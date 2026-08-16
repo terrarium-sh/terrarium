@@ -1,0 +1,108 @@
+# Templated terra sandbox unit (podman-style).
+#   systemctl start terra@pi-dev   ->   the recipe ~/.terra/pi-dev.yaml (HOME below)
+# The instance name (%i) names the recipe file; the box takes the file's stem
+# for its name, so both are %i.
+#
+# Install: cp packaging/terra@.service /etc/systemd/system/ && systemctl daemon-reload
+# See packaging/README.md for the one-time host setup (user + /dev/kvm access).
+
+[Unit]
+Description=terra microVM sandbox (%i)
+Documentation=https://github.com/alis-is/terrarium
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+# Two steps, because the box they name is different: only `setup` takes a recipe
+# *path*, and a boot takes a box *name* (it runs what setup pinned, which is the
+# point — a boot never re-reads a file somebody could have edited underneath it).
+#
+# Setting up on every start is deliberate: the unit is declarative, so each
+# restart re-reads the recipe and re-pins it, which is what makes editing that
+# file and restarting the service mean something. Re-running it on an unchanged
+# recipe pins nothing and re-bakes nothing.
+#
+# --trust-recipe is deliberate and is *not* a blanket "yes". terra only asks
+# about a recipe that lies inside a directory some box shares read-write, and a
+# recipe under ~/.terra is not one — the mount guard refuses any share containing
+# terra's own directory outright. Keeping recipes there rather than in the box's
+# project directory (which a recipe commonly shares) is what makes that true. So
+# this flag changes nothing for the intended layout; it is here because a unit
+# has no terminal to be asked on, and the alternative is a service that fails to
+# start the day someone points %i at a recipe inside a share. If you do that,
+# read the recipe first: this line is the reading.
+ExecStartPre=/usr/local/bin/terra %S/terra/.terra/%i.yaml setup --trust-recipe
+# --foreground runs the VM in *this* process rather than spawning one, so the
+# service's main PID is the thing doing the work: SIGTERM reaches it directly,
+# OOM and cgroup accounting name it, and "main process exited" and "the VM
+# stopped" are the same event. The guest's console — kernel, agent and hooks —
+# and the workload's terminal both come out on this process's stdio, so they
+# land in the journal; terra's own diagnostics, libkrun's and the gateway's go
+# to the box's log instead — `terra logs %i`.
+ExecStart=/usr/local/bin/terra %i --foreground
+
+# --- Identity -------------------------------------------------------------
+# Dedicated unprivileged account; kvm group grants /dev/kvm (libkrun needs it).
+# Rootless is not merely supported, it is the right way to run this: at uid 0
+# virtiofs serves the guest with real root authority, so the guest picks the
+# owner, mode and setuid bit of anything it writes into a read-write share.
+User=terra
+Group=terra
+SupplementaryGroups=kvm
+
+# --- State ----------------------------------------------------------------
+# terra caches the guest kernel and boot volume under $HOME/.terra/cache, shared
+# by every box on the machine — so HOME is pinned to the managed state dir,
+# regardless of the account's passwd home.
+#
+# A box lives at ~/.terra/box/<slug of its project directory>/<name>, so what
+# WorkingDirectory decides is the *slug*. This unit is a template, so `terra@a`
+# and `terra@b` must be different sandboxes; with a shared WorkingDirectory they
+# would share a slug, and a box is one (slug, name) pair — so the second instance
+# would rewrite the first one's recipe and then boot the filesystem its workload
+# had been writing to. %i is what keeps them apart.
+StateDirectory=terra terra/%i
+# 0700, not systemd's 0755 default. terra makes ~/.terra and each box's directory
+# owner-only itself, so nothing secret is directly exposed either way — but the
+# directory holding them has no reason to be traversable by every account on the
+# host, and this is where the recipes and guest images live.
+StateDirectoryMode=0700
+Environment=HOME=%S/terra
+WorkingDirectory=%S/terra/%i
+# terra needs no external tools at run time; PATH is here for the unit's own use.
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin
+
+# --- Lifecycle ------------------------------------------------------------
+# SIGTERM triggers an orderly guest shutdown: terra signals the guest over the
+# control connection, which stops the workload (SIGTERM, then SIGKILL after a
+# grace period) and runs the recipe's pre_stop hooks before the VM exits.
+# TimeoutStopSec bounds that; after it systemd sends SIGKILL, which still leaves
+# no orphan (the VM is in-process).
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=2
+
+# --- Hard requirements (do NOT tighten these away) ------------------------
+# libkrun talks to /dev/kvm; PrivateDevices=yes would hide it.
+DeviceAllow=/dev/kvm rw
+# KVM guest memory needs writable+executable mappings.
+MemoryDenyWriteExecute=no
+# The egress proxy opens host sockets, so PrivateNetwork must stay off.
+PrivateNetwork=false
+
+# --- Optional hardening (safe additions) ----------------------------------
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+# terra keeps its state under %S/terra, nothing in /tmp — so a private /tmp costs
+# nothing and takes the shared one off the map.
+PrivateTmp=true
+ReadWritePaths=%S/terra
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectClock=true
+
+[Install]
+WantedBy=multi-user.target

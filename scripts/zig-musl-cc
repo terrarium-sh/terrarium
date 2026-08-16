@@ -1,0 +1,18 @@
+#!/bin/sh
+# musl C cross-compiler via zig (no toolchain install). Used by cc-rs and as the
+# Rust musl linker for the static terra build. Two flags are dropped on the way
+# through:
+#   --target=x86_64-unknown-linux-musl — cc-rs passes the Rust triple, which zig
+#     can't parse; we supply zig's own target form below instead.
+#   -Wl,-O1 — rustc adds it to every optimized link, and zig's LLD warns
+#     "ignoring deprecated linker optimization setting" for it. It is ignored
+#     either way, so drop it rather than print a warning on every build. (Only
+#     the -Wl, form: a bare -O1 is a C optimization level cc-rs means.)
+for arg do
+	shift
+	case "$arg" in
+	--target=* | -Wl,-O?) continue ;;
+	esac
+	set -- "$@" "$arg"
+done
+exec zig cc -target x86_64-linux-musl "$@"

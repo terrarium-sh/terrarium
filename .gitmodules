@@ -1,0 +1,9 @@
+[submodule "vendor/libkrunfw"]
+	path = vendor/libkrunfw
+	url = https://github.com/containers/libkrunfw
+[submodule "vendor/libkrun"]
+	path = vendor/libkrun
+	url = https://github.com/cryi/libkrun
+[submodule "vendor/smolvm"]
+	path = vendor/smolvm
+	url = https://github.com/cryi/smolvm

@@ -1,0 +1,46 @@
+# pi-dev — an interactive dev sandbox, as a reusable recipe.
+#   cp pi-dev.yaml ~/.terra/ && cd ~/code/app && terra setup pi-dev && terra pi-dev
+# The box takes its name from the file ("pi-dev"), and its files live in
+# ~/.terra/box/<this directory>/pi-dev — never in the directory it is a box of.
+hw:
+  cpus: 2
+  mem_mib: 1024
+  rootfs_mib: 4096      # hard cap on the writable rootfs; default 512, must be > 0
+mounts:                 # nothing is shared unless it is listed here
+  - host: .             # the project directory itself: a box keeps no state in it
+    guest: /work
+  - host: ~/.ssh
+    guest: /home/terri/.ssh
+    readonly: true
+volumes:
+  - name: data
+    guest: /data
+    size_mib: 1024      # hard cap; writes past it fail with ENOSPC
+network:
+  # unrestricted-public: any public address (the host, its LAN and every private
+  # range stay blocked — that is what the name says). The default is `allowlist`,
+  # which denies everything not listed in `allow:` — and denies everything full
+  # stop when `allow:` is empty.
+  mode: unrestricted-public
+  # hosts:              # DNS records the gateway answers itself
+  #   - {name: db.local, addr: HOST_LOOPBACK}  # the machine terra runs on
+  #   - {name: nas.local, addr: 10.0.0.5}       # anything the host can reach
+  # allow:              # …and what may be reached, wherever a name resolves
+  #   - api.openai.com:443
+  #   - db.local:5432
+  #   - HOST_LOOPBACK:8000   # the host, with or without a name for it
+hooks:
+  on_start:
+    - apk add --no-cache git curl
+    - echo "terrarium ready"
+  pre_stop:
+    - echo "shutting down"
+sudo:
+  - apk
+workload:
+  # Interactive: drops you into a shell with cwd at /work (runs as terri).
+  entrypoint: /bin/sh
+  args: []
+  # One-shot command instead (argv passed literally to exec):
+  #   entrypoint: /bin/sh
+  #   args: ["-c", "echo 123"]

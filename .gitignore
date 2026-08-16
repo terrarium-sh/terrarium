@@ -1,0 +1,15 @@
+/target
+/dist
+# Staging for the folded static archives (libkrun.a, libkrunfw.a, kernel.o).
+/build
+**/*.rs.bk
+
+# Man pages and shell completions rendered from the clap CLI by
+# crates/terra/tests/docs.rs.
+/packaging/man/
+/packaging/completions/
+
+.box
+
+# Scratch: notes, branding art, anything not shipped.
+/.local-notes/

@@ -1,0 +1,53 @@
+# Single source of truth for the static-musl toolchain — so a bare `cargo
+# build`, `make`, and rust-analyzer all compile terra the same way (the Makefile
+# no longer needs to export any of this). The Makefile still builds the guest
+# `vmlinux`; a plain `cargo build` reuses whatever `make build` left under build/.
+#
+# zig provides the musl C toolchain (scripts/zig-musl-*), so no cross-gcc need be
+# installed. Paths below are `relative = true` → resolved against this file's
+# parent (the repo root), matching the Makefile's `$(abspath ...)`.
+
+[build]
+target = "x86_64-unknown-linux-musl"
+
+[target.x86_64-unknown-linux-musl]
+linker = "scripts/zig-musl-cc"
+rustflags = ["-C", "link-self-contained=no", "--cfg", "musl_v1_2_3"]
+
+[target.aarch64-unknown-linux-musl]
+linker = "scripts/zig-musl-cc-aarch64"
+rustflags = ["-C", "link-self-contained=no", "--cfg", "musl_v1_2_3"]
+
+[env]
+# krun-init-blob's build.rs invokes $CC directly (not cc-rs) to statically link
+# init.c, so CC must be set — and `force` so it wins over any host CC in the
+# shell (else host gcc has no static glibc → `cannot find -lc`).
+CC = { value = "scripts/zig-musl-cc", relative = true, force = true }
+CC_x86_64_unknown_linux_musl = { value = "scripts/zig-musl-cc", relative = true }
+AR_x86_64_unknown_linux_musl = { value = "scripts/zig-musl-ar", relative = true }
+# Cross-building for Apple Silicon still compiles libkrun's guest init for
+# aarch64 musl, in a nested cargo that runs outside this workspace — so it is
+# reached through env vars rather than the [target] table above.
+CC_aarch64_unknown_linux_musl = { value = "scripts/zig-musl-cc-aarch64", relative = true }
+AR_aarch64_unknown_linux_musl = { value = "scripts/zig-musl-ar", relative = true }
+CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER = { value = "scripts/zig-musl-cc-aarch64", relative = true }
+# zig supplies musl's CRT, so rust must not also link its self-contained one —
+# otherwise `_start` is defined twice.
+CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS = "-C link-self-contained=no"
+# include_bytes!(env!("TERRA_KERNEL_GZ")) — the stripped, gzipped vmlinux built
+# by `make build`; terra unpacks it into ~/.terra/cache/ on first boot.
+TERRA_KERNEL_GZ = { value = "build/vmlinux.gz", relative = true }
+# The prebaked (gzipped) *boot volume*: a tiny ext4 holding the guest agent and
+# resize2fs. The guest boots off this disk, so no host directory is involved in
+# bringing a sandbox up.
+TERRA_BOOT_IMG = { value = "build/boot.img.gz", relative = true }
+# sha256 of each blob above, written beside it by the Makefile and
+# include_str!'d as the blob's cache identity (see libkrun_ext::blob_name) —
+# nothing hashes the blobs at compile or boot time.
+TERRA_KERNEL_GZ_SHA256 = { value = "build/vmlinux.gz.sha256", relative = true }
+TERRA_BOOT_IMG_SHA256 = { value = "build/boot.img.gz.sha256", relative = true }
+# The prebaked (gzipped) guest root filesystem — see the Makefile. Shipping it as
+# bytes is what lets a non-Linux host create a box without any mkfs tooling.
+TERRA_ROOTFS_IMG = { value = "build/rootfs.img.gz", relative = true }
+# The prebaked empty filesystem used for scratch volumes.
+TERRA_VOLUME_IMG = { value = "build/volume.img.gz", relative = true }

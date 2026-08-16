@@ -1,0 +1,12 @@
+# `workdir` names a directory that does not exist yet, inside the share the
+# runner appends: terra creates it and hands it to the workload user. No egress
+# needed.
+workload:
+  workdir: /work/nested/deep
+  entrypoint: /bin/sh
+  args:
+    - "-c"
+    - |
+      echo PWD=$(pwd)
+      echo OWNER=$(stat -c %u:%g .)
+      echo w > ./f 2>/dev/null && echo WRITE_OK || echo WRITE_FAIL

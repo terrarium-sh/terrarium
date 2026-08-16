@@ -1,0 +1,16 @@
+# "Unprivileged" VM: same probe as client-allowed but WITHOUT a host-service
+# rule, so it cannot reach the host or the published port. Must be blocked (even
+# with retries - there is no route to the host without the rule).
+network:
+  mode: allowlist
+  allow: [example.com]
+workload:
+  entrypoint: /bin/sh
+  args:
+    - "-c"
+    - |
+      for i in 1 2 3; do
+        wget -q -T 5 -O - http://vma.terra:18080/ && { echo REACHED; exit 0; }
+        sleep 1
+      done
+      echo BLOCKED

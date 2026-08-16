@@ -1,0 +1,155 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Nothing here publishes anything, and the guest images this job bakes end up
+# embedded in the shipped binary — so the token it runs with should not be able
+# to write to the repository that produced them.
+permissions:
+  contents: read
+
+# Third-party actions are pinned by commit SHA, not by tag: a tag is mutable by
+# the action's owner, and these particular ones supply the C compiler and linker
+# for the whole static build (`setup-zig`) and can write the workspace the
+# `build/` cache is restored into (`rust-cache`). Both flow straight into the
+# guest kernel and rootfs that every sandbox boots. The trailing comment is the
+# tag the SHA stood for when it was pinned — update both together.
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # One level only. vendor/smolvm has its own libkrun/libkrunfw/sdk
+          # submodules on ssh URLs that this build never touches, and recursing
+          # would try (and fail) to fetch them.
+          submodules: true
+      # rustup picks the toolchain + components from rust-toolchain.toml.
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: . -> target
+      # The guest kernel is a full Linux build — minutes, and its only inputs are
+      # the libkrunfw submodule and the Makefile (which pins the Alpine and
+      # e2fsprogs versions). `boot.img.gz` is rebuilt regardless: its recipe has a
+      # .PHONY agent prerequisite, so a cache hit can never ship a stale agent.
+      # The linker for the musl target is `scripts/zig-musl-cc`, and CC is forced
+      # to it in .cargo/config.toml — so the Linux job needs zig just as the
+      # macOS one does. Without it nothing in this job links at all.
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.15.1
+      - name: Guest image inputs
+        id: guest
+        run: >-
+          echo "key=$(git rev-parse HEAD:vendor/libkrunfw)-${{ hashFiles('Makefile',
+          'kernel/terrarium-hardening.config') }}" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: build
+          key: guest-${{ steps.guest.outputs.key }}
+      # Block scalar: the awk body contains ": ", which is not legal in a plain
+      # YAML scalar (GitHub's parser tolerates it, stricter ones do not).
+      # Images are exempt: the branding art at the repo root is tracked on
+      # purpose. Everything else over 1 MB is a build artifact somebody committed.
+      - name: Check no large tracked files
+        run: |
+          git ls-files ':!:*.png' | xargs -r stat --printf='%s\t%n\n' \
+            | awk '$1 > 1048576 {print "ERROR: tracked file > 1 MB: "$2; ec=1} END {exit ec}'
+      # Builds the guest images (vmlinux, rootfs, boot volume) from
+      # vendor/libkrunfw and Alpine, then fmt --check, clippy -D warnings and the
+      # test suite. libkrun and smolvm-network are the vendor/libkrun and
+      # vendor/smolvm submodules, built as ordinary path dependencies.
+      - name: Verify
+        run: make verify
+      # The man pages and completions are generated from the clap CLI and are
+      # gitignored, so there is nothing to diff against — rendering them is the
+      # check: a subcommand clap_mangen cannot render fails here, not at
+      # packaging time.
+      - name: Render man pages and completions
+        run: make man
+      # Everything above runs on the host side only — no VM ever boots. The boot
+      # suite (crates/terra/tests/boot.rs, #[ignore]d in a plain `cargo test`)
+      # is the real product gate: real microVMs asserting egress enforcement,
+      # the ownership model, the on_create bake, port publishing and exec/cp.
+      # Hosted Linux runners have /dev/kvm, but its node is root-only until a
+      # udev rule opens it to the runner's user.
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      # TERRA_BIN points the suite at `make dist`'s release build — the same
+      # artifact a user runs, not the debug binary `cargo test` produced.
+      - name: Boot suite
+        run: |
+          make dist
+          TERRA_BIN=$PWD/dist/terra cargo test -p terra --test boot -- --ignored
+      # Man pages are generated the same way but not tracked — publish them.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: man
+          path: packaging/man/*.1
+      # The guest images are the one part of a terra build that *must* happen on
+      # Linux — the rootfs is baked with `mke2fs -d` inside a user namespace. Every
+      # other host just embeds the bytes, so hand them to the macOS job.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: guest-images
+          path: build/*.gz
+          retention-days: 7
+
+  macos:
+    # Apple Silicon (libkrun on macOS is aarch64-only). Build only: these runners
+    # are themselves VMs on M-series hardware without nested virtualization, so
+    # they cannot boot a guest. Testing happens on self-hosted Apple hardware.
+    runs-on: macos-latest
+    needs: verify
+    # macOS runner minutes bill at 10x on private repos; this is one release
+    # compile of libkrun's whole tree with fat LTO.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          submodules: true # see the note in the verify job
+      # `.cargo/config.toml` forces CC to the zig musl wrapper, because libkrun's
+      # init-blob compiles its *guest* init (always Linux/musl) whatever the host
+      # is. So the macOS build needs zig too.
+      - name: Install zig
+        run: brew install zig
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: . -> target
+          key: macos
+      # include_bytes!(env!("TERRA_KERNEL_GZ")) and friends — the paths come from
+      # .cargo/config.toml and are relative to the repo root.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: guest-images
+          path: build
+      # Two things this command line has to say out loud:
+      #   --target ...  `.cargo/config.toml` sets `[build] target =
+      #                 x86_64-unknown-linux-musl` for the Linux default, so
+      #                 without it cargo would build musl here.
+      #   -p terra      not `--workspace`: terra-agent's *binary* is the guest
+      #                 init (mount(2), MS_BIND, AF_VSOCK) and only ever builds
+      #                 for Linux. Its library — the host/guest contract terra
+      #                 links against — is part of this build.
+      - name: Build
+        run: cargo build --release -p terra --target aarch64-apple-darwin
+      # Cheap proof the artifact actually links and executes on macOS, which a
+      # cross-compile cannot tell you. Neither flag touches a hypervisor.
+      - name: Check it runs
+        run: |
+          ./target/aarch64-apple-darwin/release/terra --version
+          ./target/aarch64-apple-darwin/release/terra --help
+      # Download this to try terra on real Apple hardware. NOTE: it embeds the
+      # x86_64 guest images built above, which Apple Silicon cannot boot — the CLI
+      # works, `terra run` will not, until the guest set is built for aarch64.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: terra-aarch64-apple-darwin
+          path: target/aarch64-apple-darwin/release/terra

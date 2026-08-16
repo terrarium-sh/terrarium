@@ -1,0 +1,21 @@
+# "Server" VM: publish guest:18080 onto the host loopback and serve a known
+# string over a persistent HTTP server. Alpine's base busybox has no httpd, so we
+# pull it from busybox-extras in on_start - hooks run as root, while the workload
+# runs as terri on a root-owned rootfs, so installing packages is a hook's job
+# and the served files go somewhere terri can write. A persistent server (not a
+# single-shot `nc` loop) avoids availability gaps that reset the forwarder.
+# Booted detached by the runner.
+network:
+  mode: unrestricted-public
+  ports: ["18080"]
+hooks:
+  on_start:
+    - apk add --no-cache busybox-extras
+workload:
+  entrypoint: /bin/sh
+  args:
+    - "-c"
+    - |
+      mkdir -p /tmp/srv
+      printf 'HELLO_FROM_VMA' > /tmp/srv/index.html
+      exec httpd -f -p 18080 -h /tmp/srv

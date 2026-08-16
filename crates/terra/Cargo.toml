@@ -1,0 +1,43 @@
+[package]
+name = "terra"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# A library plus a three-line binary: `examples/gen-docs.rs` renders the man
+# pages and completions from the same clap types the binary parses with, and
+# neither an example nor a test crate can reach those without a lib target.
+[lib]
+name = "terra"
+path = "src/lib.rs"
+
+[[bin]]
+name = "terra"
+path = "src/main.rs"
+
+[dependencies]
+terra-agent = { path = "../terra-agent" }
+clap.workspace = true
+strum = { version = "0.28", features = ["derive"] }
+anyhow.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
+serde_json = { workspace = true }
+crossterm = { version = "0.29", default-features = false }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+libkrun = { path = "../../vendor/libkrun/src/libkrun", features = ["net", "blk"] }
+smolvm-network = { path = "../../vendor/smolvm/crates/smolvm-network" }
+libc.workspace = true
+tracing = "0.1.44"
+log = "0.4.33"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "registry", "tracing-log", "std"] }
+
+[dev-dependencies]
+clap_mangen = "0.3"
+clap_complete = "4"
+tempfile.workspace = true
+
+[lints]
+workspace = true

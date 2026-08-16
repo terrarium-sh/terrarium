@@ -1,0 +1,48 @@
+[workspace]
+resolver = "3"
+members = ["crates/terra", "crates/terra-agent"]
+# vendor/ holds the three submodules (libkrun, libkrunfw, smolvm), each its own
+# workspace. terra path-depends on two of their crates; nothing else in them is
+# ours to build, lint or format.
+exclude = ["vendor"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/alis-is/terrarium"
+# smolvm-network pulls in smoltcp 0.13, whose MSRV is 1.91.
+rust-version = "1.91"
+
+[workspace.dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1"
+anyhow = "1"
+libc = "0.2"
+tempfile = "3"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+warnings = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
+[profile.dev.package."*"]
+opt-level = 2
+
+# Profiles are only honoured in the workspace root — cargo ignores (and warns
+# about) a [profile.*] in a member manifest, so both crates are configured here.
+[profile.release]
+opt-level = 3
+lto = "fat" # link-time optimization across all crates
+strip = "symbols"
+

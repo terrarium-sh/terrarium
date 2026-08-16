@@ -1,0 +1,18 @@
+# Prints the workload uid, the in-guest share and volume owners, and writes
+# /work/wf + /data/vf so the runner can also check host-side ownership. Booted
+# once as the default (terri) and once with --root - the filesystem must look
+# identical either way; only EXEC changes.
+#
+# There is no implicit project mount any more, so the runner appends a `mounts:`
+# entry pointing /work at a temp directory it owns before booting this.
+volumes:
+  - {name: data, guest: /data, size_mib: 64}
+workload:
+  entrypoint: /bin/sh
+  args:
+    - "-c"
+    - |
+      echo EXEC=$(id -u)
+      echo WORK=$(stat -c %u:%g /work)
+      echo w > /work/wf 2>/dev/null && echo WF_OK || echo WF_FAIL
+      echo v > /data/vf 2>/dev/null && echo VOL=$(stat -c %u:%g /data/vf) || echo VOL=FAIL

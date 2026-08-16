@@ -1,0 +1,146 @@
+//! `terra show` - print the fully-resolved config a boot would use.
+
+use crate::policy::mount;
+use crate::{config, render, resolve};
+use anyhow::{Context, Result};
+use std::path::Path;
+use std::process::ExitCode;
+
+pub fn run(
+    args: &crate::cli::ShowArgs,
+    name: Option<&str>,
+    project_dir: &Path,
+    cwd: &Path,
+) -> Result<ExitCode> {
+    let target = resolve::resolve_for_show(name, project_dir, cwd)?;
+    if let Some(from) = &target.manifest_divergence {
+        eprintln!(
+            "terra: note: this is {}'s pinned recipe, which is what a boot runs - \
+             {} names {} instead, and `terra {} setup` would pin that one",
+            target.bx.name(),
+            config::MANIFEST_FILE,
+            render::printable_path(from),
+            target.bx.name()
+        );
+    }
+
+    let mut cfg = target.parsed_recipe_without_env_file()?;
+    if let Err(e) = config::merge_env_file(&mut cfg) {
+        eprintln!(
+            "terra: warning: {e:#}\n\
+             terra: printing the recipe without those values - a boot would refuse it"
+        );
+    }
+    if let Err(e) = mount::resolve_and_check_mounts(&mut cfg, &target.bx) {
+        eprintln!("terra: warning: `terra setup` would refuse this recipe:\n{e:#}");
+    }
+    let options = render::Options {
+        env_values: args.with_env_values,
+    };
+    print!(
+        "{}",
+        render::config_yaml(&cfg, options).context("serializing config")?
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::BoxRef;
+
+    /// `show` is what a recipe is reviewed with before it is trusted, so it
+    /// runs the checks that decide whether `terra setup` would take it - and
+    /// reports rather than returns them, because a recipe whose mounts are not
+    /// there yet is still worth reading. A recipe mounting terra's own state
+    /// used to print clean and then be refused at the setup nobody had run yet.
+    #[test]
+    fn show_resolves_and_judges_the_mounts_a_boot_would_get() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::create_dir_all(project.join("sub")).unwrap();
+        let _home = crate::sys::TestHome::new();
+        let bx = BoxRef::resolve(&project, "dev").unwrap();
+
+        // A mount of the box's own state is what `terra setup` refuses.
+        let mut refused = config::parse_recipe(
+            &format!(
+                "mounts:\n  - host: {}\n    guest: /work\n",
+                bx.dir().display()
+            ),
+            &project,
+            Path::new("r.yaml"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(bx.dir()).unwrap();
+        let err = mount::resolve_and_check_mounts(&mut refused, &bx)
+            .expect_err("a mount of the box's own state must be reported")
+            .to_string();
+        assert!(err.contains("this box's own state"), "{err}");
+
+        // An ordinary one resolves to the path a boot mounts, `..` and all -
+        // `std::path::absolute` leaves those in, and `terra show` printed them.
+        let mut ok = config::parse_recipe(
+            "mounts:\n  - host: ./sub/../src\n    guest: /work\n",
+            &project,
+            Path::new("r.yaml"),
+        )
+        .unwrap();
+        assert!(ok.mounts[0].host.to_string_lossy().contains(".."));
+        mount::resolve_and_check_mounts(&mut ok, &bx).unwrap();
+        assert_eq!(
+            ok.mounts[0].host,
+            std::fs::canonicalize(project.join("src")).unwrap()
+        );
+    }
+
+    /// `show` is the verb a recipe is *reviewed* with, so a file the recipe
+    /// merely names must not be able to stop it printing: an `env_file:` is
+    /// commonly the one thing the reader of an unfamiliar recipe has not
+    /// created yet, and refusing here sent them to read the YAML by hand -
+    /// exactly the reading `show` exists to replace. Only the values go
+    /// missing, and a warning says so.
+    ///
+    /// The other half is what makes the leniency safe to have: a pin exports
+    /// those values into the guest, so `terra setup` still refuses the same
+    /// recipe rather than pinning one whose environment is half there.
+    #[test]
+    fn show_prints_a_recipe_whose_env_file_is_not_there_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("dev.yaml"),
+            "env:\n  MODEL: gpt-4o\nenv_file: ./secrets.env\n",
+        )
+        .unwrap();
+
+        let show = crate::cli::ShowArgs {
+            with_env_values: false,
+        };
+        run(&show, Some("./dev.yaml"), &project, &project)
+            .expect("a recipe naming a dotenv nobody has created yet must still print");
+
+        let err = crate::cmd::setup::run(
+            &crate::cli::SetupArgs {
+                trust_recipe: false,
+                rebuild: false,
+                dry_run: true,
+            },
+            Some("./dev.yaml"),
+            &project,
+            &project,
+            false,
+        )
+        .expect_err("a pin must still refuse a dotenv it cannot read")
+        .to_string();
+        assert!(err.contains("opening env file"), "{err}");
+
+        // …and the file being there is not a thing `show` needs told twice:
+        // the values are merged as a boot would merge them.
+        std::fs::write(project.join("secrets.env"), "API_KEY=sk-1\n").unwrap();
+        let target = resolve::resolve_for_show(Some("./dev.yaml"), &project, &project).unwrap();
+        assert_eq!(target.parsed_recipe().unwrap().env["API_KEY"], "sk-1");
+    }
+}

@@ -1,0 +1,13 @@
+#!/bin/sh
+# aarch64 musl cross-compiler via zig — the counterpart to zig-musl-cc.
+# libkrun's init_blob build script compiles the guest init for the *host arch's*
+# musl target, so cross-building terra for aarch64 (Apple Silicon) needs this
+# even though the host binary itself is Mach-O.
+for arg do
+	shift
+	case "$arg" in
+	--target=* | -Wl,-O?) continue ;; # see zig-musl-cc for why
+	esac
+	set -- "$@" "$arg"
+done
+exec zig cc -target aarch64-linux-musl "$@"

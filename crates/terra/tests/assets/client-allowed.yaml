@@ -1,0 +1,20 @@
+# "Client" VM: reaches the server VM's published port. Two halves - a record
+# saying where `vma.terra` is, and the allow rule opening that port on it.
+# Retries a few times (the server's nc is single-shot, so there are brief gaps
+# between conns).
+network:
+  mode: allowlist
+  hosts:
+    - {name: vma.terra, addr: HOST_LOOPBACK}
+  allow:
+    - vma.terra:18080
+workload:
+  entrypoint: /bin/sh
+  args:
+    - "-c"
+    - |
+      for i in 1 2 3 4 5 6; do
+        out=$(wget -q -T 5 -O - http://vma.terra:18080/) && { echo "$out"; exit 0; }
+        sleep 1
+      done
+      echo WGET_FAIL

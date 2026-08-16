@@ -1,0 +1,16 @@
+# on_create bake: the guest decides whether the one-time setup is still
+# current by comparing the recipe against the stamp inside its own root, so this
+# must run exactly once across two boots of the same box - and the stamp must
+# hold the recipe verbatim.
+hw: {rootfs_mib: 1024}
+hooks:
+  on_create:
+    - mkdir -p /opt/baked
+    - date +%s%N > /opt/baked/when
+workload:
+  entrypoint: /bin/sh
+  args:
+    - "-c"
+    - |
+      echo "STAMP=$(cat /terra/recipe | tr '\n' ';')"
+      echo "WHEN=$(cat /opt/baked/when)"

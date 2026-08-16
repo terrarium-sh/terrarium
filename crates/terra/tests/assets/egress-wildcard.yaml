@@ -1,0 +1,12 @@
+# The subtree is opted into, not implied: `*.example.com` covers the subdomains
+# and deliberately not the name itself. List both to get both.
+network:
+  mode: allowlist
+  allow: ["*.example.com"]
+workload:
+  entrypoint: /bin/sh
+  args:
+    - "-c"
+    - |
+      wget -q -T 10 -O /dev/null https://www.example.com/ && echo SUB_OK       || echo SUB_FAIL
+      wget -q -T 10 -O /dev/null https://example.com/     && echo APEX_REACHED || echo APEX_BLOCKED

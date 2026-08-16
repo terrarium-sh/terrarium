@@ -1,0 +1,40 @@
+[package]
+name = "terra-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# Two crate roots, and the directories say which is which: `contract/` is built
+# for the host too (macOS, Windows), `guest/` is Linux PID 1 and never leaves it.
+[lib]
+name = "terra_agent"
+path = "src/contract/lib.rs"
+
+[[bin]]
+name = "terra-agent"
+path = "src/guest/main.rs"
+
+[dependencies]
+# The guest boot plan is serialized host-side and read by the agent as init.
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+
+# The agent *binary* is a Linux guest init; only its library (the host/guest
+# contract) is built for the host, which may be macOS or Windows. Everything
+# below is binary-only, so a host build of the library skips it all.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+# Spawn the workload on a PTY (blocking API). Pure Rust (nix). Guest-only.
+pty-process = "0.5"
+# Terminal screen model: lets a client attaching to a running TUI be repainted
+# with the current screen instead of missing history. Pure Rust (musl-friendly).
+vt100 = "0.16"
+
+# The workspace denies `unsafe_code`; the binary carries `#![allow(unsafe_code)]`
+# (vsock syscalls) and the lib scopes it to `nofollow.rs` - Cargo lints arrive as
+# command-line levels, which a crate/module attribute may override.
+[lints]
+workspace = true

@@ -1,0 +1,57 @@
+# Temporary CI. Builds nothing but the binary, so it needs no /dev/kvm and runs
+# on a stock hosted runner. The real pipeline (fmt, clippy, tests, the boot
+# suite against a live microVM, the macOS job) is parked in ci.yml.disabled —
+# restore it once there is a runner that can boot a guest.
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Actions pinned by commit SHA, not tag: setup-zig supplies the C compiler and
+# linker for the whole static build. The trailing comment is the tag the SHA
+# stood for — update both together.
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # One level only. vendor/smolvm has its own submodules on ssh URLs
+          # that this build never touches, and recursing would fail to fetch them.
+          submodules: true
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: . -> target
+      # .cargo/config.toml forces CC to scripts/zig-musl-cc for the musl target.
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.15.1
+      # The guest kernel is a full Linux build — minutes — and its only inputs
+      # are the libkrunfw submodule and the Makefile pins.
+      - name: Guest image inputs
+        id: guest
+        run: >-
+          echo "key=$(git rev-parse HEAD:vendor/libkrunfw)-${{ hashFiles('Makefile',
+          'kernel/terrarium-hardening.config') }}" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: build
+          key: guest-${{ steps.guest.outputs.key }}
+      # Bakes the guest images (needs unprivileged user namespaces, which hosted
+      # runners have) and links the one static binary.
+      - name: Build
+        run: make dist
+      - name: Check it runs
+        run: |
+          ./dist/terra --version
+          ./dist/terra --help
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: terra-x86_64-linux
+          path: dist/terra

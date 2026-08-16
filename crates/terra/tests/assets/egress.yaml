@@ -1,0 +1,13 @@
+# Egress allowlist: a name is *exact*. `example.com` reaches that name and
+# neither its subdomains nor anything else.
+network:
+  mode: allowlist
+  allow: [example.com]
+workload:
+  entrypoint: /bin/sh
+  args:
+    - "-c"
+    - |
+      wget -q -T 10 -O /dev/null https://example.com/     && echo ALLOWED_OK     || echo ALLOWED_FAIL
+      wget -q -T 10 -O /dev/null https://www.example.com/ && echo SUB_REACHED    || echo SUB_BLOCKED
+      wget -q -T 10 -O /dev/null https://api.openai.com/  && echo DENIED_REACHED || echo DENIED_BLOCKED
