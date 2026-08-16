@@ -13,8 +13,9 @@ static ROOTFS_IMG_GZ: &[u8] = include_bytes!(env!("TERRA_ROOTFS_IMG"));
 /// The prebaked *empty* filesystem for scratch volumes
 static VOLUME_IMG_GZ: &[u8] = include_bytes!(env!("TERRA_VOLUME_IMG"));
 
-/// vmlinux ELF built from vendor/libkrunfw; the Makefile sets
-/// `TERRA_KERNEL_GZ`.
+/// The guest kernel built from vendor/libkrunfw; the Makefile sets
+/// `TERRA_KERNEL_GZ`. An ELF vmlinux on `x86_64`, a flat `Image` on aarch64 —
+/// see `libkrun_ext::KERNEL_FORMAT`, which has to agree with it.
 static KERNEL_GZ: &[u8] = include_bytes!(env!("TERRA_KERNEL_GZ"));
 const KERNEL_NAME: &str = concat!("vmlinux-", include_str!(env!("TERRA_KERNEL_GZ_SHA256")));
 

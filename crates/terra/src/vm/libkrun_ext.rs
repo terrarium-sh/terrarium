@@ -22,7 +22,20 @@ use krun::{
     krun_set_vm_config, krun_start_enter,
 };
 
-const KERNEL_FORMAT_ELF: u32 = 1;
+/// `KRUN_KERNEL_FORMAT_*` for the kernel the Makefile built for this arch.
+///
+/// Not a preference — both ends fix it. libkrunfw emits an ELF `vmlinux` on
+/// `x86_64` and a flat `arch/arm64/boot/Image` on aarch64, and libkrun's loader
+/// gates on the same arch: `KernelFormat::Elf` is `#[cfg(target_arch =
+/// "x86_64")]`, so passing it on aarch64 falls through to
+/// `KernelFormatUnsupported` at boot rather than failing to compile. arm64
+/// takes `Raw` (the file, written verbatim to the load address), which is what
+/// an already-decompressed `Image` is — terra unpacks the embedded gzip before
+/// this call, so the gz-flavoured formats do not apply.
+#[cfg(target_arch = "x86_64")]
+const KERNEL_FORMAT: u32 = 1; // KRUN_KERNEL_FORMAT_ELF
+#[cfg(target_arch = "aarch64")]
+const KERNEL_FORMAT: u32 = 0; // KRUN_KERNEL_FORMAT_RAW
 
 /// libkrun's path-taking entry points call `CStr::to_str` internally, so a
 /// non-UTF-8 path is a clear error here instead of a panic there.
@@ -89,7 +102,7 @@ impl Krun {
             krun_set_kernel(
                 self.ctx_id,
                 path.as_ptr(),
-                KERNEL_FORMAT_ELF,
+                KERNEL_FORMAT,
                 std::ptr::null(),
                 cmdline.as_ptr(),
             )

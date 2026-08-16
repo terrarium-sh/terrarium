@@ -103,23 +103,49 @@ $(KERNEL_TARBALL):
 	echo "$(KERNEL_SHA256)  $@.tmp" | sha256sum -c -
 	mv $@.tmp $@
 
-## Build the guest vmlinux from libkrunfw sources, stripped and gzipped.
-## --strip-all, not just --strip-debug: the loader reads program headers only, so
-## the symbol table is 4 MiB the guest never looks at. Gzipped because it ships
-## inside the binary — 29.5 MiB of ELF becomes 8.2 MiB, and terra unpacks it once
-## into ~/.terra/cache/ rather than per boot.
+## Build the guest kernel from libkrunfw sources and gzip it for embedding.
+##
+## What gets built has a different *name and format* per arch, and this is not a
+## detail we get to choose — it is fixed at both ends. libkrunfw emits an ELF
+## `vmlinux` on x86_64 and a flat `arch/arm64/boot/Image` on aarch64 (its
+## KERNEL_BINARY_* variables, mirrored below), and libkrun's loader agrees:
+## `KernelFormat::Elf` is `#[cfg(target_arch = "x86_64")]` and arm64 only accepts
+## Raw/PeGz. So the pairing is forced, and crates/terra/src/vm/libkrun_ext.rs
+## picks the matching KRUN_KERNEL_FORMAT_* for the same arch. Change one, change
+## both.
+##
+## Staged as $(BUILD)/vmlinux either way — the name the embedded blob has always
+## had, and .cargo/config.toml points TERRA_KERNEL_GZ at it.
+KERNEL_BINARY_x86_64 := $(KERNEL_VERSION)/vmlinux
+KERNEL_BINARY_aarch64 := $(KERNEL_VERSION)/arch/arm64/boot/Image
+KERNEL_BINARY := $(KERNEL_BINARY_$(ARCH))
+## x86_64: --strip-all, not just --strip-debug — the loader reads program headers
+## only, so the symbol table is 4 MiB the guest never looks at (29.5 MiB of ELF
+## becomes 8.2 MiB gzipped). arm64's Image is already a flat binary with no
+## symbol table to drop, and objcopy cannot parse it as an object file at all.
+KERNEL_STAGE_x86_64 = objcopy --strip-all $(LIBKRUNFW_DIR)/$(KERNEL_BINARY) $(BUILD)/vmlinux
+KERNEL_STAGE_aarch64 = cp $(LIBKRUNFW_DIR)/$(KERNEL_BINARY) $(BUILD)/vmlinux
+##
+## --no-print-directory is load-bearing, not cosmetic. libkrunfw's kernel rule
+## forwards $(MAKEFLAGS) as a command-line *argument* (`$(MAKE) $(MAKEFLAGS)
+## KBUILD_...`), and GNU make <= 4.3 puts the -w it turns on implicitly for a
+## recursive make into MAKEFLAGS as a bare `w` — which then reads as a goal:
+## "No rule to make target 'w'". make 4.4 stopped adding it, so this fails only
+## on the older make the CI runners ship and never on a 4.4 workstation. Passing
+## --no-print-directory keeps `w` out of MAKEFLAGS on every version.
+LIBKRUNFW_MAKE := $(MAKE) --no-print-directory -C $(LIBKRUNFW_DIR)
 ##
 ## The config is libkrunfw's plus $(KERNEL_HARDENING): libkrunfw extracts and
 ## configures the tree first, then the fragment is appended and `olddefconfig`
 ## resolves it — appended last, so its values win over the ones set above them.
 $(KERNEL_GZ): $(KERNEL_TARBALL) $(KERNEL_HARDENING) $(PIN_STAMP)
 	echo "$(KERNEL_SHA256)  $(KERNEL_TARBALL)" | sha256sum -c -
-	$(MAKE) -C $(LIBKRUNFW_DIR) $(KERNEL_VERSION)
+	$(LIBKRUNFW_MAKE) $(KERNEL_VERSION)
 	cat $(KERNEL_HARDENING) >> $(LIBKRUNFW_DIR)/$(KERNEL_VERSION)/.config
-	$(MAKE) -C $(LIBKRUNFW_DIR)/$(KERNEL_VERSION) olddefconfig
-	$(MAKE) -C $(LIBKRUNFW_DIR) $(KERNEL_VERSION)/vmlinux
+	$(MAKE) --no-print-directory -C $(LIBKRUNFW_DIR)/$(KERNEL_VERSION) olddefconfig
+	$(LIBKRUNFW_MAKE) $(KERNEL_BINARY)
 	mkdir -p $(BUILD)
-	objcopy --strip-all $(LIBKRUNFW_DIR)/$(KERNEL_VERSION)/vmlinux $(BUILD)/vmlinux
+	$(KERNEL_STAGE_$(ARCH))
 	gzip -9nc $(BUILD)/vmlinux > $@.tmp && mv $@.tmp $@
 
 ## The sha256 of an embedded blob, written beside it. Included as text by
@@ -284,4 +310,4 @@ dist: build
 clean:
 	$(CARGO) clean
 	rm -rf $(DIST) $(BUILD)
-	-$(MAKE) -C $(LIBKRUNFW_DIR) clean
+	-$(LIBKRUNFW_MAKE) clean
