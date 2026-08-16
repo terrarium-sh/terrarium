@@ -1,7 +1,12 @@
 #!/bin/sh
-# musl C cross-compiler via zig (no toolchain install). Used by cc-rs and as the
-# Rust musl linker for the static terra build. Two flags are dropped on the way
-# through:
+# musl C compiler for the *host* arch via zig (no toolchain install). Used by
+# cc-rs and as the Rust musl linker for the static terra build, and by the
+# Makefile for e2fsprogs — all of which want the arch the build is running on.
+# zig-musl-cc-aarch64 is the fixed-target counterpart, for the one case that is
+# genuinely a cross: building for Apple Silicon from x86_64 still compiles
+# libkrun's *guest* init for aarch64 musl.
+#
+# Two flags are dropped on the way through:
 #   --target=x86_64-unknown-linux-musl — cc-rs passes the Rust triple, which zig
 #     can't parse; we supply zig's own target form below instead.
 #   -Wl,-O1 — rustc adds it to every optimized link, and zig's LLD warns
@@ -15,4 +20,4 @@ for arg do
 	esac
 	set -- "$@" "$arg"
 done
-exec zig cc -target x86_64-linux-musl "$@"
+exec zig cc -target "$(uname -m)-linux-musl" "$@"

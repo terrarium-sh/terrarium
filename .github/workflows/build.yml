@@ -1,7 +1,7 @@
 # Temporary CI. Builds nothing but the binary, so it needs no /dev/kvm and runs
-# on a stock hosted runner. The real pipeline (fmt, clippy, tests, the boot
-# suite against a live microVM, the macOS job) is parked in ci.yml.disabled —
-# restore it once there is a runner that can boot a guest.
+# on stock hosted runners. The real pipeline (fmt, clippy, tests, the boot suite
+# against a live microVM, the macOS job) is parked in ci.yml.disabled — restore
+# it once there is a runner that can boot a guest.
 name: Build
 
 on:
@@ -17,28 +17,52 @@ permissions:
 # linker for the whole static build. The trailing comment is the tag the SHA
 # stood for — update both together.
 jobs:
-  linux:
-    runs-on: ubuntu-latest
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          # Native, not cross: the guest kernel, rootfs and agent are built for
+          # the host arch (see ARCH in the Makefile), so an arm binary has to be
+          # produced on arm hardware to embed a guest it can actually boot.
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           # One level only. vendor/smolvm has its own submodules on ssh URLs
           # that this build never touches, and recursing would fail to fetch them.
           submodules: true
+      # A full Linux kernel build needs these; ubuntu-latest happens to carry
+      # them, the arm image does not, so install on both rather than depend on
+      # which runner image ships what.
+      - name: Kernel build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            flex bison bc libelf-dev libssl-dev python3-pyelftools
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: . -> target
-      # .cargo/config.toml forces CC to scripts/zig-musl-cc for the musl target.
+          key: ${{ matrix.arch }}
+      # .cargo/config.toml routes CC and the musl linker through scripts/zig-*.
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          version: 0.15.1
+          version: 0.16.0
       # The guest kernel is a full Linux build — minutes — and its only inputs
-      # are the libkrunfw submodule and the Makefile pins.
+      # are the libkrunfw submodule, the pins, the hardening fragment and the
+      # host arch. All four are in the key, so a pin bump or an arch switch
+      # cannot hit a stale image (the Makefile's pin stamp enforces the same
+      # thing locally). pins.mk especially: that is where a security bump lands.
       - name: Guest image inputs
         id: guest
         run: >-
-          echo "key=$(git rev-parse HEAD:vendor/libkrunfw)-${{ hashFiles('Makefile',
-          'kernel/terrarium-hardening.config') }}" >> "$GITHUB_OUTPUT"
+          echo "key=${{ matrix.arch }}-$(git rev-parse HEAD:vendor/libkrunfw)-${{
+          hashFiles('pins.mk', 'Makefile', 'kernel/terrarium-hardening.config') }}"
+          >> "$GITHUB_OUTPUT"
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: build
@@ -51,7 +75,13 @@ jobs:
         run: |
           ./dist/terra --version
           ./dist/terra --help
+      # The whole point of the static build — a dynamic dependency here means a
+      # tester's box has to happen to match this runner's libc.
+      - name: Check it is static
+        run: |
+          file ./dist/terra | grep -q 'statically linked'
+          ! ldd ./dist/terra 2>&1 | grep -q '=>'
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: terra-x86_64-linux
+          name: terra-${{ matrix.arch }}-linux
           path: dist/terra

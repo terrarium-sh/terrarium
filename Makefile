@@ -8,36 +8,30 @@
 # ssh URLs, and nothing here builds from them.
 
 CARGO ?= cargo
-MUSL := x86_64-unknown-linux-musl
+# Host CPU, and therefore guest CPU: a box runs on the same hardware the host
+# does, so the kernel, the rootfs and the agent are all built for $(ARCH). There
+# is no cross case to model here — `make cross` builds the *host* binary for
+# another platform and is a separate thing. Override only to reproduce another
+# arch's images on a machine that can run its binaries.
+ARCH ?= $(shell uname -m)
+MUSL := $(ARCH)-unknown-linux-musl
 LIBKRUNFW_DIR := vendor/libkrunfw
 BUILD := build
 DIST := dist
 
-# Mirror libkrunfw's pinned kernel version (vendor/libkrunfw/Makefile line 1).
-# Keep in sync on submodule bump.
-KERNEL_VERSION := linux-6.12.91
+# Versions, URLs and sha256s of everything downloaded and baked into the binary
+# — the guest kernel, e2fsprogs, the Alpine rootfs and doas. Kept in its own file
+# so a bump is a reviewable diff of provenance and nothing else; the recipes that
+# consume it are below. Needs $(ARCH) and $(LIBKRUNFW_DIR), hence included here.
+# NOTE: the CI cache key hashes this file — keep it listed there.
+include pins.mk
+
 KERNEL_GZ := $(BUILD)/vmlinux.gz
-# The published hash from cdn.kernel.org/pub/linux/kernel/v6.x/sha256sums.asc.
-# libkrunfw fetches this tarball with a bare `curl` — no -f, no hash check — and
-# it is compiled into the vmlinux that ships inside every terra binary, which
-# made it the one build input taken on trust. Verified here on every build, not
-# just on the download, so a tarball already sitting in the submodule's cache is
-# checked too. Update together with KERNEL_VERSION.
-KERNEL_SHA256 := 0ff2ab9e169f9f1948557471fbb450d3018f8c5b77caf288e1a3982582597969
-KERNEL_TARBALL := $(LIBKRUNFW_DIR)/tarballs/$(KERNEL_VERSION).tar.xz
 # Guest-kernel hardening, appended to libkrunfw's config before the build. Lives
 # here rather than as an edit to the submodule's tracked config, so a fresh
 # clone builds the same kernel this repo was tested against.
 KERNEL_HARDENING := kernel/terrarium-hardening.config
 
-# e2fsprogs, built static with the zig musl toolchain: `mke2fs` bakes the images
-# below at build time, and `resize2fs` is shipped in the binary and injected into
-# the guest, which grows them to the configured size. Pinned release tarball (not
-# the git tree: the tarball ships a generated `configure`, so the build host needs
-# no autoconf) verified by hash.
-E2FSPROGS_VERSION := 1.47.2
-E2FSPROGS_SHA256 := 7a959221c1b1cc6e28b7d7a4e204a2ffd8ec6d8a2de4461c482b64c5f4463cca
-E2FSPROGS_URL := https://mirrors.edge.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v$(E2FSPROGS_VERSION)/e2fsprogs-$(E2FSPROGS_VERSION).tar.gz
 E2FSPROGS_SRC := $(BUILD)/e2fsprogs-$(E2FSPROGS_VERSION)
 MKE2FS := $(BUILD)/mke2fs
 RESIZE2FS := $(BUILD)/resize2fs
@@ -47,18 +41,6 @@ RESIZE2FS := $(BUILD)/resize2fs
 # is what makes terra host-portable: creating a box is `write image; set_len`,
 # with no filesystem tooling on the host at all. The guest (always Alpine Linux)
 # grows the fs to the configured size on first boot.
-ALPINE_VERSION := 3.24.1
-ALPINE_ARCH := x86_64
-ALPINE_SHA256 := 41f73e3cf5fa919b8aa5ca6b30dc48f0da2720776d7423e2a7748211456fe081
-ALPINE_URL := https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/$(ALPINE_ARCH)/alpine-minirootfs-$(ALPINE_VERSION)-$(ALPINE_ARCH).tar.gz
-# doas + its sudo-compatible shim, baked into the image so a `sudo:` config can
-# let the non-root workload run listed commands as root. ~39 KiB installed, and
-# both packages grant nothing until terra writes /etc/doas.conf at boot.
-ALPINE_PKG_URL := https://dl-cdn.alpinelinux.org/alpine/v3.24/main/$(ALPINE_ARCH)
-DOAS_APK := doas-6.8.2-r8.apk
-DOAS_SHA256 := 1b0198d957fee06b484fc0e23783f03213cc97d8003c5f46b8d940d8ca9f57c8
-DOAS_SHIM_APK := doas-sudo-shim-0.2.0-r0.apk
-DOAS_SHIM_SHA256 := 74361be22e06e395703ea5bef1f53a8f21a3350a06748ab6eb404c2c916bb35b
 ROOTFS_TREE := $(BUILD)/rootfs-tree
 ROOTFS_IMG := $(BUILD)/rootfs.img.gz
 VOLUME_IMG := $(BUILD)/volume.img.gz
@@ -83,8 +65,8 @@ ROOTFS_IMG_MIB := 16
 
 .PHONY: build verify dist man cross clean
 
-# Every pinned input, in one string. The guest-image recipes below depend on the
-# stamp file this writes, because otherwise they depend on nothing at all: each
+# Every pin from pins.mk, in one string. The guest-image recipes below depend on
+# the stamp file this writes, because otherwise they depend on nothing at all: each
 # names an output that already exists after the first build, so `make` declares
 # it up to date and a bumped $(ALPINE_VERSION) — or a corrected $(KERNEL_SHA256),
 # or a new libkrunfw commit — is a silent no-op. That is the wrong failure for a
@@ -156,7 +138,7 @@ $(MKE2FS): $(PIN_STAMP)
 	rm -rf $(E2FSPROGS_SRC)
 	tar -xzf $(BUILD)/e2fsprogs.tar.gz -C $(BUILD)
 	cd $(E2FSPROGS_SRC) && CC=$(abspath scripts/zig-musl-cc) ./configure \
-		--host=x86_64-linux-musl --disable-nls --disable-uuidd --disable-fuse2fs \
+		--host=$(ARCH)-linux-musl --disable-nls --disable-uuidd --disable-fuse2fs \
 		--disable-e2initrd-helper --disable-testio-debug LDFLAGS="-static" >/dev/null
 	CC=$(abspath scripts/zig-musl-cc) $(MAKE) -C $(E2FSPROGS_SRC) libs
 	CC=$(abspath scripts/zig-musl-cc) $(MAKE) -C $(E2FSPROGS_SRC)/misc mke2fs
@@ -212,7 +194,7 @@ $(VOLUME_IMG): $(MKE2FS) $(PIN_STAMP)
 AGENT_BIN := target/$(MUSL)/release/terra-agent
 .PHONY: $(AGENT_BIN)
 $(AGENT_BIN):
-	$(CARGO) build --release -p terra-agent
+	$(CARGO) build --release -p terra-agent --target $(MUSL)
 
 ## Prebaked *boot volume*: a tiny read-only ext4 holding the guest agent,
 ## resize2fs, and the handful of empty directories stage one mounts over. This is
@@ -243,7 +225,7 @@ $(BOOT_IMG): $(MKE2FS) $(RESIZE2FS) $(AGENT_BIN) $(PIN_STAMP)
 
 ## Build the static terra binary (embeds vmlinux and the prebaked images).
 build: $(KERNEL_GZ) $(ROOTFS_IMG) $(VOLUME_IMG) $(BOOT_IMG) $(BLOB_SHAS)
-	$(CARGO) build --release -p terra
+	$(CARGO) build --release -p terra --target $(MUSL)
 
 ## Format check, lints, and the test suite. Generating the man pages and
 ## completions is `man`'s job, not this one's — a test that writes to the
@@ -253,20 +235,25 @@ build: $(KERNEL_GZ) $(ROOTFS_IMG) $(VOLUME_IMG) $(BOOT_IMG) $(BLOB_SHAS)
 ## (needs /dev/kvm).
 verify: $(KERNEL_GZ) $(ROOTFS_IMG) $(VOLUME_IMG) $(BOOT_IMG) $(BLOB_SHAS)
 	$(CARGO) fmt --all -- --check
-	$(CARGO) clippy --workspace --all-targets -- -D warnings
+	$(CARGO) clippy --workspace --all-targets --target $(MUSL) -- -D warnings
 ## The crates deny rustdoc::broken_intra_doc_links, which only fires under
 ## `cargo doc` — without this step a stale [`link`] survives verify.
-	$(CARGO) doc --workspace --no-deps --document-private-items
-	$(CARGO) test --workspace
+	$(CARGO) doc --workspace --no-deps --document-private-items --target $(MUSL)
+	$(CARGO) test --workspace --target $(MUSL)
 
 ## Regenerate man pages + shell completions from the clap CLI. Rendering lives in
 ## crates/terra/examples/gen-docs.rs so clap_mangen/clap_complete stay
 ## dev-dependencies, out of the release build's dependency graph.
 man:
-	$(CARGO) run -p terra --example gen-docs
+	$(CARGO) run -p terra --example gen-docs --target $(MUSL)
 
 ## Cross-compile the host binary with cargo-zigbuild. The guest agent and the
-## prebaked images stay x86_64 Linux whatever the host is — they run in the VM.
+## prebaked images are whatever $(ARCH) built them for and are NOT rebuilt here —
+## a cross-built binary embeds the *building* host's guest set, so it boots a box
+## only where the two archs agree. `aarch64-unknown-linux-musl` is deliberately
+## absent from the list below for that reason: it builds fine (it is a normal
+## `make ARCH=aarch64` target on arm hardware), but cross-building it from x86_64
+## would pair an arm host binary with an x86_64 guest, which cannot boot.
 ##
 ## Only these targets build today; the rest are blocked upstream in libkrun, not
 ## in terra (see README, "Platform support"):
@@ -275,7 +262,6 @@ man:
 ##                           Windows. One target-gate upstream fixes it.
 ##   x86_64-apple-darwin     krun-cpuid needs kvm-bindings; libkrun on macOS is
 ##                           Apple Silicon only.
-##   aarch64-unknown-linux-musl  libkrun calls libc::statx, absent for aarch64-musl.
 ## Linking an Apple target needs the macOS SDK for the Hypervisor framework;
 ## point SDKROOT at one (zig cannot synthesise it). Everything up to the final
 ## link works without it, so `cargo check --target aarch64-apple-darwin` is a

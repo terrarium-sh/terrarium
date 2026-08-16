@@ -7,6 +7,10 @@
 # installed. Paths below are `relative = true` → resolved against this file's
 # parent (the repo root), matching the Makefile's `$(abspath ...)`.
 
+# Only the default for a bare `cargo build` and for rust-analyzer; cargo has no
+# way to make it conditional. `make` passes `--target $(MUSL)` explicitly on
+# every invocation, so building on an aarch64 host is `make`, not bare cargo —
+# which here would cross-compile for x86_64 and then fail to run what it built.
 [build]
 target = "x86_64-unknown-linux-musl"
 
