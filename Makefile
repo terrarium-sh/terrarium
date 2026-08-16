@@ -182,6 +182,14 @@ $(RESIZE2FS): $(MKE2FS)
 ## Prebaked guest root filesystem, gzipped into the binary. Built root-owned via
 ## a user namespace, with a pinned 4 KiB block size (mke2fs would otherwise pick
 ## 1 KiB for an image this small, and the block size cannot change on resize).
+##
+## If `unshare` here dies with "write failed /proc/self/uid_map: Operation not
+## permitted", the host restricts unprivileged user namespaces: Ubuntu 24.04 and
+## derivatives ship kernel.apparmor_restrict_unprivileged_userns=1, which lets
+## the namespace be created but leaves no capabilities in it. `sudo sysctl -w
+## kernel.apparmor_restrict_unprivileged_userns=0` is the fix; CI does the same.
+## fakeroot is not an alternative — $(MKE2FS) is static, so there is no dynamic
+## linker for its LD_PRELOAD to hook.
 $(ROOTFS_IMG): $(MKE2FS) $(PIN_STAMP)
 	mkdir -p $(ROOTFS_TREE)
 	curl -fsSL $(ALPINE_URL) -o $(BUILD)/alpine-minirootfs.tar.gz

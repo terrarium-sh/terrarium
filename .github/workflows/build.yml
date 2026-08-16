@@ -44,6 +44,24 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             flex bison bc libelf-dev libssl-dev python3-pyelftools
+      # `mke2fs -d` bakes the rootfs and boot images root-owned inside a user
+      # namespace (see the Makefile), so the build needs to be able to map root
+      # in one. Ubuntu 24.04 — both runner images — ships
+      # kernel.apparmor_restrict_unprivileged_userns=1, which lets the namespace
+      # be created but strips the capabilities inside it, so the uid_map write
+      # fails with EPERM instead of unshare failing outright. Runners are
+      # throwaway VMs, so just turn it off; the guard keeps this working on an
+      # image that has no such knob.
+      #
+      # `unshare -U -r true` is the point of the step, not a formality: without
+      # it the first thing to need a namespace is the rootfs bake, ~20 minutes
+      # of kernel build later.
+      - name: Allow unprivileged user namespaces
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          unshare -U -r true
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: . -> target

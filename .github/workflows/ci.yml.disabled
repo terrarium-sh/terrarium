@@ -41,6 +41,16 @@ jobs:
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.15.1
+      # `mke2fs -d` bakes the guest images root-owned inside a user namespace,
+      # and Ubuntu 24.04 restricts unprivileged ones via AppArmor — the namespace
+      # is created but has no capabilities in it, so the uid_map write EPERMs.
+      # See the same step in build.yml.
+      - name: Allow unprivileged user namespaces
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          unshare -U -r true
       - name: Guest image inputs
         id: guest
         run: >-
