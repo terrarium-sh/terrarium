@@ -40,13 +40,11 @@ pub struct Recipe {
     pub text: String,
 }
 
-/// Where the recipe a target resolves to comes from. One variant per origin.
+/// Where the recipe a target resolves to comes from.
 #[derive(Debug)]
 pub enum Source {
     Pinned,
     File(Recipe),
-    /// The manifest chose it, which puts the manifest's own authorship in
-    /// question too (see [`crate::cmd::setup`]).
     Manifest(Recipe),
 }
 
@@ -67,9 +65,7 @@ impl ResolvedBox {
         Ok(cfg)
     }
 
-    /// The same read with the `env_file:` merge left to the caller - `terra
-    /// show` reports a dotenv it cannot read instead of refusing to print the
-    /// recipe that names it.
+    /// The same read with the `env_file:` merge left to the caller.
     pub(crate) fn parsed_recipe_without_env_file(&self) -> Result<config::Config> {
         match &self.source {
             Source::Pinned => config::load_path(&self.bx.recipe(), self.bx.project_dir()),
@@ -85,15 +81,11 @@ pub fn resolve_pinned_box(project_dir: &Path, name: Option<&str>) -> Result<BoxR
     resolve_box(project_dir, name, true)
 }
 
-/// The box `name`, set up or not. e.g. `terra rm` needs this: a setup that died
-/// after taking the lock left state to remove, but no pinned recipe.
+/// The box `name`, set up or not.
 pub fn resolve_any_box(project_dir: &Path, name: Option<&str>) -> Result<BoxRef> {
     resolve_box(project_dir, name, false)
 }
 
-/// The box, resolved from the name alone: the verbs that operate on it read no
-/// recipe, so there is no cwd to resolve one against. Only the box comes back -
-/// the recipe [`Source`] is dropped.
 fn resolve_box(project_dir: &Path, name: Option<&str>, must_exist: bool) -> Result<BoxRef> {
     Ok(resolve(name, project_dir, Purpose::Operate { must_exist })?.bx)
 }
@@ -102,15 +94,15 @@ fn resolve_box(project_dir: &Path, name: Option<&str>, must_exist: bool) -> Resu
 enum Purpose<'a> {
     Setup { cwd: &'a Path },
     Show { cwd: &'a Path },
-    Boot,
+    Boot { cwd: &'a Path },
     Operate { must_exist: bool },
 }
 
 impl<'a> Purpose<'a> {
     fn cwd(self) -> Option<&'a Path> {
         match self {
-            Purpose::Setup { cwd } | Purpose::Show { cwd } => Some(cwd),
-            Purpose::Boot | Purpose::Operate { .. } => None,
+            Purpose::Setup { cwd } | Purpose::Show { cwd } | Purpose::Boot { cwd } => Some(cwd),
+            Purpose::Operate { .. } => None,
         }
     }
 }
@@ -137,10 +129,11 @@ pub fn resolve_for_show(arg: Option<&str>, project_dir: &Path, cwd: &Path) -> Re
     resolve(arg, project_dir, Purpose::Show { cwd })
 }
 
-/// A BOX argument read for a boot: the recipe the box already pinned. Names
-/// only - a typed path is refused - and a missing recipe reads as "no box".
-pub fn resolve_for_boot(arg: Option<&str>, project_dir: &Path) -> Result<ResolvedBox> {
-    resolve(arg, project_dir, Purpose::Boot)
+/// A BOX argument read for a boot: the recipe the box already pinned, or - for
+/// a box not set up yet - the one the manifest or a typed path names. A missing
+/// recipe reads as "no box".
+pub fn resolve_for_boot(arg: Option<&str>, project_dir: &Path, cwd: &Path) -> Result<ResolvedBox> {
+    resolve(arg, project_dir, Purpose::Boot { cwd })
 }
 
 /// The one resolution: a BOX argument, and which [`Purpose`] reads it, become
@@ -148,7 +141,7 @@ pub fn resolve_for_boot(arg: Option<&str>, project_dir: &Path) -> Result<Resolve
 fn resolve(arg: Option<&str>, project_dir: &Path, purpose: Purpose) -> Result<ResolvedBox> {
     let manifest = match purpose {
         Purpose::Setup { .. } => config::load_manifest(project_dir)?,
-        Purpose::Show { .. } | Purpose::Boot | Purpose::Operate { .. } => {
+        Purpose::Show { .. } | Purpose::Boot { .. } | Purpose::Operate { .. } => {
             config::load_manifest_or_warn(project_dir)
         }
     };
@@ -181,8 +174,7 @@ fn resolve(arg: Option<&str>, project_dir: &Path, purpose: Purpose) -> Result<Re
     })
 }
 
-/// The manifest's recipe path, when it differs from the box's pin - what the
-/// next `terra setup` pins instead of the recipe `terra show` prints.
+/// The manifest's recipe path, when it differs from the box's pin.
 fn manifest_divergence(
     bx: &BoxRef,
     purpose: Purpose,
@@ -191,12 +183,10 @@ fn manifest_divergence(
 ) -> Option<PathBuf> {
     match purpose {
         Purpose::Show { .. } => {}
-        // `setup` re-pins rather than reporting, and the rest read no recipe.
-        Purpose::Setup { .. } | Purpose::Boot | Purpose::Operate { .. } => return None,
+        Purpose::Setup { .. } | Purpose::Boot { .. } | Purpose::Operate { .. } => return None,
     }
     match source {
         Source::Pinned => {}
-        // Nothing to diverge from: the manifest or a typed path chose this one.
         Source::File(_) | Source::Manifest(_) => return None,
     }
     let reference = manifest?.boxes.get(bx.name())?;
@@ -216,26 +206,23 @@ fn source_for_name(
     let pinned = bx.recipe().exists();
 
     match purpose {
-        // Operating on a box reads no recipe.
         Purpose::Operate { must_exist } => {
             if must_exist && !pinned {
                 return Err(no_such_box(project_dir, Some(name), manifest));
             }
             Ok(Source::Pinned)
         }
-        // Setup consults the manifest even for a pinned box: it decides
-        // whether the pin should change.
         Purpose::Setup { .. } => {
             chosen_recipe(bx, manifest, pinned)?.ok_or_else(|| nothing_to_run(bx, manifest))
         }
-        Purpose::Show { .. } | Purpose::Boot => {
+        Purpose::Show { .. } | Purpose::Boot { .. } => {
             if pinned {
                 return Ok(Source::Pinned);
             }
             chosen_recipe(bx, manifest, pinned)?.ok_or_else(|| {
                 let missing = nothing_to_run(bx, manifest);
                 match purpose {
-                    Purpose::Boot => {
+                    Purpose::Boot { .. } => {
                         missing.context(no_such_box(project_dir, Some(name), manifest).to_string())
                     }
                     _ => missing,
@@ -344,14 +331,10 @@ pub(crate) fn read_recipe(reference: &str, source_dir: &Path) -> Result<Option<R
     Ok(Some(Recipe { from: path, text }))
 }
 
-/// The one error for a recipe that is not there. A path names the file that
-/// was looked for - and the entry that pointed at it, when a manifest entry
-/// did; a bare word is answered with the fix: the path spelling.
+/// The one error for a recipe that is not there.
 #[must_use]
 pub(crate) fn no_such_recipe(arg: &str, reference: &str, source_dir: &Path) -> anyhow::Error {
     if !is_path(reference) {
-        // `load_manifest` refuses a non-path reference, so this is a bare
-        // argument naming a box that was never set up.
         return anyhow!(
             "no recipe for '{arg}': a bare word names a box, and a recipe file is \
              named by path\n(`terra ./{arg}.yaml setup`, or a {MANIFEST_FILE} entry)"
@@ -537,24 +520,22 @@ mod tests {
     }
 
     /// Which resolutions read a recipe path typed on the command line, and
-    /// which refuse one. The bare form takes names only, and the fix is spelled
-    /// out rather than the file being read by a command that never pins one -
-    /// while `show`, which does read one, is the half that would go unnoticed if
-    /// the two ever stopped being told apart.
+    /// which refuse one. The split is whether the verb can *run* a recipe:
+    /// `setup` pins one, `show` prints one, and a boot offers to pin one before
+    /// it runs - so all three read the file. The verbs that operate on an
+    /// existing box read no recipe at all, and for them the fix is spelled out
+    /// rather than the path being quietly taken for a name.
     #[test]
     fn a_recipe_path_is_read_only_where_there_is_a_shell_directory_for_it() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("ci.yaml"), "hw:\n  cpus: 1\n").unwrap();
-        let e = resolve_for_boot(Some("./ci.yaml"), dir.path()).unwrap_err();
-        let msg = format!("{e:#}");
-        assert!(msg.contains("terra ./ci.yaml setup"), "{msg}");
 
-        // …and so do the box-name verbs (`exec`, `stop`, `rm`, `logs`).
+        // The box-name verbs (`exec`, `stop`, `rm`, `logs`) refuse it.
         let e = resolve_box(dir.path(), Some("./ci.yaml"), true).unwrap_err();
         assert!(format!("{e:#}").contains("box name"), "{e:#}");
 
-        // The two that carry the shell's directory read the file it names.
-        for read in [resolve_for_setup, resolve_for_show] {
+        // The three that carry the shell's directory read the file it names.
+        for read in [resolve_for_setup, resolve_for_show, resolve_for_boot] {
             let t = read(Some("./ci.yaml"), dir.path(), dir.path()).unwrap();
             let Source::File(r) = &t.source else {
                 panic!("a typed path is the recipe, whatever the box has pinned")
@@ -612,7 +593,7 @@ mod tests {
         .unwrap();
         let chain = format!(
             "{:#}",
-            resolve_for_boot(Some("dev"), dir.path()).unwrap_err()
+            resolve_for_boot(Some("dev"), dir.path(), dir.path()).unwrap_err()
         );
         assert!(chain.contains("no box 'dev'"), "{chain}");
         assert!(chain.contains("never been set up"), "{chain}");
@@ -669,7 +650,7 @@ mod tests {
             None
         );
         assert_eq!(
-            resolve_for_boot(Some("dev"), dir.path())
+            resolve_for_boot(Some("dev"), dir.path(), dir.path())
                 .unwrap()
                 .manifest_divergence,
             None
@@ -711,7 +692,7 @@ mod tests {
         );
 
         // …and a boot, which runs the pinned recipe the manifest has no say in.
-        let started = resolve_for_boot(Some("dev"), dir.path()).unwrap();
+        let started = resolve_for_boot(Some("dev"), dir.path(), dir.path()).unwrap();
         assert!(matches!(started.source, Source::Pinned));
 
         // `setup` refuses, naming the file to fix.
@@ -745,7 +726,7 @@ mod tests {
         }
         let chain = format!(
             "{:#}",
-            resolve_for_boot(Some("dev"), dir.path()).unwrap_err()
+            resolve_for_boot(Some("dev"), dir.path(), dir.path()).unwrap_err()
         );
         assert!(chain.contains("reading"), "{chain}");
         assert!(

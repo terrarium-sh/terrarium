@@ -55,7 +55,7 @@ pub fn run() -> Result<ExitCode> {
     // so it is read here rather than eight times over.
     let name = cli.name.as_deref();
     match &cli.cmd {
-        None => cmd::start::run(name, &cli.boot, &project_dir, at_a_terminal),
+        None => cmd::start::run(name, &cli.boot, &project_dir, &cwd, at_a_terminal),
         Some(Cmd::Setup(a)) => cmd::setup::run(a, name, &project_dir, &cwd, at_a_terminal),
         Some(Cmd::Exec(a)) => cmd::exec::run(a, name, &project_dir, at_a_terminal),
         Some(Cmd::Put(a)) => cmd::put_get::run(a, Direction::IntoBox, name, &project_dir),

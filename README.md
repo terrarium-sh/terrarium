@@ -14,12 +14,12 @@ binary.
 ## Quickstart
 
 ```sh
-git clone https://github.com/alis-is/terrarium
-cd terrarium
-git submodule update --init      # not --recursive: see vendor/README.md
-make dist                        # -> dist/terra, one fully-static binary
-sudo install -m0755 dist/terra /usr/local/bin/terra
+curl -fsSL https://raw.githubusercontent.com/alis-is/terrarium/main/install.sh | sh
 ```
+
+Installs the latest release: `/usr/local/bin/terra` on Linux,
+`/opt/homebrew/bin` (or `/usr/local/bin`) on macOS. Prefer building from
+source? [README.dev.md](README.dev.md).
 
 Then sandbox a project:
 

@@ -42,22 +42,6 @@ pub fn validate_box_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Reduce arbitrary text to the name alphabet.
-///
-/// Note: not a validator - the result can still be empty or start with `.`.
-pub(crate) fn to_name_alphabet(text: &str) -> String {
-    text.chars()
-        .take(32)
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

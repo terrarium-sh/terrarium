@@ -2,6 +2,7 @@
 //! lock.
 
 use anyhow::{Context, Result, anyhow, bail};
+use sha2::{Digest as _, Sha256};
 use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -142,11 +143,6 @@ impl BoxRef {
         self.dir.join(RECIPE_FILE)
     }
 
-    /// The box's lock and what holds it, in one file: `<pid>`, or `<pid> bake`
-    /// while an `on_create` bake has it (see [`BAKE_MARK`]); either half can be
-    /// missing. The lock lives on this inode, and the file is truncated but
-    /// never unlinked while the box has state - a fresh file beside a live lock
-    /// would let a second terra lock it and boot over this box.
     pub fn pid_file(&self) -> PathBuf {
         self.dir.join(PID_FILE)
     }
@@ -192,9 +188,8 @@ impl BoxRef {
             .filter(|pid| *pid > 0)
     }
 
-    /// Truncating, never unlinking (see [`Self::pid_file`]) - a failed write
-    /// is worth a warning: `terra stop` finds this VM by the pid published
-    /// here.
+    /// A failed write is worth a warning: `terra stop` finds this VM by the pid
+    /// published here.
     pub fn publish_pid(&self, pid: u32, baking: bool) {
         let line = if baking {
             format!("{pid} {BAKE_MARK}")
@@ -310,7 +305,6 @@ impl Drop for BakeMark<'_> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Holder {
     Free,
-    /// An `on_create` bake: a VM with no agent port.
     SettingUp,
     Running,
 }
@@ -429,9 +423,6 @@ pub fn ensure_terra_home() -> Result<PathBuf> {
     )
 }
 
-/// Each is secured in its own right rather than by whatever directory
-/// [`SETTINGS_FILE`] pointed it into - an external disk is commonly mounted
-/// world-readable.
 pub fn ensure_box_home() -> Result<PathBuf> {
     ensure_terra_home()?;
     ensure_owner_only_dir(
@@ -474,23 +465,37 @@ pub fn existing_names(project_dir: &Path) -> Vec<String> {
     names
 }
 
-/// Canonicalized, so a symlinked spelling addresses the same box. FNV-1a
-/// written by hand rather than `DefaultHasher`, whose algorithm std may
-/// change between releases - which would orphan every box on the machine.
+/// Crockford's base32 alphabet, lowercased.
+const SLUG_ALPHABET: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
+
+const SLUG_BYTES: usize = 10;
+const _: () = assert!(
+    SLUG_BYTES.is_multiple_of(5) && SLUG_BYTES <= 32,
+    "SLUG_BYTES must be a multiple of 5 (so base32 needs no padding) and fit a sha256 digest"
+);
+
+/// The algorithm must never change - it *is* every box's address, and changing
+/// it would orphan them all. Truncated to 80 bits, accidental collisions are
+/// very unlikely (2^40 birthday) and landing on a *chosen* path would take
+/// ~2^80 work, which is what sha256 buys over a fast non-cryptographic hash.
 fn slug(project_dir: &Path) -> String {
     let real = std::fs::canonicalize(project_dir).unwrap_or_else(|_| project_dir.to_path_buf());
-    let text = real.to_string_lossy();
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in text.as_bytes() {
-        hash ^= u64::from(*b);
-        hash = hash.wrapping_mul(0x100_0000_01b3);
+    let digest = Sha256::digest(real.to_string_lossy().as_bytes());
+
+    let mut out = String::with_capacity(2 + SLUG_BYTES * 8 / 5);
+    out.push_str("t-");
+    // `acc` holds at most 12 bits (four left over, plus the byte just read),
+    // so a u16 cannot overflow.
+    let (mut acc, mut bits) = (0u16, 0u32);
+    for byte in &digest[..SLUG_BYTES] {
+        acc = (acc << 8) | u16::from(*byte);
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            out.push(SLUG_ALPHABET[usize::from((acc >> bits) & 0x1f)] as char);
+        }
     }
-    let mut name =
-        crate::name::to_name_alphabet(&real.file_name().unwrap_or_default().to_string_lossy());
-    if name.trim_matches(['.', '_', '-']).is_empty() {
-        name = "box".to_string();
-    }
-    format!("{name}-{hash:016x}")
+    out
 }
 
 pub fn read_origin(project: &Path) -> Option<PathBuf> {
@@ -586,6 +591,29 @@ mod tests {
         );
     }
 
+    /// The base32 encoding is written here, so pin it against a digest taken
+    /// from somewhere else rather than against itself. `/tmp` is canonical on
+    /// every host this runs on, so `slug` hashes exactly that string:
+    ///
+    /// ```text
+    /// $ printf /tmp | sha256sum | cut -c1-20
+    /// e9671acd244849c57167
+    /// ```
+    ///
+    /// which is the 10 bytes the slug encodes, five bits at a time.
+    #[test]
+    fn the_slug_is_base32_of_the_first_digest_bytes() {
+        let s = slug(Path::new("/tmp"));
+        assert_eq!(s, "t-x5khnk94914wawb7");
+
+        let body = s.strip_prefix("t-").expect("every slug is prefixed");
+        assert_eq!(body.len(), SLUG_BYTES * 8 / 5, "no padding, exact fit");
+        assert!(
+            body.bytes().all(|c| SLUG_ALPHABET.contains(&c)),
+            "a slug is one case and has no look-alike letters: {s}"
+        );
+    }
+
     #[test]
     fn box_state_lives_in_the_home_layout() {
         let home = TestHome::new();
@@ -599,15 +627,23 @@ mod tests {
         );
         assert_eq!(b.dir().file_name().unwrap(), "dev");
         let project = b.dir().parent().unwrap();
-        assert!(
-            project
-                .file_name()
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .starts_with("fresh-"),
-            "{}",
-            b.dir().display()
+        let slug = project.file_name().unwrap().to_str().unwrap();
+        assert!(slug.starts_with("t-"), "{}", b.dir().display());
+        assert_eq!(
+            slug.len(),
+            18,
+            "the slug is `t-` and 16 base32 characters: {slug}"
+        );
+
+        // The prefix is a constant, so the hash is the only thing telling two
+        // projects apart - a slug that stopped varying would put every project
+        // on the machine in one directory.
+        let other = dir.path().join("second");
+        std::fs::create_dir(&other).unwrap();
+        assert_ne!(
+            bx(&other).dir().parent().unwrap(),
+            project,
+            "two project directories must not share a slug"
         );
         assert_eq!(bx(&project_dir).dir(), project.join("dev"));
         // Resolution created nothing: listing commands resolve boxes they never build.
@@ -833,8 +869,10 @@ mod tests {
         assert_eq!(b.volume_img("data"), b.dir().join("vol-data.img"));
     }
 
-    /// Socket paths spend from `sun_path`'s 107 bytes; the slug is fixed-length
-    /// whatever the project's depth, so depth never lengthens a socket path.
+    /// Socket paths spend from `sun_path`'s 107 bytes; the slug is a fixed 18,
+    /// so neither the project's depth nor the length of its directory name
+    /// lengthens a socket path. The long-named case is the one that used to
+    /// cost - the directory name was part of the slug.
     #[test]
     fn socket_paths_are_bounded_and_same_length() {
         let _home = TestHome::new();
@@ -853,6 +891,17 @@ mod tests {
             b.control_sock().as_os_str().len() < 108,
             "a socket path must fit sun_path: {}",
             b.control_sock().display()
+        );
+
+        // The case the old slug paid for: the directory's *name* was part of
+        // it, so this box's sockets were ~30 bytes longer than the shallow
+        // one's for no reason but its label.
+        let long_name = dir.path().join("a-project-directory-with-a-very-long-name");
+        std::fs::create_dir_all(&long_name).unwrap();
+        assert_eq!(
+            bx(&long_name).control_sock().as_os_str().len(),
+            bx(&shallow).control_sock().as_os_str().len(),
+            "a project's directory name must not lengthen its socket paths"
         );
 
         // Checking one socket covers both only while their names are the

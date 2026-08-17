@@ -72,14 +72,17 @@ fn boot_mode(args: &BootArgs, at_a_terminal: bool) -> Result<BootMode> {
     }
 }
 
-/// `terra [BOX]` - boot a box that is already set up, or join it if it is up.
+/// `terra [BOX]` - boot a box, or join it if it is up. A box that is not set up
+/// yet is offered one first, from the recipe the manifest names for it or from
+/// a recipe path given here; `cwd` is what that path resolves against.
 pub fn run(
     name: Option<&str>,
     args: &BootArgs,
     project_dir: &Path,
+    cwd: &Path,
     at_a_terminal: bool,
 ) -> Result<ExitCode> {
-    let target = resolve::resolve_for_boot(name, project_dir)?;
+    let target = resolve::resolve_for_boot(name, project_dir, cwd)?;
 
     match plan(&target.bx, args, at_a_terminal)? {
         // One line for both: a script tells them apart by the exit code, not
