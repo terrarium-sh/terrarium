@@ -26,11 +26,13 @@ use std::process::ExitCode;
 
 /// A guest's or a child's exit status as the byte a process leaves with; wait
 /// statuses are already 0-255, so anything else means we never got one.
+#[must_use]
 pub(crate) fn exit_status_byte(code: i32) -> u8 {
     u8::try_from(code).unwrap_or(1)
 }
 
 /// A guest's or a child's exit status as this process's own.
+#[must_use]
 pub(crate) fn exit_code(code: i32) -> ExitCode {
     ExitCode::from(exit_status_byte(code))
 }

@@ -21,6 +21,7 @@ fn owned() -> MutexGuard<'static, BTreeSet<libc::pid_t>> {
 
 /// A pid as `waitpid` spells one. Every real pid fits; `-1` would mean "any
 /// child", so a value that does not fit becomes a pid that matches nothing.
+#[must_use]
 fn as_pid(pid: u32) -> libc::pid_t {
     libc::pid_t::try_from(pid).unwrap_or(libc::pid_t::MAX)
 }

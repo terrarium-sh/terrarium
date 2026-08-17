@@ -28,6 +28,7 @@ pub fn run(
     Ok(ExitCode::SUCCESS)
 }
 
+#[must_use]
 fn images_of(bx: &BoxRef) -> Vec<PathBuf> {
     let mut volumes = bx.volume_images();
     volumes.sort();
@@ -94,6 +95,7 @@ fn show(bx: &BoxRef) -> Result<()> {
 
 /// Bytes as MiB with one decimal - integer arithmetic, so no size is rounded
 /// by the float that printed it.
+#[must_use]
 fn mib(bytes: u64) -> String {
     const MIB: u64 = 1024 * 1024;
     format!("{}.{} MiB", bytes / MIB, (bytes % MIB) * 10 / MIB)

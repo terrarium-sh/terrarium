@@ -29,6 +29,7 @@ pub const DETACH_KEY: u8 = 0x1C;
 
 const SHELL_SIGPIPE_STATUS: i32 = 128 + libc::SIGPIPE;
 
+#[must_use]
 pub fn detach_key_name() -> String {
     format!("Ctrl-{}", (DETACH_KEY | 0x40) as char)
 }

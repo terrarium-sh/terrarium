@@ -71,10 +71,12 @@ impl BoxRef {
         &self.dir
     }
 
+    #[must_use]
     pub fn control_sock(&self) -> PathBuf {
         self.dir.join("c")
     }
 
+    #[must_use]
     pub fn agent_sock(&self) -> PathBuf {
         self.dir.join("a")
     }
@@ -96,16 +98,19 @@ impl BoxRef {
         Ok(())
     }
 
+    #[must_use]
     pub fn rootfs_img(&self) -> PathBuf {
         self.dir.join(ROOTFS_FILE)
     }
 
+    #[must_use]
     pub fn volume_img(&self, name: &str) -> PathBuf {
         self.dir
             .join(format!("{VOLUME_PREFIX}{name}{VOLUME_SUFFIX}"))
     }
 
     /// Every volume image the box has, whatever its recipe names.
+    #[must_use]
     pub fn volume_images(&self) -> Vec<PathBuf> {
         crate::sys::dir_entries(&self.dir)
             .map(|entry| entry.path())
@@ -117,6 +122,7 @@ impl BoxRef {
             .collect()
     }
 
+    #[must_use]
     pub fn unused_volume_images(&self, configured: &[String]) -> Vec<PathBuf> {
         let keep: Vec<PathBuf> = configured.iter().map(|n| self.volume_img(n)).collect();
         self.volume_images()

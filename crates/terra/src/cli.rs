@@ -36,6 +36,7 @@ pub struct Cli {
 }
 
 impl Cli {
+    #[must_use]
     fn has_boot_flags(&self) -> bool {
         let BootArgs {
             root,
@@ -154,6 +155,7 @@ pub enum Cmd {
 
 impl Cmd {
     /// Whether `terra <box> <verb>` means anything for this verb.
+    #[must_use]
     fn takes_the_box(&self) -> bool {
         match self {
             Cmd::Setup(_)

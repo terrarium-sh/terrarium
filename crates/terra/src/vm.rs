@@ -213,6 +213,7 @@ fn redirect_stdio_into_log(bx: &BoxRef) -> Result<()> {
 
 /// What the agent writes to `/terra/README.md`, so an AI agent looking
 /// around the box finds an explanation instead of guessing.
+#[must_use]
 fn generate_sandbox_info(cfg: &config::Config, net: &GuestNetworkConfig, root: bool) -> String {
     let yaml = config_yaml(cfg, Options::REDACTED).unwrap_or_default();
     let who = if root {

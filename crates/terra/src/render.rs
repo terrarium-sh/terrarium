@@ -13,6 +13,7 @@ const KEPT_AS_TYPED: [char; 3] = ['\'', '"', '\\'];
 /// Control characters - and the format codepoints that reorder what they sit
 /// in - come out as an escape; ordinary text, non-ASCII included, is
 /// untouched.
+#[must_use]
 pub fn printable(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -53,6 +54,7 @@ pub fn config_yaml(cfg: &config::Config, options: Options) -> Result<String, ser
     serde_yaml::to_string(&printable)
 }
 
+#[must_use]
 pub fn printable_path(path: &Path) -> String {
     printable(&path.to_string_lossy())
 }
@@ -60,6 +62,7 @@ pub fn printable_path(path: &Path) -> String {
 /// Quoted where the shell would split or read it. Single quotes, which are
 /// literal in every POSIX shell; an embedded one leaves the quoting, escapes
 /// itself and re-enters.
+#[must_use]
 pub(crate) fn shell_word(text: &str) -> String {
     let bare = |c: char| c.is_ascii_alphanumeric() || "._-/=:+@,".contains(c);
     if !text.is_empty() && text.chars().all(bare) {
@@ -68,6 +71,7 @@ pub(crate) fn shell_word(text: &str) -> String {
     format!("'{}'", text.replace('\'', r"'\''"))
 }
 
+#[must_use]
 fn mount_line(m: &config::Mount) -> String {
     let mode = if m.readonly { "ro" } else { "rw" };
     format!(
@@ -78,6 +82,7 @@ fn mount_line(m: &config::Mount) -> String {
 }
 
 /// The workload as one command line - for a screen, never for exec.
+#[must_use]
 pub fn workload_line(cfg: &config::Config) -> String {
     let mut line = printable_path(&cfg.workload.entrypoint);
     for a in &cfg.workload.args {
@@ -89,6 +94,7 @@ pub fn workload_line(cfg: &config::Config) -> String {
 
 /// The host directories a sandbox can see, one line each; "none" is said out
 /// loud because silence would be ambiguous.
+#[must_use]
 pub fn mount_lines(cfg: &config::Config) -> Vec<String> {
     if cfg.mounts.is_empty() {
         vec!["terra: mounts: none (no host filesystem in the sandbox)".to_string()]
@@ -100,6 +106,7 @@ pub fn mount_lines(cfg: &config::Config) -> Vec<String> {
     }
 }
 
+#[must_use]
 pub fn policy_summary(cfg: &config::Config) -> String {
     use std::fmt::Write as _;
     // Exhaustive destructures: a new recipe field fails to compile here until

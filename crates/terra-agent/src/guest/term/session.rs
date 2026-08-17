@@ -126,6 +126,7 @@ impl Session {
     /// The sink is handed to a thread of its own and written to only from there.
     /// Taking it by value rather than behind an `Arc<Mutex<…>>` is what makes
     /// that true by construction: nothing else has a reference to write through.
+    #[must_use]
     pub fn attach(&self, sink: impl ClientSink + 'static) -> u64 {
         let mut inner = lock(&self.inner);
         let (out, rx) = std::sync::mpsc::sync_channel::<Chunk>(OUTBOX);
@@ -191,6 +192,7 @@ impl Session {
     }
 
     #[cfg(test)]
+    #[must_use]
     fn client_count(&self) -> usize {
         lock(&self.inner).clients.len()
     }
@@ -290,8 +292,8 @@ mod tests {
         let session = Session::new(input);
 
         let (a, b) = (Recorder::new(), Recorder::new());
-        session.attach(a.clone());
-        session.attach(b.clone());
+        let _ = session.attach(a.clone());
+        let _ = session.attach(b.clone());
         assert_eq!(session.client_count(), 2);
 
         session.feed_output(b"hello");
@@ -309,7 +311,7 @@ mod tests {
         session.feed_output(b"important TUI state");
 
         let late = Recorder::new();
-        session.attach(late.clone());
+        let _ = session.attach(late.clone());
         late.wait_for(|got| {
             got.windows(b"important TUI state".len())
                 .any(|w| w == b"important TUI state")
@@ -351,8 +353,8 @@ mod tests {
         let (input, _) = input_sink();
         let session = Session::new(input);
         let (a, b) = (Recorder::new(), Recorder::new());
-        session.attach(a.clone());
-        session.attach(b.clone());
+        let _ = session.attach(a.clone());
+        let _ = session.attach(b.clone());
 
         session.feed_output(b"the last line\n");
         assert_eq!(a.exit_status(), None, "nothing has ended yet");
@@ -387,7 +389,7 @@ mod tests {
 
         let (input, _) = input_sink();
         let session = Session::new(input);
-        session.attach(NeverReturns);
+        let _ = session.attach(NeverReturns);
         session.feed_output(b"parks the writer thread");
 
         let start = Instant::now();
@@ -415,7 +417,7 @@ mod tests {
     fn dead_clients_are_dropped_on_broadcast() {
         let (input, _) = input_sink();
         let session = Session::new(input);
-        session.attach(Broken);
+        let _ = session.attach(Broken);
         assert_eq!(session.client_count(), 1);
         // One broadcast more than before: the write fails on the client's own
         // thread now, so the session learns about it from the closed outbox.
@@ -457,9 +459,9 @@ mod tests {
 
         let (input, _) = input_sink();
         let session = Session::new(input);
-        session.attach(Stalled);
+        let _ = session.attach(Stalled);
         let healthy = Recorder::new();
-        session.attach(healthy.clone());
+        let _ = session.attach(healthy.clone());
 
         // Well past the stalled client's outbox, so the old code would be parked
         // in its `write_all` with the session lock held.

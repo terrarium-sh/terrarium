@@ -49,6 +49,7 @@ impl Ending {
     /// Call it last, after everything else has been printed and with nothing
     /// still owed to the disk: the sync here is what makes the host's teardown
     /// safe to race.
+    #[must_use]
     pub fn report(self) -> bool {
         let code = *self.outcome.as_ref().unwrap_or(&AGENT_FAILED);
         // SAFETY: `sync` takes no arguments and cannot fail.

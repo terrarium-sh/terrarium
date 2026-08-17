@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 /// The paths we guard may not exist yet when they're checked, and a symlink
 /// must not sneak a protected path past under a different name. So resolve as
 /// much as the disk actually has, and keep the rest as written.
+#[must_use]
 fn canonicalize_existing_prefix(p: &Path) -> PathBuf {
     let (mut existing, mut rest) = (p.to_path_buf(), PathBuf::new());
     loop {
@@ -111,6 +112,7 @@ pub(crate) fn writable_mount_containing(
 ///
 /// ponytail: only what is pinned *now* counts; closing that fully needs a log
 /// of every share a box ever had. Add it only if mounts start changing often.
+#[must_use]
 pub(crate) fn pinned_recipes_across_boxes(project_dir: &Path) -> Vec<String> {
     state::existing_names(project_dir)
         .iter()

@@ -229,6 +229,7 @@ pub fn parse_recipe(text: &str, project_dir: &Path, source: &Path) -> Result<Con
     Ok(cfg)
 }
 /// The writable shares a recipe declares, read leniently.
+#[must_use]
 pub(crate) fn get_declared_writable_shares(text: &str, project_dir: &Path) -> Vec<PathBuf> {
     #[derive(Deserialize)]
     struct DeclaredMounts {

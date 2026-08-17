@@ -30,6 +30,7 @@ pub use imp::{
 pub const POLL: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// The moment `wait` from now runs out, clamped to ~136 years.
+#[must_use]
 pub(crate) fn deadline_after(wait: std::time::Duration) -> std::time::Instant {
     std::time::Instant::now() + wait.min(std::time::Duration::from_secs(u64::from(u32::MAX)))
 }
@@ -63,6 +64,7 @@ pub fn absolute(p: &Path, cwd: &Path) -> anyhow::Result<PathBuf> {
 
 /// Whether stdin is a terminal. Read once and passed down, so a test can
 /// drive either side without a terminal.
+#[must_use]
 pub fn at_a_terminal() -> bool {
     crossterm::tty::IsTty::is_tty(&std::io::stdin())
 }

@@ -5,6 +5,7 @@ use crate::plan;
 use std::io::Read;
 
 /// Encode a payload as one or more `[tag:u8][len:u32-le][payload]` frames.
+#[must_use]
 fn tagged(tag: u8, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(5 + payload.len());
     let mut frame = |chunk: &[u8]| {

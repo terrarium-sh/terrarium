@@ -22,6 +22,7 @@ const EGRESS_FLOOR: FloorMode = FloorMode::Strict;
 /// real name can collide with it.
 const HOST_LOOPBACK_SYMBOL: &str = "HOST_LOOPBACK";
 
+#[must_use]
 fn host_addrs(net: &GuestNetworkConfig) -> [IpAddr; 2] {
     [IpAddr::V4(net.gateway_ip), IpAddr::V6(net.gateway_ip6)]
 }
@@ -46,6 +47,7 @@ enum Port {
 }
 
 impl Port {
+    #[must_use]
     fn covers(self, port: Option<u16>) -> bool {
         match (self, port) {
             (Port::Any, _) => true,
@@ -201,6 +203,7 @@ impl BoxPolicy {
         })
     }
 
+    #[must_use]
     fn grants_for(&self, name: &str) -> Vec<Port> {
         let Some(name) = dns::normalize_hostname(name) else {
             return Vec::new();
@@ -212,6 +215,7 @@ impl BoxPolicy {
             .collect()
     }
 
+    #[must_use]
     fn is_restricted(&self) -> bool {
         self.mode == NetworkMode::Allowlist
     }
@@ -223,6 +227,7 @@ impl BoxPolicy {
     }
 
     #[cfg(test)]
+    #[must_use]
     fn forwards(&self, name: &str) -> bool {
         matches!(self.dns_for(name), DnsVerdict::Forward { .. })
     }
@@ -263,6 +268,7 @@ impl BoxPolicy {
         }
     }
 
+    #[must_use]
     fn dns_for(&self, name: &str) -> DnsVerdict {
         if let Some(ips) = self.static_answer(name) {
             return DnsVerdict::Answer(ips.to_vec());
@@ -361,6 +367,7 @@ impl Policy for BoxPolicy {
 
 /// Only a full-length prefix counts: a range containing the gateway is a
 /// rule like any other, the exact spelling reads as a grant and is not.
+#[must_use]
 fn is_single_address(cidr: Cidr, ip: IpAddr) -> bool {
     let full_length = match cidr {
         Cidr::V4 { mask, .. } => mask == u32::MAX,
@@ -369,6 +376,7 @@ fn is_single_address(cidr: Cidr, ip: IpAddr) -> bool {
     full_length && cidr.contains(ip)
 }
 
+#[must_use]
 fn name_covers(rule: &str, name: &str) -> bool {
     let Some(parent) = rule.strip_prefix("*.") else {
         return rule == name;

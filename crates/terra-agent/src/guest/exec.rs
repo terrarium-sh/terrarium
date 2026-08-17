@@ -76,6 +76,7 @@ fn exec_abandoned<C: std::io::Write>(conn: &mut C, child: &mut std::process::Chi
 /// The one reading of a child's status: an exec's, and the workload's own
 /// ([`crate::term::mux::run_workload`]), so a box and a command spell a signal death
 /// the same way.
+#[must_use]
 pub(crate) fn exit_code(child: &mut std::process::Child) -> i32 {
     use std::os::unix::process::ExitStatusExt;
     crate::reap::wait_owned(child)

@@ -121,6 +121,7 @@ pub(crate) fn roll_if_full(bx: &BoxRef, cap: u64) -> bool {
     true
 }
 
+#[must_use]
 pub(crate) fn roll_count(bx: &BoxRef) -> u64 {
     std::fs::metadata(bx.log_rolls()).map_or(0, |m| m.len())
 }

@@ -354,12 +354,14 @@ pub(crate) fn no_such_recipe(arg: &str, reference: &str, source_dir: &Path) -> a
     }
 }
 
+#[must_use]
 pub(crate) fn names_recipe_file(arg: &str) -> bool {
     Path::new(arg)
         .extension()
         .is_some_and(|e| e == "yaml" || e == "yml")
 }
 
+#[must_use]
 pub(crate) fn is_path(arg: &str) -> bool {
     arg.starts_with(['.', '/', '~'])
         || arg.contains(std::path::is_separator)

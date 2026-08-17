@@ -252,6 +252,7 @@ fn dispatch(session: &Arc<Session>, mut conn: VsockStream, master_fd: RawFd, roo
 /// Announce the agent to a client that has just connected - [`AGENT_HELLO`],
 /// ahead of whatever the connection serves. `false` means the client is already
 /// gone, which is ordinary: the host drops connections it opened too early.
+#[must_use]
 fn say_hello(conn: &mut VsockStream) -> bool {
     use std::io::Write;
     conn.write_all(&[AGENT_HELLO])
