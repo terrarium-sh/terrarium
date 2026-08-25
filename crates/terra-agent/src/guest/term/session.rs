@@ -28,6 +28,9 @@ pub type Sink = Arc<Mutex<dyn Write + Send>>;
 pub trait ClientSink: Send {
     fn out(&mut self, bytes: &[u8]) -> std::io::Result<()>;
     fn exit(&mut self, code: i32) -> std::io::Result<()>;
+    fn detached(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// The guest console, attached as a client by a `--foreground` boot alone: raw
@@ -48,6 +51,7 @@ impl ClientSink for ConsoleSink {
 enum Chunk {
     Out(Arc<[u8]>),
     Exit(i32),
+    Detached,
 }
 
 pub struct Session {
@@ -121,11 +125,10 @@ impl Session {
     }
 
     /// Attach a client, repainting it with the current screen. Returns an id
-    /// for [`Session::detach`].
+    /// for [`Session::detach_client`].
     ///
-    /// The sink is handed to a thread of its own and written to only from there.
-    /// Taking it by value rather than behind an `Arc<Mutex<…>>` is what makes
-    /// that true by construction: nothing else has a reference to write through.
+    /// The sink is written to only from a thread of its own, which taking it
+    /// by value guarantees by construction.
     #[must_use]
     pub fn attach(&self, sink: impl ClientSink + 'static) -> u64 {
         let mut inner = lock(&self.inner);
@@ -140,6 +143,7 @@ impl Session {
                 let wrote = match chunk {
                     Chunk::Out(bytes) => sink.out(&bytes),
                     Chunk::Exit(code) => sink.exit(code),
+                    Chunk::Detached => sink.detached(),
                 };
                 if wrote.is_err() {
                     break;
@@ -162,12 +166,32 @@ impl Session {
         id
     }
 
-    /// Drop a client. Returns the new shared size for the caller to put on the
-    /// PTY, when the remaining terminals allow a different one.
-    pub fn detach(&self, id: u64) -> Option<(u16, u16)> {
+    pub fn detach_client(&self, id: u64) -> Option<(u16, u16)> {
         let mut inner = lock(&self.inner);
+        if let Some(c) = inner.clients.iter().find(|c| c.id == id) {
+            let _ = c.out.try_send(Chunk::Detached);
+        }
         inner.clients.retain(|c| c.id != id);
         inner.shared_size()
+    }
+
+    pub fn detach_all_clients(&self) -> Option<(u16, u16)> {
+        let mut inner = lock(&self.inner);
+        for c in &inner.clients {
+            let _ = c.out.try_send(Chunk::Detached);
+        }
+        inner.clients.clear();
+        inner.shared_size()
+    }
+
+    /// The attached clients as `(id, size)` pairs, `size` `None` when the
+    /// client reported none - what `terra <box> sessions` shows.
+    pub fn list_clients(&self) -> Vec<(u64, Option<(u16, u16)>)> {
+        lock(&self.inner)
+            .clients
+            .iter()
+            .map(|c| (c.id, c.size))
+            .collect()
     }
 
     /// Record a client's terminal size; returns the new shared size if it
@@ -229,6 +253,74 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// A sink that was told it was detached: what the far end of a
+    /// `terra <box> detach` reads, instead of a bare EOF that would read as
+    /// the box dying.
+    #[derive(Clone)]
+    struct DetachRecorder {
+        seen: Arc<Mutex<Vec<u8>>>,
+        detached: Arc<Mutex<bool>>,
+    }
+
+    impl DetachRecorder {
+        fn new() -> Self {
+            Self {
+                seen: Arc::new(Mutex::new(Vec::new())),
+                detached: Arc::new(Mutex::new(false)),
+            }
+        }
+        fn was_detached(&self) -> bool {
+            *lock(&self.detached)
+        }
+    }
+
+    impl ClientSink for DetachRecorder {
+        fn out(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+            lock(&self.seen).extend_from_slice(bytes);
+            Ok(())
+        }
+        fn exit(&mut self, _code: i32) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn detached(&mut self) -> std::io::Result<()> {
+            *lock(&self.detached) = true;
+            Ok(())
+        }
+    }
+
+    /// A dropped client is owed the news that it was dropped, queued behind
+    /// whatever output it is still owed - the frame is what turns the socket's
+    /// close into a detach on the far end. `detach_client` and `detach_all_clients` both say
+    /// it, and the detach key's own drop does too, which is the one path that
+    /// never reads the frame (that end already knows).
+    #[test]
+    fn a_dropped_client_is_told_it_was_dropped() {
+        let (input, _) = input_sink();
+        let session = Session::new(input);
+        let one = DetachRecorder::new();
+        let two = DetachRecorder::new();
+        let _ = session.attach(one.clone());
+        let _ = session.attach(two.clone());
+
+        session.detach_client(0);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !one.was_detached() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(one.was_detached(), "the detached client was never told");
+        assert!(!two.was_detached(), "the surviving client was told too");
+
+        session.detach_all_clients();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !two.was_detached() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            two.was_detached(),
+            "detach_all_clients never told the client"
+        );
+    }
 
     /// The PTY-side sink, which is still shared: one resource, several client
     /// reader threads writing keystrokes to it, and no fan-out to stall on.
@@ -333,7 +425,7 @@ mod tests {
         // Same report again: nothing changed, nothing to apply.
         assert_eq!(session.set_client_size(ida, 20, 300), None);
         // The constraint leaves with the client.
-        assert_eq!(session.detach(ida), Some((30, 100)));
+        assert_eq!(session.detach_client(ida), Some((30, 100)));
         // The floor holds against an absurd report.
         assert_eq!(
             session.set_client_size(idb, 1, 1),
@@ -341,7 +433,54 @@ mod tests {
         );
         // The last sized client leaving reverts the session to the default -
         // a departed terminal's size must not outlive it.
-        assert_eq!(session.detach(idb), Some((DEFAULT_ROWS, DEFAULT_COLS)));
+        assert_eq!(
+            session.detach_client(idb),
+            Some((DEFAULT_ROWS, DEFAULT_COLS))
+        );
+    }
+
+    /// `terra <box> sessions` shows the client list as it is: ids in attach order,
+    /// the size each client reported, and `None` for one that reported none -
+    /// the shape a stale-size cleanup reads before choosing a victim.
+    #[test]
+    fn list_clients_names_every_client_with_its_size() {
+        let (input, _) = input_sink();
+        let session = Session::new(input);
+        assert_eq!(session.list_clients(), vec![]);
+
+        let sized = session.attach(Recorder::new());
+        let plain = session.attach(Recorder::new());
+        session.set_client_size(sized, 30, 100);
+
+        assert_eq!(
+            session.list_clients(),
+            vec![(sized, Some((30, 100))), (plain, None)]
+        );
+
+        session.detach_client(sized);
+        assert_eq!(session.list_clients(), vec![(plain, None)]);
+    }
+
+    /// `detach --all` takes every client at once, and the size reverts with
+    /// them - the same shared-size answer `detach` gives, so the caller applies
+    /// one mechanism to both. An empty session has nothing to change and says
+    /// so.
+    #[test]
+    fn detach_all_clears_the_clients_and_returns_the_default_size() {
+        let (input, _) = input_sink();
+        let session = Session::new(input);
+        let a = session.attach(Recorder::new());
+        let _b = session.attach(Recorder::new());
+        session.set_client_size(a, 30, 100);
+
+        assert_eq!(
+            session.detach_all_clients(),
+            Some((DEFAULT_ROWS, DEFAULT_COLS))
+        );
+        assert_eq!(session.client_count(), 0);
+        assert_eq!(session.list_clients(), vec![]);
+        // One more is a no-op, not an error: the box was already bare.
+        assert_eq!(session.detach_all_clients(), None);
     }
 
     /// Every attached client is owed the status the workload ended with - that
@@ -466,7 +605,8 @@ mod tests {
         // Well past the stalled client's outbox, so the old code would be parked
         // in its `write_all` with the session lock held.
         let start = std::time::Instant::now();
-        for _ in 0..(OUTBOX * 4) {
+        let ticks = OUTBOX * 4;
+        for _ in 0..ticks {
             session.feed_output(b"tick ");
         }
         assert!(
@@ -474,7 +614,15 @@ mod tests {
             "a stalled client blocked the broadcast for {:?}",
             start.elapsed()
         );
-        healthy.wait_for(|got| got.ends_with(b"tick "));
+        // Every tick must land - a healthy client dropped mid-loop would
+        // still pass an ends-with check, and the count below would fail
+        // without naming why.
+        healthy.wait_for(|got| {
+            got.windows(b"tick ".len())
+                .filter(|w| *w == b"tick ")
+                .count()
+                == ticks
+        });
         assert_eq!(
             session.client_count(),
             1,

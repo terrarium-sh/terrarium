@@ -4,7 +4,8 @@
 use anyhow::{Result, bail};
 
 pub(crate) const RESERVED_NAMES: &[&str] = &[
-    "exec", "get", "help", "logs", "ls", "ps", "put", "rm", "setup", "show", "stop", "storage",
+    "detach", "exec", "get", "help", "logs", "ls", "ps", "put", "rm", "sessions", "setup", "show",
+    "stop", "storage",
 ];
 
 pub(crate) const RESERVED_FOR_FUTURE_VERBS: &[&str] = &[

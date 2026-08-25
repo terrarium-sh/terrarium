@@ -127,6 +127,79 @@ fn wait_while_running(bx: &BoxRef, timeout: Option<u64>) -> impl FnMut() -> Resu
     }
 }
 
+/// One attached client of a box's session, as `terra <box> sessions` shows it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SessionClient {
+    pub id: u64,
+    pub reported_term_size: Option<TermSize>,
+}
+
+fn control_connection(bx: &BoxRef, verb: &str, agent_timeout: Option<u64>) -> Result<UnixStream> {
+    connect_to_running_agent(
+        bx,
+        verb,
+        terra_agent::AgentService::SessionControl,
+        "session control service",
+        agent_timeout,
+    )
+}
+
+pub fn list_clients(bx: &BoxRef, agent_timeout: Option<u64>) -> Result<Vec<SessionClient>> {
+    let mut stream = control_connection(bx, "sessions", agent_timeout)?;
+    (&stream)
+        .write_all(&terra_agent::ControlRequest::List.encode())
+        .context("asking for the session's clients")?;
+    let mut clients = Vec::new();
+    loop {
+        match terra_agent::ControlReply::read(&mut stream) {
+            Ok(Some(terra_agent::ControlReply::Client { id, rows, cols })) => {
+                clients.push(SessionClient {
+                    id,
+                    reported_term_size: (rows > 0 && cols > 0).then_some(TermSize { rows, cols }),
+                });
+            }
+            Ok(Some(terra_agent::ControlReply::Done)) => return Ok(clients),
+            Ok(Some(_)) => anyhow::bail!("the agent answered a listing with a detach reply"),
+            // A stream that ends before `Done` is the box going away.
+            Ok(None) => anyhow::bail!("{bx} stopped before its agent listed the session"),
+            Err(e) => return Err(e).context("reading the session listing"),
+        }
+    }
+}
+
+pub fn detach_client(bx: &BoxRef, client_id: u64, agent_timeout: Option<u64>) -> Result<()> {
+    let mut stream = control_connection(bx, "detach", agent_timeout)?;
+    (&stream)
+        .write_all(&terra_agent::ControlRequest::Detach { id: client_id }.encode())
+        .context("asking to detach a client")?;
+    match terra_agent::ControlReply::read(&mut stream) {
+        Ok(Some(terra_agent::ControlReply::Detached { .. })) => Ok(()),
+        Ok(Some(terra_agent::ControlReply::Missing { .. })) => {
+            anyhow::bail!("no client {client_id} is attached to {bx}")
+        }
+        Ok(Some(_)) => anyhow::bail!("the agent answered a detach with a listing reply"),
+        Ok(None) => anyhow::bail!("{bx} stopped before its agent answered the detach"),
+        Err(e) => Err(e).context("reading the detach reply"),
+    }
+}
+
+pub fn detach_all(bx: &BoxRef, agent_timeout: Option<u64>) -> Result<u64> {
+    let mut stream = control_connection(bx, "detach", agent_timeout)?;
+    (&stream)
+        .write_all(&terra_agent::ControlRequest::DetachAll.encode())
+        .context("asking to detach every client")?;
+    let mut detached = 0;
+    loop {
+        match terra_agent::ControlReply::read(&mut stream) {
+            Ok(Some(terra_agent::ControlReply::Detached { .. })) => detached += 1,
+            Ok(Some(terra_agent::ControlReply::Done)) => return Ok(detached),
+            Ok(Some(_)) => anyhow::bail!("the agent answered a detach with a listing reply"),
+            Ok(None) => anyhow::bail!("{bx} stopped before its agent answered the detach"),
+            Err(e) => return Err(e).context("reading the detach replies"),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum StdinEndAction {
     CloseSocket,
@@ -270,6 +343,9 @@ fn pump_exec_output(
                 }
             }
             Ok(Some(AgentOutput::Exit(code))) => return Ok(code),
+            Ok(Some(AgentOutput::Detached)) => {
+                anyhow::bail!("the box answered an exec with a detach")
+            }
             // A stream that ends without an exit frame means the box died
             // mid-command; success would hide that from scripts checking exit
             // codes.
@@ -306,6 +382,7 @@ fn pump_session_output(mut reader: impl Read, out: &mut impl Write) -> Result<Se
                 }
             }
             Ok(Some(AgentOutput::Exit(code))) => return Ok(SessionOutcome::Exited(code)),
+            Ok(Some(AgentOutput::Detached)) => return Ok(SessionOutcome::Detached),
             Ok(None) => return Ok(SessionOutcome::Closed),
             // An unreadable stream is not a workload that ended: say so rather
             // than hand back a status nobody sent.
@@ -340,6 +417,159 @@ impl Drop for RawTerminal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::net::UnixListener;
+
+    /// A box on disk, held as a running one, with a fake agent bound to its
+    /// socket. The fake speaks just enough of the wire for the host's side to
+    /// be driven: hello, the `SessionControl` byte, the request the host
+    /// actually sends, and the canned replies - so the retry loop, the hello
+    /// check, and the frame parsing all run for real.
+    fn agent_answering(
+        bx: &BoxRef,
+        expected: terra_agent::ControlRequest,
+        replies: Vec<terra_agent::ControlReply>,
+    ) -> (
+        std::fs::File,
+        crate::sys::TestHome,
+        std::thread::JoinHandle<()>,
+    ) {
+        let home = crate::sys::TestHome::new();
+        std::fs::create_dir_all(bx.dir()).unwrap();
+        let lock = bx.lock_run().unwrap();
+        let listener = UnixListener::bind(bx.agent_sock()).unwrap();
+        let agent = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            conn.write_all(&[terra_agent::AGENT_HELLO]).unwrap();
+            let mut service = [0u8; 1];
+            conn.read_exact(&mut service).unwrap();
+            assert_eq!(
+                service[0],
+                terra_agent::AgentService::SessionControl as u8,
+                "the host dialed a different service"
+            );
+            assert_eq!(
+                terra_agent::ControlRequest::read(&mut conn).unwrap(),
+                Some(expected),
+                "the host sent a different request"
+            );
+            for rep in replies {
+                conn.write_all(&rep.encode()).unwrap();
+            }
+            conn.flush().unwrap();
+        });
+        (lock, home, agent)
+    }
+
+    /// `terra <box> sessions` reads the roster the agent sends, and a size of
+    /// 0x0 on the wire is a client that reported none, not a 0-row terminal.
+    #[test]
+    fn list_clients_parses_the_roster_and_keeps_nosize_clients() {
+        let dir = tempfile::tempdir().unwrap();
+        let bx = BoxRef::resolve(dir.path(), "dev").unwrap();
+        let (_lock, _home, agent) = agent_answering(
+            &bx,
+            terra_agent::ControlRequest::List,
+            vec![
+                terra_agent::ControlReply::Client {
+                    id: 0,
+                    rows: 30,
+                    cols: 100,
+                },
+                terra_agent::ControlReply::Client {
+                    id: 1,
+                    rows: 0,
+                    cols: 0,
+                },
+                terra_agent::ControlReply::Done,
+            ],
+        );
+        assert_eq!(
+            list_clients(&bx, None).unwrap(),
+            vec![
+                SessionClient {
+                    id: 0,
+                    reported_term_size: Some(TermSize {
+                        rows: 30,
+                        cols: 100
+                    })
+                },
+                SessionClient {
+                    id: 1,
+                    reported_term_size: None
+                },
+            ]
+        );
+        agent.join().unwrap();
+    }
+
+    /// The guest answers a detach of a client that was never there with
+    /// `Missing`, and the host says so rather than pretending the cleanup
+    /// happened.
+    #[test]
+    fn detach_client_reports_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let bx = BoxRef::resolve(dir.path(), "dev").unwrap();
+        let (_lock, _home, agent) = agent_answering(
+            &bx,
+            terra_agent::ControlRequest::Detach { id: 9 },
+            vec![terra_agent::ControlReply::Missing { id: 9 }],
+        );
+        let err = detach_client(&bx, 9, None).unwrap_err().to_string();
+        assert!(err.contains("no client 9"), "{err}");
+        assert!(err.contains("dev"), "{err}");
+        agent.join().unwrap();
+    }
+
+    /// `detach --all` counts what the guest dropped - the number `terra`
+    /// prints.
+    #[test]
+    fn detach_all_counts_the_detached() {
+        let dir = tempfile::tempdir().unwrap();
+        let bx = BoxRef::resolve(dir.path(), "dev").unwrap();
+        let (_lock, _home, agent) = agent_answering(
+            &bx,
+            terra_agent::ControlRequest::DetachAll,
+            vec![
+                terra_agent::ControlReply::Detached { id: 0 },
+                terra_agent::ControlReply::Detached { id: 1 },
+                terra_agent::ControlReply::Done,
+            ],
+        );
+        assert_eq!(detach_all(&bx, None).unwrap(), 2);
+        agent.join().unwrap();
+    }
+
+    /// An empty session is answered with just `Done` - nothing dropped is
+    /// still an honest answer, not an error.
+    #[test]
+    fn detach_all_on_an_empty_session_counts_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let bx = BoxRef::resolve(dir.path(), "dev").unwrap();
+        let (_lock, _home, agent) = agent_answering(
+            &bx,
+            terra_agent::ControlRequest::DetachAll,
+            vec![terra_agent::ControlReply::Done],
+        );
+        assert_eq!(detach_all(&bx, None).unwrap(), 0);
+        agent.join().unwrap();
+    }
+
+    /// The one answer a stopped box has: the verb names the live agent as the
+    /// thing the box has to be booted for, the same message every agent-bound
+    /// verb gives, so a script sees one spelling of "not running".
+    #[test]
+    fn a_stopped_box_refuses_sessions_and_detach() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::sys::TestHome::new();
+        let bx = BoxRef::resolve(dir.path(), "dev").unwrap();
+        std::fs::create_dir_all(bx.dir()).unwrap();
+
+        let err = list_clients(&bx, None).unwrap_err().to_string();
+        assert!(err.contains("is not running"), "{err}");
+        assert!(err.contains("terra dev -d"), "{err}");
+        assert!(detach_client(&bx, 1, None).is_err());
+        assert!(detach_all(&bx, None).is_err());
+    }
 
     /// A pipe whose reader has gone.
     struct ClosedPipe;
@@ -515,5 +745,34 @@ mod tests {
             pump_session_output(std::io::Cursor::new(truncated), &mut Vec::new()).is_err(),
             "a truncated frame must not read as a clean end"
         );
+    }
+
+    /// `terra <box> detach` drops the client from the agent's side: the frame
+    /// it sends turns the EOF that follows into a detach, so the kicked
+    /// terminal reads "detached, box keeps running" rather than "box died" -
+    /// the same outcome as the detach key, and what lets a script tell the two
+    /// apart. An exec is never detached, so there the frame is a protocol
+    /// error.
+    #[test]
+    fn a_detach_frame_ends_the_session_as_a_detach() {
+        let wire: Vec<u8> = [AgentOutput::Out(b"bye\n".to_vec()), AgentOutput::Detached]
+            .iter()
+            .flat_map(AgentOutput::encode)
+            .collect();
+        let mut shown = Vec::new();
+        let outcome = pump_session_output(std::io::Cursor::new(wire), &mut shown).unwrap();
+        assert_eq!(outcome, SessionOutcome::Detached);
+        assert_eq!(
+            shown, b"bye\n",
+            "the output before the detach must still land"
+        );
+
+        let err = pump_exec_output(
+            std::io::Cursor::new(AgentOutput::Detached.encode()),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("detach"), "{err}");
     }
 }

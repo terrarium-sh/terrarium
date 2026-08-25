@@ -101,6 +101,8 @@ Every key: [docs/recipe.md](docs/recipe.md).
 | `terra [BOX] exec [--root] -- CMD…` | one command inside a running box |
 | `terra [BOX] put/get SRC DST` | copy one file in / out |
 | `terra [BOX] logs [-f]` | the box's diagnostics |
+| `terra [BOX] sessions` | the clients attached to the box's terminal |
+| `terra [BOX] detach ID` / `--all` | drop one attached client — or every one |
 | `terra [BOX] stop` / `rm` | graceful stop (runs `pre_stop`) / delete |
 | `terra ls` | every box: created? running? where? |
 

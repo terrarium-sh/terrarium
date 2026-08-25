@@ -54,12 +54,15 @@ pub enum AgentService {
     /// One `terra exec` - one connection, one PTY, one process, which is what
     /// lets it run as root while the workload stays unprivileged.
     Exec = b'e',
+    /// Session management, not a viewport: one ask per connection - list
+    /// the clients, or drop one. Never itself a client.
+    SessionControl = b'c',
 }
 
 impl AgentService {
     #[must_use]
     pub fn from_byte(byte: u8) -> Option<Self> {
-        [Self::Session, Self::Files, Self::Exec]
+        [Self::Session, Self::Files, Self::Exec, Self::SessionControl]
             .into_iter()
             .find(|s| *s as u8 == byte)
     }

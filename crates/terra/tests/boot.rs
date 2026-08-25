@@ -433,6 +433,121 @@ fn boot_suite() {
         "the workload's terminal reached the log:\n{log}"
     );
 
+    // == sessions/detach: the agent names and drops attached clients ==
+    // A long-running box's session takes several clients, and the ids the
+    // agent hands out are what `terra detach` takes back. The suite has no
+    // terminal, so a client attaches through `script`, which allocates one.
+    let project = server.to_str().unwrap();
+    let sessions = |s: &Suite| s.terra(&["server", "sessions", "--project", project]);
+    assert!(
+        sessions(&s).trim().is_empty(),
+        "a box nobody is attached to lists clients:\n{}",
+        sessions(&s)
+    );
+
+    // stdin stays open, so the client stays attached until it is detached.
+    let attach = |s: &Suite| -> std::process::Child {
+        Command::new("script")
+            .args([
+                "-qec",
+                &format!("{} server --project {project}", s.terra.display()),
+                "/dev/null",
+            ])
+            .env("HOME", &s.home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawning an attach through script")
+    };
+    let mut client = attach(&s);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut listed = String::new();
+    while Instant::now() < deadline {
+        listed = sessions(&s);
+        if listed.trim().starts_with("0\t") {
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    assert!(
+        listed.trim().starts_with("0\t"),
+        "the attached client never reached the session:\n{listed}"
+    );
+
+    // The detach closes the client's connection from the agent's side, so the
+    // client's process ends on its own - and the session is empty again.
+    s.terra(&["server", "detach", "0", "--project", project]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = client.try_wait().expect("waiting on the attach") {
+            assert_eq!(
+                status.code(),
+                Some(0),
+                "the detached client did not exit cleanly"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the detached client never exited"
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && !sessions(&s).trim().is_empty() {
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    assert!(
+        sessions(&s).trim().is_empty(),
+        "a detached client is still listed:\n{}",
+        sessions(&s)
+    );
+    // A client that is already gone is refused, not silently re-detached.
+    let (_, code) = s.terra_status(&["server", "detach", "0", "--project", project]);
+    assert_ne!(code, 0, "re-detaching a gone client must fail");
+
+    // Two clients, and `--all` takes both of them.
+    let mut a = attach(&s);
+    let mut b = attach(&s);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut listed = String::new();
+    while Instant::now() < deadline {
+        listed = sessions(&s);
+        let ids: Vec<&str> = listed
+            .lines()
+            .filter_map(|l| l.split('\t').next())
+            .collect();
+        if ids.len() >= 2 {
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    assert!(
+        sessions(&s).lines().count() >= 2,
+        "the second client never reached the session:\n{listed}"
+    );
+    s.terra(&["server", "detach", "--all", "--project", project]);
+    for client in [&mut a, &mut b] {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if client.try_wait().expect("waiting on the attach").is_some() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "a detached client never exited");
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && !sessions(&s).trim().is_empty() {
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    assert!(
+        sessions(&s).trim().is_empty(),
+        "clients survive a detach --all:\n{}",
+        sessions(&s)
+    );
+
     // == cp: files travel in and out of the running box ==
     let payload = format!("cp-roundtrip-{}", std::process::id());
     let src = s.work().join("cp-src.txt");

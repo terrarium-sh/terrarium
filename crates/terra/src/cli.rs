@@ -133,6 +133,15 @@ pub enum Cmd {
     /// `TERRA_DIAGNOSTICS=1` keeps those in diagnostics.log. The workload's
     /// terminal goes to the session - attach to the box to see it live.
     Logs(LogsArgs),
+    /// List the clients attached to the box's session: the ids `terra <box>
+    /// detach` takes, and the terminal size each one reported. The shared
+    /// view fits the tightest client, so one that stopped reading keeps it
+    /// small until it is detached.
+    Sessions(SessionsArgs),
+    /// Drop one attached client of the box's session - or every one of them.
+    /// The client's connection is closed and its terminal restored, as if the
+    /// detach key had been pressed.
+    Detach(DetachArgs),
     /// Print the fully-resolved config a boot would use: the box's pinned
     /// recipe, or - for a box not set up yet, or a recipe named by path - the
     /// recipe that would be pinned.
@@ -164,6 +173,8 @@ impl Cmd {
             | Cmd::Put(_)
             | Cmd::Get(_)
             | Cmd::Logs(_)
+            | Cmd::Sessions(_)
+            | Cmd::Detach(_)
             | Cmd::Show(_)
             | Cmd::Stop(_)
             | Cmd::Storage(_)
@@ -332,6 +343,28 @@ pub struct LogsArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct SessionsArgs {
+    #[command(flatten)]
+    pub agent: AgentTimeoutArg,
+}
+
+#[derive(Args, Debug)]
+pub struct DetachArgs {
+    /// The client id `terra <box> sessions` printed.
+    #[arg(
+        value_name = "ID",
+        required_unless_present = "all",
+        conflicts_with = "all"
+    )]
+    pub id: Option<u64>,
+    /// Detach every attached client instead of one by id.
+    #[arg(long)]
+    pub all: bool,
+    #[command(flatten)]
+    pub agent: AgentTimeoutArg,
+}
+
+#[derive(Args, Debug)]
 pub struct BootArgs {
     /// Run the workload as root instead of the default `terri` (uid 1000).
     #[arg(long)]
@@ -393,6 +426,11 @@ mod tests {
             (vec!["terra", "stop"], None),
             (vec!["terra", "dev", "logs", "-f"], Some("dev")),
             (vec!["terra", "logs"], None),
+            (vec!["terra", "dev", "sessions"], Some("dev")),
+            (vec!["terra", "sessions"], None),
+            (vec!["terra", "dev", "detach", "3"], Some("dev")),
+            (vec!["terra", "detach", "3"], None),
+            (vec!["terra", "detach", "--all"], None),
             (vec!["terra", "dev", "get", "/etc/x", "."], Some("dev")),
             (vec!["terra", "put", "./a", "/tmp/a"], None),
             (vec!["terra", "dev", "exec", "--", "ls"], Some("dev")),
@@ -653,6 +691,8 @@ mod tests {
             &["show"],
             &["ls"],
             &["logs"],
+            &["sessions"],
+            &["detach", "--all"],
         ];
         let mut worded: Vec<&str> = Vec::new();
         for argv in typed {
@@ -707,6 +747,22 @@ mod tests {
             panic!("expected setup")
         };
         assert!(args.rebuild && !args.trust_recipe);
+    }
+
+    /// A detach is one client or every client - a bare `terra detach` with
+    /// neither is a typo, and an id written with `--all` would be a cleanup
+    /// nobody could predict.
+    #[test]
+    fn detach_takes_one_id_or_all() {
+        assert!(Cli::try_parse_from(["terra", "dev", "detach", "3"]).is_ok());
+        assert!(Cli::try_parse_from(["terra", "dev", "detach", "--all"]).is_ok());
+        assert!(Cli::try_parse_from(["terra", "dev", "detach"]).is_err());
+        assert!(Cli::try_parse_from(["terra", "dev", "detach", "3", "--all"]).is_err());
+        let Some(Cmd::Detach(args)) = Cli::parse_from(["terra", "dev", "detach", "3"]).cmd else {
+            panic!("expected detach")
+        };
+        assert_eq!(args.id, Some(3));
+        assert!(!args.all);
     }
 
     /// The grace a stop waits is one number ([`DEFAULT_STOP_GRACE_SECS`]):

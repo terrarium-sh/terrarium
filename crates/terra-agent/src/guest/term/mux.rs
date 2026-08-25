@@ -240,6 +240,7 @@ fn dispatch(session: &Arc<Session>, mut conn: VsockStream, master_fd: RawFd, roo
     }
     match AgentService::from_byte(service[0]) {
         Some(AgentService::Session) => serve_client(session, conn, master_fd),
+        Some(AgentService::SessionControl) => serve_session_control(session, conn, master_fd),
         Some(AgentService::Files) => crate::files::serve_file_op(conn, root),
         Some(AgentService::Exec) => crate::exec::serve_exec(conn, root),
         None => eprintln!(
@@ -306,6 +307,9 @@ impl ClientSink for FramedClient {
     fn exit(&mut self, code: i32) -> std::io::Result<()> {
         self.send(&AgentOutput::Exit(code))
     }
+    fn detached(&mut self) -> std::io::Result<()> {
+        self.send(&AgentOutput::Detached)
+    }
 }
 
 impl Drop for FramedClient {
@@ -347,10 +351,62 @@ fn serve_client(session: &Arc<Session>, conn: VsockStream, master_fd: RawFd) {
                 Ok(None) | Err(_) => break,
             }
         }
-        if let Some((r, c)) = session.detach(id) {
+        if let Some((r, c)) = session.detach_client(id) {
             set_winsize(master_fd, r, c);
         }
     });
+}
+
+/// Serve one session-management ask - list the clients or drop one -
+/// without attaching as a client itself.
+fn serve_session_control(session: &Arc<Session>, mut conn: VsockStream, master_fd: RawFd) {
+    use std::io::Write;
+    let reply = |conn: &mut VsockStream, rep: &terra_agent::ControlReply| {
+        conn.write_all(&rep.encode()).and_then(|()| conn.flush())
+    };
+    match terra_agent::ControlRequest::read(&mut conn) {
+        Ok(Some(terra_agent::ControlRequest::List)) => {
+            for (id, size) in session.list_clients() {
+                let (rows, cols) = size.unwrap_or((0, 0));
+                if reply(
+                    &mut conn,
+                    &terra_agent::ControlReply::Client { id, rows, cols },
+                )
+                .is_err()
+                {
+                    return;
+                }
+            }
+            let _ = reply(&mut conn, &terra_agent::ControlReply::Done);
+        }
+        Ok(Some(terra_agent::ControlRequest::Detach { id })) => {
+            if session.list_clients().iter().any(|(cid, _)| *cid == id) {
+                if let Some((r, c)) = session.detach_client(id) {
+                    set_winsize(master_fd, r, c);
+                }
+                let _ = reply(&mut conn, &terra_agent::ControlReply::Detached { id });
+            } else {
+                let _ = reply(&mut conn, &terra_agent::ControlReply::Missing { id });
+            }
+        }
+        Ok(Some(terra_agent::ControlRequest::DetachAll)) => {
+            let ids: Vec<u64> = session
+                .list_clients()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            if let Some((r, c)) = session.detach_all_clients() {
+                set_winsize(master_fd, r, c);
+            }
+            for id in ids {
+                if reply(&mut conn, &terra_agent::ControlReply::Detached { id }).is_err() {
+                    return;
+                }
+            }
+            let _ = reply(&mut conn, &terra_agent::ControlReply::Done);
+        }
+        Ok(None) | Err(_) => {}
+    }
 }
 
 /// Attach fd 0/1 as a client: broadcast output to stdout, forward stdin keys.
@@ -380,4 +436,128 @@ fn attach_console(session: &Arc<Session>, master_fd: RawFd) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixStream;
+
+    /// A sink that never blocks and never fails: what a client's writer thread
+    /// drains into when the test only cares about the listing.
+    struct Quiet;
+    impl ClientSink for Quiet {
+        fn out(&mut self, _: &[u8]) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn exit(&mut self, _: i32) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A session with `n` attached clients and an input sink that goes nowhere.
+    fn session_with(n: usize) -> Arc<Session> {
+        let input: Sink = Arc::new(Mutex::new(std::io::sink()));
+        let session = Session::new(input);
+        for _ in 0..n {
+            let _ = session.attach(Quiet);
+        }
+        session
+    }
+
+    /// Drive one [`serve_session_control`] over a socketpair, the way the file
+    /// and exec services are driven. `master_fd` is a non-tty fd: the
+    /// TIOCSWINSZ ioctl fails on it and is ignored, exactly as it is for a
+    /// client whose terminal died mid-session.
+    fn do_control(
+        session: &Arc<Session>,
+        req: &terra_agent::ControlRequest,
+    ) -> Vec<terra_agent::ControlReply> {
+        let null = std::fs::File::open("/dev/null").unwrap();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let server = VsockStream::from(std::os::fd::OwnedFd::from(server));
+        let session = session.clone();
+        let agent =
+            std::thread::spawn(move || serve_session_control(&session, server, null.as_raw_fd()));
+        client.write_all(&req.encode()).unwrap();
+        let mut reps = Vec::new();
+        while let Some(rep) = terra_agent::ControlReply::read(&mut client).unwrap() {
+            let done = matches!(rep, terra_agent::ControlReply::Done);
+            reps.push(rep);
+            if done {
+                break;
+            }
+        }
+        agent.join().unwrap();
+        reps
+    }
+
+    #[test]
+    fn the_control_service_lists_the_clients() {
+        let session = session_with(2);
+        session.set_client_size(0, 30, 100);
+        assert_eq!(
+            do_control(&session, &terra_agent::ControlRequest::List),
+            vec![
+                terra_agent::ControlReply::Client {
+                    id: 0,
+                    rows: 30,
+                    cols: 100
+                },
+                terra_agent::ControlReply::Client {
+                    id: 1,
+                    rows: 0,
+                    cols: 0
+                },
+                terra_agent::ControlReply::Done,
+            ]
+        );
+        // The ask did not disturb the session.
+        assert_eq!(session.list_clients().len(), 2);
+    }
+
+    /// The answer to a detach is about the client's existence, not its size:
+    /// dropping a client that did not constrain the shared size must still read
+    /// as detached, or `terra detach` would call a successful cleanup "missing".
+    #[test]
+    fn the_control_service_detaches_one_client() {
+        let session = session_with(2);
+        session.set_client_size(0, 30, 100);
+        session.set_client_size(1, 50, 200);
+
+        assert_eq!(
+            do_control(&session, &terra_agent::ControlRequest::Detach { id: 1 }),
+            vec![terra_agent::ControlReply::Detached { id: 1 }]
+        );
+        assert_eq!(session.list_clients(), vec![(0, Some((30, 100)))]);
+    }
+
+    #[test]
+    fn detaching_an_unknown_id_answers_missing() {
+        let session = session_with(1);
+        assert_eq!(
+            do_control(&session, &terra_agent::ControlRequest::Detach { id: 7 }),
+            vec![terra_agent::ControlReply::Missing { id: 7 }]
+        );
+        assert_eq!(
+            session.list_clients().len(),
+            1,
+            "the unknown id took nothing"
+        );
+    }
+
+    #[test]
+    fn detach_all_drops_every_client() {
+        let session = session_with(3);
+        assert_eq!(
+            do_control(&session, &terra_agent::ControlRequest::DetachAll),
+            vec![
+                terra_agent::ControlReply::Detached { id: 0 },
+                terra_agent::ControlReply::Detached { id: 1 },
+                terra_agent::ControlReply::Detached { id: 2 },
+                terra_agent::ControlReply::Done,
+            ]
+        );
+        assert_eq!(session.list_clients(), vec![]);
+    }
 }

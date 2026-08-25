@@ -321,10 +321,8 @@ mod tests {
                 Ok(Some(AgentOutput::Out(b))) => out.extend_from_slice(&b),
                 Ok(Some(AgentOutput::Err(b))) => err.extend_from_slice(&b),
                 Ok(Some(AgentOutput::Exit(c))) => break c,
-                // No exit frame at all: the agent dropped the connection, or
-                // the deadline passed. Either is a failure however the rest of
-                // the stream looked.
-                Ok(None) | Err(_) => break NO_EXIT,
+                // A detach frame is just a dead exec connection: no status, same failure.
+                Ok(Some(AgentOutput::Detached) | None) | Err(_) => break NO_EXIT,
             }
         };
         // Joining would hang on exactly the regressions the deadline exists to

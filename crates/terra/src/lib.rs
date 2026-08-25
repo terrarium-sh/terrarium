@@ -68,5 +68,7 @@ pub fn run() -> Result<ExitCode> {
         Some(Cmd::Show(a)) => cmd::show::run(a, name, &project_dir, &cwd),
         Some(Cmd::Ls(a)) => cmd::ls::run(a, &project_dir),
         Some(Cmd::Logs(a)) => cmd::logs::run(a, name, &project_dir),
+        Some(Cmd::Sessions(a)) => cmd::sessions::run(a, name, &project_dir),
+        Some(Cmd::Detach(a)) => cmd::detach::run(a, name, &project_dir),
     }
 }
