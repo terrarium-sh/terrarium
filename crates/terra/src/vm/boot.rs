@@ -211,9 +211,13 @@ fn vm_child_exit_byte(bx: &BoxRef, status: std::process::ExitStatus) -> u8 {
     crate::exit_status_byte(status.code().unwrap_or(1))
 }
 
+fn claims_the_box(bx: &BoxRef, child_pid: u32) -> bool {
+    bx.vm_process().is_some_and(|vm| vm.pid == child_pid)
+}
+
 fn detached_exit_byte(bx: &BoxRef, child_pid: u32, status: std::process::ExitStatus) -> u8 {
     replay_logs(bx, status);
-    if bx.vm_pid() == Some(child_pid) {
+    if claims_the_box(bx, child_pid) {
         return 0;
     }
     if !status.success() {
@@ -235,7 +239,7 @@ fn spawn_detached(bx: &BoxRef, spec: &BootSpec, run_lock: File) -> Result<ExitCo
         if let Some(status) = child.try_wait().context("checking on the VM")? {
             return Ok(ExitCode::from(detached_exit_byte(bx, child.id(), status)));
         }
-        if bx.vm_pid() == Some(child.id()) || Instant::now() >= deadline {
+        if claims_the_box(bx, child.id()) || Instant::now() >= deadline {
             break;
         }
         std::thread::sleep(POLL);
@@ -244,7 +248,7 @@ fn spawn_detached(bx: &BoxRef, spec: &BootSpec, run_lock: File) -> Result<ExitCo
     // before that no command can find the box, and saying "started" would
     // send someone to `terra stop` for nothing. The unclaimed case succeeds
     // too: the VM is running, which is all `-d` asked for.
-    if bx.vm_pid() == Some(child.id()) {
+    if claims_the_box(bx, child.id()) {
         eprintln!(
             "terra: started {bx} detached (pid {}); logs: {}",
             child.id(),

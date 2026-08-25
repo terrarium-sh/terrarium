@@ -27,6 +27,7 @@ jobs:
           # submodules on ssh URLs that this build never touches, and recursing
           # would try (and fail) to fetch them.
           submodules: true
+          persist-credentials: false
       # rustup picks the toolchain + components from rust-toolchain.toml.
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
@@ -40,7 +41,7 @@ jobs:
       # macOS one does. Without it nothing in this job links at all.
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          version: 0.15.1
+          version: 0.16.0
       # `mke2fs -d` bakes the guest images root-owned inside a user namespace,
       # and Ubuntu 24.04 restricts unprivileged ones via AppArmor — the namespace
       # is created but has no capabilities in it, so the uid_map write EPERMs.
@@ -126,11 +127,14 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           submodules: true # see the note in the verify job
+          persist-credentials: false
       # `.cargo/config.toml` forces CC to the zig musl wrapper, because libkrun's
       # init-blob compiles its *guest* init (always Linux/musl) whatever the host
-      # is. So the macOS build needs zig too.
-      - name: Install zig
-        run: brew install zig
+      # is. So the macOS build needs zig too — the same SHA-pinned action the
+      # other jobs use, never an unpinned `brew install zig`.
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: . -> target

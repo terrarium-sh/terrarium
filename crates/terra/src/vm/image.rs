@@ -34,40 +34,60 @@ fn to_stage_path(path: &Path) -> PathBuf {
     path.with_file_name(format!(".{name}.{}.tmp", std::process::id()))
 }
 
-/// Unpack `src` next to `path` and rename it into place, so a half-written
-/// payload never ends up where a later run would take it as good. `finish`
-/// runs on the completed temporary before the rename; if it errors, the
-/// temporary is removed.
-fn install(
-    path: &Path,
-    src: &mut impl Read,
-    finish: impl FnOnce(&File, u64) -> Result<()>,
-) -> Result<()> {
+fn stage_pid(name: &str) -> Option<u32> {
+    name.strip_prefix('.')?
+        .strip_suffix(".tmp")?
+        .rsplit('.')
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// Remove staging temporaries whose writer is gone: `is_alive` answers for
+/// the pid in a temp's name, and a live writer keeps its temporary - only it
+/// knows how far the write got.
+pub(crate) fn sweep_staging_temps(dir: &Path, is_alive: impl Fn(u32) -> bool) {
+    for entry in crate::sys::dir_entries(dir) {
+        let Some(pid) = entry.file_name().to_str().and_then(stage_pid) else {
+            continue;
+        };
+        if !is_alive(pid) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+pub(crate) fn staged_write(path: &Path, write: impl FnOnce(&mut File) -> Result<()>) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     let tmp = to_stage_path(path);
-    match unpack_into(&tmp, src, finish) {
+    let mut out = File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+    match write(&mut out) {
         Ok(()) => {
             std::fs::rename(&tmp, path).with_context(|| format!("installing {}", path.display()))
         }
         Err(e) => {
+            drop(out);
             let _ = std::fs::remove_file(&tmp);
             Err(e)
         }
     }
 }
 
-fn unpack_into(
-    tmp: &Path,
+/// Unpack `src` into a staging temporary for `path`; `finish` sees the open
+/// temporary and its byte count before the rename.
+fn install(
+    path: &Path,
     src: &mut impl Read,
     finish: impl FnOnce(&File, u64) -> Result<()>,
 ) -> Result<()> {
-    let mut out = File::create(tmp).with_context(|| format!("creating {}", tmp.display()))?;
-    let written = std::io::copy(src, &mut out)
-        .with_context(|| format!("unpacking into {}", tmp.display()))?;
-    finish(&out, written)
+    staged_write(path, |out| {
+        let written =
+            std::io::copy(src, out).with_context(|| format!("unpacking {}", path.display()))?;
+        finish(out, written)
+    })
 }
 
 /// Write the prebaked root filesystem to `path`, sized to `size_mib` (sparse;
@@ -167,6 +187,7 @@ fn cached(gz: &[u8], name: &str, what: &str) -> Result<PathBuf> {
             let _ = std::fs::remove_file(entry.path());
         }
     }
+    sweep_staging_temps(&dir, crate::sys::pid_exists);
     Ok(path)
 }
 
@@ -222,5 +243,82 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert!(left.is_empty(), "a temporary was left behind: {left:?}");
+    }
+
+    /// A staged write replaces its target only through the final rename: a
+    /// failure anywhere in filling the temporary leaves what was installed
+    /// byte-identical and takes the temporary with it.
+    #[test]
+    fn a_failed_staged_write_leaves_the_installed_file_alone() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("rootfs.img");
+        std::fs::write(&target, b"old bytes").unwrap();
+
+        let err = staged_write(&target, |out| {
+            out.write_all(b"half of something")?;
+            anyhow::bail!("the write failed")
+        })
+        .expect_err("the closure failed on purpose");
+        assert!(err.to_string().contains("the write failed"), "{err}");
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"old bytes",
+            "a failed write replaced the live file"
+        );
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left.len(), 1, "no temporary was left behind: {left:?}");
+
+        staged_write(&target, |out| {
+            out.write_all(b"fresh bytes")?;
+            Ok(())
+        })
+        .expect("an uneventful write installs");
+        assert_eq!(std::fs::read(&target).unwrap(), b"fresh bytes");
+    }
+
+    #[test]
+    fn stage_pid_reads_the_writer_out_of_the_name() {
+        assert_eq!(stage_pid(".rootfs.img.42.tmp"), Some(42));
+        assert_eq!(stage_pid(".boot-deadbeef.7.tmp"), Some(7));
+        for other in ["vol-data.img", ".half", ".x.nopid.tmp", "", ".tmp"] {
+            assert_eq!(stage_pid(other), None, "{other:?} is not a staging temp");
+        }
+    }
+
+    /// The cache-directory sweep trusts only the pid in the name: a writer
+    /// that may still be running keeps its temporary, a dead one's is taken,
+    /// and anything not named like a staging temp is nobody's to remove.
+    #[test]
+    fn a_sweep_takes_a_dead_writers_temp_and_keeps_a_live_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let mine = format!(".rootfs.img.{}.tmp", std::process::id());
+        std::fs::write(dir.path().join(&mine), b"staging").unwrap();
+        std::fs::write(dir.path().join(".vmlinux-abc.4242.tmp"), b"staging").unwrap();
+        std::fs::write(dir.path().join("vol-data.img"), b"installed").unwrap();
+        std::fs::write(dir.path().join(".stray"), b"?").unwrap();
+
+        sweep_staging_temps(dir.path(), |pid| pid == std::process::id());
+
+        assert!(
+            dir.path().join(&mine).exists(),
+            "our own staging temp was swept"
+        );
+        assert!(!dir.path().join(".vmlinux-abc.4242.tmp").exists());
+        assert!(
+            dir.path().join("vol-data.img").exists(),
+            "an installed file was swept"
+        );
+        assert!(
+            dir.path().join(".stray").exists(),
+            "something not ours was swept"
+        );
+
+        // Under a box's lock no writer predates the run: everything staged goes.
+        sweep_staging_temps(dir.path(), |_| false);
+        assert!(!dir.path().join(&mine).exists());
     }
 }

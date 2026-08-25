@@ -10,7 +10,10 @@ Building and hacking on terra itself. Users start at the [README](README.md).
   it currently carries none), libkrunfw pristine, built from source for its
   guest kernel, and [`cryi/smolvm`](https://github.com/cryi/smolvm) for its
   `smolvm-network` crate, the egress gateway. All folded into a single
-  fully-static `terra` binary. After cloning:
+  fully-static `terra` binary. The forks are a waiting room, not a home: any
+  change a submodule carries must be merged upstream before its pin moves
+  again — see [vendor/README.md](vendor/README.md) for the policy and the
+  upstream wishlist. After cloning:
   ```sh
   git submodule update --init   # not --recursive: see vendor/README.md
   ```

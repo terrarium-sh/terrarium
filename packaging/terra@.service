@@ -87,12 +87,26 @@ RestartSec=2
 # --- Hard requirements (do NOT tighten these away) ------------------------
 # libkrun talks to /dev/kvm; PrivateDevices=yes would hide it.
 DeviceAllow=/dev/kvm rw
+DevicePolicy=closed
 # KVM guest memory needs writable+executable mappings.
 MemoryDenyWriteExecute=no
 # The egress proxy opens host sockets, so PrivateNetwork must stay off.
 PrivateNetwork=false
 
 # --- Optional hardening (safe additions) ----------------------------------
+# The address families terra and its gateway actually use: AF_UNIX for every
+# socket bridge (vsock ports, virtio-net), INET/INET6 for terminating guest
+# traffic. No netlink: the gateway sets interface flags by ioctl, by design.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+LockPersonality=true
+ProtectHostname=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+UMask=0077
+RestrictNamespaces=true
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
@@ -103,6 +117,10 @@ ReadWritePaths=%S/terra
 ProtectControlGroups=true
 ProtectKernelLogs=true
 ProtectClock=true
+# The two below are the ones to drop first if a boot misbehaves under a future
+# systemd: they filter syscalls rather than files, which KVM exercises widest.
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target

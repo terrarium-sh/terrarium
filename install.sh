@@ -1,5 +1,10 @@
 #!/bin/sh
+# Installs the latest terra release (or TERRA_VERSION=x.y.z), verifying the
+# binary against the release's SHA256SUMS before anything is put in place.
 set -eu
+
+repo="alis-is/terrarium"
+version="${TERRA_VERSION:-latest}"
 
 os=$(uname -s)
 arch=$(uname -m)
@@ -23,14 +28,42 @@ case "$os/$arch" in
     ;;
 esac
 
-tmp=$(mktemp)
-trap 'rm -f "$tmp"' EXIT
-curl -fsSL "https://github.com/alis-is/terrarium/releases/latest/download/$asset" -o "$tmp"
-chmod +x "$tmp"
+if [ "$version" = "latest" ]; then
+  base="https://github.com/$repo/releases/latest/download"
+else
+  base="https://github.com/$repo/releases/download/$version"
+fi
 
-if mkdir -p "$bin" && mv -f "$tmp" "$bin/terra" 2>/dev/null; then
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+curl -fsSL "$base/SHA256SUMS" -o "$tmp/SHA256SUMS"
+curl -fsSL "$base/$asset" -o "$tmp/terra"
+
+# The checksum comes from the same release ref as the binary, so a tampered
+# mirror of one alone cannot pass; the mismatch must be said out loud.
+expected=$(awk -v a="$asset" '$2 == a { print $1 }' "$tmp/SHA256SUMS")
+if [ -z "$expected" ]; then
+  echo "terrarium: $asset is not in this release's SHA256SUMS - refusing to install" >&2
+  exit 1
+fi
+if command -v sha256sum >/dev/null 2>&1; then
+  got=$(sha256sum < "$tmp/terra" | cut -d' ' -f1)
+else
+  got=$(shasum -a 256 < "$tmp/terra" | cut -d' ' -f1)
+fi
+if [ "$got" != "$expected" ]; then
+  echo "terrarium: CHECKSUM MISMATCH for $asset" >&2
+  echo "  expected: $expected" >&2
+  echo "  got:      $got" >&2
+  echo "nothing was installed" >&2
+  exit 1
+fi
+
+chmod +x "$tmp/terra"
+
+if mkdir -p "$bin" && mv -f "$tmp/terra" "$bin/terra" 2>/dev/null; then
   :
 else
-  sudo mv -f "$tmp" "$bin/terra"
+  sudo mv -f "$tmp/terra" "$bin/terra"
 fi
 echo "installed terra at $bin/terra"

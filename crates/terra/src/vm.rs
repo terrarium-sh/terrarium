@@ -73,6 +73,7 @@ fn attach_agent_port(krun: &libkrun_ext::Krun, bx: &BoxRef) -> Result<()> {
     let path = bx.agent_sock();
     // A crashed prior VM may have left a socket; libkrun binds EEXIST.
     let _ = std::fs::remove_file(&path);
+    image::sweep_staging_temps(bx.dir(), |_| false);
     krun.add_vsock_port(terra_agent::AGENT_VSOCK_PORT, &path, true)
 }
 
@@ -299,6 +300,7 @@ fn serve_control_sock(krun: &libkrun_ext::Krun, bx: &BoxRef, plan: &Plan) -> Res
     let watch_stop = plan.mode == PlanMode::Run;
     let sock = bx.control_sock();
     let _ = std::fs::remove_file(&sock); // a crashed prior VM may have left one
+    image::sweep_staging_temps(bx.dir(), |_| false);
     let listener = std::os::unix::net::UnixListener::bind(&sock)
         .with_context(|| format!("binding the control socket {}", sock.display()))?;
     // `bind` applies the process umask; the socket hands out secrets, so the

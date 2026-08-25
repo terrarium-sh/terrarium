@@ -3,6 +3,7 @@
 use crate::cli::{StorageCmd, StorageFileArgs};
 use crate::render::printable_path;
 use crate::state::BoxRef;
+use crate::vm::image;
 use crate::{config, resolve, sys};
 use anyhow::{Context, Result};
 use flate2::Compression;
@@ -246,39 +247,41 @@ fn import(bx: &BoxRef, from: &Path) -> Result<()> {
 }
 
 /// The images are sparse, and a plain copy would give a 512 MiB filesystem
-/// holding 40 MiB the whole 512 on the disk it lands on.
+/// holding 40 MiB the whole 512 on the disk it lands on. Staged: an import cut
+/// off part-way leaves whatever image it was restoring byte-identical.
 fn write_sparse(path: &Path, src: &mut impl Read, len: u64) -> Result<()> {
     const CHUNK: usize = 64 * 1024;
     let printable = printable_path(path);
-    let mut out = File::create(path).with_context(|| format!("creating {printable}"))?;
-    let mut src = src.take(len);
-    let mut buf = vec![0u8; CHUNK];
-    loop {
-        let read = src.read(&mut buf).context("reading the artifact")?;
-        if read == 0 {
-            break;
+    image::staged_write(path, |out| {
+        let mut src = src.take(len);
+        let mut buf = vec![0u8; CHUNK];
+        loop {
+            let read = src.read(&mut buf).context("reading the artifact")?;
+            if read == 0 {
+                break;
+            }
+            let chunk = &buf[..read];
+            if chunk.iter().all(|b| *b == 0) {
+                out.seek(SeekFrom::Current(i64::try_from(read)?))
+                    .with_context(|| format!("seeking in {printable}"))?;
+            } else {
+                out.write_all(chunk)
+                    .with_context(|| format!("writing {printable}"))?;
+            }
         }
-        let chunk = &buf[..read];
-        if chunk.iter().all(|b| *b == 0) {
-            out.seek(SeekFrom::Current(i64::try_from(read)?))
-                .with_context(|| format!("seeking in {printable}"))?;
-        } else {
-            out.write_all(chunk)
-                .with_context(|| format!("writing {printable}"))?;
-        }
-    }
-    // The offset is what was read *and* what was written, hole or not.
-    let written = out
-        .stream_position()
-        .with_context(|| format!("writing {printable}"))?;
-    anyhow::ensure!(
-        written == len,
-        "the artifact ends part-way through {printable}"
-    );
-    // A trailing hole is only a hole once the file is long enough to have one.
-    out.set_len(len)
-        .with_context(|| format!("sizing {printable}"))?;
-    Ok(())
+        // The offset is what was read *and* what was written, hole or not.
+        let written = out
+            .stream_position()
+            .with_context(|| format!("writing {printable}"))?;
+        anyhow::ensure!(
+            written == len,
+            "the artifact ends part-way through {printable}"
+        );
+        // A trailing hole is only a hole once the file is long enough to have one.
+        out.set_len(len)
+            .with_context(|| format!("sizing {printable}"))?;
+        Ok(())
+    })
 }
 
 fn prune(bx: &BoxRef) -> Result<()> {
@@ -434,6 +437,44 @@ mod tests {
         );
     }
 
+    /// Images are replaced only through a staged write's rename, so one
+    /// artifact cut off part-way leaves every image it reached byte-identical -
+    /// the import is all of them or none of them.
+    #[test]
+    fn an_import_cut_off_part_way_leaves_the_images_it_reached_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = TestHome::new();
+        let bx = built(dir.path(), &[]);
+
+        let artifact = dir.path().join("cut-off.terra");
+        let mut gz = GzEncoder::new(
+            BufWriter::new(File::create(&artifact).unwrap()),
+            Compression::fast(),
+        );
+        gz.write_all(MAGIC).unwrap();
+        write_entry_header(&mut gz, "rootfs.img", 1 << 20).unwrap();
+        gz.write_all(b"a few bytes").unwrap(); // far short of the declared length
+        gz.finish().unwrap().flush().unwrap();
+
+        let err = format!("{:#}", import(&bx, &artifact).unwrap_err());
+        assert!(err.contains("part-way through"), "{err}");
+        assert_eq!(
+            std::fs::read(bx.rootfs_img()).unwrap(),
+            b"rootfs data",
+            "a truncated artifact replaced the live image"
+        );
+        let left: Vec<String> = std::fs::read_dir(bx.dir())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !left.iter().any(|n| std::path::Path::new(n)
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("tmp"))),
+            "a staging temporary was left: {left:?}"
+        );
+    }
+
     /// `prune` takes the volume images the recipe dropped, and only those: it
     /// is the one command whose whole job is deleting a box's data, so a
     /// volume that is still named must survive it.
@@ -470,7 +511,10 @@ mod tests {
         let running = bx.lock_run().unwrap();
         for refused in [export(&bx, &artifact), import(&bx, &artifact)] {
             assert!(
-                refused.unwrap_err().to_string().contains("already in use"),
+                refused
+                    .unwrap_err()
+                    .to_string()
+                    .contains("locked by another terra command"),
                 "a box a VM is holding was operated on"
             );
         }

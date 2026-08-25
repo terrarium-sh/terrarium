@@ -10,6 +10,7 @@ use crate::vm::boot;
 use crate::{cli, config, state, sys};
 use anyhow::{Context, Result};
 use std::fs::File;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -242,6 +243,9 @@ pub fn prepare_box(approved: &ApprovedRecipe, rebuild: bool) -> Result<PreparedB
     prepare_box_state_dir(bx)?;
     // Lock before the `--rebuild` delete: a running VM may be using the image.
     let lock = bx.lock_run()?;
+    // Under the lock anything staged here predates this run - a setup or boot
+    // that died part-way through an install.
+    crate::vm::image::sweep_staging_temps(bx.dir(), |_| false);
     let recipe_path = bx.recipe();
     if let Some(r) = new_pin {
         if recipe_path.exists() {
@@ -252,8 +256,10 @@ pub fn prepare_box(approved: &ApprovedRecipe, rebuild: bool) -> Result<PreparedB
                 bx.name()
             );
         }
-        std::fs::write(&recipe_path, &r.text)
-            .with_context(|| format!("recording {}", recipe_path.display()))?;
+        crate::vm::image::staged_write(&recipe_path, |out| {
+            out.write_all(r.text.as_bytes())
+                .with_context(|| format!("recording {}", recipe_path.display()))
+        })?;
     }
     let img = bx.rootfs_img();
     if rebuild && img.exists() {

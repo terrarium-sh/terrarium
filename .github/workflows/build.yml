@@ -36,6 +36,7 @@ jobs:
           # One level only. vendor/smolvm has its own submodules on ssh URLs
           # that this build never touches, and recursing would fail to fetch them.
           submodules: true
+          persist-credentials: false
       # A full Linux kernel build needs these; ubuntu-latest happens to carry
       # them, the arm image does not, so install on both rather than depend on
       # which runner image ships what.

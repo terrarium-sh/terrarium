@@ -65,6 +65,13 @@ What does not cross it, in any configuration:
   pointing there. That mode lifts the allow-list, not the floor, which is what
   its name says: *public* egress. An `allow` entry covering an address is the
   one thing that crosses it, because that is an operator writing it down.
+  Note what an allow rule does and does not bind: addresses and ports, and the
+  names learned from answers the gateway has seen — not what flows inside. A
+  workload with one allowed endpoint can resolve whatever it likes through that
+  endpoint (DNS-over-HTTPS or DNS-over-TLS to it is indistinguishable from any
+  other HTTPS traffic), so an allowlisted public API effectively opens name
+  resolution past the gateway too. Treat every allowed endpoint as fully
+  trusted, and keep the list to what the workload actually needs.
 - **The agent's vsock port.** The one port every session, `terra put`/`get` and
   `terra exec` connection arrives on is dialable from inside the guest (the
   kernel has vsock loopback), and its services act with init's privileges — so
@@ -134,6 +141,9 @@ gateway is vendored rather than pinned by Cargo revision because it is the code
 that decides what a sandbox may reach: that belongs in the same review as the
 policy that configures it, not behind a version bump — that review is what found
 the two hard-floor gaps fixed upstream in `d2573ac`, which this pin includes. All
-three checkouts are unmodified; see [`vendor/README.md`](../vendor/README.md). The
-build inputs that are downloaded rather than pinned by commit — Alpine's
-minirootfs, e2fsprogs, doas — are all verified against a SHA-256 in the Makefile.
+three checkouts are unmodified; see [`vendor/README.md`](../vendor/README.md),
+which also states the upstreaming policy: a fork is a waiting room, every change
+a submodule carries must land upstream before the pin next moves, and the goal
+for all three is pristine-upstream tracking. The build inputs that are downloaded
+rather than pinned by commit — Alpine's minirootfs, e2fsprogs, doas — are all
+verified against a SHA-256 in the Makefile.

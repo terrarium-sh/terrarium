@@ -185,8 +185,47 @@ pub fn terminating_signal(status: std::process::ExitStatus) -> Option<i32> {
     status.signal()
 }
 
-/// `ESRCH` is `Ok` - the process is already gone.
-pub fn signal_pid(pid: u32, signal: VmSignal) -> Result<()> {
+/// Whether the kernel lists a process under this pid. A staging temp's writer
+/// is always this user's own terra, so `EPERM` - the number worn by another
+/// user's process by now - still reads as alive.
+pub fn pid_exists(pid: u32) -> bool {
+    let Ok(target) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: signal 0 delivers nothing; the call only reports reachability.
+    let rc = unsafe { libc::kill(target, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// `/proc/<pid>/stat`'s starttime (field 22), in clock ticks since boot: two
+/// processes can wear one pid in sequence, never one starttime. `None` where
+/// there is no stat to read.
+pub fn process_start_time(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The comm field may hold spaces and parentheses of its own, so field
+    // counting resumes after its last `)`; state (field 3) is first here, and
+    // starttime (field 22) is the 20th token from there.
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
+/// A `None` starttime, from a pid file written before starttimes were, passes
+/// as current - there is nothing recorded to check the live process against.
+fn published_process_is_current(pid: u32, published_start_time: Option<u64>) -> bool {
+    match published_start_time {
+        None => true,
+        Some(published) => process_start_time(pid) == Some(published),
+    }
+}
+
+/// Two outcomes are `Ok` without a signal delivered: `ESRCH` - the process is
+/// already gone - and a starttime no longer matching what was published,
+/// which is a stranger wearing the pid now.
+pub fn signal_pid(pid: u32, published_start_time: Option<u64>, signal: VmSignal) -> Result<()> {
     let sig = match signal {
         VmSignal::GracefulStop => libc::SIGTERM,
         VmSignal::ForcedStop => libc::SIGKILL,
@@ -198,9 +237,14 @@ pub fn signal_pid(pid: u32, signal: VmSignal) -> Result<()> {
             crate::state::PID_FILE
         )));
     };
-    // SAFETY: a signal to another process; nothing of ours is passed or written.
-    // The pid is the caller's to justify - see `state::vm_pid`, which reads it
-    // only from a box whose lock is held.
+    if !published_process_is_current(pid, published_start_time) {
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(delivered) = pidfd_signal(target, sig) {
+        return delivered;
+    }
+    // SAFETY: a plain signal to another process; nothing of ours is passed or written.
     if unsafe { libc::kill(target, sig) } == 0 {
         return Ok(());
     }
@@ -209,6 +253,36 @@ pub fn signal_pid(pid: u32, signal: VmSignal) -> Result<()> {
         return Ok(());
     }
     Err(err)
+}
+
+/// The pidfd pins the process from open to delivery, so no recycle between
+/// the starttime check and the signal can redirect it. `None` when the
+/// kernel lacks the pidfd calls.
+#[cfg(target_os = "linux")]
+fn pidfd_signal(target: libc::pid_t, sig: libc::c_int) -> Option<Result<()>> {
+    // SAFETY: both syscalls take plain numbers and descriptors we close below;
+    // `null` for the info pointer asks for the default delivery semantics.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, target, 0u32) };
+    if fd < 0 {
+        return None;
+    }
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            fd,
+            sig,
+            std::ptr::null::<libc::c_void>(),
+            0u32,
+        )
+    };
+    let err = std::io::Error::last_os_error();
+    // SAFETY: `fd` came from `pidfd_open` above and nothing else owns it.
+    unsafe { libc::syscall(libc::SYS_close, fd) };
+    Some(match rc {
+        0 => Ok(()),
+        _ if err.raw_os_error() == Some(libc::ESRCH) => Ok(()),
+        _ => Err(err),
+    })
 }
 
 /// `-1` while no control connection is registered, and the swap out is what
@@ -245,15 +319,17 @@ pub fn register_stop_channel(channel: std::os::fd::OwnedFd) {
     }
 }
 
-/// Turn SIGINT/SIGTERM into the guest's graceful stop, so `systemctl stop`
-/// shuts it down orderly - `pre_stop` and all - instead of killing the VM
-/// under it.
+/// SIGINT/SIGTERM/SIGHUP ask the guest for its graceful stop - a host
+/// shutdown and a closed `--foreground` terminal included. Detached boxes
+/// hear none of this: [`detach`] puts them in their own process group, past
+/// any terminal's reach.
 pub fn install_stop_signal_handlers() {
     // SAFETY: `handler` does atomic stores and one `write`, both
-    // async-signal-safe; nothing else about these two calls can fail on us.
+    // async-signal-safe; nothing else about these calls can fail on us.
     unsafe {
         libc::signal(libc::SIGINT, handler as *const () as libc::sighandler_t);
         libc::signal(libc::SIGTERM, handler as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGHUP, handler as *const () as libc::sighandler_t);
     }
 }
 
@@ -310,8 +386,36 @@ mod tests {
             .unwrap();
         let pid = child.id();
         child.wait().unwrap(); // reaped: the pid names nothing at all now
-        assert!(signal_pid(pid, VmSignal::GracefulStop).is_ok());
-        assert!(signal_pid(pid, VmSignal::ForcedStop).is_ok());
+        assert!(signal_pid(pid, None, VmSignal::GracefulStop).is_ok());
+        assert!(signal_pid(pid, None, VmSignal::ForcedStop).is_ok());
+    }
+
+    /// The pid file outlives its VM by however long it takes a boot to empty
+    /// it, and the kernel hands that number to strangers in between. A stored
+    /// starttime that no longer matches is exactly such a stranger: signalled
+    /// with nothing - `Ok`, because "already gone" is the truth about the box -
+    /// while the same pid with *its* starttime takes the signal.
+    #[test]
+    fn a_recycled_pid_is_left_alone_and_the_real_one_is_signalled() {
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        let started_at = process_start_time(pid).expect("a live child has a stat");
+
+        // One tick off is nobody's process as far as the check is concerned.
+        signal_pid(pid, Some(started_at + 1), VmSignal::GracefulStop).unwrap();
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "a living child was signalled through a recycled identity"
+        );
+
+        // The published starttime is the one that reaches it; `sleep` dies of
+        // SIGTERM outright.
+        signal_pid(pid, Some(started_at), VmSignal::GracefulStop).unwrap();
+        child.wait().unwrap();
+
+        // …and once gone, any starttime reads as already-gone rather than
+        // reaching whoever wears the pid now.
+        assert!(signal_pid(pid, Some(started_at), VmSignal::ForcedStop).is_ok());
     }
 
     /// A pid too large for `pid_t` used to convert to `-1`, and `kill(-1)`
@@ -322,14 +426,28 @@ mod tests {
     fn a_number_that_is_not_a_pid_signals_nothing() {
         for not_a_pid in [u32::MAX, u32::MAX / 2 + 1] {
             for signal in [VmSignal::GracefulStop, VmSignal::ForcedStop] {
-                let err = signal_pid(not_a_pid, signal)
+                let err = signal_pid(not_a_pid, None, signal)
                     .expect_err("a number past pid_t must not be signalled")
                     .to_string();
                 assert!(err.contains("not a process id"), "{err}");
             }
         }
         // The largest real pid is still signalled - as ESRCH, which is `Ok`.
-        assert!(signal_pid(u32::MAX / 2, VmSignal::GracefulStop).is_ok());
+        assert!(signal_pid(u32::MAX / 2, None, VmSignal::GracefulStop).is_ok());
+    }
+
+    /// The starttime field is counted from the end of the comm field, which
+    /// the kernel pads with whatever the process's name made of it - spaces
+    /// included.
+    #[test]
+    fn process_start_time_reads_field_22_wherever_the_comm_ends() {
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        let started_at = process_start_time(pid).expect("a live child has a stat");
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(started_at > 0);
+        assert_eq!(process_start_time(u32::MAX - 1), None, "no stat, no answer");
     }
 
     /// The stop byte leaves from the signal handler itself, and a signal that

@@ -14,12 +14,15 @@ binary.
 ## Quickstart
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/alis-is/terrarium/main/install.sh | sh
+curl -fsSLO https://raw.githubusercontent.com/alis-is/terrarium/main/install.sh
+sh install.sh
 ```
 
-Installs the latest release: `/usr/local/bin/terra` on Linux,
-`/opt/homebrew/bin` (or `/usr/local/bin`) on macOS. Prefer building from
-source? [README.dev.md](README.dev.md).
+The script verifies the release checksum before it puts anything in place, and
+installs the latest release: `/usr/local/bin/terra` on Linux,
+`/opt/homebrew/bin` (or `/usr/local/bin`) on macOS. Pin one with
+`TERRA_VERSION=x.y.z sh install.sh`. Prefer building from source?
+[README.dev.md](README.dev.md).
 
 Then sandbox a project:
 

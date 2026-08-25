@@ -1,31 +1,35 @@
 //! Stopping a box: ask the guest to shut down, wait out the grace, kill what is
 //! still there.
 
-use crate::state::BoxRef;
+use crate::state::{BoxRef, Holder, VmProcess};
 use crate::sys;
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-fn signal_vm(bx: &BoxRef, signal: sys::VmSignal) -> Result<Option<u32>> {
-    let Some(pid) = bx.vm_pid() else {
+fn signal_vm(bx: &BoxRef, signal: sys::VmSignal) -> Result<Option<VmProcess>> {
+    let Some(vm) = bx.vm_process() else {
         return Ok(None);
     };
-    sys::signal_pid(pid, signal)
-        .with_context(|| format!("signalling the VM process (pid {pid}) of {bx}"))?;
-    Ok(Some(pid))
+    sys::signal_pid(vm.pid, vm.started_at, signal)
+        .with_context(|| format!("signalling the VM process (pid {}) of {bx}", vm.pid))?;
+    Ok(Some(vm))
 }
 
-/// Hand back the pid the graceful stop was asked of; `Ok(None)` means the box
-/// was already stopped.
-fn request_stop(bx: &BoxRef, deadline: Instant) -> Result<Option<u32>> {
+/// Ask the box's VM to stop, returning it for the forced kill if the grace
+/// runs out; `Ok(None)` means the box was already stopped.
+fn request_stop(bx: &BoxRef, deadline: Instant) -> Result<Option<VmProcess>> {
     loop {
-        if !bx.holder().holds() {
-            return Ok(None);
+        match bx.holder() {
+            Holder::Free => return Ok(None),
+            Holder::SettingUp if bx.vm_process().is_none() => {
+                return Err(bx.setup_holds_it());
+            }
+            Holder::Running | Holder::SettingUp => {}
         }
-        if let Some(pid) = signal_vm(bx, sys::VmSignal::GracefulStop)? {
-            return Ok(Some(pid));
+        if let Some(vm) = signal_vm(bx, sys::VmSignal::GracefulStop)? {
+            return Ok(Some(vm));
         }
         anyhow::ensure!(
             Instant::now() < deadline,
@@ -63,16 +67,17 @@ pub(crate) enum StopOutcome {
 
 pub(crate) fn stop_and_wait(bx: &BoxRef, grace: Duration) -> Result<StopOutcome> {
     let deadline = sys::deadline_after(grace);
-    let Some(pid) = request_stop(bx, deadline)? else {
+    let Some(vm) = request_stop(bx, deadline)? else {
         return Ok(StopOutcome::AlreadyStopped);
     };
-    eprintln!("terra: stopping {bx} (pid {pid})");
+    eprintln!("terra: stopping {bx} (pid {})", vm.pid);
     if wait_until_stopped(bx, deadline) {
         return Ok(StopOutcome::StoppedGracefully);
     }
     eprintln!(
-        "terra: {bx} did not stop within {}s - killing pid {pid}",
-        grace.as_secs()
+        "terra: {bx} did not stop within {}s - killing pid {}",
+        grace.as_secs(),
+        vm.pid
     );
     signal_vm(bx, sys::VmSignal::ForcedStop)?;
     Ok(if wait_until_stopped(bx, Instant::now() + KILL_REAP_WAIT) {
@@ -162,12 +167,33 @@ mod tests {
         let (bx, _home) = box_in(dir.path());
         // `lock_run` empties the file, so this is a box held with no pid in it.
         let _held = bx.lock_run().unwrap();
-        assert_eq!(bx.vm_pid(), None);
+        assert_eq!(bx.vm_process(), None);
 
         let err = stop_and_wait(&bx, Duration::from_millis(200))
             .expect_err("a box held with no pid to signal must not read as stopped")
             .to_string();
         assert!(err.contains("published no pid"), "{err}");
+    }
+
+    /// A bake marks its box and serves nothing to talk to, so waiting it out
+    /// reads as a hang for exactly as long as the bake takes. A mark with no
+    /// published pid refuses immediately, saying what actually holds the box.
+    #[test]
+    fn a_bake_mark_with_no_pid_refuses_without_waiting_out_the_grace() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bx, _home) = box_in(dir.path());
+        let lock = bx.lock_run().unwrap();
+        let marked = bx.mark_baking(&lock);
+        assert_eq!(bx.vm_process(), None, "the mark precedes any child");
+
+        // Long enough that a regression to wait-it-out would fail the test run
+        // long before this grace expires.
+        let err = format!(
+            "{:#}",
+            stop_and_wait(&bx, Duration::from_mins(1)).expect_err("a bake is refused")
+        );
+        assert!(err.contains("being set up"), "{err}");
+        drop(marked);
     }
 
     /// The graceful path end to end: the published pid is signalled, and the

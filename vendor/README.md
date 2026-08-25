@@ -5,6 +5,15 @@ any of them. Init them with `git submodule update --init`, **not** `--recursive`
 `vendor/smolvm` has its own libkrun/libkrunfw/sdk submodules on ssh URLs that
 nothing here builds from.
 
+## Upstreaming policy
+
+The forks exist so a fix has somewhere to land while it travels; they are
+temporary by intent. Every change a submodule carries must be merged upstream
+before the pin next moves, and the goal for all three is pristine-upstream
+tracking: a pin bump is a version move, never a patch migration. A local
+change with no open upstream PR is a bug in this policy — file the PR first,
+then bump.
+
 `vendor/libkrunfw/` — upstream
 [libkrunfw](https://github.com/containers/libkrunfw). The top-level Makefile
 builds its patched-and-configured Linux 6.12.91 kernel (`vmlinux`), which terra
@@ -32,6 +41,18 @@ policy, so a submodule bump that lost them fails a test rather than a review.
 
 The musl C toolchain used to build terra is provided by `zig`
 (`scripts/zig-musl-*`); no cross-gcc install is required.
+
+## Upstream wishlist
+
+What terra would carry locally if the policy above allowed it — the asks to
+file when a pin bump brings them within reach:
+
+- **libkrun:** an fd-taking virtiofs entry point —
+  `krun_add_virtiofs_fd(ctx_id, tag, fd, shm_size, read_only)` accepting an
+  `O_PATH|O_DIRECTORY` descriptor. Every variant today takes a path, which
+  libkrun re-resolves when it opens the share; a mount pinned to an inode
+  instead would close the share-path TOCTOU marked `ponytail:` on
+  [`config::resolve_mounts`](../crates/terra/src/config.rs).
 
 ## Bumping libkrun / libkrunfw / smolvm
 

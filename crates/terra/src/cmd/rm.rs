@@ -2,8 +2,10 @@
 //! `--force` takes the box from a running VM.
 
 use crate::cmd::stop::{StopOutcome, stop_and_wait};
+use crate::state::BoxRef;
 use crate::{resolve, state};
 use anyhow::{Context, Result};
+use std::fs::File;
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -19,28 +21,16 @@ pub fn run(args: &crate::cli::RmArgs, name: Option<&str>, project_dir: &Path) ->
         bx.project_dir().display()
     );
 
-    // `--force` is the exception the lock is for: a wedged VM's box is removed
-    // without it, so a boot starting the moment that VM dies races the
-    // deletion.
+    // A wedged VM's holder never releases the lock, so `--force` alone removes
+    // without it - accepting the race against whatever boots once the wedge ends.
     let _lock = if args.force {
-        if bx.holder().holds() {
+        let stopped = if bx.holder().holds() {
             eprintln!("terra: {bx} is running - asking it to stop before removing it");
-
-            match stop_and_wait(bx, Duration::from_secs(args.wait)) {
-                Ok(
-                    StopOutcome::AlreadyStopped
-                    | StopOutcome::StoppedGracefully
-                    | StopOutcome::Killed,
-                ) => {}
-                Ok(StopOutcome::Wedged) => {
-                    eprintln!("terra: {bx} survived SIGKILL - removing its files anyway");
-                }
-                // Nothing was killed: the box published no pid to signal, so
-                // there is no VM process to take it away from.
-                Err(e) => eprintln!("terra: {e:#} - removing it anyway"),
-            }
-        }
-        bx.lock_run().ok()
+            stop_and_wait(bx, Duration::from_secs(args.wait))
+        } else {
+            Ok(StopOutcome::AlreadyStopped)
+        };
+        lock_after_stop(bx, stopped)?
     } else {
         Some(bx.lock_run()?)
     };
@@ -77,6 +67,19 @@ pub fn run(args: &crate::cli::RmArgs, name: Option<&str>, project_dir: &Path) ->
     Ok(ExitCode::SUCCESS)
 }
 
+fn lock_after_stop(bx: &BoxRef, stopped: Result<StopOutcome>) -> Result<Option<File>> {
+    match stopped? {
+        StopOutcome::Wedged => {
+            eprintln!("terra: {bx} survived SIGKILL - removing its files anyway");
+            Ok(None)
+        }
+        StopOutcome::AlreadyStopped | StopOutcome::StoppedGracefully | StopOutcome::Killed => bx
+            .lock_run()
+            .map(Some)
+            .with_context(|| format!("another terra took {bx} as it stopped - nothing removed")),
+    }
+}
+
 /// Remove a project's `<box_dir>/<slug>/` once its last box is gone
 fn sweep_project_dir(project_dir: &Path) {
     let Ok(project) = state::project_state_dir(project_dir) else {
@@ -94,6 +97,95 @@ fn sweep_project_dir(project_dir: &Path) {
 mod tests {
     use super::*;
     use crate::state::BoxRef;
+
+    /// The race the lock exists for, from force's side: a stop that landed
+    /// cleanly hands the box back, and a rival terra booting it in between is
+    /// refused with its images intact - not deleted under it. `--force` then
+    /// only ever deletes over a VM that survived SIGKILL.
+    #[test]
+    fn a_box_another_took_as_it_stopped_is_not_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::sys::TestHome::new();
+        let bx = BoxRef::resolve(dir.path(), "dev").unwrap();
+        std::fs::create_dir_all(bx.dir()).unwrap();
+        std::fs::write(bx.rootfs_img(), b"image").unwrap();
+
+        // The winner of the race: holding the box when rm comes to collect.
+        let _rival = bx.lock_run().unwrap();
+        let err = format!(
+            "{:#}",
+            lock_after_stop(&bx, Ok(StopOutcome::StoppedGracefully))
+                .expect_err("a box another terra holds must not be taken for removal")
+        );
+        assert!(err.contains("another terra took"), "{err}");
+        assert!(err.contains("as it stopped"), "{err}");
+        assert!(bx.rootfs_img().exists(), "the image was deleted anyway");
+
+        // A wedge is the one outcome that removes without the lock.
+        assert!(
+            lock_after_stop(&bx, Ok(StopOutcome::Wedged))
+                .unwrap()
+                .is_none(),
+            "a wedged VM never hands the lock back"
+        );
+
+        // A stop that found nothing to signal refuses too, naming itself.
+        let err = lock_after_stop(&bx, Err(anyhow::anyhow!("published no pid to signal")))
+            .expect_err("an unanswered stop must not read as permission to remove")
+            .to_string();
+        assert!(err.contains("published no pid"), "{err}");
+        assert!(bx.rootfs_img().exists());
+    }
+
+    /// `rm --force` against a held box whose holder never published a pid
+    /// refuses outright: there is no VM process to take the box away from, and
+    /// deleting whatever is on disk would be guessing at whose data it is.
+    #[test]
+    fn force_against_a_holder_that_published_no_pid_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::sys::TestHome::new();
+        let bx = BoxRef::resolve(dir.path(), "dev").unwrap();
+        std::fs::create_dir_all(bx.dir()).unwrap();
+        std::fs::write(bx.rootfs_img(), b"image").unwrap();
+        let _held = bx.lock_run().unwrap();
+        assert_eq!(bx.vm_process(), None);
+
+        let args = crate::cli::RmArgs {
+            purge: true,
+            force: true,
+            wait: 0,
+        };
+        let err = run(&args, Some("dev"), dir.path())
+            .expect_err("nothing was signalled, so nothing may be removed")
+            .to_string();
+        assert!(err.contains("published no pid"), "{err}");
+        assert!(bx.rootfs_img().exists(), "the image was deleted anyway");
+    }
+
+    /// A bake-marked box aborts `--force` as well - mid-bake deletion is what
+    /// `--rebuild` is for, and the mark says the box's own setup still owns it.
+    #[test]
+    fn force_never_deletes_mid_bake() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::sys::TestHome::new();
+        let bx = BoxRef::resolve(dir.path(), "dev").unwrap();
+        std::fs::create_dir_all(bx.dir()).unwrap();
+        std::fs::write(bx.rootfs_img(), b"image").unwrap();
+        let lock = bx.lock_run().unwrap();
+        let marked = bx.mark_baking(&lock);
+
+        let args = crate::cli::RmArgs {
+            purge: true,
+            force: true,
+            wait: 0,
+        };
+        let err = run(&args, Some("dev"), dir.path())
+            .expect_err("a box mid-bake must not be removed")
+            .to_string();
+        assert!(err.contains("being set up"), "{err}");
+        assert!(bx.rootfs_img().exists(), "the image was deleted mid-bake");
+        drop(marked);
+    }
 
     /// `rm` runs under the box lock, and that lock lives on `terra.pid`'s
     /// *inode* - so unlinking it mid-removal would end the exclusion while the

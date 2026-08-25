@@ -179,29 +179,30 @@ impl BoxRef {
         )
     }
 
-    /// The pid of the process owning this box's VM, meaningful only while the
-    /// lock is held. `None` means the file holds no pid to signal.
-    ///
-    /// Between reading this and signalling it the VM can still exit and the
-    /// pid be recycled to a stranger - accepted; closing it needs pidfds,
-    /// which only Linux has.
-    pub fn vm_pid(&self) -> Option<u32> {
-        self.lock_line()
-            .split_whitespace()
-            .next()?
-            .parse()
-            .ok()
-            .filter(|pid| *pid > 0)
+    pub fn vm_process(&self) -> Option<VmProcess> {
+        let line = self.lock_line();
+        let mut words = line.split_whitespace();
+        let pid = words.next()?.parse().ok().filter(|pid| *pid > 0)?;
+        let started_at = words.next().and_then(|w| w.parse().ok());
+        Some(VmProcess { pid, started_at })
+    }
+
+    fn marked_baking(&self) -> bool {
+        self.lock_line().split_whitespace().any(|w| w == BAKE_MARK)
     }
 
     /// A failed write is worth a warning: `terra stop` finds this VM by the pid
     /// published here.
     pub fn publish_pid(&self, pid: u32, baking: bool) {
-        let line = if baking {
-            format!("{pid} {BAKE_MARK}")
-        } else {
-            pid.to_string()
-        };
+        use std::fmt::Write as _;
+        let mut line = pid.to_string();
+        if let Some(started_at) = crate::sys::process_start_time(pid) {
+            let _ = write!(line, " {started_at}");
+        }
+        if baking {
+            line.push(' ');
+            line.push_str(BAKE_MARK);
+        }
         if let Err(e) = std::fs::write(self.pid_file(), line) {
             eprintln!("terra: warning: could not publish pid {pid} for {self}: {e}");
         }
@@ -213,7 +214,7 @@ impl BoxRef {
         if !holds_lock(&self.pid_file()) {
             return Holder::Free;
         }
-        if self.lock_line().split_whitespace().any(|w| w == BAKE_MARK) {
+        if self.marked_baking() {
             return Holder::SettingUp;
         }
         Holder::Running
@@ -276,11 +277,18 @@ impl BoxRef {
                 let _ = file.set_len(0);
                 Ok(file)
             }
-            Err(TryLockError::WouldBlock) => bail!(
-                "{} is already in use by another terra - `terra stop` it, or \
-                 `terra rm --force` to take the box away from it",
-                self.dir.display()
-            ),
+            Err(TryLockError::WouldBlock) => {
+                if self.marked_baking() {
+                    return Err(self.setup_holds_it());
+                }
+                bail!(
+                    "{} is locked by another terra command{} - a bake, export or \
+                     import holds the box for minutes",
+                    self.dir.display(),
+                    self.vm_process()
+                        .map_or_else(String::new, |vm| format!(" (pid {})", vm.pid)),
+                )
+            }
             Err(TryLockError::Error(e)) => {
                 Err(e).with_context(|| format!("locking {}", path.display()))
             }
@@ -305,6 +313,17 @@ impl Drop for BakeMark<'_> {
     fn drop(&mut self) {
         let _ = self.0.set_len(0);
     }
+}
+
+/// The VM process a box's pid file names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VmProcess {
+    pub pid: u32,
+    /// The process's `/proc` starttime when the pid was published, by which
+    /// [`crate::sys::signal_pid`] tells this VM from a stranger later
+    /// recycled onto the pid. `None` - an old line, or `/proc` had nothing -
+    /// signals unverified.
+    pub started_at: Option<u64>,
 }
 
 /// Who holds a box's run lock.
@@ -1000,6 +1019,33 @@ mod tests {
         hold_briefly(File::try_lock_shared);
     }
 
+    /// A contended lock names the command holding it instead of advising
+    /// `terra stop`: a bake or a storage export legitimately keeps the box for
+    /// minutes, and stopping it is not what the contender wants to be told.
+    /// A box mid-bake answers with the setup refusal, which says what the
+    /// holder actually is.
+    #[test]
+    fn contention_names_the_command_holding_the_box() {
+        let _home = TestHome::new();
+        let dir = tempfile::tempdir().unwrap();
+        let b = bx(dir.path());
+        std::fs::create_dir_all(b.dir()).unwrap();
+
+        let lock = b.lock_run().unwrap();
+        b.publish_pid(4242, false);
+        let err = b.lock_run().expect_err("the box is held").to_string();
+        assert!(
+            err.contains("locked by another terra command (pid 4242)"),
+            "{err}"
+        );
+        assert!(!err.contains("terra stop"), "no stop advice: {err}");
+
+        let marked = b.mark_baking(&lock);
+        let err = format!("{:#}", b.lock_run().expect_err("the box is held"));
+        assert!(err.contains("being set up"), "{err}");
+        drop(marked);
+    }
+
     /// Asking who holds a box must not itself look like holding it: the probe
     /// takes a *shared* lock, so a second probe in flight - `terra ls` beside
     /// the poll loop in `terra stop`, which is a pairing that happens
@@ -1046,20 +1092,43 @@ mod tests {
         let b = bx(dir.path());
         std::fs::create_dir_all(b.dir()).unwrap();
 
-        assert_eq!(b.vm_pid(), None, "no pid file at all");
+        assert_eq!(b.vm_process(), None, "no pid file at all");
         for bad in ["", "  ", "0", "-1", "nonsense", BAKE_MARK] {
             std::fs::write(b.pid_file(), bad).unwrap();
-            assert_eq!(b.vm_pid(), None, "{bad:?} is not a pid");
+            assert_eq!(b.vm_process(), None, "{bad:?} is not a pid");
             assert_eq!(b.holder(), Holder::Free, "{bad:?} under no lock");
         }
 
         b.publish_pid(4242, false);
-        assert_eq!(b.vm_pid(), Some(4242));
+        let published = b.vm_process().unwrap();
+        assert_eq!(published.pid, 4242);
+        assert_eq!(
+            published.started_at,
+            crate::sys::process_start_time(4242),
+            "the starttime is read off /proc and round-trips"
+        );
         b.publish_pid(4242, true);
-        assert_eq!(b.vm_pid(), Some(4242), "a marked line still names its pid");
+        let marked = b.vm_process().unwrap();
+        assert_eq!(marked.pid, 4242, "a marked line still names its pid");
+        assert_eq!(
+            marked.started_at, published.started_at,
+            "the mark rides behind the starttime"
+        );
+
+        // A line from before starttimes were recorded still reads.
+        std::fs::write(b.pid_file(), "4242").unwrap();
+        let legacy = b.vm_process().unwrap();
+        assert_eq!(legacy.pid, 4242);
+        assert_eq!(legacy.started_at, None, "the old format has no starttime");
+        std::fs::write(b.pid_file(), "4242 bake").unwrap();
+        assert_eq!(
+            b.vm_process().unwrap().started_at,
+            None,
+            "a bare word where the starttime belongs reads as absent"
+        );
 
         let lock = b.lock_run().unwrap();
-        assert_eq!(b.vm_pid(), None, "the last run's pid outlived its lock");
+        assert_eq!(b.vm_process(), None, "the last run's pid outlived its lock");
         assert_eq!(
             b.holder(),
             Holder::Running,
@@ -1074,16 +1143,28 @@ mod tests {
         // for a stopped box. The guard puts the file back however it ended.
         let marked = b.mark_baking(&lock);
         assert_eq!(b.holder(), Holder::SettingUp, "the mark alone is a mark");
-        assert_eq!(b.vm_pid(), None, "a bake marks the box before it has a pid");
+        assert_eq!(
+            b.vm_process(),
+            None,
+            "a bake marks the box before it has a pid"
+        );
         b.publish_pid(4242, true);
         assert_eq!(b.holder(), Holder::SettingUp);
-        assert_eq!(b.vm_pid(), Some(4242), "and publishes both once it has one");
+        assert_eq!(
+            b.vm_process().map(|vm| vm.pid),
+            Some(4242),
+            "and publishes both once it has one"
+        );
         drop(marked);
         assert_eq!(b.holder(), Holder::Running);
-        assert_eq!(b.vm_pid(), None, "the bake child's pid outlived the bake");
+        assert_eq!(
+            b.vm_process(),
+            None,
+            "the bake child's pid outlived the bake"
+        );
 
         b.publish_pid(std::process::id(), false);
-        assert_eq!(b.vm_pid(), Some(std::process::id()));
+        assert_eq!(b.vm_process().map(|vm| vm.pid), Some(std::process::id()));
 
         drop(lock);
         assert_eq!(b.holder(), Holder::Free);
