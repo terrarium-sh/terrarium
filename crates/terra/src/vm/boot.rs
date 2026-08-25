@@ -109,7 +109,8 @@ pub fn run_bake(cfg: &config::Config, bx: &BoxRef, lock: &File) -> Result<()> {
         }
         anyhow::bail!(
             "the on_create bake failed - fix the recipe, then `terra {} setup` re-runs \
-             it (`--rebuild` for a clean slate)",
+             it (`--rebuild` for a clean slate); TERRA_DIAGNOSTICS=1 keeps the guest's \
+             console in diagnostics.log",
             bx.name()
         );
     }
@@ -149,16 +150,16 @@ fn override_workload(cfg: &mut config::Config, command: &[String]) {
 /// pipe is read once and exists nowhere else.
 fn spawn_vm_process(bx: &BoxRef, spec: &BootSpec, lock: &File) -> Result<std::process::Child> {
     use std::process::{Command, Stdio};
-    let log = crate::logs::open_for_a_run(bx)?;
-    let log_err = log.try_clone().context("duplicating the log handle")?;
     let exe = std::env::current_exe().context("locating the terra binary")?;
     let json = serde_json::to_string(spec).context("encoding the boot for the VM process")?;
     let mut cmd = Command::new(exe);
     cmd.arg(VM_PROCESS_FLAG_ARG)
         .arg(bx.dir())
         .stdin(Stdio::piped())
-        .stdout(log)
-        .stderr(log_err);
+        // The child writes its own log through tracing; direct stdout/stderr
+        // writers go nowhere unless TERRA_DIAGNOSTICS repoints them.
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     sys::detach(&mut cmd);
     sys::pass_lock(&mut cmd, lock);
     let mut child = cmd.spawn().context("starting the background terra")?;
@@ -174,7 +175,9 @@ const REPLAY_LOG_TAIL_BYTES: u64 = 64 << 10; // 64 KiB
 
 fn log_tail(path: &Path) -> String {
     use std::io::{Read, Seek, SeekFrom};
-    let Ok(mut f) = sys::open_no_symlinks(path) else {
+    // Plain open, symlinks followed: the log name is terra's own symlink to
+    // the appender's current generation.
+    let Ok(mut f) = std::fs::File::open(path) else {
         return String::new();
     };
     let len = f.metadata().map(|m| m.len()).unwrap_or_default();

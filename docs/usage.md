@@ -121,8 +121,8 @@ myproject/                            # your files, and nothing else
         ├── a             # the agent's port: every session, `terra put`/`get` and `terra exec`
         ├── terra.pid     # the VM process — `terra stop` signals it, and the lock on it is what keeps one VM per box
         ├── baking        # present only while an `on_create` bake holds the box
-        ├── terra.log     # the box's diagnostics: terra's, libkrun's, the gateway's, the guest's boot and hooks
-        └── terra.log.1   # the generation terra.log last rolled off (see *Logs*)
+        ├── terra.log     # the box's diagnostics: terra's, libkrun's, the gateway's (rotated: terra.<date>.log alongside)
+        └── diagnostics.log # only under TERRA_DIAGNOSTICS=1: the guest console and stray host output, fresh per run
 ```
 
 It is out of the tree because of what a share means. A mount hands the guest
@@ -255,7 +255,7 @@ defaulting to the directory's only box:
 | `terra [BOX] storage <show\|export\|import\|prune>` | the box's images — its guest filesystem and volumes. `show` lists them with what each is sized to and what it actually costs on disk (they are sparse, so the two differ a lot), marking any the recipe no longer names; `export FILE` writes them all to one compressed file and `import FILE` replaces another box's images with them, so a box set up from the same recipe elsewhere gets this one's state; `prune` removes the volume images the recipe dropped, and their data with them. `export` and `import` take the box's lock, so neither runs against a live VM |
 | `terra [BOX] show` [`--with-env-values`] | the fully-resolved config a run would use: the pinned recipe once the box exists, whatever the source it was pinned from says now. A recipe named by *path* is read as a file, which is how one is reviewed before there is a box. `env:` values print as a placeholder — this output is made to be redirected or pasted into a bug report — and `--with-env-values` is how you ask for them, which is also how you read back what an `env_file:` merged in. A recipe `terra setup` would refuse still prints, with a warning: reading one is what `show` is for, and `terra <box> setup --dry-run` is what answers that question outright, for the recipe that setup would actually pin |
 | `terra ls` (`terra ps`) | created? running? — every box of the directory, with where each one's files are (details are `show`'s). `--all` lists every box on this machine instead, each with the directory it belongs to. `--tsv` prints one tab-separated line per box — state, name, directory, files — the format scripts may rely on |
-| `terra [BOX] logs` [`-f`] | the box's diagnostics — terra's, libkrun's and the gateway's, plus the guest's boot and hooks. The workload's terminal is not here; that is what attaching shows (see *Logs*) |
+| `terra [BOX] logs` [`-f`] | the box's diagnostics — terra's, libkrun's and the gateway's. The guest's boot and hooks are not in it; `TERRA_DIAGNOSTICS=1` keeps those in diagnostics.log. The workload's terminal is not here either; that is what attaching shows (see *Logs*) |
 
 Every one of them takes `--project DIR` to address a directory other than the
 current one (`ls --all` spans them all anyway). A bare `terra [BOX]` on a box
@@ -318,58 +318,50 @@ records the bake travels inside it.
 ## Logs
 
 A box has one log, `terra.log`, and it is the box's *diagnostics*: terra's own
-messages, libkrun's, the gateway's account of what it refused, and the guest's
-console — the kernel, the agent, and every `on_create`, `on_start` and
-`pre_stop` hook. `terra [BOX] logs` [`-f`] shows it.
+messages, libkrun's and the gateway's account of what it refused.
+`terra [BOX] logs` [`-f`] shows it.
 
-What is deliberately **not** in it is the workload's terminal. That one is the
-session's: the guest multiplexes it (see *the guest agent* below) and it reaches
-whoever is attached, nobody else. So the two questions have two answers —
-`terra logs` for *why is my box broken*, attaching for *what is it doing* — and
-the first no longer arrives interleaved with an escape sequence from the second,
-which used to corrupt a live TUI and every later replay of the log.
+What is deliberately **not** in it is the guest's console and the workload's
+terminal. The workload's terminal is the session's: the guest multiplexes it
+(see *the guest agent* below) and it reaches whoever is attached, nobody else.
+The console — the kernel, the agent, every `on_create`, `on_start` and
+`pre_stop` hook — is the guest's second stream, and it is discarded when
+nobody is listening: a spawned VM sends it to `/dev/null`, a `--foreground`
+VM keeps it on the terminal the process was started with. So the two questions
+have two answers — `terra logs` for *why is my box broken*, attaching for
+*what is it doing* — and neither arrives interleaved with an escape sequence
+from the other, which used to corrupt a live TUI and every later replay of the
+log.
 
-The split is one the guest already had: its diagnostics go to the console
-(`hvc0`), the workload gets a PTY, and terra hands libkrun the log for the
-console and nothing at all for the PTY. A bake has no say in this and needs
-none — an `on_create` VM serves no agent port, so its output has only the
-console to leave by, which is why `terra logs` follows a bake and why a failed
-one can still be read with nothing attached.
+When the guest's side of a failure is what you need, boot with
+`TERRA_DIAGNOSTICS=1`: the console and every stray host write — panics
+included — land in `diagnostics.log`, one fresh, unrotated file per run, next
+to `terra.log`. A bake that fails replays the tail of `terra.log` on the way
+out, which names the mistake on terra's side; the flag is how the guest's side
+is read.
 
-The consequence worth knowing: **a detached run nobody attaches to leaves no
-record of what it printed.** A workload that wants one writes it, to a volume
-that outlives the box's filesystem anyway. Terra does not keep it for you: a
+The consequence worth knowing: **a run nobody attaches to leaves no record of
+what it printed.** A workload that wants one writes it, to a volume that
+outlives the box's filesystem anyway. Terra does not keep it for you: a
 terminal is not a log, and a box that runs for a month would make it one.
 
-`--foreground` is the one exception, and for the reason the mode exists. That VM
-runs inside the terra process a service manager started, so the console *is*
-that process's stdout and no client will ever attach to relay the workload —
-there, the guest broadcasts its terminal to the console too (the plan's
-`workload_on_console`), and terra moves its own output into the log once the
-banner is said. A systemd unit gets the workload in its journal and the
-diagnostics in `terra logs`, which is the same division by another name.
+`--foreground` is the one exception, and for the reason the mode exists. That
+VM runs inside the terra process a service manager started, so the console
+*is* that process's stdout and no client will ever attach to relay the
+workload — there, the guest broadcasts its terminal to the console too (the
+plan's `workload_on_console`). A systemd unit gets the workload in its journal
+and the diagnostics in `terra logs`, which is the same division by another
+name.
 
-**The log rolls.** At 32 MiB the live file is copied to `terra.log.1` and
-emptied in place, with a line saying where the rest went. Exactly one generation
-is kept, so the log costs at most 64 MiB however much is written to it — which
-matters because a guest can drive it: a refused connection is a line here.
-`terra logs` reads both generations oldest first, so the seam does not show, and
-`-f` follows across a roll rather than going quiet or repeating itself.
-
-Copy-truncate rather than the cheaper rename, because libkrun *dups* the console
-descriptor it is handed and writes to that copy for the VM's whole life: a
-rename would leave the guest writing into the generation just rolled off, which
-the next roll would overwrite. Every writer opened the file `O_APPEND`, so
-emptying it puts all of them back at the front with no hole in between.
-
-The log starts empty on every boot and takes the rolled generation with it, so a
-box you restart often shows the run you are looking at rather than every run it
-ever had.
+**The log rolls.** Once a day the appender starts a new `terra.<date>.log` and
+repoints `terra.log` at it; the generations stay on disk, so a box you restart
+often shows one file per day it ran rather than every run it ever had. `-f`
+follows across the repoint without going quiet or repeating itself.
 
 Everything host-side is collected by one `tracing` subscriber, which is also
 what makes the gateway's own account of a refusal visible at all — those events
 were written to nobody for as long as terra installed no subscriber. `RUST_LOG`
-sets the level (libkrun defaults to `warn`, the gateway to `debug`).
+sets the level (terra's own records default to `info`, libkrun's to `warn`).
 
 A boot that never gets off the ground is reported by the process that spawned
 it: it replays the tail of the log rather than leaving you to go looking. (A

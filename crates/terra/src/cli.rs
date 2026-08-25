@@ -128,9 +128,10 @@ pub enum Cmd {
     /// Copy one file out of the box onto the host. A destination directory
     /// keeps the file's own name.
     Get(CopyArgs),
-    /// Show a box's log: the guest's boot and hooks, plus terra's and the
-    /// gateway's own diagnostics. The workload's terminal goes to the
-    /// session - attach to the box to see it live.
+    /// Show a box's log: terra's, libkrun's and the gateway's own diagnostics,
+    /// rotated as it grows. The guest's boot and hooks are not in it -
+    /// `TERRA_DIAGNOSTICS=1` keeps those in diagnostics.log. The workload's
+    /// terminal goes to the session - attach to the box to see it live.
     Logs(LogsArgs),
     /// Print the fully-resolved config a boot would use: the box's pinned
     /// recipe, or - for a box not set up yet, or a recipe named by path - the

@@ -22,10 +22,9 @@ compile_error!(
 
 pub use imp::{
     MAX_SOCK_PATH, claim_inherited_lock, create_no_symlinks, detach, disk_usage,
-    install_stop_signal_handlers, is_host_root, mode_of, open_no_symlinks, open_null,
-    open_owner_only, owner_only, pass_lock, pid_exists, point_stdio_at, process_start_time,
-    register_stop_channel, restrict_new_files, set_open_file_mode, share_owner, signal_pid,
-    terminating_signal,
+    install_stop_signal_handlers, is_host_root, mode_of, open_no_symlinks, open_null, owner_only,
+    pass_lock, pid_exists, point_stdio_at, process_start_time, register_stop_channel,
+    restrict_new_files, set_open_file_mode, share_owner, signal_pid, terminating_signal,
 };
 
 pub const POLL: std::time::Duration = std::time::Duration::from_millis(100);

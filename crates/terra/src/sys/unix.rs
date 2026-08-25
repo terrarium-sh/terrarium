@@ -4,7 +4,7 @@
 #![allow(unsafe_code)]
 
 use super::VmSignal;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::Result;
 use std::path::Path;
 use std::process::Command;
@@ -26,18 +26,6 @@ pub fn restrict_new_files() {
 
 pub fn open_null() -> Result<File> {
     File::open("/dev/null")
-}
-
-/// Refusing a symlink at the name: following a planted one would append
-/// guest console output to any file the launching user can write.
-pub fn open_owner_only(path: &Path) -> Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
 }
 
 /// Open for reading, refusing a symlink at **any** component (`openat2` with
@@ -74,6 +62,9 @@ fn explain(err: std::io::Error, path: &Path) -> std::io::Error {
 }
 
 // Off Linux there is no `openat2`, so only the final component is refused.
+#[cfg(not(target_os = "linux"))]
+use std::fs::OpenOptions;
+
 #[cfg(not(target_os = "linux"))]
 pub fn open_no_symlinks(path: &Path) -> Result<File> {
     let mut opts = OpenOptions::new();
@@ -369,6 +360,7 @@ pub fn point_stdio_at(file: &File) -> Result<()> {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    use std::fs::OpenOptions;
 
     fn scratch(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("terra-sys-{}-{name}", std::process::id()))

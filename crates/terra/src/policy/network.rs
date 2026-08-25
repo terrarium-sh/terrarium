@@ -291,8 +291,8 @@ enum DnsVerdict {
     Refuse,
 }
 
-impl Policy for BoxPolicy {
-    fn allows(&self, ip: IpAddr, port: Option<u16>) -> bool {
+impl BoxPolicy {
+    fn is_granted(&self, ip: IpAddr, port: Option<u16>) -> bool {
         if self.host.contains(&ip) {
             return self.host_grants.iter().any(|g| g.covers(port));
         }
@@ -321,6 +321,21 @@ impl Policy for BoxPolicy {
                     })
             }),
         }
+    }
+}
+
+impl Policy for BoxPolicy {
+    fn allows(&self, ip: IpAddr, port: Option<u16>) -> bool {
+        if self.is_granted(ip, port) {
+            tracing::trace!("terra: egress: allowed {}{}", ip, port_suffix(port));
+            return true;
+        }
+        tracing::warn!(
+            "terra: egress: blocked {}{} - no rule names it",
+            ip,
+            port_suffix(port)
+        );
+        false
     }
 
     fn rewrite(&self, ip: IpAddr) -> Option<IpAddr> {
@@ -363,6 +378,11 @@ impl Policy for BoxPolicy {
         // answering names itself, or the guest's own resolver would win.
         self.is_restricted() || !self.static_dns.is_empty()
     }
+}
+
+#[must_use]
+fn port_suffix(port: Option<u16>) -> String {
+    port.map_or(String::new(), |p| format!(":{p}"))
 }
 
 /// Only a full-length prefix counts: a range containing the gateway is a

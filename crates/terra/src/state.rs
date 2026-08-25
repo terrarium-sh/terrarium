@@ -163,12 +163,9 @@ impl BoxRef {
         self.dir.join("terra.log")
     }
 
-    pub fn log_rolled(&self) -> PathBuf {
-        self.dir.join("terra.log.1")
-    }
-
-    pub fn log_rolls(&self) -> PathBuf {
-        self.dir.join("terra.log.rolls")
+    /// Every writer that does not go through tracing, fresh per run.
+    pub fn diagnostics_log(&self) -> PathBuf {
+        self.dir.join("diagnostics.log")
     }
 
     pub fn logs_command(&self) -> String {
@@ -204,7 +201,7 @@ impl BoxRef {
             line.push_str(BAKE_MARK);
         }
         if let Err(e) = std::fs::write(self.pid_file(), line) {
-            eprintln!("terra: warning: could not publish pid {pid} for {self}: {e}");
+            tracing::warn!("terra: warning: could not publish pid {pid} for {self}: {e}");
         }
     }
 
@@ -223,7 +220,7 @@ impl BoxRef {
     #[must_use = "the bake mark is cleared when this drops"]
     pub fn mark_baking<'a>(&self, lock: &'a File) -> BakeMark<'a> {
         if let Err(e) = std::fs::write(self.pid_file(), BAKE_MARK) {
-            eprintln!("terra: warning: could not mark {self} as baking: {e}");
+            tracing::warn!("terra: warning: could not mark {self} as baking: {e}");
         }
         BakeMark(lock)
     }
@@ -881,8 +878,7 @@ mod tests {
             b.agent_sock(),
             b.pid_file(),
             b.log(),
-            b.log_rolled(),
-            b.log_rolls(),
+            b.diagnostics_log(),
         ] {
             assert!(
                 p.starts_with(b.dir()),
