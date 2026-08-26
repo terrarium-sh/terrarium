@@ -18,8 +18,13 @@ pub(crate) const DEFAULT_COLS: u16 = 80;
 /// reconnects, and [`Session::attach`] repaints it from the screen model.
 const OUTBOX: usize = 64;
 
-const MIN_ROWS: u16 = 5;
-const MIN_COLS: u16 = 20;
+pub(crate) const MIN_ROWS: u16 = 5;
+pub(crate) const MIN_COLS: u16 = 20;
+
+/// Ceilings on wire-reported sizes: `set_size` allocates a scrollback grid per
+/// cell, so an unclamped `u16::MAX` report would exhaust PID 1's memory.
+pub(crate) const MAX_ROWS: u16 = 512;
+pub(crate) const MAX_COLS: u16 = 1024;
 
 pub type Sink = Arc<Mutex<dyn Write + Send>>;
 
@@ -200,7 +205,10 @@ impl Session {
     pub fn set_client_size(&self, id: u64, rows: u16, cols: u16) -> Option<(u16, u16)> {
         let mut inner = lock(&self.inner);
         if let Some(c) = inner.clients.iter_mut().find(|c| c.id == id) {
-            c.size = Some((rows.max(MIN_ROWS), cols.max(MIN_COLS)));
+            c.size = Some((
+                rows.clamp(MIN_ROWS, MAX_ROWS),
+                cols.clamp(MIN_COLS, MAX_COLS),
+            ));
         }
         inner.shared_size()
     }
@@ -430,6 +438,12 @@ mod tests {
         assert_eq!(
             session.set_client_size(idb, 1, 1),
             Some((MIN_ROWS, MIN_COLS))
+        );
+        // So does the ceiling: the screen model allocates a cell per row×col,
+        // and the size arrives from the wire.
+        assert_eq!(
+            session.set_client_size(idb, u16::MAX, u16::MAX),
+            Some((MAX_ROWS, MAX_COLS))
         );
         // The last sized client leaving reverts the session to the default -
         // a departed terminal's size must not outlive it.

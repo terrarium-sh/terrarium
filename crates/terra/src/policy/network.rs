@@ -3,9 +3,7 @@
 
 use crate::config::{Network, NetworkMode, StaticDnsRecord};
 use anyhow::{Result, bail};
-use smolvm_network::{
-    Cidr, DnsDecision, FloorMode, GuestNetworkConfig, Policy, PortMapping, dns, is_floored,
-};
+use smolvm_network::{Cidr, DnsDecision, FloorMode, Policy, PortMapping, dns, is_floored};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Mutex;
@@ -22,32 +20,10 @@ const EGRESS_FLOOR: FloorMode = FloorMode::Strict;
 /// real name can collide with it.
 const HOST_LOOPBACK_SYMBOL: &str = "HOST_LOOPBACK";
 
-/// The addresses that are the machine terra runs on - the v4/v6 pair plus
-/// the EUI-64 link-local `smolvm_network::stack` derives from the same MAC.
-#[must_use]
-const fn gateway_self_addrs(net: &GuestNetworkConfig) -> [IpAddr; 3] {
-    let mac = net.gateway_mac;
-    [
-        IpAddr::V4(net.gateway_ip),
-        IpAddr::V6(net.gateway_ip6),
-        IpAddr::V6(Ipv6Addr::new(
-            0xfe80,
-            0,
-            0,
-            0,
-            u16::from_be_bytes([mac[0] ^ 0x02, mac[1]]),
-            u16::from_be_bytes([mac[2], 0xff]),
-            u16::from_be_bytes([0xfe, mac[3]]),
-            u16::from_be_bytes([mac[4], mac[5]]),
-        )),
-    ]
-}
-
 /// Short, so a guest that caches an answer does not hold it past a
 /// reconfiguration.
 const STATIC_TTL: u32 = 60;
 
-/// Learned-IP TTL clamp, matching the gateway's own DNS filter.
 const MIN_LEARNED_TTL: u64 = 60;
 const MAX_LEARNED_TTL: u64 = 3600;
 
@@ -110,7 +86,7 @@ fn parse_port_number(text: &str) -> Option<u16> {
 /// mid-boot, after `terra setup` pinned the recipe and the `y` was given.
 /// This builds exactly what a boot would and throws it away.
 pub fn validate(net: &Network) -> Result<()> {
-    BoxPolicy::new(net, &GuestNetworkConfig::default()).map(drop)
+    BoxPolicy::new(net).map(drop)
 }
 
 pub fn describe(net: &Network) -> &'static str {
@@ -140,12 +116,18 @@ pub struct BoxPolicy {
     learned_dns: Mutex<HashMap<(IpAddr, Port), Instant>>,
     static_dns: HashMap<String, Vec<IpAddr>>,
     host_grants: Vec<Port>,
-    host: [IpAddr; 3],
+    host: [IpAddr; 2],
 }
 
 impl BoxPolicy {
-    pub fn new(net: &Network, guest_net: &GuestNetworkConfig) -> Result<Self> {
-        let gateway_addrs = gateway_self_addrs(guest_net);
+    pub fn new(net: &Network) -> Result<Self> {
+        // The gateway's v4 and ULA endpoints are what HOST_LOOPBACK grants.
+        // Nothing here calls the host by link-local - guests are supposed to use IPv4/6.
+        let layout = smolvm_network::GuestNetworkConfig::default();
+        let gateway_addrs = [
+            IpAddr::V4(layout.gateway_ip),
+            IpAddr::V6(layout.gateway_ip6),
+        ];
         let mut static_dns: HashMap<String, Vec<IpAddr>> = HashMap::new();
         for rule in &net.hosts {
             let (key, addrs) = parse_dns_record(rule, &gateway_addrs)?;
@@ -507,7 +489,7 @@ fn classify(entry: &str, host: &str, port: Port) -> Result<Rule> {
 
 fn parse_dns_record(
     rule: &StaticDnsRecord,
-    gateway_addrs: &[IpAddr; 3],
+    gateway_addrs: &[IpAddr; 2],
 ) -> Result<(String, Vec<IpAddr>)> {
     if rule.name.trim().is_empty() {
         bail!("hosts record has an empty 'name'");
@@ -545,10 +527,13 @@ fn parse_dns_record(
 mod tests {
     use super::*;
 
-    /// What the gateway terra starts is configured with - every address it
-    /// answers on itself included - and so what `HOST_LOOPBACK` resolves to
-    /// in these tests.
-    const HOST_ADDRS: [IpAddr; 3] = gateway_self_addrs(&GuestNetworkConfig::default());
+    /// What the gateway terra starts is configured with, minus its EUI-64
+    /// link-local (see [`BoxPolicy::new`]) - so what `HOST_LOOPBACK` resolves
+    /// to in these tests.
+    const HOST_ADDRS: [IpAddr; 2] = [
+        IpAddr::V4(smolvm_network::GuestNetworkConfig::default().gateway_ip),
+        IpAddr::V6(smolvm_network::GuestNetworkConfig::default().gateway_ip6),
+    ];
 
     fn net(mode: NetworkMode, allow: &[&str]) -> Network {
         Network {
@@ -560,7 +545,7 @@ mod tests {
     }
 
     fn build(network: &Network) -> Result<BoxPolicy> {
-        BoxPolicy::new(network, &GuestNetworkConfig::default())
+        BoxPolicy::new(network)
     }
 
     fn policy(mode: NetworkMode, allow: &[&str]) -> BoxPolicy {

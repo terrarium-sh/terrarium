@@ -22,7 +22,7 @@ use terra_shared::{Disk, Net, Plan, PlanMode, Share, WORKLOAD_UID};
 //   Run    - the workload boot: shares mounted, agent ports served, runs
 //            until stopped.
 
-const GUEST_NETWORK: GuestNetworkConfig = GuestNetworkConfig::default();
+pub(crate) const GUEST_NETWORK: GuestNetworkConfig = GuestNetworkConfig::default();
 
 /// Attach the box's block devices. The kernel cmdline and the boot plan name
 /// the devices this produces, so the add order *is* the contract:
@@ -79,7 +79,6 @@ fn attach_agent_port(krun: &libkrun_ext::Krun, bx: &BoxRef) -> Result<()> {
     krun.add_vsock_port(terra_shared::AGENT_VSOCK_PORT, &path, true)
 }
 
-/// Run the box's VM until the workload ends.
 pub fn run(spec: &BootSpec, bx: &BoxRef, _lock: File) -> Result<ExitCode> {
     // Before libkrun exists to log anything.
     logs::init(bx)?;
@@ -113,7 +112,6 @@ pub fn run(spec: &BootSpec, bx: &BoxRef, _lock: File) -> Result<ExitCode> {
     let _console = krun.add_console(null, console_file(spec, bx, diag.as_ref())?)?;
 
     let _net_rt = start_networking(&krun, &cfg.network)?;
-
     // The vsock device carries every port added after it.
     krun.add_vsock()?;
 
@@ -257,7 +255,7 @@ fn start_networking(
     let (host_end, krun_end) =
         std::os::unix::net::UnixStream::pair().context("creating virtio-net socketpair")?;
     krun.add_net_unixstream(krun_end, &guest_net.guest_mac)?;
-    let egress = network::BoxPolicy::new(net, &guest_net)?;
+    let egress = network::BoxPolicy::new(net)?;
     log::info!(
         "terra: egress: {} - loopback/LAN/private/CGNAT floored unless a rule names them",
         network::describe(net)

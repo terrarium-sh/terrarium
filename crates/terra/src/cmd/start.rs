@@ -112,7 +112,9 @@ pub fn run(
     let project_dir = approved.bx.project_dir().to_path_buf();
     let spec = boot::BootSpec::resolve(approved.cfg, args, project_dir, mode);
 
-    if prepared.fresh_rootfs && !spec.cfg.hooks.on_create.is_empty() {
+    if !spec.cfg.hooks.on_create.is_empty()
+        && (prepared.fresh_rootfs || !approved.bx.bake_stamp().exists())
+    {
         boot::run_bake(&spec.cfg, &approved.bx, &prepared.lock)?;
     }
     boot::start(&spec, &approved.bx, mode, prepared.lock)

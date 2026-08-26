@@ -81,6 +81,11 @@ impl BoxRef {
         self.dir.join("a")
     }
 
+    #[must_use]
+    pub fn bake_stamp(&self) -> PathBuf {
+        self.dir.join("baked")
+    }
+
     /// Refuse the box before anything is built - the alternative is
     /// `ENAMETOOLONG` buried in a half-done boot.
     pub fn ensure_sockets_fit(&self) -> Result<()> {

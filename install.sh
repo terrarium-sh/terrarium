@@ -61,9 +61,24 @@ fi
 
 chmod +x "$tmp/terra"
 
-if mkdir -p "$bin" && mv -f "$tmp/terra" "$bin/terra" 2>/dev/null; then
+if [ -e "$bin/terra" ] && ! [ -f "$bin/terra" ] && ! [ -L "$bin/terra" ]; then
+  echo "terrarium: $bin/terra exists but is not a regular file - move it aside first" >&2
+  exit 1
+fi
+
+if mkdir -p "$bin" && cp -f "$tmp/terra" "$bin/terra" 2>/dev/null; then
   :
 else
-  sudo mv -f "$tmp/terra" "$bin/terra"
+  # Escalating behind nobody's back stops here: the checksummed bytes are in
+  # $tmp, but what sudo does with them deserves a yes.
+  printf 'install to %s needs root privileges - run sudo cp? [y/N] ' "$bin"
+  read -r answer
+  case "$answer" in
+    y | Y | yes | Yes) sudo cp -f "$tmp/terra" "$bin/terra" ;;
+    *)
+      echo "nothing was installed" >&2
+      exit 1
+      ;;
+  esac
 fi
 echo "installed terra at $bin/terra"

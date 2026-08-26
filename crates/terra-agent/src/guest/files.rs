@@ -119,7 +119,8 @@ pub fn serve_file_op(mut conn: impl Read + std::io::Write, root: bool) {
                                 "short transfer: {copied} of {size} bytes"
                             )));
                         }
-                        file.set_permissions(std::fs::Permissions::from_mode(mode))
+                        // Strip file-type bits (S_IFMT) to retain only the standard permission and special bits (setuid/setgid/sticky).
+                        file.set_permissions(std::fs::Permissions::from_mode(mode & 0o7777))
                     });
                     // `fchown` the open descriptor, best-effort - without CAP_CHOWN over
                     // the backing file it must not fail a put whose copy has

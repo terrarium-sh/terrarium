@@ -153,6 +153,14 @@ workload:
   naming an address grants that address — reach it by address; a sandbox that
   needs to *resolve* something lists the name.
 
+  What a refusal feels like from inside the box: a TCP connect to something not
+  granted fails immediately with "connection refused" (a reset), while UDP and
+  ICMP go silently nowhere — the packets are dropped, so expect timeouts and
+  retry loops there rather than an error. A DNS name that is not allowed is
+  answered `NXDOMAIN` at once. Grants gate *connection setup*: a flow opened
+  while its rule was in force keeps running even after TTL expiry would deny a
+  fresh connection to the same address.
+
   **Local space is closed until something names it.** In both modes terra pins a
   strict egress floor: the host, the host's LAN, and every
   RFC1918/CGNAT/link-local/multicast range are unreachable by default. The floor

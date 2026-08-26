@@ -2,6 +2,7 @@
 //! pair of pipes), one process, one exit status. What sets it apart from a
 //! session is documented on [`terra_shared::AgentService`].
 
+use crate::term::session::{MAX_COLS, MAX_ROWS, MIN_COLS, MIN_ROWS};
 use crate::term::tty::set_winsize;
 use crate::vsock::VsockStream;
 use anyhow::Result;
@@ -132,7 +133,11 @@ fn exec_on_pty(
                     }
                 }
                 Ok(Some(ClientInput::Resize { rows, cols })) if rows > 0 && cols > 0 => {
-                    set_winsize(master_fd, rows, cols);
+                    set_winsize(
+                        master_fd,
+                        rows.clamp(MIN_ROWS, MAX_ROWS),
+                        cols.clamp(MIN_COLS, MAX_COLS),
+                    );
                 }
                 Ok(Some(ClientInput::Resize { .. })) => {}
                 // A PTY cannot be half-closed, so end-of-input is the byte a real

@@ -114,6 +114,8 @@ pub fn run_bake(cfg: &config::Config, bx: &BoxRef, lock: &File) -> Result<()> {
             bx.name()
         );
     }
+    crate::vm::image::staged_write(&bx.bake_stamp(), |_| Ok(()))
+        .with_context(|| format!("recording {}", bx.bake_stamp().display()))?;
     Ok(())
 }
 

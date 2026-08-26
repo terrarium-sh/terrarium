@@ -119,7 +119,12 @@ On the host side, a box's own directory is `0700` and everything terra creates i
 it is owner-only. The agent socket is bound by libkrun rather than terra, under a
 process umask libkrun clears for its own reasons partway through a boot — so the
 `0700` directory is what keeps another account off it, and its services act as
-guest root, so that mode is not a detail. The log carries terra's own
+guest root, so that mode is not a detail. That also makes it a load-bearing
+dependency: this libkrun speaks vsock over a unix socket in that directory, and
+the filesystem is what authenticates its clients. Upstream libkrun's default is
+vhost-vsock, which has no socket file and would leave every local account able
+to dial the guest's root-capable exec service — protocol-level authentication
+(per boot, plan-delivered token) is a prerequisite before that pin moves. The log carries terra's own
 diagnostics; the guest's console reaches the disk only under
 `TERRA_DIAGNOSTICS=1`, in its own owner-only file; the rootfs image carries
 everything the guest ever wrote.

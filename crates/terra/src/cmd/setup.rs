@@ -270,6 +270,7 @@ pub fn prepare_box(approved: &ApprovedRecipe, rebuild: bool) -> Result<PreparedB
     if rebuild && img.exists() {
         eprintln!("terra: --rebuild: rebuilding {bx} from scratch");
         let _ = std::fs::remove_file(&img);
+        let _ = std::fs::remove_file(bx.bake_stamp());
     }
     let fresh = !img.exists();
     if fresh {
@@ -523,6 +524,32 @@ mod tests {
         sweep_or_keep_unused_volumes(&bx, &configured, true);
         assert!(!bx.volume_img("old").exists(), "--rebuild sweeps it");
         assert!(bx.volume_img("data").exists(), "a named volume was swept");
+    }
+
+    /// A stamp belongs to the rootfs it proves: `--rebuild` makes a new
+    /// filesystem, so the old bake's proof must go with it - or a rebuild
+    /// would inherit a bake that never ran on it.
+    #[test]
+    fn rebuild_takes_the_bake_stamp_with_the_rootfs() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::sys::TestHome::new();
+        let bx = BoxRef::resolve(dir.path(), "dev").unwrap();
+        std::fs::create_dir_all(bx.dir()).unwrap();
+        std::fs::write(bx.rootfs_img(), b"old").unwrap();
+        std::fs::write(bx.bake_stamp(), b"").unwrap();
+
+        let approved = ApprovedRecipe {
+            bx: bx.clone(),
+            cfg: yaml_serde::from_str::<crate::config::Config>("{}").unwrap(),
+            new_pin: None,
+        };
+        prepare_box(&approved, true).unwrap();
+
+        assert!(bx.rootfs_img().exists(), "--rebuild left no rootfs behind");
+        assert!(
+            !bx.bake_stamp().exists(),
+            "the rebuilt box kept the old rootfs's bake stamp"
+        );
     }
 
     /// The whole of what a pinning does about the person, off the three things

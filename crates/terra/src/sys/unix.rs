@@ -182,17 +182,25 @@ pub fn pass_lock(cmd: &mut Command, lock: &File) {
 /// holding the box would let a second one boot over it.
 pub fn claim_inherited_lock(expected: &Path) -> Option<File> {
     use std::os::fd::FromRawFd;
+    let same = fd_opens_file(LOCK_FD, expected);
+    same.then(|| {
+        // SAFETY: fd 3 is ours (dup'd in by `pass_lock` before exec) and the
+        // check above already proved it is the box's lock.
+        unsafe { File::from_raw_fd(LOCK_FD) }
+    })
+}
+
+/// Whether the descriptor `fd` opens the file `path` names, compared through
+/// dev+ino without taking `fd` over.
+fn fd_opens_file(fd: i32, path: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
-    // SAFETY: `pass_lock` dup'd this descriptor into place before exec and
-    // nothing else in this process owns it. A closed or wrong one fails the
-    // check below, and the `File` closing it on drop is the right outcome.
-    let file = unsafe { File::from_raw_fd(LOCK_FD) };
-    let same = file
-        .metadata()
-        .ok()
-        .zip(std::fs::metadata(expected).ok())
-        .is_some_and(|(got, want)| got.dev() == want.dev() && got.ino() == want.ino());
-    same.then_some(file)
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `st` outlives the call and `fd` is read-only here.
+    if unsafe { libc::fstat(fd, &raw mut st) } != 0 {
+        return false;
+    }
+    let opened = std::fs::metadata(path).ok();
+    opened.is_some_and(|want| want.dev() == st.st_dev && want.ino() == st.st_ino)
 }
 
 /// The signal a child was killed by, or `None` if it exited on its own.
@@ -549,6 +557,32 @@ mod tests {
         );
         let _ = probe.unlock();
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The lock descriptor is claimed only when it really opens the pid file:
+    /// an unrelated fd 3 - what `terra __vm` typed at a shell inherits from
+    /// whatever spawned it - must read as not-the-lock, or a VM would run
+    /// without holding the box.
+    #[test]
+    fn the_handed_lock_descriptor_is_matched_by_identity() {
+        use std::os::fd::AsRawFd;
+        let lock_path = scratch("identity.pid");
+        let _ = std::fs::remove_file(&lock_path);
+        let lock = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        let unrelated_path = scratch("not-a-lock.txt");
+        std::fs::write(&unrelated_path, b"x").unwrap();
+        let unrelated = std::fs::File::open(&unrelated_path).unwrap();
+
+        assert!(fd_opens_file(lock.as_raw_fd(), &lock_path));
+        assert!(
+            !fd_opens_file(unrelated.as_raw_fd(), &lock_path),
+            "an unrelated descriptor passed as the box's lock"
+        );
     }
 
     /// The host end of `terra put`/`get` opens a path the *guest* can have prepared:
