@@ -36,6 +36,7 @@ network:
   mode: unrestricted-public              # or allowlist + explicit rules
 workload:
   entrypoint: /bin/sh                    # a shell instead of your app's cmd
+  workdir: /work                         # so the shell starts at your project
 EOF
 terra ./dev.yaml setup      # pin the recipe, build the box (runs on_create)
 terra                       # boot it — a shell, cwd at /work
