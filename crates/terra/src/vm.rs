@@ -273,6 +273,7 @@ fn start_networking(
         guest_net,
         &ports,
         egress,
+        None,
     )
     .context("starting host-side virtio-net runtime")
 }

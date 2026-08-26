@@ -1345,7 +1345,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-network"
-version = "1.7.5"
+version = "1.13.0"
 dependencies = [
  "crossbeam-queue",
  "humantime",
