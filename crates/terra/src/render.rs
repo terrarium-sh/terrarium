@@ -43,15 +43,15 @@ impl Options {
     pub const REDACTED: Self = Self { env_values: false };
 }
 
-pub fn config_yaml(cfg: &config::Config, options: Options) -> Result<String, serde_yaml::Error> {
+pub fn config_yaml(cfg: &config::Config, options: Options) -> Result<String, yaml_serde::Error> {
     if options.env_values {
-        return serde_yaml::to_string(cfg);
+        return yaml_serde::to_string(cfg);
     }
     let mut printable = cfg.clone();
     for v in printable.env.values_mut() {
         REDACTED_ENV_VALUE.clone_into(v);
     }
-    serde_yaml::to_string(&printable)
+    yaml_serde::to_string(&printable)
 }
 
 #[must_use]
@@ -206,7 +206,7 @@ mod tests {
                 ..Default::default()
             },
             env_file: Some(PathBuf::from("/data/.env\x1b[2J  mount:    /innocent")),
-            ..serde_yaml::from_str("{}").unwrap()
+            ..yaml_serde::from_str("{}").unwrap()
         };
         let summary = policy_summary(&cfg);
         for raw in ['\x1b', '\r', '\x07'] {
@@ -260,7 +260,7 @@ mod tests {
                 ("API_KEY".to_string(), "sk-super-secret".to_string()),
                 ("MODEL".to_string(), "gpt-4o".to_string()),
             ]),
-            ..serde_yaml::from_str("{}").unwrap()
+            ..yaml_serde::from_str("{}").unwrap()
         };
         let yaml = config_yaml(&cfg, Options::REDACTED).unwrap();
         for name in ["API_KEY", "MODEL"] {
@@ -288,7 +288,7 @@ mod tests {
         }
         assert!(!asked_for.contains(REDACTED_ENV_VALUE), "{asked_for}");
         assert_eq!(
-            serde_yaml::from_str::<config::Config>(&asked_for).unwrap(),
+            yaml_serde::from_str::<config::Config>(&asked_for).unwrap(),
             cfg,
             "what it prints is not the config it was given"
         );
@@ -319,7 +319,7 @@ mod tests {
                 "API_KEY".to_string(),
                 "sk\x1b[2J\x1b[H  workload: /bin/true".to_string(),
             )]),
-            ..serde_yaml::from_str("{}").unwrap()
+            ..yaml_serde::from_str("{}").unwrap()
         };
         for printed in [
             config_yaml(&cfg, Options::REDACTED).unwrap(),
@@ -346,7 +346,7 @@ mod tests {
     fn the_approval_summary_names_the_host_file_a_recipe_reads() {
         let cfg = config::Config {
             env_file: Some(PathBuf::from("/home/me/.aws/credentials")),
-            ..serde_yaml::from_str("{}").unwrap()
+            ..yaml_serde::from_str("{}").unwrap()
         };
         let summary = policy_summary(&cfg);
         assert!(
@@ -355,7 +355,7 @@ mod tests {
         );
 
         // A recipe naming no file says nothing about one.
-        let none = policy_summary(&serde_yaml::from_str("{}").unwrap());
+        let none = policy_summary(&yaml_serde::from_str("{}").unwrap());
         assert!(!none.contains("env_file"), "{none}");
     }
 
@@ -371,7 +371,7 @@ mod tests {
                 allow: vec!["HOST_LOOPBACK:22".to_string(), "10.0.0.0/8".to_string()],
                 ..Default::default()
             },
-            ..serde_yaml::from_str("{}").unwrap()
+            ..yaml_serde::from_str("{}").unwrap()
         };
         let summary = policy_summary(&cfg);
         for rule in ["HOST_LOOPBACK:22", "10.0.0.0/8"] {

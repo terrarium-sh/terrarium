@@ -240,9 +240,10 @@ pub struct PreparedBox {
 
 pub fn prepare_box(approved: &ApprovedRecipe, rebuild: bool) -> Result<PreparedBox> {
     let ApprovedRecipe { bx, cfg, new_pin } = approved;
-    prepare_box_state_dir(bx)?;
-    // Lock before the `--rebuild` delete: a running VM may be using the image.
+    // Locked before anything on disk moves - a setup racing a finished `rm`
+    // would otherwise resurrect the state directory after rm reported it gone.
     let lock = bx.lock_run()?;
+    prepare_box_state_dir(bx)?;
     // Under the lock anything staged here predates this run - a setup or boot
     // that died part-way through an install.
     crate::vm::image::sweep_staging_temps(bx.dir(), |_| false);
@@ -258,7 +259,11 @@ pub fn prepare_box(approved: &ApprovedRecipe, rebuild: bool) -> Result<PreparedB
         }
         crate::vm::image::staged_write(&recipe_path, |out| {
             out.write_all(r.text.as_bytes())
-                .with_context(|| format!("recording {}", recipe_path.display()))
+                .with_context(|| format!("recording {}", recipe_path.display()))?;
+            // Durable before the rename - the pin is what every later boot
+            // trusts, and nothing re-derives it.
+            out.sync_all()
+                .with_context(|| format!("syncing {}", recipe_path.display()))
         })?;
     }
     let img = bx.rootfs_img();

@@ -22,6 +22,8 @@ use terra_agent::{Disk, Net, Plan, PlanMode, Share, WORKLOAD_UID};
 //   Run    - the workload boot: shares mounted, agent ports served, runs
 //            until stopped.
 
+const GUEST_NETWORK: GuestNetworkConfig = GuestNetworkConfig::default();
+
 /// Attach the box's block devices. The kernel cmdline and the boot plan name
 /// the devices this produces, so the add order *is* the contract:
 ///   /dev/vda  boot volume (agent + resize2fs, read-only, roots the kernel)
@@ -111,8 +113,7 @@ pub fn run(spec: &BootSpec, bx: &BoxRef, _lock: File) -> Result<ExitCode> {
         .transpose()?;
     let _console = krun.add_console(null, console_file(spec, diag.as_ref())?)?;
 
-    let guest_net = GuestNetworkConfig::default();
-    let _net_rt = start_networking(&krun, &cfg.network, guest_net)?;
+    let _net_rt = start_networking(&krun, &cfg.network)?;
 
     // The vsock device carries every port added after it.
     krun.add_vsock()?;
@@ -121,7 +122,7 @@ pub fn run(spec: &BootSpec, bx: &BoxRef, _lock: File) -> Result<ExitCode> {
         attach_agent_port(&krun, bx)?;
     }
 
-    let plan = build_plan(spec, shares, volumes, &guest_net);
+    let plan = build_plan(spec, shares, volumes);
     serve_control_sock(&krun, bx, &plan)?;
 
     let (vcpus, mem) = (cfg.hw.cpus, cfg.hw.mem_mib);
@@ -156,13 +157,9 @@ pub fn run(spec: &BootSpec, bx: &BoxRef, _lock: File) -> Result<ExitCode> {
 }
 
 /// The resolved config the agent runs as PID 1.
-fn build_plan(
-    spec: &BootSpec,
-    shares: Vec<Share>,
-    volumes: Vec<Disk>,
-    guest_net: &GuestNetworkConfig,
-) -> Plan {
+fn build_plan(spec: &BootSpec, shares: Vec<Share>, volumes: Vec<Disk>) -> Plan {
     let cfg = &spec.cfg;
+    let net = GUEST_NETWORK;
     let baking = spec.mode == PlanMode::Create;
     Plan {
         mode: spec.mode,
@@ -175,10 +172,10 @@ fn build_plan(
         volumes,
         share_owner: sys::share_owner(),
         net: Net {
-            guest_ip: guest_net.guest_ip.to_string(),
-            prefix: guest_net.prefix_len,
-            gateway: guest_net.gateway_ip.to_string(),
-            dns: guest_net.dns_server.to_string(),
+            guest_ip: net.guest_ip.to_string(),
+            prefix: net.prefix_len,
+            gateway: net.gateway_ip.to_string(),
+            dns: net.dns_server.to_string(),
         },
         env: cfg.env.clone(),
         root: spec.root || baking,
@@ -190,7 +187,7 @@ fn build_plan(
         workload: std::iter::once(cfg.workload.entrypoint.to_string_lossy().into_owned())
             .chain(cfg.workload.args.iter().cloned())
             .collect(),
-        sandbox_info: generate_sandbox_info(cfg, guest_net, spec.root),
+        sandbox_info: generate_sandbox_info(cfg, spec.root),
     }
 }
 
@@ -222,7 +219,8 @@ fn diagnostics_on() -> bool {
 /// What the agent writes to `/terra/README.md`, so an AI agent looking
 /// around the box finds an explanation instead of guessing.
 #[must_use]
-fn generate_sandbox_info(cfg: &config::Config, net: &GuestNetworkConfig, root: bool) -> String {
+fn generate_sandbox_info(cfg: &config::Config, root: bool) -> String {
+    let net = GUEST_NETWORK;
     let yaml = config_yaml(cfg, Options::REDACTED).unwrap_or_default();
     let who = if root {
         "`root`".to_string()
@@ -251,8 +249,8 @@ fn generate_sandbox_info(cfg: &config::Config, net: &GuestNetworkConfig, root: b
 fn start_networking(
     krun: &libkrun_ext::Krun,
     net: &config::Network,
-    guest_net: GuestNetworkConfig,
 ) -> Result<smolvm_network::VirtioNetworkRuntime> {
+    let guest_net = GUEST_NETWORK;
     let (host_end, krun_end) =
         std::os::unix::net::UnixStream::pair().context("creating virtio-net socketpair")?;
     krun.add_net_unixstream(krun_end, &guest_net.guest_mac)?;
@@ -367,13 +365,13 @@ mod tests {
     #[test]
     fn sandbox_info_carries_the_resolved_config_as_yaml() {
         let mut cfg: config::Config =
-            serde_yaml::from_str("workload:\n  entrypoint: /bin/sh\n  args: [-c, make]\n").unwrap();
+            yaml_serde::from_str("workload:\n  entrypoint: /bin/sh\n  args: [-c, make]\n").unwrap();
         cfg.mounts = vec![config::Mount {
             host: PathBuf::from("/srv/models"),
             guest: PathBuf::from("/models"),
             readonly: true,
         }];
-        let info = generate_sandbox_info(&cfg, &GuestNetworkConfig::default(), false);
+        let info = generate_sandbox_info(&cfg, false);
         assert!(info.contains("# Terrarium sandbox"));
         assert!(info.contains("`/bin/sh -c make`"));
         assert!(info.contains("(uid 1000, non-root)"));
@@ -387,7 +385,7 @@ mod tests {
         assert!(info.contains("`sudo` - the commands"), "{info}");
 
         // --root: no privilege drop, and the doc says so.
-        let root = generate_sandbox_info(&cfg, &GuestNetworkConfig::default(), true);
+        let root = generate_sandbox_info(&cfg, true);
         assert!(root.contains("You run as `root`"), "{root}");
     }
 
@@ -396,7 +394,7 @@ mod tests {
     #[test]
     fn the_plan_carries_the_resolved_config() {
         let mut cfg: config::Config =
-            serde_yaml::from_str("workload:\n  entrypoint: /bin/sh\n  args: [-c, make]\n").unwrap();
+            yaml_serde::from_str("workload:\n  entrypoint: /bin/sh\n  args: [-c, make]\n").unwrap();
         cfg.env = BTreeMap::from([("API_KEY".to_string(), "sk-super-secret".to_string())]);
         let spec = BootSpec {
             cfg,
@@ -414,7 +412,7 @@ mod tests {
             dev: "/dev/vdc".into(),
             guest: "/data".into(),
         }];
-        let plan = build_plan(&spec, shares, volumes, &GuestNetworkConfig::default());
+        let plan = build_plan(&spec, shares, volumes);
 
         assert_eq!(plan.workload, ["/bin/sh", "-c", "make"]);
         assert_eq!(plan.env["API_KEY"], "sk-super-secret");
@@ -433,8 +431,7 @@ mod tests {
             ..spec
         };
         assert!(
-            build_plan(&foreground, vec![], vec![], &GuestNetworkConfig::default())
-                .workload_on_console,
+            build_plan(&foreground, vec![], vec![]).workload_on_console,
             "a --foreground VM has the console for its only reader"
         );
     }
@@ -446,21 +443,13 @@ mod tests {
     #[test]
     fn a_bake_is_guest_root_and_a_workload_boot_is_not() {
         let spec = |root, mode| BootSpec {
-            cfg: serde_yaml::from_str("{}").unwrap(),
+            cfg: yaml_serde::from_str("{}").unwrap(),
             project_dir: PathBuf::from("/proj"),
             root,
             mode,
             foreground: false,
         };
-        let plan = |root, mode| {
-            build_plan(
-                &spec(root, mode),
-                vec![],
-                vec![],
-                &GuestNetworkConfig::default(),
-            )
-            .root
-        };
+        let plan = |root, mode| build_plan(&spec(root, mode), vec![], vec![]).root;
 
         assert!(plan(false, PlanMode::Create), "a bake is root");
         assert!(plan(true, PlanMode::Create));
@@ -475,9 +464,9 @@ mod tests {
     fn sandbox_info_names_env_vars_without_their_values() {
         let cfg = config::Config {
             env: BTreeMap::from([("API_KEY".to_string(), "sk-super-secret".to_string())]),
-            ..serde_yaml::from_str("{}").unwrap()
+            ..yaml_serde::from_str("{}").unwrap()
         };
-        let info = generate_sandbox_info(&cfg, &GuestNetworkConfig::default(), false);
+        let info = generate_sandbox_info(&cfg, false);
         assert!(info.contains("API_KEY"), "the name should still be shown");
         assert!(!info.contains("sk-super-secret"), "{info}");
     }

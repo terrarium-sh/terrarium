@@ -7,7 +7,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
-use terra_agent::nofollow;
+use terra_agent::no_symlinks;
 use terra_agent::{
     CONTROL_VSOCK_PORT, Net, Plan, PlanMode, RECIPE_STAMP_PATH, RESIZE2FS_GUEST_PATH, ROOT_DEVICE,
     Share, WORKLOAD_GID, WORKLOAD_UID, WORKLOAD_USER_NAME,
@@ -428,8 +428,7 @@ fn ensure_baked(on_create: &[String]) -> Result<()> {
 /// Prepare a mount point in the box's *persistent* rootfs, refusing a path
 /// that traverses a symlink.
 fn prepare_mount_point(path: &str) -> Result<()> {
-    let as_dir =
-        || nofollow::open_no_symlinks_raw(Path::new(path), libc::O_PATH | libc::O_DIRECTORY, 0);
+    let as_dir = || no_symlinks::open_raw(Path::new(path), libc::O_PATH | libc::O_DIRECTORY, 0);
     let refuse = |e: &std::io::Error| {
         let why = if e.raw_os_error() == Some(libc::ELOOP) {
             "it, or a directory above it, is a symlink"

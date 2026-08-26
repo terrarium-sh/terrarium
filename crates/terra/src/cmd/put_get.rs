@@ -7,12 +7,14 @@ use anyhow::{Context, Result};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use terra_agent::{FileReply, FileRequest};
 
 const MAX_GUEST_CLAIMED_BYTES: u64 = 8 << 30;
 
 const COPY_STALL_TIMEOUT: Duration = Duration::from_mins(1);
+
+const COPY_TOTAL_TIMEOUT: Duration = Duration::from_hours(1);
 
 /// Copy one file into or out of a running box
 // ponytail: single files only. Directories would put an archive format on the
@@ -36,10 +38,11 @@ pub fn run(
     )?;
     let _ = stream.set_read_timeout(Some(COPY_STALL_TIMEOUT));
     let _ = stream.set_write_timeout(Some(COPY_STALL_TIMEOUT));
+    let deadline = Instant::now() + COPY_TOTAL_TIMEOUT;
 
     match direction {
-        Direction::IntoBox => send_file_into_box(&mut stream, host, guest),
-        Direction::OutOfBox => fetch_file_from_box(&mut stream, guest, host),
+        Direction::IntoBox => send_file_into_box(&mut stream, host, guest, deadline),
+        Direction::OutOfBox => fetch_file_from_box(&mut stream, guest, host, deadline),
     }
 }
 
@@ -60,22 +63,50 @@ fn mismatched_reply(asked: &str) -> anyhow::Error {
     anyhow::anyhow!("the agent answered a {asked} request with another kind of reply")
 }
 
-fn copy_at_most(from: &mut impl Read, to: &mut impl Write, size: u64, what: &str) -> Result<u64> {
-    std::io::copy(&mut from.take(size), to).context(what.to_string())
+fn copy_at_most(
+    from: &mut impl Read,
+    to: &mut impl Write,
+    size: u64,
+    what: &str,
+    deadline: Instant,
+) -> Result<u64> {
+    let mut buf = [0u8; 16 * 1024];
+    let mut sent = 0u64;
+    while sent < size {
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "{what} ran past its {}s overall limit - the other end kept the \
+                 transfer open without finishing it",
+                COPY_TOTAL_TIMEOUT.as_secs()
+            );
+        }
+        // Never past what remains: some sources here never EOF (the padding's
+        // `io::repeat`).
+        let want = usize::min(buf.len(), usize::try_from(size - sent).unwrap_or(0));
+        let n = from.read(&mut buf[..want]).context(what.to_string())?;
+        if n == 0 {
+            break;
+        }
+        to.write_all(&buf[..n]).context(what.to_string())?;
+        sent += u64::try_from(n).unwrap_or_default();
+    }
+    Ok(sent)
 }
 
 fn send_body_padded_to_size(
     body: &mut impl Read,
     stream: &mut impl Write,
     size: u64,
+    deadline: Instant,
 ) -> Result<u64> {
-    let sent = copy_at_most(body, stream, size, "sending the file")?;
+    let sent = copy_at_most(body, stream, size, "sending the file", deadline)?;
     if sent < size {
         copy_at_most(
             &mut std::io::repeat(0),
             stream,
             size - sent,
             "completing a short transfer",
+            deadline,
         )?;
     }
     Ok(sent)
@@ -90,6 +121,7 @@ fn send_file_into_box(
     stream: &mut (impl Read + Write),
     host_path: &str,
     guest_path: &str,
+    deadline: Instant,
 ) -> Result<ExitCode> {
     let mut file = sys::open_no_symlinks(Path::new(host_path))
         .with_context(|| format!("opening {host_path}"))?;
@@ -111,7 +143,7 @@ fn send_file_into_box(
             size,
         },
     )?;
-    let sent = send_body_padded_to_size(&mut file, stream, size)?;
+    let sent = send_body_padded_to_size(&mut file, stream, size, deadline)?;
 
     match read_reply(stream)? {
         FileReply::Put => {}
@@ -129,6 +161,7 @@ fn fetch_file_from_box(
     stream: &mut (impl Read + Write),
     guest_path: &str,
     host_path: &str,
+    deadline: Instant,
 ) -> Result<ExitCode> {
     send_request(
         stream,
@@ -156,14 +189,15 @@ fn fetch_file_from_box(
     let mut file = sys::create_no_symlinks(&dst_path)
         .with_context(|| format!("creating {}", dst_path.display()))?;
 
-    let received = copy_at_most(stream, &mut file, size, "receiving the file")?;
+    let received = copy_at_most(stream, &mut file, size, "receiving the file", deadline)?;
     anyhow::ensure!(
         received == size,
         "{guest_path} ended after {received} of {size} promised bytes; {} holds the \
          truncated copy - copy it again",
         dst_path.display()
     );
-    sys::set_open_file_mode(&file, to_safe_mode(mode));
+    sys::set_open_file_mode(&file, to_safe_mode(mode))
+        .with_context(|| format!("setting permissions on {}", dst_path.display()))?;
     Ok(report(
         guest_path,
         &dst_path.display().to_string(),
@@ -239,6 +273,11 @@ fn host_guest_paths(args: &crate::cli::CopyArgs, direction: Direction) -> Result
 mod tests {
     use super::*;
 
+    /// A deadline far enough out that no test transfer trips it.
+    fn deadline() -> Instant {
+        Instant::now() + Duration::from_mins(1)
+    }
+
     /// The guest end of a get, scripted: whatever bytes the "agent" sends,
     /// then EOF. Writes (the request frame) go nowhere.
     struct GuestEnd(std::io::Cursor<Vec<u8>>);
@@ -273,14 +312,25 @@ mod tests {
         let dst = dir.path().join("out.bin");
         let dst_str = dst.to_str().unwrap();
 
-        let err = fetch_file_from_box(&mut get_reply(8, b"1234"), "/data/out.bin", dst_str)
-            .unwrap_err()
-            .to_string();
+        let err = fetch_file_from_box(
+            &mut get_reply(8, b"1234"),
+            "/data/out.bin",
+            dst_str,
+            deadline(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("4 of 8"), "{err}");
         assert!(err.contains("truncated"), "{err}");
 
         // The full transfer still succeeds, byte for byte.
-        fetch_file_from_box(&mut get_reply(8, b"12345678"), "/data/out.bin", dst_str).unwrap();
+        fetch_file_from_box(
+            &mut get_reply(8, b"12345678"),
+            "/data/out.bin",
+            dst_str,
+            deadline(),
+        )
+        .unwrap();
         assert_eq!(std::fs::read(&dst).unwrap(), b"12345678");
     }
 
@@ -293,9 +343,13 @@ mod tests {
     #[test]
     fn a_file_that_shrank_after_being_measured_is_padded_out_to_the_promised_length() {
         let mut wire = Vec::new();
-        let sent =
-            send_body_padded_to_size(&mut std::io::Cursor::new(b"1234".to_vec()), &mut wire, 8)
-                .unwrap();
+        let sent = send_body_padded_to_size(
+            &mut std::io::Cursor::new(b"1234".to_vec()),
+            &mut wire,
+            8,
+            deadline(),
+        )
+        .unwrap();
         assert_eq!(sent, 4, "the count is what was really read");
         assert_eq!(wire, b"1234\0\0\0\0", "the promised length still went out");
 
@@ -305,6 +359,7 @@ mod tests {
             &mut std::io::Cursor::new(b"12345678".to_vec()),
             &mut whole,
             8,
+            deadline(),
         )
         .unwrap();
         assert_eq!((sent, whole.as_slice()), (8, b"12345678".as_slice()));
@@ -316,9 +371,36 @@ mod tests {
             &mut std::io::Cursor::new(b"12345678and more".to_vec()),
             &mut bounded,
             8,
+            deadline(),
         )
         .unwrap();
         assert_eq!((sent, bounded.as_slice()), (8, b"12345678".as_slice()));
+    }
+
+    /// One byte at a time, forever: the stall timeout cannot see this - every
+    /// syscall lands well inside it - so the overall limit is what ends the
+    /// copy instead of letting the guest hold it open indefinitely.
+    #[test]
+    fn a_transfer_past_its_overall_deadline_fails_rather_than_trickling_forever() {
+        struct Trickle;
+        impl Read for Trickle {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                std::thread::sleep(Duration::from_millis(20));
+                Ok(1)
+            }
+        }
+
+        let mut sink = Vec::new();
+        let err = copy_at_most(
+            &mut Trickle,
+            &mut sink,
+            100,
+            "receiving the file",
+            Instant::now(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("overall limit"), "{err}");
     }
 
     /// The verb says which side is the box's, so neither path needs a mark and

@@ -79,7 +79,8 @@ pub(crate) fn stop_and_wait(bx: &BoxRef, grace: Duration) -> Result<StopOutcome>
         grace.as_secs(),
         vm.pid
     );
-    signal_vm(bx, sys::VmSignal::ForcedStop)?;
+    sys::signal_pid(vm.pid, vm.started_at, sys::VmSignal::ForcedStop)
+        .with_context(|| format!("killing the VM process (pid {}) of {bx}", vm.pid))?;
     Ok(if wait_until_stopped(bx, Instant::now() + KILL_REAP_WAIT) {
         StopOutcome::Killed
     } else {

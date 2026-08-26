@@ -160,7 +160,7 @@ pub fn load_manifest(project_dir: &Path) -> Result<Option<Manifest>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
-    let manifest: Manifest = serde_yaml::from_str(&text)
+    let manifest: Manifest = yaml_serde::from_str(&text)
         .with_context(|| format!("failed to parse {}", path.display()))?;
     for (name, reference) in &manifest.boxes {
         crate::name::validate_box_name(name).with_context(|| format!("in {}", path.display()))?;
@@ -221,7 +221,7 @@ pub fn load_path(path: &Path, project_dir: &Path) -> Result<Config> {
 }
 
 pub fn parse_recipe(text: &str, project_dir: &Path, source: &Path) -> Result<Config> {
-    let mut cfg: Config = serde_yaml::from_str(text)
+    let mut cfg: Config = yaml_serde::from_str(text)
         .with_context(|| format!("failed to parse YAML from {}", source.display()))?;
     place_paths(&mut cfg, project_dir)?;
     trim_sudo_entries(&mut cfg);
@@ -234,7 +234,7 @@ pub(crate) fn get_declared_writable_shares(text: &str, project_dir: &Path) -> Ve
     #[derive(Deserialize)]
     struct DeclaredMounts {
         #[serde(default)]
-        mounts: Vec<serde_yaml::Value>,
+        mounts: Vec<yaml_serde::Value>,
     }
     #[derive(Deserialize)]
     struct DeclaredMount {
@@ -242,12 +242,12 @@ pub(crate) fn get_declared_writable_shares(text: &str, project_dir: &Path) -> Ve
         #[serde(default)]
         readonly: bool,
     }
-    let Ok(cfg) = serde_yaml::from_str::<DeclaredMounts>(text) else {
+    let Ok(cfg) = yaml_serde::from_str::<DeclaredMounts>(text) else {
         return Vec::new();
     };
     cfg.mounts
         .into_iter()
-        .filter_map(|m| serde_yaml::from_value::<DeclaredMount>(m).ok())
+        .filter_map(|m| yaml_serde::from_value::<DeclaredMount>(m).ok())
         .filter(|m| !m.readonly)
         .map(|m| recipe_path(&m.host, project_dir).unwrap_or_else(|_| project_dir.join(&m.host)))
         .collect()
@@ -571,35 +571,35 @@ mod tests {
     #[test]
     fn network_mode_parses_from_yaml_scalar() {
         assert_eq!(
-            serde_yaml::from_str::<NetworkMode>("allowlist").unwrap(),
+            yaml_serde::from_str::<NetworkMode>("allowlist").unwrap(),
             NetworkMode::Allowlist
         );
         assert_eq!(
-            serde_yaml::from_str::<NetworkMode>("unrestricted-public").unwrap(),
+            yaml_serde::from_str::<NetworkMode>("unrestricted-public").unwrap(),
             NetworkMode::UnrestrictedPublic
         );
         // The short spelling is refused with an error naming the replacement,
         // not aliased.
-        let err = serde_yaml::from_str::<NetworkMode>("unrestricted")
+        let err = yaml_serde::from_str::<NetworkMode>("unrestricted")
             .unwrap_err()
             .to_string();
         assert!(err.contains("unrestricted-public"), "{err}");
         // What terra writes back keeps that spelling.
         assert_eq!(
-            serde_yaml::to_string(&NetworkMode::UnrestrictedPublic)
+            yaml_serde::to_string(&NetworkMode::UnrestrictedPublic)
                 .unwrap()
                 .trim(),
             "unrestricted-public"
         );
-        assert!(serde_yaml::from_str::<NetworkMode>("isolated").is_err());
+        assert!(yaml_serde::from_str::<NetworkMode>("isolated").is_err());
     }
 
     #[test]
     fn env_map_parses() {
-        let cfg: Config = serde_yaml::from_str("env:\n  MODEL: gpt-4o\n  DEBUG: \"1\"\n").unwrap();
+        let cfg: Config = yaml_serde::from_str("env:\n  MODEL: gpt-4o\n  DEBUG: \"1\"\n").unwrap();
         assert_eq!(cfg.env.get("MODEL").map(String::as_str), Some("gpt-4o"));
         assert_eq!(cfg.env.get("DEBUG").map(String::as_str), Some("1"));
-        let none: Config = serde_yaml::from_str("hw:\n  cpus: 1\n  mem_mib: 64\n").unwrap();
+        let none: Config = yaml_serde::from_str("hw:\n  cpus: 1\n  mem_mib: 64\n").unwrap();
         assert!(none.env.is_empty());
     }
 
@@ -814,10 +814,10 @@ mod tests {
     /// Container-level `#[serde(default)]` must not leak into structs without it.
     #[test]
     fn unknown_keys_and_missing_required_fields_are_refused() {
-        assert!(serde_yaml::from_str::<Config>("hw:\n  cpus: 1\n  nope: 2\n").is_err());
-        assert!(serde_yaml::from_str::<Config>("nope: 1\n").is_err());
-        assert!(serde_yaml::from_str::<Mount>("guest: /work\n").is_err());
-        assert!(serde_yaml::from_str::<StaticDnsRecord>("name: db\n").is_err());
+        assert!(yaml_serde::from_str::<Config>("hw:\n  cpus: 1\n  nope: 2\n").is_err());
+        assert!(yaml_serde::from_str::<Config>("nope: 1\n").is_err());
+        assert!(yaml_serde::from_str::<Mount>("guest: /work\n").is_err());
+        assert!(yaml_serde::from_str::<StaticDnsRecord>("name: db\n").is_err());
     }
 
     #[test]

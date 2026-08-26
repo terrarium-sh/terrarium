@@ -22,9 +22,25 @@ const EGRESS_FLOOR: FloorMode = FloorMode::Strict;
 /// real name can collide with it.
 const HOST_LOOPBACK_SYMBOL: &str = "HOST_LOOPBACK";
 
+/// The addresses that are the machine terra runs on - the v4/v6 pair plus
+/// the EUI-64 link-local `smolvm_network::stack` derives from the same MAC.
 #[must_use]
-fn host_addrs(net: &GuestNetworkConfig) -> [IpAddr; 2] {
-    [IpAddr::V4(net.gateway_ip), IpAddr::V6(net.gateway_ip6)]
+const fn gateway_self_addrs(net: &GuestNetworkConfig) -> [IpAddr; 3] {
+    let mac = net.gateway_mac;
+    [
+        IpAddr::V4(net.gateway_ip),
+        IpAddr::V6(net.gateway_ip6),
+        IpAddr::V6(Ipv6Addr::new(
+            0xfe80,
+            0,
+            0,
+            0,
+            u16::from_be_bytes([mac[0] ^ 0x02, mac[1]]),
+            u16::from_be_bytes([mac[2], 0xff]),
+            u16::from_be_bytes([0xfe, mac[3]]),
+            u16::from_be_bytes([mac[4], mac[5]]),
+        )),
+    ]
 }
 
 /// Short, so a guest that caches an answer does not hold it past a
@@ -124,12 +140,12 @@ pub struct BoxPolicy {
     learned_dns: Mutex<HashMap<(IpAddr, Port), Instant>>,
     static_dns: HashMap<String, Vec<IpAddr>>,
     host_grants: Vec<Port>,
-    host: [IpAddr; 2],
+    host: [IpAddr; 3],
 }
 
 impl BoxPolicy {
     pub fn new(net: &Network, guest_net: &GuestNetworkConfig) -> Result<Self> {
-        let gateway_addrs = host_addrs(guest_net);
+        let gateway_addrs = gateway_self_addrs(guest_net);
         let mut static_dns: HashMap<String, Vec<IpAddr>> = HashMap::new();
         for rule in &net.hosts {
             let (key, addrs) = parse_dns_record(rule, &gateway_addrs)?;
@@ -357,7 +373,7 @@ impl Policy for BoxPolicy {
             DnsVerdict::Refuse => {
                 // Answered, not forwarded: without this the box would see an
                 // unresolvable name and no reason why.
-                eprintln!("terra: egress: no allow rule names '{name}' - answered NXDOMAIN");
+                tracing::debug!("terra: egress: no allow rule names '{name}' - answered NXDOMAIN");
                 DnsDecision::Immediate(dns::error_response(query, dns::DNS_RCODE_NXDOMAIN))
             }
         }
@@ -491,7 +507,7 @@ fn classify(entry: &str, host: &str, port: Port) -> Result<Rule> {
 
 fn parse_dns_record(
     rule: &StaticDnsRecord,
-    gateway_addrs: &[IpAddr; 2],
+    gateway_addrs: &[IpAddr; 3],
 ) -> Result<(String, Vec<IpAddr>)> {
     if rule.name.trim().is_empty() {
         bail!("hosts record has an empty 'name'");
@@ -529,12 +545,10 @@ fn parse_dns_record(
 mod tests {
     use super::*;
 
-    /// What the gateway terra starts is configured with, and so what
-    /// `HOST_LOOPBACK` resolves to in these tests.
-    const HOST_ADDRS: [IpAddr; 2] = [
-        IpAddr::V4(GuestNetworkConfig::default().gateway_ip),
-        IpAddr::V6(GuestNetworkConfig::default().gateway_ip6),
-    ];
+    /// What the gateway terra starts is configured with - every address it
+    /// answers on itself included - and so what `HOST_LOOPBACK` resolves to
+    /// in these tests.
+    const HOST_ADDRS: [IpAddr; 3] = gateway_self_addrs(&GuestNetworkConfig::default());
 
     fn net(mode: NetworkMode, allow: &[&str]) -> Network {
         Network {
@@ -1049,7 +1063,12 @@ mod tests {
     fn an_address_rule_naming_the_gateway_is_refused_not_left_inert() {
         for mode in [NetworkMode::Allowlist, NetworkMode::UnrestrictedPublic] {
             for gw in HOST_ADDRS {
-                let bare = gw.to_string();
+                // An un-bracketed v6 ending in `:port` reads as ambiguous and
+                // is refused before the rule ever classifies.
+                let bare = match gw {
+                    IpAddr::V6(_) => format!("[{gw}]"),
+                    IpAddr::V4(_) => gw.to_string(),
+                };
                 let err = err_of(&net(mode, &[bare.as_str()]));
                 assert!(err.contains(HOST_LOOPBACK_SYMBOL), "{mode:?} {gw}: {err}");
 

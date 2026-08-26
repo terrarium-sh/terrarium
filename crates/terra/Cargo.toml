@@ -23,7 +23,7 @@ clap.workspace = true
 strum = { version = "0.28", features = ["derive"] }
 anyhow.workspace = true
 serde.workspace = true
-serde_yaml.workspace = true
+yaml_serde.workspace = true
 serde_json = { workspace = true }
 crossterm = { version = "0.29", default-features = false }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }

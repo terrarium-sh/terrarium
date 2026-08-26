@@ -2,27 +2,65 @@
 
 use std::io::Read;
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
 use terra_agent::{FileReply, FileRequest, WORKLOAD_GID, WORKLOAD_UID};
 
-/// Missing parents are created only once the path itself has been shown not to
-/// traverse a link (a symlinked component answers `ELOOP` on the first
-/// attempt). That check is check-time only: a parent swapped for a link
-/// *between* the probe and the mkdir can mint empty directories on the far
-/// side, but the re-open still refuses, so no file is ever written or chowned
-/// through one.
+/// Create or open `path` for writing without following a symlink
 fn create_no_symlinks(path: &str) -> std::io::Result<std::fs::File> {
-    let open = || terra_agent::nofollow::create_no_symlinks_raw(Path::new(path));
+    // Zeroed mode - `openat2` refuses a mode without `O_CREAT`.
+    let open = || terra_agent::no_symlinks::open_raw(Path::new(path), libc::O_WRONLY, 0);
     match open() {
-        // Only a genuinely absent directory earns a retry - never `ELOOP`.
+        // Exclusive create, so a link planted between probe and create
+        // answers `ELOOP` rather than being followed.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            if let Some(parent) = std::path::Path::new(path).parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            open()
+            create_missing_parents_for_the_workload_user(std::path::Path::new(path))?;
+            open().or_else(|_| {
+                terra_agent::no_symlinks::open_raw(
+                    Path::new(path),
+                    libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+                    0o600,
+                )
+            })
         }
         other => other,
     }
+}
+
+fn create_missing_parents_for_the_workload_user(path: &Path) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let Some(dir) = path.parent() else {
+        return Ok(());
+    };
+    let mut prefix = std::path::PathBuf::new();
+    let mut created = Vec::new();
+    for part in dir.components() {
+        prefix.push(part);
+        match std::fs::symlink_metadata(&prefix) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => {
+                return Err(std::io::Error::other(format!(
+                    "{} is not a directory",
+                    prefix.display()
+                )));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&prefix)?;
+                created.push(prefix.clone());
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    for dir in created {
+        let Ok(handle) = std::fs::File::open(&dir) else {
+            continue;
+        };
+        // SAFETY: `handle` is a live descriptor this loop owns.
+        unsafe {
+            libc::fchown(handle.as_raw_fd(), WORKLOAD_UID, WORKLOAD_GID);
+        }
+    }
+    Ok(())
 }
 
 /// Serve one `terra put`/`get`. A file written in goes to the workload user
@@ -39,10 +77,8 @@ pub fn serve_file_op(mut conn: impl Read + std::io::Write, root: bool) {
         }
     };
     let refuse = |conn: &mut dyn Write, err: String| reply(conn, &FileReply::Err(err));
-    // A refused put still has to swallow the body the request announced. The
-    // sender writes those bytes whatever we make of the path, and closing the
-    // connection with them unread resets it - so the host would see "connection
-    // reset by peer" in place of the reason we refused.
+    // Drain the body a refused put announced, or the host sees "connection
+    // reset by peer" instead of the reason.
     let drain = |conn: &mut dyn Read, n: u64| {
         let _ = std::io::copy(&mut conn.take(n), &mut std::io::sink());
     };
@@ -63,14 +99,18 @@ pub fn serve_file_op(mut conn: impl Read + std::io::Write, root: bool) {
                     drain(&mut conn, size);
                     Err(e)
                 }
+                Ok(ref file) if file.metadata().is_ok_and(|m| m.nlink() > 1) => {
+                    drain(&mut conn, size);
+                    Err(std::io::Error::other(
+                        "destination has more than one hard link - refusing to write through it",
+                    ))
+                }
                 Ok(mut file) => {
-                    let copied =
-                        std::io::copy(&mut std::io::Read::take(&mut conn, size), &mut file);
-                    // Whatever went wrong, the sender is still writing the body it
-                    // announced. Take the rest before replying, or a mid-copy
-                    // ENOSPC reaches the host as "Broken pipe" from its own
-                    // `write_all` - the reason substitution this drain prevents,
-                    // in by far the most likely failure.
+                    let copied = file.set_len(0).and_then(|()| {
+                        std::io::copy(&mut std::io::Read::take(&mut conn, size), &mut file)
+                    });
+                    // Drain the rest before replying, or a mid-copy ENOSPC reads as
+                    // "Broken pipe" at the host.
                     let consumed = *copied.as_ref().unwrap_or(&0);
                     drain(&mut conn, size.saturating_sub(consumed));
                     let result = copied.and_then(|copied| {
@@ -81,12 +121,9 @@ pub fn serve_file_op(mut conn: impl Read + std::io::Write, root: bool) {
                         }
                         file.set_permissions(std::fs::Permissions::from_mode(mode))
                     });
-                    // Through `fchown` on the descriptor already open, not a
-                    // `chown` subprocess re-resolving the path. Best-effort:
-                    // success depends on holding CAP_CHOWN over the backing file,
-                    // which inside a virtiofs share depends on the host user
-                    // namespace existing at all - and failing the put on it would
-                    // report a copy that has already landed as an error.
+                    // `fchown` the open descriptor, best-effort - without CAP_CHOWN over
+                    // the backing file it must not fail a put whose copy has
+                    // already landed.
                     if result.is_ok() && !root {
                         // SAFETY: `file` is a live descriptor we own for this call.
                         if unsafe { libc::fchown(file.as_raw_fd(), WORKLOAD_UID, WORKLOAD_GID) }
@@ -111,15 +148,10 @@ pub fn serve_file_op(mut conn: impl Read + std::io::Write, root: bool) {
             if !path.starts_with('/') {
                 return refuse(&mut conn, "guest path must be absolute".into());
             }
-            // A plain open, deliberately: the put side's no-symlink open is not
-            // wanted here, because reading follows a link to a file whose
-            // contents the guest already chooses, so a workload gains no more
-            // than it could have written into the file itself. And it costs the
-            // ordinary case - the guest rootfs is full of honest symlinks
-            // (`/etc/os-release -> ../usr/lib/os-release` in the image terra
-            // ships, the example in `terra put --help`); what the *host* does
-            // with the answer is where the guarantee lives (see
-            // `sys::create_no_symlinks` and `copy::to_safe_mode`).
+            // A plain open, deliberately: following a symlink only reads
+            // contents the guest chose anyway, and the rootfs is full of honest
+            // ones (`/etc/os-release`); the host side is where the guarantee
+            // lives.
             let opened = std::fs::File::open(&path).and_then(|f| {
                 let meta = f.metadata()?;
                 if meta.is_dir() {
@@ -317,6 +349,49 @@ mod tests {
 
         let _ = std::fs::remove_file(&link);
         let _ = std::fs::remove_dir_all(&real);
+    }
+
+    /// A hard link names the inode itself, so no symlink defense sees it: the
+    /// destination must be judged by its link count *before* the length goes
+    /// to zero, or an ordinary put edits whatever file the workload linked it
+    /// to - as root. An unlinked file still overwrites normally.
+    #[test]
+    fn put_refuses_a_hard_linked_destination() {
+        let target = scratch("hardlink-target");
+        let dest = scratch("hardlink-dest");
+        std::fs::write(&target, b"original").unwrap();
+        std::fs::hard_link(&target, &dest).unwrap();
+
+        let (rep, _) = do_op(
+            &FileRequest::Put {
+                path: dest.to_string_lossy().into_owned(),
+                mode: 0o644,
+                size: 5,
+            },
+            b"EVIL!",
+        );
+        assert!(
+            matches!(rep, FileReply::Err(_)),
+            "a multi-linked destination must be refused"
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"original",
+            "the write went through the link"
+        );
+
+        // With the link gone the destination has one inode to itself again.
+        std::fs::remove_file(&dest).unwrap();
+        let (rep, _) = do_op(
+            &FileRequest::Put {
+                path: target.to_string_lossy().into_owned(),
+                mode: 0o644,
+                size: 2,
+            },
+            b"ok",
+        );
+        assert_eq!(rep, FileReply::Put);
+        assert_eq!(std::fs::read(&target).unwrap(), b"ok");
     }
 
     #[test]

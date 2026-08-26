@@ -6,11 +6,9 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
-# Two crate roots, and the directories say which is which: `contract/` is built
-# for the host too (macOS, Windows), `guest/` is Linux PID 1 and never leaves it.
 [lib]
 name = "terra_agent"
-path = "src/contract/lib.rs"
+path = "src/lib.rs"
 
 [[bin]]
 name = "terra-agent"
@@ -34,7 +32,7 @@ pty-process = "0.5"
 vt100 = "0.16"
 
 # The workspace denies `unsafe_code`; the binary carries `#![allow(unsafe_code)]`
-# (vsock syscalls) and the lib scopes it to `nofollow.rs` - Cargo lints arrive as
+# (vsock syscalls) and the lib scopes it to `no_symlinks.rs` - Cargo lints arrive as
 # command-line levels, which a crate/module attribute may override.
 [lints]
 workspace = true

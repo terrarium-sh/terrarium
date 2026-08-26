@@ -32,14 +32,13 @@ pub fn open_null() -> Result<File> {
 /// `RESOLVE_NO_SYMLINKS`).
 #[cfg(target_os = "linux")]
 pub fn open_no_symlinks(path: &Path) -> Result<File> {
-    terra_agent::nofollow::open_no_symlinks_raw(path, libc::O_RDONLY, 0)
-        .map_err(|e| explain(e, path))
+    terra_agent::no_symlinks::open_raw(path, libc::O_RDONLY, 0).map_err(|e| explain(e, path))
 }
 
 /// Create or truncate for writing, under the same rule as [`open_no_symlinks`].
 #[cfg(target_os = "linux")]
 pub fn create_no_symlinks(path: &Path) -> Result<File> {
-    terra_agent::nofollow::create_no_symlinks_raw(path).map_err(|e| explain(e, path))
+    terra_agent::no_symlinks::create_raw(path).map_err(|e| explain(e, path))
 }
 
 /// The two errnos this open reports read as nonsense as written ("Too many
@@ -61,26 +60,49 @@ fn explain(err: std::io::Error, path: &Path) -> std::io::Error {
     }
 }
 
-// Off Linux there is no `openat2`, so only the final component is refused.
 #[cfg(not(target_os = "linux"))]
-use std::fs::OpenOptions;
+use std::{fs::OpenOptions, io, path::PathBuf};
 
 #[cfg(not(target_os = "linux"))]
 pub fn open_no_symlinks(path: &Path) -> Result<File> {
     let mut opts = OpenOptions::new();
     opts.read(true);
-    leaf_nofollow(path, &mut opts)
+    open_no_symlinks_best_effort(path, &mut opts)
 }
 
 #[cfg(not(target_os = "linux"))]
 pub fn create_no_symlinks(path: &Path) -> Result<File> {
     let mut opts = OpenOptions::new();
     opts.write(true).create(true).truncate(true);
-    leaf_nofollow(path, &mut opts)
+    open_no_symlinks_best_effort(path, &mut opts)
 }
 
+/// Non-Linux stand-in for the `openat2` no-symlinks contract - best effort:
+/// a link swapped in between a component's check and the open slips through,
+/// the window Linux closes in-kernel.
 #[cfg(not(target_os = "linux"))]
-fn leaf_nofollow(path: &Path, opts: &mut OpenOptions) -> Result<File> {
+fn open_no_symlinks_best_effort(path: &Path, opts: &mut OpenOptions) -> Result<File> {
+    let mut walked = PathBuf::new();
+    for component in path.components() {
+        walked.push(component);
+        if walked.as_path() == path {
+            break; // the leaf: `O_NOFOLLOW` below is its own guard
+        }
+        let meta = std::fs::symlink_metadata(&walked)?;
+        if meta.file_type().is_symlink() {
+            return Err(io::Error::other(format!(
+                "{} passes through a symlink, and terra does not follow one on a host path \
+                 a sandbox may have planted - name the resolved path instead",
+                path.display()
+            )));
+        }
+        if !meta.is_dir() {
+            return Err(io::Error::other(format!(
+                "{} is not a directory",
+                walked.display()
+            )));
+        }
+    }
     use std::os::unix::fs::OpenOptionsExt;
     opts.custom_flags(libc::O_NOFOLLOW);
     opts.open(path)
@@ -88,9 +110,9 @@ fn leaf_nofollow(path: &Path, opts: &mut OpenOptions) -> Result<File> {
 
 /// Through the handle rather than the path: the path may have become a symlink
 /// since it was opened.
-pub fn set_open_file_mode(file: &File, mode: u32) {
+pub fn set_open_file_mode(file: &File, mode: u32) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let _ = file.set_permissions(std::fs::Permissions::from_mode(mode));
+    file.set_permissions(std::fs::Permissions::from_mode(mode))
 }
 
 /// Restrict an existing path to its owner: `0700` for a directory, `0600` for a

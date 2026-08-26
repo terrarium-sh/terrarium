@@ -136,7 +136,7 @@ mod tests {
                 guest: PathBuf::from("/work"),
                 readonly,
             }],
-            ..serde_yaml::from_str("{}").unwrap()
+            ..yaml_serde::from_str("{}").unwrap()
         }
     }
 
@@ -160,7 +160,7 @@ mod tests {
         // The project directory does not contain the state (`~/.terra/box`),
         // so "sandbox my project" shares clean.
         assert!(check_mounts_exclude_terra_paths(&mount(dir.path(), false), &b).is_ok());
-        assert!(check_mounts_exclude_terra_paths(&serde_yaml::from_str("{}").unwrap(), &b).is_ok());
+        assert!(check_mounts_exclude_terra_paths(&yaml_serde::from_str("{}").unwrap(), &b).is_ok());
     }
 
     /// A recipe file inside a share a box let its guest write may have been

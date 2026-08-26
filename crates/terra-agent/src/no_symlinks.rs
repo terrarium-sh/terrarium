@@ -8,15 +8,11 @@ use std::path::Path;
 /// Create or truncate `path` for writing, owner-only, refusing a symlink at
 /// any component. `openat2` resolves atomically, so a concurrent attacker
 /// gets no check-to-use window.
-pub fn create_no_symlinks_raw(path: &Path) -> std::io::Result<File> {
-    open_no_symlinks_raw(path, libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC, 0o600)
+pub fn create_raw(path: &Path) -> std::io::Result<File> {
+    open_raw(path, libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC, 0o600)
 }
 
-pub fn open_no_symlinks_raw(
-    path: &Path,
-    flags: libc::c_int,
-    mode: libc::mode_t,
-) -> std::io::Result<File> {
+pub fn open_raw(path: &Path, flags: libc::c_int, mode: libc::mode_t) -> std::io::Result<File> {
     use std::os::fd::FromRawFd;
     use std::os::unix::ffi::OsStrExt;
 

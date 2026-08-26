@@ -27,6 +27,8 @@ const STOP_GRACE: Duration = Duration::from_secs(5);
 /// Backoff after a failed `accept` (see [`accept_failed`]).
 const ACCEPT_RETRY: Duration = Duration::from_millis(100);
 
+const CONSOLE_REATTACH_POLL: Duration = Duration::from_millis(500);
+
 /// How long the workload's last output is given to cross the PTY after the
 /// process itself has gone - see the drain in [`run_workload`]. Bounded because
 /// EOF may never come: a backgrounded grandchild can hold the slave open for as
@@ -420,6 +422,23 @@ fn attach_console(session: &Arc<Session>, master_fd: RawFd) {
     {
         set_winsize(master_fd, r, c);
     }
+
+    // Watch for a console dropped for a full outbox and re-attach it.
+    let watcher = session.clone();
+    std::thread::spawn(move || {
+        let mut id = id;
+        loop {
+            std::thread::sleep(CONSOLE_REATTACH_POLL);
+            if !watcher.list_clients().iter().any(|(live, _)| *live == id) {
+                id = watcher.attach(ConsoleSink(std::io::stdout()));
+                if let Some((rows, cols)) = winsize(0)
+                    && let Some((r, c)) = watcher.set_client_size(id, rows, cols)
+                {
+                    set_winsize(master_fd, r, c);
+                }
+            }
+        }
+    });
 
     let session = session.clone();
     std::thread::spawn(move || {

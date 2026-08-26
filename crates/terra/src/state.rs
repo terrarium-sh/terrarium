@@ -188,6 +188,20 @@ impl BoxRef {
         self.lock_line().split_whitespace().any(|w| w == BAKE_MARK)
     }
 
+    /// One contiguous write, so the worst a concurrent reader sees is a torn
+    /// tail (see the inode test for why this never renames over the file).
+    fn rewrite_lock_line(&self, line: &str) -> std::io::Result<()> {
+        use std::io::{Seek as _, Write as _};
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.pid_file())?;
+        file.seek(std::io::SeekFrom::Start(0))?;
+        file.write_all(line.as_bytes())?;
+        file.set_len(u64::try_from(line.len()).unwrap_or_default())
+    }
+
     /// A failed write is worth a warning: `terra stop` finds this VM by the pid
     /// published here.
     pub fn publish_pid(&self, pid: u32, baking: bool) {
@@ -200,7 +214,7 @@ impl BoxRef {
             line.push(' ');
             line.push_str(BAKE_MARK);
         }
-        if let Err(e) = std::fs::write(self.pid_file(), line) {
+        if let Err(e) = self.rewrite_lock_line(&line) {
             tracing::warn!("terra: warning: could not publish pid {pid} for {self}: {e}");
         }
     }
@@ -219,7 +233,7 @@ impl BoxRef {
 
     #[must_use = "the bake mark is cleared when this drops"]
     pub fn mark_baking<'a>(&self, lock: &'a File) -> BakeMark<'a> {
-        if let Err(e) = std::fs::write(self.pid_file(), BAKE_MARK) {
+        if let Err(e) = self.rewrite_lock_line(BAKE_MARK) {
             tracing::warn!("terra: warning: could not mark {self} as baking: {e}");
         }
         BakeMark(lock)
@@ -397,7 +411,7 @@ fn read_settings() -> Result<Settings> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Settings::default()),
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
-    serde_yaml::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))
+    yaml_serde::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))
 }
 
 fn settings_dir(dir: &Path, field: &str) -> Result<PathBuf> {
@@ -1164,6 +1178,41 @@ mod tests {
 
         drop(lock);
         assert_eq!(b.holder(), Holder::Free);
+    }
+
+    /// The pid file is rewritten in place, never renamed over: the run lock
+    /// is held on its inode, and a replacement file would hand the next
+    /// opener a fresh, unlocked inode while the box stayed locked on the old
+    /// one.
+    #[cfg(unix)]
+    #[test]
+    fn publishing_a_pid_keeps_the_lock_file_s_inode() {
+        use std::os::unix::fs::MetadataExt;
+        let _home = TestHome::new();
+        let dir = tempfile::tempdir().unwrap();
+        let b = bx(dir.path());
+        std::fs::create_dir_all(b.dir()).unwrap();
+        let held = b.lock_run().unwrap();
+
+        b.publish_pid(4242, false);
+        let identity = |p: &Path| {
+            let meta = std::fs::metadata(p).unwrap();
+            (meta.dev(), meta.ino())
+        };
+        let before = identity(&b.pid_file());
+
+        // Longer, then shorter than what it replaced - no tail may survive.
+        b.publish_pid(u32::MAX - 1, true);
+        b.publish_pid(4242, false);
+        assert_eq!(
+            identity(&b.pid_file()),
+            before,
+            "the lock file was replaced"
+        );
+        // 4242 names nothing in /proc, so the published line is bare.
+        assert_eq!(std::fs::read_to_string(b.pid_file()).unwrap(), "4242");
+        assert!(b.holder().holds(), "the lock outlived the rewrites");
+        drop(held);
     }
 
     /// What [`BoxRef::setup_holds_it`] says, pinned at the definition that

@@ -439,7 +439,7 @@ mod tests {
     #[test]
     fn a_boot_survives_the_trip_to_the_background_process() {
         use clap::Parser;
-        let cfg: config::Config = serde_yaml::from_str(
+        let cfg: config::Config = yaml_serde::from_str(
             "hw:\n  cpus: 4\n  mem_mib: 2048\nenv:\n  API_KEY: sk-secret\n\
              workload:\n  entrypoint: /bin/sh\n",
         )
@@ -476,7 +476,7 @@ mod tests {
                 .chain(flags.iter().copied())
                 .collect();
             BootSpec::resolve(
-                serde_yaml::from_str("{}").unwrap(),
+                yaml_serde::from_str("{}").unwrap(),
                 &crate::cli::Cli::parse_from(argv).boot,
                 PathBuf::from("/proj"),
                 boot,
@@ -500,12 +500,12 @@ mod tests {
         assert!(c.cmd.is_none(), "using a box has no verb");
         assert_eq!(c.boot.command, ["npm", "test", "--watch"]);
 
-        let mut cfg: config::Config = serde_yaml::from_str("{}").unwrap();
+        let mut cfg: config::Config = yaml_serde::from_str("{}").unwrap();
         override_workload(&mut cfg, &c.boot.command);
         assert_eq!(cfg.workload.entrypoint, PathBuf::from("npm"));
         assert_eq!(cfg.workload.args, ["test", "--watch"]);
 
-        let mut cfg: config::Config = serde_yaml::from_str("{}").unwrap();
+        let mut cfg: config::Config = yaml_serde::from_str("{}").unwrap();
         override_workload(&mut cfg, &[]);
         assert_eq!(cfg.workload, config::Workload::default());
     }
