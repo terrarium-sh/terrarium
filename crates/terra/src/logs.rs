@@ -13,12 +13,15 @@ use tracing_subscriber::filter::{LevelFilter, Targets};
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
+const KEPT_LOG_GENERATIONS: usize = 7;
+
 /// The appender for the box's log.
 fn build_appender(bx: &BoxRef) -> anyhow::Result<RollingFileAppender> {
     RollingFileAppender::builder()
         .rotation(Rotation::DAILY)
         .filename_prefix("terra")
         .filename_suffix("log")
+        .max_log_files(KEPT_LOG_GENERATIONS)
         .latest_symlink("terra.log")
         .build(bx.dir())
         .map_err(|e| anyhow::anyhow!("opening log {}: {e}", bx.log().display()))

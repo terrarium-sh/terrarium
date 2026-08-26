@@ -121,7 +121,7 @@ myproject/                            # your files, and nothing else
         ├── a             # the agent's port: every session, `terra put`/`get` and `terra exec`
         ├── terra.pid     # the VM process — `terra stop` signals it, and the lock on it is what keeps one VM per box
         ├── baking        # present only while an `on_create` bake holds the box
-        ├── terra.log     # the box's diagnostics: terra's, libkrun's, the gateway's (rotated: terra.<date>.log alongside)
+        ├── terra.log     # the box's diagnostics: terra's, libkrun's, the gateway's (rotated daily: the seven newest terra.<date>.log generations are kept)
         └── diagnostics.log # only under TERRA_DIAGNOSTICS=1: the guest console and stray host output, fresh per run
 ```
 
@@ -356,9 +356,11 @@ and the diagnostics in `terra logs`, which is the same division by another
 name.
 
 **The log rolls.** Once a day the appender starts a new `terra.<date>.log` and
-repoints `terra.log` at it; the generations stay on disk, so a box you restart
-often shows one file per day it ran rather than every run it ever had. `-f`
-follows across the repoint without going quiet or repeating itself.
+repoints `terra.log` at it; the seven newest generations stay on disk and
+older ones are pruned, so a box you restart often shows one file per day it
+ran rather than every run it ever had, and a box left running does not grow
+its diagnostics without bound. `-f` follows across the repoint without going
+quiet or repeating itself.
 
 Everything host-side is collected by one `tracing` subscriber, which is also
 what makes the gateway's own account of a refusal visible at all — those events
