@@ -8,7 +8,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
-use terra_agent::{FileReply, FileRequest};
+use terra_shared::{FileReply, FileRequest};
 
 const MAX_GUEST_CLAIMED_BYTES: u64 = 8 << 30;
 
@@ -32,7 +32,7 @@ pub fn run(
     let mut stream = crate::session::connect_to_running_agent(
         bx,
         direction.verb(),
-        terra_agent::AgentService::Files,
+        terra_shared::AgentService::Files,
         "file service",
         args.agent.agent_timeout,
     )?;
@@ -48,12 +48,12 @@ pub fn run(
 
 fn send_request(stream: &mut impl Write, req: &FileRequest) -> Result<()> {
     stream
-        .write_all(&terra_agent::frame(req).context("encoding the request")?)
+        .write_all(&terra_shared::frame(req).context("encoding the request")?)
         .context("sending the request")
 }
 
 fn read_reply(stream: &mut impl Read) -> Result<FileReply> {
-    match terra_agent::read_frame(stream).context("reading the agent's reply")? {
+    match terra_shared::read_frame(stream).context("reading the agent's reply")? {
         FileReply::Err(err) => anyhow::bail!("guest: {}", sanitize_guest_error_message(&err)),
         answered => Ok(answered),
     }
@@ -298,7 +298,7 @@ mod tests {
 
     fn get_reply(size: u64, body: &[u8]) -> GuestEnd {
         let mut script =
-            terra_agent::frame(&terra_agent::FileReply::Get { mode: 0o644, size }).unwrap();
+            terra_shared::frame(&terra_shared::FileReply::Get { mode: 0o644, size }).unwrap();
         script.extend_from_slice(body);
         GuestEnd(std::io::Cursor::new(script))
     }

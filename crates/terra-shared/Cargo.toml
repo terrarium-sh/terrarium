@@ -1,0 +1,20 @@
+[package]
+name = "terra-shared"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
+# The workspace denies `unsafe_code`; the lib scopes it to `no_symlinks.rs` -
+# Cargo lints arrive as command-line levels, which a crate/module attribute may override.
+[lints]
+workspace = true

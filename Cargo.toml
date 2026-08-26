@@ -1,9 +1,8 @@
 [workspace]
 resolver = "3"
-members = ["crates/terra", "crates/terra-agent"]
+members = ["crates/terra", "crates/terra-agent", "crates/terra-shared"]
 # vendor/ holds the three submodules (libkrun, libkrunfw, smolvm), each its own
-# workspace. terra path-depends on two of their crates; nothing else in them is
-# ours to build, lint or format.
+# workspace; nothing in them is ours to build, lint or format.
 exclude = ["vendor"]
 
 [workspace.package]
@@ -39,10 +38,8 @@ panic = "deny"
 [profile.dev.package."*"]
 opt-level = 2
 
-# Profiles are only honoured in the workspace root — cargo ignores (and warns
-# about) a [profile.*] in a member manifest, so both crates are configured here.
 [profile.release]
 opt-level = 3
-lto = "fat" # link-time optimization across all crates
+lto = "fat"
 strip = "symbols"
 

@@ -7,8 +7,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
-use terra_agent::no_symlinks;
-use terra_agent::{
+use terra_shared::no_symlinks;
+use terra_shared::{
     CONTROL_VSOCK_PORT, Net, Plan, PlanMode, RECIPE_STAMP_PATH, RESIZE2FS_GUEST_PATH, ROOT_DEVICE,
     Share, WORKLOAD_GID, WORKLOAD_UID, WORKLOAD_USER_NAME,
 };
@@ -55,7 +55,7 @@ impl Ending {
         // SAFETY: `sync` takes no arguments and cannot fail.
         unsafe { libc::sync() };
         if let Some(mut control) = self.control
-            && let Err(e) = terra_agent::send_exit_status(&mut control, code)
+            && let Err(e) = terra_shared::send_exit_status(&mut control, code)
         {
             eprintln!("terra-agent: warning: could not report the exit status ({code}): {e}");
         }
@@ -94,7 +94,7 @@ fn enter_root() -> Result<(Plan, VsockStream, Option<std::os::fd::OwnedFd>)> {
     // Plan comes over vsock, never from a file - secrets never touch disk.
     let mut control = VsockStream::connect(VMADDR_CID_HOST, CONTROL_VSOCK_PORT)
         .context("dialling the host control port")?;
-    let plan: Plan = terra_agent::read_frame(&mut control).context("reading the boot plan")?;
+    let plan: Plan = terra_shared::read_frame(&mut control).context("reading the boot plan")?;
 
     // Grow every image before mounting - boot volume is out of reach after chroot.
     grow_filesystem(ROOT_DEVICE, "/mnt/clean");
@@ -280,7 +280,7 @@ fn execute(
     // looking into a box you no longer trust. A port that will not bind is
     // fatal for the same reason, and only defensible at this point: nothing
     // else in the guest has run yet.
-    let port = crate::vsock::VsockListener::bind(terra_agent::AGENT_VSOCK_PORT)
+    let port = crate::vsock::VsockListener::bind(terra_shared::AGENT_VSOCK_PORT)
         .map_err(|e| anyhow::anyhow!("binding the agent port: {e}"))?;
 
     restrict_ptrace();
@@ -291,7 +291,7 @@ fn execute(
 
     // HOME is the workload's in every mode, so it must exist even in a bake,
     // which has not created its user yet.
-    let home = terra_agent::workload_home();
+    let home = terra_shared::workload_home();
     if ensure_workdir(&home).with_context(|| format!("creating workdir {home}"))? {
         give_to_workload(&home);
     }
@@ -326,7 +326,7 @@ fn execute(
     let workdir = plan
         .workdir
         .clone()
-        .unwrap_or_else(terra_agent::workload_home);
+        .unwrap_or_else(terra_shared::workload_home);
     let created =
         ensure_workdir(&workdir).with_context(|| format!("creating workdir {workdir}"))?;
     if created {
@@ -482,7 +482,7 @@ const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/s
 
 /// Establish the guest's base environment, then apply `plan.env` on top.
 fn setup_env(plan: &Plan) {
-    let home = terra_agent::workload_home();
+    let home = terra_shared::workload_home();
     unsafe {
         std::env::set_var("PATH", DEFAULT_PATH);
         std::env::set_var("HOME", home);

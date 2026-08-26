@@ -1470,7 +1470,7 @@ dependencies = [
  "smolvm-network",
  "strum",
  "tempfile",
- "terra-agent",
+ "terra-shared",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -1484,9 +1484,18 @@ dependencies = [
  "anyhow",
  "libc",
  "pty-process",
+ "terra-shared",
+ "vt100",
+]
+
+[[package]]
+name = "terra-shared"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
  "serde",
  "serde_json",
- "vt100",
 ]
 
 [[package]]

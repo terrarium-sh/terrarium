@@ -18,19 +18,19 @@ pub fn run(
     let stream = session::connect_to_running_agent(
         bx,
         "exec",
-        terra_agent::AgentService::Exec,
+        terra_shared::AgentService::Exec,
         "exec service",
         args.agent.agent_timeout,
     )?;
 
     let tty = args.wants_a_terminal(at_a_terminal);
-    let req = terra_agent::ExecRequest {
+    let req = terra_shared::ExecRequest {
         argv: args.command.clone(),
         as_root: args.root,
         tty: tty.then(|| session::terminal_size().unwrap_or(session::DEFAULT_TERMINAL_SIZE)),
     };
     (&stream)
-        .write_all(&terra_agent::frame(&req).context("encoding the exec request")?)
+        .write_all(&terra_shared::frame(&req).context("encoding the exec request")?)
         .context("sending the exec request")?;
     Ok(exit_code(pump_exec(&stream, tty)?))
 }

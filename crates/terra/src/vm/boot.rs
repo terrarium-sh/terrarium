@@ -32,7 +32,7 @@ pub struct BootSpec {
     /// The box's project directory
     pub project_dir: PathBuf,
     pub root: bool,
-    pub mode: terra_agent::PlanMode,
+    pub mode: terra_shared::PlanMode,
     /// run the VM runs in-process
     pub foreground: bool,
 }
@@ -50,7 +50,7 @@ impl BootSpec {
             root: args.root,
             cfg,
             project_dir,
-            mode: terra_agent::PlanMode::Run,
+            mode: terra_shared::PlanMode::Run,
             foreground: boot == BootMode::Foreground,
         }
     }
@@ -86,7 +86,7 @@ pub fn run_bake(cfg: &config::Config, bx: &BoxRef, lock: &File) -> Result<()> {
         cfg: cfg.clone(),
         project_dir: bx.project_dir().to_path_buf(),
         root: false,
-        mode: terra_agent::PlanMode::Create,
+        mode: terra_shared::PlanMode::Create,
         // never in-process
         foreground: false,
     };
@@ -317,7 +317,7 @@ fn run_attached(bx: &BoxRef, spec: &BootSpec, run_lock: File) -> Result<ExitCode
     drop(run_lock);
 
     let joined =
-        session::connect_to_agent(bx, terra_agent::AgentService::Session, "session", || {
+        session::connect_to_agent(bx, terra_shared::AgentService::Session, "session", || {
             anyhow::ensure!(
                 child.try_wait().context("checking on the VM")?.is_none(),
                 "{bx} stopped before it had a session to join"
@@ -346,7 +346,7 @@ fn run_attached(bx: &BoxRef, spec: &BootSpec, run_lock: File) -> Result<ExitCode
 /// to join.
 pub fn attach(bx: &BoxRef) -> Result<ExitCode> {
     let stream =
-        session::connect_to_agent(bx, terra_agent::AgentService::Session, "session", || {
+        session::connect_to_agent(bx, terra_shared::AgentService::Session, "session", || {
             session::still_serving(bx, "stopped before it had a session to join")
         })?;
     join_session(bx, &stream, None)

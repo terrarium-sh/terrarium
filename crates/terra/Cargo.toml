@@ -6,9 +6,8 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
-# A library plus a three-line binary: `examples/gen-docs.rs` renders the man
-# pages and completions from the same clap types the binary parses with, and
-# neither an example nor a test crate can reach those without a lib target.
+# `examples/gen-docs.rs` renders man pages and completions from the same clap
+# types the binary parses with; examples reach those only through a lib target.
 [lib]
 name = "terra"
 path = "src/lib.rs"
@@ -18,7 +17,7 @@ name = "terra"
 path = "src/main.rs"
 
 [dependencies]
-terra-agent = { path = "../terra-agent" }
+terra-shared = { path = "../terra-shared" }
 clap.workspace = true
 strum = { version = "0.28", features = ["derive"] }
 anyhow.workspace = true

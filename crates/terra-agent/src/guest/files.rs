@@ -4,19 +4,19 @@ use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
-use terra_agent::{FileReply, FileRequest, WORKLOAD_GID, WORKLOAD_UID};
+use terra_shared::{FileReply, FileRequest, WORKLOAD_GID, WORKLOAD_UID};
 
 /// Create or open `path` for writing without following a symlink
 fn create_no_symlinks(path: &str) -> std::io::Result<std::fs::File> {
     // Zeroed mode - `openat2` refuses a mode without `O_CREAT`.
-    let open = || terra_agent::no_symlinks::open_raw(Path::new(path), libc::O_WRONLY, 0);
+    let open = || terra_shared::no_symlinks::open_raw(Path::new(path), libc::O_WRONLY, 0);
     match open() {
         // Exclusive create, so a link planted between probe and create
         // answers `ELOOP` rather than being followed.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             create_missing_parents_for_the_workload_user(std::path::Path::new(path))?;
             open().or_else(|_| {
-                terra_agent::no_symlinks::open_raw(
+                terra_shared::no_symlinks::open_raw(
                     Path::new(path),
                     libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
                     0o600,
@@ -72,7 +72,7 @@ pub fn serve_file_op(mut conn: impl Read + std::io::Write, root: bool) {
     use std::os::unix::fs::PermissionsExt;
 
     let reply = |conn: &mut dyn Write, rep: &FileReply| {
-        if let Ok(f) = terra_agent::frame(rep) {
+        if let Ok(f) = terra_shared::frame(rep) {
             let _ = conn.write_all(&f);
         }
     };
@@ -82,7 +82,7 @@ pub fn serve_file_op(mut conn: impl Read + std::io::Write, root: bool) {
     let drain = |conn: &mut dyn Read, n: u64| {
         let _ = std::io::copy(&mut conn.take(n), &mut std::io::sink());
     };
-    let Ok(req) = terra_agent::read_frame::<FileRequest>(&mut conn) else {
+    let Ok(req) = terra_shared::read_frame::<FileRequest>(&mut conn) else {
         return;
     };
     match req {
@@ -188,9 +188,11 @@ mod tests {
     fn do_op(req: &FileRequest, body: &[u8]) -> (FileReply, Vec<u8>) {
         let (mut client, server) = UnixStream::pair().unwrap();
         let agent = std::thread::spawn(move || serve_file_op(server, true));
-        client.write_all(&terra_agent::frame(req).unwrap()).unwrap();
+        client
+            .write_all(&terra_shared::frame(req).unwrap())
+            .unwrap();
         client.write_all(body).unwrap();
-        let rep: FileReply = terra_agent::read_frame(&mut client).unwrap();
+        let rep: FileReply = terra_shared::read_frame(&mut client).unwrap();
         let mut rest = Vec::new();
         client.read_to_end(&mut rest).unwrap(); // agent drops the conn at op end
         agent.join().unwrap();

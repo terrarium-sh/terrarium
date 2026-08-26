@@ -1,6 +1,6 @@
 //! The agent's exec service: one `terra exec` per connection - one PTY (or one
 //! pair of pipes), one process, one exit status. What sets it apart from a
-//! session is documented on [`terra_agent::AgentService`].
+//! session is documented on [`terra_shared::AgentService`].
 
 use crate::term::tty::set_winsize;
 use crate::vsock::VsockStream;
@@ -8,7 +8,7 @@ use anyhow::Result;
 use std::io::Read;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::{Arc, Mutex};
-use terra_agent::{AgentOutput, ClientInput, ExecRequest, TermSize};
+use terra_shared::{AgentOutput, ClientInput, ExecRequest, TermSize};
 
 /// What an exec reports when the command could not be started at all - 127 is
 /// the shell's "command not found", which is what this almost always is.
@@ -29,7 +29,7 @@ const EXEC_ABANDONED: i32 = 126;
 /// as init, so this is not new authority - and unlike a `sudo:` grant it is
 /// host-initiated only (see the host-CID check on accept).
 pub fn serve_exec(mut conn: VsockStream, workload_root: bool) {
-    let Ok(req) = terra_agent::read_frame::<ExecRequest>(&mut conn) else {
+    let Ok(req) = terra_shared::read_frame::<ExecRequest>(&mut conn) else {
         return;
     };
     let Some((cmd, args)) = req.argv.split_first() else {
@@ -103,7 +103,7 @@ fn exec_on_pty(
 ) {
     use std::io::Write;
 
-    let home = terra_agent::workload_home();
+    let home = terra_shared::workload_home();
     let (pty, mut child) =
         match crate::term::mux::spawn_on_pty(cmd, args, rows, cols, as_root, Some(&home)) {
             Ok(pair) => pair,
@@ -177,7 +177,7 @@ fn exec_on_pipes(mut conn: VsockStream, cmd: &str, args: &[String], as_root: boo
         let mut command = std::process::Command::new(cmd);
         command
             .args(args)
-            .env("HOME", terra_agent::workload_home())
+            .env("HOME", terra_shared::workload_home())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -304,7 +304,7 @@ mod tests {
         let server = VsockStream::from(std::os::fd::OwnedFd::from(server));
         let agent = std::thread::spawn(move || serve_exec(server, true));
         client
-            .write_all(&terra_agent::frame(&req).unwrap())
+            .write_all(&terra_shared::frame(&req).unwrap())
             .unwrap();
         if !stdin.is_empty() {
             client

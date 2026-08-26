@@ -16,7 +16,7 @@ use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use terra_agent::{
+use terra_shared::{
     AGENT_HELLO, AgentOutput, AgentService, ClientInput, STOP_SIGNAL, WORKLOAD_GID, WORKLOAD_UID,
 };
 
@@ -167,7 +167,7 @@ pub fn run_workload(
 
     // PID 1's own exit tells the host nothing - libkrun reports every clean
     // shutdown the same way - so the status is carried out deliberately, over
-    // the control connection (see [`terra_agent::send_exit_status`]).
+    // the control connection (see [`terra_shared::send_exit_status`]).
     let code = crate::exec::exit_code(&mut child);
     exited.store(true, std::sync::atomic::Ordering::SeqCst);
 
@@ -363,35 +363,35 @@ fn serve_client(session: &Arc<Session>, conn: VsockStream, master_fd: RawFd) {
 /// without attaching as a client itself.
 fn serve_session_control(session: &Arc<Session>, mut conn: VsockStream, master_fd: RawFd) {
     use std::io::Write;
-    let reply = |conn: &mut VsockStream, rep: &terra_agent::ControlReply| {
+    let reply = |conn: &mut VsockStream, rep: &terra_shared::ControlReply| {
         conn.write_all(&rep.encode()).and_then(|()| conn.flush())
     };
-    match terra_agent::ControlRequest::read(&mut conn) {
-        Ok(Some(terra_agent::ControlRequest::List)) => {
+    match terra_shared::ControlRequest::read(&mut conn) {
+        Ok(Some(terra_shared::ControlRequest::List)) => {
             for (id, size) in session.list_clients() {
                 let (rows, cols) = size.unwrap_or((0, 0));
                 if reply(
                     &mut conn,
-                    &terra_agent::ControlReply::Client { id, rows, cols },
+                    &terra_shared::ControlReply::Client { id, rows, cols },
                 )
                 .is_err()
                 {
                     return;
                 }
             }
-            let _ = reply(&mut conn, &terra_agent::ControlReply::Done);
+            let _ = reply(&mut conn, &terra_shared::ControlReply::Done);
         }
-        Ok(Some(terra_agent::ControlRequest::Detach { id })) => {
+        Ok(Some(terra_shared::ControlRequest::Detach { id })) => {
             if session.list_clients().iter().any(|(cid, _)| *cid == id) {
                 if let Some((r, c)) = session.detach_client(id) {
                     set_winsize(master_fd, r, c);
                 }
-                let _ = reply(&mut conn, &terra_agent::ControlReply::Detached { id });
+                let _ = reply(&mut conn, &terra_shared::ControlReply::Detached { id });
             } else {
-                let _ = reply(&mut conn, &terra_agent::ControlReply::Missing { id });
+                let _ = reply(&mut conn, &terra_shared::ControlReply::Missing { id });
             }
         }
-        Ok(Some(terra_agent::ControlRequest::DetachAll)) => {
+        Ok(Some(terra_shared::ControlRequest::DetachAll)) => {
             let ids: Vec<u64> = session
                 .list_clients()
                 .into_iter()
@@ -401,11 +401,11 @@ fn serve_session_control(session: &Arc<Session>, mut conn: VsockStream, master_f
                 set_winsize(master_fd, r, c);
             }
             for id in ids {
-                if reply(&mut conn, &terra_agent::ControlReply::Detached { id }).is_err() {
+                if reply(&mut conn, &terra_shared::ControlReply::Detached { id }).is_err() {
                     return;
                 }
             }
-            let _ = reply(&mut conn, &terra_agent::ControlReply::Done);
+            let _ = reply(&mut conn, &terra_shared::ControlReply::Done);
         }
         Ok(None) | Err(_) => {}
     }
@@ -490,8 +490,8 @@ mod tests {
     /// client whose terminal died mid-session.
     fn do_control(
         session: &Arc<Session>,
-        req: &terra_agent::ControlRequest,
-    ) -> Vec<terra_agent::ControlReply> {
+        req: &terra_shared::ControlRequest,
+    ) -> Vec<terra_shared::ControlReply> {
         let null = std::fs::File::open("/dev/null").unwrap();
         let (mut client, server) = UnixStream::pair().unwrap();
         let server = VsockStream::from(std::os::fd::OwnedFd::from(server));
@@ -500,8 +500,8 @@ mod tests {
             std::thread::spawn(move || serve_session_control(&session, server, null.as_raw_fd()));
         client.write_all(&req.encode()).unwrap();
         let mut reps = Vec::new();
-        while let Some(rep) = terra_agent::ControlReply::read(&mut client).unwrap() {
-            let done = matches!(rep, terra_agent::ControlReply::Done);
+        while let Some(rep) = terra_shared::ControlReply::read(&mut client).unwrap() {
+            let done = matches!(rep, terra_shared::ControlReply::Done);
             reps.push(rep);
             if done {
                 break;
@@ -516,19 +516,19 @@ mod tests {
         let session = session_with(2);
         session.set_client_size(0, 30, 100);
         assert_eq!(
-            do_control(&session, &terra_agent::ControlRequest::List),
+            do_control(&session, &terra_shared::ControlRequest::List),
             vec![
-                terra_agent::ControlReply::Client {
+                terra_shared::ControlReply::Client {
                     id: 0,
                     rows: 30,
                     cols: 100
                 },
-                terra_agent::ControlReply::Client {
+                terra_shared::ControlReply::Client {
                     id: 1,
                     rows: 0,
                     cols: 0
                 },
-                terra_agent::ControlReply::Done,
+                terra_shared::ControlReply::Done,
             ]
         );
         // The ask did not disturb the session.
@@ -545,8 +545,8 @@ mod tests {
         session.set_client_size(1, 50, 200);
 
         assert_eq!(
-            do_control(&session, &terra_agent::ControlRequest::Detach { id: 1 }),
-            vec![terra_agent::ControlReply::Detached { id: 1 }]
+            do_control(&session, &terra_shared::ControlRequest::Detach { id: 1 }),
+            vec![terra_shared::ControlReply::Detached { id: 1 }]
         );
         assert_eq!(session.list_clients(), vec![(0, Some((30, 100)))]);
     }
@@ -555,8 +555,8 @@ mod tests {
     fn detaching_an_unknown_id_answers_missing() {
         let session = session_with(1);
         assert_eq!(
-            do_control(&session, &terra_agent::ControlRequest::Detach { id: 7 }),
-            vec![terra_agent::ControlReply::Missing { id: 7 }]
+            do_control(&session, &terra_shared::ControlRequest::Detach { id: 7 }),
+            vec![terra_shared::ControlReply::Missing { id: 7 }]
         );
         assert_eq!(
             session.list_clients().len(),
@@ -569,12 +569,12 @@ mod tests {
     fn detach_all_drops_every_client() {
         let session = session_with(3);
         assert_eq!(
-            do_control(&session, &terra_agent::ControlRequest::DetachAll),
+            do_control(&session, &terra_shared::ControlRequest::DetachAll),
             vec![
-                terra_agent::ControlReply::Detached { id: 0 },
-                terra_agent::ControlReply::Detached { id: 1 },
-                terra_agent::ControlReply::Detached { id: 2 },
-                terra_agent::ControlReply::Done,
+                terra_shared::ControlReply::Detached { id: 0 },
+                terra_shared::ControlReply::Detached { id: 1 },
+                terra_shared::ControlReply::Detached { id: 2 },
+                terra_shared::ControlReply::Done,
             ]
         );
         assert_eq!(session.list_clients(), vec![]);

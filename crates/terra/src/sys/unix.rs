@@ -32,13 +32,13 @@ pub fn open_null() -> Result<File> {
 /// `RESOLVE_NO_SYMLINKS`).
 #[cfg(target_os = "linux")]
 pub fn open_no_symlinks(path: &Path) -> Result<File> {
-    terra_agent::no_symlinks::open_raw(path, libc::O_RDONLY, 0).map_err(|e| explain(e, path))
+    terra_shared::no_symlinks::open_raw(path, libc::O_RDONLY, 0).map_err(|e| explain(e, path))
 }
 
 /// Create or truncate for writing, under the same rule as [`open_no_symlinks`].
 #[cfg(target_os = "linux")]
 pub fn create_no_symlinks(path: &Path) -> Result<File> {
-    terra_agent::no_symlinks::create_raw(path).map_err(|e| explain(e, path))
+    terra_shared::no_symlinks::create_raw(path).map_err(|e| explain(e, path))
 }
 
 /// The two errnos this open reports read as nonsense as written ("Too many
@@ -314,7 +314,7 @@ fn send_stop() {
     if fd < 0 {
         return;
     }
-    let byte = [terra_agent::STOP_SIGNAL];
+    let byte = [terra_shared::STOP_SIGNAL];
     // SAFETY: `fd` is the control connection, open for the rest of this
     // process's life (see [`STOP_FD`]); one byte from a live buffer.
     unsafe { libc::write(fd, byte.as_ptr().cast(), 1) };
@@ -489,7 +489,7 @@ mod tests {
         register_stop_channel(std::os::fd::OwnedFd::from(host));
         let mut byte = [0u8; 1];
         (&guest).read_exact(&mut byte).unwrap();
-        assert_eq!(byte[0], terra_agent::STOP_SIGNAL);
+        assert_eq!(byte[0], terra_shared::STOP_SIGNAL);
 
         // A second signal does not put a second byte on the connection - the
         // guest reads one and starts `pre_stop`.

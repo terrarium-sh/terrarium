@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 use smolvm_network::GuestNetworkConfig;
 use std::fs::File;
 use std::process::ExitCode;
-use terra_agent::{Disk, Net, Plan, PlanMode, Share, WORKLOAD_UID};
+use terra_shared::{Disk, Net, Plan, PlanMode, Share, WORKLOAD_UID};
 
 // The two VMs one spec can ask for, told apart by `spec.mode`:
 //   Create - a bare VM that bakes `on_create` and stops. No shares and no
@@ -41,7 +41,7 @@ fn attach_disks(krun: &libkrun_ext::Krun, cfg: &config::Config, bx: &BoxRef) -> 
         volumes.push(Disk {
             // Recipe validation caps volumes at MAX_VOLUMES, so this is a bug
             // guard, not an input check.
-            dev: terra_agent::volume_device(i)
+            dev: terra_shared::volume_device(i)
                 .with_context(|| format!("volume {i} is past the last guest block device"))?,
             guest: v.guest.to_string_lossy().into_owned(),
         });
@@ -76,7 +76,7 @@ fn attach_agent_port(krun: &libkrun_ext::Krun, bx: &BoxRef) -> Result<()> {
     // A crashed prior VM may have left a socket; libkrun binds EEXIST.
     let _ = std::fs::remove_file(&path);
     image::sweep_staging_temps(bx.dir(), |_| false);
-    krun.add_vsock_port(terra_agent::AGENT_VSOCK_PORT, &path, true)
+    krun.add_vsock_port(terra_shared::AGENT_VSOCK_PORT, &path, true)
 }
 
 /// Run the box's VM until the workload ends.
@@ -101,7 +101,7 @@ pub fn run(spec: &BootSpec, bx: &BoxRef, _lock: File) -> Result<ExitCode> {
     krun.set_vm_config(cfg.hw.cpus, cfg.hw.mem_mib)?;
     krun.set_kernel(
         &image::ensure_kernel_on_disk()?,
-        &terra_agent::kernel_cmdline(),
+        &terra_shared::kernel_cmdline(),
     )?;
 
     let volumes = attach_disks(&krun, cfg, bx)?;
@@ -227,7 +227,7 @@ fn generate_sandbox_info(cfg: &config::Config, root: bool) -> String {
     } else {
         format!(
             "`{}` (uid {WORKLOAD_UID}, non-root)",
-            terra_agent::WORKLOAD_USER_NAME
+            terra_shared::WORKLOAD_USER_NAME
         )
     };
     format!(
@@ -312,9 +312,9 @@ fn serve_control_sock(krun: &libkrun_ext::Krun, bx: &BoxRef, plan: &Plan) -> Res
     // `bind` applies the process umask; the socket hands out secrets, so the
     // mode is stated here too, not left to the state dir alone.
     sys::owner_only(&sock, false).with_context(|| format!("securing {}", sock.display()))?;
-    krun.add_vsock_port(terra_agent::CONTROL_VSOCK_PORT, &sock, false)?;
+    krun.add_vsock_port(terra_shared::CONTROL_VSOCK_PORT, &sock, false)?;
 
-    let frame = terra_agent::frame(plan).context("serializing the boot plan")?;
+    let frame = terra_shared::frame(plan).context("serializing the boot plan")?;
     std::thread::spawn(move || {
         use std::io::Write;
         let accepted = listener.accept();
@@ -345,7 +345,7 @@ fn serve_control_sock(krun: &libkrun_ext::Krun, bx: &BoxRef, plan: &Plan) -> Res
         // `pre_stop` runs would cut the stop channel out from under the guest.
         // The guest's last act on it is its exit status; a read that ends
         // without one is the VM dying rather than finishing.
-        if let Ok(code) = terra_agent::read_exit_status(&mut conn) {
+        if let Ok(code) = terra_shared::read_exit_status(&mut conn) {
             exit_as_the_guest_did(code);
         }
     });

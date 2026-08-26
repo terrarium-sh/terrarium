@@ -8,7 +8,7 @@
 
 use anyhow::{Context, Result};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use terra_agent::{WORKLOAD_GID, WORKLOAD_UID};
+use terra_shared::{WORKLOAD_GID, WORKLOAD_UID};
 
 /// linux/mount.h - in the locked libc only for gnu targets, and the agent
 /// builds for musl.

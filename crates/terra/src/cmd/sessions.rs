@@ -49,7 +49,7 @@ mod tests {
         assert_eq!(
             client_line(&SessionClient {
                 id: 7,
-                reported_term_size: Some(terra_agent::TermSize { rows: 24, cols: 80 })
+                reported_term_size: Some(terra_shared::TermSize { rows: 24, cols: 80 })
             }),
             "7\t24x80"
         );

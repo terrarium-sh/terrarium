@@ -399,11 +399,11 @@ fn validate(cfg: &Config) -> Result<()> {
         }
     }
 
-    if cfg.volumes.len() > terra_agent::MAX_VOLUMES {
+    if cfg.volumes.len() > terra_shared::MAX_VOLUMES {
         bail!(
             "{} volumes configured; at most {} fit (one guest block device each)",
             cfg.volumes.len(),
-            terra_agent::MAX_VOLUMES
+            terra_shared::MAX_VOLUMES
         );
     }
     for (i, v) in cfg.volumes.iter().enumerate() {
@@ -846,8 +846,8 @@ mod tests {
             }
             try_parse(&y)
         };
-        assert!(many(terra_agent::MAX_VOLUMES).is_ok());
-        let err = many(terra_agent::MAX_VOLUMES + 1).unwrap_err().to_string();
+        assert!(many(terra_shared::MAX_VOLUMES).is_ok());
+        let err = many(terra_shared::MAX_VOLUMES + 1).unwrap_err().to_string();
         assert!(err.contains("at most"), "{err}");
     }
 

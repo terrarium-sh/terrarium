@@ -1,6 +1,5 @@
-//! The library both sides link: the host/guest wire contract ([`contract`])
-//! and the one filesystem primitive the host and the guest share ([`no_symlinks`]).
-//! `guest/` is the agent binary and never leaves Linux.
+//! The whole shared surface between host and guest: the wire contract
+//! ([`contract`]) and the one filesystem primitive they share ([`no_symlinks`]).
 
 // unwrap/expect/panic are denied workspace-wide via Cargo.toml; tests opt back in.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]

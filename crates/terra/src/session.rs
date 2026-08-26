@@ -10,7 +10,7 @@ use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
-use terra_agent::{AgentOutput, AgentService, ClientInput, TermSize};
+use terra_shared::{AgentOutput, AgentService, ClientInput, TermSize};
 
 const AGENT_HELLO_WAIT_TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -67,7 +67,7 @@ pub fn connect_to_agent(
             let mut hello = [0u8; 1];
             if let Ok(1) = (&stream).read(&mut hello) {
                 anyhow::ensure!(
-                    hello[0] == terra_agent::AGENT_HELLO,
+                    hello[0] == terra_shared::AGENT_HELLO,
                     "the agent in {bx} does not speak this terra's protocol - \
                      `terra stop` it and start it again on this build"
                 );
@@ -138,7 +138,7 @@ fn control_connection(bx: &BoxRef, verb: &str, agent_timeout: Option<u64>) -> Re
     connect_to_running_agent(
         bx,
         verb,
-        terra_agent::AgentService::SessionControl,
+        terra_shared::AgentService::SessionControl,
         "session control service",
         agent_timeout,
     )
@@ -147,18 +147,18 @@ fn control_connection(bx: &BoxRef, verb: &str, agent_timeout: Option<u64>) -> Re
 pub fn list_clients(bx: &BoxRef, agent_timeout: Option<u64>) -> Result<Vec<SessionClient>> {
     let mut stream = control_connection(bx, "sessions", agent_timeout)?;
     (&stream)
-        .write_all(&terra_agent::ControlRequest::List.encode())
+        .write_all(&terra_shared::ControlRequest::List.encode())
         .context("asking for the session's clients")?;
     let mut clients = Vec::new();
     loop {
-        match terra_agent::ControlReply::read(&mut stream) {
-            Ok(Some(terra_agent::ControlReply::Client { id, rows, cols })) => {
+        match terra_shared::ControlReply::read(&mut stream) {
+            Ok(Some(terra_shared::ControlReply::Client { id, rows, cols })) => {
                 clients.push(SessionClient {
                     id,
                     reported_term_size: (rows > 0 && cols > 0).then_some(TermSize { rows, cols }),
                 });
             }
-            Ok(Some(terra_agent::ControlReply::Done)) => return Ok(clients),
+            Ok(Some(terra_shared::ControlReply::Done)) => return Ok(clients),
             Ok(Some(_)) => anyhow::bail!("the agent answered a listing with a detach reply"),
             // A stream that ends before `Done` is the box going away.
             Ok(None) => anyhow::bail!("{bx} stopped before its agent listed the session"),
@@ -170,11 +170,11 @@ pub fn list_clients(bx: &BoxRef, agent_timeout: Option<u64>) -> Result<Vec<Sessi
 pub fn detach_client(bx: &BoxRef, client_id: u64, agent_timeout: Option<u64>) -> Result<()> {
     let mut stream = control_connection(bx, "detach", agent_timeout)?;
     (&stream)
-        .write_all(&terra_agent::ControlRequest::Detach { id: client_id }.encode())
+        .write_all(&terra_shared::ControlRequest::Detach { id: client_id }.encode())
         .context("asking to detach a client")?;
-    match terra_agent::ControlReply::read(&mut stream) {
-        Ok(Some(terra_agent::ControlReply::Detached { .. })) => Ok(()),
-        Ok(Some(terra_agent::ControlReply::Missing { .. })) => {
+    match terra_shared::ControlReply::read(&mut stream) {
+        Ok(Some(terra_shared::ControlReply::Detached { .. })) => Ok(()),
+        Ok(Some(terra_shared::ControlReply::Missing { .. })) => {
             anyhow::bail!("no client {client_id} is attached to {bx}")
         }
         Ok(Some(_)) => anyhow::bail!("the agent answered a detach with a listing reply"),
@@ -186,13 +186,13 @@ pub fn detach_client(bx: &BoxRef, client_id: u64, agent_timeout: Option<u64>) ->
 pub fn detach_all(bx: &BoxRef, agent_timeout: Option<u64>) -> Result<u64> {
     let mut stream = control_connection(bx, "detach", agent_timeout)?;
     (&stream)
-        .write_all(&terra_agent::ControlRequest::DetachAll.encode())
+        .write_all(&terra_shared::ControlRequest::DetachAll.encode())
         .context("asking to detach every client")?;
     let mut detached = 0;
     loop {
-        match terra_agent::ControlReply::read(&mut stream) {
-            Ok(Some(terra_agent::ControlReply::Detached { .. })) => detached += 1,
-            Ok(Some(terra_agent::ControlReply::Done)) => return Ok(detached),
+        match terra_shared::ControlReply::read(&mut stream) {
+            Ok(Some(terra_shared::ControlReply::Detached { .. })) => detached += 1,
+            Ok(Some(terra_shared::ControlReply::Done)) => return Ok(detached),
             Ok(Some(_)) => anyhow::bail!("the agent answered a detach with a listing reply"),
             Ok(None) => anyhow::bail!("{bx} stopped before its agent answered the detach"),
             Err(e) => return Err(e).context("reading the detach replies"),
@@ -426,8 +426,8 @@ mod tests {
     /// check, and the frame parsing all run for real.
     fn agent_answering(
         bx: &BoxRef,
-        expected: terra_agent::ControlRequest,
-        replies: Vec<terra_agent::ControlReply>,
+        expected: terra_shared::ControlRequest,
+        replies: Vec<terra_shared::ControlReply>,
     ) -> (
         std::fs::File,
         crate::sys::TestHome,
@@ -439,16 +439,16 @@ mod tests {
         let listener = UnixListener::bind(bx.agent_sock()).unwrap();
         let agent = std::thread::spawn(move || {
             let (mut conn, _) = listener.accept().unwrap();
-            conn.write_all(&[terra_agent::AGENT_HELLO]).unwrap();
+            conn.write_all(&[terra_shared::AGENT_HELLO]).unwrap();
             let mut service = [0u8; 1];
             conn.read_exact(&mut service).unwrap();
             assert_eq!(
                 service[0],
-                terra_agent::AgentService::SessionControl as u8,
+                terra_shared::AgentService::SessionControl as u8,
                 "the host dialed a different service"
             );
             assert_eq!(
-                terra_agent::ControlRequest::read(&mut conn).unwrap(),
+                terra_shared::ControlRequest::read(&mut conn).unwrap(),
                 Some(expected),
                 "the host sent a different request"
             );
@@ -468,19 +468,19 @@ mod tests {
         let bx = BoxRef::resolve(dir.path(), "dev").unwrap();
         let (_lock, _home, agent) = agent_answering(
             &bx,
-            terra_agent::ControlRequest::List,
+            terra_shared::ControlRequest::List,
             vec![
-                terra_agent::ControlReply::Client {
+                terra_shared::ControlReply::Client {
                     id: 0,
                     rows: 30,
                     cols: 100,
                 },
-                terra_agent::ControlReply::Client {
+                terra_shared::ControlReply::Client {
                     id: 1,
                     rows: 0,
                     cols: 0,
                 },
-                terra_agent::ControlReply::Done,
+                terra_shared::ControlReply::Done,
             ],
         );
         assert_eq!(
@@ -511,8 +511,8 @@ mod tests {
         let bx = BoxRef::resolve(dir.path(), "dev").unwrap();
         let (_lock, _home, agent) = agent_answering(
             &bx,
-            terra_agent::ControlRequest::Detach { id: 9 },
-            vec![terra_agent::ControlReply::Missing { id: 9 }],
+            terra_shared::ControlRequest::Detach { id: 9 },
+            vec![terra_shared::ControlReply::Missing { id: 9 }],
         );
         let err = detach_client(&bx, 9, None).unwrap_err().to_string();
         assert!(err.contains("no client 9"), "{err}");
@@ -528,11 +528,11 @@ mod tests {
         let bx = BoxRef::resolve(dir.path(), "dev").unwrap();
         let (_lock, _home, agent) = agent_answering(
             &bx,
-            terra_agent::ControlRequest::DetachAll,
+            terra_shared::ControlRequest::DetachAll,
             vec![
-                terra_agent::ControlReply::Detached { id: 0 },
-                terra_agent::ControlReply::Detached { id: 1 },
-                terra_agent::ControlReply::Done,
+                terra_shared::ControlReply::Detached { id: 0 },
+                terra_shared::ControlReply::Detached { id: 1 },
+                terra_shared::ControlReply::Done,
             ],
         );
         assert_eq!(detach_all(&bx, None).unwrap(), 2);
@@ -547,8 +547,8 @@ mod tests {
         let bx = BoxRef::resolve(dir.path(), "dev").unwrap();
         let (_lock, _home, agent) = agent_answering(
             &bx,
-            terra_agent::ControlRequest::DetachAll,
-            vec![terra_agent::ControlReply::Done],
+            terra_shared::ControlRequest::DetachAll,
+            vec![terra_shared::ControlReply::Done],
         );
         assert_eq!(detach_all(&bx, None).unwrap(), 0);
         agent.join().unwrap();
