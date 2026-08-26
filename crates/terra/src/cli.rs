@@ -129,7 +129,8 @@ pub enum Cmd {
     /// keeps the file's own name.
     Get(CopyArgs),
     /// Show a box's log: terra's, libkrun's and the gateway's own diagnostics,
-    /// rotated as it grows. The guest's boot and hooks are not in it -
+    /// rotated as it grows (libkrun speaks at warn and above unless `RUST_LOG`
+    /// says otherwise). The guest's boot and hooks are not in it -
     /// `TERRA_DIAGNOSTICS=1` keeps those in diagnostics.log. The workload's
     /// terminal goes to the session - attach to the box to see it live.
     Logs(LogsArgs),

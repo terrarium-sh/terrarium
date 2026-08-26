@@ -1,14 +1,15 @@
-//! The box's one rolling log: terra's tracing records, rotated by
-//! tracing-appender into dated generations (`terra.log` is the symlink to the
-//! current one). Other writers - the guest console included - reach the disk
-//! only under `TERRA_DIAGNOSTICS=1`, in diagnostics.log.
+//! The box's one rolling log: tracing records, rotated by tracing-appender
+//! (`terra.log` is the symlink to the current one). Other writers - the guest
+//! console included - reach the disk only under `TERRA_DIAGNOSTICS=1`, in
+//! diagnostics.log.
 
 use crate::state::BoxRef;
 use crate::sys;
+use anyhow::Context as _;
 use std::io::Write;
 use std::str::FromStr;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
-use tracing_subscriber::filter::Targets;
+use tracing_subscriber::filter::{LevelFilter, Targets};
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
@@ -38,8 +39,10 @@ pub fn init(bx: &BoxRef) -> anyhow::Result<()> {
         }
     });
 
-    let defaulted = asked.is_none();
-    let filter = asked.unwrap_or_else(|| Targets::new().with_default(tracing::Level::INFO));
+    let (filter, defaulted) = match asked {
+        Some(filter) => (filter, false),
+        None => (Targets::new().with_default(LevelFilter::INFO), true),
+    };
 
     let installed = tracing_subscriber::registry()
         .with(
@@ -51,14 +54,11 @@ pub fn init(bx: &BoxRef) -> anyhow::Result<()> {
         .try_init()
         .is_ok();
 
-    // The `log` facade is capped at warn: libkrun's per-frame debug sites would
-    // flood an unasked-for default, and records under the cap are never built,
-    // not built for a filter to drop.
     if installed && defaulted {
-        log::set_max_level(log::LevelFilter::Warn);
+        log::set_max_level(log::LevelFilter::Info);
     }
 
-    // A direct write, not a tracing event: the mark must land whatever RUST_LOG says.
+    // A direct write, not a log record: the mark must land whatever RUST_LOG says.
     if let Ok(mut sep) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -70,7 +70,6 @@ pub fn init(bx: &BoxRef) -> anyhow::Result<()> {
 }
 
 pub fn open_diagnostics(bx: &BoxRef) -> anyhow::Result<std::fs::File> {
-    use anyhow::Context as _;
     let path = bx.diagnostics_log();
     sys::create_no_symlinks(&path).with_context(|| format!("opening {}", path.display()))
 }

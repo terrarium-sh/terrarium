@@ -163,7 +163,7 @@ impl BoxRef {
         self.dir.join("terra.log")
     }
 
-    /// Every writer that does not go through tracing, fresh per run.
+    /// Every writer that does not go through the logger, fresh per run.
     pub fn diagnostics_log(&self) -> PathBuf {
         self.dir.join("diagnostics.log")
     }
@@ -215,7 +215,7 @@ impl BoxRef {
             line.push_str(BAKE_MARK);
         }
         if let Err(e) = self.rewrite_lock_line(&line) {
-            tracing::warn!("terra: warning: could not publish pid {pid} for {self}: {e}");
+            log::warn!("terra: warning: could not publish pid {pid} for {self}: {e}");
         }
     }
 
@@ -234,7 +234,7 @@ impl BoxRef {
     #[must_use = "the bake mark is cleared when this drops"]
     pub fn mark_baking<'a>(&self, lock: &'a File) -> BakeMark<'a> {
         if let Err(e) = self.rewrite_lock_line(BAKE_MARK) {
-            tracing::warn!("terra: warning: could not mark {self} as baking: {e}");
+            log::warn!("terra: warning: could not mark {self} as baking: {e}");
         }
         BakeMark(lock)
     }

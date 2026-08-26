@@ -323,14 +323,14 @@ A box has one log, `terra.log`, and it is the box's *diagnostics*: terra's own
 messages, libkrun's and the gateway's account of what it refused.
 `terra [BOX] logs` [`-f`] shows it.
 
-What is deliberately **not** in it is the guest's console and the workload's
-terminal. The workload's terminal is the session's: the guest multiplexes it
-(see *the guest agent* below) and it reaches whoever is attached, nobody else.
-The console — the kernel, the agent, every `on_create`, `on_start` and
-`pre_stop` hook — is the guest's second stream, and it is discarded when
-nobody is listening: a spawned VM sends it to `/dev/null`, a `--foreground`
-VM keeps it on the terminal the process was started with. So the two questions
-have two answers — `terra logs` for *why is my box broken*, attaching for
+What is deliberately **not** in it is the workload's terminal. The workload's
+terminal is the session's: the guest multiplexes it (see *the guest agent*
+below) and it reaches whoever is attached, nobody else. A run boot sends its
+console output to `/dev/null` unless `TERRA_DIAGNOSTICS=1` repoints it at
+diagnostics.log, a `--foreground` boot keeps it on the terminal the process
+was started with, and a bake's console goes to this log - a failed
+`on_create` replays it so you can fix the recipe. So the two questions have
+two answers — `terra logs` for *why is my box broken*, attaching for
 *what is it doing* — and neither arrives interleaved with an escape sequence
 from the other, which used to corrupt a live TUI and every later replay of the
 log.
@@ -362,8 +362,10 @@ follows across the repoint without going quiet or repeating itself.
 
 Everything host-side is collected by one `tracing` subscriber, which is also
 what makes the gateway's own account of a refusal visible at all — those events
-were written to nobody for as long as terra installed no subscriber. `RUST_LOG`
-sets the level (terra's own records default to `info`, libkrun's to `warn`).
+were written to nobody for as long as terra installed no subscriber. The box
+log defaults to `info`; `RUST_LOG` overrides it verbatim. Records below the
+chosen level are never built at all — libkrun logs through the same facade, so
+its chatty device sites cost nothing unless asked for.
 
 A boot that never gets off the ground is reported by the process that spawned
 it: it replays the tail of the log rather than leaving you to go looking. (A

@@ -81,8 +81,7 @@ fn attach_agent_port(krun: &libkrun_ext::Krun, bx: &BoxRef) -> Result<()> {
 
 /// Run the box's VM until the workload ends.
 pub fn run(spec: &BootSpec, bx: &BoxRef, _lock: File) -> Result<ExitCode> {
-    // Before libkrun exists to log anything: its records reach the box's log
-    // through the same subscriber as ours and the gateway's.
+    // Before libkrun exists to log anything.
     logs::init(bx)?;
     let cfg = &spec.cfg;
     let mode = spec.mode;
@@ -111,7 +110,7 @@ pub fn run(spec: &BootSpec, bx: &BoxRef, _lock: File) -> Result<ExitCode> {
     let diag = diagnostics_on()
         .then(|| logs::open_diagnostics(bx))
         .transpose()?;
-    let _console = krun.add_console(null, console_file(spec, diag.as_ref())?)?;
+    let _console = krun.add_console(null, console_file(spec, bx, diag.as_ref())?)?;
 
     let _net_rt = start_networking(&krun, &cfg.network)?;
 
@@ -128,12 +127,12 @@ pub fn run(spec: &BootSpec, bx: &BoxRef, _lock: File) -> Result<ExitCode> {
     let (vcpus, mem) = (cfg.hw.cpus, cfg.hw.mem_mib);
     match plan.mode {
         PlanMode::Create => {
-            tracing::info!("terra: baking on_create for {bx} ({vcpus} vCPU, {mem} MiB)");
+            log::info!("terra: baking on_create for {bx} ({vcpus} vCPU, {mem} MiB)");
         }
         PlanMode::Run => {
-            tracing::info!("terra: starting {bx} ({vcpus} vCPU, {mem} MiB)");
+            log::info!("terra: starting {bx} ({vcpus} vCPU, {mem} MiB)");
             for line in mount_lines(cfg) {
-                tracing::info!("{line}");
+                log::info!("{line}");
             }
         }
     }
@@ -154,6 +153,10 @@ pub fn run(spec: &BootSpec, bx: &BoxRef, _lock: File) -> Result<ExitCode> {
     // Not reached in practice - a finished box has already left through
     // [`exit_as_the_guest_did`], a dead one through libkrun's own exit.
     Ok(ExitCode::SUCCESS)
+}
+
+fn diagnostics_on() -> bool {
+    std::env::var_os("TERRA_DIAGNOSTICS").is_some_and(|v| v == "1")
 }
 
 /// The resolved config the agent runs as PID 1.
@@ -191,10 +194,8 @@ fn build_plan(spec: &BootSpec, shares: Vec<Share>, volumes: Vec<Disk>) -> Plan {
     }
 }
 
-/// Where the guest's console writes for this boot: the diagnostics log when
-/// it is on, null otherwise, or the process's own stdout in the foreground
-/// (see [`Plan::workload_on_console`]).
-fn console_file(spec: &BootSpec, diag: Option<&File>) -> Result<File> {
+/// Where the guest console writes for this boot: whoever is listening.
+fn console_file(spec: &BootSpec, bx: &BoxRef, diag: Option<&File>) -> Result<File> {
     if spec.foreground {
         use std::os::fd::AsFd;
         return std::io::stdout()
@@ -203,17 +204,19 @@ fn console_file(spec: &BootSpec, diag: Option<&File>) -> Result<File> {
             .map(File::from)
             .context("duplicating stdout for the guest console");
     }
-    diag.map_or_else(
-        || sys::open_null().context("opening the null device for the guest console"),
-        |f| {
-            f.try_clone()
-                .context("duplicating the diagnostics log for the guest console")
-        },
-    )
-}
-
-fn diagnostics_on() -> bool {
-    std::env::var_os("TERRA_DIAGNOSTICS").is_some_and(|v| v == "1")
+    if let Some(f) = diag {
+        return f
+            .try_clone()
+            .context("duplicating the diagnostics log for the guest console");
+    }
+    if spec.mode == PlanMode::Create {
+        // O_APPEND on the symlink's target: a bake outlives no rotation.
+        return std::fs::OpenOptions::new()
+            .append(true)
+            .open(bx.log())
+            .with_context(|| format!("appending the bake console to {}", bx.log().display()));
+    }
+    sys::open_null().context("opening the null device for the guest console")
 }
 
 /// What the agent writes to `/terra/README.md`, so an AI agent looking
@@ -255,13 +258,13 @@ fn start_networking(
         std::os::unix::net::UnixStream::pair().context("creating virtio-net socketpair")?;
     krun.add_net_unixstream(krun_end, &guest_net.guest_mac)?;
     let egress = network::BoxPolicy::new(net, &guest_net)?;
-    tracing::info!(
+    log::info!(
         "terra: egress: {} - loopback/LAN/private/CGNAT floored unless a rule names them",
         network::describe(net)
     );
     let ports = network::parse_port_mappings(&net.ports)?;
     for p in &ports {
-        tracing::info!(
+        log::info!(
             "terra: published: 127.0.0.1:{} -> guest:{}",
             p.host,
             p.guest
@@ -290,7 +293,7 @@ fn check_root_writable_shares(cfg: &config::Config) -> Result<()> {
              packaging/README.md), mark the mounts `readonly: true`, or set \
              {ALLOW_ROOT_ENV}=1 to proceed anyway"
         );
-        tracing::warn!(
+        log::warn!(
             "terra: warning: {ALLOW_ROOT_ENV}=1 - the guest writes read-write shares \
              as real root"
         );
@@ -324,18 +327,18 @@ fn serve_control_sock(krun: &libkrun_ext::Krun, bx: &BoxRef, plan: &Plan) -> Res
         let mut conn = match accepted {
             Ok((conn, _)) => conn,
             Err(e) => {
-                tracing::warn!("terra: warning: the guest never opened the control port: {e}");
+                log::warn!("terra: warning: the guest never opened the control port: {e}");
                 return;
             }
         };
         if let Err(e) = conn.write_all(&frame) {
-            tracing::warn!("terra: warning: could not send the boot plan: {e}");
+            log::warn!("terra: warning: could not send the boot plan: {e}");
             return;
         }
         if watch_stop {
             match conn.try_clone() {
                 Ok(stop_channel) => sys::register_stop_channel(stop_channel.into()),
-                Err(e) => tracing::warn!(
+                Err(e) => log::warn!(
                     "terra: warning: no stop channel for this box ({e}) - \
                      it can only be killed"
                 ),

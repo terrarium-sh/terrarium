@@ -25,7 +25,10 @@ pub fn restrict_new_files() {
 }
 
 pub fn open_null() -> Result<File> {
-    File::open("/dev/null")
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/null")
 }
 
 /// Open for reading, refusing a symlink at **any** component (`openat2` with

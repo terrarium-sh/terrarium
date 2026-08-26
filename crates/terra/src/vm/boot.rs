@@ -156,7 +156,7 @@ fn spawn_vm_process(bx: &BoxRef, spec: &BootSpec, lock: &File) -> Result<std::pr
     cmd.arg(VM_PROCESS_FLAG_ARG)
         .arg(bx.dir())
         .stdin(Stdio::piped())
-        // The child writes its own log through tracing; direct stdout/stderr
+        // The child writes its own log through the log facade; direct stdout/stderr
         // writers go nowhere unless TERRA_DIAGNOSTICS repoints them.
         .stdout(Stdio::null())
         .stderr(Stdio::null());

@@ -343,10 +343,10 @@ impl BoxPolicy {
 impl Policy for BoxPolicy {
     fn allows(&self, ip: IpAddr, port: Option<u16>) -> bool {
         if self.is_granted(ip, port) {
-            tracing::trace!("terra: egress: allowed {}{}", ip, port_suffix(port));
+            log::trace!("terra: egress: allowed {}{}", ip, port_suffix(port));
             return true;
         }
-        tracing::warn!(
+        log::warn!(
             "terra: egress: blocked {}{} - no rule names it",
             ip,
             port_suffix(port)
@@ -373,7 +373,7 @@ impl Policy for BoxPolicy {
             DnsVerdict::Refuse => {
                 // Answered, not forwarded: without this the box would see an
                 // unresolvable name and no reason why.
-                tracing::debug!("terra: egress: no allow rule names '{name}' - answered NXDOMAIN");
+                log::warn!("terra: egress: no allow rule names '{name}' - answered NXDOMAIN");
                 DnsDecision::Immediate(dns::error_response(query, dns::DNS_RCODE_NXDOMAIN))
             }
         }
