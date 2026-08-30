@@ -157,6 +157,14 @@ fn diagnostics_on() -> bool {
     std::env::var_os("TERRA_DIAGNOSTICS").is_some_and(|v| v == "1")
 }
 
+#[allow(clippy::cast_possible_truncation)]
+fn now_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64
+}
+
 /// The resolved config the agent runs as PID 1.
 fn build_plan(spec: &BootSpec, shares: Vec<Share>, volumes: Vec<Disk>) -> Plan {
     let cfg = &spec.cfg;
@@ -189,6 +197,8 @@ fn build_plan(spec: &BootSpec, shares: Vec<Share>, volumes: Vec<Disk>) -> Plan {
             .chain(cfg.workload.args.iter().cloned())
             .collect(),
         sandbox_info: generate_sandbox_info(cfg, spec.root),
+        host_time_ns: Some(now_ns()),
+        host_tz: crate::host::collect(),
     }
 }
 

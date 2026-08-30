@@ -9,8 +9,8 @@ use std::process::Command;
 use std::time::Duration;
 use terra_shared::no_symlinks;
 use terra_shared::{
-    CONTROL_VSOCK_PORT, Net, Plan, PlanMode, RECIPE_STAMP_PATH, RESIZE2FS_GUEST_PATH, ROOT_DEVICE,
-    Share, WORKLOAD_GID, WORKLOAD_UID, WORKLOAD_USER_NAME,
+    CONTROL_VSOCK_PORT, HostTimezone, Net, Plan, PlanMode, RECIPE_STAMP_PATH, RESIZE2FS_GUEST_PATH,
+    ROOT_DEVICE, Share, WORKLOAD_GID, WORKLOAD_UID, WORKLOAD_USER_NAME,
 };
 
 /// Bring the guest up, returning once the workload has exited (Run) or
@@ -95,6 +95,9 @@ fn enter_root() -> Result<(Plan, VsockStream, Option<std::os::fd::OwnedFd>)> {
     let mut control = VsockStream::connect(VMADDR_CID_HOST, CONTROL_VSOCK_PORT)
         .context("dialling the host control port")?;
     let plan: Plan = terra_shared::read_frame(&mut control).context("reading the boot plan")?;
+    if let Some(ns) = plan.host_time_ns {
+        sync_clock(ns);
+    }
 
     // Grow every image before mounting - boot volume is out of reach after chroot.
     grow_filesystem(ROOT_DEVICE, "/mnt/clean");
@@ -131,6 +134,7 @@ fn enter_root() -> Result<(Plan, VsockStream, Option<std::os::fd::OwnedFd>)> {
     }
     // chroot leaves the cwd outside the new root - move it in.
     std::env::set_current_dir("/").context("chdir after chroot")?;
+    apply_tz(&plan.host_tz);
     Ok((plan, control, share_map))
 }
 
@@ -241,6 +245,77 @@ fn umount(target: &str) -> Result<()> {
         return Err(std::io::Error::last_os_error()).with_context(|| format!("umount {target}"));
     }
     Ok(())
+}
+
+#[allow(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::unnecessary_cast
+)]
+fn current_realtime_ns() -> u64 {
+    let mut ts = std::mem::MaybeUninit::<libc::timespec>::zeroed();
+    let ok = unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, ts.as_mut_ptr()) == 0 };
+    if !ok {
+        return 0;
+    }
+    let ts = unsafe { ts.assume_init() };
+    let secs = (ts.tv_sec as i64).max(0) as u64;
+    secs * 1_000_000_000 + (ts.tv_nsec as u64)
+}
+
+#[allow(
+    clippy::cast_possible_wrap,
+    clippy::cast_possible_truncation,
+    clippy::borrow_as_ptr,
+    deprecated
+)]
+fn sync_clock(host_ns: u64) {
+    const STEP_THRESH_NS: u64 = 50_000_000;
+    let now = current_realtime_ns();
+    if host_ns.abs_diff(now) <= STEP_THRESH_NS {
+        return;
+    }
+    let ts = libc::timespec {
+        tv_sec: (host_ns / 1_000_000_000) as libc::time_t,
+        tv_nsec: (host_ns % 1_000_000_000) as libc::c_long,
+    };
+    let rc = unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &raw const ts) };
+    if rc != 0 {
+        eprintln!(
+            "terra-agent: warning: clock_settime: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+#[allow(clippy::ref_option)]
+fn apply_tz(host_tz: &Option<HostTimezone>) {
+    match host_tz {
+        Some(HostTimezone::Tzif(bytes)) if !bytes.is_empty() => {
+            let _ = std::fs::create_dir_all("/etc");
+            let tmp = "/etc/.localtime.tmp";
+            if std::fs::write(tmp, bytes).is_ok() {
+                let _ = std::fs::rename(tmp, "/etc/localtime");
+            } else {
+                eprintln!(
+                    "terra-agent: warning: could not write /etc/localtime: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+        Some(HostTimezone::Iana(name)) if !name.is_empty() => {
+            let src = format!("/usr/share/zoneinfo/{name}");
+            let _ = std::fs::remove_file("/etc/localtime");
+            if std::os::unix::fs::symlink(&src, "/etc/localtime").is_err() {
+                if let Ok(bytes) = std::fs::read(&src) {
+                    let _ = std::fs::write("/etc/localtime", bytes);
+                } else {
+                    eprintln!("terra-agent: warning: IANA zone '{name}' not in guest tzdata");
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn mount(source: Option<&str>, target: &str, fstype: Option<&str>, flags: u64) -> Result<()> {

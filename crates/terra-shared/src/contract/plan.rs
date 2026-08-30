@@ -168,6 +168,14 @@ pub struct Plan {
     /// Broadcast the workload's terminal to the guest console as well as to
     /// the session's clients.
     pub workload_on_console: bool,
+    pub host_time_ns: Option<u64>,
+    pub host_tz: Option<HostTimezone>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum HostTimezone {
+    Tzif(Vec<u8>),
+    Iana(String),
 }
 
 /// Encode any message as the one wire shape every terra channel uses: a
@@ -263,44 +271,79 @@ mod tests {
 
     #[test]
     fn plan_round_trips_through_json() {
-        let plan = Plan {
-            mode: PlanMode::Create,
-            workdir: Some("/work".into()),
-            shares: vec![Share {
-                tag: "_etc".into(),
-                guest: "/etc/x".into(),
-                readonly: true,
-            }],
-            volumes: vec![Disk {
-                dev: volume_device(0).unwrap(),
-                guest: "/data".into(),
-            }],
-            share_owner: Some((1000, 1000)),
-            net: Net {
-                guest_ip: "100.96.0.2".into(),
-                prefix: 30,
-                gateway: "100.96.0.1".into(),
-                dns: "100.96.0.1".into(),
-            },
-            env: BTreeMap::from([("FOO".to_string(), "bar".to_string())]),
-            root: false,
-            sudo: vec!["apk".into()],
-            on_create: vec!["apk add git".into()],
-            on_start: vec!["date".into()],
-            pre_stop: vec!["sync".into()],
-            workload: vec!["/bin/sh".into(), "-c".into(), "make".into()],
-            sandbox_info: "# Terrarium sandbox".into(),
-            workload_on_console: true,
-        };
-        // Over the control connection, the frame must leave the stop signal
-        // that follows it untouched in the stream.
-        let mut stream = frame(&plan).unwrap();
-        stream.push(STOP_SIGNAL);
-        let mut cursor = std::io::Cursor::new(stream);
-        assert_eq!(read_frame::<Plan>(&mut cursor).unwrap(), plan);
-        let mut rest = Vec::new();
-        std::io::Read::read_to_end(&mut cursor, &mut rest).unwrap();
-        assert_eq!(rest, vec![STOP_SIGNAL]);
+        for (host_time_ns, host_tz) in [
+            (None, None),
+            (
+                Some(1_700_000_000_000_000_000),
+                Some(HostTimezone::Tzif(vec![1, 2, 3])),
+            ),
+            (
+                Some(1_700_000_000_000_000_001),
+                Some(HostTimezone::Iana("Europe/Prague".into())),
+            ),
+        ] {
+            let plan = Plan {
+                mode: PlanMode::Create,
+                workdir: Some("/work".into()),
+                shares: vec![Share {
+                    tag: "_etc".into(),
+                    guest: "/etc/x".into(),
+                    readonly: true,
+                }],
+                volumes: vec![Disk {
+                    dev: volume_device(0).unwrap(),
+                    guest: "/data".into(),
+                }],
+                share_owner: Some((1000, 1000)),
+                net: Net {
+                    guest_ip: "100.96.0.2".into(),
+                    prefix: 30,
+                    gateway: "100.96.0.1".into(),
+                    dns: "100.96.0.1".into(),
+                },
+                env: BTreeMap::from([("FOO".to_string(), "bar".to_string())]),
+                root: false,
+                sudo: vec!["apk".into()],
+                on_create: vec!["apk add git".into()],
+                on_start: vec!["date".into()],
+                pre_stop: vec!["sync".into()],
+                workload: vec!["/bin/sh".into(), "-c".into(), "make".into()],
+                sandbox_info: "# Terrarium sandbox".into(),
+                workload_on_console: true,
+                host_time_ns,
+                host_tz: host_tz.clone(),
+            };
+            // Over the control connection, the frame must leave the stop signal
+            // that follows it untouched in the stream.
+            let mut stream = frame(&plan).unwrap();
+            stream.push(STOP_SIGNAL);
+            let mut cursor = std::io::Cursor::new(stream);
+            assert_eq!(read_frame::<Plan>(&mut cursor).unwrap(), plan);
+            let mut rest = Vec::new();
+            std::io::Read::read_to_end(&mut cursor, &mut rest).unwrap();
+            assert_eq!(rest, vec![STOP_SIGNAL]);
+        }
+        // Old host without the new fields still decodes as None.
+        let json_without = serde_json::json!({
+            "mode": "Create",
+            "workdir": "/work",
+            "shares": [],
+            "volumes": [],
+            "share_owner": null,
+            "net": {"guest_ip":"100.96.0.2","prefix":30,"gateway":"100.96.0.1","dns":"100.96.0.1"},
+            "env": {},
+            "root": false,
+            "sudo": [],
+            "on_create": [],
+            "on_start": [],
+            "pre_stop": [],
+            "workload": [],
+            "sandbox_info": "",
+            "workload_on_console": false
+        });
+        let decoded: Plan = serde_json::from_value(json_without).unwrap();
+        assert_eq!(decoded.host_time_ns, None);
+        assert_eq!(decoded.host_tz, None);
     }
 
     #[test]

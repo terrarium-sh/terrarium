@@ -9,6 +9,7 @@
 pub mod cli;
 mod cmd;
 pub mod config;
+mod host;
 mod logs;
 mod name;
 mod policy;
