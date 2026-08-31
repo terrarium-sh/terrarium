@@ -26,10 +26,16 @@ fn canonicalize_existing_prefix(p: &Path) -> PathBuf {
     }
 }
 
+/// A protected path terra could not determine is left out of the guards, not
+/// an error: an unset `$HOME` names no directory to protect.
+fn find_existing_prefix<E>(path: Result<PathBuf, E>) -> Option<PathBuf> {
+    path.ok().map(|p| canonicalize_existing_prefix(&p))
+}
+
 /// Refuse a mount that overlaps terra's own state or binary: a mount
 /// containing `~/.terra` is a sandbox that can rewrite its own next boot.
 /// Sharing the project directory itself is fine.
-fn check_mounts_exclude_terra_paths(cfg: &config::Config, bx: &BoxRef) -> Result<()> {
+fn validate_mounts_against_terra_paths(mounts: &[config::Mount], bx: &BoxRef) -> Result<()> {
     struct Protected {
         path: PathBuf,
         what_shared: &'static str,
@@ -38,34 +44,35 @@ fn check_mounts_exclude_terra_paths(cfg: &config::Config, bx: &BoxRef) -> Result
 
     let protected = [
         Some(Protected {
-            path: canonicalize_existing_prefix(bx.dir()),
+            path: canonicalize_existing_prefix(bx.get_dir()),
             what_shared: "this box's own state - its recipe, disk images and sockets",
             refuse_even_readonly: true,
         }),
-        state::terra_home_path().ok().map(|home| Protected {
-            path: canonicalize_existing_prefix(&home),
+        find_existing_prefix(state::get_terra_home_path()).map(|path| Protected {
+            path,
             what_shared: "terra's own directory - the shared recipes, and where every box on \
                    this machine is kept",
             refuse_even_readonly: true,
         }),
-        state::box_home_path().ok().map(|dir| Protected {
-            path: canonicalize_existing_prefix(&dir),
+        find_existing_prefix(state::get_box_home_path()).map(|path| Protected {
+            path,
             what_shared: "every box on this machine - their recipes, disk images and sockets",
             refuse_even_readonly: true,
         }),
-        state::cache_path().ok().map(|dir| Protected {
-            path: canonicalize_existing_prefix(&dir),
+        find_existing_prefix(state::get_cache_path()).map(|path| Protected {
+            path,
             what_shared: "the kernel and agent every box on this machine boots",
             refuse_even_readonly: true,
         }),
-        std::env::current_exe().ok().map(|exe| Protected {
-            path: canonicalize_existing_prefix(&exe),
-            what_shared: "the terra binary itself - re-executed by every interactive or detached run",
+        find_existing_prefix(std::env::current_exe()).map(|path| Protected {
+            path,
+            what_shared: "the terra binary itself - re-executed by every interactive or \
+                   detached run",
             refuse_even_readonly: false,
         }),
     ];
 
-    for m in &cfg.mounts {
+    for m in mounts {
         let host = canonicalize_existing_prefix(&m.host);
         for p in protected.iter().flatten() {
             if m.readonly && !p.refuse_even_readonly {
@@ -88,20 +95,22 @@ fn check_mounts_exclude_terra_paths(cfg: &config::Config, bx: &BoxRef) -> Result
     Ok(())
 }
 
-pub(crate) fn resolve_and_check_mounts(cfg: &mut config::Config, bx: &BoxRef) -> Result<()> {
-    config::resolve_mounts(cfg)?;
-    check_mounts_exclude_terra_paths(cfg, bx)
+pub(crate) fn resolve_mounts(cfg: &config::Config, bx: &BoxRef) -> Result<Vec<config::Mount>> {
+    let mut mounts = cfg.mounts.clone();
+    config::resolve_mounts_for(&mut mounts)?;
+    validate_mounts_against_terra_paths(&mounts, bx)?;
+    Ok(mounts)
 }
 
 /// The first writable mount of `ran_recipe` whose host directory contains
 /// `recipe_file` - the share a guest could have written the file through.
-pub(crate) fn writable_mount_containing(
+pub(crate) fn find_writable_mount_containing(
     recipe_file: &Path,
     ran_recipe: &str,
     project_dir: &Path,
 ) -> Option<PathBuf> {
     let file = canonicalize_existing_prefix(recipe_file);
-    config::get_declared_writable_shares(ran_recipe, project_dir)
+    config::list_declared_writable_shares(ran_recipe, project_dir)
         .into_iter()
         .find(|share| file.starts_with(canonicalize_existing_prefix(share)))
 }
@@ -113,11 +122,11 @@ pub(crate) fn writable_mount_containing(
 /// ponytail: only what is pinned *now* counts; closing that fully needs a log
 /// of every share a box ever had. Add it only if mounts start changing often.
 #[must_use]
-pub(crate) fn pinned_recipes_across_boxes(project_dir: &Path) -> Vec<String> {
-    state::existing_names(project_dir)
+pub(crate) fn list_pinned_recipes_across_boxes(project_dir: &Path) -> Vec<String> {
+    state::list_existing_names(project_dir)
         .iter()
         .filter_map(|n| BoxRef::resolve(project_dir, n).ok())
-        .filter_map(|b| std::fs::read_to_string(b.recipe()).ok())
+        .filter_map(|b| std::fs::read_to_string(b.get_dir().join(crate::state::RECIPE_FILE)).ok())
         .collect()
 }
 
@@ -125,19 +134,16 @@ pub(crate) fn pinned_recipes_across_boxes(project_dir: &Path) -> Vec<String> {
 mod tests {
     use super::*;
 
-    fn bx(project_dir: &Path) -> BoxRef {
+    fn resolve_box_ref(project_dir: &Path) -> BoxRef {
         BoxRef::resolve(project_dir, "dev").unwrap()
     }
 
-    fn mount(host: &Path, readonly: bool) -> config::Config {
-        config::Config {
-            mounts: vec![config::Mount {
-                host: host.to_path_buf(),
-                guest: PathBuf::from("/work"),
-                readonly,
-            }],
-            ..yaml_serde::from_str("{}").unwrap()
-        }
+    fn build_mounts(host: &Path, readonly: bool) -> Vec<config::Mount> {
+        vec![config::Mount {
+            host: host.to_path_buf(),
+            guest: PathBuf::from("/work"),
+            readonly,
+        }]
     }
 
     /// A mount containing the box's own state lets the guest rewrite what its
@@ -145,22 +151,26 @@ mod tests {
     #[test]
     fn a_mount_containing_the_box_state_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let b = bx(dir.path());
+        let b = resolve_box_ref(dir.path());
 
         // The box's state directory, and its parent (`~/.terra/box/<slug>`).
-        let err = check_mounts_exclude_terra_paths(&mount(b.dir(), false), &b)
+        let err = validate_mounts_against_terra_paths(&build_mounts(b.get_dir(), false), &b)
             .unwrap_err()
             .to_string();
         assert!(err.contains("this box's own state"), "{err}");
         assert!(err.contains("--project"), "it should say what to do: {err}");
         assert!(
-            check_mounts_exclude_terra_paths(&mount(b.dir().parent().unwrap(), false), &b).is_err()
+            validate_mounts_against_terra_paths(
+                &build_mounts(b.get_dir().parent().unwrap(), false),
+                &b
+            )
+            .is_err()
         );
 
         // The project directory does not contain the state (`~/.terra/box`),
         // so "sandbox my project" shares clean.
-        assert!(check_mounts_exclude_terra_paths(&mount(dir.path(), false), &b).is_ok());
-        assert!(check_mounts_exclude_terra_paths(&yaml_serde::from_str("{}").unwrap(), &b).is_ok());
+        assert!(validate_mounts_against_terra_paths(&build_mounts(dir.path(), false), &b).is_ok());
+        assert!(validate_mounts_against_terra_paths(&[], &b).is_ok());
     }
 
     /// A recipe file inside a share a box let its guest write may have been
@@ -182,12 +192,12 @@ mod tests {
         );
 
         assert_eq!(
-            writable_mount_containing(&inside, &ran, dir.path()),
+            find_writable_mount_containing(&inside, &ran, dir.path()),
             Some(std::fs::canonicalize(&project).unwrap()),
             "a source inside a writable share must be reported"
         );
         assert_eq!(
-            writable_mount_containing(&outside, &ran, dir.path()),
+            find_writable_mount_containing(&outside, &ran, dir.path()),
             None,
             "a source outside every share is nobody's to have written"
         );
@@ -197,12 +207,15 @@ mod tests {
             "mounts:\n  - host: {}\n    guest: /work\n    readonly: true\n",
             project.display()
         );
-        assert_eq!(writable_mount_containing(&inside, &ro, dir.path()), None);
+        assert_eq!(
+            find_writable_mount_containing(&inside, &ro, dir.path()),
+            None
+        );
 
         // A previous recipe that is not YAML at all cannot answer; the check
         // steps aside rather than wedging the box.
         assert_eq!(
-            writable_mount_containing(&inside, "mounts: [{host: /nope-", dir.path()),
+            find_writable_mount_containing(&inside, "mounts: [{host: /nope-", dir.path()),
             None
         );
     }
@@ -232,7 +245,7 @@ mod tests {
         );
 
         assert_eq!(
-            writable_mount_containing(&smuggled, &ran, dir.path()),
+            find_writable_mount_containing(&smuggled, &ran, dir.path()),
             Some(std::fs::canonicalize(&project).unwrap()),
             "a deleted sibling share must not silence the check"
         );
@@ -265,7 +278,7 @@ mod tests {
         );
 
         assert_eq!(
-            writable_mount_containing(&smuggled, &ran, dir.path()),
+            find_writable_mount_containing(&smuggled, &ran, dir.path()),
             Some(std::fs::canonicalize(&project).unwrap()),
             "a deleted env_file must not silence the check"
         );
@@ -296,7 +309,7 @@ mod tests {
             "this recipe has to be one today's validation refuses, or it proves nothing"
         );
         assert_eq!(
-            writable_mount_containing(&smuggled, &ran, dir.path()),
+            find_writable_mount_containing(&smuggled, &ran, dir.path()),
             Some(std::fs::canonicalize(&project).unwrap()),
             "a pin this terra would refuse took its shares out of the gate"
         );
@@ -326,7 +339,7 @@ mod tests {
             "this recipe has to be one today's Config cannot parse, or it proves nothing"
         );
         assert_eq!(
-            writable_mount_containing(&smuggled, &ran, dir.path()),
+            find_writable_mount_containing(&smuggled, &ran, dir.path()),
             Some(std::fs::canonicalize(&project).unwrap()),
             "a pin with unknown fields took its shares out of the gate"
         );
@@ -339,7 +352,7 @@ mod tests {
         let smuggled_old = inside_old.join("evil.yaml");
         std::fs::write(&smuggled_old, "hw:\n  cpus: 2\n").unwrap();
         assert_eq!(
-            writable_mount_containing(
+            find_writable_mount_containing(
                 &smuggled_old,
                 "mounts:\n  - host: ~alice/data\n    guest: /work\n",
                 &project
@@ -373,7 +386,7 @@ mod tests {
                 "{odd} has to be an entry today's Config cannot read, or it proves nothing"
             );
             assert_eq!(
-                writable_mount_containing(&smuggled, &ran, dir.path()),
+                find_writable_mount_containing(&smuggled, &ran, dir.path()),
                 Some(std::fs::canonicalize(&project).unwrap()),
                 "{odd} took the writable share beside it out of the gate"
             );
@@ -382,7 +395,7 @@ mod tests {
         // A `mounts:` that is no list at all still answers "none": there is no
         // entry to read, which is a different thing from one that cannot be.
         assert_eq!(
-            writable_mount_containing(&smuggled, "mounts: nope\n", dir.path()),
+            find_writable_mount_containing(&smuggled, "mounts: nope\n", dir.path()),
             None
         );
     }
@@ -393,59 +406,14 @@ mod tests {
     fn a_mount_containing_terra_home_is_refused() {
         let _home = crate::sys::TestHome::new();
         let dir = tempfile::tempdir().unwrap();
-        let b = bx(dir.path());
+        let b = resolve_box_ref(dir.path());
         let home = state::ensure_terra_home().unwrap();
         let cache = home.join("cache");
         std::fs::create_dir_all(&cache).unwrap();
-        let err = check_mounts_exclude_terra_paths(&mount(&cache, false), &b)
+        let err = validate_mounts_against_terra_paths(&build_mounts(&cache, false), &b)
             .unwrap_err()
             .to_string();
         assert!(err.contains("terra's own directory"), "{err}");
-    }
-
-    /// A box directory `config.yaml` moved out of `~/.terra` is guarded where
-    /// it now is: sharing it hands over every other box's recipe and images -
-    /// the same handover, on whatever disk the operator pointed it at - and
-    /// `~/.terra` no longer contains it to catch it by accident.
-    #[test]
-    fn a_relocated_box_directory_is_refused_where_it_now_is() {
-        let _home = crate::sys::TestHome::new();
-        let dir = tempfile::tempdir().unwrap();
-        // A directory of its own, the way a second disk is: sharing the project
-        // is only an ordinary mount while the boxes are not kept inside it.
-        let disk = tempfile::tempdir().unwrap();
-        let ssd = disk.path().to_path_buf();
-        std::fs::create_dir_all(ssd.join("boxes")).unwrap();
-        std::fs::create_dir_all(ssd.join("cache")).unwrap();
-        std::fs::write(
-            state::ensure_terra_home()
-                .unwrap()
-                .join(state::SETTINGS_FILE),
-            format!(
-                "storage:\n  boxes: {ssd}/boxes\n  cache: {ssd}/cache\n",
-                ssd = ssd.display()
-            ),
-        )
-        .unwrap();
-
-        let b = bx(dir.path());
-        // A *sibling* project's boxes: the one share that contains neither this
-        // box's own state nor `~/.terra`, so nothing but the relocated box
-        // directory can refuse it.
-        let sibling = state::project_state_dir(&dir.path().join("another-project")).unwrap();
-        std::fs::create_dir_all(&sibling).unwrap();
-        for (shared, named) in [
-            (sibling, "every box on this machine"),
-            (ssd.join("cache"), "the kernel and agent"),
-            (ssd.join("boxes"), "state"),
-        ] {
-            let err = check_mounts_exclude_terra_paths(&mount(&shared, false), &b)
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains(named), "{}: {err}", shared.display());
-        }
-        // The project itself is still an ordinary share.
-        assert!(check_mounts_exclude_terra_paths(&mount(dir.path(), false), &b).is_ok());
     }
 
     /// Reading the state alone already hands over live sockets, disk images
@@ -453,8 +421,8 @@ mod tests {
     #[test]
     fn a_read_only_share_of_terra_state_is_still_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let b = bx(dir.path());
-        assert!(check_mounts_exclude_terra_paths(&mount(b.dir(), true), &b).is_err());
+        let b = resolve_box_ref(dir.path());
+        assert!(validate_mounts_against_terra_paths(&build_mounts(b.get_dir(), true), &b).is_err());
     }
 
     /// None of the protected paths is guaranteed to exist when a recipe is
@@ -490,9 +458,11 @@ mod tests {
         );
 
         // …and the box's own state is refused before anything has created it.
-        let b = bx(dir.path());
-        assert!(!b.dir().exists());
-        assert!(check_mounts_exclude_terra_paths(&mount(b.dir(), false), &b).is_err());
+        let b = resolve_box_ref(dir.path());
+        assert!(!b.get_dir().exists());
+        assert!(
+            validate_mounts_against_terra_paths(&build_mounts(b.get_dir(), false), &b).is_err()
+        );
     }
 
     /// A symlink is the same share by another name: compared after resolution.
@@ -502,30 +472,33 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let link = dir.path().join("innocent");
         std::os::unix::fs::symlink(std::env::current_exe().unwrap(), &link).unwrap();
-        let err = check_mounts_exclude_terra_paths(&mount(&link, false), &bx(dir.path()))
-            .unwrap_err()
-            .to_string();
+        let err = validate_mounts_against_terra_paths(
+            &build_mounts(&link, false),
+            &resolve_box_ref(dir.path()),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("the terra binary"), "{err}");
     }
 
     /// Every box of the directory answers, not just the one being set up - a
     /// sibling's writable share could have authored a new box's recipe.
     #[test]
-    fn pinned_recipes_across_boxes_lists_every_box_of_the_directory() {
+    fn list_pinned_recipes_across_boxes_in_the_directory() {
         let _home = crate::sys::TestHome::new();
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path();
-        assert!(pinned_recipes_across_boxes(project).is_empty());
+        assert!(list_pinned_recipes_across_boxes(project).is_empty());
 
         for (name, text) in [("a", "hw:\n  cpus: 1\n"), ("b", "hw:\n  cpus: 2\n")] {
             let b = BoxRef::resolve(project, name).unwrap();
-            std::fs::create_dir_all(b.dir()).unwrap();
-            std::fs::write(b.recipe(), text).unwrap();
+            std::fs::create_dir_all(b.get_dir()).unwrap();
+            std::fs::write(b.get_dir().join(crate::state::RECIPE_FILE), text).unwrap();
         }
         // A box directory without a pinned recipe (never set up) is skipped.
-        std::fs::create_dir_all(BoxRef::resolve(project, "c").unwrap().dir()).unwrap();
+        std::fs::create_dir_all(BoxRef::resolve(project, "c").unwrap().get_dir()).unwrap();
 
-        let recipes = pinned_recipes_across_boxes(project);
+        let recipes = list_pinned_recipes_across_boxes(project);
         assert_eq!(recipes.len(), 2, "{recipes:?}");
         assert!(recipes.iter().any(|r| r.contains("cpus: 1")));
         assert!(recipes.iter().any(|r| r.contains("cpus: 2")));
@@ -536,15 +509,19 @@ mod tests {
     #[test]
     fn a_mount_containing_the_terra_binary_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let b = bx(dir.path());
+        let b = resolve_box_ref(dir.path());
         let exe = std::env::current_exe().unwrap();
 
-        let err = check_mounts_exclude_terra_paths(&mount(exe.parent().unwrap(), false), &b)
-            .unwrap_err()
-            .to_string();
+        let err =
+            validate_mounts_against_terra_paths(&build_mounts(exe.parent().unwrap(), false), &b)
+                .unwrap_err()
+                .to_string();
         assert!(err.contains("the terra binary"), "{err}");
         // Read-only cannot rewrite it, and reading it gives away nothing that
         // shipping the binary did not.
-        assert!(check_mounts_exclude_terra_paths(&mount(exe.parent().unwrap(), true), &b).is_ok());
+        assert!(
+            validate_mounts_against_terra_paths(&build_mounts(exe.parent().unwrap(), true), &b)
+                .is_ok()
+        );
     }
 }

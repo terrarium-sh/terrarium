@@ -4,13 +4,14 @@
 
 use crate::sys;
 use anyhow::{Context, Result};
-use std::io::{Read, Write};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
-use terra_shared::{FileReply, FileRequest};
-
-const MAX_GUEST_CLAIMED_BYTES: u64 = 8 << 30;
+use terra_shared::contract::{
+    AgentService, FileReply, FileRequest, MAX_FILE_BYTES, encode_frame, read_frame,
+};
 
 const COPY_STALL_TIMEOUT: Duration = Duration::from_mins(1);
 
@@ -25,19 +26,23 @@ pub fn run(
     name: Option<&str>,
     project_dir: &Path,
 ) -> Result<ExitCode> {
-    let (host, guest) = host_guest_paths(args, direction)?;
+    let (host, guest) = resolve_host_guest_paths(args, direction)?;
     let bx = &crate::resolve::resolve_pinned_box(project_dir, name)?;
     // The file service answers only once the workload is up - after every
     // mount, `on_create` bake and `on_start` hook.
     let mut stream = crate::session::connect_to_running_agent(
         bx,
-        direction.verb(),
-        terra_shared::AgentService::Files,
+        direction.as_cli_verb(),
+        AgentService::Files,
         "file service",
         args.agent.agent_timeout,
     )?;
-    let _ = stream.set_read_timeout(Some(COPY_STALL_TIMEOUT));
-    let _ = stream.set_write_timeout(Some(COPY_STALL_TIMEOUT));
+    stream
+        .set_read_timeout(Some(COPY_STALL_TIMEOUT))
+        .context("setting copy read timeout")?;
+    stream
+        .set_write_timeout(Some(COPY_STALL_TIMEOUT))
+        .context("setting copy write timeout")?;
     let deadline = Instant::now() + COPY_TOTAL_TIMEOUT;
 
     match direction {
@@ -46,26 +51,24 @@ pub fn run(
     }
 }
 
-fn send_request(stream: &mut impl Write, req: &FileRequest) -> Result<()> {
-    stream
-        .write_all(&terra_shared::frame(req).context("encoding the request")?)
-        .context("sending the request")
-}
-
 fn read_reply(stream: &mut impl Read) -> Result<FileReply> {
-    match terra_shared::read_frame(stream).context("reading the agent's reply")? {
+    let rep = read_frame(stream)
+        .context("reading the agent's reply")?
+        .ok_or_else(|| anyhow::anyhow!("agent closed connection without replying"))?;
+    match rep {
         FileReply::Err(err) => anyhow::bail!("guest: {}", sanitize_guest_error_message(&err)),
-        answered => Ok(answered),
+        FileReply::Put | FileReply::Get { .. } => Ok(rep),
     }
 }
 
-fn mismatched_reply(asked: &str) -> anyhow::Error {
-    anyhow::anyhow!("the agent answered a {asked} request with another kind of reply")
+enum CopyTarget<'a> {
+    Plain(&'a mut dyn Write),
+    Sparse(&'a mut File),
 }
 
 fn copy_at_most(
     from: &mut impl Read,
-    to: &mut impl Write,
+    to: &mut CopyTarget<'_>,
     size: u64,
     what: &str,
     deadline: Instant,
@@ -80,14 +83,19 @@ fn copy_at_most(
                 COPY_TOTAL_TIMEOUT.as_secs()
             );
         }
-        // Never past what remains: some sources here never EOF (the padding's
-        // `io::repeat`).
-        let want = usize::min(buf.len(), usize::try_from(size - sent).unwrap_or(0));
+        let want = usize::min(buf.len(), usize::try_from(size - sent).unwrap_or(buf.len()));
         let n = from.read(&mut buf[..want]).context(what.to_string())?;
         if n == 0 {
             break;
         }
-        to.write_all(&buf[..n]).context(what.to_string())?;
+        match to {
+            CopyTarget::Plain(to) => to.write_all(&buf[..n]).context(what.to_string())?,
+            CopyTarget::Sparse(to) if buf[..n].iter().all(|byte| *byte == 0) => {
+                to.seek(SeekFrom::Current(i64::try_from(n)?))
+                    .context(what.to_string())?;
+            }
+            CopyTarget::Sparse(to) => to.write_all(&buf[..n]).context(what.to_string())?,
+        }
         sent += u64::try_from(n).unwrap_or_default();
     }
     Ok(sent)
@@ -99,11 +107,17 @@ fn send_body_padded_to_size(
     size: u64,
     deadline: Instant,
 ) -> Result<u64> {
-    let sent = copy_at_most(body, stream, size, "sending the file", deadline)?;
+    let sent = copy_at_most(
+        body,
+        &mut CopyTarget::Plain(stream),
+        size,
+        "sending the file",
+        deadline,
+    )?;
     if sent < size {
         copy_at_most(
             &mut std::io::repeat(0),
-            stream,
+            &mut CopyTarget::Plain(stream),
             size - sent,
             "completing a short transfer",
             deadline,
@@ -135,19 +149,26 @@ fn send_file_into_box(
     );
 
     let size = meta.len();
-    send_request(
-        stream,
-        &FileRequest::Put {
-            path: guest_path.to_string(),
-            mode: to_guest_mode(&meta),
-            size,
-        },
-    )?;
+    anyhow::ensure!(
+        size <= MAX_FILE_BYTES,
+        "{host_path} is {size} bytes, past the {} GiB copy ceiling",
+        MAX_FILE_BYTES >> 30
+    );
+    let request = FileRequest::Put {
+        path: guest_path.to_string(),
+        mode: to_guest_mode(&meta),
+        size,
+    };
+    stream
+        .write_all(&encode_frame(&request).context("encoding the request")?)
+        .context("sending the request")?;
     let sent = send_body_padded_to_size(&mut file, stream, size, deadline)?;
 
     match read_reply(stream)? {
         FileReply::Put => {}
-        _ => return Err(mismatched_reply("put")),
+        FileReply::Get { .. } | FileReply::Err(_) => {
+            anyhow::bail!("the agent answered a put request with another kind of reply")
+        }
     }
     anyhow::ensure!(
         sent == size,
@@ -163,20 +184,20 @@ fn fetch_file_from_box(
     host_path: &str,
     deadline: Instant,
 ) -> Result<ExitCode> {
-    send_request(
-        stream,
-        &FileRequest::Get {
-            path: guest_path.to_string(),
-        },
-    )?;
+    let request = FileRequest::Get {
+        path: guest_path.to_string(),
+    };
+    stream
+        .write_all(&encode_frame(&request).context("encoding the request")?)
+        .context("sending the request")?;
     let FileReply::Get { mode, size } = read_reply(stream)? else {
-        return Err(mismatched_reply("get"));
+        anyhow::bail!("the agent answered a get request with another kind of reply");
     };
     anyhow::ensure!(
-        size <= MAX_GUEST_CLAIMED_BYTES,
+        size <= MAX_FILE_BYTES,
         "{guest_path} says it is {size} bytes, past the {} GiB copy ceiling \
          (share a directory instead - a copy is for single files)",
-        MAX_GUEST_CLAIMED_BYTES >> 30
+        MAX_FILE_BYTES >> 30
     );
 
     let mut dst_path = PathBuf::from(host_path);
@@ -189,13 +210,21 @@ fn fetch_file_from_box(
     let mut file = sys::create_no_symlinks(&dst_path)
         .with_context(|| format!("creating {}", dst_path.display()))?;
 
-    let received = copy_at_most(stream, &mut file, size, "receiving the file", deadline)?;
+    let received = copy_at_most(
+        stream,
+        &mut CopyTarget::Sparse(&mut file),
+        size,
+        "receiving the file",
+        deadline,
+    )?;
     anyhow::ensure!(
         received == size,
         "{guest_path} ended after {received} of {size} promised bytes; {} holds the \
          truncated copy - copy it again",
         dst_path.display()
     );
+    file.set_len(size)
+        .with_context(|| format!("sizing {}", dst_path.display()))?;
     sys::set_open_file_mode(&file, to_safe_mode(mode))
         .with_context(|| format!("setting permissions on {}", dst_path.display()))?;
     Ok(report(
@@ -208,12 +237,10 @@ fn fetch_file_from_box(
 const MAX_GUEST_ERROR_MESSAGE: usize = 512;
 
 fn sanitize_guest_error_message(err: &str) -> String {
-    let mut out = crate::render::printable(
-        &err.chars()
-            .take(MAX_GUEST_ERROR_MESSAGE)
-            .collect::<String>(),
-    );
-    if err.chars().nth(MAX_GUEST_ERROR_MESSAGE).is_some() {
+    let mut chars = err.chars();
+    let message: String = chars.by_ref().take(MAX_GUEST_ERROR_MESSAGE).collect();
+    let mut out = crate::render::escape_printable(&message);
+    if chars.next().is_some() {
         out.push('…');
     }
     out
@@ -222,7 +249,8 @@ fn sanitize_guest_error_message(err: &str) -> String {
 /// The permission bits a copy carries into the box: rwx - setuid, setgid and
 /// sticky stay on the host.
 fn to_guest_mode(meta: &std::fs::Metadata) -> u32 {
-    sys::mode_of(meta) & 0o777
+    use std::os::unix::fs::PermissionsExt;
+    meta.permissions().mode() & 0o0777
 }
 
 /// The permission bits a guest-supplied mode may set on a host file: rwx,
@@ -230,7 +258,7 @@ fn to_guest_mode(meta: &std::fs::Metadata) -> u32 {
 /// by whoever ran the copy, and group or world write lets any account rewrite
 /// it before it is run.
 fn to_safe_mode(guest_mode: u32) -> u32 {
-    guest_mode & 0o777 & !0o022
+    guest_mode & 0o755
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -240,22 +268,18 @@ pub enum Direction {
 }
 
 impl Direction {
-    fn verb(self) -> &'static str {
+    fn as_cli_verb(self) -> &'static str {
         match self {
             Direction::IntoBox => "put",
             Direction::OutOfBox => "get",
         }
     }
-
-    fn working_spelling(self) -> &'static str {
-        match self {
-            Direction::IntoBox => "put ./local.txt /tmp/remote.txt",
-            Direction::OutOfBox => "get /etc/os-release ./os-release",
-        }
-    }
 }
 
-fn host_guest_paths(args: &crate::cli::CopyArgs, direction: Direction) -> Result<(&str, &str)> {
+fn resolve_host_guest_paths(
+    args: &crate::cli::CopyArgs,
+    direction: Direction,
+) -> Result<(&str, &str)> {
     let (host, guest) = match direction {
         Direction::IntoBox => (&args.src, &args.dst),
         Direction::OutOfBox => (&args.dst, &args.src),
@@ -264,7 +288,10 @@ fn host_guest_paths(args: &crate::cli::CopyArgs, direction: Direction) -> Result
         guest.starts_with('/'),
         "the box's side of a copy is an absolute path, and '{guest}' is not \
          (`terra <box> {}`)",
-        direction.working_spelling()
+        match direction {
+            Direction::IntoBox => "put ./local.txt /tmp/remote.txt",
+            Direction::OutOfBox => "get /etc/os-release ./os-release",
+        }
     );
     Ok((host, guest))
 }
@@ -274,7 +301,7 @@ mod tests {
     use super::*;
 
     /// A deadline far enough out that no test transfer trips it.
-    fn deadline() -> Instant {
+    fn make_test_deadline() -> Instant {
         Instant::now() + Duration::from_mins(1)
     }
 
@@ -296,9 +323,8 @@ mod tests {
         }
     }
 
-    fn get_reply(size: u64, body: &[u8]) -> GuestEnd {
-        let mut script =
-            terra_shared::frame(&terra_shared::FileReply::Get { mode: 0o644, size }).unwrap();
+    fn build_reply(size: u64, body: &[u8]) -> GuestEnd {
+        let mut script = encode_frame(&FileReply::Get { mode: 0o644, size }).unwrap();
         script.extend_from_slice(body);
         GuestEnd(std::io::Cursor::new(script))
     }
@@ -313,10 +339,10 @@ mod tests {
         let dst_str = dst.to_str().unwrap();
 
         let err = fetch_file_from_box(
-            &mut get_reply(8, b"1234"),
+            &mut build_reply(8, b"1234"),
             "/data/out.bin",
             dst_str,
-            deadline(),
+            make_test_deadline(),
         )
         .unwrap_err()
         .to_string();
@@ -325,13 +351,72 @@ mod tests {
 
         // The full transfer still succeeds, byte for byte.
         fetch_file_from_box(
-            &mut get_reply(8, b"12345678"),
+            &mut build_reply(8, b"12345678"),
             "/data/out.bin",
             dst_str,
-            deadline(),
+            make_test_deadline(),
         )
         .unwrap();
         assert_eq!(std::fs::read(&dst).unwrap(), b"12345678");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_zero_filled_get_stays_sparse() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dst = dir.path().join("zeros");
+        let body = vec![0; 1024 * 1024];
+        fetch_file_from_box(
+            &mut build_reply(body.len() as u64, &body),
+            "/data/zeros",
+            dst.to_str().unwrap(),
+            make_test_deadline(),
+        )
+        .unwrap();
+
+        let metadata = std::fs::metadata(&dst).unwrap();
+        assert_eq!(metadata.len(), body.len() as u64);
+        assert!(metadata.blocks() * 512 < metadata.len());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_get_refuses_symlink_destination_or_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let redirected = dir.path().join("redirected");
+        std::fs::write(&redirected, b"unchanged").unwrap();
+        let symlink_destination = dir.path().join("destination");
+        std::os::unix::fs::symlink(&redirected, &symlink_destination).unwrap();
+
+        assert!(
+            fetch_file_from_box(
+                &mut build_reply(3, b"new"),
+                "/data/out",
+                symlink_destination.to_str().unwrap(),
+                make_test_deadline(),
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&redirected).unwrap(), b"unchanged");
+
+        let real_parent = dir.path().join("real");
+        std::fs::create_dir(&real_parent).unwrap();
+        let symlink_parent = dir.path().join("linked");
+        std::os::unix::fs::symlink(&real_parent, &symlink_parent).unwrap();
+        let destination = symlink_parent.join("out");
+
+        assert!(
+            fetch_file_from_box(
+                &mut build_reply(3, b"new"),
+                "/data/out",
+                destination.to_str().unwrap(),
+                make_test_deadline(),
+            )
+            .is_err()
+        );
+        assert!(!real_parent.join("out").exists());
     }
 
     /// A file that shrank between being measured and being read still has to
@@ -347,7 +432,7 @@ mod tests {
             &mut std::io::Cursor::new(b"1234".to_vec()),
             &mut wire,
             8,
-            deadline(),
+            make_test_deadline(),
         )
         .unwrap();
         assert_eq!(sent, 4, "the count is what was really read");
@@ -359,7 +444,7 @@ mod tests {
             &mut std::io::Cursor::new(b"12345678".to_vec()),
             &mut whole,
             8,
-            deadline(),
+            make_test_deadline(),
         )
         .unwrap();
         assert_eq!((sent, whole.as_slice()), (8, b"12345678".as_slice()));
@@ -371,7 +456,7 @@ mod tests {
             &mut std::io::Cursor::new(b"12345678and more".to_vec()),
             &mut bounded,
             8,
-            deadline(),
+            make_test_deadline(),
         )
         .unwrap();
         assert_eq!((sent, bounded.as_slice()), (8, b"12345678".as_slice()));
@@ -393,7 +478,7 @@ mod tests {
         let mut sink = Vec::new();
         let err = copy_at_most(
             &mut Trickle,
-            &mut sink,
+            &mut CopyTarget::Plain(&mut sink),
             100,
             "receiving the file",
             Instant::now(),
@@ -417,18 +502,18 @@ mod tests {
             },
         };
         assert_eq!(
-            host_guest_paths(&args("./a.txt", "/tmp/a.txt"), Direction::IntoBox).unwrap(),
+            resolve_host_guest_paths(&args("./a.txt", "/tmp/a.txt"), Direction::IntoBox).unwrap(),
             ("./a.txt", "/tmp/a.txt")
         );
         assert_eq!(
-            host_guest_paths(&args("/etc/os-release", "."), Direction::OutOfBox).unwrap(),
+            resolve_host_guest_paths(&args("/etc/os-release", "."), Direction::OutOfBox).unwrap(),
             (".", "/etc/os-release")
         );
         // A host path is whatever the shell handed over - `@`, `:` and all,
         // since nothing about it has to be told apart from a box any more.
         for host in ["./odd@name", "box:/legacy", "user@host", "-"] {
             assert_eq!(
-                host_guest_paths(&args(host, "/tmp/x"), Direction::IntoBox).unwrap(),
+                resolve_host_guest_paths(&args(host, "/tmp/x"), Direction::IntoBox).unwrap(),
                 (host, "/tmp/x"),
                 "{host}"
             );
@@ -449,22 +534,26 @@ mod tests {
             },
         };
         // `put`: the destination is the guest's.
-        let err = host_guest_paths(&args("./a.txt", "tmp/a.txt"), Direction::IntoBox)
+        let err = resolve_host_guest_paths(&args("./a.txt", "tmp/a.txt"), Direction::IntoBox)
             .unwrap_err()
             .to_string();
         assert!(err.contains("absolute path"), "{err}");
         assert!(err.contains("put ./local.txt"), "the spelling: {err}");
 
         // `get`: the source is, and the host side stays free to be relative.
-        let err = host_guest_paths(&args("etc/os-release", "."), Direction::OutOfBox)
+        let err = resolve_host_guest_paths(&args("etc/os-release", "."), Direction::OutOfBox)
             .unwrap_err()
             .to_string();
         assert!(err.contains("absolute path"), "{err}");
         assert!(err.contains("get /etc/os-release"), "the spelling: {err}");
 
         // …and a relative *host* path is nobody's business but the shell's.
-        assert!(host_guest_paths(&args("./a.txt", "/tmp/a.txt"), Direction::IntoBox).is_ok());
-        assert!(host_guest_paths(&args("/tmp/a.txt", "./a.txt"), Direction::OutOfBox).is_ok());
+        assert!(
+            resolve_host_guest_paths(&args("./a.txt", "/tmp/a.txt"), Direction::IntoBox).is_ok()
+        );
+        assert!(
+            resolve_host_guest_paths(&args("/tmp/a.txt", "./a.txt"), Direction::OutOfBox).is_ok()
+        );
     }
     /// The error text comes back from the guest too, and `terra put`/`get` prints it on
     /// a cooked terminal rather than inside a session the user asked to see - so

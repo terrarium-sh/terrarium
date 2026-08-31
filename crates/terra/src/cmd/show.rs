@@ -12,35 +12,40 @@ pub fn run(
     project_dir: &Path,
     cwd: &Path,
 ) -> Result<ExitCode> {
-    let target = resolve::resolve_for_show(name, project_dir, cwd)?;
+    let target = resolve::resolve(
+        name,
+        project_dir,
+        Some(cwd),
+        resolve::Existence::MayBeMissing,
+    )?;
     if let Some(from) = &target.manifest_divergence {
         eprintln!(
             "terra: note: this is {}'s pinned recipe, which is what a boot runs - \
              {} names {} instead, and `terra {} setup` would pin that one",
-            target.bx.name(),
+            target.bx.get_name(),
             config::MANIFEST_FILE,
-            render::printable_path(from),
-            target.bx.name()
+            render::escape_printable_path(from),
+            target.bx.get_name()
         );
     }
 
-    let mut cfg = target.parsed_recipe_without_env_file()?;
+    let mut cfg = target.parse_recipe_without_env_file()?;
     if let Err(e) = config::merge_env_file(&mut cfg) {
         eprintln!(
             "terra: warning: {e:#}\n\
              terra: printing the recipe without those values - a boot would refuse it"
         );
     }
-    if let Err(e) = mount::resolve_and_check_mounts(&mut cfg, &target.bx) {
-        eprintln!("terra: warning: `terra setup` would refuse this recipe:\n{e:#}");
+    match mount::resolve_mounts(&cfg, &target.bx) {
+        Ok(mounts) => cfg.mounts = mounts,
+        Err(e) => eprintln!("terra: warning: `terra setup` would refuse this recipe:\n{e:#}"),
     }
-    let options = render::Options {
-        env_values: args.with_env_values,
+    let yaml = if args.with_env_values {
+        yaml_serde::to_string(&cfg).context("serializing config")?
+    } else {
+        render::render_redacted_config_yaml(&cfg).context("serializing config")?
     };
-    print!(
-        "{}",
-        render::config_yaml(&cfg, options).context("serializing config")?
-    );
+    print!("{yaml}");
     Ok(ExitCode::SUCCESS)
 }
 
@@ -64,17 +69,17 @@ mod tests {
         let bx = BoxRef::resolve(&project, "dev").unwrap();
 
         // A mount of the box's own state is what `terra setup` refuses.
-        let mut refused = config::parse_recipe(
+        let refused = config::parse_recipe(
             &format!(
                 "mounts:\n  - host: {}\n    guest: /work\n",
-                bx.dir().display()
+                bx.get_dir().display()
             ),
             &project,
             Path::new("r.yaml"),
         )
         .unwrap();
-        std::fs::create_dir_all(bx.dir()).unwrap();
-        let err = mount::resolve_and_check_mounts(&mut refused, &bx)
+        std::fs::create_dir_all(bx.get_dir()).unwrap();
+        let err = mount::resolve_mounts(&refused, &bx)
             .expect_err("a mount of the box's own state must be reported")
             .to_string();
         assert!(err.contains("this box's own state"), "{err}");
@@ -88,7 +93,7 @@ mod tests {
         )
         .unwrap();
         assert!(ok.mounts[0].host.to_string_lossy().contains(".."));
-        mount::resolve_and_check_mounts(&mut ok, &bx).unwrap();
+        ok.mounts = mount::resolve_mounts(&ok, &bx).unwrap();
         assert_eq!(
             ok.mounts[0].host,
             std::fs::canonicalize(project.join("src")).unwrap()
@@ -140,7 +145,13 @@ mod tests {
         // …and the file being there is not a thing `show` needs told twice:
         // the values are merged as a boot would merge them.
         std::fs::write(project.join("secrets.env"), "API_KEY=sk-1\n").unwrap();
-        let target = resolve::resolve_for_show(Some("./dev.yaml"), &project, &project).unwrap();
-        assert_eq!(target.parsed_recipe().unwrap().env["API_KEY"], "sk-1");
+        let target = resolve::resolve(
+            Some("./dev.yaml"),
+            &project,
+            Some(&project),
+            resolve::Existence::MayBeMissing,
+        )
+        .unwrap();
+        assert_eq!(target.parse_recipe().unwrap().env["API_KEY"], "sk-1");
     }
 }

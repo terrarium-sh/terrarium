@@ -3,7 +3,7 @@
 //! could otherwise repaint the very summary the `y` is being given to.
 
 use crate::config;
-use crate::policy::network;
+use crate::policy::network::runtime;
 use std::path::Path;
 
 /// The three characters `escape_debug` escapes that say nothing about a
@@ -14,7 +14,7 @@ const KEPT_AS_TYPED: [char; 3] = ['\'', '"', '\\'];
 /// in - come out as an escape; ordinary text, non-ASCII included, is
 /// untouched.
 #[must_use]
-pub fn printable(text: &str) -> String {
+pub fn escape_printable(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(at) = rest.find(KEPT_AS_TYPED) {
@@ -32,38 +32,29 @@ pub fn printable(text: &str) -> String {
 
 const REDACTED_ENV_VALUE: &str = "(set - value not printable)";
 
-#[derive(Clone, Copy, Debug)]
-pub struct Options {
-    /// Only `terra show --with-env-values` sets it: a value printed anywhere
-    /// else outlives the boot that set it.
-    pub env_values: bool,
-}
-
-impl Options {
-    pub const REDACTED: Self = Self { env_values: false };
-}
-
-pub fn config_yaml(cfg: &config::Config, options: Options) -> Result<String, yaml_serde::Error> {
-    if options.env_values {
-        return yaml_serde::to_string(cfg);
-    }
-    let mut printable = cfg.clone();
-    for v in printable.env.values_mut() {
-        REDACTED_ENV_VALUE.clone_into(v);
+pub fn render_redacted_config_yaml(cfg: &config::Config) -> Result<String, yaml_serde::Error> {
+    let mut printable = yaml_serde::to_value(cfg)?;
+    if let Some(env) = printable
+        .get_mut("env")
+        .and_then(yaml_serde::Value::as_mapping_mut)
+    {
+        for value in env.values_mut() {
+            *value = yaml_serde::Value::String(REDACTED_ENV_VALUE.to_string());
+        }
     }
     yaml_serde::to_string(&printable)
 }
 
 #[must_use]
-pub fn printable_path(path: &Path) -> String {
-    printable(&path.to_string_lossy())
+pub fn escape_printable_path(path: &Path) -> String {
+    escape_printable(&path.to_string_lossy())
 }
 
 /// Quoted where the shell would split or read it. Single quotes, which are
 /// literal in every POSIX shell; an embedded one leaves the quoting, escapes
 /// itself and re-enters.
 #[must_use]
-pub(crate) fn shell_word(text: &str) -> String {
+pub(crate) fn quote_shell_word(text: &str) -> String {
     let bare = |c: char| c.is_ascii_alphanumeric() || "._-/=:+@,".contains(c);
     if !text.is_empty() && text.chars().all(bare) {
         return text.to_string();
@@ -72,22 +63,22 @@ pub(crate) fn shell_word(text: &str) -> String {
 }
 
 #[must_use]
-fn mount_line(m: &config::Mount) -> String {
+fn format_mount_line(m: &config::Mount) -> String {
     let mode = if m.readonly { "ro" } else { "rw" };
     format!(
         "{} <- {} ({mode})",
-        printable_path(&m.guest),
-        printable_path(&m.host)
+        escape_printable_path(&m.guest),
+        escape_printable_path(&m.host)
     )
 }
 
 /// The workload as one command line - for a screen, never for exec.
 #[must_use]
-pub fn workload_line(cfg: &config::Config) -> String {
-    let mut line = printable_path(&cfg.workload.entrypoint);
+pub fn format_workload_line(cfg: &config::Config) -> String {
+    let mut line = escape_printable_path(&cfg.workload.entrypoint);
     for a in &cfg.workload.args {
         line.push(' ');
-        line.push_str(&printable(a));
+        line.push_str(&escape_printable(a));
     }
     line
 }
@@ -95,19 +86,19 @@ pub fn workload_line(cfg: &config::Config) -> String {
 /// The host directories a sandbox can see, one line each; "none" is said out
 /// loud because silence would be ambiguous.
 #[must_use]
-pub fn mount_lines(cfg: &config::Config) -> Vec<String> {
+pub fn format_mount_lines(cfg: &config::Config) -> Vec<String> {
     if cfg.mounts.is_empty() {
         vec!["terra: mounts: none (no host filesystem in the sandbox)".to_string()]
     } else {
         cfg.mounts
             .iter()
-            .map(|m| format!("terra: mount: {}", mount_line(m)))
+            .map(|m| format!("terra: mount: {}", format_mount_line(m)))
             .collect()
     }
 }
 
 #[must_use]
-pub fn policy_summary(cfg: &config::Config) -> String {
+pub fn render_policy_summary(cfg: &config::Config) -> String {
     use std::fmt::Write as _;
     // Exhaustive destructures: a new recipe field fails to compile here until
     // someone decides whether the approving person should see it. The `_`
@@ -140,40 +131,44 @@ pub fn policy_summary(cfg: &config::Config) -> String {
     } = hooks;
 
     let mut out = String::new();
-    let _ = writeln!(out, "  egress:   {}", network::describe(network));
+    let _ = writeln!(out, "  egress:   {}", runtime::describe(network));
     for rule in allow {
-        let _ = writeln!(out, "  allow:    {}", printable(rule));
+        let _ = writeln!(out, "  allow:    {}", escape_printable(rule));
     }
     if mounts.is_empty() {
         let _ = writeln!(out, "  mounts:   none");
     }
     for m in mounts {
-        let _ = writeln!(out, "  mount:    {}", mount_line(m));
+        let _ = writeln!(out, "  mount:    {}", format_mount_line(m));
     }
     if let Some(file) = env_file {
-        let _ = writeln!(out, "  env_file: {}", printable_path(file));
+        let _ = writeln!(out, "  env_file: {}", escape_printable_path(file));
     }
     for p in ports {
-        let _ = writeln!(out, "  publish:  127.0.0.1 -> guest ({})", printable(p));
+        let _ = writeln!(
+            out,
+            "  publish:  127.0.0.1 -> guest ({})",
+            escape_printable(p)
+        );
     }
     for h in hosts {
         let _ = writeln!(
             out,
             "  dns:      {} -> {}",
-            printable(&h.name),
-            printable(&h.addr)
+            escape_printable(&h.name),
+            escape_printable(&h.addr)
         );
     }
     if !sudo.is_empty() {
-        let _ = writeln!(out, "  sudo:     {}", printable(&sudo.join(", ")));
+        let _ = writeln!(out, "  sudo:     {}", escape_printable(&sudo.join(", ")));
     }
     for hook in on_create.iter().chain(on_start).chain(pre_stop) {
-        let _ = writeln!(out, "  as root:  {}", printable(hook));
+        let _ = writeln!(out, "  as root:  {}", escape_printable(hook));
     }
     for line in daemons {
-        let _ = writeln!(out, "  daemon:   {}", printable(line));
+        let _ = writeln!(out, "  daemon:   {}", escape_printable(line));
     }
-    let _ = write!(out, "  workload: {}", workload_line(cfg));
+    let _ = write!(out, "  workload: {}", format_workload_line(cfg));
     out
 }
 
@@ -212,7 +207,7 @@ mod tests {
             env_file: Some(PathBuf::from("/data/.env\x1b[2J  mount:    /innocent")),
             ..yaml_serde::from_str("{}").unwrap()
         };
-        let summary = policy_summary(&cfg);
+        let summary = render_policy_summary(&cfg);
         for raw in ['\x1b', '\r', '\x07'] {
             assert!(
                 !summary.contains(raw),
@@ -238,12 +233,12 @@ mod tests {
             r"/home/o'brien/src",
             r"C:\srv\data",
         ] {
-            assert_eq!(printable(as_typed), as_typed);
+            assert_eq!(escape_printable(as_typed), as_typed);
         }
 
         // …and what a terminal does act on is still escaped, beside them.
         for driving in ["'\x1b[2J", "\"\r", "\\\x07", "a'b\x1b]0;t\x07"] {
-            let shown = printable(driving);
+            let shown = escape_printable(driving);
             assert!(
                 !shown.contains(['\x1b', '\r', '\x07']),
                 "{shown:?} still drives the terminal"
@@ -266,7 +261,7 @@ mod tests {
             ]),
             ..yaml_serde::from_str("{}").unwrap()
         };
-        let yaml = config_yaml(&cfg, Options::REDACTED).unwrap();
+        let yaml = render_redacted_config_yaml(&cfg).unwrap();
         for name in ["API_KEY", "MODEL"] {
             assert!(
                 yaml.contains(name),
@@ -283,7 +278,7 @@ mod tests {
         // …and `terra show --with-env-values` is the one rendering that answers
         // with them, otherwise identical - a recipe read back from it has to be
         // the one a boot would run.
-        let asked_for = config_yaml(&cfg, Options { env_values: true }).unwrap();
+        let asked_for = yaml_serde::to_string(&cfg).unwrap();
         for secret in ["sk-super-secret", "gpt-4o"] {
             assert!(
                 asked_for.contains(secret),
@@ -298,7 +293,7 @@ mod tests {
         );
     }
 
-    /// `terra show` prints the recipe as YAML rather than through [`printable`], so
+    /// `terra show` prints the recipe as YAML rather than through [`escape_printable`], so
     /// what keeps a guest-authored one from driving that terminal is the YAML
     /// emitter: a scalar carrying a non-printable cannot be written plain or
     /// single-quoted, so it comes out double-quoted with the byte escaped.
@@ -326,8 +321,8 @@ mod tests {
             ..yaml_serde::from_str("{}").unwrap()
         };
         for printed in [
-            config_yaml(&cfg, Options::REDACTED).unwrap(),
-            config_yaml(&cfg, Options { env_values: true }).unwrap(),
+            render_redacted_config_yaml(&cfg).unwrap(),
+            yaml_serde::to_string(&cfg).unwrap(),
         ] {
             for raw in ['\x1b', '\r', '\x07'] {
                 assert!(
@@ -352,14 +347,14 @@ mod tests {
             env_file: Some(PathBuf::from("/home/me/.aws/credentials")),
             ..yaml_serde::from_str("{}").unwrap()
         };
-        let summary = policy_summary(&cfg);
+        let summary = render_policy_summary(&cfg);
         assert!(
             summary.contains("/home/me/.aws/credentials"),
             "the file a recipe would read is not on the page it is approved on:\n{summary}"
         );
 
         // A recipe naming no file says nothing about one.
-        let none = policy_summary(&yaml_serde::from_str("{}").unwrap());
+        let none = render_policy_summary(&yaml_serde::from_str("{}").unwrap());
         assert!(!none.contains("env_file"), "{none}");
     }
 
@@ -371,10 +366,10 @@ mod tests {
             daemons: vec!["ascend --serve".to_string(), "evil\x1b[2J".to_string()],
             ..yaml_serde::from_str("{}").unwrap()
         };
-        let summary = policy_summary(&cfg);
+        let summary = render_policy_summary(&cfg);
         assert!(summary.contains("daemon:   ascend --serve"), "{summary}");
         assert!(!summary.contains('\x1b'), "{summary}");
-        let none = policy_summary(&yaml_serde::from_str("{}").unwrap());
+        let none = render_policy_summary(&yaml_serde::from_str("{}").unwrap());
         assert!(!none.contains("daemon:"), "{none}");
     }
 
@@ -392,7 +387,7 @@ mod tests {
             },
             ..yaml_serde::from_str("{}").unwrap()
         };
-        let summary = policy_summary(&cfg);
+        let summary = render_policy_summary(&cfg);
         for rule in ["HOST_LOOPBACK:22", "10.0.0.0/8"] {
             assert!(summary.contains(rule), "{rule} is not in:\n{summary}");
         }
@@ -416,7 +411,7 @@ mod tests {
         ] {
             let out = std::process::Command::new("/bin/sh")
                 .arg("-c")
-                .arg(format!("printf %s {}", shell_word(path)))
+                .arg(format!("printf %s {}", quote_shell_word(path)))
                 .output()
                 .expect("running the shell the hint is pasted into");
             assert_eq!(
@@ -427,6 +422,6 @@ mod tests {
         }
         // A plain path is left alone: quoting every hint would be noise on the
         // overwhelmingly common one.
-        assert_eq!(shell_word("/home/me/src"), "/home/me/src");
+        assert_eq!(quote_shell_word("/home/me/src"), "/home/me/src");
     }
 }

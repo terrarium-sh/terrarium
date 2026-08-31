@@ -12,6 +12,7 @@ hooks:
   on_start:
     - apk add --no-cache busybox-extras
 workload:
+  workdir: /work
   entrypoint: /bin/sh
   args:
     - "-c"

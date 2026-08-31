@@ -4,6 +4,7 @@
 
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use std::path::PathBuf;
+use terra_shared::contract::DEFAULT_STOP_GRACE_SECS;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -52,12 +53,17 @@ impl Cli {
             return Ok(());
         };
         let verb: &str = cmd.into();
+        let boot_hint = if cmd.takes_the_box() {
+            format!(
+                "or run the box first (`terra {box_name} -d`) and then `terra {box_name} {verb}`",
+                box_name = self.name.as_deref().unwrap_or("<box>"),
+            )
+        } else {
+            "or run `terra ls` without a box".to_owned()
+        };
         anyhow::ensure!(
             !self.has_boot_flags(),
-            "the boot flags shape a boot, and `{verb}` is not one - drop them, \
-             or run the box first (`terra {box_name} -d`) and then `terra \
-             {box_name} {verb}`",
-            box_name = self.name.as_deref().unwrap_or("<box>"),
+            "the boot flags shape a boot, and `{verb}` is not one - drop them, {boot_hint}",
         );
         anyhow::ensure!(
             cmd.takes_the_box() || self.name.is_none(),
@@ -68,15 +74,13 @@ impl Cli {
 }
 
 /// The box-first fix for a verb-first spelling like `terra stop dev`.
-fn reversal_hint(typed: &[String]) -> Option<String> {
+fn build_reversal_hint(typed: &[String]) -> Option<String> {
     let [verb, name] = typed else { return None };
     crate::resolve::BoxArg::parse(name).ok()?;
-    let cmd = Cli::try_parse_from(["terra", verb.as_str()]).ok()?.cmd?;
-    let takes_only_the_box = cmd.takes_the_box()
-        && Cli::command()
-            .find_subcommand(verb.as_str())
-            .is_some_and(|sub| sub.get_positionals().count() == 0);
-    takes_only_the_box
+    let command = Cli::command();
+    let subcommand = command.find_subcommand(verb)?;
+    let cmd = Cli::try_parse_from(["terra", verb]).ok()?.cmd?;
+    (cmd.takes_the_box() && subcommand.get_positionals().count() == 0)
         .then(|| format!("terra: the box comes before the verb - `terra {name} {verb}`"))
 }
 
@@ -89,7 +93,7 @@ pub fn parse_or_exit() -> Cli {
                 .skip(1)
                 .map(|arg| arg.to_string_lossy().into_owned())
                 .collect();
-            let Some(hint) = reversal_hint(&typed) else {
+            let Some(hint) = build_reversal_hint(&typed) else {
                 reported.exit()
             };
             let _ = reported.print();
@@ -239,8 +243,8 @@ pub struct ExecArgs {
 impl ExecArgs {
     /// Whether the command gets a PTY.
     #[must_use]
-    pub fn wants_a_terminal(&self, at_a_terminal: bool) -> bool {
-        (at_a_terminal || self.tty) && !self.no_tty
+    pub fn wants_a_terminal(&self, is_at_a_terminal: bool) -> bool {
+        (is_at_a_terminal || self.tty) && !self.no_tty
     }
 }
 
@@ -267,8 +271,7 @@ pub struct AgentTimeoutArg {
 }
 
 const STOP_TEARDOWN_ALLOWANCE_SECS: u64 = 35;
-const DEFAULT_STOP_WAIT_SECS: u64 =
-    terra_shared::DEFAULT_STOP_GRACE_SECS + STOP_TEARDOWN_ALLOWANCE_SECS;
+const DEFAULT_STOP_WAIT_SECS: u64 = DEFAULT_STOP_GRACE_SECS + STOP_TEARDOWN_ALLOWANCE_SECS;
 
 #[derive(Args, Debug)]
 pub struct StopArgs {
@@ -477,12 +480,8 @@ mod tests {
     /// spelling every other container tool takes, which makes it the first
     /// thing anyone types.
     ///
-    /// The hint is offered only where `terra <verb> <word>` can mean nothing
-    /// else, which [`reversal_hint`] reads off clap rather than a list of its
-    /// own: the verb takes the box, and has no positional the word could have
-    /// been. Both halves are pinned here - every verb of that shape gets a
-    /// hint, and no verb with a positional does - so a verb that grows one
-    /// stops being guessed at on its own.
+    /// The hint is offered only for verbs whose bare form cannot consume the
+    /// box word as an argument.
     #[test]
     fn the_reversed_spelling_is_named_rather_than_left_to_clap() {
         let command = Cli::command();
@@ -497,7 +496,7 @@ mod tests {
                 continue;
             }
             assert!(Cli::try_parse_from(["terra", word, "dev"]).is_err());
-            let hint = reversal_hint(&[word.to_string(), "dev".to_string()])
+            let hint = build_reversal_hint(&[word.to_string(), "dev".to_string()])
                 .unwrap_or_else(|| panic!("`terra {word} dev` goes unexplained"));
             assert!(hint.contains(&format!("terra dev {word}")), "{hint}");
         }
@@ -509,13 +508,13 @@ mod tests {
             .filter(|s| s.get_positionals().count() > 0)
         {
             let typed = [sub.get_name().to_string(), "dev".to_string()];
-            assert_eq!(reversal_hint(&typed), None, "{}", sub.get_name());
+            assert_eq!(build_reversal_hint(&typed), None, "{}", sub.get_name());
         }
 
         // A recipe path is a box argument too - and `terra setup ./ci.yaml` is
         // the spelling every doc carried before the box came first, so it is
         // the one people still have in their fingers and their CI scripts.
-        let hint = reversal_hint(&["setup".to_string(), "./ci.yaml".to_string()])
+        let hint = build_reversal_hint(&["setup".to_string(), "./ci.yaml".to_string()])
             .expect("the old setup spelling goes unexplained");
         assert!(hint.contains("terra ./ci.yaml setup"), "{hint}");
 
@@ -528,7 +527,7 @@ mod tests {
             &["nonsense", "dev"],
         ] {
             let typed: Vec<String> = quiet.iter().map(|w| (*w).to_string()).collect();
-            assert_eq!(reversal_hint(&typed), None, "{quiet:?}");
+            assert_eq!(build_reversal_hint(&typed), None, "{quiet:?}");
         }
     }
 
@@ -557,6 +556,7 @@ mod tests {
             vec!["terra", "dev", "-d", "stop"],
             vec!["terra", "--root", "exec", "--", "ls"],
             vec!["terra", "dev", "--foreground", "logs"],
+            vec!["terra", "--root", "ls"],
         ] {
             let cli = Cli::parse_from(&argv);
             let err = cli
@@ -564,6 +564,10 @@ mod tests {
                 .expect_err("a boot flag was accepted alongside a verb")
                 .to_string();
             assert!(err.contains("boot flags"), "{argv:?}: {err}");
+            if argv.len() == 3 && argv[1] == "--root" && argv[2] == "ls" {
+                assert!(err.contains("terra ls"), "{argv:?}: {err}");
+                assert!(!err.contains("terra <box> ls"), "{argv:?}: {err}");
+            }
         }
         // …and the bare form still takes every one of them.
         assert!(Cli::parse_from(["terra", "dev", "-d"]).validate().is_ok());
@@ -636,15 +640,6 @@ mod tests {
                 "'{reserved}' is reserved but is no longer a terra word"
             );
         }
-        // A word that shipped belongs in RESERVED_NAMES, which is pinned to the
-        // CLI both ways; leaving it among the held words would put the real
-        // subcommand list one list away from where this test can see it.
-        for held in name::RESERVED_FOR_FUTURE_VERBS {
-            assert!(
-                !words.iter().any(|w| w == held),
-                "'{held}' is a terra word now - move it to RESERVED_NAMES"
-            );
-        }
     }
 
     /// Every "look here" line prints [`crate::state::BoxRef::logs_command`],
@@ -660,7 +655,7 @@ mod tests {
         // carrying one comes back out of a real shell whole is
         // `render::tests::a_word_of_a_printed_command_survives_the_shell_it_is_pasted_into`.
         let bx = crate::state::BoxRef::from_state_dir(PathBuf::from("/p/dev"), Path::new("/p"));
-        let hint = bx.logs_command();
+        let hint = bx.build_logs_command();
         let argv: Vec<&str> = hint.split_whitespace().collect();
 
         let cli = Cli::try_parse_from(&argv)
@@ -769,7 +764,7 @@ mod tests {
     }
 
     /// The wait a stop uses is one number per role: the guest escalates to
-    /// SIGKILL after [`terra_shared::DEFAULT_STOP_GRACE_SECS`], and the host
+    /// SIGKILL after [`DEFAULT_STOP_GRACE_SECS`], and the host
     /// waits that plus a teardown budget before killing the VM - taken from
     /// the flag whether or not the flag was given.
     #[test]
@@ -779,7 +774,7 @@ mod tests {
         };
         assert_eq!(
             stop_args.wait,
-            terra_shared::DEFAULT_STOP_GRACE_SECS + STOP_TEARDOWN_ALLOWANCE_SECS
+            DEFAULT_STOP_GRACE_SECS + STOP_TEARDOWN_ALLOWANCE_SECS
         );
         let Some(Cmd::Stop(stop_args)) = Cli::parse_from(["terra", "stop", "--wait", "5"]).cmd
         else {
@@ -846,8 +841,11 @@ mod tests {
         };
 
         // Unasked, it is still whatever terra itself was started at.
-        for at_a_terminal in [false, true] {
-            assert_eq!(exec(&[]).wants_a_terminal(at_a_terminal), at_a_terminal);
+        for is_at_a_terminal in [false, true] {
+            assert_eq!(
+                exec(&[]).wants_a_terminal(is_at_a_terminal),
+                is_at_a_terminal
+            );
         }
         // …and each flag wins over that, from either side.
         for asked in [&["--tty"][..], &["-t"]] {

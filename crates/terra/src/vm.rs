@@ -3,18 +3,84 @@
 
 pub mod boot;
 pub mod image;
-mod libkrun_ext;
 
 use self::boot::BootSpec;
-use crate::policy::network;
-use crate::render::{Options, config_yaml, mount_lines, workload_line};
+use crate::policy::network::rules;
+use crate::policy::network::runtime;
+use crate::render::{format_mount_lines, format_workload_line, render_redacted_config_yaml};
 use crate::state::BoxRef;
 use crate::{config, logs, sys};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use krun::{
+    krun_add_disk, krun_add_net_unixstream, krun_add_virtio_console_default, krun_add_virtiofs3,
+    krun_add_vsock, krun_add_vsock_port2, krun_create_ctx, krun_set_kernel, krun_set_vm_config,
+    krun_start_enter,
+};
 use smolvm_network::GuestNetworkConfig;
+use std::ffi::CString;
 use std::fs::File;
+#[cfg(unix)]
+use std::io::Read as _;
+use std::os::fd::{AsRawFd, IntoRawFd};
+use std::path::Path;
 use std::process::ExitCode;
-use terra_shared::{Disk, Net, Plan, PlanMode, Share, WORKLOAD_UID};
+use terra_shared::contract::{
+    AGENT_VSOCK_PORT, CONTROL_VSOCK_PORT, Disk, KERNEL_CMDLINE, Net, Plan, PlanMode, Share,
+    WORKLOAD_ID, WORKLOAD_USER_NAME, encode_frame, read_frame, to_volume_device,
+};
+
+const NET_FEATURES: u32 = 0;
+const DIAGNOSTICS_ENV_VAR: &str = "TERRA_DIAGNOSTICS";
+// libkrunfw emits ELF on x86_64 and a raw Image on aarch64.
+#[cfg(target_arch = "x86_64")]
+const KERNEL_FORMAT: u32 = 1;
+#[cfg(target_arch = "aarch64")]
+const KERNEL_FORMAT: u32 = 0;
+
+fn convert_to_c_path(path: &Path) -> Result<CString> {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    if bytes.contains(&0) {
+        anyhow::bail!("path contains a NUL byte: {}", path.display());
+    }
+    Ok(CString::new(bytes)?)
+}
+
+#[allow(unsafe_code)]
+fn configure_context(cfg: &config::Config) -> Result<u32> {
+    let ctx_id = krun_create_ctx();
+    if ctx_id < 0 {
+        bail!(
+            "krun_create_ctx failed: {} ({ctx_id})",
+            std::io::Error::from_raw_os_error(-ctx_id)
+        );
+    }
+    let ctx_id = ctx_id.cast_unsigned();
+    let rc = krun_set_vm_config(ctx_id, cfg.hw.cpus, cfg.hw.mem_mib);
+    if rc < 0 {
+        bail!(
+            "krun_set_vm_config failed: {} ({rc})",
+            std::io::Error::from_raw_os_error(-rc)
+        );
+    }
+    let kernel = convert_to_c_path(&image::ensure_kernel_on_disk()?)?;
+    let cmdline = CString::new(KERNEL_CMDLINE)?;
+    let rc = unsafe {
+        krun_set_kernel(
+            ctx_id,
+            kernel.as_ptr(),
+            KERNEL_FORMAT,
+            std::ptr::null(),
+            cmdline.as_ptr(),
+        )
+    };
+    if rc < 0 {
+        bail!(
+            "krun_set_kernel failed: {} ({rc})",
+            std::io::Error::from_raw_os_error(-rc)
+        );
+    }
+    Ok(ctx_id)
+}
 
 // The two VMs one spec can ask for, told apart by `spec.mode`:
 //   Create - a bare VM that bakes `on_create` and stops. No shares and no
@@ -24,24 +90,68 @@ use terra_shared::{Disk, Net, Plan, PlanMode, Share, WORKLOAD_UID};
 
 pub(crate) const GUEST_NETWORK: GuestNetworkConfig = GuestNetworkConfig::default();
 
+fn read_host_timezone() -> Option<Vec<u8>> {
+    #[cfg(unix)]
+    {
+        const MAX_TIMEZONE_BYTES: u64 = 1 << 20;
+
+        let mut bytes = Vec::new();
+        (File::open("/etc/localtime")
+            .and_then(|file| file.take(MAX_TIMEZONE_BYTES + 1).read_to_end(&mut bytes))
+            .is_ok()
+            && bytes.len() as u64 <= MAX_TIMEZONE_BYTES
+            && bytes.starts_with(b"TZif"))
+        .then_some(bytes)
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
 /// Attach the box's block devices. The kernel cmdline and the boot plan name
 /// the devices this produces, so the add order *is* the contract:
 ///   /dev/vda  boot volume (agent + resize2fs, read-only, roots the kernel)
 ///   /dev/vdb  the box's persistent root filesystem
 ///   /dev/vdc… one per configured volume
-fn attach_disks(krun: &libkrun_ext::Krun, cfg: &config::Config, bx: &BoxRef) -> Result<Vec<Disk>> {
-    krun.add_disk("terra-boot", &image::ensure_boot_volume_on_disk()?, true)?;
-    krun.add_disk("terra-root", &bx.rootfs_img(), false)?;
+#[allow(unsafe_code)]
+fn attach_disks(ctx_id: u32, cfg: &config::Config, bx: &BoxRef) -> Result<Vec<Disk>> {
+    let boot = image::ensure_boot_volume_on_disk()?;
+    let root = bx.get_dir().join(crate::state::ROOTFS_FILE);
+    for (id, path, read_only) in [
+        ("terra-boot", boot.as_path(), true),
+        ("terra-root", root.as_path(), false),
+    ] {
+        let id = CString::new(id)?;
+        let path = convert_to_c_path(path)?;
+        let rc = unsafe { krun_add_disk(ctx_id, id.as_ptr(), path.as_ptr(), read_only) };
+        if rc < 0 {
+            bail!(
+                "krun_add_disk for {} failed: {} ({rc})",
+                path.to_string_lossy(),
+                std::io::Error::from_raw_os_error(-rc)
+            );
+        }
+    }
     let mut volumes = Vec::new();
     for (i, v) in cfg.volumes.iter().enumerate() {
-        let img = bx.volume_img(&v.name);
+        let img = bx.get_volume_image(&v.name);
         image::ensure_volume_image(&img, v.size_mib)
             .with_context(|| format!("preparing volume image {}", img.display()))?;
-        krun.add_disk(&format!("vol{i}"), &img, false)?;
+        let id = CString::new(format!("vol{i}"))?;
+        let path = convert_to_c_path(&img)?;
+        let rc = unsafe { krun_add_disk(ctx_id, id.as_ptr(), path.as_ptr(), false) };
+        if rc < 0 {
+            bail!(
+                "krun_add_disk for {} failed: {} ({rc})",
+                img.display(),
+                std::io::Error::from_raw_os_error(-rc)
+            );
+        }
         volumes.push(Disk {
             // Recipe validation caps volumes at MAX_VOLUMES, so this is a bug
             // guard, not an input check.
-            dev: terra_shared::volume_device(i)
+            dev: to_volume_device(i)
                 .with_context(|| format!("volume {i} is past the last guest block device"))?,
             guest: v.guest.to_string_lossy().into_owned(),
         });
@@ -49,37 +159,70 @@ fn attach_disks(krun: &libkrun_ext::Krun, cfg: &config::Config, bx: &BoxRef) -> 
     Ok(volumes)
 }
 
+#[allow(unsafe_code)]
 fn attach_shares(
-    krun: &libkrun_ext::Krun,
+    ctx_id: u32,
     cfg: &config::Config,
+    bx: &BoxRef,
     mode: PlanMode,
 ) -> Result<Vec<Share>> {
-    let mut shares = Vec::new();
-    if mode == PlanMode::Run {
-        for (i, m) in cfg.mounts.iter().enumerate() {
-            let tag = format!("sh{i}");
-            krun.add_virtiofs(&tag, &m.host, m.readonly)?;
-            shares.push(Share {
-                tag,
-                guest: m.guest.to_string_lossy().into_owned(),
-                readonly: m.readonly,
-            });
+    if mode != PlanMode::Run {
+        return Ok(Vec::new());
+    }
+
+    let mounts = crate::policy::mount::resolve_mounts(cfg, bx)?;
+    let mut shares = Vec::with_capacity(mounts.len());
+    for (i, m) in mounts.iter().enumerate() {
+        let tag = format!("sh{i}");
+        let tag_c = CString::new(tag.as_str())?;
+        let path = convert_to_c_path(&m.host)?;
+        let rc = unsafe {
+            const VIRTIOFS_DAX_WINDOW: u64 = 1 << 29;
+            krun_add_virtiofs3(
+                ctx_id,
+                tag_c.as_ptr(),
+                path.as_ptr(),
+                VIRTIOFS_DAX_WINDOW,
+                m.readonly,
+            )
+        };
+        if rc < 0 {
+            bail!(
+                "krun_add_virtiofs3 for {} failed: {} ({rc})",
+                m.host.display(),
+                std::io::Error::from_raw_os_error(-rc)
+            );
         }
+        shares.push(Share {
+            tag,
+            guest: m.guest.to_string_lossy().into_owned(),
+            readonly: m.readonly,
+        });
     }
     Ok(shares)
 }
 
 /// libkrun binds under the process umask; the `0700` state directory is what
 /// keeps another account off the root-capable exec service behind it.
-fn attach_agent_port(krun: &libkrun_ext::Krun, bx: &BoxRef) -> Result<()> {
-    let path = bx.agent_sock();
+#[allow(unsafe_code)]
+fn attach_agent_port(ctx_id: u32, bx: &BoxRef) -> Result<()> {
+    let path = bx.get_dir().join(crate::state::AGENT_SOCKET);
     // A crashed prior VM may have left a socket; libkrun binds EEXIST.
     let _ = std::fs::remove_file(&path);
-    image::sweep_staging_temps(bx.dir(), |_| false);
-    krun.add_vsock_port(terra_shared::AGENT_VSOCK_PORT, &path, true)
+    image::sweep_staging_temps(bx.get_dir(), |_| false);
+    let path = convert_to_c_path(&path)?;
+    let rc = unsafe { krun_add_vsock_port2(ctx_id, AGENT_VSOCK_PORT, path.as_ptr(), true) };
+    if rc < 0 {
+        bail!(
+            "krun_add_vsock_port2 failed: {} ({rc})",
+            std::io::Error::from_raw_os_error(-rc)
+        );
+    }
+    Ok(())
 }
 
-pub fn run(spec: &BootSpec, bx: &BoxRef, _lock: File) -> Result<ExitCode> {
+#[allow(unsafe_code)]
+pub fn run(spec: &BootSpec, bx: &BoxRef, lock: &File) -> Result<ExitCode> {
     // Before libkrun exists to log anything.
     logs::init(bx)?;
     let cfg = &spec.cfg;
@@ -88,39 +231,58 @@ pub fn run(spec: &BootSpec, bx: &BoxRef, _lock: File) -> Result<ExitCode> {
         // Only a Run VM attaches shares (see the mode notes above), so only it
         // can hand a writable one to host root - checked here because this
         // process, not the spawning parent, is the one that attaches them.
-        check_root_writable_shares(cfg)?;
+        validate_root_writable_shares(cfg)?;
         // Registered before the pid is published, so no SIGTERM can land where
         // it would kill the process outright, `pre_stop` and all.
         sys::install_stop_signal_handlers();
     }
-    bx.publish_pid(std::process::id(), mode == PlanMode::Create);
+    let ctx_id = configure_context(cfg)?;
 
-    let krun = libkrun_ext::Krun::create()?;
-    krun.set_vm_config(cfg.hw.cpus, cfg.hw.mem_mib)?;
-    krun.set_kernel(
-        &image::ensure_kernel_on_disk()?,
-        &terra_shared::kernel_cmdline(),
-    )?;
-
-    let volumes = attach_disks(&krun, cfg, bx)?;
-    let shares = attach_shares(&krun, cfg, mode)?;
+    let volumes = attach_disks(ctx_id, cfg, bx)?;
+    let shares = attach_shares(ctx_id, cfg, bx, mode)?;
 
     let null = sys::open_null().context("opening the null device for the guest console")?;
-    let diag = diagnostics_on()
-        .then(|| logs::open_diagnostics(bx))
+    let diag = std::env::var_os(DIAGNOSTICS_ENV_VAR)
+        .is_some_and(|v| v == "1")
+        .then(|| {
+            let path = bx.get_dir().join(crate::state::DIAGNOSTICS_LOG);
+            sys::create_no_symlinks(&path).with_context(|| format!("opening {}", path.display()))
+        })
         .transpose()?;
-    let _console = krun.add_console(null, console_file(spec, bx, diag.as_ref())?)?;
+    let console_output = open_console_file(spec, bx, diag.as_ref())?;
+    let rc = unsafe {
+        krun_add_virtio_console_default(
+            ctx_id,
+            null.as_raw_fd(),
+            console_output.as_raw_fd(),
+            console_output.as_raw_fd(),
+        )
+    };
+    if rc < 0 {
+        bail!(
+            "krun_add_virtio_console_default failed: {} ({rc})",
+            std::io::Error::from_raw_os_error(-rc)
+        );
+    }
+    let _console = (null, console_output);
 
-    let _net_rt = start_networking(&krun, &cfg.network)?;
+    let _net_rt = start_networking(ctx_id, &cfg.network)?;
     // The vsock device carries every port added after it.
-    krun.add_vsock()?;
+    let rc = krun_add_vsock(ctx_id, 0);
+    if rc < 0 {
+        bail!(
+            "krun_add_vsock failed: {} ({rc})",
+            std::io::Error::from_raw_os_error(-rc)
+        );
+    }
 
     if mode == PlanMode::Run {
-        attach_agent_port(&krun, bx)?;
+        attach_agent_port(ctx_id, bx)?;
     }
 
     let plan = build_plan(spec, shares, volumes);
-    serve_control_sock(&krun, bx, &plan)?;
+    serve_control_sock(ctx_id, bx, &plan)?;
+    bx.publish_pid(lock, std::process::id(), mode == PlanMode::Create);
 
     let (vcpus, mem) = (cfg.hw.cpus, cfg.hw.mem_mib);
     match plan.mode {
@@ -129,7 +291,7 @@ pub fn run(spec: &BootSpec, bx: &BoxRef, _lock: File) -> Result<ExitCode> {
         }
         PlanMode::Run => {
             log::info!("terra: starting {bx} ({vcpus} vCPU, {mem} MiB)");
-            for line in mount_lines(cfg) {
+            for line in format_mount_lines(cfg) {
                 log::info!("{line}");
             }
         }
@@ -141,28 +303,22 @@ pub fn run(spec: &BootSpec, bx: &BoxRef, _lock: File) -> Result<ExitCode> {
         sys::point_stdio_at(&diag).with_context(|| {
             format!(
                 "redirecting stray output into {}",
-                bx.diagnostics_log().display()
+                bx.get_dir().join(crate::state::DIAGNOSTICS_LOG).display()
             )
         })?;
     }
 
-    krun.start_enter()?;
+    let rc = krun_start_enter(ctx_id);
+    if rc < 0 {
+        bail!(
+            "krun_start_enter failed: {} ({rc})",
+            std::io::Error::from_raw_os_error(-rc)
+        );
+    }
 
     // Not reached in practice - a finished box has already left through
-    // [`exit_as_the_guest_did`], a dead one through libkrun's own exit.
+    // the guest exits through its own status, a dead one through libkrun's own exit.
     Ok(ExitCode::SUCCESS)
-}
-
-fn diagnostics_on() -> bool {
-    std::env::var_os("TERRA_DIAGNOSTICS").is_some_and(|v| v == "1")
-}
-
-#[allow(clippy::cast_possible_truncation)]
-fn now_ns() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64
 }
 
 /// The resolved config the agent runs as PID 1.
@@ -179,12 +335,12 @@ fn build_plan(spec: &BootSpec, shares: Vec<Share>, volumes: Vec<Disk>) -> Plan {
             .map(|p| p.to_string_lossy().into_owned()),
         shares,
         volumes,
-        share_owner: sys::share_owner(),
+        share_owner: sys::read_share_owner(),
         net: Net {
-            guest_ip: net.guest_ip.to_string(),
+            guest_ip: net.guest_ip.into(),
             prefix: net.prefix_len,
-            gateway: net.gateway_ip.to_string(),
-            dns: net.dns_server.to_string(),
+            gateway: net.gateway_ip.into(),
+            dns: net.dns_server.into(),
         },
         env: cfg.env.clone(),
         root: spec.root || baking,
@@ -198,13 +354,12 @@ fn build_plan(spec: &BootSpec, shares: Vec<Share>, volumes: Vec<Disk>) -> Plan {
             .chain(cfg.workload.args.iter().cloned())
             .collect(),
         sandbox_info: generate_sandbox_info(cfg, spec.root),
-        host_time_ns: Some(now_ns()),
-        host_tz: crate::host::collect(),
+        host_tz: read_host_timezone(),
     }
 }
 
 /// Where the guest console writes for this boot: whoever is listening.
-fn console_file(spec: &BootSpec, bx: &BoxRef, diag: Option<&File>) -> Result<File> {
+fn open_console_file(spec: &BootSpec, bx: &BoxRef, diag: Option<&File>) -> Result<File> {
     if spec.foreground {
         use std::os::fd::AsFd;
         return std::io::stdout()
@@ -222,8 +377,13 @@ fn console_file(spec: &BootSpec, bx: &BoxRef, diag: Option<&File>) -> Result<Fil
         // O_APPEND on the symlink's target: a bake outlives no rotation.
         return std::fs::OpenOptions::new()
             .append(true)
-            .open(bx.log())
-            .with_context(|| format!("appending the bake console to {}", bx.log().display()));
+            .open(bx.get_dir().join(crate::state::LOG_FILE))
+            .with_context(|| {
+                format!(
+                    "appending the bake console to {}",
+                    bx.get_dir().join(crate::state::LOG_FILE).display()
+                )
+            });
     }
     sys::open_null().context("opening the null device for the guest console")
 }
@@ -233,21 +393,18 @@ fn console_file(spec: &BootSpec, bx: &BoxRef, diag: Option<&File>) -> Result<Fil
 #[must_use]
 fn generate_sandbox_info(cfg: &config::Config, root: bool) -> String {
     let net = GUEST_NETWORK;
-    let yaml = config_yaml(cfg, Options::REDACTED).unwrap_or_default();
+    let yaml = render_redacted_config_yaml(cfg).unwrap_or_default();
     let who = if root {
         "`root`".to_string()
     } else {
-        format!(
-            "`{}` (uid {WORKLOAD_UID}, non-root)",
-            terra_shared::WORKLOAD_USER_NAME
-        )
+        format!("`{WORKLOAD_USER_NAME}` (uid {WORKLOAD_ID}, non-root)")
     };
     format!(
         include_str!("sandbox_readme.md"),
         who = who,
-        cmd = workload_line(cfg),
+        cmd = format_workload_line(cfg),
         yaml = yaml,
-        egress = network::describe(&cfg.network),
+        egress = runtime::describe(&cfg.network),
         ip = net.guest_ip,
         prefix = net.prefix_len,
         gw = net.gateway_ip,
@@ -258,20 +415,38 @@ fn generate_sandbox_info(cfg: &config::Config, root: bool) -> String {
 /// The guest's traffic terminates in-process, under the egress policy. Keep
 /// the returned runtime alive for the VM's life.
 #[must_use = "the VM's networking dies with this runtime"]
+#[allow(unsafe_code)]
 fn start_networking(
-    krun: &libkrun_ext::Krun,
+    ctx_id: u32,
     net: &config::Network,
 ) -> Result<smolvm_network::VirtioNetworkRuntime> {
     let guest_net = GUEST_NETWORK;
     let (host_end, krun_end) =
         std::os::unix::net::UnixStream::pair().context("creating virtio-net socketpair")?;
-    krun.add_net_unixstream(krun_end, &guest_net.guest_mac)?;
-    let egress = network::BoxPolicy::new(net)?;
+    let krun_fd = krun_end.into_raw_fd();
+    let rc = unsafe {
+        krun_add_net_unixstream(
+            ctx_id,
+            std::ptr::null(),
+            krun_fd,
+            guest_net.guest_mac.as_ptr(),
+            NET_FEATURES,
+            0,
+        )
+    };
+    if rc < 0 {
+        unsafe { libc::close(krun_fd) };
+        bail!(
+            "krun_add_net_unixstream failed: {} ({rc})",
+            std::io::Error::from_raw_os_error(-rc)
+        );
+    }
+    let egress = runtime::BoxPolicy::new(net)?;
     log::info!(
         "terra: egress: {} - loopback/LAN/private/CGNAT floored unless a rule names them",
-        network::describe(net)
+        runtime::describe(net)
     );
-    let ports = network::parse_port_mappings(&net.ports)?;
+    let ports = rules::parse_port_mappings(&net.ports)?;
     for p in &ports {
         log::info!(
             "terra: published: 127.0.0.1:{} -> guest:{}",
@@ -293,7 +468,7 @@ fn start_networking(
 /// cannot creep into an alias.
 const ALLOW_ROOT_ENV: &str = "TERRA_ALLOW_ROOT";
 
-fn check_root_writable_shares(cfg: &config::Config) -> Result<()> {
+fn validate_root_writable_shares(cfg: &config::Config) -> Result<()> {
     if sys::is_host_root() && cfg.mounts.iter().any(|m| !m.readonly) {
         anyhow::ensure!(
             std::env::var_os(ALLOW_ROOT_ENV).is_some_and(|v| v == "1"),
@@ -315,19 +490,27 @@ fn check_root_writable_shares(cfg: &config::Config) -> Result<()> {
 /// a disk; the connection then stays open for the VM's life, carrying the
 /// graceful-stop byte - which a bake does not get, since killing it outright
 /// is what stopping one means.
-fn serve_control_sock(krun: &libkrun_ext::Krun, bx: &BoxRef, plan: &Plan) -> Result<()> {
+#[allow(unsafe_code)]
+fn serve_control_sock(ctx_id: u32, bx: &BoxRef, plan: &Plan) -> Result<()> {
     let watch_stop = plan.mode == PlanMode::Run;
-    let sock = bx.control_sock();
+    let sock = bx.get_dir().join(crate::state::CONTROL_SOCKET);
     let _ = std::fs::remove_file(&sock); // a crashed prior VM may have left one
-    image::sweep_staging_temps(bx.dir(), |_| false);
+    image::sweep_staging_temps(bx.get_dir(), |_| false);
     let listener = std::os::unix::net::UnixListener::bind(&sock)
         .with_context(|| format!("binding the control socket {}", sock.display()))?;
     // `bind` applies the process umask; the socket hands out secrets, so the
     // mode is stated here too, not left to the state dir alone.
-    sys::owner_only(&sock, false).with_context(|| format!("securing {}", sock.display()))?;
-    krun.add_vsock_port(terra_shared::CONTROL_VSOCK_PORT, &sock, false)?;
+    sys::set_owner_only(&sock, false).with_context(|| format!("securing {}", sock.display()))?;
+    let path = convert_to_c_path(&sock)?;
+    let rc = unsafe { krun_add_vsock_port2(ctx_id, CONTROL_VSOCK_PORT, path.as_ptr(), false) };
+    if rc < 0 {
+        bail!(
+            "krun_add_vsock_port2 failed: {} ({rc})",
+            std::io::Error::from_raw_os_error(-rc)
+        );
+    }
 
-    let frame = terra_shared::frame(plan).context("serializing the boot plan")?;
+    let frame = encode_frame(plan).context("serializing the boot plan")?;
     std::thread::spawn(move || {
         use std::io::Write;
         let accepted = listener.accept();
@@ -358,15 +541,11 @@ fn serve_control_sock(krun: &libkrun_ext::Krun, bx: &BoxRef, plan: &Plan) -> Res
         // `pre_stop` runs would cut the stop channel out from under the guest.
         // The guest's last act on it is its exit status; a read that ends
         // without one is the VM dying rather than finishing.
-        if let Ok(code) = terra_shared::read_exit_status(&mut conn) {
-            exit_as_the_guest_did(code);
+        if let Ok(Some(code)) = read_frame::<i32>(&mut conn) {
+            std::process::exit(i32::from(crate::exit_status_byte(code)));
         }
     });
     Ok(())
-}
-
-fn exit_as_the_guest_did(code: i32) -> ! {
-    std::process::exit(i32::from(crate::exit_status_byte(code)));
 }
 
 #[cfg(test)]
@@ -484,5 +663,18 @@ mod tests {
         let info = generate_sandbox_info(&cfg, false);
         assert!(info.contains("API_KEY"), "the name should still be shown");
         assert!(!info.contains("sk-super-secret"), "{info}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn c_paths_accept_non_utf8_os_bytes() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let path = PathBuf::from(OsString::from_vec(b"/tmp/project-\x80".to_vec()));
+        assert_eq!(
+            convert_to_c_path(&path).unwrap().as_bytes(),
+            b"/tmp/project-\x80"
+        );
     }
 }

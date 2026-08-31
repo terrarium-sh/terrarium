@@ -9,7 +9,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 fn signal_vm(bx: &BoxRef, signal: sys::VmSignal) -> Result<Option<VmProcess>> {
-    let Some(vm) = bx.vm_process() else {
+    let Some(vm) = bx.read_vm_process() else {
         return Ok(None);
     };
     sys::signal_pid(vm.pid, vm.started_at, signal)
@@ -21,9 +21,9 @@ fn signal_vm(bx: &BoxRef, signal: sys::VmSignal) -> Result<Option<VmProcess>> {
 /// runs out; `Ok(None)` means the box was already stopped.
 fn request_stop(bx: &BoxRef, deadline: Instant) -> Result<Option<VmProcess>> {
     loop {
-        match bx.holder() {
+        match bx.get_holder() {
             Holder::Free => return Ok(None),
-            Holder::SettingUp if bx.vm_process().is_none() => {
+            Holder::SettingUp if bx.read_vm_process().is_none() => {
                 return Err(bx.setup_holds_it());
             }
             Holder::Running | Holder::SettingUp => {}
@@ -43,7 +43,7 @@ const KILL_REAP_WAIT: Duration = Duration::from_secs(2);
 
 fn wait_until_stopped(bx: &BoxRef, deadline: Instant) -> bool {
     loop {
-        if !bx.holder().holds() {
+        if !bx.get_holder().holds() {
             return true;
         }
         // An instant, not a duration: each hop that re-derives the deadline
@@ -115,10 +115,10 @@ mod tests {
     /// A box on disk under a home of this test's own - which has to be in
     /// place before the box is resolved, since that is when its directory is
     /// settled.
-    fn box_in(dir: &Path) -> (BoxRef, crate::sys::TestHome) {
+    fn create_box_in(dir: &Path) -> (BoxRef, crate::sys::TestHome) {
         let home = crate::sys::TestHome::new();
         let bx = BoxRef::resolve(dir, "dev").unwrap();
-        std::fs::create_dir_all(bx.dir()).unwrap();
+        std::fs::create_dir_all(bx.get_dir()).unwrap();
         (bx, home)
     }
 
@@ -127,13 +127,13 @@ mod tests {
     /// about SIGTERM, and must echo a byte once it has: a signal that arrives
     /// while the shell is still starting is taken at the default disposition,
     /// so without the handshake a child meant to ignore SIGTERM dies of it.
-    fn vm_child(bx: &BoxRef, shell: &str) -> Child {
+    fn spawn_vm_child(bx: &BoxRef, shell: &str) -> Child {
         let lock = bx.lock_run().unwrap();
         let mut cmd = Command::new("/bin/sh");
         cmd.arg("-c").arg(shell).stdout(Stdio::piped());
         sys::pass_lock(&mut cmd, &lock);
         let mut child = cmd.spawn().unwrap();
-        bx.publish_pid(child.id(), false);
+        bx.publish_pid(&lock, child.id(), false);
         // From here the child alone holds the box, as it does after a boot.
         drop(lock);
         let mut up = [0u8; 1];
@@ -151,7 +151,7 @@ mod tests {
     #[test]
     fn a_box_nobody_holds_is_already_stopped() {
         let dir = tempfile::tempdir().unwrap();
-        let (bx, _home) = box_in(dir.path());
+        let (bx, _home) = create_box_in(dir.path());
         assert!(matches!(
             stop_and_wait(&bx, Duration::from_secs(0)).unwrap(),
             StopOutcome::AlreadyStopped
@@ -165,10 +165,10 @@ mod tests {
     #[test]
     fn a_holder_that_published_no_pid_is_waited_out_and_then_named() {
         let dir = tempfile::tempdir().unwrap();
-        let (bx, _home) = box_in(dir.path());
+        let (bx, _home) = create_box_in(dir.path());
         // `lock_run` empties the file, so this is a box held with no pid in it.
         let _held = bx.lock_run().unwrap();
-        assert_eq!(bx.vm_process(), None);
+        assert_eq!(bx.read_vm_process(), None);
 
         let err = stop_and_wait(&bx, Duration::from_millis(200))
             .expect_err("a box held with no pid to signal must not read as stopped")
@@ -182,10 +182,10 @@ mod tests {
     #[test]
     fn a_bake_mark_with_no_pid_refuses_without_waiting_out_the_grace() {
         let dir = tempfile::tempdir().unwrap();
-        let (bx, _home) = box_in(dir.path());
+        let (bx, _home) = create_box_in(dir.path());
         let lock = bx.lock_run().unwrap();
         let marked = bx.mark_baking(&lock);
-        assert_eq!(bx.vm_process(), None, "the mark precedes any child");
+        assert_eq!(bx.read_vm_process(), None, "the mark precedes any child");
 
         // Long enough that a regression to wait-it-out would fail the test run
         // long before this grace expires.
@@ -203,14 +203,14 @@ mod tests {
     #[test]
     fn a_vm_that_takes_the_signal_stops_gracefully() {
         let dir = tempfile::tempdir().unwrap();
-        let (bx, _home) = box_in(dir.path());
-        let mut child = vm_child(&bx, "echo up; exec sleep 30");
+        let (bx, _home) = create_box_in(dir.path());
+        let mut child = spawn_vm_child(&bx, "echo up; exec sleep 30");
 
         assert!(matches!(
             stop_and_wait(&bx, Duration::from_secs(10)).unwrap(),
             StopOutcome::StoppedGracefully
         ));
-        assert!(!bx.holder().holds(), "the box is still held");
+        assert!(!bx.get_holder().holds(), "the box is still held");
         child.wait().unwrap();
     }
 
@@ -224,14 +224,14 @@ mod tests {
     #[test]
     fn a_vm_that_ignores_the_signal_is_killed_once_the_grace_runs_out() {
         let dir = tempfile::tempdir().unwrap();
-        let (bx, _home) = box_in(dir.path());
-        let mut child = vm_child(&bx, "trap '' TERM; echo up; exec sleep 30");
+        let (bx, _home) = create_box_in(dir.path());
+        let mut child = spawn_vm_child(&bx, "trap '' TERM; echo up; exec sleep 30");
 
         assert!(matches!(
             stop_and_wait(&bx, Duration::from_millis(300)).unwrap(),
             StopOutcome::Killed
         ));
-        assert!(!bx.holder().holds(), "the box is still held");
+        assert!(!bx.get_holder().holds(), "the box is still held");
         child.wait().unwrap();
     }
 }

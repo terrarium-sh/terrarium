@@ -3,7 +3,7 @@
 //! with a writable share never chooses what a later boot mounts or reaches.
 
 use crate::policy::mount;
-use crate::render::{policy_summary, printable_path};
+use crate::render::{escape_printable_path, render_policy_summary};
 use crate::resolve::{self, ResolvedBox};
 use crate::state::{BoxRef, Holder};
 use crate::vm::boot;
@@ -36,13 +36,13 @@ struct GuestWritableFile {
     share: PathBuf,
 }
 
-fn guest_writable_share_containing(
+fn find_guest_writable_share_containing(
     bx: &BoxRef,
     from: &Path,
     via_manifest: bool,
 ) -> Option<GuestWritableFile> {
-    let previous = mount::pinned_recipes_across_boxes(bx.project_dir());
-    let manifest = bx.project_dir().join(config::MANIFEST_FILE);
+    let previous = mount::list_pinned_recipes_across_boxes(bx.get_project_dir());
+    let manifest = bx.get_project_dir().join(config::MANIFEST_FILE);
     let carriers: &[&Path] = if via_manifest {
         &[from, &manifest]
     } else {
@@ -51,7 +51,7 @@ fn guest_writable_share_containing(
     carriers.iter().find_map(|file| {
         previous
             .iter()
-            .find_map(|p| mount::writable_mount_containing(file, p, bx.project_dir()))
+            .find_map(|p| mount::find_writable_mount_containing(file, p, bx.get_project_dir()))
             .map(|share| GuestWritableFile {
                 recipe_or_manifest: (*file).to_path_buf(),
                 share,
@@ -59,19 +59,19 @@ fn guest_writable_share_containing(
     })
 }
 
-fn adoption_reason(from: &Path, file: &GuestWritableFile) -> String {
+fn build_adoption_reason(from: &Path, file: &GuestWritableFile) -> String {
     use std::fmt::Write as _;
     let mut why = format!(
         "{} lives inside '{}', which a box of this directory shares read-write - \
          a guest may be the author of it",
-        printable_path(&file.recipe_or_manifest),
-        printable_path(&file.share),
+        escape_printable_path(&file.recipe_or_manifest),
+        escape_printable_path(&file.share),
     );
     if file.recipe_or_manifest != from {
         let _ = write!(
             why,
             ", and it is what names {} as this box's recipe",
-            printable_path(from)
+            escape_printable_path(from)
         );
     }
     why
@@ -89,8 +89,8 @@ enum PinAction {
 
 /// The one table a pinning's fate is read from: who vouches, whether a guest
 /// could have written it, and whether there is anyone to ask.
-fn decide_pinning(approval: &Approval, suspect: bool, at_a_terminal: bool) -> PinAction {
-    match (approval, suspect, at_a_terminal) {
+fn decide_pinning(approval: &Approval, is_suspect: bool, is_at_a_terminal: bool) -> PinAction {
+    match (approval, is_suspect, is_at_a_terminal) {
         (Approval::ChosenByHand { .. }, false, _) => PinAction::WithoutAsking,
         (Approval::ChosenByHand { trust_recipe: true }, true, _) => PinAction::WarnAndPin,
         (Approval::Reported, false, _) | (Approval::Reported, true, true) => PinAction::ReportOnly,
@@ -98,18 +98,18 @@ fn decide_pinning(approval: &Approval, suspect: bool, at_a_terminal: bool) -> Pi
             PinAction::RefuseUnasked
         }
         (Approval::ChosenByHand { .. } | Approval::Offer, _, true) => PinAction::Ask {
-            default_yes: !suspect,
+            default_yes: !is_suspect,
         },
     }
 }
 
-fn approval_page(lead: &str, warning: Option<&str>, cfg: &config::Config) -> String {
+fn render_approval_page(lead: &str, warning: Option<&str>, cfg: &config::Config) -> String {
     use std::fmt::Write as _;
     let mut page = format!("{lead}\n");
     if let Some(warning) = warning {
         let _ = writeln!(page, "{warning}");
     }
-    let _ = write!(page, "It would grant:\n{}", policy_summary(cfg));
+    let _ = write!(page, "It would grant:\n{}", render_policy_summary(cfg));
     page
 }
 
@@ -142,12 +142,12 @@ fn put_the_question(
             "{page}\n\
              There is no terminal to ask on. Review the file, then \
              `terra {box_name} setup --trust-recipe` to pin it.",
-            page = approval_page(lead, warning, cfg)
+            page = render_approval_page(lead, warning, cfg)
         ),
         PinAction::Ask { default_yes } => {
             // stderr: a question on stdout would vanish into `terra setup >
             // log` and read as a hang.
-            eprintln!("terra: {}", approval_page(lead, warning, cfg));
+            eprintln!("terra: {}", render_approval_page(lead, warning, cfg));
             anyhow::ensure!(
                 confirm(
                     if default_yes {
@@ -184,10 +184,10 @@ fn answer_is_yes(answer: &str, default_yes: bool) -> bool {
 pub fn request_recipe_approval(
     target: ResolvedBox,
     approval: &Approval,
-    at_a_terminal: bool,
+    is_at_a_terminal: bool,
 ) -> Result<ApprovedRecipe> {
     target.bx.ensure_sockets_fit()?;
-    let mut cfg = target.parsed_recipe()?;
+    let mut cfg = target.parse_recipe()?;
     let ResolvedBox {
         bx,
         source,
@@ -198,34 +198,35 @@ pub fn request_recipe_approval(
         resolve::Source::File(r) => (Some(r), false),
         resolve::Source::Manifest(r) => (Some(r), true),
     };
-    mount::resolve_and_check_mounts(&mut cfg, &bx)?;
+    cfg.mounts = mount::resolve_mounts(&cfg, &bx)?;
 
     let mut new_pin = None;
     if let Some(r) = source {
-        let pinned_text = std::fs::read_to_string(bx.recipe()).unwrap_or_default();
+        let pinned_text =
+            std::fs::read_to_string(bx.get_dir().join(state::RECIPE_FILE)).unwrap_or_default();
         if r.text != pinned_text {
-            let guest_writable = guest_writable_share_containing(&bx, &r.from, via_manifest);
+            let guest_writable = find_guest_writable_share_containing(&bx, &r.from, via_manifest);
             let lead = match approval {
                 // A dry run's refusal reads as the real setup's would.
                 Approval::ChosenByHand { .. } | Approval::Reported => {
-                    format!("pinning {} to {bx}", printable_path(&r.from))
+                    format!("pinning {} to {bx}", escape_printable_path(&r.from))
                 }
                 Approval::Offer => format!(
                     "no box '{}' in {} yet - {} would build it",
-                    bx.name(),
-                    bx.project_dir().display(),
-                    printable_path(&r.from)
+                    bx.get_name(),
+                    bx.get_project_dir().display(),
+                    escape_printable_path(&r.from)
                 ),
             };
             let warning = guest_writable
                 .as_ref()
-                .map(|f| format!("WARNING: {}.", adoption_reason(&r.from, f)));
+                .map(|f| format!("WARNING: {}.", build_adoption_reason(&r.from, f)));
             put_the_question(
-                decide_pinning(approval, guest_writable.is_some(), at_a_terminal),
+                decide_pinning(approval, guest_writable.is_some(), is_at_a_terminal),
                 &lead,
                 warning.as_deref(),
                 &cfg,
-                bx.name(),
+                bx.get_name(),
             )?;
             new_pin = Some(r);
         }
@@ -238,7 +239,13 @@ pub struct PreparedBox {
     pub fresh_rootfs: bool,
 }
 
-pub fn prepare_box(approved: &ApprovedRecipe, rebuild: bool) -> Result<PreparedBox> {
+#[derive(Debug, Clone, Copy)]
+pub enum Rebuild {
+    Yes,
+    No,
+}
+
+pub fn prepare_box(approved: &ApprovedRecipe, rebuild: Rebuild) -> Result<PreparedBox> {
     let ApprovedRecipe { bx, cfg, new_pin } = approved;
     // Locked before anything on disk moves - a setup racing a finished `rm`
     // would otherwise resurrect the state directory after rm reported it gone.
@@ -246,15 +253,15 @@ pub fn prepare_box(approved: &ApprovedRecipe, rebuild: bool) -> Result<PreparedB
     prepare_box_state_dir(bx)?;
     // Under the lock anything staged here predates this run - a setup or boot
     // that died part-way through an install.
-    crate::vm::image::sweep_staging_temps(bx.dir(), |_| false);
-    let recipe_path = bx.recipe();
+    crate::vm::image::sweep_staging_temps(bx.get_dir(), |_| false);
+    let recipe_path = bx.get_dir().join(state::RECIPE_FILE);
     if let Some(r) = new_pin {
         if recipe_path.exists() {
             eprintln!(
                 "terra: recipe updated from {} (the box keeps its filesystem; \
                  `terra {} setup --rebuild` rebuilds it)",
                 r.from.display(),
-                bx.name()
+                bx.get_name()
             );
         }
         crate::vm::image::staged_write(&recipe_path, |out| {
@@ -266,11 +273,11 @@ pub fn prepare_box(approved: &ApprovedRecipe, rebuild: bool) -> Result<PreparedB
                 .with_context(|| format!("syncing {}", recipe_path.display()))
         })?;
     }
-    let img = bx.rootfs_img();
-    if rebuild && img.exists() {
+    let img = bx.get_dir().join(state::ROOTFS_FILE);
+    if matches!(rebuild, Rebuild::Yes) && img.exists() {
         eprintln!("terra: --rebuild: rebuilding {bx} from scratch");
         let _ = std::fs::remove_file(&img);
-        let _ = std::fs::remove_file(bx.bake_stamp());
+        let _ = std::fs::remove_file(bx.get_dir().join(state::BAKE_STAMP));
     }
     let fresh = !img.exists();
     if fresh {
@@ -286,15 +293,15 @@ pub fn prepare_box(approved: &ApprovedRecipe, rebuild: bool) -> Result<PreparedB
     })
 }
 
-fn sweep_or_keep_unused_volumes(bx: &BoxRef, configured: &[String], rebuild: bool) {
-    for img in bx.unused_volume_images(configured) {
-        if !rebuild {
+fn sweep_or_keep_unused_volumes(bx: &BoxRef, configured: &[String], rebuild: Rebuild) {
+    for img in bx.list_unused_volume_images(configured) {
+        if matches!(rebuild, Rebuild::No) {
             eprintln!(
                 "terra: {} holds a volume the recipe no longer names - kept \
                  (`terra {name} storage prune` removes it, and so does \
                  `terra {name} setup --rebuild`)",
                 img.display(),
-                name = bx.name()
+                name = bx.get_name()
             );
             continue;
         }
@@ -309,9 +316,9 @@ fn sweep_or_keep_unused_volumes(bx: &BoxRef, configured: &[String], rebuild: boo
 }
 
 fn refuse_a_case_variant_of_an_existing_box(bx: &BoxRef) -> Result<()> {
-    let clash = state::existing_names(bx.project_dir())
+    let clash = state::list_existing_names(bx.get_project_dir())
         .into_iter()
-        .find(|existing| existing != bx.name() && existing.eq_ignore_ascii_case(bx.name()));
+        .find(|existing| existing != bx.get_name() && existing.eq_ignore_ascii_case(bx.get_name()));
     if let Some(existing) = clash {
         anyhow::bail!(
             "{} already has a box called '{existing}', which differs from '{}' only by \
@@ -319,8 +326,8 @@ fn refuse_a_case_variant_of_an_existing_box(bx: &BoxRef) -> Result<()> {
              directory, so they would share a lock, a recipe and a root filesystem \
              (name this one something else, or `terra {existing}` for the box that is \
              already there)",
-            bx.project_dir().display(),
-            bx.name(),
+            bx.get_project_dir().display(),
+            bx.get_name(),
         );
     }
     Ok(())
@@ -330,19 +337,19 @@ fn prepare_box_state_dir(bx: &BoxRef) -> Result<()> {
     // Refused rather than created: a typo'd `--project` would silently mint a
     // directory and a box for it.
     anyhow::ensure!(
-        bx.project_dir().is_dir(),
+        bx.get_project_dir().is_dir(),
         "{} is not a directory, so it can have no box (--project names the \
          directory a box belongs to - check the spelling, or create it first)",
-        bx.project_dir().display()
+        bx.get_project_dir().display()
     );
     refuse_a_case_variant_of_an_existing_box(bx)?;
     // Box state inherits the box directory's protection, which
     // [`state::ensure_box_home`] enforces.
     state::ensure_box_home()?;
-    std::fs::create_dir_all(bx.dir())
-        .with_context(|| format!("creating box state {}", bx.dir().display()))?;
-    sys::owner_only(bx.dir(), true)
-        .with_context(|| format!("securing box state {}", bx.dir().display()))?;
+    std::fs::create_dir_all(bx.get_dir())
+        .with_context(|| format!("creating box state {}", bx.get_dir().display()))?;
+    sys::set_owner_only(bx.get_dir(), true)
+        .with_context(|| format!("securing box state {}", bx.get_dir().display()))?;
     bx.write_origin();
     Ok(())
 }
@@ -353,11 +360,11 @@ pub fn run(
     name: Option<&str>,
     project_dir: &Path,
     cwd: &Path,
-    at_a_terminal: bool,
+    is_at_a_terminal: bool,
 ) -> Result<ExitCode> {
     let target = resolve::resolve_for_setup(name, project_dir, cwd)?;
 
-    match target.bx.holder() {
+    match target.bx.get_holder() {
         Holder::Free => {}
         Holder::SettingUp => return Err(target.bx.setup_holds_it()),
         Holder::Running => anyhow::bail!(
@@ -374,7 +381,7 @@ pub fn run(
             trust_recipe: args.trust_recipe,
         }
     };
-    let approved = request_recipe_approval(target, &approval, at_a_terminal)?;
+    let approved = request_recipe_approval(target, &approval, is_at_a_terminal)?;
     if args.dry_run {
         // The refusals have run; the rest is the disk work a dry run exists
         // not to do.
@@ -385,7 +392,12 @@ pub fn run(
         );
         return Ok(ExitCode::SUCCESS);
     }
-    let prepared = prepare_box(&approved, args.rebuild)?;
+    let rebuild = if args.rebuild {
+        Rebuild::Yes
+    } else {
+        Rebuild::No
+    };
+    let prepared = prepare_box(&approved, rebuild)?;
     let ApprovedRecipe { bx, cfg, .. } = approved;
 
     // Ungated: the guest skips a bake its stamp says already ran, so
@@ -393,7 +405,7 @@ pub fn run(
     if !cfg.hooks.on_create.is_empty() {
         boot::run_bake(&cfg, &bx, &prepared.lock)?;
     }
-    eprintln!("terra: {bx} is ready - `terra {}` boots it", bx.name());
+    eprintln!("terra: {bx} is ready - `terra {}` boots it", bx.get_name());
     Ok(ExitCode::SUCCESS)
 }
 
@@ -416,11 +428,11 @@ mod tests {
         let _home = crate::sys::TestHome::new();
         let a = BoxRef::resolve(&project, "a").unwrap();
         let b = BoxRef::resolve(&project, "b").unwrap();
-        std::fs::create_dir_all(a.dir()).unwrap();
-        std::fs::create_dir_all(b.dir()).unwrap();
-        std::fs::write(a.recipe(), "hw:\n  cpus: 1\n").unwrap();
+        std::fs::create_dir_all(a.get_dir()).unwrap();
+        std::fs::create_dir_all(b.get_dir()).unwrap();
+        std::fs::write(a.get_dir().join(state::RECIPE_FILE), "hw:\n  cpus: 1\n").unwrap();
         std::fs::write(
-            b.recipe(),
+            b.get_dir().join(state::RECIPE_FILE),
             format!(
                 "mounts:\n  - host: {}\n    guest: /work\n",
                 project.display()
@@ -454,11 +466,11 @@ mod tests {
 
         // The flag pins it anyway - with the warning, but without a question,
         // so it never reaches the prompt whether there is a terminal or not.
-        for at_a_terminal in [false, true] {
+        for is_at_a_terminal in [false, true] {
             let approved = request_recipe_approval(
                 target(),
                 &Approval::ChosenByHand { trust_recipe: true },
-                at_a_terminal,
+                is_at_a_terminal,
             )
             .expect("--trust-recipe should pin without asking");
             assert!(approved.new_pin.is_some(), "the recipe should be adopted");
@@ -508,22 +520,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let _home = crate::sys::TestHome::new();
         let bx = BoxRef::resolve(dir.path(), "dev").unwrap();
-        std::fs::create_dir_all(bx.dir()).unwrap();
+        std::fs::create_dir_all(bx.get_dir()).unwrap();
         for name in ["data", "old"] {
-            std::fs::write(bx.volume_img(name), b"image").unwrap();
+            std::fs::write(bx.get_volume_image(name), b"image").unwrap();
         }
         let configured = vec!["data".to_string()];
 
-        sweep_or_keep_unused_volumes(&bx, &configured, false);
+        sweep_or_keep_unused_volumes(&bx, &configured, Rebuild::No);
         assert!(
-            bx.volume_img("old").exists(),
+            bx.get_volume_image("old").exists(),
             "a plain pin or boot deleted a volume's data"
         );
-        assert!(bx.volume_img("data").exists());
+        assert!(bx.get_volume_image("data").exists());
 
-        sweep_or_keep_unused_volumes(&bx, &configured, true);
-        assert!(!bx.volume_img("old").exists(), "--rebuild sweeps it");
-        assert!(bx.volume_img("data").exists(), "a named volume was swept");
+        sweep_or_keep_unused_volumes(&bx, &configured, Rebuild::Yes);
+        assert!(!bx.get_volume_image("old").exists(), "--rebuild sweeps it");
+        assert!(
+            bx.get_volume_image("data").exists(),
+            "a named volume was swept"
+        );
     }
 
     /// A stamp belongs to the rootfs it proves: `--rebuild` makes a new
@@ -534,20 +549,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let _home = crate::sys::TestHome::new();
         let bx = BoxRef::resolve(dir.path(), "dev").unwrap();
-        std::fs::create_dir_all(bx.dir()).unwrap();
-        std::fs::write(bx.rootfs_img(), b"old").unwrap();
-        std::fs::write(bx.bake_stamp(), b"").unwrap();
+        std::fs::create_dir_all(bx.get_dir()).unwrap();
+        std::fs::write(bx.get_dir().join(state::ROOTFS_FILE), b"old").unwrap();
+        std::fs::write(bx.get_dir().join(state::BAKE_STAMP), b"").unwrap();
 
         let approved = ApprovedRecipe {
             bx: bx.clone(),
             cfg: yaml_serde::from_str::<crate::config::Config>("{}").unwrap(),
             new_pin: None,
         };
-        prepare_box(&approved, true).unwrap();
+        prepare_box(&approved, Rebuild::Yes).unwrap();
 
-        assert!(bx.rootfs_img().exists(), "--rebuild left no rootfs behind");
         assert!(
-            !bx.bake_stamp().exists(),
+            bx.get_dir().join(state::ROOTFS_FILE).exists(),
+            "--rebuild left no rootfs behind"
+        );
+        assert!(
+            !bx.get_dir().join(state::BAKE_STAMP).exists(),
             "the rebuilt box kept the old rootfs's bake stamp"
         );
     }
@@ -565,11 +583,11 @@ mod tests {
         // A person named the recipe and nothing suspects it: pinned in silence,
         // terminal or not, `--trust-recipe` or not.
         for trust_recipe in [false, true] {
-            for at_a_terminal in [false, true] {
+            for is_at_a_terminal in [false, true] {
                 assert_eq!(
-                    decide_pinning(&by_hand(trust_recipe), false, at_a_terminal),
+                    decide_pinning(&by_hand(trust_recipe), false, is_at_a_terminal),
                     PinAction::WithoutAsking,
-                    "trust_recipe={trust_recipe} at_a_terminal={at_a_terminal}"
+                    "trust_recipe={trust_recipe} is_at_a_terminal={is_at_a_terminal}"
                 );
             }
         }
@@ -584,11 +602,11 @@ mod tests {
             decide_pinning(&by_hand(false), true, false),
             PinAction::RefuseUnasked
         );
-        for at_a_terminal in [false, true] {
+        for is_at_a_terminal in [false, true] {
             assert_eq!(
-                decide_pinning(&by_hand(true), true, at_a_terminal),
+                decide_pinning(&by_hand(true), true, is_at_a_terminal),
                 PinAction::WarnAndPin,
-                "at_a_terminal={at_a_terminal}"
+                "is_at_a_terminal={is_at_a_terminal}"
             );
         }
 
@@ -602,11 +620,11 @@ mod tests {
             decide_pinning(&Approval::Offer, true, true),
             PinAction::Ask { default_yes: false }
         );
-        for suspect in [false, true] {
+        for is_suspect in [false, true] {
             assert_eq!(
-                decide_pinning(&Approval::Offer, suspect, false),
+                decide_pinning(&Approval::Offer, is_suspect, false),
                 PinAction::RefuseUnasked,
-                "suspect={suspect}"
+                "is_suspect={is_suspect}"
             );
         }
 
@@ -614,11 +632,11 @@ mod tests {
         // where the setup it stands for would, which is the whole of its
         // promise: a suspect recipe with nobody to ask is a `terra setup` that
         // fails, and a dry run reporting that one clean would be a lie.
-        for at_a_terminal in [false, true] {
+        for is_at_a_terminal in [false, true] {
             assert_eq!(
-                decide_pinning(&Approval::Reported, false, at_a_terminal),
+                decide_pinning(&Approval::Reported, false, is_at_a_terminal),
                 PinAction::ReportOnly,
-                "at_a_terminal={at_a_terminal}"
+                "is_at_a_terminal={is_at_a_terminal}"
             );
         }
         assert_eq!(
@@ -653,20 +671,23 @@ mod tests {
         std::fs::write(project.join("dev.yaml"), "hw:\n  cpus: 1\n").unwrap();
         run(&dry_run, Some("./dev.yaml"), &project, &project, false).unwrap();
         assert!(
-            !bx.rootfs_img().exists(),
+            !bx.get_dir().join(state::ROOTFS_FILE).exists(),
             "a dry run built the guest filesystem"
         );
-        assert!(!bx.recipe().exists(), "a dry run pinned the recipe");
+        assert!(
+            !bx.get_dir().join(state::RECIPE_FILE).exists(),
+            "a dry run pinned the recipe"
+        );
 
         // …and one it would refuse fails the dry run with the same complaint.
         // Written to the same file name, so the box is still `dev` and the
         // mount is of that box's own state rather than another box's.
-        std::fs::create_dir_all(bx.dir()).unwrap();
+        std::fs::create_dir_all(bx.get_dir()).unwrap();
         std::fs::write(
             project.join("dev.yaml"),
             format!(
                 "mounts:\n  - host: {}\n    guest: /work\n",
-                bx.dir().display()
+                bx.get_dir().display()
             ),
         )
         .unwrap();
@@ -676,7 +697,10 @@ mod tests {
                 .expect_err("a dry run must not pass a recipe `terra setup` would refuse")
         );
         assert!(err.contains("this box's own state"), "{err}");
-        assert!(!bx.recipe().exists(), "a refused dry run pinned the recipe");
+        assert!(
+            !bx.get_dir().join(state::RECIPE_FILE).exists(),
+            "a refused dry run pinned the recipe"
+        );
     }
 
     /// What a typed answer means, on the one question that decides whether

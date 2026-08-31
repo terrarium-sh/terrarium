@@ -1,11 +1,10 @@
-//! Booting a prepared box: the [`BootSpec`] one invocation resolves, the three
-//! ways it can run ([`start`]), and the background VM process it is handed to.
+//! Booting a prepared box into its VM process.
 
 use crate::cli::BootArgs;
-use crate::session::{self, SessionOutcome, detach_key_name, pump_session};
+use crate::session::{self, DETACH_KEY_NAME, SessionOutcome, pump_session};
 use crate::state::BoxRef;
 use crate::sys::POLL;
-use crate::{config, exit_code, sys};
+use crate::{config, sys};
 use anyhow::{Context, Result};
 use std::fs::File;
 use std::os::unix::net::UnixStream;
@@ -32,8 +31,7 @@ pub struct BootSpec {
     /// The box's project directory
     pub project_dir: PathBuf,
     pub root: bool,
-    pub mode: terra_shared::PlanMode,
-    /// run the VM runs in-process
+    pub mode: terra_shared::contract::PlanMode,
     pub foreground: bool,
 }
 
@@ -50,7 +48,7 @@ impl BootSpec {
             root: args.root,
             cfg,
             project_dir,
-            mode: terra_shared::PlanMode::Run,
+            mode: terra_shared::contract::PlanMode::Run,
             foreground: boot == BootMode::Foreground,
         }
     }
@@ -72,7 +70,7 @@ pub fn start(spec: &BootSpec, bx: &BoxRef, boot: BootMode, run_lock: File) -> Re
     match boot {
         BootMode::Detached => spawn_detached(bx, spec, run_lock),
         BootMode::DetachedWithJoin => run_attached(bx, spec, run_lock),
-        BootMode::Foreground => crate::vm::run(spec, bx, run_lock),
+        BootMode::Foreground => crate::vm::run(spec, bx, &run_lock),
     }
 }
 
@@ -84,9 +82,9 @@ pub fn start(spec: &BootSpec, bx: &BoxRef, boot: BootMode, run_lock: File) -> Re
 pub fn run_bake(cfg: &config::Config, bx: &BoxRef, lock: &File) -> Result<()> {
     let bake = BootSpec {
         cfg: cfg.clone(),
-        project_dir: bx.project_dir().to_path_buf(),
+        project_dir: bx.get_project_dir().to_path_buf(),
         root: false,
-        mode: terra_shared::PlanMode::Create,
+        mode: terra_shared::contract::PlanMode::Create,
         // never in-process
         foreground: false,
     };
@@ -99,8 +97,11 @@ pub fn run_bake(cfg: &config::Config, bx: &BoxRef, lock: &File) -> Result<()> {
     let mut child = spawn_vm_process(bx, &bake, lock)?;
     let status = child.wait().context("waiting for the on_create bake")?;
     if !status.success() {
-        eprint!("{}", log_tail(&bx.log()));
-        if let Some(signal) = sys::terminating_signal(status) {
+        eprint!(
+            "{}",
+            read_log_tail(&bx.get_dir().join(crate::state::LOG_FILE))
+        );
+        if let Some(signal) = sys::find_terminating_signal(status) {
             anyhow::bail!(
                 "the on_create bake was killed (signal {signal}) before it finished.\n\
                  NOTE: a bake has no graceful stop - e.g. `terra stop` or the OOM killer \
@@ -111,19 +112,24 @@ pub fn run_bake(cfg: &config::Config, bx: &BoxRef, lock: &File) -> Result<()> {
             "the on_create bake failed - fix the recipe, then `terra {} setup` re-runs \
              it (`--rebuild` for a clean slate); TERRA_DIAGNOSTICS=1 keeps the guest's \
              console in diagnostics.log",
-            bx.name()
+            bx.get_name()
         );
     }
-    crate::vm::image::staged_write(&bx.bake_stamp(), |_| Ok(()))
-        .with_context(|| format!("recording {}", bx.bake_stamp().display()))?;
+    crate::vm::image::staged_write(&bx.get_dir().join(crate::state::BAKE_STAMP), |_| Ok(()))
+        .with_context(|| {
+            format!(
+                "recording {}",
+                bx.get_dir().join(crate::state::BAKE_STAMP).display()
+            )
+        })?;
     Ok(())
 }
 
-pub fn run_detached_vm(dir: PathBuf, at_a_terminal: bool) -> Result<ExitCode> {
+pub fn run_detached_vm(dir: PathBuf, is_at_a_terminal: bool) -> Result<ExitCode> {
     // A real child's stdin is the parent's pipe; a person who typed `terra
     // __vm` at a shell would otherwise sit in a silent read of their terminal.
     anyhow::ensure!(
-        !at_a_terminal,
+        !is_at_a_terminal,
         "`terra {VM_PROCESS_FLAG_ARG}` is terra's own spelling of the background VM process - \
          it is spawned by a boot, not typed (`terra <box> -d` starts one)"
     );
@@ -133,11 +139,11 @@ pub fn run_detached_vm(dir: PathBuf, at_a_terminal: bool) -> Result<ExitCode> {
     // The box arrives already locked, on a descriptor the boot dup'd into
     // place: nothing is taken here, so there is no race to lose and no window
     // in which a second terra could boot over this box.
-    let lock = sys::claim_inherited_lock(&bx.pid_file()).context(
+    let lock = sys::claim_inherited_lock(&bx.get_dir().join(crate::state::PID_FILE)).context(
         "no run lock was handed to this process - a VM process is spawned by a boot, \
          not started by hand",
     )?;
-    crate::vm::run(&spec, &bx, lock)
+    crate::vm::run(&spec, &bx, &lock)
 }
 
 fn override_workload(cfg: &mut config::Config, command: &[String]) {
@@ -156,7 +162,7 @@ fn spawn_vm_process(bx: &BoxRef, spec: &BootSpec, lock: &File) -> Result<std::pr
     let json = serde_json::to_string(spec).context("encoding the boot for the VM process")?;
     let mut cmd = Command::new(exe);
     cmd.arg(VM_PROCESS_FLAG_ARG)
-        .arg(bx.dir())
+        .arg(bx.get_dir())
         .stdin(Stdio::piped())
         // The child writes its own log through the log facade; direct stdout/stderr
         // writers go nowhere unless TERRA_DIAGNOSTICS repoints them.
@@ -175,7 +181,7 @@ fn spawn_vm_process(bx: &BoxRef, spec: &BootSpec, lock: &File) -> Result<std::pr
 
 const REPLAY_LOG_TAIL_BYTES: u64 = 64 << 10; // 64 KiB
 
-fn log_tail(path: &Path) -> String {
+fn read_log_tail(path: &Path) -> String {
     use std::io::{Read, Seek, SeekFrom};
     // Plain open, symlinks followed: the log name is terra's own symlink to
     // the appender's current generation.
@@ -185,7 +191,11 @@ fn log_tail(path: &Path) -> String {
     let len = f.metadata().map(|m| m.len()).unwrap_or_default();
     let omitted = len.saturating_sub(REPLAY_LOG_TAIL_BYTES);
     let mut tail = Vec::new();
-    if f.seek(SeekFrom::Start(omitted)).is_err() || f.read_to_end(&mut tail).is_err() {
+    if f.seek(SeekFrom::Start(omitted)).is_err()
+        || f.take(REPLAY_LOG_TAIL_BYTES)
+            .read_to_end(&mut tail)
+            .is_err()
+    {
         return String::new();
     }
     // Lossy: the tail starts mid-stream, so it can open inside a character.
@@ -204,12 +214,15 @@ fn log_tail(path: &Path) -> String {
 /// decide: each caller's failure means something different.
 fn replay_logs(bx: &BoxRef, status: std::process::ExitStatus) {
     if !status.success() {
-        eprint!("{}", log_tail(&bx.log()));
+        eprint!(
+            "{}",
+            read_log_tail(&bx.get_dir().join(crate::state::LOG_FILE))
+        );
     }
 }
 
-fn vm_child_exit_byte(bx: &BoxRef, status: std::process::ExitStatus) -> u8 {
-    if let Some(signal) = sys::terminating_signal(status) {
+fn compute_vm_child_exit_byte(bx: &BoxRef, status: std::process::ExitStatus) -> u8 {
+    if let Some(signal) = sys::find_terminating_signal(status) {
         eprintln!("terra: {bx}'s VM was killed (signal {signal})");
         return crate::exit_status_byte(128 + signal);
     }
@@ -217,10 +230,10 @@ fn vm_child_exit_byte(bx: &BoxRef, status: std::process::ExitStatus) -> u8 {
 }
 
 fn claims_the_box(bx: &BoxRef, child_pid: u32) -> bool {
-    bx.vm_process().is_some_and(|vm| vm.pid == child_pid)
+    bx.read_vm_process().is_some_and(|vm| vm.pid == child_pid)
 }
 
-fn detached_exit_byte(bx: &BoxRef, child_pid: u32, status: std::process::ExitStatus) -> u8 {
+fn compute_detached_exit_byte(bx: &BoxRef, child_pid: u32, status: std::process::ExitStatus) -> u8 {
     replay_logs(bx, status);
     if claims_the_box(bx, child_pid) {
         return 0;
@@ -228,7 +241,7 @@ fn detached_exit_byte(bx: &BoxRef, child_pid: u32, status: std::process::ExitSta
     if !status.success() {
         eprintln!("terra: {bx} failed to start");
     }
-    vm_child_exit_byte(bx, status)
+    compute_vm_child_exit_byte(bx, status)
 }
 
 /// Spawn the VM and leave it - a child that exits before claiming the box is
@@ -242,7 +255,11 @@ fn spawn_detached(bx: &BoxRef, spec: &BootSpec, run_lock: File) -> Result<ExitCo
     let deadline = Instant::now() + DETACH_CONFIRM_TIMEOUT;
     loop {
         if let Some(status) = child.try_wait().context("checking on the VM")? {
-            return Ok(ExitCode::from(detached_exit_byte(bx, child.id(), status)));
+            return Ok(ExitCode::from(compute_detached_exit_byte(
+                bx,
+                child.id(),
+                status,
+            )));
         }
         if claims_the_box(bx, child.id()) || Instant::now() >= deadline {
             break;
@@ -257,7 +274,7 @@ fn spawn_detached(bx: &BoxRef, spec: &BootSpec, run_lock: File) -> Result<ExitCo
         eprintln!(
             "terra: started {bx} detached (pid {}); logs: {}",
             child.id(),
-            bx.logs_command()
+            bx.build_logs_command()
         );
     } else {
         eprintln!(
@@ -265,7 +282,7 @@ fn spawn_detached(bx: &BoxRef, spec: &BootSpec, run_lock: File) -> Result<ExitCo
              (pid {}); logs: {}",
             DETACH_CONFIRM_TIMEOUT.as_secs(),
             child.id(),
-            bx.logs_command()
+            bx.build_logs_command()
         );
     }
     Ok(ExitCode::SUCCESS)
@@ -282,13 +299,13 @@ fn join_session(bx: &BoxRef, stream: &UnixStream, owner: Option<&mut Child>) -> 
         SessionOutcome::Detached => {
             eprintln!(
                 "\nterra: detached - {bx} keeps running (`terra {}` rejoins)",
-                bx.name()
+                bx.get_name()
             );
             Ok(ExitCode::SUCCESS)
         }
         SessionOutcome::Exited(code) => {
             reap(owner);
-            Ok(exit_code(code))
+            Ok(ExitCode::from(crate::exit_status_byte(code)))
         }
         // Closed with no status: the VM was killed (`terra rm --force`) or
         // died. Reported as a failure, because a script cannot tell that from
@@ -304,13 +321,10 @@ fn join_session(bx: &BoxRef, stream: &UnixStream, owner: Option<&mut Child>) -> 
 /// session's first client - but it is still the child's parent, so the
 /// workload's exit code comes through unless you detach.
 fn run_attached(bx: &BoxRef, spec: &BootSpec, run_lock: File) -> Result<ExitCode> {
-    eprintln!(
-        "terra: starting {bx} - {} detaches, `terra stop` stops it",
-        detach_key_name()
-    );
+    eprintln!("terra: starting {bx} - {DETACH_KEY_NAME} detaches, `terra stop` stops it");
     // The sandbox's view is worth a line on the terminal - the boot banner
     // only lands in the log.
-    for line in crate::render::mount_lines(&spec.cfg) {
+    for line in crate::render::format_mount_lines(&spec.cfg) {
         eprintln!("{line}");
     }
     let mut child = spawn_vm_process(bx, spec, &run_lock)?;
@@ -318,14 +332,18 @@ fn run_attached(bx: &BoxRef, spec: &BootSpec, run_lock: File) -> Result<ExitCode
     // keep the box reading as running, VM or no VM.
     drop(run_lock);
 
-    let joined =
-        session::connect_to_agent(bx, terra_shared::AgentService::Session, "session", || {
+    let joined = session::connect_to_agent(
+        bx,
+        terra_shared::contract::AgentService::Session,
+        "session",
+        || {
             anyhow::ensure!(
                 child.try_wait().context("checking on the VM")?.is_none(),
                 "{bx} stopped before it had a session to join"
             );
             Ok(())
-        });
+        },
+    );
     let stream = match joined {
         Ok(stream) => stream,
         Err(e) => {
@@ -335,7 +353,7 @@ fn run_attached(bx: &BoxRef, spec: &BootSpec, run_lock: File) -> Result<ExitCode
                 return Err(e);
             };
             replay_logs(bx, status);
-            return Ok(ExitCode::from(vm_child_exit_byte(bx, status)));
+            return Ok(ExitCode::from(compute_vm_child_exit_byte(bx, status)));
         }
     };
 
@@ -347,10 +365,12 @@ fn run_attached(bx: &BoxRef, spec: &BootSpec, run_lock: File) -> Result<ExitCode
 /// socket's word for it: a box can hold its lock long before there is anything
 /// to join.
 pub fn attach(bx: &BoxRef) -> Result<ExitCode> {
-    let stream =
-        session::connect_to_agent(bx, terra_shared::AgentService::Session, "session", || {
-            session::still_serving(bx, "stopped before it had a session to join")
-        })?;
+    let stream = session::connect_to_agent(
+        bx,
+        terra_shared::contract::AgentService::Session,
+        "session",
+        || session::still_serving(bx, "stopped before it had a session to join"),
+    )?;
     join_session(bx, &stream, None)
 }
 
@@ -365,17 +385,17 @@ mod tests {
     #[test]
     fn a_replayed_log_is_bounded_and_says_what_it_left_out() {
         let dir = tempfile::tempdir().unwrap();
-        let log = dir.path().join("terra.log");
+        let log = dir.path().join(crate::state::LOG_FILE);
 
         // A short log comes back whole and unannotated.
         std::fs::write(&log, b"the only line\n").unwrap();
-        assert_eq!(log_tail(&log), "the only line\n");
+        assert_eq!(read_log_tail(&log), "the only line\n");
 
         // A long one keeps its ending - which is where a failure reports.
         let mut content = vec![b'Q'; usize::try_from(REPLAY_LOG_TAIL_BYTES).unwrap() * 2];
         content.extend_from_slice(b"hook `apk add nope` failed\n");
         std::fs::write(&log, &content).unwrap();
-        let tail = log_tail(&log);
+        let tail = read_log_tail(&log);
         assert!(tail.ends_with("hook `apk add nope` failed\n"), "{tail}");
         assert!(
             u64::try_from(tail.len()).unwrap() < REPLAY_LOG_TAIL_BYTES + 200,
@@ -388,7 +408,7 @@ mod tests {
 
         // A log that is not there replays as nothing, not as an error: the
         // caller is already reporting something of its own.
-        assert!(log_tail(&dir.path().join("absent.log")).is_empty());
+        assert!(read_log_tail(&dir.path().join("absent.log")).is_empty());
     }
 
     /// A detached child that exited *without ever claiming the box* never
@@ -405,7 +425,7 @@ mod tests {
     fn a_detached_child_that_never_claimed_the_box_is_a_failed_start() {
         let dir = tempfile::tempdir().unwrap();
         let bx = BoxRef::from_state_dir(dir.path().join("dev"), dir.path());
-        std::fs::create_dir_all(bx.dir()).unwrap();
+        std::fs::create_dir_all(bx.get_dir()).unwrap();
         let exited_with = |code: i32| {
             std::process::Command::new("/bin/sh")
                 .arg("-c")
@@ -415,8 +435,8 @@ mod tests {
         };
 
         // Never claimed: the child's own status, failure and all.
-        assert_eq!(detached_exit_byte(&bx, 4242, exited_with(3)), 3);
-        assert_eq!(detached_exit_byte(&bx, 4242, exited_with(0)), 0);
+        assert_eq!(compute_detached_exit_byte(&bx, 4242, exited_with(3)), 3);
+        assert_eq!(compute_detached_exit_byte(&bx, 4242, exited_with(0)), 0);
 
         // A child a host signal took has no code of its own: the shell's
         // 128+signal spelling, not a bare 1 that reads as the workload's.
@@ -425,14 +445,15 @@ mod tests {
             .arg("kill -KILL $$")
             .status()
             .unwrap();
-        assert_eq!(detached_exit_byte(&bx, 4242, killed), 128 + 9);
+        assert_eq!(compute_detached_exit_byte(&bx, 4242, killed), 128 + 9);
 
         // Claimed, then finished - a fast workload, reported as started.
-        bx.publish_pid(4242, false);
-        assert_eq!(detached_exit_byte(&bx, 4242, exited_with(3)), 0);
+        let lock = bx.lock_run().unwrap();
+        bx.publish_pid(&lock, 4242, false);
+        assert_eq!(compute_detached_exit_byte(&bx, 4242, exited_with(3)), 0);
         // …and a *different* pid in the file is somebody else's box, not this
         // child's claim.
-        assert_eq!(detached_exit_byte(&bx, 5353, exited_with(3)), 3);
+        assert_eq!(compute_detached_exit_byte(&bx, 5353, exited_with(3)), 3);
     }
 
     /// The child is handed a boot and resolves nothing of its own, so what

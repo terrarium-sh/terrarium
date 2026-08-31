@@ -9,7 +9,6 @@
 pub mod cli;
 mod cmd;
 pub mod config;
-mod host;
 mod logs;
 mod name;
 mod policy;
@@ -32,35 +31,29 @@ pub(crate) fn exit_status_byte(code: i32) -> u8 {
     u8::try_from(code).unwrap_or(1)
 }
 
-/// A guest's or a child's exit status as this process's own.
-#[must_use]
-pub(crate) fn exit_code(code: i32) -> ExitCode {
-    ExitCode::from(exit_status_byte(code))
-}
-
 pub fn run() -> Result<ExitCode> {
     sys::restrict_new_files();
     sys::scrub_smolvm_gateway_env();
 
-    let at_a_terminal = sys::at_a_terminal();
+    let is_at_a_terminal = sys::is_at_a_terminal();
 
     // The background VM process (`terra __vm <dir>`): its parent settled the
     // box, the boot and the project directory, so the child re-resolves nothing
     // - not even its own cwd - and never reaches clap.
     if let Some(dir) = vm::boot::get_vm_process_box_dir() {
-        return vm::boot::run_detached_vm(dir, at_a_terminal);
+        return vm::boot::run_detached_vm(dir, is_at_a_terminal);
     }
 
-    let cli = cli::parse_or_exit();
+    let args = cli::parse_or_exit();
     let cwd = std::env::current_dir().context("could not read current directory")?;
-    let project_dir = sys::absolute(cli.project.as_deref().unwrap_or(&cwd), &cwd)?;
+    let project_dir = sys::resolve_absolute_path(args.project.as_deref().unwrap_or(&cwd), &cwd)?;
     // The box is the command line's first word for every verb that takes one,
     // so it is read here rather than eight times over.
-    let name = cli.name.as_deref();
-    match &cli.cmd {
-        None => cmd::start::run(name, &cli.boot, &project_dir, &cwd, at_a_terminal),
-        Some(Cmd::Setup(a)) => cmd::setup::run(a, name, &project_dir, &cwd, at_a_terminal),
-        Some(Cmd::Exec(a)) => cmd::exec::run(a, name, &project_dir, at_a_terminal),
+    let name = args.name.as_deref();
+    match &args.cmd {
+        None => cmd::start::run(name, &args.boot, &project_dir, &cwd, is_at_a_terminal),
+        Some(Cmd::Setup(a)) => cmd::setup::run(a, name, &project_dir, &cwd, is_at_a_terminal),
+        Some(Cmd::Exec(a)) => cmd::exec::run(a, name, &project_dir, is_at_a_terminal),
         Some(Cmd::Put(a)) => cmd::put_get::run(a, Direction::IntoBox, name, &project_dir),
         Some(Cmd::Get(a)) => cmd::put_get::run(a, Direction::OutOfBox, name, &project_dir),
         Some(Cmd::Stop(a)) => cmd::stop::run(a, name, &project_dir),

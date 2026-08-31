@@ -11,20 +11,20 @@ use std::process::{Command, Output};
 
 /// Run terra from wherever the test process is, for cases that address a box by
 /// `--project` and never touch `~/.terra`.
-fn terra(args: &[&str]) -> Output {
+fn run_terra_command(args: &[&str]) -> Output {
     run_terra(None, &[], args)
 }
 
 /// Run in an isolated box directory, with `HOME` pointed somewhere empty so the
 /// user's real `~/.terra` never takes part.
-fn terra_in(dir: &std::path::Path, home: &std::path::Path, args: &[&str]) -> Output {
+fn run_terra_in(dir: &std::path::Path, home: &std::path::Path, args: &[&str]) -> Output {
     run_terra(Some(dir), &[("HOME", home.as_os_str())], args)
 }
 
 /// The state directory of the one box under `~/.terra/box` - the layout is
 /// `box/<hashed project>/<box name>/`, and each test gets its own empty `HOME`,
 /// so "the one" is well defined.
-fn only_box(home: &std::path::Path) -> std::path::PathBuf {
+fn find_only_box(home: &std::path::Path) -> std::path::PathBuf {
     let dirs = |p: &std::path::Path| -> Vec<std::path::PathBuf> {
         std::fs::read_dir(p)
             .expect("no ~/.terra/box")
@@ -58,7 +58,7 @@ fn run_terra(
 
 #[test]
 fn help_lists_the_lifecycle_verbs() {
-    let out = terra(&["--help"]);
+    let out = run_terra_command(&["--help"]);
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("Launch isolated microVMs"));
@@ -87,7 +87,7 @@ fn setup_pins_a_recipe_and_the_box_then_answers_from_it() {
     let home = tempfile::tempdir().unwrap();
 
     std::fs::write(dir.path().join("b.yaml"), "hw:\n  cpus: 1\n").unwrap();
-    let first = terra_in(dir.path(), home.path(), &["./b.yaml", "setup"]);
+    let first = run_terra_in(dir.path(), home.path(), &["./b.yaml", "setup"]);
     assert!(
         first.status.success(),
         "{}",
@@ -95,7 +95,7 @@ fn setup_pins_a_recipe_and_the_box_then_answers_from_it() {
     );
     // The box takes the file's stem for its name, and its files go under
     // ~/.terra/box, not into the directory it is a box of.
-    let state = only_box(home.path());
+    let state = find_only_box(home.path());
     assert_eq!(state.file_name().unwrap(), "b");
     let recipe = state.join("recipe.yaml");
     assert!(recipe.exists(), "setup left no recipe");
@@ -109,7 +109,7 @@ fn setup_pins_a_recipe_and_the_box_then_answers_from_it() {
     // edit made to that copy is what answers.
     let marker = "env:\n  KEPT_BY_THE_BOX: \"1\"\n";
     std::fs::write(&recipe, marker).unwrap();
-    let second = terra_in(dir.path(), home.path(), &["b", "setup"]);
+    let second = run_terra_in(dir.path(), home.path(), &["b", "setup"]);
     assert!(
         second.status.success(),
         "{}",
@@ -128,33 +128,33 @@ fn setup_adopts_recipe_edits_and_start_does_not() {
     let other = dir.path().join("other.yaml");
     std::fs::write(&other, "hw:\n  cpus: 3\n").unwrap();
 
-    let made = terra_in(dir.path(), home.path(), &["./other.yaml", "setup"]);
+    let made = run_terra_in(dir.path(), home.path(), &["./other.yaml", "setup"]);
     assert!(
         made.status.success(),
         "{}",
         String::from_utf8_lossy(&made.stderr)
     );
     // The box is named after the file's stem.
-    let state = only_box(home.path());
+    let state = find_only_box(home.path());
     assert_eq!(state.file_name().unwrap(), "other");
 
     // The source changes; the pinned copy does not, and `show` (which answers
     // for `start`) still sees the old value.
     std::fs::write(&other, "hw:\n  cpus: 5\n").unwrap();
-    let shown = terra_in(dir.path(), home.path(), &["other", "show"]);
+    let shown = run_terra_in(dir.path(), home.path(), &["other", "show"]);
     assert!(
         String::from_utf8_lossy(&shown.stdout).contains("cpus: 3"),
         "start/show should answer from the pinned copy"
     );
 
     // `setup` is the adopt step, and says so.
-    let adopted = terra_in(dir.path(), home.path(), &["./other.yaml", "setup"]);
+    let adopted = run_terra_in(dir.path(), home.path(), &["./other.yaml", "setup"]);
     assert!(adopted.status.success());
     assert!(String::from_utf8_lossy(&adopted.stderr).contains("recipe updated"));
     let recipe = std::fs::read_to_string(state.join("recipe.yaml")).unwrap();
     assert!(recipe.contains("cpus: 5"));
 
-    let again = terra_in(dir.path(), home.path(), &["./other.yaml", "setup"]);
+    let again = run_terra_in(dir.path(), home.path(), &["./other.yaml", "setup"]);
     assert!(again.status.success());
     assert!(!String::from_utf8_lossy(&again.stderr).contains("recipe updated"));
 }
@@ -173,7 +173,7 @@ fn a_box_can_share_the_directory_it_is_a_box_of() {
     let recipe = dir.path().join("sandbox.yaml");
     std::fs::write(&recipe, "mounts:\n  - host: .\n    guest: /work\n").unwrap();
 
-    let out = terra_in(dir.path(), home.path(), &["./sandbox.yaml", "setup"]);
+    let out = run_terra_in(dir.path(), home.path(), &["./sandbox.yaml", "setup"]);
     assert!(
         out.status.success(),
         "{}",
@@ -185,10 +185,10 @@ fn a_box_can_share_the_directory_it_is_a_box_of() {
     );
 
     // …and it says where its files went, since they are not beside it.
-    let listed = terra_in(dir.path(), home.path(), &["ls"]);
+    let listed = run_terra_in(dir.path(), home.path(), &["ls"]);
     let stdout = String::from_utf8_lossy(&listed.stdout);
     assert!(
-        stdout.contains(&format!("files: {}", only_box(home.path()).display())),
+        stdout.contains(&format!("files: {}", find_only_box(home.path()).display())),
         "{stdout}"
     );
 
@@ -201,7 +201,7 @@ fn a_box_can_share_the_directory_it_is_a_box_of() {
         "mounts:\n  - host: .\n    guest: /work\nhw:\n  cpus: 4\nnetwork:\n  mode: unrestricted-public\n",
     )
     .unwrap();
-    let refused = terra_in(dir.path(), home.path(), &["./sandbox.yaml", "setup"]);
+    let refused = run_terra_in(dir.path(), home.path(), &["./sandbox.yaml", "setup"]);
     assert_eq!(refused.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&refused.stderr);
     assert!(stderr.contains("may be the author"), "{stderr}");
@@ -220,7 +220,7 @@ fn a_box_can_share_the_directory_it_is_a_box_of() {
     // `--rebuild` rebuilds the filesystem and says nothing about trust: it must
     // NOT be a way past this. The two were one flag once, which meant accepting
     // your own edit cost you the box - a price people learn to route around.
-    let forced = terra_in(
+    let forced = run_terra_in(
         dir.path(),
         home.path(),
         &["./sandbox.yaml", "setup", "--rebuild"],
@@ -232,7 +232,7 @@ fn a_box_can_share_the_directory_it_is_a_box_of() {
     );
 
     // …and --trust-recipe pins it, out loud, without touching the filesystem.
-    let trusted = terra_in(
+    let trusted = run_terra_in(
         dir.path(),
         home.path(),
         &["./sandbox.yaml", "setup", "--trust-recipe"],
@@ -267,7 +267,7 @@ fn a_recipe_a_sibling_box_could_have_written_is_not_pinned_silently() {
         "mounts:\n  - host: .\n    guest: /work\n",
     )
     .unwrap();
-    let dev = terra_in(dir.path(), home.path(), &["./dev.yaml", "setup"]);
+    let dev = run_terra_in(dir.path(), home.path(), &["./dev.yaml", "setup"]);
     assert!(
         dev.status.success(),
         "{}",
@@ -293,7 +293,7 @@ fn a_recipe_a_sibling_box_could_have_written_is_not_pinned_silently() {
 
     // `terra test` must not pin it. There is no terminal here, so there is
     // nobody to offer a setup to - and a script never pins a policy.
-    let started = terra_in(dir.path(), home.path(), &["test"]);
+    let started = run_terra_in(dir.path(), home.path(), &["test"]);
     assert_eq!(started.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&started.stderr);
     assert!(stderr.contains("would build it"), "{stderr}");
@@ -302,7 +302,7 @@ fn a_recipe_a_sibling_box_could_have_written_is_not_pinned_silently() {
     // …and `terra setup test`, which does read it, asks first - here, with no
     // terminal, refuses - naming the share that could have authored it and what
     // the recipe would grant.
-    let setup = terra_in(dir.path(), home.path(), &["test", "setup"]);
+    let setup = run_terra_in(dir.path(), home.path(), &["test", "setup"]);
     assert_eq!(setup.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&setup.stderr);
     assert!(stderr.contains("may be the author"), "{stderr}");
@@ -336,7 +336,7 @@ fn a_directory_can_hold_several_named_boxes() {
     std::fs::write(dir.path().join("ci.yaml"), "hw:\n  cpus: 2\n").unwrap();
 
     for r in ["./dev.yaml", "./ci.yaml"] {
-        let out = terra_in(dir.path(), home.path(), &[r, "setup"]);
+        let out = run_terra_in(dir.path(), home.path(), &[r, "setup"]);
         assert!(
             out.status.success(),
             "{}",
@@ -345,25 +345,25 @@ fn a_directory_can_hold_several_named_boxes() {
     }
 
     // A bare command cannot mean both.
-    let ambiguous = terra_in(dir.path(), home.path(), &["stop"]);
+    let ambiguous = run_terra_in(dir.path(), home.path(), &["stop"]);
     assert_eq!(ambiguous.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&ambiguous.stderr);
     assert!(stderr.contains("several boxes"), "{stderr}");
     assert!(stderr.contains("ci") && stderr.contains("dev"), "{stderr}");
 
     // A named one addresses exactly that box.
-    let stop = terra_in(dir.path(), home.path(), &["ci", "stop"]);
+    let stop = run_terra_in(dir.path(), home.path(), &["ci", "stop"]);
     assert!(stop.status.success());
     assert!(String::from_utf8_lossy(&stop.stderr).contains("already stopped"));
 
     // A bare `ls` lists them rather than refusing, and names them by name:
     // the directory is the one thing they have in common.
-    let listed = terra_in(dir.path(), home.path(), &["ls"]);
+    let listed = run_terra_in(dir.path(), home.path(), &["ls"]);
     let stdout = String::from_utf8_lossy(&listed.stdout);
     assert!(stdout.contains("dev") && stdout.contains("ci"), "{stdout}");
 
     // `--all` spans directories, so there each line carries its own.
-    let everywhere = terra_in(dir.path(), home.path(), &["ls", "--all"]);
+    let everywhere = run_terra_in(dir.path(), home.path(), &["ls", "--all"]);
     let stdout = String::from_utf8_lossy(&everywhere.stdout);
     assert!(
         stdout.contains("(dev)") && stdout.contains("(ci)"),
@@ -371,7 +371,7 @@ fn a_directory_can_hold_several_named_boxes() {
     );
     // `ls` takes no box names - it lists; the per-box question is `show`'s.
     assert_eq!(
-        terra_in(dir.path(), home.path(), &["ls", "--all", "dev"])
+        run_terra_in(dir.path(), home.path(), &["ls", "--all", "dev"])
             .status
             .code(),
         Some(2)
@@ -396,27 +396,27 @@ fn the_manifest_names_the_projects_boxes() {
 
     // With several declared and none set up, the bare form names them rather
     // than guessing - without reading any of them.
-    let bare = terra_in(dir.path(), home.path(), &[]);
+    let bare = run_terra_in(dir.path(), home.path(), &[]);
     assert_eq!(bare.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&bare.stderr);
     assert!(stderr.contains("none is set up yet"), "{stderr}");
     assert!(stderr.contains("dev") && stderr.contains("ci"), "{stderr}");
 
     // A manifest name resolves through its reference and names the box.
-    let made = terra_in(dir.path(), home.path(), &["dev", "setup"]);
+    let made = run_terra_in(dir.path(), home.path(), &["dev", "setup"]);
     assert!(
         made.status.success(),
         "{}",
         String::from_utf8_lossy(&made.stderr)
     );
-    let state = only_box(home.path());
+    let state = find_only_box(home.path());
     assert_eq!(state.file_name().unwrap(), "dev");
     let pinned = std::fs::read_to_string(state.join("recipe.yaml")).unwrap();
     assert!(pinned.contains("cpus: 3"), "{pinned}");
 
     // A bare word in neither the manifest nor on disk: a recipe is only ever
     // named by path, and the error says so.
-    let missing = terra_in(dir.path(), home.path(), &["nope", "setup"]);
+    let missing = run_terra_in(dir.path(), home.path(), &["nope", "setup"]);
     assert_eq!(missing.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&missing.stderr);
     assert!(stderr.contains("no recipe for 'nope'"), "{stderr}");
@@ -428,7 +428,7 @@ fn the_manifest_names_the_projects_boxes() {
         "boxes:\n  dev: ./gone.yaml\n",
     )
     .unwrap();
-    let dangling = terra_in(dir.path(), home.path(), &["dev", "setup", "--rebuild"]);
+    let dangling = run_terra_in(dir.path(), home.path(), &["dev", "setup", "--rebuild"]);
     assert_eq!(dangling.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&dangling.stderr);
     assert!(stderr.contains("terra.yaml"), "{stderr}");
@@ -446,7 +446,7 @@ fn ls_all_lists_boxes_by_the_directory_they_belong_to() {
 
     // On stderr: the listing is what a caller redirects, and this is a hint
     // about there being none rather than a line of it.
-    let empty = terra_in(one.path(), home.path(), &["ls", "--all"]);
+    let empty = run_terra_in(one.path(), home.path(), &["ls", "--all"]);
     assert!(
         String::from_utf8_lossy(&empty.stderr).contains("no boxes on this machine"),
         "{}",
@@ -459,14 +459,14 @@ fn ls_all_lists_boxes_by_the_directory_they_belong_to() {
     // call "stopped".
     for d in [one.path(), two.path()] {
         std::fs::write(d.join("b.yaml"), "hw:\n  cpus: 1\n").unwrap();
-        let out = terra_in(d, home.path(), &["./b.yaml", "setup"]);
+        let out = run_terra_in(d, home.path(), &["./b.yaml", "setup"]);
         assert!(
             out.status.success(),
             "{}",
             String::from_utf8_lossy(&out.stderr)
         );
     }
-    let out = terra_in(one.path(), home.path(), &["ls", "--all"]);
+    let out = run_terra_in(one.path(), home.path(), &["ls", "--all"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     for dir in [one.path(), two.path()] {
         assert!(
@@ -482,7 +482,7 @@ fn ls_all_lists_boxes_by_the_directory_they_belong_to() {
     // being quietly dropped from the listing - it still owns a filesystem.
     let gone = two.path().to_path_buf();
     two.close().unwrap();
-    let out = terra_in(one.path(), home.path(), &["ps", "--all"]);
+    let out = run_terra_in(one.path(), home.path(), &["ps", "--all"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains(&format!("gone         {} (b)", gone.display())),
@@ -491,9 +491,9 @@ fn ls_all_lists_boxes_by_the_directory_they_belong_to() {
 
     // `rm --purge` on the last box of a directory clears its project entry
     // too: nothing left for `ls` to list forever.
-    let removed = terra_in(one.path(), home.path(), &["rm", "--purge"]);
+    let removed = run_terra_in(one.path(), home.path(), &["rm", "--purge"]);
     assert!(removed.status.success());
-    let out = terra_in(one.path(), home.path(), &["ls", "--all"]);
+    let out = run_terra_in(one.path(), home.path(), &["ls", "--all"]);
     assert!(
         !String::from_utf8_lossy(&out.stdout).contains(&one.path().display().to_string()),
         "rm --purge left the project listed"
@@ -509,18 +509,18 @@ fn exec_on_a_box_that_is_not_running_says_so() {
     let home = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("dev.yaml"), "hw:\n  cpus: 1\n").unwrap();
     assert!(
-        terra_in(dir.path(), home.path(), &["./dev.yaml", "setup"])
+        run_terra_in(dir.path(), home.path(), &["./dev.yaml", "setup"])
             .status
             .success()
     );
 
-    let out = terra_in(dir.path(), home.path(), &["dev", "exec", "--", "id", "-u"]);
+    let out = run_terra_in(dir.path(), home.path(), &["dev", "exec", "--", "id", "-u"]);
     assert_eq!(out.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("is not running"), "{stderr}");
 
     // …and `--root` reaches the same check rather than a different path.
-    let rooted = terra_in(
+    let rooted = run_terra_in(
         dir.path(),
         home.path(),
         &["dev", "exec", "--root", "--", "id", "-u"],
@@ -529,7 +529,7 @@ fn exec_on_a_box_that_is_not_running_says_so() {
 
     // A command is required: with nothing after `--` there is nothing to run.
     assert_eq!(
-        terra_in(dir.path(), home.path(), &["dev", "exec"])
+        run_terra_in(dir.path(), home.path(), &["dev", "exec"])
             .status
             .code(),
         Some(2),
@@ -561,13 +561,13 @@ fn a_command_line_terra_refuses_exits_as_a_usage_error() {
         &["--no-such-flag"][..],
         &["ls", "--all", "dev"][..],
     ] {
-        let out = terra_in(dir.path(), home.path(), args);
+        let out = run_terra_in(dir.path(), home.path(), args);
         assert_eq!(out.status.code(), Some(2), "{args:?}");
     }
 
     // The refusals still say what to do instead - an exit code is not an
     // explanation.
-    let flagged = terra_in(dir.path(), home.path(), &["dev", "-d", "stop"]);
+    let flagged = run_terra_in(dir.path(), home.path(), &["dev", "-d", "stop"]);
     let stderr = String::from_utf8_lossy(&flagged.stderr);
     assert!(stderr.contains("boot flags"), "{stderr}");
     assert!(
@@ -575,7 +575,7 @@ fn a_command_line_terra_refuses_exits_as_a_usage_error() {
         "the way to do it: {stderr}"
     );
 
-    let boxed = terra_in(dir.path(), home.path(), &["dev", "ls"]);
+    let boxed = run_terra_in(dir.path(), home.path(), &["dev", "ls"]);
     let stderr = String::from_utf8_lossy(&boxed.stderr);
     assert!(stderr.contains("terra ls"), "{stderr}");
 }
@@ -590,12 +590,12 @@ fn a_bare_start_without_a_terminal_names_both_ways_to_run() {
     let home = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("dev.yaml"), "hw:\n  cpus: 1\n").unwrap();
     assert!(
-        terra_in(dir.path(), home.path(), &["./dev.yaml", "setup"])
+        run_terra_in(dir.path(), home.path(), &["./dev.yaml", "setup"])
             .status
             .success()
     );
 
-    let out = terra_in(dir.path(), home.path(), &["dev"]);
+    let out = run_terra_in(dir.path(), home.path(), &["dev"]);
     assert_eq!(out.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("-d"), "{stderr}");
@@ -622,7 +622,7 @@ fn every_verb_that_needs_a_box_says_when_there_is_none() {
         &["typo", "logs"][..],
         &["typo", "rm"][..],
     ] {
-        let out = terra_in(dir.path(), home.path(), args);
+        let out = run_terra_in(dir.path(), home.path(), args);
         assert_eq!(out.status.code(), Some(1), "{args:?}");
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(stderr.contains("no box 'typo'"), "{args:?}: {stderr}");
@@ -640,15 +640,15 @@ fn a_message_about_a_box_names_the_box() {
     let home = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("dev.yaml"), "hw:\n  cpus: 1\n").unwrap();
     assert!(
-        terra_in(dir.path(), home.path(), &["./dev.yaml", "setup"])
+        run_terra_in(dir.path(), home.path(), &["./dev.yaml", "setup"])
             .status
             .success()
     );
     let named = format!("dev ({})", dir.path().display());
-    let stopped = terra_in(dir.path(), home.path(), &["dev", "stop"]);
+    let stopped = run_terra_in(dir.path(), home.path(), &["dev", "stop"]);
     let stderr = String::from_utf8_lossy(&stopped.stderr);
     assert!(stderr.contains(&named), "{stderr}");
-    let exec = terra_in(dir.path(), home.path(), &["dev", "exec", "--", "ls"]);
+    let exec = run_terra_in(dir.path(), home.path(), &["dev", "exec", "--", "ls"]);
     let stderr = String::from_utf8_lossy(&exec.stderr);
     assert!(stderr.contains(&named), "{stderr}");
 }
@@ -660,7 +660,7 @@ fn a_message_about_a_box_names_the_box() {
 fn the_bare_form_without_a_recipe_says_how_to_set_one_up() {
     let dir = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
-    let out = terra_in(dir.path(), home.path(), &[]);
+    let out = run_terra_in(dir.path(), home.path(), &[]);
     assert_eq!(out.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("no box"), "{stderr}");
@@ -677,26 +677,26 @@ fn a_terra_word_cannot_name_a_box() {
     let home = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("logs.yaml"), "hw:\n  cpus: 1\n").unwrap();
 
-    let refused = terra_in(dir.path(), home.path(), &["./logs.yaml", "setup"]);
+    let refused = run_terra_in(dir.path(), home.path(), &["./logs.yaml", "setup"]);
     assert_eq!(refused.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&refused.stderr);
     assert!(stderr.contains("cannot name a box"), "{stderr}");
 
     // The bare `terra logs` is the log viewer, as it always was.
-    let shadowed = terra_in(dir.path(), home.path(), &["logs"]);
+    let shadowed = run_terra_in(dir.path(), home.path(), &["logs"]);
     assert!(!shadowed.status.success());
     let stderr = String::from_utf8_lossy(&shadowed.stderr);
     assert!(stderr.contains("no box"), "{stderr}");
 
     // …and the names people actually give sandboxes still work.
     std::fs::write(dir.path().join("dev.yaml"), "hw:\n  cpus: 1\n").unwrap();
-    let ok = terra_in(dir.path(), home.path(), &["./dev.yaml", "setup"]);
+    let ok = run_terra_in(dir.path(), home.path(), &["./dev.yaml", "setup"]);
     assert!(
         ok.status.success(),
         "{}",
         String::from_utf8_lossy(&ok.stderr)
     );
-    assert_eq!(only_box(home.path()).file_name().unwrap(), "dev");
+    assert_eq!(find_only_box(home.path()).file_name().unwrap(), "dev");
 }
 
 /// One line per box - its state and its name; the recipe's details are `show`'s
@@ -710,7 +710,7 @@ fn ls_reports_a_state_line_per_box() {
     // No boxes and nothing declared: says so, and is not an error. On stderr,
     // because the listing is what a caller redirects and this is a hint about
     // there being none rather than a line of it.
-    let empty = terra_in(dir.path(), home.path(), &["ls"]);
+    let empty = run_terra_in(dir.path(), home.path(), &["ls"]);
     assert!(empty.status.success());
     let stderr = String::from_utf8_lossy(&empty.stderr);
     assert!(stderr.contains("no boxes in"), "{stderr}");
@@ -725,34 +725,34 @@ fn ls_reports_a_state_line_per_box() {
     // No `files:` line: there are no files to point at yet.
     std::fs::write(dir.path().join("terra.yaml"), "boxes:\n  b: ./b.yaml\n").unwrap();
     std::fs::write(dir.path().join("b.yaml"), "hw:\n  cpus: 1\n").unwrap();
-    let declared = terra_in(dir.path(), home.path(), &["ls"]);
+    let declared = run_terra_in(dir.path(), home.path(), &["ls"]);
     let stdout = String::from_utf8_lossy(&declared.stdout);
     assert!(stdout.contains("not-created"), "{stdout}");
     assert!(stdout.contains('b'), "{stdout}");
     assert!(!stdout.contains("files:"), "{stdout}");
 
     // Set up: created, not running.
-    let setup = terra_in(dir.path(), home.path(), &["b", "setup"]);
+    let setup = run_terra_in(dir.path(), home.path(), &["b", "setup"]);
     assert!(
         setup.status.success(),
         "{}",
         String::from_utf8_lossy(&setup.stderr)
     );
-    let created = terra_in(dir.path(), home.path(), &["ls"]);
+    let created = run_terra_in(dir.path(), home.path(), &["ls"]);
     let stdout = String::from_utf8_lossy(&created.stdout);
     assert!(stdout.contains("stopped"), "{stdout}");
     assert!(!stdout.contains("not-created"), "{stdout}");
     // A box on disk says where its files are - the state dir's name is a hash,
     // so nothing else can.
     assert!(
-        stdout.contains(&format!("files: {}", only_box(home.path()).display())),
+        stdout.contains(&format!("files: {}", find_only_box(home.path()).display())),
         "{stdout}"
     );
 
     // `--tsv` is the format scripts (the boot suite's runner included)
     // may rely on: one tab-separated line per box - state, name, directory,
     // files - and nothing else. The human listing above stays free to change.
-    let tsv = terra_in(dir.path(), home.path(), &["ls", "--tsv"]);
+    let tsv = run_terra_in(dir.path(), home.path(), &["ls", "--tsv"]);
     assert!(tsv.status.success());
     let stdout = String::from_utf8_lossy(&tsv.stdout);
     assert_eq!(
@@ -760,14 +760,14 @@ fn ls_reports_a_state_line_per_box() {
         format!(
             "stopped\tb\t{}\t{}",
             dir.path().display(),
-            only_box(home.path()).display()
+            find_only_box(home.path()).display()
         ),
         "{stdout}"
     );
 
     // An empty directory is empty output, not prose a script would trip over.
     let none = tempfile::tempdir().unwrap();
-    let empty = terra_in(none.path(), home.path(), &["ls", "--tsv"]);
+    let empty = run_terra_in(none.path(), home.path(), &["ls", "--tsv"]);
     assert!(empty.status.success());
     assert!(empty.stdout.is_empty(), "{:?}", empty.stdout);
 }
@@ -782,7 +782,7 @@ fn a_missing_recipe_path_is_an_error_even_when_the_box_exists() {
     let home = tempfile::tempdir().unwrap();
     let recipe = dir.path().join("ci.yaml");
     std::fs::write(&recipe, "hw:\n  cpus: 1\n").unwrap();
-    let first = terra_in(dir.path(), home.path(), &["./ci.yaml", "setup"]);
+    let first = run_terra_in(dir.path(), home.path(), &["./ci.yaml", "setup"]);
     assert!(
         first.status.success(),
         "{}",
@@ -790,12 +790,12 @@ fn a_missing_recipe_path_is_an_error_even_when_the_box_exists() {
     );
 
     std::fs::remove_file(&recipe).unwrap();
-    let gone = terra_in(dir.path(), home.path(), &["./ci.yaml", "setup"]);
+    let gone = run_terra_in(dir.path(), home.path(), &["./ci.yaml", "setup"]);
     assert_eq!(gone.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&gone.stderr);
     assert!(stderr.contains("not found"), "{stderr}");
 
-    let by_name = terra_in(dir.path(), home.path(), &["ci", "setup"]);
+    let by_name = run_terra_in(dir.path(), home.path(), &["ci", "setup"]);
     assert!(
         by_name.status.success(),
         "{}",
@@ -818,7 +818,7 @@ fn show_prints_the_resolved_recipe_without_env_values() {
         "hw:\n  cpus: 3\n  mem_mib: 256\nenv:\n  FOO: sk-secret\n",
     )
     .unwrap();
-    let out = terra_in(dir.path(), home.path(), &["./box.yaml", "show"]);
+    let out = run_terra_in(dir.path(), home.path(), &["./box.yaml", "show"]);
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("cpus: 3"), "{stdout}");
@@ -832,7 +832,7 @@ fn show_prints_the_resolved_recipe_without_env_values() {
     );
 
     // …and `--with-env-values` is how you ask for them, on the same recipe.
-    let asked_for = terra_in(
+    let asked_for = run_terra_in(
         dir.path(),
         home.path(),
         &["./box.yaml", "show", "--with-env-values"],
@@ -861,7 +861,7 @@ fn show_answers_from_the_pinned_recipe_not_the_source_it_came_from() {
     let source = shared.join("dev.yaml");
     std::fs::write(&source, "hw:\n  cpus: 3\n").unwrap();
 
-    let made = terra_in(dir.path(), home.path(), &["~/.terra/dev.yaml", "setup"]);
+    let made = run_terra_in(dir.path(), home.path(), &["~/.terra/dev.yaml", "setup"]);
     assert!(
         made.status.success(),
         "{}",
@@ -871,7 +871,7 @@ fn show_answers_from_the_pinned_recipe_not_the_source_it_came_from() {
 
     // By name, and with no name at all - the directory's only box.
     for args in [&["dev", "show"][..], &["show"]] {
-        let out = terra_in(dir.path(), home.path(), args);
+        let out = run_terra_in(dir.path(), home.path(), args);
         assert!(
             out.status.success(),
             "{args:?}: {}",
@@ -882,7 +882,7 @@ fn show_answers_from_the_pinned_recipe_not_the_source_it_came_from() {
     }
 
     // The file itself is still readable as a file.
-    let by_path = terra_in(dir.path(), home.path(), &["~/.terra/dev.yaml", "show"]);
+    let by_path = run_terra_in(dir.path(), home.path(), &["~/.terra/dev.yaml", "show"]);
     assert!(
         String::from_utf8_lossy(&by_path.stdout).contains("cpus: 9"),
         "{}",
@@ -904,7 +904,7 @@ fn a_single_declared_box_is_what_the_directory_means() {
     )
     .unwrap();
 
-    let out = terra_in(dir.path(), home.path(), &["show"]);
+    let out = run_terra_in(dir.path(), home.path(), &["show"]);
     assert!(
         out.status.success(),
         "{}",
@@ -926,7 +926,7 @@ fn a_directory_with_no_boxes_addresses_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     for args in [&["rm"][..], &["stop"], &["logs"], &["exec", "--", "true"]] {
-        let out = terra_in(dir.path(), home.path(), args);
+        let out = run_terra_in(dir.path(), home.path(), args);
         assert_eq!(out.status.code(), Some(1), "{args:?}");
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(stderr.contains("no box"), "{args:?}: {stderr}");
@@ -943,8 +943,8 @@ fn stop_of_a_stopped_box_succeeds() {
     let dir = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("b.yaml"), "hw:\n  cpus: 1\n").unwrap();
-    terra_in(dir.path(), home.path(), &["./b.yaml", "setup"]);
-    let out = terra_in(dir.path(), home.path(), &["stop"]);
+    run_terra_in(dir.path(), home.path(), &["./b.yaml", "setup"]);
+    let out = run_terra_in(dir.path(), home.path(), &["stop"]);
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("already stopped"));
 }
@@ -954,8 +954,8 @@ fn logs_without_a_log_errors() {
     let dir = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("b.yaml"), "hw:\n  cpus: 1\n").unwrap();
-    terra_in(dir.path(), home.path(), &["./b.yaml", "setup"]);
-    let out = terra_in(dir.path(), home.path(), &["logs"]);
+    run_terra_in(dir.path(), home.path(), &["./b.yaml", "setup"]);
+    let out = run_terra_in(dir.path(), home.path(), &["logs"]);
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("no log"));
 }
@@ -972,11 +972,11 @@ fn rm_is_repeatable_while_the_box_is_addressable_and_an_error_once_it_is_gone() 
     let dir = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("b.yaml"), "hw:\n  cpus: 1\n").unwrap();
-    terra_in(dir.path(), home.path(), &["./b.yaml", "setup"]);
+    run_terra_in(dir.path(), home.path(), &["./b.yaml", "setup"]);
 
     // The recipe is kept, so the box is still there to remove again.
     for _ in 0..2 {
-        let out = terra_in(dir.path(), home.path(), &["rm"]);
+        let out = run_terra_in(dir.path(), home.path(), &["rm"]);
         assert!(
             out.status.success(),
             "{}",
@@ -985,17 +985,17 @@ fn rm_is_repeatable_while_the_box_is_addressable_and_an_error_once_it_is_gone() 
     }
 
     assert!(
-        terra_in(dir.path(), home.path(), &["b", "rm", "--purge"])
+        run_terra_in(dir.path(), home.path(), &["b", "rm", "--purge"])
             .status
             .success()
     );
     // Nothing left to address: the same call again is the typo case.
-    let again = terra_in(dir.path(), home.path(), &["b", "rm", "--purge"]);
+    let again = run_terra_in(dir.path(), home.path(), &["b", "rm", "--purge"]);
     assert_eq!(again.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&again.stderr);
     assert!(stderr.contains("no box 'b'"), "{stderr}");
 
-    let typo = terra_in(dir.path(), home.path(), &["dve", "rm", "--purge"]);
+    let typo = run_terra_in(dir.path(), home.path(), &["dve", "rm", "--purge"]);
     assert_eq!(typo.status.code(), Some(1));
     assert!(
         String::from_utf8_lossy(&typo.stderr).contains("no box 'dve'"),
@@ -1008,7 +1008,7 @@ fn rm_is_repeatable_while_the_box_is_addressable_and_an_error_once_it_is_gone() 
 fn missing_recipe_reports_the_path_and_exits_one() {
     let dir = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
-    let out = terra_in(
+    let out = run_terra_in(
         dir.path(),
         home.path(),
         &["./definitely-not-a-recipe-e2e.yaml", "setup"],
@@ -1025,7 +1025,7 @@ fn invalid_yaml_reports_parse_error_and_exits_one() {
     let home = tempfile::tempdir().unwrap();
     let cfg = dir.path().join("bad.yaml");
     std::fs::write(&cfg, "hw: [not, a, mapping]").unwrap();
-    let out = terra_in(dir.path(), home.path(), &[cfg.to_str().unwrap(), "setup"]);
+    let out = run_terra_in(dir.path(), home.path(), &[cfg.to_str().unwrap(), "setup"]);
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("failed to parse YAML"));
 }
@@ -1042,7 +1042,7 @@ fn the_shipped_example_recipe_is_accepted() {
     std::fs::create_dir_all(dir.path().join("src")).unwrap();
     std::fs::create_dir_all(home.path().join(".ssh")).unwrap();
     let recipe = concat!(env!("CARGO_MANIFEST_DIR"), "/../../pi-dev.yaml");
-    let out = terra_in(dir.path(), home.path(), &[recipe, "setup"]);
+    let out = run_terra_in(dir.path(), home.path(), &[recipe, "setup"]);
     assert!(
         out.status.success(),
         "{}",
@@ -1060,7 +1060,7 @@ fn missing_mount_host_path_exits_one() {
         "mounts:\n  - host: /nonexistent-e2e-path\n    guest: /work\n",
     )
     .unwrap();
-    let out = terra_in(dir.path(), home.path(), &[cfg.to_str().unwrap(), "setup"]);
+    let out = run_terra_in(dir.path(), home.path(), &[cfg.to_str().unwrap(), "setup"]);
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("/nonexistent-e2e-path"));
 }

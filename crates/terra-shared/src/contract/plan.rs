@@ -1,18 +1,13 @@
 //! The guest boot plan, built host-side and read by the agent.
 
-use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 
-/// Path of the agent binary in the boot volume (PID 1).
-pub const AGENT_GUEST_PATH: &str = "/terra-agent";
+use super::frames::TermSize;
 
-/// Path of `resize2fs`.
 pub const RESIZE2FS_GUEST_PATH: &str = "/terra-resize2fs";
 
-/// Boot volume.
-pub const BOOT_DEVICE: &str = "/dev/vda";
-
-/// Guest root filesystem.
 pub const ROOT_DEVICE: &str = "/dev/vdb";
 
 /// How many scratch volumes fit: `/dev/vd[c-z]`, the letters left once the
@@ -21,26 +16,20 @@ pub const MAX_VOLUMES: usize = 24;
 
 /// Block device name for the `index`-th volume; `None` past [`MAX_VOLUMES`].
 #[must_use]
-pub fn volume_device(index: usize) -> Option<String> {
-    // The bound keeps index below 256; clippy cannot see through it.
+pub fn to_volume_device(index: usize) -> Option<String> {
     #[allow(clippy::cast_possible_truncation)]
-    (index < MAX_VOLUMES).then(|| format!("/dev/vd{}", (b'c' + index as u8) as char))
+    (index < MAX_VOLUMES).then(|| format!("/dev/vd{}", char::from(b'c' + index as u8)))
 }
 
-/// Kernel cmdline: boot from [`BOOT_DEVICE`], init from [`AGENT_GUEST_PATH`].
-/// `loglevel=3` on top of `quiet` so ext4's
-/// "write access unavailable, skipping orphan cleanup" doesn't appear on the
-/// terminal - the boot volume is read-only, and that message is `KERN_ERR`.
-#[must_use]
-pub fn kernel_cmdline() -> String {
-    format!(
-        "reboot=k panic=-1 panic_print=0 nomodule console=hvc0 quiet loglevel=3 no-kvmapf \
-         root={BOOT_DEVICE} rootfstype=ext4 ro init={AGENT_GUEST_PATH}"
-    )
-}
+/// Kernel cmdline for booting the guest agent from the boot disk.
+/// `loglevel=3` keeps ext4's read-only orphan-cleanup warning off the console.
+pub const KERNEL_CMDLINE: &str = "reboot=k panic=-1 panic_print=0 nomodule console=hvc0 quiet loglevel=3 no-kvmapf \
+     root=/dev/vda rootfstype=ext4 ro init=/terra-agent";
 
-/// Vsock port for every agent service.
 pub const AGENT_VSOCK_PORT: u32 = 6000;
+
+pub const MAX_FILE_BYTES: u64 = 1 << 31;
+const MAX_FILE_ERROR_BYTES: usize = 4096;
 
 /// The byte naming what one connection to [`AGENT_VSOCK_PORT`] is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,14 +50,23 @@ pub enum AgentService {
 
 impl AgentService {
     #[must_use]
+    pub fn to_byte(self) -> u8 {
+        self as u8
+    }
+
+    #[must_use]
     pub fn from_byte(byte: u8) -> Option<Self> {
-        [Self::Session, Self::Files, Self::Exec, Self::SessionControl]
-            .into_iter()
-            .find(|s| *s as u8 == byte)
+        match byte {
+            b's' => Some(Self::Session),
+            b'f' => Some(Self::Files),
+            b'e' => Some(Self::Exec),
+            b'c' => Some(Self::SessionControl),
+            _ => None,
+        }
     }
 }
 
-/// Vsock port for the boot plan and stop signal. Guest dials out.
+/// Guest dials out.
 pub const CONTROL_VSOCK_PORT: u32 = 6001;
 
 /// Signal byte for graceful shutdown. Single byte for signal-handler use.
@@ -76,29 +74,15 @@ pub const STOP_SIGNAL: u8 = b'S';
 
 pub const DEFAULT_STOP_GRACE_SECS: u64 = 30;
 
-/// The guest's last word on the control connection: what the workload exited
-/// with, or what the `on_create` bake did in a Create VM.
-///
-/// libkrun cannot carry it: its exit-code channel is an ioctl on a *virtiofs*
-/// root, and a terra guest roots on ext4, so libkrun reports 0 however the
-/// guest ended.
-pub fn send_exit_status(w: &mut impl std::io::Write, code: i32) -> std::io::Result<()> {
-    w.write_all(&frame(&code)?)?;
-    w.flush()
-}
+/// Bump when a host and a running guest agent cannot safely communicate.
+pub const AGENT_PROTOCOL_VERSION: u8 = 1;
 
-/// Read the status the guest sent; an error means the guest let go without
-/// one - the VM died rather than finishing.
-pub fn read_exit_status(r: &mut impl std::io::Read) -> std::io::Result<i32> {
-    read_frame::<i32>(r)
-}
-
-/// The first byte the agent writes on every connection it accepts - and the
-/// host's only proof that the agent is what answered.
+/// The first bytes the agent writes on every connection it accepts - and the
+/// host's only proof that the agent is what answered and speaks its protocol.
 ///
 /// Not `0x1b`: a session's first act after this is a screen repaint, so a
 /// hello indistinguishable from the escape byte would prove nothing.
-pub const AGENT_HELLO: u8 = b'T';
+pub const AGENT_HELLO: [u8; 2] = [b'V', AGENT_PROTOCOL_VERSION];
 
 /// Where the agent records the baked `on_create` stamp.
 pub const RECIPE_STAMP_PATH: &str = "/terra/recipe";
@@ -122,14 +106,9 @@ pub const WORKLOAD_USER_NAME: &str = "terri";
 /// The non-root workload user's numeric identity (uid == gid). One source of
 /// truth for both sides: the host's userns maps this uid to the launching
 /// user, and the agent drops the workload to it.
-pub const WORKLOAD_UID: u32 = 1000;
-pub const WORKLOAD_GID: u32 = 1000;
+pub const WORKLOAD_ID: u32 = 1000;
 
-/// The workload's home directory.
-#[must_use]
-pub fn workload_home() -> String {
-    format!("/home/{WORKLOAD_USER_NAME}")
-}
+pub const WORKLOAD_HOME: &str = "/home/terri";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Disk {
@@ -137,15 +116,61 @@ pub struct Disk {
     pub guest: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Net {
-    pub guest_ip: String,
-    pub prefix: u8,
-    pub gateway: String,
-    pub dns: String,
+/// The host identity owning shared files.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShareOwner {
+    pub uid: u32,
+    pub gid: u32,
 }
 
-/// The full guest boot plan.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Net {
+    pub guest_ip: std::net::IpAddr,
+    pub prefix: u8,
+    pub gateway: std::net::IpAddr,
+    pub dns: std::net::IpAddr,
+}
+
+impl<'de> Deserialize<'de> for Net {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Fields {
+            guest_ip: std::net::IpAddr,
+            prefix: u8,
+            gateway: std::net::IpAddr,
+            dns: std::net::IpAddr,
+        }
+
+        let Fields {
+            guest_ip,
+            prefix,
+            gateway,
+            dns,
+        } = Fields::deserialize(deserializer)?;
+        let guest_uses_ipv4 = guest_ip.is_ipv4();
+        let max_prefix_bits = if guest_uses_ipv4 { 32 } else { 128 };
+        if prefix > max_prefix_bits {
+            return Err(D::Error::custom(format!(
+                "network prefix {prefix} exceeds the {max_prefix_bits}-bit address limit"
+            )));
+        }
+        if gateway.is_ipv4() != guest_uses_ipv4 || dns.is_ipv4() != guest_uses_ipv4 {
+            return Err(D::Error::custom(
+                "network gateway and DNS addresses must use the same address family as guest_ip",
+            ));
+        }
+        Ok(Self {
+            guest_ip,
+            prefix,
+            gateway,
+            dns,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Plan {
     pub mode: PlanMode,
@@ -155,7 +180,7 @@ pub struct Plan {
     /// The host uid and gid owning the shares' backing files; the agent idmaps
     /// each share so this pair reads as the workload user. `None` (a root
     /// host) mounts shares unmapped, so real ids pass through whole.
-    pub share_owner: Option<(u32, u32)>,
+    pub share_owner: Option<ShareOwner>,
     pub net: Net,
     pub env: BTreeMap<String, String>,
     /// Run the workload as root instead of dropping to the workload user
@@ -173,77 +198,15 @@ pub struct Plan {
     /// Broadcast the workload's terminal to the guest console as well as to
     /// the session's clients.
     pub workload_on_console: bool,
-    pub host_time_ns: Option<u64>,
-    pub host_tz: Option<HostTimezone>,
+    pub host_tz: Option<Vec<u8>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum HostTimezone {
-    Tzif(Vec<u8>),
-    Iana(String),
-}
-
-/// Encode any message as the one wire shape every terra channel uses: a
-/// `u32` LE length prefix plus JSON.
-pub fn frame<T: serde::Serialize>(v: &T) -> std::io::Result<Vec<u8>> {
-    let json = serde_json::to_vec(v).map_err(std::io::Error::other)?;
-    if json.len() > MAX_FRAME {
-        return Err(oversized(json.len()));
-    }
-    // `MAX_FRAME` is far below `u32::MAX`, so the length always fits the header.
-    let len = u32::try_from(json.len()).map_err(|_| oversized(json.len()))?;
-    let mut out = Vec::with_capacity(4 + json.len());
-    out.extend_from_slice(&len.to_le_bytes());
-    out.extend_from_slice(&json);
-    Ok(out)
-}
-
-fn oversized(len: usize) -> std::io::Error {
-    std::io::Error::other(format!(
-        "framed message of {len} bytes exceeds the {MAX_FRAME}-byte limit"
-    ))
-}
-
-/// Ceiling on a frame's payload, shared with [`crate::ClientInput::read`]:
-/// same hazard, same answer.
-pub const MAX_FRAME: usize = 8 << 20;
-
-/// Read one framed message (see [`frame`]).
-pub fn read_frame<T: serde::de::DeserializeOwned>(
-    r: &mut impl std::io::Read,
-) -> std::io::Result<T> {
-    let mut len = [0u8; 4];
-    r.read_exact(&mut len)?;
-    let len = u32::from_le_bytes(len) as usize;
-    if len > MAX_FRAME {
-        return Err(oversized(len));
-    }
-    let mut json = vec![0u8; len];
-    r.read_exact(&mut json)?;
-    serde_json::from_slice(&json).map_err(std::io::Error::other)
-}
-
-/// A terminal's size. A struct rather than a `(u16, u16)`: the pair crosses
-/// the host/guest wire, and named fields make a swapped order unspellable.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub struct TermSize {
-    pub rows: u16,
-    pub cols: u16,
-}
-
-/// One `terra exec`.
-///
 /// `as_root` is the `--root` flag, not the identity: the agent resolves what
 /// the command runs as, since it is the side that knows which the box is.
-///
-/// `tty: Some(size)` asks for a PTY at that size, set from whether the host's
-/// own stdin is a terminal - the same call `ssh` makes.
-///
-/// No working directory: PID 1 has already `chdir`ed to the recipe's
-/// `workdir` by the time the exec listener is accepting, and a child inherits
-/// it.
+/// `tty: Some(size)` asks for a PTY at that size; `None` uses pipes.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExecRequest {
+    #[serde(deserialize_with = "deserialize_argv")]
     pub argv: Vec<String>,
     pub as_root: bool,
     pub tty: Option<TermSize>,
@@ -255,38 +218,120 @@ pub struct ExecRequest {
 /// connection.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum FileRequest {
-    Get { path: String },
-    Put { path: String, mode: u32, size: u64 },
+    Get {
+        #[serde(deserialize_with = "deserialize_abs_path")]
+        path: String,
+    },
+    Put {
+        #[serde(deserialize_with = "deserialize_abs_path")]
+        path: String,
+        mode: u32,
+        #[serde(deserialize_with = "deserialize_file_size")]
+        size: u64,
+    },
 }
 
-/// The agent's answer to one [`FileRequest`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum FileReply {
     /// The operation failed; the text is guest-chosen and untrusted.
-    Err(String),
+    Err(#[serde(deserialize_with = "deserialize_file_error")] String),
     /// A put landed whole.
     Put,
     /// A get: the file's permission bits, and how many bytes follow.
-    Get { mode: u32, size: u64 },
+    Get {
+        mode: u32,
+        #[serde(deserialize_with = "deserialize_file_size")]
+        size: u64,
+    },
+}
+
+fn deserialize_argv<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let argv = Vec::<String>::deserialize(deserializer)?;
+    if argv.is_empty() {
+        return Err(D::Error::custom("exec request has no command"));
+    }
+    if argv.iter().any(|arg| arg.contains('\0')) {
+        return Err(D::Error::custom(
+            "exec request arguments cannot contain NUL bytes",
+        ));
+    }
+    Ok(argv)
+}
+
+fn deserialize_abs_path<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let path = String::deserialize(deserializer)?;
+    if path.contains('\0') {
+        return Err(D::Error::custom("guest path cannot contain NUL bytes"));
+    }
+    if !path.starts_with('/') {
+        return Err(D::Error::custom("guest path must be absolute"));
+    }
+    Ok(path)
+}
+
+fn deserialize_file_size<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let size = u64::deserialize(deserializer)?;
+    if size > MAX_FILE_BYTES {
+        return Err(D::Error::custom(format!(
+            "file size {size} exceeds the {MAX_FILE_BYTES}-byte limit"
+        )));
+    }
+    Ok(size)
+}
+
+fn deserialize_file_error<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let error = String::deserialize(deserializer)?;
+    if error.len() > MAX_FILE_ERROR_BYTES {
+        return Err(D::Error::custom(format!(
+            "file error exceeds the {MAX_FILE_ERROR_BYTES}-byte limit"
+        )));
+    }
+    Ok(error)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::contract::{encode_frame, read_frame};
 
     #[test]
-    fn plan_round_trips_through_json() {
-        for (host_time_ns, host_tz) in [
-            (None, None),
-            (
-                Some(1_700_000_000_000_000_000),
-                Some(HostTimezone::Tzif(vec![1, 2, 3])),
-            ),
-            (
-                Some(1_700_000_000_000_000_001),
-                Some(HostTimezone::Iana("Europe/Prague".into())),
-            ),
+    fn round_trip_agent_service_bytes() {
+        for service in [
+            AgentService::Session,
+            AgentService::Files,
+            AgentService::Exec,
+            AgentService::SessionControl,
         ] {
+            assert_eq!(AgentService::from_byte(service.to_byte()), Some(service));
+        }
+    }
+
+    #[test]
+    fn agent_hello_names_the_protocol_version() {
+        assert_eq!(AGENT_HELLO, [b'V', AGENT_PROTOCOL_VERSION]);
+    }
+
+    // pin WORKLOAD_USER_NAME and WORKLOAD_HOME
+    #[test]
+    fn match_workload_home_to_user() {
+        assert_eq!(WORKLOAD_HOME, format!("/home/{WORKLOAD_USER_NAME}"));
+    }
+
+    #[test]
+    fn round_trip_plan_through_json() {
+        for host_tz in [None, Some(vec![1, 2, 3])] {
             let plan = Plan {
                 mode: PlanMode::Create,
                 workdir: Some("/work".into()),
@@ -296,15 +341,18 @@ mod tests {
                     readonly: true,
                 }],
                 volumes: vec![Disk {
-                    dev: volume_device(0).unwrap(),
+                    dev: to_volume_device(0).unwrap(),
                     guest: "/data".into(),
                 }],
-                share_owner: Some((1000, 1000)),
+                share_owner: Some(ShareOwner {
+                    uid: 1000,
+                    gid: 1000,
+                }),
                 net: Net {
-                    guest_ip: "100.96.0.2".into(),
+                    guest_ip: "100.96.0.2".parse().unwrap(),
                     prefix: 30,
-                    gateway: "100.96.0.1".into(),
-                    dns: "100.96.0.1".into(),
+                    gateway: "100.96.0.1".parse().unwrap(),
+                    dns: "100.96.0.1".parse().unwrap(),
                 },
                 env: BTreeMap::from([("FOO".to_string(), "bar".to_string())]),
                 root: false,
@@ -316,15 +364,14 @@ mod tests {
                 workload: vec!["/bin/sh".into(), "-c".into(), "make".into()],
                 sandbox_info: "# Terrarium sandbox".into(),
                 workload_on_console: true,
-                host_time_ns,
-                host_tz: host_tz.clone(),
+                host_tz,
             };
             // Over the control connection, the frame must leave the stop signal
             // that follows it untouched in the stream.
-            let mut stream = frame(&plan).unwrap();
+            let mut stream = encode_frame(&plan).unwrap();
             stream.push(STOP_SIGNAL);
             let mut cursor = std::io::Cursor::new(stream);
-            assert_eq!(read_frame::<Plan>(&mut cursor).unwrap(), plan);
+            assert_eq!(read_frame::<Plan>(&mut cursor).unwrap(), Some(plan));
             let mut rest = Vec::new();
             std::io::Read::read_to_end(&mut cursor, &mut rest).unwrap();
             assert_eq!(rest, vec![STOP_SIGNAL]);
@@ -348,7 +395,6 @@ mod tests {
             "workload_on_console": false
         });
         let decoded: Plan = serde_json::from_value(json_without).unwrap();
-        assert_eq!(decoded.host_time_ns, None);
         assert_eq!(decoded.host_tz, None);
         // …and an old host's plan, which carries no daemons, still boots a
         // new agent.
@@ -356,20 +402,71 @@ mod tests {
     }
 
     #[test]
-    fn an_absurd_frame_length_is_refused_before_allocating() {
-        // Four bytes claiming 4 GiB, and nothing behind them.
-        let mut wire = u32::MAX.to_le_bytes().to_vec();
-        wire.extend_from_slice(b"{}");
-        let err = read_frame::<FileRequest>(&mut std::io::Cursor::new(wire)).unwrap_err();
-        assert!(err.to_string().contains("exceeds"), "{err}");
+    fn run_volume_devices_from_vdc_to_vdz() {
+        assert_eq!(to_volume_device(0).unwrap(), "/dev/vdc");
+        assert_eq!(to_volume_device(MAX_VOLUMES - 1).unwrap(), "/dev/vdz");
+        // Past the last letter is the caller's error to report, never a panic:
+        // this is linked into guest PID 1.
+        assert_eq!(to_volume_device(MAX_VOLUMES), None);
     }
 
     #[test]
-    fn volume_devices_run_from_vdc_to_vdz() {
-        assert_eq!(volume_device(0).unwrap(), "/dev/vdc");
-        assert_eq!(volume_device(MAX_VOLUMES - 1).unwrap(), "/dev/vdz");
-        // Past the last letter is the caller's error to report, never a panic:
-        // this is linked into guest PID 1.
-        assert_eq!(volume_device(MAX_VOLUMES), None);
+    fn reject_invalid_network_and_file_requests() {
+        assert!(
+            serde_json::from_value::<Net>(serde_json::json!({
+                "guest_ip": "192.0.2.2",
+                "prefix": 33,
+                "gateway": "192.0.2.1",
+                "dns": "192.0.2.1"
+            }))
+            .is_err()
+        );
+        for field in ["gateway", "dns"] {
+            let mut net = serde_json::json!({
+                "guest_ip": "192.0.2.2",
+                "prefix": 24,
+                "gateway": "192.0.2.1",
+                "dns": "192.0.2.1"
+            });
+            net[field] = serde_json::json!("2001:db8::1");
+            assert!(serde_json::from_value::<Net>(net).is_err());
+        }
+        assert!(
+            serde_json::from_value::<ExecRequest>(serde_json::json!({
+                "argv": ["/bin/sh", "bad\0arg"],
+                "as_root": false,
+                "tty": null
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ExecRequest>(serde_json::json!({
+                "argv": [],
+                "as_root": false,
+                "tty": null
+            }))
+            .is_err()
+        );
+        for request in [
+            serde_json::json!({"Get": {"path": "relative"}}),
+            serde_json::json!({"Put": {"path": "relative", "mode": 420, "size": 0}}),
+            serde_json::json!({"Get": {"path": "/tmp/has\0nul"}}),
+            serde_json::json!({"Put": {"path": "/tmp/has\0nul", "mode": 420, "size": 0}}),
+            serde_json::json!({"Put": {"path": "/tmp/file", "mode": 420, "size": MAX_FILE_BYTES + 1}}),
+        ] {
+            assert!(serde_json::from_value::<FileRequest>(request).is_err());
+        }
+        assert!(
+            serde_json::from_value::<FileReply>(serde_json::json!({
+                "Get": {"mode": 420, "size": MAX_FILE_BYTES + 1}
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<FileReply>(serde_json::json!({
+                "Err": "x".repeat(MAX_FILE_ERROR_BYTES + 1)
+            }))
+            .is_err()
+        );
     }
 }

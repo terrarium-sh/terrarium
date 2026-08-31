@@ -50,16 +50,16 @@ impl Suite {
         }
     }
 
-    fn work(&self) -> &Path {
+    fn get_work_dir(&self) -> &Path {
         self.tmp.path()
     }
 
     /// Run terra, returning stdout (stderr suppressed, as a script would).
-    fn terra(&self, args: &[&str]) -> String {
-        self.terra_status(args).0
+    fn run_terra_command(&self, args: &[&str]) -> String {
+        self.run_terra_status(args).0
     }
 
-    fn terra_status(&self, args: &[&str]) -> (String, i32) {
+    fn run_terra_status(&self, args: &[&str]) -> (String, i32) {
         let out = Command::new(&self.terra)
             .args(args)
             .env("HOME", &self.home)
@@ -76,9 +76,9 @@ impl Suite {
     /// Where terra keeps `name`'s files - asked via `ls --tsv`, the
     /// format scripts may parse, not guessed: the state directory's name is a
     /// hash.
-    fn box_files(&self, name: &str) -> PathBuf {
-        let path = self.work().join(name);
-        let out = self.terra(&["ls", "--tsv", "--project", path.to_str().unwrap()]);
+    fn get_box_files_path(&self, name: &str) -> PathBuf {
+        let path = self.get_work_dir().join(name);
+        let out = self.run_terra_command(&["ls", "--tsv", "--project", path.to_str().unwrap()]);
         let files = out
             .lines()
             .find_map(|l| l.split('\t').nth(3))
@@ -96,18 +96,19 @@ impl Suite {
     /// whole run as one captured process; the transcript is both commands'
     /// stdout, which the bake's assertions read from the workload's own output.
     fn boot_recipe(&self, recipe: &Path, name: &str, extra: &[&str]) -> String {
-        let path = self.project(name);
+        let path = self.create_project_dir(name);
         let project = path.to_str().unwrap();
-        let setup = self.terra(&[recipe.to_str().unwrap(), "setup", "--project", project]);
+        let setup =
+            self.run_terra_command(&[recipe.to_str().unwrap(), "setup", "--project", project]);
         let mut args = vec![name, "--foreground", "--project", project];
         args.extend_from_slice(extra);
-        setup + &self.terra(&args)
+        setup + &self.run_terra_command(&args)
     }
 
     /// `name`'s project directory under WORK, created - terra refuses a
     /// `--project` that does not exist rather than minting one for a typo.
-    fn project(&self, name: &str) -> PathBuf {
-        let path = self.work().join(name);
+    fn create_project_dir(&self, name: &str) -> PathBuf {
+        let path = self.get_work_dir().join(name);
         std::fs::create_dir_all(&path).unwrap();
         path
     }
@@ -120,9 +121,9 @@ impl Suite {
     /// The asset plus a `mounts:` entry pointing /work at a directory this
     /// suite owns - nothing is shared with a sandbox unless its recipe says so.
     fn boot_with_share(&self, name: &str, extra: &[&str]) -> (String, PathBuf) {
-        let prj = self.work().join(format!("{name}-proj"));
+        let prj = self.get_work_dir().join(format!("{name}-proj"));
         std::fs::create_dir_all(&prj).unwrap();
-        let recipe = self.work().join(format!("{name}.yaml"));
+        let recipe = self.get_work_dir().join(format!("{name}.yaml"));
         let base = std::fs::read_to_string(Path::new(ASSETS).join(format!("{name}.yaml"))).unwrap();
         std::fs::write(
             &recipe,
@@ -136,17 +137,17 @@ impl Suite {
     }
 
     fn exec(&self, root: bool, cmd: &[&str]) -> (String, i32) {
-        let server = self.work().join("server");
+        let server = self.get_work_dir().join("server");
         let mut args = vec!["exec"];
         if root {
             args.push("--root");
         }
         args.extend(["--project", server.to_str().unwrap(), "--"]);
         args.extend_from_slice(cmd);
-        self.terra_status(&args)
+        self.run_terra_status(&args)
     }
 
-    fn file_uid(path: &Path) -> Option<u32> {
+    fn read_file_uid(path: &Path) -> Option<u32> {
         use std::os::unix::fs::MetadataExt;
         std::fs::metadata(path).ok().map(|m| m.uid())
     }
@@ -156,7 +157,7 @@ impl Drop for Suite {
     fn drop(&mut self) {
         // `stop` waits for the guest by default; without that wait the tempdir
         // would be deleted out from under a VM still running `pre_stop`.
-        let server = self.work().join("server");
+        let server = self.get_work_dir().join("server");
         let _ = Command::new(&self.terra)
             .args(["stop", "--project", server.to_str().unwrap()])
             .env("HOME", &self.home)
@@ -184,7 +185,7 @@ fn http_get(addr: &str, host: &str) -> Option<String> {
 #[allow(clippy::too_many_lines)]
 #[test]
 #[ignore = "boots real microVMs - needs /dev/kvm: cargo test --test boot -- --ignored"]
-fn boot_suite() {
+fn run_boot_suite() {
     let s = Suite::new();
 
     // == egress: a name is exact, and the subtree is opted into ==
@@ -203,7 +204,8 @@ fn boot_suite() {
     );
     // Host diagnostics stay out of the workload's terminal: they belong in the
     // box's log - and the refusal message is terra's own policy talking.
-    let log = std::fs::read_to_string(s.box_files("egress").join("terra.log")).unwrap_or_default();
+    let log = std::fs::read_to_string(s.get_box_files_path("egress").join("terra.log"))
+        .unwrap_or_default();
     assert!(
         log.contains("no allow rule names"),
         "the log does not name the refused query:\n{log}"
@@ -239,7 +241,7 @@ fn boot_suite() {
     assert!(out.contains("WF_OK"), "{out}");
     assert!(out.contains("VOL=1000:1000"), "{out}");
     assert_eq!(
-        Suite::file_uid(&prj.join("wf")),
+        Suite::read_file_uid(&prj.join("wf")),
         Some(s.host_uid),
         "host file not owned by the launching user"
     );
@@ -250,7 +252,7 @@ fn boot_suite() {
         "--root changed the FS mapping:\n{out}"
     );
     assert!(out.contains("WF_OK"), "{out}");
-    assert_eq!(Suite::file_uid(&prj.join("wf")), Some(s.host_uid));
+    assert_eq!(Suite::read_file_uid(&prj.join("wf")), Some(s.host_uid));
 
     // == on_create: baked once, stamped in the guest, skipped after ==
     let first = s.boot("bake", &[]);
@@ -271,14 +273,14 @@ fn boot_suite() {
     );
 
     // == ports + isolation: one VM publishes, another reaches it via hosts ==
-    let server = s.project("server");
-    s.terra(&[
+    let server = s.create_project_dir("server");
+    s.run_terra_command(&[
         &format!("{ASSETS}/server.yaml"),
         "setup",
         "--project",
         server.to_str().unwrap(),
     ]);
-    s.terra(&["server", "-d", "--project", server.to_str().unwrap()]);
+    s.run_terra_command(&["server", "-d", "--project", server.to_str().unwrap()]);
     // The gateway binds the host port before the guest listens, so poll for
     // content; ~60s covers the server VM's boot plus its `apk add`.
     let deadline = Instant::now() + Duration::from_mins(1);
@@ -306,7 +308,7 @@ fn boot_suite() {
     // the sockets exist.
     {
         use std::os::unix::fs::PermissionsExt;
-        let files = s.box_files("server");
+        let files = s.get_box_files_path("server");
         let mode = std::fs::metadata(&files).unwrap().permissions().mode() & 0o777;
         assert_eq!(
             mode,
@@ -335,6 +337,13 @@ fn boot_suite() {
     );
 
     // == exec: a second process beside the workload, root on request ==
+    // An exec inherits the agent's cwd - the plan's `workdir` - not the home
+    // dir: `exec pwd` must answer the recipe's `/work`, not `/home/terri`.
+    assert_eq!(
+        s.exec(false, &["pwd"]).0.trim(),
+        "/work",
+        "exec did not start in the plan workdir"
+    );
     assert!(s.exec(false, &["id", "-u"]).0.contains("1000"));
     assert!(s.exec(true, &["id", "-u"]).0.contains('0'));
     // The workload beside it is untouched: still uid 1000, no standing
@@ -377,14 +386,14 @@ fn boot_suite() {
     // workload later does; console and state stay reachable via logs/status.
     // (A child that dies *before* owning the box replays its logs and exit
     // code - boot/lock failure, which no recipe can arrange.)
-    let oneshot = s.work().join("oneshot.yaml");
+    let oneshot = s.get_work_dir().join("oneshot.yaml");
     std::fs::write(
         &oneshot,
         "workload:\n  entrypoint: /bin/sh\n  args: [-c, 'echo ONESHOT_RAN; exit 7']\n",
     )
     .unwrap();
-    let oneshot_box = s.project("oneshot");
-    s.terra(&[
+    let oneshot_box = s.create_project_dir("oneshot");
+    s.run_terra_command(&[
         oneshot.to_str().unwrap(),
         "setup",
         "--project",
@@ -409,13 +418,13 @@ fn boot_suite() {
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline
         && !s
-            .terra(&["ls", "--project", oneshot_box.to_str().unwrap()])
+            .run_terra_command(&["ls", "--project", oneshot_box.to_str().unwrap()])
             .contains("stopped")
     {
         std::thread::sleep(Duration::from_secs(1));
     }
     assert!(
-        s.terra(&["ls", "--project", oneshot_box.to_str().unwrap()])
+        s.run_terra_command(&["ls", "--project", oneshot_box.to_str().unwrap()])
             .contains("stopped"),
         "the box did not run to completion in the background"
     );
@@ -423,7 +432,7 @@ fn boot_suite() {
     // terminal is not. A detached run nobody attaches to is broadcast to the
     // session and to nothing else, which is why a box that wants a record of
     // its own output writes one to a volume it keeps.
-    let log = s.terra(&["logs", "--project", oneshot_box.to_str().unwrap()]);
+    let log = s.run_terra_command(&["logs", "--project", oneshot_box.to_str().unwrap()]);
     assert!(
         log.contains("starting"),
         "the boot is not in the log:\n{log}"
@@ -438,7 +447,7 @@ fn boot_suite() {
     // agent hands out are what `terra detach` takes back. The suite has no
     // terminal, so a client attaches through `script`, which allocates one.
     let project = server.to_str().unwrap();
-    let sessions = |s: &Suite| s.terra(&["server", "sessions", "--project", project]);
+    let sessions = |s: &Suite| s.run_terra_command(&["server", "sessions", "--project", project]);
     assert!(
         sessions(&s).trim().is_empty(),
         "a box nobody is attached to lists clients:\n{}",
@@ -477,7 +486,7 @@ fn boot_suite() {
 
     // The detach closes the client's connection from the agent's side, so the
     // client's process ends on its own - and the session is empty again.
-    s.terra(&["server", "detach", "0", "--project", project]);
+    s.run_terra_command(&["server", "detach", "0", "--project", project]);
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if let Some(status) = client.try_wait().expect("waiting on the attach") {
@@ -504,7 +513,7 @@ fn boot_suite() {
         sessions(&s)
     );
     // A client that is already gone is refused, not silently re-detached.
-    let (_, code) = s.terra_status(&["server", "detach", "0", "--project", project]);
+    let (_, code) = s.run_terra_status(&["server", "detach", "0", "--project", project]);
     assert_ne!(code, 0, "re-detaching a gone client must fail");
 
     // Two clients, and `--all` takes both of them.
@@ -527,7 +536,7 @@ fn boot_suite() {
         sessions(&s).lines().count() >= 2,
         "the second client never reached the session:\n{listed}"
     );
-    s.terra(&["server", "detach", "--all", "--project", project]);
+    s.run_terra_command(&["server", "detach", "--all", "--project", project]);
     for client in [&mut a, &mut b] {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -550,10 +559,10 @@ fn boot_suite() {
 
     // == cp: files travel in and out of the running box ==
     let payload = format!("cp-roundtrip-{}", std::process::id());
-    let src = s.work().join("cp-src.txt");
+    let src = s.get_work_dir().join("cp-src.txt");
     std::fs::write(&src, &payload).unwrap();
-    let dst = s.work().join("cp-out.txt");
-    s.terra(&[
+    let dst = s.get_work_dir().join("cp-out.txt");
+    s.run_terra_command(&[
         "server",
         "put",
         src.to_str().unwrap(),
@@ -563,7 +572,7 @@ fn boot_suite() {
     ]);
     // …and back out with the box left off, which is the directory's only one:
     // named or defaulted, both have to reach the same agent.
-    s.terra(&[
+    s.run_terra_command(&[
         "get",
         "/tmp/cp.txt",
         dst.to_str().unwrap(),
@@ -581,22 +590,22 @@ fn boot_suite() {
     // respawns it after a second, exit 0 leaves it done. The workload waits a
     // few seconds, so the console shows both the one-shot daemon and the
     // crash loop's restarts - then the box exits 0.
-    let daemon_recipe = s.work().join("daemon.yaml");
+    let daemon_recipe = s.get_work_dir().join("daemon.yaml");
     std::fs::write(
         &daemon_recipe,
         "daemons:\n  - echo DAEMON_STARTED\n  - \"echo CRASH; exit 3\"\n\
          workload:\n  entrypoint: /bin/sh\n  args: [-c, 'sleep 4; echo WORKLOAD_DONE']\n",
     )
     .unwrap();
-    let daemon_project = s.project("daemon");
+    let daemon_project = s.create_project_dir("daemon");
     let daemon_dir = daemon_project.to_str().unwrap();
-    s.terra(&[
+    s.run_terra_command(&[
         daemon_recipe.to_str().unwrap(),
         "setup",
         "--project",
         daemon_dir,
     ]);
-    let (out, code) = s.terra_status(&["daemon", "--foreground", "--project", daemon_dir]);
+    let (out, code) = s.run_terra_status(&["daemon", "--foreground", "--project", daemon_dir]);
     assert_eq!(
         code, 0,
         "a box with daemons did not exit with its workload:\n{out}"
@@ -613,18 +622,18 @@ fn boot_suite() {
     // channel wants a virtiofs root, and a box roots on a block device - so the
     // status rides the control connection instead. Without it every boot looked
     // successful to a script, and a failed `on_create` bake did too (below).
-    let status_recipe = s.work().join("exit-status.yaml");
+    let status_recipe = s.get_work_dir().join("exit-status.yaml");
     std::fs::write(&status_recipe, "workload:\n  entrypoint: /bin/true\n").unwrap();
-    let status_project = s.project("exit-status");
+    let status_project = s.create_project_dir("exit-status");
     let status_dir = status_project.to_str().unwrap();
-    s.terra(&[
+    s.run_terra_command(&[
         status_recipe.to_str().unwrap(),
         "setup",
         "--project",
         status_dir,
     ]);
     let boot_with = |cmd: &str| {
-        s.terra_status(&[
+        s.run_terra_status(&[
             "exit-status",
             "--foreground",
             "--project",
@@ -654,14 +663,14 @@ fn boot_suite() {
     // It used to exit 0 and call the box ready, leaving a filesystem with no
     // stamp - so the *next* boot refused instead, naming a bake nobody knew had
     // failed.
-    let bad_bake = s.work().join("bad-bake.yaml");
+    let bad_bake = s.get_work_dir().join("bad-bake.yaml");
     std::fs::write(
         &bad_bake,
         "hooks:\n  on_create:\n    - \"echo BAKE_RAN; exit 9\"\n",
     )
     .unwrap();
-    let bad_project = s.project("bad-bake");
-    let (_, bake_code) = s.terra_status(&[
+    let bad_project = s.create_project_dir("bad-bake");
+    let (_, bake_code) = s.run_terra_status(&[
         bad_bake.to_str().unwrap(),
         "setup",
         "--project",
@@ -669,7 +678,7 @@ fn boot_suite() {
     ]);
     assert_ne!(bake_code, 0, "a failing on_create bake reported success");
     assert!(
-        s.terra(&["logs", "--project", bad_project.to_str().unwrap()])
+        s.run_terra_command(&["logs", "--project", bad_project.to_str().unwrap()])
             .contains("BAKE_RAN"),
         "the failed bake's console did not reach the log"
     );

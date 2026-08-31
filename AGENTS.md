@@ -14,6 +14,19 @@
     committed).
 *   **Boot Tests:** Requires `/dev/kvm`. Run: `make dist && TERRA_BIN=$PWD/dist/terra cargo test -p terra --test boot -- --ignored`
 
+## Threat model
+
+Terra's filesystem defenses protect the VM boundary: a guest must not use its
+guest filesystem or configured mounts to escape into the host or gain host
+privileges. The host and its box filesystems are trusted; guest-written share
+contents are not treated as a host security boundary, and concurrent host
+local mutation is out of scope. Host-side code should therefore stay KISS and
+should not add elaborate defenses without a new threat-model requirement.
+
+## Portability
+
+`crates/terra-agent/` and `crates/terra-shared/` must be built with portability in mind for Linux, macOS, and Windows. Isolate platform-specific APIs behind explicit conditional compilation and keep shared code platform-neutral.
+
 ## Comments
 
 **Default: no comment.** Code and names carry the *what*; a comment exists only
@@ -82,16 +95,23 @@ invariant nothing enforces — reword as intent or delete.
 **Self-documenting names are the first line of explanation.**
 
 *   **Be Descriptive:** Prefer `uncommitted_dirty_files` over `files`.
-*   **Types & Policies:** Name what they are (`SessionOutcome`), not when they happen.
-*   **Conversions:** Use verbs (`to_escape_byte`).
+*   **Types & Policies:** Name what they are (`SessionOutcome`), not when they happen; types are nouns.
+*   **Functions:** Name ordinary functions as verb phrases describing an action
+    (`resolve_pinned_box`, `send_file_into_box`). Rust trait methods,
+    constructors, and established conversion APIs (`from_*`, `into_*`, `as_*`,
+    `to_*`) may follow their idiomatic names.
+*   **Variables:** Name values as nouns describing what they hold
+    (`uncommitted_dirty_files`); name booleans as truthful predicates using
+    `is_`, `has_`, or `can_` when those prefixes fit.
+*   **Constants:** Use descriptive `SCREAMING_SNAKE_CASE` names
+    (`MAX_GUEST_CLAIMED_BYTES`).
 *   **Sibling names pair up:** names that answer each other read together
     (`takes_the_box` / `takes_only_the_box`).
-*   **Functions are verb phrases:** `resolve_pinned_box`, `send_file_into_box`.
-    `has_`/`is_` promise a bool — do not use them for a function that returns
-    the thing.
 *   **The name is the contract at the use site:** if a call site needs the
     comment to decode it, the name is wrong (`EGRESS_FLOOR` over `FLOOR_MODE`,
     `MAX_GUEST_CLAIMED_BYTES` over `MAX_CP_BYTES`).
+*   **Related names stay consistent:** use one term for one concept and keep
+    shared stems and parts of speech aligned across an API.
 *   **Avoid Shadowing:** Do not name a local variable the same as a module it calls (e.g., don't use `state` if calling `state::get()`).
 *   **Extract Closures:** Turn complex inline closures into named functions.
 *   **CLI Flags:** Name them for what they actually do (`--rebuild`), not past usage (`--force`). Update the README and completions when renaming.

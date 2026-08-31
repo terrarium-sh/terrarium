@@ -4,8 +4,6 @@
 //! The portable half is here; a host's own half is `sys/<host>.rs`. The
 //! `pub use` below is the surface such a file owes, so one it misses fails to
 //! compile naming the item.
-#![allow(unsafe_code)]
-
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
@@ -21,10 +19,10 @@ compile_error!(
 );
 
 pub use imp::{
-    MAX_SOCK_PATH, claim_inherited_lock, create_no_symlinks, detach, disk_usage,
-    install_stop_signal_handlers, is_host_root, mode_of, open_no_symlinks, open_null, owner_only,
-    pass_lock, pid_exists, point_stdio_at, process_start_time, register_stop_channel,
-    restrict_new_files, set_open_file_mode, share_owner, signal_pid, terminating_signal,
+    MAX_SOCK_PATH, claim_inherited_lock, create_no_symlinks, detach, find_terminating_signal,
+    install_stop_signal_handlers, is_host_root, open_no_symlinks, open_null, pass_lock, pid_exists,
+    point_stdio_at, read_process_start_time, read_share_owner, register_stop_channel,
+    restrict_new_files, set_open_file_mode, set_owner_only, signal_pid,
 };
 
 pub const POLL: std::time::Duration = std::time::Duration::from_millis(100);
@@ -47,35 +45,40 @@ pub enum VmSignal {
 
 pub(crate) const NO_HOME_ERROR_MESSAGE: &str = "no home directory, so no ~/.terra (set HOME)";
 
-pub(crate) fn home_dir() -> anyhow::Result<PathBuf> {
+pub(crate) fn resolve_home_dir() -> anyhow::Result<PathBuf> {
     use anyhow::Context as _;
+    // A test's own home: see [`test_paths`].
     #[cfg(test)]
-    if let Some(home) = TEST_HOME.with_borrow(Clone::clone) {
+    if let Some(home) = test_paths::get_test_home() {
         return Ok(home);
     }
     std::env::home_dir().context(NO_HOME_ERROR_MESSAGE)
 }
 
-pub fn absolute(p: &Path, cwd: &Path) -> anyhow::Result<PathBuf> {
+pub fn resolve_absolute_path(path: &Path, cwd: &Path) -> anyhow::Result<PathBuf> {
     use anyhow::Context as _;
-    let joined = cwd.join(p);
+    let joined = cwd.join(path);
     std::path::absolute(&joined).with_context(|| format!("resolving path {:?}", joined.display()))
 }
 
-/// Whether stdin is a terminal. Read once and passed down, so a test can
-/// drive either side without a terminal.
+/// Read once and passed down, so a test can drive either side without a
+/// terminal.
 #[must_use]
-pub fn at_a_terminal() -> bool {
+pub fn is_at_a_terminal() -> bool {
     crossterm::tty::IsTty::is_tty(&std::io::stdin())
 }
 
-pub fn dir_entries(dir: &Path) -> impl Iterator<Item = std::fs::DirEntry> {
-    std::fs::read_dir(dir).into_iter().flatten().flatten()
+pub fn list_dir_entries(dir: &Path) -> impl Iterator<Item = std::fs::DirEntry> {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
 }
 
 /// Drop `SMOLVM_PUBLISH_ADDR` before the gateway's port listeners read it: it
 /// would move published ports off the host loopback onto any address the
 /// environment names.
+#[allow(unsafe_code)]
 pub fn scrub_smolvm_gateway_env() {
     // SAFETY: no other thread has been started yet (this is the first thing
     // `main` does), so there is no concurrent reader of the environment.
@@ -83,41 +86,10 @@ pub fn scrub_smolvm_gateway_env() {
 }
 
 #[cfg(test)]
-thread_local! {
-    static TEST_HOME: std::cell::RefCell<Option<PathBuf>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// A home directory of this test's own, held in a thread-local rather than
-/// passed as a parameter, which would reach half the crate to serve nothing
-/// but the tests.
-///
-/// Moving the home moves the settings file with it, so both ends of this drop
-/// what was read from the home being left (see [`crate::state::settings`]).
-#[cfg(test)]
-pub(crate) struct TestHome(tempfile::TempDir);
+mod test_paths;
 
 #[cfg(test)]
-impl TestHome {
-    pub(crate) fn new() -> Self {
-        let dir = tempfile::tempdir().expect("a temporary home for this test");
-        TEST_HOME.with_borrow_mut(|home| *home = Some(dir.path().to_path_buf()));
-        crate::state::forget_settings();
-        Self(dir)
-    }
-
-    pub(crate) fn path(&self) -> &Path {
-        self.0.path()
-    }
-}
-
-#[cfg(test)]
-impl Drop for TestHome {
-    fn drop(&mut self) {
-        TEST_HOME.with_borrow_mut(|home| *home = None);
-        crate::state::forget_settings();
-    }
-}
+pub(crate) use test_paths::TestHome;
 
 #[cfg(test)]
 mod tests {

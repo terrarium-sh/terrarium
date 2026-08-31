@@ -6,23 +6,17 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
-[[bin]]
-name = "terra-agent"
-path = "src/guest/main.rs"
-
 [dependencies]
 anyhow = { workspace = true }
 terra-shared = { path = "../terra-shared" }
 
-# Binary-only: the agent runs as a Linux guest init, never built off-Linux.
 [target.'cfg(target_os = "linux")'.dependencies]
-libc.workspace = true
+linux-raw-sys.workspace = true
 pty-process = "0.5"
+rustix.workspace = true
 # Terminal screen model so a client attaching to a running TUI gets repainted
 # with the current screen instead of missing history.
 vt100 = "0.16"
 
-# The workspace denies `unsafe_code`, the binary allows it wholesale (vsock syscalls);
-# Cargo lints arrive as command-line levels, which a crate attribute may override.
 [lints]
 workspace = true

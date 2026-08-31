@@ -15,7 +15,7 @@ static VOLUME_IMG_GZ: &[u8] = include_bytes!(env!("TERRA_VOLUME_IMG"));
 
 /// The guest kernel built from vendor/libkrunfw; the Makefile sets
 /// `TERRA_KERNEL_GZ`. An ELF vmlinux on `x86_64`, a flat `Image` on aarch64 —
-/// see `libkrun_ext::KERNEL_FORMAT`, which has to agree with it.
+/// The format passed to libkrun has to agree with it.
 static KERNEL_GZ: &[u8] = include_bytes!(env!("TERRA_KERNEL_GZ"));
 const KERNEL_NAME: &str = concat!("vmlinux-", include_str!(env!("TERRA_KERNEL_GZ_SHA256")));
 
@@ -23,6 +23,7 @@ const KERNEL_NAME: &str = concat!("vmlinux-", include_str!(env!("TERRA_KERNEL_GZ
 /// filesystem is this volume, never a host directory.
 static BOOT_IMG_GZ: &[u8] = include_bytes!(env!("TERRA_BOOT_IMG"));
 const BOOT_NAME: &str = concat!("boot-", include_str!(env!("TERRA_BOOT_IMG_SHA256")));
+const BYTES_PER_MIB: u64 = 1024 * 1024;
 
 fn to_stage_path(path: &Path) -> PathBuf {
     let name = path
@@ -34,7 +35,7 @@ fn to_stage_path(path: &Path) -> PathBuf {
     path.with_file_name(format!(".{name}.{}.tmp", std::process::id()))
 }
 
-fn stage_pid(name: &str) -> Option<u32> {
+fn parse_staged_pid(name: &str) -> Option<u32> {
     name.strip_prefix('.')?
         .strip_suffix(".tmp")?
         .rsplit('.')
@@ -47,8 +48,8 @@ fn stage_pid(name: &str) -> Option<u32> {
 /// the pid in a temp's name, and a live writer keeps its temporary - only it
 /// knows how far the write got.
 pub(crate) fn sweep_staging_temps(dir: &Path, is_alive: impl Fn(u32) -> bool) {
-    for entry in crate::sys::dir_entries(dir) {
-        let Some(pid) = entry.file_name().to_str().and_then(stage_pid) else {
+    for entry in crate::sys::list_dir_entries(dir) {
+        let Some(pid) = entry.file_name().to_str().and_then(parse_staged_pid) else {
             continue;
         };
         if !is_alive(pid) {
@@ -58,22 +59,64 @@ pub(crate) fn sweep_staging_temps(dir: &Path, is_alive: impl Fn(u32) -> bool) {
 }
 
 pub(crate) fn staged_write(path: &Path, write: impl FnOnce(&mut File) -> Result<()>) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+    use rustix::fs::{AtFlags, Mode, OFlags, openat, renameat, unlinkat};
+
+    let parent_path = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let destination_name = path
+        .file_name()
+        .context("destination has no file name")?
+        .to_owned();
+    let parent = terra_shared::no_symlinks::open_no_symlinks(
+        parent_path,
+        terra_shared::no_symlinks::OpenMode::ReadDirectory,
+    )
+    .with_context(|| format!("opening {}", parent_path.display()))?;
+    match rustix::fs::statat(&parent, &destination_name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(metadata) => anyhow::ensure!(
+            !rustix::fs::FileType::from_raw_mode(metadata.st_mode).is_symlink(),
+            "{} is a symlink",
+            crate::render::escape_printable_path(path)
+        ),
+        Err(error) if error == rustix::io::Errno::NOENT => {}
+        Err(error) => {
+            return Err(std::io::Error::from(error)).with_context(|| {
+                format!("checking {}", crate::render::escape_printable_path(path))
+            });
+        }
     }
     let tmp = to_stage_path(path);
-    let mut out = File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
-    match write(&mut out) {
+    let temporary_name = tmp
+        .file_name()
+        .context("staging path has no file name")?
+        .to_owned();
+    let mut out: File = openat(
+        &parent,
+        &temporary_name,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o600),
+    )
+    .map(Into::into)
+    .with_context(|| format!("creating {}", tmp.display()))?;
+
+    let result = match write(&mut out) {
         Ok(()) => {
-            std::fs::rename(&tmp, path).with_context(|| format!("installing {}", path.display()))
-        }
-        Err(e) => {
             drop(out);
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
+            renameat(&parent, &temporary_name, &parent, &destination_name)
+                .map_err(std::io::Error::from)
+                .with_context(|| format!("installing {}", path.display()))
         }
+        Err(error) => {
+            drop(out);
+            Err(error)
+        }
+    };
+    if result.is_err() {
+        let _ = unlinkat(&parent, &temporary_name, AtFlags::empty());
     }
+    result
 }
 
 /// Unpack `src` into a staging temporary for `path`; `finish` sees the open
@@ -101,7 +144,7 @@ pub fn ensure_volume_image(path: &Path, size_mib: u32) -> Result<()> {
 }
 
 fn ensure_image(path: &Path, size_mib: u32, gz: &[u8], field: &str) -> Result<()> {
-    let target = u64::from(size_mib) * 1024 * 1024;
+    let target = u64::from(size_mib) * BYTES_PER_MIB;
     if path.exists() {
         return resize_image(path, target, field);
     }
@@ -122,7 +165,8 @@ fn resize_image(path: &Path, target: u64, field: &str) -> Result<()> {
     let current = std::fs::metadata(path)
         .with_context(|| format!("reading {}", path.display()))?
         .len();
-    let mib = |n: u64| n.div_ceil(1024 * 1024);
+    let mib = |n: u64| n.div_ceil(BYTES_PER_MIB);
+    let name = path.file_name().unwrap_or(path.as_os_str()).display();
     match target.cmp(&current) {
         std::cmp::Ordering::Equal => {}
         std::cmp::Ordering::Greater => {
@@ -135,7 +179,7 @@ fn resize_image(path: &Path, target: u64, field: &str) -> Result<()> {
             eprintln!(
                 "terra: {field} raised to {} MiB - the guest will expand {} on this boot",
                 mib(target),
-                path.file_name().unwrap_or(path.as_os_str()).display()
+                name
             );
         }
         std::cmp::Ordering::Less => {
@@ -144,7 +188,7 @@ fn resize_image(path: &Path, target: u64, field: &str) -> Result<()> {
                  shrinking would truncate the filesystem, so the existing size is kept \
                  (`terra rm` rebuilds the box at the smaller size)",
                 mib(target),
-                path.file_name().unwrap_or(path.as_os_str()).display(),
+                name,
                 mib(current),
             );
         }
@@ -153,18 +197,18 @@ fn resize_image(path: &Path, target: u64, field: &str) -> Result<()> {
 }
 
 pub fn ensure_kernel_on_disk() -> Result<PathBuf> {
-    cached(KERNEL_GZ, KERNEL_NAME, "guest kernel")
+    ensure_cached_payload(KERNEL_GZ, KERNEL_NAME, "guest kernel")
 }
 
 pub fn ensure_boot_volume_on_disk() -> Result<PathBuf> {
-    cached(BOOT_IMG_GZ, BOOT_NAME, "boot image")
+    ensure_cached_payload(BOOT_IMG_GZ, BOOT_NAME, "boot image")
 }
 
-/// Unpack an embedded payload into [`crate::state::cache_path`], skipping the
+/// Unpack an embedded payload into [`crate::state::get_cache_path`], skipping the
 /// work when it is already there. `name` embeds the payload's hash, so entries
 /// are trusted by name and length alone; the owner-only directory
 /// `ensure_cache_dir` insists on is what makes that trust safe.
-fn cached(gz: &[u8], name: &str, what: &str) -> Result<PathBuf> {
+fn ensure_cached_payload(gz: &[u8], name: &str, what: &str) -> Result<PathBuf> {
     let dir = crate::state::ensure_cache_dir()?;
     let path = dir.join(name);
 
@@ -182,7 +226,7 @@ fn cached(gz: &[u8], name: &str, what: &str) -> Result<PathBuf> {
         .with_context(|| format!("unpacking the {what}"))?;
 
     let stale = format!("{}-", name.split_once('-').map_or(name, |(p, _)| p));
-    for entry in crate::sys::dir_entries(&dir) {
+    for entry in crate::sys::list_dir_entries(&dir) {
         if entry.path() != path && entry.file_name().to_string_lossy().starts_with(&stale) {
             let _ = std::fs::remove_file(entry.path());
         }
@@ -198,7 +242,7 @@ mod tests {
     #[test]
     fn resizing_grows_but_never_shrinks() {
         let dir = tempfile::tempdir().unwrap();
-        let img = dir.path().join("rootfs.img");
+        let img = dir.path().join(crate::state::ROOTFS_FILE);
         let mib = 1024 * 1024;
         std::fs::write(&img, vec![0u8; 0]).unwrap();
         File::options()
@@ -252,7 +296,7 @@ mod tests {
     fn a_failed_staged_write_leaves_the_installed_file_alone() {
         use std::io::Write as _;
         let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("rootfs.img");
+        let target = dir.path().join(crate::state::ROOTFS_FILE);
         std::fs::write(&target, b"old bytes").unwrap();
 
         let err = staged_write(&target, |out| {
@@ -278,14 +322,61 @@ mod tests {
         })
         .expect("an uneventful write installs");
         assert_eq!(std::fs::read(&target).unwrap(), b"fresh bytes");
+
+        let target_dir = dir.path().join("target-dir");
+        std::fs::create_dir(&target_dir).unwrap();
+        assert!(staged_write(&target_dir, |_| Ok(())).is_err());
+        assert!(!to_stage_path(&target_dir).exists());
     }
 
     #[test]
-    fn stage_pid_reads_the_writer_out_of_the_name() {
-        assert_eq!(stage_pid(".rootfs.img.42.tmp"), Some(42));
-        assert_eq!(stage_pid(".boot-deadbeef.7.tmp"), Some(7));
+    fn a_staged_symlink_is_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("image.img");
+        let redirected = dir.path().join("redirected");
+        std::fs::write(&redirected, b"original").unwrap();
+        std::os::unix::fs::symlink(&redirected, to_stage_path(&target)).unwrap();
+
+        assert!(staged_write(&target, |_| Ok(())).is_err());
+        assert_eq!(std::fs::read(&redirected).unwrap(), b"original");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_staged_write_refuses_a_symlink_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("image.img");
+        let redirected = dir.path().join("redirected");
+        std::fs::write(&redirected, b"original").unwrap();
+        std::os::unix::fs::symlink(&redirected, &target).unwrap();
+
+        assert!(staged_write(&target, |_| Ok(())).is_err());
+        assert_eq!(std::fs::read(&redirected).unwrap(), b"original");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_staged_write_does_not_follow_a_parent_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_parent = dir.path().join("real");
+        std::fs::create_dir(&real_parent).unwrap();
+        let linked_parent = dir.path().join("linked");
+        std::os::unix::fs::symlink(&real_parent, &linked_parent).unwrap();
+
+        assert!(staged_write(&linked_parent.join("image.img"), |_| Ok(())).is_err());
+        assert!(!real_parent.join("image.img").exists());
+    }
+
+    #[test]
+    fn read_stage_pid_from_the_writer_name() {
+        assert_eq!(parse_staged_pid(".rootfs.img.42.tmp"), Some(42));
+        assert_eq!(parse_staged_pid(".boot-deadbeef.7.tmp"), Some(7));
         for other in ["vol-data.img", ".half", ".x.nopid.tmp", "", ".tmp"] {
-            assert_eq!(stage_pid(other), None, "{other:?} is not a staging temp");
+            assert_eq!(
+                parse_staged_pid(other),
+                None,
+                "{other:?} is not a staging temp"
+            );
         }
     }
 

@@ -8,13 +8,13 @@ use std::process::ExitCode;
 
 pub fn run(args: &crate::cli::LsArgs, project_dir: &Path) -> Result<ExitCode> {
     let boxes = if args.all {
-        boxes_on_this_machine()?
+        list_boxes_on_this_machine()?
     } else {
-        boxes_of_project(project_dir)?
+        list_boxes_of_project(project_dir)?
     };
     if args.tsv {
         for bx in boxes {
-            println!("{}", tsv_line(&bx));
+            println!("{}", format_tsv_line(&bx));
         }
         return Ok(ExitCode::SUCCESS);
     }
@@ -30,34 +30,34 @@ pub fn run(args: &crate::cli::LsArgs, project_dir: &Path) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     for bx in boxes {
-        let box_state = bx.state();
+        let box_state = bx.get_state();
         if args.all {
             println!(
                 "{box_state:<12} {} ({})",
-                bx.project_dir().display(),
-                bx.name()
+                bx.get_project_dir().display(),
+                bx.get_name()
             );
         } else {
-            println!("{box_state:<12} {}", bx.name());
+            println!("{box_state:<12} {}", bx.get_name());
         }
         if !matches!(box_state, state::BoxState::NotCreated) {
-            println!("  files: {}", bx.dir().display());
+            println!("  files: {}", bx.get_dir().display());
         }
     }
     Ok(ExitCode::SUCCESS)
 }
 
-fn tsv_line(bx: &BoxRef) -> String {
+fn format_tsv_line(bx: &BoxRef) -> String {
     format!(
         "{}\t{}\t{}\t{}",
-        bx.state(),
-        bx.name(),
-        bx.project_dir().display(),
-        bx.dir().display()
+        bx.get_state(),
+        bx.get_name(),
+        bx.get_project_dir().display(),
+        bx.get_dir().display()
     )
 }
 
-fn boxes_of_project(project_dir: &Path) -> Result<Vec<BoxRef>> {
+fn list_boxes_of_project(project_dir: &Path) -> Result<Vec<BoxRef>> {
     // Listing is what you reach for to find out what is wrong, so a broken
     // manifest must not be the thing that stops it.
     resolve::list_known_names(
@@ -69,19 +69,19 @@ fn boxes_of_project(project_dir: &Path) -> Result<Vec<BoxRef>> {
     .collect()
 }
 
-/// Every box under [`state::box_home_path`], sorted by the directory it belongs
+/// Every box under [`state::get_box_home_path`], sorted by the directory it belongs
 /// to. A slug that never recorded an origin label is not ours to list.
-fn boxes_on_this_machine() -> Result<Vec<BoxRef>> {
-    let home = state::box_home_path()?;
+fn list_boxes_on_this_machine() -> Result<Vec<BoxRef>> {
+    let home = state::get_box_home_path()?;
     let mut boxes: Vec<(PathBuf, String, PathBuf)> = Vec::new();
     for project in
-        crate::sys::dir_entries(&home).filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        crate::sys::list_dir_entries(&home).filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
     {
         let project = project.path();
         let Some(origin) = state::read_origin(&project) else {
             continue;
         };
-        for (name, dir) in state::boxes_in(&project) {
+        for (name, dir) in state::list_boxes_in(&project) {
             boxes.push((origin.clone(), name, dir));
         }
     }
@@ -105,10 +105,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let _home = crate::sys::TestHome::new();
         let bx = BoxRef::resolve(dir.path(), "dev").unwrap();
-        std::fs::create_dir_all(bx.dir()).unwrap();
-        std::fs::write(bx.rootfs_img(), b"image").unwrap();
+        std::fs::create_dir_all(bx.get_dir()).unwrap();
+        std::fs::write(bx.get_dir().join(crate::state::ROOTFS_FILE), b"image").unwrap();
 
-        let line = tsv_line(&bx);
+        let line = format_tsv_line(&bx);
         let fields: Vec<&str> = line.split('\t').collect();
         assert_eq!(
             fields,
@@ -116,7 +116,7 @@ mod tests {
                 "stopped".to_string(),
                 "dev".to_string(),
                 dir.path().display().to_string(),
-                bx.dir().display().to_string(),
+                bx.get_dir().display().to_string(),
             ],
             "{line}"
         );

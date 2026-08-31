@@ -2,18 +2,17 @@
 //! itself, and how arbitrary text is reduced to that alphabet.
 
 use anyhow::{Result, bail};
+use std::ffi::OsStr;
+use std::path::Path;
 
 pub(crate) const RESERVED_NAMES: &[&str] = &[
     "detach", "exec", "get", "help", "logs", "ls", "ps", "put", "rm", "sessions", "setup", "show",
     "stop", "storage",
 ];
 
-pub(crate) const RESERVED_FOR_FUTURE_VERBS: &[&str] = &[
-    "attach", "build", "check", "clone", "config", "copy", "cp", "create", "delete", "destroy",
-    "edit", "export", "import", "info", "init", "inspect", "kill", "list", "pause", "prune",
-    "pull", "push", "rename", "restart", "resume", "run", "start", "stats", "status", "top",
-    "unpause", "update", "upgrade", "version", "wait", "watch",
-];
+pub(crate) fn is_recipe_ext(extension: &OsStr) -> bool {
+    extension == "yaml" || extension == "yml"
+}
 
 /// Refuse a name that could not be a state subdirectory or fit a socket path,
 /// before anything is built under it.
@@ -21,10 +20,7 @@ pub fn validate_box_name(name: &str) -> Result<()> {
     if RESERVED_NAMES.contains(&name) {
         bail!("'{name}' cannot name a box: it is a terra command");
     }
-    if RESERVED_FOR_FUTURE_VERBS.contains(&name) {
-        bail!("'{name}' cannot name a box: it is held for a future terra command");
-    }
-    if crate::resolve::names_recipe_file(name) {
+    if Path::new(name).extension().is_some_and(is_recipe_ext) {
         bail!("'{name}' cannot name a box: it names a recipe file (try './{name}')");
     }
     // A leading `_` is reserved for terra's own argv words (`__vm`).
@@ -69,12 +65,6 @@ mod tests {
         // (the full list is pinned against the CLI in `cli::tests`).
         for word in ["ls", "stop", "logs", "ps", "help"] {
             assert!(validate_box_name(word).is_err(), "{word}");
-        }
-        // …and so are the words a future verb may take, which is the whole
-        // point of holding them before anyone has a box by that name.
-        for word in ["start", "run", "status", "restart", "init"] {
-            let err = validate_box_name(word).unwrap_err().to_string();
-            assert!(err.contains("future terra command"), "{word}: {err}");
         }
         // A recipe-file spelling is a path, never a name - one argument must
         // not mean a file to `setup` and a box to everything else.

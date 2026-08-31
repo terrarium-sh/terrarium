@@ -4,7 +4,7 @@ use super::*;
 /// file, and the box's, which its mounts are relative to.
 fn load_from(arg: &str, cwd: &Path, project_dir: &Path) -> Result<Config> {
     let recipe = crate::resolve::read_recipe(arg, cwd)?
-        .ok_or_else(|| crate::resolve::no_such_recipe(arg, arg, cwd))
+        .ok_or_else(|| crate::resolve::build_missing_recipe_error(arg, arg, cwd))
         .context("resolving the recipe")?;
     parse_recipe(&recipe.text, project_dir, &recipe.from)
 }
@@ -14,7 +14,7 @@ fn load(arg: &str, cwd: &Path) -> Result<Config> {
 }
 
 /// [`parse_recipe`] and the [`merge_env_file`] step that follows it in
-/// [`crate::resolve::ResolvedBox::parsed_recipe`] - together, a full read of a
+/// [`crate::resolve::ResolvedBox::parse_recipe`] - together, a full read of a
 /// recipe.
 fn read_fully(text: &str, project_dir: &Path, source: &Path) -> Result<Config> {
     let mut cfg = parse_recipe(text, project_dir, source)?;
@@ -62,11 +62,11 @@ fn parsing_a_recipe_does_not_touch_the_host_paths_it_names() {
         "a relative host is still made absolute against the project"
     );
 
-    let err = resolve_mounts(&mut cfg).unwrap_err().to_string();
-    assert!(err.contains("does not exist"), "{err}");
+    let err = resolve_mounts_for(&mut cfg.mounts).unwrap_err().to_string();
+    assert!(err.contains("resolving mount host path"), "{err}");
 
     std::fs::create_dir(project.join("gone")).unwrap();
-    resolve_mounts(&mut cfg).unwrap();
+    resolve_mounts_for(&mut cfg.mounts).unwrap();
     assert_eq!(
         cfg.mounts[0].host,
         std::fs::canonicalize(project.join("gone")).unwrap()
@@ -180,6 +180,22 @@ fn a_bad_env_file_is_refused() {
         .to_string();
     assert!(err.contains("environment variable"), "{err}");
     assert!(err.contains("KEY=VAL"), "the spelling that works: {err}");
+}
+
+#[test]
+fn an_env_file_past_the_size_limit_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("large.env"),
+        vec![b'x'; usize::try_from(MAX_ENV_FILE_BYTES + 1).unwrap()],
+    )
+    .unwrap();
+
+    let err = read_fully("env_file: large.env\n", dir.path(), Path::new("r.yaml"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("env file"), "{err}");
+    assert!(err.contains("limit"), "{err}");
 }
 
 /// An `env_file:` that is not there must not stop the recipe *parsing*: a
@@ -354,7 +370,7 @@ fn unknown_keys_and_missing_required_fields_are_refused() {
 }
 
 #[test]
-fn volume_names_are_validated() {
+fn validate_volume_names() {
     let try_parse = |yaml: &str| parse_recipe(yaml, Path::new("/proj"), Path::new("/proj/r.yaml"));
     assert!(try_parse("volumes:\n  - {name: data, guest: /data, size_mib: 64}\n").is_ok());
     // The name is required - it keys the image file.
@@ -378,8 +394,10 @@ fn volume_names_are_validated() {
         }
         try_parse(&y)
     };
-    assert!(many(terra_shared::MAX_VOLUMES).is_ok());
-    let err = many(terra_shared::MAX_VOLUMES + 1).unwrap_err().to_string();
+    assert!(many(terra_shared::contract::MAX_VOLUMES).is_ok());
+    let err = many(terra_shared::contract::MAX_VOLUMES + 1)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("at most"), "{err}");
 }
 

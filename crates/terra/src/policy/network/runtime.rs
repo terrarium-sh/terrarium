@@ -1,8 +1,10 @@
 use crate::config::{Network, NetworkMode};
 use anyhow::{Result, bail};
+use lru::LruCache;
 use smolvm_network::{Cidr, DnsDecision, FloorMode, Policy, dns, is_floored};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::num::NonZeroUsize;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -29,14 +31,6 @@ const MAX_LEARNED_TTL: u64 = 3600;
 /// process, which `hw.mem_mib` does not cap.
 pub const LEARNED_ADDRESSES_CAPACITY: usize = 4096;
 
-/// Refuse a `network:` section the gateway could not be built from - at
-/// recipe time, the only place anyone is listening: the gateway is built
-/// mid-boot, after `terra setup` pinned the recipe and the `y` was given.
-/// This builds exactly what a boot would and throws it away.
-pub fn validate(net: &Network) -> Result<()> {
-    BoxPolicy::new(net).map(drop)
-}
-
 pub fn describe(net: &Network) -> &'static str {
     match net.mode {
         NetworkMode::UnrestrictedPublic if net.allow.is_empty() => {
@@ -61,24 +55,37 @@ pub struct BoxPolicy {
     mode: NetworkMode,
     address_rules: Vec<(Cidr, Port)>,
     name_rules: Vec<(String, Port)>,
-    pub(crate) learned_dns: Mutex<HashMap<(IpAddr, Port), Instant>>,
+    pub(crate) learned_dns: Mutex<LruCache<(IpAddr, Port), Instant>>,
     static_dns: HashMap<String, Vec<IpAddr>>,
     host_grants: Vec<Port>,
-    host: [IpAddr; 2],
 }
 
 impl BoxPolicy {
     pub fn new(net: &Network) -> Result<Self> {
-        // The gateway's v4 and ULA endpoints are what HOST_LOOPBACK grants.
-        // Nothing here calls the host by link-local - guests are supposed to use IPv4/6.
-        let layout = smolvm_network::GuestNetworkConfig::default();
-        let gateway_addrs = [
-            IpAddr::V4(layout.gateway_ip),
-            IpAddr::V6(layout.gateway_ip6),
-        ];
+        let addrs = HOST_ADDRS;
+        let static_dns = Self::parse_static_dns(net, &addrs)?;
+        let (address_rules, name_rules, host_grants) =
+            Self::parse_allow_rules(net, &static_dns, &addrs)?;
+        Ok(Self {
+            mode: net.mode,
+            address_rules,
+            name_rules,
+            learned_dns: Mutex::new(LruCache::new(
+                #[allow(clippy::unwrap_used)]
+                NonZeroUsize::new(LEARNED_ADDRESSES_CAPACITY).unwrap(),
+            )),
+            static_dns,
+            host_grants,
+        })
+    }
+
+    fn parse_static_dns(
+        net: &Network,
+        gateway_addrs: &[IpAddr; 2],
+    ) -> Result<HashMap<String, Vec<IpAddr>>> {
         let mut static_dns: HashMap<String, Vec<IpAddr>> = HashMap::new();
         for rule in &net.hosts {
-            let (key, addrs) = parse_dns_record(rule, &gateway_addrs)?;
+            let (key, addrs) = parse_dns_record(rule, gateway_addrs)?;
             if static_dns.insert(key, addrs).is_some() {
                 bail!(
                     "duplicate hosts record for '{}': it names the same record as an earlier \
@@ -87,7 +94,15 @@ impl BoxPolicy {
                 );
             }
         }
+        Ok(static_dns)
+    }
 
+    #[allow(clippy::type_complexity)]
+    fn parse_allow_rules(
+        net: &Network,
+        static_dns: &HashMap<String, Vec<IpAddr>>,
+        gateway_addrs: &[IpAddr; 2],
+    ) -> Result<(Vec<(Cidr, Port)>, Vec<(String, Port)>, Vec<Port>)> {
         let mut address_rules = Vec::new();
         let mut name_rules = Vec::new();
         let mut host_grants = Vec::new();
@@ -95,26 +110,23 @@ impl BoxPolicy {
             match parse_allow(entry)? {
                 Rule::Host(port) => host_grants.push(port),
                 Rule::Addr(cidr, port) => {
-                    match gateway_addrs
-                        .iter()
-                        .find(|host_addr| is_single_address(cidr, **host_addr))
-                    {
-                        Some(gw) => bail!(
+                    if let Some(gw) = gateway_addrs.iter().find(|a| is_single_address(cidr, **a)) {
+                        bail!(
                             "allow rule '{entry}': {gw} is the machine terra is running on, \
                              which no address rule opens - write '{HOST_LOOPBACK_SYMBOL}' (with the \
                              same ':PORT', if any) to open the host"
-                        ),
-                        None => address_rules.push((cidr, port)),
+                        );
                     }
+                    address_rules.push((cidr, port));
                 }
                 Rule::Name(name, port) => {
-                    let resolved_addrs: Vec<IpAddr> = static_dns
+                    let resolved: Vec<IpAddr> = static_dns
                         .iter()
-                        .filter(|(record, _)| name_covers(&name, record))
-                        .flat_map(|(_, addrs)| addrs)
+                        .filter(|(r, _)| name_covers(&name, r))
+                        .flat_map(|(_, a)| a)
                         .copied()
                         .collect();
-                    if resolved_addrs.is_empty() && net.mode == NetworkMode::UnrestrictedPublic {
+                    if resolved.is_empty() && net.mode == NetworkMode::UnrestrictedPublic {
                         bail!(
                             "allow rule '{entry}' opens nothing under \
                              'mode: unrestricted-public': every public address is already \
@@ -126,7 +138,7 @@ impl BoxPolicy {
                              to 'mode: allowlist' where a name rule gates public egress."
                         );
                     }
-                    for addr in resolved_addrs {
+                    for addr in resolved {
                         if gateway_addrs.contains(&addr) {
                             host_grants.push(port);
                         } else if let Some(cidr) = Cidr::parse(&addr.to_string()) {
@@ -137,16 +149,7 @@ impl BoxPolicy {
                 }
             }
         }
-
-        Ok(Self {
-            mode: net.mode,
-            address_rules,
-            name_rules,
-            learned_dns: Mutex::new(HashMap::new()),
-            static_dns,
-            host_grants,
-            host: gateway_addrs,
-        })
+        Ok((address_rules, name_rules, host_grants))
     }
 
     #[must_use]
@@ -159,11 +162,6 @@ impl BoxPolicy {
             .filter(|(rule, _)| name_covers(rule, &name))
             .map(|(_, grant)| *grant)
             .collect()
-    }
-
-    #[must_use]
-    pub(crate) fn is_restricted(&self) -> bool {
-        self.mode == NetworkMode::Allowlist
     }
 
     pub(crate) fn static_answer(&self, name: &str) -> Option<&[IpAddr]> {
@@ -187,29 +185,23 @@ impl BoxPolicy {
             return;
         };
         let now = Instant::now();
-        learned.retain(|_, expires_at| *expires_at > now);
+        let host = HOST_ADDRS;
         for (ip, ttl) in records {
             // A learned address is only a resolver's word, and that is where
             // DNS rebinding aims, so the floor and the host stay closed to it.
-            if is_floored(*ip, EGRESS_FLOOR) || self.host.contains(ip) {
+            if is_floored(*ip, EGRESS_FLOOR) || host.contains(ip) {
                 continue;
             }
             let expires_at =
                 now + Duration::from_secs(u64::from(*ttl).clamp(MIN_LEARNED_TTL, MAX_LEARNED_TTL));
             for grant in &grants {
-                // ponytail: O(n) scan, only once the cap is reached - a heap
-                // keyed by expiry would pay for itself only at a far larger cap.
-                if learned.len() >= LEARNED_ADDRESSES_CAPACITY
-                    && !learned.contains_key(&(*ip, *grant))
-                    && let Some(soonest) =
-                        learned.iter().min_by_key(|(_, at)| **at).map(|(k, _)| *k)
-                {
-                    learned.remove(&soonest);
+                let key = (*ip, *grant);
+                if let Some(prev) = learned.get(&key) {
+                    let max = (*prev).max(expires_at);
+                    learned.put(key, max);
+                } else {
+                    learned.put(key, expires_at);
                 }
-                learned
-                    .entry((*ip, *grant))
-                    .and_modify(|at| *at = (*at).max(expires_at))
-                    .or_insert(expires_at);
             }
         }
     }
@@ -230,6 +222,15 @@ impl BoxPolicy {
     }
 }
 
+/// The gateway's v4 and ULA endpoints, what `HOST_LOOPBACK` grants.
+pub(crate) const HOST_ADDRS: [IpAddr; 2] = {
+    let layout = smolvm_network::GuestNetworkConfig::default();
+    [
+        IpAddr::V4(layout.gateway_ip),
+        IpAddr::V6(layout.gateway_ip6),
+    ]
+};
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum DnsVerdict {
     Answer(Vec<IpAddr>),
@@ -239,13 +240,13 @@ pub(crate) enum DnsVerdict {
 
 impl BoxPolicy {
     pub(crate) fn is_granted(&self, ip: IpAddr, port: Option<u16>) -> bool {
-        if self.host.contains(&ip) {
-            return self.host_grants.iter().any(|g| g.covers(port));
+        if HOST_ADDRS.contains(&ip) {
+            return self.host_grants.iter().any(|g| g.is_none() || *g == port);
         }
         if self
             .address_rules
             .iter()
-            .any(|(cidr, grant)| cidr.contains(ip) && grant.covers(port))
+            .any(|(cidr, grant)| cidr.contains(ip) && (grant.is_none() || *grant == port))
         {
             return true;
         }
@@ -257,14 +258,11 @@ impl BoxPolicy {
             // A poisoned lock denies rather than propagates - the safe half.
             NetworkMode::Allowlist => self.learned_dns.lock().is_ok_and(|learned| {
                 let now = Instant::now();
-                [Some(Port::Any), port.map(Port::Only)]
-                    .into_iter()
-                    .flatten()
-                    .any(|grant| {
-                        learned
-                            .get(&(ip, grant))
-                            .is_some_and(|expires_at| *expires_at > now)
-                    })
+                [None, port].into_iter().any(|grant| {
+                    learned
+                        .peek(&(ip, grant))
+                        .is_some_and(|expires_at| *expires_at > now)
+                })
             }),
         }
     }
@@ -273,19 +271,21 @@ impl BoxPolicy {
 impl Policy for BoxPolicy {
     fn allows(&self, ip: IpAddr, port: Option<u16>) -> bool {
         if self.is_granted(ip, port) {
-            log::trace!("terra: egress: allowed {}{}", ip, port_suffix(port));
+            log::trace!(
+                "terra: egress: allowed {ip}{}",
+                port.map_or_else(String::new, |port| format!(":{port}"))
+            );
             return true;
         }
         log::warn!(
-            "terra: egress: blocked {}{} - no rule names it",
-            ip,
-            port_suffix(port)
+            "terra: egress: blocked {ip}{} - no rule names it",
+            port.map_or_else(String::new, |port| format!(":{port}"))
         );
         false
     }
 
     fn rewrite(&self, ip: IpAddr) -> Option<IpAddr> {
-        self.host.contains(&ip).then_some(match ip {
+        HOST_ADDRS.contains(&ip).then_some(match ip {
             IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
             IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
         })
@@ -322,11 +322,6 @@ impl Policy for BoxPolicy {
         // Every allowlist box: TCP/53 to an allowed resolver could carry names
         // the rules refuse - the query itself is the leak. And any box
         // answering names itself, or the guest's own resolver would win.
-        self.is_restricted() || !self.static_dns.is_empty()
+        self.mode == NetworkMode::Allowlist || !self.static_dns.is_empty()
     }
-}
-
-#[must_use]
-fn port_suffix(port: Option<u16>) -> String {
-    port.map_or(String::new(), |p| format!(":{p}"))
 }

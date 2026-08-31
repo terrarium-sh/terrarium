@@ -7,6 +7,7 @@ mod validate;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use validate::{validate, validate_env};
@@ -30,8 +31,7 @@ pub struct Config {
     /// wins). `BTreeMap` so the export order is deterministic.
     pub env: BTreeMap<String, String>,
     /// A dotenv-style file merged over `env:` - the file wins. `KEY=VAL`
-    /// lines only, no space around the `=`. The value is taken literally,
-    /// quotes included. A shell `export` prefix is refused.
+    /// lines only, no space around the `=`.
     pub env_file: Option<PathBuf>,
 }
 
@@ -57,6 +57,8 @@ impl Default for Hw {
 /// Under this the guest kernel dies part-way through boot, which reads as a
 /// hang rather than an error - so a recipe naming less is refused here instead.
 const MIN_MEM_MIB: u32 = 128;
+
+const MAX_ENV_FILE_BYTES: u64 = 1 << 20;
 
 /// A bounded scratch volume
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -97,13 +99,10 @@ pub enum NetworkMode {
 #[serde(default, deny_unknown_fields)]
 pub struct Network {
     pub mode: NetworkMode,
-    /// `HOST-or-IP-or-CIDR[:PORT]`, or `[v6]:port`. No port means any port. A
-    /// name is exact; a leading `*.` opts into its subdomains (on label
-    /// boundaries, never the name itself). An address rule reaches local space
-    /// - writing one down is the operator saying so.
+    /// `HOST-or-IP-or-CIDR[:PORT]`, or `[v6]:port`. No port means any port.
     pub allow: Vec<String>,
     pub hosts: Vec<StaticDnsRecord>,
-    /// Expose a guest listener on the host loopback. `"HOST[:GUEST]"`, so a bare
+    /// Expose a guest listener on the host loopback: `"HOST[:GUEST]"`, so a bare
     /// `"8080"` means `8080:8080`. Bound on `127.0.0.1` only.
     pub ports: Vec<String>,
 }
@@ -132,10 +131,8 @@ pub struct Hooks {
 pub struct Workload {
     pub entrypoint: PathBuf,
     pub args: Vec<String>,
-    /// Where the workload starts, as an absolute guest path. Created if it
-    /// does not exist, owned by the workload user. Unset, the workload starts
-    /// in the workload user's home (`/home/terri`). The boot fails if the
-    /// directory cannot be created or entered.
+    /// Where the workload starts, as an absolute guest path. Unset, the
+    /// workload starts in the workload user's home (`/home/terri`).
     pub workdir: Option<PathBuf>,
 }
 
@@ -189,8 +186,7 @@ pub fn load_manifest(project_dir: &Path) -> Result<Option<Manifest>> {
 /// `terra.yaml` sits in the project root, which is exactly what a box shares,
 /// so a guest can leave it unparseable - and every verb that only needs a *box*
 /// would then refuse, taking `stop`, `rm` and `logs` away from the box that did
-/// it. These read the manifest for a default name and for hint text only, so
-/// carrying on without it costs nothing a warning does not cover.
+/// it.
 #[must_use]
 pub fn load_manifest_or_warn(project_dir: &Path) -> Option<Manifest> {
     match load_manifest(project_dir) {
@@ -206,17 +202,8 @@ pub fn load_manifest_or_warn(project_dir: &Path) -> Option<Manifest> {
     }
 }
 
-/// Canonicalize every `mounts[].host`, refusing one that is not there.
-///
-/// ponytail: this checks the path as it is now, but libkrun re-resolves it
-/// when it opens the share, so a symlink swapped in after this returns still
-/// redirects the mount. Closing it needs an fd-taking virtiofs entry point
-/// upstream (`krun_add_virtiofs*` has none today).
-pub fn resolve_mounts(cfg: &mut Config) -> Result<()> {
-    for m in &mut cfg.mounts {
-        if !m.host.exists() {
-            bail!("mount host path '{}' does not exist", m.host.display());
-        }
+pub(crate) fn resolve_mounts_for(mounts: &mut [Mount]) -> Result<()> {
+    for m in mounts {
         m.host = std::fs::canonicalize(&m.host)
             .with_context(|| format!("resolving mount host path '{}'", m.host.display()))?;
     }
@@ -232,47 +219,92 @@ pub fn load_path(path: &Path, project_dir: &Path) -> Result<Config> {
 pub fn parse_recipe(text: &str, project_dir: &Path, source: &Path) -> Result<Config> {
     let mut cfg: Config = yaml_serde::from_str(text)
         .with_context(|| format!("failed to parse YAML from {}", source.display()))?;
-    place_paths(&mut cfg, project_dir)?;
-    trim_sudo_entries(&mut cfg);
+    for mount in &mut cfg.mounts {
+        mount.host = resolve_recipe_path(&mount.host, project_dir)?;
+    }
+    if let Some(file) = &cfg.env_file {
+        cfg.env_file = Some(resolve_recipe_path(file, project_dir)?);
+    }
+    for path in cfg
+        .mounts
+        .iter_mut()
+        .map(|mount| &mut mount.guest)
+        .chain(cfg.volumes.iter_mut().map(|volume| &mut volume.guest))
+    {
+        *path = normalize_guest_path(path)?;
+    }
+    for command in &mut cfg.sudo {
+        *command = command.trim().to_string();
+    }
     validate(&cfg)?;
     Ok(cfg)
 }
+
+fn normalize_guest_path(path: &Path) -> Result<PathBuf> {
+    use std::path::Component;
+    if !path.is_absolute() {
+        bail!("guest path must be absolute: '{}'", path.display());
+    }
+    let mut normalized = PathBuf::from("/");
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(name) => normalized.push(name),
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Prefix(_) => bail!("guest path '{}' is not absolute", path.display()),
+        }
+    }
+    Ok(normalized)
+}
 /// The writable shares a recipe declares, read leniently.
 #[must_use]
-pub(crate) fn get_declared_writable_shares(text: &str, project_dir: &Path) -> Vec<PathBuf> {
-    #[derive(Deserialize)]
-    struct DeclaredMounts {
-        #[serde(default)]
-        mounts: Vec<yaml_serde::Value>,
-    }
-    #[derive(Deserialize)]
-    struct DeclaredMount {
-        host: PathBuf,
-        #[serde(default)]
-        readonly: bool,
-    }
-    let Ok(cfg) = yaml_serde::from_str::<DeclaredMounts>(text) else {
+pub(crate) fn list_declared_writable_shares(text: &str, project_dir: &Path) -> Vec<PathBuf> {
+    let Ok(yaml_serde::Value::Mapping(recipe)) = yaml_serde::from_str(text) else {
         return Vec::new();
     };
-    cfg.mounts
-        .into_iter()
-        .filter_map(|m| yaml_serde::from_value::<DeclaredMount>(m).ok())
-        .filter(|m| !m.readonly)
-        .map(|m| recipe_path(&m.host, project_dir).unwrap_or_else(|_| project_dir.join(&m.host)))
+    let Some(yaml_serde::Value::Sequence(mounts)) = recipe.get("mounts") else {
+        return Vec::new();
+    };
+    mounts
+        .iter()
+        .filter_map(|mount| {
+            let yaml_serde::Value::Mapping(mount) = mount else {
+                return None;
+            };
+            if mount
+                .get("readonly")
+                .and_then(yaml_serde::Value::as_bool)
+                .unwrap_or(false)
+            {
+                return None;
+            }
+            yaml_serde::from_value::<PathBuf>(mount.get("host")?.clone()).ok()
+        })
+        .map(|host| {
+            resolve_recipe_path(&host, project_dir).unwrap_or_else(|_| project_dir.join(host))
+        })
         .collect()
 }
 
 /// Merge `env_file:` over `env:` - the file wins - warning on a name set in
 /// both. Read without following symlinks (see [`crate::sys::open_no_symlinks`]).
 pub(crate) fn merge_env_file(cfg: &mut Config) -> Result<()> {
-    let Some(path) = cfg.env_file.clone() else {
+    let Some(path) = cfg.env_file.as_ref() else {
         return Ok(());
     };
-    let text = std::io::read_to_string(
-        crate::sys::open_no_symlinks(&path)
-            .with_context(|| format!("opening env file {}", path.display()))?,
-    )
-    .with_context(|| format!("reading env file {}", path.display()))?;
+    let mut text = String::new();
+    crate::sys::open_no_symlinks(path)
+        .with_context(|| format!("opening env file {}", path.display()))?
+        .take(MAX_ENV_FILE_BYTES + 1)
+        .read_to_string(&mut text)
+        .with_context(|| format!("reading env file {}", path.display()))?;
+    anyhow::ensure!(
+        text.len() as u64 <= MAX_ENV_FILE_BYTES,
+        "env file {} is larger than the {MAX_ENV_FILE_BYTES}-byte limit",
+        path.display()
+    );
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -301,13 +333,13 @@ pub(crate) fn merge_env_file(cfg: &mut Config) -> Result<()> {
 /// never the shell's (see [`crate::resolve`]). The one spelling of the
 /// rule, so a `mounts[].host`, an `env_file:` and a manifest reference cannot
 /// resolve three different ways.
-pub(crate) fn recipe_path(p: &Path, source_dir: &Path) -> Result<PathBuf> {
-    crate::sys::absolute(&expand_tilde(p)?, source_dir)
+pub(crate) fn resolve_recipe_path(p: &Path, source_dir: &Path) -> Result<PathBuf> {
+    crate::sys::resolve_absolute_path(&expand_tilde(p)?, source_dir)
 }
 
 pub(crate) fn expand_tilde(p: &Path) -> Result<PathBuf> {
     if let Ok(rest) = p.strip_prefix("~") {
-        return Ok(crate::sys::home_dir()?.join(rest));
+        return Ok(crate::sys::resolve_home_dir()?.join(rest));
     }
     // `~alice/data` is the shell's expansion, not a path terra can resolve -
     // and it is not the current user's `~` either. Left alone it joins onto the
@@ -322,20 +354,4 @@ pub(crate) fn expand_tilde(p: &Path) -> Result<PathBuf> {
         );
     }
     Ok(p.to_path_buf())
-}
-
-fn place_paths(cfg: &mut Config, project_dir: &Path) -> Result<()> {
-    for m in &mut cfg.mounts {
-        m.host = recipe_path(&m.host, project_dir)?;
-    }
-    if let Some(file) = &cfg.env_file {
-        cfg.env_file = Some(recipe_path(file, project_dir)?);
-    }
-    Ok(())
-}
-
-fn trim_sudo_entries(cfg: &mut Config) {
-    for c in &mut cfg.sudo {
-        *c = c.trim().to_string();
-    }
 }

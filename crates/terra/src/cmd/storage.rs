@@ -1,10 +1,10 @@
 //! `terra <box> storage` - the box's guest filesystem and volume images.
 
 use crate::cli::{StorageCmd, StorageFileArgs};
-use crate::render::printable_path;
+use crate::render::escape_printable_path;
 use crate::state::BoxRef;
 use crate::vm::image;
-use crate::{config, resolve, sys};
+use crate::{config, resolve};
 use anyhow::{Context, Result};
 use flate2::Compression;
 use flate2::read::GzDecoder;
@@ -13,6 +13,8 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+
+const BYTES_PER_MIB: u64 = 1024 * 1024;
 
 pub fn run(
     args: &crate::cli::StorageArgs,
@@ -30,66 +32,70 @@ pub fn run(
 }
 
 #[must_use]
-fn images_of(bx: &BoxRef) -> Vec<PathBuf> {
-    let mut volumes = bx.volume_images();
+fn list_images_of(bx: &BoxRef) -> Vec<PathBuf> {
+    let mut volumes = bx.list_volume_images();
     volumes.sort();
-    std::iter::once(bx.rootfs_img())
+    std::iter::once(bx.get_dir().join(crate::state::ROOTFS_FILE))
         .chain(volumes)
         .filter(|p| p.exists())
         .collect()
 }
 
-fn configured_volume_names(bx: &BoxRef) -> Result<Vec<String>> {
-    let cfg = config::load_path(&bx.recipe(), bx.project_dir())?;
+fn list_configured_volume_names(bx: &BoxRef) -> Result<Vec<String>> {
+    let cfg = config::load_path(
+        &bx.get_dir().join(crate::state::RECIPE_FILE),
+        bx.get_project_dir(),
+    )?;
     Ok(cfg.volumes.into_iter().map(|v| v.name).collect())
 }
 
 fn show(bx: &BoxRef) -> Result<()> {
-    let images = images_of(bx);
+    use std::os::unix::fs::MetadataExt;
+    let images = list_images_of(bx);
     if images.is_empty() {
         eprintln!(
             "terra: {bx} has no images yet - `terra {} setup` builds them",
-            bx.name()
+            bx.get_name()
         );
         return Ok(());
     }
-    let unused = bx.unused_volume_images(&configured_volume_names(bx)?);
+    let unused = bx.list_unused_volume_images(&list_configured_volume_names(bx)?);
 
     let named: Vec<(String, PathBuf)> = images
         .into_iter()
         .map(|p| {
             let name = p.file_name().unwrap_or(p.as_os_str()).to_string_lossy();
-            (printable_path(Path::new(name.as_ref())), p)
+            (escape_printable_path(Path::new(name.as_ref())), p)
         })
         .collect();
     let width = named.iter().map(|(name, _)| name.len()).max().unwrap_or(0);
 
-    println!("{:<12} {}", bx.state(), bx.name());
+    println!("{:<12} {}", bx.get_state(), bx.get_name());
     let mut total = 0;
     for (name, path) in &named {
-        let meta =
-            std::fs::metadata(path).with_context(|| format!("reading {}", printable_path(path)))?;
-        let used = sys::disk_usage(&meta);
+        let meta = std::fs::metadata(path)
+            .with_context(|| format!("reading {}", escape_printable_path(path)))?;
+        let used = meta.blocks() * 512;
         total += used;
         let note = if unused.contains(path) {
             format!(
                 "  (unused - `terra {} storage prune` removes it)",
-                bx.name()
+                bx.get_name()
             )
         } else {
             String::new()
         };
         println!(
             "  {name:<width$}  {:>12}  {:>12} on disk{note}",
-            mib(meta.len()),
-            mib(used)
+            format_mib(meta.len()),
+            format_mib(used)
         );
     }
     println!(
         "  {:<width$}  {:>12}  {:>12} on disk",
         "total",
         "",
-        mib(total)
+        format_mib(total)
     );
     Ok(())
 }
@@ -97,47 +103,50 @@ fn show(bx: &BoxRef) -> Result<()> {
 /// Bytes as MiB with one decimal - integer arithmetic, so no size is rounded
 /// by the float that printed it.
 #[must_use]
-fn mib(bytes: u64) -> String {
-    const MIB: u64 = 1024 * 1024;
-    format!("{}.{} MiB", bytes / MIB, (bytes % MIB) * 10 / MIB)
+fn format_mib(bytes: u64) -> String {
+    format!(
+        "{}.{} MiB",
+        bytes / BYTES_PER_MIB,
+        (bytes % BYTES_PER_MIB) * 10 / BYTES_PER_MIB
+    )
 }
 
-const MAGIC: &[u8; 16] = b"terra-storage-1\n";
+const STORAGE_ARTIFACT_MAGIC: &[u8; 16] = b"terra-storage-1\n";
 
 fn export(bx: &BoxRef, to: &Path) -> Result<()> {
-    let images = images_of(bx);
+    let _lock = bx.lock_run()?;
+    let rootfs = bx.get_dir().join(crate::state::ROOTFS_FILE);
+    let configured = list_configured_volume_names(bx)?
+        .into_iter()
+        .map(|name| bx.get_volume_image(&name))
+        .collect::<Vec<_>>();
+    let images = list_images_of(bx)
+        .into_iter()
+        .filter(|path| path == &rootfs || configured.contains(path))
+        .collect::<Vec<_>>();
     anyhow::ensure!(
         !images.is_empty(),
         "{bx} has no images to export - `terra {} setup` builds them",
-        bx.name()
+        bx.get_name()
     );
-    let _lock = bx.lock_run()?;
 
-    let out = File::create(to).with_context(|| format!("creating {}", printable_path(to)))?;
-    match write_artifact(&images, out) {
-        Ok(()) => {
-            for img in &images {
-                eprintln!("terra: exported {}", printable_path(img));
-            }
-            eprintln!("terra: wrote {}", printable_path(to));
-            Ok(())
-        }
-        // A half-written artifact reads as one until the entry that is cut off.
-        Err(e) => {
-            let _ = std::fs::remove_file(to);
-            Err(e)
-        }
+    image::staged_write(to, |out| write_artifact(&images, out))
+        .with_context(|| format!("writing {}", escape_printable_path(to)))?;
+    for img in &images {
+        eprintln!("terra: exported {}", escape_printable_path(img));
     }
+    eprintln!("terra: wrote {}", escape_printable_path(to));
+    Ok(())
 }
 
-fn write_artifact(images: &[PathBuf], to: File) -> Result<()> {
+fn write_artifact(images: &[PathBuf], to: &mut File) -> Result<()> {
     // `fast`: the images are mostly the zeros a sparse file reads as, which
     // compress the same at any level, and a multi-GiB box should not spend
     // minutes on the rest.
     let mut gz = GzEncoder::new(BufWriter::new(to), Compression::fast());
-    gz.write_all(MAGIC)?;
+    gz.write_all(STORAGE_ARTIFACT_MAGIC)?;
     for img in images {
-        let printable = printable_path(img);
+        let printable = escape_printable_path(img);
         let name = img
             .file_name()
             .and_then(|n| n.to_str())
@@ -172,12 +181,17 @@ fn write_entry_header(out: &mut impl Write, name: &str, len: u64) -> Result<()> 
 
 /// The next entry's name and length, or `None` at the end of the artifact.
 fn read_entry_header(src: &mut impl Read) -> Result<Option<(String, u64)>> {
-    let mut head = [0u8; 10];
-    match src.read_exact(&mut head) {
+    let mut first = [0u8; 1];
+    match src.read_exact(&mut first) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e).context("reading the artifact"),
     }
+    let mut rest = [0u8; 9];
+    src.read_exact(&mut rest).context("reading the artifact")?;
+    let mut head = [0u8; 10];
+    head[..1].copy_from_slice(&first);
+    head[1..].copy_from_slice(&rest);
     // Bounded by its own type: at most 64 KiB of name is allocated for it.
     let name_len = usize::from(u16::from_le_bytes([head[0], head[1]]));
     let len = u64::from_le_bytes([
@@ -190,59 +204,99 @@ fn read_entry_header(src: &mut impl Read) -> Result<Option<(String, u64)>> {
 }
 
 fn import(bx: &BoxRef, from: &Path) -> Result<()> {
-    let file = File::open(from).with_context(|| format!("opening {}", printable_path(from)))?;
+    let file = crate::sys::open_no_symlinks(from)
+        .with_context(|| format!("opening {}", escape_printable_path(from)))?;
     let _lock = bx.lock_run()?;
+    let cfg = config::load_path(
+        &bx.get_dir().join(crate::state::RECIPE_FILE),
+        bx.get_project_dir(),
+    )?;
+    let rootfs_limit = u64::from(cfg.hw.rootfs_mib) * BYTES_PER_MIB;
+    let volume_limit = |name: &str| {
+        let volume_name = name.strip_prefix("vol-")?.strip_suffix(".img")?;
+        cfg.volumes
+            .iter()
+            .find(|volume| volume.name == volume_name)
+            .map(|volume| u64::from(volume.size_mib) * BYTES_PER_MIB)
+    };
+    let total_limit = rootfs_limit
+        + cfg
+            .volumes
+            .iter()
+            .map(|volume| u64::from(volume.size_mib) * BYTES_PER_MIB)
+            .sum::<u64>();
     let mut gz = GzDecoder::new(BufReader::new(file));
 
-    let mut magic = [0u8; MAGIC.len()];
-    gz.read_exact(&mut magic)
-        .ok()
-        .filter(|()| &magic == MAGIC)
-        .with_context(|| {
-            format!(
-                "{} is not a terra storage artifact (`terra <box> storage export` \
-                 writes one)",
-                printable_path(from)
-            )
-        })?;
+    let mut magic = [0u8; STORAGE_ARTIFACT_MAGIC.len()];
+    if gz.read_exact(&mut magic).is_err() || magic != *STORAGE_ARTIFACT_MAGIC {
+        anyhow::bail!(
+            "{} is not a terra storage artifact (`terra <box> storage export` \
+             writes one)",
+            escape_printable_path(from)
+        );
+    }
 
     let mut restored: Vec<PathBuf> = Vec::new();
+    let mut total = 0u64;
     while let Some((name, len)) = read_entry_header(&mut gz)? {
-        let path = bx.image_named(&name).with_context(|| {
+        let path = bx.find_image_named(&name).with_context(|| {
             format!(
                 "{} carries '{}', which is not an image a box holds",
-                printable_path(from),
-                crate::render::printable(&name)
+                escape_printable_path(from),
+                crate::render::escape_printable(&name)
             )
         })?;
         anyhow::ensure!(
             !restored.contains(&path),
             "{} carries '{}' twice",
-            printable_path(from),
-            crate::render::printable(&name)
+            escape_printable_path(from),
+            crate::render::escape_printable(&name)
+        );
+        let limit = if name == crate::state::ROOTFS_FILE {
+            Some(rootfs_limit)
+        } else {
+            volume_limit(&name)
+        }
+        .with_context(|| format!("{name} is not a configured image"))?;
+        anyhow::ensure!(
+            len <= limit,
+            "{} carries '{}' at {len} bytes, past its configured {limit}-byte limit",
+            escape_printable_path(from),
+            crate::render::escape_printable(&name)
+        );
+        total = total
+            .checked_add(len)
+            .context("the artifact's image lengths overflow")?;
+        anyhow::ensure!(
+            total <= total_limit,
+            "{} carries {total} bytes of images, past the {total_limit}-byte import limit",
+            escape_printable_path(from)
         );
         write_sparse(&path, &mut gz, len)?;
-        eprintln!("terra: restored {}", printable_path(&path));
+        eprintln!("terra: restored {}", escape_printable_path(&path));
         restored.push(path);
     }
     anyhow::ensure!(
         !restored.is_empty(),
         "{} holds no images",
-        printable_path(from)
+        escape_printable_path(from)
     );
 
     // Deleting an image the artifact did not carry would throw away the data
     // this import is for.
-    for kept in images_of(bx).iter().filter(|p| !restored.contains(p)) {
+    for kept in list_images_of(bx).iter().filter(|p| !restored.contains(p)) {
         eprintln!(
             "terra: warning: keeping {} - the artifact did not carry it \
              (`terra {} storage prune` removes it if the recipe no longer \
              names that volume)",
-            printable_path(kept),
-            bx.name()
+            escape_printable_path(kept),
+            bx.get_name()
         );
     }
-    eprintln!("terra: imported into {bx} - `terra {}` boots it", bx.name());
+    eprintln!(
+        "terra: imported into {bx} - `terra {}` boots it",
+        bx.get_name()
+    );
     Ok(())
 }
 
@@ -251,7 +305,7 @@ fn import(bx: &BoxRef, from: &Path) -> Result<()> {
 /// off part-way leaves whatever image it was restoring byte-identical.
 fn write_sparse(path: &Path, src: &mut impl Read, len: u64) -> Result<()> {
     const CHUNK: usize = 64 * 1024;
-    let printable = printable_path(path);
+    let printable = escape_printable_path(path);
     image::staged_write(path, |out| {
         let mut src = src.take(len);
         let mut buf = vec![0u8; CHUNK];
@@ -285,15 +339,15 @@ fn write_sparse(path: &Path, src: &mut impl Read, len: u64) -> Result<()> {
 }
 
 fn prune(bx: &BoxRef) -> Result<()> {
-    let configured = configured_volume_names(bx)?;
+    let configured = list_configured_volume_names(bx)?;
     let _lock = bx.lock_run()?;
-    let unused = bx.unused_volume_images(&configured);
+    let unused = bx.list_unused_volume_images(&configured);
     if unused.is_empty() {
         eprintln!("terra: {bx} holds no volume image its recipe dropped");
         return Ok(());
     }
     for img in unused {
-        let printable = printable_path(&img);
+        let printable = escape_printable_path(&img);
         std::fs::remove_file(&img).with_context(|| format!("removing {printable}"))?;
         eprintln!("terra: removed {printable} - the recipe no longer names that volume");
     }
@@ -306,17 +360,17 @@ mod tests {
     use crate::sys::TestHome;
 
     /// A box with a pinned recipe, a root filesystem and the volumes named.
-    fn built(project_dir: &Path, volumes: &[&str]) -> BoxRef {
+    fn build_box_ref(project_dir: &Path, volumes: &[&str]) -> BoxRef {
         use std::fmt::Write as _;
         let bx = BoxRef::resolve(project_dir, "dev").unwrap();
-        std::fs::create_dir_all(bx.dir()).unwrap();
+        std::fs::create_dir_all(bx.get_dir()).unwrap();
         let mut recipe = String::from("hw:\n  cpus: 1\nvolumes:\n");
         for (i, name) in volumes.iter().enumerate() {
             let _ = writeln!(recipe, "  - {{name: {name}, guest: /v{i}, size_mib: 8}}");
-            std::fs::write(bx.volume_img(name), format!("{name} data").as_bytes()).unwrap();
+            std::fs::write(bx.get_volume_image(name), format!("{name} data").as_bytes()).unwrap();
         }
-        std::fs::write(bx.recipe(), recipe).unwrap();
-        std::fs::write(bx.rootfs_img(), b"rootfs data").unwrap();
+        std::fs::write(bx.get_dir().join(crate::state::RECIPE_FILE), recipe).unwrap();
+        std::fs::write(bx.get_dir().join(crate::state::ROOTFS_FILE), b"rootfs data").unwrap();
         bx
     }
 
@@ -327,11 +381,11 @@ mod tests {
     fn an_artifact_carries_every_image_of_a_box_into_another() {
         let dir = tempfile::tempdir().unwrap();
         let _home = TestHome::new();
-        let from = built(dir.path(), &["data", "cache"]);
+        let from = build_box_ref(dir.path(), &["data", "cache"]);
         // A sparse tail, which is what a real rootfs image is mostly made of.
         File::options()
             .write(true)
-            .open(from.rootfs_img())
+            .open(from.get_dir().join(crate::state::ROOTFS_FILE))
             .unwrap()
             .set_len(1 << 20)
             .unwrap();
@@ -339,18 +393,16 @@ mod tests {
         let artifact = dir.path().join("dev.terra");
         export(&from, &artifact).unwrap();
 
-        let into = BoxRef::resolve(&dir.path().join("elsewhere"), "dev").unwrap();
-        std::fs::create_dir_all(into.dir()).unwrap();
-        std::fs::write(into.recipe(), "hw:\n  cpus: 1\n").unwrap();
+        let into = build_box_ref(&dir.path().join("elsewhere"), &["data", "cache"]);
         import(&into, &artifact).unwrap();
 
         for image in [
-            from.rootfs_img(),
-            from.volume_img("data"),
-            from.volume_img("cache"),
+            from.get_dir().join(crate::state::ROOTFS_FILE),
+            from.get_volume_image("data"),
+            from.get_volume_image("cache"),
         ] {
             let name = image.file_name().unwrap().to_str().unwrap();
-            let there = into.dir().join(name);
+            let there = into.get_dir().join(name);
             assert_eq!(
                 std::fs::read(&there).unwrap(),
                 std::fs::read(&image).unwrap(),
@@ -364,6 +416,50 @@ mod tests {
         }
     }
 
+    #[test]
+    fn export_omits_volume_images_the_recipe_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = TestHome::new();
+        let from = build_box_ref(dir.path(), &["data"]);
+        std::fs::write(from.get_volume_image("old"), b"dropped").unwrap();
+
+        let artifact = dir.path().join("dev.terra");
+        export(&from, &artifact).unwrap();
+
+        let into = build_box_ref(&dir.path().join("elsewhere"), &["data"]);
+        import(&into, &artifact).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_refuses_a_symlink_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = TestHome::new();
+        let bx = build_box_ref(dir.path(), &[]);
+        let sentinel = dir.path().join("sentinel");
+        let destination = dir.path().join("export");
+        std::fs::write(&sentinel, b"keep me").unwrap();
+        std::os::unix::fs::symlink(&sentinel, &destination).unwrap();
+
+        assert!(export(&bx, &destination).is_err());
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep me");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_refuses_a_symlinked_destination_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = TestHome::new();
+        let bx = build_box_ref(dir.path(), &[]);
+        let real_parent = dir.path().join("real");
+        let linked_parent = dir.path().join("linked");
+        std::fs::create_dir(&real_parent).unwrap();
+        std::os::unix::fs::symlink(&real_parent, &linked_parent).unwrap();
+
+        assert!(export(&bx, &linked_parent.join("export.terra")).is_err());
+        assert!(!real_parent.join("export.terra").exists());
+    }
+
     /// The names in an artifact were written on another machine, so they are
     /// matched against what this box would call its own images rather than
     /// joined onto its directory - `../../` in one would otherwise write
@@ -372,7 +468,7 @@ mod tests {
     fn an_artifact_naming_a_path_outside_the_box_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let _home = TestHome::new();
-        let bx = built(dir.path(), &[]);
+        let bx = build_box_ref(dir.path(), &[]);
         let outside = dir.path().join("private.txt");
         std::fs::write(&outside, b"mine").unwrap();
 
@@ -388,7 +484,7 @@ mod tests {
                 BufWriter::new(File::create(&artifact).unwrap()),
                 Compression::fast(),
             );
-            gz.write_all(MAGIC).unwrap();
+            gz.write_all(STORAGE_ARTIFACT_MAGIC).unwrap();
             write_entry_header(&mut gz, smuggled, 4).unwrap();
             gz.write_all(b"pwnd").unwrap();
             gz.finish().unwrap().flush().unwrap();
@@ -403,7 +499,7 @@ mod tests {
         }
         assert_eq!(std::fs::read(&outside).unwrap(), b"mine");
         assert!(
-            std::fs::read_to_string(bx.recipe())
+            std::fs::read_to_string(bx.get_dir().join(crate::state::RECIPE_FILE))
                 .unwrap()
                 .contains("cpus")
         );
@@ -415,19 +511,22 @@ mod tests {
     fn a_file_that_is_not_an_artifact_is_refused_before_anything_is_written() {
         let dir = tempfile::tempdir().unwrap();
         let _home = TestHome::new();
-        let bx = built(dir.path(), &[]);
+        let bx = build_box_ref(dir.path(), &[]);
         let not_one = dir.path().join("holiday.jpg");
         std::fs::write(&not_one, b"\xff\xd8\xff\xe0 not a terra artifact at all").unwrap();
 
         let err = import(&bx, &not_one).unwrap_err().to_string();
         assert!(err.contains("not a terra storage artifact"), "{err}");
-        assert_eq!(std::fs::read(bx.rootfs_img()).unwrap(), b"rootfs data");
+        assert_eq!(
+            std::fs::read(bx.get_dir().join(crate::state::ROOTFS_FILE)).unwrap(),
+            b"rootfs data"
+        );
 
         // …and one that is an artifact but carries nothing: an empty box is
         // never what an import was asked for.
         let empty = dir.path().join("empty.terra");
         let mut gz = GzEncoder::new(File::create(&empty).unwrap(), Compression::fast());
-        gz.write_all(MAGIC).unwrap();
+        gz.write_all(STORAGE_ARTIFACT_MAGIC).unwrap();
         gz.finish().unwrap();
         assert!(
             import(&bx, &empty)
@@ -437,6 +536,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_artifact_larger_than_the_configured_image_is_refused_before_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = TestHome::new();
+        let bx = build_box_ref(dir.path(), &[]);
+        let artifact = dir.path().join("too-large.terra");
+        let mut gz = GzEncoder::new(File::create(&artifact).unwrap(), Compression::fast());
+        gz.write_all(STORAGE_ARTIFACT_MAGIC).unwrap();
+        write_entry_header(&mut gz, "rootfs.img", 512 * 1024 * 1024 + 1).unwrap();
+        gz.finish().unwrap();
+
+        let err = import(&bx, &artifact).unwrap_err().to_string();
+        assert!(err.contains("configured"), "{err}");
+        assert_eq!(
+            std::fs::read(bx.get_dir().join(crate::state::ROOTFS_FILE)).unwrap(),
+            b"rootfs data"
+        );
+    }
+
+    #[test]
+    fn a_partial_entry_header_is_refused_as_incomplete() {
+        for len in 1..10 {
+            let bytes = vec![0; len];
+            assert!(
+                read_entry_header(&mut std::io::Cursor::new(bytes)).is_err(),
+                "{len}"
+            );
+        }
+    }
+
     /// Images are replaced only through a staged write's rename, so one
     /// artifact cut off part-way leaves every image it reached byte-identical -
     /// the import is all of them or none of them.
@@ -444,14 +573,14 @@ mod tests {
     fn an_import_cut_off_part_way_leaves_the_images_it_reached_intact() {
         let dir = tempfile::tempdir().unwrap();
         let _home = TestHome::new();
-        let bx = built(dir.path(), &[]);
+        let bx = build_box_ref(dir.path(), &[]);
 
         let artifact = dir.path().join("cut-off.terra");
         let mut gz = GzEncoder::new(
             BufWriter::new(File::create(&artifact).unwrap()),
             Compression::fast(),
         );
-        gz.write_all(MAGIC).unwrap();
+        gz.write_all(STORAGE_ARTIFACT_MAGIC).unwrap();
         write_entry_header(&mut gz, "rootfs.img", 1 << 20).unwrap();
         gz.write_all(b"a few bytes").unwrap(); // far short of the declared length
         gz.finish().unwrap().flush().unwrap();
@@ -459,11 +588,11 @@ mod tests {
         let err = format!("{:#}", import(&bx, &artifact).unwrap_err());
         assert!(err.contains("part-way through"), "{err}");
         assert_eq!(
-            std::fs::read(bx.rootfs_img()).unwrap(),
+            std::fs::read(bx.get_dir().join(crate::state::ROOTFS_FILE)).unwrap(),
             b"rootfs data",
             "a truncated artifact replaced the live image"
         );
-        let left: Vec<String> = std::fs::read_dir(bx.dir())
+        let left: Vec<String> = std::fs::read_dir(bx.get_dir())
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
@@ -482,16 +611,22 @@ mod tests {
     fn prune_removes_the_volumes_the_recipe_dropped_and_nothing_else() {
         let dir = tempfile::tempdir().unwrap();
         let _home = TestHome::new();
-        let bx = built(dir.path(), &["data"]);
-        std::fs::write(bx.volume_img("old"), b"dropped").unwrap();
+        let bx = build_box_ref(dir.path(), &["data"]);
+        std::fs::write(bx.get_volume_image("old"), b"dropped").unwrap();
 
         prune(&bx).unwrap();
         assert!(
-            !bx.volume_img("old").exists(),
+            !bx.get_volume_image("old").exists(),
             "the dropped volume was kept"
         );
-        assert!(bx.volume_img("data").exists(), "a named volume was removed");
-        assert!(bx.rootfs_img().exists(), "the guest filesystem was removed");
+        assert!(
+            bx.get_volume_image("data").exists(),
+            "a named volume was removed"
+        );
+        assert!(
+            bx.get_dir().join(crate::state::ROOTFS_FILE).exists(),
+            "the guest filesystem was removed"
+        );
 
         // Nothing left to take is not an error - a prune in a script runs again.
         prune(&bx).unwrap();
@@ -504,7 +639,7 @@ mod tests {
     fn a_running_box_is_neither_exported_nor_imported() {
         let dir = tempfile::tempdir().unwrap();
         let _home = TestHome::new();
-        let bx = built(dir.path(), &[]);
+        let bx = build_box_ref(dir.path(), &[]);
         let artifact = dir.path().join("dev.terra");
         export(&bx, &artifact).unwrap();
 

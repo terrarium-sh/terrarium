@@ -18,12 +18,12 @@ pub fn run(
         eprintln!("terra: nobody is attached to {bx}");
     }
     for client in clients {
-        println!("{}", client_line(&client));
+        println!("{}", format_client_line(&client));
     }
     Ok(ExitCode::SUCCESS)
 }
 
-fn client_line(client: &SessionClient) -> String {
+fn format_client_line(client: &SessionClient) -> String {
     let size = client
         .reported_term_size
         .map_or_else(|| "-".to_owned(), |s| format!("{}x{}", s.rows, s.cols));
@@ -40,16 +40,16 @@ mod tests {
     #[test]
     fn a_client_line_is_id_then_size() {
         assert_eq!(
-            client_line(&SessionClient {
+            format_client_line(&SessionClient {
                 id: 3,
                 reported_term_size: None
             }),
             "3\t-"
         );
         assert_eq!(
-            client_line(&SessionClient {
+            format_client_line(&SessionClient {
                 id: 7,
-                reported_term_size: Some(terra_shared::TermSize { rows: 24, cols: 80 })
+                reported_term_size: Some(terra_shared::contract::TermSize { rows: 24, cols: 80 })
             }),
             "7\t24x80"
         );

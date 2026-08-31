@@ -1,20 +1,11 @@
 use super::rules::*;
-use super::runtime::LEARNED_ADDRESSES_CAPACITY;
-use super::*;
+use super::runtime::{BoxPolicy, HOST_ADDRS, LEARNED_ADDRESSES_CAPACITY, describe};
 use crate::config::{Network, NetworkMode, StaticDnsRecord};
 use anyhow::Result;
 use smolvm_network::{DnsDecision, Policy, dns};
 use std::net::IpAddr;
 
-/// What the gateway terra starts is configured with, minus its EUI-64
-/// link-local (see [`BoxPolicy::new`]) - so what `HOST_LOOPBACK` resolves
-/// to in these tests.
-const HOST_ADDRS: [IpAddr; 2] = [
-    IpAddr::V4(smolvm_network::GuestNetworkConfig::default().gateway_ip),
-    IpAddr::V6(smolvm_network::GuestNetworkConfig::default().gateway_ip6),
-];
-
-fn net(mode: NetworkMode, allow: &[&str]) -> Network {
+fn build_network(mode: NetworkMode, allow: &[&str]) -> Network {
     Network {
         mode,
         allow: allow.iter().map(ToString::to_string).collect(),
@@ -23,16 +14,16 @@ fn net(mode: NetworkMode, allow: &[&str]) -> Network {
     }
 }
 
-fn build(network: &Network) -> Result<BoxPolicy> {
+fn build_policy(network: &Network) -> Result<BoxPolicy> {
     BoxPolicy::new(network)
 }
 
-fn policy(mode: NetworkMode, allow: &[&str]) -> BoxPolicy {
-    build(&net(mode, allow)).expect("test policy")
+fn build_box_policy(mode: NetworkMode, allow: &[&str]) -> BoxPolicy {
+    build_policy(&build_network(mode, allow)).expect("test policy")
 }
 
 /// One `hosts:` record. `addr` is an address or the host token.
-fn record(name: &str, addr: &str) -> StaticDnsRecord {
+fn build_dns_record(name: &str, addr: &str) -> StaticDnsRecord {
     StaticDnsRecord {
         name: name.into(),
         addr: addr.into(),
@@ -40,20 +31,24 @@ fn record(name: &str, addr: &str) -> StaticDnsRecord {
 }
 
 /// A policy with both halves: records, and the rules that open them.
-fn published(mode: NetworkMode, hosts: &[StaticDnsRecord], allow: &[&str]) -> BoxPolicy {
-    let mut network = net(mode, allow);
+fn build_published_policy(
+    mode: NetworkMode,
+    hosts: &[StaticDnsRecord],
+    allow: &[&str],
+) -> BoxPolicy {
+    let mut network = build_network(mode, allow);
     network.hosts = hosts.to_vec();
-    build(&network).expect("test policy")
+    build_policy(&network).expect("test policy")
 }
 
-fn err_of(network: &Network) -> String {
-    build(network)
+fn format_build_error(network: &Network) -> String {
+    build_policy(network)
         .expect_err("this network section must not build")
         .to_string()
 }
 
 /// A minimal query for `name`, enough for the policy to read the question.
-fn query(name: &str, qtype: u8) -> Vec<u8> {
+fn encode_dns_query(name: &str, qtype: u8) -> Vec<u8> {
     let mut bytes = vec![0xab, 0xcd, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
     for label in name.split('.') {
         bytes.push(u8::try_from(label.len()).expect("test label fits a DNS label"));
@@ -64,12 +59,12 @@ fn query(name: &str, qtype: u8) -> Vec<u8> {
 }
 
 /// An A query for `name`.
-fn query_for(name: &str) -> Vec<u8> {
-    query(name, 1)
+fn encode_dns_a_query(name: &str) -> Vec<u8> {
+    encode_dns_query(name, 1)
 }
 
 #[test]
-fn parse_port_mappings_parse() {
+fn parse_port_mappings_and_reject_invalid_entries() {
     let mappings = parse_port_mappings(&["8080".into(), "3000:80".into()]).unwrap();
     assert_eq!(mappings[0].host, 8080);
     assert_eq!(mappings[0].guest, 8080);
@@ -102,7 +97,7 @@ fn parse_port_mappings_parse() {
 fn an_allow_rule_outranks_the_floor() {
     for mode in [NetworkMode::Allowlist, NetworkMode::UnrestrictedPublic] {
         // A single address, on the port it named and nothing else nearby.
-        let one = policy(mode, &["10.0.0.5:5432"]);
+        let one = build_box_policy(mode, &["10.0.0.5:5432"]);
         assert!(
             one.allows("10.0.0.5".parse().unwrap(), Some(5432)),
             "{mode:?}"
@@ -124,7 +119,7 @@ fn an_allow_rule_outranks_the_floor() {
 
         // A range is a rule too: the LAN, the loopback and even multicast
         // are reachable when the recipe says so.
-        let lan = policy(mode, &["10.0.0.0/8", "127.0.0.0/8", "224.0.0.0/4"]);
+        let lan = build_box_policy(mode, &["10.0.0.0/8", "127.0.0.0/8", "224.0.0.0/4"]);
         assert!(
             lan.allows("10.0.0.6".parse().unwrap(), Some(22)),
             "{mode:?}"
@@ -148,7 +143,7 @@ fn an_allow_rule_outranks_the_floor() {
 /// is what makes that claim true.
 #[test]
 fn nothing_unwritten_crosses_the_floor() {
-    let open = policy(NetworkMode::UnrestrictedPublic, &[]);
+    let open = build_box_policy(NetworkMode::UnrestrictedPublic, &[]);
     for held in [
         "127.0.0.1",
         "169.254.169.254",
@@ -169,8 +164,7 @@ fn nothing_unwritten_crosses_the_floor() {
     assert!(open.allows("1.1.1.1".parse().unwrap(), Some(443)));
 
     // The allowlist reaches nothing at all without a rule - not even DNS.
-    let closed = build(&Network::default()).unwrap();
-    assert!(closed.is_restricted());
+    let closed = build_policy(&Network::default()).unwrap();
     assert!(closed.intercepts_dns());
     assert!(!closed.allows("1.1.1.1".parse().unwrap(), Some(443)));
     assert!(!closed.forwards("example.com"));
@@ -180,7 +174,7 @@ fn nothing_unwritten_crosses_the_floor() {
 /// grant nothing, so an allowlist with only `hosts:` still lets nothing out.
 #[test]
 fn describe_names_the_posture() {
-    let mut open = net(NetworkMode::UnrestrictedPublic, &[]);
+    let mut open = build_network(NetworkMode::UnrestrictedPublic, &[]);
     assert_eq!(describe(&open), "unrestricted-public (public egress only)");
     open.allow = vec!["10.0.0.5:5432".into()];
     assert_eq!(
@@ -188,11 +182,11 @@ fn describe_names_the_posture() {
         "unrestricted-public (public egress + listed rules)"
     );
 
-    let mut closed = net(NetworkMode::Allowlist, &[]);
+    let mut closed = build_network(NetworkMode::Allowlist, &[]);
     assert!(describe(&closed).contains("not even DNS"));
     // …but a box with records has a resolver, and answering them is the
     // whole point of writing them - only what is *reachable* is nothing.
-    closed.hosts = vec![record("db.local", HOST_LOOPBACK_SYMBOL)];
+    closed.hosts = vec![build_dns_record("db.local", HOST_LOOPBACK_SYMBOL)];
     let with_records = describe(&closed);
     assert!(
         !with_records.contains("not even DNS"),
@@ -210,29 +204,29 @@ fn describe_names_the_posture() {
 /// gateway drives it: resolve, learn from the answer bytes, connect,
 /// rewrite.
 #[test]
-fn allowlist_mode_end_to_end() {
-    let p = published(
+fn exercise_allowlist_mode_end_to_end() {
+    let p = build_published_policy(
         NetworkMode::Allowlist,
         &[
-            record("db.local", HOST_LOOPBACK_SYMBOL),
-            record("nas.local", "10.0.0.5"),
+            build_dns_record("db.local", HOST_LOOPBACK_SYMBOL),
+            build_dns_record("nas.local", "10.0.0.5"),
         ],
         &["api.test:443", "db.local:5432", "nas.local:445"],
     );
     assert!(p.intercepts_dns());
 
-    let DnsDecision::Immediate(answer) = p.dns(&query_for("db.local")) else {
+    let DnsDecision::Immediate(answer) = p.dns(&encode_dns_a_query("db.local")) else {
         panic!("record not answered")
     };
     assert_eq!(dns::answer_ip_records(&answer)[0].0, HOST_ADDRS[0]);
-    let DnsDecision::Immediate(aaaa) = p.dns(&query("db.local", 28)) else {
+    let DnsDecision::Immediate(aaaa) = p.dns(&encode_dns_query("db.local", 28)) else {
         panic!("record not answered")
     };
     assert_eq!(dns::answer_ip_records(&aaaa)[0].0, HOST_ADDRS[1]);
 
     // A listed public name forwards; its answer, fed back through `learn`,
     // opens the address it carried on the rule's port.
-    let api_query = query_for("api.test");
+    let api_query = encode_dns_a_query("api.test");
     assert!(matches!(
         p.dns(&api_query),
         DnsDecision::Forward { learn: true }
@@ -245,7 +239,7 @@ fn allowlist_mode_end_to_end() {
     // The same answer under a name nobody listed teaches nothing.
     let other: IpAddr = "5.5.5.5".parse().unwrap();
     p.learn(&dns::build_ip_response(
-        &query_for("evil.test"),
+        &encode_dns_a_query("evil.test"),
         &[other],
         300,
     ));
@@ -263,7 +257,7 @@ fn allowlist_mode_end_to_end() {
 
     // Everything unlisted: no resolution, no connection.
     assert!(matches!(
-        p.dns(&query_for("exfil.example")),
+        p.dns(&encode_dns_a_query("exfil.example")),
         DnsDecision::Immediate(_)
     ));
     assert!(!p.allows("1.1.1.1".parse().unwrap(), Some(443)));
@@ -272,21 +266,21 @@ fn allowlist_mode_end_to_end() {
 /// The same lifecycle under `unrestricted-public`: public egress needs no
 /// rules; the floor and the host still do.
 #[test]
-fn unrestricted_public_mode_end_to_end() {
-    let p = published(
+fn exercise_unrestricted_public_mode_end_to_end() {
+    let p = build_published_policy(
         NetworkMode::UnrestrictedPublic,
-        &[record("db.local", HOST_LOOPBACK_SYMBOL)],
+        &[build_dns_record("db.local", HOST_LOOPBACK_SYMBOL)],
         &["db.local:5432", "10.0.0.5:445"],
     );
     // Records are answered here, so DNS is still intercepted…
     assert!(p.intercepts_dns());
     assert!(matches!(
-        p.dns(&query_for("db.local")),
+        p.dns(&encode_dns_a_query("db.local")),
         DnsDecision::Immediate(_)
     ));
     // …while every other name forwards, unlearned.
     assert!(matches!(
-        p.dns(&query_for("anything.test")),
+        p.dns(&encode_dns_a_query("anything.test")),
         DnsDecision::Forward { learn: false }
     ));
 
@@ -306,12 +300,12 @@ fn unrestricted_public_mode_end_to_end() {
 /// and so the data in it, leaves the box.
 #[test]
 fn a_query_is_answered_forwarded_or_refused() {
-    let mut network = net(NetworkMode::Allowlist, &["api.test:443"]);
-    network.hosts = vec![record("db.local", HOST_LOOPBACK_SYMBOL)];
-    let p = build(&network).unwrap();
+    let mut network = build_network(NetworkMode::Allowlist, &["api.test:443"]);
+    network.hosts = vec![build_dns_record("db.local", HOST_LOOPBACK_SYMBOL)];
+    let p = build_policy(&network).unwrap();
 
     // Answered here: the record's own address, never sent upstream.
-    let DnsDecision::Immediate(answer) = p.dns(&query_for("db.local")) else {
+    let DnsDecision::Immediate(answer) = p.dns(&encode_dns_a_query("db.local")) else {
         panic!("a hosts record must be answered by the gateway")
     };
     assert_eq!(
@@ -326,11 +320,11 @@ fn a_query_is_answered_forwarded_or_refused() {
     // A listed name goes upstream, and its answer is learned - but not its
     // subdomains: a name is exact unless the rule says `*.`.
     assert!(matches!(
-        p.dns(&query_for("api.test")),
+        p.dns(&encode_dns_a_query("api.test")),
         DnsDecision::Forward { learn: true }
     ));
     assert!(matches!(
-        p.dns(&query_for("v2.api.test")),
+        p.dns(&encode_dns_a_query("v2.api.test")),
         DnsDecision::Immediate(_)
     ));
 
@@ -338,7 +332,10 @@ fn a_query_is_answered_forwarded_or_refused() {
     // the exfiltration channel - the query itself carries the payload.
     for refused in ["payload.db.local", "exfil.example"] {
         assert!(
-            matches!(p.dns(&query_for(refused)), DnsDecision::Immediate(_)),
+            matches!(
+                p.dns(&encode_dns_a_query(refused)),
+                DnsDecision::Immediate(_)
+            ),
             "{refused}"
         );
     }
@@ -346,23 +343,25 @@ fn a_query_is_answered_forwarded_or_refused() {
 
     // The wide mode filters nothing and learns nothing: it has no allow-list
     // to be exclusive against.
-    let open = policy(NetworkMode::UnrestrictedPublic, &[]);
+    let open = build_box_policy(NetworkMode::UnrestrictedPublic, &[]);
     assert!(matches!(
-        open.dns(&query_for("anything.test")),
+        open.dns(&encode_dns_a_query("anything.test")),
         DnsDecision::Forward { learn: false }
     ));
     assert!(!open.intercepts_dns());
 
     // An address rule does not turn that gate exclusive - it is read there,
     // it simply has nothing to say about resolution.
-    assert!(policy(NetworkMode::UnrestrictedPublic, &["10.0.0.5:5432"]).forwards("any.test"));
+    assert!(
+        build_box_policy(NetworkMode::UnrestrictedPublic, &["10.0.0.5:5432"]).forwards("any.test")
+    );
     // Nor does a name rule that a `hosts:` record gave something to open;
     // a name rule with no record behind it is refused outright (see
     // [`a_name_rule_that_could_not_grant_anything_is_refused_not_ignored`]).
     assert!(
-        published(
+        build_published_policy(
             NetworkMode::UnrestrictedPublic,
-            &[record("nas.local", "10.0.0.5")],
+            &[build_dns_record("nas.local", "10.0.0.5")],
             &["nas.local:445"],
         )
         .forwards("any.test")
@@ -378,20 +377,23 @@ fn a_query_is_answered_forwarded_or_refused() {
 fn a_name_rule_that_could_not_grant_anything_is_refused_not_ignored() {
     let nas: IpAddr = "10.0.0.5".parse().unwrap();
 
-    let err = err_of(&net(NetworkMode::UnrestrictedPublic, &["nas.local:445"]));
+    let err = format_build_error(&build_network(
+        NetworkMode::UnrestrictedPublic,
+        &["nas.local:445"],
+    ));
     assert!(err.contains("opens nothing"), "{err}");
     // The message has to carry the way out, or it is just a wall.
     assert!(err.contains("hosts:"), "{err}");
     assert!(err.contains("allowlist"), "{err}");
 
     // The two spellings it names both work, in that same mode.
-    let by_addr = policy(NetworkMode::UnrestrictedPublic, &["10.0.0.5:445"]);
+    let by_addr = build_box_policy(NetworkMode::UnrestrictedPublic, &["10.0.0.5:445"]);
     assert!(by_addr.allows(nas, Some(445)));
     assert!(!by_addr.allows(nas, Some(22)));
 
-    let by_record = published(
+    let by_record = build_published_policy(
         NetworkMode::UnrestrictedPublic,
-        &[record("nas.local", "10.0.0.5")],
+        &[build_dns_record("nas.local", "10.0.0.5")],
         &["nas.local:445"],
     );
     assert!(by_record.allows(nas, Some(445)));
@@ -399,7 +401,7 @@ fn a_name_rule_that_could_not_grant_anything_is_refused_not_ignored() {
 
     // …and the same rule keeps its ordinary meaning under an allowlist,
     // where it gates public egress rather than opening the floor.
-    let gated = policy(NetworkMode::Allowlist, &["api.test:443"]);
+    let gated = build_box_policy(NetworkMode::Allowlist, &["api.test:443"]);
     let public: IpAddr = "93.184.216.34".parse().unwrap();
     gated.learn_named("api.test", &[(public, 300)]);
     assert!(gated.allows(public, Some(443)));
@@ -412,7 +414,7 @@ fn a_name_rule_that_could_not_grant_anything_is_refused_not_ignored() {
 /// which is the only way a name rule can be port-scoped at all.
 #[test]
 fn a_learned_address_carries_its_name_s_port() {
-    let p = policy(NetworkMode::Allowlist, &["api.test:443", "open.test"]);
+    let p = build_box_policy(NetworkMode::Allowlist, &["api.test:443", "open.test"]);
     let resolved: IpAddr = "93.184.216.34".parse().unwrap();
 
     assert!(!p.allows(resolved, Some(443)), "nothing is learned yet");
@@ -440,7 +442,7 @@ fn a_learned_address_carries_its_name_s_port() {
 /// recipe; the host process holding this map is not.
 #[test]
 fn what_a_guest_can_teach_this_policy_is_bounded() {
-    let p = policy(NetworkMode::Allowlist, &["*.attacker.test"]);
+    let p = build_box_policy(NetworkMode::Allowlist, &["*.attacker.test"]);
     for i in 0..(LEARNED_ADDRESSES_CAPACITY * 2) {
         let ip: IpAddr = format!("203.0.{}.{}", (i / 256) % 256, i % 256)
             .parse()
@@ -465,9 +467,9 @@ fn what_a_guest_can_teach_this_policy_is_bounded() {
 /// legitimately allowed. An answer is not a rule, so the floor holds.
 #[test]
 fn an_answer_cannot_smuggle_in_a_floored_address_or_a_published_addr() {
-    let p = published(
+    let p = build_published_policy(
         NetworkMode::Allowlist,
-        &[record("db.local", HOST_LOOPBACK_SYMBOL)],
+        &[build_dns_record("db.local", HOST_LOOPBACK_SYMBOL)],
         &["api.test", "db.local:5432"],
     );
 
@@ -489,18 +491,18 @@ fn only_a_host_rule_reaches_the_host() {
     for mode in [NetworkMode::Allowlist, NetworkMode::UnrestrictedPublic] {
         for host in HOST_ADDRS.iter().copied() {
             for entry in [&[][..], &["0.0.0.0/0", "::/0"]] {
-                let p = policy(mode, entry);
+                let p = build_box_policy(mode, entry);
                 assert!(!p.allows(host, Some(22)), "{mode:?} {host} {entry:?}");
                 assert!(!p.allows(host, None), "{mode:?} {host} {entry:?}");
             }
 
             // The token, on the port it names.
-            let scoped = policy(mode, &["HOST_LOOPBACK:5432"]);
+            let scoped = build_box_policy(mode, &["HOST_LOOPBACK:5432"]);
             assert!(scoped.allows(host, Some(5432)), "{mode:?} {host}");
             assert!(!scoped.allows(host, Some(22)), "{mode:?} {host}");
 
             // …and portless, which is every port on the host.
-            let open = policy(mode, &["host_loopback"]);
+            let open = build_box_policy(mode, &["host_loopback"]);
             assert!(open.allows(host, Some(22)), "{mode:?} {host}");
 
             // Whatever opened it, the connection is dialed at the loopback.
@@ -509,7 +511,11 @@ fn only_a_host_rule_reaches_the_host() {
 
         // A record resolving to the host answers with it and grants
         // nothing by itself.
-        let dns_only = published(mode, &[record("db.local", HOST_LOOPBACK_SYMBOL)], &[]);
+        let dns_only = build_published_policy(
+            mode,
+            &[build_dns_record("db.local", HOST_LOOPBACK_SYMBOL)],
+            &[],
+        );
         assert_eq!(
             dns_only.static_answer("db.local"),
             Some(HOST_ADDRS.as_slice()),
@@ -533,18 +539,18 @@ fn an_address_rule_naming_the_gateway_is_refused_not_left_inert() {
                 IpAddr::V6(_) => format!("[{gw}]"),
                 IpAddr::V4(_) => gw.to_string(),
             };
-            let err = err_of(&net(mode, &[bare.as_str()]));
+            let err = format_build_error(&build_network(mode, &[bare.as_str()]));
             assert!(err.contains(HOST_LOOPBACK_SYMBOL), "{mode:?} {gw}: {err}");
 
             let ported = format!("[{gw}]:80");
-            let err = err_of(&net(mode, &[ported.as_str()]));
+            let err = format_build_error(&build_network(mode, &[ported.as_str()]));
             assert!(err.contains(HOST_LOOPBACK_SYMBOL), "{mode:?} {gw}: {err}");
         }
 
         // The gateway's own /24, as a range: accepted, and still closed at
         // the gateway itself.
         let subnet = format!("{}/24", HOST_ADDRS[0]);
-        let p = policy(mode, &[subnet.as_str()]);
+        let p = build_box_policy(mode, &[subnet.as_str()]);
         assert!(!p.allows(HOST_ADDRS[0], Some(80)), "{mode:?}");
     }
 }
@@ -555,9 +561,9 @@ fn an_address_rule_naming_the_gateway_is_refused_not_left_inert() {
 fn a_record_can_point_at_the_lan() {
     let nas: IpAddr = "10.0.0.5".parse().unwrap();
     for mode in [NetworkMode::Allowlist, NetworkMode::UnrestrictedPublic] {
-        let records = [record("nas.local", "10.0.0.5")];
+        let records = [build_dns_record("nas.local", "10.0.0.5")];
 
-        let dns_only = published(mode, &records, &[]);
+        let dns_only = build_published_policy(mode, &records, &[]);
         assert_eq!(
             dns_only.static_answer("nas.local"),
             Some([nas].as_slice()),
@@ -568,7 +574,7 @@ fn a_record_can_point_at_the_lan() {
 
         // The name rule and the address rule open the same thing.
         for rule in ["nas.local:445", "10.0.0.5:445"] {
-            let p = published(mode, &records, &[rule]);
+            let p = build_published_policy(mode, &records, &[rule]);
             assert!(p.allows(nas, Some(445)), "{mode:?} {rule}");
             assert!(!p.allows(nas, Some(22)), "{mode:?} {rule}");
         }
@@ -579,11 +585,11 @@ fn a_record_can_point_at_the_lan() {
 /// reaches the other's service, as anywhere else in DNS.
 #[test]
 fn records_sharing_an_address_share_its_grants() {
-    let p = published(
+    let p = build_published_policy(
         NetworkMode::Allowlist,
         &[
-            record("db.local", HOST_LOOPBACK_SYMBOL),
-            record("cache.local", HOST_LOOPBACK_SYMBOL),
+            build_dns_record("db.local", HOST_LOOPBACK_SYMBOL),
+            build_dns_record("cache.local", HOST_LOOPBACK_SYMBOL),
         ],
         &["db.local:5432", "cache.local:6379"],
     );
@@ -599,9 +605,9 @@ fn records_sharing_an_address_share_its_grants() {
 /// an outbound channel out of a box with no egress.
 #[test]
 fn a_record_does_not_open_dns_forwarding_for_its_subdomains() {
-    let p = published(
+    let p = build_published_policy(
         NetworkMode::Allowlist,
-        &[record("api.mycorp.dev", HOST_LOOPBACK_SYMBOL)],
+        &[build_dns_record("api.mycorp.dev", HOST_LOOPBACK_SYMBOL)],
         &["api.mycorp.dev:8080"],
     );
     for under in [
@@ -616,9 +622,9 @@ fn a_record_does_not_open_dns_forwarding_for_its_subdomains() {
 
     // A `*.` rule covering a record opens the record *and* keeps its usual
     // meaning for the rest of the subtree, which still goes upstream.
-    let sub = published(
+    let sub = build_published_policy(
         NetworkMode::Allowlist,
-        &[record("api.example.com", HOST_LOOPBACK_SYMBOL)],
+        &[build_dns_record("api.example.com", HOST_LOOPBACK_SYMBOL)],
         &["*.example.com:8080"],
     );
     assert!(sub.allows(HOST_ADDRS[0], Some(8080)));
@@ -631,13 +637,13 @@ fn a_record_does_not_open_dns_forwarding_for_its_subdomains() {
 /// one or not, which left "only this host" unwriteable.
 #[test]
 fn a_name_is_exact_and_the_subtree_is_opted_into() {
-    let exact = policy(NetworkMode::Allowlist, &["example.com"]);
+    let exact = build_box_policy(NetworkMode::Allowlist, &["example.com"]);
     assert!(exact.forwards("example.com"));
     for denied in ["www.example.com", "a.b.example.com", "notexample.com"] {
         assert!(!exact.forwards(denied), "{denied} is not example.com");
     }
 
-    let sub = policy(NetworkMode::Allowlist, &["*.example.com"]);
+    let sub = build_box_policy(NetworkMode::Allowlist, &["*.example.com"]);
     for allowed in ["www.example.com", "a.b.example.com"] {
         assert!(sub.forwards(allowed), "{allowed}");
     }
@@ -650,7 +656,7 @@ fn a_name_is_exact_and_the_subtree_is_opted_into() {
     assert!(!name_covers("*.example.com", "com"));
 
     // Both, if a recipe wants both.
-    let both = policy(NetworkMode::Allowlist, &["example.com", "*.example.com"]);
+    let both = build_box_policy(NetworkMode::Allowlist, &["example.com", "*.example.com"]);
     assert!(both.forwards("example.com"));
     assert!(both.forwards("www.example.com"));
 
@@ -666,7 +672,7 @@ fn a_name_is_exact_and_the_subtree_is_opted_into() {
         other => panic!("{e} should be a name rule: {other:?}"),
     };
     assert_eq!(name_of("*.API.test:443"), "*.api.test");
-    assert!(policy(NetworkMode::Allowlist, &["*.api.test:443"]).forwards("v2.api.test"));
+    assert!(build_box_policy(NetworkMode::Allowlist, &["*.api.test:443"]).forwards("v2.api.test"));
     assert_eq!(name_of(" example.com "), "example.com");
 }
 
@@ -674,11 +680,11 @@ fn a_name_is_exact_and_the_subtree_is_opted_into() {
 #[test]
 fn port_scope_is_enforced() {
     let ip: IpAddr = "8.8.8.3".parse().unwrap();
-    let scoped = policy(NetworkMode::Allowlist, &["8.8.8.0/24:443"]);
+    let scoped = build_box_policy(NetworkMode::Allowlist, &["8.8.8.0/24:443"]);
     assert!(scoped.allows(ip, Some(443)));
     assert!(!scoped.allows(ip, Some(80)));
     // A portless rule permits any port, and only it matches a portless flow.
-    let any = policy(NetworkMode::Allowlist, &["8.8.8.0/24"]);
+    let any = build_box_policy(NetworkMode::Allowlist, &["8.8.8.0/24"]);
     assert!(any.allows(ip, Some(80)));
     assert!(any.allows(ip, None));
     assert!(!scoped.allows(ip, None));
@@ -693,29 +699,20 @@ fn an_entry_is_split_on_the_socketaddr_convention() {
         let (host, port) = split_host_port(e).unwrap();
         (host.to_string(), port)
     };
-    assert_eq!(split("[db.local]"), ("db.local".into(), Port::Any));
-    assert_eq!(
-        split("[db.local]:5432"),
-        ("db.local".into(), Port::Only(5432))
-    );
-    assert_eq!(
-        split("db.local:5432"),
-        ("db.local".into(), Port::Only(5432))
-    );
-    assert_eq!(split("db.local"), ("db.local".into(), Port::Any));
+    assert_eq!(split("[db.local]"), ("db.local".into(), None));
+    assert_eq!(split("[db.local]:5432"), ("db.local".into(), Some(5432)));
+    assert_eq!(split("db.local:5432"), ("db.local".into(), Some(5432)));
+    assert_eq!(split("db.local"), ("db.local".into(), None));
     // A v6 literal is not a host:port pair, whatever `rsplit_once` thinks.
-    assert_eq!(split("::1"), ("::1".into(), Port::Any));
+    assert_eq!(split("::1"), ("::1".into(), None));
     assert_eq!(
         split("[2001:db8::1]:443"),
-        ("2001:db8::1".into(), Port::Only(443))
+        ("2001:db8::1".into(), Some(443))
     );
     // The prefix length is part of what an entry covers, so it survives:
     // dropping it would turn `0.0.0.0/0` into the single host `0.0.0.0`.
-    assert_eq!(
-        split("8.8.8.0/24:443"),
-        ("8.8.8.0/24".into(), Port::Only(443))
-    );
-    assert_eq!(split("0.0.0.0/0"), ("0.0.0.0/0".into(), Port::Any));
+    assert_eq!(split("8.8.8.0/24:443"), ("8.8.8.0/24".into(), Some(443)));
+    assert_eq!(split("0.0.0.0/0"), ("0.0.0.0/0".into(), None));
 
     // An address rule is told apart from a name rule by the host alone.
     for addr in [
@@ -753,15 +750,15 @@ fn an_entry_is_split_on_the_socketaddr_convention() {
         assert!(err.contains(&format!("[{ambiguous}]")), "{err}");
     }
     // Both of the spellings it names mean exactly one thing.
-    assert_eq!(split("[fe80::1:2]"), ("fe80::1:2".into(), Port::Any));
-    assert_eq!(split("[fe80::1]:2"), ("fe80::1".into(), Port::Only(2)));
+    assert_eq!(split("[fe80::1:2]"), ("fe80::1:2".into(), None));
+    assert_eq!(split("[fe80::1]:2"), ("fe80::1".into(), Some(2)));
     // A v6 literal that could not be read as host:port is left alone -
     // `::1` splits into an empty head, and a hex group is not a port.
     for plain in ["::1", "2001:db8::443", "fe80::abcd"] {
-        assert_eq!(split(plain), (plain.into(), Port::Any), "{plain}");
+        assert_eq!(split(plain), (plain.into(), None), "{plain}");
     }
     // …and a prefix length keeps a CIDR out of the ambiguity entirely.
-    assert_eq!(split("fe80::1:2/64"), ("fe80::1:2/64".into(), Port::Any));
+    assert_eq!(split("fe80::1:2/64"), ("fe80::1:2/64".into(), None));
 
     // A present-but-unusable port fails the recipe rather than widening the
     // rule to every port - which is what dropping it would quietly do.
@@ -773,16 +770,16 @@ fn an_entry_is_split_on_the_socketaddr_convention() {
         assert!(parse_allow(bad).is_err(), "{bad:?} should be refused");
     }
     // A name rule that normalizes to nothing is refused, not left inert.
-    let err = err_of(&net(NetworkMode::Allowlist, &["."]));
+    let err = format_build_error(&build_network(NetworkMode::Allowlist, &["."]));
     assert!(err.contains("not a name"), "{err}");
     // …and a prefix length past the address width is refused, not dropped.
-    let err = err_of(&net(NetworkMode::Allowlist, &["10.0.0.0/33"]));
+    let err = format_build_error(&build_network(NetworkMode::Allowlist, &["10.0.0.0/33"]));
     assert!(err.contains("prefix length"), "{err}");
 
     // The bracketed spelling still matches a record, brackets stripped.
-    let bracketed = published(
+    let bracketed = build_published_policy(
         NetworkMode::Allowlist,
-        &[record("db.local", HOST_LOOPBACK_SYMBOL)],
+        &[build_dns_record("db.local", HOST_LOOPBACK_SYMBOL)],
         &["[db.local]:5432"],
     );
     assert!(bracketed.allows(HOST_ADDRS[0], Some(5432)));
@@ -792,35 +789,35 @@ fn an_entry_is_split_on_the_socketaddr_convention() {
 /// that would silently collapse into one - or into none - are refused.
 #[test]
 fn a_hosts_rule_names_exactly_one_answerable_record() {
-    let mut network = net(NetworkMode::Allowlist, &[]);
+    let mut network = build_network(NetworkMode::Allowlist, &[]);
 
-    network.hosts = vec![record("*.local", HOST_LOOPBACK_SYMBOL)];
-    assert!(err_of(&network).contains("cannot use '*'"));
+    network.hosts = vec![build_dns_record("*.local", HOST_LOOPBACK_SYMBOL)];
+    assert!(format_build_error(&network).contains("cannot use '*'"));
 
     // A name that normalizes to nothing is refused rather than left as a
     // record the gateway silently drops.
-    network.hosts = vec![record(".", HOST_LOOPBACK_SYMBOL)];
-    assert!(err_of(&network).contains("can answer"));
+    network.hosts = vec![build_dns_record(".", HOST_LOOPBACK_SYMBOL)];
+    assert!(format_build_error(&network).contains("can answer"));
 
     // Duplicates - including a pair differing only in case or by a trailing
     // dot, which the gateway strips. One record would silently own the name.
     for pair in [
         [
-            record("a.test", HOST_LOOPBACK_SYMBOL),
-            record("a.test", "10.0.0.5"),
+            build_dns_record("a.test", HOST_LOOPBACK_SYMBOL),
+            build_dns_record("a.test", "10.0.0.5"),
         ],
         [
-            record("a.test", HOST_LOOPBACK_SYMBOL),
-            record("A.TEST", "10.0.0.5"),
+            build_dns_record("a.test", HOST_LOOPBACK_SYMBOL),
+            build_dns_record("A.TEST", "10.0.0.5"),
         ],
         [
-            record("db.local", HOST_LOOPBACK_SYMBOL),
-            record("db.local.", "10.0.0.5"),
+            build_dns_record("db.local", HOST_LOOPBACK_SYMBOL),
+            build_dns_record("db.local.", "10.0.0.5"),
         ],
     ] {
         network.hosts = pair.to_vec();
         assert!(
-            err_of(&network).contains("duplicate"),
+            format_build_error(&network).contains("duplicate"),
             "{:?}",
             network.hosts
         );
@@ -828,16 +825,22 @@ fn a_hosts_rule_names_exactly_one_answerable_record() {
 
     // A record's addr is an address, or the one word for the host - any case.
     for bad in ["", "db.other.local", "10.0.0.5:5432", "10.0.0.0/8", "HOST"] {
-        network.hosts = vec![record("db.local", bad)];
-        assert!(err_of(&network).contains("neither an IP address"), "{bad}");
+        network.hosts = vec![build_dns_record("db.local", bad)];
+        assert!(
+            format_build_error(&network).contains("neither an IP address"),
+            "{bad}"
+        );
     }
-    network.hosts = vec![record("db.local", "host_loopback")];
-    assert!(build(&network).is_ok(), "the token is case-insensitive");
+    network.hosts = vec![build_dns_record("db.local", "host_loopback")];
+    assert!(
+        build_policy(&network).is_ok(),
+        "the token is case-insensitive"
+    );
 
     // Distinct names are still distinct.
     network.hosts = vec![
-        record("a.test", HOST_LOOPBACK_SYMBOL),
-        record("b.test", HOST_LOOPBACK_SYMBOL),
+        build_dns_record("a.test", HOST_LOOPBACK_SYMBOL),
+        build_dns_record("b.test", HOST_LOOPBACK_SYMBOL),
     ];
-    assert!(build(&network).is_ok());
+    assert!(build_policy(&network).is_ok());
 }

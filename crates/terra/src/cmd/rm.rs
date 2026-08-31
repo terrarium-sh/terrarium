@@ -11,20 +11,20 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 pub fn run(args: &crate::cli::RmArgs, name: Option<&str>, project_dir: &Path) -> Result<ExitCode> {
-    let bx = &resolve::resolve_any_box(project_dir, name)?;
-    let state_dir = bx.dir();
+    let bx = &resolve::resolve(name, project_dir, None, resolve::Existence::MayBeMissing)?.bx;
+    let state_dir = bx.get_dir();
 
     anyhow::ensure!(
         state_dir.exists(),
         "no box '{}' in {} to remove - `terra ls` shows what is there",
-        bx.name(),
-        bx.project_dir().display()
+        bx.get_name(),
+        bx.get_project_dir().display()
     );
 
     // A wedged VM's holder never releases the lock, so `--force` alone removes
     // without it - accepting the race against whatever boots once the wedge ends.
     let _lock = if args.force {
-        let stopped = if bx.holder().holds() {
+        let stopped = if bx.get_holder().holds() {
             eprintln!("terra: {bx} is running - asking it to stop before removing it");
             stop_and_wait(bx, Duration::from_secs(args.wait))
         } else {
@@ -42,14 +42,14 @@ pub fn run(args: &crate::cli::RmArgs, name: Option<&str>, project_dir: &Path) ->
         let path = entry
             .with_context(|| format!("reading {}", state_dir.display()))?
             .path();
-        if path == bx.pid_file() {
+        if path == bx.get_dir().join(state::PID_FILE) {
             continue;
         }
         if !args.purge && path.file_name().is_some_and(|n| n == state::RECIPE_FILE) {
             kept_recipe = true;
             continue;
         }
-        let removed = if path.is_dir() {
+        let removed = if std::fs::symlink_metadata(&path)?.is_dir() {
             std::fs::remove_dir_all(&path)
         } else {
             std::fs::remove_file(&path)
@@ -60,10 +60,11 @@ pub fn run(args: &crate::cli::RmArgs, name: Option<&str>, project_dir: &Path) ->
         eprintln!("terra: removed {bx} (kept {})", state::RECIPE_FILE);
         return Ok(ExitCode::SUCCESS);
     }
-    let _ = std::fs::remove_file(bx.pid_file());
-    let _ = std::fs::remove_dir(state_dir);
+    std::fs::remove_file(bx.get_dir().join(state::PID_FILE))
+        .with_context(|| format!("removing {}", bx.get_dir().join(state::PID_FILE).display()))?;
+    std::fs::remove_dir(state_dir).with_context(|| format!("removing {}", state_dir.display()))?;
     eprintln!("terra: removed {}", state_dir.display());
-    sweep_project_dir(bx.project_dir());
+    sweep_project_dir(bx.get_project_dir());
     Ok(ExitCode::SUCCESS)
 }
 
@@ -82,10 +83,10 @@ fn lock_after_stop(bx: &BoxRef, stopped: Result<StopOutcome>) -> Result<Option<F
 
 /// Remove a project's `<box_dir>/<slug>/` once its last box is gone
 fn sweep_project_dir(project_dir: &Path) {
-    let Ok(project) = state::project_state_dir(project_dir) else {
+    let Ok(project) = state::get_project_state_dir(project_dir) else {
         return;
     };
-    if state::boxes_in(&project).next().is_some() {
+    if state::list_boxes_in(&project).next().is_some() {
         return;
     }
     let _ = std::fs::remove_file(project.join(state::ORIGIN_FILE));
@@ -107,8 +108,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let _home = crate::sys::TestHome::new();
         let bx = BoxRef::resolve(dir.path(), "dev").unwrap();
-        std::fs::create_dir_all(bx.dir()).unwrap();
-        std::fs::write(bx.rootfs_img(), b"image").unwrap();
+        std::fs::create_dir_all(bx.get_dir()).unwrap();
+        std::fs::write(bx.get_dir().join(state::ROOTFS_FILE), b"image").unwrap();
 
         // The winner of the race: holding the box when rm comes to collect.
         let _rival = bx.lock_run().unwrap();
@@ -119,7 +120,10 @@ mod tests {
         );
         assert!(err.contains("another terra took"), "{err}");
         assert!(err.contains("as it stopped"), "{err}");
-        assert!(bx.rootfs_img().exists(), "the image was deleted anyway");
+        assert!(
+            bx.get_dir().join(state::ROOTFS_FILE).exists(),
+            "the image was deleted anyway"
+        );
 
         // A wedge is the one outcome that removes without the lock.
         assert!(
@@ -134,7 +138,7 @@ mod tests {
             .expect_err("an unanswered stop must not read as permission to remove")
             .to_string();
         assert!(err.contains("published no pid"), "{err}");
-        assert!(bx.rootfs_img().exists());
+        assert!(bx.get_dir().join(state::ROOTFS_FILE).exists());
     }
 
     /// `rm --force` against a held box whose holder never published a pid
@@ -145,10 +149,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let _home = crate::sys::TestHome::new();
         let bx = BoxRef::resolve(dir.path(), "dev").unwrap();
-        std::fs::create_dir_all(bx.dir()).unwrap();
-        std::fs::write(bx.rootfs_img(), b"image").unwrap();
+        std::fs::create_dir_all(bx.get_dir()).unwrap();
+        std::fs::write(bx.get_dir().join(state::ROOTFS_FILE), b"image").unwrap();
         let _held = bx.lock_run().unwrap();
-        assert_eq!(bx.vm_process(), None);
+        assert_eq!(bx.read_vm_process(), None);
 
         let args = crate::cli::RmArgs {
             purge: true,
@@ -159,7 +163,10 @@ mod tests {
             .expect_err("nothing was signalled, so nothing may be removed")
             .to_string();
         assert!(err.contains("published no pid"), "{err}");
-        assert!(bx.rootfs_img().exists(), "the image was deleted anyway");
+        assert!(
+            bx.get_dir().join(state::ROOTFS_FILE).exists(),
+            "the image was deleted anyway"
+        );
     }
 
     /// A bake-marked box aborts `--force` as well - mid-bake deletion is what
@@ -169,8 +176,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let _home = crate::sys::TestHome::new();
         let bx = BoxRef::resolve(dir.path(), "dev").unwrap();
-        std::fs::create_dir_all(bx.dir()).unwrap();
-        std::fs::write(bx.rootfs_img(), b"image").unwrap();
+        std::fs::create_dir_all(bx.get_dir()).unwrap();
+        std::fs::write(bx.get_dir().join(state::ROOTFS_FILE), b"image").unwrap();
         let lock = bx.lock_run().unwrap();
         let marked = bx.mark_baking(&lock);
 
@@ -183,7 +190,10 @@ mod tests {
             .expect_err("a box mid-bake must not be removed")
             .to_string();
         assert!(err.contains("being set up"), "{err}");
-        assert!(bx.rootfs_img().exists(), "the image was deleted mid-bake");
+        assert!(
+            bx.get_dir().join(state::ROOTFS_FILE).exists(),
+            "the image was deleted mid-bake"
+        );
         drop(marked);
     }
 
@@ -201,10 +211,10 @@ mod tests {
         let _home = crate::sys::TestHome::new();
         let bx = BoxRef::resolve(dir.path(), "dev").unwrap();
         let build = || {
-            std::fs::create_dir_all(bx.dir()).unwrap();
-            std::fs::write(bx.recipe(), "hw:\n  cpus: 1\n").unwrap();
-            std::fs::write(bx.rootfs_img(), b"image").unwrap();
-            std::fs::write(bx.log(), b"output").unwrap();
+            std::fs::create_dir_all(bx.get_dir()).unwrap();
+            std::fs::write(bx.get_dir().join(state::RECIPE_FILE), "hw:\n  cpus: 1\n").unwrap();
+            std::fs::write(bx.get_dir().join(state::ROOTFS_FILE), b"image").unwrap();
+            std::fs::write(bx.get_dir().join(state::LOG_FILE), b"output").unwrap();
         };
 
         let rm = |purge| crate::cli::RmArgs {
@@ -214,17 +224,29 @@ mod tests {
         };
         build();
         run(&rm(false), Some("dev"), dir.path()).unwrap();
-        assert!(bx.recipe().exists(), "the recipe should have been kept");
-        assert!(!bx.rootfs_img().exists(), "the image should be gone");
-        assert!(!bx.log().exists(), "the log should be gone");
         assert!(
-            bx.pid_file().exists(),
+            bx.get_dir().join(state::RECIPE_FILE).exists(),
+            "the recipe should have been kept"
+        );
+        assert!(
+            !bx.get_dir().join(state::ROOTFS_FILE).exists(),
+            "the image should be gone"
+        );
+        assert!(
+            !bx.get_dir().join(state::LOG_FILE).exists(),
+            "the log should be gone"
+        );
+        assert!(
+            bx.get_dir().join(state::PID_FILE).exists(),
             "the lock file was unlinked while the box still had a recipe to protect"
         );
 
         build();
         run(&rm(true), Some("dev"), dir.path()).unwrap();
-        assert!(!bx.dir().exists(), "--purge should leave nothing at all");
+        assert!(
+            !bx.get_dir().exists(),
+            "--purge should leave nothing at all"
+        );
     }
 
     /// A box name with nothing on disk behind it is a typo far more often than
@@ -249,10 +271,10 @@ mod tests {
         assert!(err.contains("terra ls"), "the way to look: {err}");
 
         // A box with state - even one whose setup died before pinning a recipe,
-        // which is what `resolve_any_box` is lenient for - is still removed.
-        std::fs::create_dir_all(bx.dir()).unwrap();
-        std::fs::write(bx.rootfs_img(), b"image").unwrap();
+        // which is what lenient resolution is for - is still removed.
+        std::fs::create_dir_all(bx.get_dir()).unwrap();
+        std::fs::write(bx.get_dir().join(state::ROOTFS_FILE), b"image").unwrap();
         run(&rm, Some("dev"), dir.path()).unwrap();
-        assert!(!bx.dir().exists());
+        assert!(!bx.get_dir().exists());
     }
 }

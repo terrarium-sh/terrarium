@@ -4,8 +4,6 @@
 //! diagnostics.log.
 
 use crate::state::BoxRef;
-use crate::sys;
-use anyhow::Context as _;
 use std::io::Write;
 use std::str::FromStr;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
@@ -15,16 +13,20 @@ use tracing_subscriber::util::SubscriberInitExt as _;
 
 const KEPT_LOG_GENERATIONS: usize = 7;
 
-/// The appender for the box's log.
 fn build_appender(bx: &BoxRef) -> anyhow::Result<RollingFileAppender> {
     RollingFileAppender::builder()
         .rotation(Rotation::DAILY)
         .filename_prefix("terra")
         .filename_suffix("log")
         .max_log_files(KEPT_LOG_GENERATIONS)
-        .latest_symlink("terra.log")
-        .build(bx.dir())
-        .map_err(|e| anyhow::anyhow!("opening log {}: {e}", bx.log().display()))
+        .latest_symlink(crate::state::LOG_FILE)
+        .build(bx.get_dir())
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "opening log {}: {e}",
+                bx.get_dir().join(crate::state::LOG_FILE).display()
+            )
+        })
 }
 
 pub fn init(bx: &BoxRef) -> anyhow::Result<()> {
@@ -65,21 +67,17 @@ pub fn init(bx: &BoxRef) -> anyhow::Result<()> {
     if let Ok(mut sep) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(bx.log())
+        .open(bx.get_dir().join(crate::state::LOG_FILE))
     {
         let _ = writeln!(&mut sep, "\n===== terra: {bx} =====");
     }
     Ok(())
 }
 
-pub fn open_diagnostics(bx: &BoxRef) -> anyhow::Result<std::fs::File> {
-    let path = bx.diagnostics_log();
-    sys::create_no_symlinks(&path).with_context(|| format!("opening {}", path.display()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sys;
 
     /// Each run owns diagnostics.log: it is opened truncated, so the file is
     /// the run's alone rather than a running account that grows forever.
@@ -87,12 +85,20 @@ mod tests {
     fn diagnostics_starts_fresh_each_run() {
         let dir = tempfile::tempdir().unwrap();
         let bx = BoxRef::from_state_dir(dir.path().join("dev"), dir.path());
-        std::fs::create_dir_all(bx.dir()).unwrap();
-        std::fs::write(bx.diagnostics_log(), b"a previous run\n").unwrap();
+        std::fs::create_dir_all(bx.get_dir()).unwrap();
+        std::fs::write(
+            bx.get_dir().join(crate::state::DIAGNOSTICS_LOG),
+            b"a previous run\n",
+        )
+        .unwrap();
 
-        let f = open_diagnostics(&bx).unwrap();
+        let path = bx.get_dir().join(crate::state::DIAGNOSTICS_LOG);
+        let f = sys::create_no_symlinks(&path).unwrap();
         drop(f);
-        assert_eq!(std::fs::read(bx.diagnostics_log()).unwrap(), b"");
+        assert_eq!(
+            std::fs::read(bx.get_dir().join(crate::state::DIAGNOSTICS_LOG)).unwrap(),
+            b""
+        );
     }
 
     /// The appender lays down the scheme: `terra.log` is a symlink to a
@@ -101,16 +107,16 @@ mod tests {
     fn the_appender_lays_down_the_scheme() {
         let dir = tempfile::tempdir().unwrap();
         let bx = BoxRef::from_state_dir(dir.path().join("dev"), dir.path());
-        std::fs::create_dir_all(bx.dir()).unwrap();
+        std::fs::create_dir_all(bx.get_dir()).unwrap();
 
         build_appender(&bx).unwrap();
 
-        let meta = std::fs::symlink_metadata(bx.log()).unwrap();
+        let meta = std::fs::symlink_metadata(bx.get_dir().join(crate::state::LOG_FILE)).unwrap();
         assert!(
             meta.file_type().is_symlink(),
             "terra.log is the appender's symlink"
         );
-        let dated: Vec<_> = std::fs::read_dir(bx.dir())
+        let dated: Vec<_> = std::fs::read_dir(bx.get_dir())
             .unwrap()
             .filter_map(Result::ok)
             .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))

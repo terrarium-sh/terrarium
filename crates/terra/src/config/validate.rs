@@ -1,8 +1,8 @@
 use anyhow::{Result, bail};
-use std::collections::BTreeMap;
-use std::path::Path;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::{Config, MIN_MEM_MIB};
+use terra_shared::contract::MAX_VOLUMES;
 
 pub(crate) fn validate_env(env: &BTreeMap<String, String>) -> Result<()> {
     for (k, v) in env {
@@ -26,24 +26,31 @@ pub(crate) fn validate_env(env: &BTreeMap<String, String>) -> Result<()> {
 }
 
 pub(crate) fn validate(cfg: &Config) -> Result<()> {
-    for m in &cfg.mounts {
-        if !m.guest.is_absolute() {
-            bail!("mount guest path must be absolute: '{}'", m.guest.display());
-        }
-    }
+    validate_workdir(cfg)?;
+    validate_hw(cfg)?;
+    validate_sudo(cfg)?;
+    validate_volumes(cfg)?;
+    validate_network(cfg)?;
+    validate_env(&cfg.env)?;
+    validate_one_thing_per_guest_path(cfg)?;
+    Ok(())
+}
 
+fn validate_workdir(cfg: &Config) -> Result<()> {
     if let Some(dir) = &cfg.workload.workdir
         && !dir.is_absolute()
     {
         bail!("workload.workdir must be absolute: '{}'", dir.display());
     }
+    Ok(())
+}
 
+fn validate_hw(cfg: &Config) -> Result<()> {
     if cfg.hw.rootfs_mib == 0 {
         bail!(
             "hw.rootfs_mib must be > 0 (the state is always a bounded image; use mounts for uncapped scratch)"
         );
     }
-
     // A VM the hypervisor cannot build fails deep inside libkrun, in a
     // background process whose only report is a replayed log - so the numbers
     // that decide whether it can be built are checked against the recipe.
@@ -57,7 +64,10 @@ pub(crate) fn validate(cfg: &Config) -> Result<()> {
             cfg.hw.mem_mib
         );
     }
+    Ok(())
+}
 
+fn validate_sudo(cfg: &Config) -> Result<()> {
     // doas fails *closed* on a parse error, silently revoking every grant - so
     // anything that could break a rule out of its own line is refused here.
     for c in &cfg.sudo {
@@ -71,15 +81,19 @@ pub(crate) fn validate(cfg: &Config) -> Result<()> {
             );
         }
     }
+    Ok(())
+}
 
-    if cfg.volumes.len() > terra_shared::MAX_VOLUMES {
+fn validate_volumes(cfg: &Config) -> Result<()> {
+    if cfg.volumes.len() > MAX_VOLUMES {
         bail!(
             "{} volumes configured; at most {} fit (one guest block device each)",
             cfg.volumes.len(),
-            terra_shared::MAX_VOLUMES
+            MAX_VOLUMES
         );
     }
-    for (i, v) in cfg.volumes.iter().enumerate() {
+    let mut seen = HashSet::new();
+    for v in &cfg.volumes {
         // The name becomes a host filename in the box's state dir: no
         // separators, no traversal.
         if matches!(v.name.as_str(), "" | "." | "..") || v.name.contains(['/', '\\']) {
@@ -89,36 +103,29 @@ pub(crate) fn validate(cfg: &Config) -> Result<()> {
             );
         }
         // Two volumes on one image would mount the same ext4 read-write twice.
-        if cfg.volumes[..i].iter().any(|p| p.name == v.name) {
+        if !seen.insert(&v.name) {
             bail!("duplicate volume name '{}'", v.name);
-        }
-        if !v.guest.is_absolute() {
-            bail!(
-                "volume '{}' guest path must be absolute: '{}'",
-                v.name,
-                v.guest.display()
-            );
         }
         if v.size_mib == 0 {
             bail!("volume '{}' must have size_mib > 0", v.name);
         }
     }
+    Ok(())
+}
 
+fn validate_network(cfg: &Config) -> Result<()> {
     // A broken `network:` would otherwise fail mid-boot, in the background
     // gateway - after the recipe was pinned - so it is refused here instead.
-    crate::policy::network::parse_port_mappings(&cfg.network.ports)?;
-    crate::policy::network::validate(&cfg.network)?;
-
-    validate_env(&cfg.env)?;
-    check_one_thing_per_guest_path(cfg)?;
+    crate::policy::network::rules::parse_port_mappings(&cfg.network.ports)?;
+    let _ = crate::policy::network::runtime::BoxPolicy::new(&cfg.network)?;
     Ok(())
 }
 
 /// Refuse two entries claiming one guest path. They are mounted in recipe
 /// order, so the later one silently wins and the earlier one is a line in the
 /// recipe that does nothing.
-fn check_one_thing_per_guest_path(cfg: &Config) -> Result<()> {
-    let claims: Vec<(&Path, String)> = cfg
+fn validate_one_thing_per_guest_path(cfg: &Config) -> Result<()> {
+    let claims = cfg
         .mounts
         .iter()
         .map(|m| {
@@ -131,10 +138,10 @@ fn check_one_thing_per_guest_path(cfg: &Config) -> Result<()> {
             cfg.volumes
                 .iter()
                 .map(|v| (v.guest.as_path(), format!("volume '{}'", v.name))),
-        )
-        .collect();
-    for (i, (guest, what)) in claims.iter().enumerate() {
-        if let Some((_, earlier)) = claims[..i].iter().find(|(p, _)| p == guest) {
+        );
+    let mut seen = HashMap::new();
+    for (guest, what) in claims {
+        if let Some(earlier) = seen.insert(guest, what.clone()) {
             bail!(
                 "guest path '{}' is claimed twice, by {earlier} and by {what} \
                  (the later one would be mounted over the earlier)",

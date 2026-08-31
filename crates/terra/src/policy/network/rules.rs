@@ -7,22 +7,7 @@ use std::net::{IpAddr, Ipv6Addr};
 /// real name can collide with it.
 pub const HOST_LOOPBACK_SYMBOL: &str = "HOST_LOOPBACK";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Port {
-    Any,
-    Only(u16),
-}
-
-impl Port {
-    #[must_use]
-    pub(crate) fn covers(self, port: Option<u16>) -> bool {
-        match (self, port) {
-            (Port::Any, _) => true,
-            (Port::Only(granted), Some(dialed)) => granted == dialed,
-            (Port::Only(_), None) => false,
-        }
-    }
-}
+pub type Port = Option<u16>;
 
 /// Parse `network.ports` - `"HOST[:GUEST]"`, bare = same on both. The host
 /// side always binds `127.0.0.1`.
@@ -102,23 +87,22 @@ pub(crate) fn parse_allow(entry: &str) -> Result<Rule> {
 
 pub(crate) fn split_host_port(entry: &str) -> Result<(&str, Port)> {
     let parse_port = |text: &str| {
-        parse_port_number(text).map(Port::Only).ok_or_else(|| {
+        parse_port_number(text).ok_or_else(|| {
             anyhow::anyhow!("allow rule '{entry}': '{text}' is not a port (1-65535)")
         })
     };
     if let Some(rest) = entry.strip_prefix('[') {
-        let (host, suffix) = rest
-            .split_once(']')
+        if let Some(host) = rest.strip_suffix(']') {
+            return Ok((host, None));
+        }
+        let (host, port_text) = rest
+            .split_once("]:")
             .ok_or_else(|| anyhow::anyhow!("allow rule '{entry}': unclosed '['"))?;
-        return match suffix.strip_prefix(':') {
-            Some(port_text) => Ok((host, parse_port(port_text)?)),
-            None if suffix.is_empty() => Ok((host, Port::Any)),
-            None => bail!("allow rule '{entry}': trailing '{suffix}' after ']'"),
-        };
+        return Ok((host, Some(parse_port(port_text)?)));
     }
     match entry.rsplit_once(':') {
         Some((host, port_text)) if !host.is_empty() && !host.contains(':') => {
-            Ok((host, parse_port(port_text)?))
+            Ok((host, Some(parse_port(port_text)?)))
         }
         Some((host, port_text))
             if host.parse::<Ipv6Addr>().is_ok() && parse_port_number(port_text).is_some() =>
@@ -129,7 +113,7 @@ pub(crate) fn split_host_port(entry: &str) -> Result<(&str, Port)> {
                  address on every port, or '[{host}]:{port_text}' for port {port_text}"
             )
         }
-        _ => Ok((entry, Port::Any)),
+        None | Some((_, _)) => Ok((entry, None)),
     }
 }
 
