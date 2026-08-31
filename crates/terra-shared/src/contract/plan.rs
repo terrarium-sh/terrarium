@@ -74,6 +74,8 @@ pub const CONTROL_VSOCK_PORT: u32 = 6001;
 /// Signal byte for graceful shutdown. Single byte for signal-handler use.
 pub const STOP_SIGNAL: u8 = b'S';
 
+pub const DEFAULT_STOP_GRACE_SECS: u64 = 30;
+
 /// The guest's last word on the control connection: what the workload exited
 /// with, or what the `on_create` bake did in a Create VM.
 ///
@@ -163,6 +165,9 @@ pub struct Plan {
     pub on_create: Vec<String>,
     pub on_start: Vec<String>,
     pub pre_stop: Vec<String>,
+    /// Background shell lines, restarted on failure until the box stops.
+    #[serde(default)]
+    pub daemons: Vec<String>,
     pub workload: Vec<String>,
     pub sandbox_info: String,
     /// Broadcast the workload's terminal to the guest console as well as to
@@ -307,6 +312,7 @@ mod tests {
                 on_create: vec!["apk add git".into()],
                 on_start: vec!["date".into()],
                 pre_stop: vec!["sync".into()],
+                daemons: vec!["while true; do sleep 60; done".into()],
                 workload: vec!["/bin/sh".into(), "-c".into(), "make".into()],
                 sandbox_info: "# Terrarium sandbox".into(),
                 workload_on_console: true,
@@ -344,6 +350,9 @@ mod tests {
         let decoded: Plan = serde_json::from_value(json_without).unwrap();
         assert_eq!(decoded.host_time_ns, None);
         assert_eq!(decoded.host_tz, None);
+        // …and an old host's plan, which carries no daemons, still boots a
+        // new agent.
+        assert!(decoded.daemons.is_empty());
     }
 
     #[test]

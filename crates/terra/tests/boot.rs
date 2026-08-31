@@ -576,6 +576,38 @@ fn boot_suite() {
         "cp did not round-trip through the guest"
     );
 
+    // == daemons: background commands restarted on failure ==
+    // Each line runs beside the workload as guest root; a non-zero exit
+    // respawns it after a second, exit 0 leaves it done. The workload waits a
+    // few seconds, so the console shows both the one-shot daemon and the
+    // crash loop's restarts - then the box exits 0.
+    let daemon_recipe = s.work().join("daemon.yaml");
+    std::fs::write(
+        &daemon_recipe,
+        "daemons:\n  - echo DAEMON_STARTED\n  - \"echo CRASH; exit 3\"\n\
+         workload:\n  entrypoint: /bin/sh\n  args: [-c, 'sleep 4; echo WORKLOAD_DONE']\n",
+    )
+    .unwrap();
+    let daemon_project = s.project("daemon");
+    let daemon_dir = daemon_project.to_str().unwrap();
+    s.terra(&[
+        daemon_recipe.to_str().unwrap(),
+        "setup",
+        "--project",
+        daemon_dir,
+    ]);
+    let (out, code) = s.terra_status(&["daemon", "--foreground", "--project", daemon_dir]);
+    assert_eq!(
+        code, 0,
+        "a box with daemons did not exit with its workload:\n{out}"
+    );
+    assert!(out.contains("DAEMON_STARTED"), "{out}");
+    assert!(out.contains("WORKLOAD_DONE"), "{out}");
+    assert!(
+        out.matches("CRASH").count() >= 2,
+        "the crashing daemon was not restarted:\n{out}"
+    );
+
     // == exit status: the workload's own, out of a VM that cannot carry one ==
     // The hypervisor exits with 0 however the guest ended - its own exit-code
     // channel wants a virtiofs root, and a box roots on a block device - so the

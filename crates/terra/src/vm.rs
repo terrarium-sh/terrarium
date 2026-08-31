@@ -192,6 +192,7 @@ fn build_plan(spec: &BootSpec, shares: Vec<Share>, volumes: Vec<Disk>) -> Plan {
         on_create: cfg.hooks.on_create.clone(),
         on_start: cfg.hooks.on_start.clone(),
         pre_stop: cfg.hooks.pre_stop.clone(),
+        daemons: cfg.daemons.clone(),
         workload_on_console: spec.foreground,
         workload: std::iter::once(cfg.workload.entrypoint.to_string_lossy().into_owned())
             .chain(cfg.workload.args.iter().cloned())
@@ -408,6 +409,7 @@ mod tests {
         let mut cfg: config::Config =
             yaml_serde::from_str("workload:\n  entrypoint: /bin/sh\n  args: [-c, make]\n").unwrap();
         cfg.env = BTreeMap::from([("API_KEY".to_string(), "sk-super-secret".to_string())]);
+        cfg.daemons = vec!["ascend --serve".into()];
         let spec = BootSpec {
             cfg,
             project_dir: PathBuf::from("/proj"),
@@ -427,6 +429,7 @@ mod tests {
         let plan = build_plan(&spec, shares, volumes);
 
         assert_eq!(plan.workload, ["/bin/sh", "-c", "make"]);
+        assert_eq!(plan.daemons, ["ascend --serve"]);
         assert_eq!(plan.env["API_KEY"], "sk-super-secret");
         assert!(!plan.sandbox_info.contains("sk-super-secret"));
         assert!(matches!(plan.mode, PlanMode::Run));

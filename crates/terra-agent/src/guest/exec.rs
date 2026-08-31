@@ -75,7 +75,7 @@ fn exec_abandoned<C: std::io::Write>(conn: &mut C, child: &mut std::process::Chi
 /// The command's exit status - `128 + signal` for a signal death, as the shell
 /// spells it - or [`EXEC_NOT_RUN`] when there is no status to report at all.
 /// The one reading of a child's status: an exec's, and the workload's own
-/// ([`crate::term::mux::run_workload`]), so a box and a command spell a signal death
+/// (in `init::run_workload`), so a box and a command spell a signal death
 /// the same way.
 #[must_use]
 pub(crate) fn exit_code(child: &mut std::process::Child) -> i32 {
@@ -91,7 +91,7 @@ pub(crate) fn exit_code(child: &mut std::process::Child) -> i32 {
 ///
 /// ponytail: returns when the PTY closes, so a command that leaves a child
 /// holding the terminal (`sh -c 'daemon &'`) keeps the exec attached - the same
-/// ceiling `run_workload` has, and the same one `ssh` is famous for. Closing the
+/// ceiling the workload's run has, and the same one `ssh` is famous for. Closing the
 /// master from the reaper thread would fix it and would race every read here;
 /// worth it only if backgrounding through exec turns out to be common.
 fn exec_on_pty(
@@ -106,7 +106,7 @@ fn exec_on_pty(
 
     let home = terra_shared::workload_home();
     let (pty, mut child) =
-        match crate::term::mux::spawn_on_pty(cmd, args, rows, cols, as_root, Some(&home)) {
+        match crate::init::spawn_on_pty(cmd, args, rows, cols, as_root, Some(&home)) {
             Ok(pair) => pair,
             Err(e) => return exec_failed(&mut conn, cmd, &e, true),
         };
@@ -189,7 +189,7 @@ fn exec_on_pipes(mut conn: VsockStream, cmd: &str, args: &[String], as_root: boo
         if !as_root {
             // SAFETY: as in `spawn_on_pty` - async-signal-safe id-setting only.
             unsafe {
-                command.pre_exec(crate::term::mux::drop_privileges);
+                command.pre_exec(crate::init::drop_privileges);
             }
         }
         Ok(crate::reap::spawn_owned(|| command.spawn())?)

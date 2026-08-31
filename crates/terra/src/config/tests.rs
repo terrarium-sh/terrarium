@@ -91,6 +91,15 @@ fn relative_mount_resolved_against_cwd() {
     assert_eq!(cfg.hooks.on_start, vec!["echo hi"]);
 }
 
+/// A recipe's daemons are shell lines, taken as written.
+#[test]
+fn daemons_parse_and_default_empty() {
+    let cfg: Config = yaml_serde::from_str("daemons: [ascend]\n").unwrap();
+    assert_eq!(cfg.daemons, vec!["ascend"]);
+    let none: Config = yaml_serde::from_str("{}").unwrap();
+    assert!(none.daemons.is_empty());
+}
+
 /// The recipe's own spellings, refused variants included.
 #[test]
 fn network_mode_parses_from_yaml_scalar() {

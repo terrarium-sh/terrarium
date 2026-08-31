@@ -32,7 +32,7 @@ libc.workspace = true
 sha2 = { version = "0.11", default-features = false }
 tracing = "0.1.44"
 tracing-appender = "0.2"
-log = "0.4.33"
+log = "0.4.34"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "registry", "tracing-log", "std"] }
 
 [dev-dependencies]

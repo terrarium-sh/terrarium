@@ -38,6 +38,8 @@ What each option means from inside the sandbox:
   other command is denied root.
 - `hooks` - `on_create` was baked into this filesystem once; `on_start` ran
   before your workload; `pre_stop` runs on an orderly stop.
+- `daemons` - background commands started with you, restarted on failure until
+  the box stops.
 - `network` - the egress policy (next section).
 
 ## Network

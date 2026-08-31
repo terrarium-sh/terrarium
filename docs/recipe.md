@@ -54,6 +54,8 @@ hooks:
     - echo ready
   pre_stop:
     - echo "cleaning up"
+daemons:                # background commands, restarted on failure
+  - ascend --serve      # exit 0 = done; anything else respawns after 1s
 workload:
   entrypoint: /bin/sh
   args: []
@@ -230,6 +232,19 @@ workload:
   guest root. `on_start` runs inside the guest before the
   workload on every boot; `pre_stop` runs on orderly shutdown (Ctrl-C / SIGTERM)
   before exit.
+- **daemons**: background commands that run beside the workload for the box's
+  whole life. Each entry is a shell line, run through `/bin/sh` as guest root
+  (like the hooks), starting after `on_start` and the `workdir` are ready. A
+  line that exits 0 is done and stays done; a non-zero exit, a signal death or
+  a spawn failure is logged and the line respawns after a second, forever — so
+  a server that never exits 0 is the intended shape. On an orderly shutdown
+  the workload is SIGTERMed first; `pre_stop` runs while the daemons are still
+  up (it can drive them), and afterwards the daemons get the same stop —
+  SIGTERM, then SIGKILL once the stop grace (30s by default — the same number
+  `terra stop --wait` is built on) runs out. Their output goes to
+  the box's console — `terra logs` for a detached box — never the session
+  terminal. For per-command policies (a specific user, restart limits,
+  dependencies) run a supervisor like `ascend` as the daemon instead.
 - **workload**: the program to run. `entrypoint` + `args` are passed literally
   to the guest exec (argv = `[entrypoint, ..args]`). For a shell command use
   `entrypoint: /bin/sh, args: ["-c", "echo hi"]`. Defaults to an interactive
@@ -274,5 +289,6 @@ session, which would leave `sudo:` deciding nothing.
 Press **Ctrl-C** to interrupt the workload, or `terra stop` for an orderly
 shutdown from elsewhere — as does `systemctl stop`, whose SIGTERM lands in the
 same place: the guest stops the workload — SIGTERM, then
-SIGKILL five seconds later, since an interactive shell ignores SIGTERM — runs
+SIGKILL once the stop grace (30s by default) runs out, since an interactive
+shell ignores SIGTERM — runs
 `pre_stop`, and exits. No VM is left running either way.

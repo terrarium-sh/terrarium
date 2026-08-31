@@ -1,16 +1,24 @@
 //! Guest init (PID 1): bring the guest up and run the plan.
 
-use crate::vsock::{VMADDR_CID_HOST, VsockStream};
+use crate::term::session::{DEFAULT_COLS, DEFAULT_ROWS, Session};
+use crate::vsock::{VMADDR_CID_HOST, VsockListener, VsockStream};
 use anyhow::{Context, Result, bail};
+use pty_process::blocking::Command as PtyCommand;
+use pty_process::blocking::Pty;
 use std::fs;
+use std::io::Read;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use terra_shared::no_symlinks;
 use terra_shared::{
-    CONTROL_VSOCK_PORT, HostTimezone, Net, Plan, PlanMode, RECIPE_STAMP_PATH, RESIZE2FS_GUEST_PATH,
-    ROOT_DEVICE, Share, WORKLOAD_GID, WORKLOAD_UID, WORKLOAD_USER_NAME,
+    CONTROL_VSOCK_PORT, DEFAULT_STOP_GRACE_SECS, HostTimezone, Net, Plan, PlanMode,
+    RECIPE_STAMP_PATH, RESIZE2FS_GUEST_PATH, ROOT_DEVICE, STOP_SIGNAL, Share, WORKLOAD_GID,
+    WORKLOAD_UID, WORKLOAD_USER_NAME,
 };
 
 /// Bring the guest up, returning once the workload has exited (Run) or
@@ -411,22 +419,24 @@ fn execute(
 
     crate::reap::watch_orphans();
 
-    // A clone, because the status this ends with still has to go back out on it.
-    let (code, session) = crate::term::mux::run_workload(
-        &plan.workload,
-        control
-            .try_clone()
-            .context("cloning the control connection")?,
-        plan.root,
-        port,
-        plan.workload_on_console,
-    )
-    .context("running the workload")?;
+    let daemons = crate::daemon::spawn_all(&plan.daemons);
+    let stop_grace = Duration::from_secs(DEFAULT_STOP_GRACE_SECS);
 
-    // Best-effort: failing cleanup should not mask the exit.
+    let outcome = run_workload(plan, control, port, stop_grace);
+    let (code, session) = match outcome {
+        Ok(pair) => pair,
+        Err(e) => {
+            daemons.stop(stop_grace);
+            return Err(e.context("running the workload"));
+        }
+    };
+
+    // Best-effort: failing cleanup should not mask the exit. Daemons stay up
+    // through `pre_stop`, which may drive them; they are stopped after.
     for line in &plan.pre_stop {
         sh_ok_within(line, PRE_STOP_TIMEOUT);
     }
+    daemons.stop(stop_grace);
     session.broadcast_exit(code, CLIENT_EXIT_GRACE);
     Ok(code)
 }
@@ -695,6 +705,178 @@ fn ensure_workdir(dir: &str) -> std::io::Result<bool> {
     Ok(true)
 }
 
+// ---- the workload, the daemons, and the graceful stop ----------------------
+
+/// Run the plan's processes - the daemons and the workload on its PTY - and
+/// hand back the workload's status and its session once it exits. The stop
+/// watcher rides a clone of the control connection, so a graceful stop reaches
+/// the workload; the daemons are the caller's to stop, after `pre_stop`. The
+/// original connection stays owed the exit status at the end of the boot.
+fn run_workload(
+    plan: &Plan,
+    control: &VsockStream,
+    port: VsockListener,
+    stop_grace: Duration,
+) -> Result<(i32, Arc<Session>)> {
+    let Some((cmd, args)) = plan.workload.split_first() else {
+        bail!("empty workload argv");
+    };
+    let (pty, child) = spawn_on_pty(cmd, args, DEFAULT_ROWS, DEFAULT_COLS, plan.root, None)?;
+    let mut terminal =
+        crate::term::mux::Terminal::start(pty, child, plan.workload_on_console, port, plan.root)
+            .context("setting up the workload's terminal")?;
+    watch_graceful_stop(
+        control
+            .try_clone()
+            .context("cloning the control connection")?,
+        terminal.pid(),
+        terminal.exited(),
+        stop_grace,
+    );
+    let code = terminal.wait();
+    Ok((code, terminal.session()))
+}
+
+/// Spawn `cmd` on a fresh PTY of the given size. The slave end is dropped on
+/// return, so the master EOFs when the command exits.
+pub(crate) fn spawn_on_pty(
+    cmd: &str,
+    args: &[String],
+    rows: u16,
+    cols: u16,
+    as_root: bool,
+    home: Option<&str>,
+) -> Result<(Pty, std::process::Child)> {
+    let (pty, pts) = pty_process::blocking::open()?;
+    pty.resize(pty_process::Size::new(rows.max(1), cols.max(1)))?;
+    let mut command = PtyCommand::new(cmd).args(args);
+    if let Some(home) = home {
+        command = command.env("HOME", home);
+    }
+    // init stays root for cleanup.
+    if !as_root {
+        // SAFETY: a post-fork/pre-exec hook that only calls async-signal-safe
+        // id-setting syscalls.
+        command = unsafe { command.pre_exec(drop_privileges) };
+    }
+    let child = crate::reap::spawn_owned(|| command.spawn(pts))?;
+    Ok((pty, child))
+}
+
+/// Drop to the workload user post-fork. Order matters: gid before uid, or we
+/// lose the privilege to set the uid.
+pub fn drop_privileges() -> std::io::Result<()> {
+    unsafe {
+        if libc::setgroups(0, std::ptr::null()) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if libc::setgid(WORKLOAD_GID) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if libc::setuid(WORKLOAD_UID) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// How often the stop watcher asks whether the workload has gone: the
+/// escalation breaks out the moment it has.
+const STOP_POLL: Duration = Duration::from_millis(50);
+
+/// Open a pidfd for the workload and start [`stop_gracefully`] watching the
+/// control connection. Without pidfds the box still runs, it just cannot be
+/// stopped gracefully (the host kills it after its `--wait`).
+fn watch_graceful_stop(
+    control: VsockStream,
+    child_pid: u32,
+    exited: Arc<AtomicBool>,
+    stop_grace: Duration,
+) {
+    match pidfd_open(child_pid) {
+        Ok(pidfd) => {
+            std::thread::spawn(move || {
+                stop_gracefully(control, &pidfd, &exited, stop_grace);
+            });
+        }
+        Err(e) => eprintln!(
+            "terra-agent: warning: no pidfd for the workload ({e}) - a graceful stop cannot reach it"
+        ),
+    }
+}
+
+/// Read `control` until the stop byte (or a host disconnect), then stop the
+/// workload: SIGTERM, wait for it to go or for `stop_grace` to run out, SIGKILL
+/// what is left. Returns as soon as the workload has exited - the grace is a
+/// ceiling, not a delay. The daemons are the caller's to stop, after `pre_stop`.
+///
+/// Signals go through a pidfd, which the kernel pins to the workload: once it
+/// is reaped its pid is the kernel's to hand out again, and a `pre_stop` hook
+/// starts moments later - a signal by pid could land on whatever now holds
+/// the number.
+fn stop_gracefully(
+    mut control: VsockStream,
+    workload: &OwnedFd,
+    exited: &AtomicBool,
+    stop_grace: Duration,
+) {
+    let mut byte = [0u8; 1];
+    loop {
+        match control.read(&mut byte) {
+            Ok(0) => break, // host disconnected: the VM is orphaned, stop
+            Ok(_) if byte[0] == STOP_SIGNAL => break,
+            Ok(_) => {} // a stray byte is not a stop
+            // EINTR is a retry, not a disconnect: treating any read error as
+            // a stop used to SIGTERM the workload on it.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => {
+                eprintln!("terra-agent: the control connection failed ({e}) - stopping");
+                break;
+            }
+        }
+    }
+    pidfd_signal(workload, libc::SIGTERM);
+    let deadline = std::time::Instant::now() + stop_grace;
+    while std::time::Instant::now() < deadline && !exited.load(Ordering::SeqCst) {
+        std::thread::sleep(STOP_POLL);
+    }
+    if !exited.load(Ordering::SeqCst) {
+        eprintln!(
+            "terra-agent: workload ignored SIGTERM after {}s - killing it",
+            stop_grace.as_secs()
+        );
+        pidfd_signal(workload, libc::SIGKILL);
+    }
+}
+
+/// A pidfd for the workload - the handle [`stop_gracefully`] signals through.
+/// Also how [`crate::daemon`] tracks its daemons.
+pub(crate) fn pidfd_open(pid: u32) -> std::io::Result<OwnedFd> {
+    let pid = libc::pid_t::try_from(pid).map_err(std::io::Error::other)?;
+    // SAFETY: `pidfd_open` takes a pid and flags, and returns a new fd or -1.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    let fd = libc::c_int::try_from(fd).map_err(std::io::Error::other)?;
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a fresh fd owned by nothing else.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Signal through a pidfd.
+pub(crate) fn pidfd_signal(pidfd: &OwnedFd, sig: libc::c_int) {
+    // SAFETY: a live fd, a null siginfo (same as `kill`), and no flags.
+    unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            sig,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        );
+    }
+}
+
 // ---- command helpers -------------------------------------------------------
 
 /// Run a command, error on non-zero.
@@ -850,5 +1032,56 @@ mod tests {
         assert!(file.is_file());
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    /// A workload willing to die, a 30s grace, and a stop byte: the stop must
+    /// return as soon as it is gone, not wait the grace out - the box's
+    /// shutdown is the workload's exit, not a timer.
+    #[test]
+    fn a_stop_ends_early_when_the_workload_takes_the_signal() {
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+        let (mut host, guest) = UnixStream::pair().unwrap();
+        let guest = VsockStream::from(std::os::fd::OwnedFd::from(guest));
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("trap 'exit 0' TERM; while true; do sleep 1; done")
+            .spawn()
+            .unwrap();
+        let child_pid = child.id();
+        let exited = Arc::new(AtomicBool::new(false));
+        let reaped = exited.clone();
+        let wait_workload = std::thread::spawn(move || {
+            child.wait().unwrap();
+            reaped.store(true, Ordering::SeqCst);
+        });
+
+        let watcher = std::thread::spawn({
+            let exited = exited.clone();
+            move || {
+                stop_gracefully(
+                    guest,
+                    &pidfd_open(child_pid).unwrap(),
+                    &exited,
+                    Duration::from_secs(30),
+                );
+            }
+        });
+        host.write_all(&[STOP_SIGNAL]).unwrap();
+
+        let start = std::time::Instant::now();
+        let deadline = start + Duration::from_secs(10);
+        while !watcher.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(watcher.is_finished(), "the stop waited the grace out");
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the stop took {:?}",
+            start.elapsed()
+        );
+        watcher.join().unwrap();
+        wait_workload.join().unwrap();
+        assert!(exited.load(Ordering::SeqCst));
     }
 }

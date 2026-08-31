@@ -121,6 +121,7 @@ pub fn policy_summary(cfg: &config::Config) -> String {
         volumes: _,
         network,
         hooks,
+        daemons,
         workload: _,
         sudo,
         env: _,
@@ -168,6 +169,9 @@ pub fn policy_summary(cfg: &config::Config) -> String {
     }
     for hook in on_create.iter().chain(on_start).chain(pre_stop) {
         let _ = writeln!(out, "  as root:  {}", printable(hook));
+    }
+    for line in daemons {
+        let _ = writeln!(out, "  daemon:   {}", printable(line));
     }
     let _ = write!(out, "  workload: {}", workload_line(cfg));
     out
@@ -357,6 +361,21 @@ mod tests {
         // A recipe naming no file says nothing about one.
         let none = policy_summary(&yaml_serde::from_str("{}").unwrap());
         assert!(!none.contains("env_file"), "{none}");
+    }
+
+    /// A daemon runs as root for the box's lifetime, so the approving page
+    /// carries every line - escaped like the hooks, and quiet when none.
+    #[test]
+    fn the_approval_summary_lists_every_daemon() {
+        let cfg = config::Config {
+            daemons: vec!["ascend --serve".to_string(), "evil\x1b[2J".to_string()],
+            ..yaml_serde::from_str("{}").unwrap()
+        };
+        let summary = policy_summary(&cfg);
+        assert!(summary.contains("daemon:   ascend --serve"), "{summary}");
+        assert!(!summary.contains('\x1b'), "{summary}");
+        let none = policy_summary(&yaml_serde::from_str("{}").unwrap());
+        assert!(!none.contains("daemon:"), "{none}");
     }
 
     /// The egress *posture* is one phrase; an `allow:` rule is what opens the

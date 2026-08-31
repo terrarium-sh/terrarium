@@ -19,6 +19,9 @@ pub struct Config {
     pub volumes: Vec<Volume>,
     pub network: Network,
     pub hooks: Hooks,
+    /// Background shell lines, restarted on failure for the box's lifetime.
+    /// Exit 0 ends the daemon; anything else respawns after 1s.
+    pub daemons: Vec<String>,
     pub workload: Workload,
     /// Commands the workload user may run as root through `doas` (aliased to
     /// `sudo`). Empty grants nothing.

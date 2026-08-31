@@ -4,6 +4,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 #![allow(unsafe_code)]
 
+mod daemon;
 mod exec;
 mod files;
 mod idmap;

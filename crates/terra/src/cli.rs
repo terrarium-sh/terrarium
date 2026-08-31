@@ -266,13 +266,15 @@ pub struct AgentTimeoutArg {
     pub agent_timeout: Option<u64>,
 }
 
-const DEFAULT_STOP_GRACE_SECS: u64 = 30;
+const STOP_TEARDOWN_ALLOWANCE_SECS: u64 = 35;
+const DEFAULT_STOP_WAIT_SECS: u64 =
+    terra_shared::DEFAULT_STOP_GRACE_SECS + STOP_TEARDOWN_ALLOWANCE_SECS;
 
 #[derive(Args, Debug)]
 pub struct StopArgs {
     /// How long to wait in seconds for the guest to shut down before the
     /// VM is killed.
-    #[arg(long, value_name = "SECS", default_value_t = DEFAULT_STOP_GRACE_SECS)]
+    #[arg(long, value_name = "SECS", default_value_t = DEFAULT_STOP_WAIT_SECS)]
     pub wait: u64,
 }
 
@@ -287,7 +289,7 @@ pub struct RmArgs {
     pub force: bool,
     /// How long to wait in seconds for that graceful stop. Only means anything
     /// with `--force`, so clap refuses it on its own.
-    #[arg(long, value_name = "SECS", default_value_t = DEFAULT_STOP_GRACE_SECS, requires = "force")]
+    #[arg(long, value_name = "SECS", default_value_t = DEFAULT_STOP_WAIT_SECS, requires = "force")]
     pub wait: u64,
 }
 
@@ -766,10 +768,19 @@ mod tests {
         assert!(!args.all);
     }
 
-    /// The grace a stop waits is one number ([`DEFAULT_STOP_GRACE_SECS`]):
-    /// taken from the flag whether or not the flag was given.
+    /// The wait a stop uses is one number per role: the guest escalates to
+    /// SIGKILL after [`terra_shared::DEFAULT_STOP_GRACE_SECS`], and the host
+    /// waits that plus a teardown budget before killing the VM - taken from
+    /// the flag whether or not the flag was given.
     #[test]
     fn the_stop_grace_has_one_default() {
+        let Some(Cmd::Stop(stop_args)) = Cli::parse_from(["terra", "stop"]).cmd else {
+            panic!("expected stop")
+        };
+        assert_eq!(
+            stop_args.wait,
+            terra_shared::DEFAULT_STOP_GRACE_SECS + STOP_TEARDOWN_ALLOWANCE_SECS
+        );
         let Some(Cmd::Stop(stop_args)) = Cli::parse_from(["terra", "stop", "--wait", "5"]).cmd
         else {
             panic!("expected stop")
