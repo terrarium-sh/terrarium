@@ -103,7 +103,7 @@ pub struct Network {
     pub allow: Vec<String>,
     pub hosts: Vec<StaticDnsRecord>,
     /// Expose a guest listener on the host loopback: `"HOST[:GUEST]"`, so a bare
-    /// `"8080"` means `8080:8080`. Bound on `127.0.0.1` only.
+    /// `"8080"` means `8080:8080`. IPv4 is required; IPv6 loopback is best-effort.
     pub ports: Vec<String>,
 }
 

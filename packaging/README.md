@@ -80,7 +80,7 @@ is one terra stops to ask about, and the unit has no terminal to be asked on.
 
 `systemctl stop` (SIGTERM) shuts the guest down orderly: terra writes one byte on
 the guest's control connection, the agent stops the workload (SIGTERM, then
-SIGKILL if it is still there five seconds later — an interactive shell ignores
+SIGKILL if it is still there 30 seconds later — an interactive shell ignores
 SIGTERM) and runs the recipe's `pre_stop` hooks, then the VM exits. Give
 `pre_stop` enough room with `TimeoutStopSec` (30s in the unit); after that systemd
 escalates to SIGKILL, which still leaves no orphan (the VM runs inside terra's

@@ -29,7 +29,7 @@ extensions terra depends on (port-gated allow rules, static DNS records,
 host-loopback forwarding). It is the code that actually enforces what a sandbox
 may reach, so it is here — readable and patchable in the same review as the
 policy that configures it,
-[`crates/terra/src/network.rs`](../crates/terra/src/network.rs). The whole
+[`crates/terra/src/policy/network.rs`](../crates/terra/src/policy/network.rs). The whole
 monorepo comes along; only that crate is compiled.
 
 The two egress-floor fixes terra's audit found (multicast, and the floor applied
@@ -52,14 +52,14 @@ file when a pin bump brings them within reach:
   `O_PATH|O_DIRECTORY` descriptor. Every variant today takes a path, which
   libkrun re-resolves when it opens the share; a mount pinned to an inode
   instead would close the share-path TOCTOU marked `ponytail:` on
-  [`config::resolve_mounts`](../crates/terra/src/config.rs).
+  [`policy::mount::resolve_mounts`](../crates/terra/src/policy/mount.rs).
 
 ## Bumping libkrun / libkrunfw / smolvm
 
 Each is `git -C vendor/<name> checkout <new-rev>` plus staging the gitlink, then:
 
 - **libkrun:** fix any FFI drift in
-  [`crates/terra/src/libkrun_ext.rs`](../crates/terra/src/libkrun_ext.rs) (the C
+  [`crates/terra/src/vm.rs`](../crates/terra/src/vm.rs) (the C
   ABI is stable within a major). Keep libkrunfw's ABI major matched to it.
 - **libkrunfw:** update `KERNEL_VERSION` in the Makefile to match
   `vendor/libkrunfw/Makefile`.
@@ -67,5 +67,5 @@ Each is `git -C vendor/<name> checkout <new-rev>` plus staging the gitlink, then
   This is the code that decides what a sandbox may reach, and terra's egress
   tests are what catch a floor that quietly narrowed.
 - Then `make clean && make build`, `make verify`, and the boot suite
-  (`eli tests/e2e/run.lua`) — its egress and ownership assertions are what
+  (`make dist && TERRA_BIN=$PWD/dist/terra cargo test -p terra --test boot -- --ignored`) — its egress and ownership assertions are what
   actually catch a behavioural change.

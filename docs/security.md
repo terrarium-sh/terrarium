@@ -11,8 +11,9 @@ What crosses the boundary, because you asked it to:
   guest can do anything to those paths that you could — including creating real
   host symlinks in them. There is no host filesystem in a sandbox with no
   `mounts`. A mount that would contain `~/.terra` (this box's state or
-  another's, and the kernel and agent every box boots) or **the terra binary
-  itself** is refused when the recipe is read: those decide what the sandbox may
+  another's, and the kernel and agent every box boots) is refused when the
+  recipe is read. A writable mount that would contain **the terra binary
+  itself** is also refused: those decide what the sandbox may
   mount and reach, what kernel it boots, and — for the binary, which an
   interactive or detached run re-executes to boot the VM — what the next run does
   at all, before there is a sandbox. They are not the sandbox's to write. A recipe
@@ -22,7 +23,8 @@ What crosses the boundary, because you asked it to:
   about the first setup of a *new* box name too, since a box that does not exist
   yet has no recipe of its own to judge an edit against and `terra.yaml` lets a
   guest name one: the sibling box that granted the share is what answers.
-- **`network.ports`** — a guest listener published on the host's `127.0.0.1`.
+- **`network.ports`** — a guest listener published on the host loopback
+  (`127.0.0.1`, with a best-effort `::1` listener).
 - **`allow: ["HOST_LOOPBACK[:PORT]"]`** — the only thing that reaches the
   machine terra is running on, together with a name a `hosts:` record resolves
   there. The host is not in the address namespace at all: no CIDR reaches it,
@@ -48,8 +50,9 @@ What crosses the boundary, because you asked it to:
   rather than checking a component and then opening it; `env_file:` is read the
   same way, for the same reason. (`O_NOFOLLOW` alone is not this: it covers the
   last component only, and the last component is not the shape of the attack.
-  Off Linux — where no host boots a VM yet — the leaf is still all that is
-  refused.) A copy out is capped at 8 GiB however long the guest says its file
+  On non-Linux Unix, terra checks each path component with the platform's
+  no-follow open; Windows is currently unsupported. A copy out is capped at 2 GiB
+  however long the guest says its file
   is, and both directions time out rather than waiting forever on a guest that
   has stopped answering.
 - **`env:` values** — they travel in the boot plan over vsock and land in the
@@ -96,7 +99,7 @@ What is **not** a boundary, and should not be relied on as one:
   to guest root is a kernel bug. That is a deliberate trade, and it costs
   nothing the VM was not already covering.
 - **Hooks.** `on_create`, `on_start` and `pre_stop` run as guest root, by design.
-- **Running terra as host root.** Refused outright when any mount is writable.
+- **Running terra as host root.** Refused by default when any mount is writable.
   Root gets no idmap — real ids pass through virtiofs — so it acts as *real*
   root and the guest picks the owner, mode and setuid bit of everything it
   writes to a share — the sandbox inside out. Run terra as an unprivileged user in the
@@ -130,8 +133,9 @@ diagnostics; the guest's console reaches the disk only under
 everything the guest ever wrote.
 
 `~/.terra` is `0700` on the same terms — and so are the box and cache
-directories, each in its own right, since `config.yaml` can put either on a disk
-mounted for everyone. Checked on every run rather than only when terra creates
+directories, each in its own right. They live at `~/.terra/box` and
+`~/.terra/cache`; terra has no configuration file that relocates them.
+Checked on every run rather than only when terra creates
 them: a directory left open by an older version, or by a looser umask, is
 tightened, and terra refuses to run if it cannot be. That is not
 housekeeping — the reusable recipes live there, and a recipe is the policy for

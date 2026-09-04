@@ -46,7 +46,7 @@ terra                       # boot it — a shell, cwd at /work
 `Ctrl-\`, stop with `terra stop`, delete with `terra rm`.
 
 Want the included recipe instead?
-`cp pi-dev.yaml ~/.terra/ && terra setup pi-dev && terra pi-dev`.
+`cp pi-dev.yaml ~/.terra/ && terra ~/.terra/pi-dev.yaml setup && terra pi-dev`.
 
 ## A recipe is a policy
 

@@ -35,7 +35,7 @@ build the static `mke2fs`/`resize2fs` that get baked in.
 
 ```sh
 make build     # vmlinux + prebaked rootfs/boot images + static terra binary
-make verify    # cargo fmt --check + clippy -D warnings + full test suite
+make verify    # build inputs + fmt + clippy + rustdoc + full test suite
 make dist      # -> dist/terra, one fully-static portable binary
 make cross     # cross-compile the host binary (see Platform support)
 make clean
@@ -129,51 +129,34 @@ rebuild the guest set, so its output embeds the building machine's guest images.
 | `aarch64-unknown-linux-musl` | builds natively (`make ARCH=aarch64` on arm hardware); boot suite not yet run on arm. Not a `make cross` target: an x86_64 build host would pair an arm binary with an x86_64 guest |
 | `aarch64-apple-darwin` | compiles end to end; the final link needs the macOS SDK for the `Hypervisor` framework (set `SDKROOT`) |
 | `x86_64-apple-darwin` | libkrun has no Intel-Mac hypervisor backend (its HVF code is aarch64-only), so this needs work upstream that is not a packaging fix. libkrun on macOS is Apple Silicon only |
-| `x86_64-pc-windows-gnu` | terra itself compiles (verified against libkrun's declared Windows API); libkrun does not. See below |
+| `x86_64-pc-windows-gnu` | unsupported — terra has no Windows platform layer, and libkrun does not build for Windows. See below |
 
-**Windows** is a libkrun question, not a terra one. Upstream ships the WHP API
-bindings, the console handles and a complete `fs/windows` passthrough, but the
-VMM never drives WHP (`vmm/src/` has `linux/` and `macos/` only, and
-`device_manager/` has no `whp/`), and the vsock and virtio-net backends are
-`nix`-only. Three dependency-level blockers sit underneath that: `krun-cpuid` is
-declared for all of x86_64 though it needs KVM, `vm-memory`'s `rawfd` feature is
-enabled unconditionally though the crate hard-errors on Windows, and
-`linux-loader` pulls `vm-memory` with default features so that `rawfd` cannot be
-turned off downstream — the last one wants a PR to rust-vmm.
+**Windows is not supported yet.** Terra's platform layer is Unix-only: the
+crate deliberately fails to compile on non-Unix targets, and the VM/control
+path uses Unix file descriptors, Unix sockets and signals. The vendored libkrun
+also lacks a Windows VMM backend and currently pulls Unix-only dependencies.
 
-None of that is in terra's way: its own sources are Windows-clean, so the day
-libkrun's device and VMM layers land, the port is a dependency bump.
+A future port therefore needs both a Windows platform layer in terra and a
+Windows-capable libkrun dependency. `docs/windows-port.md` records this status;
+it is not a verified build recipe.
 
-One thing in terra is Unix-only, and knowingly: **stopping a box is a signal.**
-`terra stop` sends `SIGTERM` to the pid in the box's `terra.pid`, which the VM
-process's handler turns into the one-byte stop on the control connection — the
-same path `systemctl stop` takes, which is why there is only one. Windows has no
-equivalent: `TerminateProcess` is `SIGKILL` with no `pre_stop`, and console
-control events only reach a process sharing the console, which a detached VM does
-not. That port will need a signalling channel of its own for the graceful half —
-a named event a thread waits on, standing in for the handler that writes the
-stop byte here — with the hard kill left to `TerminateProcess`. The note lives
-on `sys::signal_pid`.
+On Unix, **stopping a box is a signal.** `terra stop` sends `SIGTERM` to the pid
+in the box's `terra.pid`, which the VM process's handler turns into the one-byte
+stop on the control connection — the same path `systemctl stop` takes. A future
+Windows port needs replacements for this signalling path and the other Unix
+APIs used by the host process.
 
 That pid lives in the file the box's lock is taken on — one file, so a pid read
 under a held lock is that holder's by construction rather than by anyone
 remembering to sweep a stale one. Nothing but `terra rm` ever unlinks it: the lock
 is on the inode, so replacing the file would leave the next `terra` locking a
-different one. This is the second thing a Windows port has to look at — a
-`LockFileEx` range is *mandatory*, so while the lock is held nothing else can read
-the file at all; locking a range past the end of the file is the way to keep the
-pid readable there.
+different one. A future Windows port must provide an equivalent lock primitive
+while preserving those ownership and identity guarantees.
 
-Everything else where the hosts genuinely differ lives in one module,
-[`crates/terra/src/sys.rs`](crates/terra/src/sys.rs)
-— unix sockets (std has them on Unix, `uds_windows` on Windows), file modes, and
-the SIGINT/SIGTERM stop handler. Everything else is plain std: the box lock is `File::try_lock`
-(`flock` on Unix, `LockFileEx` on Windows), a run spawns a background copy of
-terra rather than `fork`ing (an interactive run then attaches to it, which is
-what makes detaching possible at all), `terra logs -f` follows the file itself rather than shelling out to
-`tail`, and the attached session drives the terminal through `crossterm`. The only
-other `cfg` in the crate is in the libkrun FFI wrapper, where libkrun's own API
-differs (console descriptors are kernel handles on Windows).
+The current Unix-specific host code includes the box lock, Unix sockets, file
+descriptors, file modes and signal handling. These are the areas a future
+Windows platform layer must replace; the rest of the CLI and recipe model is
+platform-neutral.
 
 The filesystem work that genuinely needs Linux happens inside the guest.
 

@@ -105,22 +105,22 @@ terra ls                         # created? running? (details: terra show)
 ## Where a box lives
 
 **Your project directory stays yours.** Everything terra owns for a box lives
-outside it, in `~/.terra/box/`: one directory per project (named for it, plus a
-hash of its path), one subdirectory per box:
+outside it, in `~/.terra/box/`: one directory per project (named `t-` plus a
+hash-derived Crockford base32 slug), one subdirectory per box:
 
 ```
 myproject/                            # your files, and nothing else
 
-~/.terra/box/myproject-8454e10d1c72dd5a/
-    ├── .path             # which directory these boxes belong to (`terra ls` reads it)
+~/.terra/box/t-x5khnk94914wawb7/
+    ├── .path             # which directory these boxes belong to (`terra ls --all` reads it)
     └── dev/              # one directory per box name — a box only ever has the one you gave it
         ├── recipe.yaml   # what this box was created from — the only file you write
         ├── rootfs.img    # the guest's root filesystem (bounded ext4)
         ├── vol-data.img  # one per `volumes:` entry, keyed by its name
         ├── c             # control: the guest's only channel to terra (plan + stop)
         ├── a             # the agent's port: every session, `terra put`/`get` and `terra exec`
-        ├── terra.pid     # the VM process — `terra stop` signals it, and the lock on it is what keeps one VM per box
-        ├── baking        # present only while an `on_create` bake holds the box
+        ├── terra.pid     # the VM process — `terra stop` signals it, and the lock on it is what keeps one VM per box; bake state is recorded here
+        ├── baked         # empty stamp after a non-empty `on_create` completes
         ├── terra.log     # the box's diagnostics: terra's, libkrun's, the gateway's (rotated daily: the seven newest terra.<date>.log generations are kept)
         └── diagnostics.log # only under TERRA_DIAGNOSTICS=1: the guest console and stray host output, fresh per run
 ```
@@ -140,12 +140,12 @@ mounts:
     guest: /work
 ```
 
-The project directory's name is `<its name>-<hash of its full path>`: the name
-so `ls ~/.terra/box` reads as something, the hash because two projects called
-`app` are ordinary. The path is resolved first, so reaching one project through
-a symlink addresses the boxes it already has rather than quietly making a second
-set. The `path` file is the way back — nothing else could say which project
-`myproject-8454e1…` belongs to, and it is what `terra ls` prints.
+The project directory's name is `t-` followed by 16 lowercase Crockford base32
+characters encoding the first 80 bits of the SHA-256 digest of its canonical
+path. The path is resolved first, so reaching one project through a symlink
+addresses the boxes it already has rather than quietly making a second set. The
+`.path` file is the way back, and it is what `terra ls --all` uses to find the
+project directory.
 
 Under `~/.terra` rather than beside the project, for three reasons: terra already
 refuses to share `~/.terra` with any sandbox, so every box on the machine
@@ -186,25 +186,10 @@ Not to be confused with `~/.terra` itself, which is terra's own rather than any
 box's: the reusable recipes, and the kernel and boot-volume cache shared by every
 box on the machine.
 
-**Moving the heavy data: `~/.terra/config.yaml`.** The two directories that grow
-are the boxes and the payload cache, and a laptop whose home is on a small disk
-does not want either. One optional file moves them:
-
-```yaml
-# ~/.terra/config.yaml — both keys optional, absolute or ~/…
-storage:
-  boxes: /mnt/ssd/terra/box
-  cache: /mnt/ssd/terra/cache
-```
-
-Each key names what is kept there rather than the directory's default name,
-which is the half that changes. Nothing else changes: terra creates each as `0700` wherever it now is — an
-external disk is commonly mounted world-readable, so neither leans on the
-permissions of whatever it was pointed into — and refuses to share either with a
-sandbox, exactly as it refuses `~/.terra`. Boxes that already exist stay where
-they are; move them yourself, or set the boxes up again. A file terra cannot act
-on is an error rather than a fallback to the defaults, since answering with the
-old directory would read as a machine with no boxes on it.
+The box and cache locations are fixed: boxes live under `~/.terra/box/`, and the
+shared kernel and boot-volume cache lives under `~/.terra/cache/`. Terra creates
+these directories as owner-only and has no configuration file that relocates
+them.
 
 ## The manifest: `terra.yaml`
 
@@ -250,11 +235,11 @@ defaulting to the directory's only box:
 | `terra [BOX]` | **use a box** — boot it, or join its terminal if it is already up. There is no `start` and no `attach`: which one you want is a fact about the box. A boot that runs to the end exits with the workload's own status, as `docker run` does. `-d` boots headless; the escape key (default Ctrl-\) detaches and leaves it running. A box that was never set up is offered one, on a terminal only — BOX may be a recipe path here too (`terra ./ci.yaml`), which offers to pin that file and then boots it. A box whose `on_create` bake is running holds its lock without having a session to join, so this says so and stops rather than waiting on a terminal that is not coming |
 | `terra [BOX] exec [--root] -- CMD…` | run one command in a running box, and exit with its status. Runs as the workload's user; `--root` runs it as root **without granting the workload anything** — the command comes from the host over a port nothing inside the guest can reach. A terminal is allocated exactly when this end has one, so `terra dev exec -- sh` is an interactive shell and `terra dev exec -- cat f > out` writes plain bytes with nothing to remember; `-t`/`-T` say so outright, for a script driving something that insists on a PTY or one that wants exactly the bytes a redirect would get. `--agent-timeout SECS` bounds the wait for the box's agent |
 | `terra [BOX] put SRC DST` / `terra [BOX] get SRC DST` [`--agent-timeout SECS`] | copy one file in (`put`) or out (`get`) of a running box. The verb says which side is the box's, so neither path needs a marker: the box's side is an absolute guest path, the host's is whatever your shell hands over. `get` into a directory keeps the file's own name. One file at a time — a directory is a mount's job |
-| `terra [BOX] stop` [`--wait SECS`] | orderly stop: `pre_stop`, then the VM exits; a box still up after 30 s (or the `--wait` value) has its VM killed. Stopping a stopped box succeeds — it is already what was asked for |
-| `terra [BOX] rm` [`--purge`] [`--force`] | throw the box away, keeping its recipe (`--purge` takes that too; `--force` removes a running box — it is asked to stop first, waited on for 30 s or the `--wait` value, and killed if it does not go, since what is being removed is the filesystem it is still writing to). `--wait` only means anything alongside `--force`, so it is refused on its own |
+| `terra [BOX] stop` [`--wait SECS`] | orderly stop: `pre_stop`, then the VM exits; a box still up after the 65 s default (or the `--wait` value) has its VM killed. The default allows the guest's 30 s stop grace plus VM teardown. Stopping a stopped box succeeds — it is already what was asked for |
+| `terra [BOX] rm` [`--purge`] [`--force`] [`--wait SECS`] | throw the box away, keeping its recipe (`--purge` takes that too; `--force` removes a running box — it is asked to stop first, waited on for the 65 s default or the `--wait` value, and killed if it does not go, since what is being removed is the filesystem it is still writing to). `--wait` only means anything alongside `--force`, so it is refused on its own |
 | `terra [BOX] storage <show\|export\|import\|prune>` | the box's images — its guest filesystem and volumes. `show` lists them with what each is sized to and what it actually costs on disk (they are sparse, so the two differ a lot), marking any the recipe no longer names; `export FILE` writes them all to one compressed file and `import FILE` replaces another box's images with them, so a box set up from the same recipe elsewhere gets this one's state; `prune` removes the volume images the recipe dropped, and their data with them. `export` and `import` take the box's lock, so neither runs against a live VM |
-| `terra [BOX] show` [`--with-env-values`] | the fully-resolved config a run would use: the pinned recipe once the box exists, whatever the source it was pinned from says now. A recipe named by *path* is read as a file, which is how one is reviewed before there is a box. `env:` values print as a placeholder — this output is made to be redirected or pasted into a bug report — and `--with-env-values` is how you ask for them, which is also how you read back what an `env_file:` merged in. A recipe `terra setup` would refuse still prints, with a warning: reading one is what `show` is for, and `terra <box> setup --dry-run` is what answers that question outright, for the recipe that setup would actually pin |
-| `terra ls` (`terra ps`) | created? running? — every box of the directory, with where each one's files are (details are `show`'s). `--all` lists every box on this machine instead, each with the directory it belongs to. `--tsv` prints one tab-separated line per box — state, name, directory, files — the format scripts may rely on |
+| `terra [BOX] show` [`--with-env-values`] | the fully-resolved config a run would use: the pinned recipe once the box exists; otherwise, the recipe that would be pinned. A recipe named by *path* is read as a file, which is how one is reviewed before there is a box. `env:` values print as a placeholder — this output is made to be redirected or pasted into a bug report — and `--with-env-values` is how you ask for them, which is also how you read back what an `env_file:` merged in. A recipe `terra setup` would refuse still prints, with a warning: reading one is what `show` is for, and `terra <box> setup --dry-run` is what answers that question outright, for the recipe that setup would actually pin |
+| `terra ls` (`terra ps`) | created? running? — every box of the current directory, with its state and name (details are `show`'s). `--all` lists every box on this machine instead, each with the directory it belongs to. `--tsv` prints one tab-separated line per box — state, name, directory, files — the format scripts may rely on |
 | `terra [BOX] logs` [`-f`] | the box's diagnostics — terra's, libkrun's and the gateway's. The guest's boot and hooks are not in it; `TERRA_DIAGNOSTICS=1` keeps those in diagnostics.log. The workload's terminal is not here either; that is what attaching shows (see *Logs*) |
  | `terra [BOX] sessions` [`--agent-timeout SECS`] | the clients attached to the box's terminal, one line each: the id `terra [BOX] detach` takes, and the terminal size that client reported (`-` for one that reported none). A session is a multiplexed terminal, so several terminals can sit on one box — and one that stopped reading keeps its stale size in the shared view until it is detached |
  | `terra [BOX] detach ID` / `--all` [`--agent-timeout SECS`] | drop one attached client — or every one of them. The client's connection is closed, so whatever terminal it sat on is restored; the detached client's own run ends as if its detach key had been pressed. A client that is already gone is refused rather than silently re-detached |
@@ -272,16 +257,25 @@ guest over the control connection, because the VM itself cannot carry it: the
 hypervisor exits with `0` however the guest ended. `-d` is the exception and
 says so — it exits `0` once the box is up, since the workload has not run yet.
 
-`terra ls` is the one command that is not about a directory you are standing in.
-Because every box's files are in one place, it can simply list them, each by the
-directory it belongs to:
+`terra ls` lists the boxes for the directory you are standing in. Because every
+box's files are in one place, it prints their state and name, followed by the
+state-directory path for boxes that have been created. Use `--all` to list every
+box on the machine, each by the directory it belongs to:
 
 ```
 $ terra ls
+running      dev
+  files: /home/me/.terra/box/t-x5khnk94914wawb7/dev
+setting-up   nightly
+  files: /home/me/.terra/box/t-x5khnk94914wawb7/nightly
+stopped      ci
+  files: /home/me/.terra/box/t-x5khnk94914wawb7/ci
+not-created  default
+```
+
+```sh
+$ terra ls --all
 running      /home/me/code/app (dev)
-setting-up   /home/me/code/app (nightly)
-stopped      /home/me/code/app (ci)
-not-created  /home/me/scratch/spike (default)
 gone         /home/me/code/deleted-last-week (default)
 ```
 
@@ -400,9 +394,9 @@ from the recipe alone, because a boot runs what `terra setup` pinned and someone
 approved — a flag that widened what a box may reach would route around the one
 page that question is ever put on.
 
-Man pages for every command are generated from the CLI by `make man` (or any
-`make verify`) into [`packaging/man/`](../packaging/man/) (`terra.1`, `terra-run.1`,
-…), together with the shell completions in
+Man pages for every command are generated from the CLI by `make man` into
+[`packaging/man/`](../packaging/man/) (`terra.1`, `terra-setup.1`, …), together
+with the shell completions in
 [`packaging/completions/`](../packaging/completions/).
 
 Where a `BOX` argument is accepted, a bare name is a box — a `terra.yaml`

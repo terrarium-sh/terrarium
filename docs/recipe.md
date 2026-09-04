@@ -42,9 +42,9 @@ network:
     - {name: db.local, addr: HOST_LOOPBACK}  # the machine terra runs on
     - {name: nas.local, addr: 10.0.0.5}  # …or anything the host can reach
                                          # (a record resolves; `allow:` opens)
-  ports:                   # publish a guest listener on the host loopback
-    - "8080"               # 127.0.0.1:8080 -> guest:8080
-    - "3000:80"            # 127.0.0.1:3000 -> guest:80
+  ports:                   # publish on host loopback (IPv6 is best-effort)
+    - "8080"               # 127.0.0.1:8080 (and usually [::1]:8080) -> guest:8080
+    - "3000:80"            # 127.0.0.1:3000 (and usually [::1]:3000) -> guest:80
 sudo:                  # commands terri may run as root (via doas / sudo)
   - apk
 hooks:
@@ -90,8 +90,7 @@ workload:
   its next boot. Since a box's own state lives under `~/.terra/box`, sharing
   the project directory itself is fine — nothing of the box's is in it. The
   refusal bites only for `~/.terra`; share a subdirectory (`host: ./src`) if
-  you need it anyway. A `storage.boxes` or `storage.cache` moved out of `~/.terra` by
-  `config.yaml` is refused in its own right, wherever it now is.
+  you need it anyway.
 - **volumes**: empty, fixed-size ext4 disks created on the host and mounted at
   absolute guest paths — like a tmpfs with a hard size, but on disk and
   persistent per box (survives restart; wiped by `terra rm`). Unlike `mounts`
@@ -175,8 +174,9 @@ workload:
   `allow: ["10.0.0.0/24"]`) reaches it, in either mode, on the port it names. The
   floor is there to stop a box drifting onto the network it happens to be running
   on; it has no business vetoing the recipe. Note what that means for the widest
-  spelling: `allow: ["0.0.0.0/0"]` really does hand over the LAN, the host's
-  loopback and the cloud metadata service, so write the range you mean.
+  spelling: `allow: ["0.0.0.0/0"]` hands over IPv4 LAN and floored ranges such as
+  cloud metadata, but it does not open the host itself; use `HOST_LOOPBACK` for
+  that. Add `::/0` separately for IPv6.
 
   A **DNS-learned** address is the exception: that is an upstream resolver's word
   rather than the operator's, so it stays under the floor — honouring it would
@@ -233,15 +233,16 @@ workload:
   workload on every boot; `pre_stop` runs on orderly shutdown (Ctrl-C / SIGTERM)
   before exit.
 - **daemons**: background commands that run beside the workload for the box's
-  whole life. Each entry is a shell line, run through `/bin/sh` as guest root
-  (like the hooks), starting after `on_start` and the `workdir` are ready. A
+  whole life. Each entry is a shell line, run through `/bin/sh` as the workload
+  user, or as guest root under `--root`, starting after `on_start` and the
+  `workdir` are ready. A
   line that exits 0 is done and stays done; a non-zero exit, a signal death or
   a spawn failure is logged and the line respawns after a second, forever — so
   a server that never exits 0 is the intended shape. On an orderly shutdown
   the workload is SIGTERMed first; `pre_stop` runs while the daemons are still
   up (it can drive them), and afterwards the daemons get the same stop —
-  SIGTERM, then SIGKILL once the stop grace (30s by default — the same number
-  `terra stop --wait` is built on) runs out. Their output goes to
+  SIGTERM, then SIGKILL once the guest stop grace (30s) runs out. The host
+  `terra stop` default is 65s, allowing that grace plus VM teardown. Their output goes to
   the box's console — `terra logs` for a detached box — never the session
   terminal. For per-command policies (a specific user, restart limits,
   dependencies) run a supervisor like `ascend` as the daemon instead.
@@ -250,8 +251,8 @@ workload:
   `entrypoint: /bin/sh, args: ["-c", "echo hi"]`. Defaults to an interactive
   `/bin/sh`. Runs as `terri` (uid 1000) unless `--root`. `workdir` says where
   it starts, as an absolute guest path — it need not be a mount: it is created if
-  missing and owned by the workload user. Unset, the workload starts in the home
-  of the user it runs as (`/root` under `--root`, `/home/terri` otherwise).
+  missing and owned by the workload user. Unset, the workload starts in
+  `/home/terri` in both normal and `--root` boots.
   Either way the boot fails if the directory cannot be created or entered, rather
   than starting somewhere else and resolving the workload's relative paths
   against the wrong tree.
@@ -269,7 +270,7 @@ workload:
 
 The guest root filesystem is owned by root, as a Linux root filesystem should
 be, so by default a `terri` workload cannot `apk add` or write outside
-`/work`, `/tmp` and its volumes. **Hooks run as root** — that's where one-off
+`/work`, `/tmp`, `/home/terri` and its volumes. **Hooks run as root** — that's where one-off
 package installs belong: `on_create` for expensive setup baked into the box,
 `on_start` for every boot. Use `sudo:` when the *workload itself* needs to
 elevate, and `--root` to run the whole thing as root.
@@ -279,9 +280,10 @@ the VM, so guest-root is not an escape. `sudo:` exists to keep an agent from
 casually trashing its own rootfs, not to contain a hostile one.
 
 What the guest cannot do is go around it through the agent. The agent runs as
-PID 1 and serves two vsock ports — the session (a joining `terra [BOX]`) and files
-(`terra put`/`get`) — and the guest kernel has vsock loopback, so those ports are
-dialable from inside the sandbox. They accept the **host** and nobody else: a
+PID 1 and serves one multiplexed agent vsock port for sessions, files, `exec`
+and session control. A separate control port carries the guest-to-host boot
+plan and stop signal. The guest kernel has vsock loopback, so the agent port is
+dialable from inside the sandbox, but it accepts the **host** and nobody else: a
 connection from any other CID is dropped on accept, unread. Without that check a
 workload could write any file as root, read one back, and join its own terminal
 session, which would leave `sudo:` deciding nothing.

@@ -147,7 +147,8 @@ fn fd_opens_file(fd: i32, path: &Path) -> bool {
         return false;
     };
     let want = std::fs::metadata(path).ok();
-    want.is_some_and(|want| want.dev() == opened.st_dev && want.ino() == opened.st_ino)
+    #[allow(clippy::unnecessary_cast)]
+    want.is_some_and(|want| want.dev() == opened.st_dev as u64 && want.ino() == opened.st_ino)
 }
 
 /// The signal a child was killed by, or `None` if it exited on its own.
