@@ -1,28 +1,30 @@
 # Windows support
 
-Windows is not supported by the current tree.
+We want to support Windows while keeping Terrarium lean. Terrarium is built on
+[libkrun](https://github.com/libkrun/libkrun), a strong and proven foundation
+for running microVMs, so Windows support should follow libkrun rather than
+requiring Terrarium to maintain a separate Windows VMM stack.
 
-`terra` has a Unix-only platform layer. The crate deliberately fails to
-compile on non-Unix targets, and its VM/control path uses Unix file descriptors,
-Unix sockets and signals. The vendored libkrun also lacks a Windows VMM backend
-and currently has Unix-only dependency assumptions.
+For now, Terrarium supports Linux and macOS. Windows is not supported because
+the current libkrun does not support it, and Terrarium's host platform layer uses
+Unix-only APIs.
 
-The Windows target is therefore a porting target, not a supported build:
+## WSL2
+
+Terrarium may run as a Linux program inside WSL2, not as a Windows binary. It
+needs KVM exposed to the distribution:
 
 ```sh
-cargo check -p terra --target x86_64-pc-windows-gnu
+test -r /dev/kvm && test -w /dev/kvm && echo "KVM ready"
 ```
 
-That check is expected to fail until both sides are ported. A complete port
-needs, at minimum:
+[Current WSL2 enables nested virtualization by default](https://learn.microsoft.com/en-us/windows/wsl/wsl-config),
+but the host CPU must support it. When Windows itself is a VM, the outer
+hypervisor must expose virtualization extensions too. If WSL's
+`nestedVirtualization` setting was disabled, set it to `true` in
+`%UserProfile%\.wslconfig` and run `wsl --shutdown` before starting the
+distribution again. WSL1 cannot run Terra because it has no Linux KVM device.
 
-- a `crates/terra/src/sys/windows.rs` platform implementation for sockets,
-  descriptors, ownership, stdio handover and graceful-stop signalling;
-- conditional dependency features for the Windows target;
-- a Windows-capable libkrun VMM, vsock and virtio-net implementation; and
-- Windows build and runtime tests before the target can be documented as
-  supported.
-
-Until then, use Linux for KVM and Apple Silicon macOS for the supported
-Hypervisor.framework target. See [README.dev.md](../README.dev.md) for the
-current platform matrix.
+libkrun v2 plans to support Windows later. Once that support is available, we
+will evaluate the smallest Terrarium changes needed to build and run on top of it.
+The upstream work is tracked in [libkrun issue #798](https://github.com/libkrun/libkrun/issues/798).

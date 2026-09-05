@@ -9,7 +9,7 @@ exclude = ["vendor"]
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-repository = "https://github.com/alis-is/terrarium"
+repository = "https://github.com/Berry-Studio/terrarium"
 # smolvm-network pulls in smoltcp 0.13, whose MSRV is 1.91.
 rust-version = "1.91"
 

@@ -8,7 +8,7 @@
 
 [Unit]
 Description=terra microVM sandbox (%i)
-Documentation=https://github.com/alis-is/terrarium
+Documentation=https://github.com/Berry-Studio/terrarium
 After=network-online.target
 Wants=network-online.target
 

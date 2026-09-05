@@ -1,11 +1,16 @@
 Terrarium
-Copyright 2026 Berry Studio
+Copyright 2026 Berry Studio s.r.o.
 
 This product includes software developed as part of the Terrarium project,
 licensed under the Apache License, Version 2.0 (see LICENSE).
 
-This product builds a vendored, patched copy of libkrun
-(https://github.com/containers/libkrun), Copyright the libkrun authors, also
+This product builds libkrun from the upstream project
+(https://github.com/libkrun/libkrun), Copyright the libkrun authors, licensed
+under the Apache License, Version 2.0. The vendored submodule lives under
+vendor/libkrun/.
+
+This product also includes the patched network stack from smolvm
+(https://github.com/smol-machines/smolvm), Copyright the smol-machines authors,
 licensed under the Apache License, Version 2.0. The vendored submodule lives
-under vendor/libkrun/ and terra's egress-filter changes are layered on at build
-time (see vendor/README.md).
+under vendor/smolvm/; its Terrarium-specific changes are intended to be
+upstreamed but have not yet been.

@@ -3,8 +3,12 @@
 # binary against the release's SHA256SUMS before anything is put in place.
 set -eu
 
-repo="alis-is/terrarium"
+repo="Berry-Studio/terrarium"
 version="${TERRA_VERSION:-latest}"
+case "$version" in
+  latest | v*) ;;
+  *) version="v$version" ;;
+esac
 
 os=$(uname -s)
 arch=$(uname -m)
@@ -14,9 +18,25 @@ case "$os/$arch" in
     asset=terra-x86_64-linux
     bin=/usr/local/bin
     ;;
+  Linux/aarch64 | Linux/arm64)
+    asset=terra-aarch64-linux
+    bin=/usr/local/bin
+    ;;
   Darwin/arm64)
     asset=terra-aarch64-macos
-    if [ -w /opt/homebrew/bin ]; then
+    if [ -d /opt/homebrew/bin ]; then
+      bin=/opt/homebrew/bin
+    else
+      bin=/usr/local/bin
+    fi
+    ;;
+  Darwin/x86_64)
+    if [ "$(sysctl -in sysctl.proc_translated 2>/dev/null || true)" != 1 ]; then
+      echo "terrarium: no release for Intel macOS yet" >&2
+      exit 1
+    fi
+    asset=terra-aarch64-macos
+    if [ -d /opt/homebrew/bin ]; then
       bin=/opt/homebrew/bin
     else
       bin=/usr/local/bin
@@ -66,15 +86,15 @@ if [ -e "$bin/terra" ] && ! [ -f "$bin/terra" ] && ! [ -L "$bin/terra" ]; then
   exit 1
 fi
 
-if mkdir -p "$bin" && cp -f "$tmp/terra" "$bin/terra" 2>/dev/null; then
+if install -d "$bin" 2>/dev/null && install -m 755 "$tmp/terra" "$bin/terra" 2>/dev/null; then
   :
 else
   # Escalating behind nobody's back stops here: the checksummed bytes are in
   # $tmp, but what sudo does with them deserves a yes.
-  printf 'install to %s needs root privileges - run sudo cp? [y/N] ' "$bin"
+  printf 'install to %s needs root privileges - run sudo install? [y/N] ' "$bin"
   read -r answer
   case "$answer" in
-    y | Y | yes | Yes) sudo cp -f "$tmp/terra" "$bin/terra" ;;
+    y | Y | yes | Yes) sudo install -d "$bin" && sudo install -m 755 "$tmp/terra" "$bin/terra" ;;
     *)
       echo "nothing was installed" >&2
       exit 1

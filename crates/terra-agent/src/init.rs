@@ -234,12 +234,7 @@ fn execute(
     if plan.mode == PlanMode::Create {
         return bake_if_stale(&plan.on_create).map(|()| 0);
     }
-    if !is_baked(&plan.on_create.join("\n"))? {
-        bail!(
-            "this box's on_create never finished baking - `terra setup` re-runs it \
-             (`--rebuild` for a clean slate)"
-        );
-    }
+    ensure_baked(&plan.on_create)?;
 
     for s in &plan.shares {
         mount_share(s, owner_userns)?;
@@ -315,6 +310,16 @@ fn is_baked(recipe: &str) -> Result<bool> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(e).context(format!("reading {RECIPE_STAMP_PATH}")),
     }
+}
+
+fn ensure_baked(on_create: &[String]) -> Result<()> {
+    if on_create.is_empty() || is_baked(&on_create.join("\n"))? {
+        return Ok(());
+    }
+    bail!(
+        "this box's on_create never finished baking - `terra setup` re-runs it \
+         (`--rebuild` for a clean slate)"
+    );
 }
 
 fn bake_if_stale(on_create: &[String]) -> Result<()> {
@@ -728,6 +733,11 @@ mod tests {
 
     fn create_scratch_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("terra-agent-init-{}-{name}", std::process::id()))
+    }
+
+    #[test]
+    fn an_empty_on_create_needs_no_bake_stamp() {
+        assert!(ensure_baked(&[]).is_ok());
     }
 
     /// A mount point's parents can belong to the workload from a previous boot -
