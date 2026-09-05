@@ -60,16 +60,20 @@ fn build_start_plan(bx: &BoxRef, args: &BootArgs, is_at_a_terminal: bool) -> Res
 }
 
 fn choose_boot_mode(args: &BootArgs, is_at_a_terminal: bool) -> Result<BootMode> {
-    match (args.detach, args.foreground, is_at_a_terminal) {
-        (true, _, _) => Ok(BootMode::Detached),
-        (_, true, _) => Ok(BootMode::Foreground),
-        (false, false, true) => Ok(BootMode::DetachedWithJoin),
-        (false, false, false) => anyhow::bail!(
-            "no terminal to join - say which way to run the box: `-d` boots it in \
-             the background, `--foreground` runs the VM in this process (for a \
-             service manager)"
-        ),
+    if args.detach {
+        return Ok(BootMode::Detached);
     }
+    if args.foreground {
+        return Ok(BootMode::Foreground);
+    }
+    if is_at_a_terminal {
+        return Ok(BootMode::DetachedWithJoin);
+    }
+    anyhow::bail!(
+        "no terminal to join - say which way to run the box: `-d` boots it in \
+         the background, `--foreground` runs the VM in this process (for a \
+         service manager)"
+    )
 }
 
 /// `terra [BOX]` - boot a box, or join it if it is up. A box that is not set up

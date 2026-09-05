@@ -191,7 +191,6 @@ pub(crate) fn serve_agent_port(
 
 /// Attach one `terra` client to the session and forward its framed input -
 /// keystrokes and resizes - until its connection ends.
-#[allow(unsafe_code)]
 fn serve_client(session: &Arc<Session>, conn: File, master_fd: RawFd) {
     let Ok(mut reader) = conn.try_clone() else {
         return;
@@ -213,13 +212,7 @@ fn serve_client(session: &Arc<Session>, conn: File, master_fd: RawFd) {
                     && cols > 0
                     && let Some((rows, cols)) = session.set_client_size(id, rows, cols)
                 {
-                    set_winsize(
-                        // SAFETY: `master_fd` is the live PTY master owned by the session's input
-                        // sink, which outlives this borrow.
-                        unsafe { std::os::fd::BorrowedFd::borrow_raw(master_fd) },
-                        rows,
-                        cols,
-                    );
+                    set_session_winsize(master_fd, rows, cols);
                 }
             }
             Ok(None) | Err(_) => break,
@@ -229,17 +222,10 @@ fn serve_client(session: &Arc<Session>, conn: File, master_fd: RawFd) {
         size: Some((rows, cols)),
     } = session.detach_client(id)
     {
-        set_winsize(
-            // SAFETY: `master_fd` is the live PTY master owned by the session's input sink,
-            // which outlives this borrow.
-            unsafe { std::os::fd::BorrowedFd::borrow_raw(master_fd) },
-            rows,
-            cols,
-        );
+        set_session_winsize(master_fd, rows, cols);
     }
 }
 
-#[allow(unsafe_code)]
 fn serve_session_control(session: &Arc<Session>, mut conn: File, master_fd: RawFd) {
     let send_reply = |conn: &mut File, reply: &ControlReply| {
         let bytes = encode_frame(reply)?;
@@ -258,13 +244,7 @@ fn serve_session_control(session: &Arc<Session>, mut conn: File, master_fd: RawF
         Ok(Some(ControlRequest::Detach { id })) => match session.detach_client(id) {
             DetachOutcome::Detached { size } => {
                 if let Some((rows, cols)) = size {
-                    set_winsize(
-                        // SAFETY: `master_fd` is the live PTY master owned by the session's input
-                        // sink, which outlives this borrow.
-                        unsafe { std::os::fd::BorrowedFd::borrow_raw(master_fd) },
-                        rows,
-                        cols,
-                    );
+                    set_session_winsize(master_fd, rows, cols);
                 }
                 let _ = send_reply(&mut conn, &ControlReply::Detached { id });
             }
@@ -275,13 +255,7 @@ fn serve_session_control(session: &Arc<Session>, mut conn: File, master_fd: RawF
         Ok(Some(ControlRequest::DetachAll)) => {
             let (ids, size) = session.detach_all_clients();
             if let Some((rows, cols)) = size {
-                set_winsize(
-                    // SAFETY: `master_fd` is the live PTY master owned by the session's input sink,
-                    // which outlives this borrow.
-                    unsafe { std::os::fd::BorrowedFd::borrow_raw(master_fd) },
-                    rows,
-                    cols,
-                );
+                set_session_winsize(master_fd, rows, cols);
             }
             for id in ids {
                 if send_reply(&mut conn, &ControlReply::Detached { id }).is_err() {
@@ -292,6 +266,16 @@ fn serve_session_control(session: &Arc<Session>, mut conn: File, master_fd: RawF
         }
         Ok(None) | Err(_) => {}
     }
+}
+
+#[allow(unsafe_code)]
+fn set_session_winsize(master_fd: RawFd, rows: u16, cols: u16) {
+    // SAFETY: `master_fd` is the live PTY master owned by the session input sink.
+    set_winsize(
+        unsafe { std::os::fd::BorrowedFd::borrow_raw(master_fd) },
+        rows,
+        cols,
+    );
 }
 
 #[cfg(test)]

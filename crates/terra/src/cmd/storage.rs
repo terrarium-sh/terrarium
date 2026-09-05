@@ -181,17 +181,14 @@ fn write_entry_header(out: &mut impl Write, name: &str, len: u64) -> Result<()> 
 
 /// The next entry's name and length, or `None` at the end of the artifact.
 fn read_entry_header(src: &mut impl Read) -> Result<Option<(String, u64)>> {
-    let mut first = [0u8; 1];
-    match src.read_exact(&mut first) {
+    let mut head = [0u8; 10];
+    match src.read_exact(&mut head[..1]) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e).context("reading the artifact"),
     }
-    let mut rest = [0u8; 9];
-    src.read_exact(&mut rest).context("reading the artifact")?;
-    let mut head = [0u8; 10];
-    head[..1].copy_from_slice(&first);
-    head[1..].copy_from_slice(&rest);
+    src.read_exact(&mut head[1..])
+        .context("reading the artifact")?;
     // Bounded by its own type: at most 64 KiB of name is allocated for it.
     let name_len = usize::from(u16::from_le_bytes([head[0], head[1]]));
     let len = u64::from_le_bytes([

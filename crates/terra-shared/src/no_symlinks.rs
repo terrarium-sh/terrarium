@@ -77,10 +77,16 @@ fn open_unix(path: &Path, mode: OpenMode) -> Result<File> {
         ),
     };
     let directory_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    let (anchor, intermediates, final_name) = split_path(path);
+    let mut components = path_components(path);
+    let final_name = components.next_back().unwrap_or(path.as_os_str());
+    let anchor = if path.is_absolute() {
+        Path::new("/")
+    } else {
+        Path::new(".")
+    };
     let mut directory = openat(CWD, anchor, directory_flags, FileMode::empty())
         .map_err(|error| make_unix_open_error(path, error))?;
-    for component in intermediates {
+    for component in components {
         directory = openat(&directory, component, directory_flags, FileMode::empty())
             .map_err(|error| make_unix_open_error(path, error))?;
     }
@@ -95,9 +101,8 @@ fn open_unix(path: &Path, mode: OpenMode) -> Result<File> {
 }
 
 #[cfg(all(unix, any(test, not(target_os = "linux"))))]
-fn split_path(path: &Path) -> (&'static Path, Vec<&OsStr>, &OsStr) {
-    let mut names = path
-        .components()
+fn path_components(path: &Path) -> impl DoubleEndedIterator<Item = &OsStr> {
+    path.components()
         .filter(|component| {
             !matches!(
                 component,
@@ -105,17 +110,6 @@ fn split_path(path: &Path) -> (&'static Path, Vec<&OsStr>, &OsStr) {
             )
         })
         .map(std::path::Component::as_os_str)
-        .collect::<Vec<_>>();
-    let final_name = names.pop().unwrap_or(path.as_os_str());
-    (
-        if path.is_absolute() {
-            Path::new("/")
-        } else {
-            Path::new(".")
-        },
-        names,
-        final_name,
-    )
 }
 
 #[cfg(unix)]
@@ -141,15 +135,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn splitting_paths_keeps_the_anchor_and_final_name_separate() {
-        let (anchor, intermediates, final_name) = split_path(Path::new("/a/b/c"));
-        assert_eq!(anchor, Path::new("/"));
-        assert_eq!(intermediates, [OsStr::new("a"), OsStr::new("b")]);
-        assert_eq!(final_name, OsStr::new("c"));
+    fn path_components_omit_the_anchor_and_leaf() {
+        let mut absolute = path_components(Path::new("/a/b/c"));
+        assert_eq!(absolute.next_back(), Some(OsStr::new("c")));
+        assert_eq!(
+            absolute.collect::<Vec<_>>(),
+            [OsStr::new("a"), OsStr::new("b")]
+        );
 
-        let (anchor, intermediates, final_name) = split_path(Path::new("./a/b"));
-        assert_eq!(anchor, Path::new("."));
-        assert_eq!(intermediates, [OsStr::new("a")]);
-        assert_eq!(final_name, OsStr::new("b"));
+        let mut relative = path_components(Path::new("./a/b"));
+        assert_eq!(relative.next_back(), Some(OsStr::new("b")));
+        assert_eq!(relative.collect::<Vec<_>>(), [OsStr::new("a")]);
     }
 }

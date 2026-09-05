@@ -712,14 +712,10 @@ fn run_hook(sh_cmd_line: &str, timeout: Option<Duration>) -> Result<()> {
     let (mut child, child_pidfd) =
         crate::reap::spawn_owned(|| Command::new("sh").arg("-c").arg(sh_cmd_line).spawn())
             .with_context(|| format!("spawning hook `{sh_cmd_line}`"))?;
-    let Some(timeout) = timeout else {
-        let status = crate::reap::wait_owned(&mut child)?;
-        if !status.success() {
-            bail!("hook `{sh_cmd_line}` failed ({status})");
-        }
-        return Ok(());
+    let status = match timeout {
+        Some(timeout) => wait_with_timeout(&mut child, &child_pidfd, timeout)?,
+        None => crate::reap::wait_owned(&mut child)?,
     };
-    let status = wait_with_timeout(&mut child, &child_pidfd, timeout)?;
     if !status.success() {
         bail!("hook `{sh_cmd_line}` failed ({status})");
     }

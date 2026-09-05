@@ -211,10 +211,9 @@ fn resolve_inner(
         });
     }
 
-    let reference = manifest_reference.map_or(bx.get_name(), String::as_str);
     Err(build_missing_recipe_error(
         bx.get_name(),
-        reference,
+        bx.get_name(),
         bx.get_project_dir(),
     ))
 }
