@@ -135,6 +135,11 @@ jobs:
           path: build
       - name: Build
         run: cargo build --release -p terra --target aarch64-apple-darwin
+      - name: Sign for Hypervisor.framework
+        run: >-
+          codesign --force --sign -
+          --entitlements vendor/libkrun/hvf-entitlements.plist
+          target/aarch64-apple-darwin/release/terra
       - name: Check it runs
         run: |
           ./target/aarch64-apple-darwin/release/terra --version

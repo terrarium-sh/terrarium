@@ -81,24 +81,10 @@ The example opts in to public egress for package managers and agents. Remove
 the `network:` block for no network, or use `mode: allowlist` with explicit
 rules for a narrower policy.
 
-```console
-$ terra ls
-not-created  dev
-$ terra dev setup
-terra: creating dev (...) (512 MiB)
-terra: dev (...) is ready - `terra dev` boots it
-$ terra ls
-stopped      dev
-$ terra dev
-terrarium:/work$ pwd; id -un
-/work
-terri
-```
+![Terminal demo: create a box from dev.yaml, then enter it.](docs/demo.gif)
 
-![Terminal demo: list a manifest's boxes, set up dev, then enter it.](docs/demo.gif)
-
-`terra dev` boots the box, or joins its terminal if it is already up. Detach
-with `Ctrl-\`, stop with `terra dev stop`, delete with `terra dev rm`.
+`terra` boots the default box, or joins its terminal if it is already up. Detach with
+`Ctrl-\`, stop with `terra stop`, delete with `terra rm`.
 
 Want the included recipe instead?
 `cp pi-dev.yaml ~/.terra/ && terra ~/.terra/pi-dev.yaml setup && terra pi-dev`.
