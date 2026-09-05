@@ -29,29 +29,10 @@ sh install.sh
 terra --version
 ```
 
-The script checks the downloaded binary against the release's published
-checksum before it puts anything in place, and installs the latest release:
-`/usr/local/bin/terra` on Linux,
-`/opt/homebrew/bin` (or `/usr/local/bin`) on macOS. Pin one with
-`TERRA_VERSION=x.y.z sh install.sh`; re-run `sh install.sh` to upgrade. To pin
-both the installer and binary,
-download `install.sh` from that release tag instead of `main`:
-
-```sh
-version=vX.Y.Z
-curl -fsSLO "https://raw.githubusercontent.com/Berry-Studio/terrarium/$version/install.sh"
-TERRA_VERSION="$version" sh install.sh
-```
-
-Prefer building from source?
-[README.dev.md](README.dev.md).
-
-New release binaries carry a signed build-provenance attestation. With the
-GitHub CLI, verify the installed binary with:
-
-```sh
-gh attestation verify "$(command -v terra)" --repo Berry-Studio/terrarium
-```
+The installer checks the release checksum before installing. Pin a release with
+`TERRA_VERSION=x.y.z sh install.sh`; re-run it to upgrade. Build from source:
+[README.dev.md](README.dev.md). Verify a release binary with
+`gh attestation verify "$(command -v terra)" --repo Berry-Studio/terrarium`.
 
 Then sandbox a project:
 
@@ -67,70 +48,28 @@ workload:
   entrypoint: /bin/sh                    # a shell instead of your app's cmd
   workdir: /work                         # so the shell starts at your project
 EOF
-cat > terra.yaml <<'EOF'
-boxes:
-  dev: ./dev.yaml
-EOF
-terra ls                    # the manifest declares dev, initially not-created
-terra dev setup             # pin dev's recipe, build the box (runs on_create)
-terra ls                    # dev is stopped and ready to boot
-terra dev                   # boot dev — a shell, cwd at /work
+terra ./dev.yaml setup      # pin the recipe, build the box
+terra                       # boot it — a shell, cwd at /work
 ```
 
 The example opts in to public egress for package managers and agents. Remove
-the `network:` block for no network, or use `mode: allowlist` with explicit
-rules for a narrower policy.
+`network:` for no network, or use `mode: allowlist` for a narrower policy.
 
 ![Terminal demo: create a box from dev.yaml, then enter it.](docs/demo.gif)
 
-`terra` boots the default box, or joins its terminal if it is already up. Detach with
-`Ctrl-\`, stop with `terra stop`, delete with `terra rm`.
-
-Want the included recipe instead?
-`cp pi-dev.yaml ~/.terra/ && terra ~/.terra/pi-dev.yaml setup && terra pi-dev`.
-
-## A recipe is a policy
-
-Every key is optional. An empty recipe boots a shell with no host filesystem
-and no network at all — nothing is shared or reachable unless it is written
-down:
-
-```yaml
-hw: { cpus: 2, mem_mib: 1024, rootfs_mib: 4096 }
-mounts:                       # host dirs the guest can see — none by default
-  - { host: ".", guest: /work }
-volumes:                      # bounded, persistent scratch disks
-  - { name: data, guest: /data, size_mib: 1024 }
-network:
-  mode: allowlist             # the default: nothing is reachable…
-  allow:                      # …unless a rule names it
-    - api.openai.com:443
-hooks:
-  on_create:                  # once, baked into the box's rootfs
-    - apk add --no-cache git
-workload:
-  entrypoint: /bin/sh
-```
-
-`terra setup` is the only command that pins a recipe — every boot runs the copy
-pinned inside the box, so editing a recipe changes nothing until you re-run it.
-Every key: [docs/recipe.md](docs/recipe.md).
+`terra` boots the only box in the directory, or joins it if already up. Detach
+with `Ctrl-\`, stop with `terra stop`, delete with `terra rm`.
 
 ## What you get
 
 - **Real isolation.** Each box is a microVM, not a container.
-- **Deny-by-default network.** An egress allowlist (default) or public-only
-  egress; the host, its LAN and every private range are always blocked unless a
-  rule names them.
+- **Explicit access.** No host files or network by default; the host, LAN, and
+  private ranges stay blocked unless a recipe names them.
 - **One binary.** No daemon, images to pull, or runtime downloads.
-- **Hooks.** `on_create` (once), `on_start` (every boot), `pre_stop` (on
-  orderly shutdown) — all run as guest root.
-- **Detach and rejoin.** `Ctrl-\` hands the terminal back and the box keeps
-  running; `terra` re-attaches, and several watchers share one session.
-- **Files in and out.** `terra put` / `terra get` copy files across the
-  boundary; `terra exec --root -- CMD` runs one command inside a live box.
-- **Bounded state.** Volumes and rootfs are fixed-size, capped images; `terra
-  rm` removes them but retains the pinned recipe unless given `--purge`.
+- **Lifecycle hooks.** `on_create`, `on_start`, and `pre_stop` run as guest
+  root.
+- **Work without rebuilding.** Detach, rejoin, copy files, or run `terra exec`
+  in a live box.
 
 ## Commands
 
@@ -139,50 +78,35 @@ Every key: [docs/recipe.md](docs/recipe.md).
 | `terra [BOX] setup` | pin the recipe, build the box |
 | `terra [BOX]` | boot it — or join it if it's up (`-d`: headless) |
 | `terra [BOX] -- CMD…` | run CMD instead of the recipe's workload, for one boot |
-| `terra [BOX] exec [--root] -- CMD…` | one command inside a running box |
-| `terra [BOX] put/get SRC DST` | copy one file in / out |
-| `terra [BOX] logs [-f]` | the box's diagnostics |
-| `terra [BOX] sessions` | the clients attached to the box's terminal |
-| `terra [BOX] detach ID` / `--all` | drop one attached client — or every one |
-| `terra [BOX] stop` / `rm` | graceful stop (runs `pre_stop`) / delete |
-| `terra ls` | every box: created? running? where? |
+| `terra [BOX] exec/put/get` | run a command or copy one file |
+| `terra [BOX] logs/sessions/detach` | inspect or manage a live box |
+| `terra [BOX] stop/rm` | stop it gracefully / delete it |
+| `terra ls` | list boxes in this directory (`--all`: every project) |
 
-`[BOX]` defaults to the directory's only box. Full command reference:
+`[BOX]` defaults to the directory's only box. Full reference:
 [docs/usage.md](docs/usage.md).
 
 ## Storage
 
-Boxes live outside the project at `~/.terra/box/<project>/<box>/`; each holds
-its pinned recipe, root filesystem, volumes, and logs. `~/.terra/cache/` holds
-the shared guest kernel and boot image.
-
-Use `terra ls --all` to find boxes across projects, then
-`terra <box> rm --purge --project <project-dir>` to remove a box and all of its
-state. The locations are fixed. To put Terra's state on another disk, stop all
-boxes, move `~/.terra`, and make `~/.terra` a symlink to the new location. The
-target must honour owner-only permissions; it is security-sensitive state.
-Details: [docs/usage.md](docs/usage.md#where-a-box-lives).
+Boxes live at `~/.terra/box/<project>/<box>/`; shared boot files live in
+`~/.terra/cache/`. `terra ls --all` finds them, and
+`terra <box> rm --purge --project <project-dir>` removes one completely. To use
+another disk, stop boxes, move `~/.terra`, then symlink it back; the target must
+honour owner-only permissions.
 
 ## Security
 
-The boundary is the VM. A box has the host filesystem its recipe lists and the
-network its recipe allows — nothing else. Box state lives outside your project
-in `~/.terra/box/`, so sharing `host: .` never hands the guest the rules of its
-own next boot. What crosses the boundary, what cannot, and what is deliberately
-not a boundary: [docs/security.md](docs/security.md).
-
-To report a vulnerability privately,
-[open a GitHub security advisory](https://github.com/Berry-Studio/terrarium/security/advisories/new).
+The VM is the boundary: a box gets only the mounts and egress its recipe grants.
+Read the [security model](docs/security.md), or
+[report a vulnerability privately](https://github.com/Berry-Studio/terrarium/security/advisories/new).
 
 ## Documentation
 
-- [docs/usage.md](docs/usage.md) — how a box works: the CLI, `terra.yaml`, logs
-- [docs/recipe.md](docs/recipe.md) — every recipe key, in detail
-- [docs/security.md](docs/security.md) — the security model and its limits
-- [README.dev.md](README.dev.md) — building from source, how it works,
-  porting, releasing
-- [packaging/README.md](packaging/README.md) — systemd units, man pages
-- [SECURITY.md](SECURITY.md) — reporting security vulnerabilities
+- [Recipe reference](docs/recipe.md)
+- [Usage and storage](docs/usage.md)
+- [Development and release](README.dev.md)
+- [Systemd and man pages](packaging/README.md)
+- [Security policy](SECURITY.md)
 
 ## License
 
