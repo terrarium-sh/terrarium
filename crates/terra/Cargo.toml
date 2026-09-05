@@ -29,7 +29,7 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 libkrun = { path = "../../vendor/libkrun/src/libkrun", features = ["net", "blk"] }
 smolvm-network = { path = "../../vendor/smolvm/crates/smolvm-network" }
 libc.workspace = true
-lru = "0.12"
+lru = "0.18"
 rustix.workspace = true
 sha2 = { version = "0.11", default-features = false }
 tracing-appender = "0.2"
