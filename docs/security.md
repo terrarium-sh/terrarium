@@ -1,160 +1,95 @@
 # Security model
 
-**The boundary is the VM.** A hostile workload is contained by libkrun/KVM and
-nothing else in this design is asked to hold it. Everything below is either a
-deliberate hole through that boundary, or ergonomics inside it.
+Without host mounts, the VM is the boundary. A hostile workload is contained
+by libkrun's hardware-virtualized microVM; the recipe is how you deliberately
+open narrow paths back to the host.
 
-What crosses the boundary, because you asked it to:
+## What a recipe can grant
 
-- **`mounts`** — the listed host directories, read-write unless `readonly`.
-  Writes land as *your* host user (the guest's uid 1000 is mapped to it), so a
-  guest can do anything to those paths that you could — including creating real
-  host symlinks in them. There is no host filesystem in a sandbox with no
-  `mounts`. A mount that would contain `~/.terra` (this box's state or
-  another's, and the kernel and agent every box boots) is refused when the
-  recipe is read. A writable mount that would contain **the terra binary
-  itself** is also refused: those decide what the sandbox may
-  mount and reach, what kernel it boots, and — for the binary, which an
-  interactive or detached run re-executes to boot the VM — what the next run does
-  at all, before there is a sandbox. They are not the sandbox's to write. A recipe
-  *source* inside a share is allowed, because only `terra setup` reads one —
-  and it asks first, showing what the recipe would grant, refusing outright where
-  there is no terminal to ask on (`--trust-recipe` is the scripted yes). It asks
-  about the first setup of a *new* box name too, since a box that does not exist
-  yet has no recipe of its own to judge an edit against and `terra.yaml` lets a
-  guest name one: the sibling box that granted the share is what answers.
-- **`network.ports`** — a guest listener published on the host loopback
-  (`127.0.0.1`, with a best-effort `::1` listener).
-- **`allow: ["HOST_LOOPBACK[:PORT]"]`** — the only thing that reaches the
-  machine terra is running on, together with a name a `hosts:` record resolves
-  there. The host is not in the address namespace at all: no CIDR reaches it,
-  `0.0.0.0/0` included, and neither does a mode's default reach.
-- **`terra exec`** — one command in a running box, over a socket only the host
-  can reach. It runs as whoever the workload runs
-  as; `--root` runs it as root. That grants the *host* nothing new — the file
-  service already writes any guest path as init, so a copy over a root-owned
-  binary was always a way in — and it deliberately grants the *workload*
-  nothing: a `sudo:` entry hands uid 1000 a standing escalation it can use
-  whenever it likes, while an exec cannot be reached from inside the guest at
-  all. Use `--root` for the things root is actually needed for (`apk add`,
-  reading a root-owned log, `strace`) instead of widening `sudo:` for them.
-- **`terra put` / `terra get`** — one file in or out, acting as guest root, over a socket only
-  the host can reach. A file copied *out* keeps its permission bits so a script
-  stays executable, minus setuid/setgid/sticky and group/world write: the guest
-  chooses that file's contents, so it does not also get to leave a setuid binary
-  — or one any other account can rewrite — owned by whoever ran the copy.
-  Neither end follows a symlink at *any* component of the host path — the file
-  itself or a directory above it — so a link the guest planted in a share fails
-  with `ELOOP` instead of redirecting the copy into your `~/.ssh`. That is
-  `openat2`'s `RESOLVE_NO_SYMLINKS`, which refuses the resolution in the kernel
-  rather than checking a component and then opening it; `env_file:` is read the
-  same way, for the same reason. (`O_NOFOLLOW` alone is not this: it covers the
-  last component only, and the last component is not the shape of the attack.
-  On non-Linux Unix, terra checks each path component with the platform's
-  no-follow open; Windows is currently unsupported. A copy out is capped at 2 GiB
-  however long the guest says its file
-  is, and both directions time out rather than waiting forever on a guest that
-  has stopped answering.
-- **`env:` values** — they travel in the boot plan over vsock and land in the
-  workload's environment. They are never written to a file on either side, and
-  the guest's own `/terra/README.md` names the variables without their values.
+| feature | what crosses the boundary |
+|---|---|
+| `mounts` | Host directories presented through libkrun virtiofs. A writable mount gives the guest your own access to that directory; `readonly: true` lets it inspect without changing files. It does not confine the VMM to that directory. |
+| `network.ports` | A guest listener published on host loopback only. |
+| `allow: ["HOST_LOOPBACK:PORT"]`, or an allowed `hosts:` name resolving there | A connection to the computer running terra. This is the only way to reach the host itself. |
+| `terra exec` | One host-initiated command in a running box. `--root` makes that command guest root; it does not grant the workload root. |
+| `terra put` / `get` | One host-initiated file transfer. |
+| `env:` and `env_file:` | Values supplied to guest processes. `env:` values are part of the pinned recipe; `env_file:` values are merged into the in-memory boot plan and never written to guest disk by Terra. |
 
-What does not cross it, in any configuration:
+No `mounts` means Terra exposes no host filesystem through guest devices.
 
-- **The host's own network, unless the recipe names it.** The egress floor is
-  pinned to strict, so loopback, the host's LAN, every private range, link-local
-  (cloud metadata) and the gateway's CGNAT range are unreachable by default —
-  under `mode: unrestricted-public` too, and regardless of a learned DNS answer
-  pointing there. That mode lifts the allow-list, not the floor, which is what
-  its name says: *public* egress. An `allow` entry covering an address is the
-  one thing that crosses it, because that is an operator writing it down.
-  Note what an allow rule does and does not bind: addresses and ports, and the
-  names learned from answers the gateway has seen — not what flows inside. A
-  workload with one allowed endpoint can resolve whatever it likes through that
-  endpoint (DNS-over-HTTPS or DNS-over-TLS to it is indistinguishable from any
-  other HTTPS traffic), so an allowlisted public API effectively opens name
-  resolution past the gateway too. Treat every allowed endpoint as fully
-  trusted, and keep the list to what the workload actually needs.
-- **The agent's vsock port.** The one port every session, `terra put`/`get` and
-  `terra exec` connection arrives on is dialable from inside the guest (the
-  kernel has vsock loopback), and its services act with init's privileges — so
-  it accepts the host's CID and drops every other peer unread, and the agent
-  claims it before any other guest code runs. The exec service matters most: a
-  workload that owned the port could not gain privilege (it would be answering,
-  not calling), but it could lie convincingly about what a `terra exec` found —
-  in the one situation exec exists for, looking into a box you have stopped
-  trusting.
-- **The boot plan.** The host stops listening on the control port the moment the
-  agent has dialled it, so nothing in the guest can ask for a second copy.
+## Mounts require host confinement
 
-What is **not** a boundary, and should not be relied on as one:
+libkrun virtiofs does not confine a guest to the configured directory. A guest
+can potentially access other host filesystems or directories that the VMM can
+access. Treat a mount as granting the guest the VMM's host filesystem access,
+not as a narrow filesystem boundary. See libkrun's
+[security model](https://github.com/containers/libkrun#security-model).
 
-- **Guest root.** `sudo:`, the `terri` user and the root-owned rootfs keep an
-  agent from casually trashing its own box. They do not contain a hostile one —
-  see the `sudo:` discussion in [recipe.md](recipe.md). The guest kernel is
-  hardened against the workload-to-root hop (`kernel/terrarium-hardening.config`),
-  but *hardened* is the right word and boundary is not: unprivileged user
-  namespaces are available inside the box, because rootless `podman` is that
-  mechanism rather than a consumer of it, so the distance from the workload user
-  to guest root is a kernel bug. That is a deliberate trade, and it costs
-  nothing the VM was not already covering.
-- **Hooks.** `on_create`, `on_start` and `pre_stop` run as guest root, by design.
-- **Running terra as host root.** Refused by default when any mount is writable.
-  Root gets no idmap — real ids pass through virtiofs — so it acts as *real*
-  root and the guest picks the owner, mode and setuid bit of everything it
-  writes to a share — the sandbox inside out. Run terra as an unprivileged user in the
-  `kvm` group (see [packaging/README.md](../packaging/README.md)), mark those
-  mounts `readonly: true`, or set `TERRA_ALLOW_ROOT=1` if you genuinely mean it.
-- **The recipe itself.** A recipe can mount any host path read-write and run any
-  command in the hooks, so it is trusted input: read one before `terra setup`
-  the way you would read a shell script before running it. This matters most for
-  the obvious case — sandboxing a repository that ships its own recipe.
-- **Your terminal.** A sandbox's output reaches it byte for byte, escape
-  sequences and all — that is what makes a TUI inside the box work, and it is
-  what joining a session is for. A workload can therefore drive
-  whatever its reader's terminal emulator implements: OSC 52 clipboard writes,
-  title set-and-report, hyperlinks. This is the same deal `ssh`, `docker attach`
-  and `kubectl logs` offer, and the answer is the same one — a terminal that
-  does not enable those sequences — but it is a surface the VM boundary does not
-  cover, so it is named here rather than left implied.
+Terra does not currently confine its VMM. If a workload needs mounts, run
+terra inside a host sandbox that exposes only the shares and VM runtime files:
+on Linux, use a mount namespace; on macOS, use an equivalent system sandbox.
+Running terra as a dedicated unprivileged user is weaker but useful
+confinement: the guest can still reach every file that user can reach, so that
+account must have access only to the shares and VM runtime files. Otherwise,
+do not use `mounts`.
 
-On the host side, a box's own directory is `0700` and everything terra creates in
-it is owner-only. The agent socket is bound by libkrun rather than terra, under a
-process umask libkrun clears for its own reasons partway through a boot — so the
-`0700` directory is what keeps another account off it, and its services act as
-guest root, so that mode is not a detail. That also makes it a load-bearing
-dependency: this libkrun speaks vsock over a unix socket in that directory, and
-the filesystem is what authenticates its clients. Upstream libkrun's default is
-vhost-vsock, which has no socket file and would leave every local account able
-to dial the guest's root-capable exec service — protocol-level authentication
-(per boot, plan-delivered token) is a prerequisite before that pin moves. The log carries terra's own
-diagnostics; the guest's console reaches the disk only under
-`TERRA_DIAGNOSTICS=1`, in its own owner-only file; the rootfs image carries
-everything the guest ever wrote.
+Terra's mount checks reduce accidental authority, but are not confinement. It
+refuses a mount that resolves to `~/.terra`, or a writable mount that resolves
+to the terra binary: those files define later boxes and boots, so a guest must
+never be able to rewrite them. libkrun opens a share by path after this check,
+so do not mount a path whose parent another process, including another running
+box, can replace.
 
-`~/.terra` is `0700` on the same terms — and so are the box and cache
-directories, each in its own right. They live at `~/.terra/box` and
-`~/.terra/cache`; terra has no configuration file that relocates them.
-Checked on every run rather than only when terra creates
-them: a directory left open by an older version, or by a looser umask, is
-tightened, and terra refuses to run if it cannot be. That is not
-housekeeping — the reusable recipes live there, and a recipe is the policy for
-what a box mounts and what it may reach, next to the cache holding the guest
-kernel and the PID-1 agent every box on the machine boots. Another account able
-to write there picks all of it.
+A recipe source inside a directory a currently pinned box shares read-write is
+treated as possibly guest-authored: `terra setup` shows what it grants and asks
+before pinning it. In scripts, `--trust-recipe` is that explicit approval.
+Terra does not retain former shares, so treat files that were once shared
+read-write as untrusted too.
 
-What actually enforces the isolation is three dependencies, so it is worth being
-explicit about how they are pinned: all three are git submodules pinned by commit
-— libkrun (`vendor/libkrun`, an unpatched mirror of upstream), libkrunfw
-(`vendor/libkrunfw`, pristine) and the egress gateway
-([`smolvm-network`](https://github.com/cryi/smolvm), `vendor/smolvm`). The
-gateway is vendored rather than pinned by Cargo revision because it is the code
-that decides what a sandbox may reach: that belongs in the same review as the
-policy that configures it, not behind a version bump — that review is what found
-the two hard-floor gaps fixed upstream in `d2573ac`, which this pin includes. All
-three checkouts are unmodified; see [`vendor/README.md`](../vendor/README.md),
-which also states the upstreaming policy: a fork is a waiting room, every change
-a submodule carries must land upstream before the pin next moves, and the goal
-for all three is pristine-upstream tracking. The build inputs that are downloaded
-rather than pinned by commit — Alpine's minirootfs, e2fsprogs, doas — are all
-verified against a SHA-256 in the Makefile.
+Host paths used by `put`, `get`, and `env_file` are opened without following
+symlinks. A guest cannot turn a shared-directory symlink into access somewhere
+else on the host.
+
+## Network
+
+The network policy filters egress. In both modes, the host, LAN, private ranges,
+link-local addresses, and cloud metadata remain blocked unless an `allow` rule
+explicitly permits them. `unrestricted-public` opens public internet access;
+`allowlist` opens only listed destinations.
+
+An allowed service is trusted: encrypted traffic to it can carry any protocol,
+including DNS-over-HTTPS. Keep `allow` rules as narrow as the workload permits.
+See the [recipe reference](recipe.md) for DNS and rule syntax.
+
+## What is not a boundary
+
+- **Guest root, `sudo:`, and hooks.** These protect the box's own filesystem,
+  not the host. Hooks deliberately run as guest root.
+- **The recipe.** It can mount host paths and run root hooks. Review it like a
+  shell script before setup, especially when it comes from a repository.
+- **A configured mount.** libkrun does not make it a host filesystem boundary.
+  Contain the VMM outside Terra or run without mounts.
+- **Your terminal.** Attached workload output is intentionally raw so TUIs work.
+  A hostile workload can emit terminal escape sequences; use a terminal policy
+  that disables features you do not trust.
+- **Running terra as host root.** Writable mounts then give the guest real root
+  ownership on the host. On Linux, run as an unprivileged user in the `kvm`
+  group; otherwise use read-only mounts, or set `TERRA_ALLOW_ROOT=1` only when
+  you mean it.
+
+## Host state and services
+
+Box state, the shared cache, logs, and guest images live under `~/.terra`.
+Terra keeps those directories owner-only and refuses to run if it cannot. The
+host-facing guest-agent services for sessions, files, and `exec` accept only
+the host's vsock peer. The control listener accepts the guest agent once, then
+stops listening; that connection remains open for the orderly-stop signal.
+
+Terra pins libkrun, libkrunfw, and the egress gateway as submodules.
+Downloaded build inputs are checksum-verified. See
+[vendor/README.md](../vendor/README.md) for the dependency policy.
+
+## Report a vulnerability
+
+Please follow the [security policy](../SECURITY.md) or
+[report privately on GitHub](https://github.com/Berry-Studio/terrarium/security/advisories/new).

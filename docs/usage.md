@@ -75,7 +75,9 @@ current process and sends workload output to that process's console.
 
 Terra keeps box state outside the project at
 `~/.terra/box/<project>/<box>/`; shared boot files live in `~/.terra/cache/`.
-Your project remains ordinary host files, so mounting `host: .` is safe.
+Your project remains ordinary host files. A mount of `host: .` gives the guest
+host filesystem access through the VMM and is safe only when that VMM is
+separately host-confined; see the [security model](security.md).
 
 ```sh
 terra ls --all

@@ -30,7 +30,9 @@ The manifest lives in the project root, which a box may mount and write. It is
 therefore deliberately a map of references rather than policy in place. A
 manifest edit can repoint a box name, but `setup` shows the recipe and asks for
 approval before it pins a guest-writable source. References into `~/.terra` are
-also safe: terra refuses any mount that could contain that state.
+also protected from ordinary mount configuration: terra refuses any mount that
+could contain that state. This is not VMM confinement; see the
+[security model](security.md) before enabling mounts.
 
 A bare `terra <box>` never silently pins a new recipe. On a terminal it shows
 what the recipe grants and asks before setup; without one it tells the caller to

@@ -18,6 +18,7 @@ hw:
   rootfs_mib: 4096        # bounded, private writable root filesystem; can grow, not shrink
 
 # Host directories visible inside the guest. Omit for no host filesystem access.
+# libkrun does not confine a mount to this directory; see security.md.
 mounts:
   - host: .               # relative paths resolve from the project directory
     guest: /work          # absolute path in the guest

@@ -99,7 +99,9 @@ honour owner-only permissions.
 
 ## Security
 
-The VM is the boundary: a box gets only the mounts and egress its recipe grants.
+Without mounts, the VM is the boundary. Mounts use libkrun virtiofs, which does
+not confine the VMM to the listed directories; use them only when the VMM is
+separately host-confined. See the [security model](docs/security.md).
 Read the [security model](docs/security.md), or
 [report a vulnerability privately](https://github.com/Berry-Studio/terrarium/security/advisories/new).
 
