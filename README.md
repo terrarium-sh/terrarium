@@ -1,5 +1,7 @@
 # 🪴 Terrarium
 
+> A safe home where your agent can thrive.
+
 Run coding agents and development tools in a hardware-virtualized microVM with
 only the host files and network access you grant it.
 
