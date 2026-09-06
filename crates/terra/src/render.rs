@@ -100,14 +100,8 @@ pub fn format_mount_lines(cfg: &config::Config) -> Vec<String> {
 #[must_use]
 pub fn render_policy_summary(cfg: &config::Config) -> String {
     use std::fmt::Write as _;
-    // Exhaustive destructures: a new recipe field fails to compile here until
-    // someone decides whether the approving person should see it. The `_`
-    // fields were decided against, each for a reason: `hw` and `volumes` size
-    // the box without reaching anything of the user's, `workload` is printed
-    // below, and `env` names would be the only line that grows with a recipe
-    // rather than with what it grants - and its values never reach this page.
     let config::Config {
-        hw: _,
+        hw,
         mounts,
         volumes: _,
         network,
@@ -131,6 +125,11 @@ pub fn render_policy_summary(cfg: &config::Config) -> String {
     } = hooks;
 
     let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "  hardware: {} vCPU, {} MiB RAM, {} MiB rootfs",
+        hw.cpus, hw.mem_mib, hw.rootfs_mib
+    );
     let _ = writeln!(out, "  egress:   {}", runtime::describe(network));
     for rule in allow {
         let _ = writeln!(out, "  allow:    {}", escape_printable(rule));
@@ -391,6 +390,23 @@ mod tests {
         for rule in ["HOST_LOOPBACK:22", "10.0.0.0/8"] {
             assert!(summary.contains(rule), "{rule} is not in:\n{summary}");
         }
+    }
+
+    #[test]
+    fn the_approval_summary_lists_hardware_requirements() {
+        let cfg = config::Config {
+            hw: config::Hw {
+                cpus: 4,
+                mem_mib: 4096,
+                rootfs_mib: 2048,
+            },
+            ..yaml_serde::from_str("{}").unwrap()
+        };
+        let summary = render_policy_summary(&cfg);
+        assert!(
+            summary.contains("hardware: 4 vCPU, 4096 MiB RAM, 2048 MiB rootfs"),
+            "{summary}"
+        );
     }
 
     /// Every "look here" line terra prints is a command meant to be pasted, so

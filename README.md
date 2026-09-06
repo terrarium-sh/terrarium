@@ -1,4 +1,4 @@
-# Terrarium
+# 🪴 Terrarium
 
 Run coding agents and development tools in a hardware-virtualized microVM with
 only the host files and network access you grant it.
@@ -58,7 +58,8 @@ The example opts in to public egress for package managers and agents. Remove
 ![Terminal demo: create a box from dev.yaml, then enter it.](docs/demo.gif)
 
 `terra` boots the only box in the directory, or joins it if already up. Detach
-with `Ctrl-\`, stop with `terra stop`, delete with `terra rm`.
+with `Ctrl-\`, rejoin with `terra`, stop with `terra stop`, delete with `terra rm`.
+Detailed instructions: [docs/usage.md](docs/usage.md).
 
 ## What you get
 
@@ -103,6 +104,7 @@ Read the [security model](docs/security.md), or
 ## Documentation
 
 - [Recipe reference](docs/recipe.md)
+- [Project manifest (`terra.yaml`)](docs/manifest.md)
 - [Usage and storage](docs/usage.md)
 - [Development and release](README.dev.md)
 - [Systemd and man pages](packaging/README.md)
