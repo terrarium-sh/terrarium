@@ -71,7 +71,7 @@ jobs:
           version: 0.16.0
       - name: Install component build tools
         run: |
-          rustup toolchain install nightly-2026-09-07 --profile minimal --component rustfmt clippy --target wasm32-wasip3
+          rustup toolchain install nightly-2026-09-13 --profile minimal --component rustfmt,clippy --target wasm32-wasip3
           cargo install wasm-tools --version 1.248.0 --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
@@ -105,17 +105,17 @@ jobs:
         run: |
           cargo install cargo-fuzz --version 0.13.1 --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
           cargo metadata --locked --manifest-path fuzz/Cargo.toml --format-version 1
-          cargo +nightly-2026-09-07 fuzz run network_policy -- -max_total_time=60 -max_len=4096
-          cargo +nightly-2026-09-07 fuzz run native_memory -- -max_total_time=60 -max_len=32768
-          cargo +nightly-2026-09-07 fuzz run device_queue -- -max_total_time=60 -max_len=4096
-          cargo +nightly-2026-09-07 fuzz run fuse_wire -- -max_total_time=60 -max_len=4096
-          cargo +nightly-2026-09-07 fuzz run vsock_header -- -max_total_time=60 -max_len=4096
-          cargo +nightly-2026-09-07 fuzz run protocol_frames -- -max_total_time=60 -max_len=4096
+          cargo +nightly-2026-09-13 fuzz run network_policy -- -max_total_time=60 -max_len=4096
+          cargo +nightly-2026-09-13 fuzz run native_memory -- -max_total_time=60 -max_len=32768
+          cargo +nightly-2026-09-13 fuzz run device_queue -- -max_total_time=60 -max_len=4096
+          cargo +nightly-2026-09-13 fuzz run fuse_wire -- -max_total_time=60 -max_len=4096
+          cargo +nightly-2026-09-13 fuzz run vsock_header -- -max_total_time=60 -max_len=4096
+          cargo +nightly-2026-09-13 fuzz run protocol_frames -- -max_total_time=60 -max_len=4096
       - name: Native boundary address sanitizer
         env:
           RUSTFLAGS: -Zsanitizer=address
           CARGO_TARGET_DIR: target/asan
-        run: cargo +nightly-2026-09-07 test --locked -p terra-runtime --test native_boundary --target x86_64-unknown-linux-gnu
+        run: cargo +nightly-2026-09-13 test --locked -p terra-runtime --test native_boundary --target x86_64-unknown-linux-gnu
       - name: KVM gates
         run: |
           if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
@@ -146,7 +146,7 @@ jobs:
       - name: Install component build tools
         run: |
           rustup target add aarch64-unknown-linux-musl
-          rustup toolchain install nightly-2026-09-07 --profile minimal --component rustfmt clippy --target wasm32-wasip3
+          rustup toolchain install nightly-2026-09-13 --profile minimal --component rustfmt,clippy --target wasm32-wasip3
           cargo install wasm-tools --version 1.248.0 --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
       - name: Build and verify native ARM target
         run: |
@@ -182,7 +182,7 @@ jobs:
           path: build
       - name: Install component build tools
         run: |
-          rustup toolchain install nightly-2026-09-07 --profile minimal --component rustfmt clippy --target wasm32-wasip3
+          rustup toolchain install nightly-2026-09-13 --profile minimal --component rustfmt,clippy --target wasm32-wasip3
           cargo install wasm-tools --version 1.248.0 --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
       - name: Build and sign
         run: |

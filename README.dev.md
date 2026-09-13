@@ -14,7 +14,7 @@ and writable `/dev/kvm`.
 Install the separate component toolchain and validator:
 
 ```sh
-rustup toolchain install nightly-2026-09-07 --component rustfmt,clippy --target wasm32-wasip3
+rustup toolchain install nightly-2026-09-13 --component rustfmt,clippy --target wasm32-wasip3
 cargo install wasm-tools --version 1.248.0 --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
 make dist
 ```
@@ -159,8 +159,8 @@ Network policy coverage and boundary fuzzing use the existing tools:
 
 ```sh
 python3 scripts/coverage-network-policy.py
-cargo +nightly-2026-09-07 fuzz run network_policy -- -max_total_time=60 -max_len=4096
-cargo +nightly-2026-09-07 fuzz run native_memory -- -max_total_time=60 -max_len=32768
+cargo +nightly-2026-09-13 fuzz run network_policy -- -max_total_time=60 -max_len=4096
+cargo +nightly-2026-09-13 fuzz run native_memory -- -max_total_time=60 -max_len=32768
 ```
 
 Coverage requires matching LLVM tools (`LLVM_COV` and `LLVM_PROFDATA` can override

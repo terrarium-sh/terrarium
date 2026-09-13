@@ -25,7 +25,7 @@ jobs:
           version: 0.16.0
       - name: Install component build tools
         run: |
-          rustup toolchain install nightly-2026-09-07 --profile minimal --component rustfmt clippy --target wasm32-wasip3
+          rustup toolchain install nightly-2026-09-13 --profile minimal --component rustfmt,clippy --target wasm32-wasip3
           cargo install wasm-tools --version 1.248.0 --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
       - name: Verify and build distribution
         run: |
@@ -109,7 +109,7 @@ jobs:
           path: build
       - name: Install component build tools
         run: |
-          rustup toolchain install nightly-2026-09-07 --profile minimal --component rustfmt clippy --target wasm32-wasip3
+          rustup toolchain install nightly-2026-09-13 --profile minimal --component rustfmt,clippy --target wasm32-wasip3
           cargo install wasm-tools --version 1.248.0 --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
       - name: Build and check entitlement
         run: |
@@ -140,7 +140,7 @@ jobs:
       - name: Install component build tools
         run: |
           rustup target add aarch64-unknown-linux-musl
-          rustup toolchain install nightly-2026-09-07 --profile minimal --component rustfmt clippy --target wasm32-wasip3
+          rustup toolchain install nightly-2026-09-13 --profile minimal --component rustfmt,clippy --target wasm32-wasip3
           cargo install wasm-tools --version 1.248.0 --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
       - name: Build distribution
         run: make host-dist
