@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 jobs:
-  linux:
+  linux-x86_64:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -27,6 +27,13 @@ jobs:
         run: |
           rustup toolchain install nightly-2026-09-13 --profile minimal --component rustfmt,clippy --target wasm32-wasip3
           cargo install wasm-tools --version 1.248.0 --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          key: x86_64-linux
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build
+          key: guest-x86_64-${{ hashFiles('pins.mk', 'Makefile', 'kernel/Containerfile', 'kernel/*.config', 'kernel/patches/*.patch', 'scripts/kernel-container.sh', 'scripts/*.py') }}
       - name: Verify and build distribution
         run: |
           make verify
@@ -76,6 +83,13 @@ jobs:
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          key: aarch64-guest
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build
+          key: guest-aarch64-${{ hashFiles('pins.mk', 'Makefile', 'kernel/Containerfile', 'kernel/*.config', 'kernel/patches/*.patch', 'scripts/kernel-container.sh', 'scripts/*.py') }}
       - run: |
           rustup target add aarch64-unknown-linux-musl
           make ARCH=aarch64 guest-assets
@@ -111,6 +125,9 @@ jobs:
         run: |
           rustup toolchain install nightly-2026-09-13 --profile minimal --component rustfmt,clippy --target wasm32-wasip3
           cargo install wasm-tools --version 1.248.0 --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          key: aarch64-macos
       - name: Build and check entitlement
         run: |
           make TERRA_TARGET=aarch64-apple-darwin host-dist
@@ -142,6 +159,9 @@ jobs:
           rustup target add aarch64-unknown-linux-musl
           rustup toolchain install nightly-2026-09-13 --profile minimal --component rustfmt,clippy --target wasm32-wasip3
           cargo install wasm-tools --version 1.248.0 --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          key: aarch64-linux
       - name: Build distribution
         run: make host-dist
       - name: Check distribution
@@ -154,7 +174,7 @@ jobs:
           path: dist
 
   windows:
-    needs: [linux, guest-aarch64]
+    needs: [linux-x86_64, guest-aarch64]
     strategy:
       fail-fast: false
       matrix:
@@ -176,6 +196,9 @@ jobs:
         with:
           name: terra-guest-${{ matrix.guest }}
           path: build
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          key: ${{ matrix.target }}
       - name: Build distribution
         shell: pwsh
         run: ./scripts/build-host.ps1 -Target ${{ matrix.target }}
@@ -193,7 +216,7 @@ jobs:
 
   release:
     runs-on: ubuntu-latest
-    needs: [linux, linux-aarch64, macos-aarch64, windows]
+    needs: [linux-x86_64, linux-aarch64, macos-aarch64, windows]
     permissions:
       contents: write
       attestations: write

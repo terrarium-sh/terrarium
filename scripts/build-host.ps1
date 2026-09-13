@@ -63,8 +63,8 @@ foreach ($component in $components) {
     Invoke-Native cargo @precompileArguments
 }
 
-Invoke-Native cargo build --locked --release --target $Target -p terra
-Invoke-Native cargo run --locked --target $Target -p terra --example gen-docs
+Invoke-Native cargo build --locked --release --target $Target --package terra
+Invoke-Native cargo run --locked --target $Target --package terra --example gen-docs
 New-Item -ItemType Directory -Force dist | Out-Null
 New-Item -ItemType Directory -Force dist/LICENSES | Out-Null
 Copy-Item "target/$Target/release/terra.exe" dist/terra.exe

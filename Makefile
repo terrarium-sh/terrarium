@@ -13,8 +13,9 @@ CARGO_AUDIT_VERSION := 0.22.0
 WIT_BINDGEN_VERSION := 0.61.1
 ZIG_VERSION := 0.16.0
 # Host CPU, and therefore guest CPU: a box runs on the same hardware the host
-# does, so the kernel, rootfs, and agent are built for $(ARCH).
-ARCH ?= $(shell uname -m)
+# does, so the kernel, rootfs, and agent are built for $(ARCH). Darwin's `uname
+# -m` calls it `arm64`; the guest naming (Linux kernel, Alpine) is `aarch64`.
+ARCH ?= $(shell uname -m | sed 's/^arm64$$/aarch64/')
 MUSL := $(ARCH)-unknown-linux-musl
 NATIVE := $(ARCH)-unknown-linux-gnu
 # `ARCH` names the Linux guest. `TERRA_TARGET` names the native host executable

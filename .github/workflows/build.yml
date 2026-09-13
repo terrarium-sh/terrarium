@@ -40,6 +40,13 @@ jobs:
         with:
           version: 0.16.0
       - run: rustup target add ${{ matrix.rust_target }}
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          key: ${{ matrix.arch }}-guest
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build
+          key: guest-${{ matrix.arch }}-${{ hashFiles('pins.mk', 'Makefile', 'kernel/Containerfile', 'kernel/*.config', 'kernel/patches/*.patch', 'scripts/kernel-container.sh', 'scripts/*.py') }}
       - name: Build guest assets
         run: make ARCH=${{ matrix.arch }} guest-assets
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -54,7 +61,7 @@ jobs:
             build/boot.img.gz.sha256
           if-no-files-found: error
 
-  verify:
+  linux-x86_64:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -76,16 +83,11 @@ jobs:
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           workspaces: . -> target
-          key: x86_64-component
-      - name: Guest image cache key
-        id: guest
-        run: >-
-          echo "key=${{ hashFiles('pins.mk', 'Makefile', 'kernel/Containerfile', 'kernel/*.config', 'kernel/patches/*.patch', 'scripts/kernel-container.sh', 'scripts/*.py') }}"
-          >> "$GITHUB_OUTPUT"
+          key: x86_64-linux
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: build
-          key: guest-${{ steps.guest.outputs.key }}
+          key: guest-x86_64-${{ hashFiles('pins.mk', 'Makefile', 'kernel/Containerfile', 'kernel/*.config', 'kernel/patches/*.patch', 'scripts/kernel-container.sh', 'scripts/*.py') }}
       - name: Verify
         run: make verify
       - name: Build distribution
@@ -148,6 +150,9 @@ jobs:
           rustup target add aarch64-unknown-linux-musl
           rustup toolchain install nightly-2026-09-13 --profile minimal --component rustfmt,clippy --target wasm32-wasip3
           cargo install wasm-tools --version 1.248.0 --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          key: aarch64-linux
       - name: Build and verify native ARM target
         run: |
           make host-dist
@@ -184,6 +189,9 @@ jobs:
         run: |
           rustup toolchain install nightly-2026-09-13 --profile minimal --component rustfmt,clippy --target wasm32-wasip3
           cargo install wasm-tools --version 1.248.0 --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          key: aarch64-macos
       - name: Build and sign
         run: |
           make TERRA_TARGET=aarch64-apple-darwin host-dist
@@ -224,6 +232,9 @@ jobs:
         with:
           name: terra-guest-${{ matrix.guest }}
           path: build
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          key: ${{ matrix.target }}
       - name: Build distribution
         shell: pwsh
         run: ./scripts/build-host.ps1 -Target ${{ matrix.target }}
