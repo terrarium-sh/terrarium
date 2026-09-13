@@ -163,6 +163,9 @@ impl BoxRuntime {
                     for interrupt in interrupts {
                         inject(interrupt)?;
                     }
+                    if close {
+                        receiver.close();
+                    }
                     if let Some(response) = pending.response {
                         let _ = response.send(Ok(value));
                     }
@@ -318,6 +321,7 @@ impl BoxRuntime {
                             for change in changes {
                                 inject(change.gsi, false)?;
                             }
+                            receiver.close();
                             let _ = response.send(());
                             return Ok(());
                         }

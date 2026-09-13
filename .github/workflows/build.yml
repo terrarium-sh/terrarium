@@ -180,6 +180,7 @@ jobs:
             echo '::notice title=KVM gates skipped::This hosted runner has no read/write /dev/kvm.'
             exit 0
           fi
+          make test-component-boot
           TERRA_BIN="$PWD/dist/terra" cargo test --locked -p terra --test boot --test memory -- --ignored --test-threads=1
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

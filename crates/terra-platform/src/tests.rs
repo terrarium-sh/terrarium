@@ -1553,6 +1553,11 @@ fn boot_plan(
     encode_frame(&plan).expect("plan encodes")
 }
 
+#[cfg(any(
+    target_arch = "x86_64",
+    all(target_os = "linux", target_arch = "aarch64"),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 fn boot_probe_plan(vcpus: usize) -> Vec<u8> {
     boot_plan(
         terra_protocol::PlanMode::Create,
@@ -1562,6 +1567,13 @@ fn boot_probe_plan(vcpus: usize) -> Vec<u8> {
     )
 }
 
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 fn agent_bridge_plan() -> Vec<u8> {
     boot_plan(
         terra_protocol::PlanMode::Run,
@@ -1697,7 +1709,11 @@ const BOOT_RAM: u64 = 512 << 20;
 /// and reports success. `TERRA_BOOT_TRACE=1` logs MSR/EOI flow.
 #[tokio::test]
 #[ignore = "needs /dev/kvm and `make test-component-boot`"]
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(
+    target_arch = "x86_64",
+    all(target_os = "linux", target_arch = "aarch64"),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 async fn kernel_boots_to_agent_ready() {
     let vcpus: usize = if std::env::var_os("TERRA_BOOT_ONE_CPU").is_some() {
         1
@@ -1735,7 +1751,11 @@ async fn kernel_boots_to_agent_ready() {
 
 #[tokio::test]
 #[ignore = "needs /dev/kvm and `make test-component-boot`"]
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(
+    target_arch = "x86_64",
+    all(target_os = "linux", target_arch = "aarch64"),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 async fn kernel_reports_free_pages_after_boot() {
     let vcpus: usize = if std::env::var_os("TERRA_BOOT_ONE_CPU").is_some() {
         1
@@ -1776,7 +1796,13 @@ async fn kernel_reports_free_pages_after_boot() {
     );
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 fn bridge_listener() -> (
     tempfile::TempDir,
     std::path::PathBuf,
@@ -1800,7 +1826,13 @@ fn bridge_listener() -> (
     (dir, path, listener)
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 fn connect_agent(path: &std::path::Path) -> std::io::Result<std::os::unix::net::UnixStream> {
     use std::io::Read as _;
     use terra_protocol::AGENT_HELLO;
@@ -1830,7 +1862,13 @@ fn connect_agent(path: &std::path::Path) -> std::io::Result<std::os::unix::net::
     }
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 fn assert_agent_control_and_exec(path: &std::path::Path) -> std::io::Result<()> {
     use std::io::Write as _;
     use terra_protocol::{AgentService, ControlReply, ControlRequest, encode_frame, read_frame};
@@ -1862,7 +1900,13 @@ fn assert_agent_control_and_exec(path: &std::path::Path) -> std::io::Result<()> 
     Ok(())
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 fn agent_exec(path: &std::path::Path, argv: &[&str]) -> std::io::Result<Vec<u8>> {
     use std::io::Write as _;
     use terra_protocol::{AgentOutput, AgentService, ExecRequest, encode_frame, read_frame};
@@ -1898,7 +1942,13 @@ fn agent_exec(path: &std::path::Path, argv: &[&str]) -> std::io::Result<Vec<u8>>
     Ok(output)
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 fn await_foreground_workload(path: &std::path::Path) -> std::io::Result<(Vec<u8>, i32)> {
     use std::io::Write as _;
     use terra_protocol::{AgentOutput, AgentService, read_frame};
@@ -1925,13 +1975,25 @@ fn await_foreground_workload(path: &std::path::Path) -> std::io::Result<(Vec<u8>
     }
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 struct LocalHttpPolicy {
     address: std::net::IpAddr,
     port: u16,
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 impl terra_network::Policy for LocalHttpPolicy {
     fn allows(&self, ip: std::net::IpAddr, port: Option<u16>) -> bool {
         ip == self.address && port == Some(self.port)
@@ -1946,7 +2008,13 @@ impl terra_network::Policy for LocalHttpPolicy {
     }
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 fn local_http_server(
     address: std::net::Ipv4Addr,
     body: Vec<u8>,
@@ -1991,7 +2059,13 @@ fn local_http_server(
     (port, stop, server)
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 fn local_upload_server(
     address: std::net::Ipv4Addr,
     expected_bytes: usize,
@@ -2037,7 +2111,13 @@ fn local_upload_server(
 /// owner-only Unix listener while the real component-backed machine is running.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs /dev/kvm, `make component-block-aot component-vsock-aot`, and boot assets"]
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 async fn kernel_boots_to_agent_bridge() {
     let (_socket_dir, socket_path, listener) = bridge_listener();
     let (kernel, boot_path, root_path) = kernel_boot_assets();
@@ -2074,7 +2154,13 @@ async fn kernel_boots_to_agent_bridge() {
 /// the worker reaps the machine after the agent reports the signal exit.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs /dev/kvm, component AOT artifacts, and boot assets"]
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 async fn kernel_boots_and_agent_stop_ends_workload() {
     use std::io::Write as _;
 
@@ -2127,7 +2213,13 @@ async fn kernel_boots_and_agent_stop_ends_workload() {
 /// workload's terminal output and exit status through the native agent bridge.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs /dev/kvm, component AOT artifacts, and boot assets"]
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 async fn kernel_boots_foreground_session_reports_workload_exit() {
     let (_socket_dir, socket_path, listener) = bridge_listener();
     let (kernel, boot_path, root_path) = kernel_boot_assets();
@@ -2183,7 +2275,13 @@ async fn kernel_boots_foreground_session_reports_workload_exit() {
     );
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 async fn assert_policy_dns_http(address: std::net::IpAddr, body: &[u8]) {
     let (_socket_dir, socket_path, listener) = bridge_listener();
     let (kernel, boot_path, root_path) = kernel_boot_assets();
@@ -2229,7 +2327,13 @@ async fn assert_policy_dns_http(address: std::net::IpAddr, body: &[u8]) {
     assert_eq!(outcome.exit_code, Some(0), "agent outcome: {outcome:?}");
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 async fn assert_policy_dns_upload(address: std::net::IpAddr, bytes: usize) {
     let (_socket_dir, socket_path, listener) = bridge_listener();
     let (kernel, boot_path, root_path) = kernel_boot_assets();
@@ -2276,12 +2380,24 @@ async fn assert_policy_dns_upload(address: std::net::IpAddr, bytes: usize) {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs /dev/kvm, component AOT artifacts, and boot assets"]
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 async fn kernel_boots_through_standard_wasi_tcp() {
     assert_policy_dns_http(native_ipv4_address(), b"agent-network").await;
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 fn native_ipv4_address() -> std::net::IpAddr {
     let socket = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
         .expect("bind local address probe");
@@ -2291,14 +2407,26 @@ fn native_ipv4_address() -> std::net::IpAddr {
     socket.local_addr().expect("read local address").ip()
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 fn reserved_loopback_port() -> u16 {
     let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .expect("reserve loopback port");
     listener.local_addr().expect("read reserved port").port()
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 fn published_http_response(port: u16, host_closes_first: bool) -> std::io::Result<Vec<u8>> {
     use std::io::{Read as _, Write as _};
 
@@ -2334,7 +2462,13 @@ fn published_http_response(port: u16, host_closes_first: bool) -> std::io::Resul
 /// A guest closing its response sends EOF to a host still holding its write half open.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs /dev/kvm, component AOT artifacts, and boot assets"]
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 async fn kernel_boots_published_loopback_http() {
     assert_published_loopback_http(false).await;
 }
@@ -2342,12 +2476,24 @@ async fn kernel_boots_published_loopback_http() {
 /// A host finishing its request can still receive the complete guest response and EOF.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs /dev/kvm, component AOT artifacts, and boot assets"]
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 async fn kernel_boots_published_loopback_http_after_host_eof() {
     assert_published_loopback_http(true).await;
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 async fn assert_published_loopback_http(host_closes_first: bool) {
     use std::io::Write as _;
 
@@ -2419,14 +2565,26 @@ async fn assert_published_loopback_http(host_closes_first: bool) {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs /dev/kvm, component AOT artifacts, and boot assets"]
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 async fn kernel_boots_through_standard_wasi_large_tcp() {
     assert_policy_dns_http(native_ipv4_address(), &vec![b's'; 65_537]).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs /dev/kvm, component AOT artifacts, and boot assets"]
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
 async fn kernel_uploads_through_standard_wasi_tcp() {
     assert_policy_dns_upload(native_ipv4_address(), 65_537).await;
 }
