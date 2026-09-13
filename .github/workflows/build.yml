@@ -30,6 +30,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Free runner disk
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache /usr/local/.ghcup /usr/local/share/boost
       - name: Allow unprivileged user namespaces
         run: |
           if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
@@ -67,6 +69,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Free runner disk
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache /usr/local/.ghcup /usr/local/share/boost
       - name: Allow unprivileged user namespaces
         run: |
           if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
@@ -88,8 +92,10 @@ jobs:
         with:
           path: build
           key: guest-x86_64-${{ hashFiles('pins.mk', 'Makefile', 'kernel/Containerfile', 'kernel/*.config', 'kernel/patches/*.patch', 'scripts/kernel-container.sh', 'scripts/*.py') }}
-      - name: Verify
-        run: make verify
+      - name: Verify components
+        run: make verify-components
+      - name: Verify workspace
+        run: make verify-workspace
       - name: Build distribution
         run: make dist
       - name: Check distribution
@@ -103,6 +109,16 @@ jobs:
           rustup component add llvm-tools-preview
           llvm_bin="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin"
           LLVM_COV="$llvm_bin/llvm-cov" LLVM_PROFDATA="$llvm_bin/llvm-profdata" python3 scripts/coverage-network-policy.py
+      - name: KVM gates
+        run: |
+          if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
+            echo '::notice title=KVM gates skipped::This hosted runner has no read/write /dev/kvm.'
+            exit 0
+          fi
+          make test-component-boot
+          make test-component-vmm
+      - name: Reclaim component build space
+        run: rm -rf components/*/target
       - name: Fuzz smoke
         run: |
           cargo install cargo-fuzz --version 0.13.1 --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
@@ -113,19 +129,13 @@ jobs:
           cargo +nightly-2026-09-13 fuzz run fuse_wire -- -max_total_time=60 -max_len=4096
           cargo +nightly-2026-09-13 fuzz run vsock_header -- -max_total_time=60 -max_len=4096
           cargo +nightly-2026-09-13 fuzz run protocol_frames -- -max_total_time=60 -max_len=4096
+      - name: Reclaim fuzz build space
+        run: rm -rf fuzz/target
       - name: Native boundary address sanitizer
         env:
           RUSTFLAGS: -Zsanitizer=address
           CARGO_TARGET_DIR: target/asan
         run: cargo +nightly-2026-09-13 test --locked -p terra-runtime --test native_boundary --target x86_64-unknown-linux-gnu
-      - name: KVM gates
-        run: |
-          if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
-            echo '::notice title=KVM gates skipped::This hosted runner has no read/write /dev/kvm.'
-            exit 0
-          fi
-          make test-component-boot
-          make test-component-vmm
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: terra-x86_64-linux
@@ -138,6 +148,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Free runner disk
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache /usr/local/.ghcup /usr/local/share/boost
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: terra-guest-aarch64
@@ -176,6 +188,7 @@ jobs:
 
   macos-aarch64:
     needs: guest-assets
+    if: ${{ vars.ENABLE_MACOS == 'true' }}
     runs-on: macos-15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -211,6 +224,7 @@ jobs:
 
   windows:
     needs: guest-assets
+    if: ${{ vars.ENABLE_WINDOWS == 'true' }}
     strategy:
       fail-fast: false
       matrix:

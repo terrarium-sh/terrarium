@@ -72,7 +72,7 @@ COMPONENT_TARGETS := $(addprefix component-,$(COMPONENTS))
 COMPONENT_AOT_TARGETS := $(addsuffix -aot,$(COMPONENT_TARGETS))
 COMPONENT_MANIFESTS := components/device-transport/Cargo.toml $(addprefix components/,$(addsuffix /Cargo.toml,$(COMPONENTS)))
 
-.PHONY: $(COMPONENT_TARGETS) $(COMPONENT_AOT_TARGETS) guest-assets check-guest-assets host-build host-dist source-dist verify-wit build verify verify-components dist man clean test-component-boot test-component-vmm test-install check-zig
+.PHONY: $(COMPONENT_TARGETS) $(COMPONENT_AOT_TARGETS) guest-assets check-guest-assets host-build host-dist source-dist verify-wit build verify verify-components verify-workspace dist man clean test-component-boot test-component-vmm test-install check-zig
 
 # Pin changes invalidate every embedded guest payload.
 PINS := $(ARCH) $(KERNEL_VERSION) $(KERNEL_SHA256) $(E2FSPROGS_VERSION) $(E2FSPROGS_SHA256) \
@@ -321,7 +321,9 @@ test-component-boot: $(COMPONENT_AOT_TARGETS) $(KERNEL_GZ) $(ROOTFS_IMG) $(BOOT_
 ## separate:
 ## `make dist && TERRA_BIN=$PWD/dist/terra cargo test -p terra --test boot -- --ignored`
 ## (needs /dev/kvm).
-verify: verify-components
+verify: verify-components verify-workspace
+
+verify-workspace:
 	python3 -B scripts/check-tool-versions.py
 	python3 -B scripts/test-kernel-tools.py
 	python3 -B scripts/test-alpine-sources.py

@@ -14,6 +14,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Free runner disk
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache /usr/local/.ghcup /usr/local/share/boost
       - name: Allow unprivileged user namespaces
         run: |
           if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
@@ -34,9 +36,12 @@ jobs:
         with:
           path: build
           key: guest-x86_64-${{ hashFiles('pins.mk', 'Makefile', 'kernel/Containerfile', 'kernel/*.config', 'kernel/patches/*.patch', 'scripts/kernel-container.sh', 'scripts/*.py') }}
-      - name: Verify and build distribution
+      - name: Verify components
+        run: make verify-components
+      - name: Verify workspace
+        run: make verify-workspace
+      - name: Build distribution
         run: |
-          make verify
           make dist
           make source-dist
       - name: KVM gates
@@ -47,6 +52,8 @@ jobs:
           fi
           make test-component-boot
           make test-component-vmm
+      - name: Reclaim component build space
+        run: rm -rf components/*/target
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: terra-x86_64-linux
@@ -74,6 +81,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Free runner disk
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache /usr/local/.ghcup /usr/local/share/boost
       - name: Allow unprivileged user namespaces
         run: |
           if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
@@ -112,6 +121,7 @@ jobs:
 
   macos-aarch64:
     needs: guest-aarch64
+    if: ${{ vars.ENABLE_MACOS == 'true' }}
     runs-on: macos-15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -147,6 +157,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Free runner disk
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache /usr/local/.ghcup /usr/local/share/boost
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: terra-guest-aarch64
@@ -175,6 +187,7 @@ jobs:
 
   windows:
     needs: [linux-x86_64, guest-aarch64]
+    if: ${{ vars.ENABLE_WINDOWS == 'true' }}
     strategy:
       fail-fast: false
       matrix:
@@ -217,6 +230,7 @@ jobs:
   release:
     runs-on: ubuntu-latest
     needs: [linux-x86_64, linux-aarch64, macos-aarch64, windows]
+    if: ${{ always() && !failure() && !cancelled() }}
     permissions:
       contents: write
       attestations: write
@@ -227,6 +241,7 @@ jobs:
           name: terra-x86_64-linux
           path: stage/terra-x86_64-linux
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ vars.ENABLE_MACOS == 'true' }}
         with:
           name: terra-aarch64-macos
           path: stage/terra-aarch64-macos
@@ -235,10 +250,12 @@ jobs:
           name: terra-aarch64-linux
           path: stage/terra-aarch64-linux
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ vars.ENABLE_WINDOWS == 'true' }}
         with:
           name: terra-x86_64-pc-windows-msvc
           path: stage/terra-x86_64-pc-windows-msvc
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ vars.ENABLE_WINDOWS == 'true' }}
         with:
           name: terra-aarch64-pc-windows-msvc
           path: stage/terra-aarch64-pc-windows-msvc
@@ -252,8 +269,8 @@ jobs:
           path: stage
       - name: Assemble platform archives
         run: |
-          for directory in stage/terra-x86_64-linux stage/terra-aarch64-linux stage/terra-aarch64-macos stage/terra-x86_64-pc-windows-msvc stage/terra-aarch64-pc-windows-msvc; do
-            tar -czf "$directory.tar.gz" -C "$directory" .
+          for directory in stage/*/; do
+            tar -czf "${directory%/}.tar.gz" -C "$directory" .
           done
       - name: Checksums
         run: |
