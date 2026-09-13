@@ -1,0 +1,48 @@
+[package]
+name = "terra-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+terra-io = { path = "../terra-io" }
+terra-runtime = { path = "../terra-runtime" }
+terra-network = { path = "../terra-network" }
+terra-protocol = { path = "../terra-protocol" }
+terra-limits = { path = "../terra-limits" }
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+vm-memory = { version = "0.18", features = ["backend-mmap"] }
+
+[target.'cfg(any(unix, target_os = "windows"))'.dependencies]
+wasmtime = { version = "=48.0.2", default-features = false, features = ["async", "component-model-async", "runtime", "std"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+kvm-bindings = "0.14"
+kvm-ioctls = "0.25"
+libc.workspace = true
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+applevisor = { version = "=1.0.0", default-features = false, features = ["macos-15-0"] }
+applevisor-sys = { version = "=1.0.0", default-features = false, features = ["macos-15-0"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Hypervisor"] }
+
+[dev-dependencies]
+terra-runtime = { path = "../terra-runtime", features = ["test-support"] }
+tempfile.workspace = true
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
+wasmtime = { version = "=48.0.2", default-features = false, features = ["cranelift", "wit-parser", "wat"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+virtio-blk = { git = "https://github.com/rust-vmm/vm-virtio", rev = "87bf424736548126983c278b0d49a7b061e38b12" }
+virtio-queue-git = { package = "virtio-queue", git = "https://github.com/rust-vmm/vm-virtio", rev = "87bf424736548126983c278b0d49a7b061e38b12", features = ["test-utils"] }
+virtio-bindings = "0.2.7"
+virtio-vsock = "0.12"
+
+[lints]
+workspace = true

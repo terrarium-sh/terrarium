@@ -68,15 +68,6 @@ enum PinSource {
 }
 
 impl ResolvedBox {
-    /// The recipe this target names, parsed against the box's own directory
-    /// with `env_file:` merged over `env:`. Not the config a boot runs: mounts
-    /// are absolute here, but neither canonicalized nor checked to exist.
-    pub(crate) fn parse_recipe(&self) -> Result<config::Config> {
-        let mut cfg = self.parse_recipe_without_env_file()?;
-        config::merge_env_file(&mut cfg)?;
-        Ok(cfg)
-    }
-
     pub(crate) fn parse_recipe_without_env_file(&self) -> Result<config::Config> {
         match &self.source {
             Source::Pinned => config::load_path(
@@ -224,7 +215,7 @@ fn resolve_inner(
 fn find_manifest_divergence(bx: &BoxRef, manifest: Option<&config::Manifest>) -> Option<PathBuf> {
     let reference = manifest?.boxes.get(bx.get_name())?;
     let chosen = read_recipe(reference, bx.get_project_dir()).ok()??;
-    let pinned = std::fs::read_to_string(bx.get_dir().join(state::RECIPE_FILE)).ok()?;
+    let pinned = config::read_recipe_text(&bx.get_dir().join(state::RECIPE_FILE)).ok()?;
     (chosen.text != pinned).then_some(chosen.from)
 }
 
@@ -232,7 +223,7 @@ pub(crate) fn choose_default_box_name(
     project_dir: &Path,
     manifest: Option<&config::Manifest>,
 ) -> Result<String> {
-    let existing = state::list_existing_names(project_dir);
+    let existing = state::list_existing_names(project_dir)?;
     let names = list_known_names_with(&existing, manifest);
     match names.as_slice() {
         [] => Err(build_missing_box_error(project_dir, None, manifest)),
@@ -253,9 +244,9 @@ pub(crate) fn choose_default_box_name(
 pub(crate) fn list_known_names(
     project_dir: &Path,
     manifest: Option<&config::Manifest>,
-) -> Vec<String> {
-    let existing = state::list_existing_names(project_dir);
-    list_known_names_with(&existing, manifest)
+) -> Result<Vec<String>> {
+    let existing = state::list_existing_names(project_dir)?;
+    Ok(list_known_names_with(&existing, manifest))
 }
 
 fn list_known_names_with(existing: &[String], manifest: Option<&config::Manifest>) -> Vec<String> {
@@ -315,10 +306,12 @@ pub(crate) fn read_recipe(reference: &str, source_dir: &Path) -> Result<Option<R
         return Ok(None);
     }
     let path = config::resolve_recipe_path(Path::new(reference), source_dir)?;
-    match std::fs::read_to_string(&path) {
+    match config::read_recipe_text(&path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         r => {
-            let text = r.with_context(|| format!("reading {}", path.display()))?;
+            let text = r.with_context(|| {
+                format!("reading {}", crate::render::escape_printable_path(&path))
+            })?;
             Ok(Some(Recipe { from: path, text }))
         }
     }
@@ -341,6 +334,9 @@ pub(crate) fn build_missing_recipe_error(
         Ok(p) => p.display().to_string(),
         Err(e) => return e,
     };
+    let tried = crate::render::escape_printable(&tried);
+    let reference = crate::render::escape_printable(reference);
+    let arg = crate::render::escape_printable(arg);
     if reference == arg {
         anyhow!("config not found: {tried} (terra {reference} setup reads and pins the file)")
     } else {
@@ -370,6 +366,24 @@ mod tests {
 
     /// A bare word is a box, never a file: there is no directory of profiles it
     /// could resolve into, so a recipe reaches terra by path alone.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_recipe_reference_errors_escape_terminal_controls() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = "./bad\x1b]0;title\x07.yaml";
+        std::fs::create_dir(dir.path().join(name)).unwrap();
+        let error = format!("{:#}", read_recipe(name, dir.path()).unwrap_err());
+        assert!(!error.contains(['\x1b', '\x07']), "{error:?}");
+    }
+
+    #[test]
+    fn missing_recipe_errors_escape_terminal_controls() {
+        let error =
+            build_missing_recipe_error("dev", "./bad\x1b]0;title\x07.yaml", Path::new("/project"))
+                .to_string();
+        assert!(!error.contains(['\x1b', '\x07']), "{error:?}");
+    }
+
     #[test]
     fn a_bare_word_names_no_recipe_file() {
         let dir = tempfile::tempdir().unwrap();

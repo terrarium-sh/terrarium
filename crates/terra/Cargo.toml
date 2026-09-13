@@ -16,28 +16,35 @@ path = "src/lib.rs"
 name = "terra"
 path = "src/main.rs"
 
+[features]
+fuzzing = []
+
 [dependencies]
-terra-shared = { path = "../terra-shared" }
+terra-io = { path = "../terra-io" }
+terra-limits = { path = "../terra-limits" }
+terra-protocol = { path = "../terra-protocol" }
 clap.workspace = true
-strum = { version = "0.28", features = ["derive"] }
 anyhow.workspace = true
 serde.workspace = true
 yaml_serde.workspace = true
 serde_json = { workspace = true }
-crossterm = { version = "0.29", default-features = false }
+crossterm = { version = "0.29", default-features = false, features = ["windows"] }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
-libkrun = { path = "../../vendor/libkrun/src/libkrun", features = ["net", "blk"] }
-smolvm-network = { path = "../../vendor/smolvm/crates/smolvm-network" }
+terra-network = { path = "../terra-network" }
+terra-runtime = { path = "../terra-runtime" }
+terra-platform = { path = "../terra-platform" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 libc.workspace = true
-lru = "0.18"
 rustix.workspace = true
 sha2 = { version = "0.11", default-features = false }
 tracing-appender = "0.2"
+sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 log = "0.4.34"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "registry", "tracing-log", "std"] }
 
-[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
-libproc = "0.14.11"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Pipes", "Win32_System_Threading"] }
 
 [dev-dependencies]
 clap_mangen = "0.3"

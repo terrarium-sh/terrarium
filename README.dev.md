@@ -1,205 +1,218 @@
-# Terrarium — development
+# Terrarium development
 
-Building and hacking on terra itself. Users start at the [README](README.md).
-
-## Prerequisites
-
-- **libkrun, libkrunfw and smolvm are vendored submodules** — libkrun as
-  [`cryi/libkrun`](https://github.com/cryi/libkrun) (a mirror of upstream, so
-  host-portability patches have somewhere to live and to be sent upstream from;
-  it currently carries none), libkrunfw pristine, built from source for its
-  guest kernel, and [`cryi/smolvm`](https://github.com/cryi/smolvm) for its
-  `smolvm-network` crate, the egress gateway. All folded into a single
-  fully-static `terra` binary. The forks are a waiting room, not a home: any
-  change a submodule carries must be merged upstream before its pin moves
-  again — see [vendor/README.md](vendor/README.md) for the policy and the
-  upstream wishlist. After cloning:
-  ```sh
-  git submodule update --init   # not --recursive: see vendor/README.md
-  ```
-- **`zig`** on the build host — it provides the musl C cross-toolchain
-  (`scripts/zig-musl-*`), so no musl gcc need be installed.
-- **KVM** (`/dev/kvm`) on Linux.
-
-At **run** time terra needs nothing else — no network, no `curl`/`tar`, no
-e2fsprogs. The guest root filesystem is prebaked into the binary at build time,
-so creating a box is a decompress plus a `set_len`; the filesystem work that
-needs Linux (growing the image to `hw.rootfs_mib`) happens inside the guest, which
-is always Alpine. That is also what lets a non-Linux host create a box.
-
-The **build** host additionally needs `curl` + `tar` + `unshare` (to fetch and
-bake the base rootfs) and downloads a pinned, hash-verified e2fsprogs release to
-build the static `mke2fs`/`resize2fs` that get baked in.
+Users start at the [README](README.md). Outstanding implementation and validation
+work lives in [todo.md](todo.md).
 
 ## Build
 
+Linux builds need Rust (pinned by [rust-toolchain.toml](rust-toolchain.toml)),
+Podman for kernel compilation, Zig for the musl C toolchain, Make, Python 3,
+`curl`, `tar`, `gzip`, and `unshare`. Building guest filesystem images requires
+working unprivileged user namespaces. Running Linux guests requires readable
+and writable `/dev/kvm`.
+
+Install the separate component toolchain and validator:
+
 ```sh
-make build     # vmlinux + prebaked rootfs/boot images + static terra binary
-make verify    # build inputs + fmt + clippy + rustdoc + full test suite
-make dist      # -> dist/terra, one fully-static portable binary
-make cross     # cross-compile the host binary (see Platform support)
-make clean
+rustup toolchain install nightly-2026-09-07 --component rustfmt,clippy --target wasm32-wasip3
+cargo install wasm-tools --version 1.248.0 --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
+make dist
 ```
 
-`terra` is a static-musl PIE binary — `ldd` reports *not a dynamic executable*.
-Always use `make dist` to build it; the binary is gitignored.
-It links **nothing** at runtime (no libc, no loader, no `.so`) and runs on any
-Linux with KVM. libkrun is a mainline Cargo dependency (unmodified); the guest
-kernel is libkrunfw's `vmlinux`, embedded and booted as an external kernel —
-no dlopen, no patch. It ships stripped and gzipped, and is unpacked once into
-`~/.terra/cache/vmlinux-<hash>` (the name is the hash of the embedded bytes, so
-later boots reuse it and a terra upgrade prunes the one it replaces).
+`make dist` produces `dist/terra` with embedded guest images and trusted,
+precompiled Wasmtime components, plus license notices. Linux releases target
+static musl; ordinary Cargo commands use the native host target. Production
+loads embedded AOT components without a Wasm compiler. Run image-building Make
+targets sequentially in a shared checkout.
 
-> Building libkrunfw compiles a full Linux kernel (needs `flex`, `bison`, `bc`,
-> `libelf`, `openssl` dev headers, and Python `pyelftools`) — slow on first
-> build, then cached.
+The guest is Alpine Linux on the host's CPU architecture. Guest images are
+built on Linux; macOS and Windows builds consume those images and compile AOT
+components for their own host target. See [native host builds](packaging/README.md#native-host-builds)
+for staging, platform requirements, and signing. WIT packages share
+[interface sources](components/wit/README.md) through symlinks; Windows
+checkouts require symlink privileges and `core.symlinks=true`.
 
-## How it works
+## Code layout
 
-A box's guest root is a single bounded ext4 image, its `rootfs.img`, and terra
-does not build it at run time: the image is baked at **build** time by the
-Makefile (`mke2fs -d` writing the Alpine tree into it, inside a user namespace so
-it lands root-owned) and shipped inside the binary, gzipped. Creating a box is
-therefore a decompress plus a `set_len` — no mkfs, no privilege, no network, and
-nothing fetched per machine — which is what lets a non-Linux host create one. The
-guest grows the filesystem to `hw.rootfs_mib` on first boot, with the `resize2fs`
-that rides the boot volume.
+| Path | Responsibility |
+| --- | --- |
+| `crates/terra` | CLI, recipes and manifests, box storage, policy construction, VM launch and clients |
+| `crates/terra-agent` | Linux guest initialization, hooks, workload and interactive services |
+| `crates/terra-protocol`, `crates/terra-io` | Shared wire protocol and portable local I/O |
+| `crates/terra-network` | Shared network policy types and address rules |
+| `crates/terra-platform` | KVM, Hypervisor.framework and WHP adapters; native machine resources |
+| `crates/terra-runtime` | Wasmtime stores, scoped host capabilities and component workers |
+| `components` | Boot planning, VMM and device protocols, network policy, transport and WIT |
+| `kernel`, `pins.mk` | Guest kernel configuration and pinned build inputs |
+| `fuzz`, `scripts` | Boundary fuzz targets, build checks and benchmark tools |
 
-Booting is two-stage, and no host directory takes part in it. libkrun boots the
-guest on the **boot volume**: a small read-only ext4 image, identical for every
-box, holding nothing but the agent and `resize2fs`. The kernel roots on it
-(`root=/dev/vda ro init=/terra-agent`) and runs the agent as PID 1 — no virtiofs
-root, and no initramfs alternative either (`CONFIG_BLK_DEV_INITRD` is unset in
-libkrunfw's kernel). Being a constant, the image is unpacked once into
-`~/.terra/cache/` and shared by every box, like `vmlinux`.
+Native preparation creates the machine layout, RAM, disks, directory grants
+and vCPUs. A short-lived boot component plans kernel placement; native code
+validates its writes and result before CPUs start. The VMM component then owns
+exit interpretation, MMIO routing and lifecycle decisions. Device components
+run in independent stores and communicate through bounded scalar bridges.
+Hypervisor operations and authority checks remain native. See the
+[security model](docs/security.md) for trust boundaries and resource limits.
 
-Stage one is the agent on that volume: it mounts the pseudo-filesystems, dials
-the host over vsock for its **boot plan**, grows every image to its configured
-size (the root and each volume — `resize2fs` is out of reach after this point),
-then mounts the box's root at `/dev/vdb` and chroots into it. There is no
-re-exec: the process is already mapped, and the old root simply becomes
-unreachable, which is what keeps the boot volume out of a running sandbox's `df`.
-Stage two drives the guest's own tools (`mount`, `ip`, `chroot`) for the rest of
-the setup, bakes `on_create` if the stamp inside the root is stale, then runs the
-hooks and the workload. One integrated Rust process owns the whole guest
-lifecycle.
+The agent starts as PID 1 from the read-only 8 MiB boot disk, receives its boot
+plan over vsock, grows the box's ext4 images and enters the Alpine root with
+`pivot_root`. It applies `on_create` when its guest-side recipe stamp differs,
+then configures mounts and runs hooks and the workload. Boot-plan environment
+values are sent through memory, not persisted as a host plan file.
 
-Everything host and guest still have to say to each other goes over **one vsock
-connection**, opened by the guest as its first act:
+## Guest kernel and images
 
-- the host answers it with the boot plan — so the sandbox's environment, secrets
-  included, reaches the guest through memory and is never written to a file
-- the same connection carries the one-byte graceful-stop signal behind
-  `terra stop` and `systemctl stop` (a single `write`, which is what makes it
-  usable from a signal handler)
+[pins.mk](pins.mk) records source URLs and SHA-256 hashes for the kernel,
+Alpine and filesystem tools. The kernel combines
+[kernel/terra.config](kernel/terra.config) with the architecture seed using
+`allnoconfig`; `scripts/check-kernel-config.py` checks the resolved result.
+Boot drivers are built in. The boot volume contains the agent and resize helper;
+Terra does not ship a general-purpose module tree. Packages requiring other
+kernel drivers need a built-in equivalent.
 
-The `on_create` bake needs no channel at all: the guest records the script it baked
-at `/terra/recipe` **inside its own root filesystem** and compares it against the
-plan on the next boot. The host never reads it — which is why seeding no longer
-forks a second VM: a bare `terra setup` boots one to bake on demand, and a start
-lets the same bake happen on its way to the workload.
+The pinned [kernel container](kernel/Containerfile) supplies the build tools and
+AArch64 cross compiler. Its wrapper mounts the repository read-only and `build/`
+writable, and disables network access during compilation.
 
-A running sandbox therefore has exactly the host filesystem its config asked for
-and nothing else: `mount` shows `/dev/vdb` (the bounded root), the volumes, the
-pseudo-filesystems, and any shares you configured. A box with no `mounts` and no
-project directory touches no host filesystem at all.
+```sh
+make kernel
+make kernel-export
+# Import an architecture-matched archive after verifying its source/provenance:
+make KERNEL_ARCHIVE=/path/to/terra-kernel-x86_64.tar.gz KERNEL_ARCHIVE_SHA256=... kernel
+```
 
-The guest kernel is compiled into the binary (statically linked, not
-`dlopen`ed). A virtio-net NIC is bridged over a socketpair to an in-process
-[`smolvm-network`](https://github.com/cryi/smolvm) gateway, which terminates the
-guest's traffic and reopens host sockets under the configured egress policy
-(DNS-answer learning for allowed hostnames, plus static IP/CIDR rules). Adding a
-real NIC disables libkrun's TSI backend, so the gateway is the only network path
-out of the guest.
+Exports contain the compressed kernel, resolved configuration and input digest;
+the companion `.sha256` records the archive checksum. The
+[kernel workflow](.github/workflows/kernel.yml) exports both architectures.
+Cross-compilation does not establish hardware boot acceptance.
 
-## Platform support
+Root and volume images are prebaked ext4 files. Creating a box decompresses
+and sizes those images; the guest grows the filesystems. Runtime hosts need no
+filesystem formatting tools or image downloads. The kernel and boot disk are
+cached by embedded digest under `~/.terra/cache/`.
 
-The guest is always Alpine Linux, built for the same CPU as the host — a box
-runs on the hardware the host runs on, so `make` derives `ARCH` from `uname -m`
-and builds the kernel, the rootfs and the agent for it. Both Linux archs are
-built natively in CI.
+Guest RAM is demand-backed and Linux reports free pages through the memory
+component for native discard. Guest capacity stays fixed; host RSS includes
+runtime overhead and reclaim is asynchronous. The kernel command line uses
+`init_on_alloc=1 init_on_free=1`: allocation and free-time clearing remain
+enabled. See [usage](docs/usage.md) and
+[security](docs/security.md) for the user contract and isolation limits.
 
-`make cross` is the separate case: it cross-builds the *host* binary with
-[`cargo-zigbuild`](https://github.com/rust-cross/cargo-zigbuild) and does **not**
-rebuild the guest set, so its output embeds the building machine's guest images.
+Guest ext4 images are not byte reproducible: filesystem UUIDs, timestamps, and
+compression metadata vary between builds. Pinned APK URLs can disappear from
+Alpine's rolling package repositories; retain verified build downloads when
+rebuilding historical releases.
 
-| target | state |
-|--------|-------|
-| `x86_64-unknown-linux-musl` | supported — builds, boots, e2e green |
-| `aarch64-unknown-linux-musl` | builds natively (`make ARCH=aarch64` on arm hardware); boot suite not yet run on arm. Not a `make cross` target: an x86_64 build host would pair an arm binary with an x86_64 guest |
-| `aarch64-apple-darwin` | compiles end to end; the final link needs the macOS SDK for the `Hypervisor` framework (set `SDKROOT`) |
-| `x86_64-apple-darwin` | libkrun has no Intel-Mac hypervisor backend (its HVF code is aarch64-only), so this needs work upstream that is not a packaging fix. libkrun on macOS is Apple Silicon only |
-| `x86_64-pc-windows-gnu` | unsupported — terra has no Windows platform layer, and libkrun does not build for Windows. See below |
+## Verification
 
-**Windows is not supported yet.** Terra's platform layer is Unix-only: the
-crate deliberately fails to compile on non-Unix targets, and the VM/control
-path uses Unix file descriptors, Unix sockets and signals. The vendored libkrun
-also lacks a Windows VMM backend and currently pulls Unix-only dependencies.
+The [Linux amd64 acceptance report](docs/linux-amd64-acceptance.md) records the
+tested artifact, host, commands, and results for the 2026-09-13 review.
 
-A future port therefore needs both a Windows platform layer in terra and a
-Windows-capable libkrun dependency. `docs/windows-port.md` records this status;
-it is not a verified build recipe.
+```sh
+make verify                 # component builds/tests, kernel-tool tests, fmt, Clippy, rustdoc, workspace tests
+make man                    # generated man pages and shell completions
+```
 
-On Unix, **stopping a box is a signal.** `terra stop` sends `SIGTERM` to the pid
-in the box's `terra.pid`, which the VM process's handler turns into the one-byte
-stop on the control connection — the same path `systemctl stop` takes. A future
-Windows port needs replacements for this signalling path and the other Unix
-APIs used by the host process.
+[crates/terra/src/cli.rs](crates/terra/src/cli.rs) is the source of truth for
+CLI help, man pages and completions. Generated files are not committed.
+After build assets exist, the native Rust fast path is:
 
-That pid lives in the file the box's lock is taken on — one file, so a pid read
-under a held lock is that holder's by construction rather than by anyone
-remembering to sweep a stale one. Nothing but `terra rm` ever unlinks it: the lock
-is on the inode, so replacing the file would leave the next `terra` locking a
-different one. A future Windows port must provide an equivalent lock primitive
-while preserving those ownership and identity guarantees.
+```sh
+cargo fmt --all -- --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace
+```
 
-The current Unix-specific host code includes the box lock, Unix sockets, file
-descriptors, file modes and signal handling. These are the areas a future
-Windows platform layer must replace; the rest of the CLI and recipe model is
-platform-neutral.
-
-The filesystem work that genuinely needs Linux happens inside the guest.
-
-## Release gate
-
-`cargo test` covers config parsing, egress-policy construction, boot-plan
-construction, and e2e CLI behavior (exit codes, stdout/stderr) — but not a real
-boot. Before tagging a release, run the boot suite on a host with `/dev/kvm`
-(CI runs it on every push):
+Real Linux guest gates require `/dev/kvm`:
 
 ```sh
 make dist
-TERRA_BIN=$PWD/dist/terra cargo test -p terra --test boot -- --ignored
+make test-component-boot
+make test-component-vmm
 ```
 
-The suite is an ordinary `#[ignore]`d cargo integration test
-([`crates/terra/tests/boot.rs`](crates/terra/tests/boot.rs)); config assets live
-in [`crates/terra/tests/assets/`](crates/terra/tests/assets/). It boots real
-microVMs and asserts what unit tests can't:
+These exercise platform/device integration, CLI boots, mounts, networking,
+capacity and memory growth/reclamation. Ignored tests are not covered by an
+ordinary workspace test pass. CI runs Linux VM gates when KVM is available;
+see the [build workflow](.github/workflows/build.yml) for exact conditions.
 
-- **egress** — an allowlisted host is reachable, an unallowed one is blocked.
-- **ownership** — the workload runs as terri (or uid 0 under `--root`), but the
-  filesystem *always* maps to terri: `/work` and volumes are terri-owned and
-  writable, files land owned by the launching host user, and `--root` changes only
-  the exec uid, never the on-disk ownership.
-- **ports + isolation** — one VM publishes a port; a second VM reaches it *only*
-  with a `hosts:` record naming the host plus the `allow:` rule opening that
-  port, and a third VM with neither is blocked (the always-on egress floor).
+macOS and Windows have an opt-in `native_vm_tests` workflow input. After a native
+host build (and signing on macOS), run:
+
+```sh
+TERRA_BIN="$PWD/dist/terra" cargo test --locked -p terra --test native_boot -- --ignored --nocapture
+```
+
+On Windows PowerShell:
+
+```powershell
+$env:TERRA_BIN = (Resolve-Path ./dist/terra.exe).Path
+cargo test --locked -p terra --test native_boot -- --ignored --nocapture
+```
+
+Those gates cover guest CPUs, hooks, writable/read-only mounts, granted networking,
+volume persistence, and rootless Podman image import/run/stop on a private disk.
+The Podman gate downloads Alpine packages during setup and needs public egress. Native adapter code and a cross-target check alone do
+not establish guest acceptance; outstanding host validation is in [todo.md](todo.md).
+
+Network policy coverage and boundary fuzzing use the existing tools:
+
+```sh
+python3 scripts/coverage-network-policy.py
+cargo +nightly-2026-09-07 fuzz run network_policy -- -max_total_time=60 -max_len=4096
+cargo +nightly-2026-09-07 fuzz run native_memory -- -max_total_time=60 -max_len=32768
+```
+
+Coverage requires matching LLVM tools (`LLVM_COV` and `LLVM_PROFDATA` can override
+the paths); fuzzing requires cargo-fuzz. Coverage measures the policy component's
+native Rust logic, and native sanitizers do not instrument AOT Wasm. Preserve
+minimized findings in `fuzz/corpus/` and add regressions for the violated property.
+
+## Component toolchain
+
+Runtime versions are pinned in [terra-runtime/Cargo.toml](crates/terra-runtime/Cargo.toml),
+component bindings in the component manifests, and component build commands in
+[Makefile](Makefile). Vendored [WASI interfaces](components/wit/wasi/README.md)
+are version 0.3.1. The `wasi_version` runtime integration test checks the actual
+filesystem component's imports and linkage; update that test, the WIT and host
+bindings together when changing runtime versions.
+
+Production shared memory is disabled. `make verify` also runs the feature-gated
+`shared_component_memory` and `shared_worker_memory` experiments. Those probes
+exercise core-Wasm sharing and component API limitations; they do not establish
+a supported transport between the generated device components.
+
+## Performance tools
+
+Keep comparison binaries outside version control and record their hashes with
+results. Existing Linux/KVM tools provide repeatable comparisons:
+
+```sh
+python3 scripts/bench-vmm.py --legacy /path/to/baseline --component dist/terra --output build/vmm-comparison.json
+python3 scripts/bench-shared-irqs.py --baseline /path/to/baseline --candidate dist/terra --output build/irq-comparison.json
+```
+
+Use `--help` for repetitions and workloads. The VMM tool measures readiness,
+CPU/block/mount workloads, sampled RSS, idle CPU and terminal round trips; the
+IRQ tool exercises shared mount/volume interrupt pools. Historical snapshots
+and test counts are available in Git history rather than maintained as current
+performance claims.
+
+## Release source archives
+
+`make source-dist` packages the committed checkout, pinned Linux and e2fsprogs
+sources, and the Alpine package recipes, patches and upstream sources used by
+the guest image. Source collection needs network access and Podman; `abuild`
+checks downloads against the checksums in each pinned APKBUILD.
+
+Releases publish `terra-source.tar.gz` beside the binaries. The ARM64 guest
+job also publishes `terra-alpine-aarch64-source.tar.gz` from its own package
+inventory. Each Alpine source archive includes the installed-package database
+and a manifest recording source origins and aports commits.
 
 ## Troubleshooting
 
-- **`failed to find tool "x86_64-linux-musl-gcc"`** — `zig` isn't on `PATH`.
-  The musl C toolchain is provided by `zig` via `scripts/zig-musl-*`.
-- **link error building `terra`** — the kernel ELF isn't built yet. Use
-  `make build` to build `vmlinux` first.
-- **kernel build fails** — missing kernel build deps (`flex`, `bison`, `bc`,
-  `libelf`/`elfutils`, `openssl` dev headers).
-- **the guest can't reach anything** — the default mode is `allowlist` with no
-  rules, which is *no network*. The boot banner says which posture is in force;
-  add `allow:` rules to the recipe, or set `mode: unrestricted-public`, then
-  `terra setup` to re-pin it.
-- **a connection is blocked and you don't know why** — run `terra logs`.
-  A blocked *name* logs `virtio-net: blocking DNS query by allow-host policy
-  name=…`, which is the rule you are missing; a connection to a bare IP logs
-  `virtio-net: blocking outbound connection by egress policy` with the
-  destination, so add that address or CIDR and retry.
+- **musl C compiler not found:** put Zig on `PATH`; `scripts/zig-musl-*` supplies the toolchain.
+- **kernel build fails:** check unprivileged Podman, then rerun `make kernel`. Fix pin/configuration mismatches before retrying an import.
+- **image build fails at `unshare`:** check the host's unprivileged-user-namespace policy. Images must be built with correct root ownership.
+- **guest network is blocked:** inspect `terra logs`, adjust recipe `allow:` rules or network mode, then run `terra setup` to pin the change.

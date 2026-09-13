@@ -4,26 +4,49 @@
 use crate::state::{BoxRef, Holder, VmProcess};
 use crate::sys;
 use anyhow::{Context, Result};
+#[cfg(any(windows, test))]
+use std::io::Write as _;
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-fn signal_vm(bx: &BoxRef, signal: sys::VmSignal) -> Result<Option<VmProcess>> {
+fn signal_vm(bx: &BoxRef, signal: sys::VmSignal) -> Result<Option<(VmProcess, sys::SignalResult)>> {
     let Some(vm) = bx.read_vm_process() else {
         return Ok(None);
     };
-    sys::signal_pid(vm.pid, vm.started_at, signal)
+    #[cfg(windows)]
+    if matches!(signal, sys::VmSignal::GracefulStop) {
+        return request_graceful_stop(bx).map(|()| Some((vm, sys::SignalResult::Sent)));
+    }
+    let result = sys::signal_pid(vm.pid, vm.started_at, signal)
         .with_context(|| format!("signalling the VM process (pid {}) of {bx}", vm.pid))?;
-    Ok(Some(vm))
+    Ok(Some((vm, result)))
+}
+
+#[cfg(any(windows, test))]
+fn request_graceful_stop(bx: &BoxRef) -> Result<()> {
+    let path = bx.get_dir().join(crate::state::CONTROL_SOCKET);
+    let mut control = terra_io::local::LocalStream::connect(&path)
+        .with_context(|| format!("connecting to {bx}'s stop service"))?;
+    control
+        .write_all(&[terra_protocol::STOP_SIGNAL])
+        .with_context(|| format!("asking {bx} to stop"))
 }
 
 /// Ask the box's VM to stop, returning it for the forced kill if the grace
 /// runs out; `Ok(None)` means the box was already stopped.
-fn request_stop(bx: &BoxRef, deadline: Instant) -> Result<Option<VmProcess>> {
+fn request_stop(
+    bx: &BoxRef,
+    deadline: Instant,
+    setup_action: SetupAction,
+) -> Result<Option<(VmProcess, sys::SignalResult)>> {
     loop {
         match bx.get_holder() {
             Holder::Free => return Ok(None),
-            Holder::SettingUp if bx.read_vm_process().is_none() => {
+            Holder::SettingUp
+                if matches!(setup_action, SetupAction::Refuse)
+                    || bx.read_vm_process().is_none() =>
+            {
                 return Err(bx.setup_holds_it());
             }
             Holder::Running | Holder::SettingUp => {}
@@ -60,27 +83,45 @@ pub(crate) enum StopOutcome {
     AlreadyStopped,
     StoppedGracefully,
     Killed,
+    /// The published pid did not identify the process holding this box.
+    IdentityUnknown,
     /// Still holding the box after `SIGKILL` - a VM process wedged in the
     /// kernel.
     Wedged,
 }
 
-pub(crate) fn stop_and_wait(bx: &BoxRef, grace: Duration) -> Result<StopOutcome> {
+#[derive(Clone, Copy)]
+pub(crate) enum SetupAction {
+    Refuse,
+    Stop,
+}
+
+pub(crate) fn stop_and_wait(
+    bx: &BoxRef,
+    grace: Duration,
+    setup_action: SetupAction,
+) -> Result<StopOutcome> {
     let deadline = sys::deadline_after(grace);
-    let Some(vm) = request_stop(bx, deadline)? else {
+    let Some((vm, signal_result)) = request_stop(bx, deadline, setup_action)? else {
         return Ok(StopOutcome::AlreadyStopped);
     };
     eprintln!("terra: stopping {bx} (pid {})", vm.pid);
     if wait_until_stopped(bx, deadline) {
         return Ok(StopOutcome::StoppedGracefully);
     }
+    if signal_result == sys::SignalResult::IdentityUnknown {
+        return Ok(StopOutcome::IdentityUnknown);
+    }
     eprintln!(
         "terra: {bx} did not stop within {}s - killing pid {}",
         grace.as_secs(),
         vm.pid
     );
-    sys::signal_pid(vm.pid, vm.started_at, sys::VmSignal::ForcedStop)
+    let signal_result = sys::signal_pid(vm.pid, vm.started_at, sys::VmSignal::ForcedStop)
         .with_context(|| format!("killing the VM process (pid {}) of {bx}", vm.pid))?;
+    if signal_result == sys::SignalResult::IdentityUnknown {
+        return Ok(StopOutcome::IdentityUnknown);
+    }
     Ok(if wait_until_stopped(bx, Instant::now() + KILL_REAP_WAIT) {
         StopOutcome::Killed
     } else {
@@ -94,11 +135,14 @@ pub fn run(
     project_dir: &Path,
 ) -> Result<ExitCode> {
     let bx = &crate::resolve::resolve_pinned_box(project_dir, name)?;
-    let stopped = stop_and_wait(bx, Duration::from_secs(args.wait))
+    let stopped = stop_and_wait(bx, Duration::from_secs(args.wait), SetupAction::Refuse)
         .context("could not stop the box - `terra rm --force` takes it away regardless")?;
     match stopped {
         StopOutcome::AlreadyStopped => eprintln!("terra: {bx} is already stopped"),
         StopOutcome::StoppedGracefully | StopOutcome::Killed => eprintln!("terra: {bx} stopped"),
+        StopOutcome::IdentityUnknown => {
+            anyhow::bail!("{bx} is still held but its VM process identity is unknown")
+        }
         StopOutcome::Wedged => anyhow::bail!(
             "{bx} is still running after SIGKILL - its VM process is wedged in the kernel"
         ),
@@ -122,6 +166,24 @@ mod tests {
         (bx, home)
     }
 
+    #[test]
+    fn graceful_stop_reaches_the_box_control_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bx, _home) = create_box_in(dir.path());
+        let listener =
+            terra_io::local::LocalListener::bind(bx.get_dir().join(crate::state::CONTROL_SOCKET))
+                .unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0];
+            stream.read_exact(&mut request).unwrap();
+            request
+        });
+
+        request_graceful_stop(&bx).unwrap();
+        assert_eq!(server.join().unwrap(), [terra_protocol::STOP_SIGNAL]);
+    }
+
     /// A child holding the box exactly as a VM process does - on the inherited
     /// lock descriptor - with its pid published. `shell` decides what it does
     /// about SIGTERM, and must echo a byte once it has: a signal that arrives
@@ -131,8 +193,9 @@ mod tests {
         let lock = bx.lock_run().unwrap();
         let mut cmd = Command::new("/bin/sh");
         cmd.arg("-c").arg(shell).stdout(Stdio::piped());
-        sys::pass_lock(&mut cmd, &lock);
+        let inheritance = sys::pass_lock(&mut cmd, &lock).unwrap();
         let mut child = cmd.spawn().unwrap();
+        drop(inheritance);
         bx.publish_pid(&lock, child.id(), false);
         // From here the child alone holds the box, as it does after a boot.
         drop(lock);
@@ -153,7 +216,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (bx, _home) = create_box_in(dir.path());
         assert!(matches!(
-            stop_and_wait(&bx, Duration::from_secs(0)).unwrap(),
+            stop_and_wait(&bx, Duration::from_secs(0), SetupAction::Refuse).unwrap(),
             StopOutcome::AlreadyStopped
         ));
     }
@@ -170,7 +233,7 @@ mod tests {
         let _held = bx.lock_run().unwrap();
         assert_eq!(bx.read_vm_process(), None);
 
-        let err = stop_and_wait(&bx, Duration::from_millis(200))
+        let err = stop_and_wait(&bx, Duration::from_millis(200), SetupAction::Refuse)
             .expect_err("a box held with no pid to signal must not read as stopped")
             .to_string();
         assert!(err.contains("published no pid"), "{err}");
@@ -191,9 +254,32 @@ mod tests {
         // long before this grace expires.
         let err = format!(
             "{:#}",
-            stop_and_wait(&bx, Duration::from_mins(1)).expect_err("a bake is refused")
+            stop_and_wait(&bx, Duration::from_mins(1), SetupAction::Refuse)
+                .expect_err("a bake is refused")
         );
         assert!(err.contains("being set up"), "{err}");
+        drop(marked);
+    }
+
+    #[test]
+    fn a_bake_with_a_published_pid_refuses_stop_but_allows_forced_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bx, _home) = create_box_in(dir.path());
+        let lock = bx.lock_run().unwrap();
+        let marked = bx.mark_baking(&lock);
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        bx.publish_pid(&lock, child.id(), true);
+        assert!(matches!(bx.get_holder(), Holder::SettingUp));
+        let error = stop_and_wait(&bx, Duration::ZERO, SetupAction::Refuse)
+            .expect_err("stop must leave setup running");
+        assert!(error.to_string().contains("being set up"));
+        assert!(child.try_wait().unwrap().is_none());
+        assert!(
+            request_stop(&bx, Instant::now(), SetupAction::Stop)
+                .unwrap()
+                .is_some()
+        );
+        assert!(!child.wait().unwrap().success());
         drop(marked);
     }
 
@@ -207,7 +293,7 @@ mod tests {
         let mut child = spawn_vm_child(&bx, "echo up; exec sleep 30");
 
         assert!(matches!(
-            stop_and_wait(&bx, Duration::from_secs(10)).unwrap(),
+            stop_and_wait(&bx, Duration::from_secs(10), SetupAction::Refuse).unwrap(),
             StopOutcome::StoppedGracefully
         ));
         assert!(!bx.get_holder().holds(), "the box is still held");
@@ -228,7 +314,7 @@ mod tests {
         let mut child = spawn_vm_child(&bx, "trap '' TERM; echo up; exec sleep 30");
 
         assert!(matches!(
-            stop_and_wait(&bx, Duration::from_millis(300)).unwrap(),
+            stop_and_wait(&bx, Duration::from_millis(300), SetupAction::Refuse).unwrap(),
             StopOutcome::Killed
         ));
         assert!(!bx.get_holder().holds(), "the box is still held");

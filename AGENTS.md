@@ -25,7 +25,7 @@ should not add elaborate defenses without a new threat-model requirement.
 
 ## Portability
 
-`crates/terra-agent/` and `crates/terra-shared/` must be built with portability in mind for Linux, macOS, and Windows. Isolate platform-specific APIs behind explicit conditional compilation and keep shared code platform-neutral.
+`crates/terra-agent/` and `crates/terra-protocol/` must be built with portability in mind for Linux, macOS, and Windows. Isolate platform-specific APIs behind explicit conditional compilation and keep shared code platform-neutral.
 
 ## Comments
 

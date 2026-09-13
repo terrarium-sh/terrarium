@@ -5,22 +5,32 @@ use crate::term::tty::set_winsize;
 use std::fmt::Display;
 use std::fs::File;
 use std::io::{Read, Write};
+use std::os::fd::AsFd;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+#[cfg(test)]
 use std::sync::mpsc;
-use terra_shared::contract::{
-    AgentOutput, ClientInput, ExecRequest, TermSize, encode_frame, read_frame,
-};
+use std::sync::{Arc, Mutex};
+use terra_protocol::{AgentOutput, ClientInput, ExecRequest, TermSize, encode_frame, read_frame};
 
 const EXEC_NOT_RUN: i32 = 127;
+const EXEC_SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Executes a command request until exit.
 ///
 /// A root-capable channel, deliberately: host-initiated only, matching the file port's authority.
 pub fn serve_exec(mut conn: File, workload_root: bool) {
+    if crate::vsock::set_socket_timeouts(&conn, EXEC_SETUP_TIMEOUT).is_err() {
+        return;
+    }
     let Ok(Some(req)) = read_frame::<ExecRequest>(&mut conn) else {
         let _ = send_exec(&mut conn, &AgentOutput::Exit { code: EXEC_NOT_RUN });
         return;
     };
+    if rustix::net::sockopt::set_socket_timeout(&conn, rustix::net::sockopt::Timeout::Recv, None)
+        .is_err()
+    {
+        return;
+    }
     let Some((cmd, args)) = req.argv.split_first() else {
         let _ = send_exec(&mut conn, &AgentOutput::Exit { code: EXEC_NOT_RUN });
         return;
@@ -51,23 +61,27 @@ fn report_exec_failure<C: std::io::Write>(conn: &mut C, cmd: &str, e: impl Displ
     send_exec(conn, &AgentOutput::Exit { code: EXEC_NOT_RUN });
 }
 
-fn abort_exec<C: std::io::Write>(
-    conn: &mut C,
-    child: &mut std::process::Child,
-    child_pidfd: &OwnedFd,
-) {
+fn abort_exec<C: std::io::Write>(conn: &mut C, child_pidfd: &crate::reap::OwnedPidfd) {
     let _ = rustix::process::pidfd_send_signal(child_pidfd, rustix::process::Signal::KILL);
-    let _ = crate::reap::wait_owned(child);
+    let _ = crate::reap::wait_owned(child_pidfd);
     send_exec(conn, &AgentOutput::Exit { code: EXEC_NOT_RUN });
 }
 
 #[allow(unsafe_code)]
-fn pump_input(mut src: File, out: impl Write, master_fd: Option<RawFd>, child_pidfd: OwnedFd) {
+fn pump_input(
+    mut src: File,
+    out: impl Write + AsFd,
+    master_fd: Option<RawFd>,
+    child_pidfd: OwnedFd,
+) {
     let mut stdin = Some(out);
     loop {
         match read_frame::<ClientInput>(&mut src) {
             Ok(Some(ClientInput::Keys(b))) => {
-                if stdin.as_mut().is_some_and(|out| out.write_all(&b).is_err()) {
+                if stdin
+                    .as_mut()
+                    .is_some_and(|out| write_input(&src, out, &child_pidfd, &b).is_err())
+                {
                     break;
                 }
             }
@@ -88,7 +102,7 @@ fn pump_input(mut src: File, out: impl Write, master_fd: Option<RawFd>, child_pi
             Ok(Some(ClientInput::Eof)) => match master_fd {
                 Some(_) => {
                     if let Some(out) = stdin.as_mut() {
-                        let _ = out.write_all(&[0x04]);
+                        let _ = write_input(&src, out, &child_pidfd, &[0x04]);
                     }
                 }
                 None => drop(stdin.take()),
@@ -101,10 +115,45 @@ fn pump_input(mut src: File, out: impl Write, master_fd: Option<RawFd>, child_pi
     let _ = rustix::process::pidfd_send_signal(child_pidfd, rustix::process::Signal::KILL);
 }
 
+fn write_input(
+    src: &File,
+    out: &mut (impl Write + AsFd),
+    child_pidfd: &OwnedFd,
+    mut bytes: &[u8],
+) -> std::io::Result<()> {
+    use rustix::event::{PollFd, PollFlags, poll};
+
+    let flags = rustix::fs::fcntl_getfl(&mut *out)?;
+    rustix::fs::fcntl_setfl(&mut *out, flags | rustix::fs::OFlags::NONBLOCK)?;
+    while !bytes.is_empty() {
+        let mut fds = [
+            PollFd::new(src, PollFlags::empty()),
+            PollFd::new(out, PollFlags::OUT),
+            PollFd::new(child_pidfd, PollFlags::IN),
+        ];
+        match poll(&mut fds, None) {
+            Ok(_) => {}
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(error) => return Err(error.into()),
+        }
+        if !fds[0].revents().is_empty() || !fds[2].revents().is_empty() {
+            return Err(std::io::ErrorKind::BrokenPipe.into());
+        }
+        match out.write(bytes) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(count) => bytes = &bytes[count..],
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 #[must_use]
-pub(crate) fn wait_for_exit_code(child: &mut std::process::Child) -> i32 {
+pub(crate) fn wait_for_exit_code(pidfd: &crate::reap::OwnedPidfd) -> i32 {
     use std::os::unix::process::ExitStatusExt;
-    crate::reap::wait_owned(child)
+    crate::reap::wait_owned(pidfd)
         .ok()
         .and_then(|s| s.code().or_else(|| s.signal().map(|sig| 128 + sig)))
         .unwrap_or(EXEC_NOT_RUN)
@@ -123,13 +172,13 @@ fn run_exec_on_pty(
     args: &[String],
     as_root: bool,
 ) {
-    let (pty, mut child, child_pidfd) = match crate::init::spawn_on_pty(
+    let (pty, _child, child_pidfd) = match crate::init::spawn_on_pty(
         cmd,
         args,
         rows,
         cols,
         as_root,
-        Some(terra_shared::contract::WORKLOAD_HOME),
+        Some(terra_protocol::WORKLOAD_HOME),
     ) {
         Ok(pair) => pair,
         Err(e) => return report_exec_failure(&mut conn, cmd, e, true),
@@ -137,27 +186,27 @@ fn run_exec_on_pty(
 
     let master: OwnedFd = pty.into();
     let Ok(reader) = master.try_clone() else {
-        return abort_exec(&mut conn, &mut child, &child_pidfd);
+        return abort_exec(&mut conn, &child_pidfd);
     };
     let input = std::fs::File::from(master);
     let master_fd = input.as_raw_fd();
 
     let Ok(from_host) = conn.try_clone() else {
-        return abort_exec(&mut conn, &mut child, &child_pidfd);
+        return abort_exec(&mut conn, &child_pidfd);
     };
     let Ok(input_pidfd) = child_pidfd.try_clone() else {
-        return abort_exec(&mut conn, &mut child, &child_pidfd);
+        return abort_exec(&mut conn, &child_pidfd);
     };
     let input = std::thread::spawn(move || {
         pump_input(from_host, input, Some(master_fd), input_pidfd);
     });
 
     let mut reader = std::fs::File::from(reader);
-    let output_ok = pump_copy(&mut reader, |chunk| {
+    let output_ok = pump_pty_output(&mut reader, |chunk| {
         send_exec(&mut conn, &AgentOutput::Out(chunk.to_vec()))
     });
     if !output_ok {
-        abort_exec(&mut conn, &mut child, &child_pidfd);
+        abort_exec(&mut conn, &child_pidfd);
         let _ = rustix::net::shutdown(&conn, rustix::net::Shutdown::Both);
         let _ = input.join();
         return;
@@ -165,7 +214,7 @@ fn run_exec_on_pty(
     send_exec(
         &mut conn,
         &AgentOutput::Exit {
-            code: wait_for_exit_code(&mut child),
+            code: wait_for_exit_code(&child_pidfd),
         },
     );
     // Without this, a host keeping the connection open would leak the socket and PTY master.
@@ -181,7 +230,7 @@ fn run_exec_on_pipes(mut conn: File, cmd: &str, args: &[String], as_root: bool) 
     let mut command = std::process::Command::new(cmd);
     command
         .args(args)
-        .env("HOME", terra_shared::contract::WORKLOAD_HOME)
+        .env("HOME", terra_protocol::WORKLOAD_HOME)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -199,57 +248,130 @@ fn run_exec_on_pipes(mut conn: File, cmd: &str, args: &[String], as_root: bool) 
     let (Some(stdin), Some(stdout), Some(stderr)) =
         (child.stdin.take(), child.stdout.take(), child.stderr.take())
     else {
-        return abort_exec(&mut conn, &mut child, &child_pidfd);
+        return abort_exec(&mut conn, &child_pidfd);
     };
 
     let Ok(from_host) = conn.try_clone() else {
-        return abort_exec(&mut conn, &mut child, &child_pidfd);
+        return abort_exec(&mut conn, &child_pidfd);
     };
     let Ok(input_pidfd) = child_pidfd.try_clone() else {
-        return abort_exec(&mut conn, &mut child, &child_pidfd);
+        return abort_exec(&mut conn, &child_pidfd);
     };
     let input = std::thread::spawn(move || pump_input(from_host, stdin, None, input_pidfd));
 
-    let (output_tx, output_rx) = mpsc::sync_channel(16);
-    let output_writer = std::thread::spawn(move || {
-        let mut conn = conn;
-        let output_ok = output_rx
-            .into_iter()
-            .all(|message| send_exec(&mut conn, &message));
-        (conn, output_ok)
-    });
-    let stdout_pump = pump_stream(stdout, output_tx.clone(), AgentOutput::Out);
-    let stderr_pump = pump_stream(stderr, output_tx, AgentOutput::Err);
+    let conn = Arc::new(Mutex::new(conn));
+    let child_pidfd = Arc::new(child_pidfd);
+    let stdout_pump = pump_stream(stdout, conn.clone(), AgentOutput::Out, child_pidfd.clone());
+    let stderr_pump = pump_stream(stderr, conn.clone(), AgentOutput::Err, child_pidfd.clone());
     let stdout_ok = stdout_pump.join().unwrap_or(false);
     let stderr_ok = stderr_pump.join().unwrap_or(false);
-    let Ok((mut conn, output_ok)) = output_writer.join() else {
+    let mut conn = crate::mutex::lock_or_abort(&conn);
+    if !stdout_ok || !stderr_ok {
         let _ = rustix::process::pidfd_send_signal(&child_pidfd, rustix::process::Signal::KILL);
-        let _ = crate::reap::wait_owned(&mut child);
-        let _ = input.join();
-        return;
-    };
-    if !stdout_ok || !stderr_ok || !output_ok {
-        let _ = rustix::process::pidfd_send_signal(&child_pidfd, rustix::process::Signal::KILL);
-        let _ = crate::reap::wait_owned(&mut child);
-        send_exec(&mut conn, &AgentOutput::Exit { code: EXEC_NOT_RUN });
-        let _ = rustix::net::shutdown(&conn, rustix::net::Shutdown::Both);
+        let _ = crate::reap::wait_owned(&child_pidfd);
+        send_exec(&mut *conn, &AgentOutput::Exit { code: EXEC_NOT_RUN });
+        let _ = rustix::net::shutdown(&*conn, rustix::net::Shutdown::Both);
         let _ = input.join();
         return;
     }
 
-    let code = wait_for_exit_code(&mut child);
-    send_exec(&mut conn, &AgentOutput::Exit { code });
+    let code = wait_for_exit_code(&child_pidfd);
+    send_exec(&mut *conn, &AgentOutput::Exit { code });
     // Without this, a host keeping the connection open would leak a thread.
-    let _ = rustix::net::shutdown(&conn, rustix::net::Shutdown::Read);
+    let _ = rustix::net::shutdown(&*conn, rustix::net::Shutdown::Read);
     let _ = input.join();
 }
 
-fn pump_stream<R: Read + Send + 'static>(
-    src: R,
-    output_tx: mpsc::SyncSender<AgentOutput>,
+fn pump_stream<R: Read + AsFd + Send + 'static>(
+    mut src: R,
+    conn: Arc<Mutex<File>>,
     wrap: fn(Vec<u8>) -> AgentOutput,
+    child_pidfd: Arc<crate::reap::OwnedPidfd>,
 ) -> std::thread::JoinHandle<bool> {
-    std::thread::spawn(move || pump_copy(src, |chunk| output_tx.send(wrap(chunk.to_vec())).is_ok()))
+    std::thread::spawn(move || {
+        let result = pump_pipe_output(&mut src, &child_pidfd, |chunk| {
+            let mut conn = crate::mutex::lock_or_abort(&conn);
+            send_exec(&mut *conn, &wrap(chunk.to_vec()))
+        });
+        if !result {
+            let _ =
+                rustix::process::pidfd_send_signal(&*child_pidfd, rustix::process::Signal::KILL);
+        }
+        result
+    })
+}
+
+fn pump_pipe_output<R: Read + AsFd>(
+    src: &mut R,
+    child_pidfd: &crate::reap::OwnedPidfd,
+    mut write: impl FnMut(&[u8]) -> bool,
+) -> bool {
+    use rustix::event::{PollFd, PollFlags, poll};
+    let mut deadline: Option<std::time::Instant> = None;
+    let mut bytes = [0; 8192];
+    loop {
+        let timeout = if let Some(deadline) = deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return true;
+            }
+            Some(rustix::event::Timespec::try_from(remaining).unwrap_or_default())
+        } else {
+            None
+        };
+        let mut fds = [
+            PollFd::new(&*src, PollFlags::IN),
+            PollFd::new(child_pidfd, PollFlags::IN),
+        ];
+        let watched = if deadline.is_some() {
+            &mut fds[..1]
+        } else {
+            &mut fds[..]
+        };
+        match poll(watched, timeout.as_ref()) {
+            Ok(_) => {}
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(_) => return false,
+        }
+        if deadline.is_none() && !fds[1].revents().is_empty() {
+            deadline = Some(std::time::Instant::now() + crate::init::OUTPUT_DRAIN_GRACE);
+        }
+        if fds[0].revents().is_empty() {
+            continue;
+        }
+        match src.read(&mut bytes) {
+            Ok(0) => return true,
+            Ok(count) if !write(&bytes[..count]) => return false,
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return false,
+        }
+    }
+}
+
+fn pump_pty_output<R: Read + AsFd, F: FnMut(&[u8]) -> bool>(mut src: R, mut write: F) -> bool {
+    use rustix::event::{PollFd, PollFlags, poll};
+
+    let mut buf = [0u8; 8192];
+    loop {
+        match src.read(&mut buf) {
+            Ok(0) => return true,
+            Ok(count) if !write(&buf[..count]) => return false,
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                let mut fds = [PollFd::new(&src, PollFlags::IN)];
+                match poll(&mut fds, None) {
+                    Ok(_) | Err(rustix::io::Errno::INTR) => {}
+                    Err(_) => return false,
+                }
+            }
+            Err(error) if error.raw_os_error() == Some(rustix::io::Errno::IO.raw_os_error()) => {
+                return true;
+            }
+            Err(_) => return false,
+        }
+    }
 }
 
 pub(crate) fn pump_copy<R: Read, F: FnMut(&[u8]) -> bool>(mut src: R, mut write: F) -> bool {
@@ -265,7 +387,7 @@ pub(crate) fn pump_copy<R: Read, F: FnMut(&[u8]) -> bool>(mut src: R, mut write:
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => return true,
+            Err(_) => return false,
         }
     }
 }
@@ -295,6 +417,18 @@ mod tests {
     }
 
     #[test]
+    fn pipe_exec_finishes_when_a_descendant_keeps_output_open() {
+        let started = std::time::Instant::now();
+        let (out, err, code) = run_exec_request(
+            &["sh", "-c", "sleep 5 & printf done; printf err >&2; exit 7"],
+            false,
+            &[],
+        );
+        assert_eq!((out, err, code), (b"done".to_vec(), b"err".to_vec(), 7));
+        assert!(started.elapsed() < Duration::from_secs(4));
+    }
+
+    #[test]
     fn pump_copy_retries_interrupted_reads() {
         let mut output = Vec::new();
         assert!(!pump_copy(
@@ -305,6 +439,19 @@ mod tests {
             }
         ));
         assert_eq!(output, b"x");
+    }
+
+    struct ReadError;
+
+    impl Read for ReadError {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("read failed"))
+        }
+    }
+
+    #[test]
+    fn pump_copy_reports_read_errors() {
+        assert!(!pump_copy(ReadError, |_| true));
     }
 
     fn run_exec_request(argv: &[&str], is_tty: bool, stdin: &[u8]) -> (Vec<u8>, Vec<u8>, i32) {
@@ -318,19 +465,16 @@ mod tests {
         let server = File::from(std::os::fd::OwnedFd::from(server));
         let agent = std::thread::spawn(move || serve_exec(server, true));
         client
-            .write_all(&terra_shared::contract::encode_frame(&req).unwrap())
+            .write_all(&terra_protocol::encode_frame(&req).unwrap())
             .unwrap();
         if !stdin.is_empty() {
             client
                 .write_all(
-                    &terra_shared::contract::encode_frame(&ClientInput::Keys(stdin.to_vec()))
-                        .unwrap(),
+                    &terra_protocol::encode_frame(&ClientInput::Keys(stdin.to_vec())).unwrap(),
                 )
                 .unwrap();
         }
-        client
-            .write_all(&terra_shared::contract::encode_frame(&ClientInput::Eof).unwrap())
-            .unwrap();
+        let _ = client.write_all(&terra_protocol::encode_frame(&ClientInput::Eof).unwrap());
 
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let code = loop {
@@ -399,14 +543,49 @@ mod tests {
         drop(client);
         done_rx.recv_timeout(HARNESS_TIMEOUT).unwrap();
         std::thread::sleep(Duration::from_millis(100));
-        let killed_on_disconnect = child.try_wait().unwrap().is_some();
+        let killed_on_disconnect = matches!(
+            rustix::process::waitid(
+                rustix::process::WaitId::PidFd(pidfd.as_fd()),
+                rustix::process::WaitIdOptions::EXITED
+                    | rustix::process::WaitIdOptions::NOHANG
+                    | rustix::process::WaitIdOptions::NOWAIT,
+            ),
+            Ok(Some(_)) | Err(rustix::io::Errno::CHILD)
+        );
         if !killed_on_disconnect {
             let _ = rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::KILL);
         }
-        let _ = crate::reap::wait_owned(&mut child);
+        let _ = crate::reap::wait_owned(&pidfd);
 
         assert!(!finished_after_eof, "the input thread stopped at EOF");
         assert!(killed_on_disconnect, "the child survived the disconnect");
+    }
+
+    #[test]
+    fn a_full_stdin_pipe_does_not_hold_the_input_thread_after_disconnect() {
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("while :; do sleep 1; done")
+            .stdin(std::process::Stdio::piped());
+        let (mut child, pidfd) = crate::reap::spawn_owned(|| command.spawn()).unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.set_write_timeout(Some(HARNESS_TIMEOUT)).unwrap();
+        let server = File::from(std::os::fd::OwnedFd::from(server));
+        let input_pidfd = pidfd.try_clone().unwrap();
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            pump_input(server, stdin, None, input_pidfd);
+            let _ = done_tx.send(());
+        });
+
+        client
+            .write_all(&encode_frame(&ClientInput::Keys(vec![b'x'; 1 << 20])).unwrap())
+            .unwrap();
+        drop(client);
+        done_rx.recv_timeout(HARNESS_TIMEOUT).unwrap();
+        let _ = crate::reap::wait_owned(&pidfd);
     }
 
     /// The interactive half. A PTY is what makes an exec'd shell usable, and the
@@ -425,6 +604,16 @@ mod tests {
         assert!(seen.contains("ERR"), "stderr should interleave: {seen:?}");
         assert!(err.is_empty(), "a PTY exec has no separate stderr: {err:?}");
         assert_eq!(code, 3, "a PTY exec must report the command's own status");
+    }
+
+    #[test]
+    fn a_tty_exec_delivers_input_to_its_command() {
+        let (out, _, code) = run_exec_request(&["cat"], true, b"payload\n");
+        assert!(
+            out.windows(b"payload".len())
+                .any(|bytes| bytes == b"payload")
+        );
+        assert_eq!(code, 0);
     }
 
     /// A command killed by a signal reports `128 + signal`, the shell's own

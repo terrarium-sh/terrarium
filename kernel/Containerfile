@@ -1,0 +1,11 @@
+FROM docker.io/crops/poky@sha256:58186f69ce7ef45cc4f805b1248c9ab5346cbf3e9cb9bcb2b3ccbd8e18191a72
+USER root
+RUN rm -f /etc/apt/sources.list /etc/apt/sources.list.d/* && \
+    printf '%s\n' \
+      'deb https://snapshot.debian.org/archive/debian/20260901T000000Z/ bookworm main' \
+      'deb https://snapshot.debian.org/archive/debian-security/20260901T000000Z/ bookworm-security main' \
+      > /etc/apt/sources.list && \
+    apt-get -o Acquire::Check-Valid-Until=false update && \
+    apt-get -o Acquire::Check-Valid-Until=false install -y --no-install-recommends \
+      flex bison bc libelf-dev libssl-dev gcc-aarch64-linux-gnu && \
+    rm -rf /var/lib/apt/lists/*

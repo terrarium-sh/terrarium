@@ -4,13 +4,42 @@ Copyright 2026 Berry Studio s.r.o.
 This product includes software developed as part of the Terrarium project,
 licensed under the Apache License, Version 2.0 (see LICENSE).
 
-This product builds libkrun from the upstream project
-(https://github.com/libkrun/libkrun), Copyright the libkrun authors, licensed
-under the Apache License, Version 2.0. The vendored submodule lives under
-vendor/libkrun/.
+This product includes `terra-network`, a Terra-maintained derivative of
+smolvm-network from https://github.com/cryi/smolvm, commit d2573ac. Copyright smolvm contributors; licensed
+under Apache-2.0. See crates/terra-network/LICENSE and
+crates/terra-network/PROVENANCE.md.
 
-This product also includes the patched network stack from smolvm
-(https://github.com/smol-machines/smolvm), Copyright the smol-machines authors,
-licensed under the Apache License, Version 2.0. The vendored submodule lives
-under vendor/smolvm/; its Terrarium-specific changes are intended to be
-upstreamed but have not yet been.
+This product includes WASI filesystem, socket, clock, and random interface
+specifications from WebAssembly/WASI v0.3.1, commit
+59e48bfe3fae9bf2480eb15abd8f55999eb3b395
+(https://github.com/WebAssembly/WASI). The upstream license notice is included
+in packaging/licenses/WASI-W3C.txt.
+
+macOS Apple Silicon releases use applevisor 1.0.0
+(https://github.com/Impalabs/applevisor), licensed under MIT. The full MIT
+license is in packaging/licenses/applevisor-MIT.txt. It links Apple's
+Hypervisor.framework and does not include Apple framework code.
+
+Windows releases use windows-sys 0.61 (https://github.com/microsoft/windows-rs),
+Copyright (c) Microsoft Corporation, under Apache-2.0. It supplies generated
+Windows Hypervisor Platform bindings and does not include a third-party
+hypervisor backend.
+
+Windows releases use uds_windows 1.2.1
+(https://github.com/haraldh/rust_uds_windows), Copyright (c) Microsoft
+Corporation, under MIT. The full license is in
+packaging/licenses/uds_windows-MIT.txt; its bundled third-party notices are in
+packaging/licenses/uds_windows-THIRDPARTYNOTICES.txt. It supplies the native
+AF_UNIX control channel implementation.
+
+The Windows ARM64 Hypervisor Platform register values come from Microsoft
+WinHvPlatformDefs.h, Copyright (c) Microsoft Corporation, under MIT.
+The Microsoft MIT license text is included in
+packaging/licenses/uds_windows-MIT.txt.
+
+Terrarium embeds Linux and e2fsprogs programs licensed under GPL-2.0-only,
+and an Alpine Linux root filesystem containing GPL-licensed programs.
+The GPL text is included in LICENSES/GPL-2.0.txt (packaging/licenses/GPL-2.0.txt
+in the source tree). Corresponding source, package patches and build scripts
+are published beside the binaries as `terra-source.tar.gz` and
+`terra-alpine-aarch64-source.tar.gz`.

@@ -8,8 +8,6 @@ mod exec;
 #[cfg(target_os = "linux")]
 mod files;
 #[cfg(target_os = "linux")]
-mod idmap;
-#[cfg(target_os = "linux")]
 mod init;
 #[cfg(target_os = "linux")]
 mod mutex;
@@ -25,12 +23,19 @@ mod vsock;
 
 #[cfg(target_os = "linux")]
 fn main() {
-    let failed = init::boot();
-    std::process::exit(i32::from(failed));
+    init::boot();
 }
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
     eprintln!("terra-agent only runs on Linux");
     std::process::exit(1);
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn create_scratch_path(module: &str, name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "terra-agent-{module}-{}-{name}",
+        std::process::id()
+    ))
 }

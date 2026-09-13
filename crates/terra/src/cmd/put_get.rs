@@ -3,19 +3,22 @@
 //! timeout below is there because a workload controls what comes back.
 
 use crate::sys;
+use crate::vm::image;
 use anyhow::{Context, Result};
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
-use terra_shared::contract::{
-    AgentService, FileReply, FileRequest, MAX_FILE_BYTES, encode_frame, read_frame,
+use terra_protocol::{
+    AgentService, FileReply, FileRequest, MAX_FILE_BYTES, encode_frame, read_frame_with_limit,
 };
+
+const MAX_FILE_REPLY_FRAME_BYTES: usize = 64 * 1024;
 
 const COPY_STALL_TIMEOUT: Duration = Duration::from_mins(1);
 
-const COPY_TOTAL_TIMEOUT: Duration = Duration::from_hours(1);
+const COPY_DATA_TIMEOUT: Duration = Duration::from_hours(1);
 
 /// Copy one file into or out of a running box
 // ponytail: single files only. Directories would put an archive format on the
@@ -43,7 +46,7 @@ pub fn run(
     stream
         .set_write_timeout(Some(COPY_STALL_TIMEOUT))
         .context("setting copy write timeout")?;
-    let deadline = Instant::now() + COPY_TOTAL_TIMEOUT;
+    let deadline = Instant::now() + COPY_DATA_TIMEOUT;
 
     match direction {
         Direction::IntoBox => send_file_into_box(&mut stream, host, guest, deadline),
@@ -52,7 +55,7 @@ pub fn run(
 }
 
 fn read_reply(stream: &mut impl Read) -> Result<FileReply> {
-    let rep = read_frame(stream)
+    let rep = read_frame_with_limit(stream, MAX_FILE_REPLY_FRAME_BYTES)
         .context("reading the agent's reply")?
         .ok_or_else(|| anyhow::anyhow!("agent closed connection without replying"))?;
     match rep {
@@ -78,23 +81,24 @@ fn copy_at_most(
     while sent < size {
         if Instant::now() >= deadline {
             anyhow::bail!(
-                "{what} ran past its {}s overall limit - the other end kept the \
+                "{what} ran past its {}s data transfer limit - the other end kept the \
                  transfer open without finishing it",
-                COPY_TOTAL_TIMEOUT.as_secs()
+                COPY_DATA_TIMEOUT.as_secs()
             );
         }
         let want = usize::min(buf.len(), usize::try_from(size - sent).unwrap_or(buf.len()));
-        let n = from.read(&mut buf[..want]).context(what.to_string())?;
+        let n = match from.read(&mut buf[..want]) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result.with_context(|| what.to_string())?,
+        };
         if n == 0 {
             break;
         }
         match to {
             CopyTarget::Plain(to) => to.write_all(&buf[..n]).context(what.to_string())?,
-            CopyTarget::Sparse(to) if buf[..n].iter().all(|byte| *byte == 0) => {
-                to.seek(SeekFrom::Current(i64::try_from(n)?))
-                    .context(what.to_string())?;
+            CopyTarget::Sparse(to) => {
+                image::write_sparse_chunk(to, &buf[..n]).context(what.to_string())?;
             }
-            CopyTarget::Sparse(to) => to.write_all(&buf[..n]).context(what.to_string())?,
         }
         sent += u64::try_from(n).unwrap_or_default();
     }
@@ -137,7 +141,7 @@ fn send_file_into_box(
     guest_path: &str,
     deadline: Instant,
 ) -> Result<ExitCode> {
-    let mut file = sys::open_no_symlinks(Path::new(host_path))
+    let mut file = sys::open_regular_file(Path::new(host_path))
         .with_context(|| format!("opening {host_path}"))?;
     let meta = file
         .metadata()
@@ -201,37 +205,71 @@ fn fetch_file_from_box(
     );
 
     let mut dst_path = PathBuf::from(host_path);
-    if std::fs::symlink_metadata(&dst_path).is_ok_and(|m| m.is_dir()) {
-        let name = Path::new(guest_path)
-            .file_name()
-            .context("guest path has no file name")?;
+    if std::fs::metadata(&dst_path).is_ok_and(|m| m.is_dir()) {
+        let name = extract_guest_file_name(guest_path)?;
         dst_path.push(name);
     }
-    let mut file = sys::create_no_symlinks(&dst_path)
-        .with_context(|| format!("creating {}", dst_path.display()))?;
+    let write_path = match std::fs::metadata(&dst_path) {
+        Ok(metadata) => {
+            anyhow::ensure!(
+                metadata.is_file(),
+                "creating {}: expected a regular file",
+                dst_path.display()
+            );
+            std::fs::canonicalize(&dst_path)
+                .with_context(|| format!("resolving {}", dst_path.display()))?
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::symlink_metadata(&dst_path) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    anyhow::bail!(
+                        "creating {}: destination is a dangling symlink",
+                        dst_path.display()
+                    );
+                }
+                Ok(_) => dst_path.clone(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => dst_path.clone(),
+                Err(error) => {
+                    return Err(error).with_context(|| format!("reading {}", dst_path.display()));
+                }
+            }
+        }
+        Err(error) => return Err(error).with_context(|| format!("reading {}", dst_path.display())),
+    };
+    crate::vm::image::staged_write(&write_path, |file| {
+        let received = copy_at_most(
+            stream,
+            &mut CopyTarget::Sparse(file),
+            size,
+            "receiving the file",
+            deadline,
+        )?;
+        anyhow::ensure!(
+            received == size,
+            "{guest_path} ended after {received} of {size} promised bytes; copy it again"
+        );
+        file.set_len(size)
+            .with_context(|| format!("sizing {}", write_path.display()))?;
+        sys::set_open_file_mode(file, to_safe_mode(mode))
+            .with_context(|| format!("setting permissions on {}", write_path.display()))
+    })?;
+    Ok(report(guest_path, &dst_path.display().to_string(), size))
+}
 
-    let received = copy_at_most(
-        stream,
-        &mut CopyTarget::Sparse(&mut file),
-        size,
-        "receiving the file",
-        deadline,
-    )?;
+fn extract_guest_file_name(guest_path: &str) -> Result<&std::ffi::OsStr> {
+    let name = Path::new(guest_path)
+        .file_name()
+        .context("guest path has no file name")?;
+    #[cfg(windows)]
     anyhow::ensure!(
-        received == size,
-        "{guest_path} ended after {received} of {size} promised bytes; {} holds the \
-         truncated copy - copy it again",
-        dst_path.display()
+        matches!(
+            Path::new(name).components().next(),
+            Some(std::path::Component::Normal(_))
+        ) && Path::new(name).components().nth(1).is_none()
+            && !name.to_string_lossy().contains(':'),
+        "guest file name is invalid on Windows; choose an explicit destination file name"
     );
-    file.set_len(size)
-        .with_context(|| format!("sizing {}", dst_path.display()))?;
-    sys::set_open_file_mode(&file, to_safe_mode(mode))
-        .with_context(|| format!("setting permissions on {}", dst_path.display()))?;
-    Ok(report(
-        guest_path,
-        &dst_path.display().to_string(),
-        received,
-    ))
+    Ok(name)
 }
 
 const MAX_GUEST_ERROR_MESSAGE: usize = 512;
@@ -249,8 +287,19 @@ fn sanitize_guest_error_message(err: &str) -> String {
 /// The permission bits a copy carries into the box: rwx - setuid, setgid and
 /// sticky stay on the host.
 fn to_guest_mode(meta: &std::fs::Metadata) -> u32 {
-    use std::os::unix::fs::PermissionsExt;
-    meta.permissions().mode() & 0o0777
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o0777
+    }
+    #[cfg(windows)]
+    {
+        if meta.permissions().readonly() {
+            0o444
+        } else {
+            0o644
+        }
+    }
 }
 
 /// The permission bits a guest-supplied mode may set on a host file: rwx,
@@ -329,13 +378,32 @@ mod tests {
         GuestEnd(std::io::Cursor::new(script))
     }
 
-    /// A guest that closes the stream short of the promised length must not be
-    /// reported as a completed copy: the stream ending is a clean EOF, so no
-    /// timeout fires, and success here would let a workload fake a full export.
+    #[test]
+    fn oversized_file_reply_is_rejected_before_reading_its_body() {
+        let prefix = u32::try_from(MAX_FILE_REPLY_FRAME_BYTES + 1)
+            .unwrap()
+            .to_le_bytes();
+        let error = read_reply(&mut prefix.as_slice()).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_special_guest_basename_is_refused() {
+        assert!(extract_guest_file_name("/tmp/C:notes").is_err());
+        assert!(extract_guest_file_name("/tmp/notes:stream").is_err());
+    }
+
+    /// A guest that closes the stream short of the promised length must leave
+    /// the existing destination alone.
     #[test]
     fn a_fetch_file_from_box_cut_short_is_an_error_not_a_success() {
         let dir = tempfile::tempdir().unwrap();
         let dst = dir.path().join("out.bin");
+        std::fs::write(&dst, b"kept").unwrap();
         let dst_str = dst.to_str().unwrap();
 
         let err = fetch_file_from_box(
@@ -347,7 +415,7 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("4 of 8"), "{err}");
-        assert!(err.contains("truncated"), "{err}");
+        assert_eq!(std::fs::read(&dst).unwrap(), b"kept");
 
         // The full transfer still succeeds, byte for byte.
         fetch_file_from_box(
@@ -383,7 +451,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_get_refuses_symlink_destination_or_parent() {
+    fn a_get_follows_symlink_destination_or_parent() {
         let dir = tempfile::tempdir().unwrap();
         let redirected = dir.path().join("redirected");
         std::fs::write(&redirected, b"unchanged").unwrap();
@@ -397,9 +465,9 @@ mod tests {
                 symlink_destination.to_str().unwrap(),
                 make_test_deadline(),
             )
-            .is_err()
+            .is_ok()
         );
-        assert_eq!(std::fs::read(&redirected).unwrap(), b"unchanged");
+        assert_eq!(std::fs::read(&redirected).unwrap(), b"new");
 
         let real_parent = dir.path().join("real");
         std::fs::create_dir(&real_parent).unwrap();
@@ -414,9 +482,34 @@ mod tests {
                 destination.to_str().unwrap(),
                 make_test_deadline(),
             )
-            .is_err()
+            .is_ok()
         );
-        assert!(!real_parent.join("out").exists());
+        assert_eq!(std::fs::read(real_parent.join("out")).unwrap(), b"new");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_get_refuses_a_nonregular_destination() {
+        use std::os::unix::fs::FileTypeExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("fifo");
+        rustix::fs::mkfifoat(rustix::fs::CWD, &fifo, rustix::fs::Mode::empty()).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&fifo)
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+        let error = fetch_file_from_box(
+            &mut build_reply(3, b"new"),
+            "/data/out",
+            fifo.to_str().unwrap(),
+            make_test_deadline(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("regular file"), "{error}");
     }
 
     /// A file that shrank between being measured and being read still has to
@@ -462,11 +555,30 @@ mod tests {
         assert_eq!((sent, bounded.as_slice()), (8, b"12345678".as_slice()));
     }
 
+    #[test]
+    fn file_transfer_retries_interrupted_reads() {
+        use crate::cmd::InterruptedOnce;
+
+        let payload = b"complete file";
+        let mut source = InterruptedOnce(true).chain(payload.as_slice());
+        let mut output = Vec::new();
+        let copied = copy_at_most(
+            &mut source,
+            &mut CopyTarget::Plain(&mut output),
+            payload.len() as u64,
+            "copying",
+            make_test_deadline(),
+        )
+        .unwrap();
+        assert_eq!(copied, payload.len() as u64);
+        assert_eq!(output, payload);
+    }
+
     /// One byte at a time, forever: the stall timeout cannot see this - every
-    /// syscall lands well inside it - so the overall limit is what ends the
+    /// syscall lands well inside it - so the data transfer limit is what ends the
     /// copy instead of letting the guest hold it open indefinitely.
     #[test]
-    fn a_transfer_past_its_overall_deadline_fails_rather_than_trickling_forever() {
+    fn a_transfer_past_its_data_deadline_fails_rather_than_trickling_forever() {
         struct Trickle;
         impl Read for Trickle {
             fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
@@ -485,7 +597,7 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("overall limit"), "{err}");
+        assert!(err.contains("data transfer limit"), "{err}");
     }
 
     /// The verb says which side is the box's, so neither path needs a mark and

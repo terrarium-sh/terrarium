@@ -33,20 +33,10 @@ Type=exec
 # start the day someone points %i at a recipe inside a share. If you do that,
 # read the recipe first: this line is the reading.
 ExecStartPre=/usr/local/bin/terra %S/terra/.terra/%i.yaml setup --trust-recipe
-# --foreground runs the VM in *this* process rather than spawning one, so the
-# service's main PID is the thing doing the work: SIGTERM reaches it directly,
-# OOM and cgroup accounting name it, and "main process exited" and "the VM
-# stopped" are the same event. The guest's console — kernel, agent and hooks —
-# and the workload's terminal both come out on this process's stdio, so they
-# land in the journal; terra's own diagnostics, libkrun's and the gateway's go
-# to the box's log instead — `terra logs %i`.
+# The foreground CLI owns the worker and forwards stop signals; both stay in the service cgroup.
 ExecStart=/usr/local/bin/terra %i --foreground
 
 # --- Identity -------------------------------------------------------------
-# Dedicated unprivileged account; kvm group grants /dev/kvm (libkrun needs it).
-# Rootless is not merely supported, it is the right way to run this: at uid 0
-# virtiofs serves the guest with real root authority, so the guest picks the
-# owner, mode and setuid bit of anything it writes into a read-write share.
 User=terra
 Group=terra
 SupplementaryGroups=kvm
@@ -78,17 +68,17 @@ Environment=PATH=/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin
 # control connection, which stops the workload (SIGTERM, then SIGKILL after a
 # grace period) and runs the recipe's pre_stop hooks before the VM exits.
 # TimeoutStopSec bounds that; after it systemd sends SIGKILL, which still leaves
-# no orphan (the VM is in-process).
+# no orphan worker in the service cgroup.
 KillSignal=SIGTERM
-TimeoutStopSec=30
+TimeoutStopSec=65
 Restart=on-failure
 RestartSec=2
 
 # --- Hard requirements (do NOT tighten these away) ------------------------
-# libkrun talks to /dev/kvm; PrivateDevices=yes would hide it.
+# PrivateDevices=yes would hide /dev/kvm.
 DeviceAllow=/dev/kvm rw
 DevicePolicy=closed
-# KVM guest memory needs writable+executable mappings.
+# Embedded Wasmtime AOT code requires executable mappings.
 MemoryDenyWriteExecute=no
 # The egress proxy opens host sockets, so PrivateNetwork must stay off.
 PrivateNetwork=false

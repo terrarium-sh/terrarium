@@ -5,14 +5,13 @@
 //! as orphans until the box stops. Per-daemon log files and process groups if
 //! console interleaving or surviving children bite.
 
-use crate::mutex::lock_recover;
-use std::os::fd::{AsRawFd, OwnedFd};
-use std::process::Command;
+use crate::mutex::lock_or_abort;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-type PidFdRegistry = Arc<Mutex<Vec<OwnedFd>>>;
+type PidFdRegistry = Arc<Mutex<Vec<Arc<crate::reap::OwnedPidfd>>>>;
 
 #[derive(Clone)]
 pub struct Daemons {
@@ -25,16 +24,16 @@ impl Daemons {
         self.stopping.store(true, Ordering::SeqCst);
         self.signal(rustix::process::Signal::TERM);
         let deadline = std::time::Instant::now() + grace;
-        while !lock_recover(&self.pidfds).is_empty() && std::time::Instant::now() < deadline {
+        while !lock_or_abort(&self.pidfds).is_empty() && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
         }
         self.signal(rustix::process::Signal::KILL);
     }
 
     fn signal(&self, sig: rustix::process::Signal) {
-        let pidfds = lock_recover(&self.pidfds)
+        let pidfds = lock_or_abort(&self.pidfds)
             .iter()
-            .filter_map(|pidfd| pidfd.try_clone().ok())
+            .cloned()
             .collect::<Vec<_>>();
         for pidfd in &pidfds {
             let _ = rustix::process::pidfd_send_signal(pidfd, sig);
@@ -42,26 +41,54 @@ impl Daemons {
     }
 }
 
-pub fn spawn_all(lines: &[String], as_root: bool) -> Daemons {
+pub fn spawn_all(
+    lines: &[String],
+    as_root: bool,
+    output: Option<&std::fs::File>,
+) -> std::io::Result<Daemons> {
     let pidfds = PidFdRegistry::default();
     let stopping = Arc::new(AtomicBool::new(false));
     for line in lines {
         let registry = pidfds.clone();
         let stopping = stopping.clone();
         let line = line.clone();
-        std::thread::spawn(move || supervise(&line, &registry, &stopping, as_root));
+        let output = output.map(std::fs::File::try_clone).transpose()?;
+        std::thread::spawn(move || {
+            supervise(&line, &registry, &stopping, as_root, output.as_ref());
+        });
     }
-    Daemons { pidfds, stopping }
+    Ok(Daemons { pidfds, stopping })
 }
 
 #[allow(unsafe_code)]
-fn supervise(line: &str, registry: &PidFdRegistry, stopping: &AtomicBool, as_root: bool) {
+fn supervise(
+    line: &str,
+    registry: &PidFdRegistry,
+    stopping: &AtomicBool,
+    as_root: bool,
+    output: Option<&std::fs::File>,
+) {
     loop {
         if stopping.load(Ordering::SeqCst) {
             return;
         }
         let mut command = Command::new("sh");
         command.arg("-c").arg(line);
+        if let Some(output) = output {
+            let (stdout, stderr) = match output
+                .try_clone()
+                .and_then(|stdout| output.try_clone().map(|stderr| (stdout, stderr)))
+            {
+                Ok(output) => output,
+                Err(error) => {
+                    eprintln!("terra: daemon `{line}` could not clone its output ({error})");
+                    return;
+                }
+            };
+            command
+                .stdout(Stdio::from(stdout))
+                .stderr(Stdio::from(stderr));
+        }
         if !as_root {
             use std::os::unix::process::CommandExt;
             // SAFETY: a post-fork/pre-exec hook that only calls async-signal-safe
@@ -70,7 +97,7 @@ fn supervise(line: &str, registry: &PidFdRegistry, stopping: &AtomicBool, as_roo
                 command.pre_exec(crate::init::drop_privileges);
             }
         }
-        let (mut child, pidfd) = match crate::reap::spawn_owned(|| command.spawn()) {
+        let (_child, pidfd) = match crate::reap::spawn_owned(|| command.spawn()) {
             Ok(child) => child,
             Err(e) => {
                 eprintln!("terra: daemon `{line}` could not spawn ({e})");
@@ -81,18 +108,15 @@ fn supervise(line: &str, registry: &PidFdRegistry, stopping: &AtomicBool, as_roo
                 continue;
             }
         };
-        let raw = pidfd.as_raw_fd();
-        let own_clone = pidfd.try_clone().ok();
-        let mut pidfds = lock_recover(registry);
-        pidfds.push(pidfd);
-        if stopping.load(Ordering::SeqCst)
-            && let Some(own_clone) = own_clone
-        {
-            let _ = rustix::process::pidfd_send_signal(&own_clone, rustix::process::Signal::KILL);
+        let pidfd = Arc::new(pidfd);
+        let mut pidfds = lock_or_abort(registry);
+        pidfds.push(pidfd.clone());
+        if stopping.load(Ordering::SeqCst) {
+            let _ = rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::KILL);
         }
         drop(pidfds);
-        let status = crate::reap::wait_owned(&mut child);
-        lock_recover(registry).retain(|p| p.as_raw_fd() != raw);
+        let status = crate::reap::wait_owned(&pidfd);
+        lock_or_abort(registry).retain(|registered| !Arc::ptr_eq(registered, &pidfd));
         if stopping.load(Ordering::SeqCst) {
             return;
         }
@@ -113,18 +137,14 @@ mod tests {
 
     const STOP_GRACE_TEST: Duration = Duration::from_secs(5);
 
-    fn create_scratch_path(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("terra-agent-daemon-{}-{name}", std::process::id()))
-    }
-
     /// The point of the feature: a command that exits non-zero comes back,
     /// and one that exits 0 stays done.
     #[test]
     fn a_failing_daemon_restarts_and_a_clean_one_stays_done() {
-        let file = create_scratch_path("restart-count");
+        let file = crate::create_scratch_path("daemon", "restart-count");
         let _ = std::fs::remove_file(&file);
         let line = format!("echo x >> {}; exit 3", file.display());
-        let daemons = spawn_all(&[line], true);
+        let daemons = spawn_all(&[line], true, None).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let count = |file: &std::path::Path| {
             std::fs::read_to_string(file)
@@ -138,9 +158,9 @@ mod tests {
         assert!(count(&file) >= 2, "the failing daemon never restarted");
         daemons.stop(STOP_GRACE_TEST);
 
-        let clean = create_scratch_path("clean");
+        let clean = crate::create_scratch_path("daemon", "clean");
         let _ = std::fs::remove_file(&clean);
-        let daemons = spawn_all(&[format!("echo done > {}", clean.display())], true);
+        let daemons = spawn_all(&[format!("echo done > {}", clean.display())], true, None).unwrap();
         std::thread::sleep(Duration::from_millis(300));
         daemons.stop(STOP_GRACE_TEST);
         assert_eq!(
@@ -157,13 +177,39 @@ mod tests {
         let _ = std::fs::remove_file(&clean);
     }
 
+    #[test]
+    fn daemon_output_uses_the_supplied_stream() {
+        let output = crate::create_scratch_path("daemon", "output");
+        let _ = std::fs::remove_file(&output);
+        let file = std::fs::File::create(&output).unwrap();
+        let daemons = spawn_all(
+            &["printf daemon-out; printf daemon-err >&2".to_string()],
+            true,
+            Some(&file),
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::fs::read_to_string(&output).unwrap_or_default().len()
+            < "daemon-outdaemon-err".len()
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        daemons.stop(STOP_GRACE_TEST);
+        assert_eq!(
+            std::fs::read_to_string(&output).unwrap_or_default(),
+            "daemon-outdaemon-err"
+        );
+        let _ = std::fs::remove_file(&output);
+    }
+
     /// `stop()` ends a running daemon promptly - the workload's exit must not
     /// wait out a daemon that ignores the box's shutdown.
     #[test]
     fn stop_kills_a_running_daemon_promptly() {
-        let daemons = spawn_all(&["sleep 600".to_string()], true);
+        let daemons = spawn_all(&["sleep 600".to_string()], true, None).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while lock_recover(&daemons.pidfds).is_empty() {
+        while lock_or_abort(&daemons.pidfds).is_empty() {
             assert!(std::time::Instant::now() < deadline, "never spawned");
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -180,9 +226,9 @@ mod tests {
     /// the escalation is what the grace is for.
     #[test]
     fn a_straggler_is_killed_once_the_grace_runs_out() {
-        let daemons = spawn_all(&["trap '' TERM; sleep 600".to_string()], true);
+        let daemons = spawn_all(&["trap '' TERM; sleep 600".to_string()], true, None).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while lock_recover(&daemons.pidfds).is_empty() {
+        while lock_or_abort(&daemons.pidfds).is_empty() {
             assert!(std::time::Instant::now() < deadline, "never spawned");
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -195,11 +241,11 @@ mod tests {
             start.elapsed()
         );
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !lock_recover(&daemons.pidfds).is_empty() && std::time::Instant::now() < deadline {
+        while !lock_or_abort(&daemons.pidfds).is_empty() && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(
-            lock_recover(&daemons.pidfds).is_empty(),
+            lock_or_abort(&daemons.pidfds).is_empty(),
             "the straggler survived the escalation"
         );
     }

@@ -3,8 +3,31 @@
 //! could otherwise repaint the very summary the `y` is being given to.
 
 use crate::config;
-use crate::policy::network::runtime;
+use crate::policy::network;
+use anyhow::Result;
+use std::io;
 use std::path::Path;
+
+#[derive(Debug)]
+pub(crate) struct StdoutBrokenPipe;
+
+impl std::fmt::Display for StdoutBrokenPipe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("stdout reader closed")
+    }
+}
+
+impl std::error::Error for StdoutBrokenPipe {}
+
+pub(crate) fn finish_stdout_write(result: io::Result<()>) -> Result<()> {
+    result.map_err(|error| {
+        if error.kind() == io::ErrorKind::BrokenPipe {
+            anyhow::Error::new(StdoutBrokenPipe)
+        } else {
+            anyhow::Error::new(error)
+        }
+    })
+}
 
 /// The three characters `escape_debug` escapes that say nothing about a
 /// terminal.
@@ -63,7 +86,7 @@ pub(crate) fn quote_shell_word(text: &str) -> String {
 }
 
 #[must_use]
-fn format_mount_line(m: &config::Mount) -> String {
+pub(crate) fn format_mount_line(m: &config::Mount) -> String {
     let mode = if m.readonly { "ro" } else { "rw" };
     format!(
         "{} <- {} ({mode})",
@@ -83,25 +106,12 @@ pub fn format_workload_line(cfg: &config::Config) -> String {
     line
 }
 
-/// The host directories a sandbox can see, one line each; "none" is said out
-/// loud because silence would be ambiguous.
-#[must_use]
-pub fn format_mount_lines(cfg: &config::Config) -> Vec<String> {
-    if cfg.mounts.is_empty() {
-        vec!["terra: mounts: none (no host filesystem in the sandbox)".to_string()]
-    } else {
-        cfg.mounts
-            .iter()
-            .map(|m| format!("terra: mount: {}", format_mount_line(m)))
-            .collect()
-    }
-}
-
 #[must_use]
 pub fn render_policy_summary(cfg: &config::Config) -> String {
     use std::fmt::Write as _;
     let config::Config {
         hw,
+        components,
         mounts,
         volumes: _,
         network,
@@ -130,7 +140,12 @@ pub fn render_policy_summary(cfg: &config::Config) -> String {
         "  hardware: {} vCPU, {} MiB RAM, {} MiB rootfs",
         hw.cpus, hw.mem_mib, hw.rootfs_mib
     );
-    let _ = writeln!(out, "  egress:   {}", runtime::describe(network));
+    let _ = writeln!(
+        out,
+        "  components: {} MiB each, {} MiB total",
+        components.memory_mib, components.total_memory_mib
+    );
+    let _ = writeln!(out, "  egress:   {}", network::describe(network));
     for rule in allow {
         let _ = writeln!(out, "  allow:    {}", escape_printable(rule));
     }
@@ -174,6 +189,15 @@ pub fn render_policy_summary(cfg: &config::Config) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_stdout_broken_pipes_get_the_stdout_marker() {
+        let stdout =
+            finish_stdout_write(Err(io::Error::from(io::ErrorKind::BrokenPipe))).unwrap_err();
+        assert!(stdout.downcast_ref::<StdoutBrokenPipe>().is_some());
+        let protocol = anyhow::Error::from(io::Error::from(io::ErrorKind::BrokenPipe));
+        assert!(protocol.downcast_ref::<StdoutBrokenPipe>().is_none());
+    }
     use std::path::PathBuf;
 
     /// The adoption prompt is printable so a person can judge a recipe a *guest* may
@@ -393,8 +417,12 @@ mod tests {
     }
 
     #[test]
-    fn the_approval_summary_lists_hardware_requirements() {
+    fn the_approval_summary_lists_hardware_and_component_requirements() {
         let cfg = config::Config {
+            components: config::Components {
+                memory_mib: 32,
+                total_memory_mib: 256,
+            },
             hw: config::Hw {
                 cpus: 4,
                 mem_mib: 4096,
@@ -403,6 +431,7 @@ mod tests {
             ..yaml_serde::from_str("{}").unwrap()
         };
         let summary = render_policy_summary(&cfg);
+        assert!(summary.contains("components: 32 MiB each, 256 MiB total"));
         assert!(
             summary.contains("hardware: 4 vCPU, 4096 MiB RAM, 2048 MiB rootfs"),
             "{summary}"

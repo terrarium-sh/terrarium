@@ -16,6 +16,7 @@ use validate::{validate, validate_env};
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub hw: Hw,
+    pub components: Components,
     pub mounts: Vec<Mount>,
     pub volumes: Vec<Volume>,
     pub network: Network,
@@ -33,6 +34,34 @@ pub struct Config {
     /// A dotenv-style file merged over `env:` - the file wins. `KEY=VAL`
     /// lines only, no space around the `=`.
     pub env_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct Components {
+    pub memory_mib: u32,
+    pub total_memory_mib: u32,
+}
+
+impl Default for Components {
+    fn default() -> Self {
+        Self {
+            memory_mib: terra_runtime::box_runtime::DEFAULT_COMPONENT_MEMORY_MIB,
+            total_memory_mib: terra_runtime::box_runtime::DEFAULT_TOTAL_MEMORY_MIB,
+        }
+    }
+}
+
+impl Components {
+    pub fn memory_limits(&self) -> Result<terra_runtime::box_runtime::ComponentMemoryLimits> {
+        let component_bytes = usize::try_from(u64::from(self.memory_mib) << 20)
+            .context("components.memory_mib is too large for this host")?;
+        let total_bytes = usize::try_from(u64::from(self.total_memory_mib) << 20)
+            .context("components.total_memory_mib is too large for this host")?;
+        terra_runtime::box_runtime::ComponentMemoryLimits::new(component_bytes, total_bytes)
+            .map_err(|error| anyhow::anyhow!("{error}"))
+            .context("set components.memory_mib > 0 and components.total_memory_mib >= components.memory_mib")
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -59,6 +88,7 @@ impl Default for Hw {
 const MIN_MEM_MIB: u32 = 128;
 
 const MAX_ENV_FILE_BYTES: u64 = 1 << 20;
+pub(crate) const MAX_RECIPE_BYTES: u64 = 8 << 20;
 
 /// A bounded scratch volume
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -159,22 +189,130 @@ pub struct Manifest {
 
 pub const MANIFEST_FILE: &str = "terra.yaml";
 
+pub(crate) fn read_recipe_text(path: &Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+    let mut bytes = Vec::new();
+    crate::sys::open_regular_file(path)
+        .map(|file| file.take(MAX_RECIPE_BYTES + 1))?
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_RECIPE_BYTES {
+        return Err(std::io::Error::other(format!(
+            "recipe is larger than the {MAX_RECIPE_BYTES}-byte limit"
+        )));
+    }
+    String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
+fn open_regular_env_file(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use rustix::fs::{Mode, OFlags, openat};
+        use std::path::Component;
+
+        if !path.is_absolute() {
+            return Err(std::io::Error::other("env file is not an absolute path"));
+        }
+        let mut directory = std::fs::File::open("/")?;
+        let mut components = path.components().peekable();
+        while let Some(component) = components.next() {
+            let Component::Normal(name) = component else {
+                if component != Component::RootDir {
+                    return Err(std::io::Error::other("env file is not an absolute path"));
+                }
+                continue;
+            };
+            let flags = if components.peek().is_some() {
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
+            } else {
+                OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC
+            };
+            let file =
+                openat(&directory, name, flags, Mode::empty()).map_err(std::io::Error::from)?;
+            if components.peek().is_some() {
+                directory = file.into();
+            } else {
+                let file = std::fs::File::from(file);
+                if !file.metadata()?.is_file() {
+                    return Err(std::io::Error::other("expected a regular file"));
+                }
+                return Ok(file);
+            }
+        }
+        Err(std::io::Error::other("expected a regular file"))
+    }
+
+    #[cfg(not(unix))]
+    {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        let file = options.open(path)?;
+        if !file.metadata()?.is_file() {
+            return Err(std::io::Error::other("expected a regular file"));
+        }
+        #[cfg(windows)]
+        if read_final_path(&file)? != path {
+            return Err(std::io::Error::other("env file changed while opening it"));
+        }
+        Ok(file)
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn read_final_path(file: &std::fs::File) -> std::io::Result<PathBuf> {
+    use std::os::{windows::ffi::OsStringExt as _, windows::io::AsRawHandle as _};
+    use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
+
+    const PATH_CAPACITY: u32 = 32_768;
+    let mut path = vec![0; PATH_CAPACITY as usize];
+    // SAFETY: `path` is writable for its stated length and `file` stays open.
+    let len = unsafe {
+        GetFinalPathNameByHandleW(
+            file.as_raw_handle().cast(),
+            path.as_mut_ptr(),
+            PATH_CAPACITY,
+            0,
+        )
+    };
+    if len == 0 || len >= PATH_CAPACITY {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(std::ffi::OsString::from_wide(&path[..len as usize]).into())
+}
+
+fn escape_yaml_error(error: &yaml_serde::Error) -> anyhow::Error {
+    anyhow::anyhow!(crate::render::escape_printable(&error.to_string()))
+}
+
 pub fn load_manifest(project_dir: &Path) -> Result<Option<Manifest>> {
     let path = project_dir.join(MANIFEST_FILE);
-    let text = match std::fs::read_to_string(&path) {
+    let text = match read_recipe_text(&path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!("reading {}", crate::render::escape_printable_path(&path))
+            });
+        }
     };
     let manifest: Manifest = yaml_serde::from_str(&text)
-        .with_context(|| format!("failed to parse {}", path.display()))?;
+        .map_err(|error| escape_yaml_error(&error))
+        .with_context(|| {
+            format!(
+                "failed to parse {}",
+                crate::render::escape_printable_path(&path)
+            )
+        })?;
     for (name, reference) in &manifest.boxes {
-        crate::name::validate_box_name(name).with_context(|| format!("in {}", path.display()))?;
+        crate::name::validate_box_name(name)
+            .with_context(|| format!("in {}", crate::render::escape_printable_path(&path)))?;
         if !crate::resolve::is_path(reference) {
+            let reference = crate::render::escape_printable(reference);
             bail!(
                 "box '{name}' in {} points at '{reference}', which is not a recipe path \
                  (a reference is a path, e.g. ./{reference}.yaml)",
-                path.display()
+                crate::render::escape_printable_path(&path)
             );
         }
     }
@@ -202,23 +340,21 @@ pub fn load_manifest_or_warn(project_dir: &Path) -> Option<Manifest> {
     }
 }
 
-pub(crate) fn resolve_mounts_for(mounts: &mut [Mount]) -> Result<()> {
-    for m in mounts {
-        m.host = std::fs::canonicalize(&m.host)
-            .with_context(|| format!("resolving mount host path '{}'", m.host.display()))?;
-    }
-    Ok(())
-}
-
 pub fn load_path(path: &Path, project_dir: &Path) -> Result<Config> {
-    let text =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let text = read_recipe_text(path)
+        .with_context(|| format!("reading {}", crate::render::escape_printable_path(path)))?;
     parse_recipe(&text, project_dir, path)
 }
 
 pub fn parse_recipe(text: &str, project_dir: &Path, source: &Path) -> Result<Config> {
     let mut cfg: Config = yaml_serde::from_str(text)
-        .with_context(|| format!("failed to parse YAML from {}", source.display()))?;
+        .map_err(|error| escape_yaml_error(&error))
+        .with_context(|| {
+            format!(
+                "failed to parse YAML from {}",
+                crate::render::escape_printable_path(source)
+            )
+        })?;
     for mount in &mut cfg.mounts {
         mount.host = resolve_recipe_path(&mount.host, project_dir)?;
     }
@@ -241,33 +377,54 @@ pub fn parse_recipe(text: &str, project_dir: &Path, source: &Path) -> Result<Con
 }
 
 fn normalize_guest_path(path: &Path) -> Result<PathBuf> {
-    use std::path::Component;
-    if !path.is_absolute() {
-        bail!("guest path must be absolute: '{}'", path.display());
+    let path = path.as_os_str().to_string_lossy();
+    if !path.starts_with('/') {
+        bail!(
+            "guest path must be absolute: '{}'",
+            crate::render::escape_printable(&path)
+        );
     }
-    let mut normalized = PathBuf::from("/");
-    for component in path.components() {
+    let mut components = Vec::new();
+    for component in path.split('/') {
         match component {
-            Component::RootDir | Component::CurDir => {}
-            Component::Normal(name) => normalized.push(name),
-            Component::ParentDir => {
-                normalized.pop();
+            "" | "." => {}
+            ".." => {
+                components.pop();
             }
-            Component::Prefix(_) => bail!("guest path '{}' is not absolute", path.display()),
+            name => {
+                if name.contains('\\') {
+                    bail!(
+                        "guest path '{}' contains a backslash",
+                        crate::render::escape_printable(&path)
+                    );
+                }
+                components.push(name);
+            }
         }
     }
-    Ok(normalized)
+    Ok(PathBuf::from(format!("/{}", components.join("/"))))
 }
 /// The writable shares a recipe declares, read leniently.
-#[must_use]
-pub(crate) fn list_declared_writable_shares(text: &str, project_dir: &Path) -> Vec<PathBuf> {
-    let Ok(yaml_serde::Value::Mapping(recipe)) = yaml_serde::from_str(text) else {
-        return Vec::new();
-    };
-    let Some(yaml_serde::Value::Sequence(mounts)) = recipe.get("mounts") else {
-        return Vec::new();
-    };
-    mounts
+pub(crate) fn list_declared_writable_shares(
+    text: &str,
+    project_dir: &Path,
+) -> Result<Vec<PathBuf>> {
+    #[derive(Deserialize, Default)]
+    struct RecipeMounts {
+        #[serde(default)]
+        mounts: Vec<yaml_serde::Value>,
+    }
+
+    let recipe: RecipeMounts = yaml_serde::from_str(text)?;
+    anyhow::ensure!(
+        !recipe
+            .mounts
+            .iter()
+            .any(|mount| mount.as_mapping().is_some_and(|map| map.contains_key("<<"))),
+        "cannot determine writable shares from YAML merge keys"
+    );
+    Ok(recipe
+        .mounts
         .iter()
         .filter_map(|mount| {
             let yaml_serde::Value::Mapping(mount) = mount else {
@@ -285,47 +442,71 @@ pub(crate) fn list_declared_writable_shares(text: &str, project_dir: &Path) -> V
         .map(|host| {
             resolve_recipe_path(&host, project_dir).unwrap_or_else(|_| project_dir.join(host))
         })
-        .collect()
+        .collect())
 }
 
 /// Merge `env_file:` over `env:` - the file wins - warning on a name set in
-/// both. Read without following symlinks (see [`crate::sys::open_no_symlinks`]).
+/// both.
 pub(crate) fn merge_env_file(cfg: &mut Config) -> Result<()> {
     let Some(path) = cfg.env_file.as_ref() else {
         return Ok(());
     };
     let mut text = String::new();
-    crate::sys::open_no_symlinks(path)
-        .with_context(|| format!("opening env file {}", path.display()))?
+    open_regular_env_file(path)
+        .with_context(|| {
+            format!(
+                "opening env file {}",
+                crate::render::escape_printable_path(path)
+            )
+        })?
         .take(MAX_ENV_FILE_BYTES + 1)
         .read_to_string(&mut text)
-        .with_context(|| format!("reading env file {}", path.display()))?;
+        .with_context(|| {
+            format!(
+                "reading env file {}",
+                crate::render::escape_printable_path(path)
+            )
+        })?;
     anyhow::ensure!(
         text.len() as u64 <= MAX_ENV_FILE_BYTES,
         "env file {} is larger than the {MAX_ENV_FILE_BYTES}-byte limit",
-        path.display()
+        crate::render::escape_printable_path(path)
     );
-    for line in text.lines() {
+    for (index, line) in text.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
         let (k, v) = line
             .split_once('=')
-            .with_context(|| format!("invalid env file line (want KEY=VAL): {line}"))?;
+            .with_context(|| format!("invalid env file line {} (want KEY=VAL)", index + 1))?;
         // Only a value the merge actually changes is worth a word: the same
         // name set to the same thing in both is a recipe stating what the
         // dotenv already says, not an override anyone loses.
         if cfg.env.get(k).is_some_and(|from_recipe| from_recipe != v) {
             eprintln!(
-                "terra: warning: env variable '{k}' is set in both env: and \
+                "terra: warning: env variable '{}' is set in both env: and \
                  env_file: {} - the env_file wins",
-                path.display()
+                crate::render::escape_printable(k),
+                crate::render::escape_printable_path(path)
             );
         }
         cfg.env.insert(k.to_string(), v.to_string());
     }
     validate_env(&cfg.env)
+}
+
+pub(crate) fn resolve_env_file(cfg: &mut Config) -> Result<()> {
+    let Some(path) = cfg.env_file.as_ref() else {
+        return Ok(());
+    };
+    cfg.env_file = Some(std::fs::canonicalize(path).with_context(|| {
+        format!(
+            "resolving env file {}",
+            crate::render::escape_printable_path(path)
+        )
+    })?);
+    Ok(())
 }
 
 /// Where a path written in a recipe or a `terra.yaml` lands: `~` expanded, then
@@ -350,7 +531,7 @@ pub(crate) fn expand_tilde(p: &Path) -> Result<PathBuf> {
         bail!(
             "path '{}' names another user's home with '~', which terra does not expand \
              - write the absolute path (only a leading '~/' is expanded)",
-            p.display()
+            crate::render::escape_printable_path(p)
         );
     }
     Ok(p.to_path_buf())

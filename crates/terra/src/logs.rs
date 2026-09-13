@@ -1,7 +1,4 @@
-//! The box's one rolling log: tracing records, rotated by tracing-appender
-//! (`terra.log` is the symlink to the current one). Other writers - the guest
-//! console included - reach the disk only under `TERRA_DIAGNOSTICS=1`, in
-//! diagnostics.log.
+//! Bounded daily host logs for each box.
 
 use crate::state::BoxRef;
 use std::io::Write;
@@ -13,8 +10,29 @@ use tracing_subscriber::util::SubscriberInitExt as _;
 
 const KEPT_LOG_GENERATIONS: usize = 7;
 
-fn build_appender(bx: &BoxRef) -> anyhow::Result<RollingFileAppender> {
-    RollingFileAppender::builder()
+struct CappedAppender {
+    appender: RollingFileAppender,
+    path: std::path::PathBuf,
+}
+
+impl Write for CappedAppender {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let _ = self.appender.write(&[])?;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&self.path)?;
+        terra_io::log::write_capped(&mut file, bytes)?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.appender.flush()
+    }
+}
+
+fn build_appender(bx: &BoxRef) -> anyhow::Result<CappedAppender> {
+    let appender = RollingFileAppender::builder()
         .rotation(Rotation::DAILY)
         .filename_prefix("terra")
         .filename_suffix("log")
@@ -26,11 +44,16 @@ fn build_appender(bx: &BoxRef) -> anyhow::Result<RollingFileAppender> {
                 "opening log {}: {e}",
                 bx.get_dir().join(crate::state::LOG_FILE).display()
             )
-        })
+        })?;
+    Ok(CappedAppender {
+        appender,
+        path: bx.get_dir().join(crate::state::LOG_FILE),
+    })
 }
 
 pub fn init(bx: &BoxRef) -> anyhow::Result<()> {
-    let appender = build_appender(bx)?;
+    let mut appender = build_appender(bx)?;
+    let _ = writeln!(&mut appender, "\n===== terra: {bx} =====");
 
     let spec = std::env::var("RUST_LOG").ok();
     let asked = spec.as_deref().and_then(|s| match Targets::from_str(s) {
@@ -49,28 +72,22 @@ pub fn init(bx: &BoxRef) -> anyhow::Result<()> {
         None => (Targets::new().with_default(LevelFilter::INFO), true),
     };
 
-    let installed = tracing_subscriber::registry()
+    let installation = tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
                 .with_ansi(false)
-                .with_writer(appender),
+                .with_writer(std::sync::Mutex::new(appender)),
         )
         .with(filter)
-        .try_init()
-        .is_ok();
+        .try_init();
+    if let Err(error) = &installation {
+        eprintln!("terra: warning: could not install log subscriber: {error}");
+    }
 
-    if installed && defaulted {
+    if installation.is_ok() && defaulted {
         log::set_max_level(log::LevelFilter::Info);
     }
 
-    // A direct write, not a log record: the mark must land whatever RUST_LOG says.
-    if let Ok(mut sep) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(bx.get_dir().join(crate::state::LOG_FILE))
-    {
-        let _ = writeln!(&mut sep, "\n===== terra: {bx} =====");
-    }
     Ok(())
 }
 
@@ -93,7 +110,7 @@ mod tests {
         .unwrap();
 
         let path = bx.get_dir().join(crate::state::DIAGNOSTICS_LOG);
-        let f = sys::create_no_symlinks(&path).unwrap();
+        let f = sys::create_regular_file(&path).unwrap();
         drop(f);
         assert_eq!(
             std::fs::read(bx.get_dir().join(crate::state::DIAGNOSTICS_LOG)).unwrap(),

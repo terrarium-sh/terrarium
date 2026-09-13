@@ -1,37 +1,46 @@
-# One fully-static, portable `terra` binary: libkrun is a Cargo dependency
-# (mainline, unmodified); the guest kernel is libkrunfw's `vmlinux`, embedded and
-# booted as an external kernel — no dlopen, no patch.
+# One fully-static `terra` binary embeds a minimal Terra guest kernel and
+# trusted AOT device components.
 #
 # musl C toolchain is provided by zig (scripts/zig-musl-*), so no cross-gcc need
-# be installed. After a fresh clone: `git submodule update --init` — NOT
-# --recursive: vendor/smolvm carries its own libkrun/libkrunfw/sdk submodules on
-# ssh URLs, and nothing here builds from them.
+# be installed.
 
 CARGO ?= cargo
+CARGO_LOCKED := $(CARGO) --locked
+COMPONENT_TOOLCHAIN := $(shell sed -n 's/^channel = "\(.*\)"/\1/p' components/rust-toolchain.toml)
+WASM_TOOLS_VERSION := 1.248.0
+CARGO_FUZZ_VERSION := 0.13.1
+CARGO_AUDIT_VERSION := 0.22.0
+WIT_BINDGEN_VERSION := 0.61.1
+ZIG_VERSION := 0.16.0
 # Host CPU, and therefore guest CPU: a box runs on the same hardware the host
-# does, so the kernel, the rootfs and the agent are all built for $(ARCH). There
-# is no cross case to model here — `make cross` builds the *host* binary for
-# another platform and is a separate thing. Override only to reproduce another
-# arch's images on a machine that can run its binaries.
+# does, so the kernel, rootfs, and agent are built for $(ARCH).
 ARCH ?= $(shell uname -m)
 MUSL := $(ARCH)-unknown-linux-musl
-LIBKRUNFW_DIR := vendor/libkrunfw
+NATIVE := $(ARCH)-unknown-linux-gnu
+# `ARCH` names the Linux guest. `TERRA_TARGET` names the native host executable
+# and the Wasmtime AOT artifacts it embeds. Linux keeps the static-musl release
+# default; macOS and Windows pass their native Rust target explicitly.
+TERRA_TARGET ?= $(MUSL)
+# `mke2fs` runs while producing the guest image, so it targets the Linux build
+# machine rather than the guest. This lets an x86_64 Linux builder prepare the
+# aarch64 guest payload used by macOS and Windows ARM64 releases.
+BUILD_ARCH ?= $(shell uname -m)
+MKE2FS_CC_x86_64 := scripts/zig-musl-cc
+MKE2FS_CC_aarch64 := scripts/zig-musl-cc-aarch64
+MKE2FS_CC := $(MKE2FS_CC_$(BUILD_ARCH))
 BUILD := build
 DIST := dist
+SOURCE_DIST := $(BUILD)/terra-source.tar.gz
+ALPINE_SOURCE_DIST := $(BUILD)/alpine-corresponding-source.tar.gz
 
 # Versions, URLs and sha256s of everything downloaded and baked into the binary
 # — the guest kernel, e2fsprogs, the Alpine rootfs and doas. Kept in its own file
 # so a bump is a reviewable diff of provenance and nothing else; the recipes that
-# consume it are below. Needs $(ARCH) and $(LIBKRUNFW_DIR), hence included here.
+# consume it are below. Needs $(ARCH), hence included here.
 # NOTE: the CI cache key hashes this file — keep it listed there.
 include pins.mk
 
 KERNEL_GZ := $(BUILD)/vmlinux.gz
-# Guest-kernel hardening, appended to libkrunfw's config before the build. Lives
-# here rather than as an edit to the submodule's tracked config, so a fresh
-# clone builds the same kernel this repo was tested against.
-KERNEL_HARDENING := kernel/terrarium-hardening.config
-
 E2FSPROGS_SRC := $(BUILD)/e2fsprogs-$(E2FSPROGS_VERSION)
 MKE2FS := $(BUILD)/mke2fs
 RESIZE2FS := $(BUILD)/resize2fs
@@ -48,12 +57,6 @@ VOLUME_IMG_MIB := 4
 # Big enough for the base tree, small enough to ship; the guest resizes up.
 ROOTFS_IMG_MIB := 16
 
-# The cargo/musl toolchain (target, linker, rustflags, CC/AR, TERRA_KERNEL_GZ)
-# lives in .cargo/config.toml — one source of truth shared by `make`, a bare
-# `cargo build`, and rust-analyzer. We only export CC here so the libkrunfw
-# kernel sub-build inherits the same zig musl compiler.
-
-
 # A recipe that dies partway through — Ctrl-C, ENOSPC, the OOM killer — must not
 # leave its target behind. Three of the guest images below are written straight
 # to `$@` by a `gzip` redirect, so without this a truncated `rootfs.img.gz` sits
@@ -63,28 +66,16 @@ ROOTFS_IMG_MIB := 16
 # recipe added later, for one line.
 .DELETE_ON_ERROR:
 
-.PHONY: build verify dist man cross clean
+COMPONENTS := block vsock network fs mem boot vmm policy
+COMPONENT_TARGETS := $(addprefix component-,$(COMPONENTS))
+COMPONENT_AOT_TARGETS := $(addsuffix -aot,$(COMPONENT_TARGETS))
+COMPONENT_MANIFESTS := components/device-transport/Cargo.toml $(addprefix components/,$(addsuffix /Cargo.toml,$(COMPONENTS)))
 
-# Every pin from pins.mk, in one string. The guest-image recipes below depend on
-# the stamp file this writes, because otherwise they depend on nothing at all: each
-# names an output that already exists after the first build, so `make` declares
-# it up to date and a bumped $(ALPINE_VERSION) — or a corrected $(KERNEL_SHA256),
-# or a new libkrunfw commit — is a silent no-op. That is the wrong failure for a
-# security update: the maintainer edits the pin, the build succeeds, and the
-# binary still ships the vulnerable guest.
-#
-# The stamp is rewritten only when the pins actually differ, so its mtime does
-# not move for an unrelated edit and a comment does not cost a kernel rebuild.
-#
-# The libkrunfw pin is read from the submodule's *checked-out* HEAD rather than
-# the gitlink in the last commit (`git rev-parse HEAD:vendor/libkrunfw`). The
-# normal bump is `git -C vendor/libkrunfw checkout <new>` → `make build` → test →
-# commit, and the gitlink does not move until that last step — so reading it would
-# leave exactly the window in which the rebuild matters unaware that anything
-# changed. Empty (harmlessly) in a tarball export with no `.git`.
-PINS := $(KERNEL_VERSION) $(KERNEL_SHA256) $(E2FSPROGS_VERSION) $(E2FSPROGS_SHA256) \
-        $(ALPINE_VERSION) $(ALPINE_SHA256) $(DOAS_SHA256) $(DOAS_SHIM_SHA256) \
-        $(shell git -C $(LIBKRUNFW_DIR) rev-parse HEAD 2>/dev/null)
+.PHONY: $(COMPONENT_TARGETS) $(COMPONENT_AOT_TARGETS) guest-assets check-guest-assets host-build host-dist source-dist verify-wit build verify verify-components dist man clean test-component-boot test-component-vmm test-install check-zig
+
+# Pin changes invalidate every embedded guest payload.
+PINS := $(ARCH) $(KERNEL_VERSION) $(KERNEL_SHA256) $(E2FSPROGS_VERSION) $(E2FSPROGS_SHA256) \
+        $(ALPINE_VERSION) $(ALPINE_SHA256) $(DOAS_SHA256) $(DOAS_SHIM_SHA256)
 PIN_STAMP := $(BUILD)/.pins
 
 .PHONY: FORCE
@@ -93,64 +84,89 @@ $(PIN_STAMP): FORCE
 	@mkdir -p $(BUILD)
 	@echo '$(PINS)' | cmp -s - $@ || { echo '$(PINS)' > $@; echo "pins changed -> guest images will rebuild"; }
 
-## The kernel source tarball, fetched and hash-checked here rather than by
-## libkrunfw's own unverified `curl`. Downloading it ourselves is what lets the
-## check happen at all: libkrunfw's rule only fires when the file is absent, so a
-## cached tarball would never be looked at again.
+KERNEL_ARCH_x86_64 := x86
+KERNEL_ARCH_aarch64 := arm64
+KERNEL_ARCH := $(KERNEL_ARCH_$(ARCH))
+KERNEL_TARBALL := $(BUILD)/linux-$(KERNEL_VERSION).tar.xz
+KERNEL_SOURCE := $(BUILD)/linux-$(KERNEL_VERSION)
+KERNEL_OUTPUT := $(BUILD)/kernel-$(ARCH)
+KERNEL_FRAGMENTS := kernel/terra.config kernel/$(ARCH).config
+KERNEL_PATCHES := $(sort $(wildcard kernel/patches/*.patch))
+KERNEL_INPUTS := $(BUILD)/.kernel-inputs
+KERNEL_PATCH_STAMP := $(KERNEL_SOURCE)/.terra-patches
+KERNEL_JOBS ?= $(shell nproc)
+KERNEL_CC_x86_64 := gcc
+KERNEL_CC_aarch64 := aarch64-linux-gnu-gcc
+KERNEL_CC ?= $(KERNEL_CC_$(ARCH))
+KERNEL_CROSS_aarch64 := aarch64-linux-gnu-
+KERNEL_MAKE := scripts/kernel-container.sh $(MAKE) --no-print-directory -C $(KERNEL_SOURCE) O=$(abspath $(KERNEL_OUTPUT)) \
+	ARCH=$(KERNEL_ARCH) CC="$(KERNEL_CC)" CROSS_COMPILE=$(KERNEL_CROSS_$(ARCH)) KBUILD_BUILD_USER=terra KBUILD_BUILD_HOST=terra \
+	KBUILD_BUILD_VERSION=1 KBUILD_BUILD_TIMESTAMP='2026-09-09 00:00:00 UTC'
+KERNEL_BINARY_x86_64 := vmlinux
+KERNEL_BINARY_aarch64 := arch/arm64/boot/Image
+KERNEL_BINARY := $(KERNEL_BINARY_$(ARCH))
+
+$(KERNEL_INPUTS): FORCE
+	@mkdir -p $(BUILD)
+	@{ echo '$(ARCH) $(KERNEL_VERSION) $(KERNEL_SHA256)'; cat $(KERNEL_FRAGMENTS) $(KERNEL_PATCHES) kernel/Containerfile scripts/kernel-container.sh | sha256sum; } > $@.tmp
+	@cmp -s $@.tmp $@ || cp $@.tmp $@
+	@rm -f $@.tmp
+
+ifneq ($(strip $(KERNEL_ARCHIVE_URL)),)
+KERNEL_ARCHIVE := $(BUILD)/kernel-download-$(ARCH)-$(KERNEL_ARCHIVE_SHA256).tar.gz
+$(KERNEL_ARCHIVE):
+	mkdir -p $(BUILD)
+	curl -fsSL '$(KERNEL_ARCHIVE_URL)' -o $@.tmp
+	echo '$(KERNEL_ARCHIVE_SHA256)  $@.tmp' | sha256sum -c -
+	mv $@.tmp $@
+endif
+
+ifneq ($(strip $(KERNEL_ARCHIVE)),)
+ifeq ($(strip $(KERNEL_ARCHIVE_SHA256)),)
+$(error KERNEL_ARCHIVE_SHA256 is required for a prebuilt kernel)
+endif
+$(KERNEL_GZ): $(KERNEL_ARCHIVE) $(KERNEL_INPUTS) scripts/kernel-artifact.py scripts/check-kernel-config.py
+	python3 scripts/kernel-artifact.py import $(KERNEL_ARCHIVE) $(KERNEL_ARCHIVE_SHA256) $(KERNEL_INPUTS) $(BUILD)/vmlinux $(KERNEL_OUTPUT)/.config
+	python3 scripts/check-kernel-config.py $(KERNEL_OUTPUT)/.config $(KERNEL_FRAGMENTS)
+else
 $(KERNEL_TARBALL):
-	mkdir -p $(dir $@)
-	curl -fsSL https://cdn.kernel.org/pub/linux/kernel/v6.x/$(KERNEL_VERSION).tar.xz -o $@.tmp
-	echo "$(KERNEL_SHA256)  $@.tmp" | sha256sum -c -
+	mkdir -p $(BUILD)
+	curl -fsSL $(KERNEL_URL) -o $@.tmp
+	echo '$(KERNEL_SHA256)  $@.tmp' | sha256sum -c -
 	mv $@.tmp $@
 
-## Build the guest kernel from libkrunfw sources and gzip it for embedding.
-##
-## What gets built has a different *name and format* per arch, and this is not a
-## detail we get to choose — it is fixed at both ends. libkrunfw emits an ELF
-## `vmlinux` on x86_64 and a flat `arch/arm64/boot/Image` on aarch64 (its
-## KERNEL_BINARY_* variables, mirrored below), and libkrun's loader agrees:
-## `KernelFormat::Elf` is `#[cfg(target_arch = "x86_64")]` and arm64 only accepts
-## Raw/PeGz. So the pairing is forced, and crates/terra/src/vm/libkrun_ext.rs
-## picks the matching KRUN_KERNEL_FORMAT_* for the same arch. Change one, change
-## both.
-##
-## Staged as $(BUILD)/vmlinux either way — the name the embedded blob has always
-## had, and .cargo/config.toml points TERRA_KERNEL_GZ at it.
-KERNEL_BINARY_x86_64 := $(KERNEL_VERSION)/vmlinux
-KERNEL_BINARY_aarch64 := $(KERNEL_VERSION)/arch/arm64/boot/Image
-KERNEL_BINARY := $(KERNEL_BINARY_$(ARCH))
-## x86_64: --strip-all, not just --strip-debug — the loader reads program headers
-## only, so the symbol table is 4 MiB the guest never looks at (29.5 MiB of ELF
-## becomes 8.2 MiB gzipped). arm64's Image is already a flat binary with no
-## symbol table to drop, and objcopy cannot parse it as an object file at all.
-KERNEL_STAGE_x86_64 = objcopy --strip-all $(LIBKRUNFW_DIR)/$(KERNEL_BINARY) $(BUILD)/vmlinux
-KERNEL_STAGE_aarch64 = cp $(LIBKRUNFW_DIR)/$(KERNEL_BINARY) $(BUILD)/vmlinux
-##
-## --no-print-directory is load-bearing, not cosmetic. libkrunfw's kernel rule
-## forwards $(MAKEFLAGS) as a command-line *argument* (`$(MAKE) $(MAKEFLAGS)
-## KBUILD_...`), and GNU make <= 4.3 puts the -w it turns on implicitly for a
-## recursive make into MAKEFLAGS as a bare `w` — which then reads as a goal:
-## "No rule to make target 'w'". make 4.4 stopped adding it, so this fails only
-## on the older make the CI runners ship and never on a 4.4 workstation. Passing
-## --no-print-directory keeps `w` out of MAKEFLAGS on every version.
-LIBKRUNFW_MAKE := $(MAKE) --no-print-directory -C $(LIBKRUNFW_DIR)
-##
-## The config is libkrunfw's plus $(KERNEL_HARDENING): libkrunfw extracts and
-## configures the tree first, then the fragment is appended and `olddefconfig`
-## resolves it — appended last, so its values win over the ones set above them.
-$(KERNEL_GZ): $(KERNEL_TARBALL) $(KERNEL_HARDENING) $(PIN_STAMP)
-	echo "$(KERNEL_SHA256)  $(KERNEL_TARBALL)" | sha256sum -c -
-	$(LIBKRUNFW_MAKE) $(KERNEL_VERSION)
-	cat $(KERNEL_HARDENING) >> $(LIBKRUNFW_DIR)/$(KERNEL_VERSION)/.config
-	$(MAKE) --no-print-directory -C $(LIBKRUNFW_DIR)/$(KERNEL_VERSION) olddefconfig
-	$(LIBKRUNFW_MAKE) $(KERNEL_BINARY)
-	mkdir -p $(BUILD)
-	$(KERNEL_STAGE_$(ARCH))
+$(KERNEL_SOURCE)/Makefile: $(KERNEL_TARBALL) $(KERNEL_INPUTS)
+	echo '$(KERNEL_SHA256)  $(KERNEL_TARBALL)' | sha256sum -c -
+	rm -rf $(KERNEL_SOURCE) $(KERNEL_OUTPUT)
+	tar -xf $(KERNEL_TARBALL) -C $(BUILD)
+	touch $@
+
+$(KERNEL_PATCH_STAMP): $(KERNEL_SOURCE)/Makefile $(KERNEL_PATCHES)
+	set -e; for patch in $(abspath $(KERNEL_PATCHES)); do git -C $(KERNEL_SOURCE) apply --check $$patch && git -C $(KERNEL_SOURCE) apply $$patch; done
+	sha256sum $(KERNEL_PATCHES) </dev/null > $@
+
+$(KERNEL_OUTPUT)/.config: $(KERNEL_PATCH_STAMP) $(KERNEL_INPUTS) $(KERNEL_FRAGMENTS)
+	mkdir -p $(KERNEL_OUTPUT)
+	cat $(KERNEL_FRAGMENTS) > $(KERNEL_OUTPUT)/seed.config
+	$(KERNEL_MAKE) KCONFIG_ALLCONFIG=$(abspath $(KERNEL_OUTPUT)/seed.config) allnoconfig
+	python3 scripts/check-kernel-config.py $@ $(KERNEL_FRAGMENTS)
+
+$(KERNEL_GZ): $(KERNEL_OUTPUT)/.config $(KERNEL_INPUTS) scripts/check-kernel-config.py
+	python3 scripts/check-kernel-config.py $(KERNEL_OUTPUT)/.config $(KERNEL_FRAGMENTS)
+	$(KERNEL_MAKE) -j$(KERNEL_JOBS) $(notdir $(KERNEL_BINARY))
+	scripts/kernel-container.sh $(if $(filter x86_64,$(ARCH)),objcopy --strip-all,cp) $(KERNEL_OUTPUT)/$(KERNEL_BINARY) $(BUILD)/vmlinux
 	gzip -9nc $(BUILD)/vmlinux > $@.tmp && mv $@.tmp $@
+endif
+
+.PHONY: kernel kernel-export
+kernel: $(KERNEL_GZ)
+kernel-export: $(KERNEL_GZ)
+	python3 scripts/kernel-artifact.py export $(KERNEL_GZ) $(KERNEL_OUTPUT)/.config $(KERNEL_INPUTS) $(BUILD)/terra-kernel-$(ARCH).tar.gz
+	sha256sum $(BUILD)/terra-kernel-$(ARCH).tar.gz > $(BUILD)/terra-kernel-$(ARCH).tar.gz.sha256
 
 ## The sha256 of an embedded blob, written beside it. Included as text by
 ## include_str! and used as the blob's cache identity (see
-## libkrun_ext::blob_name), so nothing hashes the blob at compile or boot time.
+## vm::image::blob_name), so nothing hashes the blob at compile or boot time.
 ## No trailing newline: the digest is concat!'d into a cache file name.
 $(BUILD)/%.sha256: $(BUILD)/%
 	sha256sum $< | cut -d' ' -f1 | tr -d '\n' > $@
@@ -158,26 +174,38 @@ $(BUILD)/%.sha256: $(BUILD)/%
 ## Static mke2fs — a *build-time* tool only: it bakes the prebaked images below.
 ## It is not shipped in the binary; the guest grows those images with resize2fs.
 $(MKE2FS): $(PIN_STAMP)
+	$(MAKE) check-zig
 	mkdir -p $(BUILD)
 	curl -fsSL $(E2FSPROGS_URL) -o $(BUILD)/e2fsprogs.tar.gz
 	echo "$(E2FSPROGS_SHA256)  $(BUILD)/e2fsprogs.tar.gz" | sha256sum -c -
 	rm -rf $(E2FSPROGS_SRC)
 	tar -xzf $(BUILD)/e2fsprogs.tar.gz -C $(BUILD)
-	cd $(E2FSPROGS_SRC) && CC=$(abspath scripts/zig-musl-cc) ./configure \
-		--host=$(ARCH)-linux-musl --disable-nls --disable-uuidd --disable-fuse2fs \
+	cd $(E2FSPROGS_SRC) && CC=$(abspath $(MKE2FS_CC)) ./configure \
+		--host=$(BUILD_ARCH)-linux-musl --disable-nls --disable-uuidd --disable-fuse2fs \
 		--disable-e2initrd-helper --disable-testio-debug LDFLAGS="-static" >/dev/null
-	CC=$(abspath scripts/zig-musl-cc) $(MAKE) -C $(E2FSPROGS_SRC) libs
-	CC=$(abspath scripts/zig-musl-cc) $(MAKE) -C $(E2FSPROGS_SRC)/misc mke2fs
+	CC=$(abspath $(MKE2FS_CC)) $(MAKE) -C $(E2FSPROGS_SRC) libs
+	CC=$(abspath $(MKE2FS_CC)) $(MAKE) -C $(E2FSPROGS_SRC)/misc mke2fs
 	cp $(E2FSPROGS_SRC)/misc/mke2fs $(MKE2FS)
 	strip $(MKE2FS)
 
-## resize2fs, from the same (already configured) e2fsprogs tree. It ships in the
-## binary and is injected into the guest, which grows each image to its
-## configured size.
+# resize2fs runs inside the guest; cross builds must not reuse the host mke2fs binary's tree.
+ifeq ($(ARCH),$(BUILD_ARCH))
 $(RESIZE2FS): $(MKE2FS)
-	CC=$(abspath scripts/zig-musl-cc) $(MAKE) -C $(E2FSPROGS_SRC)/resize resize2fs
+	CC=$(abspath $(MKE2FS_CC)) $(MAKE) -C $(E2FSPROGS_SRC)/resize resize2fs
 	cp $(E2FSPROGS_SRC)/resize/resize2fs $@
 	strip $@
+else
+GUEST_E2FSPROGS_SRC := $(BUILD)/e2fsprogs-guest-$(ARCH)
+$(RESIZE2FS): $(MKE2FS)
+	mkdir -p $(GUEST_E2FSPROGS_SRC)
+	tar -xzf $(BUILD)/e2fsprogs.tar.gz --strip-components=1 -C $(GUEST_E2FSPROGS_SRC)
+	cd $(GUEST_E2FSPROGS_SRC) && CC=$(abspath $(MKE2FS_CC_$(ARCH))) AR=$(abspath scripts/zig-musl-ar) ./configure \
+		--host=$(ARCH)-linux-musl --disable-nls --disable-uuidd --disable-fuse2fs \
+		--disable-e2initrd-helper --disable-testio-debug LDFLAGS="-static -s" >/dev/null
+	$(MAKE) -C $(GUEST_E2FSPROGS_SRC) libs
+	$(MAKE) -C $(GUEST_E2FSPROGS_SRC)/resize resize2fs
+	cp $(GUEST_E2FSPROGS_SRC)/resize/resize2fs $@
+endif
 
 ## Prebaked guest root filesystem, gzipped into the binary. Built root-owned via
 ## a user namespace, with a pinned 4 KiB block size (mke2fs would otherwise pick
@@ -211,40 +239,28 @@ $(ROOTFS_IMG): $(MKE2FS) $(PIN_STAMP)
 	unshare -U -r $(MKE2FS) -F -q -t ext4 -b 4096 -d $(ROOTFS_TREE) $(BUILD)/rootfs.img
 	gzip -9 -c $(BUILD)/rootfs.img > $(ROOTFS_IMG)
 
-## Prebaked *empty* filesystem for scratch volumes. Volumes are prebaked for the
-## same reason the root is — a host with no mkfs must still be able to create
-## one — and because libkrun's disk-format probe truncates an all-zero image by
-## one 64 KiB cluster while still advertising its original capacity, which leaves
-## the filesystem one cluster longer than the device on the next boot.
+## Prebaked *empty* filesystem for scratch volumes. Volumes are prebaked so a
+## host with no mkfs can still create one.
 $(VOLUME_IMG): $(MKE2FS) $(PIN_STAMP)
 	rm -f $(BUILD)/volume.img
 	truncate -s $(VOLUME_IMG_MIB)M $(BUILD)/volume.img
 	$(MKE2FS) -F -q -t ext4 -b 4096 $(BUILD)/volume.img
 	gzip -9 -c $(BUILD)/volume.img > $(VOLUME_IMG)
 
-## Guest agent binary. Phony on purpose: cargo already does the change detection,
-## whereas `make` would see an existing file with no prerequisites and silently
-## bake a stale agent into the boot volume after any change under crates/terra-agent.
+## Guest agent binary. Cargo decides whether the binary changed; FORCE keeps its
+## dependency graph checked without rebaking the boot image unnecessarily.
 AGENT_BIN := target/$(MUSL)/release/terra-agent
-.PHONY: $(AGENT_BIN)
-$(AGENT_BIN):
-	$(CARGO) build --release -p terra-agent --target $(MUSL)
+$(AGENT_BIN): FORCE
+	$(CARGO_LOCKED) build --release -p terra-agent --target $(MUSL)
 
-## Prebaked *boot volume*: a tiny read-only ext4 holding the guest agent,
-## resize2fs, and the handful of empty directories stage one mounts over. This is
-## what the guest boots — `root=/dev/vda ro init=/terra-agent` — so the boot path
-## touches no host directory at all, and the guest kernel has no initramfs support
-## (CONFIG_BLK_DEV_INITRD is unset in libkrunfw) to offer as an alternative.
-##
-## Constant for a given terra build: the same bytes for every box, so it is
-## unpacked once into ~/.terra/cache/ and shared, like vmlinux.
+# Built-in drivers let the kernel boot directly from this small read-only disk.
 BOOT_TREE := $(BUILD)/boot-tree
 BOOT_IMG := $(BUILD)/boot.img.gz
 BOOT_IMG_MIB := 8
 # The two blobs whose sha256 the binary embeds as their cache identity (the
 # `%.sha256` rule above; TERRA_*_SHA256 in .cargo/config.toml).
 BLOB_SHAS := $(KERNEL_GZ).sha256 $(BOOT_IMG).sha256
-$(BOOT_IMG): $(MKE2FS) $(RESIZE2FS) $(AGENT_BIN) $(PIN_STAMP)
+$(BOOT_IMG): $(MKE2FS) $(RESIZE2FS) $(AGENT_BIN) $(PIN_STAMP) Makefile
 	rm -rf $(BOOT_TREE)
 	# /dev is where the kernel auto-mounts devtmpfs (CONFIG_DEVTMPFS_MOUNT), which
 	# is what gives init a console and the disk nodes; /proc, /sys and /mnt are
@@ -255,11 +271,48 @@ $(BOOT_IMG): $(MKE2FS) $(RESIZE2FS) $(AGENT_BIN) $(PIN_STAMP)
 	rm -f $(BUILD)/boot.img
 	truncate -s $(BOOT_IMG_MIB)M $(BUILD)/boot.img
 	unshare -U -r $(MKE2FS) -F -q -t ext4 -b 4096 -d $(BOOT_TREE) $(BUILD)/boot.img
-	gzip -9 -c $(BUILD)/boot.img > $@
+	gzip -9 -c $(BUILD)/boot.img > $(BOOT_IMG)
 
-## Build the static terra binary (embeds vmlinux and the prebaked images).
-build: $(KERNEL_GZ) $(ROOTFS_IMG) $(VOLUME_IMG) $(BOOT_IMG) $(BLOB_SHAS)
-	$(CARGO) build --release -p terra --target $(MUSL)
+## Build the static terra binary (embeds vmlinux, prebaked images, and trusted
+## component artifacts).
+build: $(COMPONENT_AOT_TARGETS) $(KERNEL_GZ) $(ROOTFS_IMG) $(VOLUME_IMG) $(BOOT_IMG) $(BLOB_SHAS)
+	$(CARGO_LOCKED) build --release -p terra --target $(TERRA_TARGET)
+
+# Guest payloads are produced on Linux and then embedded by each native host
+# build. This keeps macOS and Windows releases free of host mkfs/container
+# tooling while preserving one architecture-specific Linux guest per executable.
+guest-assets: $(KERNEL_GZ) $(ROOTFS_IMG) $(VOLUME_IMG) $(BOOT_IMG) $(BLOB_SHAS)
+
+# A host build receives these architecture-matched files from a Linux guest
+# build. Check them as inputs so a fresh macOS checkout never tries to rebuild
+# the guest kernel, rootfs, or Linux agent because artifact mtimes changed.
+check-guest-assets:
+	@for asset in $(KERNEL_GZ) $(ROOTFS_IMG) $(VOLUME_IMG) $(BOOT_IMG) $(BLOB_SHAS); do test -s $$asset || { echo "missing staged guest asset: $$asset" >&2; exit 1; }; done
+
+host-build: check-guest-assets $(COMPONENT_AOT_TARGETS)
+	$(CARGO_LOCKED) build --release -p terra --target $(TERRA_TARGET)
+
+test-component-vmm: dist
+	TERRA_BIN=$(abspath $(DIST)/terra) $(CARGO_LOCKED) test -p terra --test boot --test memory -- --ignored
+
+## Components use their pinned nightly wasm toolchain outside the native
+## workspace, then the trusted native compiler produces each embedded AOT blob.
+BLOCK_COMPONENT_AOT := $(BUILD)/terra-block-component.cwasm
+verify-wit:
+	python3 scripts/check-wit-links.py
+
+$(COMPONENT_TARGETS): verify-wit
+
+$(COMPONENT_TARGETS): component-%:
+	RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO_LOCKED) build --release --target wasm32-wasip3 --manifest-path components/$*/Cargo.toml
+	wasm-tools validate --features cm-async components/$*/target/wasm32-wasip3/release/terra_$*_component.wasm
+
+$(COMPONENT_AOT_TARGETS): component-%-aot: component-%
+	mkdir -p $(BUILD)
+	$(CARGO_LOCKED) run --target $(TERRA_TARGET) -p terra-runtime --features compiler --example precompile-component -- components/$*/target/wasm32-wasip3/release/terra_$*_component.wasm $(BUILD)/terra-$*-component.cwasm $(if $(filter policy,$*),--policy,)
+
+test-component-boot: $(COMPONENT_AOT_TARGETS) $(KERNEL_GZ) $(ROOTFS_IMG) $(BOOT_IMG) $(BLOB_SHAS)
+	$(CARGO_LOCKED) test -p terra-platform --lib -- --ignored --nocapture
 
 ## Format check, lints, and the test suite. Generating the man pages and
 ## completions is `man`'s job, not this one's — a test that writes to the
@@ -267,55 +320,66 @@ build: $(KERNEL_GZ) $(ROOTFS_IMG) $(VOLUME_IMG) $(BOOT_IMG) $(BLOB_SHAS)
 ## separate:
 ## `make dist && TERRA_BIN=$PWD/dist/terra cargo test -p terra --test boot -- --ignored`
 ## (needs /dev/kvm).
-verify: $(KERNEL_GZ) $(ROOTFS_IMG) $(VOLUME_IMG) $(BOOT_IMG) $(BLOB_SHAS)
+verify: verify-components
+	python3 -B scripts/check-tool-versions.py
+	python3 -B scripts/test-kernel-tools.py
+	python3 -B scripts/test-alpine-sources.py
+	scripts/test-install.sh
 	$(CARGO) fmt --all -- --check
-	$(CARGO) clippy --workspace --all-targets --target $(MUSL) -- -D warnings
+	$(CARGO) fmt --manifest-path fuzz/Cargo.toml -- --check
+	$(CARGO_LOCKED) clippy --workspace --all-targets --target $(MUSL) -- -D warnings
+	$(CARGO_LOCKED) clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
 ## The crates deny rustdoc::broken_intra_doc_links, which only fires under
 ## `cargo doc` — without this step a stale [`link`] survives verify.
-	$(CARGO) doc --workspace --no-deps --document-private-items --target $(MUSL)
-	$(CARGO) test --workspace --target $(MUSL)
+	$(CARGO_LOCKED) doc --workspace --no-deps --document-private-items --target $(MUSL)
+	$(CARGO_LOCKED) test --workspace --target $(MUSL)
+	$(CARGO_LOCKED) test -p terra-runtime --target $(MUSL) --features thread-experiments --test shared_component_memory --test shared_worker_memory
+
+test-install:
+	scripts/test-install.sh
+
+verify-components: $(COMPONENT_AOT_TARGETS) $(KERNEL_GZ) $(ROOTFS_IMG) $(VOLUME_IMG) $(BOOT_IMG) $(BLOB_SHAS)
+	set -e; for manifest in $(COMPONENT_MANIFESTS); do RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO) fmt --manifest-path $$manifest -- --check; done
+	set -e; for manifest in $(COMPONENT_MANIFESTS); do RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO_LOCKED) clippy --target wasm32-wasip3 --manifest-path $$manifest -- -D warnings; done
+	set -e; for manifest in $(COMPONENT_MANIFESTS); do RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO_LOCKED) clippy --all-targets --target $(NATIVE) --manifest-path $$manifest -- -D warnings; done
+	set -e; for manifest in $(COMPONENT_MANIFESTS); do RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO_LOCKED) test --target $(NATIVE) --manifest-path $$manifest; done
+
+check-zig:
+	@test "$$(zig version)" = "$(ZIG_VERSION)" || { echo "need Zig $(ZIG_VERSION), found $$(zig version)" >&2; exit 1; }
 
 ## Regenerate man pages + shell completions from the clap CLI. Rendering lives in
 ## crates/terra/examples/gen-docs.rs so clap_mangen/clap_complete stay
 ## dev-dependencies, out of the release build's dependency graph.
 man:
-	$(CARGO) run -p terra --example gen-docs --target $(MUSL)
-
-## Cross-compile the host binary with cargo-zigbuild. The guest agent and the
-## prebaked images are whatever $(ARCH) built them for and are NOT rebuilt here —
-## a cross-built binary embeds the *building* host's guest set, so it boots a box
-## only where the two archs agree. `aarch64-unknown-linux-musl` is deliberately
-## absent from the list below for that reason: it builds fine (it is a normal
-## `make ARCH=aarch64` target on arm hardware), but cross-building it from x86_64
-## would pair an arm host binary with an x86_64 guest, which cannot boot.
-##
-## Only these targets build today; the rest are blocked upstream in libkrun, not
-## in terra (see README, "Platform support"):
-##   x86_64-pc-windows-gnu   krun-devices pulls vm-memory with the `rawfd`
-##                           feature unconditionally, which compile_error!s on
-##                           Windows. One target-gate upstream fixes it.
-##   x86_64-apple-darwin     krun-cpuid needs kvm-bindings; libkrun on macOS is
-##                           Apple Silicon only.
-## Linking an Apple target needs the macOS SDK for the Hypervisor framework;
-## point SDKROOT at one (zig cannot synthesise it). Everything up to the final
-## link works without it, so `cargo check --target aarch64-apple-darwin` is a
-## useful gate on a Linux CI box.
-CROSS_TARGETS := x86_64-unknown-linux-musl aarch64-apple-darwin
-cross: $(KERNEL_GZ) $(ROOTFS_IMG) $(VOLUME_IMG) $(BOOT_IMG) $(BLOB_SHAS)
-	for t in $(CROSS_TARGETS); do \
-		echo "--- $$t ---"; \
-		$(CARGO) zigbuild --release --target $$t -p terra || exit 1; \
-	done
+	$(CARGO_LOCKED) run -p terra --example gen-docs --target $(TERRA_TARGET)
 
 ## Assemble dist/terra — the single fully-static, portable binary.
-dist: build
+dist: build man
+
+host-dist: host-build man
+
+dist host-dist:
 	mkdir -p $(DIST)
+	mkdir -p $(DIST)/LICENSES
 	# install, not cp: it unlinks first, so a still-running VM holding the old
 	# binary (ETXTBSY) never blocks a rebuild.
-	install -m 755 target/$(MUSL)/release/terra $(DIST)/terra
-	@echo "assembled $(DIST)/terra (fully static — ldd: not a dynamic executable)"
+	install -m 755 target/$(TERRA_TARGET)/release/terra $(DIST)/terra
+	install -m 644 LICENSE NOTICE $(DIST)
+	install -m 644 packaging/licenses/GPL-2.0.txt packaging/licenses/applevisor-MIT.txt packaging/licenses/uds_windows-MIT.txt packaging/licenses/uds_windows-THIRDPARTYNOTICES.txt $(DIST)/LICENSES
+	cp -R packaging/man packaging/completions $(DIST)
+	@echo "assembled $(DIST)/terra for $(TERRA_TARGET)"
+
+## Source inputs for the GPL programs embedded in a release. The release
+## workflow publishes this archive beside the platform archives.
+$(ALPINE_SOURCE_DIST): $(ROOTFS_IMG) scripts/alpine-sources.sh
+	scripts/alpine-sources.sh
+
+source-dist: $(KERNEL_TARBALL) $(MKE2FS) $(ROOTFS_IMG) $(ALPINE_SOURCE_DIST)
+	git archive --format=tar --prefix=terrarium/ HEAD > $(BUILD)/terra-source.tar
+	tar --append --file=$(BUILD)/terra-source.tar --transform='s|^$(BUILD)/|terrarium/$(BUILD)/|' $(KERNEL_TARBALL) $(BUILD)/e2fsprogs.tar.gz $(ALPINE_SOURCE_DIST) $(BUILD)/alpine-minirootfs.tar.gz $(BUILD)/$(DOAS_APK) $(BUILD)/$(DOAS_SHIM_APK)
+	gzip -9nc $(BUILD)/terra-source.tar > $(SOURCE_DIST)
+	rm -f $(BUILD)/terra-source.tar
 
 clean:
 	$(CARGO) clean
 	rm -rf $(DIST) $(BUILD)
-	-$(LIBKRUNFW_MAKE) clean

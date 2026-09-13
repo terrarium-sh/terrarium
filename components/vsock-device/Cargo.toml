@@ -1,0 +1,13 @@
+[package]
+name = "terra-vsock-device"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+terra-protocol = { path = "../../crates/terra-protocol" }
+
+[lints]
+workspace = true

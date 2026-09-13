@@ -1,11 +1,12 @@
 //! Terminal-multiplexer core: broadcast output to all attached clients,
 //! forward client input to the workload.
 
-use crate::mutex::lock_recover;
+use crate::mutex::lock_or_abort;
 use std::fs::File;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
-use terra_shared::contract::{AgentOutput, encode_frame};
+use std::time::{Duration, Instant};
+use terra_protocol::{AgentOutput, encode_frame};
 
 pub(crate) const DEFAULT_ROWS: u16 = 24;
 pub(crate) const DEFAULT_COLS: u16 = 80;
@@ -18,51 +19,106 @@ pub(crate) const MAX_ROWS: u16 = 512;
 pub(crate) const MAX_COLS: u16 = 1024;
 
 pub type Sink = Arc<Mutex<dyn Write + Send>>;
-const INPUT_QUEUE_CAPACITY: usize = 64;
+const INPUT_QUEUE_CAPACITY: usize = 1;
+const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Downstream sink for an attached vsock client or the guest console.
+/// Downstream sink for an attached vsock client.
 #[derive(Clone)]
 pub(crate) struct ClientConn(Arc<Mutex<ClientConnKind>>);
 
 enum ClientConnKind {
     Vsock(File),
-    Console(std::io::Stdout),
+    #[cfg(test)]
+    Test(Box<dyn Write + Send>),
 }
 
 impl ClientConn {
-    pub(crate) fn from_vsock(conn: File) -> Self {
-        Self(Arc::new(Mutex::new(ClientConnKind::Vsock(conn))))
+    pub(crate) fn from_vsock(conn: File) -> std::io::Result<Self> {
+        rustix::net::sockopt::set_socket_timeout(
+            &conn,
+            rustix::net::sockopt::Timeout::Send,
+            Some(CLIENT_WRITE_TIMEOUT),
+        )?;
+        Ok(Self(Arc::new(Mutex::new(ClientConnKind::Vsock(conn)))))
     }
 
-    pub(crate) fn from_console(stdout: std::io::Stdout) -> Self {
-        Self(Arc::new(Mutex::new(ClientConnKind::Console(stdout))))
+    #[cfg(test)]
+    fn from_test_sink(writer: impl Write + Send + 'static) -> Self {
+        Self(Arc::new(Mutex::new(ClientConnKind::Test(Box::new(writer)))))
     }
 
     fn write(&self, msg: &AgentOutput) -> std::io::Result<()> {
-        match &mut *lock_recover(&self.0) {
+        self.write_by(msg, Instant::now() + CLIENT_WRITE_TIMEOUT)
+    }
+
+    fn write_by(&self, msg: &AgentOutput, deadline: Instant) -> std::io::Result<()> {
+        match &mut *lock_or_abort(&self.0) {
             ClientConnKind::Vsock(conn) => {
                 let bytes = encode_frame(msg)?;
-                conn.write_all(&bytes).and_then(|()| conn.flush())
+                write_until(conn, &bytes, deadline, |conn, timeout| {
+                    Ok(rustix::net::sockopt::set_socket_timeout(
+                        conn,
+                        rustix::net::sockopt::Timeout::Send,
+                        Some(timeout),
+                    )?)
+                })
             }
-            ClientConnKind::Console(stdout) => match msg {
-                AgentOutput::Out(bytes) => stdout.write_all(bytes).and_then(|()| stdout.flush()),
-                AgentOutput::Err(_) | AgentOutput::Exit { .. } | AgentOutput::Detached => Ok(()),
-            },
+            #[cfg(test)]
+            ClientConnKind::Test(writer) => {
+                let bytes = encode_frame(msg)?;
+                write_until(writer, &bytes, deadline, |_, _| Ok(()))
+            }
         }
     }
 }
 
+fn write_until<W: Write>(
+    writer: &mut W,
+    mut bytes: &[u8],
+    deadline: Instant,
+    mut prepare_write: impl FnMut(&mut W, Duration) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        let timeout = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|timeout| !timeout.is_zero())
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::TimedOut))?;
+        prepare_write(writer, prepare_socket_timeout(timeout))?;
+        match writer.write(bytes) {
+            Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::WriteZero)),
+            Ok(count) => bytes = &bytes[count..],
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    writer.flush()
+}
+
+fn prepare_socket_timeout(timeout: Duration) -> Duration {
+    // rustix rounds fractional microseconds up without carrying into tv_sec.
+    timeout
+        .saturating_sub(Duration::from_nanos(u64::from(
+            timeout.subsec_nanos() % 1_000,
+        )))
+        .max(Duration::from_micros(1))
+}
+
 impl Drop for ClientConnKind {
     fn drop(&mut self) {
-        if let ClientConnKind::Vsock(conn) = self {
-            // Shut down socket so the host reader receives EOF despite cloned streams.
-            let _ = rustix::net::shutdown(conn, rustix::net::Shutdown::Both);
+        match self {
+            Self::Vsock(conn) => {
+                let _ = rustix::net::shutdown(conn, rustix::net::Shutdown::Both);
+            }
+            #[cfg(test)]
+            Self::Test(_) => {}
         }
     }
 }
 
 pub struct Session {
     inner: Mutex<Inner>,
+    delivery: Mutex<()>,
+    _input_sink: Sink,
     input: std::sync::mpsc::SyncSender<Vec<u8>>,
 }
 
@@ -72,6 +128,7 @@ struct Inner {
     next_id: u64,
     closed: bool,
     exit_code: i32,
+    saw_output: bool,
 }
 
 struct Client {
@@ -90,9 +147,10 @@ impl Session {
     pub fn new(input: Sink) -> Arc<Self> {
         let (input_sender, input_receiver) =
             std::sync::mpsc::sync_channel::<Vec<u8>>(INPUT_QUEUE_CAPACITY);
+        let input_sink = input.clone();
         std::thread::spawn(move || {
             while let Ok(bytes) = input_receiver.recv() {
-                let mut input = lock_recover(&input);
+                let mut input = lock_or_abort(&input);
                 if input
                     .write_all(&bytes)
                     .and_then(|()| input.flush())
@@ -109,29 +167,42 @@ impl Session {
                 next_id: 0,
                 closed: false,
                 exit_code: 0,
+                saw_output: false,
             }),
+            delivery: Mutex::new(()),
+            _input_sink: input_sink,
             input: input_sender,
         })
     }
 
-    /// Broadcasts output to all attached clients, dropping any whose writes fail.
+    /// Broadcasts output, dropping clients that cannot be reached within one write budget.
     pub fn feed_output(&self, bytes: &[u8]) {
+        let _delivery = lock_or_abort(&self.delivery);
+        let frame = AgentOutput::Out(bytes.to_vec());
         let clients = {
-            let mut inner = lock_recover(&self.inner);
+            let mut inner = lock_or_abort(&self.inner);
+            if inner.closed {
+                return;
+            }
             inner.parser.process(bytes);
+            inner.saw_output = true;
             inner
                 .clients
                 .iter()
-                .map(|c| (c.id, c.conn.clone()))
+                .map(|client| (client.id, client.conn.clone()))
                 .collect::<Vec<_>>()
         };
-        let frame = AgentOutput::Out(bytes.to_vec());
-        let failed = clients
-            .into_iter()
-            .filter_map(|(id, conn)| conn.write(&frame).err().map(|_| id))
-            .collect::<Vec<_>>();
+        let mut failed = Vec::new();
+        for (id, conn) in clients {
+            if conn
+                .write_by(&frame, Instant::now() + CLIENT_WRITE_TIMEOUT)
+                .is_err()
+            {
+                failed.push(id);
+            }
+        }
         if !failed.is_empty() {
-            lock_recover(&self.inner)
+            lock_or_abort(&self.inner)
                 .clients
                 .retain(|client| !failed.contains(&client.id));
         }
@@ -139,45 +210,67 @@ impl Session {
 
     /// Broadcasts the workload exit code to all clients and closes connections.
     pub fn broadcast_exit(&self, code: i32) {
+        let _delivery = lock_or_abort(&self.delivery);
         let clients = {
-            let mut inner = lock_recover(&self.inner);
+            let mut inner = lock_or_abort(&self.inner);
             inner.exit_code = code;
             inner.closed = true;
             std::mem::take(&mut inner.clients)
         };
         for client in clients {
-            let _ = client.conn.write(&AgentOutput::Exit { code });
+            let _ = client.conn.write_by(
+                &AgentOutput::Exit { code },
+                Instant::now() + CLIENT_WRITE_TIMEOUT,
+            );
         }
     }
 
-    /// Attaches a client and repaints the current screen, returning its client ID.
+    /// Attaches a client and repaints the current screen, returning its client ID on success.
     #[must_use]
-    pub fn attach_client(&self, conn: &ClientConn) -> u64 {
-        let (id, output) = {
-            let mut inner = lock_recover(&self.inner);
+    pub fn attach_client(&self, conn: &ClientConn) -> Option<u64> {
+        let _delivery = lock_or_abort(&self.delivery);
+        let (id, output, exit) = {
+            let mut inner = lock_or_abort(&self.inner);
             let id = inner.next_id;
             inner.next_id += 1;
-            let output = if inner.closed {
-                AgentOutput::Exit {
-                    code: inner.exit_code,
-                }
+            let (output, exit) = if inner.closed {
+                let output = inner
+                    .saw_output
+                    .then(|| AgentOutput::Out(inner.parser.screen().contents_formatted()));
+                (output, Some(inner.exit_code))
             } else {
                 inner.clients.push(Client {
                     id,
                     conn: conn.clone(),
                     size: None,
                 });
-                AgentOutput::Out(inner.parser.screen().contents_formatted())
+                (
+                    Some(AgentOutput::Out(inner.parser.screen().contents_formatted())),
+                    None,
+                )
             };
-            (id, output)
+            (id, output, exit)
         };
-        let _ = conn.write(&output);
-        id
+        if let Some(output) = output
+            && conn.write(&output).is_err()
+        {
+            lock_or_abort(&self.inner)
+                .clients
+                .retain(|client| client.id != id);
+            return None;
+        }
+        if let Some(code) = exit
+            && conn.write(&AgentOutput::Exit { code }).is_err()
+        {
+            return None;
+        }
+        Some(id)
     }
 
     pub fn detach_client(&self, id: u64) -> DetachOutcome {
+        let _delivery = lock_or_abort(&self.delivery);
         let (client, size) = {
-            let mut inner = lock_recover(&self.inner);
+            let mut inner = lock_or_abort(&self.inner);
             let Some(index) = inner.clients.iter().position(|client| client.id == id) else {
                 return DetachOutcome::Missing;
             };
@@ -189,8 +282,9 @@ impl Session {
     }
 
     pub fn detach_all_clients(&self) -> (Vec<u64>, Option<(u16, u16)>) {
+        let _delivery = lock_or_abort(&self.delivery);
         let (clients, size) = {
-            let mut inner = lock_recover(&self.inner);
+            let mut inner = lock_or_abort(&self.inner);
             let clients = std::mem::take(&mut inner.clients);
             let size = inner.update_shared_size();
             (clients, size)
@@ -202,7 +296,7 @@ impl Session {
     }
 
     pub fn list_clients(&self) -> Vec<(u64, Option<(u16, u16)>)> {
-        lock_recover(&self.inner)
+        lock_or_abort(&self.inner)
             .clients
             .iter()
             .map(|c| (c.id, c.size))
@@ -211,7 +305,7 @@ impl Session {
 
     /// Records a client's terminal size, returning the new shared size if changed.
     pub fn set_client_size(&self, id: u64, rows: u16, cols: u16) -> Option<(u16, u16)> {
-        let mut inner = lock_recover(&self.inner);
+        let mut inner = lock_or_abort(&self.inner);
         let c = inner.clients.iter_mut().find(|c| c.id == id)?;
         c.size = Some((
             rows.clamp(MIN_ROWS, MAX_ROWS),
@@ -221,22 +315,28 @@ impl Session {
     }
 
     pub fn send_input(&self, bytes: &[u8]) -> std::io::Result<()> {
-        self.input
-            .try_send(bytes.to_vec())
-            .map_err(|error| match error {
-                std::sync::mpsc::TrySendError::Full(_) => {
-                    std::io::Error::from(std::io::ErrorKind::WouldBlock)
+        let deadline = Instant::now() + CLIENT_WRITE_TIMEOUT;
+        let mut bytes = bytes.to_vec();
+        loop {
+            match self.input.try_send(bytes) {
+                Ok(()) => return Ok(()),
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    return Err(std::io::ErrorKind::BrokenPipe.into());
                 }
-                std::sync::mpsc::TrySendError::Disconnected(_) => {
-                    std::io::Error::from(std::io::ErrorKind::BrokenPipe)
-                }
-            })
+                Err(std::sync::mpsc::TrySendError::Full(pending)) => bytes = pending,
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(std::io::ErrorKind::TimedOut.into());
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(10)));
+        }
     }
 
     #[cfg(test)]
     #[must_use]
     fn count_clients(&self) -> usize {
-        lock_recover(&self.inner).clients.len()
+        lock_or_abort(&self.inner).clients.len()
     }
 }
 
@@ -260,13 +360,14 @@ impl Inner {
 mod tests {
     use super::*;
     use std::os::unix::net::UnixStream;
+    use std::sync::mpsc;
     use std::time::Duration;
-    use terra_shared::contract::read_frame;
+    use terra_protocol::read_frame;
 
     fn create_client_pair() -> (ClientConn, UnixStream) {
         let (client, server) = UnixStream::pair().unwrap();
         (
-            ClientConn::from_vsock(File::from(std::os::fd::OwnedFd::from(server))),
+            ClientConn::from_vsock(File::from(std::os::fd::OwnedFd::from(server))).unwrap(),
             client,
         )
     }
@@ -281,6 +382,192 @@ mod tests {
     fn create_input_sink() -> (Sink, Arc<Mutex<Vec<u8>>>) {
         let shared = Arc::new(Mutex::new(Vec::<u8>::new()));
         (shared.clone(), shared)
+    }
+
+    struct StalledWriter {
+        writes: usize,
+        started: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    }
+
+    struct SlowWriter {
+        writes: usize,
+        started: Option<mpsc::Sender<()>>,
+    }
+
+    impl Write for SlowWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.writes += 1;
+            if self.writes > 1 {
+                if let Some(started) = self.started.take() {
+                    let _ = started.send(());
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct TrickleWriter;
+
+    struct FailingWriter(mpsc::Sender<()>);
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            let _ = self.0.send(());
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Write for TrickleWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            std::thread::sleep(Duration::from_millis(100));
+            Ok(usize::from(!bytes.is_empty()))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_trickling_frame_cannot_extend_its_write_deadline() {
+        let start = Instant::now();
+        assert_eq!(
+            write_until(
+                &mut TrickleWriter,
+                b"abcdefghij",
+                start + Duration::from_millis(250),
+                |_, _| Ok(())
+            )
+            .unwrap_err()
+            .kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        assert!(start.elapsed() < Duration::from_millis(400));
+    }
+
+    #[test]
+    fn socket_timeout_does_not_round_into_an_invalid_timeval() {
+        assert_eq!(
+            prepare_socket_timeout(Duration::new(0, 999_999_999)),
+            Duration::from_micros(999_999)
+        );
+        assert_eq!(
+            prepare_socket_timeout(Duration::from_nanos(1)),
+            Duration::from_micros(1)
+        );
+    }
+
+    impl Write for StalledWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.writes += 1;
+            if self.writes > 1 {
+                let _ = self.started.send(());
+                let _ = self.release.recv();
+            }
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn stalled_output_does_not_hold_session_state_lock() {
+        let (input, _) = create_input_sink();
+        let session = Session::new(input);
+        let (started, started_rx) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let client = ClientConn::from_test_sink(StalledWriter {
+            writes: 0,
+            started,
+            release: release_rx,
+        });
+        let _ = session.attach_client(&client);
+
+        let output_session = session.clone();
+        let output = std::thread::spawn(move || output_session.feed_output(b"blocked"));
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let start = std::time::Instant::now();
+        assert_eq!(session.list_clients().len(), 1);
+        assert!(start.elapsed() < Duration::from_millis(100));
+        release.send(()).unwrap();
+        output.join().unwrap();
+    }
+
+    #[test]
+    fn slow_clients_delay_an_attach_only_while_they_are_written() {
+        let (input, _) = create_input_sink();
+        let session = Session::new(input);
+        let (started, started_rx) = mpsc::channel();
+        for client_number in 0..4 {
+            let client = ClientConn::from_test_sink(SlowWriter {
+                writes: 0,
+                started: (client_number == 0).then_some(started.clone()),
+            });
+            let _ = session.attach_client(&client);
+        }
+        let output_session = session.clone();
+        let output = std::thread::spawn(move || output_session.feed_output(b"blocked"));
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let attach_session = session.clone();
+        let attach = std::thread::spawn(move || {
+            let client = ClientConn::from_test_sink(Vec::new());
+            let _ = attach_session.attach_client(&client);
+        });
+        let start = std::time::Instant::now();
+        attach.join().unwrap();
+        assert!(start.elapsed() < Duration::from_millis(600));
+        output.join().unwrap();
+    }
+
+    #[test]
+    fn a_slow_client_does_not_skip_a_healthy_clients_output() {
+        let (input, _) = create_input_sink();
+        let session = Session::new(input);
+        for _ in 0..11 {
+            let _ = session.attach_client(&ClientConn::from_test_sink(SlowWriter {
+                writes: 0,
+                started: None,
+            }));
+        }
+        let (healthy, mut stream) = create_client_pair();
+        let _ = session.attach_client(&healthy);
+        drain_repaint(&mut stream);
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+
+        session.feed_output(b"still here");
+
+        assert_eq!(
+            read_frame::<AgentOutput>(&mut stream).unwrap(),
+            Some(AgentOutput::Out(b"still here".to_vec()))
+        );
+    }
+
+    #[test]
+    fn a_client_whose_repaint_fails_is_not_attached() {
+        let (input, _) = create_input_sink();
+        let session = Session::new(input);
+        let (failed, _) = mpsc::channel();
+
+        assert_eq!(
+            session.attach_client(&ClientConn::from_test_sink(FailingWriter(failed))),
+            None
+        );
+        assert_eq!(session.count_clients(), 0);
     }
 
     /// `terra <box> detach` ends with the client told it was detached - the
@@ -302,13 +589,23 @@ mod tests {
             read_frame::<AgentOutput>(&mut a).unwrap(),
             Some(AgentOutput::Detached)
         );
-        b.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        let mut fds = [rustix::event::PollFd::new(&b, rustix::event::PollFlags::IN)];
+        rustix::event::poll(&mut fds, Some(&rustix::event::Timespec::default())).unwrap();
         assert!(
-            read_frame::<AgentOutput>(&mut b).is_err(),
+            fds[0].revents().is_empty(),
             "the surviving client was told too"
         );
 
         let _ = session.detach_all_clients();
+        rustix::event::poll(
+            &mut fds,
+            Some(&rustix::event::Timespec::try_from(CLIENT_WRITE_TIMEOUT).unwrap()),
+        )
+        .unwrap();
+        assert!(
+            !fds[0].revents().is_empty(),
+            "the survivor was not told it was dropped"
+        );
         assert_eq!(
             read_frame::<AgentOutput>(&mut b).unwrap(),
             Some(AgentOutput::Detached)
@@ -340,20 +637,64 @@ mod tests {
 
         session.send_input(b"q").unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        while lock_recover(&proc_in).as_slice() != b"q" && std::time::Instant::now() < deadline {
+        while lock_or_abort(&proc_in).as_slice() != b"q" && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert_eq!(&*lock_recover(&proc_in), b"q");
+        assert_eq!(&*lock_or_abort(&proc_in), b"q");
     }
 
     #[test]
     fn input_enqueue_does_not_wait_for_the_writer() {
         let (input, proc_in) = create_input_sink();
         let session = Session::new(input);
-        let _writer = lock_recover(&proc_in);
+        let _writer = lock_or_abort(&proc_in);
         let start = std::time::Instant::now();
         session.send_input(b"q").unwrap();
         assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn failed_input_write_keeps_the_sink_alive_for_terminal_resizes() {
+        let (failed, failed_rx) = mpsc::channel();
+        let input: Sink = Arc::new(Mutex::new(FailingWriter(failed)));
+        let session = Session::new(input.clone());
+        session.send_input(b"q").unwrap();
+        failed_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Arc::strong_count(&input) > 2 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(Arc::strong_count(&input), 2);
+    }
+
+    #[test]
+    fn full_input_queue_applies_backpressure_until_the_workload_reads() {
+        let (started, started_rx) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let input: Sink = Arc::new(Mutex::new(StalledWriter {
+            writes: 1,
+            started,
+            release: release_rx,
+        }));
+        let session = Session::new(input);
+        session.send_input(b"q").unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        for _ in 0..INPUT_QUEUE_CAPACITY {
+            session.send_input(b"q").unwrap();
+        }
+        assert_eq!(
+            session.send_input(b"timeout").unwrap_err().kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        let (sent, received) = mpsc::channel();
+        let sender = std::thread::spawn(move || {
+            session.send_input(b"last").unwrap();
+            sent.send(()).unwrap();
+        });
+        assert!(received.recv_timeout(Duration::from_millis(50)).is_err());
+        release.send(()).unwrap();
+        received.recv_timeout(Duration::from_secs(1)).unwrap();
+        sender.join().unwrap();
     }
 
     #[test]
@@ -379,8 +720,8 @@ mod tests {
     fn smallest_attached_terminal_wins() {
         let (input, _) = create_input_sink();
         let session = Session::new(input);
-        let ida = session.attach_client(&create_client_pair().0);
-        let idb = session.attach_client(&create_client_pair().0);
+        let ida = session.attach_client(&create_client_pair().0).unwrap();
+        let idb = session.attach_client(&create_client_pair().0).unwrap();
 
         assert_eq!(session.set_client_size(ida, 50, 200), Some((50, 200)));
         assert_eq!(session.set_client_size(idb, 30, 100), Some((30, 100)));
@@ -417,8 +758,8 @@ mod tests {
         let session = Session::new(input);
         assert_eq!(session.list_clients(), vec![]);
 
-        let sized = session.attach_client(&create_client_pair().0);
-        let plain = session.attach_client(&create_client_pair().0);
+        let sized = session.attach_client(&create_client_pair().0).unwrap();
+        let plain = session.attach_client(&create_client_pair().0).unwrap();
         session.set_client_size(sized, 30, 100);
 
         assert_eq!(
@@ -448,7 +789,7 @@ mod tests {
     fn detach_all_clears_the_clients_and_returns_the_default_size() {
         let (input, _) = create_input_sink();
         let session = Session::new(input);
-        let a = session.attach_client(&create_client_pair().0);
+        let a = session.attach_client(&create_client_pair().0).unwrap();
         let _b = session.attach_client(&create_client_pair().0);
         session.set_client_size(a, 30, 100);
 
@@ -516,6 +857,47 @@ mod tests {
             Some(AgentOutput::Exit { code: 42 })
         );
         assert_eq!(session.count_clients(), 0);
+    }
+
+    #[test]
+    fn a_client_attaching_after_output_and_exit_receives_the_screen_then_status() {
+        let (input, _) = create_input_sink();
+        let session = Session::new(input);
+        session.feed_output(b"one-shot\n");
+        session.broadcast_exit(0);
+
+        let (conn, mut stream) = create_client_pair();
+        let _ = session.attach_client(&conn);
+
+        let Some(AgentOutput::Out(output)) = read_frame(&mut stream).unwrap() else {
+            panic!("late client did not receive output");
+        };
+        assert!(String::from_utf8_lossy(&output).contains("one-shot"));
+        assert_eq!(
+            read_frame::<AgentOutput>(&mut stream).unwrap(),
+            Some(AgentOutput::Exit { code: 0 })
+        );
+    }
+
+    #[test]
+    fn output_after_exit_does_not_change_a_late_clients_repaint() {
+        let (input, _) = create_input_sink();
+        let session = Session::new(input);
+        session.feed_output(b"before exit\n");
+        session.broadcast_exit(0);
+        session.feed_output(b"after exit\n");
+
+        let (conn, mut stream) = create_client_pair();
+        let _ = session.attach_client(&conn);
+        let Some(AgentOutput::Out(output)) = read_frame(&mut stream).unwrap() else {
+            panic!("late client did not receive output");
+        };
+        assert!(String::from_utf8_lossy(&output).contains("before exit"));
+        assert!(!String::from_utf8_lossy(&output).contains("after exit"));
+        assert_eq!(
+            read_frame::<AgentOutput>(&mut stream).unwrap(),
+            Some(AgentOutput::Exit { code: 0 })
+        );
     }
 
     /// A client whose socket is gone is dropped on the next broadcast: the

@@ -6,7 +6,7 @@ use crate::session::{self, pump_exec};
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::ExitCode;
-use terra_shared::contract::{AgentService, ExecRequest, encode_frame};
+use terra_protocol::{AgentService, ExecRequest, encode_frame};
 
 pub fn run(
     args: &crate::cli::ExecArgs,

@@ -8,25 +8,17 @@
 # byte of guest that ships.
 #
 # Two mechanisms depend on it, so nothing here is decorative:
-#   * every hash is checked at build time, on the file, every build — not just on
-#     download. A tarball already cached in a submodule's tree is checked too.
+#   * every hash is checked when its input is downloaded or its payload rebuilds.
 #   * the Makefile hashes all of these into $(PIN_STAMP); edit any value and the
 #     guest images rebuild. Without that a bumped version is a silent no-op, which
 #     is the wrong failure for a security update.
 #
-# Requires $(ARCH) and $(LIBKRUNFW_DIR) — include it after those are set.
+# Requires $(ARCH) — include it after those are set.
 
-# --- Guest kernel -----------------------------------------------------------
-# Mirrors libkrunfw's pinned kernel version (vendor/libkrunfw/Makefile line 1).
-# Keep in sync on submodule bump.
-KERNEL_VERSION := linux-6.12.91
-# The published hash from cdn.kernel.org/pub/linux/kernel/v6.x/sha256sums.asc.
-# libkrunfw fetches this tarball with a bare `curl` — no -f, no hash check — and
-# it is compiled into the vmlinux that ships inside every terra binary, which
-# made it the one build input taken on trust. Update together with
-# KERNEL_VERSION.
-KERNEL_SHA256 := 0ff2ab9e169f9f1948557471fbb450d3018f8c5b77caf288e1a3982582597969
-KERNEL_TARBALL := $(LIBKRUNFW_DIR)/tarballs/$(KERNEL_VERSION).tar.xz
+# --- Terra guest kernel: upstream Linux LTS ---------------------------------
+KERNEL_VERSION := 6.18.50
+KERNEL_SHA256 := d2fc041dab4e11d9645e3ba53be058faa52b8ce28a8a97c889bb2cacee170461
+KERNEL_URL := https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$(KERNEL_VERSION).tar.xz
 
 # --- e2fsprogs --------------------------------------------------------------
 # Built static with the zig musl toolchain. `mke2fs` bakes the guest images at

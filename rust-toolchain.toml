@@ -1,8 +1,4 @@
 [toolchain]
 channel = "1.97.1"
 components = ["clippy", "rustfmt"]
-# `.cargo/config.toml` sets this as the default build target, so rustup has to
-# install its std — without it a bare `cargo build` on a fresh machine (CI
-# included) fails on a missing core/std for the target rather than on anything
-# real.
 targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]

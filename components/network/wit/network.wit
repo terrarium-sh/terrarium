@@ -1,0 +1,29 @@
+package terra:network@0.1.0;
+
+interface api {
+    record published-port { host-port: u16, guest-port: u16 }
+    record config { gateway-mac: list<u8>, gateway-ip: list<u8>, gateway-ip6: list<u8>, host-service-ports: list<option<u16>>, published-ports: list<published-port>, mtu: u32 }
+    enum error { malformed, backpressure, not-ready }
+    configure: func(config: config) -> result<_, error>;
+    run: async func() -> result<_, error>;
+    receive: async func(frame: list<u8>) -> result<_, error>;
+    take-frames: func(max-items: u32, max-bytes: u32) -> list<list<u8>>;
+    reset: func();
+}
+
+interface transport {
+    use terra:mmio/types@0.1.0.{device-error};
+    configure: func() -> result<_, device-error>;
+}
+
+world device {
+    import wasi:clocks/monotonic-clock@0.3.1;
+    import wasi:sockets/ip-name-lookup@0.3.1;
+    import wasi:sockets/types@0.3.1;
+    import terra:host/memory@0.1.0;
+    import terra:host/interrupt@0.1.0;
+    import terra:host/diagnostics@0.1.0;
+    export api;
+    export transport;
+    export terra:mmio/device@0.1.0;
+}

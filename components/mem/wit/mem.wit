@@ -1,0 +1,21 @@
+package terra:mem@0.1.0;
+
+interface host {
+    record range { addr: u64, len: u64 }
+    enum error { invalid, too-large, io }
+    discard: func(ranges: list<range>) -> result<_, error>;
+}
+
+interface transport {
+    use terra:mmio/types@0.1.0.{device-error};
+    configure: func() -> result<_, device-error>;
+    run: async func() -> result<_, device-error>;
+}
+
+world device {
+    import terra:host/memory@0.1.0;
+    import terra:host/interrupt@0.1.0;
+    import host;
+    export transport;
+    export terra:mmio/device@0.1.0;
+}

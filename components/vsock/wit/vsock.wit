@@ -1,0 +1,53 @@
+package terra:vsock@0.1.0;
+
+interface host-service {
+    enum endpoint-error { closed, io, too-large }
+    variant event { diagnostic(list<u8>), exit(s32) }
+    resource client {
+        input: async func() -> stream<u8>;
+        output: async func(bytes: stream<u8>) -> result<_, endpoint-error>;
+        shutdown-write: func();
+    }
+    listener: async func() -> option<stream<own<client>>>;
+    plan: async func() -> stream<u8>;
+    stop: async func() -> stream<u8>;
+}
+
+interface api {
+    use host-service.{event};
+    use terra:mmio/types@0.1.0.{device-error};
+    configure-device: func() -> result<_, device-error>;
+    configure-worker: async func(control-events: bool);
+    events: func() -> stream<event>;
+    record reply { header: list<u8>, payload: list<u8> }
+    record connection { guest-port: u32, host-port: u32 }
+    enum error { table-full, backpressure, unknown-connection, malformed }
+    record control-result { consumed: u32, exit-code: option<s32> }
+    record diagnostic-result { consumed: u32, output: list<u8> }
+    run: async func() -> result<_, error>;
+    decode-control: func(bytes: list<u8>, events: bool) -> result<control-result, error>;
+    decode-diagnostics: func(bytes: list<u8>) -> result<diagnostic-result, error>;
+    receive: func(packet: list<u8>) -> result<_, error>;
+    take-replies: func(max-items: u32, max-bytes: u32) -> list<reply>;
+    connect: func(guest-port: u32) -> result<u32, error>;
+    deliver: func(guest-port: u32, host-port: u32, data: list<u8>) -> result<_, error>;
+    shutdown: func(guest-port: u32, host-port: u32) -> result<_, error>;
+    reset-connection: func(guest-port: u32, host-port: u32) -> result<_, error>;
+    consume-upstream: func(guest-port: u32, host-port: u32, max-bytes: u32) -> list<u8>;
+    connections: func(max-items: u32) -> list<connection>;
+    connection-count: func() -> u32;
+    connection-exists: func(guest-port: u32, host-port: u32) -> bool;
+    reset: func();
+    close: async func();
+}
+
+world device {
+    import host-service;
+    import terra:host/memory@0.1.0;
+    import terra:host/interrupt@0.1.0;
+    import wasi:clocks/monotonic-clock@0.3.1;
+    import wasi:clocks/system-clock@0.3.1;
+    import wasi:random/random@0.3.1;
+    export api;
+    export terra:mmio/device@0.1.0;
+}

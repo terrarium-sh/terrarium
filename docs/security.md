@@ -1,95 +1,144 @@
 # Security model
 
-Without host mounts, the VM is the boundary. A hostile workload is contained
-by libkrun's hardware-virtualized microVM; the recipe is how you deliberately
-open narrow paths back to the host.
+Terra runs a workload in a hardware-virtualized VM. The VM boundary is intended
+to protect the host from a hostile guest, subject to the trusted computing base
+and limits below. Linux uses KVM, macOS uses Hypervisor.framework, and Windows
+uses WHP. Current-build hardware acceptance remains tracked in
+[todo.md](../todo.md); earlier Linux results do not validate every later change.
 
-## What a recipe can grant
+This document describes the boundary Terra implements. It is not an assurance
+against flaws in the host kernel, hypervisor, Wasmtime, WASI, native runtime,
+or the trusted build pipeline.
 
-| feature | what crosses the boundary |
-|---|---|
-| `mounts` | Host directories presented through libkrun virtiofs. A writable mount gives the guest your own access to that directory; `readonly: true` lets it inspect without changing files. It does not confine the VMM to that directory. |
-| `network.ports` | A guest listener published on host loopback only. |
-| `allow: ["HOST_LOOPBACK:PORT"]`, or an allowed `hosts:` name resolving there | A connection to the computer running terra. This is the only way to reach the host itself. |
-| `terra exec` | One host-initiated command in a running box. `--root` makes that command guest root; it does not grant the workload root. |
-| `terra put` / `get` | One host-initiated file transfer. |
-| `env:` and `env_file:` | Values supplied to guest processes. `env:` values are part of the pinned recipe; `env_file:` values are merged into the in-memory boot plan and never written to guest disk by Terra. |
+## Trust and authority
 
-No `mounts` means Terra exposes no host filesystem through guest devices.
+Treat the guest kernel, every process in the guest (including guest root),
+guest-controlled device requests, network peers, and Wasm device code as
+hostile. Trust the host operating system and identity that start Terra, the
+recipe chosen by the operator, and the build pipeline that produces Terra and
+its embedded components.
 
-## Mounts require host confinement
+A recipe is an authorization decision. Review it before `terra setup`,
+especially when it comes from another repository. It can grant host
+directories, network destinations, environment values, published ports, and
+guest-root hooks.
 
-libkrun virtiofs does not confine a guest to the configured directory. A guest
-can potentially access other host filesystems or directories that the VMM can
-access. Treat a mount as granting the guest the VMM's host filesystem access,
-not as a narrow filesystem boundary. See libkrun's
-[security model](https://github.com/containers/libkrun#security-model).
+The shipped binary embeds precompiled Wasmtime components. Deserializing an
+AOT component is trusted native-code loading, so those artifacts must come from
+the matching Terra build; guest or network input must never supply them.
 
-Terra does not currently confine its VMM. If a workload needs mounts, run
-terra inside a host sandbox that exposes only the shares and VM runtime files:
-on Linux, use a mount namespace; on macOS, use an equivalent system sandbox.
-Running terra as a dedicated unprivileged user is weaker but useful
-confinement: the guest can still reach every file that user can reach, so that
-account must have access only to the shares and VM runtime files. Otherwise,
-do not use `mounts`.
+## Recipe grants
 
-Terra's mount checks reduce accidental authority, but are not confinement. It
-refuses a mount that resolves to `~/.terra`, or a writable mount that resolves
-to the terra binary: those files define later boxes and boots, so a guest must
-never be able to rewrite them. libkrun opens a share by path after this check,
-so do not mount a path whose parent another process, including another running
-box, can replace.
+| Recipe feature | Authority it grants |
+| --- | --- |
+| `mounts` | Access to the selected host directory. A writable mount permits creation, modification, and deletion in that directory; `readonly` is enforced by the host-side directory capability. |
+| `network.allow` | Outbound access to the allowed destination and port. An explicit `HOST_LOOPBACK` grant can reach services on the Terra host. |
+| `network.hosts` | Local DNS records; a record alone does not authorize a connection. Add a matching `allow` rule. |
+| `network.mode: unrestricted-public` | Public egress without individual rules. Host, LAN, private, link-local, and cloud-metadata addresses remain blocked unless separately allowed. |
+| `network.ports` | A guest listener published on host loopback. |
+| `env` and `env_file` | Values delivered to guest hooks and workload processes. Secrets delivered to a guest may be copied or persisted by it. |
+| `hooks`, `sudo`, and `terra exec --root` | Guest-root authority inside that box only. |
+| `terra put` and `terra get` | A host-initiated transfer of one file. The operator chooses the host path and authorizes guest output. |
 
-A recipe source inside a directory a currently pinned box shares read-write is
-treated as possibly guest-authored: `terra setup` shows what it grants and asks
-before pinning it. In scripts, `--trust-recipe` is that explicit approval.
-Terra does not retain former shares, so treat files that were once shared
-read-write as untrusted too.
+The default network mode is an empty allowlist. An allowed network service is
+trusted for every action a guest can take over that connection; destination
+filtering cannot constrain the application protocol. `network.ports` does not
+publish a service to a non-loopback host address.
 
-Host paths used by `put`, `get`, and `env_file` are opened without following
-symlinks. A guest cannot turn a shared-directory symlink into access somewhere
-else on the host.
+The egress floor checks the embedded IPv4 destination in the NAT64 well-known
+prefix `64:ff9b::/96`. Site-specific translation prefixes are not inferred from
+host routing; hosts using them need equivalent destination filtering at the
+translator.
 
-## Network
+Mounts are opened as directory capabilities and exposed to their filesystem
+component as a WASI preopen. A guest path or symlink does not create a new host
+directory grant. Grant only the tree the workload needs. In particular, do not
+mount device directories, broad home directories, or other unrelated host
+trees.
 
-The network policy filters egress. In both modes, the host, LAN, private ranges,
-link-local addresses, and cloud metadata remain blocked unless an `allow` rule
-explicitly permits them. `unrestricted-public` opens public internet access;
-`allowlist` opens only listed destinations.
+`put`, `get`, and `env_file` operate on host paths selected by the operator,
+including the host filesystem's normal symlink resolution. They are distinct
+from a WASI mount capability.
 
-An allowed service is trusted: encrypted traffic to it can carry any protocol,
-including DNS-over-HTTPS. Keep `allow` rules as narrow as the workload permits.
-See the [recipe reference](recipe.md) for DNS and rule syntax.
+## Runtime boundary
 
-## What is not a boundary
+Terra creates separate Wasmtime stores and linkers for the VMM and device
+components. Native code owns VM creation, guest-RAM mappings, hypervisor
+handles, host I/O, and the checks that grant filesystem and network authority.
+Guest-memory, block-I/O, and reclaim requests are range- and overflow-checked
+before native access. Block disks are opened as fixed-capacity grants; guest
+writes cannot extend their initial extent. The filesystem component receives a
+scoped directory preopen only when a mount is configured. Network socket and
+name-resolution operations are checked against the box policy before the host
+operation proceeds. Device components do not receive arbitrary host filesystem
+or hypervisor handles.
 
-- **Guest root, `sudo:`, and hooks.** These protect the box's own filesystem,
-  not the host. Hooks deliberately run as guest root.
-- **The recipe.** It can mount host paths and run root hooks. Review it like a
-  shell script before setup, especially when it comes from a repository.
-- **A configured mount.** libkrun does not make it a host filesystem boundary.
-  Contain the VMM outside Terra or run without mounts.
-- **Your terminal.** Attached workload output is intentionally raw so TUIs work.
-  A hostile workload can emit terminal escape sequences; use a terminal policy
-  that disables features you do not trust.
-- **Running terra as host root.** Writable mounts then give the guest real root
-  ownership on the host. On Linux, run as an unprivileged user in the `kvm`
-  group; otherwise use read-only mounts, or set `TERRA_ALLOW_ROOT=1` only when
-  you mean it.
+Native preparation fixes the machine resources before a separate boot store
+parses the kernel. Native code validates its bounded writes and one-time result,
+then destroys the boot store before starting the VMM. Only the VMM receives
+opaque vCPU resources; device components cannot create or select a hypervisor.
 
-## Host state and services
+| Component | Scoped authority beyond runtime support |
+| --- | --- |
+| Block | Its VM's RAM, assigned interrupt and one fixed-capacity backing disk. |
+| Filesystem | Its VM's RAM, assigned interrupt and one directory preopen. |
+| Network | Its VM's RAM, assigned interrupt, policy-controlled WASI sockets/DNS, and warnings in the capped host log. |
+| Memory | Its VM's RAM, assigned interrupt and bounded reclamation of that RAM. |
+| Vsock | Its VM's RAM, assigned interrupt, supplied local service streams and secure randomness. |
+| Policy | Immutable policy configuration and host-submitted resolver results; no guest RAM, filesystem or sockets. |
 
-Box state, the shared cache, logs, and guest images live under `~/.terra`.
-Terra keeps those directories owner-only and refuses to run if it cannot. The
-host-facing guest-agent services for sessions, files, and `exec` accept only
-the host's vsock peer. The control listener accepts the guest agent once, then
-stops listening; that connection remains open for the orderly-stop signal.
+Components inherit no host environment, arguments or standard streams. Devices
+can read and corrupt their own VM's RAM: component isolation protects the host
+and other boxes, not the guest from its devices. A directory preopen authorizes
+its contents even when a compromised filesystem component bypasses FUSE parsing;
+Wasm-only special-file filters are not a host restriction.
 
-Terra pins libkrun, libkrunfw, and the egress gateway as submodules.
-Downloaded build inputs are checksum-verified. See
-[vendor/README.md](../vendor/README.md) for the dependency policy.
+The policy sidecar has bounded input and per-call fuel. Traps fail authorization
+closed. Device stores use epoch interruption, and production shared memory is
+disabled. Learned DNS grants expire for new connections after 60 seconds unless
+renewed; existing connections continue.
 
-## Report a vulnerability
+Component setup and device requests have bounded runtime interfaces and
+deadlines. These controls limit malformed requests and waiting work; they do
+not make host I/O interruptible or turn component failures into durable
+transactions.
 
-Please follow the [security policy](../SECURITY.md) or
-[report privately on GitHub](https://github.com/Berry-Studio/terrarium/security/advisories/new).
+Guest diagnostic events are limited to 64 KiB, enter a bounded queue, and are
+written through an 8 MiB per-file cap. This prevents diagnostic floods from
+growing the host log without bound; it is not a general storage quota.
+
+Component memory has configurable per-store and box-wide Wasm linear-memory
+limits (16 MiB and 128 MiB by default). Those limits do not bound guest RAM,
+native/WASI allocations, kernel socket memory, CPU time, disk use in writable
+shares, or bandwidth. Terra also performs per-home admission accounting, but
+that is not a host-wide resource quota. Apply operating-system limits or a
+dedicated host when hard resource isolation is required.
+
+Terra keeps its box state, recipes, images, logs, and local control sockets
+under `~/.terra` with owner-only permissions where the platform supports them.
+`terra setup` refuses to run as host root unless `TERRA_ALLOW_ROOT=1` is set.
+Running Terra as host root expands the impact of a boundary failure.
+
+## Outside the boundary
+
+- A writable mount is deliberately shared storage, not a safe place to accept
+  untrusted data for host-side execution or parsing. Treat guest-written files
+  as untrusted before using them on the host.
+- Concurrent host-local mutation of a mounted tree, and host interpretation of
+  guest-written share contents, are outside this boundary.
+- Guest users, guest root, `sudo`, and lifecycle hooks protect only the guest
+  filesystem. They do not grant host root, but a recipe can use them to change
+  everything in the guest.
+- Attached workload output is guest-controlled terminal input. A hostile guest
+  can emit terminal control sequences, so use a terminal policy appropriate for
+  untrusted output.
+- Component isolation reduces the authority given to device code. It does not
+  make Wasmtime, WASI, native adapters, or the hypervisor untrusted.
+- Cancellation and timeouts do not roll back a host write or forcibly interrupt
+  an operating-system I/O operation already in progress.
+- Terra does not provide a hard defense against denial of service, hardware
+  side channels, or a compromise of the host OS, hypervisor, native runtime,
+  Wasmtime, WASI, or trusted artifacts.
+
+For the configuration syntax and defaults, see the [recipe reference](recipe.md).
+To report a vulnerability, follow the [security policy](../SECURITY.md).

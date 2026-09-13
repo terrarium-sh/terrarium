@@ -1,0 +1,40 @@
+[package]
+name = "terra-vsock-component"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[lints.rust]
+unsafe_code = "deny"
+warnings = "warn"
+
+[lints.rustdoc]
+broken_intra_doc_links = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+terra-protocol = { path = "../../crates/terra-protocol" }
+terra-device-transport = { path = "../device-transport" }
+terra-limits = { path = "../../crates/terra-limits" }
+terra-vsock-device = { path = "../vsock-device" }
+wit-bindgen = { version = "=0.61.1", features = ["async-spawn", "inter-task-wakeup"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+futures-channel = "0.3"
+serde = "1"
+serde_json = "1"
+
+[profile.release]
+overflow-checks = true
+panic = "abort"

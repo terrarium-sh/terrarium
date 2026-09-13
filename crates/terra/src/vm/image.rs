@@ -13,9 +13,8 @@ static ROOTFS_IMG_GZ: &[u8] = include_bytes!(env!("TERRA_ROOTFS_IMG"));
 /// The prebaked *empty* filesystem for scratch volumes
 static VOLUME_IMG_GZ: &[u8] = include_bytes!(env!("TERRA_VOLUME_IMG"));
 
-/// The guest kernel built from vendor/libkrunfw; the Makefile sets
-/// `TERRA_KERNEL_GZ`. An ELF vmlinux on `x86_64`, a flat `Image` on aarch64 —
-/// The format passed to libkrun has to agree with it.
+/// The guest kernel from the pinned kernel source; the Makefile sets
+/// `TERRA_KERNEL_GZ`.
 static KERNEL_GZ: &[u8] = include_bytes!(env!("TERRA_KERNEL_GZ"));
 const KERNEL_NAME: &str = concat!("vmlinux-", include_str!(env!("TERRA_KERNEL_GZ_SHA256")));
 
@@ -23,16 +22,26 @@ const KERNEL_NAME: &str = concat!("vmlinux-", include_str!(env!("TERRA_KERNEL_GZ
 /// filesystem is this volume, never a host directory.
 static BOOT_IMG_GZ: &[u8] = include_bytes!(env!("TERRA_BOOT_IMG"));
 const BOOT_NAME: &str = concat!("boot-", include_str!(env!("TERRA_BOOT_IMG_SHA256")));
-const BYTES_PER_MIB: u64 = 1024 * 1024;
+pub(crate) const BYTES_PER_MIB: u64 = 1024 * 1024;
 
-fn to_stage_path(path: &Path) -> PathBuf {
+pub(crate) fn write_sparse_chunk(out: &mut File, chunk: &[u8]) -> std::io::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    if chunk.iter().all(|byte| *byte == 0) {
+        let offset = i64::try_from(chunk.len()).map_err(std::io::Error::other)?;
+        out.seek(SeekFrom::Current(offset))?;
+        Ok(())
+    } else {
+        out.write_all(chunk)
+    }
+}
+
+fn to_stage_path(path: &Path, attempt: u64) -> PathBuf {
     let name = path
         .file_name()
         .unwrap_or(path.as_os_str())
         .to_string_lossy()
         .into_owned();
-    // the leading `.` hides a leftover from both directory sweeps; the pid keeps concurrent runs apart.
-    path.with_file_name(format!(".{name}.{}.tmp", std::process::id()))
+    path.with_file_name(format!(".{name}.{attempt}.{}.tmp", std::process::id()))
 }
 
 fn parse_staged_pid(name: &str) -> Option<u32> {
@@ -48,7 +57,13 @@ fn parse_staged_pid(name: &str) -> Option<u32> {
 /// the pid in a temp's name, and a live writer keeps its temporary - only it
 /// knows how far the write got.
 pub(crate) fn sweep_staging_temps(dir: &Path, is_alive: impl Fn(u32) -> bool) {
-    for entry in crate::sys::list_dir_entries(dir) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
         let Some(pid) = entry.file_name().to_str().and_then(parse_staged_pid) else {
             continue;
         };
@@ -59,62 +74,40 @@ pub(crate) fn sweep_staging_temps(dir: &Path, is_alive: impl Fn(u32) -> bool) {
 }
 
 pub(crate) fn staged_write(path: &Path, write: impl FnOnce(&mut File) -> Result<()>) -> Result<()> {
-    use rustix::fs::{AtFlags, Mode, OFlags, openat, renameat, unlinkat};
-
-    let parent_path = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let destination_name = path
-        .file_name()
-        .context("destination has no file name")?
-        .to_owned();
-    let parent = terra_shared::no_symlinks::open_no_symlinks(
-        parent_path,
-        terra_shared::no_symlinks::OpenMode::ReadDirectory,
-    )
-    .with_context(|| format!("opening {}", parent_path.display()))?;
-    match rustix::fs::statat(&parent, &destination_name, AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(metadata) => anyhow::ensure!(
-            !rustix::fs::FileType::from_raw_mode(metadata.st_mode).is_symlink(),
-            "{} is a symlink",
-            crate::render::escape_printable_path(path)
-        ),
-        Err(error) if error == rustix::io::Errno::NOENT => {}
-        Err(error) => {
-            return Err(std::io::Error::from(error)).with_context(|| {
-                format!("checking {}", crate::render::escape_printable_path(path))
-            });
-        }
+    #[cfg(unix)]
+    let parent = File::open(
+        path.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new(".")),
+    )?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
-    let tmp = to_stage_path(path);
-    let temporary_name = tmp
-        .file_name()
-        .context("staging path has no file name")?
-        .to_owned();
-    let mut out: File = openat(
-        &parent,
-        &temporary_name,
-        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
-        Mode::from_raw_mode(0o600),
-    )
-    .map(Into::into)
-    .with_context(|| format!("creating {}", tmp.display()))?;
-
-    let result = match write(&mut out) {
-        Ok(()) => {
-            drop(out);
-            renameat(&parent, &temporary_name, &parent, &destination_name)
-                .map_err(std::io::Error::from)
-                .with_context(|| format!("installing {}", path.display()))
-        }
-        Err(error) => {
-            drop(out);
-            Err(error)
+    let mut attempt = 0u64;
+    let (tmp, mut out) = loop {
+        let tmp = to_stage_path(path, attempt);
+        match options.open(&tmp) {
+            Ok(file) => break (tmp, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                attempt = attempt.checked_add(1).context("too many staging files")?;
+            }
+            Err(error) => return Err(error).with_context(|| format!("creating {}", tmp.display())),
         }
     };
+    let result = write(&mut out).and_then(|()| out.sync_all().context("syncing staged image"));
+    drop(out);
+    let result = result.and_then(|()| {
+        std::fs::rename(&tmp, path).with_context(|| format!("installing {}", path.display()))?;
+        #[cfg(unix)]
+        parent.sync_all().context("syncing image directory")?;
+        Ok(())
+    });
     if result.is_err() {
-        let _ = unlinkat(&parent, &temporary_name, AtFlags::empty());
+        let _ = std::fs::remove_file(tmp);
     }
     result
 }
@@ -176,6 +169,11 @@ fn resize_image(path: &Path, target: u64, field: &str) -> Result<()> {
                 .with_context(|| format!("opening {}", path.display()))?
                 .set_len(target)
                 .with_context(|| format!("growing {}", path.display()))?;
+            log::info!(
+                "{field} raised to {} MiB; guest filesystem {} will expand on boot",
+                mib(target),
+                name
+            );
             eprintln!(
                 "terra: {field} raised to {} MiB - the guest will expand {} on this boot",
                 mib(target),
@@ -183,6 +181,12 @@ fn resize_image(path: &Path, target: u64, field: &str) -> Result<()> {
             );
         }
         std::cmp::Ordering::Less => {
+            log::warn!(
+                "{field} is {} MiB but {} is {} MiB; keeping existing filesystem size (terra rm rebuilds it)",
+                mib(target),
+                name,
+                mib(current)
+            );
             eprintln!(
                 "terra: warning: {field} is {} MiB but {} is already {} MiB; \
                  shrinking would truncate the filesystem, so the existing size is kept \
@@ -226,7 +230,8 @@ fn ensure_cached_payload(gz: &[u8], name: &str, what: &str) -> Result<PathBuf> {
         .with_context(|| format!("unpacking the {what}"))?;
 
     let stale = format!("{}-", name.split_once('-').map_or(name, |(p, _)| p));
-    for entry in crate::sys::list_dir_entries(&dir) {
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
         if entry.path() != path && entry.file_name().to_string_lossy().starts_with(&stale) {
             let _ = std::fs::remove_file(entry.path());
         }
@@ -322,49 +327,77 @@ mod tests {
         })
         .expect("an uneventful write installs");
         assert_eq!(std::fs::read(&target).unwrap(), b"fresh bytes");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
 
         let target_dir = dir.path().join("target-dir");
         std::fs::create_dir(&target_dir).unwrap();
         assert!(staged_write(&target_dir, |_| Ok(())).is_err());
-        assert!(!to_stage_path(&target_dir).exists());
+        assert!(!to_stage_path(&target_dir, 0).exists());
     }
 
+    #[test]
+    fn stale_staging_files_do_not_block_installation() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("image.img");
+        for attempt in 0..3 {
+            std::fs::write(to_stage_path(&target, attempt), b"stale").unwrap();
+        }
+        staged_write(&target, |out| {
+            std::io::Write::write_all(out, b"new")?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+        assert_eq!(std::fs::read(to_stage_path(&target, 0)).unwrap(), b"stale");
+        assert!(!to_stage_path(&target, 3).exists());
+    }
+
+    #[cfg(unix)]
     #[test]
     fn a_staged_symlink_is_not_followed() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("image.img");
         let redirected = dir.path().join("redirected");
         std::fs::write(&redirected, b"original").unwrap();
-        std::os::unix::fs::symlink(&redirected, to_stage_path(&target)).unwrap();
+        std::os::unix::fs::symlink(&redirected, to_stage_path(&target, 0)).unwrap();
 
-        assert!(staged_write(&target, |_| Ok(())).is_err());
+        staged_write(&target, |_| Ok(())).unwrap();
+        assert!(target.is_file());
         assert_eq!(std::fs::read(&redirected).unwrap(), b"original");
     }
 
     #[cfg(unix)]
     #[test]
-    fn a_staged_write_refuses_a_symlink_destination() {
+    fn a_staged_write_replaces_a_symlink_destination() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("image.img");
         let redirected = dir.path().join("redirected");
         std::fs::write(&redirected, b"original").unwrap();
         std::os::unix::fs::symlink(&redirected, &target).unwrap();
 
-        assert!(staged_write(&target, |_| Ok(())).is_err());
+        staged_write(&target, |_| Ok(())).unwrap();
+        assert!(std::fs::symlink_metadata(&target).unwrap().is_file());
         assert_eq!(std::fs::read(&redirected).unwrap(), b"original");
     }
 
     #[cfg(unix)]
     #[test]
-    fn a_staged_write_does_not_follow_a_parent_symlink() {
+    fn a_staged_write_follows_a_parent_symlink() {
         let dir = tempfile::tempdir().unwrap();
         let real_parent = dir.path().join("real");
         std::fs::create_dir(&real_parent).unwrap();
         let linked_parent = dir.path().join("linked");
         std::os::unix::fs::symlink(&real_parent, &linked_parent).unwrap();
 
-        assert!(staged_write(&linked_parent.join("image.img"), |_| Ok(())).is_err());
-        assert!(!real_parent.join("image.img").exists());
+        staged_write(&linked_parent.join("image.img"), |_| Ok(())).unwrap();
+        assert!(real_parent.join("image.img").is_file());
     }
 
     #[test]

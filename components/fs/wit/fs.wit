@@ -1,0 +1,34 @@
+package terra:fs@0.1.0;
+
+interface transport {
+    use terra:mmio/types@0.1.0.{device-error};
+    configure: async func(tag: string, max-nodes: u32) -> result<_, device-error>;
+    run: async func() -> result<_, device-error>;
+}
+
+interface host {
+    use wasi:filesystem/types@0.3.1.{descriptor};
+    enum error { access, io, unsupported }
+    record filesystem-stat {
+        blocks: u64,
+        blocks-free: u64,
+        blocks-available: u64,
+        files: u64,
+        files-free: u64,
+        block-size: u32,
+        name-max: u32,
+    }
+    set-mode: func(descriptor: borrow<descriptor>, mode: u32) -> result<_, error>;
+    get-mode: func(descriptor: borrow<descriptor>) -> result<option<u32>, error>;
+    statfs: func(descriptor: borrow<descriptor>) -> result<filesystem-stat, error>;
+}
+
+world device {
+    import wasi:filesystem/types@0.3.1;
+    import wasi:filesystem/preopens@0.3.1;
+    import terra:host/memory@0.1.0;
+    import terra:host/interrupt@0.1.0;
+    import host;
+    export transport;
+    export terra:mmio/device@0.1.0;
+}

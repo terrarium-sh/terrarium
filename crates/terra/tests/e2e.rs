@@ -1030,17 +1030,12 @@ fn invalid_yaml_reports_parse_error_and_exits_one() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("failed to parse YAML"));
 }
 
-/// The example recipe shipped at the repo root must be accepted by the mount
-/// guard - it is the first thing a new user runs, and it once drifted into a
-/// `host: .` mount the guard refuses. `terra setup` runs the full guard
-/// without booting a VM, so this needs no KVM.
+/// The example recipe shipped at the repo root must be accepted. `terra setup`
+/// performs this check without booting a VM, so this needs no KVM.
 #[test]
 fn the_shipped_example_recipe_is_accepted() {
     let dir = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
-    // Satisfy the recipe's relative and `~` mounts.
-    std::fs::create_dir_all(dir.path().join("src")).unwrap();
-    std::fs::create_dir_all(home.path().join(".ssh")).unwrap();
     let recipe = concat!(env!("CARGO_MANIFEST_DIR"), "/../../pi-dev.yaml");
     let out = run_terra_in(dir.path(), home.path(), &[recipe, "setup"]);
     assert!(

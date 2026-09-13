@@ -1,0 +1,30 @@
+interface interrupts {
+    use types.{error};
+    use machine-types.{device-kind};
+
+    record x86-interrupt {
+        vector: u8,
+        destination: u8,
+        level-triggered: bool,
+    }
+
+    record ioapic-reply {
+        value: u32,
+        interrupts: list<x86-interrupt>,
+    }
+
+    record irq-level {
+        gsi: u32,
+        asserted: bool,
+    }
+
+    stage-irq-lines: func() -> result<_, error>;
+    clear-irq-lines: func() -> result<list<irq-level>, error>;
+    device-irq-line: func(kind: device-kind, ordinal: u32, asserted: bool) -> result<option<irq-level>, error>;
+
+    stage-ioapic: func() -> result<_, error>;
+    ioapic-access: func(offset: u8, width: u8, write: bool, value: u32) -> result<ioapic-reply, error>;
+    ioapic-line: func(slot: u8, asserted: bool) -> result<list<x86-interrupt>, error>;
+    ioapic-device-line: func(kind: device-kind, ordinal: u32, asserted: bool) -> result<list<x86-interrupt>, error>;
+    ioapic-eoi: func(vector: u8) -> result<list<x86-interrupt>, error>;
+}

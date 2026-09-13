@@ -1,0 +1,126 @@
+package terra:mmio@0.1.0;
+
+interface types {
+    enum device-error { unmapped, bad-len, bad-queue, not-ready, too-large, io }
+    enum operation { read, write, reset, close, interrupt-level }
+
+    record request {
+        sequence: u64,
+        operation: operation,
+        offset: u64,
+        width: u8,
+        value: u64,
+    }
+
+    record reply {
+        sequence: u64,
+        value: u64,
+        error: u32,
+        interrupt: bool,
+    }
+
+    record routed-reply { slot: u32, reply: reply }
+    record control-reply { reply: reply, all-closed: bool }
+
+    enum error {
+        invalid-slot,
+        invalid-vcpu,
+        unsupported-msr,
+        bad-arm-exit,
+        overlap,
+        unmapped,
+        bad-width,
+        overflow,
+        busy,
+        closed,
+        device,
+    }
+}
+
+interface device {
+    use types.{request, reply};
+    serve: async func(requests: stream<request>) -> stream<reply>;
+}
+
+interface workers {
+    use types.{request, reply};
+    enum error { unavailable }
+    use machine-types.{device-kind};
+    record mapping { base: u64, size: u64 }
+    record grant { slot: u32, kind: device-kind, mapping: mapping }
+    grants: func() -> list<grant>;
+    create: async func(slot: u32, requests: stream<request>) -> result<stream<reply>, error>;
+}
+
+interface platform {
+    record mmio-read { address: u64, width: u8 }
+    record mmio-write { address: u64, width: u8, value: u64 }
+    record pio-read { port: u16, length: u32 }
+    record pio-write { port: u16, length: u32 }
+    record msr { index: u32, value: u64 }
+    record arm-exception { address: u64, syndrome: u64 }
+    record arm-read { register: option<u8>, value: u64 }
+    record hvc-result { target: u8, status: s64 }
+    record cpu-start { target: u8, entry: u64, context: u64 }
+
+    variant exit {
+        halt,
+        shutdown,
+        interrupted,
+        mmio-read(mmio-read),
+        mmio-write(mmio-write),
+        pio-read(pio-read),
+        pio-write(pio-write),
+        rdmsr(msr),
+        wrmsr(msr),
+        arm-exception(arm-exception),
+        arm-register-value(u64),
+        hvc-result(hvc-result),
+        stopped,
+    }
+
+    variant completion {
+        start,
+        reenter,
+        mmio-read(u64),
+        pio-zero,
+        rdmsr(u64),
+        msr-fault,
+        wrmsr,
+        arm-read(arm-read),
+        arm-register(u8),
+        hvc-return(s64),
+        cpu-start(cpu-start),
+        cpu-off,
+        system-stop,
+    }
+
+    enum error { unavailable, bad-exit, cancelled }
+
+    resource vcpu {
+        resume: async func(completion: completion) -> result<exit, error>;
+    }
+
+    completed: func(slot: u32, failed: bool) -> result<_, error>;
+}
+
+interface router {
+    use types.{control-reply, error, operation, reply, request, routed-reply};
+
+    configure-vcpus: func(count: u8) -> result<_, error>;
+    compose-workers: async func() -> result<_, error>;
+    remap-device: func(slot: u32, base: u64, size: u64) -> result<_, error>;
+    access: async func(address: u64, width: u8, value: u64, write: bool) -> result<routed-reply, error>;
+    control: async func(slot: u32, operation: operation) -> result<control-reply, error>;
+}
+
+world vmm {
+    import workers;
+    import platform;
+    import virtualization;
+    import lifecycle-platform;
+    export machine;
+    export interrupts;
+    export lifecycle;
+    export router;
+}

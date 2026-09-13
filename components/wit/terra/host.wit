@@ -1,0 +1,72 @@
+package terra:host@0.1.0;
+
+/// Minimal host-device contract for Phase 1A. Wasm owns device/queue
+/// parsing and device state; the native core owns guest RAM, interrupts,
+/// and authoritative resource grants. Component-supplied IDs never select
+/// a disk, VM, interrupt line, or foreign resource table.
+interface memory {
+    /// One bounded guest-physical copy. Offsets and lengths are checked
+    /// for arithmetic overflow, mapped RAM regions, holes, and aggregate
+    /// batch limits before anything is allocated or copied.
+    read: func(offset: u64, len: u64) -> result<list<u8>, memory-error>;
+    write: func(offset: u64, data: list<u8>) -> result<_, memory-error>;
+    ram-bytes: func() -> u64;
+    enum memory-error { out-of-range, too-large, unmapped }
+}
+
+interface interrupt {
+    /// Signal this device's own interrupt. No caller-chosen IRQ; the
+    /// native side coalesces and rate-bounds.
+    signal: func();
+    set-level: func(level: bool);
+}
+
+interface diagnostics {
+    event: func(message: string);
+}
+
+interface device-api {
+    use terra:mmio/types@0.1.0.{device-error};
+    configure: async func(readonly: bool) -> result<_, device-error>;
+    run: async func() -> result<_, device-error>;
+    /// Execute a pre-parsed request for focused component tests.
+    record range {
+        addr: u64,
+        len: u64,
+    }
+    execute: async func(req-type: u32, sector: u64, data: list<range>, status-addr: u64, epoch: u64) -> u8;
+    record completion {
+        status-addr: u64,
+        used-len: u32,
+        status: u8,
+    }
+    execute-chain: async func(head: u16, desc-table: u64, queue-size: u16, epoch: u64) -> result<completion, device-error>;
+}
+
+interface disk {
+    /// One fixed-capacity disk grant per component instance. Offsets
+    /// and lengths are checked natively before any byte reaches the
+    /// image; read-only grants reject every mutation path. Sync makes
+    /// prior writes durable. Free functions on the implicit grant keep
+    /// handle plumbing out of the vertical slice; async waits for the
+    /// P3 socket/filesystem scheduler slice.
+    read-at: async func(offset: u64, len: u64) -> result<list<u8>, disk-error>;
+    write-at: async func(offset: u64, data: list<u8>) -> result<_, disk-error>;
+    sync: async func() -> result<_, disk-error>;
+    capacity: func() -> u64;
+    enum disk-error { out-of-range, readonly, io, too-large, busy }
+}
+
+world device {
+    import memory;
+    import interrupt;
+}
+
+world block-device {
+    import memory;
+    import interrupt;
+    import diagnostics;
+    import disk;
+    export device-api;
+    export terra:mmio/device@0.1.0;
+}

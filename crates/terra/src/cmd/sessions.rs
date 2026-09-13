@@ -1,9 +1,10 @@
 //! `terra <box> sessions` - list the clients attached to a running box's
 //! session, as the ids `terra <box> detach` takes.
 
-use crate::resolve;
 use crate::session::{self, SessionClient};
+use crate::{render, resolve};
 use anyhow::Result;
+use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -17,8 +18,9 @@ pub fn run(
     if clients.is_empty() {
         eprintln!("terra: nobody is attached to {bx}");
     }
+    let mut out = std::io::stdout().lock();
     for client in clients {
-        println!("{}", format_client_line(&client));
+        render::finish_stdout_write(writeln!(out, "{}", format_client_line(&client)))?;
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -49,7 +51,7 @@ mod tests {
         assert_eq!(
             format_client_line(&SessionClient {
                 id: 7,
-                reported_term_size: Some(terra_shared::contract::TermSize { rows: 24, cols: 80 })
+                reported_term_size: Some(terra_protocol::TermSize { rows: 24, cols: 80 })
             }),
             "7\t24x80"
         );

@@ -8,6 +8,7 @@
 //! `TERRA_BIN` overrides the binary under test (CI points it at `dist/terra`,
 //! the shipped artifact); default is the cargo-built one.
 
+#![cfg(unix)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::{Path, PathBuf};
@@ -54,7 +55,7 @@ impl Suite {
         self.tmp.path()
     }
 
-    /// Run terra, returning stdout (stderr suppressed, as a script would).
+    /// Run terra, returning stdout and reporting stderr on failure.
     fn run_terra_command(&self, args: &[&str]) -> String {
         self.run_terra_status(args).0
     }
@@ -63,10 +64,17 @@ impl Suite {
         let out = Command::new(&self.terra)
             .args(args)
             .env("HOME", &self.home)
+            .env_remove("RUST_LOG")
             .stdin(Stdio::null())
-            .stderr(Stdio::null())
             .output()
             .expect("running terra");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if !out.status.success() {
+            eprintln!(
+                "terra command {args:?} exited {:?}: {stderr}",
+                out.status.code()
+            );
+        }
         (
             String::from_utf8_lossy(&out.stdout).into_owned(),
             out.status.code().unwrap_or(-1),
@@ -93,8 +101,8 @@ impl Suite {
     /// the box's log, not setup's stdout), then the bare form boots it. The
     /// recipes live outside any share, so nothing is ever asked about.
     /// Foreground, because this harness has no terminal and wants the VM's
-    /// whole run as one captured process; the transcript is both commands'
-    /// stdout, which the bake's assertions read from the workload's own output.
+    /// whole run as one captured process; a failed boot also appends the box
+    /// log, which preserves guest output for its assertion.
     fn boot_recipe(&self, recipe: &Path, name: &str, extra: &[&str]) -> String {
         let path = self.create_project_dir(name);
         let project = path.to_str().unwrap();
@@ -102,7 +110,13 @@ impl Suite {
             self.run_terra_command(&[recipe.to_str().unwrap(), "setup", "--project", project]);
         let mut args = vec![name, "--foreground", "--project", project];
         args.extend_from_slice(extra);
-        setup + &self.run_terra_command(&args)
+        let (boot, code) = self.run_terra_status(&args);
+        if code == 0 {
+            setup + &boot
+        } else {
+            let logs = self.run_terra_command(&["logs", "--project", project]);
+            format!("{setup}{boot}\nbox logs:\n{logs}")
+        }
     }
 
     /// `name`'s project directory under WORK, created - terra refuses a
@@ -136,20 +150,78 @@ impl Suite {
         (self.boot_recipe(&recipe, name, extra), prj)
     }
 
+    fn boot_with_mount(&self, name: &str, host: &Path, readonly: bool, script: &str) -> String {
+        let recipe = self.get_work_dir().join(format!("{name}.yaml"));
+        let script = script.replace('\n', "\n      ");
+        let readonly = if readonly { "    readonly: true\n" } else { "" };
+        std::fs::write(
+            &recipe,
+            format!(
+                "workload:\n  entrypoint: /bin/sh\n  args:\n    - -ec\n    - |\n      {script}\nmounts:\n  - host: {}\n    guest: /work\n{readonly}",
+                host.display()
+            ),
+        )
+        .unwrap();
+        self.boot_recipe(&recipe, name, &[])
+    }
+
+    fn boot_with_repository_mount(
+        &self,
+        name: &str,
+        host: &Path,
+        readonly: bool,
+        script: &str,
+    ) -> String {
+        let recipe = self.get_work_dir().join(format!("{name}.yaml"));
+        let script = script.replace('\n', "\n      ");
+        let readonly = if readonly { "    readonly: true\n" } else { "" };
+        std::fs::write(
+            &recipe,
+            format!(
+                "network:\n  mode: unrestricted-public\nhooks:\n  on_create:\n    - apk add --no-cache git python3\nworkload:\n  entrypoint: /bin/sh\n  args:\n    - -ec\n    - |\n      {script}\nmounts:\n  - host: {}\n    guest: /work\n{readonly}",
+                host.display()
+            ),
+        )
+        .unwrap();
+        self.boot_recipe(&recipe, name, &[])
+    }
+
     fn exec(&self, root: bool, cmd: &[&str]) -> (String, i32) {
         let server = self.get_work_dir().join("server");
+        self.exec_in("server", &server, root, cmd)
+    }
+
+    fn exec_in(&self, name: &str, project: &Path, root: bool, cmd: &[&str]) -> (String, i32) {
         let mut args = vec!["exec"];
         if root {
             args.push("--root");
         }
-        args.extend(["--project", server.to_str().unwrap(), "--"]);
+        args.extend(["--project", project.to_str().unwrap(), "--"]);
         args.extend_from_slice(cmd);
-        self.run_terra_status(&args)
+        let mut named = vec![name];
+        named.extend(args);
+        self.run_terra_status(&named)
     }
 
     fn read_file_uid(path: &Path) -> Option<u32> {
         use std::os::unix::fs::MetadataExt;
         std::fs::metadata(path).ok().map(|m| m.uid())
+    }
+
+    fn compile_probe(&self, name: &str) -> PathBuf {
+        let probe = self.get_work_dir().join(format!("terra-{name}-probe"));
+        let compiler = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("scripts/zig-musl-cc");
+        let source = Path::new(ASSETS).join(format!("{name}_probe.c"));
+        let status = Command::new(compiler)
+            .args(["-static", "-O2", "-o"])
+            .arg(&probe)
+            .arg(source)
+            .status()
+            .expect("compiling guest probe");
+        assert!(status.success(), "compiling guest probe failed: {status}");
+        probe
     }
 }
 
@@ -187,6 +259,9 @@ fn http_get(addr: &str, host: &str) -> Option<String> {
 #[ignore = "boots real microVMs - needs /dev/kvm: cargo test --test boot -- --ignored"]
 fn run_boot_suite() {
     let s = Suite::new();
+    let listener = std::net::TcpListener::bind("127.0.0.1:18080")
+        .expect("the boot suite needs host port 18080 free for its server VM");
+    drop(listener);
 
     // == egress: a name is exact, and the subtree is opted into ==
     let out = s.boot("egress", &[]);
@@ -207,7 +282,7 @@ fn run_boot_suite() {
     let log = std::fs::read_to_string(s.get_box_files_path("egress").join("terra.log"))
         .unwrap_or_default();
     assert!(
-        log.contains("no allow rule names"),
+        log.contains("policy denied name lookup"),
         "the log does not name the refused query:\n{log}"
     );
     assert!(
@@ -224,35 +299,6 @@ fn run_boot_suite() {
         out.contains("APEX_BLOCKED"),
         "wildcard reached the apex:\n{out}"
     );
-
-    // == workdir: created when missing, owned by the workload user ==
-    let (out, _) = s.boot_with_share("workdir", &[]);
-    assert!(out.contains("PWD=/work/nested/deep"), "{out}");
-    assert!(out.contains("OWNER=1000:1000"), "{out}");
-    assert!(out.contains("WRITE_OK"), "{out}");
-
-    // == ownership: the FS always maps to terri; --root is exec-only ==
-    let (out, prj) = s.boot_with_share("ownership", &[]);
-    assert!(
-        out.contains("EXEC=1000"),
-        "default workload not terri:\n{out}"
-    );
-    assert!(out.contains("WORK=1000:1000"), "{out}");
-    assert!(out.contains("WF_OK"), "{out}");
-    assert!(out.contains("VOL=1000:1000"), "{out}");
-    assert_eq!(
-        Suite::read_file_uid(&prj.join("wf")),
-        Some(s.host_uid),
-        "host file not owned by the launching user"
-    );
-    let (out, prj) = s.boot_with_share("ownership", &["--root"]);
-    assert!(out.contains("EXEC=0"), "--root workload not root:\n{out}");
-    assert!(
-        out.contains("WORK=1000:1000"),
-        "--root changed the FS mapping:\n{out}"
-    );
-    assert!(out.contains("WF_OK"), "{out}");
-    assert_eq!(Suite::read_file_uid(&prj.join("wf")), Some(s.host_uid));
 
     // == on_create: baked once, stamped in the guest, skipped after ==
     let first = s.boot("bake", &[]);
@@ -294,17 +340,18 @@ fn run_boot_suite() {
         }
         std::thread::sleep(Duration::from_secs(1));
     }
+    let (server_logs, server_logs_status) =
+        s.run_terra_status(&["logs", "--project", server.to_str().unwrap()]);
     assert!(
         body.contains("HELLO_FROM_VMA"),
-        "published port never answered on the host loopback"
+        "published port never answered on the host loopback (logs status {server_logs_status}):\n{server_logs}"
     );
 
     // == the state directory is what guards the agent's port ==
-    // libkrun binds `a` itself, and its exec service runs commands as guest
+    // The VMM binds `a` itself, and its exec service runs commands as guest
     // root, so the one thing between another account on this host and that
     // port is the mode of the directory it is bound in. terra's own umask
-    // cannot be it: libkrun's virtiofs clears the process umask when the guest
-    // mounts a share. Asserted on a box that is *running*, since that is when
+    // cannot be it. Asserted on a box that is *running*, since that is when
     // the sockets exist.
     {
         use std::os::unix::fs::PermissionsExt;
@@ -316,13 +363,10 @@ fn run_boot_suite() {
             "{} is {mode:o} - another account can reach the root-capable exec service",
             files.display()
         );
-        for sock in ["c", "a"] {
-            assert!(
-                files.join(sock).exists(),
-                "a running box is missing its {sock} socket - the mode above then \
-                 guards nothing"
-            );
-        }
+        assert!(
+            files.join("a").exists(),
+            "a running box is missing its agent socket"
+        );
     }
 
     let out = s.boot("client-allowed", &[]);
@@ -346,6 +390,38 @@ fn run_boot_suite() {
     );
     assert!(s.exec(false, &["id", "-u"]).0.contains("1000"));
     assert!(s.exec(true, &["id", "-u"]).0.contains('0'));
+    let (namespaces, status) = s.exec(
+        false,
+        &[
+            "sh",
+            "-ec",
+            "test -d /proc/self/ns; test -e /proc/self/ns/user; test -e /proc/self/ns/pid; test -e /proc/self/ns/net; test -e /proc/self/ns/ipc; test -e /proc/self/ns/uts; test -e /proc/self/ns/mnt; test -r /proc/sys/user/max_user_namespaces; test $(cat /proc/sys/user/max_user_namespaces) -gt 0",
+        ],
+    );
+    assert_eq!(status, 0, "unprivileged namespace basics: {namespaces}");
+    let namespace_probe = s.compile_probe("namespace");
+    s.run_terra_command(&[
+        "server",
+        "put",
+        namespace_probe.to_str().unwrap(),
+        "/tmp/terra-namespace-probe",
+        "--project",
+        server.to_str().unwrap(),
+    ]);
+    let (namespace_probe, status) = s.exec(false, &["/tmp/terra-namespace-probe"]);
+    assert_eq!(
+        status, 0,
+        "unprivileged namespace creation: {namespace_probe}"
+    );
+    let (kernel_basics, status) = s.exec(
+        true,
+        &[
+            "sh",
+            "-ec",
+            "grep -q ' - cgroup2 ' /proc/self/mountinfo; d=/tmp/terra-kernel-probe; rm -rf $d; mkdir -p $d/lower $d/upper $d/work $d/merged; echo lower > $d/lower/file; mount -t overlay overlay -o lowerdir=$d/lower,upperdir=$d/upper,workdir=$d/work $d/merged; test $(cat $d/merged/file) = lower; echo upper > $d/merged/file; test $(cat $d/upper/file) = upper; umount $d/merged; rm -rf $d; mkdir -p /dev/net; if test ! -e /dev/net/tun; then mknod /dev/net/tun c 10 200; fi; test -c /dev/net/tun; : <> /dev/net/tun; apk add --no-cache iproute2; ip link add terra-veth0 type veth peer name terra-veth1; ip link add terra-br0 type bridge; ip link set terra-veth0 master terra-br0; ip link del terra-veth0; ip link del terra-br0",
+        ],
+    );
+    assert_eq!(status, 0, "guest kernel container basics: {kernel_basics}");
     // The workload beside it is untouched: still uid 1000, no standing
     // escalation of its own - a `sudo:` grant is the thing this is not.
     assert!(s.exec(false, &["id", "-u"]).0.contains("1000"));
@@ -402,6 +478,7 @@ fn run_boot_suite() {
     let out = Command::new(&s.terra)
         .args(["oneshot", "-d", "--project", oneshot_box.to_str().unwrap()])
         .env("HOME", &s.home)
+        .env_remove("RUST_LOG")
         .stdin(Stdio::null())
         .output()
         .expect("running terra");
@@ -678,8 +755,437 @@ fn run_boot_suite() {
     ]);
     assert_ne!(bake_code, 0, "a failing on_create bake reported success");
     assert!(
-        s.run_terra_command(&["logs", "--project", bad_project.to_str().unwrap()])
-            .contains("BAKE_RAN"),
+        s.run_terra_command(&[
+            "logs",
+            "--diagnostics",
+            "--project",
+            bad_project.to_str().unwrap()
+        ])
+        .contains("BAKE_RAN"),
         "the failed bake's console did not reach the log"
     );
+}
+
+#[test]
+#[ignore = "needs /dev/kvm"]
+#[allow(clippy::too_many_lines)]
+fn run_mount_boot_suite() {
+    let s = Suite::new();
+
+    // == workdir: created when missing, owned by the workload user ==
+    let (out, _) = s.boot_with_share("workdir", &[]);
+    assert!(out.contains("PWD=/work/nested/deep"), "{out}");
+    assert!(out.contains("OWNER=1000:1000"), "{out}");
+    assert!(out.contains("WRITE_OK"), "{out}");
+
+    // == ownership: the FS always maps to terri; --root is exec-only ==
+    let (out, prj) = s.boot_with_share("ownership", &[]);
+    assert!(
+        out.contains("EXEC=1000"),
+        "default workload not terri:\n{out}"
+    );
+    assert!(out.contains("WORK=1000:1000"), "{out}");
+    assert!(out.contains("WF_OK"), "{out}");
+    assert!(out.contains("VOL=1000:1000"), "{out}");
+    assert_eq!(
+        Suite::read_file_uid(&prj.join("wf")),
+        Some(s.host_uid),
+        "host file not owned by the launching user"
+    );
+    let (out, prj) = s.boot_with_share("ownership", &["--root"]);
+    assert!(out.contains("EXEC=0"), "--root workload not root:\n{out}");
+    assert!(
+        out.contains("WORK=1000:1000"),
+        "--root changed the FS mapping:\n{out}"
+    );
+    assert!(out.contains("WF_OK"), "{out}");
+    assert_eq!(Suite::read_file_uid(&prj.join("wf")), Some(s.host_uid));
+
+    // == a writable share preserves ordinary repository-file operations ==
+    let writable = s.get_work_dir().join("mount-writable");
+    std::fs::create_dir(&writable).unwrap();
+    std::fs::write(writable.join("host.txt"), "host-visible").unwrap();
+    let executable = writable.join("run");
+    std::fs::write(&executable, "#!/bin/sh\necho EXECUTABLE\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+    }
+    std::fs::write(s.get_work_dir().join("outside-sentinel"), "host-secret").unwrap();
+    let out = s.boot_with_mount(
+        "mount-writable",
+        &writable,
+        false,
+        r#"
+test "$(cat /work/host.txt)" = host-visible
+test "$(/work/run)" = EXECUTABLE
+printf guest-visible > /work/guest.txt
+ln /work/host.txt /work/hard.txt
+printf hard-linked > /work/hard.txt
+test "$(cat /work/host.txt)" = hard-linked
+ln -s host.txt /work/relative
+test "$(cat /work/relative)" = hard-linked
+if ln -s /work/host.txt /work/absolute; then
+  echo absolute symlink accepted
+  exit 1
+fi
+if ln -s /outside-sentinel /work/outside; then
+  echo escaping absolute symlink accepted
+  exit 1
+fi
+test ! -e /work/outside
+printf open-unlink > /work/open
+exec 3</work/open
+rm /work/open
+test "$(cat <&3)" = open-unlink
+printf renamed > /work/before
+mv /work/before /work/after
+test "$(cat /work/after)" = renamed
+echo WRITABLE_OK
+"#,
+    );
+    assert!(out.contains("WRITABLE_OK"), "{out}");
+    assert_eq!(
+        std::fs::read_to_string(writable.join("guest.txt")).unwrap(),
+        "guest-visible"
+    );
+    assert_eq!(
+        std::fs::read_to_string(writable.join("host.txt")).unwrap(),
+        "hard-linked"
+    );
+    // == a read-only alias sees the writer's files but cannot mutate any alias ==
+    let out = s.boot_with_mount(
+        "mount-readonly",
+        &writable,
+        true,
+        r#"
+test "$(cat /work/guest.txt)" = guest-visible
+for command in \
+  ': > /work/new' \
+  'ln /work/host.txt /work/extra-link' \
+  'ln -s host.txt /work/extra-symlink' \
+  'mv /work/host.txt /work/renamed' \
+  'rm -f /work/guest.txt'; do
+  if sh -c "$command"; then
+    echo "readonly accepted: $command"
+    exit 1
+  fi
+done
+echo READONLY_OK
+"#,
+    );
+    assert!(out.contains("READONLY_OK"), "{out}");
+    assert_eq!(
+        std::fs::read_to_string(writable.join("guest.txt")).unwrap(),
+        "guest-visible"
+    );
+    assert!(writable.join("host.txt").is_file());
+
+    // == a guest repository keeps Git metadata, links, mmap writes, and atomic replaces ==
+    let repository = s.get_work_dir().join("mount-repository");
+    std::fs::create_dir(&repository).unwrap();
+    let out = s.boot_with_repository_mount(
+        "mount-repository",
+        &repository,
+        false,
+        r#"
+git -C /work init
+git -C /work config user.email terra@example.test
+git -C /work config user.name terra
+printf base > /work/base
+ln /work/base /work/hard
+ln -s base /work/link
+git -C /work add base hard link
+git -C /work commit -m base
+base=$(git -C /work branch --show-current)
+git -C /work checkout -b feature
+printf feature > /work/feature
+git -C /work add feature
+git -C /work commit -m feature
+git -C /work checkout "$base"
+printf main > /work/main
+git -C /work add main
+git -C /work commit -m main
+git -C /work merge --no-edit feature
+git -C /work repack -ad
+git -C /work fsck --no-dangling
+inode=$(stat -c %i /work/link)
+test "$(stat -c %i /work/link)" = "$inode"
+git -C /work status --porcelain
+git -C /work --no-pager diff
+test -z "$(git -C /work status --porcelain)"
+test -z "$(git -C /work diff)"
+python3 - <<'PY'
+import glob
+import errno
+import mmap
+import os
+import py_compile
+from pathlib import Path
+path = '/work/mapped'
+with open(path, 'wb') as file:
+    file.truncate(4096)
+with open(path, 'r+b') as file:
+    mapped = mmap.mmap(file.fileno(), 0)
+    mapped[:4] = b'mmap'
+    mapped.flush()
+    mapped.close()
+with open(path, 'r+b') as file:
+    file.truncate(2)
+with open(path, 'r+b') as file:
+    assert file.read() == b'mm'
+with open(glob.glob('/work/.git/objects/pack/*.pack')[0], 'rb') as file:
+    packed = mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ)
+    assert len(packed) > 0
+    packed.close()
+Path('/work/edited').write_text('old')
+with open('/work/edited') as previous:
+    Path('/work/edited.tmp').write_text('new')
+    os.replace('/work/edited.tmp', '/work/edited')
+    assert previous.read() == 'old'
+assert Path('/work/edited').read_text() == 'new'
+Path('/work/build.py').write_text('answer = 42\n')
+py_compile.compile('/work/build.py', cfile='/work/build.pyc', doraise=True)
+assert Path('/work/build.pyc').stat().st_size > 0
+
+def unsupported(name, operation):
+    try:
+        operation()
+    except OSError as error:
+        assert error.errno == errno.EOPNOTSUPP, (name, error)
+    else:
+        raise AssertionError(f'{name} unexpectedly succeeded')
+
+os.chmod(path, 0o600)
+assert os.stat(path).st_mode & 0o7777 == 0o600
+unsupported('xattr', lambda: os.setxattr(path, 'user.terra', b'guest-value'))
+with open(path, 'r+b') as file:
+    unsupported('fallocate', lambda: os.posix_fallocate(file.fileno(), 0, 1))
+    unsupported('seek-data', lambda: os.lseek(file.fileno(), 0, os.SEEK_DATA))
+try:
+    os.open(b'/work/\xff', os.O_WRONLY | os.O_CREAT, 0o600)
+except OSError as error:
+    assert error.errno == errno.EILSEQ, error
+else:
+    raise AssertionError('non-UTF-8 name unexpectedly succeeded')
+print('UNSUPPORTED_MOUNT_OPERATIONS_OK')
+PY
+git -C /work add mapped edited build.py build.pyc
+git -C /work commit -m mmap
+echo REPOSITORY_OK
+"#,
+    );
+    assert!(out.contains("REPOSITORY_OK"), "{out}");
+    assert!(out.contains("UNSUPPORTED_MOUNT_OPERATIONS_OK"), "{out}");
+    assert!(repository.join(".git/objects/pack").is_dir());
+    assert_eq!(std::fs::read(repository.join("mapped")).unwrap(), b"mm");
+    let out = s.boot_with_repository_mount(
+        "mount-repo-ro",
+        &repository,
+        true,
+        r#"
+git -C /work fsck --no-dangling
+git -C /work status --porcelain
+test -z "$(git -C /work status --porcelain)"
+test "$(cat /work/feature)" = feature
+echo REPOSITORY_READONLY_OK
+"#,
+    );
+    assert!(out.contains("REPOSITORY_READONLY_OK"), "{out}");
+}
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn console_input() -> (std::fs::File, std::fs::File) {
+    use std::os::fd::FromRawFd;
+    let mut master = -1;
+    let mut slave = -1;
+    // SAFETY: openpty writes two owned descriptors; optional output/configuration pointers are null.
+    let result = unsafe {
+        libc::openpty(
+            &raw mut master,
+            &raw mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
+    // SAFETY: successful openpty returned distinct descriptors, each transferred exactly once.
+    unsafe {
+        (
+            std::fs::File::from_raw_fd(master),
+            std::fs::File::from_raw_fd(slave),
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "boots a real VM and requires /dev/kvm"]
+fn attached_console_streams_hooks_before_workload_and_exit() {
+    use std::io::Read;
+    let suite = Suite::new();
+    let project = suite.create_project_dir("server");
+    let recipe = suite.get_work_dir().join("hooks.yaml");
+    std::fs::write(
+        &recipe,
+        "hw: {cpus: 2, mem_mib: 512}\nhooks:\n  on_start:\n    - printf 'HOOK_START\\n'; sleep 2; printf 'HOOK_STDERR\\n' >&2\n  pre_stop:\n    - printf 'HOOK_STOP\\n'; printf 'STOP_STDERR\\n' >&2; exit 9\nworkload:\n  entrypoint: /bin/sh\n  args: [-c, \"printf 'WORKLOAD_READY\\n'; exit 7\"]\n",
+    )
+    .unwrap();
+    let (_, setup_code) = suite.run_terra_status(&[
+        recipe.to_str().unwrap(),
+        "setup",
+        "--project",
+        project.to_str().unwrap(),
+    ]);
+    assert_eq!(setup_code, 0);
+    let (_master, slave) = console_input();
+    let mut child = Command::new(&suite.terra)
+        .args(["hooks", "--project", project.to_str().unwrap()])
+        .env("HOME", &suite.home)
+        .env_remove("RUST_LOG")
+        .stdin(slave)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = [0; 4096];
+        while let Ok(len) = stdout.read(&mut bytes) {
+            if len == 0 || sender.send(bytes[..len].to_vec()).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut output = String::new();
+    let mut hook_started = None;
+    let mut workload_started = None;
+    loop {
+        if let Ok(bytes) = receiver.recv_timeout(Duration::from_millis(50)) {
+            output.push_str(&String::from_utf8_lossy(&bytes));
+        }
+        if hook_started.is_none() && output.contains("HOOK_START") {
+            hook_started = Some(Instant::now());
+        }
+        if workload_started.is_none() && output.contains("WORKLOAD_READY") {
+            workload_started = Some(Instant::now());
+        }
+        if child.try_wait().unwrap().is_some() {
+            for bytes in receiver {
+                output.push_str(&String::from_utf8_lossy(&bytes));
+            }
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("hook console timed out: {output}");
+        }
+    }
+    assert_eq!(child.wait().unwrap().code(), Some(7), "{output}");
+    if workload_started.is_none() && output.contains("WORKLOAD_READY") {
+        workload_started = Some(Instant::now());
+    }
+    assert!(
+        workload_started
+            .unwrap()
+            .duration_since(hook_started.unwrap())
+            >= Duration::from_secs(1),
+        "startup output was delayed until after the hook: {output}"
+    );
+    for marker in ["HOOK_STDERR", "HOOK_STOP", "STOP_STDERR"] {
+        assert!(output.contains(marker), "missing {marker}: {output}");
+    }
+    assert!(
+        output.contains("HOOK_START\r\n"),
+        "terminal line endings: {output:?}"
+    );
+    assert!(output.find("WORKLOAD_READY").unwrap() < output.find("HOOK_STOP").unwrap());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "boots a VM at platform CPU/storage capacity and needs /dev/kvm"]
+fn capacity_machine_vcpus_and_storage_devices() {
+    #[cfg(target_arch = "aarch64")]
+    use terra_platform::aarch64::arm::MAX_DEVICES;
+    #[cfg(target_arch = "x86_64")]
+    use terra_platform::machine::MAX_DEVICES;
+    const STORAGE_PER_KIND: usize = (MAX_DEVICES - 5) / 2;
+    let cpus = terra_platform::worker::MAX_VCPUS;
+    let last_cpu = cpus - 1;
+    let last_mount = STORAGE_PER_KIND - 1;
+    let suite = Suite::new();
+    let host_dirs = (0..STORAGE_PER_KIND)
+        .map(|index| {
+            let path = suite.get_work_dir().join(format!("capacity-mount-{index}"));
+            std::fs::create_dir(&path).unwrap();
+            std::fs::write(path.join("host-seed"), format!("host-{index}")).unwrap();
+            path
+        })
+        .collect::<Vec<_>>();
+    let recipe = suite.get_work_dir().join("capacity.yaml");
+    let volumes = (0..STORAGE_PER_KIND)
+        .map(|index| {
+            format!("  - name: volume-{index}\n    guest: /volume-{index}\n    size_mib: 8")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let targets = (0..STORAGE_PER_KIND)
+        .map(|index| format!("/mount-{index}"))
+        .chain((0..STORAGE_PER_KIND).map(|index| format!("/volume-{index}")))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mounts = host_dirs
+        .iter()
+        .enumerate()
+        .map(|(index, host)| format!("  - host: {}\n    guest: /mount-{index}", host.display()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(
+        &recipe,
+        format!(
+            "hw: {{cpus: {cpus}, mem_mib: 512}}\nvolumes:\n{volumes}\nmounts:\n{mounts}\nworkload:\n  entrypoint: /bin/sh\n  args:\n    - -ec\n    - |\n      test \"$(nproc)\" = {cpus}\n      test \"$(cat /sys/devices/system/cpu/online)\" = 0-{last_cpu}\n      grep -Eq '0x0*5' /sys/bus/virtio/devices/*/device\n      for target in {targets}; do\n        (\n          i=0\n          while test \"$i\" -lt 16; do\n            value=\"$target:$i\"\n            printf '%s' \"$value\" > \"$target/roundtrip\"\n            test \"$(cat \"$target/roundtrip\")\" = \"$value\"\n            i=$((i + 1))\n          done\n        ) &\n      done\n      wait\n      for index in $(seq 0 {last_mount}); do test \"$(cat /mount-$index/host-seed)\" = host-$index; done\n      echo CAPACITY_OK\n"
+        ),
+    )
+    .unwrap();
+
+    let output = suite.boot_recipe(&recipe, "capacity", &[]);
+    assert!(output.contains("CAPACITY_OK"), "{output}");
+    for (index, host) in host_dirs.iter().enumerate() {
+        assert_eq!(
+            std::fs::read_to_string(host.join("roundtrip")).unwrap(),
+            format!("/mount-{index}:15")
+        );
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+#[ignore = "boots a VM with 32 volumes and needs /dev/kvm"]
+fn capacity_32_volumes_reaches_vdah() {
+    const VOLUMES: usize = 32;
+    let suite = Suite::new();
+    let recipe = suite.get_work_dir().join("capacity-volumes.yaml");
+    let volumes = (0..VOLUMES)
+        .map(|index| {
+            format!("  - name: volume-{index}\n    guest: /volume-{index}\n    size_mib: 8")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(
+        &recipe,
+        format!(
+            "hw: {{cpus: 2, mem_mib: 512}}\nvolumes:\n{volumes}\nworkload:\n  entrypoint: /bin/sh\n  args:\n    - -ec\n    - |\n      test -b /dev/vdah\n      for index in $(seq 0 31); do\n        value=volume-$index\n        printf '%s' \"$value\" > \"/volume-$index/roundtrip\"\n        test \"$(cat \"/volume-$index/roundtrip\")\" = \"$value\"\n      done\n      echo VOLUME_CAPACITY_OK\n"
+        ),
+    )
+    .unwrap();
+
+    let output = suite.boot_recipe(&recipe, "capacity-volumes", &[]);
+    assert!(output.contains("VOLUME_CAPACITY_OK"), "{output}");
 }

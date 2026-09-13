@@ -18,25 +18,68 @@ pub(crate) fn is_recipe_ext(extension: &OsStr) -> bool {
 /// before anything is built under it.
 pub fn validate_box_name(name: &str) -> Result<()> {
     if RESERVED_NAMES.contains(&name) {
-        bail!("'{name}' cannot name a box: it is a terra command");
+        bail!(
+            "'{}' cannot name a box: it is a terra command",
+            crate::render::escape_printable(name)
+        );
     }
     if Path::new(name).extension().is_some_and(is_recipe_ext) {
-        bail!("'{name}' cannot name a box: it names a recipe file (try './{name}')");
+        bail!(
+            "'{}' cannot name a box: it names a recipe file (try './{}')",
+            crate::render::escape_printable(name),
+            crate::render::escape_printable(name)
+        );
     }
     // A leading `_` is reserved for terra's own argv words (`__vm`).
     let ok = !name.is_empty()
         && name.len() <= 32
         && !name.starts_with(['.', '-', '_'])
+        && !name.ends_with('.')
+        && !is_windows_device_name(name)
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_');
     if !ok {
         bail!(
-            "'{name}' cannot name a box: a name is 1-32 characters of [a-z A-Z 0-9 . - _], \
-             not starting with '.', '-' or '_'"
+            "'{}' cannot name a box: a name is 1-32 characters of [a-z A-Z 0-9 . - _], \
+             not starting with '.', '-' or '_', ending with '.', or a Windows device name",
+            crate::render::escape_printable(name)
         );
     }
     Ok(())
+}
+
+fn is_windows_device_name(name: &str) -> bool {
+    matches!(
+        name.split('.')
+            .next()
+            .map(str::to_ascii_uppercase)
+            .as_deref(),
+        Some(
+            "CON"
+                | "PRN"
+                | "AUX"
+                | "NUL"
+                | "COM1"
+                | "COM2"
+                | "COM3"
+                | "COM4"
+                | "COM5"
+                | "COM6"
+                | "COM7"
+                | "COM8"
+                | "COM9"
+                | "LPT1"
+                | "LPT2"
+                | "LPT3"
+                | "LPT4"
+                | "LPT5"
+                | "LPT6"
+                | "LPT7"
+                | "LPT8"
+                | "LPT9"
+        )
+    )
 }
 
 #[cfg(test)]
@@ -57,6 +100,9 @@ mod tests {
             "a/b",
             "a b",
             "é",
+            "dev.",
+            "CON",
+            "lpt9.log",
             &"x".repeat(33),
         ] {
             assert!(validate_box_name(bad).is_err(), "{bad}");
@@ -75,5 +121,11 @@ mod tests {
         // The origin label sits outside the name alphabet, so no name can
         // collide with the file beside the box directories.
         assert!(validate_box_name(crate::state::ORIGIN_FILE).is_err());
+    }
+
+    #[test]
+    fn invalid_box_names_escape_terminal_controls() {
+        let error = validate_box_name("bad\x1b\x07").unwrap_err().to_string();
+        assert!(!error.contains(['\x1b', '\x07']), "{error:?}");
     }
 }

@@ -4,14 +4,14 @@
 
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use std::path::PathBuf;
-use terra_shared::contract::DEFAULT_STOP_GRACE_SECS;
+use terra_protocol::DEFAULT_STOP_GRACE_SECS;
 
 #[derive(Parser, Debug)]
 #[command(
     name = "terra",
     version = env!("CARGO_PKG_VERSION"),
-    about = "Launch isolated microVMs for AI agents via libkrun",
-    long_about = "Launch isolated microVMs for AI agents via libkrun.\n\n\
+    about = "Launch isolated microVMs for AI agents",
+    long_about = "Launch isolated microVMs for AI agents.\n\n\
                   The box comes first, always: `terra [BOX]` starts it, or attaches if \
                   it is already up. A verb after the box names one operation on it \
                   instead - `terra dev stop`, `terra dev get /etc/x .` - and every verb \
@@ -44,15 +44,16 @@ impl Cli {
             detach,
             foreground,
             command,
+            agent,
         } = &self.boot;
-        *root || *detach || *foreground || !command.is_empty()
+        *root || *detach || *foreground || agent.agent_timeout.is_some() || !command.is_empty()
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
         let Some(cmd) = &self.cmd else {
             return Ok(());
         };
-        let verb: &str = cmd.into();
+        let verb = cmd.verb();
         let boot_hint = if cmd.takes_the_box() {
             format!(
                 "or run the box first (`terra {box_name} -d`) and then `terra {box_name} {verb}`",
@@ -109,8 +110,7 @@ pub fn parse_or_exit() -> Cli {
     cli
 }
 
-#[derive(Subcommand, Debug, strum::IntoStaticStr)]
-#[strum(serialize_all = "kebab-case")]
+#[derive(Subcommand, Debug)]
 pub enum Cmd {
     /// Set up a box for this directory: read a recipe, pin it, build the guest
     /// filesystem, and bake `on_create`. Safe to run again.
@@ -132,10 +132,8 @@ pub enum Cmd {
     /// Copy one file out of the box onto the host. A destination directory
     /// keeps the file's own name.
     Get(CopyArgs),
-    /// Show a box's log: terra's, libkrun's and the gateway's own diagnostics,
-    /// rotated as it grows (libkrun speaks at warn and above unless `RUST_LOG`
-    /// says otherwise). The guest's boot and hooks are not in it -
-    /// `TERRA_DIAGNOSTICS=1` keeps those in diagnostics.log. The workload's
+    /// Show a box's host diagnostics, rotated as it grows. `--diagnostics` shows guest VM
+    /// diagnostics instead; both are replayed after a failed boot. The workload's
     /// terminal goes to the session - attach to the box to see it live.
     Logs(LogsArgs),
     /// List the clients attached to the box's session: the ids `terra <box>
@@ -169,6 +167,23 @@ pub enum Cmd {
 }
 
 impl Cmd {
+    fn verb(&self) -> &'static str {
+        match self {
+            Self::Setup(_) => "setup",
+            Self::Exec(_) => "exec",
+            Self::Put(_) => "put",
+            Self::Get(_) => "get",
+            Self::Logs(_) => "logs",
+            Self::Sessions(_) => "sessions",
+            Self::Detach(_) => "detach",
+            Self::Show(_) => "show",
+            Self::Ls(_) => "ls",
+            Self::Stop(_) => "stop",
+            Self::Storage(_) => "storage",
+            Self::Rm(_) => "rm",
+        }
+    }
+
     /// Whether `terra <box> <verb>` means anything for this verb.
     #[must_use]
     fn takes_the_box(&self) -> bool {
@@ -346,6 +361,9 @@ pub struct LogsArgs {
     /// Follow the log as it grows.
     #[arg(short, long)]
     pub follow: bool,
+    /// Show guest VM diagnostics instead of Terra's host log.
+    #[arg(long)]
+    pub diagnostics: bool,
 }
 
 #[derive(Args, Debug)]
@@ -386,6 +404,9 @@ pub struct BootArgs {
     /// join.
     #[arg(long, conflicts_with = "detach")]
     pub foreground: bool,
+
+    #[command(flatten)]
+    pub agent: AgentTimeoutArg,
 
     /// Command to run instead of the recipe's `workload:`, after `--`. argv is
     /// passed literally to the guest exec, so use `-- sh -c '…'` for a shell
@@ -666,14 +687,8 @@ mod tests {
         assert!(cli.validate().is_ok(), "{hint}");
     }
 
-    /// Every refusal [`Cli::validate`] writes names the verb through [`Cmd`]'s
-    /// strum-derived `&str` conversion, and clap owns how that verb is actually
-    /// typed - both derive the word from the variant name and agree by
-    /// convention only, so a `#[command(name = …)]` or `#[strum(…)]` rename
-    /// would leave every one of those messages prescribing a command that does
-    /// not exist, with nothing to catch it. The words are pinned to clap in
-    /// both directions: each parses from the spelling it claims, and no
-    /// subcommand is missing from the list.
+    /// Error-message verbs match clap in both directions: every spelling parses,
+    /// and every clap subcommand has a spelling test.
     #[test]
     fn every_verb_is_worded_the_way_clap_spells_it() {
         // One parse per verb, typed as clap spells it - so argv's first word is
@@ -702,7 +717,7 @@ mod tests {
             let Some(cmd) = parsed.cmd else {
                 panic!("`terra {}` parses to no verb", argv.join(" "))
             };
-            let word: &str = (&cmd).into();
+            let word = cmd.verb();
             assert_eq!(word, argv[0], "`{}` is worded as '{word}'", argv.join(" "));
             worded.push(argv[0]);
         }
@@ -710,7 +725,7 @@ mod tests {
             assert!(
                 worded.contains(&sub.get_name()),
                 "'{}' is a terra verb that no case here words - a message built \
-                 from its strum word would go unchecked",
+                 from its verb would go unchecked",
                 sub.get_name()
             );
         }
@@ -882,12 +897,27 @@ mod tests {
             panic!("expected exec")
         };
         assert_eq!(args.agent.agent_timeout, Some(5));
+        assert_eq!(
+            Cli::parse_from(["terra", "--agent-timeout", "5"])
+                .boot
+                .agent
+                .agent_timeout,
+            Some(5)
+        );
         let Some(Cmd::Get(args)) =
             Cli::parse_from(["terra", "get", "--agent-timeout", "5", "/b", "a"]).cmd
         else {
             panic!("expected get")
         };
         assert_eq!(args.agent.agent_timeout, Some(5));
+    }
+
+    #[test]
+    fn logs_can_select_guest_diagnostics() {
+        let Some(Cmd::Logs(args)) = Cli::parse_from(["terra", "logs", "--diagnostics"]).cmd else {
+            panic!("expected logs")
+        };
+        assert!(args.diagnostics);
     }
 
     /// A copy is two paths and a direction: `put` sends the source in, `get`

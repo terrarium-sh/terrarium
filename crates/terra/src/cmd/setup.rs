@@ -29,6 +29,7 @@ pub struct ApprovedRecipe {
     pub bx: BoxRef,
     pub cfg: config::Config,
     new_pin: Option<resolve::Recipe>,
+    pinned_paths: Option<mount::PinnedPaths>,
 }
 
 struct GuestWritableFile {
@@ -36,31 +37,50 @@ struct GuestWritableFile {
     share: PathBuf,
 }
 
+enum RecipeAuthorship {
+    WritableShare(GuestWritableFile),
+    UnreadablePinnedRecipe,
+}
+
 fn find_guest_writable_share_containing(
     bx: &BoxRef,
     from: &Path,
     via_manifest: bool,
-) -> Option<GuestWritableFile> {
-    let previous = mount::list_pinned_recipes_across_boxes(bx.get_project_dir());
+) -> Option<RecipeAuthorship> {
+    let Ok(previous) = mount::list_pinned_recipes_across_boxes(bx.get_project_dir()) else {
+        return Some(RecipeAuthorship::UnreadablePinnedRecipe);
+    };
     let manifest = bx.get_project_dir().join(config::MANIFEST_FILE);
     let carriers: &[&Path] = if via_manifest {
         &[from, &manifest]
     } else {
         &[from]
     };
-    carriers.iter().find_map(|file| {
-        previous
-            .iter()
-            .find_map(|p| mount::find_writable_mount_containing(file, p, bx.get_project_dir()))
-            .map(|share| GuestWritableFile {
-                recipe_or_manifest: (*file).to_path_buf(),
-                share,
-            })
-    })
+    for file in carriers {
+        for (origin, recipe) in &previous {
+            match mount::find_writable_mount_containing(file, recipe, origin) {
+                Ok(Some(share)) => {
+                    return Some(RecipeAuthorship::WritableShare(GuestWritableFile {
+                        recipe_or_manifest: (*file).to_path_buf(),
+                        share,
+                    }));
+                }
+                Ok(None) => {}
+                Err(_) => return Some(RecipeAuthorship::UnreadablePinnedRecipe),
+            }
+        }
+    }
+    None
 }
 
-fn build_adoption_reason(from: &Path, file: &GuestWritableFile) -> String {
+fn build_adoption_reason(from: &Path, authorship: &RecipeAuthorship) -> String {
     use std::fmt::Write as _;
+    let RecipeAuthorship::WritableShare(file) = authorship else {
+        return format!(
+            "a box's pinned recipe cannot be read to determine whether a guest could have written {}",
+            escape_printable_path(from)
+        );
+    };
     let mut why = format!(
         "{} lives inside '{}', which a box of this directory shares read-write - \
          a guest may be the author of it",
@@ -181,13 +201,16 @@ fn answer_is_yes(answer: &str, default_yes: bool) -> bool {
     }
 }
 
+/// `refresh_pinned_paths` lets an explicit setup replace a pin's path targets.
 pub fn request_recipe_approval(
     target: ResolvedBox,
     approval: &Approval,
     is_at_a_terminal: bool,
+    refresh_pinned_paths: bool,
 ) -> Result<ApprovedRecipe> {
     target.bx.ensure_sockets_fit()?;
-    let mut cfg = target.parse_recipe()?;
+    sys::validate_host_root()?;
+    let mut cfg = target.parse_recipe_without_env_file()?;
     let ResolvedBox {
         bx,
         source,
@@ -199,6 +222,7 @@ pub fn request_recipe_approval(
         resolve::Source::Manifest(r) => (Some(r), true),
     };
     cfg.mounts = mount::resolve_mounts(&cfg, &bx)?;
+    validate_storage_devices(&cfg)?;
 
     let mut new_pin = None;
     if let Some(r) = source {
@@ -218,9 +242,9 @@ pub fn request_recipe_approval(
                     escape_printable_path(&r.from)
                 ),
             };
-            let warning = guest_writable
-                .as_ref()
-                .map(|f| format!("WARNING: {}.", build_adoption_reason(&r.from, f)));
+            let warning = guest_writable.as_ref().map(|authorship| {
+                format!("WARNING: {}.", build_adoption_reason(&r.from, authorship))
+            });
             put_the_question(
                 decide_pinning(approval, guest_writable.is_some(), is_at_a_terminal),
                 &lead,
@@ -231,7 +255,37 @@ pub fn request_recipe_approval(
             new_pin = Some(r);
         }
     }
-    Ok(ApprovedRecipe { bx, cfg, new_pin })
+    config::resolve_env_file(&mut cfg)?;
+    let paths = mount::PinnedPaths::from_config(&cfg);
+    let pinned_paths = if mount::load_pinned_paths(&bx)?.as_ref() == Some(&paths) {
+        None
+    } else if refresh_pinned_paths || new_pin.is_some() {
+        Some(paths)
+    } else {
+        mount::verify_pinned_paths(&bx, &paths)?;
+        None
+    };
+    config::merge_env_file(&mut cfg)?;
+    Ok(ApprovedRecipe {
+        bx,
+        cfg,
+        new_pin,
+        pinned_paths,
+    })
+}
+
+fn validate_storage_devices(cfg: &config::Config) -> Result<()> {
+    let count = cfg
+        .mounts
+        .len()
+        .checked_add(cfg.volumes.len())
+        .ok_or_else(|| anyhow::anyhow!("too many volumes and host-directory mounts"))?;
+    anyhow::ensure!(
+        count <= crate::vm::MAX_GUEST_STORAGE_DEVICES,
+        "a box supports at most {} combined volumes and host-directory mounts; remove a volume or mount",
+        crate::vm::MAX_GUEST_STORAGE_DEVICES
+    );
+    Ok(())
 }
 
 pub struct PreparedBox {
@@ -246,10 +300,16 @@ pub enum Rebuild {
 }
 
 pub fn prepare_box(approved: &ApprovedRecipe, rebuild: Rebuild) -> Result<PreparedBox> {
-    let ApprovedRecipe { bx, cfg, new_pin } = approved;
+    let ApprovedRecipe {
+        bx,
+        cfg,
+        new_pin,
+        pinned_paths,
+    } = approved;
     // Locked before anything on disk moves - a setup racing a finished `rm`
     // would otherwise resurrect the state directory after rm reported it gone.
     let lock = bx.lock_run()?;
+    crate::cmd::storage::recover_import(bx)?;
     prepare_box_state_dir(bx)?;
     // Under the lock anything staged here predates this run - a setup or boot
     // that died part-way through an install.
@@ -260,23 +320,26 @@ pub fn prepare_box(approved: &ApprovedRecipe, rebuild: Rebuild) -> Result<Prepar
             eprintln!(
                 "terra: recipe updated from {} (the box keeps its filesystem; \
                  `terra {} setup --rebuild` rebuilds it)",
-                r.from.display(),
+                escape_printable_path(&r.from),
                 bx.get_name()
             );
         }
         crate::vm::image::staged_write(&recipe_path, |out| {
             out.write_all(r.text.as_bytes())
-                .with_context(|| format!("recording {}", recipe_path.display()))?;
-            // Durable before the rename - the pin is what every later boot
-            // trusts, and nothing re-derives it.
-            out.sync_all()
-                .with_context(|| format!("syncing {}", recipe_path.display()))
+                .with_context(|| format!("recording {}", recipe_path.display()))
+        })?;
+    }
+    if let Some(paths) = pinned_paths {
+        let path = bx.get_dir().join(state::PINNED_PATHS_FILE);
+        crate::vm::image::staged_write(&path, |out| {
+            yaml_serde::to_writer(&mut *out, paths).context("serializing pinned paths")
         })?;
     }
     let img = bx.get_dir().join(state::ROOTFS_FILE);
     if matches!(rebuild, Rebuild::Yes) && img.exists() {
         eprintln!("terra: --rebuild: rebuilding {bx} from scratch");
-        let _ = std::fs::remove_file(&img);
+        std::fs::remove_file(&img)
+            .with_context(|| format!("removing {} for rebuild", img.display()))?;
         let _ = std::fs::remove_file(bx.get_dir().join(state::BAKE_STAMP));
     }
     let fresh = !img.exists();
@@ -286,15 +349,19 @@ pub fn prepare_box(approved: &ApprovedRecipe, rebuild: Rebuild) -> Result<Prepar
     crate::vm::image::ensure_rootfs_image(&img, cfg.hw.rootfs_mib)
         .with_context(|| format!("preparing {}", img.display()))?;
     let configured: Vec<String> = cfg.volumes.iter().map(|v| v.name.clone()).collect();
-    sweep_or_keep_unused_volumes(bx, &configured, rebuild);
+    sweep_or_keep_unused_volumes(bx, &configured, rebuild)?;
     Ok(PreparedBox {
         lock,
         fresh_rootfs: fresh,
     })
 }
 
-fn sweep_or_keep_unused_volumes(bx: &BoxRef, configured: &[String], rebuild: Rebuild) {
-    for img in bx.list_unused_volume_images(configured) {
+fn sweep_or_keep_unused_volumes(
+    bx: &BoxRef,
+    configured: &[String],
+    rebuild: Rebuild,
+) -> Result<()> {
+    for img in bx.list_unused_volume_images(configured)? {
         if matches!(rebuild, Rebuild::No) {
             eprintln!(
                 "terra: {} holds a volume the recipe no longer names - kept \
@@ -313,10 +380,11 @@ fn sweep_or_keep_unused_volumes(bx: &BoxRef, configured: &[String], rebuild: Reb
             Err(e) => eprintln!("terra: warning: could not remove {}: {e}", img.display()),
         }
     }
+    Ok(())
 }
 
 fn refuse_a_case_variant_of_an_existing_box(bx: &BoxRef) -> Result<()> {
-    let clash = state::list_existing_names(bx.get_project_dir())
+    let clash = state::list_existing_names(bx.get_project_dir())?
         .into_iter()
         .find(|existing| existing != bx.get_name() && existing.eq_ignore_ascii_case(bx.get_name()));
     if let Some(existing) = clash {
@@ -381,7 +449,7 @@ pub fn run(
             trust_recipe: args.trust_recipe,
         }
     };
-    let approved = request_recipe_approval(target, &approval, is_at_a_terminal)?;
+    let approved = request_recipe_approval(target, &approval, is_at_a_terminal, true)?;
     if args.dry_run {
         // The refusals have run; the rest is the disk work a dry run exists
         // not to do.
@@ -412,6 +480,75 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn another_projects_relative_share_makes_recipe_and_manifest_suspect() {
+        let _home = crate::sys::TestHome::new();
+        let root = tempfile::tempdir().unwrap();
+        let origin = root.path().join("origin");
+        let target = root.path().join("target");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        let writer = BoxRef::resolve(&origin, "writer").unwrap();
+        std::fs::create_dir_all(writer.get_dir()).unwrap();
+        writer.write_origin();
+        std::fs::write(
+            writer.get_dir().join(state::RECIPE_FILE),
+            "mounts:\n  - host: ../target\n    guest: /work\n",
+        )
+        .unwrap();
+        let bx = BoxRef::resolve(&target, "dev").unwrap();
+        assert!(matches!(
+            find_guest_writable_share_containing(&bx, &target.join("evil.yaml"), false),
+            Some(RecipeAuthorship::WritableShare(_))
+        ));
+        assert!(matches!(
+            find_guest_writable_share_containing(&bx, &root.path().join("outside.yaml"), true),
+            Some(RecipeAuthorship::WritableShare(_))
+        ));
+        assert!(
+            find_guest_writable_share_containing(&bx, &root.path().join("outside.yaml"), false)
+                .is_none()
+        );
+        std::fs::write(writer.get_dir().join(state::RECIPE_FILE), [0xff]).unwrap();
+        assert!(matches!(
+            find_guest_writable_share_containing(&bx, &target.join("evil.yaml"), false),
+            Some(RecipeAuthorship::UnreadablePinnedRecipe)
+        ));
+    }
+
+    #[test]
+    fn combined_volumes_and_mounts_fit_the_vmm() {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        assert_eq!(crate::vm::MAX_GUEST_STORAGE_DEVICES, 32);
+        let cfg = config::Config {
+            mounts: (0..crate::vm::MAX_GUEST_STORAGE_DEVICES)
+                .map(|index| config::Mount {
+                    host: format!("/host/{index}").into(),
+                    guest: format!("/guest/{index}").into(),
+                    readonly: false,
+                })
+                .collect(),
+            ..config::Config::default()
+        };
+        assert!(validate_storage_devices(&cfg).is_ok());
+
+        let mut over = cfg;
+        over.volumes.push(config::Volume {
+            name: "over".into(),
+            guest: "/data".into(),
+            size_mib: 1,
+        });
+        let err = validate_storage_devices(&over).unwrap_err().to_string();
+        assert!(
+            err.contains("combined volumes and host-directory mounts"),
+            "{err}"
+        );
+        assert!(
+            err.contains(&crate::vm::MAX_GUEST_STORAGE_DEVICES.to_string()),
+            "{err}"
+        );
+    }
 
     /// Re-pinning an *already pinned* box still consults every sibling's
     /// shares: a guest in box `b`, which shares the project read-write, can
@@ -451,13 +588,18 @@ mod tests {
             manifest_divergence: None,
         };
 
-        // With no terminal to ask on, a suspect pin must refuse.
+        // Approval must precede reading even a missing env_file.
+        let mut refused = target();
+        if let resolve::Source::File(recipe) = &mut refused.source {
+            recipe.text.push_str("env_file: missing.env\n");
+        }
         let err = request_recipe_approval(
-            target(),
+            refused,
             &Approval::ChosenByHand {
                 trust_recipe: false,
             },
             false,
+            true,
         )
         .expect_err("a sibling's writable share should have made this pin suspect")
         .to_string();
@@ -471,9 +613,102 @@ mod tests {
                 target(),
                 &Approval::ChosenByHand { trust_recipe: true },
                 is_at_a_terminal,
+                true,
             )
             .expect("--trust-recipe should pin without asking");
             assert!(approved.new_pin.is_some(), "the recipe should be adopted");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_changed_pinned_target_needs_setup_before_any_source_can_boot_it() {
+        for changed_env_file in [false, true] {
+            let _home = crate::sys::TestHome::new();
+            let dir = tempfile::tempdir().unwrap();
+            let project = dir.path().join("project");
+            let safe = dir.path().join("safe");
+            let private = dir.path().join("private");
+            std::fs::create_dir_all(&project).unwrap();
+            std::fs::create_dir_all(safe.join("share")).unwrap();
+            std::fs::create_dir_all(private.join("share")).unwrap();
+            std::fs::write(safe.join("env"), "A=safe\n").unwrap();
+            std::fs::write(private.join("env"), "A=private\n").unwrap();
+            std::os::unix::fs::symlink(safe.join("share"), project.join("share")).unwrap();
+            std::os::unix::fs::symlink(safe.join("env"), project.join("env")).unwrap();
+            let recipe_text =
+                "mounts:\n  - {host: ./share, guest: /work}\nenv_file: ./env\n".to_string();
+            let bx = BoxRef::resolve(&project, "dev").unwrap();
+            let recipe = || resolve::Recipe {
+                from: project.join("dev.yaml"),
+                text: recipe_text.clone(),
+            };
+            let initial = ResolvedBox {
+                bx: bx.clone(),
+                source: resolve::Source::File(recipe()),
+                manifest_divergence: None,
+            };
+            let approved = request_recipe_approval(
+                initial,
+                &Approval::ChosenByHand {
+                    trust_recipe: false,
+                },
+                true,
+                true,
+            )
+            .unwrap();
+            prepare_box(&approved, Rebuild::No).unwrap();
+
+            let path = if changed_env_file { "env" } else { "share" };
+            std::fs::remove_file(project.join(path)).unwrap();
+            let replacement = if changed_env_file {
+                private.join("env")
+            } else {
+                private.join("share")
+            };
+            std::os::unix::fs::symlink(replacement, project.join(path)).unwrap();
+
+            for source in [resolve::Source::Pinned, resolve::Source::File(recipe())] {
+                let error = request_recipe_approval(
+                    ResolvedBox {
+                        bx: bx.clone(),
+                        source,
+                        manifest_divergence: None,
+                    },
+                    &Approval::Offer,
+                    true,
+                    false,
+                )
+                .expect_err("a changed target must not boot")
+                .to_string();
+                assert!(error.contains("moved since it was pinned"), "{error}");
+            }
+
+            let refreshed = request_recipe_approval(
+                ResolvedBox {
+                    bx: bx.clone(),
+                    source: resolve::Source::Pinned,
+                    manifest_divergence: None,
+                },
+                &Approval::ChosenByHand {
+                    trust_recipe: false,
+                },
+                true,
+                true,
+            )
+            .expect("an explicit setup refreshes pinned targets");
+            prepare_box(&refreshed, Rebuild::No).unwrap();
+            request_recipe_approval(
+                ResolvedBox {
+                    bx,
+                    source: resolve::Source::Pinned,
+                    manifest_divergence: None,
+                },
+                &Approval::Offer,
+                true,
+                false,
+            )
+            .expect("the refreshed pin boots");
         }
     }
 
@@ -526,14 +761,14 @@ mod tests {
         }
         let configured = vec!["data".to_string()];
 
-        sweep_or_keep_unused_volumes(&bx, &configured, Rebuild::No);
+        sweep_or_keep_unused_volumes(&bx, &configured, Rebuild::No).unwrap();
         assert!(
             bx.get_volume_image("old").exists(),
             "a plain pin or boot deleted a volume's data"
         );
         assert!(bx.get_volume_image("data").exists());
 
-        sweep_or_keep_unused_volumes(&bx, &configured, Rebuild::Yes);
+        sweep_or_keep_unused_volumes(&bx, &configured, Rebuild::Yes).unwrap();
         assert!(!bx.get_volume_image("old").exists(), "--rebuild sweeps it");
         assert!(
             bx.get_volume_image("data").exists(),
@@ -557,6 +792,7 @@ mod tests {
             bx: bx.clone(),
             cfg: yaml_serde::from_str::<crate::config::Config>("{}").unwrap(),
             new_pin: None,
+            pinned_paths: None,
         };
         prepare_box(&approved, Rebuild::Yes).unwrap();
 

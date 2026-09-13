@@ -3,7 +3,7 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use sha2::{Digest as _, Sha256};
-use std::fs::{File, OpenOptions, TryLockError};
+use std::fs::{File, TryLockError};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -23,13 +23,11 @@ const VOLUME_SUFFIX: &str = ".img";
 
 /// The one user-authored file in a box's state dir.
 pub const RECIPE_FILE: &str = "recipe.yaml";
+pub const PINNED_PATHS_FILE: &str = "pinned-paths.yaml";
 
 const BAKE_MARK: &str = "bake";
 
-/// How long [`BoxRef::lock_run`] outwaits a momentary holder before calling the
-/// box taken. Not a lockless test: asking whether a lock is held without taking
-/// one needs POSIX record locks, which a process drops on *any* close of the
-/// file - one stray read of the pid file would unlock a running box.
+/// POSIX record locks would let an unrelated close of the pid file unlock a running box.
 const LOCK_CONTENTION_GRACE: Duration = Duration::from_millis(500);
 
 pub const ORIGIN_FILE: &str = ".path";
@@ -100,28 +98,38 @@ impl BoxRef {
     }
 
     /// Every volume image the box has, whatever its recipe names.
-    #[must_use]
-    pub fn list_volume_images(&self) -> Vec<PathBuf> {
-        crate::sys::list_dir_entries(&self.dir)
+    pub fn list_volume_images(&self) -> Result<Vec<PathBuf>> {
+        let entries = match std::fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(error).with_context(|| format!("reading {}", self.dir.display()));
+            }
+        }
+        .collect::<std::io::Result<Vec<_>>>()
+        .with_context(|| format!("reading {}", self.dir.display()))?;
+        Ok(entries
+            .into_iter()
             .map(|entry| entry.path())
             .filter(|path| {
                 path.file_name()
                     .and_then(|n| n.to_str())
                     .is_some_and(|n| n.starts_with(VOLUME_PREFIX) && n.ends_with(VOLUME_SUFFIX))
+                    && path.is_file()
             })
-            .collect()
+            .collect::<Vec<_>>())
     }
 
-    #[must_use]
-    pub fn list_unused_volume_images(&self, configured: &[String]) -> Vec<PathBuf> {
+    pub fn list_unused_volume_images(&self, configured: &[String]) -> Result<Vec<PathBuf>> {
         let keep: Vec<PathBuf> = configured
             .iter()
             .map(|n| self.get_volume_image(n))
             .collect();
-        self.list_volume_images()
+        Ok(self
+            .list_volume_images()?
             .into_iter()
             .filter(|path| !keep.contains(path))
-            .collect()
+            .collect())
     }
 
     /// The image `name` addresses in this box, or `None` for a name that is
@@ -166,13 +174,8 @@ impl BoxRef {
     }
 
     /// Rewrites the lock metadata without replacing the inode.
-    fn rewrite_lock_line(&self, line: &str) -> std::io::Result<()> {
+    fn rewrite_lock_line(mut file: &File, line: &str) -> std::io::Result<()> {
         use std::io::{Seek as _, Write as _};
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(self.dir.join(PID_FILE))?;
         file.seek(std::io::SeekFrom::Start(0))?;
         file.set_len(0)?;
         file.write_all(line.as_bytes())?;
@@ -181,7 +184,7 @@ impl BoxRef {
 
     /// A failed write is worth a warning: `terra stop` finds this VM by the pid
     /// published here.
-    pub fn publish_pid(&self, _lock: &File, pid: u32, baking: bool) {
+    pub fn publish_pid(&self, lock: &File, pid: u32, baking: bool) {
         use std::fmt::Write as _;
         let mut line = pid.to_string();
         if let Some(started_at) = crate::sys::read_process_start_time(pid) {
@@ -191,7 +194,7 @@ impl BoxRef {
             line.push(' ');
             line.push_str(BAKE_MARK);
         }
-        if let Err(e) = self.rewrite_lock_line(&line) {
+        if let Err(e) = Self::rewrite_lock_line(lock, &line) {
             log::warn!("terra: warning: could not publish pid {pid} for {self}: {e}");
         }
     }
@@ -199,7 +202,7 @@ impl BoxRef {
     /// A host that cannot lock at all reads as [`Holder::Free`], and leaves the
     /// real complaint to `lock_run`.
     pub fn get_holder(&self) -> Holder {
-        if !holds_lock(&self.dir.join(PID_FILE)) {
+        if !crate::sys::holds_run_lock(&self.dir.join(PID_FILE)) {
             return Holder::Free;
         }
         if self.is_marked_baking() {
@@ -210,7 +213,7 @@ impl BoxRef {
 
     #[must_use = "the bake mark is cleared when this drops"]
     pub fn mark_baking<'a>(&self, lock: &'a File) -> BakeMark<'a> {
-        if let Err(e) = self.rewrite_lock_line(BAKE_MARK) {
+        if let Err(e) = Self::rewrite_lock_line(lock, BAKE_MARK) {
             log::warn!("terra: warning: could not mark {self} as baking: {e}");
         }
         BakeMark(lock)
@@ -245,15 +248,9 @@ impl BoxRef {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&path)
-            .with_context(|| format!("opening lock {}", path.display()))?;
         let deadline = Instant::now() + LOCK_CONTENTION_GRACE;
         let locked = loop {
-            match file.try_lock() {
+            match crate::sys::try_lock_run(&path) {
                 Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
                     std::thread::sleep(crate::sys::POLL);
                 }
@@ -261,7 +258,7 @@ impl BoxRef {
             }
         };
         match locked {
-            Ok(()) => {
+            Ok(file) => {
                 file.set_len(0)
                     .with_context(|| format!("truncating lock {}", path.display()))?;
                 Ok(file)
@@ -284,8 +281,6 @@ impl BoxRef {
         }
     }
 
-    /// Best-effort, UTF-8 paths only: the worst failure is a box that boots
-    /// but is missing from `terra ls`.
     pub fn write_origin(&self) {
         if let Some(project) = self.dir.parent() {
             let Some(text) = self.project_dir.to_str() else {
@@ -297,12 +292,19 @@ impl BoxRef {
     }
 }
 
-/// The mark of one bake, taken away when this drops - the error paths included.
 pub struct BakeMark<'a>(&'a File);
+
+impl BakeMark<'_> {
+    pub(crate) fn clear(self) -> std::io::Result<()> {
+        self.0.set_len(0)
+    }
+}
 
 impl Drop for BakeMark<'_> {
     fn drop(&mut self) {
-        let _ = self.0.set_len(0);
+        if let Err(error) = self.0.set_len(0) {
+            log::warn!("could not clear bake mark: {error}");
+        }
     }
 }
 
@@ -313,7 +315,7 @@ pub struct VmProcess {
     /// The process start identity when the pid was published, by which
     /// [`crate::sys::signal_pid`] tells this VM from a stranger later
     /// recycled onto the pid. `None` - an old line, or the host had no
-    /// identity - signals unverified.
+    /// identity - cannot be signalled.
     pub started_at: Option<u64>,
 }
 
@@ -360,6 +362,15 @@ fn ensure_owner_only_dir(dir: PathBuf, holds: &str) -> Result<PathBuf> {
             dir.display()
         )
     })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        anyhow::ensure!(
+            std::fs::metadata(&dir)?.permissions().mode() & 0o777 == 0o700,
+            "securing {} - it holds {holds}, so terra will not read one out of a directory that is not owner-only",
+            dir.display()
+        );
+    }
     Ok(dir)
 }
 
@@ -396,25 +407,44 @@ pub fn get_project_state_dir(project_dir: &Path) -> Result<PathBuf> {
 }
 
 /// The boxes under one `~/.terra/box/<slug>/`, as `(name, state directory)`.
-/// Unordered, empty for a slug that is not there.
-pub fn list_boxes_in(project_state_dir: &Path) -> impl Iterator<Item = (String, PathBuf)> {
-    crate::sys::list_dir_entries(project_state_dir)
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-        .filter_map(|e| {
-            e.file_name()
+/// Unordered; a missing slug is empty.
+pub fn list_boxes_in(project_state_dir: &Path) -> Result<Vec<(String, PathBuf)>> {
+    let entries = match std::fs::read_dir(project_state_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading {}", project_state_dir.display()));
+        }
+    }
+    .collect::<std::io::Result<Vec<_>>>()
+    .with_context(|| format!("reading {}", project_state_dir.display()))?;
+    let mut boxes = Vec::new();
+    for entry in entries {
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        if let Some((name, path)) = {
+            entry
+                .file_name()
                 .into_string()
                 .ok()
-                .map(|name| (name, e.path()))
-        })
+                .filter(|name| !name.starts_with('.'))
+                .map(|name| (name, entry.path()))
+        } {
+            boxes.push((name, path));
+        }
+    }
+    Ok(boxes)
 }
 
-pub fn list_existing_names(project_dir: &Path) -> Vec<String> {
-    let Ok(project) = get_project_state_dir(project_dir) else {
-        return Vec::new();
-    };
-    let mut names: Vec<String> = list_boxes_in(&project).map(|(name, _)| name).collect();
+pub fn list_existing_names(project_dir: &Path) -> Result<Vec<String>> {
+    let project = get_project_state_dir(project_dir)?;
+    let mut names: Vec<String> = list_boxes_in(&project)?
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
     names.sort();
-    names
+    Ok(names)
 }
 
 /// Crockford's base32 alphabet, lowercased.
@@ -431,7 +461,7 @@ const _: () = assert!(
 /// very unlikely (2^40 birthday) and landing on a *chosen* path would take
 /// ~2^80 work, which is what sha256 buys over a fast non-cryptographic hash.
 fn compute_slug(project_dir: &Path) -> String {
-    let real = std::fs::canonicalize(project_dir).unwrap_or_else(|_| project_dir.to_path_buf());
+    let real = crate::sys::canonicalize_existing_prefix(project_dir);
     let digest = Sha256::digest(real.as_os_str().as_encoded_bytes());
 
     let mut out = String::with_capacity(2 + SLUG_BYTES * 8 / 5);
@@ -480,24 +510,11 @@ impl std::fmt::Display for BoxState {
     }
 }
 
-fn holds_lock(path: &Path) -> bool {
-    let Ok(file) = OpenOptions::new().read(true).open(path) else {
-        return false; // no lock file -> never started
-    };
-    match file.try_lock_shared() {
-        Ok(()) => {
-            let _ = file.unlock();
-            false
-        }
-        Err(TryLockError::WouldBlock) => true,
-        Err(TryLockError::Error(_)) => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sys::TestHome;
+    use std::fs::OpenOptions;
 
     /// Every test here holds a [`TestHome`] before it resolves anything:
     /// resolution settles a box's directory under the home there and then, so
@@ -515,6 +532,23 @@ mod tests {
         while b.get_holder() != Holder::Free && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_project_under_a_symlink_keeps_the_same_slug() {
+        let directory = tempfile::tempdir().unwrap();
+        let real = directory.path().join("real");
+        let link = directory.path().join("link");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(
+            compute_slug(&real.join("missing")),
+            compute_slug(&link.join("missing"))
+        );
+        let before_creation = compute_slug(&real.join("missing"));
+        std::fs::create_dir(real.join("missing")).unwrap();
+        assert_eq!(before_creation, compute_slug(&link.join("missing")));
     }
 
     /// Substituting the cwd let whatever directory terra ran from supply the
@@ -704,7 +738,17 @@ mod tests {
     fn list_existing_names_from_disk() {
         let _home = TestHome::new();
         let dir = tempfile::tempdir().unwrap();
-        assert!(list_existing_names(dir.path()).is_empty());
+        assert!(list_existing_names(dir.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_existing_names_refuses_an_unreadable_state_directory() {
+        let _home = TestHome::new();
+        let project = tempfile::tempdir().unwrap();
+        let state_dir = get_project_state_dir(project.path()).unwrap();
+        std::fs::create_dir_all(state_dir.parent().unwrap()).unwrap();
+        std::fs::write(&state_dir, "not a directory").unwrap();
+        assert!(list_existing_names(project.path()).is_err());
     }
 
     #[test]
@@ -820,18 +864,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let b = resolve_box_ref(dir.path());
         assert!(
-            b.list_unused_volume_images(&[]).is_empty(),
+            b.list_unused_volume_images(&[]).unwrap().is_empty(),
             "a box with no state dir has nothing to list"
         );
         std::fs::create_dir_all(b.get_dir()).unwrap();
         for name in ["data", "cache", "old"] {
             std::fs::write(b.get_volume_image(name), b"image").unwrap();
         }
+        std::fs::create_dir(b.get_volume_image("directory")).unwrap();
         std::fs::write(b.get_dir().join(ROOTFS_FILE), b"rootfs").unwrap();
         std::fs::write(b.get_dir().join(RECIPE_FILE), "hw:\n  cpus: 1\n").unwrap();
         std::fs::write(b.get_dir().join(LOG_FILE), b"output").unwrap();
 
-        let mut unused = b.list_unused_volume_images(&["data".to_string()]);
+        let mut unused = b.list_unused_volume_images(&["data".to_string()]).unwrap();
         unused.sort();
         assert_eq!(
             unused,
@@ -840,7 +885,7 @@ mod tests {
 
         // With no volumes configured every image is unused - and still nothing
         // but a volume image is listed.
-        let mut all = b.list_unused_volume_images(&[]);
+        let mut all = b.list_unused_volume_images(&[]).unwrap();
         all.sort();
         assert_eq!(
             all,
@@ -1064,13 +1109,14 @@ mod tests {
     #[test]
     fn publishing_a_pid_keeps_the_lock_file_s_inode() {
         use std::os::unix::fs::MetadataExt;
+        const ABSENT_PID: u32 = u32::MAX;
         let _home = TestHome::new();
         let dir = tempfile::tempdir().unwrap();
         let b = resolve_box_ref(dir.path());
         std::fs::create_dir_all(b.get_dir()).unwrap();
         let held = b.lock_run().unwrap();
 
-        b.publish_pid(&held, 4242, false);
+        b.publish_pid(&held, ABSENT_PID, false);
         let identity = |p: &Path| {
             let meta = std::fs::metadata(p).unwrap();
             (meta.dev(), meta.ino())
@@ -1079,16 +1125,15 @@ mod tests {
 
         // Longer, then shorter than what it replaced - no tail may survive.
         b.publish_pid(&held, u32::MAX - 1, true);
-        b.publish_pid(&held, 4242, false);
+        b.publish_pid(&held, ABSENT_PID, false);
         assert_eq!(
             identity(&b.get_dir().join(PID_FILE)),
             before,
             "the lock file was replaced"
         );
-        // 4242 names no process, so the published line is bare.
         assert_eq!(
             std::fs::read_to_string(b.get_dir().join(PID_FILE)).unwrap(),
-            "4242"
+            ABSENT_PID.to_string()
         );
         assert!(b.get_holder().holds(), "the lock outlived the rewrites");
         drop(held);

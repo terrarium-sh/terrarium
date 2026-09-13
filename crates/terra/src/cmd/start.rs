@@ -109,13 +109,13 @@ pub fn run(
                 "terra: {} is already running - attaching ({} detaches)",
                 target.bx, DETACH_KEY_NAME
             );
-            return boot::attach(&target.bx);
+            return boot::attach(&target.bx, args.agent.agent_timeout);
         }
         StartPlan::Boot => {}
     }
 
     let approved =
-        setup::request_recipe_approval(target, &setup::Approval::Offer, is_at_a_terminal)?;
+        setup::request_recipe_approval(target, &setup::Approval::Offer, is_at_a_terminal, false)?;
     let mode = choose_boot_mode(args, is_at_a_terminal)?;
     let prepared = setup::prepare_box(&approved, setup::Rebuild::No)?;
     let project_dir = approved.bx.get_project_dir().to_path_buf();
@@ -131,7 +131,13 @@ pub fn run(
     {
         boot::run_bake(&spec.cfg, &approved.bx, &prepared.lock)?;
     }
-    boot::start(&spec, &approved.bx, mode, prepared.lock)
+    boot::start(
+        &spec,
+        &approved.bx,
+        mode,
+        prepared.lock,
+        args.agent.agent_timeout,
+    )
 }
 
 #[cfg(test)]

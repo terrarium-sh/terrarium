@@ -29,24 +29,15 @@ These are the requirements the unit satisfies; anything stricter breaks it.
 
 | Requirement | Why | Unit knob |
 |---|---|---|
-| `/dev/kvm` read-write | libkrun runs the VM on KVM | `SupplementaryGroups=kvm`, `DeviceAllow=/dev/kvm rw`, no `PrivateDevices` |
-| W+X memory | KVM guest memory mappings | `MemoryDenyWriteExecute=no` |
-| Real host network | the in-process egress proxy opens host sockets | no `PrivateNetwork`, no `IPAddressDeny` |
+| `/dev/kvm` read-write | the native VMM runs on KVM | `SupplementaryGroups=kvm`, `DeviceAllow=/dev/kvm rw`, no `PrivateDevices` |
+| Executable mappings | loading embedded AOT components | `MemoryDenyWriteExecute=no` |
+| Real host network | WASI capability imports open authorized host sockets | no `PrivateNetwork`, no `IPAddressDeny` |
 | Writable `$HOME/.terra` | cache of the guest kernel and boot volume (unpacked once, shared by every box), plus the box state | `StateDirectory=terra` + `Environment=HOME=%S/terra` |
 | A recipe to boot | `~/.terra/%i.yaml`, read by the `ExecStartPre` setup | yours to install; see below |
 
-The host needs no namespace privileges of its own: share ownership is remapped
-*inside* the guest (the agent unshares a user namespace there), so nothing on
-this side calls `unshare`.
-
-Running as root instead of the `terra` user boots, but it is **not** an equal
-option and should not be the default. At uid 0 virtiofs serves the guest with
-real root authority: on every read-write mount the guest picks the owner, the
-mode and the setuid bit of anything it writes, and those land on the host as
-root. A sandbox is then one `chmod 4755` away from leaving a setuid-root binary
-in a directory you share. terra warns about this at boot. Use the unprivileged
-`terra` user in the `kvm` group; if you must run as root, keep every mount
-`readonly: true`.
+The runtime needs no host namespace privileges. Host-directory mounts use the
+paths granted by the recipe. Run the service as the unprivileged `terra` user with KVM
+access; host-root execution is refused unless `TERRA_ALLOW_ROOT=1` is set.
 
 ## One-time host setup
 
@@ -56,7 +47,7 @@ install -m0755 dist/terra /usr/local/bin/terra
 install -m0644 packaging/terra@.service /etc/systemd/system/
 
 # Man pages (generated from the CLI at build time).
-install -m0644 packaging/man/*.1 /usr/local/share/man/man1/
+install -m0644 dist/man/*.1 /usr/local/share/man/man1/
 
 # Dedicated account in the kvm group (state lives in /var/lib/terra via StateDirectory).
 useradd --system --home-dir /var/lib/terra --shell /usr/sbin/nologin --groups kvm terra
@@ -72,32 +63,56 @@ journalctl -u terra@pi-dev -f
 ```
 
 The recipe should define a `workload:` — headless there's no interactive shell to
-fall back to. Its `mounts:` decide what of the host is exposed at `/work`. Keep
-it out of any directory the box shares read-write: a recipe a guest could rewrite
-is one terra stops to ask about, and the unit has no terminal to be asked on.
+fall back to. Use recipe mounts for shared directories, and `terra put`,
+`terra get`, or volumes for guest files.
 
 ## Graceful stop
 
 `systemctl stop` (SIGTERM) shuts the guest down orderly: terra writes one byte on
 the guest's control connection, the agent stops the workload (SIGTERM, then
 SIGKILL if it is still there 30 seconds later — an interactive shell ignores
-SIGTERM) and runs the recipe's `pre_stop` hooks, then the VM exits. Give
-`pre_stop` enough room with `TimeoutStopSec` (30s in the unit); after that systemd
+SIGTERM) and runs the recipe's `pre_stop` hooks, then the VM exits. The unit's
+`TimeoutStopSec` is 65 seconds; after that systemd
 escalates to SIGKILL, which still leaves no orphan (the VM runs inside terra's
 process).
 
 ## Where the output goes
 
-A `--foreground` boot splits it in two, and the split is the same one terra makes
-everywhere — *what is it doing* from *why is it broken*:
+The journal receives the attached workload's terminal output.
+`terra logs pi-dev --diagnostics` shows Terra and guest lifecycle diagnostics,
+including hook output and network denials. Kernel console collection is not implemented by
+the component backend.
 
-- **The journal** gets the workload's terminal and the guest console (kernel,
-  agent, `on_create`/`on_start`/`pre_stop` hooks). `journalctl -u terra@pi-dev`.
-- **`terra logs pi-dev`** gets terra's own diagnostics, libkrun's, and the
-  gateway's account of what egress it refused.
+The foreground CLI owns and waits for the VM worker. systemd keeps both in the
+service cgroup; orderly stop is forwarded to the worker. To send input, attach
+from another terminal with `terra pi-dev`; `Ctrl-\` detaches that client.
 
-The console is output-only here — the host gives the guest `/dev/null` for
-console input, so nothing typed at the service reaches the workload. To steer it,
-attach from any terminal: `terra pi-dev` joins the session, forwards your keys to
-the workload's PTY, and `Ctrl-\` leaves without stopping it. Every attached
-client shares one view, so this composes with a person already watching.
+## Native host builds
+
+Each executable embeds Linux guest assets for its guest architecture and AOT
+components compiled for its host target. A serialized Wasmtime component is not
+portable between hosts. Build the guest assets on Linux, then build the host
+executable with the matching `build/` directory:
+
+| Host target | Guest assets | Host build |
+| --- | --- | --- |
+| `aarch64-apple-darwin` | `make ARCH=aarch64 guest-assets` | `make TERRA_TARGET=aarch64-apple-darwin host-dist` |
+| `x86_64-pc-windows-msvc` | `make ARCH=x86_64 guest-assets` | `pwsh ./scripts/build-host.ps1 -Target x86_64-pc-windows-msvc` |
+| `aarch64-pc-windows-msvc` | `make ARCH=aarch64 guest-assets` | `pwsh ./scripts/build-host.ps1 -Target aarch64-pc-windows-msvc` |
+
+macOS requires Apple Silicon and macOS 15 or newer. The release executable must
+be signed with `packaging/macos.entitlements`, which grants
+`com.apple.security.hypervisor`. CI uses an ad-hoc signature to check the
+entitlement; a distributed macOS executable needs the project's release signing
+identity.
+
+Windows x64 requires Windows 10 version 1809 or newer with Windows Hypervisor
+Platform enabled. Windows ARM64 requires Windows 11 24H2 build 26100.3915 or
+newer with the same feature. Terra checks the hypervisor capability before it
+creates a partition, and checks ARM64 support on ARM hosts. The Windows CI jobs
+run shared/VMM unit tests and exercise the CLI; they do not establish VM boot
+coverage.
+
+`make dist` includes `LICENSE`, `NOTICE`, GPL-2.0, and the selected MIT license texts
+beside the executable. Windows builds select windows-sys under Apache-2.0; its
+license and Microsoft attribution are in the root `LICENSE` and `NOTICE`.

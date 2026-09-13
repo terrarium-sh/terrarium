@@ -1,0 +1,18 @@
+package terra:mmio@0.1.0;
+
+interface virtualization {
+    use machine-types.{device, architecture};
+
+    record config {
+        architecture: architecture,
+        ram-bytes: u64,
+        vcpus: u8,
+        devices: list<device>,
+    }
+    enum error { unavailable, invalid-config, bounds }
+
+    resource vm {
+        request-stop: func() -> result<_, error>;
+        wait-stopped: async func() -> result<_, error>;
+    }
+}

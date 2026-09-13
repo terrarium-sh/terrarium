@@ -1,0 +1,17 @@
+package terra:policy@0.1.0;
+
+interface decisions {
+    enum mode { unrestricted-public, allowlist }
+    record host-record { name: string, addr: string }
+    record config { mode: mode, allow: list<string>, hosts: list<host-record>, host-addresses: list<string> }
+    record grants { host-ports: list<option<u16>>, blocks-direct-dns: bool }
+    variant lookup { denied, resolve, %static(list<string>) }
+    configure: func(config: config) -> result<grants, string>;
+    allows: func(address: string, port: option<u16>) -> bool;
+    lookup-name: func(name: string) -> lookup;
+    accept-resolved: func(name: string, addresses: list<string>) -> list<string>;
+}
+
+world policy {
+    export decisions;
+}

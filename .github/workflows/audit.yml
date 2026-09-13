@@ -1,5 +1,4 @@
-# Weekly RustSec advisory audit of Cargo.lock, plus an audit on every push
-# that touches it. No submodules and no build: this reads the lockfile only.
+# Weekly RustSec advisory audit of every committed lockfile.
 name: Security audit
 
 on:
@@ -7,7 +6,7 @@ on:
     - cron: '23 4 * * 1'
   push:
     paths:
-      - 'Cargo.lock'
+      - '**/Cargo.lock'
       - '**/Cargo.toml'
 
 permissions:
@@ -18,13 +17,12 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      # A scheduled hit files an issue; every run records a check.
-      issues: write
-      checks: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - run: cargo install cargo-audit --version 0.22.0 --locked
+      - run: |
+          find . -name Cargo.lock -print0 | while IFS= read -r -d '' lockfile; do
+            cargo audit --file "$lockfile"
+          done

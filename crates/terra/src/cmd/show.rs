@@ -3,6 +3,7 @@
 use crate::policy::mount;
 use crate::{config, render, resolve};
 use anyhow::{Context, Result};
+use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -30,7 +31,9 @@ pub fn run(
     }
 
     let mut cfg = target.parse_recipe_without_env_file()?;
-    if let Err(e) = config::merge_env_file(&mut cfg) {
+    if let Err(e) =
+        config::resolve_env_file(&mut cfg).and_then(|()| config::merge_env_file(&mut cfg))
+    {
         eprintln!(
             "terra: warning: {e:#}\n\
              terra: printing the recipe without those values - a boot would refuse it"
@@ -45,7 +48,7 @@ pub fn run(
     } else {
         render::render_redacted_config_yaml(&cfg).context("serializing config")?
     };
-    print!("{yaml}");
+    render::finish_stdout_write(std::io::stdout().lock().write_all(yaml.as_bytes()))?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -140,7 +143,7 @@ mod tests {
         )
         .expect_err("a pin must still refuse a dotenv it cannot read")
         .to_string();
-        assert!(err.contains("opening env file"), "{err}");
+        assert!(err.contains("resolving env file"), "{err}");
 
         // …and the file being there is not a thing `show` needs told twice:
         // the values are merged as a boot would merge them.
@@ -152,6 +155,9 @@ mod tests {
             resolve::Existence::MayBeMissing,
         )
         .unwrap();
-        assert_eq!(target.parse_recipe().unwrap().env["API_KEY"], "sk-1");
+        let mut cfg = target.parse_recipe_without_env_file().unwrap();
+        config::resolve_env_file(&mut cfg).unwrap();
+        config::merge_env_file(&mut cfg).unwrap();
+        assert_eq!(cfg.env["API_KEY"], "sk-1");
     }
 }

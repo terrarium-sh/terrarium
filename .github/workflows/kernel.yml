@@ -1,0 +1,44 @@
+name: Kernel export
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - pins.mk
+      - Makefile
+      - kernel/**
+      - scripts/check-kernel-config.py
+      - scripts/kernel-container.sh
+      - scripts/kernel-artifact.py
+      - .github/workflows/kernel.yml
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    name: ${{ matrix.arch }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+          - arch: aarch64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build
+          key: kernel-${{ matrix.arch }}-${{ hashFiles('pins.mk', 'Makefile', 'kernel/Containerfile', 'kernel/*.config', 'kernel/patches/*.patch', 'scripts/kernel-container.sh', 'scripts/*.py') }}
+      - name: Build kernel archive
+        run: make ARCH=${{ matrix.arch }} kernel-export
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: terra-kernel-${{ matrix.arch }}
+          path: |
+            build/terra-kernel-${{ matrix.arch }}.tar.gz
+            build/terra-kernel-${{ matrix.arch }}.tar.gz.sha256
+          if-no-files-found: error

@@ -1,0 +1,37 @@
+[package]
+name = "terra-network-component"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[lints.rust]
+unsafe_code = "deny"
+warnings = "warn"
+
+[lints.rustdoc]
+broken_intra_doc_links = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = { version = "=0.61.1", features = ["async-spawn", "inter-task-wakeup"] }
+smoltcp = { version = "0.14", default-features = false, features = ["alloc", "async", "medium-ethernet", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp"] }
+futures = "0.3"
+terra-device-transport = { path = "../device-transport" }
+terra-network = { path = "../../crates/terra-network" }
+terra-limits = { path = "../../crates/terra-limits" }
+
+[profile.release]
+overflow-checks = true
+panic = "abort"

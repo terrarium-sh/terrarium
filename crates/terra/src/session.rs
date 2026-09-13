@@ -6,16 +6,18 @@ use crate::sys::POLL;
 use anyhow::{Context, Result};
 use std::io::{Read, Write};
 use std::net::Shutdown;
-use std::os::fd::{AsFd, AsRawFd};
-use std::os::unix::net::UnixStream;
+#[cfg(unix)]
+use std::os::fd::AsFd;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use terra_shared::contract::{self, AgentOutput, AgentService, ClientInput, TermSize};
+use terra_io::local::LocalStream;
+use terra_protocol::{self as protocol, AgentOutput, AgentService, ClientInput, TermSize};
 
 const AGENT_HELLO_WAIT_TIMEOUT: Duration = Duration::from_millis(500);
-const CONTROL_REPLY_TIMEOUT: Duration = Duration::from_secs(1);
+const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_SESSION_CLIENTS: usize = 1024;
+const MAX_CONTROL_REPLY_FRAME_BYTES: usize = 4096;
 const SILENT_BOOT_GRACE: Duration = Duration::from_secs(15);
 
 pub fn read_terminal_size() -> Option<TermSize> {
@@ -29,7 +31,10 @@ pub const DEFAULT_TERMINAL_SIZE: TermSize = TermSize { rows: 24, cols: 80 };
 /// NOTE: Not ESC - every arrow key sends that
 pub const DETACH_KEY: u8 = 0x1C;
 
+#[cfg(unix)]
 const SHELL_SIGPIPE_STATUS: i32 = 128 + rustix::process::Signal::PIPE.as_raw();
+#[cfg(windows)]
+const SHELL_SIGPIPE_STATUS: i32 = 1;
 
 pub const DETACH_KEY_NAME: &str = "Ctrl-\\";
 
@@ -42,16 +47,17 @@ pub enum SessionOutcome {
 
 /// Connect to the agent and select `service`, returning the stream once the
 /// agent's hello has been consumed and the service byte written. Retried until
-/// then: libkrun binds the socket before guest PID 1 runs, and a stale socket
+/// then: the VMM binds the socket before guest PID 1 runs, and a stale socket
 /// outlives the stopped VM.
 pub fn connect_to_agent(
     bx: &BoxRef,
     service: AgentService,
     what: &str,
     mut still_waiting: impl FnMut() -> Result<()>,
-) -> Result<UnixStream> {
+) -> Result<LocalStream> {
     let sock = bx.get_dir().join(crate::state::AGENT_SOCKET);
     let mut hint_at = Some(Instant::now() + SILENT_BOOT_GRACE);
+    let mut last_connect_error = None;
     loop {
         if hint_at.is_some_and(|at| Instant::now() > at) {
             hint_at = None;
@@ -60,35 +66,44 @@ pub fn connect_to_agent(
                 bx.build_logs_command()
             );
         }
-        still_waiting()?;
-        if let Ok(stream) = UnixStream::connect(&sock) {
-            if stream
-                .set_read_timeout(Some(AGENT_HELLO_WAIT_TIMEOUT))
-                .is_err()
-            {
-                continue;
+        if let Err(error) = still_waiting() {
+            if let Some(last_connect_error) = last_connect_error {
+                return Err(error)
+                    .context(format!("last connection attempt: {last_connect_error}"));
             }
-            let mut magic = [0];
-            if (&stream).read_exact(&mut magic).is_ok() {
-                anyhow::ensure!(
-                    magic[0] == contract::AGENT_HELLO[0],
-                    "the agent in {bx} does not speak this terra's protocol - \
-                     `terra stop` it and start it again on this build"
-                );
-                let mut version = [0];
-                if (&stream).read_exact(&mut version).is_err() {
+            return Err(error);
+        }
+        match LocalStream::connect(&sock) {
+            Err(error) => last_connect_error = Some(error.to_string()),
+            Ok(stream) => {
+                if stream
+                    .set_read_timeout(Some(AGENT_HELLO_WAIT_TIMEOUT))
+                    .is_err()
+                {
                     continue;
                 }
-                anyhow::ensure!(
-                    version[0] == contract::AGENT_PROTOCOL_VERSION,
-                    "the agent in {bx} does not speak this terra's protocol - \
+                let mut magic = [0];
+                if (&stream).read_exact(&mut magic).is_ok() {
+                    anyhow::ensure!(
+                        magic[0] == protocol::AGENT_HELLO[0],
+                        "the agent in {bx} does not speak this terra's protocol - \
                      `terra stop` it and start it again on this build"
-                );
-                if stream.set_read_timeout(None).is_err() {
-                    continue;
-                }
-                if (&stream).write_all(&[service.to_byte()]).is_ok() {
-                    return Ok(stream);
+                    );
+                    let mut version = [0];
+                    if (&stream).read_exact(&mut version).is_err() {
+                        continue;
+                    }
+                    anyhow::ensure!(
+                        version[0] == protocol::AGENT_PROTOCOL_VERSION,
+                        "the agent in {bx} does not speak this terra's protocol - \
+                     `terra stop` it and start it again on this build"
+                    );
+                    if stream.set_read_timeout(None).is_err() {
+                        continue;
+                    }
+                    if (&stream).write_all(&[service.to_byte()]).is_ok() {
+                        return Ok(stream);
+                    }
                 }
             }
         }
@@ -102,7 +117,7 @@ pub fn connect_to_running_agent(
     service: AgentService,
     what: &str,
     timeout: Option<u64>,
-) -> Result<UnixStream> {
+) -> Result<LocalStream> {
     ensure_running(bx, verb)?;
     connect_to_agent(bx, service, what, wait_while_running(bx, timeout))
 }
@@ -126,7 +141,7 @@ fn ensure_running(bx: &BoxRef, verb: &str) -> Result<()> {
     )
 }
 
-fn wait_while_running(bx: &BoxRef, timeout: Option<u64>) -> impl FnMut() -> Result<()> {
+pub(crate) fn wait_while_running(bx: &BoxRef, timeout: Option<u64>) -> impl FnMut() -> Result<()> {
     let deadline =
         timeout.map(|secs| (crate::sys::deadline_after(Duration::from_secs(secs)), secs));
     move || {
@@ -152,21 +167,21 @@ pub struct SessionClient {
 fn request_control(
     bx: &BoxRef,
     verb: &str,
-    req: &contract::ControlRequest,
+    req: &protocol::ControlRequest,
     agent_timeout: Option<u64>,
     ctx: &'static str,
-) -> Result<UnixStream> {
+) -> Result<LocalStream> {
     let stream = connect_to_running_agent(
         bx,
         verb,
-        contract::AgentService::SessionControl,
+        protocol::AgentService::SessionControl,
         "session control service",
         agent_timeout,
     )?;
     stream
-        .set_read_timeout(Some(CONTROL_REPLY_TIMEOUT))
+        .set_read_timeout(Some(CONTROL_READ_TIMEOUT))
         .context("setting the session control read timeout")?;
-    let bytes = contract::encode_frame(req).context(ctx)?;
+    let bytes = protocol::encode_frame(req).context(ctx)?;
     (&stream).write_all(&bytes).context(ctx)?;
     Ok(stream)
 }
@@ -175,14 +190,17 @@ pub fn list_clients(bx: &BoxRef, agent_timeout: Option<u64>) -> Result<Vec<Sessi
     let mut stream = request_control(
         bx,
         "sessions",
-        &contract::ControlRequest::List,
+        &protocol::ControlRequest::List,
         agent_timeout,
         "asking for the session's clients",
     )?;
     let mut clients = Vec::new();
     loop {
-        match contract::read_frame::<contract::ControlReply>(&mut stream) {
-            Ok(Some(contract::ControlReply::Client { id, size })) => {
+        match protocol::read_frame_with_limit::<protocol::ControlReply>(
+            &mut stream,
+            MAX_CONTROL_REPLY_FRAME_BYTES,
+        ) {
+            Ok(Some(protocol::ControlReply::Client { id, size })) => {
                 if clients.len() == MAX_SESSION_CLIENTS {
                     anyhow::bail!("the agent sent more than {MAX_SESSION_CLIENTS} session clients");
                 }
@@ -191,9 +209,9 @@ pub fn list_clients(bx: &BoxRef, agent_timeout: Option<u64>) -> Result<Vec<Sessi
                     reported_term_size: size,
                 });
             }
-            Ok(Some(contract::ControlReply::Done)) => return Ok(clients),
+            Ok(Some(protocol::ControlReply::Done)) => return Ok(clients),
             Ok(Some(
-                contract::ControlReply::Detached { .. } | contract::ControlReply::Missing { .. },
+                protocol::ControlReply::Detached { .. } | protocol::ControlReply::Missing { .. },
             )) => anyhow::bail!("the agent answered a listing with a detach reply"),
             Ok(None) => anyhow::bail!("{bx} stopped before its agent listed the session"),
             Err(e) => return Err(e).context("reading the session listing"),
@@ -205,16 +223,24 @@ pub fn detach_client(bx: &BoxRef, client_id: u64, agent_timeout: Option<u64>) ->
     let mut stream = request_control(
         bx,
         "detach",
-        &contract::ControlRequest::Detach { id: client_id },
+        &protocol::ControlRequest::Detach { id: client_id },
         agent_timeout,
         "asking to detach a client",
     )?;
-    match contract::read_frame::<contract::ControlReply>(&mut stream) {
-        Ok(Some(contract::ControlReply::Detached { .. })) => Ok(()),
-        Ok(Some(contract::ControlReply::Missing { .. })) => {
+    match protocol::read_frame_with_limit::<protocol::ControlReply>(
+        &mut stream,
+        MAX_CONTROL_REPLY_FRAME_BYTES,
+    ) {
+        Ok(Some(protocol::ControlReply::Detached { id })) if id == client_id => Ok(()),
+        Ok(Some(protocol::ControlReply::Missing { id })) if id == client_id => {
             anyhow::bail!("no client {client_id} is attached to {bx}")
         }
-        Ok(Some(contract::ControlReply::Client { .. } | contract::ControlReply::Done)) => {
+        Ok(Some(
+            protocol::ControlReply::Detached { id } | protocol::ControlReply::Missing { id },
+        )) => {
+            anyhow::bail!("the agent answered detach for client {client_id} with client {id}");
+        }
+        Ok(Some(protocol::ControlReply::Client { .. } | protocol::ControlReply::Done)) => {
             anyhow::bail!("the agent answered a detach with a listing reply")
         }
         Ok(None) => anyhow::bail!("{bx} stopped before its agent answered the detach"),
@@ -226,22 +252,25 @@ pub fn detach_all(bx: &BoxRef, agent_timeout: Option<u64>) -> Result<u64> {
     let mut stream = request_control(
         bx,
         "detach",
-        &contract::ControlRequest::DetachAll,
+        &protocol::ControlRequest::DetachAll,
         agent_timeout,
         "asking to detach every client",
     )?;
     let mut detached = 0;
     loop {
-        match contract::read_frame::<contract::ControlReply>(&mut stream) {
-            Ok(Some(contract::ControlReply::Detached { .. })) => {
+        match protocol::read_frame_with_limit::<protocol::ControlReply>(
+            &mut stream,
+            MAX_CONTROL_REPLY_FRAME_BYTES,
+        ) {
+            Ok(Some(protocol::ControlReply::Detached { .. })) => {
                 if detached == MAX_SESSION_CLIENTS as u64 {
                     anyhow::bail!("the agent sent more than {MAX_SESSION_CLIENTS} detach replies");
                 }
                 detached += 1;
             }
-            Ok(Some(contract::ControlReply::Done)) => return Ok(detached),
+            Ok(Some(protocol::ControlReply::Done)) => return Ok(detached),
             Ok(Some(
-                contract::ControlReply::Client { .. } | contract::ControlReply::Missing { .. },
+                protocol::ControlReply::Client { .. } | protocol::ControlReply::Missing { .. },
             )) => anyhow::bail!("the agent answered a detach with a listing reply"),
             Ok(None) => anyhow::bail!("{bx} stopped before its agent answered the detach"),
             Err(e) => return Err(e).context("reading the detach replies"),
@@ -249,22 +278,13 @@ pub fn detach_all(bx: &BoxRef, agent_timeout: Option<u64>) -> Result<u64> {
     }
 }
 
-#[derive(Clone, Copy)]
-enum StdinEndAction {
-    CloseSocket,
-    /// An EOF frame rather than a close: closing would take the read half,
-    /// and with it the output and exit status still to come. What EOF means
-    /// is the agent's call - it knows whether the command got a PTY.
-    SendEof,
-}
-
-fn send_frame(writer: &Mutex<UnixStream>, msg: &ClientInput) -> bool {
+fn send_frame(writer: &Mutex<LocalStream>, msg: &ClientInput) -> bool {
     // A poisoned lock means a panic mid-write, which may have left a
     // half-written frame - appending more would corrupt the stream.
     let Ok(mut w) = writer.lock() else {
         return false;
     };
-    let Ok(bytes) = contract::encode_frame(msg) else {
+    let Ok(bytes) = protocol::encode_frame(msg) else {
         return false;
     };
     w.write_all(&bytes).and_then(|()| w.flush()).is_ok()
@@ -272,7 +292,7 @@ fn send_frame(writer: &Mutex<UnixStream>, msg: &ClientInput) -> bool {
 
 /// Send the current terminal size when it differs from `last`; `false` means
 /// the writer is gone.
-fn report_size(writer: &Mutex<UnixStream>, last: &mut Option<TermSize>) -> bool {
+fn report_size(writer: &Mutex<LocalStream>, last: &mut Option<TermSize>) -> bool {
     let Some(s) = read_terminal_size() else {
         return true;
     };
@@ -287,7 +307,7 @@ fn report_size(writer: &Mutex<UnixStream>, last: &mut Option<TermSize>) -> bool 
 /// price of not owning the console input a crossterm event reader would
 /// compete with the stdin thread for.
 fn spawn_resize_reporter(
-    writer: Arc<Mutex<UnixStream>>,
+    writer: Arc<Mutex<LocalStream>>,
     completed: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
@@ -302,9 +322,8 @@ fn spawn_resize_reporter(
 }
 
 fn spawn_stdin_reader(
-    writer: Arc<Mutex<UnixStream>>,
+    writer: Arc<Mutex<LocalStream>>,
     escape: Option<u8>,
-    action: StdinEndAction,
     completed: Arc<AtomicBool>,
 ) -> (Arc<AtomicBool>, std::thread::JoinHandle<()>) {
     let detached = Arc::new(AtomicBool::new(false));
@@ -314,10 +333,15 @@ fn spawn_stdin_reader(
         let mut buf = [0u8; 4096];
         while !completed.load(Ordering::SeqCst) {
             if !input_is_ready(&stdin) {
+                #[cfg(windows)]
+                std::thread::sleep(POLL);
                 continue;
             }
-            let Ok(n @ 1..) = stdin.read(&mut buf) else {
-                break;
+            let n = match stdin.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
             };
             let escape_at = escape.and_then(|e| buf[..n].iter().position(|b| *b == e));
             let keys = &buf[..escape_at.unwrap_or(n)];
@@ -325,66 +349,75 @@ fn spawn_stdin_reader(
                 break;
             }
             if escape_at.is_some() {
-                detached_flag.store(true, Ordering::SeqCst);
+                detach(&writer, &detached_flag);
                 break;
             }
         }
-        match action {
-            StdinEndAction::CloseSocket => {
-                // Shut down even on a poisoned lock: closing is the safe
-                // direction, and skipping it would block the session's reader
-                // forever.
-                let _ = writer
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .shutdown(Shutdown::Both);
-            }
-            StdinEndAction::SendEof => {
-                send_frame(&writer, &ClientInput::Eof);
-            }
-        }
+        send_frame(&writer, &ClientInput::Eof);
     });
     (detached, thread)
 }
 
-#[allow(unsafe_code)]
-fn input_is_ready(fd: impl AsFd) -> bool {
-    use rustix::event::{FdSetElement, Timespec, fd_set_bound, fd_set_insert, fd_set_num_elements};
+fn detach(writer: &Mutex<LocalStream>, detached: &AtomicBool) {
+    detached.store(true, Ordering::SeqCst);
+    if let Ok(stream) = writer.lock() {
+        let _ = stream.shutdown(Shutdown::Both);
+    }
+}
 
-    let fd = fd.as_fd().as_raw_fd();
-    let mut read_fds = vec![FdSetElement::default(); fd_set_num_elements(1, fd + 1)];
-    fd_set_insert(&mut read_fds, fd);
+#[cfg(unix)]
+fn input_is_ready(fd: impl AsFd) -> bool {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+
+    let mut read_fds = [PollFd::new(&fd, PollFlags::IN)];
     let timeout = Timespec {
         tv_sec: 0,
         tv_nsec: POLL.subsec_nanos().into(),
     };
-    // SAFETY: stdin remains open while `select` waits on its descriptor.
+    poll(&mut read_fds, Some(&timeout)).is_ok_and(|ready| ready > 0)
+}
+
+#[allow(unsafe_code)]
+#[cfg(windows)]
+fn input_is_ready(_stdin: &std::io::Stdin) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_PIPE, GetFileType};
+    use windows_sys::Win32::System::Console::GetNumberOfConsoleInputEvents;
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+
+    let handle = std::io::stdin().as_raw_handle();
+    // SAFETY: stdin owns this handle for the duration of the probe and all output pointers are
+    // writable locals.
     unsafe {
-        rustix::event::select(
-            fd_set_bound(&read_fds),
-            Some(&mut read_fds),
-            None,
-            None,
-            Some(&timeout),
-        )
+        if GetFileType(handle) == FILE_TYPE_PIPE {
+            let mut available = 0;
+            return PeekNamedPipe(
+                handle,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &raw mut available,
+                std::ptr::null_mut(),
+            ) != 0
+                && available > 0;
+        }
+        let mut events = 0;
+        GetNumberOfConsoleInputEvents(handle, &raw mut events) != 0 && events > 0
     }
-    .is_ok_and(|ready| ready > 0)
 }
 
 struct InputThreads {
     detached: Arc<AtomicBool>,
     completed: Arc<AtomicBool>,
-    stdin: Option<std::thread::JoinHandle<()>>,
+    stdin: std::thread::JoinHandle<()>,
     resize: Option<std::thread::JoinHandle<()>>,
 }
 
 impl InputThreads {
-    fn stop(self, stream: &UnixStream) {
+    fn stop(self, stream: &LocalStream) {
         self.completed.store(true, Ordering::SeqCst);
         let _ = stream.shutdown(Shutdown::Both);
-        if let Some(stdin) = self.stdin {
-            let _ = stdin.join();
-        }
+        let _ = self.stdin.join();
         if let Some(resize) = self.resize {
             let _ = resize.join();
         }
@@ -395,9 +428,8 @@ impl InputThreads {
 /// a mutex so their frames cannot interleave. The returned flag is set when
 /// the detach byte ended input.
 fn spawn_input_threads(
-    stream: &UnixStream,
+    stream: &LocalStream,
     escape: Option<u8>,
-    action: StdinEndAction,
     report_resizes: bool,
 ) -> Result<InputThreads> {
     let writer = Arc::new(Mutex::new(
@@ -406,11 +438,11 @@ fn spawn_input_threads(
     let completed = Arc::new(AtomicBool::new(false));
     // A piped exec has no terminal whose size could change.
     let resize = report_resizes.then(|| spawn_resize_reporter(writer.clone(), completed.clone()));
-    let (detached, stdin) = spawn_stdin_reader(writer, escape, action, completed.clone());
+    let (detached, stdin) = spawn_stdin_reader(writer, escape, completed.clone());
     Ok(InputThreads {
         detached,
         completed,
-        stdin: Some(stdin),
+        stdin,
         resize,
     })
 }
@@ -429,7 +461,7 @@ fn pump_output(
     ctx: &'static str,
 ) -> Result<PumpResult> {
     loop {
-        match contract::read_frame::<AgentOutput>(&mut reader) {
+        match protocol::read_frame::<AgentOutput>(&mut reader) {
             Ok(Some(AgentOutput::Out(b))) => {
                 if out.write_all(&b).and_then(|()| out.flush()).is_err() {
                     return Ok(PumpResult::Sigpipe);
@@ -458,9 +490,9 @@ fn pump_output(
 /// too: without it the local terminal would hold keystrokes until a newline
 /// and turn Ctrl-C into a signal for terra itself. A piped exec keeps stderr
 /// in its own frame, so redirecting it away still works.
-pub fn pump_exec(stream: &UnixStream, tty: bool) -> Result<i32> {
+pub fn pump_exec(stream: &LocalStream, tty: bool) -> Result<i32> {
     let _raw = tty.then(RawTerminal::enable);
-    let threads = spawn_input_threads(stream, None, StdinEndAction::SendEof, tty)?;
+    let threads = spawn_input_threads(stream, None, tty)?;
     let result = pump_exec_output(stream, &mut std::io::stdout(), &mut std::io::stderr());
     threads.stop(stream);
     result
@@ -480,9 +512,9 @@ fn pump_exec_output(reader: impl Read, out: &mut impl Write, err: &mut impl Writ
     }
 }
 
-pub fn pump_session(stream: &UnixStream) -> Result<SessionOutcome> {
+pub fn pump_session(stream: &LocalStream) -> Result<SessionOutcome> {
     let _raw = RawTerminal::enable();
-    let threads = spawn_input_threads(stream, Some(DETACH_KEY), StdinEndAction::CloseSocket, true)?;
+    let threads = spawn_input_threads(stream, Some(DETACH_KEY), true)?;
     let ended = pump_session_output(stream, &mut std::io::stdout());
     let detached = threads.detached.load(Ordering::SeqCst);
     threads.stop(stream);
@@ -527,14 +559,24 @@ impl Drop for RawTerminal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::net::UnixListener;
+    use terra_io::local::LocalListener;
 
+    #[cfg(unix)]
     #[test]
     fn input_readiness_waits_for_a_byte() {
-        let (mut writer, reader) = UnixStream::pair().unwrap();
+        let (mut writer, reader) = LocalStream::pair().unwrap();
         assert!(!input_is_ready(&reader));
         writer.write_all(b"x").unwrap();
         assert!(input_is_ready(&reader));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn input_readiness_reports_eof() {
+        let (writer, mut reader) = LocalStream::pair().unwrap();
+        drop(writer);
+        assert!(input_is_ready(&reader));
+        assert_eq!(reader.read(&mut [0]).unwrap(), 0);
     }
 
     /// A box on disk, held as a running one, with a fake agent bound to its
@@ -544,8 +586,8 @@ mod tests {
     /// check, and the frame parsing all run for real.
     fn spawn_fake_agent(
         project_dir: &std::path::Path,
-        expected: contract::ControlRequest,
-        replies: Vec<contract::ControlReply>,
+        expected: protocol::ControlRequest,
+        replies: Vec<protocol::ControlReply>,
     ) -> (
         BoxRef,
         std::fs::File,
@@ -556,24 +598,24 @@ mod tests {
         let bx = BoxRef::resolve(project_dir, "dev").unwrap();
         std::fs::create_dir_all(bx.get_dir()).unwrap();
         let lock = bx.lock_run().unwrap();
-        let listener = UnixListener::bind(bx.get_dir().join(crate::state::AGENT_SOCKET)).unwrap();
+        let listener = LocalListener::bind(bx.get_dir().join(crate::state::AGENT_SOCKET)).unwrap();
         let agent = std::thread::spawn(move || {
             let (mut conn, _) = listener.accept().unwrap();
-            conn.write_all(&contract::AGENT_HELLO).unwrap();
+            conn.write_all(&protocol::AGENT_HELLO).unwrap();
             let mut service = [0u8; 1];
             conn.read_exact(&mut service).unwrap();
             assert_eq!(
                 service[0],
-                contract::AgentService::SessionControl.to_byte(),
+                protocol::AgentService::SessionControl.to_byte(),
                 "the host dialed a different service"
             );
             assert_eq!(
-                contract::read_frame::<contract::ControlRequest>(&mut conn).unwrap(),
+                protocol::read_frame::<protocol::ControlRequest>(&mut conn).unwrap(),
                 Some(expected),
                 "the host sent a different request"
             );
             for rep in replies {
-                conn.write_all(&contract::encode_frame(&rep).unwrap())
+                conn.write_all(&protocol::encode_frame(&rep).unwrap())
                     .unwrap();
             }
             conn.flush().unwrap();
@@ -587,17 +629,17 @@ mod tests {
         let bx = BoxRef::resolve(home.get_path(), "dev").unwrap();
         std::fs::create_dir_all(bx.get_dir()).unwrap();
         let _lock = bx.lock_run().unwrap();
-        let listener = UnixListener::bind(bx.get_dir().join(crate::state::AGENT_SOCKET)).unwrap();
+        let listener = LocalListener::bind(bx.get_dir().join(crate::state::AGENT_SOCKET)).unwrap();
         let agent = std::thread::spawn(move || {
             let (mut conn, _) = listener.accept().unwrap();
             conn.write_all(&[
-                contract::AGENT_HELLO[0],
-                contract::AGENT_PROTOCOL_VERSION.wrapping_add(1),
+                protocol::AGENT_HELLO[0],
+                protocol::AGENT_PROTOCOL_VERSION.wrapping_add(1),
             ])
             .unwrap();
         });
 
-        let error = connect_to_agent(&bx, contract::AgentService::Session, "session", || Ok(()))
+        let error = connect_to_agent(&bx, protocol::AgentService::Session, "session", || Ok(()))
             .unwrap_err();
         assert!(
             error
@@ -615,17 +657,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (bx, _lock, _home, agent) = spawn_fake_agent(
             dir.path(),
-            contract::ControlRequest::List,
+            protocol::ControlRequest::List,
             vec![
-                contract::ControlReply::Client {
+                protocol::ControlReply::Client {
                     id: 0,
                     size: Some(TermSize {
                         rows: 30,
                         cols: 100,
                     }),
                 },
-                contract::ControlReply::Client { id: 1, size: None },
-                contract::ControlReply::Done,
+                protocol::ControlReply::Client { id: 1, size: None },
+                protocol::ControlReply::Done,
             ],
         );
         assert_eq!(
@@ -647,6 +689,24 @@ mod tests {
         agent.join().unwrap();
     }
 
+    #[test]
+    fn detach_replies_must_name_the_requested_client() {
+        for reply in [
+            protocol::ControlReply::Detached { id: 8 },
+            protocol::ControlReply::Missing { id: 8 },
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (bx, _lock, _home, agent) = spawn_fake_agent(
+                dir.path(),
+                protocol::ControlRequest::Detach { id: 9 },
+                vec![reply],
+            );
+            let error = detach_client(&bx, 9, None).unwrap_err().to_string();
+            assert!(error.contains("client 9 with client 8"), "{error}");
+            agent.join().unwrap();
+        }
+    }
+
     /// The guest answers a detach of a client that was never there with
     /// `Missing`, and the host says so rather than pretending the cleanup
     /// happened.
@@ -655,8 +715,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (bx, _lock, _home, agent) = spawn_fake_agent(
             dir.path(),
-            contract::ControlRequest::Detach { id: 9 },
-            vec![contract::ControlReply::Missing { id: 9 }],
+            protocol::ControlRequest::Detach { id: 9 },
+            vec![protocol::ControlReply::Missing { id: 9 }],
         );
         let err = detach_client(&bx, 9, None).unwrap_err().to_string();
         assert!(err.contains("no client 9"), "{err}");
@@ -671,11 +731,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (bx, _lock, _home, agent) = spawn_fake_agent(
             dir.path(),
-            contract::ControlRequest::DetachAll,
+            protocol::ControlRequest::DetachAll,
             vec![
-                contract::ControlReply::Detached { id: 0 },
-                contract::ControlReply::Detached { id: 1 },
-                contract::ControlReply::Done,
+                protocol::ControlReply::Detached { id: 0 },
+                protocol::ControlReply::Detached { id: 1 },
+                protocol::ControlReply::Done,
             ],
         );
         assert_eq!(detach_all(&bx, None).unwrap(), 2);
@@ -689,8 +749,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (bx, _lock, _home, agent) = spawn_fake_agent(
             dir.path(),
-            contract::ControlRequest::DetachAll,
-            vec![contract::ControlReply::Done],
+            protocol::ControlRequest::DetachAll,
+            vec![protocol::ControlReply::Done],
         );
         assert_eq!(detach_all(&bx, None).unwrap(), 0);
         agent.join().unwrap();
@@ -743,7 +803,7 @@ mod tests {
         let lock = bx.lock_run().unwrap();
 
         let baking = bx.mark_baking(&lock);
-        for verb in ["exec", "cp"] {
+        for verb in ["exec", "put", "get"] {
             let err = ensure_running(&bx, verb).unwrap_err().to_string();
             assert_eq!(err, bx.setup_holds_it().to_string(), "{verb}");
         }
@@ -786,7 +846,7 @@ mod tests {
         // noticing the closed sink can end this.
         let flood = |make_output: fn(Vec<u8>) -> AgentOutput| -> Vec<u8> {
             std::iter::repeat_with(|| {
-                contract::encode_frame(&make_output(b"tick\n".to_vec())).unwrap()
+                protocol::encode_frame(&make_output(b"tick\n".to_vec())).unwrap()
             })
             .take(64)
             .flatten()
@@ -819,7 +879,7 @@ mod tests {
             AgentOutput::Exit { code: 3 },
         ]
         .iter()
-        .flat_map(|f| contract::encode_frame(f).unwrap())
+        .flat_map(|f| protocol::encode_frame(f).unwrap())
         .collect();
         let status = pump_exec_output(std::io::Cursor::new(wire), &mut out, &mut err).unwrap();
         assert_eq!(
@@ -837,13 +897,23 @@ mod tests {
     fn a_session_whose_reader_left_detaches_rather_than_pumping_forever() {
         // No exit frame within it: only noticing the closed sink can end this.
         let flood: Vec<u8> = std::iter::repeat_with(|| {
-            contract::encode_frame(&AgentOutput::Out(b"tick\n".to_vec())).unwrap()
+            protocol::encode_frame(&AgentOutput::Out(b"tick\n".to_vec())).unwrap()
         })
         .take(64)
         .flatten()
         .collect();
         let outcome = pump_session_output(std::io::Cursor::new(flood), &mut ClosedPipe).unwrap();
         assert_eq!(outcome, SessionOutcome::Detached);
+    }
+
+    #[test]
+    fn detach_wakes_a_quiet_session_pump() {
+        let (writer, reader) = LocalStream::pair().unwrap();
+        let detached = AtomicBool::new(false);
+        let pump = std::thread::spawn(move || pump_session_output(reader, &mut Vec::new()));
+        detach(&Mutex::new(writer), &detached);
+        assert!(detached.load(Ordering::SeqCst));
+        assert_eq!(pump.join().unwrap().unwrap(), SessionOutcome::Closed);
     }
 
     #[test]
@@ -861,7 +931,7 @@ mod tests {
         let session = |frames: &[AgentOutput]| {
             let wire: Vec<u8> = frames
                 .iter()
-                .flat_map(|f| contract::encode_frame(f).unwrap())
+                .flat_map(|f| protocol::encode_frame(f).unwrap())
                 .collect();
             let mut shown = Vec::new();
             let outcome = pump_session_output(std::io::Cursor::new(wire), &mut shown).unwrap();
@@ -887,7 +957,7 @@ mod tests {
         );
 
         let mut truncated =
-            contract::encode_frame(&AgentOutput::Out(b"0123456789".to_vec())).unwrap();
+            protocol::encode_frame(&AgentOutput::Out(b"0123456789".to_vec())).unwrap();
         truncated.truncate(7);
         assert!(
             pump_session_output(std::io::Cursor::new(truncated), &mut Vec::new()).is_err(),
@@ -905,7 +975,7 @@ mod tests {
     fn a_detach_frame_ends_the_session_as_a_detach() {
         let wire: Vec<u8> = [AgentOutput::Out(b"bye\n".to_vec()), AgentOutput::Detached]
             .iter()
-            .flat_map(|f| contract::encode_frame(f).unwrap())
+            .flat_map(|f| protocol::encode_frame(f).unwrap())
             .collect();
         let mut shown = Vec::new();
         let outcome = pump_session_output(std::io::Cursor::new(wire), &mut shown).unwrap();
@@ -916,7 +986,7 @@ mod tests {
         );
 
         let err = pump_exec_output(
-            std::io::Cursor::new(contract::encode_frame(&AgentOutput::Detached).unwrap()),
+            std::io::Cursor::new(protocol::encode_frame(&AgentOutput::Detached).unwrap()),
             &mut Vec::new(),
             &mut Vec::new(),
         )

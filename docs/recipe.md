@@ -1,113 +1,128 @@
 # Recipe reference
 
 A recipe is the YAML policy for one box: its resources, host access, network,
-and workload. `terra setup` pins a copy into the box; every later boot uses that
-copy. Edit the recipe, then run `terra setup` again to apply a change. A
-project's `terra.yaml` names boxes and points to their recipes; see
-[manifest.md](manifest.md). For the CLI and box lifecycle, see
-[usage.md](usage.md).
+and workload. `terra setup` pins a copy in the box. Edit the source recipe and
+run setup again to apply a change. A project's `terra.yaml` maps box names to
+recipes; see [the manifest reference](manifest.md).
 
-Every key is optional. An empty recipe gives a box 2 vCPUs, 1 GiB RAM, a 512 MiB
-writable root filesystem, an interactive shell, no host files, and no network.
+An empty recipe creates a box with 2 vCPUs, 1024 MiB RAM, a 512 MiB writable
+root filesystem, an interactive shell, no host mounts, and no network.
 
 ```yaml
-# Guest resources. Defaults: 2 vCPUs, 1024 MiB RAM, 512 MiB rootfs.
 hw:
-  cpus: 2                 # virtual CPUs
-  mem_mib: 1024           # guest RAM
-  rootfs_mib: 4096        # bounded, private writable root filesystem; can grow, not shrink
-
-# Host directories visible inside the guest. Omit for no host filesystem access.
-# libkrun does not confine a mount to this directory; see security.md.
+  cpus: 2
+  mem_mib: 1024
+  rootfs_mib: 4096
+components:
+  memory_mib: 16
+  total_memory_mib: 128
 mounts:
-  - host: .               # relative paths resolve from the project directory
-    guest: /work          # absolute path in the guest
-    readonly: false       # true prevents guest writes
-
-# Private, persistent guest disks. They survive restart and are removed by `terra rm`.
+  - host: .
+    guest: /work
+    readonly: false
 volumes:
-  - name: data            # stable disk identity; changing it leaves this disk and creates a new empty one
-    guest: /data          # absolute guest mount point
-    size_mib: 1024        # hard size cap; further writes fail with ENOSPC
-
-# Variables supplied to hooks and the workload.
+  - name: data
+    guest: /data
+    size_mib: 1024
 env:
-  MODEL: gpt-6
-env_file: .env            # project-relative dotenv file merged over env; values are literal
-
-# Egress, local DNS records, and host-loopback port publishing.
+  MODEL: example
+env_file: .env  # create this file, or omit env_file
 network:
-  mode: unrestricted-public  # public egress; allowlist is the no-network default
-  allow:                    # hostname, IP, or CIDR, optionally with :PORT
-    - db.local:5432         # opens this locally defined service
+  mode: allowlist
+  allow: [dl-cdn.alpinelinux.org:443, db.local:5432]
   hosts:
-    - name: db.local
-      addr: HOST_LOOPBACK    # the machine running terra; a record alone is not a grant
-  ports:
-    - "3000:80"             # host 127.0.0.1:3000 -> guest :80
-
-# Commands run as guest root.
+    - { name: db.local, addr: HOST_LOOPBACK }
+  ports: ["3000:80"]
 hooks:
-  on_create:                # once during setup, baked into the rootfs with no host mounts
-    - apk add --no-cache git
-  on_start:                 # before every workload start
-    - echo ready
-  pre_stop:                 # on orderly shutdown
-    - echo cleaning up
-
-# Background shell commands beside the workload; non-zero exits restart after one second.
-daemons:
-  - ascend --serve
-
-# Commands the workload user may run as guest root, with any arguments.
-sudo:
-  - apk
-
-# The program to run as terri (UID 1000) unless terra is invoked with --root.
+  on_create: [apk add --no-cache git]
+  on_start: [echo ready]
+  pre_stop: [echo stopping]
+daemons: []
+sudo: [apk]
 workload:
-  entrypoint: /bin/sh      # defaults to an interactive shell
-  args: []                 # literal argv after entrypoint
-  workdir: /work           # absolute guest directory; created if needed
+  entrypoint: /bin/sh
+  args: []
+  workdir: /work
 ```
+
+## Resources and storage
+
+`hw.cpus`, `hw.mem_mib`, and `hw.rootfs_mib` set virtual CPUs, guest RAM, and
+the private writable root filesystem capacity. The root filesystem is sparse,
+but it cannot exceed `rootfs_mib`. `components.memory_mib` limits each Wasm
+component's linear memory and `components.total_memory_mib` limits their total.
+Both must be positive, and the total must be at least the per-component value.
+The defaults are 16 MiB per component and 128 MiB in total. These limits are
+separate from guest RAM and do not bound all native host-process memory.
+
+Increasing a root filesystem or volume limit takes effect on the next boot;
+existing images do not shrink. Renaming a volume leaves its prior image behind
+and creates an empty one under the new name. `terra <box> setup --rebuild`
+removes images for volumes no longer named by the recipe; `storage prune` removes
+those orphaned volume images without rebuilding the root filesystem. A box has
+at most 32 combined host-directory mounts and volumes on x86_64, or 11 on AArch64.
+
+`volumes` are persistent private guest disks. Each needs a unique plain `name`,
+an absolute `guest` path, and a positive `size_mib`; writes past the size fail.
+They survive restarts and are removed by `terra rm`.
+
+## Mounts and environment
+
+Each `mounts` item has a host path, an absolute guest path, and optional
+`readonly: true`. Host and `env_file` paths resolve relative to the project
+directory; `~` expands only for the current user's home. Mount hosts must exist
+when the box starts. A mount grants the guest access to that host directory.
+
+Mounts use a scoped WASI directory capability. Guest path traversal and
+symlinks cannot open a host path outside that grant. Read-only mounts reject
+writes and metadata changes. They support ordinary file I/O, relative symlinks,
+and guest execution/mmap. Names must be UTF-8; guest modes and ownership are
+synthetic, not host POSIX metadata. Terra has no host-to-guest
+file-notification bridge: applications must rescan or poll for host and
+other-box edits. Guest-originated inotify remains available. Host edits do not
+automatically invalidate guest mapped pages. Use private volumes when an application needs full Linux
+filesystem behavior; host chmod/chown, xattrs, and cross-box locks are not
+available through a mount.
+
+`env` supplies literal variables to hooks and guest processes. `env_file` is a
+dotenv file whose `KEY=VALUE` entries override `env`; blank lines and `#`
+comments are allowed. `terra <box> show` redacts environment values unless
+`--with-env-values` is specified.
 
 ## Network
 
-`mode: allowlist` is the default: the box cannot make an external connection
-until an `allow` rule permits it. It can still ask Terra's built-in DNS server;
-that server answers `hosts` records and forwards only names named by `allow`.
-Every other name returns `NXDOMAIN`. `mode: unrestricted-public` permits the
-public internet, while the host, LAN, and private ranges remain blocked unless
-an `allow` rule grants them.
+The default `mode: allowlist` permits no egress until an `allow` entry grants a
+hostname, IP address, or CIDR, optionally limited with `:PORT`. A hostname rule
+is exact; `*.example.com` matches subdomains, not `example.com` itself.
 
-A hostname rule is exact; `*.example.com` grants subdomains but not
-`example.com`. `hosts` supplies a DNS record; add a matching `allow` rule to
-reach it. `HOST_LOOPBACK` names the machine running terra. `ports` publishes
-guest listeners on host loopback only: `"8080"` maps 8080 to 8080, and
-`"3000:80"` maps host 3000 to guest 80.
+`mode: unrestricted-public` permits public destinations. The host, LAN,
+private ranges, link-local addresses, and cloud-metadata addresses still need
+an explicit rule. `HOST_LOOPBACK` names the host running Terra. A `hosts`
+record only provides local DNS; add a matching `allow` rule before connecting.
+`ports` publishes a guest listener on host loopback: `"8080"` maps the same
+port and `"3000:80"` maps host 3000 to guest 80.
 
-The network policy is the box's egress filtering. Read the
-[security model](security.md) for DNS, CIDR, and isolation limits.
+External ICMP echo forwarding is unavailable, so TCP or UDP rules do not enable
+external `ping`. DNS returns A and AAAA records only. Terra uses a 60-second DNS
+cache hint: an address learned from a lookup permits new connections for 60
+seconds unless another lookup renews it; an existing connection is unaffected.
 
-## What runs when
+## Processes
 
-`on_create` runs once, as guest root, while `terra setup` builds the box. Its
-changes stay in the box's filesystem, and it runs before any host folders are
-shared. Put slower package installation here.
+`hooks.on_create` runs once as guest root during setup, before host mounts are
+available. `hooks.on_start` runs as guest root before every workload start, and
+`pre_stop` runs during an orderly stop. `daemons` are background shell commands:
+a nonzero exit restarts after one second; exit zero ends that daemon.
 
-`on_start` runs as guest root before every start. `pre_stop` runs during an
-orderly stop, after the workload is signalled and before the VM exits. Hooks are
-shell commands.
+The workload and daemons run as `terri` (UID 1000) by default. `workload.entrypoint`
+defaults to `/bin/sh`; `args` are passed literally. `workdir`, when given, must
+be absolute. `sudo` grants the workload user named commands as guest root with
+any arguments. `terra <box> --root` runs that boot's workload and daemons as
+guest root; `terra <box> exec --root -- CMD` affects only that command.
 
-The workload and daemons run as `terri` (UID 1000) by default. `sudo`
-allows specific commands as guest root; `terra --root` runs the main workload
-as root. These rules protect the box's own files. The VM is what protects the
-host.
+## Applying changes
 
-## Changing or removing a box
-
-`terra setup` is the explicit way to pin a recipe. An interactive
-`terra <box>` can offer the same setup; accepting it pins the recipe too.
-Re-run `terra setup` after a recipe change; growing a root filesystem or volume
-takes effect on the next boot. Use `terra setup --rebuild` to discard old box
-storage while rebuilding, or `terra rm` to remove the box. See
-[usage.md](usage.md) for command details and storage cleanup.
+Run `terra <box> setup` after editing a recipe. `--dry-run` validates setup
+without changing state. `--rebuild` discards the guest root filesystem, reruns
+`on_create`, and removes volume images no longer named by the recipe. Read
+[usage](usage.md) and [security](security.md) before granting host access.

@@ -1,11 +1,11 @@
-/target
+**/target
 /dist
-# Staging for the folded static archives (libkrun.a, libkrunfw.a, kernel.o).
+# Downloaded inputs and generated guest payloads.
 /build
 **/*.rs.bk
 
 # Man pages and shell completions rendered from the clap CLI by
-# crates/terra/tests/docs.rs.
+# crates/terra/examples/gen-docs.rs.
 /packaging/man/
 /packaging/completions/
 
@@ -13,3 +13,6 @@
 
 # Scratch: notes, branding art, anything not shipped.
 /.local-notes/
+# Preserved performance baselines survive make clean.
+/performance-baselines/
+__pycache__/

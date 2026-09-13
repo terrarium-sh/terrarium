@@ -1,13 +1,78 @@
-//! The Unix hosts. Variance *within* the family - `openat2` on Linux,
-//! `sun_path`'s length on Darwin - is settled here, so a host joins this file
-//! rather than starting another one.
+//! Unix process, file and control-channel operations.
 use super::VmSignal;
 use std::fs::File;
 use std::io::Result;
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use terra_shared::contract::ShareOwner;
+
+pub fn try_lock_run(path: &Path) -> std::result::Result<File, std::fs::TryLockError> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .map_err(std::fs::TryLockError::Error)?;
+    file.try_lock()?;
+    Ok(file)
+}
+
+pub fn holds_run_lock(path: &Path) -> bool {
+    let Ok(file) = std::fs::OpenOptions::new().read(true).open(path) else {
+        return false;
+    };
+    match file.try_lock_shared() {
+        Ok(()) => {
+            let _ = file.unlock();
+            false
+        }
+        Err(std::fs::TryLockError::WouldBlock) => true,
+        Err(std::fs::TryLockError::Error(_)) => false,
+    }
+}
+
+#[allow(unsafe_code)]
+pub fn host_addresses() -> Result<Vec<std::net::IpAddr>> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    let mut first = std::ptr::null_mut();
+    // SAFETY: `first` is writable and `freeifaddrs` releases exactly the list returned on success.
+    if unsafe { libc::getifaddrs(&raw mut first) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut addresses = Vec::new();
+    let mut current = first;
+    while !current.is_null() {
+        // SAFETY: every node up to the null terminator belongs to the list returned above.
+        let entry = unsafe { &*current };
+        if !entry.ifa_addr.is_null() {
+            // SAFETY: `ifa_addr` has the family selected by `sa_family`.
+            let address = unsafe {
+                match i32::from((*entry.ifa_addr).sa_family) {
+                    libc::AF_INET => {
+                        let socket = &*entry.ifa_addr.cast::<libc::sockaddr_in>();
+                        Some(IpAddr::V4(Ipv4Addr::from(u32::from_be(
+                            socket.sin_addr.s_addr,
+                        ))))
+                    }
+                    libc::AF_INET6 => {
+                        let socket = &*entry.ifa_addr.cast::<libc::sockaddr_in6>();
+                        Some(IpAddr::V6(Ipv6Addr::from(socket.sin6_addr.s6_addr)))
+                    }
+                    _ => None,
+                }
+            };
+            if let Some(address) = address {
+                addresses.push(address.to_canonical());
+            }
+        }
+        current = entry.ifa_next;
+    }
+    // SAFETY: `first` is the allocation returned by `getifaddrs`.
+    unsafe { libc::freeifaddrs(first) };
+    addresses.sort_unstable();
+    addresses.dedup();
+    Ok(addresses)
+}
 
 /// Max usable `AF_UNIX` socket path length: `sun_path` minus its NUL - 103 on
 /// Darwin/BSD, 107 elsewhere.
@@ -18,51 +83,6 @@ pub const MAX_SOCK_PATH: usize = 107;
 
 pub fn restrict_new_files() {
     rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o077));
-}
-
-pub fn open_null() -> Result<File> {
-    std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/null")
-}
-
-/// Open for reading, refusing a symlink at **any** component.
-pub fn open_no_symlinks(path: &Path) -> Result<File> {
-    terra_shared::no_symlinks::open_no_symlinks(path, terra_shared::no_symlinks::OpenMode::Read)
-        .map_err(|error| explain(error, path))
-}
-
-pub fn create_no_symlinks(path: &Path) -> Result<File> {
-    terra_shared::no_symlinks::open_no_symlinks(
-        path,
-        terra_shared::no_symlinks::OpenMode::CreateTruncate,
-    )
-    .map_err(|error| explain(error, path))
-}
-
-/// The two errnos this open reports read as nonsense as written ("Too many
-/// levels of symbolic links" for one symlink; "Function not implemented" for an
-/// open).
-fn explain(err: std::io::Error, path: &Path) -> std::io::Error {
-    #[cfg(target_os = "linux")]
-    {
-        match err.raw_os_error() {
-            Some(e) if e == rustix::io::Errno::LOOP.raw_os_error() => {
-                terra_shared::no_symlinks::make_symlink_error(path)
-            }
-            Some(e) if e == rustix::io::Errno::NOSYS.raw_os_error() => std::io::Error::other(
-                "this kernel has no openat2 (Linux 5.6+), which is how terra keeps a symlink \
-                 planted in a share from redirecting a copy",
-            ),
-            None | Some(_) => err,
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = path;
-        err
-    }
 }
 
 /// Through the handle rather than the path: the path may have become a symlink
@@ -94,10 +114,11 @@ const LOCK_FD: std::os::fd::RawFd = 3;
 /// Hand `lock` to the spawned child as [`LOCK_FD`]. A duplicate descriptor
 /// holds the same `flock`, released only when every one of them closes.
 #[allow(unsafe_code)]
-pub fn pass_lock(cmd: &mut Command, lock: &File) {
+pub fn pass_lock(cmd: &mut Command, lock: &File) -> Result<File> {
     use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
-    let fd = lock.as_raw_fd();
+    let inherited = lock.try_clone()?;
+    let fd = inherited.as_raw_fd();
     // SAFETY: the closure runs between fork and exec, where only
     // async-signal-safe calls are allowed - `dup2` and `fcntl` are both.
     unsafe {
@@ -119,6 +140,7 @@ pub fn pass_lock(cmd: &mut Command, lock: &File) {
             Ok(())
         });
     }
+    Ok(inherited)
 }
 
 /// The run lock a boot passed down, or `None` when [`LOCK_FD`] is not the file
@@ -132,8 +154,12 @@ pub fn claim_inherited_lock(expected: &Path) -> Option<File> {
     same.then(|| {
         // SAFETY: fd 3 is ours (dup'd in by `pass_lock` before exec) and the
         // check above already proved it is the box's lock.
-        unsafe { File::from_raw_fd(LOCK_FD) }
+        let file = unsafe { File::from_raw_fd(LOCK_FD) };
+        rustix::io::fcntl_setfd(&file, rustix::io::FdFlags::CLOEXEC).ok()?;
+        file.try_lock().ok()?;
+        Some(file)
     })
+    .flatten()
 }
 
 /// Whether the descriptor `fd` opens the file `path` names, compared through
@@ -141,13 +167,19 @@ pub fn claim_inherited_lock(expected: &Path) -> Option<File> {
 #[allow(unsafe_code)]
 fn fd_opens_file(fd: i32, path: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
-    // SAFETY: `fd` is a live descriptor for the duration of the call.
-    let fd = unsafe { rustix::fd::BorrowedFd::borrow_raw(fd) };
-    let Ok(opened) = rustix::fs::fstat(fd) else {
+    let mut opened = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: fstat accepts invalid descriptor numbers and initializes the writable output only on success.
+    if unsafe { libc::fstat(fd, opened.as_mut_ptr()) } != 0 {
         return false;
-    };
+    }
+    // SAFETY: fstat succeeded and initialized the stat value.
+    let opened = unsafe { opened.assume_init() };
     let want = std::fs::metadata(path).ok();
-    #[allow(clippy::unnecessary_cast)]
+    #[allow(
+        clippy::unnecessary_cast,
+        clippy::cast_sign_loss,
+        reason = "matches std MetadataExt device ID conversion on Unix hosts"
+    )]
     want.is_some_and(|want| want.dev() == opened.st_dev as u64 && want.ino() == opened.st_ino)
 }
 
@@ -172,6 +204,7 @@ pub fn pid_exists(pid: u32) -> bool {
 
 /// Process start identity: Linux clock ticks since boot, or Darwin wall-clock
 /// microseconds. Two processes can wear one pid in sequence, never one starttime.
+#[cfg_attr(target_os = "macos", allow(unsafe_code))]
 pub fn read_process_start_time(pid: u32) -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
@@ -188,11 +221,24 @@ pub fn read_process_start_time(pid: u32) -> Option<u64> {
     }
     #[cfg(target_os = "macos")]
     {
-        use libproc::bsd_info::BSDInfo;
-        use libproc::proc_pid::pidinfo;
-
         let pid = i32::try_from(pid).ok()?;
-        let info = pidinfo::<BSDInfo>(pid, 0).ok()?;
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+        let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+        // SAFETY: the buffer has the size required by PROC_PIDTBSDINFO.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        if written != size {
+            return None;
+        }
+        // SAFETY: proc_pidinfo initialized the complete structure.
+        let info = unsafe { info.assume_init() };
         info.pbi_start_tvsec
             .checked_mul(1_000_000)?
             .checked_add(info.pbi_start_tvusec)
@@ -204,19 +250,19 @@ pub fn read_process_start_time(pid: u32) -> Option<u64> {
     }
 }
 
-/// A `None` starttime, from a pid file written before starttimes were, passes
-/// as current - there is nothing recorded to check the live process against.
 fn published_process_is_current(pid: u32, published_start_time: Option<u64>) -> bool {
     match published_start_time {
-        None => true,
+        None => false,
         Some(published) => read_process_start_time(pid) == Some(published),
     }
 }
 
-/// Two outcomes are `Ok` without a signal delivered: `ESRCH` - the process is
-/// already gone - and a starttime no longer matching what was published,
-/// which is a stranger wearing the pid now.
-pub fn signal_pid(pid: u32, published_start_time: Option<u64>, signal: VmSignal) -> Result<()> {
+/// `IdentityUnknown` means the process is gone or its published identity cannot be verified.
+pub fn signal_pid(
+    pid: u32,
+    published_start_time: Option<u64>,
+    signal: VmSignal,
+) -> Result<super::SignalResult> {
     let sig = match signal {
         VmSignal::GracefulStop => rustix::process::Signal::TERM,
         VmSignal::ForcedStop => rustix::process::Signal::KILL,
@@ -236,18 +282,18 @@ pub fn signal_pid(pid: u32, published_start_time: Option<u64>, signal: VmSignal)
     #[cfg(target_os = "linux")]
     if let Ok(fd) = rustix::process::pidfd_open(target, rustix::process::PidfdFlags::empty()) {
         if !published_process_is_current(pid, published_start_time) {
-            return Ok(());
+            return Ok(super::SignalResult::IdentityUnknown);
         }
         return match rustix::process::pidfd_send_signal(&fd, sig) {
-            Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
+            Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(super::SignalResult::Sent),
             Err(e) => Err(std::io::Error::from(e)),
         };
     }
     if !published_process_is_current(pid, published_start_time) {
-        return Ok(());
+        return Ok(super::SignalResult::IdentityUnknown);
     }
     match rustix::process::kill_process(target, sig) {
-        Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
+        Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(super::SignalResult::Sent),
         Err(e) => Err(std::io::Error::from(e)),
     }
 }
@@ -269,7 +315,7 @@ fn send_stop() {
     if fd < 0 {
         return;
     }
-    let byte = [terra_shared::contract::STOP_SIGNAL];
+    let byte = [terra_protocol::STOP_SIGNAL];
     // SAFETY: `fd` is the control connection, open for the rest of this
     // process's life (see [`STOP_FD`]); one byte from a live buffer.
     unsafe {
@@ -315,28 +361,10 @@ pub fn is_host_root() -> bool {
     rustix::process::getuid().as_raw() == 0
 }
 
-/// The host uid and gid a share's backing files will carry: this process's
-/// own. `None` as root - real ids pass through virtiofs whole, nothing to map.
-#[must_use]
-pub fn read_share_owner() -> Option<ShareOwner> {
-    let (uid, gid) = (
-        rustix::process::getuid().as_raw(),
-        rustix::process::getgid().as_raw(),
-    );
-    (uid != 0).then_some(ShareOwner { uid, gid })
-}
-
-/// Point this process's stdout and stderr at `file`, so every writer that
-/// reaches them follows - a panic included.
-pub fn point_stdio_at(file: &File) -> Result<()> {
-    rustix::stdio::dup2_stdout(file).map_err(std::io::Error::from)?;
-    rustix::stdio::dup2_stderr(file).map_err(std::io::Error::from)?;
-    Ok(())
-}
-
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    use crate::sys::SignalResult;
     use std::fs::OpenOptions;
 
     fn create_scratch_path(name: &str) -> std::path::PathBuf {
@@ -355,8 +383,14 @@ mod tests {
             .unwrap();
         let pid = child.id();
         child.wait().unwrap(); // reaped: the pid names nothing at all now
-        assert!(signal_pid(pid, None, VmSignal::GracefulStop).is_ok());
-        assert!(signal_pid(pid, None, VmSignal::ForcedStop).is_ok());
+        assert_eq!(
+            signal_pid(pid, None, VmSignal::GracefulStop).unwrap(),
+            SignalResult::IdentityUnknown
+        );
+        assert_eq!(
+            signal_pid(pid, None, VmSignal::ForcedStop).unwrap(),
+            SignalResult::IdentityUnknown
+        );
     }
 
     /// The pid file outlives its VM by however long it takes a boot to empty
@@ -365,13 +399,22 @@ mod tests {
     /// with nothing - `Ok`, because "already gone" is the truth about the box -
     /// while the same pid with *its* starttime takes the signal.
     #[test]
-    fn a_recycled_pid_is_left_alone_and_the_real_one_is_signalled() {
+    fn an_unverified_pid_is_left_alone_and_the_real_one_is_signalled() {
         let mut child = Command::new("sleep").arg("30").spawn().unwrap();
         let pid = child.id();
         let started_at = read_process_start_time(pid).expect("a live child has a stat");
 
+        assert_eq!(
+            signal_pid(pid, None, VmSignal::ForcedStop).unwrap(),
+            SignalResult::IdentityUnknown
+        );
+        assert!(child.try_wait().unwrap().is_none());
+
         // One tick off is nobody's process as far as the check is concerned.
-        signal_pid(pid, Some(started_at + 1), VmSignal::GracefulStop).unwrap();
+        assert_eq!(
+            signal_pid(pid, Some(started_at + 1), VmSignal::GracefulStop).unwrap(),
+            SignalResult::IdentityUnknown
+        );
         assert!(
             child.try_wait().unwrap().is_none(),
             "a living child was signalled through a recycled identity"
@@ -379,12 +422,18 @@ mod tests {
 
         // The published starttime is the one that reaches it; `sleep` dies of
         // SIGTERM outright.
-        signal_pid(pid, Some(started_at), VmSignal::GracefulStop).unwrap();
+        assert_eq!(
+            signal_pid(pid, Some(started_at), VmSignal::GracefulStop).unwrap(),
+            SignalResult::Sent
+        );
         child.wait().unwrap();
 
         // …and once gone, any starttime reads as already-gone rather than
         // reaching whoever wears the pid now.
-        assert!(signal_pid(pid, Some(started_at), VmSignal::ForcedStop).is_ok());
+        assert_eq!(
+            signal_pid(pid, Some(started_at), VmSignal::ForcedStop).unwrap(),
+            SignalResult::IdentityUnknown
+        );
     }
 
     /// A pid too large for `pid_t` used to convert to `-1`, and `kill(-1)`
@@ -448,7 +497,7 @@ mod tests {
         register_stop_channel(std::os::fd::OwnedFd::from(host));
         let mut byte = [0u8; 1];
         (&guest).read_exact(&mut byte).unwrap();
-        assert_eq!(byte[0], terra_shared::contract::STOP_SIGNAL);
+        assert_eq!(byte[0], terra_protocol::STOP_SIGNAL);
 
         // A second signal does not put a second byte on the connection - the
         // guest reads one and starts `pre_stop`.
@@ -485,8 +534,9 @@ mod tests {
         cmd.arg("-c")
             .arg("read line")
             .stdin(std::process::Stdio::piped());
-        pass_lock(&mut cmd, &lock);
+        let inheritance = pass_lock(&mut cmd, &lock).unwrap();
         let mut child = cmd.spawn().unwrap();
+        drop(inheritance);
 
         // The taker lets go: from here the box is held by the child alone.
         drop(lock);
@@ -527,42 +577,11 @@ mod tests {
         let unrelated = std::fs::File::open(&unrelated_path).unwrap();
 
         assert!(fd_opens_file(lock.as_raw_fd(), &lock_path));
+        assert!(!fd_opens_file(-1, &lock_path));
+        assert!(!fd_opens_file(i32::MAX, &lock_path));
         assert!(
             !fd_opens_file(unrelated.as_raw_fd(), &lock_path),
             "an unrelated descriptor passed as the box's lock"
         );
-    }
-
-    /// The host end of `terra put`/`get` opens a path the *guest* can have prepared:
-    /// both directions commonly sit in a read-write share, where guest root
-    /// creates real host symlinks. The leaf alone is not enough - a symlinked
-    /// *parent* is the one that escapes the share.
-    #[test]
-    fn neither_direction_resolves_through_a_symlink() {
-        let real = create_scratch_path("private");
-        let link = create_scratch_path("share-reports");
-        let _ = std::fs::remove_dir_all(&real);
-        let _ = std::fs::remove_file(&link);
-        std::fs::create_dir_all(&real).unwrap();
-        std::fs::write(real.join("key.pem"), b"SECRET").unwrap();
-        std::os::unix::fs::symlink(&real, &link).unwrap();
-
-        // (a) a symlinked parent, on both directions.
-        let err = create_no_symlinks(&link.join("pwned.sh"))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("symlink"), "{err}");
-        assert!(!real.join("pwned.sh").exists(), "the write escaped");
-        assert!(open_no_symlinks(&link.join("key.pem")).is_err());
-
-        // (b) the leaf itself, which `O_NOFOLLOW` already caught.
-        assert!(open_no_symlinks(&link).is_err());
-
-        // …and an ordinary path through real directories still works.
-        assert!(open_no_symlinks(&real.join("key.pem")).is_ok());
-        assert!(create_no_symlinks(&real.join("fine.txt")).is_ok());
-
-        let _ = std::fs::remove_file(&link);
-        let _ = std::fs::remove_dir_all(&real);
     }
 }

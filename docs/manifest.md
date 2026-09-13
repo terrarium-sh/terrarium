@@ -1,39 +1,32 @@
 # Project manifest
 
-`terra.yaml` names a project's boxes and maps each name to a recipe. Commit it
-when the project has more than one useful sandbox, so `terra dev` means the
-same thing for everyone who clones the project. Recipes themselves are described
-in the [recipe reference](recipe.md); commands and lifecycle are in
-[usage.md](usage.md).
-
-## Format
+`terra.yaml` gives a project stable names for its recipes. Commit it when a
+project has more than one useful box, so each clone uses the same names.
 
 ```yaml
-# terra.yaml
 boxes:
   dev: ./dev.yaml
-  ci: ~/ci/terra.yaml
+  ci: ./ci.yaml
 ```
 
-Each value is a recipe path, not an inline recipe. Relative paths resolve from
-the project root; `~` expands in the usual way. A manifest with one entry makes
-bare `terra setup` select that box. With several entries, terra lists the boxes
-instead of guessing.
+Each value is a recipe path, never an inline recipe. Relative paths resolve
+from the project directory, and `~` expands for the current user. With one
+manifest entry, `terra setup` can choose it without a box name; with several,
+specify one:
 
-## Pinning and trust
+```sh
+terra dev setup
+terra ci setup --dry-run
+terra dev
+```
 
-`terra <box> setup` reads the manifest, pins the recipe it names, and builds the
-box. The manifest is consulted again only by `setup`; booting an existing box
-uses its pinned recipe.
+Setup reads the manifest and pins the referenced recipe. Later boots use the
+pinned copy, so changing either file has no effect until `terra <box> setup`
+runs again. `terra <box> show` displays the pinned recipe and notes if the
+manifest now points elsewhere.
 
-The manifest lives in the project root, which a box may mount and write. It is
-therefore deliberately a map of references rather than policy in place. A
-manifest edit can repoint a box name, but `setup` shows the recipe and asks for
-approval before it pins a guest-writable source. References into `~/.terra` are
-also protected from ordinary mount configuration: terra refuses any mount that
-could contain that state. This is not VMM confinement; see the
-[security model](security.md) before enabling mounts.
-
-A bare `terra <box>` never silently pins a new recipe. On a terminal it shows
-what the recipe grants and asks before setup; without one it tells the caller to
-run `terra <box> setup`.
+The manifest is a map of references because a project directory can be mounted
+into a guest. Terra asks before pinning a recipe that a guest might have
+written; in noninteractive use, review it and pass `--trust-recipe`. Keep
+recipes as the policy document and read [security](security.md) before granting
+mounts or network access.

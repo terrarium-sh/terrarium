@@ -1,7 +1,3 @@
-# Temporary CI. Builds nothing but the binary, so it needs no /dev/kvm and runs
-# on stock hosted runners. The real pipeline (fmt, clippy, tests, the boot suite
-# against a live microVM, the macOS job) is parked in ci.yml.disabled — restore
-# it once there is a runner that can boot a guest.
 name: Build
 
 on:
@@ -9,142 +5,251 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      native_vm_tests:
+        description: Run macOS and Windows VM gates (requires hypervisor access on the runners)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
-# Actions pinned by commit SHA, not tag: setup-zig supplies the C compiler and
-# linker for the whole static build. The trailing comment is the tag the SHA
-# stood for — update both together.
 jobs:
-  build:
+  guest-assets:
+    name: Linux guest (${{ matrix.arch }})
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: x86_64
-            runner: ubuntu-latest
-          # Native, not cross: the guest kernel, rootfs and agent are built for
-          # the host arch (see ARCH in the Makefile), so an arm binary has to be
-          # produced on arm hardware to embed a guest it can actually boot.
+            rust_target: x86_64-unknown-linux-musl
           - arch: aarch64
-            runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
+            rust_target: aarch64-unknown-linux-musl
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # One level only. vendor/smolvm has its own submodules on ssh URLs
-          # that this build never touches, and recursing would fail to fetch them.
-          submodules: true
           persist-credentials: false
-      # A full Linux kernel build needs these; ubuntu-latest happens to carry
-      # them, the arm image does not, so install on both rather than depend on
-      # which runner image ships what.
-      - name: Kernel build deps
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            flex bison bc libelf-dev libssl-dev python3-pyelftools
-      # `mke2fs -d` bakes the rootfs and boot images root-owned inside a user
-      # namespace (see the Makefile), so the build needs to be able to map root
-      # in one. Ubuntu 24.04 — both runner images — ships
-      # kernel.apparmor_restrict_unprivileged_userns=1, which lets the namespace
-      # be created but strips the capabilities inside it, so the uid_map write
-      # fails with EPERM instead of unshare failing outright. Runners are
-      # throwaway VMs, so just turn it off; the guard keeps this working on an
-      # image that has no such knob.
-      #
-      # `unshare -U -r true` is the point of the step, not a formality: without
-      # it the first thing to need a namespace is the rootfs bake, ~20 minutes
-      # of kernel build later.
       - name: Allow unprivileged user namespaces
         run: |
           if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
           unshare -U -r true
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
-        with:
-          workspaces: . -> target
-          key: ${{ matrix.arch }}
-      # .cargo/config.toml routes CC and the musl linker through scripts/zig-*.
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0
-      # The guest kernel is a full Linux build — minutes — and its only inputs
-      # are the libkrunfw submodule, the pins, the hardening fragment and the
-      # host arch. All four are in the key, so a pin bump or an arch switch
-      # cannot hit a stale image (the Makefile's pin stamp enforces the same
-      # thing locally). pins.mk especially: that is where a security bump lands.
-      - name: Guest image inputs
+      - run: rustup target add ${{ matrix.rust_target }}
+      - name: Build guest assets
+        run: make ARCH=${{ matrix.arch }} guest-assets
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: terra-guest-${{ matrix.arch }}
+          path: |
+            build/vmlinux.gz
+            build/rootfs.img.gz
+            build/volume.img.gz
+            build/boot.img.gz
+            build/vmlinux.gz.sha256
+            build/boot.img.gz.sha256
+          if-no-files-found: error
+
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Allow unprivileged user namespaces
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          unshare -U -r true
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+      - name: Install component build tools
+        run: |
+          rustup toolchain install nightly-2026-09-07 --profile minimal --component rustfmt clippy --target wasm32-wasip3
+          cargo install wasm-tools --version 1.248.0 --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          workspaces: . -> target
+          key: x86_64-component
+      - name: Guest image cache key
         id: guest
         run: >-
-          echo "key=${{ matrix.arch }}-$(git rev-parse HEAD:vendor/libkrunfw)-${{
-          hashFiles('pins.mk', 'Makefile', 'kernel/terrarium-hardening.config') }}"
+          echo "key=${{ hashFiles('pins.mk', 'Makefile', 'kernel/Containerfile', 'kernel/*.config', 'kernel/patches/*.patch', 'scripts/kernel-container.sh', 'scripts/*.py') }}"
           >> "$GITHUB_OUTPUT"
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: build
           key: guest-${{ steps.guest.outputs.key }}
-      # Bakes the guest images (needs unprivileged user namespaces, which hosted
-      # runners have) and links the one static binary.
-      - name: Build
+      - name: Verify
+        run: make verify
+      - name: Build distribution
         run: make dist
-      - name: Check it runs
+      - name: Check distribution
         run: |
           ./dist/terra --version
           ./dist/terra --help
-      # The whole point of the static build — a dynamic dependency here means a
-      # tester's box has to happen to match this runner's libc.
-      - name: Check it is static
-        run: |
           file ./dist/terra | grep -q 'statically linked'
           ! ldd ./dist/terra 2>&1 | grep -q '=>'
+      - name: Network policy coverage
+        run: |
+          rustup component add llvm-tools-preview
+          llvm_bin="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin"
+          LLVM_COV="$llvm_bin/llvm-cov" LLVM_PROFDATA="$llvm_bin/llvm-profdata" python3 scripts/coverage-network-policy.py
+      - name: Fuzz smoke
+        run: |
+          cargo install cargo-fuzz --version 0.13.1 --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
+          cargo metadata --locked --manifest-path fuzz/Cargo.toml --format-version 1
+          cargo +nightly-2026-09-07 fuzz run network_policy -- -max_total_time=60 -max_len=4096
+          cargo +nightly-2026-09-07 fuzz run native_memory -- -max_total_time=60 -max_len=32768
+          cargo +nightly-2026-09-07 fuzz run device_queue -- -max_total_time=60 -max_len=4096
+          cargo +nightly-2026-09-07 fuzz run fuse_wire -- -max_total_time=60 -max_len=4096
+          cargo +nightly-2026-09-07 fuzz run vsock_header -- -max_total_time=60 -max_len=4096
+          cargo +nightly-2026-09-07 fuzz run protocol_frames -- -max_total_time=60 -max_len=4096
+      - name: Native boundary address sanitizer
+        env:
+          RUSTFLAGS: -Zsanitizer=address
+          CARGO_TARGET_DIR: target/asan
+        run: cargo +nightly-2026-09-07 test --locked -p terra-runtime --test native_boundary --target x86_64-unknown-linux-gnu
+      - name: KVM gates
+        run: |
+          if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
+            echo '::notice title=KVM gates skipped::This hosted runner has no read/write /dev/kvm.'
+            exit 0
+          fi
+          make test-component-boot
+          make test-component-vmm
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: terra-${{ matrix.arch }}-linux
-          path: dist/terra
-      - if: matrix.arch == 'aarch64'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: guest-images-aarch64
-          path: |
-            build/*.gz
-            build/*.sha256
-          retention-days: 7
+          name: terra-x86_64-linux
+          path: dist
 
-  macos:
-    runs-on: macos-latest
-    needs: build
-    timeout-minutes: 45
+  linux-aarch64:
+    needs: guest-assets
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          submodules: true
           persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: terra-guest-aarch64
+          path: build
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - name: Install component build tools
+        run: |
+          rustup target add aarch64-unknown-linux-musl
+          rustup toolchain install nightly-2026-09-07 --profile minimal --component rustfmt clippy --target wasm32-wasip3
+          cargo install wasm-tools --version 1.248.0 --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
+      - name: Build and verify native ARM target
+        run: |
+          make host-dist
+          cargo fmt --all -- --check
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+          cargo test --locked --workspace
+          make verify-components
+          ./dist/terra --version
+          ./dist/terra --help
+      - name: KVM product gates
+        run: |
+          if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
+            echo '::notice title=KVM gates skipped::This hosted runner has no read/write /dev/kvm.'
+            exit 0
+          fi
+          TERRA_BIN="$PWD/dist/terra" cargo test --locked -p terra --test boot --test memory -- --ignored --test-threads=1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          workspaces: . -> target
-          key: macos
+          name: terra-aarch64-linux
+          path: dist
+
+  macos-aarch64:
+    needs: guest-assets
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: guest-images-aarch64
+          name: terra-guest-aarch64
           path: build
-      - name: Build
-        run: cargo build --release -p terra --target aarch64-apple-darwin
-      - name: Sign for Hypervisor.framework
-        run: >-
-          codesign --force --sign -
-          --entitlements vendor/libkrun/hvf-entitlements.plist
-          target/aarch64-apple-darwin/release/terra
-      - name: Check it runs
+      - name: Install component build tools
         run: |
-          ./target/aarch64-apple-darwin/release/terra --version
-          ./target/aarch64-apple-darwin/release/terra --help
+          rustup toolchain install nightly-2026-09-07 --profile minimal --component rustfmt clippy --target wasm32-wasip3
+          cargo install wasm-tools --version 1.248.0 --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
+      - name: Build and sign
+        run: |
+          make TERRA_TARGET=aarch64-apple-darwin host-dist
+          codesign --force --sign - --entitlements packaging/macos.entitlements dist/terra
+          codesign --verify --strict --verbose=2 dist/terra
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+          cargo test --locked --workspace
+          ./dist/terra --version
+          ./dist/terra --help
+      - name: Native VM acceptance
+        if: ${{ inputs.native_vm_tests }}
+        run: TERRA_BIN="$PWD/dist/terra" cargo test --locked -p terra --test native_boot -- --ignored --nocapture
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: terra-aarch64-macos
-          path: target/aarch64-apple-darwin/release/terra
+          path: dist
+
+  windows:
+    needs: guest-assets
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            guest: x86_64
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            guest: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Enable Git symlinks
+        run: git config --global core.symlinks true
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: terra-guest-${{ matrix.guest }}
+          path: build
+      - name: Build distribution
+        shell: pwsh
+        run: ./scripts/build-host.ps1 -Target ${{ matrix.target }}
+      - name: Check native target
+        shell: pwsh
+        run: |
+          cargo check --locked --workspace --all-targets --target ${{ matrix.target }}
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo clippy --locked --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
+      - name: Run workspace unit tests
+        shell: pwsh
+        run: cargo test --locked --workspace
+      - name: Check distribution
+        shell: pwsh
+        run: |
+          ./dist/terra.exe --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./dist/terra.exe --help
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Native VM acceptance
+        if: ${{ inputs.native_vm_tests }}
+        shell: pwsh
+        run: |
+          $env:TERRA_BIN = (Resolve-Path ./dist/terra.exe).Path
+          cargo test --locked -p terra --test native_boot -- --ignored --nocapture
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: terra-${{ matrix.target }}
+          path: dist

@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::{Config, MIN_MEM_MIB};
-use terra_shared::contract::MAX_VOLUMES;
+use terra_protocol::MAX_VOLUMES;
 
 pub(crate) fn validate_env(env: &BTreeMap<String, String>) -> Result<()> {
     for (k, v) in env {
@@ -19,7 +19,10 @@ pub(crate) fn validate_env(env: &BTreeMap<String, String>) -> Result<()> {
             );
         }
         if v.contains('\0') {
-            anyhow::bail!("invalid value for environment variable {k}: it cannot contain a NUL");
+            anyhow::bail!(
+                "invalid value for environment variable {}: it cannot contain a NUL",
+                crate::render::escape_printable(k)
+            );
         }
     }
     Ok(())
@@ -28,6 +31,7 @@ pub(crate) fn validate_env(env: &BTreeMap<String, String>) -> Result<()> {
 pub(crate) fn validate(cfg: &Config) -> Result<()> {
     validate_workdir(cfg)?;
     validate_hw(cfg)?;
+    cfg.components.memory_limits()?;
     validate_sudo(cfg)?;
     validate_volumes(cfg)?;
     validate_network(cfg)?;
@@ -40,7 +44,10 @@ fn validate_workdir(cfg: &Config) -> Result<()> {
     if let Some(dir) = &cfg.workload.workdir
         && !dir.is_absolute()
     {
-        bail!("workload.workdir must be absolute: '{}'", dir.display());
+        bail!(
+            "workload.workdir must be absolute: '{}'",
+            crate::render::escape_printable_path(dir)
+        );
     }
     Ok(())
 }
@@ -51,11 +58,19 @@ fn validate_hw(cfg: &Config) -> Result<()> {
             "hw.rootfs_mib must be > 0 (the state is always a bounded image; use mounts for uncapped scratch)"
         );
     }
-    // A VM the hypervisor cannot build fails deep inside libkrun, in a
+    // A VM the VMM cannot build fails in a
     // background process whose only report is a replayed log - so the numbers
     // that decide whether it can be built are checked against the recipe.
     if cfg.hw.cpus == 0 {
         bail!("hw.cpus must be > 0 (a VM needs at least one vCPU)");
+    }
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    if usize::from(cfg.hw.cpus) > terra_platform::worker::MAX_VCPUS {
+        bail!(
+            "hw.cpus is {}; at most {} vCPUs fit this machine",
+            cfg.hw.cpus,
+            terra_platform::worker::MAX_VCPUS
+        );
     }
     if cfg.hw.mem_mib < MIN_MEM_MIB {
         bail!(
@@ -76,8 +91,9 @@ fn validate_sudo(cfg: &Config) -> Result<()> {
         }
         if c.split_whitespace().count() > 1 || c.chars().any(char::is_control) {
             bail!(
-                "sudo entry '{c}' must be a bare command, without arguments \
-                 (it permits the command with any arguments)"
+                "sudo entry '{}' must be a bare command, without arguments \
+                 (it permits the command with any arguments)",
+                crate::render::escape_printable(c)
             );
         }
     }
@@ -96,18 +112,29 @@ fn validate_volumes(cfg: &Config) -> Result<()> {
     for v in &cfg.volumes {
         // The name becomes a host filename in the box's state dir: no
         // separators, no traversal.
-        if matches!(v.name.as_str(), "" | "." | "..") || v.name.contains(['/', '\\']) {
+        if matches!(v.name.as_str(), "" | "." | "..")
+            || v.name
+                .contains(['/', '\\', ':', '*', '?', '"', '<', '>', '|'])
+            || v.name.chars().any(char::is_control)
+            || v.name.len() > 247
+        {
             bail!(
                 "volume name '{}' must be a plain name (it names the image file)",
-                v.name
+                crate::render::escape_printable(&v.name)
             );
         }
         // Two volumes on one image would mount the same ext4 read-write twice.
-        if !seen.insert(&v.name) {
-            bail!("duplicate volume name '{}'", v.name);
+        if !seen.insert(v.name.to_lowercase()) {
+            bail!(
+                "duplicate volume name '{}'",
+                crate::render::escape_printable(&v.name)
+            );
         }
         if v.size_mib == 0 {
-            bail!("volume '{}' must have size_mib > 0", v.name);
+            bail!(
+                "volume '{}' must have size_mib > 0",
+                crate::render::escape_printable(&v.name)
+            );
         }
     }
     Ok(())
@@ -117,7 +144,15 @@ fn validate_network(cfg: &Config) -> Result<()> {
     // A broken `network:` would otherwise fail mid-boot, in the background
     // gateway - after the recipe was pinned - so it is refused here instead.
     crate::policy::network::rules::parse_port_mappings(&cfg.network.ports)?;
-    let _ = crate::policy::network::runtime::BoxPolicy::new(&cfg.network)?;
+    let (_, policy_memory_bytes) = cfg
+        .components
+        .memory_limits()?
+        .reserve_policy()
+        .map_err(|error| anyhow::anyhow!(crate::render::escape_printable(&format!("{error:#}"))))?;
+    let _ = crate::policy::network::runtime::BoxPolicy::with_memory_limit(
+        &cfg.network,
+        policy_memory_bytes,
+    )?;
     Ok(())
 }
 
@@ -131,21 +166,25 @@ fn validate_one_thing_per_guest_path(cfg: &Config) -> Result<()> {
         .map(|m| {
             (
                 m.guest.as_path(),
-                format!("mount from '{}'", m.host.display()),
+                format!(
+                    "mount from '{}'",
+                    crate::render::escape_printable_path(&m.host)
+                ),
             )
         })
-        .chain(
-            cfg.volumes
-                .iter()
-                .map(|v| (v.guest.as_path(), format!("volume '{}'", v.name))),
-        );
+        .chain(cfg.volumes.iter().map(|v| {
+            (
+                v.guest.as_path(),
+                format!("volume '{}'", crate::render::escape_printable(&v.name)),
+            )
+        }));
     let mut seen = HashMap::new();
     for (guest, what) in claims {
         if let Some(earlier) = seen.insert(guest, what.clone()) {
             bail!(
                 "guest path '{}' is claimed twice, by {earlier} and by {what} \
                  (the later one would be mounted over the earlier)",
-                guest.display()
+                crate::render::escape_printable_path(guest)
             );
         }
     }

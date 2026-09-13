@@ -2,9 +2,11 @@
 
 use std::process::ExitCode;
 
-fn main() -> ExitCode {
-    match terra::run() {
+#[tokio::main]
+async fn main() -> ExitCode {
+    match terra::run().await {
         Ok(code) => code,
+        Err(error) if terra::is_stdout_broken_pipe(&error) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("terra: {e:#}");
             ExitCode::FAILURE

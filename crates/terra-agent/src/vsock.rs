@@ -17,9 +17,9 @@ use rustix::net::{
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::{OwnedFd, RawFd};
-use std::sync::Arc;
-use std::time::Duration;
-use terra_shared::contract::{
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
+use terra_protocol::{
     AGENT_HELLO, AgentService, ClientInput, ControlReply, ControlRequest, TermSize, encode_frame,
     read_frame,
 };
@@ -28,6 +28,57 @@ use terra_shared::contract::{
 pub const VMADDR_CID_HOST: u32 = 2;
 
 const ACCEPT_RETRY: Duration = Duration::from_millis(100);
+const REFUSED_CONNECTION_LOG_INTERVAL: Duration = Duration::from_secs(1);
+const STARTUP_WAIT: Duration = Duration::from_mins(5);
+
+pub(crate) struct StartupGate {
+    state: Mutex<StartupState>,
+    changed: Condvar,
+}
+
+enum StartupState {
+    Pending,
+    Ready,
+    Failed,
+}
+
+impl StartupGate {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(StartupState::Pending),
+            changed: Condvar::new(),
+        })
+    }
+
+    pub(crate) fn ready(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            *state = StartupState::Ready;
+            self.changed.notify_all();
+        }
+    }
+
+    pub(crate) fn fail(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            *state = StartupState::Failed;
+            self.changed.notify_all();
+        }
+    }
+
+    fn wait(&self) -> bool {
+        let Ok(state) = self.state.lock() else {
+            return false;
+        };
+        let Ok((state, _)) = self
+            .changed
+            .wait_timeout_while(state, STARTUP_WAIT, |state| {
+                matches!(state, StartupState::Pending)
+            })
+        else {
+            return false;
+        };
+        matches!(*state, StartupState::Ready)
+    }
+}
 
 #[repr(C)]
 struct SockaddrVm {
@@ -40,6 +91,7 @@ struct SockaddrVm {
 
 pub struct VsockListener {
     fd: OwnedFd,
+    last_refusal: Mutex<Option<Instant>>,
 }
 
 fn create_vsock_socket(cid: u32, port: u32) -> std::io::Result<(OwnedFd, SockaddrVm)> {
@@ -81,7 +133,10 @@ impl VsockListener {
         let (fd, addr) = create_vsock_socket(u32::MAX /* any */, port)?;
         bind(&fd, &addr)?;
         listen(&fd, 8)?;
-        Ok(Self { fd })
+        Ok(Self {
+            fd,
+            last_refusal: Mutex::new(None),
+        })
     }
 
     /// Accepts the next connection from the host, refusing other peers.
@@ -105,8 +160,16 @@ impl VsockListener {
                 return Ok(file);
             }
             drop(file);
-            eprintln!("terra-agent: refused vsock connection from inside the guest (cid {cid})");
-            // No sleep: `acceptfrom` blocks when idle; sleep only throttles legitimate host accepts.
+            let now = Instant::now();
+            let mut last_refusal = crate::mutex::lock_or_abort(&self.last_refusal);
+            if last_refusal
+                .is_none_or(|last| now.duration_since(last) >= REFUSED_CONNECTION_LOG_INTERVAL)
+            {
+                eprintln!(
+                    "terra-agent: refused vsock connection from inside the guest (cid {cid})"
+                );
+                *last_refusal = Some(now);
+            }
         }
     }
 }
@@ -123,6 +186,8 @@ pub(crate) fn serve_agent_port(
     listener: VsockListener,
     master_fd: RawFd,
     workload_is_root: bool,
+    initial_session: Option<std::sync::mpsc::SyncSender<()>>,
+    startup: Arc<StartupGate>,
 ) {
     let session = session.clone();
     std::thread::spawn(move || {
@@ -135,7 +200,9 @@ pub(crate) fn serve_agent_port(
                     continue;
                 }
             };
+            let initial_session = initial_session.clone();
             let session = session.clone();
+            let startup = startup.clone();
             std::thread::spawn(move || {
                 // Hello must be the first byte on the connection before any service output.
                 let mut conn = conn;
@@ -169,16 +236,24 @@ pub(crate) fn serve_agent_port(
                     return;
                 }
                 match AgentService::from_byte(service_byte[0]) {
-                    Some(AgentService::Session) => serve_client(&session, conn, master_fd),
+                    Some(AgentService::Session) => {
+                        serve_client(&session, conn, master_fd, initial_session.as_ref());
+                    }
                     Some(AgentService::SessionControl) => {
                         serve_session_control(&session, conn, master_fd);
                     }
-                    Some(AgentService::Files) => {
+                    Some(AgentService::Files) if startup.wait() => {
+                        if crate::vsock::set_socket_timeouts(&conn, Duration::from_secs(30))
+                            .is_err()
+                        {
+                            return;
+                        }
                         crate::files::serve_file_op(conn, workload_is_root);
                     }
-                    Some(AgentService::Exec) => {
+                    Some(AgentService::Exec) if startup.wait() => {
                         crate::exec::serve_exec(conn, workload_is_root);
                     }
+                    Some(AgentService::Files | AgentService::Exec) => {}
                     None => eprintln!(
                         "terra-agent: unknown service byte {:#04x} - dropping the connection",
                         service_byte[0]
@@ -191,12 +266,24 @@ pub(crate) fn serve_agent_port(
 
 /// Attach one `terra` client to the session and forward its framed input -
 /// keystrokes and resizes - until its connection ends.
-fn serve_client(session: &Arc<Session>, conn: File, master_fd: RawFd) {
+fn serve_client(
+    session: &Arc<Session>,
+    conn: File,
+    master_fd: RawFd,
+    initial_session: Option<&std::sync::mpsc::SyncSender<()>>,
+) {
     let Ok(mut reader) = conn.try_clone() else {
         return;
     };
-    let client = ClientConn::from_vsock(conn);
-    let id = session.attach_client(&client);
+    let Ok(client) = ClientConn::from_vsock(conn) else {
+        return;
+    };
+    let Some(id) = session.attach_client(&client) else {
+        return;
+    };
+    if let Some(initial_session) = initial_session {
+        let _ = initial_session.try_send(());
+    }
 
     loop {
         match read_frame::<ClientInput>(&mut reader) {
@@ -227,6 +314,9 @@ fn serve_client(session: &Arc<Session>, conn: File, master_fd: RawFd) {
 }
 
 fn serve_session_control(session: &Arc<Session>, mut conn: File, master_fd: RawFd) {
+    if set_socket_timeouts(&conn, Duration::from_secs(30)).is_err() {
+        return;
+    }
     let send_reply = |conn: &mut File, reply: &ControlReply| {
         let bytes = encode_frame(reply)?;
         conn.write_all(&bytes).and_then(|()| conn.flush())
@@ -278,6 +368,19 @@ fn set_session_winsize(master_fd: RawFd, rows: u16, cols: u16) {
     );
 }
 
+pub(crate) fn set_socket_timeouts(
+    conn: &impl std::os::fd::AsFd,
+    duration: Duration,
+) -> std::io::Result<()> {
+    for timeout in [
+        rustix::net::sockopt::Timeout::Recv,
+        rustix::net::sockopt::Timeout::Send,
+    ] {
+        rustix::net::sockopt::set_socket_timeout(conn, timeout, Some(duration))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,10 +394,27 @@ mod tests {
         for _ in 0..n {
             let (client, server) = UnixStream::pair().unwrap();
             let _ = client;
-            let client = ClientConn::from_vsock(File::from(std::os::fd::OwnedFd::from(server)));
+            let client =
+                ClientConn::from_vsock(File::from(std::os::fd::OwnedFd::from(server))).unwrap();
             let _ = session.attach_client(&client);
         }
         session
+    }
+
+    #[test]
+    fn requests_wait_for_startup_or_fail_with_it() {
+        let startup = StartupGate::new();
+        let waiting = {
+            let startup = startup.clone();
+            std::thread::spawn(move || startup.wait())
+        };
+        std::thread::sleep(Duration::from_millis(20));
+        startup.ready();
+        assert!(waiting.join().unwrap());
+
+        let startup = StartupGate::new();
+        startup.fail();
+        assert!(!startup.wait());
     }
 
     fn run_control_request(session: &Arc<Session>, req: &ControlRequest) -> Vec<ControlReply> {
@@ -305,7 +425,7 @@ mod tests {
         let agent =
             std::thread::spawn(move || serve_session_control(&session, server, null.as_raw_fd()));
         client
-            .write_all(&terra_shared::contract::encode_frame(req).unwrap())
+            .write_all(&terra_protocol::encode_frame(req).unwrap())
             .unwrap();
         let mut reps = Vec::new();
         while let Some(rep) = read_frame::<ControlReply>(&mut client).unwrap() {

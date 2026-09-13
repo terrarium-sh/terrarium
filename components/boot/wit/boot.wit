@@ -1,0 +1,59 @@
+package terra:boot@0.1.0;
+
+interface types {
+    enum architecture { x86, arm }
+    enum device-kind { block, net, vsock, fs, memory }
+
+    record device {
+        kind: device-kind,
+        mmio-base: u64,
+        irq: u32,
+    }
+
+    record machine {
+        architecture: architecture,
+        ram-bytes: u64,
+        vcpus: u8,
+        devices: list<device>,
+    }
+
+    record boot-entry {
+        entry: u64,
+        boot-argument: u64,
+    }
+
+    enum error {
+        invalid-ram,
+        invalid-vcpus,
+        invalid-device,
+        command-line-too-long,
+        invalid-kernel,
+        kernel-architecture,
+        kernel-layout,
+        kernel-too-large,
+        boot-data-too-large,
+        unavailable,
+        bounds,
+    }
+}
+
+interface host {
+    use types.{machine, error};
+
+    machine-config: func() -> machine;
+    kernel-size: func() -> u64;
+    kernel-prefix: func() -> result<list<u8>, error>;
+    copy-kernel: func(source-offset: u64, guest-address: u64, length: u32) -> result<_, error>;
+    write-ram: func(address: u64, bytes: list<u8>) -> result<_, error>;
+}
+
+interface boot {
+    use types.{boot-entry, error};
+
+    stage: func(kernel-command-line: string) -> result<boot-entry, error>;
+}
+
+world boot-component {
+    import host;
+    export boot;
+}

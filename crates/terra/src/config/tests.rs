@@ -13,9 +13,6 @@ fn load(arg: &str, cwd: &Path) -> Result<Config> {
     load_from(arg, cwd, cwd)
 }
 
-/// [`parse_recipe`] and the [`merge_env_file`] step that follows it in
-/// [`crate::resolve::ResolvedBox::parse_recipe`] - together, a full read of a
-/// recipe.
 fn read_fully(text: &str, project_dir: &Path, source: &Path) -> Result<Config> {
     let mut cfg = parse_recipe(text, project_dir, source)?;
     merge_env_file(&mut cfg)?;
@@ -62,15 +59,29 @@ fn parsing_a_recipe_does_not_touch_the_host_paths_it_names() {
         "a relative host is still made absolute against the project"
     );
 
-    let err = resolve_mounts_for(&mut cfg.mounts).unwrap_err().to_string();
+    let bx = crate::state::BoxRef::from_state_dir(project.join("box-state"), project);
+    let err = crate::policy::mount::resolve_mounts(&cfg, &bx)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("resolving mount host path"), "{err}");
 
     std::fs::create_dir(project.join("gone")).unwrap();
-    resolve_mounts_for(&mut cfg.mounts).unwrap();
+    cfg.mounts = crate::policy::mount::resolve_mounts(&cfg, &bx).unwrap();
     assert_eq!(
         cfg.mounts[0].host,
         std::fs::canonicalize(project.join("gone")).unwrap()
     );
+}
+
+#[test]
+fn duplicate_unrelated_yaml_keys_do_not_hide_writable_shares() {
+    let dir = tempfile::tempdir().unwrap();
+    let shares = list_declared_writable_shares(
+        "env: {A: one, A: two}\nmounts:\n  - host: .\n    guest: /work\n",
+        dir.path(),
+    )
+    .unwrap();
+    assert_eq!(shares, vec![dir.path().to_path_buf()]);
 }
 
 #[test]
@@ -384,6 +395,17 @@ fn validate_volume_names() {
     );
     // The name becomes a filename - no separators or traversal.
     assert!(try_parse("volumes:\n  - {name: ../x, guest: /a, size_mib: 64}\n").is_err());
+    assert!(try_parse(
+        "volumes:\n  - {name: data, guest: /a, size_mib: 64}\n  - {name: DATA, guest: /b, size_mib: 64}\n"
+    )
+    .is_err());
+    let long_name = "x".repeat(248);
+    assert!(
+        try_parse(&format!(
+            "volumes:\n  - {{name: {long_name}, guest: /a, size_mib: 64}}\n"
+        ))
+        .is_err()
+    );
 
     // Past the last device letter it used to panic rather than error.
     let many = |n: usize| {
@@ -394,8 +416,8 @@ fn validate_volume_names() {
         }
         try_parse(&y)
     };
-    assert!(many(terra_shared::contract::MAX_VOLUMES).is_ok());
-    let err = many(terra_shared::contract::MAX_VOLUMES + 1)
+    assert!(many(terra_protocol::MAX_VOLUMES).is_ok());
+    let err = many(terra_protocol::MAX_VOLUMES + 1)
         .unwrap_err()
         .to_string();
     assert!(err.contains("at most"), "{err}");
@@ -478,6 +500,16 @@ fn hardware_a_vm_cannot_be_built_from_is_refused() {
     let err = try_parse("hw:\n  cpus: 0\n").unwrap_err().to_string();
     assert!(err.contains("hw.cpus"), "{err}");
 
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    {
+        let limit = terra_platform::worker::MAX_VCPUS;
+        assert!(try_parse(&format!("hw:\n  cpus: {limit}\n")).is_ok());
+        let err = try_parse(&format!("hw:\n  cpus: {}\n", limit + 1))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&format!("at most {limit} vCPUs")), "{err}");
+    }
+
     let err = try_parse("hw:\n  mem_mib: 16\n").unwrap_err().to_string();
     assert!(err.contains("hw.mem_mib"), "{err}");
     assert!(err.contains("128"), "the floor is named: {err}");
@@ -535,6 +567,21 @@ fn missing_config_names_the_path() {
     assert!(err.contains("resolving the recipe"), "{err}");
 }
 
+#[test]
+fn recipes_and_manifests_have_a_bounded_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let oversized = dir.path().join("large.yaml");
+    std::fs::File::create(&oversized)
+        .unwrap()
+        .set_len(MAX_RECIPE_BYTES + 1)
+        .unwrap();
+    let recipe = format!("{:#}", load_path(&oversized, dir.path()).unwrap_err());
+    assert!(recipe.contains("larger than"), "{recipe}");
+    std::fs::rename(&oversized, dir.path().join(MANIFEST_FILE)).unwrap();
+    let manifest = format!("{:#}", load_manifest(dir.path()).unwrap_err());
+    assert!(manifest.contains("larger than"), "{manifest}");
+}
+
 /// A guest path: a relative one has no host cwd to mean and would silently
 /// land wherever the workload happened to start.
 #[test]
@@ -556,4 +603,139 @@ fn a_relative_workdir_is_refused() {
     )
     .unwrap();
     assert_eq!(ok.workload.workdir.unwrap(), Path::new("/work"));
+}
+
+#[test]
+fn guest_paths_use_posix_separators_on_every_host() {
+    assert_eq!(
+        normalize_guest_path(Path::new("/work/../data")).unwrap(),
+        Path::new("/data")
+    );
+    assert_eq!(
+        normalize_guest_path(Path::new("/C:/data")).unwrap(),
+        Path::new("/C:/data")
+    );
+    assert!(normalize_guest_path(Path::new(r"\work")).is_err());
+    assert!(normalize_guest_path(Path::new("/work\\data")).is_err());
+}
+
+#[test]
+fn component_memory_defaults_overrides_and_validation() {
+    let try_parse = |yaml: &str| parse_recipe(yaml, Path::new("/proj"), Path::new("/proj/r.yaml"));
+    let defaults = try_parse("{}").unwrap();
+    assert_eq!(defaults.components.memory_mib, 16);
+    assert_eq!(defaults.components.total_memory_mib, 128);
+    let custom = try_parse("components: {memory_mib: 32, total_memory_mib: 256}").unwrap();
+    assert_eq!(custom.components.memory_mib, 32);
+    assert_eq!(
+        custom.components.memory_limits().unwrap().total_bytes(),
+        256 << 20
+    );
+    let encoded = yaml_serde::to_string(&custom).unwrap();
+    assert_eq!(try_parse(&encoded).unwrap(), custom);
+    for yaml in [
+        "components: {memory_mib: 0}",
+        "components: {memory_mib: 129}",
+        "components: {total_memory_mib: 0}",
+        "components: {memory_mib: 16, total_memory_mib: 16}",
+        "components: {memory_mib: -1}",
+        "components: {memory_mib: 4294967296}",
+        "components: {unknown: 1}",
+    ] {
+        assert!(try_parse(yaml).is_err(), "{yaml}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn recipe_reads_reject_fifos_and_device_symlinks() {
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join(MANIFEST_FILE);
+    rustix::fs::mkfifoat(rustix::fs::CWD, &fifo, rustix::fs::Mode::empty()).unwrap();
+    assert!(read_recipe_text(&fifo).is_err());
+    let device = dir.path().join("device.yaml");
+    std::os::unix::fs::symlink("/dev/zero", &device).unwrap();
+    assert!(read_recipe_text(&device).is_err());
+}
+
+#[test]
+fn manifest_reference_errors_escape_terminal_controls() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(MANIFEST_FILE),
+        "boxes:\n  dev: \"bad\\e\\a\"\n",
+    )
+    .unwrap();
+    let error = load_manifest(dir.path()).unwrap_err().to_string();
+    assert!(!error.contains(['\x1b', '\x07']), "{error:?}");
+    assert!(error.contains("not a recipe path"), "{error}");
+}
+
+#[test]
+fn yaml_errors_escape_terminal_controls() {
+    let dir = tempfile::tempdir().unwrap();
+    let yaml = "\"\\e]52;c;payload\\a\": true\n";
+    std::fs::write(dir.path().join(MANIFEST_FILE), yaml).unwrap();
+    for error in [
+        parse_recipe(yaml, dir.path(), Path::new("r.yaml")).unwrap_err(),
+        load_manifest(dir.path()).unwrap_err(),
+    ] {
+        let message = format!("{error:#}");
+        assert!(!message.contains('\x1b'), "{message:?}");
+        assert!(!message.contains('\x07'), "{message:?}");
+    }
+}
+
+#[test]
+fn validation_errors_escape_terminal_controls() {
+    let dir = tempfile::tempdir().unwrap();
+    for yaml in [
+        "workload:\n  workdir: \"bad\\e\\a\"\n",
+        "sudo: [\"apk\\e\\a add\"]\n",
+        "mounts: [{host: ., guest: \"bad\\e\\a\"}]\n",
+        "mounts: [{host: ., guest: \"/work\\e\\a\"}]\nvolumes: [{name: data, guest: \"/work\\e\\a\", size_mib: 1}]\n",
+    ] {
+        let error = format!(
+            "{:#}",
+            parse_recipe(yaml, dir.path(), Path::new("r.yaml")).unwrap_err()
+        );
+        assert!(!error.contains(['\x1b', '\x07']), "{error:?}");
+    }
+}
+
+#[test]
+fn mount_merge_keys_cannot_hide_writable_shares() {
+    assert!(
+        list_declared_writable_shares(
+            "mounts:\n  - <<: {host: ., guest: /work}\n",
+            Path::new("/project"),
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn invalid_env_lines_do_not_disclose_contents() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("secret"), "# comment\nsecret-token\x1b\n").unwrap();
+    let error = read_fully("env_file: secret", dir.path(), Path::new("r.yaml"))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("line 2"), "{error}");
+    assert!(!error.contains("secret-token"));
+    assert!(!error.contains('\x1b'));
+}
+
+#[test]
+fn volume_names_reject_windows_filename_metacharacters() {
+    for character in [':', '*', '?', '"', '<', '>', '|', '\0'] {
+        let name = format!("data{character}stream");
+        let mut cfg = Config::default();
+        cfg.volumes.push(Volume {
+            name,
+            guest: PathBuf::from("/data"),
+            size_mib: 64,
+        });
+        assert!(validate(&cfg).is_err());
+    }
 }

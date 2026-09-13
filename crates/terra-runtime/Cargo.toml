@@ -1,0 +1,56 @@
+[package]
+name = "terra-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+# The shipped device runtime only deserializes artifacts produced by the
+# trusted build. Keep Cranelift out of that dependency graph.
+compiler = ["wasmtime/cranelift"]
+thread-experiments = ["wasmtime/threads"]
+test-support = ["wasmtime/cranelift", "dep:terra-vsock-device", "dep:virtio-bindings"]
+
+[dependencies]
+terra-io = { path = "../terra-io" }
+terra-limits = { path = "../terra-limits" }
+terra-network = { path = "../terra-network" }
+log = "0.4.34"
+terra-vsock-device = { path = "../../components/vsock-device", optional = true }
+rustix = { workspace = true }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
+virtio-bindings = { version = "0.2.7", optional = true }
+wasmtime = { version = "=48.0.2", default-features = false, features = ["async", "component-model-async", "runtime", "std"] }
+wasmtime-wasi = { version = "=48.0.2", default-features = false, features = ["p3"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+vm-memory = { version = "0.18", features = ["backend-mmap"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Wdk_Storage_FileSystem", "Wdk_System_SystemServices", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Memory", "Win32_System_SystemInformation"] }
+
+[dev-dependencies]
+terra-protocol = { path = "../terra-protocol" }
+terra-vsock-device = { path = "../../components/vsock-device" }
+tempfile = { workspace = true }
+# Core-Wasm spike tests compile WAT and components; release builds do not.
+wasmtime = { version = "=48.0.2", default-features = false, features = ["cranelift", "wit-parser", "wat"] }
+
+[[test]]
+name = "shared_component_memory"
+required-features = ["thread-experiments"]
+
+[[test]]
+name = "shared_worker_memory"
+required-features = ["thread-experiments"]
+
+[[example]]
+name = "precompile-component"
+required-features = ["compiler"]
+
+[lints]
+workspace = true

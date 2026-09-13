@@ -1,12 +1,20 @@
 //! The agent's file port: one file transfer operation per connection.
 
-use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
-use terra_shared::contract::{
+use terra_protocol::{
     FileReply, FileRequest, MAX_FILE_BYTES, WORKLOAD_ID, encode_frame, read_frame,
 };
+
+fn open_directory(path: &Path) -> std::io::Result<std::fs::File> {
+    Ok(rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )?
+    .into())
+}
 
 struct PreparedPut {
     file: std::fs::File,
@@ -18,11 +26,10 @@ struct PreparedPut {
 fn generate_random_temp_name() -> std::io::Result<std::ffi::OsString> {
     let mut random = [0u8; 16];
     rustix::rand::getrandom(&mut random, rustix::rand::GetRandomFlags::empty())?;
-    let mut name = String::with_capacity(32);
-    for byte in random {
-        let _ = write!(name, "{byte:02x}");
-    }
-    Ok(std::ffi::OsString::from(format!(".terra-put-{name}")))
+    Ok(std::ffi::OsString::from(format!(
+        ".terra-put-{:032x}",
+        u128::from_le_bytes(random)
+    )))
 }
 
 fn create_put_temp(path: &Path) -> std::io::Result<PreparedPut> {
@@ -34,10 +41,7 @@ fn create_put_temp(path: &Path) -> std::io::Result<PreparedPut> {
         .file_name()
         .ok_or_else(|| std::io::Error::other("destination has no file name"))?
         .to_owned();
-    let parent = terra_shared::no_symlinks::open_no_symlinks(
-        parent_path,
-        terra_shared::no_symlinks::OpenMode::ReadDirectory,
-    )?;
+    let parent = open_directory(parent_path)?;
     let temp = generate_random_temp_name()?;
     let file = rustix::fs::openat(
         &parent,
@@ -53,12 +57,12 @@ fn create_put_temp(path: &Path) -> std::io::Result<PreparedPut> {
     })
 }
 
-fn prepare_put(path: &Path, workload_is_root: bool) -> std::io::Result<PreparedPut> {
+fn prepare_put(path: &Path) -> std::io::Result<PreparedPut> {
     match create_put_temp(path) {
         Ok(prepared) => Ok(prepared),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let parent = path.parent().unwrap_or(path);
-            ensure_directory(parent, !workload_is_root)?;
+            ensure_directory(parent, false)?;
             create_put_temp(path)
         }
         Err(error) => Err(error),
@@ -67,10 +71,7 @@ fn prepare_put(path: &Path, workload_is_root: bool) -> std::io::Result<PreparedP
 
 pub(crate) fn ensure_directory(path: &Path, give_to_workload: bool) -> std::io::Result<()> {
     use rustix::fs::{Mode, OFlags};
-    match terra_shared::no_symlinks::open_no_symlinks(
-        path,
-        terra_shared::no_symlinks::OpenMode::ReadDirectory,
-    ) {
+    match open_directory(path) {
         Ok(_) => return Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
@@ -78,10 +79,7 @@ pub(crate) fn ensure_directory(path: &Path, give_to_workload: bool) -> std::io::
     let mut missing = Vec::new();
     let mut parent = 'ancestors: {
         for ancestor in path.ancestors() {
-            match terra_shared::no_symlinks::open_no_symlinks(
-                ancestor,
-                terra_shared::no_symlinks::OpenMode::ReadDirectory,
-            ) {
+            match open_directory(ancestor) {
                 Ok(handle) => break 'ancestors handle,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     missing.push(ancestor.to_owned());
@@ -103,7 +101,7 @@ pub(crate) fn ensure_directory(path: &Path, give_to_workload: bool) -> std::io::
         parent = rustix::fs::openat(
             &parent,
             name,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
             Mode::empty(),
         )?
         .into();
@@ -119,10 +117,12 @@ pub(crate) fn ensure_directory(path: &Path, give_to_workload: bool) -> std::io::
 }
 
 fn open_regular_file(path: &str) -> std::io::Result<(std::fs::File, u32, u64)> {
-    let file = terra_shared::no_symlinks::open_no_symlinks(
-        Path::new(path),
-        terra_shared::no_symlinks::OpenMode::ReadNonblocking,
-    )?;
+    let file: std::fs::File = rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )?
+    .into();
     let meta = file.metadata()?;
     if meta.is_dir() {
         return Err(std::io::Error::other(
@@ -169,7 +169,7 @@ fn receive_put(
         parent,
         temp_name,
         destination_name,
-    } = match prepare_put(destination, workload_is_root) {
+    } = match prepare_put(destination) {
         Ok(prepared) => prepared,
         Err(error) => {
             discard_bytes(conn, size);
@@ -199,6 +199,7 @@ fn receive_put(
             .map_err(std::io::Error::from)?;
         }
         file.set_permissions(std::fs::Permissions::from_mode(mode & 0o777))?;
+        file.sync_all()?;
         drop(file);
         rustix::fs::renameat(&parent, &temp_name, &parent, &destination_name)
             .map_err(std::io::Error::from)
@@ -233,11 +234,10 @@ pub fn serve_file_op(mut conn: impl Read + Write, workload_is_root: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     fn run_file_operation(req: &FileRequest, body: &[u8]) -> (FileReply, Vec<u8>) {
-        let mut input = terra_shared::contract::encode_frame(req).unwrap();
+        let mut input = terra_protocol::encode_frame(req).unwrap();
         input.extend_from_slice(body);
         let mut conn = TestConn {
             input: std::io::Cursor::new(input),
@@ -245,9 +245,7 @@ mod tests {
         };
         serve_file_op(&mut conn, true);
         let mut output = std::io::Cursor::new(conn.output);
-        let rep: FileReply = terra_shared::contract::read_frame(&mut output)
-            .unwrap()
-            .unwrap();
+        let rep: FileReply = terra_protocol::read_frame(&mut output).unwrap().unwrap();
         let mut rest = Vec::new();
         std::io::Read::read_to_end(&mut output, &mut rest).unwrap();
         (rep, rest)
@@ -280,13 +278,27 @@ mod tests {
         }
     }
 
-    fn create_scratch_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("terra-agent-cp-{}-{name}", std::process::id()))
+    #[test]
+    fn get_follows_a_symlink_and_rejects_non_regular_files() {
+        let directory = crate::create_scratch_path("cp", "get-links");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory).unwrap();
+        let target = directory.join("file");
+        let link = directory.join("link");
+        std::fs::write(&target, b"contents").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let (mut file, _, size) = open_regular_file(link.to_str().unwrap()).unwrap();
+        let mut contents = String::new();
+        file.read_to_string(&mut contents).unwrap();
+        assert_eq!(contents, "contents");
+        assert_eq!(size, 8);
+        assert!(open_regular_file(directory.to_str().unwrap()).is_err());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
     fn put_then_get_round_trips_bytes_and_mode_without_special_bits() {
-        let path = create_scratch_path("roundtrip.bin");
+        let path = crate::create_scratch_path("cp", "roundtrip.bin");
         let payload = b"#!/bin/sh\necho hi\n";
 
         let (rep, _) = run_file_operation(
@@ -322,11 +334,34 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[test]
+    fn put_parents_keep_the_agents_owner() {
+        let directory = crate::create_scratch_path("cp", "put-root-owned-parents");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory).unwrap();
+        let destination = directory.join("etc/newdir/file");
+
+        let prepared = prepare_put(&destination).unwrap();
+        assert_eq!(
+            std::fs::metadata(directory.join("etc")).unwrap().uid(),
+            rustix::process::getuid().as_raw()
+        );
+        assert_eq!(
+            std::fs::metadata(directory.join("etc/newdir"))
+                .unwrap()
+                .uid(),
+            rustix::process::getuid().as_raw()
+        );
+
+        drop(prepared);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     /// Replacing a symlink must not write through to its target.
     #[test]
     fn put_replaces_a_symlink_without_following_it() {
-        let target = create_scratch_path("nofollow-target");
-        let link = create_scratch_path("nofollow-link");
+        let target = crate::create_scratch_path("cp", "nofollow-target");
+        let link = crate::create_scratch_path("cp", "nofollow-link");
         std::fs::write(&target, b"original").unwrap();
         let _ = std::fs::remove_file(&link);
         std::os::unix::fs::symlink(&target, &link).unwrap();
@@ -351,17 +386,10 @@ mod tests {
         let _ = std::fs::remove_file(&target);
     }
 
-    /// The variant that leaf-only `O_NOFOLLOW` misses, and the one that actually
-    /// escalates: the symlink is a *parent* of the destination, not the
-    /// destination. `~/out -> /` turns an ordinary
-    /// `terra dev put x /home/terri/out/y` into a root write at `/y`, which is
-    /// then handed to the workload user. Both spellings must be refused -
-    /// including the one where nothing needs creating, so `create_dir_all` is
-    /// never even reached.
     #[test]
-    fn put_refuses_a_symlinked_parent_directory() {
-        let real = create_scratch_path("parent-real");
-        let link = create_scratch_path("parent-link");
+    fn put_follows_a_symlinked_parent_directory() {
+        let real = crate::create_scratch_path("cp", "parent-real");
+        let link = crate::create_scratch_path("cp", "parent-link");
         let _ = std::fs::remove_dir_all(&real);
         let _ = std::fs::remove_file(&link);
         std::fs::create_dir_all(&real).unwrap();
@@ -376,14 +404,8 @@ mod tests {
             },
             b"EVIL!",
         );
-        assert!(
-            matches!(rep, FileReply::Err(_)),
-            "a symlinked parent must be refused"
-        );
-        assert!(
-            !real.join("landed.txt").exists(),
-            "the write landed on the far side of the link"
-        );
+        assert!(matches!(rep, FileReply::Put));
+        assert_eq!(std::fs::read(real.join("landed.txt")).unwrap(), b"EVIL!");
 
         let nested = link.join("sub/landed.txt");
         let (rep, _) = run_file_operation(
@@ -394,13 +416,10 @@ mod tests {
             },
             b"EVIL!",
         );
-        assert!(
-            matches!(rep, FileReply::Err(_)),
-            "a symlinked parent must be refused"
-        );
-        assert!(
-            !real.join("sub").exists(),
-            "directories were created through it"
+        assert!(matches!(rep, FileReply::Put));
+        assert_eq!(
+            std::fs::read(real.join("sub/landed.txt")).unwrap(),
+            b"EVIL!"
         );
 
         let ok = real.join("fine/ok.txt");
@@ -422,8 +441,8 @@ mod tests {
     /// Replacing a hard-linked destination must not overwrite the linked inode.
     #[test]
     fn put_replaces_a_hard_link_without_overwriting_the_inode() {
-        let target = create_scratch_path("hardlink-target");
-        let dest = create_scratch_path("hardlink-dest");
+        let target = crate::create_scratch_path("cp", "hardlink-target");
+        let dest = crate::create_scratch_path("cp", "hardlink-dest");
         let _ = std::fs::remove_file(&target);
         let _ = std::fs::remove_file(&dest);
         std::fs::write(&target, b"original").unwrap();
@@ -460,7 +479,7 @@ mod tests {
 
     #[test]
     fn short_put_keeps_the_original_destination() {
-        let path = create_scratch_path("short.bin");
+        let path = crate::create_scratch_path("cp", "short.bin");
         std::fs::write(&path, b"original").unwrap();
 
         let (rep, _) = run_file_operation(
@@ -478,7 +497,7 @@ mod tests {
 
     #[test]
     fn put_creates_missing_parent_directories() {
-        let dir = create_scratch_path("nested");
+        let dir = crate::create_scratch_path("cp", "nested");
         let path = dir.join("a/b/file.txt");
         let (rep, _) = run_file_operation(
             &FileRequest::Put {
@@ -505,7 +524,7 @@ mod tests {
     fn errors_come_back_as_replies() {
         let (rep, bytes) = run_file_operation(
             &FileRequest::Get {
-                path: create_scratch_path("missing")
+                path: crate::create_scratch_path("cp", "missing")
                     .to_string_lossy()
                     .into_owned(),
             },
