@@ -149,6 +149,16 @@ fn host_interface_addresses_need_an_explicit_address_rule() {
     assert!(!allowed.allows(address, Some(80)));
 }
 
+/// A host address is read as an address or the policy refuses to build: a typo
+/// must not silently become an address that no `allow:` rule can open and no
+/// answer is floored against.
+#[test]
+fn a_host_address_that_is_not_an_address_is_refused_not_ignored() {
+    let mut network = build_network(NetworkMode::Allowlist, &[]);
+    network.host_addresses = vec!["not-an-address".into()];
+    assert_eq!(format_build_error(&network), "invalid host address");
+}
+
 #[test]
 fn nat64_cannot_reach_a_host_interface_address() {
     let address: IpAddr = "1.1.1.1".parse().unwrap();

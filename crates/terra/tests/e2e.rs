@@ -867,7 +867,7 @@ fn show_answers_from_the_pinned_recipe_not_the_source_it_came_from() {
         "{}",
         String::from_utf8_lossy(&made.stderr)
     );
-    std::fs::write(&source, "hw:\n  cpus: 9\n").unwrap();
+    std::fs::write(&source, "hw:\n  cpus: 4\n").unwrap();
 
     // By name, and with no name at all - the directory's only box.
     for args in [&["dev", "show"][..], &["show"]] {
@@ -884,7 +884,7 @@ fn show_answers_from_the_pinned_recipe_not_the_source_it_came_from() {
     // The file itself is still readable as a file.
     let by_path = run_terra_in(dir.path(), home.path(), &["~/.terra/dev.yaml", "show"]);
     assert!(
-        String::from_utf8_lossy(&by_path.stdout).contains("cpus: 9"),
+        String::from_utf8_lossy(&by_path.stdout).contains("cpus: 4"),
         "{}",
         String::from_utf8_lossy(&by_path.stdout)
     );
