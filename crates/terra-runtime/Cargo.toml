@@ -21,6 +21,7 @@ terra-network = { path = "../terra-network" }
 log = "0.4.34"
 terra-vsock-device = { path = "../../components/vsock-device", optional = true }
 rustix = { workspace = true }
+target-lexicon = "0.13"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 virtio-bindings = { version = "0.2.7", optional = true }
 wasmtime = { version = "=48.0.2", default-features = false, features = ["async", "component-model-async", "runtime", "std"] }

@@ -25,7 +25,7 @@ TERRA_TARGET ?= $(MUSL)
 # `mke2fs` runs while producing the guest image, so it targets the Linux build
 # machine rather than the guest. This lets an x86_64 Linux builder prepare the
 # aarch64 guest payload used by macOS and Windows ARM64 releases.
-BUILD_ARCH ?= $(shell uname -m)
+BUILD_ARCH ?= $(shell uname -m | sed 's/^arm64$$/aarch64/')
 MKE2FS_CC_x86_64 := scripts/zig-musl-cc
 MKE2FS_CC_aarch64 := scripts/zig-musl-cc-aarch64
 MKE2FS_CC := $(MKE2FS_CC_$(BUILD_ARCH))
@@ -97,9 +97,9 @@ KERNEL_INPUTS := $(BUILD)/.kernel-inputs
 KERNEL_PATCH_STAMP := $(KERNEL_SOURCE)/.terra-patches
 KERNEL_JOBS ?= $(shell nproc)
 KERNEL_CC_x86_64 := gcc
-KERNEL_CC_aarch64 := aarch64-linux-gnu-gcc
+KERNEL_CC_aarch64 := $(if $(filter aarch64,$(BUILD_ARCH)),gcc,aarch64-linux-gnu-gcc)
 KERNEL_CC ?= $(KERNEL_CC_$(ARCH))
-KERNEL_CROSS_aarch64 := aarch64-linux-gnu-
+KERNEL_CROSS_aarch64 := $(if $(filter aarch64,$(BUILD_ARCH)),,aarch64-linux-gnu-)
 KERNEL_MAKE := scripts/kernel-container.sh $(MAKE) --no-print-directory -C $(KERNEL_SOURCE) O=$(abspath $(KERNEL_OUTPUT)) \
 	ARCH=$(KERNEL_ARCH) CC="$(KERNEL_CC)" CROSS_COMPILE=$(KERNEL_CROSS_$(ARCH)) KBUILD_BUILD_USER=terra KBUILD_BUILD_HOST=terra \
 	KBUILD_BUILD_VERSION=1 KBUILD_BUILD_TIMESTAMP='2026-09-09 00:00:00 UTC'

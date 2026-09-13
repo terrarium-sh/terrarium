@@ -1762,6 +1762,7 @@ dependencies = [
  "libc",
  "log",
  "rustix",
+ "target-lexicon",
  "tempfile",
  "terra-io",
  "terra-limits",

@@ -71,8 +71,9 @@ Terra does not ship a general-purpose module tree. Packages requiring other
 kernel drivers need a built-in equivalent.
 
 The pinned [kernel container](kernel/Containerfile) supplies the build tools and
-AArch64 cross compiler. Its wrapper mounts the repository read-only and `build/`
-writable, and disables network access during compilation.
+the AArch64 compiler, native on AArch64 hosts and cross on x86_64. Its wrapper
+mounts the repository read-only and `build/` writable, and disables network
+access during compilation.
 
 ```sh
 make kernel
