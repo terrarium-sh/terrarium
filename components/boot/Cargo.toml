@@ -26,7 +26,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 vm-fdt = { version = "0.3", default-features = false, features = ["alloc"] }
-wit-bindgen = "=0.61.1"
+wit-bindgen = "=0.62.0"
 terra-limits = { path = "../../crates/terra-limits" }
 
 [profile.release]
