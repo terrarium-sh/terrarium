@@ -716,7 +716,7 @@ fn shutdown_write(stream: &WriteHalf) {
     let _ = stream.shutdown(std::net::Shutdown::Write);
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::component::vsock::host::terra::vsock::host_service::{
@@ -727,7 +727,11 @@ mod tests {
     #[tokio::test]
     async fn endpoint_claims_are_single_use_and_stream_leases_hold_client_capacity() {
         let live_clients = Arc::new(AtomicUsize::new(1));
-        let (stream, _) = LocalStream::pair().expect("local stream pair");
+        let root = tempfile::tempdir().expect("socket directory");
+        let path = root.path().join("socket");
+        let listener = LocalListener::bind(&path).expect("listener");
+        let stream = LocalStream::connect(&path).expect("client");
+        let (_peer, _) = listener.accept().expect("peer");
         let state = client_state(stream, Arc::new(ClientLease(Arc::clone(&live_clients))))
             .expect("client state");
         let mut service = VsockHostService {
@@ -751,7 +755,11 @@ mod tests {
     #[tokio::test]
     async fn repeated_host_stream_claims_trap_before_allocating_a_transmit() {
         let live_clients = Arc::new(AtomicUsize::new(1));
-        let (stream, _) = LocalStream::pair().expect("local stream pair");
+        let root = tempfile::tempdir().expect("socket directory");
+        let path = root.path().join("socket");
+        let listener = LocalListener::bind(&path).expect("listener");
+        let stream = LocalStream::connect(&path).expect("client");
+        let (_peer, _) = listener.accept().expect("peer");
         let state = client_state(stream, Arc::new(ClientLease(Arc::clone(&live_clients))))
             .expect("client state");
         let mut service = VsockHostService {

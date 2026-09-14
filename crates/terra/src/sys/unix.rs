@@ -361,7 +361,7 @@ pub fn is_host_root() -> bool {
     rustix::process::getuid().as_raw() == 0
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::sys::SignalResult;
@@ -457,6 +457,7 @@ mod tests {
     /// The starttime field is counted from the end of the comm field, which
     /// the kernel pads with whatever the process's name made of it - spaces
     /// included.
+    #[cfg(target_os = "linux")]
     #[test]
     fn process_start_time_reads_field_22_wherever_the_comm_ends() {
         let mut child = Command::new("sleep").arg("30").spawn().unwrap();

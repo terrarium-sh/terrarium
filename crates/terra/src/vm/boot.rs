@@ -470,18 +470,16 @@ mod tests {
     /// A child that *did* claim the box first is the other case: a workload
     /// fast enough to finish inside the window, where "started" is the honest
     /// answer whatever it exited with.
-    #[cfg(unix)]
     #[test]
     fn a_detached_child_that_never_claimed_the_box_is_a_failed_start() {
         let dir = tempfile::tempdir().unwrap();
         let bx = BoxRef::from_state_dir(dir.path().join("dev"), dir.path());
         std::fs::create_dir_all(bx.get_dir()).unwrap();
-        let exited_with = |code: i32| {
-            std::process::Command::new("/bin/sh")
-                .arg("-c")
-                .arg(format!("exit {code}"))
-                .status()
-                .unwrap()
+        let exited_with = |code: u8| {
+            use std::io::Write as _;
+            let mut child = sys::build_test_child_command().spawn().unwrap();
+            child.stdin.take().unwrap().write_all(&[code]).unwrap();
+            child.wait().unwrap()
         };
 
         // Never claimed: the child's own status, failure and all.
@@ -490,12 +488,15 @@ mod tests {
 
         // A child a host signal took has no code of its own: the shell's
         // 128+signal spelling, not a bare 1 that reads as the workload's.
-        let killed = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg("kill -KILL $$")
-            .status()
-            .unwrap();
-        assert_eq!(compute_detached_exit_byte(&bx, 4242, killed), 128 + 9);
+        #[cfg(unix)]
+        {
+            let killed = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg("kill -KILL $$")
+                .status()
+                .unwrap();
+            assert_eq!(compute_detached_exit_byte(&bx, 4242, killed), 128 + 9);
+        }
 
         // Claimed, then finished - a fast workload, reported as started.
         let lock = bx.lock_run().unwrap();

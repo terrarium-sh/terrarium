@@ -242,7 +242,6 @@ mod tests {
     }
 
     /// A guest can replace a nested share with a symlink between boots.
-    #[cfg(unix)]
     #[test]
     fn boot_refuses_a_share_redirected_into_box_state() {
         let dir = tempfile::tempdir().unwrap();
@@ -268,11 +267,11 @@ mod tests {
         };
         assert!(shares(&spec).is_ok());
         std::fs::remove_dir(&share).unwrap();
-        std::os::unix::fs::symlink(bx.get_dir(), &share).unwrap();
+        crate::sys::symlink_dir(bx.get_dir(), &share).unwrap();
         let error = shares(&spec).err().unwrap().to_string();
         assert!(error.contains("opening share"), "{error}");
 
-        std::fs::remove_file(&share).unwrap();
+        crate::sys::remove_directory_symlink(&share).unwrap();
         std::fs::create_dir(&share).unwrap();
         let child = share.join("child");
         std::fs::create_dir(&child).unwrap();
@@ -281,7 +280,7 @@ mod tests {
         assert!(shares(&spec).is_ok());
         std::fs::remove_dir_all(&share).unwrap();
         std::fs::create_dir(bx.get_dir().join("child")).unwrap();
-        std::os::unix::fs::symlink(bx.get_dir(), &share).unwrap();
+        crate::sys::symlink_dir(bx.get_dir(), &share).unwrap();
         assert!(shares(&spec).is_err());
     }
 

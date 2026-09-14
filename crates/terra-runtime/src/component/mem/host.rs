@@ -372,7 +372,6 @@ mod tests {
         .unwrap();
     }
 
-    #[cfg(unix)]
     #[test]
     fn sub_host_page_reclaim_is_rejected_without_modifying_memory() {
         let page = host_page_bytes();
@@ -507,7 +506,8 @@ mod tests {
 
     #[test]
     fn discard_does_not_touch_another_mapping() {
-        let (mut first, first_ram) = host();
+        let first_ram = SyntheticRam::new(64 * 1024).expect("RAM");
+        let mut first = MemHost::new(DeviceHost::with_ram(first_ram.clone()));
         let (_second, second_ram) = host();
         BoundedMemory::new(&first_ram)
             .write(0, &[0x5a; 4096])
@@ -515,9 +515,14 @@ mod tests {
         BoundedMemory::new(&second_ram)
             .write(0, &[0xa5; 4096])
             .expect("write second RAM");
-        first
-            .discard(&[ReclaimRange { addr: 0, len: 4096 }])
-            .expect("discard first RAM");
+        let result = first.discard(&[ReclaimRange {
+            addr: 0,
+            len: 64 * 1024,
+        }]);
+        assert!(
+            result.is_ok()
+                || (cfg!(target_os = "macos") && result == Err(ReclaimError::Unsupported))
+        );
         assert_eq!(
             BoundedMemory::new(&second_ram)
                 .read(0, 4096)

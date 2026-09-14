@@ -620,7 +620,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_changed_pinned_target_needs_setup_before_any_source_can_boot_it() {
         for changed_env_file in [false, true] {
@@ -634,8 +633,8 @@ mod tests {
             std::fs::create_dir_all(private.join("share")).unwrap();
             std::fs::write(safe.join("env"), "A=safe\n").unwrap();
             std::fs::write(private.join("env"), "A=private\n").unwrap();
-            std::os::unix::fs::symlink(safe.join("share"), project.join("share")).unwrap();
-            std::os::unix::fs::symlink(safe.join("env"), project.join("env")).unwrap();
+            crate::sys::symlink_dir(safe.join("share"), project.join("share")).unwrap();
+            crate::sys::symlink_file(safe.join("env"), project.join("env")).unwrap();
             let recipe_text =
                 "mounts:\n  - {host: ./share, guest: /work}\nenv_file: ./env\n".to_string();
             let bx = BoxRef::resolve(&project, "dev").unwrap();
@@ -660,13 +659,21 @@ mod tests {
             prepare_box(&approved, Rebuild::No).unwrap();
 
             let path = if changed_env_file { "env" } else { "share" };
-            std::fs::remove_file(project.join(path)).unwrap();
+            if changed_env_file {
+                std::fs::remove_file(project.join(path)).unwrap();
+            } else {
+                crate::sys::remove_directory_symlink(project.join(path)).unwrap();
+            }
             let replacement = if changed_env_file {
                 private.join("env")
             } else {
                 private.join("share")
             };
-            std::os::unix::fs::symlink(replacement, project.join(path)).unwrap();
+            if changed_env_file {
+                crate::sys::symlink_file(replacement, project.join(path)).unwrap();
+            } else {
+                crate::sys::symlink_dir(replacement, project.join(path)).unwrap();
+            }
 
             for source in [resolve::Source::Pinned, resolve::Source::File(recipe())] {
                 let error = request_recipe_approval(

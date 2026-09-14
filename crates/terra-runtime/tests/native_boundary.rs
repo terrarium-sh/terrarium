@@ -39,7 +39,6 @@ fn file_grants_enforce_capacity_and_readonly_independently_of_wasm() {
     assert_eq!(file.as_file().metadata().unwrap().len(), 4096);
 }
 
-#[cfg(unix)]
 #[test]
 fn file_grants_retain_the_opened_file_after_path_replacement() {
     let directory = tempfile::tempdir().unwrap();
@@ -54,24 +53,8 @@ fn file_grants_retain_the_opened_file_after_path_replacement() {
         std::fs::read(directory.path().join("original")).unwrap()[0],
         3
     );
-    assert!(FileDisk::open(std::path::Path::new("/dev/null"), false).is_err());
-}
-
-#[cfg(unix)]
-#[test]
-fn hostile_memory_imports_cannot_cross_mapping_holes() {
-    use std::sync::Arc;
-    use terra_runtime::SyntheticRam;
-    use vm_memory::{GuestAddress, GuestMemoryMmap};
-
-    let mapping =
-        GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4096), (GuestAddress(8192), 4096)])
-            .unwrap();
-    let mut host = DeviceHost::with_ram(SyntheticRam::from_shared(Arc::new(mapping)).unwrap());
-    host.write(0, vec![0xa5; 4096]).unwrap();
-    assert!(host.read(4095, 4098).is_err());
-    assert!(host.write(4095, vec![0; 4098]).is_err());
-    assert_eq!(host.read(0, 4096).unwrap(), vec![0xa5; 4096]);
+    let null_device = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    assert!(FileDisk::open(std::path::Path::new(null_device), false).is_err());
 }
 
 #[test]

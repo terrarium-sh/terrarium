@@ -472,14 +472,13 @@ mod tests {
     /// the protected path has to resolve as far as it can - otherwise a
     /// symlinked home would be compared under its unresolved spelling and
     /// slip past.
-    #[cfg(unix)]
     #[test]
     fn a_protected_path_that_is_not_there_yet_resolves_the_parent_it_does_have() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("real-home");
         std::fs::create_dir_all(&home).unwrap();
         let linked = dir.path().join("home");
-        std::os::unix::fs::symlink(&home, &linked).unwrap();
+        crate::sys::symlink_dir(&home, &linked).unwrap();
 
         let resolved = std::fs::canonicalize(&home).unwrap();
         assert_eq!(
@@ -507,12 +506,11 @@ mod tests {
     }
 
     /// A symlink is the same share by another name: compared after resolution.
-    #[cfg(unix)]
     #[test]
     fn a_symlink_to_a_protected_path_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let link = dir.path().join("innocent");
-        std::os::unix::fs::symlink(std::env::current_exe().unwrap(), &link).unwrap();
+        crate::sys::symlink_file(std::env::current_exe().unwrap(), &link).unwrap();
         let err = validate_mounts_against_terra_paths(
             &build_mounts(&link, false),
             &resolve_box_ref(dir.path()),
@@ -535,7 +533,6 @@ mod tests {
         assert!(!error.contains(['\x1b', '\x07']), "{error:?}");
     }
 
-    #[cfg(unix)]
     #[test]
     fn changed_mount_and_env_file_targets_are_refused() {
         let _home = crate::sys::TestHome::new();
@@ -548,8 +545,8 @@ mod tests {
         std::fs::create_dir_all(&private).unwrap();
         std::fs::write(safe.join("env"), "A=safe\n").unwrap();
         std::fs::write(private.join("env"), "A=private\n").unwrap();
-        std::os::unix::fs::symlink(&safe, project.join("share")).unwrap();
-        std::os::unix::fs::symlink(safe.join("env"), project.join("env")).unwrap();
+        crate::sys::symlink_dir(&safe, project.join("share")).unwrap();
+        crate::sys::symlink_file(safe.join("env"), project.join("env")).unwrap();
         let bx = resolve_box_ref(&project);
         std::fs::create_dir_all(bx.get_dir()).unwrap();
 
@@ -567,10 +564,10 @@ mod tests {
         )
         .unwrap();
 
-        std::fs::remove_file(project.join("share")).unwrap();
-        std::os::unix::fs::symlink(&private, project.join("share")).unwrap();
+        crate::sys::remove_directory_symlink(project.join("share")).unwrap();
+        crate::sys::symlink_dir(&private, project.join("share")).unwrap();
         std::fs::remove_file(project.join("env")).unwrap();
-        std::os::unix::fs::symlink(private.join("env"), project.join("env")).unwrap();
+        crate::sys::symlink_file(private.join("env"), project.join("env")).unwrap();
         let mut changed = config();
         changed.mounts = resolve_mounts(&changed, &bx).unwrap();
         config::resolve_env_file(&mut changed).unwrap();

@@ -1,4 +1,7 @@
-use std::os::unix::fs::{MetadataExt as _, symlink};
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt as _, symlink as symlink_dir, symlink as symlink_file};
+#[cfg(windows)]
+use std::os::windows::fs::{symlink_dir, symlink_file};
 
 use wasmtime::component::Resource;
 use wasmtime_wasi::{
@@ -26,7 +29,7 @@ fn mount_source_requires_a_directory_without_a_leaf_symlink() {
     let directory = base.join("directory");
     std::fs::create_dir(&directory).unwrap();
     let link = base.join("link");
-    symlink(&directory, &link).unwrap();
+    symlink_dir(&directory, &link).unwrap();
     assert!(ShareGrant::new(&directory, true).is_ok());
     assert!(ShareGrant::new(&link, true).is_err());
     let file = base.join("file");
@@ -44,16 +47,18 @@ fn mount_source_rejects_a_symlinked_ancestor() {
     std::fs::create_dir_all(private_parent.join("share")).unwrap();
     let expected = expected_parent.join("share");
     std::fs::rename(&expected_parent, base.join("moved")).unwrap();
-    symlink(&private_parent, &expected_parent).unwrap();
+    symlink_dir(&private_parent, &expected_parent).unwrap();
     assert!(ShareGrant::new(&expected, false).is_err());
 }
 
-#[test]
-fn preopen_retains_its_directory_and_rights_without_ambient_resources() {
+#[tokio::test]
+async fn preopen_retains_its_directory_and_rights_without_ambient_resources() {
     let root = tempfile::tempdir().unwrap();
     let base = std::fs::canonicalize(root.path()).unwrap();
     let original = base.join("grant");
     std::fs::create_dir(&original).unwrap();
+    std::fs::write(original.join("retained"), b"original").unwrap();
+    #[cfg(unix)]
     let inode = std::fs::metadata(&original).unwrap().ino();
     let grant = ShareGrant::new(&original, true).unwrap();
     std::fs::rename(&original, base.join("moved")).unwrap();
@@ -66,17 +71,44 @@ fn preopen_retains_its_directory_and_rights_without_ambient_resources() {
     let Descriptor::Dir(directory) = view.table.get(&directories[0].0).unwrap() else {
         panic!("preopen must be a directory")
     };
+    #[cfg(unix)]
     assert_eq!(directory.dir.metadata().unwrap().ino(), inode);
     assert_eq!(directory.perms, FsPerms::ReadOnly);
-    view.table.set_max_capacity(1);
+    fs.ctx().table.set_max_capacity(1);
     assert!(fs.get_directories().is_err());
     fs.ctx()
         .table
         .delete(directories.into_iter().next().unwrap().0)
         .unwrap();
-    assert_eq!(fs.get_directories().unwrap().len(), 1);
+    let directories = fs.get_directories().unwrap();
+    assert_eq!(directories.len(), 1);
     let mut empty = DeviceHost::new(4096).unwrap();
     assert!(empty.filesystem().get_directories().unwrap().is_empty());
+    fs.ctx().table.set_max_capacity(2);
+    let engine = crate::engine::device_engine().unwrap();
+    let mut store = wasmtime::Store::new(&engine, fs);
+    let opened = store
+        .run_concurrent(async |accessor| {
+            let access = accessor.with_getter::<WasiFilesystem>(WasiFilesystemView::filesystem);
+            WasiFilesystem::open_at(
+                &access,
+                Resource::new_borrow(directories[0].0.rep()),
+                PathFlags::empty(),
+                "retained".into(),
+                OpenFlags::empty(),
+                DescriptorFlags::READ,
+            )
+            .await
+            .unwrap()
+            .rep()
+        })
+        .await
+        .unwrap();
+    let mut fs = store.into_data();
+    fs.ctx()
+        .table
+        .delete(Resource::<Descriptor>::new_own(opened))
+        .unwrap();
 }
 
 #[tokio::test]
@@ -88,7 +120,7 @@ async fn wasi_itself_denies_escape_and_readonly_mutation() {
     let mounted = base.join("mounted");
     std::fs::create_dir(&mounted).unwrap();
     std::fs::write(mounted.join("file"), b"original").unwrap();
-    symlink("../secret", mounted.join("escape")).unwrap();
+    symlink_file("../secret", mounted.join("escape")).unwrap();
     let engine = crate::engine::device_engine().unwrap();
     for readonly in [false, true] {
         let mut fs = host(ShareGrant::new(&mounted, readonly).unwrap());
@@ -248,8 +280,25 @@ async fn mode_capability_changes_writable_files_and_rejects_readonly_files() {
         let result = store
             .data_mut()
             .set_mode_for_descriptor(Resource::new_borrow(descriptor), 0o7600);
-        assert_eq!(result.is_ok(), !readonly);
-        if !readonly {
+        assert_eq!(result.is_ok(), !readonly && cfg!(unix));
+        #[cfg(windows)]
+        assert_eq!(
+            result,
+            Err(if readonly {
+                crate::component::fs::host::terra::fs::host::Error::Access
+            } else {
+                crate::component::fs::host::terra::fs::host::Error::Unsupported
+            })
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            store
+                .data_mut()
+                .mode_for_descriptor(Resource::new_borrow(descriptor))
+                .unwrap(),
+            None
+        );
+        if !readonly && cfg!(unix) {
             assert_eq!(
                 store
                     .data_mut()

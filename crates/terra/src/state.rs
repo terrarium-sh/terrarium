@@ -534,14 +534,13 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn missing_project_under_a_symlink_keeps_the_same_slug() {
         let directory = tempfile::tempdir().unwrap();
         let real = directory.path().join("real");
         let link = directory.path().join("link");
         std::fs::create_dir(&real).unwrap();
-        std::os::unix::fs::symlink(&real, &link).unwrap();
+        crate::sys::symlink_dir(&real, &link).unwrap();
         assert_eq!(
             compute_slug(&real.join("missing")),
             compute_slug(&link.join("missing"))
@@ -613,14 +612,29 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn distinct_non_utf8_project_paths_have_distinct_slugs() {
         use std::ffi::OsString;
-        use std::os::unix::ffi::OsStringExt;
-
-        let first = PathBuf::from(OsString::from_vec(b"/tmp/project-\x80".to_vec()));
-        let second = PathBuf::from(OsString::from_vec(b"/tmp/project-\x81".to_vec()));
+        #[cfg(unix)]
+        let names = {
+            use std::os::unix::ffi::OsStringExt as _;
+            [
+                OsString::from_vec(vec![0x80]),
+                OsString::from_vec(vec![0x81]),
+            ]
+        };
+        #[cfg(windows)]
+        let names = {
+            use std::os::windows::ffi::OsStringExt as _;
+            [
+                OsString::from_wide(&[0xd800]),
+                OsString::from_wide(&[0xd801]),
+            ]
+        };
+        let root = tempfile::tempdir().unwrap();
+        let [first, second] = names.map(|name| root.path().join(name));
+        assert!(first.to_str().is_none());
+        assert!(second.to_str().is_none());
         assert_ne!(compute_slug(&first), compute_slug(&second));
     }
 
@@ -760,16 +774,11 @@ mod tests {
         let real = dir.path().join("project");
         std::fs::create_dir(&real).unwrap();
         let link = dir.path().join("link");
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(&real, &link).unwrap();
-            assert_eq!(
-                resolve_box_ref(&real).get_dir(),
-                resolve_box_ref(&link).get_dir()
-            );
-        }
-        #[cfg(not(unix))]
-        let _ = link;
+        crate::sys::symlink_dir(&real, &link).unwrap();
+        assert_eq!(
+            resolve_box_ref(&real).get_dir(),
+            resolve_box_ref(&link).get_dir()
+        );
     }
 
     #[test]
@@ -1107,9 +1116,9 @@ mod tests {
     /// is held on its inode, and a replacement file would hand the next
     /// opener a fresh, unlocked inode while the box stayed locked on the old
     /// one.
-    #[cfg(unix)]
     #[test]
-    fn publishing_a_pid_keeps_the_lock_file_s_inode() {
+    fn publishing_a_pid_preserves_the_held_lock() {
+        #[cfg(unix)]
         use std::os::unix::fs::MetadataExt;
         const ABSENT_PID: u32 = u32::MAX;
         let _home = TestHome::new();
@@ -1119,15 +1128,18 @@ mod tests {
         let held = b.lock_run().unwrap();
 
         b.publish_pid(&held, ABSENT_PID, false);
+        #[cfg(unix)]
         let identity = |p: &Path| {
             let meta = std::fs::metadata(p).unwrap();
             (meta.dev(), meta.ino())
         };
+        #[cfg(unix)]
         let before = identity(&b.get_dir().join(PID_FILE));
 
         // Longer, then shorter than what it replaced - no tail may survive.
         b.publish_pid(&held, u32::MAX - 1, true);
         b.publish_pid(&held, ABSENT_PID, false);
+        #[cfg(unix)]
         assert_eq!(
             identity(&b.get_dir().join(PID_FILE)),
             before,

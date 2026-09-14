@@ -846,7 +846,6 @@ mod tests {
         import(&into, &artifact).unwrap();
     }
 
-    #[cfg(unix)]
     #[test]
     fn export_replaces_a_symlink_destination() {
         let dir = tempfile::tempdir().unwrap();
@@ -855,14 +854,13 @@ mod tests {
         let sentinel = dir.path().join("sentinel");
         let destination = dir.path().join("export");
         std::fs::write(&sentinel, b"keep me").unwrap();
-        std::os::unix::fs::symlink(&sentinel, &destination).unwrap();
+        crate::sys::symlink_file(&sentinel, &destination).unwrap();
 
         export(&bx, &destination).unwrap();
         assert!(std::fs::symlink_metadata(&destination).unwrap().is_file());
         assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep me");
     }
 
-    #[cfg(unix)]
     #[test]
     fn export_follows_a_symlinked_destination_parent() {
         let dir = tempfile::tempdir().unwrap();
@@ -871,7 +869,7 @@ mod tests {
         let real_parent = dir.path().join("real");
         let linked_parent = dir.path().join("linked");
         std::fs::create_dir(&real_parent).unwrap();
-        std::os::unix::fs::symlink(&real_parent, &linked_parent).unwrap();
+        crate::sys::symlink_dir(&real_parent, &linked_parent).unwrap();
 
         export(&bx, &linked_parent.join("export.terra")).unwrap();
         assert!(real_parent.join("export.terra").is_file());

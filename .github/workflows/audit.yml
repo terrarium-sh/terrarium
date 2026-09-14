@@ -2,28 +2,41 @@
 name: Security audit
 
 on:
-  # schedule:
-  #   - cron: '23 4 * * 1'
-  # push:
-  #   paths:
-  #     - '**/Cargo.lock'
-  #     - '**/Cargo.toml'
+  schedule:
+    - cron: '23 4 * * 1'
+  push:
+    branches: [main]
+    paths:
+      - '**/Cargo.lock'
+      - '**/Cargo.toml'
+      - .github/workflows/audit.yml
+  pull_request:
+    paths:
+      - '**/Cargo.lock'
+      - '**/Cargo.toml'
+      - .github/workflows/audit.yml
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   cargo-audit:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          cache-targets: false
+          cache-on-failure: true
       - run: cargo install cargo-audit --version 0.22.0 --locked
       - run: |
-          find . -name Cargo.lock -print0 | while IFS= read -r -d '' lockfile; do
+          git ls-files -z -- Cargo.lock '*/Cargo.lock' | while IFS= read -r -d '' lockfile; do
             cargo audit --file "$lockfile"
           done

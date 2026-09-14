@@ -106,6 +106,14 @@ rebuilding historical releases.
 
 ## Verification
 
+Build CI runs `verify-source → guest-assets → native host builds`. The first gate
+checks formatting, WIT links, tool pins, and build scripts without guest images;
+Rust/component tests run in the host jobs against the staged guest assets.
+Build runs on pull requests and `main`; `v*` tags trigger releases for every
+platform. Release reuses the Build workflow, adds source archives, then publishes
+only after every build and check passes. Security audits run on dependency changes and weekly. Kernel changes
+run tooling checks; kernel archive export is available through manual dispatch.
+
 The [Linux amd64 acceptance report](docs/linux-amd64-acceptance.md) records the
 tested artifact, host, commands, and results for the 2026-09-13 review.
 
@@ -124,6 +132,9 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace
 ```
 
+Windows tests run symlink fixtures by default. Enable Developer Mode or grant
+the account permission to create symbolic links before running the suite.
+
 Real Linux guest gates require `/dev/kvm`:
 
 ```sh
@@ -138,17 +149,17 @@ ordinary workspace test pass. CI runs Linux VM gates when KVM is available;
 see the [build workflow](.github/workflows/build.yml) for exact conditions.
 
 macOS and Windows have an opt-in `native_vm_tests` workflow input. After a native
-host build (and signing on macOS), run:
+host build (and signing on macOS), install Zig 0.16.0 for the guest probes and run:
 
 ```sh
-TERRA_BIN="$PWD/dist/terra" cargo test --locked -p terra --test native_boot -- --ignored --nocapture
+TERRA_BIN="$PWD/dist/terra" cargo test --locked -p terra --test native_boot --test boot --test memory -- --ignored --test-threads=1 --nocapture
 ```
 
 On Windows PowerShell:
 
 ```powershell
 $env:TERRA_BIN = (Resolve-Path ./dist/terra.exe).Path
-cargo test --locked -p terra --test native_boot -- --ignored --nocapture
+cargo test --locked -p terra --test native_boot --test boot --test memory -- --ignored --test-threads=1 --nocapture
 ```
 
 Those gates cover guest CPUs, hooks, writable/read-only mounts, granted networking,

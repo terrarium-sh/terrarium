@@ -449,14 +449,13 @@ mod tests {
         assert!(metadata.blocks() * 512 < metadata.len());
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_get_follows_symlink_destination_or_parent() {
         let dir = tempfile::tempdir().unwrap();
         let redirected = dir.path().join("redirected");
         std::fs::write(&redirected, b"unchanged").unwrap();
         let symlink_destination = dir.path().join("destination");
-        std::os::unix::fs::symlink(&redirected, &symlink_destination).unwrap();
+        crate::sys::symlink_file(&redirected, &symlink_destination).unwrap();
 
         assert!(
             fetch_file_from_box(
@@ -472,7 +471,7 @@ mod tests {
         let real_parent = dir.path().join("real");
         std::fs::create_dir(&real_parent).unwrap();
         let symlink_parent = dir.path().join("linked");
-        std::os::unix::fs::symlink(&real_parent, &symlink_parent).unwrap();
+        crate::sys::symlink_dir(&real_parent, &symlink_parent).unwrap();
         let destination = symlink_parent.join("out");
 
         assert!(

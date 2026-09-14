@@ -1,5 +1,9 @@
 #![allow(clippy::expect_used)]
 
+#[cfg(unix)]
+use std::os::unix::fs::symlink as symlink_file;
+#[cfg(windows)]
+use std::os::windows::fs::symlink_file;
 use std::sync::Arc;
 
 use terra_runtime::{
@@ -252,12 +256,10 @@ fn dirents(reply: &[u8]) -> Vec<(u64, String)> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(unix)]
 #[allow(clippy::too_many_lines)]
 async fn wasm_filesystem_component_serves_files_through_standard_wasi() {
     let root = tempfile::tempdir().expect("tempdir");
     std::fs::write(root.path().join("visible"), b"data").expect("fixture");
-    std::os::unix::fs::symlink("visible", root.path().join("link")).expect("symlink fixture");
     let Mounted {
         channel,
         ram,
@@ -285,36 +287,31 @@ async fn wasm_filesystem_component_serves_files_through_standard_wasi() {
     assert_eq!(reply_error(&read), 0);
     assert_eq!(&read[16..], b"data");
 
-    let link = submit(&channel, &memory, 4, &request(1, 5, 1, b"link\0")).await;
-    assert_eq!(reply_error(&link), 0);
-    let link = u64::from_le_bytes(link[16..24].try_into().expect("link inode"));
-    let target = submit(&channel, &memory, 5, &request(5, 6, link, &[])).await;
-    assert_eq!(reply_error(&target), 0);
-    assert_eq!(&target[16..], b"visible");
-
     let mut create = vec![0; 16];
     create[..4].copy_from_slice(&(0o100_u32 | 2).to_le_bytes());
     create[4..8].copy_from_slice(&0o600_u32.to_le_bytes());
     create.extend_from_slice(b"written\0");
-    let created = submit(&channel, &memory, 6, &request(35, 7, 1, &create)).await;
+    let created = submit(&channel, &memory, 4, &request(35, 7, 1, &create)).await;
     assert_eq!(reply_error(&created), 0);
     let inode = u64::from_le_bytes(created[16..24].try_into().expect("created inode"));
+    let expected_mode = if cfg!(unix) { 0o100_600 } else { 0o100_755 };
     assert_eq!(
         u32::from_le_bytes(created[116..120].try_into().expect("created mode")),
-        0o100_600
+        expected_mode
     );
+    #[cfg(unix)]
     assert_eq!(
         std::os::unix::fs::MetadataExt::mode(
             &std::fs::metadata(root.path().join("written")).expect("created metadata")
         ),
-        0o100_600
+        expected_mode
     );
     let handle = u64::from_le_bytes(created[144..152].try_into().expect("created handle"));
     let mut write = vec![0; 40];
     write[..8].copy_from_slice(&handle.to_le_bytes());
     write[16..20].copy_from_slice(&3_u32.to_le_bytes());
     write.extend_from_slice(b"new");
-    let written = submit(&channel, &memory, 7, &request(16, 8, inode, &write)).await;
+    let written = submit(&channel, &memory, 5, &request(16, 8, inode, &write)).await;
     assert_eq!(reply_error(&written), 0);
     assert_eq!(
         u32::from_le_bytes(written[16..20].try_into().expect("written bytes")),
@@ -323,20 +320,21 @@ async fn wasm_filesystem_component_serves_files_through_standard_wasi() {
     let mut read = vec![0; 24];
     read[..8].copy_from_slice(&handle.to_le_bytes());
     read[16..20].copy_from_slice(&3_u32.to_le_bytes());
-    let read = submit(&channel, &memory, 8, &request(15, 9, inode, &read)).await;
+    let read = submit(&channel, &memory, 6, &request(15, 9, inode, &read)).await;
     assert_eq!(reply_error(&read), 0);
     assert_eq!(&read[16..], b"new");
-    let getattr = submit(&channel, &memory, 9, &request(3, 10, inode, &[])).await;
+    let getattr = submit(&channel, &memory, 7, &request(3, 10, inode, &[])).await;
     assert_eq!(reply_error(&getattr), 0);
     assert_eq!(
         u32::from_le_bytes(getattr[92..96].try_into().expect("getattr mode")),
-        0o100_600
+        expected_mode
     );
     let mut setattr = vec![0; 84];
     setattr[..4].copy_from_slice(&1_u32.to_le_bytes());
     setattr[68..72].copy_from_slice(&0o100_640_u32.to_le_bytes());
-    let setattr = submit(&channel, &memory, 10, &request(4, 11, inode, &setattr)).await;
-    assert_eq!(reply_error(&setattr), 0);
+    let setattr = submit(&channel, &memory, 8, &request(4, 11, inode, &setattr)).await;
+    assert_eq!(reply_error(&setattr), if cfg!(unix) { 0 } else { -95 });
+    #[cfg(unix)]
     assert_eq!(
         u32::from_le_bytes(setattr[92..96].try_into().expect("setattr mode")),
         0o100_640
@@ -344,7 +342,7 @@ async fn wasm_filesystem_component_serves_files_through_standard_wasi() {
     let mut rename = 1_u64.to_le_bytes().to_vec();
     rename.extend_from_slice(b"written\0renamed\0");
     assert_eq!(
-        reply_error(&submit(&channel, &memory, 11, &request(12, 12, 1, &rename)).await),
+        reply_error(&submit(&channel, &memory, 9, &request(12, 12, 1, &rename)).await),
         0
     );
     assert_eq!(
@@ -352,25 +350,16 @@ async fn wasm_filesystem_component_serves_files_through_standard_wasi() {
         b"new"
     );
     assert_eq!(
-        reply_error(&submit(&channel, &memory, 12, &request(10, 13, 1, b"renamed\0")).await),
+        reply_error(&submit(&channel, &memory, 10, &request(10, 13, 1, b"renamed\0")).await),
         0
     );
     let mut read = vec![0; 24];
     read[..8].copy_from_slice(&handle.to_le_bytes());
     read[16..20].copy_from_slice(&3_u32.to_le_bytes());
-    let reply = submit(&channel, &memory, 13, &request(15, 14, inode, &read)).await;
+    let reply = submit(&channel, &memory, 11, &request(15, 14, inode, &read)).await;
     assert_eq!(reply_error(&reply), 0);
     assert_eq!(&reply[16..], b"new");
-    let mut rename_link = 1_u64.to_le_bytes().to_vec();
-    rename_link.extend_from_slice(b"link\0renamed-link\0");
-    assert_eq!(
-        reply_error(&submit(&channel, &memory, 14, &request(12, 15, 1, &rename_link)).await),
-        0
-    );
-    let target = submit(&channel, &memory, 15, &request(5, 16, link, &[])).await;
-    assert_eq!(reply_error(&target), 0);
-    assert_eq!(&target[16..], b"visible");
-    let statfs = submit(&channel, &memory, 16, &request(17, 17, 1, &[])).await;
+    let statfs = submit(&channel, &memory, 12, &request(17, 17, 1, &[])).await;
     assert_eq!(reply_error(&statfs), 0);
     assert_ne!(
         u64::from_le_bytes(statfs[16..24].try_into().expect("blocks")),
@@ -382,6 +371,37 @@ async fn wasm_filesystem_component_serves_files_through_standard_wasi() {
     );
     channel.close().expect("close");
     assert!(!root.path().join("renamed").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wasm_filesystem_component_retains_symlink_targets_after_rename() {
+    let root = tempfile::tempdir().expect("tempdir");
+    std::fs::write(root.path().join("visible"), b"data").expect("fixture");
+    symlink_file("visible", root.path().join("link")).expect("symlink fixture");
+    let Mounted {
+        channel,
+        ram,
+        _runtime,
+    } = mount(root.path(), false).await;
+    let memory = BoundedMemory::new(&ram);
+    initialize(&channel, &memory).await;
+    let link = submit(&channel, &memory, 1, &request(1, 5, 1, b"link\0")).await;
+    assert_eq!(reply_error(&link), 0);
+    let link = u64::from_le_bytes(link[16..24].try_into().expect("link inode"));
+    let target = submit(&channel, &memory, 2, &request(5, 6, link, &[])).await;
+    assert_eq!(reply_error(&target), 0);
+    assert_eq!(&target[16..], b"visible");
+
+    let mut rename_link = 1_u64.to_le_bytes().to_vec();
+    rename_link.extend_from_slice(b"link\0renamed-link\0");
+    assert_eq!(
+        reply_error(&submit(&channel, &memory, 3, &request(12, 15, 1, &rename_link)).await),
+        0
+    );
+    let target = submit(&channel, &memory, 4, &request(5, 16, link, &[])).await;
+    assert_eq!(reply_error(&target), 0);
+    assert_eq!(&target[16..], b"visible");
+    channel.close().expect("close");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -480,10 +500,9 @@ async fn wasm_filesystem_component_enforces_readonly_grant() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(unix)]
 async fn wasm_filesystem_component_refreshes_a_relooked_up_node_path() {
     let root = tempfile::tempdir().expect("tempdir");
-    std::os::unix::fs::symlink("first", root.path().join("old")).expect("symlink fixture");
+    symlink_file("first", root.path().join("old")).expect("symlink fixture");
     std::fs::hard_link(root.path().join("old"), root.path().join("new"))
         .expect("hard link fixture");
     let Mounted {
@@ -516,10 +535,9 @@ async fn wasm_filesystem_component_refreshes_a_relooked_up_node_path() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(unix)]
 async fn wasm_filesystem_component_clears_an_unlinked_node_path() {
     let root = tempfile::tempdir().expect("tempdir");
-    std::os::unix::fs::symlink("first", root.path().join("link")).expect("symlink fixture");
+    symlink_file("first", root.path().join("link")).expect("symlink fixture");
     let Mounted {
         channel,
         ram,

@@ -3,19 +3,45 @@ name: Build
 on:
   push:
     branches: [main]
-  # pull_request: disabled until the main build is green
+  pull_request:
   workflow_dispatch:
     inputs:
       native_vm_tests:
         description: Run macOS and Windows VM gates (requires hypervisor access on the runners)
         type: boolean
         default: false
+  workflow_call:
+    inputs:
+      native_vm_tests:
+        description: Run macOS and Windows VM gates
+        type: boolean
+        default: false
+      release_sources:
+        description: Assemble source archives for release publishing
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  verify:
+    name: Verify source
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install component formatter
+        run: rustup toolchain install nightly-2026-09-13 --profile minimal --component rustfmt
+      - run: make verify-source
+
   guest-assets:
+    needs: verify
     name: Linux guest (${{ matrix.arch }})
     runs-on: ubuntu-latest
     strategy:
@@ -62,9 +88,35 @@ jobs:
             build/vmlinux.gz.sha256
             build/boot.img.gz.sha256
           if-no-files-found: error
+          compression-level: 0
+
+      - name: Assemble release sources
+        if: ${{ inputs.release_sources }}
+        run: |
+          if [ "${{ matrix.arch }}" = x86_64 ]; then
+            make ARCH=x86_64 source-dist
+          else
+            scripts/alpine-sources.sh
+            mv build/alpine-corresponding-source.tar.gz build/terra-alpine-aarch64-source.tar.gz
+          fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ inputs.release_sources && matrix.arch == 'x86_64' }}
+        with:
+          name: terra-source
+          path: build/terra-source.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ inputs.release_sources && matrix.arch == 'aarch64' }}
+        with:
+          name: terra-alpine-source-aarch64
+          path: build/terra-alpine-aarch64-source.tar.gz
+          if-no-files-found: error
+          compression-level: 0
 
   linux-x86_64:
-    if: ${{ vars.ENABLE_LINUX == 'true' }}
+    name: Build Linux (x86_64)
+    needs: guest-assets
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -81,24 +133,23 @@ jobs:
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0
-      - name: Install component build tools
+      - name: Install component toolchain
         run: |
           rustup toolchain install nightly-2026-09-13 --profile minimal --component rustfmt,clippy --target wasm32-wasip3
-          cargo install wasm-tools --version 1.248.0 --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
+          cache-on-failure: true
           workspaces: . -> target
           key: x86_64-linux
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Install wasm-tools
+        run: |
+          cargo install wasm-tools --version 1.248.0 --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
+          name: terra-guest-x86_64
           path: build
-          key: guest-x86_64-${{ hashFiles('pins.mk', 'Makefile', 'kernel/Containerfile', 'kernel/*.config', 'kernel/patches/*.patch', 'scripts/kernel-container.sh', 'scripts/*.py') }}
-      - name: Verify components
-        run: make verify-components
-      - name: Verify workspace
-        run: make verify-workspace
-      - name: Build distribution
-        run: make dist
+      - name: Verify and build host
+        run: make verify-host-components verify-workspace host-dist
       - name: Check distribution
         run: |
           ./dist/terra --version
@@ -116,8 +167,8 @@ jobs:
             echo '::notice title=KVM gates skipped::This hosted runner has no read/write /dev/kvm.'
             exit 0
           fi
-          make test-component-boot
-          make test-component-vmm
+          cargo test --locked --target x86_64-unknown-linux-musl -p terra-platform --lib -- --ignored --test-threads=1
+          TERRA_BIN="$PWD/dist/terra" cargo test --locked --target x86_64-unknown-linux-musl -p terra --test boot --test memory -- --ignored --test-threads=1
       - name: Reclaim component build space
         run: rm -rf components/*/target
       - name: Fuzz smoke
@@ -143,8 +194,8 @@ jobs:
           path: dist
 
   linux-aarch64:
+    name: Build Linux (aarch64)
     needs: guest-assets
-    if: ${{ vars.ENABLE_LINUX == 'true' }}
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -165,21 +216,34 @@ jobs:
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0
-      - name: Install component build tools
+      - name: Install component toolchain
         run: |
           rustup target add aarch64-unknown-linux-musl
           rustup toolchain install nightly-2026-09-13 --profile minimal --component rustfmt,clippy --target wasm32-wasip3
-          cargo install wasm-tools --version 1.248.0 --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
+          cache-on-failure: true
+          workspaces: |
+            .
+            components/device-transport
+            components/block
+            components/vsock
+            components/network
+            components/fs
+            components/mem
+            components/boot
+            components/vmm
+            components/policy
           key: aarch64-linux
+      - name: Install wasm-tools
+        run: |
+          cargo install wasm-tools --version 1.248.0 --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
       - name: Build and verify native ARM target
         run: |
-          make host-dist
+          make verify-host-components host-dist
           cargo fmt --all -- --check
-          cargo clippy --locked --workspace --all-targets -- -D warnings
-          cargo test --locked --workspace
-          make verify-components
+          cargo clippy --locked --workspace --all-targets --target aarch64-unknown-linux-musl -- -D warnings
+          cargo test --locked --target aarch64-unknown-linux-musl --workspace
           ./dist/terra --version
           ./dist/terra --help
       - name: KVM product gates
@@ -188,14 +252,15 @@ jobs:
             echo '::notice title=KVM gates skipped::This hosted runner has no read/write /dev/kvm.'
             exit 0
           fi
-          make test-component-boot
-          TERRA_BIN="$PWD/dist/terra" cargo test --locked -p terra --test boot --test memory -- --ignored --test-threads=1
+          cargo test --locked --target aarch64-unknown-linux-musl -p terra-platform --lib -- --ignored --test-threads=1
+          TERRA_BIN="$PWD/dist/terra" cargo test --locked --target aarch64-unknown-linux-musl -p terra --test boot --test memory -- --ignored --test-threads=1
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: terra-aarch64-linux
           path: dist
 
   macos-aarch64:
+    name: Build macOS (aarch64)
     needs: guest-assets
     runs-on: macos-15
     steps:
@@ -206,31 +271,50 @@ jobs:
         with:
           name: terra-guest-aarch64
           path: build
-      - name: Install component build tools
+      - name: Install component toolchain
         run: |
           rustup toolchain install nightly-2026-09-13 --profile minimal --component rustfmt,clippy --target wasm32-wasip3
-          cargo install wasm-tools --version 1.248.0 --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
+          cache-on-failure: true
+          workspaces: |
+            .
+            components/device-transport
+            components/block
+            components/vsock
+            components/network
+            components/fs
+            components/mem
+            components/boot
+            components/vmm
+            components/policy
           key: aarch64-macos
+      - name: Install wasm-tools
+        run: |
+          cargo install wasm-tools --version 1.248.0 --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
       - name: Build and sign
         run: |
           make TERRA_TARGET=aarch64-apple-darwin host-dist
           codesign --force --sign - --entitlements packaging/macos.entitlements dist/terra
           codesign --verify --strict --verbose=2 dist/terra
-          cargo clippy --locked --workspace --all-targets -- -D warnings
-          cargo test --locked --workspace
+          cargo clippy --locked --workspace --all-targets --target aarch64-apple-darwin -- -D warnings
+          cargo test --locked --target aarch64-apple-darwin --workspace
           ./dist/terra --version
           ./dist/terra --help
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        if: ${{ inputs.native_vm_tests }}
+        with:
+          version: 0.16.0
       - name: Native VM acceptance
         if: ${{ inputs.native_vm_tests }}
-        run: TERRA_BIN="$PWD/dist/terra" cargo test --locked -p terra --test native_boot -- --ignored --nocapture
+        run: TERRA_BIN="$PWD/dist/terra" cargo test --locked --target aarch64-apple-darwin -p terra --test native_boot --test boot --test memory -- --ignored --test-threads=1 --nocapture
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: terra-aarch64-macos
           path: dist
 
   windows:
+    name: Build Windows (${{ matrix.guest }})
     needs: guest-assets
     strategy:
       fail-fast: false
@@ -253,8 +337,22 @@ jobs:
         with:
           name: terra-guest-${{ matrix.guest }}
           path: build
+      - name: Install component toolchain
+        run: rustup toolchain install nightly-2026-09-13 --profile minimal --target wasm32-wasip3
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
+          cache-on-failure: true
+          workspaces: |
+            .
+            components/device-transport
+            components/block
+            components/vsock
+            components/network
+            components/fs
+            components/mem
+            components/boot
+            components/vmm
+            components/policy
           key: ${{ matrix.target }}
       - name: Build distribution
         shell: pwsh
@@ -262,12 +360,10 @@ jobs:
       - name: Check native target
         shell: pwsh
         run: |
-          cargo check --locked --workspace --all-targets --target ${{ matrix.target }}
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo clippy --locked --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
       - name: Run workspace unit tests
         shell: pwsh
-        run: cargo test --locked --workspace
+        run: cargo test --locked --target ${{ matrix.target }} --workspace
       - name: Check distribution
         shell: pwsh
         run: |
@@ -275,12 +371,16 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ./dist/terra.exe --help
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        if: ${{ inputs.native_vm_tests }}
+        with:
+          version: 0.16.0
       - name: Native VM acceptance
         if: ${{ inputs.native_vm_tests }}
         shell: pwsh
         run: |
           $env:TERRA_BIN = (Resolve-Path ./dist/terra.exe).Path
-          cargo test --locked -p terra --test native_boot -- --ignored --nocapture
+          cargo test --locked --target ${{ matrix.target }} -p terra --test native_boot --test boot --test memory -- --ignored --test-threads=1 --nocapture
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: terra-${{ matrix.target }}

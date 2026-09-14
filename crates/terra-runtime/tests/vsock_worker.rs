@@ -1,4 +1,3 @@
-#![cfg(unix)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::io::{Read, Write};
@@ -83,7 +82,7 @@ async fn guest_packet(
     );
 }
 
-async fn read_until_eof(socket: &mut std::os::unix::net::UnixStream) -> Vec<u8> {
+async fn read_until_eof(socket: &mut terra_io::local::LocalStream) -> Vec<u8> {
     tokio::time::timeout(Duration::from_secs(2), async {
         let mut received = Vec::new();
         loop {
@@ -134,7 +133,7 @@ async fn serve_and_disconnect(
     replies: Replies,
     receive: Receive,
     count: TypedFunc<(), (u32,)>,
-    client: &mut std::os::unix::net::UnixStream,
+    client: &mut terra_io::local::LocalStream,
     payload: &[u8],
 ) {
     let request = next_reply(accessor, replies, 1).await;
@@ -229,7 +228,7 @@ async fn drive_transport_ready(
 }
 
 async fn create_worker(
-    listener: std::os::unix::net::UnixListener,
+    listener: terra_io::local::LocalListener,
 ) -> (wasmtime::Store<terra_runtime::engine::DeviceHost>, Worker) {
     let engine = device_engine().unwrap();
     let mut store = device_store_with_ram(&engine, terra_runtime::SyntheticRam::new(4096).unwrap());
@@ -322,8 +321,8 @@ async fn create_worker(
 async fn client_handshake_and_half_close_preserve_both_directions() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("agent.sock");
-    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-    let mut client = std::os::unix::net::UnixStream::connect(&path).unwrap();
+    let listener = terra_io::local::LocalListener::bind(&path).unwrap();
+    let mut client = terra_io::local::LocalStream::connect(&path).unwrap();
     client.set_nonblocking(true).unwrap();
     client.write_all(b"early").unwrap();
 
@@ -383,7 +382,7 @@ async fn client_handshake_and_half_close_preserve_both_directions() {
 async fn sequential_clients_share_one_running_vsock_component() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("sequential.sock");
-    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    let listener = terra_io::local::LocalListener::bind(&path).unwrap();
     let (
         mut store,
         Worker {
@@ -401,7 +400,7 @@ async fn sequential_clients_share_one_running_vsock_component() {
             tokio::pin!(running);
             let clients = async {
                 for payload in [b"first".as_slice(), b"second".as_slice()] {
-                    let mut client = std::os::unix::net::UnixStream::connect(&path).unwrap();
+                    let mut client = terra_io::local::LocalStream::connect(&path).unwrap();
                     client.set_nonblocking(true).unwrap();
                     serve_and_disconnect(accessor, replies, receive, count, &mut client, payload)
                         .await;
@@ -420,15 +419,15 @@ async fn sequential_clients_share_one_running_vsock_component() {
         .unwrap()
         .unwrap();
     assert_eq!(store.data_mut().vsock_service_mut().live_clients(), 0);
-    assert!(std::os::unix::net::UnixStream::connect(&path).is_err());
+    assert!(terra_io::local::LocalStream::connect(&path).is_err());
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn close_before_run_releases_configuration_and_finishes_without_starting_clients() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("unstarted.sock");
-    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-    let _client = std::os::unix::net::UnixStream::connect(&path).unwrap();
+    let listener = terra_io::local::LocalListener::bind(&path).unwrap();
+    let _client = terra_io::local::LocalStream::connect(&path).unwrap();
     let (mut store, worker) = create_worker(listener).await;
     tokio::time::timeout(
         Duration::from_secs(2),
@@ -454,8 +453,8 @@ async fn close_before_run_releases_configuration_and_finishes_without_starting_c
 async fn close_releases_an_idle_client() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("idle.sock");
-    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-    let _client = std::os::unix::net::UnixStream::connect(&path).unwrap();
+    let listener = terra_io::local::LocalListener::bind(&path).unwrap();
+    let _client = terra_io::local::LocalStream::connect(&path).unwrap();
     let (
         mut store,
         Worker {
@@ -498,7 +497,7 @@ async fn close_releases_an_idle_client() {
 async fn pre_handshake_client_close_releases_the_listener_grant() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("retry.sock");
-    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    let listener = terra_io::local::LocalListener::bind(&path).unwrap();
     let (
         mut store,
         Worker {
@@ -516,7 +515,7 @@ async fn pre_handshake_client_close_releases_the_listener_grant() {
             tokio::pin!(running);
             let retries = async {
                 for _ in 0..65 {
-                    drop(std::os::unix::net::UnixStream::connect(&path).unwrap());
+                    drop(terra_io::local::LocalStream::connect(&path).unwrap());
                     let _ = next_reply(accessor, replies, 1).await;
                     wait_for_no_connections(accessor, count).await;
                     wait_for_no_clients(accessor).await;

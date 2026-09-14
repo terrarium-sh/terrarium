@@ -1,7 +1,7 @@
 //! Filesystem component bindings over the box-wide MMIO router.
 
 pub mod host;
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod tests;
 
 #[cfg(any(test, feature = "test-support"))]

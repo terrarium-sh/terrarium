@@ -1027,7 +1027,6 @@ mod block_component_tests {
     }
 }
 
-#[cfg(unix)]
 mod file_backend {
     use super::super::component::block::backing::{
         BackingError, BlockBacking, BlockDevice, FileDisk, STATUS_IOERR, STATUS_OK,
@@ -1487,28 +1486,32 @@ mod vsock_tests {
     }
 }
 
-/// Pinned boot assets: kernel bytes, the read-only boot disk, and a
-/// private read-write copy of the root disk. The guest resizes and
-/// stamps its root; the build tree stays pristine.
-#[cfg(any(target_arch = "x86_64", unix))]
-fn kernel_boot_assets() -> (Vec<u8>, std::path::PathBuf, tempfile::TempPath) {
-    use std::fs;
+fn kernel_boot_assets() -> (Vec<u8>, tempfile::TempPath, tempfile::TempPath) {
+    use std::io::Read;
     let build = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../build");
-    let kernel = fs::read(build.join("vmlinux")).expect("run `make build` first");
-    let boot = build.join("boot.img");
-    assert!(boot.is_file(), "run `make build` first");
-    let staged = tempfile::NamedTempFile::new()
-        .expect("create a private rootfs file")
-        .into_temp_path();
-    fs::copy(build.join("rootfs.img"), &staged).expect("stage a private rootfs copy");
-    (kernel, boot, staged)
+    let decode = |name| {
+        flate2::read::GzDecoder::new(
+            std::fs::File::open(build.join(name)).expect("run `make build` first"),
+        )
+    };
+    let mut kernel = Vec::new();
+    decode("vmlinux.gz").read_to_end(&mut kernel).unwrap();
+    let stage_disk = |name| {
+        let mut disk = tempfile::NamedTempFile::new().unwrap();
+        std::io::copy(&mut decode(name), &mut disk).unwrap();
+        disk.into_temp_path()
+    };
+    (
+        kernel,
+        stage_disk("boot.img.gz"),
+        stage_disk("rootfs.img.gz"),
+    )
 }
 
 /// Boot plan proving agent readiness end to end: Create mode with one
 /// hook asserting every online CPU the machine was given. A hook
 /// failure is the agent's nonzero exit report, so SMP rides the same
 /// frame as the boot.
-#[cfg(any(target_arch = "x86_64", unix))]
 fn boot_plan(
     mode: terra_protocol::PlanMode,
     on_create: Vec<String>,
@@ -1547,11 +1550,6 @@ fn boot_plan(
     encode_frame(&plan).expect("plan encodes")
 }
 
-#[cfg(any(
-    target_arch = "x86_64",
-    all(target_os = "linux", target_arch = "aarch64"),
-    all(target_os = "macos", target_arch = "aarch64")
-))]
 fn boot_probe_plan(vcpus: usize) -> Vec<u8> {
     boot_plan(
         terra_protocol::PlanMode::Create,
@@ -1561,13 +1559,6 @@ fn boot_probe_plan(vcpus: usize) -> Vec<u8> {
     )
 }
 
-#[cfg(any(
-    all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ),
-    all(target_os = "macos", target_arch = "aarch64")
-))]
 fn agent_bridge_plan() -> Vec<u8> {
     boot_plan(
         terra_protocol::PlanMode::Run,
@@ -1577,7 +1568,6 @@ fn agent_bridge_plan() -> Vec<u8> {
     )
 }
 
-#[cfg(any(target_arch = "x86_64", unix))]
 fn boot_artifacts() -> super::worker::TrustedArtifacts {
     // SAFETY: these build-tree artifacts are trusted AOT output for this binary's Wasmtime.
     #[allow(unsafe_code)]
@@ -1615,10 +1605,10 @@ fn boot_artifacts() -> super::worker::TrustedArtifacts {
     }
 }
 
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs /dev/kvm and `make test-component-boot`"]
+#[ignore = "requires a native hypervisor and `make test-component-boot`"]
 async fn kernel_boots_directory_share() {
+    #[cfg(unix)]
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use terra_protocol::{Plan, PlanMode, Share, encode_frame, read_frame};
     let directory = tempfile::tempdir().unwrap();
@@ -1627,9 +1617,12 @@ async fn kernel_boots_directory_share() {
     std::fs::write(directory.path().join("large-host"), vec![b'x'; 65_537]).unwrap();
     let executable = directory.path().join("script");
     std::fs::write(&executable, "#!/bin/sh\necho executed\n").unwrap();
-    let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&executable, permissions).unwrap();
+    #[cfg(unix)]
+    {
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+    }
     let tag = super::component::fs::host::share_tag(0);
     let encoded = boot_plan(PlanMode::Run, Vec::new(), vec!["/bin/true".into()], false);
     let mut plan: Plan = read_frame(&mut encoded.as_slice()).unwrap().unwrap();
@@ -1644,7 +1637,7 @@ async fn kernel_boots_directory_share() {
     let outcome = super::worker::run(super::worker::WorkerInput {
         component_memory_limits: terra_runtime::box_runtime::ComponentMemoryLimits::default(),
         kernel,
-        boot_disk,
+        boot_disk: boot_disk.to_path_buf(),
         root_disk: root_disk.to_path_buf(),
         volume_disks: Vec::new(),
         shares: vec![super::component::fs::host::ShareGrant::new(&mount, false).unwrap()],
@@ -1676,6 +1669,7 @@ async fn kernel_boots_directory_share() {
         std::fs::read(directory.path().join("large-copy")).unwrap(),
         vec![b'x'; 65_537]
     );
+    #[cfg(unix)]
     assert_eq!(
         std::fs::metadata(directory.path().join("renamed"))
             .unwrap()
@@ -1684,24 +1678,20 @@ async fn kernel_boots_directory_share() {
     );
 }
 
-#[cfg(any(target_arch = "x86_64", unix))]
 struct DenyAllPolicy;
 
-#[cfg(any(target_arch = "x86_64", unix))]
 impl terra_network::Policy for DenyAllPolicy {
     fn allows(&self, _: std::net::IpAddr, _: Option<u16>) -> bool {
         false
     }
 }
 
-#[cfg(any(target_arch = "x86_64", unix))]
 fn boot_network_policy() -> terra_network::PolicyHandle {
     std::sync::Arc::new(DenyAllPolicy)
 }
 
 /// 512 MiB of guest RAM for the kernel boot: kernel, Alpine
 /// userspace, and page cache with room to spare.
-#[cfg(any(target_arch = "x86_64", unix))]
 const BOOT_RAM: u64 = 512 << 20;
 
 /// Phase 1B gate: the pinned kernel boots on two vCPUs with both disks
@@ -1709,12 +1699,7 @@ const BOOT_RAM: u64 = 512 << 20;
 /// the native vsock bridge, reads its plan, proves both CPUs online,
 /// and reports success. `TERRA_BOOT_TRACE=1` logs MSR/EOI flow.
 #[tokio::test]
-#[ignore = "needs /dev/kvm and `make test-component-boot`"]
-#[cfg(any(
-    target_arch = "x86_64",
-    all(target_os = "linux", target_arch = "aarch64"),
-    all(target_os = "macos", target_arch = "aarch64")
-))]
+#[ignore = "requires a native hypervisor and `make test-component-boot`"]
 async fn kernel_boots_to_agent_ready() {
     let vcpus: usize = if std::env::var_os("TERRA_BOOT_ONE_CPU").is_some() {
         1
@@ -1725,7 +1710,7 @@ async fn kernel_boots_to_agent_ready() {
     let outcome = super::worker::run(super::worker::WorkerInput {
         component_memory_limits: terra_runtime::box_runtime::ComponentMemoryLimits::default(),
         kernel,
-        boot_disk: boot_path.clone(),
+        boot_disk: boot_path.to_path_buf(),
         root_disk: root_path.to_path_buf(),
         volume_disks: Vec::new(),
         shares: Vec::new(),
@@ -1751,12 +1736,7 @@ async fn kernel_boots_to_agent_ready() {
 }
 
 #[tokio::test]
-#[ignore = "needs /dev/kvm and `make test-component-boot`"]
-#[cfg(any(
-    target_arch = "x86_64",
-    all(target_os = "linux", target_arch = "aarch64"),
-    all(target_os = "macos", target_arch = "aarch64")
-))]
+#[ignore = "requires a native hypervisor and `make test-component-boot`"]
 async fn kernel_reports_free_pages_after_boot() {
     let vcpus: usize = if std::env::var_os("TERRA_BOOT_ONE_CPU").is_some() {
         1
@@ -1767,7 +1747,7 @@ async fn kernel_reports_free_pages_after_boot() {
     let outcome = super::worker::run(super::worker::WorkerInput {
         component_memory_limits: terra_runtime::box_runtime::ComponentMemoryLimits::default(),
         kernel,
-        boot_disk: boot_path.clone(),
+        boot_disk: boot_path.to_path_buf(),
         root_disk: root_path.to_path_buf(),
         volume_disks: Vec::new(),
         shares: Vec::new(),
@@ -1797,25 +1777,21 @@ async fn kernel_reports_free_pages_after_boot() {
     );
 }
 
-#[cfg(any(
-    all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ),
-    all(target_os = "macos", target_arch = "aarch64")
-))]
 fn bridge_listener() -> (
     tempfile::TempDir,
     std::path::PathBuf,
-    std::os::unix::net::UnixListener,
+    terra_io::local::LocalListener,
 ) {
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
 
     let dir = tempfile::tempdir().expect("temporary socket directory");
     let path = dir.path().join("agent.sock");
-    let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind agent socket");
+    let listener = terra_io::local::LocalListener::bind(&path).expect("bind agent socket");
+    #[cfg(unix)]
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
         .expect("secure agent socket");
+    #[cfg(unix)]
     assert_eq!(
         std::fs::metadata(&path)
             .expect("agent socket metadata")
@@ -1827,21 +1803,14 @@ fn bridge_listener() -> (
     (dir, path, listener)
 }
 
-#[cfg(any(
-    all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ),
-    all(target_os = "macos", target_arch = "aarch64")
-))]
-fn connect_agent(path: &std::path::Path) -> std::io::Result<std::os::unix::net::UnixStream> {
+fn connect_agent(path: &std::path::Path) -> std::io::Result<terra_io::local::LocalStream> {
     use std::io::Read as _;
     use terra_protocol::AGENT_HELLO;
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_mins(2);
     loop {
         let attempt = (|| {
-            let mut stream = std::os::unix::net::UnixStream::connect(path)?;
+            let mut stream = terra_io::local::LocalStream::connect(path)?;
             stream.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
             let mut hello = [0; AGENT_HELLO.len()];
             stream.read_exact(&mut hello)?;
@@ -1863,13 +1832,6 @@ fn connect_agent(path: &std::path::Path) -> std::io::Result<std::os::unix::net::
     }
 }
 
-#[cfg(any(
-    all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ),
-    all(target_os = "macos", target_arch = "aarch64")
-))]
 fn assert_agent_control_and_exec(path: &std::path::Path) -> std::io::Result<()> {
     use std::io::Write as _;
     use terra_protocol::{AgentService, ControlReply, ControlRequest, encode_frame, read_frame};
@@ -1901,13 +1863,6 @@ fn assert_agent_control_and_exec(path: &std::path::Path) -> std::io::Result<()> 
     Ok(())
 }
 
-#[cfg(any(
-    all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ),
-    all(target_os = "macos", target_arch = "aarch64")
-))]
 fn agent_exec(path: &std::path::Path, argv: &[&str]) -> std::io::Result<Vec<u8>> {
     use std::io::Write as _;
     use terra_protocol::{AgentOutput, AgentService, ExecRequest, encode_frame, read_frame};
@@ -1943,13 +1898,6 @@ fn agent_exec(path: &std::path::Path, argv: &[&str]) -> std::io::Result<Vec<u8>>
     Ok(output)
 }
 
-#[cfg(any(
-    all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ),
-    all(target_os = "macos", target_arch = "aarch64")
-))]
 fn await_foreground_workload(path: &std::path::Path) -> std::io::Result<(Vec<u8>, i32)> {
     use std::io::Write as _;
     use terra_protocol::{AgentOutput, AgentService, read_frame};
@@ -1976,25 +1924,11 @@ fn await_foreground_workload(path: &std::path::Path) -> std::io::Result<(Vec<u8>
     }
 }
 
-#[cfg(any(
-    all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ),
-    all(target_os = "macos", target_arch = "aarch64")
-))]
 struct LocalHttpPolicy {
     address: std::net::IpAddr,
     port: u16,
 }
 
-#[cfg(any(
-    all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ),
-    all(target_os = "macos", target_arch = "aarch64")
-))]
 impl terra_network::Policy for LocalHttpPolicy {
     fn allows(&self, ip: std::net::IpAddr, port: Option<u16>) -> bool {
         ip == self.address && port == Some(self.port)
@@ -2009,13 +1943,6 @@ impl terra_network::Policy for LocalHttpPolicy {
     }
 }
 
-#[cfg(any(
-    all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ),
-    all(target_os = "macos", target_arch = "aarch64")
-))]
 fn local_http_server(
     address: std::net::Ipv4Addr,
     body: Vec<u8>,
@@ -2060,13 +1987,6 @@ fn local_http_server(
     (port, stop, server)
 }
 
-#[cfg(any(
-    all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ),
-    all(target_os = "macos", target_arch = "aarch64")
-))]
 fn local_upload_server(
     address: std::net::Ipv4Addr,
     expected_bytes: usize,
@@ -2111,14 +2031,7 @@ fn local_upload_server(
 /// Phase 1E gate: a Run VM serves agent control and exec over the worker's
 /// owner-only Unix listener while the real component-backed machine is running.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs /dev/kvm, `make component-block-aot component-vsock-aot`, and boot assets"]
-#[cfg(any(
-    all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ),
-    all(target_os = "macos", target_arch = "aarch64")
-))]
+#[ignore = "requires a native hypervisor, `make component-block-aot component-vsock-aot`, and boot assets"]
 async fn kernel_boots_to_agent_bridge() {
     let (_socket_dir, socket_path, listener) = bridge_listener();
     let (kernel, boot_path, root_path) = kernel_boot_assets();
@@ -2127,7 +2040,7 @@ async fn kernel_boots_to_agent_bridge() {
     let worker = super::worker::run(super::worker::WorkerInput {
         component_memory_limits: terra_runtime::box_runtime::ComponentMemoryLimits::default(),
         kernel,
-        boot_disk: boot_path,
+        boot_disk: boot_path.to_path_buf(),
         root_disk: root_path.to_path_buf(),
         volume_disks: Vec::new(),
         shares: Vec::new(),
@@ -2154,21 +2067,15 @@ async fn kernel_boots_to_agent_bridge() {
 /// Phase 1E gate: the host stop channel reaches a running guest workload and
 /// the worker reaps the machine after the agent reports the signal exit.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs /dev/kvm, component AOT artifacts, and boot assets"]
-#[cfg(any(
-    all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ),
-    all(target_os = "macos", target_arch = "aarch64")
-))]
+#[ignore = "requires a native hypervisor, component AOT artifacts, and boot assets"]
 async fn kernel_boots_and_agent_stop_ends_workload() {
     use std::io::Write as _;
 
     let (_socket_dir, socket_path, listener) = bridge_listener();
     let (kernel, boot_path, root_path) = kernel_boot_assets();
-    let (mut control_writer, control) =
-        std::os::unix::net::UnixStream::pair().expect("create worker control channel");
+    let (_control_dir, control_path, control_listener) = bridge_listener();
+    let mut control_writer = terra_io::local::LocalStream::connect(&control_path).unwrap();
+    let (control, _) = control_listener.accept().unwrap();
     let client_path = socket_path.clone();
     let client = tokio::task::spawn_blocking(move || {
         assert_agent_control_and_exec(&client_path)?;
@@ -2177,7 +2084,7 @@ async fn kernel_boots_and_agent_stop_ends_workload() {
     let worker = super::worker::run(super::worker::WorkerInput {
         component_memory_limits: terra_runtime::box_runtime::ComponentMemoryLimits::default(),
         kernel,
-        boot_disk: boot_path,
+        boot_disk: boot_path.to_path_buf(),
         root_disk: root_path.to_path_buf(),
         volume_disks: Vec::new(),
         shares: Vec::new(),
@@ -2213,14 +2120,7 @@ async fn kernel_boots_and_agent_stop_ends_workload() {
 /// A foreground Run box waits for its first attached client, then carries the
 /// workload's terminal output and exit status through the native agent bridge.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs /dev/kvm, component AOT artifacts, and boot assets"]
-#[cfg(any(
-    all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ),
-    all(target_os = "macos", target_arch = "aarch64")
-))]
+#[ignore = "requires a native hypervisor, component AOT artifacts, and boot assets"]
 async fn kernel_boots_foreground_session_reports_workload_exit() {
     let (_socket_dir, socket_path, listener) = bridge_listener();
     let (kernel, boot_path, root_path) = kernel_boot_assets();
@@ -2229,7 +2129,7 @@ async fn kernel_boots_foreground_session_reports_workload_exit() {
     let worker = super::worker::run(super::worker::WorkerInput {
         component_memory_limits: terra_runtime::box_runtime::ComponentMemoryLimits::default(),
         kernel,
-        boot_disk: boot_path,
+        boot_disk: boot_path.to_path_buf(),
         root_disk: root_path.to_path_buf(),
         volume_disks: Vec::new(),
         shares: Vec::new(),
@@ -2276,13 +2176,6 @@ async fn kernel_boots_foreground_session_reports_workload_exit() {
     );
 }
 
-#[cfg(any(
-    all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ),
-    all(target_os = "macos", target_arch = "aarch64")
-))]
 async fn assert_policy_dns_http(address: std::net::IpAddr, body: &[u8]) {
     let (_socket_dir, socket_path, listener) = bridge_listener();
     let (kernel, boot_path, root_path) = kernel_boot_assets();
@@ -2302,7 +2195,7 @@ async fn assert_policy_dns_http(address: std::net::IpAddr, body: &[u8]) {
     let worker = super::worker::run(super::worker::WorkerInput {
         component_memory_limits: terra_runtime::box_runtime::ComponentMemoryLimits::default(),
         kernel,
-        boot_disk: boot_path,
+        boot_disk: boot_path.to_path_buf(),
         root_disk: root_path.to_path_buf(),
         volume_disks: Vec::new(),
         shares: Vec::new(),
@@ -2328,13 +2221,6 @@ async fn assert_policy_dns_http(address: std::net::IpAddr, body: &[u8]) {
     assert_eq!(outcome.exit_code, Some(0), "agent outcome: {outcome:?}");
 }
 
-#[cfg(any(
-    all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ),
-    all(target_os = "macos", target_arch = "aarch64")
-))]
 async fn assert_policy_dns_upload(address: std::net::IpAddr, bytes: usize) {
     let (_socket_dir, socket_path, listener) = bridge_listener();
     let (kernel, boot_path, root_path) = kernel_boot_assets();
@@ -2353,7 +2239,7 @@ async fn assert_policy_dns_upload(address: std::net::IpAddr, bytes: usize) {
     let worker = super::worker::run(super::worker::WorkerInput {
         component_memory_limits: terra_runtime::box_runtime::ComponentMemoryLimits::default(),
         kernel,
-        boot_disk: boot_path,
+        boot_disk: boot_path.to_path_buf(),
         root_disk: root_path.to_path_buf(),
         volume_disks: Vec::new(),
         shares: Vec::new(),
@@ -2380,25 +2266,11 @@ async fn assert_policy_dns_upload(address: std::net::IpAddr, bytes: usize) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs /dev/kvm, component AOT artifacts, and boot assets"]
-#[cfg(any(
-    all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ),
-    all(target_os = "macos", target_arch = "aarch64")
-))]
+#[ignore = "requires a native hypervisor, component AOT artifacts, and boot assets"]
 async fn kernel_boots_through_standard_wasi_tcp() {
     assert_policy_dns_http(native_ipv4_address(), b"agent-network").await;
 }
 
-#[cfg(any(
-    all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ),
-    all(target_os = "macos", target_arch = "aarch64")
-))]
 fn native_ipv4_address() -> std::net::IpAddr {
     let socket = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
         .expect("bind local address probe");
@@ -2408,26 +2280,12 @@ fn native_ipv4_address() -> std::net::IpAddr {
     socket.local_addr().expect("read local address").ip()
 }
 
-#[cfg(any(
-    all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ),
-    all(target_os = "macos", target_arch = "aarch64")
-))]
 fn reserved_loopback_port() -> u16 {
     let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .expect("reserve loopback port");
     listener.local_addr().expect("read reserved port").port()
 }
 
-#[cfg(any(
-    all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ),
-    all(target_os = "macos", target_arch = "aarch64")
-))]
 fn published_http_response(port: u16, host_closes_first: bool) -> std::io::Result<Vec<u8>> {
     use std::io::{Read as _, Write as _};
 
@@ -2462,39 +2320,18 @@ fn published_http_response(port: u16, host_closes_first: bool) -> std::io::Resul
 
 /// A guest closing its response sends EOF to a host still holding its write half open.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs /dev/kvm, component AOT artifacts, and boot assets"]
-#[cfg(any(
-    all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ),
-    all(target_os = "macos", target_arch = "aarch64")
-))]
+#[ignore = "requires a native hypervisor, component AOT artifacts, and boot assets"]
 async fn kernel_boots_published_loopback_http() {
     assert_published_loopback_http(false).await;
 }
 
 /// A host finishing its request can still receive the complete guest response and EOF.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs /dev/kvm, component AOT artifacts, and boot assets"]
-#[cfg(any(
-    all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ),
-    all(target_os = "macos", target_arch = "aarch64")
-))]
+#[ignore = "requires a native hypervisor, component AOT artifacts, and boot assets"]
 async fn kernel_boots_published_loopback_http_after_host_eof() {
     assert_published_loopback_http(true).await;
 }
 
-#[cfg(any(
-    all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ),
-    all(target_os = "macos", target_arch = "aarch64")
-))]
 async fn assert_published_loopback_http(host_closes_first: bool) {
     use std::io::Write as _;
 
@@ -2502,8 +2339,9 @@ async fn assert_published_loopback_http(host_closes_first: bool) {
     const BODY: &[u8] = b"published-body";
     let host_port = reserved_loopback_port();
     let (kernel, boot_path, root_path) = kernel_boot_assets();
-    let (mut control_writer, control) =
-        std::os::unix::net::UnixStream::pair().expect("create worker control channel");
+    let (_control_dir, control_path, control_listener) = bridge_listener();
+    let mut control_writer = terra_io::local::LocalStream::connect(&control_path).unwrap();
+    let (control, _) = control_listener.accept().unwrap();
     let diagnostics = tempfile::NamedTempFile::new().expect("create diagnostics");
     let client = tokio::task::spawn_blocking(move || {
         let response = published_http_response(host_port, host_closes_first)?;
@@ -2513,7 +2351,7 @@ async fn assert_published_loopback_http(host_closes_first: bool) {
     let worker = super::worker::run(super::worker::WorkerInput {
         component_memory_limits: terra_runtime::box_runtime::ComponentMemoryLimits::default(),
         kernel,
-        boot_disk: boot_path,
+        boot_disk: boot_path.to_path_buf(),
         root_disk: root_path.to_path_buf(),
         volume_disks: Vec::new(),
         shares: Vec::new(),
@@ -2565,27 +2403,13 @@ async fn assert_published_loopback_http(host_closes_first: bool) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs /dev/kvm, component AOT artifacts, and boot assets"]
-#[cfg(any(
-    all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ),
-    all(target_os = "macos", target_arch = "aarch64")
-))]
+#[ignore = "requires a native hypervisor, component AOT artifacts, and boot assets"]
 async fn kernel_boots_through_standard_wasi_large_tcp() {
     assert_policy_dns_http(native_ipv4_address(), &vec![b's'; 65_537]).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs /dev/kvm, component AOT artifacts, and boot assets"]
-#[cfg(any(
-    all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ),
-    all(target_os = "macos", target_arch = "aarch64")
-))]
+#[ignore = "requires a native hypervisor, component AOT artifacts, and boot assets"]
 async fn kernel_uploads_through_standard_wasi_tcp() {
     assert_policy_dns_upload(native_ipv4_address(), 65_537).await;
 }

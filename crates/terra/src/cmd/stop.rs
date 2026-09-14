@@ -150,10 +150,11 @@ pub fn run(
     Ok(ExitCode::SUCCESS)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Read as _;
+    #[cfg(unix)]
     use std::process::{Child, Command, Stdio};
 
     /// A box on disk under a home of this test's own - which has to be in
@@ -189,6 +190,7 @@ mod tests {
     /// about SIGTERM, and must echo a byte once it has: a signal that arrives
     /// while the shell is still starting is taken at the default disposition,
     /// so without the handshake a child meant to ignore SIGTERM dies of it.
+    #[cfg(unix)]
     fn spawn_vm_child(bx: &BoxRef, shell: &str) -> Child {
         let lock = bx.lock_run().unwrap();
         let mut cmd = Command::new("/bin/sh");
@@ -267,7 +269,7 @@ mod tests {
         let (bx, _home) = create_box_in(dir.path());
         let lock = bx.lock_run().unwrap();
         let marked = bx.mark_baking(&lock);
-        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let mut child = sys::build_test_child_command().spawn().unwrap();
         bx.publish_pid(&lock, child.id(), true);
         assert!(matches!(bx.get_holder(), Holder::SettingUp));
         let error = stop_and_wait(&bx, Duration::ZERO, SetupAction::Refuse)
@@ -287,6 +289,7 @@ mod tests {
     /// box being let go is what says the stop landed - the lock, not the
     /// signal's own return, which says only that it was delivered.
     #[test]
+    #[cfg(unix)]
     fn a_vm_that_takes_the_signal_stops_gracefully() {
         let dir = tempfile::tempdir().unwrap();
         let (bx, _home) = create_box_in(dir.path());
@@ -308,6 +311,7 @@ mod tests {
     /// An ignored SIGTERM survives `exec`, so it is `sleep` itself that refuses
     /// the signal here rather than a shell that would have to forward it.
     #[test]
+    #[cfg(unix)]
     fn a_vm_that_ignores_the_signal_is_killed_once_the_grace_runs_out() {
         let dir = tempfile::tempdir().unwrap();
         let (bx, _home) = create_box_in(dir.path());

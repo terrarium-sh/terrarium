@@ -359,42 +359,39 @@ mod tests {
         assert!(!to_stage_path(&target, 3).exists());
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_staged_symlink_is_not_followed() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("image.img");
         let redirected = dir.path().join("redirected");
         std::fs::write(&redirected, b"original").unwrap();
-        std::os::unix::fs::symlink(&redirected, to_stage_path(&target, 0)).unwrap();
+        crate::sys::symlink_file(&redirected, to_stage_path(&target, 0)).unwrap();
 
         staged_write(&target, |_| Ok(())).unwrap();
         assert!(target.is_file());
         assert_eq!(std::fs::read(&redirected).unwrap(), b"original");
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_staged_write_replaces_a_symlink_destination() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("image.img");
         let redirected = dir.path().join("redirected");
         std::fs::write(&redirected, b"original").unwrap();
-        std::os::unix::fs::symlink(&redirected, &target).unwrap();
+        crate::sys::symlink_file(&redirected, &target).unwrap();
 
         staged_write(&target, |_| Ok(())).unwrap();
         assert!(std::fs::symlink_metadata(&target).unwrap().is_file());
         assert_eq!(std::fs::read(&redirected).unwrap(), b"original");
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_staged_write_follows_a_parent_symlink() {
         let dir = tempfile::tempdir().unwrap();
         let real_parent = dir.path().join("real");
         std::fs::create_dir(&real_parent).unwrap();
         let linked_parent = dir.path().join("linked");
-        std::os::unix::fs::symlink(&real_parent, &linked_parent).unwrap();
+        crate::sys::symlink_dir(&real_parent, &linked_parent).unwrap();
 
         staged_write(&linked_parent.join("image.img"), |_| Ok(())).unwrap();
         assert!(real_parent.join("image.img").is_file());

@@ -409,43 +409,97 @@ fn win_ok(ok: i32) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs::TryLockError;
-    use std::process::{Command, Stdio};
+    use windows_sys::Win32::Foundation::{INVALID_HANDLE_VALUE, LocalFree};
+    use windows_sys::Win32::Security::Authorization::GetNamedSecurityInfoW;
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, EqualSid, GetAce, GetSecurityDescriptorControl, SE_DACL_PROTECTED,
+    };
+    use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
 
-    /// A Windows sharing reservation belongs to every inherited duplicate, so
-    /// the child keeps the box unavailable after the boot process exits.
     #[test]
-    fn inherited_run_lock_outlives_the_parent() {
+    fn the_handed_lock_handle_is_matched_by_identity() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("terra.pid");
-        let lock = try_lock_run(&path).unwrap();
-        let mut command = Command::new(std::env::var_os("COMSPEC").unwrap());
-        command.args(["/C", "more > NUL"]).stdin(Stdio::piped());
-        let inheritance = pass_lock(&mut command, &lock).unwrap();
-        let mut child = command.spawn().unwrap();
-        drop(inheritance);
-        drop(lock);
-
-        assert!(matches!(try_lock_run(&path), Err(TryLockError::WouldBlock)));
-
-        drop(child.stdin.take());
-        child.wait().unwrap();
-        assert!(try_lock_run(&path).is_ok());
+        let lock_path = directory.path().join("terra.pid");
+        let lock = try_lock_run(&lock_path).unwrap();
+        let unrelated = tempfile::NamedTempFile::new().unwrap();
+        assert!(file_handle_matches_path(lock.as_raw_handle(), &lock_path));
+        assert!(!file_handle_matches_path(std::ptr::null_mut(), &lock_path));
+        assert!(!file_handle_matches_path(INVALID_HANDLE_VALUE, &lock_path));
+        assert!(!file_handle_matches_path(
+            unrelated.as_file().as_raw_handle(),
+            &lock_path
+        ));
     }
 
     #[test]
-    fn ordinary_handle_is_not_a_run_lock() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("terra.pid");
-        std::fs::write(&path, []).unwrap();
-        let ordinary = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-        let duplicate = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-        assert!(!holds_run_lock(&path));
-        drop(duplicate);
-        drop(ordinary);
-
-        let lock = try_lock_run(&path).unwrap();
-        assert!(holds_run_lock(&path));
-        drop(lock);
+    fn owner_only_acl_grants_only_the_current_user_and_blocks_inheritance() {
+        let root = tempfile::tempdir().unwrap();
+        let sid = current_user_sid().unwrap();
+        for directory in [false, true] {
+            let path = root
+                .path()
+                .join(if directory { "directory" } else { "file" });
+            if directory {
+                std::fs::create_dir(&path).unwrap();
+            } else {
+                std::fs::write(&path, b"private").unwrap();
+            }
+            set_owner_only(&path, directory).unwrap();
+            let wide = path
+                .as_os_str()
+                .encode_wide()
+                .chain(Some(0))
+                .collect::<Vec<_>>();
+            let mut acl = std::ptr::null_mut();
+            let mut descriptor = std::ptr::null_mut();
+            let mut control = 0;
+            let mut revision = 0;
+            let mut entry = std::ptr::null_mut();
+            // SAFETY: Windows owns the queried descriptor until LocalFree; every output pointer
+            // is writable, and the successful queries bound the ACL and ACE reads.
+            unsafe {
+                assert_eq!(
+                    GetNamedSecurityInfoW(
+                        wide.as_ptr(),
+                        SE_FILE_OBJECT,
+                        DACL_SECURITY_INFORMATION,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        &raw mut acl,
+                        std::ptr::null_mut(),
+                        &raw mut descriptor,
+                    ),
+                    0
+                );
+                assert_ne!(
+                    GetSecurityDescriptorControl(descriptor, &raw mut control, &raw mut revision),
+                    0
+                );
+                assert_ne!(control & SE_DACL_PROTECTED, 0);
+                assert!(!acl.is_null());
+                assert_eq!((*acl).AceCount, 1);
+                assert_ne!(GetAce(acl, 0, &raw mut entry), 0);
+                let entry = &*entry.cast::<ACCESS_ALLOWED_ACE>();
+                assert_eq!(entry.Header.AceType, 0);
+                assert!(
+                    entry.Mask & GENERIC_ALL != 0
+                        || entry.Mask & FILE_ALL_ACCESS == FILE_ALL_ACCESS
+                );
+                assert_ne!(
+                    EqualSid(
+                        (&raw const entry.SidStart).cast_mut().cast(),
+                        sid.as_ptr().cast_mut().cast()
+                    ),
+                    0
+                );
+                let inheritance = if directory {
+                    OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
+                } else {
+                    0
+                };
+                assert_eq!(u32::from(entry.Header.AceFlags), inheritance);
+                assert!(LocalFree(descriptor).is_null());
+            }
+        }
     }
 }

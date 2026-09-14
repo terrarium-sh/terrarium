@@ -136,12 +136,12 @@ mod prepared_machine_tests {
         );
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn aot_vmm_applies_boot_and_keeps_both_vcpus_responsive() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::time::{Duration, Instant};
+        #[cfg(unix)]
         use vm_memory::{GuestAddress, GuestMemoryMmap};
 
         for architecture in [Architecture::X86, Architecture::Arm] {
@@ -187,9 +187,15 @@ mod prepared_machine_tests {
                 irq,
             })
             .collect();
+            #[cfg(unix)]
             let ram = SyntheticRam::from_shared(Arc::new(
                 GuestMemoryMmap::from_ranges(&[(GuestAddress(base), 8 << 20)]).unwrap(),
             ))
+            .unwrap();
+            #[cfg(windows)]
+            let ram = SyntheticRam::from_windows_ram(
+                crate::WindowsRam::allocate_at(8 << 20, base).unwrap(),
+            )
             .unwrap();
             let config = MachineConfig::new(architecture, 8 << 20, 2, devices).unwrap();
             let mut kernel = vec![0; 65536];

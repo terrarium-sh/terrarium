@@ -123,8 +123,6 @@ fn sweep_project_dir(project_dir: &Path) {
 mod tests {
     use super::*;
     use crate::state::BoxRef;
-    #[cfg(unix)]
-    use std::process::Command;
 
     #[test]
     fn removal_retries_a_stale_staging_directory() {
@@ -234,7 +232,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn force_does_not_remove_a_box_with_an_unverified_pid() {
         let dir = tempfile::tempdir().unwrap();
@@ -243,8 +240,7 @@ mod tests {
         std::fs::create_dir_all(bx.get_dir()).unwrap();
         std::fs::write(bx.get_dir().join(state::ROOTFS_FILE), b"image").unwrap();
         let lock = bx.lock_run().unwrap();
-        let mut command = Command::new("sleep");
-        command.arg("30");
+        let mut command = crate::sys::build_test_child_command();
         let inheritance = crate::sys::pass_lock(&mut command, &lock).unwrap();
         let mut child = command.spawn().unwrap();
         drop(inheritance);

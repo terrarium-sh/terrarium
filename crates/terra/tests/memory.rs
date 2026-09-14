@@ -1,6 +1,5 @@
-//! Real-KVM demand-memory regression.
+//! Native-hypervisor demand-memory regression.
 
-#![cfg(target_os = "linux")]
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
 use std::path::{Path, PathBuf};
@@ -78,6 +77,7 @@ fn run_command(terra: &Path, home: &Path, args: &[&str], timeout: Duration) -> O
     let mut child = Command::new(terra)
         .args(args)
         .env("HOME", home)
+        .env("USERPROFILE", home)
         .env_remove("RUST_LOG")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -123,13 +123,19 @@ fn vm_pid(running: &RunningBox) -> u32 {
 }
 
 fn rss_kib(pid: u32) -> std::io::Result<u64> {
-    let status = std::fs::read_to_string(format!("/proc/{pid}/status"))?;
-    status
-        .lines()
-        .find_map(|line| line.strip_prefix("VmRSS:"))
-        .and_then(|line| line.split_whitespace().next())
-        .and_then(|value| value.parse().ok())
-        .ok_or_else(|| std::io::Error::other("VmRSS is absent or malformed"))
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+
+    let pid = Pid::from_u32(pid);
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing().with_memory(),
+    );
+    system
+        .process(pid)
+        .map(|process| process.memory() / 1024)
+        .ok_or_else(|| std::io::Error::other("VM process is absent"))
 }
 
 fn wait_for_rss(
@@ -152,7 +158,7 @@ fn wait_for_rss(
         }
         assert!(
             started.elapsed() < MEMORY_SETTLE_TIMEOUT,
-            "{description} after {} seconds; VmRSS samples (KiB): {samples:?}\nbox logs:\n{}",
+            "{description} after {} seconds; resident memory samples (KiB): {samples:?}\nbox logs:\n{}",
             MEMORY_SETTLE_TIMEOUT.as_secs(),
             running.logs()
         );
@@ -166,7 +172,7 @@ fn wait_for_idle_rss(running: &RunningBox, pid: u32) -> u64 {
     wait_for_rss(
         running,
         pid,
-        "idle demand-backed VmRSS did not settle below 512 MiB",
+        "idle demand-backed resident memory did not settle below 512 MiB",
         |rss| {
             if rss.abs_diff(previous) > 16 * MIB_KIB {
                 previous = rss;
@@ -178,7 +184,7 @@ fn wait_for_idle_rss(running: &RunningBox, pid: u32) -> u64 {
 }
 
 #[test]
-#[ignore = "boots a real 2 GiB microVM and needs /dev/kvm: cargo test -p terra --test memory -- --ignored"]
+#[ignore = "boots a real 2 GiB microVM and requires a native hypervisor: cargo test -p terra --test memory -- --ignored"]
 fn guest_memory_grows_and_shrinks_with_its_working_set() {
     let terra = std::env::var_os("TERRA_BIN")
         .map_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_terra")), PathBuf::from);
@@ -227,7 +233,7 @@ fn guest_memory_grows_and_shrinks_with_its_working_set() {
     let initial = wait_for_rss(
         &running,
         pid,
-        "initial demand-backed VmRSS did not settle below 512 MiB",
+        "initial demand-backed resident memory did not settle below 512 MiB",
         |rss| rss < 512 * MIB_KIB,
     );
 
@@ -243,14 +249,14 @@ fn guest_memory_grows_and_shrinks_with_its_working_set() {
         let grown = wait_for_rss(
             &running,
             pid,
-            &format!("VmRSS did not grow by 128 MiB from {before} KiB in cycle {cycle}"),
+            &format!("resident memory did not grow by 128 MiB from {before} KiB in cycle {cycle}"),
             |rss| rss >= before + 128 * MIB_KIB,
         );
         running.exec(&["rm", "-f", "/dev/shm/terra-memory-test"]);
         let shrunk = wait_for_rss(
             &running,
             pid,
-            &format!("VmRSS did not release 128 MiB in cycle {cycle}"),
+            &format!("resident memory did not release 128 MiB in cycle {cycle}"),
             |rss| rss + 128 * MIB_KIB <= grown,
         );
         println!(

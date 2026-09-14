@@ -72,7 +72,7 @@ COMPONENT_TARGETS := $(addprefix component-,$(COMPONENTS))
 COMPONENT_AOT_TARGETS := $(addsuffix -aot,$(COMPONENT_TARGETS))
 COMPONENT_MANIFESTS := components/device-transport/Cargo.toml $(addprefix components/,$(addsuffix /Cargo.toml,$(COMPONENTS)))
 
-.PHONY: $(COMPONENT_TARGETS) $(COMPONENT_AOT_TARGETS) guest-assets check-guest-assets host-build host-dist source-dist verify-wit build verify verify-components verify-workspace dist man clean test-component-boot test-component-vmm test-install check-zig
+.PHONY: $(COMPONENT_TARGETS) $(COMPONENT_AOT_TARGETS) verify-source verify-host-components guest-assets check-guest-assets host-build host-dist source-dist verify-wit build verify verify-components verify-workspace dist man clean test-component-boot test-component-vmm test-install check-zig
 
 # Pin changes invalidate every embedded guest payload.
 PINS := $(ARCH) $(KERNEL_VERSION) $(KERNEL_SHA256) $(E2FSPROGS_VERSION) $(E2FSPROGS_SHA256) \
@@ -323,13 +323,16 @@ test-component-boot: $(COMPONENT_AOT_TARGETS) $(KERNEL_GZ) $(ROOTFS_IMG) $(BOOT_
 ## (needs /dev/kvm).
 verify: verify-components verify-workspace
 
-verify-workspace:
+verify-source: verify-wit
 	python3 -B scripts/check-tool-versions.py
 	python3 -B scripts/test-kernel-tools.py
 	python3 -B scripts/test-alpine-sources.py
 	scripts/test-install.sh
 	$(CARGO) fmt --all -- --check
 	$(CARGO) fmt --manifest-path fuzz/Cargo.toml -- --check
+	set -e; for manifest in $(COMPONENT_MANIFESTS); do RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO) fmt --manifest-path $$manifest -- --check; done
+
+verify-workspace: verify-source
 	$(CARGO_LOCKED) clippy --workspace --all-targets --target $(MUSL) -- -D warnings
 	$(CARGO_LOCKED) clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
 ## The crates deny rustdoc::broken_intra_doc_links, which only fires under
@@ -342,6 +345,9 @@ test-install:
 	scripts/test-install.sh
 
 verify-components: $(COMPONENT_AOT_TARGETS) $(KERNEL_GZ) $(ROOTFS_IMG) $(VOLUME_IMG) $(BOOT_IMG) $(BLOB_SHAS)
+verify-host-components: check-guest-assets $(COMPONENT_AOT_TARGETS)
+
+verify-components verify-host-components:
 	set -e; for manifest in $(COMPONENT_MANIFESTS); do RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO) fmt --manifest-path $$manifest -- --check; done
 	set -e; for manifest in $(COMPONENT_MANIFESTS); do RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO_LOCKED) clippy --target wasm32-wasip3 --manifest-path $$manifest -- -D warnings; done
 	set -e; for manifest in $(COMPONENT_MANIFESTS); do RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO_LOCKED) clippy --all-targets --target $(NATIVE) --manifest-path $$manifest -- -D warnings; done

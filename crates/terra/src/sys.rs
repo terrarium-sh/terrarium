@@ -124,6 +124,15 @@ pub fn is_at_a_terminal() -> bool {
     crossterm::tty::IsTty::is_tty(&std::io::stdin())
 }
 
+#[cfg(all(test, windows))]
+pub(crate) use std::fs::remove_dir as remove_directory_symlink;
+#[cfg(all(test, unix))]
+pub(crate) use std::fs::remove_file as remove_directory_symlink;
+#[cfg(all(test, unix))]
+pub(crate) use std::os::unix::fs::{symlink as symlink_dir, symlink as symlink_file};
+#[cfg(all(test, windows))]
+pub(crate) use std::os::windows::fs::{symlink_dir, symlink_file};
+
 #[cfg(test)]
 mod test_paths;
 
@@ -185,8 +194,34 @@ pub(crate) fn reserve_staging_directory(
 }
 
 #[cfg(test)]
+pub(crate) fn build_test_child_command() -> std::process::Command {
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", "sys::tests::wait_for_test_input"])
+        .env("TERRA_TEST_CHILD", "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    command
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::TryLockError;
+    use std::io::Write as _;
+
+    #[test]
+    fn wait_for_test_input() {
+        use std::io::Read as _;
+
+        if std::env::var_os("TERRA_TEST_CHILD").is_none() {
+            return;
+        }
+        let mut status = [0];
+        std::io::stdin().read_exact(&mut status).unwrap();
+        std::process::exit(i32::from(status[0]));
+    }
 
     #[test]
     fn host_root_needs_an_override() {
@@ -205,5 +240,62 @@ mod tests {
         let forever = deadline_after(std::time::Duration::from_secs(u64::MAX));
         assert!(forever > now);
         assert!(deadline_after(std::time::Duration::from_secs(1)) < forever);
+    }
+    /// An inherited run lock keeps the box unavailable after the parent releases it.
+    #[test]
+    fn inherited_run_lock_outlives_the_parent() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("terra.pid");
+        let lock = try_lock_run(&path).unwrap();
+        let mut command = build_test_child_command();
+        let inheritance = pass_lock(&mut command, &lock).unwrap();
+        let mut child = command.spawn().unwrap();
+        drop(inheritance);
+        drop(lock);
+
+        assert!(matches!(try_lock_run(&path), Err(TryLockError::WouldBlock)));
+
+        child.stdin.take().unwrap().write_all(&[0]).unwrap();
+        assert!(child.wait().unwrap().success());
+        assert!(try_lock_run(&path).is_ok());
+    }
+
+    #[test]
+    fn ordinary_handle_is_not_a_run_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("terra.pid");
+        std::fs::write(&path, []).unwrap();
+        let ordinary = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let duplicate = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        assert!(!holds_run_lock(&path));
+        drop(duplicate);
+        drop(ordinary);
+
+        let lock = try_lock_run(&path).unwrap();
+        assert!(holds_run_lock(&path));
+        drop(lock);
+    }
+
+    #[test]
+    fn process_identity_guards_forced_termination() {
+        let mut child = build_test_child_command().spawn().unwrap();
+        let pid = child.id();
+        let started = read_process_start_time(pid).unwrap();
+        for identity in [None, Some(started + 1)] {
+            assert_eq!(
+                signal_pid(pid, identity, VmSignal::ForcedStop).unwrap(),
+                SignalResult::IdentityUnknown
+            );
+            assert!(child.try_wait().unwrap().is_none());
+        }
+        assert_eq!(
+            signal_pid(pid, Some(started), VmSignal::ForcedStop).unwrap(),
+            SignalResult::Sent
+        );
+        assert!(!child.wait().unwrap().success());
+        assert_eq!(
+            signal_pid(pid, Some(started), VmSignal::ForcedStop).unwrap(),
+            SignalResult::IdentityUnknown
+        );
     }
 }

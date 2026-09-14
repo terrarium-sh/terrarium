@@ -1,22 +1,49 @@
-name: Kernel export
+name: Kernel checks
 
 on:
   workflow_dispatch:
-  # push:
-  #   paths:
-  #     - pins.mk
-  #     - Makefile
-  #     - kernel/**
-  #     - scripts/check-kernel-config.py
-  #     - scripts/kernel-container.sh
-  #     - scripts/kernel-artifact.py
-  #     - .github/workflows/kernel.yml
+  push:
+    branches: [main]
+    paths:
+      - pins.mk
+      - Makefile
+      - kernel/**
+      - scripts/check-kernel-config.py
+      - scripts/kernel-container.sh
+      - scripts/kernel-artifact.py
+      - scripts/test-kernel-tools.py
+      - .github/workflows/kernel.yml
+  pull_request:
+    paths:
+      - pins.mk
+      - Makefile
+      - kernel/**
+      - scripts/check-kernel-config.py
+      - scripts/kernel-container.sh
+      - scripts/kernel-artifact.py
+      - scripts/test-kernel-tools.py
+      - .github/workflows/kernel.yml
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  verify:
+    name: Verify kernel tooling
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: python3 -B scripts/test-kernel-tools.py
+
   export:
+    needs: verify
+    if: ${{ github.event_name == 'workflow_dispatch' }}
     name: ${{ matrix.arch }}
     runs-on: ubuntu-24.04
     strategy:
@@ -42,3 +69,4 @@ jobs:
             build/terra-kernel-${{ matrix.arch }}.tar.gz
             build/terra-kernel-${{ matrix.arch }}.tar.gz.sha256
           if-no-files-found: error
+          compression-level: 0

@@ -1,4 +1,4 @@
-//! Boot suite - the product gate. Boots real microVMs (needs /dev/kvm) and
+//! Boot suite - the product gate. Boots real microVMs with the native hypervisor and
 //! asserts what host-side tests cannot: egress enforcement, the uid/ownership
 //! model, the guest-side `on_create` bake, cross-VM port publishing and
 //! isolation, exec, cp, and detach. Excluded from a default `cargo test`:
@@ -8,7 +8,6 @@
 //! `TERRA_BIN` overrides the binary under test (CI points it at `dist/terra`,
 //! the shipped artifact); default is the cargo-built one.
 
-#![cfg(unix)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::{Path, PathBuf};
@@ -20,6 +19,7 @@ const ASSETS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/assets");
 struct Suite {
     terra: PathBuf,
     home: PathBuf,
+    #[cfg(unix)]
     host_uid: u32,
     // Owns WORK; removed on drop, after the Drop impl stopped the server VM.
     tmp: tempfile::TempDir,
@@ -39,6 +39,7 @@ impl Suite {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
         std::fs::create_dir_all(&home).unwrap();
+        #[cfg(unix)]
         let host_uid = {
             use std::os::unix::fs::MetadataExt;
             std::fs::metadata(tmp.path()).unwrap().uid()
@@ -46,6 +47,7 @@ impl Suite {
         Self {
             terra,
             home,
+            #[cfg(unix)]
             host_uid,
             tmp,
         }
@@ -64,6 +66,7 @@ impl Suite {
         let out = Command::new(&self.terra)
             .args(args)
             .env("HOME", &self.home)
+            .env("USERPROFILE", &self.home)
             .env_remove("RUST_LOG")
             .stdin(Stdio::null())
             .output()
@@ -203,6 +206,7 @@ impl Suite {
         self.run_terra_status(&named)
     }
 
+    #[cfg(unix)]
     fn read_file_uid(path: &Path) -> Option<u32> {
         use std::os::unix::fs::MetadataExt;
         std::fs::metadata(path).ok().map(|m| m.uid())
@@ -210,11 +214,13 @@ impl Suite {
 
     fn compile_probe(&self, name: &str) -> PathBuf {
         let probe = self.get_work_dir().join(format!("terra-{name}-probe"));
-        let compiler = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("scripts/zig-musl-cc");
         let source = Path::new(ASSETS).join(format!("{name}_probe.c"));
-        let status = Command::new(compiler)
+        let status = Command::new("zig")
+            .args([
+                "cc",
+                "-target",
+                &format!("{}-linux-musl", std::env::consts::ARCH),
+            ])
             .args(["-static", "-O2", "-o"])
             .arg(&probe)
             .arg(source)
@@ -233,6 +239,7 @@ impl Drop for Suite {
         let _ = Command::new(&self.terra)
             .args(["stop", "--project", server.to_str().unwrap()])
             .env("HOME", &self.home)
+            .env("USERPROFILE", &self.home)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -256,7 +263,7 @@ fn http_get(addr: &str, host: &str) -> Option<String> {
 /// group boots, so the order is part of the suite.
 #[allow(clippy::too_many_lines)]
 #[test]
-#[ignore = "boots real microVMs - needs /dev/kvm: cargo test --test boot -- --ignored"]
+#[ignore = "boots real microVMs - requires a native hypervisor: cargo test --test boot -- --ignored"]
 fn run_boot_suite() {
     let s = Suite::new();
     let listener = std::net::TcpListener::bind("127.0.0.1:18080")
@@ -353,6 +360,7 @@ fn run_boot_suite() {
     // port is the mode of the directory it is bound in. terra's own umask
     // cannot be it. Asserted on a box that is *running*, since that is when
     // the sockets exist.
+    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let files = s.get_box_files_path("server");
@@ -478,6 +486,7 @@ fn run_boot_suite() {
     let out = Command::new(&s.terra)
         .args(["oneshot", "-d", "--project", oneshot_box.to_str().unwrap()])
         .env("HOME", &s.home)
+        .env("USERPROFILE", &s.home)
         .env_remove("RUST_LOG")
         .stdin(Stdio::null())
         .output()
@@ -520,119 +529,119 @@ fn run_boot_suite() {
     );
 
     // == sessions/detach: the agent names and drops attached clients ==
-    // A long-running box's session takes several clients, and the ids the
-    // agent hands out are what `terra detach` takes back. The suite has no
-    // terminal, so a client attaches through `script`, which allocates one.
-    let project = server.to_str().unwrap();
-    let sessions = |s: &Suite| s.run_terra_command(&["server", "sessions", "--project", project]);
-    assert!(
-        sessions(&s).trim().is_empty(),
-        "a box nobody is attached to lists clients:\n{}",
-        sessions(&s)
-    );
-
-    // stdin stays open, so the client stays attached until it is detached.
-    let attach = |s: &Suite| -> std::process::Child {
-        Command::new("script")
-            .args([
-                "-qec",
-                &format!("{} server --project {project}", s.terra.display()),
-                "/dev/null",
-            ])
-            .env("HOME", &s.home)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawning an attach through script")
-    };
-    let mut client = attach(&s);
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut listed = String::new();
-    while Instant::now() < deadline {
-        listed = sessions(&s);
-        if listed.trim().starts_with("0\t") {
-            break;
-        }
-        std::thread::sleep(Duration::from_secs(1));
-    }
-    assert!(
-        listed.trim().starts_with("0\t"),
-        "the attached client never reached the session:\n{listed}"
-    );
-
-    // The detach closes the client's connection from the agent's side, so the
-    // client's process ends on its own - and the session is empty again.
-    s.run_terra_command(&["server", "detach", "0", "--project", project]);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Some(status) = client.try_wait().expect("waiting on the attach") {
-            assert_eq!(
-                status.code(),
-                Some(0),
-                "the detached client did not exit cleanly"
-            );
-            break;
-        }
+    #[cfg(unix)]
+    {
+        let project = server.to_str().unwrap();
+        let sessions =
+            |s: &Suite| s.run_terra_command(&["server", "sessions", "--project", project]);
         assert!(
-            Instant::now() < deadline,
-            "the detached client never exited"
+            sessions(&s).trim().is_empty(),
+            "a box nobody is attached to lists clients:\n{}",
+            sessions(&s)
         );
-        std::thread::sleep(Duration::from_secs(1));
-    }
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline && !sessions(&s).trim().is_empty() {
-        std::thread::sleep(Duration::from_secs(1));
-    }
-    assert!(
-        sessions(&s).trim().is_empty(),
-        "a detached client is still listed:\n{}",
-        sessions(&s)
-    );
-    // A client that is already gone is refused, not silently re-detached.
-    let (_, code) = s.run_terra_status(&["server", "detach", "0", "--project", project]);
-    assert_ne!(code, 0, "re-detaching a gone client must fail");
 
-    // Two clients, and `--all` takes both of them.
-    let mut a = attach(&s);
-    let mut b = attach(&s);
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut listed = String::new();
-    while Instant::now() < deadline {
-        listed = sessions(&s);
-        let ids: Vec<&str> = listed
-            .lines()
-            .filter_map(|l| l.split('\t').next())
-            .collect();
-        if ids.len() >= 2 {
-            break;
-        }
-        std::thread::sleep(Duration::from_secs(1));
-    }
-    assert!(
-        sessions(&s).lines().count() >= 2,
-        "the second client never reached the session:\n{listed}"
-    );
-    s.run_terra_command(&["server", "detach", "--all", "--project", project]);
-    for client in [&mut a, &mut b] {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if client.try_wait().expect("waiting on the attach").is_some() {
+        // The PTY master stays open until the client detaches.
+        let attach = |s: &Suite| {
+            let (terminal, input) = console_input();
+            let child = Command::new(&s.terra)
+                .args(["server", "--project", project])
+                .env("HOME", &s.home)
+                .env("USERPROFILE", &s.home)
+                .stdin(input)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawning a terminal client");
+            (child, terminal)
+        };
+        let (mut client, _terminal) = attach(&s);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut listed = String::new();
+        while Instant::now() < deadline {
+            listed = sessions(&s);
+            if listed.trim().starts_with("0\t") {
                 break;
             }
-            assert!(Instant::now() < deadline, "a detached client never exited");
             std::thread::sleep(Duration::from_secs(1));
         }
+        assert!(
+            listed.trim().starts_with("0\t"),
+            "the attached client never reached the session:\n{listed}"
+        );
+
+        // The detach closes the client's connection from the agent's side, so the
+        // client's process ends on its own - and the session is empty again.
+        s.run_terra_command(&["server", "detach", "0", "--project", project]);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = client.try_wait().expect("waiting on the attach") {
+                assert_eq!(
+                    status.code(),
+                    Some(0),
+                    "the detached client did not exit cleanly"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the detached client never exited"
+            );
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && !sessions(&s).trim().is_empty() {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        assert!(
+            sessions(&s).trim().is_empty(),
+            "a detached client is still listed:\n{}",
+            sessions(&s)
+        );
+        // A client that is already gone is refused, not silently re-detached.
+        let (_, code) = s.run_terra_status(&["server", "detach", "0", "--project", project]);
+        assert_ne!(code, 0, "re-detaching a gone client must fail");
+
+        // Two clients, and `--all` takes both of them.
+        let (mut a, _a_terminal) = attach(&s);
+        let (mut b, _b_terminal) = attach(&s);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut listed = String::new();
+        while Instant::now() < deadline {
+            listed = sessions(&s);
+            let ids: Vec<&str> = listed
+                .lines()
+                .filter_map(|l| l.split('\t').next())
+                .collect();
+            if ids.len() >= 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        assert!(
+            sessions(&s).lines().count() >= 2,
+            "the second client never reached the session:\n{listed}"
+        );
+        s.run_terra_command(&["server", "detach", "--all", "--project", project]);
+        for client in [&mut a, &mut b] {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if client.try_wait().expect("waiting on the attach").is_some() {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "a detached client never exited");
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && !sessions(&s).trim().is_empty() {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        assert!(
+            sessions(&s).trim().is_empty(),
+            "clients survive a detach --all:\n{}",
+            sessions(&s)
+        );
     }
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline && !sessions(&s).trim().is_empty() {
-        std::thread::sleep(Duration::from_secs(1));
-    }
-    assert!(
-        sessions(&s).trim().is_empty(),
-        "clients survive a detach --all:\n{}",
-        sessions(&s)
-    );
 
     // == cp: files travel in and out of the running box ==
     let payload = format!("cp-roundtrip-{}", std::process::id());
@@ -767,7 +776,7 @@ fn run_boot_suite() {
 }
 
 #[test]
-#[ignore = "needs /dev/kvm"]
+#[ignore = "requires a native hypervisor"]
 #[allow(clippy::too_many_lines)]
 fn run_mount_boot_suite() {
     let s = Suite::new();
@@ -787,6 +796,8 @@ fn run_mount_boot_suite() {
     assert!(out.contains("WORK=1000:1000"), "{out}");
     assert!(out.contains("WF_OK"), "{out}");
     assert!(out.contains("VOL=1000:1000"), "{out}");
+    assert_eq!(std::fs::read(prj.join("wf")).unwrap(), b"w\n");
+    #[cfg(unix)]
     assert_eq!(
         Suite::read_file_uid(&prj.join("wf")),
         Some(s.host_uid),
@@ -799,6 +810,8 @@ fn run_mount_boot_suite() {
         "--root changed the FS mapping:\n{out}"
     );
     assert!(out.contains("WF_OK"), "{out}");
+    assert_eq!(std::fs::read(prj.join("wf")).unwrap(), b"w\n");
+    #[cfg(unix)]
     assert_eq!(Suite::read_file_uid(&prj.join("wf")), Some(s.host_uid));
 
     // == a writable share preserves ordinary repository-file operations ==
@@ -807,6 +820,7 @@ fn run_mount_boot_suite() {
     std::fs::write(writable.join("host.txt"), "host-visible").unwrap();
     let executable = writable.join("run");
     std::fs::write(&executable, "#!/bin/sh\necho EXECUTABLE\n").unwrap();
+    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
@@ -890,7 +904,7 @@ echo READONLY_OK
         "mount-repository",
         &repository,
         false,
-        r#"
+        &r#"
 git -C /work init
 git -C /work config user.email terra@example.test
 git -C /work config user.name terra
@@ -958,8 +972,7 @@ def unsupported(name, operation):
     else:
         raise AssertionError(f'{name} unexpectedly succeeded')
 
-os.chmod(path, 0o600)
-assert os.stat(path).st_mode & 0o7777 == 0o600
+HOST_MODE_ASSERTIONS
 unsupported('xattr', lambda: os.setxattr(path, 'user.terra', b'guest-value'))
 with open(path, 'r+b') as file:
     unsupported('fallocate', lambda: os.posix_fallocate(file.fileno(), 0, 1))
@@ -975,7 +988,15 @@ PY
 git -C /work add mapped edited build.py build.pyc
 git -C /work commit -m mmap
 echo REPOSITORY_OK
-"#,
+"#
+        .replace(
+            "HOST_MODE_ASSERTIONS",
+            if cfg!(windows) {
+                "unsupported('chmod', lambda: os.chmod(path, 0o600))"
+            } else {
+                "os.chmod(path, 0o600)\nassert os.stat(path).st_mode & 0o7777 == 0o600"
+            },
+        ),
     );
     assert!(out.contains("REPOSITORY_OK"), "{out}");
     assert!(out.contains("UNSUPPORTED_MOUNT_OPERATIONS_OK"), "{out}");
@@ -996,7 +1017,7 @@ echo REPOSITORY_READONLY_OK
     assert!(out.contains("REPOSITORY_READONLY_OK"), "{out}");
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[allow(unsafe_code)]
 fn console_input() -> (std::fs::File, std::fs::File) {
     use std::os::fd::FromRawFd;
@@ -1022,9 +1043,9 @@ fn console_input() -> (std::fs::File, std::fs::File) {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
-#[ignore = "boots a real VM and requires /dev/kvm"]
+#[ignore = "boots a real VM and requires a native hypervisor"]
 fn attached_console_streams_hooks_before_workload_and_exit() {
     use std::io::Read;
     let suite = Suite::new();
@@ -1046,6 +1067,7 @@ fn attached_console_streams_hooks_before_workload_and_exit() {
     let mut child = Command::new(&suite.terra)
         .args(["hooks", "--project", project.to_str().unwrap()])
         .env("HOME", &suite.home)
+        .env("USERPROFILE", &suite.home)
         .env_remove("RUST_LOG")
         .stdin(slave)
         .stdout(Stdio::piped())
@@ -1108,9 +1130,8 @@ fn attached_console_streams_hooks_before_workload_and_exit() {
     assert!(output.find("WORKLOAD_READY").unwrap() < output.find("HOOK_STOP").unwrap());
 }
 
-#[cfg(target_os = "linux")]
 #[test]
-#[ignore = "boots a VM at platform CPU/storage capacity and needs /dev/kvm"]
+#[ignore = "boots a VM at platform CPU/storage capacity and requires a native hypervisor"]
 fn capacity_machine_vcpus_and_storage_devices() {
     #[cfg(target_arch = "aarch64")]
     use terra_platform::aarch64::arm::MAX_DEVICES;
@@ -1165,9 +1186,9 @@ fn capacity_machine_vcpus_and_storage_devices() {
     }
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 #[test]
-#[ignore = "boots a VM with 32 volumes and needs /dev/kvm"]
+#[ignore = "boots a VM with 32 volumes and requires a native hypervisor"]
 fn capacity_32_volumes_reaches_vdah() {
     const VOLUMES: usize = 32;
     let suite = Suite::new();
