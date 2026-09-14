@@ -25,7 +25,7 @@ panic = "deny"
 crate-type = ["cdylib"]
 
 [dependencies]
-wit-bindgen = { version = "=0.61.1", features = ["async-spawn", "inter-task-wakeup"] }
+wit-bindgen = { version = "=0.62.0", features = ["async-spawn", "inter-task-wakeup"] }
 smoltcp = { version = "0.14", default-features = false, features = ["alloc", "async", "medium-ethernet", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp"] }
 futures = "0.3"
 terra-device-transport = { path = "../device-transport" }
