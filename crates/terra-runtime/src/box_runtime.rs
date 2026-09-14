@@ -119,7 +119,7 @@ impl BoxMemoryBudget {
 
     fn reserve(&self, bytes: usize) -> bool {
         self.reserved
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current
                     .checked_add(bytes)
                     .filter(|next| *next <= self.limits.total_bytes)
@@ -130,7 +130,7 @@ impl BoxMemoryBudget {
     fn release(&self, bytes: usize) {
         let _ = self
             .reserved
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current.checked_sub(bytes)
             });
     }

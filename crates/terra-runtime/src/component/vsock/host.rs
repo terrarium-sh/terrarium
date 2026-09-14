@@ -94,7 +94,7 @@ impl VsockHostService {
 
     fn reserve_client(&self) -> Option<Arc<ClientLease>> {
         self.live_clients
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 (count < MAX_CLIENTS).then_some(count + 1)
             })
             .ok()

@@ -15,14 +15,20 @@ fn run_terra_command(args: &[&str]) -> Output {
     run_terra(None, &[], args)
 }
 
-/// Run in an isolated box directory, with `HOME` pointed somewhere empty so the
-/// user's real `~/.terra` never takes part.
+/// Run with an isolated home so the user's real `~/.terra` never takes part.
 fn run_terra_in(dir: &std::path::Path, home: &std::path::Path, args: &[&str]) -> Output {
-    run_terra(Some(dir), &[("HOME", home.as_os_str())], args)
+    run_terra(
+        Some(dir),
+        &[
+            ("HOME", home.as_os_str()),
+            ("USERPROFILE", home.as_os_str()),
+        ],
+        args,
+    )
 }
 
 /// The state directory of the one box under `~/.terra/box` - the layout is
-/// `box/<hashed project>/<box name>/`, and each test gets its own empty `HOME`,
+/// `box/<hashed project>/<box name>/`, and each test gets its own empty home,
 /// so "the one" is well defined.
 fn find_only_box(home: &std::path::Path) -> std::path::PathBuf {
     let dirs = |p: &std::path::Path| -> Vec<std::path::PathBuf> {
@@ -1066,10 +1072,12 @@ fn missing_mount_host_path_exits_one() {
     let cfg = dir.path().join("cfg.yaml");
     std::fs::write(
         &cfg,
-        "mounts:\n  - host: /nonexistent-e2e-path\n    guest: /work\n",
+        "mounts:\n  - host: ./nonexistent-e2e-path\n    guest: /work\n",
     )
     .unwrap();
     let out = run_terra_in(dir.path(), home.path(), &[cfg.to_str().unwrap(), "setup"]);
     assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("/nonexistent-e2e-path"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("resolving mount host path"), "{stderr}");
+    assert!(stderr.contains("nonexistent-e2e-path"), "{stderr}");
 }

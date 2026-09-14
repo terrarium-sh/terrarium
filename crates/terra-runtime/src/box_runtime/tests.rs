@@ -27,6 +27,9 @@ async fn completed_device_loops_retire_without_stopping_the_box() {
 
 #[tokio::test]
 async fn epochs_yield_spinning_wasm_for_deadline_and_cancellation() {
+    use std::future::{Future as _, poll_fn};
+    use std::task::Poll;
+
     let engine = device_engine().expect("engine");
     let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
     let spin =
@@ -36,21 +39,18 @@ async fn epochs_yield_spinning_wasm_for_deadline_and_cancellation() {
         .expect("spin instance")
         .get_typed_func::<(), ()>(&mut runtime.store, "run")
         .expect("spin function");
-    let yielded = Arc::new(AtomicBool::new(false));
-    let observer = Arc::clone(&yielded);
-    tokio::spawn(async move {
-        tokio::task::yield_now().await;
-        observer.store(true, Ordering::Release);
-    });
+    let call = spin.call_async(&mut runtime.store, ());
+    tokio::pin!(call);
+    poll_fn(|cx| {
+        assert!(call.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
     assert!(
-        tokio::time::timeout(
-            std::time::Duration::from_millis(250),
-            spin.call_async(&mut runtime.store, ()),
-        )
-        .await
-        .is_err()
+        tokio::time::timeout(Duration::from_millis(250), call)
+            .await
+            .is_err()
     );
-    assert!(yielded.load(Ordering::Acquire));
 }
 
 #[test]

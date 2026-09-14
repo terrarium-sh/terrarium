@@ -1,5 +1,7 @@
 # 🪴 Terrarium
 
+> ⚠️ **Under construction — not ready to be used as of now.** ⚠️
+
 > A safe home where your agent can thrive.
 
 Run coding agents and development tools in a hardware-virtualized microVM with
