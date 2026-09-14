@@ -150,7 +150,7 @@ fn launch_vcpus(
         let partition = Arc::clone(&group.partition);
         let stop = Arc::clone(&group.stop);
         let starts = Arc::clone(&starts);
-        group.spawn(move || arm_run_vcpu(&partition, id, &control, receiver, &starts, &stop))?;
+        group.spawn(move || arm_run_vcpu(&partition, id, &control, &receiver, &starts, &stop))?;
     }
     Ok(group.into_started())
 }
@@ -571,7 +571,7 @@ fn arm_run_vcpu(
     partition: &Arc<crate::windows::whp::Partition>,
     vcpu: u32,
     worker: &terra_runtime::component::vmm::NativeVcpu,
-    receiver: mpsc::Receiver<ArmCpuCommand>,
+    receiver: &mpsc::Receiver<ArmCpuCommand>,
     starts: &ArmCpuStarts,
     stop: &Arc<AtomicBool>,
 ) -> Result<(), String> {

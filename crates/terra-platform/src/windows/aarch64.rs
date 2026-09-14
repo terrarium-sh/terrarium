@@ -50,7 +50,7 @@ pub fn setup_bsp(
     setup_cpu(partition, 0, kernel_entry, fdt_address)
 }
 
-/// Start an `AArch64` secondary with the PSCI CPU_ON entry contract.
+/// Start an `AArch64` secondary with the PSCI `CPU_ON` entry contract.
 pub fn setup_secondary(
     partition: &Partition,
     vcpu: u32,

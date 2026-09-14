@@ -65,7 +65,11 @@ async fn mount_with_resource_capacity(
         ),
     )
     .expect("component");
-    let grant = ShareGrant::new(path, readonly).expect("grant");
+    let grant = ShareGrant::new(
+        &std::fs::canonicalize(path).expect("canonical mount"),
+        readonly,
+    )
+    .expect("grant");
     let device = DeviceHost::with_ram(ram.clone());
     let host = match resource_capacity {
         Some(resource_capacity) => FsHost::with_resource_capacity(device, grant, resource_capacity),

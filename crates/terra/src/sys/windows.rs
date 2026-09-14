@@ -38,9 +38,11 @@ pub fn try_lock_run(path: &Path) -> std::result::Result<File, std::fs::TryLockEr
         .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
         .open(path)
         .map_err(|error| {
-            (error.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32))
-                .then_some(std::fs::TryLockError::WouldBlock)
-                .unwrap_or(std::fs::TryLockError::Error(error))
+            if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION.cast_signed()) {
+                std::fs::TryLockError::WouldBlock
+            } else {
+                std::fs::TryLockError::Error(error)
+            }
         })
 }
 
@@ -238,7 +240,7 @@ pub fn holds_run_lock(path: &Path) -> bool {
         .write(true)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .open(path)
-        .is_err_and(|error| error.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32))
+        .is_err_and(|error| error.raw_os_error() == Some(ERROR_SHARING_VIOLATION.cast_signed()))
 }
 
 pub fn find_terminating_signal(_status: std::process::ExitStatus) -> Option<i32> {

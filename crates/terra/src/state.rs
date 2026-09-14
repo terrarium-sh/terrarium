@@ -589,19 +589,21 @@ mod tests {
     }
 
     /// The base32 encoding is written here, so pin it against a digest taken
-    /// from somewhere else rather than against itself. `/tmp` is canonical on
-    /// every host this runs on, so `slug` hashes exactly that string:
+    /// from somewhere else rather than against itself. On Unix `/` is its own
+    /// canonical form, so `slug` hashes exactly that string:
     ///
     /// ```text
-    /// $ printf /tmp | sha256sum | cut -c1-20
-    /// e9671acd244849c57167
+    /// $ printf / | sha256sum | cut -c1-20
+    /// 8a5edab28263244321
     /// ```
     ///
     /// which is the 10 bytes the slug encodes, five bits at a time.
     #[test]
     fn the_slug_is_base32_of_the_first_digest_bytes() {
-        let s = compute_slug(Path::new("/tmp"));
-        assert_eq!(s, "t-x5khnk94914wawb7");
+        let s = compute_slug(Path::new("/"));
+        // Windows resolves `/` to a drive root, whose spelling is not fixed.
+        #[cfg(unix)]
+        assert_eq!(s, "t-h9fdncm2ccj468cy");
 
         let body = s.strip_prefix("t-").expect("every slug is prefixed");
         assert_eq!(body.len(), SLUG_BYTES * 8 / 5, "no padding, exact fit");

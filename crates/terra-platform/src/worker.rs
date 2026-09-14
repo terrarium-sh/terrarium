@@ -807,6 +807,7 @@ mod tests {
         use terra_runtime::engine::{DeviceHost, device_engine};
 
         let directory = tempfile::tempdir().unwrap();
+        let mount = std::fs::canonicalize(directory.path()).unwrap();
         let engine = device_engine().unwrap();
         let component = wasmtime::component::Component::new(
             &engine,
@@ -817,7 +818,7 @@ mod tests {
         .unwrap();
         let host = FsHost::new(
             DeviceHost::new(64 * 1024).unwrap(),
-            ShareGrant::new(directory.path(), false).unwrap(),
+            ShareGrant::new(&mount, false).unwrap(),
         );
         let channel = crate::component::fs::instantiate(
             wasmtime::Store::new(&engine, host),

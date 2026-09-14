@@ -14,7 +14,8 @@ fn load(arg: &str, cwd: &Path) -> Result<Config> {
 }
 
 fn read_fully(text: &str, project_dir: &Path, source: &Path) -> Result<Config> {
-    let mut cfg = parse_recipe(text, project_dir, source)?;
+    let project_dir = std::fs::canonicalize(project_dir)?;
+    let mut cfg = parse_recipe(text, &project_dir, source)?;
     merge_env_file(&mut cfg)?;
     Ok(cfg)
 }

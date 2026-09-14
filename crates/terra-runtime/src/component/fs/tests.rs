@@ -22,13 +22,14 @@ fn host(grant: ShareGrant) -> FsHost {
 #[test]
 fn mount_source_requires_a_directory_without_a_leaf_symlink() {
     let root = tempfile::tempdir().unwrap();
-    let directory = root.path().join("directory");
+    let base = std::fs::canonicalize(root.path()).unwrap();
+    let directory = base.join("directory");
     std::fs::create_dir(&directory).unwrap();
-    let link = root.path().join("link");
+    let link = base.join("link");
     symlink(&directory, &link).unwrap();
     assert!(ShareGrant::new(&directory, true).is_ok());
     assert!(ShareGrant::new(&link, true).is_err());
-    let file = root.path().join("file");
+    let file = base.join("file");
     std::fs::write(&file, b"file").unwrap();
     assert!(ShareGrant::new(&file, false).is_err());
 }
@@ -36,12 +37,13 @@ fn mount_source_requires_a_directory_without_a_leaf_symlink() {
 #[test]
 fn mount_source_rejects_a_symlinked_ancestor() {
     let root = tempfile::tempdir().unwrap();
-    let expected_parent = root.path().join("expected");
-    let private_parent = root.path().join("private");
+    let base = std::fs::canonicalize(root.path()).unwrap();
+    let expected_parent = base.join("expected");
+    let private_parent = base.join("private");
     std::fs::create_dir_all(expected_parent.join("share")).unwrap();
     std::fs::create_dir_all(private_parent.join("share")).unwrap();
     let expected = expected_parent.join("share");
-    std::fs::rename(&expected_parent, root.path().join("moved")).unwrap();
+    std::fs::rename(&expected_parent, base.join("moved")).unwrap();
     symlink(&private_parent, &expected_parent).unwrap();
     assert!(ShareGrant::new(&expected, false).is_err());
 }
@@ -49,11 +51,12 @@ fn mount_source_rejects_a_symlinked_ancestor() {
 #[test]
 fn preopen_retains_its_directory_and_rights_without_ambient_resources() {
     let root = tempfile::tempdir().unwrap();
-    let original = root.path().join("grant");
+    let base = std::fs::canonicalize(root.path()).unwrap();
+    let original = base.join("grant");
     std::fs::create_dir(&original).unwrap();
     let inode = std::fs::metadata(&original).unwrap().ino();
     let grant = ShareGrant::new(&original, true).unwrap();
-    std::fs::rename(&original, root.path().join("moved")).unwrap();
+    std::fs::rename(&original, base.join("moved")).unwrap();
     std::fs::create_dir(&original).unwrap();
     let mut fs = host(grant);
     let directories = fs.get_directories().unwrap();
@@ -80,8 +83,9 @@ fn preopen_retains_its_directory_and_rights_without_ambient_resources() {
 #[allow(clippy::too_many_lines)]
 async fn wasi_itself_denies_escape_and_readonly_mutation() {
     let root = tempfile::tempdir().unwrap();
-    std::fs::write(root.path().join("secret"), b"outside").unwrap();
-    let mounted = root.path().join("mounted");
+    let base = std::fs::canonicalize(root.path()).unwrap();
+    std::fs::write(base.join("secret"), b"outside").unwrap();
+    let mounted = base.join("mounted");
     std::fs::create_dir(&mounted).unwrap();
     std::fs::write(mounted.join("file"), b"original").unwrap();
     symlink("../secret", mounted.join("escape")).unwrap();
@@ -214,7 +218,8 @@ async fn wasi_itself_denies_escape_and_readonly_mutation() {
 #[tokio::test]
 async fn mode_capability_changes_writable_files_and_rejects_readonly_files() {
     let root = tempfile::tempdir().unwrap();
-    let mounted = root.path().join("mounted");
+    let base = std::fs::canonicalize(root.path()).unwrap();
+    let mounted = base.join("mounted");
     std::fs::create_dir(&mounted).unwrap();
     std::fs::write(mounted.join("file"), b"file").unwrap();
     let engine = crate::engine::device_engine().unwrap();

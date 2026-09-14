@@ -40,6 +40,20 @@ fn find_only_box(home: &std::path::Path) -> std::path::PathBuf {
     boxes.pop().unwrap()
 }
 
+/// The path terra reports for a project directory: the child resolves its cwd
+/// through macOS's `/var` symlink, while Windows keeps the spelling it was
+/// handed (and `canonicalize` would add a `\\?\` prefix there).
+fn project_path(dir: &std::path::Path) -> std::path::PathBuf {
+    #[cfg(unix)]
+    {
+        std::fs::canonicalize(dir).unwrap()
+    }
+    #[cfg(not(unix))]
+    {
+        dir.to_path_buf()
+    }
+}
+
 fn run_terra(
     dir: Option<&std::path::Path>,
     env: &[(&str, &std::ffi::OsStr)],
@@ -443,6 +457,8 @@ fn ls_all_lists_boxes_by_the_directory_they_belong_to() {
     let home = tempfile::tempdir().unwrap();
     let one = tempfile::tempdir().unwrap();
     let two = tempfile::tempdir().unwrap();
+    let one_dir = project_path(one.path());
+    let two_dir = project_path(two.path());
 
     // On stderr: the listing is what a caller redirects, and this is a hint
     // about there being none rather than a line of it.
@@ -468,7 +484,7 @@ fn ls_all_lists_boxes_by_the_directory_they_belong_to() {
     }
     let out = run_terra_in(one.path(), home.path(), &["ls", "--all"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    for dir in [one.path(), two.path()] {
+    for dir in [&one_dir, &two_dir] {
         assert!(
             stdout.contains(&format!("{} (b)", dir.display())),
             "{stdout}"
@@ -480,7 +496,7 @@ fn ls_all_lists_boxes_by_the_directory_they_belong_to() {
 
     // A box outlives the directory it was made for, and says so rather than
     // being quietly dropped from the listing - it still owns a filesystem.
-    let gone = two.path().to_path_buf();
+    let gone = two_dir.clone();
     two.close().unwrap();
     let out = run_terra_in(one.path(), home.path(), &["ps", "--all"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -495,7 +511,7 @@ fn ls_all_lists_boxes_by_the_directory_they_belong_to() {
     assert!(removed.status.success());
     let out = run_terra_in(one.path(), home.path(), &["ls", "--all"]);
     assert!(
-        !String::from_utf8_lossy(&out.stdout).contains(&one.path().display().to_string()),
+        !String::from_utf8_lossy(&out.stdout).contains(&one_dir.display().to_string()),
         "rm --purge left the project listed"
     );
 }
@@ -644,7 +660,7 @@ fn a_message_about_a_box_names_the_box() {
             .status
             .success()
     );
-    let named = format!("dev ({})", dir.path().display());
+    let named = format!("dev ({})", project_path(dir.path()).display());
     let stopped = run_terra_in(dir.path(), home.path(), &["dev", "stop"]);
     let stderr = String::from_utf8_lossy(&stopped.stderr);
     assert!(stderr.contains(&named), "{stderr}");
@@ -706,6 +722,7 @@ fn a_terra_word_cannot_name_a_box() {
 fn ls_reports_a_state_line_per_box() {
     let dir = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
+    let dir_path = project_path(dir.path());
 
     // No boxes and nothing declared: says so, and is not an error. On stderr,
     // because the listing is what a caller redirects and this is a hint about
@@ -714,10 +731,7 @@ fn ls_reports_a_state_line_per_box() {
     assert!(empty.status.success());
     let stderr = String::from_utf8_lossy(&empty.stderr);
     assert!(stderr.contains("no boxes in"), "{stderr}");
-    assert!(
-        stderr.contains(&dir.path().display().to_string()),
-        "{stderr}"
-    );
+    assert!(stderr.contains(&dir_path.display().to_string()), "{stderr}");
     assert!(empty.stdout.is_empty(), "the listing itself is empty");
 
     // Declared in the manifest but never set up: listed, as not created -
@@ -759,7 +773,7 @@ fn ls_reports_a_state_line_per_box() {
         stdout.trim_end(),
         format!(
             "stopped\tb\t{}\t{}",
-            dir.path().display(),
+            dir_path.display(),
             find_only_box(home.path()).display()
         ),
         "{stdout}"

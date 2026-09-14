@@ -1490,6 +1490,7 @@ mod vsock_tests {
 /// Pinned boot assets: kernel bytes, the read-only boot disk, and a
 /// private read-write copy of the root disk. The guest resizes and
 /// stamps its root; the build tree stays pristine.
+#[cfg(any(target_arch = "x86_64", unix))]
 fn kernel_boot_assets() -> (Vec<u8>, std::path::PathBuf, tempfile::TempPath) {
     use std::fs;
     let build = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../build");
@@ -1507,6 +1508,7 @@ fn kernel_boot_assets() -> (Vec<u8>, std::path::PathBuf, tempfile::TempPath) {
 /// hook asserting every online CPU the machine was given. A hook
 /// failure is the agent's nonzero exit report, so SMP rides the same
 /// frame as the boot.
+#[cfg(any(target_arch = "x86_64", unix))]
 fn boot_plan(
     mode: terra_protocol::PlanMode,
     on_create: Vec<String>,
@@ -1575,6 +1577,7 @@ fn agent_bridge_plan() -> Vec<u8> {
     )
 }
 
+#[cfg(any(target_arch = "x86_64", unix))]
 fn boot_artifacts() -> super::worker::TrustedArtifacts {
     // SAFETY: these build-tree artifacts are trusted AOT output for this binary's Wasmtime.
     #[allow(unsafe_code)]
@@ -1619,6 +1622,7 @@ async fn kernel_boots_directory_share() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use terra_protocol::{Plan, PlanMode, Share, encode_frame, read_frame};
     let directory = tempfile::tempdir().unwrap();
+    let mount = std::fs::canonicalize(directory.path()).unwrap();
     std::fs::write(directory.path().join("host-file"), "host-data").unwrap();
     std::fs::write(directory.path().join("large-host"), vec![b'x'; 65_537]).unwrap();
     let executable = directory.path().join("script");
@@ -1643,7 +1647,7 @@ async fn kernel_boots_directory_share() {
         boot_disk,
         root_disk: root_disk.to_path_buf(),
         volume_disks: Vec::new(),
-        shares: vec![super::component::fs::host::ShareGrant::new(directory.path(), false).unwrap()],
+        shares: vec![super::component::fs::host::ShareGrant::new(&mount, false).unwrap()],
         plan: encode_frame(&plan).unwrap(),
         artifacts: boot_artifacts(),
         network_policy: boot_network_policy(),
@@ -1680,20 +1684,24 @@ async fn kernel_boots_directory_share() {
     );
 }
 
+#[cfg(any(target_arch = "x86_64", unix))]
 struct DenyAllPolicy;
 
+#[cfg(any(target_arch = "x86_64", unix))]
 impl terra_network::Policy for DenyAllPolicy {
     fn allows(&self, _: std::net::IpAddr, _: Option<u16>) -> bool {
         false
     }
 }
 
+#[cfg(any(target_arch = "x86_64", unix))]
 fn boot_network_policy() -> terra_network::PolicyHandle {
     std::sync::Arc::new(DenyAllPolicy)
 }
 
 /// 512 MiB of guest RAM for the kernel boot: kernel, Alpine
 /// userspace, and page cache with room to spare.
+#[cfg(any(target_arch = "x86_64", unix))]
 const BOOT_RAM: u64 = 512 << 20;
 
 /// Phase 1B gate: the pinned kernel boots on two vCPUs with both disks

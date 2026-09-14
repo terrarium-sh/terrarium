@@ -122,6 +122,7 @@ async fn every_device_resets_and_closes_in_one_box_runtime() {
     ] = load_components(&engine);
     let ram = SyntheticRam::new(64 * 1024).expect("RAM");
     let root = tempfile::tempdir().expect("mount directory");
+    let mount = std::fs::canonicalize(root.path()).expect("canonical mount directory");
     let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
     runtime.initialize_mmio(&router).await.expect("MMIO router");
 
@@ -140,7 +141,7 @@ async fn every_device_resets_and_closes_in_one_box_runtime() {
         &mut runtime,
         FsHost::new(
             DeviceHost::with_ram(ram.clone()),
-            ShareGrant::new(root.path(), false).expect("mount grant"),
+            ShareGrant::new(&mount, false).expect("mount grant"),
         ),
         &fs_component,
         "test",

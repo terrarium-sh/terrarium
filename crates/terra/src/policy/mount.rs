@@ -138,7 +138,10 @@ pub(crate) fn find_writable_mount_containing(
     Ok(
         config::list_declared_writable_shares(ran_recipe, project_dir)?
             .into_iter()
-            .find(|share| file.starts_with(canonicalize_existing_prefix(share))),
+            .find_map(|share| {
+                let share = canonicalize_existing_prefix(&share);
+                file.starts_with(&share).then_some(share)
+            }),
     )
 }
 
@@ -400,7 +403,7 @@ mod tests {
                 &project
             )
             .unwrap(),
-            Some(inside_old),
+            Some(std::fs::canonicalize(&inside_old).unwrap()),
             "an unexpandable host dropped the share it names"
         );
     }

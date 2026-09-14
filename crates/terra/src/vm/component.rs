@@ -218,10 +218,11 @@ mod tests {
     #[test]
     fn workload_mounts_have_matching_grants_and_plan_tags() {
         let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
         let spec = BootSpec {
             cfg: Config {
                 mounts: vec![Mount {
-                    host: dir.path().to_path_buf(),
+                    host: root,
                     guest: PathBuf::from("/work"),
                     readonly: true,
                 }],
@@ -245,9 +246,10 @@ mod tests {
     #[test]
     fn boot_refuses_a_share_redirected_into_box_state() {
         let dir = tempfile::tempdir().unwrap();
-        let share = dir.path().join("data");
-        let project_dir = dir.path().join("project");
-        let bx = BoxRef::from_state_dir(dir.path().join("state"), &project_dir);
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let share = root.join("data");
+        let project_dir = root.join("project");
+        let bx = BoxRef::from_state_dir(root.join("state"), &project_dir);
         std::fs::create_dir(&share).unwrap();
         std::fs::create_dir(bx.get_dir()).unwrap();
         let spec = BootSpec {
