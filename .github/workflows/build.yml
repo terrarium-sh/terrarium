@@ -64,6 +64,7 @@ jobs:
           if-no-files-found: error
 
   linux-x86_64:
+    if: ${{ vars.ENABLE_LINUX == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -143,6 +144,7 @@ jobs:
 
   linux-aarch64:
     needs: guest-assets
+    if: ${{ vars.ENABLE_LINUX == 'true' }}
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -195,7 +197,6 @@ jobs:
 
   macos-aarch64:
     needs: guest-assets
-    if: ${{ vars.ENABLE_MACOS == 'true' }}
     runs-on: macos-15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -231,7 +232,6 @@ jobs:
 
   windows:
     needs: guest-assets
-    if: ${{ vars.ENABLE_WINDOWS == 'true' }}
     strategy:
       fail-fast: false
       matrix:
