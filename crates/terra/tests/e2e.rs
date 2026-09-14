@@ -39,7 +39,7 @@ fn find_only_box(home: &std::path::Path) -> std::path::PathBuf {
             .filter(|p| p.is_dir())
             .collect()
     };
-    let projects = dirs(&home.join(".terra/box"));
+    let projects = dirs(&home.join(".terra").join("box"));
     assert_eq!(projects.len(), 1, "expected one project: {projects:?}");
     let mut boxes = dirs(&projects[0]);
     assert_eq!(boxes.len(), 1, "expected one box: {boxes:?}");
