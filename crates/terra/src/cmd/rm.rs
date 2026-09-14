@@ -244,7 +244,7 @@ mod tests {
         let inheritance = crate::sys::pass_lock(&mut command, &lock).unwrap();
         let mut child = command.spawn().unwrap();
         drop(inheritance);
-        std::fs::write(bx.get_dir().join(state::PID_FILE), child.id().to_string()).unwrap();
+        BoxRef::rewrite_lock_line(&lock, &child.id().to_string()).unwrap();
         drop(lock);
 
         let error = run(

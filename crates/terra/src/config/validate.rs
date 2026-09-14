@@ -42,7 +42,7 @@ pub(crate) fn validate(cfg: &Config) -> Result<()> {
 
 fn validate_workdir(cfg: &Config) -> Result<()> {
     if let Some(dir) = &cfg.workload.workdir
-        && !dir.is_absolute()
+        && !dir.as_os_str().to_string_lossy().starts_with('/')
     {
         bail!(
             "workload.workdir must be absolute: '{}'",

@@ -16,6 +16,13 @@ fn signal_vm(bx: &BoxRef, signal: sys::VmSignal) -> Result<Option<(VmProcess, sy
     };
     #[cfg(windows)]
     if matches!(signal, sys::VmSignal::GracefulStop) {
+        if vm.started_at.is_none() || sys::read_process_start_time(vm.pid) != vm.started_at {
+            return Ok(Some((vm, sys::SignalResult::IdentityUnknown)));
+        }
+        if bx.get_holder() == Holder::SettingUp {
+            let result = sys::signal_pid(vm.pid, vm.started_at, sys::VmSignal::ForcedStop)?;
+            return Ok(Some((vm, result)));
+        }
         return request_graceful_stop(bx).map(|()| Some((vm, sys::SignalResult::Sent)));
     }
     let result = sys::signal_pid(vm.pid, vm.started_at, signal)

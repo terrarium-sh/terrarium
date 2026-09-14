@@ -11,13 +11,14 @@ use std::os::windows::{
 };
 use std::path::Path;
 use std::process::Command;
-use windows_sys::Win32::Foundation::{FILETIME, GENERIC_ALL, HANDLE_FLAG_INHERIT, STILL_ACTIVE};
+use windows_sys::Win32::Foundation::{FILETIME, HANDLE_FLAG_INHERIT, STILL_ACTIVE};
 use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW};
 use windows_sys::Win32::Security::{
     ACL, ACL_REVISION, AddAccessAllowedAceEx, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
     GetLengthSid, GetTokenInformation, InitializeAcl, OBJECT_INHERIT_ACE,
     PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
+use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
 use windows_sys::Win32::System::Threading::{
     CREATE_NEW_PROCESS_GROUP, GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, OpenProcess,
     OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, TerminateProcess,
@@ -162,7 +163,7 @@ pub fn set_owner_only(path: &Path, directory: bool) -> Result<()> {
             acl_ptr,
             ACL_REVISION,
             inherit,
-            GENERIC_ALL,
+            FILE_ALL_ACCESS,
             sid.as_ptr().cast_mut().cast(),
         ))?;
     }
@@ -285,6 +286,12 @@ pub fn signal_pid(
 ) -> Result<SignalResult> {
     let rights = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE;
     let Some(result) = with_process(pid, rights, |process| {
+        let mut exit = 0;
+        // SAFETY: `process` is an open process handle and `exit` is writable.
+        win_ok(unsafe { GetExitCodeProcess(process, &raw mut exit) })?;
+        if exit != STILL_ACTIVE as u32 {
+            return Ok(SignalResult::IdentityUnknown);
+        }
         if published_start_time
             .is_none_or(|published| read_process_start_time(pid) != Some(published))
         {
@@ -414,7 +421,6 @@ mod tests {
     use windows_sys::Win32::Security::{
         ACCESS_ALLOWED_ACE, EqualSid, GetAce, GetSecurityDescriptorControl, SE_DACL_PROTECTED,
     };
-    use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
 
     #[test]
     fn the_handed_lock_handle_is_matched_by_identity() {
@@ -481,10 +487,7 @@ mod tests {
                 assert_ne!(GetAce(acl, 0, &raw mut entry), 0);
                 let entry = &*entry.cast::<ACCESS_ALLOWED_ACE>();
                 assert_eq!(entry.Header.AceType, 0);
-                assert!(
-                    entry.Mask & GENERIC_ALL != 0
-                        || entry.Mask & FILE_ALL_ACCESS == FILE_ALL_ACCESS
-                );
+                assert_eq!(entry.Mask, FILE_ALL_ACCESS);
                 assert_ne!(
                     EqualSid(
                         (&raw const entry.SidStart).cast_mut().cast(),

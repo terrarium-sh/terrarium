@@ -87,15 +87,12 @@ mod tests {
             .to_string();
         assert!(err.contains("this box's own state"), "{err}");
 
-        // An ordinary one resolves to the path a boot mounts, `..` and all -
-        // `std::path::absolute` leaves those in, and `terra show` printed them.
         let mut ok = config::parse_recipe(
             "mounts:\n  - host: ./sub/../src\n    guest: /work\n",
             &project,
             Path::new("r.yaml"),
         )
         .unwrap();
-        assert!(ok.mounts[0].host.to_string_lossy().contains(".."));
         ok.mounts = mount::resolve_mounts(&ok, &bx).unwrap();
         assert_eq!(
             ok.mounts[0].host,

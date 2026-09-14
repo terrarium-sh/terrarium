@@ -400,14 +400,18 @@ mod tests {
 
     #[test]
     fn dotted_path_is_local() {
-        let p = resolve_recipe_path("./pi-dev.yaml", Path::new("/proj")).unwrap();
-        assert_eq!(p, PathBuf::from("/proj/pi-dev.yaml"));
+        let project = tempfile::tempdir().unwrap();
+        let p = resolve_recipe_path("./pi-dev.yaml", project.path()).unwrap();
+        assert_eq!(p, project.path().join("pi-dev.yaml"));
     }
 
     #[test]
     fn absolute_path_is_kept() {
-        let p = resolve_recipe_path("/etc/x.yaml", Path::new("/proj")).unwrap();
-        assert_eq!(p, PathBuf::from("/etc/x.yaml"));
+        let directory = tempfile::tempdir().unwrap();
+        let recipe = directory.path().join("x.yaml");
+        let project = directory.path().join("project");
+        let p = resolve_recipe_path(recipe.to_str().unwrap(), &project).unwrap();
+        assert_eq!(p, recipe);
     }
 
     #[test]
@@ -421,10 +425,11 @@ mod tests {
     /// name for the same reason.
     #[test]
     fn a_bare_yaml_filename_is_a_path() {
+        let project = tempfile::tempdir().unwrap();
         for file in ["ci.yaml", "ci.yml"] {
             assert!(is_path(file), "{file}");
-            let p = resolve_recipe_path(file, Path::new("/proj")).unwrap();
-            assert_eq!(p, Path::new("/proj").join(file));
+            let p = resolve_recipe_path(file, project.path()).unwrap();
+            assert_eq!(p, project.path().join(file));
         }
         assert!(!is_path("ci"));
         assert!(!is_path("ci.v2"), "an extension that is not a recipe's");

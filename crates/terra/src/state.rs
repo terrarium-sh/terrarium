@@ -174,7 +174,7 @@ impl BoxRef {
     }
 
     /// Rewrites the lock metadata without replacing the inode.
-    fn rewrite_lock_line(mut file: &File, line: &str) -> std::io::Result<()> {
+    pub(crate) fn rewrite_lock_line(mut file: &File, line: &str) -> std::io::Result<()> {
         use std::io::{Seek as _, Write as _};
         file.seek(std::io::SeekFrom::Start(0))?;
         file.set_len(0)?;
@@ -1058,11 +1058,11 @@ mod tests {
         );
 
         // A line from before starttimes were recorded still reads.
-        std::fs::write(b.get_dir().join(PID_FILE), "4242").unwrap();
+        BoxRef::rewrite_lock_line(&lock, "4242").unwrap();
         let legacy = b.read_vm_process().unwrap();
         assert_eq!(legacy.pid, 4242);
         assert_eq!(legacy.started_at, None, "the old format has no starttime");
-        std::fs::write(b.get_dir().join(PID_FILE), "4242 bake").unwrap();
+        BoxRef::rewrite_lock_line(&lock, "4242 bake").unwrap();
         assert_eq!(
             b.read_vm_process().unwrap().started_at,
             None,
@@ -1109,6 +1109,7 @@ mod tests {
         );
 
         drop(lock);
+        wait_until_free(&b);
         assert_eq!(b.get_holder(), Holder::Free);
     }
 
