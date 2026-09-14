@@ -27,7 +27,7 @@ crate-type = ["cdylib"]
 [dependencies]
 lru = "0.18"
 terra-network = { path = "../../crates/terra-network" }
-wit-bindgen = "=0.61.1"
+wit-bindgen = "=0.62.0"
 
 [profile.release]
 overflow-checks = true
