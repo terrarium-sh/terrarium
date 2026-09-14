@@ -111,6 +111,8 @@ async fn preopen_retains_its_directory_and_rights_without_ambient_resources() {
         .unwrap();
 }
 
+/// Windows denies syncing WASI's read-only directory handle; escape and
+/// readonly-mutation checks still run on every host.
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn wasi_itself_denies_escape_and_readonly_mutation() {
@@ -129,9 +131,15 @@ async fn wasi_itself_denies_escape_and_readonly_mutation() {
         store
             .run_concurrent(async |accessor| {
                 let access = accessor.with_getter::<WasiFilesystem>(WasiFilesystemView::filesystem);
-                WasiFilesystem::sync(&access, Resource::new_borrow(root_fd.rep()))
-                    .await
-                    .unwrap();
+                let synced =
+                    WasiFilesystem::sync(&access, Resource::new_borrow(root_fd.rep())).await;
+                #[cfg(unix)]
+                synced.unwrap();
+                #[cfg(windows)]
+                assert!(matches!(
+                    synced.unwrap_err().downcast().unwrap(),
+                    ErrorCode::Access
+                ));
                 let open = async |path: &str, flags, mode| {
                     WasiFilesystem::open_at(
                         &access,

@@ -363,7 +363,7 @@ jobs:
           cargo clippy --locked --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
       - name: Run workspace unit tests
         shell: pwsh
-        run: cargo test --locked --target ${{ matrix.target }} --workspace
+        run: cargo test --locked --target ${{ matrix.target }} --workspace --no-fail-fast
       - name: Check distribution
         shell: pwsh
         run: |
