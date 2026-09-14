@@ -489,12 +489,16 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[allow(unsafe_code)]
     fn a_get_refuses_a_nonregular_destination() {
+        use std::os::unix::ffi::OsStrExt as _;
         use std::os::unix::fs::FileTypeExt;
 
         let dir = tempfile::tempdir().unwrap();
         let fifo = dir.path().join("fifo");
-        rustix::fs::mkfifoat(rustix::fs::CWD, &fifo, rustix::fs::Mode::empty()).unwrap();
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `fifo_c` stays alive for the call and the tempdir owns the path.
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
         assert!(
             std::fs::symlink_metadata(&fifo)
                 .unwrap()

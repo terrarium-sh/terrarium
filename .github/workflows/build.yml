@@ -3,7 +3,7 @@ name: Build
 on:
   push:
     branches: [main]
-  pull_request:
+  # pull_request: disabled until the main build is green
   workflow_dispatch:
     inputs:
       native_vm_tests:

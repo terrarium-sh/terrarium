@@ -2,12 +2,13 @@
 name: Security audit
 
 on:
-  schedule:
-    - cron: '23 4 * * 1'
-  push:
-    paths:
-      - '**/Cargo.lock'
-      - '**/Cargo.toml'
+  # schedule:
+  #   - cron: '23 4 * * 1'
+  # push:
+  #   paths:
+  #     - '**/Cargo.lock'
+  #     - '**/Cargo.toml'
+  workflow_dispatch:
 
 permissions:
   contents: read

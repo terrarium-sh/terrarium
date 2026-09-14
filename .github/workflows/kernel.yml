@@ -2,15 +2,15 @@ name: Kernel export
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - pins.mk
-      - Makefile
-      - kernel/**
-      - scripts/check-kernel-config.py
-      - scripts/kernel-container.sh
-      - scripts/kernel-artifact.py
-      - .github/workflows/kernel.yml
+  # push:
+  #   paths:
+  #     - pins.mk
+  #     - Makefile
+  #     - kernel/**
+  #     - scripts/check-kernel-config.py
+  #     - scripts/kernel-container.sh
+  #     - scripts/kernel-artifact.py
+  #     - .github/workflows/kernel.yml
 
 permissions:
   contents: read

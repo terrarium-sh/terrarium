@@ -430,14 +430,15 @@ async fn wasm_filesystem_component_retains_linked_nodes_after_forget() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(unix)]
+#[allow(unsafe_code)]
 async fn wasm_filesystem_component_create_rejects_existing_fifo() {
+    use std::os::unix::ffi::OsStrExt as _;
+
     let root = tempfile::tempdir().expect("tempdir");
-    rustix::fs::mkfifoat(
-        rustix::fs::CWD,
-        root.path().join("fifo"),
-        rustix::fs::Mode::empty(),
-    )
-    .expect("FIFO fixture");
+    let fifo = root.path().join("fifo");
+    let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("fifo path");
+    // SAFETY: `fifo_c` stays alive for the call and the tempdir owns the path.
+    assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
     let Mounted {
         channel,
         ram,

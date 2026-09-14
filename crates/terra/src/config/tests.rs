@@ -648,10 +648,15 @@ fn component_memory_defaults_overrides_and_validation() {
 
 #[cfg(unix)]
 #[test]
+#[allow(unsafe_code)]
 fn recipe_reads_reject_fifos_and_device_symlinks() {
+    use std::os::unix::ffi::OsStrExt as _;
+
     let dir = tempfile::tempdir().unwrap();
     let fifo = dir.path().join(MANIFEST_FILE);
-    rustix::fs::mkfifoat(rustix::fs::CWD, &fifo, rustix::fs::Mode::empty()).unwrap();
+    let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    // SAFETY: `fifo_c` stays alive for the call and the tempdir owns the path.
+    assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
     assert!(read_recipe_text(&fifo).is_err());
     let device = dir.path().join("device.yaml");
     std::os::unix::fs::symlink("/dev/zero", &device).unwrap();
