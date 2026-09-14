@@ -255,6 +255,8 @@ fn dirents(reply: &[u8]) -> Vec<(u64, String)> {
     entries
 }
 
+/// WASI's Windows handles omit delete sharing, so rename and unlink of an
+/// open file return access denied while the file remains readable.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn wasm_filesystem_component_serves_files_through_standard_wasi() {
@@ -341,17 +343,30 @@ async fn wasm_filesystem_component_serves_files_through_standard_wasi() {
     );
     let mut rename = 1_u64.to_le_bytes().to_vec();
     rename.extend_from_slice(b"written\0renamed\0");
+    let expected_mutation_error = if cfg!(windows) { -13 } else { 0 };
     assert_eq!(
         reply_error(&submit(&channel, &memory, 9, &request(12, 12, 1, &rename)).await),
-        0
+        expected_mutation_error
     );
+    let retained_name = if cfg!(windows) { "written" } else { "renamed" };
     assert_eq!(
-        std::fs::read(root.path().join("renamed")).expect("renamed file"),
+        std::fs::read(root.path().join(retained_name)).expect("retained file"),
         b"new"
     );
+    assert_eq!(root.path().join("written").exists(), cfg!(windows));
+    assert_eq!(root.path().join("renamed").exists(), cfg!(unix));
+    let unlink = format!("{retained_name}\0");
     assert_eq!(
-        reply_error(&submit(&channel, &memory, 10, &request(10, 13, 1, b"renamed\0")).await),
-        0
+        reply_error(
+            &submit(
+                &channel,
+                &memory,
+                10,
+                &request(10, 13, 1, unlink.as_bytes())
+            )
+            .await
+        ),
+        expected_mutation_error
     );
     let mut read = vec![0; 24];
     read[..8].copy_from_slice(&handle.to_le_bytes());
@@ -371,6 +386,7 @@ async fn wasm_filesystem_component_serves_files_through_standard_wasi() {
     );
     channel.close().expect("close");
     assert!(!root.path().join("renamed").exists());
+    assert_eq!(root.path().join("written").exists(), cfg!(windows));
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -27,7 +27,7 @@ crate-type = ["cdylib"]
 [dependencies]
 terra-device-transport = { path = "../device-transport" }
 terra-limits = { path = "../../crates/terra-limits" }
-wit-bindgen = { version = "=0.61.1", features = ["async-spawn", "inter-task-wakeup"] }
+wit-bindgen = { version = "=0.62.0", features = ["async-spawn", "inter-task-wakeup"] }
 futures = { version = "0.3", default-features = false }
 
 [profile.release]
