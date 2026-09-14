@@ -29,7 +29,7 @@ terra-protocol = { path = "../../crates/terra-protocol" }
 terra-device-transport = { path = "../device-transport" }
 terra-limits = { path = "../../crates/terra-limits" }
 terra-vsock-device = { path = "../vsock-device" }
-wit-bindgen = { version = "=0.61.1", features = ["async-spawn", "inter-task-wakeup"] }
+wit-bindgen = { version = "=0.62.0", features = ["async-spawn", "inter-task-wakeup"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 futures-channel = "0.3"
 serde = "1"
