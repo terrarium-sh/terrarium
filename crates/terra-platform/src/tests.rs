@@ -532,17 +532,7 @@ mod block_component_tests {
     ) -> (Linker<super::super::engine::DeviceHost>, Fixture) {
         let engine = device_engine().expect("engine builds");
         let linker = block_component_linker(&engine).expect("block imports link");
-        let ram = std::sync::Arc::new(
-            vm_memory::GuestMemoryMmap::from_ranges(&[(
-                vm_memory::GuestAddress(0),
-                usize::try_from(RAM).unwrap(),
-            )])
-            .unwrap(),
-        );
-        let mut store = super::super::engine::device_store_with_ram(
-            &engine,
-            SyntheticRam::from_shared(ram.clone()).unwrap(),
-        );
+        let mut store = device_store(&engine, RAM).expect("store builds");
         let mut disk = BoundedDisk::new(capacity_sectors * 512, readonly);
         if !readonly {
             disk.write(3 * 512, &[0xABu8; 512]).ok();
@@ -962,6 +952,7 @@ mod block_component_tests {
         assert!(SyntheticRam::new(RAM).is_some());
     }
 
+    #[cfg(unix)]
     #[test]
     fn shared_ram_aliases_one_mapping() {
         use super::super::BoundedMemory;
@@ -986,6 +977,7 @@ mod block_component_tests {
         assert_eq!(&back, b"shared");
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn component_operates_on_shared_machine_ram() {
         use super::super::engine::device_store_with_ram;
@@ -1620,6 +1612,7 @@ fn boot_artifacts() -> super::worker::TrustedArtifacts {
     }
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs /dev/kvm and `make test-component-boot`"]
 async fn kernel_boots_directory_share() {
@@ -2588,6 +2581,7 @@ async fn kernel_boots_through_standard_wasi_large_tcp() {
 async fn kernel_uploads_through_standard_wasi_tcp() {
     assert_policy_dns_upload(native_ipv4_address(), 65_537).await;
 }
+#[cfg(unix)]
 #[test]
 #[allow(unsafe_code)]
 fn vsock_header_matches_upstream_packet_layout() {
@@ -2636,7 +2630,7 @@ fn vsock_header_matches_upstream_packet_layout() {
 /// (chain/byte caps, no indirect, uniform direction, exact framing).
 /// There is deliberately no fourth arm: anything upstream rejects
 /// that we accept is a bug in our walk, and fails loudly.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod blk_oracle {
     use super::super::component::block::backing::ParsedRequest;
     use virtio_blk::request::{Request, RequestType};
@@ -2975,6 +2969,7 @@ mod blk_oracle {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn memory_hole_is_rejected_before_partial_write() {
     use std::sync::Arc;
