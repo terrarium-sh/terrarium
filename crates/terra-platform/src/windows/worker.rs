@@ -278,37 +278,18 @@ fn run_x64_vcpu(
     stop: &Arc<AtomicBool>,
 ) -> Result<(), String> {
     let emulator = crate::windows::whp::Emulator::new().map_err(|error| error.to_string())?;
-    log::debug!("Windows vCPU {vcpu}: entering WHP");
-    let mut exit_count = 0_u64;
     while !stop.load(Ordering::Relaxed) {
         let raw = partition
             .run_vcpu_context(vcpu)
             .map_err(|error| error.to_string())?;
-        exit_count = exit_count.saturating_add(1);
-        let exit = crate::windows::whp::RunExit::from(raw);
-        let trace_exit = exit_count <= 512 || exit_count.is_power_of_two();
-        if trace_exit {
-            log::debug!(
-                "Windows vCPU {vcpu}: exit {exit_count}, reason={:#x}, rip={:#x}, {exit:?}",
-                raw.ExitReason,
-                raw.VpContext.Rip
-            );
-        }
-        match exit {
+        match crate::windows::whp::RunExit::from(raw) {
             crate::windows::whp::RunExit::MemoryAccess { .. } => {
                 let mut access =
                     |address: u64,
                      write: bool,
                      data: &mut [u8]|
                      -> Result<(), crate::windows::whp::PartitionError> {
-                        let result =
-                            access_x64_memory(partition, worker, ioapic, address, write, data);
-                        if trace_exit {
-                            log::debug!(
-                                "Windows vCPU {vcpu}: MMIO address={address:#x}, write={write}, data={data:02x?}, result={result:?}"
-                            );
-                        }
-                        result
+                        access_x64_memory(partition, worker, ioapic, address, write, data)
                     };
                 let mut io = |port,
                               write,
