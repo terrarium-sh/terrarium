@@ -130,7 +130,7 @@ fn native_boot_executes_shell() {
             "--",
             "/bin/sh",
             "-ec",
-            &format!("test \"$(nproc)\" = {cpus}; echo BOOT_SHELL_OK"),
+            &format!("test \"$(nproc)\" = {cpus}; sleep 1; echo BOOT_SHELL_OK"),
         ]);
         assert!(
             output.contains("BOOT_SHELL_OK"),

@@ -33,6 +33,13 @@ use windows_sys::Win32::System::Hypervisor::{
 #[cfg(target_arch = "aarch64")]
 const ARM64_SUPPORT: u64 = 1 << 11;
 
+// windows-sys omits the WHP register union's required 16-byte alignment.
+#[repr(C, align(16))]
+#[derive(Clone, Copy, Default)]
+struct AlignedRegisterValue(WHV_REGISTER_VALUE);
+
+const _: () = assert!(size_of::<AlignedRegisterValue>() == size_of::<WHV_REGISTER_VALUE>());
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WhpError(i32);
 
@@ -357,7 +364,7 @@ impl Partition {
         names: &[WHV_REGISTER_NAME],
     ) -> Result<Vec<WHV_REGISTER_VALUE>, PartitionError> {
         self.require_vcpu(index)?;
-        let mut values = vec![WHV_REGISTER_VALUE::default(); names.len()];
+        let mut values = vec![AlignedRegisterValue::default(); names.len()];
         // SAFETY: names and values have equal, valid lengths for this synchronous call.
         result(unsafe {
             WHvGetVirtualProcessorRegisters(
@@ -365,11 +372,11 @@ impl Partition {
                 index,
                 names.as_ptr(),
                 names.len() as u32,
-                values.as_mut_ptr(),
+                values.as_mut_ptr().cast(),
             )
         })
         .map_err(PartitionError::Api)?;
-        Ok(values)
+        Ok(values.into_iter().map(|value| value.0).collect())
     }
 
     pub fn register_u64(&self, index: u32, name: WHV_REGISTER_NAME) -> Result<u64, PartitionError> {
@@ -388,6 +395,7 @@ impl Partition {
         if names.len() != values.len() {
             return Err(PartitionError::InvalidVcpu);
         }
+        let values: Vec<_> = values.iter().copied().map(AlignedRegisterValue).collect();
         // SAFETY: names and values have equal, valid lengths for this synchronous call.
         result(unsafe {
             WHvSetVirtualProcessorRegisters(
@@ -395,7 +403,7 @@ impl Partition {
                 index,
                 names.as_ptr(),
                 names.len() as u32,
-                values.as_ptr(),
+                values.as_ptr().cast(),
             )
         })
         .map_err(PartitionError::Api)
@@ -1060,6 +1068,36 @@ impl RunExit {
 
 #[cfg(all(test, target_arch = "x86_64"))]
 mod tests {
+    use super::{Partition, WHV_REGISTER_VALUE};
+
+    #[test]
+    #[ignore = "requires Windows Hypervisor Platform"]
+    fn register_access_accepts_unaligned_binding_values() {
+        use windows_sys::Win32::System::Hypervisor::{WHvX64RegisterRax, WHvX64RegisterRbx};
+
+        #[repr(C, align(16))]
+        struct RegisterInput {
+            padding: u64,
+            values: [WHV_REGISTER_VALUE; 2],
+        }
+
+        let input = RegisterInput {
+            padding: 0,
+            values: [
+                WHV_REGISTER_VALUE { Reg64: 0x1234 },
+                WHV_REGISTER_VALUE { Reg64: 0x5678 },
+            ],
+        };
+        assert_eq!(input.values.as_ptr().addr() % 16, 8);
+        let ram = terra_runtime::WindowsRam::allocate(2 << 20).unwrap();
+        let partition = Partition::new(ram, 1).unwrap();
+        partition.create_vcpu(0).unwrap();
+        let names = [WHvX64RegisterRax, WHvX64RegisterRbx];
+        partition.set_registers(0, &names, &input.values).unwrap();
+        assert_eq!(partition.register_u64(0, names[0]).unwrap(), 0x1234);
+        assert_eq!(partition.register_u64(0, names[1]).unwrap(), 0x5678);
+    }
+
     #[test]
     fn invalid_opcode_is_a_pending_exception() {
         assert_eq!(
