@@ -92,6 +92,10 @@ pub fn set_open_file_mode(file: &File, mode: u32) -> Result<()> {
     file.set_permissions(std::fs::Permissions::from_mode(mode))
 }
 
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "matches the fallible Windows implementation"
+)]
 pub fn make_sparse(_file: &File) -> Result<()> {
     Ok(())
 }

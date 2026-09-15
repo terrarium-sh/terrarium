@@ -49,7 +49,7 @@ const MAX_TOTAL: u64 = terra_limits::MAX_BATCH_GUEST_COPY_BYTES;
 const MAX_DISCARD: u64 = terra_limits::MAX_GUEST_DISCARD_BYTES;
 const MAX_RANGES: usize = 16;
 const ID_TAG: &[u8] = b"terra-vda";
-const DISCARD_BYTES: u64 = 16;
+const DISCARD_BYTES: usize = 16;
 const DISCARD_SECTOR_ALIGNMENT: u32 = 1;
 
 fn build_block_configuration(capacity: u64, readonly: bool) -> Result<(u64, Vec<u8>), DeviceError> {
@@ -87,7 +87,7 @@ fn build_block_configuration(capacity: u64, readonly: bool) -> Result<(u64, Vec<
 }
 
 fn parse_discard_range(bytes: &[u8], capacity: u64) -> Result<(u64, u64), u8> {
-    let bytes: &[u8; DISCARD_BYTES as usize] = bytes.try_into().map_err(|_| STATUS_IOERR)?;
+    let bytes: &[u8; DISCARD_BYTES] = bytes.try_into().map_err(|_| STATUS_IOERR)?;
     let sector = u64::from_le_bytes(bytes[..8].try_into().map_err(|_| STATUS_IOERR)?);
     let sectors = u64::from(u32::from_le_bytes(
         bytes[8..12].try_into().map_err(|_| STATUS_IOERR)?,
@@ -106,6 +106,39 @@ fn parse_discard_range(bytes: &[u8], capacity: u64) -> Result<(u64, u64), u8> {
     )
     .map(|offset| (offset, sectors * SECTOR_BYTES))
     .ok_or(STATUS_IOERR)
+}
+
+fn write_device_id(data: &[Range], total: u64, epoch: u64) -> Result<(), DeviceError> {
+    let mut tag = [0u8; 20];
+    let len = ID_TAG.len().min(20);
+    tag[..len].copy_from_slice(&ID_TAG[..len]);
+    let mut remaining = &tag[..total.min(20) as usize];
+    for range in data {
+        if remaining.is_empty() {
+            break;
+        }
+        let take = remaining
+            .len()
+            .min(usize::try_from(range.len).unwrap_or(usize::MAX));
+        write_guest(range.addr, &remaining[..take], epoch)?;
+        remaining = &remaining[take..];
+    }
+    Ok(())
+}
+
+async fn execute_discard(data: &[Range], capacity: u64) -> Result<(), u8> {
+    let [range] = data else {
+        return Err(STATUS_IOERR);
+    };
+    if range.len != DISCARD_BYTES as u64 {
+        return Err(STATUS_IOERR);
+    }
+    let bytes =
+        terra::host::memory::read(range.addr, DISCARD_BYTES as u64).map_err(|_| STATUS_IOERR)?;
+    let (offset, len) = parse_discard_range(&bytes, capacity)?;
+    terra::host::disk::discard(offset, len)
+        .await
+        .map_err(|_| STATUS_IOERR)
 }
 
 static CLOSED: AtomicBool = AtomicBool::new(false);
@@ -379,41 +412,16 @@ impl Guest for Block {
                 write_status(status_addr, status, epoch).unwrap_or(STATUS_IOERR)
             }
             T_GET_ID => {
-                let mut tag = [0u8; 20];
-                let len = ID_TAG.len().min(20);
-                tag[..len].copy_from_slice(&ID_TAG[..len]);
-                let mut remaining = &tag[..total.min(20) as usize];
-                for range in &data {
-                    if remaining.is_empty() {
-                        break;
-                    }
-                    let take = remaining
-                        .len()
-                        .min(usize::try_from(range.len).unwrap_or(usize::MAX));
-                    if write_guest(range.addr, &remaining[..take], epoch).is_err() {
-                        return fail();
-                    }
-                    remaining = &remaining[take..];
+                if write_device_id(&data, total, epoch).is_err() {
+                    return fail();
                 }
                 write_status(status_addr, STATUS_OK, epoch).unwrap_or(STATUS_IOERR)
             }
             T_DISCARD => {
-                if data.len() != 1 || data[0].len != DISCARD_BYTES {
-                    return fail();
-                }
-                let Ok(bytes) = terra::host::memory::read(data[0].addr, DISCARD_BYTES) else {
-                    return fail();
-                };
-                let (offset, len) = match parse_discard_range(&bytes, capacity) {
-                    Ok(range) => range,
-                    Err(status) => {
-                        return write_status(status_addr, status, epoch).unwrap_or(STATUS_IOERR);
-                    }
-                };
-                let status = match terra::host::disk::discard(offset, len).await {
-                    Ok(()) => STATUS_OK,
-                    Err(_) => STATUS_IOERR,
-                };
+                let status = execute_discard(&data, capacity)
+                    .await
+                    .err()
+                    .unwrap_or(STATUS_OK);
                 write_status(status_addr, status, epoch).unwrap_or(STATUS_IOERR)
             }
             _ => write_status(status_addr, STATUS_UNSUPP, epoch).unwrap_or(STATUS_IOERR),
@@ -693,8 +701,8 @@ mod component_export {
 mod tests {
     use super::*;
 
-    fn discard_segment(sector: u64, sectors: u32, flags: u32) -> [u8; DISCARD_BYTES as usize] {
-        let mut bytes = [0; DISCARD_BYTES as usize];
+    fn discard_segment(sector: u64, sectors: u32, flags: u32) -> [u8; DISCARD_BYTES] {
+        let mut bytes = [0; DISCARD_BYTES];
         bytes[..8].copy_from_slice(&sector.to_le_bytes());
         bytes[8..12].copy_from_slice(&sectors.to_le_bytes());
         bytes[12..].copy_from_slice(&flags.to_le_bytes());

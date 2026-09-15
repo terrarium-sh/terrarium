@@ -618,7 +618,7 @@ mod block_component_tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn component_advertises_bounded_io_and_flush() {
+    async fn component_advertises_bounded_io_flush_and_discard() {
         let (_, mut fixture) = fixture(256, false).await;
         assert_eq!(
             fixture
@@ -638,7 +638,15 @@ mod block_component_tests {
         );
         assert_eq!(
             mmio(&mut fixture, Operation::Read, 0x010, 4, 0).await.value,
-            u64::from((1u32 << 1) | (1 << 2) | (1 << 9))
+            u64::from((1u32 << 1) | (1 << 2) | (1 << 9) | (1 << 13))
+        );
+        assert_eq!(
+            mmio(&mut fixture, Operation::Read, 0x124, 4, 0).await.value,
+            terra_limits::MAX_GUEST_DISCARD_BYTES / 512
+        );
+        assert_eq!(
+            mmio(&mut fixture, Operation::Read, 0x128, 4, 0).await.value,
+            1
         );
         assert_eq!(
             mmio(&mut fixture, Operation::Write, 0x014, 4, 1)
