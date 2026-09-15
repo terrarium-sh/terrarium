@@ -101,7 +101,7 @@ fn read_allocated_bytes(file: &std::fs::File) -> u64 {
             file.as_raw_handle(),
             FileStandardInfo,
             (&raw mut info).cast(),
-            core::mem::size_of::<FILE_STANDARD_INFO>() as u32,
+            u32::try_from(core::mem::size_of::<FILE_STANDARD_INFO>()).unwrap(),
         )
     };
     assert_ne!(result, 0);

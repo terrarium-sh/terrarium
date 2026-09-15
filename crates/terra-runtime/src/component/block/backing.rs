@@ -366,7 +366,7 @@ fn discard_file(file: &std::fs::File, offset: u64, len: u64) -> std::io::Result<
             file.as_raw_handle(),
             FSCTL_SET_ZERO_DATA,
             (&raw const range).cast(),
-            core::mem::size_of_val(&range) as u32,
+            u32::try_from(core::mem::size_of_val(&range)).map_err(std::io::Error::other)?,
             core::ptr::null_mut(),
             0,
             &raw mut returned,
