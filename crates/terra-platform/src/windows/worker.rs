@@ -285,31 +285,30 @@ fn run_x64_vcpu(
             .run_vcpu_context(vcpu)
             .map_err(|error| error.to_string())?;
         exit_count = exit_count.saturating_add(1);
-        if exit_count.is_power_of_two() {
+        let exit = crate::windows::whp::RunExit::from(raw);
+        let trace_exit = exit_count <= 512 || exit_count.is_power_of_two();
+        if trace_exit {
             log::debug!(
-                "Windows vCPU {vcpu}: exit {exit_count}, reason={:#x}, rip={:#x}",
+                "Windows vCPU {vcpu}: exit {exit_count}, reason={:#x}, rip={:#x}, {exit:?}",
                 raw.ExitReason,
                 raw.VpContext.Rip
             );
         }
-        match crate::windows::whp::RunExit::from(raw) {
+        match exit {
             crate::windows::whp::RunExit::MemoryAccess { .. } => {
                 let mut access =
                     |address: u64,
                      write: bool,
                      data: &mut [u8]|
                      -> Result<(), crate::windows::whp::PartitionError> {
-                        if partition.contains_guest_memory(address, data.len()) {
-                            return partition.access_guest_memory(address, write, data);
+                        let result =
+                            access_x64_memory(partition, worker, ioapic, address, write, data);
+                        if trace_exit {
+                            log::debug!(
+                                "Windows vCPU {vcpu}: MMIO address={address:#x}, write={write}, data={data:02x?}, result={result:?}"
+                            );
                         }
-                        if (crate::windows::amd64::IOAPIC_BASE
-                            ..crate::windows::amd64::IOAPIC_BASE
-                                + crate::windows::amd64::IOAPIC_SIZE)
-                            .contains(&address)
-                        {
-                            return ioapic_access(ioapic, address, write, data);
-                        }
-                        mmio_access(worker, address, write, data)
+                        result
                     };
                 let mut io = |port,
                               write,
@@ -382,6 +381,27 @@ fn require_reentry(worker: &NativeVcpu, exit: Exit) -> Result<(), String> {
     )
     .then_some(())
     .ok_or("unexpected Windows x64 VMM completion".to_owned())
+}
+
+#[cfg(target_arch = "x86_64")]
+fn access_x64_memory(
+    partition: &crate::windows::whp::Partition,
+    worker: &NativeVcpu,
+    ioapic: &IoApicHandle,
+    address: u64,
+    write: bool,
+    data: &mut [u8],
+) -> Result<(), crate::windows::whp::PartitionError> {
+    if partition.contains_guest_memory(address, data.len()) {
+        return partition.access_guest_memory(address, write, data);
+    }
+    if (crate::windows::amd64::IOAPIC_BASE
+        ..crate::windows::amd64::IOAPIC_BASE + crate::windows::amd64::IOAPIC_SIZE)
+        .contains(&address)
+    {
+        return ioapic_access(ioapic, address, write, data);
+    }
+    mmio_access(worker, address, write, data)
 }
 
 #[cfg(target_arch = "x86_64")]
