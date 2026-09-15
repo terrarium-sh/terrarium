@@ -113,6 +113,36 @@ impl Drop for BoxFixture {
 
 #[test]
 #[ignore = "requires a release binary and usable KVM, Hypervisor.framework, or WHP"]
+fn native_boot_executes_shell() {
+    for cpus in [1, 2] {
+        let fixture = BoxFixture::new();
+        let recipe = fixture.directory.path().join("native.yaml");
+        let config = serde_json::json!({
+            "hw": {"cpus": cpus, "mem_mib": 256},
+            "workload": {"entrypoint": "/bin/sleep", "args": ["300"]}
+        });
+        std::fs::write(&recipe, yaml_serde::to_string(&config).unwrap()).unwrap();
+        fixture.successful(&[recipe.to_str().unwrap(), "setup"]);
+        fixture.successful(&["native", "-d"]);
+        let output = fixture.successful(&[
+            "native",
+            "exec",
+            "--",
+            "/bin/sh",
+            "-ec",
+            &format!("test \"$(nproc)\" = {cpus}; echo BOOT_SHELL_OK"),
+        ]);
+        assert!(
+            output.contains("BOOT_SHELL_OK"),
+            "{cpus}-CPU guest did not produce the shell marker:\n{output}\nguest diagnostics:\n{}",
+            fixture.diagnostics()
+        );
+        fixture.successful(&["native", "stop"]);
+    }
+}
+
+#[test]
+#[ignore = "requires a release binary and usable KVM, Hypervisor.framework, or WHP"]
 fn native_boot_mounts_network_storage_and_restart() {
     let fixture = BoxFixture::new();
     let writable = fixture.directory.path().join("writable");

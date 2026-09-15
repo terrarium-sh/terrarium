@@ -61,7 +61,9 @@ impl VcpuGroup {
     ) -> Result<(), String> {
         self.threads.push(
             std::thread::Builder::new()
-                .spawn(run)
+                .spawn(move || {
+                    run().inspect_err(|error| log::error!("Windows vCPU failed: {error}"))
+                })
                 .map_err(|error| error.to_string())?,
         );
         Ok(())
@@ -121,6 +123,11 @@ fn launch_vcpus(
 ) -> Result<StartedVcpus<VcpuReaper>, String> {
     crate::windows::amd64::configure_planned_boot(&partition, boot.entry, boot.boot_argument)
         .map_err(|error| format!("configuring boot: {error:?}"))?;
+    log::info!(
+        "Windows x64 boot: entry={:#x}, boot argument={:#x}",
+        boot.entry,
+        boot.boot_argument
+    );
     let mut group = VcpuGroup::new(partition, hard_stop);
     for (id, control) in (0_u32..).zip(controls) {
         let partition = Arc::clone(&group.partition);
@@ -271,10 +278,20 @@ fn run_x64_vcpu(
     stop: &Arc<AtomicBool>,
 ) -> Result<(), String> {
     let emulator = crate::windows::whp::Emulator::new().map_err(|error| error.to_string())?;
+    log::debug!("Windows vCPU {vcpu}: entering WHP");
+    let mut exit_count = 0_u64;
     while !stop.load(Ordering::Relaxed) {
         let raw = partition
             .run_vcpu_context(vcpu)
             .map_err(|error| error.to_string())?;
+        exit_count = exit_count.saturating_add(1);
+        if exit_count.is_power_of_two() {
+            log::debug!(
+                "Windows vCPU {vcpu}: exit {exit_count}, reason={:#x}, rip={:#x}",
+                raw.ExitReason,
+                raw.VpContext.Rip
+            );
+        }
         match crate::windows::whp::RunExit::from(raw) {
             crate::windows::whp::RunExit::MemoryAccess { .. } => {
                 let mut access =

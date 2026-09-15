@@ -52,13 +52,21 @@ pub(crate) async fn boot_prepared<
     let boot = unsafe {
         wasmtime::component::Component::deserialize(runtime.store.engine(), input.artifacts.boot)
     }?;
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    let kernel_cmdline = crate::windows::amd64::build_kernel_cmdline(
+        crate::windows::whp::query_tsc_frequency().map_err(|error| {
+            wasmtime::Error::msg(format!("querying the WHP guest clock: {error}"))
+        })?,
+    )?;
+    #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
+    let kernel_cmdline = terra_protocol::KERNEL_CMDLINE.to_owned();
     let entry = runtime
         .boot_prepared_machine(
             &boot,
             prepared.config(),
             prepared.ram()?,
             std::mem::take(&mut input.kernel),
-            terra_protocol::KERNEL_CMDLINE,
+            &kernel_cmdline,
         )
         .await?;
     prepared.accept_boot(entry)?;

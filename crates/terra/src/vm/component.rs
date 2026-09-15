@@ -192,7 +192,10 @@ pub async fn run(spec: &BootSpec, bx: &BoxRef, lock: &File) -> Result<ExitCode> 
     })
     .await;
     let worker_result = match prepared {
-        Ok(prepared) => prepared.observation.observe(prepared.runtime.start()).await,
+        Ok(prepared) => {
+            log::info!("component VMM prepared; starting guest CPUs and devices");
+            prepared.observation.observe(prepared.runtime.start()).await
+        }
         Err(error) => Err(error),
     };
     let outcome = worker_result.map_err(|error| {

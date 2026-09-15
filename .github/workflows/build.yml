@@ -162,11 +162,13 @@ jobs:
           llvm_bin="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin"
           LLVM_COV="$llvm_bin/llvm-cov" LLVM_PROFDATA="$llvm_bin/llvm-profdata" python3 scripts/coverage-network-policy.py
       - name: KVM gates
+        timeout-minutes: 15
         run: |
           if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
             echo '::notice title=KVM gates skipped::This hosted runner has no read/write /dev/kvm.'
             exit 0
           fi
+          TERRA_BIN="$PWD/dist/terra" cargo test --locked --target x86_64-unknown-linux-musl -p terra --test native_boot native_boot_executes_shell -- --ignored --test-threads=1 --nocapture
           cargo test --locked --target x86_64-unknown-linux-musl -p terra-platform --lib -- --ignored --test-threads=1
           TERRA_BIN="$PWD/dist/terra" cargo test --locked --target x86_64-unknown-linux-musl -p terra --test boot --test memory -- --ignored --test-threads=1
       - name: Reclaim component build space
@@ -320,12 +322,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: windows-2025
+          - runner: ${{ vars.WINDOWS_X64_VM_RUNNER || 'windows-2025' }}
             target: x86_64-pc-windows-msvc
             guest: x86_64
-          - runner: windows-11-arm
+            native_vm_tests: ${{ vars.WINDOWS_X64_VM_RUNNER != '' }}
+          - runner: ${{ vars.WINDOWS_ARM64_VM_RUNNER || 'windows-11-arm' }}
             target: aarch64-pc-windows-msvc
             guest: aarch64
+            native_vm_tests: ${{ vars.WINDOWS_ARM64_VM_RUNNER != '' }}
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Enable Git symlinks
@@ -371,6 +375,19 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ./dist/terra.exe --help
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Native boot and shell gate
+        if: ${{ inputs.native_vm_tests || matrix.native_vm_tests }}
+        timeout-minutes: 10
+        shell: pwsh
+        run: |
+          $env:TERRA_BIN = (Resolve-Path ./dist/terra.exe).Path
+          cargo test --locked --target ${{ matrix.target }} -p terra --test native_boot native_boot_executes_shell -- --ignored --test-threads=1 --nocapture
+      - name: Report Windows boot coverage
+        if: ${{ !(inputs.native_vm_tests || matrix.native_vm_tests) }}
+        shell: pwsh
+        run: |
+          '### Windows boot was not tested' >> $env:GITHUB_STEP_SUMMARY
+          'Set WINDOWS_X64_VM_RUNNER or WINDOWS_ARM64_VM_RUNNER to a runner label with working WHP to enable the required boot and shell gate.' >> $env:GITHUB_STEP_SUMMARY
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         if: ${{ inputs.native_vm_tests }}
         with:

@@ -102,6 +102,21 @@ fn result(status: i32) -> Result<(), WhpError> {
     (status >= 0).then_some(()).ok_or(WhpError(status))
 }
 
+#[cfg(target_arch = "x86_64")]
+pub fn query_tsc_frequency() -> Result<u64, WhpError> {
+    let mut frequency = 0_u64;
+    // SAFETY: ProcessorClockFrequency writes one u64 frequency in Hz.
+    result(unsafe {
+        WHvGetCapability(
+            windows_sys::Win32::System::Hypervisor::WHvCapabilityCodeProcessorClockFrequency,
+            (&raw mut frequency).cast(),
+            size_of::<u64>() as u32,
+            std::ptr::null_mut(),
+        )
+    })?;
+    Ok(frequency)
+}
+
 /// Check that the installed host can create WHP partitions on this architecture.
 pub fn check_available() -> Result<(), AvailabilityError> {
     let mut present = WHV_CAPABILITY::default();

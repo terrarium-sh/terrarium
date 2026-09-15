@@ -30,6 +30,18 @@ const EFER_LME_LMA: u64 = 0x500;
 const CODE_SEGMENT_ATTRIBUTES: u16 = 0xA09B;
 const DATA_SEGMENT_ATTRIBUTES: u16 = 0xC093;
 
+pub fn build_kernel_cmdline(tsc_frequency_hz: u64) -> wasmtime::Result<String> {
+    let tsc_khz = u32::try_from(tsc_frequency_hz / 1000)?;
+    if tsc_khz == 0 {
+        return Err(wasmtime::Error::msg("WHP reported a zero TSC frequency"));
+    }
+    log::info!("Windows x64 guest clock: {tsc_khz} kHz");
+    Ok(format!(
+        "{} tsc_early_khz={tsc_khz}",
+        terra_protocol::KERNEL_CMDLINE
+    ))
+}
+
 fn segment(selector: u16, attributes: u16) -> WHV_X64_SEGMENT_REGISTER {
     WHV_X64_SEGMENT_REGISTER {
         Base: 0,
@@ -110,6 +122,19 @@ pub fn configure_planned_boot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Without PIT or a CPUID-reported frequency, Linux's LAPIC calibration
+    /// waits forever for a tick. Supply WHP's TSC frequency before calibration.
+    #[test]
+    fn kernel_cmdline_supplies_the_native_clock_in_khz() {
+        assert_eq!(
+            build_kernel_cmdline(3_000_000_000).unwrap(),
+            format!("{} tsc_early_khz=3000000", terra_protocol::KERNEL_CMDLINE)
+        );
+        assert!(build_kernel_cmdline(0).is_err());
+        assert!(build_kernel_cmdline(999).is_err());
+        assert!(build_kernel_cmdline((u64::from(u32::MAX) + 1) * 1000).is_err());
+    }
 
     #[test]
     fn planned_segments_set_the_long_mode_descriptor_bits() {

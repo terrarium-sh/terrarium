@@ -30,6 +30,7 @@ applevisor = { version = "=1.0.0", default-features = false, features = ["macos-
 applevisor-sys = { version = "=1.0.0", default-features = false, features = ["macos-15-0"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+log = "0.4.34"
 windows-sys = { version = "0.61", features = ["Win32_System_Hypervisor"] }
 
 [dev-dependencies]

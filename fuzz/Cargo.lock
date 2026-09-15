@@ -1577,6 +1577,7 @@ dependencies = [
  "kvm-bindings",
  "kvm-ioctls",
  "libc",
+ "log",
  "rustix",
  "terra-io",
  "terra-limits",
