@@ -62,7 +62,7 @@ pub fn connect_to_agent(
         if hint_at.is_some_and(|at| Instant::now() > at) {
             hint_at = None;
             eprintln!(
-                "terra: still waiting for {bx}'s {what} - `{}` shows the boot so far",
+                "terra: still waiting for {bx}'s {what} - `{} --diagnostics --follow` shows the guest boot",
                 bx.build_logs_command()
             );
         }
@@ -76,12 +76,9 @@ pub fn connect_to_agent(
         match LocalStream::connect(&sock) {
             Err(error) => last_connect_error = Some(error.to_string()),
             Ok(stream) => {
-                if stream
+                stream
                     .set_read_timeout(Some(AGENT_HELLO_WAIT_TIMEOUT))
-                    .is_err()
-                {
-                    continue;
-                }
+                    .context("setting the agent handshake timeout")?;
                 let mut magic = [0];
                 if (&stream).read_exact(&mut magic).is_ok() {
                     anyhow::ensure!(
@@ -98,9 +95,9 @@ pub fn connect_to_agent(
                         "the agent in {bx} does not speak this terra's protocol - \
                      `terra stop` it and start it again on this build"
                     );
-                    if stream.set_read_timeout(None).is_err() {
-                        continue;
-                    }
+                    stream
+                        .set_read_timeout(None)
+                        .context("clearing the agent handshake timeout")?;
                     if (&stream).write_all(&[service.to_byte()]).is_ok() {
                         return Ok(stream);
                     }

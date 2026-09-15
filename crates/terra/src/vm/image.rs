@@ -126,6 +126,32 @@ fn install(
     })
 }
 
+fn install_sparse(
+    path: &Path,
+    src: &mut impl Read,
+    finish: impl FnOnce(&File, u64) -> Result<()>,
+) -> Result<()> {
+    staged_write(path, |out| {
+        crate::sys::make_sparse(out)
+            .with_context(|| format!("making {} sparse", path.display()))?;
+        let mut buf = vec![0; 64 * 1024];
+        let mut written = 0;
+        loop {
+            let read = match src.read(&mut buf) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => result.with_context(|| format!("unpacking {}", path.display()))?,
+            };
+            if read == 0 {
+                break;
+            }
+            write_sparse_chunk(out, &buf[..read])
+                .with_context(|| format!("unpacking {}", path.display()))?;
+            written += u64::try_from(read).unwrap_or_default();
+        }
+        finish(out, written)
+    })
+}
+
 /// Write the prebaked root filesystem to `path`, sized to `size_mib` (sparse;
 /// the guest grows the filesystem into it on first boot).
 pub fn ensure_rootfs_image(path: &Path, size_mib: u32) -> Result<()> {
@@ -143,7 +169,7 @@ fn ensure_image(path: &Path, size_mib: u32, gz: &[u8], field: &str) -> Result<()
     }
     // One byte past the cap proves it does not fit without unpacking it all.
     let mut bounded = flate2::read::GzDecoder::new(gz).take(target + 1);
-    install(path, &mut bounded, |out, baked| {
+    install_sparse(path, &mut bounded, |out, baked| {
         if target < baked {
             bail!("the prebaked filesystem does not fit {field} ({size_mib} MiB)");
         }
@@ -163,10 +189,13 @@ fn resize_image(path: &Path, target: u64, field: &str) -> Result<()> {
     match target.cmp(&current) {
         std::cmp::Ordering::Equal => {}
         std::cmp::Ordering::Greater => {
-            OpenOptions::new()
+            let image = OpenOptions::new()
                 .write(true)
                 .open(path)
-                .with_context(|| format!("opening {}", path.display()))?
+                .with_context(|| format!("opening {}", path.display()))?;
+            crate::sys::make_sparse(&image)
+                .with_context(|| format!("making {} sparse", path.display()))?;
+            image
                 .set_len(target)
                 .with_context(|| format!("growing {}", path.display()))?;
             log::info!(
@@ -271,6 +300,26 @@ mod tests {
     fn a_rootfs_smaller_than_the_prebaked_image_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         assert!(ensure_rootfs_image(&dir.path().join("tiny.img"), 1).is_err());
+    }
+
+    #[test]
+    fn sparse_install_preserves_contents_and_trailing_hole() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image.img");
+        let mut bytes = vec![1; 64 * 1024];
+        bytes.extend(vec![0; 64 * 1024]);
+        bytes.extend(vec![2; 64 * 1024]);
+        bytes.extend(vec![0; 64 * 1024]);
+        let mut source = bytes.as_slice();
+
+        install_sparse(&path, &mut source, |out, written| {
+            out.set_len(written)?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), bytes.len() as u64);
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
     }
 
     /// Nothing is renamed into place until it is whole, and a payload that was

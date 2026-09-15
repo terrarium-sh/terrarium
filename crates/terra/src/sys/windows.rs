@@ -139,6 +139,27 @@ pub fn set_open_file_mode(file: &File, mode: u32) -> Result<()> {
     file.set_permissions(permissions)
 }
 
+pub fn make_sparse(file: &File) -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    use windows_sys::Win32::System::Ioctl::FSCTL_SET_SPARSE;
+
+    let mut returned = 0;
+    // SAFETY: `file` supplies a live synchronous handle, and the null buffers match FSCTL_SET_SPARSE.
+    win_ok(unsafe {
+        DeviceIoControl(
+            file.as_raw_handle(),
+            FSCTL_SET_SPARSE,
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            &raw mut returned,
+            std::ptr::null_mut(),
+        )
+    })
+}
+
 pub fn set_owner_only(path: &Path, directory: bool) -> Result<()> {
     let sid = current_user_sid()?;
     let acl_size = std::mem::size_of::<ACL>()
@@ -416,11 +437,23 @@ fn win_ok(ok: i32) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::windows::fs::MetadataExt;
     use windows_sys::Win32::Foundation::{INVALID_HANDLE_VALUE, LocalFree};
     use windows_sys::Win32::Security::Authorization::GetNamedSecurityInfoW;
     use windows_sys::Win32::Security::{
         ACCESS_ALLOWED_ACE, EqualSid, GetAce, GetSecurityDescriptorControl, SE_DACL_PROTECTED,
     };
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_SPARSE_FILE;
+
+    #[test]
+    fn a_sparse_file_keeps_the_sparse_attribute() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        make_sparse(file.as_file()).unwrap();
+        assert_ne!(
+            file.as_file().metadata().unwrap().file_attributes() & FILE_ATTRIBUTE_SPARSE_FILE,
+            0
+        );
+    }
 
     #[test]
     fn the_handed_lock_handle_is_matched_by_identity() {

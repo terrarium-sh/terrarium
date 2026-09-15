@@ -450,6 +450,7 @@ fn run_disk_job<T: Send + 'static, F>(
     host: &mut DeviceHost,
     offset: u64,
     len: u64,
+    max_len: u64,
     operation: F,
 ) -> impl core::future::Future<Output = Result<T, terra::host::disk::DiskError>> + Send + use<T, F>
 where
@@ -463,7 +464,7 @@ where
     async move {
         use crate::component::block::backing::BackingError;
         use terra::host::disk::DiskError;
-        if len > MAX_SINGLE_BYTES {
+        if len > max_len {
             return Err(DiskError::TooLarge);
         }
         if offset.checked_add(len).is_none_or(|end| end > capacity) {
@@ -500,6 +501,13 @@ impl<T: Send + 'static> terra::host::disk::HostWithStore<T> for TerraHost {
     ) -> impl core::future::Future<Output = Result<(), terra::host::disk::DiskError>> + Send {
         host.with(|mut access| disk_write_at(access.get(), offset, data))
     }
+    fn discard(
+        host: &wasmtime::component::Accessor<T, Self>,
+        offset: u64,
+        len: u64,
+    ) -> impl core::future::Future<Output = Result<(), terra::host::disk::DiskError>> + Send {
+        host.with(|mut access| disk_discard(access.get(), offset, len))
+    }
     fn sync(
         host: &wasmtime::component::Accessor<T, Self>,
     ) -> impl core::future::Future<Output = Result<(), terra::host::disk::DiskError>> + Send {
@@ -513,7 +521,7 @@ fn disk_read_at(
     len: u64,
 ) -> impl core::future::Future<Output = Result<Vec<u8>, terra::host::disk::DiskError>> + Send + use<>
 {
-    run_disk_job(host, offset, len, move |disk| {
+    run_disk_job(host, offset, len, MAX_SINGLE_BYTES, move |disk| {
         let len = usize::try_from(len)
             .map_err(|_| crate::component::block::backing::BackingError::OutOfRange)?;
         let mut bytes = vec![0; len];
@@ -527,15 +535,33 @@ fn disk_write_at(
     offset: u64,
     data: Vec<u8>,
 ) -> impl core::future::Future<Output = Result<(), terra::host::disk::DiskError>> + Send + use<> {
-    run_disk_job(host, offset, data.len() as u64, move |disk| {
-        disk.write_at(offset, &data)
-    })
+    run_disk_job(
+        host,
+        offset,
+        data.len() as u64,
+        MAX_SINGLE_BYTES,
+        move |disk| disk.write_at(offset, &data),
+    )
+}
+
+fn disk_discard(
+    host: &mut DeviceHost,
+    offset: u64,
+    len: u64,
+) -> impl core::future::Future<Output = Result<(), terra::host::disk::DiskError>> + Send + use<> {
+    run_disk_job(
+        host,
+        offset,
+        len,
+        terra_limits::MAX_GUEST_DISCARD_BYTES,
+        move |disk| disk.discard(offset, len),
+    )
 }
 
 fn disk_sync(
     host: &mut DeviceHost,
 ) -> impl core::future::Future<Output = Result<(), terra::host::disk::DiskError>> + Send + use<> {
-    run_disk_job(host, 0, 0, |disk| disk.sync())
+    run_disk_job(host, 0, 0, MAX_SINGLE_BYTES, |disk| disk.sync())
 }
 
 impl terra::host::disk::Host for DeviceHost {
@@ -711,6 +737,11 @@ where
             Box::pin(async move { Ok((operation.await,)) })
         },
     )?;
+    disk.func_wrap_concurrent("discard", move |accessor, (offset, len): (u64, u64)| {
+        let operation =
+            accessor.with(|mut access| disk_discard(host(access.data_mut()), offset, len));
+        Box::pin(async move { Ok((operation.await,)) })
+    })?;
     disk.func_wrap_concurrent("sync", move |accessor, (): ()| {
         let operation = accessor.with(|mut access| disk_sync(host(access.data_mut())));
         Box::pin(async move { Ok((operation.await,)) })
@@ -857,7 +888,10 @@ mod tests {
     #[tokio::test]
     async fn disk_imports_enforce_bounds_and_readonly_without_a_guest() {
         use super::terra::host::disk::DiskError;
-        use super::{BoundedDisk, DeviceHost, DiskGrant, disk_read_at, disk_sync, disk_write_at};
+        use super::{
+            BoundedDisk, DeviceHost, DiskGrant, disk_discard, disk_read_at, disk_sync,
+            disk_write_at,
+        };
 
         let mut host = DeviceHost::new(4096).expect("host");
         host.set_disk(DiskGrant::Mem(BoundedDisk::new(4096, false)));
@@ -875,9 +909,19 @@ mod tests {
             disk_read_at(&mut host, 4096, 1).await,
             Err(DiskError::OutOfRange)
         ));
+        assert_eq!(disk_discard(&mut host, 4095, 1).await, Ok(()));
+        assert_eq!(disk_read_at(&mut host, 4095, 1).await, Ok(vec![0]));
+        assert!(matches!(
+            disk_discard(&mut host, 0, terra_limits::MAX_GUEST_DISCARD_BYTES + 1).await,
+            Err(DiskError::TooLarge)
+        ));
         host.set_disk(DiskGrant::Mem(BoundedDisk::new(4096, true)));
         assert!(matches!(
             disk_write_at(&mut host, 0, vec![1]).await,
+            Err(DiskError::Readonly)
+        ));
+        assert!(matches!(
+            disk_discard(&mut host, 0, 1).await,
             Err(DiskError::Readonly)
         ));
         assert_eq!(disk_sync(&mut host).await, Ok(()));

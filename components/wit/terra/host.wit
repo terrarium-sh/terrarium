@@ -52,6 +52,7 @@ interface disk {
     /// P3 socket/filesystem scheduler slice.
     read-at: async func(offset: u64, len: u64) -> result<list<u8>, disk-error>;
     write-at: async func(offset: u64, data: list<u8>) -> result<_, disk-error>;
+    discard: async func(offset: u64, len: u64) -> result<_, disk-error>;
     sync: async func() -> result<_, disk-error>;
     capacity: func() -> u64;
     enum disk-error { out-of-range, readonly, io, too-large, busy }

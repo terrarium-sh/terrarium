@@ -68,6 +68,12 @@ a stable base32 hash of the project path; shared files live under
 the root filesystem and volumes; `export`, `import`, and `prune` manage images.
 Export and import require a stopped box and the same recipe.
 
+The root filesystem and volumes use discard/TRIM to return freed guest blocks
+to the host automatically. Their configured capacity stays the same; physical
+space is reclaimed where the host filesystem supports sparse holes, at its
+allocation granularity. Deletions made before discard was enabled need a guest
+`fstrim` to reclaim their space.
+
 Every command accepts `--project DIR` to operate on another project. Read the
 [security model](security.md) before using mounts, public network access, or
 guest-provided files on the host.

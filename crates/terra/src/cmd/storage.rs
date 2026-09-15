@@ -543,6 +543,7 @@ fn write_sparse(path: &Path, src: &mut impl Read, len: u64) -> Result<()> {
     const CHUNK: usize = 64 * 1024;
     let printable = escape_printable_path(path);
     image::staged_write(path, |out| {
+        crate::sys::make_sparse(out).with_context(|| format!("making {printable} sparse"))?;
         let mut src = src.take(len);
         let mut buf = vec![0u8; CHUNK];
         loop {

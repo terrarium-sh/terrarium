@@ -144,7 +144,9 @@ pub async fn run_detached_vm(dir: PathBuf, is_at_a_terminal: bool) -> Result<Exi
         "no run lock was handed to this process - a VM process is spawned by a boot, \
          not started by hand",
     )?;
-    crate::vm::run(&spec, &bx, &lock).await
+    crate::vm::run(&spec, &bx, &lock)
+        .await
+        .inspect_err(|error| log::error!("VM failed: {error:#}"))
 }
 
 fn validate_boot_spec_size(bytes: usize) -> Result<()> {

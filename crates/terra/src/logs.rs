@@ -1,4 +1,4 @@
-//! Bounded daily host logs for each box.
+//! Bounded host logs for each box.
 
 use crate::state::BoxRef;
 use std::io::Write;
@@ -8,6 +8,7 @@ use tracing_subscriber::filter::{LevelFilter, Targets};
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
+#[cfg(unix)]
 const KEPT_LOG_GENERATIONS: usize = 7;
 
 struct CappedAppender {
@@ -32,19 +33,26 @@ impl Write for CappedAppender {
 }
 
 fn build_appender(bx: &BoxRef) -> anyhow::Result<CappedAppender> {
-    let appender = RollingFileAppender::builder()
-        .rotation(Rotation::DAILY)
+    let builder = RollingFileAppender::builder()
         .filename_prefix("terra")
-        .filename_suffix("log")
+        .filename_suffix("log");
+    #[cfg(unix)]
+    let builder = builder
+        .rotation(Rotation::DAILY)
         .max_log_files(KEPT_LOG_GENERATIONS)
-        .latest_symlink(crate::state::LOG_FILE)
-        .build(bx.get_dir())
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "opening log {}: {e}",
-                bx.get_dir().join(crate::state::LOG_FILE).display()
-            )
-        })?;
+        .latest_symlink(crate::state::LOG_FILE);
+    // Windows symlink creation requires privileges; keep the capped log at its public path.
+    #[cfg(windows)]
+    let builder = {
+        crate::sys::create_regular_file(&bx.get_dir().join(crate::state::LOG_FILE))?;
+        builder.rotation(Rotation::NEVER)
+    };
+    let appender = builder.build(bx.get_dir()).map_err(|e| {
+        anyhow::anyhow!(
+            "opening log {}: {e}",
+            bx.get_dir().join(crate::state::LOG_FILE).display()
+        )
+    })?;
     Ok(CappedAppender {
         appender,
         path: bx.get_dir().join(crate::state::LOG_FILE),
@@ -121,6 +129,7 @@ mod tests {
     /// The appender lays down the scheme: `terra.log` is a symlink to a
     /// dated generation.
     #[test]
+    #[cfg(unix)]
     fn the_appender_lays_down_the_scheme() {
         let dir = tempfile::tempdir().unwrap();
         let bx = BoxRef::from_state_dir(dir.path().join("dev"), dir.path());
@@ -147,5 +156,25 @@ mod tests {
             .collect();
         assert_eq!(dated.len(), 1, "the current generation is dated: {dated:?}");
         assert_ne!(dated[0], "terra.log", "the live name is the symlink's");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn the_appender_writes_without_symlink_privileges() {
+        let dir = tempfile::tempdir().unwrap();
+        let bx = BoxRef::from_state_dir(dir.path().join("dev"), dir.path());
+        std::fs::create_dir_all(bx.get_dir()).unwrap();
+
+        let mut appender = build_appender(&bx).unwrap();
+        writeln!(&mut appender, "booting").unwrap();
+        appender.flush().unwrap();
+
+        let path = bx.get_dir().join(crate::state::LOG_FILE);
+        assert!(std::fs::symlink_metadata(&path).unwrap().is_file());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "booting\n");
+
+        drop(appender);
+        build_appender(&bx).unwrap();
+        assert!(std::fs::read(path).unwrap().is_empty());
     }
 }

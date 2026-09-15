@@ -27,8 +27,9 @@ pub use imp::is_host_root;
 pub use imp::register_stop_channel;
 pub use imp::{
     MAX_SOCK_PATH, claim_inherited_lock, detach, find_terminating_signal, holds_run_lock,
-    host_addresses, install_stop_signal_handlers, pass_lock, pid_exists, read_process_start_time,
-    restrict_new_files, set_open_file_mode, set_owner_only, signal_pid, try_lock_run,
+    host_addresses, install_stop_signal_handlers, make_sparse, pass_lock, pid_exists,
+    read_process_start_time, restrict_new_files, set_open_file_mode, set_owner_only, signal_pid,
+    try_lock_run,
 };
 
 pub(crate) fn validate_host_root() -> anyhow::Result<()> {

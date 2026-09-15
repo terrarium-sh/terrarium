@@ -430,6 +430,7 @@ mod block_component_tests {
     const T_OUT: u32 = 1;
     const T_FLUSH: u32 = 4;
     const T_GET_ID: u32 = 8;
+    const T_DISCARD: u32 = 11;
 
     type Execute = TypedFunc<(u32, u64, Vec<Range>, u64, u64), (u8,)>;
     type Configure = TypedFunc<(bool,), (Result<(), super::super::engine::DeviceError>,)>;
@@ -694,6 +695,52 @@ mod block_component_tests {
                 .expect("read back"),
             [0xCDu8; 512]
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn component_discard_reaches_the_backing_without_changing_neighbors() {
+        let (_linker, mut fixture) = fixture(8, false).await;
+        fixture
+            .store
+            .data_mut()
+            .guest_write(DATA, &[0x5A; 1536])
+            .expect("payload staged");
+        let (status,) = fixture
+            .execute
+            .call_async(&mut fixture.store, (T_OUT, 0, one(DATA, 1536), STATUS, 0))
+            .await
+            .expect("write runs");
+        assert_eq!(status, 0);
+
+        let mut discard = [0; 16];
+        discard[..8].copy_from_slice(&1_u64.to_le_bytes());
+        discard[8..12].copy_from_slice(&1_u32.to_le_bytes());
+        fixture
+            .store
+            .data_mut()
+            .guest_write(DATA, &discard)
+            .expect("discard range staged");
+        let (status,) = fixture
+            .execute
+            .call_async(&mut fixture.store, (T_DISCARD, 0, one(DATA, 16), STATUS, 0))
+            .await
+            .expect("discard runs");
+        assert_eq!(status, 0);
+
+        let (status,) = fixture
+            .execute
+            .call_async(&mut fixture.store, (T_IN, 0, one(DATA, 1536), STATUS, 0))
+            .await
+            .expect("read runs");
+        assert_eq!(status, 0);
+        let contents = fixture
+            .store
+            .data()
+            .guest_read(DATA, 1536)
+            .expect("read back");
+        assert_eq!(&contents[..512], &[0x5A; 512]);
+        assert_eq!(&contents[512..1024], &[0; 512]);
+        assert_eq!(&contents[1024..], &[0x5A; 512]);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1135,6 +1182,10 @@ mod file_backend {
         }
 
         fn write_at(&mut self, _offset: u64, _buf: &[u8]) -> Result<(), BackingError> {
+            Err(BackingError::Io)
+        }
+
+        fn discard(&mut self, _offset: u64, _len: u64) -> Result<(), BackingError> {
             Err(BackingError::Io)
         }
 

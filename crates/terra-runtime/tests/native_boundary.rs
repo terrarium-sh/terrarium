@@ -36,6 +36,9 @@ fn file_grants_enforce_capacity_and_readonly_independently_of_wasm() {
     let mut last = [0];
     readonly.read_at(4095, &mut last).unwrap();
     assert_eq!(last, [0xa5]);
+    assert_eq!(readonly.discard(0, 1), Err(BackingError::ReadOnly));
+    assert_eq!(writable.discard(4096, 1), Err(BackingError::OutOfRange));
+    writable.discard(4095, 1).unwrap();
     assert_eq!(file.as_file().metadata().unwrap().len(), 4096);
 }
 
@@ -55,6 +58,54 @@ fn file_grants_retain_the_opened_file_after_path_replacement() {
     );
     let null_device = if cfg!(windows) { "NUL" } else { "/dev/null" };
     assert!(FileDisk::open(std::path::Path::new(null_device), false).is_err());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn file_discard_reclaims_allocated_blocks() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let file = tempfile::NamedTempFile::new().unwrap();
+    file.as_file().set_len(1 << 20).unwrap();
+    let mut disk = FileDisk::open(file.path(), false).unwrap();
+    disk.write_at(0, &vec![0xa5; 128 << 10]).unwrap();
+    let allocated = file.as_file().metadata().unwrap().blocks();
+    disk.discard(0, 128 << 10).unwrap();
+    assert!(file.as_file().metadata().unwrap().blocks() < allocated);
+}
+
+#[cfg(windows)]
+#[test]
+fn file_discard_reclaims_allocated_bytes() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    file.as_file().set_len(1 << 20).unwrap();
+    let mut disk = FileDisk::open(file.path(), false).unwrap();
+    disk.write_at(0, &vec![0xa5; 128 << 10]).unwrap();
+    let allocated = read_allocated_bytes(file.as_file());
+    disk.discard(0, 128 << 10).unwrap();
+    assert!(read_allocated_bytes(file.as_file()) < allocated);
+}
+
+#[cfg(windows)]
+fn read_allocated_bytes(file: &std::fs::File) -> u64 {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_STANDARD_INFO, FileStandardInfo, GetFileInformationByHandleEx,
+    };
+
+    let mut info = FILE_STANDARD_INFO::default();
+    #[allow(unsafe_code)]
+    let result = unsafe {
+        // SAFETY: `file` owns the handle and `info` has the exact output-buffer size.
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileStandardInfo,
+            (&raw mut info).cast(),
+            core::mem::size_of::<FILE_STANDARD_INFO>() as u32,
+        )
+    };
+    assert_ne!(result, 0);
+    u64::try_from(info.AllocationSize).unwrap()
 }
 
 #[test]

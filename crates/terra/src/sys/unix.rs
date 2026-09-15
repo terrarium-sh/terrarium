@@ -92,6 +92,10 @@ pub fn set_open_file_mode(file: &File, mode: u32) -> Result<()> {
     file.set_permissions(std::fs::Permissions::from_mode(mode))
 }
 
+pub fn make_sparse(_file: &File) -> Result<()> {
+    Ok(())
+}
+
 /// Restrict an existing path to its owner: `0700` for a directory, `0600` for a
 /// file.
 pub fn set_owner_only(path: &Path, dir: bool) -> Result<()> {

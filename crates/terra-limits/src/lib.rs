@@ -22,6 +22,7 @@ pub const X86_IOAPIC_PINS: u32 = 24;
 pub const MAX_VM_OPEN_FILES: usize = 4096;
 pub const MAX_SINGLE_GUEST_COPY_BYTES: u64 = 16 * 1024;
 pub const MAX_BATCH_GUEST_COPY_BYTES: u64 = 64 * 1024;
+pub const MAX_GUEST_DISCARD_BYTES: u64 = 1024 * 1024;
 
 pub const ARM_RAM_BASE: u64 = 0x4000_0000;
 pub const ARM_GIC_DIST_BASE: u64 = 0x0800_0000;

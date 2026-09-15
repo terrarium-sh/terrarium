@@ -27,6 +27,8 @@ const STACK_TOP: u64 = terra_limits::X86_STACK_TOP;
 const CR0_PROTECTED_PAGING: u64 = 0x8005_0033;
 const CR4_PAE: u64 = 0x20;
 const EFER_LME_LMA: u64 = 0x500;
+const CODE_SEGMENT_ATTRIBUTES: u16 = 0xA09B;
+const DATA_SEGMENT_ATTRIBUTES: u16 = 0xC093;
 
 fn segment(selector: u16, attributes: u16) -> WHV_X64_SEGMENT_REGISTER {
     WHV_X64_SEGMENT_REGISTER {
@@ -53,8 +55,8 @@ pub fn configure_planned_boot(
     kernel_entry: u64,
     boot_params_address: u64,
 ) -> Result<(), PartitionError> {
-    let code = segment(0x08, 0xA9B);
-    let data = segment(0x10, 0xC93);
+    let code = segment(0x08, CODE_SEGMENT_ATTRIBUTES);
+    let data = segment(0x10, DATA_SEGMENT_ATTRIBUTES);
     let names = [
         WHV_X64_REGISTER_CR0,
         WHV_X64_REGISTER_CR3,
@@ -103,4 +105,21 @@ pub fn configure_planned_boot(
     ];
     partition.set_registers(0, &names, &values)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn planned_segments_set_the_long_mode_descriptor_bits() {
+        assert_eq!(CODE_SEGMENT_ATTRIBUTES & 0x0F00, 0);
+        assert_eq!(CODE_SEGMENT_ATTRIBUTES & (1 << 13), 1 << 13);
+        assert_eq!(CODE_SEGMENT_ATTRIBUTES & (1 << 14), 0);
+        assert_eq!(CODE_SEGMENT_ATTRIBUTES & (1 << 15), 1 << 15);
+        assert_eq!(DATA_SEGMENT_ATTRIBUTES & 0x0F00, 0);
+        assert_eq!(DATA_SEGMENT_ATTRIBUTES & (1 << 13), 0);
+        assert_eq!(DATA_SEGMENT_ATTRIBUTES & (1 << 14), 1 << 14);
+        assert_eq!(DATA_SEGMENT_ATTRIBUTES & (1 << 15), 1 << 15);
+    }
 }

@@ -31,17 +31,82 @@ const T_IN: u32 = 0;
 const T_OUT: u32 = 1;
 const T_FLUSH: u32 = 4;
 const T_GET_ID: u32 = 8;
+const T_DISCARD: u32 = 11;
 const VIRTIO_BLK_F_SIZE_MAX: u32 = 1;
 const VIRTIO_BLK_F_SEG_MAX: u32 = 2;
 const VIRTIO_BLK_F_RO: u32 = 5;
 const VIRTIO_BLK_F_FLUSH: u32 = 9;
+const VIRTIO_BLK_F_DISCARD: u32 = 13;
 const VIRTIO_F_VERSION_1: u32 = 32;
 const CONFIG_SIZE_MAX: usize = 8;
 const CONFIG_SEG_MAX: usize = 12;
+const CONFIG_MAX_DISCARD_SECTORS: usize = 36;
+const CONFIG_MAX_DISCARD_SEG: usize = 40;
+const CONFIG_DISCARD_SECTOR_ALIGNMENT: usize = 44;
+const CONFIG_BYTES: usize = 48;
 const MAX_SINGLE: u64 = terra_limits::MAX_SINGLE_GUEST_COPY_BYTES;
 const MAX_TOTAL: u64 = terra_limits::MAX_BATCH_GUEST_COPY_BYTES;
+const MAX_DISCARD: u64 = terra_limits::MAX_GUEST_DISCARD_BYTES;
 const MAX_RANGES: usize = 16;
 const ID_TAG: &[u8] = b"terra-vda";
+const DISCARD_BYTES: u64 = 16;
+const DISCARD_SECTOR_ALIGNMENT: u32 = 1;
+
+fn build_block_configuration(capacity: u64, readonly: bool) -> Result<(u64, Vec<u8>), DeviceError> {
+    let mut config = vec![0u8; CONFIG_BYTES];
+    config[..8].copy_from_slice(&(capacity / SECTOR_BYTES).to_le_bytes());
+    config[CONFIG_SIZE_MAX..CONFIG_SIZE_MAX + 4].copy_from_slice(
+        &u32::try_from(MAX_SINGLE)
+            .map_err(|_| DeviceError::TooLarge)?
+            .to_le_bytes(),
+    );
+    config[CONFIG_SEG_MAX..CONFIG_SEG_MAX + 4].copy_from_slice(
+        &u32::try_from(MAX_TOTAL / MAX_SINGLE)
+            .map_err(|_| DeviceError::TooLarge)?
+            .to_le_bytes(),
+    );
+    let mut features = (1u64 << VIRTIO_BLK_F_SIZE_MAX)
+        | (1u64 << VIRTIO_BLK_F_SEG_MAX)
+        | (1u64 << VIRTIO_BLK_F_FLUSH)
+        | (1u64 << VIRTIO_F_VERSION_1);
+    if readonly {
+        features |= 1u64 << VIRTIO_BLK_F_RO;
+    } else {
+        features |= 1u64 << VIRTIO_BLK_F_DISCARD;
+        config[CONFIG_MAX_DISCARD_SECTORS..CONFIG_MAX_DISCARD_SECTORS + 4].copy_from_slice(
+            &u32::try_from(MAX_DISCARD / SECTOR_BYTES)
+                .map_err(|_| DeviceError::TooLarge)?
+                .to_le_bytes(),
+        );
+        config[CONFIG_MAX_DISCARD_SEG..CONFIG_MAX_DISCARD_SEG + 4]
+            .copy_from_slice(&1u32.to_le_bytes());
+        config[CONFIG_DISCARD_SECTOR_ALIGNMENT..CONFIG_DISCARD_SECTOR_ALIGNMENT + 4]
+            .copy_from_slice(&DISCARD_SECTOR_ALIGNMENT.to_le_bytes());
+    }
+    Ok((features, config))
+}
+
+fn parse_discard_range(bytes: &[u8], capacity: u64) -> Result<(u64, u64), u8> {
+    let bytes: &[u8; DISCARD_BYTES as usize] = bytes.try_into().map_err(|_| STATUS_IOERR)?;
+    let sector = u64::from_le_bytes(bytes[..8].try_into().map_err(|_| STATUS_IOERR)?);
+    let sectors = u64::from(u32::from_le_bytes(
+        bytes[8..12].try_into().map_err(|_| STATUS_IOERR)?,
+    ));
+    let flags = u32::from_le_bytes(bytes[12..].try_into().map_err(|_| STATUS_IOERR)?);
+    if flags != 0 {
+        return Err(STATUS_UNSUPP);
+    }
+    if sectors > MAX_DISCARD / SECTOR_BYTES {
+        return Err(STATUS_IOERR);
+    }
+    sector_start(
+        sector,
+        sectors.checked_mul(SECTOR_BYTES).ok_or(STATUS_IOERR)?,
+        capacity,
+    )
+    .map(|offset| (offset, sectors * SECTOR_BYTES))
+    .ok_or(STATUS_IOERR)
+}
 
 static CLOSED: AtomicBool = AtomicBool::new(false);
 static EPOCH: AtomicU64 = AtomicU64::new(0);
@@ -201,25 +266,7 @@ impl Guest for Block {
         EPOCH.fetch_add(1, Ordering::AcqRel);
         QUEUE_PENDING.store(false, Ordering::Release);
         let capacity = terra::host::disk::capacity();
-        let mut config = vec![0u8; 20];
-        config[..8].copy_from_slice(&(capacity / SECTOR_BYTES).to_le_bytes());
-        config[CONFIG_SIZE_MAX..CONFIG_SIZE_MAX + 4].copy_from_slice(
-            &u32::try_from(MAX_SINGLE)
-                .map_err(|_| DeviceError::TooLarge)?
-                .to_le_bytes(),
-        );
-        config[CONFIG_SEG_MAX..CONFIG_SEG_MAX + 4].copy_from_slice(
-            &u32::try_from(MAX_TOTAL / MAX_SINGLE)
-                .map_err(|_| DeviceError::TooLarge)?
-                .to_le_bytes(),
-        );
-        let mut features = (1u64 << VIRTIO_BLK_F_SIZE_MAX)
-            | (1u64 << VIRTIO_BLK_F_SEG_MAX)
-            | (1u64 << VIRTIO_BLK_F_FLUSH)
-            | (1u64 << VIRTIO_F_VERSION_1);
-        if readonly {
-            features |= 1u64 << VIRTIO_BLK_F_RO;
-        }
+        let (features, config) = build_block_configuration(capacity, readonly)?;
         publish_interrupt_level(false);
         *TRANSPORT.lock().map_err(|_| DeviceError::Io)? = Some(TransportState {
             transport: MmioTransport::new(
@@ -350,6 +397,25 @@ impl Guest for Block {
                 }
                 write_status(status_addr, STATUS_OK, epoch).unwrap_or(STATUS_IOERR)
             }
+            T_DISCARD => {
+                if data.len() != 1 || data[0].len != DISCARD_BYTES {
+                    return fail();
+                }
+                let Ok(bytes) = terra::host::memory::read(data[0].addr, DISCARD_BYTES) else {
+                    return fail();
+                };
+                let (offset, len) = match parse_discard_range(&bytes, capacity) {
+                    Ok(range) => range,
+                    Err(status) => {
+                        return write_status(status_addr, status, epoch).unwrap_or(STATUS_IOERR);
+                    }
+                };
+                let status = match terra::host::disk::discard(offset, len).await {
+                    Ok(()) => STATUS_OK,
+                    Err(_) => STATUS_IOERR,
+                };
+                write_status(status_addr, status, epoch).unwrap_or(STATUS_IOERR)
+            }
             _ => write_status(status_addr, STATUS_UNSUPP, epoch).unwrap_or(STATUS_IOERR),
         }
     }
@@ -395,7 +461,7 @@ impl Guest for Block {
         if chain.len() < 2 {
             return Err(DeviceError::BadLen);
         }
-        let writable_data = req_type != T_OUT;
+        let writable_data = !matches!(req_type, T_OUT | T_DISCARD);
         let mut data = Vec::new();
         let mut total = 0u64;
         for (index, desc) in chain.iter().enumerate().skip(1) {
@@ -626,6 +692,78 @@ mod component_export {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn discard_segment(sector: u64, sectors: u32, flags: u32) -> [u8; DISCARD_BYTES as usize] {
+        let mut bytes = [0; DISCARD_BYTES as usize];
+        bytes[..8].copy_from_slice(&sector.to_le_bytes());
+        bytes[8..12].copy_from_slice(&sectors.to_le_bytes());
+        bytes[12..].copy_from_slice(&flags.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn writable_configuration_advertises_one_bounded_discard_segment() {
+        let (features, config) = build_block_configuration(16 * 1024, false).unwrap();
+        assert_ne!(features & (1 << VIRTIO_BLK_F_DISCARD), 0);
+        assert_eq!(
+            u32::from_le_bytes(
+                config[CONFIG_MAX_DISCARD_SECTORS..CONFIG_MAX_DISCARD_SECTORS + 4]
+                    .try_into()
+                    .unwrap()
+            ),
+            u32::try_from(MAX_DISCARD / SECTOR_BYTES).unwrap()
+        );
+        assert_eq!(
+            u32::from_le_bytes(
+                config[CONFIG_MAX_DISCARD_SEG..CONFIG_MAX_DISCARD_SEG + 4]
+                    .try_into()
+                    .unwrap()
+            ),
+            1
+        );
+        assert_eq!(
+            u32::from_le_bytes(
+                config[CONFIG_DISCARD_SECTOR_ALIGNMENT..CONFIG_DISCARD_SECTOR_ALIGNMENT + 4]
+                    .try_into()
+                    .unwrap()
+            ),
+            DISCARD_SECTOR_ALIGNMENT
+        );
+        let (readonly_features, _) = build_block_configuration(16 * 1024, true).unwrap();
+        assert_eq!(readonly_features & (1 << VIRTIO_BLK_F_DISCARD), 0);
+    }
+
+    #[test]
+    fn parse_discard_range_rejects_invalid_segment() {
+        assert_eq!(
+            parse_discard_range(&discard_segment(2, 4, 0), 16 * 512),
+            Ok((1024, 2048))
+        );
+        assert_eq!(
+            parse_discard_range(&discard_segment(0, 0, 0), 16 * 512),
+            Err(STATUS_IOERR)
+        );
+        assert_eq!(
+            parse_discard_range(&discard_segment(0, 1, 1), 16 * 512),
+            Err(STATUS_UNSUPP)
+        );
+        assert_eq!(
+            parse_discard_range(&discard_segment(u64::MAX, 1, 0), u64::MAX),
+            Err(STATUS_IOERR)
+        );
+        assert_eq!(
+            parse_discard_range(
+                &discard_segment(0, u32::try_from(MAX_DISCARD / SECTOR_BYTES).unwrap() + 1, 0),
+                u64::MAX,
+            ),
+            Err(STATUS_IOERR)
+        );
+        assert_eq!(
+            parse_discard_range(&discard_segment(15, 2, 0), 16 * 512),
+            Err(STATUS_IOERR)
+        );
+        assert_eq!(parse_discard_range(&[0; 15], 16 * 512), Err(STATUS_IOERR));
+    }
 
     #[test]
     fn ring_addresses_reject_overflow() {

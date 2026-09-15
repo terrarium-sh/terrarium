@@ -421,7 +421,11 @@ fn mount(
         target,
         fstype.unwrap_or("none"),
         flags,
-        c"",
+        if fstype == Some("ext4") && !flags.contains(rustix::mount::MountFlags::RDONLY) {
+            c"discard"
+        } else {
+            c""
+        },
     )
     .map_err(std::io::Error::from)
     .with_context(|| format!("mounting {target}"))
