@@ -109,7 +109,7 @@ async fn finish_tasks() {
     }
 }
 
-pub(crate) async fn configure(control_events: bool) {
+pub(crate) fn configure(control_events: bool) {
     if WORKER
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -145,9 +145,9 @@ pub(crate) async fn configure(control_events: bool) {
         }
     });
     let worker = Worker {
-        plan: host_service::plan().await,
-        stop: host_service::stop().await,
-        listener: host_service::listener().await,
+        plan: host_service::plan(),
+        stop: host_service::stop(),
+        listener: host_service::listener(),
         event_sender,
         event_reader: Some(event_reader),
         control_events,
@@ -405,7 +405,7 @@ fn start_listener(mut listener: StreamReader<host_service::Client>) {
                         abandon_client(port);
                         continue;
                     }
-                    if !spawn_task(async move { start_client(port, client).await })
+                    if !spawn_task(async move { start_client(port, client) })
                         && switch().reset_connection(AGENT_VSOCK_PORT, port).is_ok()
                     {
                         schedule_receive_queue();
@@ -417,8 +417,8 @@ fn start_listener(mut listener: StreamReader<host_service::Client>) {
 }
 
 #[allow(clippy::too_many_lines)]
-async fn start_client(port: u32, client: host_service::Client) {
-    let input = client.input().await;
+fn start_client(port: u32, client: host_service::Client) {
+    let input = client.input();
     let (writer, output) = crate::wit_stream::new();
     let input_waker = register_client(port);
     let output_waker = register_client(port);

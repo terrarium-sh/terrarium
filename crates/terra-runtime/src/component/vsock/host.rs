@@ -11,14 +11,20 @@ use std::sync::{
 use terra_io::local::{LocalListener, LocalStream};
 use wasmtime::StoreContextMut;
 use wasmtime::component::{
-    Accessor, Destination, Resource, ResourceTable, Source, StreamConsumer, StreamProducer,
+    Access, Accessor, Destination, Resource, ResourceTable, Source, StreamConsumer, StreamProducer,
     StreamReader, StreamResult, VecBuffer,
 };
 
 wasmtime::component::bindgen!({
     world: "device",
     path: "../../components/vsock/wit",
-    imports: { default: trappable },
+    imports: {
+        default: trappable,
+        "terra:vsock/host-service.[method]client.input": store | trappable,
+        "terra:vsock/host-service.listener": store | trappable,
+        "terra:vsock/host-service.plan": store | trappable,
+        "terra:vsock/host-service.stop": store | trappable,
+    },
 });
 
 const MAX_CLIENTS: usize = 64;
@@ -153,29 +159,27 @@ impl terra::vsock::host_service::HostClient for VsockHostService {
 }
 
 impl<T: Send + 'static> terra::vsock::host_service::HostClientWithStore<T> for VsockHost {
-    async fn input(
-        host: &Accessor<T, Self>,
+    fn input(
+        mut access: Access<'_, T, Self>,
         resource: Resource<terra::vsock::host_service::Client>,
     ) -> wasmtime::Result<StreamReader<u8>> {
-        host.with(|mut access| {
-            let input = access.get().client_mut(&resource).and_then(|client| {
-                client
-                    .input
-                    .take()
-                    .map(|input| (input, Arc::clone(&client.lease)))
-            });
-            let (input, lease) =
-                input.ok_or_else(|| wasmtime::Error::msg("vsock input already claimed"))?;
-            StreamReader::new(
-                &mut access,
-                InputProducer {
-                    input: Some(input),
-                    _lease: Some(lease),
-                    #[cfg(windows)]
-                    retry: None,
-                },
-            )
-        })
+        let input = access.get().client_mut(&resource).and_then(|client| {
+            client
+                .input
+                .take()
+                .map(|input| (input, Arc::clone(&client.lease)))
+        });
+        let (input, lease) =
+            input.ok_or_else(|| wasmtime::Error::msg("vsock input already claimed"))?;
+        StreamReader::new(
+            &mut access,
+            InputProducer {
+                input: Some(input),
+                _lease: Some(lease),
+                #[cfg(windows)]
+                retry: None,
+            },
+        )
     }
 
     fn output(
@@ -224,58 +228,52 @@ impl<T: Send + 'static> terra::vsock::host_service::HostClientWithStore<T> for V
 }
 
 impl<T: Send + 'static> terra::vsock::host_service::HostWithStore<T> for VsockHost {
-    async fn listener(
-        host: &Accessor<T, Self>,
+    fn listener(
+        mut access: Access<'_, T, Self>,
     ) -> wasmtime::Result<Option<StreamReader<Resource<terra::vsock::host_service::Client>>>> {
-        host.with(|mut access| {
-            let Some(listener) = access.get().listener.take() else {
-                return Ok(None);
-            };
-            let getter = host.getter();
-            StreamReader::new(
-                &mut access,
-                ListenerProducer {
-                    listener,
-                    getter,
-                    #[cfg(windows)]
-                    retry: None,
-                },
-            )
-            .map(Some)
-        })
+        let Some(listener) = access.get().listener.take() else {
+            return Ok(None);
+        };
+        let getter = access.getter();
+        StreamReader::new(
+            &mut access,
+            ListenerProducer {
+                listener,
+                getter,
+                #[cfg(windows)]
+                retry: None,
+            },
+        )
+        .map(Some)
     }
 
-    async fn plan(host: &Accessor<T, Self>) -> wasmtime::Result<StreamReader<u8>> {
-        host.with(|mut access| {
-            let plan = access
-                .get()
-                .plan
-                .take()
-                .ok_or_else(|| wasmtime::Error::msg("vsock plan already claimed"))?;
-            StreamReader::new(&mut access, plan)
-        })
+    fn plan(mut access: Access<'_, T, Self>) -> wasmtime::Result<StreamReader<u8>> {
+        let plan = access
+            .get()
+            .plan
+            .take()
+            .ok_or_else(|| wasmtime::Error::msg("vsock plan already claimed"))?;
+        StreamReader::new(&mut access, plan)
     }
 
-    async fn stop(host: &Accessor<T, Self>) -> wasmtime::Result<StreamReader<u8>> {
-        host.with(|mut access| {
-            let stop = {
-                let service = access.get();
-                if service.stop_issued {
-                    return Err(wasmtime::Error::msg("vsock stop already claimed"));
-                }
-                service.stop_issued = true;
-                service.stop.take()
-            };
-            StreamReader::new(
-                &mut access,
-                InputProducer {
-                    input: stop,
-                    _lease: None,
-                    #[cfg(windows)]
-                    retry: None,
-                },
-            )
-        })
+    fn stop(mut access: Access<'_, T, Self>) -> wasmtime::Result<StreamReader<u8>> {
+        let stop = {
+            let service = access.get();
+            if service.stop_issued {
+                return Err(wasmtime::Error::msg("vsock stop already claimed"));
+            }
+            service.stop_issued = true;
+            service.stop.take()
+        };
+        StreamReader::new(
+            &mut access,
+            InputProducer {
+                input: stop,
+                _lease: None,
+                #[cfg(windows)]
+                retry: None,
+            },
+        )
     }
 }
 
@@ -776,19 +774,19 @@ mod tests {
             .run_concurrent(async |accessor| {
                 let service = accessor.with_getter::<VsockHost>(DeviceHost::vsock_service_mut);
                 assert!(
-                    VsockHost::input(&service, Resource::new_own(client_rep))
-                        .await
+                    service
+                        .with(|access| VsockHost::input(access, Resource::new_own(client_rep)))
                         .is_ok()
                 );
                 assert!(
-                    VsockHost::input(&service, Resource::new_own(client_rep))
-                        .await
+                    service
+                        .with(|access| VsockHost::input(access, Resource::new_own(client_rep)))
                         .is_err()
                 );
-                assert!(VsockHost::plan(&service).await.is_ok());
-                assert!(VsockHost::plan(&service).await.is_err());
-                assert!(VsockHost::stop(&service).await.is_ok());
-                assert!(VsockHost::stop(&service).await.is_err());
+                assert!(service.with(VsockHost::plan).is_ok());
+                assert!(service.with(VsockHost::plan).is_err());
+                assert!(service.with(VsockHost::stop).is_ok());
+                assert!(service.with(VsockHost::stop).is_err());
             })
             .await
             .expect("concurrent store");

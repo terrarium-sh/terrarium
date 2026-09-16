@@ -114,7 +114,7 @@ impl exports::terra::vsock::api::Guest for Vsock {
     }
 
     async fn configure_worker(control_events: bool) {
-        worker::configure(control_events).await;
+        worker::configure(control_events);
     }
 
     fn events() -> wit_bindgen::rt::async_support::StreamReader<exports::terra::vsock::api::Event> {

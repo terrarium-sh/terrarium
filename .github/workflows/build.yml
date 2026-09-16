@@ -37,7 +37,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install component formatter
-        run: rustup toolchain install nightly-2026-09-13 --profile minimal --component rustfmt
+        run: rustup toolchain install nightly-2026-09-16 --profile minimal --component rustfmt
       - run: make verify-source
 
   guest-assets:
@@ -135,7 +135,7 @@ jobs:
           version: 0.16.0
       - name: Install component toolchain
         run: |
-          rustup toolchain install nightly-2026-09-13 --profile minimal --component rustfmt,clippy --target wasm32-wasip3
+          rustup toolchain install nightly-2026-09-16 --profile minimal --component rustfmt,clippy --target wasm32-wasip3
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           cache-on-failure: true
@@ -177,19 +177,19 @@ jobs:
         run: |
           cargo install cargo-fuzz --version 0.13.1 --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
           cargo metadata --locked --manifest-path fuzz/Cargo.toml --format-version 1
-          cargo +nightly-2026-09-13 fuzz run network_policy -- -max_total_time=60 -max_len=4096
-          cargo +nightly-2026-09-13 fuzz run native_memory -- -max_total_time=60 -max_len=32768
-          cargo +nightly-2026-09-13 fuzz run device_queue -- -max_total_time=60 -max_len=4096
-          cargo +nightly-2026-09-13 fuzz run fuse_wire -- -max_total_time=60 -max_len=4096
-          cargo +nightly-2026-09-13 fuzz run vsock_header -- -max_total_time=60 -max_len=4096
-          cargo +nightly-2026-09-13 fuzz run protocol_frames -- -max_total_time=60 -max_len=4096
+          cargo +nightly-2026-09-16 fuzz run network_policy -- -max_total_time=60 -max_len=4096
+          cargo +nightly-2026-09-16 fuzz run native_memory -- -max_total_time=60 -max_len=32768
+          cargo +nightly-2026-09-16 fuzz run device_queue -- -max_total_time=60 -max_len=4096
+          cargo +nightly-2026-09-16 fuzz run fuse_wire -- -max_total_time=60 -max_len=4096
+          cargo +nightly-2026-09-16 fuzz run vsock_header -- -max_total_time=60 -max_len=4096
+          cargo +nightly-2026-09-16 fuzz run protocol_frames -- -max_total_time=60 -max_len=4096
       - name: Reclaim fuzz build space
         run: rm -rf fuzz/target
       - name: Native boundary address sanitizer
         env:
           RUSTFLAGS: -Zsanitizer=address
           CARGO_TARGET_DIR: target/asan
-        run: cargo +nightly-2026-09-13 test --locked -p terra-runtime --test native_boundary --target x86_64-unknown-linux-gnu
+        run: cargo +nightly-2026-09-16 test --locked -p terra-runtime --test native_boundary --target x86_64-unknown-linux-gnu
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: terra-x86_64-linux
@@ -221,7 +221,7 @@ jobs:
       - name: Install component toolchain
         run: |
           rustup target add aarch64-unknown-linux-musl
-          rustup toolchain install nightly-2026-09-13 --profile minimal --component rustfmt,clippy --target wasm32-wasip3
+          rustup toolchain install nightly-2026-09-16 --profile minimal --component rustfmt,clippy --target wasm32-wasip3
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           cache-on-failure: true
@@ -275,7 +275,7 @@ jobs:
           path: build
       - name: Install component toolchain
         run: |
-          rustup toolchain install nightly-2026-09-13 --profile minimal --component rustfmt,clippy --target wasm32-wasip3
+          rustup toolchain install nightly-2026-09-16 --profile minimal --component rustfmt,clippy --target wasm32-wasip3
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           cache-on-failure: true
@@ -342,7 +342,7 @@ jobs:
           name: terra-guest-${{ matrix.guest }}
           path: build
       - name: Install component toolchain
-        run: rustup toolchain install nightly-2026-09-13 --profile minimal --target wasm32-wasip3
+        run: rustup toolchain install nightly-2026-09-16 --profile minimal --target wasm32-wasip3
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           cache-on-failure: true

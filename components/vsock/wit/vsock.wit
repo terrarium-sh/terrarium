@@ -4,13 +4,13 @@ interface host-service {
     enum endpoint-error { closed, io, too-large }
     variant event { diagnostic(list<u8>), exit(s32) }
     resource client {
-        input: async func() -> stream<u8>;
+        input: func() -> stream<u8>;
         output: async func(bytes: stream<u8>) -> result<_, endpoint-error>;
         shutdown-write: func();
     }
-    listener: async func() -> option<stream<own<client>>>;
-    plan: async func() -> stream<u8>;
-    stop: async func() -> stream<u8>;
+    listener: func() -> option<stream<own<client>>>;
+    plan: func() -> stream<u8>;
+    stop: func() -> stream<u8>;
 }
 
 interface api {
