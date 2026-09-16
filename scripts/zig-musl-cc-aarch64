@@ -7,6 +7,8 @@ for arg do
 	shift
 	case "$arg" in
 	--target=* | -Wl,-O?) continue ;; # see zig-musl-cc for why
+	# rustc adds this to every aarch64 link; zig's self-hosted linker rejects it
+	-Wl,--fix-cortex-a53-843419) continue ;;
 	esac
 	set -- "$@" "$arg"
 done
