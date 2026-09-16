@@ -408,7 +408,6 @@ fn run_one(
                 terra_runtime::component::vmm::Completion::HvcReturn(status) => {
                     cpu.set_reg(applevisor::prelude::Reg::X0, status.cast_unsigned())
                         .map_err(|error| error.to_string())?;
-                    cpu.advance_pc().map_err(|error| error.to_string())?;
                     Ok(CpuRun::Continue)
                 }
                 terra_runtime::component::vmm::Completion::CpuStart(start) => {
@@ -427,16 +426,11 @@ fn run_one(
                     };
                     cpu.set_reg(applevisor::prelude::Reg::X0, status.cast_unsigned())
                         .map_err(|error| error.to_string())?;
-                    cpu.advance_pc().map_err(|error| error.to_string())?;
                     Ok(CpuRun::Continue)
                 }
-                terra_runtime::component::vmm::Completion::CpuOff => {
-                    cpu.advance_pc().map_err(|error| error.to_string())?;
-                    Ok(CpuRun::Off)
-                }
+                terra_runtime::component::vmm::Completion::CpuOff => Ok(CpuRun::Off),
                 terra_runtime::component::vmm::Completion::SystemStop => {
                     starts.stop();
-                    cpu.advance_pc().map_err(|error| error.to_string())?;
                     Ok(CpuRun::Stop)
                 }
                 terra_runtime::component::vmm::Completion::Start

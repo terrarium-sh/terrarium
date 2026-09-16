@@ -198,16 +198,19 @@ pub(super) async fn run_bridge(
             }
             Some(BridgeEvent::Completion(index, result)) => {
                 let operation = operations.swap_remove(index);
-                let failed = result.is_err();
+                let failure = result
+                    .as_ref()
+                    .err()
+                    .map(|error| format!("MMIO router failed: {error:#}"));
                 let all_closed = result.as_ref().is_ok_and(|reply| reply.all_closed);
                 let _ = operation.reply.send(result.map(|reply| reply.routed));
-                if failed {
+                if let Some(reason) = failure {
                     return bridge_error(
                         &context.admission,
                         &mut receiver,
                         &mut control_receiver,
                         operations,
-                        "MMIO router failed",
+                        &reason,
                     );
                 }
                 if all_closed {
@@ -245,7 +248,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aot_router_configures_bounded_vcpu_banks() {
+    async fn aot_router_configures_bounded_vcpu_banks_and_preserves_failures() {
         let engine = crate::engine::device_engine().expect("engine");
         let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
         // SAFETY: these test bytes are built AOT artifacts for this exact runtime.
@@ -288,6 +291,33 @@ mod tests {
             .expect("AOT MMIO router initializes");
         runtime.configure_mmio_vcpus(2).await.expect("vCPU setup");
         assert!(runtime.configure_mmio_vcpus(33).await.is_err());
+
+        let router = runtime.mmio.as_ref().expect("router");
+        let response =
+            enqueue(&router.sender, &router.admission, access()).expect("unmapped request queued");
+        let failure = Arc::clone(&router.failure);
+        let error = runtime
+            .start()
+            .join()
+            .await
+            .expect_err("unmapped access fails");
+        assert!(error.to_string().contains("unmapped"), "{error:#}");
+        assert!(
+            response
+                .recv()
+                .expect("response")
+                .unwrap_err()
+                .to_string()
+                .contains("unmapped")
+        );
+        assert!(
+            failure
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .contains("unmapped")
+        );
     }
 
     #[test]

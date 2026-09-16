@@ -9,12 +9,13 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use kvm_bindings::{
-    KVM_ARM_VCPU_POWER_OFF, KVM_ARM_VCPU_PSCI_0_2, KVM_DEV_ARM_VGIC_CTRL_INIT,
-    KVM_DEV_ARM_VGIC_GRP_ADDR, KVM_DEV_ARM_VGIC_GRP_CTRL, KVM_DEV_ARM_VGIC_GRP_NR_IRQS,
-    KVM_REG_ARM_CORE, KVM_REG_ARM64, KVM_REG_SIZE_U64, KVM_SYSTEM_EVENT_RESET,
-    KVM_SYSTEM_EVENT_SHUTDOWN, KVM_VGIC_V3_ADDR_TYPE_DIST, KVM_VGIC_V3_ADDR_TYPE_REDIST,
-    kvm_create_device, kvm_device_attr, kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_V3, kvm_regs,
-    kvm_userspace_memory_region, kvm_vcpu_init, user_pt_regs,
+    KVM_ARM_IRQ_TYPE_SHIFT, KVM_ARM_IRQ_TYPE_SPI, KVM_ARM_VCPU_POWER_OFF, KVM_ARM_VCPU_PSCI_0_2,
+    KVM_DEV_ARM_VGIC_CTRL_INIT, KVM_DEV_ARM_VGIC_GRP_ADDR, KVM_DEV_ARM_VGIC_GRP_CTRL,
+    KVM_DEV_ARM_VGIC_GRP_NR_IRQS, KVM_REG_ARM_CORE, KVM_REG_ARM64, KVM_REG_SIZE_U64,
+    KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN, KVM_VGIC_V3_ADDR_TYPE_DIST,
+    KVM_VGIC_V3_ADDR_TYPE_REDIST, kvm_create_device, kvm_device_attr,
+    kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_V3, kvm_regs, kvm_userspace_memory_region, kvm_vcpu_init,
+    user_pt_regs,
 };
 use kvm_ioctls::{DeviceFd, Kvm, VcpuExit, VcpuFd, VmFd};
 use terra_runtime::SyntheticRam;
@@ -146,7 +147,10 @@ impl Machine {
         let irq = GIC_SPI_OFFSET
             .checked_add(irq)
             .ok_or(ArmWorkerError::TooManyDevices)?;
-        self.vm.set_irq_line(irq, level)?;
+        self.vm.set_irq_line(
+            (KVM_ARM_IRQ_TYPE_SPI << KVM_ARM_IRQ_TYPE_SHIFT) | irq,
+            level,
+        )?;
         Ok(())
     }
 }
@@ -307,7 +311,11 @@ pub async fn prepare(mut input: WorkerInput) -> Result<PreparedVmm, ArmWorkerErr
     let config = layout
         .machine_config(input.vcpus)
         .map_err(|error| ArmWorkerError::Component(error.to_string()))?;
-    let kvm = Kvm::new().map_err(|error| component_error(&wasmtime::Error::from(error)))?;
+    let kvm = Kvm::new().map_err(|error| {
+        ArmWorkerError::Component(format!(
+            "opening /dev/kvm: {error}; check KVM access permissions"
+        ))
+    })?;
     let machine = Machine::new(&kvm, &config)?;
     let mut runtime =
         crate::worker::create_runtime(&input).map_err(|error| component_error(&error))?;
@@ -439,7 +447,7 @@ impl Drop for VcpuGroup {
 }
 
 fn component_error(error: &wasmtime::Error) -> ArmWorkerError {
-    ArmWorkerError::Component(error.to_string())
+    ArmWorkerError::Component(format!("{error:#}"))
 }
 
 fn inject_irq(machine: &Machine, irq: u32, level: bool) -> wasmtime::Result<()> {
