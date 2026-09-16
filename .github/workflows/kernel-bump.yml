@@ -1,0 +1,59 @@
+name: Kernel bump
+
+on:
+  schedule:
+    - cron: '17 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Same-series LTS patches only; a new LTS series stays manual since it can need config and patch work.
+      - name: Open patch-bump PR for the pinned LTS series
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          current=$(sed -n 's/^KERNEL_VERSION := //p' pins.mk)
+          series=$(cut -d. -f1,2 <<<"$current")
+          major=$(cut -d. -f1 <<<"$current")
+          latest=$(curl -fsSL https://www.kernel.org/releases.json | jq -r --arg s "$series." '[.releases[] | select(.moniker == "longterm") | .version | select(startswith($s))] | sort_by(split(".") | map(tonumber)) | last // empty')
+          if [ -z "$latest" ]; then
+            echo "::notice title=Kernel series EOL::$series is no longer listed as longterm; pick a new LTS manually."
+            exit 0
+          fi
+          if [ "$latest" = "$current" ]; then
+            echo "kernel $current is the newest $series patch."
+            exit 0
+          fi
+          downloads=$(mktemp -d)
+          archive="$downloads/linux-$latest.tar.xz"
+          curl -fsSL "https://cdn.kernel.org/pub/linux/kernel/v$major.x/linux-$latest.tar.xz" -o "$archive"
+          curl -fsSL "https://cdn.kernel.org/pub/linux/kernel/v$major.x/linux-$latest.tar.sign" -o "$downloads/linux-$latest.tar.sign"
+          gpg --batch --dearmor --output "$downloads/gregkh.gpg" .github/keys/gregkh.asc
+          xz -cd "$archive" | gpgv --keyring "$downloads/gregkh.gpg" "$downloads/linux-$latest.tar.sign" -
+          sha=$(sha256sum "$archive" | cut -d' ' -f1)
+          sed -i "s/^KERNEL_VERSION := .*/KERNEL_VERSION := $latest/" pins.mk
+          sed -i "s/^KERNEL_SHA256 := .*/KERNEL_SHA256 := $sha/" pins.mk
+          branch="kernel-$latest"
+          if [ "$(gh pr list --head "$branch" --json number --jq length)" -gt 0 ]; then
+            echo "PR for $latest already open."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add pins.mk
+          git commit -m "kernel: bump to $latest"
+          git push -u origin "$branch"
+          gh pr create --title "kernel: bump to $latest" --body "New $series LTS patch. ChangeLog: https://cdn.kernel.org/pub/linux/kernel/v$major.x/ChangeLog-$latest"
