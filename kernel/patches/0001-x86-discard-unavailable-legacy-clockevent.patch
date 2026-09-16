@@ -1,0 +1,21 @@
+Subject: [PATCH] x86/time: discard the legacy clockevent when its IRQ is unavailable
+
+WHP guests have a local APIC timer but no legacy timer IRQ. Keeping
+global_clock_event after request_irq() fails makes LAPIC calibration verify
+against jiffies that never advance, disabling the working LAPIC timer.
+Clear the unavailable reference so calibration uses the supplied TSC frequency.
+
+--- a/arch/x86/kernel/time.c
++++ b/arch/x86/kernel/time.c
+@@ -49,8 +49,10 @@ static void __init setup_default_timer_irq(void)
+ 	 * without legacy PIC/PIT we need this for the HPET0 in legacy
+ 	 * replacement mode.
+ 	 */
+-	if (request_irq(0, timer_interrupt, flags, "timer", NULL))
++	if (request_irq(0, timer_interrupt, flags, "timer", NULL)) {
+ 		pr_info("Failed to register legacy timer interrupt\n");
++		global_clock_event = NULL;
++	}
+ }
+ 
+ /* Default timer init function */
