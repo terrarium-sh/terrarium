@@ -9,6 +9,11 @@ Run coding agents and development tools in a hardware-virtualized microVM.
 One self-contained `terra` binary, one YAML recipe, and explicit grants for
 host files and network access. No host files or network access by default.
 
+**Keep it simple, keep it auditable.** Terrarium aims for a small core whose
+code and behavior are easy to understand and review. Every feature and
+abstraction must earn its complexity. Recipes, lifecycle hooks, and external
+tools let you adapt it to your needs while keeping the core focused.
+
 **The virtual devices are sandboxed too.** Terrarium runs device components in
 separate WebAssembly sandboxes with scoped host access: a filesystem device gets
 its granted directory; a network device gets policy-controlled sockets.
