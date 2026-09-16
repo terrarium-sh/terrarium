@@ -76,6 +76,6 @@ exhaustive adversarial validation.
 This records local Linux amd64 acceptance, not validation of other hosts.
 Systemd deployment, commits, and pushes were excluded. Other architectures,
 multi-day stress, independent security review, power-loss testing, suspend/resume,
-and matched performance comparisons remain in [the backlog](../todo.md).
+and matched performance comparisons remain in [the backlog](todo.md).
 The [documented resource limits](security.md) and
 [mount coherency limitations](recipe.md#mounts-and-environment) still apply.

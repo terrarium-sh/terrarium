@@ -1,24 +1,23 @@
 # 🪴 Terrarium
 
-> ⚠️ **Under construction — not ready to be used as of now.** ⚠️
+> ⚠️ **Under construction — docs are incomplete and the code is still under
+> internal review. Use with caution.** ⚠️
 
-> A safe home where your agent can thrive.
+> Give your agent room to work. Decide what it can touch.
 
-Run coding agents and development tools in a hardware-virtualized microVM with
-only the network access you grant it.
+Run coding agents and development tools in a hardware-virtualized microVM.
+One self-contained `terra` binary, one YAML recipe, and explicit grants for
+host files and network access. No host files or network access by default.
 
-Terrarium is a minimal sandbox: one self-contained `terra` binary and a YAML
-recipe. It boots a microVM and uses the recipe as the explicit policy for host
-files, network access, guest resources, and workload.
+**The virtual devices are sandboxed too.** Terrarium runs device components in
+separate WebAssembly sandboxes with scoped host access: a filesystem device gets
+its granted directory; a network device gets policy-controlled sockets.
+The microVM isolates the workload, and the device sandboxes limit the authority
+of the code handling its requests. See the [security model](docs/security.md).
 
-[![CI](https://github.com/Berry-Studio/terrarium/actions/workflows/build.yml/badge.svg)](https://github.com/Berry-Studio/terrarium/actions)
-[![Latest release](https://img.shields.io/github/v/release/Berry-Studio/terrarium)](https://github.com/Berry-Studio/terrarium/releases/latest)
+[![CI](https://github.com/terrarium-sh/terrarium/actions/workflows/build.yml/badge.svg)](https://github.com/terrarium-sh/terrarium/actions)
+[![Latest release](https://img.shields.io/github/v/release/terrarium-sh/terrarium)](https://github.com/terrarium-sh/terrarium/releases/latest)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-
-Terrarium runs a workload in a microVM with exactly the network it was allowed
-to reach. No daemon; no images to pull or runtime downloads — the guest root
-filesystem, boot, and trusted precompiled device components are embedded in the
-binary.
 
 The supported host and build requirements are maintained in
 [README.dev.md](README.dev.md). Terrarium may work in WSL2 when its distribution
@@ -27,15 +26,27 @@ has read-write access to `/dev/kvm`.
 ## Quickstart
 
 ```sh
-curl -fsSLO https://raw.githubusercontent.com/Berry-Studio/terrarium/main/install.sh
+curl -fsSLO https://raw.githubusercontent.com/terrarium-sh/terrarium/main/install.sh
 sh install.sh
 terra --version
 ```
 
+On Windows (PowerShell):
+
+```powershell
+Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/terrarium-sh/terrarium/main/install.ps1 -OutFile install.ps1
+powershell -ExecutionPolicy Bypass -File install.ps1
+```
+
+`install.ps1` installs `terra.exe` to `%LOCALAPPDATA%\Programs\terra`, adds that
+directory to the user `PATH` (open a new terminal afterwards), takes
+`-Prerelease`, and honors `$env:TERRA_VERSION`.
+
 The installer verifies the release checksum and also verifies its GitHub attestation when the GitHub CLI is installed. Pin a release with
-`TERRA_VERSION=x.y.z sh install.sh`; re-run it to upgrade. Build from source:
+`TERRA_VERSION=x.y.z sh install.sh`; re-run it to upgrade, or pass
+`--prerelease` to take the newest release even when it is a prerelease. Build from source:
 [README.dev.md](README.dev.md) using the pinned Rust toolchains. Verify a release archive with
-`gh attestation verify terra-x86_64-linux.tar.gz --repo Berry-Studio/terrarium`
+`gh attestation verify terra-x86_64-linux.tar.gz --repo terrarium-sh/terrarium`
 after downloading the matching release archive.
 
 Then sandbox a project:
@@ -70,7 +81,8 @@ instructions: [docs/usage.md](docs/usage.md).
 - **Explicit access.** No host files or network by default; the host, LAN, and
   private ranges stay blocked unless a recipe names them. Grant host directories
   with `mounts`, or transfer individual files with `put` and `get`.
-- **One binary.** No daemon, images to pull, or runtime downloads.
+- **One binary.** The base guest filesystem and VM components are embedded in
+  `terra`; no daemon required. Recipe hooks can install additional packages.
 - **Lifecycle hooks.** `on_create`, `on_start`, and `pre_stop` run as guest
   root. Startup and stop output appears live in the attached console, with the
   workload between them. Package installation usually belongs in `on_create`.
@@ -106,7 +118,7 @@ honour owner-only permissions.
 The VM is the boundary. Each host-directory mount has its own filesystem
 component and directory grant, with read-only enforcement on the host.
 Read the [security model](docs/security.md), or
-[report a vulnerability privately](https://github.com/Berry-Studio/terrarium/security/advisories/new).
+[report a vulnerability privately](https://github.com/terrarium-sh/terrarium/security/advisories/new).
 
 ## Documentation
 

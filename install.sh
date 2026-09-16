@@ -4,7 +4,18 @@
 # it verifies the release attestation too.
 set -eu
 
-repo="Berry-Studio/terrarium"
+prerelease=no
+for arg in "$@"; do
+  case "$arg" in
+    --prerelease) prerelease=yes ;;
+    *)
+      echo "usage: install.sh [--prerelease]" >&2
+      exit 2
+      ;;
+  esac
+done
+
+repo="terrarium-sh/terrarium"
 version="${TERRA_VERSION:-latest}"
 case "$version" in
   latest | v*) ;;
@@ -41,14 +52,26 @@ case "$os/$arch" in
     ;;
 esac
 
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+if [ "$version" = latest ] && [ "$prerelease" = yes ]; then
+  # releases/latest/download resolves to the newest stable release only.
+  curl -fsSL --proto '=https' --tlsv1.2 \
+    "https://api.github.com/repos/$repo/releases?per_page=1" -o "$tmp/releases.json"
+  version=$(sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' "$tmp/releases.json" | head -n 1)
+  if [ -z "$version" ]; then
+    echo "terrarium: could not resolve the newest release" >&2
+    exit 1
+  fi
+fi
+
 if [ "$version" = "latest" ]; then
   base="https://github.com/$repo/releases/latest/download"
 else
   base="https://github.com/$repo/releases/download/$version"
 fi
 
-tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
 curl -fsSL --proto '=https' --tlsv1.2 "$base/SHA256SUMS" -o "$tmp/SHA256SUMS"
 archive="$asset.tar.gz"
 curl -fsSL --proto '=https' --tlsv1.2 "$base/$archive" -o "$tmp/$archive"

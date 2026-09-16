@@ -1,7 +1,7 @@
 # Terrarium development
 
 Users start at the [README](README.md). Outstanding implementation and validation
-work lives in [todo.md](todo.md).
+work lives in [todo.md](docs/todo.md).
 
 ## Build
 
@@ -165,7 +165,7 @@ cargo test --locked -p terra --test native_boot --test boot --test memory -- --i
 Those gates cover guest CPUs, hooks, writable/read-only mounts, granted networking,
 volume persistence, and rootless Podman image import/run/stop on a private disk.
 The Podman gate downloads Alpine packages during setup and needs public egress. Native adapter code and a cross-target check alone do
-not establish guest acceptance; outstanding host validation is in [todo.md](todo.md).
+not establish guest acceptance; outstanding host validation is in [todo.md](docs/todo.md).
 
 Network policy coverage and boundary fuzzing use the existing tools:
 

@@ -1,7 +1,7 @@
 # Security policy
 
 Please do not report suspected vulnerabilities in public issues. Report them
-privately through [GitHub's private security advisory form](https://github.com/Berry-Studio/terrarium/security/advisories/new).
+privately through [GitHub's private security advisory form](https://github.com/terrarium-sh/terrarium/security/advisories/new).
 
 Include the affected Terra version or commit, a proof of concept or clear
 reproduction steps, impact, and any mitigation you found. Do not include

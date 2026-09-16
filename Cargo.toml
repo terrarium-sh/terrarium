@@ -7,7 +7,7 @@ exclude = ["vendor", "components", "fuzz"]
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-repository = "https://github.com/Berry-Studio/terrarium"
+repository = "https://github.com/terrarium-sh/terrarium"
 rust-version = "1.95"
 
 [workspace.dependencies]

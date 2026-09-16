@@ -19,27 +19,27 @@ VM behavior.
   passed, plus 5 repeated two-vCPU network/storage/restart runs. The review
   fixed TCP truncation at host EOF and a native-cleanup mutex stall.
   Commands, artifact hash, results, and validation limits are recorded in
-  [Linux amd64 acceptance](docs/linux-amd64-acceptance.md).
+  [Linux amd64 acceptance](linux-amd64-acceptance.md).
 
 - [ ] **Linux AArch64 KVM:** run the packaged binary's boot, mount, networking,
   SMP, memory-reclaim, shutdown, and ARM GIC-routing gates on AArch64 hardware.
   Include CPU state, device ordering, and capacity behavior.
   Record the commands and results beside
-  [`crates/terra/tests/native_boot.rs`](crates/terra/tests/native_boot.rs) and
-  [`crates/terra/tests/memory.rs`](crates/terra/tests/memory.rs).
+  [`crates/terra/tests/native_boot.rs`](../crates/terra/tests/native_boot.rs) and
+  [`crates/terra/tests/memory.rs`](../crates/terra/tests/memory.rs).
 
 - [ ] **macOS and Windows:** run the native packaged-release gates on Apple
   Silicon macOS and both supported Windows WHP architectures. Cover boot,
   two-vCPU startup, granted networking, read-write and read-only mounts,
   persistent volumes, and orderly shutdown. On Windows, explicitly verify the
   reduced WASI mount contract, CPU state, and device ordering. The gate is
-  [`crates/terra/tests/native_boot.rs`](crates/terra/tests/native_boot.rs).
+  [`crates/terra/tests/native_boot.rs`](../crates/terra/tests/native_boot.rs).
 
 - [x] **Guest workflow compatibility:** make rootless Podman work for the
   ordinary Alpine user without granting host TUN access or host privileges.
   Start from the existing TUN/namespace setup in
-  [`kernel/terra.config`](kernel/terra.config) and the guest initialization in
-  [`crates/terra-agent/src/init.rs`](crates/terra-agent/src/init.rs). Add an
+  [`kernel/terra.config`](../kernel/terra.config) and the guest initialization in
+  [`crates/terra-agent/src/init.rs`](../crates/terra-agent/src/init.rs). Add an
   ignored native-boot gate that creates and stops a rootless container on a
   private disk, proves allowed egress, and proves existing denials remain.
   The ignored `native_boot_runs_rootless_podman_on_a_private_disk` gate passed
@@ -64,12 +64,12 @@ VM behavior.
 - [ ] **Mount coherency contract:** define cache and writeback behavior for
   host and other-box changes through open files, directory listings, mappings,
   rename, truncation, and fsync. Test it through the filesystem worker
-  ([`components/fs`](components/fs)) and real guests. Document polling for
+  ([`components/fs`](../components/fs)) and real guests. Document polling for
   editors; host-to-guest notification bridging is intentionally absent.
 
 - [ ] **Concurrent mount workloads:** extend the existing one-guest Git, atomic
   save, executable, and mmap coverage in
-  [`crates/terra/tests/boot.rs`](crates/terra/tests/boot.rs) to cover concurrent
+  [`crates/terra/tests/boot.rs`](../crates/terra/tests/boot.rs) to cover concurrent
   host and other-box changes. Include visibility, read-only grants, cancellation,
   ENOSPC, reset, and shutdown under I/O.
   The 2026-09-13 native acceptance gate now checks host replacement, guest
@@ -81,7 +81,7 @@ VM behavior.
   or full queues, slow or failed I/O, cancellation, reset, and shutdown while
   other devices and boxes continue. Include power-loss recovery separately from
   successful `fsync`/`sync`. Extend the production-worker tests in
-  [`crates/terra-runtime/tests`](crates/terra-runtime/tests) and native gates
+  [`crates/terra-runtime/tests`](../crates/terra-runtime/tests) and native gates
   where hypervisor behavior is material.
 
 ## Time and performance
@@ -90,16 +90,16 @@ VM behavior.
   suspend/resume, and clock jumps on every native backend. Define Windows
   timezone behavior and test TZif/DST handling. Audit early-kernel entropy and
   backend entropy readiness before hooks, TLS, or key generation. The wire
-  contract is [`crates/terra-protocol/src/plan.rs`](crates/terra-protocol/src/plan.rs)
-  and delivery is [`components/vsock`](components/vsock).
+  contract is [`crates/terra-protocol/src/plan.rs`](../crates/terra-protocol/src/plan.rs)
+  and delivery is [`components/vsock`](../components/vsock).
 
 - [ ] **Measured performance:** use matched previous/current binaries and real
   Git/build, parallel CPU, concurrent network, storage, and multi-box workloads
   to measure setup, ready time, throughput, tail console latency, CPU, RSS,
   MMIO/KVM-exit costs, and shutdown. Investigate the known mount-throughput and
   intermittent CPU-count-hook failures only if reproduced. Keep drivers under
-  [`scripts/bench-vmm.py`](scripts/bench-vmm.py) and
-  [`scripts/bench-shared-irqs.py`](scripts/bench-shared-irqs.py).
+  [`scripts/bench-vmm.py`](../scripts/bench-vmm.py) and
+  [`scripts/bench-shared-irqs.py`](../scripts/bench-shared-irqs.py).
 
 ## Containment and sustained operation
 
@@ -109,8 +109,8 @@ VM behavior.
   Clearly distinguish Terra's current component
   memory/admission limits from deployment-owned hard native and kernel-memory
   limits. Relevant admission and worker code is
-  [`crates/terra/src/vm/resources.rs`](crates/terra/src/vm/resources.rs) and
-  [`crates/terra-runtime/src/box_runtime.rs`](crates/terra-runtime/src/box_runtime.rs).
+  [`crates/terra/src/vm/resources.rs`](../crates/terra/src/vm/resources.rs) and
+  [`crates/terra-runtime/src/box_runtime.rs`](../crates/terra-runtime/src/box_runtime.rs).
   Document the required deployment-owned OS controls for hard worker/process
   and kernel-memory containment.
 
@@ -120,7 +120,7 @@ VM behavior.
   that exclude secrets and treat guest output as untrusted. Add a narrow broker
   only where destination grants cannot constrain an approved operation.
 
-- [ ] **Adversarial validation:** extend [`fuzz/fuzz_targets`](fuzz/fuzz_targets)
+- [ ] **Adversarial validation:** extend [`fuzz/fuzz_targets`](../fuzz/fuzz_targets)
   beyond network policy, native memory, device queues, FUSE, vsock headers, and
   protocol frames to native imports and control input. Prove cross-box RAM, file,
   network, control, and resource isolation during reset and teardown. Run

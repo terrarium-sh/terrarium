@@ -4,7 +4,7 @@ Terra runs a workload in a hardware-virtualized VM. The VM boundary is intended
 to protect the host from a hostile guest, subject to the trusted computing base
 and limits below. Linux uses KVM, macOS uses Hypervisor.framework, and Windows
 uses WHP. Current-build hardware acceptance remains tracked in
-[todo.md](../todo.md); earlier Linux results do not validate every later change.
+[todo.md](todo.md); earlier Linux results do not validate every later change.
 
 This document describes the boundary Terra implements. It is not an assurance
 against flaws in the host kernel, hypervisor, Wasmtime, WASI, native runtime,
