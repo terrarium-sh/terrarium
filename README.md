@@ -5,28 +5,26 @@
 
 > Give your agent room to work. Decide what it can touch.
 
-Run coding agents and development tools in a hardware-virtualized microVM.
-One self-contained `terra` binary, one YAML recipe, and explicit grants for
-host files and network access. No host files or network access by default.
-
-**Keep it simple, keep it auditable.** Terrarium aims for a small core whose
-code and behavior are easy to understand and review. Every feature and
-abstraction must earn its complexity. Recipes, lifecycle hooks, and external
-tools let you adapt it to your needs while keeping the core focused.
-
-**The virtual devices are sandboxed too.** Terrarium runs device components in
-separate WebAssembly sandboxes with scoped host access: a filesystem device gets
-its granted directory; a network device gets policy-controlled sockets.
-The microVM isolates the workload, and the device sandboxes limit the authority
-of the code handling its requests. See the [security model](docs/security.md).
-
 [![CI](https://github.com/terrarium-sh/terrarium/actions/workflows/build.yml/badge.svg)](https://github.com/terrarium-sh/terrarium/actions)
 [![Latest release](https://img.shields.io/github/v/release/terrarium-sh/terrarium)](https://github.com/terrarium-sh/terrarium/releases/latest)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-The supported host and build requirements are maintained in
-[README.dev.md](README.dev.md). Terrarium may work in WSL2 when its distribution
-has read-write access to `/dev/kvm`.
+Run coding agents and development tools in a hardware-virtualized microVM.
+One self-contained `terra` binary, one YAML recipe, and explicit grants for
+host files and network access. No host files or network access by default.
+
+**Keep it simple, keep it auditable.** Terrarium keeps a small core that is easy
+to understand and review. Recipes, lifecycle hooks, and external tools add what
+you need without growing the core.
+
+**The virtual devices are sandboxed too.** Device components run in separate
+WebAssembly sandboxes with scoped host access: a filesystem device gets its
+granted directory, a network device policy-controlled sockets. The microVM
+isolates the workload; the sandboxes limit what the code handling guest requests
+can do. See the [security model](docs/security.md).
+
+Supported hosts: Linux amd64 and aarch64, macOS on Apple Silicon, and Windows
+amd64. Build requirements: [README.dev.md](README.dev.md).
 
 ## Quickstart
 
