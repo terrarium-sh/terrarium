@@ -136,13 +136,10 @@ $(KERNEL_TARBALL):
 	echo '$(KERNEL_SHA256)  $@.tmp' | sha256sum -c -
 	mv $@.tmp $@
 
-$(KERNEL_SOURCE)/Makefile: $(KERNEL_TARBALL) $(KERNEL_INPUTS)
+$(KERNEL_PATCH_STAMP): $(KERNEL_TARBALL) $(KERNEL_INPUTS)
 	echo '$(KERNEL_SHA256)  $(KERNEL_TARBALL)' | sha256sum -c -
 	rm -rf $(KERNEL_SOURCE) $(KERNEL_OUTPUT)
 	tar -xf $(KERNEL_TARBALL) -C $(BUILD)
-	touch $@
-
-$(KERNEL_PATCH_STAMP): $(KERNEL_SOURCE)/Makefile $(KERNEL_PATCHES)
 	set -e; for patch in $(abspath $(KERNEL_PATCHES)); do git apply --directory=$(KERNEL_SOURCE) --check $$patch && git apply --directory=$(KERNEL_SOURCE) $$patch; done
 	sha256sum $(KERNEL_PATCHES) </dev/null > $@
 

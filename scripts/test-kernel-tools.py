@@ -7,6 +7,9 @@ import gzip
 import hashlib
 import importlib.util
 import io
+import os
+import shutil
+import subprocess
 import tarfile
 import tempfile
 import unittest
@@ -27,6 +30,54 @@ def tool(name: str):
 
 CONFIG = tool("check-kernel-config")
 ARTIFACT = tool("kernel-artifact")
+
+
+class KernelPatchTests(unittest.TestCase):
+    def test_cached_patches_follow_content_and_retry_from_clean_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            for name in ("Makefile", "pins.mk", "kernel/terra.config", "kernel/x86_64.config",
+                         "kernel/Containerfile", "scripts/kernel-container.sh"):
+                destination = directory / name
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(SCRIPTS.parent / name, destination)
+            build = directory / "build"
+            build.mkdir()
+            archive = build / "linux-test.tar.xz"
+            with tarfile.open(archive, "w:xz") as tar:
+                for name, data in (("Makefile", b"fixture\n"),
+                                   ("test.txt", b"header\nbefore\nfooter\n")):
+                    entry = tarfile.TarInfo(f"linux-test/{name}")
+                    entry.size = len(data)
+                    tar.addfile(entry, io.BytesIO(data))
+            patch = directory / "kernel/patches/test.patch"
+            patch.parent.mkdir()
+            patch.write_text("--- a/test.txt\n+++ b/test.txt\n@@ -1,3 +1,3 @@\n header\n-before\n+after\n footer\n")
+            command = ["make", "ARCH=x86_64", "KERNEL_VERSION=test",
+                       f"KERNEL_SHA256={hashlib.sha256(archive.read_bytes()).hexdigest()}",
+                       "KERNEL_ARCHIVE_URL=", "build/linux-test/.terra-patches"]
+
+            def prepare() -> None:
+                result = subprocess.run(command, cwd=directory, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+            prepare()
+            source = build / "linux-test/test.txt"
+            stamp = build / "linux-test/.terra-patches"
+            self.assertEqual(source.read_text(), "header\nafter\nfooter\n")
+            original_stamp = stamp.stat().st_mtime_ns
+            newer = original_stamp + 1_000_000_000
+            os.utime(patch, ns=(newer, newer))
+            prepare()
+            self.assertEqual(stamp.stat().st_mtime_ns, original_stamp)
+
+            patch.write_text(patch.read_text().replace("+after", "+changed"))
+            prepare()
+            self.assertEqual(source.read_text(), "header\nchanged\nfooter\n")
+
+            stamp.unlink()
+            prepare()
+            self.assertEqual(source.read_text(), "header\nchanged\nfooter\n")
 
 
 class KernelConfigTests(unittest.TestCase):
