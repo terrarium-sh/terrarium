@@ -143,7 +143,7 @@ $(KERNEL_SOURCE)/Makefile: $(KERNEL_TARBALL) $(KERNEL_INPUTS)
 	touch $@
 
 $(KERNEL_PATCH_STAMP): $(KERNEL_SOURCE)/Makefile $(KERNEL_PATCHES)
-	set -e; for patch in $(abspath $(KERNEL_PATCHES)); do git -C $(KERNEL_SOURCE) apply --check $$patch && git -C $(KERNEL_SOURCE) apply $$patch; done
+	set -e; for patch in $(abspath $(KERNEL_PATCHES)); do git apply --directory=$(KERNEL_SOURCE) --check $$patch && git apply --directory=$(KERNEL_SOURCE) $$patch; done
 	sha256sum $(KERNEL_PATCHES) </dev/null > $@
 
 $(KERNEL_OUTPUT)/.config: $(KERNEL_PATCH_STAMP) $(KERNEL_INPUTS) $(KERNEL_FRAGMENTS)
