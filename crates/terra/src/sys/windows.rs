@@ -493,7 +493,7 @@ mod tests {
             let mut descriptor = std::ptr::null_mut();
             let mut control = 0;
             let mut revision = 0;
-            let mut entry = std::ptr::null_mut();
+            let mut entry = std::mem::MaybeUninit::uninit();
             // SAFETY: Windows owns the queried descriptor until LocalFree; every output pointer
             // is writable, and the successful queries bound the ACL and ACE reads.
             unsafe {
@@ -517,8 +517,9 @@ mod tests {
                 assert_ne!(control & SE_DACL_PROTECTED, 0);
                 assert!(!acl.is_null());
                 assert_eq!((*acl).AceCount, 1);
-                assert_ne!(GetAce(acl, 0, &raw mut entry), 0);
-                let entry = &*entry.cast::<ACCESS_ALLOWED_ACE>();
+                assert_ne!(GetAce(acl, 0, entry.as_mut_ptr()), 0);
+                // SAFETY: `GetAce` succeeded, so `entry` names the ACL's first ACE.
+                let entry = &*entry.assume_init().cast::<ACCESS_ALLOWED_ACE>();
                 assert_eq!(entry.Header.AceType, 0);
                 assert_eq!(entry.Mask, FILE_ALL_ACCESS);
                 assert_ne!(

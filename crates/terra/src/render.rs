@@ -291,8 +291,11 @@ mod tests {
                 "the name should still be printable: {yaml}"
             );
         }
-        for secret in ["sk-super-secret", "gpt-4o"] {
-            assert!(!yaml.contains(secret), "{secret} was printed:\n{yaml}");
+        for (name, secret) in [("API_KEY", "sk-super-secret"), ("MODEL", "gpt-4o")] {
+            assert!(
+                !yaml.contains(secret),
+                "the value of {name} was printed:\n{yaml}"
+            );
         }
         // Only `env:` is redacted - the rest is what makes the output worth
         // printing at all.
@@ -302,10 +305,10 @@ mod tests {
         // with them, otherwise identical - a recipe read back from it has to be
         // the one a boot would run.
         let asked_for = yaml_serde::to_string(&cfg).unwrap();
-        for secret in ["sk-super-secret", "gpt-4o"] {
+        for (name, secret) in [("API_KEY", "sk-super-secret"), ("MODEL", "gpt-4o")] {
             assert!(
                 asked_for.contains(secret),
-                "{secret} is missing:\n{asked_for}"
+                "the value of {name} is missing:\n{asked_for}"
             );
         }
         assert!(!asked_for.contains(REDACTED_ENV_VALUE), "{asked_for}");

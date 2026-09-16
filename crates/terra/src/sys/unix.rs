@@ -34,11 +34,13 @@ pub fn holds_run_lock(path: &Path) -> bool {
 #[allow(unsafe_code)]
 pub fn host_addresses() -> Result<Vec<std::net::IpAddr>> {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-    let mut first = std::ptr::null_mut();
+    let mut first = std::mem::MaybeUninit::<*mut libc::ifaddrs>::uninit();
     // SAFETY: `first` is writable and `freeifaddrs` releases exactly the list returned on success.
-    if unsafe { libc::getifaddrs(&raw mut first) } != 0 {
+    if unsafe { libc::getifaddrs(first.as_mut_ptr()) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
+    // SAFETY: the call above succeeded, so it initialized the list head.
+    let first = unsafe { first.assume_init() };
     let mut addresses = Vec::new();
     let mut current = first;
     while !current.is_null() {
