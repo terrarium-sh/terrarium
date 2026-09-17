@@ -1664,7 +1664,7 @@ dependencies = [
 
 [[package]]
 name = "terra"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1695,7 +1695,7 @@ dependencies = [
 
 [[package]]
 name = "terra-agent"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "linux-raw-sys",
@@ -1707,7 +1707,7 @@ dependencies = [
 
 [[package]]
 name = "terra-io"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "tempfile",
  "uds_windows",
@@ -1715,15 +1715,15 @@ dependencies = [
 
 [[package]]
 name = "terra-limits"
-version = "0.1.0"
+version = "0.0.1"
 
 [[package]]
 name = "terra-network"
-version = "0.1.0"
+version = "0.0.1"
 
 [[package]]
 name = "terra-platform"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "applevisor",
  "applevisor-sys",
@@ -1751,7 +1751,7 @@ dependencies = [
 
 [[package]]
 name = "terra-protocol"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -1759,7 +1759,7 @@ dependencies = [
 
 [[package]]
 name = "terra-runtime"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "libc",
  "log",
@@ -1781,7 +1781,7 @@ dependencies = [
 
 [[package]]
 name = "terra-vsock-device"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "terra-protocol",
 ]
