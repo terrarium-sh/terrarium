@@ -118,6 +118,32 @@ platform. Release reuses the Build workflow, adds source archives, then publishe
 only after every build and check passes. Security audits run on dependency changes and weekly. Kernel changes
 run tooling checks; kernel archive export is available through manual dispatch.
 
+Two weekly workflows open pin-update PRs: `Guest pins bump` checks same-series
+kernel LTS patches, stable e2fsprogs releases, and Alpine releases with doas and
+its shim for both guest architectures. `Build tools bump` checks Rust stable
+and nightly, Zig, Cargo build tools, container digests, abuild, and Debian
+snapshot timestamps. Cargo dependencies and GitHub Actions remain covered by
+Dependabot. Kernel LTS-series changes stay manual.
+
+The updaters download guest artifacts before recording their SHA-256 hashes;
+Alpine rootfs and e2fsprogs downloads are checked against upstream checksums.
+Alpine and its packages move together, and mismatched architecture versions
+stop the update. Tool updates keep build entry points synchronized and refresh
+wit-bindgen lockfiles. Generated PRs require review; the new updater jobs
+explicitly dispatch Build because PRs opened with `GITHUB_TOKEN` do not trigger
+pull-request CI.
+
+Preview updates without modifying files:
+
+```sh
+python3 scripts/update-pins.py alpine --dry-run
+python3 scripts/update-pins.py e2fsprogs --dry-run
+python3 scripts/update-build-tools.py rust --dry-run
+python3 scripts/update-build-tools.py cargo-tools --dry-run
+python3 scripts/update-build-tools.py zig --dry-run
+python3 scripts/update-build-tools.py containers --dry-run
+```
+
 The [Linux amd64 acceptance report](docs/linux-amd64-acceptance.md) records the
 tested artifact, host, commands, and results for the 2026-09-13 review.
 

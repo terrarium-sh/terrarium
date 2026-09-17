@@ -1,13 +1,14 @@
-name: Kernel bump
+name: Guest pins bump
 
 on:
   schedule:
-    - cron: '17 5 * * 1'
+    - cron: '27 5 * * 1'
   workflow_dispatch:
 
 permissions:
   contents: write
   pull-requests: write
+  actions: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -15,6 +16,24 @@ concurrency:
 
 jobs:
   bump:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [alpine, e2fsprogs]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Test pin updater
+        run: python3 -B scripts/test-pin-updates.py
+      - name: Update guest pins
+        run: python3 scripts/update-pins.py '${{ matrix.component }}'
+      - name: Open update PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
+        run: bash scripts/open-pin-pr.sh '${{ matrix.component }}' pins.mk
+
+  kernel:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

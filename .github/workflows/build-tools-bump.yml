@@ -1,0 +1,48 @@
+name: Build tools bump
+
+on:
+  schedule:
+    - cron: '37 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [rust, cargo-tools, zig, containers]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Test pin updater
+        run: python3 -B scripts/test-pin-updates.py
+      - name: Update build tools
+        run: python3 scripts/update-build-tools.py '${{ matrix.component }}'
+      - name: Refresh component lockfiles
+        if: matrix.component == 'cargo-tools'
+        run: |
+          if git diff --quiet -- components; then
+            exit 0
+          fi
+          version=$(sed -n 's/^WIT_BINDGEN_VERSION := //p' Makefile)
+          for manifest in components/*/Cargo.toml; do
+            if grep -q '^wit-bindgen ' "$manifest"; then
+              cargo update --manifest-path "$manifest" --package wit-bindgen --precise "$version"
+            fi
+          done
+      - name: Check synchronized tool versions
+        run: python3 -B scripts/check-tool-versions.py
+      - name: Open update PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
+        run: bash scripts/open-pin-pr.sh '${{ matrix.component }}' Makefile README.dev.md rust-toolchain.toml components kernel/Containerfile scripts/alpine-sources.sh scripts/build-host.ps1 .github/workflows

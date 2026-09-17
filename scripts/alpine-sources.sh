@@ -53,15 +53,25 @@ while read -r package version origin commit license <&3; do
     git -C "$directory" archive "$commit" "main/$origin" | tar -x -C "$directory" --strip-components=2
     rm -rf "$directory/.git"
     mkdir -p "$tree/distfiles"
-    if [ "$origin" = apk-tools ]; then
-        wget -q -P "$tree/distfiles" "https://distfiles.alpinelinux.org/distfiles/$alpine_branch/apk-tools-v$version.tar.gz"
-    fi
     podman run --rm --security-opt=label=disable --volume "$directory:/package:ro" --volume "$tree/distfiles:/distfiles:rw" \
-        --env "CHOST=$architecture" --entrypoint /bin/sh "$image" -ec '
+        --env "CHOST=$architecture" --env "ALPINE_BRANCH=$alpine_branch" --entrypoint /bin/sh "$image" -ec '
             apk add --no-cache abuild=3.17.0-r0
             cp -a /package /tmp/package
             cd /tmp/package
             export SRCDEST=/distfiles
+            (
+                . ./APKBUILD
+                if [ "$pkgname" = apk-tools ]; then
+                    for source_entry in $source; do
+                        case "$source_entry" in
+                            *::*) source_filename=${source_entry%%::*} ;;
+                            *://*) source_filename=${source_entry##*/} ;;
+                            *) continue ;;
+                        esac
+                        wget -q -P "$SRCDEST" "https://distfiles.alpinelinux.org/distfiles/$ALPINE_BRANCH/$source_filename"
+                    done
+                fi
+            )
             for attempt in 1 2 3; do
                 abuild -F fetch && break
                 [ "$attempt" = 3 ] && exit 1

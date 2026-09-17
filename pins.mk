@@ -30,9 +30,6 @@ E2FSPROGS_SHA256 := 7a959221c1b1cc6e28b7d7a4e204a2ffd8ec6d8a2de4461c482b64c5f446
 E2FSPROGS_URL := https://mirrors.edge.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v$(E2FSPROGS_VERSION)/e2fsprogs-$(E2FSPROGS_VERSION).tar.gz
 
 # --- Alpine root filesystem -------------------------------------------------
-# The guest userland. v3.24 is the current stable branch (Alpine has no separate
-# LTS track — a stable branch is supported for ~2 years); 3.24.1 is its latest
-# point release. Both checked against dl-cdn on 2026-08-16.
 ALPINE_VERSION := 3.24.1
 # Derived, deliberately: the mirror path is the *branch* (v3.24) while the
 # tarball is the *point release* (3.24.1), and hardcoding both is how a bump to

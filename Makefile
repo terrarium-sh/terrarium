@@ -314,6 +314,7 @@ verify-source: verify-wit
 	python3 -B scripts/check-tool-versions.py
 	python3 -B scripts/test-kernel-tools.py
 	python3 -B scripts/test-alpine-sources.py
+	python3 -B scripts/test-pin-updates.py
 	scripts/test-install.sh
 	$(CARGO) fmt --all -- --check
 	$(CARGO) fmt --manifest-path fuzz/Cargo.toml -- --check
