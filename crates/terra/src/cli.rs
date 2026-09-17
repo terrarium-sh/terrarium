@@ -9,7 +9,7 @@ use terra_protocol::DEFAULT_STOP_GRACE_SECS;
 #[derive(Parser, Debug)]
 #[command(
     name = "terra",
-    version = env!("CARGO_PKG_VERSION"),
+    version = env!("TERRA_VERSION"),
     about = "Launch isolated microVMs for AI agents",
     long_about = "Launch isolated microVMs for AI agents.\n\n\
                   The box comes first, always: `terra [BOX]` starts it, or attaches if \
@@ -970,5 +970,25 @@ mod tests {
 
         assert!(Cli::try_parse_from(["terra", "dev", "exec"]).is_err());
         assert!(Cli::try_parse_from(["terra", "exec"]).is_err());
+    }
+
+    /// The version string names the commit this build was made from; outside an
+    /// exact release tag it reads `dev+<hash>` instead of the release version.
+    #[test]
+    fn version_names_the_built_commit() {
+        let git = |args: &[&str]| -> Option<String> {
+            let output = std::process::Command::new("git").args(args).output().ok()?;
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            (output.status.success() && !stdout.is_empty()).then_some(stdout)
+        };
+        let Some(hash) = git(&["rev-parse", "--short", "HEAD"]) else {
+            return;
+        };
+        let base = git(&["describe", "--tags", "--exact-match"]).map_or_else(
+            || "dev".to_owned(),
+            |tag| tag.strip_prefix('v').unwrap_or(&tag).to_owned(),
+        );
+        let expected = format!("{base}+{hash}");
+        assert_eq!(Cli::command().get_version(), Some(expected.as_str()));
     }
 }

@@ -36,7 +36,14 @@
   }
   .tagline { margin-top: 2.5rem; font-size: 1.4rem; font-weight: 500; line-height: 1.4; }
   .philosophy { max-width: 64ch; margin: 1rem auto 0; color: #68655d; }
-  .source { margin-top: 2.5rem; font-size: 0.875rem; }
+  .source {
+    margin-top: 2.5rem;
+    font-size: 0.875rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    align-items: center;
+  }
   a { color: inherit; }
 </style>
 </head>
@@ -48,7 +55,10 @@
     <p class="tagline">Give your agent room to work. Decide what it can touch.</p>
     <p class="philosophy">A small, auditable core. Extend it with recipes,
       hooks, and your own tools.</p>
-    <p class="source"><a href="https://github.com/terrarium-sh/terrarium">View on GitHub &rarr;</a></p>
+    <div class="source">
+      <a href="https://github.com/terrarium-sh/terrarium">View on GitHub &rarr;</a>
+      <a href="https://discord.gg/CQDEtqxPwJ">Join the Discord &rarr;</a>
+    </div>
   </main>
 </body>
 </html>
