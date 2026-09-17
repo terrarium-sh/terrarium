@@ -57,7 +57,11 @@ while read -r package version origin commit license <&3; do
             cp -a /package /tmp/package
             cd /tmp/package
             export SRCDEST=/distfiles
-            abuild -F fetch
+            for attempt in 1 2 3; do
+                abuild -F fetch && break
+                [ "$attempt" = 3 ] && exit 1
+                sleep "$attempt"
+            done
         ' </dev/null
 done 3< "$manifest"
 

@@ -392,11 +392,11 @@ version = "0.1.0"
 
 [[package]]
 name = "terra-limits"
-version = "0.1.0"
+version = "0.0.1"
 
 [[package]]
 name = "terra-network"
-version = "0.1.0"
+version = "0.0.1"
 
 [[package]]
 name = "terra-network-component"

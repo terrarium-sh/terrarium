@@ -200,7 +200,7 @@ dependencies = [
 
 [[package]]
 name = "terra-network"
-version = "0.1.0"
+version = "0.0.1"
 
 [[package]]
 name = "terra-policy-component"
