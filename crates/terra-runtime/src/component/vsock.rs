@@ -46,9 +46,7 @@ impl DiagnosticSink {
 
     fn finish(self) -> std::io::Result<()> {
         drop(self.sender);
-        self.finished
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .map_err(std::io::Error::other)?
+        self.finished.recv().map_err(std::io::Error::other)?
     }
 }
 
