@@ -45,6 +45,16 @@ for index, argument in enumerate(sys.argv):
         (directory / "source.tar.gz").write_bytes(chost.encode())
 '''
 
+WGET = r'''#!/usr/bin/env python3
+import os, pathlib
+import sys
+
+if os.environ.get("FAIL_WGET"):
+    raise SystemExit(25)
+if path := os.environ.get("WGET_LOG"):
+    pathlib.Path(path).write_text(" ".join(sys.argv[1:]))
+'''
+
 
 class AlpineSourcesTest(unittest.TestCase):
     def setUp(self):
@@ -58,6 +68,7 @@ class AlpineSourcesTest(unittest.TestCase):
         self.bin.mkdir()
         self.command("git", GIT)
         self.command("podman", PODMAN)
+        self.command("wget", WGET)
 
     def tearDown(self):
         self.temp.cleanup()
@@ -72,6 +83,10 @@ class AlpineSourcesTest(unittest.TestCase):
         image.parent.mkdir()
         data = ("A:aarch64\n\n" + "\n\n".join(records)).encode()
         with tarfile.open(image, "w:gz") as archive:
+            release = b"3.24.1\n"
+            release_entry = tarfile.TarInfo("./etc/alpine-release")
+            release_entry.size = len(release)
+            archive.addfile(release_entry, io.BytesIO(release))
             entry = tarfile.TarInfo("./lib/apk/db/installed")
             entry.size = len(data)
             archive.addfile(entry, io.BytesIO(data))
@@ -104,6 +119,22 @@ class AlpineSourcesTest(unittest.TestCase):
         result = self.collect()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("missing Alpine source origin or commit", result.stderr)
+        self.assertFalse((self.root / "build/alpine-corresponding-source.tar.gz").exists())
+
+    def test_apk_tools_uses_the_matching_alpine_distfiles_mirror(self):
+        self.write_database(["P:apk-tools\nV:3.0.6\nL:GPL-2.0-only\no:apk-tools\nc:deadbeef"])
+        wget_log = self.root / "wget.log"
+        result = self.collect(WGET_LOG=str(wget_log))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "https://distfiles.alpinelinux.org/distfiles/v3.24/apk-tools-v3.0.6.tar.gz",
+            wget_log.read_text(),
+        )
+
+    def test_a_failed_apk_tools_mirror_download_does_not_archive_sources(self):
+        self.write_database(["P:apk-tools\nV:3.0.6\nL:GPL-2.0-only\no:apk-tools\nc:deadbeef"])
+        result = self.collect(FAIL_WGET="1")
+        self.assertNotEqual(result.returncode, 0)
         self.assertFalse((self.root / "build/alpine-corresponding-source.tar.gz").exists())
 
     def test_fetch_and_container_failures_do_not_archive_partial_sources(self):

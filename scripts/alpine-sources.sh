@@ -11,6 +11,8 @@ sources="$tree/sources"
 rm -rf "$tree"
 mkdir -p "$sources"
 tar -xOzf "$root/build/alpine-minirootfs.tar.gz" ./lib/apk/db/installed > "$database"
+alpine_release=$(tar -xOzf "$root/build/alpine-minirootfs.tar.gz" ./etc/alpine-release)
+alpine_branch=v${alpine_release%.*}
 architecture=$(awk -F: '/^A:/ && $2 != "noarch" { print $2; exit }' "$database")
 case "$architecture" in
     x86_64 | aarch64) ;;
@@ -51,6 +53,9 @@ while read -r package version origin commit license <&3; do
     git -C "$directory" archive "$commit" "main/$origin" | tar -x -C "$directory" --strip-components=2
     rm -rf "$directory/.git"
     mkdir -p "$tree/distfiles"
+    if [ "$origin" = apk-tools ]; then
+        wget -q -P "$tree/distfiles" "https://distfiles.alpinelinux.org/distfiles/$alpine_branch/apk-tools-v$version.tar.gz"
+    fi
     podman run --rm --security-opt=label=disable --volume "$directory:/package:ro" --volume "$tree/distfiles:/distfiles:rw" \
         --env "CHOST=$architecture" --entrypoint /bin/sh "$image" -ec '
             apk add --no-cache abuild=3.17.0-r0
