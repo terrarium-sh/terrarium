@@ -29,16 +29,14 @@ amd64. Build requirements: [README.dev.md](README.dev.md).
 ## Quickstart
 
 ```sh
-curl -fsSLO https://raw.githubusercontent.com/terrarium-sh/terrarium/main/install.sh
-sh install.sh
+curl -fsSLO https://raw.githubusercontent.com/terrarium-sh/terrarium/main/install.sh && sh install.sh
 terra --version
 ```
 
 On Windows (PowerShell):
 
 ```powershell
-Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/terrarium-sh/terrarium/main/install.ps1 -OutFile install.ps1
-powershell -ExecutionPolicy Bypass -File install.ps1
+Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/terrarium-sh/terrarium/main/install.ps1 -OutFile install.ps1; if ($?) { powershell -ExecutionPolicy Bypass -File install.ps1 }
 ```
 
 `install.ps1` installs `terra.exe` to `%LOCALAPPDATA%\Programs\terra`, adds that
