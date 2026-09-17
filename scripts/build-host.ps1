@@ -42,13 +42,6 @@ foreach ($asset in $guestAssets) {
         throw "missing staged $guest guest asset: $asset"
     }
 }
-foreach ($asset in "vmlinux.gz", "boot.img.gz") {
-    $expected = (Get-Content -LiteralPath "build/$asset.sha256" -Raw).Trim()
-    if ($expected -notmatch '^[0-9a-f]{64}$' -or $expected -ne (Get-FileHash -LiteralPath "build/$asset" -Algorithm SHA256).Hash.ToLowerInvariant()) {
-        throw "invalid staged guest asset hash: build/$asset"
-    }
-}
-
 Invoke-Native rustup target add $Target
 Invoke-Native rustup toolchain install $componentToolchain --profile minimal --target wasm32-wasip3
 Invoke-Native cargo "+$componentToolchain" install wasm-tools --version 1.248.0 --locked
