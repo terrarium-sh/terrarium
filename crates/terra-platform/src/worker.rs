@@ -12,7 +12,7 @@ pub use crate::amd64::machine::MAX_VCPUS;
 /// Resources supplied to one platform VM worker.
 pub struct WorkerInput {
     pub kernel: Vec<u8>,
-    pub boot_disk: PathBuf,
+    pub boot_disk: Vec<u8>,
     pub root_disk: PathBuf,
     pub volume_disks: Vec<PathBuf>,
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -120,8 +120,7 @@ pub(crate) async fn assemble_devices(
 }
 
 pub(crate) fn disk_paths(input: &WorkerInput) -> Vec<(PathBuf, bool)> {
-    let mut disks = Vec::with_capacity(2 + input.volume_disks.len());
-    disks.push((input.boot_disk.clone(), true));
+    let mut disks = Vec::with_capacity(1 + input.volume_disks.len());
     disks.push((input.root_disk.clone(), false));
     disks.extend(input.volume_disks.iter().cloned().map(|path| (path, false)));
     disks
@@ -274,7 +273,7 @@ pub(crate) async fn finish_device_shutdown(
 pub(crate) async fn blocks(
     runtime: &mut crate::box_runtime::BoxRuntime,
     ram: impl Into<terra_runtime::component::vmm::virtualization::RamGrant> + Send,
-    input: &WorkerInput,
+    input: &mut WorkerInput,
     disks: &[(PathBuf, bool)],
     interrupt: impl Fn(usize) -> crate::component::block::Interrupt,
 ) -> Result<Vec<crate::component::DeviceChannel>, String> {
@@ -288,17 +287,21 @@ pub(crate) async fn blocks(
         .iter()
         .map(|(path, readonly)| {
             FileDisk::open(path, *readonly)
-                .map(|disk| (disk, *readonly))
+                .map(|disk| (DiskGrant::File(disk), *readonly))
                 .map_err(|error| format!("opening block backing {}: {error}", path.display()))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let boot_disk = DiskGrant::Mem(terra_runtime::BoundedDisk::from_readonly_bytes(
+        std::mem::take(&mut input.boot_disk),
+    ));
+    let disks = std::iter::once((boot_disk, true)).chain(disks);
     let ram = ram.into();
-    let mut channels = Vec::with_capacity(disks.len());
-    for (index, (disk, readonly)) in disks.into_iter().enumerate() {
+    let mut channels = Vec::with_capacity(2 + input.volume_disks.len());
+    for (index, (disk, readonly)) in disks.enumerate() {
         let ram = ram.clone();
         let host = move || {
             let mut host = DeviceHost::with_ram(ram.resolve()?);
-            host.set_disk(DiskGrant::File(disk));
+            host.set_disk(disk);
             Ok(host)
         };
         channels.push(
@@ -712,7 +715,7 @@ mod tests {
         let input = super::WorkerInput {
             component_memory_limits: terra_runtime::box_runtime::ComponentMemoryLimits::default(),
             kernel: Vec::new(),
-            boot_disk: std::path::PathBuf::new(),
+            boot_disk: Vec::new(),
             root_disk: std::path::PathBuf::new(),
             volume_disks: Vec::new(),
             shares: Vec::new(),

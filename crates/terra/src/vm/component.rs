@@ -121,8 +121,8 @@ pub async fn run(spec: &BootSpec, bx: &BoxRef, lock: &File) -> Result<ExitCode> 
         sys::install_stop_signal_handlers();
     }
 
-    let kernel = std::fs::read(image::ensure_kernel_on_disk()?).context("reading guest kernel")?;
-    let boot_disk = image::ensure_boot_volume_on_disk()?;
+    let kernel = image::load_kernel()?;
+    let boot_disk = image::load_boot_image()?;
     let root_disk = bx.get_dir().join(crate::state::ROOTFS_FILE);
     let (volume_disks, volumes) = volume_disks(spec, bx)?;
     let (shares, plan_shares) = shares(spec)?;

@@ -84,8 +84,11 @@ instructions: [docs/usage.md](docs/usage.md).
 - **Explicit access.** No host files or network by default; the host, LAN, and
   private ranges stay blocked unless a recipe names them. Grant host directories
   with `mounts`, or transfer individual files with `put` and `get`.
-- **One binary.** The base guest filesystem and VM components are embedded in
-  `terra`; no daemon required. Recipe hooks can install additional packages.
+- **One binary.** The guest kernel, base guest filesystem, and VM components
+  are embedded in `terra`; no daemon required. The kernel loads directly into
+  memory on each boot. Upgrade Terra and stop/start a box to use the kernel
+  bundled with that release, without rebuilding the box.
+  Recipe hooks can install additional packages.
 - **Lifecycle hooks.** `on_create`, `on_start`, and `pre_stop` run as guest
   root. Startup and stop output appears live in the attached console, with the
   workload between them. Package installation usually belongs in `on_create`.
@@ -110,8 +113,8 @@ instructions: [docs/usage.md](docs/usage.md).
 ## Storage
 
 Boxes live at `~/.terra/box/t-<project-slug>/<box>/`, where the slug is a stable
-base32 hash of the project path; shared boot files live in
-`~/.terra/cache/`. `terra ls --all` finds them, and
+base32 hash of the project path. The kernel and read-only boot disk load into
+memory from the Terra binary on every boot. `terra ls --all` finds boxes, and
 `terra <box> rm --purge --project <project-dir>` removes one completely. To use
 another disk, stop boxes, move `~/.terra`, then symlink it back; the target must
 honour owner-only permissions.

@@ -32,7 +32,7 @@ These are the requirements the unit satisfies; anything stricter breaks it.
 | `/dev/kvm` read-write | the native VMM runs on KVM | `SupplementaryGroups=kvm`, `DeviceAllow=/dev/kvm rw`, no `PrivateDevices` |
 | Executable mappings | loading embedded AOT components | `MemoryDenyWriteExecute=no` |
 | Real host network | WASI capability imports open authorized host sockets | no `PrivateNetwork`, no `IPAddressDeny` |
-| Writable `$HOME/.terra` | cache of the guest kernel and boot volume (unpacked once, shared by every box), plus the box state | `StateDirectory=terra` + `Environment=HOME=%S/terra` |
+| Writable `$HOME/.terra` | persistent box state | `StateDirectory=terra` + `Environment=HOME=%S/terra` |
 | A recipe to boot | `~/.terra/%i.yaml`, read by the `ExecStartPre` setup | yours to install; see below |
 
 The runtime needs no host namespace privileges. Host-directory mounts use the

@@ -1,7 +1,4 @@
-//! The payloads terra ships inside its own binary - the guest kernel, the boot
-//! volume, and the prebaked filesystems a box is made of - and how each gets
-//! onto disk. Every one is installed the same way: unpack beside the
-//! destination, rename it in.
+//! Loading the embedded guest kernel and installing boot and filesystem images.
 
 use anyhow::{Context, Result, bail};
 use std::fs::{File, OpenOptions};
@@ -16,12 +13,10 @@ static VOLUME_IMG_GZ: &[u8] = include_bytes!(env!("TERRA_VOLUME_IMG"));
 /// The guest kernel from the pinned kernel source; the Makefile sets
 /// `TERRA_KERNEL_GZ`.
 static KERNEL_GZ: &[u8] = include_bytes!(env!("TERRA_KERNEL_GZ"));
-const KERNEL_NAME: &str = concat!("vmlinux-", include_str!(env!("TERRA_KERNEL_GZ_SHA256")));
 
 /// A read-only ext4 with the guest agent and `resize2fs`. The guest's root
 /// filesystem is this volume, never a host directory.
 static BOOT_IMG_GZ: &[u8] = include_bytes!(env!("TERRA_BOOT_IMG"));
-const BOOT_NAME: &str = concat!("boot-", include_str!(env!("TERRA_BOOT_IMG_SHA256")));
 pub(crate) const BYTES_PER_MIB: u64 = 1024 * 1024;
 
 pub(crate) fn write_sparse_chunk(out: &mut File, chunk: &[u8]) -> std::io::Result<()> {
@@ -110,20 +105,6 @@ pub(crate) fn staged_write(path: &Path, write: impl FnOnce(&mut File) -> Result<
         let _ = std::fs::remove_file(tmp);
     }
     result
-}
-
-/// Unpack `src` into a staging temporary for `path`; `finish` sees the open
-/// temporary and its byte count before the rename.
-fn install(
-    path: &Path,
-    src: &mut impl Read,
-    finish: impl FnOnce(&File, u64) -> Result<()>,
-) -> Result<()> {
-    staged_write(path, |out| {
-        let written =
-            std::io::copy(src, out).with_context(|| format!("unpacking {}", path.display()))?;
-        finish(out, written)
-    })
 }
 
 fn install_sparse(
@@ -229,49 +210,46 @@ fn resize_image(path: &Path, target: u64, field: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn ensure_kernel_on_disk() -> Result<PathBuf> {
-    ensure_cached_payload(KERNEL_GZ, KERNEL_NAME, "guest kernel")
+pub fn load_kernel() -> Result<Vec<u8>> {
+    let mut kernel = Vec::new();
+    flate2::read::GzDecoder::new(KERNEL_GZ)
+        .read_to_end(&mut kernel)
+        .context("decompressing guest kernel")?;
+    Ok(kernel)
 }
 
-pub fn ensure_boot_volume_on_disk() -> Result<PathBuf> {
-    ensure_cached_payload(BOOT_IMG_GZ, BOOT_NAME, "boot image")
-}
-
-/// Unpack an embedded payload into [`crate::state::get_cache_path`], skipping the
-/// work when it is already there. `name` embeds the payload's hash, so entries
-/// are trusted by name and length alone; the owner-only directory
-/// `ensure_cache_dir` insists on is what makes that trust safe.
-fn ensure_cached_payload(gz: &[u8], name: &str, what: &str) -> Result<PathBuf> {
-    let dir = crate::state::ensure_cache_dir()?;
-    let path = dir.join(name);
-
-    let trailer = gz
-        .last_chunk::<4>()
-        .with_context(|| format!("the embedded {what} is not a gzip stream"))?;
-    let unpacked = u64::from(u32::from_le_bytes(*trailer));
-
-    // `symlink_metadata`: a link parked at this name is a miss, not a hit on
-    // whatever it points at.
-    if std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file() && m.len() == unpacked) {
-        return Ok(path);
-    }
-    install(&path, &mut flate2::read::GzDecoder::new(gz), |_, _| Ok(()))
-        .with_context(|| format!("unpacking the {what}"))?;
-
-    let stale = format!("{}-", name.split_once('-').map_or(name, |(p, _)| p));
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        if entry.path() != path && entry.file_name().to_string_lossy().starts_with(&stale) {
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
-    sweep_staging_temps(&dir, crate::sys::pid_exists);
-    Ok(path)
+pub fn load_boot_image() -> Result<Vec<u8>> {
+    let mut image = Vec::new();
+    flate2::read::GzDecoder::new(BOOT_IMG_GZ)
+        .read_to_end(&mut image)
+        .context("decompressing boot image")?;
+    image.shrink_to_fit();
+    Ok(image)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loading_kernel_leaves_no_files_on_disk() {
+        let home = crate::sys::TestHome::new();
+        let kernel = load_kernel().unwrap();
+        let expected_size = u32::from_le_bytes(*KERNEL_GZ.last_chunk::<4>().unwrap());
+        assert!(!kernel.is_empty());
+        assert_eq!(kernel.len() as u64, u64::from(expected_size));
+        assert_eq!(std::fs::read_dir(home.get_path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn loading_boot_image_leaves_no_files_on_disk() {
+        let home = crate::sys::TestHome::new();
+        let image = load_boot_image().unwrap();
+        let expected_size = u32::from_le_bytes(*BOOT_IMG_GZ.last_chunk::<4>().unwrap());
+        assert!(!image.is_empty());
+        assert_eq!(image.len() as u64, u64::from(expected_size));
+        assert_eq!(std::fs::read_dir(home.get_path()).unwrap().count(), 0);
+    }
 
     #[test]
     fn resizing_grows_but_never_shrinks() {
@@ -326,7 +304,7 @@ mod tests {
     /// refused takes its temporary with it. A leftover named like the thing it
     /// was going to be is the failure: in a box's state directory
     /// [`crate::state::BoxRef::unused_volume_images`] would read it as a
-    /// volume image, and in the cache it would be read back as a kernel.
+    /// volume image.
     #[test]
     fn a_refused_payload_leaves_nothing_behind() {
         let dir = tempfile::tempdir().unwrap();
@@ -459,7 +437,7 @@ mod tests {
         }
     }
 
-    /// The cache-directory sweep trusts only the pid in the name: a writer
+    /// The staging sweep trusts only the pid in the name: a writer
     /// that may still be running keeps its temporary, a dead one's is taken,
     /// and anything not named like a staging temp is nobody's to remove.
     #[test]

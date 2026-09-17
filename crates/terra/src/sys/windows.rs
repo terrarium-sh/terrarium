@@ -269,15 +269,6 @@ pub fn find_terminating_signal(_status: std::process::ExitStatus) -> Option<i32>
     None
 }
 
-pub fn pid_exists(pid: u32) -> bool {
-    with_process(pid, PROCESS_QUERY_LIMITED_INFORMATION, |process| {
-        let mut exit = 0;
-        // SAFETY: `process` is an open process handle and `exit` is writable.
-        unsafe { GetExitCodeProcess(process, &raw mut exit) != 0 && exit == STILL_ACTIVE as u32 }
-    })
-    .unwrap_or(false)
-}
-
 pub fn read_process_start_time(pid: u32) -> Option<u64> {
     with_process(pid, PROCESS_QUERY_LIMITED_INFORMATION, |process| {
         let mut created = FILETIME::default();

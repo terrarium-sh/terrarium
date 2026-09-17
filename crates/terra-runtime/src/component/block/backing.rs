@@ -401,3 +401,22 @@ fn ignore_unsupported(error: std::io::Error) -> std::io::Result<()> {
         .then_some(())
         .ok_or(error)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_disk_preserves_bytes_and_refuses_mutation() {
+        let mut disk = DiskGrant::Mem(BoundedDisk::from_readonly_bytes(vec![1, 2, 3, 4]));
+        let mut bytes = [0; 4];
+        assert_eq!(disk.capacity(), 4);
+        assert_eq!(disk.read_at(0, &mut bytes), Ok(()));
+        assert_eq!(bytes, [1, 2, 3, 4]);
+        assert_eq!(disk.write_at(0, &[9]), Err(BackingError::ReadOnly));
+        assert_eq!(disk.discard(0, 4), Err(BackingError::ReadOnly));
+        assert_eq!(disk.read_at(1, &mut bytes), Err(BackingError::OutOfRange));
+        assert_eq!(disk.read_at(0, &mut bytes), Ok(()));
+        assert_eq!(bytes, [1, 2, 3, 4]);
+    }
+}

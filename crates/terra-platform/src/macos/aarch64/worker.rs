@@ -143,7 +143,7 @@ fn inject_irq(machine: &Machine, irq: u32, level: bool) -> wasmtime::Result<()> 
 #[allow(clippy::too_many_lines)]
 pub async fn prepare(mut input: WorkerInput) -> Result<PreparedVmm, String> {
     let disks = crate::worker::disk_paths(&input);
-    let blocks = disks.len();
+    let blocks = 1 + disks.len();
     let shares = input.shares.len();
     let layout = crate::aarch64::arm::build_machine_layout(input.ram_bytes, blocks, shares)
         .map_err(|error| format!("invalid HVF layout: {error:?}"))?;

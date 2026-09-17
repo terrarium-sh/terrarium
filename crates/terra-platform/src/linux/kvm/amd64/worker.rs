@@ -30,7 +30,7 @@ pub async fn prepare(mut input: WorkerInput) -> Result<PreparedVmm, KvmError> {
     let kvm = open()?;
     let kvm = Arc::new(kvm);
     let disks = crate::worker::disk_paths(&input);
-    let block_count = disks.len();
+    let block_count = 1 + disks.len();
     let cpuid = build_cpuid(&kvm, input.vcpus)?;
     let share_count = input.shares.len();
     let layout = crate::machine::build_machine_layout(input.ram_bytes, block_count, share_count)

@@ -162,13 +162,6 @@ kernel-export: $(KERNEL_GZ)
 	python3 scripts/kernel-artifact.py export $(KERNEL_GZ) $(KERNEL_OUTPUT)/.config $(KERNEL_INPUTS) $(BUILD)/terra-kernel-$(ARCH).tar.gz
 	sha256sum $(BUILD)/terra-kernel-$(ARCH).tar.gz > $(BUILD)/terra-kernel-$(ARCH).tar.gz.sha256
 
-## The sha256 of an embedded blob, written beside it. Included as text by
-## include_str! and used as the blob's cache identity (see
-## vm::image::blob_name), so nothing hashes the blob at compile or boot time.
-## No trailing newline: the digest is concat!'d into a cache file name.
-$(BUILD)/%.sha256: $(BUILD)/%
-	sha256sum $< | cut -d' ' -f1 | tr -d '\n' > $@
-
 ## Static mke2fs — a *build-time* tool only: it bakes the prebaked images below.
 ## It is not shipped in the binary; the guest grows those images with resize2fs.
 $(MKE2FS): $(PIN_STAMP)
@@ -254,10 +247,7 @@ $(AGENT_BIN): FORCE
 # Built-in drivers let the kernel boot directly from this small read-only disk.
 BOOT_TREE := $(BUILD)/boot-tree
 BOOT_IMG := $(BUILD)/boot.img.gz
-BOOT_IMG_MIB := 8
-# The two blobs whose sha256 the binary embeds as their cache identity (the
-# `%.sha256` rule above; TERRA_*_SHA256 in .cargo/config.toml).
-BLOB_SHAS := $(KERNEL_GZ).sha256 $(BOOT_IMG).sha256
+BOOT_IMG_MIB := 3
 $(BOOT_IMG): $(MKE2FS) $(RESIZE2FS) $(AGENT_BIN) $(PIN_STAMP) Makefile
 	rm -rf $(BOOT_TREE)
 	# /dev is where the kernel auto-mounts devtmpfs (CONFIG_DEVTMPFS_MOUNT), which
@@ -268,24 +258,24 @@ $(BOOT_IMG): $(MKE2FS) $(RESIZE2FS) $(AGENT_BIN) $(PIN_STAMP) Makefile
 	install -m 755 $(RESIZE2FS) $(BOOT_TREE)/terra-resize2fs
 	rm -f $(BUILD)/boot.img
 	truncate -s $(BOOT_IMG_MIB)M $(BUILD)/boot.img
-	unshare -U -r $(MKE2FS) -F -q -t ext4 -b 4096 -d $(BOOT_TREE) $(BUILD)/boot.img
+	unshare -U -r $(MKE2FS) -F -q -t ext4 -b 4096 -m 0 -O ^has_journal -d $(BOOT_TREE) $(BUILD)/boot.img
 	gzip -9 -c $(BUILD)/boot.img > $(BOOT_IMG)
 
 ## Build the static terra binary (embeds vmlinux, prebaked images, and trusted
 ## component artifacts).
-build: $(COMPONENT_AOT_TARGETS) $(KERNEL_GZ) $(ROOTFS_IMG) $(VOLUME_IMG) $(BOOT_IMG) $(BLOB_SHAS)
+build: $(COMPONENT_AOT_TARGETS) $(KERNEL_GZ) $(ROOTFS_IMG) $(VOLUME_IMG) $(BOOT_IMG)
 	$(CARGO_LOCKED) build --release -p terra --target $(TERRA_TARGET)
 
 # Guest payloads are produced on Linux and then embedded by each native host
 # build. This keeps macOS and Windows releases free of host mkfs/container
 # tooling while preserving one architecture-specific Linux guest per executable.
-guest-assets: $(KERNEL_GZ) $(ROOTFS_IMG) $(VOLUME_IMG) $(BOOT_IMG) $(BLOB_SHAS)
+guest-assets: $(KERNEL_GZ) $(ROOTFS_IMG) $(VOLUME_IMG) $(BOOT_IMG)
 
 # A host build receives these architecture-matched files from a Linux guest
 # build. Check them as inputs so a fresh macOS checkout never tries to rebuild
 # the guest kernel, rootfs, or Linux agent because artifact mtimes changed.
 check-guest-assets:
-	@for asset in $(KERNEL_GZ) $(ROOTFS_IMG) $(VOLUME_IMG) $(BOOT_IMG) $(BLOB_SHAS); do test -s $$asset || { echo "missing staged guest asset: $$asset" >&2; exit 1; }; done
+	@for asset in $(KERNEL_GZ) $(ROOTFS_IMG) $(VOLUME_IMG) $(BOOT_IMG); do test -s $$asset || { echo "missing staged guest asset: $$asset" >&2; exit 1; }; done
 
 host-build: check-guest-assets $(COMPONENT_AOT_TARGETS)
 	$(CARGO_LOCKED) build --release -p terra --target $(TERRA_TARGET)
@@ -309,7 +299,7 @@ $(COMPONENT_AOT_TARGETS): component-%-aot: component-%
 	mkdir -p $(BUILD)
 	$(CARGO_LOCKED) run --target $(TERRA_TARGET) -p terra-runtime --features compiler --example precompile-component -- components/$*/target/wasm32-wasip3/release/terra_$*_component.wasm $(BUILD)/terra-$*-component.cwasm $(if $(filter policy,$*),--policy,)
 
-test-component-boot: $(COMPONENT_AOT_TARGETS) $(KERNEL_GZ) $(ROOTFS_IMG) $(BOOT_IMG) $(BLOB_SHAS)
+test-component-boot: $(COMPONENT_AOT_TARGETS) $(KERNEL_GZ) $(ROOTFS_IMG) $(BOOT_IMG)
 	$(CARGO_LOCKED) test -p terra-platform --lib -- --ignored --nocapture
 
 ## Format check, lints, and the test suite. Generating the man pages and
@@ -341,7 +331,7 @@ verify-workspace: verify-source
 test-install:
 	scripts/test-install.sh
 
-verify-components: $(COMPONENT_AOT_TARGETS) $(KERNEL_GZ) $(ROOTFS_IMG) $(VOLUME_IMG) $(BOOT_IMG) $(BLOB_SHAS)
+verify-components: $(COMPONENT_AOT_TARGETS) $(KERNEL_GZ) $(ROOTFS_IMG) $(VOLUME_IMG) $(BOOT_IMG)
 verify-host-components: check-guest-assets $(COMPONENT_AOT_TARGETS)
 
 verify-components verify-host-components:

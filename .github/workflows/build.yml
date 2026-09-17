@@ -85,8 +85,6 @@ jobs:
             build/rootfs.img.gz
             build/volume.img.gz
             build/boot.img.gz
-            build/vmlinux.gz.sha256
-            build/boot.img.gz.sha256
           if-no-files-found: error
           compression-level: 0
 

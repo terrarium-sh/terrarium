@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const BOX_HOME: &str = "box";
-const CACHE_HOME: &str = "cache";
 
 pub(crate) const ROOTFS_FILE: &str = "rootfs.img";
 pub(crate) const PID_FILE: &str = "terra.pid";
@@ -348,11 +347,6 @@ pub fn get_box_home_path() -> Result<PathBuf> {
     get_terra_home_path().map(|home| home.join(BOX_HOME))
 }
 
-/// Where the kernel and boot volume are unpacked.
-pub fn get_cache_path() -> Result<PathBuf> {
-    get_terra_home_path().map(|home| home.join(CACHE_HOME))
-}
-
 fn ensure_owner_only_dir(dir: PathBuf, holds: &str) -> Result<PathBuf> {
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     crate::sys::set_owner_only(&dir, true).with_context(|| {
@@ -378,7 +372,7 @@ pub fn ensure_terra_home() -> Result<PathBuf> {
     ensure_owner_only_dir(
         get_terra_home_path()?,
         "this machine's recipes (what a sandbox may mount and reach) and where the \
-         boxes and the kernel are kept",
+         boxes are kept",
     )
 }
 
@@ -387,14 +381,6 @@ pub fn ensure_box_home() -> Result<PathBuf> {
     ensure_owner_only_dir(
         terra_home.join(BOX_HOME),
         "every box's recipe, disk images and sockets",
-    )
-}
-
-pub fn ensure_cache_dir() -> Result<PathBuf> {
-    let terra_home = ensure_terra_home()?;
-    ensure_owner_only_dir(
-        terra_home.join(CACHE_HOME),
-        "the guest kernel and the PID-1 agent every box boots",
     )
 }
 
@@ -551,7 +537,7 @@ mod tests {
     }
 
     /// Substituting the cwd let whatever directory terra ran from supply the
-    /// kernel it boots.
+    /// recipes it trusts.
     #[test]
     fn terra_home_is_absolute_never_the_cwd() {
         let _home = TestHome::new();
@@ -697,11 +683,10 @@ mod tests {
     }
 
     #[test]
-    fn box_and_cache_paths_live_under_terra_home() {
+    fn box_path_lives_under_terra_home() {
         let home = TestHome::new();
         let terra_home = home.get_path().join(".terra");
         assert_eq!(get_box_home_path().unwrap(), terra_home.join("box"));
-        assert_eq!(get_cache_path().unwrap(), terra_home.join("cache"));
     }
 
     /// The names in a storage artifact were written on another machine, so an

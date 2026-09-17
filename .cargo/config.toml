@@ -21,16 +21,10 @@ CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER = { value = "scripts/zig-musl-cc-
 # zig supplies musl's CRT, so rust must not also link its self-contained one —
 # otherwise `_start` is defined twice.
 CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS = "-C link-self-contained=no"
-# include_bytes!(env!("TERRA_KERNEL_GZ")) — the gzipped Terra kernel built
-# by `make build`; terra unpacks it into ~/.terra/cache/ on first boot.
+# The embedded kernel is decompressed into memory on each boot.
 TERRA_KERNEL_GZ = { value = "build/vmlinux.gz", relative = true }
 # Read-only ext4 containing the guest agent and filesystem resize helper.
 TERRA_BOOT_IMG = { value = "build/boot.img.gz", relative = true }
-# sha256 of each blob above, written beside it by the Makefile and
-# include_str!'d as the blob's cache identity (see vm::image) —
-# nothing hashes the blobs at compile or boot time.
-TERRA_KERNEL_GZ_SHA256 = { value = "build/vmlinux.gz.sha256", relative = true }
-TERRA_BOOT_IMG_SHA256 = { value = "build/boot.img.gz.sha256", relative = true }
 # The prebaked (gzipped) guest root filesystem — see the Makefile. Shipping it as
 # bytes is what lets a non-Linux host create a box without any mkfs tooling.
 TERRA_ROOTFS_IMG = { value = "build/rootfs.img.gz", relative = true }

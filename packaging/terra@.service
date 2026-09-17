@@ -42,8 +42,7 @@ Group=terra
 SupplementaryGroups=kvm
 
 # --- State ----------------------------------------------------------------
-# terra caches the guest kernel and boot volume under $HOME/.terra/cache, shared
-# by every box on the machine — so HOME is pinned to the managed state dir,
+# HOME is pinned to the managed state directory so box state stays there
 # regardless of the account's passwd home.
 #
 # A box lives at ~/.terra/box/<slug of its project directory>/<name>, so what

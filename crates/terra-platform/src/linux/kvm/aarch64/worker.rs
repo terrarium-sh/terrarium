@@ -304,7 +304,7 @@ pub async fn prepare(mut input: WorkerInput) -> Result<PreparedVmm, ArmWorkerErr
         return Err(ArmWorkerError::BadVcpuCount(input.vcpus));
     }
     let disks = crate::worker::disk_paths(&input);
-    let blocks = disks.len();
+    let blocks = 1 + disks.len();
     let shares = input.shares.len();
     let layout = crate::aarch64::arm::build_machine_layout(input.ram_bytes, blocks, shares)
         .map_err(|error| ArmWorkerError::Component(format!("invalid ARM layout: {error:?}")))?;

@@ -54,7 +54,7 @@ run in independent stores and communicate through bounded scalar bridges.
 Hypervisor operations and authority checks remain native. See the
 [security model](docs/security.md) for trust boundaries and resource limits.
 
-The agent starts as PID 1 from the read-only 8 MiB boot disk, receives its boot
+The agent starts as PID 1 from the read-only 3 MiB memory-backed boot disk, receives its boot
 plan over vsock, grows the box's ext4 images and enters the Alpine root with
 `pivot_root`. It applies `on_create` when its guest-side recipe stamp differs,
 then configures mounts and runs hooks and the workload. Boot-plan environment
@@ -90,7 +90,11 @@ Cross-compilation does not establish hardware boot acceptance.
 Root and volume images are prebaked ext4 files. Creating a box decompresses
 and sizes those images; the guest grows the filesystems. Runtime hosts need no
 filesystem formatting tools or image downloads. The kernel and boot disk are
-cached by embedded digest under `~/.terra/cache/`.
+embedded in `terra` and decompressed directly into memory on each boot. The
+read-only boot filesystem has no journal.
+Each boot selects the payloads bundled with the binary starting the box, so
+upgrading Terra and stopping/starting an existing box updates its kernel and
+boot disk without rebuilding its root filesystem.
 
 Guest RAM is demand-backed and Linux reports free pages through the memory
 component for native discard. Guest capacity stays fixed; host RSS includes

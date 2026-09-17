@@ -369,6 +369,14 @@ impl BoundedDisk {
     }
 
     #[must_use]
+    pub fn from_readonly_bytes(data: Vec<u8>) -> Self {
+        Self {
+            data,
+            readonly: true,
+        }
+    }
+
+    #[must_use]
     pub fn capacity(&self) -> usize {
         self.data.len()
     }

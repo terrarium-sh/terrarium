@@ -1545,7 +1545,7 @@ mod vsock_tests {
     }
 }
 
-fn kernel_boot_assets() -> (Vec<u8>, tempfile::TempPath, tempfile::TempPath) {
+fn kernel_boot_assets() -> (Vec<u8>, Vec<u8>, tempfile::TempPath) {
     use std::io::Read;
     let build = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../build");
     let decode = |name| {
@@ -1560,11 +1560,9 @@ fn kernel_boot_assets() -> (Vec<u8>, tempfile::TempPath, tempfile::TempPath) {
         std::io::copy(&mut decode(name), &mut disk).unwrap();
         disk.into_temp_path()
     };
-    (
-        kernel,
-        stage_disk("boot.img.gz"),
-        stage_disk("rootfs.img.gz"),
-    )
+    let mut boot_disk = Vec::new();
+    decode("boot.img.gz").read_to_end(&mut boot_disk).unwrap();
+    (kernel, boot_disk, stage_disk("rootfs.img.gz"))
 }
 
 /// Boot plan proving agent readiness end to end: Create mode with one
@@ -1696,7 +1694,7 @@ async fn kernel_boots_directory_share() {
     let outcome = super::worker::run(super::worker::WorkerInput {
         component_memory_limits: terra_runtime::box_runtime::ComponentMemoryLimits::default(),
         kernel,
-        boot_disk: boot_disk.to_path_buf(),
+        boot_disk,
         root_disk: root_disk.to_path_buf(),
         volume_disks: Vec::new(),
         shares: vec![super::component::fs::host::ShareGrant::new(&mount, false).unwrap()],
@@ -1765,11 +1763,11 @@ async fn kernel_boots_to_agent_ready() {
     } else {
         2
     };
-    let (kernel, boot_path, root_path) = kernel_boot_assets();
+    let (kernel, boot_disk, root_path) = kernel_boot_assets();
     let outcome = super::worker::run(super::worker::WorkerInput {
         component_memory_limits: terra_runtime::box_runtime::ComponentMemoryLimits::default(),
         kernel,
-        boot_disk: boot_path.to_path_buf(),
+        boot_disk,
         root_disk: root_path.to_path_buf(),
         volume_disks: Vec::new(),
         shares: Vec::new(),
@@ -1802,11 +1800,11 @@ async fn kernel_reports_free_pages_after_boot() {
     } else {
         2
     };
-    let (kernel, boot_path, root_path) = kernel_boot_assets();
+    let (kernel, boot_disk, root_path) = kernel_boot_assets();
     let outcome = super::worker::run(super::worker::WorkerInput {
         component_memory_limits: terra_runtime::box_runtime::ComponentMemoryLimits::default(),
         kernel,
-        boot_disk: boot_path.to_path_buf(),
+        boot_disk,
         root_disk: root_path.to_path_buf(),
         volume_disks: Vec::new(),
         shares: Vec::new(),
@@ -2093,13 +2091,13 @@ fn local_upload_server(
 #[ignore = "requires a native hypervisor, `make component-block-aot component-vsock-aot`, and boot assets"]
 async fn kernel_boots_to_agent_bridge() {
     let (_socket_dir, socket_path, listener) = bridge_listener();
-    let (kernel, boot_path, root_path) = kernel_boot_assets();
+    let (kernel, boot_disk, root_path) = kernel_boot_assets();
     let client_path = socket_path.clone();
     let client = tokio::task::spawn_blocking(move || assert_agent_control_and_exec(&client_path));
     let worker = super::worker::run(super::worker::WorkerInput {
         component_memory_limits: terra_runtime::box_runtime::ComponentMemoryLimits::default(),
         kernel,
-        boot_disk: boot_path.to_path_buf(),
+        boot_disk,
         root_disk: root_path.to_path_buf(),
         volume_disks: Vec::new(),
         shares: Vec::new(),
@@ -2131,7 +2129,7 @@ async fn kernel_boots_and_agent_stop_ends_workload() {
     use std::io::Write as _;
 
     let (_socket_dir, socket_path, listener) = bridge_listener();
-    let (kernel, boot_path, root_path) = kernel_boot_assets();
+    let (kernel, boot_disk, root_path) = kernel_boot_assets();
     let (_control_dir, control_path, control_listener) = bridge_listener();
     let mut control_writer = terra_io::local::LocalStream::connect(&control_path).unwrap();
     let (control, _) = control_listener.accept().unwrap();
@@ -2143,7 +2141,7 @@ async fn kernel_boots_and_agent_stop_ends_workload() {
     let worker = super::worker::run(super::worker::WorkerInput {
         component_memory_limits: terra_runtime::box_runtime::ComponentMemoryLimits::default(),
         kernel,
-        boot_disk: boot_path.to_path_buf(),
+        boot_disk,
         root_disk: root_path.to_path_buf(),
         volume_disks: Vec::new(),
         shares: Vec::new(),
@@ -2182,13 +2180,13 @@ async fn kernel_boots_and_agent_stop_ends_workload() {
 #[ignore = "requires a native hypervisor, component AOT artifacts, and boot assets"]
 async fn kernel_boots_foreground_session_reports_workload_exit() {
     let (_socket_dir, socket_path, listener) = bridge_listener();
-    let (kernel, boot_path, root_path) = kernel_boot_assets();
+    let (kernel, boot_disk, root_path) = kernel_boot_assets();
     let client_path = socket_path.clone();
     let client = tokio::task::spawn_blocking(move || await_foreground_workload(&client_path));
     let worker = super::worker::run(super::worker::WorkerInput {
         component_memory_limits: terra_runtime::box_runtime::ComponentMemoryLimits::default(),
         kernel,
-        boot_disk: boot_path.to_path_buf(),
+        boot_disk,
         root_disk: root_path.to_path_buf(),
         volume_disks: Vec::new(),
         shares: Vec::new(),
@@ -2237,7 +2235,7 @@ async fn kernel_boots_foreground_session_reports_workload_exit() {
 
 async fn assert_policy_dns_http(address: std::net::IpAddr, body: &[u8]) {
     let (_socket_dir, socket_path, listener) = bridge_listener();
-    let (kernel, boot_path, root_path) = kernel_boot_assets();
+    let (kernel, boot_disk, root_path) = kernel_boot_assets();
     let listener_address = std::net::Ipv4Addr::UNSPECIFIED;
     let body = body.to_vec();
     let (port, stop_server, server) = local_http_server(listener_address, body.clone());
@@ -2254,7 +2252,7 @@ async fn assert_policy_dns_http(address: std::net::IpAddr, body: &[u8]) {
     let worker = super::worker::run(super::worker::WorkerInput {
         component_memory_limits: terra_runtime::box_runtime::ComponentMemoryLimits::default(),
         kernel,
-        boot_disk: boot_path.to_path_buf(),
+        boot_disk,
         root_disk: root_path.to_path_buf(),
         volume_disks: Vec::new(),
         shares: Vec::new(),
@@ -2282,7 +2280,7 @@ async fn assert_policy_dns_http(address: std::net::IpAddr, body: &[u8]) {
 
 async fn assert_policy_dns_upload(address: std::net::IpAddr, bytes: usize) {
     let (_socket_dir, socket_path, listener) = bridge_listener();
-    let (kernel, boot_path, root_path) = kernel_boot_assets();
+    let (kernel, boot_disk, root_path) = kernel_boot_assets();
     let listener_address = std::net::Ipv4Addr::UNSPECIFIED;
     let (port, stop_server, server) = local_upload_server(listener_address, bytes);
     let client_path = socket_path.clone();
@@ -2298,7 +2296,7 @@ async fn assert_policy_dns_upload(address: std::net::IpAddr, bytes: usize) {
     let worker = super::worker::run(super::worker::WorkerInput {
         component_memory_limits: terra_runtime::box_runtime::ComponentMemoryLimits::default(),
         kernel,
-        boot_disk: boot_path.to_path_buf(),
+        boot_disk,
         root_disk: root_path.to_path_buf(),
         volume_disks: Vec::new(),
         shares: Vec::new(),
@@ -2397,7 +2395,7 @@ async fn assert_published_loopback_http(host_closes_first: bool) {
     const GUEST_PORT: u16 = 8080;
     const BODY: &[u8] = b"published-body";
     let host_port = reserved_loopback_port();
-    let (kernel, boot_path, root_path) = kernel_boot_assets();
+    let (kernel, boot_disk, root_path) = kernel_boot_assets();
     let (_control_dir, control_path, control_listener) = bridge_listener();
     let mut control_writer = terra_io::local::LocalStream::connect(&control_path).unwrap();
     let (control, _) = control_listener.accept().unwrap();
@@ -2410,7 +2408,7 @@ async fn assert_published_loopback_http(host_closes_first: bool) {
     let worker = super::worker::run(super::worker::WorkerInput {
         component_memory_limits: terra_runtime::box_runtime::ComponentMemoryLimits::default(),
         kernel,
-        boot_disk: boot_path.to_path_buf(),
+        boot_disk,
         root_disk: root_path.to_path_buf(),
         volume_disks: Vec::new(),
         shares: Vec::new(),

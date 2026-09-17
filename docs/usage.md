@@ -34,6 +34,17 @@ The workload has one shared session. Press `Ctrl-\` to detach without stopping
 it, then run `terra <box>` to join again. `terra <box> sessions` lists attached
 clients, and `terra <box> detach ID` or `--all` removes them.
 
+## Kernel updates
+
+Each boot uses the guest kernel bundled with the `terra` binary that starts
+the box. After upgrading Terra, run `terra <box> stop`, then `terra <box>` to
+use that release's kernel. Existing boxes do not need rebuilding. Attaching
+to a running box leaves its kernel unchanged.
+
+The kernel and read-only boot disk are decompressed directly into memory on
+each boot, without disk files or a cache. Using the latest Terra release gives you the kernel shipped with that
+release; guest package updates do not change the kernel Terra boots.
+
 ## Work with a running box
 
 ```sh
@@ -62,8 +73,8 @@ recipe. Add `--purge` to remove the recipe too. `--force` can remove a running
 box after attempting a graceful stop.
 
 Box state lives under `~/.terra/box/t-<project-slug>/<box>/`, where the slug is
-a stable base32 hash of the project path; shared files live under
-`~/.terra/cache/`. `terra ls` lists boxes in the current project, and
+a stable base32 hash of the project path. The memory-backed boot disk contains
+the guest agent and resize helper bundled with the Terra binary. `terra ls` lists boxes in the current project, and
 `terra ls --all` lists every local project. `terra <box> storage show` inspects
 the root filesystem and volumes; `export`, `import`, and `prune` manage images.
 Export and import require a stopped box and the same recipe.

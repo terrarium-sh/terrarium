@@ -36,7 +36,7 @@ if ($env:PROCESSOR_ARCHITECTURE -ne $hostArchitecture) {
     throw "build target $Target requires a native $hostArchitecture host, found $env:PROCESSOR_ARCHITECTURE"
 }
 
-$guestAssets = "build/vmlinux.gz", "build/rootfs.img.gz", "build/volume.img.gz", "build/boot.img.gz", "build/vmlinux.gz.sha256", "build/boot.img.gz.sha256"
+$guestAssets = "build/vmlinux.gz", "build/rootfs.img.gz", "build/volume.img.gz", "build/boot.img.gz"
 foreach ($asset in $guestAssets) {
     if (-not (Test-Path -LiteralPath $asset -PathType Leaf) -or (Get-Item -LiteralPath $asset).Length -eq 0) {
         throw "missing staged $guest guest asset: $asset"

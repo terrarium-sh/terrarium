@@ -182,7 +182,7 @@ async fn prepare_x64(mut input: WorkerInput) -> Result<PreparedVmm, String> {
     let mut component_runtime =
         crate::worker::create_runtime(&input).map_err(|error| error.to_string())?;
     let disks = crate::worker::disk_paths(&input);
-    let block_count = disks.len();
+    let block_count = 1 + disks.len();
     let share_count = input.shares.len();
     let layout = crate::machine::build_machine_layout(input.ram_bytes, block_count, share_count)
         .map_err(|error| format!("invalid WHP layout: {error:?}"))?;
@@ -532,7 +532,7 @@ async fn prepare_arm64(mut input: WorkerInput) -> Result<PreparedVmm, String> {
     let mut component_runtime =
         crate::worker::create_runtime(&input).map_err(|error| error.to_string())?;
     let disks = crate::worker::disk_paths(&input);
-    let block_count = disks.len();
+    let block_count = 1 + disks.len();
     let shares = input.shares.len();
     let layout = crate::aarch64::arm::build_machine_layout(input.ram_bytes, block_count, shares)
         .map_err(|error| format!("invalid ARM WHP layout: {error:?}"))?;

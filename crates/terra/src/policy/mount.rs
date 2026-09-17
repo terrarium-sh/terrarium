@@ -42,11 +42,6 @@ fn validate_mounts_against_terra_paths(mounts: &[config::Mount], bx: &BoxRef) ->
             what_shared: "every box on this machine - their recipes, disk images and sockets",
             refuse_even_readonly: true,
         }),
-        find_existing_prefix(state::get_cache_path()).map(|path| Protected {
-            path,
-            what_shared: "the kernel and agent every box on this machine boots",
-            refuse_even_readonly: true,
-        }),
         find_existing_prefix(std::env::current_exe()).map(|path| Protected {
             path,
             what_shared: "the terra binary itself - re-executed by every interactive or \
@@ -441,24 +436,22 @@ mod tests {
         assert!(find_writable_mount_containing(&smuggled, "mounts: nope\n", dir.path()).is_err());
     }
 
-    /// `~/.terra` covers the shared recipes, the kernel cache and every other
-    /// box's state - refused even outside this box's own state.
+    /// `~/.terra` covers shared recipes and every box's state, so mounts of
+    /// the home directory are refused even outside this box's own state.
     #[test]
     fn a_mount_containing_terra_home_is_refused() {
         let _home = crate::sys::TestHome::new();
         let dir = tempfile::tempdir().unwrap();
         let b = resolve_box_ref(dir.path());
-        let home = state::ensure_terra_home().unwrap();
-        let cache = home.join("cache");
-        std::fs::create_dir_all(&cache).unwrap();
-        let err = validate_mounts_against_terra_paths(&build_mounts(&cache, false), &b)
+        let shared = state::ensure_terra_home().unwrap().join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        let err = validate_mounts_against_terra_paths(&build_mounts(&shared, false), &b)
             .unwrap_err()
             .to_string();
         assert!(err.contains("terra's own directory"), "{err}");
     }
 
-    /// Reading the state alone already hands over live sockets, disk images
-    /// and the kernel.
+    /// Reading the state alone already hands over live sockets and disk images.
     #[test]
     fn a_read_only_share_of_terra_state_is_still_refused() {
         let dir = tempfile::tempdir().unwrap();

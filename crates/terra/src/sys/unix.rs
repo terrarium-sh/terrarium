@@ -199,19 +199,6 @@ pub fn find_terminating_signal(status: std::process::ExitStatus) -> Option<i32> 
     status.signal()
 }
 
-/// Whether the kernel lists a process under this pid - what a staging-temp
-/// sweep needs to know before it deletes a dead writer's leftovers. `getpgid`
-/// reads any process the way `kill(0)` does, without a permission check.
-pub fn pid_exists(pid: u32) -> bool {
-    let Ok(pid) = i32::try_from(pid) else {
-        return false;
-    };
-    let Some(pid) = rustix::process::Pid::from_raw(pid) else {
-        return false;
-    };
-    rustix::process::getpgid(Some(pid)).is_ok()
-}
-
 /// Process start identity: Linux clock ticks since boot, or Darwin wall-clock
 /// microseconds. Two processes can wear one pid in sequence, never one starttime.
 #[cfg_attr(target_os = "macos", allow(unsafe_code))]
