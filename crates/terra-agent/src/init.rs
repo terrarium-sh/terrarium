@@ -20,8 +20,8 @@ use std::time::Duration;
 use terra_protocol::{
     CLOCK_SYNC, CLOCK_SYNC_BYTES, CONTROL_VSOCK_PORT, DEFAULT_STOP_GRACE_SECS,
     DIAGNOSTIC_VSOCK_PORT, LifecycleEvent, LifecycleProtocol, Net, Plan, PlanMode,
-    RECIPE_STAMP_PATH, RESIZE2FS_GUEST_PATH, ROOT_DEVICE, STOP_SIGNAL, Share, WORKLOAD_ID,
-    WORKLOAD_USER_NAME,
+    RECIPE_STAMP_PATH, RESIZE2FS_GUEST_PATH, ROOT_DEVICE, STOP_SIGNAL, Share, TermSize,
+    WORKLOAD_ID, WORKLOAD_USER_NAME,
 };
 
 const AGENT_FAILED: i32 = 1;
@@ -987,19 +987,26 @@ fn wait_for_initial_session(
 pub(crate) fn spawn_on_pty(
     cmd: &str,
     args: &[String],
-    rows: u16,
-    cols: u16,
+    term: TermSize,
     as_root: bool,
     home_env: Option<&str>,
+    workdir: Option<&str>,
+    env: &std::collections::BTreeMap<String, String>,
 ) -> Result<(Pty, std::process::Child, crate::reap::OwnedPidfd)> {
     let (pty, pts) = pty_process::blocking::open()?;
     pty.resize(pty_process::Size::new(
-        rows.clamp(MIN_ROWS, MAX_ROWS),
-        cols.clamp(MIN_COLS, MAX_COLS),
+        term.rows.clamp(MIN_ROWS, MAX_ROWS),
+        term.cols.clamp(MIN_COLS, MAX_COLS),
     ))?;
     let mut command = PtyCommand::new(cmd).args(args);
     if let Some(home_env) = home_env {
         command = command.env("HOME", home_env);
+    }
+    if let Some(workdir) = workdir {
+        command = command.current_dir(workdir);
+    }
+    for (k, v) in env {
+        command = command.env(k, v);
     }
     if !as_root {
         // SAFETY: a post-fork/pre-exec hook that only calls async-signal-safe

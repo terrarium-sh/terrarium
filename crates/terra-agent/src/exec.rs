@@ -2,6 +2,7 @@
 
 use crate::term::session::{MAX_COLS, MAX_ROWS, MIN_COLS, MIN_ROWS};
 use crate::term::tty::set_winsize;
+use std::collections::BTreeMap;
 use std::fmt::Display;
 use std::fs::File;
 use std::io::{Read, Write};
@@ -37,8 +38,20 @@ pub fn serve_exec(mut conn: File, workload_root: bool) {
     };
     let as_root = req.as_root || workload_root;
     match req.tty {
-        Some(TermSize { rows, cols }) => run_exec_on_pty(conn, rows, cols, cmd, args, as_root),
-        None => run_exec_on_pipes(conn, cmd, args, as_root),
+        Some(term) => {
+            run_exec_on_pty(
+                conn,
+                term,
+                cmd,
+                args,
+                as_root,
+                req.workdir.as_deref(),
+                &req.env,
+            );
+        }
+        None => {
+            run_exec_on_pipes(conn, cmd, args, as_root, req.workdir.as_deref(), &req.env);
+        }
     }
 }
 
@@ -166,19 +179,21 @@ pub(crate) fn wait_for_exit_code(pidfd: &crate::reap::OwnedPidfd) -> i32 {
 /// worth it only if backgrounding through exec turns out to be common.
 fn run_exec_on_pty(
     mut conn: File,
-    rows: u16,
-    cols: u16,
+    term: TermSize,
     cmd: &str,
     args: &[String],
     as_root: bool,
+    workdir: Option<&str>,
+    env: &BTreeMap<String, String>,
 ) {
     let (pty, _child, child_pidfd) = match crate::init::spawn_on_pty(
         cmd,
         args,
-        rows,
-        cols,
+        term,
         as_root,
         Some(terra_protocol::WORKLOAD_HOME),
+        workdir,
+        env,
     ) {
         Ok(pair) => pair,
         Err(e) => return report_exec_failure(&mut conn, cmd, e, true),
@@ -223,7 +238,14 @@ fn run_exec_on_pty(
 }
 
 #[allow(unsafe_code)]
-fn run_exec_on_pipes(mut conn: File, cmd: &str, args: &[String], as_root: bool) {
+fn run_exec_on_pipes(
+    mut conn: File,
+    cmd: &str,
+    args: &[String],
+    as_root: bool,
+    workdir: Option<&str>,
+    env: &BTreeMap<String, String>,
+) {
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;
 
@@ -234,6 +256,12 @@ fn run_exec_on_pipes(mut conn: File, cmd: &str, args: &[String], as_root: bool) 
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(workdir) = workdir {
+        command.current_dir(workdir);
+    }
+    for (k, v) in env {
+        command.env(k, v);
+    }
     if !as_root {
         // SAFETY: as in `spawn_on_pty` - async-signal-safe id-setting only.
         unsafe {
@@ -455,10 +483,21 @@ mod tests {
     }
 
     fn run_exec_request(argv: &[&str], is_tty: bool, stdin: &[u8]) -> (Vec<u8>, Vec<u8>, i32) {
+        run_exec_request_with_env(argv, is_tty, stdin, BTreeMap::new())
+    }
+
+    fn run_exec_request_with_env(
+        argv: &[&str],
+        is_tty: bool,
+        stdin: &[u8],
+        env: BTreeMap<String, String>,
+    ) -> (Vec<u8>, Vec<u8>, i32) {
         let req = ExecRequest {
             argv: argv.iter().map(ToString::to_string).collect(),
             as_root: false,
             tty: is_tty.then_some(TermSize { rows: 24, cols: 80 }),
+            workdir: None,
+            env,
         };
         let (mut client, server) = UnixStream::pair().unwrap();
         client.set_read_timeout(Some(HARNESS_TIMEOUT)).unwrap();
@@ -664,5 +703,42 @@ mod tests {
         let (out, _, code) = run_exec_request(&["sh", "-c", "echo $HOME"], false, b"");
         assert_eq!(String::from_utf8_lossy(&out), "/home/terri\n");
         assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn an_exec_overlays_supplied_env_over_inherited_env() {
+        let mut env = BTreeMap::new();
+        env.insert("SUPPLIED_VAR".to_string(), "from_exec".to_string());
+        env.insert("HOME".to_string(), "/custom/exec/home".to_string());
+
+        let (out, _, code) = run_exec_request_with_env(
+            &[
+                "sh",
+                "-c",
+                "echo $SUPPLIED_VAR; echo $HOME; test -n \"$PATH\" && echo has_path",
+            ],
+            false,
+            b"",
+            env.clone(),
+        );
+        assert_eq!(code, 0);
+        let out_str = String::from_utf8_lossy(&out);
+        assert_eq!(out_str, "from_exec\n/custom/exec/home\nhas_path\n");
+
+        let (out, _, code) = run_exec_request_with_env(
+            &[
+                "sh",
+                "-c",
+                "echo $SUPPLIED_VAR; echo $HOME; test -n \"$PATH\" && echo has_path",
+            ],
+            true,
+            b"",
+            env,
+        );
+        assert_eq!(code, 0);
+        let out_str = String::from_utf8_lossy(&out);
+        assert!(out_str.contains("from_exec"));
+        assert!(out_str.contains("/custom/exec/home"));
+        assert!(out_str.contains("has_path"));
     }
 }

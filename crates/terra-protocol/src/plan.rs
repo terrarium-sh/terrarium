@@ -232,6 +232,10 @@ pub struct ExecRequest {
     pub argv: Vec<String>,
     pub as_root: bool,
     pub tty: Option<TermSize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
 }
 
 /// One `terra put`/`get` operation on an absolute guest path. A put carries

@@ -125,7 +125,7 @@ fn supervise(
         }
         drop(processes);
         let status = crate::reap::wait_owned(&pidfd);
-        crate::reap::signal_owned_process_group(&pidfd, leader, rustix::process::Signal::KILL);
+        let _ = rustix::process::kill_process_group(leader, rustix::process::Signal::KILL);
         lock_or_abort(registry).retain(|registered| !Arc::ptr_eq(&registered.pidfd, &pidfd));
         if stopping.load(Ordering::SeqCst) {
             return;
@@ -285,6 +285,65 @@ mod tests {
         assert!(
             rustix::process::test_kill_process(pid).is_err(),
             "daemon process group child survived daemon stop"
+        );
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn daemon_exiting_cleans_up_orphaned_process_group_children() {
+        let file = crate::create_scratch_path("daemon", "exit-child-pid");
+        let _ = std::fs::remove_file(&file);
+        let line = format!("sh -c 'sleep 600' & echo $! > {}; exit 0", file.display());
+        let daemons = spawn_all(&[line], true, None).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !file.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(file.exists(), "child pid file was never written");
+        let child_pid_str = std::fs::read_to_string(&file).unwrap();
+        let child_pid: i32 = child_pid_str.trim().parse().unwrap();
+        let pid = rustix::process::Pid::from_raw(child_pid).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while rustix::process::test_kill_process(pid).is_ok()
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            rustix::process::test_kill_process(pid).is_err(),
+            "daemon child survived leader exit"
+        );
+        let _ = std::fs::remove_file(&file);
+        daemons.stop(STOP_GRACE_TEST);
+    }
+
+    #[test]
+    fn stop_kills_straggler_daemon_process_group_children() {
+        let file = crate::create_scratch_path("daemon", "straggler-child-pid");
+        let _ = std::fs::remove_file(&file);
+        let line = format!(
+            "sh -c 'trap \"\" TERM; sleep 600' & echo $! > {}; wait",
+            file.display()
+        );
+        let daemons = spawn_all(&[line], true, None).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !file.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(file.exists(), "child pid file was never written");
+        let child_pid_str = std::fs::read_to_string(&file).unwrap();
+        let child_pid: i32 = child_pid_str.trim().parse().unwrap();
+        let pid = rustix::process::Pid::from_raw(child_pid).unwrap();
+        daemons.stop(STOP_GRACE_TEST);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while rustix::process::test_kill_process(pid).is_ok()
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            rustix::process::test_kill_process(pid).is_err(),
+            "straggler child survived daemon stop"
         );
         let _ = std::fs::remove_file(&file);
     }

@@ -1932,6 +1932,8 @@ fn agent_exec(path: &std::path::Path, argv: &[&str]) -> std::io::Result<Vec<u8>>
         argv: argv.iter().map(ToString::to_string).collect(),
         as_root: true,
         tty: None,
+        workdir: None,
+        env: std::collections::BTreeMap::new(),
     })?)?;
     let mut output = Vec::new();
     loop {

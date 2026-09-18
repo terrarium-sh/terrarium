@@ -74,15 +74,44 @@ impl Cli {
     }
 }
 
-/// The box-first fix for a verb-first spelling like `terra stop dev`.
+/// The box-first fix for a verb-first spelling like `terra stop dev` or `terra stop dev --wait 5`.
 fn build_reversal_hint(typed: &[String]) -> Option<String> {
-    let [verb, name] = typed else { return None };
-    crate::resolve::BoxArg::parse(name).ok()?;
     let command = Cli::command();
-    let subcommand = command.find_subcommand(verb)?;
-    let cmd = Cli::try_parse_from(["terra", verb]).ok()?.cmd?;
-    (cmd.takes_the_box() && subcommand.get_positionals().count() == 0)
-        .then(|| format!("terra: the box comes before the verb - `terra {name} {verb}`"))
+    let (verb_idx, verb) = typed.iter().enumerate().find_map(|(i, arg)| {
+        let sub = command.find_subcommand(arg)?;
+        let name = sub.get_name();
+        (!matches!(name, "ls" | "help")).then_some((i, name))
+    })?;
+
+    for (idx, arg) in typed.iter().enumerate() {
+        if idx <= verb_idx || arg.starts_with('-') || crate::resolve::BoxArg::parse(arg).is_err() {
+            continue;
+        }
+        let mut candidate_argv = Vec::with_capacity(typed.len() + 1);
+        candidate_argv.push("terra".to_string());
+        candidate_argv.extend(typed[..idx].iter().cloned());
+        candidate_argv.extend(typed[idx + 1..].iter().cloned());
+
+        if Cli::try_parse_from(&candidate_argv).is_ok_and(|c| c.validate().is_ok()) {
+            let mut fixed = Vec::with_capacity(typed.len() + 1);
+            fixed.push("terra");
+            for prev in &typed[..verb_idx] {
+                fixed.push(prev.as_str());
+            }
+            fixed.push(arg.as_str());
+            fixed.push(verb);
+            for (i, rem) in typed.iter().enumerate().skip(verb_idx + 1) {
+                if i != idx {
+                    fixed.push(rem.as_str());
+                }
+            }
+            return Some(format!(
+                "terra: the box comes before the verb - `{}`",
+                fixed.join(" ")
+            ));
+        }
+    }
+    None
 }
 
 #[must_use]
@@ -235,6 +264,7 @@ pub struct ShowArgs {
 }
 
 #[derive(Args, Debug)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct ExecArgs {
     /// Run as root instead of the workload's own user.
     #[arg(long)]
@@ -247,6 +277,15 @@ pub struct ExecArgs {
     /// its output is exactly what a redirect would capture.
     #[arg(short = 'T', long)]
     pub no_tty: bool,
+    /// Working directory inside the box.
+    #[arg(short = 'w', long, value_name = "DIR")]
+    pub workdir: Option<String>,
+    /// Environment variables for the command (KEY=VALUE, or KEY to inherit from the host).
+    #[arg(short = 'e', long = "env", value_name = "KEY[=VALUE]")]
+    pub env: Vec<String>,
+    /// Inherit the host's environment variables.
+    #[arg(short = 'E', long)]
+    pub inherit_env: bool,
     #[command(flatten)]
     pub agent: AgentTimeoutArg,
     /// The command to run, after `--`. argv is passed literally to the guest
@@ -539,13 +578,28 @@ mod tests {
             .expect("the old setup spelling goes unexplained");
         assert!(hint.contains("terra ./ci.yaml setup"), "{hint}");
 
+        // With flags or command arguments, the reversal hint still identifies the box.
+        for (reversed, expected) in [
+            (
+                vec!["stop", "dev", "--wait", "5"],
+                "terra dev stop --wait 5",
+            ),
+            (vec!["logs", "dev", "-f"], "terra dev logs -f"),
+            (vec!["rm", "dev", "--purge"], "terra dev rm --purge"),
+            (vec!["exec", "dev", "--", "ls"], "terra dev exec -- ls"),
+        ] {
+            let typed: Vec<String> = reversed.iter().map(|w| (*w).to_string()).collect();
+            let hint = build_reversal_hint(&typed)
+                .unwrap_or_else(|| panic!("`terra {}` goes unexplained", reversed.join(" ")));
+            assert!(hint.contains(expected), "{hint}");
+        }
+
         // Nothing else is guessed at.
         for quiet in [
-            &["stop"][..],                   // no word to be the box
-            &["exec", "dev"],                // the word could be its own argument
-            &["stop", "not a box"],          // nothing a box could be called
-            &["stop", "dev", "--wait", "5"], // the bare two-word form only
-            &["nonsense", "dev"],
+            &["stop"][..],          // no word to be the box
+            &["exec", "dev"],       // missing command after --
+            &["stop", "not a box"], // nothing a box could be called
+            &["nonsense", "dev"],   // not a terra command
         ] {
             let typed: Vec<String> = quiet.iter().map(|w| (*w).to_string()).collect();
             assert_eq!(build_reversal_hint(&typed), None, "{quiet:?}");
@@ -970,6 +1024,28 @@ mod tests {
 
         assert!(Cli::try_parse_from(["terra", "dev", "exec"]).is_err());
         assert!(Cli::try_parse_from(["terra", "exec"]).is_err());
+    }
+
+    #[test]
+    fn exec_accepts_workdir_and_env_flags() {
+        let cli = Cli::parse_from([
+            "terra", "dev", "exec", "-w", "/custom", "-e", "FOO=BAR", "--env", "BAZ=QUX", "-e",
+            "BARE", "-E", "--", "pwd",
+        ]);
+        assert_eq!(cli.name.as_deref(), Some("dev"));
+        let Some(Cmd::Exec(args)) = cli.cmd else {
+            panic!("expected exec")
+        };
+        assert_eq!(args.workdir.as_deref(), Some("/custom"));
+        assert_eq!(args.env, ["FOO=BAR", "BAZ=QUX", "BARE"]);
+        assert!(args.inherit_env);
+        assert_eq!(args.command, ["pwd"]);
+
+        let cli_long = Cli::parse_from(["terra", "dev", "exec", "--inherit-env", "--", "pwd"]);
+        let Some(Cmd::Exec(args_long)) = cli_long.cmd else {
+            panic!("expected exec")
+        };
+        assert!(args_long.inherit_env);
     }
 
     /// The version string names the commit this build was made from; outside an
