@@ -84,7 +84,8 @@ pub fn connect_to_agent(
                     anyhow::ensure!(
                         magic[0] == protocol::AGENT_HELLO[0],
                         "the agent in {bx} does not speak this terra's protocol - \
-                     `terra stop` it and start it again on this build"
+                     `terra {name} stop` and start it again on this build",
+                        name = bx.get_name()
                     );
                     let mut version = [0];
                     if (&stream).read_exact(&mut version).is_err() {
@@ -93,7 +94,8 @@ pub fn connect_to_agent(
                     anyhow::ensure!(
                         version[0] == protocol::AGENT_PROTOCOL_VERSION,
                         "the agent in {bx} does not speak this terra's protocol - \
-                     `terra stop` it and start it again on this build"
+                     `terra {name} stop` and start it again on this build",
+                        name = bx.get_name()
                     );
                     stream
                         .set_read_timeout(None)

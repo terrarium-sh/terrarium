@@ -360,7 +360,10 @@ fn run_attached(
     run_lock: File,
     agent_timeout: Option<u64>,
 ) -> Result<ExitCode> {
-    eprintln!("terra: starting {bx} - {DETACH_KEY_NAME} detaches, `terra stop` stops it");
+    eprintln!(
+        "terra: starting {bx} - {DETACH_KEY_NAME} detaches, `terra {} stop` stops it",
+        bx.get_name()
+    );
     // The sandbox's view is worth a line on the terminal - the boot banner
     // only lands in the log.
     if spec.cfg.mounts.is_empty() {

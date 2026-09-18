@@ -34,18 +34,22 @@ impl AsFd for OwnedPidfd {
     }
 }
 
-/// Kills an owned process group while preventing the orphan reaper from releasing its leader PID.
-pub fn kill_owned_process_group(pidfd: &OwnedPidfd, leader: rustix::process::Pid) {
+/// Signals an owned process group while preventing the orphan reaper from releasing its leader PID.
+pub fn signal_owned_process_group(
+    pidfd: &OwnedPidfd,
+    leader: rustix::process::Pid,
+    sig: rustix::process::Signal,
+) {
     let owned = lock_or_abort(&OWNED);
     if lock_or_abort(&pidfd.status).is_none()
         && owned
             .iter()
             .any(|child| Arc::ptr_eq(&child.status, &pidfd.status))
     {
-        let _ = rustix::process::kill_process_group(leader, rustix::process::Signal::KILL);
+        let _ = rustix::process::kill_process_group(leader, sig);
     }
     drop(owned);
-    let _ = rustix::process::pidfd_send_signal(pidfd, rustix::process::Signal::KILL);
+    let _ = rustix::process::pidfd_send_signal(pidfd, sig);
 }
 
 static OWNED: Mutex<Vec<OwnedChild>> = Mutex::new(Vec::new());

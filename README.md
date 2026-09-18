@@ -78,7 +78,8 @@ instructions: [docs/usage.md](docs/usage.md).
 
 ## What you get
 
-- **Real isolation.** Each box is a microVM, not a container.
+- **Real isolation.** Each box is a dedicated microVM with its own kernel and 
+  rootfs—sharing only what you explicitly allow.
 - **Explicit access.** No host files or network by default; the host, LAN, and
   private ranges stay blocked unless a recipe names them. Grant host directories
   with `mounts`, or transfer individual files with `put` and `get`.

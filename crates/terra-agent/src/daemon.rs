@@ -1,21 +1,23 @@
 //! Background commands restarted on failure (`daemons:` in the recipe).
-//!
-//! ponytail: restarts on non-zero with a fixed 1s backoff, and a daemon's
-//! SIGTERM kills the shell, not what the shell started - the children live on
-//! as orphans until the box stops. Per-daemon log files and process groups if
-//! console interleaving or surviving children bite.
 
 use crate::mutex::lock_or_abort;
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-type PidFdRegistry = Arc<Mutex<Vec<Arc<crate::reap::OwnedPidfd>>>>;
+#[derive(Clone)]
+struct DaemonProcess {
+    pidfd: Arc<crate::reap::OwnedPidfd>,
+    leader: rustix::process::Pid,
+}
+
+type DaemonRegistry = Arc<Mutex<Vec<DaemonProcess>>>;
 
 #[derive(Clone)]
 pub struct Daemons {
-    pidfds: PidFdRegistry,
+    processes: DaemonRegistry,
     stopping: Arc<AtomicBool>,
 }
 
@@ -24,19 +26,19 @@ impl Daemons {
         self.stopping.store(true, Ordering::SeqCst);
         self.signal(rustix::process::Signal::TERM);
         let deadline = std::time::Instant::now() + grace;
-        while !lock_or_abort(&self.pidfds).is_empty() && std::time::Instant::now() < deadline {
+        while !lock_or_abort(&self.processes).is_empty() && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
         }
         self.signal(rustix::process::Signal::KILL);
     }
 
     fn signal(&self, sig: rustix::process::Signal) {
-        let pidfds = lock_or_abort(&self.pidfds)
+        let processes = lock_or_abort(&self.processes)
             .iter()
             .cloned()
             .collect::<Vec<_>>();
-        for pidfd in &pidfds {
-            let _ = rustix::process::pidfd_send_signal(pidfd, sig);
+        for process in &processes {
+            crate::reap::signal_owned_process_group(&process.pidfd, process.leader, sig);
         }
     }
 }
@@ -46,10 +48,10 @@ pub fn spawn_all(
     as_root: bool,
     output: Option<&std::fs::File>,
 ) -> std::io::Result<Daemons> {
-    let pidfds = PidFdRegistry::default();
+    let processes = DaemonRegistry::default();
     let stopping = Arc::new(AtomicBool::new(false));
     for line in lines {
-        let registry = pidfds.clone();
+        let registry = processes.clone();
         let stopping = stopping.clone();
         let line = line.clone();
         let output = output.map(std::fs::File::try_clone).transpose()?;
@@ -57,13 +59,16 @@ pub fn spawn_all(
             supervise(&line, &registry, &stopping, as_root, output.as_ref());
         });
     }
-    Ok(Daemons { pidfds, stopping })
+    Ok(Daemons {
+        processes,
+        stopping,
+    })
 }
 
 #[allow(unsafe_code)]
 fn supervise(
     line: &str,
-    registry: &PidFdRegistry,
+    registry: &DaemonRegistry,
     stopping: &AtomicBool,
     as_root: bool,
     output: Option<&std::fs::File>,
@@ -73,7 +78,7 @@ fn supervise(
             return;
         }
         let mut command = Command::new("sh");
-        command.arg("-c").arg(line);
+        command.arg("-c").arg(line).process_group(0);
         if let Some(output) = output {
             let (stdout, stderr) = match output
                 .try_clone()
@@ -90,15 +95,14 @@ fn supervise(
                 .stderr(Stdio::from(stderr));
         }
         if !as_root {
-            use std::os::unix::process::CommandExt;
             // SAFETY: a post-fork/pre-exec hook that only calls async-signal-safe
             // id-setting syscalls.
             unsafe {
                 command.pre_exec(crate::init::drop_privileges);
             }
         }
-        let (_child, pidfd) = match crate::reap::spawn_owned(|| command.spawn()) {
-            Ok(child) => child,
+        let (child, pidfd) = match crate::reap::spawn_owned(|| command.spawn()) {
+            Ok(pair) => pair,
             Err(e) => {
                 eprintln!("terra: daemon `{line}` could not spawn ({e})");
                 if stopping.load(Ordering::SeqCst) {
@@ -108,15 +112,21 @@ fn supervise(
                 continue;
             }
         };
+        let leader = rustix::process::Pid::from_child(&child);
         let pidfd = Arc::new(pidfd);
-        let mut pidfds = lock_or_abort(registry);
-        pidfds.push(pidfd.clone());
+        let process = DaemonProcess {
+            pidfd: pidfd.clone(),
+            leader,
+        };
+        let mut processes = lock_or_abort(registry);
+        processes.push(process);
         if stopping.load(Ordering::SeqCst) {
-            let _ = rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::KILL);
+            crate::reap::signal_owned_process_group(&pidfd, leader, rustix::process::Signal::KILL);
         }
-        drop(pidfds);
+        drop(processes);
         let status = crate::reap::wait_owned(&pidfd);
-        lock_or_abort(registry).retain(|registered| !Arc::ptr_eq(registered, &pidfd));
+        crate::reap::signal_owned_process_group(&pidfd, leader, rustix::process::Signal::KILL);
+        lock_or_abort(registry).retain(|registered| !Arc::ptr_eq(&registered.pidfd, &pidfd));
         if stopping.load(Ordering::SeqCst) {
             return;
         }
@@ -209,7 +219,7 @@ mod tests {
     fn stop_kills_a_running_daemon_promptly() {
         let daemons = spawn_all(&["sleep 600".to_string()], true, None).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while lock_or_abort(&daemons.pidfds).is_empty() {
+        while lock_or_abort(&daemons.processes).is_empty() {
             assert!(std::time::Instant::now() < deadline, "never spawned");
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -228,7 +238,7 @@ mod tests {
     fn a_straggler_is_killed_once_the_grace_runs_out() {
         let daemons = spawn_all(&["trap '' TERM; sleep 600".to_string()], true, None).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while lock_or_abort(&daemons.pidfds).is_empty() {
+        while lock_or_abort(&daemons.processes).is_empty() {
             assert!(std::time::Instant::now() < deadline, "never spawned");
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -241,12 +251,41 @@ mod tests {
             start.elapsed()
         );
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !lock_or_abort(&daemons.pidfds).is_empty() && std::time::Instant::now() < deadline {
+        while !lock_or_abort(&daemons.processes).is_empty() && std::time::Instant::now() < deadline
+        {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(
-            lock_or_abort(&daemons.pidfds).is_empty(),
+            lock_or_abort(&daemons.processes).is_empty(),
             "the straggler survived the escalation"
         );
+    }
+
+    #[test]
+    fn stop_kills_daemon_process_group_children() {
+        let file = crate::create_scratch_path("daemon", "child-pid");
+        let _ = std::fs::remove_file(&file);
+        let line = format!("sh -c 'sleep 600' & echo $! > {}; wait", file.display());
+        let daemons = spawn_all(&[line], true, None).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !file.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(file.exists(), "child pid file was never written");
+        let child_pid_str = std::fs::read_to_string(&file).unwrap();
+        let child_pid: i32 = child_pid_str.trim().parse().unwrap();
+        let pid = rustix::process::Pid::from_raw(child_pid).unwrap();
+        daemons.stop(STOP_GRACE_TEST);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while rustix::process::test_kill_process(pid).is_ok()
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            rustix::process::test_kill_process(pid).is_err(),
+            "daemon process group child survived daemon stop"
+        );
+        let _ = std::fs::remove_file(&file);
     }
 }

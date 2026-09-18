@@ -436,9 +436,10 @@ pub fn run(
         Holder::Free => {}
         Holder::SettingUp => return Err(target.bx.setup_holds_it()),
         Holder::Running => anyhow::bail!(
-            "{} is running - `terra stop` it before setting it up again \
+            "{} is running - `terra {} stop` before setting it up again \
              (its recipe is pinned for as long as the VM holds it)",
-            target.bx
+            target.bx,
+            target.bx.get_name()
         ),
     }
 

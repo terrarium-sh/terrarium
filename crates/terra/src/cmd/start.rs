@@ -36,7 +36,7 @@ fn build_start_plan(bx: &BoxRef, args: &BootArgs, is_at_a_terminal: bool) -> Res
         };
         anyhow::bail!(
             "{bx} is already running, so it cannot be started with {asked} - \
-             `terra exec {name}{root} -- …` runs one in it, or `terra stop {name}` \
+             `terra {name} exec{root} -- …` runs one in it, or `terra {name} stop` \
              first to boot it differently",
             name = bx.get_name(),
             root = if args.root { " --root" } else { "" }
@@ -45,7 +45,7 @@ fn build_start_plan(bx: &BoxRef, args: &BootArgs, is_at_a_terminal: bool) -> Res
     if args.foreground {
         anyhow::bail!(
             "{bx} is already running, so there is no VM to run in this process - \
-             `terra stop {name}` first to run it here, or leave --foreground off \
+             `terra {name} stop` first to run it here, or leave --foreground off \
              to attach to the one that is up",
             name = bx.get_name()
         );
@@ -275,7 +275,7 @@ mod tests {
         let err = refused(&["--", "npm", "test"], false);
         assert!(err.contains("a command of its own"), "{err}");
         assert!(
-            err.contains("terra exec dev -- …"),
+            err.contains("terra dev exec -- …"),
             "the way to do it: {err}"
         );
 
@@ -283,7 +283,7 @@ mod tests {
         // silently is not the root one that was asked for.
         let err = refused(&["--root"], false);
         assert!(err.contains("as root"), "{err}");
-        assert!(err.contains("terra exec dev --root"), "{err}");
+        assert!(err.contains("terra dev exec --root"), "{err}");
 
         // `--foreground` is refused from either side of the terminal question:
         // off one it used to be the 125 an already-running box answers, and at
@@ -291,7 +291,7 @@ mod tests {
         for is_at_a_terminal in [false, true] {
             let err = refused(&["--foreground"], is_at_a_terminal);
             assert!(err.contains("no VM to run in this process"), "{err}");
-            assert!(err.contains("terra stop dev"), "the way to do it: {err}");
+            assert!(err.contains("terra dev stop"), "the way to do it: {err}");
         }
 
         // …and `-d`, which shapes nothing about the workload, is not refused:

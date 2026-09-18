@@ -621,6 +621,8 @@ fn setup_env(plan: &Plan) {
     let home = terra_protocol::WORKLOAD_HOME;
     // SAFETY: no other thread touches the environment yet.
     unsafe {
+        std::env::set_var("PATH", DEFAULT_PATH);
+        std::env::set_var("TERM", "xterm-256color");
         for (k, v) in &plan.env {
             if k.is_empty() || k.contains(['=', '\0']) || v.contains('\0') {
                 eprintln!("terra: warning: skipping invalid env key `{k}`");
@@ -628,10 +630,8 @@ fn setup_env(plan: &Plan) {
             }
             std::env::set_var(k, v);
         }
-        std::env::set_var("PATH", DEFAULT_PATH);
         std::env::set_var("HOME", home);
         std::env::set_var("XDG_RUNTIME_DIR", workload_runtime_dir());
-        std::env::set_var("TERM", "xterm-256color");
     }
     let name = b"terrarium";
     let _ = rustix::system::sethostname(name);
@@ -1085,9 +1085,10 @@ fn wait_with_timeout(
             Err(error) => return Err(error.into()),
         }
         if std::time::Instant::now() >= deadline {
-            crate::reap::kill_owned_process_group(
+            crate::reap::signal_owned_process_group(
                 child_pidfd,
                 rustix::process::Pid::from_child(child),
+                rustix::process::Signal::KILL,
             );
             break;
         }
@@ -1595,5 +1596,71 @@ mod tests {
                 .unwrap()
                 .contains(rustix::fs::OFlags::NONBLOCK)
         );
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn setup_env_allows_plan_to_override_path_and_term_while_preserving_home() {
+        let orig_path = std::env::var("PATH").ok();
+        let orig_term = std::env::var("TERM").ok();
+        let orig_home = std::env::var("HOME").ok();
+
+        let mut env = std::collections::BTreeMap::new();
+        env.insert(
+            "PATH".to_string(),
+            format!(
+                "/custom/bin:{}",
+                orig_path.as_deref().unwrap_or(DEFAULT_PATH)
+            ),
+        );
+        env.insert("TERM".to_string(), "custom-term".to_string());
+        env.insert("HOME".to_string(), "/attempted/home".to_string());
+        let plan = Plan {
+            mode: PlanMode::Run,
+            workdir: None,
+            shares: Vec::new(),
+            volumes: Vec::new(),
+            net: Net {
+                guest_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 2, 15)),
+                prefix: 24,
+                gateway: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 2, 2)),
+                dns: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 2, 3)),
+            },
+            env,
+            root: false,
+            sudo: Vec::new(),
+            on_create: Vec::new(),
+            on_start: Vec::new(),
+            pre_stop: Vec::new(),
+            daemons: Vec::new(),
+            workload: Vec::new(),
+            sandbox_info: String::new(),
+            workload_on_console: false,
+            await_initial_session: false,
+            lifecycle_protocol: LifecycleProtocol::EventsV1,
+            host_tz: None,
+            host_time: None,
+            host_seed: None,
+        };
+        setup_env(&plan);
+        assert!(std::env::var("PATH").unwrap().starts_with("/custom/bin:"));
+        assert_eq!(std::env::var("TERM").unwrap(), "custom-term");
+        assert_eq!(
+            std::env::var("HOME").unwrap(),
+            terra_protocol::WORKLOAD_HOME
+        );
+
+        // SAFETY: test-local cleanup restoring initial environment variables.
+        unsafe {
+            if let Some(path) = orig_path {
+                std::env::set_var("PATH", path);
+            }
+            if let Some(term) = orig_term {
+                std::env::set_var("TERM", term);
+            }
+            if let Some(home) = orig_home {
+                std::env::set_var("HOME", home);
+            }
+        }
     }
 }
