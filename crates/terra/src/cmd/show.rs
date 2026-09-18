@@ -42,9 +42,10 @@ pub fn run(
     match mount::resolve_mounts(&cfg, &target.bx) {
         Ok(mounts) => {
             for s in mount::find_sensitive_mounts(&mounts) {
-                let access = match s.mount.readonly {
-                    true =>  "read-only",
-                    false => "read-write"
+                let access = if s.mount.readonly {
+                    "read-only"
+                } else {
+                    "read-write"
                 };
                 eprintln!(
                     "terra: warning: mount '{}' shares sensitive host {} ({access}) with the sandbox",
@@ -56,12 +57,19 @@ pub fn run(
         }
         Err(e) => eprintln!("terra: warning: `terra setup` would refuse this recipe:\n{e:#}"),
     }
-    let yaml = if args.with_env_values {
-        yaml_serde::to_string(&cfg).context("serializing config")?
+    let target;
+    let to_show = if args.with_env_values {
+        &cfg
     } else {
-        render::render_redacted_config_yaml(&cfg).context("serializing config")?
+        target = render::redact_config_env(&cfg);
+        &target
     };
-    render::finish_stdout_write(std::io::stdout().lock().write_all(yaml.as_bytes()))?;
+    let output = if args.json {
+        render::render_config_json(to_show).context("serializing config to json")?
+    } else {
+        render::render_config_yaml(to_show).context("serializing config")?
+    };
+    render::finish_stdout_write(std::io::stdout().lock().write_all(output.as_bytes()))?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -136,6 +144,7 @@ mod tests {
 
         let show = crate::cli::ShowArgs {
             with_env_values: false,
+            json: false,
         };
         run(&show, Some("./dev.yaml"), &project, &project)
             .expect("a recipe naming a dotenv nobody has created yet must still print");
@@ -191,7 +200,28 @@ mod tests {
 
         let show = crate::cli::ShowArgs {
             with_env_values: false,
+            json: false,
         };
         assert!(run(&show, Some("./dev.yaml"), &project, &project).is_ok());
+    }
+
+    #[test]
+    fn show_json_mode_renders_valid_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("dev.yaml"), "env:\n  SECRET: pass123\n").unwrap();
+
+        let show = crate::cli::ShowArgs {
+            with_env_values: false,
+            json: true,
+        };
+        assert!(run(&show, Some("./dev.yaml"), &project, &project).is_ok());
+
+        let show_with_env = crate::cli::ShowArgs {
+            with_env_values: true,
+            json: true,
+        };
+        assert!(run(&show_with_env, Some("./dev.yaml"), &project, &project).is_ok());
     }
 }

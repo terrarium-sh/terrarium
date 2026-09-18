@@ -132,3 +132,5 @@ invariant nothing enforces — reword as intent or delete.
 *   **Short; lead with what it is**, not what it isn't.
 *   **Examples go in `after_long_help`** — `-h` stays a summary.
 *   **Errors name the mistake and the fix**, or offer the working spelling.
+*   **Machine-readable outputs prefer `snake_case`** (JSON
+    keys, serialized enum variants like `setting_up`, `not_created`).

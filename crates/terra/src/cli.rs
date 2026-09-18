@@ -261,6 +261,9 @@ pub struct ShowArgs {
     /// redirected to a file or pasted into a bug report.
     #[arg(long)]
     pub with_env_values: bool,
+    /// Output machine-readable JSON instead of YAML.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -391,8 +394,11 @@ pub struct LsArgs {
     /// One box per line - state, name, directory, files - separated by tabs,
     /// with no prose around them. This is the format scripts may rely on; the
     /// human listing is prose and may change.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "json")]
     pub tsv: bool,
+    /// Output machine-readable JSON array of boxes.
+    #[arg(long, conflicts_with = "tsv")]
+    pub json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -400,6 +406,10 @@ pub struct LogsArgs {
     /// Follow the log as it grows.
     #[arg(short, long)]
     pub follow: bool,
+    /// Number of lines of history from the end of the log to print before
+    /// following.
+    #[arg(short = 'n', long = "tail", value_name = "LINES")]
+    pub tail: Option<usize>,
     /// Show guest VM diagnostics instead of Terra's host log.
     #[arg(long)]
     pub diagnostics: bool,
@@ -888,6 +898,18 @@ mod tests {
         };
         assert!(!show(&[]).with_env_values);
         assert!(show(&["--with-env-values"]).with_env_values);
+        assert!(!show(&[]).json);
+        assert!(show(&["--json"]).json);
+    }
+
+    #[test]
+    fn ls_json_and_tsv_conflict() {
+        assert!(Cli::try_parse_from(["terra", "ls", "--json", "--tsv"]).is_err());
+        let Some(Cmd::Ls(args)) = Cli::parse_from(["terra", "ls", "--json"]).cmd else {
+            panic!("expected ls");
+        };
+        assert!(args.json);
+        assert!(!args.tsv);
     }
 
     /// Whether an exec'd command gets a PTY was read off terra's own stdin and
@@ -972,6 +994,19 @@ mod tests {
             panic!("expected logs")
         };
         assert!(args.diagnostics);
+    }
+
+    #[test]
+    fn logs_tail_flag_is_parsed() {
+        let Some(Cmd::Logs(args)) = Cli::parse_from(["terra", "logs", "-n", "42"]).cmd else {
+            panic!("expected logs")
+        };
+        assert_eq!(args.tail, Some(42));
+
+        let Some(Cmd::Logs(args)) = Cli::parse_from(["terra", "logs", "--tail", "100"]).cmd else {
+            panic!("expected logs")
+        };
+        assert_eq!(args.tail, Some(100));
     }
 
     /// A copy is two paths and a direction: `put` sends the source in, `get`

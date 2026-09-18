@@ -25,7 +25,7 @@ mod resources;
 use self::boot::BootSpec;
 use crate::config;
 use crate::policy::network;
-use crate::render::{format_workload_line, render_redacted_config_yaml};
+use crate::render::{format_workload_line, redact_config_env, render_config_yaml};
 #[cfg(not(any(
     all(
         target_os = "linux",
@@ -136,7 +136,7 @@ pub(super) fn build_plan(spec: &BootSpec, shares: Vec<Share>, volumes: Vec<Disk>
 #[must_use]
 fn generate_sandbox_info(cfg: &config::Config, root: bool) -> String {
     let net = GUEST_NETWORK;
-    let yaml = render_redacted_config_yaml(cfg).unwrap_or_default();
+    let yaml = render_config_yaml(&redact_config_env(cfg)).unwrap_or_default();
     let who = if root {
         "`root`".to_string()
     } else {

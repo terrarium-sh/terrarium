@@ -55,17 +55,22 @@ pub fn escape_printable(text: &str) -> String {
 
 const REDACTED_ENV_VALUE: &str = "(set - value not printable)";
 
-pub fn render_redacted_config_yaml(cfg: &config::Config) -> Result<String, yaml_serde::Error> {
-    let mut printable = yaml_serde::to_value(cfg)?;
-    if let Some(env) = printable
-        .get_mut("env")
-        .and_then(yaml_serde::Value::as_mapping_mut)
-    {
-        for value in env.values_mut() {
-            *value = yaml_serde::Value::String(REDACTED_ENV_VALUE.to_string());
-        }
+#[must_use]
+pub fn redact_config_env(cfg: &config::Config) -> config::Config {
+    let mut redacted = cfg.clone();
+    for value in redacted.env.values_mut() {
+        *value = REDACTED_ENV_VALUE.to_string();
     }
-    yaml_serde::to_string(&printable)
+    redacted
+}
+
+pub fn render_config_yaml(cfg: &config::Config) -> Result<String, yaml_serde::Error> {
+    yaml_serde::to_string(cfg)
+}
+
+pub fn render_config_json(cfg: &config::Config) -> Result<String, serde_json::Error> {
+    let json = serde_json::to_string_pretty(cfg)?;
+    Ok(format!("{json}\n"))
 }
 
 #[must_use]
@@ -284,7 +289,7 @@ mod tests {
             ]),
             ..yaml_serde::from_str("{}").unwrap()
         };
-        let yaml = render_redacted_config_yaml(&cfg).unwrap();
+        let yaml = render_config_yaml(&redact_config_env(&cfg)).unwrap();
         for name in ["API_KEY", "MODEL"] {
             assert!(
                 yaml.contains(name),
@@ -304,7 +309,7 @@ mod tests {
         // …and `terra show --with-env-values` is the one rendering that answers
         // with them, otherwise identical - a recipe read back from it has to be
         // the one a boot would run.
-        let asked_for = yaml_serde::to_string(&cfg).unwrap();
+        let asked_for = render_config_yaml(&cfg).unwrap();
         for (name, secret) in [("API_KEY", "sk-super-secret"), ("MODEL", "gpt-4o")] {
             assert!(
                 asked_for.contains(secret),
@@ -314,6 +319,32 @@ mod tests {
         assert!(!asked_for.contains(REDACTED_ENV_VALUE), "{asked_for}");
         assert_eq!(
             yaml_serde::from_str::<config::Config>(&asked_for).unwrap(),
+            cfg,
+            "what it prints is not the config it was given"
+        );
+
+        let json = render_config_json(&redact_config_env(&cfg)).unwrap();
+        for name in ["API_KEY", "MODEL"] {
+            assert!(
+                json.contains(name),
+                "the name should still be in json: {json}"
+            );
+        }
+        for (name, secret) in [("API_KEY", "sk-super-secret"), ("MODEL", "gpt-4o")] {
+            assert!(
+                !json.contains(secret),
+                "the value of {name} was printed in json:\n{json}"
+            );
+        }
+        let asked_for_json = render_config_json(&cfg).unwrap();
+        for (name, secret) in [("API_KEY", "sk-super-secret"), ("MODEL", "gpt-4o")] {
+            assert!(
+                asked_for_json.contains(secret),
+                "the value of {name} is missing in json:\n{asked_for_json}"
+            );
+        }
+        assert_eq!(
+            serde_json::from_str::<config::Config>(&asked_for_json).unwrap(),
             cfg,
             "what it prints is not the config it was given"
         );
@@ -347,7 +378,7 @@ mod tests {
             ..yaml_serde::from_str("{}").unwrap()
         };
         for printed in [
-            render_redacted_config_yaml(&cfg).unwrap(),
+            render_config_yaml(&redact_config_env(&cfg)).unwrap(),
             yaml_serde::to_string(&cfg).unwrap(),
         ] {
             for raw in ['\x1b', '\r', '\x07'] {

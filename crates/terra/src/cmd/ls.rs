@@ -20,6 +20,21 @@ pub fn run(args: &crate::cli::LsArgs, project_dir: &Path) -> Result<ExitCode> {
         }
         return Ok(ExitCode::SUCCESS);
     }
+    if args.json {
+        let entries: Vec<BoxEntry<'_>> = boxes
+            .iter()
+            .map(|bx| BoxEntry {
+                name: bx.get_name(),
+                state: bx.get_state(),
+                project_dir: bx.get_project_dir(),
+                dir: bx.get_dir(),
+            })
+            .collect();
+        let json = serde_json::to_string_pretty(&entries).context("serializing boxes to json")?;
+        let mut out = std::io::stdout().lock();
+        render::finish_stdout_write(writeln!(out, "{json}"))?;
+        return Ok(ExitCode::SUCCESS);
+    }
     if boxes.is_empty() {
         if args.all {
             eprintln!("terra: no boxes on this machine");
@@ -59,6 +74,14 @@ fn format_tsv_line(bx: &BoxRef) -> String {
         render::escape_printable_path(bx.get_project_dir()),
         render::escape_printable_path(bx.get_dir())
     )
+}
+
+#[derive(serde::Serialize)]
+struct BoxEntry<'a> {
+    name: &'a str,
+    state: state::BoxState,
+    project_dir: &'a Path,
+    dir: &'a Path,
 }
 
 fn list_boxes_of_project(project_dir: &Path) -> Result<Vec<BoxRef>> {
@@ -168,5 +191,26 @@ mod tests {
             ],
             "{line}"
         );
+    }
+
+    #[test]
+    fn a_json_listing_is_an_array_with_promised_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::sys::TestHome::new();
+        let bx = BoxRef::resolve(dir.path(), "dev").unwrap();
+        std::fs::create_dir_all(bx.get_dir()).unwrap();
+        std::fs::write(bx.get_dir().join(crate::state::ROOTFS_FILE), b"image").unwrap();
+
+        let entries = vec![BoxEntry {
+            name: bx.get_name(),
+            state: bx.get_state(),
+            project_dir: bx.get_project_dir(),
+            dir: bx.get_dir(),
+        }];
+        let json = serde_json::to_string(&entries).unwrap();
+        assert!(json.contains(r#""name":"dev""#));
+        assert!(json.contains(r#""state":"stopped""#));
+        assert!(json.contains(&format!(r#""project_dir":"{}""#, dir.path().display())));
+        assert!(json.contains(&format!(r#""dir":"{}""#, bx.get_dir().display())));
     }
 }

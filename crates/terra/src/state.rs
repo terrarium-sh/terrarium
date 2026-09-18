@@ -473,6 +473,8 @@ pub fn read_origin(project: &Path) -> Option<PathBuf> {
 }
 
 /// Whether a box has a guest filesystem, and whether a terra is holding it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BoxState {
     Running,
     SettingUp,
@@ -488,9 +490,9 @@ impl std::fmt::Display for BoxState {
         // asks for.
         f.pad(match self {
             BoxState::Running => "running",
-            BoxState::SettingUp => "setting-up",
+            BoxState::SettingUp => "setting_up",
             BoxState::Stopped => "stopped",
-            BoxState::NotCreated => "not-created",
+            BoxState::NotCreated => "not_created",
             BoxState::Gone => "gone",
         })
     }
@@ -680,6 +682,27 @@ mod tests {
                 "{word:?} is not a single word"
             );
         }
+    }
+
+    #[test]
+    fn box_state_serializes_to_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&BoxState::Running).unwrap(),
+            "\"running\""
+        );
+        assert_eq!(
+            serde_json::to_string(&BoxState::SettingUp).unwrap(),
+            "\"setting_up\""
+        );
+        assert_eq!(
+            serde_json::to_string(&BoxState::Stopped).unwrap(),
+            "\"stopped\""
+        );
+        assert_eq!(
+            serde_json::to_string(&BoxState::NotCreated).unwrap(),
+            "\"not_created\""
+        );
+        assert_eq!(serde_json::to_string(&BoxState::Gone).unwrap(), "\"gone\"");
     }
 
     #[test]

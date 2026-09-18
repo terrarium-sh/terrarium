@@ -253,9 +253,10 @@ pub fn request_recipe_approval(
                 ));
             }
             for s in &sensitive_mounts {
-                let access = match s.mount.readonly {
-                    true =>  "read-only",
-                    false => "read-write"
+                let access = if s.mount.readonly {
+                    "read-only"
+                } else {
+                    "read-write"
                 };
                 warnings.push(format!(
                     "WARNING: mount '{}' shares sensitive host {} ({access}) with the sandbox.",

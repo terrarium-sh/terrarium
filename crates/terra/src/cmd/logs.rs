@@ -96,6 +96,43 @@ impl LogText {
     }
 }
 
+fn seek_to_tail<F: std::io::Read + std::io::Seek>(f: &mut F, lines: usize) -> std::io::Result<()> {
+    let len = f.seek(std::io::SeekFrom::End(0))?;
+    if len == 0 || lines == 0 {
+        return Ok(());
+    }
+    let mut found = 0;
+    let mut cursor = len;
+    let mut buf = [0u8; 4096];
+    let mut at_end = true;
+
+    while cursor > 0 {
+        let chunk_size = usize::try_from(cursor).map_or(buf.len(), |c| c.min(buf.len()));
+        cursor -= chunk_size as u64;
+        f.seek(std::io::SeekFrom::Start(cursor))?;
+        f.read_exact(&mut buf[..chunk_size])?;
+
+        for (i, &byte) in buf[..chunk_size].iter().enumerate().rev() {
+            let file_offset = cursor + i as u64;
+            if at_end {
+                at_end = false;
+                if byte == b'\n' {
+                    continue;
+                }
+            }
+            if byte == b'\n' {
+                found += 1;
+                if found == lines {
+                    f.seek(std::io::SeekFrom::Start(file_offset + 1))?;
+                    return Ok(());
+                }
+            }
+        }
+    }
+    f.seek(std::io::SeekFrom::Start(0))?;
+    Ok(())
+}
+
 fn write_log(
     args: &crate::cli::LogsArgs,
     name: Option<&str>,
@@ -115,6 +152,9 @@ fn write_log(
     let mut out = std::io::stdout();
     let mut text = LogText::default();
     let mut f = std::fs::File::open(&log).with_context(|| format!("opening {}", log.display()))?;
+    if let Some(tail) = args.tail {
+        seek_to_tail(&mut f, tail).context("seeking to tail")?;
+    }
     if !args.follow {
         text.drain(&mut f, &mut out).context("streaming log")?;
         text.finish(&mut out)?;
@@ -194,5 +234,55 @@ mod tests {
         let mut old = String::new();
         f.read_to_string(&mut old).unwrap();
         assert_eq!(old, "grown in place", "the old generation stays readable");
+    }
+
+    #[test]
+    fn seek_to_tail_positions_at_last_n_lines() {
+        use std::io::Cursor;
+
+        let content = b"line 1\nline 2\nline 3\nline 4\n";
+        let mut cur = Cursor::new(content.to_vec());
+
+        seek_to_tail(&mut cur, 2).unwrap();
+        let mut out = String::new();
+        cur.read_to_string(&mut out).unwrap();
+        assert_eq!(out, "line 3\nline 4\n");
+
+        cur.set_position(0);
+        seek_to_tail(&mut cur, 1).unwrap();
+        out.clear();
+        cur.read_to_string(&mut out).unwrap();
+        assert_eq!(out, "line 4\n");
+
+        cur.set_position(0);
+        seek_to_tail(&mut cur, 10).unwrap();
+        out.clear();
+        cur.read_to_string(&mut out).unwrap();
+        assert_eq!(out, "line 1\nline 2\nline 3\nline 4\n");
+
+        cur.set_position(0);
+        seek_to_tail(&mut cur, 0).unwrap();
+        out.clear();
+        cur.read_to_string(&mut out).unwrap();
+        assert_eq!(out, "");
+
+        let content_no_nl = b"first\nsecond\nthird";
+        let mut cur = Cursor::new(content_no_nl.to_vec());
+        seek_to_tail(&mut cur, 1).unwrap();
+        out.clear();
+        cur.read_to_string(&mut out).unwrap();
+        assert_eq!(out, "third");
+
+        cur.set_position(0);
+        seek_to_tail(&mut cur, 2).unwrap();
+        out.clear();
+        cur.read_to_string(&mut out).unwrap();
+        assert_eq!(out, "second\nthird");
+
+        let mut cur = Cursor::new(Vec::new());
+        seek_to_tail(&mut cur, 5).unwrap();
+        out.clear();
+        cur.read_to_string(&mut out).unwrap();
+        assert_eq!(out, "");
     }
 }
