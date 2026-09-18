@@ -87,6 +87,75 @@ pub(crate) fn resolve_mounts(cfg: &config::Config, bx: &BoxRef) -> Result<Vec<co
     Ok(mounts)
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SensitiveMount<'a> {
+    pub mount: &'a config::Mount,
+    pub sensitive_path: PathBuf,
+    pub category: &'static str,
+}
+
+pub(crate) struct SensitiveTarget {
+    pub path: PathBuf,
+    pub category: &'static str,
+}
+
+fn sensitive_targets() -> Vec<SensitiveTarget> {
+    let mut targets = Vec::new();
+    if let Ok(home) = crate::sys::resolve_home_dir() {
+        for (rel, category) in [
+            (".ssh", "SSH keys and configuration"),
+            (".aws", "AWS credentials"),
+            (".gnupg", "GnuPG keys"),
+            (".docker", "Docker credentials"),
+            (".kube", "Kubernetes cluster credentials"),
+            (".config/gcloud", "Google Cloud credentials"),
+            (".azure", "Azure credentials"),
+        ] {
+            targets.push(SensitiveTarget {
+                path: canonicalize_existing_prefix(&home.join(rel)),
+                category,
+            });
+        }
+    }
+    for (path, category) in [
+        ("/etc/shadow", "host shadow passwords"),
+        ("/etc/sudoers", "host sudo rules"),
+        ("/etc/sudoers.d", "host sudo rules"),
+        ("/etc/pam.d", "host PAM authentication rules"),
+    ] {
+        targets.push(SensitiveTarget {
+            path: canonicalize_existing_prefix(Path::new(path)),
+            category,
+        });
+    }
+    targets
+}
+
+pub(crate) fn find_sensitive_mounts_with_targets<'a>(
+    mounts: &'a [config::Mount],
+    targets: &[SensitiveTarget],
+) -> Vec<SensitiveMount<'a>> {
+    let mut sensitive = Vec::new();
+    for m in mounts {
+        let host = canonicalize_existing_prefix(&m.host);
+        for target in targets {
+            if host.starts_with(&target.path) || target.path.starts_with(&host) {
+                sensitive.push(SensitiveMount {
+                    mount: m,
+                    sensitive_path: target.path.clone(),
+                    category: target.category,
+                });
+                break;
+            }
+        }
+    }
+    sensitive
+}
+
+pub(crate) fn find_sensitive_mounts(mounts: &[config::Mount]) -> Vec<SensitiveMount<'_>> {
+    find_sensitive_mounts_with_targets(mounts, &sensitive_targets())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct PinnedPaths {
     mounts: Vec<PathBuf>,
@@ -616,5 +685,65 @@ mod tests {
             validate_mounts_against_terra_paths(&build_mounts(exe.parent().unwrap(), true), &b)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn sensitive_mounts_are_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let ssh_dir = dir.path().join(".ssh");
+        std::fs::create_dir_all(&ssh_dir).unwrap();
+        let id_rsa = ssh_dir.join("id_rsa");
+        std::fs::write(&id_rsa, "secret").unwrap();
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let targets = vec![
+            SensitiveTarget {
+                path: ssh_dir.clone(),
+                category: "SSH keys and configuration",
+            },
+            SensitiveTarget {
+                path: PathBuf::from("/etc/shadow"),
+                category: "host shadow passwords",
+            },
+        ];
+
+        let mounts = vec![
+            config::Mount {
+                host: ssh_dir.clone(),
+                guest: PathBuf::from("/ssh"),
+                readonly: false,
+            },
+            config::Mount {
+                host: id_rsa.clone(),
+                guest: PathBuf::from("/key"),
+                readonly: true,
+            },
+            config::Mount {
+                host: project_dir,
+                guest: PathBuf::from("/src"),
+                readonly: false,
+            },
+        ];
+
+        let sensitive = find_sensitive_mounts_with_targets(&mounts, &targets);
+        assert_eq!(sensitive.len(), 2);
+        assert_eq!(sensitive[0].mount.host, ssh_dir);
+        assert!(!sensitive[0].mount.readonly);
+        assert_eq!(sensitive[0].category, "SSH keys and configuration");
+
+        assert_eq!(sensitive[1].mount.host, id_rsa);
+        assert!(sensitive[1].mount.readonly);
+        assert_eq!(sensitive[1].category, "SSH keys and configuration");
+    }
+
+    #[test]
+    fn default_sensitive_targets_scans_mounts() {
+        let mounts = vec![config::Mount {
+            host: PathBuf::from("/tmp"),
+            guest: PathBuf::from("/work"),
+            readonly: false,
+        }];
+        assert!(find_sensitive_mounts(&mounts).is_empty());
     }
 }

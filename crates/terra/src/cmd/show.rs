@@ -40,7 +40,20 @@ pub fn run(
         );
     }
     match mount::resolve_mounts(&cfg, &target.bx) {
-        Ok(mounts) => cfg.mounts = mounts,
+        Ok(mounts) => {
+            for s in mount::find_sensitive_mounts(&mounts) {
+                let access = match s.mount.readonly {
+                    true =>  "read-only",
+                    false => "read-write"
+                };
+                eprintln!(
+                    "terra: warning: mount '{}' shares sensitive host {} ({access}) with the sandbox",
+                    render::escape_printable_path(&s.mount.host),
+                    s.category
+                );
+            }
+            cfg.mounts = mounts;
+        }
         Err(e) => eprintln!("terra: warning: `terra setup` would refuse this recipe:\n{e:#}"),
     }
     let yaml = if args.with_env_values {
@@ -156,5 +169,29 @@ mod tests {
         config::resolve_env_file(&mut cfg).unwrap();
         config::merge_env_file(&mut cfg).unwrap();
         assert_eq!(cfg.env["API_KEY"], "sk-1");
+    }
+
+    #[test]
+    fn show_prints_recipe_with_sensitive_mounts() {
+        let home = crate::sys::TestHome::new();
+        let ssh_dir = home.get_path().join(".ssh");
+        std::fs::create_dir_all(&ssh_dir).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("dev.yaml"),
+            format!(
+                "mounts:\n  - host: {}\n    guest: /ssh\n    readonly: true\n",
+                ssh_dir.display()
+            ),
+        )
+        .unwrap();
+
+        let show = crate::cli::ShowArgs {
+            with_env_values: false,
+        };
+        assert!(run(&show, Some("./dev.yaml"), &project, &project).is_ok());
     }
 }

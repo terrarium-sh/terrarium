@@ -230,6 +230,9 @@ pub fn request_recipe_approval(
             std::fs::read_to_string(bx.get_dir().join(state::RECIPE_FILE)).unwrap_or_default();
         if r.text != pinned_text {
             let guest_writable = find_guest_writable_share_containing(&bx, &r.from, via_manifest);
+            let sensitive_mounts = mount::find_sensitive_mounts(&cfg.mounts);
+            let has_readwrite_sensitive = sensitive_mounts.iter().any(|s| !s.mount.readonly);
+            let is_suspect = guest_writable.is_some() || has_readwrite_sensitive;
             let lead = match approval {
                 // A dry run's refusal reads as the real setup's would.
                 Approval::ChosenByHand { .. } | Approval::Reported => {
@@ -242,11 +245,27 @@ pub fn request_recipe_approval(
                     escape_printable_path(&r.from)
                 ),
             };
-            let warning = guest_writable.as_ref().map(|authorship| {
-                format!("WARNING: {}.", build_adoption_reason(&r.from, authorship))
-            });
+            let mut warnings = Vec::new();
+            if let Some(authorship) = &guest_writable {
+                warnings.push(format!(
+                    "WARNING: {}.",
+                    build_adoption_reason(&r.from, authorship)
+                ));
+            }
+            for s in &sensitive_mounts {
+                let access = match s.mount.readonly {
+                    true =>  "read-only",
+                    false => "read-write"
+                };
+                warnings.push(format!(
+                    "WARNING: mount '{}' shares sensitive host {} ({access}) with the sandbox.",
+                    escape_printable_path(&s.mount.host),
+                    s.category
+                ));
+            }
+            let warning = (!warnings.is_empty()).then(|| warnings.join("\n"));
             put_the_question(
-                decide_pinning(approval, guest_writable.is_some(), is_at_a_terminal),
+                decide_pinning(approval, is_suspect, is_at_a_terminal),
                 &lead,
                 warning.as_deref(),
                 &cfg,
@@ -619,6 +638,60 @@ mod tests {
             .expect("--trust-recipe should pin without asking");
             assert!(approved.new_pin.is_some(), "the recipe should be adopted");
         }
+    }
+
+    #[test]
+    fn readwrite_sensitive_mounts_are_suspect_and_warn_on_pinning() {
+        let home = crate::sys::TestHome::new();
+        let ssh_dir = home.get_path().join(".ssh");
+        std::fs::create_dir_all(&ssh_dir).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let bx = BoxRef::resolve(&project, "dev").unwrap();
+        std::fs::create_dir_all(bx.get_dir()).unwrap();
+
+        let recipe_path = project.join("recipe.yaml");
+        let recipe_text = format!(
+            "mounts:\n  - host: {}\n    guest: /ssh\n    readonly: false\n",
+            ssh_dir.display()
+        );
+        std::fs::write(&recipe_path, &recipe_text).unwrap();
+
+        let target = || ResolvedBox {
+            bx: bx.clone(),
+            source: resolve::Source::File(resolve::Recipe {
+                from: recipe_path.clone(),
+                text: recipe_text.clone(),
+            }),
+            manifest_divergence: None,
+        };
+
+        let err = request_recipe_approval(
+            target(),
+            &Approval::ChosenByHand {
+                trust_recipe: false,
+            },
+            false,
+            true,
+        )
+        .expect_err("read-write sensitive mount must be suspect")
+        .to_string();
+
+        assert!(err.contains("shares sensitive host SSH keys"), "{err}");
+        assert!(err.contains("(read-write)"), "{err}");
+        assert!(err.contains("--trust-recipe"), "{err}");
+
+        let approved = request_recipe_approval(
+            target(),
+            &Approval::ChosenByHand { trust_recipe: true },
+            false,
+            true,
+        )
+        .expect("--trust-recipe should pin with sensitive mount");
+        assert!(approved.new_pin.is_some());
     }
 
     #[test]
