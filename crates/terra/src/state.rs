@@ -1201,7 +1201,7 @@ mod tests {
         assert!(matches!(b.get_state(), BoxState::Running));
         let marked = b.mark_baking(&lock);
         assert!(matches!(b.get_state(), BoxState::SettingUp));
-        assert_eq!(b.get_state().to_string(), "setting-up");
+        assert_eq!(b.get_state().to_string(), "setting_up");
         drop(marked);
         drop(lock);
 

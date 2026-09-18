@@ -747,7 +747,7 @@ fn ls_reports_a_state_line_per_box() {
     std::fs::write(dir.path().join("b.yaml"), "hw:\n  cpus: 1\n").unwrap();
     let declared = run_terra_in(dir.path(), home.path(), &["ls"]);
     let stdout = String::from_utf8_lossy(&declared.stdout);
-    assert!(stdout.contains("not-created"), "{stdout}");
+    assert!(stdout.contains("not_created"), "{stdout}");
     assert!(stdout.contains('b'), "{stdout}");
     assert!(!stdout.contains("files:"), "{stdout}");
 
@@ -761,7 +761,7 @@ fn ls_reports_a_state_line_per_box() {
     let created = run_terra_in(dir.path(), home.path(), &["ls"]);
     let stdout = String::from_utf8_lossy(&created.stdout);
     assert!(stdout.contains("stopped"), "{stdout}");
-    assert!(!stdout.contains("not-created"), "{stdout}");
+    assert!(!stdout.contains("not_created"), "{stdout}");
     // A box on disk says where its files are - the state dir's name is a hash,
     // so nothing else can.
     assert!(
