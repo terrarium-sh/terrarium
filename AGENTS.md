@@ -10,8 +10,7 @@
     cargo test --workspace # Use `cargo test -p terra --lib` for terra units
     ```
 *   **CLI Updates:** `crates/terra/src/cli.rs` is the source of truth for the man
-    pages and completions; `make man` re-renders them (they are generated, not
-    committed).
+    pages; `make man` re-renders them (they are generated, not committed).
 *   **Boot Tests:** Requires `/dev/kvm`. Run: `make dist && TERRA_BIN=$PWD/dist/terra cargo test -p terra --test boot -- --ignored`
 
 ## Threat model
@@ -114,7 +113,7 @@ invariant nothing enforces — reword as intent or delete.
     shared stems and parts of speech aligned across an API.
 *   **Avoid Shadowing:** Do not name a local variable the same as a module it calls (e.g., don't use `state` if calling `state::get()`).
 *   **Extract Closures:** Turn complex inline closures into named functions.
-*   **CLI Flags:** Name them for what they actually do (`--rebuild`), not past usage (`--force`). Update the README and completions when renaming.
+*   **CLI Flags:** Name them for what they actually do (`--rebuild`), not past usage (`--force`). Update the README when renaming.
 
 ## Structure
 

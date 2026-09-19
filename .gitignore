@@ -4,10 +4,8 @@
 /build
 **/*.rs.bk
 
-# Man pages and shell completions rendered from the clap CLI by
-# crates/terra/examples/gen-docs.rs.
+# Man pages rendered from the clap CLI by crates/terra/examples/gen-docs.rs.
 /packaging/man/
-/packaging/completions/
 
 .box
 

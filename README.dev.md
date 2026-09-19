@@ -149,11 +149,12 @@ tested artifact, host, commands, and results for the 2026-09-13 review.
 
 ```sh
 make verify                 # component builds/tests, kernel-tool tests, fmt, Clippy, rustdoc, workspace tests
-make man                    # generated man pages and shell completions
+make man                    # generated man pages
 ```
 
 [crates/terra/src/cli.rs](crates/terra/src/cli.rs) is the source of truth for
-CLI help, man pages and completions. Generated files are not committed.
+CLI help, man pages and completions (`terra completions <shell>`). Generated man
+pages are not committed.
 After build assets exist, the native Rust fast path is:
 
 ```sh

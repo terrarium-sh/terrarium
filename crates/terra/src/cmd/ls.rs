@@ -239,13 +239,12 @@ mod tests {
             },
         ];
         let json = serde_json::to_string(&entries).unwrap();
-        assert!(json.contains(r#""name":"dev""#));
-        assert!(json.contains(r#""state":"stopped""#));
-        assert!(json.contains(&format!(r#""project_dir":"{}""#, dir.path().display())));
-        assert!(json.contains(&format!(r#""dir":"{}""#, bx.get_dir().display())));
-        assert!(json.contains(r#""pid":1234"#));
-        assert!(json.contains(r#""process_identity":5678"#));
         let parsed: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0]["name"], "dev");
+        assert_eq!(parsed[0]["state"], "stopped");
+        assert_eq!(parsed[0]["project_dir"], dir.path().to_str().unwrap());
+        assert_eq!(parsed[0]["dir"], bx.get_dir().to_str().unwrap());
         assert!(parsed[0].get("pid").is_none());
         assert!(parsed[0].get("process_identity").is_none());
         assert_eq!(parsed[1]["pid"], 1234);

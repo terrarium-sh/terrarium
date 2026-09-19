@@ -6,8 +6,8 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
-# `examples/gen-docs.rs` renders man pages and completions from the same clap
-# types the binary parses with; examples reach those only through a lib target.
+# `examples/gen-docs.rs` renders man pages from the same clap types the binary
+# parses with; examples reach those only through a lib target.
 [lib]
 name = "terra"
 path = "src/lib.rs"
@@ -24,6 +24,7 @@ terra-io = { path = "../terra-io" }
 terra-limits = { path = "../terra-limits" }
 terra-protocol = { path = "../terra-protocol" }
 clap.workspace = true
+clap_complete = "4"
 anyhow.workspace = true
 serde.workspace = true
 yaml_serde.workspace = true
@@ -48,7 +49,6 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Network
 
 [dev-dependencies]
 clap_mangen = "0.3"
-clap_complete = "4"
 tempfile.workspace = true
 
 [lints]

@@ -71,5 +71,6 @@ pub async fn run() -> Result<ExitCode> {
         Some(Cmd::Logs(a)) => cmd::logs::run(a, name, &project_dir),
         Some(Cmd::Sessions(a)) => cmd::sessions::run(a, name, &project_dir),
         Some(Cmd::Detach(a)) => cmd::detach::run(a, name, &project_dir),
+        Some(Cmd::Completions(a)) => cmd::completions::run(a),
     }
 }

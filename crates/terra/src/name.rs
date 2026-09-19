@@ -6,8 +6,21 @@ use std::ffi::OsStr;
 use std::path::Path;
 
 pub(crate) const RESERVED_NAMES: &[&str] = &[
-    "detach", "exec", "get", "help", "logs", "ls", "ps", "put", "rm", "sessions", "setup", "show",
-    "stop", "storage",
+    "completions",
+    "detach",
+    "exec",
+    "get",
+    "help",
+    "logs",
+    "ls",
+    "ps",
+    "put",
+    "rm",
+    "sessions",
+    "setup",
+    "show",
+    "stop",
+    "storage",
 ];
 
 pub(crate) fn is_recipe_ext(extension: &OsStr) -> bool {

@@ -1,6 +1,5 @@
 //! The command line, as clap types. `examples/gen-docs.rs` (`make man`) renders
-//! the man pages and completions from these, so this is the single source of
-//! truth for both.
+//! the man pages from these, so this is the single source of truth.
 
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use std::path::PathBuf;
@@ -80,7 +79,7 @@ fn build_reversal_hint(typed: &[String]) -> Option<String> {
     let (verb_idx, verb) = typed.iter().enumerate().find_map(|(i, arg)| {
         let sub = command.find_subcommand(arg)?;
         let name = sub.get_name();
-        (!matches!(name, "ls" | "help")).then_some((i, name))
+        (!matches!(name, "ls" | "completions" | "help")).then_some((i, name))
     })?;
 
     for (idx, arg) in typed.iter().enumerate() {
@@ -193,6 +192,11 @@ pub enum Cmd {
     /// Throw a box away: its guest filesystem, volumes, logs and sockets. The
     /// recipe is kept, so `terra <box>` can build it again from scratch.
     Rm(RmArgs),
+    /// Output shell completion code for the specified shell.
+    #[command(after_long_help = "EXAMPLES:\n    \
+                                 source <(terra completions bash)\n    \
+                                 eval \"$(terra completions zsh)\"")]
+    Completions(CompletionsArgs),
 }
 
 impl Cmd {
@@ -210,6 +214,7 @@ impl Cmd {
             Self::Stop(_) => "stop",
             Self::Storage(_) => "storage",
             Self::Rm(_) => "rm",
+            Self::Completions(_) => "completions",
         }
     }
 
@@ -228,7 +233,7 @@ impl Cmd {
             | Cmd::Stop(_)
             | Cmd::Storage(_)
             | Cmd::Rm(_) => true,
-            Cmd::Ls(_) => false,
+            Cmd::Ls(_) | Cmd::Completions(_) => false,
         }
     }
 }
@@ -474,6 +479,13 @@ pub struct BootArgs {
     pub command: Vec<String>,
 }
 
+#[derive(Args, Debug)]
+pub struct CompletionsArgs {
+    /// Target shell for completions.
+    #[arg(value_enum)]
+    pub shell: clap_complete::Shell,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -670,13 +682,10 @@ mod tests {
         );
     }
 
-    /// `ls` is about the directory rather than one box, and it is the only verb
-    /// that is: a box written before it would be read silently, so it is
-    /// refused with the spelling that works. Every other verb takes the box,
-    /// which is what makes the grammar one rule with one exception instead of
-    /// two orders.
+    /// `ls` and `completions` take no box: a box written before them is refused
+    /// with the spelling that works. Every other verb takes the box.
     #[test]
-    fn ls_is_the_only_verb_that_takes_no_box() {
+    fn ls_and_completions_take_no_box() {
         let err = Cli::parse_from(["terra", "dev", "ls"])
             .validate()
             .expect_err("`ls` takes no box")
@@ -684,9 +693,21 @@ mod tests {
         assert!(err.contains("terra ls"), "{err}");
         assert!(Cli::parse_from(["terra", "ls", "--all"]).validate().is_ok());
 
+        let err = Cli::parse_from(["terra", "dev", "completions", "bash"])
+            .validate()
+            .expect_err("`completions` takes no box")
+            .to_string();
+        assert!(err.contains("terra completions"), "{err}");
+
+        let parsed = Cli::parse_from(["terra", "completions", "bash"]);
+        assert!(parsed.validate().is_ok());
+        let Some(Cmd::Completions(args)) = parsed.cmd else {
+            panic!("expected completions");
+        };
+        assert_eq!(args.shell, clap_complete::Shell::Bash);
+
         // Both ways, off the verbs themselves: a new verb that quietly took no
-        // box - or a second `ls` - fails here rather than reading a box name
-        // nobody meant.
+        // box fails here rather than reading a box name nobody meant.
         for sub in Cli::command().get_subcommands() {
             let word = sub.get_name();
             let Ok(Some(cmd)) = Cli::try_parse_from(["terra", word]).map(|c| c.cmd) else {
@@ -694,8 +715,8 @@ mod tests {
             };
             assert_eq!(
                 cmd.takes_the_box(),
-                word != "ls",
-                "'{word}' disagrees with the one exception"
+                word != "ls" && word != "completions",
+                "'{word}' disagrees with taking no box"
             );
         }
     }
@@ -777,6 +798,7 @@ mod tests {
             &["logs"],
             &["sessions"],
             &["detach", "--all"],
+            &["completions", "bash"],
         ];
         let mut worded: Vec<&str> = Vec::new();
         for argv in typed {

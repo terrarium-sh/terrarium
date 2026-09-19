@@ -302,10 +302,9 @@ $(COMPONENT_AOT_TARGETS): component-%-aot: component-%
 test-component-boot: $(COMPONENT_AOT_TARGETS) $(KERNEL_GZ) $(ROOTFS_IMG) $(BOOT_IMG)
 	$(CARGO_LOCKED) test -p terra-platform --lib -- --ignored --nocapture
 
-## Format check, lints, and the test suite. Generating the man pages and
-## completions is `man`'s job, not this one's — a test that writes to the
-## working tree is a surprise nobody wants from `cargo test`. The boot suite is
-## separate:
+## Format check, lints, and the test suite. Generating the man pages is
+## `man`'s job, not this one's — a test that writes to the working tree is a
+## surprise nobody wants from `cargo test`. The boot suite is separate:
 ## `make dist && TERRA_BIN=$PWD/dist/terra cargo test -p terra --test boot -- --ignored`
 ## (needs /dev/kvm).
 verify: verify-components verify-workspace
@@ -344,9 +343,9 @@ verify-components verify-host-components:
 check-zig:
 	@test "$$(zig version)" = "$(ZIG_VERSION)" || { echo "need Zig $(ZIG_VERSION), found $$(zig version)" >&2; exit 1; }
 
-## Regenerate man pages + shell completions from the clap CLI. Rendering lives in
-## crates/terra/examples/gen-docs.rs so clap_mangen/clap_complete stay
-## dev-dependencies, out of the release build's dependency graph.
+## Regenerate man pages from the clap CLI. Rendering lives in
+## crates/terra/examples/gen-docs.rs so clap_mangen stays a dev-dependency,
+## out of the release build's dependency graph.
 man:
 	$(CARGO_LOCKED) run -p terra --example gen-docs --target $(TERRA_TARGET)
 
@@ -363,7 +362,7 @@ dist host-dist:
 	install -m 755 target/$(TERRA_TARGET)/release/terra $(DIST)/terra
 	install -m 644 LICENSE NOTICE $(DIST)
 	install -m 644 packaging/licenses/GPL-2.0.txt packaging/licenses/applevisor-MIT.txt packaging/licenses/uds_windows-MIT.txt packaging/licenses/uds_windows-THIRDPARTYNOTICES.txt $(DIST)/LICENSES
-	cp -R packaging/man packaging/completions $(DIST)
+	cp -R packaging/man $(DIST)
 	@echo "assembled $(DIST)/terra for $(TERRA_TARGET)"
 
 ## Source inputs for the GPL programs embedded in a release. The release

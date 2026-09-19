@@ -63,4 +63,4 @@ New-Item -ItemType Directory -Force dist/LICENSES | Out-Null
 Copy-Item "target/$Target/release/terra.exe" dist/terra.exe
 Copy-Item LICENSE, NOTICE dist
 Copy-Item packaging/licenses/GPL-2.0.txt, packaging/licenses/applevisor-MIT.txt, packaging/licenses/uds_windows-MIT.txt, packaging/licenses/uds_windows-THIRDPARTYNOTICES.txt dist/LICENSES
-Copy-Item -Recurse -Force packaging/man, packaging/completions dist
+Copy-Item -Recurse -Force packaging/man dist

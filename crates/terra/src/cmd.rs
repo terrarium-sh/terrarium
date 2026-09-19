@@ -1,5 +1,6 @@
 //! One file per command: each holds its `run` and the machinery only it uses.
 
+pub mod completions;
 pub mod detach;
 pub mod exec;
 pub mod logs;
