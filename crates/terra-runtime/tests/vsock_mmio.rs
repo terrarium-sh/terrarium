@@ -192,7 +192,6 @@ async fn posted_receive_queue_drains_handshake_and_plan_without_a_second_bell() 
             ram.clone(),
             include_bytes!("../../../build/terra-vsock-component.cwasm"),
             plan_frame(),
-            false,
             None,
             None,
             None,

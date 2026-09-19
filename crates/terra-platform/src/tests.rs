@@ -1576,7 +1576,7 @@ fn boot_plan(
     await_initial_session: bool,
 ) -> Vec<u8> {
     use std::collections::BTreeMap;
-    use terra_protocol::{LifecycleProtocol, Net, Plan, encode_frame};
+    use terra_protocol::{Net, Plan, encode_frame};
     let plan = Plan {
         mode,
         workdir: None,
@@ -1597,9 +1597,7 @@ fn boot_plan(
         daemons: Vec::new(),
         workload,
         sandbox_info: String::new(),
-        workload_on_console: false,
         await_initial_session,
-        lifecycle_protocol: LifecycleProtocol::EventsV1,
         host_tz: None,
         host_time: None,
         host_seed: None,
@@ -1899,7 +1897,7 @@ fn assert_agent_control_and_exec(path: &std::path::Path) -> std::io::Result<()> 
             format!("connecting session-control service: {error}"),
         )
     })?;
-    control.write_all(&[AgentService::SessionControl.to_byte()])?;
+    control.write_all(&encode_frame(&AgentService::SessionControl)?)?;
     control.write_all(&encode_frame(&ControlRequest::List)?)?;
     let control_reply = read_frame::<ControlReply>(&mut control).map_err(|error| {
         std::io::Error::new(
@@ -1927,7 +1925,7 @@ fn agent_exec(path: &std::path::Path, argv: &[&str]) -> std::io::Result<Vec<u8>>
     let mut exec = connect_agent(path).map_err(|error| {
         std::io::Error::new(error.kind(), format!("connecting exec service: {error}"))
     })?;
-    exec.write_all(&[AgentService::Exec.to_byte()])?;
+    exec.write_all(&encode_frame(&AgentService::Exec)?)?;
     exec.write_all(&encode_frame(&ExecRequest {
         argv: argv.iter().map(ToString::to_string).collect(),
         as_root: true,
@@ -1959,10 +1957,10 @@ fn agent_exec(path: &std::path::Path, argv: &[&str]) -> std::io::Result<Vec<u8>>
 
 fn await_foreground_workload(path: &std::path::Path) -> std::io::Result<(Vec<u8>, i32)> {
     use std::io::Write as _;
-    use terra_protocol::{AgentOutput, AgentService, read_frame};
+    use terra_protocol::{AgentOutput, AgentService, encode_frame, read_frame};
 
     let mut session = connect_agent(path)?;
-    session.write_all(&[AgentService::Session.to_byte()])?;
+    session.write_all(&encode_frame(&AgentService::Session)?)?;
     let mut output = Vec::new();
     loop {
         match read_frame::<AgentOutput>(&mut session)? {

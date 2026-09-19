@@ -5,12 +5,13 @@ use crate::state::{BoxRef, Holder};
 use crate::sys::POLL;
 use anyhow::{Context, Result};
 use std::io::{Read, Write};
-use std::net::Shutdown;
 #[cfg(unix)]
 use std::os::fd::AsFd;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use terra_io::local::AsyncLocalStream;
+#[cfg(test)]
 use terra_io::local::LocalStream;
 use terra_protocol::{self as protocol, AgentOutput, AgentService, ClientInput, TermSize};
 
@@ -46,15 +47,15 @@ pub enum SessionOutcome {
 }
 
 /// Connect to the agent and select `service`, returning the stream once the
-/// agent's hello has been consumed and the service byte written. Retried until
+/// agent's hello has been consumed and the service frame written. Retried until
 /// then: the VMM binds the socket before guest PID 1 runs, and a stale socket
 /// outlives the stopped VM.
-pub fn connect_to_agent(
+pub async fn connect_to_agent(
     bx: &BoxRef,
     service: AgentService,
     what: &str,
     mut still_waiting: impl FnMut() -> Result<()>,
-) -> Result<LocalStream> {
+) -> Result<AsyncLocalStream> {
     let sock = bx.get_dir().join(crate::state::AGENT_SOCKET);
     let mut hint_at = Some(Instant::now() + SILENT_BOOT_GRACE);
     let mut last_connect_error = None;
@@ -73,14 +74,19 @@ pub fn connect_to_agent(
             }
             return Err(error);
         }
-        match LocalStream::connect(&sock) {
-            Err(error) => last_connect_error = Some(error.to_string()),
-            Ok(stream) => {
-                stream
-                    .set_read_timeout(Some(AGENT_HELLO_WAIT_TIMEOUT))
-                    .context("setting the agent handshake timeout")?;
+        match tokio::time::timeout(AGENT_HELLO_WAIT_TIMEOUT, AsyncLocalStream::connect(&sock)).await
+        {
+            Err(_) => last_connect_error = Some("connection attempt timed out".to_owned()),
+            Ok(Err(error)) => last_connect_error = Some(error.to_string()),
+            Ok(Ok(mut stream)) => {
                 let mut magic = [0];
-                if (&stream).read_exact(&mut magic).is_ok() {
+                if tokio::time::timeout(
+                    AGENT_HELLO_WAIT_TIMEOUT,
+                    tokio::io::AsyncReadExt::read_exact(&mut stream, &mut magic),
+                )
+                .await
+                .is_ok_and(|result| result.is_ok())
+                {
                     anyhow::ensure!(
                         magic[0] == protocol::AGENT_HELLO[0],
                         "the agent in {bx} does not speak this terra's protocol - \
@@ -88,7 +94,13 @@ pub fn connect_to_agent(
                         name = bx.get_name()
                     );
                     let mut version = [0];
-                    if (&stream).read_exact(&mut version).is_err() {
+                    if tokio::time::timeout(
+                        AGENT_HELLO_WAIT_TIMEOUT,
+                        tokio::io::AsyncReadExt::read_exact(&mut stream, &mut version),
+                    )
+                    .await
+                    .is_err()
+                    {
                         continue;
                     }
                     anyhow::ensure!(
@@ -97,28 +109,28 @@ pub fn connect_to_agent(
                      `terra {name} stop` and start it again on this build",
                         name = bx.get_name()
                     );
-                    stream
-                        .set_read_timeout(None)
-                        .context("clearing the agent handshake timeout")?;
-                    if (&stream).write_all(&[service.to_byte()]).is_ok() {
+                    if protocol::write_frame_async(&mut stream, &service)
+                        .await
+                        .is_ok()
+                    {
                         return Ok(stream);
                     }
                 }
             }
         }
-        std::thread::sleep(POLL);
+        tokio::time::sleep(POLL).await;
     }
 }
 
-pub fn connect_to_running_agent(
+pub async fn connect_to_running_agent(
     bx: &BoxRef,
     verb: &str,
     service: AgentService,
     what: &str,
     timeout: Option<u64>,
-) -> Result<LocalStream> {
+) -> Result<AsyncLocalStream> {
     ensure_running(bx, verb)?;
-    connect_to_agent(bx, service, what, wait_while_running(bx, timeout))
+    connect_to_agent(bx, service, what, wait_while_running(bx, timeout)).await
 }
 
 pub fn still_serving(bx: &BoxRef, stopped: &str) -> Result<()> {
@@ -163,42 +175,48 @@ pub struct SessionClient {
     pub reported_term_size: Option<TermSize>,
 }
 
-fn request_control(
+async fn request_control(
     bx: &BoxRef,
     verb: &str,
     req: &protocol::ControlRequest,
     agent_timeout: Option<u64>,
     ctx: &'static str,
-) -> Result<LocalStream> {
-    let stream = connect_to_running_agent(
+) -> Result<AsyncLocalStream> {
+    let mut stream = connect_to_running_agent(
         bx,
         verb,
         protocol::AgentService::SessionControl,
         "session control service",
         agent_timeout,
-    )?;
-    stream
-        .set_read_timeout(Some(CONTROL_READ_TIMEOUT))
-        .context("setting the session control read timeout")?;
-    let bytes = protocol::encode_frame(req).context(ctx)?;
-    (&stream).write_all(&bytes).context(ctx)?;
+    )
+    .await?;
+    protocol::write_frame_async(&mut stream, req)
+        .await
+        .context(ctx)?;
     Ok(stream)
 }
 
-pub fn list_clients(bx: &BoxRef, agent_timeout: Option<u64>) -> Result<Vec<SessionClient>> {
+pub async fn list_clients(bx: &BoxRef, agent_timeout: Option<u64>) -> Result<Vec<SessionClient>> {
     let mut stream = request_control(
         bx,
         "sessions",
         &protocol::ControlRequest::List,
         agent_timeout,
         "asking for the session's clients",
-    )?;
+    )
+    .await?;
     let mut clients = Vec::new();
     loop {
-        match protocol::read_frame_with_limit::<protocol::ControlReply>(
-            &mut stream,
-            MAX_CONTROL_REPLY_FRAME_BYTES,
-        ) {
+        match tokio::time::timeout(
+            CONTROL_READ_TIMEOUT,
+            protocol::read_frame_async_with_limit::<protocol::ControlReply>(
+                &mut stream,
+                MAX_CONTROL_REPLY_FRAME_BYTES,
+            ),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("reading the session listing timed out"))?
+        {
             Ok(Some(protocol::ControlReply::Client { id, size })) => {
                 if clients.len() == MAX_SESSION_CLIENTS {
                     anyhow::bail!("the agent sent more than {MAX_SESSION_CLIENTS} session clients");
@@ -218,18 +236,25 @@ pub fn list_clients(bx: &BoxRef, agent_timeout: Option<u64>) -> Result<Vec<Sessi
     }
 }
 
-pub fn detach_client(bx: &BoxRef, client_id: u64, agent_timeout: Option<u64>) -> Result<()> {
+pub async fn detach_client(bx: &BoxRef, client_id: u64, agent_timeout: Option<u64>) -> Result<()> {
     let mut stream = request_control(
         bx,
         "detach",
         &protocol::ControlRequest::Detach { id: client_id },
         agent_timeout,
         "asking to detach a client",
-    )?;
-    match protocol::read_frame_with_limit::<protocol::ControlReply>(
-        &mut stream,
-        MAX_CONTROL_REPLY_FRAME_BYTES,
-    ) {
+    )
+    .await?;
+    match tokio::time::timeout(
+        CONTROL_READ_TIMEOUT,
+        protocol::read_frame_async_with_limit::<protocol::ControlReply>(
+            &mut stream,
+            MAX_CONTROL_REPLY_FRAME_BYTES,
+        ),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("reading the detach reply timed out"))?
+    {
         Ok(Some(protocol::ControlReply::Detached { id })) if id == client_id => Ok(()),
         Ok(Some(protocol::ControlReply::Missing { id })) if id == client_id => {
             anyhow::bail!("no client {client_id} is attached to {bx}")
@@ -247,20 +272,27 @@ pub fn detach_client(bx: &BoxRef, client_id: u64, agent_timeout: Option<u64>) ->
     }
 }
 
-pub fn detach_all(bx: &BoxRef, agent_timeout: Option<u64>) -> Result<u64> {
+pub async fn detach_all(bx: &BoxRef, agent_timeout: Option<u64>) -> Result<u64> {
     let mut stream = request_control(
         bx,
         "detach",
         &protocol::ControlRequest::DetachAll,
         agent_timeout,
         "asking to detach every client",
-    )?;
+    )
+    .await?;
     let mut detached = 0;
     loop {
-        match protocol::read_frame_with_limit::<protocol::ControlReply>(
-            &mut stream,
-            MAX_CONTROL_REPLY_FRAME_BYTES,
-        ) {
+        match tokio::time::timeout(
+            CONTROL_READ_TIMEOUT,
+            protocol::read_frame_async_with_limit::<protocol::ControlReply>(
+                &mut stream,
+                MAX_CONTROL_REPLY_FRAME_BYTES,
+            ),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("reading the detach replies timed out"))?
+        {
             Ok(Some(protocol::ControlReply::Detached { .. })) => {
                 if detached == MAX_SESSION_CLIENTS as u64 {
                     anyhow::bail!("the agent sent more than {MAX_SESSION_CLIENTS} detach replies");
@@ -277,60 +309,38 @@ pub fn detach_all(bx: &BoxRef, agent_timeout: Option<u64>) -> Result<u64> {
     }
 }
 
-fn send_frame(writer: &Mutex<LocalStream>, msg: &ClientInput) -> bool {
-    // A poisoned lock means a panic mid-write, which may have left a
-    // half-written frame - appending more would corrupt the stream.
-    let Ok(mut w) = writer.lock() else {
-        return false;
-    };
-    let Ok(bytes) = protocol::encode_frame(msg) else {
-        return false;
-    };
-    w.write_all(&bytes).and_then(|()| w.flush()).is_ok()
+enum Input {
+    Frame(ClientInput),
+    Detach,
 }
 
-/// Send the current terminal size when it differs from `last`; `false` means
-/// the writer is gone.
-fn report_size(writer: &Mutex<LocalStream>, last: &mut Option<TermSize>) -> bool {
-    let Some(s) = read_terminal_size() else {
-        return true;
-    };
-    if *last == Some(s) {
-        return true;
+struct InputReader {
+    completed: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for InputReader {
+    fn drop(&mut self) {
+        self.completed.store(true, Ordering::SeqCst);
     }
-    *last = Some(s);
-    send_frame(writer, &ClientInput::Resize(s))
 }
 
-/// A resize is noticed by polling the size on a timer - one `POLL` late, the
-/// price of not owning the console input a crossterm event reader would
-/// compete with the stdin thread for.
-fn spawn_resize_reporter(
-    writer: Arc<Mutex<LocalStream>>,
-    completed: Arc<AtomicBool>,
-) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
-        let mut last = None;
-        while !completed.load(Ordering::SeqCst) {
-            if !report_size(&writer, &mut last) {
-                break;
-            }
-            std::thread::sleep(POLL);
+impl InputReader {
+    async fn stop(mut self) {
+        self.completed.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = tokio::task::spawn_blocking(move || thread.join()).await;
         }
-    })
+    }
 }
 
-fn spawn_stdin_reader(
-    writer: Arc<Mutex<LocalStream>>,
-    escape: Option<u8>,
-    completed: Arc<AtomicBool>,
-) -> (Arc<AtomicBool>, std::thread::JoinHandle<()>) {
-    let detached = Arc::new(AtomicBool::new(false));
-    let detached_flag = detached.clone();
+fn spawn_stdin_reader(escape: Option<u8>, sender: tokio::sync::mpsc::Sender<Input>) -> InputReader {
+    let completed = Arc::new(AtomicBool::new(false));
+    let stopped = completed.clone();
     let thread = std::thread::spawn(move || {
         let mut stdin = std::io::stdin();
         let mut buf = [0u8; 4096];
-        while !completed.load(Ordering::SeqCst) {
+        while !stopped.load(Ordering::SeqCst) {
             if !input_is_ready(&stdin) {
                 #[cfg(windows)]
                 std::thread::sleep(POLL);
@@ -342,25 +352,25 @@ fn spawn_stdin_reader(
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
             };
-            let escape_at = escape.and_then(|e| buf[..n].iter().position(|b| *b == e));
+            let escape_at = escape.and_then(|key| buf[..n].iter().position(|byte| *byte == key));
             let keys = &buf[..escape_at.unwrap_or(n)];
-            if !keys.is_empty() && !send_frame(&writer, &ClientInput::Keys(keys.to_vec())) {
-                break;
+            if !keys.is_empty()
+                && sender
+                    .blocking_send(Input::Frame(ClientInput::Keys(keys.to_vec())))
+                    .is_err()
+            {
+                return;
             }
             if escape_at.is_some() {
-                detach(&writer, &detached_flag);
-                break;
+                let _ = sender.blocking_send(Input::Detach);
+                return;
             }
         }
-        send_frame(&writer, &ClientInput::Eof);
+        let _ = sender.blocking_send(Input::Frame(ClientInput::Eof));
     });
-    (detached, thread)
-}
-
-fn detach(writer: &Mutex<LocalStream>, detached: &AtomicBool) {
-    detached.store(true, Ordering::SeqCst);
-    if let Ok(stream) = writer.lock() {
-        let _ = stream.shutdown(Shutdown::Both);
+    InputReader {
+        completed,
+        thread: Some(thread),
     }
 }
 
@@ -405,47 +415,6 @@ fn input_is_ready(_stdin: &std::io::Stdin) -> bool {
     }
 }
 
-struct InputThreads {
-    detached: Arc<AtomicBool>,
-    completed: Arc<AtomicBool>,
-    stdin: std::thread::JoinHandle<()>,
-    resize: Option<std::thread::JoinHandle<()>>,
-}
-
-impl InputThreads {
-    fn stop(self, stream: &LocalStream) {
-        self.completed.store(true, Ordering::SeqCst);
-        let _ = stream.shutdown(Shutdown::Both);
-        let _ = self.stdin.join();
-        if let Some(resize) = self.resize {
-            let _ = resize.join();
-        }
-    }
-}
-
-/// The stdin and resize threads of one session, sharing the write half behind
-/// a mutex so their frames cannot interleave. The returned flag is set when
-/// the detach byte ended input.
-fn spawn_input_threads(
-    stream: &LocalStream,
-    escape: Option<u8>,
-    report_resizes: bool,
-) -> Result<InputThreads> {
-    let writer = Arc::new(Mutex::new(
-        stream.try_clone().context("cloning attach socket")?,
-    ));
-    let completed = Arc::new(AtomicBool::new(false));
-    // A piped exec has no terminal whose size could change.
-    let resize = report_resizes.then(|| spawn_resize_reporter(writer.clone(), completed.clone()));
-    let (detached, stdin) = spawn_stdin_reader(writer, escape, completed.clone());
-    Ok(InputThreads {
-        detached,
-        completed,
-        stdin,
-        resize,
-    })
-}
-
 enum PumpResult {
     Exit(i32),
     Detached,
@@ -453,34 +422,108 @@ enum PumpResult {
     Sigpipe,
 }
 
-fn pump_output(
-    mut reader: impl Read,
+async fn output_loop(
+    reader: &mut (impl tokio::io::AsyncRead + Unpin),
     out: &mut dyn Write,
     mut err: Option<&mut dyn Write>,
     ctx: &'static str,
 ) -> Result<PumpResult> {
     loop {
-        match protocol::read_frame::<AgentOutput>(&mut reader) {
-            Ok(Some(AgentOutput::Out(b))) => {
-                if out.write_all(&b).and_then(|()| out.flush()).is_err() {
+        match protocol::read_frame_async::<AgentOutput>(reader).await {
+            Ok(Some(AgentOutput::Out(bytes))) => {
+                if out.write_all(&bytes).and_then(|()| out.flush()).is_err() {
                     return Ok(PumpResult::Sigpipe);
                 }
             }
-            Ok(Some(AgentOutput::Err(b))) => {
+            Ok(Some(AgentOutput::Err(bytes))) => {
                 let sink: &mut dyn Write = match &mut err {
-                    Some(e) => *e as &mut dyn Write,
-                    None => out as &mut dyn Write,
+                    Some(err) => *err,
+                    None => out,
                 };
-                if sink.write_all(&b).and_then(|()| sink.flush()).is_err() {
+                if sink.write_all(&bytes).and_then(|()| sink.flush()).is_err() {
                     return Ok(PumpResult::Sigpipe);
                 }
             }
-            Ok(Some(AgentOutput::Exit { code: c })) => return Ok(PumpResult::Exit(c)),
+            Ok(Some(AgentOutput::Exit { code })) => return Ok(PumpResult::Exit(code)),
             Ok(Some(AgentOutput::Detached)) => return Ok(PumpResult::Detached),
             Ok(None) => return Ok(PumpResult::Closed),
-            Err(e) => return Err(e).context(ctx),
+            Err(error) => return Err(error).context(ctx),
         }
     }
+}
+
+async fn input_loop(
+    mut writer: impl tokio::io::AsyncWrite + Unpin,
+    mut input: tokio::sync::mpsc::Receiver<Input>,
+    report_resizes: bool,
+) -> Result<PumpResult> {
+    let mut input_open = true;
+    let mut last_size = None;
+    let mut resize = tokio::time::interval(POLL);
+    resize.tick().await;
+    loop {
+        tokio::select! {
+            message = input.recv(), if input_open => match message {
+                Some(Input::Frame(input)) => protocol::write_frame_async(&mut writer, &input)
+                    .await
+                    .context("sending terminal input")?,
+                Some(Input::Detach) => {
+                    let _ = tokio::io::AsyncWriteExt::shutdown(&mut writer).await;
+                    return Ok(PumpResult::Detached);
+                }
+                None => input_open = false,
+            },
+            _ = resize.tick(), if report_resizes => {
+                if let Some(size) = read_terminal_size().filter(|size| Some(*size) != last_size) {
+                    last_size = Some(size);
+                    protocol::write_frame_async(&mut writer, &ClientInput::Resize(size))
+                        .await
+                        .context("sending terminal size")?;
+                }
+            },
+            else => std::future::pending::<()>().await,
+        }
+    }
+}
+
+async fn pump_stream(
+    mut reader: impl tokio::io::AsyncRead + Unpin,
+    writer: impl tokio::io::AsyncWrite + Send + Unpin + 'static,
+    input: tokio::sync::mpsc::Receiver<Input>,
+    report_resizes: bool,
+    out: &mut dyn Write,
+    err: Option<&mut dyn Write>,
+    ctx: &'static str,
+) -> Result<PumpResult> {
+    let mut input_loops = tokio::task::JoinSet::new();
+    input_loops.spawn(input_loop(writer, input, report_resizes));
+    let result = tokio::select! {
+        biased;
+        result = output_loop(&mut reader, out, err, ctx) => result,
+        result = input_loops.join_next() => match result {
+            Some(Ok(result)) => result,
+            Some(Err(error)) => Err(error).context("joining terminal input worker"),
+            None => Err(anyhow::anyhow!("terminal input worker ended unexpectedly")),
+        },
+    };
+    input_loops.shutdown().await;
+    result
+}
+
+async fn pump_output(
+    reader: tokio::io::ReadHalf<AsyncLocalStream>,
+    writer: tokio::io::WriteHalf<AsyncLocalStream>,
+    escape: Option<u8>,
+    report_resizes: bool,
+    out: &mut dyn Write,
+    err: Option<&mut dyn Write>,
+    ctx: &'static str,
+) -> Result<PumpResult> {
+    let (input_sender, input) = tokio::sync::mpsc::channel(16);
+    let input_reader = spawn_stdin_reader(escape, input_sender);
+    let result = pump_stream(reader, writer, input, report_resizes, out, err, ctx).await;
+    input_reader.stop().await;
+    result
 }
 
 /// Run one exec to completion and hand back the command's exit status.
@@ -489,21 +532,41 @@ fn pump_output(
 /// too: without it the local terminal would hold keystrokes until a newline
 /// and turn Ctrl-C into a signal for terra itself. A piped exec keeps stderr
 /// in its own frame, so redirecting it away still works.
-pub fn pump_exec(stream: &LocalStream, tty: bool) -> Result<i32> {
+pub async fn pump_exec(stream: AsyncLocalStream, tty: bool) -> Result<i32> {
     let _raw = tty.then(RawTerminal::enable);
-    let threads = spawn_input_threads(stream, None, tty)?;
-    let result = pump_exec_output(stream, &mut std::io::stdout(), &mut std::io::stderr());
-    threads.stop(stream);
-    result
-}
-
-fn pump_exec_output(reader: impl Read, out: &mut impl Write, err: &mut impl Write) -> Result<i32> {
+    let (reader, writer) = tokio::io::split(stream);
     match pump_output(
         reader,
+        writer,
+        None,
+        tty,
+        &mut std::io::stdout(),
+        Some(&mut std::io::stderr()),
+        "reading the command's output",
+    )
+    .await?
+    {
+        PumpResult::Exit(code) => Ok(code),
+        PumpResult::Sigpipe => Ok(SHELL_SIGPIPE_STATUS),
+        PumpResult::Detached => anyhow::bail!("the box answered an exec with a detach"),
+        PumpResult::Closed => anyhow::bail!("the box stopped before the command finished"),
+    }
+}
+
+#[cfg(test)]
+async fn pump_exec_output(
+    mut reader: impl tokio::io::AsyncRead + Unpin,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> Result<i32> {
+    match output_loop(
+        &mut reader,
         out as &mut dyn Write,
         Some(err as &mut dyn Write),
         "reading the command's output",
-    )? {
+    )
+    .await?
+    {
         PumpResult::Exit(c) => Ok(c),
         PumpResult::Sigpipe => Ok(SHELL_SIGPIPE_STATUS),
         PumpResult::Detached => anyhow::bail!("the box answered an exec with a detach"),
@@ -511,25 +574,39 @@ fn pump_exec_output(reader: impl Read, out: &mut impl Write, err: &mut impl Writ
     }
 }
 
-pub fn pump_session(stream: &LocalStream) -> Result<SessionOutcome> {
+pub async fn pump_session(stream: AsyncLocalStream) -> Result<SessionOutcome> {
     let _raw = RawTerminal::enable();
-    let threads = spawn_input_threads(stream, Some(DETACH_KEY), true)?;
-    let ended = pump_session_output(stream, &mut std::io::stdout());
-    let detached = threads.detached.load(Ordering::SeqCst);
-    threads.stop(stream);
-    if detached {
-        return Ok(SessionOutcome::Detached);
-    }
-    ended
-}
-
-fn pump_session_output(reader: impl Read, out: &mut impl Write) -> Result<SessionOutcome> {
+    let (reader, writer) = tokio::io::split(stream);
     match pump_output(
         reader,
+        writer,
+        Some(DETACH_KEY),
+        true,
+        &mut std::io::stdout(),
+        None,
+        "reading the box's terminal",
+    )
+    .await?
+    {
+        PumpResult::Exit(code) => Ok(SessionOutcome::Exited(code)),
+        PumpResult::Detached | PumpResult::Sigpipe => Ok(SessionOutcome::Detached),
+        PumpResult::Closed => Ok(SessionOutcome::Closed),
+    }
+}
+
+#[cfg(test)]
+async fn pump_session_output(
+    mut reader: impl tokio::io::AsyncRead + Unpin,
+    out: &mut impl Write,
+) -> Result<SessionOutcome> {
+    match output_loop(
+        &mut reader,
         out as &mut dyn Write,
         None,
         "reading the box's terminal",
-    )? {
+    )
+    .await?
+    {
         PumpResult::Exit(c) => Ok(SessionOutcome::Exited(c)),
         PumpResult::Detached | PumpResult::Sigpipe => Ok(SessionOutcome::Detached),
         PumpResult::Closed => Ok(SessionOutcome::Closed),
@@ -560,6 +637,27 @@ mod tests {
     use super::*;
     use terra_io::local::LocalListener;
 
+    async fn frame_reader(bytes: Vec<u8>) -> tokio::io::DuplexStream {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (mut writer, reader) = tokio::io::duplex(bytes.len().max(1));
+        writer.write_all(&bytes).await.unwrap();
+        writer.shutdown().await.unwrap();
+        reader
+    }
+
+    async fn session_output(frames: &[AgentOutput]) -> (SessionOutcome, Vec<u8>) {
+        let wire = frames
+            .iter()
+            .flat_map(|frame| protocol::encode_frame(frame).unwrap())
+            .collect();
+        let mut shown = Vec::new();
+        let outcome = pump_session_output(frame_reader(wire).await, &mut shown)
+            .await
+            .unwrap();
+        (outcome, shown)
+    }
+
     #[cfg(unix)]
     #[test]
     fn input_readiness_waits_for_a_byte() {
@@ -580,7 +678,7 @@ mod tests {
 
     /// A box on disk, held as a running one, with a fake agent bound to its
     /// socket. The fake speaks just enough of the wire for the host's side to
-    /// be driven: hello, the `SessionControl` byte, the request the host
+    /// be driven: hello, the `SessionControl` frame, the request the host
     /// actually sends, and the canned replies - so the retry loop, the hello
     /// check, and the frame parsing all run for real.
     fn spawn_fake_agent(
@@ -601,11 +699,9 @@ mod tests {
         let agent = std::thread::spawn(move || {
             let (mut conn, _) = listener.accept().unwrap();
             conn.write_all(&protocol::AGENT_HELLO).unwrap();
-            let mut service = [0u8; 1];
-            conn.read_exact(&mut service).unwrap();
             assert_eq!(
-                service[0],
-                protocol::AgentService::SessionControl.to_byte(),
+                protocol::read_frame::<protocol::AgentService>(&mut conn).unwrap(),
+                Some(protocol::AgentService::SessionControl),
                 "the host dialed a different service"
             );
             assert_eq!(
@@ -622,8 +718,8 @@ mod tests {
         (bx, lock, home, agent)
     }
 
-    #[test]
-    fn an_agent_on_a_different_protocol_is_refused() {
+    #[tokio::test]
+    async fn an_agent_on_a_different_protocol_is_refused() {
         let home = crate::sys::TestHome::new();
         let bx = BoxRef::resolve(home.get_path(), "dev").unwrap();
         std::fs::create_dir_all(bx.get_dir()).unwrap();
@@ -638,8 +734,11 @@ mod tests {
             .unwrap();
         });
 
-        let error = connect_to_agent(&bx, protocol::AgentService::Session, "session", || Ok(()))
-            .unwrap_err();
+        let Err(error) =
+            connect_to_agent(&bx, protocol::AgentService::Session, "session", || Ok(())).await
+        else {
+            panic!("accepted incompatible agent");
+        };
         assert!(
             error
                 .to_string()
@@ -651,8 +750,8 @@ mod tests {
 
     /// `terra <box> sessions` reads the roster the agent sends, including
     /// clients that reported no terminal size.
-    #[test]
-    fn list_clients_parses_the_roster_and_keeps_nosize_clients() {
+    #[tokio::test]
+    async fn list_clients_parses_the_roster_and_keeps_nosize_clients() {
         let dir = tempfile::tempdir().unwrap();
         let (bx, _lock, _home, agent) = spawn_fake_agent(
             dir.path(),
@@ -670,7 +769,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            list_clients(&bx, None).unwrap(),
+            list_clients(&bx, None).await.unwrap(),
             vec![
                 SessionClient {
                     id: 0,
@@ -688,8 +787,8 @@ mod tests {
         agent.join().unwrap();
     }
 
-    #[test]
-    fn detach_replies_must_name_the_requested_client() {
+    #[tokio::test]
+    async fn detach_replies_must_name_the_requested_client() {
         for reply in [
             protocol::ControlReply::Detached { id: 8 },
             protocol::ControlReply::Missing { id: 8 },
@@ -700,7 +799,7 @@ mod tests {
                 protocol::ControlRequest::Detach { id: 9 },
                 vec![reply],
             );
-            let error = detach_client(&bx, 9, None).unwrap_err().to_string();
+            let error = detach_client(&bx, 9, None).await.unwrap_err().to_string();
             assert!(error.contains("client 9 with client 8"), "{error}");
             agent.join().unwrap();
         }
@@ -709,15 +808,15 @@ mod tests {
     /// The guest answers a detach of a client that was never there with
     /// `Missing`, and the host says so rather than pretending the cleanup
     /// happened.
-    #[test]
-    fn detach_client_reports_missing() {
+    #[tokio::test]
+    async fn detach_client_reports_missing() {
         let dir = tempfile::tempdir().unwrap();
         let (bx, _lock, _home, agent) = spawn_fake_agent(
             dir.path(),
             protocol::ControlRequest::Detach { id: 9 },
             vec![protocol::ControlReply::Missing { id: 9 }],
         );
-        let err = detach_client(&bx, 9, None).unwrap_err().to_string();
+        let err = detach_client(&bx, 9, None).await.unwrap_err().to_string();
         assert!(err.contains("no client 9"), "{err}");
         assert!(err.contains("dev"), "{err}");
         agent.join().unwrap();
@@ -725,8 +824,8 @@ mod tests {
 
     /// `detach --all` counts what the guest dropped - the number `terra`
     /// prints.
-    #[test]
-    fn detach_all_counts_the_detached() {
+    #[tokio::test]
+    async fn detach_all_counts_the_detached() {
         let dir = tempfile::tempdir().unwrap();
         let (bx, _lock, _home, agent) = spawn_fake_agent(
             dir.path(),
@@ -737,39 +836,39 @@ mod tests {
                 protocol::ControlReply::Done,
             ],
         );
-        assert_eq!(detach_all(&bx, None).unwrap(), 2);
+        assert_eq!(detach_all(&bx, None).await.unwrap(), 2);
         agent.join().unwrap();
     }
 
     /// An empty session is answered with just `Done` - nothing dropped is
     /// still an honest answer, not an error.
-    #[test]
-    fn detach_all_on_an_empty_session_counts_zero() {
+    #[tokio::test]
+    async fn detach_all_on_an_empty_session_counts_zero() {
         let dir = tempfile::tempdir().unwrap();
         let (bx, _lock, _home, agent) = spawn_fake_agent(
             dir.path(),
             protocol::ControlRequest::DetachAll,
             vec![protocol::ControlReply::Done],
         );
-        assert_eq!(detach_all(&bx, None).unwrap(), 0);
+        assert_eq!(detach_all(&bx, None).await.unwrap(), 0);
         agent.join().unwrap();
     }
 
     /// The one answer a stopped box has: the verb names the live agent as the
     /// thing the box has to be booted for, the same message every agent-bound
     /// verb gives, so a script sees one spelling of "not running".
-    #[test]
-    fn a_stopped_box_refuses_sessions_and_detach() {
+    #[tokio::test]
+    async fn a_stopped_box_refuses_sessions_and_detach() {
         let dir = tempfile::tempdir().unwrap();
         let _home = crate::sys::TestHome::new();
         let bx = BoxRef::resolve(dir.path(), "dev").unwrap();
         std::fs::create_dir_all(bx.get_dir()).unwrap();
 
-        let err = list_clients(&bx, None).unwrap_err().to_string();
+        let err = list_clients(&bx, None).await.unwrap_err().to_string();
         assert!(err.contains("is not running"), "{err}");
         assert!(err.contains("terra dev -d"), "{err}");
-        assert!(detach_client(&bx, 1, None).is_err());
-        assert!(detach_all(&bx, None).is_err());
+        assert!(detach_client(&bx, 1, None).await.is_err());
+        assert!(detach_all(&bx, None).await.is_err());
     }
 
     /// A pipe whose reader has gone.
@@ -839,8 +938,8 @@ mod tests {
     /// stream nobody reads until the command happened to finish: `tail -f`
     /// through a pipe hung forever. The status is the one a shell reports for
     /// a command SIGPIPE took.
-    #[test]
-    fn an_exec_whose_reader_left_ends_rather_than_pumping_into_a_closed_pipe() {
+    #[tokio::test]
+    async fn an_exec_whose_reader_left_ends_rather_than_pumping_into_a_closed_pipe() {
         // More output than any reader took, and no exit frame within it: only
         // noticing the closed sink can end this.
         let flood = |make_output: fn(Vec<u8>) -> AgentOutput| -> Vec<u8> {
@@ -853,18 +952,20 @@ mod tests {
         };
 
         let status = pump_exec_output(
-            std::io::Cursor::new(flood(AgentOutput::Out)),
+            frame_reader(flood(AgentOutput::Out)).await,
             &mut ClosedPipe,
             &mut Vec::new(),
         )
+        .await
         .unwrap();
         assert_eq!(status, SHELL_SIGPIPE_STATUS);
         // stderr is the same pipe under `2>&1 | head`, so it ends the same way.
         let status = pump_exec_output(
-            std::io::Cursor::new(flood(AgentOutput::Err)),
+            frame_reader(flood(AgentOutput::Err)).await,
             &mut Vec::new(),
             &mut ClosedPipe,
         )
+        .await
         .unwrap();
         assert_eq!(status, SHELL_SIGPIPE_STATUS);
 
@@ -880,7 +981,9 @@ mod tests {
         .iter()
         .flat_map(|f| protocol::encode_frame(f).unwrap())
         .collect();
-        let status = pump_exec_output(std::io::Cursor::new(wire), &mut out, &mut err).unwrap();
+        let status = pump_exec_output(frame_reader(wire).await, &mut out, &mut err)
+            .await
+            .unwrap();
         assert_eq!(
             (status, out.as_slice(), err.as_slice()),
             (3, &b"built\n"[..], &b"warned\n"[..])
@@ -892,8 +995,8 @@ mod tests {
     /// stream nobody reads until the workload ended: the same hang the exec
     /// pump refuses, fixed there and not here. The reader leaving is this
     /// client leaving, so the session detaches and the box keeps running.
-    #[test]
-    fn a_session_whose_reader_left_detaches_rather_than_pumping_forever() {
+    #[tokio::test]
+    async fn a_session_whose_reader_left_detaches_rather_than_pumping_forever() {
         // No exit frame within it: only noticing the closed sink can end this.
         let flood: Vec<u8> = std::iter::repeat_with(|| {
             protocol::encode_frame(&AgentOutput::Out(b"tick\n".to_vec())).unwrap()
@@ -901,18 +1004,10 @@ mod tests {
         .take(64)
         .flatten()
         .collect();
-        let outcome = pump_session_output(std::io::Cursor::new(flood), &mut ClosedPipe).unwrap();
+        let outcome = pump_session_output(frame_reader(flood).await, &mut ClosedPipe)
+            .await
+            .unwrap();
         assert_eq!(outcome, SessionOutcome::Detached);
-    }
-
-    #[test]
-    fn detach_wakes_a_quiet_session_pump() {
-        let (writer, reader) = LocalStream::pair().unwrap();
-        let detached = AtomicBool::new(false);
-        let pump = std::thread::spawn(move || pump_session_output(reader, &mut Vec::new()));
-        detach(&Mutex::new(writer), &detached);
-        assert!(detached.load(Ordering::SeqCst));
-        assert_eq!(pump.join().unwrap().unwrap(), SessionOutcome::Closed);
     }
 
     #[test]
@@ -925,33 +1020,26 @@ mod tests {
     /// hearing one and not hearing one is what a joiner exits with: a box that
     /// finished is not the same event as a VM that was killed under it, and a
     /// bare EOF used to be the only spelling of both.
-    #[test]
-    fn a_session_ends_on_the_status_it_was_given_or_says_it_never_got_one() {
-        let session = |frames: &[AgentOutput]| {
-            let wire: Vec<u8> = frames
-                .iter()
-                .flat_map(|f| protocol::encode_frame(f).unwrap())
-                .collect();
-            let mut shown = Vec::new();
-            let outcome = pump_session_output(std::io::Cursor::new(wire), &mut shown).unwrap();
-            (outcome, shown)
-        };
-
-        let (outcome, shown) = session(&[
+    #[tokio::test]
+    async fn a_session_ends_on_the_status_it_was_given_or_says_it_never_got_one() {
+        let (outcome, shown) = session_output(&[
             AgentOutput::Out(b"building\n".to_vec()),
             AgentOutput::Exit { code: 3 },
-        ]);
+        ])
+        .await;
         assert_eq!(outcome, SessionOutcome::Exited(3));
         assert_eq!(shown, b"building\n", "the terminal output must still land");
 
         assert_eq!(
-            session(&[AgentOutput::Exit { code: 0 }]).0,
+            session_output(&[AgentOutput::Exit { code: 0 }]).await.0,
             SessionOutcome::Exited(0)
         );
 
-        assert_eq!(session(&[]).0, SessionOutcome::Closed);
+        assert_eq!(session_output(&[]).await.0, SessionOutcome::Closed);
         assert_eq!(
-            session(&[AgentOutput::Out(b"half a boot\n".to_vec())]).0,
+            session_output(&[AgentOutput::Out(b"half a boot\n".to_vec())])
+                .await
+                .0,
             SessionOutcome::Closed
         );
 
@@ -959,7 +1047,9 @@ mod tests {
             protocol::encode_frame(&AgentOutput::Out(b"0123456789".to_vec())).unwrap();
         truncated.truncate(7);
         assert!(
-            pump_session_output(std::io::Cursor::new(truncated), &mut Vec::new()).is_err(),
+            pump_session_output(frame_reader(truncated).await, &mut Vec::new())
+                .await
+                .is_err(),
             "a truncated frame must not read as a clean end"
         );
     }
@@ -970,14 +1060,16 @@ mod tests {
     /// the same outcome as the detach key, and what lets a script tell the two
     /// apart. An exec is never detached, so there the frame is a protocol
     /// error.
-    #[test]
-    fn a_detach_frame_ends_the_session_as_a_detach() {
+    #[tokio::test]
+    async fn a_detach_frame_ends_the_session_as_a_detach() {
         let wire: Vec<u8> = [AgentOutput::Out(b"bye\n".to_vec()), AgentOutput::Detached]
             .iter()
             .flat_map(|f| protocol::encode_frame(f).unwrap())
             .collect();
         let mut shown = Vec::new();
-        let outcome = pump_session_output(std::io::Cursor::new(wire), &mut shown).unwrap();
+        let outcome = pump_session_output(frame_reader(wire).await, &mut shown)
+            .await
+            .unwrap();
         assert_eq!(outcome, SessionOutcome::Detached);
         assert_eq!(
             shown, b"bye\n",
@@ -985,11 +1077,108 @@ mod tests {
         );
 
         let err = pump_exec_output(
-            std::io::Cursor::new(protocol::encode_frame(&AgentOutput::Detached).unwrap()),
+            frame_reader(protocol::encode_frame(&AgentOutput::Detached).unwrap()).await,
             &mut Vec::new(),
             &mut Vec::new(),
         )
+        .await
         .unwrap_err();
         assert!(err.to_string().contains("detach"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn input_keeps_a_fragmented_output_frame_intact() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (host, mut peer) = tokio::io::duplex(1024);
+        let (reader, writer) = tokio::io::split(host);
+        let (input_sender, input) = tokio::sync::mpsc::channel(1);
+        let (fragment_sent, fragment_seen) = tokio::sync::oneshot::channel();
+        let peer_task = tokio::spawn(async move {
+            let output = protocol::encode_frame(&AgentOutput::Out(b"hello\n".to_vec())).unwrap();
+            peer.write_all(&output[..2]).await.unwrap();
+            fragment_sent.send(()).unwrap();
+            assert_eq!(
+                protocol::read_frame_async(&mut peer).await.unwrap(),
+                Some(ClientInput::Keys(b"input".to_vec()))
+            );
+            peer.write_all(&output[2..]).await.unwrap();
+            protocol::write_frame_async(&mut peer, &AgentOutput::Exit { code: 7 })
+                .await
+                .unwrap();
+        });
+        fragment_seen.await.unwrap();
+        input_sender
+            .send(Input::Frame(ClientInput::Keys(b"input".to_vec())))
+            .await
+            .unwrap();
+
+        let mut shown = Vec::new();
+        assert!(matches!(
+            pump_stream(
+                reader,
+                writer,
+                input,
+                false,
+                &mut shown,
+                None,
+                "reading output"
+            )
+            .await,
+            Ok(PumpResult::Exit(7))
+        ));
+        assert_eq!(shown, b"hello\n");
+        peer_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exit_stops_a_writer_blocked_by_full_input() {
+        let (host, mut peer) = tokio::io::duplex(1);
+        let (reader, writer) = tokio::io::split(host);
+        let (input_sender, input) = tokio::sync::mpsc::channel(1);
+        input_sender
+            .send(Input::Frame(ClientInput::Keys(vec![0; 1024])))
+            .await
+            .unwrap();
+        let (can_exit, wait_for_input) = tokio::sync::oneshot::channel();
+        let producer = async move {
+            tokio::task::yield_now().await;
+            input_sender
+                .send(Input::Frame(ClientInput::Keys(vec![1; 1024])))
+                .await
+                .unwrap();
+            can_exit.send(()).unwrap();
+            input_sender
+                .send(Input::Frame(ClientInput::Keys(vec![2; 1024])))
+                .await
+        };
+        let peer_task = async move {
+            wait_for_input.await.unwrap();
+            protocol::write_frame_async(&mut peer, &AgentOutput::Exit { code: 0 })
+                .await
+                .unwrap();
+        };
+        let mut shown = Vec::new();
+        let complete = tokio::time::timeout(Duration::from_secs(1), async {
+            let (result, producer, peer) = tokio::join!(
+                pump_stream(
+                    reader,
+                    writer,
+                    input,
+                    false,
+                    &mut shown,
+                    None,
+                    "reading output"
+                ),
+                producer,
+                peer_task,
+            );
+            (result, producer, peer)
+        })
+        .await
+        .expect("exit did not stop the blocked input writer");
+
+        assert!(matches!(complete.0, Ok(PumpResult::Exit(0))));
+        assert!(complete.1.is_err());
     }
 }

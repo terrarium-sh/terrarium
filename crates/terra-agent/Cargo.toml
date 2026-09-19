@@ -9,10 +9,13 @@ rust-version.workspace = true
 [dependencies]
 anyhow = { workspace = true }
 sha2 = { version = "0.11", default-features = false }
-terra-protocol = { path = "../terra-protocol" }
+terra-protocol = { path = "../terra-protocol", features = ["tokio"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 linux-raw-sys.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
+tokio-util = { version = "0.7", features = ["rt", "compat"] }
+async-io = "2.6"
 pty-process = "0.5"
 rustix.workspace = true
 # Terminal screen model so a client attaching to a running TUI gets repainted

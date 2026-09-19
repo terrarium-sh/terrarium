@@ -409,8 +409,6 @@ mod tests {
             pending_rx: None,
             pending: [false; 2],
         };
-        super::super::switch().set_diagnostics_enabled(true);
-
         write_transport(&mut state, 0x70, &0_u32.to_le_bytes()).unwrap();
         super::super::switch().rx(
             &request(terra_vsock_device::DIAGNOSTIC_VSOCK_PORT, 100),
@@ -433,13 +431,5 @@ mod tests {
                 .iter()
                 .all(|reply| reply.header.op == RESET)
         );
-
-        *super::super::switch() = terra_vsock_device::VsockSwitch::new();
-        write_transport(&mut state, 0x70, &0_u32.to_le_bytes()).unwrap();
-        super::super::switch().rx(
-            &request(terra_vsock_device::DIAGNOSTIC_VSOCK_PORT, 100),
-            &[],
-        );
-        assert_eq!(super::super::switch().take_replies()[0].header.op, RESET);
     }
 }

@@ -156,14 +156,10 @@ impl VsockDev {
         sink
     }
 
-    pub async fn configure_worker_store(
+    pub async fn connect_events_store(
         &mut self,
         store: &mut Store<crate::box_runtime::BoxHost>,
-        control_events: bool,
     ) -> wasmtime::Result<()> {
-        self.component
-            .configure_worker_store(store, control_events)
-            .await?;
         self.component
             .events_store(store)
             .await?
@@ -174,7 +170,6 @@ impl VsockDev {
 struct VsockWorkerGrant {
     component: wasmtime::component::Component,
     plan: Vec<u8>,
-    control_events: bool,
     listener: Option<UnixListener>,
     control: Option<UnixStream>,
     diagnostics: Option<std::fs::File>,
@@ -214,9 +209,7 @@ impl VsockWorkerGrant {
         if let Some(diagnostics) = self.diagnostics {
             device_state.grant_diagnostics(diagnostics)?;
         }
-        device_state
-            .configure_worker_store(&mut child.store, self.control_events)
-            .await?;
+        device_state.connect_events_store(&mut child.store).await?;
         child.register_loop(Box::new(move |accessor| {
             Box::pin(run_worker(
                 accessor,
@@ -241,7 +234,6 @@ impl VsockChannel {
         ram: impl Into<RamGrant> + Send,
         artifact: &'static [u8],
         plan: Vec<u8>,
-        control_events: bool,
         listener: Option<UnixListener>,
         control: Option<UnixStream>,
         diagnostics: Option<std::fs::File>,
@@ -262,7 +254,6 @@ impl VsockChannel {
         let setup = VsockWorkerGrant {
             component,
             plan,
-            control_events,
             listener,
             control,
             diagnostics,
@@ -433,9 +424,7 @@ mod tests {
             daemons: Vec::new(),
             workload: vec!["/bin/sh".into()],
             sandbox_info: String::new(),
-            workload_on_console: false,
             await_initial_session: false,
-            lifecycle_protocol: terra_protocol::LifecycleProtocol::EventsV1,
             host_tz: None,
             host_time: None,
             host_seed: None,
@@ -612,7 +601,6 @@ mod tests {
                 ram,
                 include_bytes!("../../../../build/terra-vsock-component.cwasm"),
                 boot_plan(),
-                false,
                 None,
                 None,
                 None,

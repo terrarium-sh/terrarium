@@ -42,40 +42,23 @@ pub use crate::control::{
     decode_clock_sync,
 };
 
-/// The byte naming what one connection to [`AGENT_VSOCK_PORT`] is for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
+/// The service selected by the first host frame on an agent connection.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum AgentService {
     /// The workload's shared terminal: a *viewport* onto the one PTY every
     /// client shares - no per-client process, no uid of its own.
-    Session = b's',
-    /// One `terra sync` session.
-    Files = b'f',
+    Session,
+    Sync,
     /// One `terra exec` - one connection, one PTY, one process, which is what
     /// lets it run as root while the workload stays unprivileged.
-    Exec = b'e',
+    Exec,
     /// Session management, not a viewport: one ask per connection - list
     /// the clients, or drop one. Never itself a client.
-    SessionControl = b'c',
+    SessionControl,
 }
 
-impl AgentService {
-    #[must_use]
-    pub fn to_byte(self) -> u8 {
-        self as u8
-    }
-
-    #[must_use]
-    pub fn from_byte(byte: u8) -> Option<Self> {
-        match byte {
-            b's' => Some(Self::Session),
-            b'f' => Some(Self::Files),
-            b'e' => Some(Self::Exec),
-            b'c' => Some(Self::SessionControl),
-            _ => None,
-        }
-    }
-}
+pub const MAX_SERVICE_FRAME_BYTES: usize = 64;
 
 /// Signal byte for graceful shutdown. Single byte for signal-handler use.
 pub const STOP_SIGNAL: u8 = b'S';
@@ -83,7 +66,7 @@ pub const STOP_SIGNAL: u8 = b'S';
 pub const DEFAULT_STOP_GRACE_SECS: u64 = 30;
 
 /// Bump when a host and a running guest agent cannot safely communicate.
-pub const AGENT_PROTOCOL_VERSION: u8 = 1;
+pub const AGENT_PROTOCOL_VERSION: u8 = 2;
 
 /// The first bytes the agent writes on every connection it accepts - and the
 /// host's only proof that the agent is what answered and speaks its protocol.
@@ -99,13 +82,6 @@ pub const RECIPE_STAMP_PATH: &str = "/terra/recipe";
 pub enum PlanMode {
     Run,
     Create,
-}
-
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub enum LifecycleProtocol {
-    #[default]
-    Legacy,
-    EventsV1,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -206,13 +182,9 @@ pub struct Plan {
     pub daemons: Vec<String>,
     pub workload: Vec<String>,
     pub sandbox_info: String,
-    /// Retained for older agents; current hosts send false and current agents ignore this field.
-    pub workload_on_console: bool,
     /// Wait for the foreground host session before starting the workload.
     #[serde(default)]
     pub await_initial_session: bool,
-    #[serde(default)]
-    pub lifecycle_protocol: LifecycleProtocol,
     pub host_tz: Option<Vec<u8>>,
     #[serde(default)]
     pub host_time: Option<HostTime>,
@@ -257,14 +229,43 @@ mod tests {
     use crate::{encode_frame, read_frame};
 
     #[test]
-    fn round_trip_agent_service_bytes() {
+    fn round_trip_named_agent_services() {
         for service in [
             AgentService::Session,
-            AgentService::Files,
+            AgentService::Sync,
             AgentService::Exec,
             AgentService::SessionControl,
         ] {
-            assert_eq!(AgentService::from_byte(service.to_byte()), Some(service));
+            let name = match service {
+                AgentService::Session => "session",
+                AgentService::Sync => "sync",
+                AgentService::Exec => "exec",
+                AgentService::SessionControl => "session_control",
+            };
+            let frame = encode_frame(&service).unwrap();
+            assert_eq!(&frame[4..], format!("\"{name}\"").as_bytes());
+            assert_eq!(
+                crate::read_frame_with_limit::<AgentService>(
+                    &mut frame.as_slice(),
+                    MAX_SERVICE_FRAME_BYTES,
+                )
+                .unwrap(),
+                Some(service),
+            );
+        }
+    }
+
+    #[test]
+    fn service_selection_rejects_unknown_and_oversized_frames() {
+        let unknown = encode_frame(&"unknown_service").unwrap();
+        let oversized = u32::try_from(MAX_SERVICE_FRAME_BYTES + 1)
+            .unwrap()
+            .to_le_bytes();
+        for mut bytes in [unknown.as_slice(), oversized.as_slice()] {
+            let error =
+                crate::read_frame_with_limit::<AgentService>(&mut bytes, MAX_SERVICE_FRAME_BYTES)
+                    .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         }
     }
 
@@ -309,9 +310,7 @@ mod tests {
                 daemons: vec!["while true; do sleep 60; done".into()],
                 workload: vec!["/bin/sh".into(), "-c".into(), "make".into()],
                 sandbox_info: "# Terrarium sandbox".into(),
-                workload_on_console: true,
                 await_initial_session: true,
-                lifecycle_protocol: LifecycleProtocol::EventsV1,
                 host_tz,
                 host_time: Some(HostTime {
                     seconds: 1,
@@ -329,7 +328,7 @@ mod tests {
             std::io::Read::read_to_end(&mut cursor, &mut rest).unwrap();
             assert_eq!(rest, vec![STOP_SIGNAL]);
         }
-        // Old host without the new fields still decodes as None.
+        // Optional plan fields retain their defaults when absent.
         let json_without = serde_json::json!({
             "mode": "Create",
             "workdir": "/work",
@@ -343,14 +342,11 @@ mod tests {
             "on_start": [],
             "pre_stop": [],
             "workload": [],
-            "sandbox_info": "",
-            "workload_on_console": false
+            "sandbox_info": ""
         });
         let decoded: Plan = serde_json::from_value(json_without).unwrap();
         assert_eq!(decoded.host_tz, None);
-        assert_eq!(decoded.lifecycle_protocol, LifecycleProtocol::Legacy);
-        // …and an old host's plan, which carries no daemons, still boots a
-        // new agent.
+        assert!(!decoded.await_initial_session);
         assert!(decoded.daemons.is_empty());
     }
 

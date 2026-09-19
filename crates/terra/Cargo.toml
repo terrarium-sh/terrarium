@@ -20,9 +20,9 @@ path = "src/main.rs"
 fuzzing = []
 
 [dependencies]
-terra-io = { path = "../terra-io" }
+terra-io = { path = "../terra-io", features = ["tokio"] }
 terra-limits = { path = "../terra-limits" }
-terra-protocol = { path = "../terra-protocol" }
+terra-protocol = { path = "../terra-protocol", features = ["tokio"] }
 clap.workspace = true
 clap_complete = "4"
 anyhow.workspace = true
@@ -34,7 +34,7 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 terra-network = { path = "../terra-network" }
 terra-runtime = { path = "../terra-runtime" }
 terra-platform = { path = "../terra-platform" }
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "sync", "time"] }
 libc.workspace = true
 rustix.workspace = true
 sha2 = { version = "0.11", default-features = false }

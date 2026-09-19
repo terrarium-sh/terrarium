@@ -3,6 +3,8 @@
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
+#[cfg(feature = "tokio")]
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TermSize {
@@ -27,11 +29,15 @@ fn read_len(reader: &mut impl Read, max_bytes: usize) -> io::Result<Option<usize
         Err(e) => return Err(e),
     }
     reader.read_exact(&mut bytes[1..])?;
+    checked_len(bytes, max_bytes).map(Some)
+}
+
+fn checked_len(bytes: [u8; 4], max_bytes: usize) -> io::Result<usize> {
     let len = u32::from_le_bytes(bytes) as usize;
     if len > max_bytes {
         return Err(make_oversized_error(len, max_bytes));
     }
-    Ok(Some(len))
+    Ok(len)
 }
 
 fn make_oversized_error(len: usize, max_bytes: usize) -> io::Error {
@@ -85,6 +91,43 @@ pub fn encode_frame_with_limit<T: Serialize>(value: &T, max_bytes: usize) -> io:
 /// Read one frame; `None` on a clean EOF at a frame boundary.
 pub fn read_frame<T: DeserializeOwned>(reader: &mut impl Read) -> io::Result<Option<T>> {
     read_frame_with_limit(reader, MAX_FRAME_BYTES)
+}
+
+/// Read one frame asynchronously; `None` on a clean EOF at a frame boundary.
+#[cfg(feature = "tokio")]
+pub async fn read_frame_async<T: DeserializeOwned>(
+    reader: &mut (impl AsyncRead + Unpin),
+) -> io::Result<Option<T>> {
+    read_frame_async_with_limit(reader, MAX_FRAME_BYTES).await
+}
+
+/// Read an async frame with a tighter payload limit; `None` means EOF at a frame boundary.
+#[cfg(feature = "tokio")]
+pub async fn read_frame_async_with_limit<T: DeserializeOwned>(
+    reader: &mut (impl AsyncRead + Unpin),
+    max_bytes: usize,
+) -> io::Result<Option<T>> {
+    let mut bytes = [0u8; 4];
+    match reader.read_exact(&mut bytes[..1]).await {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(error),
+    }
+    reader.read_exact(&mut bytes[1..]).await?;
+    let mut payload = vec![0u8; checked_len(bytes, max_bytes.min(MAX_FRAME_BYTES))?];
+    reader.read_exact(&mut payload).await?;
+    serde_json::from_slice(&payload)
+        .map(Some)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+/// Encode and write one frame asynchronously.
+#[cfg(feature = "tokio")]
+pub async fn write_frame_async<T: Serialize>(
+    writer: &mut (impl AsyncWrite + Unpin),
+    value: &T,
+) -> io::Result<()> {
+    writer.write_all(&encode_frame(value)?).await
 }
 
 /// Read one frame with a tighter payload limit; `None` means EOF at a frame boundary.
@@ -142,6 +185,77 @@ pub enum ControlReply {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn async_frames_share_the_sync_wire_format() {
+        let value = ControlReply::Detached { id: 7 };
+        let (mut sync_writer, mut async_reader) = tokio::io::duplex(128);
+        sync_writer
+            .write_all(&encode_frame(&value).unwrap())
+            .await
+            .unwrap();
+        sync_writer.shutdown().await.unwrap();
+        assert_eq!(
+            read_frame_async(&mut async_reader).await.unwrap(),
+            Some(value)
+        );
+
+        let (mut async_writer, mut sync_reader) = tokio::io::duplex(128);
+        write_frame_async(&mut async_writer, &ControlReply::Done)
+            .await
+            .unwrap();
+        async_writer.shutdown().await.unwrap();
+        let mut bytes = Vec::new();
+        sync_reader.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(
+            read_frame::<ControlReply>(&mut bytes.as_slice()).unwrap(),
+            Some(ControlReply::Done)
+        );
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn async_frames_enforce_the_callers_limit_before_reading_the_payload() {
+        for (length, limit) in [
+            (65_u32, 64),
+            (u32::try_from(MAX_FRAME_BYTES + 1).unwrap(), usize::MAX),
+        ] {
+            let (mut writer, mut reader) = tokio::io::duplex(4);
+            writer.write_all(&length.to_le_bytes()).await.unwrap();
+            let error = read_frame_async_with_limit::<ControlReply>(&mut reader, limit)
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn async_frames_reject_truncated_and_oversized_input() {
+        let frame = encode_frame(&ControlReply::Done).unwrap();
+        let (mut writer, mut reader) = tokio::io::duplex(128);
+        writer.write_all(&frame[..frame.len() - 1]).await.unwrap();
+        writer.shutdown().await.unwrap();
+        assert_eq!(
+            read_frame_async::<ControlReply>(&mut reader)
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+
+        let (mut writer, mut reader) = tokio::io::duplex(128);
+        writer.write_all(&u32::MAX.to_le_bytes()).await.unwrap();
+        writer.shutdown().await.unwrap();
+        assert_eq!(
+            read_frame_async::<ControlReply>(&mut reader)
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
 
     #[test]
     fn frame_limits_reject_the_prefix_before_reading_payload() {

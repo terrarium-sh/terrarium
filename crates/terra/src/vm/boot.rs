@@ -11,7 +11,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitCode};
 use std::time::{Duration, Instant};
-use terra_io::local::LocalStream;
+use terra_io::local::AsyncLocalStream;
 
 /// The background VM process's own first argv: `terra __vm <dir>` skips the
 /// command line and takes its boot off stdin.
@@ -65,7 +65,7 @@ pub(crate) enum BootMode {
     DetachedWithJoin,
 }
 
-pub fn start(
+pub async fn start(
     spec: &BootSpec,
     bx: &BoxRef,
     boot: BootMode,
@@ -75,7 +75,7 @@ pub fn start(
     match boot {
         BootMode::Detached => spawn_detached(bx, spec, run_lock),
         BootMode::DetachedWithJoin | BootMode::Foreground => {
-            run_attached(bx, spec, run_lock, agent_timeout)
+            run_attached(bx, spec, run_lock, agent_timeout).await
         }
     }
 }
@@ -328,8 +328,12 @@ fn reap(owner: Option<&mut Child>) {
     }
 }
 
-fn join_session(bx: &BoxRef, stream: &LocalStream, owner: Option<&mut Child>) -> Result<ExitCode> {
-    match pump_session(stream)? {
+async fn join_session(
+    bx: &BoxRef,
+    stream: AsyncLocalStream,
+    owner: Option<&mut Child>,
+) -> Result<ExitCode> {
+    match pump_session(stream).await? {
         SessionOutcome::Detached => {
             eprintln!(
                 "\nterra: detached - {bx} keeps running (`terra {}` rejoins)",
@@ -354,7 +358,7 @@ fn join_session(bx: &BoxRef, stream: &LocalStream, owner: Option<&mut Child>) ->
 /// Spawn the VM and attach to its console. This process is only the
 /// session's first client - but it is still the child's parent, so the
 /// workload's exit code comes through unless you detach.
-fn run_attached(
+async fn run_attached(
     bx: &BoxRef,
     spec: &BootSpec,
     run_lock: File,
@@ -387,7 +391,8 @@ fn run_attached(
                 "{bx} stopped before it had a session to join"
             );
             Ok(())
-        });
+        })
+        .await;
     let stream = match joined {
         Ok(stream) => stream,
         Err(e) => {
@@ -401,20 +406,21 @@ fn run_attached(
         }
     };
 
-    join_session(bx, &stream, Some(&mut child))
+    join_session(bx, stream, Some(&mut child)).await
 }
 
 /// Join a running box's multiplexed terminal; the detach key detaches without
 /// stopping the workload. Waits for the session rather than taking the
 /// socket's word for it: a box can hold its lock long before there is anything
 /// to join.
-pub fn attach(bx: &BoxRef, agent_timeout: Option<u64>) -> Result<ExitCode> {
+pub async fn attach(bx: &BoxRef, agent_timeout: Option<u64>) -> Result<ExitCode> {
     let mut wait_for_agent = session::wait_while_running(bx, agent_timeout);
     let stream =
         session::connect_to_agent(bx, terra_protocol::AgentService::Session, "session", || {
             wait_for_agent()
-        })?;
-    join_session(bx, &stream, None)
+        })
+        .await?;
+    join_session(bx, stream, None).await
 }
 
 #[cfg(test)]

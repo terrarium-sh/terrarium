@@ -25,7 +25,7 @@ fn decode_frame<T: DeserializeOwned>(
         .map_err(|_| Error::Malformed)
 }
 
-pub fn decode_control(bytes: &[u8], events: bool) -> Result<ControlResult, Error> {
+pub fn decode_control(bytes: &[u8]) -> Result<ControlResult, Error> {
     if bytes.len() > MAX_CONTROL_BYTES {
         return Err(Error::Malformed);
     }
@@ -35,27 +35,18 @@ pub fn decode_control(bytes: &[u8], events: bool) -> Result<ControlResult, Error
     };
     for _ in 0..MAX_MESSAGES {
         let unread = &bytes[result.consumed as usize..];
-        let decoded = if events {
-            decode_frame::<LifecycleEvent>(unread, MAX_CONTROL_BYTES - 4)?.map(
-                |(event, consumed)| {
-                    let code = match event {
-                        LifecycleEvent::Exit { code } => Some(code),
-                        LifecycleEvent::Diagnostic { .. } => None,
-                    };
-                    (code, consumed)
-                },
-            )
-        } else {
-            decode_frame::<i32>(unread, MAX_CONTROL_BYTES - 4)?
-                .map(|(code, consumed)| (Some(code), consumed))
-        };
-        let Some((code, consumed)) = decoded else {
+        let Some((event, consumed)) =
+            decode_frame::<LifecycleEvent>(unread, MAX_CONTROL_BYTES - 4)?
+        else {
             break;
         };
         result.consumed += u32::try_from(consumed).map_err(|_| Error::Malformed)?;
-        if code.is_some() {
-            result.exit_code = code;
-            break;
+        match event {
+            LifecycleEvent::Exit { code } => {
+                result.exit_code = Some(code);
+                return Ok(result);
+            }
+            LifecycleEvent::Diagnostic { .. } => {}
         }
     }
     Ok(result)
@@ -98,24 +89,21 @@ mod tests {
     }
 
     #[test]
-    fn fragmented_lifecycle_and_legacy_frames_preserve_the_cursor() {
-        for (bytes, events) in [
-            (frame(&LifecycleEvent::Exit { code: -7 }), true),
-            (frame(&-7), false),
-        ] {
-            for end in 0..bytes.len() {
-                let result = decode_control(&bytes[..end], events).unwrap();
-                assert_eq!(result.consumed, 0);
-                assert_eq!(result.exit_code, None);
-            }
-            let result = decode_control(&bytes, events).unwrap();
-            assert_eq!(result.consumed as usize, bytes.len());
-            assert_eq!(result.exit_code, Some(-7));
+    fn fragmented_lifecycle_frames_preserve_the_cursor() {
+        let bytes = frame(&LifecycleEvent::Exit { code: -7 });
+        for end in 0..bytes.len() {
+            let result = decode_control(&bytes[..end]).unwrap();
+            assert_eq!(result.consumed, 0);
+            assert_eq!(result.exit_code, None);
         }
+        let result = decode_control(&bytes).unwrap();
+        assert_eq!(result.consumed as usize, bytes.len());
+        assert_eq!(result.exit_code, Some(-7));
+        assert!(decode_control(&frame(&-7)).is_err());
     }
 
     #[test]
-    fn diagnostic_batches_preserve_partial_tail_and_reject_control_events() {
+    fn diagnostic_batches_preserve_partial_tail_and_reject_exit_events() {
         let first = frame(&LifecycleEvent::Diagnostic {
             bytes: b"hook output".to_vec(),
         });
@@ -126,7 +114,7 @@ mod tests {
         assert_eq!(result.output, b"hook output");
         assert!(decode_diagnostics(&frame(&LifecycleEvent::Exit { code: 0 })).is_err());
         assert!(decode_diagnostics(&u32::MAX.to_le_bytes()).is_err());
-        assert!(decode_control(&u32::MAX.to_le_bytes(), true).is_err());
-        assert!(decode_control(&[1, 0, 0, 0, b'{'], true).is_err());
+        assert!(decode_control(&u32::MAX.to_le_bytes()).is_err());
+        assert!(decode_control(&[1, 0, 0, 0, b'{']).is_err());
     }
 }

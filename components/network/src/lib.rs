@@ -939,19 +939,6 @@ async fn wait_for_activity() -> bool {
     }
 }
 
-async fn yield_once() {
-    let mut yielded = false;
-    poll_fn(|context| {
-        if yielded {
-            Poll::Ready(())
-        } else {
-            yielded = true;
-            context.waker().wake_by_ref();
-            Poll::Pending
-        }
-    })
-    .await;
-}
 fn config(config: Config) -> Result<GatewayConfig, Error> {
     let mac: [u8; 6] = config
         .gateway_mac
@@ -1446,7 +1433,7 @@ impl Guest for Network {
                 let _ = transport::service_queues().await;
             }
             if processed == MAX_WORK_PER_WAKE {
-                yield_once().await;
+                wit_bindgen::rt::async_support::yield_async().await;
             }
         }
         Ok(())

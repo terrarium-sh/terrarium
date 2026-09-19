@@ -68,43 +68,87 @@ pub(crate) fn sweep_staging_temps(dir: &Path, is_alive: impl Fn(u32) -> bool) {
     }
 }
 
-pub(crate) fn staged_write(path: &Path, write: impl FnOnce(&mut File) -> Result<()>) -> Result<()> {
+pub(crate) struct StagedFile {
+    file: File,
+    staging: StagedPath,
+}
+
+struct StagedPath {
+    temporary: PathBuf,
+    destination: PathBuf,
     #[cfg(unix)]
-    let parent = File::open(
-        path.parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new(".")),
-    )?;
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+    parent: File,
+}
+
+impl Drop for StagedPath {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.temporary);
     }
-    let mut attempt = 0u64;
-    let (tmp, mut out) = loop {
-        let tmp = to_stage_path(path, attempt);
-        match options.open(&tmp) {
-            Ok(file) => break (tmp, file),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                attempt = attempt.checked_add(1).context("too many staging files")?;
-            }
-            Err(error) => return Err(error).with_context(|| format!("creating {}", tmp.display())),
-        }
-    };
-    let result = write(&mut out).and_then(|()| out.sync_all().context("syncing staged image"));
-    drop(out);
-    let result = result.and_then(|()| {
-        std::fs::rename(&tmp, path).with_context(|| format!("installing {}", path.display()))?;
+}
+
+impl StagedFile {
+    pub(crate) fn file_mut(&mut self) -> &mut File {
+        &mut self.file
+    }
+
+    pub(crate) fn new(path: &Path) -> Result<Self> {
         #[cfg(unix)]
-        parent.sync_all().context("syncing image directory")?;
-        Ok(())
-    });
-    if result.is_err() {
-        let _ = std::fs::remove_file(tmp);
+        let parent = File::open(
+            path.parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new(".")),
+        )?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut attempt = 0u64;
+        let (temporary, file) = loop {
+            let temporary = to_stage_path(path, attempt);
+            match options.open(&temporary) {
+                Ok(file) => break (temporary, file),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    attempt = attempt.checked_add(1).context("too many staging files")?;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| format!("creating {}", temporary.display()));
+                }
+            }
+        };
+        Ok(Self {
+            file,
+            staging: StagedPath {
+                temporary,
+                destination: path.to_owned(),
+                #[cfg(unix)]
+                parent,
+            },
+        })
     }
-    result
+
+    pub(crate) fn commit(self) -> Result<()> {
+        let Self { file, staging } = self;
+        let result = file.sync_all().context("syncing staged image");
+        drop(file);
+        result?;
+        std::fs::rename(&staging.temporary, &staging.destination)
+            .with_context(|| format!("installing {}", staging.destination.display()))?;
+        #[cfg(unix)]
+        staging
+            .parent
+            .sync_all()
+            .context("syncing image directory")?;
+        Ok(())
+    }
+}
+
+pub(crate) fn staged_write(path: &Path, write: impl FnOnce(&mut File) -> Result<()>) -> Result<()> {
+    let mut staged = StagedFile::new(path)?;
+    write(&mut staged.file)?;
+    staged.commit()
 }
 
 fn install_sparse(

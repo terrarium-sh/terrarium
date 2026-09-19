@@ -28,7 +28,6 @@ available in this environment.
 | P2: Windows missing components | Fixed: PowerShell reads the component list from Makefile, including boot and policy. |
 | P3: reaper PID reuse | Fixed: preserve exit status by owned process identity and wait through pidfds, rather than assigning a reused PID's status to an old waiter. Daemon supervision shares the same handle without descriptor duplication. |
 | P4: one unreadable project hides all boxes | Fixed: warn and skip that project's state. |
-| P5: Legacy lifecycle default | No defect: the default supports older hosts talking to a newer agent. Current hosts explicitly request EventsV1 and do not need to decode Legacy replies. |
 | P5: failed VM attachment | Fixed: release host attachment state and invalidate the failed Wasm instance; callers must use a fresh runtime after initialization failure. |
 | P5: memory poison and small reports | No defect: reporting is a reclamation hint. The guest supplies poison; discarding nonzero-poison pages would replace it with zeros. Sub-host-page hints must not discard adjacent live guest pages. |
 | P5: transient listener failure | Fixed: retry failed published listeners with a delay. |

@@ -22,8 +22,6 @@ pub enum Error {
     Malformed,
 }
 
-type ConfigureWorker = TypedFunc<(bool,), ()>;
-
 #[derive(ComponentType, Lift, Lower)]
 #[component(variant)]
 pub enum HostEvent {
@@ -36,7 +34,6 @@ pub enum HostEvent {
 type Events = TypedFunc<(), (StreamReader<HostEvent>,)>;
 
 pub struct VsockComponent {
-    configure_worker: ConfigureWorker,
     events: Events,
     run: TypedFunc<(), (Result<(), Error>,)>,
     mmio_serve: crate::component::vmm::mmio::Serve,
@@ -49,7 +46,6 @@ impl VsockComponent {
         mut store: &mut Store<BoxHost>,
     ) -> wasmtime::Result<Self> {
         let get = |name| component_export(component, "terra:vsock/api@0.1.0", name, "vsock");
-        let configure_worker = instance.get_typed_func(&mut store, get("configure-worker")?)?;
         let events = instance.get_typed_func(&mut store, get("events")?)?;
         let run = instance.get_typed_func(&mut store, get("run")?)?;
         let configure = instance.get_typed_func::<(), (Result<(), crate::engine::DeviceError>,)>(
@@ -68,7 +64,6 @@ impl VsockComponent {
             component_export(component, "terra:mmio/device@0.1.0", "serve", "vsock")?,
         )?;
         Ok(Self {
-            configure_worker,
             events,
             run,
             mmio_serve,
@@ -102,15 +97,6 @@ impl VsockComponent {
         .await
         .map_err(|_| wasmtime::Error::msg("vsock component initialization timed out"))??;
         Self::bind(component, &instance, &mut runtime.store).await
-    }
-
-    pub async fn configure_worker_store(
-        &self,
-        store: &mut Store<BoxHost>,
-        control_events: bool,
-    ) -> wasmtime::Result<()> {
-        self.call_store(store, self.configure_worker, (control_events,))
-            .await
     }
 
     pub async fn events_store(

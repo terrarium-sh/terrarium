@@ -7,23 +7,23 @@ use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::ExitCode;
-use terra_protocol::{AgentService, ExecRequest, encode_frame};
+use terra_protocol::{AgentService, ExecRequest, write_frame_async};
 
-pub fn run(
+pub async fn run(
     args: &crate::cli::ExecArgs,
     name: Option<&str>,
     project_dir: &Path,
     is_at_a_terminal: bool,
 ) -> Result<ExitCode> {
-    use std::io::Write;
     let bx = &resolve::resolve_pinned_box(project_dir, name)?;
-    let stream = session::connect_to_running_agent(
+    let mut stream = session::connect_to_running_agent(
         bx,
         "exec",
         AgentService::Exec,
         "exec service",
         args.agent.agent_timeout,
-    )?;
+    )
+    .await?;
 
     let env = resolve_exec_env(args.inherit_env, &args.env)?;
 
@@ -35,12 +35,12 @@ pub fn run(
         workdir: args.workdir.clone(),
         env,
     };
-    (&stream)
-        .write_all(&encode_frame(&req).context("encoding the exec request")?)
+    write_frame_async(&mut stream, &req)
+        .await
         .context("sending the exec request")?;
-    Ok(ExitCode::from(crate::exit_status_byte(pump_exec(
-        &stream, tty,
-    )?)))
+    Ok(ExitCode::from(crate::exit_status_byte(
+        pump_exec(stream, tty).await?,
+    )))
 }
 
 /// Host paths, shells, and session sockets would break or misconfigure the guest VM if inherited blindly.

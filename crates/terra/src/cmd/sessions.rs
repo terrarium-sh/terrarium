@@ -14,13 +14,13 @@ struct SessionEntry {
     term_size: Option<terra_protocol::TermSize>,
 }
 
-pub fn run(
+pub async fn run(
     args: &crate::cli::SessionsArgs,
     name: Option<&str>,
     project_dir: &Path,
 ) -> Result<ExitCode> {
     let bx = &resolve::resolve_pinned_box(project_dir, name)?;
-    let clients = session::list_clients(bx, args.agent.agent_timeout)?;
+    let clients = session::list_clients(bx, args.agent.agent_timeout).await?;
     if args.json {
         let entries: Vec<SessionEntry> = clients
             .into_iter()

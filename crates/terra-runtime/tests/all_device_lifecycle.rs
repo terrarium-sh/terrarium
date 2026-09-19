@@ -99,7 +99,6 @@ async fn start_vsock(runtime: &mut BoxRuntime, ram: SyntheticRam) -> VsockChanne
             ram,
             include_bytes!("../../../build/terra-vsock-component.cwasm"),
             vec![2, 0, 0, 0, b'{', b'}'],
-            false,
             None,
             None,
             None,

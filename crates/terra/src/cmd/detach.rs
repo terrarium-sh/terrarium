@@ -8,17 +8,17 @@ use anyhow::Result;
 use std::path::Path;
 use std::process::ExitCode;
 
-pub fn run(
+pub async fn run(
     args: &crate::cli::DetachArgs,
     name: Option<&str>,
     project_dir: &Path,
 ) -> Result<ExitCode> {
     let bx = &resolve::resolve_pinned_box(project_dir, name)?;
     if let Some(id) = args.id {
-        session::detach_client(bx, id, args.agent.agent_timeout)?;
+        session::detach_client(bx, id, args.agent.agent_timeout).await?;
         eprintln!("terra: detached client {id} from {bx}");
     } else {
-        let detached = session::detach_all(bx, args.agent.agent_timeout)?;
+        let detached = session::detach_all(bx, args.agent.agent_timeout).await?;
         if detached == 0 {
             eprintln!("terra: nobody was attached to {bx}");
         } else {

@@ -9,7 +9,8 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 #[cfg(test)]
 use std::process::Command;
 use std::process::{Child, ExitStatus};
-use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
+#[cfg(test)]
 use std::time::Duration;
 
 struct OwnedChild {
@@ -53,8 +54,6 @@ pub fn signal_owned_process_group(
 }
 
 static OWNED: Mutex<Vec<OwnedChild>> = Mutex::new(Vec::new());
-static REAPED: Condvar = Condvar::new();
-const IDLE: Duration = Duration::from_millis(100);
 
 fn register_owned(
     owned: &mut Vec<OwnedChild>,
@@ -90,55 +89,63 @@ where
     Ok((child, OwnedPidfd { pidfd, status }))
 }
 
-/// Waits for a child registered with [`spawn_owned`].
-pub fn wait_owned(pidfd: &OwnedPidfd) -> std::io::Result<ExitStatus> {
-    use std::os::unix::process::ExitStatusExt;
+/// Waits asynchronously for a child registered with [`spawn_owned`].
+pub async fn wait_owned(pidfd: &OwnedPidfd) -> std::io::Result<ExitStatus> {
+    let pidfd_ready = tokio::io::unix::AsyncFd::new(pidfd.try_clone()?)?;
     loop {
-        let parked_status = lock_or_abort(&pidfd.status).take();
-        if let Some(status) = parked_status {
-            lock_or_abort(&OWNED).retain(|child| !Arc::ptr_eq(&child.status, &pidfd.status));
+        if let Some(status) = collect_status(pidfd)? {
             return Ok(status);
         }
-        match rustix::process::waitid(
-            rustix::process::WaitId::PidFd(pidfd.as_fd()),
-            rustix::process::WaitIdOptions::EXITED,
-        ) {
-            Ok(Some(status)) => {
-                let raw = status
-                    .exit_status()
-                    .map(|code| code << 8)
-                    .or_else(|| {
-                        status
-                            .terminating_signal()
-                            .map(|signal| signal | if status.dumped() { 0x80 } else { 0 })
-                    })
-                    .ok_or_else(|| std::io::Error::other("child exited without a status"))?;
-                lock_or_abort(&OWNED).retain(|child| !Arc::ptr_eq(&child.status, &pidfd.status));
-                return Ok(ExitStatus::from_raw(raw));
-            }
-            Ok(None) => continue,
-            Err(rustix::io::Errno::CHILD) => {}
-            Err(error) => return Err(error.into()),
-        }
-        let mut owned = lock_or_abort(&OWNED);
-        let parked_status = lock_or_abort(&pidfd.status).take();
-        if let Some(status) = parked_status {
-            owned.retain(|child| !Arc::ptr_eq(&child.status, &pidfd.status));
+        let mut ready = pidfd_ready.readable().await?;
+        if let Some(status) = collect_status(pidfd)? {
             return Ok(status);
         }
-        owned = REAPED.wait(owned).unwrap_or_else(PoisonError::into_inner);
-        drop(owned);
+        ready.clear_ready();
     }
 }
 
-/// Spawns a background thread that reaps orphaned processes.
-pub fn watch_orphans() {
-    std::thread::spawn(|| {
-        loop {
-            while reap_one_orphan() {}
-            std::thread::sleep(IDLE);
+fn collect_status(pidfd: &OwnedPidfd) -> std::io::Result<Option<ExitStatus>> {
+    use std::os::unix::process::ExitStatusExt;
+
+    let mut owned = lock_or_abort(&OWNED);
+    if let Some(status) = lock_or_abort(&pidfd.status).take() {
+        owned.retain(|child| !Arc::ptr_eq(&child.status, &pidfd.status));
+        return Ok(Some(status));
+    }
+    match rustix::process::waitid(
+        rustix::process::WaitId::PidFd(pidfd.as_fd()),
+        rustix::process::WaitIdOptions::EXITED | rustix::process::WaitIdOptions::NOHANG,
+    ) {
+        Ok(Some(status)) => {
+            let raw = status
+                .exit_status()
+                .map(|code| code << 8)
+                .or_else(|| {
+                    status
+                        .terminating_signal()
+                        .map(|signal| signal | if status.dumped() { 0x80 } else { 0 })
+                })
+                .ok_or_else(|| std::io::Error::other("child exited without a status"))?;
+            owned.retain(|child| !Arc::ptr_eq(&child.status, &pidfd.status));
+            Ok(Some(ExitStatus::from_raw(raw)))
         }
-    });
+        Ok(None) | Err(rustix::io::Errno::CHILD) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub async fn watch_orphans(cancellation: tokio_util::sync::CancellationToken) {
+    let Ok(mut signals) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())
+    else {
+        return;
+    };
+    while reap_one_orphan() {}
+    while matches!(
+        cancellation.run_until_cancelled(signals.recv()).await,
+        Some(Some(()))
+    ) {
+        while reap_one_orphan() {}
+    }
 }
 
 /// Reaps one exited child, parking owned children's statuses. Returns true if a child was reaped.
@@ -151,7 +158,6 @@ fn reap_one_orphan() -> bool {
     if let Some(child) = owned.iter().find(|c| c.pid == pid) {
         use std::os::unix::process::ExitStatusExt;
         *lock_or_abort(&child.status) = Some(ExitStatus::from_raw(status.as_raw()));
-        REAPED.notify_all();
     }
     true
 }
@@ -162,8 +168,8 @@ mod tests {
 
     /// The whole point: a child nobody waits on is reaped, and one the agent
     /// took through [`spawn_owned`] is left for its own caller to collect.
-    #[test]
-    fn an_orphan_is_reaped_and_an_owned_child_is_left_alone() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_orphan_is_reaped_and_an_owned_child_is_left_alone() {
         let (owned_child, pidfd) =
             spawn_owned(|| Command::new("/bin/sh").arg("-c").arg("exit 7").spawn()).unwrap();
         let orphan = Command::new("/bin/sh")
@@ -183,7 +189,7 @@ mod tests {
         }
         assert!(gone(orphan_pid), "the orphan was never reaped");
 
-        assert_eq!(wait_owned(&pidfd).unwrap().code(), Some(7));
+        assert_eq!(wait_owned(&pidfd).await.unwrap().code(), Some(7));
         assert!(
             !OWNED
                 .lock()
@@ -194,8 +200,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_owned_status_survives_the_reaper_before_its_waiter() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_owned_status_survives_the_reaper_before_its_waiter() {
         let (child, pidfd) =
             spawn_owned(|| Command::new("/bin/sh").arg("-c").arg("exit 7").spawn()).unwrap();
         let pid = rustix::process::Pid::from_child(&child);
@@ -210,9 +216,9 @@ mod tests {
             {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(1));
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
-        assert_eq!(wait_owned(&pidfd).unwrap().code(), Some(7));
+        assert_eq!(wait_owned(&pidfd).await.unwrap().code(), Some(7));
     }
 
     #[test]

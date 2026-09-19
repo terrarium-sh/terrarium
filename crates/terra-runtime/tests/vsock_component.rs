@@ -154,11 +154,16 @@ async fn component_drains_selected_stream_while_another_is_queued() {
         .instantiate_async(&mut store, &component)
         .await
         .expect("instance");
-    let configure = instance
-        .get_typed_func::<(bool,), ()>(&mut store, export("configure-worker"))
-        .expect("configure worker");
-    configure
-        .call_async(&mut store, (true,))
+    let events =
+        instance
+            .get_typed_func::<(), (
+                wasmtime::component::StreamReader<
+                    terra_runtime::component::vsock::bindings::HostEvent,
+                >,
+            )>(&mut store, export("events"))
+            .expect("events");
+    let (_events,) = events
+        .call_async(&mut store, ())
         .await
         .expect("framed lifecycle");
     let receive: Receive = instance
@@ -364,36 +369,37 @@ async fn lifecycle_decoding_stays_in_component_and_handles_bounded_frames() {
         .instantiate_async(&mut store, &component)
         .await
         .unwrap();
-    let control: TypedFunc<(Vec<u8>, bool), ComponentResult<ControlResult>> = instance
+    let control: TypedFunc<(Vec<u8>,), ComponentResult<ControlResult>> = instance
         .get_typed_func(&mut store, export("decode-control"))
         .unwrap();
     let diagnostics: TypedFunc<(Vec<u8>,), ComponentResult<DiagnosticResult>> = instance
         .get_typed_func(&mut store, export("decode-diagnostics"))
         .unwrap();
-    for (frame, events) in [
-        (encode_frame(&-13).unwrap(), false),
-        (
-            encode_frame(&LifecycleEvent::Exit { code: -13 }).unwrap(),
-            true,
-        ),
-    ] {
-        let partial = control
-            .call_async(&mut store, (frame[..frame.len() - 1].to_vec(), events))
+    let frame = encode_frame(&LifecycleEvent::Exit { code: -13 }).unwrap();
+    let partial = control
+        .call_async(&mut store, (frame[..frame.len() - 1].to_vec(),))
+        .await
+        .unwrap()
+        .0
+        .unwrap();
+    assert_eq!(partial.consumed, 0);
+    assert_eq!(partial.exit_code, None);
+    let result = control
+        .call_async(&mut store, (frame.clone(),))
+        .await
+        .unwrap()
+        .0
+        .unwrap();
+    assert_eq!(result.consumed as usize, frame.len());
+    assert_eq!(result.exit_code, Some(-13));
+    assert!(
+        control
+            .call_async(&mut store, (encode_frame(&-13).unwrap(),))
             .await
             .unwrap()
             .0
-            .unwrap();
-        assert_eq!(partial.consumed, 0);
-        assert_eq!(partial.exit_code, None);
-        let result = control
-            .call_async(&mut store, (frame.clone(), events))
-            .await
-            .unwrap()
-            .0
-            .unwrap();
-        assert_eq!(result.consumed as usize, frame.len());
-        assert_eq!(result.exit_code, Some(-13));
-    }
+            .is_err()
+    );
     for bytes in [vec![255; 16300], vec![0; 32700]] {
         let frame = encode_frame(&LifecycleEvent::Diagnostic {
             bytes: bytes.clone(),

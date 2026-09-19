@@ -1,4 +1,4 @@
-//! Wire protocol types for filesystem synchronization (`AgentService::Files`).
+//! Wire protocol types for filesystem synchronization (`AgentService::Sync`).
 
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -68,7 +68,7 @@ pub enum RootStatus {
     Missing,
 }
 
-/// Host requests sent to the guest agent over [`crate::AgentService::Files`].
+/// Host requests sent to the guest agent over [`crate::AgentService::Sync`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SyncRequest {
     /// Open the sync session for a specific guest root.
@@ -131,7 +131,7 @@ pub enum SyncRequest {
     EndSession,
 }
 
-/// Guest agent replies sent to the host over [`crate::AgentService::Files`].
+/// Guest agent replies sent to the host over [`crate::AgentService::Sync`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SyncReply {
     /// The session has opened and resolved the guest root.

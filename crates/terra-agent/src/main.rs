@@ -1,29 +1,161 @@
 //! Guest agent entrypoint: PID 1.
-
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+#[cfg(target_os = "linux")]
+mod bootstrap;
+#[cfg(target_os = "linux")]
+mod config;
 #[cfg(target_os = "linux")]
 mod daemon;
 #[cfg(target_os = "linux")]
+mod diagnostics;
+#[cfg(target_os = "linux")]
 mod exec;
 #[cfg(target_os = "linux")]
-mod files;
-#[cfg(target_os = "linux")]
-mod init;
+mod hooks;
 #[cfg(target_os = "linux")]
 mod mutex;
 #[cfg(target_os = "linux")]
 mod reap;
 #[cfg(target_os = "linux")]
+mod sync;
+#[cfg(target_os = "linux")]
 mod term {
     pub mod session;
     pub mod tty;
 }
+#[cfg(all(test, target_os = "linux"))]
+mod tests;
 #[cfg(target_os = "linux")]
 mod vsock;
+#[cfg(target_os = "linux")]
+mod workload;
 
 #[cfg(target_os = "linux")]
-fn main() {
-    init::boot();
+use {
+    anyhow::Result,
+    diagnostics::Diagnostics,
+    std::{
+        fs::{self, File},
+        io::Write,
+    },
+    terra_protocol::{CLOCK_SYNC, LifecycleEvent, Plan, STOP_SIGNAL},
+    tokio_util::{sync::CancellationToken, task::TaskTracker},
+};
+
+#[cfg(target_os = "linux")]
+type AsyncFile = tokio_util::compat::Compat<async_io::Async<File>>;
+
+#[cfg(target_os = "linux")]
+fn into_async_file(file: impl Into<std::os::fd::OwnedFd>) -> std::io::Result<AsyncFile> {
+    use tokio_util::compat::FuturesAsyncReadCompatExt;
+    async_io::Async::new(File::from(file.into())).map(FuturesAsyncReadCompatExt::compat)
+}
+
+#[cfg(target_os = "linux")]
+const AGENT_FAILED: i32 = 1;
+
+#[cfg(target_os = "linux")]
+fn main() -> ! {
+    let (control, outcome) = match bootstrap::enter_root() {
+        Ok((plan, control, diagnostic)) => {
+            let outcome = run_agent(&plan, &control, diagnostic);
+            if let Ok(flags) = rustix::fs::fcntl_getfl(&control) {
+                let _ = rustix::fs::fcntl_setfl(&control, flags & !rustix::fs::OFlags::NONBLOCK);
+            }
+            (Some(control), outcome)
+        }
+        Err(error) => (None, Err(error)),
+    };
+    if let Err(error) = &outcome {
+        eprintln!("terra-agent: init failed: {error:#}");
+        if let Ok(mut kernel_log) = fs::OpenOptions::new().write(true).open("/dev/kmsg") {
+            let _ =
+                kernel_log.write_all(format!("terra-agent: init failed: {error:#}\n").as_bytes());
+        }
+    }
+    let code = *outcome.as_ref().unwrap_or(&AGENT_FAILED);
+    // Disk sync precedes the report so host teardown can safely race it.
+    rustix::fs::sync();
+    if let Some(mut control) = control {
+        if let Err(error) = write_exit_report(&mut control, code) {
+            eprintln!("terra-agent: warning: could not report the exit status ({code}): {error}");
+        } else {
+            // Powering off would reset virtio before the host drains the exit frame.
+            loop {
+                std::thread::park();
+            }
+        }
+    }
+    if let Err(error) = rustix::system::reboot(rustix::system::RebootCommand::PowerOff) {
+        eprintln!("terra-agent: could not power off after reporting exit status: {error}");
+    }
+    std::process::exit(i32::from(outcome.is_err()))
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::main]
+async fn run_agent(plan: &Plan, control: &File, diagnostic: File) -> Result<i32> {
+    let control_reader = crate::into_async_file(control.try_clone()?)?;
+    let diagnostic = Diagnostics::new(diagnostic)?;
+    let stop = CancellationToken::new();
+    let shutdown = CancellationToken::new();
+    let tasks = TaskTracker::new();
+    tasks.spawn(crate::reap::watch_orphans(shutdown.clone()));
+    tasks.spawn(watch_control(
+        control_reader,
+        stop.clone(),
+        shutdown.clone(),
+    ));
+    diagnostic.record(b"agent received boot plan");
+    let outcome = workload::execute(plan, &diagnostic, &stop, &shutdown, &tasks).await;
+    shutdown.cancel();
+    tasks.close();
+    tasks.wait().await;
+    if let Err(error) = &outcome {
+        diagnostic.record(format!("terra-agent: init failed: {error:#}").as_bytes());
+    }
+    diagnostic.finish().await;
+    outcome
+}
+
+#[cfg(target_os = "linux")]
+fn write_exit_report(writer: &mut impl Write, code: i32) -> std::io::Result<()> {
+    let frame = terra_protocol::encode_frame(&LifecycleEvent::Exit { code })?;
+    writer.write_all(&frame).and_then(|()| writer.flush())
+}
+
+#[cfg(target_os = "linux")]
+async fn watch_control(
+    mut control: crate::AsyncFile,
+    stop: CancellationToken,
+    shutdown: CancellationToken,
+) {
+    use tokio::io::AsyncReadExt as _;
+    shutdown
+        .run_until_cancelled(async {
+            let mut byte = [0u8; 1];
+            loop {
+                match control.read(&mut byte).await {
+                    Ok(0) => break,
+                    Ok(_) if byte[0] == STOP_SIGNAL => break,
+                    Ok(_) if byte[0] == CLOCK_SYNC => {
+                        if let Err(error) = bootstrap::read_clock_update(&mut control).await {
+                            eprintln!("terra-agent: clock update failed ({error:#})");
+                        }
+                    }
+                    Ok(_) => eprintln!("terra-agent: ignored invalid control command"),
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) => {
+                        eprintln!(
+                            "terra-agent: the control connection failed ({error}) - stopping"
+                        );
+                        break;
+                    }
+                }
+            }
+            stop.cancel();
+        })
+        .await;
 }
 
 #[cfg(not(target_os = "linux"))]

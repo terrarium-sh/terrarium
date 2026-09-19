@@ -1,4 +1,4 @@
-//! The agent's file port: one sync session per connection (`AgentService::Files`).
+//! The agent's filesystem synchronization service (`AgentService::Sync`).
 
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
@@ -11,6 +11,18 @@ use terra_protocol::{
     SyncEntryKind, SyncReply, SyncRequest, WORKLOAD_ID, encode_frame, read_frame, truncate_nanos,
     validate_relative_path,
 };
+use tokio_util::sync::CancellationToken;
+
+fn ensure_not_cancelled(cancellation: &CancellationToken) -> std::io::Result<()> {
+    if cancellation.is_cancelled() {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "file transfer cancelled",
+        ))
+    } else {
+        Ok(())
+    }
+}
 
 fn open_directory(
     path: &Path,
@@ -32,6 +44,16 @@ struct PreparedPut {
     parent: std::fs::File,
     temp_name: std::ffi::OsString,
     destination_name: std::ffi::OsString,
+    is_committed: bool,
+}
+
+impl Drop for PreparedPut {
+    fn drop(&mut self) {
+        if !self.is_committed {
+            let _ =
+                rustix::fs::unlinkat(&self.parent, &self.temp_name, rustix::fs::AtFlags::empty());
+        }
+    }
 }
 
 fn generate_random_temp_name() -> std::io::Result<std::ffi::OsString> {
@@ -65,6 +87,7 @@ fn create_put_temp(path: &Path) -> std::io::Result<PreparedPut> {
         parent,
         temp_name: temp,
         destination_name: destination,
+        is_committed: false,
     })
 }
 
@@ -135,7 +158,7 @@ fn open_or_create_directory(
     Ok(parent)
 }
 
-fn inspect_file(path: &Path) -> std::io::Result<(std::fs::File, u32, u64, i64, u32)> {
+fn open_sync_file(path: &Path) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
     let file: std::fs::File = rustix::fs::open(
         path,
         rustix::fs::OFlags::RDONLY
@@ -157,18 +180,10 @@ fn inspect_file(path: &Path) -> std::io::Result<(std::fs::File, u32, u64, i64, u
             "file is larger than the {MAX_FILE_BYTES}-byte limit"
         )));
     }
-    let mtime_secs = meta.mtime();
-    let mtime_nanos = truncate_nanos(u32::try_from(meta.mtime_nsec()).unwrap_or(0));
-    Ok((
-        file,
-        meta.permissions().mode() & 0o7777,
-        meta.len(),
-        mtime_secs,
-        mtime_nanos,
-    ))
+    Ok((file, meta))
 }
 
-fn send_reply_checked(conn: &mut impl Write, reply: &SyncReply) -> std::io::Result<()> {
+fn send_reply(conn: &mut impl Write, reply: &SyncReply) -> std::io::Result<()> {
     let frame = encode_frame(reply)?;
     conn.write_all(&frame)
 }
@@ -191,25 +206,14 @@ fn resolve_target_path(session_root: &Path, relative_path: &str) -> std::io::Res
     Ok(path)
 }
 
-enum HashProgress {
-    Progress(u64),
-    Done(std::io::Result<[u8; 32]>),
-}
-
-fn hash_file_worker(path: &Path, tx: &std::sync::mpsc::Sender<HashProgress>) {
-    let mut file = match inspect_file(path) {
-        Ok((file, ..)) => file,
-        Err(e) => {
-            let _ = tx.send(HashProgress::Done(Err(e)));
-            return;
-        }
-    };
-    let before = match file.metadata() {
-        Ok(meta) => meta,
-        Err(error) => {
-            let _ = tx.send(HashProgress::Done(Err(error)));
-            return;
-        }
+fn hash_file<E>(
+    path: &Path,
+    cancellation: &CancellationToken,
+    mut report_progress: impl FnMut(u64) -> Result<(), E>,
+) -> Result<std::io::Result<[u8; 32]>, E> {
+    let (mut file, before) = match open_sync_file(path) {
+        Ok(file) => file,
+        Err(error) => return Ok(Err(error)),
     };
     let deadline = std::time::Instant::now() + Duration::from_hours(1);
     let mut hasher = Sha256::new();
@@ -217,11 +221,11 @@ fn hash_file_worker(path: &Path, tx: &std::sync::mpsc::Sender<HashProgress>) {
     let mut total_hashed = 0u64;
     let mut last_report = std::time::Instant::now();
     loop {
+        if let Err(error) = ensure_not_cancelled(cancellation) {
+            return Ok(Err(error));
+        }
         if std::time::Instant::now() >= deadline || total_hashed > MAX_FILE_BYTES {
-            let _ = tx.send(HashProgress::Done(Err(std::io::Error::other(
-                "hashing exceeded its limit",
-            ))));
-            return;
+            return Ok(Err(std::io::Error::other("hashing exceeded its limit")));
         }
         match file.read(&mut buffer) {
             Ok(0) => break,
@@ -229,35 +233,32 @@ fn hash_file_worker(path: &Path, tx: &std::sync::mpsc::Sender<HashProgress>) {
                 hasher.update(&buffer[..n]);
                 total_hashed += n as u64;
                 if last_report.elapsed() >= Duration::from_millis(1500) {
-                    if tx.send(HashProgress::Progress(total_hashed)).is_err() {
-                        return;
-                    }
+                    report_progress(total_hashed)?;
                     last_report = std::time::Instant::now();
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) => {
-                let _ = tx.send(HashProgress::Done(Err(e)));
-                return;
-            }
+            Err(error) => return Ok(Err(error)),
         }
     }
     if !file.metadata().is_ok_and(|after| {
         before.len() == after.len() && before.modified().ok() == after.modified().ok()
     }) {
-        let _ = tx.send(HashProgress::Done(Err(std::io::Error::other(
-            "source changed while hashing",
-        ))));
-        return;
+        return Ok(Err(std::io::Error::other("source changed while hashing")));
     }
-    let digest = hasher.finalize();
-    let _ = tx.send(HashProgress::Done(Ok(digest.into())));
+    Ok(Ok(hasher.finalize().into()))
 }
 
-fn stream_exact(mut from: impl Read, mut to: impl Write, size: u64) -> std::io::Result<()> {
+fn stream_exact(
+    mut from: impl Read,
+    mut to: impl Write,
+    size: u64,
+    cancellation: &CancellationToken,
+) -> std::io::Result<()> {
     let mut buf = [0u8; 8192];
     let mut remaining = size;
     while remaining > 0 {
+        ensure_not_cancelled(cancellation)?;
         let want = usize::min(buf.len(), usize::try_from(remaining).unwrap_or(buf.len()));
         let n = match from.read(&mut buf[..want]) {
             Ok(0) => {
@@ -270,6 +271,7 @@ fn stream_exact(mut from: impl Read, mut to: impl Write, size: u64) -> std::io::
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         };
+        ensure_not_cancelled(cancellation)?;
         to.write_all(&buf[..n])?;
         remaining -= n as u64;
     }
@@ -290,6 +292,26 @@ fn set_path_mtime(path: &Path, mtime_secs: i64, mtime_nanos: u32) -> std::io::Re
     };
     rustix::fs::utimensat(rustix::fs::CWD, path, &times, rustix::fs::AtFlags::empty())
         .map_err(std::io::Error::from)
+}
+
+fn build_sync_entry(
+    relative_path: String,
+    kind: SyncEntryKind,
+    metadata: &std::fs::Metadata,
+    link_target: Option<String>,
+) -> SyncEntry {
+    SyncEntry {
+        relative_path,
+        kind,
+        size: match kind {
+            SyncEntryKind::File => metadata.len(),
+            SyncEntryKind::Directory | SyncEntryKind::Symlink => 0,
+        },
+        mode: metadata.mode() & 0o777,
+        mtime_secs: metadata.mtime(),
+        mtime_nanos: truncate_nanos(u32::try_from(metadata.mtime_nsec()).unwrap_or(0)),
+        link_target,
+    }
 }
 
 struct ScanState<'a, W: Write> {
@@ -313,7 +335,7 @@ impl<W: Write> ScanState<'_, W> {
         };
         let rel_str = child_rel.to_string_lossy().into_owned();
         if rel_str.len() > terra_protocol::MAX_SYNC_PATH_BYTES {
-            send_reply_checked(
+            send_reply(
                 self.conn,
                 &SyncReply::Err(format!("relative path exceeds maximum length: {rel_str}")),
             )?;
@@ -323,13 +345,13 @@ impl<W: Write> ScanState<'_, W> {
         let meta = match std::fs::symlink_metadata(&full) {
             Ok(m) => m,
             Err(e) => {
-                send_reply_checked(self.conn, &SyncReply::Err(e.to_string()))?;
+                send_reply(self.conn, &SyncReply::Err(e.to_string()))?;
                 return Ok(false);
             }
         };
         self.entries_count += 1;
         if self.entries_count > MAX_SYNC_ENTRIES {
-            send_reply_checked(
+            send_reply(
                 self.conn,
                 &SyncReply::Err(format!(
                     "manifest exceeds maximum entries limit: {MAX_SYNC_ENTRIES}"
@@ -353,14 +375,14 @@ impl<W: Write> ScanState<'_, W> {
                     SyncEntryKind::Symlink
                 }
                 Err(e) => {
-                    send_reply_checked(self.conn, &SyncReply::Err(e.to_string()))?;
+                    send_reply(self.conn, &SyncReply::Err(e.to_string()))?;
                     return Ok(false);
                 }
             }
         } else if meta.is_file() {
             SyncEntryKind::File
         } else {
-            send_reply_checked(
+            send_reply(
                 self.conn,
                 &SyncReply::Err(format!("unsupported special file: {rel_str}")),
             )?;
@@ -368,7 +390,7 @@ impl<W: Write> ScanState<'_, W> {
         };
         self.total_metadata_bytes += rel_str.len() + 32;
         if self.total_metadata_bytes > MAX_SYNC_METADATA_BYTES {
-            send_reply_checked(
+            send_reply(
                 self.conn,
                 &SyncReply::Err(format!(
                     "manifest metadata exceeds maximum bytes limit: {MAX_SYNC_METADATA_BYTES}"
@@ -376,27 +398,19 @@ impl<W: Write> ScanState<'_, W> {
             )?;
             return Ok(false);
         }
-        let mtime_secs = meta.mtime();
-        let mtime_nanos = truncate_nanos(u32::try_from(meta.mtime_nsec()).unwrap_or(0));
-        let sync_entry = SyncEntry {
-            relative_path: rel_str,
-            kind,
-            size: if kind == SyncEntryKind::File {
-                meta.len()
-            } else {
-                0
-            },
-            mode: meta.mode() & 0o777,
-            mtime_secs,
-            mtime_nanos,
-            link_target,
-        };
-        send_reply_checked(self.conn, &SyncReply::Entry(sync_entry))?;
+        send_reply(
+            self.conn,
+            &SyncReply::Entry(build_sync_entry(rel_str, kind, &meta, link_target)),
+        )?;
         Ok(true)
     }
 }
 
-fn scan_directory_tree(session_root: &Path, conn: &mut impl Write) -> std::io::Result<()> {
+fn scan_directory_tree(
+    session_root: &Path,
+    conn: &mut impl Write,
+    cancellation: &CancellationToken,
+) -> std::io::Result<()> {
     let mut state = ScanState {
         session_root,
         conn,
@@ -407,6 +421,7 @@ fn scan_directory_tree(session_root: &Path, conn: &mut impl Write) -> std::io::R
     queue.push_back(PathBuf::new());
 
     while let Some(rel) = queue.pop_front() {
+        ensure_not_cancelled(cancellation)?;
         let full = if rel.as_os_str().is_empty() {
             session_root.to_path_buf()
         } else {
@@ -415,7 +430,7 @@ fn scan_directory_tree(session_root: &Path, conn: &mut impl Write) -> std::io::R
         let read_dir = match std::fs::read_dir(&full) {
             Ok(rd) => rd,
             Err(e) => {
-                send_reply_checked(
+                send_reply(
                     state.conn,
                     &SyncReply::Err(format!("reading directory {}: {e}", full.display())),
                 )?;
@@ -423,16 +438,17 @@ fn scan_directory_tree(session_root: &Path, conn: &mut impl Write) -> std::io::R
             }
         };
         for entry_res in read_dir {
+            ensure_not_cancelled(cancellation)?;
             let entry = match entry_res {
                 Ok(e) => e,
                 Err(e) => {
-                    send_reply_checked(state.conn, &SyncReply::Err(e.to_string()))?;
+                    send_reply(state.conn, &SyncReply::Err(e.to_string()))?;
                     return Ok(());
                 }
             };
             let file_name = entry.file_name();
             let Some(name_str) = file_name.to_str() else {
-                send_reply_checked(
+                send_reply(
                     state.conn,
                     &SyncReply::Err("non-utf8 filename encountered".to_string()),
                 )?;
@@ -446,72 +462,45 @@ fn scan_directory_tree(session_root: &Path, conn: &mut impl Write) -> std::io::R
             }
         }
     }
-    send_reply_checked(state.conn, &SyncReply::ScanComplete)
+    send_reply(state.conn, &SyncReply::ScanComplete)
 }
 
 fn handle_scan_entries(
     root_path: &Path,
     root_status: RootStatus,
     conn: &mut (impl Read + Write),
+    cancellation: &CancellationToken,
 ) -> std::io::Result<()> {
-    match root_status {
-        RootStatus::ExistingDirectory => {
-            let meta = std::fs::symlink_metadata(root_path)?;
-            send_reply_checked(
-                conn,
-                &SyncReply::Entry(SyncEntry {
-                    relative_path: String::new(),
-                    kind: SyncEntryKind::Directory,
-                    size: 0,
-                    mode: meta.mode() & 0o777,
-                    mtime_secs: meta.mtime(),
-                    mtime_nanos: truncate_nanos(u32::try_from(meta.mtime_nsec()).unwrap_or(0)),
-                    link_target: None,
-                }),
-            )?;
-            scan_directory_tree(root_path, conn)
-        }
-        RootStatus::ExistingFile => {
-            let meta = std::fs::symlink_metadata(root_path)?;
-            let mtime_secs = meta.mtime();
-            let mtime_nanos = truncate_nanos(u32::try_from(meta.mtime_nsec()).unwrap_or(0));
-            send_reply_checked(
-                conn,
-                &SyncReply::Entry(SyncEntry {
-                    relative_path: String::new(),
-                    kind: SyncEntryKind::File,
-                    size: meta.len(),
-                    mode: meta.mode() & 0o777,
-                    mtime_secs,
-                    mtime_nanos,
-                    link_target: None,
-                }),
-            )?;
-            send_reply_checked(conn, &SyncReply::ScanComplete)
-        }
-        RootStatus::ExistingSymlink => {
-            let meta = std::fs::symlink_metadata(root_path)?;
-            let target = std::fs::read_link(root_path)?
+    ensure_not_cancelled(cancellation)?;
+    let kind = match root_status {
+        RootStatus::ExistingDirectory => SyncEntryKind::Directory,
+        RootStatus::ExistingFile => SyncEntryKind::File,
+        RootStatus::ExistingSymlink => SyncEntryKind::Symlink,
+        RootStatus::Missing => return send_reply(conn, &SyncReply::ScanComplete),
+    };
+    let metadata = std::fs::symlink_metadata(root_path)?;
+    let link_target = if kind == SyncEntryKind::Symlink {
+        Some(
+            std::fs::read_link(root_path)?
                 .to_str()
                 .ok_or_else(|| std::io::Error::other("non-UTF-8 symlink target"))?
-                .to_owned();
-            let mtime_secs = meta.mtime();
-            let mtime_nanos = truncate_nanos(u32::try_from(meta.mtime_nsec()).unwrap_or(0));
-            send_reply_checked(
-                conn,
-                &SyncReply::Entry(SyncEntry {
-                    relative_path: String::new(),
-                    kind: SyncEntryKind::Symlink,
-                    size: 0,
-                    mode: meta.mode() & 0o777,
-                    mtime_secs,
-                    mtime_nanos,
-                    link_target: Some(target),
-                }),
-            )?;
-            send_reply_checked(conn, &SyncReply::ScanComplete)
-        }
-        RootStatus::Missing => send_reply_checked(conn, &SyncReply::ScanComplete),
+                .to_owned(),
+        )
+    } else {
+        None
+    };
+    send_reply(
+        conn,
+        &SyncReply::Entry(build_sync_entry(
+            String::new(),
+            kind,
+            &metadata,
+            link_target,
+        )),
+    )?;
+    match kind {
+        SyncEntryKind::Directory => scan_directory_tree(root_path, conn, cancellation),
+        SyncEntryKind::File | SyncEntryKind::Symlink => send_reply(conn, &SyncReply::ScanComplete),
     }
 }
 
@@ -519,35 +508,17 @@ fn handle_compute_digest(
     root_path: &Path,
     relative_path: &str,
     conn: &mut (impl Read + Write),
+    cancellation: &CancellationToken,
 ) -> std::io::Result<()> {
     let target = match resolve_target_path(root_path, relative_path) {
         Ok(p) => p,
-        Err(e) => return send_reply_checked(conn, &SyncReply::Err(e.to_string())),
+        Err(e) => return send_reply(conn, &SyncReply::Err(e.to_string())),
     };
-    let (tx, rx) = std::sync::mpsc::channel();
-    let thread_path = target.clone();
-    std::thread::spawn(move || {
-        hash_file_worker(&thread_path, &tx);
-    });
-    loop {
-        match rx.recv_timeout(Duration::from_millis(500)) {
-            Ok(HashProgress::Progress(bytes_hashed)) => {
-                send_reply_checked(conn, &SyncReply::DigestProgress { bytes_hashed })?;
-            }
-            Ok(HashProgress::Done(Ok(sha256))) => {
-                return send_reply_checked(conn, &SyncReply::Digest { sha256 });
-            }
-            Ok(HashProgress::Done(Err(e))) => {
-                return send_reply_checked(conn, &SyncReply::Err(e.to_string()));
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return send_reply_checked(
-                    conn,
-                    &SyncReply::Err("hashing worker disconnected".to_string()),
-                );
-            }
-        }
+    match hash_file(&target, cancellation, |bytes_hashed| {
+        send_reply(conn, &SyncReply::DigestProgress { bytes_hashed })
+    })? {
+        Ok(sha256) => send_reply(conn, &SyncReply::Digest { sha256 }),
+        Err(error) => send_reply(conn, &SyncReply::Err(error.to_string())),
     }
 }
 
@@ -565,34 +536,33 @@ fn handle_write_file(
     meta: WriteFileMeta,
     workload_is_root: bool,
     conn: &mut (impl Read + Write),
+    cancellation: &CancellationToken,
 ) -> std::io::Result<()> {
     let target = match resolve_target_path(root_path, relative_path) {
         Ok(p) => p,
-        Err(e) => return send_reply_checked(conn, &SyncReply::Err(e.to_string())),
+        Err(e) => return send_reply(conn, &SyncReply::Err(e.to_string())),
     };
-    let PreparedPut {
-        mut file,
-        parent,
-        temp_name,
-        destination_name,
-    } = match prepare_put(&target) {
+    let mut upload = match prepare_put(&target) {
         Ok(p) => p,
-        Err(e) => return send_reply_checked(conn, &SyncReply::Err(e.to_string())),
+        Err(e) => return send_reply(conn, &SyncReply::Err(e.to_string())),
     };
-    send_reply_checked(conn, &SyncReply::WriteFileReady)?;
+    send_reply(conn, &SyncReply::WriteFileReady)?;
 
     let result = (|| -> std::io::Result<()> {
-        stream_exact(&mut *conn, &mut file, meta.size)?;
+        let file = &mut upload.file;
+        stream_exact(&mut *conn, &mut *file, meta.size, cancellation)?;
+        ensure_not_cancelled(cancellation)?;
         if !matches!(
             read_frame::<SyncRequest>(&mut *conn)?,
             Some(SyncRequest::CommitFile)
         ) {
             return Err(std::io::Error::other("upload was not committed by sender"));
         }
+        ensure_not_cancelled(cancellation)?;
         file.set_len(meta.size)?;
         if !workload_is_root {
             rustix::fs::fchown(
-                &file,
+                &*file,
                 Some(rustix::process::Uid::from_raw(WORKLOAD_ID)),
                 Some(rustix::process::Gid::from_raw(WORKLOAD_ID)),
             )
@@ -604,15 +574,20 @@ fn handle_write_file(
             meta.mtime_nanos,
         )?)?;
         file.sync_all()?;
-        drop(file);
-        rustix::fs::renameat(&parent, &temp_name, &parent, &destination_name)
-            .map_err(std::io::Error::from)
+        ensure_not_cancelled(cancellation)?;
+        rustix::fs::renameat(
+            &upload.parent,
+            &upload.temp_name,
+            &upload.parent,
+            &upload.destination_name,
+        )?;
+        upload.is_committed = true;
+        Ok(())
     })();
 
-    let _ = rustix::fs::unlinkat(&parent, &temp_name, rustix::fs::AtFlags::empty());
     match result {
-        Ok(()) => send_reply_checked(conn, &SyncReply::Success),
-        Err(e) => send_reply_checked(conn, &SyncReply::Err(e.to_string())),
+        Ok(()) => send_reply(conn, &SyncReply::Success),
+        Err(e) => send_reply(conn, &SyncReply::Err(e.to_string())),
     }
 }
 
@@ -620,70 +595,53 @@ fn handle_read_file(
     root_path: &Path,
     relative_path: &str,
     conn: &mut (impl Read + Write),
+    cancellation: &CancellationToken,
 ) -> std::io::Result<()> {
     let target = match resolve_target_path(root_path, relative_path) {
         Ok(p) => p,
-        Err(e) => return send_reply_checked(conn, &SyncReply::Err(e.to_string())),
+        Err(e) => return send_reply(conn, &SyncReply::Err(e.to_string())),
     };
-    let (mut file, mode, size, mtime_secs, mtime_nanos) = match inspect_file(&target) {
+    let (mut file, before) = match open_sync_file(&target) {
         Ok(res) => res,
-        Err(e) => return send_reply_checked(conn, &SyncReply::Err(e.to_string())),
+        Err(e) => return send_reply(conn, &SyncReply::Err(e.to_string())),
     };
-    send_reply_checked(
+    send_reply(
         conn,
         &SyncReply::ReadFileReady {
-            size,
-            mode,
-            mtime_secs,
-            mtime_nanos,
+            size: before.len(),
+            mode: before.mode() & 0o7777,
+            mtime_secs: before.mtime(),
+            mtime_nanos: truncate_nanos(u32::try_from(before.mtime_nsec()).unwrap_or(0)),
         },
     )?;
-    let before = file.metadata()?;
-    stream_exact(&mut file, &mut *conn, size)?;
+    stream_exact(&mut file, &mut *conn, before.len(), cancellation)?;
     let after = file.metadata()?;
     if before.len() != after.len() || before.modified()? != after.modified()? {
-        return send_reply_checked(
+        return send_reply(
             conn,
             &SyncReply::Err("source changed while transferring".to_string()),
         );
     }
-    send_reply_checked(conn, &SyncReply::Success)
+    send_reply(conn, &SyncReply::Success)
 }
 
-fn handle_create_dir(
+fn create_directory(
     root_path: &Path,
     relative_path: &str,
     mode: u32,
     workload_is_root: bool,
-    conn: &mut (impl Read + Write),
 ) -> std::io::Result<()> {
-    let dir_path = match resolve_target_path(root_path, relative_path) {
-        Ok(p) => p,
-        Err(e) => return send_reply_checked(conn, &SyncReply::Err(e.to_string())),
-    };
+    let dir_path = resolve_target_path(root_path, relative_path)?;
     if let Some(parent) = dir_path.parent() {
         ensure_directory(parent, false)?;
     }
-    let res = open_or_create_directory(&dir_path, !workload_is_root, rustix::fs::OFlags::NOFOLLOW)
-        .and_then(|directory| {
-            directory.set_permissions(std::fs::Permissions::from_mode((mode & 0o777) | 0o700))
-        });
-    match res {
-        Ok(()) => send_reply_checked(conn, &SyncReply::Success),
-        Err(e) => send_reply_checked(conn, &SyncReply::Err(e.to_string())),
-    }
+    let directory =
+        open_or_create_directory(&dir_path, !workload_is_root, rustix::fs::OFlags::NOFOLLOW)?;
+    directory.set_permissions(std::fs::Permissions::from_mode((mode & 0o777) | 0o700))
 }
 
-fn handle_create_symlink(
-    root_path: &Path,
-    relative_path: &str,
-    target: &str,
-    conn: &mut (impl Read + Write),
-) -> std::io::Result<()> {
-    let link_path = match resolve_target_path(root_path, relative_path) {
-        Ok(p) => p,
-        Err(e) => return send_reply_checked(conn, &SyncReply::Err(e.to_string())),
-    };
+fn create_symlink(root_path: &Path, relative_path: &str, target: &str) -> std::io::Result<()> {
+    let link_path = resolve_target_path(root_path, relative_path)?;
     if let Some(parent) = link_path.parent() {
         ensure_directory(parent, false)?;
     }
@@ -691,64 +649,43 @@ fn handle_create_symlink(
     let result =
         std::os::unix::fs::symlink(target, &temp).and_then(|()| std::fs::rename(&temp, &link_path));
     let _ = std::fs::remove_file(&temp);
-    match result {
-        Ok(()) => send_reply_checked(conn, &SyncReply::Success),
-        Err(e) => send_reply_checked(conn, &SyncReply::Err(e.to_string())),
-    }
+    result
 }
 
-fn handle_update_metadata(
+fn update_metadata(
     root_path: &Path,
     relative_path: &str,
     mode: u32,
     mtime_secs: i64,
     mtime_nanos: u32,
-    conn: &mut (impl Read + Write),
 ) -> std::io::Result<()> {
-    let target = match resolve_target_path(root_path, relative_path) {
-        Ok(p) => p,
-        Err(e) => return send_reply_checked(conn, &SyncReply::Err(e.to_string())),
-    };
+    let target = resolve_target_path(root_path, relative_path)?;
     let meta = std::fs::symlink_metadata(&target)?;
     if meta.file_type().is_symlink() {
         return Err(std::io::Error::other("cannot update symlink metadata"));
     }
     std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode & 0o777))?;
-    match set_path_mtime(&target, mtime_secs, mtime_nanos) {
-        Ok(()) => send_reply_checked(conn, &SyncReply::Success),
-        Err(e) => send_reply_checked(conn, &SyncReply::Err(e.to_string())),
-    }
+    set_path_mtime(&target, mtime_secs, mtime_nanos)
 }
 
-fn handle_remove_entry(
-    root_path: &Path,
-    relative_path: &str,
-    is_dir: bool,
-    conn: &mut (impl Read + Write),
-) -> std::io::Result<()> {
+fn remove_entry(root_path: &Path, relative_path: &str, is_dir: bool) -> std::io::Result<()> {
     if relative_path.is_empty() {
-        return send_reply_checked(
-            conn,
-            &SyncReply::Err("cannot remove session root itself".to_string()),
-        );
+        return Err(std::io::Error::other("cannot remove session root itself"));
     }
-    let target = match resolve_target_path(root_path, relative_path) {
-        Ok(p) => p,
-        Err(e) => return send_reply_checked(conn, &SyncReply::Err(e.to_string())),
-    };
-    let res = if is_dir {
+    let target = resolve_target_path(root_path, relative_path)?;
+    if is_dir {
         std::fs::remove_dir(&target)
     } else {
         std::fs::remove_file(&target)
-    };
-    match res {
-        Ok(()) => send_reply_checked(conn, &SyncReply::Success),
-        Err(e) => send_reply_checked(conn, &SyncReply::Err(e.to_string())),
     }
 }
 
-pub fn serve_sync_session(mut conn: impl Read + Write, workload_is_root: bool) {
-    let _ = handle_sync_session(&mut conn, workload_is_root);
+pub fn serve_sync_session(
+    mut conn: impl Read + Write,
+    workload_is_root: bool,
+    cancellation: &CancellationToken,
+) {
+    let _ = handle_sync_session(&mut conn, workload_is_root, cancellation);
 }
 
 fn inspect_root_status(
@@ -761,7 +698,7 @@ fn inspect_root_status(
         Ok(m) if m.file_type().is_symlink() => Ok(Some(RootStatus::ExistingSymlink)),
         Ok(m) if m.is_file() => Ok(Some(RootStatus::ExistingFile)),
         Ok(_) => {
-            send_reply_checked(
+            send_reply(
                 conn,
                 &SyncReply::Err(format!("root {guest_root} is an unsupported file type")),
             )?;
@@ -769,7 +706,7 @@ fn inspect_root_status(
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Some(RootStatus::Missing)),
         Err(e) => {
-            send_reply_checked(
+            send_reply(
                 conn,
                 &SyncReply::Err(format!("inspecting root {guest_root}: {e}")),
             )?;
@@ -789,20 +726,23 @@ fn init_session(conn: &mut (impl Read + Write)) -> std::io::Result<Option<(PathB
         return Ok(None);
     };
 
-    send_reply_checked(conn, &SyncReply::SessionReady { root_status })?;
+    send_reply(conn, &SyncReply::SessionReady { root_status })?;
     Ok(Some((root_path, root_status)))
 }
 
 fn handle_sync_session(
     conn: &mut (impl Read + Write),
     workload_is_root: bool,
+    cancellation: &CancellationToken,
 ) -> std::io::Result<()> {
+    ensure_not_cancelled(cancellation)?;
     let Some((mut root_path, mut root_status)) = init_session(conn)? else {
         return Ok(());
     };
 
     while let Some(req) = read_frame::<SyncRequest>(&mut *conn)? {
-        match req {
+        ensure_not_cancelled(cancellation)?;
+        let result = match req {
             SyncRequest::CommitFile => return Err(std::io::Error::other("unexpected file commit")),
             SyncRequest::BeginSession { guest_root } => {
                 let p = PathBuf::from(&guest_root);
@@ -811,13 +751,16 @@ fn handle_sync_session(
                 };
                 root_path = p;
                 root_status = status;
-                send_reply_checked(conn, &SyncReply::SessionReady { root_status })?;
+                send_reply(conn, &SyncReply::SessionReady { root_status })?;
+                continue;
             }
             SyncRequest::ScanEntries => {
-                handle_scan_entries(&root_path, root_status, conn)?;
+                handle_scan_entries(&root_path, root_status, conn, cancellation)?;
+                continue;
             }
             SyncRequest::ComputeDigest { relative_path } => {
-                handle_compute_digest(&root_path, &relative_path, conn)?;
+                handle_compute_digest(&root_path, &relative_path, conn, cancellation)?;
+                continue;
             }
             SyncRequest::WriteFile {
                 relative_path,
@@ -837,49 +780,42 @@ fn handle_sync_session(
                     },
                     workload_is_root,
                     conn,
+                    cancellation,
                 )?;
+                continue;
             }
             SyncRequest::ReadFile { relative_path } => {
-                handle_read_file(&root_path, &relative_path, conn)?;
+                handle_read_file(&root_path, &relative_path, conn, cancellation)?;
+                continue;
             }
             SyncRequest::CreateDir {
                 relative_path,
                 mode,
-            } => {
-                handle_create_dir(&root_path, &relative_path, mode, workload_is_root, conn)?;
-            }
+            } => create_directory(&root_path, &relative_path, mode, workload_is_root),
             SyncRequest::CreateSymlink {
                 relative_path,
                 target,
-            } => {
-                handle_create_symlink(&root_path, &relative_path, &target, conn)?;
-            }
+            } => create_symlink(&root_path, &relative_path, &target),
             SyncRequest::UpdateMetadata {
                 relative_path,
                 mode,
                 mtime_secs,
                 mtime_nanos,
-            } => {
-                handle_update_metadata(
-                    &root_path,
-                    &relative_path,
-                    mode,
-                    mtime_secs,
-                    mtime_nanos,
-                    conn,
-                )?;
-            }
+            } => update_metadata(&root_path, &relative_path, mode, mtime_secs, mtime_nanos),
             SyncRequest::RemoveEntry {
                 relative_path,
                 is_dir,
-            } => {
-                handle_remove_entry(&root_path, &relative_path, is_dir, conn)?;
-            }
+            } => remove_entry(&root_path, &relative_path, is_dir),
             SyncRequest::EndSession => {
-                send_reply_checked(conn, &SyncReply::Success)?;
+                send_reply(conn, &SyncReply::Success)?;
                 break;
             }
-        }
+        };
+        let reply = match result {
+            Ok(()) => SyncReply::Success,
+            Err(error) => SyncReply::Err(error.to_string()),
+        };
+        send_reply(conn, &reply)?;
     }
     Ok(())
 }
@@ -928,14 +864,15 @@ mod tests {
             input: std::io::Cursor::new(Vec::new()),
             output: Vec::new(),
         };
-        handle_scan_entries(&root, RootStatus::ExistingDirectory, &mut conn).unwrap();
+        handle_scan_entries(
+            &root,
+            RootStatus::ExistingDirectory,
+            &mut conn,
+            &CancellationToken::new(),
+        )
+        .unwrap();
         std::os::unix::fs::symlink(&outside, root.join("new")).unwrap();
-        conn.output.clear();
-        handle_create_dir(&root, "new", 0o777, true, &mut conn).unwrap();
-        let reply = read_frame::<SyncReply>(&mut std::io::Cursor::new(conn.output))
-            .unwrap()
-            .unwrap();
-        assert!(matches!(reply, SyncReply::Err(_)), "{reply:?}");
+        assert!(create_directory(&root, "new", 0o777, true).is_err());
         assert_eq!(std::fs::metadata(&outside).unwrap().mode() & 0o777, 0o700);
         std::fs::remove_dir_all(scratch).unwrap();
     }
@@ -986,10 +923,99 @@ mod tests {
                 input: std::io::Cursor::new(input),
                 output: Vec::new(),
             };
-            serve_sync_session(&mut conn, true);
+            serve_sync_session(&mut conn, true, &CancellationToken::new());
             assert_eq!(std::fs::read(&destination).unwrap(), b"old");
             assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 1);
         }
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
+
+    #[test]
+    fn failed_upload_ready_reply_removes_the_temporary_file() {
+        let scratch = crate::create_scratch_path("sync", "failed-upload-ready");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let destination = scratch.join("file");
+        std::fs::write(&destination, b"old").unwrap();
+        let mut closed = std::io::Cursor::new(&mut [] as &mut [u8]);
+        let error = handle_write_file(
+            &scratch,
+            "file",
+            WriteFileMeta {
+                size: 3,
+                mode: 0o644,
+                mtime_secs: 100,
+                mtime_nanos: 0,
+            },
+            true,
+            &mut closed,
+            &CancellationToken::new(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WriteZero);
+        assert_eq!(std::fs::read(&destination).unwrap(), b"old");
+        assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 1);
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
+
+    #[test]
+    fn mutation_errors_are_replied_to_without_ending_the_session() {
+        let scratch = crate::create_scratch_path("sync", "mutation-errors");
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::write(scratch.join("file"), b"old").unwrap();
+        std::os::unix::fs::symlink("file", scratch.join("link")).unwrap();
+        let requests = [
+            SyncRequest::BeginSession {
+                guest_root: scratch.to_str().unwrap().into(),
+            },
+            SyncRequest::CreateDir {
+                relative_path: "link".into(),
+                mode: 0o777,
+            },
+            SyncRequest::CreateSymlink {
+                relative_path: "file/child".into(),
+                target: "target".into(),
+            },
+            SyncRequest::UpdateMetadata {
+                relative_path: "link".into(),
+                mode: 0o777,
+                mtime_secs: 100,
+                mtime_nanos: 0,
+            },
+            SyncRequest::RemoveEntry {
+                relative_path: String::new(),
+                is_dir: true,
+            },
+            SyncRequest::EndSession,
+        ];
+        let mut conn = TestConn {
+            input: std::io::Cursor::new(
+                requests
+                    .iter()
+                    .flat_map(|request| encode_frame(request).unwrap())
+                    .collect(),
+            ),
+            output: Vec::new(),
+        };
+        serve_sync_session(&mut conn, true, &CancellationToken::new());
+        let mut replies = conn.output.as_slice();
+        assert_eq!(
+            read_frame::<SyncReply>(&mut replies).unwrap(),
+            Some(SyncReply::SessionReady {
+                root_status: RootStatus::ExistingDirectory
+            })
+        );
+        for _ in 0..4 {
+            assert!(matches!(
+                read_frame::<SyncReply>(&mut replies).unwrap(),
+                Some(SyncReply::Err(_))
+            ));
+        }
+        assert_eq!(
+            read_frame::<SyncReply>(&mut replies).unwrap(),
+            Some(SyncReply::Success)
+        );
+        assert!(replies.is_empty());
+        assert_eq!(std::fs::read(scratch.join("file")).unwrap(), b"old");
         std::fs::remove_dir_all(scratch).unwrap();
     }
 
@@ -1020,12 +1046,164 @@ mod tests {
         }
     }
 
+    struct CancellingConn {
+        input: std::io::Cursor<Vec<u8>>,
+        output: Vec<u8>,
+        cancellation: CancellationToken,
+        cancel_at: u64,
+    }
+
+    impl Read for CancellingConn {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let remaining = self.cancel_at.saturating_sub(self.input.position());
+            let count = usize::min(buf.len(), usize::try_from(remaining).unwrap());
+            let n = self.input.read(&mut buf[..count])?;
+            if self.input.position() >= self.cancel_at {
+                self.cancellation.cancel();
+            }
+            Ok(n)
+        }
+    }
+
+    impl Write for CancellingConn {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.output.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Cancelling while copying an upload keeps the destination and removes the temporary file.
+    #[test]
+    fn cancelling_upload_preserves_the_existing_file() {
+        let scratch = crate::create_scratch_path("sync", "cancel-upload");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let destination = scratch.join("file");
+        std::fs::write(&destination, b"old").unwrap();
+        let begin = encode_frame(&SyncRequest::BeginSession {
+            guest_root: scratch.to_str().unwrap().into(),
+        })
+        .unwrap();
+        let write = encode_frame(&SyncRequest::WriteFile {
+            relative_path: "file".into(),
+            size: 12,
+            mode: 0o644,
+            mtime_secs: 100,
+            mtime_nanos: 0,
+        })
+        .unwrap();
+        let cancellation = CancellationToken::new();
+        let mut input = begin.clone();
+        input.extend(&write);
+        input.extend(b"new contents");
+        let mut conn = CancellingConn {
+            input: std::io::Cursor::new(input),
+            output: Vec::new(),
+            cancellation: cancellation.clone(),
+            cancel_at: u64::try_from(begin.len() + write.len() + 1).unwrap(),
+        };
+
+        serve_sync_session(&mut conn, true, &cancellation);
+
+        assert!(cancellation.is_cancelled());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"old");
+        assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 1);
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
+
     #[test]
     fn random_temp_suffix_has_fixed_hex_shape() {
         let name = generate_random_temp_name().unwrap().into_string().unwrap();
         let suffix = name.strip_prefix(".terra-put-").unwrap();
         assert_eq!(suffix.len(), 32);
         assert!(suffix.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn scans_preserve_metadata_for_directories_files_and_symlinks() {
+        let scratch = crate::create_scratch_path("sync", "scan-metadata");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let file = scratch.join("file");
+        std::fs::write(&file, b"contents").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o640)).unwrap();
+        set_path_mtime(&file, 1000, 0).unwrap();
+        let link = scratch.join("link");
+        std::os::unix::fs::symlink("file", &link).unwrap();
+
+        for (path, status, kind, size, target) in [
+            (
+                &scratch,
+                RootStatus::ExistingDirectory,
+                SyncEntryKind::Directory,
+                0,
+                None,
+            ),
+            (
+                &file,
+                RootStatus::ExistingFile,
+                SyncEntryKind::File,
+                8,
+                None,
+            ),
+            (
+                &link,
+                RootStatus::ExistingSymlink,
+                SyncEntryKind::Symlink,
+                0,
+                Some("file"),
+            ),
+        ] {
+            let mut conn = TestConn {
+                input: std::io::Cursor::new(Vec::new()),
+                output: Vec::new(),
+            };
+            handle_scan_entries(path, status, &mut conn, &CancellationToken::new()).unwrap();
+            let metadata = std::fs::symlink_metadata(path).unwrap();
+            let mut replies = conn.output.as_slice();
+            assert_eq!(
+                read_frame::<SyncReply>(&mut replies).unwrap(),
+                Some(SyncReply::Entry(SyncEntry {
+                    relative_path: String::new(),
+                    kind,
+                    size,
+                    mode: metadata.mode() & 0o777,
+                    mtime_secs: metadata.mtime(),
+                    mtime_nanos: truncate_nanos(u32::try_from(metadata.mtime_nsec()).unwrap()),
+                    link_target: target.map(str::to_owned),
+                }))
+            );
+            let mut children = Vec::new();
+            while let Some(SyncReply::Entry(entry)) = read_frame(&mut replies).unwrap() {
+                children.push(entry);
+            }
+            if kind == SyncEntryKind::Directory {
+                children.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+                assert_eq!(children.len(), 2);
+                assert_eq!(
+                    (
+                        children[0].kind,
+                        children[0].size,
+                        children[0].mode,
+                        children[0].mtime_secs
+                    ),
+                    (SyncEntryKind::File, 8, 0o640, 1000)
+                );
+                assert_eq!(
+                    (
+                        children[1].kind,
+                        children[1].size,
+                        children[1].link_target.as_deref()
+                    ),
+                    (SyncEntryKind::Symlink, 0, Some("file"))
+                );
+            } else {
+                assert!(children.is_empty());
+            }
+        }
+        std::fs::remove_dir_all(scratch).unwrap();
     }
 
     #[test]
@@ -1058,7 +1236,7 @@ mod tests {
             input: std::io::Cursor::new(input),
             output: Vec::new(),
         };
-        serve_sync_session(&mut conn, true);
+        serve_sync_session(&mut conn, true, &CancellationToken::new());
 
         let mut out_cursor = std::io::Cursor::new(conn.output);
         let rep1: SyncReply = read_frame(&mut out_cursor).unwrap().unwrap();
@@ -1104,7 +1282,7 @@ mod tests {
             input: std::io::Cursor::new(input),
             output: Vec::new(),
         };
-        serve_sync_session(&mut conn, true);
+        serve_sync_session(&mut conn, true, &CancellationToken::new());
 
         let mut out_cursor = std::io::Cursor::new(conn.output);
         let rep1: SyncReply = read_frame(&mut out_cursor).unwrap().unwrap();

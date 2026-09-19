@@ -79,7 +79,7 @@ fn choose_boot_mode(args: &BootArgs, is_at_a_terminal: bool) -> Result<BootMode>
 /// `terra [BOX]` - boot a box, or join it if it is up. A box that is not set up
 /// yet is offered one first, from the recipe the manifest names for it or from
 /// a recipe path given here; `cwd` is what that path resolves against.
-pub fn run(
+pub async fn run(
     name: Option<&str>,
     args: &BootArgs,
     project_dir: &Path,
@@ -109,7 +109,7 @@ pub fn run(
                 "terra: {} is already running - attaching ({} detaches)",
                 target.bx, DETACH_KEY_NAME
             );
-            return boot::attach(&target.bx, args.agent.agent_timeout);
+            return boot::attach(&target.bx, args.agent.agent_timeout).await;
         }
         StartPlan::Boot => {}
     }
@@ -138,6 +138,7 @@ pub fn run(
         prepared.lock,
         args.agent.agent_timeout,
     )
+    .await
 }
 
 #[cfg(test)]

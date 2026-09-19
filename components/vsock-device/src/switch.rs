@@ -104,7 +104,6 @@ pub enum VsockError {
 pub struct VsockSwitch {
     connections: Vec<Connection>,
     lifecycle_bound: [bool; 2],
-    diagnostics_enabled: bool,
     upstream: VecDeque<Upstream>,
     upstream_bytes: usize,
     replies: VecDeque<Reply>,
@@ -118,17 +117,12 @@ impl VsockSwitch {
         Self {
             connections: Vec::new(),
             lifecycle_bound: [false; 2],
-            diagnostics_enabled: false,
             upstream: VecDeque::new(),
             upstream_bytes: 0,
             replies: VecDeque::new(),
             reply_bytes: 0,
             next_ephemeral: 0x8000_0000,
         }
-    }
-
-    pub fn set_diagnostics_enabled(&mut self, enabled: bool) {
-        self.diagnostics_enabled = enabled;
     }
 
     pub fn reset_connections(&mut self) {
@@ -332,7 +326,6 @@ impl VsockSwitch {
 
     fn on_request(&mut self, header: &VsockHeader) {
         if !matches!(header.dst_port, CONTROL_VSOCK_PORT | DIAGNOSTIC_VSOCK_PORT)
-            || (header.dst_port == DIAGNOSTIC_VSOCK_PORT && !self.diagnostics_enabled)
             || header.fwd_cnt != 0
             || self.find(header.src_port, header.dst_port).is_some()
             || self.has_guest_connection(header.dst_port)
@@ -929,14 +922,10 @@ mod tests {
     }
 
     #[test]
-    fn diagnostic_port_requires_events() {
+    fn diagnostic_port_is_available() {
         let mut switch = VsockSwitch::new();
         let mut request = guest(OP_REQUEST, 0, 0);
         request.dst_port = DIAGNOSTIC_VSOCK_PORT;
-        switch.rx(&request, &[]);
-        assert!(!switch.connection_exists(100, DIAGNOSTIC_VSOCK_PORT));
-        switch.take_replies();
-        switch.set_diagnostics_enabled(true);
         switch.rx(&request, &[]);
         assert_eq!(
             switch.take_replies()[0].header.src_port,
@@ -957,9 +946,8 @@ mod tests {
     }
 
     #[test]
-    fn transport_reset_keeps_events_diagnostics_enabled() {
+    fn transport_reset_keeps_diagnostics_available() {
         let mut switch = VsockSwitch::new();
-        switch.set_diagnostics_enabled(true);
         switch.reset_connections();
         let mut diagnostic = guest(OP_REQUEST, 0, 0);
         diagnostic.dst_port = DIAGNOSTIC_VSOCK_PORT;
@@ -970,9 +958,8 @@ mod tests {
     }
 
     #[test]
-    fn transport_reset_keeps_events_and_lifecycle_bindings() {
+    fn transport_reset_keeps_lifecycle_bindings() {
         let mut switch = VsockSwitch::new();
-        switch.set_diagnostics_enabled(true);
         switch.rx(&guest(OP_REQUEST, 0, 0), &[]);
         let mut diagnostic = guest(OP_REQUEST, 0, 0);
         diagnostic.dst_port = DIAGNOSTIC_VSOCK_PORT;
@@ -995,16 +982,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![OP_RST, OP_RST]
         );
-    }
-
-    #[test]
-    fn transport_reset_keeps_legacy_diagnostics_denied() {
-        let mut switch = VsockSwitch::new();
-        switch.reset_connections();
-        let mut diagnostic = guest(OP_REQUEST, 0, 0);
-        diagnostic.dst_port = DIAGNOSTIC_VSOCK_PORT;
-        switch.rx(&diagnostic, &[]);
-        assert_eq!(switch.take_replies()[0].header.op, OP_RST);
     }
 
     #[test]
@@ -1164,7 +1141,6 @@ mod tests {
     #[test]
     fn selected_drain_bypasses_a_stalled_connection() {
         let mut switch = VsockSwitch::new();
-        switch.set_diagnostics_enabled(true);
         switch.rx(&guest(OP_REQUEST, 0, 0), &[]);
         let mut diagnostic_request = guest(OP_REQUEST, 0, 0);
         diagnostic_request.dst_port = DIAGNOSTIC_VSOCK_PORT;

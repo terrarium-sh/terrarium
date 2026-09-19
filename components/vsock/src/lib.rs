@@ -76,20 +76,6 @@ pub(crate) async fn wait_for_work() {
     .await;
 }
 
-pub(crate) async fn yield_once() {
-    let mut yielded = false;
-    poll_fn(|context| {
-        if yielded {
-            Poll::Ready(())
-        } else {
-            yielded = true;
-            context.waker().wake_by_ref();
-            Poll::Pending
-        }
-    })
-    .await;
-}
-
 fn error(error: VsockError) -> Error {
     match error {
         VsockError::TableFull => Error::TableFull,
@@ -113,11 +99,9 @@ impl exports::terra::vsock::api::Guest for Vsock {
         transport::configure()
     }
 
-    async fn configure_worker(control_events: bool) {
-        worker::configure(control_events);
-    }
-
-    fn events() -> wit_bindgen::rt::async_support::StreamReader<exports::terra::vsock::api::Event> {
+    #[allow(clippy::unused_async_trait_impl)]
+    async fn events()
+    -> wit_bindgen::rt::async_support::StreamReader<exports::terra::vsock::api::Event> {
         worker::events()
     }
 
@@ -125,11 +109,8 @@ impl exports::terra::vsock::api::Guest for Vsock {
         worker::run().await
     }
 
-    fn decode_control(
-        bytes: Vec<u8>,
-        events: bool,
-    ) -> Result<exports::terra::vsock::api::ControlResult, Error> {
-        lifecycle::decode_control(&bytes, events)
+    fn decode_control(bytes: Vec<u8>) -> Result<exports::terra::vsock::api::ControlResult, Error> {
+        lifecycle::decode_control(&bytes)
     }
 
     fn decode_diagnostics(

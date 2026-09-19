@@ -280,10 +280,13 @@ async fn create_worker(
         )
         .unwrap();
     drive_transport_ready(&mut store, serve).await;
-    let configure = instance
-        .get_typed_func::<(bool,), ()>(&mut store, export("configure-worker"))
+    let events = instance
+        .get_typed_func::<
+            (),
+            (StreamReader<terra_runtime::component::vsock::bindings::HostEvent>,),
+        >(&mut store, export("events"))
         .unwrap();
-    configure.call_async(&mut store, (false,)).await.unwrap();
+    let (_events,) = events.call_async(&mut store, ()).await.unwrap();
     let run = instance
         .get_typed_func::<(), (Result<(), terra_runtime::component::vsock::bindings::Error>,)>(
             &mut store,
@@ -622,7 +625,6 @@ async fn shared_close_releases_the_diagnostic_sink() {
             terra_runtime::SyntheticRam::new(4096).unwrap(),
             include_bytes!("../../../build/terra-vsock-component.cwasm"),
             vec![2, 0, 0, 0, b'{', b'}'],
-            false,
             None,
             None,
             Some(output.reopen().unwrap()),

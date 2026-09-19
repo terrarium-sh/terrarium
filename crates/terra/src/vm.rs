@@ -40,9 +40,7 @@ use std::fs::File;
 #[cfg(unix)]
 use std::io::Read as _;
 use terra_network::GuestNetworkConfig;
-use terra_protocol::{
-    Disk, LifecycleProtocol, Net, Plan, PlanMode, Share, WORKLOAD_ID, WORKLOAD_USER_NAME,
-};
+use terra_protocol::{Disk, Net, Plan, PlanMode, Share, WORKLOAD_ID, WORKLOAD_USER_NAME};
 
 pub(crate) const GUEST_NETWORK: GuestNetworkConfig = GuestNetworkConfig::default();
 #[cfg(target_arch = "x86_64")]
@@ -118,9 +116,7 @@ pub(super) fn build_plan(spec: &BootSpec, shares: Vec<Share>, volumes: Vec<Disk>
         on_start: cfg.hooks.on_start.clone(),
         pre_stop: cfg.hooks.pre_stop.clone(),
         daemons: cfg.daemons.clone(),
-        workload_on_console: false,
         await_initial_session: spec.foreground,
-        lifecycle_protocol: LifecycleProtocol::EventsV1,
         workload: std::iter::once(cfg.workload.entrypoint.to_string_lossy().into_owned())
             .chain(cfg.workload.args.iter().cloned())
             .collect(),
@@ -238,19 +234,12 @@ mod tests {
         assert!(plan.shares[0].readonly);
         assert_eq!(plan.volumes[0].dev, "/dev/vdc");
         assert_eq!(plan.volumes[0].guest, "/data");
-        // The session is the workload's only terminal.
-        assert!(!plan.workload_on_console);
         let foreground = BootSpec {
             foreground: true,
             ..spec
         };
         let foreground_plan = build_plan(&foreground, vec![], vec![]);
-        assert!(!foreground_plan.workload_on_console);
         assert!(foreground_plan.await_initial_session);
-        assert_eq!(
-            foreground_plan.lifecycle_protocol,
-            LifecycleProtocol::EventsV1
-        );
     }
 
     /// A bake installs software into the box's filesystem, so it runs as guest

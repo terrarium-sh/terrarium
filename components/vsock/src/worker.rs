@@ -4,7 +4,7 @@ use crate::wasi::{
     clocks::{monotonic_clock, system_clock},
     random::random,
 };
-use crate::{CLOSED, sample_clock, switch, transport, wait_for_work, wake_worker, yield_once};
+use crate::{CLOSED, sample_clock, switch, transport, wait_for_work, wake_worker};
 use futures_channel::mpsc::{self, Sender};
 use futures_util::StreamExt;
 use futures_util::{
@@ -40,8 +40,6 @@ struct Worker {
     stop: StreamReader<u8>,
     listener: Option<StreamReader<host_service::Client>>,
     event_sender: Sender<Event>,
-    event_reader: Option<StreamReader<Event>>,
-    control_events: bool,
 }
 
 struct ClientWake {
@@ -105,19 +103,20 @@ async fn finish_tasks() {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .is_empty()
     {
-        yield_once().await;
+        wit_bindgen::rt::async_support::yield_async().await;
     }
 }
 
-pub(crate) fn configure(control_events: bool) {
+pub(crate) fn events() -> StreamReader<Event> {
     if WORKER
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .is_some()
     {
-        return;
+        let (writer, reader) = crate::wit_stream::new();
+        drop(writer);
+        return reader;
     }
-    switch().set_diagnostics_enabled(control_events);
     PENDING_PLAN
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -149,25 +148,11 @@ pub(crate) fn configure(control_events: bool) {
         stop: host_service::stop(),
         listener: host_service::listener(),
         event_sender,
-        event_reader: Some(event_reader),
-        control_events,
     };
     *WORKER
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(worker);
-}
-
-pub(crate) fn events() -> StreamReader<Event> {
-    WORKER
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .as_mut()
-        .and_then(|worker| worker.event_reader.take())
-        .unwrap_or_else(|| {
-            let (writer, reader) = crate::wit_stream::new::<Event>();
-            drop(writer);
-            reader
-        })
+    event_reader
 }
 
 pub(crate) fn wake_clients() {
@@ -705,7 +690,6 @@ fn flush_events(sender: &mut Sender<Event>, pending: &mut VecDeque<Event>) {
 fn drain_lifecycle(
     sender: &mut Sender<Event>,
     pending: &mut VecDeque<Event>,
-    control_events: bool,
     control: &mut Vec<u8>,
     diagnostics: &mut Vec<u8>,
 ) {
@@ -723,7 +707,7 @@ fn drain_lifecycle(
             control.extend_from_slice(&bytes);
         }
         if !control.is_empty() {
-            let Ok(result) = crate::lifecycle::decode_control(control, control_events) else {
+            let Ok(result) = crate::lifecycle::decode_control(control) else {
                 reset_lifecycle_connection(source, CONTROL_VSOCK_PORT, control);
                 return;
             };
@@ -835,7 +819,7 @@ async fn run_worker(worker: Worker) -> Result<(), Error> {
             if !pending {
                 break;
             }
-            yield_once().await;
+            wit_bindgen::rt::async_support::yield_async().await;
         }
         if pending {
             wake_worker();
@@ -855,7 +839,6 @@ async fn run_worker(worker: Worker) -> Result<(), Error> {
         drain_lifecycle(
             &mut event_sender,
             &mut pending_events,
-            worker.control_events,
             &mut control,
             &mut diagnostics,
         );
@@ -878,7 +861,6 @@ mod tests {
         for port in [CONTROL_VSOCK_PORT, DIAGNOSTIC_VSOCK_PORT] {
             for malformed in [vec![255; 4], vec![1, 0, 0, 0, b'{']] {
                 *switch() = terra_vsock_device::VsockSwitch::new();
-                switch().set_diagnostics_enabled(true);
                 let mut header = VsockHeader {
                     src_cid: GUEST_CID,
                     dst_cid: HOST_CID,
@@ -896,13 +878,7 @@ mod tests {
                 header.op = 5;
                 header.len = u32::try_from(malformed.len()).unwrap();
                 switch().rx(&header, &malformed);
-                drain_lifecycle(
-                    &mut sender,
-                    &mut pending,
-                    true,
-                    &mut control,
-                    &mut diagnostics,
-                );
+                drain_lifecycle(&mut sender, &mut pending, &mut control, &mut diagnostics);
                 assert!(!switch().connection_exists(100, port));
                 assert_eq!(control, [] as [u8; 0]);
                 assert_eq!(diagnostics, [] as [u8; 0]);
