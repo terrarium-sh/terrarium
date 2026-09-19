@@ -6,6 +6,11 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
+pub(crate) fn file_link_count(path: &Path) -> Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(std::fs::symlink_metadata(path)?.nlink())
+}
+
 pub fn try_lock_run(path: &Path) -> std::result::Result<File, std::fs::TryLockError> {
     let file = std::fs::OpenOptions::new()
         .create(true)

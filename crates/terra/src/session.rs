@@ -802,7 +802,7 @@ mod tests {
         let lock = bx.lock_run().unwrap();
 
         let baking = bx.mark_baking(&lock);
-        for verb in ["exec", "put", "get"] {
+        for verb in ["exec", "sync"] {
             let err = ensure_running(&bx, verb).unwrap_err().to_string();
             assert_eq!(err, bx.setup_holds_it().to_string(), "{verb}");
         }

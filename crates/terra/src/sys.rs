@@ -22,6 +22,7 @@ compile_error!(
 
 #[cfg(windows)]
 pub(crate) use imp::file_handle_matches_path;
+pub(crate) use imp::file_link_count;
 pub use imp::is_host_root;
 #[cfg(unix)]
 pub use imp::register_stop_channel;
@@ -132,7 +133,49 @@ pub(crate) use std::fs::remove_file as remove_directory_symlink;
 #[cfg(all(test, unix))]
 pub(crate) use std::os::unix::fs::{symlink as symlink_dir, symlink as symlink_file};
 #[cfg(all(test, windows))]
-pub(crate) use std::os::windows::fs::{symlink_dir, symlink_file};
+pub(crate) use std::os::windows::fs::symlink_dir;
+#[cfg(all(test, windows))]
+pub(crate) use std::os::windows::fs::symlink_file;
+
+#[cfg(unix)]
+pub(crate) fn set_path_mtime(
+    path: &Path,
+    mtime_secs: i64,
+    mtime_nanos: u32,
+) -> std::io::Result<()> {
+    #[allow(clippy::cast_possible_wrap)]
+    let times = rustix::fs::Timestamps {
+        last_access: rustix::fs::Timespec {
+            tv_sec: 0,
+            tv_nsec: rustix::fs::UTIME_OMIT,
+        },
+        last_modification: rustix::fs::Timespec {
+            tv_sec: mtime_secs as _,
+            tv_nsec: mtime_nanos.into(),
+        },
+    };
+    rustix::fs::utimensat(rustix::fs::CWD, path, &times, rustix::fs::AtFlags::empty())
+        .map_err(std::io::Error::from)
+}
+
+#[cfg(windows)]
+pub(crate) fn set_path_mtime(
+    path: &Path,
+    mtime_secs: i64,
+    mtime_nanos: u32,
+) -> std::io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_WRITE_ATTRIBUTES,
+    };
+
+    let file_times = terra_protocol::sync_file_times(mtime_secs, mtime_nanos)?;
+    let file = std::fs::OpenOptions::new()
+        .access_mode(FILE_WRITE_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    file.set_times(file_times)
+}
 
 #[cfg(test)]
 mod test_paths;

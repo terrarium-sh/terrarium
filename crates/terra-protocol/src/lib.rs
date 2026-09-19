@@ -6,6 +6,8 @@
 pub mod control;
 mod frames;
 mod plan;
+pub mod sync;
 
 pub use frames::*;
 pub use plan::*;
+pub use sync::*;

@@ -13,7 +13,7 @@ use terra_protocol::DEFAULT_STOP_GRACE_SECS;
     long_about = "Launch isolated microVMs for AI agents.\n\n\
                   The box comes first, always: `terra [BOX]` starts it, or attaches if \
                   it is already up. A verb after the box names one operation on it \
-                  instead - `terra dev stop`, `terra dev get /etc/x .` - and every verb \
+                  instead - `terra dev stop`, `terra dev sync :/etc/x .` - and every verb \
                   defaults to this directory's only box. With a box already up and \
                   neither a terminal to attach from nor `-d`, terra exits 125.",
     after_long_help = "EXAMPLES:\n    \
@@ -155,11 +155,17 @@ pub enum Cmd {
     ///
     /// Its exit status is this command's.
     Exec(ExecArgs),
-    /// Copy one file from the host into the box.
-    Put(CopyArgs),
-    /// Copy one file out of the box onto the host. A destination directory
-    /// keeps the file's own name.
-    Get(CopyArgs),
+    /// Synchronize files and directories between the host and a running box.
+    ///
+    /// The guest endpoint is prefixed with `box:` or `:` (e.g. `box:/app/` or `:/app/`).
+    /// Exactly one endpoint must be a guest endpoint.
+    #[command(after_long_help = "EXAMPLES:\n    \
+                           terra dev sync ./src/ box:/app/           Sync host ./src/ into guest /app/\n    \
+                           terra dev sync box:/app/output/ ./output/ Sync guest output into host\n    \
+                           terra dev sync --delete ./src/ :/app/     Sync and delete destination extras\n    \
+                           terra dev sync --checksum ./src/ :/app/   Compare file contents using SHA-256\n    \
+                           terra dev sync --dry-run ./src/ :/app/    Preview planned actions without modifying anything")]
+    Sync(SyncArgs),
     /// Show a box's host diagnostics, rotated as it grows. `--diagnostics` shows guest VM
     /// diagnostics instead; both are replayed after a failed boot. The workload's
     /// terminal goes to the session - attach to the box to see it live.
@@ -204,8 +210,7 @@ impl Cmd {
         match self {
             Self::Setup(_) => "setup",
             Self::Exec(_) => "exec",
-            Self::Put(_) => "put",
-            Self::Get(_) => "get",
+            Self::Sync(_) => "sync",
             Self::Logs(_) => "logs",
             Self::Sessions(_) => "sessions",
             Self::Detach(_) => "detach",
@@ -224,8 +229,7 @@ impl Cmd {
         match self {
             Cmd::Setup(_)
             | Cmd::Exec(_)
-            | Cmd::Put(_)
-            | Cmd::Get(_)
+            | Cmd::Sync(_)
             | Cmd::Logs(_)
             | Cmd::Sessions(_)
             | Cmd::Detach(_)
@@ -311,17 +315,26 @@ impl ExecArgs {
 }
 
 #[derive(Args, Debug)]
-pub struct CopyArgs {
-    /// Source path. The guest side is absolute; the host side is anything.
+pub struct SyncArgs {
+    /// Source path. Prefix with 'box:' or ':' for the guest endpoint.
     pub src: String,
-    /// Destination path.
+    /// Destination path. Prefix with 'box:' or ':' for the guest endpoint.
     pub dst: String,
+    /// Remove destination entries that do not exist on the source (directories only).
+    #[arg(long)]
+    pub delete: bool,
+    /// Compare file contents by SHA-256 digest instead of size and timestamp.
+    #[arg(long)]
+    pub checksum: bool,
+    /// Show what would be transferred or deleted without performing any changes.
+    #[arg(long)]
+    pub dry_run: bool,
     #[command(flatten)]
     pub agent: AgentTimeoutArg,
 }
 
 /// `--agent-timeout`, one definition for the verbs that dial the live agent
-/// (`exec`, `put`, `get`).
+/// (`exec`, `sync`).
 #[derive(Args, Debug)]
 pub struct AgentTimeoutArg {
     /// Give up after this many seconds if the agent has not answered yet (it
@@ -529,8 +542,8 @@ mod tests {
             (vec!["terra", "dev", "detach", "3"], Some("dev")),
             (vec!["terra", "detach", "3"], None),
             (vec!["terra", "detach", "--all"], None),
-            (vec!["terra", "dev", "get", "/etc/x", "."], Some("dev")),
-            (vec!["terra", "put", "./a", "/tmp/a"], None),
+            (vec!["terra", "dev", "sync", ":/etc/x", "."], Some("dev")),
+            (vec!["terra", "sync", "./a", ":/tmp/a"], None),
             (vec!["terra", "dev", "exec", "--", "ls"], Some("dev")),
             (vec!["terra", "dev", "show"], Some("dev")),
             (vec!["terra", "dev", "rm", "--purge"], Some("dev")),
@@ -788,8 +801,7 @@ mod tests {
         let typed: &[&[&str]] = &[
             &["setup"],
             &["exec", "--", "ls"],
-            &["put", "./a", "/b"],
-            &["get", "/b", "./a"],
+            &["sync", "./a", ":/b"],
             &["stop"],
             &["storage", "show"],
             &["rm"],
@@ -999,8 +1011,8 @@ mod tests {
             panic!("expected exec")
         };
         assert_eq!(args.agent.agent_timeout, None);
-        let Some(Cmd::Put(args)) = Cli::parse_from(["terra", "put", "a", "/b"]).cmd else {
-            panic!("expected put")
+        let Some(Cmd::Sync(args)) = Cli::parse_from(["terra", "sync", "./a", ":/b"]).cmd else {
+            panic!("expected sync")
         };
         assert_eq!(args.agent.agent_timeout, None);
 
@@ -1017,10 +1029,10 @@ mod tests {
                 .agent_timeout,
             Some(5)
         );
-        let Some(Cmd::Get(args)) =
-            Cli::parse_from(["terra", "get", "--agent-timeout", "5", "/b", "a"]).cmd
+        let Some(Cmd::Sync(args)) =
+            Cli::parse_from(["terra", "sync", "--agent-timeout", "5", ":/b", "./a"]).cmd
         else {
-            panic!("expected get")
+            panic!("expected sync")
         };
         assert_eq!(args.agent.agent_timeout, Some(5));
     }
@@ -1046,30 +1058,46 @@ mod tests {
         assert_eq!(args.tail, Some(100));
     }
 
-    /// A copy is two paths and a direction: `put` sends the source in, `get`
-    /// fetches it out, and the box is the ordinary one before the verb. There
-    /// is no third positional and no mark on a path to tell the sides apart.
+    /// Sync takes source, destination, optional flags, and the box is the ordinary one before the verb.
     #[test]
-    fn put_and_get_take_two_paths_and_the_box_before_them() {
-        let cli = Cli::parse_from(["terra", "dev", "put", "./a.txt", "/tmp/a"]);
+    fn sync_takes_two_paths_and_the_box_before_them() {
+        let cli = Cli::parse_from(["terra", "dev", "sync", "./a.txt", "box:/tmp/a"]);
         assert_eq!(cli.name.as_deref(), Some("dev"));
-        let Some(Cmd::Put(args)) = cli.cmd else {
-            panic!("expected put")
+        let Some(Cmd::Sync(args)) = cli.cmd else {
+            panic!("expected sync")
         };
         assert_eq!(
             (args.src.as_str(), args.dst.as_str()),
-            ("./a.txt", "/tmp/a")
+            ("./a.txt", "box:/tmp/a")
         );
+        assert!(!args.delete);
+        assert!(!args.checksum);
+        assert!(!args.dry_run);
 
-        let Some(Cmd::Get(args)) = Cli::parse_from(["terra", "get", "/etc/x", "."]).cmd else {
-            panic!("expected get")
+        let Some(Cmd::Sync(args)) = Cli::parse_from([
+            "terra",
+            "sync",
+            "--delete",
+            "--checksum",
+            "--dry-run",
+            ":/etc/x",
+            ".",
+        ])
+        .cmd
+        else {
+            panic!("expected sync")
         };
-        assert_eq!((args.src.as_str(), args.dst.as_str()), ("/etc/x", "."));
+        assert_eq!((args.src.as_str(), args.dst.as_str()), (":/etc/x", "."));
+        assert!(args.delete);
+        assert!(args.checksum);
+        assert!(args.dry_run);
 
         // Two paths exactly - a box smuggled in as a third is an error.
-        assert!(Cli::try_parse_from(["terra", "put", "dev", "a", "/b"]).is_err());
-        assert!(Cli::try_parse_from(["terra", "put", "a"]).is_err());
-        // …and `cp` is gone rather than quietly meaning one of them.
+        assert!(Cli::try_parse_from(["terra", "sync", "dev", "a", "/b"]).is_err());
+        assert!(Cli::try_parse_from(["terra", "sync", "a"]).is_err());
+        // ...and removed verbs are gone
+        assert!(Cli::try_parse_from(["terra", "put", "a", "/b"]).is_err());
+        assert!(Cli::try_parse_from(["terra", "get", "/b", "a"]).is_err());
         assert!(Cli::try_parse_from(["terra", "cp", "a", "/b"]).is_err());
     }
 

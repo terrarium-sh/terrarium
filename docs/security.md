@@ -38,7 +38,7 @@ the matching Terra build; guest or network input must never supply them.
 | `network.ports` | A guest listener published on host loopback. |
 | `env` and `env_file` | Values delivered to guest hooks and workload processes. Secrets delivered to a guest may be copied or persisted by it. |
 | `hooks`, `sudo`, and `terra exec --root` | Guest-root authority inside that box only. |
-| `terra put` and `terra get` | A host-initiated transfer of one file. The operator chooses the host path and authorizes guest output. |
+| `terra sync` | A host-initiated synchronization of files and directories. The operator chooses the host path and authorizes guest input or output. |
 
 The default network mode is an empty allowlist. An allowed network service is
 trusted for every action a guest can take over that connection; destination
@@ -56,9 +56,15 @@ directory grant. Grant only the tree the workload needs. In particular, do not
 mount device directories, broad home directories, or other unrelated host
 trees.
 
-`put`, `get`, and `env_file` operate on host paths selected by the operator,
-including the host filesystem's normal symlink resolution. They are distinct
-from a WASI mount capability.
+`env_file` follows the operator-selected host path. `sync` validates guest
+manifest paths and link targets and checks destination ancestors for symlinks
+before accessing entries. These checks assume the host destination is not
+concurrently modified, including through a guest-writable share; they do not
+protect against an ancestor being replaced between a check and an operation.
+Metadata-only downloads reject multiply linked files to avoid changing another
+path's inode permissions or timestamps. `--delete` authorizes removal of
+destination extras within that tree. These operations are distinct from a WASI
+mount capability.
 
 ## Runtime boundary
 

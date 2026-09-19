@@ -10,8 +10,8 @@ fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) {
 
 fuzz_target!(|bytes: &[u8]| {
     decode::<terra_protocol::Plan>(bytes);
-    decode::<terra_protocol::FileRequest>(bytes);
-    decode::<terra_protocol::FileReply>(bytes);
+    decode::<terra_protocol::SyncRequest>(bytes);
+    decode::<terra_protocol::SyncReply>(bytes);
     decode::<terra_protocol::ExecRequest>(bytes);
     decode::<terra_protocol::control::LifecycleEvent>(bytes);
     decode::<ClientInput>(bytes);

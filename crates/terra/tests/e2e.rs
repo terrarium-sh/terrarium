@@ -82,14 +82,19 @@ fn help_lists_the_lifecycle_verbs() {
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("Launch isolated microVMs"));
-    for sub in [
-        "setup", "put", "get", "exec", "stop", "rm", "show", "ls", "logs",
-    ] {
+    for sub in ["setup", "sync", "exec", "stop", "rm", "show", "ls", "logs"] {
         assert!(stdout.contains(sub), "help missing subcommand {sub}");
     }
     // Using a box has no verb at all - `terra [BOX]` covers start and attach,
     // because which one a person wants is a fact about the box.
-    for gone in ["  start ", "  attach ", "  run ", "  create "] {
+    for gone in [
+        "  start ",
+        "  attach ",
+        "  run ",
+        "  create ",
+        "  put ",
+        "  get ",
+    ] {
         assert!(
             !stdout.contains(gone),
             "{gone:?} is still a subcommand: {stdout}"
@@ -639,7 +644,7 @@ fn every_verb_that_needs_a_box_says_when_there_is_none() {
     let home = tempfile::tempdir().unwrap();
     for args in [
         &["typo", "exec", "--", "ls"][..],
-        &["typo", "put", "a.txt", "/a"][..],
+        &["typo", "sync", "a.txt", ":/a"][..],
         &["typo", "stop"][..],
         &["typo", "logs"][..],
         &["typo", "rm"][..],

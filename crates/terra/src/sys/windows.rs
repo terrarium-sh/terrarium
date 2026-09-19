@@ -444,6 +444,21 @@ pub(crate) fn file_handle_matches_path(handle: *mut std::ffi::c_void, expected: 
     }
 }
 
+pub(crate) fn file_link_count(path: &Path) -> Result<u64> {
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_READ_ATTRIBUTES, GetFileInformationByHandle,
+    };
+
+    let file = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .open(path)?;
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: the file handle is live and information is writable for this call.
+    win_ok(unsafe { GetFileInformationByHandle(file.as_raw_handle(), &raw mut information) })?;
+    Ok(u64::from(information.nNumberOfLinks))
+}
+
 fn win_ok(ok: i32) -> Result<()> {
     (ok != 0).then_some(()).ok_or_else(Error::last_os_error)
 }

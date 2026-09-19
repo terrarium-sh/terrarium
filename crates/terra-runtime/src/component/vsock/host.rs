@@ -433,28 +433,30 @@ impl<T: 'static> StreamConsumer<T> for OutputConsumer {
             let mut source = source.as_direct(store);
             let bytes = source.remaining();
             let count = bytes.len().min(CHUNK_BYTES);
-            let mut ready = match output.poll_write_ready(context) {
-                core::task::Poll::Ready(Ok(ready)) => ready,
-                core::task::Poll::Ready(Err(error)) => {
-                    return core::task::Poll::Ready(Err(error.into()));
+            loop {
+                let mut ready = match output.poll_write_ready(context) {
+                    core::task::Poll::Ready(Ok(ready)) => ready,
+                    core::task::Poll::Ready(Err(error)) => {
+                        return core::task::Poll::Ready(Err(error.into()));
+                    }
+                    core::task::Poll::Pending => return core::task::Poll::Pending,
+                };
+                if count == 0 {
+                    return core::task::Poll::Ready(Ok(StreamResult::Completed));
                 }
-                core::task::Poll::Pending => return core::task::Poll::Pending,
-            };
-            if count == 0 {
-                return core::task::Poll::Ready(Ok(StreamResult::Completed));
-            }
-            match ready
-                .try_io(|stream| std::io::Write::write(&mut stream.get_ref(), &bytes[..count]))
-            {
-                Ok(Ok(count)) => {
-                    source.mark_read(count);
-                    core::task::Poll::Ready(Ok(StreamResult::Completed))
+                match ready
+                    .try_io(|stream| std::io::Write::write(&mut stream.get_ref(), &bytes[..count]))
+                {
+                    Ok(Ok(count)) => {
+                        source.mark_read(count);
+                        return core::task::Poll::Ready(Ok(StreamResult::Completed));
+                    }
+                    Ok(Err(_)) => {
+                        this.complete(Err(terra::vsock::host_service::EndpointError::Io));
+                        return core::task::Poll::Ready(Ok(StreamResult::Dropped));
+                    }
+                    Err(_) => {}
                 }
-                Ok(Err(_)) => {
-                    this.complete(Err(terra::vsock::host_service::EndpointError::Io));
-                    core::task::Poll::Ready(Ok(StreamResult::Dropped))
-                }
-                Err(_) => core::task::Poll::Pending,
             }
         }
     }
@@ -480,15 +482,18 @@ fn poll_listener_accept(
     context: &mut core::task::Context<'_>,
     finish: bool,
 ) -> core::task::Poll<io::Result<Option<LocalStream>>> {
-    let mut ready = match listener.poll_read_ready(context) {
-        core::task::Poll::Ready(Ok(ready)) => ready,
-        core::task::Poll::Ready(Err(error)) => return core::task::Poll::Ready(Err(error)),
-        core::task::Poll::Pending if finish => return core::task::Poll::Ready(Ok(None)),
-        core::task::Poll::Pending => return core::task::Poll::Pending,
-    };
-    match ready.try_io(|listener| listener.get_ref().accept().map(|(stream, _)| stream)) {
-        Ok(stream) => core::task::Poll::Ready(stream.map(Some)),
-        Err(_) => core::task::Poll::Pending,
+    loop {
+        let mut ready = match listener.poll_read_ready(context) {
+            core::task::Poll::Ready(Ok(ready)) => ready,
+            core::task::Poll::Ready(Err(error)) => return core::task::Poll::Ready(Err(error)),
+            core::task::Poll::Pending if finish => return core::task::Poll::Ready(Ok(None)),
+            core::task::Poll::Pending => return core::task::Poll::Pending,
+        };
+        if let Ok(stream) =
+            ready.try_io(|listener| listener.get_ref().accept().map(|(stream, _)| stream))
+        {
+            return core::task::Poll::Ready(stream.map(Some));
+        }
     }
 }
 
@@ -583,18 +588,34 @@ fn poll_input<T>(
     }
     let mut destination = destination.as_direct(store, CHUNK_BYTES);
     let bytes = destination.remaining();
-    let mut ready = match input.poll_read_ready(context) {
-        core::task::Poll::Ready(Ok(ready)) => ready,
-        core::task::Poll::Ready(Err(error)) => return core::task::Poll::Ready(Err(error.into())),
-        core::task::Poll::Pending => return core::task::Poll::Pending,
-    };
-    match ready.try_io(|stream| std::io::Read::read(&mut stream.get_ref(), bytes)) {
-        Ok(Ok(0) | Err(_)) => core::task::Poll::Ready(Ok(StreamResult::Dropped)),
-        Ok(Ok(count)) => {
+    match poll_read_input(input, context, bytes) {
+        core::task::Poll::Ready(Ok(0) | Err(_)) => {
+            core::task::Poll::Ready(Ok(StreamResult::Dropped))
+        }
+        core::task::Poll::Ready(Ok(count)) => {
             destination.mark_written(count);
             core::task::Poll::Ready(Ok(StreamResult::Completed))
         }
-        Err(_) => core::task::Poll::Pending,
+        core::task::Poll::Pending => core::task::Poll::Pending,
+    }
+}
+
+#[cfg(unix)]
+fn poll_read_input(
+    input: &mut ReadHalf,
+    context: &mut core::task::Context<'_>,
+    bytes: &mut [u8],
+) -> core::task::Poll<io::Result<usize>> {
+    loop {
+        let mut ready = match input.poll_read_ready(context) {
+            core::task::Poll::Ready(Ok(ready)) => ready,
+            core::task::Poll::Ready(Err(error)) => return core::task::Poll::Ready(Err(error)),
+            core::task::Poll::Pending => return core::task::Poll::Pending,
+        };
+        if let Ok(result) = ready.try_io(|stream| std::io::Read::read(&mut stream.get_ref(), bytes))
+        {
+            return core::task::Poll::Ready(result);
+        }
     }
 }
 
@@ -721,6 +742,58 @@ mod tests {
         HostClient, HostClientWithStore, HostWithStore,
     };
     use crate::engine::DeviceHost;
+
+    #[cfg(unix)]
+    struct ReadWake(AtomicUsize);
+
+    #[cfg(unix)]
+    impl std::task::Wake for ReadWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stale_readiness_registers_the_next_readers_waker() {
+        use std::io::Write;
+        use std::task::{Context, Poll, Waker};
+        let directory = tempfile::tempdir().expect("socket directory");
+        let path = directory.path().join("socket");
+        let listener = LocalListener::bind(&path).expect("listener");
+        let mut client = LocalStream::connect(&path).expect("client");
+        let (server, _) = listener.accept().expect("peer");
+        let mut input = prepare_stream(server).expect("async socket");
+        client.write_all(b"first").expect("first write");
+        drop(input.readable().await.expect("initial readiness"));
+        let mut buffer = [0; 5];
+        assert!(matches!(
+            poll_read_input(
+                &mut input,
+                &mut Context::from_waker(Waker::noop()),
+                &mut buffer
+            ),
+            Poll::Ready(Ok(5))
+        ));
+        let wake = Arc::new(ReadWake(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&wake));
+        assert!(
+            poll_read_input(&mut input, &mut Context::from_waker(&waker), &mut buffer).is_pending()
+        );
+        client.write_all(b"later").expect("second write");
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while wake.0.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the new reader must be woken after stale readiness is cleared");
+        assert!(matches!(
+            poll_read_input(&mut input, &mut Context::from_waker(&waker), &mut buffer),
+            Poll::Ready(Ok(5))
+        ));
+        assert_eq!(&buffer, b"later");
+    }
 
     #[tokio::test]
     async fn endpoint_claims_are_single_use_and_stream_leases_hold_client_capacity() {

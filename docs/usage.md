@@ -50,17 +50,46 @@ release; guest package updates do not change the kernel Terra boots.
 ```sh
 terra dev exec -- make test
 terra dev exec --root -- apk add strace
-terra dev put ./input.txt /tmp/input.txt
-terra dev get /tmp/result.txt ./result.txt
+terra dev sync ./src/ :/app/
+terra dev sync :/app/output/ ./output/
 terra dev logs -f
 ```
 
-`exec`, `put`, and `get` require a running box. `exec` runs separately from the
-workload; use `--root` only for that command. `put` copies one host file into
-the guest and `get` copies one guest file out. `logs` contains Terra diagnostics;
-attach to the box for workload output. Guest VM diagnostics are written to
-`diagnostics.log`, replayed after a failed boot, and available through
-`terra <box> logs --diagnostics`.
+`exec` and `sync` require a running box. `exec` runs separately from the
+workload; use `--root` only for that command. `sync` synchronizes files and
+directories between the host and the guest (`box:/path` or `:/path`).
+`logs` contains Terra diagnostics; attach to the box for workload output.
+Guest VM diagnostics are written to `diagnostics.log`, replayed after a failed
+boot, and available through `terra <box> logs --diagnostics`.
+
+Sync is one-way. `box:` and `:` both refer to the selected box. A source
+folder ending in `/` copies its contents; without `/`, an existing destination
+directory receives a subdirectory with the source's name. Missing sources fail.
+
+By default, sync skips files with equal size and modification time (compared at
+microsecond precision). `--checksum` reads same-size files on both sides and
+compares SHA-256 instead; matching contents need no transfer. `--delete` removes
+extras only inside the selected destination subtree, after successful transfers.
+File-to-directory and directory-to-file conflicts still fail with `--delete`;
+remove the conflicting destination entry before retrying.
+`--dry-run` previews these actions without modifying either side.
+
+Sync preserves modification times and supported permission bits. It copies
+symlinks without following them; downloaded links must resolve within the
+synchronized tree. Special files and non-UTF-8 tree names are rejected. A failed
+transfer preserves that file's previous destination, but a tree sync is not a
+transaction: completed earlier changes remain. Retry with a quiet source if files
+change during scanning or transfer. After upgrading from an older agent protocol,
+stop and restart the box before syncing.
+
+Links inside the synchronized tree are copied as links, never traversed as
+directories. A selected root that is itself a symlink is treated as a link;
+use its target path to synchronize the directory's contents. Parents above
+the selected root resolve normally. On macOS, paths that differ only in case
+or Unicode normalization are rejected when they would alias another entry.
+Metadata-only downloads to files with multiple hard links fail; replace the
+destination file with an independent copy before retrying. Keep the host
+destination quiet during a download, including any guest-writable share of it.
 
 `terra <box> show` prints the effective pinned recipe for review. Environment
 values stay redacted unless `--with-env-values` is passed.

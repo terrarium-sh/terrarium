@@ -248,7 +248,7 @@ pub(crate) fn serve_agent_port(
                         {
                             return;
                         }
-                        crate::files::serve_file_op(conn, workload_is_root);
+                        crate::files::serve_sync_session(conn, workload_is_root);
                     }
                     Some(AgentService::Exec) if startup.wait() => {
                         crate::exec::serve_exec(conn, workload_is_root);

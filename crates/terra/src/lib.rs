@@ -24,7 +24,6 @@ mod vm;
 
 use anyhow::{Context, Result};
 use cli::Cmd;
-use cmd::put_get::Direction;
 use std::process::ExitCode;
 
 #[must_use]
@@ -61,8 +60,7 @@ pub async fn run() -> Result<ExitCode> {
         None => cmd::start::run(name, &args.boot, &project_dir, &cwd, is_at_a_terminal),
         Some(Cmd::Setup(a)) => cmd::setup::run(a, name, &project_dir, &cwd, is_at_a_terminal),
         Some(Cmd::Exec(a)) => cmd::exec::run(a, name, &project_dir, is_at_a_terminal),
-        Some(Cmd::Put(a)) => cmd::put_get::run(a, Direction::IntoBox, name, &project_dir),
-        Some(Cmd::Get(a)) => cmd::put_get::run(a, Direction::OutOfBox, name, &project_dir),
+        Some(Cmd::Sync(a)) => cmd::sync::run(a, name, &project_dir),
         Some(Cmd::Stop(a)) => cmd::stop::run(a, name, &project_dir),
         Some(Cmd::Storage(a)) => cmd::storage::run(a, name, &project_dir),
         Some(Cmd::Rm(a)) => cmd::rm::run(a, name, &project_dir),

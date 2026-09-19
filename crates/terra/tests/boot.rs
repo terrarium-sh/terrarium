@@ -410,9 +410,9 @@ fn run_boot_suite() {
     let namespace_probe = s.compile_probe("namespace");
     s.run_terra_command(&[
         "server",
-        "put",
+        "sync",
         namespace_probe.to_str().unwrap(),
-        "/tmp/terra-namespace-probe",
+        ":/tmp/terra-namespace-probe",
         "--project",
         server.to_str().unwrap(),
     ]);
@@ -643,24 +643,24 @@ fn run_boot_suite() {
         );
     }
 
-    // == cp: files travel in and out of the running box ==
-    let payload = format!("cp-roundtrip-{}", std::process::id());
-    let src = s.get_work_dir().join("cp-src.txt");
+    // == sync: files travel in and out of the running box ==
+    let payload = format!("sync-roundtrip-{}", std::process::id());
+    let src = s.get_work_dir().join("sync-src.txt");
     std::fs::write(&src, &payload).unwrap();
-    let dst = s.get_work_dir().join("cp-out.txt");
+    let dst = s.get_work_dir().join("sync-out.txt");
     s.run_terra_command(&[
         "server",
-        "put",
+        "sync",
         src.to_str().unwrap(),
-        "/tmp/cp.txt",
+        ":/tmp/sync.txt",
         "--project",
         server.to_str().unwrap(),
     ]);
     // …and back out with the box left off, which is the directory's only one:
     // named or defaulted, both have to reach the same agent.
     s.run_terra_command(&[
-        "get",
-        "/tmp/cp.txt",
+        "sync",
+        ":/tmp/sync.txt",
         dst.to_str().unwrap(),
         "--project",
         server.to_str().unwrap(),
@@ -668,8 +668,64 @@ fn run_boot_suite() {
     assert_eq!(
         std::fs::read_to_string(&dst).unwrap_or_default(),
         payload,
-        "cp did not round-trip through the guest"
+        "sync did not round-trip through the guest"
     );
+
+    // == sync tree: directory tree synchronization, deletion, and checksum ==
+    let tree_dir = s.get_work_dir().join("sync-tree-src");
+    std::fs::create_dir_all(tree_dir.join("subdir")).unwrap();
+    std::fs::write(tree_dir.join("file1.txt"), b"file1-content").unwrap();
+    std::fs::write(tree_dir.join("subdir/file2.txt"), b"file2-content").unwrap();
+
+    s.run_terra_command(&[
+        "server",
+        "sync",
+        &format!("{}/", tree_dir.display()),
+        ":/tmp/synced-tree/",
+        "--project",
+        server.to_str().unwrap(),
+    ]);
+
+    let tree_out = s.get_work_dir().join("sync-tree-out");
+    s.run_terra_command(&[
+        "sync",
+        ":/tmp/synced-tree/",
+        &format!("{}/", tree_out.display()),
+        "--project",
+        server.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        std::fs::read(tree_out.join("file1.txt")).unwrap(),
+        b"file1-content"
+    );
+    assert_eq!(
+        std::fs::read(tree_out.join("subdir/file2.txt")).unwrap(),
+        b"file2-content"
+    );
+
+    std::fs::remove_file(tree_dir.join("file1.txt")).unwrap();
+    std::fs::write(tree_dir.join("file3.txt"), b"file3-content").unwrap();
+    s.run_terra_command(&[
+        "server",
+        "sync",
+        "--delete",
+        &format!("{}/", tree_dir.display()),
+        ":/tmp/synced-tree/",
+        "--project",
+        server.to_str().unwrap(),
+    ]);
+
+    let (ls_out, status) = s.exec(false, &["sh", "-c", "ls /tmp/synced-tree"]);
+    assert_eq!(status, 0);
+    assert!(
+        !ls_out.contains("file1.txt"),
+        "file1.txt should have been deleted: {ls_out}"
+    );
+    assert!(
+        ls_out.contains("file3.txt"),
+        "file3.txt should exist: {ls_out}"
+    );
+    assert!(ls_out.contains("subdir"), "subdir should exist: {ls_out}");
 
     // == daemons: background commands restarted on failure ==
     // Each line runs beside the workload as guest root; a non-zero exit

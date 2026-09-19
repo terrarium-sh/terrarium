@@ -73,8 +73,9 @@ The example opts in to public egress for package managers and agents. Remove
 
 `terra` boots the only box in the directory, or joins it if already up. Detach
 with `Ctrl-\`, rejoin with `terra`, stop with `terra stop`, delete with `terra rm`.
-Use `terra put` and `terra get` to transfer one file at a time. Detailed
-instructions: [docs/usage.md](docs/usage.md).
+List boxes with `terra ls`, inspect configuration with `terra show`, and transfer
+files and directories with `terra sync`. Detailed instructions:
+[docs/usage.md](docs/usage.md).
 
 ## What you get
 
@@ -82,7 +83,7 @@ instructions: [docs/usage.md](docs/usage.md).
   rootfs—sharing only what you explicitly allow.
 - **Explicit access.** No host files or network by default; the host, LAN, and
   private ranges stay blocked unless a recipe names them. Grant host directories
-  with `mounts`, or transfer individual files with `put` and `get`.
+  with `mounts`, or sync files and directories with `sync`.
 - **One binary.** The guest kernel, base guest filesystem, and VM components
   are embedded in `terra`; no daemon required. The kernel loads directly into
   memory on each boot. Upgrade Terra and stop/start a box to use the kernel
@@ -91,7 +92,7 @@ instructions: [docs/usage.md](docs/usage.md).
 - **Lifecycle hooks.** `on_create`, `on_start`, and `pre_stop` run as guest
   root. Startup and stop output appears live in the attached console, with the
   workload between them. Package installation usually belongs in `on_create`.
-- **Work without rebuilding.** Detach, rejoin, copy files, or run `terra exec`
+- **Work without rebuilding.** Detach, rejoin, sync files, or run `terra exec`
   in a live box.
 
 ## Commands
@@ -99,15 +100,22 @@ instructions: [docs/usage.md](docs/usage.md).
 | command | what it does |
 |---|---|
 | `terra [BOX] setup` | pin the recipe, build the box |
-| `terra [BOX]` | boot it — or join it if it's up (`-d`: headless) |
+| `terra [BOX]` | boot the box — or join if it is up (`-d`: headless) |
 | `terra [BOX] -- CMD…` | run CMD instead of the recipe's workload, for one boot |
-| `terra [BOX] exec/put/get` | run a command or copy one file |
-| `terra [BOX] logs/sessions/detach` | inspect or manage a live box |
-| `terra [BOX] stop/rm` | stop it gracefully / delete it |
-| `terra ls` | list boxes in this directory (`--all`: every project) |
+| `terra [BOX] exec -- CMD…` | run a command in a running box |
+| `terra [BOX] sync SRC DST` | sync files and directories between host and box |
+| `terra [BOX] logs` | show host diagnostics (`-f`: follow, `--diagnostics`: VM log) |
+| `terra [BOX] sessions` | list attached console clients |
+| `terra [BOX] detach [ID]` | disconnect an attached client (`--all`: every client) |
+| `terra [BOX] show` | print the resolved recipe and configuration |
+| `terra ls` | list boxes in this directory (`--all`: every project, alias: `ps`) |
+| `terra [BOX] stop` | stop a running box gracefully |
+| `terra [BOX] storage` | inspect or manage box storage (`show`, `export`, `import`, `prune`) |
+| `terra [BOX] rm` | delete a box's storage and logs (`--purge`: remove recipe too) |
+| `terra completions SHELL` | output shell completion code (`bash`, `zsh`, `fish`) |
 
-`[BOX]` defaults to the directory's only box. Full reference:
-[docs/usage.md](docs/usage.md).
+`[BOX]` defaults to the directory's only box. Every command accepts `--project DIR`
+to target another project directory. Full reference: [docs/usage.md](docs/usage.md).
 
 ## Storage
 

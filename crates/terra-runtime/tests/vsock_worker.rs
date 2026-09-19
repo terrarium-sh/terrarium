@@ -377,6 +377,66 @@ async fn client_handshake_and_half_close_preserve_both_directions() {
     assert_eq!(store.data_mut().vsock_service_mut().live_clients(), 0);
 }
 
+/// A long-lived request/reply stream must deliver each reply without a FIN or
+/// another guest packet to wake the host reader.
+#[tokio::test(flavor = "current_thread")]
+async fn repeated_round_trips_deliver_replies_without_closing_the_stream() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("round-trips.sock");
+    let listener = terra_io::local::LocalListener::bind(&path).unwrap();
+    let mut client = terra_io::local::LocalStream::connect(&path).unwrap();
+    client.set_nonblocking(true).unwrap();
+    let (
+        mut store,
+        Worker {
+            run,
+            close,
+            replies,
+            receive,
+            count: _,
+        },
+    ) = create_worker(listener).await;
+    store
+        .run_concurrent(async |accessor| {
+            let running = run.call_concurrent(accessor, ());
+            let exchange = async {
+                let request = next_reply(accessor, replies, 1).await;
+                let port = VsockHeader::parse(&request.header).unwrap().0.src_port;
+                guest_packet(accessor, receive, port, 2, 0, &[]).await;
+                for index in 0_u64..1000 {
+                    let payload = index.to_le_bytes();
+                    client.write_all(&payload).unwrap();
+                    assert_eq!(next_reply(accessor, replies, 5).await.payload, payload);
+                    guest_packet(accessor, receive, port, 5, 0, &payload).await;
+                    let mut received = Vec::new();
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        while received.len() < payload.len() {
+                            let mut buffer = [0; 8];
+                            match client.read(&mut buffer) {
+                                Ok(0) => panic!("reply stream closed at round {index}"),
+                                Ok(count) => received.extend_from_slice(&buffer[..count]),
+                                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                    tokio::time::sleep(Duration::from_millis(1)).await;
+                                }
+                                Err(error) => panic!("reading round {index}: {error}"),
+                            }
+                        }
+                    })
+                    .await
+                    .unwrap_or_else(|_| panic!("reply stalled at round {index}"));
+                    assert_eq!(received, payload);
+                }
+                close.call_concurrent(accessor, ()).await.unwrap();
+            };
+            let (result, ()) = tokio::join!(running, exchange);
+            assert!(result.unwrap().0.is_ok());
+            Ok::<(), wasmtime::Error>(())
+        })
+        .await
+        .unwrap()
+        .unwrap();
+}
+
 /// A client disconnect does not retire the component's one granted listener.
 #[tokio::test(flavor = "current_thread")]
 async fn sequential_clients_share_one_running_vsock_component() {

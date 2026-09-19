@@ -63,8 +63,8 @@ journalctl -u terra@pi-dev -f
 ```
 
 The recipe should define a `workload:` — headless there's no interactive shell to
-fall back to. Use recipe mounts for shared directories, and `terra put`,
-`terra get`, or volumes for guest files.
+fall back to. Use recipe mounts for shared directories, and `terra sync`
+or volumes for guest files.
 
 ## Graceful stop
 

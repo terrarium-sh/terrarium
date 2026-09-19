@@ -42,9 +42,6 @@ pub use crate::control::{
     decode_clock_sync,
 };
 
-pub const MAX_FILE_BYTES: u64 = 1 << 31;
-const MAX_FILE_ERROR_BYTES: usize = 4096;
-
 /// The byte naming what one connection to [`AGENT_VSOCK_PORT`] is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -52,7 +49,7 @@ pub enum AgentService {
     /// The workload's shared terminal: a *viewport* onto the one PTY every
     /// client shares - no per-client process, no uid of its own.
     Session = b's',
-    /// One `terra put`/`get` operation.
+    /// One `terra sync` session.
     Files = b'f',
     /// One `terra exec` - one connection, one PTY, one process, which is what
     /// lets it run as root while the workload stays unprivileged.
@@ -238,39 +235,6 @@ pub struct ExecRequest {
     pub env: BTreeMap<String, String>,
 }
 
-/// One `terra put`/`get` operation on an absolute guest path. A put carries
-/// the host file's permission bits (so scripts stay executable) and its exact
-/// `size` - the agent reads that many bytes and replies on the same
-/// connection.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum FileRequest {
-    Get {
-        #[serde(deserialize_with = "deserialize_abs_path")]
-        path: String,
-    },
-    Put {
-        #[serde(deserialize_with = "deserialize_abs_path")]
-        path: String,
-        mode: u32,
-        #[serde(deserialize_with = "deserialize_file_size")]
-        size: u64,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum FileReply {
-    /// The operation failed; the text is guest-chosen and untrusted.
-    Err(#[serde(deserialize_with = "deserialize_file_error")] String),
-    /// A put landed whole.
-    Put,
-    /// A get: the file's permission bits, and how many bytes follow.
-    Get {
-        mode: u32,
-        #[serde(deserialize_with = "deserialize_file_size")]
-        size: u64,
-    },
-}
-
 fn deserialize_argv<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
 where
     D: Deserializer<'de>,
@@ -285,46 +249,6 @@ where
         ));
     }
     Ok(argv)
-}
-
-fn deserialize_abs_path<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let path = String::deserialize(deserializer)?;
-    if path.contains('\0') {
-        return Err(D::Error::custom("guest path cannot contain NUL bytes"));
-    }
-    if !path.starts_with('/') {
-        return Err(D::Error::custom("guest path must be absolute"));
-    }
-    Ok(path)
-}
-
-fn deserialize_file_size<'de, D>(deserializer: D) -> Result<u64, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let size = u64::deserialize(deserializer)?;
-    if size > MAX_FILE_BYTES {
-        return Err(D::Error::custom(format!(
-            "file size {size} exceeds the {MAX_FILE_BYTES}-byte limit"
-        )));
-    }
-    Ok(size)
-}
-
-fn deserialize_file_error<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let error = String::deserialize(deserializer)?;
-    if error.len() > MAX_FILE_ERROR_BYTES {
-        return Err(D::Error::custom(format!(
-            "file error exceeds the {MAX_FILE_ERROR_BYTES}-byte limit"
-        )));
-    }
-    Ok(error)
 }
 
 #[cfg(test)]
@@ -442,7 +366,7 @@ mod tests {
     }
 
     #[test]
-    fn reject_invalid_network_and_file_requests() {
+    fn reject_invalid_network_and_exec_requests() {
         assert!(
             serde_json::from_value::<Net>(serde_json::json!({
                 "guest_ip": "192.0.2.2",
@@ -475,27 +399,6 @@ mod tests {
                 "argv": [],
                 "as_root": false,
                 "tty": null
-            }))
-            .is_err()
-        );
-        for request in [
-            serde_json::json!({"Get": {"path": "relative"}}),
-            serde_json::json!({"Put": {"path": "relative", "mode": 420, "size": 0}}),
-            serde_json::json!({"Get": {"path": "/tmp/has\0nul"}}),
-            serde_json::json!({"Put": {"path": "/tmp/has\0nul", "mode": 420, "size": 0}}),
-            serde_json::json!({"Put": {"path": "/tmp/file", "mode": 420, "size": MAX_FILE_BYTES + 1}}),
-        ] {
-            assert!(serde_json::from_value::<FileRequest>(request).is_err());
-        }
-        assert!(
-            serde_json::from_value::<FileReply>(serde_json::json!({
-                "Get": {"mode": 420, "size": MAX_FILE_BYTES + 1}
-            }))
-            .is_err()
-        );
-        assert!(
-            serde_json::from_value::<FileReply>(serde_json::json!({
-                "Err": "x".repeat(MAX_FILE_ERROR_BYTES + 1)
             }))
             .is_err()
         );

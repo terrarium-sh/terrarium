@@ -9,18 +9,17 @@ pub(crate) const RESERVED_NAMES: &[&str] = &[
     "completions",
     "detach",
     "exec",
-    "get",
     "help",
     "logs",
     "ls",
     "ps",
-    "put",
     "rm",
     "sessions",
     "setup",
     "show",
     "stop",
     "storage",
+    "sync",
 ];
 
 pub(crate) fn is_recipe_ext(extension: &OsStr) -> bool {
