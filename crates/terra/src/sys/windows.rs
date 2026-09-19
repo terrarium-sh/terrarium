@@ -160,6 +160,29 @@ pub fn make_sparse(file: &File) -> Result<()> {
     })
 }
 
+pub fn allocated_size(path: &Path, metadata: &std::fs::Metadata) -> u64 {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{GetLastError, NO_ERROR};
+    use windows_sys::Win32::Storage::FileSystem::{GetCompressedFileSizeW, INVALID_FILE_SIZE};
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut high = 0u32;
+    // SAFETY: `wide` is null-terminated and `high` is a valid writable pointer.
+    let low = unsafe { GetCompressedFileSizeW(wide.as_ptr(), &raw mut high) };
+    if low == INVALID_FILE_SIZE {
+        // SAFETY: reading thread-local Win32 error code.
+        let err = unsafe { GetLastError() };
+        if err != NO_ERROR {
+            return metadata.len();
+        }
+    }
+    (u64::from(high) << 32) | u64::from(low)
+}
+
 pub fn set_owner_only(path: &Path, directory: bool) -> Result<()> {
     let sid = current_user_sid()?;
     let acl_size = std::mem::size_of::<ACL>()

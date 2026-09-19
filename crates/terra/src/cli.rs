@@ -74,7 +74,7 @@ impl Cli {
     }
 }
 
-/// The box-first fix for a verb-first spelling like `terra stop dev` or `terra stop dev --wait 5`.
+/// The box-first fix for a verb-first spelling like `terra stop dev` or `terra stop dev -t 5`.
 fn build_reversal_hint(typed: &[String]) -> Option<String> {
     let command = Cli::command();
     let (verb_idx, verb) = typed.iter().enumerate().find_map(|(i, arg)| {
@@ -328,14 +328,14 @@ pub struct AgentTimeoutArg {
 }
 
 const STOP_TEARDOWN_ALLOWANCE_SECS: u64 = 35;
-const DEFAULT_STOP_WAIT_SECS: u64 = DEFAULT_STOP_GRACE_SECS + STOP_TEARDOWN_ALLOWANCE_SECS;
+const DEFAULT_STOP_TIMEOUT_SECS: u64 = DEFAULT_STOP_GRACE_SECS + STOP_TEARDOWN_ALLOWANCE_SECS;
 
 #[derive(Args, Debug)]
 pub struct StopArgs {
     /// How long to wait in seconds for the guest to shut down before the
     /// VM is killed.
-    #[arg(long, value_name = "SECS", default_value_t = DEFAULT_STOP_WAIT_SECS)]
-    pub wait: u64,
+    #[arg(short = 't', long = "timeout", value_name = "SECS", default_value_t = DEFAULT_STOP_TIMEOUT_SECS)]
+    pub timeout: u64,
 }
 
 #[derive(Args, Debug)]
@@ -349,8 +349,8 @@ pub struct RmArgs {
     pub force: bool,
     /// How long to wait in seconds for that graceful stop. Only means anything
     /// with `--force`, so clap refuses it on its own.
-    #[arg(long, value_name = "SECS", default_value_t = DEFAULT_STOP_WAIT_SECS, requires = "force")]
-    pub wait: u64,
+    #[arg(short = 't', long = "timeout", value_name = "SECS", default_value_t = DEFAULT_STOP_TIMEOUT_SECS, requires = "force")]
+    pub timeout: u64,
 }
 
 #[derive(Args, Debug)]
@@ -359,11 +359,18 @@ pub struct StorageArgs {
     pub cmd: StorageCmd,
 }
 
+#[derive(Args, Debug, Default)]
+pub struct StorageShowArgs {
+    /// Output machine-readable JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
 #[derive(Subcommand, Debug)]
 pub enum StorageCmd {
     /// List the box's images: what each is sized to, what it costs on disk,
     /// and which the recipe no longer names.
-    Show,
+    Show(StorageShowArgs),
     /// Write the box's images to one file, to be imported into a box set up
     /// from the same recipe on another machine.
     ///
@@ -417,6 +424,9 @@ pub struct LogsArgs {
 
 #[derive(Args, Debug)]
 pub struct SessionsArgs {
+    /// Output machine-readable JSON array of sessions.
+    #[arg(long)]
+    pub json: bool,
     #[command(flatten)]
     pub agent: AgentTimeoutArg,
 }
@@ -590,10 +600,7 @@ mod tests {
 
         // With flags or command arguments, the reversal hint still identifies the box.
         for (reversed, expected) in [
-            (
-                vec!["stop", "dev", "--wait", "5"],
-                "terra dev stop --wait 5",
-            ),
+            (vec!["stop", "dev", "-t", "5"], "terra dev stop -t 5"),
             (vec!["logs", "dev", "-f"], "terra dev logs -f"),
             (vec!["rm", "dev", "--purge"], "terra dev rm --purge"),
             (vec!["exec", "dev", "--", "ls"], "terra dev exec -- ls"),
@@ -842,7 +849,7 @@ mod tests {
         assert!(!args.all);
     }
 
-    /// The wait a stop uses is one number per role: the guest escalates to
+    /// The timeout a stop uses is one number per role: the guest escalates to
     /// SIGKILL after [`DEFAULT_STOP_GRACE_SECS`], and the host
     /// waits that plus a teardown budget before killing the VM - taken from
     /// the flag whether or not the flag was given.
@@ -852,19 +859,27 @@ mod tests {
             panic!("expected stop")
         };
         assert_eq!(
-            stop_args.wait,
+            stop_args.timeout,
             DEFAULT_STOP_GRACE_SECS + STOP_TEARDOWN_ALLOWANCE_SECS
         );
-        let Some(Cmd::Stop(stop_args)) = Cli::parse_from(["terra", "stop", "--wait", "5"]).cmd
+        let Some(Cmd::Stop(stop_args)) = Cli::parse_from(["terra", "stop", "-t", "5"]).cmd else {
+            panic!("expected stop")
+        };
+        assert_eq!(stop_args.timeout, 5);
+        let Some(Cmd::Stop(stop_args)) = Cli::parse_from(["terra", "stop", "--timeout", "5"]).cmd
         else {
             panic!("expected stop")
         };
-        assert_eq!(stop_args.wait, 5);
-        // A bare `--wait` used to mean "the default I would have used anyway".
-        assert!(Cli::try_parse_from(["terra", "stop", "--wait"]).is_err());
-        // Nothing waits for a stop `rm` never asked for.
-        assert!(Cli::try_parse_from(["terra", "rm", "--wait", "5"]).is_err());
-        assert!(Cli::try_parse_from(["terra", "rm", "--force", "--wait", "5"]).is_ok());
+        assert_eq!(stop_args.timeout, 5);
+        assert!(Cli::try_parse_from(["terra", "stop", "-t"]).is_err());
+        assert!(Cli::try_parse_from(["terra", "stop", "--timeout"]).is_err());
+        assert!(Cli::try_parse_from(["terra", "stop", "--wait", "5"]).is_err());
+        // Nothing times out for a stop `rm` never asked for.
+        assert!(Cli::try_parse_from(["terra", "rm", "-t", "5"]).is_err());
+        assert!(Cli::try_parse_from(["terra", "rm", "--timeout", "5"]).is_err());
+        assert!(Cli::try_parse_from(["terra", "rm", "--force", "-t", "5"]).is_ok());
+        assert!(Cli::try_parse_from(["terra", "rm", "--force", "--timeout", "5"]).is_ok());
+        assert!(Cli::try_parse_from(["terra", "rm", "--force", "--wait", "5"]).is_err());
     }
 
     /// `terra setup` sets up; booting is `terra <box>`'s job. The boot flags

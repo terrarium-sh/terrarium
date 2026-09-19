@@ -102,6 +102,11 @@ pub fn make_sparse(_file: &File) -> Result<()> {
     Ok(())
 }
 
+pub fn allocated_size(_path: &Path, metadata: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    metadata.blocks() * 512
+}
+
 /// Restrict an existing path to its owner: `0700` for a directory, `0600` for a
 /// file.
 pub fn set_owner_only(path: &Path, dir: bool) -> Result<()> {

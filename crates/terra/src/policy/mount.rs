@@ -699,11 +699,11 @@ mod tests {
 
         let targets = vec![
             SensitiveTarget {
-                path: ssh_dir.clone(),
+                path: canonicalize_existing_prefix(&ssh_dir),
                 category: "SSH keys and configuration",
             },
             SensitiveTarget {
-                path: PathBuf::from("/etc/shadow"),
+                path: canonicalize_existing_prefix(Path::new("/etc/shadow")),
                 category: "host shadow passwords",
             },
         ];

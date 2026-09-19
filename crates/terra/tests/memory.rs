@@ -67,7 +67,7 @@ impl Drop for RunningBox {
         let _ = run_command(
             &self.terra,
             &self.home,
-            &["stop", "--wait", "5", "--project", project],
+            &["stop", "-t", "5", "--project", project],
             Duration::from_secs(10),
         );
     }

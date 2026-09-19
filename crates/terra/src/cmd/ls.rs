@@ -23,11 +23,22 @@ pub fn run(args: &crate::cli::LsArgs, project_dir: &Path) -> Result<ExitCode> {
     if args.json {
         let entries: Vec<BoxEntry<'_>> = boxes
             .iter()
-            .map(|bx| BoxEntry {
-                name: bx.get_name(),
-                state: bx.get_state(),
-                project_dir: bx.get_project_dir(),
-                dir: bx.get_dir(),
+            .map(|bx| {
+                let box_state = bx.get_state();
+                let (pid, process_identity) = if box_state == state::BoxState::Running {
+                    bx.read_vm_process()
+                        .map_or((None, None), |vm| (Some(vm.pid), vm.process_identity))
+                } else {
+                    (None, None)
+                };
+                BoxEntry {
+                    name: bx.get_name(),
+                    state: box_state,
+                    project_dir: bx.get_project_dir(),
+                    dir: bx.get_dir(),
+                    pid,
+                    process_identity,
+                }
             })
             .collect();
         let json = serde_json::to_string_pretty(&entries).context("serializing boxes to json")?;
@@ -35,6 +46,7 @@ pub fn run(args: &crate::cli::LsArgs, project_dir: &Path) -> Result<ExitCode> {
         render::finish_stdout_write(writeln!(out, "{json}"))?;
         return Ok(ExitCode::SUCCESS);
     }
+
     if boxes.is_empty() {
         if args.all {
             eprintln!("terra: no boxes on this machine");
@@ -82,6 +94,13 @@ struct BoxEntry<'a> {
     state: state::BoxState,
     project_dir: &'a Path,
     dir: &'a Path,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pid: Option<u32>,
+    /// Opaque platform-specific process start identity token (Linux ticks
+    /// since boot, macOS epoch microseconds, Windows FILETIME) used to
+    /// distinguish the running VM from a recycled PID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    process_identity: Option<u64>,
 }
 
 fn list_boxes_of_project(project_dir: &Path) -> Result<Vec<BoxRef>> {
@@ -201,16 +220,35 @@ mod tests {
         std::fs::create_dir_all(bx.get_dir()).unwrap();
         std::fs::write(bx.get_dir().join(crate::state::ROOTFS_FILE), b"image").unwrap();
 
-        let entries = vec![BoxEntry {
-            name: bx.get_name(),
-            state: bx.get_state(),
-            project_dir: bx.get_project_dir(),
-            dir: bx.get_dir(),
-        }];
+        let entries = vec![
+            BoxEntry {
+                name: bx.get_name(),
+                state: bx.get_state(),
+                project_dir: bx.get_project_dir(),
+                dir: bx.get_dir(),
+                pid: None,
+                process_identity: None,
+            },
+            BoxEntry {
+                name: bx.get_name(),
+                state: state::BoxState::Running,
+                project_dir: bx.get_project_dir(),
+                dir: bx.get_dir(),
+                pid: Some(1234),
+                process_identity: Some(5678),
+            },
+        ];
         let json = serde_json::to_string(&entries).unwrap();
         assert!(json.contains(r#""name":"dev""#));
         assert!(json.contains(r#""state":"stopped""#));
         assert!(json.contains(&format!(r#""project_dir":"{}""#, dir.path().display())));
         assert!(json.contains(&format!(r#""dir":"{}""#, bx.get_dir().display())));
+        assert!(json.contains(r#""pid":1234"#));
+        assert!(json.contains(r#""process_identity":5678"#));
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+        assert!(parsed[0].get("pid").is_none());
+        assert!(parsed[0].get("process_identity").is_none());
+        assert_eq!(parsed[1]["pid"], 1234);
+        assert_eq!(parsed[1]["process_identity"], 5678);
     }
 }

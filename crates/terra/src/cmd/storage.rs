@@ -38,7 +38,7 @@ pub fn run(
 ) -> Result<ExitCode> {
     let bx = resolve::resolve_pinned_box(project_dir, name)?;
     match &args.cmd {
-        StorageCmd::Show => show(&bx),
+        StorageCmd::Show(show_args) => show(&bx, show_args.json),
         StorageCmd::Export(StorageFileArgs { file }) => export(&bx, file),
         StorageCmd::Import(StorageFileArgs { file }) => import(&bx, file),
         StorageCmd::Prune => prune(&bx),
@@ -66,8 +66,58 @@ fn list_configured_volume_names(bx: &BoxRef) -> Result<Vec<String>> {
     Ok(cfg.volumes.into_iter().map(|v| v.name).collect())
 }
 
-fn show(bx: &BoxRef) -> Result<()> {
+#[derive(Serialize)]
+struct StorageShowOutput<'a> {
+    images: Vec<StorageImageEntry<'a>>,
+    total_disk_bytes: u64,
+}
+
+#[derive(Serialize)]
+struct StorageImageEntry<'a> {
+    name: String,
+    path: &'a Path,
+    virtual_bytes: u64,
+    disk_bytes: u64,
+    is_unused: bool,
+}
+
+fn show(bx: &BoxRef, json: bool) -> Result<()> {
     let images = list_images_of(bx)?;
+    if json {
+        let unused = if images.is_empty() {
+            Vec::new()
+        } else {
+            bx.list_unused_volume_images(&list_configured_volume_names(bx)?)?
+        };
+        let mut entries = Vec::with_capacity(images.len());
+        let mut total_disk_bytes = 0;
+        for path in &images {
+            let meta = std::fs::metadata(path)
+                .with_context(|| format!("reading {}", escape_printable_path(path)))?;
+            let disk_bytes = crate::sys::allocated_size(path, &meta);
+            total_disk_bytes += disk_bytes;
+            let name = path
+                .file_name()
+                .unwrap_or_else(|| path.as_os_str())
+                .to_string_lossy();
+            entries.push(StorageImageEntry {
+                name: name.into_owned(),
+                path,
+                virtual_bytes: meta.len(),
+                disk_bytes,
+                is_unused: unused.contains(path),
+            });
+        }
+        let output = StorageShowOutput {
+            images: entries,
+            total_disk_bytes,
+        };
+        let rendered =
+            serde_json::to_string_pretty(&output).context("serializing storage images to json")?;
+        let mut out = std::io::stdout().lock();
+        crate::render::finish_stdout_write(writeln!(out, "{rendered}"))?;
+        return Ok(());
+    }
     if images.is_empty() {
         eprintln!(
             "terra: {bx} has no images yet - `terra {} setup` builds them",
@@ -92,7 +142,7 @@ fn show(bx: &BoxRef) -> Result<()> {
     for (name, path) in &named {
         let meta = std::fs::metadata(path)
             .with_context(|| format!("reading {}", escape_printable_path(path)))?;
-        let used = allocated_size(&meta);
+        let used = crate::sys::allocated_size(path, &meta);
         total += used;
         let note = if unused.contains(path) {
             format!(
@@ -117,17 +167,6 @@ fn show(bx: &BoxRef) -> Result<()> {
         format_mib(total)
     ))?;
     Ok(())
-}
-
-#[cfg(unix)]
-fn allocated_size(metadata: &std::fs::Metadata) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    metadata.blocks() * 512
-}
-
-#[cfg(windows)]
-fn allocated_size(metadata: &std::fs::Metadata) -> u64 {
-    metadata.len()
 }
 
 /// Bytes as MiB with one decimal - integer arithmetic, so no size is rounded
@@ -1076,5 +1115,31 @@ mod tests {
         }
         drop(running);
         import(&bx, &artifact).unwrap();
+    }
+
+    #[test]
+    fn storage_show_json_renders_images_and_total() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = TestHome::new();
+        let bx = build_box_ref(dir.path(), &["data"]);
+
+        let output = StorageShowOutput {
+            images: vec![StorageImageEntry {
+                name: "rootfs.ext4".to_string(),
+                path: Path::new("/tmp/rootfs.ext4"),
+                virtual_bytes: 1024,
+                disk_bytes: 512,
+                is_unused: false,
+            }],
+            total_disk_bytes: 512,
+        };
+        let json = serde_json::to_string(&output).unwrap();
+        assert!(json.contains(r#""name":"rootfs.ext4""#));
+        assert!(json.contains(r#""virtual_bytes":1024"#));
+        assert!(json.contains(r#""disk_bytes":512"#));
+        assert!(json.contains(r#""is_unused":false"#));
+        assert!(json.contains(r#""total_disk_bytes":512"#));
+
+        assert!(show(&bx, true).is_ok());
     }
 }

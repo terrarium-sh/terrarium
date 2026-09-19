@@ -162,8 +162,11 @@ impl BoxRef {
         let line = self.read_lock_line();
         let mut words = line.split_whitespace();
         let pid = words.next()?.parse().ok().filter(|pid| *pid > 0)?;
-        let started_at = words.next().and_then(|w| w.parse().ok());
-        Some(VmProcess { pid, started_at })
+        let process_identity = words.next().and_then(|w| w.parse().ok());
+        Some(VmProcess {
+            pid,
+            process_identity,
+        })
     }
 
     fn is_marked_baking(&self) -> bool {
@@ -186,8 +189,8 @@ impl BoxRef {
     pub fn publish_pid(&self, lock: &File, pid: u32, baking: bool) {
         use std::fmt::Write as _;
         let mut line = pid.to_string();
-        if let Some(started_at) = crate::sys::read_process_start_time(pid) {
-            let _ = write!(line, " {started_at}");
+        if let Some(process_identity) = crate::sys::read_process_start_time(pid) {
+            let _ = write!(line, " {process_identity}");
         }
         if baking {
             line.push(' ');
@@ -315,7 +318,7 @@ pub struct VmProcess {
     /// [`crate::sys::signal_pid`] tells this VM from a stranger later
     /// recycled onto the pid. `None` - an old line, or the host had no
     /// identity - cannot be signalled.
-    pub started_at: Option<u64>,
+    pub process_identity: Option<u64>,
 }
 
 /// Who holds a box's run lock.
@@ -1053,7 +1056,7 @@ mod tests {
         let published = b.read_vm_process().unwrap();
         assert_eq!(published.pid, 4242);
         assert_eq!(
-            published.started_at,
+            published.process_identity,
             crate::sys::read_process_start_time(4242),
             "the start identity is read from the host and round-trips"
         );
@@ -1061,20 +1064,23 @@ mod tests {
         let marked = b.read_vm_process().unwrap();
         assert_eq!(marked.pid, 4242, "a marked line still names its pid");
         assert_eq!(
-            marked.started_at, published.started_at,
-            "the mark rides behind the starttime"
+            marked.process_identity, published.process_identity,
+            "the mark rides behind the start identity"
         );
 
-        // A line from before starttimes were recorded still reads.
+        // A line from before start identity was recorded still reads.
         BoxRef::rewrite_lock_line(&lock, "4242").unwrap();
         let legacy = b.read_vm_process().unwrap();
         assert_eq!(legacy.pid, 4242);
-        assert_eq!(legacy.started_at, None, "the old format has no starttime");
+        assert_eq!(
+            legacy.process_identity, None,
+            "the old format has no start identity"
+        );
         BoxRef::rewrite_lock_line(&lock, "4242 bake").unwrap();
         assert_eq!(
-            b.read_vm_process().unwrap().started_at,
+            b.read_vm_process().unwrap().process_identity,
             None,
-            "a bare word where the starttime belongs reads as absent"
+            "a bare word where the start identity belongs reads as absent"
         );
 
         // Still the same inode being locked, not a fresh file beside it.

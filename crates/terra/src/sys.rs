@@ -26,9 +26,10 @@ pub use imp::is_host_root;
 #[cfg(unix)]
 pub use imp::register_stop_channel;
 pub use imp::{
-    MAX_SOCK_PATH, claim_inherited_lock, detach, find_terminating_signal, holds_run_lock,
-    host_addresses, install_stop_signal_handlers, make_sparse, pass_lock, read_process_start_time,
-    restrict_new_files, set_open_file_mode, set_owner_only, signal_pid, try_lock_run,
+    MAX_SOCK_PATH, allocated_size, claim_inherited_lock, detach, find_terminating_signal,
+    holds_run_lock, host_addresses, install_stop_signal_handlers, make_sparse, pass_lock,
+    read_process_start_time, restrict_new_files, set_open_file_mode, set_owner_only, signal_pid,
+    try_lock_run,
 };
 
 pub(crate) fn validate_host_root() -> anyhow::Result<()> {
@@ -231,8 +232,8 @@ mod tests {
         assert!(validate_host_root_for(false, false).is_ok());
     }
 
-    /// `--wait` and `--agent-timeout` take any u64, and `Instant + Duration`
-    /// panics on overflow - so `terra stop --wait 18446744073709551615` must
+    /// `-t`/`--timeout` and `--agent-timeout` take any u64, and `Instant + Duration`
+    /// panics on overflow - so `terra stop -t 18446744073709551615` must
     /// clamp to "forever" rather than take terra down mid-stop.
     #[test]
     fn an_absurd_wait_becomes_a_far_deadline_not_a_panic() {

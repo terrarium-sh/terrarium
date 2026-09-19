@@ -3,10 +3,16 @@
 
 use crate::session::{self, SessionClient};
 use crate::{render, resolve};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
+
+#[derive(serde::Serialize)]
+struct SessionEntry {
+    id: u64,
+    term_size: Option<terra_protocol::TermSize>,
+}
 
 pub fn run(
     args: &crate::cli::SessionsArgs,
@@ -15,6 +21,20 @@ pub fn run(
 ) -> Result<ExitCode> {
     let bx = &resolve::resolve_pinned_box(project_dir, name)?;
     let clients = session::list_clients(bx, args.agent.agent_timeout)?;
+    if args.json {
+        let entries: Vec<SessionEntry> = clients
+            .into_iter()
+            .map(|client| SessionEntry {
+                id: client.id,
+                term_size: client.reported_term_size,
+            })
+            .collect();
+        let json =
+            serde_json::to_string_pretty(&entries).context("serializing sessions to json")?;
+        let mut out = std::io::stdout().lock();
+        render::finish_stdout_write(writeln!(out, "{json}"))?;
+        return Ok(ExitCode::SUCCESS);
+    }
     if clients.is_empty() {
         eprintln!("terra: nobody is attached to {bx}");
     }
@@ -55,5 +75,22 @@ mod tests {
             }),
             "7\t24x80"
         );
+    }
+
+    #[test]
+    fn session_entry_serializes_to_json_with_snake_case_keys() {
+        let entries = vec![
+            SessionEntry {
+                id: 1,
+                term_size: Some(terra_protocol::TermSize { rows: 24, cols: 80 }),
+            },
+            SessionEntry {
+                id: 2,
+                term_size: None,
+            },
+        ];
+        let json = serde_json::to_string(&entries).unwrap();
+        assert!(json.contains(r#"{"id":1,"term_size":{"rows":24,"cols":80}}"#));
+        assert!(json.contains(r#"{"id":2,"term_size":null}"#));
     }
 }

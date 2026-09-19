@@ -16,16 +16,18 @@ fn signal_vm(bx: &BoxRef, signal: sys::VmSignal) -> Result<Option<(VmProcess, sy
     };
     #[cfg(windows)]
     if matches!(signal, sys::VmSignal::GracefulStop) {
-        if vm.started_at.is_none() || sys::read_process_start_time(vm.pid) != vm.started_at {
+        if vm.process_identity.is_none()
+            || sys::read_process_start_time(vm.pid) != vm.process_identity
+        {
             return Ok(Some((vm, sys::SignalResult::IdentityUnknown)));
         }
         if bx.get_holder() == Holder::SettingUp {
-            let result = sys::signal_pid(vm.pid, vm.started_at, sys::VmSignal::ForcedStop)?;
+            let result = sys::signal_pid(vm.pid, vm.process_identity, sys::VmSignal::ForcedStop)?;
             return Ok(Some((vm, result)));
         }
         return request_graceful_stop(bx).map(|()| Some((vm, sys::SignalResult::Sent)));
     }
-    let result = sys::signal_pid(vm.pid, vm.started_at, signal)
+    let result = sys::signal_pid(vm.pid, vm.process_identity, signal)
         .with_context(|| format!("signalling the VM process (pid {}) of {bx}", vm.pid))?;
     Ok(Some((vm, result)))
 }
@@ -124,7 +126,7 @@ pub(crate) fn stop_and_wait(
         grace.as_secs(),
         vm.pid
     );
-    let signal_result = sys::signal_pid(vm.pid, vm.started_at, sys::VmSignal::ForcedStop)
+    let signal_result = sys::signal_pid(vm.pid, vm.process_identity, sys::VmSignal::ForcedStop)
         .with_context(|| format!("killing the VM process (pid {}) of {bx}", vm.pid))?;
     if signal_result == sys::SignalResult::IdentityUnknown {
         return Ok(StopOutcome::IdentityUnknown);
@@ -142,7 +144,7 @@ pub fn run(
     project_dir: &Path,
 ) -> Result<ExitCode> {
     let bx = &crate::resolve::resolve_pinned_box(project_dir, name)?;
-    let stopped = stop_and_wait(bx, Duration::from_secs(args.wait), SetupAction::Refuse)
+    let stopped = stop_and_wait(bx, Duration::from_secs(args.timeout), SetupAction::Refuse)
         .context("could not stop the box - `terra rm --force` takes it away regardless")?;
     match stopped {
         StopOutcome::AlreadyStopped => eprintln!("terra: {bx} is already stopped"),

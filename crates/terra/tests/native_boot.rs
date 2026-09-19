@@ -76,7 +76,7 @@ impl BoxFixture {
 
     fn force_remove(&self) -> String {
         let output = Command::new(&self.terra)
-            .args(["native", "rm", "--force", "--wait", "0"])
+            .args(["native", "rm", "--force", "-t", "0"])
             .arg("--project")
             .arg(&self.project)
             .env("HOME", &self.home)
@@ -107,7 +107,7 @@ impl BoxFixture {
 
 impl Drop for BoxFixture {
     fn drop(&mut self) {
-        let _ = self.run(&["stop", "--wait", "5"]);
+        let _ = self.run(&["stop", "-t", "5"]);
     }
 }
 

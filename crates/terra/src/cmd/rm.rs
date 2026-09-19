@@ -26,7 +26,7 @@ pub fn run(args: &crate::cli::RmArgs, name: Option<&str>, project_dir: &Path) ->
     let _lock = if args.force {
         let stopped = if bx.get_holder().holds() {
             eprintln!("terra: {bx} is running - asking it to stop before removing it");
-            stop_and_wait(bx, Duration::from_secs(args.wait), SetupAction::Stop)
+            stop_and_wait(bx, Duration::from_secs(args.timeout), SetupAction::Stop)
         } else {
             Ok(StopOutcome::AlreadyStopped)
         };
@@ -140,7 +140,7 @@ mod tests {
             &crate::cli::RmArgs {
                 purge: false,
                 force: false,
-                wait: 0,
+                timeout: 0,
             },
             Some("dev"),
             project.path(),
@@ -220,7 +220,7 @@ mod tests {
         let args = crate::cli::RmArgs {
             purge: true,
             force: true,
-            wait: 0,
+            timeout: 0,
         };
         let err = run(&args, Some("dev"), dir.path())
             .expect_err("nothing was signalled, so nothing may be removed")
@@ -251,7 +251,7 @@ mod tests {
             &crate::cli::RmArgs {
                 purge: true,
                 force: true,
-                wait: 0,
+                timeout: 0,
             },
             Some("dev"),
             dir.path(),
@@ -280,7 +280,7 @@ mod tests {
         let args = crate::cli::RmArgs {
             purge: true,
             force: true,
-            wait: 0,
+            timeout: 0,
         };
         let err = run(&args, Some("dev"), dir.path())
             .expect_err("a box mid-bake must not be removed")
@@ -316,7 +316,7 @@ mod tests {
         let rm = |purge| crate::cli::RmArgs {
             purge,
             force: false,
-            wait: 30,
+            timeout: 30,
         };
         build();
         run(&rm(false), Some("dev"), dir.path()).unwrap();
@@ -357,7 +357,7 @@ mod tests {
         let rm = crate::cli::RmArgs {
             purge: true,
             force: false,
-            wait: 30,
+            timeout: 30,
         };
 
         let err = run(&rm, Some("dve"), dir.path())
