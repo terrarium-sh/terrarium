@@ -63,37 +63,6 @@ pub(super) fn statfs(file: &File) -> Result<FilesystemStat, Error> {
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::os::windows::fs::OpenOptionsExt as _;
-    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
-
-    #[test]
-    fn file_and_directory_handles_report_the_same_volume_after_rename() {
-        let root = tempfile::tempdir().unwrap();
-        let file_path = root.path().join("before");
-        let file = File::create(&file_path).unwrap();
-        std::fs::rename(&file_path, root.path().join("after")).unwrap();
-        let directory = File::options()
-            .read(true)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-            .open(root.path())
-            .unwrap();
-        let stat = statfs(&file).unwrap();
-        let directory_stat = statfs(&directory).unwrap();
-        assert_ne!(stat.blocks, 0);
-        assert_ne!(stat.block_size, 0);
-        assert_ne!(stat.name_max, 0);
-        assert_eq!(stat.blocks, directory_stat.blocks);
-        assert_eq!(stat.block_size, directory_stat.block_size);
-        assert_eq!(stat.name_max, directory_stat.name_max);
-        assert!(stat.blocks_available <= stat.blocks_free);
-        assert!(stat.blocks_free <= stat.blocks);
-        assert_eq!((stat.files, stat.files_free), (0, 0));
-    }
-}
-
 #[allow(unsafe_code)]
 pub(super) fn set_readonly(file: &File, readonly: bool) -> Result<(), Error> {
     use std::os::windows::io::{FromRawHandle, OwnedHandle};
@@ -177,4 +146,35 @@ pub(super) fn open_metadata_file(directory: &File, name: &str) -> Result<File, E
         return Err(Error::Access);
     }
     Ok(file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+
+    #[test]
+    fn file_and_directory_handles_report_the_same_volume_after_rename() {
+        let root = tempfile::tempdir().unwrap();
+        let file_path = root.path().join("before");
+        let file = File::create(&file_path).unwrap();
+        std::fs::rename(&file_path, root.path().join("after")).unwrap();
+        let directory = File::options()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(root.path())
+            .unwrap();
+        let stat = statfs(&file).unwrap();
+        let directory_stat = statfs(&directory).unwrap();
+        assert_ne!(stat.blocks, 0);
+        assert_ne!(stat.block_size, 0);
+        assert_ne!(stat.name_max, 0);
+        assert_eq!(stat.blocks, directory_stat.blocks);
+        assert_eq!(stat.block_size, directory_stat.block_size);
+        assert_eq!(stat.name_max, directory_stat.name_max);
+        assert!(stat.blocks_available <= stat.blocks_free);
+        assert!(stat.blocks_free <= stat.blocks);
+        assert_eq!((stat.files, stat.files_free), (0, 0));
+    }
 }

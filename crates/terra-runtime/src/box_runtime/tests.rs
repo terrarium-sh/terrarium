@@ -625,7 +625,8 @@ fn dropping_a_box_moves_filesystem_resource_cleanup_off_the_caller() {
     let runtime = BoxRuntime::new(&engine, BoxHost::new()).unwrap();
     let mut filesystem = crate::component::fs::host::FsHost::new(
         DeviceContext::new(4096).unwrap(),
-        crate::component::fs::host::ShareGrant::new(root.path(), false).unwrap(),
+        crate::component::fs::host::ShareGrant::new(&root.path().canonicalize().unwrap(), false)
+            .unwrap(),
     );
     let (started, ready) = std::sync::mpsc::channel();
     let (release, blocked) = std::sync::mpsc::channel();

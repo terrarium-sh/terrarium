@@ -2,6 +2,8 @@
 use std::path::Component;
 use std::{io, path::Path};
 
+#[cfg(target_os = "macos")]
+mod macos;
 #[cfg(windows)]
 mod windows;
 
@@ -442,7 +444,10 @@ fn open_metadata_file(
         #[cfg(target_os = "linux")]
         let flags = OFlags::PATH;
         #[cfg(target_os = "macos")]
-        let flags = OFlags::from_bits_retain(libc::O_EVTONLY.cast_unsigned());
+        let flags = {
+            macos::restrict_event_only_descriptors().map_err(|_| Error::Access)?;
+            OFlags::from_bits_retain(libc::O_EVTONLY.cast_unsigned())
+        };
         std::fs::File::from(
             openat(
                 directory,
@@ -671,7 +676,7 @@ fn add_descriptor_lifecycle<T: Send + 'static>(
 #[cfg(test)]
 mod metadata_tests {
     use super::*;
-    use std::io::Read;
+    use std::io::{Read, Write};
 
     #[test]
     fn cancelled_metadata_open_keeps_its_permit_until_the_blocking_job_finishes() {
@@ -765,12 +770,14 @@ mod metadata_tests {
         std::fs::rename(&original, &moved).unwrap();
         std::fs::write(&original, b"replacement").unwrap();
         let descriptor = Descriptor::File(wasmtime_wasi::filesystem::File::new(
-            metadata,
+            metadata.try_clone().unwrap(),
             FsPerms::ReadWrite,
             OpenMode::empty(),
             false,
         ));
         set_mode(&descriptor, 0o600).unwrap();
+        assert!(metadata.read(&mut [0; 1]).is_err());
+        assert!(metadata.write(b"changed").is_err());
         assert_eq!(std::fs::read(&moved).unwrap(), b"original");
         assert_eq!(std::fs::read(&original).unwrap(), b"replacement");
         for name in ["", ".", "..", "../original", "original/child", "original\0"] {
