@@ -1,0 +1,3 @@
+onlyBuiltDependencies:
+  - '@alis-is/starlight'
+  - esbuild
