@@ -2,7 +2,7 @@
 
 #![allow(unsafe_code)]
 
-use terra_runtime::component::vmm::virtualization::{PreparedMachine, StartedVcpus, VcpuReaper};
+use terra_runtime::component::vmm::virtualization::{PreparedMachine, StartedVcpus};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
@@ -317,13 +317,12 @@ pub async fn prepare(mut input: WorkerInput) -> Result<PreparedVmm, ArmWorkerErr
         ))
     })?;
     let machine = Machine::new(&kvm, &config)?;
-    let mut runtime =
-        crate::worker::create_runtime(&input).map_err(|error| component_error(&error))?;
+    let runtime = crate::worker::create_runtime(&input).map_err(|error| component_error(&error))?;
     let lifecycle = runtime.lifecycle_notifier();
     let hard_stop = input.hard_stop;
     let group = VcpuGroup::prepare(&machine, input.vcpus, &lifecycle, hard_stop)?;
     let prepared = PreparedMachine::new(config, machine);
-    let machine = crate::worker::boot_prepared(&mut runtime, prepared, &mut input)
+    let (mut runtime, machine) = crate::worker::boot_prepared(runtime, prepared, &mut input)
         .await
         .map_err(|error| component_error(&error))?;
     let devices = worker::assemble_devices(
@@ -331,15 +330,17 @@ pub async fn prepare(mut input: WorkerInput) -> Result<PreparedVmm, ArmWorkerErr
         &mut input,
         machine.ram(),
         &disks,
-        |kind, index| machine.bind_interrupt(kind, index, inject_irq),
+        |kind, index| {
+            machine
+                .bind_interrupt(kind, index, inject_irq)
+                .map_err(|error| error.to_string())
+        },
     )
-    .await
     .map_err(ArmWorkerError::Component)?;
-    let shutdowns =
-        worker::grant_device_shutdown(&mut runtime, &devices).map_err(ArmWorkerError::Component)?;
+    worker::grant_device_shutdown(&mut runtime, &devices).map_err(ArmWorkerError::Component)?;
     let interrupt_machine = machine.clone();
-    let interrupt_shutdown = runtime
-        .grant_interrupt_shutdown(move || {
+    runtime
+        .grant_interrupt_shutdown(async move {
             let interrupt_machine = interrupt_machine.machine();
             interrupt_machine
                 .irqs
@@ -348,14 +349,15 @@ pub async fn prepare(mut input: WorkerInput) -> Result<PreparedVmm, ArmWorkerErr
                 .map_err(|error| format!("{error:?}"))
         })
         .map_err(|error| component_error(&error))?;
-    let runners = runtime
-        .grant_vcpus(move |controls, boot| {
+    let (runtime, runners) = runtime
+        .prepare_vcpus(move |controls, boot| {
             group
                 .start(controls, boot)
                 .map_err(|error| wasmtime::Error::msg(format!("ARM vCPU startup: {error:?}")))
         })
         .await
         .map_err(|error| component_error(&error))?;
+    let teardown = runtime.native_teardown();
     Ok(PreparedVmm {
         runtime,
         observation: VmmObservation {
@@ -363,8 +365,7 @@ pub async fn prepare(mut input: WorkerInput) -> Result<PreparedVmm, ArmWorkerErr
             lifecycle,
             deadline: input.deadline,
             devices,
-            shutdowns,
-            interrupts: Some(interrupt_shutdown),
+            teardown,
         },
     })
 }
@@ -401,7 +402,7 @@ impl VcpuGroup {
         self,
         controls: Vec<NativeVcpu>,
         boot: terra_runtime::component::vmm::boot::BootEntry,
-    ) -> Result<StartedVcpus<VcpuReaper>, ArmWorkerError> {
+    ) -> Result<StartedVcpus, ArmWorkerError> {
         if self.runners.len() != controls.len() {
             return Err(ArmWorkerError::BadVcpuCount(controls.len()));
         }
@@ -413,24 +414,29 @@ impl VcpuGroup {
             .iter()
             .map(|runner| (Arc::clone(&runner.stop), runner.publication.clone()))
             .collect::<Vec<_>>();
-        Ok(StartedVcpus::new(self, move || {
-            for (stop, publication) in stops {
-                stop.store(true, Ordering::Release);
-                publication.kick();
-            }
-            Ok(())
-        })
-        .with_reaper(|mut group| {
-            group
-                .stop()
-                .map(|outcomes| {
-                    outcomes
-                        .into_iter()
-                        .map(|outcome| outcome.map(|_| ()).map_err(|error| format!("{error:?}")))
-                        .collect()
-                })
-                .map_err(|error| format!("{error:?}"))
-        }))
+        Ok(StartedVcpus::new(
+            self,
+            move || {
+                for (stop, publication) in stops {
+                    stop.store(true, Ordering::Release);
+                    publication.kick();
+                }
+                Ok(())
+            },
+            |mut group| {
+                group
+                    .stop()
+                    .map(|outcomes| {
+                        outcomes
+                            .into_iter()
+                            .map(|outcome| {
+                                outcome.map(|_| ()).map_err(|error| format!("{error:?}"))
+                            })
+                            .collect()
+                    })
+                    .map_err(|error| format!("{error:?}"))
+            },
+        ))
     }
 
     fn stop(&mut self) -> Result<Vec<Result<ArmVcpuOutcome, ArmWorkerError>>, ArmWorkerError> {

@@ -7,13 +7,14 @@ use bridge::{BridgeContext, run_bridge};
 pub use device::MmioDevice;
 
 use crate::box_runtime::{BoxHost, BoxRuntime};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use wasmtime::component::{Component, StreamReader, TypedFunc};
 
 wasmtime::component::bindgen!({
     world: "vmm", path: "../../components/vmm/wit",
     imports: { default: trappable },
+    exports: { default: async },
     with: {
         "terra:mmio/platform.vcpu": crate::component::vmm::Vcpu,
         "terra:mmio/virtualization.vm": crate::component::vmm::virtualization::Vm,
@@ -21,8 +22,8 @@ wasmtime::component::bindgen!({
 });
 pub use terra::mmio::types::{ControlReply, Error, Operation, Reply, Request, RoutedReply};
 pub type Serve = TypedFunc<(StreamReader<Request>,), (StreamReader<Reply>,)>;
-type ComposeWorkers = TypedFunc<(), (Result<(), Error>,)>;
-type Remap = TypedFunc<(u32, u64, u64), (Result<(), Error>,)>;
+pub(crate) type OpenDevice = TypedFunc<(u32, u64, u64), (Result<StreamReader<Request>, Error>,)>;
+pub(crate) type AttachReplies = TypedFunc<(u32, StreamReader<Reply>), (Result<(), Error>,)>;
 type Access = TypedFunc<(u64, u8, u64, bool), (Result<RoutedReply, Error>,)>;
 type Control = TypedFunc<(u32, Operation), (Result<ControlReply, Error>,)>;
 type ConfigureVcpus = TypedFunc<(u8,), (Result<(), Error>,)>;
@@ -42,25 +43,48 @@ enum Command {
 }
 struct Pending {
     command: Command,
-    reply: mpsc::SyncSender<wasmtime::Result<RoutedReply>>,
+    reply: ReplyOwner,
 }
 
-#[derive(Clone)]
+#[derive(Default)]
 struct DeviceRequestCounts {
-    completed: Arc<AtomicU64>,
-    failed: Arc<AtomicU64>,
+    completed: AtomicU64,
+    failed: AtomicU64,
 }
+
+struct DeviceRegistration {
+    kind: crate::component::vmm::machine::DeviceKind,
+    slot: u32,
+    base: AtomicU64,
+    counts: DeviceRequestCounts,
+}
+
+struct DevicePlan {
+    device: Arc<DeviceRegistration>,
+    mapping: Option<(u64, u64)>,
+    setup: crate::component::vmm::workers::Setup,
+}
+
+type DeviceRegistry = Arc<OnceLock<Box<[Arc<DeviceRegistration>]>>>;
 
 fn submit(
     sender: &tokio::sync::mpsc::Sender<Pending>,
-    admission: &Mutex<bool>,
+    admission: &Arc<Mutex<Option<String>>>,
     failure: &Mutex<Option<String>>,
     command: Command,
+    control: device::ControlGuard,
 ) -> wasmtime::Result<RoutedReply> {
     if let Some(failure) = recorded_failure(failure) {
         return Err(wasmtime::Error::msg(failure));
     }
-    let response = enqueue(sender, admission, command)?;
+    let (reply, response) = mpsc::sync_channel(1);
+    enqueue_reply(
+        sender,
+        admission,
+        command,
+        ReplySender::Sync(reply),
+        Some(control),
+    )?;
     wait_for_reply(failure, &response)
 }
 
@@ -83,25 +107,111 @@ fn wait_for_reply(
 
 fn enqueue(
     sender: &tokio::sync::mpsc::Sender<Pending>,
-    admission: &Mutex<bool>,
+    admission: &Arc<Mutex<Option<String>>>,
     command: Command,
 ) -> wasmtime::Result<mpsc::Receiver<wasmtime::Result<RoutedReply>>> {
     let (reply, response) = mpsc::sync_channel(1);
-    let admission = admission
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !*admission {
-        return Err(wasmtime::Error::msg("MMIO bridge stopping"));
-    }
-    sender
-        .try_send(Pending { command, reply })
-        .map_err(|error| wasmtime::Error::msg(format!("MMIO bridge unavailable: {error}")))?;
+    enqueue_reply(sender, admission, command, ReplySender::Sync(reply), None)?;
     Ok(response)
 }
 
+enum ReplySender {
+    Sync(mpsc::SyncSender<wasmtime::Result<RoutedReply>>),
+    Async(tokio::sync::oneshot::Sender<wasmtime::Result<RoutedReply>>),
+}
+
+struct ReplyOwner {
+    sender: Option<ReplySender>,
+    control: Option<device::ControlGuard>,
+    admission: Arc<Mutex<Option<String>>>,
+}
+
+impl ReplyOwner {
+    fn send(mut self, result: wasmtime::Result<RoutedReply>) {
+        self.complete(result);
+    }
+
+    fn complete(&mut self, result: wasmtime::Result<RoutedReply>) {
+        if let Some(control) = self.control.take() {
+            control.complete(result.is_ok());
+        }
+        match self.sender.take() {
+            Some(ReplySender::Sync(sender)) => {
+                let _ = sender.send(result);
+            }
+            Some(ReplySender::Async(sender)) => {
+                let _ = sender.send(result);
+            }
+            None => {}
+        }
+    }
+}
+
+impl Drop for ReplyOwner {
+    fn drop(&mut self) {
+        if self.sender.is_some() {
+            let reason = recorded_failure(&self.admission)
+                .unwrap_or_else(|| "MMIO bridge stopped".to_owned());
+            self.complete(Err(wasmtime::Error::msg(reason)));
+        }
+    }
+}
+
+fn enqueue_reply(
+    sender: &tokio::sync::mpsc::Sender<Pending>,
+    admission: &Arc<Mutex<Option<String>>>,
+    command: Command,
+    reply: ReplySender,
+    control: Option<device::ControlGuard>,
+) -> wasmtime::Result<()> {
+    let pending = Pending {
+        command,
+        reply: ReplyOwner {
+            sender: Some(reply),
+            control,
+            admission: Arc::clone(admission),
+        },
+    };
+    let stopped = admission
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if stopped.is_some() {
+        drop(stopped);
+        return Err(wasmtime::Error::msg("MMIO bridge stopping"));
+    }
+    let result = sender.try_send(pending);
+    drop(stopped);
+    result.map_err(|error| wasmtime::Error::msg(format!("MMIO bridge unavailable: {error}")))
+}
+
+async fn submit_async(
+    sender: &tokio::sync::mpsc::Sender<Pending>,
+    admission: &Arc<Mutex<Option<String>>>,
+    failure: &Mutex<Option<String>>,
+    command: Command,
+    control: device::ControlGuard,
+) -> wasmtime::Result<RoutedReply> {
+    if let Some(failure) = recorded_failure(failure) {
+        return Err(wasmtime::Error::msg(failure));
+    }
+    let (reply, response) = tokio::sync::oneshot::channel();
+    enqueue_reply(
+        sender,
+        admission,
+        command,
+        ReplySender::Async(reply),
+        Some(control),
+    )?;
+    tokio::time::timeout(RESPONSE_TIMEOUT, response)
+        .await
+        .map_err(|error| wasmtime::Error::msg(format!("MMIO response: {error}")))?
+        .map_err(|error| wasmtime::Error::msg(format!("MMIO response: {error}")))?
+        .map_err(|error| recorded_failure(failure).map_or(error, wasmtime::Error::msg))
+}
+
 pub(crate) struct Router {
-    pub(crate) bridge: Option<crate::box_runtime::ComponentLoop>,
-    pub(crate) entrypoint: Option<crate::box_runtime::ComponentLoop>,
+    pub(crate) bridge: crate::box_runtime::ComponentLoop,
+    pub(crate) entrypoint: crate::box_runtime::ComponentLoop,
     pub(crate) initialize_machine: crate::component::vmm::virtualization::InitializeMachine,
     pub(crate) compose_machine: crate::component::vmm::virtualization::ControlMachine,
     pub(crate) irq_lines_stage: crate::component::vmm::interrupts::Stage,
@@ -112,26 +222,28 @@ pub(crate) struct Router {
     pub(crate) ioapic_line: crate::component::vmm::interrupts::Line,
     pub(crate) ioapic_device_line: crate::component::vmm::interrupts::DeviceLine,
     pub(crate) ioapic_eoi: crate::component::vmm::interrupts::Eoi,
-    compose_workers: ComposeWorkers,
-    remap: Remap,
+    pub(crate) open_device: OpenDevice,
+    pub(crate) attach_replies: AttachReplies,
     configure_vcpus: ConfigureVcpus,
     sender: tokio::sync::mpsc::Sender<Pending>,
     control_sender: tokio::sync::mpsc::Sender<Pending>,
-    admission: Arc<Mutex<bool>>,
-    slots: Arc<AtomicUsize>,
-    callbacks: Arc<Mutex<Vec<DeviceRequestCounts>>>,
-    failure: Arc<Mutex<Option<String>>>,
+    admission: Arc<Mutex<Option<String>>>,
+    devices: DeviceRegistry,
+    device_plan: Vec<DevicePlan>,
+    pub(crate) failure: Arc<Mutex<Option<String>>>,
 }
 
 impl Router {
-    pub(crate) fn record_failure(&self, error: &wasmtime::Error) {
-        Self::record_failure_in(&self.failure, error);
-    }
-
+    #[cfg(test)]
     pub(crate) fn failure_sink(&self) -> Arc<Mutex<Option<String>>> {
         Arc::clone(&self.failure)
     }
-
+    pub(crate) fn unprepared_count(&self) -> usize {
+        self.device_plan.len()
+    }
+    pub(crate) fn has_component(&self, kind: crate::component::vmm::machine::DeviceKind) -> bool {
+        self.device_plan.iter().any(|plan| plan.device.kind == kind)
+    }
     pub(crate) fn record_failure_in(failure: &Mutex<Option<String>>, error: &wasmtime::Error) {
         let mut failure = failure
             .lock()
@@ -170,7 +282,7 @@ fn lifecycle_loop(
                     return Err(wasmtime::Error::msg(format!("Wasm lifecycle: {error:?}")));
                 }
             };
-            lifecycle.complete(outcome);
+            lifecycle.publish_outcome(outcome);
             Ok(())
         })
     })
@@ -195,114 +307,73 @@ impl BoxRuntime {
             return Err(wasmtime::Error::msg("MMIO router already initialized"));
         }
         let linker = mmio_component_linker(self.store.engine())?;
-        let instance = linker.instantiate_async(&mut self.store, component).await?;
-        let export = |name| {
-            crate::engine::component_export(component, "terra:mmio/router@0.1.0", name, "MMIO")
-        };
-        let lifecycle_export = |name| {
-            crate::engine::component_export(
-                component,
-                "terra:mmio/lifecycle@0.1.0",
-                name,
-                "VMM lifecycle",
-            )
-        };
-        let run_lifecycle: RunLifecycle =
-            instance.get_typed_func(&mut self.store, lifecycle_export("run")?)?;
-        let machine_export = |name| {
-            crate::engine::component_export(
-                component,
-                "terra:mmio/machine@0.1.0",
-                name,
-                "VMM machine",
-            )
-        };
-        let initialize_machine =
-            instance.get_typed_func(&mut self.store, machine_export("initialize")?)?;
-        let compose_machine =
-            instance.get_typed_func(&mut self.store, machine_export("compose")?)?;
-        let irq_export = |name| {
-            crate::engine::component_export(
-                component,
-                "terra:mmio/interrupts@0.1.0",
-                name,
-                "VMM interrupts",
-            )
-        };
-        let irq_lines_stage =
-            instance.get_typed_func(&mut self.store, irq_export("stage-irq-lines")?)?;
-        let device_irq_line =
-            instance.get_typed_func(&mut self.store, irq_export("device-irq-line")?)?;
-        let clear_irq_lines =
-            instance.get_typed_func(&mut self.store, irq_export("clear-irq-lines")?)?;
-        let ioapic_stage = instance.get_typed_func(&mut self.store, irq_export("stage-ioapic")?)?;
-        let ioapic_access =
-            instance.get_typed_func(&mut self.store, irq_export("ioapic-access")?)?;
-        let ioapic_line = instance.get_typed_func(&mut self.store, irq_export("ioapic-line")?)?;
-        let ioapic_device_line =
-            instance.get_typed_func(&mut self.store, irq_export("ioapic-device-line")?)?;
-        let ioapic_eoi = instance.get_typed_func(&mut self.store, irq_export("ioapic-eoi")?)?;
-        let compose_workers =
-            instance.get_typed_func(&mut self.store, export("compose-workers")?)?;
-        let remap = instance.get_typed_func(&mut self.store, export("remap-device")?)?;
-        let access: Access = instance.get_typed_func(&mut self.store, export("access")?)?;
-        let control: Control = instance.get_typed_func(&mut self.store, export("control")?)?;
-        let configure_vcpus =
-            instance.get_typed_func(&mut self.store, export("configure-vcpus")?)?;
+        let instance = Vmm::instantiate_async(&mut self.store, component, &linker).await?;
+        let router = instance.terra_mmio_router();
+        let machine = instance.terra_mmio_machine();
+        let interrupts = instance.terra_mmio_interrupts();
+        let run_lifecycle = instance.terra_mmio_lifecycle().func_run();
+        let initialize_machine = machine.func_initialize().func().typed(&self.store)?;
+        let compose_machine = machine.func_compose();
+        let irq_lines_stage = interrupts.func_stage_irq_lines();
+        let device_irq_line = interrupts.func_device_irq_line();
+        let clear_irq_lines = interrupts.func_clear_irq_lines();
+        let ioapic_stage = interrupts.func_stage_ioapic();
+        let ioapic_access = interrupts.func_ioapic_access();
+        let ioapic_line = interrupts.func_ioapic_line();
+        let ioapic_device_line = interrupts.func_ioapic_device_line();
+        let ioapic_eoi = interrupts.func_ioapic_eoi();
+        let open_device = router.func_open_device();
+        let attach_replies = router.func_attach_replies();
+        let access = router.func_access();
+        let control = router.func_control();
+        let configure_vcpus = router.func_configure_vcpus();
         let (sender, receiver) = tokio::sync::mpsc::channel(COMMAND_CAPACITY);
         let (control_sender, control_receiver) = tokio::sync::mpsc::channel(CONTROL_CAPACITY);
-        let admission = Arc::new(Mutex::new(true));
-        let slots = Arc::new(AtomicUsize::new(0));
+        let admission = Arc::new(Mutex::new(None));
         let failure = Arc::new(Mutex::new(None));
-        let callbacks = Arc::new(Mutex::new(Vec::new()));
-        let loop_callbacks = Arc::clone(&callbacks);
-        let loop_failure = Arc::clone(&failure);
+        let devices: DeviceRegistry = Arc::new(OnceLock::new());
+        let loop_devices = Arc::clone(&devices);
         let loop_admission = Arc::clone(&admission);
+        let bridge_senders = (sender.clone(), control_sender.clone());
         let bridge: crate::box_runtime::ComponentLoop = Box::new(move |accessor| {
             Box::pin(async move {
-                let result = run_bridge(
+                let _senders = bridge_senders;
+                run_bridge(
                     accessor,
                     receiver,
                     control_receiver,
                     BridgeContext {
                         access,
                         control,
-                        callbacks: loop_callbacks,
+                        devices: loop_devices,
                         admission: loop_admission,
                     },
                 )
-                .await;
-                if let Err(error) = &result {
-                    *loop_failure
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                        Some(format!("{error:#}"));
-                }
-                result
+                .await
             })
         });
         let entrypoint = lifecycle_loop(run_lifecycle, self.lifecycle_notifier());
-        let vcpu_callbacks = Arc::clone(&callbacks);
+        let vcpu_devices = Arc::clone(&devices);
         crate::component::vmm::configure_callbacks(
             &mut self.store.data_mut().platform,
             Arc::new(move |slot, failed| {
-                let callbacks = vcpu_callbacks
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let device = callbacks
+                let devices = vcpu_devices
+                    .get()
+                    .ok_or_else(|| wasmtime::Error::msg("device plan is not started"))?;
+                let device = devices
                     .get(usize::try_from(slot)?)
                     .ok_or_else(|| wasmtime::Error::msg("vCPU device callback outside box"))?;
                 if failed {
-                    device.failed.fetch_add(1, Ordering::Relaxed);
+                    device.counts.failed.fetch_add(1, Ordering::Relaxed);
                 } else {
-                    device.completed.fetch_add(1, Ordering::Relaxed);
+                    device.counts.completed.fetch_add(1, Ordering::Relaxed);
                 }
                 Ok(())
             }),
         );
         self.mmio = Some(Router {
-            bridge: Some(bridge),
-            entrypoint: Some(entrypoint),
+            bridge,
+            entrypoint,
             initialize_machine,
             compose_machine,
             irq_lines_stage,
@@ -313,14 +384,14 @@ impl BoxRuntime {
             ioapic_line,
             ioapic_device_line,
             ioapic_eoi,
-            compose_workers,
-            remap,
+            open_device,
+            attach_replies,
             configure_vcpus,
             sender,
             control_sender,
             admission,
-            slots,
-            callbacks,
+            devices,
+            device_plan: Vec::new(),
             failure,
         });
         Ok(())
@@ -333,7 +404,7 @@ impl BoxRuntime {
     ) -> wasmtime::Result<()> {
         // SAFETY: TrustedArtifacts accepts only the build's authenticated AOT artifacts.
         let component =
-            unsafe { crate::engine::trusted_component(self.store.engine(), artifacts.mmio) }?;
+            unsafe { crate::engine::trusted_component(self.store.engine(), artifacts.mmio()) }?;
         self.initialize_mmio(&component).await
     }
 }
@@ -347,84 +418,83 @@ pub fn mmio_component_linker(
 }
 
 #[cfg(any(test, feature = "test-support"))]
-async fn initialize_test_router(root: &mut BoxRuntime) -> wasmtime::Result<()> {
-    if root.mmio.is_none() {
-        let component = Component::new(
-            root.store.engine(),
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../components/vmm/target/wasm32-wasip3/release/terra_vmm_component.wasm"
-            )),
-        )?;
-        root.initialize_mmio(&component).await?;
-    }
-    Ok(())
-}
-
-pub(crate) struct PendingWorker {
-    pub kind: crate::component::vmm::machine::DeviceKind,
-    slot: u32,
-    base: Arc<AtomicU64>,
-    mapping: Option<terra::mmio::workers::Mapping>,
-    factory: crate::component::vmm::workers::Factory,
+pub(crate) async fn initialize_test_router(root: &mut BoxRuntime) -> wasmtime::Result<()> {
+    let component = Component::new(
+        root.store.engine(),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../components/vmm/target/wasm32-wasip3/release/terra_vmm_component.wasm"
+        )),
+    )?;
+    root.initialize_mmio(&component).await
 }
 
 impl BoxRuntime {
-    pub(crate) fn grant_pending_workers(
-        &mut self,
-    ) -> wasmtime::Result<(usize, crate::component::vmm::workers::SetupGuard)> {
-        let grants = std::mem::take(&mut self.pending_workers)
-            .into_iter()
-            .map(|worker| crate::component::vmm::workers::GrantedWorker {
-                slot: worker.slot,
-                kind: worker.kind,
-                mapping: worker.mapping,
-                base: worker.base,
-                factory: Some(worker.factory),
-            })
-            .collect::<Vec<_>>();
-        let count = grants.len();
-        let setup = self.store.data_mut().platform.workers.grant_all(grants)?;
-        Ok((count, setup))
+    pub(crate) async fn prepare_devices(mut self) -> wasmtime::Result<Self> {
+        let Some(router) = self.mmio.as_mut() else {
+            return Ok(self);
+        };
+        let plans = std::mem::take(&mut router.device_plan);
+        let devices = plans.iter().map(|plan| Arc::clone(&plan.device)).collect();
+        for DevicePlan {
+            device,
+            mapping,
+            setup,
+        } in plans
+        {
+            let mapping =
+                mapping.ok_or_else(|| wasmtime::Error::msg("worker grant has no mapping"))?;
+            let worker = crate::component::vmm::workers::within_setup_timeout(
+                device.slot,
+                self.prepare_worker(device.slot, mapping, setup),
+            )
+            .await?;
+            self.attach_worker(worker)?;
+        }
+        self.mmio
+            .as_ref()
+            .ok_or_else(|| wasmtime::Error::msg("MMIO router missing"))?
+            .devices
+            .set(devices)
+            .map_err(|_| wasmtime::Error::msg("device registry already published"))?;
+        Ok(self)
     }
 
-    pub(crate) fn finish_worker_creation(
+    async fn prepare_worker(
         &mut self,
-        count: usize,
-        outcome: wasmtime::Result<()>,
-    ) -> wasmtime::Result<()> {
-        let workers = &mut self.store.data_mut().platform.workers;
-        workers.factories.clear();
-        let children = std::mem::take(&mut workers.children);
-        outcome?;
+        slot: u32,
+        (base, size): (u64, u64),
+        setup: crate::component::vmm::workers::Setup,
+    ) -> wasmtime::Result<crate::box_runtime::WorkerTask> {
         wasmtime::ensure!(
-            children.len() == count,
-            "VMM did not create every granted worker"
+            usize::try_from(slot)? < crate::box_runtime::MAX_BOX_COMPONENTS
+                && size != 0
+                && base.checked_add(size).is_some(),
+            "worker grant outside box"
         );
-        for child in children {
-            self.attach_child(child)?;
-        }
-        Ok(())
-    }
-
-    pub(crate) async fn compose_workers(&mut self) -> wasmtime::Result<()> {
-        if self.pending_workers.is_empty() {
-            return Ok(());
-        }
-        let compose = self
+        let open_device = self
             .mmio
             .as_ref()
             .ok_or_else(|| wasmtime::Error::msg("MMIO router missing"))?
-            .compose_workers;
-        let (count, _setup) = self.grant_pending_workers()?;
-        let outcome = tokio::time::timeout(
-            crate::component::vmm::workers::SETUP_TIMEOUT.saturating_mul(u32::try_from(count)?),
-            compose.call_async(&mut self.store, ()),
-        )
-        .await
-        .map_err(wasmtime::Error::from)
-        .and_then(std::convert::identity)
-        .and_then(|(result,)| result.map_err(router_error));
-        self.finish_worker_creation(count, outcome)
+            .open_device;
+        let (request_reader,) = open_device
+            .call_async(&mut self.store, (slot, base, size))
+            .await?;
+        let request_reader = request_reader.map_err(router_error)?;
+        let (sink, request_stream) =
+            crate::component::relay::channel(crate::component::relay::MMIO_CAPACITY);
+        request_reader.pipe(&mut self.store, sink)?;
+        let worker = setup(request_stream).await?;
+        let replies = StreamReader::new(&mut self.store, worker.replies)?;
+        let attach_replies = self
+            .mmio
+            .as_ref()
+            .ok_or_else(|| wasmtime::Error::msg("MMIO router missing"))?
+            .attach_replies;
+        let (result,) = attach_replies
+            .call_async(&mut self.store, (slot, replies))
+            .await?;
+        result.map_err(router_error)?;
+        Ok(worker.worker)
     }
 }

@@ -76,17 +76,33 @@ when the box starts. A mount grants the guest access to that host directory.
 Mounts use a scoped WASI directory capability. Guest path traversal and
 symlinks cannot open a host path outside that grant. Read-only mounts reject
 writes and metadata changes. They support ordinary file I/O, relative symlinks,
-and guest execution/mmap. Names must be UTF-8; guest modes and ownership are
-synthetic, not host POSIX metadata.
+and guest execution/mmap. Names must be UTF-8; guest ownership is synthetic.
+Linux and macOS hosts expose Unix permission bits. On Windows, regular files
+report mode `0755`, or `0555` when the read-only attribute is set. Setting any
+write bit clears that attribute; clearing all write bits sets it. Owner/group
+distinctions and executable bits remain synthetic, and Windows ACLs are unchanged.
+Windows directories report `0755`; other directory modes are unsupported.
+Lookup, stat, and chmod do not require content-read permission. Write-only files
+can be opened for writing; reopening checks inode identity before truncation.
 
-Each shared mount allows 32 active data I/O requests and 256 outstanding requests
-including queued work. These are individual reads, writes, or flushes, not whole
-copy jobs. Operations on the same file run in order.
+Each shared mount allows 32 active filesystem requests and 256 outstanding
+requests including queued work. Reads, writes, flushes, and metadata operations
+use the same queue; these are individual requests, not whole copy jobs. Reads,
+writes, and flushes on the same file run in order. Event resolution has one
+reserved operation, and cancellation bypasses the scheduler with reserved
+virtio-fs ring capacity. If all 32 operations stall, further queued filesystem
+work waits for capacity. Each mount has its own runtime with at most 33 blocking
+threads for filesystem operations and descriptor cleanup. Saturating that pool
+does not consume the pools used by other mounts or guest disks. Shared underlying
+host storage failures can still affect every user of that storage.
 
 On shutdown, each shared mount has one second to flush its open writable files.
 A failed or timed-out flush reports an I/O error and allows shutdown to continue;
-durability is not guaranteed after that error. An already-running host write may
-still complete after shutdown.
+durability is not guaranteed after that error. An already-running host filesystem
+operation may still complete after shutdown.
+Descriptor cleanup runs off the worker and retains its resource reservation
+until it completes. Process teardown waits at most one second for remaining
+runtime tasks; this does not force the host OS to complete stalled filesystem I/O.
 
 Terra forwards native host file events to guest `inotify` automatically on Linux,
 macOS, and Windows hosts, including read-only mounts and other-box edits.
@@ -95,6 +111,9 @@ Guest writes generate native host notifications through ordinary filesystem I/O.
 Delivery is best effort: events can be coalesced, duplicated, reordered, or lost;
 rename cookies and exact event counts are not preserved. Watcher failures and
 queue overflow produce rate-limited diagnostics without stopping the box.
+Watcher registration waits asynchronously for up to one second before the
+filesystem component starts. A timeout disables notifications for that mount
+and lets startup continue; the watcher stops when its blocked host call returns.
 Each box shares a budget of 4,096 pending events and 1,024 watched directories
 across its mounts. Directories beyond the watch limit receive no notification
 coverage; reaching the limit produces a rate-limited diagnostic.

@@ -1,4 +1,5 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
+use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 
@@ -9,6 +10,7 @@ type Stop<O> = Box<dyn FnOnce() -> Outcome<O> + Send>;
 type Pending<O> = Option<(Stop<O>, watch::Sender<Option<Outcome<O>>>)>;
 
 struct TaskState<O: Clone + Send + Sync + 'static> {
+    launch: Once,
     pending: Arc<Mutex<Pending<O>>>,
     cancel: Mutex<Option<Cancel>>,
 }
@@ -41,13 +43,6 @@ fn start<O: Clone + Send + Sync + 'static>(
     {
         let _ = cancel();
     }
-    if pending
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .is_none()
-    {
-        return;
-    }
     let worker_pending = Arc::clone(pending);
     if std::thread::Builder::new()
         .spawn(move || run(&worker_pending))
@@ -58,8 +53,8 @@ fn start<O: Clone + Send + Sync + 'static>(
 }
 
 impl<O: Clone + Send + Sync + 'static> TaskState<O> {
-    fn start(&self) {
-        start(&self.pending, &self.cancel);
+    pub(super) fn start(&self) {
+        self.launch.call_once(|| start(&self.pending, &self.cancel));
     }
 }
 
@@ -74,6 +69,7 @@ impl<O: Clone + Send + Sync + 'static> NativeTask<O> {
         let (sender, outcome) = watch::channel(None);
         Self {
             state: Arc::new(TaskState {
+                launch: Once::new(),
                 pending: Arc::new(Mutex::new(Some((Box::new(stop), sender)))),
                 cancel: Mutex::new(cancel),
             }),
@@ -91,28 +87,28 @@ impl<O: Clone + Send + Sync + 'static> NativeTask<O> {
         cancel.map_or(Ok(()), |cancel| cancel())
     }
 
-    fn start(&self) {
+    pub(super) fn start(&self) {
         self.state.start();
     }
 
     async fn wait_for_outcome(&self) -> Outcome<O> {
         self.start();
         let mut receiver = self.outcome.clone();
-        if let Some(outcome) = receiver.borrow_and_update().clone() {
-            return outcome;
-        }
         receiver
-            .changed()
+            .wait_for(Option::is_some)
             .await
-            .map_err(|_| "native task stopped without an outcome".to_owned())?;
-        receiver
-            .borrow_and_update()
+            .map_err(|_| "native task stopped without an outcome".to_owned())?
             .clone()
             .ok_or_else(|| "native task outcome missing".to_owned())?
     }
 
     pub async fn wait(&self) -> Outcome<O> {
-        tokio::time::timeout(std::time::Duration::from_secs(10), self.wait_for_outcome())
+        self.wait_until(Instant::now() + Duration::from_secs(10))
+            .await
+    }
+
+    pub async fn wait_until(&self, deadline: Instant) -> Outcome<O> {
+        tokio::time::timeout_at(deadline.into(), self.wait_for_outcome())
             .await
             .map_err(|_| "native task timed out".to_owned())?
     }
@@ -193,7 +189,17 @@ mod tests {
                 Ok(())
             })),
         );
-        reaper.start();
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let reaper = &reaper;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    reaper.start();
+                });
+            }
+        });
         assert_eq!(cancelled.load(Ordering::SeqCst), 1);
         let (first, second) = tokio::join!(reaper.wait(), reaper.wait());
         assert_eq!(first, second);
@@ -232,7 +238,12 @@ mod tests {
             },
             Some(Box::new(|| Ok(()))),
         );
-        assert_eq!(reaper.wait().await, Err("native task timed out".to_owned()));
+        assert_eq!(
+            reaper
+                .wait_until(Instant::now() + Duration::from_millis(20))
+                .await,
+            Err("native task timed out".to_owned())
+        );
         assert!(retained.upgrade().is_some());
         release.send(()).unwrap();
         assert_eq!(reaper.wait().await, Ok(vec![Ok(())]));

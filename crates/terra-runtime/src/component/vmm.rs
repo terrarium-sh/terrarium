@@ -142,13 +142,30 @@ fn accepts_arm_completion(
 
 type Completed = Arc<dyn Fn(u32, bool) -> wasmtime::Result<()> + Send + Sync>;
 
-#[derive(Default)]
 pub struct PlatformHost {
     table: ResourceTable,
     completed: Option<Completed>,
     virtualization: virtualization::VirtualizationHost,
-    pending_vcpus: Vec<(u8, NativeVcpu)>,
-    pub(crate) workers: workers::WorkerHost,
+    pending_vcpus: Vec<NativeVcpu>,
+    pub(crate) native_teardown: teardown::NativeTeardown,
+}
+
+impl PlatformHost {
+    pub(crate) fn with_native_teardown(native_teardown: teardown::NativeTeardown) -> Self {
+        Self {
+            table: ResourceTable::new(),
+            completed: None,
+            virtualization: virtualization::VirtualizationHost::default(),
+            pending_vcpus: Vec::new(),
+            native_teardown,
+        }
+    }
+}
+
+impl Default for PlatformHost {
+    fn default() -> Self {
+        Self::with_native_teardown(teardown::NativeTeardown::new())
+    }
 }
 
 pub struct Platform;
@@ -237,7 +254,6 @@ pub(crate) fn add_to_linker(
 ) -> wasmtime::Result<()> {
     platform::add_to_linker::<BoxHost, Platform>(linker, |host| &mut host.platform)?;
     virtualization::add_to_linker(linker)?;
-    workers::add_to_linker(linker)?;
     lifecycle::add_to_linker(linker)
 }
 

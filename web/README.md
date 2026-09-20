@@ -70,7 +70,7 @@ registry requires authentication. pnpm packages that source using its upstream
 `prepack` script; `pnpm-workspace.yaml` explicitly permits that step. No GitHub
 registry token is needed. Update the pinned URL and lockfile together.
 
-The header fetches the current star count from GitHub’s public API when opened.
-It keeps the star link without a count while loading, when JavaScript is disabled,
+The footer fetches the current star count from GitHub’s public API when opened.
+It keeps the GitHub link without a count while loading, when JavaScript is disabled,
 or if GitHub is unavailable or rate-limits the request. No token or build-time
 star lookup is needed; the website remains statically hosted.

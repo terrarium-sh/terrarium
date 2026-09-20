@@ -2,7 +2,7 @@
 
 #![allow(unsafe_code)]
 
-use terra_runtime::component::vmm::virtualization::{PreparedMachine, StartedVcpus, VcpuReaper};
+use terra_runtime::component::vmm::virtualization::{PreparedMachine, StartedVcpus};
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -48,11 +48,12 @@ pub async fn prepare(mut input: WorkerInput) -> Result<PreparedVmm, KvmError> {
         .map_err(|error| KvmError::Component(format!("creating KVM irqchip: {error:?}")))?;
     let vcpus = PreparedVcpuGroup::prepare(&machine, &cpuid, input.vcpus, input.hard_stop)?;
     let prepared = PreparedMachine::new(config, machine);
-    let mut component_runtime = crate::worker::create_runtime(&input)
+    let component_runtime = crate::worker::create_runtime(&input)
         .map_err(|error| KvmError::Component(error.to_string()))?;
-    let machine = crate::worker::boot_prepared(&mut component_runtime, prepared, &mut input)
-        .await
-        .map_err(|error| KvmError::Component(error.to_string()))?;
+    let (mut component_runtime, machine) =
+        crate::worker::boot_prepared(component_runtime, prepared, &mut input)
+            .await
+            .map_err(|error| KvmError::Component(error.to_string()))?;
     let irq_machine = machine.clone();
     let interrupts = component_runtime
         .grant_irq_lines(move |gsi, level| {
@@ -70,24 +71,26 @@ pub async fn prepare(mut input: WorkerInput) -> Result<PreparedVmm, KvmError> {
         &mut input,
         machine.ram(),
         &disks,
-        |kind, index| interrupts.bind_interrupt(kind, index),
+        |kind, index| Ok(interrupts.bind_interrupt(kind, index)),
     )
-    .await
     .map_err(KvmError::Component)?;
-    let shutdowns = crate::worker::grant_device_shutdown(&mut component_runtime, &devices)
+    crate::worker::grant_device_shutdown(&mut component_runtime, &devices)
         .map_err(KvmError::Component)?;
-    let interrupt_shutdown = component_runtime
-        .grant_interrupt_shutdown(move || interrupts.close().map_err(|error| error.to_string()))
+    component_runtime
+        .grant_interrupt_shutdown(async move {
+            interrupts.close().await.map_err(|error| error.to_string())
+        })
         .map_err(|error| KvmError::Component(error.to_string()))?;
     let lifecycle = component_runtime.lifecycle_notifier();
-    let runners = component_runtime
-        .grant_vcpus(move |controls, boot| {
+    let (component_runtime, runners) = component_runtime
+        .prepare_vcpus(move |controls, boot| {
             vcpus
                 .start(controls, boot)
                 .map_err(|error| wasmtime::Error::msg(format!("vCPU startup: {error:?}")))
         })
         .await
         .map_err(|error| KvmError::Component(error.to_string()))?;
+    let teardown = component_runtime.native_teardown();
     Ok(PreparedVmm {
         runtime: component_runtime,
         observation: VmmObservation {
@@ -95,8 +98,7 @@ pub async fn prepare(mut input: WorkerInput) -> Result<PreparedVmm, KvmError> {
             lifecycle,
             deadline: input.deadline,
             devices,
-            shutdowns,
-            interrupts: Some(interrupt_shutdown),
+            teardown,
         },
     })
 }
@@ -188,7 +190,7 @@ impl PreparedVcpuGroup {
         mut self,
         workers: Vec<terra_runtime::component::vmm::NativeVcpu>,
         boot: terra_runtime::component::vmm::boot::BootEntry,
-    ) -> Result<StartedVcpus<VcpuReaper>, KvmError> {
+    ) -> Result<StartedVcpus, KvmError> {
         if workers.len() != self.senders.len() {
             return Err(KvmError::ThreadGone);
         }
@@ -218,19 +220,22 @@ impl Drop for PreparedVcpuGroup {
     }
 }
 
-fn started_vcpus(group: VcpuGroup) -> StartedVcpus<VcpuReaper> {
+fn started_vcpus(group: VcpuGroup) -> StartedVcpus {
     let stops = group
         .runners
         .iter()
         .map(crate::kvm::VcpuHandle::stop_callback)
         .collect::<Vec<_>>();
-    StartedVcpus::new(group, move || {
-        for stop in stops {
-            stop();
-        }
-        Ok(())
-    })
-    .with_reaper(|mut group| group.stop())
+    StartedVcpus::new(
+        group,
+        move || {
+            for stop in stops {
+                stop();
+            }
+            Ok(())
+        },
+        |mut group| group.stop(),
+    )
 }
 
 struct VcpuGroup {

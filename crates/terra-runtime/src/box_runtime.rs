@@ -1,23 +1,22 @@
 //! Bounded component stores for one Terra box.
 
-use std::future::{Future, poll_fn};
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::{
-    Arc, Mutex,
+    Arc,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
-use std::task::Poll;
 use std::time::Duration;
 
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use tokio::{sync::watch, task::JoinSet};
+use tokio_util::task::AbortOnDropHandle;
 
 use wasmtime::component::{Accessor, ResourceTable};
 use wasmtime::{Engine, ResourceLimiter, Store};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
-use crate::component::fs::host::FsHost;
-use crate::component::mem::host::MemHost;
-use crate::engine::{COMPONENT_EPOCH_DEADLINE, DeviceHost, STORE_MEMORY_BYTES};
+use crate::engine::{COMPONENT_EPOCH_DEADLINE, DeviceContext, DeviceHost, STORE_MEMORY_BYTES};
 
 pub const BOX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_BOX_COMPONENTS: usize = terra_limits::MAX_DEVICES;
@@ -73,7 +72,8 @@ impl Default for ComponentMemoryLimits {
         }
     }
 }
-const MAX_BOX_COMPONENT_LOOPS: usize = MAX_BOX_COMPONENTS * 3 + 32 + 2;
+const MAX_BOX_COMPONENT_LOOPS: usize =
+    MAX_BOX_COMPONENTS * 3 + terra_limits::MAX_VCPUS as usize + 2;
 const EPOCH_TICK_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Keeps the runtime engine's epoch interruption advancing.
@@ -141,103 +141,110 @@ impl BoxMemoryBudget {
     }
 }
 
-/// All host state reachable by components belonging to one box.
-pub struct BoxHost {
-    pub block: Vec<DeviceHost>,
-    pub network: Vec<DeviceHost>,
-    pub vsock: Vec<DeviceHost>,
-    pub filesystems: Vec<FsHost>,
-    pub memory: Vec<MemHost>,
-    pub(crate) boot: crate::component::vmm::boot::BootHost,
+pub trait StoreHost: WasiView + 'static {
+    fn retire(self)
+    where
+        Self: Sized,
+    {
+        drop(self);
+    }
+}
+
+pub struct RootHost {
     pub(crate) platform: crate::component::vmm::PlatformHost,
     pub(crate) lifecycle: crate::component::vmm::lifecycle::LifecycleHost,
-    router_ctx: WasiCtx,
-    router_table: ResourceTable,
+    ctx: WasiCtx,
+    table: ResourceTable,
+}
+
+pub type BoxHost = StoreState<RootHost>;
+
+pub struct StoreState<H: StoreHost> {
+    host: Option<H>,
     wasm_memory_bytes: usize,
     pending_memory_growth: usize,
     memory_budget: Arc<BoxMemoryBudget>,
 }
 
-struct DropRecovery {
-    filesystems: Vec<FsHost>,
-    machine: Option<crate::component::vmm::virtualization::MachineRecovery>,
-    devices: Vec<crate::component::vmm::teardown::DeviceShutdown>,
-    interrupts: Option<crate::component::vmm::teardown::NativeCleanup>,
+impl<H: StoreHost> std::ops::Deref for StoreState<H> {
+    type Target = H;
+    #[allow(clippy::expect_used)]
+    fn deref(&self) -> &H {
+        self.host
+            .as_ref()
+            .expect("host is present until store drop")
+    }
 }
-
-impl Drop for DropRecovery {
+impl<H: StoreHost> std::ops::DerefMut for StoreState<H> {
+    #[allow(clippy::expect_used)]
+    fn deref_mut(&mut self) -> &mut H {
+        self.host
+            .as_mut()
+            .expect("host is present until store drop")
+    }
+}
+impl<H: StoreHost> AsMut<H> for StoreState<H> {
+    fn as_mut(&mut self) -> &mut H {
+        self
+    }
+}
+impl<H: StoreHost> WasiView for StoreState<H> {
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        (**self).ctx()
+    }
+}
+impl<H: StoreHost + DeviceHost> DeviceHost for StoreState<H> {
+    fn context(&mut self) -> &mut DeviceContext {
+        (**self).context()
+    }
+}
+impl<H: StoreHost> Drop for StoreState<H> {
     fn drop(&mut self) {
-        if self.machine.is_some()
-            || !self.devices.is_empty()
-            || self.interrupts.is_some()
-            || !self.filesystems.is_empty()
-        {
-            start_drop_recovery(Self {
-                filesystems: std::mem::take(&mut self.filesystems),
-                machine: self.machine.take(),
-                devices: std::mem::take(&mut self.devices),
-                interrupts: self.interrupts.take(),
-            });
+        if let Some(host) = self.host.take() {
+            host.retire();
+        }
+        self.memory_budget.release(self.wasm_memory_bytes);
+    }
+}
+
+impl RootHost {
+    #[must_use]
+    pub fn new() -> Self {
+        let mut router_table = ResourceTable::new();
+        router_table.set_max_capacity(crate::engine::MAX_DEVICE_RESOURCES);
+        let lifecycle = crate::component::vmm::lifecycle::LifecycleHost::new();
+        Self {
+            platform: crate::component::vmm::PlatformHost::with_native_teardown(
+                lifecycle.native_teardown(),
+            ),
+            lifecycle,
+            ctx: WasiCtxBuilder::new()
+                .max_random_size(crate::MAX_SINGLE_BYTES)
+                .allow_tcp(false)
+                .allow_udp(false)
+                .allow_ip_name_lookup(false)
+                .build(),
+            table: router_table,
         }
     }
 }
-
-async fn finish_native_recovery(mut recovery: DropRecovery) -> wasmtime::Result<()> {
-    if let Some(machine) = recovery.machine.as_ref()
-        && let Err(error) = machine.wait().await
-    {
-        // ponytail: retain live VM resources after a failed join; release when the platform can prove vCPUs stopped.
-        std::mem::forget(recovery);
-        return Err(error);
+impl Default for RootHost {
+    fn default() -> Self {
+        Self::new()
     }
-    recovery.machine = None;
-    let mut result = Ok(());
-    for device in &recovery.devices {
-        if let Err(error) = device.wait_until_closed().await {
-            result = Err(wasmtime::Error::msg(error));
-        }
-    }
-    recovery.devices.clear();
-    if let Some(interrupts) = &recovery.interrupts
-        && let Err(error) = interrupts.wait_until_finished().await
-    {
-        result = Err(wasmtime::Error::msg(error));
-    }
-    recovery.interrupts = None;
-    drop(std::mem::take(&mut recovery.filesystems));
-    result
 }
 
-fn run_drop_recovery(recovery: &Mutex<Option<DropRecovery>>) {
-    let recovery = recovery
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take();
-    if let Some(recovery) = recovery {
-        if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            let _ = runtime.block_on(finish_native_recovery(recovery));
-        } else {
-            // ponytail: failed runtime creation retains VM resources; retry cleanup if this becomes recoverable.
-            std::mem::forget(recovery);
+impl StoreHost for crate::component::vmm::boot::BootHost {}
+
+impl StoreHost for RootHost {
+    fn retire(self) {
+        let teardown = self.lifecycle.native_teardown();
+        if teardown.has_work() {
+            teardown.start();
         }
     }
 }
-
-fn start_drop_recovery(recovery: DropRecovery) {
-    let recovery = Arc::new(Mutex::new(Some(recovery)));
-    let worker_recovery = Arc::clone(&recovery);
-    if std::thread::Builder::new()
-        .spawn(move || run_drop_recovery(&worker_recovery))
-        .is_err()
-    {
-        // Keep native resources alive if no cleanup thread can be started.
-        std::mem::forget(recovery);
-    }
-}
-
+impl StoreHost for DeviceContext {}
 impl BoxHost {
     #[must_use]
     pub fn new() -> Self {
@@ -246,112 +253,29 @@ impl BoxHost {
 
     #[must_use]
     pub fn with_memory_limits(limits: ComponentMemoryLimits) -> Self {
-        let mut router_table = ResourceTable::new();
-        router_table.set_max_capacity(crate::engine::MAX_DEVICE_RESOURCES);
         Self {
-            block: Vec::new(),
-            network: Vec::new(),
-            vsock: Vec::new(),
-            filesystems: Vec::new(),
-            memory: Vec::new(),
-            boot: crate::component::vmm::boot::BootHost::default(),
-            platform: crate::component::vmm::PlatformHost::default(),
-            lifecycle: crate::component::vmm::lifecycle::LifecycleHost::new(),
-            router_ctx: WasiCtxBuilder::new()
-                .max_random_size(crate::MAX_SINGLE_BYTES)
-                .allow_tcp(false)
-                .allow_udp(false)
-                .allow_ip_name_lookup(false)
-                .build(),
-            router_table,
+            host: Some(RootHost::new()),
             wasm_memory_bytes: 0,
             pending_memory_growth: 0,
             memory_budget: Arc::new(BoxMemoryBudget::new(limits)),
         }
     }
-
-    #[allow(clippy::expect_used, clippy::missing_panics_doc)]
-    pub fn vsock_device(&mut self) -> &mut DeviceHost {
-        self.vsock
-            .first_mut()
-            .expect("vsock component host must be registered before instantiation")
-    }
-
-    pub fn vsock_cli(&mut self) -> wasmtime_wasi::cli::WasiCliCtxView<'_> {
-        wasmtime_wasi::cli::WasiCliView::cli(Self::vsock_device(self))
-    }
-
-    pub fn vsock_clocks(&mut self) -> wasmtime_wasi::clocks::WasiClocksCtxView<'_> {
-        wasmtime_wasi::clocks::WasiClocksView::clocks(Self::vsock_device(self))
-    }
-
-    pub fn vsock_random(&mut self) -> &mut wasmtime_wasi::random::WasiRandomCtx {
-        wasmtime_wasi::random::WasiRandomView::random(Self::vsock_device(self))
-    }
-
-    pub fn vsock_service(&mut self) -> &mut crate::component::vsock::host::VsockHostService {
-        self.vsock_device().vsock_service_mut()
-    }
-
-    fn rebind(
-        &mut self,
-        memory_budget: Arc<BoxMemoryBudget>,
-        lifecycle: crate::component::vmm::lifecycle::LifecycleHost,
-    ) -> wasmtime::Result<()> {
-        if self.wasm_memory_bytes != 0 || self.pending_memory_growth != 0 {
-            return Err(wasmtime::Error::msg("child host already has Wasm memory"));
-        }
-        self.memory_budget = memory_budget;
-        self.lifecycle = lifecycle;
-        Ok(())
-    }
-
-    fn component_count(&self) -> usize {
-        self.block
-            .len()
-            .saturating_add(self.network.len())
-            .saturating_add(self.vsock.len())
-            .saturating_add(self.filesystems.len())
-            .saturating_add(self.memory.len())
-    }
 }
-
-impl Drop for BoxHost {
-    fn drop(&mut self) {
-        let machine = self.platform.take_recovery_reaper().ok().flatten();
-        let (devices, interrupts) = self.lifecycle.take_shutdowns();
-        if machine.is_some()
-            || !devices.is_empty()
-            || interrupts.is_some()
-            || !self.filesystems.is_empty()
-        {
-            start_drop_recovery(DropRecovery {
-                filesystems: std::mem::take(&mut self.filesystems),
-                machine,
-                devices,
-                interrupts,
-            });
-        }
-        self.memory_budget.release(self.wasm_memory_bytes);
-    }
-}
-
-impl WasiView for BoxHost {
+impl WasiView for RootHost {
     fn ctx(&mut self) -> WasiCtxView<'_> {
         WasiCtxView {
-            ctx: &mut self.router_ctx,
-            table: &mut self.router_table,
+            ctx: &mut self.ctx,
+            table: &mut self.table,
         }
     }
 }
-
 impl Default for BoxHost {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl ResourceLimiter for BoxHost {
+impl<H: StoreHost> ResourceLimiter for StoreState<H> {
     fn memory_growing(
         &mut self,
         current: usize,
@@ -408,78 +332,106 @@ impl ResourceLimiter for BoxHost {
 }
 
 /// A long-running device loop borrowing its component store through an accessor.
-pub type ComponentLoop = Box<
+pub type ComponentLoop<T = BoxHost> = Box<
     dyn for<'a> FnOnce(
-            &'a Accessor<BoxHost>,
+            &'a Accessor<T>,
         ) -> Pin<Box<dyn Future<Output = wasmtime::Result<()>> + Send + 'a>>
         + Send,
 >;
 
-type RunningLoop<'a> = Pin<Box<dyn Future<Output = wasmtime::Result<()>> + Send + 'a>>;
-
-/// Owns a box's root store and its device child stores.
+/// Builds a box's root store and device workers.
 pub struct BoxRuntime {
     pub store: Store<BoxHost>,
-    pub(crate) filesystem_runtime: Option<crate::component::fs::FilesystemRuntime>,
     pub(crate) mmio: Option<crate::component::vmm::mmio::Router>,
     epoch_clock: Arc<EpochClock>,
     memory_budget: Arc<BoxMemoryBudget>,
     shutdown: watch::Sender<bool>,
-    children: Vec<BoxRuntime>,
-    pub(crate) pending_workers: Vec<crate::component::vmm::mmio::PendingWorker>,
+    children: Vec<WorkerTask>,
     component_loops: Vec<ComponentLoop>,
 }
 
-/// Owns a running box runtime. Dropping it stops every component loop.
-pub struct BoxRuntimeHandle(Option<tokio::task::JoinHandle<wasmtime::Result<()>>>);
+pub struct PreparedBoxRuntime {
+    store: Store<BoxHost>,
+    _epoch_clock: Arc<EpochClock>,
+    shutdown: watch::Sender<bool>,
+    children: Vec<WorkerTask>,
+    component_loops: Vec<ComponentLoop>,
+    failure: Option<Arc<std::sync::Mutex<Option<String>>>>,
+}
 
-impl BoxRuntimeHandle {
-    pub fn abort(&self) {
-        if let Some(task) = &self.0 {
-            task.abort();
-        }
-    }
+pub struct DeviceWorker<H: StoreHost> {
+    pub store: Store<StoreState<H>>,
+    epoch_clock: Arc<EpochClock>,
+    component_loops: Vec<ComponentLoop<StoreState<H>>>,
+}
 
-    pub async fn join(mut self) -> wasmtime::Result<()> {
-        self.wait_for_task(BOX_SHUTDOWN_TIMEOUT, false).await
-    }
+pub(crate) struct WorkerTask {
+    run: Pin<Box<dyn Future<Output = wasmtime::Result<()>> + Send>>,
+    executor: Option<tokio::runtime::Handle>,
+    epoch_clock: Arc<EpochClock>,
+    memory_budget: Arc<BoxMemoryBudget>,
+    loop_count: usize,
+}
 
-    pub async fn abort_and_join(mut self) {
-        let _ = self.wait_for_task(BOX_SHUTDOWN_TIMEOUT, true).await;
-    }
-
-    async fn wait_for_task(&mut self, timeout: Duration, abort: bool) -> wasmtime::Result<()> {
-        let (result, timed_out) = {
-            let task = self
-                .0
-                .as_mut()
-                .ok_or_else(|| wasmtime::Error::msg("box runtime already joined"))?;
-            if abort {
-                task.abort();
-            }
-            let result = tokio::time::timeout(timeout, &mut *task).await;
-            if result.is_err() && !abort {
-                task.abort();
-                (tokio::time::timeout(timeout, &mut *task).await, true)
-            } else {
-                (result, false)
-            }
-        };
-        if timed_out {
-            if result.is_ok() {
-                let _ = self.0.take();
-            }
-            return Err(wasmtime::Error::msg("box runtime shutdown timed out"));
-        }
-        let result = result.map_err(|_| wasmtime::Error::msg("box runtime shutdown timed out"))?;
-        let _ = self.0.take();
-        result.map_err(|error| wasmtime::Error::msg(format!("box runtime task: {error}")))?
+impl WorkerTask {
+    pub(crate) fn run_on(
+        mut self,
+        executor: tokio::runtime::Handle,
+        owner: impl Send + 'static,
+    ) -> Self {
+        self.executor = Some(executor);
+        self.run = Box::pin(async move {
+            let _owner = owner;
+            self.run.await
+        });
+        self
     }
 }
 
-impl Drop for BoxRuntimeHandle {
-    fn drop(&mut self) {
+fn create_store<H: StoreHost>(engine: &Engine, host: StoreState<H>) -> Store<StoreState<H>> {
+    let mut store = Store::new(engine, host);
+    store.set_epoch_deadline(COMPONENT_EPOCH_DEADLINE);
+    store.epoch_deadline_async_yield_and_update(COMPONENT_EPOCH_DEADLINE);
+    store.limiter(|host| host);
+    store
+}
+
+/// Owns a running box runtime. Dropping it stops every component loop.
+pub struct BoxRuntimeHandle(AbortOnDropHandle<wasmtime::Result<()>>);
+
+impl BoxRuntimeHandle {
+    pub fn abort(&self) {
+        self.0.abort();
+    }
+
+    pub async fn join(self) -> wasmtime::Result<()> {
+        self.join_until(tokio::time::Instant::now() + BOX_SHUTDOWN_TIMEOUT)
+            .await
+    }
+
+    pub async fn join_until(mut self, deadline: tokio::time::Instant) -> wasmtime::Result<()> {
+        self.wait_for_task(deadline).await
+    }
+
+    pub async fn abort_and_join(self) {
+        self.abort_and_join_until(tokio::time::Instant::now() + BOX_SHUTDOWN_TIMEOUT)
+            .await;
+    }
+
+    pub async fn abort_and_join_until(mut self, deadline: tokio::time::Instant) {
         self.abort();
+        let _ = self.wait_for_task(deadline).await;
+    }
+
+    async fn wait_for_task(&mut self, deadline: tokio::time::Instant) -> wasmtime::Result<()> {
+        let task = &mut self.0;
+        let result = tokio::time::timeout_at(deadline, &mut *task)
+            .await
+            .map_err(|_| {
+                task.abort();
+                wasmtime::Error::msg("box runtime shutdown timed out")
+            })?;
+        result.map_err(|error| wasmtime::Error::msg(format!("box runtime task: {error}")))?
     }
 }
 
@@ -491,113 +443,88 @@ impl BoxRuntime {
 
     pub fn new(engine: &Engine, host: BoxHost) -> wasmtime::Result<Self> {
         let memory_budget = Arc::clone(&host.memory_budget);
-        Self::new_with_resources(
-            engine,
-            host,
-            EpochClock::start(engine.clone())?,
-            memory_budget,
-        )
-    }
-
-    fn new_with_resources(
-        engine: &Engine,
-        host: BoxHost,
-        epoch_clock: Arc<EpochClock>,
-        memory_budget: Arc<BoxMemoryBudget>,
-    ) -> wasmtime::Result<Self> {
-        if host.component_count() > MAX_BOX_COMPONENTS {
-            return Err(wasmtime::Error::msg("box has too many components"));
-        }
-        let mut store = Store::new(engine, host);
-        store.set_epoch_deadline(COMPONENT_EPOCH_DEADLINE);
-        store.epoch_deadline_async_yield_and_update(COMPONENT_EPOCH_DEADLINE);
-        store.limiter(|host| host);
+        let epoch_clock = EpochClock::start(engine.clone())?;
         let (shutdown, _) = watch::channel(false);
         Ok(Self {
-            store,
-            filesystem_runtime: None,
+            store: create_store(engine, host),
             mmio: None,
             epoch_clock,
             memory_budget,
             shutdown,
             children: Vec::new(),
-            pending_workers: Vec::new(),
             component_loops: Vec::new(),
         })
     }
 
-    pub fn new_child(&self, host: BoxHost) -> wasmtime::Result<Self> {
+    pub fn new_child<H: StoreHost>(&self, host: H) -> DeviceWorker<H> {
         self.child_factory()(host)
     }
 
-    pub(crate) fn child_factory(
+    pub(crate) fn child_factory<H: StoreHost>(
         &self,
-    ) -> impl FnOnce(BoxHost) -> wasmtime::Result<Self> + Send + 'static {
-        let notifier = self.lifecycle_notifier();
+    ) -> impl FnOnce(H) -> DeviceWorker<H> + Send + 'static {
         let memory_budget = Arc::clone(&self.memory_budget);
         let epoch_clock = Arc::clone(&self.epoch_clock);
         let engine = self.store.engine().clone();
-        move |mut host| {
-            let lifecycle =
-                crate::component::vmm::lifecycle::LifecycleHost::from_notifier(notifier);
-            host.rebind(Arc::clone(&memory_budget), lifecycle)?;
-            Self::new_with_resources(&engine, host, epoch_clock, memory_budget)
+        move |host| DeviceWorker {
+            store: create_store(
+                &engine,
+                StoreState {
+                    host: Some(host),
+                    wasm_memory_bytes: 0,
+                    pending_memory_growth: 0,
+                    memory_budget,
+                },
+            ),
+            epoch_clock,
+            component_loops: Vec::new(),
         }
     }
 
-    pub fn attach_child(&mut self, child: BoxRuntime) -> wasmtime::Result<()> {
-        if !child.children.is_empty()
-            || !Arc::ptr_eq(&self.epoch_clock, &child.epoch_clock)
-            || !Arc::ptr_eq(&self.memory_budget, &child.memory_budget)
-        {
-            return Err(wasmtime::Error::msg("child runtime belongs to another box"));
-        }
-        if self.children.len() >= MAX_BOX_COMPONENTS
-            || self
-                .component_count()
-                .checked_add(child.component_count())
-                .is_none_or(|count| count > MAX_BOX_COMPONENTS)
-        {
-            return Err(wasmtime::Error::msg("box has too many components"));
-        }
-        if self.registered_loop_count() + child.registered_loop_count() > MAX_BOX_COMPONENT_LOOPS {
-            return Err(wasmtime::Error::msg("box has too many component loops"));
-        }
+    pub fn attach_child<H: StoreHost>(&mut self, child: DeviceWorker<H>) -> wasmtime::Result<()> {
+        wasmtime::ensure!(
+            self.component_count() < MAX_BOX_COMPONENTS,
+            "box has too many components"
+        );
+        let child = child.prepare(self.shutdown.subscribe());
+        self.attach_worker(child)
+    }
+
+    pub(crate) fn attach_worker(&mut self, child: WorkerTask) -> wasmtime::Result<()> {
+        wasmtime::ensure!(
+            Arc::ptr_eq(&self.epoch_clock, &child.epoch_clock)
+                && Arc::ptr_eq(&self.memory_budget, &child.memory_budget),
+            "child runtime belongs to another box"
+        );
+        wasmtime::ensure!(
+            self.children.len() < MAX_BOX_COMPONENTS,
+            "box has too many components"
+        );
+        wasmtime::ensure!(
+            self.registered_loop_count() + child.loop_count <= MAX_BOX_COMPONENT_LOOPS,
+            "box has too many component loops"
+        );
         self.children.push(child);
         Ok(())
     }
 
     pub(crate) fn component_count(&self) -> usize {
-        self.store
-            .data()
-            .component_count()
-            .saturating_add(self.children.iter().map(Self::component_count).sum())
-            .saturating_add(self.pending_workers.len())
+        self.children.len()
+            + self
+                .mmio
+                .as_ref()
+                .map_or(0, crate::component::vmm::mmio::Router::unprepared_count)
     }
 
     #[must_use]
     pub fn has_component(&self, kind: crate::component::vmm::machine::DeviceKind) -> bool {
-        self.pending_workers
-            .iter()
-            .any(|worker| worker.kind == kind)
-            || match kind {
-                crate::component::vmm::machine::DeviceKind::Block => {
-                    !self.store.data().block.is_empty()
-                }
-                crate::component::vmm::machine::DeviceKind::Net => {
-                    !self.store.data().network.is_empty()
-                }
-                crate::component::vmm::machine::DeviceKind::Vsock => {
-                    !self.store.data().vsock.is_empty()
-                }
-                crate::component::vmm::machine::DeviceKind::Fs => {
-                    !self.store.data().filesystems.is_empty()
-                }
-                crate::component::vmm::machine::DeviceKind::Memory => {
-                    !self.store.data().memory.is_empty()
-                }
-            }
-            || self.children.iter().any(|child| child.has_component(kind))
+        self.mmio
+            .as_ref()
+            .is_some_and(|router| router.has_component(kind))
+    }
+
+    pub(crate) fn shutdown_receiver(&self) -> watch::Receiver<bool> {
+        self.shutdown.subscribe()
     }
 
     pub fn register_loop(&mut self, component_loop: ComponentLoop) -> wasmtime::Result<()> {
@@ -613,71 +540,40 @@ impl BoxRuntime {
             + self
                 .children
                 .iter()
-                .map(Self::registered_loop_count)
+                .map(|child| child.loop_count)
                 .sum::<usize>()
     }
 
-    #[must_use]
-    pub fn start(self) -> BoxRuntimeHandle {
-        BoxRuntimeHandle(Some(tokio::spawn(Self::run_group(self))))
+    pub async fn prepare(self) -> wasmtime::Result<PreparedBoxRuntime> {
+        self.validate_runtime_start()?;
+        self.prepare_devices().await?.finish()
     }
 
-    #[allow(clippy::too_many_lines)]
-    async fn run_group(mut root: Self) -> wasmtime::Result<()> {
-        let lifecycle = root.lifecycle_notifier();
-        let failure = root
-            .mmio
-            .as_ref()
-            .map(crate::component::vmm::mmio::Router::failure_sink);
-        let mut workers = JoinSet::new();
-        let result = async {
-            let children = std::mem::take(&mut root.children);
-            let child_shutdowns = children.iter().map(|child| child.shutdown.clone()).collect::<Vec<_>>();
-            for mut child in children {
-                let executor = child.filesystem_runtime.as_ref().map_or_else(
-                    || Ok(tokio::runtime::Handle::current()),
-                    crate::component::fs::FilesystemRuntime::handle,
-                )?;
-                workers.spawn_on(async move { child.run_until_shutdown(true).await }, &executor);
+    pub(crate) fn finish(mut self) -> wasmtime::Result<PreparedBoxRuntime> {
+        self.validate_runtime_start()?;
+        let failure = if let Some(router) = self.mmio.take() {
+            let crate::component::vmm::mmio::Router {
+                bridge,
+                entrypoint,
+                failure,
+                ..
+            } = router;
+            if self.store.data().platform.is_machine_running() {
+                self.register_loop(entrypoint)?;
             }
-            let root_result = root.run_until_shutdown(false);
-            tokio::pin!(root_result);
-            loop {
-                tokio::select! {
-                    result = &mut root_result => {
-                        result?;
-                        for shutdown in &child_shutdowns {
-                            shutdown.send_replace(true);
-                        }
-                        return tokio::time::timeout(BOX_SHUTDOWN_TIMEOUT, async {
-                            while let Some(result) = workers.join_next().await {
-                                result.map_err(|error| wasmtime::Error::msg(format!("box worker task: {error}")))??;
-                            }
-                            Ok(())
-                        }).await.map_err(|_| wasmtime::Error::msg("box runtime shutdown timed out"))?;
-                    },
-                    result = workers.join_next(), if !workers.is_empty() => {
-                        result
-                            .ok_or_else(|| wasmtime::Error::msg("box worker task missing"))?
-                            .map_err(|error| wasmtime::Error::msg(format!("box worker task: {error}")))??;
-                    }
-                }
-            }
-        }
-        .await;
-        workers.abort_all();
-        while workers.join_next().await.is_some() {}
-        if let Err(error) = &result {
-            if let Some(failure) = &failure {
-                crate::component::vmm::mmio::Router::record_failure_in(failure, error);
-            }
-            if let (Some(failure), Err(recovery)) = (&failure, root.recover_native().await) {
-                crate::component::vmm::mmio::Router::record_failure_in(failure, &recovery);
-            }
-            lifecycle.component_failed();
-            lifecycle.complete(crate::component::vmm::lifecycle::Outcome::ComponentFailed);
-        }
-        result
+            self.component_loops.push(bridge);
+            Some(failure)
+        } else {
+            None
+        };
+        Ok(PreparedBoxRuntime {
+            store: self.store,
+            _epoch_clock: self.epoch_clock,
+            shutdown: self.shutdown,
+            children: self.children,
+            component_loops: self.component_loops,
+            failure,
+        })
     }
 
     #[must_use]
@@ -685,114 +581,173 @@ impl BoxRuntime {
         self.store.data().lifecycle.notifier()
     }
 
-    async fn recover_native(&mut self) -> wasmtime::Result<()> {
-        let machine = self.store.data_mut().platform.take_recovery_reaper()?;
-        let (devices, interrupts) = self.store.data_mut().lifecycle.take_shutdowns();
-        finish_native_recovery(DropRecovery {
-            filesystems: Vec::new(),
-            machine,
-            devices,
-            interrupts,
-        })
-        .await
-    }
-
-    pub fn add_block(&mut self, host: DeviceHost) -> wasmtime::Result<usize> {
-        self.add_host(|box_host| &mut box_host.block, host)
-    }
-
-    pub fn add_network(&mut self, host: DeviceHost) -> wasmtime::Result<usize> {
-        self.add_host(|box_host| &mut box_host.network, host)
-    }
-
-    pub fn add_vsock(&mut self, host: DeviceHost) -> wasmtime::Result<usize> {
-        self.add_host(|box_host| &mut box_host.vsock, host)
-    }
-
-    pub fn add_fs(&mut self, host: FsHost) -> wasmtime::Result<usize> {
-        self.add_host(|box_host| &mut box_host.filesystems, host)
-    }
-
-    pub fn add_mem(&mut self, host: MemHost) -> wasmtime::Result<usize> {
-        self.add_host(|box_host| &mut box_host.memory, host)
-    }
-
-    fn add_host<Host>(
-        &mut self,
-        select: fn(&mut BoxHost) -> &mut Vec<Host>,
-        host: Host,
-    ) -> wasmtime::Result<usize> {
-        if self.component_count() >= MAX_BOX_COMPONENTS {
-            return Err(wasmtime::Error::msg("box has too many components"));
-        }
-        let box_host = self.store.data_mut();
-        let hosts = select(box_host);
-        let index = hosts.len();
-        hosts.push(host);
-        Ok(index)
-    }
-
-    #[cfg(test)]
-    async fn run(&mut self) -> wasmtime::Result<()> {
-        self.run_until_shutdown(false).await
-    }
-
-    async fn run_until_shutdown(&mut self, wait_for_shutdown: bool) -> wasmtime::Result<()> {
-        let mut component_loops = std::mem::take(&mut self.component_loops);
-        if let Some(bridge) = self.mmio.as_mut().and_then(|router| router.bridge.take()) {
-            component_loops.push(bridge);
-        }
-        if component_loops.is_empty() {
-            return Err(wasmtime::Error::msg("box runtime has no component loops"));
-        }
-        let mut shutdown = self.shutdown.subscribe();
-        let result = self
-            .store
-            .run_concurrent(async move |accessor| {
-                let mut component_loops: Vec<RunningLoop<'_>> = component_loops
-                    .into_iter()
-                    .map(|component_loop| component_loop(accessor))
-                    .collect();
-                loop {
-                    if wait_for_loop(&mut component_loops).await? {
-                        if wait_for_shutdown {
-                            while !*shutdown.borrow_and_update() {
-                                shutdown.changed().await.map_err(|_| {
-                                    wasmtime::Error::msg("box runtime shutdown signal closed")
-                                })?;
-                            }
-                        }
-                        return Ok(());
-                    }
-                }
-            })
-            .await
-            .and_then(|result| result);
-        if let Err(error) = &result {
-            if let Some(router) = &self.mmio {
-                router.record_failure(error);
-            }
-            self.lifecycle_notifier()
-                .complete(crate::component::vmm::lifecycle::Outcome::ComponentFailed);
-        }
-        result
+    #[must_use]
+    pub fn native_teardown(&self) -> crate::component::vmm::teardown::NativeTeardown {
+        self.store.data().lifecycle.native_teardown()
     }
 }
 
-async fn wait_for_loop(component_loops: &mut Vec<RunningLoop<'_>>) -> wasmtime::Result<bool> {
-    poll_fn(|context| {
-        for (index, component_loop) in component_loops.iter_mut().enumerate() {
-            if let Poll::Ready(result) = component_loop.as_mut().poll(context) {
-                return Poll::Ready(result.map(|()| index));
+impl PreparedBoxRuntime {
+    #[must_use]
+    pub fn lifecycle_notifier(&self) -> crate::component::vmm::lifecycle::LifecycleNotifier {
+        self.store.data().lifecycle.notifier()
+    }
+
+    #[must_use]
+    pub fn native_teardown(&self) -> crate::component::vmm::teardown::NativeTeardown {
+        self.store.data().lifecycle.native_teardown()
+    }
+
+    #[must_use]
+    pub fn start(self) -> BoxRuntimeHandle {
+        BoxRuntimeHandle(AbortOnDropHandle::new(tokio::spawn(Self::run_group(self))))
+    }
+
+    async fn run_group(mut root: Self) -> wasmtime::Result<()> {
+        enum StoreRole {
+            Root,
+            Child,
+        }
+
+        let lifecycle = root.store.data().lifecycle.notifier();
+        let failure = root.failure.take();
+        let mut workers = JoinSet::new();
+        for child in std::mem::take(&mut root.children) {
+            workers.spawn_on(
+                child.run,
+                &child
+                    .executor
+                    .unwrap_or_else(tokio::runtime::Handle::current),
+            );
+        }
+        let shutdown = root.shutdown.clone();
+        let result = async {
+            let root_events =
+                futures_util::stream::once(root.run()).map(|result| (StoreRole::Root, result));
+            let child_events = futures_util::stream::unfold(&mut workers, |workers| async {
+                workers.join_next().await.map(|result| {
+                    let result = result
+                        .map_err(|error| wasmtime::Error::msg(format!("box worker task: {error}")))
+                        .and_then(std::convert::identity);
+                    ((StoreRole::Child, result), workers)
+                })
+            });
+            let events = futures_util::stream::select(root_events, child_events);
+            tokio::pin!(events);
+            let mut deadline = None;
+            loop {
+                let event = if let Some(deadline) = deadline {
+                    tokio::time::timeout_at(deadline, events.next())
+                        .await
+                        .map_err(|_| wasmtime::Error::msg("box runtime shutdown timed out"))?
+                } else {
+                    events.next().await
+                };
+                let Some((role, result)) = event else {
+                    return Ok(());
+                };
+                result?;
+                match role {
+                    StoreRole::Root => {
+                        shutdown.send_replace(true);
+                        deadline = Some(lifecycle.begin_shutdown().into());
+                    }
+                    StoreRole::Child => {}
+                }
             }
         }
-        Poll::Pending
-    })
-    .await
-    .map(|index| {
-        drop(component_loops.remove(index));
-        component_loops.is_empty()
-    })
+        .await;
+        if let Err(error) = &result {
+            if let Some(failure) = &failure {
+                crate::component::vmm::mmio::Router::record_failure_in(failure, error);
+            }
+            lifecycle.component_failed();
+            lifecycle.publish_outcome(crate::component::vmm::lifecycle::Outcome::ComponentFailed);
+        }
+        workers.shutdown().await;
+        if result.is_err()
+            && let Err(error) = root.recover_native().await
+        {
+            log::warn!("native recovery after component failure: {error:#}");
+        }
+        result
+    }
+
+    async fn recover_native(&mut self) -> wasmtime::Result<()> {
+        self.store
+            .data()
+            .lifecycle
+            .native_teardown()
+            .wait_until_finished()
+            .await
+            .map_err(wasmtime::Error::msg)
+    }
+
+    async fn run(&mut self) -> wasmtime::Result<()> {
+        let loops = std::mem::take(&mut self.component_loops);
+        run_store(&mut self.store, loops, None).await
+    }
+}
+
+impl<H: StoreHost> DeviceWorker<H> {
+    pub fn register_loop(
+        &mut self,
+        component_loop: ComponentLoop<StoreState<H>>,
+    ) -> wasmtime::Result<()> {
+        wasmtime::ensure!(
+            self.component_loops.len() < MAX_BOX_COMPONENT_LOOPS,
+            "box has too many component loops"
+        );
+        self.component_loops.push(component_loop);
+        Ok(())
+    }
+
+    pub(crate) fn prepare(mut self, shutdown: watch::Receiver<bool>) -> WorkerTask {
+        WorkerTask {
+            executor: None,
+            epoch_clock: Arc::clone(&self.epoch_clock),
+            memory_budget: Arc::clone(&self.store.data().memory_budget),
+            loop_count: self.component_loops.len(),
+            run: Box::pin(async move { self.run(shutdown).await }),
+        }
+    }
+
+    async fn run(&mut self, shutdown: watch::Receiver<bool>) -> wasmtime::Result<()> {
+        run_store(
+            &mut self.store,
+            std::mem::take(&mut self.component_loops),
+            Some(shutdown),
+        )
+        .await
+    }
+}
+
+async fn run_store<T: Send + 'static>(
+    store: &mut Store<T>,
+    loops: Vec<ComponentLoop<T>>,
+    shutdown: Option<watch::Receiver<bool>>,
+) -> wasmtime::Result<()> {
+    wasmtime::ensure!(!loops.is_empty(), "box runtime has no component loops");
+    store
+        .run_concurrent(async move |accessor| {
+            let mut running: FuturesUnordered<_> = loops
+                .into_iter()
+                .map(|component_loop| component_loop(accessor))
+                .collect();
+            while let Some(result) = running.next().await {
+                result?;
+            }
+            if let Some(mut shutdown) = shutdown {
+                while !*shutdown.borrow_and_update() {
+                    shutdown
+                        .changed()
+                        .await
+                        .map_err(|_| wasmtime::Error::msg("box runtime shutdown signal closed"))?;
+                }
+            }
+            Ok(())
+        })
+        .await?
 }
 
 #[cfg(test)]

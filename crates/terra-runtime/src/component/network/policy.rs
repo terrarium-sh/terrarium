@@ -5,56 +5,164 @@ use std::{
     sync::Arc,
 };
 
-use terra_network::{Policy, PolicyHandle, PortMapping};
+use futures_util::FutureExt;
+use std::panic::AssertUnwindSafe;
+use terra_network::policy::{AsyncPolicy, DecisionFuture};
+use terra_network::{NameLookup, Policy, PolicyHandle, PortMapping};
+use tokio::sync::Semaphore;
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, sockets::SocketAddrUse};
 
-pub fn build_network_context(
-    policy: PolicyHandle,
-    policy_calls: Arc<tokio::sync::Semaphore>,
+enum Backend {
+    Async {
+        metadata: PolicyHandle,
+        decisions: Arc<dyn AsyncPolicy>,
+    },
+    Blocking(PolicyHandle),
+}
+
+#[derive(Clone)]
+pub(crate) struct PolicyClient {
+    backend: Arc<Backend>,
+    calls: Arc<Semaphore>,
+}
+
+impl PolicyClient {
+    pub(crate) fn new(policy: PolicyHandle, calls: Arc<Semaphore>) -> Self {
+        let backend = match Arc::clone(&policy).asynchronous() {
+            Some(decisions) => Backend::Async {
+                metadata: policy,
+                decisions,
+            },
+            None => Backend::Blocking(policy),
+        };
+        Self {
+            backend: Arc::new(backend),
+            calls,
+        }
+    }
+
+    async fn authorize_socket(
+        &self,
+        host_service_ports: Arc<[Option<u16>]>,
+        published_ports: Arc<[PortMapping]>,
+        address: SocketAddr,
+        purpose: SocketAddrUse,
+    ) -> bool {
+        let Ok(permit) = Arc::clone(&self.calls).try_acquire_owned() else {
+            return false;
+        };
+        match self.backend.as_ref() {
+            Backend::Async {
+                metadata,
+                decisions,
+            } => {
+                match authorize_socket_grants(
+                    metadata.as_ref(),
+                    &host_service_ports,
+                    &published_ports,
+                    address,
+                    purpose,
+                ) {
+                    Some(allowed) => allowed,
+                    None => {
+                        // WASI socket checks require a Sync future; policy futures only require Send.
+                        receive_decision(decisions.allows(
+                            address.ip(),
+                            Some(address.port()),
+                            Box::new(permit),
+                        ))
+                        .map(|allowed| allowed.unwrap_or(false))
+                        .shared()
+                        .await
+                    }
+                }
+            }
+            Backend::Blocking(policy) => {
+                let policy = Arc::clone(policy);
+                tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    authorize_socket(
+                        policy.as_ref(),
+                        &host_service_ports,
+                        &published_ports,
+                        address,
+                        purpose,
+                    )
+                })
+                .await
+                .unwrap_or(false)
+            }
+        }
+    }
+
+    pub(crate) async fn lookup_name(&self, name: String) -> Option<NameLookup> {
+        let permit = Arc::clone(&self.calls).try_acquire_owned().ok()?;
+        match self.backend.as_ref() {
+            Backend::Async { decisions, .. } => {
+                receive_decision(decisions.lookup_name(name, Box::new(permit))).await
+            }
+            Backend::Blocking(policy) => {
+                let policy = Arc::clone(policy);
+                tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    policy.lookup_name(&name)
+                })
+                .await
+                .ok()
+            }
+        }
+    }
+
+    pub(crate) async fn accept_resolved(
+        &self,
+        name: String,
+        addresses: Vec<IpAddr>,
+    ) -> Option<Vec<IpAddr>> {
+        let permit = Arc::clone(&self.calls).try_acquire_owned().ok()?;
+        match self.backend.as_ref() {
+            Backend::Async { decisions, .. } => {
+                receive_decision(decisions.accept_resolved(name, addresses, Box::new(permit))).await
+            }
+            Backend::Blocking(policy) => {
+                let policy = Arc::clone(policy);
+                tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    policy.accept_resolved(&name, &addresses)
+                })
+                .await
+                .ok()
+            }
+        }
+    }
+}
+
+async fn receive_decision<T>(response: DecisionFuture<T>) -> Option<T> {
+    AssertUnwindSafe(response).catch_unwind().await.ok()
+}
+
+pub(super) fn build_network_context(
+    policy: PolicyClient,
     host_service_ports: Vec<Option<u16>>,
     published_ports: Vec<PortMapping>,
 ) -> WasiCtx {
+    let host_service_ports: Arc<[Option<u16>]> = Arc::from(host_service_ports);
+    let published_ports: Arc<[PortMapping]> = Arc::from(published_ports);
     WasiCtxBuilder::new()
         .max_random_size(crate::MAX_SINGLE_BYTES)
         .allow_tcp(true)
         .allow_udp(true)
         .allow_ip_name_lookup(true)
         .socket_addr_check(move |address, purpose| {
-            let policy = Arc::clone(&policy);
-            let policy_calls = Arc::clone(&policy_calls);
+            let policy = policy.clone();
             let host_service_ports = host_service_ports.clone();
             let published_ports = published_ports.clone();
-            Box::pin(authorize_socket_async(
-                policy,
-                policy_calls,
-                host_service_ports,
-                published_ports,
-                address,
-                purpose,
-            ))
+            Box::pin(async move {
+                policy
+                    .authorize_socket(host_service_ports, published_ports, address, purpose)
+                    .await
+            })
         })
         .build()
-}
-
-async fn authorize_socket_async(
-    policy: PolicyHandle,
-    policy_calls: Arc<tokio::sync::Semaphore>,
-    host_service_ports: Vec<Option<u16>>,
-    published_ports: Vec<PortMapping>,
-    address: SocketAddr,
-    purpose: SocketAddrUse,
-) -> bool {
-    crate::component::policy::run_policy_decision(policy, policy_calls, move |policy| {
-        authorize_socket(
-            policy,
-            &host_service_ports,
-            &published_ports,
-            address,
-            purpose,
-        )
-    })
-    .await
-    .unwrap_or(false)
 }
 
 fn authorize_socket(
@@ -64,10 +172,28 @@ fn authorize_socket(
     address: SocketAddr,
     purpose: SocketAddrUse,
 ) -> bool {
+    authorize_socket_grants(
+        policy,
+        host_service_ports,
+        published_ports,
+        address,
+        purpose,
+    )
+    .unwrap_or_else(|| policy.allows(address.ip(), Some(address.port())))
+}
+
+/// `None` requires an egress decision from the policy worker.
+fn authorize_socket_grants(
+    policy: &dyn Policy,
+    host_service_ports: &[Option<u16>],
+    published_ports: &[PortMapping],
+    address: SocketAddr,
+    purpose: SocketAddrUse,
+) -> Option<bool> {
     if !policy.is_available() {
-        return false;
+        return Some(false);
     }
-    match purpose {
+    Some(match purpose {
         SocketAddrUse::UdpBind => address.ip().is_unspecified() && address.port() == 0,
         SocketAddrUse::TcpBind => {
             (address.ip().is_unspecified() && address.port() == 0)
@@ -88,10 +214,15 @@ fn authorize_socket(
                 && host_service_ports
                     .iter()
                     .any(|port| port.is_none_or(|port| port == address.port()));
-            !(address.port() == 53 && policy.blocks_direct_dns())
-                && (host_service || policy.allows(address.ip(), Some(address.port())))
+            if address.port() == 53 && policy.blocks_direct_dns() {
+                false
+            } else if host_service {
+                true
+            } else {
+                return None;
+            }
         }
-    }
+    })
 }
 
 fn is_host_loopback(ip: IpAddr) -> bool {
@@ -270,6 +401,133 @@ mod tests {
         }
     }
 
+    struct AsyncProbe;
+
+    impl Policy for AsyncProbe {
+        fn asynchronous(self: Arc<Self>) -> Option<Arc<dyn AsyncPolicy>> {
+            Some(self)
+        }
+        fn allows(&self, _: IpAddr, _: Option<u16>) -> bool {
+            panic!("synchronous fallback")
+        }
+    }
+
+    impl AsyncPolicy for AsyncProbe {
+        fn allows(
+            &self,
+            _: IpAddr,
+            _: Option<u16>,
+            lease: terra_network::policy::DecisionLease,
+        ) -> DecisionFuture<bool> {
+            Box::pin(async move {
+                let _lease = lease;
+                let visited = std::cell::Cell::new(false);
+                tokio::task::yield_now().await;
+                visited.set(true);
+                visited.get()
+            })
+        }
+        fn lookup_name(
+            &self,
+            _: String,
+            lease: terra_network::policy::DecisionLease,
+        ) -> DecisionFuture<NameLookup> {
+            Box::pin(async move {
+                let _lease = lease;
+                panic!("lookup failed")
+            })
+        }
+        fn accept_resolved(
+            &self,
+            _: String,
+            _: Vec<IpAddr>,
+            lease: terra_network::policy::DecisionLease,
+        ) -> DecisionFuture<Vec<IpAddr>> {
+            Box::pin(async move {
+                let _lease = lease;
+                panic!("resolution failed")
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_async_policies_support_send_futures_and_fail_closed_on_panic() {
+        let calls = Arc::new(Semaphore::new(1));
+        let client = PolicyClient::new(Arc::new(AsyncProbe), calls.clone());
+        assert!(
+            client
+                .authorize_socket(
+                    Arc::default(),
+                    Arc::default(),
+                    SocketAddr::from(([192, 0, 2, 1], 443)),
+                    SocketAddrUse::TcpConnect
+                )
+                .await
+        );
+        assert!(client.lookup_name("test".into()).await.is_none());
+        assert!(
+            client
+                .accept_resolved("test".into(), vec![])
+                .await
+                .is_none()
+        );
+        assert_eq!(calls.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_synchronous_policy_waiters_retain_admission() {
+        struct BlockedLookup {
+            entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+            release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl Policy for BlockedLookup {
+            fn allows(&self, _: IpAddr, _: Option<u16>) -> bool {
+                false
+            }
+            fn lookup_name(&self, _: &str) -> NameLookup {
+                self.entered
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap()
+                    .send(())
+                    .unwrap();
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap();
+                NameLookup::Denied
+            }
+        }
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let calls = Arc::new(Semaphore::new(1));
+        let client = PolicyClient::new(
+            Arc::new(BlockedLookup {
+                entered: std::sync::Mutex::new(Some(entered)),
+                release: std::sync::Mutex::new(blocked),
+            }),
+            calls.clone(),
+        );
+        {
+            let response = client.lookup_name("blocked.test".into());
+            tokio::pin!(response);
+            tokio::select! {
+                result = &mut response => panic!("unexpected response: {}", result.is_some()),
+                result = started => result.unwrap(),
+            }
+        }
+        assert_eq!(calls.available_permits(), 0);
+        assert!(client.lookup_name("another.test".into()).await.is_none());
+        drop(client);
+        release.send(()).unwrap();
+        let _permit = tokio::time::timeout(Duration::from_secs(1), calls.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
     struct Slow;
 
     impl Policy for Slow {
@@ -285,11 +543,9 @@ mod tests {
         assert!(
             tokio::time::timeout(
                 Duration::from_millis(10),
-                authorize_socket_async(
-                    policy,
-                    Arc::new(tokio::sync::Semaphore::new(1)),
-                    Vec::new(),
-                    Vec::new(),
+                PolicyClient::new(policy, Arc::new(Semaphore::new(1))).authorize_socket(
+                    Arc::default(),
+                    Arc::default(),
                     SocketAddr::from(([192, 0, 2, 1], 443)),
                     SocketAddrUse::TcpConnect,
                 ),
@@ -302,15 +558,14 @@ mod tests {
     #[tokio::test]
     async fn saturated_socket_policy_callback_denies() {
         assert!(
-            !authorize_socket_async(
-                Arc::new(Restricted),
-                Arc::new(tokio::sync::Semaphore::new(0)),
-                Vec::new(),
-                Vec::new(),
-                SocketAddr::from(([192, 0, 2, 1], 443)),
-                SocketAddrUse::TcpConnect,
-            )
-            .await
+            !PolicyClient::new(Arc::new(Restricted), Arc::new(Semaphore::new(0)))
+                .authorize_socket(
+                    Arc::default(),
+                    Arc::default(),
+                    SocketAddr::from(([192, 0, 2, 1], 443)),
+                    SocketAddrUse::TcpConnect,
+                )
+                .await
         );
     }
 }

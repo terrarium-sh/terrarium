@@ -1,4 +1,5 @@
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 
@@ -9,6 +10,18 @@ pub use crate::component::vmm::mmio::terra::mmio::lifecycle_platform;
 pub struct LifecycleNotifier {
     event: watch::Sender<Option<Event>>,
     outcome: watch::Sender<Option<Outcome>>,
+    shutdown_deadline: ShutdownDeadline,
+}
+
+#[derive(Clone)]
+pub(crate) struct ShutdownDeadline(Arc<OnceLock<Instant>>);
+
+impl ShutdownDeadline {
+    pub(crate) fn start(&self) -> Instant {
+        *self
+            .0
+            .get_or_init(|| Instant::now() + crate::box_runtime::BOX_SHUTDOWN_TIMEOUT)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,59 +45,26 @@ pub enum WaitError {
     Missing,
 }
 
-struct InterruptGrant {
-    cleanup: Option<super::teardown::NativeCleanup>,
-}
-
 pub struct LifecycleHost {
     sender: LifecycleNotifier,
-    receiver: watch::Receiver<Option<Event>>,
-    devices: Option<Vec<Option<super::teardown::DeviceShutdown>>>,
-    interrupts: Option<InterruptGrant>,
+    teardown: super::teardown::NativeTeardown,
 }
 
 pub struct LifecyclePlatform;
 
 impl LifecycleHost {
-    pub(crate) fn take_shutdowns(
-        &mut self,
-    ) -> (
-        Vec<super::teardown::DeviceShutdown>,
-        Option<super::teardown::NativeCleanup>,
-    ) {
-        let devices = self
-            .devices
-            .take()
-            .into_iter()
-            .flatten()
-            .flatten()
-            .collect();
-        let interrupts = self.interrupts.take().and_then(|grant| grant.cleanup);
-        (devices, interrupts)
-    }
-
-    fn claim_interrupt_shutdown(
-        &mut self,
-    ) -> Result<Option<super::teardown::NativeCleanup>, lifecycle_platform::Error> {
-        match &mut self.interrupts {
-            Some(grant) => grant
-                .cleanup
-                .take()
-                .map(Some)
-                .ok_or(lifecycle_platform::Error::Closed),
-            None => Ok(None),
-        }
-    }
-
     #[must_use]
     pub fn new() -> Self {
-        let (event, receiver) = watch::channel(None);
+        let (event, _) = watch::channel(None);
         let (outcome, _) = watch::channel(None);
+        let shutdown_deadline = ShutdownDeadline(Arc::new(OnceLock::new()));
         Self {
-            sender: LifecycleNotifier { event, outcome },
-            receiver,
-            devices: None,
-            interrupts: None,
+            sender: LifecycleNotifier {
+                event,
+                outcome,
+                shutdown_deadline,
+            },
+            teardown: super::teardown::NativeTeardown::new(),
         }
     }
 
@@ -93,34 +73,23 @@ impl LifecycleHost {
         self.sender.clone()
     }
 
-    #[must_use]
-    pub fn from_notifier(sender: LifecycleNotifier) -> Self {
-        Self {
-            receiver: sender.event.subscribe(),
-            sender,
-            devices: None,
-            interrupts: None,
-        }
+    pub(crate) fn native_teardown(&self) -> super::teardown::NativeTeardown {
+        self.teardown.clone()
     }
 
-    fn next_event(
+    pub(crate) fn next_event(
         &self,
     ) -> impl core::future::Future<
         Output = wasmtime::Result<Result<lifecycle_platform::Event, lifecycle_platform::Error>>,
     > + Send
     + use<> {
-        let mut receiver = self.receiver.clone();
+        let mut receiver = self.sender.event.subscribe();
         async move {
-            let event = if let Some(event) = *receiver.borrow_and_update() {
-                event
-            } else {
-                receiver
-                    .changed()
-                    .await
-                    .map_err(|_| wasmtime::Error::msg("lifecycle event source closed"))?;
-                (*receiver.borrow_and_update())
-                    .ok_or_else(|| wasmtime::Error::msg("lifecycle event missing"))?
-            };
+            let event = receiver
+                .wait_for(Option::is_some)
+                .await
+                .map_err(|_| wasmtime::Error::msg("lifecycle event source closed"))?
+                .ok_or_else(|| wasmtime::Error::msg("lifecycle event missing"))?;
             Ok(Ok(match event {
                 Event::GuestExit(code) => lifecycle_platform::Event::GuestExit(code),
                 Event::ComponentFailed => lifecycle_platform::Event::ComponentFailed,
@@ -137,6 +106,11 @@ impl Default for LifecycleHost {
 }
 
 impl LifecycleNotifier {
+    #[must_use]
+    pub fn begin_shutdown(&self) -> Instant {
+        self.shutdown_deadline.start()
+    }
+
     pub fn guest_exit(&self, code: i32) {
         self.publish(Event::GuestExit(code));
     }
@@ -154,6 +128,7 @@ impl LifecycleNotifier {
             if current.is_some() {
                 false
             } else {
+                self.shutdown_deadline.start();
                 *current = Some(event);
                 true
             }
@@ -165,11 +140,13 @@ impl LifecycleNotifier {
         self.outcome.subscribe()
     }
 
-    pub fn complete(&self, outcome: Outcome) {
+    /// Publishes the first terminal decision; native teardown may still be running.
+    pub fn publish_outcome(&self, outcome: Outcome) {
         let _ = self.outcome.send_if_modified(|current| {
             if current.is_some() {
                 false
             } else {
+                self.shutdown_deadline.start();
                 *current = Some(outcome);
                 true
             }
@@ -183,15 +160,15 @@ pub async fn wait_for_outcome(
     notifier: &LifecycleNotifier,
 ) -> Result<Outcome, WaitError> {
     let next = async {
-        if let Some(outcome) = *receiver.borrow_and_update() {
-            Ok(outcome)
-        } else {
-            receiver.changed().await.map_err(|_| WaitError::Closed)?;
-            (*receiver.borrow_and_update()).ok_or(WaitError::Missing)
-        }
+        receiver
+            .wait_for(Option::is_some)
+            .await
+            .map_err(|_| WaitError::Closed)?
+            .ok_or(WaitError::Missing)
     };
     if let Some(deadline) = deadline {
         tokio::select! {
+            biased;
             outcome = next => outcome,
             () = tokio::time::sleep(deadline) => {
                 notifier.deadline();
@@ -207,38 +184,15 @@ impl wasmtime::component::HasData for LifecyclePlatform {
     type Data<'a> = &'a mut LifecycleHost;
 }
 
-impl lifecycle_platform::Host for LifecycleHost {
-    fn devices(&mut self) -> wasmtime::Result<Vec<lifecycle_platform::DeviceGrant>> {
-        self.devices
-            .iter()
-            .flatten()
-            .enumerate()
-            .filter_map(|(id, device)| device.as_ref().map(|device| (id, device)))
-            .map(|(id, device)| {
-                Ok(lifecycle_platform::DeviceGrant {
-                    id: u32::try_from(id)?,
-                    kind: device.kind,
-                })
-            })
-            .collect()
-    }
-}
+impl lifecycle_platform::Host for LifecycleHost {}
 
 impl crate::box_runtime::BoxRuntime {
     pub fn grant_interrupt_shutdown(
         &mut self,
-        close: impl FnOnce() -> Result<(), String> + Send + 'static,
-    ) -> wasmtime::Result<super::teardown::NativeCleanup> {
-        let host = &mut self.store.data_mut().lifecycle;
-        wasmtime::ensure!(
-            host.interrupts.is_none(),
-            "interrupt shutdown already granted"
-        );
-        let cleanup = super::teardown::NativeCleanup::new(close, None);
-        host.interrupts = Some(InterruptGrant {
-            cleanup: Some(cleanup.clone()),
-        });
-        Ok(cleanup)
+        close: impl Future<Output = Result<(), String>> + Send + 'static,
+    ) -> wasmtime::Result<()> {
+        let teardown = self.store.data().lifecycle.native_teardown();
+        teardown.install_interrupts(Box::pin(close))
     }
 
     pub fn grant_device_shutdown(
@@ -249,46 +203,24 @@ impl crate::box_runtime::BoxRuntime {
             devices.len() <= crate::box_runtime::MAX_BOX_COMPONENTS,
             "box has too many device shutdown grants"
         );
-        let host = &mut self.store.data_mut().lifecycle;
-        wasmtime::ensure!(host.devices.is_none(), "device shutdown already granted");
-        host.devices = Some(devices.into_iter().map(Some).collect());
-        Ok(())
+        self.store
+            .data()
+            .lifecycle
+            .native_teardown()
+            .install_devices(devices)
     }
 }
 
 impl<T: Send + 'static> lifecycle_platform::HostWithStore<T> for LifecyclePlatform {
-    async fn release_interrupts(
+    async fn shutdown(
         host: &wasmtime::component::Accessor<T, Self>,
     ) -> wasmtime::Result<Result<(), lifecycle_platform::Error>> {
-        let cleanup = host.with(|mut access| access.get().claim_interrupt_shutdown());
-        let cleanup = match cleanup {
-            Ok(Some(cleanup)) => cleanup,
-            Ok(None) => return Ok(Ok(())),
-            Err(error) => return Ok(Err(error)),
-        };
-        Ok(cleanup
-            .wait()
-            .await
-            .map_err(|_| lifecycle_platform::Error::Closed))
-    }
-
-    async fn close_device(
-        host: &wasmtime::component::Accessor<T, Self>,
-        id: u32,
-    ) -> wasmtime::Result<Result<(), lifecycle_platform::Error>> {
-        let device = host.with(|mut access| {
-            access
-                .get()
-                .devices
-                .as_mut()?
-                .get_mut(usize::try_from(id).ok()?)?
-                .take()
+        let (teardown, deadline) = host.with(|mut access| {
+            let host = access.get();
+            (host.native_teardown(), host.sender.begin_shutdown())
         });
-        let Some(device) = device else {
-            return Ok(Err(lifecycle_platform::Error::Closed));
-        };
-        Ok(device
-            .wait()
+        Ok(teardown
+            .wait_until(deadline)
             .await
             .map_err(|_| lifecycle_platform::Error::Closed))
     }
@@ -317,45 +249,6 @@ mod tests {
     use super::{Event, LifecycleHost, Outcome, lifecycle_platform, wait_for_outcome};
 
     #[tokio::test]
-    async fn interrupt_cleanup_is_claimed_once_and_cannot_be_regranted() {
-        let engine = crate::engine::device_engine().unwrap();
-        let mut runtime =
-            crate::box_runtime::BoxRuntime::new(&engine, crate::box_runtime::BoxHost::new())
-                .unwrap();
-        assert!(
-            runtime
-                .store
-                .data_mut()
-                .lifecycle
-                .claim_interrupt_shutdown()
-                .unwrap()
-                .is_none()
-        );
-        let recovery = runtime
-            .grant_interrupt_shutdown(|| Err("interrupt failure".to_owned()))
-            .unwrap();
-        assert!(runtime.grant_interrupt_shutdown(|| Ok(())).is_err());
-        let claimed = runtime
-            .store
-            .data_mut()
-            .lifecycle
-            .claim_interrupt_shutdown()
-            .unwrap()
-            .unwrap();
-        assert!(
-            runtime
-                .store
-                .data_mut()
-                .lifecycle
-                .claim_interrupt_shutdown()
-                .is_err()
-        );
-        assert!(runtime.grant_interrupt_shutdown(|| Ok(())).is_err());
-        assert_eq!(claimed.wait().await, Err("interrupt failure".to_owned()));
-        assert_eq!(recovery.wait().await, Err("interrupt failure".to_owned()));
-    }
-
-    #[tokio::test]
     async fn retains_the_first_terminal_event() {
         let host = LifecycleHost::new();
         let notifier = host.notifier();
@@ -366,7 +259,7 @@ mod tests {
             host.next_event().await.expect("event"),
             Ok(lifecycle_platform::Event::Deadline)
         ));
-        assert_eq!(*host.receiver.borrow(), Some(Event::Deadline));
+        assert_eq!(*host.sender.event.borrow(), Some(Event::Deadline));
     }
 
     #[tokio::test]
@@ -374,8 +267,8 @@ mod tests {
         let host = LifecycleHost::new();
         let notifier = host.notifier();
         let mut outcome = notifier.subscribe();
-        notifier.complete(Outcome::VcpuFinished);
-        notifier.complete(Outcome::Deadline);
+        notifier.publish_outcome(Outcome::VcpuFinished);
+        notifier.publish_outcome(Outcome::Deadline);
         outcome.changed().await.expect("outcome");
 
         assert_eq!(*outcome.borrow_and_update(), Some(Outcome::VcpuFinished));
@@ -393,5 +286,45 @@ mod tests {
                 .expect("deadline outcome"),
             Outcome::Deadline
         );
+    }
+
+    #[tokio::test]
+    async fn closed_outcome_channels_keep_the_last_terminal_value() {
+        let host = LifecycleHost::new();
+        let notifier = host.notifier();
+        for terminal in [None, Some(Outcome::GuestExit(7))] {
+            let (sender, mut receiver) = tokio::sync::watch::channel(terminal);
+            receiver.borrow_and_update();
+            drop(sender);
+            assert_eq!(
+                wait_for_outcome(&mut receiver, None, &notifier).await,
+                terminal.ok_or(super::WaitError::Closed)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn published_outcome_wins_over_an_expired_deadline() {
+        let host = LifecycleHost::new();
+        let notifier = host.notifier();
+        let mut outcome = notifier.subscribe();
+        notifier.publish_outcome(Outcome::GuestExit(7));
+
+        assert_eq!(
+            wait_for_outcome(&mut outcome, Some(Duration::ZERO), &notifier).await,
+            Ok(Outcome::GuestExit(7))
+        );
+        assert_eq!(*host.sender.event.borrow(), None);
+    }
+
+    #[test]
+    fn terminal_phases_keep_the_first_shutdown_deadline() {
+        let host = LifecycleHost::new();
+        let notifier = host.notifier();
+        notifier.guest_exit(7);
+        let deadline = notifier.begin_shutdown();
+        notifier.publish_outcome(Outcome::GuestExit(7));
+
+        assert_eq!(notifier.begin_shutdown(), deadline);
     }
 }

@@ -126,7 +126,7 @@ async fn stalled_io_loop_does_not_delay_another_loop_in_the_same_box() {
             })
         }))
         .expect("fast loop");
-    let handle = runtime.start();
+    let handle = runtime.prepare().await.expect("runtime prepared").start();
     tokio::time::timeout(Duration::from_secs(1), fast_ready)
         .await
         .expect("fast loop is not blocked by stalled I/O")
@@ -179,8 +179,12 @@ async fn a_failed_box_does_not_stop_an_independent_box() {
             })
         }))
         .expect("independent loop");
-    let failed = failed.start();
-    let independent = independent.start();
+    let failed = failed.prepare().await.expect("runtime prepared").start();
+    let independent = independent
+        .prepare()
+        .await
+        .expect("runtime prepared")
+        .start();
     assert!(failed.join().await.is_err(), "failure reaches only its box");
     tokio::time::timeout(Duration::from_secs(1), ready)
         .await

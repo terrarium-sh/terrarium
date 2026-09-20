@@ -150,92 +150,70 @@ impl FileDisk {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl BlockBacking for FileDisk {
     fn capacity(&self) -> u64 {
         self.capacity
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), BackingError> {
-        use std::os::unix::fs::FileExt as _;
         self.check_range(offset, buf.len())?;
-        self.file
-            .read_exact_at(buf, offset)
-            .map_err(|_| BackingError::Io)?;
-        Ok(())
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt as _;
+            self.file
+                .read_exact_at(buf, offset)
+                .map_err(|_| BackingError::Io)?;
+            Ok(())
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::FileExt as _;
+            let mut done = 0;
+            while done < buf.len() {
+                let at = offset
+                    .checked_add(u64::try_from(done).map_err(|_| BackingError::Io)?)
+                    .ok_or(BackingError::Io)?;
+                match self.file.seek_read(&mut buf[done..], at) {
+                    Ok(0) => return Err(BackingError::Io),
+                    Ok(len) => done += len,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => return Err(BackingError::Io),
+                }
+            }
+            Ok(())
+        }
     }
 
     fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<(), BackingError> {
-        use std::os::unix::fs::FileExt as _;
         if self.readonly {
             return Err(BackingError::ReadOnly);
         }
         self.check_range(offset, buf.len())?;
-        self.file
-            .write_all_at(buf, offset)
-            .map_err(|_| BackingError::Io)
-    }
-
-    fn discard(&mut self, offset: u64, len: u64) -> Result<(), BackingError> {
-        if self.readonly {
-            return Err(BackingError::ReadOnly);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt as _;
+            self.file
+                .write_all_at(buf, offset)
+                .map_err(|_| BackingError::Io)
         }
-        self.check_range_len(offset, len)?;
-        if len == 0 {
-            return Ok(());
-        }
-        discard_file(&self.file, offset, len).map_err(|_| BackingError::Io)
-    }
-
-    fn sync(&self) -> Result<(), BackingError> {
-        self.file.sync_all().map_err(|_| BackingError::Io)?;
-        Ok(())
-    }
-}
-
-#[cfg(windows)]
-impl BlockBacking for FileDisk {
-    fn capacity(&self) -> u64 {
-        self.capacity
-    }
-
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), BackingError> {
-        use std::os::windows::fs::FileExt as _;
-        self.check_range(offset, buf.len())?;
-        let mut done = 0;
-        while done < buf.len() {
-            let at = offset
-                .checked_add(u64::try_from(done).map_err(|_| BackingError::Io)?)
-                .ok_or(BackingError::Io)?;
-            match self.file.seek_read(&mut buf[done..], at) {
-                Ok(0) => return Err(BackingError::Io),
-                Ok(len) => done += len,
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(_) => return Err(BackingError::Io),
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::FileExt as _;
+            let mut done = 0;
+            while done < buf.len() {
+                let at = offset
+                    .checked_add(u64::try_from(done).map_err(|_| BackingError::Io)?)
+                    .ok_or(BackingError::Io)?;
+                match self.file.seek_write(&buf[done..], at) {
+                    Ok(0) => return Err(BackingError::Io),
+                    Ok(len) => done += len,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => return Err(BackingError::Io),
+                }
             }
+            Ok(())
         }
-        Ok(())
-    }
-
-    fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<(), BackingError> {
-        use std::os::windows::fs::FileExt as _;
-        if self.readonly {
-            return Err(BackingError::ReadOnly);
-        }
-        self.check_range(offset, buf.len())?;
-        let mut done = 0;
-        while done < buf.len() {
-            let at = offset
-                .checked_add(u64::try_from(done).map_err(|_| BackingError::Io)?)
-                .ok_or(BackingError::Io)?;
-            match self.file.seek_write(&buf[done..], at) {
-                Ok(0) => return Err(BackingError::Io),
-                Ok(len) => done += len,
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(_) => return Err(BackingError::Io),
-            }
-        }
-        Ok(())
     }
 
     fn discard(&mut self, offset: u64, len: u64) -> Result<(), BackingError> {

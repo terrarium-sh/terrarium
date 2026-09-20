@@ -1,12 +1,71 @@
 //! Native authority for standard WASI name lookups in the network component.
 
+use super::policy::PolicyClient;
 use std::{marker::PhantomData, sync::Arc, time::Duration};
-use terra_network::{NameLookup, PolicyHandle};
+use terra_network::NameLookup;
 use tokio::sync::Semaphore;
 use wasmtime::component::Accessor;
 use wasmtime_wasi::sockets::{WasiSockets, WasiSocketsView};
 
-use crate::engine::{DeviceHost, device_component_linker};
+use crate::engine::{DeviceContext, DeviceHost};
+use wasmtime_wasi::{WasiCtxView, WasiView};
+
+pub struct NetworkHost {
+    pub context: DeviceContext,
+    network_policy: PolicyClient,
+    network_lookups: Arc<tokio::sync::Semaphore>,
+}
+
+impl NetworkHost {
+    #[must_use]
+    pub fn new(
+        mut context: DeviceContext,
+        policy: terra_network::PolicyHandle,
+        published_ports: Vec<terra_network::PortMapping>,
+    ) -> Self {
+        let host_service_ports = policy.host_service_ports().to_vec();
+        let policy = PolicyClient::new(policy, Arc::new(Semaphore::new(MAX_POLICY_CALLS)));
+        *context.ctx().ctx = super::policy::build_network_context(
+            policy.clone(),
+            host_service_ports,
+            published_ports,
+        );
+        Self {
+            context,
+            network_policy: policy,
+            network_lookups: Arc::new(tokio::sync::Semaphore::new(
+                crate::component::network::host::MAX_NAME_LOOKUPS,
+            )),
+        }
+    }
+
+    pub(crate) fn network_policy(&self) -> PolicyClient {
+        self.network_policy.clone()
+    }
+
+    pub(crate) fn network_lookups(&self) -> Arc<tokio::sync::Semaphore> {
+        Arc::clone(&self.network_lookups)
+    }
+}
+
+impl DeviceHost for NetworkHost {
+    fn context(&mut self) -> &mut DeviceContext {
+        &mut self.context
+    }
+}
+impl WasiView for NetworkHost {
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        self.context.ctx()
+    }
+}
+
+impl AsMut<NetworkHost> for NetworkHost {
+    fn as_mut(&mut self) -> &mut Self {
+        self
+    }
+}
+
+impl crate::box_runtime::StoreHost for NetworkHost {}
 
 pub(crate) const MAX_NAME_LOOKUPS: usize = 8;
 use crate::component::policy::MAX_NAME_BYTES;
@@ -14,79 +73,15 @@ pub(crate) const MAX_POLICY_CALLS: usize = 8;
 const MAX_NAME_ADDRESSES: usize = 32;
 const NAME_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 
-#[derive(wasmtime::component::ComponentType, wasmtime::component::Lower)]
-#[component(record)]
-pub struct NetworkConfig {
-    #[component(name = "gateway-mac")]
-    pub gateway_mac: Vec<u8>,
-    #[component(name = "gateway-ip")]
-    pub gateway_ip: Vec<u8>,
-    #[component(name = "gateway-ip6")]
-    pub gateway_ip6: Vec<u8>,
-    #[component(name = "host-service-ports")]
-    pub host_service_ports: Vec<Option<u16>>,
-    #[component(name = "published-ports")]
-    pub published_ports: Vec<PublishedPort>,
-    pub mtu: u32,
-}
-
-#[derive(wasmtime::component::ComponentType, wasmtime::component::Lower)]
-#[component(record)]
-pub struct PublishedPort {
-    #[component(name = "host-port")]
-    pub host_port: u16,
-    #[component(name = "guest-port")]
-    pub guest_port: u16,
-}
-
-#[derive(Clone, Copy, Debug, wasmtime::component::ComponentType, wasmtime::component::Lift)]
-#[component(enum)]
-#[repr(u8)]
-pub enum NetworkError {
-    #[component(name = "malformed")]
-    Malformed,
-    #[component(name = "backpressure")]
-    Backpressure,
-    #[component(name = "not-ready")]
-    NotReady,
-}
-
-pub trait NetworkHostState: Send {
-    fn network_sockets(&mut self) -> wasmtime_wasi::sockets::WasiSocketsCtxView<'_>;
-    fn network_lookups(&mut self) -> Arc<Semaphore>;
-    fn network_policy_calls(&mut self) -> Arc<Semaphore>;
-}
-
-impl NetworkHostState for DeviceHost {
-    fn network_sockets(&mut self) -> wasmtime_wasi::sockets::WasiSocketsCtxView<'_> {
-        Self::sockets(self)
-    }
-
-    fn network_lookups(&mut self) -> Arc<Semaphore> {
-        Self::network_lookups(self)
-    }
-
-    fn network_policy_calls(&mut self) -> Arc<Semaphore> {
-        Self::network_policy_calls(self)
-    }
-}
-
 struct NetworkNameLookupHost<T>(PhantomData<T>);
 
 impl<T: 'static> wasmtime::component::HasData for NetworkNameLookupHost<T> {
-    type Data<'a> = &'a mut DeviceHost;
-}
-
-struct NetworkMemoryHost;
-
-impl wasmtime::component::HasData for NetworkMemoryHost {
-    type Data<'a> = &'a mut DeviceHost;
+    type Data<'a> = &'a mut NetworkHost;
 }
 
 async fn resolve_name<T>(
-    policy: PolicyHandle,
+    policy: PolicyClient,
     lookups: Arc<Semaphore>,
-    policy_calls: Arc<Semaphore>,
     accessor: Accessor<T, WasiSockets>,
     name: String,
 ) -> Result<
@@ -101,16 +96,10 @@ async fn resolve_name<T>(
     if name.len() > MAX_NAME_BYTES {
         return Err(ErrorCode::InvalidArgument);
     }
-    let addresses = match crate::component::policy::run_policy_decision(
-        Arc::clone(&policy),
-        Arc::clone(&policy_calls),
-        {
-            let name = name.clone();
-            move |policy| policy.lookup_name(&name)
-        },
-    )
-    .await
-    .ok_or(ErrorCode::TemporaryResolverFailure)?
+    let addresses = match policy
+        .lookup_name(name.clone())
+        .await
+        .ok_or(ErrorCode::TemporaryResolverFailure)?
     {
         NameLookup::Static(addresses) => addresses,
         NameLookup::Denied => return Err(ErrorCode::AccessDenied),
@@ -131,11 +120,10 @@ async fn resolve_name<T>(
                 .map(native_address)
                 .collect::<Vec<_>>();
             drop(permit);
-            crate::component::policy::run_policy_decision(policy, policy_calls, move |policy| {
-                policy.accept_resolved(&name, &resolved)
-            })
-            .await
-            .ok_or(ErrorCode::TemporaryResolverFailure)?
+            policy
+                .accept_resolved(name, resolved)
+                .await
+                .ok_or(ErrorCode::TemporaryResolverFailure)?
         }
     };
     (!addresses.is_empty() && addresses.len() <= MAX_NAME_ADDRESSES)
@@ -170,9 +158,9 @@ fn native_address(
     }
 }
 
-impl wasmtime_wasi::p3::bindings::sockets::ip_name_lookup::Host for &mut DeviceHost {}
+impl wasmtime_wasi::p3::bindings::sockets::ip_name_lookup::Host for &mut NetworkHost {}
 
-impl<T: NetworkHostState + 'static>
+impl<T: wasmtime_wasi::WasiView + 'static>
     wasmtime_wasi::p3::bindings::sockets::ip_name_lookup::HostWithStore<T>
     for NetworkNameLookupHost<T>
 {
@@ -185,82 +173,33 @@ impl<T: NetworkHostState + 'static>
             wasmtime_wasi::p3::bindings::sockets::ip_name_lookup::ErrorCode,
         >,
     > {
-        let (policy, lookups, policy_calls) = host.with(|mut access| {
+        let (policy, lookups) = host.with(|mut access| {
             let host = access.get();
-            (
-                host.network_policy(),
-                host.network_lookups(),
-                host.network_policy_calls(),
-            )
+            (host.network_policy(), host.network_lookups())
         });
-        let resolver = host.with_getter::<WasiSockets>(T::network_sockets);
-        Ok(match policy {
-            Some(policy) => resolve_name(policy, lookups, policy_calls, resolver, name).await,
-            None => {
-                Err(wasmtime_wasi::p3::bindings::sockets::ip_name_lookup::ErrorCode::AccessDenied)
-            }
-        })
+        let resolver = host.with_getter::<WasiSockets>(T::sockets);
+        Ok(resolve_name(policy, lookups, resolver, name).await)
     }
 }
 
-pub fn network_component_linker(
+pub fn network_component_linker<T: wasmtime_wasi::WasiView + AsMut<NetworkHost> + 'static>(
     engine: &wasmtime::Engine,
-) -> wasmtime::Result<wasmtime::component::Linker<DeviceHost>> {
-    let mut linker = device_component_linker(engine)?;
-    wasmtime_wasi::p3::bindings::sockets::types::add_to_linker::<DeviceHost, WasiSockets>(
-        &mut linker,
-        DeviceHost::sockets,
-    )?;
-    super::limits::add_socket_limits(&mut linker, DeviceHost::sockets)?;
-    wasmtime_wasi::p3::bindings::sockets::ip_name_lookup::add_to_linker::<
-        DeviceHost,
-        NetworkNameLookupHost<DeviceHost>,
-    >(&mut linker, |host| host)?;
-    crate::engine::terra::host::memory::add_to_linker::<DeviceHost, NetworkMemoryHost>(
-        &mut linker,
-        |host| host,
-    )?;
-    crate::engine::terra::host::interrupt::add_to_linker::<DeviceHost, NetworkMemoryHost>(
-        &mut linker,
-        |host| host,
-    )?;
-    crate::engine::terra::host::diagnostics::add_to_linker::<DeviceHost, NetworkMemoryHost>(
-        &mut linker,
-        |host| host,
-    )?;
-    Ok(linker)
-}
-
-pub fn network_component_linker_with<T>(
-    engine: &wasmtime::Engine,
-    wasi: crate::engine::DeviceWasiGetters<T>,
-    get_host: for<'a> fn(&'a mut T) -> &'a mut DeviceHost,
-) -> wasmtime::Result<wasmtime::component::Linker<T>>
-where
-    T: NetworkHostState + 'static,
-{
-    let mut linker = crate::engine::device_component_linker_with_wasi(engine, wasi)?;
+) -> wasmtime::Result<wasmtime::component::Linker<T>> {
+    let mut linker = crate::engine::device_component_linker(engine)?;
     wasmtime_wasi::p3::bindings::sockets::types::add_to_linker::<T, WasiSockets>(
         &mut linker,
-        T::network_sockets,
+        T::sockets,
     )?;
-    super::limits::add_socket_limits(&mut linker, T::network_sockets)?;
+    super::limits::add_socket_limits(&mut linker, T::sockets)?;
     wasmtime_wasi::p3::bindings::sockets::ip_name_lookup::add_to_linker::<
         T,
         NetworkNameLookupHost<T>,
-    >(&mut linker, get_host)?;
-    crate::engine::terra::host::memory::add_to_linker::<T, NetworkMemoryHost>(
-        &mut linker,
-        get_host,
-    )?;
-    crate::engine::terra::host::interrupt::add_to_linker::<T, NetworkMemoryHost>(
-        &mut linker,
-        get_host,
-    )?;
-    crate::engine::terra::host::diagnostics::add_to_linker::<T, NetworkMemoryHost>(
-        &mut linker,
-        get_host,
-    )?;
+    >(&mut linker, AsMut::as_mut)?;
+    crate::engine::add_device_imports(&mut linker, |host: &mut T| &mut host.as_mut().context)?;
+    crate::engine::terra::host::diagnostics::add_to_linker::<
+        T,
+        wasmtime::component::HasSelf<crate::engine::DeviceContext>,
+    >(&mut linker, |host| &mut host.as_mut().context)?;
     Ok(linker)
 }
 
@@ -270,6 +209,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
     use std::thread;
     use terra_network::Policy;
+    use terra_network::PolicyHandle;
 
     struct Static;
 
@@ -301,8 +241,16 @@ mod tests {
 
     #[test]
     fn each_device_host_has_its_own_lookup_budget() {
-        let first = DeviceHost::new(1).expect("device host");
-        let second = DeviceHost::new(1).expect("device host");
+        let first = NetworkHost::new(
+            crate::engine::DeviceContext::new(1).unwrap(),
+            Arc::new(Static),
+            vec![],
+        );
+        let second = NetworkHost::new(
+            crate::engine::DeviceContext::new(1).unwrap(),
+            Arc::new(Static),
+            vec![],
+        );
         assert!(!Arc::ptr_eq(
             &first.network_lookups(),
             &second.network_lookups()
@@ -328,11 +276,8 @@ mod tests {
         assert!(
             tokio::time::timeout(
                 Duration::from_millis(10),
-                crate::component::policy::run_policy_decision(
-                    policy,
-                    Arc::new(Semaphore::new(1)),
-                    |policy| { policy.lookup_name("slow.test") }
-                ),
+                PolicyClient::new(policy, Arc::new(Semaphore::new(1)))
+                    .lookup_name("slow.test".into()),
             )
             .await
             .is_err()

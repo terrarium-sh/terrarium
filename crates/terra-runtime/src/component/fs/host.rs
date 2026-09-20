@@ -5,16 +5,17 @@ use std::{io, path::Path};
 #[cfg(windows)]
 mod windows;
 
-use wasmtime::component::{Access, HasData, HasSelf, Resource, StreamReader};
+use wasmtime::component::{Access, HasSelf, Resource, StreamReader};
 use wasmtime_wasi::{
     WasiView,
-    filesystem::{Descriptor, Dir, FsPerms, OpenMode, WasiFilesystem, WasiFilesystemView},
+    filesystem::{Descriptor, Dir, FsPerms, OpenMode, WasiFilesystem},
     p3::bindings::filesystem::{preopens, types},
 };
 
 wasmtime::component::bindgen!({
     world: "device",
     path: "../../components/fs/wit",
+    exports: { default: async },
     imports: {
  "terra:fs/host.file-events": store | trappable,
  "terra:fs/host.open-metadata-at": async | store,
@@ -25,9 +26,13 @@ wasmtime::component::bindgen!({
     with: {
         "terra:host/memory@0.1.0": crate::engine::terra::host::memory,
         "terra:host/interrupt@0.1.0": crate::engine::terra::host::interrupt,
+        "terra:mmio/types@0.1.0": crate::component::vmm::mmio::terra::mmio::types,
         "wasi:filesystem/types.descriptor": wasmtime_wasi::filesystem::Descriptor,
     },
 });
+
+pub(crate) use Device as FsComponent;
+pub use terra::mmio::types::DeviceError as FsDeviceError;
 
 #[derive(Clone)]
 pub struct ShareGrant {
@@ -89,7 +94,9 @@ impl ShareGrant {
             watch_budget: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 super::file_events::MAX_NATIVE_WATCHES,
             )),
-            event_budget: std::sync::Arc::new(tokio::sync::Semaphore::new(4096 - 2)),
+            event_budget: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                super::file_events::MAX_PENDING_FILE_EVENTS - 2,
+            )),
             directory,
             #[cfg(test)]
             watch_registration: None,
@@ -99,7 +106,8 @@ impl ShareGrant {
 
 pub fn share_notification_budgets(shares: &mut [ShareGrant]) {
     // Reserve the stream transfer and worker slots for each share.
-    let queued = 4096_usize.saturating_sub(shares.len().saturating_mul(2));
+    let queued =
+        super::file_events::MAX_PENDING_FILE_EVENTS.saturating_sub(shares.len().saturating_mul(2));
     let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(queued));
     let watches = std::sync::Arc::new(tokio::sync::Semaphore::new(
         super::file_events::MAX_NATIVE_WATCHES,
@@ -166,7 +174,7 @@ pub fn share_tag(index: usize) -> String {
 }
 
 pub struct FsHost {
-    pub device: crate::engine::DeviceHost,
+    pub device: crate::engine::DeviceContext,
     grant: ShareGrant,
     events: Option<super::file_events::FileEvents>,
     descriptor_budget: std::sync::Arc<tokio::sync::Semaphore>,
@@ -175,15 +183,44 @@ pub struct FsHost {
     pub(super) io_gate: Option<std::sync::Arc<super::stalled_io::IoGate>>,
 }
 
+impl crate::box_runtime::StoreHost for FsHost {
+    fn retire(self) {
+        let pending = std::sync::Arc::new(std::sync::Mutex::new(Some(self)));
+        let worker = pending.clone();
+        if std::thread::Builder::new()
+            .name("terra-filesystem-drop".into())
+            .spawn(move || {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime.block_on(async {
+                        let host = worker
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .take();
+                        drop(host);
+                    }),
+                    Err(_) => std::mem::forget(worker),
+                }
+            })
+            .is_err()
+        {
+            // ponytail: retain filesystem resources if cleanup cannot start; retry if thread exhaustion becomes recoverable.
+            std::mem::forget(pending);
+        }
+    }
+}
+
 impl FsHost {
     #[must_use]
-    pub fn new(device: crate::engine::DeviceHost, grant: ShareGrant) -> Self {
+    pub fn new(device: crate::engine::DeviceContext, grant: ShareGrant) -> Self {
         Self::with_resource_capacity(device, grant, 16_384)
     }
 
     #[must_use]
     pub fn with_resource_capacity(
-        mut device: crate::engine::DeviceHost,
+        mut device: crate::engine::DeviceContext,
         grant: ShareGrant,
         resource_capacity: usize,
     ) -> Self {
@@ -296,23 +333,19 @@ impl<T: Send + 'static> terra::fs::host::HostWithStore<T> for HasSelf<FsHost> {
                 .map_err(|_| Error::Io)?;
             Ok((directory, permit))
         })?;
-        let descriptor = tokio::task::spawn_blocking(move || {
+        let (descriptor, permit) = tokio::task::spawn_blocking(move || {
             let file = open_metadata_file(&directory.dir, &name)?;
-            if file.metadata().map_err(|_| Error::Io)?.is_dir() {
-                Ok(Descriptor::Dir(Dir::new(
-                    file,
-                    directory.perms,
-                    OpenMode::empty(),
-                    false,
-                )))
+            let descriptor = if file.metadata().map_err(|_| Error::Io)?.is_dir() {
+                Descriptor::Dir(Dir::new(file, directory.perms, OpenMode::empty(), false))
             } else {
-                Ok(Descriptor::File(wasmtime_wasi::filesystem::File::new(
+                Descriptor::File(wasmtime_wasi::filesystem::File::new(
                     file,
                     directory.perms,
                     OpenMode::empty(),
                     false,
-                )))
-            }
+                ))
+            };
+            Ok::<_, Error>((descriptor, permit))
         })
         .await
         .map_err(|_| Error::Io)??;
@@ -549,59 +582,33 @@ fn set_mode(descriptor: &Descriptor, mode: u32) -> Result<(), terra::fs::host::E
     }
 }
 
-struct MountPreopens;
-
-impl HasData for MountPreopens {
-    type Data<'a> = &'a mut FsHost;
-}
-
 impl preopens::Host for FsHost {
     fn get_directories(&mut self) -> wasmtime::Result<Vec<(Resource<Descriptor>, String)>> {
         Ok(vec![(self.grant_directory()?, "/".into())])
     }
 }
 
-pub fn fs_component_linker(
-    engine: &wasmtime::Engine,
-) -> wasmtime::Result<wasmtime::component::Linker<FsHost>> {
-    let mut linker = crate::engine::device_component_linker(engine)?;
-    types::add_to_linker::<_, WasiFilesystem>(&mut linker, FsHost::filesystem)?;
-    add_descriptor_lifecycle(&mut linker, FsHost::filesystem, |host| host)?;
-    terra::fs::host::add_to_linker::<FsHost, HasSelf<FsHost>>(&mut linker, |host| host)?;
-    preopens::add_to_linker::<_, MountPreopens>(&mut linker, |host| host)?;
-    crate::engine::terra::host::memory::add_to_linker::<FsHost, crate::engine::TerraHost>(
-        &mut linker,
-        |host| &mut host.device,
-    )?;
-    crate::engine::terra::host::interrupt::add_to_linker::<FsHost, crate::engine::TerraHost>(
-        &mut linker,
-        |host| &mut host.device,
-    )?;
-    Ok(linker)
+impl crate::engine::DeviceHost for FsHost {
+    fn context(&mut self) -> &mut crate::engine::DeviceContext {
+        &mut self.device
+    }
+}
+impl AsMut<FsHost> for FsHost {
+    fn as_mut(&mut self) -> &mut Self {
+        self
+    }
 }
 
-pub fn fs_component_linker_with<T>(
+pub fn fs_component_linker<T: WasiView + AsMut<FsHost> + 'static>(
     engine: &wasmtime::Engine,
-    wasi: crate::engine::DeviceWasiGetters<T>,
-    filesystem: for<'a> fn(&'a mut T) -> wasmtime_wasi::filesystem::WasiFilesystemCtxView<'a>,
-    host: for<'a> fn(&'a mut T) -> &'a mut FsHost,
-) -> wasmtime::Result<wasmtime::component::Linker<T>>
-where
-    T: Send + 'static,
-{
-    let mut linker = crate::engine::device_component_linker_with_wasi(engine, wasi)?;
-    types::add_to_linker::<T, WasiFilesystem>(&mut linker, filesystem)?;
-    add_descriptor_lifecycle(&mut linker, filesystem, host)?;
-    terra::fs::host::add_to_linker::<T, HasSelf<FsHost>>(&mut linker, host)?;
-    linker
-        .instance("wasi:filesystem/preopens@0.3.1")?
-        .func_wrap("get-directories", move |mut store, (): ()| {
-            Ok((vec![(
-                host(store.data_mut()).grant_directory()?,
-                String::from("/"),
-            )],))
-        })?;
-    crate::engine::add_device_imports(&mut linker, move |store| &mut host(store).device)?;
+) -> wasmtime::Result<wasmtime::component::Linker<T>> {
+    use wasmtime_wasi::filesystem::WasiFilesystemView;
+    let mut linker = crate::engine::device_component_linker(engine)?;
+    types::add_to_linker::<T, WasiFilesystem>(&mut linker, T::filesystem)?;
+    add_descriptor_lifecycle(&mut linker, T::filesystem, AsMut::as_mut)?;
+    terra::fs::host::add_to_linker::<T, HasSelf<FsHost>>(&mut linker, AsMut::as_mut)?;
+    preopens::add_to_linker::<T, HasSelf<FsHost>>(&mut linker, AsMut::as_mut)?;
+    crate::engine::add_device_imports(&mut linker, |host: &mut T| &mut host.as_mut().device)?;
     Ok(linker)
 }
 
@@ -665,6 +672,80 @@ fn add_descriptor_lifecycle<T: Send + 'static>(
 mod metadata_tests {
     use super::*;
     use std::io::Read;
+
+    #[test]
+    fn cancelled_metadata_open_keeps_its_permit_until_the_blocking_job_finishes() {
+        use terra::fs::host::HostWithStore;
+        use wasmtime_wasi::p3::bindings::filesystem::preopens::Host;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join("file"), b"metadata").unwrap();
+            let grant = ShareGrant::new(&root.path().canonicalize().unwrap(), true).unwrap();
+            let mut host = FsHost::with_resource_capacity(
+                crate::engine::DeviceContext::new(4096).unwrap(),
+                grant,
+                2,
+            );
+            let parent = host.get_directories().unwrap().remove(0).0;
+            let budget = host.descriptor_budget.clone();
+            let engine = crate::engine::device_engine().unwrap();
+            let mut store = wasmtime::Store::new(&engine, host);
+            let (entered, started) = tokio::sync::oneshot::channel();
+            let (release, blocked) = std::sync::mpsc::channel();
+            let occupied_pool = tokio::task::spawn_blocking(move || {
+                entered.send(()).unwrap();
+                let _ = blocked.recv_timeout(std::time::Duration::from_secs(5));
+            });
+            started.await.unwrap();
+            store
+                .run_concurrent(async |accessor| {
+                    let accessor = accessor.with_getter::<HasSelf<FsHost>>(|host| host);
+                    {
+                        let open = HasSelf::<FsHost>::open_metadata_at(
+                            &accessor,
+                            Resource::new_borrow(parent.rep()),
+                            "file".into(),
+                        );
+                        tokio::pin!(open);
+                        assert!(futures_util::poll!(&mut open).is_pending());
+                    }
+                    assert_eq!(budget.available_permits(), 0);
+                    release.send(()).unwrap();
+                    occupied_pool.await.unwrap();
+                    drop(
+                        tokio::time::timeout(std::time::Duration::from_secs(5), budget.acquire())
+                            .await
+                            .unwrap()
+                            .unwrap(),
+                    );
+                    let descriptor = HasSelf::<FsHost>::open_metadata_at(
+                        &accessor,
+                        Resource::new_borrow(parent.rep()),
+                        "file".into(),
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(budget.available_permits(), 0);
+                    accessor.with(|mut access| {
+                        access.get().retire_descriptor(descriptor.rep()).unwrap();
+                    });
+                })
+                .await
+                .unwrap();
+            drop(
+                tokio::time::timeout(std::time::Duration::from_secs(5), budget.acquire())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        });
+    }
 
     #[test]
     fn metadata_handle_keeps_the_inode_without_granting_content_access() {

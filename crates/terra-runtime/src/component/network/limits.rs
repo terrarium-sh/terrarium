@@ -183,19 +183,23 @@ fn set_option<S>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::{DeviceHost, device_engine};
+    use crate::engine::{NetworkHost, device_engine};
     use wasmtime_wasi::sockets::WasiSocketsView;
+
+    struct Deny;
+    impl terra_network::Policy for Deny {
+        fn allows(&self, _: std::net::IpAddr, _: Option<u16>) -> bool {
+            false
+        }
+    }
 
     #[tokio::test]
     async fn socket_defaults_and_resource_exhaustion_are_enforced() {
-        struct Deny;
-        impl terra_network::Policy for Deny {
-            fn allows(&self, _: std::net::IpAddr, _: Option<u16>) -> bool {
-                false
-            }
-        }
-        let mut host = DeviceHost::new(4096).unwrap();
-        host.set_network_policy(std::sync::Arc::new(Deny), vec![], vec![]);
+        let mut host = NetworkHost::new(
+            crate::engine::DeviceContext::new(4096).unwrap(),
+            std::sync::Arc::new(Deny),
+            vec![],
+        );
         host.sockets().table.set_max_capacity(2);
         let tcp = create_tcp(host.sockets(), IpAddressFamily::Ipv4).unwrap();
         let udp = create_udp(host.sockets(), IpAddressFamily::Ipv4)
@@ -222,7 +226,11 @@ mod tests {
 
     #[test]
     fn oversized_socket_options_fail_before_host_allocation() {
-        let mut host = DeviceHost::new(4096).unwrap();
+        let mut host = NetworkHost::new(
+            crate::engine::DeviceContext::new(4096).unwrap(),
+            std::sync::Arc::new(Deny),
+            vec![],
+        );
         let result = set_option(
             host.sockets(),
             Resource::<TcpSocket>::new_borrow(u32::MAX),
@@ -243,11 +251,11 @@ mod tests {
             .is_err()
         );
         let engine = device_engine().unwrap();
-        let mut upstream = Linker::<DeviceHost>::new(&engine);
+        let mut upstream = Linker::<NetworkHost>::new(&engine);
         wasmtime_wasi::p3::bindings::sockets::types::add_to_linker::<
-            DeviceHost,
+            NetworkHost,
             wasmtime_wasi::sockets::WasiSockets,
-        >(&mut upstream, DeviceHost::sockets)
+        >(&mut upstream, NetworkHost::sockets)
         .unwrap();
         let mut types = upstream.instance(SOCKETS_TYPES_INTERFACE).unwrap();
         assert!(
@@ -255,12 +263,14 @@ mod tests {
                 .func_wrap(
                     "[static]tcp-socket.create",
                     |mut store, (family,): (IpAddressFamily,)| {
-                        socket_result(create_tcp(DeviceHost::sockets(store.data_mut()), family))
+                        socket_result(create_tcp(NetworkHost::sockets(store.data_mut()), family))
                     },
                 )
                 .is_err()
         );
-        let linker = super::super::host::network_component_linker(&engine).unwrap();
+        let linker =
+            super::super::host::network_component_linker::<crate::engine::NetworkHost>(&engine)
+                .unwrap();
         let component = wasmtime::component::Component::new(
             &engine,
             r#"

@@ -1,11 +1,11 @@
 #![allow(clippy::unwrap_used)]
 
 use terra_runtime::component::block::backing::{BackingError, BlockBacking, FileDisk};
-use terra_runtime::engine::{DeviceHost, terra::host::memory::Host};
+use terra_runtime::engine::{DeviceContext, terra::host::memory::Host};
 
 #[test]
 fn hostile_memory_imports_reject_overflow_and_oversized_copies() {
-    let mut host = DeviceHost::new(4096).unwrap();
+    let mut host = DeviceContext::new(4096).unwrap();
     host.write(0, vec![0xa5; 4096]).unwrap();
     for (offset, length) in [(u64::MAX, 2), (4095, 2), (0, u64::MAX)] {
         assert!(host.read(offset, length).is_err());

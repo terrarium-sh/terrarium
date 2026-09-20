@@ -2,14 +2,14 @@
 
 use terra_runtime::{
     component::fs::host::{FsHost, ShareGrant},
-    engine::DeviceHost,
+    engine::DeviceContext,
 };
 use wasmtime::component::Resource;
 use wasmtime_wasi::p3::bindings::filesystem::preopens::Host as _;
 
 fn host(root: &std::path::Path, readonly: bool) -> FsHost {
     FsHost::new(
-        DeviceHost::new(4096).expect("guest RAM"),
+        DeviceContext::new(4096).expect("guest RAM"),
         ShareGrant::new(&root.canonicalize().expect("canonical path"), readonly)
             .expect("share grant"),
     )

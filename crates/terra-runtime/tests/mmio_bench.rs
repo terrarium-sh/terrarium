@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 use terra_runtime::{
     SyntheticRam,
     box_runtime::{BoxHost, BoxRuntime, BoxRuntimeHandle},
-    component::{Interrupt, mem::host::MemHost},
-    engine::{DeviceHost, device_engine, trusted_component},
+    component::Interrupt,
+    engine::{DeviceContext, device_engine, trusted_component},
 };
 
 const WARMUP_SAMPLES: usize = 128;
@@ -121,15 +121,12 @@ async fn start_memory() -> (Duration, RunningMemory) {
     let interrupt: Interrupt = std::sync::Arc::new(|_| Ok(()));
     let channel = terra_runtime::component::mem::instantiate_shared(
         &mut runtime,
-        MemHost::new(DeviceHost::with_ram(
-            SyntheticRam::new(64 * 1024).expect("RAM"),
-        )),
+        DeviceContext::with_ram(SyntheticRam::new(64 * 1024).expect("RAM")),
         &component,
         interrupt,
     )
-    .await
     .expect("memory device");
-    let runtime = runtime.start();
+    let runtime = runtime.prepare().await.expect("runtime prepared").start();
     (start.elapsed(), RunningMemory { channel, runtime })
 }
 

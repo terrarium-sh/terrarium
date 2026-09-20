@@ -5,7 +5,8 @@ use crate::component::vmm::mmio::Error;
 pub use crate::component::vmm::mmio::exports::terra::mmio::interrupts::{
     IoapicReply, X86Interrupt,
 };
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
+use tokio::sync::{mpsc as queue, watch};
 use wasmtime::component::TypedFunc;
 
 pub(crate) type Stage = TypedFunc<(), (Result<(), Error>,)>;
@@ -40,12 +41,85 @@ fn validate_x86_interrupts(interrupts: &[X86Interrupt], vcpus: u8) -> wasmtime::
     Ok(())
 }
 
+type CompletionSender = watch::Sender<Option<Result<(), String>>>;
+
+struct InterruptQueue<T> {
+    sender: Arc<Mutex<Option<queue::Sender<T>>>>,
+    completion: watch::Receiver<Option<Result<(), String>>>,
+}
+
+impl<T> Clone for InterruptQueue<T> {
+    fn clone(&self) -> Self {
+        Self {
+            sender: Arc::clone(&self.sender),
+            completion: self.completion.clone(),
+        }
+    }
+}
+
+impl<T> InterruptQueue<T> {
+    fn send(&self, command: T) -> wasmtime::Result<()> {
+        self.sender
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .ok_or_else(|| wasmtime::Error::msg("interrupt queue closed"))?
+            .try_send(command)
+            .map_err(|error| wasmtime::Error::msg(format!("interrupt queue: {error}")))
+    }
+
+    async fn close(&self) -> wasmtime::Result<()> {
+        self.sender
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let mut completion = self.completion.clone();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            completion
+                .wait_for(Option::is_some)
+                .await
+                .map_err(|_| wasmtime::Error::msg("interrupt worker stopped without completion"))?
+                .clone()
+                .ok_or_else(|| wasmtime::Error::msg("interrupt completion missing"))?
+                .map_err(wasmtime::Error::msg)
+        })
+        .await
+        .map_err(|_| wasmtime::Error::msg("interrupt shutdown timed out"))?
+    }
+}
+
+fn interrupt_queue<T>() -> (InterruptQueue<T>, queue::Receiver<T>, CompletionSender) {
+    let (sender, receiver) = queue::channel(256);
+    let (finished, completion) = watch::channel(None);
+    (
+        InterruptQueue {
+            sender: Arc::new(Mutex::new(Some(sender))),
+            completion,
+        },
+        receiver,
+        finished,
+    )
+}
+
+async fn complete_interrupt_worker(
+    operation: impl Future<Output = wasmtime::Result<()>>,
+    completion: CompletionSender,
+) -> wasmtime::Result<()> {
+    let result = operation.await;
+    completion.send_replace(Some(
+        result
+            .as_ref()
+            .copied()
+            .map_err(|error| format!("{error:#}")),
+    ));
+    result
+}
+
 enum Command {
     Line(u8, bool),
     DeviceLine(super::machine::DeviceKind, u32, bool),
     Access(u8, u8, bool, u32),
     Eoi(u8),
-    Close,
 }
 struct Pending {
     command: Command,
@@ -54,17 +128,15 @@ struct Pending {
 
 #[derive(Clone)]
 pub struct IoApicHandle {
-    sender: tokio::sync::mpsc::Sender<Pending>,
+    queue: InterruptQueue<Pending>,
 }
 
 impl IoApicHandle {
     pub fn set_line(&self, slot: u8, level: bool) -> wasmtime::Result<()> {
-        self.sender
-            .try_send(Pending {
-                command: Command::Line(slot, level),
-                response: None,
-            })
-            .map_err(|error| wasmtime::Error::msg(format!("IOAPIC queue: {error}")))
+        self.queue.send(Pending {
+            command: Command::Line(slot, level),
+            response: None,
+        })
     }
 
     #[must_use]
@@ -75,13 +147,10 @@ impl IoApicHandle {
     ) -> crate::component::Interrupt {
         let handle = self.clone();
         Arc::new(move |level| {
-            handle
-                .sender
-                .try_send(Pending {
-                    command: Command::DeviceLine(kind, u32::try_from(ordinal)?, level),
-                    response: None,
-                })
-                .map_err(|error| wasmtime::Error::msg(format!("IOAPIC queue: {error}")))
+            handle.queue.send(Pending {
+                command: Command::DeviceLine(kind, u32::try_from(ordinal)?, level),
+                response: None,
+            })
         })
     }
 
@@ -93,18 +162,16 @@ impl IoApicHandle {
         self.request(Command::Eoi(vector)).map(|_| ())
     }
 
-    pub fn close(&self) -> wasmtime::Result<()> {
-        self.request(Command::Close).map(|_| ())
+    pub async fn close(&self) -> wasmtime::Result<()> {
+        self.queue.close().await
     }
 
     fn request(&self, command: Command) -> wasmtime::Result<u32> {
         let (response, receiver) = mpsc::sync_channel(1);
-        self.sender
-            .try_send(Pending {
-                command,
-                response: Some(response),
-            })
-            .map_err(|error| wasmtime::Error::msg(format!("IOAPIC queue: {error}")))?;
+        self.queue.send(Pending {
+            command,
+            response: Some(response),
+        })?;
         receiver
             .recv_timeout(std::time::Duration::from_secs(5))
             .map_err(|error| wasmtime::Error::msg(format!("IOAPIC response: {error}")))?
@@ -113,7 +180,13 @@ impl IoApicHandle {
 
 impl BoxRuntime {
     pub async fn grant_ioapic(&mut self, inject: Inject) -> wasmtime::Result<IoApicHandle> {
-        let vcpus = self.store.data().platform.machine_config()?.vcpus();
+        let vcpus = self
+            .store
+            .data()
+            .platform
+            .machine_config()
+            .ok_or_else(|| wasmtime::Error::msg("VM has no machine configuration"))?
+            .vcpus();
         let router = self
             .mmio
             .as_ref()
@@ -127,56 +200,52 @@ impl BoxRuntime {
         );
         let (result,) = stage.call_async(&mut self.store, ()).await?;
         result.map_err(|error| wasmtime::Error::msg(format!("IOAPIC grant: {error:?}")))?;
-        let (sender, mut receiver) = tokio::sync::mpsc::channel::<Pending>(256);
+        let (queue, mut receiver, completion) = interrupt_queue::<Pending>();
         self.register_loop(Box::new(move |accessor| {
-            Box::pin(async move {
-                while let Some(pending) = receiver.recv().await {
-                    let close = matches!(pending.command, Command::Close);
-                    let (value, interrupts) = match pending.command {
-                        Command::Line(slot, level) => {
-                            let (result,) = line.call_concurrent(accessor, (slot, level)).await?;
-                            (0, result.map_err(wasm_error)?)
-                        }
-                        Command::DeviceLine(kind, ordinal, level) => {
-                            let (result,) = device_line
-                                .call_concurrent(accessor, (kind, ordinal, level))
-                                .await?;
-                            (0, result.map_err(wasm_error)?)
-                        }
-                        Command::Eoi(vector) => {
-                            let (result,) = eoi.call_concurrent(accessor, (vector,)).await?;
-                            (0, result.map_err(wasm_error)?)
-                        }
-                        Command::Access(offset, width, write, value) => {
-                            let (result,) = access
-                                .call_concurrent(accessor, (offset, width, write, value))
-                                .await?;
-                            match result {
-                                Ok(result) => (result.value, result.interrupts),
-                                Err(error) if is_guest_ioapic_error(error) => (0, Vec::new()),
-                                Err(error) => return Err(wasm_error(error)),
+            Box::pin(complete_interrupt_worker(
+                async move {
+                    while let Some(pending) = receiver.recv().await {
+                        let (value, interrupts) = match pending.command {
+                            Command::Line(slot, level) => {
+                                let (result,) =
+                                    line.call_concurrent(accessor, (slot, level)).await?;
+                                (0, result.map_err(wasm_error)?)
                             }
+                            Command::DeviceLine(kind, ordinal, level) => {
+                                let (result,) = device_line
+                                    .call_concurrent(accessor, (kind, ordinal, level))
+                                    .await?;
+                                (0, result.map_err(wasm_error)?)
+                            }
+                            Command::Eoi(vector) => {
+                                let (result,) = eoi.call_concurrent(accessor, (vector,)).await?;
+                                (0, result.map_err(wasm_error)?)
+                            }
+                            Command::Access(offset, width, write, value) => {
+                                let (result,) = access
+                                    .call_concurrent(accessor, (offset, width, write, value))
+                                    .await?;
+                                match result {
+                                    Ok(result) => (result.value, result.interrupts),
+                                    Err(error) if is_guest_ioapic_error(error) => (0, Vec::new()),
+                                    Err(error) => return Err(wasm_error(error)),
+                                }
+                            }
+                        };
+                        validate_x86_interrupts(&interrupts, vcpus)?;
+                        for interrupt in interrupts {
+                            inject(interrupt)?;
                         }
-                        Command::Close => (0, Vec::new()),
-                    };
-                    validate_x86_interrupts(&interrupts, vcpus)?;
-                    for interrupt in interrupts {
-                        inject(interrupt)?;
+                        if let Some(response) = pending.response {
+                            let _ = response.send(Ok(value));
+                        }
                     }
-                    if close {
-                        receiver.close();
-                    }
-                    if let Some(response) = pending.response {
-                        let _ = response.send(Ok(value));
-                    }
-                    if close {
-                        return Ok(());
-                    }
-                }
-                Ok(())
-            })
+                    Ok(())
+                },
+                completion,
+            ))
         }))?;
-        Ok(IoApicHandle { sender })
+        Ok(IoApicHandle { queue })
     }
 }
 
@@ -202,6 +271,61 @@ fn is_guest_ioapic_error(error: Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn saturated_interrupt_queue_drains_after_a_cancelled_close() {
+        use futures_util::FutureExt;
+
+        let (queue, mut receiver, completion) = interrupt_queue();
+        let retained = queue.clone();
+        for value in 0..256 {
+            queue.send(value).unwrap();
+        }
+        assert!(queue.send(256).is_err());
+        {
+            let closing = queue.close();
+            tokio::pin!(closing);
+            assert!(closing.as_mut().now_or_never().is_none());
+        }
+        assert!(retained.send(257).is_err());
+        complete_interrupt_worker(
+            async move {
+                for value in 0..256 {
+                    assert_eq!(receiver.recv().await, Some(value));
+                }
+                assert_eq!(receiver.recv().await, None);
+                Ok(())
+            },
+            completion,
+        )
+        .await
+        .unwrap();
+        retained.close().await.unwrap();
+        queue.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn interrupt_close_reports_worker_failure_and_abandonment() {
+        let (queue, _receiver, completion) = interrupt_queue::<()>();
+        let error =
+            complete_interrupt_worker(async { wasmtime::bail!("injection failed") }, completion)
+                .await
+                .unwrap_err();
+        assert_eq!(
+            queue.close().await.unwrap_err().to_string(),
+            error.to_string()
+        );
+        let (queue, _receiver, completion) = interrupt_queue::<()>();
+        drop(completion);
+        assert!(
+            queue
+                .close()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("without completion")
+        );
+    }
 
     fn interrupt(vector: u8, destination: u8) -> X86Interrupt {
         X86Interrupt {
@@ -243,14 +367,11 @@ pub(crate) type ClearLines = TypedFunc<
     (Result<Vec<crate::component::vmm::mmio::exports::terra::mmio::interrupts::IrqLevel>, Error>,),
 >;
 
-enum GsiCommand {
-    Level(super::machine::DeviceKind, u32, bool),
-    Close(mpsc::SyncSender<()>),
-}
+struct GsiCommand(super::machine::DeviceKind, u32, bool);
 
 #[derive(Clone)]
 pub struct IrqHandle {
-    sender: tokio::sync::mpsc::Sender<GsiCommand>,
+    queue: InterruptQueue<GsiCommand>,
 }
 
 impl IrqHandle {
@@ -260,22 +381,12 @@ impl IrqHandle {
         kind: super::machine::DeviceKind,
         ordinal: usize,
     ) -> crate::component::Interrupt {
-        let sender = self.sender.clone();
-        Arc::new(move |level| {
-            sender
-                .try_send(GsiCommand::Level(kind, u32::try_from(ordinal)?, level))
-                .map_err(|error| wasmtime::Error::msg(format!("IRQ queue: {error}")))
-        })
+        let queue = self.queue.clone();
+        Arc::new(move |level| queue.send(GsiCommand(kind, u32::try_from(ordinal)?, level)))
     }
 
-    pub fn close(&self) -> wasmtime::Result<()> {
-        let (response, receiver) = mpsc::sync_channel(1);
-        self.sender
-            .try_send(GsiCommand::Close(response))
-            .map_err(|error| wasmtime::Error::msg(format!("IRQ queue: {error}")))?;
-        receiver
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .map_err(|error| wasmtime::Error::msg(format!("IRQ response: {error}")))
+    pub async fn close(&self) -> wasmtime::Result<()> {
+        self.queue.close().await
     }
 }
 
@@ -295,42 +406,36 @@ impl BoxRuntime {
         );
         let (result,) = stage.call_async(&mut self.store, ()).await?;
         result.map_err(wasm_error)?;
-        let (sender, mut receiver) = tokio::sync::mpsc::channel(256);
+        let (queue, mut receiver, completion) = interrupt_queue();
         self.register_loop(Box::new(move |accessor| {
-            Box::pin(async move {
-                while let Some(command) = receiver.recv().await {
-                    match command {
-                        GsiCommand::Level(kind, ordinal, level) => {
-                            let (result,) = line
-                                .call_concurrent(accessor, (kind, ordinal, level))
-                                .await?;
-                            if let Some(change) = result.map_err(wasm_error)? {
-                                inject(change.gsi, change.asserted)?;
-                            }
-                        }
-                        GsiCommand::Close(response) => {
-                            let (result,) = clear.call_concurrent(accessor, ()).await?;
-                            let changes = result.map_err(wasm_error)?;
-                            if changes.len() > IOAPIC_PINS
-                                || changes
-                                    .iter()
-                                    .any(|change| change.asserted || !is_x86_irq_line(change.gsi))
-                            {
-                                return Err(wasmtime::Error::msg("invalid IRQ cleanup batch"));
-                            }
-                            for change in changes {
-                                inject(change.gsi, false)?;
-                            }
-                            receiver.close();
-                            let _ = response.send(());
-                            return Ok(());
+            Box::pin(complete_interrupt_worker(
+                async move {
+                    while let Some(GsiCommand(kind, ordinal, level)) = receiver.recv().await {
+                        let (result,) = line
+                            .call_concurrent(accessor, (kind, ordinal, level))
+                            .await?;
+                        if let Some(change) = result.map_err(wasm_error)? {
+                            inject(change.gsi, change.asserted)?;
                         }
                     }
-                }
-                Ok(())
-            })
+                    let (result,) = clear.call_concurrent(accessor, ()).await?;
+                    let changes = result.map_err(wasm_error)?;
+                    if changes.len() > IOAPIC_PINS
+                        || changes
+                            .iter()
+                            .any(|change| change.asserted || !is_x86_irq_line(change.gsi))
+                    {
+                        return Err(wasmtime::Error::msg("invalid IRQ cleanup batch"));
+                    }
+                    for change in changes {
+                        inject(change.gsi, false)?;
+                    }
+                    Ok(())
+                },
+                completion,
+            ))
         }))?;
-        Ok(IrqHandle { sender })
+        Ok(IrqHandle { queue })
     }
 }
 

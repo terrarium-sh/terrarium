@@ -6,7 +6,8 @@ use tokio::sync::Notify;
 use wasmtime::component::{Accessor, Lift, TypedFunc};
 
 use super::Interrupt;
-use crate::box_runtime::{BoxHost, BoxRuntime};
+use crate::box_runtime::{DeviceWorker, StoreHost, StoreState};
+use crate::engine::DeviceHost;
 
 pub(crate) struct Worker<E> {
     pub run: TypedFunc<(), (Result<(), E>,)>,
@@ -14,24 +15,22 @@ pub(crate) struct Worker<E> {
 }
 
 impl<E: Lift + std::fmt::Debug + Send + Sync + 'static> Worker<E> {
-    pub fn register(
+    pub fn register<H: StoreHost + DeviceHost>(
         self,
-        runtime: &mut BoxRuntime,
+        runtime: &mut DeviceWorker<H>,
         wake: Arc<Notify>,
         name: &'static str,
-        read_interrupt: impl Fn(&mut BoxHost) -> wasmtime::Result<bool> + Send + Sync + 'static,
     ) -> wasmtime::Result<()> {
         runtime.register_loop(Box::new(move |accessor| {
-            Box::pin(self.drive(accessor, wake, name, read_interrupt))
+            Box::pin(self.drive(accessor, wake, name))
         }))
     }
 
-    pub(crate) async fn drive(
+    pub(crate) async fn drive<H: StoreHost + DeviceHost>(
         self,
-        accessor: &Accessor<BoxHost>,
+        accessor: &Accessor<StoreState<H>>,
         wake: Arc<Notify>,
         name: &'static str,
-        read_interrupt: impl Fn(&mut BoxHost) -> wasmtime::Result<bool> + Send + Sync,
     ) -> wasmtime::Result<()> {
         let running = self.run.call_concurrent(accessor, ());
         tokio::pin!(running);
@@ -43,7 +42,11 @@ impl<E: Lift + std::fmt::Debug + Send + Sync + 'static> Worker<E> {
                 },
                 () = wake.notified() => false,
             };
-            let level = accessor.with(|mut store| read_interrupt(store.data_mut()))?;
+            let level = accessor.with(|mut store| {
+                let host = store.data_mut().context();
+                host.end_window();
+                host.interrupt_level()
+            });
             (self.interrupt)(level)?;
             if finished {
                 return Ok(());

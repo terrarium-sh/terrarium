@@ -411,7 +411,7 @@ mod block_component_tests {
     use super::super::component::vmm::mmio::{Operation, Reply, Request};
     use super::super::engine::{
         Completion, DeviceError, DiskGrant, Range, block_component_linker, device_engine,
-        device_store, precompile_component,
+        precompile_component, test_support::device_store,
     };
     use super::super::{BoundedDisk, SyntheticRam};
     use std::pin::Pin;
@@ -454,7 +454,7 @@ mod block_component_tests {
     }
 
     struct Fixture {
-        store: wasmtime::Store<super::super::engine::DeviceHost>,
+        store: wasmtime::Store<super::super::engine::BlockHost>,
         execute: Execute,
         configure: Configure,
         serve: Serve,
@@ -462,13 +462,13 @@ mod block_component_tests {
 
     struct ReplySink(Arc<Mutex<Option<Reply>>>);
 
-    impl StreamConsumer<super::super::engine::DeviceHost> for ReplySink {
+    impl StreamConsumer<super::super::engine::BlockHost> for ReplySink {
         type Item = Reply;
 
         fn poll_consume(
             self: Pin<&mut Self>,
             _: &mut Context<'_>,
-            store: StoreContextMut<super::super::engine::DeviceHost>,
+            store: StoreContextMut<super::super::engine::BlockHost>,
             mut source: Source<'_, Self::Item>,
             finish: bool,
         ) -> Poll<wasmtime::Result<StreamResult>> {
@@ -530,15 +530,17 @@ mod block_component_tests {
     async fn fixture(
         capacity_sectors: usize,
         readonly: bool,
-    ) -> (Linker<super::super::engine::DeviceHost>, Fixture) {
+    ) -> (Linker<super::super::engine::BlockHost>, Fixture) {
         let engine = device_engine().expect("engine builds");
         let linker = block_component_linker(&engine).expect("block imports link");
-        let mut store = device_store(&engine, RAM).expect("store builds");
         let mut disk = BoundedDisk::new(capacity_sectors * 512, readonly);
         if !readonly {
             disk.write(3 * 512, &[0xABu8; 512]).ok();
         }
-        store.data_mut().set_disk(DiskGrant::Mem(disk));
+        let mut store = device_store(
+            &engine,
+            crate::engine::BlockHost::new(SyntheticRam::new(RAM).unwrap(), DiskGrant::Mem(disk)),
+        );
         let component =
             Component::new(&engine, component_bytes()).expect("block component compiles");
         let instance = linker
@@ -664,6 +666,7 @@ mod block_component_tests {
         fixture
             .store
             .data()
+            .context
             .guest_read(STATUS, 1)
             .expect("status readable")[0]
     }
@@ -674,6 +677,7 @@ mod block_component_tests {
         fixture
             .store
             .data_mut()
+            .context
             .guest_write(DATA, &[0xCDu8; 512])
             .expect("payload staged");
         let (result,) = fixture
@@ -683,10 +687,11 @@ mod block_component_tests {
             .expect("write runs");
         assert_eq!(result, 0);
         assert_eq!(status(&fixture), 0);
-        assert!(fixture.store.data_mut().drain_signal());
+        assert!(fixture.store.data_mut().context.drain_signal());
         fixture
             .store
             .data_mut()
+            .context
             .guest_write(DATA, &[0u8; 512])
             .expect("buffer cleared");
         let (result,) = fixture
@@ -699,6 +704,7 @@ mod block_component_tests {
             fixture
                 .store
                 .data()
+                .context
                 .guest_read(DATA, 512)
                 .expect("read back"),
             [0xCDu8; 512]
@@ -711,6 +717,7 @@ mod block_component_tests {
         fixture
             .store
             .data_mut()
+            .context
             .guest_write(DATA, &[0x5A; 1536])
             .expect("payload staged");
         let (status,) = fixture
@@ -726,6 +733,7 @@ mod block_component_tests {
         fixture
             .store
             .data_mut()
+            .context
             .guest_write(DATA, &discard)
             .expect("discard range staged");
         let (status,) = fixture
@@ -744,6 +752,7 @@ mod block_component_tests {
         let contents = fixture
             .store
             .data()
+            .context
             .guest_read(DATA, 1536)
             .expect("read back");
         assert_eq!(&contents[..512], &[0x5A; 512]);
@@ -757,11 +766,13 @@ mod block_component_tests {
         fixture
             .store
             .data_mut()
+            .context
             .guest_write(DATA, &[0x11u8; 512])
             .expect("first half staged");
         fixture
             .store
             .data_mut()
+            .context
             .guest_write(DATA + 512, &[0x22u8; 512])
             .expect("second half staged");
         let ranges = vec![
@@ -783,11 +794,13 @@ mod block_component_tests {
         fixture
             .store
             .data_mut()
+            .context
             .guest_write(DATA, &[0u8; 512])
             .expect("buffer cleared");
         fixture
             .store
             .data_mut()
+            .context
             .guest_write(DATA + 512, &[0u8; 512])
             .expect("buffer cleared");
         let ranges = vec![
@@ -810,6 +823,7 @@ mod block_component_tests {
             fixture
                 .store
                 .data()
+                .context
                 .guest_read(DATA, 512)
                 .expect("first back"),
             [0x11u8; 512]
@@ -818,6 +832,7 @@ mod block_component_tests {
             fixture
                 .store
                 .data()
+                .context
                 .guest_read(DATA + 512, 512)
                 .expect("second back"),
             [0x22u8; 512]
@@ -830,6 +845,7 @@ mod block_component_tests {
         fixture
             .store
             .data_mut()
+            .context
             .guest_write(DATA, &[0xCDu8; 512])
             .expect("payload staged");
         let (result,) = fixture
@@ -871,7 +887,7 @@ mod block_component_tests {
             .await
             .expect("flush runs");
         assert_eq!(result, 0);
-        assert!(fixture.store.data_mut().drain_signal());
+        assert!(fixture.store.data_mut().context.drain_signal());
         let (result,) = fixture
             .execute
             .call_async(&mut fixture.store, (0xFFFF, 0, one(DATA, 512), STATUS, 0))
@@ -879,16 +895,21 @@ mod block_component_tests {
             .expect("unknown type completes");
         assert_eq!(result, 2);
         assert_eq!(status(&fixture), 2);
-        assert!(fixture.store.data_mut().drain_signal());
+        assert!(fixture.store.data_mut().context.drain_signal());
         let (result,) = fixture
             .execute
             .call_async(&mut fixture.store, (T_GET_ID, 0, one(DATA, 512), STATUS, 0))
             .await
             .expect("identify runs");
         assert_eq!(result, 0);
-        assert!(fixture.store.data_mut().drain_signal());
+        assert!(fixture.store.data_mut().context.drain_signal());
         assert_eq!(
-            &fixture.store.data().guest_read(DATA, 12).expect("id back")[..],
+            &fixture
+                .store
+                .data()
+                .context
+                .guest_read(DATA, 12)
+                .expect("id back")[..],
             b"terra-vda\0\0\0"
         );
     }
@@ -899,6 +920,7 @@ mod block_component_tests {
         fixture
             .store
             .data_mut()
+            .context
             .guest_write(DATA, &[0xCDu8; 512])
             .expect("payload staged");
         let (result,) = fixture
@@ -911,6 +933,7 @@ mod block_component_tests {
         fixture
             .store
             .data_mut()
+            .context
             .guest_write(STATUS, &[0xFFu8; 1])
             .expect("status armed");
         let (result,) = fixture
@@ -941,10 +964,14 @@ mod block_component_tests {
         // compatibility checks but not validation of arbitrary bytes.
         let component =
             unsafe { Component::deserialize(&engine, &artifact).expect("deserializes") };
-        let mut store = device_store(&engine, RAM).expect("store builds");
-        store
-            .data_mut()
-            .set_disk(DiskGrant::Mem(BoundedDisk::new(8 * 512, false)));
+        let mut store = device_store(
+            &engine,
+            crate::engine::BlockHost::new(
+                crate::SyntheticRam::new(RAM).unwrap(),
+                DiskGrant::Mem(BoundedDisk::new(8 * 512, false)),
+            ),
+        );
+
         let instance: Instance = linker
             .instantiate_async(&mut store, &component)
             .await
@@ -965,6 +992,7 @@ mod block_component_tests {
         header[..4].copy_from_slice(&T_IN.to_le_bytes());
         store
             .data_mut()
+            .context
             .guest_write(0x1000, &header)
             .expect("header fits");
         let descriptors = [
@@ -980,6 +1008,7 @@ mod block_component_tests {
             descriptor[14..].copy_from_slice(&next.to_le_bytes());
             store
                 .data_mut()
+                .context
                 .guest_write(
                     0x4000 + u64::try_from(index).expect("index fits") * 16,
                     &descriptor,
@@ -997,7 +1026,11 @@ mod block_component_tests {
             .expect("aot flush runs");
         assert_eq!(result, 0);
         assert_eq!(
-            store.data().guest_read(STATUS, 1).expect("status readable")[0],
+            store
+                .data()
+                .context
+                .guest_read(STATUS, 1)
+                .expect("status readable")[0],
             0
         );
     }
@@ -1035,7 +1068,6 @@ mod block_component_tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn component_operates_on_shared_machine_ram() {
-        use super::super::engine::device_store_with_ram;
         use std::sync::Arc;
         use vm_memory::{Bytes as _, GuestAddress, GuestMemoryMmap};
         let engine = device_engine().expect("engine builds");
@@ -1048,10 +1080,12 @@ mod block_component_tests {
             .expect("maps"),
         );
         let ram = SyntheticRam::from_shared(Arc::clone(&mem)).expect("aliases");
-        let mut store = device_store_with_ram(&engine, ram);
         let mut disk = BoundedDisk::new(8 * 512, false);
         disk.write(2 * 512, &[0x5Eu8; 512]).expect("pattern in");
-        store.data_mut().set_disk(DiskGrant::Mem(disk));
+        let mut store = device_store(
+            &engine,
+            crate::engine::BlockHost::new(ram, DiskGrant::Mem(disk)),
+        );
         let component =
             Component::new(&engine, component_bytes()).expect("block component compiles");
         let instance = linker

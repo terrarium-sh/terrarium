@@ -8,6 +8,38 @@ pub use uds_windows::{UnixListener as LocalListener, UnixStream as LocalStream};
 #[cfg(all(unix, feature = "tokio"))]
 pub use tokio::net::UnixStream as AsyncLocalStream;
 
+#[cfg(all(unix, feature = "tokio"))]
+pub struct AsyncLocalListener(tokio::io::unix::AsyncFd<LocalListener>);
+
+#[cfg(all(unix, feature = "tokio"))]
+impl AsyncLocalListener {
+    pub fn from_std(listener: LocalListener) -> std::io::Result<Self> {
+        listener.set_nonblocking(true)?;
+        tokio::io::unix::AsyncFd::new(listener).map(Self)
+    }
+
+    pub fn poll_read_ready(
+        &self,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.0.poll_read_ready(context).map_ok(|_| ())
+    }
+
+    pub fn poll_accept(
+        &self,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<LocalStream>> {
+        loop {
+            let mut ready = std::task::ready!(self.0.poll_read_ready(context))?;
+            if let Ok(result) =
+                ready.try_io(|listener| listener.get_ref().accept().map(|(stream, _)| stream))
+            {
+                return std::task::Poll::Ready(result);
+            }
+        }
+    }
+}
+
 #[cfg(all(windows, feature = "tokio"))]
 mod asynchronous {
     use std::io;
@@ -18,7 +50,7 @@ mod asynchronous {
     use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
     use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt as _};
 
-    use super::LocalStream;
+    use super::{LocalListener, LocalStream};
 
     struct WindowsLocalStream(LocalStream);
 
@@ -64,6 +96,55 @@ mod asynchronous {
         }
     }
 
+    struct WindowsLocalListener(LocalListener);
+
+    impl std::os::windows::io::AsSocket for WindowsLocalListener {
+        #[allow(unsafe_code)]
+        fn as_socket(&self) -> std::os::windows::io::BorrowedSocket<'_> {
+            use std::os::windows::io::{AsRawSocket, BorrowedSocket};
+            // SAFETY: The listener owns this socket for the returned borrow's lifetime.
+            unsafe { BorrowedSocket::borrow_raw(self.0.as_raw_socket()) }
+        }
+    }
+
+    // SAFETY: The wrapper owns the listening socket for the whole async registration.
+    #[allow(unsafe_code)]
+    unsafe impl async_io::IoSafe for WindowsLocalListener {}
+
+    pub struct AsyncLocalListener(Async<WindowsLocalListener>);
+
+    impl AsyncLocalListener {
+        pub fn from_std(listener: LocalListener) -> io::Result<Self> {
+            Async::new(WindowsLocalListener(listener)).map(Self)
+        }
+
+        pub fn poll_read_ready(&self, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.0.poll_readable(context)
+        }
+
+        pub fn poll_accept(&self, context: &mut Context<'_>) -> Poll<io::Result<LocalStream>> {
+            loop {
+                match self.0.get_ref().0.accept() {
+                    Ok((stream, _)) => return Poll::Ready(Ok(stream)),
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        std::task::ready!(self.0.poll_readable(context))?;
+                    }
+                    Err(error) => return Poll::Ready(Err(error)),
+                }
+            }
+        }
+    }
+
+    impl AsyncLocalStream {
+        pub fn poll_read_ready(&self, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.0.get_ref().poll_readable(context)
+        }
+
+        pub fn poll_write_ready(&self, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.0.get_ref().poll_writable(context)
+        }
+    }
+
     impl AsyncRead for AsyncLocalStream {
         fn poll_read(
             self: Pin<&mut Self>,
@@ -97,7 +178,7 @@ mod asynchronous {
 }
 
 #[cfg(all(windows, feature = "tokio"))]
-pub use asynchronous::AsyncLocalStream;
+pub use asynchronous::{AsyncLocalListener, AsyncLocalStream};
 
 #[cfg(test)]
 mod tests {
@@ -143,6 +224,44 @@ mod asynchronous_tests {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     use super::*;
+
+    #[tokio::test]
+    async fn listener_readiness_waits_and_preserves_the_connection() {
+        use std::{future::poll_fn, time::Duration};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("socket");
+        let listener = AsyncLocalListener::from_std(LocalListener::bind(&path).unwrap()).unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                poll_fn(|cx| listener.poll_read_ready(cx))
+            )
+            .await
+            .is_err()
+        );
+        let mut client = LocalStream::connect(&path).unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            poll_fn(|cx| listener.poll_read_ready(cx)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut server = tokio::time::timeout(
+            Duration::from_secs(1),
+            poll_fn(|cx| listener.poll_accept(cx)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        client.write_all(b"probe").unwrap();
+        let mut buffer = [0; 5];
+        server
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        server.read_exact(&mut buffer).unwrap();
+        assert_eq!(&buffer, b"probe");
+    }
 
     #[tokio::test]
     async fn asynchronous_local_stream_round_trip() {

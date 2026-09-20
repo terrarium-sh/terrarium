@@ -1,11 +1,9 @@
 //! Native device handles for host-issued MMIO and lifecycle requests.
 
-#[cfg(any(test, feature = "test-support"))]
-use super::initialize_test_router;
 use super::{
-    Arc, AtomicU64, BoxRuntime, Command, DEVICE_SPAN, DeviceRequestCounts, Mutex, Operation,
-    Ordering, Pending, PendingWorker, Reply, enqueue, recorded_failure, router_error, submit,
-    terra, wait_for_reply,
+    Arc, AtomicU64, BoxRuntime, Command, DEVICE_SPAN, DevicePlan, DeviceRegistration,
+    DeviceRequestCounts, Mutex, Operation, Ordering, Pending, Reply, enqueue, recorded_failure,
+    submit, submit_async, wait_for_reply,
 };
 
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -18,121 +16,94 @@ enum DeviceState {
 
 #[derive(Clone)]
 pub struct MmioDevice {
-    slot: u32,
-    base: Arc<AtomicU64>,
+    device: Arc<DeviceRegistration>,
     sender: tokio::sync::mpsc::Sender<Pending>,
     control_sender: tokio::sync::mpsc::Sender<Pending>,
     state: Arc<Mutex<DeviceState>>,
-    admission: Arc<Mutex<bool>>,
-    completed: Arc<AtomicU64>,
-    failed: Arc<AtomicU64>,
+    admission: Arc<Mutex<Option<String>>>,
     failure: Arc<Mutex<Option<String>>>,
 }
 
 impl MmioDevice {
-    pub(crate) async fn grant_worker(
+    pub(crate) fn grant_worker(
         root: &mut BoxRuntime,
         kind: crate::component::vmm::machine::DeviceKind,
-        factory: crate::component::vmm::workers::Factory,
+        setup: crate::component::vmm::workers::Setup,
     ) -> wasmtime::Result<Self> {
-        #[cfg(any(test, feature = "test-support"))]
-        initialize_test_router(root).await?;
-        let router = root
-            .mmio
+        root.mmio
             .as_ref()
             .ok_or_else(|| wasmtime::Error::msg("MMIO router missing"))?;
-        let slot = u32::try_from(router.slots.load(Ordering::Acquire))?;
-        wasmtime::ensure!(
-            usize::try_from(slot)? < crate::box_runtime::MAX_BOX_COMPONENTS,
-            "box has too many components"
-        );
         wasmtime::ensure!(
             root.component_count() < crate::box_runtime::MAX_BOX_COMPONENTS,
             "box has too many components"
         );
-        let base = u64::from(slot) * DEVICE_SPAN;
-        let channel = Self::register(root, slot, base)?;
-        root.pending_workers.push(PendingWorker {
+        let config = root.store.data().platform.machine_config().cloned();
+        let router = root
+            .mmio
+            .as_mut()
+            .ok_or_else(|| wasmtime::Error::msg("MMIO router missing"))?;
+        let slot = u32::try_from(router.device_plan.len())?;
+        let mapping = if let Some(config) = config {
+            let ordinal = router
+                .device_plan
+                .iter()
+                .filter(|plan| plan.device.kind == kind)
+                .count();
+            config
+                .devices()
+                .iter()
+                .filter(|device| device.kind == kind)
+                .nth(ordinal)
+                .map(|device| {
+                    (
+                        device.mmio_base,
+                        match config.architecture() {
+                            crate::component::vmm::virtualization::Architecture::X86 => DEVICE_SPAN,
+                            crate::component::vmm::virtualization::Architecture::Arm => 0x200,
+                        },
+                    )
+                })
+        } else {
+            Some((u64::from(slot) * DEVICE_SPAN, DEVICE_SPAN))
+        };
+        let device = Arc::new(DeviceRegistration {
             kind,
             slot,
-            base: Arc::clone(&channel.base),
-            mapping: (!root.store.data().platform.has_machine()).then_some(
-                terra::mmio::workers::Mapping {
-                    base,
-                    size: DEVICE_SPAN,
-                },
-            ),
-            factory,
+            base: AtomicU64::new(mapping.map_or(u64::from(slot) * DEVICE_SPAN, |(base, _)| base)),
+            counts: DeviceRequestCounts::default(),
         });
-        if !root.store.data().platform.has_machine() {
-            root.compose_workers().await?;
-        }
+        let channel = Self {
+            device: Arc::clone(&device),
+            sender: router.sender.clone(),
+            control_sender: router.control_sender.clone(),
+            state: Arc::new(Mutex::new(DeviceState::Open)),
+            admission: Arc::clone(&router.admission),
+            failure: Arc::clone(&router.failure),
+        };
+        router.device_plan.push(DevicePlan {
+            device,
+            mapping,
+            setup,
+        });
         Ok(channel)
     }
 
-    fn register(root: &BoxRuntime, slot: u32, base: u64) -> wasmtime::Result<Self> {
-        let router = root
+    pub fn map_mmio(&self, runtime: &mut BoxRuntime, base: u64, size: u64) -> wasmtime::Result<()> {
+        wasmtime::ensure!(
+            size != 0 && base.checked_add(size).is_some(),
+            "invalid MMIO mapping"
+        );
+        let router = runtime
             .mmio
-            .as_ref()
+            .as_mut()
             .ok_or_else(|| wasmtime::Error::msg("MMIO router missing"))?;
-        let sender = router.sender.clone();
-        let control_sender = router.control_sender.clone();
-        let admission = Arc::clone(&router.admission);
-        let failure = Arc::clone(&router.failure);
-        let slots = Arc::clone(&router.slots);
-        let callbacks = Arc::clone(&router.callbacks);
-        let completed = Arc::new(AtomicU64::new(0));
-        let failed = Arc::new(AtomicU64::new(0));
-        callbacks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(DeviceRequestCounts {
-                completed: Arc::clone(&completed),
-                failed: Arc::clone(&failed),
-            });
-        slots.fetch_add(1, Ordering::Release);
-        Ok(Self {
-            slot,
-            base: Arc::new(AtomicU64::new(base)),
-            sender,
-            control_sender,
-            state: Arc::new(Mutex::new(DeviceState::Open)),
-            admission,
-            completed,
-            failed,
-            failure,
-        })
-    }
-
-    pub async fn map(
-        &self,
-        runtime: &mut BoxRuntime,
-        base: u64,
-        size: u64,
-    ) -> wasmtime::Result<()> {
-        if let Some(worker) = runtime
-            .pending_workers
-            .iter_mut()
-            .find(|worker| worker.slot == self.slot)
-        {
-            wasmtime::ensure!(
-                size != 0 && base.checked_add(size).is_some(),
-                "invalid MMIO mapping"
-            );
-            worker.mapping = Some(terra::mmio::workers::Mapping { base, size });
-            self.base.store(base, Ordering::Release);
-            return Ok(());
-        }
-        let remap = runtime
-            .mmio
-            .as_ref()
-            .ok_or_else(|| wasmtime::Error::msg("MMIO router missing"))?
-            .remap;
-        let (result,) = remap
-            .call_async(&mut runtime.store, (self.slot, base, size))
-            .await?;
-        result.map_err(router_error)?;
-        self.base.store(base, Ordering::Release);
+        let plan = router
+            .device_plan
+            .get_mut(usize::try_from(self.device.slot)?)
+            .filter(|plan| Arc::ptr_eq(&plan.device, &self.device))
+            .ok_or_else(|| wasmtime::Error::msg("device belongs to another box"))?;
+        plan.mapping = Some((base, size));
+        self.device.base.store(base, Ordering::Release);
         Ok(())
     }
 
@@ -140,6 +111,7 @@ impl MmioDevice {
         validate_width(len)?;
         let width = u8::try_from(len)?;
         let address = self
+            .device
             .base
             .load(Ordering::Acquire)
             .checked_add(offset)
@@ -160,6 +132,7 @@ impl MmioDevice {
             .ok_or_else(|| wasmtime::Error::msg("MMIO width too large"))?
             .copy_from_slice(bytes);
         let address = self
+            .device
             .base
             .load(Ordering::Acquire)
             .checked_add(offset)
@@ -174,54 +147,58 @@ impl MmioDevice {
     }
 
     pub fn reset(&self) -> wasmtime::Result<()> {
-        {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if *state != DeviceState::Open {
-                return Err(wasmtime::Error::msg("MMIO device unavailable"));
-            }
-            *state = DeviceState::Resetting;
-        }
-        let result = self.control(Operation::Reset).map(|_| ());
+        self.control(Operation::Reset)
+    }
+
+    fn begin_control(&self, operation: Operation) -> wasmtime::Result<Option<ControlGuard>> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *state = if result.is_ok() {
-            DeviceState::Open
-        } else {
-            DeviceState::Closed
-        };
-        result
-    }
-    pub fn close(&self) -> wasmtime::Result<()> {
-        {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match *state {
-                DeviceState::Closed => return Ok(()),
-                DeviceState::Open => *state = DeviceState::Closing,
-                DeviceState::Resetting | DeviceState::Closing => {
-                    return Err(wasmtime::Error::msg("MMIO device unavailable"));
+        match *state {
+            DeviceState::Open => {
+                *state = match operation {
+                    Operation::Reset => DeviceState::Resetting,
+                    Operation::Close => DeviceState::Closing,
+                    Operation::Read | Operation::Write | Operation::InterruptLevel => {
+                        wasmtime::bail!("invalid MMIO control operation");
+                    }
                 }
             }
+            DeviceState::Closed if operation == Operation::Close => return Ok(None),
+            DeviceState::Closed | DeviceState::Resetting | DeviceState::Closing => {
+                return Err(wasmtime::Error::msg("MMIO device unavailable"));
+            }
         }
-        let result = self.control(Operation::Close).map(|_| ());
-        *self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = DeviceState::Closed;
-        result
+        Ok(Some(ControlGuard {
+            state: Arc::clone(&self.state),
+            succeeded: false,
+        }))
+    }
+
+    pub fn close(&self) -> wasmtime::Result<()> {
+        self.control(Operation::Close)
+    }
+
+    pub async fn close_async(&self) -> wasmtime::Result<()> {
+        let Some(control) = self.begin_control(Operation::Close)? else {
+            return Ok(());
+        };
+        submit_async(
+            &self.control_sender,
+            &self.admission,
+            &self.failure,
+            Command::Control(self.device.slot, Operation::Close),
+            control,
+        )
+        .await
+        .map(|_| ())
     }
     #[must_use]
     pub fn request_counts(&self) -> (u64, u64) {
         (
-            self.completed.load(Ordering::Relaxed),
-            self.failed.load(Ordering::Relaxed),
+            self.device.counts.completed.load(Ordering::Relaxed),
+            self.device.counts.failed.load(Ordering::Relaxed),
         )
     }
     #[must_use]
@@ -248,14 +225,45 @@ impl MmioDevice {
         Ok(wait_for_reply(&self.failure, &response)?.reply)
     }
 
-    fn control(&self, operation: Operation) -> wasmtime::Result<Reply> {
-        Ok(submit(
+    fn control(&self, operation: Operation) -> wasmtime::Result<()> {
+        let Some(control) = self.begin_control(operation)? else {
+            return Ok(());
+        };
+        submit(
             &self.control_sender,
             &self.admission,
             &self.failure,
-            Command::Control(self.slot, operation),
-        )?
-        .reply)
+            Command::Control(self.device.slot, operation),
+            control,
+        )
+        .map(|_| ())
+    }
+}
+
+pub(super) struct ControlGuard {
+    state: Arc<Mutex<DeviceState>>,
+    succeeded: bool,
+}
+
+impl ControlGuard {
+    pub(super) fn complete(mut self, succeeded: bool) {
+        self.succeeded = succeeded;
+    }
+}
+
+impl Drop for ControlGuard {
+    fn drop(&mut self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *state = match *state {
+            DeviceState::Resetting if self.succeeded => DeviceState::Open,
+            DeviceState::Open
+            | DeviceState::Resetting
+            | DeviceState::Closing
+            | DeviceState::Closed => DeviceState::Closed,
+        };
     }
 }
 
@@ -269,7 +277,173 @@ fn validate_width(width: usize) -> wasmtime::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_width;
+    use super::*;
+
+    fn test_device() -> (MmioDevice, tokio::sync::mpsc::Receiver<Pending>) {
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        let (control_sender, controls) = tokio::sync::mpsc::channel(1);
+        let device = MmioDevice {
+            device: Arc::new(DeviceRegistration {
+                kind: crate::component::vmm::machine::DeviceKind::Block,
+                slot: 0,
+                base: AtomicU64::new(0),
+                counts: DeviceRequestCounts::default(),
+            }),
+            sender,
+            control_sender,
+            state: Arc::new(Mutex::new(DeviceState::Open)),
+            admission: Arc::new(Mutex::new(None)),
+            failure: Arc::new(Mutex::new(None)),
+        };
+        (device, controls)
+    }
+
+    #[test]
+    fn abandoned_sync_waiters_leave_control_completion_to_the_request() {
+        use super::super::{ReplySender, RoutedReply, enqueue_reply};
+
+        for operation in [Operation::Reset, Operation::Close] {
+            for resolution in [Some(true), Some(false), None] {
+                let (device, mut controls) = test_device();
+                let control = device.begin_control(operation).unwrap().unwrap();
+                let (reply, response) = std::sync::mpsc::sync_channel(1);
+                enqueue_reply(
+                    &device.control_sender,
+                    &device.admission,
+                    Command::Control(0, operation),
+                    ReplySender::Sync(reply),
+                    Some(control),
+                )
+                .unwrap();
+                drop(response);
+                assert!(device.reset().is_err());
+                assert!(device.close().is_err());
+                assert!(device.read(0, 4).is_err());
+                let pending = controls.try_recv().unwrap();
+                match resolution {
+                    Some(true) => pending.reply.send(Ok(RoutedReply {
+                        slot: 0,
+                        reply: Reply {
+                            sequence: 0,
+                            value: 0,
+                            error: 0,
+                            interrupt: false,
+                        },
+                    })),
+                    Some(false) => pending
+                        .reply
+                        .send(Err(wasmtime::Error::msg("control failed"))),
+                    None => drop(pending),
+                }
+                let expected = if operation == Operation::Reset && resolution == Some(true) {
+                    DeviceState::Open
+                } else {
+                    DeviceState::Closed
+                };
+                assert!(*device.state.lock().unwrap() == expected);
+            }
+        }
+    }
+
+    #[test]
+    fn rejected_controls_close_the_device() {
+        for operation in [Operation::Reset, Operation::Close] {
+            let (device, _controls) = test_device();
+            *device.admission.lock().unwrap() = Some("stopped".to_owned());
+            assert!(device.control(operation).is_err());
+            assert!(*device.state.lock().unwrap() == DeviceState::Closed);
+            device.close().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_close_stays_in_flight_until_the_bridge_resolves_it() {
+        let (device, mut controls) = test_device();
+        let pending = {
+            let close = device.close_async();
+            tokio::pin!(close);
+            tokio::select! {
+                result = &mut close => panic!("close completed before reply: {result:?}"),
+                pending = controls.recv() => pending.unwrap(),
+            }
+        };
+        assert!(*device.state.lock().unwrap() == DeviceState::Closing);
+        assert!(device.close().is_err());
+        assert!(device.read(0, 4).is_err());
+        drop(pending);
+        assert!(*device.state.lock().unwrap() == DeviceState::Closed);
+        device.close_async().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_or_cancelled_setup_cannot_produce_a_ready_runtime() {
+        for cancel in [false, true] {
+            let engine = crate::engine::device_engine().unwrap();
+            let mut runtime = BoxRuntime::new(&engine, crate::box_runtime::BoxHost::new()).unwrap();
+            super::super::initialize_test_router(&mut runtime)
+                .await
+                .unwrap();
+            let registry = Arc::downgrade(&runtime.mmio.as_ref().unwrap().devices);
+            let cancelled = tokio_util::sync::CancellationToken::new();
+            let owner = cancelled.clone().drop_guard();
+            let (entered, started) = tokio::sync::oneshot::channel();
+            let setup: crate::component::vmm::workers::Setup = Box::new(move |_| {
+                Box::pin(async move {
+                    let _owner = owner;
+                    let _ = entered.send(());
+                    if cancel {
+                        std::future::pending::<()>().await;
+                    }
+                    wasmtime::bail!("injected setup failure")
+                })
+            });
+            MmioDevice::grant_worker(
+                &mut runtime,
+                crate::component::vmm::machine::DeviceKind::Block,
+                setup,
+            )
+            .unwrap();
+            {
+                let preparation = runtime.prepare();
+                tokio::pin!(preparation);
+                if cancel {
+                    tokio::select! {
+                        result = &mut preparation => panic!("setup completed: {}", result.is_ok()),
+                        result = tokio::time::timeout(std::time::Duration::from_secs(5), started) => {
+                            result.unwrap().unwrap();
+                        }
+                    }
+                } else {
+                    assert!(preparation.await.is_err());
+                }
+            }
+            assert!(cancelled.is_cancelled());
+            assert!(registry.upgrade().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn device_grants_count_manually_attached_workers_towards_box_capacity() {
+        let engine = crate::engine::device_engine().unwrap();
+        let mut runtime = BoxRuntime::new(&engine, crate::box_runtime::BoxHost::new()).unwrap();
+        super::super::initialize_test_router(&mut runtime)
+            .await
+            .unwrap();
+        for _ in 0..crate::box_runtime::MAX_BOX_COMPONENTS {
+            let worker = runtime.new_child(crate::box_runtime::RootHost::new());
+            runtime.attach_child(worker).unwrap();
+        }
+        let setup: crate::component::vmm::workers::Setup =
+            Box::new(|_| Box::pin(async { panic!("over-capacity setup must not run") }));
+        let error = MmioDevice::grant_worker(
+            &mut runtime,
+            crate::component::vmm::machine::DeviceKind::Block,
+            setup,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.to_string(), "box has too many components");
+    }
 
     #[test]
     fn accepts_only_virtio_mmio_widths() {
@@ -279,5 +453,24 @@ mod tests {
         for width in [0, 3, 5, 9] {
             assert!(validate_width(width).is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn granting_a_worker_requires_an_initialized_router() {
+        let engine = crate::engine::device_engine().expect("engine");
+        let mut runtime =
+            BoxRuntime::new(&engine, crate::box_runtime::BoxHost::new()).expect("runtime");
+        let setup: crate::component::vmm::workers::Setup =
+            Box::new(|_| Box::pin(async { unreachable!() }));
+
+        let error = MmioDevice::grant_worker(
+            &mut runtime,
+            crate::component::vmm::machine::DeviceKind::Block,
+            setup,
+        )
+        .err()
+        .expect("MMIO router is required");
+
+        assert!(error.to_string().contains("MMIO router missing"));
     }
 }

@@ -1,19 +1,14 @@
 //! Block component bindings over the box-wide MMIO router.
 
 pub mod backing;
+pub mod host;
 
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::Arc;
-use std::time::Duration;
 
-use wasmtime::component::{Component, Instance};
+use wasmtime::component::Component;
 
-#[cfg(any(test, feature = "test-support"))]
-use wasmtime::Store;
-
-use crate::engine::{
-    DeviceError, DeviceHost, DeviceWasiGetters, block_component_linker_captured, component_export,
-};
+use host::{BlockDevice, BlockHost, DeviceError, block_component_linker};
 
 pub use crate::component::Interrupt;
 
@@ -23,150 +18,81 @@ type BlockState = crate::component::worker::Worker<DeviceError>;
 
 #[cfg(any(test, feature = "test-support"))]
 pub async fn instantiate(
-    store: Store<DeviceHost>,
+    engine: &wasmtime::Engine,
+    host: BlockHost,
     component: &Component,
     readonly: bool,
     interrupt: Interrupt,
-) -> wasmtime::Result<DeviceChannel> {
-    let engine = store.engine().clone();
+) -> wasmtime::Result<crate::component::StandaloneDevice> {
     let mut runtime =
-        crate::box_runtime::BoxRuntime::new(&engine, crate::box_runtime::BoxHost::new())?;
-    let channel = instantiate_shared(
-        &mut runtime,
-        store.into_data(),
-        component,
-        readonly,
-        interrupt,
-    )
-    .await?;
-    Ok(DeviceChannel {
-        _runtime: Some(Arc::new(runtime.start())),
-        ..channel
+        crate::box_runtime::BoxRuntime::new(engine, crate::box_runtime::BoxHost::new())?;
+    crate::component::vmm::mmio::initialize_test_router(&mut runtime).await?;
+    let channel = instantiate_shared(&mut runtime, host, component, readonly, interrupt)?;
+    Ok(crate::component::StandaloneDevice {
+        _runtime: Arc::new(runtime.prepare().await?.start()),
+        device: channel,
     })
 }
 
-pub async fn instantiate_shared(
+pub fn instantiate_shared(
     runtime: &mut crate::box_runtime::BoxRuntime,
-    host: DeviceHost,
+    host: BlockHost,
     component: &Component,
     readonly: bool,
     interrupt: Interrupt,
 ) -> wasmtime::Result<DeviceChannel> {
-    grant_shared(runtime, move || Ok(host), component, readonly, interrupt).await
+    grant_shared(runtime, move || Ok(host), component, readonly, interrupt)
 }
 
-pub async fn grant_shared(
+pub fn grant_shared(
     runtime: &mut crate::box_runtime::BoxRuntime,
-    host: impl FnOnce() -> wasmtime::Result<DeviceHost> + Send + 'static,
+    host: impl FnOnce() -> wasmtime::Result<BlockHost> + Send + 'static,
     component: &Component,
     readonly: bool,
     interrupt: Interrupt,
 ) -> wasmtime::Result<DeviceChannel> {
     let child = runtime.child_factory();
     let component = component.clone();
-    let factory: crate::component::vmm::workers::Factory = Box::new(move || {
-        Box::pin(async move {
-            create_worker(
-                child(crate::box_runtime::BoxHost::new())?,
-                host()?,
-                &component,
-                readonly,
-                interrupt,
-            )
-            .await
-        })
-    });
-    let mmio = crate::component::vmm::mmio::MmioDevice::grant_worker(
-        runtime,
+    runtime.grant_device_worker(
         crate::component::vmm::machine::DeviceKind::Block,
-        factory,
+        async move { create_worker(child(host()?), &component, readonly, interrupt).await },
     )
-    .await?;
-    Ok(DeviceChannel {
-        mmio,
-        _runtime: None,
-    })
 }
 
 async fn create_worker(
-    mut child: crate::box_runtime::BoxRuntime,
-    host: DeviceHost,
+    mut child: crate::box_runtime::DeviceWorker<BlockHost>,
     component: &Component,
     readonly: bool,
     interrupt: Interrupt,
 ) -> wasmtime::Result<(
-    crate::box_runtime::BoxRuntime,
+    crate::box_runtime::DeviceWorker<BlockHost>,
     crate::component::vmm::mmio::Serve,
 )> {
-    let wake = host.interrupt_notification();
-    let slot = child.add_block(host)?;
-    let linker = block_component_linker_captured(
-        child.store.engine(),
-        DeviceWasiGetters {
-            cli: shared_block_cli,
-            clocks: shared_block_clocks,
-        },
-        move |host: &mut crate::box_runtime::BoxHost| &mut host.block[slot],
-    )?;
-    let export = |name| component_export(component, "terra:host/device-api@0.1.0", name, "block");
-    let instance: Instance = tokio::time::timeout(
-        Duration::from_secs(2),
-        linker.instantiate_async(&mut child.store, component),
-    )
-    .await
-    .map_err(|_| wasmtime::Error::msg("block component initialization timed out"))??;
-    let configure = instance.get_typed_func::<(bool,), (Result<(), DeviceError>,)>(
-        &mut child.store,
-        &export("configure")?,
-    )?;
-    let (result,) = tokio::time::timeout(
-        Duration::from_secs(2),
-        configure.call_async(&mut child.store, (readonly,)),
-    )
-    .await
-    .map_err(|_| wasmtime::Error::msg("block component configure timed out"))??;
+    let wake = child.store.data().context.interrupt_notification();
+    let linker = block_component_linker(child.store.engine())?;
+    let instance = BlockDevice::instantiate_async(&mut child.store, component, &linker)
+        .await
+        .map_err(|error| error.context("block component initialization"))?;
+    let api = instance.terra_host_device_api();
+    let configure = api.func_configure();
+    let (result,) = configure
+        .call_async(&mut child.store, (readonly,))
+        .await
+        .map_err(|error| error.context("block component configuration"))?;
     result.map_err(|error| wasmtime::Error::msg(format!("block configure: {error:?}")))?;
     let state = BlockState {
-        run: instance.get_typed_func(&mut child.store, export("run")?)?,
+        run: api.func_run(),
         interrupt,
     };
-    let serve: crate::component::vmm::mmio::Serve = instance.get_typed_func(
-        &mut child.store,
-        component_export(component, "terra:mmio/device@0.1.0", "serve", "block")?,
-    )?;
-    state.register(&mut child, wake, "block", move |host| {
-        let host = host
-            .block
-            .get_mut(slot)
-            .ok_or_else(|| wasmtime::Error::msg("block host missing"))?;
-        host.end_window();
-        Ok(host.interrupt_level())
-    })?;
+    let serve = instance.terra_mmio_device().func_serve();
+    state.register(&mut child, wake, "block")?;
     Ok((child, serve))
-}
-
-fn shared_block_cli(
-    host: &mut crate::box_runtime::BoxHost,
-) -> wasmtime_wasi::cli::WasiCliCtxView<'_> {
-    use wasmtime_wasi::cli::WasiCliView;
-
-    host.block[0].cli()
-}
-
-fn shared_block_clocks(
-    host: &mut crate::box_runtime::BoxHost,
-) -> wasmtime_wasi::clocks::WasiClocksCtxView<'_> {
-    use wasmtime_wasi::clocks::WasiClocksView;
-
-    host.block[0].clocks()
 }
 
 #[cfg(test)]
 mod tests {
 
-    use crate::engine::{
-        DeviceHost, DiskGrant, device_engine, device_store, device_store_with_ram,
-    };
+    use crate::engine::{BlockHost, DiskGrant, device_engine};
     use crate::{BoundedDisk, BoundedMemory, SyntheticRam};
     #[cfg(any(test, feature = "test-support"))]
     use std::sync::Arc;
@@ -183,14 +109,20 @@ mod tests {
             std::fs::read(component_path).expect("block component built"),
         )
         .expect("component compiles");
-        let mut store = device_store(&engine, 64 * 1024).expect("store builds");
-        store
-            .data_mut()
-            .set_disk(DiskGrant::Mem(BoundedDisk::new(4096, false)));
-        let channel =
-            crate::component::block::instantiate(store, &component, false, Arc::new(|_| Ok(())))
-                .await
-                .expect("actor instantiates");
+        let host = crate::engine::BlockHost::new(
+            crate::SyntheticRam::new(64 * 1024).unwrap(),
+            DiskGrant::Mem(BoundedDisk::new(4096, false)),
+        );
+
+        let channel = crate::component::block::instantiate(
+            &engine,
+            host,
+            &component,
+            false,
+            Arc::new(|_| Ok(())),
+        )
+        .await
+        .expect("actor instantiates");
 
         assert_eq!(
             channel.read(0, 4).expect("magic read"),
@@ -239,10 +171,8 @@ mod tests {
             .configure_mmio_vcpus(2)
             .await
             .expect("vCPU router setup");
-        let mut writable = DeviceHost::with_ram(ram.clone());
-        writable.set_disk(DiskGrant::Mem(BoundedDisk::new(4096, false)));
-        let mut readonly = DeviceHost::with_ram(ram);
-        readonly.set_disk(DiskGrant::Mem(BoundedDisk::new(8192, true)));
+        let writable = BlockHost::new(ram.clone(), DiskGrant::Mem(BoundedDisk::new(4096, false)));
+        let readonly = BlockHost::new(ram, DiskGrant::Mem(BoundedDisk::new(8192, true)));
         let first = crate::component::block::instantiate_shared(
             &mut runtime,
             writable,
@@ -250,7 +180,6 @@ mod tests {
             false,
             Arc::new(|_| Ok(())),
         )
-        .await
         .expect("first block instantiates");
         let second = crate::component::block::instantiate_shared(
             &mut runtime,
@@ -259,17 +188,43 @@ mod tests {
             true,
             Arc::new(|_| Ok(())),
         )
-        .await
         .expect("second block instantiates");
+        let mut other_box =
+            crate::box_runtime::BoxRuntime::new(&engine, crate::box_runtime::BoxHost::new())
+                .unwrap();
+        other_box.initialize_mmio(&router).await.unwrap();
+        let other_device = crate::component::block::instantiate_shared(
+            &mut other_box,
+            BlockHost::new(
+                crate::SyntheticRam::new(4096).unwrap(),
+                crate::engine::DiskGrant::Mem(crate::BoundedDisk::new(0, false)),
+            ),
+            &component,
+            false,
+            Arc::new(|_| Ok(())),
+        )
+        .unwrap();
+        assert_eq!(
+            first
+                .map_mmio(&mut other_box, 0xf000_0000, 0x1000)
+                .unwrap_err()
+                .to_string(),
+            "device belongs to another box"
+        );
+        let other_running = other_box.prepare().await.unwrap().start();
+        assert_eq!(
+            other_device.read(0, 4).unwrap(),
+            0x7472_6976_u32.to_le_bytes()
+        );
+        other_device.close().unwrap();
+        other_running.join().await.unwrap();
         first
             .map_mmio(&mut runtime, 0xd000_0000, 0x1000)
-            .await
             .expect("first physical mapping");
         second
             .map_mmio(&mut runtime, 0xe000_0000, 0x1000)
-            .await
             .expect("second physical mapping");
-        let runtime = runtime.start();
+        let runtime = runtime.prepare().await.unwrap().start();
         assert_eq!(
             first.read(0x100, 4).expect("first capacity"),
             8_u32.to_le_bytes()
@@ -309,19 +264,24 @@ mod tests {
             ),
         )
         .unwrap();
-        let mut store = device_store(&engine, 64 * 1024).unwrap();
-        let ram = store.data().guest_ram().clone();
-        store
-            .data_mut()
-            .set_disk(DiskGrant::Mem(BoundedDisk::new(4096, false)));
-        store
-            .data_mut()
+        let mut host = crate::engine::BlockHost::new(
+            crate::SyntheticRam::new(64 * 1024).unwrap(),
+            DiskGrant::Mem(BoundedDisk::new(4096, false)),
+        );
+        let ram = host.context.guest_ram().clone();
+
+        host.context
             .guest_write(0x2002, &257u16.to_le_bytes())
             .unwrap();
-        let channel =
-            crate::component::block::instantiate(store, &component, false, Arc::new(|_| Ok(())))
-                .await
-                .unwrap();
+        let channel = crate::component::block::instantiate(
+            &engine,
+            host,
+            &component,
+            false,
+            Arc::new(|_| Ok(())),
+        )
+        .await
+        .unwrap();
         for (offset, value) in [
             (0x70, 1u32),
             (0x70, 3),
@@ -372,14 +332,15 @@ mod tests {
         .unwrap();
         let ram = SyntheticRam::new(64 * 1024).unwrap();
         let memory = BoundedMemory::new(&ram);
-        let mut store = device_store_with_ram(&engine, ram.clone());
-        store
-            .data_mut()
-            .set_disk(DiskGrant::Mem(BoundedDisk::new(4096, false)));
+        let host = crate::engine::BlockHost::new(
+            ram.clone(),
+            DiskGrant::Mem(BoundedDisk::new(4096, false)),
+        );
         let interrupted = Arc::new(AtomicBool::new(false));
         let interrupt = Arc::clone(&interrupted);
         let channel = crate::component::block::instantiate(
-            store,
+            &engine,
+            host,
             &component,
             false,
             Arc::new(move |level| {

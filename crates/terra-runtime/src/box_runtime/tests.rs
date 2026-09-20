@@ -6,15 +6,13 @@ use std::time::Duration;
 
 use super::{BOX_WASM_MEMORY_BYTES, BoxHost, BoxRuntime, BoxRuntimeHandle, MAX_BOX_COMPONENTS};
 use crate::component::vmm::lifecycle::Outcome;
-use crate::engine::{DeviceHost, device_engine};
+use crate::engine::{DeviceContext, device_engine};
 use wasmtime::{Module, ResourceLimiter};
 
 #[tokio::test]
 async fn completed_device_loops_retire_without_stopping_the_box() {
     let engine = device_engine().expect("engine");
-    let mut host = BoxHost::new();
-    host.block.push(DeviceHost::new(4096).expect("device host"));
-    let mut runtime = BoxRuntime::new(&engine, host).expect("runtime");
+    let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
     runtime
         .register_loop(Box::new(|_| Box::pin(async { Ok(()) })))
         .expect("first loop");
@@ -22,7 +20,13 @@ async fn completed_device_loops_retire_without_stopping_the_box() {
         .register_loop(Box::new(|_| Box::pin(async { Ok(()) })))
         .expect("second loop");
 
-    runtime.run().await.expect("all loops exit cleanly");
+    runtime
+        .prepare()
+        .await
+        .unwrap()
+        .run()
+        .await
+        .expect("all loops exit cleanly");
 }
 
 #[tokio::test]
@@ -55,10 +59,7 @@ async fn epochs_yield_spinning_wasm_for_deadline_and_cancellation() {
 
 #[test]
 fn resource_limits_apply_per_independent_store() {
-    let mut host = BoxHost::new();
-    for _ in 0..MAX_BOX_COMPONENTS {
-        host.block.push(DeviceHost::new(4096).expect("device host"));
-    }
+    let host = BoxHost::new();
 
     assert_eq!(ResourceLimiter::instances(&host), 16);
     assert_eq!(ResourceLimiter::memories(&host), 4);
@@ -70,27 +71,71 @@ fn empty_child_stores_cannot_bypass_box_capacity() {
     let engine = device_engine().expect("engine");
     let mut root = BoxRuntime::new(&engine, BoxHost::new()).expect("root");
     for _ in 0..MAX_BOX_COMPONENTS {
-        let child = root.new_child(BoxHost::new()).expect("child");
+        let child = root.new_child(crate::engine::BlockHost::new(
+            crate::SyntheticRam::new(4096).unwrap(),
+            crate::engine::DiskGrant::Mem(crate::BoundedDisk::new(0, false)),
+        ));
         root.attach_child(child).expect("available slot");
     }
-    let child = root.new_child(BoxHost::new()).expect("child");
+    let child = root.new_child(crate::box_runtime::RootHost::new());
     assert!(root.attach_child(child).is_err());
+}
+
+#[test]
+fn device_workers_cannot_cross_box_memory_budgets() {
+    let engine = device_engine().expect("engine");
+    let first = BoxRuntime::new(&engine, BoxHost::new()).expect("first box");
+    let mut second = BoxRuntime::new(&engine, BoxHost::new()).expect("second box");
+    let worker = first.new_child(crate::box_runtime::RootHost::new());
+
+    assert!(second.attach_child(worker).is_err());
+    assert_eq!(first.memory_budget.reserved(), 0);
+    assert_eq!(second.memory_budget.reserved(), 0);
+}
+
+#[tokio::test]
+async fn dropping_a_temporary_store_does_not_start_box_teardown() {
+    use crate::component::vmm::{machine::DeviceKind, teardown::DeviceShutdown};
+
+    let engine = device_engine().expect("engine");
+    let mut root = BoxRuntime::new(&engine, BoxHost::new()).expect("box");
+    let (closed, mut closure) = tokio::sync::oneshot::channel();
+    root.grant_device_shutdown(vec![DeviceShutdown::new(DeviceKind::Block, async move {
+        closed.send(()).expect("observe close");
+        Ok(())
+    })])
+    .expect("device cleanup");
+    drop(root.new_child(crate::box_runtime::RootHost::new()));
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), &mut closure)
+            .await
+            .is_err()
+    );
+    root.store
+        .data()
+        .lifecycle
+        .native_teardown()
+        .wait_until_finished()
+        .await
+        .expect("box teardown");
+    closure.await.expect("device closed");
 }
 
 #[test]
 fn router_host_resources_have_a_native_limit() {
     let mut host = BoxHost::new();
     for _ in 0..crate::engine::MAX_DEVICE_RESOURCES {
-        host.router_table.push(0_u8).expect("resource slot");
+        host.table.push(0_u8).expect("resource slot");
     }
-    assert!(host.router_table.push(0_u8).is_err());
+    assert!(host.table.push(0_u8).is_err());
 }
 
 #[test]
 fn component_loop_admission_counts_attached_children() {
     let engine = device_engine().expect("engine");
     let mut root = BoxRuntime::new(&engine, BoxHost::new()).expect("root");
-    let mut child = root.new_child(BoxHost::new()).expect("child");
+    let mut child = root.new_child(crate::box_runtime::RootHost::new());
     for _ in 0..super::MAX_BOX_COMPONENT_LOOPS {
         child
             .register_loop(Box::new(|_| Box::pin(async { Ok(()) })))
@@ -101,7 +146,7 @@ fn component_loop_admission_counts_attached_children() {
         root.register_loop(Box::new(|_| Box::pin(async { Ok(()) })))
             .is_err()
     );
-    let mut child = root.new_child(BoxHost::new()).expect("child");
+    let mut child = root.new_child(crate::box_runtime::RootHost::new());
     child
         .register_loop(Box::new(|_| Box::pin(async { Ok(()) })))
         .expect("child slot");
@@ -157,7 +202,7 @@ fn child_stores_share_the_box_memory_budget() {
     let engine = device_engine().expect("engine");
     let mut root = BoxRuntime::new(&engine, BoxHost::new()).expect("root runtime");
     let mut children = (0..(BOX_WASM_MEMORY_BYTES / crate::engine::STORE_MEMORY_BYTES - 1))
-        .map(|_| root.new_child(BoxHost::new()).expect("child runtime"))
+        .map(|_| root.new_child(crate::box_runtime::RootHost::new()))
         .collect::<Vec<_>>();
 
     assert!(
@@ -181,9 +226,7 @@ fn child_stores_share_the_box_memory_budget() {
         );
     }
 
-    let mut rejected = root
-        .new_child(BoxHost::new())
-        .expect("rejected child runtime");
+    let mut rejected = root.new_child(crate::box_runtime::RootHost::new());
     assert!(
         !ResourceLimiter::memory_growing(
             rejected.store.data_mut(),
@@ -204,7 +247,7 @@ fn child_stores_share_the_box_memory_budget() {
 fn dropped_boot_store_releases_its_shared_memory_reservation() {
     let engine = device_engine().expect("engine");
     let root = BoxRuntime::new(&engine, BoxHost::new()).expect("root runtime");
-    let mut boot = root.new_child(BoxHost::new()).expect("boot store");
+    let mut boot = root.new_child(crate::component::vmm::boot::BootHost::default());
     assert!(
         ResourceLimiter::memory_growing(
             boot.store.data_mut(),
@@ -238,11 +281,13 @@ async fn wait_for_drop(dropped: &AtomicBool) {
 
 async fn running_handle(dropped: Arc<AtomicBool>) -> BoxRuntimeHandle {
     let (started, ready) = tokio::sync::oneshot::channel();
-    let handle = BoxRuntimeHandle(Some(tokio::spawn(async move {
-        let _flag = DropFlag(dropped);
-        let _ = started.send(());
-        std::future::pending::<wasmtime::Result<()>>().await
-    })));
+    let handle = BoxRuntimeHandle(tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
+        async move {
+            let _flag = DropFlag(dropped);
+            let _ = started.send(());
+            std::future::pending::<wasmtime::Result<()>>().await
+        },
+    )));
     ready.await.expect("runtime task starts");
     handle
 }
@@ -263,7 +308,7 @@ async fn shutdown_deadline_aborts_a_cooperative_runtime_task() {
     let dropped = Arc::new(AtomicBool::new(false));
     let mut handle = running_handle(Arc::clone(&dropped)).await;
     let error = handle
-        .wait_for_task(Duration::ZERO, false)
+        .wait_for_task(tokio::time::Instant::now())
         .await
         .expect_err("pending runtime exceeds shutdown deadline");
     assert_eq!(error.to_string(), "box runtime shutdown timed out");
@@ -271,13 +316,13 @@ async fn shutdown_deadline_aborts_a_cooperative_runtime_task() {
 }
 
 #[tokio::test]
-async fn child_failure_stops_the_runtime_group() {
+async fn root_failure_stops_the_runtime_group() {
     let engine = device_engine().expect("engine");
     let mut root = BoxRuntime::new(&engine, BoxHost::new()).expect("root runtime");
     let mut outcome = root.lifecycle_notifier().subscribe();
     let dropped = Arc::new(AtomicBool::new(false));
     let child_drop = DropFlag(Arc::clone(&dropped));
-    let mut child = root.new_child(BoxHost::new()).expect("child runtime");
+    let mut child = root.new_child(crate::box_runtime::RootHost::new());
     child
         .register_loop(Box::new(move |_| {
             let drop_flag = child_drop;
@@ -293,9 +338,60 @@ async fn child_failure_stops_the_runtime_group() {
     }))
     .expect("root loop");
 
-    root.start().join().await.expect_err("root worker failure");
+    root.prepare()
+        .await
+        .unwrap()
+        .start()
+        .join()
+        .await
+        .expect_err("root worker failure");
     wait_for_drop(&dropped).await;
     assert_eq!(*outcome.borrow_and_update(), Some(Outcome::ComponentFailed));
+}
+
+#[tokio::test]
+async fn child_failure_or_panic_stops_a_running_root() {
+    for panics in [false, true] {
+        let engine = device_engine().unwrap();
+        let mut root = BoxRuntime::new(&engine, BoxHost::new()).unwrap();
+        let outcome = root.lifecycle_notifier().subscribe();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let root_drop = DropFlag(Arc::clone(&dropped));
+        let (started, ready) = tokio::sync::oneshot::channel();
+        root.register_loop(Box::new(move |_| {
+            Box::pin(async move {
+                let _drop = root_drop;
+                started.send(()).unwrap();
+                std::future::pending::<wasmtime::Result<()>>().await
+            })
+        }))
+        .unwrap();
+        let mut child = root.new_child(crate::box_runtime::RootHost::new());
+        child
+            .register_loop(Box::new(move |_| {
+                Box::pin(async move {
+                    ready.await.unwrap();
+                    assert!(!panics, "child panic");
+                    Err(wasmtime::Error::msg("child failed"))
+                })
+            }))
+            .unwrap();
+        root.attach_child(child).unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            root.prepare().await.unwrap().start().join(),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(error.to_string().contains(if panics {
+            "child panic"
+        } else {
+            "child failed"
+        }));
+        wait_for_drop(&dropped).await;
+        assert_eq!(*outcome.borrow(), Some(Outcome::ComponentFailed));
+    }
 }
 
 #[tokio::test]
@@ -304,8 +400,8 @@ async fn completed_root_stops_child_workers() {
     let mut root = BoxRuntime::new(&engine, BoxHost::new()).expect("root runtime");
     let dropped = Arc::new(AtomicBool::new(false));
     let child_drop = DropFlag(Arc::clone(&dropped));
-    let mut child = root.new_child(BoxHost::new()).expect("child runtime");
-    let mut shutdown = child.shutdown.subscribe();
+    let mut child = root.new_child(crate::box_runtime::RootHost::new());
+    let mut shutdown = root.shutdown.subscribe();
     child
         .register_loop(Box::new(move |_| {
             let drop_flag = child_drop;
@@ -320,7 +416,13 @@ async fn completed_root_stops_child_workers() {
     root.register_loop(Box::new(|_| Box::pin(async { Ok(()) })))
         .expect("root loop");
 
-    root.start().join().await.expect("root completion");
+    root.prepare()
+        .await
+        .unwrap()
+        .start()
+        .join()
+        .await
+        .expect("root completion");
     wait_for_drop(&dropped).await;
 }
 
@@ -330,7 +432,7 @@ async fn root_and_child_stores_make_progress_together() {
     let mut root = BoxRuntime::new(&engine, BoxHost::new()).expect("root runtime");
     let barrier = Arc::new(tokio::sync::Barrier::new(2));
     let completed = Arc::new(AtomicUsize::new(0));
-    let mut child = root.new_child(BoxHost::new()).expect("child runtime");
+    let mut child = root.new_child(crate::box_runtime::RootHost::new());
     let child_barrier = Arc::clone(&barrier);
     let child_completed = Arc::clone(&completed);
     child
@@ -355,10 +457,13 @@ async fn root_and_child_stores_make_progress_together() {
     }))
     .expect("root loop");
 
-    tokio::time::timeout(Duration::from_secs(1), root.start().join())
-        .await
-        .expect("stores make progress in parallel")
-        .expect("runtime completion");
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        root.prepare().await.unwrap().start().join(),
+    )
+    .await
+    .expect("stores make progress in parallel")
+    .expect("runtime completion");
     assert_eq!(completed.load(Ordering::Acquire), 2);
 }
 
@@ -369,8 +474,8 @@ async fn child_failure_during_shutdown_fails_the_group() {
     let outcome = root.lifecycle_notifier().subscribe();
     root.register_loop(Box::new(|_| Box::pin(async { Ok(()) })))
         .expect("root loop");
-    let mut child = root.new_child(BoxHost::new()).expect("child");
-    let mut shutdown = child.shutdown.subscribe();
+    let mut child = root.new_child(crate::box_runtime::RootHost::new());
+    let mut shutdown = root.shutdown.subscribe();
     child
         .register_loop(Box::new(move |_| {
             Box::pin(async move {
@@ -384,6 +489,9 @@ async fn child_failure_during_shutdown_fails_the_group() {
         .expect("child loop");
     root.attach_child(child).expect("attach child");
     let error = root
+        .prepare()
+        .await
+        .unwrap()
         .start()
         .join()
         .await
@@ -393,12 +501,69 @@ async fn child_failure_during_shutdown_fails_the_group() {
 }
 
 #[tokio::test]
+async fn competing_failures_publish_the_primary_error_before_native_cleanup() {
+    use crate::component::vmm::{machine::DeviceKind, teardown::DeviceShutdown};
+
+    let engine = device_engine().unwrap();
+    let mut root = BoxRuntime::new(&engine, BoxHost::new()).unwrap();
+    let router = wasmtime::component::Component::new(
+        &engine,
+        include_bytes!(
+            "../../../../components/vmm/target/wasm32-wasip3/release/terra_vmm_component.wasm"
+        ),
+    )
+    .unwrap();
+    root.initialize_mmio(&router).await.unwrap();
+    let failure = root.mmio.as_ref().unwrap().failure_sink();
+    let outcome = root.lifecycle_notifier().subscribe();
+    let (entered, started) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    root.grant_device_shutdown(vec![DeviceShutdown::new(DeviceKind::Block, async move {
+        entered.send(()).unwrap();
+        released.recv_timeout(Duration::from_secs(2)).unwrap();
+        Err("cleanup failed".to_owned())
+    })])
+    .unwrap();
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let child_barrier = Arc::clone(&barrier);
+    let mut child = root.new_child(crate::box_runtime::RootHost::new());
+    child
+        .register_loop(Box::new(move |_| {
+            Box::pin(async move {
+                child_barrier.wait().await;
+                Err(wasmtime::Error::msg("child failed"))
+            })
+        }))
+        .unwrap();
+    root.attach_child(child).unwrap();
+    root.register_loop(Box::new(move |_| {
+        Box::pin(async move {
+            barrier.wait().await;
+            Err(wasmtime::Error::msg("root failed"))
+        })
+    }))
+    .unwrap();
+
+    let running = root.prepare().await.unwrap().start();
+    tokio::time::timeout(Duration::from_secs(2), started)
+        .await
+        .unwrap()
+        .unwrap();
+    let primary = failure.lock().unwrap().clone().unwrap();
+    assert!(matches!(primary.as_str(), "root failed" | "child failed"));
+    assert_eq!(*outcome.borrow(), Some(Outcome::ComponentFailed));
+    release.send(()).unwrap();
+    assert_eq!(running.join().await.unwrap_err().to_string(), primary);
+    assert_eq!(failure.lock().unwrap().as_deref(), Some(primary.as_str()));
+}
+
+#[tokio::test]
 async fn configured_component_limit_counts_all_memories_and_is_inherited() {
     let engine = device_engine().unwrap();
     let limits = ComponentMemoryLimits::new(65_536, 131_072).unwrap();
     let root = BoxRuntime::new(&engine, BoxHost::with_memory_limits(limits)).unwrap();
-    let mut first = root.new_child(BoxHost::new()).unwrap();
-    let mut peer = root.new_child(BoxHost::new()).unwrap();
+    let mut first = root.new_child(crate::box_runtime::RootHost::new());
+    let mut peer = root.new_child(crate::box_runtime::RootHost::new());
     let two_memories = wasmtime::Module::new(&engine, "(module (memory 1) (memory 1))").unwrap();
     let error = wasmtime::Instance::new_async(&mut first.store, &two_memories, &[])
         .await
@@ -412,7 +577,7 @@ async fn configured_component_limit_counts_all_memories_and_is_inherited() {
         !ResourceLimiter::memory_growing(peer.store.data_mut(), 65_536, 131_072, None).unwrap()
     );
     drop(first);
-    let mut replacement = root.new_child(BoxHost::new()).unwrap();
+    let mut replacement = root.new_child(crate::box_runtime::RootHost::new());
     wasmtime::Instance::new_async(&mut replacement.store, &memory, &[])
         .await
         .unwrap();
@@ -442,47 +607,6 @@ fn policy_memory_reservation_preserves_the_total_box_limit() {
     );
 }
 
-#[tokio::test]
-async fn cancelled_recovery_retains_cleanup_order() {
-    use crate::component::vmm::{machine::DeviceKind, teardown::DeviceShutdown};
-    let (entered, started) = tokio::sync::oneshot::channel();
-    let (release, released) = std::sync::mpsc::channel();
-    let (finished, completed) = tokio::sync::oneshot::channel();
-    let first_finished = Arc::new(AtomicBool::new(false));
-    let first_observer = Arc::clone(&first_finished);
-    let devices = vec![
-        DeviceShutdown::new(DeviceKind::Memory, move || {
-            entered.send(()).unwrap();
-            released.recv_timeout(Duration::from_secs(2)).unwrap();
-            first_finished.store(true, Ordering::Release);
-            Ok(())
-        }),
-        DeviceShutdown::new(DeviceKind::Block, move || {
-            assert!(first_observer.load(Ordering::Acquire));
-            finished.send(()).unwrap();
-            Ok(())
-        }),
-    ];
-    {
-        let recovering = super::finish_native_recovery(super::DropRecovery {
-            filesystems: Vec::new(),
-            machine: None,
-            devices,
-            interrupts: None,
-        });
-        tokio::pin!(recovering);
-        tokio::select! {
-            result = &mut recovering => panic!("recovery completed before release: {result:?}"),
-            result = started => result.unwrap(),
-        }
-    }
-    release.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(2), completed)
-        .await
-        .unwrap()
-        .unwrap();
-}
-
 #[test]
 fn dropping_a_box_moves_filesystem_resource_cleanup_off_the_caller() {
     use wasmtime_wasi::WasiView;
@@ -497,9 +621,10 @@ fn dropping_a_box_moves_filesystem_resource_cleanup_off_the_caller() {
         }
     }
     let root = tempfile::tempdir().unwrap();
-    let mut host = BoxHost::new();
+    let engine = device_engine().unwrap();
+    let runtime = BoxRuntime::new(&engine, BoxHost::new()).unwrap();
     let mut filesystem = crate::component::fs::host::FsHost::new(
-        DeviceHost::new(4096).unwrap(),
+        DeviceContext::new(4096).unwrap(),
         crate::component::fs::host::ShareGrant::new(root.path(), false).unwrap(),
     );
     let (started, ready) = std::sync::mpsc::channel();
@@ -512,7 +637,7 @@ fn dropping_a_box_moves_filesystem_resource_cleanup_off_the_caller() {
             release: blocked,
         })
         .unwrap();
-    host.filesystems.push(filesystem);
+    let host = runtime.new_child(filesystem);
     let (dropped, done) = std::sync::mpsc::channel();
     let caller = std::thread::spawn(move || {
         drop(host);
@@ -523,4 +648,32 @@ fn dropping_a_box_moves_filesystem_resource_cleanup_off_the_caller() {
     drop(release);
     caller.join().unwrap();
     result.expect("native resource cleanup must not block the dropping thread");
+}
+
+#[tokio::test]
+async fn dropping_root_starts_cleanup_without_waiting_for_it_or_the_last_observer() {
+    use crate::component::vmm::{machine::DeviceKind, teardown::DeviceShutdown};
+
+    let host = BoxHost::new();
+    let teardown = host.lifecycle.native_teardown();
+    let (entered, started) = std::sync::mpsc::channel();
+    let (release, blocked) = std::sync::mpsc::channel();
+    teardown
+        .install_devices(vec![DeviceShutdown::new(DeviceKind::Block, async move {
+            entered.send(()).unwrap();
+            blocked.recv_timeout(Duration::from_secs(5)).unwrap();
+            Ok(())
+        })])
+        .unwrap();
+    let (dropped, done) = std::sync::mpsc::channel();
+    let caller = std::thread::spawn(move || {
+        drop(host);
+        dropped.send(()).unwrap();
+    });
+    started.recv_timeout(Duration::from_secs(3)).unwrap();
+    let result = done.recv_timeout(Duration::from_secs(1));
+    release.send(()).unwrap();
+    caller.join().unwrap();
+    result.expect("root retirement must not wait for native cleanup");
+    teardown.wait_until_finished().await.unwrap();
 }

@@ -1,7 +1,22 @@
 //! Egress authorization and DNS policy contracts for native socket adapters.
 
-use std::net::IpAddr;
-use std::sync::Arc;
+use std::{future::Future, net::IpAddr, pin::Pin, sync::Arc};
+
+pub type DecisionLease = Box<dyn Send>;
+
+pub type DecisionFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
+
+/// Retain the lease with accepted work until completion, including after caller cancellation.
+pub trait AsyncPolicy: Send + Sync {
+    fn allows(&self, ip: IpAddr, port: Option<u16>, lease: DecisionLease) -> DecisionFuture<bool>;
+    fn lookup_name(&self, name: String, lease: DecisionLease) -> DecisionFuture<NameLookup>;
+    fn accept_resolved(
+        &self,
+        name: String,
+        addresses: Vec<IpAddr>,
+        lease: DecisionLease,
+    ) -> DecisionFuture<Vec<IpAddr>>;
+}
 
 /// The result a policy permits for one standard name lookup.
 pub enum NameLookup {
@@ -15,6 +30,11 @@ pub enum NameLookup {
 
 /// Native egress decisions; implementations must avoid blocking host I/O.
 pub trait Policy: Send + Sync {
+    /// Opt into nonblocking decisions and metadata checks; `None` keeps synchronous calls isolated.
+    fn asynchronous(self: Arc<Self>) -> Option<Arc<dyn AsyncPolicy>> {
+        None
+    }
+
     fn is_available(&self) -> bool {
         true
     }

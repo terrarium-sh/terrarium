@@ -197,10 +197,9 @@ async fn posted_receive_queue_drains_handshake_and_plan_without_a_second_bell() 
             None,
             no_interrupt(),
         )
-        .await
     }
     .expect("vsock");
-    let runtime = runtime.start();
+    let runtime = runtime.prepare().await.expect("runtime prepared").start();
     let memory = BoundedMemory::new(&ram);
 
     configure_transport(&channel);

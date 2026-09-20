@@ -1,5 +1,7 @@
+use wasmtime::component::HasSelf;
+
 use crate::SyntheticRam;
-use crate::engine::DeviceHost;
+use crate::engine::DeviceContext;
 #[cfg(unix)]
 use vm_memory::{GuestAddress, GuestMemoryBackend, GuestMemoryRegion, MemoryRegionAddress};
 #[cfg(windows)]
@@ -11,12 +13,15 @@ wasmtime::component::bindgen!({
     world: "device",
     path: "../../components/mem/wit",
     debug: false,
+    exports: { default: async },
     with: {
         "terra:host/memory@0.1.0": crate::engine::terra::host::memory,
         "terra:host/interrupt@0.1.0": crate::engine::terra::host::interrupt,
+        "terra:mmio/types@0.1.0": crate::component::vmm::mmio::terra::mmio::types,
     },
 });
 
+pub(crate) use Device as MemComponent;
 pub use terra::mmio::types::DeviceError as MemDeviceError;
 
 const PAGE_BYTES: u64 = 4096;
@@ -37,20 +42,11 @@ pub enum ReclaimError {
     Io,
 }
 
-pub struct MemHost {
-    pub device: DeviceHost,
-}
-
-impl MemHost {
-    #[must_use]
-    pub fn new(device: DeviceHost) -> Self {
-        Self { device }
-    }
-
+impl DeviceContext {
     pub fn discard(&mut self, ranges: &[ReclaimRange]) -> Result<(), ReclaimError> {
-        validate_ranges(self.device.guest_ram(), ranges)?;
+        validate_ranges(self.guest_ram(), ranges)?;
         for &range in ranges {
-            discard_range(self.device.guest_ram(), range)?;
+            discard_range(self.guest_ram(), range)?;
         }
         Ok(())
     }
@@ -205,58 +201,6 @@ fn host_page_bytes() -> usize {
     }
 }
 
-struct MemMemoryHost;
-
-impl wasmtime::component::HasData for MemMemoryHost {
-    type Data<'a> = &'a mut MemHost;
-}
-
-struct MemInterruptHost;
-
-impl wasmtime::component::HasData for MemInterruptHost {
-    type Data<'a> = &'a mut MemHost;
-}
-
-struct MemNativeHost;
-
-impl wasmtime::component::HasData for MemNativeHost {
-    type Data<'a> = &'a mut MemHost;
-}
-
-impl wasmtime_wasi::WasiView for MemHost {
-    fn ctx(&mut self) -> wasmtime_wasi::WasiCtxView<'_> {
-        wasmtime_wasi::WasiView::ctx(&mut self.device)
-    }
-}
-
-impl terra::host::memory::Host for MemHost {
-    fn read(&mut self, offset: u64, len: u64) -> Result<Vec<u8>, terra::host::memory::MemoryError> {
-        terra::host::memory::Host::read(&mut self.device, offset, len)
-    }
-
-    fn write(
-        &mut self,
-        offset: u64,
-        data: Vec<u8>,
-    ) -> Result<(), terra::host::memory::MemoryError> {
-        terra::host::memory::Host::write(&mut self.device, offset, data)
-    }
-
-    fn ram_bytes(&mut self) -> u64 {
-        terra::host::memory::Host::ram_bytes(&mut self.device)
-    }
-}
-
-impl terra::host::interrupt::Host for MemHost {
-    fn set_level(&mut self, level: bool) {
-        terra::host::interrupt::Host::set_level(&mut self.device, level);
-    }
-
-    fn signal(&mut self) {
-        terra::host::interrupt::Host::signal(&mut self.device);
-    }
-}
-
 fn reclaim_error(error: ReclaimError) -> terra::mem::host::Error {
     match error {
         ReclaimError::Invalid => terra::mem::host::Error::Invalid,
@@ -265,7 +209,7 @@ fn reclaim_error(error: ReclaimError) -> terra::mem::host::Error {
     }
 }
 
-impl terra::mem::host::Host for MemHost {
+impl terra::mem::host::Host for DeviceContext {
     fn discard(
         &mut self,
         ranges: Vec<terra::mem::host::Range>,
@@ -281,64 +225,12 @@ impl terra::mem::host::Host for MemHost {
     }
 }
 
-pub fn mem_component_linker(
+pub fn mem_component_linker<T: crate::engine::DeviceHost>(
     engine: &wasmtime::Engine,
-) -> wasmtime::Result<wasmtime::component::Linker<MemHost>> {
+) -> wasmtime::Result<wasmtime::component::Linker<T>> {
     let mut linker = crate::engine::device_component_linker(engine)?;
-    crate::engine::terra::host::memory::add_to_linker::<MemHost, MemMemoryHost>(
-        &mut linker,
-        |host| host,
-    )?;
-    crate::engine::terra::host::interrupt::add_to_linker::<MemHost, MemInterruptHost>(
-        &mut linker,
-        |host| host,
-    )?;
-    terra::mem::host::add_to_linker::<MemHost, MemNativeHost>(&mut linker, |host| host)?;
-    Ok(linker)
-}
-
-fn shared_memory(host: &mut crate::box_runtime::BoxHost) -> &mut MemHost {
-    &mut host.memory[0]
-}
-
-fn shared_memory_cli(
-    host: &mut crate::box_runtime::BoxHost,
-) -> wasmtime_wasi::cli::WasiCliCtxView<'_> {
-    use wasmtime_wasi::cli::WasiCliView;
-
-    shared_memory(host).device.cli()
-}
-
-fn shared_memory_clocks(
-    host: &mut crate::box_runtime::BoxHost,
-) -> wasmtime_wasi::clocks::WasiClocksCtxView<'_> {
-    use wasmtime_wasi::clocks::WasiClocksView;
-
-    shared_memory(host).device.clocks()
-}
-
-pub fn shared_mem_component_linker(
-    engine: &wasmtime::Engine,
-) -> wasmtime::Result<wasmtime::component::Linker<crate::box_runtime::BoxHost>> {
-    let mut linker = crate::engine::device_component_linker_with_wasi(
-        engine,
-        crate::engine::DeviceWasiGetters {
-            cli: shared_memory_cli,
-            clocks: shared_memory_clocks,
-        },
-    )?;
-    crate::engine::terra::host::memory::add_to_linker::<crate::box_runtime::BoxHost, MemMemoryHost>(
-        &mut linker,
-        shared_memory,
-    )?;
-    crate::engine::terra::host::interrupt::add_to_linker::<
-        crate::box_runtime::BoxHost,
-        MemInterruptHost,
-    >(&mut linker, shared_memory)?;
-    terra::mem::host::add_to_linker::<crate::box_runtime::BoxHost, MemNativeHost>(
-        &mut linker,
-        shared_memory,
-    )?;
+    crate::engine::add_device_imports(&mut linker, T::context)?;
+    terra::mem::host::add_to_linker::<T, HasSelf<DeviceContext>>(&mut linker, T::context)?;
     Ok(linker)
 }
 
@@ -347,15 +239,15 @@ mod tests {
     use super::*;
     use crate::BoundedMemory;
 
-    fn host() -> (MemHost, SyntheticRam) {
+    fn host() -> (DeviceContext, SyntheticRam) {
         let ram = SyntheticRam::new(16 * 1024).expect("RAM");
-        (MemHost::new(DeviceHost::with_ram(ram.clone())), ram)
+        (DeviceContext::with_ram(ram.clone()), ram)
     }
 
     #[test]
     fn legal_reclaim_batches_are_not_limited_by_a_worker_lifetime_total() {
         let ram = SyntheticRam::new(256 << 20).unwrap();
-        let mut host = MemHost::new(DeviceHost::with_ram(ram));
+        let mut host = DeviceContext::with_ram(ram);
         let result = host.discard(&[ReclaimRange {
             addr: 0,
             len: MAX_DISCARD_BYTES,
@@ -380,9 +272,8 @@ mod tests {
             return;
         }
         let ram = SyntheticRam::new((page * 2) as u64).expect("RAM");
-        let mut host = MemHost::new(DeviceHost::with_ram(ram));
-        host.device
-            .guest_write(0, &vec![0x5a; guest_page])
+        let mut host = DeviceContext::with_ram(ram);
+        host.guest_write(0, &vec![0x5a; guest_page])
             .expect("write RAM");
         assert_eq!(
             host.discard(&[ReclaimRange {
@@ -392,7 +283,7 @@ mod tests {
             Err(ReclaimError::Invalid)
         );
         assert_eq!(
-            host.device.guest_read(0, PAGE_BYTES).expect("read RAM"),
+            host.guest_read(0, PAGE_BYTES).expect("read RAM"),
             vec![0x5a; guest_page]
         );
     }
@@ -402,9 +293,8 @@ mod tests {
     fn discard_zeroes_this_vm_page() {
         let page = host_page_bytes();
         let ram = SyntheticRam::new((page * 2) as u64).expect("RAM");
-        let mut host = MemHost::new(DeviceHost::with_ram(ram.clone()));
-        host.device
-            .guest_write(page as u64, &vec![0x5a; page])
+        let mut host = DeviceContext::with_ram(ram.clone());
+        host.guest_write(page as u64, &vec![0x5a; page])
             .expect("write RAM");
         let result = host.discard(&[ReclaimRange {
             addr: page as u64,
@@ -413,18 +303,14 @@ mod tests {
         #[cfg(target_os = "macos")]
         if result == Err(ReclaimError::Unsupported) {
             assert_eq!(
-                host.device
-                    .guest_read(page as u64, page as u64)
-                    .expect("read RAM"),
+                host.guest_read(page as u64, page as u64).expect("read RAM"),
                 vec![0x5a; page]
             );
             return;
         }
         result.expect("discard page");
         assert_eq!(
-            host.device
-                .guest_read(page as u64, page as u64)
-                .expect("read RAM"),
+            host.guest_read(page as u64, page as u64).expect("read RAM"),
             vec![0; page]
         );
         assert_eq!(
@@ -488,7 +374,7 @@ mod tests {
                 .expect("RAM with a hole"),
         );
         let ram = SyntheticRam::from_shared(mapping).expect("RAM alias");
-        let mut host = MemHost::new(DeviceHost::with_ram(ram.clone()));
+        let mut host = DeviceContext::with_ram(ram.clone());
         BoundedMemory::new(&ram)
             .write(0, &[0x5a; 4096])
             .expect("write first region");
@@ -507,7 +393,7 @@ mod tests {
     #[test]
     fn discard_does_not_touch_another_mapping() {
         let first_ram = SyntheticRam::new(64 * 1024).expect("RAM");
-        let mut first = MemHost::new(DeviceHost::with_ram(first_ram.clone()));
+        let mut first = DeviceContext::with_ram(first_ram.clone());
         let (_second, second_ram) = host();
         BoundedMemory::new(&first_ram)
             .write(0, &[0x5a; 4096])

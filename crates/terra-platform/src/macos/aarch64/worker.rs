@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Instant;
-use terra_runtime::component::vmm::virtualization::{PreparedMachine, StartedVcpus, VcpuReaper};
+use terra_runtime::component::vmm::virtualization::{PreparedMachine, StartedVcpus};
 use terra_runtime::component::vmm::{NativeVcpu, boot::BootEntry};
 
 use crate::macos::aarch64::machine::{Cpu, Machine, RunExit};
@@ -154,31 +154,34 @@ pub async fn prepare(mut input: WorkerInput) -> Result<PreparedVmm, String> {
         Arc::new(Machine::new(layout.ram_size()).map_err(|error| error.to_string())?);
     let group = VcpuGroup::prepare(&native_machine, input.vcpus, input.hard_stop)?;
     let prepared = PreparedMachine::new(config, Arc::clone(&native_machine));
-    let mut component_runtime =
+    let component_runtime =
         crate::worker::create_runtime(&input).map_err(|error| error.to_string())?;
-    let machine = crate::worker::boot_prepared(&mut component_runtime, prepared, &mut input)
-        .await
-        .map_err(|error| error.to_string())?;
+    let (mut component_runtime, machine) =
+        crate::worker::boot_prepared(component_runtime, prepared, &mut input)
+            .await
+            .map_err(|error| error.to_string())?;
     let devices = worker::assemble_devices(
         &mut component_runtime,
         &mut input,
         machine.ram(),
         &disks,
         |kind, index| {
-            machine.bind_interrupt(kind, index, |machine, irq, level| {
-                inject_irq(machine, irq, level)
-            })
+            machine
+                .bind_interrupt(kind, index, |machine, irq, level| {
+                    inject_irq(machine, irq, level)
+                })
+                .map_err(|error| error.to_string())
         },
-    )
-    .await?;
-    let shutdowns = worker::grant_device_shutdown(&mut component_runtime, &devices)?;
+    )?;
+    worker::grant_device_shutdown(&mut component_runtime, &devices)?;
     let lifecycle = component_runtime.lifecycle_notifier();
-    let group = component_runtime
-        .grant_vcpus(move |controls, boot| {
+    let (component_runtime, group) = component_runtime
+        .prepare_vcpus(move |controls, boot| {
             group.start(controls, boot).map_err(wasmtime::Error::msg)
         })
         .await
         .map_err(|error| error.to_string())?;
+    let teardown = component_runtime.native_teardown();
     Ok(PreparedVmm {
         runtime: component_runtime,
         observation: VmmObservation {
@@ -186,8 +189,7 @@ pub async fn prepare(mut input: WorkerInput) -> Result<PreparedVmm, String> {
             lifecycle,
             deadline: input.deadline,
             devices,
-            shutdowns,
-            interrupts: None,
+            teardown,
         },
     })
 }
@@ -242,11 +244,7 @@ impl VcpuGroup {
         Ok(group)
     }
 
-    fn start(
-        self,
-        workers: Vec<NativeVcpu>,
-        boot: BootEntry,
-    ) -> Result<StartedVcpus<VcpuReaper>, String> {
+    fn start(self, workers: Vec<NativeVcpu>, boot: BootEntry) -> Result<StartedVcpus, String> {
         if self.starts.senders.len() != workers.len() {
             return Err("vCPU worker count changed during startup".to_owned());
         }
@@ -259,11 +257,14 @@ impl VcpuGroup {
                 .map_err(|_| "vCPU startup thread disappeared")?;
         }
         let starts = Arc::clone(&self.starts);
-        Ok(StartedVcpus::new(self, move || {
-            starts.stop();
-            Ok(())
-        })
-        .with_reaper(|mut group| group.stop()))
+        Ok(StartedVcpus::new(
+            self,
+            move || {
+                starts.stop();
+                Ok(())
+            },
+            |mut group| group.stop(),
+        ))
     }
 
     fn stop(&mut self) -> Result<Vec<Result<(), String>>, String> {

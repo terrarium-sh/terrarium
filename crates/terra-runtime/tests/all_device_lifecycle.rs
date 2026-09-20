@@ -10,10 +10,9 @@ use terra_runtime::{
     component::{
         Interrupt,
         fs::host::{FsHost, ShareGrant},
-        mem::host::MemHost,
         vsock::VsockChannel,
     },
-    engine::{DeviceHost, DiskGrant, device_engine},
+    engine::{DeviceContext, DiskGrant, device_engine},
 };
 use wasmtime::component::Component;
 
@@ -90,7 +89,7 @@ fn load_components(engine: &wasmtime::Engine) -> [Component; 5] {
     ]
 }
 
-async fn start_vsock(runtime: &mut BoxRuntime, ram: SyntheticRam) -> VsockChannel {
+fn start_vsock(runtime: &mut BoxRuntime, ram: SyntheticRam) -> VsockChannel {
     // SAFETY: this test embeds the build's trusted AOT vsock artifact.
     #[allow(unsafe_code)]
     unsafe {
@@ -104,7 +103,6 @@ async fn start_vsock(runtime: &mut BoxRuntime, ram: SyntheticRam) -> VsockChanne
             None,
             no_interrupt(),
         )
-        .await
     }
     .expect("vsock")
 }
@@ -125,8 +123,10 @@ async fn every_device_resets_and_closes_in_one_box_runtime() {
     let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
     runtime.initialize_mmio(&router).await.expect("MMIO router");
 
-    let mut block_host = DeviceHost::with_ram(ram.clone());
-    block_host.set_disk(DiskGrant::Mem(BoundedDisk::new(4096, false)));
+    let block_host = terra_runtime::engine::BlockHost::new(
+        ram.clone(),
+        DiskGrant::Mem(BoundedDisk::new(4096, false)),
+    );
     let block = terra_runtime::component::block::instantiate_shared(
         &mut runtime,
         block_host,
@@ -134,12 +134,11 @@ async fn every_device_resets_and_closes_in_one_box_runtime() {
         false,
         no_interrupt(),
     )
-    .await
     .expect("block");
     let filesystem = terra_runtime::component::fs::instantiate_shared(
         &mut runtime,
         FsHost::new(
-            DeviceHost::with_ram(ram.clone()),
+            DeviceContext::with_ram(ram.clone()),
             ShareGrant::new(&mount, false).expect("mount grant"),
         ),
         &fs_component,
@@ -147,31 +146,28 @@ async fn every_device_resets_and_closes_in_one_box_runtime() {
         8192,
         no_interrupt(),
     )
-    .await
     .expect("filesystem");
     let memory = terra_runtime::component::mem::instantiate_shared(
         &mut runtime,
-        MemHost::new(DeviceHost::with_ram(ram.clone())),
+        DeviceContext::with_ram(ram.clone()),
         &mem_component,
         no_interrupt(),
     )
-    .await
     .expect("memory");
     let policy: PolicyHandle = Arc::new(NoNetwork);
     let network = terra_runtime::component::network::instantiate_shared(
         &mut runtime,
-        DeviceHost::with_ram(ram.clone()),
+        terra_runtime::engine::DeviceContext::with_ram(ram.clone()),
         &network_component,
         policy,
         Vec::new(),
         GuestNetworkConfig::default(),
         no_interrupt(),
     )
-    .await
     .expect("network");
-    let vsock = start_vsock(&mut runtime, ram).await;
+    let vsock = start_vsock(&mut runtime, ram);
 
-    let runtime = runtime.start();
+    let runtime = runtime.prepare().await.expect("runtime prepared").start();
     for _ in 0..3 {
         reset_device(
             |offset, bytes| block.write(offset, bytes),

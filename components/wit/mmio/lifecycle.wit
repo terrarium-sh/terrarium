@@ -1,8 +1,6 @@
 package terra:mmio@0.1.0;
 
 interface lifecycle-platform {
-    use machine-types.{device-kind};
-    record device-grant { id: u32, kind: device-kind }
     variant event {
         guest-exit(s32),
         component-failed,
@@ -13,9 +11,7 @@ interface lifecycle-platform {
     enum error { closed }
 
     next-event: async func() -> result<event, error>;
-    devices: func() -> list<device-grant>;
-    close-device: async func(id: u32) -> result<_, error>;
-    release-interrupts: async func() -> result<_, error>;
+    shutdown: async func() -> result<_, error>;
 }
 
 interface lifecycle {

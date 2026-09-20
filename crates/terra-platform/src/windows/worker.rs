@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(target_arch = "aarch64")]
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
-use terra_runtime::component::vmm::virtualization::{StartedVcpus, VcpuReaper};
+use terra_runtime::component::vmm::virtualization::StartedVcpus;
 
 use crate::WindowsRam;
 #[cfg(target_arch = "x86_64")]
@@ -37,22 +37,25 @@ impl VcpuGroup {
         }
     }
 
-    fn into_started(self) -> StartedVcpus<VcpuReaper> {
+    fn into_started(self) -> StartedVcpus {
         let partition = Arc::clone(&self.partition);
         let stop = Arc::clone(&self.stop);
         let on_stop = self.on_stop.clone();
         let count = self.threads.len();
-        StartedVcpus::new(self, move || {
-            stop.store(true, Ordering::Relaxed);
-            if let Some(on_stop) = on_stop {
-                on_stop();
-            }
-            for id in (0_u32..).take(count) {
-                let _ = partition.cancel_vcpu(id);
-            }
-            Ok(())
-        })
-        .with_reaper(|mut group| group.stop())
+        StartedVcpus::new(
+            self,
+            move || {
+                stop.store(true, Ordering::Relaxed);
+                if let Some(on_stop) = on_stop {
+                    on_stop();
+                }
+                for id in (0_u32..).take(count) {
+                    let _ = partition.cancel_vcpu(id);
+                }
+                Ok(())
+            },
+            |mut group| group.stop(),
+        )
     }
 
     fn spawn(
@@ -120,7 +123,7 @@ fn launch_vcpus(
     boot: terra_runtime::component::vmm::boot::BootEntry,
     ioapic: &IoApicHandle,
     hard_stop: Option<fn() -> !>,
-) -> Result<StartedVcpus<VcpuReaper>, String> {
+) -> Result<StartedVcpus, String> {
     crate::windows::amd64::configure_planned_boot(&partition, boot.entry, boot.boot_argument)
         .map_err(|error| format!("configuring boot: {error:?}"))?;
     log::info!(
@@ -144,7 +147,7 @@ fn launch_vcpus(
     controls: Vec<terra_runtime::component::vmm::NativeVcpu>,
     boot: terra_runtime::component::vmm::boot::BootEntry,
     hard_stop: Option<fn() -> !>,
-) -> Result<StartedVcpus<VcpuReaper>, String> {
+) -> Result<StartedVcpus, String> {
     crate::windows::aarch64::setup_bsp(&partition, boot.entry, boot.boot_argument)
         .map_err(|error| error.to_string())?;
     let mut group = VcpuGroup::new(partition, hard_stop);
@@ -179,7 +182,7 @@ async fn prepare_x64(mut input: WorkerInput) -> Result<PreparedVmm, String> {
     if input.vcpus == 0 || input.vcpus > MAX_VCPUS {
         return Err("invalid Windows x64 VM dimensions".to_owned());
     }
-    let mut component_runtime =
+    let component_runtime =
         crate::worker::create_runtime(&input).map_err(|error| error.to_string())?;
     let disks = crate::worker::disk_paths(&input);
     let block_count = 1 + disks.len();
@@ -199,9 +202,10 @@ async fn prepare_x64(mut input: WorkerInput) -> Result<PreparedVmm, String> {
             .map_err(|error| error.to_string())?;
     }
     let prepared = PreparedMachine::new(config, partition);
-    let partition = crate::worker::boot_prepared(&mut component_runtime, prepared, &mut input)
-        .await
-        .map_err(|error| error.to_string())?;
+    let (mut component_runtime, partition) =
+        crate::worker::boot_prepared(component_runtime, prepared, &mut input)
+            .await
+            .map_err(|error| error.to_string())?;
     let ram_alias = partition.ram();
     let ioapic = component_runtime
         .grant_ioapic(Arc::new({
@@ -230,21 +234,23 @@ async fn prepare_x64(mut input: WorkerInput) -> Result<PreparedVmm, String> {
         &mut input,
         ram_alias.clone(),
         &disks,
-        |kind, index| ioapic.bind_interrupt(kind, index),
-    )
-    .await?;
-    let shutdowns = worker::grant_device_shutdown(&mut component_runtime, &devices)?;
+        |kind, index| Ok(ioapic.bind_interrupt(kind, index)),
+    )?;
+    worker::grant_device_shutdown(&mut component_runtime, &devices)?;
     let interrupt_handle = ioapic.clone();
-    let interrupt_shutdown = component_runtime
-        .grant_interrupt_shutdown(move || {
-            interrupt_handle.close().map_err(|error| error.to_string())
+    component_runtime
+        .grant_interrupt_shutdown(async move {
+            interrupt_handle
+                .close()
+                .await
+                .map_err(|error| error.to_string())
         })
         .map_err(|error| error.to_string())?;
     let lifecycle = component_runtime.lifecycle_notifier();
     let launch_ioapic = ioapic.clone();
     let hard_stop = input.hard_stop;
-    let runners = component_runtime
-        .grant_vcpus(move |controls, boot| {
+    let (component_runtime, runners) = component_runtime
+        .prepare_vcpus(move |controls, boot| {
             launch_vcpus(
                 partition.machine(),
                 controls,
@@ -256,6 +262,7 @@ async fn prepare_x64(mut input: WorkerInput) -> Result<PreparedVmm, String> {
         })
         .await
         .map_err(|error| error.to_string())?;
+    let teardown = component_runtime.native_teardown();
     Ok(PreparedVmm {
         runtime: component_runtime,
         observation: VmmObservation {
@@ -263,8 +270,7 @@ async fn prepare_x64(mut input: WorkerInput) -> Result<PreparedVmm, String> {
             lifecycle,
             deadline: input.deadline,
             devices,
-            shutdowns,
-            interrupts: Some(interrupt_shutdown),
+            teardown,
         },
     })
 }
@@ -529,7 +535,7 @@ async fn prepare_arm64(mut input: WorkerInput) -> Result<PreparedVmm, String> {
     if input.vcpus == 0 || input.vcpus > MAX_VCPUS {
         return Err("invalid Windows ARM64 vCPU count".to_owned());
     }
-    let mut component_runtime =
+    let component_runtime =
         crate::worker::create_runtime(&input).map_err(|error| error.to_string())?;
     let disks = crate::worker::disk_paths(&input);
     let block_count = 1 + disks.len();
@@ -549,28 +555,33 @@ async fn prepare_arm64(mut input: WorkerInput) -> Result<PreparedVmm, String> {
             .map_err(|error| error.to_string())?;
     }
     let prepared = PreparedMachine::new(config, partition);
-    let partition = crate::worker::boot_prepared(&mut component_runtime, prepared, &mut input)
-        .await
-        .map_err(|error| error.to_string())?;
+    let (mut component_runtime, partition) =
+        crate::worker::boot_prepared(component_runtime, prepared, &mut input)
+            .await
+            .map_err(|error| error.to_string())?;
     let ram_alias = partition.ram();
     let devices = worker::assemble_devices(
         &mut component_runtime,
         &mut input,
         ram_alias,
         &disks,
-        |kind, index| partition.bind_interrupt(kind, index, inject_arm_irq),
-    )
-    .await?;
-    let shutdowns = worker::grant_device_shutdown(&mut component_runtime, &devices)?;
+        |kind, index| {
+            partition
+                .bind_interrupt(kind, index, inject_arm_irq)
+                .map_err(|error| error.to_string())
+        },
+    )?;
+    worker::grant_device_shutdown(&mut component_runtime, &devices)?;
     let lifecycle = component_runtime.lifecycle_notifier();
     let hard_stop = input.hard_stop;
-    let runners = component_runtime
-        .grant_vcpus(move |controls, boot| {
+    let (component_runtime, runners) = component_runtime
+        .prepare_vcpus(move |controls, boot| {
             launch_vcpus(partition.machine(), controls, boot, hard_stop)
                 .map_err(wasmtime::Error::msg)
         })
         .await
         .map_err(|error| error.to_string())?;
+    let teardown = component_runtime.native_teardown();
     Ok(PreparedVmm {
         runtime: component_runtime,
         observation: VmmObservation {
@@ -578,8 +589,7 @@ async fn prepare_arm64(mut input: WorkerInput) -> Result<PreparedVmm, String> {
             lifecycle,
             deadline: input.deadline,
             devices,
-            shutdowns,
-            interrupts: None,
+            teardown,
         },
     })
 }

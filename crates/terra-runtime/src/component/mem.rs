@@ -4,17 +4,14 @@ pub mod host;
 
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::Arc;
+#[cfg(test)]
 use std::time::Duration;
 
+use crate::engine::DeviceContext;
 use wasmtime::Store;
-use wasmtime::component::{Component, Instance, TypedFunc};
+use wasmtime::component::Component;
 
-use crate::component::mem::host::{MemDeviceError, MemHost, shared_mem_component_linker};
-use crate::engine::component_export;
-
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
-
-type Configure = TypedFunc<(), (Result<(), MemDeviceError>,)>;
+use crate::component::mem::host::{MemComponent, MemDeviceError, mem_component_linker};
 
 pub use crate::component::Interrupt;
 
@@ -31,14 +28,14 @@ async fn configure_state<T: Send + 'static>(
     component: &Component,
     linker: &wasmtime::component::Linker<T>,
     interrupt: Interrupt,
-) -> wasmtime::Result<(Instance, MemState)> {
-    let export = |name| component_export(component, "terra:mem/transport@0.1.0", name, "memory");
-    let instance: Instance = linker.instantiate_async(&mut *store, component).await?;
-    let configure: Configure = instance.get_typed_func(&mut *store, export("configure")?)?;
+) -> wasmtime::Result<(MemComponent, MemState)> {
+    let instance = MemComponent::instantiate_async(&mut *store, component, linker).await?;
+    let transport = instance.terra_mem_transport();
+    let configure = transport.func_configure();
     let (configured,) = configure.call_async(&mut *store, ()).await?;
     configured.map_err(|error| transport_error("configure", error))?;
     let state = MemState {
-        run: instance.get_typed_func(&mut *store, export("run")?)?,
+        run: transport.func_run(),
         interrupt,
     };
     Ok((instance, state))
@@ -46,32 +43,33 @@ async fn configure_state<T: Send + 'static>(
 
 #[cfg(any(test, feature = "test-support"))]
 pub async fn instantiate(
-    store: Store<MemHost>,
+    engine: &wasmtime::Engine,
+    host: DeviceContext,
     component: &Component,
     interrupt: Interrupt,
-) -> wasmtime::Result<DeviceChannel> {
-    let engine = store.engine().clone();
+) -> wasmtime::Result<crate::component::StandaloneDevice> {
     let mut runtime =
-        crate::box_runtime::BoxRuntime::new(&engine, crate::box_runtime::BoxHost::new())?;
-    let channel = instantiate_shared(&mut runtime, store.into_data(), component, interrupt).await?;
-    Ok(DeviceChannel {
-        _runtime: Some(Arc::new(runtime.start())),
-        ..channel
+        crate::box_runtime::BoxRuntime::new(engine, crate::box_runtime::BoxHost::new())?;
+    crate::component::vmm::mmio::initialize_test_router(&mut runtime).await?;
+    let channel = instantiate_shared(&mut runtime, host, component, interrupt)?;
+    Ok(crate::component::StandaloneDevice {
+        _runtime: Arc::new(runtime.prepare().await?.start()),
+        device: channel,
     })
 }
 
-pub async fn instantiate_shared(
+pub fn instantiate_shared(
     runtime: &mut crate::box_runtime::BoxRuntime,
-    host: MemHost,
+    host: DeviceContext,
     component: &Component,
     interrupt: Interrupt,
 ) -> wasmtime::Result<DeviceChannel> {
-    grant_shared(runtime, move || Ok(host), component, interrupt).await
+    grant_shared(runtime, move || Ok(host), component, interrupt)
 }
 
-pub async fn grant_shared(
+pub fn grant_shared(
     runtime: &mut crate::box_runtime::BoxRuntime,
-    host: impl FnOnce() -> wasmtime::Result<MemHost> + Send + 'static,
+    host: impl FnOnce() -> wasmtime::Result<DeviceContext> + Send + 'static,
     component: &Component,
     interrupt: Interrupt,
 ) -> wasmtime::Result<DeviceChannel> {
@@ -80,59 +78,27 @@ pub async fn grant_shared(
     }
     let child = runtime.child_factory();
     let component = component.clone();
-    let factory: crate::component::vmm::workers::Factory = Box::new(move || {
-        Box::pin(async move {
-            create_worker(
-                child(crate::box_runtime::BoxHost::new())?,
-                host()?,
-                &component,
-                interrupt,
-            )
-            .await
-        })
-    });
-    let mmio = crate::component::vmm::mmio::MmioDevice::grant_worker(
-        runtime,
+    runtime.grant_device_worker(
         crate::component::vmm::machine::DeviceKind::Memory,
-        factory,
+        async move { create_worker(child(host()?), &component, interrupt).await },
     )
-    .await?;
-    Ok(DeviceChannel {
-        mmio,
-        _runtime: None,
-    })
 }
 
 async fn create_worker(
-    mut child: crate::box_runtime::BoxRuntime,
-    host: MemHost,
+    mut child: crate::box_runtime::DeviceWorker<DeviceContext>,
     component: &Component,
     interrupt: Interrupt,
 ) -> wasmtime::Result<(
-    crate::box_runtime::BoxRuntime,
+    crate::box_runtime::DeviceWorker<DeviceContext>,
     crate::component::vmm::mmio::Serve,
 )> {
-    let wake = host.device.interrupt_notification();
-    child.add_mem(host)?;
-    let linker = shared_mem_component_linker(child.store.engine())?;
-    let (instance, state) = tokio::time::timeout(
-        REQUEST_TIMEOUT,
-        configure_state(&mut child.store, component, &linker, interrupt),
-    )
-    .await
-    .map_err(|_| wasmtime::Error::msg("memory component setup timed out"))??;
-    let serve: crate::component::vmm::mmio::Serve = instance.get_typed_func(
-        &mut child.store,
-        component_export(component, "terra:mmio/device@0.1.0", "serve", "memory")?,
-    )?;
-    state.register(&mut child, wake, "mem", move |host| {
-        let host = host
-            .memory
-            .get_mut(0)
-            .ok_or_else(|| wasmtime::Error::msg("mem host missing"))?;
-        host.device.end_window();
-        Ok(host.device.interrupt_level())
-    })?;
+    let wake = child.store.data().interrupt_notification();
+    let linker = mem_component_linker(child.store.engine())?;
+    let (instance, state) = configure_state(&mut child.store, component, &linker, interrupt)
+        .await
+        .map_err(|error| error.context("memory component setup"))?;
+    let serve = instance.terra_mmio_device().func_serve();
+    state.register(&mut child, wake, "mem")?;
     Ok((child, serve))
 }
 
@@ -140,9 +106,9 @@ async fn create_worker(
 mod tests {
     use super::*;
     use crate::SyntheticRam;
-    use crate::engine::{DeviceHost, device_engine};
+    use crate::engine::{DeviceContext, device_engine};
 
-    async fn channel() -> DeviceChannel {
+    async fn channel() -> crate::component::StandaloneDevice {
         let engine = device_engine().expect("engine builds");
         let component_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../components/mem/target/wasm32-wasip3/release/terra_mem_component.wasm");
@@ -152,8 +118,8 @@ mod tests {
         )
         .expect("component compiles");
         let ram = SyntheticRam::new(64 * 1024).expect("RAM");
-        let store = Store::new(&engine, MemHost::new(DeviceHost::with_ram(ram.clone())));
-        crate::component::mem::instantiate(store, &component, Arc::new(|_| Ok(())))
+        let host = DeviceContext::with_ram(ram.clone());
+        crate::component::mem::instantiate(&engine, host, &component, Arc::new(|_| Ok(())))
             .await
             .expect("actor instantiates")
     }
@@ -187,20 +153,22 @@ mod tests {
         let mut runtime =
             crate::box_runtime::BoxRuntime::new(&engine, crate::box_runtime::BoxHost::new())
                 .expect("box runtime");
+        crate::component::vmm::mmio::initialize_test_router(&mut runtime)
+            .await
+            .expect("MMIO router");
         let interrupts = Arc::new(tokio::sync::Notify::new());
         let notification = Arc::clone(&interrupts);
         let channel = crate::component::mem::instantiate_shared(
             &mut runtime,
-            MemHost::new(DeviceHost::with_ram(ram)),
+            DeviceContext::with_ram(ram),
             &component,
             Arc::new(move |_| {
                 notification.notify_one();
                 Ok(())
             }),
         )
-        .await
         .expect("shared worker instantiates");
-        let runtime = runtime.start();
+        let runtime = runtime.prepare().await.unwrap().start();
         for _ in 0..32 {
             assert_eq!(
                 channel.read(0, 4).expect("magic read"),
@@ -230,11 +198,12 @@ mod tests {
         .unwrap();
         let ram = SyntheticRam::new(64 * 1024).unwrap();
         let memory = crate::BoundedMemory::new(&ram);
-        let store = Store::new(&engine, MemHost::new(DeviceHost::with_ram(ram.clone())));
+        let host = DeviceContext::with_ram(ram.clone());
         let interrupted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let interrupt = Arc::clone(&interrupted);
         let channel = crate::component::mem::instantiate(
-            store,
+            &engine,
+            host,
             &component,
             Arc::new(move |level| {
                 interrupt.store(level, std::sync::atomic::Ordering::Release);

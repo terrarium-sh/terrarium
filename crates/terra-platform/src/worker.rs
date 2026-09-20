@@ -44,13 +44,16 @@ pub(crate) fn create_runtime(
 pub(crate) async fn boot_prepared<
     M: terra_runtime::component::vmm::virtualization::VirtualMachine,
 >(
-    runtime: &mut crate::box_runtime::BoxRuntime,
+    mut runtime: crate::box_runtime::BoxRuntime,
     mut prepared: terra_runtime::component::vmm::virtualization::PreparedMachine<M>,
     input: &mut WorkerInput,
-) -> wasmtime::Result<terra_runtime::component::vmm::virtualization::MachineHandle<M>> {
+) -> wasmtime::Result<(
+    crate::box_runtime::BoxRuntime,
+    terra_runtime::component::vmm::virtualization::MachineHandle<M>,
+)> {
     // SAFETY: TrustedArtifacts admits only build-embedded AOT output for this runtime.
     let boot = unsafe {
-        wasmtime::component::Component::deserialize(runtime.store.engine(), input.artifacts.boot)
+        wasmtime::component::Component::deserialize(runtime.store.engine(), input.artifacts.boot())
     }?;
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     let kernel_cmdline = crate::windows::amd64::build_kernel_cmdline(
@@ -74,7 +77,7 @@ pub(crate) async fn boot_prepared<
     runtime.attach_machine(prepared).await
 }
 
-pub(crate) async fn assemble_devices(
+pub(crate) fn assemble_devices(
     runtime: &mut crate::box_runtime::BoxRuntime,
     input: &mut WorkerInput,
     ram: terra_runtime::component::vmm::virtualization::RamGrant,
@@ -82,32 +85,28 @@ pub(crate) async fn assemble_devices(
     bind_interrupt: impl Fn(
         terra_runtime::component::vmm::machine::DeviceKind,
         usize,
-    ) -> crate::component::network::Interrupt,
+    ) -> Result<crate::component::network::Interrupt, String>,
 ) -> Result<Vec<MmioDevice>, String> {
     use terra_runtime::component::vmm::machine::DeviceKind;
     let blocks = blocks(runtime, ram.clone(), input, disks, |index| {
         bind_interrupt(DeviceKind::Block, index)
-    })
-    .await?;
+    })?;
     let filesystems = filesystems(runtime, ram.clone(), input, |index| {
         bind_interrupt(DeviceKind::Fs, index)
-    })
-    .await?;
+    })?;
     let memory = memory(
         runtime,
         ram.clone(),
         input,
-        bind_interrupt(DeviceKind::Memory, 0),
-    )
-    .await?;
+        bind_interrupt(DeviceKind::Memory, 0)?,
+    )?;
     let network = network(
         runtime,
         ram.clone(),
         input,
-        bind_interrupt(DeviceKind::Net, 0),
-    )
-    .await?;
-    let vsock = vsock(runtime, ram, input, bind_interrupt(DeviceKind::Vsock, 0)).await?;
+        bind_interrupt(DeviceKind::Net, 0)?,
+    )?;
+    let vsock = vsock(runtime, ram, input, bind_interrupt(DeviceKind::Vsock, 0)?)?;
     let mut devices = blocks
         .into_iter()
         .map(MmioDevice::Block)
@@ -136,7 +135,7 @@ pub struct WorkerOutcome {
 }
 
 pub struct PreparedVmm {
-    pub runtime: crate::box_runtime::BoxRuntime,
+    pub runtime: crate::box_runtime::PreparedBoxRuntime,
     pub observation: VmmObservation,
 }
 
@@ -145,8 +144,7 @@ pub struct VmmObservation {
     pub(crate) lifecycle: terra_runtime::component::vmm::lifecycle::LifecycleNotifier,
     pub(crate) deadline: Option<Duration>,
     pub(crate) devices: Vec<MmioDevice>,
-    pub(crate) shutdowns: Vec<terra_runtime::component::vmm::teardown::DeviceShutdown>,
-    pub(crate) interrupts: Option<terra_runtime::component::vmm::teardown::NativeCleanup>,
+    pub(crate) teardown: terra_runtime::component::vmm::teardown::NativeTeardown,
 }
 
 impl VmmObservation {
@@ -162,16 +160,11 @@ impl VmmObservation {
             &self.lifecycle,
         )
         .await;
-        let vcpu_outcomes = self.reaper.wait().await;
-        let device_cleanup = finish_device_shutdown(&self.shutdowns).await;
-        let interrupt_cleanup = match self.interrupts {
-            Some(interrupts) => interrupts.wait().await,
-            None => Ok(()),
-        };
-        let cleanup =
-            finish_component_runtime(runtime, device_cleanup.and(interrupt_cleanup)).await;
-        let vcpu_outcomes = vcpu_outcomes?;
-        let exit_code = match outcome.map_err(|error| format!("VMM lifecycle: {error:?}"))? {
+        let shutdown_deadline = self.lifecycle.begin_shutdown();
+        let cleanup = self.teardown.wait_until(shutdown_deadline).await;
+        let runtime = finish_component_runtime(runtime, cleanup, shutdown_deadline).await;
+        let outcome = outcome.map_err(|error| format!("VMM lifecycle: {error:?}"))?;
+        let exit_code = match outcome {
             Outcome::GuestExit(code) => Some(code),
             Outcome::VcpuFinished | Outcome::Deadline => None,
             Outcome::ComponentFailed => {
@@ -182,7 +175,8 @@ impl VmmObservation {
                     .unwrap_or_else(|| "VMM component failed".to_owned()));
             }
         };
-        cleanup?;
+        let vcpu_outcomes = self.reaper.wait_until(shutdown_deadline).await?;
+        runtime?;
         Ok(WorkerOutcome {
             exit_code,
             vcpu_outcomes,
@@ -221,11 +215,15 @@ pub async fn run(input: WorkerInput) -> Result<WorkerOutcome, String> {
 pub(crate) async fn finish_component_runtime(
     runtime: crate::box_runtime::BoxRuntimeHandle,
     cleanup: Result<(), String>,
+    deadline: std::time::Instant,
 ) -> Result<(), String> {
     match cleanup {
-        Ok(()) => runtime.join().await.map_err(|error| error.to_string()),
+        Ok(()) => runtime
+            .join_until(deadline.into())
+            .await
+            .map_err(|error| error.to_string()),
         Err(error) => {
-            runtime.abort_and_join().await;
+            runtime.abort_and_join_until(deadline.into()).await;
             Err(error)
         }
     }
@@ -234,7 +232,7 @@ pub(crate) async fn finish_component_runtime(
 pub(crate) fn grant_device_shutdown(
     runtime: &mut crate::box_runtime::BoxRuntime,
     devices: &[MmioDevice],
-) -> Result<Vec<terra_runtime::component::vmm::teardown::DeviceShutdown>, String> {
+) -> Result<(), String> {
     use terra_runtime::component::vmm::{machine::DeviceKind, teardown::DeviceShutdown};
 
     let shutdowns = devices
@@ -248,40 +246,28 @@ pub(crate) fn grant_device_shutdown(
                 MmioDevice::Vsock(_) => DeviceKind::Vsock,
                 MmioDevice::Network(_) => DeviceKind::Net,
             };
-            DeviceShutdown::new(kind, move || device.close())
+            DeviceShutdown::new(kind, async move { device.close().await })
         })
         .collect::<Vec<_>>();
     runtime
-        .grant_device_shutdown(shutdowns.clone())
-        .map_err(|error| error.to_string())?;
-    Ok(shutdowns)
-}
-
-pub(crate) async fn finish_device_shutdown(
-    devices: &[terra_runtime::component::vmm::teardown::DeviceShutdown],
-) -> Result<(), String> {
-    let mut first_error = None;
-    for device in devices {
-        if let Err(error) = device.wait().await {
-            first_error.get_or_insert(error);
-        }
-    }
-    first_error.map_or(Ok(()), Err)
+        .grant_device_shutdown(shutdowns)
+        .map_err(|error| error.to_string())
 }
 
 #[allow(unsafe_code)]
-pub(crate) async fn blocks(
+pub(crate) fn blocks(
     runtime: &mut crate::box_runtime::BoxRuntime,
     ram: impl Into<terra_runtime::component::vmm::virtualization::RamGrant> + Send,
     input: &mut WorkerInput,
     disks: &[(PathBuf, bool)],
-    interrupt: impl Fn(usize) -> crate::component::block::Interrupt,
+    interrupt: impl Fn(usize) -> Result<crate::component::block::Interrupt, String>,
 ) -> Result<Vec<crate::component::DeviceChannel>, String> {
     use crate::component::block::backing::FileDisk;
-    use crate::engine::{DeviceHost, DiskGrant, trusted_component};
+    use crate::component::block::host::BlockHost;
+    use crate::engine::{DiskGrant, trusted_component};
 
     // SAFETY: TrustedArtifacts admits only build-embedded AOT output for this runtime.
-    let component = unsafe { trusted_component(runtime.store.engine(), input.artifacts.block) }
+    let component = unsafe { trusted_component(runtime.store.engine(), input.artifacts.block()) }
         .map_err(|error| error.to_string())?;
     let disks = disks
         .iter()
@@ -299,20 +285,15 @@ pub(crate) async fn blocks(
     let mut channels = Vec::with_capacity(2 + input.volume_disks.len());
     for (index, (disk, readonly)) in disks.enumerate() {
         let ram = ram.clone();
-        let host = move || {
-            let mut host = DeviceHost::with_ram(ram.resolve()?);
-            host.set_disk(disk);
-            Ok(host)
-        };
+        let host = move || Ok(BlockHost::new(ram.resolve()?, disk));
         channels.push(
             crate::component::block::grant_shared(
                 runtime,
                 host,
                 &component,
                 readonly,
-                interrupt(index),
+                interrupt(index)?,
             )
-            .await
             .map_err(|error| error.to_string())?,
         );
     }
@@ -320,46 +301,45 @@ pub(crate) async fn blocks(
 }
 
 #[allow(unsafe_code)]
-pub(crate) async fn network(
+pub(crate) fn network(
     runtime: &mut crate::box_runtime::BoxRuntime,
     ram: impl Into<terra_runtime::component::vmm::virtualization::RamGrant> + Send,
     input: &WorkerInput,
     interrupt: crate::component::network::Interrupt,
 ) -> Result<crate::component::DeviceChannel, String> {
-    use crate::engine::{DeviceHost, trusted_component};
+    use crate::engine::{DeviceContext, trusted_component};
 
     // SAFETY: TrustedArtifacts admits only build-embedded AOT output for this runtime.
-    let component = unsafe { trusted_component(runtime.store.engine(), input.artifacts.network) }
+    let component = unsafe { trusted_component(runtime.store.engine(), input.artifacts.network()) }
         .map_err(|error| error.to_string())?;
     let ram = ram.into();
     crate::component::network::grant_shared(
         runtime,
-        move || Ok(DeviceHost::with_ram(ram.resolve()?)),
+        move || Ok(DeviceContext::with_ram(ram.resolve()?)),
         &component,
         input.network_policy.clone(),
         input.port_mappings.clone(),
         terra_network::GuestNetworkConfig::default(),
         interrupt,
     )
-    .await
     .map_err(|error| error.to_string())
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 #[allow(unsafe_code)]
-pub(crate) async fn filesystems(
+pub(crate) fn filesystems(
     runtime: &mut crate::box_runtime::BoxRuntime,
     ram: impl Into<terra_runtime::component::vmm::virtualization::RamGrant> + Send,
     input: &WorkerInput,
-    interrupt: impl Fn(usize) -> crate::component::network::Interrupt,
+    interrupt: impl Fn(usize) -> Result<crate::component::network::Interrupt, String>,
 ) -> Result<Vec<crate::component::DeviceChannel>, String> {
-    use crate::engine::{DeviceHost, trusted_component};
+    use crate::engine::{DeviceContext, trusted_component};
 
     if input.shares.is_empty() {
         return Ok(Vec::new());
     }
     // SAFETY: TrustedArtifacts admits only build-embedded AOT output for this runtime.
-    let component = unsafe { trusted_component(runtime.store.engine(), input.artifacts.fs) }
+    let component = unsafe { trusted_component(runtime.store.engine(), input.artifacts.fs()) }
         .map_err(|error| error.to_string())?;
     let ram = ram.into();
     let mut channels = Vec::with_capacity(input.shares.len());
@@ -377,7 +357,7 @@ pub(crate) async fn filesystems(
         let ram = ram.clone();
         let host = move || {
             Ok(crate::component::fs::host::FsHost::with_resource_capacity(
-                DeviceHost::with_ram(ram.resolve()?),
+                DeviceContext::with_ram(ram.resolve()?),
                 grant,
                 resource_capacity,
             ))
@@ -389,9 +369,8 @@ pub(crate) async fn filesystems(
                 &component,
                 &crate::component::fs::host::share_tag(index),
                 max_nodes,
-                interrupt(index),
+                interrupt(index)?,
             )
-            .await
             .map_err(|error| error.to_string())?,
         );
     }
@@ -417,36 +396,31 @@ fn filesystem_resource_capacity_for(limit: usize, shares: usize) -> usize {
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 #[allow(unsafe_code)]
-pub(crate) async fn memory(
+pub(crate) fn memory(
     runtime: &mut crate::box_runtime::BoxRuntime,
     ram: impl Into<terra_runtime::component::vmm::virtualization::RamGrant> + Send,
     input: &WorkerInput,
     interrupt: crate::component::network::Interrupt,
 ) -> Result<crate::component::DeviceChannel, String> {
-    use crate::engine::{DeviceHost, trusted_component};
+    use crate::engine::{DeviceContext, trusted_component};
 
     // SAFETY: TrustedArtifacts admits only build-embedded AOT output for this runtime.
-    let component = unsafe { trusted_component(runtime.store.engine(), input.artifacts.mem) }
+    let component = unsafe { trusted_component(runtime.store.engine(), input.artifacts.mem()) }
         .map_err(|error| error.to_string())?;
     let ram = ram.into();
-    let host = move || {
-        Ok(crate::component::mem::host::MemHost::new(
-            DeviceHost::with_ram(ram.resolve()?),
-        ))
-    };
+    let host = move || Ok(DeviceContext::with_ram(ram.resolve()?));
     crate::component::mem::grant_shared(runtime, host, &component, interrupt)
-        .await
         .map_err(|error| error.to_string())
 }
 
 #[allow(unsafe_code)]
-pub(crate) async fn vsock(
+pub(crate) fn vsock(
     runtime: &mut crate::box_runtime::BoxRuntime,
     ram: impl Into<terra_runtime::component::vmm::virtualization::RamGrant> + Send,
     input: &mut WorkerInput,
     interrupt: crate::component::network::Interrupt,
 ) -> Result<crate::component::vsock::VsockChannel, String> {
-    let artifact = input.artifacts.vsock;
+    let artifact = input.artifacts.vsock();
     let listener = input.listener.take();
     let control = input.control.take();
     let diagnostics = input.diagnostics.take();
@@ -462,7 +436,6 @@ pub(crate) async fn vsock(
             diagnostics,
             interrupt,
         )
-        .await
     }
     .map_err(|error| error.to_string())
 }
@@ -478,13 +451,13 @@ pub enum MmioDevice {
 }
 
 impl MmioDevice {
-    pub fn close(&self) -> Result<(), String> {
+    pub async fn close(&self) -> Result<(), String> {
         match self {
             Self::Block(channel)
             | Self::Filesystem(channel)
             | Self::Memory(channel)
-            | Self::Network(channel) => channel.close(),
-            Self::Vsock(channel) => channel.close(),
+            | Self::Network(channel) => channel.close_async().await,
+            Self::Vsock(channel) => channel.close_async().await,
         }
         .map_err(|error| error.to_string())
     }
@@ -530,11 +503,10 @@ mod tests {
         use terra_runtime::component::vmm::machine::{Device, DeviceKind};
         use terra_runtime::component::vmm::virtualization::{Architecture, MachineConfig};
 
-        use terra_runtime::component::mem::host::MemHost;
         use terra_runtime::component::vmm::virtualization::{
             PreparedMachine, StartedVcpus, VirtualMachine,
         };
-        use terra_runtime::engine::DeviceHost;
+        use terra_runtime::engine::DeviceContext;
 
         struct TestVm(terra_runtime::SyntheticRam);
         impl VirtualMachine for TestVm {
@@ -607,7 +579,7 @@ mod tests {
             .unwrap();
         prepared.accept_boot(entry).unwrap();
         runtime.initialize_mmio(&component).await.unwrap();
-        let machine = runtime.attach_machine(prepared).await.unwrap();
+        let (mut runtime, machine) = runtime.attach_machine(prepared).await.unwrap();
         let component = wasmtime::component::Component::new(
             &engine,
             include_bytes!(
@@ -618,47 +590,51 @@ mod tests {
         let ram = machine.ram();
         let channel = crate::component::mem::grant_shared(
             &mut runtime,
-            move || Ok(MemHost::new(DeviceHost::with_ram(ram.resolve()?))),
+            move || Ok(DeviceContext::with_ram(ram.resolve()?)),
             &component,
             Arc::new(|_| Ok(())),
         )
-        .await
         .unwrap();
         let devices = vec![super::MmioDevice::Memory(channel.clone())];
-        let shutdowns = super::grant_device_shutdown(&mut runtime, &devices).unwrap();
+        super::grant_device_shutdown(&mut runtime, &devices).unwrap();
         let injections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let delivered = Arc::clone(&injections);
-        let interrupt = machine.bind_interrupt(
-            terra_runtime::component::vmm::machine::DeviceKind::Memory,
-            0,
-            move |_, irq, level| {
-                assert_eq!(irq, 15);
-                assert!(level);
-                delivered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Ok(())
-            },
-        );
+        let interrupt = machine
+            .bind_interrupt(
+                terra_runtime::component::vmm::machine::DeviceKind::Memory,
+                0,
+                move |_, irq, level| {
+                    assert_eq!(irq, 15);
+                    assert!(level);
+                    delivered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .unwrap();
         let _ = machine.machine();
         let denied = machine.bind_interrupt(
             terra_runtime::component::vmm::machine::DeviceKind::Memory,
             1,
             |_, _, _| panic!("ungranted interrupt"),
         );
+        assert!(denied.is_err());
         let startup_interrupt = Arc::clone(&interrupt);
-        let startup = runtime
-            .grant_vcpus(move |controls, _| {
-                assert!(denied(true).is_err());
+        let (runtime, startup) = runtime
+            .prepare_vcpus(move |controls, _| {
                 startup_interrupt(true)?;
-                Ok(
-                    StartedVcpus::new(controls, || Ok(())).with_reaper(|controls| {
+                Ok(StartedVcpus::new(
+                    controls,
+                    || Ok(()),
+                    |controls| {
                         drop(controls);
                         Ok(vec![Ok(())])
-                    }),
-                )
+                    },
+                ))
             })
             .await
             .unwrap();
         let lifecycle = runtime.lifecycle_notifier();
+        let teardown = runtime.native_teardown();
         let prepared = super::PreparedVmm {
             runtime,
             observation: super::VmmObservation {
@@ -666,8 +642,7 @@ mod tests {
                 lifecycle: lifecycle.clone(),
                 deadline: None,
                 devices,
-                shutdowns,
-                interrupts: None,
+                teardown,
             },
         };
         let _ = machine.machine();
@@ -687,6 +662,49 @@ mod tests {
 
         assert_eq!(injections.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(channel.read(0, 4).is_err());
+    }
+
+    #[tokio::test]
+    async fn timed_out_device_close_does_not_start_later_devices() {
+        use terra_runtime::component::vmm::{machine::DeviceKind, teardown::DeviceShutdown};
+
+        let (release, released) = std::sync::mpsc::channel();
+        let (second_started, second_started_receiver) = std::sync::mpsc::channel();
+        let first = DeviceShutdown::new(DeviceKind::Memory, async move {
+            released.recv().expect("release first device");
+            Ok(())
+        });
+        let second = DeviceShutdown::new(DeviceKind::Block, async move {
+            second_started.send(()).expect("record second device");
+            Ok(())
+        });
+
+        let engine = terra_runtime::engine::device_engine().unwrap();
+        let mut runtime =
+            crate::box_runtime::BoxRuntime::new(&engine, crate::box_runtime::BoxHost::new())
+                .unwrap();
+        runtime.grant_device_shutdown(vec![first, second]).unwrap();
+        let teardown = runtime.native_teardown();
+        assert_eq!(
+            teardown
+                .wait_until(std::time::Instant::now() + std::time::Duration::from_millis(20))
+                .await,
+            Err("native task timed out".to_owned())
+        );
+        assert!(matches!(
+            second_started_receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        release.send(()).expect("release first device");
+        assert_eq!(
+            teardown
+                .wait_until(std::time::Instant::now() + std::time::Duration::from_secs(2))
+                .await,
+            Ok(())
+        );
+        second_started_receiver
+            .recv()
+            .expect("second device closes after the first");
     }
 
     struct DenyAll;
@@ -742,9 +760,8 @@ mod tests {
             &mut runtime,
             terra_runtime::SyntheticRam::new(4096).unwrap(),
             &input,
-            |_| std::sync::Arc::new(|_| Ok(())),
+            |_| Ok(std::sync::Arc::new(|_| Ok(()))),
         )
-        .await
         .unwrap();
         assert!(shares.is_empty());
     }
@@ -783,6 +800,14 @@ mod tests {
             terra_runtime::box_runtime::BoxHost::new(),
         )
         .unwrap();
+        let router = wasmtime::component::Component::new(
+            &engine,
+            include_bytes!(
+                "../../../components/vmm/target/wasm32-wasip3/release/terra_vmm_component.wasm"
+            ),
+        )
+        .unwrap();
+        runtime.initialize_mmio(&router).await.unwrap();
         // SAFETY: the artifact is embedded from the trusted build.
         #[allow(unsafe_code)]
         let channel = unsafe {
@@ -796,10 +821,9 @@ mod tests {
                 None,
                 std::sync::Arc::new(|_| Ok(())),
             )
-            .await
         }
         .unwrap();
-        let runtime_task = runtime.start();
+        let runtime_task = runtime.prepare().await.unwrap().start();
         let device = channel;
         assert_eq!(
             device.read_mmio(0, 4).unwrap(),
@@ -813,7 +837,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn filesystem_actor_alone_publishes_interrupt_levels() {
         use terra_runtime::component::fs::host::{FsHost, ShareGrant};
-        use terra_runtime::engine::{DeviceHost, device_engine};
+        use terra_runtime::engine::{DeviceContext, device_engine};
 
         let directory = tempfile::tempdir().unwrap();
         let mount = std::fs::canonicalize(directory.path()).unwrap();
@@ -826,11 +850,12 @@ mod tests {
         )
         .unwrap();
         let host = FsHost::new(
-            DeviceHost::new(64 * 1024).unwrap(),
+            DeviceContext::new(64 * 1024).unwrap(),
             ShareGrant::new(&mount, false).unwrap(),
         );
         let channel = crate::component::fs::instantiate(
-            wasmtime::Store::new(&engine, host),
+            &engine,
+            host,
             &component,
             "test",
             8192,

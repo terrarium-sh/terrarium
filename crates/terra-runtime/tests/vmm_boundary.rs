@@ -1,14 +1,13 @@
 #![allow(clippy::expect_used)]
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use terra_runtime::{
     SyntheticRam,
     box_runtime::{BoxHost, BoxRuntime},
     component::{
         Interrupt,
-        mem::host::MemHost,
         vmm::{
             Completion, Exit,
             boot::BootEntry,
@@ -18,7 +17,7 @@ use terra_runtime::{
             },
         },
     },
-    engine::{DeviceHost, device_component_linker, device_engine},
+    engine::{DeviceContext, device_component_linker, device_engine},
 };
 use wasmtime::{Store, component::Component};
 
@@ -31,9 +30,12 @@ impl VirtualMachine for TestVm {
 }
 
 async fn attach_test_machine(
-    runtime: &mut BoxRuntime,
+    runtime: BoxRuntime,
     ram: SyntheticRam,
-) -> terra_runtime::component::vmm::virtualization::MachineHandle<TestVm> {
+) -> (
+    BoxRuntime,
+    terra_runtime::component::vmm::virtualization::MachineHandle<TestVm>,
+) {
     let devices = [
         (DeviceKind::Block, 11),
         (DeviceKind::Block, 12),
@@ -85,6 +87,22 @@ fn memory(engine: &wasmtime::Engine) -> Component {
     .expect("memory component")
 }
 
+async fn prepare_test_vcpus(
+    runtime: BoxRuntime,
+) -> wasmtime::Result<(
+    terra_runtime::box_runtime::PreparedBoxRuntime,
+    Vec<terra_runtime::component::vmm::NativeVcpu>,
+)> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let (runtime, _reaper) = runtime
+        .prepare_vcpus(move |controls, _| {
+            sender.send(controls).expect("test setup");
+            Ok(StartedVcpus::new((), || Ok(()), |()| Ok(Vec::new())))
+        })
+        .await?;
+    Ok((runtime, receiver.recv().expect("test setup")))
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::too_many_lines)]
 async fn wasm_vmm_routes_native_exits_and_stops_with_the_box() {
@@ -95,20 +113,16 @@ async fn wasm_vmm_routes_native_exits_and_stops_with_the_box() {
         .initialize_mmio(&router(&engine))
         .await
         .expect("router");
-    let machine = attach_test_machine(&mut runtime, ram.clone()).await;
+    let (mut runtime, machine) = attach_test_machine(runtime, ram.clone()).await;
     let ram_grant = machine.ram();
     let memory = terra_runtime::component::mem::grant_shared(
         &mut runtime,
-        move || Ok(MemHost::new(DeviceHost::with_ram(ram_grant.resolve()?))),
+        move || Ok(DeviceContext::with_ram(ram_grant.resolve()?)),
         &memory(&engine),
         no_interrupt(),
     )
-    .await
     .expect("memory device");
-    let startup = runtime
-        .grant_vcpus(|controls, _| Ok(StartedVcpus::new(controls, || Ok(()))))
-        .await
-        .expect("vCPU grants");
+    let (runtime, startup) = prepare_test_vcpus(runtime).await.expect("vCPU grants");
     assert_eq!(machine.machine().0.size(), ram.size());
     let runtime = runtime.start();
     let vcpu = startup.into_iter().next().expect("vCPU");
@@ -225,46 +239,33 @@ async fn wasm_vmm_routes_native_exits_and_stops_with_the_box() {
 }
 
 #[tokio::test]
-async fn vcpu_grants_are_unique_and_require_a_router() {
-    let engine = device_engine().expect("engine");
-    let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
-    assert!(
-        runtime
-            .grant_vcpus(|controls, _| Ok(StartedVcpus::new(controls, || Ok(()))))
-            .await
-            .is_err(),
-        "router is the only vCPU grant path"
-    );
+async fn vcpu_preparation_requires_a_router_and_boot() {
+    let engine = device_engine().expect("test setup");
+    for router_present in [false, true] {
+        let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("test setup");
+        if router_present {
+            runtime
+                .initialize_mmio(&router(&engine))
+                .await
+                .expect("test setup");
+        }
+        assert!(prepare_test_vcpus(runtime).await.is_err());
+    }
+    let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("test setup");
     runtime
         .initialize_mmio(&router(&engine))
         .await
-        .expect("router");
-    assert!(
-        runtime
-            .grant_vcpus(|controls, _| Ok(StartedVcpus::new(controls, || Ok(()))))
-            .await
-            .is_err(),
-        "VM and boot are required"
-    );
-    attach_test_machine(&mut runtime, SyntheticRam::new(8 << 20).expect("RAM")).await;
-    let vcpus = runtime
-        .grant_vcpus(|controls, _| Ok(StartedVcpus::new(controls, || Ok(()))))
-        .await
-        .expect("first vCPU group");
+        .expect("test setup");
+    let (runtime, _) =
+        attach_test_machine(runtime, SyntheticRam::new(8 << 20).expect("test setup")).await;
+    let (_prepared, vcpus) = prepare_test_vcpus(runtime).await.expect("test setup");
     assert_eq!(vcpus.len(), 1);
-    assert!(
-        runtime
-            .grant_vcpus(|controls, _| Ok(StartedVcpus::new(controls, || Ok(()))))
-            .await
-            .is_err(),
-        "duplicate vCPU grant"
-    );
 }
 
 #[tokio::test]
 async fn device_components_receive_no_platform_or_vcpu_grant() {
     let engine = device_engine().expect("engine");
-    let mut store = Store::new(&engine, DeviceHost::new(4096).expect("device host"));
+    let mut store = Store::new(&engine, DeviceContext::new(4096).expect("device host"));
     let linker = device_component_linker(&engine).expect("device linker");
     assert!(
         linker
@@ -283,12 +284,12 @@ async fn failed_startup_disconnects_native_vcpus() {
         .initialize_mmio(&router(&engine))
         .await
         .expect("router");
-    attach_test_machine(&mut runtime, SyntheticRam::new(8 << 20).expect("RAM")).await;
+    let (runtime, _) = attach_test_machine(runtime, SyntheticRam::new(8 << 20).expect("RAM")).await;
     let (sender, receiver) = std::sync::mpsc::channel();
     let started = runtime
-        .grant_vcpus(move |controls, _| {
+        .prepare_vcpus(move |controls, _| {
             sender.send(controls).expect("native controls");
-            Err::<StartedVcpus<()>, _>(wasmtime::Error::msg("injected startup failure"))
+            Err::<StartedVcpus, _>(wasmtime::Error::msg("injected startup failure"))
         })
         .await;
     assert!(started.is_err());
@@ -300,16 +301,10 @@ async fn failed_startup_disconnects_native_vcpus() {
     })
     .await
     .expect("native probe");
-    assert!(
-        runtime
-            .grant_vcpus(|_, _| Ok(StartedVcpus::new((), || Ok(()))))
-            .await
-            .is_err()
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn vcpu_failure_runs_wasi_teardown_before_publishing_failure() {
+async fn vcpu_failure_preserves_teardown_order_before_runtime_join() {
     use terra_runtime::component::vmm::{
         lifecycle::Outcome, machine::DeviceKind, teardown::DeviceShutdown,
     };
@@ -320,18 +315,19 @@ async fn vcpu_failure_runs_wasi_teardown_before_publishing_failure() {
         .initialize_mmio(&router(&engine))
         .await
         .expect("router");
-    attach_test_machine(&mut runtime, SyntheticRam::new(8 << 20).expect("RAM")).await;
+    let (mut runtime, _) =
+        attach_test_machine(runtime, SyntheticRam::new(8 << 20).expect("RAM")).await;
     let order = Arc::new(std::sync::Mutex::new(Vec::new()));
     let devices = Arc::clone(&order);
     runtime
-        .grant_device_shutdown(vec![DeviceShutdown::new(DeviceKind::Memory, move || {
+        .grant_device_shutdown(vec![DeviceShutdown::new(DeviceKind::Memory, async move {
             devices.lock().expect("order").push("device");
             Ok(())
         })])
         .expect("device grant");
     let interrupts = Arc::clone(&order);
     runtime
-        .grant_interrupt_shutdown(move || {
+        .grant_interrupt_shutdown(async move {
             interrupts.lock().expect("order").push("interrupt");
             Ok(())
         })
@@ -339,20 +335,23 @@ async fn vcpu_failure_runs_wasi_teardown_before_publishing_failure() {
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     let stop = Arc::clone(&order);
     let reap = Arc::clone(&order);
-    let reaper = runtime
-        .grant_vcpus(move |mut controls, _| {
+    let (runtime, reaper) = runtime
+        .prepare_vcpus(move |mut controls, _| {
             sender
                 .send(controls.pop().expect("vCPU"))
                 .expect("native controller");
-            Ok(StartedVcpus::new(controls, move || {
-                stop.lock().expect("order").push("stop");
-                Ok(())
-            })
-            .with_reaper(move |controls| {
-                drop(controls);
-                reap.lock().expect("order").push("reap");
-                Ok(vec![Ok(())])
-            }))
+            Ok(StartedVcpus::new(
+                controls,
+                move || {
+                    stop.lock().expect("order").push("stop");
+                    Ok(())
+                },
+                move |controls| {
+                    drop(controls);
+                    reap.lock().expect("order").push("reap");
+                    Ok(vec![Ok(())])
+                },
+            ))
         })
         .await
         .expect("launch");
@@ -377,12 +376,12 @@ async fn vcpu_failure_runs_wasi_teardown_before_publishing_failure() {
         .expect("failure outcome timeout")
         .expect("failure outcome");
     assert_eq!(*outcome.borrow_and_update(), Some(Outcome::ComponentFailed));
+    assert!(running.join().await.is_err());
     assert_eq!(
         *order.lock().expect("order"),
         ["stop", "reap", "device", "interrupt"]
     );
     reaper.wait().await.expect("native recovery shares reaping");
-    assert!(running.join().await.is_err());
 }
 
 #[tokio::test]
@@ -403,8 +402,8 @@ async fn wasi_requests_cpu_stop_before_publishing_terminal_outcomes() {
             .initialize_mmio(&router(&engine))
             .await
             .expect("router");
-        let machine =
-            attach_test_machine(&mut runtime, SyntheticRam::new(8 << 20).expect("RAM")).await;
+        let (mut runtime, machine) =
+            attach_test_machine(runtime, SyntheticRam::new(8 << 20).expect("RAM")).await;
         let calls = Arc::new(AtomicUsize::new(0));
         let stops = Arc::clone(&calls);
         let reaped = Arc::new(AtomicUsize::new(0));
@@ -412,26 +411,6 @@ async fn wasi_requests_cpu_stop_before_publishing_terminal_outcomes() {
         let stop_requested = Arc::clone(&calls);
         let (reaper_started, started) = tokio::sync::oneshot::channel();
         let (release, released) = std::sync::mpsc::sync_channel(1);
-        let controls = runtime
-            .grant_vcpus(move |controls, _| {
-                Ok(StartedVcpus::new(controls, move || {
-                    stops.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
-                })
-                .with_reaper(move |controls| {
-                    assert_eq!(stop_requested.load(Ordering::SeqCst), 1);
-                    reaper_started.send(()).expect("reaper observer");
-                    released
-                        .recv_timeout(Duration::from_secs(2))
-                        .expect("release reaper");
-                    let count = controls.len();
-                    drop(controls);
-                    finished.store(1, Ordering::SeqCst);
-                    Ok(vec![Ok(()); count])
-                }))
-            })
-            .await
-            .expect("launch");
         let closed = Arc::new(std::sync::Mutex::new(Vec::new()));
         let shutdowns = [
             DeviceKind::Block,
@@ -444,7 +423,7 @@ async fn wasi_requests_cpu_stop_before_publishing_terminal_outcomes() {
         .map(|kind| {
             let closed = Arc::clone(&closed);
             let reaped = Arc::clone(&reaped);
-            DeviceShutdown::new(kind, move || {
+            DeviceShutdown::new(kind, async move {
                 assert_eq!(reaped.load(Ordering::SeqCst), 1);
                 closed.lock().expect("close observer").push(kind);
                 if event == Event::ComponentFailed && kind == DeviceKind::Memory {
@@ -456,22 +435,46 @@ async fn wasi_requests_cpu_stop_before_publishing_terminal_outcomes() {
         })
         .collect::<Vec<_>>();
         runtime
-            .grant_device_shutdown(shutdowns.clone())
+            .grant_device_shutdown(shutdowns)
             .expect("shutdown grants");
         let interrupt_calls = Arc::new(AtomicUsize::new(0));
         let released_interrupts = Arc::clone(&interrupt_calls);
         let closed_devices = Arc::clone(&closed);
         let live_machine = machine.clone();
-        let interrupt_cleanup = runtime
-            .grant_interrupt_shutdown(move || {
+        runtime
+            .grant_interrupt_shutdown(async move {
                 assert!(live_machine.machine().0.size() > 0);
                 assert_eq!(closed_devices.lock().expect("close observer").len(), 5);
                 released_interrupts.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             })
             .expect("interrupt grant");
+        let teardown = runtime.native_teardown();
         let lifecycle = runtime.lifecycle_notifier();
         let mut outcome = lifecycle.subscribe();
+        let (runtime, controls) = runtime
+            .prepare_vcpus(move |controls, _| {
+                Ok(StartedVcpus::new(
+                    controls,
+                    move || {
+                        stops.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    },
+                    move |controls| {
+                        assert_eq!(stop_requested.load(Ordering::SeqCst), 1);
+                        reaper_started.send(()).expect("reaper observer");
+                        released
+                            .recv_timeout(Duration::from_secs(2))
+                            .expect("release reaper");
+                        let count = controls.len();
+                        drop(controls);
+                        finished.store(1, Ordering::SeqCst);
+                        Ok(vec![Ok(()); count])
+                    },
+                ))
+            })
+            .await
+            .expect("launch");
         let running = runtime.start();
         let expected = match event {
             Event::GuestExit(code) => {
@@ -508,11 +511,14 @@ async fn wasi_requests_cpu_stop_before_publishing_terminal_outcomes() {
         assert!(machine.ram().resolve().is_ok());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(reaped.load(Ordering::SeqCst), 1);
-        assert_eq!(interrupt_calls.load(Ordering::SeqCst), 1);
-        interrupt_cleanup
-            .wait()
-            .await
-            .expect("shared interrupt cleanup");
+        let teardown = teardown
+            .wait_until(Instant::now() + Duration::from_secs(2))
+            .await;
+        if event == Event::ComponentFailed {
+            assert_eq!(teardown, Err("close failed".to_owned()));
+        } else {
+            teardown.expect("native teardown");
+        }
         assert_eq!(interrupt_calls.load(Ordering::SeqCst), 1);
 
         assert_eq!(
@@ -525,9 +531,6 @@ async fn wasi_requests_cpu_stop_before_publishing_terminal_outcomes() {
                 DeviceKind::Block
             ]
         );
-        for shutdown in &shutdowns {
-            let _ = shutdown.wait().await;
-        }
         assert_eq!(
             closed.lock().expect("close observer").len(),
             5,
@@ -549,21 +552,30 @@ async fn deferred_device_failure_prevents_cpu_launch() {
         .initialize_mmio(&router(&engine))
         .await
         .expect("router");
-    attach_test_machine(&mut runtime, ram.clone()).await;
+    let (mut runtime, _) = attach_test_machine(runtime, ram.clone()).await;
     let _channel = terra_runtime::component::block::instantiate_shared(
         &mut runtime,
-        DeviceHost::with_ram(ram),
+        terra_runtime::engine::BlockHost::new(
+            ram,
+            terra_runtime::engine::DiskGrant::Mem(terra_runtime::BoundedDisk::new(0, false)),
+        ),
         &memory(&engine),
         true,
         no_interrupt(),
     )
-    .await
     .expect("grant is deferred until composition");
     let launched = Arc::new(AtomicBool::new(false));
     let cpu_started = Arc::clone(&launched);
-    let startup = runtime.grant_vcpus(move |controls, _| {
+    let startup = runtime.prepare_vcpus(move |controls, _| {
         cpu_started.store(true, Ordering::SeqCst);
-        Ok(StartedVcpus::new(controls, || Ok(())))
+        Ok(StartedVcpus::new(
+            controls,
+            || Ok(()),
+            |controls| {
+                drop(controls);
+                Ok(Vec::new())
+            },
+        ))
     });
     assert!(
         tokio::time::timeout(Duration::from_secs(3), startup)
@@ -587,7 +599,7 @@ async fn wasi_composes_multiple_deferred_workers_with_their_final_mappings() {
         .initialize_mmio(&router(&engine))
         .await
         .expect("router");
-    attach_test_machine(&mut runtime, ram.clone()).await;
+    let (mut runtime, _) = attach_test_machine(runtime, ram.clone()).await;
     let block = Component::new(
         &engine,
         include_bytes!(
@@ -596,9 +608,11 @@ async fn wasi_composes_multiple_deferred_workers_with_their_final_mappings() {
     )
     .expect("block component");
     let mut channels = Vec::new();
-    for bytes in [4096, 8192] {
-        let mut host = DeviceHost::with_ram(ram.clone());
-        host.set_disk(DiskGrant::Mem(BoundedDisk::new(bytes, false)));
+    for bytes in [4096, 8192, 12288] {
+        let host = terra_runtime::engine::BlockHost::new(
+            ram.clone(),
+            DiskGrant::Mem(BoundedDisk::new(bytes, false)),
+        );
         let channel = terra_runtime::component::block::instantiate_shared(
             &mut runtime,
             host,
@@ -606,18 +620,19 @@ async fn wasi_composes_multiple_deferred_workers_with_their_final_mappings() {
             false,
             no_interrupt(),
         )
-        .await
         .expect("deferred block grant");
+        if bytes == 12288 {
+            channel
+                .map_mmio(&mut runtime, 0xe000_0000, 0x1000)
+                .expect("explicit mapping for an additional device");
+        }
         channels.push(channel);
     }
-    let startup = runtime
-        .grant_vcpus(|controls, _| Ok(StartedVcpus::new(controls, || Ok(()))))
-        .await
-        .expect("startup grant");
+    let (runtime, startup) = prepare_test_vcpus(runtime).await.expect("startup grant");
     let running = runtime.start();
     let controls = startup;
     tokio::task::spawn_blocking(move || {
-        for (channel, sectors) in channels.into_iter().zip([8_u32, 16]) {
+        for (channel, sectors) in channels.into_iter().zip([8_u32, 16, 24]) {
             assert_eq!(
                 channel.read(0, 4).expect("magic"),
                 0x7472_6976_u32.to_le_bytes()
@@ -648,21 +663,22 @@ async fn wasi_lifecycle_closes_a_device_through_the_running_mmio_bridge() {
         .initialize_mmio(&router(&engine))
         .await
         .expect("router");
-    attach_test_machine(&mut runtime, ram.clone()).await;
+    let (mut runtime, _) = attach_test_machine(runtime, ram.clone()).await;
     let channel = terra_runtime::component::mem::instantiate_shared(
         &mut runtime,
-        MemHost::new(DeviceHost::with_ram(ram)),
+        DeviceContext::with_ram(ram),
         &memory(&engine),
         no_interrupt(),
     )
-    .await
     .expect("memory grant");
     let closing = channel.clone();
-    let shutdown = DeviceShutdown::new(DeviceKind::Memory, move || {
-        closing.close().map_err(|error| error.to_string())
-    });
     runtime
-        .grant_device_shutdown(vec![shutdown.clone()])
+        .grant_device_shutdown(vec![DeviceShutdown::new(DeviceKind::Memory, async move {
+            closing
+                .close_async()
+                .await
+                .map_err(|error| error.to_string())
+        })])
         .expect("shutdown grant");
     let delivered = Arc::new(std::sync::Mutex::new(Vec::new()));
     let injections = Arc::clone(&delivered);
@@ -679,15 +695,16 @@ async fn wasi_lifecycle_closes_a_device_through_the_running_mmio_bridge() {
     assert!(runtime.grant_ioapic(Arc::new(|_| Ok(()))).await.is_err());
     let memory_irq = ioapic.bind_interrupt(DeviceKind::Memory, 0);
     let interrupt_handle = ioapic.clone();
-    let interrupt_cleanup = runtime
-        .grant_interrupt_shutdown(move || {
-            interrupt_handle.close().map_err(|error| error.to_string())
+    runtime
+        .grant_interrupt_shutdown(async move {
+            interrupt_handle
+                .close()
+                .await
+                .map_err(|error| error.to_string())
         })
         .expect("interrupt grant");
-    let startup = runtime
-        .grant_vcpus(|controls, _| Ok(StartedVcpus::new(controls, || Ok(()))))
-        .await
-        .expect("startup grant");
+    let teardown = runtime.native_teardown();
+    let (runtime, startup) = prepare_test_vcpus(runtime).await.expect("startup grant");
     let lifecycle = runtime.lifecycle_notifier();
     let mut outcome = lifecycle.subscribe();
     let running = runtime.start();
@@ -712,15 +729,11 @@ async fn wasi_lifecycle_closes_a_device_through_the_running_mmio_bridge() {
         .expect("teardown completes without a nested store loop")
         .expect("lifecycle outcome");
     assert_eq!(*outcome.borrow_and_update(), Some(Outcome::GuestExit(0)));
-    shutdown
-        .wait()
+    teardown
+        .wait_until(Instant::now() + Duration::from_secs(3))
         .await
-        .expect("native observes the same close");
+        .expect("native teardown closes the device and interrupts");
     assert!(channel.read(0, 4).is_err());
-    interrupt_cleanup
-        .wait()
-        .await
-        .expect("native observes interrupt cleanup");
     assert!(memory_irq(false).is_err());
     assert!(ioapic.set_line(0, false).is_err());
     drop(controls);
@@ -738,20 +751,24 @@ async fn wasi_irq_lines_drain_assertions_before_vm_release() {
         .await
         .expect("router");
     let ram = SyntheticRam::new(8 << 20).expect("RAM");
-    attach_test_machine(&mut runtime, ram.clone()).await;
+    let (mut runtime, _) = attach_test_machine(runtime, ram.clone()).await;
     let channel = terra_runtime::component::mem::instantiate_shared(
         &mut runtime,
-        MemHost::new(DeviceHost::with_ram(ram)),
+        DeviceContext::with_ram(ram),
         &memory(&engine),
         no_interrupt(),
     )
-    .await
     .expect("memory grant");
     runtime
         .grant_device_shutdown(vec![
             terra_runtime::component::vmm::teardown::DeviceShutdown::new(
                 DeviceKind::Memory,
-                move || channel.close().map_err(|error| error.to_string()),
+                async move {
+                    channel
+                        .close_async()
+                        .await
+                        .map_err(|error| error.to_string())
+                },
             ),
         ])
         .expect("device cleanup grant");
@@ -770,26 +787,32 @@ async fn wasi_irq_lines_drain_assertions_before_vm_release() {
     assert!(runtime.grant_irq_lines(|_, _| Ok(())).await.is_err());
     assert!(runtime.grant_ioapic(Arc::new(|_| Ok(()))).await.is_err());
     let memory_irq = lines.bind_interrupt(DeviceKind::Memory, 0);
+    for _ in 0..256 {
+        memory_irq(true).expect("queue accepts its full capacity");
+    }
+    assert!(memory_irq(false).is_err());
     let interrupt_handle = lines.clone();
-    let cleanup = runtime
-        .grant_interrupt_shutdown(move || {
-            interrupt_handle.close().map_err(|error| error.to_string())
+    runtime
+        .grant_interrupt_shutdown(async move {
+            interrupt_handle
+                .close()
+                .await
+                .map_err(|error| error.to_string())
         })
         .expect("cleanup grant");
-    let startup = runtime
-        .grant_vcpus(|controls, _| Ok(StartedVcpus::new(controls, || Ok(()))))
-        .await
-        .expect("startup grant");
+    let teardown = runtime.native_teardown();
+    let (runtime, startup) = prepare_test_vcpus(runtime).await.expect("startup grant");
     let lifecycle = runtime.lifecycle_notifier();
     let running = runtime.start();
     let controls = startup;
-    memory_irq(true).expect("assert memory IRQ");
-    memory_irq(true).expect("repeated assertion");
     lifecycle.guest_exit(0);
-    tokio::time::timeout(Duration::from_secs(3), cleanup.wait())
-        .await
-        .expect("IRQ cleanup completes")
-        .expect("IRQ cleanup");
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        teardown.wait_until(Instant::now() + Duration::from_secs(3)),
+    )
+    .await
+    .expect("IRQ cleanup completes")
+    .expect("IRQ cleanup");
     assert_eq!(
         *delivered.lock().expect("interrupt observer"),
         [(15, true), (15, false)]
@@ -810,40 +833,43 @@ async fn failed_native_reaping_retains_vm_and_dependent_cleanup() {
         .initialize_mmio(&router(&engine))
         .await
         .expect("router");
-    let machine = attach_test_machine(&mut runtime, SyntheticRam::new(8 << 20).expect("RAM")).await;
+    let (mut runtime, machine) =
+        attach_test_machine(runtime, SyntheticRam::new(8 << 20).expect("RAM")).await;
     let backend = Arc::downgrade(&machine.machine());
     drop(machine);
     let closes = Arc::new(AtomicUsize::new(0));
     let device_closes = Arc::clone(&closes);
     runtime
-        .grant_device_shutdown(vec![DeviceShutdown::new(DeviceKind::Memory, move || {
+        .grant_device_shutdown(vec![DeviceShutdown::new(DeviceKind::Memory, async move {
             device_closes.fetch_add(1, Ordering::SeqCst);
             Ok(())
         })])
         .expect("shutdown grant");
     let interrupt_closes = Arc::clone(&closes);
-    let _interrupts = runtime
-        .grant_interrupt_shutdown(move || {
+    runtime
+        .grant_interrupt_shutdown(async move {
             interrupt_closes.fetch_add(1, Ordering::SeqCst);
             Ok(())
         })
         .expect("interrupt cleanup");
-    let reaper = runtime
-        .grant_vcpus(|controls, _| {
-            Ok(
-                StartedVcpus::new(controls, || Ok(())).with_reaper(|controls| {
-                    drop(controls);
-                    Err("injected reaper timeout".to_owned())
-                }),
-            )
-        })
-        .await
-        .expect("native startup");
     runtime
         .register_loop(Box::new(|_| {
             Box::pin(async { Err(wasmtime::Error::msg("injected VMM trap")) })
         }))
         .expect("failure loop");
+    let (runtime, reaper) = runtime
+        .prepare_vcpus(|controls, _| {
+            Ok(StartedVcpus::new(
+                controls,
+                || Ok(()),
+                |controls| {
+                    drop(controls);
+                    Err("injected reaper timeout".to_owned())
+                },
+            ))
+        })
+        .await
+        .expect("native startup");
     assert!(runtime.start().join().await.is_err());
     assert!(reaper.wait().await.is_err());
     assert!(

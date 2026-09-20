@@ -42,14 +42,15 @@ interface device {
     serve: async func(requests: stream<request>) -> stream<reply>;
 }
 
-interface workers {
-    use types.{request, reply};
-    enum error { unavailable }
-    use machine-types.{device-kind};
-    record mapping { base: u64, size: u64 }
-    record grant { slot: u32, kind: device-kind, mapping: mapping }
-    grants: func() -> list<grant>;
-    create: async func(slot: u32, requests: stream<request>) -> result<stream<reply>, error>;
+interface router {
+    use types.{control-reply, error, operation, reply, request, routed-reply};
+
+    configure-vcpus: func(count: u8) -> result<_, error>;
+    open-device: func(slot: u32, base: u64, size: u64) -> result<stream<request>, error>;
+    attach-replies: async func(slot: u32, replies: stream<reply>) -> result<_, error>;
+    remap-device: func(slot: u32, base: u64, size: u64) -> result<_, error>;
+    access: async func(address: u64, width: u8, value: u64, write: bool) -> result<routed-reply, error>;
+    control: async func(slot: u32, operation: operation) -> result<control-reply, error>;
 }
 
 interface platform {
@@ -104,18 +105,7 @@ interface platform {
     completed: func(slot: u32, failed: bool) -> result<_, error>;
 }
 
-interface router {
-    use types.{control-reply, error, operation, reply, request, routed-reply};
-
-    configure-vcpus: func(count: u8) -> result<_, error>;
-    compose-workers: async func() -> result<_, error>;
-    remap-device: func(slot: u32, base: u64, size: u64) -> result<_, error>;
-    access: async func(address: u64, width: u8, value: u64, write: bool) -> result<routed-reply, error>;
-    control: async func(slot: u32, operation: operation) -> result<control-reply, error>;
-}
-
 world vmm {
-    import workers;
     import platform;
     import virtualization;
     import lifecycle-platform;

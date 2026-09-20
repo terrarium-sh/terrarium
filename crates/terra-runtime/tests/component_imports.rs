@@ -83,7 +83,6 @@ fn compiled_components_import_only_their_declared_capabilities() {
             &[
                 "terra:mmio/types",
                 "terra:mmio/machine-types",
-                "terra:mmio/workers",
                 "terra:mmio/platform",
                 "terra:mmio/virtualization",
                 "terra:mmio/lifecycle-platform",

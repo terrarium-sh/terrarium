@@ -2,13 +2,13 @@
 
 /// Build-embedded AOT artifacts for one exact Wasmtime runtime.
 pub struct TrustedArtifacts {
-    pub block: &'static [u8],
-    pub vsock: &'static [u8],
-    pub network: &'static [u8],
-    pub fs: &'static [u8],
-    pub mem: &'static [u8],
-    pub boot: &'static [u8],
-    pub mmio: &'static [u8],
+    block: &'static [u8],
+    vsock: &'static [u8],
+    network: &'static [u8],
+    fs: &'static [u8],
+    mem: &'static [u8],
+    boot: &'static [u8],
+    mmio: &'static [u8],
 }
 
 impl TrustedArtifacts {
@@ -36,5 +36,40 @@ impl TrustedArtifacts {
             boot,
             mmio,
         }
+    }
+
+    #[must_use]
+    pub const fn block(&self) -> &'static [u8] {
+        self.block
+    }
+
+    #[must_use]
+    pub const fn vsock(&self) -> &'static [u8] {
+        self.vsock
+    }
+
+    #[must_use]
+    pub const fn network(&self) -> &'static [u8] {
+        self.network
+    }
+
+    #[must_use]
+    pub const fn fs(&self) -> &'static [u8] {
+        self.fs
+    }
+
+    #[must_use]
+    pub const fn mem(&self) -> &'static [u8] {
+        self.mem
+    }
+
+    #[must_use]
+    pub const fn boot(&self) -> &'static [u8] {
+        self.boot
+    }
+
+    #[must_use]
+    pub const fn mmio(&self) -> &'static [u8] {
+        self.mmio
     }
 }

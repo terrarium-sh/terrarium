@@ -15,11 +15,11 @@ use wasmtime_wasi::{
 
 use crate::{
     component::fs::host::{FsHost, ShareGrant},
-    engine::DeviceHost,
+    engine::DeviceContext,
 };
 
 fn host(grant: ShareGrant) -> FsHost {
-    FsHost::new(DeviceHost::new(4096).unwrap(), grant)
+    FsHost::new(DeviceContext::new(4096).unwrap(), grant)
 }
 
 #[test]
@@ -82,7 +82,7 @@ async fn preopen_retains_its_directory_and_rights_without_ambient_resources() {
         .unwrap();
     let directories = fs.get_directories().unwrap();
     assert_eq!(directories.len(), 1);
-    let mut empty = DeviceHost::new(4096).unwrap();
+    let mut empty = DeviceContext::new(4096).unwrap();
     assert!(empty.filesystem().get_directories().unwrap().is_empty());
     fs.ctx().table.set_max_capacity(2);
     let engine = crate::engine::device_engine().unwrap();

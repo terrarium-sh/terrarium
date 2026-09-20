@@ -13,5 +13,5 @@ interface machine {
     use platform.{vcpu};
 
     initialize: func(config: config, vm: own<vm>, vcpus: list<own<vcpu>>) -> result<_, error>;
-    compose: async func() -> result<_, error>;
+    compose: func() -> result<_, error>;
 }

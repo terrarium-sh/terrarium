@@ -4,10 +4,13 @@ use std::time::Duration;
 
 use wasmtime::component::Component;
 
-use crate::box_runtime::{BoxHost, BoxRuntime};
+#[cfg(test)]
+use crate::box_runtime::BoxHost;
+use crate::box_runtime::{BoxRuntime, StoreState};
 use crate::component::vmm::machine::Device;
 use crate::component::vmm::virtualization::{Architecture, MachineConfig};
 use crate::{BoundedMemory, SyntheticRam};
+use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 wasmtime::component::bindgen!({
     world: "boot-component", path: "../../components/boot/wit",
@@ -32,13 +35,34 @@ struct BootGrant {
     remaining_kernel_copy_bytes: u64,
 }
 
-#[derive(Default)]
-pub struct BootHost(Option<BootGrant>);
-
-pub struct Boot;
-
-impl wasmtime::component::HasData for Boot {
-    type Data<'a> = &'a mut BootHost;
+pub struct BootHost {
+    grant: Option<BootGrant>,
+    ctx: WasiCtx,
+    table: ResourceTable,
+}
+impl Default for BootHost {
+    fn default() -> Self {
+        let mut table = ResourceTable::new();
+        table.set_max_capacity(crate::engine::MAX_DEVICE_RESOURCES);
+        Self {
+            grant: None,
+            table,
+            ctx: WasiCtxBuilder::new()
+                .max_random_size(crate::MAX_SINGLE_BYTES)
+                .allow_tcp(false)
+                .allow_udp(false)
+                .allow_ip_name_lookup(false)
+                .build(),
+        }
+    }
+}
+impl WasiView for BootHost {
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.ctx,
+            table: &mut self.table,
+        }
+    }
 }
 
 fn bounds() -> terra::boot::types::Error {
@@ -52,9 +76,9 @@ impl BootHost {
         ram: SyntheticRam,
         kernel: Vec<u8>,
     ) -> wasmtime::Result<()> {
-        wasmtime::ensure!(self.0.is_none(), "boot capabilities already granted");
+        wasmtime::ensure!(self.grant.is_none(), "boot capabilities already granted");
         let remaining_kernel_copy_bytes = u64::try_from(kernel.len())?;
-        self.0 = Some(BootGrant {
+        self.grant = Some(BootGrant {
             config,
             ram,
             kernel,
@@ -64,13 +88,13 @@ impl BootHost {
     }
 
     fn get(&mut self) -> Result<&mut BootGrant, terra::boot::types::Error> {
-        self.0.as_mut().ok_or_else(bounds)
+        self.grant.as_mut().ok_or_else(bounds)
     }
 }
 
 impl terra::boot::host::Host for BootHost {
     fn machine_config(&mut self) -> wasmtime::Result<terra::boot::types::Machine> {
-        let Some(grant) = self.0.as_ref() else {
+        let Some(grant) = self.grant.as_ref() else {
             return Ok(terra::boot::types::Machine {
                 architecture: terra::boot::types::Architecture::X86,
                 ram_bytes: 0,
@@ -108,7 +132,7 @@ impl terra::boot::host::Host for BootHost {
 
     fn kernel_size(&mut self) -> wasmtime::Result<u64> {
         Ok(self
-            .0
+            .grant
             .as_ref()
             .and_then(|grant| u64::try_from(grant.kernel.len()).ok())
             .unwrap_or(0))
@@ -176,14 +200,16 @@ impl BoxRuntime {
             command_line.len() <= 2048,
             "kernel command line exceeds boot limit"
         );
-        let mut boot_store = self.new_child(BoxHost::new())?;
+        let mut boot_store = self.new_child(BootHost::default());
         boot_store
             .store
             .data_mut()
-            .boot
             .grant(config.clone(), ram.clone(), kernel)?;
         let mut linker = crate::engine::device_component_linker(self.store.engine())?;
-        terra::boot::host::add_to_linker::<BoxHost, Boot>(&mut linker, |host| &mut host.boot)?;
+        terra::boot::host::add_to_linker::<
+            StoreState<BootHost>,
+            wasmtime::component::HasSelf<BootHost>,
+        >(&mut linker, AsMut::as_mut)?;
         let entry = tokio::time::timeout(BOOT_TIMEOUT, async {
             let boot =
                 BootComponent::instantiate_async(&mut boot_store.store, component, &linker).await?;

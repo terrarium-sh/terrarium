@@ -1,11 +1,11 @@
 //! Bounded owned-value streams between component stores.
 
-use std::future::Future;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use tokio::sync::mpsc;
+use tokio_util::sync::PollSender;
 use wasmtime::StoreContextMut;
 use wasmtime::component::{
     Destination, Lift, Lower, Source, StreamConsumer, StreamProducer, StreamResult, VecBuffer,
@@ -13,12 +13,8 @@ use wasmtime::component::{
 
 pub const MMIO_CAPACITY: NonZeroUsize = NonZeroUsize::new(64).expect("nonzero relay capacity");
 
-type Reservation<T> =
-    Pin<Box<dyn Future<Output = Result<mpsc::OwnedPermit<T>, mpsc::error::SendError<()>>> + Send>>;
-
 pub struct Sink<T> {
-    sender: mpsc::Sender<T>,
-    reservation: Option<Reservation<T>>,
+    sender: PollSender<T>,
 }
 
 pub struct Stream<T> {
@@ -32,8 +28,7 @@ pub fn channel<T: Lift + Lower + Send + Sync + 'static>(
     let (sender, receiver) = mpsc::channel(capacity.get());
     (
         Sink {
-            sender,
-            reservation: None,
+            sender: PollSender::new(sender),
         },
         Stream { receiver },
     )
@@ -50,27 +45,26 @@ impl<D: 'static, T: Lift + Lower + Send + Sync + 'static> StreamConsumer<D> for 
         finish: bool,
     ) -> Poll<wasmtime::Result<StreamResult>> {
         if finish {
-            self.reservation = None;
+            self.sender.abort_send();
             return Poll::Ready(Ok(StreamResult::Cancelled));
         }
-        let mut reservation = self
-            .reservation
-            .take()
-            .unwrap_or_else(|| Box::pin(self.sender.clone().reserve_owned()));
-        let permit = match reservation.as_mut().poll(context) {
-            Poll::Pending => {
-                self.reservation = Some(reservation);
-                return Poll::Pending;
-            }
-            Poll::Ready(Ok(permit)) => permit,
-            Poll::Ready(Err(_)) => return Poll::Ready(Ok(StreamResult::Dropped)),
-        };
-        let mut item = None;
-        source.read(store, &mut item)?;
-        if let Some(item) = item {
-            permit.send(item);
+        if std::task::ready!(self.sender.poll_reserve(context)).is_err() {
+            return Poll::Ready(Ok(StreamResult::Dropped));
         }
-        Poll::Ready(Ok(StreamResult::Completed))
+        let mut item = None;
+        if let Err(error) = source.read(store, &mut item) {
+            self.sender.abort_send();
+            return Poll::Ready(Err(error));
+        }
+        if let Some(item) = item {
+            match self.sender.send_item(item) {
+                Ok(()) => Poll::Ready(Ok(StreamResult::Completed)),
+                Err(_) => Poll::Ready(Ok(StreamResult::Dropped)),
+            }
+        } else {
+            self.sender.abort_send();
+            Poll::Ready(Ok(StreamResult::Completed))
+        }
     }
 }
 

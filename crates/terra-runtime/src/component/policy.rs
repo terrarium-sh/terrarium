@@ -1,7 +1,8 @@
 //! WIT adapter for an isolated network policy sidecar.
 
+use futures_util::FutureExt;
 use std::net::IpAddr;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, mpsc};
 use terra_network::{NameLookup, Policy as NetworkPolicy};
 use wasmtime::component::Component;
 use wasmtime::{Engine, Store, StoreLimits, StoreLimitsBuilder};
@@ -19,20 +20,6 @@ const CALL_FUEL: u64 = 5_000_000;
 const MAX_CONFIG_BYTES: usize = 64 * 1024;
 const MAX_ADDRESSES: usize = 4096;
 pub(crate) const MAX_NAME_BYTES: usize = 254;
-
-pub(crate) async fn run_policy_decision<T: Send + 'static>(
-    policy: terra_network::PolicyHandle,
-    calls: Arc<tokio::sync::Semaphore>,
-    decision: impl FnOnce(&dyn NetworkPolicy) -> T + Send + 'static,
-) -> Option<T> {
-    let permit = calls.try_acquire_owned().ok()?;
-    tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        decision(policy.as_ref())
-    })
-    .await
-    .ok()
-}
 
 struct Host {
     ctx: WasiCtx,
@@ -122,7 +109,9 @@ impl PolicyFactory {
                 .call_configure(&mut store, config),
         )?
         .map_err(wasmtime::Error::msg)?;
-        let (sender, receiver) = mpsc::sync_channel::<Decision>(1);
+        let (sender, receiver) =
+            mpsc::sync_channel::<Decision>(crate::component::network::host::MAX_POLICY_CALLS);
+        let available = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let worker = std::thread::Builder::new()
             .name("network-policy".into())
             .spawn(move || {
@@ -134,8 +123,9 @@ impl PolicyFactory {
                 }
             })?;
         Ok(ComponentPolicy {
-            sender: Mutex::new(Some(sender)),
-            worker: Some(worker),
+            sender,
+            available,
+            worker,
             host_ports: grants.host_ports,
             blocks_direct_dns: grants.blocks_direct_dns,
         })
@@ -146,14 +136,9 @@ impl PolicyFactory {
 fn complete_decision<T>(
     future: impl std::future::Future<Output = wasmtime::Result<T>>,
 ) -> wasmtime::Result<T> {
-    let mut future = std::pin::pin!(future);
-    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
-    match future.as_mut().poll(&mut context) {
-        std::task::Poll::Ready(result) => result,
-        std::task::Poll::Pending => Err(wasmtime::Error::msg(
-            "network policy unexpectedly suspended",
-        )),
-    }
+    future
+        .now_or_never()
+        .ok_or_else(|| wasmtime::Error::msg("network policy unexpectedly suspended"))?
 }
 
 struct State {
@@ -165,71 +150,77 @@ struct State {
 type Decision = Box<dyn FnOnce(&mut State) -> bool + Send>;
 
 pub struct ComponentPolicy {
-    sender: Mutex<Option<mpsc::SyncSender<Decision>>>,
-    worker: Option<std::thread::JoinHandle<()>>,
+    sender: mpsc::SyncSender<Decision>,
+    available: Arc<std::sync::atomic::AtomicBool>,
+    worker: std::thread::JoinHandle<()>,
     host_ports: Vec<Option<u16>>,
     blocks_direct_dns: bool,
 }
 
 impl ComponentPolicy {
-    fn call<T: Send + 'static>(
+    fn enqueue<T: Send + 'static>(
         &self,
         call: impl FnOnce(&Policy, &mut Store<Host>) -> wasmtime::Result<T> + Send + 'static,
-    ) -> Option<T> {
-        let mut sender = self.sender.lock().ok()?;
-        let (reply, response) = mpsc::sync_channel(1);
-        let decision = Box::new(move |state: &mut State| {
+        reply: impl FnOnce(Option<T>) + Send + 'static,
+    ) {
+        let available = Arc::clone(&self.available);
+        let decision: Decision = Box::new(move |state| {
             let result = state
                 .store
                 .set_fuel(CALL_FUEL)
                 .and_then(|()| call(&state.bindings, &mut state.store));
             let succeeded = result.is_ok();
-            let _ = reply.send(result);
+            if !succeeded {
+                available.store(false, std::sync::atomic::Ordering::Release);
+            }
+            reply(result.ok());
             succeeded
         });
-        let result = sender
-            .as_ref()?
-            .send(decision)
-            .ok()
-            .and_then(|()| response.recv().ok())
-            .and_then(Result::ok);
-        if result.is_none() {
-            *sender = None;
+        if self.is_available() {
+            let _ = self.sender.try_send(decision);
         }
-        result
     }
-}
 
-impl Drop for ComponentPolicy {
-    fn drop(&mut self) {
-        self.sender
-            .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
+    fn call<T: Send + 'static>(
+        &self,
+        call: impl FnOnce(&Policy, &mut Store<Host>) -> wasmtime::Result<T> + Send + 'static,
+    ) -> Option<T> {
+        let (reply, response) = mpsc::sync_channel(1);
+        self.enqueue(call, move |result| {
+            let _ = reply.send(result);
+        });
+        response.recv().ok().flatten()
+    }
+
+    fn call_async<T: Send + 'static, F>(
+        &self,
+        call: F,
+        lease: terra_network::policy::DecisionLease,
+    ) -> impl std::future::Future<Output = Option<T>> + Send + use<T, F>
+    where
+        F: FnOnce(&Policy, &mut Store<Host>) -> wasmtime::Result<T> + Send + 'static,
+    {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.enqueue(call, move |result| {
+            drop(lease);
+            let _ = reply.send(result);
+        });
+        async move { response.await.ok().flatten() }
     }
 }
 
 impl NetworkPolicy for ComponentPolicy {
+    fn asynchronous(self: Arc<Self>) -> Option<Arc<dyn terra_network::policy::AsyncPolicy>> {
+        Some(self)
+    }
+
     fn is_available(&self) -> bool {
-        self.sender.lock().is_ok_and(|sender| sender.is_some())
-            && self
-                .worker
-                .as_ref()
-                .is_some_and(|worker| !worker.is_finished())
+        self.available.load(std::sync::atomic::Ordering::Acquire) && !self.worker.is_finished()
     }
 
     fn allows(&self, address: IpAddr, port: Option<u16>) -> bool {
-        self.call(move |bindings, store| {
-            complete_decision(bindings.terra_policy_decisions().call_allows(
-                store,
-                &address.to_string(),
-                port,
-            ))
-        })
-        .unwrap_or(false)
+        self.call(move |bindings, store| decide_allows(bindings, store, address, port))
+            .unwrap_or(false)
     }
 
     fn host_service_ports(&self) -> &[Option<u16>] {
@@ -241,21 +232,8 @@ impl NetworkPolicy for ComponentPolicy {
             return NameLookup::Denied;
         }
         let name = name.to_owned();
-        match self.call(move |bindings, store| {
-            complete_decision(
-                bindings
-                    .terra_policy_decisions()
-                    .call_lookup_name(store, &name),
-            )
-        }) {
-            Some(Lookup::Static(addresses)) => addresses
-                .iter()
-                .map(|address| address.parse())
-                .collect::<Result<Vec<_>, _>>()
-                .map_or(NameLookup::Denied, NameLookup::Static),
-            Some(Lookup::Resolve) => NameLookup::Resolve,
-            Some(Lookup::Denied) | None => NameLookup::Denied,
-        }
+        self.call(move |bindings, store| decide_lookup(bindings, store, &name))
+            .unwrap_or(NameLookup::Denied)
     }
 
     fn accept_resolved(&self, name: &str, addresses: &[IpAddr]) -> Vec<IpAddr> {
@@ -267,17 +245,8 @@ impl NetworkPolicy for ComponentPolicy {
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>();
-        self.call(move |bindings, store| {
-            complete_decision(
-                bindings
-                    .terra_policy_decisions()
-                    .call_accept_resolved(store, &name, &addresses),
-            )
-        })
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|address| address.parse().ok())
-        .collect()
+        self.call(move |bindings, store| decide_resolved(bindings, store, &name, &addresses))
+            .unwrap_or_default()
     }
 
     fn blocks_direct_dns(&self) -> bool {
@@ -285,9 +254,110 @@ impl NetworkPolicy for ComponentPolicy {
     }
 }
 
+impl terra_network::policy::AsyncPolicy for ComponentPolicy {
+    fn allows(
+        &self,
+        address: IpAddr,
+        port: Option<u16>,
+        lease: terra_network::policy::DecisionLease,
+    ) -> terra_network::policy::DecisionFuture<bool> {
+        let response = self.call_async(
+            move |bindings, store| decide_allows(bindings, store, address, port),
+            lease,
+        );
+        Box::pin(async move { response.await.unwrap_or(false) })
+    }
+    fn lookup_name(
+        &self,
+        name: String,
+        lease: terra_network::policy::DecisionLease,
+    ) -> terra_network::policy::DecisionFuture<NameLookup> {
+        if name.len() > MAX_NAME_BYTES {
+            return Box::pin(async { NameLookup::Denied });
+        }
+        let response = self.call_async(
+            move |bindings, store| decide_lookup(bindings, store, &name),
+            lease,
+        );
+        Box::pin(async move { response.await.unwrap_or(NameLookup::Denied) })
+    }
+
+    fn accept_resolved(
+        &self,
+        name: String,
+        addresses: Vec<IpAddr>,
+        lease: terra_network::policy::DecisionLease,
+    ) -> terra_network::policy::DecisionFuture<Vec<IpAddr>> {
+        if name.len() > MAX_NAME_BYTES || addresses.len() > MAX_ADDRESSES {
+            return Box::pin(async { Vec::new() });
+        }
+        let addresses = addresses
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        let response = self.call_async(
+            move |bindings, store| decide_resolved(bindings, store, &name, &addresses),
+            lease,
+        );
+        Box::pin(async move { response.await.unwrap_or_default() })
+    }
+}
+
+fn decide_allows(
+    bindings: &Policy,
+    store: &mut Store<Host>,
+    address: IpAddr,
+    port: Option<u16>,
+) -> wasmtime::Result<bool> {
+    complete_decision(bindings.terra_policy_decisions().call_allows(
+        store,
+        &address.to_string(),
+        port,
+    ))
+}
+
+fn decide_lookup(
+    bindings: &Policy,
+    store: &mut Store<Host>,
+    name: &str,
+) -> wasmtime::Result<NameLookup> {
+    Ok(
+        match complete_decision(
+            bindings
+                .terra_policy_decisions()
+                .call_lookup_name(store, name),
+        )? {
+            Lookup::Static(addresses) => addresses
+                .iter()
+                .map(|address| address.parse())
+                .collect::<Result<Vec<_>, _>>()
+                .map_or(NameLookup::Denied, NameLookup::Static),
+            Lookup::Resolve => NameLookup::Resolve,
+            Lookup::Denied => NameLookup::Denied,
+        },
+    )
+}
+
+fn decide_resolved(
+    bindings: &Policy,
+    store: &mut Store<Host>,
+    name: &str,
+    addresses: &[String],
+) -> wasmtime::Result<Vec<IpAddr>> {
+    Ok(complete_decision(
+        bindings
+            .terra_policy_decisions()
+            .call_accept_resolved(store, name, addresses),
+    )?
+    .iter()
+    .filter_map(|address| address.parse().ok())
+    .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::component::network::policy::PolicyClient;
     use std::sync::{Arc, OnceLock};
 
     #[allow(unsafe_code)]
@@ -320,6 +390,128 @@ mod tests {
             hosts: Vec::new(),
             host_addresses: Vec::new(),
         }
+    }
+
+    #[test]
+    fn asynchronous_policy_does_not_use_the_tokio_blocking_pool() {
+        let policy: terra_network::PolicyHandle =
+            Arc::new(instantiate(&config(&["api.test:443"])).unwrap());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        let (started, ready) = mpsc::sync_channel(1);
+        let (release, blocked) = mpsc::sync_channel(1);
+        let occupied = runtime.spawn_blocking(move || {
+            started.send(()).unwrap();
+            blocked.recv().unwrap();
+        });
+        ready.recv().unwrap();
+        let result = runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                PolicyClient::new(policy, Arc::new(tokio::sync::Semaphore::new(1)))
+                    .lookup_name("api.test".into())
+                    .await
+            })
+            .await
+        });
+        release.send(()).unwrap();
+        runtime.block_on(occupied).unwrap();
+        assert!(matches!(result.unwrap(), Some(NameLookup::Resolve)));
+    }
+
+    #[tokio::test]
+    async fn cancelled_async_policy_waiter_retains_admission_until_reply() {
+        let policy = Arc::new(instantiate(&config(&["1.1.1.1:443"])).unwrap());
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, blocked) = mpsc::sync_channel(1);
+        policy.enqueue(
+            move |_, _| {
+                started.send(()).unwrap();
+                blocked.recv().unwrap();
+                Ok(())
+            },
+            |_| {},
+        );
+        ready.await.unwrap();
+        let calls = Arc::new(tokio::sync::Semaphore::new(1));
+        let client = PolicyClient::new(policy.clone(), calls.clone());
+        let operation = client.lookup_name("api.test".into());
+        let result = tokio::time::timeout(std::time::Duration::from_millis(20), operation).await;
+        let retained = calls.available_permits();
+        release.send(()).unwrap();
+        assert!(result.is_err());
+        assert_eq!(retained, 0);
+        let permit = tokio::time::timeout(std::time::Duration::from_secs(1), calls.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(permit);
+        let response = policy.call_async(
+            |_, _| Err::<(), _>(wasmtime::Error::msg("trap")),
+            Box::new(()),
+        );
+        assert!(response.await.is_none());
+        assert!(!policy.is_available());
+        assert!(
+            !terra_network::policy::AsyncPolicy::allows(
+                policy.as_ref(),
+                "1.1.1.1".parse().unwrap(),
+                Some(443),
+                Box::new(()),
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_and_abandoned_requests_release_leases_without_joining_the_worker() {
+        let policy = instantiate(&config(&[])).unwrap();
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, blocked) = mpsc::channel();
+        policy.enqueue(
+            move |_, _| {
+                entered.send(()).unwrap();
+                blocked
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap();
+                Err::<(), _>(wasmtime::Error::msg("worker failed"))
+            },
+            |_| {},
+        );
+        started.await.unwrap();
+        let capacity = crate::component::network::host::MAX_POLICY_CALLS;
+        let calls = Arc::new(tokio::sync::Semaphore::new(capacity + 1));
+        for _ in 0..capacity {
+            let lease = calls.clone().try_acquire_owned().unwrap();
+            drop(policy.call_async(
+                |_, _| -> wasmtime::Result<()> { panic!("request ran after worker failure") },
+                Box::new(lease),
+            ));
+        }
+        let lease = calls.clone().try_acquire_owned().unwrap();
+        assert!(
+            policy
+                .call_async(|_, _| Ok(()), Box::new(lease))
+                .await
+                .is_none()
+        );
+        assert_eq!(calls.available_permits(), 1);
+        let available = Arc::clone(&policy.available);
+        let before_drop = std::time::Instant::now();
+        drop(policy);
+        let drop_elapsed = before_drop.elapsed();
+        let _ = release.send(());
+        assert!(drop_elapsed < std::time::Duration::from_secs(1));
+        let _permits = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            calls.acquire_many(u32::try_from(capacity + 1).unwrap()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!available.load(std::sync::atomic::Ordering::Acquire));
     }
 
     #[test]

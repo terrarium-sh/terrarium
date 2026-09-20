@@ -1,23 +1,85 @@
 //! Fixed local-socket grants for the sandboxed vsock service.
 
 use std::io;
-#[cfg(windows)]
 use std::pin::Pin;
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-};
+use std::sync::Arc;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use terra_io::local::{LocalListener, LocalStream};
+use terra_io::local::{
+    AsyncLocalListener as Listener, AsyncLocalStream, LocalListener, LocalStream,
+};
+type ReadHalf = AsyncLocalStream;
+type WriteHalf = AsyncLocalStream;
 use wasmtime::StoreContextMut;
 use wasmtime::component::{
     Access, Accessor, Destination, Resource, ResourceTable, Source, StreamConsumer, StreamProducer,
     StreamReader, StreamResult, VecBuffer,
 };
 
+use crate::SyntheticRam;
+use crate::engine::{DeviceContext, DeviceHost, add_device_imports, device_component_linker};
+use wasmtime::Engine;
+use wasmtime_wasi::{WasiCtxView, WasiView};
+
+pub struct VsockDeviceHost {
+    pub context: DeviceContext,
+    vsock_service: VsockHostService,
+}
+
+impl VsockDeviceHost {
+    #[must_use]
+    pub fn new(ram: SyntheticRam, service: VsockHostService) -> Self {
+        Self {
+            context: DeviceContext::with_ram(ram),
+            vsock_service: service,
+        }
+    }
+
+    pub fn vsock_service_mut(&mut self) -> &mut VsockHostService {
+        &mut self.vsock_service
+    }
+}
+
+impl DeviceHost for VsockDeviceHost {
+    fn context(&mut self) -> &mut DeviceContext {
+        &mut self.context
+    }
+}
+impl WasiView for VsockDeviceHost {
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        self.context.ctx()
+    }
+}
+
+impl AsMut<VsockDeviceHost> for VsockDeviceHost {
+    fn as_mut(&mut self) -> &mut Self {
+        self
+    }
+}
+
+impl crate::box_runtime::StoreHost for VsockDeviceHost {}
+
+pub fn vsock_component_linker<T: WasiView + AsMut<VsockDeviceHost> + 'static>(
+    engine: &Engine,
+) -> wasmtime::Result<wasmtime::component::Linker<T>> {
+    use wasmtime_wasi::{
+        p3::bindings::random::random as random_bindings,
+        random::{WasiRandom, WasiRandomView},
+    };
+    let mut linker = device_component_linker(engine)?;
+    random_bindings::add_to_linker::<T, WasiRandom>(&mut linker, WasiRandomView::random)?;
+    terra::vsock::host_service::add_to_linker::<T, VsockHost>(&mut linker, |host| {
+        host.as_mut().vsock_service_mut()
+    })?;
+    add_device_imports(&mut linker, |host: &mut T| host.as_mut().context())?;
+    Ok(linker)
+}
+
 wasmtime::component::bindgen!({
     world: "device",
     path: "../../components/vsock/wit",
+    exports: { default: async },
     imports: {
         default: trappable,
         "terra:vsock/host-service.[method]client.input": store | trappable,
@@ -25,23 +87,16 @@ wasmtime::component::bindgen!({
         "terra:vsock/host-service.plan": store | trappable,
         "terra:vsock/host-service.stop": store | trappable,
     },
+    with: {
+        "terra:mmio/types@0.1.0": crate::component::vmm::mmio::terra::mmio::types,
+    },
 });
+
+pub(crate) use Device as VsockBindings;
+pub use exports::terra::vsock::api::{Error as VsockError, Event as VsockEvent};
 
 const MAX_CLIENTS: usize = 64;
 const CHUNK_BYTES: usize = 16 * 1024;
-
-#[cfg(unix)]
-type Listener = tokio::io::unix::AsyncFd<LocalListener>;
-#[cfg(unix)]
-type ReadHalf = tokio::io::unix::AsyncFd<LocalStream>;
-#[cfg(unix)]
-type WriteHalf = tokio::io::unix::AsyncFd<LocalStream>;
-#[cfg(windows)]
-type Listener = LocalListener;
-#[cfg(windows)]
-type ReadHalf = LocalStream;
-#[cfg(windows)]
-type WriteHalf = LocalStream;
 
 pub struct VsockHost;
 
@@ -51,21 +106,13 @@ pub struct VsockHostService {
     stop: Option<ReadHalf>,
     stop_issued: bool,
     resources: ResourceTable,
-    live_clients: Arc<AtomicUsize>,
+    client_slots: Arc<Semaphore>,
 }
 
 struct ClientState {
     input: Option<ReadHalf>,
     output: Option<WriteHalf>,
-    lease: Arc<ClientLease>,
-}
-
-struct ClientLease(Arc<AtomicUsize>);
-
-impl Drop for ClientLease {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
-    }
+    lease: Arc<OwnedSemaphorePermit>,
 }
 
 impl VsockHostService {
@@ -80,13 +127,13 @@ impl VsockHostService {
             stop: stop.map(prepare_stream).transpose()?,
             stop_issued: false,
             resources: client_resources(),
-            live_clients: Arc::new(AtomicUsize::new(0)),
+            client_slots: Arc::new(Semaphore::new(MAX_CLIENTS)),
         })
     }
 
     #[must_use]
     pub fn live_clients(&self) -> usize {
-        self.live_clients.load(Ordering::Acquire)
+        MAX_CLIENTS - self.client_slots.available_permits()
     }
 
     fn client_mut(
@@ -98,13 +145,11 @@ impl VsockHostService {
             .ok()
     }
 
-    fn reserve_client(&self) -> Option<Arc<ClientLease>> {
-        self.live_clients
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                (count < MAX_CLIENTS).then_some(count + 1)
-            })
+    fn reserve_client(&self) -> Option<Arc<OwnedSemaphorePermit>> {
+        Arc::clone(&self.client_slots)
+            .try_acquire_owned()
             .ok()
-            .map(|_| Arc::new(ClientLease(Arc::clone(&self.live_clients))))
+            .map(Arc::new)
     }
 }
 
@@ -116,7 +161,7 @@ impl Default for VsockHostService {
             stop: None,
             stop_issued: false,
             resources: client_resources(),
-            live_clients: Arc::new(AtomicUsize::new(0)),
+            client_slots: Arc::new(Semaphore::new(MAX_CLIENTS)),
         }
     }
 }
@@ -142,8 +187,8 @@ impl terra::vsock::host_service::HostClient for VsockHostService {
             return Ok(());
         };
         let output = client.output.take();
-        if let Some(output) = output {
-            shutdown_write(&output);
+        if let Some(mut output) = output {
+            shutdown_write(&mut output);
         }
         Ok(())
     }
@@ -176,8 +221,6 @@ impl<T: Send + 'static> terra::vsock::host_service::HostClientWithStore<T> for V
             InputProducer {
                 input: Some(input),
                 _lease: Some(lease),
-                #[cfg(windows)]
-                retry: None,
             },
         )
     }
@@ -208,8 +251,6 @@ impl<T: Send + 'static> terra::vsock::host_service::HostClientWithStore<T> for V
                         output: Some(output),
                         _lease: lease,
                         sender: Some(sender),
-                        #[cfg(windows)]
-                        retry: None,
                     },
                 )
                 .map_err(|_| terra::vsock::host_service::EndpointError::Io)?;
@@ -235,16 +276,7 @@ impl<T: Send + 'static> terra::vsock::host_service::HostWithStore<T> for VsockHo
             return Ok(None);
         };
         let getter = access.getter();
-        StreamReader::new(
-            &mut access,
-            ListenerProducer {
-                listener,
-                getter,
-                #[cfg(windows)]
-                retry: None,
-            },
-        )
-        .map(Some)
+        StreamReader::new(&mut access, ListenerProducer { listener, getter }).map(Some)
     }
 
     fn plan(mut access: Access<'_, T, Self>) -> wasmtime::Result<StreamReader<u8>> {
@@ -270,8 +302,6 @@ impl<T: Send + 'static> terra::vsock::host_service::HostWithStore<T> for VsockHo
             InputProducer {
                 input: stop,
                 _lease: None,
-                #[cfg(windows)]
-                retry: None,
             },
         )
     }
@@ -280,8 +310,6 @@ impl<T: Send + 'static> terra::vsock::host_service::HostWithStore<T> for VsockHo
 struct ListenerProducer<T> {
     listener: Listener,
     getter: for<'a> fn(&'a mut T) -> &'a mut VsockHostService,
-    #[cfg(windows)]
-    retry: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
 impl<T: 'static> StreamProducer<T> for ListenerProducer<T> {
@@ -297,21 +325,9 @@ impl<T: 'static> StreamProducer<T> for ListenerProducer<T> {
     ) -> core::task::Poll<wasmtime::Result<StreamResult>> {
         let this = self.as_mut().get_mut();
         if destination.remaining(&mut store) == Some(0) {
-            return poll_listener_ready(
-                &mut this.listener,
-                context,
-                finish,
-                #[cfg(windows)]
-                &mut this.retry,
-            );
+            return poll_listener_ready(&mut this.listener, context, finish);
         }
-        let stream = match poll_listener_accept(
-            &mut this.listener,
-            context,
-            finish,
-            #[cfg(windows)]
-            &mut this.retry,
-        ) {
+        let stream = match poll_listener_accept(&mut this.listener, context, finish) {
             core::task::Poll::Ready(Ok(Some(stream))) => stream,
             core::task::Poll::Ready(Ok(None)) => {
                 return core::task::Poll::Ready(Ok(StreamResult::Cancelled));
@@ -342,9 +358,7 @@ impl<T: 'static> StreamProducer<T> for ListenerProducer<T> {
 
 struct InputProducer {
     input: Option<ReadHalf>,
-    _lease: Option<Arc<ClientLease>>,
-    #[cfg(windows)]
-    retry: Option<Pin<Box<tokio::time::Sleep>>>,
+    _lease: Option<Arc<OwnedSemaphorePermit>>,
 }
 
 impl<T: 'static> StreamProducer<T> for InputProducer {
@@ -362,25 +376,15 @@ impl<T: 'static> StreamProducer<T> for InputProducer {
         let Some(input) = this.input.as_mut() else {
             return core::task::Poll::Ready(Ok(StreamResult::Dropped));
         };
-        poll_input(
-            input,
-            context,
-            store,
-            destination,
-            finish,
-            #[cfg(windows)]
-            &mut this.retry,
-        )
+        poll_input(input, context, store, destination, finish)
     }
 }
 
 struct OutputConsumer {
     output: Option<WriteHalf>,
-    _lease: Arc<ClientLease>,
+    _lease: Arc<OwnedSemaphorePermit>,
     sender:
         Option<tokio::sync::oneshot::Sender<Result<(), terra::vsock::host_service::EndpointError>>>,
-    #[cfg(windows)]
-    retry: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
 impl OutputConsumer {
@@ -393,8 +397,8 @@ impl OutputConsumer {
 
 impl Drop for OutputConsumer {
     fn drop(&mut self) {
-        if let Some(output) = self.output.take() {
-            shutdown_write(&output);
+        if let Some(mut output) = self.output.take() {
+            shutdown_write(&mut output);
         }
         self.complete(Ok(()));
     }
@@ -419,156 +423,53 @@ impl<T: 'static> StreamConsumer<T> for OutputConsumer {
             this.complete(Err(terra::vsock::host_service::EndpointError::Closed));
             return core::task::Poll::Ready(Ok(StreamResult::Cancelled));
         }
-        #[cfg(windows)]
-        return poll_output(
-            output,
-            context,
-            store,
-            source,
-            &mut this.retry,
-            &mut this.sender,
-        );
-        #[cfg(unix)]
-        {
-            let mut source = source.as_direct(store);
-            let bytes = source.remaining();
-            let count = bytes.len().min(CHUNK_BYTES);
-            loop {
-                let mut ready = match output.poll_write_ready(context) {
-                    core::task::Poll::Ready(Ok(ready)) => ready,
-                    core::task::Poll::Ready(Err(error)) => {
-                        return core::task::Poll::Ready(Err(error.into()));
-                    }
-                    core::task::Poll::Pending => return core::task::Poll::Pending,
-                };
-                if count == 0 {
-                    return core::task::Poll::Ready(Ok(StreamResult::Completed));
-                }
-                match ready
-                    .try_io(|stream| std::io::Write::write(&mut stream.get_ref(), &bytes[..count]))
-                {
-                    Ok(Ok(count)) => {
-                        source.mark_read(count);
-                        return core::task::Poll::Ready(Ok(StreamResult::Completed));
-                    }
-                    Ok(Err(_)) => {
-                        this.complete(Err(terra::vsock::host_service::EndpointError::Io));
-                        return core::task::Poll::Ready(Ok(StreamResult::Dropped));
-                    }
-                    Err(_) => {}
-                }
+        let mut source = source.as_direct(store);
+        let bytes = source.remaining();
+        let count = bytes.len().min(CHUNK_BYTES);
+        if count == 0 {
+            return output
+                .poll_write_ready(context)
+                .map_ok(|()| StreamResult::Completed)
+                .map_err(Into::into);
+        }
+        match Pin::new(output).poll_write(context, &bytes[..count]) {
+            core::task::Poll::Ready(Ok(count)) => {
+                source.mark_read(count);
+                core::task::Poll::Ready(Ok(StreamResult::Completed))
             }
+            core::task::Poll::Ready(Err(_)) => {
+                this.complete(Err(terra::vsock::host_service::EndpointError::Io));
+                core::task::Poll::Ready(Ok(StreamResult::Dropped))
+            }
+            core::task::Poll::Pending => core::task::Poll::Pending,
         }
     }
 }
 
-#[cfg(unix)]
 fn poll_listener_ready(
     listener: &mut Listener,
     context: &mut core::task::Context<'_>,
     finish: bool,
 ) -> core::task::Poll<wasmtime::Result<StreamResult>> {
     match listener.poll_read_ready(context) {
-        core::task::Poll::Ready(Ok(_)) => core::task::Poll::Ready(Ok(StreamResult::Completed)),
+        core::task::Poll::Ready(Ok(())) => core::task::Poll::Ready(Ok(StreamResult::Completed)),
         core::task::Poll::Ready(Err(error)) => core::task::Poll::Ready(Err(error.into())),
         core::task::Poll::Pending if finish => core::task::Poll::Ready(Ok(StreamResult::Cancelled)),
         core::task::Poll::Pending => core::task::Poll::Pending,
     }
 }
 
-#[cfg(unix)]
 fn poll_listener_accept(
     listener: &mut Listener,
     context: &mut core::task::Context<'_>,
     finish: bool,
 ) -> core::task::Poll<io::Result<Option<LocalStream>>> {
-    loop {
-        let mut ready = match listener.poll_read_ready(context) {
-            core::task::Poll::Ready(Ok(ready)) => ready,
-            core::task::Poll::Ready(Err(error)) => return core::task::Poll::Ready(Err(error)),
-            core::task::Poll::Pending if finish => return core::task::Poll::Ready(Ok(None)),
-            core::task::Poll::Pending => return core::task::Poll::Pending,
-        };
-        if let Ok(stream) =
-            ready.try_io(|listener| listener.get_ref().accept().map(|(stream, _)| stream))
-        {
-            return core::task::Poll::Ready(stream.map(Some));
-        }
+    match listener.poll_accept(context) {
+        core::task::Poll::Pending if finish => core::task::Poll::Ready(Ok(None)),
+        result => result.map_ok(Some),
     }
 }
 
-#[cfg(windows)]
-fn poll_listener_ready(
-    listener: &mut Listener,
-    context: &mut core::task::Context<'_>,
-    finish: bool,
-    retry: &mut Option<Pin<Box<tokio::time::Sleep>>>,
-) -> core::task::Poll<wasmtime::Result<StreamResult>> {
-    if finish {
-        return core::task::Poll::Ready(Ok(StreamResult::Cancelled));
-    }
-    let _ = listener;
-    retry_pending(retry, context)
-}
-
-#[cfg(windows)]
-fn poll_listener_accept(
-    listener: &mut Listener,
-    context: &mut core::task::Context<'_>,
-    finish: bool,
-    retry: &mut Option<Pin<Box<tokio::time::Sleep>>>,
-) -> core::task::Poll<io::Result<Option<LocalStream>>> {
-    match listener.accept() {
-        Ok((stream, _)) => core::task::Poll::Ready(Ok(Some(stream))),
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock && finish => {
-            core::task::Poll::Ready(Ok(None))
-        }
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-            match poll_retry(retry, context) {
-                core::task::Poll::Ready(()) => {
-                    context.waker().wake_by_ref();
-                    core::task::Poll::Pending
-                }
-                core::task::Poll::Pending => core::task::Poll::Pending,
-            }
-        }
-        Err(error) => core::task::Poll::Ready(Err(error)),
-    }
-}
-
-#[cfg(windows)]
-fn poll_retry(
-    retry: &mut Option<Pin<Box<tokio::time::Sleep>>>,
-    context: &mut core::task::Context<'_>,
-) -> core::task::Poll<()> {
-    use core::future::Future;
-
-    let sleep = retry
-        .get_or_insert_with(|| Box::pin(tokio::time::sleep(std::time::Duration::from_millis(1))));
-    match sleep.as_mut().poll(context) {
-        core::task::Poll::Ready(()) => {
-            *retry = None;
-            core::task::Poll::Ready(())
-        }
-        core::task::Poll::Pending => core::task::Poll::Pending,
-    }
-}
-
-#[cfg(windows)]
-fn retry_pending(
-    retry: &mut Option<Pin<Box<tokio::time::Sleep>>>,
-    context: &mut core::task::Context<'_>,
-) -> core::task::Poll<wasmtime::Result<StreamResult>> {
-    match poll_retry(retry, context) {
-        core::task::Poll::Ready(()) => {
-            context.waker().wake_by_ref();
-            core::task::Poll::Pending
-        }
-        core::task::Poll::Pending => core::task::Poll::Pending,
-    }
-}
-
-#[cfg(unix)]
 fn poll_input<T>(
     input: &mut ReadHalf,
     context: &mut core::task::Context<'_>,
@@ -581,7 +482,7 @@ fn poll_input<T>(
     }
     if destination.remaining(&mut store) == Some(0) {
         return match input.poll_read_ready(context) {
-            core::task::Poll::Ready(Ok(_)) => core::task::Poll::Ready(Ok(StreamResult::Completed)),
+            core::task::Poll::Ready(Ok(())) => core::task::Poll::Ready(Ok(StreamResult::Completed)),
             core::task::Poll::Ready(Err(error)) => core::task::Poll::Ready(Err(error.into())),
             core::task::Poll::Pending => core::task::Poll::Pending,
         };
@@ -600,139 +501,39 @@ fn poll_input<T>(
     }
 }
 
-#[cfg(unix)]
 fn poll_read_input(
     input: &mut ReadHalf,
     context: &mut core::task::Context<'_>,
     bytes: &mut [u8],
 ) -> core::task::Poll<io::Result<usize>> {
-    loop {
-        let mut ready = match input.poll_read_ready(context) {
-            core::task::Poll::Ready(Ok(ready)) => ready,
-            core::task::Poll::Ready(Err(error)) => return core::task::Poll::Ready(Err(error)),
-            core::task::Poll::Pending => return core::task::Poll::Pending,
-        };
-        if let Ok(result) = ready.try_io(|stream| std::io::Read::read(&mut stream.get_ref(), bytes))
-        {
-            return core::task::Poll::Ready(result);
-        }
-    }
+    let mut buffer = ReadBuf::new(bytes);
+    Pin::new(input)
+        .poll_read(context, &mut buffer)
+        .map_ok(|()| buffer.filled().len())
 }
 
-#[cfg(windows)]
-fn poll_output<T>(
-    output: &mut WriteHalf,
-    context: &mut core::task::Context<'_>,
-    store: StoreContextMut<T>,
-    source: Source<'_, u8>,
-    retry: &mut Option<Pin<Box<tokio::time::Sleep>>>,
-    sender: &mut Option<
-        tokio::sync::oneshot::Sender<Result<(), terra::vsock::host_service::EndpointError>>,
-    >,
-) -> core::task::Poll<wasmtime::Result<StreamResult>> {
-    let mut source = source.as_direct(store);
-    let bytes = source.remaining();
-    let count = bytes.len().min(CHUNK_BYTES);
-    if count == 0 {
-        return poll_retry(retry, context).map(|()| Ok(StreamResult::Completed));
-    }
-    match std::io::Write::write(output, &bytes[..count]) {
-        Ok(count) => {
-            source.mark_read(count);
-            core::task::Poll::Ready(Ok(StreamResult::Completed))
-        }
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => retry_pending(retry, context),
-        Err(_) => {
-            if let Some(sender) = sender.take() {
-                let _ = sender.send(Err(terra::vsock::host_service::EndpointError::Io));
-            }
-            core::task::Poll::Ready(Ok(StreamResult::Dropped))
-        }
-    }
-}
-
-#[cfg(windows)]
-fn poll_input<T>(
-    input: &mut ReadHalf,
-    context: &mut core::task::Context<'_>,
-    mut store: StoreContextMut<T>,
-    destination: Destination<'_, u8, VecBuffer<u8>>,
-    finish: bool,
-    retry: &mut Option<Pin<Box<tokio::time::Sleep>>>,
-) -> core::task::Poll<wasmtime::Result<StreamResult>> {
-    if finish {
-        return core::task::Poll::Ready(Ok(StreamResult::Cancelled));
-    }
-    if destination.remaining(&mut store) == Some(0) {
-        return poll_retry(retry, context).map(|()| Ok(StreamResult::Completed));
-    }
-    let mut destination = destination.as_direct(store, CHUNK_BYTES);
-    let bytes = destination.remaining();
-    match std::io::Read::read(input, bytes) {
-        Ok(0) => core::task::Poll::Ready(Ok(StreamResult::Dropped)),
-        Ok(count) => {
-            destination.mark_written(count);
-            core::task::Poll::Ready(Ok(StreamResult::Completed))
-        }
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => retry_pending(retry, context),
-        Err(_) => core::task::Poll::Ready(Ok(StreamResult::Dropped)),
-    }
-}
-
-#[cfg(unix)]
 fn prepare_listener(listener: LocalListener) -> io::Result<Listener> {
-    listener.set_nonblocking(true)?;
-    tokio::io::unix::AsyncFd::new(listener)
+    Listener::from_std(listener)
 }
 
-#[cfg(windows)]
-fn prepare_listener(listener: LocalListener) -> io::Result<Listener> {
-    listener.set_nonblocking(true)?;
-    Ok(listener)
-}
-
-#[cfg(unix)]
-fn prepare_stream(stream: LocalStream) -> io::Result<ReadHalf> {
+fn prepare_stream(stream: LocalStream) -> io::Result<AsyncLocalStream> {
     stream.set_nonblocking(true)?;
-    tokio::io::unix::AsyncFd::new(stream)
+    AsyncLocalStream::from_std(stream)
 }
 
-#[cfg(windows)]
-fn prepare_stream(stream: LocalStream) -> io::Result<ReadHalf> {
-    stream.set_nonblocking(true)?;
-    Ok(stream)
-}
-
-#[cfg(unix)]
-fn client_state(stream: LocalStream, lease: Arc<ClientLease>) -> io::Result<ClientState> {
-    stream.set_nonblocking(true)?;
+fn client_state(stream: LocalStream, lease: Arc<OwnedSemaphorePermit>) -> io::Result<ClientState> {
     let writer = stream.try_clone()?;
     Ok(ClientState {
-        input: Some(tokio::io::unix::AsyncFd::new(stream)?),
-        output: Some(tokio::io::unix::AsyncFd::new(writer)?),
+        input: Some(prepare_stream(stream)?),
+        output: Some(prepare_stream(writer)?),
         lease,
     })
 }
 
-#[cfg(windows)]
-fn client_state(stream: LocalStream, lease: Arc<ClientLease>) -> io::Result<ClientState> {
-    stream.set_nonblocking(true)?;
-    let writer = stream.try_clone()?;
-    Ok(ClientState {
-        input: Some(stream),
-        output: Some(writer),
-        lease,
-    })
-}
-
-#[cfg(unix)]
-fn shutdown_write(stream: &WriteHalf) {
-    let _ = stream.get_ref().shutdown(std::net::Shutdown::Write);
-}
-
-#[cfg(windows)]
-fn shutdown_write(stream: &WriteHalf) {
-    let _ = stream.shutdown(std::net::Shutdown::Write);
+fn shutdown_write(stream: &mut WriteHalf) {
+    let _ = Pin::new(stream).poll_shutdown(&mut core::task::Context::from_waker(
+        core::task::Waker::noop(),
+    ));
 }
 
 #[cfg(test)]
@@ -741,7 +542,9 @@ mod tests {
     use crate::component::vsock::host::terra::vsock::host_service::{
         HostClient, HostClientWithStore, HostWithStore,
     };
-    use crate::engine::DeviceHost;
+    use crate::engine::VsockDeviceHost;
+    #[cfg(unix)]
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[cfg(unix)]
     struct ReadWake(AtomicUsize);
@@ -765,7 +568,9 @@ mod tests {
         let (server, _) = listener.accept().expect("peer");
         let mut input = prepare_stream(server).expect("async socket");
         client.write_all(b"first").expect("first write");
-        drop(input.readable().await.expect("initial readiness"));
+        std::future::poll_fn(|cx| input.poll_read_ready(cx))
+            .await
+            .expect("initial readiness");
         let mut buffer = [0; 5];
         assert!(matches!(
             poll_read_input(
@@ -797,18 +602,14 @@ mod tests {
 
     #[tokio::test]
     async fn endpoint_claims_are_single_use_and_stream_leases_hold_client_capacity() {
-        let live_clients = Arc::new(AtomicUsize::new(1));
+        let mut service = VsockHostService::default();
         let root = tempfile::tempdir().expect("socket directory");
         let path = root.path().join("socket");
         let listener = LocalListener::bind(&path).expect("listener");
         let stream = LocalStream::connect(&path).expect("client");
         let (_peer, _) = listener.accept().expect("peer");
-        let state = client_state(stream, Arc::new(ClientLease(Arc::clone(&live_clients))))
+        let state = client_state(stream, service.reserve_client().expect("client capacity"))
             .expect("client state");
-        let mut service = VsockHostService {
-            live_clients: Arc::clone(&live_clients),
-            ..VsockHostService::default()
-        };
         let entry = service.resources.push(state).expect("resource entry");
         let client = Resource::new_own(entry.rep());
         let state = service.client_mut(&client).expect("live client");
@@ -817,35 +618,30 @@ mod tests {
         assert!(state.input.take().is_none());
         let lease = Arc::clone(&state.lease);
         service.drop(client).expect("drop client resource");
-        assert_eq!(live_clients.load(Ordering::Acquire), 1);
+        assert_eq!(service.live_clients(), 1);
         drop(input);
         drop(lease);
-        assert_eq!(live_clients.load(Ordering::Acquire), 0);
+        assert_eq!(service.live_clients(), 0);
     }
 
     #[tokio::test]
     async fn repeated_host_stream_claims_trap_before_allocating_a_transmit() {
-        let live_clients = Arc::new(AtomicUsize::new(1));
+        let mut service = VsockHostService::default();
         let root = tempfile::tempdir().expect("socket directory");
         let path = root.path().join("socket");
         let listener = LocalListener::bind(&path).expect("listener");
         let stream = LocalStream::connect(&path).expect("client");
         let (_peer, _) = listener.accept().expect("peer");
-        let state = client_state(stream, Arc::new(ClientLease(Arc::clone(&live_clients))))
+        let state = client_state(stream, service.reserve_client().expect("client capacity"))
             .expect("client state");
-        let mut service = VsockHostService {
-            live_clients,
-            ..VsockHostService::default()
-        };
         let entry = service.resources.push(state).expect("resource entry");
         let client_rep = entry.rep();
-        let mut host = DeviceHost::new(4096).expect("host");
-        host.set_vsock_service(service);
+        let host = VsockDeviceHost::new(crate::SyntheticRam::new(4096).unwrap(), service);
         let engine = crate::engine::device_engine().expect("engine");
         let mut store = wasmtime::Store::new(&engine, host);
         store
             .run_concurrent(async |accessor| {
-                let service = accessor.with_getter::<VsockHost>(DeviceHost::vsock_service_mut);
+                let service = accessor.with_getter::<VsockHost>(VsockDeviceHost::vsock_service_mut);
                 assert!(
                     service
                         .with(|access| VsockHost::input(access, Resource::new_own(client_rep)))

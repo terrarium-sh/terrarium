@@ -18,7 +18,7 @@ use wasmtime_wasi::p3::bindings::filesystem::types::ErrorCode;
 use super::host::{FsHost, ShareGrant};
 use crate::box_runtime::{BoxHost, BoxRuntime, BoxRuntimeHandle};
 use crate::component::DeviceChannel;
-use crate::engine::{DeviceHost, device_engine};
+use crate::engine::{DeviceContext, device_engine};
 use crate::{BoundedMemory, SyntheticRam};
 
 pub(super) struct IoGate {
@@ -56,14 +56,14 @@ impl Drop for StalledRead {
     }
 }
 
-impl StreamProducer<BoxHost> for StalledRead {
+impl StreamProducer<crate::box_runtime::StoreState<FsHost>> for StalledRead {
     type Item = u8;
     type Buffer = Option<u8>;
 
     fn poll_produce<'a>(
         mut self: Pin<&mut Self>,
         context: &mut Context<'_>,
-        _: wasmtime::StoreContextMut<'a, BoxHost>,
+        _: wasmtime::StoreContextMut<'a, crate::box_runtime::StoreState<FsHost>>,
         mut destination: Destination<'a, Self::Item, Self::Buffer>,
         _finish: bool,
     ) -> Poll<wasmtime::Result<StreamResult>> {
@@ -80,9 +80,9 @@ impl StreamProducer<BoxHost> for StalledRead {
 }
 
 pub(super) fn install_io_gate(
-    mut linker: Linker<BoxHost>,
+    mut linker: Linker<crate::box_runtime::StoreState<FsHost>>,
     gate: Option<Arc<IoGate>>,
-) -> wasmtime::Result<Linker<BoxHost>> {
+) -> wasmtime::Result<Linker<crate::box_runtime::StoreState<FsHost>>> {
     if let Some(gate) = gate {
         linker.allow_shadowing(true);
         if matches!(gate.operation, Operation::HostMetadata) {
@@ -159,9 +159,9 @@ pub(super) fn install_io_gate(
 }
 
 fn install_metadata_gate(
-    mut linker: Linker<BoxHost>,
+    mut linker: Linker<crate::box_runtime::StoreState<FsHost>>,
     gate: Arc<IoGate>,
-) -> wasmtime::Result<Linker<BoxHost>> {
+) -> wasmtime::Result<Linker<crate::box_runtime::StoreState<FsHost>>> {
     use wasmtime_wasi::filesystem::WasiFilesystem;
     use wasmtime_wasi::p3::bindings::filesystem::types::{HostDescriptorWithStore, PathFlags};
     if matches!(gate.operation, Operation::Lookup) {
@@ -171,7 +171,7 @@ fn install_metadata_gate(
                 let gate = gate.clone();
                 Box::pin(async move {
                     gate.wait_if_armed().await;
-                    let wasi = accessor.with_getter::<WasiFilesystem>(super::shared_filesystem);
+                    let wasi = accessor.with_getter::<WasiFilesystem>(wasmtime_wasi::filesystem::WasiFilesystemView::filesystem);
                     Ok((match WasiFilesystem::stat_at(&wasi, descriptor, flags, path).await { Ok(value) => Ok(value), Err(error) => Err(error.downcast()?), },))
                 })
             },
@@ -185,7 +185,9 @@ fn install_metadata_gate(
                     let gate = gate.clone();
                     Box::pin(async move {
                         gate.wait_if_armed().await;
-                        let wasi = accessor.with_getter::<WasiFilesystem>(super::shared_filesystem);
+                        let wasi = accessor.with_getter::<WasiFilesystem>(
+                            wasmtime_wasi::filesystem::WasiFilesystemView::filesystem,
+                        );
                         Ok((match WasiFilesystem::stat(&wasi, descriptor).await {
                             Ok(value) => Ok(value),
                             Err(error) => Err(error.downcast()?),
@@ -263,7 +265,7 @@ impl Mounted {
         .unwrap();
         let router = Component::new(&engine, include_bytes!("../../../../../components/vmm/target/wasm32-wasip3/release/terra_vmm_component.wasm")).unwrap();
         let mut host =
-            FsHost::with_resource_capacity(DeviceHost::with_ram(ram.clone()), grant, capacity);
+            FsHost::with_resource_capacity(DeviceContext::with_ram(ram.clone()), grant, capacity);
         host.io_gate = Some(gate);
         let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).unwrap();
         runtime.initialize_mmio(&router).await.unwrap();
@@ -275,12 +277,11 @@ impl Mounted {
             8192,
             Arc::new(|_| Ok(())),
         )
-        .await
         .unwrap();
         let mut mounted = Self {
             channel,
             ram,
-            runtime: runtime.start(),
+            runtime: runtime.prepare().await.unwrap().start(),
             next: 0,
             request_head: 2,
         };
@@ -816,7 +817,8 @@ fn saturated_mount_cleanup_does_not_starve_another_mount_or_guest_disk() {
         .unwrap();
     runtime.block_on(async {
         use crate::component::block::backing::{DiskGrant, FileDisk};
-        use crate::engine::{TerraHost, terra::host::disk::HostWithStore};
+        use crate::engine::terra::host::disk::HostWithStore;
+        use wasmtime::component::HasSelf;
 
         let (_root, mut stalled, gate) = mount_with_operation(Operation::HostMetadata).await;
         let (_healthy_root, mut healthy, _) = mount_with_operation(Operation::HostMetadata).await;
@@ -826,8 +828,10 @@ fn saturated_mount_cleanup_does_not_starve_another_mount_or_guest_disk() {
         let disk_root = tempfile::tempdir().unwrap();
         let disk_path = disk_root.path().join("disk");
         std::fs::write(&disk_path, b"disk contents").unwrap();
-        let mut disk_host = DeviceHost::new(4096).unwrap();
-        disk_host.set_disk(DiskGrant::File(FileDisk::open(&disk_path, false).unwrap()));
+        let disk_host = crate::engine::BlockHost::new(
+            crate::SyntheticRam::new(4096).unwrap(),
+            DiskGrant::File(FileDisk::open(&disk_path, false).unwrap()),
+        );
         let mut disk_store = wasmtime::Store::new(&device_engine().unwrap(), disk_host);
 
         let (release, blocked) = std::sync::mpsc::channel();
@@ -853,8 +857,11 @@ fn saturated_mount_cleanup_does_not_starve_another_mount_or_guest_disk() {
             assert_eq!(&reply[16..], b"fast");
             let bytes = disk_store
                 .run_concurrent(async |accessor| {
-                    let disk = accessor.with_getter::<TerraHost>(|host| host);
-                    TerraHost::read_at(&disk, 0, 13).await
+                    let disk = accessor
+                        .with_getter::<HasSelf<crate::component::block::host::BlockHost>>(|host| {
+                            host
+                        });
+                    HasSelf::<crate::component::block::host::BlockHost>::read_at(&disk, 0, 13).await
                 })
                 .await
                 .unwrap()

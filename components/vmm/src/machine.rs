@@ -62,7 +62,7 @@ impl Guest for super::Dispatcher {
         Ok(())
     }
 
-    async fn compose() -> Result<(), Error> {
+    fn compose() -> Result<(), Error> {
         {
             let machine = VM.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if machine
@@ -72,9 +72,6 @@ impl Guest for super::Dispatcher {
                 return Err(Error::InvalidState);
             }
         }
-        <super::Dispatcher as super::exports::terra::mmio::router::Guest>::compose_workers()
-            .await
-            .map_err(|_| Error::Platform)?;
         let mut machine = VM.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         machine.as_mut().ok_or(Error::InvalidState)?.vcpu_state = VcpuState::Running;
         Ok(())
@@ -218,23 +215,15 @@ pub fn request_stop() -> Result<(), Error> {
     Ok(())
 }
 
-pub async fn wait_stopped() -> Result<(), Error> {
-    let vm = {
-        let machine = VM.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        machine
-            .as_ref()
-            .filter(|machine| machine.vcpu_state == VcpuState::Running)
-            .map(|machine| Arc::clone(&machine.vm))
-    };
-    if let Some(vm) = vm {
-        vm.wait_stopped().await.map_err(|_| Error::Platform)?;
-        VM.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_mut()
-            .ok_or(Error::InvalidState)?
-            .vcpu_state = VcpuState::Stopped;
+pub fn mark_stopped() {
+    if let Some(machine) = VM
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_mut()
+        .filter(|machine| machine.vcpu_state == VcpuState::Running)
+    {
+        machine.vcpu_state = VcpuState::Stopped;
     }
-    Ok(())
 }
 
 pub fn release() -> Result<(), Error> {

@@ -6,7 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use terra_runtime::component::vmm::mmio::{Operation, Reply as MmioReply, Request};
-use terra_runtime::engine::{device_engine, device_store_with_ram, vsock_component_linker};
+use terra_runtime::engine::test_support::device_store;
+use terra_runtime::engine::{device_engine, vsock_component_linker};
 use terra_vsock_device::VsockHeader;
 use wasmtime::StoreContextMut;
 use wasmtime::component::{
@@ -23,11 +24,11 @@ struct Reply {
 
 type Replies = TypedFunc<(u32, u32), (Vec<Reply>,)>;
 type Receive =
-    TypedFunc<(Vec<u8>,), (Result<(), terra_runtime::component::vsock::bindings::Error>,)>;
+    TypedFunc<(Vec<u8>,), (Result<(), terra_runtime::component::vsock::host::VsockError>,)>;
 type Serve = TypedFunc<(StreamReader<Request>,), (StreamReader<MmioReply>,)>;
 
 async fn next_reply(
-    accessor: &Accessor<terra_runtime::engine::DeviceHost>,
+    accessor: &Accessor<terra_runtime::engine::VsockDeviceHost>,
     replies: Replies,
     operation: u16,
 ) -> Reply {
@@ -51,7 +52,7 @@ async fn next_reply(
 }
 
 async fn guest_packet(
-    accessor: &Accessor<terra_runtime::engine::DeviceHost>,
+    accessor: &Accessor<terra_runtime::engine::VsockDeviceHost>,
     receive: Receive,
     port: u32,
     operation: u16,
@@ -102,7 +103,7 @@ async fn read_until_eof(socket: &mut terra_io::local::LocalStream) -> Vec<u8> {
 }
 
 async fn wait_for_no_connections(
-    accessor: &Accessor<terra_runtime::engine::DeviceHost>,
+    accessor: &Accessor<terra_runtime::engine::VsockDeviceHost>,
     count: TypedFunc<(), (u32,)>,
 ) {
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -114,11 +115,11 @@ async fn wait_for_no_connections(
     .expect("closed host client releases its pending guest connection");
 }
 
-fn live_clients(accessor: &Accessor<terra_runtime::engine::DeviceHost>) -> usize {
+fn live_clients(accessor: &Accessor<terra_runtime::engine::VsockDeviceHost>) -> usize {
     accessor.with(|mut access| access.get().vsock_service_mut().live_clients())
 }
 
-async fn wait_for_no_clients(accessor: &Accessor<terra_runtime::engine::DeviceHost>) {
+async fn wait_for_no_clients(accessor: &Accessor<terra_runtime::engine::VsockDeviceHost>) {
     tokio::time::timeout(Duration::from_secs(2), async {
         while live_clients(accessor) != 0 {
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -129,7 +130,7 @@ async fn wait_for_no_clients(accessor: &Accessor<terra_runtime::engine::DeviceHo
 }
 
 async fn serve_and_disconnect(
-    accessor: &Accessor<terra_runtime::engine::DeviceHost>,
+    accessor: &Accessor<terra_runtime::engine::VsockDeviceHost>,
     replies: Replies,
     receive: Receive,
     count: TypedFunc<(), (u32,)>,
@@ -149,7 +150,7 @@ async fn serve_and_disconnect(
 }
 
 struct Worker {
-    run: TypedFunc<(), (Result<(), terra_runtime::component::vsock::bindings::Error>,)>,
+    run: TypedFunc<(), (Result<(), terra_runtime::component::vsock::host::VsockError>,)>,
     close: TypedFunc<(), ()>,
     replies: Replies,
     receive: Receive,
@@ -158,13 +159,13 @@ struct Worker {
 
 struct ReplySink(Arc<Mutex<Vec<MmioReply>>>);
 
-impl StreamConsumer<terra_runtime::engine::DeviceHost> for ReplySink {
+impl StreamConsumer<terra_runtime::engine::VsockDeviceHost> for ReplySink {
     type Item = MmioReply;
 
     fn poll_consume(
         self: Pin<&mut Self>,
         _: &mut Context<'_>,
-        store: StoreContextMut<terra_runtime::engine::DeviceHost>,
+        store: StoreContextMut<terra_runtime::engine::VsockDeviceHost>,
         mut source: Source<'_, Self::Item>,
         finish: bool,
     ) -> Poll<wasmtime::Result<StreamResult>> {
@@ -181,7 +182,7 @@ impl StreamConsumer<terra_runtime::engine::DeviceHost> for ReplySink {
 }
 
 async fn drive_transport_ready(
-    store: &mut wasmtime::Store<terra_runtime::engine::DeviceHost>,
+    store: &mut wasmtime::Store<terra_runtime::engine::VsockDeviceHost>,
     serve: Serve,
 ) {
     let requests = StreamReader::new(
@@ -229,16 +230,22 @@ async fn drive_transport_ready(
 
 async fn create_worker(
     listener: terra_io::local::LocalListener,
-) -> (wasmtime::Store<terra_runtime::engine::DeviceHost>, Worker) {
+) -> (
+    wasmtime::Store<terra_runtime::engine::VsockDeviceHost>,
+    Worker,
+) {
     let engine = device_engine().unwrap();
-    let mut store = device_store_with_ram(&engine, terra_runtime::SyntheticRam::new(4096).unwrap());
-    store.data_mut().set_vsock_service(
-        terra_runtime::component::vsock::host::VsockHostService::new(
-            vec![2, 0, 0, 0, b'{', b'}'],
-            Some(listener),
-            None,
-        )
-        .unwrap(),
+    let mut store = device_store(
+        &engine,
+        terra_runtime::engine::VsockDeviceHost::new(
+            terra_runtime::SyntheticRam::new(4096).unwrap(),
+            terra_runtime::component::vsock::host::VsockHostService::new(
+                vec![2, 0, 0, 0, b'{', b'}'],
+                Some(listener),
+                None,
+            )
+            .unwrap(),
+        ),
     );
     let component = Component::new(
         &engine,
@@ -281,14 +288,14 @@ async fn create_worker(
         .unwrap();
     drive_transport_ready(&mut store, serve).await;
     let events = instance
-        .get_typed_func::<
-            (),
-            (StreamReader<terra_runtime::component::vsock::bindings::HostEvent>,),
-        >(&mut store, export("events"))
+        .get_typed_func::<(), (StreamReader<terra_runtime::component::vsock::host::VsockEvent>,)>(
+            &mut store,
+            export("events"),
+        )
         .unwrap();
     let (_events,) = events.call_async(&mut store, ()).await.unwrap();
     let run = instance
-        .get_typed_func::<(), (Result<(), terra_runtime::component::vsock::bindings::Error>,)>(
+        .get_typed_func::<(), (Result<(), terra_runtime::component::vsock::host::VsockError>,)>(
             &mut store,
             export("run"),
         )
@@ -630,10 +637,9 @@ async fn shared_close_releases_the_diagnostic_sink() {
             Some(output.reopen().unwrap()),
             std::sync::Arc::new(|_| Ok(())),
         )
-        .await
         .unwrap()
     };
-    let runtime = runtime.start();
+    let runtime = runtime.prepare().await.expect("runtime prepared").start();
     tokio::time::timeout(Duration::from_secs(3), channel.close_async())
         .await
         .unwrap()

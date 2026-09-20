@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use super::host::terra::fs::host::{EventKind as FileEventKind, FileEvent};
 use notify::event::{ModifyKind, RenameMode};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-const MAX_PENDING_FILE_EVENTS: usize = 4096;
+pub(crate) const MAX_PENDING_FILE_EVENTS: usize = 4096;
 const WATCH_START_TIMEOUT: Duration = Duration::from_secs(1);
 pub(super) const MAX_NATIVE_WATCHES: usize = 1024;
 use tokio::sync::mpsc;

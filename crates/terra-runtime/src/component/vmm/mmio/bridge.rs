@@ -1,20 +1,16 @@
 //! Bounded host requests and shutdown for the Wasm router.
 
-use std::future::Future;
-use std::pin::Pin;
+use futures_util::future::BoxFuture;
 use wasmtime::component::Accessor;
 
+use futures_util::stream::{FuturesUnordered, StreamExt};
+
 use super::{
-    Access, Arc, BoxHost, COMMAND_CAPACITY, CONTROL_CAPACITY, Command, Control,
-    DeviceRequestCounts, Mutex, Operation, Ordering, Pending, REQUEST_TIMEOUT, RoutedReply, mpsc,
-    router_error,
+    Access, Arc, BoxHost, COMMAND_CAPACITY, CONTROL_CAPACITY, Command, Control, Mutex, Operation,
+    Ordering, Pending, REQUEST_TIMEOUT, ReplyOwner, RoutedReply, router_error,
 };
 
-struct BridgeOperation<'a> {
-    is_control: bool,
-    reply: mpsc::SyncSender<wasmtime::Result<RoutedReply>>,
-    future: Pin<Box<dyn Future<Output = wasmtime::Result<BridgeReply>> + Send + 'a>>,
-}
+type BridgeOperation<'a> = BoxFuture<'a, Completion>;
 
 struct BridgeReply {
     routed: RoutedReply,
@@ -24,31 +20,32 @@ struct BridgeReply {
 pub(super) struct BridgeContext {
     pub(super) access: Access,
     pub(super) control: Control,
-    pub(super) callbacks: Arc<Mutex<Vec<DeviceRequestCounts>>>,
-    pub(super) admission: Arc<Mutex<bool>>,
+    pub(super) devices: super::DeviceRegistry,
+    pub(super) admission: Arc<Mutex<Option<String>>>,
 }
+
+type Operations<'a> = FuturesUnordered<BridgeOperation<'a>>;
+type Completion = (ReplyOwner, wasmtime::Result<BridgeReply>);
 
 enum BridgeEvent {
     Pending(Pending),
-    Completion(usize, wasmtime::Result<BridgeReply>),
+    Completion(Completion),
 }
 
 fn complete_device(context: &BridgeContext, routed: &RoutedReply) -> wasmtime::Result<()> {
     let device = context
-        .callbacks
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(usize::try_from(routed.slot)?)
-        .cloned()
+        .devices
+        .get()
+        .and_then(|devices| devices.get(routed.slot as usize))
         .ok_or_else(|| wasmtime::Error::msg("invalid MMIO reply slot"))?;
     if routed.reply.error != 0 {
-        device.failed.fetch_add(1, Ordering::Relaxed);
+        device.counts.failed.fetch_add(1, Ordering::Relaxed);
         return Err(wasmtime::Error::msg(format!(
             "MMIO device error {}",
             routed.reply.error
         )));
     }
-    device.completed.fetch_add(1, Ordering::Relaxed);
+    device.counts.completed.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
 
@@ -58,114 +55,70 @@ fn dispatch_pending<'a>(
     pending: Pending,
 ) -> BridgeOperation<'a> {
     let Pending { command, reply } = pending;
-    let is_control = matches!(command, Command::Control(_, _));
-    BridgeOperation {
-        is_control,
-        reply,
-        future: Box::pin(async move {
-            tokio::time::timeout(REQUEST_TIMEOUT, async {
-                let reply = match command {
-                    Command::Access(address, width, value, write) => {
-                        let (result,) = context
-                            .access
-                            .call_concurrent(accessor, (address, width, value, write))
-                            .await?;
-                        let routed = result.map_err(router_error)?;
-                        complete_device(context, &routed)?;
-                        BridgeReply {
-                            routed,
-                            all_closed: false,
-                        }
+    Box::pin(async move {
+        let result = tokio::time::timeout(REQUEST_TIMEOUT, async {
+            let reply = match command {
+                Command::Access(address, width, value, write) => {
+                    let (result,) = context
+                        .access
+                        .call_concurrent(accessor, (address, width, value, write))
+                        .await?;
+                    let routed = result.map_err(router_error)?;
+                    complete_device(context, &routed)?;
+                    BridgeReply {
+                        routed,
+                        all_closed: false,
                     }
-                    Command::Control(slot, operation) => {
-                        let (result,) = context
-                            .control
-                            .call_concurrent(accessor, (slot, operation))
-                            .await?;
-                        let control = result.map_err(router_error)?;
-                        wasmtime::ensure!(
-                            !control.all_closed || operation == Operation::Close,
-                            "MMIO service completed without a close request"
-                        );
-                        let routed = RoutedReply {
-                            slot,
-                            reply: control.reply,
-                        };
-                        complete_device(context, &routed)?;
-                        BridgeReply {
-                            routed,
-                            all_closed: control.all_closed,
-                        }
+                }
+                Command::Control(slot, operation) => {
+                    let (result,) = context
+                        .control
+                        .call_concurrent(accessor, (slot, operation))
+                        .await?;
+                    let control = result.map_err(router_error)?;
+                    wasmtime::ensure!(
+                        !control.all_closed || operation == Operation::Close,
+                        "MMIO service completed without a close request"
+                    );
+                    let routed = RoutedReply {
+                        slot,
+                        reply: control.reply,
+                    };
+                    complete_device(context, &routed)?;
+                    BridgeReply {
+                        routed,
+                        all_closed: control.all_closed,
                     }
-                };
-                Ok(reply)
-            })
-            .await
-            .unwrap_or_else(|_| Err(wasmtime::Error::msg("MMIO request timed out")))
-        }),
-    }
-}
-
-fn reject_pending(pending: &Pending, reason: &str) {
-    let _ = pending
-        .reply
-        .send(Err(wasmtime::Error::msg(reason.to_owned())));
-}
-
-fn reject_receiver(receiver: &mut tokio::sync::mpsc::Receiver<Pending>, reason: &str) {
-    while let Ok(pending) = receiver.try_recv() {
-        reject_pending(&pending, reason);
-    }
+                }
+            };
+            Ok(reply)
+        })
+        .await
+        .unwrap_or_else(|_| Err(wasmtime::Error::msg("MMIO request timed out")));
+        (reply, result)
+    })
 }
 
 fn stop_bridge(
-    admission: &Mutex<bool>,
+    admission: &Mutex<Option<String>>,
     receiver: &mut tokio::sync::mpsc::Receiver<Pending>,
     control_receiver: &mut tokio::sync::mpsc::Receiver<Pending>,
-    operations: Vec<BridgeOperation<'_>>,
     reason: &str,
 ) {
     *admission
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
-    reject_receiver(receiver, reason);
-    reject_receiver(control_receiver, reason);
-    for operation in operations {
-        let _ = operation
-            .reply
-            .send(Err(wasmtime::Error::msg(reason.to_owned())));
-    }
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reason.to_owned());
+    while receiver.try_recv().is_ok() {}
+    while control_receiver.try_recv().is_ok() {}
 }
 
-fn bridge_error(
-    admission: &Mutex<bool>,
-    receiver: &mut tokio::sync::mpsc::Receiver<Pending>,
-    control_receiver: &mut tokio::sync::mpsc::Receiver<Pending>,
-    operations: Vec<BridgeOperation<'_>>,
-    reason: &str,
-) -> wasmtime::Result<()> {
-    stop_bridge(admission, receiver, control_receiver, operations, reason);
-    Err(wasmtime::Error::msg(reason.to_owned()))
-}
-
-fn poll_completion(
-    operations: &mut [BridgeOperation<'_>],
-    context: &mut std::task::Context<'_>,
-) -> std::task::Poll<(usize, wasmtime::Result<BridgeReply>)> {
-    for (index, operation) in operations.iter_mut().enumerate() {
-        if let std::task::Poll::Ready(result) = operation.future.as_mut().poll(context) {
-            return std::task::Poll::Ready((index, result));
-        }
-    }
-    std::task::Poll::Pending
-}
-
-async fn drain_operations(mut operations: Vec<BridgeOperation<'_>>) {
-    while !operations.is_empty() {
-        let (index, result) =
-            std::future::poll_fn(|context| poll_completion(&mut operations, context)).await;
-        let operation = operations.swap_remove(index);
-        let _ = operation.reply.send(result.map(|reply| reply.routed));
+async fn drain_operations<'a>(control_operations: Operations<'a>, data_operations: Operations<'a>) {
+    let mut operations = control_operations
+        .into_iter()
+        .chain(data_operations)
+        .collect::<Operations<'a>>();
+    while let Some((reply, result)) = operations.next().await {
+        reply.send(result.map(|reply| reply.routed));
     }
 }
 
@@ -175,64 +128,58 @@ pub(super) async fn run_bridge(
     mut control_receiver: tokio::sync::mpsc::Receiver<Pending>,
     context: BridgeContext,
 ) -> wasmtime::Result<()> {
-    let mut operations: Vec<BridgeOperation<'_>> =
-        Vec::with_capacity(COMMAND_CAPACITY + CONTROL_CAPACITY);
+    let mut control_operations = Operations::new();
+    let mut data_operations = Operations::new();
     loop {
-        let controls = operations
-            .iter()
-            .filter(|operation| operation.is_control)
-            .count();
-        let accepts_data = operations.len() - controls < COMMAND_CAPACITY;
-        let accepts_control = controls < CONTROL_CAPACITY;
-        let has_operations = !operations.is_empty();
-        let next_completion =
-            std::future::poll_fn(|context| poll_completion(&mut operations, context));
         let event = tokio::select! {
-            (index, result) = next_completion, if has_operations => Some(BridgeEvent::Completion(index, result)),
-            pending = control_receiver.recv(), if accepts_control => pending.map(BridgeEvent::Pending),
-            pending = receiver.recv(), if accepts_data => pending.map(BridgeEvent::Pending),
+            completion = control_operations.next(), if !control_operations.is_empty() => completion.map(BridgeEvent::Completion),
+            completion = data_operations.next(), if !data_operations.is_empty() => completion.map(BridgeEvent::Completion),
+            pending = control_receiver.recv(), if control_operations.len() < CONTROL_CAPACITY => pending.map(BridgeEvent::Pending),
+            pending = receiver.recv(), if data_operations.len() < COMMAND_CAPACITY => pending.map(BridgeEvent::Pending),
         };
         match event {
             Some(BridgeEvent::Pending(pending)) => {
-                operations.push(dispatch_pending(accessor, &context, pending));
+                if matches!(&pending.command, Command::Control(_, _)) {
+                    control_operations.push(dispatch_pending(accessor, &context, pending));
+                } else {
+                    data_operations.push(dispatch_pending(accessor, &context, pending));
+                }
             }
-            Some(BridgeEvent::Completion(index, result)) => {
-                let operation = operations.swap_remove(index);
+            Some(BridgeEvent::Completion((reply, result))) => {
                 let failure = result
                     .as_ref()
                     .err()
                     .map(|error| format!("MMIO router failed: {error:#}"));
                 let all_closed = result.as_ref().is_ok_and(|reply| reply.all_closed);
-                let _ = operation.reply.send(result.map(|reply| reply.routed));
+                reply.send(result.map(|reply| reply.routed));
                 if let Some(reason) = failure {
-                    return bridge_error(
+                    stop_bridge(
                         &context.admission,
                         &mut receiver,
                         &mut control_receiver,
-                        operations,
                         &reason,
                     );
+                    return Err(wasmtime::Error::msg(reason));
                 }
                 if all_closed {
                     stop_bridge(
                         &context.admission,
                         &mut receiver,
                         &mut control_receiver,
-                        Vec::new(),
                         "MMIO bridge stopped",
                     );
-                    drain_operations(operations).await;
+                    drain_operations(control_operations, data_operations).await;
                     return Ok(());
                 }
             }
             None => {
-                return bridge_error(
+                stop_bridge(
                     &context.admission,
                     &mut receiver,
                     &mut control_receiver,
-                    operations,
                     "MMIO bridge closed",
                 );
+                return Err(wasmtime::Error::msg("MMIO bridge closed"));
             }
         }
     }
@@ -240,11 +187,32 @@ pub(super) async fn run_bridge(
 
 #[cfg(test)]
 mod tests {
-    use super::super::{BoxRuntime, Reply, enqueue};
+    use super::super::{BoxRuntime, Reply, ReplySender, enqueue, mpsc};
     use super::*;
 
     fn access() -> Command {
         Command::Access(0, 4, 0, false)
+    }
+
+    #[tokio::test]
+    async fn dropping_the_queue_resolves_async_callers_with_the_stop_reason() {
+        let admission = Arc::new(Mutex::new(None));
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let (reply, response) = tokio::sync::oneshot::channel();
+        super::super::enqueue_reply(
+            &sender,
+            &admission,
+            access(),
+            ReplySender::Async(reply),
+            None,
+        )
+        .unwrap();
+        *admission.lock().unwrap() = Some("original bridge failure".to_owned());
+        drop(receiver);
+        assert_eq!(
+            response.await.unwrap().unwrap_err().to_string(),
+            "original bridge failure"
+        );
     }
 
     #[tokio::test]
@@ -297,6 +265,9 @@ mod tests {
             enqueue(&router.sender, &router.admission, access()).expect("unmapped request queued");
         let failure = Arc::clone(&router.failure);
         let error = runtime
+            .prepare()
+            .await
+            .unwrap()
             .start()
             .join()
             .await
@@ -322,7 +293,7 @@ mod tests {
 
     #[test]
     fn lifecycle_controls_bypass_a_saturated_data_queue() {
-        let admission = Mutex::new(true);
+        let admission = Arc::new(Mutex::new(None));
         let (data_sender, mut data_receiver) = tokio::sync::mpsc::channel(COMMAND_CAPACITY);
         let (control_sender, mut control_receiver) = tokio::sync::mpsc::channel(CONTROL_CAPACITY);
         for _ in 0..COMMAND_CAPACITY {
@@ -361,37 +332,50 @@ mod tests {
 
     #[test]
     fn stopping_rejects_new_work_and_completes_queued_callers() {
-        let admission = Mutex::new(true);
+        let admission = Arc::new(Mutex::new(None));
         let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
         let first = enqueue(&sender, &admission, access()).expect("first request");
         let second = enqueue(&sender, &admission, access()).expect("second request");
         *admission
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some("MMIO bridge stopped".to_owned());
         assert!(enqueue(&sender, &admission, access()).is_err());
-        reject_receiver(&mut receiver, "MMIO bridge stopped");
+        while receiver.try_recv().is_ok() {}
         assert!(first.recv().expect("first response").is_err());
         assert!(second.recv().expect("second response").is_err());
     }
 
     #[test]
     fn stopping_completes_in_flight_callers_without_waiting_for_the_component() {
-        let admission = Mutex::new(true);
+        let admission = Arc::new(Mutex::new(None));
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
         let (_control_sender, mut control_receiver) = tokio::sync::mpsc::channel(1);
         let (reply, response) = mpsc::sync_channel(1);
+        let reply = ReplyOwner {
+            sender: Some(ReplySender::Sync(reply)),
+            control: None,
+            admission: Arc::clone(&admission),
+        };
+        let operation: BridgeOperation<'_> = Box::pin(async move {
+            std::future::pending::<()>().await;
+            (reply, Err(wasmtime::Error::msg("unreachable")))
+        });
         stop_bridge(
             &admission,
             &mut receiver,
             &mut control_receiver,
-            vec![BridgeOperation {
-                is_control: false,
-                reply,
-                future: Box::pin(std::future::pending()),
-            }],
             "MMIO router failed",
         );
-        assert!(response.recv().expect("in-flight response").is_err());
+        drop(operation);
+        assert_eq!(
+            response
+                .recv()
+                .expect("in-flight response")
+                .unwrap_err()
+                .to_string(),
+            "MMIO router failed"
+        );
         assert!(enqueue(&sender, &admission, access()).is_err());
     }
 
@@ -412,27 +396,35 @@ mod tests {
             },
             all_closed: false,
         };
-        let operations = vec![
-            BridgeOperation {
-                is_control: true,
-                reply: first_reply,
-                future: Box::pin(async move {
-                    released.await.expect("second operation releases first");
-                    Ok(reply(0))
-                }),
-            },
-            BridgeOperation {
-                is_control: true,
-                reply: second_reply,
-                future: Box::pin(async move {
-                    release.send(()).expect("release first operation");
-                    Ok(reply(1))
-                }),
-            },
-        ];
-        tokio::time::timeout(REQUEST_TIMEOUT, drain_operations(operations))
-            .await
-            .expect("shutdown polls all in-flight operations");
+        let admission = Arc::new(Mutex::new(None));
+        let first_reply = ReplyOwner {
+            sender: Some(ReplySender::Sync(first_reply)),
+            control: None,
+            admission: Arc::clone(&admission),
+        };
+        let second_reply = ReplyOwner {
+            sender: Some(ReplySender::Sync(second_reply)),
+            control: None,
+            admission,
+        };
+        let control_operations = [
+            Box::pin(async move {
+                released.await.expect("second operation releases first");
+                (first_reply, Ok(reply(0)))
+            }) as BridgeOperation<'_>,
+            Box::pin(async move {
+                release.send(()).expect("release first operation");
+                (second_reply, Ok(reply(1)))
+            }) as BridgeOperation<'_>,
+        ]
+        .into_iter()
+        .collect();
+        tokio::time::timeout(
+            REQUEST_TIMEOUT,
+            drain_operations(control_operations, Operations::new()),
+        )
+        .await
+        .expect("shutdown polls all in-flight operations");
         assert_eq!(
             first
                 .recv()

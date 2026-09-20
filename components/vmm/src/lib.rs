@@ -762,16 +762,12 @@ impl Guest for Dispatcher {
         Ok(())
     }
 
-    async fn compose_workers() -> Result<(), Error> {
-        let grants = terra::mmio::workers::grants();
-        for grant in grants {
-            let requests = open_device(grant.slot, grant.mapping.base, grant.mapping.size)?;
-            let replies = terra::mmio::workers::create(grant.slot, requests)
-                .await
-                .map_err(|_| Error::Device)?;
-            attach_replies(grant.slot, replies).await?;
-        }
-        Ok(())
+    fn open_device(slot: u32, base: u64, size: u64) -> Result<StreamReader<Request>, Error> {
+        open_device(slot, base, size)
+    }
+
+    async fn attach_replies(slot: u32, replies: StreamReader<Reply>) -> Result<(), Error> {
+        attach_replies(slot, replies).await
     }
 
     fn remap_device(slot: u32, base: u64, size: u64) -> Result<(), Error> {

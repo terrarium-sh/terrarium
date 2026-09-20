@@ -10,7 +10,7 @@ use terra_runtime::{
     BoundedMemory, SyntheticRam,
     box_runtime::{BoxHost, BoxRuntime, BoxRuntimeHandle},
     component::fs::host::{FsHost, ShareGrant},
-    engine::{DeviceHost, device_engine},
+    engine::{DeviceContext, device_engine},
 };
 use wasmtime::component::Component;
 
@@ -74,7 +74,7 @@ async fn mount_with_resource_capacity(
         readonly,
     )
     .expect("grant");
-    let device = DeviceHost::with_ram(ram.clone());
+    let device = DeviceContext::with_ram(ram.clone());
     let host = match resource_capacity {
         Some(resource_capacity) => FsHost::with_resource_capacity(device, grant, resource_capacity),
         None => FsHost::new(device, grant),
@@ -97,9 +97,8 @@ async fn mount_with_resource_capacity(
             .expect("node capacity"),
         Arc::new(|_| Ok(())),
     )
-    .await
     .expect("channel");
-    let runtime = runtime.start();
+    let runtime = runtime.prepare().await.expect("runtime prepared").start();
     for (offset, value) in [
         (0x70, 1_u32),
         (0x70, 3),

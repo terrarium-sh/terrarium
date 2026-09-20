@@ -18,9 +18,13 @@
   <meta name="description" content="Run coding agents and development tools in a microVM. One static core, Wasm-isolated devices, explicit access, and native support for Linux and Windows (x86_64 / ARM64), and macOS on Apple Silicon." />
 </svelte:head>
 
+<aside class="construction-notice" aria-label="Project status">
+  <strong><span aria-hidden="true">⚠</span> Still finding our frog legs.</strong>
+  <span>Testing and internal review are ongoing. Use with caution.</span>
+</aside>
+
 <section class="hero">
   <div class="hero-copy">
-    <div class="construction-notice"><strong><span aria-hidden="true">⚠</span> Under construction</strong><span>The code is still under internal review.</span></div>
     <p class="eyebrow">A little space of its own</p>
     <h1>Give your agent<br />room to <em>work.</em></h1>
     <p class="lead">Decide what it can touch.</p>
@@ -77,7 +81,7 @@
   <div>
     <p class="eyebrow">From a recipe to a running box</p>
     <h2>Make a little room.</h2>
-    {#if releaseTag}<p><a class="release-link" target="_blank" rel="noopener noreferrer" href={`https://github.com/terrarium-sh/terrarium/releases/tag/${releaseTag}`}>Released {releaseTag}</a></p>{/if}
+    {#if releaseTag}<p class="release-note">Current release <a target="_blank" rel="noopener noreferrer" href={`https://github.com/terrarium-sh/terrarium/releases/tag/${releaseTag}`}>{releaseTag}</a></p>{/if}
     <p>Install Terra and save this recipe as <code>dev.yaml</code>. Then set up and enter your box.</p>
     {#if isClient}
       <div class="platform-choice">

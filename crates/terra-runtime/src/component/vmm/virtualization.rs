@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::sync::Arc;
 
 use wasmtime::component::Resource;
@@ -136,6 +135,73 @@ mod prepared_machine_tests {
         );
     }
 
+    #[test]
+    fn interrupt_bindings_validate_the_device_during_setup() {
+        let machine = MachineHandle(Arc::new(CreatedMachine {
+            machine: Arc::new(TestVm(SyntheticRam::new(32768).unwrap())),
+            devices: vec![super::super::machine::Device {
+                kind: super::super::machine::DeviceKind::Memory,
+                mmio_base: 0,
+                irq: 15,
+            }],
+        }));
+        let delivered = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let observed = Arc::clone(&delivered);
+        let interrupt = machine
+            .bind_interrupt(
+                super::super::machine::DeviceKind::Memory,
+                0,
+                move |_, irq, level| {
+                    assert!(level);
+                    observed.store(irq, std::sync::atomic::Ordering::Relaxed);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(
+            machine
+                .bind_interrupt(super::super::machine::DeviceKind::Memory, 1, |_, _, _| Ok(
+                    ()
+                ))
+                .is_err()
+        );
+        interrupt(true).unwrap();
+        assert_eq!(delivered.load(std::sync::atomic::Ordering::Relaxed), 15);
+    }
+
+    #[tokio::test]
+    async fn failed_stop_keeps_machine_resources_with_native_teardown() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let backend = Arc::new(TestVm(SyntheticRam::new(32768).unwrap()));
+        let backend_weak = Arc::downgrade(&backend);
+        let stop_called = Arc::new(AtomicBool::new(false));
+        let observed_stop = Arc::clone(&stop_called);
+        let teardown = super::super::teardown::NativeTeardown::new();
+        teardown
+            .install_machine(MachineRecovery {
+                reaper: VcpuReaper::new(
+                    || Ok(Vec::new()),
+                    Some(Box::new(move || {
+                        observed_stop.store(true, Ordering::Relaxed);
+                        Err(wasmtime::Error::msg("injected stop failure"))
+                    })),
+                ),
+                _backend: backend.clone(),
+                _ram: SyntheticRam::new(32768).unwrap(),
+            })
+            .unwrap();
+        drop(backend);
+        assert!(
+            teardown
+                .wait_until(std::time::Instant::now() + std::time::Duration::from_secs(1))
+                .await
+                .is_err()
+        );
+        assert!(stop_called.load(Ordering::Relaxed));
+        assert!(backend_weak.upgrade().is_some());
+    }
+
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn aot_vmm_applies_boot_and_keeps_both_vcpus_responsive() {
@@ -240,11 +306,13 @@ mod prepared_machine_tests {
 
             let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).unwrap();
             runtime.initialize_mmio(&vmm).await.unwrap();
-            let handle = runtime.attach_machine(prepared).await.unwrap();
-            let vcpus = runtime
-                .grant_vcpus(move |controls, accepted| {
+            let (runtime, handle) = runtime.attach_machine(prepared).await.unwrap();
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            let (runtime, _reaper) = runtime
+                .prepare_vcpus(move |controls, accepted| {
                     assert_eq!(accepted.entry, entry);
-                    Ok(StartedVcpus::new(controls, || Ok(())))
+                    sender.send(controls).unwrap();
+                    Ok(StartedVcpus::new((), || Ok(()), |()| Ok(Vec::new())))
                 })
                 .await
                 .unwrap();
@@ -273,7 +341,7 @@ mod prepared_machine_tests {
             }
 
             let running = runtime.start();
-            let mut controls = vcpus.into_iter();
+            let mut controls = receiver.recv().unwrap().into_iter();
             let busy_cpu = controls.next().unwrap();
             let probe_cpu = controls.next().unwrap();
             let probe_done = Arc::new(AtomicBool::new(false));
@@ -363,19 +431,17 @@ impl<M: VirtualMachine> MachineHandle<M> {
         kind: super::machine::DeviceKind,
         ordinal: usize,
         inject: impl Fn(&M, u32, bool) -> wasmtime::Result<()> + Send + Sync + 'static,
-    ) -> crate::component::Interrupt {
-        let handle = self.clone();
-        Arc::new(move |level| {
-            let created = &handle.0;
-            let machine = Arc::clone(&created.machine);
-            let device = created
-                .devices
-                .iter()
-                .filter(|device| device.kind == kind)
-                .nth(ordinal)
-                .ok_or_else(|| wasmtime::Error::msg("interrupt device outside VM grant"))?;
-            inject(&machine, device.irq, level)
-        })
+    ) -> wasmtime::Result<crate::component::Interrupt> {
+        let irq = self
+            .0
+            .devices
+            .iter()
+            .filter(|device| device.kind == kind)
+            .nth(ordinal)
+            .map(|device| device.irq)
+            .ok_or_else(|| wasmtime::Error::msg("interrupt device outside VM grant"))?;
+        let machine = self.machine();
+        Ok(Arc::new(move |level| inject(&machine, irq, level)))
     }
 
     pub fn inject_irq(
@@ -458,169 +524,84 @@ impl<M: VirtualMachine> PreparedMachine<M> {
 
 pub struct Vm;
 
-pub struct StartedVcpus<R> {
-    runners: R,
-    reaper: Option<VcpuReaper>,
-    request_stop: Box<dyn FnOnce() -> wasmtime::Result<()> + Send>,
-}
+pub struct StartedVcpus(VcpuReaper);
 
-impl<R> StartedVcpus<R> {
-    pub fn new(
+impl StartedVcpus {
+    pub fn new<R: Send + 'static>(
         runners: R,
         request_stop: impl FnOnce() -> wasmtime::Result<()> + Send + 'static,
+        reap: impl FnOnce(R) -> Result<Vec<Result<(), String>>, String> + Send + 'static,
     ) -> Self {
-        Self {
-            runners,
-            reaper: None,
-            request_stop: Box::new(request_stop),
-        }
+        Self(VcpuReaper::new(
+            move || reap(runners),
+            Some(Box::new(request_stop)),
+        ))
     }
-}
-
-impl<R: Send + 'static> StartedVcpus<R> {
-    pub fn with_reaper(
-        self,
-        stop: impl FnOnce(R) -> Result<Vec<Result<(), String>>, String> + Send + 'static,
-    ) -> StartedVcpus<VcpuReaper> {
-        let Self {
-            runners,
-            request_stop,
-            reaper: _,
-        } = self;
-        let reaper = VcpuReaper::new(move || stop(runners), Some(Box::new(request_stop)));
-        let cancellation = reaper.clone();
-        StartedVcpus {
-            runners: reaper.clone(),
-            reaper: Some(reaper),
-            request_stop: Box::new(move || cancellation.request_stop()),
-        }
-    }
-}
-
-type StartVcpus = Box<
-    dyn FnOnce(
-            Vec<super::NativeVcpu>,
-            super::boot::BootEntry,
-        ) -> wasmtime::Result<StartedVcpus<Box<dyn Any + Send>>>
-        + Send,
->;
-
-struct ReapingGrant {
-    reaper: Option<VcpuReaper>,
-    is_wait_claimed: bool,
 }
 
 pub(crate) struct MachineRecovery {
-    reaper: Option<VcpuReaper>,
+    reaper: VcpuReaper,
     _backend: Arc<dyn VirtualMachine>,
     _ram: SyntheticRam,
 }
 
 impl MachineRecovery {
-    pub(crate) async fn wait(&self) -> wasmtime::Result<()> {
-        if let Some(reaper) = &self.reaper {
-            reaper
-                .wait_until_finished()
-                .await
-                .map_err(wasmtime::Error::msg)?;
-        }
+    pub(crate) async fn wait(&mut self) -> wasmtime::Result<()> {
+        self.reaper.request_stop()?;
+        self.reaper
+            .wait_until_finished()
+            .await
+            .map_err(wasmtime::Error::msg)?;
         Ok(())
     }
 }
 
-#[derive(Default, PartialEq)]
-enum MachinePhase {
+struct MachineGrant {
+    config: MachineConfig,
+    ram: SyntheticRam,
+    backend: Arc<dyn VirtualMachine>,
+}
+
+struct BootReadyMachine {
+    grant: MachineGrant,
+    boot_entry: super::boot::BootEntry,
+}
+
+#[derive(Default)]
+enum MachineState {
     #[default]
-    Prepared,
-    BootReady,
-    Running,
-    Stopping,
-    Stopped,
+    Detached,
+    BootReady(BootReadyMachine),
+    Running(MachineGrant),
 }
 
 #[derive(Default)]
 pub(super) struct VirtualizationHost {
-    config: Option<MachineConfig>,
-    ram: Option<SyntheticRam>,
-    backend: Option<Arc<dyn VirtualMachine>>,
-    boot_entry: Option<super::boot::BootEntry>,
-    start_vcpus: Option<StartVcpus>,
-    reaping: Option<ReapingGrant>,
-    phase: MachinePhase,
-    request_stop: Option<Box<dyn FnOnce() -> wasmtime::Result<()> + Send>>,
-}
-
-impl VirtualizationHost {
-    fn claim_reaper(&mut self) -> wasmtime::Result<Option<VcpuReaper>> {
-        wasmtime::ensure!(
-            self.phase == MachinePhase::Stopping && self.request_stop.is_none(),
-            "vCPU stop wait unavailable"
-        );
-        self.reaping
-            .as_mut()
-            .and_then(|grant| {
-                if grant.is_wait_claimed {
-                    None
-                } else {
-                    grant.is_wait_claimed = true;
-                    Some(grant.reaper.clone())
-                }
-            })
-            .ok_or_else(|| wasmtime::Error::msg("vCPU stop wait already claimed"))
-    }
+    state: MachineState,
 }
 
 impl PlatformHost {
-    pub(crate) fn machine_config(&self) -> wasmtime::Result<&MachineConfig> {
-        self.virtualization
-            .config
-            .as_ref()
-            .ok_or_else(|| wasmtime::Error::msg("VM has no machine configuration"))
+    pub(crate) fn is_machine_running(&self) -> bool {
+        matches!(self.virtualization.state, MachineState::Running(_))
     }
 
-    pub(crate) fn has_machine(&self) -> bool {
-        self.virtualization.config.is_some()
+    fn machine_grant(&self) -> Option<&MachineGrant> {
+        match &self.virtualization.state {
+            MachineState::Detached => None,
+            MachineState::BootReady(machine) => Some(&machine.grant),
+            MachineState::Running(machine) => Some(machine),
+        }
+    }
+
+    pub(crate) fn machine_config(&self) -> Option<&MachineConfig> {
+        self.machine_grant().map(|grant| &grant.config)
     }
 
     pub(crate) fn completion_grant(&self) -> wasmtime::Result<(&MachineConfig, SyntheticRam)> {
-        Ok((
-            self.machine_config()?,
-            self.virtualization
-                .ram
-                .clone()
-                .ok_or_else(|| wasmtime::Error::msg("VM has no RAM grant"))?,
-        ))
-    }
-
-    pub(crate) fn take_recovery_reaper(&mut self) -> wasmtime::Result<Option<MachineRecovery>> {
-        let virtualization = &mut self.virtualization;
-        if virtualization.phase == MachinePhase::Running {
-            if let Some(stop) = virtualization.request_stop.take() {
-                let _ = stop();
-            }
-            virtualization.phase = MachinePhase::Stopping;
-        }
-        if virtualization.phase != MachinePhase::Stopping {
-            return Ok(None);
-        }
-        let reaper = virtualization
-            .reaping
-            .as_ref()
-            .map(|grant| grant.reaper.clone())
-            .ok_or_else(|| wasmtime::Error::msg("vCPU reaper unavailable"))?;
-        let backend = virtualization
-            .backend
-            .take()
-            .ok_or_else(|| wasmtime::Error::msg("VM backend unavailable"))?;
-        let ram = virtualization
-            .ram
-            .take()
-            .ok_or_else(|| wasmtime::Error::msg("VM RAM unavailable"))?;
-        Ok(Some(MachineRecovery {
-            reaper,
-            _backend: backend,
-            _ram: ram,
-        }))
+        let grant = self
+            .machine_grant()
+            .ok_or_else(|| wasmtime::Error::msg("VM has no machine configuration"))?;
+        Ok((&grant.config, grant.ram.clone()))
     }
 }
 
@@ -629,42 +610,16 @@ impl virtualization::Host for PlatformHost {}
 impl virtualization::HostVm for PlatformHost {
     fn request_stop(&mut self, resource: Resource<Vm>) -> wasmtime::Result<Result<(), Error>> {
         self.table.get(&resource)?;
-        if self.virtualization.phase != MachinePhase::Running {
+        if !matches!(self.virtualization.state, MachineState::Running(_)) {
             return Ok(Err(Error::Unavailable));
         }
-        if let Some(stop) = self.virtualization.request_stop.take() {
-            stop()?;
-            self.virtualization.phase = MachinePhase::Stopping;
-        }
+        self.native_teardown.start();
         Ok(Ok(()))
     }
 
     fn drop(&mut self, resource: Resource<Vm>) -> wasmtime::Result<()> {
         self.table.delete(resource)?;
         Ok(())
-    }
-}
-
-impl<T: Send + 'static> virtualization::HostVmWithStore<T> for Platform {
-    async fn wait_stopped(
-        host: &wasmtime::component::Accessor<T, Self>,
-        resource: Resource<Vm>,
-    ) -> wasmtime::Result<Result<(), Error>> {
-        let reaper = host.with(|mut access| {
-            let host = access.get();
-            host.table.get(&resource)?;
-            host.virtualization.claim_reaper()
-        })?;
-        if let Some(reaper) = reaper {
-            reaper.wait().await.map_err(wasmtime::Error::msg)?;
-        }
-        host.with(|mut access| {
-            let virtualization = &mut access.get().virtualization;
-            virtualization.phase = MachinePhase::Stopped;
-            virtualization.backend = None;
-            virtualization.ram = None;
-        });
-        Ok(Ok(()))
     }
 }
 
@@ -675,44 +630,40 @@ pub(crate) fn add_to_linker(
 }
 
 impl BoxRuntime {
-    pub async fn grant_vcpus<R: Any + Send>(
-        &mut self,
+    pub(crate) fn validate_runtime_start(&self) -> wasmtime::Result<()> {
+        match self.store.data().platform.virtualization.state {
+            MachineState::Detached | MachineState::Running(_) => Ok(()),
+            MachineState::BootReady(_) => {
+                wasmtime::bail!("VM vCPU startup must complete before runtime preparation")
+            }
+        }
+    }
+
+    pub async fn prepare_vcpus(
+        self,
         start: impl FnOnce(
             Vec<super::NativeVcpu>,
             super::boot::BootEntry,
-        ) -> wasmtime::Result<StartedVcpus<R>>
+        ) -> wasmtime::Result<StartedVcpus>
         + Send
         + 'static,
-    ) -> wasmtime::Result<R> {
-        let router = self
-            .mmio
-            .as_ref()
-            .ok_or_else(|| wasmtime::Error::msg("VMM missing"))?;
+    ) -> wasmtime::Result<(crate::box_runtime::PreparedBoxRuntime, VcpuReaper)> {
         wasmtime::ensure!(
-            router.entrypoint.is_some(),
-            "VMM entrypoint already selected"
+            matches!(
+                self.store.data().platform.virtualization.state,
+                MachineState::BootReady(_)
+            ),
+            "VM boot must complete before vCPU startup"
         );
-        self.install_vcpu_start(start)?;
-        let router = self
-            .mmio
-            .as_mut()
-            .ok_or_else(|| wasmtime::Error::msg("VMM missing"))?;
-        let entrypoint = router
-            .entrypoint
-            .take()
-            .ok_or_else(|| wasmtime::Error::msg("VMM entrypoint already selected"))?;
-        self.register_loop(entrypoint)?;
-        let compose = self
+        let mut runtime = self.prepare_devices().await?;
+        let compose = runtime
             .mmio
             .as_ref()
             .ok_or_else(|| wasmtime::Error::msg("VMM missing"))?
             .compose_machine;
-        let (worker_count, _setup) = self.grant_pending_workers()?;
         let outcome = tokio::time::timeout(
-            super::workers::SETUP_TIMEOUT
-                .saturating_mul(u32::try_from(worker_count)?)
-                .saturating_add(super::EXIT_TIMEOUT),
-            compose.call_async(&mut self.store, ()),
+            super::EXIT_TIMEOUT,
+            compose.call_async(&mut runtime.store, ()),
         )
         .await
         .map_err(wasmtime::Error::from)
@@ -722,106 +673,60 @@ impl BoxRuntime {
                 wasmtime::Error::msg(format!("Wasm machine composition: {error:?}"))
             })
         });
-        if let Err(error) = self.finish_worker_creation(worker_count, outcome) {
-            let host = &mut self.store.data_mut().platform;
-            host.pending_vcpus.clear();
-            host.table = wasmtime::component::ResourceTable::new();
-            return Err(error);
-        }
-        let started = self.start_native_vcpus();
-        if started.is_err() {
-            self.store.data_mut().platform.table = wasmtime::component::ResourceTable::new();
-        }
-        started
+        outcome?;
+        let started = runtime.start_native_vcpus(start)?;
+        Ok((runtime.finish()?, started))
     }
 
-    fn install_vcpu_start<R: Any + Send>(
+    fn start_native_vcpus(
         &mut self,
         start: impl FnOnce(
             Vec<super::NativeVcpu>,
             super::boot::BootEntry,
-        ) -> wasmtime::Result<StartedVcpus<R>>
-        + Send
-        + 'static,
-    ) -> wasmtime::Result<()> {
-        let host = &self.store.data().platform.virtualization;
-        wasmtime::ensure!(
-            host.phase == MachinePhase::BootReady && host.start_vcpus.is_none(),
-            "VM boot must complete before vCPU startup"
-        );
-        wasmtime::ensure!(self.mmio.is_some(), "VMM missing");
-        let host = &mut self.store.data_mut().platform.virtualization;
-        host.start_vcpus = Some(Box::new(move |controls, boot| {
-            let StartedVcpus {
-                runners,
-                reaper,
-                request_stop,
-            } = start(controls, boot)?;
-            Ok(StartedVcpus {
-                runners: Box::new(runners) as Box<dyn Any + Send>,
-                reaper,
-                request_stop,
-            })
-        }));
-        Ok(())
-    }
-
-    fn start_native_vcpus<R: Any + Send>(&mut self) -> wasmtime::Result<R> {
+        ) -> wasmtime::Result<StartedVcpus>,
+    ) -> wasmtime::Result<VcpuReaper> {
         let host = &mut self.store.data_mut().platform;
         let virtualization = &mut host.virtualization;
-        wasmtime::ensure!(
-            virtualization.phase == MachinePhase::BootReady,
-            "VM boot must complete before vCPU startup"
-        );
-        let start = virtualization
-            .start_vcpus
-            .take()
-            .ok_or_else(|| wasmtime::Error::msg("vCPU startup unavailable"))?;
-        let controls = std::mem::take(&mut host.pending_vcpus)
-            .into_iter()
-            .map(|(_, cpu)| cpu)
-            .collect();
-        let boot = virtualization
-            .boot_entry
-            .take()
-            .ok_or_else(|| wasmtime::Error::msg("VM boot is incomplete"))?;
-        let StartedVcpus {
-            runners,
-            reaper,
-            request_stop,
-        } = start(controls, boot)?;
-        virtualization.reaping = Some(ReapingGrant {
-            reaper,
-            is_wait_claimed: false,
-        });
-        virtualization.request_stop = Some(request_stop);
-        virtualization.phase = MachinePhase::Running;
-        runners
-            .downcast::<R>()
-            .map(|runners| *runners)
-            .map_err(|_| wasmtime::Error::msg("vCPU startup result type mismatch"))
+        let state = std::mem::replace(&mut virtualization.state, MachineState::Detached);
+        let MachineState::BootReady(machine) = state else {
+            virtualization.state = state;
+            return Err(wasmtime::Error::msg(
+                "VM boot must complete before vCPU startup",
+            ));
+        };
+        let BootReadyMachine { grant, boot_entry } = machine;
+        let controls = std::mem::take(&mut host.pending_vcpus);
+        let StartedVcpus(reaper) = start(controls, boot_entry)?;
+        host.native_teardown.install_machine(MachineRecovery {
+            reaper: reaper.clone(),
+            _backend: Arc::clone(&grant.backend),
+            _ram: grant.ram.clone(),
+        })?;
+        virtualization.state = MachineState::Running(grant);
+        Ok(reaper)
     }
 
     pub async fn attach_machine<M: VirtualMachine>(
-        &mut self,
+        mut self,
         prepared: PreparedMachine<M>,
-    ) -> wasmtime::Result<MachineHandle<M>> {
+    ) -> wasmtime::Result<(Self, MachineHandle<M>)> {
         let PreparedMachine {
             config,
             backend,
             boot_entry,
         } = prepared;
-        wasmtime::ensure!(
-            boot_entry.is_some(),
-            "VM boot must complete before attachment"
-        );
+        let boot_entry = boot_entry
+            .ok_or_else(|| wasmtime::Error::msg("VM boot must complete before attachment"))?;
         let initialize = self
             .mmio
             .as_ref()
             .ok_or_else(|| wasmtime::Error::msg("VMM missing"))?
             .initialize_machine;
         let host = &mut self.store.data_mut().platform.virtualization;
-        wasmtime::ensure!(host.config.is_none(), "VM already attached");
+        wasmtime::ensure!(
+            matches!(host.state, MachineState::Detached),
+            "VM already attached"
+        );
         let machine = Arc::new(backend);
         let retained_backend: Arc<dyn VirtualMachine> = machine.clone();
         let ram = machine.memory()?;
@@ -834,25 +739,21 @@ impl BoxRuntime {
         let vm = self.store.data_mut().platform.table.push(Vm)?;
         let mut native_vcpus = Vec::with_capacity(usize::from(config.vcpus));
         let mut vcpus = Vec::with_capacity(usize::from(config.vcpus));
-        for id in 0..config.vcpus {
+        for _ in 0..config.vcpus {
             let (native, vcpu) = super::vcpu_channel();
-            native_vcpus.push((id, native));
-            match self.store.data_mut().platform.table.push_child(vcpu, &vm) {
-                Ok(vcpu) => vcpus.push(vcpu),
-                Err(error) => {
-                    clear_machine_attachment(&mut self.store.data_mut().platform);
-                    return Err(error.into());
-                }
-            }
+            native_vcpus.push(native);
+            vcpus.push(self.store.data_mut().platform.table.push_child(vcpu, &vm)?);
         }
         let host = &mut self.store.data_mut().platform;
-        host.workers.machine_layout = Some(config.clone());
         host.pending_vcpus = native_vcpus;
-        host.virtualization.config = Some(config.clone());
-        host.virtualization.ram = Some(ram);
-        host.virtualization.backend = Some(retained_backend);
-        host.virtualization.boot_entry = boot_entry;
-        host.virtualization.phase = MachinePhase::BootReady;
+        host.virtualization.state = MachineState::BootReady(BootReadyMachine {
+            grant: MachineGrant {
+                config: config.clone(),
+                ram,
+                backend: retained_backend,
+            },
+            boot_entry,
+        });
         let initialized = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             initialize.call_async(&mut self.store, (config.as_wit(), vm, vcpus)),
@@ -865,18 +766,7 @@ impl BoxRuntime {
                 wasmtime::Error::msg(format!("Wasm machine initialization: {error:?}"))
             })
         });
-        if let Err(error) = initialized {
-            self.mmio = None;
-            clear_machine_attachment(&mut self.store.data_mut().platform);
-            return Err(error);
-        }
-        Ok(handle)
+        initialized?;
+        Ok((self, handle))
     }
-}
-
-fn clear_machine_attachment(host: &mut PlatformHost) {
-    host.table = wasmtime::component::ResourceTable::new();
-    host.pending_vcpus.clear();
-    host.workers.machine_layout = None;
-    host.virtualization = VirtualizationHost::default();
 }

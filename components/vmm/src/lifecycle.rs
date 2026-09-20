@@ -118,34 +118,9 @@ async fn wait_for_event() -> Result<Event, lifecycle_platform::Error> {
 
 async fn finish_shutdown(event: Event) -> Result<Event, lifecycle_platform::Error> {
     super::machine::request_stop().map_err(|_| lifecycle_platform::Error::Closed)?;
-    super::machine::wait_stopped()
-        .await
-        .map_err(|_| lifecycle_platform::Error::Closed)?;
-    let devices = close_devices().await;
-    let interrupts = lifecycle_platform::release_interrupts().await;
-    devices?;
-    interrupts?;
+    lifecycle_platform::shutdown().await?;
+    super::machine::mark_stopped();
     Ok(event)
-}
-
-async fn close_devices() -> Result<(), lifecycle_platform::Error> {
-    use super::terra::mmio::machine_types::DeviceKind;
-
-    let mut devices = lifecycle_platform::devices();
-    devices.sort_by_key(|device| match device.kind {
-        DeviceKind::Memory => 0,
-        DeviceKind::Fs => 1,
-        DeviceKind::Net => 2,
-        DeviceKind::Vsock => 3,
-        DeviceKind::Block => 4,
-    });
-    let mut result = Ok(());
-    for device in devices {
-        if let Err(error) = lifecycle_platform::close_device(device.id).await {
-            result = Err(error);
-        }
-    }
-    result
 }
 
 #[cfg(test)]

@@ -1,6 +1,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use terra_runtime::engine::{device_engine, device_store, vsock_component_linker};
+use terra_runtime::engine::test_support::device_store;
+use terra_runtime::engine::{device_engine, vsock_component_linker};
 use wasmtime::component::{Component, TypedFunc, wit_parser::ItemName};
 
 #[derive(
@@ -80,7 +81,13 @@ async fn component_releases_credit_after_consumer_drains_data() {
     let engine = device_engine().expect("engine");
     let linker = vsock_component_linker(&engine).expect("linker");
     let component = Component::new(&engine, COMPONENT).expect("component");
-    let mut store = device_store(&engine, 64 * 1024).expect("store");
+    let mut store = device_store(
+        &engine,
+        terra_runtime::engine::VsockDeviceHost::new(
+            terra_runtime::SyntheticRam::new(64 * 1024).unwrap(),
+            terra_runtime::component::vsock::host::VsockHostService::default(),
+        ),
+    );
     let instance = linker
         .instantiate_async(&mut store, &component)
         .await
@@ -149,7 +156,13 @@ async fn component_drains_selected_stream_while_another_is_queued() {
     let engine = device_engine().expect("engine");
     let linker = vsock_component_linker(&engine).expect("linker");
     let component = Component::new(&engine, COMPONENT).expect("component");
-    let mut store = device_store(&engine, 64 * 1024).expect("store");
+    let mut store = device_store(
+        &engine,
+        terra_runtime::engine::VsockDeviceHost::new(
+            terra_runtime::SyntheticRam::new(64 * 1024).unwrap(),
+            terra_runtime::component::vsock::host::VsockHostService::default(),
+        ),
+    );
     let instance = linker
         .instantiate_async(&mut store, &component)
         .await
@@ -158,7 +171,7 @@ async fn component_drains_selected_stream_while_another_is_queued() {
         instance
             .get_typed_func::<(), (
                 wasmtime::component::StreamReader<
-                    terra_runtime::component::vsock::bindings::HostEvent,
+                    terra_runtime::component::vsock::host::VsockEvent,
                 >,
             )>(&mut store, export("events"))
             .expect("events");
@@ -242,7 +255,13 @@ async fn component_close_clears_queued_state() {
     let engine = device_engine().expect("engine");
     let linker = vsock_component_linker(&engine).expect("linker");
     let component = Component::new(&engine, COMPONENT).expect("component");
-    let mut store = device_store(&engine, 64 * 1024).expect("store");
+    let mut store = device_store(
+        &engine,
+        terra_runtime::engine::VsockDeviceHost::new(
+            terra_runtime::SyntheticRam::new(64 * 1024).unwrap(),
+            terra_runtime::component::vsock::host::VsockHostService::default(),
+        ),
+    );
     let instance = linker
         .instantiate_async(&mut store, &component)
         .await
@@ -293,7 +312,13 @@ async fn component_rejects_backpressure_without_resetting_connection_state() {
     let engine = device_engine().expect("engine");
     let linker = vsock_component_linker(&engine).expect("linker");
     let component = Component::new(&engine, COMPONENT).expect("component");
-    let mut store = device_store(&engine, 64 * 1024).expect("store");
+    let mut store = device_store(
+        &engine,
+        terra_runtime::engine::VsockDeviceHost::new(
+            terra_runtime::SyntheticRam::new(64 * 1024).unwrap(),
+            terra_runtime::component::vsock::host::VsockHostService::default(),
+        ),
+    );
     let instance = linker
         .instantiate_async(&mut store, &component)
         .await
@@ -363,7 +388,13 @@ async fn lifecycle_decoding_stays_in_component_and_handles_bounded_frames() {
     use terra_protocol::{LifecycleEvent, encode_frame};
     let engine = device_engine().unwrap();
     let component = Component::new(&engine, COMPONENT).unwrap();
-    let mut store = device_store(&engine, 65536).unwrap();
+    let mut store = device_store(
+        &engine,
+        terra_runtime::engine::VsockDeviceHost::new(
+            terra_runtime::SyntheticRam::new(65536).unwrap(),
+            terra_runtime::component::vsock::host::VsockHostService::default(),
+        ),
+    );
     let instance = vsock_component_linker(&engine)
         .unwrap()
         .instantiate_async(&mut store, &component)

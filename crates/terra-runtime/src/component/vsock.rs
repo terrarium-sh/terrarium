@@ -1,20 +1,28 @@
 //! Native control streams for the compartmentalized vsock device.
 
-pub mod bindings;
 pub mod host;
 #[cfg(any(test, feature = "test-support"))]
 pub mod protocol;
 
+use futures_util::{
+    FutureExt,
+    future::{BoxFuture, Shared},
+};
+
+use crate::box_runtime::StoreState;
+use crate::component::vmm::lifecycle::LifecycleNotifier;
 use crate::component::vmm::virtualization::RamGrant;
-use crate::component::vsock::bindings::VsockComponent;
+use host::VsockDeviceHost;
+use host::{VsockBindings, VsockError, VsockEvent};
 use std::{
     io::Write,
     pin::Pin,
+    sync::Arc,
     sync::atomic::{AtomicBool, Ordering},
-    sync::{Arc, Mutex, mpsc},
     time::Duration,
 };
 use terra_io::local::{LocalListener as UnixListener, LocalStream as UnixStream};
+#[cfg(test)]
 use wasmtime::Store;
 use wasmtime::StoreContextMut;
 use wasmtime::component::{Accessor, Source, StreamConsumer, StreamResult};
@@ -26,13 +34,13 @@ const RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
 
 struct DiagnosticSink {
     sender: tokio::sync::mpsc::Sender<Vec<u8>>,
-    finished: std::sync::mpsc::Receiver<std::io::Result<()>>,
+    finished: tokio::sync::oneshot::Receiver<std::io::Result<()>>,
 }
 
 impl DiagnosticSink {
     fn new(mut output: std::fs::File) -> std::io::Result<Self> {
         let (sender, mut receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
-        let (done, finished) = std::sync::mpsc::sync_channel(1);
+        let (done, finished) = tokio::sync::oneshot::channel();
         std::thread::Builder::new()
             .name("guest-diagnostics".into())
             .spawn(move || {
@@ -44,33 +52,19 @@ impl DiagnosticSink {
         Ok(Self { sender, finished })
     }
 
-    fn finish(self) -> std::io::Result<()> {
+    async fn finish(self) -> std::io::Result<()> {
         drop(self.sender);
-        self.finished.recv().map_err(std::io::Error::other)?
+        self.finished.await.map_err(std::io::Error::other)?
     }
 }
 
 struct EventSink {
-    exit_code: Arc<Mutex<Option<i32>>>,
     diagnostic_sender: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
-    lifecycle: Option<crate::component::vmm::lifecycle::LifecycleNotifier>,
-}
-
-impl EventSink {
-    fn new(
-        exit_code: Arc<Mutex<Option<i32>>>,
-        diagnostic_sender: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
-    ) -> Self {
-        Self {
-            exit_code,
-            diagnostic_sender,
-            lifecycle: None,
-        }
-    }
+    lifecycle: LifecycleNotifier,
 }
 
 impl<H: 'static> StreamConsumer<H> for EventSink {
-    type Item = crate::component::vsock::bindings::HostEvent;
+    type Item = VsockEvent;
 
     fn poll_consume(
         self: Pin<&mut Self>,
@@ -89,7 +83,7 @@ impl<H: 'static> StreamConsumer<H> for EventSink {
             return std::task::Poll::Ready(Ok(StreamResult::Completed));
         };
         match event {
-            crate::component::vsock::bindings::HostEvent::Diagnostic(bytes) => {
+            VsockEvent::Diagnostic(bytes) => {
                 if bytes.len() > MAX_DIAGNOSTIC_BATCH_BYTES {
                     return std::task::Poll::Ready(Err(wasmtime::Error::msg(
                         "vsock diagnostic event limit",
@@ -100,71 +94,18 @@ impl<H: 'static> StreamConsumer<H> for EventSink {
                 };
                 let _ = sender.try_send(bytes);
             }
-            crate::component::vsock::bindings::HostEvent::Exit(code) => {
-                *self
-                    .exit_code
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(code);
-                if let Some(lifecycle) = &self.lifecycle {
-                    lifecycle.guest_exit(code);
-                }
+            VsockEvent::Exit(code) => {
+                self.lifecycle.guest_exit(code);
             }
         }
         std::task::Poll::Ready(Ok(StreamResult::Completed))
     }
 }
 
-pub struct VsockDev {
-    component: VsockComponent,
-    diagnostic_sink: Option<DiagnosticSink>,
-    exit_code: Arc<Mutex<Option<i32>>>,
-    lifecycle: Option<crate::component::vmm::lifecycle::LifecycleNotifier>,
-}
-
 #[derive(Clone)]
 pub struct VsockChannel {
-    close_response: Arc<Mutex<mpsc::Receiver<wasmtime::Result<()>>>>,
-    failure: Arc<Mutex<Option<String>>>,
+    close: Shared<BoxFuture<'static, Result<(), String>>>,
     mmio: crate::component::vmm::mmio::MmioDevice,
-    shared_closing: Arc<AtomicBool>,
-}
-
-impl VsockDev {
-    pub fn grant_diagnostics(&mut self, output: std::fs::File) -> std::io::Result<()> {
-        self.diagnostic_sink = Some(DiagnosticSink::new(output)?);
-        Ok(())
-    }
-
-    pub async fn finish_diagnostics(&mut self) -> wasmtime::Result<()> {
-        let sink = self.diagnostic_sink.take();
-        if let Some(sink) = sink {
-            tokio::task::spawn_blocking(move || sink.finish())
-                .await
-                .map_err(|_| wasmtime::Error::msg("vsock diagnostic writer stopped"))??;
-        }
-        Ok(())
-    }
-
-    fn event_sink(&self) -> EventSink {
-        let mut sink = EventSink::new(
-            Arc::clone(&self.exit_code),
-            self.diagnostic_sink
-                .as_ref()
-                .map(|sink| sink.sender.clone()),
-        );
-        sink.lifecycle.clone_from(&self.lifecycle);
-        sink
-    }
-
-    pub async fn connect_events_store(
-        &mut self,
-        store: &mut Store<crate::box_runtime::BoxHost>,
-    ) -> wasmtime::Result<()> {
-        self.component
-            .events_store(store)
-            .await?
-            .pipe(store, self.event_sink())
-    }
 }
 
 struct VsockWorkerGrant {
@@ -175,50 +116,62 @@ struct VsockWorkerGrant {
     diagnostics: Option<std::fs::File>,
     interrupt: crate::component::Interrupt,
     ram: RamGrant,
-    exit_code: Arc<Mutex<Option<i32>>>,
-    failure: Arc<Mutex<Option<String>>>,
     closing: Arc<AtomicBool>,
     lifecycle: crate::component::vmm::lifecycle::LifecycleNotifier,
-    completion: mpsc::SyncSender<wasmtime::Result<()>>,
+    completion: tokio::sync::oneshot::Sender<wasmtime::Result<()>>,
 }
 
 impl VsockWorkerGrant {
     async fn create(
         self,
-        mut child: crate::box_runtime::BoxRuntime,
+        child: impl FnOnce(VsockDeviceHost) -> crate::box_runtime::DeviceWorker<VsockDeviceHost>,
     ) -> wasmtime::Result<(
-        crate::box_runtime::BoxRuntime,
+        crate::box_runtime::DeviceWorker<VsockDeviceHost>,
         crate::component::vmm::mmio::Serve,
     )> {
-        let mut device_host = crate::engine::DeviceHost::with_ram(self.ram.resolve()?);
-        device_host.set_vsock_service(host::VsockHostService::new(
-            self.plan,
-            self.listener,
-            self.control,
-        )?);
-        let wake = device_host.interrupt_notification();
-        let component =
-            VsockComponent::instantiate_shared(&mut child, device_host, &self.component).await?;
-        let serve = component.mmio_serve();
-        let mut device_state = VsockDev {
-            component,
-            diagnostic_sink: None,
-            exit_code: self.exit_code,
-            lifecycle: Some(self.lifecycle),
+        let device_host = VsockDeviceHost::new(
+            self.ram.resolve()?,
+            host::VsockHostService::new(self.plan, self.listener, self.control)?,
+        );
+        let wake = device_host.context.interrupt_notification();
+        let mut child = child(device_host);
+        let linker = host::vsock_component_linker(child.store.engine())?;
+        let instance = VsockBindings::instantiate_async(&mut child.store, &self.component, &linker)
+            .await
+            .map_err(|error| error.context("vsock component initialization"))?;
+        let api = instance.terra_vsock_api();
+        let (configured,) = api
+            .func_configure_device()
+            .call_async(&mut child.store, ())
+            .await
+            .map_err(|error| error.context("vsock component configuration"))?;
+        configured.map_err(|error| wasmtime::Error::msg(format!("vsock configure: {error:?}")))?;
+        let serve = instance.terra_mmio_device().func_serve();
+        let worker = crate::component::worker::Worker {
+            run: api.func_run(),
+            interrupt: self.interrupt,
         };
-        if let Some(diagnostics) = self.diagnostics {
-            device_state.grant_diagnostics(diagnostics)?;
-        }
-        device_state.connect_events_store(&mut child.store).await?;
+        let diagnostics = self.diagnostics.map(DiagnosticSink::new).transpose()?;
+        let (events,) = api
+            .func_events()
+            .call_async(&mut child.store, ())
+            .await
+            .map_err(|error| error.context("vsock component event stream"))?;
+        events.pipe(
+            &mut child.store,
+            EventSink {
+                diagnostic_sender: diagnostics.as_ref().map(|sink| sink.sender.clone()),
+                lifecycle: self.lifecycle,
+            },
+        )?;
         child.register_loop(Box::new(move |accessor| {
             Box::pin(run_worker(
                 accessor,
-                device_state,
+                worker,
+                diagnostics,
                 self.completion,
-                self.interrupt,
                 wake,
                 self.closing,
-                self.failure,
             ))
         }))?;
         Ok((child, serve))
@@ -229,7 +182,7 @@ impl VsockChannel {
     /// # Safety
     /// `artifact` must be trusted AOT output from this exact Wasmtime build.
     #[allow(unsafe_code, clippy::too_many_arguments)]
-    pub async unsafe fn from_trusted_shared(
+    pub unsafe fn from_trusted_shared(
         runtime: &mut crate::box_runtime::BoxRuntime,
         ram: impl Into<RamGrant> + Send,
         artifact: &'static [u8],
@@ -247,10 +200,8 @@ impl VsockChannel {
         let component = unsafe {
             wasmtime::component::Component::deserialize(runtime.store.engine(), artifact)?
         };
-        let exit_code = Arc::new(Mutex::new(None));
-        let failure = Arc::new(Mutex::new(None));
         let shared_closing = Arc::new(AtomicBool::new(false));
-        let (completion, close_response) = mpsc::sync_channel(1);
+        let (completion, close_response) = tokio::sync::oneshot::channel();
         let setup = VsockWorkerGrant {
             component,
             plan,
@@ -259,142 +210,81 @@ impl VsockChannel {
             diagnostics,
             interrupt,
             ram,
-            exit_code: Arc::clone(&exit_code),
-            failure: Arc::clone(&failure),
             closing: Arc::clone(&shared_closing),
             lifecycle: runtime.lifecycle_notifier(),
             completion,
         };
         let child = runtime.child_factory();
-        let factory: crate::component::vmm::workers::Factory = Box::new(move || {
-            Box::pin(async move {
-                setup
-                    .create(child(crate::box_runtime::BoxHost::new())?)
-                    .await
-            })
-        });
-        let mmio = crate::component::vmm::mmio::MmioDevice::grant_worker(
-            runtime,
+        let mmio = runtime.grant_device_worker(
             crate::component::vmm::machine::DeviceKind::Vsock,
-            factory,
-        )
-        .await?;
-        Ok(Self {
-            close_response: Arc::new(Mutex::new(close_response)),
-            failure,
-            mmio,
-            shared_closing,
-        })
+            async move { setup.create(child).await },
+        )?;
+        let closing_device = mmio.clone();
+        let close = async move {
+            shared_closing.store(true, Ordering::Release);
+            closing_device
+                .close_async()
+                .await
+                .map_err(|error| error.to_string())?;
+            tokio::time::timeout(RESPONSE_TIMEOUT, close_response)
+                .await
+                .map_err(|error| format!("vsock component response: {error}"))?
+                .map_err(|error| format!("vsock component response: {error}"))?
+                .map_err(|error| error.to_string())
+        }
+        .boxed()
+        .shared();
+        Ok(Self { close, mmio })
     }
 
     #[must_use]
     pub fn failure(&self) -> Option<String> {
         self.mmio.failure().or_else(|| {
-            self.failure
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone()
+            self.close
+                .peek()
+                .and_then(|result| result.as_ref().err().cloned())
         })
     }
 
-    fn finish_close(&self) -> wasmtime::Result<()> {
-        self.close_response
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .recv_timeout(RESPONSE_TIMEOUT)
-            .map_err(|error| {
-                let error = format!("vsock component response: {error}");
-                set_failure(&self.failure, error.clone());
-                wasmtime::Error::msg(error)
-            })?
-    }
-
     pub fn read_mmio(&self, offset: u64, len: usize) -> wasmtime::Result<Vec<u8>> {
-        if !matches!(len, 1 | 2 | 4 | 8) {
-            return Err(wasmtime::Error::msg("invalid vsock MMIO width"));
-        }
         self.mmio.read(offset, len)
     }
 
     pub fn write_mmio(&self, offset: u64, bytes: &[u8]) -> wasmtime::Result<()> {
-        if !matches!(bytes.len(), 1 | 2 | 4 | 8) {
-            return Err(wasmtime::Error::msg("invalid vsock MMIO width"));
-        }
         self.mmio.write(offset, bytes)
     }
 
-    pub fn close(&self) -> wasmtime::Result<()> {
-        if self.shared_closing.swap(true, Ordering::AcqRel) {
-            return Err(wasmtime::Error::msg("vsock component is already closing"));
-        }
-        if let Some(error) = self.failure() {
-            return Err(wasmtime::Error::msg(format!(
-                "vsock component unavailable: {error}"
-            )));
-        }
-        if let Err(error) = self.mmio.close() {
-            self.shared_closing.store(false, Ordering::Release);
-            return Err(error);
-        }
-        self.finish_close()
-    }
-
     pub async fn close_async(&self) -> wasmtime::Result<()> {
-        let channel = self.clone();
-        tokio::task::spawn_blocking(move || channel.close())
-            .await
-            .map_err(|_| wasmtime::Error::msg("vsock close task stopped"))?
+        self.close.clone().await.map_err(wasmtime::Error::msg)
     }
 }
 
 async fn run_worker(
-    accessor: &Accessor<crate::box_runtime::BoxHost>,
-    mut device: VsockDev,
-    completion: mpsc::SyncSender<wasmtime::Result<()>>,
-    interrupt: crate::component::Interrupt,
+    accessor: &Accessor<StoreState<VsockDeviceHost>>,
+    worker: crate::component::worker::Worker<VsockError>,
+    diagnostics: Option<DiagnosticSink>,
+    completion: tokio::sync::oneshot::Sender<wasmtime::Result<()>>,
     wake: Arc<tokio::sync::Notify>,
     shared_closing: Arc<AtomicBool>,
-    failure: Arc<Mutex<Option<String>>>,
 ) -> wasmtime::Result<()> {
     let result = async {
-        crate::component::worker::Worker {
-            run: device.component.run_function(),
-            interrupt,
-        }
-        .drive(accessor, wake, "vsock", |host| {
-            let host = host
-                .vsock
-                .first_mut()
-                .ok_or_else(|| wasmtime::Error::msg("vsock host missing"))?;
-            host.end_window();
-            Ok(host.interrupt_level())
-        })
-        .await?;
+        worker.drive(accessor, wake, "vsock").await?;
         wasmtime::ensure!(
             shared_closing.load(Ordering::Acquire),
             "vsock worker stopped"
         );
-        device.finish_diagnostics().await
+        if let Some(sink) = diagnostics {
+            sink.finish().await?;
+        }
+        Ok(())
     }
     .await;
     let error = result
         .as_ref()
         .err()
         .map(|error| format!("vsock component: {error:#}"));
-    if let Some(error) = &error {
-        set_failure(&failure, error.clone());
-    }
     let _ = completion.send(result);
     error.map_or(Ok(()), |error| Err(wasmtime::Error::msg(error)))
-}
-
-fn set_failure(failure: &Mutex<Option<String>>, error: String) {
-    let mut slot = failure
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if slot.is_none() {
-        *slot = Some(error);
-    }
 }
 
 #[cfg(test)]
@@ -433,35 +323,55 @@ mod tests {
     }
 
     #[test]
-    fn diagnostic_finish_flushes_queued_output() {
-        let output = tempfile::NamedTempFile::new().unwrap();
-        let sink = DiagnosticSink::new(output.reopen().unwrap()).unwrap();
-        sink.sender
-            .blocking_send(b"failed bake output\n".to_vec())
+    fn diagnostic_finish_flushes_output_with_the_blocking_pool_occupied() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
             .unwrap();
-        sink.finish().unwrap();
-        assert_eq!(
-            std::fs::read(output.path()).unwrap(),
-            b"failed bake output\n"
-        );
+        runtime.block_on(async {
+            let (entered, started) = tokio::sync::oneshot::channel();
+            let (release, blocked) = std::sync::mpsc::channel();
+            let occupied_pool = tokio::task::spawn_blocking(move || {
+                entered.send(()).unwrap();
+                let _ = blocked.recv_timeout(Duration::from_secs(5));
+            });
+            started.await.unwrap();
+            let output = tempfile::NamedTempFile::new().unwrap();
+            let sink = DiagnosticSink::new(output.reopen().unwrap()).unwrap();
+            sink.sender
+                .send(b"failed bake output\n".to_vec())
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), sink.finish())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                std::fs::read(output.path()).unwrap(),
+                b"failed bake output\n"
+            );
+            release.send(()).unwrap();
+            occupied_pool.await.unwrap();
+        });
     }
 
-    #[test]
-    fn diagnostic_flood_drains_after_reaching_file_limit() {
+    #[tokio::test]
+    async fn diagnostic_flood_drains_after_reaching_file_limit() {
         let output = tempfile::NamedTempFile::new().unwrap();
         let sink = DiagnosticSink::new(output.reopen().unwrap()).unwrap();
         for _ in 0..=(MAX_DIAGNOSTIC_FILE_BYTES / 4096) {
-            sink.sender.blocking_send(vec![b'x'; 4096]).unwrap();
+            sink.sender.send(vec![b'x'; 4096]).await.unwrap();
         }
-        sink.finish().unwrap();
+        sink.finish().await.unwrap();
         assert_eq!(
             output.as_file().metadata().unwrap().len(),
             MAX_DIAGNOSTIC_FILE_BYTES as u64
         );
     }
 
-    #[test]
-    fn restarting_diagnostics_does_not_reset_the_file_budget() {
+    #[tokio::test]
+    async fn restarting_diagnostics_does_not_reset_the_file_budget() {
         let output = tempfile::NamedTempFile::new().unwrap();
         output
             .as_file()
@@ -474,8 +384,8 @@ mod tests {
                 .open(output.path())
                 .unwrap();
             let sink = DiagnosticSink::new(file).unwrap();
-            sink.sender.blocking_send(vec![b'x'; 4096]).unwrap();
-            sink.finish().unwrap();
+            sink.sender.send(vec![b'x'; 4096]).await.unwrap();
+            sink.finish().await.unwrap();
         }
         assert_eq!(
             output.as_file().metadata().unwrap().len(),
@@ -487,24 +397,29 @@ mod tests {
     async fn typed_events_update_the_bounded_native_observers() {
         let engine = crate::engine::device_engine().expect("engine");
         let mut store = Store::new(&engine, ());
-        let exit_code = Arc::new(Mutex::new(None));
-        let events = wasmtime::component::StreamReader::new(
-            &mut store,
-            vec![crate::component::vsock::bindings::HostEvent::Exit(7)],
-        )
-        .expect("event stream");
+        let lifecycle = crate::component::vmm::lifecycle::LifecycleHost::new();
+        let events = wasmtime::component::StreamReader::new(&mut store, vec![VsockEvent::Exit(7)])
+            .expect("event stream");
         events
-            .pipe(&mut store, EventSink::new(Arc::clone(&exit_code), None))
+            .pipe(
+                &mut store,
+                EventSink {
+                    lifecycle: lifecycle.notifier(),
+                    diagnostic_sender: None,
+                },
+            )
             .expect("event sink");
         store
             .run_concurrent(async |_| {
-                while *exit_code
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    != Some(7)
-                {
-                    tokio::task::yield_now().await;
-                }
+                let event = tokio::time::timeout(Duration::from_secs(1), lifecycle.next_event())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                assert!(matches!(
+                    event,
+                    crate::component::vmm::lifecycle::lifecycle_platform::Event::GuestExit(7)
+                ));
             })
             .await
             .expect("event stream runs");
@@ -514,7 +429,7 @@ mod tests {
     async fn saturated_diagnostics_do_not_delay_exit_events() {
         let engine = crate::engine::device_engine().expect("engine");
         let mut store = Store::new(&engine, ());
-        let exit_code = Arc::new(Mutex::new(None));
+        let lifecycle = crate::component::vmm::lifecycle::LifecycleHost::new();
         let (diagnostic_sender, _diagnostic_receiver) = tokio::sync::mpsc::channel(1);
         diagnostic_sender
             .try_send(vec![0])
@@ -522,26 +437,31 @@ mod tests {
         let events = wasmtime::component::StreamReader::new(
             &mut store,
             vec![
-                crate::component::vsock::bindings::HostEvent::Diagnostic(b"slow disk\n".to_vec()),
-                crate::component::vsock::bindings::HostEvent::Exit(9),
+                VsockEvent::Diagnostic(b"slow disk\n".to_vec()),
+                VsockEvent::Exit(9),
             ],
         )
         .expect("event stream");
         events
             .pipe(
                 &mut store,
-                EventSink::new(Arc::clone(&exit_code), Some(diagnostic_sender)),
+                EventSink {
+                    lifecycle: lifecycle.notifier(),
+                    diagnostic_sender: Some(diagnostic_sender),
+                },
             )
             .expect("event sink");
         store
             .run_concurrent(async |_| {
-                while *exit_code
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    != Some(9)
-                {
-                    tokio::task::yield_now().await;
-                }
+                let event = tokio::time::timeout(Duration::from_secs(1), lifecycle.next_event())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                assert!(matches!(
+                    event,
+                    crate::component::vmm::lifecycle::lifecycle_platform::Event::GuestExit(9)
+                ));
             })
             .await
             .expect("event stream runs");
@@ -554,15 +474,19 @@ mod tests {
         let (diagnostic_sender, mut diagnostic_receiver) = tokio::sync::mpsc::channel(1);
         let events = wasmtime::component::StreamReader::new(
             &mut store,
-            vec![crate::component::vsock::bindings::HostEvent::Diagnostic(
-                vec![0; MAX_DIAGNOSTIC_BATCH_BYTES + 1],
-            )],
+            vec![VsockEvent::Diagnostic(vec![
+                0;
+                MAX_DIAGNOSTIC_BATCH_BYTES + 1
+            ])],
         )
         .expect("event stream");
         events
             .pipe(
                 &mut store,
-                EventSink::new(Arc::new(Mutex::new(None)), Some(diagnostic_sender)),
+                EventSink {
+                    lifecycle: crate::component::vmm::lifecycle::LifecycleHost::new().notifier(),
+                    diagnostic_sender: Some(diagnostic_sender),
+                },
             )
             .expect("event sink");
         assert!(
@@ -578,54 +502,81 @@ mod tests {
         assert!(diagnostic_receiver.try_recv().is_err());
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn shared_channel_runs_vsock_in_a_child_store() {
-        let engine = crate::engine::device_engine().expect("engine");
-        let mut runtime =
-            crate::box_runtime::BoxRuntime::new(&engine, crate::box_runtime::BoxHost::new())
-                .expect("runtime");
-        let router = wasmtime::component::Component::new(
+    #[test]
+    fn shared_channel_runs_vsock_in_a_child_store() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let engine = crate::engine::device_engine().expect("engine");
+            let mut runtime =
+                crate::box_runtime::BoxRuntime::new(&engine, crate::box_runtime::BoxHost::new())
+                    .expect("runtime");
+            let router = wasmtime::component::Component::new(
             &engine,
             include_bytes!(
                 "../../../../components/vmm/target/wasm32-wasip3/release/terra_vmm_component.wasm"
             ),
         )
         .expect("router component");
-        runtime.initialize_mmio(&router).await.expect("router");
-        let ram = SyntheticRam::new(4096).expect("test RAM maps");
-        // SAFETY: the test embeds the trusted build's component artifact.
-        #[allow(unsafe_code)]
-        let channel = unsafe {
-            VsockChannel::from_trusted_shared(
-                &mut runtime,
-                ram,
-                include_bytes!("../../../../build/terra-vsock-component.cwasm"),
-                boot_plan(),
-                None,
-                None,
-                None,
-                Arc::new(|_| Ok(())),
-            )
+            runtime.initialize_mmio(&router).await.expect("router");
+            let ram = SyntheticRam::new(4096).expect("test RAM maps");
+            // SAFETY: the test embeds the trusted build's component artifact.
+            #[allow(unsafe_code)]
+            let channel = unsafe {
+                VsockChannel::from_trusted_shared(
+                    &mut runtime,
+                    ram,
+                    include_bytes!("../../../../build/terra-vsock-component.cwasm"),
+                    boot_plan(),
+                    None,
+                    None,
+                    None,
+                    Arc::new(|_| Ok(())),
+                )
+            }
+            .expect("component");
+            assert!(runtime.has_component(crate::component::vmm::machine::DeviceKind::Vsock));
+            let runtime_task = runtime.prepare().await.unwrap().start();
+            let request = channel.clone();
+            assert_eq!(
+                tokio::task::spawn_blocking(move || request.read_mmio(0, 4))
+                    .await
+                    .expect("request thread")
+                    .expect("component request"),
+                0x7472_6976_u32.to_le_bytes()
+            );
+            assert_eq!(channel.mmio.request_counts(), (1, 0));
+            let (entered, started) = tokio::sync::oneshot::channel();
+            let (release, blocked) = std::sync::mpsc::channel();
+            let occupied_pool = tokio::task::spawn_blocking(move || {
+                entered.send(()).unwrap();
+                let _ = blocked.recv_timeout(Duration::from_secs(5));
+            });
+            started.await.unwrap();
+            let mut cancelled = Box::pin(channel.close_async());
+            assert!(futures_util::poll!(&mut cancelled).is_pending());
+            drop(cancelled);
+            let peer = channel.clone();
+            let (first, second) = tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::join!(channel.close_async(), peer.close_async())
+            })
             .await
-        }
-        .expect("component");
-        assert!(runtime.store.data().vsock.is_empty());
-        assert!(runtime.has_component(crate::component::vmm::machine::DeviceKind::Vsock));
-        let runtime_task = runtime.start();
-        let request = channel.clone();
-        assert_eq!(
-            tokio::task::spawn_blocking(move || request.read_mmio(0, 4))
+            .expect("close does not need the blocking pool");
+            first.expect("close survives cancelled waiter");
+            second.expect("concurrent waiter shares completion");
+            release.send(()).unwrap();
+            occupied_pool.await.unwrap();
+            channel
+                .close_async()
                 .await
-                .expect("request thread")
-                .expect("component request"),
-            0x7472_6976_u32.to_le_bytes()
-        );
-        assert_eq!(channel.mmio.request_counts(), (1, 0));
-        channel.close_async().await.expect("component close");
-        assert!(channel.close_async().await.is_err());
-        runtime_task
-            .join()
-            .await
-            .expect("runtime stops after the final component closes");
+                .expect("repeated close shares completion");
+            runtime_task
+                .join()
+                .await
+                .expect("runtime stops after the final component closes");
+        });
     }
 }
