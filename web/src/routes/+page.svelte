@@ -77,7 +77,7 @@
   <div>
     <p class="eyebrow">From a recipe to a running box</p>
     <h2>Make a little room.</h2>
-    {#if releaseTag}<p><a class="release-link" href={`https://github.com/terrarium-sh/terrarium/releases/tag/${releaseTag}`}>Released {releaseTag} <span aria-hidden="true">↗</span></a></p>{/if}
+    {#if releaseTag}<p><a class="release-link" target="_blank" rel="noopener noreferrer" href={`https://github.com/terrarium-sh/terrarium/releases/tag/${releaseTag}`}>Released {releaseTag}</a></p>{/if}
     <p>Install Terra and save this recipe as <code>dev.yaml</code>. Then set up and enter your box.</p>
     {#if isClient}
       <div class="platform-choice">
@@ -127,8 +127,8 @@ terra</code></pre>
 <section class="reading-section">
   <p class="eyebrow">Keep exploring</p><h2>A reference within reach.</h2>
   <div class="reading-grid">
-    <a href="{base}/commands/"><h3>Command reference <span aria-hidden="true">↗</span></h3><p>Find a command, flag, or example. Generated directly from the CLI.</p></a>
-    <a href="{base}/docs/recipe/"><h3>Write a recipe <span aria-hidden="true">↗</span></h3><p>Configure resources, mounts, network access, and lifecycle hooks.</p></a>
-    <a href="{base}/docs/security/"><h3>Understand the boundary <span aria-hidden="true">↗</span></h3><p>What Terra isolates, what it trusts, and how its devices are sandboxed.</p></a>
+    <a href="{base}/commands/"><h3>Command reference</h3><p>Find a command, flag, or example. Generated directly from the CLI.</p></a>
+    <a href="{base}/docs/recipe/"><h3>Write a recipe</h3><p>Configure resources, mounts, network access, and lifecycle hooks.</p></a>
+    <a href="{base}/docs/security/"><h3>Understand the boundary</h3><p>What Terra isolates, what it trusts, and how its devices are sandboxed.</p></a>
   </div>
 </section>

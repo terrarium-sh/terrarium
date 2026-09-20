@@ -1,5 +1,5 @@
 import { base } from '$app/paths';
-import { marked } from 'marked';
+import { marked, Renderer } from 'marked';
 
 const repository = 'https://github.com/terrarium-sh/terrarium/blob/main/';
 const guideFiles = ['usage', 'recipe', 'manifest', 'security'] as const;
@@ -53,10 +53,20 @@ const addHeadingIds = (html: string) => {
 	});
 };
 
+const renderer = new Renderer();
+const renderLink = renderer.link;
+renderer.link = function (token) {
+	const html = renderLink.call(this, token);
+	return /^(?:https?:)?\/\//i.test(token.href)
+		? html.replace('<a ', '<a target="_blank" rel="noopener noreferrer" ')
+		: html;
+};
+
 const renderGuide = (markdown: string) =>
 	addHeadingIds(
 		marked.parse(markdown, {
 			async: false,
+			renderer,
 			walkTokens(token) {
 				if (token.type === 'link') token.href = rewriteLink(token.href);
 			}

@@ -23,8 +23,8 @@ pnpm preview
 Deploy the contents of `build/`. All pages are prerendered, with local styles,
 scripts, and assets; no runtime server, external fonts, or search service is
 required. Client JavaScript powers platform detection on the homepage and
-command search. Guides remain JavaScript-free; all content is readable without
-JavaScript.
+command search, plus the live GitHub star count on every page. All content
+is readable without JavaScript.
 Set `BASE_PATH=/terrarium` at build time for a GitHub Pages project site;
 leave it empty for a domain root. Deep links use directory `index.html` files.
 
@@ -42,12 +42,15 @@ Edit those source documents to update their website pages.
 Both `dev` and `build` regenerate the command index before starting; generated
 files are ignored by Git. Re-run the command after rebuilding a local binary.
 Search runs entirely in the browser and matches command names, flags, and help
-text. The reference shows which binary version generated it.
+text. The reference shows which binary version generated it. The homepage links
+the release identified by that binary; development binaries omit the release
+badge. CI sets `TERRA_RELEASE_TAG` and generation rejects a mismatched binary.
 
 The Pages workflow rebuilds on website/documentation changes and releases.
 It downloads the latest stable Linux release, verifies its checksum, and
 generates the reference from that binary. Guides track the repository;
-the command reference tracks the displayed release version. A successful
+the command reference tracks the displayed release version. Each guide labels
+this distinction so unreleased features are not mistaken for released commands. A successful
 Release workflow also triggers Pages, including releases created by
 `GITHUB_TOKEN`. Pull requests build and check the site without deploying.
 GitHub's Pages configuration supplies the deployment base path.
@@ -66,3 +69,8 @@ Starlight is pinned to a public GitHub source commit because its package
 registry requires authentication. pnpm packages that source using its upstream
 `prepack` script; `pnpm-workspace.yaml` explicitly permits that step. No GitHub
 registry token is needed. Update the pinned URL and lockfile together.
+
+The header fetches the current star count from GitHub’s public API when opened.
+It keeps the star link without a count while loading, when JavaScript is disabled,
+or if GitHub is unavailable or rate-limits the request. No token or build-time
+star lookup is needed; the website remains statically hosted.

@@ -22,7 +22,7 @@
   <p class="small">Generated from <code>{version}</code>. Search commands, flags, and examples below.</p>
 </div>
 <div class="search-row" role="search" aria-label="Command reference">
-  <Input id="command-search" label="Search commands, flags, examples" bind:value={query} aria-controls="command-results" />
+  <Input id="command-search" label="Search commands" bind:value={query} aria-controls="command-results" />
   {#if query}<Button onclick={() => query = ''}>Clear</Button>{/if}
 </div>
 <p class="small muted" role="status">{matches.length} of {commands.length} commands</p>

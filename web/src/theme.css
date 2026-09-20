@@ -56,10 +56,12 @@ summary { cursor: pointer; color: var(--accent); font-weight: 600; padding-block
 .small { font-size: 0.8rem; }
 .eyebrow { color: var(--hint-color); font-size: 0.7rem; letter-spacing: 0.11em; text-transform: uppercase; }
 .site-header, main, .site-footer { max-width: 1160px; margin-inline: auto; padding-inline: 2rem; }
-.site-header { display: flex; justify-content: space-between; align-items: center; gap: 1rem; min-height: 100px; border-bottom: 1px solid var(--frost-border-color); }
-.wordmark { display: flex; gap: 0.4rem; align-items: center; color: var(--text-color); text-decoration: none; font-weight: 750; font-size: 1.45rem; letter-spacing: -0.065em; }
+.site-header { display: flex; justify-content: space-between; align-items: center; gap: 1.5rem 3rem; min-height: 100px; border-bottom: 1px solid var(--frost-border-color); }
+.wordmark { display: flex; gap: 0.65rem; align-items: center; color: var(--text-color); text-decoration: none; font-weight: 750; font-size: 1.45rem; letter-spacing: -0.065em; }
 .wordmark .muted { color: #8c897e; }
 nav { display: flex; gap: 1.7rem; flex-wrap: wrap; font-size: 0.85rem; }
+.site-header nav { align-items: center; gap: 2rem; }
+.site-header nav a { display: inline-flex; align-items: center; min-height: 44px; }
 nav a { color: var(--hint-color); text-decoration: none; }
 nav a[aria-current] { color: var(--accent); text-decoration: underline; }
 .site-footer { display: flex; justify-content: space-between; gap: 1.5rem; margin-top: 5rem; padding-block: 1.8rem; border-top: 1px solid var(--frost-border-color); font-size: 0.8rem; color: var(--hint-color); }
@@ -165,6 +167,8 @@ nav a[aria-current] { color: var(--accent); text-decoration: underline; }
   .site-header, main, .site-footer { padding-inline: 1.25rem; }
   .site-header { flex-wrap: wrap; padding-block: 1rem; min-height: auto; }
   nav { gap: 1.3rem; }
+  .site-header { row-gap: .5rem; }
+  .site-header nav { width: 100%; gap: .75rem; }
   .hero, .start-section, .principles, .reference-layout { grid-template-columns: 1fr; }
   .hero { gap: 2rem; }
   .hero h1 { font-size: 3.25rem; }
@@ -221,3 +225,6 @@ nav a[aria-current] { color: var(--accent); text-decoration: underline; }
 .construction-notice > span { font-size: .85rem; }
 .release-link { display: inline-block; padding: .3rem .7rem; border: 1px solid var(--glass-border-color); border-radius: 2rem; background: var(--glass-color); color: var(--accent-strong); font-weight: 600; }
 .docs-notice { padding: 1rem; border-left: 3px solid var(--glass-border-color); background: var(--accent-soft); }
+
+.github-stars { display: inline-flex; align-items: center; gap: .5rem; }
+.star-count { color: #376f9b; font-variant-numeric: tabular-nums; white-space: nowrap; }
