@@ -47,7 +47,7 @@ pub(super) fn meta_mtime_secs(meta: &std::fs::Metadata) -> i64 {
         meta.modified()
             .ok()
             .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-            .map_or(0, |d| d.as_secs() as i64)
+            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
     }
 }
 
@@ -257,12 +257,11 @@ pub(super) async fn scan_guest_entries(
     Ok(entries)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
     #[test]
-    #[cfg(unix)]
     fn host_operations_refuse_existing_symlink_ancestors() {
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
