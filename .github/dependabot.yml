@@ -9,39 +9,7 @@ updates:
     schedule:
       interval: weekly
   - package-ecosystem: cargo
-    directory: /components/block
-    schedule:
-      interval: weekly
-  - package-ecosystem: cargo
-    directory: /components/boot
-    schedule:
-      interval: weekly
-  - package-ecosystem: cargo
-    directory: /components/device-transport
-    schedule:
-      interval: weekly
-  - package-ecosystem: cargo
-    directory: /components/fs
-    schedule:
-      interval: weekly
-  - package-ecosystem: cargo
-    directory: /components/mem
-    schedule:
-      interval: weekly
-  - package-ecosystem: cargo
-    directory: /components/network
-    schedule:
-      interval: weekly
-  - package-ecosystem: cargo
-    directory: /components/policy
-    schedule:
-      interval: weekly
-  - package-ecosystem: cargo
-    directory: /components/vmm
-    schedule:
-      interval: weekly
-  - package-ecosystem: cargo
-    directory: /components/vsock
+    directory: /components
     schedule:
       interval: weekly
   - package-ecosystem: github-actions

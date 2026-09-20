@@ -103,7 +103,7 @@ mod tests {
     async fn actor_configures_and_serves_component_mmio() {
         let engine = device_engine().expect("engine builds");
         let component_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../components/block/target/wasm32-wasip3/release/terra_block_component.wasm");
+            .join("../../components/target/wasm32-wasip3/release/terra_block_component.wasm");
         let component = Component::new(
             &engine,
             std::fs::read(component_path).expect("block component built"),
@@ -148,7 +148,7 @@ mod tests {
         let component = Component::new(
             &engine,
             include_bytes!(
-                "../../../../components/block/target/wasm32-wasip3/release/terra_block_component.wasm"
+                "../../../../components/target/wasm32-wasip3/release/terra_block_component.wasm"
             ),
         )
         .expect("component compiles");
@@ -159,7 +159,7 @@ mod tests {
         let router = Component::new(
             &engine,
             include_bytes!(
-                "../../../../components/vmm/target/wasm32-wasip3/release/terra_vmm_component.wasm"
+                "../../../../components/target/wasm32-wasip3/release/terra_vmm_component.wasm"
             ),
         )
         .expect("MMIO router compiles");
@@ -260,7 +260,7 @@ mod tests {
         let component = Component::new(
             &engine,
             include_bytes!(
-                "../../../../components/block/target/wasm32-wasip3/release/terra_block_component.wasm"
+                "../../../../components/target/wasm32-wasip3/release/terra_block_component.wasm"
             ),
         )
         .unwrap();
@@ -326,7 +326,7 @@ mod tests {
         let component = Component::new(
             &engine,
             include_bytes!(
-                "../../../../components/block/target/wasm32-wasip3/release/terra_block_component.wasm"
+                "../../../../components/target/wasm32-wasip3/release/terra_block_component.wasm"
             ),
         )
         .unwrap();

@@ -229,14 +229,20 @@ async fn prepare_x64(mut input: WorkerInput) -> Result<PreparedVmm, String> {
         }))
         .await
         .map_err(|error| error.to_string())?;
-    let devices = worker::assemble_devices(
+    worker::assemble_devices(
         &mut component_runtime,
         &mut input,
         ram_alias.clone(),
         &disks,
-        |kind, index| Ok(ioapic.bind_interrupt(kind, index)),
+        |kind, index| {
+            ioapic
+                .bind_interrupt(kind, index)
+                .map_err(|error| error.to_string())
+        },
     )?;
-    worker::grant_device_shutdown(&mut component_runtime, &devices)?;
+    let failure = component_runtime
+        .mmio_failure_observation()
+        .map_err(|error| error.to_string())?;
     let interrupt_handle = ioapic.clone();
     component_runtime
         .grant_interrupt_shutdown(async move {
@@ -269,7 +275,7 @@ async fn prepare_x64(mut input: WorkerInput) -> Result<PreparedVmm, String> {
             reaper: runners,
             lifecycle,
             deadline: input.deadline,
-            devices,
+            failure,
             teardown,
         },
     })
@@ -560,7 +566,7 @@ async fn prepare_arm64(mut input: WorkerInput) -> Result<PreparedVmm, String> {
             .await
             .map_err(|error| error.to_string())?;
     let ram_alias = partition.ram();
-    let devices = worker::assemble_devices(
+    worker::assemble_devices(
         &mut component_runtime,
         &mut input,
         ram_alias,
@@ -571,7 +577,7 @@ async fn prepare_arm64(mut input: WorkerInput) -> Result<PreparedVmm, String> {
                 .map_err(|error| error.to_string())
         },
     )?;
-    worker::grant_device_shutdown(&mut component_runtime, &devices)?;
+    let failure = component_runtime.mmio_failure_observation()?;
     let lifecycle = component_runtime.lifecycle_notifier();
     let hard_stop = input.hard_stop;
     let (component_runtime, runners) = component_runtime
@@ -588,7 +594,7 @@ async fn prepare_arm64(mut input: WorkerInput) -> Result<PreparedVmm, String> {
             reaper: runners,
             lifecycle,
             deadline: input.deadline,
-            devices,
+            failure,
             teardown,
         },
     })

@@ -259,11 +259,17 @@ impl Mounted {
         let component = Component::new(
             &engine,
             include_bytes!(
-                "../../../../../components/fs/target/wasm32-wasip3/release/terra_fs_component.wasm"
+                "../../../../../components/target/wasm32-wasip3/release/terra_fs_component.wasm"
             ),
         )
         .unwrap();
-        let router = Component::new(&engine, include_bytes!("../../../../../components/vmm/target/wasm32-wasip3/release/terra_vmm_component.wasm")).unwrap();
+        let router = Component::new(
+            &engine,
+            include_bytes!(
+                "../../../../../components/target/wasm32-wasip3/release/terra_vmm_component.wasm"
+            ),
+        )
+        .unwrap();
         let mut host =
             FsHost::with_resource_capacity(DeviceContext::with_ram(ram.clone()), grant, capacity);
         host.io_gate = Some(gate);
@@ -572,7 +578,10 @@ async fn stalled_writes_and_flushes_do_not_block_shutdown() {
         mounted.request(4097, 1, &[]).await;
         let start = std::time::Instant::now();
         let error = mounted.channel.close().unwrap_err();
-        assert!(error.to_string().contains("MMIO device error"), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("MMIO filesystem device error"),
+            "{error:#}"
+        );
         assert!(start.elapsed() < Duration::from_secs(2));
         assert!(
             gate.started.available_permits() > 0,

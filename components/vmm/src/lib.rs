@@ -52,11 +52,16 @@ const MSRS: [(u32, u64); 12] = [
     (0xC000_0103, 0),
 ];
 
-struct DeviceState {
-    next_sequence: u64,
-    writer: Option<StreamWriter<Request>>,
-    replies: Option<StreamReader<Reply>>,
-    closed: bool,
+enum DeviceState {
+    AwaitingReplies {
+        writer: StreamWriter<Request>,
+    },
+    Ready {
+        next_sequence: u64,
+        writer: StreamWriter<Request>,
+        replies: StreamReader<Reply>,
+    },
+    Closed,
 }
 
 struct Device {
@@ -96,9 +101,14 @@ impl MsrBank {
 #[derive(Default)]
 struct Router {
     devices: Vec<Option<Device>>,
-    msrs: Option<Vec<MsrBank>>,
-    powered: Option<Vec<bool>>,
+    vcpus: Option<Vec<Vcpu>>,
     started: bool,
+}
+
+#[derive(Clone)]
+struct Vcpu {
+    msrs: MsrBank,
+    powered: bool,
 }
 
 static ROUTER: LazyLock<Mutex<Router>> = LazyLock::new(|| Mutex::new(Router::default()));
@@ -169,9 +179,10 @@ fn device_state(slot: usize) -> Result<Arc<AsyncMutex<DeviceState>>, Error> {
 
 fn vcpu_bank(router: &mut Router, vcpu: u8) -> Result<&mut MsrBank, Error> {
     router
-        .msrs
+        .vcpus
         .as_mut()
-        .and_then(|banks| banks.get_mut(usize::from(vcpu)))
+        .and_then(|vcpus| vcpus.get_mut(usize::from(vcpu)))
+        .map(|vcpu| &mut vcpu.msrs)
         .ok_or(Error::InvalidVcpu)
 }
 
@@ -183,9 +194,10 @@ fn start_vcpu(router: &mut Router, vcpu: u8) -> Result<(), Error> {
 
 fn powered(router: &mut Router, vcpu: u8) -> Result<&mut bool, Error> {
     router
-        .powered
+        .vcpus
         .as_mut()
-        .and_then(|cpus| cpus.get_mut(usize::from(vcpu)))
+        .and_then(|vcpus| vcpus.get_mut(usize::from(vcpu)))
+        .map(|vcpu| &mut vcpu.powered)
         .ok_or(Error::InvalidVcpu)
 }
 
@@ -225,9 +237,10 @@ fn psci_hvc_for(router: &mut Router, id: u8, hvc: &Hvc) -> Result<platform::Comp
                     return Ok(platform::Completion::HvcReturn(-3));
                 };
                 let Some(powered) = router
-                    .powered
+                    .vcpus
                     .as_mut()
-                    .and_then(|cpus| cpus.get_mut(usize::from(target)))
+                    .and_then(|vcpus| vcpus.get_mut(usize::from(target)))
+                    .map(|vcpu| &mut vcpu.powered)
                 else {
                     return Ok(platform::Completion::HvcReturn(-3));
                 };
@@ -239,9 +252,10 @@ fn psci_hvc_for(router: &mut Router, id: u8, hvc: &Hvc) -> Result<platform::Comp
                 return Ok(platform::Completion::HvcReturn(-3));
             };
             let Some(powered) = router
-                .powered
+                .vcpus
                 .as_mut()
-                .and_then(|cpus| cpus.get_mut(usize::from(target)))
+                .and_then(|vcpus| vcpus.get_mut(usize::from(target)))
+                .map(|vcpu| &mut vcpu.powered)
             else {
                 return Ok(platform::Completion::HvcReturn(-3));
             };
@@ -281,9 +295,7 @@ fn psci_start_result_for(
 }
 
 fn mark_closed(state: &mut DeviceState) {
-    state.closed = true;
-    state.writer = None;
-    state.replies = None;
+    *state = DeviceState::Closed;
 }
 
 enum ReplySequence {
@@ -309,11 +321,29 @@ async fn dispatch(
 ) -> Result<Reply, Error> {
     let state = device_state(slot)?;
     let mut state = state.lock().await;
-    if state.closed {
-        return Err(Error::Closed);
-    }
-    let sequence = state.next_sequence;
-    state.next_sequence = state.next_sequence.wrapping_add(1);
+    dispatch_state(&mut state, operation, offset, width, value).await
+}
+
+async fn dispatch_state(
+    state: &mut DeviceState,
+    operation: Operation,
+    offset: u64,
+    width: u8,
+    value: u64,
+) -> Result<Reply, Error> {
+    let (sequence, writer, replies) = match state {
+        DeviceState::AwaitingReplies { .. } => return Err(Error::Busy),
+        DeviceState::Ready {
+            next_sequence,
+            writer,
+            replies,
+        } => {
+            let sequence = *next_sequence;
+            *next_sequence = next_sequence.wrapping_add(1);
+            (sequence, writer, replies)
+        }
+        DeviceState::Closed => return Err(Error::Closed),
+    };
     let request = Request {
         sequence,
         operation,
@@ -321,29 +351,23 @@ async fn dispatch(
         width,
         value,
     };
-    let unwritten = match state.writer.as_mut() {
-        Some(writer) => writer.write_all(vec![request]).await,
-        None => return Err(Error::Closed),
-    };
+    let unwritten = writer.write_all(vec![request]).await;
     if !unwritten.is_empty() {
-        mark_closed(&mut state);
+        mark_closed(state);
         return Err(Error::Closed);
     }
     for stale_replies in 0..=MAX_STALE_REPLIES {
-        let (result, replies) = match state.replies.as_mut() {
-            Some(replies) => replies.read(Vec::with_capacity(1)).await,
-            None => return Err(Error::Busy),
-        };
+        let (result, replies) = replies.read(Vec::with_capacity(1)).await;
         let reply = match result {
             StreamResult::Complete(1) => {
                 let Some(reply) = replies.into_iter().next() else {
-                    mark_closed(&mut state);
+                    mark_closed(state);
                     return Err(Error::Device);
                 };
                 reply
             }
             StreamResult::Complete(_) | StreamResult::Dropped | StreamResult::Cancelled => {
-                mark_closed(&mut state);
+                mark_closed(state);
                 return Err(Error::Closed);
             }
         };
@@ -351,7 +375,7 @@ async fn dispatch(
             ReplySequence::Current => return Ok(reply),
             ReplySequence::Stale if stale_replies < MAX_STALE_REPLIES => {}
             ReplySequence::Stale | ReplySequence::Future => {
-                mark_closed(&mut state);
+                mark_closed(state);
                 return Err(Error::Device);
             }
         }
@@ -506,10 +530,7 @@ async fn run_vcpu(cpu: platform::Vcpu, id: u8) -> Result<(), Error> {
     loop {
         let exit = match cpu.resume(completion).await {
             Ok(exit) => exit,
-            Err(platform::Error::Cancelled) => {
-                lifecycle::vcpu_finished();
-                return Ok(());
-            }
+            Err(platform::Error::Cancelled) => return Ok(()),
             Err(platform::Error::Unavailable | platform::Error::BadExit) => {
                 return Err(Error::Device);
             }
@@ -518,10 +539,7 @@ async fn run_vcpu(cpu: platform::Vcpu, id: u8) -> Result<(), Error> {
             platform::Exit::Halt | platform::Exit::Interrupted | platform::Exit::PioWrite(_) => {
                 platform::Completion::Reenter
             }
-            platform::Exit::Shutdown | platform::Exit::Stopped => {
-                lifecycle::vcpu_finished();
-                return Ok(());
-            }
+            platform::Exit::Shutdown | platform::Exit::Stopped => return Ok(()),
             platform::Exit::MmioRead(request) => platform::Completion::MmioRead(
                 vcpu_access(request.address, request.width, 0, false).await?,
             ),
@@ -549,10 +567,7 @@ async fn run_vcpu(cpu: platform::Vcpu, id: u8) -> Result<(), Error> {
             platform::Exit::ArmException(request) => {
                 match handle_arm_exception(&cpu, id, request).await {
                     Ok(completion) => completion,
-                    Err(Error::Closed) => {
-                        lifecycle::vcpu_finished();
-                        return Ok(());
-                    }
+                    Err(Error::Closed) => return Ok(()),
                     Err(Error::BadArmExit) => platform::Completion::ArmRead(platform::ArmRead {
                         register: None,
                         value: 0,
@@ -640,11 +655,10 @@ impl exports::terra::mmio::interrupts::Guest for Dispatcher {
     }
 
     fn device_irq_line(
-        kind: terra::mmio::machine_types::DeviceKind,
-        ordinal: u32,
+        slot: u8,
         asserted: bool,
     ) -> Result<Option<exports::terra::mmio::interrupts::IrqLevel>, Error> {
-        machine::device_irq_line(kind, ordinal, asserted).map_err(|_| Error::Device)
+        machine::device_irq_line(slot, asserted).map_err(|_| Error::Device)
     }
 
     fn stage_ioapic() -> Result<(), Error> {
@@ -681,15 +695,6 @@ impl exports::terra::mmio::interrupts::Guest for Dispatcher {
             .map_err(ioapic_error)
     }
 
-    fn ioapic_device_line(
-        kind: terra::mmio::machine_types::DeviceKind,
-        ordinal: u32,
-        asserted: bool,
-    ) -> Result<Vec<exports::terra::mmio::interrupts::X86Interrupt>, Error> {
-        let slot = machine::device_slot(kind, ordinal).ok_or(Error::InvalidSlot)?;
-        <Self as exports::terra::mmio::interrupts::Guest>::ioapic_line(slot, asserted)
-    }
-
     fn ioapic_eoi(
         vector: u8,
     ) -> Result<Vec<exports::terra::mmio::interrupts::X86Interrupt>, Error> {
@@ -720,12 +725,7 @@ fn open_device(slot: u32, base: u64, size: u64) -> Result<StreamReader<Request>,
     router.devices[slot] = Some(Device {
         base,
         size,
-        state: Arc::new(AsyncMutex::new(DeviceState {
-            next_sequence: 0,
-            writer: Some(writer),
-            replies: None,
-            closed: false,
-        })),
+        state: Arc::new(AsyncMutex::new(DeviceState::AwaitingReplies { writer })),
     });
     Ok(reader)
 }
@@ -734,14 +734,21 @@ async fn attach_replies(slot: u32, replies: StreamReader<Reply>) -> Result<(), E
     let slot = usize::try_from(slot).map_err(|_| Error::InvalidSlot)?;
     let state = device_state(slot)?;
     let mut state = state.lock().await;
-    if state.closed {
-        return Err(Error::Closed);
+    match std::mem::replace(&mut *state, DeviceState::Closed) {
+        DeviceState::AwaitingReplies { writer } => {
+            *state = DeviceState::Ready {
+                next_sequence: 0,
+                writer,
+                replies,
+            };
+            Ok(())
+        }
+        ready @ DeviceState::Ready { .. } => {
+            *state = ready;
+            Err(Error::Busy)
+        }
+        DeviceState::Closed => Err(Error::Closed),
     }
-    if state.replies.is_some() {
-        return Err(Error::Busy);
-    }
-    state.replies = Some(replies);
-    Ok(())
 }
 
 impl Guest for Dispatcher {
@@ -751,14 +758,18 @@ impl Guest for Dispatcher {
             return Err(Error::InvalidVcpu);
         }
         let mut router = router();
-        if router.started || router.msrs.is_some() {
+        if router.started || router.vcpus.is_some() {
             return Err(Error::Busy);
         }
-        router.msrs = Some(vec![MsrBank::new(); count]);
-        let mut powered = vec![false; count];
-        powered[0] = true;
-        router.powered = Some(powered);
-        lifecycle::configure_vcpus(u8::try_from(count).map_err(|_| Error::InvalidVcpu)?);
+        let mut vcpus = vec![
+            Vcpu {
+                msrs: MsrBank::new(),
+                powered: false,
+            };
+            count
+        ];
+        vcpus[0].powered = true;
+        router.vcpus = Some(vcpus);
         Ok(())
     }
 
@@ -831,12 +842,7 @@ mod tests {
         Device {
             base,
             size,
-            state: Arc::new(AsyncMutex::new(DeviceState {
-                next_sequence: 0,
-                writer: None,
-                replies: None,
-                closed: false,
-            })),
+            state: Arc::new(AsyncMutex::new(DeviceState::Closed)),
         }
     }
 
@@ -844,8 +850,7 @@ mod tests {
     fn routing_rejects_invalid_width_and_outside_ranges() {
         let router = Router {
             devices: vec![Some(device(0x1000, 0x200))],
-            msrs: None,
-            powered: None,
+            vcpus: None,
             started: false,
         };
         assert_eq!(device_for_address(&router, 0x1000, 3), Err(Error::BadWidth));
@@ -858,8 +863,7 @@ mod tests {
     fn routing_skips_devices_above_the_address() {
         let router = Router {
             devices: vec![Some(device(0x2000, 0x200)), Some(device(0x1000, 0x200))],
-            msrs: None,
-            powered: None,
+            vcpus: None,
             started: false,
         };
         assert_eq!(device_for_address(&router, 0x800, 4), Err(Error::Unmapped));
@@ -870,8 +874,7 @@ mod tests {
     fn remapping_rejects_overlap_and_overflow() {
         let router = Router {
             devices: vec![Some(device(0x1000, 0x200)), Some(device(0x2000, 0x200))],
-            msrs: None,
-            powered: None,
+            vcpus: None,
             started: false,
         };
         assert!(device_range_overlaps(&router, Some(0), 0x1f00, 0x2100));
@@ -960,8 +963,16 @@ mod tests {
     fn psci_updates_cpu_state_only_after_native_start_succeeds() {
         let mut router = Router {
             devices: Vec::new(),
-            msrs: Some(vec![MsrBank::new(), MsrBank::new()]),
-            powered: Some(vec![true, false]),
+            vcpus: Some(vec![
+                Vcpu {
+                    msrs: MsrBank::new(),
+                    powered: true,
+                },
+                Vcpu {
+                    msrs: MsrBank::new(),
+                    powered: false,
+                },
+            ]),
             started: true,
         };
         let start = psci_hvc_for(
@@ -979,7 +990,7 @@ mod tests {
             panic!("expected CPU start");
         };
         assert_eq!((start.target, start.entry, start.context), (1, 0x8000, 7));
-        assert!(!router.powered.as_ref().expect("CPU state")[1]);
+        assert!(!router.vcpus.as_ref().expect("CPU state")[1].powered);
         assert!(matches!(
             psci_start_result_for(
                 &mut router,
@@ -990,7 +1001,7 @@ mod tests {
             ),
             Ok(platform::Completion::HvcReturn(-3))
         ));
-        assert!(!router.powered.as_ref().expect("CPU state")[1]);
+        assert!(!router.vcpus.as_ref().expect("CPU state")[1].powered);
         assert!(matches!(
             psci_start_result_for(
                 &mut router,
@@ -1001,15 +1012,17 @@ mod tests {
             ),
             Ok(platform::Completion::HvcReturn(0))
         ));
-        assert!(router.powered.as_ref().expect("CPU state")[1]);
+        assert!(router.vcpus.as_ref().expect("CPU state")[1].powered);
     }
 
     #[test]
     fn psci_rejects_an_invalid_cpu_without_failing_the_router() {
         let mut router = Router {
             devices: Vec::new(),
-            msrs: Some(vec![MsrBank::new()]),
-            powered: Some(vec![true]),
+            vcpus: Some(vec![Vcpu {
+                msrs: MsrBank::new(),
+                powered: true,
+            }]),
             started: true,
         };
         let completion = psci_hvc_for(

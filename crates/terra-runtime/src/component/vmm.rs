@@ -27,10 +27,9 @@ struct Pending {
     reply: mpsc::SyncSender<Completion>,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum ProtocolPhase {
+enum VcpuState {
     AwaitingStart,
-    Running,
+    AwaitingCompletion(Pending),
 }
 
 pub struct NativeVcpu {
@@ -76,8 +75,7 @@ impl NativeVcpu {
 
 struct Rendezvous {
     exits: tokio::sync::mpsc::Receiver<Pending>,
-    pending: Option<Pending>,
-    phase: ProtocolPhase,
+    state: VcpuState,
 }
 
 pub struct Vcpu(Option<Rendezvous>);
@@ -88,8 +86,7 @@ fn vcpu_channel() -> (NativeVcpu, Vcpu) {
         NativeVcpu { sender },
         Vcpu(Some(Rendezvous {
             exits,
-            pending: None,
-            phase: ProtocolPhase::AwaitingStart,
+            state: VcpuState::AwaitingStart,
         })),
     )
 }
@@ -205,42 +202,41 @@ impl<T: Send + 'static> platform::HostVcpuWithStore<T> for Platform {
                 .take()
                 .ok_or_else(|| wasmtime::Error::msg("vCPU resume already pending"))
         })?;
-        if let Some(pending) = rendezvous.pending.take() {
-            let valid = if matches!(
-                (&pending.exit, &completion),
-                (
-                    Exit::ArmException(_) | Exit::ArmRegisterValue(_),
-                    Completion::CpuStart(_)
-                )
-            ) {
-                accessor.with(|mut store| {
-                    let (config, ram) = store.get().completion_grant()?;
-                    Ok::<_, wasmtime::Error>(accepts_completion(
-                        &pending.exit,
-                        &completion,
-                        Some((config, &ram)),
-                    ))
-                })?
-            } else {
-                accepts_completion(&pending.exit, &completion, None)
-            };
-            if !valid {
-                return Ok(Err(Error::BadExit));
+        match rendezvous.state {
+            VcpuState::AwaitingCompletion(pending) => {
+                let valid = if matches!(
+                    (&pending.exit, &completion),
+                    (
+                        Exit::ArmException(_) | Exit::ArmRegisterValue(_),
+                        Completion::CpuStart(_)
+                    )
+                ) {
+                    accessor.with(|mut store| {
+                        let (config, ram) = store.get().completion_grant()?;
+                        Ok::<_, wasmtime::Error>(accepts_completion(
+                            &pending.exit,
+                            &completion,
+                            Some((config, &ram)),
+                        ))
+                    })?
+                } else {
+                    accepts_completion(&pending.exit, &completion, None)
+                };
+                if !valid {
+                    return Ok(Err(Error::BadExit));
+                }
+                if pending.reply.send(completion).is_err() {
+                    return Ok(Err(Error::Cancelled));
+                }
             }
-            if pending.reply.send(completion).is_err() {
-                return Ok(Err(Error::Cancelled));
-            }
-        } else if rendezvous.phase != ProtocolPhase::AwaitingStart
-            || !matches!(completion, Completion::Start)
-        {
-            return Ok(Err(Error::BadExit));
+            VcpuState::AwaitingStart if matches!(completion, Completion::Start) => {}
+            VcpuState::AwaitingStart => return Ok(Err(Error::BadExit)),
         }
-        rendezvous.phase = ProtocolPhase::Running;
         let Some(pending) = rendezvous.exits.recv().await else {
             return Ok(Ok(Exit::Stopped));
         };
         let exit = pending.exit;
-        rendezvous.pending = Some(pending);
+        rendezvous.state = VcpuState::AwaitingCompletion(pending);
         accessor.with(|mut store| {
             store.get().table.get_mut(&resource)?.0 = Some(rendezvous);
             Ok::<(), wasmtime::Error>(())

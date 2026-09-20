@@ -1,16 +1,33 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
-use terra_protocol::SyncDirection;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum Endpoint {
-    Guest {
-        path: String,
-        has_trailing_separator: bool,
+pub(super) struct GuestEndpoint {
+    pub(super) path: String,
+    pub(super) has_trailing_separator: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct HostEndpoint {
+    pub(super) path: PathBuf,
+    pub(super) has_trailing_separator: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Endpoint {
+    Guest(GuestEndpoint),
+    Host(HostEndpoint),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Transfer {
+    Upload {
+        host: HostEndpoint,
+        guest: GuestEndpoint,
     },
-    Host {
-        path: PathBuf,
-        has_trailing_separator: bool,
+    Download {
+        guest: GuestEndpoint,
+        host: HostEndpoint,
     },
 }
 
@@ -29,10 +46,10 @@ fn parse_endpoint(raw: &str) -> Result<Endpoint> {
             !path.is_empty(),
             "guest path is empty after removing trailing separators; use 'box:/' or ':/' for the guest root"
         );
-        return Ok(Endpoint::Guest {
+        return Ok(Endpoint::Guest(GuestEndpoint {
             path: path.to_owned(),
             has_trailing_separator: raw.ends_with('/'),
-        });
+        }));
     }
 
     let is_windows_drive =
@@ -52,33 +69,29 @@ fn parse_endpoint(raw: &str) -> Result<Endpoint> {
     }
 
     let has_trailing_separator = raw.ends_with('/') || (cfg!(windows) && raw.ends_with('\\'));
-    Ok(Endpoint::Host {
+    Ok(Endpoint::Host(HostEndpoint {
         path: PathBuf::from(raw).components().collect(),
         has_trailing_separator,
-    })
+    }))
 }
 
-pub(super) fn parse_endpoints(src: &str, dst: &str) -> Result<(Endpoint, Endpoint, SyncDirection)> {
+pub(super) fn parse_endpoints(src: &str, dst: &str) -> Result<Transfer> {
     let src_endpoint = parse_endpoint(src).context("parsing source endpoint")?;
     let dst_endpoint = parse_endpoint(dst).context("parsing destination endpoint")?;
 
-    match (&src_endpoint, &dst_endpoint) {
-        (Endpoint::Guest { .. }, Endpoint::Guest { .. }) => {
+    match (src_endpoint, dst_endpoint) {
+        (Endpoint::Guest(_), Endpoint::Guest(_)) => {
             anyhow::bail!(
                 "sync operates between host and a box; both source and destination cannot be inside the box"
             );
         }
-        (Endpoint::Host { .. }, Endpoint::Host { .. }) => {
+        (Endpoint::Host(_), Endpoint::Host(_)) => {
             anyhow::bail!(
                 "sync operates between host and a box; exactly one of source and destination must be inside the box ('box:/path' or ':/path')"
             );
         }
-        (Endpoint::Host { .. }, Endpoint::Guest { .. }) => {
-            Ok((src_endpoint, dst_endpoint, SyncDirection::HostToGuest))
-        }
-        (Endpoint::Guest { .. }, Endpoint::Host { .. }) => {
-            Ok((src_endpoint, dst_endpoint, SyncDirection::GuestToHost))
-        }
+        (Endpoint::Host(host), Endpoint::Guest(guest)) => Ok(Transfer::Upload { host, guest }),
+        (Endpoint::Guest(guest), Endpoint::Host(host)) => Ok(Transfer::Download { guest, host }),
     }
 }
 
@@ -120,24 +133,24 @@ mod tests {
     fn parse_endpoint_identifies_guest_and_host() {
         assert_eq!(
             parse_endpoint("box:/app/out").unwrap(),
-            Endpoint::Guest {
+            Endpoint::Guest(GuestEndpoint {
                 path: "/app/out".to_string(),
                 has_trailing_separator: false,
-            }
+            })
         );
         assert_eq!(
             parse_endpoint(":/app/out/").unwrap(),
-            Endpoint::Guest {
+            Endpoint::Guest(GuestEndpoint {
                 path: "/app/out".to_string(),
                 has_trailing_separator: true,
-            }
+            })
         );
         assert_eq!(
             parse_endpoint("./local/path/").unwrap(),
-            Endpoint::Host {
+            Endpoint::Host(HostEndpoint {
                 path: PathBuf::from("./local/path/"),
                 has_trailing_separator: true,
-            }
+            })
         );
     }
 
@@ -156,10 +169,10 @@ mod tests {
         for root in ["box:/", ":/"] {
             assert_eq!(
                 parse_endpoint(root).unwrap(),
-                Endpoint::Guest {
+                Endpoint::Guest(GuestEndpoint {
                     path: "/".into(),
                     has_trailing_separator: true,
-                }
+                })
             );
         }
     }
@@ -174,8 +187,14 @@ mod tests {
     fn exactly_one_guest_endpoint_required() {
         assert!(parse_endpoints("box:/a", "box:/b").is_err());
         assert!(parse_endpoints("./a", "./b").is_err());
-        assert!(parse_endpoints("./a", "box:/b").is_ok());
-        assert!(parse_endpoints(":/a", "./b").is_ok());
+        assert!(matches!(
+            parse_endpoints("./a", "box:/b"),
+            Ok(Transfer::Upload { .. })
+        ));
+        assert!(matches!(
+            parse_endpoints(":/a", "./b"),
+            Ok(Transfer::Download { .. })
+        ));
     }
 
     #[test]

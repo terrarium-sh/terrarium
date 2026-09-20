@@ -100,10 +100,10 @@ async fn dropping_a_temporary_store_does_not_start_box_teardown() {
     let engine = device_engine().expect("engine");
     let mut root = BoxRuntime::new(&engine, BoxHost::new()).expect("box");
     let (closed, mut closure) = tokio::sync::oneshot::channel();
-    root.grant_device_shutdown(vec![DeviceShutdown::new(DeviceKind::Block, async move {
+    root.add_device_shutdown(DeviceShutdown::new(DeviceKind::Block, async move {
         closed.send(()).expect("observe close");
         Ok(())
-    })])
+    }))
     .expect("device cleanup");
     drop(root.new_child(crate::box_runtime::RootHost::new()));
 
@@ -509,7 +509,7 @@ async fn competing_failures_publish_the_primary_error_before_native_cleanup() {
     let router = wasmtime::component::Component::new(
         &engine,
         include_bytes!(
-            "../../../../components/vmm/target/wasm32-wasip3/release/terra_vmm_component.wasm"
+            "../../../../components/target/wasm32-wasip3/release/terra_vmm_component.wasm"
         ),
     )
     .unwrap();
@@ -518,11 +518,11 @@ async fn competing_failures_publish_the_primary_error_before_native_cleanup() {
     let outcome = root.lifecycle_notifier().subscribe();
     let (entered, started) = tokio::sync::oneshot::channel();
     let (release, released) = std::sync::mpsc::channel();
-    root.grant_device_shutdown(vec![DeviceShutdown::new(DeviceKind::Block, async move {
+    root.add_device_shutdown(DeviceShutdown::new(DeviceKind::Block, async move {
         entered.send(()).unwrap();
         released.recv_timeout(Duration::from_secs(2)).unwrap();
         Err("cleanup failed".to_owned())
-    })])
+    }))
     .unwrap();
     let barrier = Arc::new(tokio::sync::Barrier::new(2));
     let child_barrier = Arc::clone(&barrier);
@@ -659,11 +659,11 @@ async fn dropping_root_starts_cleanup_without_waiting_for_it_or_the_last_observe
     let (entered, started) = std::sync::mpsc::channel();
     let (release, blocked) = std::sync::mpsc::channel();
     teardown
-        .install_devices(vec![DeviceShutdown::new(DeviceKind::Block, async move {
+        .install_device(DeviceShutdown::new(DeviceKind::Block, async move {
             entered.send(()).unwrap();
             blocked.recv_timeout(Duration::from_secs(5)).unwrap();
             Ok(())
-        })])
+        }))
         .unwrap();
     let (dropped, done) = std::sync::mpsc::channel();
     let caller = std::thread::spawn(move || {

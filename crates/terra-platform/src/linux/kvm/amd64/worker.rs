@@ -66,16 +66,21 @@ pub async fn prepare(mut input: WorkerInput) -> Result<PreparedVmm, KvmError> {
         })
         .await
         .map_err(|error| KvmError::Component(error.to_string()))?;
-    let devices = crate::worker::assemble_devices(
+    crate::worker::assemble_devices(
         &mut component_runtime,
         &mut input,
         machine.ram(),
         &disks,
-        |kind, index| Ok(interrupts.bind_interrupt(kind, index)),
+        |kind, index| {
+            interrupts
+                .bind_interrupt(kind, index)
+                .map_err(|error| error.to_string())
+        },
     )
     .map_err(KvmError::Component)?;
-    crate::worker::grant_device_shutdown(&mut component_runtime, &devices)
-        .map_err(KvmError::Component)?;
+    let failure = component_runtime
+        .mmio_failure_observation()
+        .map_err(|error| KvmError::Component(error.to_string()))?;
     component_runtime
         .grant_interrupt_shutdown(async move {
             interrupts.close().await.map_err(|error| error.to_string())
@@ -97,7 +102,7 @@ pub async fn prepare(mut input: WorkerInput) -> Result<PreparedVmm, KvmError> {
             reaper: runners,
             lifecycle,
             deadline: input.deadline,
-            devices,
+            failure,
             teardown,
         },
     })

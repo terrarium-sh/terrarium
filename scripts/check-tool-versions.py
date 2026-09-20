@@ -30,7 +30,7 @@ sources = [
     *sorted((ROOT / ".github/workflows").glob("*.yml")),
     ROOT / "scripts/build-host.ps1",
     ROOT / "README.dev.md",
-    *sorted((ROOT / "components").glob("*/Cargo.toml")),
+    ROOT / "components/Cargo.toml",
 ]
 patterns = {
     "nightly": re.compile(r"nightly-[0-9-]+"),

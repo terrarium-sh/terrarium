@@ -111,7 +111,7 @@ mod tests {
     async fn channel() -> crate::component::StandaloneDevice {
         let engine = device_engine().expect("engine builds");
         let component_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../components/mem/target/wasm32-wasip3/release/terra_mem_component.wasm");
+            .join("../../components/target/wasm32-wasip3/release/terra_mem_component.wasm");
         let component = Component::new(
             &engine,
             std::fs::read(component_path).expect("memory component built"),
@@ -145,7 +145,7 @@ mod tests {
         let component = Component::new(
             &engine,
             include_bytes!(
-                "../../../../components/mem/target/wasm32-wasip3/release/terra_mem_component.wasm"
+                "../../../../components/target/wasm32-wasip3/release/terra_mem_component.wasm"
             ),
         )
         .expect("component compiles");
@@ -192,7 +192,7 @@ mod tests {
         let component = Component::new(
             &engine,
             include_bytes!(
-                "../../../../components/mem/target/wasm32-wasip3/release/terra_mem_component.wasm"
+                "../../../../components/target/wasm32-wasip3/release/terra_mem_component.wasm"
             ),
         )
         .unwrap();

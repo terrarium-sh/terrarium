@@ -1,0 +1,27 @@
+[workspace]
+resolver = "3"
+members = ["block", "boot", "device-transport", "fs", "mem", "network", "policy", "vmm", "vsock"]
+exclude = ["vsock-device"]
+
+[workspace.dependencies]
+wit-bindgen = "=0.62.0"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+warnings = "warn"
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
+[profile.release]
+overflow-checks = true
+panic = "abort"

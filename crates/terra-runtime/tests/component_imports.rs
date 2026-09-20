@@ -91,7 +91,7 @@ fn compiled_components_import_only_their_declared_capabilities() {
     ];
     for (name, capabilities) in components {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
-            "../../components/{name}/target/wasm32-wasip3/release/terra_{name}_component.wasm"
+            "../../components/target/wasm32-wasip3/release/terra_{name}_component.wasm"
         ));
         let component = Component::from_file(&engine, path).expect("built component");
         let actual = component

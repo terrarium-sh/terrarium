@@ -11,9 +11,8 @@ fn filesystem_descriptor_methods_link_at_wasi_031() {
     let engine = device_engine().expect("device engine");
     let linker = fs_component_linker::<terra_runtime::component::fs::host::FsHost>(&engine)
         .expect("filesystem linker");
-    let component = include_bytes!(
-        "../../../components/fs/target/wasm32-wasip3/release/terra_fs_component.wasm"
-    );
+    let component =
+        include_bytes!("../../../components/target/wasm32-wasip3/release/terra_fs_component.wasm");
 
     assert!(
         component

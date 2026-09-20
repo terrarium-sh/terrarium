@@ -123,11 +123,7 @@ pub fn grant_shared(
             .await?
         })
     });
-    crate::component::vmm::mmio::MmioDevice::grant_worker(
-        runtime,
-        crate::component::vmm::machine::DeviceKind::Fs,
-        setup,
-    )
+    runtime.grant_device_setup(crate::component::vmm::machine::DeviceKind::Fs, setup)
 }
 
 async fn create_worker(

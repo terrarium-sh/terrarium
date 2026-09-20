@@ -7,7 +7,7 @@ use terra_runtime::component::vmm::{
     boot::BootEntry,
     virtualization::{Architecture, MachineConfig, PreparedMachine, VirtualMachine},
 };
-use terra_runtime::engine::{DeviceHost, terra::host::memory::Host};
+use terra_runtime::engine::{DeviceContext, terra::host::memory::Host};
 
 #[derive(Arbitrary, Debug)]
 struct Input {
@@ -25,7 +25,7 @@ impl VirtualMachine for Machine {
 }
 
 fuzz_target!(|input: Input| {
-    let Some(mut host) = DeviceHost::new(4096) else {
+    let Some(mut host) = DeviceContext::new(4096) else {
         return;
     };
     let Ok(before) = host.read(0, 4096) else {

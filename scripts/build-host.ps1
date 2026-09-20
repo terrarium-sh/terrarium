@@ -47,9 +47,9 @@ Invoke-Native rustup toolchain install $componentToolchain --profile minimal --t
 Invoke-Native cargo "+$componentToolchain" install wasm-tools --version 1.248.0 --locked
 
 foreach ($component in $components) {
-    Invoke-Native cargo "+$componentToolchain" build --locked --release --target wasm32-wasip3 --manifest-path "components/$component/Cargo.toml"
-    Invoke-Native wasm-tools validate --features cm-async "components/$component/target/wasm32-wasip3/release/terra_$($component)_component.wasm"
-    $precompileArguments = @("run", "--locked", "--release", "--target", $Target, "-p", "terra-runtime", "--features", "compiler", "--example", "precompile-component", "--", "components/$component/target/wasm32-wasip3/release/terra_$($component)_component.wasm", "build/terra-$component-component.cwasm")
+    Invoke-Native cargo "+$componentToolchain" build --locked --release --target wasm32-wasip3 --manifest-path components/Cargo.toml --package "terra-$component-component"
+    Invoke-Native wasm-tools validate --features cm-async "components/target/wasm32-wasip3/release/terra_$($component)_component.wasm"
+    $precompileArguments = @("run", "--locked", "--release", "--target", $Target, "-p", "terra-runtime", "--features", "compiler", "--example", "precompile-component", "--", "components/target/wasm32-wasip3/release/terra_$($component)_component.wasm", "build/terra-$component-component.cwasm")
     if ($component -eq "policy") {
         $precompileArguments += "--policy"
     }

@@ -70,7 +70,8 @@ ROOTFS_IMG_MIB := 16
 COMPONENTS := block vsock network fs mem boot vmm policy
 COMPONENT_TARGETS := $(addprefix component-,$(COMPONENTS))
 COMPONENT_AOT_TARGETS := $(addsuffix -aot,$(COMPONENT_TARGETS))
-COMPONENT_MANIFESTS := components/device-transport/Cargo.toml $(addprefix components/,$(addsuffix /Cargo.toml,$(COMPONENTS)))
+COMPONENT_MANIFEST := components/Cargo.toml
+COMPONENT_WASM_DIR := components/target/wasm32-wasip3/release
 
 .PHONY: $(COMPONENT_TARGETS) $(COMPONENT_AOT_TARGETS) verify-source verify-host-components guest-assets check-guest-assets host-build host-dist source-dist verify-wit build verify verify-components verify-workspace dist man clean test-component-boot test-component-vmm test-install check-zig
 
@@ -283,8 +284,8 @@ host-build: check-guest-assets $(COMPONENT_AOT_TARGETS)
 test-component-vmm: dist
 	TERRA_BIN=$(abspath $(DIST)/terra) $(CARGO_LOCKED) test -p terra --test boot --test memory -- --ignored
 
-## Components use their pinned nightly wasm toolchain outside the native
-## workspace, then the trusted native compiler produces each embedded AOT blob.
+## Components use their pinned nightly wasm toolchain in their own workspace,
+## then the trusted native compiler produces each embedded AOT blob.
 BLOCK_COMPONENT_AOT := $(BUILD)/terra-block-component.cwasm
 verify-wit:
 	python3 scripts/check-wit-links.py
@@ -292,12 +293,12 @@ verify-wit:
 $(COMPONENT_TARGETS): verify-wit
 
 $(COMPONENT_TARGETS): component-%:
-	RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO_LOCKED) build --release --target wasm32-wasip3 --manifest-path components/$*/Cargo.toml
-	wasm-tools validate --features cm-async components/$*/target/wasm32-wasip3/release/terra_$*_component.wasm
+	RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO_LOCKED) build --release --target wasm32-wasip3 --manifest-path $(COMPONENT_MANIFEST) -p terra-$*-component
+	wasm-tools validate --features cm-async $(COMPONENT_WASM_DIR)/terra_$*_component.wasm
 
 $(COMPONENT_AOT_TARGETS): component-%-aot: component-%
 	mkdir -p $(BUILD)
-	$(CARGO_LOCKED) run --target $(TERRA_TARGET) -p terra-runtime --features compiler --example precompile-component -- components/$*/target/wasm32-wasip3/release/terra_$*_component.wasm $(BUILD)/terra-$*-component.cwasm $(if $(filter policy,$*),--policy,)
+	$(CARGO_LOCKED) run --target $(TERRA_TARGET) -p terra-runtime --features compiler --example precompile-component -- $(COMPONENT_WASM_DIR)/terra_$*_component.wasm $(BUILD)/terra-$*-component.cwasm $(if $(filter policy,$*),--policy,)
 
 test-component-boot: $(COMPONENT_AOT_TARGETS) $(KERNEL_GZ) $(ROOTFS_IMG) $(BOOT_IMG)
 	$(CARGO_LOCKED) test -p terra-platform --lib -- --ignored --nocapture
@@ -317,7 +318,7 @@ verify-source: verify-wit
 	scripts/test-install.sh
 	$(CARGO) fmt --all -- --check
 	$(CARGO) fmt --manifest-path fuzz/Cargo.toml -- --check
-	set -e; for manifest in $(COMPONENT_MANIFESTS); do RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO) fmt --manifest-path $$manifest -- --check; done
+	RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO) fmt --manifest-path $(COMPONENT_MANIFEST) -- --check
 
 verify-workspace: verify-source
 	$(CARGO_LOCKED) clippy --workspace --all-targets --target $(MUSL) -- -D warnings
@@ -335,10 +336,10 @@ verify-components: $(COMPONENT_AOT_TARGETS) $(KERNEL_GZ) $(ROOTFS_IMG) $(VOLUME_
 verify-host-components: check-guest-assets $(COMPONENT_AOT_TARGETS)
 
 verify-components verify-host-components:
-	set -e; for manifest in $(COMPONENT_MANIFESTS); do RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO) fmt --manifest-path $$manifest -- --check; done
-	set -e; for manifest in $(COMPONENT_MANIFESTS); do RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO_LOCKED) clippy --target wasm32-wasip3 --manifest-path $$manifest -- -D warnings; done
-	set -e; for manifest in $(COMPONENT_MANIFESTS); do RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO_LOCKED) clippy --all-targets --target $(NATIVE) --manifest-path $$manifest -- -D warnings; done
-	set -e; for manifest in $(COMPONENT_MANIFESTS); do RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO_LOCKED) test --target $(NATIVE) --manifest-path $$manifest; done
+	RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO) fmt --manifest-path $(COMPONENT_MANIFEST) -- --check
+	RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO_LOCKED) clippy --workspace --target wasm32-wasip3 --manifest-path $(COMPONENT_MANIFEST) -- -D warnings
+	RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO_LOCKED) clippy --workspace --all-targets --target $(NATIVE) --manifest-path $(COMPONENT_MANIFEST) -- -D warnings
+	RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO_LOCKED) test --workspace --target $(NATIVE) --manifest-path $(COMPONENT_MANIFEST)
 
 check-zig:
 	@test "$$(zig version)" = "$(ZIG_VERSION)" || { echo "need Zig $(ZIG_VERSION), found $$(zig version)" >&2; exit 1; }

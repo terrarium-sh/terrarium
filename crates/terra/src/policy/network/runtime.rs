@@ -19,9 +19,11 @@ impl BoxPolicy {
         let factory = FACTORY
             .get_or_init(|| {
                 // SAFETY: Make produces this embedded artifact for the pinned Wasmtime build.
-                unsafe {
-                    PolicyFactory::from_build_artifact(include_bytes!(env!("TERRA_POLICY_AOT")))
-                }
+                PolicyFactory::from_trusted_artifact(unsafe {
+                    terra_runtime::TrustedArtifact::from_trusted_bytes(include_bytes!(env!(
+                        "TERRA_POLICY_AOT"
+                    )))
+                })
                 .map_err(|error| error.to_string())
             })
             .as_ref()

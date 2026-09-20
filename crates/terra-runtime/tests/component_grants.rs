@@ -146,17 +146,57 @@ fn host_service_clients_are_exclusive_to_vsock() {
 
 fn assert_components<T: 'static>(linker: &Linker<T>, engine: &wasmtime::Engine, device: &str) {
     for (name, bytes) in [
-        ("block", include_bytes!("../../../components/block/target/wasm32-wasip3/release/terra_block_component.wasm").as_slice()),
-        ("network", include_bytes!("../../../components/network/target/wasm32-wasip3/release/terra_network_component.wasm").as_slice()),
-        ("fs", include_bytes!("../../../components/fs/target/wasm32-wasip3/release/terra_fs_component.wasm").as_slice()),
-        ("mem", include_bytes!("../../../components/mem/target/wasm32-wasip3/release/terra_mem_component.wasm").as_slice()),
-        ("boot", include_bytes!("../../../components/boot/target/wasm32-wasip3/release/terra_boot_component.wasm").as_slice()),
-        ("vsock", include_bytes!("../../../components/vsock/target/wasm32-wasip3/release/terra_vsock_component.wasm").as_slice()),
+        (
+            "block",
+            include_bytes!(
+                "../../../components/target/wasm32-wasip3/release/terra_block_component.wasm"
+            )
+            .as_slice(),
+        ),
+        (
+            "network",
+            include_bytes!(
+                "../../../components/target/wasm32-wasip3/release/terra_network_component.wasm"
+            )
+            .as_slice(),
+        ),
+        (
+            "fs",
+            include_bytes!(
+                "../../../components/target/wasm32-wasip3/release/terra_fs_component.wasm"
+            )
+            .as_slice(),
+        ),
+        (
+            "mem",
+            include_bytes!(
+                "../../../components/target/wasm32-wasip3/release/terra_mem_component.wasm"
+            )
+            .as_slice(),
+        ),
+        (
+            "boot",
+            include_bytes!(
+                "../../../components/target/wasm32-wasip3/release/terra_boot_component.wasm"
+            )
+            .as_slice(),
+        ),
+        (
+            "vsock",
+            include_bytes!(
+                "../../../components/target/wasm32-wasip3/release/terra_vsock_component.wasm"
+            )
+            .as_slice(),
+        ),
     ] {
         let component = Component::new(engine, bytes).expect("component compiles");
         let result = linker.instantiate_pre(&component);
-        assert_eq!(result.is_ok(), name == device,
-            "{device} linker, {name} component: {:?}", result.err());
+        assert_eq!(
+            result.is_ok(),
+            name == device,
+            "{device} linker, {name} component: {:?}",
+            result.err()
+        );
     }
 }
 
@@ -202,9 +242,7 @@ fn mmio_dispatcher_requires_no_device_capabilities() {
         terra_runtime::component::vmm::mmio::mmio_component_linker(&engine).expect("VMM linker");
     let component = Component::new(
         &engine,
-        include_bytes!(
-            "../../../components/vmm/target/wasm32-wasip3/release/terra_vmm_component.wasm"
-        ),
+        include_bytes!("../../../components/target/wasm32-wasip3/release/terra_vmm_component.wasm"),
     )
     .expect("MMIO component compiles");
     linker

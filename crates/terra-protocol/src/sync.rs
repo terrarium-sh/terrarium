@@ -15,6 +15,66 @@ pub const MAX_SYNC_PATH_BYTES: usize = 4096;
 /// Total budget on accumulated metadata bytes from untrusted manifest frames.
 pub const MAX_SYNC_METADATA_BYTES: usize = 16 * 1024 * 1024;
 
+/// The limit exceeded while collecting a sync manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncManifestLimit {
+    Entries,
+    MetadataBytes,
+}
+
+/// Running entry and metadata budget for a sync manifest.
+#[derive(Debug, Default)]
+pub struct SyncManifestBudget {
+    entries: usize,
+    metadata_bytes: usize,
+}
+
+impl SyncManifestBudget {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            entries: 0,
+            metadata_bytes: 0,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_existing_entries(entries: usize) -> Self {
+        Self {
+            entries,
+            metadata_bytes: 0,
+        }
+    }
+
+    /// Adds one entry and its path, link-target, and fixed metadata overhead.
+    pub fn add_entry(
+        &mut self,
+        path: &str,
+        link_target: Option<&str>,
+    ) -> Result<(), SyncManifestLimit> {
+        self.entries = self
+            .entries
+            .checked_add(1)
+            .ok_or(SyncManifestLimit::Entries)?;
+        if self.entries > MAX_SYNC_ENTRIES {
+            return Err(SyncManifestLimit::Entries);
+        }
+        let metadata_bytes = path
+            .len()
+            .checked_add(link_target.map_or(0, str::len))
+            .and_then(|bytes| bytes.checked_add(32))
+            .ok_or(SyncManifestLimit::MetadataBytes)?;
+        self.metadata_bytes = self
+            .metadata_bytes
+            .checked_add(metadata_bytes)
+            .ok_or(SyncManifestLimit::MetadataBytes)?;
+        if self.metadata_bytes > MAX_SYNC_METADATA_BYTES {
+            return Err(SyncManifestLimit::MetadataBytes);
+        }
+        Ok(())
+    }
+}
+
 /// Upper limit on untrusted error message frames from guest.
 pub const MAX_SYNC_ERROR_BYTES: usize = 4096;
 
@@ -293,6 +353,24 @@ mod tests {
         assert_eq!(truncate_nanos(1_000), 1_000);
         assert_eq!(truncate_nanos(1_999), 1_000);
         assert_eq!(truncate_nanos(123_456_789), 123_456_000);
+    }
+
+    #[test]
+    fn manifest_budget_rejects_entries_and_metadata_after_the_limit() {
+        let mut entry_budget = SyncManifestBudget::with_existing_entries(MAX_SYNC_ENTRIES - 1);
+        assert!(entry_budget.add_entry("entry", None).is_ok());
+        assert_eq!(
+            entry_budget.add_entry("one-too-many", None),
+            Err(SyncManifestLimit::Entries)
+        );
+
+        let mut metadata_budget = SyncManifestBudget::new();
+        let metadata = "a".repeat(MAX_SYNC_METADATA_BYTES - 32);
+        assert!(metadata_budget.add_entry(&metadata, None).is_ok());
+        assert_eq!(
+            metadata_budget.add_entry("a", None),
+            Err(SyncManifestLimit::MetadataBytes)
+        );
     }
 
     #[test]

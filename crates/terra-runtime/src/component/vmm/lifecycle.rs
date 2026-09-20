@@ -195,19 +195,15 @@ impl crate::box_runtime::BoxRuntime {
         teardown.install_interrupts(Box::pin(close))
     }
 
-    pub fn grant_device_shutdown(
+    pub fn add_device_shutdown(
         &mut self,
-        devices: Vec<super::teardown::DeviceShutdown>,
+        device: super::teardown::DeviceShutdown,
     ) -> wasmtime::Result<()> {
-        wasmtime::ensure!(
-            devices.len() <= crate::box_runtime::MAX_BOX_COMPONENTS,
-            "box has too many device shutdown grants"
-        );
         self.store
             .data()
             .lifecycle
             .native_teardown()
-            .install_devices(devices)
+            .install_device(device)
     }
 }
 

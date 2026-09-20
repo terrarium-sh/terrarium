@@ -70,9 +70,7 @@ fn no_interrupt() -> Interrupt {
 fn router(engine: &wasmtime::Engine) -> Component {
     Component::new(
         engine,
-        include_bytes!(
-            "../../../components/vmm/target/wasm32-wasip3/release/terra_vmm_component.wasm"
-        ),
+        include_bytes!("../../../components/target/wasm32-wasip3/release/terra_vmm_component.wasm"),
     )
     .expect("router component")
 }
@@ -80,9 +78,7 @@ fn router(engine: &wasmtime::Engine) -> Component {
 fn memory(engine: &wasmtime::Engine) -> Component {
     Component::new(
         engine,
-        include_bytes!(
-            "../../../components/mem/target/wasm32-wasip3/release/terra_mem_component.wasm"
-        ),
+        include_bytes!("../../../components/target/wasm32-wasip3/release/terra_mem_component.wasm"),
     )
     .expect("memory component")
 }
@@ -320,10 +316,10 @@ async fn vcpu_failure_preserves_teardown_order_before_runtime_join() {
     let order = Arc::new(std::sync::Mutex::new(Vec::new()));
     let devices = Arc::clone(&order);
     runtime
-        .grant_device_shutdown(vec![DeviceShutdown::new(DeviceKind::Memory, async move {
+        .add_device_shutdown(DeviceShutdown::new(DeviceKind::Memory, async move {
             devices.lock().expect("order").push("device");
             Ok(())
-        })])
+        }))
         .expect("device grant");
     let interrupts = Arc::clone(&order);
     runtime
@@ -434,9 +430,11 @@ async fn wasi_requests_cpu_stop_before_publishing_terminal_outcomes() {
             })
         })
         .collect::<Vec<_>>();
-        runtime
-            .grant_device_shutdown(shutdowns)
-            .expect("shutdown grants");
+        for shutdown in shutdowns {
+            runtime
+                .add_device_shutdown(shutdown)
+                .expect("shutdown grant");
+        }
         let interrupt_calls = Arc::new(AtomicUsize::new(0));
         let released_interrupts = Arc::clone(&interrupt_calls);
         let closed_devices = Arc::clone(&closed);
@@ -603,7 +601,7 @@ async fn wasi_composes_multiple_deferred_workers_with_their_final_mappings() {
     let block = Component::new(
         &engine,
         include_bytes!(
-            "../../../components/block/target/wasm32-wasip3/release/terra_block_component.wasm"
+            "../../../components/target/wasm32-wasip3/release/terra_block_component.wasm"
         ),
     )
     .expect("block component");
@@ -654,7 +652,7 @@ async fn wasi_composes_multiple_deferred_workers_with_their_final_mappings() {
 #[allow(clippy::too_many_lines)]
 async fn wasi_lifecycle_closes_a_device_through_the_running_mmio_bridge() {
     use terra_runtime::component::vmm::lifecycle::Outcome;
-    use terra_runtime::component::vmm::{machine::DeviceKind, teardown::DeviceShutdown};
+    use terra_runtime::component::vmm::machine::DeviceKind;
 
     let engine = device_engine().expect("engine");
     let ram = SyntheticRam::new(8 << 20).expect("RAM");
@@ -671,15 +669,6 @@ async fn wasi_lifecycle_closes_a_device_through_the_running_mmio_bridge() {
         no_interrupt(),
     )
     .expect("memory grant");
-    let closing = channel.clone();
-    runtime
-        .grant_device_shutdown(vec![DeviceShutdown::new(DeviceKind::Memory, async move {
-            closing
-                .close_async()
-                .await
-                .map_err(|error| error.to_string())
-        })])
-        .expect("shutdown grant");
     let delivered = Arc::new(std::sync::Mutex::new(Vec::new()));
     let injections = Arc::clone(&delivered);
     let ioapic = runtime
@@ -693,7 +682,10 @@ async fn wasi_lifecycle_closes_a_device_through_the_running_mmio_bridge() {
         .await
         .expect("IOAPIC grant");
     assert!(runtime.grant_ioapic(Arc::new(|_| Ok(()))).await.is_err());
-    let memory_irq = ioapic.bind_interrupt(DeviceKind::Memory, 0);
+    let memory_irq = ioapic
+        .bind_interrupt(DeviceKind::Memory, 0)
+        .expect("bind memory interrupt");
+    assert!(ioapic.bind_interrupt(DeviceKind::Memory, 1).is_err());
     let interrupt_handle = ioapic.clone();
     runtime
         .grant_interrupt_shutdown(async move {
@@ -752,26 +744,13 @@ async fn wasi_irq_lines_drain_assertions_before_vm_release() {
         .expect("router");
     let ram = SyntheticRam::new(8 << 20).expect("RAM");
     let (mut runtime, _) = attach_test_machine(runtime, ram.clone()).await;
-    let channel = terra_runtime::component::mem::instantiate_shared(
+    terra_runtime::component::mem::instantiate_shared(
         &mut runtime,
         DeviceContext::with_ram(ram),
         &memory(&engine),
         no_interrupt(),
     )
     .expect("memory grant");
-    runtime
-        .grant_device_shutdown(vec![
-            terra_runtime::component::vmm::teardown::DeviceShutdown::new(
-                DeviceKind::Memory,
-                async move {
-                    channel
-                        .close_async()
-                        .await
-                        .map_err(|error| error.to_string())
-                },
-            ),
-        ])
-        .expect("device cleanup grant");
     let delivered = Arc::new(std::sync::Mutex::new(Vec::new()));
     let injections = Arc::clone(&delivered);
     let lines = runtime
@@ -786,7 +765,10 @@ async fn wasi_irq_lines_drain_assertions_before_vm_release() {
         .expect("IRQ grant");
     assert!(runtime.grant_irq_lines(|_, _| Ok(())).await.is_err());
     assert!(runtime.grant_ioapic(Arc::new(|_| Ok(()))).await.is_err());
-    let memory_irq = lines.bind_interrupt(DeviceKind::Memory, 0);
+    let memory_irq = lines
+        .bind_interrupt(DeviceKind::Memory, 0)
+        .expect("bind memory interrupt");
+    assert!(lines.bind_interrupt(DeviceKind::Memory, 1).is_err());
     for _ in 0..256 {
         memory_irq(true).expect("queue accepts its full capacity");
     }
@@ -840,10 +822,10 @@ async fn failed_native_reaping_retains_vm_and_dependent_cleanup() {
     let closes = Arc::new(AtomicUsize::new(0));
     let device_closes = Arc::clone(&closes);
     runtime
-        .grant_device_shutdown(vec![DeviceShutdown::new(DeviceKind::Memory, async move {
+        .add_device_shutdown(DeviceShutdown::new(DeviceKind::Memory, async move {
             device_closes.fetch_add(1, Ordering::SeqCst);
             Ok(())
-        })])
+        }))
         .expect("shutdown grant");
     let interrupt_closes = Arc::clone(&closes);
     runtime

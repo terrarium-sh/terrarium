@@ -176,9 +176,7 @@ async fn posted_receive_queue_drains_handshake_and_plan_without_a_second_bell() 
     let engine = device_engine().expect("engine");
     let router = Component::new(
         &engine,
-        include_bytes!(
-            "../../../components/vmm/target/wasm32-wasip3/release/terra_vmm_component.wasm"
-        ),
+        include_bytes!("../../../components/target/wasm32-wasip3/release/terra_vmm_component.wasm"),
     )
     .expect("MMIO router");
     let ram = SyntheticRam::new(256 * 1024).expect("RAM");
@@ -186,18 +184,21 @@ async fn posted_receive_queue_drains_handshake_and_plan_without_a_second_bell() 
     runtime.initialize_mmio(&router).await.expect("MMIO router");
     // SAFETY: this test embeds the build's trusted AOT vsock artifact.
     #[allow(unsafe_code)]
-    let channel = unsafe {
-        VsockChannel::from_trusted_shared(
-            &mut runtime,
-            ram.clone(),
-            include_bytes!("../../../build/terra-vsock-component.cwasm"),
-            plan_frame(),
-            None,
-            None,
-            None,
-            no_interrupt(),
-        )
-    }
+    let artifact = unsafe {
+        terra_runtime::TrustedArtifact::from_trusted_bytes(include_bytes!(
+            "../../../build/terra-vsock-component.cwasm"
+        ))
+    };
+    let channel = VsockChannel::from_trusted_artifact(
+        &mut runtime,
+        ram.clone(),
+        artifact,
+        plan_frame(),
+        None,
+        None,
+        None,
+        no_interrupt(),
+    )
     .expect("vsock");
     let runtime = runtime.prepare().await.expect("runtime prepared").start();
     let memory = BoundedMemory::new(&ram);

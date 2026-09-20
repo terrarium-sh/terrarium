@@ -219,9 +219,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn actor_configures_and_serves_component_mmio() {
         let engine = device_engine().expect("engine builds");
-        let component_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
-            "../../components/network/target/wasm32-wasip3/release/terra_network_component.wasm",
-        );
+        let component_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../components/target/wasm32-wasip3/release/terra_network_component.wasm");
         let component = Component::new(
             &engine,
             std::fs::read(component_path).expect("network component built"),
@@ -258,9 +257,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn shared_box_network_serves_and_closes() {
         let engine = device_engine().expect("engine");
-        let component = Component::new(&engine, include_bytes!(
-            "../../../../components/network/target/wasm32-wasip3/release/terra_network_component.wasm"
-        )).expect("component");
+        let component = Component::new(
+            &engine,
+            include_bytes!(
+                "../../../../components/target/wasm32-wasip3/release/terra_network_component.wasm"
+            ),
+        )
+        .expect("component");
         let mut runtime =
             crate::box_runtime::BoxRuntime::new(&engine, crate::box_runtime::BoxHost::new())
                 .expect("runtime");
@@ -299,7 +302,7 @@ mod tests {
         let component = Component::new(
             &engine,
             include_bytes!(
-                "../../../../components/network/target/wasm32-wasip3/release/terra_network_component.wasm"
+                "../../../../components/target/wasm32-wasip3/release/terra_network_component.wasm"
             ),
         )
         .expect("component compiles");

@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use terra_runtime::component::vmm::mmio::{Operation, Reply as MmioReply, Request};
-use terra_runtime::engine::test_support::device_store;
+use terra_runtime::engine::test_support::{StandaloneHost, device_store};
 use terra_runtime::engine::{device_engine, vsock_component_linker};
 use terra_vsock_device::VsockHeader;
 use wasmtime::StoreContextMut;
@@ -28,7 +28,7 @@ type Receive =
 type Serve = TypedFunc<(StreamReader<Request>,), (StreamReader<MmioReply>,)>;
 
 async fn next_reply(
-    accessor: &Accessor<terra_runtime::engine::VsockDeviceHost>,
+    accessor: &Accessor<StandaloneHost<terra_runtime::engine::VsockDeviceHost>>,
     replies: Replies,
     operation: u16,
 ) -> Reply {
@@ -52,7 +52,7 @@ async fn next_reply(
 }
 
 async fn guest_packet(
-    accessor: &Accessor<terra_runtime::engine::VsockDeviceHost>,
+    accessor: &Accessor<StandaloneHost<terra_runtime::engine::VsockDeviceHost>>,
     receive: Receive,
     port: u32,
     operation: u16,
@@ -103,7 +103,7 @@ async fn read_until_eof(socket: &mut terra_io::local::LocalStream) -> Vec<u8> {
 }
 
 async fn wait_for_no_connections(
-    accessor: &Accessor<terra_runtime::engine::VsockDeviceHost>,
+    accessor: &Accessor<StandaloneHost<terra_runtime::engine::VsockDeviceHost>>,
     count: TypedFunc<(), (u32,)>,
 ) {
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -115,11 +115,15 @@ async fn wait_for_no_connections(
     .expect("closed host client releases its pending guest connection");
 }
 
-fn live_clients(accessor: &Accessor<terra_runtime::engine::VsockDeviceHost>) -> usize {
+fn live_clients(
+    accessor: &Accessor<StandaloneHost<terra_runtime::engine::VsockDeviceHost>>,
+) -> usize {
     accessor.with(|mut access| access.get().vsock_service_mut().live_clients())
 }
 
-async fn wait_for_no_clients(accessor: &Accessor<terra_runtime::engine::VsockDeviceHost>) {
+async fn wait_for_no_clients(
+    accessor: &Accessor<StandaloneHost<terra_runtime::engine::VsockDeviceHost>>,
+) {
     tokio::time::timeout(Duration::from_secs(2), async {
         while live_clients(accessor) != 0 {
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -130,7 +134,7 @@ async fn wait_for_no_clients(accessor: &Accessor<terra_runtime::engine::VsockDev
 }
 
 async fn serve_and_disconnect(
-    accessor: &Accessor<terra_runtime::engine::VsockDeviceHost>,
+    accessor: &Accessor<StandaloneHost<terra_runtime::engine::VsockDeviceHost>>,
     replies: Replies,
     receive: Receive,
     count: TypedFunc<(), (u32,)>,
@@ -159,13 +163,13 @@ struct Worker {
 
 struct ReplySink(Arc<Mutex<Vec<MmioReply>>>);
 
-impl StreamConsumer<terra_runtime::engine::VsockDeviceHost> for ReplySink {
+impl StreamConsumer<StandaloneHost<terra_runtime::engine::VsockDeviceHost>> for ReplySink {
     type Item = MmioReply;
 
     fn poll_consume(
         self: Pin<&mut Self>,
         _: &mut Context<'_>,
-        store: StoreContextMut<terra_runtime::engine::VsockDeviceHost>,
+        store: StoreContextMut<StandaloneHost<terra_runtime::engine::VsockDeviceHost>>,
         mut source: Source<'_, Self::Item>,
         finish: bool,
     ) -> Poll<wasmtime::Result<StreamResult>> {
@@ -182,7 +186,7 @@ impl StreamConsumer<terra_runtime::engine::VsockDeviceHost> for ReplySink {
 }
 
 async fn drive_transport_ready(
-    store: &mut wasmtime::Store<terra_runtime::engine::VsockDeviceHost>,
+    store: &mut wasmtime::Store<StandaloneHost<terra_runtime::engine::VsockDeviceHost>>,
     serve: Serve,
 ) {
     let requests = StreamReader::new(
@@ -231,7 +235,7 @@ async fn drive_transport_ready(
 async fn create_worker(
     listener: terra_io::local::LocalListener,
 ) -> (
-    wasmtime::Store<terra_runtime::engine::VsockDeviceHost>,
+    wasmtime::Store<StandaloneHost<terra_runtime::engine::VsockDeviceHost>>,
     Worker,
 ) {
     let engine = device_engine().unwrap();
@@ -250,7 +254,7 @@ async fn create_worker(
     let component = Component::new(
         &engine,
         include_bytes!(
-            "../../../components/vsock/target/wasm32-wasip3/release/terra_vsock_component.wasm"
+            "../../../components/target/wasm32-wasip3/release/terra_vsock_component.wasm"
         ),
     )
     .unwrap();
@@ -617,28 +621,29 @@ async fn shared_close_releases_the_diagnostic_sink() {
     .unwrap();
     let router = Component::new(
         &engine,
-        include_bytes!(
-            "../../../components/vmm/target/wasm32-wasip3/release/terra_vmm_component.wasm"
-        ),
+        include_bytes!("../../../components/target/wasm32-wasip3/release/terra_vmm_component.wasm"),
     )
     .unwrap();
     runtime.initialize_mmio(&router).await.unwrap();
     let output = tempfile::NamedTempFile::new().unwrap();
     // SAFETY: the embedded artifact is produced by the trusted build for this runtime.
     #[allow(unsafe_code)]
-    let channel = unsafe {
-        terra_runtime::component::vsock::VsockChannel::from_trusted_shared(
-            &mut runtime,
-            terra_runtime::SyntheticRam::new(4096).unwrap(),
-            include_bytes!("../../../build/terra-vsock-component.cwasm"),
-            vec![2, 0, 0, 0, b'{', b'}'],
-            None,
-            None,
-            Some(output.reopen().unwrap()),
-            std::sync::Arc::new(|_| Ok(())),
-        )
-        .unwrap()
+    let artifact = unsafe {
+        terra_runtime::TrustedArtifact::from_trusted_bytes(include_bytes!(
+            "../../../build/terra-vsock-component.cwasm"
+        ))
     };
+    let channel = terra_runtime::component::vsock::VsockChannel::from_trusted_artifact(
+        &mut runtime,
+        terra_runtime::SyntheticRam::new(4096).unwrap(),
+        artifact,
+        vec![2, 0, 0, 0, b'{', b'}'],
+        None,
+        None,
+        Some(output.reopen().unwrap()),
+        std::sync::Arc::new(|_| Ok(())),
+    )
+    .unwrap();
     let runtime = runtime.prepare().await.expect("runtime prepared").start();
     tokio::time::timeout(Duration::from_secs(3), channel.close_async())
         .await

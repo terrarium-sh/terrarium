@@ -52,32 +52,26 @@ fn reset_device(
 fn load_components(engine: &wasmtime::Engine) -> [Component; 5] {
     let router = component(
         engine,
-        include_bytes!(
-            "../../../components/vmm/target/wasm32-wasip3/release/terra_vmm_component.wasm"
-        ),
+        include_bytes!("../../../components/target/wasm32-wasip3/release/terra_vmm_component.wasm"),
     );
     let block_component = component(
         engine,
         include_bytes!(
-            "../../../components/block/target/wasm32-wasip3/release/terra_block_component.wasm"
+            "../../../components/target/wasm32-wasip3/release/terra_block_component.wasm"
         ),
     );
     let fs_component = component(
         engine,
-        include_bytes!(
-            "../../../components/fs/target/wasm32-wasip3/release/terra_fs_component.wasm"
-        ),
+        include_bytes!("../../../components/target/wasm32-wasip3/release/terra_fs_component.wasm"),
     );
     let mem_component = component(
         engine,
-        include_bytes!(
-            "../../../components/mem/target/wasm32-wasip3/release/terra_mem_component.wasm"
-        ),
+        include_bytes!("../../../components/target/wasm32-wasip3/release/terra_mem_component.wasm"),
     );
     let network_component = component(
         engine,
         include_bytes!(
-            "../../../components/network/target/wasm32-wasip3/release/terra_network_component.wasm"
+            "../../../components/target/wasm32-wasip3/release/terra_network_component.wasm"
         ),
     );
     [
@@ -92,18 +86,21 @@ fn load_components(engine: &wasmtime::Engine) -> [Component; 5] {
 fn start_vsock(runtime: &mut BoxRuntime, ram: SyntheticRam) -> VsockChannel {
     // SAFETY: this test embeds the build's trusted AOT vsock artifact.
     #[allow(unsafe_code)]
-    unsafe {
-        VsockChannel::from_trusted_shared(
-            runtime,
-            ram,
-            include_bytes!("../../../build/terra-vsock-component.cwasm"),
-            vec![2, 0, 0, 0, b'{', b'}'],
-            None,
-            None,
-            None,
-            no_interrupt(),
-        )
-    }
+    let artifact = unsafe {
+        terra_runtime::TrustedArtifact::from_trusted_bytes(include_bytes!(
+            "../../../build/terra-vsock-component.cwasm"
+        ))
+    };
+    VsockChannel::from_trusted_artifact(
+        runtime,
+        ram,
+        artifact,
+        vec![2, 0, 0, 0, b'{', b'}'],
+        None,
+        None,
+        None,
+        no_interrupt(),
+    )
     .expect("vsock")
 }
 

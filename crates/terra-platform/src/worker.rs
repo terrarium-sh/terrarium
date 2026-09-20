@@ -40,7 +40,6 @@ pub(crate) fn create_runtime(
     )
 }
 
-#[allow(unsafe_code)]
 pub(crate) async fn boot_prepared<
     M: terra_runtime::component::vmm::virtualization::VirtualMachine,
 >(
@@ -51,10 +50,7 @@ pub(crate) async fn boot_prepared<
     crate::box_runtime::BoxRuntime,
     terra_runtime::component::vmm::virtualization::MachineHandle<M>,
 )> {
-    // SAFETY: TrustedArtifacts admits only build-embedded AOT output for this runtime.
-    let boot = unsafe {
-        wasmtime::component::Component::deserialize(runtime.store.engine(), input.artifacts.boot())
-    }?;
+    let boot = input.artifacts.boot().deserialize(runtime.store.engine())?;
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     let kernel_cmdline = crate::windows::amd64::build_kernel_cmdline(
         crate::windows::whp::query_tsc_frequency().map_err(|error| {
@@ -86,36 +82,28 @@ pub(crate) fn assemble_devices(
         terra_runtime::component::vmm::machine::DeviceKind,
         usize,
     ) -> Result<crate::component::network::Interrupt, String>,
-) -> Result<Vec<MmioDevice>, String> {
+) -> Result<(), String> {
     use terra_runtime::component::vmm::machine::DeviceKind;
-    let blocks = blocks(runtime, ram.clone(), input, disks, |index| {
+    blocks(runtime, ram.clone(), input, disks, |index| {
         bind_interrupt(DeviceKind::Block, index)
     })?;
-    let filesystems = filesystems(runtime, ram.clone(), input, |index| {
+    filesystems(runtime, ram.clone(), input, |index| {
         bind_interrupt(DeviceKind::Fs, index)
     })?;
-    let memory = memory(
+    memory(
         runtime,
         ram.clone(),
         input,
         bind_interrupt(DeviceKind::Memory, 0)?,
     )?;
-    let network = network(
+    network(
         runtime,
         ram.clone(),
         input,
         bind_interrupt(DeviceKind::Net, 0)?,
     )?;
-    let vsock = vsock(runtime, ram, input, bind_interrupt(DeviceKind::Vsock, 0)?)?;
-    let mut devices = blocks
-        .into_iter()
-        .map(MmioDevice::Block)
-        .collect::<Vec<_>>();
-    devices.extend(filesystems.into_iter().map(MmioDevice::Filesystem));
-    devices.push(MmioDevice::Memory(memory));
-    devices.push(MmioDevice::Network(network));
-    devices.push(MmioDevice::Vsock(vsock));
-    Ok(devices)
+    vsock(runtime, ram, input, bind_interrupt(DeviceKind::Vsock, 0)?)?;
+    Ok(())
 }
 
 pub(crate) fn disk_paths(input: &WorkerInput) -> Vec<(PathBuf, bool)> {
@@ -143,7 +131,7 @@ pub struct VmmObservation {
     pub(crate) reaper: terra_runtime::component::vmm::virtualization::VcpuReaper,
     pub(crate) lifecycle: terra_runtime::component::vmm::lifecycle::LifecycleNotifier,
     pub(crate) deadline: Option<Duration>,
-    pub(crate) devices: Vec<MmioDevice>,
+    pub(crate) failure: terra_runtime::component::vmm::mmio::FailureObservation,
     pub(crate) teardown: terra_runtime::component::vmm::teardown::NativeTeardown,
 }
 
@@ -169,9 +157,8 @@ impl VmmObservation {
             Outcome::VcpuFinished | Outcome::Deadline => None,
             Outcome::ComponentFailed => {
                 return Err(self
-                    .devices
-                    .iter()
-                    .find_map(MmioDevice::failure)
+                    .failure
+                    .failure()
                     .unwrap_or_else(|| "VMM component failed".to_owned()));
             }
         };
@@ -229,32 +216,6 @@ pub(crate) async fn finish_component_runtime(
     }
 }
 
-pub(crate) fn grant_device_shutdown(
-    runtime: &mut crate::box_runtime::BoxRuntime,
-    devices: &[MmioDevice],
-) -> Result<(), String> {
-    use terra_runtime::component::vmm::{machine::DeviceKind, teardown::DeviceShutdown};
-
-    let shutdowns = devices
-        .iter()
-        .cloned()
-        .map(|device| {
-            let kind = match &device {
-                MmioDevice::Block(_) => DeviceKind::Block,
-                MmioDevice::Filesystem(_) => DeviceKind::Fs,
-                MmioDevice::Memory(_) => DeviceKind::Memory,
-                MmioDevice::Vsock(_) => DeviceKind::Vsock,
-                MmioDevice::Network(_) => DeviceKind::Net,
-            };
-            DeviceShutdown::new(kind, async move { device.close().await })
-        })
-        .collect::<Vec<_>>();
-    runtime
-        .grant_device_shutdown(shutdowns)
-        .map_err(|error| error.to_string())
-}
-
-#[allow(unsafe_code)]
 pub(crate) fn blocks(
     runtime: &mut crate::box_runtime::BoxRuntime,
     ram: impl Into<terra_runtime::component::vmm::virtualization::RamGrant> + Send,
@@ -264,10 +225,12 @@ pub(crate) fn blocks(
 ) -> Result<Vec<crate::component::DeviceChannel>, String> {
     use crate::component::block::backing::FileDisk;
     use crate::component::block::host::BlockHost;
-    use crate::engine::{DiskGrant, trusted_component};
+    use crate::engine::DiskGrant;
 
-    // SAFETY: TrustedArtifacts admits only build-embedded AOT output for this runtime.
-    let component = unsafe { trusted_component(runtime.store.engine(), input.artifacts.block()) }
+    let component = input
+        .artifacts
+        .block()
+        .deserialize(runtime.store.engine())
         .map_err(|error| error.to_string())?;
     let disks = disks
         .iter()
@@ -286,31 +249,31 @@ pub(crate) fn blocks(
     for (index, (disk, readonly)) in disks.enumerate() {
         let ram = ram.clone();
         let host = move || Ok(BlockHost::new(ram.resolve()?, disk));
-        channels.push(
-            crate::component::block::grant_shared(
-                runtime,
-                host,
-                &component,
-                readonly,
-                interrupt(index)?,
-            )
-            .map_err(|error| error.to_string())?,
-        );
+        let channel = crate::component::block::grant_shared(
+            runtime,
+            host,
+            &component,
+            readonly,
+            interrupt(index)?,
+        )
+        .map_err(|error| error.to_string())?;
+        channels.push(channel);
     }
     Ok(channels)
 }
 
-#[allow(unsafe_code)]
 pub(crate) fn network(
     runtime: &mut crate::box_runtime::BoxRuntime,
     ram: impl Into<terra_runtime::component::vmm::virtualization::RamGrant> + Send,
     input: &WorkerInput,
     interrupt: crate::component::network::Interrupt,
 ) -> Result<crate::component::DeviceChannel, String> {
-    use crate::engine::{DeviceContext, trusted_component};
+    use crate::engine::DeviceContext;
 
-    // SAFETY: TrustedArtifacts admits only build-embedded AOT output for this runtime.
-    let component = unsafe { trusted_component(runtime.store.engine(), input.artifacts.network()) }
+    let component = input
+        .artifacts
+        .network()
+        .deserialize(runtime.store.engine())
         .map_err(|error| error.to_string())?;
     let ram = ram.into();
     crate::component::network::grant_shared(
@@ -326,20 +289,21 @@ pub(crate) fn network(
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-#[allow(unsafe_code)]
 pub(crate) fn filesystems(
     runtime: &mut crate::box_runtime::BoxRuntime,
     ram: impl Into<terra_runtime::component::vmm::virtualization::RamGrant> + Send,
     input: &WorkerInput,
     interrupt: impl Fn(usize) -> Result<crate::component::network::Interrupt, String>,
 ) -> Result<Vec<crate::component::DeviceChannel>, String> {
-    use crate::engine::{DeviceContext, trusted_component};
+    use crate::engine::DeviceContext;
 
     if input.shares.is_empty() {
         return Ok(Vec::new());
     }
-    // SAFETY: TrustedArtifacts admits only build-embedded AOT output for this runtime.
-    let component = unsafe { trusted_component(runtime.store.engine(), input.artifacts.fs()) }
+    let component = input
+        .artifacts
+        .fs()
+        .deserialize(runtime.store.engine())
         .map_err(|error| error.to_string())?;
     let ram = ram.into();
     let mut channels = Vec::with_capacity(input.shares.len());
@@ -362,17 +326,16 @@ pub(crate) fn filesystems(
                 resource_capacity,
             ))
         };
-        channels.push(
-            crate::component::fs::grant_shared(
-                runtime,
-                host,
-                &component,
-                &crate::component::fs::host::share_tag(index),
-                max_nodes,
-                interrupt(index)?,
-            )
-            .map_err(|error| error.to_string())?,
-        );
+        let channel = crate::component::fs::grant_shared(
+            runtime,
+            host,
+            &component,
+            &crate::component::fs::host::share_tag(index),
+            max_nodes,
+            interrupt(index)?,
+        )
+        .map_err(|error| error.to_string())?;
+        channels.push(channel);
     }
     Ok(channels)
 }
@@ -395,17 +358,18 @@ fn filesystem_resource_capacity_for(limit: usize, shares: usize) -> usize {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-#[allow(unsafe_code)]
 pub(crate) fn memory(
     runtime: &mut crate::box_runtime::BoxRuntime,
     ram: impl Into<terra_runtime::component::vmm::virtualization::RamGrant> + Send,
     input: &WorkerInput,
     interrupt: crate::component::network::Interrupt,
 ) -> Result<crate::component::DeviceChannel, String> {
-    use crate::engine::{DeviceContext, trusted_component};
+    use crate::engine::DeviceContext;
 
-    // SAFETY: TrustedArtifacts admits only build-embedded AOT output for this runtime.
-    let component = unsafe { trusted_component(runtime.store.engine(), input.artifacts.mem()) }
+    let component = input
+        .artifacts
+        .mem()
+        .deserialize(runtime.store.engine())
         .map_err(|error| error.to_string())?;
     let ram = ram.into();
     let host = move || Ok(DeviceContext::with_ram(ram.resolve()?));
@@ -413,69 +377,26 @@ pub(crate) fn memory(
         .map_err(|error| error.to_string())
 }
 
-#[allow(unsafe_code)]
 pub(crate) fn vsock(
     runtime: &mut crate::box_runtime::BoxRuntime,
     ram: impl Into<terra_runtime::component::vmm::virtualization::RamGrant> + Send,
     input: &mut WorkerInput,
     interrupt: crate::component::network::Interrupt,
 ) -> Result<crate::component::vsock::VsockChannel, String> {
-    let artifact = input.artifacts.vsock();
     let listener = input.listener.take();
     let control = input.control.take();
     let diagnostics = input.diagnostics.take();
-    // SAFETY: TrustedArtifacts admits only build-embedded AOT output.
-    unsafe {
-        crate::component::vsock::VsockChannel::from_trusted_shared(
-            runtime,
-            ram,
-            artifact,
-            std::mem::take(&mut input.plan),
-            listener,
-            control,
-            diagnostics,
-            interrupt,
-        )
-    }
+    crate::component::vsock::VsockChannel::from_trusted_artifact(
+        runtime,
+        ram,
+        input.artifacts.vsock(),
+        std::mem::take(&mut input.plan),
+        listener,
+        control,
+        diagnostics,
+        interrupt,
+    )
     .map_err(|error| error.to_string())
-}
-
-/// Component-backed device selected by a platform MMIO slot.
-#[derive(Clone)]
-pub enum MmioDevice {
-    Block(crate::component::DeviceChannel),
-    Filesystem(crate::component::DeviceChannel),
-    Memory(crate::component::DeviceChannel),
-    Vsock(crate::component::vsock::VsockChannel),
-    Network(crate::component::DeviceChannel),
-}
-
-impl MmioDevice {
-    pub async fn close(&self) -> Result<(), String> {
-        match self {
-            Self::Block(channel)
-            | Self::Filesystem(channel)
-            | Self::Memory(channel)
-            | Self::Network(channel) => channel.close_async().await,
-            Self::Vsock(channel) => channel.close_async().await,
-        }
-        .map_err(|error| error.to_string())
-    }
-
-    #[must_use]
-    pub fn failure(&self) -> Option<String> {
-        match self {
-            Self::Block(channel) if channel.request_counts().1 != 0 => {
-                Some("block component failed".to_owned())
-            }
-            Self::Filesystem(channel) if channel.request_counts().1 != 0 => {
-                Some("filesystem component failed".to_owned())
-            }
-            Self::Memory(channel) | Self::Network(channel) => channel.failure(),
-            Self::Vsock(vsock) => vsock.failure(),
-            Self::Block(_) | Self::Filesystem(_) => None,
-        }
-    }
 }
 
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
@@ -523,7 +444,7 @@ mod tests {
         let component = wasmtime::component::Component::new(
             &engine,
             include_bytes!(
-                "../../../components/vmm/target/wasm32-wasip3/release/terra_vmm_component.wasm"
+                "../../../components/target/wasm32-wasip3/release/terra_vmm_component.wasm"
             ),
         )
         .unwrap();
@@ -563,7 +484,7 @@ mod tests {
         let boot = wasmtime::component::Component::new(
             &engine,
             include_bytes!(
-                "../../../components/boot/target/wasm32-wasip3/release/terra_boot_component.wasm"
+                "../../../components/target/wasm32-wasip3/release/terra_boot_component.wasm"
             ),
         )
         .unwrap();
@@ -583,7 +504,7 @@ mod tests {
         let component = wasmtime::component::Component::new(
             &engine,
             include_bytes!(
-                "../../../components/mem/target/wasm32-wasip3/release/terra_mem_component.wasm"
+                "../../../components/target/wasm32-wasip3/release/terra_mem_component.wasm"
             ),
         )
         .unwrap();
@@ -595,8 +516,6 @@ mod tests {
             Arc::new(|_| Ok(())),
         )
         .unwrap();
-        let devices = vec![super::MmioDevice::Memory(channel.clone())];
-        super::grant_device_shutdown(&mut runtime, &devices).unwrap();
         let injections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let delivered = Arc::clone(&injections);
         let interrupt = machine
@@ -618,6 +537,7 @@ mod tests {
             |_, _, _| panic!("ungranted interrupt"),
         );
         assert!(denied.is_err());
+        let failure = runtime.mmio_failure_observation().unwrap();
         let startup_interrupt = Arc::clone(&interrupt);
         let (runtime, startup) = runtime
             .prepare_vcpus(move |controls, _| {
@@ -641,7 +561,7 @@ mod tests {
                 reaper: startup,
                 lifecycle: lifecycle.clone(),
                 deadline: None,
-                devices,
+                failure,
                 teardown,
             },
         };
@@ -683,7 +603,8 @@ mod tests {
         let mut runtime =
             crate::box_runtime::BoxRuntime::new(&engine, crate::box_runtime::BoxHost::new())
                 .unwrap();
-        runtime.grant_device_shutdown(vec![first, second]).unwrap();
+        runtime.add_device_shutdown(first).unwrap();
+        runtime.add_device_shutdown(second).unwrap();
         let teardown = runtime.native_teardown();
         assert_eq!(
             teardown
@@ -803,25 +724,28 @@ mod tests {
         let router = wasmtime::component::Component::new(
             &engine,
             include_bytes!(
-                "../../../components/vmm/target/wasm32-wasip3/release/terra_vmm_component.wasm"
+                "../../../components/target/wasm32-wasip3/release/terra_vmm_component.wasm"
             ),
         )
         .unwrap();
         runtime.initialize_mmio(&router).await.unwrap();
         // SAFETY: the artifact is embedded from the trusted build.
         #[allow(unsafe_code)]
-        let channel = unsafe {
-            terra_runtime::component::vsock::VsockChannel::from_trusted_shared(
-                &mut runtime,
-                terra_runtime::SyntheticRam::new(4096).unwrap(),
-                include_bytes!("../../../build/terra-vsock-component.cwasm"),
-                plan,
-                None,
-                None,
-                None,
-                std::sync::Arc::new(|_| Ok(())),
-            )
-        }
+        let artifact = unsafe {
+            terra_runtime::TrustedArtifact::from_trusted_bytes(include_bytes!(
+                "../../../build/terra-vsock-component.cwasm"
+            ))
+        };
+        let channel = terra_runtime::component::vsock::VsockChannel::from_trusted_artifact(
+            &mut runtime,
+            terra_runtime::SyntheticRam::new(4096).unwrap(),
+            artifact,
+            plan,
+            None,
+            None,
+            None,
+            std::sync::Arc::new(|_| Ok(())),
+        )
         .unwrap();
         let runtime_task = runtime.prepare().await.unwrap().start();
         let device = channel;
@@ -845,7 +769,7 @@ mod tests {
         let component = wasmtime::component::Component::new(
             &engine,
             include_bytes!(
-                "../../../components/fs/target/wasm32-wasip3/release/terra_fs_component.wasm"
+                "../../../components/target/wasm32-wasip3/release/terra_fs_component.wasm"
             ),
         )
         .unwrap();

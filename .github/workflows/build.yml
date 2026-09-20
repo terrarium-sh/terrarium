@@ -171,7 +171,7 @@ jobs:
           cargo test --locked --target x86_64-unknown-linux-musl -p terra-platform --lib -- --ignored --test-threads=1
           TERRA_BIN="$PWD/dist/terra" cargo test --locked --target x86_64-unknown-linux-musl -p terra --test boot --test memory -- --ignored --test-threads=1
       - name: Reclaim component build space
-        run: rm -rf components/*/target
+        run: rm -rf components/target
       - name: Fuzz smoke
         run: |
           cargo install cargo-fuzz --version 0.13.1 --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
@@ -226,15 +226,7 @@ jobs:
           cache-on-failure: true
           workspaces: |
             .
-            components/device-transport
-            components/block
-            components/vsock
-            components/network
-            components/fs
-            components/mem
-            components/boot
-            components/vmm
-            components/policy
+            components
           key: aarch64-linux
       - name: Install wasm-tools
         run: |
@@ -281,15 +273,7 @@ jobs:
           cache-on-failure: true
           workspaces: |
             .
-            components/device-transport
-            components/block
-            components/vsock
-            components/network
-            components/fs
-            components/mem
-            components/boot
-            components/vmm
-            components/policy
+            components
           key: aarch64-macos
       - name: Install wasm-tools
         run: |
@@ -348,15 +332,7 @@ jobs:
           cache-on-failure: true
           workspaces: |
             .
-            components/device-transport
-            components/block
-            components/vsock
-            components/network
-            components/fs
-            components/mem
-            components/boot
-            components/vmm
-            components/policy
+            components
           key: ${{ matrix.target }}
       - name: Build distribution
         shell: pwsh

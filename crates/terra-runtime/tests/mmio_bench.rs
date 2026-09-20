@@ -6,7 +6,7 @@ use terra_runtime::{
     SyntheticRam,
     box_runtime::{BoxHost, BoxRuntime, BoxRuntimeHandle},
     component::Interrupt,
-    engine::{DeviceContext, device_engine, trusted_component},
+    engine::{DeviceContext, device_engine},
 };
 
 const WARMUP_SAMPLES: usize = 128;
@@ -101,20 +101,20 @@ async fn start_memory() -> (Duration, RunningMemory) {
     // SAFETY: these build-embedded artifacts are trusted AOT output for this Wasmtime build.
     #[allow(unsafe_code)]
     let router = unsafe {
-        trusted_component(
-            &engine,
-            include_bytes!("../../../build/terra-vmm-component.cwasm"),
-        )
+        terra_runtime::TrustedArtifact::from_trusted_bytes(include_bytes!(
+            "../../../build/terra-vmm-component.cwasm"
+        ))
     }
+    .deserialize(&engine)
     .expect("MMIO artifact");
     // SAFETY: this build-embedded artifact is trusted AOT output for this Wasmtime build.
     #[allow(unsafe_code)]
     let component = unsafe {
-        trusted_component(
-            &engine,
-            include_bytes!("../../../build/terra-mem-component.cwasm"),
-        )
+        terra_runtime::TrustedArtifact::from_trusted_bytes(include_bytes!(
+            "../../../build/terra-mem-component.cwasm"
+        ))
     }
+    .deserialize(&engine)
     .expect("memory artifact");
     let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
     runtime.initialize_mmio(&router).await.expect("MMIO router");

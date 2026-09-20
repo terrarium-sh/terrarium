@@ -7,14 +7,6 @@ pub use crate::component::vmm::mmio::exports::terra::mmio::interrupts::{
 };
 use std::sync::{Arc, Mutex, mpsc};
 use tokio::sync::{mpsc as queue, watch};
-use wasmtime::component::TypedFunc;
-
-pub(crate) type Stage = TypedFunc<(), (Result<(), Error>,)>;
-pub(crate) type Access = TypedFunc<(u8, u8, bool, u32), (Result<IoapicReply, Error>,)>;
-pub(crate) type Line = TypedFunc<(u8, bool), (Result<Vec<X86Interrupt>, Error>,)>;
-pub(crate) type DeviceLine =
-    TypedFunc<(super::machine::DeviceKind, u32, bool), (Result<Vec<X86Interrupt>, Error>,)>;
-pub(crate) type Eoi = TypedFunc<(u8,), (Result<Vec<X86Interrupt>, Error>,)>;
 pub type Inject = Arc<dyn Fn(X86Interrupt) -> wasmtime::Result<()> + Send + Sync>;
 
 const IOAPIC_PINS: usize = terra_limits::X86_IOAPIC_PINS as usize;
@@ -117,7 +109,6 @@ async fn complete_interrupt_worker(
 
 enum Command {
     Line(u8, bool),
-    DeviceLine(super::machine::DeviceKind, u32, bool),
     Access(u8, u8, bool, u32),
     Eoi(u8),
 }
@@ -129,6 +120,7 @@ struct Pending {
 #[derive(Clone)]
 pub struct IoApicHandle {
     queue: InterruptQueue<Pending>,
+    config: super::virtualization::MachineConfig,
 }
 
 impl IoApicHandle {
@@ -139,19 +131,19 @@ impl IoApicHandle {
         })
     }
 
-    #[must_use]
     pub fn bind_interrupt(
         &self,
         kind: super::machine::DeviceKind,
         ordinal: usize,
-    ) -> crate::component::Interrupt {
-        let handle = self.clone();
-        Arc::new(move |level| {
-            handle.queue.send(Pending {
-                command: Command::DeviceLine(kind, u32::try_from(ordinal)?, level),
+    ) -> wasmtime::Result<crate::component::Interrupt> {
+        let slot = self.config.device_slot(kind, ordinal)?;
+        let queue = self.queue.clone();
+        Ok(Arc::new(move |level| {
+            queue.send(Pending {
+                command: Command::Line(slot, level),
                 response: None,
             })
-        })
+        }))
     }
 
     pub fn access(&self, offset: u8, width: u8, write: bool, value: u32) -> wasmtime::Result<u32> {
@@ -180,23 +172,23 @@ impl IoApicHandle {
 
 impl BoxRuntime {
     pub async fn grant_ioapic(&mut self, inject: Inject) -> wasmtime::Result<IoApicHandle> {
-        let vcpus = self
+        let config = self
             .store
             .data()
             .platform
             .machine_config()
             .ok_or_else(|| wasmtime::Error::msg("VM has no machine configuration"))?
-            .vcpus();
+            .clone();
+        let vcpus = config.vcpus();
         let router = self
             .mmio
             .as_ref()
             .ok_or_else(|| wasmtime::Error::msg("VMM missing"))?;
-        let (stage, access, line, device_line, eoi) = (
-            router.ioapic_stage,
-            router.ioapic_access,
-            router.ioapic_line,
-            router.ioapic_device_line,
-            router.ioapic_eoi,
+        let (stage, access, line, eoi) = (
+            router.interrupts.func_stage_ioapic(),
+            router.interrupts.func_ioapic_access(),
+            router.interrupts.func_ioapic_line(),
+            router.interrupts.func_ioapic_eoi(),
         );
         let (result,) = stage.call_async(&mut self.store, ()).await?;
         result.map_err(|error| wasmtime::Error::msg(format!("IOAPIC grant: {error:?}")))?;
@@ -209,12 +201,6 @@ impl BoxRuntime {
                             Command::Line(slot, level) => {
                                 let (result,) =
                                     line.call_concurrent(accessor, (slot, level)).await?;
-                                (0, result.map_err(wasm_error)?)
-                            }
-                            Command::DeviceLine(kind, ordinal, level) => {
-                                let (result,) = device_line
-                                    .call_concurrent(accessor, (kind, ordinal, level))
-                                    .await?;
                                 (0, result.map_err(wasm_error)?)
                             }
                             Command::Eoi(vector) => {
@@ -245,7 +231,7 @@ impl BoxRuntime {
                 completion,
             ))
         }))?;
-        Ok(IoApicHandle { queue })
+        Ok(IoApicHandle { queue, config })
     }
 }
 
@@ -353,36 +339,23 @@ mod tests {
     }
 }
 
-pub(crate) type GsiLine = TypedFunc<
-    (super::machine::DeviceKind, u32, bool),
-    (
-        Result<
-            Option<crate::component::vmm::mmio::exports::terra::mmio::interrupts::IrqLevel>,
-            Error,
-        >,
-    ),
->;
-pub(crate) type ClearLines = TypedFunc<
-    (),
-    (Result<Vec<crate::component::vmm::mmio::exports::terra::mmio::interrupts::IrqLevel>, Error>,),
->;
-
-struct GsiCommand(super::machine::DeviceKind, u32, bool);
+struct GsiCommand(u8, bool);
 
 #[derive(Clone)]
 pub struct IrqHandle {
     queue: InterruptQueue<GsiCommand>,
+    config: super::virtualization::MachineConfig,
 }
 
 impl IrqHandle {
-    #[must_use]
     pub fn bind_interrupt(
         &self,
         kind: super::machine::DeviceKind,
         ordinal: usize,
-    ) -> crate::component::Interrupt {
+    ) -> wasmtime::Result<crate::component::Interrupt> {
+        let slot = self.config.device_slot(kind, ordinal)?;
         let queue = self.queue.clone();
-        Arc::new(move |level| queue.send(GsiCommand(kind, u32::try_from(ordinal)?, level)))
+        Ok(Arc::new(move |level| queue.send(GsiCommand(slot, level))))
     }
 
     pub async fn close(&self) -> wasmtime::Result<()> {
@@ -400,9 +373,9 @@ impl BoxRuntime {
             .as_ref()
             .ok_or_else(|| wasmtime::Error::msg("VMM missing"))?;
         let (stage, line, clear) = (
-            router.irq_lines_stage,
-            router.device_irq_line,
-            router.clear_irq_lines,
+            router.interrupts.func_stage_irq_lines(),
+            router.interrupts.func_device_irq_line(),
+            router.interrupts.func_clear_irq_lines(),
         );
         let (result,) = stage.call_async(&mut self.store, ()).await?;
         result.map_err(wasm_error)?;
@@ -410,10 +383,8 @@ impl BoxRuntime {
         self.register_loop(Box::new(move |accessor| {
             Box::pin(complete_interrupt_worker(
                 async move {
-                    while let Some(GsiCommand(kind, ordinal, level)) = receiver.recv().await {
-                        let (result,) = line
-                            .call_concurrent(accessor, (kind, ordinal, level))
-                            .await?;
+                    while let Some(GsiCommand(slot, level)) = receiver.recv().await {
+                        let (result,) = line.call_concurrent(accessor, (slot, level)).await?;
                         if let Some(change) = result.map_err(wasm_error)? {
                             inject(change.gsi, change.asserted)?;
                         }
@@ -435,7 +406,14 @@ impl BoxRuntime {
                 completion,
             ))
         }))?;
-        Ok(IrqHandle { queue })
+        let config = self
+            .store
+            .data()
+            .platform
+            .machine_config()
+            .ok_or_else(|| wasmtime::Error::msg("VM has no machine configuration"))?
+            .clone();
+        Ok(IrqHandle { queue, config })
     }
 }
 

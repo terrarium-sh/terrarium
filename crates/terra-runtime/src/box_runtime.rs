@@ -585,6 +585,15 @@ impl BoxRuntime {
     pub fn native_teardown(&self) -> crate::component::vmm::teardown::NativeTeardown {
         self.store.data().lifecycle.native_teardown()
     }
+
+    pub fn mmio_failure_observation(
+        &self,
+    ) -> wasmtime::Result<crate::component::vmm::mmio::FailureObservation> {
+        self.mmio
+            .as_ref()
+            .map(crate::component::vmm::mmio::Router::failure_observation)
+            .ok_or_else(|| wasmtime::Error::msg("MMIO router missing"))
+    }
 }
 
 impl PreparedBoxRuntime {

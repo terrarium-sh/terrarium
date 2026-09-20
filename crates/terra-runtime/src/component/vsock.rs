@@ -179,13 +179,34 @@ impl VsockWorkerGrant {
 }
 
 impl VsockChannel {
-    /// # Safety
-    /// `artifact` must be trusted AOT output from this exact Wasmtime build.
-    #[allow(unsafe_code, clippy::too_many_arguments)]
-    pub unsafe fn from_trusted_shared(
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_trusted_artifact(
         runtime: &mut crate::box_runtime::BoxRuntime,
         ram: impl Into<RamGrant> + Send,
-        artifact: &'static [u8],
+        artifact: crate::TrustedArtifact,
+        plan: Vec<u8>,
+        listener: Option<UnixListener>,
+        control: Option<UnixStream>,
+        diagnostics: Option<std::fs::File>,
+        interrupt: crate::component::network::Interrupt,
+    ) -> wasmtime::Result<Self> {
+        Self::from_component(
+            runtime,
+            ram,
+            artifact.deserialize(runtime.store.engine())?,
+            plan,
+            listener,
+            control,
+            diagnostics,
+            interrupt,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_component(
+        runtime: &mut crate::box_runtime::BoxRuntime,
+        ram: impl Into<RamGrant> + Send,
+        component: wasmtime::component::Component,
         plan: Vec<u8>,
         listener: Option<UnixListener>,
         control: Option<UnixStream>,
@@ -196,10 +217,6 @@ impl VsockChannel {
             return Err(wasmtime::Error::msg("box already has a vsock component"));
         }
         let ram = ram.into();
-        // SAFETY: the caller supplies AOT output for this exact Wasmtime build.
-        let component = unsafe {
-            wasmtime::component::Component::deserialize(runtime.store.engine(), artifact)?
-        };
         let shared_closing = Arc::new(AtomicBool::new(false));
         let (completion, close_response) = tokio::sync::oneshot::channel();
         let setup = VsockWorkerGrant {
@@ -215,7 +232,7 @@ impl VsockChannel {
             completion,
         };
         let child = runtime.child_factory();
-        let mmio = runtime.grant_device_worker(
+        let mmio = runtime.grant_device_worker_unmanaged(
             crate::component::vmm::machine::DeviceKind::Vsock,
             async move { setup.create(child).await },
         )?;
@@ -234,6 +251,15 @@ impl VsockChannel {
         }
         .boxed()
         .shared();
+        if let Err(error) =
+            runtime.add_device_shutdown(crate::component::vmm::teardown::DeviceShutdown::new(
+                crate::component::vmm::machine::DeviceKind::Vsock,
+                close.clone(),
+            ))
+        {
+            mmio.revoke_worker(runtime)?;
+            return Err(error);
+        }
         Ok(Self { close, mmio })
     }
 
@@ -515,28 +541,31 @@ mod tests {
                 crate::box_runtime::BoxRuntime::new(&engine, crate::box_runtime::BoxHost::new())
                     .expect("runtime");
             let router = wasmtime::component::Component::new(
-            &engine,
-            include_bytes!(
-                "../../../../components/vmm/target/wasm32-wasip3/release/terra_vmm_component.wasm"
-            ),
-        )
-        .expect("router component");
+                &engine,
+                include_bytes!(
+                    "../../../../components/target/wasm32-wasip3/release/terra_vmm_component.wasm"
+                ),
+            )
+            .expect("router component");
             runtime.initialize_mmio(&router).await.expect("router");
             let ram = SyntheticRam::new(4096).expect("test RAM maps");
             // SAFETY: the test embeds the trusted build's component artifact.
             #[allow(unsafe_code)]
-            let channel = unsafe {
-                VsockChannel::from_trusted_shared(
-                    &mut runtime,
-                    ram,
-                    include_bytes!("../../../../build/terra-vsock-component.cwasm"),
-                    boot_plan(),
-                    None,
-                    None,
-                    None,
-                    Arc::new(|_| Ok(())),
-                )
-            }
+            let artifact = unsafe {
+                crate::TrustedArtifact::from_trusted_bytes(include_bytes!(
+                    "../../../../build/terra-vsock-component.cwasm"
+                ))
+            };
+            let channel = VsockChannel::from_trusted_artifact(
+                &mut runtime,
+                ram,
+                artifact,
+                boot_plan(),
+                None,
+                None,
+                None,
+                Arc::new(|_| Ok(())),
+            )
             .expect("component");
             assert!(runtime.has_component(crate::component::vmm::machine::DeviceKind::Vsock));
             let runtime_task = runtime.prepare().await.unwrap().start();

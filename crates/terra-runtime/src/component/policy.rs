@@ -42,13 +42,9 @@ pub struct PolicyFactory {
 }
 
 impl PolicyFactory {
-    /// # Safety
-    /// The artifact must come from this build's trusted policy compilation.
-    #[allow(unsafe_code)]
-    pub unsafe fn from_build_artifact(artifact: &'static [u8]) -> wasmtime::Result<Self> {
+    pub fn from_trusted_artifact(artifact: crate::TrustedArtifact) -> wasmtime::Result<Self> {
         let engine = crate::engine::policy_engine()?;
-        // SAFETY: the caller guarantees the artifact's trusted build provenance.
-        let component = unsafe { crate::engine::trusted_component(&engine, artifact)? };
+        let component = artifact.deserialize(&engine)?;
         Ok(Self { engine, component })
     }
 
@@ -368,13 +364,14 @@ mod tests {
             let artifact = Box::leak(
                 crate::engine::precompile_component(
                     &engine,
-                    include_bytes!("../../../../components/policy/target/wasm32-wasip3/release/terra_policy_component.wasm"),
+                    include_bytes!("../../../../components/target/wasm32-wasip3/release/terra_policy_component.wasm"),
                 )
                 .unwrap()
                 .into_boxed_slice(),
             );
             // SAFETY: `artifact` was produced from this trusted component by this engine.
-            let component = unsafe { crate::engine::trusted_component(&engine, artifact) }.unwrap();
+            let artifact = unsafe { crate::TrustedArtifact::from_trusted_bytes(artifact) };
+            let component = artifact.deserialize(&engine).unwrap();
             PolicyFactory { engine, component }
         })
     }

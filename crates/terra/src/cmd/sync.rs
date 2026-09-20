@@ -9,7 +9,8 @@ mod security;
 mod test_support;
 
 use self::endpoint::{
-    DestinationPlacement, Endpoint, SourcePlacement, parse_endpoints, resolve_placement,
+    DestinationPlacement, GuestEndpoint, HostEndpoint, SourcePlacement, Transfer, parse_endpoints,
+    resolve_placement,
 };
 use self::exec::{SyncStats, execute_plan, read_reply, send_request};
 use self::plan::build_plan;
@@ -27,7 +28,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 /// Synchronize a file or directory tree between the host and a running box.
 pub async fn run(args: &SyncArgs, name: Option<&str>, project_dir: &Path) -> Result<ExitCode> {
-    let (src_endpoint, dst_endpoint, direction) = parse_endpoints(&args.src, &args.dst)?;
+    let transfer = parse_endpoints(&args.src, &args.dst)?;
     let bx = &crate::resolve::resolve_pinned_box(project_dir, name)?;
 
     let mut stream = crate::session::connect_to_running_agent(
@@ -39,12 +40,12 @@ pub async fn run(args: &SyncArgs, name: Option<&str>, project_dir: &Path) -> Res
     )
     .await?;
 
-    match direction {
-        SyncDirection::HostToGuest => {
-            sync_host_to_guest(&mut stream, &src_endpoint, &dst_endpoint, args).await
+    match transfer {
+        Transfer::Upload { host, guest } => {
+            sync_host_to_guest(&mut stream, &host, &guest, args).await
         }
-        SyncDirection::GuestToHost => {
-            sync_guest_to_host(&mut stream, &src_endpoint, &dst_endpoint, args).await
+        Transfer::Download { guest, host } => {
+            sync_guest_to_host(&mut stream, &guest, &host, args).await
         }
     }
     .map_err(|error| anyhow::anyhow!(crate::render::escape_printable(&format!("{error:#}"))))
@@ -53,24 +54,14 @@ pub async fn run(args: &SyncArgs, name: Option<&str>, project_dir: &Path) -> Res
 #[allow(clippy::too_many_lines)]
 async fn sync_host_to_guest(
     stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
-    src_endpoint: &Endpoint,
-    dst_endpoint: &Endpoint,
+    src_endpoint: &HostEndpoint,
+    dst_endpoint: &GuestEndpoint,
     args: &SyncArgs,
 ) -> Result<ExitCode> {
-    let (src_path, src_has_trailing) = match src_endpoint {
-        Endpoint::Host {
-            path,
-            has_trailing_separator,
-        } => (path, *has_trailing_separator),
-        Endpoint::Guest { .. } => unreachable!(),
-    };
-    let (dst_path_str, dst_has_trailing) = match dst_endpoint {
-        Endpoint::Guest {
-            path,
-            has_trailing_separator,
-        } => (path, *has_trailing_separator),
-        Endpoint::Host { .. } => unreachable!(),
-    };
+    let src_path = &src_endpoint.path;
+    let src_has_trailing = src_endpoint.has_trailing_separator;
+    let dst_path_str = &dst_endpoint.path;
+    let dst_has_trailing = dst_endpoint.has_trailing_separator;
 
     let src_meta = match std::fs::symlink_metadata(src_path) {
         Ok(m) => m,
@@ -196,24 +187,14 @@ async fn sync_host_to_guest(
 #[allow(clippy::too_many_lines)]
 async fn sync_guest_to_host(
     stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
-    src_endpoint: &Endpoint,
-    dst_endpoint: &Endpoint,
+    src_endpoint: &GuestEndpoint,
+    dst_endpoint: &HostEndpoint,
     args: &SyncArgs,
 ) -> Result<ExitCode> {
-    let (src_path_str, src_has_trailing) = match src_endpoint {
-        Endpoint::Guest {
-            path,
-            has_trailing_separator,
-        } => (path, *has_trailing_separator),
-        Endpoint::Host { .. } => unreachable!(),
-    };
-    let (dst_path, dst_has_trailing) = match dst_endpoint {
-        Endpoint::Host {
-            path,
-            has_trailing_separator,
-        } => (path, *has_trailing_separator),
-        Endpoint::Guest { .. } => unreachable!(),
-    };
+    let src_path_str = &src_endpoint.path;
+    let src_has_trailing = src_endpoint.has_trailing_separator;
+    let dst_path = &dst_endpoint.path;
+    let dst_has_trailing = dst_endpoint.has_trailing_separator;
 
     send_request(
         stream,
@@ -420,7 +401,13 @@ mod tests {
                     agent_timeout: None,
                 },
             };
-            let (src, dst, _) = parse_endpoints(&args.src, &args.dst).unwrap();
+            let Transfer::Download {
+                guest: src,
+                host: dst,
+            } = parse_endpoints(&args.src, &args.dst).unwrap()
+            else {
+                panic!("expected download transfer");
+            };
             let error = sync_guest_to_host(&mut peer(&replies), &src, &dst, &args)
                 .await
                 .unwrap_err();
@@ -452,7 +439,13 @@ mod tests {
                 agent_timeout: None,
             },
         };
-        let (src, dst, _) = parse_endpoints(&args.src, &args.dst).unwrap();
+        let Transfer::Download {
+            guest: src,
+            host: dst,
+        } = parse_endpoints(&args.src, &args.dst).unwrap()
+        else {
+            panic!("expected download transfer");
+        };
         let replies = [SyncReply::SessionReady {
             root_status: RootStatus::ExistingSymlink,
         }];
@@ -477,7 +470,13 @@ mod tests {
                 agent_timeout: None,
             },
         };
-        let (src, dst, _) = parse_endpoints(&args.src, &args.dst).unwrap();
+        let Transfer::Download {
+            guest: src,
+            host: dst,
+        } = parse_endpoints(&args.src, &args.dst).unwrap()
+        else {
+            panic!("expected download transfer");
+        };
         let replies = [
             SyncReply::SessionReady {
                 root_status: RootStatus::ExistingDirectory,

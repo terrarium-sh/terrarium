@@ -27,6 +27,35 @@ impl crate::box_runtime::BoxRuntime {
         kind: super::machine::DeviceKind,
         initialize: impl Future<Output = wasmtime::Result<(DeviceWorker<H>, Serve)>> + Send + 'static,
     ) -> wasmtime::Result<super::mmio::MmioDevice> {
+        self.grant_device_setup(kind, setup(initialize, self.shutdown_receiver()))
+    }
+
+    pub(crate) fn grant_device_setup(
+        &mut self,
+        kind: super::machine::DeviceKind,
+        setup: Setup,
+    ) -> wasmtime::Result<super::mmio::MmioDevice> {
+        let device = super::mmio::MmioDevice::grant_worker(self, kind, setup)?;
+        let closing = device.clone();
+        if let Err(error) =
+            self.add_device_shutdown(super::teardown::DeviceShutdown::new(kind, async move {
+                closing
+                    .close_async()
+                    .await
+                    .map_err(|error| error.to_string())
+            }))
+        {
+            device.revoke_worker(self)?;
+            return Err(error);
+        }
+        Ok(device)
+    }
+
+    pub(crate) fn grant_device_worker_unmanaged<H: StoreHost>(
+        &mut self,
+        kind: super::machine::DeviceKind,
+        initialize: impl Future<Output = wasmtime::Result<(DeviceWorker<H>, Serve)>> + Send + 'static,
+    ) -> wasmtime::Result<super::mmio::MmioDevice> {
         let setup = setup(initialize, self.shutdown_receiver());
         super::mmio::MmioDevice::grant_worker(self, kind, setup)
     }

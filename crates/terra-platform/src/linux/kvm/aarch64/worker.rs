@@ -325,7 +325,7 @@ pub async fn prepare(mut input: WorkerInput) -> Result<PreparedVmm, ArmWorkerErr
     let (mut runtime, machine) = crate::worker::boot_prepared(runtime, prepared, &mut input)
         .await
         .map_err(|error| component_error(&error))?;
-    let devices = worker::assemble_devices(
+    worker::assemble_devices(
         &mut runtime,
         &mut input,
         machine.ram(),
@@ -337,7 +337,9 @@ pub async fn prepare(mut input: WorkerInput) -> Result<PreparedVmm, ArmWorkerErr
         },
     )
     .map_err(ArmWorkerError::Component)?;
-    worker::grant_device_shutdown(&mut runtime, &devices).map_err(ArmWorkerError::Component)?;
+    let failure = runtime
+        .mmio_failure_observation()
+        .map_err(|error| ArmWorkerError::Component(error.to_string()))?;
     let interrupt_machine = machine.clone();
     runtime
         .grant_interrupt_shutdown(async move {
@@ -364,7 +366,7 @@ pub async fn prepare(mut input: WorkerInput) -> Result<PreparedVmm, ArmWorkerErr
             reaper: runners,
             lifecycle,
             deadline: input.deadline,
-            devices,
+            failure,
             teardown,
         },
     })

@@ -1783,6 +1783,7 @@ dependencies = [
 name = "terra-runtime"
 version = "0.0.1"
 dependencies = [
+ "futures-util",
  "libc",
  "log",
  "notify",
@@ -1792,6 +1793,7 @@ dependencies = [
  "terra-limits",
  "terra-network",
  "tokio",
+ "tokio-util",
  "vm-memory",
  "wasmtime",
  "wasmtime-wasi",
@@ -1916,6 +1918,7 @@ dependencies = [
  "futures-core",
  "futures-io",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

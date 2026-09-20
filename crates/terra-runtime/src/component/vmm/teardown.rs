@@ -10,13 +10,13 @@ type CleanupTask = super::reaper::NativeTask<()>;
 #[derive(Default)]
 struct TeardownGrants {
     machine: Option<super::virtualization::MachineRecovery>,
-    devices: Option<Vec<DeviceShutdown>>,
+    devices: Vec<DeviceShutdown>,
     interrupts: Option<Close>,
 }
 
 impl TeardownGrants {
     fn has_work(&self) -> bool {
-        self.machine.is_some() || self.devices.is_some() || self.interrupts.is_some()
+        self.machine.is_some() || !self.devices.is_empty() || self.interrupts.is_some()
     }
 }
 
@@ -100,18 +100,17 @@ impl NativeTeardown {
         Ok(())
     }
 
-    pub(crate) fn install_devices(&self, mut devices: Vec<DeviceShutdown>) -> wasmtime::Result<()> {
+    pub(crate) fn install_device(&self, device: DeviceShutdown) -> wasmtime::Result<()> {
         let mut state = self
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let grants = state.grants_mut()?;
         wasmtime::ensure!(
-            grants.devices.is_none(),
-            "device teardown already installed"
+            grants.devices.len() < crate::box_runtime::MAX_BOX_COMPONENTS,
+            "box has too many device shutdown grants"
         );
-        devices.sort_by_key(DeviceShutdown::order);
-        grants.devices = Some(devices);
+        grants.devices.push(device);
         Ok(())
     }
 
@@ -183,14 +182,16 @@ fn run_teardown(mut grants: TeardownGrants) -> Outcome {
             std::mem::forget(grants);
             return Err(error.to_string());
         }
+        grants.devices.sort_by_key(DeviceShutdown::order);
         let TeardownGrants {
             machine,
             devices,
             interrupts,
+            ..
         } = grants;
         drop(machine);
         let mut first_error = None;
-        for device in devices.unwrap_or_default() {
+        for device in devices {
             if let Err(error) = device.close().await {
                 first_error.get_or_insert(error);
             }
@@ -244,15 +245,21 @@ mod tests {
         let (entered, started) = tokio::sync::oneshot::channel();
         let (release, blocked) = std::sync::mpsc::channel();
         teardown
-            .install_devices(vec![DeviceShutdown::new(DeviceKind::Block, async move {
+            .install_device(DeviceShutdown::new(DeviceKind::Block, async move {
                 entered.send(()).unwrap();
                 blocked.recv_timeout(Duration::from_secs(5)).unwrap();
                 Err("device close failed".to_owned())
-            })])
+            }))
             .unwrap();
         teardown.start();
         started.await.unwrap();
-        assert!(teardown.install_devices(Vec::new()).is_err());
+        assert!(
+            teardown
+                .install_device(DeviceShutdown::new(DeviceKind::Block, async {
+                    panic!("late device grant executed")
+                }))
+                .is_err()
+        );
         assert!(
             teardown
                 .install_interrupts(Box::pin(async { panic!("late grant executed") }))
@@ -288,7 +295,9 @@ mod tests {
             }),
         ];
         let teardown = NativeTeardown::new();
-        teardown.install_devices(devices).unwrap();
+        for device in devices {
+            teardown.install_device(device).unwrap();
+        }
         {
             let recovering = teardown.wait_until_finished();
             tokio::pin!(recovering);
@@ -313,18 +322,18 @@ mod tests {
         let interrupts = Arc::clone(&completed);
         let teardown = NativeTeardown::new();
         teardown
-            .install_devices(vec![
-                DeviceShutdown::new(DeviceKind::Memory, async move {
-                    first.lock().unwrap().push("memory");
-                    Err("first failure".to_owned())
-                }),
-                DeviceShutdown::new(DeviceKind::Block, async move {
-                    let mut completed = second.lock().unwrap();
-                    assert_eq!(*completed, ["memory"]);
-                    completed.push("block");
-                    Err("second failure".to_owned())
-                }),
-            ])
+            .install_device(DeviceShutdown::new(DeviceKind::Block, async move {
+                let mut completed = second.lock().unwrap();
+                assert_eq!(*completed, ["memory"]);
+                completed.push("block");
+                Err("second failure".to_owned())
+            }))
+            .unwrap();
+        teardown
+            .install_device(DeviceShutdown::new(DeviceKind::Memory, async move {
+                first.lock().unwrap().push("memory");
+                Err("first failure".to_owned())
+            }))
             .unwrap();
         teardown
             .install_interrupts(Box::pin(async move {
@@ -350,11 +359,11 @@ mod tests {
         let retained = teardown.clone();
         let (closed, completion) = std::sync::mpsc::channel();
         teardown
-            .install_devices(vec![DeviceShutdown::new(DeviceKind::Block, async move {
+            .install_device(DeviceShutdown::new(DeviceKind::Block, async move {
                 tokio::time::sleep(Duration::from_millis(1)).await;
                 closed.send(()).unwrap();
                 Ok(())
-            })])
+            }))
             .unwrap();
         drop(teardown);
         assert_eq!(
@@ -370,18 +379,7 @@ mod tests {
     #[test]
     fn rejected_grants_do_not_start_cleanup() {
         let teardown = NativeTeardown::new();
-        teardown.install_devices(Vec::new()).unwrap();
-        assert!(teardown.install_devices(Vec::new()).is_err());
         let calls = Arc::new(AtomicUsize::new(0));
-        let device_calls = Arc::clone(&calls);
-        assert!(
-            teardown
-                .install_devices(vec![DeviceShutdown::new(DeviceKind::Block, async move {
-                    device_calls.fetch_add(1, Ordering::Relaxed);
-                    Ok(())
-                })])
-                .is_err()
-        );
         let interrupt_calls = Arc::clone(&calls);
         teardown
             .install_interrupts(Box::pin(async move {

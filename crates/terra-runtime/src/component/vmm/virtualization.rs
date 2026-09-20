@@ -11,16 +11,11 @@ pub(crate) type InitializeMachine = wasmtime::component::TypedFunc<
     (Config, Resource<Vm>, Vec<Resource<super::Vcpu>>),
     (Result<(), super::machine::Error>,),
 >;
-pub(crate) type ControlMachine =
-    wasmtime::component::TypedFunc<(), (Result<(), super::machine::Error>,)>;
 use crate::{BoundedMemory, SyntheticRam};
 
 #[derive(Clone)]
 pub struct MachineConfig {
-    architecture: Architecture,
-    ram_bytes: u64,
-    vcpus: u8,
-    devices: Vec<super::machine::Device>,
+    config: Config,
 }
 
 impl MachineConfig {
@@ -52,55 +47,53 @@ impl MachineConfig {
             "device count outside VM grant"
         );
         Ok(Self {
-            architecture,
-            ram_bytes,
-            vcpus,
-            devices,
+            config: Config {
+                architecture,
+                ram_bytes,
+                vcpus,
+                devices,
+            },
         })
     }
 
     #[must_use]
     pub fn architecture(&self) -> Architecture {
-        self.architecture
+        self.config.architecture
     }
 
     #[must_use]
     pub fn ram_bytes(&self) -> u64 {
-        self.ram_bytes
+        self.config.ram_bytes
     }
 
     #[must_use]
     pub fn vcpus(&self) -> u8 {
-        self.vcpus
+        self.config.vcpus
     }
 
     #[must_use]
     pub fn devices(&self) -> &[super::machine::Device] {
-        &self.devices
+        &self.config.devices
     }
 
     #[must_use]
     pub fn is_valid_cpu(&self, id: u8) -> bool {
-        id < self.vcpus
+        id < self.config.vcpus
     }
 
-    fn as_wit(&self) -> Config {
-        Config {
-            architecture: self.architecture,
-            ram_bytes: self.ram_bytes,
-            vcpus: self.vcpus,
-            devices: self
-                .devices
-                .iter()
-                .map(
-                    |device| crate::component::vmm::mmio::terra::mmio::machine_types::Device {
-                        kind: device.kind,
-                        mmio_base: device.mmio_base,
-                        irq: device.irq,
-                    },
-                )
-                .collect(),
-        }
+    pub fn device_slot(
+        &self,
+        kind: super::machine::DeviceKind,
+        ordinal: usize,
+    ) -> wasmtime::Result<u8> {
+        self.devices()
+            .iter()
+            .enumerate()
+            .filter(|(_, device)| device.kind == kind)
+            .nth(ordinal)
+            .map(|(slot, _)| u8::try_from(slot))
+            .transpose()?
+            .ok_or_else(|| wasmtime::Error::msg("interrupt device outside VM grant"))
     }
 }
 #[cfg(test)]
@@ -223,7 +216,7 @@ mod prepared_machine_tests {
             };
             let boot = wasmtime::component::Component::new(
                 &engine,
-                include_bytes!("../../../../../components/boot/target/wasm32-wasip3/release/terra_boot_component.wasm"),
+                include_bytes!("../../../../../components/target/wasm32-wasip3/release/terra_boot_component.wasm"),
             )
             .unwrap();
             let base = match architecture {
@@ -494,7 +487,7 @@ impl<M: VirtualMachine> PreparedMachine<M> {
 
     pub fn accept_boot(&mut self, entry: super::boot::BootEntry) -> wasmtime::Result<()> {
         wasmtime::ensure!(self.boot_entry.is_none(), "VM boot already accepted");
-        match self.config.architecture {
+        match self.config.architecture() {
             Architecture::X86 => wasmtime::ensure!(
                 entry.boot_argument == 0x7000,
                 "x86 boot argument outside accepted layout"
@@ -656,14 +649,14 @@ impl BoxRuntime {
             "VM boot must complete before vCPU startup"
         );
         let mut runtime = self.prepare_devices().await?;
-        let compose = runtime
+        let machine = &runtime
             .mmio
             .as_ref()
             .ok_or_else(|| wasmtime::Error::msg("VMM missing"))?
-            .compose_machine;
+            .machine;
         let outcome = tokio::time::timeout(
             super::EXIT_TIMEOUT,
-            compose.call_async(&mut runtime.store, ()),
+            machine.func_compose().call_async(&mut runtime.store, ()),
         )
         .await
         .map_err(wasmtime::Error::from)
@@ -717,11 +710,15 @@ impl BoxRuntime {
         } = prepared;
         let boot_entry = boot_entry
             .ok_or_else(|| wasmtime::Error::msg("VM boot must complete before attachment"))?;
-        let initialize = self
+        let machine_bindings = &self
             .mmio
             .as_ref()
             .ok_or_else(|| wasmtime::Error::msg("VMM missing"))?
-            .initialize_machine;
+            .machine;
+        let initialize: InitializeMachine = machine_bindings
+            .func_initialize()
+            .func()
+            .typed(&self.store)?;
         let host = &mut self.store.data_mut().platform.virtualization;
         wasmtime::ensure!(
             matches!(host.state, MachineState::Detached),
@@ -734,12 +731,12 @@ impl BoxRuntime {
             ram.mapped_bytes() == config.ram_bytes(),
             "backend RAM differs from machine configuration"
         );
-        let devices = config.devices.clone();
+        let devices = config.devices().to_vec();
         let handle = MachineHandle(Arc::new(CreatedMachine { machine, devices }));
         let vm = self.store.data_mut().platform.table.push(Vm)?;
-        let mut native_vcpus = Vec::with_capacity(usize::from(config.vcpus));
-        let mut vcpus = Vec::with_capacity(usize::from(config.vcpus));
-        for _ in 0..config.vcpus {
+        let mut native_vcpus = Vec::with_capacity(usize::from(config.vcpus()));
+        let mut vcpus = Vec::with_capacity(usize::from(config.vcpus()));
+        for _ in 0..config.vcpus() {
             let (native, vcpu) = super::vcpu_channel();
             native_vcpus.push(native);
             vcpus.push(self.store.data_mut().platform.table.push_child(vcpu, &vm)?);
@@ -756,7 +753,7 @@ impl BoxRuntime {
         });
         let initialized = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            initialize.call_async(&mut self.store, (config.as_wit(), vm, vcpus)),
+            initialize.call_async(&mut self.store, (config.config.clone(), vm, vcpus)),
         )
         .await
         .map_err(wasmtime::Error::from)

@@ -40,8 +40,15 @@ fn complete_device(context: &BridgeContext, routed: &RoutedReply) -> wasmtime::R
         .ok_or_else(|| wasmtime::Error::msg("invalid MMIO reply slot"))?;
     if routed.reply.error != 0 {
         device.counts.failed.fetch_add(1, Ordering::Relaxed);
+        let kind = match device.kind {
+            crate::component::vmm::machine::DeviceKind::Block => "block",
+            crate::component::vmm::machine::DeviceKind::Fs => "filesystem",
+            crate::component::vmm::machine::DeviceKind::Memory => "memory",
+            crate::component::vmm::machine::DeviceKind::Vsock => "vsock",
+            crate::component::vmm::machine::DeviceKind::Net => "network",
+        };
         return Err(wasmtime::Error::msg(format!(
-            "MMIO device error {}",
+            "MMIO {kind} device error {}",
             routed.reply.error
         )));
     }

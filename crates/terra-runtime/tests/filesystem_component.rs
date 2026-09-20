@@ -64,9 +64,7 @@ async fn mount_with_resource_capacity(
     let engine = device_engine().expect("engine");
     let component = Component::new(
         &engine,
-        include_bytes!(
-            "../../../components/fs/target/wasm32-wasip3/release/terra_fs_component.wasm"
-        ),
+        include_bytes!("../../../components/target/wasm32-wasip3/release/terra_fs_component.wasm"),
     )
     .expect("component");
     let grant = ShareGrant::new(
@@ -81,9 +79,7 @@ async fn mount_with_resource_capacity(
     };
     let router = Component::new(
         &engine,
-        include_bytes!(
-            "../../../components/vmm/target/wasm32-wasip3/release/terra_vmm_component.wasm"
-        ),
+        include_bytes!("../../../components/target/wasm32-wasip3/release/terra_vmm_component.wasm"),
     )
     .expect("MMIO router");
     let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");

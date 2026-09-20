@@ -11,8 +11,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use wasmtime::component::{Component, StreamReader, TypedFunc};
 
+#[derive(Clone)]
+pub struct FailureObservation {
+    failure: Arc<Mutex<Option<String>>>,
+}
+
+impl FailureObservation {
+    #[must_use]
+    pub fn failure(&self) -> Option<String> {
+        recorded_failure(&self.failure)
+    }
+}
+
 wasmtime::component::bindgen!({
     world: "vmm", path: "../../components/vmm/wit",
+    additional_derives: [PartialEq, Eq],
     imports: { default: trappable },
     exports: { default: async },
     with: {
@@ -22,11 +35,8 @@ wasmtime::component::bindgen!({
 });
 pub use terra::mmio::types::{ControlReply, Error, Operation, Reply, Request, RoutedReply};
 pub type Serve = TypedFunc<(StreamReader<Request>,), (StreamReader<Reply>,)>;
-pub(crate) type OpenDevice = TypedFunc<(u32, u64, u64), (Result<StreamReader<Request>, Error>,)>;
-pub(crate) type AttachReplies = TypedFunc<(u32, StreamReader<Reply>), (Result<(), Error>,)>;
 type Access = TypedFunc<(u64, u8, u64, bool), (Result<RoutedReply, Error>,)>;
 type Control = TypedFunc<(u32, Operation), (Result<ControlReply, Error>,)>;
-type ConfigureVcpus = TypedFunc<(u8,), (Result<(), Error>,)>;
 type RunLifecycle = TypedFunc<
     (),
     (Result<terra::mmio::lifecycle_platform::Event, terra::mmio::lifecycle_platform::Error>,),
@@ -212,19 +222,9 @@ async fn submit_async(
 pub(crate) struct Router {
     pub(crate) bridge: crate::box_runtime::ComponentLoop,
     pub(crate) entrypoint: crate::box_runtime::ComponentLoop,
-    pub(crate) initialize_machine: crate::component::vmm::virtualization::InitializeMachine,
-    pub(crate) compose_machine: crate::component::vmm::virtualization::ControlMachine,
-    pub(crate) irq_lines_stage: crate::component::vmm::interrupts::Stage,
-    pub(crate) device_irq_line: crate::component::vmm::interrupts::GsiLine,
-    pub(crate) clear_irq_lines: crate::component::vmm::interrupts::ClearLines,
-    pub(crate) ioapic_stage: crate::component::vmm::interrupts::Stage,
-    pub(crate) ioapic_access: crate::component::vmm::interrupts::Access,
-    pub(crate) ioapic_line: crate::component::vmm::interrupts::Line,
-    pub(crate) ioapic_device_line: crate::component::vmm::interrupts::DeviceLine,
-    pub(crate) ioapic_eoi: crate::component::vmm::interrupts::Eoi,
-    pub(crate) open_device: OpenDevice,
-    pub(crate) attach_replies: AttachReplies,
-    configure_vcpus: ConfigureVcpus,
+    pub(crate) machine: exports::terra::mmio::machine::Guest,
+    pub(crate) interrupts: exports::terra::mmio::interrupts::Guest,
+    routing: exports::terra::mmio::router::Guest,
     sender: tokio::sync::mpsc::Sender<Pending>,
     control_sender: tokio::sync::mpsc::Sender<Pending>,
     admission: Arc<Mutex<Option<String>>>,
@@ -234,6 +234,12 @@ pub(crate) struct Router {
 }
 
 impl Router {
+    #[must_use]
+    pub fn failure_observation(&self) -> FailureObservation {
+        FailureObservation {
+            failure: Arc::clone(&self.failure),
+        }
+    }
     #[cfg(test)]
     pub(crate) fn failure_sink(&self) -> Arc<Mutex<Option<String>>> {
         Arc::clone(&self.failure)
@@ -290,12 +296,13 @@ fn lifecycle_loop(
 
 impl BoxRuntime {
     pub async fn configure_mmio_vcpus(&mut self, count: u32) -> wasmtime::Result<()> {
-        let configure_vcpus = self
+        let router = &self
             .mmio
             .as_ref()
             .ok_or_else(|| wasmtime::Error::msg("MMIO router missing"))?
-            .configure_vcpus;
-        let (result,) = configure_vcpus
+            .routing;
+        let (result,) = router
+            .func_configure_vcpus()
             .call_async(&mut self.store, (u8::try_from(count)?,))
             .await?;
         result.map_err(router_error)
@@ -311,22 +318,7 @@ impl BoxRuntime {
         let router = instance.terra_mmio_router();
         let machine = instance.terra_mmio_machine();
         let interrupts = instance.terra_mmio_interrupts();
-        let run_lifecycle = instance.terra_mmio_lifecycle().func_run();
-        let initialize_machine = machine.func_initialize().func().typed(&self.store)?;
-        let compose_machine = machine.func_compose();
-        let irq_lines_stage = interrupts.func_stage_irq_lines();
-        let device_irq_line = interrupts.func_device_irq_line();
-        let clear_irq_lines = interrupts.func_clear_irq_lines();
-        let ioapic_stage = interrupts.func_stage_ioapic();
-        let ioapic_access = interrupts.func_ioapic_access();
-        let ioapic_line = interrupts.func_ioapic_line();
-        let ioapic_device_line = interrupts.func_ioapic_device_line();
-        let ioapic_eoi = interrupts.func_ioapic_eoi();
-        let open_device = router.func_open_device();
-        let attach_replies = router.func_attach_replies();
-        let access = router.func_access();
-        let control = router.func_control();
-        let configure_vcpus = router.func_configure_vcpus();
+        let lifecycle = instance.terra_mmio_lifecycle().clone();
         let (sender, receiver) = tokio::sync::mpsc::channel(COMMAND_CAPACITY);
         let (control_sender, control_receiver) = tokio::sync::mpsc::channel(CONTROL_CAPACITY);
         let admission = Arc::new(Mutex::new(None));
@@ -335,6 +327,7 @@ impl BoxRuntime {
         let loop_devices = Arc::clone(&devices);
         let loop_admission = Arc::clone(&admission);
         let bridge_senders = (sender.clone(), control_sender.clone());
+        let bridge_router = router.clone();
         let bridge: crate::box_runtime::ComponentLoop = Box::new(move |accessor| {
             Box::pin(async move {
                 let _senders = bridge_senders;
@@ -343,8 +336,8 @@ impl BoxRuntime {
                     receiver,
                     control_receiver,
                     BridgeContext {
-                        access,
-                        control,
+                        access: bridge_router.func_access(),
+                        control: bridge_router.func_control(),
                         devices: loop_devices,
                         admission: loop_admission,
                     },
@@ -352,7 +345,7 @@ impl BoxRuntime {
                 .await
             })
         });
-        let entrypoint = lifecycle_loop(run_lifecycle, self.lifecycle_notifier());
+        let entrypoint = lifecycle_loop(lifecycle.func_run(), self.lifecycle_notifier());
         let vcpu_devices = Arc::clone(&devices);
         crate::component::vmm::configure_callbacks(
             &mut self.store.data_mut().platform,
@@ -374,19 +367,9 @@ impl BoxRuntime {
         self.mmio = Some(Router {
             bridge,
             entrypoint,
-            initialize_machine,
-            compose_machine,
-            irq_lines_stage,
-            device_irq_line,
-            clear_irq_lines,
-            ioapic_stage,
-            ioapic_access,
-            ioapic_line,
-            ioapic_device_line,
-            ioapic_eoi,
-            open_device,
-            attach_replies,
-            configure_vcpus,
+            machine: machine.clone(),
+            interrupts: interrupts.clone(),
+            routing: router.clone(),
             sender,
             control_sender,
             admission,
@@ -397,14 +380,11 @@ impl BoxRuntime {
         Ok(())
     }
 
-    #[allow(unsafe_code)]
     pub async fn initialize_mmio_artifact(
         &mut self,
         artifacts: &crate::TrustedArtifacts,
     ) -> wasmtime::Result<()> {
-        // SAFETY: TrustedArtifacts accepts only the build's authenticated AOT artifacts.
-        let component =
-            unsafe { crate::engine::trusted_component(self.store.engine(), artifacts.mmio()) }?;
+        let component = artifacts.mmio().deserialize(self.store.engine())?;
         self.initialize_mmio(&component).await
     }
 }
@@ -423,7 +403,7 @@ pub(crate) async fn initialize_test_router(root: &mut BoxRuntime) -> wasmtime::R
         root.store.engine(),
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../components/vmm/target/wasm32-wasip3/release/terra_vmm_component.wasm"
+            "/../../components/target/wasm32-wasip3/release/terra_vmm_component.wasm"
         )),
     )?;
     root.initialize_mmio(&component).await
@@ -472,12 +452,13 @@ impl BoxRuntime {
                 && base.checked_add(size).is_some(),
             "worker grant outside box"
         );
-        let open_device = self
+        let router = &self
             .mmio
             .as_ref()
             .ok_or_else(|| wasmtime::Error::msg("MMIO router missing"))?
-            .open_device;
-        let (request_reader,) = open_device
+            .routing;
+        let (request_reader,) = router
+            .func_open_device()
             .call_async(&mut self.store, (slot, base, size))
             .await?;
         let request_reader = request_reader.map_err(router_error)?;
@@ -486,12 +467,13 @@ impl BoxRuntime {
         request_reader.pipe(&mut self.store, sink)?;
         let worker = setup(request_stream).await?;
         let replies = StreamReader::new(&mut self.store, worker.replies)?;
-        let attach_replies = self
+        let router = &self
             .mmio
             .as_ref()
             .ok_or_else(|| wasmtime::Error::msg("MMIO router missing"))?
-            .attach_replies;
-        let (result,) = attach_replies
+            .routing;
+        let (result,) = router
+            .func_attach_replies()
             .call_async(&mut self.store, (slot, replies))
             .await?;
         result.map_err(router_error)?;

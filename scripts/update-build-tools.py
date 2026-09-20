@@ -129,7 +129,7 @@ def main():
         "Makefile", "README.dev.md", "pins.mk", "rust-toolchain.toml", "components/rust-toolchain.toml",
         "kernel/Containerfile", "scripts/alpine-sources.sh", "scripts/build-host.ps1",
         *(str(path.relative_to(args.root)) for path in args.root.glob(".github/workflows/*.yml")),
-        *(str(path.relative_to(args.root)) for path in args.root.glob("components/*/Cargo.toml")),
+        "components/Cargo.toml",
     ]
     original = {path: (args.root / path).read_text() for path in paths}
     updated = original.copy()

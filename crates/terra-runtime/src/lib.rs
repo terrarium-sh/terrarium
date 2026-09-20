@@ -3,7 +3,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod artifacts;
-pub use artifacts::TrustedArtifacts;
+pub use artifacts::{TrustedArtifact, TrustedArtifacts};
 pub mod box_runtime;
 pub mod component;
 pub mod engine;

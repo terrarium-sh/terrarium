@@ -305,7 +305,9 @@ mod tests {
         let runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
         let component = Component::new(
             &engine,
-            include_bytes!("../../../../../components/boot/target/wasm32-wasip3/release/terra_boot_component.wasm"),
+            include_bytes!(
+                "../../../../../components/target/wasm32-wasip3/release/terra_boot_component.wasm"
+            ),
         )
         .expect("boot component");
         let ram = SyntheticRam::new(2 << 20).expect("test RAM");

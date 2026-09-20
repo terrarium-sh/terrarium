@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use terra_protocol::{
     MAX_FILE_BYTES, MAX_SYNC_ENTRIES, MAX_SYNC_METADATA_BYTES, RootStatus, SyncEntry,
-    SyncEntryKind, SyncReply, SyncRequest, WORKLOAD_ID, encode_frame, read_frame, truncate_nanos,
-    validate_relative_path,
+    SyncEntryKind, SyncManifestBudget, SyncManifestLimit, SyncReply, SyncRequest, WORKLOAD_ID,
+    encode_frame, read_frame, truncate_nanos, validate_relative_path,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -317,8 +317,7 @@ fn build_sync_entry(
 struct ScanState<'a, W: Write> {
     session_root: &'a Path,
     conn: &'a mut W,
-    entries_count: usize,
-    total_metadata_bytes: usize,
+    budget: SyncManifestBudget,
 }
 
 impl<W: Write> ScanState<'_, W> {
@@ -349,16 +348,6 @@ impl<W: Write> ScanState<'_, W> {
                 return Ok(false);
             }
         };
-        self.entries_count += 1;
-        if self.entries_count > MAX_SYNC_ENTRIES {
-            send_reply(
-                self.conn,
-                &SyncReply::Err(format!(
-                    "manifest exceeds maximum entries limit: {MAX_SYNC_ENTRIES}"
-                )),
-            )?;
-            return Ok(false);
-        }
         let mut link_target = None;
         let kind = if meta.is_dir() {
             queue.push_back(child_rel);
@@ -370,7 +359,6 @@ impl<W: Write> ScanState<'_, W> {
                         .to_str()
                         .ok_or_else(|| std::io::Error::other("non-UTF-8 symlink target"))?
                         .to_owned();
-                    self.total_metadata_bytes += target_str.len();
                     link_target = Some(target_str);
                     SyncEntryKind::Symlink
                 }
@@ -388,15 +376,26 @@ impl<W: Write> ScanState<'_, W> {
             )?;
             return Ok(false);
         };
-        self.total_metadata_bytes += rel_str.len() + 32;
-        if self.total_metadata_bytes > MAX_SYNC_METADATA_BYTES {
-            send_reply(
-                self.conn,
-                &SyncReply::Err(format!(
-                    "manifest metadata exceeds maximum bytes limit: {MAX_SYNC_METADATA_BYTES}"
-                )),
-            )?;
-            return Ok(false);
+        match self.budget.add_entry(&rel_str, link_target.as_deref()) {
+            Ok(()) => {}
+            Err(SyncManifestLimit::Entries) => {
+                send_reply(
+                    self.conn,
+                    &SyncReply::Err(format!(
+                        "manifest exceeds maximum entries limit: {MAX_SYNC_ENTRIES}"
+                    )),
+                )?;
+                return Ok(false);
+            }
+            Err(SyncManifestLimit::MetadataBytes) => {
+                send_reply(
+                    self.conn,
+                    &SyncReply::Err(format!(
+                        "manifest metadata exceeds maximum bytes limit: {MAX_SYNC_METADATA_BYTES}"
+                    )),
+                )?;
+                return Ok(false);
+            }
         }
         send_reply(
             self.conn,
@@ -414,8 +413,7 @@ fn scan_directory_tree(
     let mut state = ScanState {
         session_root,
         conn,
-        entries_count: 0,
-        total_metadata_bytes: 0,
+        budget: SyncManifestBudget::new(),
     };
     let mut queue = VecDeque::new();
     queue.push_back(PathBuf::new());

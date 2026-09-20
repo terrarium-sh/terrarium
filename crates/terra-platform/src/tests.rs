@@ -411,7 +411,8 @@ mod block_component_tests {
     use super::super::component::vmm::mmio::{Operation, Reply, Request};
     use super::super::engine::{
         Completion, DeviceError, DiskGrant, Range, block_component_linker, device_engine,
-        precompile_component, test_support::device_store,
+        precompile_component,
+        test_support::{StandaloneHost, device_store},
     };
     use super::super::{BoundedDisk, SyntheticRam};
     use std::pin::Pin;
@@ -442,7 +443,7 @@ mod block_component_tests {
 
     pub(crate) fn component_bytes() -> Vec<u8> {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../components/block/target/wasm32-wasip3/release/terra_block_component.wasm");
+            .join("../../components/target/wasm32-wasip3/release/terra_block_component.wasm");
         std::fs::read(&path)
             .expect("block component missing; run `make component-block` with the pinned nightly")
     }
@@ -454,7 +455,7 @@ mod block_component_tests {
     }
 
     struct Fixture {
-        store: wasmtime::Store<super::super::engine::BlockHost>,
+        store: wasmtime::Store<StandaloneHost<super::super::engine::BlockHost>>,
         execute: Execute,
         configure: Configure,
         serve: Serve,
@@ -462,13 +463,13 @@ mod block_component_tests {
 
     struct ReplySink(Arc<Mutex<Option<Reply>>>);
 
-    impl StreamConsumer<super::super::engine::BlockHost> for ReplySink {
+    impl StreamConsumer<StandaloneHost<super::super::engine::BlockHost>> for ReplySink {
         type Item = Reply;
 
         fn poll_consume(
             self: Pin<&mut Self>,
             _: &mut Context<'_>,
-            store: StoreContextMut<super::super::engine::BlockHost>,
+            store: StoreContextMut<StandaloneHost<super::super::engine::BlockHost>>,
             mut source: Source<'_, Self::Item>,
             finish: bool,
         ) -> Poll<wasmtime::Result<StreamResult>> {
@@ -530,7 +531,10 @@ mod block_component_tests {
     async fn fixture(
         capacity_sectors: usize,
         readonly: bool,
-    ) -> (Linker<super::super::engine::BlockHost>, Fixture) {
+    ) -> (
+        Linker<StandaloneHost<super::super::engine::BlockHost>>,
+        Fixture,
+    ) {
         let engine = device_engine().expect("engine builds");
         let linker = block_component_linker(&engine).expect("block imports link");
         let mut disk = BoundedDisk::new(capacity_sectors * 512, readonly);

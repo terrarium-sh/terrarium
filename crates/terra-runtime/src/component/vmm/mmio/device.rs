@@ -14,6 +14,21 @@ enum DeviceState {
     Closed,
 }
 
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum ControlOperation {
+    Reset,
+    Close,
+}
+
+impl From<ControlOperation> for Operation {
+    fn from(operation: ControlOperation) -> Self {
+        match operation {
+            ControlOperation::Reset => Self::Reset,
+            ControlOperation::Close => Self::Close,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct MmioDevice {
     device: Arc<DeviceRegistration>,
@@ -88,6 +103,22 @@ impl MmioDevice {
         Ok(channel)
     }
 
+    pub(crate) fn revoke_worker(&self, root: &mut BoxRuntime) -> wasmtime::Result<()> {
+        let router = root
+            .mmio
+            .as_mut()
+            .ok_or_else(|| wasmtime::Error::msg("MMIO router missing"))?;
+        wasmtime::ensure!(
+            router
+                .device_plan
+                .last()
+                .is_some_and(|plan| Arc::ptr_eq(&plan.device, &self.device)),
+            "device is not the latest box grant"
+        );
+        router.device_plan.pop();
+        Ok(())
+    }
+
     pub fn map_mmio(&self, runtime: &mut BoxRuntime, base: u64, size: u64) -> wasmtime::Result<()> {
         wasmtime::ensure!(
             size != 0 && base.checked_add(size).is_some(),
@@ -147,10 +178,10 @@ impl MmioDevice {
     }
 
     pub fn reset(&self) -> wasmtime::Result<()> {
-        self.control(Operation::Reset)
+        self.control(ControlOperation::Reset)
     }
 
-    fn begin_control(&self, operation: Operation) -> wasmtime::Result<Option<ControlGuard>> {
+    fn begin_control(&self, operation: ControlOperation) -> wasmtime::Result<Option<ControlGuard>> {
         let mut state = self
             .state
             .lock()
@@ -158,14 +189,11 @@ impl MmioDevice {
         match *state {
             DeviceState::Open => {
                 *state = match operation {
-                    Operation::Reset => DeviceState::Resetting,
-                    Operation::Close => DeviceState::Closing,
-                    Operation::Read | Operation::Write | Operation::InterruptLevel => {
-                        wasmtime::bail!("invalid MMIO control operation");
-                    }
+                    ControlOperation::Reset => DeviceState::Resetting,
+                    ControlOperation::Close => DeviceState::Closing,
                 }
             }
-            DeviceState::Closed if operation == Operation::Close => return Ok(None),
+            DeviceState::Closed if operation == ControlOperation::Close => return Ok(None),
             DeviceState::Closed | DeviceState::Resetting | DeviceState::Closing => {
                 return Err(wasmtime::Error::msg("MMIO device unavailable"));
             }
@@ -177,18 +205,18 @@ impl MmioDevice {
     }
 
     pub fn close(&self) -> wasmtime::Result<()> {
-        self.control(Operation::Close)
+        self.control(ControlOperation::Close)
     }
 
     pub async fn close_async(&self) -> wasmtime::Result<()> {
-        let Some(control) = self.begin_control(Operation::Close)? else {
+        let Some(control) = self.begin_control(ControlOperation::Close)? else {
             return Ok(());
         };
         submit_async(
             &self.control_sender,
             &self.admission,
             &self.failure,
-            Command::Control(self.device.slot, Operation::Close),
+            Command::Control(self.device.slot, ControlOperation::Close.into()),
             control,
         )
         .await
@@ -225,7 +253,7 @@ impl MmioDevice {
         Ok(wait_for_reply(&self.failure, &response)?.reply)
     }
 
-    fn control(&self, operation: Operation) -> wasmtime::Result<()> {
+    fn control(&self, operation: ControlOperation) -> wasmtime::Result<()> {
         let Some(control) = self.begin_control(operation)? else {
             return Ok(());
         };
@@ -233,7 +261,7 @@ impl MmioDevice {
             &self.control_sender,
             &self.admission,
             &self.failure,
-            Command::Control(self.device.slot, operation),
+            Command::Control(self.device.slot, operation.into()),
             control,
         )
         .map(|_| ())
@@ -302,7 +330,7 @@ mod tests {
     fn abandoned_sync_waiters_leave_control_completion_to_the_request() {
         use super::super::{ReplySender, RoutedReply, enqueue_reply};
 
-        for operation in [Operation::Reset, Operation::Close] {
+        for operation in [ControlOperation::Reset, ControlOperation::Close] {
             for resolution in [Some(true), Some(false), None] {
                 let (device, mut controls) = test_device();
                 let control = device.begin_control(operation).unwrap().unwrap();
@@ -310,7 +338,7 @@ mod tests {
                 enqueue_reply(
                     &device.control_sender,
                     &device.admission,
-                    Command::Control(0, operation),
+                    Command::Control(0, operation.into()),
                     ReplySender::Sync(reply),
                     Some(control),
                 )
@@ -335,7 +363,7 @@ mod tests {
                         .send(Err(wasmtime::Error::msg("control failed"))),
                     None => drop(pending),
                 }
-                let expected = if operation == Operation::Reset && resolution == Some(true) {
+                let expected = if operation == ControlOperation::Reset && resolution == Some(true) {
                     DeviceState::Open
                 } else {
                     DeviceState::Closed
@@ -347,7 +375,7 @@ mod tests {
 
     #[test]
     fn rejected_controls_close_the_device() {
-        for operation in [Operation::Reset, Operation::Close] {
+        for operation in [ControlOperation::Reset, ControlOperation::Close] {
             let (device, _controls) = test_device();
             *device.admission.lock().unwrap() = Some("stopped".to_owned());
             assert!(device.control(operation).is_err());

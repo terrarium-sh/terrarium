@@ -34,11 +34,7 @@ jobs:
             exit 0
           fi
           version=$(sed -n 's/^WIT_BINDGEN_VERSION := //p' Makefile)
-          for manifest in components/*/Cargo.toml; do
-            if grep -q '^wit-bindgen ' "$manifest"; then
-              cargo update --manifest-path "$manifest" --package wit-bindgen --precise "$version"
-            fi
-          done
+          cargo update --manifest-path components/Cargo.toml --package wit-bindgen --precise "$version"
       - name: Check synchronized tool versions
         run: python3 -B scripts/check-tool-versions.py
       - name: Open update PR

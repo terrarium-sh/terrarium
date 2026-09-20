@@ -5,8 +5,9 @@ use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use terra_protocol::{
-    MAX_FILE_BYTES, MAX_SYNC_ENTRIES, MAX_SYNC_METADATA_BYTES, SyncEntry, SyncEntryKind, SyncReply,
-    SyncRequest, truncate_nanos, validate_relative_path,
+    MAX_FILE_BYTES, MAX_SYNC_ENTRIES, MAX_SYNC_METADATA_BYTES, SyncEntry, SyncEntryKind,
+    SyncManifestBudget, SyncManifestLimit, SyncReply, SyncRequest, truncate_nanos,
+    validate_relative_path,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -117,7 +118,7 @@ pub(super) fn scan_host_directory(root_path: &Path) -> Result<BTreeMap<String, S
     let mut entries = single_host_entry_map(root_path, &std::fs::symlink_metadata(root_path)?)?;
     let mut queue = VecDeque::new();
     queue.push_back(PathBuf::new());
-    let mut total_metadata_bytes = 0usize;
+    let mut budget = SyncManifestBudget::with_existing_entries(entries.len());
 
     while let Some(rel) = queue.pop_front() {
         let full = if rel.as_os_str().is_empty() {
@@ -181,16 +182,15 @@ pub(super) fn scan_host_directory(root_path: &Path) -> Result<BTreeMap<String, S
                 0
             };
 
-            total_metadata_bytes +=
-                rel_str.len() + link_target.as_ref().map_or(0, std::string::String::len) + 32;
-            anyhow::ensure!(
-                entries.len() < MAX_SYNC_ENTRIES,
-                "manifest exceeds maximum entry budget of {MAX_SYNC_ENTRIES} entries"
-            );
-            anyhow::ensure!(
-                total_metadata_bytes <= MAX_SYNC_METADATA_BYTES,
-                "manifest exceeds maximum metadata budget of {MAX_SYNC_METADATA_BYTES} bytes"
-            );
+            match budget.add_entry(&rel_str, link_target.as_deref()) {
+                Ok(()) => {}
+                Err(SyncManifestLimit::Entries) => anyhow::bail!(
+                    "manifest exceeds maximum entry budget of {MAX_SYNC_ENTRIES} entries"
+                ),
+                Err(SyncManifestLimit::MetadataBytes) => anyhow::bail!(
+                    "manifest exceeds maximum metadata budget of {MAX_SYNC_METADATA_BYTES} bytes"
+                ),
+            }
 
             if kind == SyncEntryKind::Directory {
                 queue.push_back(child_rel);
@@ -218,7 +218,7 @@ pub(super) async fn scan_guest_entries(
 ) -> Result<BTreeMap<String, SyncEntry>> {
     send_request(stream, &SyncRequest::ScanEntries).await?;
     let mut entries = BTreeMap::new();
-    let mut total_metadata_bytes = 0usize;
+    let mut budget = SyncManifestBudget::new();
 
     let deadline = Instant::now() + COPY_DATA_TIMEOUT;
     loop {
@@ -230,20 +230,15 @@ pub(super) async fn scan_guest_entries(
             SyncReply::Entry(entry) => {
                 validate_relative_path(&entry.relative_path)
                     .map_err(|e| anyhow::anyhow!("invalid guest path: {e}"))?;
-                total_metadata_bytes += entry.relative_path.len()
-                    + entry
-                        .link_target
-                        .as_ref()
-                        .map_or(0, std::string::String::len)
-                    + 32;
-                anyhow::ensure!(
-                    entries.len() < MAX_SYNC_ENTRIES,
-                    "guest manifest exceeds maximum entry budget of {MAX_SYNC_ENTRIES} entries"
-                );
-                anyhow::ensure!(
-                    total_metadata_bytes <= MAX_SYNC_METADATA_BYTES,
-                    "guest manifest exceeds maximum metadata budget of {MAX_SYNC_METADATA_BYTES} bytes"
-                );
+                match budget.add_entry(&entry.relative_path, entry.link_target.as_deref()) {
+                    Ok(()) => {}
+                    Err(SyncManifestLimit::Entries) => anyhow::bail!(
+                        "guest manifest exceeds maximum entry budget of {MAX_SYNC_ENTRIES} entries"
+                    ),
+                    Err(SyncManifestLimit::MetadataBytes) => anyhow::bail!(
+                        "guest manifest exceeds maximum metadata budget of {MAX_SYNC_METADATA_BYTES} bytes"
+                    ),
+                }
                 anyhow::ensure!(
                     entries.insert(entry.relative_path.clone(), entry).is_none(),
                     "guest manifest contains a duplicate path"

@@ -10,7 +10,7 @@ pub use crate::component::vsock::host::{VsockDeviceHost, vsock_component_linker}
 
 use super::{BoundedMemory, Interrupt, MAX_SINGLE_BYTES, SyntheticRam};
 use std::sync::Arc;
-use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
+use wasmtime::{Config, Engine};
 use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 /// Guest linear memory ceiling per device store. Debug components
@@ -29,7 +29,6 @@ pub struct DeviceContext {
     irq: Interrupt,
     interrupt_level: bool,
     interrupt_notification: Arc<tokio::sync::Notify>,
-    limits: StoreLimits,
 }
 
 impl DeviceContext {
@@ -57,7 +56,6 @@ impl DeviceContext {
             irq: Interrupt::new(),
             interrupt_level: false,
             interrupt_notification: Arc::new(tokio::sync::Notify::new()),
-            limits: build_device_limits(STORE_MEMORY_BYTES),
         }
     }
 
@@ -127,16 +125,6 @@ impl DeviceHost for DeviceContext {
     }
 }
 
-fn build_device_limits(memory_bytes: usize) -> StoreLimits {
-    StoreLimitsBuilder::new()
-        .memory_size(memory_bytes)
-        .table_elements(1024)
-        .instances(16)
-        .memories(4)
-        .tables(8)
-        .build()
-}
-
 /// Engine for device stores with epoch interruption and async components.
 pub fn device_engine() -> wasmtime::Result<Engine> {
     configured_device_engine(false)
@@ -172,9 +160,48 @@ fn apply_device_settings(config: &mut Config, fuel: bool) -> wasmtime::Result<()
 }
 
 pub mod test_support {
-    use super::{DeviceHost, Engine, Store, build_device_limits};
+    use super::{DeviceContext, DeviceHost, Engine, WasiCtxView, WasiView};
+    use wasmtime::{Store, StoreLimits, StoreLimitsBuilder};
+
+    pub struct StandaloneHost<H> {
+        host: H,
+        pub(super) limits: StoreLimits,
+    }
+
+    impl<H> std::ops::Deref for StandaloneHost<H> {
+        type Target = H;
+
+        fn deref(&self) -> &H {
+            &self.host
+        }
+    }
+
+    impl<H> std::ops::DerefMut for StandaloneHost<H> {
+        fn deref_mut(&mut self) -> &mut H {
+            &mut self.host
+        }
+    }
+
+    impl<H> AsMut<H> for StandaloneHost<H> {
+        fn as_mut(&mut self) -> &mut H {
+            &mut self.host
+        }
+    }
+
+    impl<H: WasiView> WasiView for StandaloneHost<H> {
+        fn ctx(&mut self) -> WasiCtxView<'_> {
+            self.host.ctx()
+        }
+    }
+
+    impl<H: DeviceHost> DeviceHost for StandaloneHost<H> {
+        fn context(&mut self) -> &mut DeviceContext {
+            self.host.context()
+        }
+    }
+
     #[must_use]
-    pub fn device_store<H: DeviceHost>(engine: &Engine, host: H) -> Store<H> {
+    pub fn device_store<H: DeviceHost>(engine: &Engine, host: H) -> Store<StandaloneHost<H>> {
         device_store_with_limits(
             engine,
             host,
@@ -186,13 +213,19 @@ pub mod test_support {
     #[must_use]
     pub fn device_store_with_limits<H: DeviceHost>(
         engine: &Engine,
-        mut host: H,
+        host: H,
         limits: crate::box_runtime::ComponentMemoryLimits,
-    ) -> Store<H> {
-        host.context().limits = build_device_limits(limits.component_bytes());
-        let mut store = Store::new(engine, host);
+    ) -> Store<StandaloneHost<H>> {
+        let limits = StoreLimitsBuilder::new()
+            .memory_size(limits.component_bytes())
+            .table_elements(1024)
+            .instances(16)
+            .memories(4)
+            .tables(8)
+            .build();
+        let mut store = Store::new(engine, StandaloneHost { host, limits });
         store.set_epoch_deadline(1);
-        store.limiter(|host| &mut host.context().limits);
+        store.limiter(|host| &mut host.limits);
         store
     }
 }
@@ -294,21 +327,6 @@ pub fn add_device_imports<T: Send + 'static>(
 #[cfg(any(test, feature = "compiler", feature = "test-support"))]
 pub fn precompile_component(engine: &Engine, bytes: &[u8]) -> wasmtime::Result<Vec<u8>> {
     engine.precompile_component(bytes)
-}
-
-/// Deserialize a build-embedded component artifact.
-///
-/// # Safety
-///
-/// `artifact` must be trusted AOT output from this exact Wasmtime build,
-/// never runtime input.
-#[allow(unsafe_code)]
-pub unsafe fn trusted_component(
-    engine: &Engine,
-    artifact: &'static [u8],
-) -> wasmtime::Result<wasmtime::component::Component> {
-    // SAFETY: the caller guarantees the artifact's trusted build provenance.
-    unsafe { wasmtime::component::Component::deserialize(engine, artifact) }
 }
 
 #[cfg(test)]

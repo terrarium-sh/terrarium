@@ -160,7 +160,7 @@ pub async fn prepare(mut input: WorkerInput) -> Result<PreparedVmm, String> {
         crate::worker::boot_prepared(component_runtime, prepared, &mut input)
             .await
             .map_err(|error| error.to_string())?;
-    let devices = worker::assemble_devices(
+    worker::assemble_devices(
         &mut component_runtime,
         &mut input,
         machine.ram(),
@@ -173,7 +173,7 @@ pub async fn prepare(mut input: WorkerInput) -> Result<PreparedVmm, String> {
                 .map_err(|error| error.to_string())
         },
     )?;
-    worker::grant_device_shutdown(&mut component_runtime, &devices)?;
+    let failure = component_runtime.mmio_failure_observation()?;
     let lifecycle = component_runtime.lifecycle_notifier();
     let (component_runtime, group) = component_runtime
         .prepare_vcpus(move |controls, boot| {
@@ -188,7 +188,7 @@ pub async fn prepare(mut input: WorkerInput) -> Result<PreparedVmm, String> {
             reaper: group,
             lifecycle,
             deadline: input.deadline,
-            devices,
+            failure,
             teardown,
         },
     })

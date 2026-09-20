@@ -45,9 +45,8 @@ struct ComponentReply {
     payload: Vec<u8>,
 }
 
-const COMPONENT: &[u8] = include_bytes!(
-    "../../../components/vsock/target/wasm32-wasip3/release/terra_vsock_component.wasm"
-);
+const COMPONENT: &[u8] =
+    include_bytes!("../../../components/target/wasm32-wasip3/release/terra_vsock_component.wasm");
 
 type ComponentResult<T> = (Result<T, ComponentError>,);
 type Receive = TypedFunc<(Vec<u8>,), ComponentResult<()>>;
