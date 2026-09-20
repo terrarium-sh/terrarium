@@ -266,6 +266,14 @@ async fn sync_guest_to_host(
         },
     );
     let effective_host_root = PathBuf::from(effective_host_root_str);
+    if initial_root_status == RootStatus::ExistingSymlink && effective_host_root == *dst_path {
+        anyhow::bail!(
+            "cannot sync guest symlink {src_path_str} to {}: the link target would resolve outside \
+             the destination; sync the link's target instead, or place the link inside a directory \
+             destination",
+            dst_path.display()
+        );
+    }
     let single_file_name = if is_dir_sync {
         None
     } else {
@@ -426,6 +434,33 @@ mod tests {
                 Path::new("..")
             );
         }
+    }
+
+    /// A guest symlink whose destination is the root itself would resolve its
+    /// target relative to the destination's parent, outside the synced tree.
+    #[tokio::test]
+    async fn download_rejects_a_symlink_that_replaces_the_destination() {
+        let scratch = tempfile::tempdir().unwrap();
+        let destination = scratch.path().join("out");
+        let args = SyncArgs {
+            src: ":/link".into(),
+            dst: destination.to_str().unwrap().into(),
+            delete: false,
+            checksum: false,
+            dry_run: false,
+            agent: crate::cli::AgentTimeoutArg {
+                agent_timeout: None,
+            },
+        };
+        let (src, dst, _) = parse_endpoints(&args.src, &args.dst).unwrap();
+        let replies = [SyncReply::SessionReady {
+            root_status: RootStatus::ExistingSymlink,
+        }];
+        let error = sync_guest_to_host(&mut peer(&replies), &src, &dst, &args)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("symlink"), "{error:#}");
+        assert!(std::fs::symlink_metadata(&destination).is_err());
     }
 
     #[tokio::test]
