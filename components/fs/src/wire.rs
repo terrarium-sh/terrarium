@@ -3,6 +3,10 @@
 pub const HEADER: usize = 40;
 pub const OUT_HEADER: usize = 16;
 pub const INIT: u32 = 26;
+pub const RECEIVE_EVENT: u32 = 4096;
+pub const CANCEL_EVENTS: u32 = 4097;
+pub const EVENT_SAME_INODE: u32 = 0x200;
+pub const FILE_EVENTS: u32 = 1 << 31;
 pub const FORGET: u32 = 2;
 pub const LOOKUP: u32 = 1;
 pub const GETATTR: u32 = 3;
@@ -100,6 +104,9 @@ pub fn init(body: &[u8]) -> Result<Vec<u8>, i32> {
     out[18..20].copy_from_slice(&48_u16.to_le_bytes());
     out[20..24].copy_from_slice(&(64 * 1024_u32).to_le_bytes());
     out[24..28].copy_from_slice(&1_u32.to_le_bytes());
+    if extended {
+        out[32..36].copy_from_slice(&(u32_at(body, 16).unwrap_or(0) & FILE_EVENTS).to_le_bytes());
+    }
     Ok(out)
 }
 
@@ -129,6 +136,18 @@ mod tests {
         assert_eq!(u16::from_le_bytes(reply[16..18].try_into().unwrap()), 64);
         assert_eq!(u16::from_le_bytes(reply[18..20].try_into().unwrap()), 48);
         assert_eq!(u32_at(&reply, 20), Some(64 * 1024));
+    }
+
+    #[test]
+    fn events_require_explicit_extended_negotiation() {
+        let mut body = vec![0; 20];
+        body[..4].copy_from_slice(&7_u32.to_le_bytes());
+        body[4..8].copy_from_slice(&40_u32.to_le_bytes());
+        body[16..20].copy_from_slice(&FILE_EVENTS.to_le_bytes());
+        assert_eq!(u32_at(&init(&body).unwrap(), 32), Some(0));
+        body[12..16].copy_from_slice(&INIT_EXT.to_le_bytes());
+        assert_eq!(u32_at(&init(&body).unwrap(), 32), Some(FILE_EVENTS));
+        assert_eq!(u32_at(&init(&body[..16]).unwrap(), 32), Some(0));
     }
 
     #[test]

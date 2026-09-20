@@ -388,3 +388,164 @@ fn serve_request(listener: &TcpListener) {
         }
     }
 }
+
+#[test]
+#[ignore = "requires a release binary, Zig, and usable KVM, Hypervisor.framework, or WHP"]
+fn native_boot_forwards_shared_file_events() {
+    let writer = BoxFixture::new();
+    let reader = BoxFixture::new();
+    let shared = writer.directory.path().join("shared");
+    std::fs::create_dir(&shared).unwrap();
+    let probe = shared.join("probe");
+    let status = Command::new("zig")
+        .args([
+            "cc",
+            "-target",
+            &format!("{}-linux-musl", std::env::consts::ARCH),
+            "-static",
+            "-O2",
+            "-o",
+        ])
+        .arg(&probe)
+        .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/assets/file_events_probe.c"))
+        .status()
+        .unwrap();
+    assert!(status.success());
+    for (fixture, readonly) in [(&writer, false), (&reader, true)] {
+        let recipe = fixture.directory.path().join("native.yaml");
+        let config = serde_json::json!({
+            "mounts": [{"host": shared, "guest": "/shared", "readonly": readonly}],
+            "workload": {"entrypoint": "/bin/sleep", "args": ["300"]}
+        });
+        std::fs::write(&recipe, yaml_serde::to_string(&config).unwrap()).unwrap();
+        fixture.successful(&[recipe.to_str().unwrap(), "setup"]);
+        fixture.successful(&["native", "-d"]);
+    }
+    std::fs::create_dir(shared.join("nested")).unwrap();
+    for (index, (name, expected)) in [
+        ("value", "host"),
+        ("value", "atomic"),
+        ("value", "guest"),
+        ("created", "new"),
+        ("created", "absent"),
+        ("nested/value", "nested"),
+        ("value", "resumed"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if index == 0 {
+            std::fs::write(shared.join(name), "initial").unwrap();
+        }
+        let (parent, basename) = name.rsplit_once('/').unwrap_or(("", name));
+        reader.successful(&["native", "exec", "--", "rm", "-f", "/tmp/event-ready"]);
+        std::thread::scope(|scope| {
+            let probe = scope.spawn(|| {
+                reader.successful(&[
+                    "native",
+                    "exec",
+                    "--",
+                    "/shared/probe",
+                    &format!("/shared/{parent}"),
+                    basename,
+                    "/tmp/event-ready",
+                    expected,
+                ])
+            });
+            reader.successful(&["native", "exec", "--", "sh", "-ec", "for i in $(seq 1 100); do test ! -e /tmp/event-ready || exit 0; sleep .1; done; exit 1"]);
+            match index {
+                0 | 3 | 5 => std::fs::write(shared.join(name), expected).unwrap(),
+                1 => {
+                    std::fs::write(shared.join("replacement"), expected).unwrap();
+                    std::fs::rename(shared.join("replacement"), shared.join(name)).unwrap();
+                }
+                2 => {
+                    assert_guest_write_notifies_host(&writer, &shared);
+                }
+                4 => std::fs::remove_file(shared.join(name)).unwrap(),
+                6 => {
+                    for value in 0..10_000 {
+                        std::fs::write(shared.join("flood"), value.to_string()).unwrap();
+                    }
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while !probe.is_finished() && Instant::now() < deadline {
+                        std::fs::write(shared.join(name), expected).unwrap();
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                }
+                _ => unreachable!(),
+            }
+            let output = probe.join().unwrap();
+            assert!(output.contains("FILE_EVENTS_OK"), "{output}");
+        });
+    }
+    assert_eq!(
+        std::fs::read_to_string(shared.join("value")).unwrap(),
+        "resumed"
+    );
+    writer.successful(&["native", "stop"]);
+    reader.successful(&["native", "stop"]);
+}
+
+fn assert_guest_write_notifies_host(writer: &BoxFixture, shared: &std::path::Path) {
+    use notify::Watcher as _;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let mut watcher = notify::recommended_watcher(sender).unwrap();
+    watcher
+        .watch(shared, notify::RecursiveMode::Recursive)
+        .unwrap();
+    writer.successful(&[
+        "native",
+        "exec",
+        "--",
+        "sh",
+        "-ec",
+        "printf guest > /shared/value",
+    ]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let event = receiver
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap()
+            .unwrap();
+        if !matches!(event.kind, notify::EventKind::Access(_))
+            && event.paths.iter().any(|path| path.ends_with("value"))
+        {
+            break;
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a release binary, package downloads, and usable KVM, Hypervisor.framework, or WHP"]
+fn native_boot_reloads_node_server_from_host_events() {
+    let fixture = BoxFixture::new();
+    let shared = fixture.directory.path().join("shared");
+    std::fs::create_dir(&shared).unwrap();
+    let script = |value| {
+        format!(
+            "require('node:http').createServer((req,res)=>res.end('{value}')).listen(3000,'127.0.0.1');\n"
+        )
+    };
+    std::fs::write(shared.join("server.js"), script("initial")).unwrap();
+    let recipe = fixture.directory.path().join("native.yaml");
+    let config = serde_json::json!({
+        "network": {"mode": "unrestricted-public"},
+        "hooks": {"on_create": ["apk add --no-cache nodejs"]},
+        "mounts": [{"host": shared, "guest": "/shared", "readonly": true}],
+        "workload": {"entrypoint": "/usr/bin/node", "args": ["--watch", "/shared/server.js"]}
+    });
+    std::fs::write(&recipe, yaml_serde::to_string(&config).unwrap()).unwrap();
+    fixture.successful(&[recipe.to_str().unwrap(), "setup"]);
+    fixture.successful(&["native", "-d"]);
+    for value in ["initial", "edited", "replaced"] {
+        if value == "edited" {
+            std::fs::write(shared.join("server.js"), script(value)).unwrap();
+        } else if value == "replaced" {
+            std::fs::write(shared.join("replacement.js"), script(value)).unwrap();
+            std::fs::rename(shared.join("replacement.js"), shared.join("server.js")).unwrap();
+        }
+        fixture.successful(&["native", "exec", "--", "sh", "-ec", &format!("for i in $(seq 1 150); do if test \"$(wget -q -T 1 -O - http://127.0.0.1:3000/ || true)\" = {value}; then exit 0; fi; sleep .1; done; exit 1")]);
+    }
+    fixture.successful(&["native", "stop"]);
+}

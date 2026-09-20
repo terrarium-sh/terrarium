@@ -64,8 +64,11 @@ VM behavior.
 - [ ] **Mount coherency contract:** define cache and writeback behavior for
   host and other-box changes through open files, directory listings, mappings,
   rename, truncation, and fsync. Test it through the filesystem worker
-  ([`components/fs`](../components/fs)) and real guests. Document polling for
-  editors; host-to-guest notification bridging is intentionally absent.
+  ([`components/fs`](../components/fs)) and real guests. Native event forwarding
+  now covers host-to-guest notifications through virtio-fs without polling or
+  recovery scans. Linux KVM acceptance passed on 2026-09-20 for direct and
+  directory watches, atomic saves, read-only shares, box-to-box edits, and Node
+  native watch-mode reload. Actual macOS and Windows acceptance remains open.
 
 - [ ] **Concurrent mount workloads:** extend the existing one-guest Git, atomic
   save, executable, and mmap coverage in

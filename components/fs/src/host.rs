@@ -111,6 +111,7 @@ type Descriptor = std::sync::Arc<types::Descriptor>;
 const MAX_DIRECTORY_CACHE_BYTES: usize = 4 << 20;
 static DIRECTORY_CACHE_BYTES: AtomicUsize = AtomicUsize::new(0);
 
+#[derive(Clone)]
 pub struct Node {
     descriptor: Option<Descriptor>,
     path: Option<(Descriptor, String)>,
@@ -295,13 +296,23 @@ impl Node {
         self.descriptor.as_ref().ok_or(Error::Unsupported)
     }
 
+    pub async fn child_identity(&self, name: &str) -> Result<types::MetadataHashValue, Error> {
+        self.descriptor()?
+            .metadata_hash_at(types::PathFlags::empty(), name.to_owned())
+            .await
+            .map_err(error)
+    }
+
     pub async fn stat(&self) -> Result<Stat, Error> {
         if let Some(descriptor) = &self.descriptor {
             let mut stat = stat(
                 descriptor.stat().await.map_err(error)?,
                 descriptor.metadata_hash().await.map_err(error)?,
             );
-            if let Some(mode) = crate::terra::fs::host::get_mode(descriptor).map_err(host_error)? {
+            if let Some(mode) = crate::terra::fs::host::get_mode(descriptor)
+                .await
+                .map_err(host_error)?
+            {
                 stat.mode = mode;
             }
             Ok(stat)
@@ -312,7 +323,7 @@ impl Node {
     }
 
     pub async fn open(&self, flags: OpenFlags) -> Result<Descriptor, Error> {
-        let descriptor = self.descriptor()?;
+        let mut descriptor = self.descriptor()?.clone();
         if !matches!(
             descriptor.get_type().await.map_err(error)?,
             types::DescriptorType::RegularFile
@@ -324,12 +335,34 @@ impl Node {
             || (flags.0 & OpenFlags::WRITE.0 != 0
                 && !granted.contains(types::DescriptorFlags::WRITE))
         {
-            return Err(Error::Access);
+            let (parent, name) = self.path.as_ref().ok_or(Error::Access)?;
+            let mut access = types::DescriptorFlags::empty();
+            if flags.0 & OpenFlags::READ.0 != 0 {
+                access |= types::DescriptorFlags::READ;
+            }
+            if flags.0 & OpenFlags::WRITE.0 != 0 {
+                access |= types::DescriptorFlags::WRITE;
+            }
+            let reopened = parent
+                .open_at(
+                    types::PathFlags::empty(),
+                    name.clone(),
+                    types::OpenFlags::empty(),
+                    access,
+                )
+                .await
+                .map_err(error)?;
+            let expected = descriptor.metadata_hash().await.map_err(error)?;
+            let actual = reopened.metadata_hash().await.map_err(error)?;
+            if (expected.upper, expected.lower) != (actual.upper, actual.lower) {
+                return Err(Error::NoEntry);
+            }
+            descriptor = std::sync::Arc::new(reopened);
         }
         if flags.0 & OpenFlags::TRUNCATE.0 != 0 {
             descriptor.set_size(0).await.map_err(error)?;
         }
-        Ok(descriptor.clone())
+        Ok(descriptor)
     }
 
     pub async fn setattr(
@@ -346,10 +379,16 @@ impl Node {
         }
         let descriptor = self.descriptor()?;
         if let Some(mode) = mode {
-            crate::terra::fs::host::set_mode(descriptor, mode).map_err(host_error)?;
+            crate::terra::fs::host::set_mode(descriptor, mode)
+                .await
+                .map_err(host_error)?;
         }
         if let Some(size) = size {
-            descriptor.set_size(size).await.map_err(error)?;
+            self.open(OpenFlags::WRITE)
+                .await?
+                .set_size(size)
+                .await
+                .map_err(error)?;
         }
         if atime.is_some() || mtime.is_some() {
             let convert = |value: Option<Timestamp>| match value {
@@ -395,8 +434,10 @@ impl Node {
         ))
     }
 
-    pub fn statfs(&self) -> Result<Statfs, Error> {
-        let stat = crate::terra::fs::host::statfs(self.descriptor()?).map_err(host_error)?;
+    pub async fn statfs(&self) -> Result<Statfs, Error> {
+        let stat = crate::terra::fs::host::statfs(self.descriptor()?)
+            .await
+            .map_err(host_error)?;
         Ok(Statfs {
             blocks: stat.blocks,
             blocks_free: stat.blocks_free,
@@ -543,7 +584,7 @@ pub async fn lookup(parent: &Node, name: Vec<u8>) -> Result<Node, Error> {
                 types::ErrorCode::ReadOnly
                 | types::ErrorCode::NotPermitted
                 | types::ErrorCode::Access,
-            ) => directory
+            ) => match directory
                 .open_at(
                     types::PathFlags::empty(),
                     name.clone(),
@@ -551,7 +592,17 @@ pub async fn lookup(parent: &Node, name: Vec<u8>) -> Result<Node, Error> {
                     types::DescriptorFlags::READ,
                 )
                 .await
-                .map_err(error)?,
+            {
+                Ok(descriptor) => descriptor,
+                Err(
+                    types::ErrorCode::ReadOnly
+                    | types::ErrorCode::NotPermitted
+                    | types::ErrorCode::Access,
+                ) => crate::terra::fs::host::open_metadata_at(directory, name.clone())
+                    .await
+                    .map_err(host_error)?,
+                Err(code) => return Err(error(code)),
+            },
             Err(code) => return Err(error(code)),
         };
         Some(std::sync::Arc::new(opened))
@@ -602,7 +653,7 @@ pub async fn create(
             .map_err(error)?,
     );
     if created {
-        apply_create_mode(&descriptor, mode)?;
+        apply_create_mode(&descriptor, mode).await?;
     }
     Ok((
         Node {
@@ -620,12 +671,12 @@ pub async fn mkdir(parent: &Node, name: Vec<u8>, mode: u32) -> Result<Node, Erro
         .await
         .map_err(error)?;
     let node = lookup(parent, name).await?;
-    apply_create_mode(node.descriptor()?, mode)?;
+    apply_create_mode(node.descriptor()?, mode).await?;
     Ok(node)
 }
 
-fn apply_create_mode(descriptor: &Descriptor, mode: u32) -> Result<(), Error> {
-    match crate::terra::fs::host::set_mode(descriptor, mode) {
+async fn apply_create_mode(descriptor: &Descriptor, mode: u32) -> Result<(), Error> {
+    match crate::terra::fs::host::set_mode(descriptor, mode).await {
         Ok(()) | Err(crate::terra::fs::host::Error::Unsupported) => Ok(()),
         Err(error) => Err(host_error(error)),
     }

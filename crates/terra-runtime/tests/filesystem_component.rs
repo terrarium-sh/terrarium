@@ -335,11 +335,10 @@ async fn wasm_filesystem_component_serves_files_through_standard_wasi() {
     setattr[..4].copy_from_slice(&1_u32.to_le_bytes());
     setattr[68..72].copy_from_slice(&0o100_640_u32.to_le_bytes());
     let setattr = submit(&channel, &memory, 8, &request(4, 11, inode, &setattr)).await;
-    assert_eq!(reply_error(&setattr), if cfg!(unix) { 0 } else { -95 });
-    #[cfg(unix)]
+    assert_eq!(reply_error(&setattr), 0);
     assert_eq!(
         u32::from_le_bytes(setattr[92..96].try_into().expect("setattr mode")),
-        0o100_640
+        if cfg!(unix) { 0o100_640 } else { 0o100_755 }
     );
     let mut rename = 1_u64.to_le_bytes().to_vec();
     rename.extend_from_slice(b"written\0renamed\0");
@@ -744,5 +743,262 @@ async fn wasm_filesystem_component_rejects_unsupported_opcodes_without_parsing()
         .await;
         assert_eq!(reply_error(&reply), -95, "opcode {opcode}");
     }
+    channel.close().expect("close");
+}
+
+async fn initialize_events(mounted: &Mounted) {
+    let mut init = vec![0; 20];
+    init[..4].copy_from_slice(&7_u32.to_le_bytes());
+    init[4..8].copy_from_slice(&40_u32.to_le_bytes());
+    init[12..16].copy_from_slice(&(1_u32 << 30).to_le_bytes());
+    init[16..20].copy_from_slice(&(1_u32 << 31).to_le_bytes());
+    let reply = submit(
+        &mounted.channel,
+        &BoundedMemory::new(&mounted.ram),
+        0,
+        &request(26, 1, 1, &init),
+    )
+    .await;
+    assert_eq!(reply_error(&reply), 0);
+    assert_eq!(&reply[48..52], &(1_u32 << 31).to_le_bytes());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_events_complete_filesystem_receive_requests_on_readonly_mounts() {
+    let directory = tempfile::tempdir().expect("share");
+    let mounted = mount(directory.path(), true).await;
+    initialize_events(&mounted).await;
+    std::fs::write(directory.path().join("changed"), "contents").expect("host write");
+    let reply = submit(
+        &mounted.channel,
+        &BoundedMemory::new(&mounted.ram),
+        1,
+        &request(4096, 2, 1, &[]),
+    )
+    .await;
+    assert_eq!(reply_error(&reply), 0);
+    assert_eq!(reply.len(), 296);
+    assert_eq!(&reply[16..24], &1_u64.to_le_bytes());
+    assert_eq!(&reply[36..40], &7_u32.to_le_bytes());
+    assert_eq!(&reply[40..47], b"changed");
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("changed")).expect("contents"),
+        "contents"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelling_an_idle_receive_does_not_block_the_filesystem_worker() {
+    let directory = tempfile::tempdir().expect("share");
+    let mounted = mount(directory.path(), false).await;
+    initialize_events(&mounted).await;
+    let (receive, cancel) = submit_pair(
+        &mounted.channel,
+        &BoundedMemory::new(&mounted.ram),
+        &request(4096, 2, 1, &[]),
+        &request(4097, 3, 1, &[]),
+    )
+    .await;
+    assert_eq!(reply_error(&receive), -19);
+    assert_eq!(reply_error(&cancel), 0);
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn native_events_keep_inode_identity_across_atomic_replacement() {
+    let directory = tempfile::tempdir().expect("share");
+    std::fs::write(directory.path().join("value"), "old").expect("original");
+    let mounted = mount(directory.path(), true).await;
+    initialize_events(&mounted).await;
+    let memory = BoundedMemory::new(&mounted.ram);
+    let lookup = submit(&mounted.channel, &memory, 1, &request(1, 2, 1, b"value\0")).await;
+    let inode = &lookup[16..24];
+    std::fs::write(directory.path().join("temporary"), "new").expect("replacement");
+    std::fs::rename(
+        directory.path().join("temporary"),
+        directory.path().join("value"),
+    )
+    .expect("atomic save");
+    let mut saw_replacement = false;
+    for index in 2..16 {
+        let reply = submit(
+            &mounted.channel,
+            &memory,
+            index,
+            &request(4096, u64::from(index) + 1, 1, &[]),
+        )
+        .await;
+        if reply.get(40..45) == Some(b"value") {
+            assert_eq!(&reply[24..32], inode);
+            let kind = u32::from_le_bytes(reply[32..36].try_into().expect("event kind"));
+            assert_eq!(kind & 0x200, 0);
+            saw_replacement = true;
+            break;
+        }
+    }
+    assert!(saw_replacement, "atomic replacement was not forwarded");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn content_events_reuse_confirmed_cached_inode_identity() {
+    let directory = tempfile::tempdir().expect("share");
+    std::fs::write(directory.path().join("value"), "initial").expect("original");
+    let mounted = mount(directory.path(), true).await;
+    initialize_events(&mounted).await;
+    let memory = BoundedMemory::new(&mounted.ram);
+    let lookup = submit(&mounted.channel, &memory, 1, &request(1, 2, 1, b"value\0")).await;
+    for index in (2..66).step_by(2) {
+        std::fs::write(directory.path().join("value"), format!("update {index}"))
+            .expect("host write");
+        let getattr = submit(
+            &mounted.channel,
+            &memory,
+            index,
+            &request(3, u64::from(index) + 1, 1, &[]),
+        )
+        .await;
+        assert_eq!(reply_error(&getattr), 0);
+        let reply = submit(
+            &mounted.channel,
+            &memory,
+            index + 1,
+            &request(4096, u64::from(index) + 2, 1, &[]),
+        )
+        .await;
+        assert_eq!(&reply[24..32], &lookup[16..24]);
+        let kind = u32::from_le_bytes(reply[32..36].try_into().expect("event kind"));
+        assert_eq!(kind & 0x200, 0x200);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn metadata_lookup_and_chmod_do_not_require_file_read_access() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    for readonly in [true, false] {
+        let root = tempfile::tempdir().expect("root");
+        let path = root.path().join("locked");
+        std::fs::write(&path, b"original").expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let mounted = mount(root.path(), readonly).await;
+        let memory = BoundedMemory::new(&mounted.ram);
+        let channel = &mounted.channel;
+        let lookup = submit(channel, &memory, 0, &request(1, 1, 1, b"locked\0")).await;
+        assert_eq!(reply_error(&lookup), 0);
+        let inode = u64::from_le_bytes(lookup[16..24].try_into().expect("inode"));
+        assert_eq!(
+            u32::from_le_bytes(lookup[116..120].try_into().expect("mode")),
+            0o100_000
+        );
+        let getattr = submit(channel, &memory, 1, &request(3, 2, inode, &[])).await;
+        assert_eq!(reply_error(&getattr), 0);
+        let mut chmod = vec![0; 84];
+        chmod[..4].copy_from_slice(&1_u32.to_le_bytes());
+        chmod[68..72].copy_from_slice(&0o600_u32.to_le_bytes());
+        let changed = submit(channel, &memory, 2, &request(4, 3, inode, &chmod)).await;
+        assert_eq!(reply_error(&changed), if readonly { -13 } else { 0 });
+        if readonly {
+            assert_eq!(
+                std::fs::metadata(&path).expect("metadata").mode() & 0o777,
+                0
+            );
+            channel.close().expect("close");
+            continue;
+        }
+        assert_eq!(
+            std::fs::metadata(&path).expect("metadata").mode() & 0o777,
+            0o600
+        );
+        let opened = submit(
+            channel,
+            &memory,
+            3,
+            &request(14, 4, inode, &1_u32.to_le_bytes()),
+        )
+        .await;
+        assert_eq!(reply_error(&opened), 0);
+        let handle = u64::from_le_bytes(opened[16..24].try_into().expect("handle"));
+        let mut write_body = vec![0; 40];
+        write_body[..8].copy_from_slice(&handle.to_le_bytes());
+        write_body[16..20].copy_from_slice(&3_u32.to_le_bytes());
+        write_body.extend_from_slice(b"new");
+        assert_eq!(
+            reply_error(&submit(channel, &memory, 4, &request(16, 5, inode, &write_body)).await),
+            0
+        );
+        assert_eq!(std::fs::read(&path).expect("read"), b"newginal");
+        channel.close().expect("close");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn write_only_files_open_for_write_without_read_access() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().expect("root");
+    let path = root.path().join("writeonly");
+    std::fs::write(&path, b"original").expect("write");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200)).expect("chmod");
+    let mounted = mount(root.path(), false).await;
+    let memory = BoundedMemory::new(&mounted.ram);
+    let channel = &mounted.channel;
+    let lookup = submit(channel, &memory, 0, &request(1, 1, 1, b"writeonly\0")).await;
+    assert_eq!(reply_error(&lookup), 0);
+    let inode = u64::from_le_bytes(lookup[16..24].try_into().expect("inode"));
+    let opened = submit(
+        channel,
+        &memory,
+        1,
+        &request(14, 2, inode, &(1_u32 | 0o1000).to_le_bytes()),
+    )
+    .await;
+    assert_eq!(reply_error(&opened), 0);
+    assert_eq!(std::fs::metadata(&path).expect("metadata").len(), 0);
+    std::fs::rename(&path, root.path().join("moved")).expect("rename");
+    std::fs::write(&path, b"replacement").expect("replace");
+    let reopened = submit(
+        channel,
+        &memory,
+        2,
+        &request(14, 3, inode, &(1_u32 | 0o1000).to_le_bytes()),
+    )
+    .await;
+    assert!(matches!(reply_error(&reopened), 0 | -2));
+    assert_eq!(
+        std::fs::read(&path).expect("replacement contents"),
+        b"replacement"
+    );
+    channel.close().expect("close");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("restore mode");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn inaccessible_directories_allow_metadata_and_permission_repair() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().expect("root");
+    let path = root.path().join("locked");
+    std::fs::create_dir(&path).expect("directory");
+    std::fs::write(path.join("child"), b"contents").expect("child");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    let mounted = mount(root.path(), false).await;
+    let memory = BoundedMemory::new(&mounted.ram);
+    let channel = &mounted.channel;
+    let lookup = submit(channel, &memory, 0, &request(1, 1, 1, b"locked\0")).await;
+    assert_eq!(reply_error(&lookup), 0);
+    let inode = u64::from_le_bytes(lookup[16..24].try_into().expect("inode"));
+    assert_eq!(
+        u32::from_le_bytes(lookup[116..120].try_into().expect("mode")),
+        0o040_000
+    );
+    let mut chmod = vec![0; 84];
+    chmod[..4].copy_from_slice(&1_u32.to_le_bytes());
+    chmod[68..72].copy_from_slice(&0o700_u32.to_le_bytes());
+    assert_eq!(
+        reply_error(&submit(channel, &memory, 1, &request(4, 2, inode, &chmod)).await),
+        0
+    );
+    let child = submit(channel, &memory, 2, &request(1, 3, inode, b"child\0")).await;
+    assert_eq!(reply_error(&child), 0);
     channel.close().expect("close");
 }

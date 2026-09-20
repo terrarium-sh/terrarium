@@ -1,10 +1,13 @@
+mod io;
+mod requests;
+
 use std::sync::{
     LazyLock, Mutex,
     atomic::{AtomicBool, Ordering},
 };
-use std::task::Poll;
+use std::task::{Context, Poll};
 
-use futures::future::poll_fn;
+use futures::{FutureExt, StreamExt, future::poll_fn};
 
 use terra_device_transport::{
     INT_USED_BUFFER, MmioError, MmioTransport, SPLIT_RING_DESC_F_NEXT, SplitRingDescriptor,
@@ -31,6 +34,7 @@ const MAX_COPY: usize = terra_limits::MAX_SINGLE_GUEST_COPY_BYTES as usize;
 const MAX_NODES: usize = 8192;
 const MAX_HANDLES: usize = 2048;
 const MAX_DIRECTORIES: usize = 2048;
+const CLOSE_FLUSH_TIMEOUT: u64 = 1_000_000_000;
 
 struct NodeRecord {
     id: u64,
@@ -49,11 +53,22 @@ struct OpenHandle {
 
 struct OpenDirectory {
     node: u64,
-    directory: host::Directory,
+    directory: std::sync::Arc<futures::lock::Mutex<host::Directory>>,
     descriptor: Option<std::sync::Arc<crate::wasi::filesystem::types::Descriptor>>,
 }
 
+struct PendingReply {
+    queue: usize,
+    head: u16,
+    output: Vec<Descriptor>,
+    unique: u64,
+    generation: u64,
+}
+
 struct State {
+    event_request: Option<PendingReply>,
+    event_entries: std::collections::BTreeMap<(u64, Vec<u8>), u64>,
+    events_enabled: bool,
     max_nodes: usize,
     nodes: std::collections::BTreeMap<u64, NodeRecord>,
     node_id_by_identity: std::collections::BTreeMap<(u64, u64), u64>,
@@ -72,8 +87,7 @@ struct Transport {
 
 type Descriptor = SplitRingDescriptor;
 
-static STATE: LazyLock<futures::lock::Mutex<Option<State>>> =
-    LazyLock::new(|| futures::lock::Mutex::new(None));
+static STATE: LazyLock<Mutex<Option<State>>> = LazyLock::new(|| Mutex::new(None));
 static TRANSPORT: LazyLock<Mutex<Option<Transport>>> = LazyLock::new(|| Mutex::new(None));
 static COMPLETION_GATE: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static RUNNING: AtomicBool = AtomicBool::new(false);
@@ -154,25 +168,6 @@ fn clear_work() {
     *WORK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Work::default();
-}
-
-async fn wait_for_work() {
-    poll_fn(|context| {
-        WORK_WAKER.register(context.waker());
-        if RUNNING.load(Ordering::Acquire)
-            && WORK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .pending
-                .iter()
-                .all(|pending| !pending)
-        {
-            Poll::Pending
-        } else {
-            Poll::Ready(())
-        }
-    })
-    .await;
 }
 
 fn node(state: &State, inode: u64) -> Result<&host::Node, DeviceError> {
@@ -290,14 +285,6 @@ fn directory(state: &State, handle: u64) -> Result<&OpenDirectory, DeviceError> 
     state
         .directories
         .iter()
-        .find_map(|(known, directory)| (*known == handle).then_some(directory))
-        .ok_or(DeviceError::Io)
-}
-
-fn directory_mut(state: &mut State, handle: u64) -> Result<&mut OpenDirectory, DeviceError> {
-    state
-        .directories
-        .iter_mut()
         .find_map(|(known, directory)| (*known == handle).then_some(directory))
         .ok_or(DeviceError::Io)
 }
@@ -837,33 +824,45 @@ fn reply(
     )
 }
 
-#[allow(clippy::too_many_lines)]
-async fn process_request(state: &mut State, queue: usize) -> Result<bool, DeviceError> {
-    let request_generation = generation()?;
-    let Some((head, desc, _, size)) = available(queue)? else {
-        return Ok(false);
-    };
-    transport(|transport| {
-        transport.next[queue] = transport.next[queue].wrapping_add(1);
-        Ok(())
-    })?;
-    let malformed =
-        || complete(queue, head, 0).and_then(|()| available(queue).map(|next| next.is_some()));
-    let Ok(table) = read(
+fn forget_request(state: &mut State, request: &wire::Request<'_>) -> Result<(), i32> {
+    match request.opcode {
+        wire::FORGET => forget(state, request.node, u64_at(request.body, 0).unwrap_or(0)),
+        wire::FORGET_MULTI => {
+            let count = usize::try_from(u32_at(request.body, 0)?).map_err(|_| wire::EINVAL)?;
+            if count > MAX_NODES || request.body.len() != 8 + count.saturating_mul(16) {
+                return Err(wire::EINVAL);
+            }
+            for offset in (8..request.body.len()).step_by(16) {
+                forget(
+                    state,
+                    u64_at(request.body, offset)?,
+                    u64_at(request.body, offset + 8)?,
+                );
+            }
+        }
+        _ => return Err(wire::EINVAL),
+    }
+    Ok(())
+}
+
+struct RequestBuffers {
+    input: Vec<u8>,
+    output: Vec<Descriptor>,
+}
+
+fn read_request_buffers(desc: u64, head: u16, size: u16) -> Result<RequestBuffers, DeviceError> {
+    let table = read(
         desc,
         usize::from(size) * terra_device_transport::SPLIT_RING_DESCRIPTOR_BYTES,
-    ) else {
-        return malformed();
-    };
-    let Ok(chain) = split_ring_chain(
+    )?;
+    let chain = split_ring_chain(
         &table,
         head,
         size,
         MAX_CHAIN,
         SPLIT_RING_DESC_F_NEXT | WRITE,
-    ) else {
-        return malformed();
-    };
+    )
+    .map_err(|_| DeviceError::BadLen)?;
     let (input, output) = chain.split_at(
         chain
             .iter()
@@ -875,518 +874,140 @@ async fn process_request(state: &mut State, queue: usize) -> Result<bool, Device
             .iter()
             .any(|descriptor| descriptor.flags & WRITE == 0)
     {
-        return malformed();
+        return Err(DeviceError::BadLen);
     }
     let mut request = Vec::new();
     for descriptor in input {
         let length = usize::try_from(descriptor.len).map_err(|_| DeviceError::TooLarge)?;
-        let Ok(bytes) = read(descriptor.addr, length) else {
-            return malformed();
-        };
-        request.extend(bytes);
-        if request.len() > MAX_REQUEST {
-            return malformed();
+        if length > MAX_REQUEST.saturating_sub(request.len()) {
+            return Err(DeviceError::TooLarge);
+        }
+        request.extend(read(descriptor.addr, length)?);
+    }
+    Ok(RequestBuffers {
+        input: request,
+        output: output.to_vec(),
+    })
+}
+
+fn cancel_event_request(state: &mut State) -> Result<(), DeviceError> {
+    state.events_enabled = false;
+    if let Some(pending) = state.event_request.take() {
+        let _completion = COMPLETION_GATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if generation()? == pending.generation {
+            reply(
+                pending.queue,
+                pending.head,
+                &pending.output,
+                wire::reply(pending.unique, 19, &[]),
+            )?;
         }
     }
+    Ok(())
+}
+
+fn remember_lookup(state: &mut State, request: &wire::Request<'_>, response: &[u8]) {
+    if let (Ok(name), Ok(child)) = (name(request.body), u64_at(response, 0)) {
+        if state.event_entries.len() == MAX_NODES {
+            state.event_entries.pop_first();
+        }
+        let key = (request.node, name);
+        if state
+            .event_entries
+            .get(&key)
+            .is_none_or(|id| state.nodes.get(id).is_none_or(|record| record.lookups == 0))
+        {
+            state.event_entries.insert(key, child);
+        }
+    }
+}
+
+fn process_request(
+    state: &mut State,
+    scheduler: &mut io::IoScheduler,
+    queue: usize,
+) -> Result<bool, DeviceError> {
+    let request_generation = generation()?;
+    let Some((head, desc, _, size)) = available(queue)? else {
+        return Ok(false);
+    };
+    transport(|transport| {
+        transport.next[queue] = transport.next[queue].wrapping_add(1);
+        Ok(())
+    })?;
+    let malformed =
+        || complete(queue, head, 0).and_then(|()| available(queue).map(|next| next.is_some()));
+    let Ok(RequestBuffers {
+        input: request,
+        output,
+    }) = read_request_buffers(desc, head, size)
+    else {
+        return malformed();
+    };
     let parsed = wire::request(&request);
 
-    if let Ok(request) = &parsed {
-        match request.opcode {
-            wire::FORGET => forget(state, request.node, u64_at(request.body, 0).unwrap_or(0)),
-            wire::FORGET_MULTI => {
-                let count = usize::try_from(u32_at(request.body, 0).unwrap_or(u32::MAX))
-                    .unwrap_or(MAX_NODES);
-                if count > MAX_NODES || request.body.len() != 8 + count.saturating_mul(16) {
-                    return malformed();
-                }
-                for offset in (8..request.body.len()).step_by(16) {
-                    forget(
-                        state,
-                        u64_at(request.body, offset).unwrap_or(0),
-                        u64_at(request.body, offset + 8).unwrap_or(0),
-                    );
-                }
-            }
-            _ => {}
+    if let Ok(request) = &parsed
+        && matches!(request.opcode, wire::FORGET | wire::FORGET_MULTI)
+    {
+        if forget_request(state, request).is_err() {
+            return malformed();
         }
-        if matches!(request.opcode, wire::FORGET | wire::FORGET_MULTI) {
-            let _completion = COMPLETION_GATE
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if request_generation != generation()? {
-                clear_runtime(state);
-                return Ok(false);
-            }
-            complete(queue, head, 0)?;
-            return available(queue).map(|next| next.is_some());
+        let _completion = COMPLETION_GATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if request_generation != generation()? {
+            clear_runtime(state);
+            return Ok(false);
         }
+        complete(queue, head, 0)?;
+        return available(queue).map(|next| next.is_some());
     }
     if output.is_empty() {
         return malformed();
     }
-    let response = match parsed {
-        Ok(request) if request.opcode == wire::INIT => match wire::init(request.body) {
-            Ok(body) => wire::reply(request.unique, 0, &body),
-            Err(errno) => wire::reply(request.unique, errno, &[]),
-        },
-        Ok(request) if request.opcode == wire::GETATTR => match node(state, request.node) {
-            Ok(node) => match node.stat().await {
-                Ok(stat) => wire::reply(request.unique, 0, &attr_out(&stat)),
-                Err(error) => wire::reply(request.unique, host_error(error), &[]),
-            },
-            Err(_) => wire::reply(request.unique, 2, &[]),
-        },
-        Ok(request) if request.opcode == wire::LOOKUP => match name(request.body) {
-            Ok(name) => match node(state, request.node) {
-                Ok(parent) => match host::lookup(parent, name).await {
-                    Ok(child) => match child.stat().await {
-                        Ok(stat) => match node_id(state, child, &stat) {
-                            Ok(inode) => wire::reply(request.unique, 0, &entry(&stat, inode)),
-                            Err(error) => wire::reply(request.unique, error, &[]),
-                        },
-                        Err(error) => wire::reply(request.unique, host_error(error), &[]),
-                    },
-                    Err(error) => wire::reply(request.unique, host_error(error), &[]),
-                },
-                Err(_) => wire::reply(request.unique, 2, &[]),
-            },
-            Err(error) => wire::reply(request.unique, error, &[]),
-        },
-        Ok(request) if request.opcode == wire::READLINK => match node(state, request.node) {
-            Ok(node) => match node.readlink().await {
-                Ok(target) => wire::reply(request.unique, 0, &target),
-                Err(error) => wire::reply(request.unique, host_error(error), &[]),
-            },
-            Err(_) => wire::reply(request.unique, 2, &[]),
-        },
-        Ok(request) if request.opcode == wire::SETATTR => {
-            let valid = u32_at(request.body, 0);
-            let size = u64_at(request.body, 16);
-            let atime = u64_at(request.body, 32);
-            let mtime = u64_at(request.body, 40);
-            let atime_nsec = u32_at(request.body, 56);
-            let mtime_nsec = u32_at(request.body, 60);
-            let mode = u32_at(request.body, 68);
-            let uid = u32_at(request.body, 76);
-            let gid = u32_at(request.body, 80);
-            match (
-                valid, size, atime, mtime, atime_nsec, mtime_nsec, mode, uid, gid,
-            ) {
-                (
-                    Ok(valid),
-                    Ok(size),
-                    Ok(atime),
-                    Ok(mtime),
-                    Ok(atime_nsec),
-                    Ok(mtime_nsec),
-                    Ok(mode),
-                    Ok(uid),
-                    Ok(gid),
-                ) => match node(state, request.node) {
-                    Ok(node) => match node
-                        .setattr(
-                            (valid & 1 != 0).then_some(mode),
-                            (valid & 8 != 0).then_some(size),
-                            (valid & 16 != 0).then_some(timestamp(atime, atime_nsec)),
-                            (valid & 32 != 0).then_some(timestamp(mtime, mtime_nsec)),
-                            (valid & 2 != 0).then_some(uid),
-                            (valid & 4 != 0).then_some(gid),
-                        )
-                        .await
-                    {
-                        Ok(()) => match node.stat().await {
-                            Ok(stat) => wire::reply(request.unique, 0, &attr_out(&stat)),
-                            Err(error) => wire::reply(request.unique, host_error(error), &[]),
-                        },
-                        Err(error) => wire::reply(request.unique, host_error(error), &[]),
-                    },
-                    Err(_) => wire::reply(request.unique, 2, &[]),
-                },
-                _ => wire::reply(request.unique, wire::EINVAL, &[]),
-            }
+    if let Ok(request) = &parsed
+        && request.opcode == wire::RECEIVE_EVENT
+        && state.events_enabled
+        && state.event_request.is_none()
+        && request.node == 1
+        && request.body.is_empty()
+        && output
+            .iter()
+            .map(|descriptor| u64::from(descriptor.len))
+            .sum::<u64>()
+            >= 296
+    {
+        state.event_request = Some(PendingReply {
+            queue,
+            head,
+            output,
+            unique: request.unique,
+            generation: request_generation,
+        });
+        return available(queue).map(|next| next.is_some());
+    }
+    if let Ok(request) = &parsed
+        && request.opcode == wire::CANCEL_EVENTS
+    {
+        cancel_event_request(state)?;
+    }
+    let response = match &parsed {
+        Ok(request) => {
+            let target = PendingReply {
+                queue,
+                head,
+                output: output.clone(),
+                unique: request.unique,
+                generation: request_generation,
+            };
+            let Some(response) = execute_request(state, scheduler, request, target) else {
+                return available(queue).map(|next| next.is_some());
+            };
+            response
         }
-        Ok(request) if request.opcode == wire::MKDIR => {
-            match (
-                u32_at(request.body, 0),
-                name(request.body.get(8..).unwrap_or_default()),
-            ) {
-                (Ok(mode), Ok(name)) => match node(state, request.node) {
-                    Ok(parent) => match host::mkdir(parent, name, mode).await {
-                        Ok(child) => match child.stat().await {
-                            Ok(stat) => match node_id(state, child, &stat) {
-                                Ok(inode) => wire::reply(request.unique, 0, &entry(&stat, inode)),
-                                Err(error) => wire::reply(request.unique, error, &[]),
-                            },
-                            Err(error) => wire::reply(request.unique, host_error(error), &[]),
-                        },
-                        Err(error) => wire::reply(request.unique, host_error(error), &[]),
-                    },
-                    Err(_) => wire::reply(request.unique, 2, &[]),
-                },
-                (Err(error), _) | (_, Err(error)) => wire::reply(request.unique, error, &[]),
-            }
-        }
-        Ok(request) if request.opcode == wire::CREATE => match (
-            u32_at(request.body, 0),
-            u32_at(request.body, 4),
-            name(request.body.get(16..).unwrap_or_default()),
-        ) {
-            (Ok(flags), Ok(mode), Ok(name)) => match node(state, request.node) {
-                Ok(parent) => match create_flags(flags) {
-                    Ok(access) => match host::create(parent, name, access, mode).await {
-                        Ok((child, descriptor)) => match child.stat().await {
-                            Ok(stat) => match node_id(state, child, &stat) {
-                                Ok(inode) => {
-                                    match store_handle(state, inode, descriptor, flags & 3 != 0) {
-                                        Ok(handle) => {
-                                            let mut out = entry(&stat, inode);
-                                            out.extend_from_slice(&open(handle));
-                                            wire::reply(request.unique, 0, &out)
-                                        }
-                                        Err(error) => wire::reply(request.unique, error, &[]),
-                                    }
-                                }
-                                Err(error) => wire::reply(request.unique, error, &[]),
-                            },
-                            Err(error) => wire::reply(request.unique, host_error(error), &[]),
-                        },
-                        Err(error) => wire::reply(request.unique, host_error(error), &[]),
-                    },
-                    Err(error) => wire::reply(request.unique, error, &[]),
-                },
-                Err(_) => wire::reply(request.unique, 2, &[]),
-            },
-            (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
-                wire::reply(request.unique, error, &[])
-            }
-        },
-        Ok(request) if matches!(request.opcode, wire::UNLINK | wire::RMDIR) => {
-            match name(request.body) {
-                Ok(name) => match node(state, request.node) {
-                    Ok(parent) => {
-                        let removed_stat = match host::lookup(parent, name.clone()).await {
-                            Ok(removed) => removed.stat().await.ok(),
-                            Err(_) => None,
-                        };
-                        match host::unlink(parent, name, request.opcode == wire::RMDIR).await {
-                            Ok(()) => {
-                                if let Some(removed_stat) = removed_stat {
-                                    clear_node_path(state, &removed_stat);
-                                }
-                                wire::reply(request.unique, 0, &[])
-                            }
-                            Err(error) => wire::reply(request.unique, host_error(error), &[]),
-                        }
-                    }
-                    Err(_) => wire::reply(request.unique, 2, &[]),
-                },
-                Err(error) => wire::reply(request.unique, error, &[]),
-            }
-        }
-        Ok(request) if matches!(request.opcode, wire::RENAME | wire::RENAME2) => match (
-            u64_at(request.body, 0),
-            names(
-                request
-                    .body
-                    .get(
-                        if request.opcode == wire::RENAME2 {
-                            16
-                        } else {
-                            8
-                        }..,
-                    )
-                    .unwrap_or_default(),
-            ),
-        ) {
-            (Ok(new_parent), Ok((old_name, new_name))) => {
-                let flags = if request.opcode == wire::RENAME2 {
-                    u32_at(request.body, 8).unwrap_or(u32::MAX)
-                } else {
-                    0
-                };
-                match rename_mode(flags) {
-                    Ok(mode) => match (node(state, request.node), node(state, new_parent)) {
-                        (Ok(old_parent), Ok(new_parent)) => match new_parent.clone_descriptor() {
-                            Ok(new_parent_descriptor) => {
-                                let replaced_stat =
-                                    match host::lookup(new_parent, new_name.clone()).await {
-                                        Ok(replaced) => replaced.stat().await.ok(),
-                                        Err(_) => None,
-                                    };
-                                match host::lookup(old_parent, old_name.clone()).await {
-                                    Ok(renamed) => match renamed.stat().await {
-                                        Ok(stat) => match host::rename(
-                                            old_parent,
-                                            old_name,
-                                            new_parent,
-                                            new_name.clone(),
-                                            mode,
-                                        )
-                                        .await
-                                        {
-                                            Ok(()) => {
-                                                repoint_node(
-                                                    state,
-                                                    &stat,
-                                                    new_parent_descriptor,
-                                                    new_name,
-                                                );
-                                                if let Some(replaced_stat) = replaced_stat
-                                                    && (replaced_stat.dev, replaced_stat.ino)
-                                                        != (stat.dev, stat.ino)
-                                                {
-                                                    clear_node_path(state, &replaced_stat);
-                                                }
-                                                wire::reply(request.unique, 0, &[])
-                                            }
-                                            Err(error) => {
-                                                wire::reply(request.unique, host_error(error), &[])
-                                            }
-                                        },
-                                        Err(error) => {
-                                            wire::reply(request.unique, host_error(error), &[])
-                                        }
-                                    },
-                                    Err(error) => {
-                                        wire::reply(request.unique, host_error(error), &[])
-                                    }
-                                }
-                            }
-                            Err(error) => wire::reply(request.unique, host_error(error), &[]),
-                        },
-                        _ => wire::reply(request.unique, 2, &[]),
-                    },
-                    Err(error) => wire::reply(request.unique, error, &[]),
-                }
-            }
-            (Err(error), _) | (_, Err(error)) => wire::reply(request.unique, error, &[]),
-        },
-        Ok(request) if request.opcode == wire::LINK => {
-            match (
-                u64_at(request.body, 0),
-                name(request.body.get(8..).unwrap_or_default()),
-            ) {
-                (Ok(old_inode), Ok(name)) => {
-                    match (node(state, old_inode), node(state, request.node)) {
-                        (Ok(old), Ok(parent)) => match host::link(old, parent, name).await {
-                            Ok(()) => match old.stat().await {
-                                Ok(stat) => {
-                                    increment_lookup(state, old_inode);
-                                    wire::reply(request.unique, 0, &entry(&stat, old_inode))
-                                }
-                                Err(error) => wire::reply(request.unique, host_error(error), &[]),
-                            },
-                            Err(error) => wire::reply(request.unique, host_error(error), &[]),
-                        },
-                        _ => wire::reply(request.unique, 2, &[]),
-                    }
-                }
-                (Err(error), _) | (_, Err(error)) => wire::reply(request.unique, error, &[]),
-            }
-        }
-        Ok(request) if request.opcode == wire::SYMLINK => match symlink_parts(request.body) {
-            Ok((name, target)) => match node(state, request.node) {
-                Ok(parent) => match host::symlink(parent, name, target).await {
-                    Ok(child) => match child.stat().await {
-                        Ok(stat) => match node_id(state, child, &stat) {
-                            Ok(inode) => wire::reply(request.unique, 0, &entry(&stat, inode)),
-                            Err(error) => wire::reply(request.unique, error, &[]),
-                        },
-                        Err(error) => wire::reply(request.unique, host_error(error), &[]),
-                    },
-                    Err(error) => wire::reply(request.unique, host_error(error), &[]),
-                },
-                Err(_) => wire::reply(request.unique, 2, &[]),
-            },
-            Err(error) => wire::reply(request.unique, error, &[]),
-        },
-        Ok(request) if request.opcode == wire::OPEN => match u32_at(request.body, 0)
-            .and_then(open_flags)
-        {
-            Ok((flags, writable)) => match node(state, request.node) {
-                Ok(node) => match node.open(flags).await {
-                    Ok(descriptor) => match store_handle(state, request.node, descriptor, writable)
-                    {
-                        Ok(handle) => wire::reply(request.unique, 0, &open(handle)),
-                        Err(error) => wire::reply(request.unique, error, &[]),
-                    },
-                    Err(error) => wire::reply(request.unique, host_error(error), &[]),
-                },
-                Err(_) => wire::reply(request.unique, 2, &[]),
-            },
-            Err(error) => wire::reply(request.unique, error, &[]),
-        },
-        Ok(request) if request.opcode == wire::OPENDIR => match node(state, request.node) {
-            Ok(node) => match node.open_directory().await {
-                Ok((directory, descriptor)) if state.directories.len() < MAX_DIRECTORIES => {
-                    let handle = state.next_handle;
-                    state.next_handle = state.next_handle.wrapping_add(1).max(2);
-                    state.directories.push((
-                        handle,
-                        OpenDirectory {
-                            node: request.node,
-                            directory,
-                            descriptor,
-                        },
-                    ));
-                    state.unused_nodes.remove(&request.node);
-                    wire::reply(request.unique, 0, &open(handle))
-                }
-                Ok(_) => wire::reply(request.unique, 24, &[]),
-                Err(error) => wire::reply(request.unique, host_error(error), &[]),
-            },
-            Err(_) => wire::reply(request.unique, 2, &[]),
-        },
-        Ok(request) if request.opcode == wire::RELEASE => {
-            let mut release_error = None;
-            if let (Ok(id), Ok(flags), Ok(_owner)) = (
-                u64_at(request.body, 0),
-                u32_at(request.body, 12),
-                u64_at(request.body, 16),
-            ) {
-                if flags & 2 != 0
-                    && let Ok(handle) = handle(state, id)
-                    && node(state, handle.node).is_ok()
-                {
-                    release_error = Some(95);
-                }
-                let released_node = state
-                    .handles
-                    .iter()
-                    .find(|known| known.id == id)
-                    .map(|handle| handle.node);
-                state.handles.retain(|known| known.id != id);
-                if let Some(node) = released_node {
-                    mark_unused_if_unheld(state, node);
-                }
-            }
-            wire::reply(request.unique, release_error.unwrap_or(0), &[])
-        }
-        Ok(request) if request.opcode == wire::FLUSH => match flush_body(request.body) {
-            Ok(()) => wire::reply(request.unique, 0, &[]),
-            Err(error) => wire::reply(request.unique, error, &[]),
-        },
-        Ok(request) if request.opcode == wire::RELEASEDIR => {
-            if let Ok(handle) = u64_at(request.body, 0) {
-                let released_node = state
-                    .directories
-                    .iter()
-                    .find(|(known, _)| *known == handle)
-                    .map(|(_, directory)| directory.node);
-                state.directories.retain(|(known, _)| *known != handle);
-                if let Some(node) = released_node {
-                    mark_unused_if_unheld(state, node);
-                }
-            }
-            wire::reply(request.unique, 0, &[])
-        }
-        Ok(request) if request.opcode == wire::FSYNCDIR => match u64_at(request.body, 0) {
-            Ok(id) => match directory(state, id) {
-                Ok(OpenDirectory {
-                    descriptor: Some(descriptor),
-                    ..
-                }) => match descriptor.sync().await {
-                    Ok(()) => wire::reply(request.unique, 0, &[]),
-                    Err(error) => wire::reply(request.unique, wasi_error(error), &[]),
-                },
-                Ok(_) => wire::reply(request.unique, 95, &[]),
-                Err(_) => wire::reply(request.unique, 9, &[]),
-            },
-            Err(error) => wire::reply(request.unique, error, &[]),
-        },
-        Ok(request) if request.opcode == wire::READDIR => match (
-            u64_at(request.body, 0),
-            u64_at(request.body, 8),
-            u32_at(request.body, 16),
-        ) {
-            (Ok(handle), Ok(cookie), Ok(size)) => match directory_mut(state, handle) {
-                Ok(directory) => match directory.directory.readdir(cookie, 256, size).await {
-                    Ok(entries) => wire::reply(
-                        request.unique,
-                        0,
-                        &dirents(entries, usize::try_from(size).unwrap_or(0)),
-                    ),
-                    Err(error) => wire::reply(request.unique, host_error(error), &[]),
-                },
-                Err(_) => wire::reply(request.unique, 2, &[]),
-            },
-            (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
-                wire::reply(request.unique, error, &[])
-            }
-        },
-        Ok(request) if request.opcode == wire::FSYNC => match u64_at(request.body, 0) {
-            Ok(id) => match handle(state, id) {
-                Ok(handle) => match handle.descriptor.sync_data().await {
-                    Ok(()) => wire::reply(request.unique, 0, &[]),
-                    Err(_) => wire::reply(request.unique, 5, &[]),
-                },
-                Err(_) => wire::reply(request.unique, 9, &[]),
-            },
-            Err(error) => wire::reply(request.unique, error, &[]),
-        },
-        Ok(request) if request.opcode == wire::STATFS => match node(state, request.node) {
-            Ok(node) => match node.statfs() {
-                Ok(stat) => wire::reply(request.unique, 0, &statfs(&stat)),
-                Err(error) => wire::reply(request.unique, host_error(error), &[]),
-            },
-            Err(_) => wire::reply(request.unique, 2, &[]),
-        },
-        Ok(request) if matches!(request.opcode, 21..=24 | 31..=33 | 43 | 46 | 50) => {
-            wire::reply(request.unique, 95, &[])
-        }
-        Ok(request) if request.opcode == wire::READ => {
-            match (
-                u64_at(request.body, 0),
-                u64_at(request.body, 8),
-                u32_at(request.body, 16),
-            ) {
-                (Ok(id), Ok(offset), Ok(size)) => match handle(state, id) {
-                    Ok(handle) => {
-                        match read_file(
-                            &handle.descriptor,
-                            offset,
-                            usize::try_from(size).unwrap_or(MAX_READ).min(MAX_READ),
-                        )
-                        .await
-                        {
-                            Ok(bytes) => wire::reply(request.unique, 0, &bytes),
-                            Err(error) => wire::reply(request.unique, error, &[]),
-                        }
-                    }
-                    Err(_) => wire::reply(request.unique, 9, &[]),
-                },
-                (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
-                    wire::reply(request.unique, error, &[])
-                }
-            }
-        }
-        Ok(request) if request.opcode == wire::WRITE => {
-            match (
-                u64_at(request.body, 0),
-                u64_at(request.body, 8),
-                u32_at(request.body, 16),
-            ) {
-                (Ok(id), Ok(offset), Ok(size)) => match request.body.get(40..) {
-                    Some(bytes) if bytes.len() == usize::try_from(size).unwrap_or(usize::MAX) => {
-                        match handle(state, id) {
-                            Ok(handle) if handle.writable => {
-                                match write_file(&handle.descriptor, offset, bytes.to_vec()).await {
-                                    Ok(()) => wire::reply(request.unique, 0, &sized_out(size)),
-                                    Err(error) => wire::reply(request.unique, error, &[]),
-                                }
-                            }
-                            _ => wire::reply(request.unique, 9, &[]),
-                        }
-                    }
-                    _ => wire::reply(request.unique, wire::EINVAL, &[]),
-                },
-                (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
-                    wire::reply(request.unique, error, &[])
-                }
-            }
-        }
-        Ok(request) => wire::reply(request.unique, wire::ENOSYS, &[]),
-        Err(errno) => wire::reply(0, errno, &[]),
+        Err(errno) => wire::reply(0, *errno, &[]),
     };
     let _completion = COMPLETION_GATE
         .lock()
@@ -1395,10 +1016,123 @@ async fn process_request(state: &mut State, queue: usize) -> Result<bool, Device
         clear_runtime(state);
         return Ok(false);
     }
-    if reply(queue, head, output, response).is_err() {
+    if reply(queue, head, &output, response).is_err() {
         return malformed();
     }
     available(queue).map(|next| next.is_some())
+}
+
+fn execute_request(
+    state: &mut State,
+    scheduler: &mut io::IoScheduler,
+    request: &wire::Request<'_>,
+    target: PendingReply,
+) -> Option<Vec<u8>> {
+    if request.opcode == wire::INIT && scheduler.contains_generation(target.generation) {
+        return Some(wire::reply(request.unique, 16, &[]));
+    }
+    let result = if let Some(result) = requests::execute_immediate(state, request) {
+        result
+    } else {
+        match requests::prepare_io(state, request, target.generation)
+            .and_then(|operation| scheduler.enqueue(operation, target))
+        {
+            Ok(()) => return None,
+            Err(errno) => Err(errno),
+        }
+    };
+    Some(encode_response(request.unique, result))
+}
+
+fn dispatch_event(state: &mut State, payload: &[u8]) {
+    let Some(request) = state.event_request.take() else {
+        return;
+    };
+    let _completion = COMPLETION_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if generation().ok() == Some(request.generation) {
+        let _ = reply(
+            request.queue,
+            request.head,
+            &request.output,
+            wire::reply(request.unique, 0, payload),
+        );
+    }
+}
+
+async fn encode_event(
+    state: requests::RequestState,
+    event: crate::terra::fs::host::FileEvent,
+) -> Option<Vec<u8>> {
+    use crate::terra::fs::host::EventKind;
+    let mut parts = event.path.split('/').collect::<Vec<_>>();
+    if parts
+        .iter()
+        .any(|part| part.is_empty() || matches!(*part, "." | "..") || part.contains('\0'))
+    {
+        return None;
+    }
+    let name = parts.pop()?;
+    if name.len() > 255 {
+        return None;
+    }
+    let mut parent = host::root().ok()?;
+    for part in parts {
+        parent = host::lookup(&parent, part.as_bytes().to_vec()).await.ok()?;
+    }
+    let stat = parent.stat().await.ok()?;
+    let (id, child) = state
+        .with(|state| {
+            let id = *state
+                .node_id_by_identity
+                .get(&(stat.dev, stat.ino))
+                .ok_or(2)?;
+            let child = state
+                .event_entries
+                .get(&(id, name.as_bytes().to_vec()))
+                .copied()
+                .unwrap_or(0);
+            Ok((id, child))
+        })
+        .ok()?;
+    let identity = if child != 0 && matches!(event.kind, EventKind::Modify | EventKind::Metadata) {
+        parent.child_identity(name).await.ok()
+    } else {
+        None
+    };
+    let same_inode = state
+        .with(|state| {
+            let same_inode = identity.is_some_and(|identity| {
+                state
+                    .node_id_by_identity
+                    .get(&(identity.upper, identity.lower))
+                    == Some(&child)
+            });
+            if !same_inode {
+                state.event_entries.remove(&(id, name.as_bytes().to_vec()));
+            }
+            Ok(same_inode)
+        })
+        .ok()?;
+    let kind: u32 = match event.kind {
+        EventKind::Create => 1,
+        EventKind::Remove => 2,
+        EventKind::Modify => 3,
+        EventKind::Metadata => 4,
+    } | if event.is_directory { 0x100 } else { 0 }
+        | if same_inode {
+            wire::EVENT_SAME_INODE
+        } else {
+            0
+        };
+    let mut payload = vec![0; 280];
+    payload[..8].copy_from_slice(&id.to_le_bytes());
+    payload[8..16].copy_from_slice(&child.to_le_bytes());
+    payload[16..20].copy_from_slice(&kind.to_le_bytes());
+    payload[20..24].copy_from_slice(&u32::try_from(name.len()).ok()?.to_le_bytes());
+    payload[24..24 + name.len()].copy_from_slice(name.as_bytes());
+    Some(payload)
 }
 
 pub async fn configure(tag: &str, max_nodes: u32) -> Result<(), DeviceError> {
@@ -1411,7 +1145,12 @@ pub async fn configure(tag: &str, max_nodes: u32) -> Result<(), DeviceError> {
     config[36..40].copy_from_slice(&1_u32.to_le_bytes());
     let root = host::root().map_err(|_| DeviceError::Io)?;
     let root_stat = root.stat().await.map_err(|_| DeviceError::Io)?;
-    *STATE.lock().await = Some(State {
+    *STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(State {
+        event_request: None,
+        event_entries: std::collections::BTreeMap::new(),
+        events_enabled: false,
         max_nodes,
         nodes: std::collections::BTreeMap::from([(
             1,
@@ -1470,6 +1209,9 @@ pub fn mmio_read(addr: u64, len: u32) -> Result<Vec<u8>, DeviceError> {
 }
 
 fn clear_runtime(state: &mut State) {
+    state.event_request = None;
+    state.event_entries.clear();
+    state.events_enabled = false;
     state.handles.clear();
     state.directories.clear();
     state.nodes.retain(|_, record| record.id == 1);
@@ -1500,6 +1242,7 @@ pub fn mmio_write(addr: u64, data: &[u8]) -> Result<bool, DeviceError> {
             transport.generation = transport.generation.wrapping_add(1);
             transport.next = [0; 2];
             clear_work();
+            WORK_WAKER.wake();
         }
         Ok(bell.map(usize::from))
     })?;
@@ -1513,24 +1256,186 @@ pub fn mmio_write(addr: u64, data: &[u8]) -> Result<bool, DeviceError> {
     Ok(false)
 }
 
+fn encode_response(unique: u64, result: Result<Vec<u8>, i32>) -> Vec<u8> {
+    match result {
+        Ok(body) => wire::reply(unique, 0, &body),
+        Err(errno) => wire::reply(unique, errno, &[]),
+    }
+}
+
+fn complete_io(completed: io::CompletedIo) {
+    let target = completed.reply;
+    let _completion = COMPLETION_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if generation().ok() == Some(target.generation)
+        && reply(
+            target.queue,
+            target.head,
+            &target.output,
+            encode_response(target.unique, completed.result),
+        )
+        .is_err()
+    {
+        let _ = complete(target.queue, target.head, 0);
+    }
+}
+
+struct ReadyWork {
+    completed: Option<io::CompletedIo>,
+    event: Poll<Option<crate::terra::fs::host::FileEvent>>,
+    queue: Option<usize>,
+}
+
+fn poll_work(
+    context: &mut Context<'_>,
+    scheduler: &mut io::IoScheduler,
+    events: &mut (impl futures::Stream<Item = crate::terra::fs::host::FileEvent> + Unpin),
+    can_receive_event: bool,
+    current_generation: u64,
+) -> Poll<ReadyWork> {
+    WORK_WAKER.register(context.waker());
+    let completed = scheduler.poll_complete(context);
+    let event = if can_receive_event {
+        events.poll_next_unpin(context)
+    } else {
+        Poll::Pending
+    };
+    let queue = take_work();
+    if completed.is_some()
+        || event.is_ready()
+        || queue.is_some()
+        || !RUNNING.load(Ordering::Acquire)
+        || generation().ok() != Some(current_generation)
+    {
+        Poll::Ready(ReadyWork {
+            completed,
+            event,
+            queue,
+        })
+    } else {
+        Poll::Pending
+    }
+}
+
+struct EventWork {
+    generation: u64,
+    unique: u64,
+    work: futures::future::LocalBoxFuture<'static, Option<Vec<u8>>>,
+}
+
+fn poll_event(context: &mut Context<'_>, pending: &mut Option<EventWork>) {
+    let Some(event) = pending.as_mut() else {
+        return;
+    };
+    let Poll::Ready(payload) = event.work.poll_unpin(context) else {
+        return;
+    };
+    let _ = requests::RequestState(event.generation).with(|state| {
+        if state
+            .event_request
+            .as_ref()
+            .is_some_and(|request| request.unique == event.unique)
+            && let Some(payload) = payload
+        {
+            dispatch_event(state, &payload);
+        }
+        Ok(())
+    });
+    *pending = None;
+    context.waker().wake_by_ref();
+}
+
 pub async fn run() -> Result<(), DeviceError> {
+    let mut events = crate::terra::fs::host::file_events().into_stream();
+    let mut events_closed = false;
+    let mut pending_event = None;
+    let mut event_work = None;
+    let mut scheduler = io::IoScheduler::default();
+    let Ok(mut current_generation) = generation() else {
+        return Ok(());
+    };
     while RUNNING.load(Ordering::Acquire) {
-        wait_for_work().await;
-        let Some(queue) = take_work() else {
+        let Ok(observed_generation) = generation() else {
+            break;
+        };
+        if observed_generation != current_generation {
+            scheduler.discard_pending();
+            pending_event = None;
+            if let Some(state) = STATE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_mut()
+            {
+                clear_runtime(state);
+            }
+            current_generation = observed_generation;
+        }
+        if event_work.is_none() {
+            let state = STATE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(state) = state.as_ref() {
+                if let Some(request) = state.event_request.as_ref() {
+                    if let Some(event) = pending_event.take() {
+                        event_work = Some(EventWork {
+                            generation: current_generation,
+                            unique: request.unique,
+                            work: encode_event(requests::RequestState(current_generation), event)
+                                .boxed_local(),
+                        });
+                    }
+                } else if !state.events_enabled {
+                    pending_event = None;
+                }
+            }
+        }
+        let ReadyWork {
+            completed,
+            event,
+            queue,
+        } = poll_fn(|context| {
+            poll_event(context, &mut event_work);
+            poll_work(
+                context,
+                &mut scheduler,
+                &mut events,
+                pending_event.is_none() && !events_closed && event_work.is_none(),
+                current_generation,
+            )
+        })
+        .await;
+        if let Some(completed) = completed {
+            complete_io(completed);
+        }
+        match event {
+            Poll::Ready(Some(event)) => pending_event = Some(event),
+            Poll::Ready(None) => events_closed = true,
+            Poll::Pending => {}
+        }
+        if !RUNNING.load(Ordering::Acquire) {
+            continue;
+        }
+        if generation().ok() != Some(current_generation) {
+            if let Some(queue) = queue {
+                queue_work(queue);
+            }
+            continue;
+        }
+        let Some(queue) = queue else {
             continue;
         };
-        let Ok(queued_generation) = generation() else {
-            continue;
-        };
-        let mut state = STATE.lock().await;
+        let mut state = STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let pending = match state.as_mut() {
             // An unaddressable ring cannot be completed; wait for reset or another doorbell.
-            Some(state) => process_request(state, queue).await.unwrap_or(false),
+            Some(state) => process_request(state, &mut scheduler, queue).unwrap_or(false),
             None => false,
         };
         drop(state);
         if pending {
-            let _ = queue_work_if_current(queue, queued_generation);
+            let _ = queue_work_if_current(queue, current_generation);
         }
     }
     Ok(())
@@ -1571,29 +1476,73 @@ pub async fn close() -> Result<(), DeviceError> {
     RUNNING.store(false, Ordering::Release);
     clear_work();
     WORK_WAKER.wake();
-    let mut state = STATE.lock().await;
-    let mut sync_failed = false;
-    if let Some(state) = state.as_ref() {
-        for handle in state.handles.iter().filter(|handle| handle.writable) {
-            if handle.descriptor.sync_data().await.is_err() {
-                sync_failed = true;
-            }
-        }
-    }
-    *state = None;
     *TRANSPORT
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-    if sync_failed {
-        Err(DeviceError::Io)
-    } else {
-        Ok(())
+    let flush = async {
+        let state = STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let mut result = Ok(());
+        if let Some(state) = state {
+            for handle in state.handles.iter().filter(|handle| handle.writable) {
+                if handle.descriptor.sync_data().await.is_err() {
+                    result = Err(DeviceError::Io);
+                }
+            }
+        }
+        result
+    };
+    let deadline = crate::wasi::clocks::monotonic_clock::wait_for(CLOSE_FLUSH_TIMEOUT);
+    futures::pin_mut!(flush, deadline);
+    match futures::future::select(flush, deadline).await {
+        futures::future::Either::Left((result, _)) => result,
+        futures::future::Either::Right(((), _)) => Err(DeviceError::Io),
     }
 }
 
 #[cfg(test)]
 mod allocation_tests {
     use super::*;
+
+    #[test]
+    fn busy_request_queue_does_not_starve_events_or_io_completions() {
+        use futures::FutureExt;
+        let waker = futures::task::noop_waker();
+        let mut context = Context::from_waker(&waker);
+        let mut scheduler = io::IoScheduler::default();
+        let mut events = futures::stream::repeat_with(|| crate::terra::fs::host::FileEvent {
+            path: "changed".into(),
+            kind: crate::terra::fs::host::EventKind::Modify,
+            is_directory: false,
+        });
+        for unique in 0..32 {
+            queue_work(REQUEST_QUEUE);
+            scheduler
+                .enqueue(
+                    io::PreparedIo {
+                        identity: (0, unique),
+                        work: async { Ok(Vec::new()) }.boxed_local(),
+                    },
+                    PendingReply {
+                        queue: REQUEST_QUEUE,
+                        head: 0,
+                        output: Vec::new(),
+                        unique,
+                        generation: 0,
+                    },
+                )
+                .unwrap();
+            let Poll::Ready(ready) = poll_work(&mut context, &mut scheduler, &mut events, true, 0)
+            else {
+                panic!("queued work must be ready");
+            };
+            assert_eq!(ready.queue, Some(REQUEST_QUEUE));
+            assert!(matches!(ready.event, Poll::Ready(Some(_))));
+            assert_eq!(ready.completed.unwrap().reply.unique, unique);
+        }
+    }
 
     #[test]
     fn reset_discards_pending_indices_and_interrupts() {

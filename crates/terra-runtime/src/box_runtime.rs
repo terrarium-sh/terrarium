@@ -159,6 +159,7 @@ pub struct BoxHost {
 }
 
 struct DropRecovery {
+    filesystems: Vec<FsHost>,
     machine: Option<crate::component::vmm::virtualization::MachineRecovery>,
     devices: Vec<crate::component::vmm::teardown::DeviceShutdown>,
     interrupts: Option<crate::component::vmm::teardown::NativeCleanup>,
@@ -166,8 +167,13 @@ struct DropRecovery {
 
 impl Drop for DropRecovery {
     fn drop(&mut self) {
-        if self.machine.is_some() || !self.devices.is_empty() || self.interrupts.is_some() {
+        if self.machine.is_some()
+            || !self.devices.is_empty()
+            || self.interrupts.is_some()
+            || !self.filesystems.is_empty()
+        {
             start_drop_recovery(Self {
+                filesystems: std::mem::take(&mut self.filesystems),
                 machine: self.machine.take(),
                 devices: std::mem::take(&mut self.devices),
                 interrupts: self.interrupts.take(),
@@ -198,6 +204,7 @@ async fn finish_native_recovery(mut recovery: DropRecovery) -> wasmtime::Result<
         result = Err(wasmtime::Error::msg(error));
     }
     recovery.interrupts = None;
+    drop(std::mem::take(&mut recovery.filesystems));
     result
 }
 
@@ -226,7 +233,8 @@ fn start_drop_recovery(recovery: DropRecovery) {
         .spawn(move || run_drop_recovery(&worker_recovery))
         .is_err()
     {
-        run_drop_recovery(&recovery);
+        // Keep native resources alive if no cleanup thread can be started.
+        std::mem::forget(recovery);
     }
 }
 
@@ -312,8 +320,13 @@ impl Drop for BoxHost {
     fn drop(&mut self) {
         let machine = self.platform.take_recovery_reaper().ok().flatten();
         let (devices, interrupts) = self.lifecycle.take_shutdowns();
-        if machine.is_some() || !devices.is_empty() || interrupts.is_some() {
+        if machine.is_some()
+            || !devices.is_empty()
+            || interrupts.is_some()
+            || !self.filesystems.is_empty()
+        {
             start_drop_recovery(DropRecovery {
+                filesystems: std::mem::take(&mut self.filesystems),
                 machine,
                 devices,
                 interrupts,
@@ -407,6 +420,7 @@ type RunningLoop<'a> = Pin<Box<dyn Future<Output = wasmtime::Result<()>> + Send 
 /// Owns a box's root store and its device child stores.
 pub struct BoxRuntime {
     pub store: Store<BoxHost>,
+    pub(crate) filesystem_runtime: Option<crate::component::fs::FilesystemRuntime>,
     pub(crate) mmio: Option<crate::component::vmm::mmio::Router>,
     epoch_clock: Arc<EpochClock>,
     memory_budget: Arc<BoxMemoryBudget>,
@@ -501,6 +515,7 @@ impl BoxRuntime {
         let (shutdown, _) = watch::channel(false);
         Ok(Self {
             store,
+            filesystem_runtime: None,
             mmio: None,
             epoch_clock,
             memory_budget,
@@ -619,7 +634,11 @@ impl BoxRuntime {
             let children = std::mem::take(&mut root.children);
             let child_shutdowns = children.iter().map(|child| child.shutdown.clone()).collect::<Vec<_>>();
             for mut child in children {
-                workers.spawn(async move { child.run_until_shutdown(true).await });
+                let executor = child.filesystem_runtime.as_ref().map_or_else(
+                    || Ok(tokio::runtime::Handle::current()),
+                    crate::component::fs::FilesystemRuntime::handle,
+                )?;
+                workers.spawn_on(async move { child.run_until_shutdown(true).await }, &executor);
             }
             let root_result = root.run_until_shutdown(false);
             tokio::pin!(root_result);
@@ -670,6 +689,7 @@ impl BoxRuntime {
         let machine = self.store.data_mut().platform.take_recovery_reaper()?;
         let (devices, interrupts) = self.store.data_mut().lifecycle.take_shutdowns();
         finish_native_recovery(DropRecovery {
+            filesystems: Vec::new(),
             machine,
             devices,
             interrupts,

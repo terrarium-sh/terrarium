@@ -77,11 +77,33 @@ Mounts use a scoped WASI directory capability. Guest path traversal and
 symlinks cannot open a host path outside that grant. Read-only mounts reject
 writes and metadata changes. They support ordinary file I/O, relative symlinks,
 and guest execution/mmap. Names must be UTF-8; guest modes and ownership are
-synthetic, not host POSIX metadata. Terra has no host-to-guest
-file-notification bridge: applications must rescan or poll for host and
-other-box edits. Guest-originated inotify remains available. Host edits do not
-automatically invalidate guest mapped pages. Use private volumes when an application needs full Linux
-filesystem behavior; host chmod/chown, xattrs, and cross-box locks are not
+synthetic, not host POSIX metadata.
+
+Each shared mount allows 32 active data I/O requests and 256 outstanding requests
+including queued work. These are individual reads, writes, or flushes, not whole
+copy jobs. Operations on the same file run in order.
+
+On shutdown, each shared mount has one second to flush its open writable files.
+A failed or timed-out flush reports an I/O error and allows shutdown to continue;
+durability is not guaranteed after that error. An already-running host write may
+still complete after shutdown.
+
+Terra forwards native host file events to guest `inotify` automatically on Linux,
+macOS, and Windows hosts, including read-only mounts and other-box edits.
+Events travel through the virtio-fs filesystem worker and the bundled FUSE driver.
+Guest writes generate native host notifications through ordinary filesystem I/O.
+Delivery is best effort: events can be coalesced, duplicated, reordered, or lost;
+rename cookies and exact event counts are not preserved. Watcher failures and
+queue overflow produce rate-limited diagnostics without stopping the box.
+Each box shares a budget of 4,096 pending events and 1,024 watched directories
+across its mounts. Directories beyond the watch limit receive no notification
+coverage; reaching the limit produces a rate-limited diagnostic.
+Terra does not poll, rescan, or replay missed changes. Filesystems without native
+notifications cannot provide automatic reload through this bridge. Host edits do
+not automatically invalidate guest mapped pages. Private disks and `sync` transfers
+receive no additional notification bridge.
+
+Use private volumes when an application needs full Linux filesystem behavior; host chmod/chown, xattrs, and cross-box locks are not
 available through a mount.
 
 `env` supplies literal variables to hooks and guest processes. `env_file` is a

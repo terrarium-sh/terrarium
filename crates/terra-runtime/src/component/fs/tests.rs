@@ -287,30 +287,47 @@ async fn mode_capability_changes_writable_files_and_rejects_readonly_files() {
             .unwrap();
         let result = store
             .data_mut()
-            .set_mode_for_descriptor(Resource::new_borrow(descriptor), 0o7600);
-        assert_eq!(result.is_ok(), !readonly && cfg!(unix));
+            .set_mode_for_descriptor(&Resource::new_borrow(descriptor), 0o7600);
+        assert_eq!(result.is_ok(), !readonly);
         #[cfg(windows)]
-        assert_eq!(
-            result,
-            Err(if readonly {
-                crate::component::fs::host::terra::fs::host::Error::Access
-            } else {
-                crate::component::fs::host::terra::fs::host::Error::Unsupported
-            })
-        );
-        #[cfg(windows)]
-        assert_eq!(
-            store
-                .data_mut()
-                .mode_for_descriptor(Resource::new_borrow(descriptor))
-                .unwrap(),
-            None
-        );
+        {
+            assert_eq!(
+                store
+                    .data_mut()
+                    .mode_for_descriptor(&Resource::new_borrow(descriptor))
+                    .unwrap(),
+                Some(0o100_755)
+            );
+            if !readonly {
+                store
+                    .data_mut()
+                    .set_mode_for_descriptor(&Resource::new_borrow(descriptor), 0o444)
+                    .unwrap();
+                assert_eq!(
+                    store
+                        .data_mut()
+                        .mode_for_descriptor(&Resource::new_borrow(descriptor))
+                        .unwrap(),
+                    Some(0o100_555)
+                );
+                store
+                    .data_mut()
+                    .set_mode_for_descriptor(&Resource::new_borrow(descriptor), 0o644)
+                    .unwrap();
+                assert_eq!(
+                    store
+                        .data_mut()
+                        .mode_for_descriptor(&Resource::new_borrow(descriptor))
+                        .unwrap(),
+                    Some(0o100_755)
+                );
+            }
+        }
         if !readonly && cfg!(unix) {
             assert_eq!(
                 store
                     .data_mut()
-                    .mode_for_descriptor(Resource::new_borrow(descriptor))
+                    .mode_for_descriptor(&Resource::new_borrow(descriptor))
                     .unwrap(),
                 Some(0o100_600)
             );

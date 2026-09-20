@@ -22,7 +22,7 @@ fn shares_report_filesystem_statistics() {
         let mut fs = host(root.path(), readonly);
         let descriptor = fs.get_directories().expect("preopen").remove(0).0;
         let stat = fs
-            .statfs_for_descriptor(Resource::new_borrow(descriptor.rep()))
+            .statfs_for_descriptor(&Resource::new_borrow(descriptor.rep()))
             .expect("filesystem statistics");
         assert_ne!(stat.blocks, 0);
         assert_ne!(stat.block_size, 0);
@@ -35,7 +35,7 @@ fn filesystem_statistics_reject_unknown_descriptors() {
     let root = tempfile::tempdir().expect("tempdir");
     let mut fs = host(root.path(), true);
     assert!(
-        fs.statfs_for_descriptor(Resource::new_borrow(u32::MAX))
+        fs.statfs_for_descriptor(&Resource::new_borrow(u32::MAX))
             .is_err()
     );
 }

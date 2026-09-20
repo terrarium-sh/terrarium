@@ -1,0 +1,281 @@
+--- a/fs/fuse/dir.c
++++ b/fs/fuse/dir.c
+@@ -9,6 +9,7 @@
+ #include "fuse_i.h"
+ 
+ #include <linux/pagemap.h>
++#include <linux/fsnotify.h>
+ #include <linux/file.h>
+ #include <linux/fs_context.h>
+ #include <linux/moduleparam.h>
+@@ -1756,6 +1757,174 @@
+ 	return err;
+ }
+ 
++static void fuse_terra_notify(struct fuse_mount *fm,
++			      const struct fuse_terra_event *event)
++{
++	struct inode *dir, *inode = NULL, *current_inode = NULL, *recorded = NULL;
++	struct dentry *parent, *entry;
++	struct fuse_entry_out outarg;
++	struct qstr name;
++	bool replaced;
++	u32 kind = event->kind & ~(0x100 | FUSE_TERRA_EVENT_SAME_INODE);
++	u32 mask;
++	int err;
++
++	if (!event->name_len || event->name_len > NAME_MAX ||
++	    strnlen(event->name, sizeof(event->name)) != event->name_len ||
++	    memchr(event->name, '/', event->name_len) ||
++	    !strcmp(event->name, ".") || !strcmp(event->name, ".."))
++		return;
++	switch (kind) {
++	case 1: mask = FS_CREATE; break;
++	case 2: mask = FS_DELETE; break;
++	case 3: mask = FS_MODIFY; break;
++	case 4: mask = FS_ATTRIB; break;
++	default: return;
++	}
++	if (event->kind & 0x100)
++		mask |= FS_ISDIR;
++	down_read(&fm->fc->killsb);
++	if (!fm->sb)
++		goto unlock_sb;
++	dir = fuse_ilookup(fm->fc, event->parent, NULL);
++	if (!dir)
++		goto unlock_sb;
++	if (dir->i_sb != fm->sb || !S_ISDIR(dir->i_mode))
++		goto put_dir;
++	if ((event->kind & FUSE_TERRA_EVENT_SAME_INODE) && kind >= 3 && event->child) {
++		inode = fuse_ilookup(fm->fc, event->child, NULL);
++		if (inode && inode->i_sb == fm->sb) {
++			fuse_invalidate_attr(inode);
++			if (kind == 3)
++				invalidate_mapping_pages(inode->i_mapping, 0, -1);
++			if (S_ISDIR(inode->i_mode))
++				mask |= FS_ISDIR;
++			name.name = event->name;
++			name.len = event->name_len;
++			name.hash = 0;
++			fsnotify(mask | FS_EVENT_ON_CHILD, inode, FSNOTIFY_EVENT_INODE,
++				 dir, &name, inode, 0);
++			iput(inode);
++			goto put_dir;
++		}
++		iput(inode);
++		inode = NULL;
++	}
++	parent = d_find_alias(dir);
++	if (!parent)
++		parent = d_obtain_alias(igrab(dir));
++	if (IS_ERR(parent))
++		goto put_dir;
++	name.name = event->name;
++	name.len = event->name_len;
++	name.hash = full_name_hash(parent, name.name, name.len);
++	inode_lock(dir);
++	entry = d_lookup(parent, &name);
++	if (entry && d_mountpoint(entry))
++		goto unlock;
++	if (event->child) {
++		recorded = fuse_ilookup(fm->fc, event->child, NULL);
++		if (recorded && recorded->i_sb != fm->sb) {
++			iput(recorded);
++			recorded = NULL;
++		}
++	}
++	err = fuse_lookup_name(dir->i_sb, get_node_id(dir), &name,
++			       &outarg, &current_inode);
++	if (err && err != -ENOENT)
++		goto unlock;
++	if (recorded)
++		inode = recorded;
++	else if (entry)
++		inode = d_inode(entry);
++	replaced = inode && inode != current_inode;
++	if (!inode)
++		inode = current_inode;
++	if (inode) {
++		fuse_invalidate_attr(inode);
++		/* Do not write back guest pages over an external edit. */
++		if (kind == 1 || kind == 3)
++			invalidate_mapping_pages(inode->i_mapping, 0, -1);
++		if (S_ISDIR(inode->i_mode))
++			mask |= FS_ISDIR;
++	}
++	if (entry)
++		fuse_invalidate_entry_cache(entry);
++	fuse_dir_changed(dir);
++	if (entry && (replaced || !inode))
++		d_drop(entry);
++	if (kind >= 3 && inode && !replaced)
++		fsnotify(mask | FS_EVENT_ON_CHILD, inode, FSNOTIFY_EVENT_INODE,
++			 dir, &name, inode, 0);
++	else
++		fsnotify_name(mask, inode, inode ? FSNOTIFY_EVENT_INODE : FSNOTIFY_EVENT_NONE,
++			      dir, &name, 0);
++	if (inode) {
++		if (replaced) {
++			fsnotify_link_count(inode);
++			fsnotify_inoderemove(inode);
++		} else if (kind <= 2)
++			fsnotify_inode(inode, FS_MODIFY);
++	}
++ unlock:
++	iput(recorded);
++	iput(current_inode);
++	dput(entry);
++	inode_unlock(dir);
++	dput(parent);
++ put_dir:
++	iput(dir);
++ unlock_sb:
++	up_read(&fm->fc->killsb);
++}
++
++struct fuse_terra_receive {
++	struct fuse_args args;
++	struct fuse_mount *fm;
++	struct fuse_terra_event event;
++};
++
++static void fuse_terra_receive_done(struct fuse_args *args, int error)
++{
++	struct fuse_terra_receive *receive = container_of(args, typeof(*receive), args);
++
++	if (!error) {
++		fuse_terra_notify(receive->fm, &receive->event);
++		memset(&receive->event, 0, sizeof(receive->event));
++		error = fuse_simple_background(receive->fm, args, GFP_NOFS);
++		if (!error)
++			return;
++	}
++	if (error != -ENODEV && error != -ECONNABORTED && error != -ENOTCONN)
++		pr_warn_ratelimited("fuse: shared file notifications stopped (%d)\n", error);
++	kfree(receive);
++}
++
++void fuse_terra_start_events(struct fuse_mount *fm)
++{
++	struct fuse_terra_receive *receive;
++	int error;
++
++	receive = kzalloc(sizeof(*receive), GFP_KERNEL);
++	if (!receive) {
++		pr_warn_ratelimited("fuse: shared file notifications unavailable\n");
++		return;
++	}
++	receive->fm = fm;
++	receive->args.opcode = FUSE_TERRA_RECEIVE_EVENT;
++	receive->args.nodeid = FUSE_ROOT_ID;
++	receive->args.out_numargs = 1;
++	receive->args.out_args[0].size = sizeof(receive->event);
++	receive->args.out_args[0].value = &receive->event;
++	receive->args.force = true;
++	receive->args.nocreds = true;
++	receive->args.may_block = true;
++	receive->args.end = fuse_terra_receive_done;
++	error = fuse_simple_background(fm, &receive->args, GFP_KERNEL);
++	if (error)
++		fuse_terra_receive_done(&receive->args, error);
++}
++
+ static long fuse_dir_ioctl(struct file *file, unsigned int cmd,
+ 			    unsigned long arg)
+ {
+--- a/fs/fuse/inode.c
++++ b/fs/fuse/inode.c
+@@ -1316,6 +1316,7 @@
+ 
+ static void process_init_reply(struct fuse_args *args, int error)
+ {
++	bool file_events = false;
+ 	struct fuse_init_args *ia = container_of(args, typeof(*ia), args);
+ 	struct fuse_mount *fm = ia->fm;
+ 	struct fuse_conn *fc = fm->fc;
+@@ -1335,6 +1336,8 @@
+ 
+ 			if (flags & FUSE_INIT_EXT)
+ 				flags |= (u64) arg->flags2 << 32;
++
++			file_events = flags & FUSE_TERRA_FILE_EVENTS;
+ 
+ 			ra_pages = arg->max_readahead / PAGE_SIZE;
+ 			if (flags & FUSE_ASYNC_READ)
+@@ -1478,6 +1481,8 @@
+ 
+ 	fuse_set_initialized(fc);
+ 	wake_up_all(&fc->blocked_waitq);
++	if (ok && file_events)
++		fuse_terra_start_events(fm);
+ }
+ 
+ static struct fuse_init_args *fuse_new_init(struct fuse_mount *fm)
+@@ -1524,6 +1529,7 @@
+ 	if (fuse_uring_enabled())
+ 		flags |= FUSE_OVER_IO_URING;
+ 
++	flags |= FUSE_TERRA_FILE_EVENTS;
+ 	ia->in.flags = flags;
+ 	ia->in.flags2 = flags >> 32;
+ 
+--- a/fs/fuse/fuse_i.h
++++ b/fs/fuse/fuse_i.h
+@@ -1556,4 +1556,6 @@
+ #define fuse_sysctl_unregister()	do { } while (0)
+ #endif /* CONFIG_SYSCTL */
+ 
++void fuse_terra_start_events(struct fuse_mount *fm);
++
+ #endif /* _FS_FUSE_I_H */
+--- a/fs/fuse/virtio_fs.c
++++ b/fs/fuse/virtio_fs.c
+@@ -1434,6 +1434,13 @@
+ 	}
+ 
+ 	vq = fsvq->vq;
++	/* Cancellation needs its header and reply even when ordinary I/O stalls. */
++	if (req->in.h.opcode != FUSE_TERRA_CANCEL_EVENTS &&
++	    vq->num_free < total_sgs + 2) {
++		spin_unlock(&fsvq->lock);
++		ret = -ENOSPC;
++		goto out;
++	}
+ 	ret = virtqueue_add_sgs(vq, sgs, out_sgs, in_sgs, req, GFP_ATOMIC);
+ 	if (ret < 0) {
+ 		spin_unlock(&fsvq->lock);
+@@ -1615,6 +1615,15 @@
+ 	if (IS_ENABLED(CONFIG_FUSE_DAX))
+ 		fuse_dax_cancel_work(fc);
+ 
++	{
++		FUSE_ARGS(args);
++		args.opcode = FUSE_TERRA_CANCEL_EVENTS;
++		args.nodeid = FUSE_ROOT_ID;
++		args.force = true;
++		args.nocreds = true;
++		fuse_simple_request(fm, &args);
++	}
++
+ 	/* Stop forget queue. Soon destroy will be sent */
+ 	spin_lock(&fsvq->lock);
+ 	fsvq->connected = false;
+--- a/include/uapi/linux/fuse.h
++++ b/include/uapi/linux/fuse.h
+@@ -1308,4 +1308,16 @@
+ 	uint8_t padding[6];
+ };
+ 
++#define FUSE_TERRA_FILE_EVENTS (1ULL << 63)
++#define FUSE_TERRA_RECEIVE_EVENT 4096
++#define FUSE_TERRA_CANCEL_EVENTS 4097
++#define FUSE_TERRA_EVENT_SAME_INODE 0x200
++struct fuse_terra_event {
++	uint64_t parent;
++	uint64_t child;
++	uint32_t kind;
++	uint32_t name_len;
++	char name[256];
++};
++
+ #endif /* _LINUX_FUSE_H */

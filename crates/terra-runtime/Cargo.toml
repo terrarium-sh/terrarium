@@ -15,6 +15,7 @@ thread-experiments = ["wasmtime/threads"]
 test-support = ["wasmtime/cranelift", "dep:terra-vsock-device", "dep:virtio-bindings"]
 
 [dependencies]
+notify = "8.2"
 terra-io = { path = "../terra-io" }
 terra-limits = { path = "../terra-limits" }
 terra-network = { path = "../terra-network" }
@@ -32,7 +33,7 @@ libc = { workspace = true }
 vm-memory = { version = "0.18", features = ["backend-mmap"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Wdk_Storage_FileSystem", "Wdk_System_SystemServices", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_Memory", "Win32_System_SystemInformation"] }
+windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Win32_Security", "Wdk_Storage_FileSystem", "Wdk_System_SystemServices", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_Memory", "Win32_System_SystemInformation"] }
 
 [dev-dependencies]
 terra-protocol = { path = "../terra-protocol" }

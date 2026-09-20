@@ -167,6 +167,7 @@ jobs:
             exit 0
           fi
           TERRA_BIN="$PWD/dist/terra" cargo test --locked --target x86_64-unknown-linux-musl -p terra --test native_boot native_boot_executes_shell -- --ignored --test-threads=1 --nocapture
+          TERRA_BIN="$PWD/dist/terra" cargo test --locked --target x86_64-unknown-linux-musl -p terra --test native_boot native_boot_forwards_shared_file_events -- --ignored --test-threads=1 --nocapture
           cargo test --locked --target x86_64-unknown-linux-musl -p terra-platform --lib -- --ignored --test-threads=1
           TERRA_BIN="$PWD/dist/terra" cargo test --locked --target x86_64-unknown-linux-musl -p terra --test boot --test memory -- --ignored --test-threads=1
       - name: Reclaim component build space
@@ -253,6 +254,7 @@ jobs:
             exit 0
           fi
           cargo test --locked --target aarch64-unknown-linux-musl -p terra-platform --lib -- --ignored --test-threads=1
+          TERRA_BIN="$PWD/dist/terra" cargo test --locked --target aarch64-unknown-linux-musl -p terra --test native_boot native_boot_forwards_shared_file_events -- --ignored --test-threads=1 --nocapture
           TERRA_BIN="$PWD/dist/terra" cargo test --locked --target aarch64-unknown-linux-musl -p terra --test boot --test memory -- --ignored --test-threads=1
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

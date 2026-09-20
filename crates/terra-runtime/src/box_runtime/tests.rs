@@ -465,6 +465,7 @@ async fn cancelled_recovery_retains_cleanup_order() {
     ];
     {
         let recovering = super::finish_native_recovery(super::DropRecovery {
+            filesystems: Vec::new(),
             machine: None,
             devices,
             interrupts: None,
@@ -480,4 +481,46 @@ async fn cancelled_recovery_retains_cleanup_order() {
         .await
         .unwrap()
         .unwrap();
+}
+
+#[test]
+fn dropping_a_box_moves_filesystem_resource_cleanup_off_the_caller() {
+    use wasmtime_wasi::WasiView;
+    struct BlockOnDrop {
+        started: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+    impl Drop for BlockOnDrop {
+        fn drop(&mut self) {
+            let _ = self.started.send(());
+            let _ = self.release.recv();
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let mut host = BoxHost::new();
+    let mut filesystem = crate::component::fs::host::FsHost::new(
+        DeviceHost::new(4096).unwrap(),
+        crate::component::fs::host::ShareGrant::new(root.path(), false).unwrap(),
+    );
+    let (started, ready) = std::sync::mpsc::channel();
+    let (release, blocked) = std::sync::mpsc::channel();
+    filesystem
+        .ctx()
+        .table
+        .push(BlockOnDrop {
+            started,
+            release: blocked,
+        })
+        .unwrap();
+    host.filesystems.push(filesystem);
+    let (dropped, done) = std::sync::mpsc::channel();
+    let caller = std::thread::spawn(move || {
+        drop(host);
+        dropped.send(()).unwrap();
+    });
+    ready.recv_timeout(Duration::from_secs(3)).unwrap();
+    let result = done.recv_timeout(Duration::from_secs(1));
+    drop(release);
+    caller.join().unwrap();
+    result.expect("native resource cleanup must not block the dropping thread");
 }

@@ -371,7 +371,9 @@ pub(crate) async fn filesystems(
                 .into(),
         );
     }
-    for (index, grant) in input.shares.iter().cloned().enumerate() {
+    let mut grants = input.shares.clone();
+    crate::component::fs::host::share_notification_budgets(&mut grants);
+    for (index, grant) in grants.into_iter().enumerate() {
         let ram = ram.clone();
         let host = move || {
             Ok(crate::component::fs::host::FsHost::with_resource_capacity(
