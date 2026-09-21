@@ -6,7 +6,8 @@ use wasmtime::component::StreamReader;
 use crate::box_runtime::store::StoreHost;
 use crate::box_runtime::{DeviceWorker, WorkerTask};
 use crate::component::relay;
-use crate::component::vmm::mmio::{Reply, Request, Serve};
+use crate::component::vmm::bindings::types::{Reply, Request};
+use crate::component::vmm::mmio::Serve;
 
 pub(crate) const SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -25,7 +26,7 @@ pub(crate) struct PreparedWorker {
 impl crate::box_runtime::BoxRuntime {
     pub(crate) fn grant_device_worker<H: StoreHost>(
         &mut self,
-        kind: super::machine::DeviceKind,
+        kind: super::bindings::machine::DeviceKind,
         initialize: impl Future<Output = wasmtime::Result<(DeviceWorker<H>, Serve)>> + Send + 'static,
     ) -> wasmtime::Result<super::mmio::MmioDevice> {
         self.grant_device_setup(kind, setup(initialize, self.shutdown_receiver()))
@@ -33,7 +34,7 @@ impl crate::box_runtime::BoxRuntime {
 
     pub(crate) fn grant_device_setup(
         &mut self,
-        kind: super::machine::DeviceKind,
+        kind: super::bindings::machine::DeviceKind,
         setup: Setup,
     ) -> wasmtime::Result<super::mmio::MmioDevice> {
         let device = super::mmio::MmioDevice::grant_worker(self, kind, setup)?;
@@ -54,7 +55,7 @@ impl crate::box_runtime::BoxRuntime {
 
     pub(crate) fn grant_device_worker_unmanaged<H: StoreHost>(
         &mut self,
-        kind: super::machine::DeviceKind,
+        kind: super::bindings::machine::DeviceKind,
         initialize: impl Future<Output = wasmtime::Result<(DeviceWorker<H>, Serve)>> + Send + 'static,
     ) -> wasmtime::Result<super::mmio::MmioDevice> {
         let setup = setup(initialize, self.shutdown_receiver());

@@ -7,11 +7,11 @@ use super::{Platform, PlatformHost};
 
 use crate::box_runtime::BoxRuntime;
 use crate::box_runtime::store::BoxHost;
-use crate::component::vmm::mmio::terra::mmio::virtualization;
-pub use crate::component::vmm::mmio::terra::mmio::virtualization::{Architecture, Config, Error};
+use crate::component::vmm::bindings::virtualization;
+pub use crate::component::vmm::bindings::virtualization::{Architecture, Config, Error};
 pub(crate) type InitializeMachine = wasmtime::component::TypedFunc<
     (Config, Resource<Vm>, Vec<Resource<super::Vcpu>>),
-    (Result<(), super::machine::Error>,),
+    (Result<(), super::bindings::machine::Error>,),
 >;
 use crate::memory::{BoundedMemory, GuestRam};
 
@@ -25,7 +25,7 @@ impl MachineConfig {
         architecture: Architecture,
         ram_bytes: u64,
         vcpus: u8,
-        devices: Vec<super::machine::Device>,
+        devices: Vec<super::bindings::machine::Device>,
     ) -> wasmtime::Result<Self> {
         wasmtime::ensure!(
             vcpus != 0
@@ -74,7 +74,7 @@ impl MachineConfig {
     }
 
     #[must_use]
-    pub fn devices(&self) -> &[super::machine::Device] {
+    pub fn devices(&self) -> &[super::bindings::machine::Device] {
         &self.config.devices
     }
 
@@ -85,7 +85,7 @@ impl MachineConfig {
 
     pub fn device_slot(
         &self,
-        kind: super::machine::DeviceKind,
+        kind: super::bindings::machine::DeviceKind,
         ordinal: usize,
     ) -> wasmtime::Result<u8> {
         self.devices()
@@ -126,7 +126,7 @@ impl From<GuestRam> for RamGrant {
 
 struct CreatedMachine<M> {
     machine: Arc<M>,
-    devices: Vec<super::machine::Device>,
+    devices: Vec<super::bindings::machine::Device>,
 }
 
 pub struct MachineHandle<M>(Arc<CreatedMachine<M>>);
@@ -145,7 +145,7 @@ impl<M: VirtualMachine> MachineHandle<M> {
 
     pub fn bind_interrupt(
         &self,
-        kind: super::machine::DeviceKind,
+        kind: super::bindings::machine::DeviceKind,
         ordinal: usize,
         inject: impl Fn(&M, u32, bool) -> wasmtime::Result<()> + Send + Sync + 'static,
     ) -> wasmtime::Result<crate::component::Interrupt> {
@@ -528,8 +528,8 @@ mod tests {
     fn interrupt_bindings_validate_the_device_during_setup() {
         let machine = MachineHandle(Arc::new(CreatedMachine {
             machine: Arc::new(TestVm(GuestRam::new(32768).unwrap())),
-            devices: vec![super::super::machine::Device {
-                kind: super::super::machine::DeviceKind::Memory,
+            devices: vec![super::super::bindings::machine::Device {
+                kind: super::super::bindings::machine::DeviceKind::Memory,
                 mmio_base: 0,
                 irq: 15,
             }],
@@ -538,7 +538,7 @@ mod tests {
         let observed = Arc::clone(&delivered);
         let interrupt = machine
             .bind_interrupt(
-                super::super::machine::DeviceKind::Memory,
+                super::super::bindings::machine::DeviceKind::Memory,
                 0,
                 move |_, irq, level| {
                     assert!(level);
@@ -549,9 +549,11 @@ mod tests {
             .unwrap();
         assert!(
             machine
-                .bind_interrupt(super::super::machine::DeviceKind::Memory, 1, |_, _, _| Ok(
-                    ()
-                ))
+                .bind_interrupt(
+                    super::super::bindings::machine::DeviceKind::Memory,
+                    1,
+                    |_, _, _| Ok(())
+                )
                 .is_err()
         );
         interrupt(true).unwrap();
@@ -623,26 +625,68 @@ mod tests {
             };
             let devices = match architecture {
                 Architecture::X86 => vec![
-                    (super::super::machine::DeviceKind::Block, 0xd000_0000, 11),
-                    (super::super::machine::DeviceKind::Block, 0xd000_1000, 12),
-                    (super::super::machine::DeviceKind::Net, 0xd000_2000, 13),
-                    (super::super::machine::DeviceKind::Vsock, 0xd000_3000, 14),
-                    (super::super::machine::DeviceKind::Memory, 0xd000_4000, 15),
+                    (
+                        super::super::bindings::machine::DeviceKind::Block,
+                        0xd000_0000,
+                        11,
+                    ),
+                    (
+                        super::super::bindings::machine::DeviceKind::Block,
+                        0xd000_1000,
+                        12,
+                    ),
+                    (
+                        super::super::bindings::machine::DeviceKind::Net,
+                        0xd000_2000,
+                        13,
+                    ),
+                    (
+                        super::super::bindings::machine::DeviceKind::Vsock,
+                        0xd000_3000,
+                        14,
+                    ),
+                    (
+                        super::super::bindings::machine::DeviceKind::Memory,
+                        0xd000_4000,
+                        15,
+                    ),
                 ],
                 Architecture::Arm => vec![
-                    (super::super::machine::DeviceKind::Block, 0x0a00_0000, 16),
-                    (super::super::machine::DeviceKind::Block, 0x0a00_0200, 17),
-                    (super::super::machine::DeviceKind::Memory, 0x0a00_0400, 18),
-                    (super::super::machine::DeviceKind::Net, 0x0a00_0600, 19),
-                    (super::super::machine::DeviceKind::Vsock, 0x0a00_0800, 20),
+                    (
+                        super::super::bindings::machine::DeviceKind::Block,
+                        0x0a00_0000,
+                        16,
+                    ),
+                    (
+                        super::super::bindings::machine::DeviceKind::Block,
+                        0x0a00_0200,
+                        17,
+                    ),
+                    (
+                        super::super::bindings::machine::DeviceKind::Memory,
+                        0x0a00_0400,
+                        18,
+                    ),
+                    (
+                        super::super::bindings::machine::DeviceKind::Net,
+                        0x0a00_0600,
+                        19,
+                    ),
+                    (
+                        super::super::bindings::machine::DeviceKind::Vsock,
+                        0x0a00_0800,
+                        20,
+                    ),
                 ],
             }
             .into_iter()
-            .map(|(kind, mmio_base, irq)| super::super::machine::Device {
-                kind,
-                mmio_base,
-                irq,
-            })
+            .map(
+                |(kind, mmio_base, irq)| super::super::bindings::machine::Device {
+                    kind,
+                    mmio_base,
+                    irq,
+                },
+            )
             .collect();
             #[cfg(unix)]
             let ram = GuestRam::from_shared(Arc::new(

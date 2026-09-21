@@ -90,7 +90,7 @@ wasmtime::component::bindgen!({
         "terra:vsock/host-service.stop": store | trappable,
     },
     with: {
-        "terra:mmio/types@0.1.0": crate::component::vmm::mmio::terra::mmio::types,
+        "terra:mmio/types@0.1.0": crate::component::vmm::bindings::types,
     },
 });
 

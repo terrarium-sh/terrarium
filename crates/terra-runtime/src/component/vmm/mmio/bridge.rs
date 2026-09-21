@@ -41,11 +41,11 @@ fn complete_device(context: &BridgeContext, routed: &RoutedReply) -> wasmtime::R
     if routed.reply.error != 0 {
         device.counts.failed.fetch_add(1, Ordering::Relaxed);
         let kind = match device.kind {
-            crate::component::vmm::machine::DeviceKind::Block => "block",
-            crate::component::vmm::machine::DeviceKind::Fs => "filesystem",
-            crate::component::vmm::machine::DeviceKind::Memory => "memory",
-            crate::component::vmm::machine::DeviceKind::Vsock => "vsock",
-            crate::component::vmm::machine::DeviceKind::Net => "network",
+            crate::component::vmm::bindings::machine::DeviceKind::Block => "block",
+            crate::component::vmm::bindings::machine::DeviceKind::Fs => "filesystem",
+            crate::component::vmm::bindings::machine::DeviceKind::Memory => "memory",
+            crate::component::vmm::bindings::machine::DeviceKind::Vsock => "vsock",
+            crate::component::vmm::bindings::machine::DeviceKind::Net => "network",
         };
         return Err(wasmtime::Error::msg(format!(
             "MMIO {kind} device error {}",

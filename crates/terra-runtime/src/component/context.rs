@@ -1,7 +1,8 @@
 //! Shared device capabilities and host imports.
 
 use crate::MAX_SINGLE_BYTES;
-use crate::component::block::host::terra;
+use crate::component::bindings::{diagnostics, interrupt, memory};
+use crate::component::vmm::bindings::types;
 use crate::memory::{BoundedMemory, GuestRam};
 use std::sync::Arc;
 use wasmtime::Engine;
@@ -189,28 +190,24 @@ pub fn device_component_linker<T: WasiView + 'static>(
     Ok(linker)
 }
 
-fn memory_error(error: crate::memory::MemoryError) -> terra::host::memory::MemoryError {
+fn memory_error(error: crate::memory::MemoryError) -> memory::MemoryError {
     match error {
-        crate::memory::MemoryError::OutOfRange => terra::host::memory::MemoryError::OutOfRange,
-        crate::memory::MemoryError::TooLarge => terra::host::memory::MemoryError::TooLarge,
-        crate::memory::MemoryError::Unmapped => terra::host::memory::MemoryError::Unmapped,
+        crate::memory::MemoryError::OutOfRange => memory::MemoryError::OutOfRange,
+        crate::memory::MemoryError::TooLarge => memory::MemoryError::TooLarge,
+        crate::memory::MemoryError::Unmapped => memory::MemoryError::Unmapped,
     }
 }
 
-impl terra::mmio::types::Host for DeviceContext {}
+impl types::Host for DeviceContext {}
 
-impl terra::host::memory::Host for DeviceContext {
-    fn read(&mut self, offset: u64, len: u64) -> Result<Vec<u8>, terra::host::memory::MemoryError> {
+impl memory::Host for DeviceContext {
+    fn read(&mut self, offset: u64, len: u64) -> Result<Vec<u8>, memory::MemoryError> {
         self.memory().read(offset, len).map_err(memory_error)
     }
 
-    fn write(
-        &mut self,
-        offset: u64,
-        data: Vec<u8>,
-    ) -> Result<(), terra::host::memory::MemoryError> {
+    fn write(&mut self, offset: u64, data: Vec<u8>) -> Result<(), memory::MemoryError> {
         if u64::try_from(data.len()).unwrap_or(u64::MAX) > MAX_SINGLE_BYTES {
-            return Err(terra::host::memory::MemoryError::TooLarge);
+            return Err(memory::MemoryError::TooLarge);
         }
         self.memory().write(offset, &data).map_err(memory_error)
     }
@@ -220,7 +217,7 @@ impl terra::host::memory::Host for DeviceContext {
     }
 }
 
-impl terra::host::interrupt::Host for DeviceContext {
+impl interrupt::Host for DeviceContext {
     fn set_level(&mut self, level: bool) {
         if self.interrupt_level != level {
             self.interrupt_level = level;
@@ -235,7 +232,7 @@ impl terra::host::interrupt::Host for DeviceContext {
     }
 }
 
-impl terra::host::diagnostics::Host for DeviceContext {
+impl diagnostics::Host for DeviceContext {
     fn event(&mut self, message: String) {
         log::warn!("network: {message}");
     }
@@ -246,8 +243,8 @@ pub fn add_device_imports<T: Send + 'static>(
     context: fn(&mut T) -> &mut DeviceContext,
 ) -> wasmtime::Result<()> {
     use wasmtime::component::HasSelf;
-    terra::host::memory::add_to_linker::<T, HasSelf<DeviceContext>>(linker, context)?;
-    terra::host::interrupt::add_to_linker::<T, HasSelf<DeviceContext>>(linker, context)?;
+    memory::add_to_linker::<T, HasSelf<DeviceContext>>(linker, context)?;
+    interrupt::add_to_linker::<T, HasSelf<DeviceContext>>(linker, context)?;
     Ok(())
 }
 
@@ -255,7 +252,7 @@ pub fn add_device_imports<T: Send + 'static>(
 mod tests {
     #[test]
     fn interrupt_wakeups_are_coalesced_and_device_scoped() {
-        use super::terra::host::interrupt::Host as _;
+        use super::interrupt::Host as _;
         use std::future::Future as _;
         use std::task::{Context, Poll, Waker};
 
@@ -302,7 +299,7 @@ mod tests {
 
     #[test]
     fn published_interrupt_levels_are_device_scoped_and_survive_coalescing() {
-        use super::terra::host::interrupt::Host as _;
+        use super::interrupt::Host as _;
         use std::future::Future as _;
         use std::task::{Context, Poll, Waker};
 

@@ -3,11 +3,12 @@
 //! Build it first: `make component-block` (nightly `wasm32-wasip3`).
 
 use crate::box_runtime::store::test_support::{StandaloneHost, device_store};
+use crate::component::bindings::{Completion, Range};
 use crate::component::block::backing::BoundedDisk;
 use crate::component::block::backing::DiskGrant;
-use crate::component::block::host::{BlockHost, Completion, Range, block_component_linker};
-use crate::component::vmm::mmio::terra::mmio::types::DeviceError;
-use crate::component::vmm::mmio::{Operation, Reply, Request};
+use crate::component::block::host::{BlockHost, block_component_linker};
+use crate::component::vmm::bindings::types::DeviceError;
+use crate::component::vmm::bindings::types::{Operation, Reply, Request};
 use crate::engine::{device_engine, precompile_component};
 use crate::memory::GuestRam;
 use std::pin::Pin;

@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use super::machine::DeviceKind;
+use super::bindings::machine::DeviceKind;
 
 type Outcome = Result<(), String>;
 type Close = futures_util::future::BoxFuture<'static, Outcome>;

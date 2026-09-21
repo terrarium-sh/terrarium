@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
 use crate::box_runtime::store::BoxHost;
-pub use crate::component::vmm::mmio::terra::mmio::lifecycle_platform;
+pub use crate::component::vmm::bindings::lifecycle_platform;
 
 #[derive(Clone)]
 pub struct LifecycleNotifier {

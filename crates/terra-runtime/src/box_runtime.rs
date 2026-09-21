@@ -242,7 +242,10 @@ impl BoxRuntime {
     }
 
     #[must_use]
-    pub fn has_component(&self, kind: crate::component::vmm::machine::DeviceKind) -> bool {
+    pub fn has_component(
+        &self,
+        kind: crate::component::vmm::bindings::machine::DeviceKind,
+    ) -> bool {
         self.mmio
             .as_ref()
             .is_some_and(|router| router.has_component(kind))

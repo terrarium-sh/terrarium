@@ -899,8 +899,8 @@ fn saturated_mount_cleanup_does_not_starve_another_mount_or_guest_disk() {
         .build()
         .unwrap();
     runtime.block_on(async {
+        use crate::component::bindings::disk::HostWithStore;
         use crate::component::block::backing::{DiskGrant, FileDisk};
-        use crate::component::block::host::terra::host::disk::HostWithStore;
         use wasmtime::component::HasSelf;
 
         let (_root, mut stalled, gate) = mount_with_operation(Operation::HostMetadata).await;

@@ -1,10 +1,8 @@
 //! Bounded rendezvous for Wasm IOAPIC emulation and native interrupt injection.
 
 use crate::box_runtime::BoxRuntime;
-use crate::component::vmm::mmio::Error;
-pub use crate::component::vmm::mmio::exports::terra::mmio::interrupts::{
-    IoapicReply, X86Interrupt,
-};
+pub use crate::component::vmm::bindings::interrupts::{IoapicReply, X86Interrupt};
+use crate::component::vmm::bindings::types::Error;
 use std::sync::{Arc, Mutex, mpsc};
 use tokio::sync::{mpsc as queue, watch};
 pub type Inject = Arc<dyn Fn(X86Interrupt) -> wasmtime::Result<()> + Send + Sync>;
@@ -133,7 +131,7 @@ impl IoApicHandle {
 
     pub fn bind_interrupt(
         &self,
-        kind: super::machine::DeviceKind,
+        kind: super::bindings::machine::DeviceKind,
         ordinal: usize,
     ) -> wasmtime::Result<crate::component::Interrupt> {
         let slot = self.config.device_slot(kind, ordinal)?;
@@ -350,7 +348,7 @@ pub struct IrqHandle {
 impl IrqHandle {
     pub fn bind_interrupt(
         &self,
-        kind: super::machine::DeviceKind,
+        kind: super::bindings::machine::DeviceKind,
         ordinal: usize,
     ) -> wasmtime::Result<crate::component::Interrupt> {
         let slot = self.config.device_slot(kind, ordinal)?;

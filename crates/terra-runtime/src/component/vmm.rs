@@ -1,9 +1,9 @@
 //! Scoped hypervisor rendezvous for the long-running Wasm VMM.
 
+pub mod bindings;
 pub mod boot;
 pub mod interrupts;
 pub mod lifecycle;
-pub mod machine;
 pub mod mmio;
 pub mod reaper;
 pub mod teardown;
@@ -15,8 +15,8 @@ use std::time::Duration;
 use wasmtime::component::{Accessor, Resource, ResourceTable};
 
 use crate::box_runtime::store::BoxHost;
-pub use crate::component::vmm::mmio::terra::mmio::platform;
-pub use crate::component::vmm::mmio::terra::mmio::platform::{Completion, Error, Exit};
+pub use crate::component::vmm::bindings::platform;
+pub use crate::component::vmm::bindings::platform::{Completion, Error, Exit};
 use crate::memory::BoundedMemory;
 
 const MAX_VCPUS: usize = terra_limits::X86_MAX_VCPUS as usize;

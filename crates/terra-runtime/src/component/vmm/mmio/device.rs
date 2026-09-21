@@ -42,7 +42,7 @@ pub struct MmioDevice {
 impl MmioDevice {
     pub(crate) fn grant_worker(
         root: &mut BoxRuntime,
-        kind: crate::component::vmm::machine::DeviceKind,
+        kind: crate::component::vmm::bindings::machine::DeviceKind,
         setup: crate::component::vmm::workers::Setup,
     ) -> wasmtime::Result<Self> {
         root.mmio
@@ -312,7 +312,7 @@ mod tests {
         let (control_sender, controls) = tokio::sync::mpsc::channel(1);
         let device = MmioDevice {
             device: Arc::new(DeviceRegistration {
-                kind: crate::component::vmm::machine::DeviceKind::Block,
+                kind: crate::component::vmm::bindings::machine::DeviceKind::Block,
                 slot: 0,
                 base: AtomicU64::new(0),
                 counts: DeviceRequestCounts::default(),
@@ -428,7 +428,7 @@ mod tests {
             });
             MmioDevice::grant_worker(
                 &mut runtime,
-                crate::component::vmm::machine::DeviceKind::Block,
+                crate::component::vmm::bindings::machine::DeviceKind::Block,
                 setup,
             )
             .unwrap();
@@ -467,7 +467,7 @@ mod tests {
             Box::new(|_| Box::pin(async { panic!("over-capacity setup must not run") }));
         let error = MmioDevice::grant_worker(
             &mut runtime,
-            crate::component::vmm::machine::DeviceKind::Block,
+            crate::component::vmm::bindings::machine::DeviceKind::Block,
             setup,
         )
         .err()
@@ -495,7 +495,7 @@ mod tests {
 
         let error = MmioDevice::grant_worker(
             &mut runtime,
-            crate::component::vmm::machine::DeviceKind::Block,
+            crate::component::vmm::bindings::machine::DeviceKind::Block,
             setup,
         )
         .err()

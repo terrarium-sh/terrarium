@@ -37,7 +37,7 @@ pub const GIC_LAYOUT: GicLayout = GicLayout {
     redistributor_size: GIC_REDIST_SIZE,
 };
 
-pub use terra_runtime::component::vmm::machine::{Device, DeviceKind};
+pub use terra_runtime::component::vmm::bindings::machine::{Device, DeviceKind};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Layout {

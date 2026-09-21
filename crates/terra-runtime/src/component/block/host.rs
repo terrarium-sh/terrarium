@@ -1,7 +1,8 @@
-//! Block device capabilities and component bindings.
+//! Host disk capabilities and block component linker.
 
 use super::backing::{BlockBacking, DiskGrant};
 use crate::MAX_SINGLE_BYTES;
+use crate::component::bindings::disk;
 use crate::component::context::{
     DeviceContext, DeviceHost, add_device_imports, device_component_linker,
 };
@@ -10,18 +11,6 @@ use std::sync::{Arc, Mutex};
 use wasmtime::Engine;
 use wasmtime::component::HasSelf;
 use wasmtime_wasi::{WasiCtxView, WasiView};
-
-wasmtime::component::bindgen!({
-    world: "block-device",
-    path: "../../components/wit/terra",
-    exports: { default: async },
-    with: {
-        "terra:mmio/types@0.1.0": crate::component::vmm::mmio::terra::mmio::types,
-    },
-});
-
-pub use exports::terra::host::device_api::{Completion, Range};
-pub use terra::mmio::types::DeviceError;
 
 pub struct BlockHost {
     pub context: DeviceContext,
@@ -67,7 +56,7 @@ fn run_disk_job<T: Send + 'static, F>(
     len: u64,
     max_len: u64,
     operation: F,
-) -> impl core::future::Future<Output = Result<T, terra::host::disk::DiskError>> + Send + use<T, F>
+) -> impl core::future::Future<Output = Result<T, disk::DiskError>> + Send + use<T, F>
 where
     F: FnOnce(&mut DiskGrant) -> Result<T, super::backing::BackingError> + Send + 'static,
 {
@@ -76,7 +65,7 @@ where
     let job = Arc::clone(&host.disk_slot).try_acquire_owned();
     async move {
         use super::backing::BackingError;
-        use terra::host::disk::DiskError;
+        use disk::DiskError;
         if len > max_len {
             return Err(DiskError::TooLarge);
         }
@@ -98,32 +87,31 @@ where
     }
 }
 
-impl<T: Send + 'static> terra::host::disk::HostWithStore<T> for HasSelf<BlockHost> {
+impl<T: Send + 'static> disk::HostWithStore<T> for HasSelf<BlockHost> {
     fn read_at(
         host: &wasmtime::component::Accessor<T, Self>,
         offset: u64,
         len: u64,
-    ) -> impl core::future::Future<Output = Result<Vec<u8>, terra::host::disk::DiskError>> + Send
-    {
+    ) -> impl core::future::Future<Output = Result<Vec<u8>, disk::DiskError>> + Send {
         host.with(|mut access| disk_read_at(access.get(), offset, len))
     }
     fn write_at(
         host: &wasmtime::component::Accessor<T, Self>,
         offset: u64,
         data: Vec<u8>,
-    ) -> impl core::future::Future<Output = Result<(), terra::host::disk::DiskError>> + Send {
+    ) -> impl core::future::Future<Output = Result<(), disk::DiskError>> + Send {
         host.with(|mut access| disk_write_at(access.get(), offset, data))
     }
     fn discard(
         host: &wasmtime::component::Accessor<T, Self>,
         offset: u64,
         len: u64,
-    ) -> impl core::future::Future<Output = Result<(), terra::host::disk::DiskError>> + Send {
+    ) -> impl core::future::Future<Output = Result<(), disk::DiskError>> + Send {
         host.with(|mut access| disk_discard(access.get(), offset, len))
     }
     fn sync(
         host: &wasmtime::component::Accessor<T, Self>,
-    ) -> impl core::future::Future<Output = Result<(), terra::host::disk::DiskError>> + Send {
+    ) -> impl core::future::Future<Output = Result<(), disk::DiskError>> + Send {
         host.with(|mut access| disk_sync(access.get()))
     }
 }
@@ -132,8 +120,7 @@ fn disk_read_at(
     host: &mut BlockHost,
     offset: u64,
     len: u64,
-) -> impl core::future::Future<Output = Result<Vec<u8>, terra::host::disk::DiskError>> + Send + use<>
-{
+) -> impl core::future::Future<Output = Result<Vec<u8>, disk::DiskError>> + Send + use<> {
     run_disk_job(host, offset, len, MAX_SINGLE_BYTES, move |disk| {
         let len = usize::try_from(len).map_err(|_| super::backing::BackingError::OutOfRange)?;
         let mut bytes = vec![0; len];
@@ -146,7 +133,7 @@ fn disk_write_at(
     host: &mut BlockHost,
     offset: u64,
     data: Vec<u8>,
-) -> impl core::future::Future<Output = Result<(), terra::host::disk::DiskError>> + Send + use<> {
+) -> impl core::future::Future<Output = Result<(), disk::DiskError>> + Send + use<> {
     run_disk_job(
         host,
         offset,
@@ -160,7 +147,7 @@ fn disk_discard(
     host: &mut BlockHost,
     offset: u64,
     len: u64,
-) -> impl core::future::Future<Output = Result<(), terra::host::disk::DiskError>> + Send + use<> {
+) -> impl core::future::Future<Output = Result<(), disk::DiskError>> + Send + use<> {
     run_disk_job(
         host,
         offset,
@@ -172,11 +159,11 @@ fn disk_discard(
 
 fn disk_sync(
     host: &mut BlockHost,
-) -> impl core::future::Future<Output = Result<(), terra::host::disk::DiskError>> + Send + use<> {
+) -> impl core::future::Future<Output = Result<(), disk::DiskError>> + Send + use<> {
     run_disk_job(host, 0, 0, MAX_SINGLE_BYTES, |disk| disk.sync())
 }
 
-impl terra::host::disk::Host for BlockHost {
+impl disk::Host for BlockHost {
     fn capacity(&mut self) -> u64 {
         self.disk_capacity
     }
@@ -186,7 +173,7 @@ pub fn block_component_linker<T: WasiView + AsMut<BlockHost> + 'static>(
     engine: &Engine,
 ) -> wasmtime::Result<wasmtime::component::Linker<T>> {
     let mut linker = device_component_linker(engine)?;
-    terra::host::disk::add_to_linker::<T, HasSelf<BlockHost>>(&mut linker, AsMut::as_mut)?;
+    disk::add_to_linker::<T, HasSelf<BlockHost>>(&mut linker, AsMut::as_mut)?;
     add_device_imports(&mut linker, |host: &mut T| host.as_mut().context())?;
     Ok(linker)
 }
@@ -196,7 +183,7 @@ mod tests {
     use crate::component::block::backing::BoundedDisk;
     #[tokio::test]
     async fn disk_imports_enforce_bounds_and_readonly_without_a_guest() {
-        use super::terra::host::disk::DiskError;
+        use super::disk::DiskError;
         use super::{BlockHost, DiskGrant, disk_discard, disk_read_at, disk_sync, disk_write_at};
 
         let mut host = BlockHost::new(
@@ -240,9 +227,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_waiter_keeps_its_disk_slot_until_blocking_work_returns() {
-        use super::{
-            BlockHost, disk_read_at, disk_sync, run_disk_job, terra::host::disk::DiskError,
-        };
+        use super::{BlockHost, disk::DiskError, disk_read_at, disk_sync, run_disk_job};
 
         let mut host = BlockHost::new(
             crate::memory::GuestRam::new(4096).unwrap(),

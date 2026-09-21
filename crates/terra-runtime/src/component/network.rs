@@ -20,7 +20,7 @@ wasmtime::component::bindgen!({
     path: "../../components/network/wit",
     exports: { default: async },
     with: {
-        "terra:mmio/types@0.1.0": crate::component::vmm::mmio::terra::mmio::types,
+        "terra:mmio/types@0.1.0": crate::component::vmm::bindings::types,
     },
 });
 use exports::terra::network::api::{Config as NetworkConfig, Error as NetworkError, PublishedPort};
@@ -153,7 +153,7 @@ pub fn grant_shared(
 ) -> wasmtime::Result<DeviceChannel> {
     let host_service_ports = policy.host_service_ports().to_vec();
     let policy_mappings = port_mappings.clone();
-    if runtime.has_component(crate::component::vmm::machine::DeviceKind::Net) {
+    if runtime.has_component(crate::component::vmm::bindings::machine::DeviceKind::Net) {
         return Err(wasmtime::Error::msg(
             "box network component already configured",
         ));
@@ -162,7 +162,7 @@ pub fn grant_shared(
     let child = runtime.child_factory();
     let component = component.clone();
     runtime.grant_device_worker(
-        crate::component::vmm::machine::DeviceKind::Net,
+        crate::component::vmm::bindings::machine::DeviceKind::Net,
         async move {
             let host = NetworkHost::new(host()?, policy, policy_mappings);
             create_worker(child(host), &component, config, interrupt).await

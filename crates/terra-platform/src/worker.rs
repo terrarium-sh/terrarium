@@ -80,11 +80,11 @@ pub(crate) fn assemble_devices(
     ram: terra_runtime::component::vmm::virtualization::RamGrant,
     disks: &[(PathBuf, bool)],
     bind_interrupt: impl Fn(
-        terra_runtime::component::vmm::machine::DeviceKind,
+        terra_runtime::component::vmm::bindings::machine::DeviceKind,
         usize,
     ) -> Result<terra_runtime::component::network::Interrupt, String>,
 ) -> Result<(), String> {
-    use terra_runtime::component::vmm::machine::DeviceKind;
+    use terra_runtime::component::vmm::bindings::machine::DeviceKind;
     blocks(runtime, ram.clone(), input, disks, |index| {
         bind_interrupt(DeviceKind::Block, index)
     })?;
@@ -425,7 +425,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     async fn prepared_vmm_observes_wasi_startup_and_shutdown() {
         use std::sync::Arc;
-        use terra_runtime::component::vmm::machine::{Device, DeviceKind};
+        use terra_runtime::component::vmm::bindings::machine::{Device, DeviceKind};
         use terra_runtime::component::vmm::virtualization::{Architecture, MachineConfig};
 
         use terra_runtime::component::context::DeviceContext;
@@ -524,7 +524,7 @@ mod tests {
         let delivered = Arc::clone(&injections);
         let interrupt = machine
             .bind_interrupt(
-                terra_runtime::component::vmm::machine::DeviceKind::Memory,
+                terra_runtime::component::vmm::bindings::machine::DeviceKind::Memory,
                 0,
                 move |_, irq, level| {
                     assert_eq!(irq, 15);
@@ -536,7 +536,7 @@ mod tests {
             .unwrap();
         let _ = machine.machine();
         let denied = machine.bind_interrupt(
-            terra_runtime::component::vmm::machine::DeviceKind::Memory,
+            terra_runtime::component::vmm::bindings::machine::DeviceKind::Memory,
             1,
             |_, _, _| panic!("ungranted interrupt"),
         );
@@ -590,7 +590,8 @@ mod tests {
 
     #[tokio::test]
     async fn timed_out_device_close_does_not_start_later_devices() {
-        use terra_runtime::component::vmm::{machine::DeviceKind, teardown::DeviceShutdown};
+        use terra_runtime::component::vmm::bindings::machine::DeviceKind;
+        use terra_runtime::component::vmm::teardown::DeviceShutdown;
 
         let (release, released) = std::sync::mpsc::channel();
         let (second_started, second_started_receiver) = std::sync::mpsc::channel();

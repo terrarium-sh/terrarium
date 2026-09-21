@@ -198,7 +198,7 @@ pub fn network_component_linker<T: wasmtime_wasi::WasiView + AsMut<NetworkHost> 
     crate::component::context::add_device_imports(&mut linker, |host: &mut T| {
         &mut host.as_mut().context
     })?;
-    crate::component::block::host::terra::host::diagnostics::add_to_linker::<
+    crate::component::bindings::diagnostics::add_to_linker::<
         T,
         wasmtime::component::HasSelf<crate::component::context::DeviceContext>,
     >(&mut linker, |host| &mut host.as_mut().context)?;

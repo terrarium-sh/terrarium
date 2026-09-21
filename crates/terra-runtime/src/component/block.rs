@@ -8,7 +8,9 @@ use std::sync::Arc;
 
 use wasmtime::component::Component;
 
-use host::{BlockDevice, BlockHost, DeviceError, block_component_linker};
+use crate::component::bindings::BlockDevice;
+use crate::component::vmm::bindings::types::DeviceError;
+use host::{BlockHost, block_component_linker};
 
 pub use crate::component::Interrupt;
 
@@ -54,7 +56,7 @@ pub fn grant_shared(
     let child = runtime.child_factory();
     let component = component.clone();
     runtime.grant_device_worker(
-        crate::component::vmm::machine::DeviceKind::Block,
+        crate::component::vmm::bindings::machine::DeviceKind::Block,
         async move { create_worker(child(host()?), &component, readonly, interrupt).await },
     )
 }

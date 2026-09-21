@@ -2,7 +2,7 @@
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
-use terra_runtime::component::block::host::terra::host::memory::Host;
+use terra_runtime::component::bindings::memory::Host;
 use terra_runtime::component::context::DeviceContext;
 use terra_runtime::component::vmm::{
     boot::BootEntry,

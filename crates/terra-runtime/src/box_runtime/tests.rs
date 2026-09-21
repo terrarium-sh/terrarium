@@ -90,7 +90,8 @@ fn device_workers_cannot_cross_box_memory_budgets() {
 
 #[tokio::test]
 async fn dropping_a_temporary_store_does_not_start_box_teardown() {
-    use crate::component::vmm::{machine::DeviceKind, teardown::DeviceShutdown};
+    use crate::component::vmm::bindings::machine::DeviceKind;
+    use crate::component::vmm::teardown::DeviceShutdown;
 
     let engine = device_engine().expect("engine");
     let mut root = BoxRuntime::new(&engine, BoxHost::new()).expect("box");
@@ -445,7 +446,8 @@ async fn child_failure_during_shutdown_fails_the_group() {
 
 #[tokio::test]
 async fn competing_failures_publish_the_primary_error_before_native_cleanup() {
-    use crate::component::vmm::{machine::DeviceKind, teardown::DeviceShutdown};
+    use crate::component::vmm::bindings::machine::DeviceKind;
+    use crate::component::vmm::teardown::DeviceShutdown;
 
     let engine = device_engine().unwrap();
     let mut root = BoxRuntime::new(&engine, BoxHost::new()).unwrap();
@@ -572,7 +574,8 @@ fn dropping_a_box_moves_filesystem_resource_cleanup_off_the_caller() {
 
 #[tokio::test]
 async fn dropping_root_starts_cleanup_without_waiting_for_it_or_the_last_observer() {
-    use crate::component::vmm::{machine::DeviceKind, teardown::DeviceShutdown};
+    use crate::component::vmm::bindings::machine::DeviceKind;
+    use crate::component::vmm::teardown::DeviceShutdown;
 
     let host = BoxHost::new();
     let teardown = host.lifecycle.native_teardown();

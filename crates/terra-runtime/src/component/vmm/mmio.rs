@@ -1,4 +1,4 @@
-//! Native setup and bindings for the Wasm MMIO router.
+//! Native setup and request handling for the Wasm MMIO router.
 
 mod bridge;
 mod device;
@@ -24,24 +24,12 @@ impl FailureObservation {
     }
 }
 
-wasmtime::component::bindgen!({
-    world: "vmm", path: "../../components/vmm/wit",
-    additional_derives: [PartialEq, Eq],
-    imports: { default: trappable },
-    exports: { default: async },
-    with: {
-        "terra:mmio/platform.vcpu": crate::component::vmm::Vcpu,
-        "terra:mmio/virtualization.vm": crate::component::vmm::virtualization::Vm,
-    },
-});
-pub use terra::mmio::types::{ControlReply, Error, Operation, Reply, Request, RoutedReply};
+use super::bindings::types::{ControlReply, Error, Operation, Reply, Request, RoutedReply};
+use super::bindings::{Vmm, exports, lifecycle_platform};
 pub type Serve = TypedFunc<(StreamReader<Request>,), (StreamReader<Reply>,)>;
 type Access = TypedFunc<(u64, u8, u64, bool), (Result<RoutedReply, Error>,)>;
 type Control = TypedFunc<(u32, Operation), (Result<ControlReply, Error>,)>;
-type RunLifecycle = TypedFunc<
-    (),
-    (Result<terra::mmio::lifecycle_platform::Event, terra::mmio::lifecycle_platform::Error>,),
->;
+type RunLifecycle = TypedFunc<(), (Result<lifecycle_platform::Event, lifecycle_platform::Error>,)>;
 const DEVICE_SPAN: u64 = 0x1000;
 const COMMAND_CAPACITY: usize = 64;
 const CONTROL_CAPACITY: usize = 64;
@@ -64,7 +52,7 @@ struct DeviceRequestCounts {
 }
 
 struct DeviceRegistration {
-    kind: crate::component::vmm::machine::DeviceKind,
+    kind: crate::component::vmm::bindings::machine::DeviceKind,
     slot: u32,
     base: AtomicU64,
     counts: DeviceRequestCounts,
@@ -248,7 +236,10 @@ impl Router {
     pub(crate) fn unprepared_count(&self) -> usize {
         self.device_plan.len()
     }
-    pub(crate) fn has_component(&self, kind: crate::component::vmm::machine::DeviceKind) -> bool {
+    pub(crate) fn has_component(
+        &self,
+        kind: crate::component::vmm::bindings::machine::DeviceKind,
+    ) -> bool {
         self.device_plan.iter().any(|plan| plan.device.kind == kind)
     }
     pub(crate) fn record_failure_in(failure: &Mutex<Option<String>>, error: &wasmtime::Error) {
@@ -273,16 +264,16 @@ fn lifecycle_loop(
         Box::pin(async move {
             let (result,) = function.call_concurrent(accessor, ()).await?;
             let outcome = match result {
-                Ok(terra::mmio::lifecycle_platform::Event::GuestExit(code)) => {
+                Ok(lifecycle_platform::Event::GuestExit(code)) => {
                     crate::component::vmm::lifecycle::Outcome::GuestExit(code)
                 }
-                Ok(terra::mmio::lifecycle_platform::Event::ComponentFailed) => {
+                Ok(lifecycle_platform::Event::ComponentFailed) => {
                     crate::component::vmm::lifecycle::Outcome::ComponentFailed
                 }
-                Ok(terra::mmio::lifecycle_platform::Event::VcpuFinished) => {
+                Ok(lifecycle_platform::Event::VcpuFinished) => {
                     crate::component::vmm::lifecycle::Outcome::VcpuFinished
                 }
-                Ok(terra::mmio::lifecycle_platform::Event::Deadline) => {
+                Ok(lifecycle_platform::Event::Deadline) => {
                     crate::component::vmm::lifecycle::Outcome::Deadline
                 }
                 Err(error) => {

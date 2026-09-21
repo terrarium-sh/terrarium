@@ -16,7 +16,7 @@ const VOLUME_IRQS: [u32; 3] = [20, 21, 22];
 pub const IRQ_BASE: u32 = BOOT_IRQ;
 pub const MAX_VCPUS: usize = terra_limits::X86_MAX_VCPUS as usize;
 
-pub use terra_runtime::component::vmm::machine::{Device, DeviceKind};
+pub use terra_runtime::component::vmm::bindings::machine::{Device, DeviceKind};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Layout {

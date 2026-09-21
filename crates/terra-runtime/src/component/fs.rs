@@ -123,7 +123,10 @@ pub fn grant_shared(
             .await?
         })
     });
-    runtime.grant_device_setup(crate::component::vmm::machine::DeviceKind::Fs, setup)
+    runtime.grant_device_setup(
+        crate::component::vmm::bindings::machine::DeviceKind::Fs,
+        setup,
+    )
 }
 
 async fn create_worker(

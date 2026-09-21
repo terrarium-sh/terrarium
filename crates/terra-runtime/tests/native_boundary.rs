@@ -1,9 +1,9 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use terra_runtime::component::bindings::memory::Host;
 use terra_runtime::component::block::backing::BoundedDisk;
 use terra_runtime::component::block::backing::DiskError;
 use terra_runtime::component::block::backing::{BackingError, BlockBacking, FileDisk};
-use terra_runtime::component::block::host::terra::host::memory::Host;
 use terra_runtime::component::context::DeviceContext;
 use terra_runtime::component::context::Interrupt;
 use terra_runtime::component::context::MAX_SIGNALS_PER_WINDOW;

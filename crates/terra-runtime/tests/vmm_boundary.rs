@@ -7,8 +7,8 @@ use terra_runtime::box_runtime::BoxRuntime;
 use terra_runtime::box_runtime::store::BoxHost;
 use terra_runtime::component::Interrupt;
 use terra_runtime::component::context::{DeviceContext, device_component_linker};
+use terra_runtime::component::vmm::bindings::machine::{Device, DeviceKind};
 use terra_runtime::component::vmm::boot::BootEntry;
-use terra_runtime::component::vmm::machine::{Device, DeviceKind};
 use terra_runtime::component::vmm::virtualization::{
     Architecture, MachineConfig, PreparedMachine, StartedVcpus, VirtualMachine,
 };
@@ -122,8 +122,8 @@ async fn wasm_vmm_routes_native_exits_and_stops_with_the_box() {
 
     let pio = tokio::task::block_in_place(|| {
         vcpu.exchange(
-            terra_runtime::component::vmm::mmio::terra::mmio::platform::Exit::PioRead(
-                terra_runtime::component::vmm::mmio::terra::mmio::platform::PioRead {
+            terra_runtime::component::vmm::bindings::platform::Exit::PioRead(
+                terra_runtime::component::vmm::bindings::platform::PioRead {
                     port: 0x3f8,
                     length: 1,
                 },
@@ -135,7 +135,7 @@ async fn wasm_vmm_routes_native_exits_and_stops_with_the_box() {
 
     let msr = tokio::task::block_in_place(|| {
         vcpu.exchange(Exit::Rdmsr(
-            terra_runtime::component::vmm::mmio::terra::mmio::platform::Msr {
+            terra_runtime::component::vmm::bindings::platform::Msr {
                 index: 0x10,
                 value: 0,
             },
@@ -146,7 +146,7 @@ async fn wasm_vmm_routes_native_exits_and_stops_with_the_box() {
 
     let unsupported_msr = tokio::task::block_in_place(|| {
         vcpu.exchange(Exit::Rdmsr(
-            terra_runtime::component::vmm::mmio::terra::mmio::platform::Msr {
+            terra_runtime::component::vmm::bindings::platform::Msr {
                 index: u32::MAX,
                 value: 0,
             },
@@ -157,7 +157,7 @@ async fn wasm_vmm_routes_native_exits_and_stops_with_the_box() {
 
     let mmio = tokio::task::block_in_place(|| {
         vcpu.exchange(Exit::MmioRead(
-            terra_runtime::component::vmm::mmio::terra::mmio::platform::MmioRead {
+            terra_runtime::component::vmm::bindings::platform::MmioRead {
                 address: 0xd000_4000,
                 width: 4,
             },
@@ -297,9 +297,9 @@ async fn failed_startup_disconnects_native_vcpus() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn vcpu_failure_preserves_teardown_order_before_runtime_join() {
-    use terra_runtime::component::vmm::{
-        lifecycle::Outcome, machine::DeviceKind, teardown::DeviceShutdown,
-    };
+    use terra_runtime::component::vmm::bindings::machine::DeviceKind;
+    use terra_runtime::component::vmm::lifecycle::Outcome;
+    use terra_runtime::component::vmm::teardown::DeviceShutdown;
 
     let engine = device_engine().expect("engine");
     let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
@@ -379,8 +379,9 @@ async fn vcpu_failure_preserves_teardown_order_before_runtime_join() {
 #[allow(clippy::too_many_lines)]
 async fn wasi_requests_cpu_stop_before_publishing_terminal_outcomes() {
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use terra_runtime::component::vmm::bindings::machine::DeviceKind;
     use terra_runtime::component::vmm::lifecycle::{Event, Outcome};
-    use terra_runtime::component::vmm::{machine::DeviceKind, teardown::DeviceShutdown};
+    use terra_runtime::component::vmm::teardown::DeviceShutdown;
 
     let engine = device_engine().expect("engine");
     for event in [
@@ -648,8 +649,8 @@ async fn wasi_composes_multiple_deferred_workers_with_their_final_mappings() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::too_many_lines)]
 async fn wasi_lifecycle_closes_a_device_through_the_running_mmio_bridge() {
+    use terra_runtime::component::vmm::bindings::machine::DeviceKind;
     use terra_runtime::component::vmm::lifecycle::Outcome;
-    use terra_runtime::component::vmm::machine::DeviceKind;
 
     let engine = device_engine().expect("engine");
     let ram = GuestRam::new(8 << 20).expect("RAM");
@@ -731,7 +732,7 @@ async fn wasi_lifecycle_closes_a_device_through_the_running_mmio_bridge() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wasi_irq_lines_drain_assertions_before_vm_release() {
-    use terra_runtime::component::vmm::machine::DeviceKind;
+    use terra_runtime::component::vmm::bindings::machine::DeviceKind;
 
     let engine = device_engine().expect("engine");
     let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");

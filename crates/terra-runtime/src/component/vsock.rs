@@ -213,7 +213,7 @@ impl VsockChannel {
         diagnostics: Option<std::fs::File>,
         interrupt: crate::component::network::Interrupt,
     ) -> wasmtime::Result<Self> {
-        if runtime.has_component(crate::component::vmm::machine::DeviceKind::Vsock) {
+        if runtime.has_component(crate::component::vmm::bindings::machine::DeviceKind::Vsock) {
             return Err(wasmtime::Error::msg("box already has a vsock component"));
         }
         let ram = ram.into();
@@ -233,7 +233,7 @@ impl VsockChannel {
         };
         let child = runtime.child_factory();
         let mmio = runtime.grant_device_worker_unmanaged(
-            crate::component::vmm::machine::DeviceKind::Vsock,
+            crate::component::vmm::bindings::machine::DeviceKind::Vsock,
             async move { setup.create(child).await },
         )?;
         let closing_device = mmio.clone();
@@ -253,7 +253,7 @@ impl VsockChannel {
         .shared();
         if let Err(error) =
             runtime.add_device_shutdown(crate::component::vmm::teardown::DeviceShutdown::new(
-                crate::component::vmm::machine::DeviceKind::Vsock,
+                crate::component::vmm::bindings::machine::DeviceKind::Vsock,
                 close.clone(),
             ))
         {
@@ -569,7 +569,9 @@ mod tests {
                 Arc::new(|_| Ok(())),
             )
             .expect("component");
-            assert!(runtime.has_component(crate::component::vmm::machine::DeviceKind::Vsock));
+            assert!(
+                runtime.has_component(crate::component::vmm::bindings::machine::DeviceKind::Vsock)
+            );
             let runtime_task = runtime.prepare().await.unwrap().start();
             let request = channel.clone();
             assert_eq!(

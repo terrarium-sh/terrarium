@@ -73,13 +73,13 @@ pub fn grant_shared(
     component: &Component,
     interrupt: Interrupt,
 ) -> wasmtime::Result<DeviceChannel> {
-    if runtime.has_component(crate::component::vmm::machine::DeviceKind::Memory) {
+    if runtime.has_component(crate::component::vmm::bindings::machine::DeviceKind::Memory) {
         return Err(wasmtime::Error::msg("box already has a memory component"));
     }
     let child = runtime.child_factory();
     let component = component.clone();
     runtime.grant_device_worker(
-        crate::component::vmm::machine::DeviceKind::Memory,
+        crate::component::vmm::bindings::machine::DeviceKind::Memory,
         async move { create_worker(child(host()?), &component, interrupt).await },
     )
 }

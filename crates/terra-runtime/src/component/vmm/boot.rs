@@ -8,7 +8,7 @@ use crate::box_runtime::BoxRuntime;
 #[cfg(test)]
 use crate::box_runtime::store::BoxHost;
 use crate::box_runtime::store::StoreState;
-use crate::component::vmm::machine::Device;
+use crate::component::vmm::bindings::machine::Device;
 use crate::component::vmm::virtualization::{Architecture, MachineConfig};
 use crate::memory::{BoundedMemory, GuestRam};
 use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
@@ -116,11 +116,19 @@ impl terra::boot::host::Host for BootHost {
                 .iter()
                 .map(|device: &Device| terra::boot::types::Device {
                     kind: match device.kind {
-                        super::machine::DeviceKind::Block => terra::boot::types::DeviceKind::Block,
-                        super::machine::DeviceKind::Net => terra::boot::types::DeviceKind::Net,
-                        super::machine::DeviceKind::Vsock => terra::boot::types::DeviceKind::Vsock,
-                        super::machine::DeviceKind::Fs => terra::boot::types::DeviceKind::Fs,
-                        super::machine::DeviceKind::Memory => {
+                        super::bindings::machine::DeviceKind::Block => {
+                            terra::boot::types::DeviceKind::Block
+                        }
+                        super::bindings::machine::DeviceKind::Net => {
+                            terra::boot::types::DeviceKind::Net
+                        }
+                        super::bindings::machine::DeviceKind::Vsock => {
+                            terra::boot::types::DeviceKind::Vsock
+                        }
+                        super::bindings::machine::DeviceKind::Fs => {
+                            terra::boot::types::DeviceKind::Fs
+                        }
+                        super::bindings::machine::DeviceKind::Memory => {
                             terra::boot::types::DeviceKind::Memory
                         }
                     },
