@@ -21,7 +21,7 @@ pub struct WorkerInput {
     pub network_policy: terra_network::PolicyHandle,
     pub port_mappings: Vec<terra_network::PortMapping>,
     pub ram_bytes: u64,
-    pub component_memory_limits: terra_runtime::box_runtime::ComponentMemoryLimits,
+    pub component_memory_limits: terra_runtime::box_runtime::store::ComponentMemoryLimits,
     pub vcpus: usize,
     pub deadline: Option<Duration>,
     pub hard_stop: Option<fn() -> !>,
@@ -35,7 +35,9 @@ pub(crate) fn create_runtime(
 ) -> wasmtime::Result<terra_runtime::box_runtime::BoxRuntime> {
     terra_runtime::box_runtime::BoxRuntime::new(
         &terra_runtime::engine::device_engine()?,
-        terra_runtime::box_runtime::BoxHost::with_memory_limits(input.component_memory_limits),
+        terra_runtime::box_runtime::store::BoxHost::with_memory_limits(
+            input.component_memory_limits,
+        ),
     )
 }
 
@@ -268,7 +270,7 @@ pub(crate) fn network(
     input: &WorkerInput,
     interrupt: terra_runtime::component::network::Interrupt,
 ) -> Result<terra_runtime::component::DeviceChannel, String> {
-    use terra_runtime::engine::DeviceContext;
+    use terra_runtime::component::context::DeviceContext;
 
     let component = input
         .artifacts
@@ -295,7 +297,7 @@ pub(crate) fn filesystems(
     input: &WorkerInput,
     interrupt: impl Fn(usize) -> Result<terra_runtime::component::network::Interrupt, String>,
 ) -> Result<Vec<terra_runtime::component::DeviceChannel>, String> {
-    use terra_runtime::engine::DeviceContext;
+    use terra_runtime::component::context::DeviceContext;
 
     if input.shares.is_empty() {
         return Ok(Vec::new());
@@ -366,7 +368,7 @@ pub(crate) fn memory(
     input: &WorkerInput,
     interrupt: terra_runtime::component::network::Interrupt,
 ) -> Result<terra_runtime::component::DeviceChannel, String> {
-    use terra_runtime::engine::DeviceContext;
+    use terra_runtime::component::context::DeviceContext;
 
     let component = input
         .artifacts
@@ -426,10 +428,10 @@ mod tests {
         use terra_runtime::component::vmm::machine::{Device, DeviceKind};
         use terra_runtime::component::vmm::virtualization::{Architecture, MachineConfig};
 
+        use terra_runtime::component::context::DeviceContext;
         use terra_runtime::component::vmm::virtualization::{
             PreparedMachine, StartedVcpus, VirtualMachine,
         };
-        use terra_runtime::engine::DeviceContext;
 
         struct TestVm(terra_runtime::memory::GuestRam);
         impl VirtualMachine for TestVm {
@@ -440,7 +442,7 @@ mod tests {
         let engine = terra_runtime::engine::device_engine().unwrap();
         let mut runtime = terra_runtime::box_runtime::BoxRuntime::new(
             &engine,
-            terra_runtime::box_runtime::BoxHost::new(),
+            terra_runtime::box_runtime::store::BoxHost::new(),
         )
         .unwrap();
         let component = wasmtime::component::Component::new(
@@ -604,7 +606,7 @@ mod tests {
         let engine = terra_runtime::engine::device_engine().unwrap();
         let mut runtime = terra_runtime::box_runtime::BoxRuntime::new(
             &engine,
-            terra_runtime::box_runtime::BoxHost::new(),
+            terra_runtime::box_runtime::store::BoxHost::new(),
         )
         .unwrap();
         runtime.add_device_shutdown(first).unwrap();
@@ -657,7 +659,8 @@ mod tests {
             )
         };
         let input = super::WorkerInput {
-            component_memory_limits: terra_runtime::box_runtime::ComponentMemoryLimits::default(),
+            component_memory_limits:
+                terra_runtime::box_runtime::store::ComponentMemoryLimits::default(),
             kernel: Vec::new(),
             boot_disk: Vec::new(),
             root_disk: std::path::PathBuf::new(),
@@ -678,7 +681,7 @@ mod tests {
         let engine = terra_runtime::engine::device_engine().unwrap();
         let mut runtime = terra_runtime::box_runtime::BoxRuntime::new(
             &engine,
-            terra_runtime::box_runtime::BoxHost::new(),
+            terra_runtime::box_runtime::store::BoxHost::new(),
         )
         .unwrap();
         let shares = super::filesystems(

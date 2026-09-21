@@ -2,7 +2,9 @@
 
 use super::backing::{BlockBacking, DiskGrant};
 use crate::MAX_SINGLE_BYTES;
-use crate::engine::{DeviceContext, DeviceHost, add_device_imports, device_component_linker};
+use crate::component::context::{
+    DeviceContext, DeviceHost, add_device_imports, device_component_linker,
+};
 use crate::memory::GuestRam;
 use std::sync::{Arc, Mutex};
 use wasmtime::Engine;
@@ -57,7 +59,7 @@ impl AsMut<BlockHost> for BlockHost {
     }
 }
 
-impl crate::box_runtime::StoreHost for BlockHost {}
+impl crate::box_runtime::store::StoreHost for BlockHost {}
 
 fn run_disk_job<T: Send + 'static, F>(
     host: &mut BlockHost,

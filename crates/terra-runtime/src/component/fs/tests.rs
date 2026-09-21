@@ -13,10 +13,8 @@ use wasmtime_wasi::{
     },
 };
 
-use crate::{
-    component::fs::host::{FsHost, ShareGrant},
-    engine::DeviceContext,
-};
+use crate::component::context::DeviceContext;
+use crate::component::fs::host::{FsHost, ShareGrant};
 
 fn host(grant: ShareGrant) -> FsHost {
     FsHost::new(DeviceContext::new(4096).unwrap(), grant)
@@ -337,8 +335,9 @@ async fn mode_capability_changes_writable_files_and_rejects_readonly_files() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn filesystem_actor_alone_publishes_interrupt_levels() {
+    use crate::component::context::DeviceContext;
     use crate::component::fs::host::{FsHost, ShareGrant};
-    use crate::engine::{DeviceContext, device_engine};
+    use crate::engine::device_engine;
 
     let directory = tempfile::tempdir().unwrap();
     let mount = std::fs::canonicalize(directory.path()).unwrap();

@@ -176,7 +176,7 @@ pub fn share_tag(index: usize) -> String {
 }
 
 pub struct FsHost {
-    pub device: crate::engine::DeviceContext,
+    pub device: crate::component::context::DeviceContext,
     grant: ShareGrant,
     events: Option<super::file_events::FileEvents>,
     descriptor_budget: std::sync::Arc<tokio::sync::Semaphore>,
@@ -185,7 +185,7 @@ pub struct FsHost {
     pub(super) io_gate: Option<std::sync::Arc<super::stalled_io::IoGate>>,
 }
 
-impl crate::box_runtime::StoreHost for FsHost {
+impl crate::box_runtime::store::StoreHost for FsHost {
     fn retire(self) {
         let pending = std::sync::Arc::new(std::sync::Mutex::new(Some(self)));
         let worker = pending.clone();
@@ -216,13 +216,13 @@ impl crate::box_runtime::StoreHost for FsHost {
 
 impl FsHost {
     #[must_use]
-    pub fn new(device: crate::engine::DeviceContext, grant: ShareGrant) -> Self {
+    pub fn new(device: crate::component::context::DeviceContext, grant: ShareGrant) -> Self {
         Self::with_resource_capacity(device, grant, 16_384)
     }
 
     #[must_use]
     pub fn with_resource_capacity(
-        mut device: crate::engine::DeviceContext,
+        mut device: crate::component::context::DeviceContext,
         grant: ShareGrant,
         resource_capacity: usize,
     ) -> Self {
@@ -702,8 +702,8 @@ impl preopens::Host for FsHost {
     }
 }
 
-impl crate::engine::DeviceHost for FsHost {
-    fn context(&mut self) -> &mut crate::engine::DeviceContext {
+impl crate::component::context::DeviceHost for FsHost {
+    fn context(&mut self) -> &mut crate::component::context::DeviceContext {
         &mut self.device
     }
 }
@@ -717,12 +717,14 @@ pub fn fs_component_linker<T: WasiView + AsMut<FsHost> + 'static>(
     engine: &wasmtime::Engine,
 ) -> wasmtime::Result<wasmtime::component::Linker<T>> {
     use wasmtime_wasi::filesystem::WasiFilesystemView;
-    let mut linker = crate::engine::device_component_linker(engine)?;
+    let mut linker = crate::component::context::device_component_linker(engine)?;
     types::add_to_linker::<T, WasiFilesystem>(&mut linker, T::filesystem)?;
     add_descriptor_lifecycle(&mut linker, T::filesystem, AsMut::as_mut)?;
     terra::fs::host::add_to_linker::<T, HasSelf<FsHost>>(&mut linker, AsMut::as_mut)?;
     preopens::add_to_linker::<T, HasSelf<FsHost>>(&mut linker, AsMut::as_mut)?;
-    crate::engine::add_device_imports(&mut linker, |host: &mut T| &mut host.as_mut().device)?;
+    crate::component::context::add_device_imports(&mut linker, |host: &mut T| {
+        &mut host.as_mut().device
+    })?;
     Ok(linker)
 }
 
@@ -803,7 +805,7 @@ mod metadata_tests {
             std::fs::write(root.path().join("file"), b"metadata").unwrap();
             let grant = ShareGrant::new(&root.path().canonicalize().unwrap(), true).unwrap();
             let mut host = FsHost::with_resource_capacity(
-                crate::engine::DeviceContext::new(4096).unwrap(),
+                crate::component::context::DeviceContext::new(4096).unwrap(),
                 grant,
                 2,
             );

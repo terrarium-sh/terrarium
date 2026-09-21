@@ -197,7 +197,7 @@ mod tests {
     #[tokio::test]
     async fn socket_defaults_and_resource_exhaustion_are_enforced() {
         let mut host = NetworkHost::new(
-            crate::engine::DeviceContext::new(4096).unwrap(),
+            crate::component::context::DeviceContext::new(4096).unwrap(),
             std::sync::Arc::new(Deny),
             vec![],
         );
@@ -228,7 +228,7 @@ mod tests {
     #[test]
     fn oversized_socket_options_fail_before_host_allocation() {
         let mut host = NetworkHost::new(
-            crate::engine::DeviceContext::new(4096).unwrap(),
+            crate::component::context::DeviceContext::new(4096).unwrap(),
             std::sync::Arc::new(Deny),
             vec![],
         );

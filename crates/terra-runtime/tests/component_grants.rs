@@ -73,7 +73,7 @@ fn wasi_filesystem_and_socket_resources_are_device_specific() {
             false,
         );
         assert_resource(
-            &mem_component_linker::<terra_runtime::engine::DeviceContext>(&engine)
+            &mem_component_linker::<terra_runtime::component::context::DeviceContext>(&engine)
                 .expect("component linker"),
             &engine,
             interface,
@@ -132,7 +132,7 @@ fn host_service_clients_are_exclusive_to_vsock() {
         false,
     );
     assert_resource(
-        &mem_component_linker::<terra_runtime::engine::DeviceContext>(&engine)
+        &mem_component_linker::<terra_runtime::component::context::DeviceContext>(&engine)
             .expect("memory linker"),
         &engine,
         interface,
@@ -217,7 +217,7 @@ fn component_linkers_exclude_ungranted_interfaces() {
         "fs",
     );
     assert_components(
-        &mem_component_linker::<terra_runtime::engine::DeviceContext>(&engine)
+        &mem_component_linker::<terra_runtime::component::context::DeviceContext>(&engine)
             .expect("component linker"),
         &engine,
         "mem",
@@ -287,7 +287,7 @@ fn only_vmm_receives_virtual_machine_and_vcpu_resources() {
             false,
         );
         assert_resource(
-            &mem_component_linker::<terra_runtime::engine::DeviceContext>(&engine)
+            &mem_component_linker::<terra_runtime::component::context::DeviceContext>(&engine)
                 .expect("memory linker"),
             &engine,
             interface,
@@ -335,7 +335,7 @@ fn assert_random_grants<T: 'static>(
 
 #[test]
 fn only_vsock_receives_secure_random_and_no_component_receives_insecure_random() {
-    use terra_runtime::box_runtime::StoreState;
+    use terra_runtime::box_runtime::store::StoreState;
 
     let engine = device_engine().expect("device engine");
     assert_random_grants(
@@ -355,7 +355,7 @@ fn only_vsock_receives_secure_random_and_no_component_receives_insecure_random()
         false,
     );
     assert_random_grants(
-        &mem_component_linker::<terra_runtime::engine::DeviceContext>(&engine)
+        &mem_component_linker::<terra_runtime::component::context::DeviceContext>(&engine)
             .expect("memory linker"),
         &engine,
         false,
@@ -385,7 +385,7 @@ fn only_vsock_receives_secure_random_and_no_component_receives_insecure_random()
 
 #[test]
 fn device_cli_context_has_no_host_data_or_terminal_streams() {
-    use terra_runtime::engine::DeviceContext;
+    use terra_runtime::component::context::DeviceContext;
     use wasmtime_wasi::{
         cli::WasiCliView,
         p3::bindings::cli::{

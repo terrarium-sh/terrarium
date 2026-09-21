@@ -9,7 +9,7 @@ use futures_util::{
     future::{BoxFuture, Shared},
 };
 
-use crate::box_runtime::StoreState;
+use crate::box_runtime::store::StoreState;
 use crate::component::vmm::lifecycle::LifecycleNotifier;
 use crate::component::vmm::virtualization::RamGrant;
 use host::VsockDeviceHost;
@@ -537,9 +537,11 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             let engine = crate::engine::device_engine().expect("engine");
-            let mut runtime =
-                crate::box_runtime::BoxRuntime::new(&engine, crate::box_runtime::BoxHost::new())
-                    .expect("runtime");
+            let mut runtime = crate::box_runtime::BoxRuntime::new(
+                &engine,
+                crate::box_runtime::store::BoxHost::new(),
+            )
+            .expect("runtime");
             let router = wasmtime::component::Component::new(
                 &engine,
                 include_bytes!(
@@ -639,7 +641,7 @@ mod tests {
         .unwrap();
         let engine = crate::engine::device_engine().unwrap();
         let mut runtime =
-            crate::box_runtime::BoxRuntime::new(&engine, crate::box_runtime::BoxHost::new())
+            crate::box_runtime::BoxRuntime::new(&engine, crate::box_runtime::store::BoxHost::new())
                 .unwrap();
         let router = wasmtime::component::Component::new(
             &engine,

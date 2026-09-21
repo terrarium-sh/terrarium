@@ -6,7 +6,8 @@ mod device;
 use bridge::{BridgeContext, run_bridge};
 pub use device::MmioDevice;
 
-use crate::box_runtime::{BoxHost, BoxRuntime};
+use crate::box_runtime::BoxRuntime;
+use crate::box_runtime::store::BoxHost;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use wasmtime::component::{Component, StreamReader, TypedFunc};
@@ -392,7 +393,7 @@ impl BoxRuntime {
 pub fn mmio_component_linker(
     engine: &wasmtime::Engine,
 ) -> wasmtime::Result<wasmtime::component::Linker<BoxHost>> {
-    let mut linker = crate::engine::device_component_linker(engine)?;
+    let mut linker = crate::component::context::device_component_linker(engine)?;
     crate::component::vmm::add_to_linker(&mut linker)?;
     Ok(linker)
 }

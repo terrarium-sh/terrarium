@@ -6,8 +6,9 @@ use tokio::sync::Notify;
 use wasmtime::component::{Accessor, Lift, TypedFunc};
 
 use super::Interrupt;
-use crate::box_runtime::{DeviceWorker, StoreHost, StoreState};
-use crate::engine::DeviceHost;
+use crate::box_runtime::DeviceWorker;
+use crate::box_runtime::store::{StoreHost, StoreState};
+use crate::component::context::DeviceHost;
 
 pub(crate) struct Worker<E> {
     pub run: TypedFunc<(), (Result<(), E>,)>,

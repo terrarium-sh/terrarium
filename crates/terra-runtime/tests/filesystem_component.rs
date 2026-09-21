@@ -6,12 +6,12 @@ use std::os::unix::fs::symlink as symlink_file;
 use std::os::windows::fs::symlink_file;
 use std::sync::Arc;
 
-use terra_runtime::{
-    box_runtime::{BoxHost, BoxRuntime, BoxRuntimeHandle},
-    component::fs::host::{FsHost, ShareGrant},
-    engine::{DeviceContext, device_engine},
-    memory::{BoundedMemory, GuestRam},
-};
+use terra_runtime::box_runtime::store::BoxHost;
+use terra_runtime::box_runtime::{BoxRuntime, BoxRuntimeHandle};
+use terra_runtime::component::context::DeviceContext;
+use terra_runtime::component::fs::host::{FsHost, ShareGrant};
+use terra_runtime::engine::device_engine;
+use terra_runtime::memory::{BoundedMemory, GuestRam};
 use wasmtime::component::Component;
 
 const REQUEST_QUEUE: u32 = 1;

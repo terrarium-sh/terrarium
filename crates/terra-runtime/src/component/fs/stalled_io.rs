@@ -16,9 +16,11 @@ use wasmtime_wasi::filesystem::Descriptor;
 use wasmtime_wasi::p3::bindings::filesystem::types::ErrorCode;
 
 use super::host::{FsHost, ShareGrant};
-use crate::box_runtime::{BoxHost, BoxRuntime, BoxRuntimeHandle};
+use crate::box_runtime::store::BoxHost;
+use crate::box_runtime::{BoxRuntime, BoxRuntimeHandle};
 use crate::component::DeviceChannel;
-use crate::engine::{DeviceContext, device_engine};
+use crate::component::context::DeviceContext;
+use crate::engine::device_engine;
 use crate::memory::{BoundedMemory, GuestRam};
 
 pub(super) struct IoGate {
@@ -56,14 +58,14 @@ impl Drop for StalledRead {
     }
 }
 
-impl StreamProducer<crate::box_runtime::StoreState<FsHost>> for StalledRead {
+impl StreamProducer<crate::box_runtime::store::StoreState<FsHost>> for StalledRead {
     type Item = u8;
     type Buffer = Option<u8>;
 
     fn poll_produce<'a>(
         mut self: Pin<&mut Self>,
         context: &mut Context<'_>,
-        _: wasmtime::StoreContextMut<'a, crate::box_runtime::StoreState<FsHost>>,
+        _: wasmtime::StoreContextMut<'a, crate::box_runtime::store::StoreState<FsHost>>,
         mut destination: Destination<'a, Self::Item, Self::Buffer>,
         _finish: bool,
     ) -> Poll<wasmtime::Result<StreamResult>> {
@@ -80,9 +82,9 @@ impl StreamProducer<crate::box_runtime::StoreState<FsHost>> for StalledRead {
 }
 
 pub(super) fn install_io_gate(
-    mut linker: Linker<crate::box_runtime::StoreState<FsHost>>,
+    mut linker: Linker<crate::box_runtime::store::StoreState<FsHost>>,
     gate: Option<Arc<IoGate>>,
-) -> wasmtime::Result<Linker<crate::box_runtime::StoreState<FsHost>>> {
+) -> wasmtime::Result<Linker<crate::box_runtime::store::StoreState<FsHost>>> {
     if let Some(gate) = gate {
         linker.allow_shadowing(true);
         if matches!(gate.operation, Operation::HostMetadata) {
@@ -159,9 +161,9 @@ pub(super) fn install_io_gate(
 }
 
 fn install_metadata_gate(
-    mut linker: Linker<crate::box_runtime::StoreState<FsHost>>,
+    mut linker: Linker<crate::box_runtime::store::StoreState<FsHost>>,
     gate: Arc<IoGate>,
-) -> wasmtime::Result<Linker<crate::box_runtime::StoreState<FsHost>>> {
+) -> wasmtime::Result<Linker<crate::box_runtime::store::StoreState<FsHost>>> {
     use wasmtime_wasi::filesystem::WasiFilesystem;
     use wasmtime_wasi::p3::bindings::filesystem::types::{HostDescriptorWithStore, PathFlags};
     if matches!(gate.operation, Operation::Lookup) {

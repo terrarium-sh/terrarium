@@ -7,7 +7,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::time::Duration;
 
-use crate::engine::DeviceContext;
+use crate::component::context::DeviceContext;
 use wasmtime::Store;
 use wasmtime::component::Component;
 
@@ -49,7 +49,7 @@ pub async fn instantiate(
     interrupt: Interrupt,
 ) -> wasmtime::Result<crate::component::StandaloneDevice> {
     let mut runtime =
-        crate::box_runtime::BoxRuntime::new(engine, crate::box_runtime::BoxHost::new())?;
+        crate::box_runtime::BoxRuntime::new(engine, crate::box_runtime::store::BoxHost::new())?;
     crate::component::vmm::mmio::initialize_test_router(&mut runtime).await?;
     let channel = instantiate_shared(&mut runtime, host, component, interrupt)?;
     Ok(crate::component::StandaloneDevice {
@@ -105,7 +105,8 @@ async fn create_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::{DeviceContext, device_engine};
+    use crate::component::context::DeviceContext;
+    use crate::engine::device_engine;
     use crate::memory::GuestRam;
 
     async fn channel() -> crate::component::StandaloneDevice {
@@ -151,7 +152,7 @@ mod tests {
         .expect("component compiles");
         let ram = GuestRam::new(64 * 1024).expect("RAM");
         let mut runtime =
-            crate::box_runtime::BoxRuntime::new(&engine, crate::box_runtime::BoxHost::new())
+            crate::box_runtime::BoxRuntime::new(&engine, crate::box_runtime::store::BoxHost::new())
                 .expect("box runtime");
         crate::component::vmm::mmio::initialize_test_router(&mut runtime)
             .await

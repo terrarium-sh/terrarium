@@ -2,12 +2,12 @@
 
 use std::time::{Duration, Instant};
 
-use terra_runtime::{
-    box_runtime::{BoxHost, BoxRuntime, BoxRuntimeHandle},
-    component::Interrupt,
-    engine::{DeviceContext, device_engine},
-    memory::GuestRam,
-};
+use terra_runtime::box_runtime::store::BoxHost;
+use terra_runtime::box_runtime::{BoxRuntime, BoxRuntimeHandle};
+use terra_runtime::component::Interrupt;
+use terra_runtime::component::context::DeviceContext;
+use terra_runtime::engine::device_engine;
+use terra_runtime::memory::GuestRam;
 
 const WARMUP_SAMPLES: usize = 128;
 const SEQUENTIAL_SAMPLES: usize = 2048;

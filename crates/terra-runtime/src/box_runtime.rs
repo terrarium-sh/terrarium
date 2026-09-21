@@ -4,7 +4,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
 
@@ -12,66 +12,15 @@ use futures_util::{StreamExt, stream::FuturesUnordered};
 use tokio::{sync::watch, task::JoinSet};
 use tokio_util::task::AbortOnDropHandle;
 
-use wasmtime::component::{Accessor, ResourceTable};
-use wasmtime::{Engine, ResourceLimiter, Store};
-use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+use wasmtime::component::Accessor;
+use wasmtime::{Engine, Store};
 
-use crate::engine::{COMPONENT_EPOCH_DEADLINE, DeviceContext, DeviceHost, STORE_MEMORY_BYTES};
+pub mod store;
+
+use store::{BoxHost, BoxMemoryBudget, StoreHost, StoreState, create_store};
 
 pub const BOX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_BOX_COMPONENTS: usize = terra_limits::MAX_DEVICES;
-pub const DEFAULT_COMPONENT_MEMORY_MIB: u32 = 16;
-pub const DEFAULT_TOTAL_MEMORY_MIB: u32 = 128;
-pub const BOX_WASM_MEMORY_BYTES: usize = (DEFAULT_TOTAL_MEMORY_MIB as usize) << 20;
-
-#[derive(Clone, Copy, Debug)]
-pub struct ComponentMemoryLimits {
-    component_bytes: usize,
-    total_bytes: usize,
-}
-
-impl ComponentMemoryLimits {
-    pub fn new(component_bytes: usize, total_bytes: usize) -> wasmtime::Result<Self> {
-        wasmtime::ensure!(
-            component_bytes > 0 && component_bytes <= total_bytes,
-            "component memory limit must be positive and no larger than the total memory limit"
-        );
-        Ok(Self {
-            component_bytes,
-            total_bytes,
-        })
-    }
-
-    /// Returns the remaining device limits and the reserved policy memory bytes.
-    pub fn reserve_policy(self) -> wasmtime::Result<(Self, usize)> {
-        let remaining = self.total_bytes.checked_sub(self.component_bytes)
-            .filter(|remaining| *remaining > 0)
-            .ok_or_else(|| wasmtime::Error::msg("network policy needs a separate component budget; increase components.total_memory_mib above components.memory_mib"))?;
-        Ok((
-            Self::new(self.component_bytes.min(remaining), remaining)?,
-            self.component_bytes,
-        ))
-    }
-
-    #[must_use]
-    pub fn total_bytes(self) -> usize {
-        self.total_bytes
-    }
-
-    #[must_use]
-    pub fn component_bytes(self) -> usize {
-        self.component_bytes
-    }
-}
-
-impl Default for ComponentMemoryLimits {
-    fn default() -> Self {
-        Self {
-            component_bytes: STORE_MEMORY_BYTES,
-            total_bytes: BOX_WASM_MEMORY_BYTES,
-        }
-    }
-}
 const MAX_BOX_COMPONENT_LOOPS: usize =
     MAX_BOX_COMPONENTS * 3 + terra_limits::MAX_VCPUS as usize + 2;
 const EPOCH_TICK_INTERVAL: Duration = Duration::from_millis(10);
@@ -85,9 +34,8 @@ struct EpochClock {
 impl EpochClock {
     fn start(engine: Engine) -> wasmtime::Result<Arc<Self>> {
         let stop = Arc::new(AtomicBool::new(false));
-        let ticker =
-            crate::engine::spawn_epoch_ticker(engine, EPOCH_TICK_INTERVAL, Arc::clone(&stop))
-                .ok_or_else(|| wasmtime::Error::msg("starting epoch ticker"))?;
+        let ticker = spawn_epoch_ticker(engine, EPOCH_TICK_INTERVAL, Arc::clone(&stop))
+            .ok_or_else(|| wasmtime::Error::msg("starting epoch ticker"))?;
         Ok(Arc::new(Self {
             stop,
             ticker: Some(ticker),
@@ -104,231 +52,24 @@ impl Drop for EpochClock {
     }
 }
 
-struct BoxMemoryBudget {
-    limits: ComponentMemoryLimits,
-    reserved: AtomicUsize,
-}
-
-impl BoxMemoryBudget {
-    fn new(limits: ComponentMemoryLimits) -> Self {
-        Self {
-            limits,
-            reserved: AtomicUsize::new(0),
-        }
-    }
-
-    fn reserve(&self, bytes: usize) -> bool {
-        self.reserved
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                current
-                    .checked_add(bytes)
-                    .filter(|next| *next <= self.limits.total_bytes)
-            })
-            .is_ok()
-    }
-
-    fn release(&self, bytes: usize) {
-        let _ = self
-            .reserved
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                current.checked_sub(bytes)
-            });
-    }
-
-    #[cfg(test)]
-    fn reserved(&self) -> usize {
-        self.reserved.load(Ordering::Acquire)
-    }
-}
-
-pub trait StoreHost: WasiView + 'static {
-    fn retire(self)
-    where
-        Self: Sized,
-    {
-        drop(self);
-    }
-}
-
-pub struct RootHost {
-    pub(crate) platform: crate::component::vmm::PlatformHost,
-    pub(crate) lifecycle: crate::component::vmm::lifecycle::LifecycleHost,
-    ctx: WasiCtx,
-    table: ResourceTable,
-}
-
-pub type BoxHost = StoreState<RootHost>;
-
-pub struct StoreState<H: StoreHost> {
-    host: Option<H>,
-    wasm_memory_bytes: usize,
-    pending_memory_growth: usize,
-    memory_budget: Arc<BoxMemoryBudget>,
-}
-
-impl<H: StoreHost> std::ops::Deref for StoreState<H> {
-    type Target = H;
-    #[allow(clippy::expect_used)]
-    fn deref(&self) -> &H {
-        self.host
-            .as_ref()
-            .expect("host is present until store drop")
-    }
-}
-impl<H: StoreHost> std::ops::DerefMut for StoreState<H> {
-    #[allow(clippy::expect_used)]
-    fn deref_mut(&mut self) -> &mut H {
-        self.host
-            .as_mut()
-            .expect("host is present until store drop")
-    }
-}
-impl<H: StoreHost> AsMut<H> for StoreState<H> {
-    fn as_mut(&mut self) -> &mut H {
-        self
-    }
-}
-impl<H: StoreHost> WasiView for StoreState<H> {
-    fn ctx(&mut self) -> WasiCtxView<'_> {
-        (**self).ctx()
-    }
-}
-impl<H: StoreHost + DeviceHost> DeviceHost for StoreState<H> {
-    fn context(&mut self) -> &mut DeviceContext {
-        (**self).context()
-    }
-}
-impl<H: StoreHost> Drop for StoreState<H> {
-    fn drop(&mut self) {
-        if let Some(host) = self.host.take() {
-            host.retire();
-        }
-        self.memory_budget.release(self.wasm_memory_bytes);
-    }
-}
-
-impl RootHost {
-    #[must_use]
-    pub fn new() -> Self {
-        let mut router_table = ResourceTable::new();
-        router_table.set_max_capacity(crate::engine::MAX_DEVICE_RESOURCES);
-        let lifecycle = crate::component::vmm::lifecycle::LifecycleHost::new();
-        Self {
-            platform: crate::component::vmm::PlatformHost::with_native_teardown(
-                lifecycle.native_teardown(),
-            ),
-            lifecycle,
-            ctx: WasiCtxBuilder::new()
-                .max_random_size(crate::MAX_SINGLE_BYTES)
-                .allow_tcp(false)
-                .allow_udp(false)
-                .allow_ip_name_lookup(false)
-                .build(),
-            table: router_table,
-        }
-    }
-}
-impl Default for RootHost {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl StoreHost for crate::component::vmm::boot::BootHost {}
-
-impl StoreHost for RootHost {
-    fn retire(self) {
-        let teardown = self.lifecycle.native_teardown();
-        if teardown.has_work() {
-            teardown.start();
-        }
-    }
-}
-impl StoreHost for DeviceContext {}
-impl BoxHost {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::with_memory_limits(ComponentMemoryLimits::default())
-    }
-
-    #[must_use]
-    pub fn with_memory_limits(limits: ComponentMemoryLimits) -> Self {
-        Self {
-            host: Some(RootHost::new()),
-            wasm_memory_bytes: 0,
-            pending_memory_growth: 0,
-            memory_budget: Arc::new(BoxMemoryBudget::new(limits)),
-        }
-    }
-}
-impl WasiView for RootHost {
-    fn ctx(&mut self) -> WasiCtxView<'_> {
-        WasiCtxView {
-            ctx: &mut self.ctx,
-            table: &mut self.table,
-        }
-    }
-}
-impl Default for BoxHost {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<H: StoreHost> ResourceLimiter for StoreState<H> {
-    fn memory_growing(
-        &mut self,
-        current: usize,
-        desired: usize,
-        _maximum: Option<usize>,
-    ) -> wasmtime::Result<bool> {
-        self.pending_memory_growth = 0;
-        let Some(growth) = desired.checked_sub(current) else {
-            return Ok(false);
-        };
-        if self
-            .wasm_memory_bytes
-            .checked_add(growth)
-            .is_none_or(|total| total > self.memory_budget.limits.component_bytes)
-            || !self.memory_budget.reserve(growth)
-        {
-            return Ok(false);
-        }
-        self.wasm_memory_bytes += growth;
-        self.pending_memory_growth = growth;
-        Ok(true)
-    }
-
-    fn memory_grow_failed(&mut self, error: wasmtime::Error) -> wasmtime::Result<()> {
-        let _ = error;
-        self.wasm_memory_bytes = self
-            .wasm_memory_bytes
-            .saturating_sub(self.pending_memory_growth);
-        self.memory_budget.release(self.pending_memory_growth);
-        self.pending_memory_growth = 0;
-        Ok(())
-    }
-
-    fn table_growing(
-        &mut self,
-        _current: usize,
-        desired: usize,
-        _maximum: Option<usize>,
-    ) -> wasmtime::Result<bool> {
-        Ok(desired <= 1024)
-    }
-
-    fn instances(&self) -> usize {
-        16
-    }
-
-    fn memories(&self) -> usize {
-        4
-    }
-
-    fn tables(&self) -> usize {
-        8
-    }
+/// Running epoch ticker: bumps the engine clock until `stop` is set so
+/// epoch deadlines actually fire. The worker owns one per VM; the
+/// harness test proves the mechanism with a short interval.
+#[must_use]
+fn spawn_epoch_ticker(
+    engine: Engine,
+    interval: core::time::Duration,
+    stop: std::sync::Arc<core::sync::atomic::AtomicBool>,
+) -> Option<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("epoch-tick".to_string())
+        .spawn(move || {
+            while !stop.load(core::sync::atomic::Ordering::Acquire) {
+                std::thread::sleep(interval);
+                engine.increment_epoch();
+            }
+        })
+        .ok()
 }
 
 /// A long-running device loop borrowing its component store through an accessor.
@@ -388,14 +129,6 @@ impl WorkerTask {
     }
 }
 
-fn create_store<H: StoreHost>(engine: &Engine, host: StoreState<H>) -> Store<StoreState<H>> {
-    let mut store = Store::new(engine, host);
-    store.set_epoch_deadline(COMPONENT_EPOCH_DEADLINE);
-    store.epoch_deadline_async_yield_and_update(COMPONENT_EPOCH_DEADLINE);
-    store.limiter(|host| host);
-    store
-}
-
 /// Owns a running box runtime. Dropping it stops every component loop.
 pub struct BoxRuntimeHandle(AbortOnDropHandle<wasmtime::Result<()>>);
 
@@ -442,7 +175,7 @@ impl BoxRuntime {
     }
 
     pub fn new(engine: &Engine, host: BoxHost) -> wasmtime::Result<Self> {
-        let memory_budget = Arc::clone(&host.memory_budget);
+        let memory_budget = Arc::clone(host.memory_budget());
         let epoch_clock = EpochClock::start(engine.clone())?;
         let (shutdown, _) = watch::channel(false);
         Ok(Self {
@@ -467,15 +200,7 @@ impl BoxRuntime {
         let epoch_clock = Arc::clone(&self.epoch_clock);
         let engine = self.store.engine().clone();
         move |host| DeviceWorker {
-            store: create_store(
-                &engine,
-                StoreState {
-                    host: Some(host),
-                    wasm_memory_bytes: 0,
-                    pending_memory_growth: 0,
-                    memory_budget,
-                },
-            ),
+            store: create_store(&engine, StoreState::with_budget(host, memory_budget)),
             epoch_clock,
             component_loops: Vec::new(),
         }
@@ -715,7 +440,7 @@ impl<H: StoreHost> DeviceWorker<H> {
         WorkerTask {
             executor: None,
             epoch_clock: Arc::clone(&self.epoch_clock),
-            memory_budget: Arc::clone(&self.store.data().memory_budget),
+            memory_budget: Arc::clone(self.store.data().memory_budget()),
             loop_count: self.component_loops.len(),
             run: Box::pin(async move { self.run(shutdown).await }),
         }

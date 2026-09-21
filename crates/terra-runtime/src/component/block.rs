@@ -25,7 +25,7 @@ pub async fn instantiate(
     interrupt: Interrupt,
 ) -> wasmtime::Result<crate::component::StandaloneDevice> {
     let mut runtime =
-        crate::box_runtime::BoxRuntime::new(engine, crate::box_runtime::BoxHost::new())?;
+        crate::box_runtime::BoxRuntime::new(engine, crate::box_runtime::store::BoxHost::new())?;
     crate::component::vmm::mmio::initialize_test_router(&mut runtime).await?;
     let channel = instantiate_shared(&mut runtime, host, component, readonly, interrupt)?;
     Ok(crate::component::StandaloneDevice {
@@ -158,7 +158,7 @@ mod tests {
         .expect("component compiles");
         let ram = GuestRam::new(64 * 1024).expect("RAM");
         let mut runtime =
-            crate::box_runtime::BoxRuntime::new(&engine, crate::box_runtime::BoxHost::new())
+            crate::box_runtime::BoxRuntime::new(&engine, crate::box_runtime::store::BoxHost::new())
                 .expect("box runtime");
         let router = Component::new(
             &engine,
@@ -194,7 +194,7 @@ mod tests {
         )
         .expect("second block instantiates");
         let mut other_box =
-            crate::box_runtime::BoxRuntime::new(&engine, crate::box_runtime::BoxHost::new())
+            crate::box_runtime::BoxRuntime::new(&engine, crate::box_runtime::store::BoxHost::new())
                 .unwrap();
         other_box.initialize_mmio(&router).await.unwrap();
         let other_device = crate::component::block::instantiate_shared(

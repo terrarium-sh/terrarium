@@ -7,7 +7,8 @@ use std::{
     task::{Context, Poll},
 };
 
-use terra_runtime::box_runtime::{BoxHost, BoxRuntime};
+use terra_runtime::box_runtime::BoxRuntime;
+use terra_runtime::box_runtime::store::BoxHost;
 use wasmtime::component::{
     Component, Destination, Linker, StreamProducer, StreamReader, StreamResult, VecBuffer,
 };

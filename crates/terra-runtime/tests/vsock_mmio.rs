@@ -3,12 +3,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use terra_runtime::{
-    box_runtime::{BoxHost, BoxRuntime},
-    component::{Interrupt, vsock::VsockChannel},
-    engine::device_engine,
-    memory::{BoundedMemory, GuestRam},
-};
+use terra_runtime::box_runtime::BoxRuntime;
+use terra_runtime::box_runtime::store::BoxHost;
+use terra_runtime::component::Interrupt;
+use terra_runtime::component::vsock::VsockChannel;
+use terra_runtime::engine::device_engine;
+use terra_runtime::memory::{BoundedMemory, GuestRam};
 use terra_vsock_device::{
     CONTROL_VSOCK_PORT, GUEST_CID, HOST_CID, VSOCK_HEADER_BYTES, VsockHeader,
 };

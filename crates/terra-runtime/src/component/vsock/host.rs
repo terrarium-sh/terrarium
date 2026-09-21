@@ -17,7 +17,9 @@ use wasmtime::component::{
     StreamReader, StreamResult, VecBuffer,
 };
 
-use crate::engine::{DeviceContext, DeviceHost, add_device_imports, device_component_linker};
+use crate::component::context::{
+    DeviceContext, DeviceHost, add_device_imports, device_component_linker,
+};
 use crate::memory::GuestRam;
 use wasmtime::Engine;
 use wasmtime_wasi::{WasiCtxView, WasiView};
@@ -58,7 +60,7 @@ impl AsMut<VsockDeviceHost> for VsockDeviceHost {
     }
 }
 
-impl crate::box_runtime::StoreHost for VsockDeviceHost {}
+impl crate::box_runtime::store::StoreHost for VsockDeviceHost {}
 
 pub fn vsock_component_linker<T: WasiView + AsMut<VsockDeviceHost> + 'static>(
     engine: &Engine,

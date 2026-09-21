@@ -1,8 +1,8 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use terra_runtime::box_runtime::store::test_support::device_store;
 use terra_runtime::component::vsock::host::{VsockDeviceHost, vsock_component_linker};
 use terra_runtime::engine::device_engine;
-use terra_runtime::engine::test_support::device_store;
 use wasmtime::component::{Component, TypedFunc, wit_parser::ItemName};
 
 #[derive(

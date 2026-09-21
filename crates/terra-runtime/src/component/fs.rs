@@ -68,7 +68,7 @@ pub async fn instantiate(
     interrupt: Interrupt,
 ) -> wasmtime::Result<crate::component::StandaloneDevice> {
     let mut runtime =
-        crate::box_runtime::BoxRuntime::new(engine, crate::box_runtime::BoxHost::new())?;
+        crate::box_runtime::BoxRuntime::new(engine, crate::box_runtime::store::BoxHost::new())?;
     crate::component::vmm::mmio::initialize_test_router(&mut runtime).await?;
     let channel = instantiate_shared(&mut runtime, host, component, tag, max_nodes, interrupt)?;
     Ok(crate::component::StandaloneDevice {

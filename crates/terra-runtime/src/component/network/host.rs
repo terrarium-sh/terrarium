@@ -7,7 +7,7 @@ use tokio::sync::Semaphore;
 use wasmtime::component::Accessor;
 use wasmtime_wasi::sockets::{WasiSockets, WasiSocketsView};
 
-use crate::engine::{DeviceContext, DeviceHost};
+use crate::component::context::{DeviceContext, DeviceHost};
 use wasmtime_wasi::{WasiCtxView, WasiView};
 
 pub struct NetworkHost {
@@ -65,7 +65,7 @@ impl AsMut<NetworkHost> for NetworkHost {
     }
 }
 
-impl crate::box_runtime::StoreHost for NetworkHost {}
+impl crate::box_runtime::store::StoreHost for NetworkHost {}
 
 pub(crate) const MAX_NAME_LOOKUPS: usize = 8;
 use crate::component::policy::MAX_NAME_BYTES;
@@ -185,7 +185,7 @@ impl<T: wasmtime_wasi::WasiView + 'static>
 pub fn network_component_linker<T: wasmtime_wasi::WasiView + AsMut<NetworkHost> + 'static>(
     engine: &wasmtime::Engine,
 ) -> wasmtime::Result<wasmtime::component::Linker<T>> {
-    let mut linker = crate::engine::device_component_linker(engine)?;
+    let mut linker = crate::component::context::device_component_linker(engine)?;
     wasmtime_wasi::p3::bindings::sockets::types::add_to_linker::<T, WasiSockets>(
         &mut linker,
         T::sockets,
@@ -195,10 +195,12 @@ pub fn network_component_linker<T: wasmtime_wasi::WasiView + AsMut<NetworkHost> 
         T,
         NetworkNameLookupHost<T>,
     >(&mut linker, AsMut::as_mut)?;
-    crate::engine::add_device_imports(&mut linker, |host: &mut T| &mut host.as_mut().context)?;
+    crate::component::context::add_device_imports(&mut linker, |host: &mut T| {
+        &mut host.as_mut().context
+    })?;
     crate::component::block::host::terra::host::diagnostics::add_to_linker::<
         T,
-        wasmtime::component::HasSelf<crate::engine::DeviceContext>,
+        wasmtime::component::HasSelf<crate::component::context::DeviceContext>,
     >(&mut linker, |host| &mut host.as_mut().context)?;
     Ok(linker)
 }
@@ -242,12 +244,12 @@ mod tests {
     #[test]
     fn each_device_host_has_its_own_lookup_budget() {
         let first = NetworkHost::new(
-            crate::engine::DeviceContext::new(1).unwrap(),
+            crate::component::context::DeviceContext::new(1).unwrap(),
             Arc::new(Static),
             vec![],
         );
         let second = NetworkHost::new(
-            crate::engine::DeviceContext::new(1).unwrap(),
+            crate::component::context::DeviceContext::new(1).unwrap(),
             Arc::new(Static),
             vec![],
         );

@@ -93,7 +93,7 @@ impl PolicyFactory {
         store.limiter(|host| &mut host.limits);
         store.set_epoch_deadline(u64::MAX);
         store.set_fuel(CALL_FUEL)?;
-        let linker = crate::engine::device_component_linker(&self.engine)?;
+        let linker = crate::component::context::device_component_linker(&self.engine)?;
         let bindings = complete_decision(Policy::instantiate_async(
             &mut store,
             &self.component,
@@ -704,7 +704,8 @@ mod tests {
         assert!(instantiate(&excessive).is_err());
         excessive.allow = vec!["a".repeat(MAX_CONFIG_BYTES + 1)];
         assert!(instantiate(&excessive).is_err());
-        let linker = crate::engine::device_component_linker::<Host>(&factory().engine).unwrap();
+        let linker =
+            crate::component::context::device_component_linker::<Host>(&factory().engine).unwrap();
         for (interface, name, export) in [
             (
                 "wasi:filesystem/types@0.3.1",

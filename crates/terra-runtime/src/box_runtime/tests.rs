@@ -1,13 +1,14 @@
-use crate::box_runtime::ComponentMemoryLimits;
-use crate::engine::STORE_MEMORY_BYTES;
+use crate::box_runtime::store::ComponentMemoryLimits;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use super::{BOX_WASM_MEMORY_BYTES, BoxHost, BoxRuntime, BoxRuntimeHandle, MAX_BOX_COMPONENTS};
+use super::store::{BOX_WASM_MEMORY_BYTES, BoxHost};
+use super::{BoxRuntime, BoxRuntimeHandle, MAX_BOX_COMPONENTS};
 
+use crate::component::context::DeviceContext;
 use crate::component::vmm::lifecycle::Outcome;
-use crate::engine::{DeviceContext, device_engine};
+use crate::engine::device_engine;
 use wasmtime::{Module, ResourceLimiter};
 
 #[tokio::test]
@@ -59,15 +60,6 @@ async fn epochs_yield_spinning_wasm_for_deadline_and_cancellation() {
 }
 
 #[test]
-fn resource_limits_apply_per_independent_store() {
-    let host = BoxHost::new();
-
-    assert_eq!(ResourceLimiter::instances(&host), 16);
-    assert_eq!(ResourceLimiter::memories(&host), 4);
-    assert_eq!(ResourceLimiter::tables(&host), 8);
-}
-
-#[test]
 fn empty_child_stores_cannot_bypass_box_capacity() {
     let engine = device_engine().expect("engine");
     let mut root = BoxRuntime::new(&engine, BoxHost::new()).expect("root");
@@ -80,7 +72,7 @@ fn empty_child_stores_cannot_bypass_box_capacity() {
         ));
         root.attach_child(child).expect("available slot");
     }
-    let child = root.new_child(crate::box_runtime::RootHost::new());
+    let child = root.new_child(crate::box_runtime::store::RootHost::new());
     assert!(root.attach_child(child).is_err());
 }
 
@@ -89,7 +81,7 @@ fn device_workers_cannot_cross_box_memory_budgets() {
     let engine = device_engine().expect("engine");
     let first = BoxRuntime::new(&engine, BoxHost::new()).expect("first box");
     let mut second = BoxRuntime::new(&engine, BoxHost::new()).expect("second box");
-    let worker = first.new_child(crate::box_runtime::RootHost::new());
+    let worker = first.new_child(crate::box_runtime::store::RootHost::new());
 
     assert!(second.attach_child(worker).is_err());
     assert_eq!(first.memory_budget.reserved(), 0);
@@ -108,7 +100,7 @@ async fn dropping_a_temporary_store_does_not_start_box_teardown() {
         Ok(())
     }))
     .expect("device cleanup");
-    drop(root.new_child(crate::box_runtime::RootHost::new()));
+    drop(root.new_child(crate::box_runtime::store::RootHost::new()));
 
     assert!(
         tokio::time::timeout(Duration::from_millis(30), &mut closure)
@@ -126,19 +118,10 @@ async fn dropping_a_temporary_store_does_not_start_box_teardown() {
 }
 
 #[test]
-fn router_host_resources_have_a_native_limit() {
-    let mut host = BoxHost::new();
-    for _ in 0..crate::engine::MAX_DEVICE_RESOURCES {
-        host.table.push(0_u8).expect("resource slot");
-    }
-    assert!(host.table.push(0_u8).is_err());
-}
-
-#[test]
 fn component_loop_admission_counts_attached_children() {
     let engine = device_engine().expect("engine");
     let mut root = BoxRuntime::new(&engine, BoxHost::new()).expect("root");
-    let mut child = root.new_child(crate::box_runtime::RootHost::new());
+    let mut child = root.new_child(crate::box_runtime::store::RootHost::new());
     for _ in 0..super::MAX_BOX_COMPONENT_LOOPS {
         child
             .register_loop(Box::new(|_| Box::pin(async { Ok(()) })))
@@ -149,7 +132,7 @@ fn component_loop_admission_counts_attached_children() {
         root.register_loop(Box::new(|_| Box::pin(async { Ok(()) })))
             .is_err()
     );
-    let mut child = root.new_child(crate::box_runtime::RootHost::new());
+    let mut child = root.new_child(crate::box_runtime::store::RootHost::new());
     child
         .register_loop(Box::new(|_| Box::pin(async { Ok(()) })))
         .expect("child slot");
@@ -157,62 +140,19 @@ fn component_loop_admission_counts_attached_children() {
 }
 
 #[test]
-fn component_memory_limit_sums_memories_and_releases_failed_growth() {
-    let mut host = BoxHost::new();
-    assert!(
-        ResourceLimiter::memory_growing(&mut host, 0, crate::engine::STORE_MEMORY_BYTES, None,)
-            .expect("first memory reservation")
-    );
-    ResourceLimiter::memory_grow_failed(&mut host, wasmtime::Error::msg("allocation"))
-        .expect("allocation failure rolls back");
-    assert_eq!(host.wasm_memory_bytes, 0);
-
-    assert!(
-        ResourceLimiter::memory_growing(&mut host, 0, crate::engine::STORE_MEMORY_BYTES, None)
-            .unwrap()
-    );
-    assert!(!ResourceLimiter::memory_growing(&mut host, 0, 65_536, None).unwrap());
-}
-
-#[test]
-fn failed_growth_releases_only_its_reservation() {
-    let mut host = BoxHost::new();
-    assert!(ResourceLimiter::memory_growing(&mut host, 0, 4096, None).expect("memory reservation"));
-    assert!(
-        ResourceLimiter::memory_growing(&mut host, 4096, 8192, None)
-            .expect("incremental memory reservation")
-    );
-    ResourceLimiter::memory_grow_failed(
-        &mut host,
-        wasmtime::Error::msg("memory growth exceeds memory type's limits"),
-    )
-    .expect("memory type rejection");
-    assert_eq!(host.wasm_memory_bytes, 4096);
-    assert_eq!(host.memory_budget.reserved(), 4096);
-    assert!(
-            !ResourceLimiter::memory_growing(
-                &mut host,
-                0,
-                crate::engine::STORE_MEMORY_BYTES + 1,
-                None,
-            )
-            .expect("per-memory cap")
-        );
-}
-
-#[test]
 fn child_stores_share_the_box_memory_budget() {
     let engine = device_engine().expect("engine");
     let mut root = BoxRuntime::new(&engine, BoxHost::new()).expect("root runtime");
-    let mut children = (0..(BOX_WASM_MEMORY_BYTES / crate::engine::STORE_MEMORY_BYTES - 1))
-        .map(|_| root.new_child(crate::box_runtime::RootHost::new()))
+    let mut children = (0..(BOX_WASM_MEMORY_BYTES / crate::box_runtime::store::STORE_MEMORY_BYTES
+        - 1))
+        .map(|_| root.new_child(crate::box_runtime::store::RootHost::new()))
         .collect::<Vec<_>>();
 
     assert!(
         ResourceLimiter::memory_growing(
             root.store.data_mut(),
             0,
-            crate::engine::STORE_MEMORY_BYTES,
+            crate::box_runtime::store::STORE_MEMORY_BYTES,
             None,
         )
         .expect("root reservation")
@@ -222,19 +162,19 @@ fn child_stores_share_the_box_memory_budget() {
             ResourceLimiter::memory_growing(
                 child.store.data_mut(),
                 0,
-                crate::engine::STORE_MEMORY_BYTES,
+                crate::box_runtime::store::STORE_MEMORY_BYTES,
                 None,
             )
             .expect("child reservation")
         );
     }
 
-    let mut rejected = root.new_child(crate::box_runtime::RootHost::new());
+    let mut rejected = root.new_child(crate::box_runtime::store::RootHost::new());
     assert!(
         !ResourceLimiter::memory_growing(
             rejected.store.data_mut(),
             0,
-            crate::engine::STORE_MEMORY_BYTES,
+            crate::box_runtime::store::STORE_MEMORY_BYTES,
             None,
         )
         .expect("box cap")
@@ -242,7 +182,7 @@ fn child_stores_share_the_box_memory_budget() {
     drop(children);
     assert_eq!(
         root.memory_budget.reserved(),
-        crate::engine::STORE_MEMORY_BYTES
+        crate::box_runtime::store::STORE_MEMORY_BYTES
     );
 }
 
@@ -255,7 +195,7 @@ fn dropped_boot_store_releases_its_shared_memory_reservation() {
         ResourceLimiter::memory_growing(
             boot.store.data_mut(),
             0,
-            crate::engine::STORE_MEMORY_BYTES,
+            crate::box_runtime::store::STORE_MEMORY_BYTES,
             None,
         )
         .expect("boot memory reservation")
@@ -325,7 +265,7 @@ async fn root_failure_stops_the_runtime_group() {
     let mut outcome = root.lifecycle_notifier().subscribe();
     let dropped = Arc::new(AtomicBool::new(false));
     let child_drop = DropFlag(Arc::clone(&dropped));
-    let mut child = root.new_child(crate::box_runtime::RootHost::new());
+    let mut child = root.new_child(crate::box_runtime::store::RootHost::new());
     child
         .register_loop(Box::new(move |_| {
             let drop_flag = child_drop;
@@ -369,7 +309,7 @@ async fn child_failure_or_panic_stops_a_running_root() {
             })
         }))
         .unwrap();
-        let mut child = root.new_child(crate::box_runtime::RootHost::new());
+        let mut child = root.new_child(crate::box_runtime::store::RootHost::new());
         child
             .register_loop(Box::new(move |_| {
                 Box::pin(async move {
@@ -403,7 +343,7 @@ async fn completed_root_stops_child_workers() {
     let mut root = BoxRuntime::new(&engine, BoxHost::new()).expect("root runtime");
     let dropped = Arc::new(AtomicBool::new(false));
     let child_drop = DropFlag(Arc::clone(&dropped));
-    let mut child = root.new_child(crate::box_runtime::RootHost::new());
+    let mut child = root.new_child(crate::box_runtime::store::RootHost::new());
     let mut shutdown = root.shutdown.subscribe();
     child
         .register_loop(Box::new(move |_| {
@@ -435,7 +375,7 @@ async fn root_and_child_stores_make_progress_together() {
     let mut root = BoxRuntime::new(&engine, BoxHost::new()).expect("root runtime");
     let barrier = Arc::new(tokio::sync::Barrier::new(2));
     let completed = Arc::new(AtomicUsize::new(0));
-    let mut child = root.new_child(crate::box_runtime::RootHost::new());
+    let mut child = root.new_child(crate::box_runtime::store::RootHost::new());
     let child_barrier = Arc::clone(&barrier);
     let child_completed = Arc::clone(&completed);
     child
@@ -477,7 +417,7 @@ async fn child_failure_during_shutdown_fails_the_group() {
     let outcome = root.lifecycle_notifier().subscribe();
     root.register_loop(Box::new(|_| Box::pin(async { Ok(()) })))
         .expect("root loop");
-    let mut child = root.new_child(crate::box_runtime::RootHost::new());
+    let mut child = root.new_child(crate::box_runtime::store::RootHost::new());
     let mut shutdown = root.shutdown.subscribe();
     child
         .register_loop(Box::new(move |_| {
@@ -529,7 +469,7 @@ async fn competing_failures_publish_the_primary_error_before_native_cleanup() {
     .unwrap();
     let barrier = Arc::new(tokio::sync::Barrier::new(2));
     let child_barrier = Arc::clone(&barrier);
-    let mut child = root.new_child(crate::box_runtime::RootHost::new());
+    let mut child = root.new_child(crate::box_runtime::store::RootHost::new());
     child
         .register_loop(Box::new(move |_| {
             Box::pin(async move {
@@ -565,8 +505,8 @@ async fn configured_component_limit_counts_all_memories_and_is_inherited() {
     let engine = device_engine().unwrap();
     let limits = ComponentMemoryLimits::new(65_536, 131_072).unwrap();
     let root = BoxRuntime::new(&engine, BoxHost::with_memory_limits(limits)).unwrap();
-    let mut first = root.new_child(crate::box_runtime::RootHost::new());
-    let mut peer = root.new_child(crate::box_runtime::RootHost::new());
+    let mut first = root.new_child(crate::box_runtime::store::RootHost::new());
+    let mut peer = root.new_child(crate::box_runtime::store::RootHost::new());
     let two_memories = wasmtime::Module::new(&engine, "(module (memory 1) (memory 1))").unwrap();
     let error = wasmtime::Instance::new_async(&mut first.store, &two_memories, &[])
         .await
@@ -580,34 +520,10 @@ async fn configured_component_limit_counts_all_memories_and_is_inherited() {
         !ResourceLimiter::memory_growing(peer.store.data_mut(), 65_536, 131_072, None).unwrap()
     );
     drop(first);
-    let mut replacement = root.new_child(crate::box_runtime::RootHost::new());
+    let mut replacement = root.new_child(crate::box_runtime::store::RootHost::new());
     wasmtime::Instance::new_async(&mut replacement.store, &memory, &[])
         .await
         .unwrap();
-}
-
-#[test]
-fn component_limits_can_be_raised_and_invalid_limits_are_rejected() {
-    assert!(ComponentMemoryLimits::new(0, 1).is_err());
-    assert!(ComponentMemoryLimits::new(2, 1).is_err());
-    let mut host = BoxHost::with_memory_limits(
-        ComponentMemoryLimits::new(STORE_MEMORY_BYTES * 2, BOX_WASM_MEMORY_BYTES).unwrap(),
-    );
-    assert!(ResourceLimiter::memory_growing(&mut host, 0, STORE_MEMORY_BYTES * 2, None).unwrap());
-}
-
-#[test]
-fn policy_memory_reservation_preserves_the_total_box_limit() {
-    let limits = ComponentMemoryLimits::new(16 << 20, 128 << 20).unwrap();
-    let (remaining, policy_bytes) = limits.reserve_policy().unwrap();
-    assert_eq!(policy_bytes, 16 << 20);
-    assert_eq!(remaining.total_bytes() + policy_bytes, limits.total_bytes());
-    assert!(
-        ComponentMemoryLimits::new(16 << 20, 16 << 20)
-            .unwrap()
-            .reserve_policy()
-            .is_err()
-    );
 }
 
 #[test]

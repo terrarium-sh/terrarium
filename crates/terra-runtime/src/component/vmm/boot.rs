@@ -4,9 +4,10 @@ use std::time::Duration;
 
 use wasmtime::component::Component;
 
+use crate::box_runtime::BoxRuntime;
 #[cfg(test)]
-use crate::box_runtime::BoxHost;
-use crate::box_runtime::{BoxRuntime, StoreState};
+use crate::box_runtime::store::BoxHost;
+use crate::box_runtime::store::StoreState;
 use crate::component::vmm::machine::Device;
 use crate::component::vmm::virtualization::{Architecture, MachineConfig};
 use crate::memory::{BoundedMemory, GuestRam};
@@ -43,7 +44,7 @@ pub struct BootHost {
 impl Default for BootHost {
     fn default() -> Self {
         let mut table = ResourceTable::new();
-        table.set_max_capacity(crate::engine::MAX_DEVICE_RESOURCES);
+        table.set_max_capacity(crate::component::context::MAX_DEVICE_RESOURCES);
         Self {
             grant: None,
             table,
@@ -205,7 +206,7 @@ impl BoxRuntime {
             .store
             .data_mut()
             .grant(config.clone(), ram.clone(), kernel)?;
-        let mut linker = crate::engine::device_component_linker(self.store.engine())?;
+        let mut linker = crate::component::context::device_component_linker(self.store.engine())?;
         terra::boot::host::add_to_linker::<
             StoreState<BootHost>,
             wasmtime::component::HasSelf<BootHost>,

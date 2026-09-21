@@ -4,17 +4,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use terra_network::{GuestNetworkConfig, Policy, PolicyHandle};
-use terra_runtime::{
-    box_runtime::{BoxHost, BoxRuntime},
-    component::{
-        Interrupt,
-        block::backing::{BoundedDisk, DiskGrant},
-        fs::host::{FsHost, ShareGrant},
-        vsock::VsockChannel,
-    },
-    engine::{DeviceContext, device_engine},
-    memory::GuestRam,
-};
+use terra_runtime::box_runtime::BoxRuntime;
+use terra_runtime::box_runtime::store::BoxHost;
+use terra_runtime::component::Interrupt;
+use terra_runtime::component::block::backing::{BoundedDisk, DiskGrant};
+use terra_runtime::component::context::DeviceContext;
+use terra_runtime::component::fs::host::{FsHost, ShareGrant};
+use terra_runtime::component::vsock::VsockChannel;
+use terra_runtime::engine::device_engine;
+use terra_runtime::memory::GuestRam;
 use wasmtime::component::Component;
 
 const STATUS: u64 = 0x70;
@@ -155,7 +153,7 @@ async fn every_device_resets_and_closes_in_one_box_runtime() {
     let policy: PolicyHandle = Arc::new(NoNetwork);
     let network = terra_runtime::component::network::instantiate_shared(
         &mut runtime,
-        terra_runtime::engine::DeviceContext::with_ram(ram.clone()),
+        terra_runtime::component::context::DeviceContext::with_ram(ram.clone()),
         &network_component,
         policy,
         Vec::new(),

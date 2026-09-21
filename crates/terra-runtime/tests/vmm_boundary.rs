@@ -3,22 +3,18 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use terra_runtime::{
-    box_runtime::{BoxHost, BoxRuntime},
-    component::{
-        Interrupt,
-        vmm::{
-            Completion, Exit,
-            boot::BootEntry,
-            machine::{Device, DeviceKind},
-            virtualization::{
-                Architecture, MachineConfig, PreparedMachine, StartedVcpus, VirtualMachine,
-            },
-        },
-    },
-    engine::{DeviceContext, device_component_linker, device_engine},
-    memory::GuestRam,
+use terra_runtime::box_runtime::BoxRuntime;
+use terra_runtime::box_runtime::store::BoxHost;
+use terra_runtime::component::Interrupt;
+use terra_runtime::component::context::{DeviceContext, device_component_linker};
+use terra_runtime::component::vmm::boot::BootEntry;
+use terra_runtime::component::vmm::machine::{Device, DeviceKind};
+use terra_runtime::component::vmm::virtualization::{
+    Architecture, MachineConfig, PreparedMachine, StartedVcpus, VirtualMachine,
 };
+use terra_runtime::component::vmm::{Completion, Exit};
+use terra_runtime::engine::device_engine;
+use terra_runtime::memory::GuestRam;
 use wasmtime::{Store, component::Component};
 
 struct TestVm(GuestRam);

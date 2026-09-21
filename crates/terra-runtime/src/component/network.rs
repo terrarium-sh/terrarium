@@ -95,7 +95,7 @@ async fn configure_state<T: Send + 'static>(
 #[allow(clippy::too_many_arguments)]
 pub async fn instantiate(
     engine: &wasmtime::Engine,
-    host: crate::engine::DeviceContext,
+    host: crate::component::context::DeviceContext,
     component: &Component,
     policy: PolicyHandle,
     port_mappings: Vec<PortMapping>,
@@ -103,7 +103,7 @@ pub async fn instantiate(
     interrupt: Interrupt,
 ) -> wasmtime::Result<crate::component::StandaloneDevice> {
     let mut runtime =
-        crate::box_runtime::BoxRuntime::new(engine, crate::box_runtime::BoxHost::new())?;
+        crate::box_runtime::BoxRuntime::new(engine, crate::box_runtime::store::BoxHost::new())?;
     crate::component::vmm::mmio::initialize_test_router(&mut runtime).await?;
     let channel = instantiate_shared(
         &mut runtime,
@@ -123,7 +123,7 @@ pub async fn instantiate(
 #[allow(clippy::too_many_arguments)]
 pub fn instantiate_shared(
     runtime: &mut crate::box_runtime::BoxRuntime,
-    host: crate::engine::DeviceContext,
+    host: crate::component::context::DeviceContext,
     component: &Component,
     policy: PolicyHandle,
     port_mappings: Vec<PortMapping>,
@@ -144,7 +144,7 @@ pub fn instantiate_shared(
 #[allow(clippy::too_many_arguments)]
 pub fn grant_shared(
     runtime: &mut crate::box_runtime::BoxRuntime,
-    host: impl FnOnce() -> wasmtime::Result<crate::engine::DeviceContext> + Send + 'static,
+    host: impl FnOnce() -> wasmtime::Result<crate::component::context::DeviceContext> + Send + 'static,
     component: &Component,
     policy: PolicyHandle,
     port_mappings: Vec<PortMapping>,
@@ -226,7 +226,7 @@ mod tests {
             std::fs::read(component_path).expect("network component built"),
         )
         .expect("component compiles");
-        let host = crate::engine::DeviceContext::new(64 * 1024).unwrap();
+        let host = crate::component::context::DeviceContext::new(64 * 1024).unwrap();
         let interrupts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed = Arc::clone(&interrupts);
         let channel = crate::component::network::instantiate(
@@ -265,12 +265,12 @@ mod tests {
         )
         .expect("component");
         let mut runtime =
-            crate::box_runtime::BoxRuntime::new(&engine, crate::box_runtime::BoxHost::new())
+            crate::box_runtime::BoxRuntime::new(&engine, crate::box_runtime::store::BoxHost::new())
                 .expect("runtime");
         crate::component::vmm::mmio::initialize_test_router(&mut runtime)
             .await
             .expect("MMIO router");
-        let host = crate::engine::DeviceContext::with_ram(
+        let host = crate::component::context::DeviceContext::with_ram(
             crate::memory::GuestRam::new(64 * 1024).expect("RAM"),
         );
         let channel = crate::component::network::instantiate_shared(
@@ -306,7 +306,7 @@ mod tests {
             ),
         )
         .expect("component compiles");
-        let mut host = crate::engine::DeviceContext::new(64 * 1024).unwrap();
+        let mut host = crate::component::context::DeviceContext::new(64 * 1024).unwrap();
         let ram = host.guest_ram().clone();
         host.guest_write(0x2002, &257u16.to_le_bytes())
             .expect("avail index writes");

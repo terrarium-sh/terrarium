@@ -5,10 +5,10 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
+use terra_runtime::box_runtime::store::test_support::{StandaloneHost, device_store};
 use terra_runtime::component::vmm::mmio::{Operation, Reply as MmioReply, Request};
 use terra_runtime::component::vsock::host::{VsockDeviceHost, vsock_component_linker};
 use terra_runtime::engine::device_engine;
-use terra_runtime::engine::test_support::{StandaloneHost, device_store};
 use terra_vsock_device::VsockHeader;
 use wasmtime::StoreContextMut;
 use wasmtime::component::{
@@ -610,7 +610,7 @@ async fn shared_close_releases_the_diagnostic_sink() {
     let engine = device_engine().unwrap();
     let mut runtime = terra_runtime::box_runtime::BoxRuntime::new(
         &engine,
-        terra_runtime::box_runtime::BoxHost::new(),
+        terra_runtime::box_runtime::store::BoxHost::new(),
     )
     .unwrap();
     let router = Component::new(

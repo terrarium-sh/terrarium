@@ -1,4 +1,5 @@
 pub mod block;
+pub mod context;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub mod fs;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]

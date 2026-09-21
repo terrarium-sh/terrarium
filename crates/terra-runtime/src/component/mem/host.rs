@@ -1,6 +1,6 @@
 use wasmtime::component::HasSelf;
 
-use crate::engine::DeviceContext;
+use crate::component::context::DeviceContext;
 use crate::memory::{ReclaimError, ReclaimRange};
 
 wasmtime::component::bindgen!({
@@ -42,11 +42,11 @@ impl terra::mem::host::Host for DeviceContext {
     }
 }
 
-pub fn mem_component_linker<T: crate::engine::DeviceHost>(
+pub fn mem_component_linker<T: crate::component::context::DeviceHost>(
     engine: &wasmtime::Engine,
 ) -> wasmtime::Result<wasmtime::component::Linker<T>> {
-    let mut linker = crate::engine::device_component_linker(engine)?;
-    crate::engine::add_device_imports(&mut linker, T::context)?;
+    let mut linker = crate::component::context::device_component_linker(engine)?;
+    crate::component::context::add_device_imports(&mut linker, T::context)?;
     terra::mem::host::add_to_linker::<T, HasSelf<DeviceContext>>(&mut linker, T::context)?;
     Ok(linker)
 }

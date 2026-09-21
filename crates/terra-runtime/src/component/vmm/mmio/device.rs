@@ -407,7 +407,8 @@ mod tests {
     async fn failed_or_cancelled_setup_cannot_produce_a_ready_runtime() {
         for cancel in [false, true] {
             let engine = crate::engine::device_engine().unwrap();
-            let mut runtime = BoxRuntime::new(&engine, crate::box_runtime::BoxHost::new()).unwrap();
+            let mut runtime =
+                BoxRuntime::new(&engine, crate::box_runtime::store::BoxHost::new()).unwrap();
             super::super::initialize_test_router(&mut runtime)
                 .await
                 .unwrap();
@@ -453,12 +454,13 @@ mod tests {
     #[tokio::test]
     async fn device_grants_count_manually_attached_workers_towards_box_capacity() {
         let engine = crate::engine::device_engine().unwrap();
-        let mut runtime = BoxRuntime::new(&engine, crate::box_runtime::BoxHost::new()).unwrap();
+        let mut runtime =
+            BoxRuntime::new(&engine, crate::box_runtime::store::BoxHost::new()).unwrap();
         super::super::initialize_test_router(&mut runtime)
             .await
             .unwrap();
         for _ in 0..crate::box_runtime::MAX_BOX_COMPONENTS {
-            let worker = runtime.new_child(crate::box_runtime::RootHost::new());
+            let worker = runtime.new_child(crate::box_runtime::store::RootHost::new());
             runtime.attach_child(worker).unwrap();
         }
         let setup: crate::component::vmm::workers::Setup =
@@ -487,7 +489,7 @@ mod tests {
     async fn granting_a_worker_requires_an_initialized_router() {
         let engine = crate::engine::device_engine().expect("engine");
         let mut runtime =
-            BoxRuntime::new(&engine, crate::box_runtime::BoxHost::new()).expect("runtime");
+            BoxRuntime::new(&engine, crate::box_runtime::store::BoxHost::new()).expect("runtime");
         let setup: crate::component::vmm::workers::Setup =
             Box::new(|_| Box::pin(async { unreachable!() }));
 

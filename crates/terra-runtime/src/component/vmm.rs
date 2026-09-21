@@ -14,7 +14,7 @@ use std::sync::{Arc, mpsc};
 use std::time::Duration;
 use wasmtime::component::{Accessor, Resource, ResourceTable};
 
-use crate::box_runtime::BoxHost;
+use crate::box_runtime::store::BoxHost;
 pub use crate::component::vmm::mmio::terra::mmio::platform;
 pub use crate::component::vmm::mmio::terra::mmio::platform::{Completion, Error, Exit};
 use crate::memory::BoundedMemory;

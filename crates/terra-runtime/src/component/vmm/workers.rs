@@ -3,7 +3,8 @@ use std::pin::Pin;
 
 use wasmtime::component::StreamReader;
 
-use crate::box_runtime::{DeviceWorker, StoreHost, WorkerTask};
+use crate::box_runtime::store::StoreHost;
+use crate::box_runtime::{DeviceWorker, WorkerTask};
 use crate::component::relay;
 use crate::component::vmm::mmio::{Reply, Request, Serve};
 
@@ -112,7 +113,10 @@ mod tests {
                 started.send(()).unwrap();
                 let _guard = NotifyDrop(Some(dropped));
                 std::future::pending::<
-                    wasmtime::Result<(DeviceWorker<crate::engine::DeviceContext>, Serve)>,
+                    wasmtime::Result<(
+                        DeviceWorker<crate::component::context::DeviceContext>,
+                        Serve,
+                    )>,
                 >()
                 .await
             },

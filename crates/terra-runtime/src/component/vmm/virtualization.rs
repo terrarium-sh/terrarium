@@ -5,7 +5,8 @@ use wasmtime::component::Resource;
 pub use super::reaper::VcpuReaper;
 use super::{Platform, PlatformHost};
 
-use crate::box_runtime::{BoxHost, BoxRuntime};
+use crate::box_runtime::BoxRuntime;
+use crate::box_runtime::store::BoxHost;
 use crate::component::vmm::mmio::terra::mmio::virtualization;
 pub use crate::component::vmm::mmio::terra::mmio::virtualization::{Architecture, Config, Error};
 pub(crate) type InitializeMachine = wasmtime::component::TypedFunc<
@@ -95,284 +96,6 @@ impl MachineConfig {
             .map(|(slot, _)| u8::try_from(slot))
             .transpose()?
             .ok_or_else(|| wasmtime::Error::msg("interrupt device outside VM grant"))
-    }
-}
-#[cfg(test)]
-mod prepared_machine_tests {
-    use super::*;
-
-    struct TestVm(GuestRam);
-
-    impl VirtualMachine for TestVm {
-        fn memory(&self) -> wasmtime::Result<GuestRam> {
-            Ok(self.0.clone())
-        }
-    }
-
-    #[test]
-    fn prepared_machine_accepts_boot_once() {
-        let config = MachineConfig::new(Architecture::X86, 32768, 1, Vec::new()).unwrap();
-        let mut machine = PreparedMachine::new(config, TestVm(GuestRam::new(32768).unwrap()));
-        machine
-            .accept_boot(super::super::boot::BootEntry {
-                entry: 0,
-                boot_argument: 0x7000,
-            })
-            .unwrap();
-        assert!(
-            machine
-                .accept_boot(super::super::boot::BootEntry {
-                    entry: 0,
-                    boot_argument: 0x7000,
-                })
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn interrupt_bindings_validate_the_device_during_setup() {
-        let machine = MachineHandle(Arc::new(CreatedMachine {
-            machine: Arc::new(TestVm(GuestRam::new(32768).unwrap())),
-            devices: vec![super::super::machine::Device {
-                kind: super::super::machine::DeviceKind::Memory,
-                mmio_base: 0,
-                irq: 15,
-            }],
-        }));
-        let delivered = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let observed = Arc::clone(&delivered);
-        let interrupt = machine
-            .bind_interrupt(
-                super::super::machine::DeviceKind::Memory,
-                0,
-                move |_, irq, level| {
-                    assert!(level);
-                    observed.store(irq, std::sync::atomic::Ordering::Relaxed);
-                    Ok(())
-                },
-            )
-            .unwrap();
-        assert!(
-            machine
-                .bind_interrupt(super::super::machine::DeviceKind::Memory, 1, |_, _, _| Ok(
-                    ()
-                ))
-                .is_err()
-        );
-        interrupt(true).unwrap();
-        assert_eq!(delivered.load(std::sync::atomic::Ordering::Relaxed), 15);
-    }
-
-    #[tokio::test]
-    async fn failed_stop_keeps_machine_resources_with_native_teardown() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        let backend = Arc::new(TestVm(GuestRam::new(32768).unwrap()));
-        let backend_weak = Arc::downgrade(&backend);
-        let stop_called = Arc::new(AtomicBool::new(false));
-        let observed_stop = Arc::clone(&stop_called);
-        let teardown = super::super::teardown::NativeTeardown::new();
-        teardown
-            .install_machine(MachineRecovery {
-                reaper: VcpuReaper::new(
-                    || Ok(Vec::new()),
-                    Some(Box::new(move || {
-                        observed_stop.store(true, Ordering::Relaxed);
-                        Err(wasmtime::Error::msg("injected stop failure"))
-                    })),
-                ),
-                _backend: backend.clone(),
-                _ram: GuestRam::new(32768).unwrap(),
-            })
-            .unwrap();
-        drop(backend);
-        assert!(
-            teardown
-                .wait_until(std::time::Instant::now() + std::time::Duration::from_secs(1))
-                .await
-                .is_err()
-        );
-        assert!(stop_called.load(Ordering::Relaxed));
-        assert!(backend_weak.upgrade().is_some());
-    }
-
-    #[tokio::test]
-    #[allow(clippy::too_many_lines)]
-    async fn aot_vmm_applies_boot_and_keeps_both_vcpus_responsive() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::time::{Duration, Instant};
-        #[cfg(unix)]
-        use vm_memory::{GuestAddress, GuestMemoryMmap};
-
-        for architecture in [Architecture::X86, Architecture::Arm] {
-            let engine = crate::engine::device_engine().unwrap();
-            // SAFETY: the artifact is produced by this repository's matching AOT build.
-            #[allow(unsafe_code)]
-            let vmm = unsafe {
-                wasmtime::component::Component::deserialize(
-                    &engine,
-                    include_bytes!("../../../../../build/terra-vmm-component.cwasm"),
-                )
-                .unwrap()
-            };
-            let boot = wasmtime::component::Component::new(
-                &engine,
-                include_bytes!("../../../../../components/target/wasm32-wasip3/release/terra_boot_component.wasm"),
-            )
-            .unwrap();
-            let base = match architecture {
-                Architecture::X86 => 0,
-                Architecture::Arm => 0x4000_0000,
-            };
-            let devices = match architecture {
-                Architecture::X86 => vec![
-                    (super::super::machine::DeviceKind::Block, 0xd000_0000, 11),
-                    (super::super::machine::DeviceKind::Block, 0xd000_1000, 12),
-                    (super::super::machine::DeviceKind::Net, 0xd000_2000, 13),
-                    (super::super::machine::DeviceKind::Vsock, 0xd000_3000, 14),
-                    (super::super::machine::DeviceKind::Memory, 0xd000_4000, 15),
-                ],
-                Architecture::Arm => vec![
-                    (super::super::machine::DeviceKind::Block, 0x0a00_0000, 16),
-                    (super::super::machine::DeviceKind::Block, 0x0a00_0200, 17),
-                    (super::super::machine::DeviceKind::Memory, 0x0a00_0400, 18),
-                    (super::super::machine::DeviceKind::Net, 0x0a00_0600, 19),
-                    (super::super::machine::DeviceKind::Vsock, 0x0a00_0800, 20),
-                ],
-            }
-            .into_iter()
-            .map(|(kind, mmio_base, irq)| super::super::machine::Device {
-                kind,
-                mmio_base,
-                irq,
-            })
-            .collect();
-            #[cfg(unix)]
-            let ram = GuestRam::from_shared(Arc::new(
-                GuestMemoryMmap::from_ranges(&[(GuestAddress(base), 8 << 20)]).unwrap(),
-            ))
-            .unwrap();
-            #[cfg(windows)]
-            let ram = GuestRam::from_windows_ram(
-                crate::memory::WindowsRam::allocate_at(8 << 20, base).unwrap(),
-            )
-            .unwrap();
-            let config = MachineConfig::new(architecture, 8 << 20, 2, devices).unwrap();
-            let mut kernel = vec![0; 65536];
-            let (entry, copied) = match architecture {
-                Architecture::X86 => {
-                    kernel[..4].copy_from_slice(b"\x7fELF");
-                    kernel[4] = 2;
-                    kernel[5] = 1;
-                    kernel[18..20].copy_from_slice(&62_u16.to_le_bytes());
-                    kernel[24..32].copy_from_slice(&0x10_0000_u64.to_le_bytes());
-                    kernel[32..40].copy_from_slice(&64_u64.to_le_bytes());
-                    kernel[56..58].copy_from_slice(&1_u16.to_le_bytes());
-                    kernel[64..68].copy_from_slice(&1_u32.to_le_bytes());
-                    kernel[72..80].copy_from_slice(&0x100_u64.to_le_bytes());
-                    kernel[88..96].copy_from_slice(&0x10_0000_u64.to_le_bytes());
-                    kernel[96..104].copy_from_slice(&0xff00_u64.to_le_bytes());
-                    kernel[104..112].copy_from_slice(&0x10000_u64.to_le_bytes());
-                    kernel[0x100..].fill(42);
-                    (0x10_0000, kernel[0x100..].to_vec())
-                }
-                Architecture::Arm => {
-                    kernel[8..16].copy_from_slice(&0x80_000_u64.to_le_bytes());
-                    kernel[16..24].copy_from_slice(&0x20_0000_u64.to_le_bytes());
-                    kernel[56..60].copy_from_slice(b"ARMd");
-                    (base + 0x80_000, kernel.clone())
-                }
-            };
-            let mut prepared = PreparedMachine::new(config, TestVm(ram));
-            let boot_entry = BoxRuntime::new(&engine, BoxHost::new())
-                .unwrap()
-                .boot_prepared_machine(
-                    &boot,
-                    prepared.config(),
-                    prepared.ram().unwrap(),
-                    kernel,
-                    "root=/dev/vda",
-                )
-                .await
-                .unwrap();
-            assert_eq!(boot_entry.entry, entry);
-            prepared.accept_boot(boot_entry).unwrap();
-
-            let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).unwrap();
-            runtime.initialize_mmio(&vmm).await.unwrap();
-            let (runtime, handle) = runtime.attach_machine(prepared).await.unwrap();
-            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-            let (runtime, _reaper) = runtime
-                .prepare_vcpus(move |controls, accepted| {
-                    assert_eq!(accepted.entry, entry);
-                    sender.send(controls).unwrap();
-                    Ok(StartedVcpus::new((), || Ok(()), |()| Ok(Vec::new())))
-                })
-                .await
-                .unwrap();
-            let backend = handle.machine();
-            let memory = BoundedMemory::new(&backend.0);
-            for (index, chunk) in copied.chunks(16384).enumerate() {
-                assert_eq!(
-                    memory
-                        .read(entry + index as u64 * 16384, chunk.len() as u64)
-                        .unwrap(),
-                    chunk
-                );
-            }
-            assert_eq!(memory.read(entry + copied.len() as u64, 4).unwrap(), [0; 4]);
-            match architecture {
-                Architecture::X86 => {
-                    assert_eq!(
-                        memory.read(boot_entry.boot_argument + 0x202, 4).unwrap(),
-                        b"HdrS"
-                    );
-                }
-                Architecture::Arm => assert_eq!(
-                    memory.read(boot_entry.boot_argument, 4).unwrap(),
-                    0xd00d_feed_u32.to_be_bytes()
-                ),
-            }
-
-            let running = runtime.start();
-            let mut controls = receiver.recv().unwrap().into_iter();
-            let busy_cpu = controls.next().unwrap();
-            let probe_cpu = controls.next().unwrap();
-            let probe_done = Arc::new(AtomicBool::new(false));
-            let stop = Arc::clone(&probe_done);
-            let (ready, started) = tokio::sync::oneshot::channel();
-            let busy = tokio::task::spawn_blocking(move || {
-                busy_cpu.exchange(super::super::Exit::Halt).unwrap();
-                ready.send(()).unwrap();
-                let deadline = Instant::now() + Duration::from_secs(5);
-                while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
-                    assert!(matches!(
-                        busy_cpu.exchange(super::super::Exit::Halt).unwrap(),
-                        super::super::Completion::Reenter
-                    ));
-                }
-            });
-            started.await.unwrap();
-            let (probe_cpu, completion, elapsed) = tokio::task::spawn_blocking(move || {
-                let started = Instant::now();
-                let result = probe_cpu.exchange(super::super::Exit::Halt);
-                probe_done.store(true, Ordering::Release);
-                (probe_cpu, result, started.elapsed())
-            })
-            .await
-            .unwrap();
-            busy.await.unwrap();
-            drop(probe_cpu);
-            running.abort_and_join().await;
-            assert!(matches!(
-                completion.unwrap(),
-                super::super::Completion::Reenter
-            ));
-            assert!(
-                elapsed < Duration::from_secs(1),
-                "a busy vCPU starved its sibling"
-            );
-        }
     }
 }
 
@@ -766,5 +489,286 @@ impl BoxRuntime {
         });
         initialized?;
         Ok((self, handle))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestVm(GuestRam);
+
+    impl VirtualMachine for TestVm {
+        fn memory(&self) -> wasmtime::Result<GuestRam> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn prepared_machine_accepts_boot_once() {
+        let config = MachineConfig::new(Architecture::X86, 32768, 1, Vec::new()).unwrap();
+        let mut machine = PreparedMachine::new(config, TestVm(GuestRam::new(32768).unwrap()));
+        machine
+            .accept_boot(super::super::boot::BootEntry {
+                entry: 0,
+                boot_argument: 0x7000,
+            })
+            .unwrap();
+        assert!(
+            machine
+                .accept_boot(super::super::boot::BootEntry {
+                    entry: 0,
+                    boot_argument: 0x7000,
+                })
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn interrupt_bindings_validate_the_device_during_setup() {
+        let machine = MachineHandle(Arc::new(CreatedMachine {
+            machine: Arc::new(TestVm(GuestRam::new(32768).unwrap())),
+            devices: vec![super::super::machine::Device {
+                kind: super::super::machine::DeviceKind::Memory,
+                mmio_base: 0,
+                irq: 15,
+            }],
+        }));
+        let delivered = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let observed = Arc::clone(&delivered);
+        let interrupt = machine
+            .bind_interrupt(
+                super::super::machine::DeviceKind::Memory,
+                0,
+                move |_, irq, level| {
+                    assert!(level);
+                    observed.store(irq, std::sync::atomic::Ordering::Relaxed);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(
+            machine
+                .bind_interrupt(super::super::machine::DeviceKind::Memory, 1, |_, _, _| Ok(
+                    ()
+                ))
+                .is_err()
+        );
+        interrupt(true).unwrap();
+        assert_eq!(delivered.load(std::sync::atomic::Ordering::Relaxed), 15);
+    }
+
+    #[tokio::test]
+    async fn failed_stop_keeps_machine_resources_with_native_teardown() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let backend = Arc::new(TestVm(GuestRam::new(32768).unwrap()));
+        let backend_weak = Arc::downgrade(&backend);
+        let stop_called = Arc::new(AtomicBool::new(false));
+        let observed_stop = Arc::clone(&stop_called);
+        let teardown = super::super::teardown::NativeTeardown::new();
+        teardown
+            .install_machine(MachineRecovery {
+                reaper: VcpuReaper::new(
+                    || Ok(Vec::new()),
+                    Some(Box::new(move || {
+                        observed_stop.store(true, Ordering::Relaxed);
+                        Err(wasmtime::Error::msg("injected stop failure"))
+                    })),
+                ),
+                _backend: backend.clone(),
+                _ram: GuestRam::new(32768).unwrap(),
+            })
+            .unwrap();
+        drop(backend);
+        assert!(
+            teardown
+                .wait_until(std::time::Instant::now() + std::time::Duration::from_secs(1))
+                .await
+                .is_err()
+        );
+        assert!(stop_called.load(Ordering::Relaxed));
+        assert!(backend_weak.upgrade().is_some());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn aot_vmm_applies_boot_and_keeps_both_vcpus_responsive() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+        #[cfg(unix)]
+        use vm_memory::{GuestAddress, GuestMemoryMmap};
+
+        for architecture in [Architecture::X86, Architecture::Arm] {
+            let engine = crate::engine::device_engine().unwrap();
+            // SAFETY: the artifact is produced by this repository's matching AOT build.
+            #[allow(unsafe_code)]
+            let vmm = unsafe {
+                wasmtime::component::Component::deserialize(
+                    &engine,
+                    include_bytes!("../../../../../build/terra-vmm-component.cwasm"),
+                )
+                .unwrap()
+            };
+            let boot = wasmtime::component::Component::new(
+            &engine,
+            include_bytes!(
+                "../../../../../components/target/wasm32-wasip3/release/terra_boot_component.wasm"
+            ),
+        )
+        .unwrap();
+            let base = match architecture {
+                Architecture::X86 => 0,
+                Architecture::Arm => 0x4000_0000,
+            };
+            let devices = match architecture {
+                Architecture::X86 => vec![
+                    (super::super::machine::DeviceKind::Block, 0xd000_0000, 11),
+                    (super::super::machine::DeviceKind::Block, 0xd000_1000, 12),
+                    (super::super::machine::DeviceKind::Net, 0xd000_2000, 13),
+                    (super::super::machine::DeviceKind::Vsock, 0xd000_3000, 14),
+                    (super::super::machine::DeviceKind::Memory, 0xd000_4000, 15),
+                ],
+                Architecture::Arm => vec![
+                    (super::super::machine::DeviceKind::Block, 0x0a00_0000, 16),
+                    (super::super::machine::DeviceKind::Block, 0x0a00_0200, 17),
+                    (super::super::machine::DeviceKind::Memory, 0x0a00_0400, 18),
+                    (super::super::machine::DeviceKind::Net, 0x0a00_0600, 19),
+                    (super::super::machine::DeviceKind::Vsock, 0x0a00_0800, 20),
+                ],
+            }
+            .into_iter()
+            .map(|(kind, mmio_base, irq)| super::super::machine::Device {
+                kind,
+                mmio_base,
+                irq,
+            })
+            .collect();
+            #[cfg(unix)]
+            let ram = GuestRam::from_shared(Arc::new(
+                GuestMemoryMmap::from_ranges(&[(GuestAddress(base), 8 << 20)]).unwrap(),
+            ))
+            .unwrap();
+            #[cfg(windows)]
+            let ram = GuestRam::from_windows_ram(
+                crate::memory::WindowsRam::allocate_at(8 << 20, base).unwrap(),
+            )
+            .unwrap();
+            let config = MachineConfig::new(architecture, 8 << 20, 2, devices).unwrap();
+            let mut kernel = vec![0; 65536];
+            let (entry, copied) = match architecture {
+                Architecture::X86 => {
+                    kernel[..4].copy_from_slice(b"\x7fELF");
+                    kernel[4] = 2;
+                    kernel[5] = 1;
+                    kernel[18..20].copy_from_slice(&62_u16.to_le_bytes());
+                    kernel[24..32].copy_from_slice(&0x10_0000_u64.to_le_bytes());
+                    kernel[32..40].copy_from_slice(&64_u64.to_le_bytes());
+                    kernel[56..58].copy_from_slice(&1_u16.to_le_bytes());
+                    kernel[64..68].copy_from_slice(&1_u32.to_le_bytes());
+                    kernel[72..80].copy_from_slice(&0x100_u64.to_le_bytes());
+                    kernel[88..96].copy_from_slice(&0x10_0000_u64.to_le_bytes());
+                    kernel[96..104].copy_from_slice(&0xff00_u64.to_le_bytes());
+                    kernel[104..112].copy_from_slice(&0x10000_u64.to_le_bytes());
+                    kernel[0x100..].fill(42);
+                    (0x10_0000, kernel[0x100..].to_vec())
+                }
+                Architecture::Arm => {
+                    kernel[8..16].copy_from_slice(&0x80_000_u64.to_le_bytes());
+                    kernel[16..24].copy_from_slice(&0x20_0000_u64.to_le_bytes());
+                    kernel[56..60].copy_from_slice(b"ARMd");
+                    (base + 0x80_000, kernel.clone())
+                }
+            };
+            let mut prepared = PreparedMachine::new(config, TestVm(ram));
+            let boot_entry = BoxRuntime::new(&engine, BoxHost::new())
+                .unwrap()
+                .boot_prepared_machine(
+                    &boot,
+                    prepared.config(),
+                    prepared.ram().unwrap(),
+                    kernel,
+                    "root=/dev/vda",
+                )
+                .await
+                .unwrap();
+            assert_eq!(boot_entry.entry, entry);
+            prepared.accept_boot(boot_entry).unwrap();
+
+            let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).unwrap();
+            runtime.initialize_mmio(&vmm).await.unwrap();
+            let (runtime, handle) = runtime.attach_machine(prepared).await.unwrap();
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            let (runtime, _reaper) = runtime
+                .prepare_vcpus(move |controls, accepted| {
+                    assert_eq!(accepted.entry, entry);
+                    sender.send(controls).unwrap();
+                    Ok(StartedVcpus::new((), || Ok(()), |()| Ok(Vec::new())))
+                })
+                .await
+                .unwrap();
+            let backend = handle.machine();
+            let memory = BoundedMemory::new(&backend.0);
+            for (index, chunk) in copied.chunks(16384).enumerate() {
+                assert_eq!(
+                    memory
+                        .read(entry + index as u64 * 16384, chunk.len() as u64)
+                        .unwrap(),
+                    chunk
+                );
+            }
+            assert_eq!(memory.read(entry + copied.len() as u64, 4).unwrap(), [0; 4]);
+            match architecture {
+                Architecture::X86 => {
+                    assert_eq!(
+                        memory.read(boot_entry.boot_argument + 0x202, 4).unwrap(),
+                        b"HdrS"
+                    );
+                }
+                Architecture::Arm => assert_eq!(
+                    memory.read(boot_entry.boot_argument, 4).unwrap(),
+                    0xd00d_feed_u32.to_be_bytes()
+                ),
+            }
+
+            let running = runtime.start();
+            let mut controls = receiver.recv().unwrap().into_iter();
+            let busy_cpu = controls.next().unwrap();
+            let probe_cpu = controls.next().unwrap();
+            let probe_done = Arc::new(AtomicBool::new(false));
+            let stop = Arc::clone(&probe_done);
+            let (ready, started) = tokio::sync::oneshot::channel();
+            let busy = tokio::task::spawn_blocking(move || {
+                busy_cpu.exchange(super::super::Exit::Halt).unwrap();
+                ready.send(()).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
+                    assert!(matches!(
+                        busy_cpu.exchange(super::super::Exit::Halt).unwrap(),
+                        super::super::Completion::Reenter
+                    ));
+                }
+            });
+            started.await.unwrap();
+            let (probe_cpu, completion, elapsed) = tokio::task::spawn_blocking(move || {
+                let started = Instant::now();
+                let result = probe_cpu.exchange(super::super::Exit::Halt);
+                probe_done.store(true, Ordering::Release);
+                (probe_cpu, result, started.elapsed())
+            })
+            .await
+            .unwrap();
+            busy.await.unwrap();
+            drop(probe_cpu);
+            running.abort_and_join().await;
+            assert!(matches!(
+                completion.unwrap(),
+                super::super::Completion::Reenter
+            ));
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "a busy vCPU starved its sibling"
+            );
+        }
     }
 }
