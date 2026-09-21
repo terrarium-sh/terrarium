@@ -23,13 +23,16 @@ jobs:
         component: [alpine, e2fsprogs]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # GITHUB_TOKEN cannot push workflow-file changes or open PRs; WORKFLOW_TOKEN is a PAT with Contents, Pull requests, Workflows, Actions write.
+          token: ${{ secrets.WORKFLOW_TOKEN || github.token }}
       - name: Test pin updater
         run: python3 -B scripts/test-pin-updates.py
       - name: Update guest pins
         run: python3 scripts/update-pins.py '${{ matrix.component }}'
       - name: Open update PR
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.WORKFLOW_TOKEN || github.token }}
           BASE_BRANCH: ${{ github.event.repository.default_branch }}
         run: bash scripts/open-pin-pr.sh '${{ matrix.component }}' pins.mk
 
@@ -40,7 +43,7 @@ jobs:
       # Same-series LTS patches only; a new LTS series stays manual since it can need config and patch work.
       - name: Open patch-bump PR for the pinned LTS series
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.WORKFLOW_TOKEN || github.token }}
         run: |
           set -euo pipefail
           current=$(sed -n 's/^KERNEL_VERSION := //p' pins.mk)

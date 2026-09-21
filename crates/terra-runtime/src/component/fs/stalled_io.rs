@@ -244,6 +244,70 @@ impl IoGate {
     }
 }
 
+#[derive(Clone, Copy)]
+struct PendingRequest {
+    output: u64,
+    unique: u64,
+    head: u16,
+    used_start: u16,
+}
+
+impl PendingRequest {
+    fn read_reply(self, memory: &BoundedMemory<'_>) -> Option<Vec<u8>> {
+        let used = u16::from_le_bytes(memory.read(0x3002, 2).unwrap().try_into().unwrap());
+        for offset in 0..used.wrapping_sub(self.used_start) {
+            let index = self.used_start.wrapping_add(offset);
+            let entry = memory.read(0x3004 + u64::from(index % 128) * 8, 8).unwrap();
+            if entry[..4] != u32::from(self.head).to_le_bytes() {
+                continue;
+            }
+            let length = u32::from_le_bytes(entry[4..8].try_into().unwrap());
+            assert!(
+                (16..=1024).contains(&length),
+                "invalid completed FUSE reply length: {length}"
+            );
+            let reply = memory.read(self.output, u64::from(length)).unwrap();
+            assert_eq!(&reply[8..16], &self.unique.to_le_bytes());
+            assert_eq!(&reply[..4], &length.to_le_bytes());
+            return Some(reply);
+        }
+        None
+    }
+}
+
+#[test]
+fn replies_wait_for_their_used_ring_entry() {
+    let ram = SyntheticRam::new(64 * 1024).unwrap();
+    let memory = BoundedMemory::new(&ram);
+    let request = PendingRequest {
+        output: 0x4000,
+        unique: 7,
+        head: 2,
+        used_start: 127,
+    };
+    memory.write(0x3002, &127_u16.to_le_bytes()).unwrap();
+    memory
+        .write(request.output + 8, &request.unique.to_le_bytes())
+        .unwrap();
+    assert!(request.read_reply(&memory).is_none());
+    memory.write(request.output, &16_u32.to_le_bytes()).unwrap();
+    assert!(request.read_reply(&memory).is_none());
+    memory
+        .write(0x3004 + 127 * 8, &4_u32.to_le_bytes())
+        .unwrap();
+    memory.write(0x3002, &128_u16.to_le_bytes()).unwrap();
+    assert!(request.read_reply(&memory).is_none());
+    memory
+        .write(0x3004, &u32::from(request.head).to_le_bytes())
+        .unwrap();
+    memory.write(0x3008, &16_u32.to_le_bytes()).unwrap();
+    memory.write(0x3002, &129_u16.to_le_bytes()).unwrap();
+    assert_eq!(
+        request.read_reply(&memory).unwrap(),
+        memory.read(request.output, 16).unwrap()
+    );
+}
+
 struct Mounted {
     channel: DeviceChannel,
     ram: SyntheticRam,
@@ -328,8 +392,9 @@ impl Mounted {
         self.request(26, 1, &init).await;
     }
 
-    fn submit(&mut self, head: u16, opcode: u32, node: u64, body: &[u8]) -> (u64, u64) {
+    fn submit(&mut self, head: u16, opcode: u32, node: u64, body: &[u8]) -> PendingRequest {
         let memory = BoundedMemory::new(&self.ram);
+        let used_start = u16::from_le_bytes(memory.read(0x3002, 2).unwrap().try_into().unwrap());
         let unique = u64::from(self.next) + 1;
         let input = 0x4000 + u64::from(head) * 0x1000;
         let output = input + 0x800;
@@ -358,17 +423,20 @@ impl Mounted {
         self.next += 1;
         memory.write(0x2002, &self.next.to_le_bytes()).unwrap();
         self.channel.write(0x50, &1_u32.to_le_bytes()).unwrap();
-        (output, unique)
+        PendingRequest {
+            output,
+            unique,
+            head,
+            used_start,
+        }
     }
 
-    async fn receive(&self, target: (u64, u64)) -> Vec<u8> {
+    async fn receive(&self, target: PendingRequest) -> Vec<u8> {
         tokio::time::timeout(Duration::from_secs(3), async {
             let memory = BoundedMemory::new(&self.ram);
             loop {
-                let header = memory.read(target.0, 16).unwrap();
-                if header[8..16] == target.1.to_le_bytes() {
-                    let length = u32::from_le_bytes(header[..4].try_into().unwrap());
-                    return memory.read(target.0, u64::from(length)).unwrap();
+                if let Some(reply) = target.read_reply(&memory) {
+                    return reply;
                 }
                 tokio::task::yield_now().await;
             }
@@ -475,7 +543,9 @@ async fn stalled_read_allows_other_io_events_cancellation_and_shutdown() {
     assert_eq!(&event[40..47], b"changed");
     mounted.request(4097, 1, &[]).await;
     assert_eq!(
-        BoundedMemory::new(&mounted.ram).read(slow.0, 16).unwrap(),
+        BoundedMemory::new(&mounted.ram)
+            .read(slow.output, 16)
+            .unwrap(),
         vec![0; 16]
     );
     gate.release.notify_one();
@@ -530,7 +600,9 @@ async fn reset_retains_running_reads_without_publishing_old_replies() {
         .forget();
     mounted.request(3, 1, &[]).await;
     assert_eq!(
-        BoundedMemory::new(&mounted.ram).read(slow.0, 16).unwrap(),
+        BoundedMemory::new(&mounted.ram)
+            .read(slow.output, 16)
+            .unwrap(),
         vec![0; 16]
     );
     mounted.channel.close().unwrap();
@@ -589,7 +661,7 @@ async fn stalled_writes_and_flushes_do_not_block_shutdown() {
         );
         assert_eq!(
             BoundedMemory::new(&mounted.ram)
-                .read(pending.0, 16)
+                .read(pending.output, 16)
                 .unwrap(),
             vec![0; 16]
         );
@@ -659,7 +731,7 @@ async fn stalled_metadata_preserves_other_io_events_reset_and_close() {
         mounted.runtime.abort_and_join().await;
         assert_eq!(
             BoundedMemory::new(&mounted.ram)
-                .read(pending.0, 16)
+                .read(pending.output, 16)
                 .unwrap(),
             vec![0; 16]
         );
@@ -690,7 +762,7 @@ async fn stalled_event_resolution_preserves_requests_and_cancellation() {
     mounted.runtime.abort_and_join().await;
     assert_eq!(
         BoundedMemory::new(&mounted.ram)
-            .read(notification.0, cancelled.len() as u64)
+            .read(notification.output, cancelled.len() as u64)
             .unwrap(),
         cancelled
     );
