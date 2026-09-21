@@ -196,7 +196,7 @@ async fn rename_entry(state: RequestState, request: &Request<'_>) -> Result<Vec<
     let mode = rename_mode(flags)?;
     let old_parent = request_node(state, request.node)?;
     let new_parent = request_node(state, new_parent_id)?;
-    let new_parent_descriptor = new_parent.clone_descriptor().map_err(host_error)?;
+    let new_parent_descriptor = new_parent.resolve_descriptor().await.map_err(host_error)?;
     let replaced_stat = match host::lookup(&new_parent, new_name.clone()).await {
         Ok(replaced) => replaced.stat().await.ok(),
         Err(_) => None,

@@ -115,6 +115,7 @@ static DIRECTORY_CACHE_BYTES: AtomicUsize = AtomicUsize::new(0);
 pub struct Node {
     descriptor: Option<Descriptor>,
     path: Option<(Descriptor, String)>,
+    path_identity: Option<types::MetadataHashValue>,
 }
 
 pub struct Directory {
@@ -288,76 +289,114 @@ impl Node {
         self.path = None;
     }
 
-    pub fn clone_descriptor(&self) -> Result<Descriptor, Error> {
-        Ok(self.descriptor()?.clone())
+    async fn checked_path(&self) -> Result<&(Descriptor, String), Error> {
+        let path = self.path.as_ref().ok_or(Error::NoEntry)?;
+        if let Some(expected) = &self.path_identity {
+            let actual = path
+                .0
+                .metadata_hash_at(types::PathFlags::empty(), path.1.clone())
+                .await
+                .map_err(error)?;
+            if (expected.upper, expected.lower) != (actual.upper, actual.lower) {
+                return Err(Error::NoEntry);
+            }
+        }
+        Ok(path)
     }
 
-    fn descriptor(&self) -> Result<&Descriptor, Error> {
-        self.descriptor.as_ref().ok_or(Error::Unsupported)
+    pub async fn resolve_descriptor(&self) -> Result<Descriptor, Error> {
+        if let Some(descriptor) = &self.descriptor {
+            return Ok(descriptor.clone());
+        }
+        self.open_path(types::OpenFlags::DIRECTORY, types::DescriptorFlags::READ)
+            .await
+    }
+
+    async fn open_path(
+        &self,
+        flags: types::OpenFlags,
+        access: types::DescriptorFlags,
+    ) -> Result<Descriptor, Error> {
+        let (parent, name) = if self.descriptor.is_some() {
+            self.path.as_ref().ok_or(Error::Access)?
+        } else {
+            self.checked_path().await?
+        };
+        let opened = parent
+            .open_at(types::PathFlags::empty(), name.clone(), flags, access)
+            .await
+            .map_err(error)?;
+        let expected = if let Some(descriptor) = &self.descriptor {
+            Some(descriptor.metadata_hash().await.map_err(error)?)
+        } else {
+            self.path_identity
+        };
+        if let Some(expected) = expected {
+            let actual = opened.metadata_hash().await.map_err(error)?;
+            if (expected.upper, expected.lower) != (actual.upper, actual.lower) {
+                return Err(Error::NoEntry);
+            }
+        }
+        Ok(std::sync::Arc::new(opened))
     }
 
     pub async fn child_identity(&self, name: &str) -> Result<types::MetadataHashValue, Error> {
-        self.descriptor()?
+        self.resolve_descriptor()
+            .await?
             .metadata_hash_at(types::PathFlags::empty(), name.to_owned())
             .await
             .map_err(error)
     }
 
     pub async fn stat(&self) -> Result<Stat, Error> {
-        if let Some(descriptor) = &self.descriptor {
-            let mut stat = stat(
-                descriptor.stat().await.map_err(error)?,
-                descriptor.metadata_hash().await.map_err(error)?,
-            );
-            if let Some(mode) = crate::terra::fs::host::get_mode(descriptor)
-                .await
-                .map_err(host_error)?
-            {
-                stat.mode = mode;
-            }
-            Ok(stat)
+        let (mut stat, mode) = if let Some(descriptor) = &self.descriptor {
+            (
+                stat(
+                    descriptor.stat().await.map_err(error)?,
+                    descriptor.metadata_hash().await.map_err(error)?,
+                ),
+                crate::terra::fs::host::get_mode(descriptor).await,
+            )
         } else {
-            let (parent, name) = self.path.as_ref().ok_or(Error::NoEntry)?;
-            path_stat(parent, name).await
+            let (parent, name) = self.checked_path().await?;
+            (
+                path_stat(parent, name).await?,
+                crate::terra::fs::host::get_mode_at(parent, name.clone()).await,
+            )
+        };
+        if let Some(mode) = mode.map_err(host_error)? {
+            stat.mode = mode;
         }
+        Ok(stat)
     }
 
     pub async fn open(&self, flags: OpenFlags) -> Result<Descriptor, Error> {
-        let mut descriptor = self.descriptor()?.clone();
+        let mut access = types::DescriptorFlags::empty();
+        if flags.0 & OpenFlags::READ.0 != 0 {
+            access |= types::DescriptorFlags::READ;
+        }
+        if flags.0 & OpenFlags::WRITE.0 != 0 {
+            access |= types::DescriptorFlags::WRITE;
+        }
+
+        let mut descriptor = if let Some(descriptor) = &self.descriptor {
+            descriptor.clone()
+        } else {
+            self.open_path(types::OpenFlags::empty(), access).await?
+        };
         if !matches!(
             descriptor.get_type().await.map_err(error)?,
             types::DescriptorType::RegularFile
         ) {
             return Err(Error::Unsupported);
         }
-        let granted = descriptor.get_flags().await.map_err(error)?;
-        if (flags.0 & OpenFlags::READ.0 != 0 && !granted.contains(types::DescriptorFlags::READ))
-            || (flags.0 & OpenFlags::WRITE.0 != 0
-                && !granted.contains(types::DescriptorFlags::WRITE))
+        if !descriptor
+            .get_flags()
+            .await
+            .map_err(error)?
+            .contains(access)
         {
-            let (parent, name) = self.path.as_ref().ok_or(Error::Access)?;
-            let mut access = types::DescriptorFlags::empty();
-            if flags.0 & OpenFlags::READ.0 != 0 {
-                access |= types::DescriptorFlags::READ;
-            }
-            if flags.0 & OpenFlags::WRITE.0 != 0 {
-                access |= types::DescriptorFlags::WRITE;
-            }
-            let reopened = parent
-                .open_at(
-                    types::PathFlags::empty(),
-                    name.clone(),
-                    types::OpenFlags::empty(),
-                    access,
-                )
-                .await
-                .map_err(error)?;
-            let expected = descriptor.metadata_hash().await.map_err(error)?;
-            let actual = reopened.metadata_hash().await.map_err(error)?;
-            if (expected.upper, expected.lower) != (actual.upper, actual.lower) {
-                return Err(Error::NoEntry);
-            }
-            descriptor = std::sync::Arc::new(reopened);
+            descriptor = self.open_path(types::OpenFlags::empty(), access).await?;
         }
         if flags.0 & OpenFlags::TRUNCATE.0 != 0 {
             descriptor.set_size(0).await.map_err(error)?;
@@ -377,11 +416,17 @@ impl Node {
         if !fixed_owner(uid, gid) {
             return Err(Error::Unsupported);
         }
-        let descriptor = self.descriptor()?;
         if let Some(mode) = mode {
-            crate::terra::fs::host::set_mode(descriptor, mode)
-                .await
-                .map_err(host_error)?;
+            if let Some(descriptor) = &self.descriptor {
+                crate::terra::fs::host::set_mode(descriptor, mode)
+                    .await
+                    .map_err(host_error)?;
+            } else {
+                let (parent, name) = self.checked_path().await?;
+                crate::terra::fs::host::set_mode_at(parent, name.clone(), mode)
+                    .await
+                    .map_err(host_error)?;
+            }
         }
         if let Some(size) = size {
             self.open(OpenFlags::WRITE)
@@ -400,10 +445,23 @@ impl Node {
                 }
                 None => types::NewTimestamp::NoChange,
             };
-            descriptor
-                .set_times(convert(atime), convert(mtime))
-                .await
-                .map_err(error)?;
+            if let Some(descriptor) = &self.descriptor {
+                descriptor
+                    .set_times(convert(atime), convert(mtime))
+                    .await
+                    .map_err(error)?;
+            } else {
+                let (parent, name) = self.checked_path().await?;
+                parent
+                    .set_times_at(
+                        types::PathFlags::empty(),
+                        name.clone(),
+                        convert(atime),
+                        convert(mtime),
+                    )
+                    .await
+                    .map_err(error)?;
+            }
         }
         Ok(())
     }
@@ -418,7 +476,7 @@ impl Node {
     }
 
     pub async fn open_directory(&self) -> Result<(Directory, Option<Descriptor>), Error> {
-        let descriptor = self.descriptor()?.clone();
+        let descriptor = self.resolve_descriptor().await?;
         if !matches!(
             descriptor.get_type().await.map_err(error)?,
             types::DescriptorType::Directory
@@ -435,7 +493,7 @@ impl Node {
     }
 
     pub async fn statfs(&self) -> Result<Statfs, Error> {
-        let stat = crate::terra::fs::host::statfs(self.descriptor()?)
+        let stat = crate::terra::fs::host::statfs(self.resolve_descriptor().await?.as_ref())
             .await
             .map_err(host_error)?;
         Ok(Statfs {
@@ -545,12 +603,13 @@ pub fn root() -> Result<Node, Error> {
     Ok(Node {
         descriptor: Some(std::sync::Arc::new(descriptor)),
         path: None,
+        path_identity: None,
     })
 }
 
 pub async fn lookup(parent: &Node, name: Vec<u8>) -> Result<Node, Error> {
     let name = text(&name)?.to_owned();
-    let directory = parent.descriptor()?;
+    let directory = parent.resolve_descriptor().await?;
     let metadata = directory
         .stat_at(types::PathFlags::empty(), name.clone())
         .await
@@ -570,48 +629,55 @@ pub async fn lookup(parent: &Node, name: Vec<u8>) -> Result<Node, Error> {
         | types::DescriptorType::Other(_) => None,
     };
     let descriptor = if let Some(flags) = flags {
-        let opened = match directory
-            .open_at(
-                types::PathFlags::empty(),
-                name.clone(),
-                types::OpenFlags::empty(),
-                flags,
-            )
-            .await
-        {
-            Ok(descriptor) => descriptor,
-            Err(
-                types::ErrorCode::ReadOnly
-                | types::ErrorCode::NotPermitted
-                | types::ErrorCode::Access,
-            ) => match directory
+        let mut opened = None;
+        for access in [flags, types::DescriptorFlags::READ] {
+            match directory
                 .open_at(
                     types::PathFlags::empty(),
                     name.clone(),
                     types::OpenFlags::empty(),
-                    types::DescriptorFlags::READ,
+                    access,
                 )
                 .await
             {
-                Ok(descriptor) => descriptor,
+                Ok(descriptor) => {
+                    opened = Some(descriptor);
+                    break;
+                }
                 Err(
                     types::ErrorCode::ReadOnly
                     | types::ErrorCode::NotPermitted
                     | types::ErrorCode::Access,
-                ) => crate::terra::fs::host::open_metadata_at(directory, name.clone())
-                    .await
-                    .map_err(host_error)?,
+                ) => {}
                 Err(code) => return Err(error(code)),
-            },
-            Err(code) => return Err(error(code)),
-        };
-        Some(std::sync::Arc::new(opened))
+            }
+        }
+        if opened.is_none() {
+            opened = match crate::terra::fs::host::open_metadata_at(&directory, name.clone()).await
+            {
+                Ok(descriptor) => Some(descriptor),
+                Err(crate::terra::fs::host::Error::Unsupported) => None,
+                Err(error) => return Err(host_error(error)),
+            };
+        }
+        opened.map(std::sync::Arc::new)
+    } else {
+        None
+    };
+    let path_identity = if descriptor.is_none() {
+        Some(
+            directory
+                .metadata_hash_at(types::PathFlags::empty(), name.clone())
+                .await
+                .map_err(error)?,
+        )
     } else {
         None
     };
     Ok(Node {
         descriptor,
         path: Some((directory.clone(), name)),
+        path_identity,
     })
 }
 
@@ -629,7 +695,7 @@ pub async fn create(
     if flags.0 & CreateFlags::TRUNCATE.0 != 0 {
         open |= types::OpenFlags::TRUNCATE;
     }
-    let directory = parent.descriptor()?;
+    let directory = parent.resolve_descriptor().await?;
     let created = match directory
         .stat_at(types::PathFlags::empty(), name.clone())
         .await
@@ -659,6 +725,7 @@ pub async fn create(
         Node {
             descriptor: Some(descriptor.clone()),
             path: Some((directory.clone(), name)),
+            path_identity: None,
         },
         descriptor,
     ))
@@ -666,12 +733,13 @@ pub async fn create(
 
 pub async fn mkdir(parent: &Node, name: Vec<u8>, mode: u32) -> Result<Node, Error> {
     parent
-        .descriptor()?
+        .resolve_descriptor()
+        .await?
         .create_directory_at(text(&name)?.to_owned())
         .await
         .map_err(error)?;
     let node = lookup(parent, name).await?;
-    apply_create_mode(node.descriptor()?, mode).await?;
+    apply_create_mode(&node.resolve_descriptor().await?, mode).await?;
     Ok(node)
 }
 
@@ -693,13 +761,15 @@ fn host_error(error: crate::terra::fs::host::Error) -> Error {
 pub async fn unlink(parent: &Node, name: Vec<u8>, directory: bool) -> Result<(), Error> {
     if directory {
         parent
-            .descriptor()?
+            .resolve_descriptor()
+            .await?
             .remove_directory_at(text(&name)?.to_owned())
             .await
             .map_err(error)
     } else {
         parent
-            .descriptor()?
+            .resolve_descriptor()
+            .await?
             .unlink_file_at(text(&name)?.to_owned())
             .await
             .map_err(error)
@@ -717,10 +787,11 @@ pub async fn rename(
         return Err(Error::Unsupported);
     }
     old_parent
-        .descriptor()?
+        .resolve_descriptor()
+        .await?
         .rename_at(
             text(&old_name)?.to_owned(),
-            new_parent.descriptor()?,
+            new_parent.resolve_descriptor().await?.as_ref(),
             text(&new_name)?.to_owned(),
         )
         .await
@@ -728,12 +799,12 @@ pub async fn rename(
 }
 
 pub async fn link(old: &Node, parent: &Node, name: Vec<u8>) -> Result<(), Error> {
-    let (source, source_name) = old.path.as_ref().ok_or(Error::Unsupported)?;
+    let (source, source_name) = old.checked_path().await?;
     source
         .link_at(
             types::PathFlags::empty(),
             source_name.clone(),
-            parent.descriptor()?,
+            parent.resolve_descriptor().await?.as_ref(),
             text(&name)?.to_owned(),
         )
         .await
@@ -742,7 +813,8 @@ pub async fn link(old: &Node, parent: &Node, name: Vec<u8>) -> Result<(), Error>
 
 pub async fn symlink(parent: &Node, name: Vec<u8>, target: Vec<u8>) -> Result<Node, Error> {
     parent
-        .descriptor()?
+        .resolve_descriptor()
+        .await?
         .symlink_at(
             core::str::from_utf8(&target)
                 .map_err(|_| Error::IllegalByteSequence)?

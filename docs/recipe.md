@@ -84,6 +84,10 @@ distinctions and executable bits remain synthetic, and Windows ACLs are unchange
 Windows directories report `0755`; other directory modes are unsupported.
 Lookup, stat, and chmod do not require content-read permission. Write-only files
 can be opened for writing; reopening checks inode identity before truncation.
+On macOS, inaccessible objects use a parent-directory-relative metadata reference.
+If the host renames, removes, or replaces such an object, its cached guest reference
+returns not-found; look it up again at its current path. Files already opened for
+content access keep their normal descriptor semantics.
 
 Each shared mount allows 32 active filesystem requests and 256 outstanding
 requests including queued work. Reads, writes, flushes, and metadata operations

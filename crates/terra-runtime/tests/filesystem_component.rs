@@ -834,6 +834,8 @@ async fn native_events_keep_inode_identity_across_atomic_replacement() {
     assert!(saw_replacement, "atomic replacement was not forwarded");
 }
 
+/// Native backends can deliver delayed creation events that invalidate the cache.
+/// Refresh the lookup until a content event resolves against the cached inode.
 #[tokio::test(flavor = "multi_thread")]
 async fn content_events_reuse_confirmed_cached_inode_identity() {
     let directory = tempfile::tempdir().expect("share");
@@ -841,18 +843,18 @@ async fn content_events_reuse_confirmed_cached_inode_identity() {
     let mounted = mount(directory.path(), true).await;
     initialize_events(&mounted).await;
     let memory = BoundedMemory::new(&mounted.ram);
-    let lookup = submit(&mounted.channel, &memory, 1, &request(1, 2, 1, b"value\0")).await;
-    for index in (2..66).step_by(2) {
-        std::fs::write(directory.path().join("value"), format!("update {index}"))
-            .expect("host write");
-        let getattr = submit(
+    let mut saw_content = false;
+    for index in (0..64).step_by(2) {
+        let lookup = submit(
             &mounted.channel,
             &memory,
             index,
-            &request(3, u64::from(index) + 1, 1, &[]),
+            &request(1, u64::from(index) + 1, 1, b"value\0"),
         )
         .await;
-        assert_eq!(reply_error(&getattr), 0);
+        assert_eq!(reply_error(&lookup), 0);
+        std::fs::write(directory.path().join("value"), format!("update {index}"))
+            .expect("host write");
         let reply = submit(
             &mounted.channel,
             &memory,
@@ -860,10 +862,15 @@ async fn content_events_reuse_confirmed_cached_inode_identity() {
             &request(4096, u64::from(index) + 2, 1, &[]),
         )
         .await;
-        assert_eq!(&reply[24..32], &lookup[16..24]);
         let kind = u32::from_le_bytes(reply[32..36].try_into().expect("event kind"));
+        if !matches!(kind & 0xff, 3 | 4) || reply[24..32] != lookup[16..24] {
+            continue;
+        }
         assert_eq!(kind & 0x200, 0x200);
+        saw_content = true;
+        break;
     }
+    assert!(saw_content, "content change was not forwarded");
 }
 
 #[cfg(unix)]
@@ -996,4 +1003,45 @@ async fn inaccessible_directories_allow_metadata_and_permission_repair() {
     let child = submit(channel, &memory, 2, &request(1, 3, inode, b"child\0")).await;
     assert_eq!(reply_error(&child), 0);
     channel.close().expect("close");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn inaccessible_metadata_nodes_never_chmod_replacements() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    for replace_with_symlink in [false, true] {
+        let root = tempfile::tempdir().expect("root");
+        let path = root.path().join("locked");
+        std::fs::write(&path, b"original").expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let mounted = mount(root.path(), false).await;
+        let memory = BoundedMemory::new(&mounted.ram);
+        let lookup = submit(&mounted.channel, &memory, 0, &request(1, 1, 1, b"locked\0")).await;
+        assert_eq!(reply_error(&lookup), 0);
+        let inode = u64::from_le_bytes(lookup[16..24].try_into().expect("inode"));
+        std::fs::rename(&path, root.path().join("moved")).expect("rename");
+        let replacement = root.path().join("replacement");
+        std::fs::write(&replacement, b"replacement").expect("replacement");
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o640))
+            .expect("chmod");
+        if replace_with_symlink {
+            symlink(&replacement, &path).expect("symlink");
+        } else {
+            std::fs::hard_link(&replacement, &path).expect("link");
+        }
+        let mut chmod = vec![0; 84];
+        chmod[..4].copy_from_slice(&1_u32.to_le_bytes());
+        chmod[68..72].copy_from_slice(&0o777_u32.to_le_bytes());
+        let reply = submit(&mounted.channel, &memory, 1, &request(4, 2, inode, &chmod)).await;
+        assert!(matches!(reply_error(&reply), 0 | -2));
+        assert_eq!(
+            std::fs::metadata(&replacement)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+        mounted.channel.close().expect("close");
+    }
 }

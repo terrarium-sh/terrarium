@@ -28,6 +28,8 @@ interface host {
     }
     set-mode: async func(descriptor: borrow<descriptor>, mode: u32) -> result<_, error>;
     get-mode: async func(descriptor: borrow<descriptor>) -> result<option<u32>, error>;
+    get-mode-at: async func(parent: borrow<descriptor>, name: string) -> result<option<u32>, error>;
+    set-mode-at: async func(parent: borrow<descriptor>, name: string, mode: u32) -> result<_, error>;
     statfs: async func(descriptor: borrow<descriptor>) -> result<filesystem-stat, error>;
 }
 
