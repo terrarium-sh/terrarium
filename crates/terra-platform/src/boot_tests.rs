@@ -94,7 +94,7 @@ async fn kernel_boots_directory_share() {
         permissions.set_mode(0o755);
         std::fs::set_permissions(&executable, permissions).unwrap();
     }
-    let tag = terra_runtime::component::fs::host::share_tag(0);
+    let tag = terra_runtime::component::fs::share_tag(0);
     let encoded = boot_plan(PlanMode::Run, Vec::new(), vec!["/bin/true".into()], false);
     let mut plan: Plan = read_frame(&mut encoded.as_slice()).unwrap().unwrap();
     plan.on_start.push("set -ex; test $(/work/script) = executed; test $(cat /work/host-file) = host-data; printf guest-data >/work/guest-file; ln /work/guest-file /work/hardlink; ln -s guest-file /work/link; test $(cat /work/link) = guest-data; mv /work/guest-file /work/renamed; test $(cat /work/hardlink) = guest-data; cp /work/large-host /work/large-copy; cmp /work/large-host /work/large-copy; test $(wc -c </work/large-copy) = 65537; sync".into());
@@ -106,13 +106,12 @@ async fn kernel_boots_directory_share() {
     });
     let (kernel, boot_disk, root_disk) = kernel_boot_assets();
     let outcome = super::worker::run(super::worker::WorkerInput {
-        component_memory_limits: terra_runtime::box_runtime::store::ComponentMemoryLimits::default(
-        ),
+        component_memory_limits: terra_runtime::box_runtime::ComponentMemoryLimits::default(),
         kernel,
         boot_disk,
         root_disk: root_disk.to_path_buf(),
         volume_disks: Vec::new(),
-        shares: vec![terra_runtime::component::fs::host::ShareGrant::new(&mount, false).unwrap()],
+        shares: vec![terra_runtime::component::fs::ShareGrant::new(&mount, false).unwrap()],
         plan: encode_frame(&plan).unwrap(),
         artifacts: crate::test_support::artifacts::trusted_artifacts(),
         network_policy: boot_network_policy(),
@@ -180,8 +179,7 @@ async fn kernel_boots_to_agent_ready() {
     };
     let (kernel, boot_disk, root_path) = kernel_boot_assets();
     let outcome = super::worker::run(super::worker::WorkerInput {
-        component_memory_limits: terra_runtime::box_runtime::store::ComponentMemoryLimits::default(
-        ),
+        component_memory_limits: terra_runtime::box_runtime::ComponentMemoryLimits::default(),
         kernel,
         boot_disk,
         root_disk: root_path.to_path_buf(),
@@ -218,8 +216,7 @@ async fn kernel_reports_free_pages_after_boot() {
     };
     let (kernel, boot_disk, root_path) = kernel_boot_assets();
     let outcome = super::worker::run(super::worker::WorkerInput {
-        component_memory_limits: terra_runtime::box_runtime::store::ComponentMemoryLimits::default(
-        ),
+        component_memory_limits: terra_runtime::box_runtime::ComponentMemoryLimits::default(),
         kernel,
         boot_disk,
         root_disk: root_path.to_path_buf(),
@@ -514,8 +511,7 @@ async fn kernel_boots_to_agent_bridge() {
     let client_path = socket_path.clone();
     let client = tokio::task::spawn_blocking(move || assert_agent_control_and_exec(&client_path));
     let worker = super::worker::run(super::worker::WorkerInput {
-        component_memory_limits: terra_runtime::box_runtime::store::ComponentMemoryLimits::default(
-        ),
+        component_memory_limits: terra_runtime::box_runtime::ComponentMemoryLimits::default(),
         kernel,
         boot_disk,
         root_disk: root_path.to_path_buf(),
@@ -559,8 +555,7 @@ async fn kernel_boots_and_agent_stop_ends_workload() {
         control_writer.write_all(&[terra_protocol::STOP_SIGNAL])
     });
     let worker = super::worker::run(super::worker::WorkerInput {
-        component_memory_limits: terra_runtime::box_runtime::store::ComponentMemoryLimits::default(
-        ),
+        component_memory_limits: terra_runtime::box_runtime::ComponentMemoryLimits::default(),
         kernel,
         boot_disk,
         root_disk: root_path.to_path_buf(),
@@ -605,8 +600,7 @@ async fn kernel_boots_foreground_session_reports_workload_exit() {
     let client_path = socket_path.clone();
     let client = tokio::task::spawn_blocking(move || await_foreground_workload(&client_path));
     let worker = super::worker::run(super::worker::WorkerInput {
-        component_memory_limits: terra_runtime::box_runtime::store::ComponentMemoryLimits::default(
-        ),
+        component_memory_limits: terra_runtime::box_runtime::ComponentMemoryLimits::default(),
         kernel,
         boot_disk,
         root_disk: root_path.to_path_buf(),
@@ -673,8 +667,7 @@ async fn assert_policy_dns_http(address: std::net::IpAddr, body: &[u8]) {
         Ok::<(), std::io::Error>(())
     });
     let worker = super::worker::run(super::worker::WorkerInput {
-        component_memory_limits: terra_runtime::box_runtime::store::ComponentMemoryLimits::default(
-        ),
+        component_memory_limits: terra_runtime::box_runtime::ComponentMemoryLimits::default(),
         kernel,
         boot_disk,
         root_disk: root_path.to_path_buf(),
@@ -718,8 +711,7 @@ async fn assert_policy_dns_upload(address: std::net::IpAddr, bytes: usize) {
         Ok::<(), std::io::Error>(())
     });
     let worker = super::worker::run(super::worker::WorkerInput {
-        component_memory_limits: terra_runtime::box_runtime::store::ComponentMemoryLimits::default(
-        ),
+        component_memory_limits: terra_runtime::box_runtime::ComponentMemoryLimits::default(),
         kernel,
         boot_disk,
         root_disk: root_path.to_path_buf(),
@@ -831,7 +823,7 @@ async fn assert_published_loopback_http(host_closes_first: bool) {
         Ok::<Vec<u8>, std::io::Error>(response)
     });
     let worker = super::worker::run(super::worker::WorkerInput {
-        component_memory_limits: terra_runtime::box_runtime::store::ComponentMemoryLimits::default(),
+        component_memory_limits: terra_runtime::box_runtime::ComponentMemoryLimits::default(),
         kernel,
         boot_disk,
         root_disk: root_path.to_path_buf(),

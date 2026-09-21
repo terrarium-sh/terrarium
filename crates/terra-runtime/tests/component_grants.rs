@@ -4,7 +4,7 @@
 mod support;
 
 use terra_runtime::component::block::host::{BlockHost, block_component_linker};
-use terra_runtime::component::fs::host::fs_component_linker;
+use terra_runtime::component::fs::fs_component_linker;
 use terra_runtime::component::mem::host::mem_component_linker;
 use terra_runtime::component::network::host::{NetworkHost, network_component_linker};
 use terra_runtime::component::vsock::host::{VsockDeviceHost, vsock_component_linker};
@@ -84,7 +84,7 @@ fn wasi_filesystem_and_socket_resources_are_device_specific() {
             false,
         );
         assert_resource(
-            &fs_component_linker::<terra_runtime::component::fs::host::FsHost>(&engine)
+            &fs_component_linker::<terra_runtime::component::fs::FsHost>(&engine)
                 .expect("component linker"),
             &engine,
             interface,
@@ -120,7 +120,7 @@ fn host_service_clients_are_exclusive_to_vsock() {
         false,
     );
     assert_resource(
-        &fs_component_linker::<terra_runtime::component::fs::host::FsHost>(&engine)
+        &fs_component_linker::<terra_runtime::component::fs::FsHost>(&engine)
             .expect("filesystem linker"),
         &engine,
         interface,
@@ -178,7 +178,7 @@ fn component_linkers_exclude_ungranted_interfaces() {
         "network",
     );
     assert_components(
-        &fs_component_linker::<terra_runtime::component::fs::host::FsHost>(&engine)
+        &fs_component_linker::<terra_runtime::component::fs::FsHost>(&engine)
             .expect("component linker"),
         &engine,
         "fs",
@@ -243,7 +243,7 @@ fn only_vmm_receives_virtual_machine_and_vcpu_resources() {
             false,
         );
         assert_resource(
-            &fs_component_linker::<terra_runtime::component::fs::host::FsHost>(&engine)
+            &fs_component_linker::<terra_runtime::component::fs::FsHost>(&engine)
                 .expect("filesystem linker"),
             &engine,
             interface,
@@ -299,7 +299,7 @@ fn assert_random_grants<T: 'static>(
 
 #[test]
 fn only_vsock_receives_secure_random_and_no_component_receives_insecure_random() {
-    use terra_runtime::box_runtime::store::StoreState;
+    use terra_runtime::box_runtime::StoreState;
 
     let engine = device_engine().expect("device engine");
     assert_random_grants(
@@ -313,7 +313,7 @@ fn only_vsock_receives_secure_random_and_no_component_receives_insecure_random()
         false,
     );
     assert_random_grants(
-        &fs_component_linker::<terra_runtime::component::fs::host::FsHost>(&engine)
+        &fs_component_linker::<terra_runtime::component::fs::FsHost>(&engine)
             .expect("filesystem linker"),
         &engine,
         false,

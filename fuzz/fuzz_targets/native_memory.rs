@@ -5,8 +5,7 @@ use libfuzzer_sys::fuzz_target;
 use terra_runtime::component::bindings::memory::Host;
 use terra_runtime::component::context::DeviceContext;
 use terra_runtime::component::vmm::{
-    boot::BootEntry,
-    virtualization::{Architecture, MachineConfig, PreparedMachine, VirtualMachine},
+    Architecture, BootEntry, MachineConfig, PreparedMachine, VirtualMachine,
 };
 use terra_runtime::memory::GuestRam;
 

@@ -3,14 +3,13 @@ use crate::worker::{self, PreparedVmm, WorkerInput};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use terra_runtime::component::vmm::virtualization::{PreparedMachine, StartedVcpus};
-use terra_runtime::component::vmm::{Exit, platform};
+use terra_runtime::component::vmm::{Exit, PreparedMachine, StartedVcpus, platform};
 use terra_runtime::memory::WindowsRam;
 
 fn launch_vcpus(
     partition: Arc<crate::windows::whp::Partition>,
     controls: Vec<terra_runtime::component::vmm::NativeVcpu>,
-    boot: terra_runtime::component::vmm::boot::BootEntry,
+    boot: terra_runtime::component::vmm::BootEntry,
     hard_stop: Option<fn() -> !>,
 ) -> Result<StartedVcpus, String> {
     crate::windows::aarch64::setup_bsp(&partition, boot.entry, boot.boot_argument)

@@ -6,8 +6,7 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use terra_runtime::box_runtime::BoxRuntime;
-use terra_runtime::box_runtime::store::BoxHost;
+use terra_runtime::box_runtime::{BoxHost, BoxRuntime};
 use terra_runtime::component::Interrupt;
 use terra_runtime::component::vsock::VsockChannel;
 use terra_runtime::engine::device_engine;

@@ -118,8 +118,7 @@ fn read_allocated_bytes(file: &std::fs::File) -> u64 {
 #[test]
 fn boot_results_require_mapped_aligned_addresses_and_one_acceptance() {
     use terra_runtime::component::vmm::{
-        boot::BootEntry,
-        virtualization::{Architecture, MachineConfig, PreparedMachine, VirtualMachine},
+        Architecture, BootEntry, MachineConfig, PreparedMachine, VirtualMachine,
     };
     struct Machine(terra_runtime::memory::GuestRam);
     impl VirtualMachine for Machine {

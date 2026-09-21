@@ -37,7 +37,7 @@ pub const GIC_LAYOUT: GicLayout = GicLayout {
     redistributor_size: GIC_REDIST_SIZE,
 };
 
-pub use terra_runtime::component::vmm::bindings::machine::{Device, DeviceKind};
+pub use terra_runtime::component::vmm::{Device, DeviceKind};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Layout {
@@ -59,10 +59,10 @@ impl Layout {
     pub fn machine_config(
         &self,
         vcpus: usize,
-    ) -> wasmtime::Result<terra_runtime::component::vmm::virtualization::MachineConfig> {
-        use terra_runtime::component::vmm::virtualization;
-        virtualization::MachineConfig::new(
-            virtualization::Architecture::Arm,
+    ) -> wasmtime::Result<terra_runtime::component::vmm::MachineConfig> {
+        use terra_runtime::component::vmm;
+        vmm::MachineConfig::new(
+            vmm::Architecture::Arm,
             self.ram_size,
             u8::try_from(vcpus)?,
             self.devices.clone(),

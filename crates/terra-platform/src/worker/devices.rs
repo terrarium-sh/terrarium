@@ -6,14 +6,14 @@ use std::path::PathBuf;
 pub(crate) fn assemble_devices(
     runtime: &mut terra_runtime::box_runtime::BoxRuntime,
     input: &mut WorkerInput,
-    ram: terra_runtime::component::vmm::virtualization::RamGrant,
+    ram: terra_runtime::component::vmm::RamGrant,
     disks: &[(PathBuf, bool)],
     bind_interrupt: impl Fn(
-        terra_runtime::component::vmm::bindings::machine::DeviceKind,
+        terra_runtime::component::vmm::DeviceKind,
         usize,
     ) -> Result<terra_runtime::component::network::Interrupt, String>,
 ) -> Result<(), String> {
-    use terra_runtime::component::vmm::bindings::machine::DeviceKind;
+    use terra_runtime::component::vmm::DeviceKind;
     blocks(runtime, ram.clone(), input, disks, |index| {
         bind_interrupt(DeviceKind::Block, index)
     })?;
@@ -45,7 +45,7 @@ pub(crate) fn disk_paths(input: &WorkerInput) -> Vec<(PathBuf, bool)> {
 
 fn blocks(
     runtime: &mut terra_runtime::box_runtime::BoxRuntime,
-    ram: impl Into<terra_runtime::component::vmm::virtualization::RamGrant> + Send,
+    ram: impl Into<terra_runtime::component::vmm::RamGrant> + Send,
     input: &mut WorkerInput,
     disks: &[(PathBuf, bool)],
     interrupt: impl Fn(usize) -> Result<terra_runtime::component::block::Interrupt, String>,
@@ -92,7 +92,7 @@ fn blocks(
 
 fn network(
     runtime: &mut terra_runtime::box_runtime::BoxRuntime,
-    ram: impl Into<terra_runtime::component::vmm::virtualization::RamGrant> + Send,
+    ram: impl Into<terra_runtime::component::vmm::RamGrant> + Send,
     input: &WorkerInput,
     interrupt: terra_runtime::component::network::Interrupt,
 ) -> Result<terra_runtime::component::DeviceChannel, String> {
@@ -119,7 +119,7 @@ fn network(
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn filesystems(
     runtime: &mut terra_runtime::box_runtime::BoxRuntime,
-    ram: impl Into<terra_runtime::component::vmm::virtualization::RamGrant> + Send,
+    ram: impl Into<terra_runtime::component::vmm::RamGrant> + Send,
     input: &WorkerInput,
     interrupt: impl Fn(usize) -> Result<terra_runtime::component::network::Interrupt, String>,
 ) -> Result<Vec<terra_runtime::component::DeviceChannel>, String> {
@@ -144,12 +144,12 @@ fn filesystems(
         );
     }
     let mut grants = input.shares.clone();
-    terra_runtime::component::fs::host::share_notification_budgets(&mut grants);
+    terra_runtime::component::fs::share_notification_budgets(&mut grants);
     for (index, grant) in grants.into_iter().enumerate() {
         let ram = ram.clone();
         let host = move || {
             Ok(
-                terra_runtime::component::fs::host::FsHost::with_resource_capacity(
+                terra_runtime::component::fs::FsHost::with_resource_capacity(
                     DeviceContext::with_ram(ram.resolve()?),
                     grant,
                     resource_capacity,
@@ -160,7 +160,7 @@ fn filesystems(
             runtime,
             host,
             &component,
-            &terra_runtime::component::fs::host::share_tag(index),
+            &terra_runtime::component::fs::share_tag(index),
             max_nodes,
             interrupt(index)?,
         )
@@ -190,7 +190,7 @@ fn filesystem_resource_capacity_for(limit: usize, shares: usize) -> usize {
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn memory(
     runtime: &mut terra_runtime::box_runtime::BoxRuntime,
-    ram: impl Into<terra_runtime::component::vmm::virtualization::RamGrant> + Send,
+    ram: impl Into<terra_runtime::component::vmm::RamGrant> + Send,
     input: &WorkerInput,
     interrupt: terra_runtime::component::network::Interrupt,
 ) -> Result<terra_runtime::component::DeviceChannel, String> {
@@ -209,7 +209,7 @@ fn memory(
 
 fn vsock(
     runtime: &mut terra_runtime::box_runtime::BoxRuntime,
-    ram: impl Into<terra_runtime::component::vmm::virtualization::RamGrant> + Send,
+    ram: impl Into<terra_runtime::component::vmm::RamGrant> + Send,
     input: &mut WorkerInput,
     interrupt: terra_runtime::component::network::Interrupt,
 ) -> Result<terra_runtime::component::vsock::VsockChannel, String> {
@@ -263,8 +263,7 @@ mod tests {
             )
         };
         let input = super::WorkerInput {
-            component_memory_limits:
-                terra_runtime::box_runtime::store::ComponentMemoryLimits::default(),
+            component_memory_limits: terra_runtime::box_runtime::ComponentMemoryLimits::default(),
             kernel: Vec::new(),
             boot_disk: Vec::new(),
             root_disk: std::path::PathBuf::new(),
@@ -285,7 +284,7 @@ mod tests {
         let engine = terra_runtime::engine::device_engine().unwrap();
         let mut runtime = terra_runtime::box_runtime::BoxRuntime::new(
             &engine,
-            terra_runtime::box_runtime::store::BoxHost::new(),
+            terra_runtime::box_runtime::BoxHost::new(),
         )
         .unwrap();
         let shares = super::filesystems(

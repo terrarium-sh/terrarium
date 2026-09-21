@@ -24,7 +24,7 @@ pub(super) struct Machine {
     irqs: Vec<u32>,
 }
 
-impl terra_runtime::component::vmm::virtualization::VirtualMachine for Machine {
+impl terra_runtime::component::vmm::VirtualMachine for Machine {
     fn memory(&self) -> wasmtime::Result<GuestRam> {
         GuestRam::from_shared(self.ram())
             .ok_or_else(|| wasmtime::Error::msg("aliasing ARM KVM RAM"))
@@ -34,7 +34,7 @@ impl terra_runtime::component::vmm::virtualization::VirtualMachine for Machine {
 impl Machine {
     pub(super) fn new(
         kvm: &Kvm,
-        config: &terra_runtime::component::vmm::virtualization::MachineConfig,
+        config: &terra_runtime::component::vmm::MachineConfig,
     ) -> Result<Self, ArmWorkerError> {
         let ram_bytes = config.ram_bytes();
         let ram_size = usize::try_from(ram_bytes).map_err(|_| ArmWorkerError::Memory)?;

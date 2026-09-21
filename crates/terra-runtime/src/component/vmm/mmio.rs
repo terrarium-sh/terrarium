@@ -24,7 +24,8 @@ impl FailureObservation {
     }
 }
 
-use super::bindings::types::{ControlReply, Error, Operation, Reply, Request, RoutedReply};
+use super::bindings::types::{ControlReply, Error, RoutedReply};
+pub use super::bindings::types::{DeviceError, Operation, Reply, Request};
 use super::bindings::{Vmm, exports, lifecycle_platform};
 pub type Serve = TypedFunc<(StreamReader<Request>,), (StreamReader<Reply>,)>;
 type Access = TypedFunc<(u64, u8, u64, bool), (Result<RoutedReply, Error>,)>;

@@ -16,7 +16,7 @@ const VOLUME_IRQS: [u32; 3] = [20, 21, 22];
 pub const IRQ_BASE: u32 = BOOT_IRQ;
 pub const MAX_VCPUS: usize = terra_limits::X86_MAX_VCPUS as usize;
 
-pub use terra_runtime::component::vmm::bindings::machine::{Device, DeviceKind};
+pub use terra_runtime::component::vmm::{Device, DeviceKind};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Layout {
@@ -38,10 +38,10 @@ impl Layout {
     pub fn machine_config(
         &self,
         vcpus: usize,
-    ) -> wasmtime::Result<terra_runtime::component::vmm::virtualization::MachineConfig> {
-        use terra_runtime::component::vmm::virtualization;
-        virtualization::MachineConfig::new(
-            virtualization::Architecture::X86,
+    ) -> wasmtime::Result<terra_runtime::component::vmm::MachineConfig> {
+        use terra_runtime::component::vmm;
+        vmm::MachineConfig::new(
+            vmm::Architecture::X86,
             self.ram_size,
             u8::try_from(vcpus)?,
             self.devices.clone(),

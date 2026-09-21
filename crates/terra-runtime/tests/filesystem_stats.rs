@@ -1,7 +1,7 @@
 #![allow(clippy::expect_used)]
 
 use terra_runtime::component::context::DeviceContext;
-use terra_runtime::component::fs::host::{FsHost, ShareGrant};
+use terra_runtime::component::fs::{FsHost, ShareGrant};
 use wasmtime::component::Resource;
 use wasmtime_wasi::p3::bindings::filesystem::preopens::Host as _;
 

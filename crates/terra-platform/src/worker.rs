@@ -17,13 +17,13 @@ pub struct WorkerInput {
     pub root_disk: PathBuf,
     pub volume_disks: Vec<PathBuf>,
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-    pub shares: Vec<terra_runtime::component::fs::host::ShareGrant>,
+    pub shares: Vec<terra_runtime::component::fs::ShareGrant>,
     pub plan: Vec<u8>,
     pub artifacts: terra_runtime::TrustedArtifacts,
     pub network_policy: terra_network::PolicyHandle,
     pub port_mappings: Vec<terra_network::PortMapping>,
     pub ram_bytes: u64,
-    pub component_memory_limits: terra_runtime::box_runtime::store::ComponentMemoryLimits,
+    pub component_memory_limits: terra_runtime::box_runtime::ComponentMemoryLimits,
     pub vcpus: usize,
     pub deadline: Option<Duration>,
     pub hard_stop: Option<fn() -> !>,
@@ -37,21 +37,17 @@ pub(crate) fn create_runtime(
 ) -> wasmtime::Result<terra_runtime::box_runtime::BoxRuntime> {
     terra_runtime::box_runtime::BoxRuntime::new(
         &terra_runtime::engine::device_engine()?,
-        terra_runtime::box_runtime::store::BoxHost::with_memory_limits(
-            input.component_memory_limits,
-        ),
+        terra_runtime::box_runtime::BoxHost::with_memory_limits(input.component_memory_limits),
     )
 }
 
-pub(crate) async fn boot_prepared<
-    M: terra_runtime::component::vmm::virtualization::VirtualMachine,
->(
+pub(crate) async fn boot_prepared<M: terra_runtime::component::vmm::VirtualMachine>(
     mut runtime: terra_runtime::box_runtime::BoxRuntime,
-    mut prepared: terra_runtime::component::vmm::virtualization::PreparedMachine<M>,
+    mut prepared: terra_runtime::component::vmm::PreparedMachine<M>,
     input: &mut WorkerInput,
 ) -> wasmtime::Result<(
     terra_runtime::box_runtime::BoxRuntime,
-    terra_runtime::component::vmm::virtualization::MachineHandle<M>,
+    terra_runtime::component::vmm::MachineHandle<M>,
 )> {
     let boot = input.artifacts.boot().deserialize(runtime.store.engine())?;
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
@@ -91,7 +87,7 @@ pub struct PreparedVmm {
 }
 
 pub struct VmmObservation {
-    reaper: terra_runtime::component::vmm::virtualization::VcpuReaper,
+    reaper: terra_runtime::component::vmm::VcpuReaper,
     lifecycle: terra_runtime::component::vmm::lifecycle::LifecycleNotifier,
     deadline: Option<Duration>,
     failure: terra_runtime::component::vmm::mmio::FailureObservation,
@@ -103,9 +99,8 @@ pub(crate) async fn finish_preparation(
     deadline: Option<Duration>,
     start: impl FnOnce(
         Vec<terra_runtime::component::vmm::NativeVcpu>,
-        terra_runtime::component::vmm::boot::BootEntry,
-    )
-        -> wasmtime::Result<terra_runtime::component::vmm::virtualization::StartedVcpus>
+        terra_runtime::component::vmm::BootEntry,
+    ) -> wasmtime::Result<terra_runtime::component::vmm::StartedVcpus>
     + Send
     + 'static,
 ) -> wasmtime::Result<PreparedVmm> {
@@ -223,12 +218,10 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     async fn prepared_vmm_observes_wasi_startup_and_shutdown() {
         use std::sync::Arc;
-        use terra_runtime::component::vmm::bindings::machine::{Device, DeviceKind};
-        use terra_runtime::component::vmm::virtualization::{Architecture, MachineConfig};
-
         use terra_runtime::component::context::DeviceContext;
-        use terra_runtime::component::vmm::virtualization::{
-            PreparedMachine, StartedVcpus, VirtualMachine,
+        use terra_runtime::component::vmm::{
+            Architecture, Device, DeviceKind, MachineConfig, PreparedMachine, StartedVcpus,
+            VirtualMachine,
         };
 
         struct TestVm(terra_runtime::memory::GuestRam);
@@ -240,7 +233,7 @@ mod tests {
         let engine = terra_runtime::engine::device_engine().unwrap();
         let mut runtime = terra_runtime::box_runtime::BoxRuntime::new(
             &engine,
-            terra_runtime::box_runtime::store::BoxHost::new(),
+            terra_runtime::box_runtime::BoxHost::new(),
         )
         .unwrap();
         let component =
@@ -312,7 +305,7 @@ mod tests {
         let delivered = Arc::clone(&injections);
         let interrupt = machine
             .bind_interrupt(
-                terra_runtime::component::vmm::bindings::machine::DeviceKind::Memory,
+                terra_runtime::component::vmm::DeviceKind::Memory,
                 0,
                 move |_, irq, level| {
                     assert_eq!(irq, 15);
@@ -324,7 +317,7 @@ mod tests {
             .unwrap();
         let _ = machine.machine();
         let denied = machine.bind_interrupt(
-            terra_runtime::component::vmm::bindings::machine::DeviceKind::Memory,
+            terra_runtime::component::vmm::DeviceKind::Memory,
             1,
             |_, _, _| panic!("ungranted interrupt"),
         );
@@ -367,7 +360,7 @@ mod tests {
 
     #[tokio::test]
     async fn timed_out_device_close_does_not_start_later_devices() {
-        use terra_runtime::component::vmm::bindings::machine::DeviceKind;
+        use terra_runtime::component::vmm::DeviceKind;
         use terra_runtime::component::vmm::teardown::DeviceShutdown;
 
         let (release, released) = std::sync::mpsc::channel();
@@ -384,7 +377,7 @@ mod tests {
         let engine = terra_runtime::engine::device_engine().unwrap();
         let mut runtime = terra_runtime::box_runtime::BoxRuntime::new(
             &engine,
-            terra_runtime::box_runtime::store::BoxHost::new(),
+            terra_runtime::box_runtime::BoxHost::new(),
         )
         .unwrap();
         runtime.add_device_shutdown(first).unwrap();

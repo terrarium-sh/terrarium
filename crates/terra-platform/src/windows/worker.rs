@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use terra_runtime::component::vmm::virtualization::StartedVcpus;
+use terra_runtime::component::vmm::StartedVcpus;
 
 const STOP_DEADLINE: Duration = Duration::from_secs(5);
 

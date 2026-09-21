@@ -5,8 +5,7 @@ mod support;
 
 use std::time::{Duration, Instant};
 
-use terra_runtime::box_runtime::store::BoxHost;
-use terra_runtime::box_runtime::{BoxRuntime, BoxRuntimeHandle};
+use terra_runtime::box_runtime::{BoxHost, BoxRuntime, BoxRuntimeHandle};
 use terra_runtime::component::Interrupt;
 use terra_runtime::component::context::DeviceContext;
 use terra_runtime::engine::device_engine;

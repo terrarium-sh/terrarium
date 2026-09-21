@@ -46,21 +46,19 @@ pub struct Components {
 impl Default for Components {
     fn default() -> Self {
         Self {
-            memory_mib: terra_runtime::box_runtime::store::DEFAULT_COMPONENT_MEMORY_MIB,
-            total_memory_mib: terra_runtime::box_runtime::store::DEFAULT_TOTAL_MEMORY_MIB,
+            memory_mib: terra_runtime::box_runtime::DEFAULT_COMPONENT_MEMORY_MIB,
+            total_memory_mib: terra_runtime::box_runtime::DEFAULT_TOTAL_MEMORY_MIB,
         }
     }
 }
 
 impl Components {
-    pub fn memory_limits(
-        &self,
-    ) -> Result<terra_runtime::box_runtime::store::ComponentMemoryLimits> {
+    pub fn memory_limits(&self) -> Result<terra_runtime::box_runtime::ComponentMemoryLimits> {
         let component_bytes = usize::try_from(u64::from(self.memory_mib) << 20)
             .context("components.memory_mib is too large for this host")?;
         let total_bytes = usize::try_from(u64::from(self.total_memory_mib) << 20)
             .context("components.total_memory_mib is too large for this host")?;
-        terra_runtime::box_runtime::store::ComponentMemoryLimits::new(component_bytes, total_bytes)
+        terra_runtime::box_runtime::ComponentMemoryLimits::new(component_bytes, total_bytes)
             .map_err(|error| anyhow::anyhow!("{error}"))
             .context("set components.memory_mib > 0 and components.total_memory_mib >= components.memory_mib")
     }

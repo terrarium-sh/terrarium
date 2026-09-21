@@ -1,6 +1,6 @@
 //! Linux/KVM `AArch64` worker backed by scoped WASI VMM components.
 
-use terra_runtime::component::vmm::virtualization::{PreparedMachine, StartedVcpus};
+use terra_runtime::component::vmm::{PreparedMachine, StartedVcpus};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
@@ -77,7 +77,7 @@ struct VcpuRunner {
 enum VcpuCommand {
     Start {
         component: NativeVcpu,
-        boot: Option<terra_runtime::component::vmm::boot::BootEntry>,
+        boot: Option<terra_runtime::component::vmm::BootEntry>,
     },
     Stop,
 }
@@ -158,7 +158,7 @@ impl VcpuRunner {
     fn start(
         &self,
         component: NativeVcpu,
-        boot: Option<terra_runtime::component::vmm::boot::BootEntry>,
+        boot: Option<terra_runtime::component::vmm::BootEntry>,
     ) -> Result<(), ArmWorkerError> {
         self.command
             .send(VcpuCommand::Start { component, boot })
@@ -271,7 +271,7 @@ impl VcpuGroup {
     fn start(
         self,
         controls: Vec<NativeVcpu>,
-        boot: terra_runtime::component::vmm::boot::BootEntry,
+        boot: terra_runtime::component::vmm::BootEntry,
     ) -> Result<StartedVcpus, ArmWorkerError> {
         if self.runners.len() != controls.len() {
             return Err(ArmWorkerError::BadVcpuCount(controls.len()));

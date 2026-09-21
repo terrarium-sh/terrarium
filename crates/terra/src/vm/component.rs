@@ -19,7 +19,7 @@ use terra_protocol::{
     to_volume_device,
 };
 use terra_runtime::TrustedArtifacts;
-use terra_runtime::component::fs::host::{ShareGrant, share_tag};
+use terra_runtime::component::fs::{ShareGrant, share_tag};
 
 #[allow(unsafe_code)]
 const ARTIFACTS: TrustedArtifacts = {

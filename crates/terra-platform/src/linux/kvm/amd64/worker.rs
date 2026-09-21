@@ -2,7 +2,7 @@
 
 #![allow(unsafe_code)]
 
-use terra_runtime::component::vmm::virtualization::{PreparedMachine, StartedVcpus};
+use terra_runtime::component::vmm::{PreparedMachine, StartedVcpus};
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -118,7 +118,7 @@ pub(super) fn build_cpuid(
 enum VcpuCommand {
     Start(
         terra_runtime::component::vmm::NativeVcpu,
-        terra_runtime::component::vmm::boot::BootEntry,
+        terra_runtime::component::vmm::BootEntry,
     ),
     Stop,
 }
@@ -178,7 +178,7 @@ impl PreparedVcpuGroup {
     fn start(
         mut self,
         workers: Vec<terra_runtime::component::vmm::NativeVcpu>,
-        boot: terra_runtime::component::vmm::boot::BootEntry,
+        boot: terra_runtime::component::vmm::BootEntry,
     ) -> Result<StartedVcpus, KvmError> {
         if workers.len() != self.senders.len() {
             return Err(KvmError::ThreadGone);

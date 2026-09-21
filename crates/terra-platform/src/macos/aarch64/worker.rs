@@ -2,8 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Instant;
-use terra_runtime::component::vmm::virtualization::{PreparedMachine, StartedVcpus};
-use terra_runtime::component::vmm::{NativeVcpu, boot::BootEntry};
+use terra_runtime::component::vmm::{BootEntry, NativeVcpu, PreparedMachine, StartedVcpus};
 
 use crate::macos::aarch64::machine::{Cpu, Machine, RunExit};
 use crate::worker::{self, PreparedVmm, WorkerInput};

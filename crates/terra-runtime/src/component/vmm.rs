@@ -1,13 +1,20 @@
 //! Scoped hypervisor rendezvous for the long-running Wasm VMM.
 
-pub mod bindings;
-pub mod boot;
+pub(crate) mod bindings;
+pub(crate) mod boot;
 pub mod interrupts;
 pub mod lifecycle;
 pub mod mmio;
 pub mod reaper;
 pub mod teardown;
-pub mod virtualization;
+pub(crate) mod virtualization;
+
+pub use bindings::machine::{Device, DeviceKind};
+pub use boot::BootEntry;
+pub use virtualization::{
+    Architecture, MachineConfig, MachineHandle, PreparedMachine, RamGrant, StartedVcpus,
+    VcpuReaper, VirtualMachine,
+};
 
 use std::sync::{Arc, mpsc};
 use std::time::Duration;

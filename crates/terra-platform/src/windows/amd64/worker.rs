@@ -4,15 +4,15 @@ use crate::worker::{self, PreparedVmm, WorkerInput};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use terra_runtime::component::vmm::interrupts::{IoApicHandle, X86Interrupt};
-use terra_runtime::component::vmm::virtualization::{PreparedMachine, StartedVcpus};
-use terra_runtime::component::vmm::{Completion, NativeVcpu};
-use terra_runtime::component::vmm::{Exit, platform};
+use terra_runtime::component::vmm::{
+    Completion, Exit, NativeVcpu, PreparedMachine, StartedVcpus, platform,
+};
 use terra_runtime::memory::WindowsRam;
 
 fn launch_vcpus(
     partition: Arc<crate::windows::whp::Partition>,
     controls: Vec<NativeVcpu>,
-    boot: terra_runtime::component::vmm::boot::BootEntry,
+    boot: terra_runtime::component::vmm::BootEntry,
     ioapic: &IoApicHandle,
     hard_stop: Option<fn() -> !>,
 ) -> Result<StartedVcpus, String> {

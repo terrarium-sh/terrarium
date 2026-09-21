@@ -136,7 +136,7 @@ pub struct Partition {
     vcpus: Mutex<Vec<u32>>,
 }
 
-impl terra_runtime::component::vmm::virtualization::VirtualMachine for Partition {
+impl terra_runtime::component::vmm::VirtualMachine for Partition {
     fn memory(&self) -> wasmtime::Result<terra_runtime::memory::GuestRam> {
         terra_runtime::memory::GuestRam::from_windows_ram(Arc::clone(&self.memory))
             .ok_or_else(|| wasmtime::Error::msg("aliasing WHP guest RAM"))

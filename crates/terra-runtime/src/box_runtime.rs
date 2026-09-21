@@ -16,9 +16,13 @@ use wasmtime::component::Accessor;
 use wasmtime::{Engine, Store};
 
 pub(crate) mod setup;
-pub mod store;
+pub(crate) mod store;
 
-use store::{BoxHost, BoxMemoryBudget, StoreHost, StoreState};
+use store::BoxMemoryBudget;
+pub use store::{
+    BoxHost, ComponentMemoryLimits, DEFAULT_COMPONENT_MEMORY_MIB, DEFAULT_TOTAL_MEMORY_MIB,
+    RootHost, StoreHost, StoreState,
+};
 
 pub const BOX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_BOX_COMPONENTS: usize = terra_limits::MAX_DEVICES;
