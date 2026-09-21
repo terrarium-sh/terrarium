@@ -14,10 +14,10 @@ use std::sync::{Arc, mpsc};
 use std::time::Duration;
 use wasmtime::component::{Accessor, Resource, ResourceTable};
 
-use crate::BoundedMemory;
 use crate::box_runtime::BoxHost;
 pub use crate::component::vmm::mmio::terra::mmio::platform;
 pub use crate::component::vmm::mmio::terra::mmio::platform::{Completion, Error, Exit};
+use crate::memory::BoundedMemory;
 
 const MAX_VCPUS: usize = terra_limits::X86_MAX_VCPUS as usize;
 const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -94,7 +94,7 @@ fn vcpu_channel() -> (NativeVcpu, Vcpu) {
 fn accepts_completion(
     exit: &Exit,
     completion: &Completion,
-    completion_grant: Option<(&virtualization::MachineConfig, &crate::SyntheticRam)>,
+    completion_grant: Option<(&virtualization::MachineConfig, &crate::memory::GuestRam)>,
 ) -> bool {
     match exit {
         Exit::Halt | Exit::Interrupted | Exit::MmioWrite(_) | Exit::PioWrite(_) => {
@@ -114,7 +114,7 @@ fn accepts_completion(
 
 fn accepts_arm_completion(
     completion: &Completion,
-    completion_grant: Option<(&virtualization::MachineConfig, &crate::SyntheticRam)>,
+    completion_grant: Option<(&virtualization::MachineConfig, &crate::memory::GuestRam)>,
 ) -> bool {
     match completion {
         Completion::ArmRead(read) => read.register.is_none_or(|register| register < 31),
@@ -436,7 +436,7 @@ mod tests {
             None
         ));
 
-        let ram = crate::SyntheticRam::new(4096).unwrap();
+        let ram = crate::memory::GuestRam::new(4096).unwrap();
         let config = virtualization::MachineConfig::new(
             virtualization::Architecture::Arm,
             ram.size(),

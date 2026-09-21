@@ -168,7 +168,7 @@ pub fn check_available() -> Result<(), AvailabilityError> {
 /// A configured WHP partition with one contiguous guest-physical RAM range.
 pub struct Partition {
     handle: WHV_PARTITION_HANDLE,
-    memory: Arc<terra_runtime::WindowsRam>,
+    memory: Arc<terra_runtime::memory::WindowsRam>,
     vcpu_count: u32,
     mapped: bool,
     mapped_gpa: u64,
@@ -176,15 +176,15 @@ pub struct Partition {
 }
 
 impl terra_runtime::component::vmm::virtualization::VirtualMachine for Partition {
-    fn memory(&self) -> wasmtime::Result<terra_runtime::SyntheticRam> {
-        terra_runtime::SyntheticRam::from_windows_ram(Arc::clone(&self.memory))
+    fn memory(&self) -> wasmtime::Result<terra_runtime::memory::GuestRam> {
+        terra_runtime::memory::GuestRam::from_windows_ram(Arc::clone(&self.memory))
             .ok_or_else(|| wasmtime::Error::msg("aliasing WHP guest RAM"))
     }
 }
 
 impl Partition {
     pub fn new(
-        memory: Arc<terra_runtime::WindowsRam>,
+        memory: Arc<terra_runtime::memory::WindowsRam>,
         vcpu_count: u32,
     ) -> Result<Self, PartitionError> {
         check_available().map_err(PartitionError::Availability)?;
@@ -270,9 +270,9 @@ impl Partition {
         write: bool,
         data: &mut [u8],
     ) -> Result<(), PartitionError> {
-        let ram = terra_runtime::SyntheticRam::from_windows_ram(Arc::clone(&self.memory))
+        let ram = terra_runtime::memory::GuestRam::from_windows_ram(Arc::clone(&self.memory))
             .ok_or(PartitionError::InvalidMemorySize)?;
-        let memory = terra_runtime::BoundedMemory::new(&ram);
+        let memory = terra_runtime::memory::BoundedMemory::new(&ram);
         if write {
             memory
                 .write(address, data)
@@ -1089,7 +1089,7 @@ mod tests {
             ],
         };
         assert_eq!(input.values.as_ptr().addr() % 16, 8);
-        let ram = terra_runtime::WindowsRam::allocate(2 << 20).unwrap();
+        let ram = terra_runtime::memory::WindowsRam::allocate(2 << 20).unwrap();
         let partition = Partition::new(ram, 1).unwrap();
         partition.create_vcpu(0).unwrap();
         let names = [WHvX64RegisterRax, WHvX64RegisterRbx];

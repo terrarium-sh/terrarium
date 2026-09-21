@@ -1,6 +1,69 @@
 //! Host disk capabilities for the Wasm block device.
 
-use crate::BoundedDisk;
+use crate::MAX_BATCH_BYTES;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiskError {
+    OutOfRange,
+    ReadOnly,
+    TooLarge,
+}
+
+/// One disk grant: fixed capacity with the real read-only mode enforced
+/// on every mutation path, mirroring the native WASI wrapper.
+pub struct BoundedDisk {
+    data: Vec<u8>,
+    readonly: bool,
+}
+
+impl BoundedDisk {
+    #[must_use]
+    pub fn new(capacity: usize, readonly: bool) -> Self {
+        Self {
+            data: vec![0u8; capacity],
+            readonly,
+        }
+    }
+
+    #[must_use]
+    pub fn from_readonly_bytes(data: Vec<u8>) -> Self {
+        Self {
+            data,
+            readonly: true,
+        }
+    }
+
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.data.len()
+    }
+
+    pub fn read(&self, offset: usize, len: usize) -> Result<&[u8], DiskError> {
+        let end = offset.checked_add(len).ok_or(DiskError::OutOfRange)?;
+        let len_u64 = u64::try_from(len).map_err(|_| DiskError::OutOfRange)?;
+        if end > self.data.len() || len_u64 > MAX_BATCH_BYTES {
+            return Err(DiskError::OutOfRange);
+        }
+        Ok(&self.data[offset..end])
+    }
+
+    pub fn write(&mut self, offset: usize, buf: &[u8]) -> Result<(), DiskError> {
+        if self.readonly {
+            return Err(DiskError::ReadOnly);
+        }
+        let len_u64 = u64::try_from(buf.len()).map_err(|_| DiskError::TooLarge)?;
+        if len_u64 > MAX_BATCH_BYTES {
+            return Err(DiskError::TooLarge);
+        }
+        let end = offset.checked_add(buf.len()).ok_or(DiskError::OutOfRange)?;
+        if end > self.data.len() {
+            return Err(DiskError::OutOfRange);
+        }
+        self.data[offset..end].copy_from_slice(buf);
+        Ok(())
+    }
+}
+
 pub const STATUS_OK: u8 = 0;
 #[cfg(any(test, feature = "test-support"))]
 #[path = "reference.rs"]
@@ -92,8 +155,8 @@ impl BlockBacking for BoundedDisk {
     fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<(), BackingError> {
         let offset = usize::try_from(offset).map_err(|_| BackingError::OutOfRange)?;
         self.write(offset, buf).map_err(|error| match error {
-            crate::DiskError::ReadOnly => BackingError::ReadOnly,
-            _ => BackingError::OutOfRange,
+            DiskError::ReadOnly => BackingError::ReadOnly,
+            DiskError::OutOfRange | DiskError::TooLarge => BackingError::OutOfRange,
         })
     }
 

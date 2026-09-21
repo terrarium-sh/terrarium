@@ -9,7 +9,7 @@ use crate::box_runtime::BoxHost;
 use crate::box_runtime::{BoxRuntime, StoreState};
 use crate::component::vmm::machine::Device;
 use crate::component::vmm::virtualization::{Architecture, MachineConfig};
-use crate::{BoundedMemory, SyntheticRam};
+use crate::memory::{BoundedMemory, GuestRam};
 use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 wasmtime::component::bindgen!({
@@ -30,7 +30,7 @@ pub struct BootEntry {
 
 struct BootGrant {
     config: MachineConfig,
-    ram: SyntheticRam,
+    ram: GuestRam,
     kernel: Vec<u8>,
     remaining_kernel_copy_bytes: u64,
 }
@@ -73,7 +73,7 @@ impl BootHost {
     fn grant(
         &mut self,
         config: MachineConfig,
-        ram: SyntheticRam,
+        ram: GuestRam,
         kernel: Vec<u8>,
     ) -> wasmtime::Result<()> {
         wasmtime::ensure!(self.grant.is_none(), "boot capabilities already granted");
@@ -188,7 +188,7 @@ impl BoxRuntime {
         &self,
         component: &Component,
         config: &MachineConfig,
-        ram: SyntheticRam,
+        ram: GuestRam,
         kernel: Vec<u8>,
         command_line: &str,
     ) -> wasmtime::Result<BootEntry> {
@@ -268,7 +268,7 @@ mod tests {
         let engine = crate::engine::device_engine().expect("engine");
         let runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
         let component = hostile_component(&engine, "unreachable");
-        let ram = SyntheticRam::new(2 << 20).expect("test RAM");
+        let ram = GuestRam::new(2 << 20).expect("test RAM");
         let config = MachineConfig::new(Architecture::X86, ram.size(), 1, Vec::new())
             .expect("test machine configuration");
 
@@ -286,7 +286,7 @@ mod tests {
         let engine = crate::engine::device_engine().expect("engine");
         let runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
         let component = hostile_component(&engine, "(loop br 0)");
-        let ram = SyntheticRam::new(2 << 20).expect("test RAM");
+        let ram = GuestRam::new(2 << 20).expect("test RAM");
         let config = MachineConfig::new(Architecture::X86, ram.size(), 1, Vec::new())
             .expect("test machine configuration");
 
@@ -310,7 +310,7 @@ mod tests {
             ),
         )
         .expect("boot component");
-        let ram = SyntheticRam::new(2 << 20).expect("test RAM");
+        let ram = GuestRam::new(2 << 20).expect("test RAM");
         let config = MachineConfig::new(Architecture::X86, ram.size(), 1, Vec::new())
             .expect("test machine configuration");
 
@@ -325,7 +325,7 @@ mod tests {
 
     #[test]
     fn kernel_copies_are_bounded_and_cannot_exceed_the_image_budget() {
-        let ram = SyntheticRam::new(4096).expect("test RAM");
+        let ram = GuestRam::new(4096).expect("test RAM");
         let config = MachineConfig::new(Architecture::X86, 4096, 1, Vec::new())
             .expect("test machine configuration");
         let mut host = BootHost::default();

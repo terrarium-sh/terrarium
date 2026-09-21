@@ -92,10 +92,12 @@ async fn create_worker(
 #[cfg(test)]
 mod tests {
 
+    use crate::component::block::backing::BoundedDisk;
     use crate::component::block::backing::DiskGrant;
     use crate::component::block::host::BlockHost;
     use crate::engine::device_engine;
-    use crate::{BoundedDisk, BoundedMemory, SyntheticRam};
+    use crate::memory::BoundedMemory;
+    use crate::memory::GuestRam;
     #[cfg(any(test, feature = "test-support"))]
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -112,7 +114,7 @@ mod tests {
         )
         .expect("component compiles");
         let host = crate::component::block::host::BlockHost::new(
-            crate::SyntheticRam::new(64 * 1024).unwrap(),
+            crate::memory::GuestRam::new(64 * 1024).unwrap(),
             DiskGrant::Mem(BoundedDisk::new(4096, false)),
         );
 
@@ -154,7 +156,7 @@ mod tests {
             ),
         )
         .expect("component compiles");
-        let ram = SyntheticRam::new(64 * 1024).expect("RAM");
+        let ram = GuestRam::new(64 * 1024).expect("RAM");
         let mut runtime =
             crate::box_runtime::BoxRuntime::new(&engine, crate::box_runtime::BoxHost::new())
                 .expect("box runtime");
@@ -198,8 +200,10 @@ mod tests {
         let other_device = crate::component::block::instantiate_shared(
             &mut other_box,
             BlockHost::new(
-                crate::SyntheticRam::new(4096).unwrap(),
-                crate::component::block::backing::DiskGrant::Mem(crate::BoundedDisk::new(0, false)),
+                crate::memory::GuestRam::new(4096).unwrap(),
+                crate::component::block::backing::DiskGrant::Mem(
+                    crate::component::block::backing::BoundedDisk::new(0, false),
+                ),
             ),
             &component,
             false,
@@ -267,7 +271,7 @@ mod tests {
         )
         .unwrap();
         let mut host = crate::component::block::host::BlockHost::new(
-            crate::SyntheticRam::new(64 * 1024).unwrap(),
+            crate::memory::GuestRam::new(64 * 1024).unwrap(),
             DiskGrant::Mem(BoundedDisk::new(4096, false)),
         );
         let ram = host.context.guest_ram().clone();
@@ -304,15 +308,21 @@ mod tests {
         assert!(channel.failure().is_none());
         assert_eq!(channel.read(0, 4).unwrap(), 0x7472_6976u32.to_le_bytes());
         assert_eq!(
-            crate::BoundedMemory::new(&ram).read(0x3002, 2).unwrap(),
+            crate::memory::BoundedMemory::new(&ram)
+                .read(0x3002, 2)
+                .unwrap(),
             [0, 0]
         );
-        crate::BoundedMemory::new(&ram)
+        crate::memory::BoundedMemory::new(&ram)
             .write(0x2002, &258u16.to_le_bytes())
             .unwrap();
         channel.write(0x50, &0u32.to_le_bytes()).unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while crate::BoundedMemory::new(&ram).read(0x3002, 2).unwrap() != [1, 0] {
+            while crate::memory::BoundedMemory::new(&ram)
+                .read(0x3002, 2)
+                .unwrap()
+                != [1, 0]
+            {
                 assert!(channel.failure().is_none());
                 tokio::task::yield_now().await;
             }
@@ -332,7 +342,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let ram = SyntheticRam::new(64 * 1024).unwrap();
+        let ram = GuestRam::new(64 * 1024).unwrap();
         let memory = BoundedMemory::new(&ram);
         let host = crate::component::block::host::BlockHost::new(
             ram.clone(),

@@ -4,10 +4,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use terra_runtime::{
-    BoundedMemory, SyntheticRam,
     box_runtime::{BoxHost, BoxRuntime},
     component::{Interrupt, vsock::VsockChannel},
     engine::device_engine,
+    memory::{BoundedMemory, GuestRam},
 };
 use terra_vsock_device::{
     CONTROL_VSOCK_PORT, GUEST_CID, HOST_CID, VSOCK_HEADER_BYTES, VsockHeader,
@@ -179,7 +179,7 @@ async fn posted_receive_queue_drains_handshake_and_plan_without_a_second_bell() 
         include_bytes!("../../../components/target/wasm32-wasip3/release/terra_vmm_component.wasm"),
     )
     .expect("MMIO router");
-    let ram = SyntheticRam::new(256 * 1024).expect("RAM");
+    let ram = GuestRam::new(256 * 1024).expect("RAM");
     let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
     runtime.initialize_mmio(&router).await.expect("MMIO router");
     // SAFETY: this test embeds the build's trusted AOT vsock artifact.

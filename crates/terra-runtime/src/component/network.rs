@@ -203,7 +203,7 @@ mod tests {
 
     async fn wait_for_used(
         channel: &DeviceChannel,
-        memory: &crate::BoundedMemory<'_>,
+        memory: &crate::memory::BoundedMemory<'_>,
         expected: [u8; 2],
     ) {
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -271,7 +271,7 @@ mod tests {
             .await
             .expect("MMIO router");
         let host = crate::engine::DeviceContext::with_ram(
-            crate::SyntheticRam::new(64 * 1024).expect("RAM"),
+            crate::memory::GuestRam::new(64 * 1024).expect("RAM"),
         );
         let channel = crate::component::network::instantiate_shared(
             &mut runtime,
@@ -348,7 +348,7 @@ mod tests {
             channel.read(0, 4).expect("worker survives"),
             0x7472_6976u32.to_le_bytes()
         );
-        let memory = crate::BoundedMemory::new(&ram);
+        let memory = crate::memory::BoundedMemory::new(&ram);
         assert_eq!(memory.read(0x3002, 2).expect("used index"), [0, 0]);
         memory
             .write(0x2002, &258u16.to_le_bytes())

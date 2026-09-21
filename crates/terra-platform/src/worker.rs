@@ -238,9 +238,11 @@ pub(crate) fn blocks(
                 .map_err(|error| format!("opening block backing {}: {error}", path.display()))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let boot_disk = DiskGrant::Mem(terra_runtime::BoundedDisk::from_readonly_bytes(
-        std::mem::take(&mut input.boot_disk),
-    ));
+    let boot_disk = DiskGrant::Mem(
+        terra_runtime::component::block::backing::BoundedDisk::from_readonly_bytes(std::mem::take(
+            &mut input.boot_disk,
+        )),
+    );
     let disks = std::iter::once((boot_disk, true)).chain(disks);
     let ram = ram.into();
     let mut channels = Vec::with_capacity(2 + input.volume_disks.len());
@@ -429,9 +431,9 @@ mod tests {
         };
         use terra_runtime::engine::DeviceContext;
 
-        struct TestVm(terra_runtime::SyntheticRam);
+        struct TestVm(terra_runtime::memory::GuestRam);
         impl VirtualMachine for TestVm {
-            fn memory(&self) -> wasmtime::Result<terra_runtime::SyntheticRam> {
+            fn memory(&self) -> wasmtime::Result<terra_runtime::memory::GuestRam> {
                 Ok(self.0.clone())
             }
         }
@@ -466,7 +468,7 @@ mod tests {
         let config = MachineConfig::new(Architecture::X86, 8 << 20, 1, devices).unwrap();
         let mut prepared = PreparedMachine::new(
             config,
-            TestVm(terra_runtime::SyntheticRam::new(8 << 20).unwrap()),
+            TestVm(terra_runtime::memory::GuestRam::new(8 << 20).unwrap()),
         );
         let mut kernel = vec![0; 512];
         kernel[..4].copy_from_slice(b"\x7fELF");
@@ -681,7 +683,7 @@ mod tests {
         .unwrap();
         let shares = super::filesystems(
             &mut runtime,
-            terra_runtime::SyntheticRam::new(4096).unwrap(),
+            terra_runtime::memory::GuestRam::new(4096).unwrap(),
             &input,
             |_| Ok(std::sync::Arc::new(|_| Ok(()))),
         )

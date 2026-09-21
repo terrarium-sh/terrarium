@@ -4,6 +4,7 @@ use wasmtime::component::Resource;
 
 pub use super::reaper::VcpuReaper;
 use super::{Platform, PlatformHost};
+
 use crate::box_runtime::{BoxHost, BoxRuntime};
 use crate::component::vmm::mmio::terra::mmio::virtualization;
 pub use crate::component::vmm::mmio::terra::mmio::virtualization::{Architecture, Config, Error};
@@ -11,7 +12,7 @@ pub(crate) type InitializeMachine = wasmtime::component::TypedFunc<
     (Config, Resource<Vm>, Vec<Resource<super::Vcpu>>),
     (Result<(), super::machine::Error>,),
 >;
-use crate::{BoundedMemory, SyntheticRam};
+use crate::memory::{BoundedMemory, GuestRam};
 
 #[derive(Clone)]
 pub struct MachineConfig {
@@ -100,10 +101,10 @@ impl MachineConfig {
 mod prepared_machine_tests {
     use super::*;
 
-    struct TestVm(SyntheticRam);
+    struct TestVm(GuestRam);
 
     impl VirtualMachine for TestVm {
-        fn memory(&self) -> wasmtime::Result<SyntheticRam> {
+        fn memory(&self) -> wasmtime::Result<GuestRam> {
             Ok(self.0.clone())
         }
     }
@@ -111,7 +112,7 @@ mod prepared_machine_tests {
     #[test]
     fn prepared_machine_accepts_boot_once() {
         let config = MachineConfig::new(Architecture::X86, 32768, 1, Vec::new()).unwrap();
-        let mut machine = PreparedMachine::new(config, TestVm(SyntheticRam::new(32768).unwrap()));
+        let mut machine = PreparedMachine::new(config, TestVm(GuestRam::new(32768).unwrap()));
         machine
             .accept_boot(super::super::boot::BootEntry {
                 entry: 0,
@@ -131,7 +132,7 @@ mod prepared_machine_tests {
     #[test]
     fn interrupt_bindings_validate_the_device_during_setup() {
         let machine = MachineHandle(Arc::new(CreatedMachine {
-            machine: Arc::new(TestVm(SyntheticRam::new(32768).unwrap())),
+            machine: Arc::new(TestVm(GuestRam::new(32768).unwrap())),
             devices: vec![super::super::machine::Device {
                 kind: super::super::machine::DeviceKind::Memory,
                 mmio_base: 0,
@@ -166,7 +167,7 @@ mod prepared_machine_tests {
     async fn failed_stop_keeps_machine_resources_with_native_teardown() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        let backend = Arc::new(TestVm(SyntheticRam::new(32768).unwrap()));
+        let backend = Arc::new(TestVm(GuestRam::new(32768).unwrap()));
         let backend_weak = Arc::downgrade(&backend);
         let stop_called = Arc::new(AtomicBool::new(false));
         let observed_stop = Arc::clone(&stop_called);
@@ -181,7 +182,7 @@ mod prepared_machine_tests {
                     })),
                 ),
                 _backend: backend.clone(),
-                _ram: SyntheticRam::new(32768).unwrap(),
+                _ram: GuestRam::new(32768).unwrap(),
             })
             .unwrap();
         drop(backend);
@@ -247,13 +248,13 @@ mod prepared_machine_tests {
             })
             .collect();
             #[cfg(unix)]
-            let ram = SyntheticRam::from_shared(Arc::new(
+            let ram = GuestRam::from_shared(Arc::new(
                 GuestMemoryMmap::from_ranges(&[(GuestAddress(base), 8 << 20)]).unwrap(),
             ))
             .unwrap();
             #[cfg(windows)]
-            let ram = SyntheticRam::from_windows_ram(
-                crate::WindowsRam::allocate_at(8 << 20, base).unwrap(),
+            let ram = GuestRam::from_windows_ram(
+                crate::memory::WindowsRam::allocate_at(8 << 20, base).unwrap(),
             )
             .unwrap();
             let config = MachineConfig::new(architecture, 8 << 20, 2, devices).unwrap();
@@ -376,26 +377,26 @@ mod prepared_machine_tests {
 }
 
 pub trait VirtualMachine: Send + Sync + 'static {
-    fn memory(&self) -> wasmtime::Result<SyntheticRam>;
+    fn memory(&self) -> wasmtime::Result<GuestRam>;
 }
 
 impl<T: VirtualMachine> VirtualMachine for Arc<T> {
-    fn memory(&self) -> wasmtime::Result<SyntheticRam> {
+    fn memory(&self) -> wasmtime::Result<GuestRam> {
         self.as_ref().memory()
     }
 }
 
 #[derive(Clone)]
-pub struct RamGrant(Arc<dyn Fn() -> wasmtime::Result<SyntheticRam> + Send + Sync>);
+pub struct RamGrant(Arc<dyn Fn() -> wasmtime::Result<GuestRam> + Send + Sync>);
 
 impl RamGrant {
-    pub fn resolve(&self) -> wasmtime::Result<SyntheticRam> {
+    pub fn resolve(&self) -> wasmtime::Result<GuestRam> {
         (self.0)()
     }
 }
 
-impl From<SyntheticRam> for RamGrant {
-    fn from(ram: SyntheticRam) -> Self {
+impl From<GuestRam> for RamGrant {
+    fn from(ram: GuestRam) -> Self {
         Self(Arc::new(move || Ok(ram.clone())))
     }
 }
@@ -481,7 +482,7 @@ impl<M> PreparedMachine<M> {
 }
 
 impl<M: VirtualMachine> PreparedMachine<M> {
-    pub fn ram(&self) -> wasmtime::Result<SyntheticRam> {
+    pub fn ram(&self) -> wasmtime::Result<GuestRam> {
         self.backend.memory()
     }
 
@@ -535,7 +536,7 @@ impl StartedVcpus {
 pub(crate) struct MachineRecovery {
     reaper: VcpuReaper,
     _backend: Arc<dyn VirtualMachine>,
-    _ram: SyntheticRam,
+    _ram: GuestRam,
 }
 
 impl MachineRecovery {
@@ -551,7 +552,7 @@ impl MachineRecovery {
 
 struct MachineGrant {
     config: MachineConfig,
-    ram: SyntheticRam,
+    ram: GuestRam,
     backend: Arc<dyn VirtualMachine>,
 }
 
@@ -590,7 +591,7 @@ impl PlatformHost {
         self.machine_grant().map(|grant| &grant.config)
     }
 
-    pub(crate) fn completion_grant(&self) -> wasmtime::Result<(&MachineConfig, SyntheticRam)> {
+    pub(crate) fn completion_grant(&self) -> wasmtime::Result<(&MachineConfig, GuestRam)> {
         let grant = self
             .machine_grant()
             .ok_or_else(|| wasmtime::Error::msg("VM has no machine configuration"))?;

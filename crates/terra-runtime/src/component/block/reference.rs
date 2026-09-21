@@ -1,7 +1,10 @@
 //! Test-only virtio-blk reference implementation.
 
 use super::{BlockBacking, STATUS_OK};
-use crate::{BoundedDisk, BoundedMemory, MAX_BATCH_BYTES, MAX_SINGLE_BYTES};
+
+use crate::component::block::backing::BoundedDisk;
+use crate::memory::BoundedMemory;
+use crate::{MAX_BATCH_BYTES, MAX_SINGLE_BYTES};
 use virtio_bindings::bindings::{virtio_blk as blk, virtio_config as transport};
 
 pub const SECTOR_BYTES: u64 = 512;

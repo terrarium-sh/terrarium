@@ -1,12 +1,14 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use terra_runtime::component::block::backing::BoundedDisk;
+use terra_runtime::component::block::backing::DiskError;
 use terra_runtime::component::block::backing::{BackingError, BlockBacking, FileDisk};
 use terra_runtime::component::block::host::terra::host::memory::Host;
 use terra_runtime::engine::DeviceContext;
-use terra_runtime::{
-    BoundedDisk, BoundedMemory, DiskError, Interrupt, MAX_SIGNALS_PER_WINDOW, MemoryError,
-    SyntheticRam,
-};
+use terra_runtime::engine::Interrupt;
+use terra_runtime::engine::MAX_SIGNALS_PER_WINDOW;
+use terra_runtime::memory::MemoryError;
+use terra_runtime::memory::{BoundedMemory, GuestRam};
 
 #[test]
 fn hostile_memory_imports_reject_overflow_and_oversized_copies() {
@@ -119,16 +121,16 @@ fn boot_results_require_mapped_aligned_addresses_and_one_acceptance() {
         boot::BootEntry,
         virtualization::{Architecture, MachineConfig, PreparedMachine, VirtualMachine},
     };
-    struct Machine(terra_runtime::SyntheticRam);
+    struct Machine(terra_runtime::memory::GuestRam);
     impl VirtualMachine for Machine {
-        fn memory(&self) -> wasmtime::Result<terra_runtime::SyntheticRam> {
+        fn memory(&self) -> wasmtime::Result<terra_runtime::memory::GuestRam> {
             Ok(self.0.clone())
         }
     }
     let config = MachineConfig::new(Architecture::Arm, 4096, 1, Vec::new()).unwrap();
     let mut machine = PreparedMachine::new(
         config,
-        Machine(terra_runtime::SyntheticRam::new(4096).unwrap()),
+        Machine(terra_runtime::memory::GuestRam::new(4096).unwrap()),
     );
     for (entry, boot_argument) in [(u64::MAX, 0), (4096, 0), (1, 0), (0, 4096), (0, u64::MAX)] {
         assert!(
@@ -156,8 +158,8 @@ fn boot_results_require_mapped_aligned_addresses_and_one_acceptance() {
     );
 }
 
-fn ram_64k() -> SyntheticRam {
-    SyntheticRam::new(64 * 1024).expect("64 KiB RAM")
+fn ram_64k() -> GuestRam {
+    GuestRam::new(64 * 1024).expect("64 KiB RAM")
 }
 
 #[test]
@@ -225,7 +227,7 @@ fn memory_hole_is_rejected_before_partial_write() {
         ])
         .unwrap(),
     );
-    let ram = SyntheticRam::from_shared(mapping).unwrap();
+    let ram = GuestRam::from_shared(mapping).unwrap();
     let memory = BoundedMemory::new(&ram);
     memory.write(0xff0, &[0x42; 16]).unwrap();
     assert_eq!(memory.write(0xff0, &[0x99; 32]), Err(MemoryError::Unmapped));
@@ -236,13 +238,13 @@ fn memory_hole_is_rejected_before_partial_write() {
 #[test]
 fn hostile_memory_imports_cannot_cross_mapping_holes() {
     use std::sync::Arc;
-    use terra_runtime::SyntheticRam;
+    use terra_runtime::memory::GuestRam;
     use vm_memory::{GuestAddress, GuestMemoryMmap};
 
     let mapping =
         GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4096), (GuestAddress(8192), 4096)])
             .unwrap();
-    let mut host = DeviceContext::with_ram(SyntheticRam::from_shared(Arc::new(mapping)).unwrap());
+    let mut host = DeviceContext::with_ram(GuestRam::from_shared(Arc::new(mapping)).unwrap());
     host.write(0, vec![0xa5; 4096]).unwrap();
     assert!(host.read(4095, 4098).is_err());
     assert!(host.write(4095, vec![0; 4098]).is_err());
@@ -251,7 +253,7 @@ fn hostile_memory_imports_cannot_cross_mapping_holes() {
 
 #[test]
 fn synthetic_ram_shapes_match() {
-    assert!(SyntheticRam::new(256 * 1024).is_some());
+    assert!(GuestRam::new(256 * 1024).is_some());
 }
 
 #[cfg(unix)]
@@ -262,8 +264,8 @@ fn shared_ram_aliases_one_mapping() {
     let mem = Arc::new(
         GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 64 * 1024)]).expect("maps"),
     );
-    let first = SyntheticRam::from_shared(Arc::clone(&mem)).expect("aliases");
-    let second = SyntheticRam::from_shared(Arc::clone(&mem)).expect("aliases");
+    let first = GuestRam::from_shared(Arc::clone(&mem)).expect("aliases");
+    let second = GuestRam::from_shared(Arc::clone(&mem)).expect("aliases");
     assert_eq!(first.size(), 64 * 1024);
     BoundedMemory::new(&first)
         .write(512, b"shared")

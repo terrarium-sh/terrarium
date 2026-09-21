@@ -2,13 +2,13 @@
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
-use terra_runtime::SyntheticRam;
 use terra_runtime::component::block::host::terra::host::memory::Host;
 use terra_runtime::component::vmm::{
     boot::BootEntry,
     virtualization::{Architecture, MachineConfig, PreparedMachine, VirtualMachine},
 };
 use terra_runtime::engine::DeviceContext;
+use terra_runtime::memory::GuestRam;
 
 #[derive(Arbitrary, Debug)]
 struct Input {
@@ -17,10 +17,10 @@ struct Input {
     bytes: Vec<u8>,
 }
 
-struct Machine(SyntheticRam);
+struct Machine(GuestRam);
 
 impl VirtualMachine for Machine {
-    fn memory(&self) -> wasmtime::Result<SyntheticRam> {
+    fn memory(&self) -> wasmtime::Result<GuestRam> {
         Ok(self.0.clone())
     }
 }
@@ -49,7 +49,7 @@ fuzz_target!(|input: Input| {
                 .is_some_and(|end| end <= 4096)
         );
     }
-    let Some(ram) = SyntheticRam::new(4096) else {
+    let Some(ram) = GuestRam::new(4096) else {
         return;
     };
     let Ok(config) = MachineConfig::new(Architecture::Arm, 4096, 1, Vec::new()) else {

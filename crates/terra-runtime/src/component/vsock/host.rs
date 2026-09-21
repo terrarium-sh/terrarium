@@ -17,8 +17,8 @@ use wasmtime::component::{
     StreamReader, StreamResult, VecBuffer,
 };
 
-use crate::SyntheticRam;
 use crate::engine::{DeviceContext, DeviceHost, add_device_imports, device_component_linker};
+use crate::memory::GuestRam;
 use wasmtime::Engine;
 use wasmtime_wasi::{WasiCtxView, WasiView};
 
@@ -29,7 +29,7 @@ pub struct VsockDeviceHost {
 
 impl VsockDeviceHost {
     #[must_use]
-    pub fn new(ram: SyntheticRam, service: VsockHostService) -> Self {
+    pub fn new(ram: GuestRam, service: VsockHostService) -> Self {
         Self {
             context: DeviceContext::with_ram(ram),
             vsock_service: service,
@@ -636,7 +636,7 @@ mod tests {
             .expect("client state");
         let entry = service.resources.push(state).expect("resource entry");
         let client_rep = entry.rep();
-        let host = VsockDeviceHost::new(crate::SyntheticRam::new(4096).unwrap(), service);
+        let host = VsockDeviceHost::new(crate::memory::GuestRam::new(4096).unwrap(), service);
         let engine = crate::engine::device_engine().expect("engine");
         let mut store = wasmtime::Store::new(&engine, host);
         store

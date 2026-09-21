@@ -80,8 +80,8 @@ pub struct Machine {
 }
 
 impl terra_runtime::component::vmm::virtualization::VirtualMachine for Machine {
-    fn memory(&self) -> wasmtime::Result<terra_runtime::SyntheticRam> {
-        terra_runtime::SyntheticRam::from_shared(self.shared_ram())
+    fn memory(&self) -> wasmtime::Result<terra_runtime::memory::GuestRam> {
+        terra_runtime::memory::GuestRam::from_shared(self.shared_ram())
             .ok_or_else(|| wasmtime::Error::msg("aliasing KVM guest RAM"))
     }
 }

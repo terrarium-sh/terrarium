@@ -316,7 +316,7 @@ async fn run_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SyntheticRam;
+    use crate::memory::GuestRam;
     use std::collections::BTreeMap;
 
     fn boot_plan() -> Vec<u8> {
@@ -548,7 +548,7 @@ mod tests {
             )
             .expect("router component");
             runtime.initialize_mmio(&router).await.expect("router");
-            let ram = SyntheticRam::new(4096).expect("test RAM maps");
+            let ram = GuestRam::new(4096).expect("test RAM maps");
             // SAFETY: the test embeds the trusted build's component artifact.
             #[allow(unsafe_code)]
             let artifact = unsafe {
@@ -658,7 +658,7 @@ mod tests {
         };
         let channel = crate::component::vsock::VsockChannel::from_trusted_artifact(
             &mut runtime,
-            crate::SyntheticRam::new(4096).unwrap(),
+            crate::memory::GuestRam::new(4096).unwrap(),
             artifact,
             plan,
             None,

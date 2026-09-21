@@ -19,7 +19,7 @@ use super::host::{FsHost, ShareGrant};
 use crate::box_runtime::{BoxHost, BoxRuntime, BoxRuntimeHandle};
 use crate::component::DeviceChannel;
 use crate::engine::{DeviceContext, device_engine};
-use crate::{BoundedMemory, SyntheticRam};
+use crate::memory::{BoundedMemory, GuestRam};
 
 pub(super) struct IoGate {
     operation: Operation,
@@ -277,7 +277,7 @@ impl PendingRequest {
 
 #[test]
 fn replies_wait_for_their_used_ring_entry() {
-    let ram = SyntheticRam::new(64 * 1024).unwrap();
+    let ram = GuestRam::new(64 * 1024).unwrap();
     let memory = BoundedMemory::new(&ram);
     let request = PendingRequest {
         output: 0x4000,
@@ -310,7 +310,7 @@ fn replies_wait_for_their_used_ring_entry() {
 
 struct Mounted {
     channel: DeviceChannel,
-    ram: SyntheticRam,
+    ram: GuestRam,
     runtime: BoxRuntimeHandle,
     next: u16,
     request_head: u16,
@@ -318,7 +318,7 @@ struct Mounted {
 
 impl Mounted {
     async fn new(grant: ShareGrant, gate: Arc<IoGate>, capacity: usize) -> Self {
-        let ram = SyntheticRam::new(1024 * 1024).unwrap();
+        let ram = GuestRam::new(1024 * 1024).unwrap();
         let engine = device_engine().unwrap();
         let component = Component::new(
             &engine,
@@ -910,7 +910,7 @@ fn saturated_mount_cleanup_does_not_starve_another_mount_or_guest_disk() {
         let disk_path = disk_root.path().join("disk");
         std::fs::write(&disk_path, b"disk contents").unwrap();
         let disk_host = crate::component::block::host::BlockHost::new(
-            crate::SyntheticRam::new(4096).unwrap(),
+            crate::memory::GuestRam::new(4096).unwrap(),
             DiskGrant::File(FileDisk::open(&disk_path, false).unwrap()),
         );
         let mut disk_store = wasmtime::Store::new(&device_engine().unwrap(), disk_host);

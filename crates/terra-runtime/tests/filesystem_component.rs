@@ -7,10 +7,10 @@ use std::os::windows::fs::symlink_file;
 use std::sync::Arc;
 
 use terra_runtime::{
-    BoundedMemory, SyntheticRam,
     box_runtime::{BoxHost, BoxRuntime, BoxRuntimeHandle},
     component::fs::host::{FsHost, ShareGrant},
     engine::{DeviceContext, device_engine},
+    memory::{BoundedMemory, GuestRam},
 };
 use wasmtime::component::Component;
 
@@ -47,7 +47,7 @@ fn reply_error(reply: &[u8]) -> i32 {
 
 struct Mounted {
     channel: terra_runtime::component::DeviceChannel,
-    ram: SyntheticRam,
+    ram: GuestRam,
     _runtime: BoxRuntimeHandle,
 }
 
@@ -60,7 +60,7 @@ async fn mount_with_resource_capacity(
     readonly: bool,
     resource_capacity: Option<usize>,
 ) -> Mounted {
-    let ram = SyntheticRam::new(64 * 1024).expect("ram");
+    let ram = GuestRam::new(64 * 1024).expect("ram");
     let engine = device_engine().expect("engine");
     let component = Component::new(
         &engine,

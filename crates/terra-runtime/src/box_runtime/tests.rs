@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use super::{BOX_WASM_MEMORY_BYTES, BoxHost, BoxRuntime, BoxRuntimeHandle, MAX_BOX_COMPONENTS};
+
 use crate::component::vmm::lifecycle::Outcome;
 use crate::engine::{DeviceContext, device_engine};
 use wasmtime::{Module, ResourceLimiter};
@@ -72,8 +73,10 @@ fn empty_child_stores_cannot_bypass_box_capacity() {
     let mut root = BoxRuntime::new(&engine, BoxHost::new()).expect("root");
     for _ in 0..MAX_BOX_COMPONENTS {
         let child = root.new_child(crate::component::block::host::BlockHost::new(
-            crate::SyntheticRam::new(4096).unwrap(),
-            crate::component::block::backing::DiskGrant::Mem(crate::BoundedDisk::new(0, false)),
+            crate::memory::GuestRam::new(4096).unwrap(),
+            crate::component::block::backing::DiskGrant::Mem(
+                crate::component::block::backing::BoundedDisk::new(0, false),
+            ),
         ));
         root.attach_child(child).expect("available slot");
     }

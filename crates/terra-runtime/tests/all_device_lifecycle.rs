@@ -5,15 +5,15 @@ use std::time::Duration;
 
 use terra_network::{GuestNetworkConfig, Policy, PolicyHandle};
 use terra_runtime::{
-    BoundedDisk, SyntheticRam,
     box_runtime::{BoxHost, BoxRuntime},
     component::{
         Interrupt,
-        block::backing::DiskGrant,
+        block::backing::{BoundedDisk, DiskGrant},
         fs::host::{FsHost, ShareGrant},
         vsock::VsockChannel,
     },
     engine::{DeviceContext, device_engine},
+    memory::GuestRam,
 };
 use wasmtime::component::Component;
 
@@ -84,7 +84,7 @@ fn load_components(engine: &wasmtime::Engine) -> [Component; 5] {
     ]
 }
 
-fn start_vsock(runtime: &mut BoxRuntime, ram: SyntheticRam) -> VsockChannel {
+fn start_vsock(runtime: &mut BoxRuntime, ram: GuestRam) -> VsockChannel {
     // SAFETY: this test embeds the build's trusted AOT vsock artifact.
     #[allow(unsafe_code)]
     let artifact = unsafe {
@@ -115,7 +115,7 @@ async fn every_device_resets_and_closes_in_one_box_runtime() {
         mem_component,
         network_component,
     ] = load_components(&engine);
-    let ram = SyntheticRam::new(64 * 1024).expect("RAM");
+    let ram = GuestRam::new(64 * 1024).expect("RAM");
     let root = tempfile::tempdir().expect("mount directory");
     let mount = std::fs::canonicalize(root.path()).expect("canonical mount directory");
     let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");

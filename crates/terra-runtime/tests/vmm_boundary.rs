@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use terra_runtime::{
-    SyntheticRam,
     box_runtime::{BoxHost, BoxRuntime},
     component::{
         Interrupt,
@@ -18,20 +17,21 @@ use terra_runtime::{
         },
     },
     engine::{DeviceContext, device_component_linker, device_engine},
+    memory::GuestRam,
 };
 use wasmtime::{Store, component::Component};
 
-struct TestVm(SyntheticRam);
+struct TestVm(GuestRam);
 
 impl VirtualMachine for TestVm {
-    fn memory(&self) -> wasmtime::Result<SyntheticRam> {
+    fn memory(&self) -> wasmtime::Result<GuestRam> {
         Ok(self.0.clone())
     }
 }
 
 async fn attach_test_machine(
     runtime: BoxRuntime,
-    ram: SyntheticRam,
+    ram: GuestRam,
 ) -> (
     BoxRuntime,
     terra_runtime::component::vmm::virtualization::MachineHandle<TestVm>,
@@ -103,7 +103,7 @@ async fn prepare_test_vcpus(
 #[allow(clippy::too_many_lines)]
 async fn wasm_vmm_routes_native_exits_and_stops_with_the_box() {
     let engine = device_engine().expect("engine");
-    let ram = SyntheticRam::new(8 << 20).expect("RAM");
+    let ram = GuestRam::new(8 << 20).expect("RAM");
     let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
     runtime
         .initialize_mmio(&router(&engine))
@@ -253,7 +253,7 @@ async fn vcpu_preparation_requires_a_router_and_boot() {
         .await
         .expect("test setup");
     let (runtime, _) =
-        attach_test_machine(runtime, SyntheticRam::new(8 << 20).expect("test setup")).await;
+        attach_test_machine(runtime, GuestRam::new(8 << 20).expect("test setup")).await;
     let (_prepared, vcpus) = prepare_test_vcpus(runtime).await.expect("test setup");
     assert_eq!(vcpus.len(), 1);
 }
@@ -280,7 +280,7 @@ async fn failed_startup_disconnects_native_vcpus() {
         .initialize_mmio(&router(&engine))
         .await
         .expect("router");
-    let (runtime, _) = attach_test_machine(runtime, SyntheticRam::new(8 << 20).expect("RAM")).await;
+    let (runtime, _) = attach_test_machine(runtime, GuestRam::new(8 << 20).expect("RAM")).await;
     let (sender, receiver) = std::sync::mpsc::channel();
     let started = runtime
         .prepare_vcpus(move |controls, _| {
@@ -311,8 +311,7 @@ async fn vcpu_failure_preserves_teardown_order_before_runtime_join() {
         .initialize_mmio(&router(&engine))
         .await
         .expect("router");
-    let (mut runtime, _) =
-        attach_test_machine(runtime, SyntheticRam::new(8 << 20).expect("RAM")).await;
+    let (mut runtime, _) = attach_test_machine(runtime, GuestRam::new(8 << 20).expect("RAM")).await;
     let order = Arc::new(std::sync::Mutex::new(Vec::new()));
     let devices = Arc::clone(&order);
     runtime
@@ -399,7 +398,7 @@ async fn wasi_requests_cpu_stop_before_publishing_terminal_outcomes() {
             .await
             .expect("router");
         let (mut runtime, machine) =
-            attach_test_machine(runtime, SyntheticRam::new(8 << 20).expect("RAM")).await;
+            attach_test_machine(runtime, GuestRam::new(8 << 20).expect("RAM")).await;
         let calls = Arc::new(AtomicUsize::new(0));
         let stops = Arc::clone(&calls);
         let reaped = Arc::new(AtomicUsize::new(0));
@@ -544,7 +543,7 @@ async fn deferred_device_failure_prevents_cpu_launch() {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     let engine = device_engine().expect("engine");
-    let ram = SyntheticRam::new(8 << 20).expect("RAM");
+    let ram = GuestRam::new(8 << 20).expect("RAM");
     let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
     runtime
         .initialize_mmio(&router(&engine))
@@ -556,7 +555,7 @@ async fn deferred_device_failure_prevents_cpu_launch() {
         terra_runtime::component::block::host::BlockHost::new(
             ram,
             terra_runtime::component::block::backing::DiskGrant::Mem(
-                terra_runtime::BoundedDisk::new(0, false),
+                terra_runtime::component::block::backing::BoundedDisk::new(0, false),
             ),
         ),
         &memory(&engine),
@@ -588,12 +587,12 @@ async fn deferred_device_failure_prevents_cpu_launch() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wasi_composes_multiple_deferred_workers_with_their_final_mappings() {
-    use terra_runtime::BoundedDisk;
+    use terra_runtime::component::block::backing::BoundedDisk;
 
     use terra_runtime::component::block::backing::DiskGrant;
 
     let engine = device_engine().expect("engine");
-    let ram = SyntheticRam::new(8 << 20).expect("RAM");
+    let ram = GuestRam::new(8 << 20).expect("RAM");
     let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
     runtime
         .initialize_mmio(&router(&engine))
@@ -657,7 +656,7 @@ async fn wasi_lifecycle_closes_a_device_through_the_running_mmio_bridge() {
     use terra_runtime::component::vmm::machine::DeviceKind;
 
     let engine = device_engine().expect("engine");
-    let ram = SyntheticRam::new(8 << 20).expect("RAM");
+    let ram = GuestRam::new(8 << 20).expect("RAM");
     let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
     runtime
         .initialize_mmio(&router(&engine))
@@ -744,7 +743,7 @@ async fn wasi_irq_lines_drain_assertions_before_vm_release() {
         .initialize_mmio(&router(&engine))
         .await
         .expect("router");
-    let ram = SyntheticRam::new(8 << 20).expect("RAM");
+    let ram = GuestRam::new(8 << 20).expect("RAM");
     let (mut runtime, _) = attach_test_machine(runtime, ram.clone()).await;
     terra_runtime::component::mem::instantiate_shared(
         &mut runtime,
@@ -818,7 +817,7 @@ async fn failed_native_reaping_retains_vm_and_dependent_cleanup() {
         .await
         .expect("router");
     let (mut runtime, machine) =
-        attach_test_machine(runtime, SyntheticRam::new(8 << 20).expect("RAM")).await;
+        attach_test_machine(runtime, GuestRam::new(8 << 20).expect("RAM")).await;
     let backend = Arc::downgrade(&machine.machine());
     drop(machine);
     let closes = Arc::new(AtomicUsize::new(0));

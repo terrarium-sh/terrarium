@@ -18,8 +18,8 @@ use kvm_bindings::{
     user_pt_regs,
 };
 use kvm_ioctls::{DeviceFd, Kvm, VcpuExit, VcpuFd, VmFd};
-use terra_runtime::SyntheticRam;
 use terra_runtime::component::vmm::{Completion, Exit, NativeVcpu, platform};
+use terra_runtime::memory::GuestRam;
 use vm_memory::{GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 
 use crate::aarch64::arm::{GIC_DIST_BASE, GIC_REDIST_BASE, MAX_VCPUS, RAM_BASE};
@@ -57,8 +57,8 @@ struct Machine {
 }
 
 impl terra_runtime::component::vmm::virtualization::VirtualMachine for Machine {
-    fn memory(&self) -> wasmtime::Result<SyntheticRam> {
-        SyntheticRam::from_shared(self.ram())
+    fn memory(&self) -> wasmtime::Result<GuestRam> {
+        GuestRam::from_shared(self.ram())
             .ok_or_else(|| wasmtime::Error::msg("aliasing ARM KVM RAM"))
     }
 }

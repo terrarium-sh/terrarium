@@ -236,7 +236,7 @@ async fn create_worker(
     let mut store = device_store(
         &engine,
         VsockDeviceHost::new(
-            terra_runtime::SyntheticRam::new(4096).unwrap(),
+            terra_runtime::memory::GuestRam::new(4096).unwrap(),
             terra_runtime::component::vsock::host::VsockHostService::new(
                 vec![2, 0, 0, 0, b'{', b'}'],
                 Some(listener),
@@ -629,7 +629,7 @@ async fn shared_close_releases_the_diagnostic_sink() {
     };
     let channel = terra_runtime::component::vsock::VsockChannel::from_trusted_artifact(
         &mut runtime,
-        terra_runtime::SyntheticRam::new(4096).unwrap(),
+        terra_runtime::memory::GuestRam::new(4096).unwrap(),
         artifact,
         vec![2, 0, 0, 0, b'{', b'}'],
         None,

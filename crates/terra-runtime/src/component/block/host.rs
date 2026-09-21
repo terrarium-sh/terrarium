@@ -1,8 +1,9 @@
 //! Block device capabilities and component bindings.
 
 use super::backing::{BlockBacking, DiskGrant};
+use crate::MAX_SINGLE_BYTES;
 use crate::engine::{DeviceContext, DeviceHost, add_device_imports, device_component_linker};
-use crate::{MAX_SINGLE_BYTES, SyntheticRam};
+use crate::memory::GuestRam;
 use std::sync::{Arc, Mutex};
 use wasmtime::Engine;
 use wasmtime::component::HasSelf;
@@ -29,7 +30,7 @@ pub struct BlockHost {
 
 impl BlockHost {
     #[must_use]
-    pub fn new(ram: SyntheticRam, disk: DiskGrant) -> Self {
+    pub fn new(ram: GuestRam, disk: DiskGrant) -> Self {
         Self {
             context: DeviceContext::with_ram(ram),
             disk_capacity: disk.capacity(),
@@ -190,14 +191,14 @@ pub fn block_component_linker<T: WasiView + AsMut<BlockHost> + 'static>(
 
 #[cfg(test)]
 mod tests {
-    use crate::BoundedDisk;
+    use crate::component::block::backing::BoundedDisk;
     #[tokio::test]
     async fn disk_imports_enforce_bounds_and_readonly_without_a_guest() {
         use super::terra::host::disk::DiskError;
         use super::{BlockHost, DiskGrant, disk_discard, disk_read_at, disk_sync, disk_write_at};
 
         let mut host = BlockHost::new(
-            crate::SyntheticRam::new(4096).unwrap(),
+            crate::memory::GuestRam::new(4096).unwrap(),
             DiskGrant::Mem(BoundedDisk::new(4096, false)),
         );
         assert_eq!(disk_write_at(&mut host, 4095, vec![7]).await, Ok(()));
@@ -221,7 +222,7 @@ mod tests {
             Err(DiskError::TooLarge)
         ));
         let mut host = BlockHost::new(
-            crate::SyntheticRam::new(4096).unwrap(),
+            crate::memory::GuestRam::new(4096).unwrap(),
             DiskGrant::Mem(BoundedDisk::new(4096, true)),
         );
         assert!(matches!(
@@ -242,12 +243,16 @@ mod tests {
         };
 
         let mut host = BlockHost::new(
-            crate::SyntheticRam::new(4096).unwrap(),
-            crate::component::block::backing::DiskGrant::Mem(crate::BoundedDisk::new(0, false)),
+            crate::memory::GuestRam::new(4096).unwrap(),
+            crate::component::block::backing::DiskGrant::Mem(
+                crate::component::block::backing::BoundedDisk::new(0, false),
+            ),
         );
         let mut other = BlockHost::new(
-            crate::SyntheticRam::new(4096).unwrap(),
-            crate::component::block::backing::DiskGrant::Mem(crate::BoundedDisk::new(0, false)),
+            crate::memory::GuestRam::new(4096).unwrap(),
+            crate::component::block::backing::DiskGrant::Mem(
+                crate::component::block::backing::BoundedDisk::new(0, false),
+            ),
         );
         let (started, started_rx) = tokio::sync::oneshot::channel();
         let (release, release_rx) = std::sync::mpsc::sync_channel(0);

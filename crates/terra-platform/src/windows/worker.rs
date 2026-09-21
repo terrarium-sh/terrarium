@@ -8,13 +8,13 @@ use terra_runtime::component::vmm::virtualization::StartedVcpus;
 #[cfg(target_arch = "x86_64")]
 use crate::machine::MAX_VCPUS;
 use crate::worker::{self, PreparedVmm, VmmObservation, WorkerInput};
-use terra_runtime::WindowsRam;
 #[cfg(target_arch = "x86_64")]
 use terra_runtime::component::vmm::interrupts::{IoApicHandle, X86Interrupt};
 use terra_runtime::component::vmm::virtualization::PreparedMachine;
 #[cfg(target_arch = "x86_64")]
 use terra_runtime::component::vmm::{Completion, NativeVcpu};
 use terra_runtime::component::vmm::{Exit, platform};
+use terra_runtime::memory::WindowsRam;
 
 const STOP_DEADLINE: Duration = Duration::from_secs(5);
 

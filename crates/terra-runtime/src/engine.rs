@@ -2,7 +2,8 @@
 
 use crate::component::block::host::terra;
 
-use super::{BoundedMemory, Interrupt, MAX_SINGLE_BYTES, SyntheticRam};
+use super::MAX_SINGLE_BYTES;
+use super::memory::{BoundedMemory, GuestRam};
 use std::sync::Arc;
 use wasmtime::{Config, Engine};
 use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
@@ -15,11 +16,77 @@ pub const STORE_MEMORY_BYTES: usize =
 pub const MAX_DEVICE_RESOURCES: usize = 512;
 pub(crate) const COMPONENT_EPOCH_DEADLINE: u64 = 10;
 
+/// Interrupts coalesced per window before further signals drop.
+pub const MAX_SIGNALS_PER_WINDOW: u32 = 64;
+
+/// One device's interrupt line. The device cannot name an IRQ; the native
+/// side coalesces bursts and drops past the per-window budget.
+pub struct Interrupt {
+    pending: bool,
+    window_count: u32,
+    delivered: u64,
+    dropped: u64,
+}
+
+impl Interrupt {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            pending: false,
+            window_count: 0,
+            delivered: 0,
+            dropped: 0,
+        }
+    }
+
+    pub fn signal(&mut self) -> bool {
+        if self.window_count >= MAX_SIGNALS_PER_WINDOW {
+            self.dropped += 1;
+            return false;
+        }
+        self.window_count += 1;
+        self.pending = true;
+        true
+    }
+
+    /// Drain one coalesced notification. Returns true when the guest
+    /// needs an injection.
+    pub fn take(&mut self) -> bool {
+        if self.pending {
+            self.pending = false;
+            self.delivered += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn end_window(&mut self) {
+        self.window_count = 0;
+    }
+
+    #[must_use]
+    pub fn delivered(&self) -> u64 {
+        self.delivered
+    }
+
+    #[must_use]
+    pub fn dropped(&self) -> u64 {
+        self.dropped
+    }
+}
+
+impl Default for Interrupt {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Common WASI, guest memory and interrupt state for one device.
 pub struct DeviceContext {
     ctx: WasiCtx,
     table: ResourceTable,
-    ram: SyntheticRam,
+    ram: GuestRam,
     irq: Interrupt,
     interrupt_level: bool,
     interrupt_notification: Arc<tokio::sync::Notify>,
@@ -28,14 +95,14 @@ pub struct DeviceContext {
 impl DeviceContext {
     #[must_use]
     pub fn new(ram_size: u64) -> Option<Self> {
-        Some(Self::with_ram(SyntheticRam::new(ram_size)?))
+        Some(Self::with_ram(GuestRam::new(ram_size)?))
     }
 
     /// Attach an already-mapped RAM alias (for example the VM worker's
     /// mapping) instead of allocating. The memory imports keep their
     /// bounds; only the backing mapping changes.
     #[must_use]
-    pub fn with_ram(ram: SyntheticRam) -> Self {
+    pub fn with_ram(ram: GuestRam) -> Self {
         let mut table = ResourceTable::new();
         table.set_max_capacity(MAX_DEVICE_RESOURCES);
         Self {
@@ -53,7 +120,7 @@ impl DeviceContext {
         }
     }
 
-    pub(crate) fn guest_ram(&self) -> &SyntheticRam {
+    pub(crate) fn guest_ram(&self) -> &GuestRam {
         &self.ram
     }
 
@@ -77,15 +144,16 @@ impl DeviceContext {
         self.irq.take()
     }
 
-    /// Stage bytes into the synthetic guest RAM backing this device's
-    /// memory import. The worker stages real virtqueue memory instead;
-    /// the same bounds apply on both paths.
-    pub fn guest_write(&mut self, offset: u64, data: &[u8]) -> Result<(), super::MemoryError> {
+    pub fn guest_write(
+        &mut self,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<(), crate::memory::MemoryError> {
         self.memory().write(offset, data)
     }
 
     /// Read back bytes staged in this device's guest RAM.
-    pub fn guest_read(&self, offset: u64, len: u64) -> Result<Vec<u8>, super::MemoryError> {
+    pub fn guest_read(&self, offset: u64, len: u64) -> Result<Vec<u8>, crate::memory::MemoryError> {
         self.memory().read(offset, len)
     }
 
@@ -155,6 +223,7 @@ fn apply_device_settings(config: &mut Config, fuel: bool) -> wasmtime::Result<()
 
 pub mod test_support {
     use super::{DeviceContext, DeviceHost, Engine, WasiCtxView, WasiView};
+
     use wasmtime::{Store, StoreLimits, StoreLimitsBuilder};
 
     pub struct StandaloneHost<H> {
@@ -253,11 +322,11 @@ pub fn device_component_linker<T: WasiView + 'static>(
     Ok(linker)
 }
 
-fn memory_error(error: super::MemoryError) -> terra::host::memory::MemoryError {
+fn memory_error(error: crate::memory::MemoryError) -> terra::host::memory::MemoryError {
     match error {
-        super::MemoryError::OutOfRange => terra::host::memory::MemoryError::OutOfRange,
-        super::MemoryError::TooLarge => terra::host::memory::MemoryError::TooLarge,
-        super::MemoryError::Unmapped => terra::host::memory::MemoryError::Unmapped,
+        crate::memory::MemoryError::OutOfRange => terra::host::memory::MemoryError::OutOfRange,
+        crate::memory::MemoryError::TooLarge => terra::host::memory::MemoryError::TooLarge,
+        crate::memory::MemoryError::Unmapped => terra::host::memory::MemoryError::Unmapped,
     }
 }
 
@@ -412,7 +481,7 @@ mod tests {
             std::pin::pin!(first_wake.notified()).poll(&mut context),
             Poll::Ready(())
         );
-        for _ in 0..crate::MAX_SIGNALS_PER_WINDOW {
+        for _ in 0..crate::engine::MAX_SIGNALS_PER_WINDOW {
             first.signal();
         }
         assert_eq!(
@@ -439,7 +508,7 @@ mod tests {
         first.set_level(true);
         assert!(first.interrupt_level());
         assert!(!second.interrupt_level());
-        for _ in 0..crate::MAX_SIGNALS_PER_WINDOW {
+        for _ in 0..crate::engine::MAX_SIGNALS_PER_WINDOW {
             first.signal();
         }
         first.set_level(false);

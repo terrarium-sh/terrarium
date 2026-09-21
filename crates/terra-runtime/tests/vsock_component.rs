@@ -84,7 +84,7 @@ async fn component_releases_credit_after_consumer_drains_data() {
     let mut store = device_store(
         &engine,
         VsockDeviceHost::new(
-            terra_runtime::SyntheticRam::new(64 * 1024).unwrap(),
+            terra_runtime::memory::GuestRam::new(64 * 1024).unwrap(),
             terra_runtime::component::vsock::host::VsockHostService::default(),
         ),
     );
@@ -159,7 +159,7 @@ async fn component_drains_selected_stream_while_another_is_queued() {
     let mut store = device_store(
         &engine,
         VsockDeviceHost::new(
-            terra_runtime::SyntheticRam::new(64 * 1024).unwrap(),
+            terra_runtime::memory::GuestRam::new(64 * 1024).unwrap(),
             terra_runtime::component::vsock::host::VsockHostService::default(),
         ),
     );
@@ -258,7 +258,7 @@ async fn component_close_clears_queued_state() {
     let mut store = device_store(
         &engine,
         VsockDeviceHost::new(
-            terra_runtime::SyntheticRam::new(64 * 1024).unwrap(),
+            terra_runtime::memory::GuestRam::new(64 * 1024).unwrap(),
             terra_runtime::component::vsock::host::VsockHostService::default(),
         ),
     );
@@ -315,7 +315,7 @@ async fn component_rejects_backpressure_without_resetting_connection_state() {
     let mut store = device_store(
         &engine,
         VsockDeviceHost::new(
-            terra_runtime::SyntheticRam::new(64 * 1024).unwrap(),
+            terra_runtime::memory::GuestRam::new(64 * 1024).unwrap(),
             terra_runtime::component::vsock::host::VsockHostService::default(),
         ),
     );
@@ -391,7 +391,7 @@ async fn lifecycle_decoding_stays_in_component_and_handles_bounded_frames() {
     let mut store = device_store(
         &engine,
         VsockDeviceHost::new(
-            terra_runtime::SyntheticRam::new(65536).unwrap(),
+            terra_runtime::memory::GuestRam::new(65536).unwrap(),
             terra_runtime::component::vsock::host::VsockHostService::default(),
         ),
     );

@@ -105,8 +105,8 @@ async fn create_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SyntheticRam;
     use crate::engine::{DeviceContext, device_engine};
+    use crate::memory::GuestRam;
 
     async fn channel() -> crate::component::StandaloneDevice {
         let engine = device_engine().expect("engine builds");
@@ -117,7 +117,7 @@ mod tests {
             std::fs::read(component_path).expect("memory component built"),
         )
         .expect("component compiles");
-        let ram = SyntheticRam::new(64 * 1024).expect("RAM");
+        let ram = GuestRam::new(64 * 1024).expect("RAM");
         let host = DeviceContext::with_ram(ram.clone());
         crate::component::mem::instantiate(&engine, host, &component, Arc::new(|_| Ok(())))
             .await
@@ -149,7 +149,7 @@ mod tests {
             ),
         )
         .expect("component compiles");
-        let ram = SyntheticRam::new(64 * 1024).expect("RAM");
+        let ram = GuestRam::new(64 * 1024).expect("RAM");
         let mut runtime =
             crate::box_runtime::BoxRuntime::new(&engine, crate::box_runtime::BoxHost::new())
                 .expect("box runtime");
@@ -196,8 +196,8 @@ mod tests {
             ),
         )
         .unwrap();
-        let ram = SyntheticRam::new(64 * 1024).unwrap();
-        let memory = crate::BoundedMemory::new(&ram);
+        let ram = GuestRam::new(64 * 1024).unwrap();
+        let memory = crate::memory::BoundedMemory::new(&ram);
         let host = DeviceContext::with_ram(ram.clone());
         let interrupted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let interrupt = Arc::clone(&interrupted);

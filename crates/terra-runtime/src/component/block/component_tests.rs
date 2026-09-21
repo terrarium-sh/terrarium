@@ -2,6 +2,7 @@
 //! requests drive `execute` through the actual memory/disk imports.
 //! Build it first: `make component-block` (nightly `wasm32-wasip3`).
 
+use crate::component::block::backing::BoundedDisk;
 use crate::component::block::backing::DiskGrant;
 use crate::component::block::host::{BlockHost, Completion, Range, block_component_linker};
 use crate::component::vmm::mmio::terra::mmio::types::DeviceError;
@@ -10,7 +11,7 @@ use crate::engine::{
     device_engine, precompile_component,
     test_support::{StandaloneHost, device_store},
 };
-use crate::{BoundedDisk, SyntheticRam};
+use crate::memory::GuestRam;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -136,7 +137,7 @@ async fn fixture(
     }
     let mut store = device_store(
         &engine,
-        BlockHost::new(SyntheticRam::new(RAM).unwrap(), DiskGrant::Mem(disk)),
+        BlockHost::new(GuestRam::new(RAM).unwrap(), DiskGrant::Mem(disk)),
     );
     let component = Component::new(&engine, component_bytes()).expect("block component compiles");
     let instance = linker
@@ -562,7 +563,7 @@ async fn component_aot_deserialize_runs() {
     let mut store = device_store(
         &engine,
         BlockHost::new(
-            crate::SyntheticRam::new(RAM).unwrap(),
+            crate::memory::GuestRam::new(RAM).unwrap(),
             DiskGrant::Mem(BoundedDisk::new(8 * 512, false)),
         ),
     );
@@ -644,7 +645,7 @@ async fn component_operates_on_shared_machine_ram() {
         )])
         .expect("maps"),
     );
-    let ram = SyntheticRam::from_shared(Arc::clone(&mem)).expect("aliases");
+    let ram = GuestRam::from_shared(Arc::clone(&mem)).expect("aliases");
     let mut disk = BoundedDisk::new(8 * 512, false);
     disk.write(2 * 512, &[0x5Eu8; 512]).expect("pattern in");
     let mut store = device_store(&engine, BlockHost::new(ram, DiskGrant::Mem(disk)));

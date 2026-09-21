@@ -1,5 +1,5 @@
 use crate::component::block::backing::{DESC_F_INDIRECT, DESC_F_NEXT, DESC_F_WRITE, Descriptor};
-use crate::{BoundedMemory, SyntheticRam};
+use crate::memory::{BoundedMemory, GuestRam};
 
 #[test]
 fn descriptor_flags_match_bindings() {
@@ -23,8 +23,8 @@ const BLK_HDR: u64 = 0x1000;
 const BLK_DATA: u64 = 0x2000;
 const BLK_STATUS: u64 = 0x3000;
 
-fn blk_ram() -> SyntheticRam {
-    SyntheticRam::new(256 * 1024).expect("256 KiB RAM")
+fn blk_ram() -> GuestRam {
+    GuestRam::new(256 * 1024).expect("256 KiB RAM")
 }
 
 fn write_blk_hdr(mem: &BoundedMemory, request_type: u32, sector: u64) {
@@ -347,7 +347,9 @@ mod file_backend {
         BLK_DATA, BLK_HDR, BLK_STATUS, blk_ram, in_chain_1sector, out_chain_1sector, status_byte,
         write_blk_hdr,
     };
-    use super::{BoundedMemory, blk};
+
+    use super::BoundedMemory;
+    use super::blk;
     use crate::component::block::backing::{
         BackingError, BlockBacking, BlockDevice, FileDisk, STATUS_IOERR, STATUS_OK,
     };
