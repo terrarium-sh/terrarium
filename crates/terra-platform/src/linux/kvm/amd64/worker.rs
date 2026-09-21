@@ -14,7 +14,7 @@ use crate::kvm::{
 };
 use crate::machine::MAX_VCPUS;
 
-pub use crate::worker::{PreparedVmm, VmmObservation, WorkerInput};
+pub use crate::worker::{PreparedVmm, WorkerInput};
 
 fn stop_timed_out(outcomes: &[Result<VcpuOutcome, KvmError>]) -> bool {
     outcomes
@@ -29,7 +29,7 @@ pub async fn prepare(mut input: WorkerInput) -> Result<PreparedVmm, KvmError> {
     }
     let kvm = open()?;
     let kvm = Arc::new(kvm);
-    let disks = crate::worker::disk_paths(&input);
+    let disks = crate::worker::devices::disk_paths(&input);
     let block_count = 1 + disks.len();
     let cpuid = build_cpuid(&kvm, input.vcpus)?;
     let share_count = input.shares.len();
@@ -66,7 +66,7 @@ pub async fn prepare(mut input: WorkerInput) -> Result<PreparedVmm, KvmError> {
         })
         .await
         .map_err(|error| KvmError::Component(error.to_string()))?;
-    crate::worker::assemble_devices(
+    crate::worker::devices::assemble_devices(
         &mut component_runtime,
         &mut input,
         machine.ram(),
@@ -78,34 +78,18 @@ pub async fn prepare(mut input: WorkerInput) -> Result<PreparedVmm, KvmError> {
         },
     )
     .map_err(KvmError::Component)?;
-    let failure = component_runtime
-        .mmio_failure_observation()
-        .map_err(|error| KvmError::Component(error.to_string()))?;
     component_runtime
         .grant_interrupt_shutdown(async move {
             interrupts.close().await.map_err(|error| error.to_string())
         })
         .map_err(|error| KvmError::Component(error.to_string()))?;
-    let lifecycle = component_runtime.lifecycle_notifier();
-    let (component_runtime, runners) = component_runtime
-        .prepare_vcpus(move |controls, boot| {
-            vcpus
-                .start(controls, boot)
-                .map_err(|error| wasmtime::Error::msg(format!("vCPU startup: {error:?}")))
-        })
-        .await
-        .map_err(|error| KvmError::Component(error.to_string()))?;
-    let teardown = component_runtime.native_teardown();
-    Ok(PreparedVmm {
-        runtime: component_runtime,
-        observation: VmmObservation {
-            reaper: runners,
-            lifecycle,
-            deadline: input.deadline,
-            failure,
-            teardown,
-        },
+    crate::worker::finish_preparation(component_runtime, input.deadline, move |controls, boot| {
+        vcpus
+            .start(controls, boot)
+            .map_err(|error| wasmtime::Error::msg(format!("vCPU startup: {error:?}")))
     })
+    .await
+    .map_err(|error| KvmError::Component(error.to_string()))
 }
 
 pub(super) fn build_cpuid(

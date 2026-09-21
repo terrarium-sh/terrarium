@@ -6,7 +6,7 @@ use terra_runtime::component::vmm::virtualization::{PreparedMachine, StartedVcpu
 use terra_runtime::component::vmm::{NativeVcpu, boot::BootEntry};
 
 use crate::macos::aarch64::machine::{Cpu, Machine, RunExit};
-use crate::worker::{self, PreparedVmm, VmmObservation, WorkerInput};
+use crate::worker::{self, PreparedVmm, WorkerInput};
 use applevisor::prelude::VcpuHandle;
 
 const STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -142,7 +142,7 @@ fn inject_irq(machine: &Machine, irq: u32, level: bool) -> wasmtime::Result<()> 
 
 #[allow(clippy::too_many_lines)]
 pub async fn prepare(mut input: WorkerInput) -> Result<PreparedVmm, String> {
-    let disks = crate::worker::disk_paths(&input);
+    let disks = crate::worker::devices::disk_paths(&input);
     let blocks = 1 + disks.len();
     let shares = input.shares.len();
     let layout = crate::aarch64::arm::build_machine_layout(input.ram_bytes, blocks, shares)
@@ -160,7 +160,7 @@ pub async fn prepare(mut input: WorkerInput) -> Result<PreparedVmm, String> {
         crate::worker::boot_prepared(component_runtime, prepared, &mut input)
             .await
             .map_err(|error| error.to_string())?;
-    worker::assemble_devices(
+    worker::devices::assemble_devices(
         &mut component_runtime,
         &mut input,
         machine.ram(),
@@ -173,27 +173,11 @@ pub async fn prepare(mut input: WorkerInput) -> Result<PreparedVmm, String> {
                 .map_err(|error| error.to_string())
         },
     )?;
-    let failure = component_runtime
-        .mmio_failure_observation()
-        .map_err(|error| error.to_string())?;
-    let lifecycle = component_runtime.lifecycle_notifier();
-    let (component_runtime, group) = component_runtime
-        .prepare_vcpus(move |controls, boot| {
-            group.start(controls, boot).map_err(wasmtime::Error::msg)
-        })
-        .await
-        .map_err(|error| error.to_string())?;
-    let teardown = component_runtime.native_teardown();
-    Ok(PreparedVmm {
-        runtime: component_runtime,
-        observation: VmmObservation {
-            reaper: group,
-            lifecycle,
-            deadline: input.deadline,
-            failure,
-            teardown,
-        },
+    crate::worker::finish_preparation(component_runtime, input.deadline, move |controls, boot| {
+        group.start(controls, boot).map_err(wasmtime::Error::msg)
     })
+    .await
+    .map_err(|error| error.to_string())
 }
 
 struct VcpuGroup {

@@ -24,7 +24,7 @@ use vm_memory::{GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 
 use crate::aarch64::arm::{GIC_DIST_BASE, GIC_REDIST_BASE, MAX_VCPUS, RAM_BASE};
 use crate::runner::{PthreadPublication, install_kick_handler, unblock_kick_signal};
-use crate::worker::{self, PreparedVmm, VmmObservation, WorkerInput};
+use crate::worker::{self, PreparedVmm, WorkerInput};
 
 const GIC_SPI_OFFSET: u32 = 32;
 const VGIC_IRQS: u32 = 128;
@@ -303,7 +303,7 @@ pub async fn prepare(mut input: WorkerInput) -> Result<PreparedVmm, ArmWorkerErr
     if input.vcpus == 0 || input.vcpus > MAX_VCPUS {
         return Err(ArmWorkerError::BadVcpuCount(input.vcpus));
     }
-    let disks = crate::worker::disk_paths(&input);
+    let disks = crate::worker::devices::disk_paths(&input);
     let blocks = 1 + disks.len();
     let shares = input.shares.len();
     let layout = crate::aarch64::arm::build_machine_layout(input.ram_bytes, blocks, shares)
@@ -325,7 +325,7 @@ pub async fn prepare(mut input: WorkerInput) -> Result<PreparedVmm, ArmWorkerErr
     let (mut runtime, machine) = crate::worker::boot_prepared(runtime, prepared, &mut input)
         .await
         .map_err(|error| component_error(&error))?;
-    worker::assemble_devices(
+    worker::devices::assemble_devices(
         &mut runtime,
         &mut input,
         machine.ram(),
@@ -337,9 +337,6 @@ pub async fn prepare(mut input: WorkerInput) -> Result<PreparedVmm, ArmWorkerErr
         },
     )
     .map_err(ArmWorkerError::Component)?;
-    let failure = runtime
-        .mmio_failure_observation()
-        .map_err(|error| ArmWorkerError::Component(error.to_string()))?;
     let interrupt_machine = machine.clone();
     runtime
         .grant_interrupt_shutdown(async move {
@@ -351,25 +348,13 @@ pub async fn prepare(mut input: WorkerInput) -> Result<PreparedVmm, ArmWorkerErr
                 .map_err(|error| format!("{error:?}"))
         })
         .map_err(|error| component_error(&error))?;
-    let (runtime, runners) = runtime
-        .prepare_vcpus(move |controls, boot| {
-            group
-                .start(controls, boot)
-                .map_err(|error| wasmtime::Error::msg(format!("ARM vCPU startup: {error:?}")))
-        })
-        .await
-        .map_err(|error| component_error(&error))?;
-    let teardown = runtime.native_teardown();
-    Ok(PreparedVmm {
-        runtime,
-        observation: VmmObservation {
-            reaper: runners,
-            lifecycle,
-            deadline: input.deadline,
-            failure,
-            teardown,
-        },
+    crate::worker::finish_preparation(runtime, input.deadline, move |controls, boot| {
+        group
+            .start(controls, boot)
+            .map_err(|error| wasmtime::Error::msg(format!("ARM vCPU startup: {error:?}")))
     })
+    .await
+    .map_err(|error| component_error(&error))
 }
 
 struct VcpuGroup {

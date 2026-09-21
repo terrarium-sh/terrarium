@@ -7,7 +7,7 @@ use terra_runtime::component::vmm::virtualization::StartedVcpus;
 
 #[cfg(target_arch = "x86_64")]
 use crate::machine::MAX_VCPUS;
-use crate::worker::{self, PreparedVmm, VmmObservation, WorkerInput};
+use crate::worker::{self, PreparedVmm, WorkerInput};
 #[cfg(target_arch = "x86_64")]
 use terra_runtime::component::vmm::interrupts::{IoApicHandle, X86Interrupt};
 use terra_runtime::component::vmm::virtualization::PreparedMachine;
@@ -184,7 +184,7 @@ async fn prepare_x64(mut input: WorkerInput) -> Result<PreparedVmm, String> {
     }
     let component_runtime =
         crate::worker::create_runtime(&input).map_err(|error| error.to_string())?;
-    let disks = crate::worker::disk_paths(&input);
+    let disks = crate::worker::devices::disk_paths(&input);
     let block_count = 1 + disks.len();
     let share_count = input.shares.len();
     let layout = crate::machine::build_machine_layout(input.ram_bytes, block_count, share_count)
@@ -229,7 +229,7 @@ async fn prepare_x64(mut input: WorkerInput) -> Result<PreparedVmm, String> {
         }))
         .await
         .map_err(|error| error.to_string())?;
-    worker::assemble_devices(
+    worker::devices::assemble_devices(
         &mut component_runtime,
         &mut input,
         ram_alias.clone(),
@@ -240,9 +240,6 @@ async fn prepare_x64(mut input: WorkerInput) -> Result<PreparedVmm, String> {
                 .map_err(|error| error.to_string())
         },
     )?;
-    let failure = component_runtime
-        .mmio_failure_observation()
-        .map_err(|error| error.to_string())?;
     let interrupt_handle = ioapic.clone();
     component_runtime
         .grant_interrupt_shutdown(async move {
@@ -252,33 +249,20 @@ async fn prepare_x64(mut input: WorkerInput) -> Result<PreparedVmm, String> {
                 .map_err(|error| error.to_string())
         })
         .map_err(|error| error.to_string())?;
-    let lifecycle = component_runtime.lifecycle_notifier();
     let launch_ioapic = ioapic.clone();
     let hard_stop = input.hard_stop;
-    let (component_runtime, runners) = component_runtime
-        .prepare_vcpus(move |controls, boot| {
-            launch_vcpus(
-                partition.machine(),
-                controls,
-                boot,
-                &launch_ioapic,
-                hard_stop,
-            )
-            .map_err(wasmtime::Error::msg)
-        })
-        .await
-        .map_err(|error| error.to_string())?;
-    let teardown = component_runtime.native_teardown();
-    Ok(PreparedVmm {
-        runtime: component_runtime,
-        observation: VmmObservation {
-            reaper: runners,
-            lifecycle,
-            deadline: input.deadline,
-            failure,
-            teardown,
-        },
+    crate::worker::finish_preparation(component_runtime, input.deadline, move |controls, boot| {
+        launch_vcpus(
+            partition.machine(),
+            controls,
+            boot,
+            &launch_ioapic,
+            hard_stop,
+        )
+        .map_err(wasmtime::Error::msg)
     })
+    .await
+    .map_err(|error| error.to_string())
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -543,7 +527,7 @@ async fn prepare_arm64(mut input: WorkerInput) -> Result<PreparedVmm, String> {
     }
     let component_runtime =
         crate::worker::create_runtime(&input).map_err(|error| error.to_string())?;
-    let disks = crate::worker::disk_paths(&input);
+    let disks = crate::worker::devices::disk_paths(&input);
     let block_count = 1 + disks.len();
     let shares = input.shares.len();
     let layout = crate::aarch64::arm::build_machine_layout(input.ram_bytes, block_count, shares)
@@ -566,7 +550,7 @@ async fn prepare_arm64(mut input: WorkerInput) -> Result<PreparedVmm, String> {
             .await
             .map_err(|error| error.to_string())?;
     let ram_alias = partition.ram();
-    worker::assemble_devices(
+    worker::devices::assemble_devices(
         &mut component_runtime,
         &mut input,
         ram_alias,
@@ -577,29 +561,12 @@ async fn prepare_arm64(mut input: WorkerInput) -> Result<PreparedVmm, String> {
                 .map_err(|error| error.to_string())
         },
     )?;
-    let failure = component_runtime
-        .mmio_failure_observation()
-        .map_err(|error| error.to_string())?;
-    let lifecycle = component_runtime.lifecycle_notifier();
     let hard_stop = input.hard_stop;
-    let (component_runtime, runners) = component_runtime
-        .prepare_vcpus(move |controls, boot| {
-            launch_vcpus(partition.machine(), controls, boot, hard_stop)
-                .map_err(wasmtime::Error::msg)
-        })
-        .await
-        .map_err(|error| error.to_string())?;
-    let teardown = component_runtime.native_teardown();
-    Ok(PreparedVmm {
-        runtime: component_runtime,
-        observation: VmmObservation {
-            reaper: runners,
-            lifecycle,
-            deadline: input.deadline,
-            failure,
-            teardown,
-        },
+    crate::worker::finish_preparation(component_runtime, input.deadline, move |controls, boot| {
+        launch_vcpus(partition.machine(), controls, boot, hard_stop).map_err(wasmtime::Error::msg)
     })
+    .await
+    .map_err(|error| error.to_string())
 }
 
 #[cfg(target_arch = "aarch64")]
