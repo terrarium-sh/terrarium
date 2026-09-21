@@ -173,7 +173,9 @@ pub async fn prepare(mut input: WorkerInput) -> Result<PreparedVmm, String> {
                 .map_err(|error| error.to_string())
         },
     )?;
-    let failure = component_runtime.mmio_failure_observation()?;
+    let failure = component_runtime
+        .mmio_failure_observation()
+        .map_err(|error| error.to_string())?;
     let lifecycle = component_runtime.lifecycle_notifier();
     let (component_runtime, group) = component_runtime
         .prepare_vcpus(move |controls, boot| {

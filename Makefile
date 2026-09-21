@@ -6,6 +6,9 @@
 
 CARGO ?= cargo
 CARGO_LOCKED := $(CARGO) --locked
+KEEP_GOING ?= 0
+TEST_FLAGS := $(if $(filter 1,$(KEEP_GOING)),--no-fail-fast)
+CHECK_FAILURE = $(if $(filter 1,$(KEEP_GOING)),status=1,exit $$?)
 COMPONENT_TOOLCHAIN := $(shell sed -n 's/^channel = "\(.*\)"/\1/p' components/rust-toolchain.toml)
 WASM_TOOLS_VERSION := 1.248.0
 CARGO_FUZZ_VERSION := 0.13.1
@@ -282,7 +285,7 @@ host-build: check-guest-assets $(COMPONENT_AOT_TARGETS)
 	$(CARGO_LOCKED) build --release -p terra --target $(TERRA_TARGET)
 
 test-component-vmm: dist
-	TERRA_BIN=$(abspath $(DIST)/terra) $(CARGO_LOCKED) test -p terra --test boot --test memory -- --ignored
+	TERRA_BIN=$(abspath $(DIST)/terra) $(CARGO_LOCKED) test $(TEST_FLAGS) -p terra --test boot --test memory -- --ignored
 
 ## Components use their pinned nightly wasm toolchain in their own workspace,
 ## then the trusted native compiler produces each embedded AOT blob.
@@ -301,33 +304,38 @@ $(COMPONENT_AOT_TARGETS): component-%-aot: component-%
 	$(CARGO_LOCKED) run --target $(TERRA_TARGET) -p terra-runtime --features compiler --example precompile-component -- $(COMPONENT_WASM_DIR)/terra_$*_component.wasm $(BUILD)/terra-$*-component.cwasm $(if $(filter policy,$*),--policy,)
 
 test-component-boot: $(COMPONENT_AOT_TARGETS) $(KERNEL_GZ) $(ROOTFS_IMG) $(BOOT_IMG)
-	$(CARGO_LOCKED) test -p terra-platform --lib -- --ignored --nocapture
+	$(CARGO_LOCKED) test $(TEST_FLAGS) -p terra-platform --lib -- --ignored --nocapture
 
 ## Format check, lints, and the test suite. Generating the man pages is
 ## `man`'s job, not this one's — a test that writes to the working tree is a
 ## surprise nobody wants from `cargo test`. The boot suite is separate:
 ## `make dist && TERRA_BIN=$PWD/dist/terra cargo test -p terra --test boot -- --ignored`
 ## (needs /dev/kvm).
-verify: verify-components verify-workspace
+verify:
+	$(MAKE) $(if $(filter 1,$(KEEP_GOING)),--keep-going) verify-components verify-workspace
 
-verify-source: verify-wit
-	python3 -B scripts/check-tool-versions.py
-	python3 -B scripts/test-kernel-tools.py
-	python3 -B scripts/test-alpine-sources.py
-	python3 -B scripts/test-pin-updates.py
-	scripts/test-install.sh
-	$(CARGO) fmt --all -- --check
-	$(CARGO) fmt --manifest-path fuzz/Cargo.toml -- --check
-	RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO) fmt --manifest-path $(COMPONENT_MANIFEST) -- --check
+verify-source:
+	@status=0; \
+	$(MAKE) verify-wit || $(CHECK_FAILURE); \
+	python3 -B scripts/check-tool-versions.py || $(CHECK_FAILURE); \
+	python3 -B scripts/test-kernel-tools.py || $(CHECK_FAILURE); \
+	python3 -B scripts/test-alpine-sources.py || $(CHECK_FAILURE); \
+	python3 -B scripts/test-pin-updates.py || $(CHECK_FAILURE); \
+	scripts/test-install.sh || $(CHECK_FAILURE); \
+	$(CARGO) fmt --all -- --check || $(CHECK_FAILURE); \
+	$(CARGO) fmt --manifest-path fuzz/Cargo.toml -- --check || $(CHECK_FAILURE); \
+	RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO) fmt --manifest-path $(COMPONENT_MANIFEST) -- --check || $(CHECK_FAILURE); \
+	exit $$status
 
-verify-workspace: verify-source
-	$(CARGO_LOCKED) clippy --workspace --all-targets --target $(MUSL) -- -D warnings
-	$(CARGO_LOCKED) clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
-## The crates deny rustdoc::broken_intra_doc_links, which only fires under
-## `cargo doc` — without this step a stale [`link`] survives verify.
-	$(CARGO_LOCKED) doc --workspace --no-deps --document-private-items --target $(MUSL)
-	$(CARGO_LOCKED) test --workspace --target $(MUSL)
-	$(CARGO_LOCKED) test -p terra-runtime --target $(MUSL) --features thread-experiments --test shared_component_memory --test shared_worker_memory
+verify-workspace:
+	@status=0; \
+	$(MAKE) verify-source || $(CHECK_FAILURE); \
+	$(CARGO_LOCKED) clippy --workspace --all-targets --target $(MUSL) -- -D warnings || $(CHECK_FAILURE); \
+	$(CARGO_LOCKED) clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings || $(CHECK_FAILURE); \
+	$(CARGO_LOCKED) doc --workspace --no-deps --document-private-items --target $(MUSL) || $(CHECK_FAILURE); \
+	$(CARGO_LOCKED) test $(TEST_FLAGS) --workspace --target $(MUSL) || $(CHECK_FAILURE); \
+	$(CARGO_LOCKED) test $(TEST_FLAGS) -p terra-runtime --target $(MUSL) --features thread-experiments --test shared_component_memory --test shared_worker_memory || $(CHECK_FAILURE); \
+	exit $$status
 
 test-install:
 	scripts/test-install.sh
@@ -336,10 +344,12 @@ verify-components: $(COMPONENT_AOT_TARGETS) $(KERNEL_GZ) $(ROOTFS_IMG) $(VOLUME_
 verify-host-components: check-guest-assets $(COMPONENT_AOT_TARGETS)
 
 verify-components verify-host-components:
-	RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO) fmt --manifest-path $(COMPONENT_MANIFEST) -- --check
-	RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO_LOCKED) clippy --workspace --target wasm32-wasip3 --manifest-path $(COMPONENT_MANIFEST) -- -D warnings
-	RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO_LOCKED) clippy --workspace --all-targets --target $(NATIVE) --manifest-path $(COMPONENT_MANIFEST) -- -D warnings
-	RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO_LOCKED) test --workspace --target $(NATIVE) --manifest-path $(COMPONENT_MANIFEST)
+	@status=0; \
+	RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO) fmt --manifest-path $(COMPONENT_MANIFEST) -- --check || $(CHECK_FAILURE); \
+	RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO_LOCKED) clippy --workspace --target wasm32-wasip3 --manifest-path $(COMPONENT_MANIFEST) -- -D warnings || $(CHECK_FAILURE); \
+	RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO_LOCKED) clippy --workspace --all-targets --target $(NATIVE) --manifest-path $(COMPONENT_MANIFEST) -- -D warnings || $(CHECK_FAILURE); \
+	RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO_LOCKED) test $(TEST_FLAGS) --workspace --target $(NATIVE) --manifest-path $(COMPONENT_MANIFEST) || $(CHECK_FAILURE); \
+	exit $$status
 
 check-zig:
 	@test "$$(zig version)" = "$(ZIG_VERSION)" || { echo "need Zig $(ZIG_VERSION), found $$(zig version)" >&2; exit 1; }

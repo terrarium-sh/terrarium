@@ -38,10 +38,9 @@ jobs:
           persist-credentials: false
       - name: Install component formatter
         run: rustup toolchain install nightly-2026-09-16 --profile minimal --component rustfmt
-      - run: make verify-source
+      - run: make KEEP_GOING=1 verify-source
 
   guest-assets:
-    needs: verify
     name: Linux guest (${{ matrix.arch }})
     runs-on: ubuntu-latest
     strategy:
@@ -115,6 +114,7 @@ jobs:
   linux-x86_64:
     name: Build Linux (x86_64)
     needs: guest-assets
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -146,8 +146,12 @@ jobs:
         with:
           name: terra-guest-x86_64
           path: build
-      - name: Verify and build host
-        run: make verify-host-components verify-workspace host-dist
+      - name: Build host
+        id: host-build
+        run: make host-dist
+      - name: Verify host
+        if: ${{ !cancelled() && steps.host-build.outcome == 'success' }}
+        run: make --keep-going KEEP_GOING=1 verify-host-components verify-workspace
       - name: Check distribution
         run: |
           ./dist/terra --version
@@ -155,40 +159,50 @@ jobs:
           file ./dist/terra | grep -q 'statically linked'
           ! ldd ./dist/terra 2>&1 | grep -q '=>'
       - name: Network policy coverage
+        if: ${{ !cancelled() && steps.host-build.outcome == 'success' }}
         run: |
           rustup component add llvm-tools-preview
           llvm_bin="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin"
           LLVM_COV="$llvm_bin/llvm-cov" LLVM_PROFDATA="$llvm_bin/llvm-profdata" python3 scripts/coverage-network-policy.py
       - name: KVM gates
+        if: ${{ !cancelled() && steps.host-build.outcome == 'success' }}
         timeout-minutes: 15
         run: |
           if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
             echo '::notice title=KVM gates skipped::This hosted runner has no read/write /dev/kvm.'
             exit 0
           fi
-          TERRA_BIN="$PWD/dist/terra" cargo test --locked --target x86_64-unknown-linux-musl -p terra --test native_boot native_boot_executes_shell -- --ignored --test-threads=1 --nocapture
-          TERRA_BIN="$PWD/dist/terra" cargo test --locked --target x86_64-unknown-linux-musl -p terra --test native_boot native_boot_forwards_shared_file_events -- --ignored --test-threads=1 --nocapture
-          cargo test --locked --target x86_64-unknown-linux-musl -p terra-platform --lib -- --ignored --test-threads=1
-          TERRA_BIN="$PWD/dist/terra" cargo test --locked --target x86_64-unknown-linux-musl -p terra --test boot --test memory -- --ignored --test-threads=1
+          status=0
+          TERRA_BIN="$PWD/dist/terra" cargo test --no-fail-fast --locked --target x86_64-unknown-linux-musl -p terra --test native_boot native_boot_executes_shell -- --ignored --test-threads=1 --nocapture || status=1
+          TERRA_BIN="$PWD/dist/terra" cargo test --no-fail-fast --locked --target x86_64-unknown-linux-musl -p terra --test native_boot native_boot_forwards_shared_file_events -- --ignored --test-threads=1 --nocapture || status=1
+          cargo test --no-fail-fast --locked --target x86_64-unknown-linux-musl -p terra-platform --lib -- --ignored --test-threads=1 || status=1
+          TERRA_BIN="$PWD/dist/terra" cargo test --no-fail-fast --locked --target x86_64-unknown-linux-musl -p terra --test boot --test memory -- --ignored --test-threads=1 || status=1
+          exit "$status"
       - name: Reclaim component build space
+        if: ${{ !cancelled() }}
         run: rm -rf components/target
       - name: Fuzz smoke
+        if: ${{ !cancelled() && steps.host-build.outcome == 'success' }}
         run: |
           cargo install cargo-fuzz --version 0.13.1 --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
           cargo metadata --locked --manifest-path fuzz/Cargo.toml --format-version 1
-          cargo +nightly-2026-09-16 fuzz run network_policy -- -max_total_time=60 -max_len=4096
-          cargo +nightly-2026-09-16 fuzz run native_memory -- -max_total_time=60 -max_len=32768
-          cargo +nightly-2026-09-16 fuzz run device_queue -- -max_total_time=60 -max_len=4096
-          cargo +nightly-2026-09-16 fuzz run fuse_wire -- -max_total_time=60 -max_len=4096
-          cargo +nightly-2026-09-16 fuzz run vsock_header -- -max_total_time=60 -max_len=4096
-          cargo +nightly-2026-09-16 fuzz run protocol_frames -- -max_total_time=60 -max_len=4096
+          status=0
+          cargo +nightly-2026-09-16 fuzz run network_policy -- -max_total_time=60 -max_len=4096 || status=1
+          cargo +nightly-2026-09-16 fuzz run native_memory -- -max_total_time=60 -max_len=32768 || status=1
+          cargo +nightly-2026-09-16 fuzz run device_queue -- -max_total_time=60 -max_len=4096 || status=1
+          cargo +nightly-2026-09-16 fuzz run fuse_wire -- -max_total_time=60 -max_len=4096 || status=1
+          cargo +nightly-2026-09-16 fuzz run vsock_header -- -max_total_time=60 -max_len=4096 || status=1
+          cargo +nightly-2026-09-16 fuzz run protocol_frames -- -max_total_time=60 -max_len=4096 || status=1
+          exit "$status"
       - name: Reclaim fuzz build space
+        if: ${{ !cancelled() }}
         run: rm -rf fuzz/target
       - name: Native boundary address sanitizer
+        if: ${{ !cancelled() && steps.host-build.outcome == 'success' }}
         env:
           RUSTFLAGS: -Zsanitizer=address
           CARGO_TARGET_DIR: target/asan
-        run: cargo +nightly-2026-09-16 test --locked -p terra-runtime --test native_boundary --target x86_64-unknown-linux-gnu
+        run: cargo +nightly-2026-09-16 test --no-fail-fast --locked -p terra-runtime --test native_boundary --target x86_64-unknown-linux-gnu
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: terra-x86_64-linux
@@ -197,6 +211,7 @@ jobs:
   linux-aarch64:
     name: Build Linux (aarch64)
     needs: guest-assets
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -231,23 +246,35 @@ jobs:
       - name: Install wasm-tools
         run: |
           cargo install wasm-tools --version 1.248.0 --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
-      - name: Build and verify native ARM target
+      - name: Build native ARM target
+        id: host-build
+        run: make host-dist
+      - name: Verify native ARM target
+        if: ${{ !cancelled() && steps.host-build.outcome == 'success' }}
         run: |
-          make verify-host-components host-dist
-          cargo fmt --all -- --check
-          cargo clippy --locked --workspace --all-targets --target aarch64-unknown-linux-musl -- -D warnings
-          cargo test --locked --target aarch64-unknown-linux-musl --workspace
+          status=0
+          make KEEP_GOING=1 verify-host-components || status=1
+          cargo fmt --all -- --check || status=1
+          cargo clippy --locked --workspace --all-targets --target aarch64-unknown-linux-musl -- -D warnings || status=1
+          cargo test --no-fail-fast --locked --target aarch64-unknown-linux-musl --workspace || status=1
+          exit "$status"
+      - name: Check distribution
+        if: ${{ !cancelled() && steps.host-build.outcome == 'success' }}
+        run: |
           ./dist/terra --version
           ./dist/terra --help
       - name: KVM product gates
+        if: ${{ !cancelled() && steps.host-build.outcome == 'success' }}
         run: |
           if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
             echo '::notice title=KVM gates skipped::This hosted runner has no read/write /dev/kvm.'
             exit 0
           fi
-          cargo test --locked --target aarch64-unknown-linux-musl -p terra-platform --lib -- --ignored --test-threads=1
-          TERRA_BIN="$PWD/dist/terra" cargo test --locked --target aarch64-unknown-linux-musl -p terra --test native_boot native_boot_forwards_shared_file_events -- --ignored --test-threads=1 --nocapture
-          TERRA_BIN="$PWD/dist/terra" cargo test --locked --target aarch64-unknown-linux-musl -p terra --test boot --test memory -- --ignored --test-threads=1
+          status=0
+          cargo test --no-fail-fast --locked --target aarch64-unknown-linux-musl -p terra-platform --lib -- --ignored --test-threads=1 || status=1
+          TERRA_BIN="$PWD/dist/terra" cargo test --no-fail-fast --locked --target aarch64-unknown-linux-musl -p terra --test native_boot native_boot_forwards_shared_file_events -- --ignored --test-threads=1 --nocapture || status=1
+          TERRA_BIN="$PWD/dist/terra" cargo test --no-fail-fast --locked --target aarch64-unknown-linux-musl -p terra --test boot --test memory -- --ignored --test-threads=1 || status=1
+          exit "$status"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: terra-aarch64-linux
@@ -256,6 +283,7 @@ jobs:
   macos-aarch64:
     name: Build macOS (aarch64)
     needs: guest-assets
+    if: ${{ !cancelled() }}
     runs-on: macos-15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -279,21 +307,26 @@ jobs:
         run: |
           cargo install wasm-tools --version 1.248.0 --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
       - name: Build and sign
+        id: host-build
         run: |
           make TERRA_TARGET=aarch64-apple-darwin host-dist
           codesign --force --sign - --entitlements packaging/macos.entitlements dist/terra
           codesign --verify --strict --verbose=2 dist/terra
-          cargo clippy --locked --workspace --all-targets --target aarch64-apple-darwin -- -D warnings
-          cargo test --locked --target aarch64-apple-darwin --workspace
           ./dist/terra --version
           ./dist/terra --help
+      - name: Check native target
+        if: ${{ !cancelled() && steps.host-build.outcome == 'success' }}
+        run: cargo clippy --locked --workspace --all-targets --target aarch64-apple-darwin -- -D warnings
+      - name: Run workspace unit tests
+        if: ${{ !cancelled() && steps.host-build.outcome == 'success' }}
+        run: cargo test --no-fail-fast --locked --target aarch64-apple-darwin --workspace
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
-        if: ${{ inputs.native_vm_tests }}
+        if: ${{ !cancelled() && steps.host-build.outcome == 'success' && inputs.native_vm_tests }}
         with:
           version: 0.16.0
       - name: Native VM acceptance
-        if: ${{ inputs.native_vm_tests }}
-        run: TERRA_BIN="$PWD/dist/terra" cargo test --locked --target aarch64-apple-darwin -p terra --test native_boot --test boot --test memory -- --ignored --test-threads=1 --nocapture
+        if: ${{ !cancelled() && steps.host-build.outcome == 'success' && inputs.native_vm_tests }}
+        run: TERRA_BIN="$PWD/dist/terra" cargo test --no-fail-fast --locked --target aarch64-apple-darwin -p terra --test native_boot --test boot --test memory -- --ignored --test-threads=1 --nocapture
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: terra-aarch64-macos
@@ -302,6 +335,7 @@ jobs:
   windows:
     name: Build Windows (${{ matrix.guest }})
     needs: guest-assets
+    if: ${{ !cancelled() }}
     strategy:
       fail-fast: false
       matrix:
@@ -335,6 +369,7 @@ jobs:
             components
           key: ${{ matrix.target }}
       - name: Build distribution
+        id: host-build
         shell: pwsh
         run: ./scripts/build-host.ps1 -Target ${{ matrix.target }}
       - name: Check native target
@@ -342,6 +377,7 @@ jobs:
         run: |
           cargo clippy --locked --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
       - name: Run workspace unit tests
+        if: ${{ !cancelled() && steps.host-build.outcome == 'success' }}
         shell: pwsh
         run: cargo test --locked --target ${{ matrix.target }} --workspace --no-fail-fast
       - name: Check distribution
@@ -352,12 +388,12 @@ jobs:
           ./dist/terra.exe --help
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Native boot and shell gate
-        if: ${{ inputs.native_vm_tests || matrix.native_vm_tests }}
+        if: ${{ !cancelled() && steps.host-build.outcome == 'success' && (inputs.native_vm_tests || matrix.native_vm_tests) }}
         timeout-minutes: 10
         shell: pwsh
         run: |
           $env:TERRA_BIN = (Resolve-Path ./dist/terra.exe).Path
-          cargo test --locked --target ${{ matrix.target }} -p terra --test native_boot native_boot_executes_shell -- --ignored --test-threads=1 --nocapture
+          cargo test --no-fail-fast --locked --target ${{ matrix.target }} -p terra --test native_boot native_boot_executes_shell -- --ignored --test-threads=1 --nocapture
       - name: Report Windows boot coverage
         if: ${{ !(inputs.native_vm_tests || matrix.native_vm_tests) }}
         shell: pwsh
@@ -365,15 +401,15 @@ jobs:
           '### Windows boot was not tested' >> $env:GITHUB_STEP_SUMMARY
           'Set WINDOWS_X64_VM_RUNNER or WINDOWS_ARM64_VM_RUNNER to a runner label with working WHP to enable the required boot and shell gate.' >> $env:GITHUB_STEP_SUMMARY
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
-        if: ${{ inputs.native_vm_tests }}
+        if: ${{ !cancelled() && steps.host-build.outcome == 'success' && inputs.native_vm_tests }}
         with:
           version: 0.16.0
       - name: Native VM acceptance
-        if: ${{ inputs.native_vm_tests }}
+        if: ${{ !cancelled() && steps.host-build.outcome == 'success' && inputs.native_vm_tests }}
         shell: pwsh
         run: |
           $env:TERRA_BIN = (Resolve-Path ./dist/terra.exe).Path
-          cargo test --locked --target ${{ matrix.target }} -p terra --test native_boot --test boot --test memory -- --ignored --test-threads=1 --nocapture
+          cargo test --no-fail-fast --locked --target ${{ matrix.target }} -p terra --test native_boot --test boot --test memory -- --ignored --test-threads=1 --nocapture
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: terra-${{ matrix.target }}

@@ -149,6 +149,7 @@ tested artifact, host, commands, and results for the 2026-09-13 review.
 
 ```sh
 make verify                 # component builds/tests, kernel-tool tests, fmt, Clippy, rustdoc, workspace tests
+make verify KEEP_GOING=1    # run all independent checks and test suites, then report failure (CI mode)
 make man                    # generated man pages
 ```
 

@@ -2249,9 +2249,10 @@ async fn kernel_boots_foreground_session_reports_workload_exit() {
         control: None,
         diagnostics: None,
     });
-    let (outcome, client) = tokio::time::timeout(std::time::Duration::from_secs(75), async {
-        tokio::join!(worker, client)
-    })
+    let (outcome, client) = Box::pin(tokio::time::timeout(
+        std::time::Duration::from_secs(75),
+        async { tokio::join!(worker, client) },
+    ))
     .await
     .expect("foreground workload finishes within its bound");
     let (output, exit_code) = client
@@ -2417,14 +2418,14 @@ fn published_http_response(port: u16, host_closes_first: bool) -> std::io::Resul
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires a native hypervisor, component AOT artifacts, and boot assets"]
 async fn kernel_boots_published_loopback_http() {
-    assert_published_loopback_http(false).await;
+    Box::pin(assert_published_loopback_http(false)).await;
 }
 
 /// A host finishing its request can still receive the complete guest response and EOF.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires a native hypervisor, component AOT artifacts, and boot assets"]
 async fn kernel_boots_published_loopback_http_after_host_eof() {
-    assert_published_loopback_http(true).await;
+    Box::pin(assert_published_loopback_http(true)).await;
 }
 
 async fn assert_published_loopback_http(host_closes_first: bool) {
@@ -2471,9 +2472,10 @@ async fn assert_published_loopback_http(host_closes_first: bool) {
         control: Some(control),
         diagnostics: Some(diagnostics.reopen().expect("reopen diagnostics")),
     });
-    let (outcome, response) = tokio::time::timeout(std::time::Duration::from_secs(75), async {
-        tokio::join!(worker, client)
-    })
+    let (outcome, response) = Box::pin(tokio::time::timeout(
+        std::time::Duration::from_secs(75),
+        async { tokio::join!(worker, client) },
+    ))
     .await
     .unwrap_or_else(|error| {
         panic!(
