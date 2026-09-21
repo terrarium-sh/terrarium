@@ -11,7 +11,7 @@ pub(crate) fn assemble_devices(
     bind_interrupt: impl Fn(
         terra_runtime::component::vmm::DeviceKind,
         usize,
-    ) -> Result<terra_runtime::component::network::Interrupt, String>,
+    ) -> Result<terra_runtime::component::InterruptCallback, String>,
 ) -> Result<(), String> {
     use terra_runtime::component::vmm::DeviceKind;
     blocks(runtime, ram.clone(), input, disks, |index| {
@@ -48,7 +48,7 @@ fn blocks(
     ram: impl Into<terra_runtime::component::vmm::RamGrant> + Send,
     input: &mut WorkerInput,
     disks: &[(PathBuf, bool)],
-    interrupt: impl Fn(usize) -> Result<terra_runtime::component::block::Interrupt, String>,
+    interrupt: impl Fn(usize) -> Result<terra_runtime::component::InterruptCallback, String>,
 ) -> Result<Vec<terra_runtime::component::DeviceChannel>, String> {
     use terra_runtime::component::block::backing::{DiskGrant, FileDisk};
     use terra_runtime::component::block::host::BlockHost;
@@ -77,7 +77,7 @@ fn blocks(
     for (index, (disk, readonly)) in disks.enumerate() {
         let ram = ram.clone();
         let host = move || Ok(BlockHost::new(ram.resolve()?, disk));
-        let channel = terra_runtime::component::block::grant_shared(
+        let channel = terra_runtime::component::block::register_device_with_host_factory(
             runtime,
             host,
             &component,
@@ -94,7 +94,7 @@ fn network(
     runtime: &mut terra_runtime::box_runtime::BoxRuntime,
     ram: impl Into<terra_runtime::component::vmm::RamGrant> + Send,
     input: &WorkerInput,
-    interrupt: terra_runtime::component::network::Interrupt,
+    interrupt: terra_runtime::component::InterruptCallback,
 ) -> Result<terra_runtime::component::DeviceChannel, String> {
     use terra_runtime::component::context::DeviceContext;
 
@@ -104,7 +104,7 @@ fn network(
         .deserialize(runtime.store.engine())
         .map_err(|error| error.to_string())?;
     let ram = ram.into();
-    terra_runtime::component::network::grant_shared(
+    terra_runtime::component::network::register_device_with_host_factory(
         runtime,
         move || Ok(DeviceContext::with_ram(ram.resolve()?)),
         &component,
@@ -121,7 +121,7 @@ fn filesystems(
     runtime: &mut terra_runtime::box_runtime::BoxRuntime,
     ram: impl Into<terra_runtime::component::vmm::RamGrant> + Send,
     input: &WorkerInput,
-    interrupt: impl Fn(usize) -> Result<terra_runtime::component::network::Interrupt, String>,
+    interrupt: impl Fn(usize) -> Result<terra_runtime::component::InterruptCallback, String>,
 ) -> Result<Vec<terra_runtime::component::DeviceChannel>, String> {
     use terra_runtime::component::context::DeviceContext;
 
@@ -156,7 +156,7 @@ fn filesystems(
                 ),
             )
         };
-        let channel = terra_runtime::component::fs::grant_shared(
+        let channel = terra_runtime::component::fs::register_device_with_host_factory(
             runtime,
             host,
             &component,
@@ -192,7 +192,7 @@ fn memory(
     runtime: &mut terra_runtime::box_runtime::BoxRuntime,
     ram: impl Into<terra_runtime::component::vmm::RamGrant> + Send,
     input: &WorkerInput,
-    interrupt: terra_runtime::component::network::Interrupt,
+    interrupt: terra_runtime::component::InterruptCallback,
 ) -> Result<terra_runtime::component::DeviceChannel, String> {
     use terra_runtime::component::context::DeviceContext;
 
@@ -203,15 +203,17 @@ fn memory(
         .map_err(|error| error.to_string())?;
     let ram = ram.into();
     let host = move || Ok(DeviceContext::with_ram(ram.resolve()?));
-    terra_runtime::component::mem::grant_shared(runtime, host, &component, interrupt)
-        .map_err(|error| error.to_string())
+    terra_runtime::component::mem::register_device_with_host_factory(
+        runtime, host, &component, interrupt,
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn vsock(
     runtime: &mut terra_runtime::box_runtime::BoxRuntime,
     ram: impl Into<terra_runtime::component::vmm::RamGrant> + Send,
     input: &mut WorkerInput,
-    interrupt: terra_runtime::component::network::Interrupt,
+    interrupt: terra_runtime::component::InterruptCallback,
 ) -> Result<terra_runtime::component::vsock::VsockChannel, String> {
     let listener = input.listener.take();
     let control = input.control.take();

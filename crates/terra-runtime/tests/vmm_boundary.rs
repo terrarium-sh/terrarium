@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use terra_runtime::box_runtime::{BoxHost, BoxRuntime};
-use terra_runtime::component::Interrupt;
+use terra_runtime::component::InterruptCallback;
 use terra_runtime::component::context::{DeviceContext, device_component_linker};
 use terra_runtime::component::vmm::{
     Architecture, BootEntry, Completion, Device, DeviceKind, Exit, MachineConfig, PreparedMachine,
@@ -59,7 +59,7 @@ async fn attach_test_machine(
     runtime.attach_machine(prepared).await.expect("attach VM")
 }
 
-fn no_interrupt() -> Interrupt {
+fn no_interrupt() -> InterruptCallback {
     Arc::new(|_| Ok(()))
 }
 
@@ -99,7 +99,7 @@ async fn wasm_vmm_routes_native_exits_and_stops_with_the_box() {
         .expect("router");
     let (mut runtime, machine) = attach_test_machine(runtime, ram.clone()).await;
     let ram_grant = machine.ram();
-    let memory = terra_runtime::component::mem::grant_shared(
+    let memory = terra_runtime::component::mem::register_device_with_host_factory(
         &mut runtime,
         move || Ok(DeviceContext::with_ram(ram_grant.resolve()?)),
         &memory(&engine),
@@ -533,7 +533,7 @@ async fn deferred_device_failure_prevents_cpu_launch() {
         .await
         .expect("router");
     let (mut runtime, _) = attach_test_machine(runtime, ram.clone()).await;
-    let _channel = terra_runtime::component::block::instantiate_shared(
+    let _channel = terra_runtime::component::block::register_device(
         &mut runtime,
         terra_runtime::component::block::host::BlockHost::new(
             ram,
@@ -589,7 +589,7 @@ async fn wasi_composes_multiple_deferred_workers_with_their_final_mappings() {
             ram.clone(),
             DiskGrant::Mem(BoundedDisk::new(bytes, false)),
         );
-        let channel = terra_runtime::component::block::instantiate_shared(
+        let channel = terra_runtime::component::block::register_device(
             &mut runtime,
             host,
             &block,
@@ -640,7 +640,7 @@ async fn wasi_lifecycle_closes_a_device_through_the_running_mmio_bridge() {
         .await
         .expect("router");
     let (mut runtime, _) = attach_test_machine(runtime, ram.clone()).await;
-    let channel = terra_runtime::component::mem::instantiate_shared(
+    let channel = terra_runtime::component::mem::register_device(
         &mut runtime,
         DeviceContext::with_ram(ram),
         &memory(&engine),
@@ -722,7 +722,7 @@ async fn wasi_irq_lines_drain_assertions_before_vm_release() {
         .expect("router");
     let ram = GuestRam::new(8 << 20).expect("RAM");
     let (mut runtime, _) = attach_test_machine(runtime, ram.clone()).await;
-    terra_runtime::component::mem::instantiate_shared(
+    terra_runtime::component::mem::register_device(
         &mut runtime,
         DeviceContext::with_ram(ram),
         &memory(&engine),

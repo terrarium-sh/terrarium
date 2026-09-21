@@ -148,7 +148,7 @@ impl<M: VirtualMachine> MachineHandle<M> {
         kind: super::bindings::machine::DeviceKind,
         ordinal: usize,
         inject: impl Fn(&M, u32, bool) -> wasmtime::Result<()> + Send + Sync + 'static,
-    ) -> wasmtime::Result<crate::component::Interrupt> {
+    ) -> wasmtime::Result<crate::component::InterruptCallback> {
         let irq = self
             .0
             .devices

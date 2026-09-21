@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use terra_runtime::box_runtime::{BoxHost, BoxRuntime};
-use terra_runtime::component::Interrupt;
+use terra_runtime::component::InterruptCallback;
 use terra_runtime::component::vsock::VsockChannel;
 use terra_runtime::engine::device_engine;
 use terra_runtime::memory::{BoundedMemory, GuestRam};
@@ -29,7 +29,7 @@ const TX_DATA: u64 = 0x1_8000;
 const PACKET_BYTES: usize = 4096;
 const EXPECTED_REPLIES: u16 = 9;
 
-fn no_interrupt() -> Interrupt {
+fn no_interrupt() -> InterruptCallback {
     Arc::new(|_| Ok(()))
 }
 

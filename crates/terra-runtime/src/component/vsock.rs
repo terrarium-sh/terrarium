@@ -112,7 +112,7 @@ struct VsockWorkerGrant {
     listener: Option<UnixListener>,
     control: Option<UnixStream>,
     diagnostics: Option<std::fs::File>,
-    interrupt: crate::component::Interrupt,
+    interrupt: crate::component::InterruptCallback,
     ram: RamGrant,
     closing: Arc<AtomicBool>,
     lifecycle: crate::component::vmm::lifecycle::LifecycleNotifier,
@@ -145,7 +145,7 @@ impl VsockWorkerGrant {
             .map_err(|error| error.context("vsock component configuration"))?;
         configured.map_err(|error| wasmtime::Error::msg(format!("vsock configure: {error:?}")))?;
         let serve = instance.terra_mmio_device().func_serve();
-        let worker = crate::component::worker::Worker {
+        let device_loop = crate::component::device_loop::DeviceLoop {
             run: api.func_run(),
             interrupt: self.interrupt,
         };
@@ -165,7 +165,7 @@ impl VsockWorkerGrant {
         child.register_loop(Box::new(move |accessor| {
             Box::pin(run_worker(
                 accessor,
-                worker,
+                device_loop,
                 diagnostics,
                 self.completion,
                 wake,
@@ -186,7 +186,7 @@ impl VsockChannel {
         listener: Option<UnixListener>,
         control: Option<UnixStream>,
         diagnostics: Option<std::fs::File>,
-        interrupt: crate::component::network::Interrupt,
+        interrupt: crate::component::InterruptCallback,
     ) -> wasmtime::Result<Self> {
         Self::from_component(
             runtime,
@@ -209,7 +209,7 @@ impl VsockChannel {
         listener: Option<UnixListener>,
         control: Option<UnixStream>,
         diagnostics: Option<std::fs::File>,
-        interrupt: crate::component::network::Interrupt,
+        interrupt: crate::component::InterruptCallback,
     ) -> wasmtime::Result<Self> {
         if runtime.has_component(crate::component::vmm::bindings::machine::DeviceKind::Vsock) {
             return Err(wasmtime::Error::msg("box already has a vsock component"));
@@ -285,14 +285,14 @@ impl VsockChannel {
 
 async fn run_worker(
     accessor: &Accessor<StoreState<VsockDeviceHost>>,
-    worker: crate::component::worker::Worker<VsockError>,
+    device_loop: crate::component::device_loop::DeviceLoop<VsockError>,
     diagnostics: Option<DiagnosticSink>,
     completion: tokio::sync::oneshot::Sender<wasmtime::Result<()>>,
     wake: Arc<tokio::sync::Notify>,
     shared_closing: Arc<AtomicBool>,
 ) -> wasmtime::Result<()> {
     let result = async {
-        worker.drive(accessor, wake, "vsock").await?;
+        device_loop.drive(accessor, wake, "vsock").await?;
         wasmtime::ensure!(
             shared_closing.load(Ordering::Acquire),
             "vsock worker stopped"

@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use terra_network::{GuestNetworkConfig, Policy, PolicyHandle};
 use terra_runtime::box_runtime::{BoxHost, BoxRuntime};
-use terra_runtime::component::Interrupt;
+use terra_runtime::component::InterruptCallback;
 use terra_runtime::component::block::backing::{BoundedDisk, DiskGrant};
 use terra_runtime::component::context::DeviceContext;
 use terra_runtime::component::fs::{FsHost, ShareGrant};
@@ -31,7 +31,7 @@ impl Policy for NoNetwork {
     }
 }
 
-fn no_interrupt() -> Interrupt {
+fn no_interrupt() -> InterruptCallback {
     Arc::new(|_| Ok(()))
 }
 
@@ -100,7 +100,7 @@ async fn every_device_resets_and_closes_in_one_box_runtime() {
         ram.clone(),
         DiskGrant::Mem(BoundedDisk::new(4096, false)),
     );
-    let block = terra_runtime::component::block::instantiate_shared(
+    let block = terra_runtime::component::block::register_device(
         &mut runtime,
         block_host,
         &block_component,
@@ -108,7 +108,7 @@ async fn every_device_resets_and_closes_in_one_box_runtime() {
         no_interrupt(),
     )
     .expect("block");
-    let filesystem = terra_runtime::component::fs::instantiate_shared(
+    let filesystem = terra_runtime::component::fs::register_device(
         &mut runtime,
         FsHost::new(
             DeviceContext::with_ram(ram.clone()),
@@ -120,7 +120,7 @@ async fn every_device_resets_and_closes_in_one_box_runtime() {
         no_interrupt(),
     )
     .expect("filesystem");
-    let memory = terra_runtime::component::mem::instantiate_shared(
+    let memory = terra_runtime::component::mem::register_device(
         &mut runtime,
         DeviceContext::with_ram(ram.clone()),
         &mem_component,
@@ -128,7 +128,7 @@ async fn every_device_resets_and_closes_in_one_box_runtime() {
     )
     .expect("memory");
     let policy: PolicyHandle = Arc::new(NoNetwork);
-    let network = terra_runtime::component::network::instantiate_shared(
+    let network = terra_runtime::component::network::register_device(
         &mut runtime,
         terra_runtime::component::context::DeviceContext::with_ram(ram.clone()),
         &network_component,

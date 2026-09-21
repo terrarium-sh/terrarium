@@ -15,14 +15,14 @@ pub const MAX_SIGNALS_PER_WINDOW: u32 = 64;
 
 /// One device's interrupt line. The device cannot name an IRQ; the native
 /// side coalesces bursts and drops past the per-window budget.
-pub struct Interrupt {
+pub struct InterruptSignals {
     pending: bool,
     window_count: u32,
     delivered: u64,
     dropped: u64,
 }
 
-impl Interrupt {
+impl InterruptSignals {
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -70,7 +70,7 @@ impl Interrupt {
     }
 }
 
-impl Default for Interrupt {
+impl Default for InterruptSignals {
     fn default() -> Self {
         Self::new()
     }
@@ -81,7 +81,7 @@ pub struct DeviceContext {
     ctx: WasiCtx,
     table: ResourceTable,
     ram: GuestRam,
-    irq: Interrupt,
+    irq: InterruptSignals,
     interrupt_level: bool,
     interrupt_notification: Arc<tokio::sync::Notify>,
 }
@@ -108,7 +108,7 @@ impl DeviceContext {
                 .build(),
             table,
             ram,
-            irq: Interrupt::new(),
+            irq: InterruptSignals::new(),
             interrupt_level: false,
             interrupt_notification: Arc::new(tokio::sync::Notify::new()),
         }

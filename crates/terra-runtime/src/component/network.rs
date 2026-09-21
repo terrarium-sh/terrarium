@@ -26,11 +26,11 @@ wasmtime::component::bindgen!({
 use exports::terra::network::api::{Config as NetworkConfig, Error as NetworkError, PublishedPort};
 use terra::mmio::types::DeviceError;
 
-pub use crate::component::Interrupt;
+use crate::component::InterruptCallback;
 
 use crate::component::DeviceChannel;
 
-type NetworkState = crate::component::worker::Worker<NetworkError>;
+use crate::component::device_loop::DeviceLoop;
 
 fn transport_error(error: DeviceError) -> wasmtime::Error {
     wasmtime::Error::msg(format!("network transport: {error:?}"))
@@ -61,13 +61,13 @@ fn network_config(
     }
 }
 
-async fn configure_state<T: Send + 'static>(
+async fn configure_device<T: Send + 'static>(
     store: &mut Store<T>,
     component: &Component,
     linker: &wasmtime::component::Linker<T>,
     config: NetworkConfig,
-    interrupt: Interrupt,
-) -> wasmtime::Result<(Device, NetworkState)> {
+    interrupt: InterruptCallback,
+) -> wasmtime::Result<(Device, DeviceLoop<NetworkError>)> {
     let instance = Device::instantiate_async(&mut *store, component, linker)
         .await
         .map_err(|error| error.context("network component instantiation"))?;
@@ -84,11 +84,11 @@ async fn configure_state<T: Send + 'static>(
         .await
         .map_err(|error| error.context("network transport configuration"))?;
     configured.map_err(transport_error)?;
-    let state = NetworkState {
+    let device_loop = DeviceLoop {
         run: api.func_run(),
         interrupt,
     };
-    Ok((instance, state))
+    Ok((instance, device_loop))
 }
 
 #[cfg(test)]
@@ -100,12 +100,12 @@ pub(crate) async fn instantiate(
     policy: PolicyHandle,
     port_mappings: Vec<PortMapping>,
     config: GuestNetworkConfig,
-    interrupt: Interrupt,
+    interrupt: InterruptCallback,
 ) -> wasmtime::Result<crate::component::StandaloneDevice> {
     let mut runtime =
         crate::box_runtime::BoxRuntime::new(engine, crate::box_runtime::store::BoxHost::new())?;
     crate::component::vmm::mmio::initialize_test_router(&mut runtime).await?;
-    let channel = instantiate_shared(
+    let channel = register_device(
         &mut runtime,
         host,
         component,
@@ -121,16 +121,16 @@ pub(crate) async fn instantiate(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn instantiate_shared(
+pub fn register_device(
     runtime: &mut crate::box_runtime::BoxRuntime,
     host: crate::component::context::DeviceContext,
     component: &Component,
     policy: PolicyHandle,
     port_mappings: Vec<PortMapping>,
     config: GuestNetworkConfig,
-    interrupt: Interrupt,
+    interrupt: InterruptCallback,
 ) -> wasmtime::Result<DeviceChannel> {
-    grant_shared(
+    register_device_with_host_factory(
         runtime,
         move || Ok(host),
         component,
@@ -142,14 +142,16 @@ pub fn instantiate_shared(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn grant_shared(
+pub fn register_device_with_host_factory(
     runtime: &mut crate::box_runtime::BoxRuntime,
-    host: impl FnOnce() -> wasmtime::Result<crate::component::context::DeviceContext> + Send + 'static,
+    create_host: impl FnOnce() -> wasmtime::Result<crate::component::context::DeviceContext>
+    + Send
+    + 'static,
     component: &Component,
     policy: PolicyHandle,
     port_mappings: Vec<PortMapping>,
     config: GuestNetworkConfig,
-    interrupt: Interrupt,
+    interrupt: InterruptCallback,
 ) -> wasmtime::Result<DeviceChannel> {
     let host_service_ports = policy.host_service_ports().to_vec();
     let policy_mappings = port_mappings.clone();
@@ -164,7 +166,7 @@ pub fn grant_shared(
     runtime.grant_device_worker(
         crate::component::vmm::bindings::machine::DeviceKind::Net,
         async move {
-            let host = NetworkHost::new(host()?, policy, policy_mappings);
+            let host = NetworkHost::new(create_host()?, policy, policy_mappings);
             create_worker(child(host), &component, config, interrupt).await
         },
     )
@@ -174,17 +176,17 @@ async fn create_worker(
     mut child: crate::box_runtime::DeviceWorker<NetworkHost>,
     component: &Component,
     config: NetworkConfig,
-    interrupt: Interrupt,
+    interrupt: InterruptCallback,
 ) -> wasmtime::Result<(
     crate::box_runtime::DeviceWorker<NetworkHost>,
     crate::component::vmm::mmio::Serve,
 )> {
     let wake = child.store.data().context.interrupt_notification();
     let linker = crate::component::network::host::network_component_linker(child.store.engine())?;
-    let (instance, state) =
-        configure_state(&mut child.store, component, &linker, config, interrupt).await?;
+    let (instance, device_loop) =
+        configure_device(&mut child.store, component, &linker, config, interrupt).await?;
     let serve = instance.terra_mmio_device().func_serve();
-    state.register(&mut child, wake, "network")?;
+    device_loop.register(&mut child, wake, "network")?;
     Ok((child, serve))
 }
 
@@ -263,7 +265,7 @@ mod tests {
         let host = crate::component::context::DeviceContext::with_ram(
             crate::memory::GuestRam::new(64 * 1024).expect("RAM"),
         );
-        let channel = crate::component::network::instantiate_shared(
+        let channel = crate::component::network::register_device(
             &mut runtime,
             host,
             &component,

@@ -329,7 +329,7 @@ impl Mounted {
         host.io_gate = Some(gate);
         let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).unwrap();
         runtime.initialize_mmio(&router).await.unwrap();
-        let channel = super::instantiate_shared(
+        let channel = super::register_device(
             &mut runtime,
             host,
             &component,

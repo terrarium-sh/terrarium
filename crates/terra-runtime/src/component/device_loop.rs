@@ -5,17 +5,17 @@ use std::sync::Arc;
 use tokio::sync::Notify;
 use wasmtime::component::{Accessor, Lift, TypedFunc};
 
-use super::Interrupt;
+use super::InterruptCallback;
 use crate::box_runtime::DeviceWorker;
 use crate::box_runtime::store::{StoreHost, StoreState};
 use crate::component::context::DeviceHost;
 
-pub(crate) struct Worker<E> {
+pub(crate) struct DeviceLoop<E> {
     pub run: TypedFunc<(), (Result<(), E>,)>,
-    pub interrupt: Interrupt,
+    pub interrupt: InterruptCallback,
 }
 
-impl<E: Lift + std::fmt::Debug + Send + Sync + 'static> Worker<E> {
+impl<E: Lift + std::fmt::Debug + Send + Sync + 'static> DeviceLoop<E> {
     pub fn register<H: StoreHost + DeviceHost>(
         self,
         runtime: &mut DeviceWorker<H>,

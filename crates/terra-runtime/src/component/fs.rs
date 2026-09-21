@@ -52,11 +52,11 @@ impl Drop for FilesystemRuntime {
     }
 }
 
-pub use crate::component::Interrupt;
+use crate::component::InterruptCallback;
 
 use crate::component::DeviceChannel;
 
-type FsState = crate::component::worker::Worker<FsDeviceError>;
+use crate::component::device_loop::DeviceLoop;
 
 fn transport_error(operation: &str, error: FsDeviceError) -> wasmtime::Error {
     wasmtime::Error::msg(format!("filesystem {operation}: {error:?}"))
@@ -69,27 +69,27 @@ pub(crate) async fn instantiate(
     component: &Component,
     tag: &str,
     max_nodes: u32,
-    interrupt: Interrupt,
+    interrupt: InterruptCallback,
 ) -> wasmtime::Result<crate::component::StandaloneDevice> {
     let mut runtime =
         crate::box_runtime::BoxRuntime::new(engine, crate::box_runtime::store::BoxHost::new())?;
     crate::component::vmm::mmio::initialize_test_router(&mut runtime).await?;
-    let channel = instantiate_shared(&mut runtime, host, component, tag, max_nodes, interrupt)?;
+    let channel = register_device(&mut runtime, host, component, tag, max_nodes, interrupt)?;
     Ok(crate::component::StandaloneDevice {
         _runtime: Arc::new(runtime.prepare().await?.start()),
         device: channel,
     })
 }
 
-pub fn instantiate_shared(
+pub fn register_device(
     runtime: &mut crate::box_runtime::BoxRuntime,
     host: FsHost,
     component: &Component,
     tag: &str,
     max_nodes: u32,
-    interrupt: Interrupt,
+    interrupt: InterruptCallback,
 ) -> wasmtime::Result<DeviceChannel> {
-    grant_shared(
+    register_device_with_host_factory(
         runtime,
         move || Ok(host),
         component,
@@ -99,19 +99,19 @@ pub fn instantiate_shared(
     )
 }
 
-pub fn grant_shared(
+pub fn register_device_with_host_factory(
     runtime: &mut crate::box_runtime::BoxRuntime,
-    host: impl FnOnce() -> wasmtime::Result<FsHost> + Send + 'static,
+    create_host: impl FnOnce() -> wasmtime::Result<FsHost> + Send + 'static,
     component: &Component,
     tag: &str,
     max_nodes: u32,
-    interrupt: Interrupt,
+    interrupt: InterruptCallback,
 ) -> wasmtime::Result<DeviceChannel> {
     let tag = tag.to_owned();
     let child = runtime.child_factory();
     let component = component.clone();
     let setup = crate::box_runtime::setup::setup(
-        async move { create_worker(child(host()?), &component, tag, max_nodes, interrupt).await },
+        async move { create_worker(child(create_host()?), &component, tag, max_nodes, interrupt).await },
         runtime.shutdown_receiver(),
     );
     let setup: crate::box_runtime::setup::Setup = Box::new(move |requests| {
@@ -138,7 +138,7 @@ async fn create_worker(
     component: &Component,
     tag: String,
     max_nodes: u32,
-    interrupt: Interrupt,
+    interrupt: InterruptCallback,
 ) -> wasmtime::Result<(
     crate::box_runtime::DeviceWorker<FsHost>,
     crate::component::vmm::mmio::Serve,
@@ -160,11 +160,11 @@ async fn create_worker(
         .await
         .map_err(|error| error.context("filesystem component configuration"))?;
     configured.map_err(|error| transport_error("configure", error))?;
-    let state = FsState {
+    let device_loop = DeviceLoop {
         run: transport.func_run(),
         interrupt,
     };
     let serve = instance.terra_mmio_device().func_serve();
-    state.register(&mut child, wake, "fs")?;
+    device_loop.register(&mut child, wake, "fs")?;
     Ok((child, serve))
 }

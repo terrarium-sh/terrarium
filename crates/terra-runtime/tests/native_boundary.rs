@@ -5,7 +5,7 @@ use terra_runtime::component::block::backing::BoundedDisk;
 use terra_runtime::component::block::backing::DiskError;
 use terra_runtime::component::block::backing::{BackingError, BlockBacking, FileDisk};
 use terra_runtime::component::context::DeviceContext;
-use terra_runtime::component::context::Interrupt;
+use terra_runtime::component::context::InterruptSignals;
 use terra_runtime::component::context::MAX_SIGNALS_PER_WINDOW;
 use terra_runtime::memory::MemoryError;
 use terra_runtime::memory::{BoundedMemory, GuestRam};
@@ -201,7 +201,7 @@ fn writable_disk_enforces_capacity() {
 
 #[test]
 fn interrupt_storm_coalesces_and_drops() {
-    let mut irq = Interrupt::new();
+    let mut irq = InterruptSignals::new();
     for _ in 0..(MAX_SIGNALS_PER_WINDOW + 10) {
         irq.signal();
     }

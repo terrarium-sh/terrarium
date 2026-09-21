@@ -133,7 +133,7 @@ impl IoApicHandle {
         &self,
         kind: super::bindings::machine::DeviceKind,
         ordinal: usize,
-    ) -> wasmtime::Result<crate::component::Interrupt> {
+    ) -> wasmtime::Result<crate::component::InterruptCallback> {
         let slot = self.config.device_slot(kind, ordinal)?;
         let queue = self.queue.clone();
         Ok(Arc::new(move |level| {
@@ -350,7 +350,7 @@ impl IrqHandle {
         &self,
         kind: super::bindings::machine::DeviceKind,
         ordinal: usize,
-    ) -> wasmtime::Result<crate::component::Interrupt> {
+    ) -> wasmtime::Result<crate::component::InterruptCallback> {
         let slot = self.config.device_slot(kind, ordinal)?;
         let queue = self.queue.clone();
         Ok(Arc::new(move |level| queue.send(GsiCommand(slot, level))))

@@ -11,9 +11,9 @@ pub mod relay;
 pub mod vmm;
 pub mod vsock;
 
-pub type Interrupt = std::sync::Arc<dyn Fn(bool) -> wasmtime::Result<()> + Send + Sync>;
+pub type InterruptCallback = std::sync::Arc<dyn Fn(bool) -> wasmtime::Result<()> + Send + Sync>;
 
-mod worker;
+mod device_loop;
 
 pub use vmm::mmio::MmioDevice as DeviceChannel;
 

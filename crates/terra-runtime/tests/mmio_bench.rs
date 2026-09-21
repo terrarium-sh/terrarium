@@ -6,7 +6,7 @@ mod support;
 use std::time::{Duration, Instant};
 
 use terra_runtime::box_runtime::{BoxHost, BoxRuntime, BoxRuntimeHandle};
-use terra_runtime::component::Interrupt;
+use terra_runtime::component::InterruptCallback;
 use terra_runtime::component::context::DeviceContext;
 use terra_runtime::engine::device_engine;
 use terra_runtime::memory::GuestRam;
@@ -110,8 +110,8 @@ async fn start_memory() -> (Duration, RunningMemory) {
         .expect("memory artifact");
     let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
     runtime.initialize_mmio(&router).await.expect("MMIO router");
-    let interrupt: Interrupt = std::sync::Arc::new(|_| Ok(()));
-    let channel = terra_runtime::component::mem::instantiate_shared(
+    let interrupt: InterruptCallback = std::sync::Arc::new(|_| Ok(()));
+    let channel = terra_runtime::component::mem::register_device(
         &mut runtime,
         DeviceContext::with_ram(GuestRam::new(64 * 1024).expect("RAM")),
         &component,

@@ -294,7 +294,7 @@ mod tests {
             wasmtime::component::Component::new(&engine, crate::test_support::artifacts::wasm::MEM)
                 .unwrap();
         let ram = machine.ram();
-        let channel = terra_runtime::component::mem::grant_shared(
+        let channel = terra_runtime::component::mem::register_device_with_host_factory(
             &mut runtime,
             move || Ok(DeviceContext::with_ram(ram.resolve()?)),
             &component,

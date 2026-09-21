@@ -9,14 +9,13 @@ use std::sync::Arc;
 use wasmtime::component::Component;
 
 use crate::component::bindings::BlockDevice;
-use crate::component::vmm::bindings::types::DeviceError;
 use host::{BlockHost, block_component_linker};
 
-pub use crate::component::Interrupt;
+use crate::component::InterruptCallback;
 
 use crate::component::DeviceChannel;
 
-type BlockState = crate::component::worker::Worker<DeviceError>;
+use crate::component::device_loop::DeviceLoop;
 
 #[cfg(test)]
 pub(crate) async fn instantiate(
@@ -24,40 +23,40 @@ pub(crate) async fn instantiate(
     host: BlockHost,
     component: &Component,
     readonly: bool,
-    interrupt: Interrupt,
+    interrupt: InterruptCallback,
 ) -> wasmtime::Result<crate::component::StandaloneDevice> {
     let mut runtime =
         crate::box_runtime::BoxRuntime::new(engine, crate::box_runtime::store::BoxHost::new())?;
     crate::component::vmm::mmio::initialize_test_router(&mut runtime).await?;
-    let channel = instantiate_shared(&mut runtime, host, component, readonly, interrupt)?;
+    let channel = register_device(&mut runtime, host, component, readonly, interrupt)?;
     Ok(crate::component::StandaloneDevice {
         _runtime: Arc::new(runtime.prepare().await?.start()),
         device: channel,
     })
 }
 
-pub fn instantiate_shared(
+pub fn register_device(
     runtime: &mut crate::box_runtime::BoxRuntime,
     host: BlockHost,
     component: &Component,
     readonly: bool,
-    interrupt: Interrupt,
+    interrupt: InterruptCallback,
 ) -> wasmtime::Result<DeviceChannel> {
-    grant_shared(runtime, move || Ok(host), component, readonly, interrupt)
+    register_device_with_host_factory(runtime, move || Ok(host), component, readonly, interrupt)
 }
 
-pub fn grant_shared(
+pub fn register_device_with_host_factory(
     runtime: &mut crate::box_runtime::BoxRuntime,
-    host: impl FnOnce() -> wasmtime::Result<BlockHost> + Send + 'static,
+    create_host: impl FnOnce() -> wasmtime::Result<BlockHost> + Send + 'static,
     component: &Component,
     readonly: bool,
-    interrupt: Interrupt,
+    interrupt: InterruptCallback,
 ) -> wasmtime::Result<DeviceChannel> {
     let child = runtime.child_factory();
     let component = component.clone();
     runtime.grant_device_worker(
         crate::component::vmm::bindings::machine::DeviceKind::Block,
-        async move { create_worker(child(host()?), &component, readonly, interrupt).await },
+        async move { create_worker(child(create_host()?), &component, readonly, interrupt).await },
     )
 }
 
@@ -65,7 +64,7 @@ async fn create_worker(
     mut child: crate::box_runtime::DeviceWorker<BlockHost>,
     component: &Component,
     readonly: bool,
-    interrupt: Interrupt,
+    interrupt: InterruptCallback,
 ) -> wasmtime::Result<(
     crate::box_runtime::DeviceWorker<BlockHost>,
     crate::component::vmm::mmio::Serve,
@@ -82,12 +81,12 @@ async fn create_worker(
         .await
         .map_err(|error| error.context("block component configuration"))?;
     result.map_err(|error| wasmtime::Error::msg(format!("block configure: {error:?}")))?;
-    let state = BlockState {
+    let device_loop = DeviceLoop {
         run: api.func_run(),
         interrupt,
     };
     let serve = instance.terra_mmio_device().func_serve();
-    state.register(&mut child, wake, "block")?;
+    device_loop.register(&mut child, wake, "block")?;
     Ok((child, serve))
 }
 
@@ -163,7 +162,7 @@ mod tests {
             .expect("vCPU router setup");
         let writable = BlockHost::new(ram.clone(), DiskGrant::Mem(BoundedDisk::new(4096, false)));
         let readonly = BlockHost::new(ram, DiskGrant::Mem(BoundedDisk::new(8192, true)));
-        let first = crate::component::block::instantiate_shared(
+        let first = crate::component::block::register_device(
             &mut runtime,
             writable,
             &component,
@@ -171,7 +170,7 @@ mod tests {
             Arc::new(|_| Ok(())),
         )
         .expect("first block instantiates");
-        let second = crate::component::block::instantiate_shared(
+        let second = crate::component::block::register_device(
             &mut runtime,
             readonly,
             &component,
@@ -183,7 +182,7 @@ mod tests {
             crate::box_runtime::BoxRuntime::new(&engine, crate::box_runtime::store::BoxHost::new())
                 .unwrap();
         other_box.initialize_mmio(&router).await.unwrap();
-        let other_device = crate::component::block::instantiate_shared(
+        let other_device = crate::component::block::register_device(
             &mut other_box,
             BlockHost::new(
                 crate::memory::GuestRam::new(4096).unwrap(),
