@@ -348,3 +348,7 @@ impl Descriptor {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "reference/tests.rs"]
+mod tests;

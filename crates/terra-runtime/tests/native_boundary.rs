@@ -1,7 +1,11 @@
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use terra_runtime::component::block::backing::{BackingError, BlockBacking, FileDisk};
 use terra_runtime::engine::{DeviceContext, terra::host::memory::Host};
+use terra_runtime::{
+    BoundedDisk, BoundedMemory, DiskError, Interrupt, MAX_SIGNALS_PER_WINDOW, MemoryError,
+    SyntheticRam,
+};
 
 #[test]
 fn hostile_memory_imports_reject_overflow_and_oversized_copies() {
@@ -149,4 +153,126 @@ fn boot_results_require_mapped_aligned_addresses_and_one_acceptance() {
             })
             .is_err()
     );
+}
+
+fn ram_64k() -> SyntheticRam {
+    SyntheticRam::new(64 * 1024).expect("64 KiB RAM")
+}
+
+#[test]
+fn oob_read_fails_closed() {
+    let ram = ram_64k();
+    let mem = BoundedMemory::new(&ram);
+    assert_eq!(mem.read(ram.size(), 1), Err(MemoryError::OutOfRange));
+    assert_eq!(mem.read(0, ram.size() + 1), Err(MemoryError::TooLarge));
+}
+
+#[test]
+fn offset_plus_len_overflow_fails_closed() {
+    let ram = ram_64k();
+    let mem = BoundedMemory::new(&ram);
+    assert_eq!(mem.read(u64::MAX - 4, 16), Err(MemoryError::OutOfRange));
+}
+
+#[test]
+fn round_trip_through_synthetic_ram() {
+    let ram = ram_64k();
+    let mem = BoundedMemory::new(&ram);
+    mem.write(128, b"virtio").expect("in-range write");
+    assert_eq!(mem.read(128, 6).expect("in-range read"), b"virtio");
+}
+
+#[test]
+fn readonly_disk_resists_writes_and_truncation() {
+    let mut disk = BoundedDisk::new(4096, true);
+    assert_eq!(disk.write(0, b"x"), Err(DiskError::ReadOnly));
+    assert!(disk.read(0, 4).is_ok());
+    assert_eq!(disk.read(4090, 16), Err(DiskError::OutOfRange));
+}
+
+#[test]
+fn writable_disk_enforces_capacity() {
+    let mut disk = BoundedDisk::new(512, false);
+    disk.write(0, &[7u8; 16]).expect("in-capacity write");
+    assert_eq!(disk.write(500, &[7u8; 16]), Err(DiskError::OutOfRange));
+}
+
+#[test]
+fn interrupt_storm_coalesces_and_drops() {
+    let mut irq = Interrupt::new();
+    for _ in 0..(MAX_SIGNALS_PER_WINDOW + 10) {
+        irq.signal();
+    }
+    assert!(irq.take());
+    assert!(!irq.take());
+    assert_eq!(irq.delivered(), 1);
+    assert_eq!(irq.dropped(), 10);
+    irq.end_window();
+    irq.signal();
+    assert!(irq.take());
+}
+
+#[cfg(unix)]
+#[test]
+fn memory_hole_is_rejected_before_partial_write() {
+    use std::sync::Arc;
+    use vm_memory::{GuestAddress, GuestMemoryMmap};
+    let mapping = Arc::new(
+        GuestMemoryMmap::<()>::from_ranges(&[
+            (GuestAddress(0), 0x1000),
+            (GuestAddress(0x2000), 0x1000),
+        ])
+        .unwrap(),
+    );
+    let ram = SyntheticRam::from_shared(mapping).unwrap();
+    let memory = BoundedMemory::new(&ram);
+    memory.write(0xff0, &[0x42; 16]).unwrap();
+    assert_eq!(memory.write(0xff0, &[0x99; 32]), Err(MemoryError::Unmapped));
+    assert_eq!(memory.read(0xff0, 16).unwrap(), vec![0x42; 16]);
+}
+
+#[cfg(unix)]
+#[test]
+fn hostile_memory_imports_cannot_cross_mapping_holes() {
+    use std::sync::Arc;
+    use terra_runtime::SyntheticRam;
+    use vm_memory::{GuestAddress, GuestMemoryMmap};
+
+    let mapping =
+        GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4096), (GuestAddress(8192), 4096)])
+            .unwrap();
+    let mut host = DeviceContext::with_ram(SyntheticRam::from_shared(Arc::new(mapping)).unwrap());
+    host.write(0, vec![0xa5; 4096]).unwrap();
+    assert!(host.read(4095, 4098).is_err());
+    assert!(host.write(4095, vec![0; 4098]).is_err());
+    assert_eq!(host.read(0, 4096).unwrap(), vec![0xa5; 4096]);
+}
+
+#[test]
+fn synthetic_ram_shapes_match() {
+    assert!(SyntheticRam::new(256 * 1024).is_some());
+}
+
+#[cfg(unix)]
+#[test]
+fn shared_ram_aliases_one_mapping() {
+    use std::sync::Arc;
+    use vm_memory::{Bytes as _, GuestAddress, GuestMemoryMmap};
+    let mem = Arc::new(
+        GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 64 * 1024)]).expect("maps"),
+    );
+    let first = SyntheticRam::from_shared(Arc::clone(&mem)).expect("aliases");
+    let second = SyntheticRam::from_shared(Arc::clone(&mem)).expect("aliases");
+    assert_eq!(first.size(), 64 * 1024);
+    BoundedMemory::new(&first)
+        .write(512, b"shared")
+        .expect("writes");
+    assert_eq!(
+        BoundedMemory::new(&second).read(512, 6).expect("reads"),
+        b"shared"
+    );
+    let mut back = [0u8; 6];
+    mem.read_slice(&mut back, GuestAddress(512))
+        .expect("mapped");
+    assert_eq!(&back, b"shared");
 }

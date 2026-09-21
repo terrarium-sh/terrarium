@@ -1913,10 +1913,6 @@ dependencies = [
  "terra-protocol",
  "terra-runtime",
  "tokio",
- "virtio-bindings 0.2.7 (registry+https://github.com/rust-lang/crates.io-index)",
- "virtio-blk",
- "virtio-queue 0.18.0 (git+https://github.com/rust-vmm/vm-virtio?rev=87bf424736548126983c278b0d49a7b061e38b12)",
- "virtio-vsock",
  "vm-memory",
  "wasmtime",
  "windows-sys 0.61.2",
@@ -1950,6 +1946,8 @@ dependencies = [
  "tokio",
  "tokio-util",
  "virtio-bindings 0.2.7 (registry+https://github.com/rust-lang/crates.io-index)",
+ "virtio-blk",
+ "virtio-queue 0.18.0 (git+https://github.com/rust-vmm/vm-virtio?rev=87bf424736548126983c278b0d49a7b061e38b12)",
  "vm-memory",
  "wasmtime",
  "wasmtime-wasi",
@@ -1961,6 +1959,7 @@ name = "terra-vsock-device"
 version = "0.0.1"
 dependencies = [
  "terra-protocol",
+ "virtio-vsock",
 ]
 
 [[package]]

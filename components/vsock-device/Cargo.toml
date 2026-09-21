@@ -10,5 +10,8 @@ rust-version.workspace = true
 [dependencies]
 terra-protocol = { path = "../../crates/terra-protocol" }
 
+[target.'cfg(unix)'.dev-dependencies]
+virtio-vsock = "0.12"
+
 [lints]
 workspace = true

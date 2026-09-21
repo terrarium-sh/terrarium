@@ -403,3 +403,6 @@ mod tests {
         .expect("closing the device deasserts the published interrupt");
     }
 }
+
+#[cfg(test)]
+mod component_tests;

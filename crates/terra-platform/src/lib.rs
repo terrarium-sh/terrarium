@@ -24,4 +24,4 @@ pub use linux::kvm::amd64::{arch, kvm};
 pub(crate) use linux::runner;
 
 #[cfg(test)]
-mod tests;
+mod boot_tests;

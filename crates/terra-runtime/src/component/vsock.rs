@@ -608,4 +608,73 @@ mod tests {
                 .expect("runtime stops after the final component closes");
         });
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn vsock_actor_alone_publishes_interrupt_levels() {
+        let plan = terra_protocol::encode_frame(&terra_protocol::Plan {
+            mode: terra_protocol::PlanMode::Run,
+            workdir: None,
+            shares: Vec::new(),
+            volumes: Vec::new(),
+            net: terra_protocol::Net {
+                guest_ip: "100.96.0.2".parse().unwrap(),
+                prefix: 30,
+                gateway: "100.96.0.1".parse().unwrap(),
+                dns: "100.96.0.1".parse().unwrap(),
+            },
+            env: std::collections::BTreeMap::new(),
+            root: false,
+            sudo: Vec::new(),
+            on_create: Vec::new(),
+            on_start: Vec::new(),
+            pre_stop: Vec::new(),
+            daemons: Vec::new(),
+            workload: vec!["/bin/sh".into()],
+            sandbox_info: String::new(),
+            await_initial_session: false,
+            host_tz: None,
+            host_time: None,
+            host_seed: None,
+        })
+        .unwrap();
+        let engine = crate::engine::device_engine().unwrap();
+        let mut runtime =
+            crate::box_runtime::BoxRuntime::new(&engine, crate::box_runtime::BoxHost::new())
+                .unwrap();
+        let router = wasmtime::component::Component::new(
+            &engine,
+            include_bytes!(
+                "../../../../components/target/wasm32-wasip3/release/terra_vmm_component.wasm"
+            ),
+        )
+        .unwrap();
+        runtime.initialize_mmio(&router).await.unwrap();
+        // SAFETY: the artifact is embedded from the trusted build.
+        #[allow(unsafe_code)]
+        let artifact = unsafe {
+            crate::TrustedArtifact::from_trusted_bytes(include_bytes!(
+                "../../../../build/terra-vsock-component.cwasm"
+            ))
+        };
+        let channel = crate::component::vsock::VsockChannel::from_trusted_artifact(
+            &mut runtime,
+            crate::SyntheticRam::new(4096).unwrap(),
+            artifact,
+            plan,
+            None,
+            None,
+            None,
+            std::sync::Arc::new(|_| Ok(())),
+        )
+        .unwrap();
+        let runtime_task = runtime.prepare().await.unwrap().start();
+        let device = channel;
+        assert_eq!(
+            device.read_mmio(0, 4).unwrap(),
+            0x7472_6976_u32.to_le_bytes()
+        );
+        device.write_mmio(0x70, &0_u32.to_le_bytes()).unwrap();
+        device.close_async().await.unwrap();
+        runtime_task.join().await.unwrap();
+    }
 }

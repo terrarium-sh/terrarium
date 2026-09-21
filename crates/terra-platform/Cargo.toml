@@ -35,16 +35,9 @@ windows-sys = { version = "0.61", features = ["Win32_System_Hypervisor"] }
 
 [dev-dependencies]
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
-terra-runtime = { path = "../terra-runtime", features = ["test-support"] }
 tempfile.workspace = true
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 wasmtime = { version = "=48.0.2", default-features = false, features = ["cranelift", "wit-parser", "wat"] }
-virtio-bindings = "0.2.7"
-
-[target.'cfg(unix)'.dev-dependencies]
-virtio-blk = { git = "https://github.com/rust-vmm/vm-virtio", rev = "87bf424736548126983c278b0d49a7b061e38b12" }
-virtio-queue-git = { package = "virtio-queue", git = "https://github.com/rust-vmm/vm-virtio", rev = "87bf424736548126983c278b0d49a7b061e38b12", features = ["test-utils"] }
-virtio-vsock = "0.12"
 
 [lints]
 workspace = true

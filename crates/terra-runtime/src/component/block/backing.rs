@@ -2,10 +2,10 @@
 
 use crate::BoundedDisk;
 pub const STATUS_OK: u8 = 0;
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 #[path = "reference.rs"]
 mod reference;
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 pub use reference::*;
 
 /// Host storage operations exposed to the block component.

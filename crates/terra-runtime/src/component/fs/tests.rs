@@ -334,3 +334,38 @@ async fn mode_capability_changes_writable_files_and_rejects_readonly_files() {
         }
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn filesystem_actor_alone_publishes_interrupt_levels() {
+    use crate::component::fs::host::{FsHost, ShareGrant};
+    use crate::engine::{DeviceContext, device_engine};
+
+    let directory = tempfile::tempdir().unwrap();
+    let mount = std::fs::canonicalize(directory.path()).unwrap();
+    let engine = device_engine().unwrap();
+    let component = wasmtime::component::Component::new(
+        &engine,
+        include_bytes!(
+            "../../../../../components/target/wasm32-wasip3/release/terra_fs_component.wasm"
+        ),
+    )
+    .unwrap();
+    let host = FsHost::new(
+        DeviceContext::new(64 * 1024).unwrap(),
+        ShareGrant::new(&mount, false).unwrap(),
+    );
+    let channel = crate::component::fs::instantiate(
+        &engine,
+        host,
+        &component,
+        "test",
+        8192,
+        std::sync::Arc::new(|_| Ok(())),
+    )
+    .await
+    .unwrap();
+    let device = channel;
+    assert_eq!(device.read(0, 4).unwrap(), 0x7472_6976_u32.to_le_bytes());
+    device.write(0x70, &0_u32.to_le_bytes()).unwrap();
+    device.close().unwrap();
+}

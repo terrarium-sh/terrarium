@@ -119,9 +119,9 @@ impl PolicyFactory {
                 }
             })?;
         Ok(ComponentPolicy {
-            sender,
+            sender: Some(sender),
             available,
-            worker,
+            worker: Some(worker),
             host_ports: grants.host_ports,
             blocks_direct_dns: grants.blocks_direct_dns,
         })
@@ -146,11 +146,21 @@ struct State {
 type Decision = Box<dyn FnOnce(&mut State) -> bool + Send>;
 
 pub struct ComponentPolicy {
-    sender: mpsc::SyncSender<Decision>,
+    sender: Option<mpsc::SyncSender<Decision>>,
     available: Arc<std::sync::atomic::AtomicBool>,
-    worker: std::thread::JoinHandle<()>,
+    worker: Option<std::thread::JoinHandle<()>>,
     host_ports: Vec<Option<u16>>,
     blocks_direct_dns: bool,
+}
+
+impl Drop for ComponentPolicy {
+    fn drop(&mut self) {
+        // The worker's recv loop ends when the sender drops, so release it before joining.
+        self.sender.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 impl ComponentPolicy {
@@ -172,8 +182,10 @@ impl ComponentPolicy {
             reply(result.ok());
             succeeded
         });
-        if self.is_available() {
-            let _ = self.sender.try_send(decision);
+        if self.is_available()
+            && let Some(sender) = &self.sender
+        {
+            let _ = sender.try_send(decision);
         }
     }
 
@@ -211,7 +223,11 @@ impl NetworkPolicy for ComponentPolicy {
     }
 
     fn is_available(&self) -> bool {
-        self.available.load(std::sync::atomic::Ordering::Acquire) && !self.worker.is_finished()
+        self.available.load(std::sync::atomic::Ordering::Acquire)
+            && self
+                .worker
+                .as_ref()
+                .is_some_and(|worker| !worker.is_finished())
     }
 
     fn allows(&self, address: IpAddr, port: Option<u16>) -> bool {
@@ -463,7 +479,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejected_and_abandoned_requests_release_leases_without_joining_the_worker() {
+    async fn worker_failure_releases_leases_of_rejected_and_abandoned_requests() {
         let policy = instantiate(&config(&[])).unwrap();
         let (entered, started) = tokio::sync::oneshot::channel();
         let (release, blocked) = mpsc::channel();
@@ -496,11 +512,8 @@ mod tests {
         );
         assert_eq!(calls.available_permits(), 1);
         let available = Arc::clone(&policy.available);
-        let before_drop = std::time::Instant::now();
-        drop(policy);
-        let drop_elapsed = before_drop.elapsed();
         let _ = release.send(());
-        assert!(drop_elapsed < std::time::Duration::from_secs(1));
+        drop(policy);
         let _permits = tokio::time::timeout(
             std::time::Duration::from_secs(1),
             calls.acquire_many(u32::try_from(capacity + 1).unwrap()),

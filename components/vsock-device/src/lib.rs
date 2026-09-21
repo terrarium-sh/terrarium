@@ -7,3 +7,6 @@ mod switch;
 
 pub use packet::{HeaderError, VSOCK_HEADER_BYTES, VsockHeader};
 pub use switch::*;
+
+#[cfg(test)]
+mod tests;
