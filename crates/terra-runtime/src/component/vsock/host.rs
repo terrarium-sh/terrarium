@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use terra_io::local::{
+use terra_platform::io::local::{
     AsyncLocalListener as Listener, AsyncLocalStream, LocalListener, LocalStream,
 };
 type ReadHalf = AsyncLocalStream;

@@ -76,7 +76,7 @@ COMPONENT_AOT_TARGETS := $(addsuffix -aot,$(COMPONENT_TARGETS))
 COMPONENT_MANIFEST := components/Cargo.toml
 COMPONENT_WASM_DIR := components/target/wasm32-wasip3/release
 
-.PHONY: $(COMPONENT_TARGETS) $(COMPONENT_AOT_TARGETS) verify-source verify-host-components guest-assets check-guest-assets host-build host-dist source-dist verify-wit build verify verify-components verify-workspace dist man clean test-component-boot test-component-vmm test-install check-zig
+.PHONY: $(COMPONENT_TARGETS) $(COMPONENT_AOT_TARGETS) verify-source verify-host-components guest-assets check-guest-assets host-build host-dist source-dist verify-wit verify-dependency-boundaries verify-platform build verify verify-components verify-workspace dist man clean test-component-boot test-platform-native-vm test-component-vmm test-install check-zig
 
 # Pin changes invalidate every embedded guest payload.
 PINS := $(ARCH) $(KERNEL_VERSION) $(KERNEL_SHA256) $(E2FSPROGS_VERSION) $(E2FSPROGS_SHA256) \
@@ -304,7 +304,13 @@ $(COMPONENT_AOT_TARGETS): component-%-aot: component-%
 	$(CARGO_LOCKED) run --target $(TERRA_TARGET) -p terra-runtime --features compiler --example precompile-component -- $(COMPONENT_WASM_DIR)/terra_$*_component.wasm $(BUILD)/terra-$*-component.cwasm $(if $(filter policy,$*),--policy,)
 
 test-component-boot: $(COMPONENT_AOT_TARGETS) $(KERNEL_GZ) $(ROOTFS_IMG) $(BOOT_IMG)
-	$(CARGO_LOCKED) test $(TEST_FLAGS) -p terra-platform --lib -- --ignored --nocapture
+	$(CARGO_LOCKED) test $(TEST_FLAGS) -p terra-runtime --lib -- --ignored --nocapture
+
+test-platform-native-vm:
+	CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER="sh scripts/run-macos-vm-test" $(CARGO_LOCKED) test $(TEST_FLAGS) -p terra-platform --test native_vm -- --ignored --test-threads=1 --nocapture
+ifeq ($(ARCH),x86_64)
+	$(CARGO_LOCKED) test $(TEST_FLAGS) -p terra-platform --lib cpuid_matches_the_fixed_vcpu_count -- --ignored --nocapture
+endif
 
 ## Format check, lints, and the test suite. Generating the man pages is
 ## `man`'s job, not this one's — a test that writes to the working tree is a
@@ -317,6 +323,7 @@ verify:
 verify-source:
 	@status=0; \
 	$(MAKE) verify-wit || $(CHECK_FAILURE); \
+	$(MAKE) verify-dependency-boundaries || $(CHECK_FAILURE); \
 	python3 -B scripts/check-tool-versions.py || $(CHECK_FAILURE); \
 	python3 -B scripts/test-kernel-tools.py || $(CHECK_FAILURE); \
 	python3 -B scripts/test-alpine-sources.py || $(CHECK_FAILURE); \
@@ -330,12 +337,19 @@ verify-source:
 verify-workspace:
 	@status=0; \
 	$(MAKE) verify-source || $(CHECK_FAILURE); \
+	$(MAKE) verify-platform || $(CHECK_FAILURE); \
 	$(CARGO_LOCKED) clippy --workspace --all-targets --target $(MUSL) -- -D warnings || $(CHECK_FAILURE); \
 	$(CARGO_LOCKED) clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings || $(CHECK_FAILURE); \
 	$(CARGO_LOCKED) doc --workspace --no-deps --document-private-items --target $(MUSL) || $(CHECK_FAILURE); \
 	$(CARGO_LOCKED) test $(TEST_FLAGS) --workspace --target $(MUSL) || $(CHECK_FAILURE); \
 	$(CARGO_LOCKED) test $(TEST_FLAGS) -p terra-runtime --target $(MUSL) --features thread-experiments --test shared_component_memory --test shared_worker_memory || $(CHECK_FAILURE); \
 	exit $$status
+
+verify-dependency-boundaries:
+	python3 -B scripts/check-dependency-boundaries.py
+
+verify-platform:
+	$(CARGO_LOCKED) test $(TEST_FLAGS) -p terra-platform --target $(MUSL)
 
 test-install:
 	scripts/test-install.sh

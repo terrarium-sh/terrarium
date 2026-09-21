@@ -152,6 +152,11 @@ jobs:
       - name: Verify host
         if: ${{ !cancelled() && steps.host-build.outcome == 'success' }}
         run: make --keep-going KEEP_GOING=1 verify-host-components verify-workspace
+      - name: Check platform on Windows
+        if: ${{ !cancelled() && steps.host-build.outcome == 'success' }}
+        run: |
+          rustup target add x86_64-pc-windows-gnu
+          cargo check --locked --all-targets -p terra-platform --target x86_64-pc-windows-gnu
       - name: Check distribution
         run: |
           ./dist/terra --version
@@ -175,7 +180,9 @@ jobs:
           status=0
           TERRA_BIN="$PWD/dist/terra" cargo test --no-fail-fast --locked --target x86_64-unknown-linux-musl -p terra --test native_boot native_boot_executes_shell -- --ignored --test-threads=1 --nocapture || status=1
           TERRA_BIN="$PWD/dist/terra" cargo test --no-fail-fast --locked --target x86_64-unknown-linux-musl -p terra --test native_boot native_boot_forwards_shared_file_events -- --ignored --test-threads=1 --nocapture || status=1
-          cargo test --no-fail-fast --locked --target x86_64-unknown-linux-musl -p terra-platform --lib -- --ignored --test-threads=1 || status=1
+          cargo test --no-fail-fast --locked --target x86_64-unknown-linux-musl -p terra-runtime --lib -- --ignored --test-threads=1 || status=1
+          cargo test --no-fail-fast --locked --target x86_64-unknown-linux-musl -p terra-platform --test native_vm -- --ignored --test-threads=1 || status=1
+          cargo test --no-fail-fast --locked --target x86_64-unknown-linux-musl -p terra-platform --lib cpuid_matches_the_fixed_vcpu_count -- --ignored --test-threads=1 || status=1
           TERRA_BIN="$PWD/dist/terra" cargo test --no-fail-fast --locked --target x86_64-unknown-linux-musl -p terra --test boot --test memory -- --ignored --test-threads=1 || status=1
           exit "$status"
       - name: Reclaim component build space
@@ -271,7 +278,8 @@ jobs:
             exit 0
           fi
           status=0
-          cargo test --no-fail-fast --locked --target aarch64-unknown-linux-musl -p terra-platform --lib -- --ignored --test-threads=1 || status=1
+          cargo test --no-fail-fast --locked --target aarch64-unknown-linux-musl -p terra-runtime --lib -- --ignored --test-threads=1 || status=1
+          cargo test --no-fail-fast --locked --target aarch64-unknown-linux-musl -p terra-platform --test native_vm -- --ignored --test-threads=1 || status=1
           TERRA_BIN="$PWD/dist/terra" cargo test --no-fail-fast --locked --target aarch64-unknown-linux-musl -p terra --test native_boot native_boot_forwards_shared_file_events -- --ignored --test-threads=1 --nocapture || status=1
           TERRA_BIN="$PWD/dist/terra" cargo test --no-fail-fast --locked --target aarch64-unknown-linux-musl -p terra --test boot --test memory -- --ignored --test-threads=1 || status=1
           exit "$status"
@@ -321,12 +329,14 @@ jobs:
         if: ${{ !cancelled() && steps.host-build.outcome == 'success' }}
         run: cargo test --no-fail-fast --locked --target aarch64-apple-darwin --workspace
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
-        if: ${{ !cancelled() && steps.host-build.outcome == 'success' && inputs.native_vm_tests }}
+        if: ${{ !cancelled() && steps.host-build.outcome == 'success' && (inputs.native_vm_tests || matrix.native_vm_tests) }}
         with:
           version: 0.16.0
       - name: Native VM acceptance
-        if: ${{ !cancelled() && steps.host-build.outcome == 'success' && inputs.native_vm_tests }}
-        run: TERRA_BIN="$PWD/dist/terra" cargo test --no-fail-fast --locked --target aarch64-apple-darwin -p terra --test native_boot --test boot --test memory -- --ignored --test-threads=1 --nocapture
+        if: ${{ !cancelled() && steps.host-build.outcome == 'success' && (inputs.native_vm_tests || matrix.native_vm_tests) }}
+        run: |
+          CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER="sh scripts/run-macos-vm-test" cargo test --no-fail-fast --locked --target aarch64-apple-darwin -p terra-platform --test native_vm -- --ignored --test-threads=1
+          TERRA_BIN="$PWD/dist/terra" cargo test --no-fail-fast --locked --target aarch64-apple-darwin -p terra --test native_boot --test boot --test memory -- --ignored --test-threads=1 --nocapture
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: terra-aarch64-macos
@@ -387,6 +397,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ./dist/terra.exe --help
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Native VM lifecycle
+        if: ${{ !cancelled() && steps.host-build.outcome == 'success' && (inputs.native_vm_tests || matrix.native_vm_tests) }}
+        timeout-minutes: 5
+        shell: pwsh
+        run: cargo test --no-fail-fast --locked --target ${{ matrix.target }} -p terra-platform --test native_vm -- --ignored --test-threads=1
       - name: Native boot and shell gate
         if: ${{ !cancelled() && steps.host-build.outcome == 'success' && (inputs.native_vm_tests || matrix.native_vm_tests) }}
         timeout-minutes: 10

@@ -94,7 +94,7 @@ async fn kernel_boots_directory_share() {
         permissions.set_mode(0o755);
         std::fs::set_permissions(&executable, permissions).unwrap();
     }
-    let tag = terra_runtime::component::fs::share_tag(0);
+    let tag = crate::component::fs::share_tag(0);
     let encoded = boot_plan(PlanMode::Run, Vec::new(), vec!["/bin/true".into()], false);
     let mut plan: Plan = read_frame(&mut encoded.as_slice()).unwrap().unwrap();
     plan.on_start.push("set -ex; test $(/work/script) = executed; test $(cat /work/host-file) = host-data; printf guest-data >/work/guest-file; ln /work/guest-file /work/hardlink; ln -s guest-file /work/link; test $(cat /work/link) = guest-data; mv /work/guest-file /work/renamed; test $(cat /work/hardlink) = guest-data; cp /work/large-host /work/large-copy; cmp /work/large-host /work/large-copy; test $(wc -c </work/large-copy) = 65537; sync".into());
@@ -106,14 +106,14 @@ async fn kernel_boots_directory_share() {
     });
     let (kernel, boot_disk, root_disk) = kernel_boot_assets();
     let outcome = super::worker::run(super::worker::WorkerInput {
-        component_memory_limits: terra_runtime::box_runtime::ComponentMemoryLimits::default(),
+        component_memory_limits: crate::box_runtime::ComponentMemoryLimits::default(),
         kernel,
         boot_disk,
         root_disk: root_disk.to_path_buf(),
         volume_disks: Vec::new(),
-        shares: vec![terra_runtime::component::fs::ShareGrant::new(&mount, false).unwrap()],
+        shares: vec![crate::component::fs::ShareGrant::new(&mount, false).unwrap()],
         plan: encode_frame(&plan).unwrap(),
-        artifacts: crate::test_support::artifacts::trusted_artifacts(),
+        artifacts: crate::test_fixtures::trusted_artifacts(),
         network_policy: boot_network_policy(),
         port_mappings: Vec::new(),
         ram_bytes: BOOT_RAM,
@@ -179,14 +179,14 @@ async fn kernel_boots_to_agent_ready() {
     };
     let (kernel, boot_disk, root_path) = kernel_boot_assets();
     let outcome = super::worker::run(super::worker::WorkerInput {
-        component_memory_limits: terra_runtime::box_runtime::ComponentMemoryLimits::default(),
+        component_memory_limits: crate::box_runtime::ComponentMemoryLimits::default(),
         kernel,
         boot_disk,
         root_disk: root_path.to_path_buf(),
         volume_disks: Vec::new(),
         shares: Vec::new(),
         plan: boot_probe_plan(vcpus),
-        artifacts: crate::test_support::artifacts::trusted_artifacts(),
+        artifacts: crate::test_fixtures::trusted_artifacts(),
         network_policy: boot_network_policy(),
         port_mappings: Vec::new(),
         hard_stop: None,
@@ -216,7 +216,7 @@ async fn kernel_reports_free_pages_after_boot() {
     };
     let (kernel, boot_disk, root_path) = kernel_boot_assets();
     let outcome = super::worker::run(super::worker::WorkerInput {
-        component_memory_limits: terra_runtime::box_runtime::ComponentMemoryLimits::default(),
+        component_memory_limits: crate::box_runtime::ComponentMemoryLimits::default(),
         kernel,
         boot_disk,
         root_disk: root_path.to_path_buf(),
@@ -228,7 +228,7 @@ async fn kernel_reports_free_pages_after_boot() {
             vec!["sleep".into(), "4".into()],
             false,
         ),
-        artifacts: crate::test_support::artifacts::trusted_artifacts(),
+        artifacts: crate::test_fixtures::trusted_artifacts(),
         network_policy: boot_network_policy(),
         port_mappings: Vec::new(),
         hard_stop: None,
@@ -251,14 +251,15 @@ async fn kernel_reports_free_pages_after_boot() {
 fn bridge_listener() -> (
     tempfile::TempDir,
     std::path::PathBuf,
-    terra_io::local::LocalListener,
+    terra_platform::io::local::LocalListener,
 ) {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
 
     let dir = tempfile::tempdir().expect("temporary socket directory");
     let path = dir.path().join("agent.sock");
-    let listener = terra_io::local::LocalListener::bind(&path).expect("bind agent socket");
+    let listener =
+        terra_platform::io::local::LocalListener::bind(&path).expect("bind agent socket");
     #[cfg(unix)]
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
         .expect("secure agent socket");
@@ -274,14 +275,16 @@ fn bridge_listener() -> (
     (dir, path, listener)
 }
 
-fn connect_agent(path: &std::path::Path) -> std::io::Result<terra_io::local::LocalStream> {
+fn connect_agent(
+    path: &std::path::Path,
+) -> std::io::Result<terra_platform::io::local::LocalStream> {
     use std::io::Read as _;
     use terra_protocol::AGENT_HELLO;
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_mins(2);
     loop {
         let attempt = (|| {
-            let mut stream = terra_io::local::LocalStream::connect(path)?;
+            let mut stream = terra_platform::io::local::LocalStream::connect(path)?;
             stream.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
             let mut hello = [0; AGENT_HELLO.len()];
             stream.read_exact(&mut hello)?;
@@ -511,14 +514,14 @@ async fn kernel_boots_to_agent_bridge() {
     let client_path = socket_path.clone();
     let client = tokio::task::spawn_blocking(move || assert_agent_control_and_exec(&client_path));
     let worker = super::worker::run(super::worker::WorkerInput {
-        component_memory_limits: terra_runtime::box_runtime::ComponentMemoryLimits::default(),
+        component_memory_limits: crate::box_runtime::ComponentMemoryLimits::default(),
         kernel,
         boot_disk,
         root_disk: root_path.to_path_buf(),
         volume_disks: Vec::new(),
         shares: Vec::new(),
         plan: agent_bridge_plan(),
-        artifacts: crate::test_support::artifacts::trusted_artifacts(),
+        artifacts: crate::test_fixtures::trusted_artifacts(),
         network_policy: boot_network_policy(),
         port_mappings: Vec::new(),
         hard_stop: None,
@@ -547,7 +550,8 @@ async fn kernel_boots_and_agent_stop_ends_workload() {
     let (_socket_dir, socket_path, listener) = bridge_listener();
     let (kernel, boot_disk, root_path) = kernel_boot_assets();
     let (_control_dir, control_path, control_listener) = bridge_listener();
-    let mut control_writer = terra_io::local::LocalStream::connect(&control_path).unwrap();
+    let mut control_writer =
+        terra_platform::io::local::LocalStream::connect(&control_path).unwrap();
     let (control, _) = control_listener.accept().unwrap();
     let client_path = socket_path.clone();
     let client = tokio::task::spawn_blocking(move || {
@@ -555,7 +559,7 @@ async fn kernel_boots_and_agent_stop_ends_workload() {
         control_writer.write_all(&[terra_protocol::STOP_SIGNAL])
     });
     let worker = super::worker::run(super::worker::WorkerInput {
-        component_memory_limits: terra_runtime::box_runtime::ComponentMemoryLimits::default(),
+        component_memory_limits: crate::box_runtime::ComponentMemoryLimits::default(),
         kernel,
         boot_disk,
         root_disk: root_path.to_path_buf(),
@@ -567,7 +571,7 @@ async fn kernel_boots_and_agent_stop_ends_workload() {
             vec!["sleep".into(), "120".into()],
             false,
         ),
-        artifacts: crate::test_support::artifacts::trusted_artifacts(),
+        artifacts: crate::test_fixtures::trusted_artifacts(),
         network_policy: boot_network_policy(),
         port_mappings: Vec::new(),
         hard_stop: None,
@@ -600,7 +604,7 @@ async fn kernel_boots_foreground_session_reports_workload_exit() {
     let client_path = socket_path.clone();
     let client = tokio::task::spawn_blocking(move || await_foreground_workload(&client_path));
     let worker = super::worker::run(super::worker::WorkerInput {
-        component_memory_limits: terra_runtime::box_runtime::ComponentMemoryLimits::default(),
+        component_memory_limits: crate::box_runtime::ComponentMemoryLimits::default(),
         kernel,
         boot_disk,
         root_disk: root_path.to_path_buf(),
@@ -616,7 +620,7 @@ async fn kernel_boots_foreground_session_reports_workload_exit() {
             ],
             true,
         ),
-        artifacts: crate::test_support::artifacts::trusted_artifacts(),
+        artifacts: crate::test_fixtures::trusted_artifacts(),
         network_policy: boot_network_policy(),
         port_mappings: Vec::new(),
         hard_stop: None,
@@ -667,14 +671,14 @@ async fn assert_policy_dns_http(address: std::net::IpAddr, body: &[u8]) {
         Ok::<(), std::io::Error>(())
     });
     let worker = super::worker::run(super::worker::WorkerInput {
-        component_memory_limits: terra_runtime::box_runtime::ComponentMemoryLimits::default(),
+        component_memory_limits: crate::box_runtime::ComponentMemoryLimits::default(),
         kernel,
         boot_disk,
         root_disk: root_path.to_path_buf(),
         volume_disks: Vec::new(),
         shares: Vec::new(),
         plan: agent_bridge_plan(),
-        artifacts: crate::test_support::artifacts::trusted_artifacts(),
+        artifacts: crate::test_fixtures::trusted_artifacts(),
         network_policy: std::sync::Arc::new(LocalHttpPolicy { address, port }),
         port_mappings: Vec::new(),
         hard_stop: None,
@@ -711,14 +715,14 @@ async fn assert_policy_dns_upload(address: std::net::IpAddr, bytes: usize) {
         Ok::<(), std::io::Error>(())
     });
     let worker = super::worker::run(super::worker::WorkerInput {
-        component_memory_limits: terra_runtime::box_runtime::ComponentMemoryLimits::default(),
+        component_memory_limits: crate::box_runtime::ComponentMemoryLimits::default(),
         kernel,
         boot_disk,
         root_disk: root_path.to_path_buf(),
         volume_disks: Vec::new(),
         shares: Vec::new(),
         plan: agent_bridge_plan(),
-        artifacts: crate::test_support::artifacts::trusted_artifacts(),
+        artifacts: crate::test_fixtures::trusted_artifacts(),
         network_policy: std::sync::Arc::new(LocalHttpPolicy { address, port }),
         port_mappings: Vec::new(),
         hard_stop: None,
@@ -814,7 +818,8 @@ async fn assert_published_loopback_http(host_closes_first: bool) {
     let host_port = reserved_loopback_port();
     let (kernel, boot_disk, root_path) = kernel_boot_assets();
     let (_control_dir, control_path, control_listener) = bridge_listener();
-    let mut control_writer = terra_io::local::LocalStream::connect(&control_path).unwrap();
+    let mut control_writer =
+        terra_platform::io::local::LocalStream::connect(&control_path).unwrap();
     let (control, _) = control_listener.accept().unwrap();
     let diagnostics = tempfile::NamedTempFile::new().expect("create diagnostics");
     let client = tokio::task::spawn_blocking(move || {
@@ -823,7 +828,7 @@ async fn assert_published_loopback_http(host_closes_first: bool) {
         Ok::<Vec<u8>, std::io::Error>(response)
     });
     let worker = super::worker::run(super::worker::WorkerInput {
-        component_memory_limits: terra_runtime::box_runtime::ComponentMemoryLimits::default(),
+        component_memory_limits: crate::box_runtime::ComponentMemoryLimits::default(),
         kernel,
         boot_disk,
         root_disk: root_path.to_path_buf(),
@@ -839,7 +844,7 @@ async fn assert_published_loopback_http(host_closes_first: bool) {
             ],
             false,
         ),
-        artifacts: crate::test_support::artifacts::trusted_artifacts(),
+        artifacts: crate::test_fixtures::trusted_artifacts(),
         network_policy: boot_network_policy(),
         port_mappings: vec![terra_network::PortMapping::new(host_port, GUEST_PORT)],
         hard_stop: None,

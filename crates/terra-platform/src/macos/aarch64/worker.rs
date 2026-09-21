@@ -1,19 +1,22 @@
+use crate::aarch64::arm::MAX_VCPUS;
+use crate::macos::aarch64::machine::{Cpu, Machine, RunExit};
+use crate::vm::{
+    ArmException, ArmRead, BootState, CpuStart, HvcResult, InterruptControllerConfig,
+    InterruptMode, VcpuAction, VcpuExit, VcpuHandler, VcpuOutcome, VmCapabilities, VmConfig,
+    VmHandle,
+};
+use applevisor::prelude::VcpuHandle;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Instant;
-use terra_runtime::component::vmm::{BootEntry, NativeVcpu, PreparedMachine, StartedVcpus};
-
-use crate::macos::aarch64::machine::{Cpu, Machine, RunExit};
-use crate::worker::{self, PreparedVmm, WorkerInput};
-use applevisor::prelude::VcpuHandle;
 
 const STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 enum CpuCommand {
     Start {
-        worker: NativeVcpu,
-        boot: Option<BootEntry>,
+        handler: Box<dyn VcpuHandler>,
+        boot: Option<BootState>,
     },
     CpuStart(u64, u64),
     Stop,
@@ -133,53 +136,59 @@ enum CpuRun {
     Stop,
 }
 
-fn inject_irq(machine: &Machine, irq: u32, level: bool) -> wasmtime::Result<()> {
-    machine
-        .set_irq(irq, level)
-        .map_err(|error| wasmtime::Error::msg(error.to_string()))
+pub struct MacArmVm {
+    machine: Arc<Machine>,
+    group: PreparedVcpuGroup,
 }
 
-#[allow(clippy::too_many_lines)]
-pub async fn prepare(mut input: WorkerInput) -> Result<PreparedVmm, String> {
-    let disks = crate::worker::devices::disk_paths(&input);
-    let blocks = 1 + disks.len();
-    let shares = input.shares.len();
-    let layout = crate::aarch64::arm::build_machine_layout(input.ram_bytes, blocks, shares)
-        .map_err(|error| format!("invalid HVF layout: {error:?}"))?;
-    let config = layout
-        .machine_config(input.vcpus)
-        .map_err(|error| error.to_string())?;
-    let native_machine =
-        Arc::new(Machine::new(layout.ram_size()).map_err(|error| error.to_string())?);
-    let group = VcpuGroup::prepare(&native_machine, input.vcpus, input.hard_stop)?;
-    let prepared = PreparedMachine::new(config, Arc::clone(&native_machine));
-    let component_runtime =
-        crate::worker::create_runtime(&input).map_err(|error| error.to_string())?;
-    let (mut component_runtime, machine) =
-        crate::worker::boot_prepared(component_runtime, prepared, &mut input)
-            .await
-            .map_err(|error| error.to_string())?;
-    worker::devices::assemble_devices(
-        &mut component_runtime,
-        &mut input,
-        machine.ram(),
-        &disks,
-        |kind, index| {
-            machine
-                .bind_interrupt(kind, index, |machine, irq, level| {
-                    inject_irq(machine, irq, level)
-                })
-                .map_err(|error| error.to_string())
-        },
-    )?;
-    crate::worker::finish_preparation(component_runtime, input.deadline, move |controls, boot| {
-        group.start(controls, boot).map_err(wasmtime::Error::msg)
-    })
-    .await
-    .map_err(|error| error.to_string())
+impl MacArmVm {
+    pub fn create(config: &VmConfig, hard_stop: Option<fn() -> !>) -> Result<Self, String> {
+        let vcpus = usize::from(config.vcpus);
+        match config.interrupt_controller {
+            InterruptControllerConfig::Arm(_) => {}
+            InterruptControllerConfig::X86 => {
+                return Err("ARM interrupt controller required".to_owned());
+            }
+        }
+        if vcpus == 0 || vcpus > MAX_VCPUS {
+            return Err(format!("invalid vCPU count: {vcpus}"));
+        }
+        let machine = Arc::new(Machine::new(config).map_err(|error| error.to_string())?);
+        let group = PreparedVcpuGroup {
+            group: VcpuGroup::prepare(&machine, vcpus, hard_stop)?,
+        };
+        Ok(Self { machine, group })
+    }
+
+    #[allow(clippy::unnecessary_wraps)]
+    pub const fn capabilities() -> Result<VmCapabilities, String> {
+        Ok(VmCapabilities {
+            interrupt_mode: InterruptMode::ArmIrqLines,
+            tsc_frequency: None,
+        })
+    }
 }
 
-struct VcpuGroup {
+impl MacArmVm {
+    #[must_use]
+    pub fn handle(&self) -> VmHandle {
+        VmHandle::new(Arc::clone(&self.machine))
+    }
+
+    pub(crate) fn start(
+        self,
+        boot: BootState,
+        handlers: Vec<Box<dyn VcpuHandler>>,
+    ) -> Result<VcpuGroup, String> {
+        self.group.start(handlers, boot)
+    }
+}
+
+struct PreparedVcpuGroup {
+    group: VcpuGroup,
+}
+
+pub(crate) struct VcpuGroup {
     starts: Arc<CpuStarts>,
     threads: Vec<thread::JoinHandle<Result<(), String>>>,
     hard_stop: Option<fn() -> !>,
@@ -228,28 +237,38 @@ impl VcpuGroup {
         }
         Ok(group)
     }
+}
 
-    fn start(self, workers: Vec<NativeVcpu>, boot: BootEntry) -> Result<StartedVcpus, String> {
-        if self.starts.senders.len() != workers.len() {
+impl PreparedVcpuGroup {
+    fn start(
+        self,
+        handlers: Vec<Box<dyn VcpuHandler>>,
+        boot: BootState,
+    ) -> Result<VcpuGroup, String> {
+        if self.group.starts.senders.len() != handlers.len() {
             return Err("vCPU worker count changed during startup".to_owned());
         }
-        for (cpu_id, (sender, worker)) in self.starts.senders.iter().zip(workers).enumerate() {
+        for (cpu_id, (sender, handler)) in
+            self.group.starts.senders.iter().zip(handlers).enumerate()
+        {
             sender
                 .send(CpuCommand::Start {
-                    worker,
+                    handler,
                     boot: (cpu_id == 0).then_some(boot),
                 })
                 .map_err(|_| "vCPU startup thread disappeared")?;
         }
-        let starts = Arc::clone(&self.starts);
-        Ok(StartedVcpus::new(
-            self,
-            move || {
-                starts.stop();
-                Ok(())
-            },
-            |mut group| group.stop(),
-        ))
+        Ok(self.group)
+    }
+}
+
+impl VcpuGroup {
+    pub(crate) fn request_stop(&mut self) {
+        self.starts.stop();
+    }
+
+    pub(crate) fn join(&mut self) -> Result<Vec<Result<(), String>>, String> {
+        self.stop()
     }
 
     fn stop(&mut self) -> Result<Vec<Result<(), String>>, String> {
@@ -284,11 +303,11 @@ fn spawn_cpu(
                 ready_sender
                     .send(Ok(()))
                     .map_err(|_| "vCPU setup receiver disappeared")?;
-                let (worker, boot) = match receiver
+                let (mut handler, boot) = match receiver
                     .recv()
                     .map_err(|_| "vCPU startup sender disappeared")?
                 {
-                    CpuCommand::Start { worker, boot } => (worker, boot),
+                    CpuCommand::Start { handler, boot } => (handler, boot),
                     CpuCommand::Stop => return Ok(()),
                     CpuCommand::CpuStart(_, _) => {
                         return Err("vCPU started before native startup".to_owned());
@@ -301,9 +320,12 @@ fn spawn_cpu(
                     cpu.set_reg(applevisor::prelude::Reg::X0, boot.boot_argument)
                         .map_err(|error| error.to_string())?;
                     loop {
-                        match run_one(&cpu, cpu_id, &worker, &starts)? {
+                        match run_one(&cpu, cpu_id, handler.as_mut(), &starts)? {
                             CpuRun::Continue => {}
-                            CpuRun::Off | CpuRun::Stop => return Ok(()),
+                            CpuRun::Off | CpuRun::Stop => {
+                                handler.finished(VcpuOutcome::Stopped);
+                                return Ok(());
+                            }
                         }
                     }
                 }
@@ -323,7 +345,7 @@ fn spawn_cpu(
                     cpu.set_reg(applevisor::prelude::Reg::X0, context)
                         .map_err(|error| error.to_string())?;
                     loop {
-                        match run_one(&cpu, cpu_id, &worker, &starts)? {
+                        match run_one(&cpu, cpu_id, handler.as_mut(), &starts)? {
                             CpuRun::Continue => {}
                             CpuRun::Off => {
                                 starts.powered_off(cpu_id);
@@ -339,7 +361,10 @@ fn spawn_cpu(
                                 starts.replace_handle(old, cpu.handle())?;
                                 break;
                             }
-                            CpuRun::Stop => return Ok(()),
+                            CpuRun::Stop => {
+                                handler.finished(VcpuOutcome::Stopped);
+                                return Ok(());
+                            }
                         }
                     }
                 }
@@ -364,7 +389,7 @@ impl Drop for VcpuGroup {
 fn run_one(
     cpu: &Cpu,
     cpu_id: usize,
-    worker: &NativeVcpu,
+    handler: &mut dyn VcpuHandler,
     starts: &CpuStarts,
 ) -> Result<CpuRun, String> {
     match cpu.run().map_err(|error| error.to_string())? {
@@ -377,36 +402,37 @@ fn run_one(
             physical_address,
             ..
         } => {
-            let completion = worker
-                .exchange_arm_exception(physical_address, syndrome, |register| {
-                    cpu.arm_register_value(register)
-                        .map_err(|error| wasmtime::Error::msg(error.to_string()))
-                })
-                .map_err(|error| error.to_string())?;
-            match completion {
-                terra_runtime::component::vmm::Completion::ArmRead(completion) => {
-                    cpu.set_arm_mmio_read(completion.register, completion.value)
+            let mut action = handler.exchange(VcpuExit::ArmException(ArmException {
+                address: physical_address,
+                syndrome,
+            }))?;
+            while let VcpuAction::ArmRegister(register) = action {
+                let value = cpu
+                    .arm_register_value(register)
+                    .map_err(|error| error.to_string())?;
+                action = handler.exchange(VcpuExit::ArmRegisterValue(value))?;
+            }
+            match action {
+                VcpuAction::ArmRead(ArmRead { register, value }) => {
+                    cpu.set_arm_mmio_read(register, value)
                         .map_err(|error| error.to_string())?;
                     cpu.advance_pc().map_err(|error| error.to_string())?;
                     Ok(CpuRun::Continue)
                 }
 
-                terra_runtime::component::vmm::Completion::HvcReturn(status) => {
+                VcpuAction::HvcReturn(status) => {
                     cpu.set_reg(applevisor::prelude::Reg::X0, status.cast_unsigned())
                         .map_err(|error| error.to_string())?;
                     Ok(CpuRun::Continue)
                 }
-                terra_runtime::component::vmm::Completion::CpuStart(start) => {
-                    let status = starts.start(u64::from(start.target), start.entry, start.context);
-                    let completion = worker
-                        .exchange(terra_runtime::component::vmm::Exit::HvcResult(
-                            terra_runtime::component::vmm::platform::HvcResult {
-                                target: start.target,
-                                status,
-                            },
-                        ))
-                        .map_err(|error| error.to_string())?;
-                    let terra_runtime::component::vmm::Completion::HvcReturn(status) = completion
+                VcpuAction::CpuStart(CpuStart {
+                    target,
+                    entry,
+                    context,
+                }) => {
+                    let status = starts.start(u64::from(target), entry, context);
+                    let VcpuAction::HvcReturn(status) =
+                        handler.exchange(VcpuExit::HvcResult(HvcResult { target, status }))?
                     else {
                         return Err("unexpected PSCI start completion".to_owned());
                     };
@@ -414,21 +440,20 @@ fn run_one(
                         .map_err(|error| error.to_string())?;
                     Ok(CpuRun::Continue)
                 }
-                terra_runtime::component::vmm::Completion::CpuOff => Ok(CpuRun::Off),
-                terra_runtime::component::vmm::Completion::SystemStop => {
+                VcpuAction::CpuOff => Ok(CpuRun::Off),
+                VcpuAction::SystemStop => {
                     starts.stop();
                     Ok(CpuRun::Stop)
                 }
-                terra_runtime::component::vmm::Completion::Start
-                | terra_runtime::component::vmm::Completion::Reenter
-                | terra_runtime::component::vmm::Completion::MmioRead(_)
-                | terra_runtime::component::vmm::Completion::PioZero
-                | terra_runtime::component::vmm::Completion::Rdmsr(_)
-                | terra_runtime::component::vmm::Completion::MsrFault
-                | terra_runtime::component::vmm::Completion::Wrmsr
-                | terra_runtime::component::vmm::Completion::ArmRegister(_) => {
-                    Err("unexpected ARM VMM completion".to_owned())
-                }
+                VcpuAction::Start
+                | VcpuAction::Reenter
+                | VcpuAction::MmioRead(_)
+                | VcpuAction::PioZero
+                | VcpuAction::Rdmsr(_)
+                | VcpuAction::MsrFault
+                | VcpuAction::Wrmsr
+                | VcpuAction::ArmRegister(_)
+                | VcpuAction::IoApicValue(_) => Err("unexpected ARM VMM completion".to_owned()),
             }
         }
         RunExit::Unknown => Err(format!("unexpected HVF exit on CPU {cpu_id}")),

@@ -2,27 +2,32 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
-pub mod aarch64;
-#[cfg(target_arch = "x86_64")]
-pub mod amd64;
-pub mod worker;
+#[cfg(target_arch = "aarch64")]
+mod aarch64;
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "linux", target_os = "windows")
+))]
+mod amd64;
 
 #[cfg(target_os = "linux")]
-pub mod linux;
+mod linux;
 #[cfg(target_os = "macos")]
-pub mod macos;
+mod macos;
 #[cfg(target_os = "windows")]
-pub mod windows;
+mod windows;
 
-#[cfg(target_arch = "x86_64")]
-pub use amd64::machine;
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_os = "linux", target_os = "windows")
+))]
+pub(crate) use amd64::machine;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-pub use linux::kvm::amd64::{arch, kvm};
+pub(crate) use linux::kvm::amd64::{arch, kvm};
 #[cfg(target_os = "linux")]
 pub(crate) use linux::runner;
 
-#[cfg(test)]
-mod boot_tests;
-
-#[cfg(test)]
-mod test_support;
+pub mod filesystem;
+pub mod io;
+pub mod memory;
+pub mod vm;

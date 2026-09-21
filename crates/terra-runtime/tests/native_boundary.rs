@@ -217,16 +217,9 @@ fn interrupt_storm_coalesces_and_drops() {
 #[cfg(unix)]
 #[test]
 fn memory_hole_is_rejected_before_partial_write() {
-    use std::sync::Arc;
-    use vm_memory::{GuestAddress, GuestMemoryMmap};
-    let mapping = Arc::new(
-        GuestMemoryMmap::<()>::from_ranges(&[
-            (GuestAddress(0), 0x1000),
-            (GuestAddress(0x2000), 0x1000),
-        ])
-        .unwrap(),
-    );
-    let ram = GuestRam::from_shared(mapping).unwrap();
+    use terra_platform::memory::GuestMemory;
+    let ram =
+        GuestRam::from_memory(GuestMemory::from_ranges(&[(0, 0x1000), (0x2000, 0x1000)]).unwrap());
     let memory = BoundedMemory::new(&ram);
     memory.write(0xff0, &[0x42; 16]).unwrap();
     assert_eq!(memory.write(0xff0, &[0x99; 32]), Err(MemoryError::Unmapped));
@@ -236,14 +229,11 @@ fn memory_hole_is_rejected_before_partial_write() {
 #[cfg(unix)]
 #[test]
 fn hostile_memory_imports_cannot_cross_mapping_holes() {
-    use std::sync::Arc;
+    use terra_platform::memory::GuestMemory;
     use terra_runtime::memory::GuestRam;
-    use vm_memory::{GuestAddress, GuestMemoryMmap};
 
-    let mapping =
-        GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 4096), (GuestAddress(8192), 4096)])
-            .unwrap();
-    let mut host = DeviceContext::with_ram(GuestRam::from_shared(Arc::new(mapping)).unwrap());
+    let ram = GuestRam::from_memory(GuestMemory::from_ranges(&[(0, 4096), (8192, 4096)]).unwrap());
+    let mut host = DeviceContext::with_ram(ram);
     host.write(0, vec![0xa5; 4096]).unwrap();
     assert!(host.read(4095, 4098).is_err());
     assert!(host.write(4095, vec![0; 4098]).is_err());
@@ -258,13 +248,10 @@ fn synthetic_ram_shapes_match() {
 #[cfg(unix)]
 #[test]
 fn shared_ram_aliases_one_mapping() {
-    use std::sync::Arc;
-    use vm_memory::{Bytes as _, GuestAddress, GuestMemoryMmap};
-    let mem = Arc::new(
-        GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 64 * 1024)]).expect("maps"),
-    );
-    let first = GuestRam::from_shared(Arc::clone(&mem)).expect("aliases");
-    let second = GuestRam::from_shared(Arc::clone(&mem)).expect("aliases");
+    use terra_platform::memory::GuestMemory;
+    let mem = GuestMemory::allocate(64 * 1024).expect("maps");
+    let first = GuestRam::from_memory(mem.clone());
+    let second = GuestRam::from_memory(mem.clone());
     assert_eq!(first.size(), 64 * 1024);
     BoundedMemory::new(&first)
         .write(512, b"shared")
@@ -273,8 +260,5 @@ fn shared_ram_aliases_one_mapping() {
         BoundedMemory::new(&second).read(512, 6).expect("reads"),
         b"shared"
     );
-    let mut back = [0u8; 6];
-    mem.read_slice(&mut back, GuestAddress(512))
-        .expect("mapped");
-    assert_eq!(&back, b"shared");
+    assert_eq!(mem.read(512, 6).expect("mapped"), b"shared");
 }

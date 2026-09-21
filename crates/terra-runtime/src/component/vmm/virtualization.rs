@@ -109,6 +109,12 @@ impl<T: VirtualMachine> VirtualMachine for Arc<T> {
     }
 }
 
+impl VirtualMachine for terra_platform::vm::VmHandle {
+    fn memory(&self) -> wasmtime::Result<GuestRam> {
+        Ok(GuestRam::from_memory(self.memory()))
+    }
+}
+
 #[derive(Clone)]
 pub struct RamGrant(Arc<dyn Fn() -> wasmtime::Result<GuestRam> + Send + Sync>);
 
@@ -568,8 +574,7 @@ mod tests {
     async fn aot_vmm_applies_boot_and_keeps_both_vcpus_responsive() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::time::{Duration, Instant};
-        #[cfg(unix)]
-        use vm_memory::{GuestAddress, GuestMemoryMmap};
+        use terra_platform::memory::GuestMemory;
 
         for architecture in [Architecture::X86, Architecture::Arm] {
             let engine = crate::engine::device_engine().unwrap();
@@ -649,16 +654,7 @@ mod tests {
                 },
             )
             .collect();
-            #[cfg(unix)]
-            let ram = GuestRam::from_shared(Arc::new(
-                GuestMemoryMmap::from_ranges(&[(GuestAddress(base), 8 << 20)]).unwrap(),
-            ))
-            .unwrap();
-            #[cfg(windows)]
-            let ram = GuestRam::from_windows_ram(
-                crate::memory::WindowsRam::allocate_at(8 << 20, base).unwrap(),
-            )
-            .unwrap();
+            let ram = GuestRam::from_memory(GuestMemory::allocate_at(base, 8 << 20).unwrap());
             let config = MachineConfig::new(architecture, 8 << 20, 2, devices).unwrap();
             let mut kernel = vec![0; 65536];
             let (entry, copied) = match architecture {

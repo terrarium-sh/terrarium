@@ -32,3 +32,5 @@ pub const ARM_GIC_REDIST_SIZE: u64 = 0x0020_0000;
 pub const ARM_VIRTIO_MMIO_BASE: u64 = 0x0a00_0000;
 pub const ARM_VIRTIO_MMIO_STRIDE: u64 = 0x200;
 pub const ARM_VIRTIO_IRQ_BASE: u32 = 16;
+
+pub const MAX_LOG_FILE_BYTES: u64 = 8 << 20;

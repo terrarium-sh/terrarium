@@ -24,6 +24,7 @@ use crate::box_runtime::store::BoxHost;
 pub use crate::component::vmm::bindings::platform;
 pub use crate::component::vmm::bindings::platform::{Completion, Error, Exit};
 use crate::memory::BoundedMemory;
+use terra_platform::vm;
 
 const MAX_VCPUS: usize = terra_limits::X86_MAX_VCPUS as usize;
 pub(crate) const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -40,6 +41,7 @@ enum VcpuState {
 
 pub struct NativeVcpu {
     sender: tokio::sync::mpsc::Sender<Pending>,
+    arm_registers: u8,
 }
 
 impl NativeVcpu {
@@ -79,6 +81,107 @@ impl NativeVcpu {
     }
 }
 
+fn native_exit(exit: vm::VcpuExit) -> Option<Exit> {
+    match exit {
+        vm::VcpuExit::Halt => Some(Exit::Halt),
+        vm::VcpuExit::Shutdown => Some(Exit::Shutdown),
+        vm::VcpuExit::Interrupted => Some(Exit::Interrupted),
+        vm::VcpuExit::MmioRead(vm::MmioRead { address, width }) => {
+            Some(Exit::MmioRead(platform::MmioRead { address, width }))
+        }
+        vm::VcpuExit::MmioWrite(vm::MmioWrite {
+            address,
+            width,
+            value,
+        }) => Some(Exit::MmioWrite(platform::MmioWrite {
+            address,
+            width,
+            value,
+        })),
+        vm::VcpuExit::PioRead(vm::PioRead { port, length }) => {
+            Some(Exit::PioRead(platform::PioRead { port, length }))
+        }
+        vm::VcpuExit::PioWrite(vm::PioWrite { port, length }) => {
+            Some(Exit::PioWrite(platform::PioWrite { port, length }))
+        }
+        vm::VcpuExit::Rdmsr(vm::Msr { index, value }) => {
+            Some(Exit::Rdmsr(platform::Msr { index, value }))
+        }
+        vm::VcpuExit::Wrmsr(vm::Msr { index, value }) => {
+            Some(Exit::Wrmsr(platform::Msr { index, value }))
+        }
+        vm::VcpuExit::ArmException(vm::ArmException { address, syndrome }) => {
+            Some(Exit::ArmException(platform::ArmException {
+                address,
+                syndrome,
+            }))
+        }
+        vm::VcpuExit::ArmRegisterValue(value) => Some(Exit::ArmRegisterValue(value)),
+        vm::VcpuExit::HvcResult(vm::HvcResult { target, status }) => {
+            Some(Exit::HvcResult(platform::HvcResult { target, status }))
+        }
+        vm::VcpuExit::IoApicAccess(_) | vm::VcpuExit::IoApicEoi(_) => None,
+        vm::VcpuExit::Stopped => Some(Exit::Stopped),
+    }
+}
+
+fn native_action(action: Completion) -> vm::VcpuAction {
+    match action {
+        Completion::Start => vm::VcpuAction::Start,
+        Completion::Reenter => vm::VcpuAction::Reenter,
+        Completion::MmioRead(value) => vm::VcpuAction::MmioRead(value),
+        Completion::PioZero => vm::VcpuAction::PioZero,
+        Completion::Rdmsr(value) => vm::VcpuAction::Rdmsr(value),
+        Completion::MsrFault => vm::VcpuAction::MsrFault,
+        Completion::Wrmsr => vm::VcpuAction::Wrmsr,
+        Completion::ArmRead(platform::ArmRead { register, value }) => {
+            vm::VcpuAction::ArmRead(vm::ArmRead { register, value })
+        }
+        Completion::ArmRegister(register) => vm::VcpuAction::ArmRegister(register),
+        Completion::HvcReturn(status) => vm::VcpuAction::HvcReturn(status),
+        Completion::CpuStart(platform::CpuStart {
+            target,
+            entry,
+            context,
+        }) => vm::VcpuAction::CpuStart(vm::CpuStart {
+            target,
+            entry,
+            context,
+        }),
+        Completion::CpuOff => vm::VcpuAction::CpuOff,
+        Completion::SystemStop => vm::VcpuAction::SystemStop,
+    }
+}
+
+impl vm::VcpuHandler for NativeVcpu {
+    fn exchange(&mut self, exit: vm::VcpuExit) -> Result<vm::VcpuAction, String> {
+        if matches!(exit, vm::VcpuExit::ArmException(_)) {
+            self.arm_registers = 0;
+        }
+        let exit = native_exit(exit)
+            .ok_or_else(|| "IOAPIC exits require the runtime interrupt adapter".to_owned())?;
+        let action = NativeVcpu::exchange(self, exit)
+            .map(native_action)
+            .map_err(|error| error.to_string())?;
+        if let vm::VcpuAction::ArmRegister(register) = action {
+            if register > 31 || self.arm_registers == 4 {
+                return Err("VMM exceeded ARM register access grant".to_owned());
+            }
+            self.arm_registers += 1;
+        }
+        Ok(action)
+    }
+
+    fn finished(&mut self, outcome: vm::VcpuOutcome) {
+        let exit = match outcome {
+            vm::VcpuOutcome::Shutdown => Exit::Shutdown,
+            vm::VcpuOutcome::Stopped => Exit::Stopped,
+        };
+        let (reply, _) = mpsc::sync_channel(1);
+        let _ = self.sender.try_send(Pending { exit, reply });
+    }
+}
+
 struct Rendezvous {
     exits: tokio::sync::mpsc::Receiver<Pending>,
     state: VcpuState,
@@ -89,7 +192,10 @@ pub struct Vcpu(Option<Rendezvous>);
 fn vcpu_channel() -> (NativeVcpu, Vcpu) {
     let (sender, exits) = tokio::sync::mpsc::channel(1);
     (
-        NativeVcpu { sender },
+        NativeVcpu {
+            sender,
+            arm_registers: 0,
+        },
         Vcpu(Some(Rendezvous {
             exits,
             state: VcpuState::AwaitingStart,
@@ -268,6 +374,184 @@ mod tests {
     use super::*;
     use std::future::Future;
     use std::task::{Context, Poll, Waker};
+
+    #[test]
+    fn native_terminal_notifications_preserve_the_outcome() {
+        for (outcome, expected) in [
+            (vm::VcpuOutcome::Shutdown, Exit::Shutdown),
+            (vm::VcpuOutcome::Stopped, Exit::Stopped),
+        ] {
+            let (mut native, mut vcpu) = vcpu_channel();
+            vm::VcpuHandler::finished(&mut native, outcome);
+            let pending = vcpu.0.as_mut().unwrap().exits.try_recv().unwrap();
+            assert_eq!(pending.exit, expected);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn native_exits_preserve_every_payload() {
+        let cases = [
+            (vm::VcpuExit::Halt, Exit::Halt),
+            (vm::VcpuExit::Shutdown, Exit::Shutdown),
+            (vm::VcpuExit::Interrupted, Exit::Interrupted),
+            (
+                vm::VcpuExit::MmioRead(vm::MmioRead {
+                    address: 0x1234,
+                    width: 8,
+                }),
+                Exit::MmioRead(platform::MmioRead {
+                    address: 0x1234,
+                    width: 8,
+                }),
+            ),
+            (
+                vm::VcpuExit::MmioWrite(vm::MmioWrite {
+                    address: 0x2345,
+                    width: 4,
+                    value: 0x5678,
+                }),
+                Exit::MmioWrite(platform::MmioWrite {
+                    address: 0x2345,
+                    width: 4,
+                    value: 0x5678,
+                }),
+            ),
+            (
+                vm::VcpuExit::PioRead(vm::PioRead {
+                    port: 0x1234,
+                    length: 2,
+                }),
+                Exit::PioRead(platform::PioRead {
+                    port: 0x1234,
+                    length: 2,
+                }),
+            ),
+            (
+                vm::VcpuExit::PioWrite(vm::PioWrite {
+                    port: 0x2345,
+                    length: 4,
+                }),
+                Exit::PioWrite(platform::PioWrite {
+                    port: 0x2345,
+                    length: 4,
+                }),
+            ),
+            (
+                vm::VcpuExit::Rdmsr(vm::Msr {
+                    index: 0x1234,
+                    value: 0x5678,
+                }),
+                Exit::Rdmsr(platform::Msr {
+                    index: 0x1234,
+                    value: 0x5678,
+                }),
+            ),
+            (
+                vm::VcpuExit::Wrmsr(vm::Msr {
+                    index: 0x2345,
+                    value: 0x6789,
+                }),
+                Exit::Wrmsr(platform::Msr {
+                    index: 0x2345,
+                    value: 0x6789,
+                }),
+            ),
+            (
+                vm::VcpuExit::ArmException(vm::ArmException {
+                    address: 0x1234,
+                    syndrome: 0x5678,
+                }),
+                Exit::ArmException(platform::ArmException {
+                    address: 0x1234,
+                    syndrome: 0x5678,
+                }),
+            ),
+            (
+                vm::VcpuExit::ArmRegisterValue(0x1234),
+                Exit::ArmRegisterValue(0x1234),
+            ),
+            (
+                vm::VcpuExit::HvcResult(vm::HvcResult {
+                    target: 3,
+                    status: -2,
+                }),
+                Exit::HvcResult(platform::HvcResult {
+                    target: 3,
+                    status: -2,
+                }),
+            ),
+            (vm::VcpuExit::Stopped, Exit::Stopped),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(native_exit(input), Some(expected));
+        }
+        assert_eq!(
+            native_exit(vm::VcpuExit::IoApicAccess(vm::IoApicAccess {
+                offset: 0,
+                width: 4,
+                write: false,
+                value: 0,
+            })),
+            None
+        );
+        assert_eq!(native_exit(vm::VcpuExit::IoApicEoi(32)), None);
+    }
+
+    #[test]
+    fn native_actions_preserve_every_payload() {
+        let cases = [
+            (Completion::Start, vm::VcpuAction::Start),
+            (Completion::Reenter, vm::VcpuAction::Reenter),
+            (
+                Completion::MmioRead(0x1234),
+                vm::VcpuAction::MmioRead(0x1234),
+            ),
+            (Completion::PioZero, vm::VcpuAction::PioZero),
+            (Completion::Rdmsr(0x2345), vm::VcpuAction::Rdmsr(0x2345)),
+            (Completion::MsrFault, vm::VcpuAction::MsrFault),
+            (Completion::Wrmsr, vm::VcpuAction::Wrmsr),
+            (
+                Completion::ArmRead(platform::ArmRead {
+                    register: Some(7),
+                    value: 0x3456,
+                }),
+                vm::VcpuAction::ArmRead(vm::ArmRead {
+                    register: Some(7),
+                    value: 0x3456,
+                }),
+            ),
+            (
+                Completion::ArmRead(platform::ArmRead {
+                    register: None,
+                    value: 0x4567,
+                }),
+                vm::VcpuAction::ArmRead(vm::ArmRead {
+                    register: None,
+                    value: 0x4567,
+                }),
+            ),
+            (Completion::ArmRegister(31), vm::VcpuAction::ArmRegister(31)),
+            (Completion::HvcReturn(-3), vm::VcpuAction::HvcReturn(-3)),
+            (
+                Completion::CpuStart(platform::CpuStart {
+                    target: 2,
+                    entry: 0x4567,
+                    context: 0x5678,
+                }),
+                vm::VcpuAction::CpuStart(vm::CpuStart {
+                    target: 2,
+                    entry: 0x4567,
+                    context: 0x5678,
+                }),
+            ),
+            (Completion::CpuOff, vm::VcpuAction::CpuOff),
+            (Completion::SystemStop, vm::VcpuAction::SystemStop),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(native_action(input), expected);
+        }
+    }
 
     async fn resume(
         accessor: &Accessor<PlatformHost>,

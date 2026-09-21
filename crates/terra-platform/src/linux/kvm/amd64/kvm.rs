@@ -5,14 +5,15 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
+use std::{error, fmt};
 
-use kvm_bindings::{KVM_API_VERSION, kvm_userspace_memory_region};
-use kvm_ioctls::{Cap, Kvm, VcpuExit, VcpuFd, VmFd};
-use vm_memory::{GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
-
-use crate::machine::{Layout, MAX_VCPUS};
+use crate::memory::GuestMemory;
 use crate::runner::{PthreadPublication, install_kick_handler, unblock_kick_signal};
-use terra_runtime::component::vmm::{Completion, Exit, NativeVcpu, platform};
+use crate::vm::{
+    MmioRead, MmioWrite, Msr, PioRead, PioWrite, VcpuAction, VcpuExit, VcpuHandler, VcpuOutcome,
+};
+use kvm_bindings::{KVM_API_VERSION, kvm_userspace_memory_region};
+use kvm_ioctls::{Cap, Kvm, VcpuExit as KvmVcpuExit, VcpuFd, VmFd};
 
 /// Largest PIO transfer completed in one exit (the `kvm_run` buffer).
 pub const MAX_IO_BYTES: usize = 8192;
@@ -33,13 +34,7 @@ pub enum KvmError {
     Timeout,
     ThreadGone,
     KickHandler(std::io::Error),
-    Component(String),
-}
-
-impl From<wasmtime::Error> for KvmError {
-    fn from(error: wasmtime::Error) -> Self {
-        Self::Component(format!("{error:#}"))
-    }
+    Handler(String),
 }
 
 impl From<kvm_ioctls::Error> for KvmError {
@@ -53,6 +48,51 @@ impl From<DispatchError> for KvmError {
         Self::Dispatch(error)
     }
 }
+
+impl fmt::Display for KvmError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ApiVersion(version) => write!(formatter, "unsupported KVM API version {version}"),
+            Self::MissingCap(capability) => {
+                write!(formatter, "missing KVM capability {capability}")
+            }
+            Self::NoVcpus => formatter.write_str("KVM supports no vCPUs"),
+            Self::BadVcpuCount(count) => write!(formatter, "unsupported vCPU count {count}"),
+            Self::Memory(operation) => write!(formatter, "KVM memory {operation} failed"),
+            Self::Kvm(error) => write!(formatter, "KVM error: {error}"),
+            Self::Dispatch(error) => write!(formatter, "KVM exit dispatch failed: {error}"),
+            Self::Timeout => formatter.write_str("KVM vCPU stop timed out"),
+            Self::ThreadGone => formatter.write_str("KVM vCPU thread exited"),
+            Self::KickHandler(error) => {
+                write!(formatter, "installing KVM vCPU kick handler: {error}")
+            }
+            Self::Handler(error) => write!(formatter, "vCPU handler: {error}"),
+        }
+    }
+}
+
+impl error::Error for KvmError {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        match self {
+            Self::Kvm(error) => Some(error),
+            Self::Dispatch(error) => Some(error),
+            Self::KickHandler(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for DispatchError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unexpected(exit) => write!(formatter, "unexpected exit {exit}"),
+            Self::Fatal(exit, code) => write!(formatter, "fatal exit {exit} ({code:#x})"),
+            Self::TooLarge => formatter.write_str("exit payload is too large"),
+        }
+    }
+}
+
+impl error::Error for DispatchError {}
 
 pub fn open() -> Result<Kvm, KvmError> {
     let kvm = Kvm::new()?;
@@ -76,42 +116,33 @@ pub fn open() -> Result<Kvm, KvmError> {
 /// closes first, and the pages outlive every runner and device.
 pub struct Machine {
     vm: VmFd,
-    ram: Arc<GuestMemoryMmap>,
-}
-
-impl terra_runtime::component::vmm::VirtualMachine for Machine {
-    fn memory(&self) -> wasmtime::Result<terra_runtime::memory::GuestRam> {
-        terra_runtime::memory::GuestRam::from_shared(self.shared_ram())
-            .ok_or_else(|| wasmtime::Error::msg("aliasing KVM guest RAM"))
-    }
+    ram: GuestMemory,
 }
 
 impl Machine {
-    /// Create the VM, map the layout's RAM as slot 0, and check the vCPU
-    /// count against both the static ceiling and the host limit. KVM
-    /// resources are created here, never in a parent and transferred.
-    pub fn new(kvm: &Kvm, layout: &Layout, vcpu_count: usize) -> Result<Self, KvmError> {
-        if vcpu_count == 0 || vcpu_count > MAX_VCPUS {
+    /// Create the VM and map its RAM as slot 0.
+    pub fn new(
+        kvm: &Kvm,
+        ram_base: u64,
+        ram_bytes: u64,
+        vcpu_count: usize,
+    ) -> Result<Self, KvmError> {
+        if vcpu_count == 0 {
             return Err(KvmError::BadVcpuCount(vcpu_count));
         }
         if vcpu_count > kvm.get_max_vcpus() {
             return Err(KvmError::BadVcpuCount(vcpu_count));
         }
         let vm = kvm.create_vm()?;
-        let ram_size =
-            usize::try_from(layout.ram_size()).map_err(|_| KvmError::Memory("ram-size"))?;
-        let ram = Arc::new(
-            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), ram_size)])
-                .map_err(|_| KvmError::Memory("map"))?,
-        );
+        let ram = GuestMemory::allocate_at(ram_base, ram_bytes).ok_or(KvmError::Memory("map"))?;
         let host_addr = ram
-            .get_host_address(GuestAddress(0))
-            .map_err(|_| KvmError::Memory("host-addr"))?;
+            .host_address(ram_base)
+            .ok_or(KvmError::Memory("host-addr"))?;
         let region = kvm_userspace_memory_region {
             slot: 0,
             flags: 0,
-            guest_phys_addr: 0,
-            memory_size: layout.ram_size(),
+            guest_phys_addr: ram_base,
+            memory_size: ram_bytes,
             userspace_addr: host_addr as u64,
         };
         // SAFETY: `host_addr` is the base of the live `vm-memory` mapping
@@ -131,12 +162,15 @@ impl Machine {
         &self.vm
     }
 
-    /// Alias the guest mapping for a device store. The device's memory
-    /// imports then operate on this VM's RAM under the same bounds, not
-    /// on a private copy.
+    pub fn inject_interrupt(&self, irq: u32, level: bool) -> Result<(), String> {
+        self.vm_fd()
+            .set_irq_line(irq, level)
+            .map_err(|error| format!("KVM interrupt: {error}"))
+    }
+
     #[must_use]
-    pub fn shared_ram(&self) -> Arc<GuestMemoryMmap> {
-        Arc::clone(&self.ram)
+    pub fn memory(&self) -> GuestMemory {
+        self.ram.clone()
     }
 }
 
@@ -148,13 +182,6 @@ pub enum DispatchError {
     TooLarge,
 }
 
-/// Outcome reported by a runner thread.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum VcpuOutcome {
-    Shutdown,
-    Stopped,
-}
-
 fn trace_exit(exit: &str) {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *ENABLED.get_or_init(|| std::env::var_os("TERRA_BOOT_TRACE").is_some()) {
@@ -162,15 +189,16 @@ fn trace_exit(exit: &str) {
     }
 }
 
-fn component_completion(vcpu: &NativeVcpu, exit: Exit) -> Result<Completion, KvmError> {
-    vcpu.exchange(exit)
-        .map_err(|error| KvmError::Component(format!("vCPU component: {error:#}")))
+fn handler_action(handler: &mut dyn VcpuHandler, exit: VcpuExit) -> Result<VcpuAction, KvmError> {
+    handler
+        .exchange(exit)
+        .map_err(|error| KvmError::Handler(format!("vCPU handler: {error}")))
 }
 
-fn require_reentry(completion: Completion) -> Result<(), KvmError> {
-    matches!(completion, Completion::Reenter)
+fn require_reentry(action: VcpuAction) -> Result<(), KvmError> {
+    matches!(action, VcpuAction::Reenter)
         .then_some(())
-        .ok_or_else(|| KvmError::Component("vCPU completion must reenter".to_owned()))
+        .ok_or_else(|| KvmError::Handler("vCPU action must reenter".to_owned()))
 }
 
 fn mmio_width(length: usize) -> Result<u8, KvmError> {
@@ -198,177 +226,180 @@ fn mmio_value(bytes: &[u8]) -> Result<u64, KvmError> {
     Ok(u64::from_le_bytes(value))
 }
 
-fn unexpected_completion(expected: &'static str) -> KvmError {
-    KvmError::Component(format!("vCPU completion must be {expected}"))
+fn unexpected_action(expected: &'static str) -> KvmError {
+    KvmError::Handler(format!("vCPU action must be {expected}"))
 }
 
 #[allow(clippy::too_many_lines)]
 fn dispatch_kernel_exit(
-    component: &NativeVcpu,
+    handler: &mut dyn VcpuHandler,
     stop: &AtomicBool,
-    exit: VcpuExit<'_>,
+    exit: KvmVcpuExit<'_>,
 ) -> Result<Option<VcpuOutcome>, KvmError> {
     match exit {
-        VcpuExit::IoIn(port, data) => {
-            let completion = component_completion(
-                component,
-                Exit::PioRead(platform::PioRead {
+        KvmVcpuExit::IoIn(port, data) => {
+            let action = handler_action(
+                handler,
+                VcpuExit::PioRead(PioRead {
                     port,
                     length: pio_length(data.len())?,
                 }),
             )?;
-            if !matches!(completion, Completion::PioZero) {
-                return Err(unexpected_completion("pio-zero"));
+            if !matches!(action, VcpuAction::PioZero) {
+                return Err(unexpected_action("pio-zero"));
             }
             data.fill(0);
         }
-        VcpuExit::IoOut(port, data) => {
-            require_reentry(component_completion(
-                component,
-                Exit::PioWrite(platform::PioWrite {
+        KvmVcpuExit::IoOut(port, data) => {
+            require_reentry(handler_action(
+                handler,
+                VcpuExit::PioWrite(PioWrite {
                     port,
                     length: pio_length(data.len())?,
                 }),
             )?)?;
         }
-        VcpuExit::MmioRead(address, data) => {
+        KvmVcpuExit::MmioRead(address, data) => {
             let width = mmio_width(data.len())?;
-            let completion = component_completion(
-                component,
-                Exit::MmioRead(platform::MmioRead { address, width }),
-            )?;
-            let Completion::MmioRead(value) = completion else {
-                return Err(unexpected_completion("mmio-read"));
+            let action = handler_action(handler, VcpuExit::MmioRead(MmioRead { address, width }))?;
+            let VcpuAction::MmioRead(value) = action else {
+                return Err(unexpected_action("mmio-read"));
             };
             data.copy_from_slice(&value.to_le_bytes()[..usize::from(width)]);
         }
-        VcpuExit::MmioWrite(address, data) => {
+        KvmVcpuExit::MmioWrite(address, data) => {
             let width = mmio_width(data.len())?;
-            require_reentry(component_completion(
-                component,
-                Exit::MmioWrite(platform::MmioWrite {
+            require_reentry(handler_action(
+                handler,
+                VcpuExit::MmioWrite(MmioWrite {
                     address,
                     width,
                     value: mmio_value(data)?,
                 }),
             )?)?;
         }
-        VcpuExit::X86Rdmsr(msr) => {
+        KvmVcpuExit::X86Rdmsr(msr) => {
             trace_exit("rdmsr");
-            let completion = component_completion(
-                component,
-                Exit::Rdmsr(platform::Msr {
+            let action = handler_action(
+                handler,
+                VcpuExit::Rdmsr(Msr {
                     index: msr.index,
                     value: 0,
                 }),
             )?;
-            match completion {
-                Completion::Rdmsr(value) => {
+            match action {
+                VcpuAction::Rdmsr(value) => {
                     *msr.data = value;
                     *msr.error = 0;
                 }
-                Completion::MsrFault => *msr.error = 1,
-                _ => return Err(unexpected_completion("rdmsr")),
+                VcpuAction::MsrFault => *msr.error = 1,
+                _ => return Err(unexpected_action("rdmsr")),
             }
         }
-        VcpuExit::X86Wrmsr(msr) => {
+        KvmVcpuExit::X86Wrmsr(msr) => {
             trace_exit("wrmsr");
-            match component_completion(
-                component,
-                Exit::Wrmsr(platform::Msr {
+            match handler_action(
+                handler,
+                VcpuExit::Wrmsr(Msr {
                     index: msr.index,
                     value: msr.data,
                 }),
             )? {
-                Completion::Wrmsr => *msr.error = 0,
-                Completion::MsrFault => *msr.error = 1,
-                _ => return Err(unexpected_completion("wrmsr")),
+                VcpuAction::Wrmsr => *msr.error = 0,
+                VcpuAction::MsrFault => *msr.error = 1,
+                _ => return Err(unexpected_action("wrmsr")),
             }
         }
-        VcpuExit::Hlt => {
+        KvmVcpuExit::Hlt => {
             trace_exit("hlt");
-            require_reentry(component_completion(component, Exit::Halt)?)?;
+            require_reentry(handler_action(handler, VcpuExit::Halt)?)?;
         }
-        VcpuExit::Intr | VcpuExit::IoapicEoi(_) => {
+        KvmVcpuExit::Intr | KvmVcpuExit::IoapicEoi(_) => {
             if stop.load(Ordering::Acquire) {
                 return Ok(Some(VcpuOutcome::Stopped));
             }
             trace_exit("interrupted");
-            require_reentry(component_completion(component, Exit::Interrupted)?)?;
+            require_reentry(handler_action(handler, VcpuExit::Interrupted)?)?;
         }
-        VcpuExit::Shutdown => {
-            let _ = component.exchange(Exit::Shutdown);
+        KvmVcpuExit::Shutdown => {
+            let _ = handler.exchange(VcpuExit::Shutdown);
             return Ok(Some(VcpuOutcome::Shutdown));
         }
-        VcpuExit::FailEntry(reason, _) => {
+        KvmVcpuExit::FailEntry(reason, _) => {
             return Err(KvmError::Dispatch(DispatchError::Fatal(
                 "fail-entry",
                 reason,
             )));
         }
-        VcpuExit::InternalError => {
+        KvmVcpuExit::InternalError => {
             return Err(KvmError::Dispatch(DispatchError::Fatal(
                 "internal-error",
                 0,
             )));
         }
-        VcpuExit::Unsupported(code) => {
+        KvmVcpuExit::Unsupported(code) => {
             return Err(KvmError::Dispatch(DispatchError::Fatal(
                 "unsupported-exit",
                 u64::from(code),
             )));
         }
-        VcpuExit::Unknown => return Err(KvmError::Dispatch(DispatchError::Unexpected("unknown"))),
-        VcpuExit::Exception => {
+        KvmVcpuExit::Unknown => {
+            return Err(KvmError::Dispatch(DispatchError::Unexpected("unknown")));
+        }
+        KvmVcpuExit::Exception => {
             return Err(KvmError::Dispatch(DispatchError::Unexpected("exception")));
         }
-        VcpuExit::Hypercall(_) => {
+        KvmVcpuExit::Hypercall(_) => {
             return Err(KvmError::Dispatch(DispatchError::Unexpected("hypercall")));
         }
-        VcpuExit::Debug(_) => return Err(KvmError::Dispatch(DispatchError::Unexpected("debug"))),
-        VcpuExit::IrqWindowOpen => {
+        KvmVcpuExit::Debug(_) => {
+            return Err(KvmError::Dispatch(DispatchError::Unexpected("debug")));
+        }
+        KvmVcpuExit::IrqWindowOpen => {
             return Err(KvmError::Dispatch(DispatchError::Unexpected(
                 "irq-window-open",
             )));
         }
-        VcpuExit::SetTpr => return Err(KvmError::Dispatch(DispatchError::Unexpected("set-tpr"))),
-        VcpuExit::TprAccess => {
+        KvmVcpuExit::SetTpr => {
+            return Err(KvmError::Dispatch(DispatchError::Unexpected("set-tpr")));
+        }
+        KvmVcpuExit::TprAccess => {
             return Err(KvmError::Dispatch(DispatchError::Unexpected("tpr-access")));
         }
-        VcpuExit::S390Sieic => {
+        KvmVcpuExit::S390Sieic => {
             return Err(KvmError::Dispatch(DispatchError::Unexpected("s390-sieic")));
         }
-        VcpuExit::S390Reset => {
+        KvmVcpuExit::S390Reset => {
             return Err(KvmError::Dispatch(DispatchError::Unexpected("s390-reset")));
         }
-        VcpuExit::Dcr => return Err(KvmError::Dispatch(DispatchError::Unexpected("dcr"))),
-        VcpuExit::Nmi => return Err(KvmError::Dispatch(DispatchError::Unexpected("nmi"))),
-        VcpuExit::Osi => return Err(KvmError::Dispatch(DispatchError::Unexpected("osi"))),
-        VcpuExit::PaprHcall => {
+        KvmVcpuExit::Dcr => return Err(KvmError::Dispatch(DispatchError::Unexpected("dcr"))),
+        KvmVcpuExit::Nmi => return Err(KvmError::Dispatch(DispatchError::Unexpected("nmi"))),
+        KvmVcpuExit::Osi => return Err(KvmError::Dispatch(DispatchError::Unexpected("osi"))),
+        KvmVcpuExit::PaprHcall => {
             return Err(KvmError::Dispatch(DispatchError::Unexpected("papr-hcall")));
         }
-        VcpuExit::S390Ucontrol => {
+        KvmVcpuExit::S390Ucontrol => {
             return Err(KvmError::Dispatch(DispatchError::Unexpected(
                 "s390-ucontrol",
             )));
         }
-        VcpuExit::Watchdog => {
+        KvmVcpuExit::Watchdog => {
             return Err(KvmError::Dispatch(DispatchError::Unexpected("watchdog")));
         }
-        VcpuExit::S390Tsch => {
+        KvmVcpuExit::S390Tsch => {
             return Err(KvmError::Dispatch(DispatchError::Unexpected("s390-tsch")));
         }
-        VcpuExit::Epr => return Err(KvmError::Dispatch(DispatchError::Unexpected("epr"))),
-        VcpuExit::SystemEvent(_, _) => {
+        KvmVcpuExit::Epr => return Err(KvmError::Dispatch(DispatchError::Unexpected("epr"))),
+        KvmVcpuExit::SystemEvent(_, _) => {
             return Err(KvmError::Dispatch(DispatchError::Unexpected(
                 "system-event",
             )));
         }
-        VcpuExit::S390Stsi => {
+        KvmVcpuExit::S390Stsi => {
             return Err(KvmError::Dispatch(DispatchError::Unexpected("s390-stsi")));
         }
-        VcpuExit::Hyperv => return Err(KvmError::Dispatch(DispatchError::Unexpected("hyperv"))),
-        VcpuExit::MemoryFault { .. } => {
+        KvmVcpuExit::Hyperv => return Err(KvmError::Dispatch(DispatchError::Unexpected("hyperv"))),
+        KvmVcpuExit::MemoryFault { .. } => {
             return Err(KvmError::Dispatch(DispatchError::Unexpected(
                 "memory-fault",
             )));
@@ -377,27 +408,30 @@ fn dispatch_kernel_exit(
     Ok(None)
 }
 
-/// Run one Linux KVM vCPU through the scoped Wasm VMM bridge. Native code only
-/// turns KVM's borrowed exit buffers into typed values and applies validated
-/// completions before reentering KVM.
+/// Run one Linux KVM vCPU through its platform handler.
 pub fn run_kernel_vcpu(
     vcpu: &mut VcpuFd,
     stop: &AtomicBool,
-    component: &NativeVcpu,
+    handler: &mut dyn VcpuHandler,
 ) -> Result<VcpuOutcome, KvmError> {
     loop {
         if stop.load(Ordering::Acquire) {
-            return Ok(VcpuOutcome::Stopped);
+            let outcome = VcpuOutcome::Stopped;
+            handler.finished(outcome);
+            return Ok(outcome);
         }
         match vcpu.run() {
             Ok(exit) => {
-                if let Some(outcome) = dispatch_kernel_exit(component, stop, exit)? {
+                if let Some(outcome) = dispatch_kernel_exit(handler, stop, exit)? {
+                    handler.finished(outcome);
                     return Ok(outcome);
                 }
             }
             Err(error) if error.errno() == libc::EINTR || error.errno() == libc::EAGAIN => {
                 if stop.load(Ordering::Acquire) {
-                    return Ok(VcpuOutcome::Stopped);
+                    let outcome = VcpuOutcome::Stopped;
+                    handler.finished(outcome);
+                    return Ok(outcome);
                 }
             }
             Err(error) => return Err(KvmError::Kvm(error)),
@@ -488,15 +522,6 @@ impl VcpuHandle {
     pub fn request_stop(&self) {
         self.stop.store(true, Ordering::Release);
         self.runner.kick();
-    }
-
-    pub fn stop_callback(&self) -> impl FnOnce() + Send + 'static {
-        let stop = Arc::clone(&self.stop);
-        let runner = self.runner.clone();
-        move || {
-            stop.store(true, Ordering::Release);
-            runner.kick();
-        }
     }
 
     /// Bounded stop: flag, repeated kicks, then wait for the runner's

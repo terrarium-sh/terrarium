@@ -1,95 +1,23 @@
-//! Reusable `x86_64` KVM worker for component-backed Linux boots.
+//! Native `x86_64` KVM vCPU preparation and execution.
 
 #![allow(unsafe_code)]
 
-use terra_runtime::component::vmm::{PreparedMachine, StartedVcpus};
-
-use std::sync::Arc;
 use std::time::Instant;
 
 use crate::arch::{KVM_MAX_CPUID_ENTRIES, setup_bsp_planned, setup_irqchip};
 use crate::kvm::{
-    KvmError, Machine, STOP_DEADLINE, VcpuOutcome, open, park_ap, run_kernel_vcpu,
-    spawn_configured_vcpu_ready,
+    KvmError, Machine, STOP_DEADLINE, park_ap, run_kernel_vcpu, spawn_configured_vcpu_ready,
 };
 use crate::machine::MAX_VCPUS;
-
-pub use crate::worker::{PreparedVmm, WorkerInput};
+use crate::vm::{
+    BootState, InterruptControllerConfig, InterruptMode, VcpuHandler, VcpuOutcome, VmCapabilities,
+    VmConfig, VmHandle,
+};
 
 fn stop_timed_out(outcomes: &[Result<VcpuOutcome, KvmError>]) -> bool {
     outcomes
         .iter()
         .any(|outcome| matches!(outcome, Err(KvmError::Timeout)))
-}
-
-#[allow(clippy::too_many_lines)]
-pub async fn prepare(mut input: WorkerInput) -> Result<PreparedVmm, KvmError> {
-    if input.vcpus == 0 || input.vcpus > MAX_VCPUS {
-        return Err(KvmError::BadVcpuCount(input.vcpus));
-    }
-    let kvm = open()?;
-    let kvm = Arc::new(kvm);
-    let disks = crate::worker::devices::disk_paths(&input);
-    let block_count = 1 + disks.len();
-    let cpuid = build_cpuid(&kvm, input.vcpus)?;
-    let share_count = input.shares.len();
-    let layout = crate::machine::build_machine_layout(input.ram_bytes, block_count, share_count)
-        .map_err(|error| KvmError::Component(format!("invalid KVM layout: {error:?}")))?;
-    let config = layout
-        .machine_config(input.vcpus)
-        .map_err(|error| KvmError::Component(error.to_string()))?;
-    let machine = Arc::new(Machine::new(&kvm, &layout, input.vcpus)?);
-    let gsis = layout
-        .devices()
-        .iter()
-        .map(|device| device.irq)
-        .collect::<Vec<_>>();
-    setup_irqchip(machine.vm_fd(), &gsis)
-        .map_err(|error| KvmError::Component(format!("creating KVM irqchip: {error:?}")))?;
-    let vcpus = PreparedVcpuGroup::prepare(&machine, &cpuid, input.vcpus, input.hard_stop)?;
-    let prepared = PreparedMachine::new(config, machine);
-    let component_runtime = crate::worker::create_runtime(&input)
-        .map_err(|error| KvmError::Component(error.to_string()))?;
-    let (mut component_runtime, machine) =
-        crate::worker::boot_prepared(component_runtime, prepared, &mut input)
-            .await
-            .map_err(|error| KvmError::Component(error.to_string()))?;
-    let irq_machine = machine.clone();
-    let interrupts = component_runtime
-        .grant_irq_lines(move |gsi, level| {
-            irq_machine.inject_irq(gsi, level, |machine, gsi, level| {
-                machine
-                    .vm_fd()
-                    .set_irq_line(gsi, level)
-                    .map_err(|error| wasmtime::Error::msg(format!("KVM interrupt: {error}")))
-            })
-        })
-        .await
-        .map_err(|error| KvmError::Component(error.to_string()))?;
-    crate::worker::devices::assemble_devices(
-        &mut component_runtime,
-        &mut input,
-        machine.ram(),
-        &disks,
-        |kind, index| {
-            interrupts
-                .bind_interrupt(kind, index)
-                .map_err(|error| error.to_string())
-        },
-    )
-    .map_err(KvmError::Component)?;
-    component_runtime
-        .grant_interrupt_shutdown(async move {
-            interrupts.close().await.map_err(|error| error.to_string())
-        })
-        .map_err(|error| KvmError::Component(error.to_string()))?;
-    crate::worker::finish_preparation(component_runtime, input.deadline, move |controls, boot| {
-        vcpus
-            .start(controls, boot)
-            .map_err(|error| wasmtime::Error::msg(format!("vCPU startup: {error:?}")))
-    })
-    .await
-    .map_err(|error| KvmError::Component(error.to_string()))
 }
 
 pub(super) fn build_cpuid(
@@ -115,26 +43,78 @@ pub(super) fn build_cpuid(
     Ok(cpuid)
 }
 
+pub struct KvmX86Vm {
+    machine: std::sync::Arc<Machine>,
+    vcpus: NativePreparedVcpus,
+}
+
+impl KvmX86Vm {
+    pub fn create(config: &VmConfig, hard_stop: Option<fn() -> !>) -> Result<Self, String> {
+        let vcpu_count = usize::from(config.vcpus);
+        if config.interrupt_controller != InterruptControllerConfig::X86
+            || vcpu_count == 0
+            || vcpu_count > MAX_VCPUS
+        {
+            return Err(format!("invalid x86 KVM VM dimensions: {vcpu_count} vCPUs"));
+        }
+        let kvm = crate::kvm::open().map_err(|error| format!("opening KVM: {error:?}"))?;
+        let cpuid =
+            build_cpuid(&kvm, vcpu_count).map_err(|error| format!("KVM CPUID: {error:?}"))?;
+        let machine = std::sync::Arc::new(
+            Machine::new(&kvm, config.ram_base, config.ram_bytes, vcpu_count)
+                .map_err(|error| format!("creating KVM VM: {error:?}"))?,
+        );
+        setup_irqchip(machine.vm_fd(), &config.irq_routes)
+            .map_err(|error| format!("creating KVM irqchip: {error:?}"))?;
+        let vcpus = NativePreparedVcpus::new(&machine, &cpuid, vcpu_count, hard_stop)
+            .map_err(|error| format!("preparing KVM vCPUs: {error:?}"))?;
+        Ok(Self { machine, vcpus })
+    }
+
+    #[allow(clippy::unnecessary_wraps)]
+    pub const fn capabilities() -> Result<VmCapabilities, String> {
+        Ok(VmCapabilities {
+            interrupt_mode: InterruptMode::X86IrqLines,
+            tsc_frequency: None,
+        })
+    }
+
+    #[must_use]
+    pub fn handle(&self) -> VmHandle {
+        VmHandle::new(std::sync::Arc::clone(&self.machine))
+    }
+
+    pub fn start(
+        self,
+        boot: BootState,
+        handlers: Vec<Box<dyn VcpuHandler>>,
+    ) -> Result<VcpuGroup, String> {
+        self.vcpus
+            .start(handlers, boot)
+            .map_err(|error| format!("starting KVM vCPUs: {error:?}"))
+    }
+}
+
 enum VcpuCommand {
-    Start(
-        terra_runtime::component::vmm::NativeVcpu,
-        terra_runtime::component::vmm::BootEntry,
-    ),
+    Start(Box<dyn VcpuHandler>, BootState),
     Stop,
 }
 
-struct PreparedVcpuGroup {
+pub(crate) struct NativePreparedVcpus {
     group: VcpuGroup,
     senders: Vec<std::sync::mpsc::SyncSender<VcpuCommand>>,
 }
 
-impl PreparedVcpuGroup {
-    fn prepare(
-        machine: &Arc<Machine>,
+impl NativePreparedVcpus {
+    pub(crate) fn new(
+        machine: &std::sync::Arc<Machine>,
         cpuid: &kvm_bindings::CpuId,
         vcpu_count: usize,
         hard_stop: Option<fn() -> !>,
     ) -> Result<Self, KvmError> {
+        if vcpu_count == 0 || vcpu_count > MAX_VCPUS {
+            return Err(KvmError::BadVcpuCount(vcpu_count));
+        }
         let mut group = VcpuGroup {
             runners: Vec::with_capacity(vcpu_count),
             hard_stop,
@@ -144,29 +124,29 @@ impl PreparedVcpuGroup {
             let (sender, receiver) = std::sync::mpsc::sync_channel(1);
             let cpu_cpuid = cpuid.clone();
             group.runners.push(spawn_configured_vcpu_ready(
-                Arc::clone(machine),
+                std::sync::Arc::clone(machine),
                 u64::try_from(id).map_err(|_| KvmError::BadVcpuCount(vcpu_count))?,
                 move |vcpu, stop, ready| {
                     if id == 0 {
                         ready.send(()).map_err(|_| KvmError::ThreadGone)?;
-                        let VcpuCommand::Start(worker, boot) =
+                        let VcpuCommand::Start(mut handler, boot) =
                             receiver.recv().map_err(|_| KvmError::ThreadGone)?
                         else {
                             return Ok(VcpuOutcome::Stopped);
                         };
                         setup_bsp_planned(&cpu_cpuid, vcpu, boot.entry, boot.boot_argument)
                             .map_err(|_| KvmError::Memory("bsp"))?;
-                        run_kernel_vcpu(vcpu, stop, &worker)
+                        run_kernel_vcpu(vcpu, stop, handler.as_mut())
                     } else {
                         vcpu.set_cpuid2(&cpu_cpuid)?;
                         park_ap(vcpu)?;
                         ready.send(()).map_err(|_| KvmError::ThreadGone)?;
-                        let VcpuCommand::Start(worker, _) =
+                        let VcpuCommand::Start(mut handler, _) =
                             receiver.recv().map_err(|_| KvmError::ThreadGone)?
                         else {
                             return Ok(VcpuOutcome::Stopped);
                         };
-                        run_kernel_vcpu(vcpu, stop, &worker)
+                        run_kernel_vcpu(vcpu, stop, handler.as_mut())
                     }
                 },
             )?);
@@ -175,69 +155,62 @@ impl PreparedVcpuGroup {
         Ok(Self { group, senders })
     }
 
-    fn start(
+    pub(crate) fn start(
         mut self,
-        workers: Vec<terra_runtime::component::vmm::NativeVcpu>,
-        boot: terra_runtime::component::vmm::BootEntry,
-    ) -> Result<StartedVcpus, KvmError> {
-        if workers.len() != self.senders.len() {
+        handlers: Vec<Box<dyn VcpuHandler>>,
+        boot: BootState,
+    ) -> Result<VcpuGroup, KvmError> {
+        if handlers.len() != self.senders.len() {
             return Err(KvmError::ThreadGone);
         }
-        for (sender, worker) in self.senders.drain(..).zip(workers) {
+        for (sender, handler) in self.senders.drain(..).zip(handlers) {
             sender
-                .send(VcpuCommand::Start(worker, boot))
+                .send(VcpuCommand::Start(handler, boot))
                 .map_err(|_| KvmError::ThreadGone)?;
         }
         let hard_stop = self.group.hard_stop;
-        let group = std::mem::replace(
+        Ok(std::mem::replace(
+            &mut self.group,
+            VcpuGroup {
+                runners: Vec::new(),
+                hard_stop,
+            },
+        ))
+    }
+}
+
+impl Drop for NativePreparedVcpus {
+    fn drop(&mut self) {
+        for sender in &self.senders {
+            let _ = sender.send(VcpuCommand::Stop);
+        }
+        let hard_stop = self.group.hard_stop;
+        let mut group = std::mem::replace(
             &mut self.group,
             VcpuGroup {
                 runners: Vec::new(),
                 hard_stop,
             },
         );
-        Ok(started_vcpus(group))
+        let _ = group.join();
     }
 }
 
-impl Drop for PreparedVcpuGroup {
-    fn drop(&mut self) {
-        for sender in &self.senders {
-            let _ = sender.send(VcpuCommand::Stop);
-        }
-        let _ = self.group.stop();
-    }
-}
-
-fn started_vcpus(group: VcpuGroup) -> StartedVcpus {
-    let stops = group
-        .runners
-        .iter()
-        .map(crate::kvm::VcpuHandle::stop_callback)
-        .collect::<Vec<_>>();
-    StartedVcpus::new(
-        group,
-        move || {
-            for stop in stops {
-                stop();
-            }
-            Ok(())
-        },
-        |mut group| group.stop(),
-    )
-}
-
-struct VcpuGroup {
+pub struct VcpuGroup {
     runners: Vec<crate::kvm::VcpuHandle>,
     hard_stop: Option<fn() -> !>,
 }
 
 impl VcpuGroup {
-    fn stop(&mut self) -> Result<Vec<Result<(), String>>, String> {
-        let mut runners = std::mem::take(&mut self.runners);
-        for runner in &runners {
+    pub fn request_stop(&self) {
+        for runner in &self.runners {
             runner.request_stop();
         }
+    }
+
+    pub fn join(&mut self) -> Result<Vec<Result<(), String>>, String> {
+        self.request_stop();
+        let mut runners = std::mem::take(&mut self.runners);
         let deadline = Instant::now() + STOP_DEADLINE;
         let outcomes = runners
             .iter_mut()
@@ -260,33 +233,18 @@ impl VcpuGroup {
 impl Drop for VcpuGroup {
     fn drop(&mut self) {
         if !self.runners.is_empty() {
-            let _ = self.stop();
+            let runners = std::mem::take(&mut self.runners);
+            let mut group = Self {
+                runners,
+                hard_stop: self.hard_stop,
+            };
+            let _ = group.join();
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::machine::{DeviceKind, build_machine_layout};
-
-    #[test]
-    fn volume_blocks_precede_network_and_vsock() {
-        let layout = build_machine_layout(512 << 20, 10, 0).expect("layout");
-        let kinds = layout
-            .devices()
-            .iter()
-            .map(|device| device.kind)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            kinds,
-            [
-                vec![DeviceKind::Block; 10],
-                vec![DeviceKind::Net, DeviceKind::Vsock, DeviceKind::Memory]
-            ]
-            .concat()
-        );
-    }
-
     #[test]
     #[ignore = "needs /dev/kvm"]
     fn cpuid_matches_the_fixed_vcpu_count() {
@@ -310,7 +268,7 @@ mod tests {
     fn a_stop_timeout_requires_the_process_supervisor() {
         assert!(super::stop_timed_out(&[Err(crate::kvm::KvmError::Timeout)]));
         assert!(!super::stop_timed_out(&[Ok(
-            crate::kvm::VcpuOutcome::Stopped
+            crate::vm::VcpuOutcome::Stopped
         )]));
     }
 }

@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+codesign --force --sign - --entitlements "$(dirname "$0")/../packaging/macos.entitlements" "$1"
+exec "$@"

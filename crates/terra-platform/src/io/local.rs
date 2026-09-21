@@ -5,13 +5,13 @@ pub use std::os::unix::net::{UnixListener as LocalListener, UnixStream as LocalS
 #[cfg(windows)]
 pub use uds_windows::{UnixListener as LocalListener, UnixStream as LocalStream};
 
-#[cfg(all(unix, feature = "tokio"))]
+#[cfg(unix)]
 pub use tokio::net::UnixStream as AsyncLocalStream;
 
-#[cfg(all(unix, feature = "tokio"))]
+#[cfg(unix)]
 pub struct AsyncLocalListener(tokio::io::unix::AsyncFd<LocalListener>);
 
-#[cfg(all(unix, feature = "tokio"))]
+#[cfg(unix)]
 impl AsyncLocalListener {
     pub fn from_std(listener: LocalListener) -> std::io::Result<Self> {
         listener.set_nonblocking(true)?;
@@ -40,7 +40,7 @@ impl AsyncLocalListener {
     }
 }
 
-#[cfg(all(windows, feature = "tokio"))]
+#[cfg(windows)]
 mod asynchronous {
     use std::io;
     use std::pin::Pin;
@@ -177,7 +177,7 @@ mod asynchronous {
     }
 }
 
-#[cfg(all(windows, feature = "tokio"))]
+#[cfg(windows)]
 pub use asynchronous::{AsyncLocalListener, AsyncLocalStream};
 
 #[cfg(test)]
@@ -215,15 +215,53 @@ mod tests {
         client.shutdown(Shutdown::Write).unwrap();
         assert_eq!(server.read(&mut buffer).unwrap(), 0);
     }
+
+    #[test]
+    fn local_stream_pair_round_trip() {
+        let (mut left, mut right) = LocalStream::pair().unwrap();
+        left.write_all(b"ping").unwrap();
+        let mut buffer = [0; 4];
+        right.read_exact(&mut buffer).unwrap();
+        assert_eq!(&buffer, b"ping");
+    }
 }
 
-#[cfg(all(test, feature = "tokio"))]
+#[cfg(test)]
 mod asynchronous_tests {
     use std::io::{Read as _, Write as _};
 
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_accept_and_read_leave_the_stream_usable() {
+        use std::{future::poll_fn, time::Duration};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("socket");
+        let listener = AsyncLocalListener::from_std(LocalListener::bind(&path).unwrap()).unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                poll_fn(|cx| listener.poll_accept(cx)),
+            )
+            .await
+            .is_err()
+        );
+        let mut client = AsyncLocalStream::connect(&path).await.unwrap();
+        let mut server = poll_fn(|cx| listener.poll_accept(cx)).await.unwrap();
+        let mut bytes = [0; 4];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), client.read_exact(&mut bytes))
+                .await
+                .is_err()
+        );
+        server.write_all(b"ping").unwrap();
+        client.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"ping");
+        server.shutdown(std::net::Shutdown::Write).unwrap();
+        assert_eq!(client.read(&mut bytes).await.unwrap(), 0);
+    }
 
     #[tokio::test]
     async fn listener_readiness_waits_and_preserves_the_connection() {

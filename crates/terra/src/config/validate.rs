@@ -65,11 +65,11 @@ fn validate_hw(cfg: &Config) -> Result<()> {
         bail!("hw.cpus must be > 0 (a VM needs at least one vCPU)");
     }
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-    if usize::from(cfg.hw.cpus) > terra_platform::worker::MAX_VCPUS {
+    if usize::from(cfg.hw.cpus) > terra_runtime::worker::MAX_VCPUS {
         bail!(
             "hw.cpus is {}; at most {} vCPUs fit this machine",
             cfg.hw.cpus,
-            terra_platform::worker::MAX_VCPUS
+            terra_runtime::worker::MAX_VCPUS
         );
     }
     if cfg.hw.mem_mib < MIN_MEM_MIB {

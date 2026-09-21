@@ -10,7 +10,7 @@ use std::os::fd::AsFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use terra_io::local::AsyncLocalStream;
+use terra_platform::io::local::AsyncLocalStream;
 use terra_protocol::{self as protocol, AgentOutput, AgentService, ClientInput, TermSize};
 
 const AGENT_HELLO_WAIT_TIMEOUT: Duration = Duration::from_millis(500);
@@ -633,7 +633,7 @@ impl Drop for RawTerminal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use terra_io::local::LocalListener;
+    use terra_platform::io::local::LocalListener;
 
     async fn frame_reader(bytes: Vec<u8>) -> tokio::io::DuplexStream {
         use tokio::io::AsyncWriteExt as _;
@@ -659,7 +659,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn input_readiness_waits_for_a_byte() {
-        let (mut writer, reader) = terra_io::local::LocalStream::pair().unwrap();
+        let (mut writer, reader) = terra_platform::io::local::LocalStream::pair().unwrap();
         assert!(!input_is_ready(&reader));
         writer.write_all(b"x").unwrap();
         assert!(input_is_ready(&reader));
@@ -668,7 +668,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn input_readiness_reports_eof() {
-        let (writer, mut reader) = terra_io::local::LocalStream::pair().unwrap();
+        let (writer, mut reader) = terra_platform::io::local::LocalStream::pair().unwrap();
         drop(writer);
         assert!(input_is_ready(&reader));
         assert_eq!(reader.read(&mut [0]).unwrap(), 0);

@@ -15,39 +15,37 @@ thread-experiments = ["wasmtime/threads"]
 test-support = []
 
 [dependencies]
+terra-platform = { path = "../terra-platform" }
+terra-protocol = { path = "../terra-protocol" }
 futures-util = { version = "0.3", default-features = false, features = ["alloc", "std"] }
 notify = "8.2"
-terra-io = { path = "../terra-io", features = ["tokio"] }
 terra-limits = { path = "../terra-limits" }
 terra-network = { path = "../terra-network" }
 log = "0.4.34"
-rustix = { workspace = true }
 target-lexicon = "0.13"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 wasmtime = { version = "=48.0.2", default-features = false, features = ["async", "component-model-async", "runtime", "std"] }
 wasmtime-wasi = { version = "=48.0.2", default-features = false, features = ["p3"] }
 
-[target.'cfg(unix)'.dependencies]
-libc = { workspace = true }
-vm-memory = { version = "0.18", features = ["backend-mmap"] }
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Win32_Security", "Wdk_Storage_FileSystem", "Wdk_System_SystemServices", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_Memory", "Win32_System_SystemInformation"] }
-
 [dev-dependencies]
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 # Integration tests link the library without cfg(test).
 terra-runtime = { path = ".", features = ["test-support"] }
 virtio-bindings = "0.2.7"
-terra-protocol = { path = "../terra-protocol" }
 terra-vsock-device = { path = "../../components/vsock-device" }
 tempfile = { workspace = true }
 # Core-Wasm spike tests compile WAT and components; release builds do not.
 wasmtime = { version = "=48.0.2", default-features = false, features = ["cranelift", "wit-parser", "wat"] }
 
 [target.'cfg(unix)'.dev-dependencies]
+libc.workspace = true
+vm-memory = { version = "0.18", features = ["backend-mmap"] }
 virtio-blk = { git = "https://github.com/rust-vmm/vm-virtio", rev = "87bf424736548126983c278b0d49a7b061e38b12" }
 virtio-queue-git = { package = "virtio-queue", git = "https://github.com/rust-vmm/vm-virtio", rev = "87bf424736548126983c278b0d49a7b061e38b12", features = ["test-utils"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [[test]]
 name = "shared_component_memory"

@@ -503,7 +503,7 @@ fn hardware_a_vm_cannot_be_built_from_is_refused() {
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     {
-        let limit = terra_platform::worker::MAX_VCPUS;
+        let limit = terra_runtime::worker::MAX_VCPUS;
         assert!(try_parse(&format!("hw:\n  cpus: {limit}\n")).is_ok());
         let err = try_parse(&format!("hw:\n  cpus: {}\n", limit + 1))
             .unwrap_err()

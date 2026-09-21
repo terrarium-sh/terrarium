@@ -132,12 +132,10 @@ impl Partition {
         Ok(RunExit::from_arm64(&context))
     }
 
-    pub fn vcpu_count(&self) -> u32 {
-        self.vcpu_count
-    }
-
-    pub fn request_arm64_spi(&self, irq: u32, asserted: bool) -> Result<(), PartitionError> {
-        let intid = irq.checked_add(32).ok_or(PartitionError::InvalidVcpu)?;
+    pub fn inject_interrupt(&self, irq: u32, asserted: bool) -> Result<(), String> {
+        let intid = irq
+            .checked_add(32)
+            .ok_or_else(|| PartitionError::InvalidVcpu.to_string())?;
         let interrupt = Arm64InterruptControl {
             target_partition: 0,
             interrupt_control: u64::from(asserted) * ARM64_INTERRUPT_ASSERTED,
@@ -155,7 +153,7 @@ impl Partition {
                 size_of::<Arm64InterruptControl>() as u32,
             )
         })
-        .map_err(PartitionError::Api)
+        .map_err(|error| PartitionError::Api(error).to_string())
     }
 
     pub(super) fn configure_interrupt_controller(&self) -> Result<(), PartitionError> {
@@ -164,7 +162,7 @@ impl Partition {
             emulation_mode: ARM64_IC_EMULATION_MODE_GIC_V3,
             reserved: 0,
             gic_v3: Arm64IcGicV3Parameters {
-                gicd_base_address: crate::aarch64::arm::GIC_DIST_BASE,
+                gicd_base_address: self.gic.distributor_base,
                 gits_translater_base_address: 0,
                 reserved: 0,
                 gic_lpi_int_id_bits: lpi_id_bits,
@@ -186,8 +184,20 @@ impl Partition {
     }
 
     pub(super) fn configure_arm64_vcpu(&self, index: u32) -> Result<(), PartitionError> {
-        let gicr_base = crate::aarch64::arm::GIC_REDIST_BASE
-            + u64::from(index) * ARM64_GIC_REDISTRIBUTOR_STRIDE;
+        let offset = u64::from(index)
+            .checked_mul(ARM64_GIC_REDISTRIBUTOR_STRIDE)
+            .ok_or(PartitionError::InvalidGic)?;
+        if offset
+            .checked_add(ARM64_GIC_REDISTRIBUTOR_STRIDE)
+            .is_none_or(|end| end > self.gic.redistributor_size)
+        {
+            return Err(PartitionError::InvalidGic);
+        }
+        let gicr_base = self
+            .gic
+            .redistributor_base
+            .checked_add(offset)
+            .ok_or(PartitionError::InvalidGic)?;
         let names = [crate::windows::aarch64::WHV_ARM64_REGISTER_GICR_BASE_GPA];
         let values = [WHV_REGISTER_VALUE { Reg64: gicr_base }];
         // SAFETY: the just-created vCPU accepts the documented GICR base register.

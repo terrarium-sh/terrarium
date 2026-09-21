@@ -8,7 +8,9 @@ pub mod box_runtime;
 pub mod component;
 pub mod engine;
 
+pub mod machine;
 pub mod memory;
+pub mod worker;
 
 pub use terra_limits::MAX_BATCH_GUEST_COPY_BYTES as MAX_BATCH_BYTES;
 pub use terra_limits::MAX_SINGLE_GUEST_COPY_BYTES as MAX_SINGLE_BYTES;
@@ -19,3 +21,6 @@ pub mod test_support;
 #[cfg(test)]
 #[allow(dead_code)]
 mod test_fixtures;
+
+#[cfg(test)]
+mod boot_tests;

@@ -1,7 +1,9 @@
 #![allow(unsafe_code)]
 
-use super::worker::ArmWorkerError;
-use crate::aarch64::arm::{GIC_DIST_BASE, GIC_REDIST_BASE, MAX_VCPUS, RAM_BASE};
+use super::ArmWorkerError;
+use crate::aarch64::arm::MAX_VCPUS;
+use crate::memory::GuestMemory;
+use crate::vm::VmConfig;
 use kvm_bindings::{
     KVM_ARM_IRQ_TYPE_SHIFT, KVM_ARM_IRQ_TYPE_SPI, KVM_ARM_VCPU_POWER_OFF, KVM_ARM_VCPU_PSCI_0_2,
     KVM_DEV_ARM_VGIC_CTRL_INIT, KVM_DEV_ARM_VGIC_GRP_ADDR, KVM_DEV_ARM_VGIC_GRP_CTRL,
@@ -11,49 +13,50 @@ use kvm_bindings::{
 };
 use kvm_ioctls::{DeviceFd, Kvm, VcpuFd, VmFd};
 use std::sync::Arc;
-use terra_runtime::memory::GuestRam;
-use vm_memory::{GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 
 const GIC_SPI_OFFSET: u32 = 32;
 const VGIC_IRQS: u32 = 128;
 
-pub(super) struct Machine {
+pub(crate) struct Machine {
     vgic: DeviceFd,
     vm: Arc<VmFd>,
-    ram: Arc<GuestMemoryMmap<()>>,
+    ram: GuestMemory,
     irqs: Vec<u32>,
 }
 
-impl terra_runtime::component::vmm::VirtualMachine for Machine {
-    fn memory(&self) -> wasmtime::Result<GuestRam> {
-        GuestRam::from_shared(self.ram())
-            .ok_or_else(|| wasmtime::Error::msg("aliasing ARM KVM RAM"))
-    }
-}
-
 impl Machine {
-    pub(super) fn new(
-        kvm: &Kvm,
-        config: &terra_runtime::component::vmm::MachineConfig,
-    ) -> Result<Self, ArmWorkerError> {
-        let ram_bytes = config.ram_bytes();
-        let ram_size = usize::try_from(ram_bytes).map_err(|_| ArmWorkerError::Memory)?;
-        if ram_size == 0 || !ram_bytes.is_multiple_of(4096) {
+    pub(super) fn new(kvm: &Kvm, config: &VmConfig) -> Result<Self, ArmWorkerError> {
+        let ram_size = usize::try_from(config.ram_bytes).map_err(|_| ArmWorkerError::Memory)?;
+        if ram_size == 0 || !config.ram_bytes.is_multiple_of(4096) {
+            return Err(ArmWorkerError::Memory);
+        }
+        let crate::vm::InterruptControllerConfig::Arm(gic) = &config.interrupt_controller else {
+            return Err(ArmWorkerError::Memory);
+        };
+        if gic.distributor_size == 0
+            || gic.redistributor_size == 0
+            || gic
+                .distributor_base
+                .checked_add(gic.distributor_size)
+                .is_none()
+            || gic
+                .redistributor_base
+                .checked_add(gic.redistributor_size)
+                .is_none()
+        {
             return Err(ArmWorkerError::Memory);
         }
         let vm = Arc::new(kvm.create_vm()?);
-        let ram = Arc::new(
-            GuestMemoryMmap::from_ranges(&[(GuestAddress(RAM_BASE), ram_size)])
-                .map_err(|_| ArmWorkerError::Memory)?,
-        );
+        let ram = GuestMemory::allocate_at(config.ram_base, config.ram_bytes)
+            .ok_or(ArmWorkerError::Memory)?;
         let host_address = ram
-            .get_host_address(GuestAddress(RAM_BASE))
-            .map_err(|_| ArmWorkerError::Memory)?;
+            .host_address(config.ram_base)
+            .ok_or(ArmWorkerError::Memory)?;
         let region = kvm_userspace_memory_region {
             slot: 0,
             flags: 0,
-            guest_phys_addr: RAM_BASE,
-            memory_size: ram_bytes,
+            guest_phys_addr: config.ram_base,
+            memory_size: config.ram_bytes,
             userspace_addr: host_address as u64,
         };
         // SAFETY: this machine owns the mapped RAM for the VM lifetime.
@@ -64,8 +67,8 @@ impl Machine {
             flags: 0,
         };
         let vgic = vm.create_device(&mut device)?;
-        set_vgic_address(&vgic, KVM_VGIC_V3_ADDR_TYPE_DIST, GIC_DIST_BASE)?;
-        set_vgic_address(&vgic, KVM_VGIC_V3_ADDR_TYPE_REDIST, GIC_REDIST_BASE)?;
+        set_vgic_address(&vgic, KVM_VGIC_V3_ADDR_TYPE_DIST, gic.distributor_base)?;
+        set_vgic_address(&vgic, KVM_VGIC_V3_ADDR_TYPE_REDIST, gic.redistributor_base)?;
         vgic.set_device_attr(&kvm_device_attr {
             group: KVM_DEV_ARM_VGIC_GRP_NR_IRQS,
             attr: 0,
@@ -76,7 +79,7 @@ impl Machine {
             vgic,
             vm,
             ram,
-            irqs: config.devices().iter().map(|device| device.irq).collect(),
+            irqs: config.irq_routes.clone(),
         })
     }
 
@@ -107,17 +110,22 @@ impl Machine {
         Ok(vcpus)
     }
 
-    pub(super) fn ram(&self) -> Arc<GuestMemoryMmap<()>> {
-        Arc::clone(&self.ram)
+    pub(crate) fn memory(&self) -> GuestMemory {
+        self.ram.clone()
     }
 
-    pub(super) fn clear_interrupts(&self) -> Result<(), ArmWorkerError> {
+    pub(crate) fn clear_interrupts(&self) -> Result<(), ArmWorkerError> {
         self.irqs
             .iter()
-            .try_for_each(|irq| self.interrupt(*irq, false))
+            .try_for_each(|irq| self.set_irq_line(*irq, false))
     }
 
-    pub(super) fn interrupt(&self, irq: u32, level: bool) -> Result<(), ArmWorkerError> {
+    pub(crate) fn inject_interrupt(&self, irq: u32, level: bool) -> Result<(), String> {
+        self.set_irq_line(irq, level)
+            .map_err(|error| format!("ARM interrupt: {error:?}"))
+    }
+
+    fn set_irq_line(&self, irq: u32, level: bool) -> Result<(), ArmWorkerError> {
         let irq = GIC_SPI_OFFSET
             .checked_add(irq)
             .ok_or(ArmWorkerError::TooManyDevices)?;

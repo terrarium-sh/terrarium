@@ -2,16 +2,15 @@
 
 use std::ffi::c_void;
 use std::fmt;
-use std::sync::Arc;
 
+use crate::memory::GuestMemory;
+use crate::vm::{GicConfig as NativeGicConfig, VmConfig};
 use applevisor::prelude::{
-    ExitReason, GicConfig, GicEnabled, HypervisorError, MemPerms, PAGE_SIZE, Reg, SysReg, Vcpu,
-    VcpuExit, VcpuHandle, VirtualMachine, VirtualMachineConfig, VirtualMachineInstance,
+    ExitReason, GicConfig as HvGicConfig, GicEnabled, HypervisorError, MemPerms, PAGE_SIZE, Reg,
+    SysReg, Vcpu, VcpuExit, VcpuHandle, VirtualMachine, VirtualMachineConfig,
+    VirtualMachineInstance,
 };
 use applevisor_sys::hv_vm_map;
-use vm_memory::{GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
-
-use crate::aarch64::arm::{GIC_LAYOUT, GicLayout, RAM_BASE};
 
 const GIC_SPI_OFFSET: u32 = 32;
 
@@ -26,7 +25,13 @@ pub enum HvError {
 
 impl fmt::Display for HvError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{self:?}")
+        match self {
+            Self::ProgramCounterOverflow => formatter.write_str("program counter overflow"),
+            Self::InvalidRegister => formatter.write_str("invalid ARM register"),
+            Self::Memory => formatter.write_str("invalid guest memory"),
+            Self::GicLayout => formatter.write_str("invalid GIC layout"),
+            Self::Hypervisor(error) => write!(formatter, "Hypervisor.framework: {error}"),
+        }
     }
 }
 
@@ -52,7 +57,7 @@ pub enum RunExit {
 /// One configured Apple Silicon VM. Hypervisor.framework permits one VM per process.
 pub struct Machine {
     vm: VirtualMachineInstance<GicEnabled>,
-    ram: Arc<GuestMemoryMmap<()>>,
+    ram: GuestMemory,
 }
 
 /// A vCPU which stays on the thread that created it.
@@ -60,36 +65,28 @@ pub struct Cpu {
     vcpu: Vcpu,
 }
 
-impl terra_runtime::component::vmm::VirtualMachine for Machine {
-    fn memory(&self) -> wasmtime::Result<terra_runtime::memory::GuestRam> {
-        terra_runtime::memory::GuestRam::from_shared(self.shared_ram())
-            .ok_or_else(|| wasmtime::Error::msg("aliasing HVF RAM"))
-    }
-}
-
 impl Machine {
-    pub fn new(ram_size: u64) -> Result<Self, HvError> {
-        let ram_size_usize = usize::try_from(ram_size).map_err(|_| HvError::Memory)?;
-        if ram_size_usize == 0 || !ram_size.is_multiple_of(PAGE_SIZE as u64) {
+    pub fn new(config: &VmConfig) -> Result<Self, HvError> {
+        let ram_size_usize = usize::try_from(config.ram_bytes).map_err(|_| HvError::Memory)?;
+        if ram_size_usize == 0 || !config.ram_bytes.is_multiple_of(PAGE_SIZE as u64) {
             return Err(HvError::Memory);
         }
-        let gic = gic_layout()?;
-        let mut gic_config = GicConfig::new();
+        let crate::vm::InterruptControllerConfig::Arm(gic) = &config.interrupt_controller else {
+            return Err(HvError::GicLayout);
+        };
+        let gic = gic_layout(gic)?;
+        let mut gic_config = HvGicConfig::new();
         gic_config.set_distributor_base(gic.distributor_base)?;
         gic_config.set_redistributor_base(gic.redistributor_base)?;
         let vm = VirtualMachine::with_gic(VirtualMachineConfig::new(), gic_config)?;
-        let ram = Arc::new(
-            GuestMemoryMmap::from_ranges(&[(GuestAddress(RAM_BASE), ram_size_usize)])
-                .map_err(|_| HvError::Memory)?,
-        );
-        let host_address = ram
-            .get_host_address(GuestAddress(RAM_BASE))
-            .map_err(|_| HvError::Memory)?;
+        let ram =
+            GuestMemory::allocate_at(config.ram_base, config.ram_bytes).ok_or(HvError::Memory)?;
+        let host_address = ram.host_address(config.ram_base).ok_or(HvError::Memory)?;
         // SAFETY: `ram` stays alive until after the Hypervisor.framework VM is destroyed.
         let result = unsafe {
             hv_vm_map(
                 host_address.cast::<c_void>(),
-                RAM_BASE,
+                config.ram_base,
                 ram_size_usize,
                 u64::from(MemPerms::RWX),
             )
@@ -116,14 +113,17 @@ impl Machine {
     }
 
     #[must_use]
-    pub fn shared_ram(&self) -> Arc<GuestMemoryMmap<()>> {
-        Arc::clone(&self.ram)
+    pub fn memory(&self) -> GuestMemory {
+        self.ram.clone()
     }
 
-    pub fn set_irq(&self, irq: u32, level: bool) -> Result<(), HvError> {
-        let intid = GIC_SPI_OFFSET.checked_add(irq).ok_or(HvError::GicLayout)?;
-        self.vm.gic_set_spi(intid, level)?;
-        Ok(())
+    pub fn inject_interrupt(&self, irq: u32, level: bool) -> Result<(), String> {
+        let intid = GIC_SPI_OFFSET
+            .checked_add(irq)
+            .ok_or_else(|| HvError::GicLayout.to_string())?;
+        self.vm
+            .gic_set_spi(intid, level)
+            .map_err(|error| HvError::from(error).to_string())
     }
 }
 
@@ -171,30 +171,30 @@ impl Cpu {
     }
 }
 
-fn gic_layout() -> Result<GicLayout, HvError> {
+fn gic_layout(gic: &NativeGicConfig) -> Result<NativeGicConfig, HvError> {
     let distributor_size =
-        u64::try_from(GicConfig::get_distributor_size()?).map_err(|_| HvError::GicLayout)?;
-    let redistributor_size = u64::try_from(GicConfig::get_redistributor_region_size()?)
+        u64::try_from(HvGicConfig::get_distributor_size()?).map_err(|_| HvError::GicLayout)?;
+    let redistributor_size = u64::try_from(HvGicConfig::get_redistributor_region_size()?)
         .map_err(|_| HvError::GicLayout)?;
-    let distributor_alignment = u64::try_from(GicConfig::get_distributor_base_alignment()?)
+    let distributor_alignment = u64::try_from(HvGicConfig::get_distributor_base_alignment()?)
         .map_err(|_| HvError::GicLayout)?;
-    let redistributor_alignment = u64::try_from(GicConfig::get_redistributor_base_alignment()?)
+    let redistributor_alignment = u64::try_from(HvGicConfig::get_redistributor_base_alignment()?)
         .map_err(|_| HvError::GicLayout)?;
     if distributor_alignment == 0
         || redistributor_alignment == 0
-        || !GIC_LAYOUT
-            .distributor_base
-            .is_multiple_of(distributor_alignment)
-        || !GIC_LAYOUT
+        || !gic.distributor_base.is_multiple_of(distributor_alignment)
+        || !gic
             .redistributor_base
             .is_multiple_of(redistributor_alignment)
+        || gic.distributor_size < distributor_size
+        || gic.redistributor_size < redistributor_size
     {
         return Err(HvError::GicLayout);
     }
-    Ok(GicLayout {
+    Ok(NativeGicConfig {
         distributor_size,
         redistributor_size,
-        ..GIC_LAYOUT
+        ..*gic
     })
 }
 

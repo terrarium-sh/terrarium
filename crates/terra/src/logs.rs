@@ -23,7 +23,7 @@ impl Write for CappedAppender {
             .read(true)
             .append(true)
             .open(&self.path)?;
-        terra_io::log::write_capped(&mut file, bytes)?;
+        terra_platform::io::log::write_capped(&mut file, bytes, terra_limits::MAX_LOG_FILE_BYTES)?;
         Ok(bytes.len())
     }
 

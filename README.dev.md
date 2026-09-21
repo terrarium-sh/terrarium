@@ -38,20 +38,20 @@ checkouts require symlink privileges and `core.symlinks=true`.
 | --- | --- |
 | `crates/terra` | CLI, recipes and manifests, box storage, policy construction, VM launch and clients |
 | `crates/terra-agent` | Linux guest initialization, hooks, workload and interactive services |
-| `crates/terra-protocol`, `crates/terra-io` | Shared wire protocol and portable local I/O |
+| `crates/terra-protocol` | Shared guest wire protocol |
 | `crates/terra-network` | Shared network policy types and address rules |
-| `crates/terra-platform` | KVM, Hypervisor.framework and WHP adapters; native machine resources |
-| `crates/terra-runtime` | Wasmtime stores, scoped host capabilities and component workers |
+| `crates/terra-platform` | Native VM, memory, filesystem and local-I/O APIs over KVM, Hypervisor.framework and WHP |
+| `crates/terra-runtime` | Wasmtime stores, guest layout, scoped host capabilities and component/VM lifecycle orchestration |
 | `components` | Boot planning, VMM and device protocols, network policy, transport and WIT |
 | `kernel`, `pins.mk` | Guest kernel configuration and pinned build inputs |
 | `fuzz`, `scripts` | Boundary fuzz targets, build checks and benchmark tools |
 
-Native preparation creates the machine layout, RAM, disks, directory grants
-and vCPUs. A short-lived boot component plans kernel placement; native code
-validates its writes and result before CPUs start. The VMM component then owns
-exit interpretation, MMIO routing and lifecycle decisions. Device components
-run in independent stores and communicate through bounded scalar bridges.
-Hypervisor operations and authority checks remain native. See the
+Runtime derives the fixed machine layout and asks platform to create the VM,
+RAM, disks and vCPUs. A short-lived boot component plans kernel placement;
+runtime validates its writes and result before CPUs start. The VMM component
+then owns exit interpretation, MMIO routing and lifecycle decisions. Device
+components run in independent stores and communicate through bounded scalar
+bridges. Hypervisor operations and authority checks remain native. See the
 [security model](docs/security.md) for trust boundaries and resource limits.
 
 The agent starts as PID 1 from the read-only 3 MiB memory-backed boot disk, receives its boot
@@ -165,7 +165,15 @@ After build assets exist, the native Rust fast path is:
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace
+make verify-platform        # platform tests independently of runtime
+make verify-dependency-boundaries
 ```
+
+`verify-dependency-boundaries` reads the supported-target Cargo metadata graphs
+and rejects platform paths to runtime, Wasmtime, WASI, or the guest protocol.
+Tokio is a required dependency of platform and runtime; synchronous platform
+APIs remain usable without starting a Tokio runtime. CI also cross-checks
+platform for Windows; native VM gates remain required for execution behavior.
 
 Windows tests run symlink fixtures by default. Enable Developer Mode or grant
 the account permission to create symbolic links before running the suite.
@@ -175,13 +183,18 @@ Real Linux guest gates require `/dev/kvm`:
 ```sh
 make dist
 make test-component-boot
+make test-platform-native-vm
 make test-component-vmm
 ```
 
-These exercise platform/device integration, CLI boots, mounts, networking,
+These exercise runtime/device integration, CLI boots, mounts, networking,
 capacity and memory growth/reclamation. Ignored tests are not covered by an
 ordinary workspace test pass. CI runs Linux VM gates when KVM is available;
 see the [build workflow](.github/workflows/build.yml) for exact conditions.
+
+`make test-platform-native-vm` checks preparation cleanup and repeated stop/join
+on a native hypervisor without guest artifacts. On Apple Silicon the target
+signs the test executable with the hypervisor entitlement before running it.
 
 macOS and Windows have an opt-in `native_vm_tests` workflow input. After a native
 host build (and signing on macOS), install Zig 0.16.0 for the guest probes and run:

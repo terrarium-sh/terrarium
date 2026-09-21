@@ -20,7 +20,6 @@ path = "src/main.rs"
 fuzzing = []
 
 [dependencies]
-terra-io = { path = "../terra-io", features = ["tokio"] }
 terra-limits = { path = "../terra-limits" }
 terra-protocol = { path = "../terra-protocol", features = ["tokio"] }
 clap.workspace = true

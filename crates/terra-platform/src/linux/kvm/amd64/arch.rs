@@ -2,6 +2,7 @@
 
 use kvm_bindings::{CpuId, KvmIrqRouting, kvm_regs, kvm_segment, kvm_sregs};
 use kvm_ioctls::{VcpuFd, VmFd};
+use std::{error, fmt};
 
 pub const GDT_ADDR: u64 = terra_limits::X86_GDT_ADDR;
 pub const PML4_ADDR: u64 = terra_limits::X86_PML4_ADDR;
@@ -23,6 +24,25 @@ pub enum ArchError {
 impl From<kvm_ioctls::Error> for ArchError {
     fn from(error: kvm_ioctls::Error) -> Self {
         Self::Kvm(error)
+    }
+}
+
+impl fmt::Display for ArchError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Kvm(error) => write!(formatter, "KVM error: {error}"),
+            Self::IrqOutOfRange(irq) => write!(formatter, "IRQ {irq} is outside the IOAPIC range"),
+            Self::Routing => formatter.write_str("allocating KVM IRQ routing"),
+        }
+    }
+}
+
+impl error::Error for ArchError {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        match self {
+            Self::Kvm(error) => Some(error),
+            Self::IrqOutOfRange(_) | Self::Routing => None,
+        }
     }
 }
 

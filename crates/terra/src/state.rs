@@ -169,6 +169,18 @@ impl BoxRef {
         })
     }
 
+    #[cfg(any(windows, test))]
+    pub fn request_stop(&self) -> Result<()> {
+        use std::io::Write as _;
+
+        let mut control =
+            terra_platform::io::local::LocalStream::connect(self.dir.join(CONTROL_SOCKET))
+                .with_context(|| format!("connecting to {self}'s stop service"))?;
+        control
+            .write_all(&[terra_protocol::STOP_SIGNAL])
+            .with_context(|| format!("asking {self} to stop"))
+    }
+
     fn is_marked_baking(&self) -> bool {
         self.read_lock_line()
             .split_whitespace()
@@ -512,6 +524,26 @@ mod tests {
     /// one taken afterwards would be a box in the developer's real `~/.terra`.
     fn resolve_box_ref(project_dir: &Path) -> BoxRef {
         BoxRef::resolve(project_dir, "dev").unwrap()
+    }
+
+    #[test]
+    fn graceful_stop_reaches_the_box_control_socket() {
+        use std::io::Read as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bx = BoxRef::from_state_dir(dir.path().join("dev"), dir.path());
+        std::fs::create_dir_all(&bx.dir).unwrap();
+        let listener =
+            terra_platform::io::local::LocalListener::bind(bx.dir.join(CONTROL_SOCKET)).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0];
+            stream.read_exact(&mut request).unwrap();
+            request
+        });
+
+        bx.request_stop().unwrap();
+        assert_eq!(server.join().unwrap(), [terra_protocol::STOP_SIGNAL]);
     }
 
     /// A lock's release is deferred while a concurrently forked test child

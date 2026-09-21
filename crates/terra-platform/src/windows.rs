@@ -1,7 +1,7 @@
 //! Windows Hypervisor Platform execution backend.
 
 pub mod whp;
-mod worker;
+pub(crate) mod worker;
 
 #[cfg(target_arch = "aarch64")]
 pub mod aarch64;

@@ -625,21 +625,13 @@ async fn component_aot_deserialize_runs() {
     );
 }
 
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn component_operates_on_shared_machine_ram() {
-    use std::sync::Arc;
-    use vm_memory::{Bytes as _, GuestAddress, GuestMemoryMmap};
+    use terra_platform::memory::GuestMemory;
     let engine = device_engine().expect("engine builds");
     let linker = block_component_linker(&engine).expect("block imports link");
-    let mem = Arc::new(
-        GuestMemoryMmap::<()>::from_ranges(&[(
-            GuestAddress(0),
-            usize::try_from(RAM).expect("test RAM fits"),
-        )])
-        .expect("maps"),
-    );
-    let ram = GuestRam::from_shared(Arc::clone(&mem)).expect("aliases");
+    let mem = GuestMemory::allocate(RAM).expect("maps");
+    let ram = GuestRam::from_memory(mem.clone());
     let mut disk = BoundedDisk::new(8 * 512, false);
     disk.write(2 * 512, &[0x5Eu8; 512]).expect("pattern in");
     let mut store = device_store(&engine, BlockHost::new(ram, DiskGrant::Mem(disk)));
@@ -662,12 +654,8 @@ async fn component_operates_on_shared_machine_ram() {
     assert_eq!(result, 0);
     // The component wrote through the shared mapping, not a copy:
     // the bytes are visible on the other alias with no round trip.
-    let mut back = [0u8; 512];
-    mem.read_slice(&mut back, GuestAddress(DATA))
-        .expect("mapped");
+    let back = mem.read(DATA, 512).expect("mapped");
     assert_eq!(back, [0x5Eu8; 512]);
-    let mut status = [0u8; 1];
-    mem.read_slice(&mut status, GuestAddress(STATUS))
-        .expect("mapped");
+    let status = mem.read(STATUS, 1).expect("mapped");
     assert_eq!(status, [0]);
 }

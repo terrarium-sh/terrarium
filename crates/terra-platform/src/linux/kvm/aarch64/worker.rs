@@ -1,44 +1,25 @@
-//! Linux/KVM `AArch64` worker backed by scoped WASI VMM components.
-
-use terra_runtime::component::vmm::{PreparedMachine, StartedVcpus};
+//! Linux/KVM `AArch64` vCPU runners.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
+use super::ArmWorkerError;
+use super::machine::Machine;
+use crate::aarch64::arm::MAX_VCPUS;
+use crate::memory::GuestMemory;
+use crate::runner::{PthreadPublication, install_kick_handler, unblock_kick_signal};
+use crate::vm::{
+    BootState, InterruptControllerConfig, InterruptMode, VcpuAction, VcpuExit as NativeExit,
+    VcpuHandler, VcpuOutcome, VmCapabilities, VmConfig, VmHandle,
+};
 use kvm_bindings::{
     KVM_REG_ARM_CORE, KVM_REG_ARM64, KVM_REG_SIZE_U64, KVM_SYSTEM_EVENT_RESET,
     KVM_SYSTEM_EVENT_SHUTDOWN, kvm_regs, user_pt_regs,
 };
 use kvm_ioctls::{Kvm, VcpuExit, VcpuFd};
-use terra_runtime::component::vmm::{Completion, Exit, NativeVcpu, platform};
-use vm_memory::GuestMemoryMmap;
-
-use super::machine::Machine;
-use crate::aarch64::arm::MAX_VCPUS;
-use crate::runner::{PthreadPublication, install_kick_handler, unblock_kick_signal};
-use crate::worker::{self, PreparedVmm, WorkerInput};
 
 const STOP_DEADLINE: Duration = Duration::from_secs(5);
-
-#[derive(Debug)]
-pub enum ArmWorkerError {
-    BadVcpuCount(usize),
-    TooManyDevices,
-    Memory,
-    Kvm(kvm_ioctls::Error),
-    Component(String),
-    ThreadGone,
-    KickHandler(std::io::Error),
-    Timeout,
-    UnexpectedExit(&'static str),
-}
-
-impl From<kvm_ioctls::Error> for ArmWorkerError {
-    fn from(error: kvm_ioctls::Error) -> Self {
-        Self::Kvm(error)
-    }
-}
 
 fn configure_boot_vcpu(
     vcpu: &VcpuFd,
@@ -76,8 +57,8 @@ struct VcpuRunner {
 
 enum VcpuCommand {
     Start {
-        component: NativeVcpu,
-        boot: Option<terra_runtime::component::vmm::BootEntry>,
+        handler: Box<dyn VcpuHandler>,
+        boot: Option<BootState>,
     },
     Stop,
 }
@@ -89,12 +70,7 @@ enum ArmVcpuOutcome {
 }
 
 impl VcpuRunner {
-    fn spawn(
-        id: usize,
-        mut vcpu: VcpuFd,
-        ram: Arc<GuestMemoryMmap<()>>,
-        lifecycle: terra_runtime::component::vmm::lifecycle::LifecycleNotifier,
-    ) -> Result<Self, ArmWorkerError> {
+    fn spawn(id: usize, mut vcpu: VcpuFd, ram: GuestMemory) -> Result<Self, ArmWorkerError> {
         install_kick_handler().map_err(ArmWorkerError::KickHandler)?;
         let stop = Arc::new(AtomicBool::new(false));
         let publication = PthreadPublication::new();
@@ -109,7 +85,7 @@ impl VcpuRunner {
                 let result = match unblock_kick_signal().map_err(ArmWorkerError::KickHandler) {
                     Err(error) => Err(error),
                     Ok(()) => match commands.recv() {
-                        Ok(VcpuCommand::Start { component, boot }) => {
+                        Ok(VcpuCommand::Start { mut handler, boot }) => {
                             if thread_stop.load(Ordering::Acquire) {
                                 Ok(ArmVcpuOutcome::Stopped)
                             } else if let Some(boot) = boot {
@@ -119,14 +95,27 @@ impl VcpuRunner {
                                     Err(error)
                                 } else {
                                     let _published = thread_publication.publish();
-                                    let result = run_vcpu(&mut vcpu, &thread_stop, &component);
+                                    let result =
+                                        run_vcpu(&mut vcpu, &thread_stop, handler.as_mut());
                                     thread_publication.clear();
+                                    if let Ok(outcome) = &result {
+                                        handler.finished(match outcome {
+                                            ArmVcpuOutcome::Shutdown => VcpuOutcome::Shutdown,
+                                            ArmVcpuOutcome::Stopped => VcpuOutcome::Stopped,
+                                        });
+                                    }
                                     result
                                 }
                             } else {
                                 let _published = thread_publication.publish();
-                                let result = run_vcpu(&mut vcpu, &thread_stop, &component);
+                                let result = run_vcpu(&mut vcpu, &thread_stop, handler.as_mut());
                                 thread_publication.clear();
+                                if let Ok(outcome) = &result {
+                                    handler.finished(match outcome {
+                                        ArmVcpuOutcome::Shutdown => VcpuOutcome::Shutdown,
+                                        ArmVcpuOutcome::Stopped => VcpuOutcome::Stopped,
+                                    });
+                                }
                                 result
                             }
                         }
@@ -134,9 +123,6 @@ impl VcpuRunner {
                         Err(_) => Err(ArmWorkerError::ThreadGone),
                     },
                 };
-                if result.is_err() {
-                    lifecycle.component_failed();
-                }
                 let _ = done.send(result);
             })
             .map_err(|_| ArmWorkerError::ThreadGone)?;
@@ -157,11 +143,11 @@ impl VcpuRunner {
 
     fn start(
         &self,
-        component: NativeVcpu,
-        boot: Option<terra_runtime::component::vmm::BootEntry>,
+        handler: Box<dyn VcpuHandler>,
+        boot: Option<BootState>,
     ) -> Result<(), ArmWorkerError> {
         self.command
-            .send(VcpuCommand::Start { component, boot })
+            .send(VcpuCommand::Start { handler, boot })
             .map_err(|_| ArmWorkerError::ThreadGone)
     }
 
@@ -183,130 +169,131 @@ impl VcpuRunner {
     }
 }
 
-#[allow(clippy::too_many_lines)]
-pub async fn prepare(mut input: WorkerInput) -> Result<PreparedVmm, ArmWorkerError> {
-    if input.vcpus == 0 || input.vcpus > MAX_VCPUS {
-        return Err(ArmWorkerError::BadVcpuCount(input.vcpus));
-    }
-    let disks = crate::worker::devices::disk_paths(&input);
-    let blocks = 1 + disks.len();
-    let shares = input.shares.len();
-    let layout = crate::aarch64::arm::build_machine_layout(input.ram_bytes, blocks, shares)
-        .map_err(|error| ArmWorkerError::Component(format!("invalid ARM layout: {error:?}")))?;
-    let config = layout
-        .machine_config(input.vcpus)
-        .map_err(|error| ArmWorkerError::Component(error.to_string()))?;
-    let kvm = Kvm::new().map_err(|error| {
-        ArmWorkerError::Component(format!(
-            "opening /dev/kvm: {error}; check KVM access permissions"
-        ))
-    })?;
-    let machine = Machine::new(&kvm, &config)?;
-    let runtime = crate::worker::create_runtime(&input).map_err(|error| component_error(&error))?;
-    let lifecycle = runtime.lifecycle_notifier();
-    let hard_stop = input.hard_stop;
-    let group = VcpuGroup::prepare(&machine, input.vcpus, &lifecycle, hard_stop)?;
-    let prepared = PreparedMachine::new(config, machine);
-    let (mut runtime, machine) = crate::worker::boot_prepared(runtime, prepared, &mut input)
-        .await
-        .map_err(|error| component_error(&error))?;
-    worker::devices::assemble_devices(
-        &mut runtime,
-        &mut input,
-        machine.ram(),
-        &disks,
-        |kind, index| {
-            machine
-                .bind_interrupt(kind, index, inject_irq)
-                .map_err(|error| error.to_string())
-        },
-    )
-    .map_err(ArmWorkerError::Component)?;
-    let interrupt_machine = machine.clone();
-    runtime
-        .grant_interrupt_shutdown(async move {
-            let interrupt_machine = interrupt_machine.machine();
-            interrupt_machine
-                .clear_interrupts()
-                .map_err(|error| format!("{error:?}"))
-        })
-        .map_err(|error| component_error(&error))?;
-    crate::worker::finish_preparation(runtime, input.deadline, move |controls, boot| {
-        group
-            .start(controls, boot)
-            .map_err(|error| wasmtime::Error::msg(format!("ARM vCPU startup: {error:?}")))
-    })
-    .await
-    .map_err(|error| component_error(&error))
+pub struct KvmArmVm {
+    machine: Arc<Machine>,
+    group: PreparedVcpuGroup,
 }
 
-struct VcpuGroup {
+impl KvmArmVm {
+    pub fn create(config: &VmConfig, hard_stop: Option<fn() -> !>) -> Result<Self, String> {
+        Self::prepare_native(config, hard_stop).map_err(|error| error.to_string())
+    }
+
+    fn prepare_native(
+        config: &VmConfig,
+        hard_stop: Option<fn() -> !>,
+    ) -> Result<Self, ArmWorkerError> {
+        let vcpus = usize::from(config.vcpus);
+        match config.interrupt_controller {
+            InterruptControllerConfig::Arm(_) => {}
+            InterruptControllerConfig::X86 => {
+                return Err(ArmWorkerError::InvalidInterruptController);
+            }
+        }
+        if vcpus == 0 || vcpus > MAX_VCPUS {
+            return Err(ArmWorkerError::BadVcpuCount(vcpus));
+        }
+        let kvm = Kvm::new().map_err(|error| {
+            ArmWorkerError::Native(format!(
+                "opening /dev/kvm: {error}; check KVM access permissions"
+            ))
+        })?;
+        let machine = Arc::new(Machine::new(&kvm, config)?);
+        let group = PreparedVcpuGroup {
+            group: VcpuGroup::prepare(&machine, vcpus, hard_stop)?,
+        };
+        Ok(Self { machine, group })
+    }
+
+    #[allow(clippy::unnecessary_wraps)]
+    pub const fn capabilities() -> Result<VmCapabilities, String> {
+        Ok(VmCapabilities {
+            interrupt_mode: InterruptMode::ArmIrqLines,
+            tsc_frequency: None,
+        })
+    }
+}
+
+impl KvmArmVm {
+    #[must_use]
+    pub fn handle(&self) -> VmHandle {
+        VmHandle::new(Arc::clone(&self.machine))
+    }
+
+    pub(crate) fn start(
+        self,
+        boot: BootState,
+        handlers: Vec<Box<dyn VcpuHandler>>,
+    ) -> Result<VcpuGroup, String> {
+        self.group
+            .start(handlers, boot)
+            .map_err(|error| format!("{error:?}"))
+    }
+}
+
+struct PreparedVcpuGroup {
+    group: VcpuGroup,
+}
+
+pub(crate) struct VcpuGroup {
+    _machine: Option<Arc<Machine>>,
     runners: Vec<VcpuRunner>,
     hard_stop: Option<fn() -> !>,
 }
 
 impl VcpuGroup {
     fn prepare(
-        machine: &Machine,
+        machine: &Arc<Machine>,
         count: usize,
-        lifecycle: &terra_runtime::component::vmm::lifecycle::LifecycleNotifier,
         hard_stop: Option<fn() -> !>,
     ) -> Result<Self, ArmWorkerError> {
         let vcpus = machine.prepare_vcpus(count)?;
         let mut group = Self {
+            _machine: Some(Arc::clone(machine)),
             runners: Vec::with_capacity(count),
             hard_stop,
         };
         for (id, vcpu) in vcpus.into_iter().enumerate() {
-            group.runners.push(VcpuRunner::spawn(
-                id,
-                vcpu,
-                machine.ram(),
-                lifecycle.clone(),
-            )?);
+            group
+                .runners
+                .push(VcpuRunner::spawn(id, vcpu, machine.memory())?);
         }
         Ok(group)
     }
+}
 
+impl PreparedVcpuGroup {
     fn start(
         self,
-        controls: Vec<NativeVcpu>,
-        boot: terra_runtime::component::vmm::BootEntry,
-    ) -> Result<StartedVcpus, ArmWorkerError> {
-        if self.runners.len() != controls.len() {
-            return Err(ArmWorkerError::BadVcpuCount(controls.len()));
+        handlers: Vec<Box<dyn VcpuHandler>>,
+        boot: BootState,
+    ) -> Result<VcpuGroup, ArmWorkerError> {
+        if self.group.runners.len() != handlers.len() {
+            return Err(ArmWorkerError::BadVcpuCount(handlers.len()));
         }
-        for (id, (runner, component)) in self.runners.iter().zip(controls).enumerate() {
-            runner.start(component, (id == 0).then_some(boot))?;
+        for (id, (runner, handler)) in self.group.runners.iter().zip(handlers).enumerate() {
+            runner.start(handler, (id == 0).then_some(boot))?;
         }
-        let stops = self
-            .runners
-            .iter()
-            .map(|runner| (Arc::clone(&runner.stop), runner.publication.clone()))
-            .collect::<Vec<_>>();
-        Ok(StartedVcpus::new(
-            self,
-            move || {
-                for (stop, publication) in stops {
-                    stop.store(true, Ordering::Release);
-                    publication.kick();
-                }
-                Ok(())
-            },
-            |mut group| {
-                group
-                    .stop()
-                    .map(|outcomes| {
-                        outcomes
-                            .into_iter()
-                            .map(|outcome| {
-                                outcome.map(|_| ()).map_err(|error| format!("{error:?}"))
-                            })
-                            .collect()
-                    })
-                    .map_err(|error| format!("{error:?}"))
-            },
-        ))
+        Ok(self.group)
+    }
+}
+
+impl VcpuGroup {
+    pub(crate) fn request_stop(&mut self) {
+        for runner in &self.runners {
+            runner.request_stop();
+        }
+    }
+
+    pub(crate) fn join(&mut self) -> Result<Vec<Result<(), String>>, String> {
+        self.stop()
+            .map(|outcomes| {
+                outcomes
+                    .into_iter()
+                    .map(|outcome| outcome.map(|_| ()).map_err(|error| format!("{error:?}")))
+                    .collect()
+            })
+            .map_err(|error| format!("{error:?}"))
     }
 
     fn stop(&mut self) -> Result<Vec<Result<ArmVcpuOutcome, ArmWorkerError>>, ArmWorkerError> {
@@ -320,16 +307,6 @@ impl Drop for VcpuGroup {
             let _ = self.stop();
         }
     }
-}
-
-fn component_error(error: &wasmtime::Error) -> ArmWorkerError {
-    ArmWorkerError::Component(format!("{error:#}"))
-}
-
-fn inject_irq(machine: &Machine, irq: u32, level: bool) -> wasmtime::Result<()> {
-    machine
-        .interrupt(irq, level)
-        .map_err(|error| wasmtime::Error::msg(format!("ARM interrupt: {error:?}")))
 }
 
 fn stop_runners(
@@ -359,7 +336,7 @@ fn stop_runners(
 fn run_vcpu(
     vcpu: &mut VcpuFd,
     stop: &AtomicBool,
-    component: &NativeVcpu,
+    handler: &mut dyn VcpuHandler,
 ) -> Result<ArmVcpuOutcome, ArmWorkerError> {
     loop {
         if stop.load(Ordering::Acquire) {
@@ -368,9 +345,9 @@ fn run_vcpu(
         match vcpu.run() {
             Ok(VcpuExit::MmioRead(address, data)) => {
                 let width = width(data.len())?;
-                let Completion::MmioRead(value) = component
-                    .exchange(Exit::MmioRead(platform::MmioRead { address, width }))
-                    .map_err(|error| component_error(&error))?
+                let VcpuAction::MmioRead(value) = handler
+                    .exchange(NativeExit::MmioRead(crate::vm::MmioRead { address, width }))
+                    .map_err(ArmWorkerError::Native)?
                 else {
                     return Err(ArmWorkerError::UnexpectedExit("mmio-read-completion"));
                 };
@@ -378,35 +355,35 @@ fn run_vcpu(
             }
             Ok(VcpuExit::MmioWrite(address, data)) => {
                 reenter(
-                    component
-                        .exchange(Exit::MmioWrite(platform::MmioWrite {
+                    handler
+                        .exchange(NativeExit::MmioWrite(crate::vm::MmioWrite {
                             address,
                             width: width(data.len())?,
                             value: value(data)?,
                         }))
-                        .map_err(|error| component_error(&error))?,
+                        .map_err(ArmWorkerError::Native)?,
                 )?;
             }
             Ok(VcpuExit::Hlt) => reenter(
-                component
-                    .exchange(Exit::Halt)
-                    .map_err(|error| component_error(&error))?,
+                handler
+                    .exchange(NativeExit::Halt)
+                    .map_err(ArmWorkerError::Native)?,
             )?,
             Ok(VcpuExit::Intr) => {
                 if stop.load(Ordering::Acquire) {
                     return Ok(ArmVcpuOutcome::Stopped);
                 }
                 reenter(
-                    component
-                        .exchange(Exit::Interrupted)
-                        .map_err(|error| component_error(&error))?,
+                    handler
+                        .exchange(NativeExit::Interrupted)
+                        .map_err(ArmWorkerError::Native)?,
                 )?;
             }
             Ok(
                 VcpuExit::Shutdown
                 | VcpuExit::SystemEvent(KVM_SYSTEM_EVENT_SHUTDOWN | KVM_SYSTEM_EVENT_RESET, _),
             ) => {
-                let _ = component.exchange(Exit::Shutdown);
+                let _ = handler.exchange(NativeExit::Shutdown);
                 return Ok(ArmVcpuOutcome::Shutdown);
             }
             Ok(_) => return Err(ArmWorkerError::UnexpectedExit("KVM exit")),
@@ -434,8 +411,8 @@ fn value(data: &[u8]) -> Result<u64, ArmWorkerError> {
     Ok(u64::from_le_bytes(bytes))
 }
 
-fn reenter(completion: Completion) -> Result<(), ArmWorkerError> {
-    if matches!(completion, Completion::Reenter) {
+fn reenter(action: VcpuAction) -> Result<(), ArmWorkerError> {
+    if matches!(action, VcpuAction::Reenter) {
         Ok(())
     } else {
         Err(ArmWorkerError::UnexpectedExit("completion"))
@@ -476,6 +453,7 @@ mod tests {
             let _ = done.send(Ok(ArmVcpuOutcome::Stopped));
         });
         drop(VcpuGroup {
+            _machine: None,
             runners: vec![VcpuRunner {
                 stop,
                 publication: PthreadPublication::new(),

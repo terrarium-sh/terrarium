@@ -11,7 +11,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitCode};
 use std::time::{Duration, Instant};
-use terra_io::local::AsyncLocalStream;
+use terra_platform::io::local::AsyncLocalStream;
 
 /// The background VM process's own first argv: `terra __vm <dir>` skips the
 /// command line and takes its boot off stdin.

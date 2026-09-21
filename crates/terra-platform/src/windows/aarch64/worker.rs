@@ -1,89 +1,87 @@
+use crate::memory::GuestMemory;
+use crate::vm::{
+    ArmException, ArmRead, BootState, CpuStart, InterruptControllerConfig, InterruptMode,
+    VcpuAction, VcpuExit, VcpuHandler, VcpuOutcome, VmCapabilities, VmConfig, VmHandle,
+};
 use crate::windows::worker::VcpuGroup;
-use crate::worker::{self, PreparedVmm, WorkerInput};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use terra_runtime::component::vmm::{Exit, PreparedMachine, StartedVcpus, platform};
-use terra_runtime::memory::WindowsRam;
 
-fn launch_vcpus(
+pub struct WindowsVm {
     partition: Arc<crate::windows::whp::Partition>,
-    controls: Vec<terra_runtime::component::vmm::NativeVcpu>,
-    boot: terra_runtime::component::vmm::BootEntry,
     hard_stop: Option<fn() -> !>,
-) -> Result<StartedVcpus, String> {
-    crate::windows::aarch64::setup_bsp(&partition, boot.entry, boot.boot_argument)
-        .map_err(|error| error.to_string())?;
-    let mut group = VcpuGroup::new(partition, hard_stop);
-    let (starts, receivers) = ArmCpuStarts::new(Arc::clone(&group.partition));
-    group.on_stop = Some({
-        let starts = Arc::clone(&starts);
-        Arc::new(move || starts.stop())
-    });
-    for ((id, control), receiver) in (0_u32..).zip(controls).zip(receivers) {
-        let partition = Arc::clone(&group.partition);
-        let stop = Arc::clone(&group.stop);
-        let starts = Arc::clone(&starts);
-        group.spawn(move || arm_run_vcpu(&partition, id, &control, &receiver, &starts, &stop))?;
-    }
-    Ok(group.into_started())
 }
 
-#[allow(clippy::too_many_lines)]
-pub async fn prepare(mut input: WorkerInput) -> Result<PreparedVmm, String> {
-    use crate::aarch64::arm::{MAX_VCPUS, RAM_BASE};
+impl WindowsVm {
+    pub fn create(config: &VmConfig, hard_stop: Option<fn() -> !>) -> Result<Self, String> {
+        use crate::aarch64::arm::MAX_VCPUS;
 
-    if input.vcpus == 0 || input.vcpus > MAX_VCPUS {
-        return Err("invalid Windows ARM64 vCPU count".to_owned());
-    }
-    let component_runtime =
-        crate::worker::create_runtime(&input).map_err(|error| error.to_string())?;
-    let disks = crate::worker::devices::disk_paths(&input);
-    let block_count = 1 + disks.len();
-    let shares = input.shares.len();
-    let layout = crate::aarch64::arm::build_machine_layout(input.ram_bytes, block_count, shares)
-        .map_err(|error| format!("invalid ARM WHP layout: {error:?}"))?;
-    let config = layout
-        .machine_config(input.vcpus)
-        .map_err(|error| error.to_string())?;
-    let ram =
-        WindowsRam::allocate_at(config.ram_bytes(), RAM_BASE).ok_or("allocating ARM WHP RAM")?;
-    let partition = crate::windows::whp::Partition::new(ram, u32::from(config.vcpus()))
-        .map_err(|error| error.to_string())?;
-    for id in 0..u32::from(config.vcpus()) {
-        partition
-            .create_vcpu(id)
-            .map_err(|error| error.to_string())?;
-    }
-    let prepared = PreparedMachine::new(config, partition);
-    let (mut component_runtime, partition) =
-        crate::worker::boot_prepared(component_runtime, prepared, &mut input)
-            .await
-            .map_err(|error| error.to_string())?;
-    let ram_alias = partition.ram();
-    worker::devices::assemble_devices(
-        &mut component_runtime,
-        &mut input,
-        ram_alias,
-        &disks,
-        |kind, index| {
+        let InterruptControllerConfig::Arm(gic) = config.interrupt_controller else {
+            return Err("Windows ARM64 requires an ARM interrupt controller".to_owned());
+        };
+        if config.vcpus == 0 || usize::from(config.vcpus) > MAX_VCPUS {
+            return Err("invalid Windows ARM64 VM dimensions".to_owned());
+        }
+        let memory = GuestMemory::allocate_at(config.ram_base, config.ram_bytes)
+            .ok_or("allocating ARM WHP RAM")?;
+        let partition = Arc::new(
+            crate::windows::whp::Partition::new(memory, u32::from(config.vcpus), Some(gic))
+                .map_err(|error| error.to_string())?,
+        );
+        for id in 0..u32::from(config.vcpus) {
             partition
-                .bind_interrupt(kind, index, inject_arm_irq)
-                .map_err(|error| error.to_string())
-        },
-    )?;
-    let hard_stop = input.hard_stop;
-    crate::worker::finish_preparation(component_runtime, input.deadline, move |controls, boot| {
-        launch_vcpus(partition.machine(), controls, boot, hard_stop).map_err(wasmtime::Error::msg)
-    })
-    .await
-    .map_err(|error| error.to_string())
+                .create_vcpu(id)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(Self {
+            partition,
+            hard_stop,
+        })
+    }
+
+    #[allow(clippy::unnecessary_wraps)]
+    pub const fn capabilities() -> Result<VmCapabilities, String> {
+        Ok(VmCapabilities {
+            interrupt_mode: InterruptMode::ArmIrqLines,
+            tsc_frequency: None,
+        })
+    }
+
+    #[must_use]
+    pub fn handle(&self) -> VmHandle {
+        VmHandle::new(Arc::clone(&self.partition))
+    }
+
+    pub fn start(
+        self,
+        boot: BootState,
+        handlers: Vec<Box<dyn VcpuHandler>>,
+    ) -> Result<VcpuGroup, String> {
+        if handlers.len() != usize::try_from(self.partition.vcpu_count()).unwrap_or(usize::MAX) {
+            return Err("vCPU handler count changed during startup".to_owned());
+        }
+        let partition = self.partition;
+        crate::windows::aarch64::setup_bsp(&partition, boot.entry, boot.boot_argument)
+            .map_err(|error| error.to_string())?;
+        let mut group = VcpuGroup::new(partition, self.hard_stop);
+        let (starts, receivers) = ArmCpuStarts::new(Arc::clone(&group.partition));
+        group.secondary = Some(Arc::clone(&starts));
+        for ((id, handler), receiver) in (0_u32..).zip(handlers).zip(receivers) {
+            let partition = Arc::clone(&group.partition);
+            let stop = Arc::clone(&group.stop);
+            let starts = Arc::clone(&starts);
+            group
+                .spawn(move || arm_run_vcpu(&partition, id, handler, &receiver, &starts, &stop))?;
+        }
+        Ok(group)
+    }
 }
 
 fn arm_run_vcpu(
     partition: &Arc<crate::windows::whp::Partition>,
     vcpu: u32,
-    worker: &terra_runtime::component::vmm::NativeVcpu,
+    mut handler: Box<dyn VcpuHandler>,
     receiver: &mpsc::Receiver<ArmCpuCommand>,
     starts: &ArmCpuStarts,
     stop: &Arc<AtomicBool>,
@@ -93,7 +91,10 @@ fn arm_run_vcpu(
         if !active {
             match receiver.recv() {
                 Ok(ArmCpuCommand::Start) => active = true,
-                Ok(ArmCpuCommand::Stop) | Err(_) => return Ok(()),
+                Ok(ArmCpuCommand::Stop) | Err(_) => {
+                    handler.finished(VcpuOutcome::Stopped);
+                    return Ok(());
+                }
             }
         }
         while !stop.load(Ordering::Relaxed) {
@@ -103,37 +104,36 @@ fn arm_run_vcpu(
             {
                 crate::windows::whp::RunExit::MemoryAccess {
                     gpa, pc, syndrome, ..
-                } => match arm_mmio(partition, vcpu, worker, starts, gpa, pc, syndrome)? {
-                    ArmRun::Continue => {}
-                    ArmRun::Off => {
-                        starts.powered_off(vcpu);
-                        active = false;
-                        break;
+                } => {
+                    match arm_mmio(partition, vcpu, handler.as_mut(), starts, gpa, pc, syndrome)? {
+                        ArmRun::Continue => {}
+                        ArmRun::Off => {
+                            starts.powered_off(vcpu);
+                            active = false;
+                            break;
+                        }
+                        ArmRun::Stop => {
+                            stop.store(true, Ordering::Relaxed);
+                            starts.stop();
+                            handler.finished(VcpuOutcome::Shutdown);
+                            return Ok(());
+                        }
                     }
-                    ArmRun::Stop => {
-                        stop.store(true, Ordering::Relaxed);
-                        starts.stop();
-                        return Ok(());
-                    }
-                },
-                crate::windows::whp::RunExit::Halt | crate::windows::whp::RunExit::Canceled => {
+                }
+                crate::windows::whp::RunExit::Canceled => {
+                    handler.finished(VcpuOutcome::Stopped);
                     return Ok(());
                 }
                 crate::windows::whp::RunExit::Reset { .. } => {
                     stop.store(true, Ordering::Relaxed);
                     starts.stop();
+                    handler.finished(VcpuOutcome::Stopped);
                     return Ok(());
                 }
                 crate::windows::whp::RunExit::Other(reason) => {
                     stop.store(true, Ordering::Relaxed);
                     starts.stop();
                     return Err(format!("unexpected ARM WHP exit {reason:#x} on CPU {vcpu}"));
-                }
-                crate::windows::whp::RunExit::ApicEoi(_) => {
-                    return Err("x64 APIC exit on ARM CPU".to_owned());
-                }
-                crate::windows::whp::RunExit::IoPortAccess => {
-                    return Err("x64 I/O-port exit on ARM CPU".to_owned());
                 }
             }
         }
@@ -143,7 +143,7 @@ fn arm_run_vcpu(
     }
 }
 
-struct ArmCpuStarts {
+pub(crate) struct ArmCpuStarts {
     partition: Arc<crate::windows::whp::Partition>,
     started: std::sync::Mutex<Vec<bool>>,
     senders: Vec<mpsc::Sender<ArmCpuCommand>>,
@@ -173,7 +173,7 @@ impl ArmCpuStarts {
         )
     }
 
-    fn start(&self, start: &terra_runtime::component::vmm::platform::CpuStart) -> i64 {
+    fn start(&self, start: &CpuStart) -> i64 {
         if self.stopped.load(Ordering::Relaxed) {
             return -3;
         }
@@ -216,7 +216,7 @@ impl ArmCpuStarts {
         }
     }
 
-    fn stop(&self) {
+    pub(crate) fn stop(&self) {
         if !self.stopped.swap(true, Ordering::Relaxed) {
             for sender in &self.senders {
                 let _ = sender.send(ArmCpuCommand::Stop);
@@ -237,34 +237,40 @@ enum ArmRun {
 fn arm_mmio(
     partition: &crate::windows::whp::Partition,
     vcpu: u32,
-    worker: &terra_runtime::component::vmm::NativeVcpu,
+    handler: &mut dyn VcpuHandler,
     starts: &ArmCpuStarts,
     gpa: u64,
     pc: u64,
     syndrome: u64,
 ) -> Result<ArmRun, String> {
-    let completion = worker
-        .exchange_arm_exception(gpa, syndrome, |register| {
-            if register == 31 {
-                return Ok(0);
-            }
-            let register = arm_general_register(register).map_err(wasmtime::Error::msg)?;
+    let mut action = handler.exchange(VcpuExit::ArmException(ArmException {
+        address: gpa,
+        syndrome,
+    }))?;
+    while let VcpuAction::ArmRegister(register) = action {
+        if register > 31 {
+            return Err("ARM register outside vCPU grant".to_owned());
+        }
+        let value = if register == 31 {
+            0
+        } else {
             partition
-                .register_u64(vcpu, register)
-                .map_err(|error| wasmtime::Error::msg(error.to_string()))
-        })
-        .map_err(|error| error.to_string())?;
+                .register_u64(vcpu, arm_general_register(register)?)
+                .map_err(|error| error.to_string())?
+        };
+        action = handler.exchange(VcpuExit::ArmRegisterValue(value))?;
+    }
     let pc = pc.checked_add(4).ok_or("ARM PC overflow")?;
-    match completion {
-        terra_runtime::component::vmm::Completion::ArmRead(completion) => {
+    match action {
+        VcpuAction::ArmRead(ArmRead { register, value }) => {
             let mut registers = vec![(crate::windows::aarch64::WHV_ARM64_REGISTER_PC, pc)];
-            if let Some(register) = completion.register {
-                registers.push((arm_general_register(register)?, completion.value));
+            if let Some(register) = register {
+                registers.push((arm_general_register(register)?, value));
             }
             arm_set_registers(partition, vcpu, &registers)?;
             Ok(ArmRun::Continue)
         }
-        terra_runtime::component::vmm::Completion::HvcReturn(status) => {
+        VcpuAction::HvcReturn(status) => {
             arm_set_registers(
                 partition,
                 vcpu,
@@ -278,15 +284,13 @@ fn arm_mmio(
             )?;
             Ok(ArmRun::Continue)
         }
-        terra_runtime::component::vmm::Completion::CpuStart(start) => {
+        VcpuAction::CpuStart(start) => {
             let status = starts.start(&start);
-            let completion = worker
-                .exchange(Exit::HvcResult(platform::HvcResult {
-                    target: start.target,
-                    status,
-                }))
-                .map_err(|error| error.to_string())?;
-            let terra_runtime::component::vmm::Completion::HvcReturn(status) = completion else {
+            let action = handler.exchange(VcpuExit::HvcResult(crate::vm::HvcResult {
+                target: start.target,
+                status,
+            }))?;
+            let VcpuAction::HvcReturn(status) = action else {
                 return Err("unexpected PSCI start completion".to_owned());
             };
             arm_set_registers(
@@ -302,7 +306,7 @@ fn arm_mmio(
             )?;
             Ok(ArmRun::Continue)
         }
-        terra_runtime::component::vmm::Completion::CpuOff => {
+        VcpuAction::CpuOff => {
             arm_set_registers(
                 partition,
                 vcpu,
@@ -310,7 +314,7 @@ fn arm_mmio(
             )?;
             Ok(ArmRun::Off)
         }
-        terra_runtime::component::vmm::Completion::SystemStop => {
+        VcpuAction::SystemStop => {
             arm_set_registers(
                 partition,
                 vcpu,
@@ -318,16 +322,15 @@ fn arm_mmio(
             )?;
             Ok(ArmRun::Stop)
         }
-        terra_runtime::component::vmm::Completion::Start
-        | terra_runtime::component::vmm::Completion::Reenter
-        | terra_runtime::component::vmm::Completion::MmioRead(_)
-        | terra_runtime::component::vmm::Completion::PioZero
-        | terra_runtime::component::vmm::Completion::Rdmsr(_)
-        | terra_runtime::component::vmm::Completion::MsrFault
-        | terra_runtime::component::vmm::Completion::Wrmsr
-        | terra_runtime::component::vmm::Completion::ArmRegister(_) => {
-            Err("unexpected ARM VMM completion".to_owned())
-        }
+        VcpuAction::Start
+        | VcpuAction::Reenter
+        | VcpuAction::MmioRead(_)
+        | VcpuAction::PioZero
+        | VcpuAction::Rdmsr(_)
+        | VcpuAction::MsrFault
+        | VcpuAction::Wrmsr
+        | VcpuAction::ArmRegister(_)
+        | VcpuAction::IoApicValue(_) => Err("unexpected ARM VMM completion".to_owned()),
     }
 }
 
@@ -360,14 +363,4 @@ fn arm_set_registers(
     partition
         .set_registers(vcpu, &names, &values)
         .map_err(|error| error.to_string())
-}
-
-fn inject_arm_irq(
-    partition: &crate::windows::whp::Partition,
-    irq: u32,
-    level: bool,
-) -> wasmtime::Result<()> {
-    partition
-        .request_arm64_spi(irq, level)
-        .map_err(|error| wasmtime::Error::msg(error.to_string()))
 }

@@ -19,14 +19,14 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
-use terra_io::local::{LocalListener as UnixListener, LocalStream as UnixStream};
+use terra_platform::io::local::{LocalListener as UnixListener, LocalStream as UnixStream};
 #[cfg(test)]
 use wasmtime::Store;
 use wasmtime::StoreContextMut;
 use wasmtime::component::{Accessor, Source, StreamConsumer, StreamResult};
 
 #[cfg(test)]
-const MAX_DIAGNOSTIC_FILE_BYTES: usize = terra_io::log::MAX_LOG_FILE_BYTES;
+const MAX_DIAGNOSTIC_FILE_BYTES: u64 = terra_limits::MAX_LOG_FILE_BYTES;
 const MAX_DIAGNOSTIC_BATCH_BYTES: usize = 65536;
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -43,7 +43,13 @@ impl DiagnosticSink {
             .name("guest-diagnostics".into())
             .spawn(move || {
                 let result = std::iter::from_fn(|| receiver.blocking_recv())
-                    .try_for_each(|bytes| terra_io::log::write_capped(&mut output, &bytes))
+                    .try_for_each(|bytes| {
+                        terra_platform::io::log::write_capped(
+                            &mut output,
+                            &bytes,
+                            terra_limits::MAX_LOG_FILE_BYTES,
+                        )
+                    })
                     .and_then(|()| output.flush());
                 let _ = done.send(result);
             })?;
@@ -390,7 +396,7 @@ mod tests {
         sink.finish().await.unwrap();
         assert_eq!(
             output.as_file().metadata().unwrap().len(),
-            MAX_DIAGNOSTIC_FILE_BYTES as u64
+            MAX_DIAGNOSTIC_FILE_BYTES
         );
     }
 
@@ -399,7 +405,7 @@ mod tests {
         let output = tempfile::NamedTempFile::new().unwrap();
         output
             .as_file()
-            .set_len(MAX_DIAGNOSTIC_FILE_BYTES as u64 - 1)
+            .set_len(MAX_DIAGNOSTIC_FILE_BYTES - 1)
             .unwrap();
         for _ in 0..2 {
             let file = std::fs::OpenOptions::new()
@@ -413,7 +419,7 @@ mod tests {
         }
         assert_eq!(
             output.as_file().metadata().unwrap().len(),
-            MAX_DIAGNOSTIC_FILE_BYTES as u64
+            MAX_DIAGNOSTIC_FILE_BYTES
         );
     }
 

@@ -8,10 +8,12 @@ mod aarch64;
 #[cfg(target_arch = "x86_64")]
 pub mod amd64;
 
+use crate::memory::GuestMemory;
+use crate::vm::GicConfig;
 use std::error::Error;
 use std::fmt;
 use std::mem::size_of;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use windows_sys::Win32::System::Hypervisor::{
     WHV_CAPABILITY, WHV_PARTITION_HANDLE, WHV_REGISTER_NAME, WHV_REGISTER_VALUE,
     WHvCancelRunVirtualProcessor,
@@ -51,6 +53,7 @@ impl Error for WhpError {}
 pub enum AvailabilityError {
     Api(WhpError),
     HypervisorDisabled,
+    #[cfg(target_arch = "aarch64")]
     Arm64Unsupported,
 }
 
@@ -61,6 +64,7 @@ impl fmt::Display for AvailabilityError {
             Self::HypervisorDisabled => formatter.write_str(
                 "Windows Hypervisor Platform is unavailable; enable the Windows Hypervisor Platform feature",
             ),
+            #[cfg(target_arch = "aarch64")]
             Self::Arm64Unsupported => formatter.write_str(
                 "this Windows Arm64 host needs Windows 11 24H2 or later with Windows Hypervisor Platform enabled",
             ),
@@ -74,7 +78,10 @@ impl Error for AvailabilityError {}
 pub enum PartitionError {
     Availability(AvailabilityError),
     InvalidMemorySize,
+    #[cfg(target_arch = "aarch64")]
+    InvalidGic,
     InvalidVcpu,
+    #[cfg(target_arch = "x86_64")]
     Transport,
     Api(WhpError),
 }
@@ -86,9 +93,12 @@ impl fmt::Display for PartitionError {
             Self::InvalidMemorySize => {
                 formatter.write_str("guest memory must be a nonzero multiple of 4096 bytes")
             }
+            #[cfg(target_arch = "aarch64")]
+            Self::InvalidGic => formatter.write_str("invalid ARM GIC layout"),
             Self::InvalidVcpu => {
                 formatter.write_str("virtual processor index is outside the configured partition")
             }
+            #[cfg(target_arch = "x86_64")]
             Self::Transport => formatter.write_str("VMM transport failed"),
             Self::Api(error) => error.fmt(formatter),
         }
@@ -129,31 +139,55 @@ pub fn check_available() -> Result<(), AvailabilityError> {
 /// A configured WHP partition with one contiguous guest-physical RAM range.
 pub struct Partition {
     handle: WHV_PARTITION_HANDLE,
-    memory: Arc<terra_runtime::memory::WindowsRam>,
+    memory: GuestMemory,
     vcpu_count: u32,
     mapped: bool,
     mapped_gpa: u64,
     vcpus: Mutex<Vec<u32>>,
-}
-
-impl terra_runtime::component::vmm::VirtualMachine for Partition {
-    fn memory(&self) -> wasmtime::Result<terra_runtime::memory::GuestRam> {
-        terra_runtime::memory::GuestRam::from_windows_ram(Arc::clone(&self.memory))
-            .ok_or_else(|| wasmtime::Error::msg("aliasing WHP guest RAM"))
-    }
+    #[cfg(target_arch = "aarch64")]
+    gic: GicConfig,
 }
 
 impl Partition {
+    #[must_use]
+    pub fn memory(&self) -> GuestMemory {
+        self.memory.clone()
+    }
+
+    #[must_use]
+    pub const fn vcpu_count(&self) -> u32 {
+        self.vcpu_count
+    }
+
     pub fn new(
-        memory: Arc<terra_runtime::memory::WindowsRam>,
+        memory: GuestMemory,
         vcpu_count: u32,
+        gic: Option<GicConfig>,
     ) -> Result<Self, PartitionError> {
         check_available().map_err(PartitionError::Availability)?;
-        if memory.size() == 0 || !memory.size().is_multiple_of(4096) {
+        if memory.mapped_bytes() == 0 || !memory.mapped_bytes().is_multiple_of(4096) {
             return Err(PartitionError::InvalidMemorySize);
         }
         if vcpu_count == 0 {
             return Err(PartitionError::InvalidVcpu);
+        }
+        #[cfg(target_arch = "aarch64")]
+        let gic = gic.ok_or(PartitionError::InvalidGic)?;
+        #[cfg(not(target_arch = "aarch64"))]
+        let _ = gic;
+        #[cfg(target_arch = "aarch64")]
+        if gic.distributor_size == 0
+            || gic.redistributor_size == 0
+            || gic
+                .distributor_base
+                .checked_add(gic.distributor_size)
+                .is_none()
+            || gic
+                .redistributor_base
+                .checked_add(gic.redistributor_size)
+                .is_none()
+        {
+            return Err(PartitionError::InvalidGic);
         }
         let mut handle = 0;
         // SAFETY: handle points to storage for the output partition handle.
@@ -166,6 +200,8 @@ impl Partition {
             mapped: false,
             mapped_gpa,
             vcpus: Mutex::new(Vec::new()),
+            #[cfg(target_arch = "aarch64")]
+            gic,
         };
         result(
             // SAFETY: the pre-setup partition accepts ProcessorCount as a u32 property.
@@ -182,13 +218,17 @@ impl Partition {
         partition.configure_interrupt_controller()?;
         // SAFETY: the configured partition handle is valid until Partition drops it.
         result(unsafe { WHvSetupPartition(partition.handle) }).map_err(PartitionError::Api)?;
-        // SAFETY: WindowsRam owns the page-aligned source range until the partition unmaps it.
+        let address = partition
+            .memory
+            .host_address(mapped_gpa)
+            .ok_or(PartitionError::InvalidMemorySize)?;
+        // SAFETY: GuestMemory owns the page-aligned source range until the partition unmaps it.
         result(unsafe {
             WHvMapGpaRange(
                 partition.handle,
-                partition.memory.address().cast(),
+                address.cast(),
                 partition.mapped_gpa,
-                partition.memory.size() as u64,
+                partition.memory.mapped_bytes(),
                 WHV_MAP_GPA_RANGE_FLAG_READ
                     | WHV_MAP_GPA_RANGE_FLAG_WRITE
                     | WHV_MAP_GPA_RANGE_FLAG_EXECUTE,
@@ -248,6 +288,7 @@ impl Partition {
         Ok(values.into_iter().map(|value| value.0).collect())
     }
 
+    #[cfg(any(target_arch = "aarch64", test))]
     pub fn register_u64(&self, index: u32, name: WHV_REGISTER_NAME) -> Result<u64, PartitionError> {
         let value = self.registers(index, &[name])?[0];
         // SAFETY: callers select a WHP register whose value is represented as Reg64.
@@ -301,7 +342,7 @@ impl Drop for Partition {
         }
         if self.mapped {
             // SAFETY: this is the exact GPA mapping created by Partition::new.
-            unsafe { WHvUnmapGpaRange(self.handle, self.mapped_gpa, self.memory.size() as u64) };
+            unsafe { WHvUnmapGpaRange(self.handle, self.mapped_gpa, self.memory.mapped_bytes()) };
         }
         // SAFETY: handle was returned by WHvCreatePartition and is deleted once here.
         unsafe { WHvDeletePartition(self.handle) };
@@ -318,11 +359,15 @@ pub enum RunExit {
         cpsr: u64,
         syndrome: u64,
     },
+    #[cfg(target_arch = "x86_64")]
     IoPortAccess,
+    #[cfg(target_arch = "x86_64")]
     ApicEoi(u8),
+    #[cfg(target_arch = "aarch64")]
     Reset {
         reboot: bool,
     },
+    #[cfg(target_arch = "x86_64")]
     Halt,
     Canceled,
     Other(i32),

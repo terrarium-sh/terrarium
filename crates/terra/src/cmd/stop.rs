@@ -4,8 +4,6 @@
 use crate::state::{BoxRef, Holder, VmProcess};
 use crate::sys;
 use anyhow::{Context, Result};
-#[cfg(any(windows, test))]
-use std::io::Write as _;
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -25,21 +23,13 @@ fn signal_vm(bx: &BoxRef, signal: sys::VmSignal) -> Result<Option<(VmProcess, sy
             let result = sys::signal_pid(vm.pid, vm.process_identity, sys::VmSignal::ForcedStop)?;
             return Ok(Some((vm, result)));
         }
-        return request_graceful_stop(bx).map(|()| Some((vm, sys::SignalResult::Sent)));
+        return bx
+            .request_stop()
+            .map(|()| Some((vm, sys::SignalResult::Sent)));
     }
     let result = sys::signal_pid(vm.pid, vm.process_identity, signal)
         .with_context(|| format!("signalling the VM process (pid {}) of {bx}", vm.pid))?;
     Ok(Some((vm, result)))
-}
-
-#[cfg(any(windows, test))]
-fn request_graceful_stop(bx: &BoxRef) -> Result<()> {
-    let path = bx.get_dir().join(crate::state::CONTROL_SOCKET);
-    let mut control = terra_io::local::LocalStream::connect(&path)
-        .with_context(|| format!("connecting to {bx}'s stop service"))?;
-    control
-        .write_all(&[terra_protocol::STOP_SIGNAL])
-        .with_context(|| format!("asking {bx} to stop"))
 }
 
 /// Ask the box's VM to stop, returning it for the forced kill if the grace
@@ -162,6 +152,7 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::io::Read as _;
     #[cfg(unix)]
     use std::process::{Child, Command, Stdio};
@@ -174,24 +165,6 @@ mod tests {
         let bx = BoxRef::resolve(dir, "dev").unwrap();
         std::fs::create_dir_all(bx.get_dir()).unwrap();
         (bx, home)
-    }
-
-    #[test]
-    fn graceful_stop_reaches_the_box_control_socket() {
-        let dir = tempfile::tempdir().unwrap();
-        let (bx, _home) = create_box_in(dir.path());
-        let listener =
-            terra_io::local::LocalListener::bind(bx.get_dir().join(crate::state::CONTROL_SOCKET))
-                .unwrap();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0];
-            stream.read_exact(&mut request).unwrap();
-            request
-        });
-
-        request_graceful_stop(&bx).unwrap();
-        assert_eq!(server.join().unwrap(), [terra_protocol::STOP_SIGNAL]);
     }
 
     /// A child holding the box exactly as a VM process does - on the inherited

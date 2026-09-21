@@ -12,14 +12,14 @@ use std::fs::File;
 use std::io::Write as _;
 use std::process::ExitCode;
 use std::sync::Arc;
-use terra_io::local::{LocalListener, LocalStream};
-use terra_platform::worker::WorkerInput;
+use terra_platform::io::local::{LocalListener, LocalStream};
 use terra_protocol::{
     Disk, MAX_PLAN_BYTES, MAX_PLAN_HOST_STATE_BYTES, PlanMode, Share, encode_frame_with_limit,
     to_volume_device,
 };
 use terra_runtime::TrustedArtifacts;
 use terra_runtime::component::fs::{ShareGrant, share_tag};
+use terra_runtime::worker::WorkerInput;
 
 #[allow(unsafe_code)]
 const ARTIFACTS: TrustedArtifacts = {
@@ -171,7 +171,7 @@ pub async fn run(spec: &BootSpec, bx: &BoxRef, lock: &File) -> Result<ExitCode> 
     };
 
     bx.publish_pid(lock, std::process::id(), spec.mode == PlanMode::Create);
-    let prepared = terra_platform::worker::prepare(WorkerInput {
+    let prepared = terra_runtime::worker::prepare(WorkerInput {
         component_memory_limits,
         kernel,
         boot_disk,

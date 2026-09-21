@@ -43,13 +43,7 @@ use terra_network::GuestNetworkConfig;
 use terra_protocol::{Disk, Net, Plan, PlanMode, Share, WORKLOAD_ID, WORKLOAD_USER_NAME};
 
 pub(crate) const GUEST_NETWORK: GuestNetworkConfig = GuestNetworkConfig::default();
-#[cfg(target_arch = "x86_64")]
-pub(crate) const MAX_GUEST_STORAGE_DEVICES: usize = terra_platform::machine::MAX_IO_DEVICES - 4;
-#[cfg(target_arch = "aarch64")]
-pub(crate) const MAX_GUEST_STORAGE_DEVICES: usize = terra_platform::aarch64::arm::MAX_DEVICES - 5;
-
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-pub(crate) const MAX_GUEST_STORAGE_DEVICES: usize = 0;
+pub(crate) use terra_runtime::machine::MAX_GUEST_STORAGE_DEVICES;
 
 fn read_host_timezone() -> Option<Vec<u8>> {
     #[cfg(unix)]
@@ -160,10 +154,7 @@ mod tests {
     #[test]
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     fn accepted_storage_count_fills_native_layout() {
-        #[cfg(target_arch = "aarch64")]
-        use terra_platform::aarch64::arm::build_machine_layout;
-        #[cfg(target_arch = "x86_64")]
-        use terra_platform::machine::build_machine_layout;
+        use terra_runtime::machine::build_machine_layout;
 
         for volumes in 0..=MAX_GUEST_STORAGE_DEVICES {
             let shares = MAX_GUEST_STORAGE_DEVICES - volumes;

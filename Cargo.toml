@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/terra", "crates/terra-agent", "crates/terra-protocol", "crates/terra-io", "crates/terra-runtime", "crates/terra-platform", "crates/terra-network", "crates/terra-limits", "components/vsock-device"]
+members = ["crates/terra", "crates/terra-agent", "crates/terra-protocol", "crates/terra-runtime", "crates/terra-platform", "crates/terra-network", "crates/terra-limits", "components/vsock-device"]
 exclude = ["vendor", "components", "fuzz"]
 
 [workspace.package]

@@ -1,5 +1,3 @@
-#[cfg(unix)]
-use std::path::Component;
 use std::{io, path::Path};
 
 use wasmtime_wasi::filesystem::{Dir, FsPerms, OpenMode};
@@ -17,30 +15,11 @@ pub struct ShareGrant {
 
 impl ShareGrant {
     pub fn new(root: &Path, readonly: bool) -> io::Result<Self> {
-        #[cfg(unix)]
-        {
-            Ok(Self::from_directory(
-                open_directory_without_symlinks(root)?,
-                readonly,
-                root,
-            ))
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt;
-            let mut options = std::fs::OpenOptions::new();
-            options
-                .read(true)
-                .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS);
-            let directory = options.open(root)?;
-            if !directory.metadata()?.is_dir() {
-                return Err(io::Error::other("mount source must be a directory"));
-            }
-            if read_final_path(&directory)? != root {
-                return Err(io::Error::other("mount source changed while opening it"));
-            }
-            Ok(Self::from_directory(directory, readonly, root))
-        }
+        Ok(Self::from_directory(
+            terra_platform::filesystem::open_share_root(root)?,
+            readonly,
+            root,
+        ))
     }
 
     fn from_directory(directory: std::fs::File, readonly: bool, root: &Path) -> Self {
@@ -86,56 +65,6 @@ pub fn share_notification_budgets(shares: &mut [ShareGrant]) {
         share.watch_budget = watches.clone();
         share.event_budget = budget.clone();
     }
-}
-
-#[cfg(windows)]
-#[allow(unsafe_code)]
-fn read_final_path(file: &std::fs::File) -> io::Result<std::path::PathBuf> {
-    use std::os::{windows::ffi::OsStringExt as _, windows::io::AsRawHandle as _};
-    use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
-
-    const PATH_CAPACITY: u32 = 32_768;
-    let mut path = vec![0; PATH_CAPACITY as usize];
-    // SAFETY: `path` is writable for its stated length and `file` stays open.
-    let len = unsafe {
-        GetFinalPathNameByHandleW(
-            file.as_raw_handle().cast(),
-            path.as_mut_ptr(),
-            PATH_CAPACITY,
-            0,
-        )
-    };
-    if len == 0 || len >= PATH_CAPACITY {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(std::ffi::OsString::from_wide(&path[..len as usize]).into())
-}
-
-#[cfg(unix)]
-fn open_directory_without_symlinks(root: &Path) -> io::Result<std::fs::File> {
-    use rustix::fs::{Mode, OFlags, openat};
-
-    if !root.is_absolute() {
-        return Err(io::Error::other("mount source is not an absolute path"));
-    }
-    let mut directory = std::fs::File::open("/")?;
-    for component in root.components() {
-        let Component::Normal(name) = component else {
-            if component != Component::RootDir {
-                return Err(io::Error::other("mount source is not an absolute path"));
-            }
-            continue;
-        };
-        directory = openat(
-            &directory,
-            name,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(io::Error::from)?
-        .into();
-    }
-    Ok(directory)
 }
 
 #[must_use]

@@ -1,16 +1,16 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use terra_runtime::component::vmm::StartedVcpus;
 
 const STOP_DEADLINE: Duration = Duration::from_secs(5);
 
-pub(super) struct VcpuGroup {
+pub struct VcpuGroup {
     pub(super) partition: Arc<crate::windows::whp::Partition>,
     pub(super) stop: Arc<AtomicBool>,
     threads: Vec<std::thread::JoinHandle<Result<(), String>>>,
     hard_stop: Option<fn() -> !>,
-    pub(super) on_stop: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(target_arch = "aarch64")]
+    pub(super) secondary: Option<Arc<crate::windows::aarch64::worker::ArmCpuStarts>>,
 }
 
 impl VcpuGroup {
@@ -23,29 +23,9 @@ impl VcpuGroup {
             stop: Arc::new(AtomicBool::new(false)),
             threads: Vec::new(),
             hard_stop,
-            on_stop: None,
+            #[cfg(target_arch = "aarch64")]
+            secondary: None,
         }
-    }
-
-    pub(super) fn into_started(self) -> StartedVcpus {
-        let partition = Arc::clone(&self.partition);
-        let stop = Arc::clone(&self.stop);
-        let on_stop = self.on_stop.clone();
-        let count = self.threads.len();
-        StartedVcpus::new(
-            self,
-            move || {
-                stop.store(true, Ordering::Relaxed);
-                if let Some(on_stop) = on_stop {
-                    on_stop();
-                }
-                for id in (0_u32..).take(count) {
-                    let _ = partition.cancel_vcpu(id);
-                }
-                Ok(())
-            },
-            |mut group| group.stop(),
-        )
     }
 
     pub(super) fn spawn(
@@ -62,11 +42,19 @@ impl VcpuGroup {
         Ok(())
     }
 
-    fn stop(&mut self) -> Result<Vec<Result<(), String>>, String> {
+    pub fn request_stop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(on_stop) = &self.on_stop {
-            on_stop();
+        #[cfg(target_arch = "aarch64")]
+        if let Some(secondary) = &self.secondary {
+            secondary.stop();
         }
+        for id in (0_u32..).take(self.threads.len()) {
+            let _ = self.partition.cancel_vcpu(id);
+        }
+    }
+
+    pub fn join(&mut self) -> Result<Vec<Result<(), String>>, String> {
+        self.request_stop();
         let threads = std::mem::take(&mut self.threads);
         let deadline = Instant::now() + STOP_DEADLINE;
         loop {
@@ -101,7 +89,7 @@ impl VcpuGroup {
 impl Drop for VcpuGroup {
     fn drop(&mut self) {
         if !self.threads.is_empty() {
-            let _ = self.stop();
+            let _ = self.join();
         }
     }
 }

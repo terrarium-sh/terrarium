@@ -1,7 +1,6 @@
 pub mod emulator;
 
 use super::{Partition, PartitionError, RunExit, WhpError, result};
-use std::sync::Arc;
 use windows_sys::Win32::System::Hypervisor::{
     WHV_INTERRUPT_CONTROL, WHV_REGISTER_VALUE, WHV_RUN_VP_EXIT_CONTEXT,
     WHV_X64_PENDING_INTERRUPTION_REGISTER, WHvGetCapability, WHvRegisterPendingInterruption,
@@ -61,18 +60,11 @@ fn encode_pending_invalid_opcode() -> u64 {
 }
 
 impl Partition {
-    pub fn run_vcpu(&self, index: u32) -> Result<RunExit, PartitionError> {
-        Ok(RunExit::from(self.run_vcpu_context(index)?))
-    }
-
     pub fn contains_guest_memory(&self, address: u64, len: usize) -> bool {
         let Some(len) = u64::try_from(len).ok() else {
             return false;
         };
-        let Some(memory_end) = u64::try_from(self.memory.size())
-            .ok()
-            .and_then(|size| self.mapped_gpa.checked_add(size))
-        else {
+        let Some(memory_end) = self.mapped_gpa.checked_add(self.memory.mapped_bytes()) else {
             return false;
         };
         address >= self.mapped_gpa
@@ -87,19 +79,14 @@ impl Partition {
         write: bool,
         data: &mut [u8],
     ) -> Result<(), PartitionError> {
-        let ram = terra_runtime::memory::GuestRam::from_windows_ram(Arc::clone(&self.memory))
-            .ok_or(PartitionError::InvalidMemorySize)?;
-        let memory = terra_runtime::memory::BoundedMemory::new(&ram);
         if write {
-            memory
+            self.memory
                 .write(address, data)
                 .map_err(|_| PartitionError::InvalidVcpu)
         } else {
-            let bytes = memory
-                .read(
-                    address,
-                    u64::try_from(data.len()).map_err(|_| PartitionError::InvalidVcpu)?,
-                )
+            let bytes = self
+                .memory
+                .read(address, data.len())
                 .map_err(|_| PartitionError::InvalidVcpu)?;
             data.copy_from_slice(&bytes);
             Ok(())
@@ -147,6 +134,11 @@ impl Partition {
             )
         })
         .map_err(PartitionError::Api)
+    }
+
+    #[allow(clippy::unused_self)]
+    pub fn inject_interrupt(&self, _: u32, _: bool) -> Result<(), String> {
+        Err("native interrupt lines are unavailable".to_owned())
     }
 
     pub fn request_x64_interrupt(
@@ -201,8 +193,8 @@ mod tests {
             ],
         };
         assert_eq!(input.values.as_ptr().addr() % 16, 8);
-        let ram = terra_runtime::memory::WindowsRam::allocate(2 << 20).unwrap();
-        let partition = Partition::new(ram, 1).unwrap();
+        let ram = crate::memory::GuestMemory::allocate(2 << 20).unwrap();
+        let partition = Partition::new(ram, 1, None).unwrap();
         partition.create_vcpu(0).unwrap();
         let names = [WHvX64RegisterRax, WHvX64RegisterRbx];
         partition.set_registers(0, &names, &input.values).unwrap();

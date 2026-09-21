@@ -1845,7 +1845,6 @@ dependencies = [
  "sha2 0.11.0",
  "sysinfo",
  "tempfile",
- "terra-io",
  "terra-limits",
  "terra-network",
  "terra-platform",
@@ -1876,17 +1875,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "terra-io"
-version = "0.0.1"
-dependencies = [
- "async-io",
- "tempfile",
- "tokio",
- "tokio-util",
- "uds_windows",
-]
-
-[[package]]
 name = "terra-limits"
 version = "0.0.1"
 
@@ -1900,21 +1888,18 @@ version = "0.0.1"
 dependencies = [
  "applevisor",
  "applevisor-sys",
- "flate2",
+ "async-io",
  "kvm-bindings",
  "kvm-ioctls",
  "libc",
  "log",
  "rustix",
  "tempfile",
- "terra-io",
  "terra-limits",
- "terra-network",
- "terra-protocol",
- "terra-runtime",
  "tokio",
+ "tokio-util",
+ "uds_windows",
  "vm-memory",
- "wasmtime",
  "windows-sys 0.61.2",
 ]
 
@@ -1931,16 +1916,16 @@ dependencies = [
 name = "terra-runtime"
 version = "0.0.1"
 dependencies = [
+ "flate2",
  "futures-util",
  "libc",
  "log",
  "notify",
- "rustix",
  "target-lexicon",
  "tempfile",
- "terra-io",
  "terra-limits",
  "terra-network",
+ "terra-platform",
  "terra-protocol",
  "terra-runtime",
  "terra-vsock-device",

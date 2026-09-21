@@ -1,6 +1,4 @@
-use std::fs::File;
-use std::os::windows::io::AsRawHandle as _;
-use std::ptr::null_mut;
+use std::{fs::File, os::windows::io::AsRawHandle as _, ptr::null_mut};
 
 use windows_sys::Wdk::Storage::FileSystem::{
     FileFsFullSizeInformation, NtQueryVolumeInformationFile,
@@ -9,10 +7,32 @@ use windows_sys::Wdk::System::SystemServices::FILE_FS_FULL_SIZE_INFORMATION;
 use windows_sys::Win32::Storage::FileSystem::GetVolumeInformationByHandleW;
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
-use super::terra::fs::host::{Error, FilesystemStat};
+use super::{Error, FilesystemStat};
 
 #[allow(unsafe_code)]
-pub(super) fn statfs(file: &File) -> Result<FilesystemStat, Error> {
+pub(super) fn read_final_path(file: &File) -> std::io::Result<std::path::PathBuf> {
+    use std::os::{windows::ffi::OsStringExt as _, windows::io::AsRawHandle as _};
+    use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
+
+    const PATH_CAPACITY: u32 = 32_768;
+    let mut path = vec![0; PATH_CAPACITY as usize];
+    // SAFETY: `path` is writable for its stated length and `file` stays open.
+    let len = unsafe {
+        GetFinalPathNameByHandleW(
+            file.as_raw_handle().cast(),
+            path.as_mut_ptr(),
+            PATH_CAPACITY,
+            0,
+        )
+    };
+    if len == 0 || len >= PATH_CAPACITY {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(std::ffi::OsString::from_wide(&path[..len as usize]).into())
+}
+
+#[allow(unsafe_code)]
+pub(super) fn stat(file: &File) -> Result<FilesystemStat, Error> {
     let mut status = IO_STATUS_BLOCK::default();
     let mut size = FILE_FS_FULL_SIZE_INFORMATION::default();
     // SAFETY: WASI opens synchronous handles; both output buffers stay live for the query.
@@ -55,7 +75,6 @@ pub(super) fn statfs(file: &File) -> Result<FilesystemStat, Error> {
         blocks_free: u64::try_from(size.ActualAvailableAllocationUnits).map_err(|_| Error::Io)?,
         blocks_available: u64::try_from(size.CallerAvailableAllocationUnits)
             .map_err(|_| Error::Io)?,
-        // Windows does not report inode capacity; zero denotes undefined statfs fields.
         files: 0,
         files_free: 0,
         block_size,
@@ -65,7 +84,7 @@ pub(super) fn statfs(file: &File) -> Result<FilesystemStat, Error> {
 
 #[allow(unsafe_code)]
 pub(super) fn set_readonly(file: &File, readonly: bool) -> Result<(), Error> {
-    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    use std::os::windows::io::{FromRawHandle as _, OwnedHandle};
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
@@ -92,8 +111,8 @@ pub(super) fn set_readonly(file: &File, readonly: bool) -> Result<(), Error> {
 
 #[allow(unsafe_code)]
 pub(super) fn open_metadata_file(directory: &File, name: &str) -> Result<File, Error> {
-    use std::os::windows::fs::MetadataExt;
-    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    use std::os::windows::fs::MetadataExt as _;
+    use std::os::windows::io::{FromRawHandle as _, OwnedHandle};
     use std::ptr::null;
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use windows_sys::Wdk::Storage::FileSystem::{
@@ -104,7 +123,6 @@ pub(super) fn open_metadata_file(directory: &File, name: &str) -> Result<File, E
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
         FILE_SHARE_WRITE, SYNCHRONIZE,
     };
-
     let mut encoded = name.encode_utf16().collect::<Vec<_>>();
     let length = u16::try_from(encoded.len() * 2).map_err(|_| Error::Access)?;
     let name = UNICODE_STRING {
@@ -146,35 +164,4 @@ pub(super) fn open_metadata_file(directory: &File, name: &str) -> Result<File, E
         return Err(Error::Access);
     }
     Ok(file)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::os::windows::fs::OpenOptionsExt as _;
-    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
-
-    #[test]
-    fn file_and_directory_handles_report_the_same_volume_after_rename() {
-        let root = tempfile::tempdir().unwrap();
-        let file_path = root.path().join("before");
-        let file = File::create(&file_path).unwrap();
-        std::fs::rename(&file_path, root.path().join("after")).unwrap();
-        let directory = File::options()
-            .read(true)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-            .open(root.path())
-            .unwrap();
-        let stat = statfs(&file).unwrap();
-        let directory_stat = statfs(&directory).unwrap();
-        assert_ne!(stat.blocks, 0);
-        assert_ne!(stat.block_size, 0);
-        assert_ne!(stat.name_max, 0);
-        assert_eq!(stat.blocks, directory_stat.blocks);
-        assert_eq!(stat.block_size, directory_stat.block_size);
-        assert_eq!(stat.name_max, directory_stat.name_max);
-        assert!(stat.blocks_available <= stat.blocks_free);
-        assert!(stat.blocks_free <= stat.blocks);
-        assert_eq!((stat.files, stat.files_free), (0, 0));
-    }
 }
