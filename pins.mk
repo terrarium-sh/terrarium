@@ -25,8 +25,8 @@ KERNEL_URL := https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$(KERNEL_VERSIO
 # build time; `resize2fs` ships inside the binary and is injected into the guest,
 # which grows them to the configured size. Pinned to the release tarball, not the
 # git tree: the tarball ships a generated `configure`, so no autoconf is needed.
-E2FSPROGS_VERSION := 1.47.2
-E2FSPROGS_SHA256 := 7a959221c1b1cc6e28b7d7a4e204a2ffd8ec6d8a2de4461c482b64c5f4463cca
+E2FSPROGS_VERSION := 1.47.4
+E2FSPROGS_SHA256 := da274408bebbfd13a5a2fc3cfc66e3ffff17c48534673aa67f88d49b99123b96
 E2FSPROGS_URL := https://mirrors.edge.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v$(E2FSPROGS_VERSION)/e2fsprogs-$(E2FSPROGS_VERSION).tar.gz
 
 # --- Alpine root filesystem -------------------------------------------------
