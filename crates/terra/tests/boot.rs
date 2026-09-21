@@ -1190,7 +1190,7 @@ fn attached_console_streams_hooks_before_workload_and_exit() {
 #[ignore = "boots a VM at platform CPU/storage capacity and requires a native hypervisor"]
 fn capacity_machine_vcpus_and_storage_devices() {
     const STORAGE_PER_KIND: usize = terra_runtime::machine::MAX_GUEST_STORAGE_DEVICES / 2;
-    let cpus = terra_runtime::worker::MAX_VCPUS;
+    let cpus = terra_runtime::machine::MAX_VCPUS;
     let last_cpu = cpus - 1;
     let last_mount = STORAGE_PER_KIND - 1;
     let suite = Suite::new();

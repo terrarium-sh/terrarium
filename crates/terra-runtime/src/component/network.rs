@@ -1,8 +1,11 @@
 //! Network component bindings over the box-wide MMIO router.
 
-pub mod host;
+mod authorization;
+mod bindings;
+mod host;
 mod limits;
-pub mod policy;
+
+use crate::machine::DeviceKind;
 
 #[cfg(test)]
 use std::sync::Arc;
@@ -13,23 +16,14 @@ use terra_network::{GuestNetworkConfig, PolicyHandle, PortMapping};
 use wasmtime::Store;
 use wasmtime::component::Component;
 
-use host::NetworkHost;
-
-wasmtime::component::bindgen!({
-    world: "device",
-    path: "../../components/network/wit",
-    exports: { default: async },
-    with: {
-        "terra:mmio/types@0.1.0": crate::component::vmm::bindings::types,
-    },
-});
-use exports::terra::network::api::{Config as NetworkConfig, Error as NetworkError, PublishedPort};
-use terra::mmio::types::DeviceError;
+pub(crate) use authorization::MAX_POLICY_CALLS;
+#[cfg(test)]
+pub(crate) use authorization::PolicyClient;
+use bindings::{DeviceError, NetworkComponent, NetworkConfig, NetworkError, PublishedPort};
+pub use host::{NetworkHost, network_component_linker};
 
 use crate::component::InterruptCallback;
-
-use crate::component::DeviceChannel;
-
+use crate::component::MmioDevice;
 use crate::component::device_loop::DeviceLoop;
 
 fn transport_error(error: DeviceError) -> wasmtime::Error {
@@ -67,8 +61,8 @@ async fn configure_device<T: Send + 'static>(
     linker: &wasmtime::component::Linker<T>,
     config: NetworkConfig,
     interrupt: InterruptCallback,
-) -> wasmtime::Result<(Device, DeviceLoop<NetworkError>)> {
-    let instance = Device::instantiate_async(&mut *store, component, linker)
+) -> wasmtime::Result<(NetworkComponent, DeviceLoop<NetworkError>)> {
+    let instance = NetworkComponent::instantiate_async(&mut *store, component, linker)
         .await
         .map_err(|error| error.context("network component instantiation"))?;
     let api = instance.terra_network_api();
@@ -104,7 +98,7 @@ pub(crate) async fn instantiate(
 ) -> wasmtime::Result<crate::component::StandaloneDevice> {
     let mut runtime =
         crate::box_runtime::BoxRuntime::new(engine, crate::box_runtime::store::BoxHost::new())?;
-    crate::component::vmm::mmio::initialize_test_router(&mut runtime).await?;
+    crate::component::vmm::initialize_test_vmm(&mut runtime).await?;
     let channel = register_device(
         &mut runtime,
         host,
@@ -129,7 +123,7 @@ pub fn register_device(
     port_mappings: Vec<PortMapping>,
     config: GuestNetworkConfig,
     interrupt: InterruptCallback,
-) -> wasmtime::Result<DeviceChannel> {
+) -> wasmtime::Result<MmioDevice> {
     register_device_with_host_factory(
         runtime,
         move || Ok(host),
@@ -152,10 +146,10 @@ pub fn register_device_with_host_factory(
     port_mappings: Vec<PortMapping>,
     config: GuestNetworkConfig,
     interrupt: InterruptCallback,
-) -> wasmtime::Result<DeviceChannel> {
+) -> wasmtime::Result<MmioDevice> {
     let host_service_ports = policy.host_service_ports().to_vec();
     let policy_mappings = port_mappings.clone();
-    if runtime.has_component(crate::component::vmm::bindings::machine::DeviceKind::Net) {
+    if runtime.has_component(DeviceKind::Net) {
         return Err(wasmtime::Error::msg(
             "box network component already configured",
         ));
@@ -163,13 +157,10 @@ pub fn register_device_with_host_factory(
     let config = network_config(config, host_service_ports, port_mappings);
     let child = runtime.child_factory();
     let component = component.clone();
-    runtime.grant_device_worker(
-        crate::component::vmm::bindings::machine::DeviceKind::Net,
-        async move {
-            let host = NetworkHost::new(create_host()?, policy, policy_mappings);
-            create_worker(child(host), &component, config, interrupt).await
-        },
-    )
+    runtime.grant_device_worker(DeviceKind::Net, async move {
+        let host = NetworkHost::new(create_host()?, policy, policy_mappings);
+        create_worker(child(host), &component, config, interrupt).await
+    })
 }
 
 async fn create_worker(
@@ -182,7 +173,7 @@ async fn create_worker(
     crate::component::vmm::mmio::Serve,
 )> {
     let wake = child.store.data().context.interrupt_notification();
-    let linker = crate::component::network::host::network_component_linker(child.store.engine())?;
+    let linker = network_component_linker(child.store.engine())?;
     let (instance, device_loop) =
         configure_device(&mut child.store, component, &linker, config, interrupt).await?;
     let serve = instance.terra_mmio_device().func_serve();
@@ -204,7 +195,7 @@ mod tests {
     }
 
     async fn wait_for_used(
-        channel: &DeviceChannel,
+        channel: &MmioDevice,
         memory: &crate::memory::BoundedMemory<'_>,
         expected: [u8; 2],
     ) {
@@ -259,7 +250,7 @@ mod tests {
         let mut runtime =
             crate::box_runtime::BoxRuntime::new(&engine, crate::box_runtime::store::BoxHost::new())
                 .expect("runtime");
-        crate::component::vmm::mmio::initialize_test_router(&mut runtime)
+        crate::component::vmm::initialize_test_vmm(&mut runtime)
             .await
             .expect("MMIO router");
         let host = crate::component::context::DeviceContext::with_ram(

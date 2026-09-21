@@ -4,15 +4,15 @@
 
 use std::time::Instant;
 
-use crate::arch::{KVM_MAX_CPUID_ENTRIES, setup_bsp_planned, setup_irqchip};
-use crate::kvm::{
+use super::arch::{KVM_MAX_CPUID_ENTRIES, setup_bsp_planned, setup_irqchip};
+use super::kvm::{
     KvmError, Machine, STOP_DEADLINE, park_ap, run_kernel_vcpu, spawn_configured_vcpu_ready,
 };
-use crate::machine::MAX_VCPUS;
 use crate::vm::{
     BootState, InterruptControllerConfig, InterruptMode, VcpuHandler, VcpuOutcome, VmCapabilities,
     VmConfig, VmHandle,
 };
+use terra_limits::X86_MAX_VCPUS;
 
 fn stop_timed_out(outcomes: &[Result<VcpuOutcome, KvmError>]) -> bool {
     outcomes
@@ -25,7 +25,7 @@ pub(super) fn build_cpuid(
     vcpu_count: usize,
 ) -> Result<kvm_bindings::CpuId, KvmError> {
     let vcpus = u8::try_from(vcpu_count).map_err(|_| KvmError::BadVcpuCount(vcpu_count))?;
-    if vcpu_count == 0 || vcpu_count > MAX_VCPUS {
+    if vcpu_count == 0 || vcpu_count > X86_MAX_VCPUS as usize {
         return Err(KvmError::BadVcpuCount(vcpu_count));
     }
     let mut cpuid = kvm.get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)?;
@@ -53,11 +53,11 @@ impl KvmX86Vm {
         let vcpu_count = usize::from(config.vcpus);
         if config.interrupt_controller != InterruptControllerConfig::X86
             || vcpu_count == 0
-            || vcpu_count > MAX_VCPUS
+            || vcpu_count > X86_MAX_VCPUS as usize
         {
             return Err(format!("invalid x86 KVM VM dimensions: {vcpu_count} vCPUs"));
         }
-        let kvm = crate::kvm::open().map_err(|error| format!("opening KVM: {error:?}"))?;
+        let kvm = super::kvm::open().map_err(|error| format!("opening KVM: {error:?}"))?;
         let cpuid =
             build_cpuid(&kvm, vcpu_count).map_err(|error| format!("KVM CPUID: {error:?}"))?;
         let machine = std::sync::Arc::new(
@@ -112,7 +112,7 @@ impl NativePreparedVcpus {
         vcpu_count: usize,
         hard_stop: Option<fn() -> !>,
     ) -> Result<Self, KvmError> {
-        if vcpu_count == 0 || vcpu_count > MAX_VCPUS {
+        if vcpu_count == 0 || vcpu_count > X86_MAX_VCPUS as usize {
             return Err(KvmError::BadVcpuCount(vcpu_count));
         }
         let mut group = VcpuGroup {
@@ -197,7 +197,7 @@ impl Drop for NativePreparedVcpus {
 }
 
 pub struct VcpuGroup {
-    runners: Vec<crate::kvm::VcpuHandle>,
+    runners: Vec<super::kvm::VcpuHandle>,
     hard_stop: Option<fn() -> !>,
 }
 
@@ -248,7 +248,7 @@ mod tests {
     #[test]
     #[ignore = "needs /dev/kvm"]
     fn cpuid_matches_the_fixed_vcpu_count() {
-        let kvm = crate::kvm::open().expect("open KVM");
+        let kvm = super::super::kvm::open().expect("open KVM");
         for count in [1, 2, 8, 32] {
             let cpuid = super::build_cpuid(&kvm, count).expect("native CPUID");
             let leaf = cpuid
@@ -266,7 +266,9 @@ mod tests {
 
     #[test]
     fn a_stop_timeout_requires_the_process_supervisor() {
-        assert!(super::stop_timed_out(&[Err(crate::kvm::KvmError::Timeout)]));
+        assert!(super::stop_timed_out(&[Err(
+            super::super::kvm::KvmError::Timeout
+        )]));
         assert!(!super::stop_timed_out(&[Ok(
             crate::vm::VcpuOutcome::Stopped
         )]));

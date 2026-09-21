@@ -7,8 +7,8 @@ use std::sync::{Arc, mpsc};
 use std::time::Duration;
 use std::{error, fmt};
 
+use crate::linux::runner::{PthreadPublication, install_kick_handler, unblock_kick_signal};
 use crate::memory::GuestMemory;
-use crate::runner::{PthreadPublication, install_kick_handler, unblock_kick_signal};
 use crate::vm::{
     MmioRead, MmioWrite, Msr, PioRead, PioWrite, VcpuAction, VcpuExit, VcpuHandler, VcpuOutcome,
 };

@@ -48,7 +48,7 @@ fn reply_error(reply: &[u8]) -> i32 {
 }
 
 struct Mounted {
-    channel: terra_runtime::component::DeviceChannel,
+    channel: terra_runtime::component::MmioDevice,
     ram: GuestRam,
     _runtime: BoxRuntimeHandle,
 }
@@ -77,7 +77,7 @@ async fn mount_with_resource_capacity(
     };
     let router = Component::new(&engine, support::artifacts::wasm::VMM).expect("MMIO router");
     let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
-    runtime.initialize_mmio(&router).await.expect("MMIO router");
+    runtime.initialize_vmm(&router).await.expect("MMIO router");
     let channel = terra_runtime::component::fs::register_device(
         &mut runtime,
         host,
@@ -114,7 +114,7 @@ async fn mount_with_resource_capacity(
     }
 }
 
-async fn initialize(channel: &terra_runtime::component::DeviceChannel, memory: &BoundedMemory<'_>) {
+async fn initialize(channel: &terra_runtime::component::MmioDevice, memory: &BoundedMemory<'_>) {
     let mut init = vec![0; 16];
     init[..4].copy_from_slice(&7_u32.to_le_bytes());
     init[4..8].copy_from_slice(&40_u32.to_le_bytes());
@@ -125,7 +125,7 @@ async fn initialize(channel: &terra_runtime::component::DeviceChannel, memory: &
 }
 
 async fn submit(
-    channel: &terra_runtime::component::DeviceChannel,
+    channel: &terra_runtime::component::MmioDevice,
     memory: &BoundedMemory<'_>,
     index: u16,
     request: &[u8],
@@ -169,7 +169,7 @@ async fn submit(
 }
 
 async fn submit_pair(
-    channel: &terra_runtime::component::DeviceChannel,
+    channel: &terra_runtime::component::MmioDevice,
     memory: &BoundedMemory<'_>,
     first: &[u8],
     second: &[u8],

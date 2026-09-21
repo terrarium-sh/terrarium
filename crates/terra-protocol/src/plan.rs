@@ -4,7 +4,8 @@ use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 
-use super::frames::TermSize;
+pub const MAX_PLAN_BYTES: usize = 1 << 20;
+pub const MAX_PLAN_HOST_STATE_BYTES: usize = 1024;
 
 pub const RESIZE2FS_GUEST_PATH: &str = "/terra-resize2fs";
 
@@ -36,44 +37,6 @@ fn disk_suffix(mut index: usize) -> String {
 /// `loglevel=3` keeps ext4's read-only orphan-cleanup warning off the console.
 pub const KERNEL_CMDLINE: &str = "reboot=k panic=-1 panic_print=0 quiet loglevel=3 no-kvmapf \
      root=/dev/vda rootfstype=ext4 ro init=/terra-agent";
-
-pub use crate::control::{
-    AGENT_VSOCK_PORT, CLOCK_SYNC, CLOCK_SYNC_BYTES, CONTROL_VSOCK_PORT, DIAGNOSTIC_VSOCK_PORT,
-    decode_clock_sync,
-};
-
-/// The service selected by the first host frame on an agent connection.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentService {
-    /// The workload's shared terminal: a *viewport* onto the one PTY every
-    /// client shares - no per-client process, no uid of its own.
-    Session,
-    Sync,
-    /// One `terra exec` - one connection, one PTY, one process, which is what
-    /// lets it run as root while the workload stays unprivileged.
-    Exec,
-    /// Session management, not a viewport: one ask per connection - list
-    /// the clients, or drop one. Never itself a client.
-    SessionControl,
-}
-
-pub const MAX_SERVICE_FRAME_BYTES: usize = 64;
-
-/// Signal byte for graceful shutdown. Single byte for signal-handler use.
-pub const STOP_SIGNAL: u8 = b'S';
-
-pub const DEFAULT_STOP_GRACE_SECS: u64 = 30;
-
-/// Bump when a host and a running guest agent cannot safely communicate.
-pub const AGENT_PROTOCOL_VERSION: u8 = 2;
-
-/// The first bytes the agent writes on every connection it accepts - and the
-/// host's only proof that the agent is what answered and speaks its protocol.
-///
-/// Not `0x1b`: a session's first act after this is a screen repaint, so a
-/// hello indistinguishable from the escape byte would prove nothing.
-pub const AGENT_HELLO: [u8; 2] = [b'V', AGENT_PROTOCOL_VERSION];
 
 /// Where the agent records the baked `on_create` stamp.
 pub const RECIPE_STAMP_PATH: &str = "/terra/recipe";
@@ -192,92 +155,32 @@ pub struct Plan {
     pub host_seed: Option<[u8; 32]>,
 }
 
-/// `as_root` is the `--root` flag, not the identity: the agent resolves what
-/// the command runs as, since it is the side that knows which the box is.
-/// `tty: Some(size)` asks for a PTY at that size; `None` uses pipes.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ExecRequest {
-    #[serde(deserialize_with = "deserialize_argv")]
-    pub argv: Vec<String>,
-    pub as_root: bool,
-    pub tty: Option<TermSize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workdir: Option<String>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub env: BTreeMap<String, String>,
-}
-
-fn deserialize_argv<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let argv = Vec::<String>::deserialize(deserializer)?;
-    if argv.is_empty() {
-        return Err(D::Error::custom("exec request has no command"));
-    }
-    if argv.iter().any(|arg| arg.contains('\0')) {
-        return Err(D::Error::custom(
-            "exec request arguments cannot contain NUL bytes",
-        ));
-    }
-    Ok(argv)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{encode_frame, read_frame};
 
-    #[test]
-    fn round_trip_named_agent_services() {
-        for service in [
-            AgentService::Session,
-            AgentService::Sync,
-            AgentService::Exec,
-            AgentService::SessionControl,
-        ] {
-            let name = match service {
-                AgentService::Session => "session",
-                AgentService::Sync => "sync",
-                AgentService::Exec => "exec",
-                AgentService::SessionControl => "session_control",
-            };
-            let frame = encode_frame(&service).unwrap();
-            assert_eq!(&frame[4..], format!("\"{name}\"").as_bytes());
-            assert_eq!(
-                crate::read_frame_with_limit::<AgentService>(
-                    &mut frame.as_slice(),
-                    MAX_SERVICE_FRAME_BYTES,
-                )
-                .unwrap(),
-                Some(service),
-            );
-        }
-    }
-
-    #[test]
-    fn service_selection_rejects_unknown_and_oversized_frames() {
-        let unknown = encode_frame(&"unknown_service").unwrap();
-        let oversized = u32::try_from(MAX_SERVICE_FRAME_BYTES + 1)
-            .unwrap()
-            .to_le_bytes();
-        for mut bytes in [unknown.as_slice(), oversized.as_slice()] {
-            let error =
-                crate::read_frame_with_limit::<AgentService>(&mut bytes, MAX_SERVICE_FRAME_BYTES)
-                    .unwrap_err();
-            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-        }
-    }
-
-    #[test]
-    fn agent_hello_names_the_protocol_version() {
-        assert_eq!(AGENT_HELLO, [b'V', AGENT_PROTOCOL_VERSION]);
-    }
-
     // pin WORKLOAD_USER_NAME and WORKLOAD_HOME
     #[test]
     fn match_workload_home_to_user() {
         assert_eq!(WORKLOAD_HOME, format!("/home/{WORKLOAD_USER_NAME}"));
+    }
+
+    #[test]
+    fn plan_mode_retains_its_wire_format() {
+        assert_eq!(
+            serde_json::to_string(&PlanMode::Create).unwrap(),
+            "\"Create\""
+        );
+    }
+
+    #[test]
+    fn plan_limit_rejects_the_length_before_allocating() {
+        let over_limit = u32::try_from(MAX_PLAN_BYTES + 1).unwrap();
+        let mut reader = std::io::Cursor::new(over_limit.to_le_bytes());
+        let error = crate::read_frame_with_limit::<Plan>(&mut reader, MAX_PLAN_BYTES).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(reader.position(), 4);
     }
 
     #[test]
@@ -318,15 +221,8 @@ mod tests {
                 }),
                 host_seed: Some([3; 32]),
             };
-            // Over the control connection, the frame must leave the stop signal
-            // that follows it untouched in the stream.
-            let mut stream = encode_frame(&plan).unwrap();
-            stream.push(STOP_SIGNAL);
-            let mut cursor = std::io::Cursor::new(stream);
+            let mut cursor = std::io::Cursor::new(encode_frame(&plan).unwrap());
             assert_eq!(read_frame::<Plan>(&mut cursor).unwrap(), Some(plan));
-            let mut rest = Vec::new();
-            std::io::Read::read_to_end(&mut cursor, &mut rest).unwrap();
-            assert_eq!(rest, vec![STOP_SIGNAL]);
         }
         // Optional plan fields retain their defaults when absent.
         let json_without = serde_json::json!({
@@ -362,7 +258,7 @@ mod tests {
     }
 
     #[test]
-    fn reject_invalid_network_and_exec_requests() {
+    fn reject_invalid_network_requests() {
         assert!(
             serde_json::from_value::<Net>(serde_json::json!({
                 "guest_ip": "192.0.2.2",
@@ -382,21 +278,5 @@ mod tests {
             net[field] = serde_json::json!("2001:db8::1");
             assert!(serde_json::from_value::<Net>(net).is_err());
         }
-        assert!(
-            serde_json::from_value::<ExecRequest>(serde_json::json!({
-                "argv": ["/bin/sh", "bad\0arg"],
-                "as_root": false,
-                "tty": null
-            }))
-            .is_err()
-        );
-        assert!(
-            serde_json::from_value::<ExecRequest>(serde_json::json!({
-                "argv": [],
-                "as_root": false,
-                "tty": null
-            }))
-            .is_err()
-        );
     }
 }

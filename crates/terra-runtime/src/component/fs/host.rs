@@ -1,4 +1,5 @@
 use super::ShareGrant;
+use super::bindings::wit as terra;
 use super::metadata::{get_mode, get_mode_at, open_metadata_file, set_mode, set_mode_at, statfs};
 
 use wasmtime::component::{Access, HasSelf, Resource, StreamReader};
@@ -7,30 +8,6 @@ use wasmtime_wasi::{
     filesystem::{Descriptor, Dir, OpenMode, WasiFilesystem},
     p3::bindings::filesystem::{preopens, types},
 };
-
-wasmtime::component::bindgen!({
-    world: "device",
-    path: "../../components/fs/wit",
-    exports: { default: async },
-    imports: {
- "terra:fs/host.file-events": store | trappable,
- "terra:fs/host.open-metadata-at": async | store,
- "terra:fs/host.set-mode": async | store,
- "terra:fs/host.get-mode": async | store,
- "terra:fs/host.get-mode-at": async | store,
- "terra:fs/host.set-mode-at": async | store,
- "terra:fs/host.statfs": async | store,
- },
-    with: {
-        "terra:host/memory@0.1.0": crate::component::bindings::memory,
-        "terra:host/interrupt@0.1.0": crate::component::bindings::interrupt,
-        "terra:mmio/types@0.1.0": crate::component::vmm::bindings::types,
-        "wasi:filesystem/types.descriptor": wasmtime_wasi::filesystem::Descriptor,
-    },
-});
-
-pub(crate) use Device as FsComponent;
-pub use terra::mmio::types::DeviceError as FsDeviceError;
 
 pub struct FsHost {
     pub device: crate::component::context::DeviceContext,

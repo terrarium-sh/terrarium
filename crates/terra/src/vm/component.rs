@@ -19,7 +19,7 @@ use terra_protocol::{
 };
 use terra_runtime::TrustedArtifacts;
 use terra_runtime::component::fs::{ShareGrant, share_tag};
-use terra_runtime::worker::WorkerInput;
+use terra_runtime::orchestration::VmInput;
 
 #[allow(unsafe_code)]
 const ARTIFACTS: TrustedArtifacts = {
@@ -171,7 +171,7 @@ pub async fn run(spec: &BootSpec, bx: &BoxRef, lock: &File) -> Result<ExitCode> 
     };
 
     bx.publish_pid(lock, std::process::id(), spec.mode == PlanMode::Create);
-    let prepared = terra_runtime::worker::prepare(WorkerInput {
+    let prepared = terra_runtime::orchestration::prepare(VmInput {
         component_memory_limits,
         kernel,
         boot_disk,
@@ -194,7 +194,7 @@ pub async fn run(spec: &BootSpec, bx: &BoxRef, lock: &File) -> Result<ExitCode> 
     let worker_result = match prepared {
         Ok(prepared) => {
             log::info!("component VMM prepared; starting guest CPUs and devices");
-            prepared.observation.observe(prepared.runtime.start()).await
+            prepared.run().await
         }
         Err(error) => Err(error),
     };

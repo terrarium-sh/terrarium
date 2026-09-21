@@ -179,7 +179,7 @@ async fn posted_receive_queue_drains_handshake_and_plan_without_a_second_bell() 
     let router = Component::new(&engine, support::artifacts::wasm::VMM).expect("MMIO router");
     let ram = GuestRam::new(256 * 1024).expect("RAM");
     let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
-    runtime.initialize_mmio(&router).await.expect("MMIO router");
+    runtime.initialize_vmm(&router).await.expect("MMIO router");
     let artifact = support::artifacts::trusted_artifacts().vsock();
     let channel = VsockChannel::from_trusted_artifact(
         &mut runtime,

@@ -19,7 +19,7 @@ const SATURATION_ATTEMPTS: usize = 2048;
 const MAGIC: [u8; 4] = 0x7472_6976_u32.to_le_bytes();
 
 struct RunningMemory {
-    channel: terra_runtime::component::DeviceChannel,
+    channel: terra_runtime::component::MmioDevice,
     runtime: BoxRuntimeHandle,
 }
 
@@ -38,7 +38,7 @@ fn print_samples(scenario: &str, samples: &mut [Duration]) {
     );
 }
 
-fn read_magic(channel: &terra_runtime::component::DeviceChannel) -> wasmtime::Result<()> {
+fn read_magic(channel: &terra_runtime::component::MmioDevice) -> wasmtime::Result<()> {
     let bytes = channel.read(0, 4)?;
     (bytes == MAGIC)
         .then_some(())
@@ -46,7 +46,7 @@ fn read_magic(channel: &terra_runtime::component::DeviceChannel) -> wasmtime::Re
 }
 
 fn read_error(
-    channel: &terra_runtime::component::DeviceChannel,
+    channel: &terra_runtime::component::MmioDevice,
     scenario: &str,
     error: &wasmtime::Error,
 ) -> wasmtime::Error {
@@ -58,7 +58,7 @@ fn read_error(
 }
 
 fn read_samples(
-    channel: &terra_runtime::component::DeviceChannel,
+    channel: &terra_runtime::component::MmioDevice,
     count: usize,
     scenario: &str,
 ) -> wasmtime::Result<Vec<Duration>> {
@@ -101,7 +101,7 @@ async fn start_memory() -> (Duration, RunningMemory) {
     let start = Instant::now();
     let engine = device_engine().expect("engine");
     let router = support::artifacts::trusted_artifacts()
-        .mmio()
+        .vmm()
         .deserialize(&engine)
         .expect("MMIO artifact");
     let component = support::artifacts::trusted_artifacts()
@@ -109,7 +109,7 @@ async fn start_memory() -> (Duration, RunningMemory) {
         .deserialize(&engine)
         .expect("memory artifact");
     let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
-    runtime.initialize_mmio(&router).await.expect("MMIO router");
+    runtime.initialize_vmm(&router).await.expect("MMIO router");
     let interrupt: InterruptCallback = std::sync::Arc::new(|_| Ok(()));
     let channel = terra_runtime::component::mem::register_device(
         &mut runtime,

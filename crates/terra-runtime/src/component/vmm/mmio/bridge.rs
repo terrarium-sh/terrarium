@@ -1,5 +1,6 @@
 //! Bounded host requests and shutdown for the Wasm router.
 
+use crate::machine::DeviceKind;
 use futures_util::future::BoxFuture;
 use wasmtime::component::Accessor;
 
@@ -17,11 +18,26 @@ struct BridgeReply {
     all_closed: bool,
 }
 
-pub(super) struct BridgeContext {
-    pub(super) access: Access,
-    pub(super) control: Control,
-    pub(super) devices: super::DeviceRegistry,
-    pub(super) admission: Arc<Mutex<Option<String>>>,
+pub(in crate::component::vmm) struct BridgeContext {
+    pub(in crate::component::vmm) access: Access,
+    pub(in crate::component::vmm) control: Control,
+    pub(in crate::component::vmm) devices: super::DeviceRegistry,
+    pub(in crate::component::vmm) admission: Arc<Mutex<Option<String>>>,
+}
+
+pub(in crate::component::vmm) fn create_component_loop(
+    context: BridgeContext,
+    sender: tokio::sync::mpsc::Sender<Pending>,
+    control_sender: tokio::sync::mpsc::Sender<Pending>,
+    receiver: tokio::sync::mpsc::Receiver<Pending>,
+    control_receiver: tokio::sync::mpsc::Receiver<Pending>,
+) -> crate::box_runtime::ComponentLoop {
+    Box::new(move |accessor| {
+        Box::pin(async move {
+            let _senders = (sender, control_sender);
+            run_bridge(accessor, receiver, control_receiver, context).await
+        })
+    })
 }
 
 type Operations<'a> = FuturesUnordered<BridgeOperation<'a>>;
@@ -41,11 +57,11 @@ fn complete_device(context: &BridgeContext, routed: &RoutedReply) -> wasmtime::R
     if routed.reply.error != 0 {
         device.counts.failed.fetch_add(1, Ordering::Relaxed);
         let kind = match device.kind {
-            crate::component::vmm::bindings::machine::DeviceKind::Block => "block",
-            crate::component::vmm::bindings::machine::DeviceKind::Fs => "filesystem",
-            crate::component::vmm::bindings::machine::DeviceKind::Memory => "memory",
-            crate::component::vmm::bindings::machine::DeviceKind::Vsock => "vsock",
-            crate::component::vmm::bindings::machine::DeviceKind::Net => "network",
+            DeviceKind::Block => "block",
+            DeviceKind::Fs => "filesystem",
+            DeviceKind::Memory => "memory",
+            DeviceKind::Vsock => "vsock",
+            DeviceKind::Net => "network",
         };
         return Err(wasmtime::Error::msg(format!(
             "MMIO {kind} device error {}",
@@ -129,7 +145,7 @@ async fn drain_operations<'a>(control_operations: Operations<'a>, data_operation
     }
 }
 
-pub(super) async fn run_bridge(
+async fn run_bridge(
     accessor: &Accessor<BoxHost>,
     mut receiver: tokio::sync::mpsc::Receiver<Pending>,
     mut control_receiver: tokio::sync::mpsc::Receiver<Pending>,
@@ -228,13 +244,13 @@ mod tests {
         let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
         let artifacts = crate::test_fixtures::trusted_artifacts();
         runtime
-            .initialize_mmio_artifact(&artifacts)
+            .initialize_vmm_artifact(&artifacts)
             .await
             .expect("AOT MMIO router initializes");
         runtime.configure_mmio_vcpus(2).await.expect("vCPU setup");
         assert!(runtime.configure_mmio_vcpus(33).await.is_err());
 
-        let router = runtime.mmio.as_ref().expect("router");
+        let router = runtime.vmm.as_ref().expect("router");
         let response =
             enqueue(&router.sender, &router.admission, access()).expect("unmapped request queued");
         let failure = Arc::clone(&router.failure);

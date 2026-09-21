@@ -2,102 +2,19 @@ use std::sync::Arc;
 
 use wasmtime::component::Resource;
 
-pub use super::reaper::VcpuReaper;
+use super::VcpuReaper;
 use super::{Platform, PlatformHost};
 
 use crate::box_runtime::BoxRuntime;
 use crate::box_runtime::store::BoxHost;
 use crate::component::vmm::bindings::virtualization;
-pub use crate::component::vmm::bindings::virtualization::{Architecture, Config, Error};
+use crate::component::vmm::bindings::virtualization::{Config, Error};
+use crate::machine::{Architecture, Device, DeviceKind, MachineConfig};
 pub(crate) type InitializeMachine = wasmtime::component::TypedFunc<
     (Config, Resource<Vm>, Vec<Resource<super::Vcpu>>),
     (Result<(), super::bindings::machine::Error>,),
 >;
 use crate::memory::{BoundedMemory, GuestRam};
-
-#[derive(Clone)]
-pub struct MachineConfig {
-    config: Config,
-}
-
-impl MachineConfig {
-    pub fn new(
-        architecture: Architecture,
-        ram_bytes: u64,
-        vcpus: u8,
-        devices: Vec<super::bindings::machine::Device>,
-    ) -> wasmtime::Result<Self> {
-        wasmtime::ensure!(
-            vcpus != 0
-                && usize::from(vcpus)
-                    <= match architecture {
-                        Architecture::X86 => super::MAX_VCPUS,
-                        Architecture::Arm => terra_limits::ARM_MAX_VCPUS as usize,
-                    },
-            "vCPU count outside VM grant"
-        );
-        wasmtime::ensure!(
-            ram_bytes != 0 && ram_bytes.is_multiple_of(4096),
-            "RAM size outside VM grant"
-        );
-        wasmtime::ensure!(
-            devices.len()
-                <= match architecture {
-                    Architecture::X86 => terra_limits::X86_MAX_DEVICES,
-                    Architecture::Arm => terra_limits::ARM_MAX_DEVICES,
-                },
-            "device count outside VM grant"
-        );
-        Ok(Self {
-            config: Config {
-                architecture,
-                ram_bytes,
-                vcpus,
-                devices,
-            },
-        })
-    }
-
-    #[must_use]
-    pub fn architecture(&self) -> Architecture {
-        self.config.architecture
-    }
-
-    #[must_use]
-    pub fn ram_bytes(&self) -> u64 {
-        self.config.ram_bytes
-    }
-
-    #[must_use]
-    pub fn vcpus(&self) -> u8 {
-        self.config.vcpus
-    }
-
-    #[must_use]
-    pub fn devices(&self) -> &[super::bindings::machine::Device] {
-        &self.config.devices
-    }
-
-    #[must_use]
-    pub fn is_valid_cpu(&self, id: u8) -> bool {
-        id < self.config.vcpus
-    }
-
-    pub fn device_slot(
-        &self,
-        kind: super::bindings::machine::DeviceKind,
-        ordinal: usize,
-    ) -> wasmtime::Result<u8> {
-        self.devices()
-            .iter()
-            .enumerate()
-            .filter(|(_, device)| device.kind == kind)
-            .nth(ordinal)
-            .map(|(slot, _)| u8::try_from(slot))
-            .transpose()?
-            .ok_or_else(|| wasmtime::Error::msg("interrupt device outside VM grant"))
-    }
-}
 
 pub trait VirtualMachine: Send + Sync + 'static {
     fn memory(&self) -> wasmtime::Result<GuestRam>;
@@ -132,7 +49,7 @@ impl From<GuestRam> for RamGrant {
 
 struct CreatedMachine<M> {
     machine: Arc<M>,
-    devices: Vec<super::bindings::machine::Device>,
+    devices: Vec<Device>,
 }
 
 pub struct MachineHandle<M>(Arc<CreatedMachine<M>>);
@@ -151,7 +68,7 @@ impl<M: VirtualMachine> MachineHandle<M> {
 
     pub fn bind_interrupt(
         &self,
-        kind: super::bindings::machine::DeviceKind,
+        kind: DeviceKind,
         ordinal: usize,
         inject: impl Fn(&M, u32, bool) -> wasmtime::Result<()> + Send + Sync + 'static,
     ) -> wasmtime::Result<crate::component::InterruptCallback> {
@@ -399,6 +316,26 @@ impl PlatformHost {
 }
 
 impl BoxRuntime {
+    pub(crate) async fn compose_machine(&mut self) -> wasmtime::Result<()> {
+        let machine = &self
+            .vmm
+            .as_ref()
+            .ok_or_else(|| wasmtime::Error::msg("VMM missing"))?
+            .machine;
+        tokio::time::timeout(
+            super::EXIT_TIMEOUT,
+            machine.func_compose().call_async(&mut self.store, ()),
+        )
+        .await
+        .map_err(wasmtime::Error::from)
+        .and_then(std::convert::identity)
+        .and_then(|(result,)| {
+            result.map_err(|error| {
+                wasmtime::Error::msg(format!("Wasm machine composition: {error:?}"))
+            })
+        })
+    }
+
     pub async fn attach_machine<M: VirtualMachine>(
         mut self,
         prepared: PreparedMachine<M>,
@@ -411,7 +348,7 @@ impl BoxRuntime {
         let boot_entry = boot_entry
             .ok_or_else(|| wasmtime::Error::msg("VM boot must complete before attachment"))?;
         let machine_bindings = &self
-            .mmio
+            .vmm
             .as_ref()
             .ok_or_else(|| wasmtime::Error::msg("VMM missing"))?
             .machine;
@@ -437,7 +374,7 @@ impl BoxRuntime {
         let mut native_vcpus = Vec::with_capacity(usize::from(config.vcpus()));
         let mut vcpus = Vec::with_capacity(usize::from(config.vcpus()));
         for _ in 0..config.vcpus() {
-            let (native, vcpu) = super::vcpu_channel();
+            let (native, vcpu) = super::vcpu::vcpu_channel();
             native_vcpus.push(native);
             vcpus.push(self.store.data_mut().platform.table.push_child(vcpu, &vm)?);
         }
@@ -453,7 +390,7 @@ impl BoxRuntime {
         });
         let initialized = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            initialize.call_async(&mut self.store, (config.config.clone(), vm, vcpus)),
+            initialize.call_async(&mut self.store, (config.into_component_config(), vm, vcpus)),
         )
         .await
         .map_err(wasmtime::Error::from)
@@ -504,8 +441,8 @@ mod tests {
     fn interrupt_bindings_validate_the_device_during_setup() {
         let machine = MachineHandle(Arc::new(CreatedMachine {
             machine: Arc::new(TestVm(GuestRam::new(32768).unwrap())),
-            devices: vec![super::super::bindings::machine::Device {
-                kind: super::super::bindings::machine::DeviceKind::Memory,
+            devices: vec![Device {
+                kind: DeviceKind::Memory,
                 mmio_base: 0,
                 irq: 15,
             }],
@@ -513,23 +450,15 @@ mod tests {
         let delivered = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let observed = Arc::clone(&delivered);
         let interrupt = machine
-            .bind_interrupt(
-                super::super::bindings::machine::DeviceKind::Memory,
-                0,
-                move |_, irq, level| {
-                    assert!(level);
-                    observed.store(irq, std::sync::atomic::Ordering::Relaxed);
-                    Ok(())
-                },
-            )
+            .bind_interrupt(DeviceKind::Memory, 0, move |_, irq, level| {
+                assert!(level);
+                observed.store(irq, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            })
             .unwrap();
         assert!(
             machine
-                .bind_interrupt(
-                    super::super::bindings::machine::DeviceKind::Memory,
-                    1,
-                    |_, _, _| Ok(())
-                )
+                .bind_interrupt(DeviceKind::Memory, 1, |_, _, _| Ok(()))
                 .is_err()
         );
         interrupt(true).unwrap();
@@ -579,7 +508,7 @@ mod tests {
         for architecture in [Architecture::X86, Architecture::Arm] {
             let engine = crate::engine::device_engine().unwrap();
             let vmm = crate::test_fixtures::trusted_artifacts()
-                .mmio()
+                .vmm()
                 .deserialize(&engine)
                 .unwrap();
             let boot =
@@ -591,68 +520,26 @@ mod tests {
             };
             let devices = match architecture {
                 Architecture::X86 => vec![
-                    (
-                        super::super::bindings::machine::DeviceKind::Block,
-                        0xd000_0000,
-                        11,
-                    ),
-                    (
-                        super::super::bindings::machine::DeviceKind::Block,
-                        0xd000_1000,
-                        12,
-                    ),
-                    (
-                        super::super::bindings::machine::DeviceKind::Net,
-                        0xd000_2000,
-                        13,
-                    ),
-                    (
-                        super::super::bindings::machine::DeviceKind::Vsock,
-                        0xd000_3000,
-                        14,
-                    ),
-                    (
-                        super::super::bindings::machine::DeviceKind::Memory,
-                        0xd000_4000,
-                        15,
-                    ),
+                    (DeviceKind::Block, 0xd000_0000, 11),
+                    (DeviceKind::Block, 0xd000_1000, 12),
+                    (DeviceKind::Net, 0xd000_2000, 13),
+                    (DeviceKind::Vsock, 0xd000_3000, 14),
+                    (DeviceKind::Memory, 0xd000_4000, 15),
                 ],
                 Architecture::Arm => vec![
-                    (
-                        super::super::bindings::machine::DeviceKind::Block,
-                        0x0a00_0000,
-                        16,
-                    ),
-                    (
-                        super::super::bindings::machine::DeviceKind::Block,
-                        0x0a00_0200,
-                        17,
-                    ),
-                    (
-                        super::super::bindings::machine::DeviceKind::Memory,
-                        0x0a00_0400,
-                        18,
-                    ),
-                    (
-                        super::super::bindings::machine::DeviceKind::Net,
-                        0x0a00_0600,
-                        19,
-                    ),
-                    (
-                        super::super::bindings::machine::DeviceKind::Vsock,
-                        0x0a00_0800,
-                        20,
-                    ),
+                    (DeviceKind::Block, 0x0a00_0000, 16),
+                    (DeviceKind::Block, 0x0a00_0200, 17),
+                    (DeviceKind::Memory, 0x0a00_0400, 18),
+                    (DeviceKind::Net, 0x0a00_0600, 19),
+                    (DeviceKind::Vsock, 0x0a00_0800, 20),
                 ],
             }
             .into_iter()
-            .map(
-                |(kind, mmio_base, irq)| super::super::bindings::machine::Device {
-                    kind,
-                    mmio_base,
-                    irq,
-                },
-            )
+            .map(|(kind, mmio_base, irq)| Device {
+                kind,
+                mmio_base,
+                irq,
+            })
             .collect();
             let ram = GuestRam::from_memory(GuestMemory::allocate_at(base, 8 << 20).unwrap());
             let config = MachineConfig::new(architecture, 8 << 20, 2, devices).unwrap();
@@ -697,7 +584,7 @@ mod tests {
             prepared.accept_boot(boot_entry).unwrap();
 
             let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).unwrap();
-            runtime.initialize_mmio(&vmm).await.unwrap();
+            runtime.initialize_vmm(&vmm).await.unwrap();
             let (runtime, handle) = runtime.attach_machine(prepared).await.unwrap();
             let (sender, receiver) = std::sync::mpsc::sync_channel(1);
             let (runtime, _reaper) = runtime

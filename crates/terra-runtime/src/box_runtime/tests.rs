@@ -64,7 +64,7 @@ fn empty_child_stores_cannot_bypass_box_capacity() {
     let engine = device_engine().expect("engine");
     let mut root = BoxRuntime::new(&engine, BoxHost::new()).expect("root");
     for _ in 0..MAX_BOX_COMPONENTS {
-        let child = root.new_child(crate::component::block::host::BlockHost::new(
+        let child = root.new_child(crate::component::block::BlockHost::new(
             crate::memory::GuestRam::new(4096).unwrap(),
             crate::component::block::backing::DiskGrant::Mem(
                 crate::component::block::backing::BoundedDisk::new(0, false),
@@ -90,8 +90,8 @@ fn device_workers_cannot_cross_box_memory_budgets() {
 
 #[tokio::test]
 async fn dropping_a_temporary_store_does_not_start_box_teardown() {
-    use crate::component::vmm::bindings::machine::DeviceKind;
     use crate::component::vmm::teardown::DeviceShutdown;
+    use crate::machine::DeviceKind;
 
     let engine = device_engine().expect("engine");
     let mut root = BoxRuntime::new(&engine, BoxHost::new()).expect("box");
@@ -446,15 +446,15 @@ async fn child_failure_during_shutdown_fails_the_group() {
 
 #[tokio::test]
 async fn competing_failures_publish_the_primary_error_before_native_cleanup() {
-    use crate::component::vmm::bindings::machine::DeviceKind;
     use crate::component::vmm::teardown::DeviceShutdown;
+    use crate::machine::DeviceKind;
 
     let engine = device_engine().unwrap();
     let mut root = BoxRuntime::new(&engine, BoxHost::new()).unwrap();
     let router =
         wasmtime::component::Component::new(&engine, crate::test_fixtures::wasm::VMM).unwrap();
-    root.initialize_mmio(&router).await.unwrap();
-    let failure = root.mmio.as_ref().unwrap().failure_sink();
+    root.initialize_vmm(&router).await.unwrap();
+    let failure = root.vmm.as_ref().unwrap().failure_sink();
     let outcome = root.lifecycle_notifier().subscribe();
     let (entered, started) = tokio::sync::oneshot::channel();
     let (release, released) = std::sync::mpsc::channel();
@@ -539,7 +539,7 @@ fn dropping_a_box_moves_filesystem_resource_cleanup_off_the_caller() {
     let root = tempfile::tempdir().unwrap();
     let engine = device_engine().unwrap();
     let runtime = BoxRuntime::new(&engine, BoxHost::new()).unwrap();
-    let mut filesystem = crate::component::fs::host::FsHost::new(
+    let mut filesystem = crate::component::fs::FsHost::new(
         DeviceContext::new(4096).unwrap(),
         crate::component::fs::ShareGrant::new(&root.path().canonicalize().unwrap(), false).unwrap(),
     );
@@ -568,8 +568,8 @@ fn dropping_a_box_moves_filesystem_resource_cleanup_off_the_caller() {
 
 #[tokio::test]
 async fn dropping_root_starts_cleanup_without_waiting_for_it_or_the_last_observer() {
-    use crate::component::vmm::bindings::machine::DeviceKind;
     use crate::component::vmm::teardown::DeviceShutdown;
+    use crate::machine::DeviceKind;
 
     let host = BoxHost::new();
     let teardown = host.lifecycle.native_teardown();

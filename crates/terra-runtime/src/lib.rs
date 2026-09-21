@@ -2,7 +2,7 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
-pub mod artifacts;
+mod artifacts;
 pub use artifacts::{TrustedArtifact, TrustedArtifacts};
 pub mod box_runtime;
 pub mod component;
@@ -10,10 +10,10 @@ pub mod engine;
 
 pub mod machine;
 pub mod memory;
-pub mod worker;
+pub mod orchestration;
 
-pub use terra_limits::MAX_BATCH_GUEST_COPY_BYTES as MAX_BATCH_BYTES;
-pub use terra_limits::MAX_SINGLE_GUEST_COPY_BYTES as MAX_SINGLE_BYTES;
+pub(crate) use terra_limits::MAX_BATCH_GUEST_COPY_BYTES as MAX_BATCH_BYTES;
+pub(crate) use terra_limits::MAX_SINGLE_GUEST_COPY_BYTES as MAX_SINGLE_BYTES;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;

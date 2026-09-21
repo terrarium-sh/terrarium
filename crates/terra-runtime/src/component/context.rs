@@ -8,6 +8,8 @@ use std::sync::Arc;
 use wasmtime::Engine;
 use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
+pub use crate::component::bindings::memory::Host as MemoryHost;
+
 pub const MAX_DEVICE_RESOURCES: usize = 512;
 
 /// Interrupts coalesced per window before further signals drop.
@@ -213,7 +215,7 @@ impl memory::Host for DeviceContext {
     }
 
     fn ram_bytes(&mut self) -> u64 {
-        self.ram.size()
+        self.ram.address_limit()
     }
 }
 
@@ -250,6 +252,21 @@ pub fn add_device_imports<T: Send + 'static>(
 
 #[cfg(test)]
 mod tests {
+    /// The existing ram-bytes import supplies the exclusive guest address bound
+    /// used by device transports to validate descriptor addresses, including ARM RAM.
+    #[test]
+    fn device_memory_import_preserves_nonzero_guest_address_bounds() {
+        use super::memory::Host as _;
+        let ram = crate::memory::GuestRam::from_memory(
+            terra_platform::memory::GuestMemory::allocate_at(0x4000_0000, 4096).unwrap(),
+        );
+        let mut host = super::DeviceContext::with_ram(ram);
+        assert_eq!(host.ram_bytes(), 0x4000_1000);
+        host.write(0x4000_0000, vec![7]).unwrap();
+        assert_eq!(host.read(0x4000_0000, 1).unwrap(), vec![7]);
+        assert!(host.read(0, 1).is_err());
+    }
+
     #[test]
     fn interrupt_wakeups_are_coalesced_and_device_scoped() {
         use super::interrupt::Host as _;

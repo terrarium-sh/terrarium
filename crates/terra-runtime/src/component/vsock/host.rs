@@ -17,6 +17,7 @@ use wasmtime::component::{
     StreamReader, StreamResult, VecBuffer,
 };
 
+use super::bindings::wit as terra;
 use crate::component::context::{
     DeviceContext, DeviceHost, add_device_imports, device_component_linker,
 };
@@ -77,25 +78,6 @@ pub fn vsock_component_linker<T: WasiView + AsMut<VsockDeviceHost> + 'static>(
     add_device_imports(&mut linker, |host: &mut T| host.as_mut().context())?;
     Ok(linker)
 }
-
-wasmtime::component::bindgen!({
-    world: "device",
-    path: "../../components/vsock/wit",
-    exports: { default: async },
-    imports: {
-        default: trappable,
-        "terra:vsock/host-service.[method]client.input": store | trappable,
-        "terra:vsock/host-service.listener": store | trappable,
-        "terra:vsock/host-service.plan": store | trappable,
-        "terra:vsock/host-service.stop": store | trappable,
-    },
-    with: {
-        "terra:mmio/types@0.1.0": crate::component::vmm::bindings::types,
-    },
-});
-
-pub(crate) use Device as VsockBindings;
-pub use exports::terra::vsock::api::{Error as VsockError, Event as VsockEvent};
 
 const MAX_CLIENTS: usize = 64;
 const CHUNK_BYTES: usize = 16 * 1024;
@@ -540,11 +522,9 @@ fn shutdown_write(stream: &mut WriteHalf) {
 
 #[cfg(test)]
 mod tests {
+    use super::terra::vsock::host_service::{HostClient, HostClientWithStore, HostWithStore};
     use super::*;
-    use crate::component::vsock::host::VsockDeviceHost;
-    use crate::component::vsock::host::terra::vsock::host_service::{
-        HostClient, HostClientWithStore, HostWithStore,
-    };
+    use crate::component::vsock::VsockDeviceHost;
     #[cfg(unix)]
     use std::sync::atomic::{AtomicUsize, Ordering};
 

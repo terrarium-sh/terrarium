@@ -8,7 +8,7 @@ use std::sync::{
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
-use super::host::terra::fs::host::{EventKind as FileEventKind, FileEvent};
+use super::bindings::wit::fs::host::{EventKind as FileEventKind, FileEvent};
 use notify::event::{ModifyKind, RenameMode};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 pub(crate) const MAX_PENDING_FILE_EVENTS: usize = 4096;

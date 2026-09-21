@@ -1,12 +1,12 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use terra_runtime::component::bindings::memory::Host;
 use terra_runtime::component::block::backing::BoundedDisk;
 use terra_runtime::component::block::backing::DiskError;
 use terra_runtime::component::block::backing::{BackingError, BlockBacking, FileDisk};
 use terra_runtime::component::context::DeviceContext;
 use terra_runtime::component::context::InterruptSignals;
 use terra_runtime::component::context::MAX_SIGNALS_PER_WINDOW;
+use terra_runtime::component::context::MemoryHost as _;
 use terra_runtime::memory::MemoryError;
 use terra_runtime::memory::{BoundedMemory, GuestRam};
 
@@ -117,9 +117,8 @@ fn read_allocated_bytes(file: &std::fs::File) -> u64 {
 
 #[test]
 fn boot_results_require_mapped_aligned_addresses_and_one_acceptance() {
-    use terra_runtime::component::vmm::{
-        Architecture, BootEntry, MachineConfig, PreparedMachine, VirtualMachine,
-    };
+    use terra_runtime::component::vmm::{BootEntry, PreparedMachine, VirtualMachine};
+    use terra_runtime::machine::{Architecture, MachineConfig};
     struct Machine(terra_runtime::memory::GuestRam);
     impl VirtualMachine for Machine {
         fn memory(&self) -> wasmtime::Result<terra_runtime::memory::GuestRam> {
@@ -165,8 +164,14 @@ fn ram_64k() -> GuestRam {
 fn oob_read_fails_closed() {
     let ram = ram_64k();
     let mem = BoundedMemory::new(&ram);
-    assert_eq!(mem.read(ram.size(), 1), Err(MemoryError::OutOfRange));
-    assert_eq!(mem.read(0, ram.size() + 1), Err(MemoryError::TooLarge));
+    assert_eq!(
+        mem.read(ram.address_limit(), 1),
+        Err(MemoryError::OutOfRange)
+    );
+    assert_eq!(
+        mem.read(0, ram.address_limit() + 1),
+        Err(MemoryError::TooLarge)
+    );
 }
 
 #[test]
@@ -182,6 +187,24 @@ fn round_trip_through_synthetic_ram() {
     let mem = BoundedMemory::new(&ram);
     mem.write(128, b"virtio").expect("in-range write");
     assert_eq!(mem.read(128, 6).expect("in-range read"), b"virtio");
+}
+
+#[test]
+fn nonzero_guest_base_keeps_capacity_and_address_bounds_distinct() {
+    use terra_platform::memory::GuestMemory;
+
+    let ram = GuestRam::from_memory(GuestMemory::allocate_at(0x10_0000, 0x4000).expect("RAM"));
+    let memory = BoundedMemory::new(&ram);
+
+    assert_eq!(ram.mapped_bytes(), 0x4000);
+    assert_eq!(ram.address_limit(), 0x10_4000);
+    memory.write(0x10_0000, b"RAM").expect("mapped write");
+    assert_eq!(memory.read(0x10_0000, 3).expect("mapped read"), b"RAM");
+    assert_eq!(memory.read(0, 1), Err(MemoryError::OutOfRange));
+    assert_eq!(
+        memory.read(ram.address_limit(), 1),
+        Err(MemoryError::OutOfRange)
+    );
 }
 
 #[test]
@@ -252,7 +275,7 @@ fn shared_ram_aliases_one_mapping() {
     let mem = GuestMemory::allocate(64 * 1024).expect("maps");
     let first = GuestRam::from_memory(mem.clone());
     let second = GuestRam::from_memory(mem.clone());
-    assert_eq!(first.size(), 64 * 1024);
+    assert_eq!(first.address_limit(), 64 * 1024);
     BoundedMemory::new(&first)
         .write(512, b"shared")
         .expect("writes");

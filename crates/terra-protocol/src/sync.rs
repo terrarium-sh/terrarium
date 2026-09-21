@@ -263,9 +263,9 @@ where
     Ok(path)
 }
 
-/// Validates that a relative path is safely bounded within the synchronized root.
-/// Allows `""` to represent the root itself.
-pub fn validate_relative_path(path: &str) -> Result<(), &'static str> {
+/// Validates the slash-separated relative path syntax used on the wire.
+/// Allows `""` to represent the synchronized root.
+pub fn validate_wire_relative_path(path: &str) -> Result<(), &'static str> {
     if path.is_empty() {
         return Ok(());
     }
@@ -285,12 +285,23 @@ pub fn validate_relative_path(path: &str) -> Result<(), &'static str> {
         if component == "." || component == ".." {
             return Err("relative path contains dot or dot-dot components");
         }
-        #[cfg(windows)]
-        if component.contains('\\') || component.contains(':') {
-            return Err("relative path contains invalid Windows characters");
-        }
     }
     Ok(())
+}
+
+/// Validates a wire path before using it on this host filesystem.
+pub fn validate_relative_path(path: &str) -> Result<(), &'static str> {
+    validate_wire_relative_path(path)?;
+    #[cfg(windows)]
+    if path.split('/').any(windows_path_component_is_invalid) {
+        return Err("relative path contains invalid Windows characters");
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_path_component_is_invalid(component: &str) -> bool {
+    component.contains('\\') || component.contains(':')
 }
 
 fn deserialize_sync_file_size<'de, D>(deserializer: D) -> Result<u64, D::Error>
@@ -344,6 +355,18 @@ mod tests {
         assert!(validate_relative_path("foo/../bar").is_err());
         assert!(validate_relative_path("foo\0bar").is_err());
         assert!(validate_relative_path(&"a/".repeat(3000)).is_err());
+    }
+
+    #[test]
+    fn wire_paths_are_platform_neutral() {
+        assert!(validate_wire_relative_path("dir\\name/file:name").is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn host_paths_reject_windows_separators_and_drive_markers() {
+        assert!(validate_relative_path("dir\\name").is_err());
+        assert!(validate_relative_path("drive:name").is_err());
     }
 
     #[test]

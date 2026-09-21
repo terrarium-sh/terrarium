@@ -2,10 +2,10 @@
 //! requests drive `execute` through the actual memory/disk imports.
 //! Build it first: `make component-block` (nightly `wasm32-wasip3`).
 
-use crate::component::bindings::{Completion, Range};
 use crate::component::block::backing::BoundedDisk;
 use crate::component::block::backing::DiskGrant;
-use crate::component::block::host::{BlockHost, block_component_linker};
+use crate::component::block::bindings::{Completion, Range};
+use crate::component::block::{BlockHost, block_component_linker};
 use crate::component::vmm::bindings::types::DeviceError;
 use crate::component::vmm::bindings::types::{Operation, Reply, Request};
 use crate::engine::{device_engine, precompile_component};

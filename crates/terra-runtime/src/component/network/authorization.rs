@@ -12,6 +12,8 @@ use terra_network::{NameLookup, Policy, PolicyHandle, PortMapping};
 use tokio::sync::Semaphore;
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, sockets::SocketAddrUse};
 
+pub(crate) const MAX_POLICY_CALLS: usize = 8;
+
 enum Backend {
     Async {
         metadata: PolicyHandle,

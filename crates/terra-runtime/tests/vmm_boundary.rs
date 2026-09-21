@@ -10,10 +10,10 @@ use terra_runtime::box_runtime::{BoxHost, BoxRuntime};
 use terra_runtime::component::InterruptCallback;
 use terra_runtime::component::context::{DeviceContext, device_component_linker};
 use terra_runtime::component::vmm::{
-    Architecture, BootEntry, Completion, Device, DeviceKind, Exit, MachineConfig, PreparedMachine,
-    StartedVcpus, VirtualMachine,
+    BootEntry, Completion, Exit, PreparedMachine, StartedVcpus, VirtualMachine,
 };
 use terra_runtime::engine::device_engine;
+use terra_runtime::machine::{Architecture, Device, DeviceKind, MachineConfig};
 use terra_runtime::memory::GuestRam;
 use wasmtime::{Store, component::Component};
 
@@ -47,8 +47,8 @@ async fn attach_test_machine(
         mmio_base: 0xd000_0000 + slot * 0x1000,
     })
     .collect();
-    let config =
-        MachineConfig::new(Architecture::X86, ram.size(), 1, devices).expect("machine config");
+    let config = MachineConfig::new(Architecture::X86, ram.mapped_bytes(), 1, devices)
+        .expect("machine config");
     let mut prepared = PreparedMachine::new(config, TestVm(ram));
     prepared
         .accept_boot(BootEntry {
@@ -94,7 +94,7 @@ async fn wasm_vmm_routes_native_exits_and_stops_with_the_box() {
     let ram = GuestRam::new(8 << 20).expect("RAM");
     let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
     runtime
-        .initialize_mmio(&router(&engine))
+        .initialize_vmm(&router(&engine))
         .await
         .expect("router");
     let (mut runtime, machine) = attach_test_machine(runtime, ram.clone()).await;
@@ -107,10 +107,10 @@ async fn wasm_vmm_routes_native_exits_and_stops_with_the_box() {
     )
     .expect("memory device");
     let (runtime, startup) = prepare_test_vcpus(runtime).await.expect("vCPU grants");
-    assert_eq!(machine.machine().0.size(), ram.size());
+    assert_eq!(machine.machine().0.address_limit(), ram.address_limit());
     let runtime = runtime.start();
     let vcpu = startup.into_iter().next().expect("vCPU");
-    assert_eq!(machine.machine().0.size(), ram.size());
+    assert_eq!(machine.machine().0.address_limit(), ram.address_limit());
 
     let pio = tokio::task::block_in_place(|| {
         vcpu.exchange(terra_runtime::component::vmm::platform::Exit::PioRead(
@@ -223,7 +223,7 @@ async fn vcpu_preparation_requires_a_router_and_boot() {
         let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("test setup");
         if router_present {
             runtime
-                .initialize_mmio(&router(&engine))
+                .initialize_vmm(&router(&engine))
                 .await
                 .expect("test setup");
         }
@@ -231,7 +231,7 @@ async fn vcpu_preparation_requires_a_router_and_boot() {
     }
     let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("test setup");
     runtime
-        .initialize_mmio(&router(&engine))
+        .initialize_vmm(&router(&engine))
         .await
         .expect("test setup");
     let (runtime, _) =
@@ -259,7 +259,7 @@ async fn failed_startup_disconnects_native_vcpus() {
     let engine = device_engine().expect("engine");
     let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
     runtime
-        .initialize_mmio(&router(&engine))
+        .initialize_vmm(&router(&engine))
         .await
         .expect("router");
     let (runtime, _) = attach_test_machine(runtime, GuestRam::new(8 << 20).expect("RAM")).await;
@@ -283,14 +283,13 @@ async fn failed_startup_disconnects_native_vcpus() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn vcpu_failure_preserves_teardown_order_before_runtime_join() {
-    use terra_runtime::component::vmm::DeviceKind;
     use terra_runtime::component::vmm::lifecycle::Outcome;
     use terra_runtime::component::vmm::teardown::DeviceShutdown;
 
     let engine = device_engine().expect("engine");
     let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
     runtime
-        .initialize_mmio(&router(&engine))
+        .initialize_vmm(&router(&engine))
         .await
         .expect("router");
     let (mut runtime, _) = attach_test_machine(runtime, GuestRam::new(8 << 20).expect("RAM")).await;
@@ -365,7 +364,6 @@ async fn vcpu_failure_preserves_teardown_order_before_runtime_join() {
 #[allow(clippy::too_many_lines)]
 async fn wasi_requests_cpu_stop_before_publishing_terminal_outcomes() {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use terra_runtime::component::vmm::DeviceKind;
     use terra_runtime::component::vmm::lifecycle::{Event, Outcome};
     use terra_runtime::component::vmm::teardown::DeviceShutdown;
 
@@ -377,7 +375,7 @@ async fn wasi_requests_cpu_stop_before_publishing_terminal_outcomes() {
     ] {
         let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
         runtime
-            .initialize_mmio(&router(&engine))
+            .initialize_vmm(&router(&engine))
             .await
             .expect("router");
         let (mut runtime, machine) =
@@ -423,7 +421,7 @@ async fn wasi_requests_cpu_stop_before_publishing_terminal_outcomes() {
         let live_machine = machine.clone();
         runtime
             .grant_interrupt_shutdown(async move {
-                assert!(live_machine.machine().0.size() > 0);
+                assert!(live_machine.machine().0.address_limit() > 0);
                 assert_eq!(closed_devices.lock().expect("close observer").len(), 5);
                 released_interrupts.fetch_add(1, Ordering::SeqCst);
                 Ok(())
@@ -485,7 +483,7 @@ async fn wasi_requests_cpu_stop_before_publishing_terminal_outcomes() {
             .expect("lifecycle outcome");
         assert_eq!(*outcome.borrow_and_update(), Some(expected));
         assert!(
-            machine.machine().0.size() > 0,
+            machine.machine().0.address_limit() > 0,
             "native handles retain the VM through cleanup"
         );
         assert!(machine.ram().resolve().is_ok());
@@ -529,13 +527,13 @@ async fn deferred_device_failure_prevents_cpu_launch() {
     let ram = GuestRam::new(8 << 20).expect("RAM");
     let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
     runtime
-        .initialize_mmio(&router(&engine))
+        .initialize_vmm(&router(&engine))
         .await
         .expect("router");
     let (mut runtime, _) = attach_test_machine(runtime, ram.clone()).await;
     let _channel = terra_runtime::component::block::register_device(
         &mut runtime,
-        terra_runtime::component::block::host::BlockHost::new(
+        terra_runtime::component::block::BlockHost::new(
             ram,
             terra_runtime::component::block::backing::DiskGrant::Mem(
                 terra_runtime::component::block::backing::BoundedDisk::new(0, false),
@@ -578,14 +576,14 @@ async fn wasi_composes_multiple_deferred_workers_with_their_final_mappings() {
     let ram = GuestRam::new(8 << 20).expect("RAM");
     let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
     runtime
-        .initialize_mmio(&router(&engine))
+        .initialize_vmm(&router(&engine))
         .await
         .expect("router");
     let (mut runtime, _) = attach_test_machine(runtime, ram.clone()).await;
     let block = Component::new(&engine, support::artifacts::wasm::BLOCK).expect("block component");
     let mut channels = Vec::new();
     for bytes in [4096, 8192, 12288] {
-        let host = terra_runtime::component::block::host::BlockHost::new(
+        let host = terra_runtime::component::block::BlockHost::new(
             ram.clone(),
             DiskGrant::Mem(BoundedDisk::new(bytes, false)),
         );
@@ -629,14 +627,13 @@ async fn wasi_composes_multiple_deferred_workers_with_their_final_mappings() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::too_many_lines)]
 async fn wasi_lifecycle_closes_a_device_through_the_running_mmio_bridge() {
-    use terra_runtime::component::vmm::DeviceKind;
     use terra_runtime::component::vmm::lifecycle::Outcome;
 
     let engine = device_engine().expect("engine");
     let ram = GuestRam::new(8 << 20).expect("RAM");
     let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
     runtime
-        .initialize_mmio(&router(&engine))
+        .initialize_vmm(&router(&engine))
         .await
         .expect("router");
     let (mut runtime, _) = attach_test_machine(runtime, ram.clone()).await;
@@ -712,12 +709,10 @@ async fn wasi_lifecycle_closes_a_device_through_the_running_mmio_bridge() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wasi_irq_lines_drain_assertions_before_vm_release() {
-    use terra_runtime::component::vmm::DeviceKind;
-
     let engine = device_engine().expect("engine");
     let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
     runtime
-        .initialize_mmio(&router(&engine))
+        .initialize_vmm(&router(&engine))
         .await
         .expect("router");
     let ram = GuestRam::new(8 << 20).expect("RAM");
@@ -790,7 +785,7 @@ async fn failed_native_reaping_retains_vm_and_dependent_cleanup() {
     let engine = device_engine().expect("engine");
     let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
     runtime
-        .initialize_mmio(&router(&engine))
+        .initialize_vmm(&router(&engine))
         .await
         .expect("router");
     let (mut runtime, machine) =

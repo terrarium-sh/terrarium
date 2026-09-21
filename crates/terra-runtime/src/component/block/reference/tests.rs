@@ -120,7 +120,7 @@ fn block_read_write_round_trip() {
     mem.write(BLK_DATA, &[0xABu8; 512]).expect("payload fits");
     write_blk_hdr(&mem, blk::VIRTIO_BLK_T_OUT, 3);
     let written = dev
-        .execute(&mem, &out_chain_1sector(), 0, ram.size(), 0)
+        .execute(&mem, &out_chain_1sector(), 0, ram.address_limit(), 0)
         .expect("write completes");
     assert_eq!(written.status, STATUS_OK);
     assert_eq!(written.used_len, 1);
@@ -128,7 +128,7 @@ fn block_read_write_round_trip() {
     mem.write(BLK_DATA, &[0u8; 512]).expect("clear buffer");
     write_blk_hdr(&mem, blk::VIRTIO_BLK_T_IN, 3);
     let read = dev
-        .execute(&mem, &in_chain_1sector(), 0, ram.size(), 0)
+        .execute(&mem, &in_chain_1sector(), 0, ram.address_limit(), 0)
         .expect("read completes");
     assert_eq!(read.status, STATUS_OK);
     assert_eq!(read.used_len, 512 + 1);
@@ -143,12 +143,12 @@ fn block_readonly_rejects_writes() {
     mem.write(BLK_DATA, &[0xABu8; 512]).expect("payload fits");
     write_blk_hdr(&mem, blk::VIRTIO_BLK_T_OUT, 0);
     let written = dev
-        .execute(&mem, &out_chain_1sector(), 0, ram.size(), 0)
+        .execute(&mem, &out_chain_1sector(), 0, ram.address_limit(), 0)
         .expect("well-formed request still completes");
     assert_eq!(written.status, STATUS_IOERR);
     assert_eq!(status_byte(&mem), STATUS_IOERR);
     write_blk_hdr(&mem, blk::VIRTIO_BLK_T_IN, 0);
-    dev.execute(&mem, &in_chain_1sector(), 0, ram.size(), 0)
+    dev.execute(&mem, &in_chain_1sector(), 0, ram.address_limit(), 0)
         .expect("read completes");
     assert_eq!(mem.read(BLK_DATA, 512).expect("read back"), [0u8; 512]);
 }
@@ -160,13 +160,13 @@ fn block_oob_and_overflow_are_ioerr_not_panic() {
     let mut dev = BlockDevice::new(8 * 512, false, b"terra-vda");
     write_blk_hdr(&mem, blk::VIRTIO_BLK_T_IN, 8);
     let past_end = dev
-        .execute(&mem, &in_chain_1sector(), 0, ram.size(), 0)
+        .execute(&mem, &in_chain_1sector(), 0, ram.address_limit(), 0)
         .expect("completes with error status");
     assert_eq!(past_end.status, STATUS_IOERR);
     assert_eq!(status_byte(&mem), STATUS_IOERR);
     write_blk_hdr(&mem, blk::VIRTIO_BLK_T_IN, u64::MAX);
     let overflow = dev
-        .execute(&mem, &in_chain_1sector(), 0, ram.size(), 0)
+        .execute(&mem, &in_chain_1sector(), 0, ram.address_limit(), 0)
         .expect("sector overflow completes");
     assert_eq!(overflow.status, STATUS_IOERR);
 }
@@ -185,7 +185,7 @@ fn block_unsupported_types_get_unsupp() {
     ] {
         write_blk_hdr(&mem, request_type, 0);
         let completion = dev
-            .execute(&mem, &out_chain_1sector(), 0, ram.size(), 0)
+            .execute(&mem, &out_chain_1sector(), 0, ram.address_limit(), 0)
             .expect("unsupported still completes");
         assert_eq!(completion.status, STATUS_UNSUPP);
         assert_eq!(status_byte(&mem), STATUS_UNSUPP);
@@ -204,18 +204,18 @@ fn block_flush_and_identify() {
         Descriptor::writable(BLK_STATUS, 1, None),
     ];
     let flushed = dev
-        .execute(&mem, &bare, 0, ram.size(), 0)
+        .execute(&mem, &bare, 0, ram.address_limit(), 0)
         .expect("flush completes");
     assert_eq!(flushed.status, STATUS_OK);
     assert_eq!(flushed.used_len, 1);
     write_blk_hdr(&mem, blk::VIRTIO_BLK_T_FLUSH, 0);
     assert_eq!(
-        dev.execute(&mem, &out_chain_1sector(), 0, ram.size(), 0),
+        dev.execute(&mem, &out_chain_1sector(), 0, ram.address_limit(), 0),
         Err(BlkError::Malformed)
     );
     write_blk_hdr(&mem, blk::VIRTIO_BLK_T_GET_ID, 0);
     let identified = dev
-        .execute(&mem, &in_chain_1sector(), 0, ram.size(), 0)
+        .execute(&mem, &in_chain_1sector(), 0, ram.address_limit(), 0)
         .expect("identify completes");
     assert_eq!(identified.status, STATUS_OK);
     assert_eq!(
@@ -239,12 +239,12 @@ fn block_malformed_chains_write_no_completion() {
         Descriptor::writable(BLK_STATUS, 1, None),
     ];
     assert_eq!(
-        dev.execute(&mem, &short_hdr, 0, ram.size(), 0),
+        dev.execute(&mem, &short_hdr, 0, ram.address_limit(), 0),
         Err(BlkError::Malformed)
     );
     let no_status = vec![Descriptor::readable(BLK_HDR, 16, None)];
     assert_eq!(
-        dev.execute(&mem, &no_status, 0, ram.size(), 0),
+        dev.execute(&mem, &no_status, 0, ram.address_limit(), 0),
         Err(BlkError::Malformed)
     );
     let mixed = vec![
@@ -254,7 +254,7 @@ fn block_malformed_chains_write_no_completion() {
         Descriptor::writable(BLK_STATUS, 1, None),
     ];
     assert_eq!(
-        dev.execute(&mem, &mixed, 0, ram.size(), 0),
+        dev.execute(&mem, &mixed, 0, ram.address_limit(), 0),
         Err(BlkError::Malformed)
     );
     let wrong_dir = vec![
@@ -264,7 +264,7 @@ fn block_malformed_chains_write_no_completion() {
     ];
     write_blk_hdr(&mem, blk::VIRTIO_BLK_T_IN, 0);
     assert_eq!(
-        dev.execute(&mem, &wrong_dir, 0, ram.size(), 0),
+        dev.execute(&mem, &wrong_dir, 0, ram.address_limit(), 0),
         Err(BlkError::Malformed)
     );
     assert_eq!(status_byte(&mem), 0);
@@ -275,7 +275,7 @@ fn block_malformed_chains_write_no_completion() {
         Descriptor::writable(BLK_STATUS, 1, None),
     ];
     let partial = dev
-        .execute(&mem, &ragged, 0, ram.size(), 0)
+        .execute(&mem, &ragged, 0, ram.address_limit(), 0)
         .expect("ragged length still completes");
     assert_eq!(partial.status, STATUS_IOERR);
     assert_eq!(status_byte(&mem), STATUS_IOERR);
@@ -297,7 +297,7 @@ fn block_oversized_transfers_rejected() {
     }
     flood.push(Descriptor::writable(BLK_STATUS, 1, None));
     assert_eq!(
-        dev.execute(&mem, &flood, 0, ram.size(), 0),
+        dev.execute(&mem, &flood, 0, ram.address_limit(), 0),
         Err(BlkError::Malformed)
     );
     write_blk_hdr(&mem, blk::VIRTIO_BLK_T_OUT, 0);
@@ -307,7 +307,7 @@ fn block_oversized_transfers_rejected() {
         Descriptor::writable(BLK_STATUS, 1, None),
     ];
     assert_eq!(
-        dev.execute(&mem, &wide, 0, ram.size(), 0),
+        dev.execute(&mem, &wide, 0, ram.address_limit(), 0),
         Err(BlkError::Malformed)
     );
 }
@@ -319,7 +319,7 @@ fn block_reset_fences_stale_completions() {
     let mut dev = BlockDevice::new(8 * 512, false, b"terra-vda");
     mem.write(BLK_DATA, &[0xABu8; 512]).expect("payload fits");
     write_blk_hdr(&mem, blk::VIRTIO_BLK_T_OUT, 0);
-    dev.execute(&mem, &out_chain_1sector(), 0, ram.size(), 0)
+    dev.execute(&mem, &out_chain_1sector(), 0, ram.address_limit(), 0)
         .expect("write completes");
     dev.reset();
     assert_eq!(dev.epoch(), 1);
@@ -328,16 +328,16 @@ fn block_reset_fences_stale_completions() {
     mem.write(BLK_DATA, &[0xCDu8; 512])
         .expect("new payload fits");
     assert_eq!(
-        dev.execute(&mem, &out_chain_1sector(), 0, ram.size(), 0),
+        dev.execute(&mem, &out_chain_1sector(), 0, ram.address_limit(), 0),
         Err(BlkError::Stale)
     );
     assert_eq!(status_byte(&mem), 0);
-    dev.execute(&mem, &out_chain_1sector(), 0, ram.size(), 1)
+    dev.execute(&mem, &out_chain_1sector(), 0, ram.address_limit(), 1)
         .expect("current epoch works");
     assert_eq!(status_byte(&mem), STATUS_OK);
     mem.write(BLK_DATA, &[0u8; 512]).expect("clear buffer");
     write_blk_hdr(&mem, blk::VIRTIO_BLK_T_IN, 0);
-    dev.execute(&mem, &in_chain_1sector(), 0, ram.size(), 1)
+    dev.execute(&mem, &in_chain_1sector(), 0, ram.address_limit(), 1)
         .expect("read completes");
     assert_eq!(mem.read(BLK_DATA, 512).expect("read back"), [0xABu8; 512]);
 }
@@ -381,7 +381,7 @@ mod file_backend {
         {
             let mut dev = file_device(file.path(), false);
             let written = dev
-                .execute(&mem, &out_chain_1sector(), 0, ram.size(), 0)
+                .execute(&mem, &out_chain_1sector(), 0, ram.address_limit(), 0)
                 .expect("write completes");
             assert_eq!(written.status, STATUS_OK);
             assert_eq!(status_byte(&mem), STATUS_OK);
@@ -390,13 +390,13 @@ mod file_backend {
                 super::Descriptor::readable(BLK_HDR, 16, Some(1)),
                 super::Descriptor::writable(BLK_STATUS, 1, None),
             ];
-            dev.execute(&mem, &bare, 0, ram.size(), 0)
+            dev.execute(&mem, &bare, 0, ram.address_limit(), 0)
                 .expect("flush completes");
         }
         let mut dev = file_device(file.path(), false);
         mem.write(BLK_DATA, &[0u8; 512]).expect("clear buffer");
         write_blk_hdr(&mem, blk::VIRTIO_BLK_T_IN, 3);
-        dev.execute(&mem, &in_chain_1sector(), 0, ram.size(), 0)
+        dev.execute(&mem, &in_chain_1sector(), 0, ram.address_limit(), 0)
             .expect("read completes");
         assert_eq!(mem.read(BLK_DATA, 512).expect("read back"), [0xABu8; 512]);
     }
@@ -410,7 +410,7 @@ mod file_backend {
         mem.write(BLK_DATA, &[0xABu8; 512]).expect("payload fits");
         write_blk_hdr(&mem, blk::VIRTIO_BLK_T_OUT, 4);
         let past_end = dev
-            .execute(&mem, &out_chain_1sector(), 0, ram.size(), 0)
+            .execute(&mem, &out_chain_1sector(), 0, ram.address_limit(), 0)
             .expect("completes with error status");
         assert_eq!(past_end.status, STATUS_IOERR);
         assert_eq!(
@@ -429,13 +429,13 @@ mod file_backend {
         mem.write(BLK_DATA, &[0xABu8; 512]).expect("payload fits");
         write_blk_hdr(&mem, blk::VIRTIO_BLK_T_OUT, 0);
         let written = dev
-            .execute(&mem, &out_chain_1sector(), 0, ram.size(), 0)
+            .execute(&mem, &out_chain_1sector(), 0, ram.address_limit(), 0)
             .expect("well-formed request still completes");
         assert_eq!(written.status, STATUS_IOERR);
         let raw = std::fs::read(file.path()).expect("image readable");
         assert_eq!(&raw[..512], &[0u8; 512]);
         write_blk_hdr(&mem, blk::VIRTIO_BLK_T_IN, 0);
-        dev.execute(&mem, &in_chain_1sector(), 0, ram.size(), 0)
+        dev.execute(&mem, &in_chain_1sector(), 0, ram.address_limit(), 0)
             .expect("read completes");
     }
 
@@ -472,7 +472,7 @@ mod file_backend {
         mem.write(BLK_DATA, &[0xABu8; 512]).expect("payload fits");
         write_blk_hdr(&mem, blk::VIRTIO_BLK_T_OUT, 0);
         let written = dev
-            .execute(&mem, &out_chain_1sector(), 0, ram.size(), 0)
+            .execute(&mem, &out_chain_1sector(), 0, ram.address_limit(), 0)
             .expect("completes with error status");
         assert_eq!(written.status, STATUS_IOERR);
         write_blk_hdr(&mem, blk::VIRTIO_BLK_T_FLUSH, 0);
@@ -481,7 +481,7 @@ mod file_backend {
             super::Descriptor::writable(BLK_STATUS, 1, None),
         ];
         let flushed = dev
-            .execute(&mem, &bare, 0, ram.size(), 0)
+            .execute(&mem, &bare, 0, ram.address_limit(), 0)
             .expect("flush completes");
         assert_eq!(flushed.status, STATUS_IOERR);
     }

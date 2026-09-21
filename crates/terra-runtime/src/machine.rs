@@ -1,6 +1,116 @@
-//! Fixed Terra guest machine layouts.
+//! Guest machine layouts, validated configuration, and native VM configuration.
 
-pub use crate::component::vmm::{Architecture, Device, DeviceKind};
+pub use crate::component::vmm::bindings::machine::{Device, DeviceKind};
+pub use crate::component::vmm::bindings::virtualization::Architecture;
+use crate::component::vmm::bindings::virtualization::Config;
+
+#[derive(Clone)]
+pub struct MachineConfig {
+    config: Config,
+}
+
+impl MachineConfig {
+    pub fn new(
+        architecture: Architecture,
+        ram_bytes: u64,
+        vcpus: u8,
+        devices: Vec<Device>,
+    ) -> wasmtime::Result<Self> {
+        wasmtime::ensure!(
+            vcpus != 0
+                && usize::from(vcpus)
+                    <= match architecture {
+                        Architecture::X86 => terra_limits::X86_MAX_VCPUS as usize,
+                        Architecture::Arm => terra_limits::ARM_MAX_VCPUS as usize,
+                    },
+            "vCPU count outside VM grant"
+        );
+        wasmtime::ensure!(
+            ram_bytes != 0 && ram_bytes.is_multiple_of(4096),
+            "RAM size outside VM grant"
+        );
+        wasmtime::ensure!(
+            devices.len()
+                <= match architecture {
+                    Architecture::X86 => terra_limits::X86_MAX_DEVICES,
+                    Architecture::Arm => terra_limits::ARM_MAX_DEVICES,
+                },
+            "device count outside VM grant"
+        );
+        Ok(Self {
+            config: Config {
+                architecture,
+                ram_bytes,
+                vcpus,
+                devices,
+            },
+        })
+    }
+
+    #[must_use]
+    pub fn architecture(&self) -> Architecture {
+        self.config.architecture
+    }
+
+    #[must_use]
+    pub fn ram_bytes(&self) -> u64 {
+        self.config.ram_bytes
+    }
+
+    #[must_use]
+    pub fn vcpus(&self) -> u8 {
+        self.config.vcpus
+    }
+
+    #[must_use]
+    pub fn devices(&self) -> &[Device] {
+        &self.config.devices
+    }
+
+    #[must_use]
+    pub(crate) fn is_valid_cpu(&self, id: u8) -> bool {
+        id < self.config.vcpus
+    }
+
+    pub(crate) fn device_slot(&self, kind: DeviceKind, ordinal: usize) -> wasmtime::Result<u8> {
+        self.devices()
+            .iter()
+            .enumerate()
+            .filter(|(_, device)| device.kind == kind)
+            .nth(ordinal)
+            .map(|(slot, _)| u8::try_from(slot))
+            .transpose()?
+            .ok_or_else(|| wasmtime::Error::msg("interrupt device outside VM grant"))
+    }
+
+    #[must_use]
+    pub(crate) fn to_native_config(&self) -> terra_platform::vm::VmConfig {
+        use terra_platform::vm::{GicConfig, InterruptControllerConfig, VmConfig};
+
+        VmConfig {
+            ram_base: match self.architecture() {
+                Architecture::X86 => 0,
+                Architecture::Arm => terra_limits::ARM_RAM_BASE,
+            },
+            ram_bytes: self.ram_bytes(),
+            vcpus: self.vcpus(),
+            interrupt_controller: match self.architecture() {
+                Architecture::X86 => InterruptControllerConfig::X86,
+                Architecture::Arm => InterruptControllerConfig::Arm(GicConfig {
+                    distributor_base: terra_limits::ARM_GIC_DIST_BASE,
+                    distributor_size: terra_limits::ARM_GIC_DIST_SIZE,
+                    redistributor_base: terra_limits::ARM_GIC_REDIST_BASE,
+                    redistributor_size: terra_limits::ARM_GIC_REDIST_SIZE,
+                }),
+            },
+            irq_routes: self.devices().iter().map(|device| device.irq).collect(),
+        }
+    }
+
+    pub(crate) fn into_component_config(self) -> Config {
+        self.config
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Layout {
@@ -25,11 +135,8 @@ impl Layout {
         &self.devices
     }
 
-    pub fn machine_config(
-        &self,
-        vcpus: usize,
-    ) -> wasmtime::Result<crate::component::vmm::MachineConfig> {
-        crate::component::vmm::MachineConfig::new(
+    pub fn to_machine_config(&self, vcpus: usize) -> wasmtime::Result<MachineConfig> {
+        MachineConfig::new(
             self.architecture,
             self.ram_size,
             u8::try_from(vcpus)?,
@@ -46,6 +153,12 @@ pub enum LayoutError {
     TooManyDevices,
     Overlap,
 }
+
+pub const MAX_VCPUS: usize = if cfg!(target_arch = "aarch64") {
+    terra_limits::ARM_MAX_VCPUS as usize
+} else {
+    terra_limits::X86_MAX_VCPUS as usize
+};
 
 #[cfg(target_arch = "x86_64")]
 pub const MAX_GUEST_STORAGE_DEVICES: usize = terra_limits::X86_MAX_DEVICES - 5;
@@ -191,6 +304,40 @@ fn arm_layout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_configuration_preserves_the_machine_layout() {
+        use terra_platform::vm::{GicConfig, InterruptControllerConfig, VmConfig};
+
+        for architecture in [Architecture::X86, Architecture::Arm] {
+            let layout = build_machine_layout_for(architecture, 8 << 20, 2, 1).unwrap();
+            let config = layout.to_machine_config(2).unwrap();
+            let expected = VmConfig {
+                ram_base: match architecture {
+                    Architecture::X86 => 0,
+                    Architecture::Arm => terra_limits::ARM_RAM_BASE,
+                },
+                ram_bytes: 8 << 20,
+                vcpus: 2,
+                interrupt_controller: match architecture {
+                    Architecture::X86 => InterruptControllerConfig::X86,
+                    Architecture::Arm => InterruptControllerConfig::Arm(GicConfig {
+                        distributor_base: terra_limits::ARM_GIC_DIST_BASE,
+                        distributor_size: terra_limits::ARM_GIC_DIST_SIZE,
+                        redistributor_base: terra_limits::ARM_GIC_REDIST_BASE,
+                        redistributor_size: terra_limits::ARM_GIC_REDIST_SIZE,
+                    }),
+                },
+                irq_routes: layout.devices().iter().map(|device| device.irq).collect(),
+            };
+            assert_eq!(config.to_native_config(), expected);
+            let component = config.into_component_config();
+            assert_eq!(component.architecture, architecture);
+            assert_eq!(component.ram_bytes, expected.ram_bytes);
+            assert_eq!(component.vcpus, expected.vcpus);
+            assert_eq!(component.devices, layout.devices());
+        }
+    }
 
     #[test]
     fn arm_machine_has_fixed_devices() {

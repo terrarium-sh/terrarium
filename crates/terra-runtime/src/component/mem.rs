@@ -1,6 +1,9 @@
 //! Memory component bindings over the box-wide MMIO router.
 
-pub mod host;
+mod bindings;
+mod host;
+
+use crate::machine::DeviceKind;
 
 #[cfg(test)]
 use std::sync::Arc;
@@ -11,12 +14,11 @@ use crate::component::context::DeviceContext;
 use wasmtime::Store;
 use wasmtime::component::Component;
 
-use crate::component::mem::host::{MemComponent, MemDeviceError, mem_component_linker};
+use bindings::{MemComponent, MemDeviceError};
+pub use host::mem_component_linker;
 
 use crate::component::InterruptCallback;
-
-use crate::component::DeviceChannel;
-
+use crate::component::MmioDevice;
 use crate::component::device_loop::DeviceLoop;
 
 fn transport_error(operation: &str, error: MemDeviceError) -> wasmtime::Error {
@@ -50,7 +52,7 @@ pub(crate) async fn instantiate(
 ) -> wasmtime::Result<crate::component::StandaloneDevice> {
     let mut runtime =
         crate::box_runtime::BoxRuntime::new(engine, crate::box_runtime::store::BoxHost::new())?;
-    crate::component::vmm::mmio::initialize_test_router(&mut runtime).await?;
+    crate::component::vmm::initialize_test_vmm(&mut runtime).await?;
     let channel = register_device(&mut runtime, host, component, interrupt)?;
     Ok(crate::component::StandaloneDevice {
         _runtime: Arc::new(runtime.prepare().await?.start()),
@@ -63,7 +65,7 @@ pub fn register_device(
     host: DeviceContext,
     component: &Component,
     interrupt: InterruptCallback,
-) -> wasmtime::Result<DeviceChannel> {
+) -> wasmtime::Result<MmioDevice> {
     register_device_with_host_factory(runtime, move || Ok(host), component, interrupt)
 }
 
@@ -72,16 +74,15 @@ pub fn register_device_with_host_factory(
     create_host: impl FnOnce() -> wasmtime::Result<DeviceContext> + Send + 'static,
     component: &Component,
     interrupt: InterruptCallback,
-) -> wasmtime::Result<DeviceChannel> {
-    if runtime.has_component(crate::component::vmm::bindings::machine::DeviceKind::Memory) {
+) -> wasmtime::Result<MmioDevice> {
+    if runtime.has_component(DeviceKind::Memory) {
         return Err(wasmtime::Error::msg("box already has a memory component"));
     }
     let child = runtime.child_factory();
     let component = component.clone();
-    runtime.grant_device_worker(
-        crate::component::vmm::bindings::machine::DeviceKind::Memory,
-        async move { create_worker(child(create_host()?), &component, interrupt).await },
-    )
+    runtime.grant_device_worker(DeviceKind::Memory, async move {
+        create_worker(child(create_host()?), &component, interrupt).await
+    })
 }
 
 async fn create_worker(
@@ -144,7 +145,7 @@ mod tests {
         let mut runtime =
             crate::box_runtime::BoxRuntime::new(&engine, crate::box_runtime::store::BoxHost::new())
                 .expect("box runtime");
-        crate::component::vmm::mmio::initialize_test_router(&mut runtime)
+        crate::component::vmm::initialize_test_vmm(&mut runtime)
             .await
             .expect("MMIO router");
         let interrupts = Arc::new(tokio::sync::Notify::new());

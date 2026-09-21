@@ -8,8 +8,7 @@ use crate::box_runtime::BoxRuntime;
 #[cfg(test)]
 use crate::box_runtime::store::BoxHost;
 use crate::box_runtime::store::StoreState;
-use crate::component::vmm::bindings::machine::Device;
-use crate::component::vmm::virtualization::{Architecture, MachineConfig};
+use crate::machine::{Architecture, Device, DeviceKind, MachineConfig};
 use crate::memory::{BoundedMemory, GuestRam};
 use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
@@ -116,21 +115,11 @@ impl terra::boot::host::Host for BootHost {
                 .iter()
                 .map(|device: &Device| terra::boot::types::Device {
                     kind: match device.kind {
-                        super::bindings::machine::DeviceKind::Block => {
-                            terra::boot::types::DeviceKind::Block
-                        }
-                        super::bindings::machine::DeviceKind::Net => {
-                            terra::boot::types::DeviceKind::Net
-                        }
-                        super::bindings::machine::DeviceKind::Vsock => {
-                            terra::boot::types::DeviceKind::Vsock
-                        }
-                        super::bindings::machine::DeviceKind::Fs => {
-                            terra::boot::types::DeviceKind::Fs
-                        }
-                        super::bindings::machine::DeviceKind::Memory => {
-                            terra::boot::types::DeviceKind::Memory
-                        }
+                        DeviceKind::Block => terra::boot::types::DeviceKind::Block,
+                        DeviceKind::Net => terra::boot::types::DeviceKind::Net,
+                        DeviceKind::Vsock => terra::boot::types::DeviceKind::Vsock,
+                        DeviceKind::Fs => terra::boot::types::DeviceKind::Fs,
+                        DeviceKind::Memory => terra::boot::types::DeviceKind::Memory,
                     },
                     mmio_base: device.mmio_base,
                     irq: device.irq,
@@ -278,7 +267,7 @@ mod tests {
         let runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
         let component = hostile_component(&engine, "unreachable");
         let ram = GuestRam::new(2 << 20).expect("test RAM");
-        let config = MachineConfig::new(Architecture::X86, ram.size(), 1, Vec::new())
+        let config = MachineConfig::new(Architecture::X86, ram.mapped_bytes(), 1, Vec::new())
             .expect("test machine configuration");
 
         assert!(
@@ -296,7 +285,7 @@ mod tests {
         let runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
         let component = hostile_component(&engine, "(loop br 0)");
         let ram = GuestRam::new(2 << 20).expect("test RAM");
-        let config = MachineConfig::new(Architecture::X86, ram.size(), 1, Vec::new())
+        let config = MachineConfig::new(Architecture::X86, ram.mapped_bytes(), 1, Vec::new())
             .expect("test machine configuration");
 
         assert!(
@@ -315,7 +304,7 @@ mod tests {
         let component =
             Component::new(&engine, crate::test_fixtures::wasm::BOOT).expect("boot component");
         let ram = GuestRam::new(2 << 20).expect("test RAM");
-        let config = MachineConfig::new(Architecture::X86, ram.size(), 1, Vec::new())
+        let config = MachineConfig::new(Architecture::X86, ram.mapped_bytes(), 1, Vec::new())
             .expect("test machine configuration");
 
         assert!(

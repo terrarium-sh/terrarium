@@ -3,6 +3,7 @@
 use crate::box_runtime::BoxRuntime;
 pub use crate::component::vmm::bindings::interrupts::{IoapicReply, X86Interrupt};
 use crate::component::vmm::bindings::types::Error;
+use crate::machine::{DeviceKind, MachineConfig};
 use std::sync::{Arc, Mutex, mpsc};
 use tokio::sync::{mpsc as queue, watch};
 pub type Inject = Arc<dyn Fn(X86Interrupt) -> wasmtime::Result<()> + Send + Sync>;
@@ -118,7 +119,7 @@ struct Pending {
 #[derive(Clone)]
 pub struct IoApicHandle {
     queue: InterruptQueue<Pending>,
-    config: super::virtualization::MachineConfig,
+    config: MachineConfig,
 }
 
 impl IoApicHandle {
@@ -131,7 +132,7 @@ impl IoApicHandle {
 
     pub fn bind_interrupt(
         &self,
-        kind: super::bindings::machine::DeviceKind,
+        kind: DeviceKind,
         ordinal: usize,
     ) -> wasmtime::Result<crate::component::InterruptCallback> {
         let slot = self.config.device_slot(kind, ordinal)?;
@@ -179,7 +180,7 @@ impl BoxRuntime {
             .clone();
         let vcpus = config.vcpus();
         let router = self
-            .mmio
+            .vmm
             .as_ref()
             .ok_or_else(|| wasmtime::Error::msg("VMM missing"))?;
         let (stage, access, line, eoi) = (
@@ -342,13 +343,13 @@ struct GsiCommand(u8, bool);
 #[derive(Clone)]
 pub struct IrqHandle {
     queue: InterruptQueue<GsiCommand>,
-    config: super::virtualization::MachineConfig,
+    config: MachineConfig,
 }
 
 impl IrqHandle {
     pub fn bind_interrupt(
         &self,
-        kind: super::bindings::machine::DeviceKind,
+        kind: DeviceKind,
         ordinal: usize,
     ) -> wasmtime::Result<crate::component::InterruptCallback> {
         let slot = self.config.device_slot(kind, ordinal)?;
@@ -367,7 +368,7 @@ impl BoxRuntime {
         inject: impl Fn(u32, bool) -> wasmtime::Result<()> + Send + Sync + 'static,
     ) -> wasmtime::Result<IrqHandle> {
         let router = self
-            .mmio
+            .vmm
             .as_ref()
             .ok_or_else(|| wasmtime::Error::msg("VMM missing"))?;
         let (stage, line, clear) = (

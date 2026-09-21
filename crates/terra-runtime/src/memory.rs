@@ -33,12 +33,13 @@ impl GuestRam {
         &self.0
     }
 
-    pub(crate) fn mapped_bytes(&self) -> u64 {
+    #[must_use]
+    pub fn mapped_bytes(&self) -> u64 {
         self.0.mapped_bytes()
     }
 
     #[must_use]
-    pub const fn size(&self) -> u64 {
+    pub const fn address_limit(&self) -> u64 {
         self.0.limit()
     }
 }
@@ -56,28 +57,15 @@ impl<'a> BoundedMemory<'a> {
         Self { ram }
     }
 
-    fn check_range(&self, offset: u64, len: u64) -> Result<(), MemoryError> {
+    fn copy_len(len: u64) -> Result<usize, MemoryError> {
         if len > MAX_SINGLE_BYTES {
             return Err(MemoryError::TooLarge);
         }
-        let end = offset.checked_add(len).ok_or(MemoryError::OutOfRange)?;
-        if end > self.ram.size() {
-            return Err(MemoryError::OutOfRange);
-        }
-        #[cfg(windows)]
-        if offset < self.ram.memory().guest_base() {
-            return Err(MemoryError::OutOfRange);
-        }
-        self.ram
-            .memory()
-            .contains_range(offset, len)
-            .then_some(())
-            .ok_or(MemoryError::Unmapped)
+        usize::try_from(len).map_err(|_| MemoryError::TooLarge)
     }
 
     pub fn read(&self, offset: u64, len: u64) -> Result<Vec<u8>, MemoryError> {
-        self.check_range(offset, len)?;
-        let len = usize::try_from(len).map_err(|_| MemoryError::TooLarge)?;
+        let len = Self::copy_len(len)?;
         self.ram
             .memory()
             .read(offset, len)
@@ -85,10 +73,7 @@ impl<'a> BoundedMemory<'a> {
     }
 
     pub fn write(&self, offset: u64, data: &[u8]) -> Result<(), MemoryError> {
-        self.check_range(
-            offset,
-            u64::try_from(data.len()).map_err(|_| MemoryError::TooLarge)?,
-        )?;
+        Self::copy_len(u64::try_from(data.len()).map_err(|_| MemoryError::TooLarge)?)?;
         self.ram
             .memory()
             .write(offset, data)

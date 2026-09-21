@@ -63,6 +63,12 @@ world device {
     import interrupt;
 }
 
+world host-interfaces {
+    import memory;
+    import interrupt;
+    import diagnostics;
+}
+
 world block-device {
     import memory;
     import interrupt;

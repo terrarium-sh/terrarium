@@ -1,6 +1,31 @@
-//! Agent channel identifiers, lifecycle events, and clock updates.
+//! Agent connection control, lifecycle events, and clock updates.
 
-#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+use serde::{Deserialize, Serialize};
+
+/// The service selected by the first host frame on an agent connection.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentService {
+    Session,
+    Sync,
+    Exec,
+    SessionControl,
+}
+
+pub const MAX_SERVICE_FRAME_BYTES: usize = 64;
+
+pub const STOP_SIGNAL: u8 = b'S';
+
+pub const DEFAULT_STOP_GRACE_SECS: u64 = 30;
+
+/// Bump when a host and a running guest agent cannot safely communicate.
+pub const AGENT_PROTOCOL_VERSION: u8 = 2;
+
+/// The first bytes the agent writes on each accepted connection.
+/// `V` cannot be an escape byte because a session repaints immediately after the hello.
+pub const AGENT_HELLO: [u8; 2] = [b'V', AGENT_PROTOCOL_VERSION];
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LifecycleEvent {
     Diagnostic {
         #[serde(deserialize_with = "deserialize_diagnostic")]
@@ -73,5 +98,61 @@ mod tests {
         let mut invalid = update;
         invalid[9..13].copy_from_slice(&1_000_000_000_u32.to_le_bytes());
         assert_eq!(decode_clock_sync(&invalid), None);
+    }
+
+    #[test]
+    fn service_selection_retains_its_wire_format() {
+        for (service, wire) in [
+            (AgentService::Session, "\"session\""),
+            (AgentService::Sync, "\"sync\""),
+            (AgentService::Exec, "\"exec\""),
+            (AgentService::SessionControl, "\"session_control\""),
+        ] {
+            let frame = crate::encode_frame(&service).unwrap();
+            assert_eq!(&frame[4..], wire.as_bytes());
+            assert_eq!(
+                crate::read_frame_with_limit::<AgentService>(
+                    &mut frame.as_slice(),
+                    MAX_SERVICE_FRAME_BYTES,
+                )
+                .unwrap(),
+                Some(service),
+            );
+        }
+        assert_eq!(AGENT_HELLO, [b'V', AGENT_PROTOCOL_VERSION]);
+    }
+
+    #[test]
+    fn service_selection_rejects_unknown_and_oversized_frames() {
+        let unknown = crate::encode_frame(&"unknown_service").unwrap();
+        let oversized = u32::try_from(MAX_SERVICE_FRAME_BYTES + 1)
+            .unwrap()
+            .to_le_bytes();
+        for mut bytes in [unknown.as_slice(), oversized.as_slice()] {
+            let error =
+                crate::read_frame_with_limit::<AgentService>(&mut bytes, MAX_SERVICE_FRAME_BYTES)
+                    .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[test]
+    fn lifecycle_events_retain_their_wire_format() {
+        assert_eq!(
+            serde_json::to_string(&LifecycleEvent::Exit { code: 23 }).unwrap(),
+            "{\"Exit\":{\"code\":23}}"
+        );
+    }
+    #[test]
+    fn round_trip_lifecycle_events() {
+        for event in [
+            LifecycleEvent::Diagnostic {
+                bytes: b"hook output".to_vec(),
+            },
+            LifecycleEvent::Exit { code: 23 },
+        ] {
+            let mut cur = std::io::Cursor::new(crate::encode_frame(&event).unwrap());
+            assert_eq!(crate::read_frame(&mut cur).unwrap(), Some(event));
+        }
     }
 }

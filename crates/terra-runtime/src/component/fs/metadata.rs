@@ -1,6 +1,6 @@
 use wasmtime_wasi::filesystem::Descriptor;
 
-use super::host::terra;
+use super::bindings::wit as terra;
 
 fn map_error(error: terra_platform::filesystem::Error) -> terra::fs::host::Error {
     match error {

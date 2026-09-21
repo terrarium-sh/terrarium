@@ -232,7 +232,9 @@ impl GuestMemory {
     fn check_range(&self, addr: u64, len: u64) -> Result<(), MemoryError> {
         if self.contains_range(addr, len) {
             Ok(())
-        } else if addr.checked_add(len).is_none_or(|end| end > self.limit) {
+        } else if addr < self.guest_base()
+            || addr.checked_add(len).is_none_or(|end| end > self.limit)
+        {
             Err(MemoryError::OutOfRange)
         } else {
             Err(MemoryError::Unmapped)
@@ -418,7 +420,7 @@ mod tests {
     fn nonzero_base_rejects_addresses_before_the_mapping() {
         let memory = GuestMemory::allocate_at(0x1000, 0x1000).expect("RAM");
         assert!(!memory.contains_range(0, 1));
-        assert_eq!(memory.read(0, 1), Err(MemoryError::Unmapped));
+        assert_eq!(memory.read(0, 1), Err(MemoryError::OutOfRange));
         assert_eq!(memory.read(0x2000, 1), Err(MemoryError::OutOfRange));
     }
 

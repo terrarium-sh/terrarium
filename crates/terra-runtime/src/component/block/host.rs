@@ -1,8 +1,8 @@
 //! Host disk capabilities and block component linker.
 
 use super::backing::{BlockBacking, DiskGrant};
+use super::bindings::disk;
 use crate::MAX_SINGLE_BYTES;
-use crate::component::bindings::disk;
 use crate::component::context::{
     DeviceContext, DeviceHost, add_device_imports, device_component_linker,
 };

@@ -1,19 +1,24 @@
 //! Block component bindings over the box-wide MMIO router.
 
 pub mod backing;
-pub mod host;
+mod bindings;
+mod host;
+
+use crate::machine::DeviceKind;
 
 #[cfg(test)]
 use std::sync::Arc;
 
 use wasmtime::component::Component;
 
-use crate::component::bindings::BlockDevice;
-use host::{BlockHost, block_component_linker};
+use bindings::BlockDevice;
+#[cfg(test)]
+pub(crate) use bindings::disk::HostWithStore as DiskHostWithStore;
+pub use host::{BlockHost, block_component_linker};
 
 use crate::component::InterruptCallback;
 
-use crate::component::DeviceChannel;
+use crate::component::MmioDevice;
 
 use crate::component::device_loop::DeviceLoop;
 
@@ -27,7 +32,7 @@ pub(crate) async fn instantiate(
 ) -> wasmtime::Result<crate::component::StandaloneDevice> {
     let mut runtime =
         crate::box_runtime::BoxRuntime::new(engine, crate::box_runtime::store::BoxHost::new())?;
-    crate::component::vmm::mmio::initialize_test_router(&mut runtime).await?;
+    crate::component::vmm::initialize_test_vmm(&mut runtime).await?;
     let channel = register_device(&mut runtime, host, component, readonly, interrupt)?;
     Ok(crate::component::StandaloneDevice {
         _runtime: Arc::new(runtime.prepare().await?.start()),
@@ -41,7 +46,7 @@ pub fn register_device(
     component: &Component,
     readonly: bool,
     interrupt: InterruptCallback,
-) -> wasmtime::Result<DeviceChannel> {
+) -> wasmtime::Result<MmioDevice> {
     register_device_with_host_factory(runtime, move || Ok(host), component, readonly, interrupt)
 }
 
@@ -51,13 +56,12 @@ pub fn register_device_with_host_factory(
     component: &Component,
     readonly: bool,
     interrupt: InterruptCallback,
-) -> wasmtime::Result<DeviceChannel> {
+) -> wasmtime::Result<MmioDevice> {
     let child = runtime.child_factory();
     let component = component.clone();
-    runtime.grant_device_worker(
-        crate::component::vmm::bindings::machine::DeviceKind::Block,
-        async move { create_worker(child(create_host()?), &component, readonly, interrupt).await },
-    )
+    runtime.grant_device_worker(DeviceKind::Block, async move {
+        create_worker(child(create_host()?), &component, readonly, interrupt).await
+    })
 }
 
 async fn create_worker(
@@ -93,9 +97,9 @@ async fn create_worker(
 #[cfg(test)]
 mod tests {
 
+    use crate::component::block::BlockHost;
     use crate::component::block::backing::BoundedDisk;
     use crate::component::block::backing::DiskGrant;
-    use crate::component::block::host::BlockHost;
     use crate::engine::device_engine;
     use crate::memory::BoundedMemory;
     use crate::memory::GuestRam;
@@ -108,7 +112,7 @@ mod tests {
         let engine = device_engine().expect("engine builds");
         let component =
             Component::new(&engine, crate::test_fixtures::wasm::BLOCK).expect("component compiles");
-        let host = crate::component::block::host::BlockHost::new(
+        let host = crate::component::block::BlockHost::new(
             crate::memory::GuestRam::new(64 * 1024).unwrap(),
             DiskGrant::Mem(BoundedDisk::new(4096, false)),
         );
@@ -153,7 +157,7 @@ mod tests {
         let router =
             Component::new(&engine, crate::test_fixtures::wasm::VMM).expect("MMIO router compiles");
         runtime
-            .initialize_mmio(&router)
+            .initialize_vmm(&router)
             .await
             .expect("MMIO router initializes");
         runtime
@@ -181,7 +185,7 @@ mod tests {
         let mut other_box =
             crate::box_runtime::BoxRuntime::new(&engine, crate::box_runtime::store::BoxHost::new())
                 .unwrap();
-        other_box.initialize_mmio(&router).await.unwrap();
+        other_box.initialize_vmm(&router).await.unwrap();
         let other_device = crate::component::block::register_device(
             &mut other_box,
             BlockHost::new(
@@ -249,7 +253,7 @@ mod tests {
     async fn component_resyncs_overfull_guest_queue_and_completes_new_work() {
         let engine = device_engine().unwrap();
         let component = Component::new(&engine, crate::test_fixtures::wasm::BLOCK).unwrap();
-        let mut host = crate::component::block::host::BlockHost::new(
+        let mut host = crate::component::block::BlockHost::new(
             crate::memory::GuestRam::new(64 * 1024).unwrap(),
             DiskGrant::Mem(BoundedDisk::new(4096, false)),
         );
@@ -317,7 +321,7 @@ mod tests {
         let component = Component::new(&engine, crate::test_fixtures::wasm::BLOCK).unwrap();
         let ram = GuestRam::new(64 * 1024).unwrap();
         let memory = BoundedMemory::new(&ram);
-        let host = crate::component::block::host::BlockHost::new(
+        let host = crate::component::block::BlockHost::new(
             ram.clone(),
             DiskGrant::Mem(BoundedDisk::new(4096, false)),
         );

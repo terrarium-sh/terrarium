@@ -1,10 +1,12 @@
+//! Host the Wasm lifecycle and publish outcomes with one shared shutdown deadline.
+
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 
 use crate::box_runtime::store::BoxHost;
-pub use crate::component::vmm::bindings::lifecycle_platform;
+pub(crate) use crate::component::vmm::bindings::lifecycle_platform;
 
 #[derive(Clone)]
 pub struct LifecycleNotifier {
@@ -45,12 +47,12 @@ pub enum WaitError {
     Missing,
 }
 
-pub struct LifecycleHost {
+pub(crate) struct LifecycleHost {
     sender: LifecycleNotifier,
     teardown: super::teardown::NativeTeardown,
 }
 
-pub struct LifecyclePlatform;
+pub(crate) struct LifecyclePlatform;
 
 impl LifecycleHost {
     #[must_use]
@@ -154,7 +156,7 @@ impl LifecycleNotifier {
     }
 }
 
-pub async fn wait_for_outcome(
+pub(crate) async fn wait_for_outcome(
     receiver: &mut watch::Receiver<Option<Outcome>>,
     deadline: Option<Duration>,
     notifier: &LifecycleNotifier,
@@ -214,6 +216,33 @@ pub(crate) fn add_to_linker(
 ) -> wasmtime::Result<()> {
     lifecycle_platform::add_to_linker::<BoxHost, LifecyclePlatform>(linker, |host| {
         &mut host.lifecycle
+    })
+}
+
+type RunLifecycle = wasmtime::component::TypedFunc<
+    (),
+    (Result<lifecycle_platform::Event, lifecycle_platform::Error>,),
+>;
+
+pub(super) fn create_component_loop(
+    function: RunLifecycle,
+    lifecycle: LifecycleNotifier,
+) -> crate::box_runtime::ComponentLoop {
+    Box::new(move |accessor| {
+        Box::pin(async move {
+            let (result,) = function.call_concurrent(accessor, ()).await?;
+            let outcome = match result {
+                Ok(lifecycle_platform::Event::GuestExit(code)) => Outcome::GuestExit(code),
+                Ok(lifecycle_platform::Event::ComponentFailed) => Outcome::ComponentFailed,
+                Ok(lifecycle_platform::Event::VcpuFinished) => Outcome::VcpuFinished,
+                Ok(lifecycle_platform::Event::Deadline) => Outcome::Deadline,
+                Err(error) => {
+                    return Err(wasmtime::Error::msg(format!("Wasm lifecycle: {error:?}")));
+                }
+            };
+            lifecycle.publish_outcome(outcome);
+            Ok(())
+        })
     })
 }
 

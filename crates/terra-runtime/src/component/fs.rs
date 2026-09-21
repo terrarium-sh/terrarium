@@ -1,23 +1,26 @@
 //! Filesystem component bindings over the box-wide MMIO router.
 
+mod bindings;
 mod file_events;
 mod grant;
-pub(crate) mod host;
+mod host;
 mod metadata;
 #[cfg(test)]
 mod stalled_io;
 #[cfg(test)]
 mod tests;
 
+use crate::machine::DeviceKind;
+
 #[cfg(test)]
 use std::sync::Arc;
 
 use wasmtime::component::Component;
 
+use bindings::FsComponent;
+pub use bindings::{FilesystemStat, FsDeviceError, FsError};
 pub use grant::{ShareGrant, share_notification_budgets, share_tag};
-use host::FsComponent;
-pub use host::terra::fs::host::{Error as FsError, FilesystemStat};
-pub use host::{FsDeviceError, FsHost, fs_component_linker};
+pub use host::{FsHost, fs_component_linker};
 
 pub(crate) const MAX_BLOCKING_THREADS: usize = 33;
 
@@ -54,9 +57,7 @@ impl Drop for FilesystemRuntime {
 }
 
 use crate::component::InterruptCallback;
-
-use crate::component::DeviceChannel;
-
+use crate::component::MmioDevice;
 use crate::component::device_loop::DeviceLoop;
 
 fn transport_error(operation: &str, error: FsDeviceError) -> wasmtime::Error {
@@ -74,7 +75,7 @@ pub(crate) async fn instantiate(
 ) -> wasmtime::Result<crate::component::StandaloneDevice> {
     let mut runtime =
         crate::box_runtime::BoxRuntime::new(engine, crate::box_runtime::store::BoxHost::new())?;
-    crate::component::vmm::mmio::initialize_test_router(&mut runtime).await?;
+    crate::component::vmm::initialize_test_vmm(&mut runtime).await?;
     let channel = register_device(&mut runtime, host, component, tag, max_nodes, interrupt)?;
     Ok(crate::component::StandaloneDevice {
         _runtime: Arc::new(runtime.prepare().await?.start()),
@@ -89,7 +90,7 @@ pub fn register_device(
     tag: &str,
     max_nodes: u32,
     interrupt: InterruptCallback,
-) -> wasmtime::Result<DeviceChannel> {
+) -> wasmtime::Result<MmioDevice> {
     register_device_with_host_factory(
         runtime,
         move || Ok(host),
@@ -107,7 +108,7 @@ pub fn register_device_with_host_factory(
     tag: &str,
     max_nodes: u32,
     interrupt: InterruptCallback,
-) -> wasmtime::Result<DeviceChannel> {
+) -> wasmtime::Result<MmioDevice> {
     let tag = tag.to_owned();
     let child = runtime.child_factory();
     let component = component.clone();
@@ -128,10 +129,7 @@ pub fn register_device_with_host_factory(
             .await?
         })
     });
-    runtime.grant_device_setup(
-        crate::component::vmm::bindings::machine::DeviceKind::Fs,
-        setup,
-    )
+    runtime.grant_device_setup(DeviceKind::Fs, setup)
 }
 
 async fn create_worker(

@@ -1,4 +1,3 @@
-use crate::machine::MAX_VCPUS;
 use crate::memory::GuestMemory;
 use crate::vm::{
     BootState, InterruptControllerConfig, InterruptMode, IoApicAccess, VcpuAction, VcpuExit,
@@ -7,6 +6,7 @@ use crate::vm::{
 use crate::windows::worker::VcpuGroup;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use terra_limits::X86_MAX_VCPUS;
 
 pub struct WindowsVm {
     partition: Arc<crate::windows::whp::Partition>,
@@ -17,7 +17,7 @@ impl WindowsVm {
     pub fn create(config: &VmConfig, hard_stop: Option<fn() -> !>) -> Result<Self, String> {
         if config.interrupt_controller != InterruptControllerConfig::X86
             || config.vcpus == 0
-            || usize::from(config.vcpus) > MAX_VCPUS
+            || usize::from(config.vcpus) > X86_MAX_VCPUS as usize
         {
             return Err("invalid Windows x64 VM dimensions".to_owned());
         }

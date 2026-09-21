@@ -106,7 +106,7 @@ impl PolicyFactory {
         )?
         .map_err(wasmtime::Error::msg)?;
         let (sender, receiver) =
-            mpsc::sync_channel::<Decision>(crate::component::network::host::MAX_POLICY_CALLS);
+            mpsc::sync_channel::<Decision>(crate::component::network::MAX_POLICY_CALLS);
         let available = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let worker = std::thread::Builder::new()
             .name("network-policy".into())
@@ -369,7 +369,7 @@ fn decide_resolved(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::component::network::policy::PolicyClient;
+    use crate::component::network::PolicyClient;
     use std::sync::{Arc, OnceLock};
 
     #[allow(unsafe_code)]
@@ -491,7 +491,7 @@ mod tests {
             |_| {},
         );
         started.await.unwrap();
-        let capacity = crate::component::network::host::MAX_POLICY_CALLS;
+        let capacity = crate::component::network::MAX_POLICY_CALLS;
         let calls = Arc::new(tokio::sync::Semaphore::new(capacity + 1));
         for _ in 0..capacity {
             let lease = calls.clone().try_acquire_owned().unwrap();

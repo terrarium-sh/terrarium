@@ -1,3 +1,5 @@
+//! Run native cleanup independently of waiting tasks.
+
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
@@ -65,7 +67,10 @@ impl<O: Clone + Send + Sync + 'static> Drop for TaskState<O> {
 }
 
 impl<O: Clone + Send + Sync + 'static> NativeTask<O> {
-    pub fn new(stop: impl FnOnce() -> Outcome<O> + Send + 'static, cancel: Option<Cancel>) -> Self {
+    pub(crate) fn new(
+        stop: impl FnOnce() -> Outcome<O> + Send + 'static,
+        cancel: Option<Cancel>,
+    ) -> Self {
         let (sender, outcome) = watch::channel(None);
         Self {
             state: Arc::new(TaskState {

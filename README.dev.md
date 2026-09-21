@@ -54,6 +54,28 @@ components run in independent stores and communicate through bounded scalar
 bridges. Hypervisor operations and authority checks remain native. See the
 [security model](docs/security.md) for trust boundaries and resource limits.
 
+Runtime entry points live in `terra-runtime::orchestration`; `machine` owns
+layout, validated machine configuration, and conversion to native VM configuration.
+A prepared VM runs through `PreparedVm::run`, which keeps its component runtime
+and outcome observer paired. `box_runtime/setup.rs` owns device preparation and
+startup sequencing. `component/vmm.rs` initializes the VMM; `component/vmm/mmio`
+handles native MMIO requests, and `component/vmm/vcpu.rs` hosts the vCPU rendezvous.
+Device module roots own registration and selected public exports; private
+`bindings.rs` files hold generated interfaces, and `host.rs` implements native imports.
+Network socket authorization lives in `component/network/authorization.rs`;
+`component/policy.rs` hosts the isolated policy component.
+
+Shutdown responsibilities stay with their resource owners:
+
+| Owner | Responsibility |
+| --- | --- |
+| `orchestration/observation.rs` | Observe the VM outcome and await final cleanup |
+| `component/vmm/lifecycle.rs` | Publish events and outcomes and establish the shared shutdown deadline |
+| `box_runtime` | Stop and join Wasmtime tasks |
+| `component/vmm/teardown.rs` | Sequence native cleanup and retain resources when cleanup cannot finish |
+| `component/vmm/native_task.rs` | Run cleanup independently of cancellation of a waiter |
+| `terra-platform` VM backends | Stop and join native vCPU threads |
+
 The agent starts as PID 1 from the read-only 3 MiB memory-backed boot disk, receives its boot
 plan over vsock, grows the box's ext4 images and enters the Alpine root with
 `pivot_root`. It applies `on_create` when its guest-side recipe stamp differs,

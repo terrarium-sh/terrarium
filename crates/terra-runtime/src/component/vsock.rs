@@ -1,7 +1,9 @@
 //! Native control streams for the compartmentalized vsock device.
 
-pub mod host;
+mod bindings;
+mod host;
 
+use crate::machine::DeviceKind;
 use futures_util::{
     FutureExt,
     future::{BoxFuture, Shared},
@@ -10,8 +12,9 @@ use futures_util::{
 use crate::box_runtime::store::StoreState;
 use crate::component::vmm::lifecycle::LifecycleNotifier;
 use crate::component::vmm::virtualization::RamGrant;
-use host::VsockDeviceHost;
-use host::{VsockBindings, VsockError, VsockEvent};
+use bindings::VsockBindings;
+pub use bindings::{VsockError, VsockEvent};
+pub use host::{VsockDeviceHost, VsockHostService, vsock_component_linker};
 use std::{
     io::Write,
     pin::Pin,
@@ -217,7 +220,7 @@ impl VsockChannel {
         diagnostics: Option<std::fs::File>,
         interrupt: crate::component::InterruptCallback,
     ) -> wasmtime::Result<Self> {
-        if runtime.has_component(crate::component::vmm::bindings::machine::DeviceKind::Vsock) {
+        if runtime.has_component(DeviceKind::Vsock) {
             return Err(wasmtime::Error::msg("box already has a vsock component"));
         }
         let ram = ram.into();
@@ -236,10 +239,9 @@ impl VsockChannel {
             completion,
         };
         let child = runtime.child_factory();
-        let mmio = runtime.grant_device_worker_unmanaged(
-            crate::component::vmm::bindings::machine::DeviceKind::Vsock,
-            async move { setup.create(child).await },
-        )?;
+        let mmio = runtime.grant_device_worker_unmanaged(DeviceKind::Vsock, async move {
+            setup.create(child).await
+        })?;
         let closing_device = mmio.clone();
         let close = async move {
             shared_closing.store(true, Ordering::Release);
@@ -255,12 +257,9 @@ impl VsockChannel {
         }
         .boxed()
         .shared();
-        if let Err(error) =
-            runtime.add_device_shutdown(crate::component::vmm::teardown::DeviceShutdown::new(
-                crate::component::vmm::bindings::machine::DeviceKind::Vsock,
-                close.clone(),
-            ))
-        {
+        if let Err(error) = runtime.add_device_shutdown(
+            crate::component::vmm::teardown::DeviceShutdown::new(DeviceKind::Vsock, close.clone()),
+        ) {
             mmio.revoke_worker(runtime)?;
             return Err(error);
         }
@@ -549,7 +548,7 @@ mod tests {
             let router =
                 wasmtime::component::Component::new(&engine, crate::test_fixtures::wasm::VMM)
                     .expect("router component");
-            runtime.initialize_mmio(&router).await.expect("router");
+            runtime.initialize_vmm(&router).await.expect("router");
             let ram = GuestRam::new(4096).expect("test RAM maps");
             let artifact = crate::test_fixtures::trusted_artifacts().vsock();
             let channel = VsockChannel::from_trusted_artifact(
@@ -563,9 +562,7 @@ mod tests {
                 Arc::new(|_| Ok(())),
             )
             .expect("component");
-            assert!(
-                runtime.has_component(crate::component::vmm::bindings::machine::DeviceKind::Vsock)
-            );
+            assert!(runtime.has_component(DeviceKind::Vsock));
             let runtime_task = runtime.prepare().await.unwrap().start();
             let request = channel.clone();
             assert_eq!(
@@ -641,7 +638,7 @@ mod tests {
                 .unwrap();
         let router =
             wasmtime::component::Component::new(&engine, crate::test_fixtures::wasm::VMM).unwrap();
-        runtime.initialize_mmio(&router).await.unwrap();
+        runtime.initialize_vmm(&router).await.unwrap();
         let artifact = crate::test_fixtures::trusted_artifacts().vsock();
         let channel = crate::component::vsock::VsockChannel::from_trusted_artifact(
             &mut runtime,

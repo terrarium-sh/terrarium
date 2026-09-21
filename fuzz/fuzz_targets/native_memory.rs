@@ -2,11 +2,9 @@
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
-use terra_runtime::component::bindings::memory::Host;
-use terra_runtime::component::context::DeviceContext;
-use terra_runtime::component::vmm::{
-    Architecture, BootEntry, MachineConfig, PreparedMachine, VirtualMachine,
-};
+use terra_runtime::component::context::{DeviceContext, MemoryHost};
+use terra_runtime::component::vmm::{BootEntry, PreparedMachine, VirtualMachine};
+use terra_runtime::machine::{Architecture, MachineConfig};
 use terra_runtime::memory::GuestRam;
 
 #[derive(Arbitrary, Debug)]

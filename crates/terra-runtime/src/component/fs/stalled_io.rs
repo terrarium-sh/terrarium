@@ -18,7 +18,7 @@ use wasmtime_wasi::p3::bindings::filesystem::types::ErrorCode;
 use super::{FsHost, ShareGrant};
 use crate::box_runtime::store::BoxHost;
 use crate::box_runtime::{BoxRuntime, BoxRuntimeHandle};
-use crate::component::DeviceChannel;
+use crate::component::MmioDevice;
 use crate::component::context::DeviceContext;
 use crate::engine::device_engine;
 use crate::memory::{BoundedMemory, GuestRam};
@@ -311,7 +311,7 @@ fn replies_wait_for_their_used_ring_entry() {
 }
 
 struct Mounted {
-    channel: DeviceChannel,
+    channel: MmioDevice,
     ram: GuestRam,
     runtime: BoxRuntimeHandle,
     next: u16,
@@ -328,7 +328,7 @@ impl Mounted {
             FsHost::with_resource_capacity(DeviceContext::with_ram(ram.clone()), grant, capacity);
         host.io_gate = Some(gate);
         let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).unwrap();
-        runtime.initialize_mmio(&router).await.unwrap();
+        runtime.initialize_vmm(&router).await.unwrap();
         let channel = super::register_device(
             &mut runtime,
             host,
@@ -887,7 +887,7 @@ fn saturated_mount_cleanup_does_not_starve_another_mount_or_guest_disk() {
         .build()
         .unwrap();
     runtime.block_on(async {
-        use crate::component::bindings::disk::HostWithStore;
+        use crate::component::block::DiskHostWithStore as _;
         use crate::component::block::backing::{DiskGrant, FileDisk};
         use wasmtime::component::HasSelf;
 
@@ -899,7 +899,7 @@ fn saturated_mount_cleanup_does_not_starve_another_mount_or_guest_disk() {
         let disk_root = tempfile::tempdir().unwrap();
         let disk_path = disk_root.path().join("disk");
         std::fs::write(&disk_path, b"disk contents").unwrap();
-        let disk_host = crate::component::block::host::BlockHost::new(
+        let disk_host = crate::component::block::BlockHost::new(
             crate::memory::GuestRam::new(4096).unwrap(),
             DiskGrant::File(FileDisk::open(&disk_path, false).unwrap()),
         );
@@ -929,10 +929,8 @@ fn saturated_mount_cleanup_does_not_starve_another_mount_or_guest_disk() {
             let bytes = disk_store
                 .run_concurrent(async |accessor| {
                     let disk = accessor
-                        .with_getter::<HasSelf<crate::component::block::host::BlockHost>>(|host| {
-                            host
-                        });
-                    HasSelf::<crate::component::block::host::BlockHost>::read_at(&disk, 0, 13).await
+                        .with_getter::<HasSelf<crate::component::block::BlockHost>>(|host| host);
+                    HasSelf::<crate::component::block::BlockHost>::read_at(&disk, 0, 13).await
                 })
                 .await
                 .unwrap()

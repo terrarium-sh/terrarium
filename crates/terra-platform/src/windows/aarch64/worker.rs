@@ -7,6 +7,7 @@ use crate::windows::worker::VcpuGroup;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use terra_limits::ARM_MAX_VCPUS;
 
 pub struct WindowsVm {
     partition: Arc<crate::windows::whp::Partition>,
@@ -15,12 +16,10 @@ pub struct WindowsVm {
 
 impl WindowsVm {
     pub fn create(config: &VmConfig, hard_stop: Option<fn() -> !>) -> Result<Self, String> {
-        use crate::aarch64::arm::MAX_VCPUS;
-
         let InterruptControllerConfig::Arm(gic) = config.interrupt_controller else {
             return Err("Windows ARM64 requires an ARM interrupt controller".to_owned());
         };
-        if config.vcpus == 0 || usize::from(config.vcpus) > MAX_VCPUS {
+        if config.vcpus == 0 || usize::from(config.vcpus) > ARM_MAX_VCPUS as usize {
             return Err("invalid Windows ARM64 VM dimensions".to_owned());
         }
         let memory = GuestMemory::allocate_at(config.ram_base, config.ram_bytes)

@@ -3,11 +3,11 @@
 #[path = "support/artifacts.rs"]
 mod support;
 
-use terra_runtime::component::block::host::{BlockHost, block_component_linker};
+use terra_runtime::component::block::{BlockHost, block_component_linker};
 use terra_runtime::component::fs::fs_component_linker;
-use terra_runtime::component::mem::host::mem_component_linker;
-use terra_runtime::component::network::host::{NetworkHost, network_component_linker};
-use terra_runtime::component::vsock::host::{VsockDeviceHost, vsock_component_linker};
+use terra_runtime::component::mem::mem_component_linker;
+use terra_runtime::component::network::{NetworkHost, network_component_linker};
+use terra_runtime::component::vsock::{VsockDeviceHost, vsock_component_linker};
 use terra_runtime::engine::device_engine;
 use wasmtime::component::{Component, Linker};
 
@@ -199,8 +199,7 @@ fn component_linkers_exclude_ungranted_interfaces() {
 #[test]
 fn mmio_dispatcher_requires_no_device_capabilities() {
     let engine = device_engine().expect("device engine");
-    let linker =
-        terra_runtime::component::vmm::mmio::mmio_component_linker(&engine).expect("VMM linker");
+    let linker = terra_runtime::component::vmm::vmm_component_linker(&engine).expect("VMM linker");
     let component =
         Component::new(&engine, support::artifacts::wasm::VMM).expect("MMIO component compiles");
     linker
@@ -221,8 +220,7 @@ fn mmio_dispatcher_requires_no_device_capabilities() {
 #[test]
 fn only_vmm_receives_virtual_machine_and_vcpu_resources() {
     let engine = device_engine().expect("device engine");
-    let vmm =
-        terra_runtime::component::vmm::mmio::mmio_component_linker(&engine).expect("VMM linker");
+    let vmm = terra_runtime::component::vmm::vmm_component_linker(&engine).expect("VMM linker");
     for (interface, resource) in [
         ("terra:mmio/virtualization@0.1.0", "vm"),
         ("terra:mmio/platform@0.1.0", "vcpu"),
@@ -325,7 +323,7 @@ fn only_vsock_receives_secure_random_and_no_component_receives_insecure_random()
         false,
     );
     assert_random_grants(
-        &terra_runtime::component::vmm::mmio::mmio_component_linker(&engine).expect("VMM linker"),
+        &terra_runtime::component::vmm::vmm_component_linker(&engine).expect("VMM linker"),
         &engine,
         false,
     );
@@ -394,8 +392,7 @@ fn device_cli_context_has_no_host_data_or_terminal_streams() {
 #[test]
 fn runtime_vmm_cannot_import_boot_resources_or_vm_memory_methods() {
     let engine = device_engine().expect("engine");
-    let linker =
-        terra_runtime::component::vmm::mmio::mmio_component_linker(&engine).expect("VMM linker");
+    let linker = terra_runtime::component::vmm::vmm_component_linker(&engine).expect("VMM linker");
     assert_resource(
         &linker,
         &engine,

@@ -94,9 +94,9 @@ async fn every_device_resets_and_closes_in_one_box_runtime() {
     let root = tempfile::tempdir().expect("mount directory");
     let mount = std::fs::canonicalize(root.path()).expect("canonical mount directory");
     let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
-    runtime.initialize_mmio(&router).await.expect("MMIO router");
+    runtime.initialize_vmm(&router).await.expect("MMIO router");
 
-    let block_host = terra_runtime::component::block::host::BlockHost::new(
+    let block_host = terra_runtime::component::block::BlockHost::new(
         ram.clone(),
         DiskGrant::Mem(BoundedDisk::new(4096, false)),
     );

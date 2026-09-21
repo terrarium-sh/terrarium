@@ -1,11 +1,13 @@
+//! Retain native resources and sequence VM, device, and interrupt cleanup.
+
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use super::bindings::machine::DeviceKind;
+use crate::machine::DeviceKind;
 
 type Outcome = Result<(), String>;
 type Close = futures_util::future::BoxFuture<'static, Outcome>;
-type CleanupTask = super::reaper::NativeTask<()>;
+type CleanupTask = super::native_task::NativeTask<()>;
 
 #[derive(Default)]
 struct TeardownGrants {

@@ -3,7 +3,7 @@
 #[path = "support/artifacts.rs"]
 mod support;
 
-use terra_runtime::component::vsock::host::{VsockDeviceHost, vsock_component_linker};
+use terra_runtime::component::vsock::{VsockDeviceHost, vsock_component_linker};
 use terra_runtime::engine::device_engine;
 use terra_runtime::test_support::device_store;
 use wasmtime::component::{Component, TypedFunc, wit_parser::ItemName};
@@ -87,7 +87,7 @@ async fn component_releases_credit_after_consumer_drains_data() {
         &engine,
         VsockDeviceHost::new(
             terra_runtime::memory::GuestRam::new(64 * 1024).unwrap(),
-            terra_runtime::component::vsock::host::VsockHostService::default(),
+            terra_runtime::component::vsock::VsockHostService::default(),
         ),
     );
     let instance = linker
@@ -162,7 +162,7 @@ async fn component_drains_selected_stream_while_another_is_queued() {
         &engine,
         VsockDeviceHost::new(
             terra_runtime::memory::GuestRam::new(64 * 1024).unwrap(),
-            terra_runtime::component::vsock::host::VsockHostService::default(),
+            terra_runtime::component::vsock::VsockHostService::default(),
         ),
     );
     let instance = linker
@@ -173,7 +173,7 @@ async fn component_drains_selected_stream_while_another_is_queued() {
         instance
             .get_typed_func::<(), (
                 wasmtime::component::StreamReader<
-                    terra_runtime::component::vsock::host::VsockEvent,
+                    terra_runtime::component::vsock::VsockEvent,
                 >,
             )>(&mut store, export("events"))
             .expect("events");
@@ -261,7 +261,7 @@ async fn component_close_clears_queued_state() {
         &engine,
         VsockDeviceHost::new(
             terra_runtime::memory::GuestRam::new(64 * 1024).unwrap(),
-            terra_runtime::component::vsock::host::VsockHostService::default(),
+            terra_runtime::component::vsock::VsockHostService::default(),
         ),
     );
     let instance = linker
@@ -318,7 +318,7 @@ async fn component_rejects_backpressure_without_resetting_connection_state() {
         &engine,
         VsockDeviceHost::new(
             terra_runtime::memory::GuestRam::new(64 * 1024).unwrap(),
-            terra_runtime::component::vsock::host::VsockHostService::default(),
+            terra_runtime::component::vsock::VsockHostService::default(),
         ),
     );
     let instance = linker
@@ -394,7 +394,7 @@ async fn lifecycle_decoding_stays_in_component_and_handles_bounded_frames() {
         &engine,
         VsockDeviceHost::new(
             terra_runtime::memory::GuestRam::new(65536).unwrap(),
-            terra_runtime::component::vsock::host::VsockHostService::default(),
+            terra_runtime::component::vsock::VsockHostService::default(),
         ),
     );
     let instance = vsock_component_linker(&engine)

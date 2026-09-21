@@ -1,13 +1,11 @@
-pub mod bindings;
+pub(crate) mod bindings;
 pub mod block;
 pub mod context;
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub mod fs;
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub mod mem;
 pub mod network;
 pub mod policy;
-pub mod relay;
+pub(crate) mod relay;
 pub mod vmm;
 pub mod vsock;
 
@@ -15,18 +13,18 @@ pub type InterruptCallback = std::sync::Arc<dyn Fn(bool) -> wasmtime::Result<()>
 
 mod device_loop;
 
-pub use vmm::mmio::MmioDevice as DeviceChannel;
+pub use vmm::mmio::MmioDevice;
 
 #[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct StandaloneDevice {
-    device: DeviceChannel,
+    device: MmioDevice,
     _runtime: std::sync::Arc<crate::box_runtime::BoxRuntimeHandle>,
 }
 
 #[cfg(test)]
 impl std::ops::Deref for StandaloneDevice {
-    type Target = DeviceChannel;
+    type Target = MmioDevice;
     fn deref(&self) -> &Self::Target {
         &self.device
     }

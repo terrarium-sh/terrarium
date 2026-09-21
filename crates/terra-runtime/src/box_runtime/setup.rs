@@ -16,9 +16,9 @@ use super::{
 use crate::component::relay;
 use crate::component::vmm::bindings::types::{Reply, Request};
 use crate::component::vmm::boot::BootEntry;
-use crate::component::vmm::mmio::Serve;
-use crate::component::vmm::virtualization::{StartedVcpus, VcpuReaper};
-use crate::component::vmm::{self, NativeVcpu};
+use crate::component::vmm::mmio::{DevicePlan, Serve, router_error};
+use crate::component::vmm::{self, NativeVcpu, StartedVcpus, VcpuReaper};
+use crate::machine::DeviceKind;
 
 pub(crate) const SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -46,7 +46,7 @@ impl BoxRuntime {
         let (shutdown, _) = watch::channel(false);
         Ok(Self {
             store: create_store(engine, host),
-            mmio: None,
+            vmm: None,
             epoch_clock,
             memory_budget,
             shutdown,
@@ -55,7 +55,7 @@ impl BoxRuntime {
         })
     }
 
-    pub fn new_child<H: StoreHost>(&self, host: H) -> DeviceWorker<H> {
+    pub(crate) fn new_child<H: StoreHost>(&self, host: H) -> DeviceWorker<H> {
         self.child_factory()(host)
     }
 
@@ -72,7 +72,11 @@ impl BoxRuntime {
         }
     }
 
-    pub fn attach_child<H: StoreHost>(&mut self, child: DeviceWorker<H>) -> wasmtime::Result<()> {
+    #[cfg(test)]
+    pub(crate) fn attach_child<H: StoreHost>(
+        &mut self,
+        child: DeviceWorker<H>,
+    ) -> wasmtime::Result<()> {
         wasmtime::ensure!(
             self.component_count() < MAX_BOX_COMPONENTS,
             "box has too many components"
@@ -102,19 +106,16 @@ impl BoxRuntime {
     pub(crate) fn component_count(&self) -> usize {
         self.children.len()
             + self
-                .mmio
+                .vmm
                 .as_ref()
-                .map_or(0, crate::component::vmm::mmio::Router::unprepared_count)
+                .map_or(0, crate::component::vmm::VmmInstance::unprepared_count)
     }
 
     #[must_use]
-    pub fn has_component(
-        &self,
-        kind: crate::component::vmm::bindings::machine::DeviceKind,
-    ) -> bool {
-        self.mmio
+    pub fn has_component(&self, kind: DeviceKind) -> bool {
+        self.vmm
             .as_ref()
-            .is_some_and(|router| router.has_component(kind))
+            .is_some_and(|instance| instance.has_component(kind))
     }
 
     pub(crate) fn shutdown_receiver(&self) -> watch::Receiver<bool> {
@@ -145,15 +146,15 @@ impl BoxRuntime {
 
     fn finish(mut self) -> wasmtime::Result<PreparedBoxRuntime> {
         self.store.data().platform.validate_runtime_start()?;
-        let failure = if let Some(router) = self.mmio.take() {
-            let crate::component::vmm::mmio::Router {
+        let failure = if let Some(instance) = self.vmm.take() {
+            let crate::component::vmm::VmmInstance {
                 bridge,
-                entrypoint,
+                lifecycle_loop,
                 failure,
                 ..
-            } = router;
+            } = instance;
             if self.store.data().platform.is_machine_running() {
-                self.register_loop(entrypoint)?;
+                self.register_loop(lifecycle_loop)?;
             }
             self.component_loops.push(bridge);
             Some(failure)
@@ -178,24 +179,7 @@ impl BoxRuntime {
     ) -> wasmtime::Result<(PreparedBoxRuntime, VcpuReaper)> {
         self.store.data().platform.validate_vcpu_start()?;
         let mut runtime = self.prepare_devices().await?;
-        let machine = &runtime
-            .mmio
-            .as_ref()
-            .ok_or_else(|| wasmtime::Error::msg("VMM missing"))?
-            .machine;
-        let outcome = tokio::time::timeout(
-            vmm::EXIT_TIMEOUT,
-            machine.func_compose().call_async(&mut runtime.store, ()),
-        )
-        .await
-        .map_err(wasmtime::Error::from)
-        .and_then(std::convert::identity)
-        .and_then(|(result,)| {
-            result.map_err(|error| {
-                wasmtime::Error::msg(format!("Wasm machine composition: {error:?}"))
-            })
-        });
-        outcome?;
+        runtime.compose_machine().await?;
         let started = runtime
             .store
             .data_mut()
@@ -206,7 +190,7 @@ impl BoxRuntime {
 
     pub(crate) fn grant_device_worker<H: StoreHost>(
         &mut self,
-        kind: vmm::bindings::machine::DeviceKind,
+        kind: DeviceKind,
         initialize: impl Future<Output = wasmtime::Result<(DeviceWorker<H>, Serve)>> + Send + 'static,
     ) -> wasmtime::Result<vmm::mmio::MmioDevice> {
         self.grant_device_setup(kind, setup(initialize, self.shutdown_receiver()))
@@ -214,7 +198,7 @@ impl BoxRuntime {
 
     pub(crate) fn grant_device_setup(
         &mut self,
-        kind: vmm::bindings::machine::DeviceKind,
+        kind: DeviceKind,
         setup: Setup,
     ) -> wasmtime::Result<vmm::mmio::MmioDevice> {
         let device = vmm::mmio::MmioDevice::grant_worker(self, kind, setup)?;
@@ -235,7 +219,7 @@ impl BoxRuntime {
 
     pub(crate) fn grant_device_worker_unmanaged<H: StoreHost>(
         &mut self,
-        kind: vmm::bindings::machine::DeviceKind,
+        kind: DeviceKind,
         initialize: impl Future<Output = wasmtime::Result<(DeviceWorker<H>, Serve)>> + Send + 'static,
     ) -> wasmtime::Result<vmm::mmio::MmioDevice> {
         let setup = setup(initialize, self.shutdown_receiver());
@@ -260,6 +244,76 @@ impl BoxRuntime {
             .native_teardown()
             .install_device(device)
     }
+
+    async fn prepare_devices(mut self) -> wasmtime::Result<Self> {
+        let Some(instance) = self.vmm.as_mut() else {
+            return Ok(self);
+        };
+        let plans = std::mem::take(&mut instance.device_plan);
+        let devices = plans.iter().map(|plan| Arc::clone(&plan.device)).collect();
+        for DevicePlan {
+            device,
+            mapping,
+            setup,
+        } in plans
+        {
+            let mapping =
+                mapping.ok_or_else(|| wasmtime::Error::msg("worker grant has no mapping"))?;
+            let worker = within_setup_timeout(
+                device.slot,
+                self.prepare_worker(device.slot, mapping, setup),
+            )
+            .await?;
+            self.attach_worker(worker)?;
+        }
+        self.vmm
+            .as_ref()
+            .ok_or_else(|| wasmtime::Error::msg("MMIO router missing"))?
+            .devices
+            .set(devices)
+            .map_err(|_| wasmtime::Error::msg("device registry already published"))?;
+        Ok(self)
+    }
+
+    async fn prepare_worker(
+        &mut self,
+        slot: u32,
+        (base, size): (u64, u64),
+        setup: Setup,
+    ) -> wasmtime::Result<WorkerTask> {
+        wasmtime::ensure!(
+            usize::try_from(slot)? < crate::box_runtime::MAX_BOX_COMPONENTS
+                && size != 0
+                && base.checked_add(size).is_some(),
+            "worker grant outside box"
+        );
+        let router = &self
+            .vmm
+            .as_ref()
+            .ok_or_else(|| wasmtime::Error::msg("MMIO router missing"))?
+            .routing;
+        let (request_reader,) = router
+            .func_open_device()
+            .call_async(&mut self.store, (slot, base, size))
+            .await?;
+        let request_reader = request_reader.map_err(router_error)?;
+        let (sink, request_stream) =
+            crate::component::relay::channel(crate::component::relay::MMIO_CAPACITY);
+        request_reader.pipe(&mut self.store, sink)?;
+        let worker = setup(request_stream).await?;
+        let replies = StreamReader::new(&mut self.store, worker.replies)?;
+        let router = &self
+            .vmm
+            .as_ref()
+            .ok_or_else(|| wasmtime::Error::msg("MMIO router missing"))?
+            .routing;
+        let (result,) = router
+            .func_attach_replies()
+            .call_async(&mut self.store, (slot, replies))
+            .await?;
+        result.map_err(router_error)?;
+        Ok(worker.worker)
+    }
 }
 
 pub(crate) fn setup<H: StoreHost>(
@@ -281,7 +335,7 @@ pub(crate) fn setup<H: StoreHost>(
     })
 }
 
-pub(crate) async fn within_setup_timeout<T>(
+async fn within_setup_timeout<T>(
     slot: u32,
     operation: impl Future<Output = wasmtime::Result<T>>,
 ) -> wasmtime::Result<T> {

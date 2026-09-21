@@ -1,7 +1,6 @@
 #![allow(unsafe_code)]
 
 use super::ArmWorkerError;
-use crate::aarch64::arm::MAX_VCPUS;
 use crate::memory::GuestMemory;
 use crate::vm::VmConfig;
 use kvm_bindings::{
@@ -13,6 +12,7 @@ use kvm_bindings::{
 };
 use kvm_ioctls::{DeviceFd, Kvm, VcpuFd, VmFd};
 use std::sync::Arc;
+use terra_limits::ARM_MAX_VCPUS;
 
 const GIC_SPI_OFFSET: u32 = 32;
 const VGIC_IRQS: u32 = 128;
@@ -84,7 +84,7 @@ impl Machine {
     }
 
     pub(super) fn prepare_vcpus(&self, count: usize) -> Result<Vec<VcpuFd>, ArmWorkerError> {
-        if count == 0 || count > MAX_VCPUS {
+        if count == 0 || count > ARM_MAX_VCPUS as usize {
             return Err(ArmWorkerError::BadVcpuCount(count));
         }
         let mut vcpus = Vec::with_capacity(count);

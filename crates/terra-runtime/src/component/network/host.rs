@@ -1,6 +1,6 @@
 //! Native authority for standard WASI name lookups in the network component.
 
-use super::policy::PolicyClient;
+use super::authorization::PolicyClient;
 use std::{marker::PhantomData, sync::Arc, time::Duration};
 use terra_network::NameLookup;
 use tokio::sync::Semaphore;
@@ -24,8 +24,8 @@ impl NetworkHost {
         published_ports: Vec<terra_network::PortMapping>,
     ) -> Self {
         let host_service_ports = policy.host_service_ports().to_vec();
-        let policy = PolicyClient::new(policy, Arc::new(Semaphore::new(MAX_POLICY_CALLS)));
-        *context.ctx().ctx = super::policy::build_network_context(
+        let policy = PolicyClient::new(policy, Arc::new(Semaphore::new(super::MAX_POLICY_CALLS)));
+        *context.ctx().ctx = super::authorization::build_network_context(
             policy.clone(),
             host_service_ports,
             published_ports,
@@ -33,9 +33,7 @@ impl NetworkHost {
         Self {
             context,
             network_policy: policy,
-            network_lookups: Arc::new(tokio::sync::Semaphore::new(
-                crate::component::network::host::MAX_NAME_LOOKUPS,
-            )),
+            network_lookups: Arc::new(tokio::sync::Semaphore::new(MAX_NAME_LOOKUPS)),
         }
     }
 
@@ -69,7 +67,6 @@ impl crate::box_runtime::store::StoreHost for NetworkHost {}
 
 pub(crate) const MAX_NAME_LOOKUPS: usize = 8;
 use crate::component::policy::MAX_NAME_BYTES;
-pub(crate) const MAX_POLICY_CALLS: usize = 8;
 const MAX_NAME_ADDRESSES: usize = 32;
 const NAME_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 

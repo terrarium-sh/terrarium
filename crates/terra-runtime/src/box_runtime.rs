@@ -24,8 +24,8 @@ pub use store::{
     RootHost, StoreHost, StoreState,
 };
 
-pub const BOX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
-pub const MAX_BOX_COMPONENTS: usize = terra_limits::MAX_DEVICES;
+pub(crate) const BOX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const MAX_BOX_COMPONENTS: usize = terra_limits::MAX_DEVICES;
 const MAX_BOX_COMPONENT_LOOPS: usize =
     MAX_BOX_COMPONENTS * 3 + terra_limits::MAX_VCPUS as usize + 2;
 const EPOCH_TICK_INTERVAL: Duration = Duration::from_millis(10);
@@ -78,7 +78,7 @@ fn spawn_epoch_ticker(
 }
 
 /// A long-running device loop borrowing its component store through an accessor.
-pub type ComponentLoop<T = BoxHost> = Box<
+pub(crate) type ComponentLoop<T = BoxHost> = Box<
     dyn for<'a> FnOnce(
             &'a Accessor<T>,
         ) -> Pin<Box<dyn Future<Output = wasmtime::Result<()>> + Send + 'a>>
@@ -88,7 +88,7 @@ pub type ComponentLoop<T = BoxHost> = Box<
 /// Builds a box's root store and device workers.
 pub struct BoxRuntime {
     pub store: Store<BoxHost>,
-    pub(crate) mmio: Option<crate::component::vmm::mmio::Router>,
+    pub(crate) vmm: Option<crate::component::vmm::VmmInstance>,
     epoch_clock: Arc<EpochClock>,
     memory_budget: Arc<BoxMemoryBudget>,
     shutdown: watch::Sender<bool>,
@@ -105,7 +105,7 @@ pub struct PreparedBoxRuntime {
     failure: Option<Arc<std::sync::Mutex<Option<String>>>>,
 }
 
-pub struct DeviceWorker<H: StoreHost> {
+pub(crate) struct DeviceWorker<H: StoreHost> {
     pub store: Store<StoreState<H>>,
     epoch_clock: Arc<EpochClock>,
     component_loops: Vec<ComponentLoop<StoreState<H>>>,
@@ -184,13 +184,13 @@ impl BoxRuntime {
         self.store.data().lifecycle.native_teardown()
     }
 
-    pub fn mmio_failure_observation(
+    pub fn vmm_failure_observation(
         &self,
-    ) -> wasmtime::Result<crate::component::vmm::mmio::FailureObservation> {
-        self.mmio
+    ) -> wasmtime::Result<crate::component::vmm::FailureObservation> {
+        self.vmm
             .as_ref()
-            .map(crate::component::vmm::mmio::Router::failure_observation)
-            .ok_or_else(|| wasmtime::Error::msg("MMIO router missing"))
+            .map(crate::component::vmm::VmmInstance::failure_observation)
+            .ok_or_else(|| wasmtime::Error::msg("VMM missing"))
     }
 }
 
@@ -266,7 +266,7 @@ impl PreparedBoxRuntime {
         .await;
         if let Err(error) = &result {
             if let Some(failure) = &failure {
-                crate::component::vmm::mmio::Router::record_failure_in(failure, error);
+                crate::component::vmm::VmmInstance::record_failure_in(failure, error);
             }
             lifecycle.component_failed();
             lifecycle.publish_outcome(crate::component::vmm::lifecycle::Outcome::ComponentFailed);

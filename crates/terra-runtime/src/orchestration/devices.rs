@@ -1,44 +1,37 @@
-use super::WorkerInput;
+use super::VmInput;
+use crate::machine::DeviceKind;
 use std::path::PathBuf;
 
 pub(crate) fn assemble_devices(
     runtime: &mut crate::box_runtime::BoxRuntime,
-    input: &mut WorkerInput,
+    input: &mut VmInput,
     ram: crate::component::vmm::RamGrant,
     disks: &[(PathBuf, bool)],
-    bind_interrupt: impl Fn(
-        crate::component::vmm::DeviceKind,
-        usize,
-    ) -> Result<crate::component::InterruptCallback, String>,
+    bind_interrupt: impl Fn(DeviceKind, usize) -> Result<crate::component::InterruptCallback, String>,
 ) -> Result<(), String> {
     blocks(runtime, ram.clone(), input, disks, |index| {
-        bind_interrupt(crate::component::vmm::DeviceKind::Block, index)
+        bind_interrupt(DeviceKind::Block, index)
     })?;
     filesystems(runtime, ram.clone(), input, |index| {
-        bind_interrupt(crate::component::vmm::DeviceKind::Fs, index)
+        bind_interrupt(DeviceKind::Fs, index)
     })?;
     memory(
         runtime,
         ram.clone(),
         input,
-        bind_interrupt(crate::component::vmm::DeviceKind::Memory, 0)?,
+        bind_interrupt(DeviceKind::Memory, 0)?,
     )?;
     network(
         runtime,
         ram.clone(),
         input,
-        bind_interrupt(crate::component::vmm::DeviceKind::Net, 0)?,
+        bind_interrupt(DeviceKind::Net, 0)?,
     )?;
-    vsock(
-        runtime,
-        ram,
-        input,
-        bind_interrupt(crate::component::vmm::DeviceKind::Vsock, 0)?,
-    )?;
+    vsock(runtime, ram, input, bind_interrupt(DeviceKind::Vsock, 0)?)?;
     Ok(())
 }
 
-pub(crate) fn disk_paths(input: &WorkerInput) -> Vec<(PathBuf, bool)> {
+pub(crate) fn disk_paths(input: &VmInput) -> Vec<(PathBuf, bool)> {
     let mut disks = Vec::with_capacity(1 + input.volume_disks.len());
     disks.push((input.root_disk.clone(), false));
     disks.extend(input.volume_disks.iter().cloned().map(|path| (path, false)));
@@ -48,12 +41,12 @@ pub(crate) fn disk_paths(input: &WorkerInput) -> Vec<(PathBuf, bool)> {
 fn blocks(
     runtime: &mut crate::box_runtime::BoxRuntime,
     ram: impl Into<crate::component::vmm::RamGrant> + Send,
-    input: &mut WorkerInput,
+    input: &mut VmInput,
     disks: &[(PathBuf, bool)],
     interrupt: impl Fn(usize) -> Result<crate::component::InterruptCallback, String>,
 ) -> Result<(), String> {
+    use crate::component::block::BlockHost;
     use crate::component::block::backing::{DiskGrant, FileDisk};
-    use crate::component::block::host::BlockHost;
     let component = input
         .artifacts
         .block()
@@ -90,7 +83,7 @@ fn blocks(
 fn network(
     runtime: &mut crate::box_runtime::BoxRuntime,
     ram: impl Into<crate::component::vmm::RamGrant> + Send,
-    input: &WorkerInput,
+    input: &VmInput,
     interrupt: crate::component::InterruptCallback,
 ) -> Result<(), String> {
     use crate::component::context::DeviceContext;
@@ -116,7 +109,7 @@ fn network(
 fn filesystems(
     runtime: &mut crate::box_runtime::BoxRuntime,
     ram: impl Into<crate::component::vmm::RamGrant> + Send,
-    input: &WorkerInput,
+    input: &VmInput,
     interrupt: impl Fn(usize) -> Result<crate::component::InterruptCallback, String>,
 ) -> Result<(), String> {
     use crate::component::context::DeviceContext;
@@ -171,7 +164,7 @@ fn filesystem_resource_capacity_for(limit: usize, shares: usize) -> usize {
 fn memory(
     runtime: &mut crate::box_runtime::BoxRuntime,
     ram: impl Into<crate::component::vmm::RamGrant> + Send,
-    input: &WorkerInput,
+    input: &VmInput,
     interrupt: crate::component::InterruptCallback,
 ) -> Result<(), String> {
     use crate::component::context::DeviceContext;
@@ -194,7 +187,7 @@ fn memory(
 fn vsock(
     runtime: &mut crate::box_runtime::BoxRuntime,
     ram: impl Into<crate::component::vmm::RamGrant> + Send,
-    input: &mut WorkerInput,
+    input: &mut VmInput,
     interrupt: crate::component::InterruptCallback,
 ) -> Result<(), String> {
     crate::component::vsock::VsockChannel::from_trusted_artifact(
@@ -243,7 +236,7 @@ mod tests {
                 include_bytes!("../../../../build/terra-vmm-component.cwasm"),
             )
         };
-        let input = super::WorkerInput {
+        let input = super::VmInput {
             component_memory_limits: crate::box_runtime::ComponentMemoryLimits::default(),
             kernel: Vec::new(),
             boot_disk: Vec::new(),

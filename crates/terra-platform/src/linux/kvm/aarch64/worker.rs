@@ -6,9 +6,8 @@ use std::time::{Duration, Instant};
 
 use super::ArmWorkerError;
 use super::machine::Machine;
-use crate::aarch64::arm::MAX_VCPUS;
+use crate::linux::runner::{PthreadPublication, install_kick_handler, unblock_kick_signal};
 use crate::memory::GuestMemory;
-use crate::runner::{PthreadPublication, install_kick_handler, unblock_kick_signal};
 use crate::vm::{
     BootState, InterruptControllerConfig, InterruptMode, VcpuAction, VcpuExit as NativeExit,
     VcpuHandler, VcpuOutcome, VmCapabilities, VmConfig, VmHandle,
@@ -18,6 +17,7 @@ use kvm_bindings::{
     KVM_SYSTEM_EVENT_SHUTDOWN, kvm_regs, user_pt_regs,
 };
 use kvm_ioctls::{Kvm, VcpuExit, VcpuFd};
+use terra_limits::ARM_MAX_VCPUS;
 
 const STOP_DEADLINE: Duration = Duration::from_secs(5);
 
@@ -190,7 +190,7 @@ impl KvmArmVm {
                 return Err(ArmWorkerError::InvalidInterruptController);
             }
         }
-        if vcpus == 0 || vcpus > MAX_VCPUS {
+        if vcpus == 0 || vcpus > ARM_MAX_VCPUS as usize {
             return Err(ArmWorkerError::BadVcpuCount(vcpus));
         }
         let kvm = Kvm::new().map_err(|error| {

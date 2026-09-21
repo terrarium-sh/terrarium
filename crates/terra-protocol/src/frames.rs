@@ -1,23 +1,14 @@
 //! The framed wire protocol spoken across host/guest channels.
 
+use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 #[cfg(feature = "tokio")]
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub struct TermSize {
-    pub rows: u16,
-    pub cols: u16,
-}
-
 /// Ceiling on a frame's payload; the reader refuses a peer's length past it
 /// before allocating.
 const MAX_FRAME_BYTES: usize = 8 << 20;
-
-pub const MAX_PLAN_BYTES: usize = 1 << 20;
-pub const MAX_PLAN_HOST_STATE_BYTES: usize = 1024;
 
 /// Read a `u32`-LE length prefix; see [`MAX_FRAME_BYTES`]. Returns `None` on a
 /// clean EOF at a frame boundary.
@@ -145,43 +136,6 @@ pub fn read_frame_with_limit<T: DeserializeOwned>(
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ClientInput {
-    Keys(Vec<u8>),
-    Resize(TermSize),
-    Eof,
-}
-
-/// A framed response from the agent to a client.
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum AgentOutput {
-    Out(Vec<u8>),
-    Err(Vec<u8>),
-    Exit {
-        code: i32,
-    },
-    /// Distinguishes a requested detach from a workload exit.
-    Detached,
-}
-
-pub use crate::control::LifecycleEvent;
-
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ControlRequest {
-    List,
-    Detach { id: u64 },
-    DetachAll,
-}
-
-/// The agent's answer to a [`ControlRequest`].
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ControlReply {
-    Client { id: u64, size: Option<TermSize> },
-    Done,
-    Detached { id: u64 },
-    Missing { id: u64 },
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,7 +143,7 @@ mod tests {
     #[cfg(feature = "tokio")]
     #[tokio::test]
     async fn async_frames_share_the_sync_wire_format() {
-        let value = ControlReply::Detached { id: 7 };
+        let value = 7_u8;
         let (mut sync_writer, mut async_reader) = tokio::io::duplex(128);
         sync_writer
             .write_all(&encode_frame(&value).unwrap())
@@ -202,16 +156,11 @@ mod tests {
         );
 
         let (mut async_writer, mut sync_reader) = tokio::io::duplex(128);
-        write_frame_async(&mut async_writer, &ControlReply::Done)
-            .await
-            .unwrap();
+        write_frame_async(&mut async_writer, &9_u8).await.unwrap();
         async_writer.shutdown().await.unwrap();
         let mut bytes = Vec::new();
         sync_reader.read_to_end(&mut bytes).await.unwrap();
-        assert_eq!(
-            read_frame::<ControlReply>(&mut bytes.as_slice()).unwrap(),
-            Some(ControlReply::Done)
-        );
+        assert_eq!(read_frame::<u8>(&mut bytes.as_slice()).unwrap(), Some(9));
     }
 
     #[cfg(feature = "tokio")]
@@ -223,7 +172,7 @@ mod tests {
         ] {
             let (mut writer, mut reader) = tokio::io::duplex(4);
             writer.write_all(&length.to_le_bytes()).await.unwrap();
-            let error = read_frame_async_with_limit::<ControlReply>(&mut reader, limit)
+            let error = read_frame_async_with_limit::<u8>(&mut reader, limit)
                 .await
                 .unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidData);
@@ -233,12 +182,12 @@ mod tests {
     #[cfg(feature = "tokio")]
     #[tokio::test]
     async fn async_frames_reject_truncated_and_oversized_input() {
-        let frame = encode_frame(&ControlReply::Done).unwrap();
+        let frame = encode_frame(&7_u8).unwrap();
         let (mut writer, mut reader) = tokio::io::duplex(128);
         writer.write_all(&frame[..frame.len() - 1]).await.unwrap();
         writer.shutdown().await.unwrap();
         assert_eq!(
-            read_frame_async::<ControlReply>(&mut reader)
+            read_frame_async::<u8>(&mut reader)
                 .await
                 .unwrap_err()
                 .kind(),
@@ -249,7 +198,7 @@ mod tests {
         writer.write_all(&u32::MAX.to_le_bytes()).await.unwrap();
         writer.shutdown().await.unwrap();
         assert_eq!(
-            read_frame_async::<ControlReply>(&mut reader)
+            read_frame_async::<u8>(&mut reader)
                 .await
                 .unwrap_err()
                 .kind(),
@@ -261,62 +210,34 @@ mod tests {
     fn frame_limits_reject_the_prefix_before_reading_payload() {
         for (limit, claimed) in [(32, 33_u32), (usize::MAX, u32::MAX)] {
             let mut reader = std::io::Cursor::new(claimed.to_le_bytes());
-            let error = read_frame_with_limit::<ControlReply>(&mut reader, limit).unwrap_err();
+            let error = read_frame_with_limit::<u8>(&mut reader, limit).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidData);
             assert_eq!(reader.position(), 4);
         }
-        let frame = encode_frame(&ControlReply::Done).unwrap();
+        let frame = encode_frame(&7_u8).unwrap();
         let limit = frame.len() - 4;
         assert_eq!(
-            read_frame_with_limit::<ControlReply>(&mut frame.as_slice(), limit).unwrap(),
-            Some(ControlReply::Done)
+            read_frame_with_limit::<u8>(&mut frame.as_slice(), limit).unwrap(),
+            Some(7)
         );
         assert_eq!(
-            read_frame_with_limit::<ControlReply>(&mut [].as_slice(), limit).unwrap(),
+            read_frame_with_limit::<u8>(&mut [].as_slice(), limit).unwrap(),
             None
         );
     }
 
     #[test]
-    fn plan_limit_rejects_an_oversized_plan_before_allocating() {
-        let over_limit = u32::try_from(MAX_PLAN_BYTES + 1).unwrap();
-        let mut reader = std::io::Cursor::new(over_limit.to_le_bytes());
-        let error = read_frame_with_limit::<crate::Plan>(&mut reader, MAX_PLAN_BYTES).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert_eq!(reader.position(), 4);
-    }
-
-    #[test]
     fn encoding_with_a_limit_rejects_the_payload() {
-        let value = ClientInput::Keys(b"input".to_vec());
+        let value = "input";
         let payload_bytes = encode_frame(&value).unwrap().len() - 4;
         let error = encode_frame_with_limit(&value, payload_bytes - 1).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Other);
     }
 
     #[test]
-    fn round_trip_client_input_frames() {
-        for msg in [
-            ClientInput::Keys(b"ls -la\n".to_vec()),
-            ClientInput::Keys(vec![]),
-            ClientInput::Resize(TermSize {
-                rows: 40,
-                cols: 120,
-            }),
-            ClientInput::Eof,
-        ] {
-            let encoded = encode_frame(&msg).unwrap();
-            let mut cur = std::io::Cursor::new(encoded);
-            assert_eq!(read_frame(&mut cur).unwrap(), Some(msg));
-        }
-        let mut empty = std::io::Cursor::new(Vec::new());
-        assert_eq!(read_frame::<ClientInput>(&mut empty).unwrap(), None);
-    }
-
-    #[test]
     fn refuse_oversized_frame() {
-        let big = vec![b'x'; MAX_FRAME_BYTES + 1];
-        let err = encode_frame(&ClientInput::Keys(big)).unwrap_err();
+        let big = "x".repeat(MAX_FRAME_BYTES + 1);
+        let err = encode_frame(&big).unwrap_err();
         assert!(err.to_string().contains("exceeds"), "{err}");
     }
 
@@ -325,87 +246,7 @@ mod tests {
     fn refuse_absurd_client_frame_before_allocating() {
         let mut wire = Vec::new();
         wire.extend_from_slice(&u32::MAX.to_le_bytes());
-        let err = read_frame::<ClientInput>(&mut std::io::Cursor::new(wire)).unwrap_err();
+        let err = read_frame::<u8>(&mut std::io::Cursor::new(wire)).unwrap_err();
         assert!(err.to_string().contains("exceeds"), "{err}");
-    }
-
-    /// An exec's output and its exit status share one stream, so the status has
-    /// to survive whatever the command printed - a `\x01` in the output must not
-    /// be read as an exit frame, and a negative code must round-trip.
-    #[test]
-    fn round_trip_exec_output_and_exit_status() {
-        for msg in [
-            AgentOutput::Out(b"\x00\x01\x02 arbitrary \xff bytes\n".to_vec()),
-            AgentOutput::Out(vec![]),
-            AgentOutput::Err(b"warning: \x01\x02\n".to_vec()),
-            AgentOutput::Exit { code: 0 },
-            AgentOutput::Exit { code: 127 },
-            AgentOutput::Exit { code: -1 },
-            AgentOutput::Detached,
-        ] {
-            let mut cur = std::io::Cursor::new(encode_frame(&msg).unwrap());
-            assert_eq!(read_frame(&mut cur).unwrap(), Some(msg));
-        }
-        let mut empty = std::io::Cursor::new(Vec::new());
-        assert_eq!(read_frame::<AgentOutput>(&mut empty).unwrap(), None);
-    }
-
-    #[test]
-    fn round_trip_lifecycle_events() {
-        for event in [
-            LifecycleEvent::Diagnostic {
-                bytes: b"hook output".to_vec(),
-            },
-            LifecycleEvent::Exit { code: 23 },
-        ] {
-            let mut cur = std::io::Cursor::new(encode_frame(&event).unwrap());
-            assert_eq!(read_frame(&mut cur).unwrap(), Some(event));
-        }
-    }
-
-    #[test]
-    fn round_trip_control_requests() {
-        for msg in [
-            ControlRequest::List,
-            ControlRequest::Detach { id: 0 },
-            ControlRequest::Detach { id: u64::MAX },
-            ControlRequest::DetachAll,
-        ] {
-            let encoded = encode_frame(&msg).unwrap();
-            let mut cur = std::io::Cursor::new(encoded);
-            assert_eq!(read_frame(&mut cur).unwrap(), Some(msg));
-        }
-        let mut empty = std::io::Cursor::new(Vec::new());
-        assert_eq!(read_frame::<ControlRequest>(&mut empty).unwrap(), None);
-    }
-
-    #[test]
-    fn round_trip_control_replies() {
-        for msg in [
-            ControlReply::Client {
-                id: 7,
-                size: Some(TermSize {
-                    rows: 40,
-                    cols: 120,
-                }),
-            },
-            ControlReply::Client { id: 3, size: None },
-            ControlReply::Done,
-            ControlReply::Detached { id: 2 },
-            ControlReply::Missing { id: 9 },
-        ] {
-            let encoded = encode_frame(&msg).unwrap();
-            let mut cur = std::io::Cursor::new(encoded);
-            assert_eq!(read_frame(&mut cur).unwrap(), Some(msg));
-        }
-    }
-
-    #[test]
-    fn refuse_bad_control_frame() {
-        let mut bad = Vec::new();
-        bad.extend_from_slice(&4u32.to_le_bytes());
-        bad.extend_from_slice(b"nope");
-        let err = read_frame::<ControlReply>(&mut std::io::Cursor::new(bad)).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }

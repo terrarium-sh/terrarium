@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use terra_runtime::component::vmm::mmio::{Operation, Reply as MmioReply, Request};
-use terra_runtime::component::vsock::host::{VsockDeviceHost, vsock_component_linker};
+use terra_runtime::component::vsock::{VsockDeviceHost, vsock_component_linker};
 use terra_runtime::engine::device_engine;
 use terra_runtime::test_support::{StandaloneHost, device_store};
 use terra_vsock_device::VsockHeader;
@@ -27,8 +27,7 @@ struct Reply {
 }
 
 type Replies = TypedFunc<(u32, u32), (Vec<Reply>,)>;
-type Receive =
-    TypedFunc<(Vec<u8>,), (Result<(), terra_runtime::component::vsock::host::VsockError>,)>;
+type Receive = TypedFunc<(Vec<u8>,), (Result<(), terra_runtime::component::vsock::VsockError>,)>;
 type Serve = TypedFunc<(StreamReader<Request>,), (StreamReader<MmioReply>,)>;
 
 async fn next_reply(
@@ -154,7 +153,7 @@ async fn serve_and_disconnect(
 }
 
 struct Worker {
-    run: TypedFunc<(), (Result<(), terra_runtime::component::vsock::host::VsockError>,)>,
+    run: TypedFunc<(), (Result<(), terra_runtime::component::vsock::VsockError>,)>,
     close: TypedFunc<(), ()>,
     replies: Replies,
     receive: Receive,
@@ -240,7 +239,7 @@ async fn create_worker(
         &engine,
         VsockDeviceHost::new(
             terra_runtime::memory::GuestRam::new(4096).unwrap(),
-            terra_runtime::component::vsock::host::VsockHostService::new(
+            terra_runtime::component::vsock::VsockHostService::new(
                 vec![2, 0, 0, 0, b'{', b'}'],
                 Some(listener),
                 None,
@@ -283,14 +282,14 @@ async fn create_worker(
         .unwrap();
     drive_transport_ready(&mut store, serve).await;
     let events = instance
-        .get_typed_func::<(), (StreamReader<terra_runtime::component::vsock::host::VsockEvent>,)>(
+        .get_typed_func::<(), (StreamReader<terra_runtime::component::vsock::VsockEvent>,)>(
             &mut store,
             export("events"),
         )
         .unwrap();
     let (_events,) = events.call_async(&mut store, ()).await.unwrap();
     let run = instance
-        .get_typed_func::<(), (Result<(), terra_runtime::component::vsock::host::VsockError>,)>(
+        .get_typed_func::<(), (Result<(), terra_runtime::component::vsock::VsockError>,)>(
             &mut store,
             export("run"),
         )
@@ -612,7 +611,7 @@ async fn shared_close_releases_the_diagnostic_sink() {
     )
     .unwrap();
     let router = Component::new(&engine, support::artifacts::wasm::VMM).unwrap();
-    runtime.initialize_mmio(&router).await.unwrap();
+    runtime.initialize_vmm(&router).await.unwrap();
     let output = tempfile::NamedTempFile::new().unwrap();
     let artifact = support::artifacts::trusted_artifacts().vsock();
     let channel = terra_runtime::component::vsock::VsockChannel::from_trusted_artifact(

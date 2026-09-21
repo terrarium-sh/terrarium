@@ -67,6 +67,12 @@ fn boot_probe_plan(vcpus: usize) -> Vec<u8> {
     )
 }
 
+async fn run_vm(
+    input: super::orchestration::VmInput,
+) -> Result<super::orchestration::VmOutcome, String> {
+    super::orchestration::prepare(input).await?.run().await
+}
+
 fn agent_bridge_plan() -> Vec<u8> {
     boot_plan(
         terra_protocol::PlanMode::Run,
@@ -105,7 +111,7 @@ async fn kernel_boots_directory_share() {
         readonly: false,
     });
     let (kernel, boot_disk, root_disk) = kernel_boot_assets();
-    let outcome = super::worker::run(super::worker::WorkerInput {
+    let outcome = run_vm(super::orchestration::VmInput {
         component_memory_limits: crate::box_runtime::ComponentMemoryLimits::default(),
         kernel,
         boot_disk,
@@ -178,7 +184,7 @@ async fn kernel_boots_to_agent_ready() {
         2
     };
     let (kernel, boot_disk, root_path) = kernel_boot_assets();
-    let outcome = super::worker::run(super::worker::WorkerInput {
+    let outcome = run_vm(super::orchestration::VmInput {
         component_memory_limits: crate::box_runtime::ComponentMemoryLimits::default(),
         kernel,
         boot_disk,
@@ -215,7 +221,7 @@ async fn kernel_reports_free_pages_after_boot() {
         2
     };
     let (kernel, boot_disk, root_path) = kernel_boot_assets();
-    let outcome = super::worker::run(super::worker::WorkerInput {
+    let outcome = run_vm(super::orchestration::VmInput {
         component_memory_limits: crate::box_runtime::ComponentMemoryLimits::default(),
         kernel,
         boot_disk,
@@ -513,7 +519,7 @@ async fn kernel_boots_to_agent_bridge() {
     let (kernel, boot_disk, root_path) = kernel_boot_assets();
     let client_path = socket_path.clone();
     let client = tokio::task::spawn_blocking(move || assert_agent_control_and_exec(&client_path));
-    let worker = super::worker::run(super::worker::WorkerInput {
+    let worker = run_vm(super::orchestration::VmInput {
         component_memory_limits: crate::box_runtime::ComponentMemoryLimits::default(),
         kernel,
         boot_disk,
@@ -558,7 +564,7 @@ async fn kernel_boots_and_agent_stop_ends_workload() {
         assert_agent_control_and_exec(&client_path)?;
         control_writer.write_all(&[terra_protocol::STOP_SIGNAL])
     });
-    let worker = super::worker::run(super::worker::WorkerInput {
+    let worker = run_vm(super::orchestration::VmInput {
         component_memory_limits: crate::box_runtime::ComponentMemoryLimits::default(),
         kernel,
         boot_disk,
@@ -603,7 +609,7 @@ async fn kernel_boots_foreground_session_reports_workload_exit() {
     let (kernel, boot_disk, root_path) = kernel_boot_assets();
     let client_path = socket_path.clone();
     let client = tokio::task::spawn_blocking(move || await_foreground_workload(&client_path));
-    let worker = super::worker::run(super::worker::WorkerInput {
+    let worker = run_vm(super::orchestration::VmInput {
         component_memory_limits: crate::box_runtime::ComponentMemoryLimits::default(),
         kernel,
         boot_disk,
@@ -670,7 +676,7 @@ async fn assert_policy_dns_http(address: std::net::IpAddr, body: &[u8]) {
         assert_eq!(output, body);
         Ok::<(), std::io::Error>(())
     });
-    let worker = super::worker::run(super::worker::WorkerInput {
+    let worker = run_vm(super::orchestration::VmInput {
         component_memory_limits: crate::box_runtime::ComponentMemoryLimits::default(),
         kernel,
         boot_disk,
@@ -714,7 +720,7 @@ async fn assert_policy_dns_upload(address: std::net::IpAddr, bytes: usize) {
         );
         Ok::<(), std::io::Error>(())
     });
-    let worker = super::worker::run(super::worker::WorkerInput {
+    let worker = run_vm(super::orchestration::VmInput {
         component_memory_limits: crate::box_runtime::ComponentMemoryLimits::default(),
         kernel,
         boot_disk,
@@ -827,7 +833,7 @@ async fn assert_published_loopback_http(host_closes_first: bool) {
         control_writer.write_all(&[terra_protocol::STOP_SIGNAL])?;
         Ok::<Vec<u8>, std::io::Error>(response)
     });
-    let worker = super::worker::run(super::worker::WorkerInput {
+    let worker = run_vm(super::orchestration::VmInput {
         component_memory_limits: crate::box_runtime::ComponentMemoryLimits::default(),
         kernel,
         boot_disk,

@@ -1,4 +1,3 @@
-use crate::aarch64::arm::MAX_VCPUS;
 use crate::macos::aarch64::machine::{Cpu, Machine, RunExit};
 use crate::vm::{
     ArmException, ArmRead, BootState, CpuStart, HvcResult, InterruptControllerConfig,
@@ -10,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Instant;
+use terra_limits::ARM_MAX_VCPUS;
 
 const STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -150,7 +150,7 @@ impl MacArmVm {
                 return Err("ARM interrupt controller required".to_owned());
             }
         }
-        if vcpus == 0 || vcpus > MAX_VCPUS {
+        if vcpus == 0 || vcpus > ARM_MAX_VCPUS as usize {
             return Err(format!("invalid vCPU count: {vcpus}"));
         }
         let machine = Arc::new(Machine::new(config).map_err(|error| error.to_string())?);

@@ -32,7 +32,7 @@ pub struct TrustedArtifacts {
     fs: TrustedArtifact,
     mem: TrustedArtifact,
     boot: TrustedArtifact,
-    mmio: TrustedArtifact,
+    vmm: TrustedArtifact,
 }
 
 impl TrustedArtifacts {
@@ -49,7 +49,7 @@ impl TrustedArtifacts {
         fs: &'static [u8],
         mem: &'static [u8],
         boot: &'static [u8],
-        mmio: &'static [u8],
+        vmm: &'static [u8],
     ) -> Self {
         Self {
             block: TrustedArtifact(block),
@@ -58,7 +58,7 @@ impl TrustedArtifacts {
             fs: TrustedArtifact(fs),
             mem: TrustedArtifact(mem),
             boot: TrustedArtifact(boot),
-            mmio: TrustedArtifact(mmio),
+            vmm: TrustedArtifact(vmm),
         }
     }
 
@@ -93,7 +93,7 @@ impl TrustedArtifacts {
     }
 
     #[must_use]
-    pub const fn mmio(&self) -> TrustedArtifact {
-        self.mmio
+    pub const fn vmm(&self) -> TrustedArtifact {
+        self.vmm
     }
 }

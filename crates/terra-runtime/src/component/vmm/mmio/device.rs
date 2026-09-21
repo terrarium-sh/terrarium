@@ -5,6 +5,7 @@ use super::{
     DeviceRequestCounts, Mutex, Operation, Ordering, Pending, Reply, enqueue, recorded_failure,
     submit, submit_async, wait_for_reply,
 };
+use crate::machine::{Architecture, DeviceKind};
 
 #[derive(Copy, Clone, Eq, PartialEq)]
 enum DeviceState {
@@ -42,10 +43,10 @@ pub struct MmioDevice {
 impl MmioDevice {
     pub(crate) fn grant_worker(
         root: &mut BoxRuntime,
-        kind: crate::component::vmm::bindings::machine::DeviceKind,
+        kind: DeviceKind,
         setup: crate::box_runtime::setup::Setup,
     ) -> wasmtime::Result<Self> {
-        root.mmio
+        root.vmm
             .as_ref()
             .ok_or_else(|| wasmtime::Error::msg("MMIO router missing"))?;
         wasmtime::ensure!(
@@ -53,13 +54,13 @@ impl MmioDevice {
             "box has too many components"
         );
         let config = root.store.data().platform.machine_config().cloned();
-        let router = root
-            .mmio
+        let instance = root
+            .vmm
             .as_mut()
             .ok_or_else(|| wasmtime::Error::msg("MMIO router missing"))?;
-        let slot = u32::try_from(router.device_plan.len())?;
+        let slot = u32::try_from(instance.device_plan.len())?;
         let mapping = if let Some(config) = config {
-            let ordinal = router
+            let ordinal = instance
                 .device_plan
                 .iter()
                 .filter(|plan| plan.device.kind == kind)
@@ -73,8 +74,8 @@ impl MmioDevice {
                     (
                         device.mmio_base,
                         match config.architecture() {
-                            crate::component::vmm::virtualization::Architecture::X86 => DEVICE_SPAN,
-                            crate::component::vmm::virtualization::Architecture::Arm => 0x200,
+                            Architecture::X86 => DEVICE_SPAN,
+                            Architecture::Arm => 0x200,
                         },
                     )
                 })
@@ -89,13 +90,13 @@ impl MmioDevice {
         });
         let channel = Self {
             device: Arc::clone(&device),
-            sender: router.sender.clone(),
-            control_sender: router.control_sender.clone(),
+            sender: instance.sender.clone(),
+            control_sender: instance.control_sender.clone(),
             state: Arc::new(Mutex::new(DeviceState::Open)),
-            admission: Arc::clone(&router.admission),
-            failure: Arc::clone(&router.failure),
+            admission: Arc::clone(&instance.admission),
+            failure: Arc::clone(&instance.failure),
         };
-        router.device_plan.push(DevicePlan {
+        instance.device_plan.push(DevicePlan {
             device,
             mapping,
             setup,
@@ -104,18 +105,18 @@ impl MmioDevice {
     }
 
     pub(crate) fn revoke_worker(&self, root: &mut BoxRuntime) -> wasmtime::Result<()> {
-        let router = root
-            .mmio
+        let instance = root
+            .vmm
             .as_mut()
             .ok_or_else(|| wasmtime::Error::msg("MMIO router missing"))?;
         wasmtime::ensure!(
-            router
+            instance
                 .device_plan
                 .last()
                 .is_some_and(|plan| Arc::ptr_eq(&plan.device, &self.device)),
             "device is not the latest box grant"
         );
-        router.device_plan.pop();
+        instance.device_plan.pop();
         Ok(())
     }
 
@@ -124,11 +125,11 @@ impl MmioDevice {
             size != 0 && base.checked_add(size).is_some(),
             "invalid MMIO mapping"
         );
-        let router = runtime
-            .mmio
+        let instance = runtime
+            .vmm
             .as_mut()
             .ok_or_else(|| wasmtime::Error::msg("MMIO router missing"))?;
-        let plan = router
+        let plan = instance
             .device_plan
             .get_mut(usize::try_from(self.device.slot)?)
             .filter(|plan| Arc::ptr_eq(&plan.device, &self.device))
@@ -312,7 +313,7 @@ mod tests {
         let (control_sender, controls) = tokio::sync::mpsc::channel(1);
         let device = MmioDevice {
             device: Arc::new(DeviceRegistration {
-                kind: crate::component::vmm::bindings::machine::DeviceKind::Block,
+                kind: DeviceKind::Block,
                 slot: 0,
                 base: AtomicU64::new(0),
                 counts: DeviceRequestCounts::default(),
@@ -409,10 +410,10 @@ mod tests {
             let engine = crate::engine::device_engine().unwrap();
             let mut runtime =
                 BoxRuntime::new(&engine, crate::box_runtime::store::BoxHost::new()).unwrap();
-            super::super::initialize_test_router(&mut runtime)
+            crate::component::vmm::initialize_test_vmm(&mut runtime)
                 .await
                 .unwrap();
-            let registry = Arc::downgrade(&runtime.mmio.as_ref().unwrap().devices);
+            let registry = Arc::downgrade(&runtime.vmm.as_ref().unwrap().devices);
             let cancelled = tokio_util::sync::CancellationToken::new();
             let owner = cancelled.clone().drop_guard();
             let (entered, started) = tokio::sync::oneshot::channel();
@@ -426,12 +427,7 @@ mod tests {
                     wasmtime::bail!("injected setup failure")
                 })
             });
-            MmioDevice::grant_worker(
-                &mut runtime,
-                crate::component::vmm::bindings::machine::DeviceKind::Block,
-                setup,
-            )
-            .unwrap();
+            MmioDevice::grant_worker(&mut runtime, DeviceKind::Block, setup).unwrap();
             {
                 let preparation = runtime.prepare();
                 tokio::pin!(preparation);
@@ -456,7 +452,7 @@ mod tests {
         let engine = crate::engine::device_engine().unwrap();
         let mut runtime =
             BoxRuntime::new(&engine, crate::box_runtime::store::BoxHost::new()).unwrap();
-        super::super::initialize_test_router(&mut runtime)
+        crate::component::vmm::initialize_test_vmm(&mut runtime)
             .await
             .unwrap();
         for _ in 0..crate::box_runtime::MAX_BOX_COMPONENTS {
@@ -465,13 +461,9 @@ mod tests {
         }
         let setup: crate::box_runtime::setup::Setup =
             Box::new(|_| Box::pin(async { panic!("over-capacity setup must not run") }));
-        let error = MmioDevice::grant_worker(
-            &mut runtime,
-            crate::component::vmm::bindings::machine::DeviceKind::Block,
-            setup,
-        )
-        .err()
-        .unwrap();
+        let error = MmioDevice::grant_worker(&mut runtime, DeviceKind::Block, setup)
+            .err()
+            .unwrap();
         assert_eq!(error.to_string(), "box has too many components");
     }
 
@@ -493,13 +485,9 @@ mod tests {
         let setup: crate::box_runtime::setup::Setup =
             Box::new(|_| Box::pin(async { unreachable!() }));
 
-        let error = MmioDevice::grant_worker(
-            &mut runtime,
-            crate::component::vmm::bindings::machine::DeviceKind::Block,
-            setup,
-        )
-        .err()
-        .expect("MMIO router is required");
+        let error = MmioDevice::grant_worker(&mut runtime, DeviceKind::Block, setup)
+            .err()
+            .expect("MMIO router is required");
 
         assert!(error.to_string().contains("MMIO router missing"));
     }
