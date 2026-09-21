@@ -1,5 +1,7 @@
 //! AMD64 WHP planned-boot register state.
 
+pub mod worker;
+
 use windows_sys::Win32::System::Hypervisor::{
     WHV_REGISTER_VALUE, WHV_X64_SEGMENT_REGISTER, WHV_X64_SEGMENT_REGISTER_0,
     WHV_X64_TABLE_REGISTER,

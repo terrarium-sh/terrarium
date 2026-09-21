@@ -1,5 +1,7 @@
 //! `AArch64` WHP register names absent from the current `windows-rs` metadata.
 
+pub mod worker;
+
 use windows_sys::Win32::System::Hypervisor::WHV_REGISTER_NAME;
 
 use super::whp::{Partition, PartitionError};

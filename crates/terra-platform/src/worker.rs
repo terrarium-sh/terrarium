@@ -56,7 +56,7 @@ pub(crate) async fn boot_prepared<
     let boot = input.artifacts.boot().deserialize(runtime.store.engine())?;
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     let kernel_cmdline = crate::windows::amd64::build_kernel_cmdline(
-        crate::windows::whp::query_tsc_frequency().map_err(|error| {
+        crate::windows::whp::amd64::query_tsc_frequency().map_err(|error| {
             wasmtime::Error::msg(format!("querying the WHP guest clock: {error}"))
         })?,
     )?;
@@ -212,8 +212,10 @@ use crate::linux::kvm::aarch64::worker::prepare as prepare_native;
 use crate::linux::kvm::amd64::worker::prepare as prepare_native;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use crate::macos::aarch64::worker::prepare as prepare_native;
-#[cfg(target_os = "windows")]
-use crate::windows::worker::prepare as prepare_native;
+#[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+use crate::windows::aarch64::worker::prepare as prepare_native;
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+use crate::windows::amd64::worker::prepare as prepare_native;
 
 #[cfg(test)]
 mod tests {
