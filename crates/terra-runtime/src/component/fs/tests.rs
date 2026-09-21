@@ -1,7 +1,7 @@
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt as _, symlink as symlink_dir, symlink as symlink_file};
+use std::os::unix::fs::{MetadataExt as _, symlink as symlink_file};
 #[cfg(windows)]
-use std::os::windows::fs::{symlink_dir, symlink_file};
+use std::os::windows::fs::symlink_file;
 
 use wasmtime::component::Resource;
 use wasmtime_wasi::{
@@ -14,39 +14,10 @@ use wasmtime_wasi::{
 };
 
 use crate::component::context::DeviceContext;
-use crate::component::fs::host::{FsHost, ShareGrant};
+use crate::component::fs::{FsHost, ShareGrant};
 
 fn host(grant: ShareGrant) -> FsHost {
     FsHost::new(DeviceContext::new(4096).unwrap(), grant)
-}
-
-#[test]
-fn mount_source_requires_a_directory_without_a_leaf_symlink() {
-    let root = tempfile::tempdir().unwrap();
-    let base = std::fs::canonicalize(root.path()).unwrap();
-    let directory = base.join("directory");
-    std::fs::create_dir(&directory).unwrap();
-    let link = base.join("link");
-    symlink_dir(&directory, &link).unwrap();
-    assert!(ShareGrant::new(&directory, true).is_ok());
-    assert!(ShareGrant::new(&link, true).is_err());
-    let file = base.join("file");
-    std::fs::write(&file, b"file").unwrap();
-    assert!(ShareGrant::new(&file, false).is_err());
-}
-
-#[test]
-fn mount_source_rejects_a_symlinked_ancestor() {
-    let root = tempfile::tempdir().unwrap();
-    let base = std::fs::canonicalize(root.path()).unwrap();
-    let expected_parent = base.join("expected");
-    let private_parent = base.join("private");
-    std::fs::create_dir_all(expected_parent.join("share")).unwrap();
-    std::fs::create_dir_all(private_parent.join("share")).unwrap();
-    let expected = expected_parent.join("share");
-    std::fs::rename(&expected_parent, base.join("moved")).unwrap();
-    symlink_dir(&private_parent, &expected_parent).unwrap();
-    assert!(ShareGrant::new(&expected, false).is_err());
 }
 
 #[tokio::test]
@@ -336,7 +307,7 @@ async fn mode_capability_changes_writable_files_and_rejects_readonly_files() {
 #[tokio::test(flavor = "multi_thread")]
 async fn filesystem_actor_alone_publishes_interrupt_levels() {
     use crate::component::context::DeviceContext;
-    use crate::component::fs::host::{FsHost, ShareGrant};
+    use crate::component::fs::{FsHost, ShareGrant};
     use crate::engine::device_engine;
 
     let directory = tempfile::tempdir().unwrap();

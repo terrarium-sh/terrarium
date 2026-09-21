@@ -15,7 +15,7 @@ use wasmtime::component::{
 use wasmtime_wasi::filesystem::Descriptor;
 use wasmtime_wasi::p3::bindings::filesystem::types::ErrorCode;
 
-use super::host::{FsHost, ShareGrant};
+use super::{FsHost, ShareGrant};
 use crate::box_runtime::store::BoxHost;
 use crate::box_runtime::{BoxRuntime, BoxRuntimeHandle};
 use crate::component::DeviceChannel;

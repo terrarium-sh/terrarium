@@ -1,7 +1,9 @@
 //! Filesystem component bindings over the box-wide MMIO router.
 
 mod file_events;
+mod grant;
 pub(crate) mod host;
+mod metadata;
 #[cfg(test)]
 mod stalled_io;
 #[cfg(test)]
@@ -12,11 +14,10 @@ use std::sync::Arc;
 
 use wasmtime::component::Component;
 
+pub use grant::{ShareGrant, share_notification_budgets, share_tag};
 use host::FsComponent;
 pub use host::terra::fs::host::{Error as FsError, FilesystemStat};
-pub use host::{
-    FsDeviceError, FsHost, ShareGrant, fs_component_linker, share_notification_budgets, share_tag,
-};
+pub use host::{FsDeviceError, FsHost, fs_component_linker};
 
 pub(crate) const MAX_BLOCKING_THREADS: usize = 33;
 

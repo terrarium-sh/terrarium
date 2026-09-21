@@ -17,7 +17,7 @@ pub(super) const MAX_NATIVE_WATCHES: usize = 1024;
 use tokio::sync::mpsc;
 use wasmtime::component::{Destination, StreamProducer, StreamResult};
 
-use crate::component::fs::host::ShareGrant;
+use crate::component::fs::ShareGrant;
 
 pub(super) struct FileEvents {
     receiver: mpsc::Receiver<QueuedEvent>,
