@@ -1,5 +1,8 @@
 #![allow(clippy::expect_used)]
 
+#[path = "support/artifacts.rs"]
+mod support;
+
 #[cfg(unix)]
 use std::os::unix::fs::symlink as symlink_file;
 #[cfg(windows)]
@@ -62,11 +65,7 @@ async fn mount_with_resource_capacity(
 ) -> Mounted {
     let ram = GuestRam::new(64 * 1024).expect("ram");
     let engine = device_engine().expect("engine");
-    let component = Component::new(
-        &engine,
-        include_bytes!("../../../components/target/wasm32-wasip3/release/terra_fs_component.wasm"),
-    )
-    .expect("component");
+    let component = Component::new(&engine, support::artifacts::wasm::FS).expect("component");
     let grant = ShareGrant::new(
         &std::fs::canonicalize(path).expect("canonical mount"),
         readonly,
@@ -77,11 +76,7 @@ async fn mount_with_resource_capacity(
         Some(resource_capacity) => FsHost::with_resource_capacity(device, grant, resource_capacity),
         None => FsHost::new(device, grant),
     };
-    let router = Component::new(
-        &engine,
-        include_bytes!("../../../components/target/wasm32-wasip3/release/terra_vmm_component.wasm"),
-    )
-    .expect("MMIO router");
+    let router = Component::new(&engine, support::artifacts::wasm::VMM).expect("MMIO router");
     let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
     runtime.initialize_mmio(&router).await.expect("MMIO router");
     let channel = terra_runtime::component::fs::instantiate_shared(

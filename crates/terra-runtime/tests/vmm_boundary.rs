@@ -1,5 +1,8 @@
 #![allow(clippy::expect_used)]
 
+#[path = "support/artifacts.rs"]
+mod support;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -64,19 +67,11 @@ fn no_interrupt() -> Interrupt {
 }
 
 fn router(engine: &wasmtime::Engine) -> Component {
-    Component::new(
-        engine,
-        include_bytes!("../../../components/target/wasm32-wasip3/release/terra_vmm_component.wasm"),
-    )
-    .expect("router component")
+    Component::new(engine, support::artifacts::wasm::VMM).expect("router component")
 }
 
 fn memory(engine: &wasmtime::Engine) -> Component {
-    Component::new(
-        engine,
-        include_bytes!("../../../components/target/wasm32-wasip3/release/terra_mem_component.wasm"),
-    )
-    .expect("memory component")
+    Component::new(engine, support::artifacts::wasm::MEM).expect("memory component")
 }
 
 async fn prepare_test_vcpus(
@@ -596,13 +591,7 @@ async fn wasi_composes_multiple_deferred_workers_with_their_final_mappings() {
         .await
         .expect("router");
     let (mut runtime, _) = attach_test_machine(runtime, ram.clone()).await;
-    let block = Component::new(
-        &engine,
-        include_bytes!(
-            "../../../components/target/wasm32-wasip3/release/terra_block_component.wasm"
-        ),
-    )
-    .expect("block component");
+    let block = Component::new(&engine, support::artifacts::wasm::BLOCK).expect("block component");
     let mut channels = Vec::new();
     for bytes in [4096, 8192, 12288] {
         let host = terra_runtime::component::block::host::BlockHost::new(

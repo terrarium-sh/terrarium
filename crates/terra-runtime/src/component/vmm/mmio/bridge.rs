@@ -226,40 +226,7 @@ mod tests {
     async fn aot_router_configures_bounded_vcpu_banks_and_preserves_failures() {
         let engine = crate::engine::device_engine().expect("engine");
         let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
-        // SAFETY: these test bytes are built AOT artifacts for this exact runtime.
-        #[allow(unsafe_code)]
-        let artifacts = unsafe {
-            crate::TrustedArtifacts::new(
-                include_bytes!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../../build/terra-block-component.cwasm"
-                )),
-                include_bytes!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../../build/terra-vsock-component.cwasm"
-                )),
-                include_bytes!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../../build/terra-network-component.cwasm"
-                )),
-                include_bytes!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../../build/terra-fs-component.cwasm"
-                )),
-                include_bytes!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../../build/terra-mem-component.cwasm"
-                )),
-                include_bytes!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../../build/terra-boot-component.cwasm"
-                )),
-                include_bytes!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../../build/terra-vmm-component.cwasm"
-                )),
-            )
-        };
+        let artifacts = crate::test_fixtures::trusted_artifacts();
         runtime
             .initialize_mmio_artifact(&artifacts)
             .await

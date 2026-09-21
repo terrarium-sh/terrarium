@@ -65,11 +65,11 @@ impl BoundedDisk {
 }
 
 pub const STATUS_OK: u8 = 0;
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 #[path = "reference.rs"]
 mod reference;
-#[cfg(any(test, feature = "test-support"))]
-pub use reference::*;
+#[cfg(test)]
+pub(crate) use reference::*;
 
 /// Host storage operations exposed to the block component.
 pub trait BlockBacking {

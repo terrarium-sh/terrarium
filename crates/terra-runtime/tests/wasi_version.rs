@@ -1,5 +1,8 @@
 #![allow(clippy::expect_used)]
 
+#[path = "support/artifacts.rs"]
+mod support;
+
 use terra_runtime::component::fs::host::fs_component_linker;
 use terra_runtime::engine::device_engine;
 use wasmtime::component::Component;
@@ -11,8 +14,7 @@ fn filesystem_descriptor_methods_link_at_wasi_031() {
     let engine = device_engine().expect("device engine");
     let linker = fs_component_linker::<terra_runtime::component::fs::host::FsHost>(&engine)
         .expect("filesystem linker");
-    let component =
-        include_bytes!("../../../components/target/wasm32-wasip3/release/terra_fs_component.wasm");
+    let component = support::artifacts::wasm::FS;
 
     assert!(
         component

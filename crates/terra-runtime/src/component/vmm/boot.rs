@@ -312,13 +312,8 @@ mod tests {
     async fn boot_component_rejects_a_malformed_kernel_without_retaining_a_store() {
         let engine = crate::engine::device_engine().expect("engine");
         let runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
-        let component = Component::new(
-            &engine,
-            include_bytes!(
-                "../../../../../components/target/wasm32-wasip3/release/terra_boot_component.wasm"
-            ),
-        )
-        .expect("boot component");
+        let component =
+            Component::new(&engine, crate::test_fixtures::wasm::BOOT).expect("boot component");
         let ram = GuestRam::new(2 << 20).expect("test RAM");
         let config = MachineConfig::new(Architecture::X86, ram.size(), 1, Vec::new())
             .expect("test machine configuration");

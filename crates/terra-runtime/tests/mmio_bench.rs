@@ -1,5 +1,8 @@
 #![allow(clippy::expect_used)]
 
+#[path = "support/artifacts.rs"]
+mod support;
+
 use std::time::{Duration, Instant};
 
 use terra_runtime::box_runtime::store::BoxHost;
@@ -98,24 +101,14 @@ async fn sustained_aot_memory_mmio_reads_complete() {
 async fn start_memory() -> (Duration, RunningMemory) {
     let start = Instant::now();
     let engine = device_engine().expect("engine");
-    // SAFETY: these build-embedded artifacts are trusted AOT output for this Wasmtime build.
-    #[allow(unsafe_code)]
-    let router = unsafe {
-        terra_runtime::TrustedArtifact::from_trusted_bytes(include_bytes!(
-            "../../../build/terra-vmm-component.cwasm"
-        ))
-    }
-    .deserialize(&engine)
-    .expect("MMIO artifact");
-    // SAFETY: this build-embedded artifact is trusted AOT output for this Wasmtime build.
-    #[allow(unsafe_code)]
-    let component = unsafe {
-        terra_runtime::TrustedArtifact::from_trusted_bytes(include_bytes!(
-            "../../../build/terra-mem-component.cwasm"
-        ))
-    }
-    .deserialize(&engine)
-    .expect("memory artifact");
+    let router = support::artifacts::trusted_artifacts()
+        .mmio()
+        .deserialize(&engine)
+        .expect("MMIO artifact");
+    let component = support::artifacts::trusted_artifacts()
+        .mem()
+        .deserialize(&engine)
+        .expect("memory artifact");
     let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
     runtime.initialize_mmio(&router).await.expect("MMIO router");
     let interrupt: Interrupt = std::sync::Arc::new(|_| Ok(()));

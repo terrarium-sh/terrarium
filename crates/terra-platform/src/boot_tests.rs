@@ -76,43 +76,6 @@ fn agent_bridge_plan() -> Vec<u8> {
     )
 }
 
-fn boot_artifacts() -> terra_runtime::TrustedArtifacts {
-    // SAFETY: these build-tree artifacts are trusted AOT output for this binary's Wasmtime.
-    #[allow(unsafe_code)]
-    unsafe {
-        terra_runtime::TrustedArtifacts::new(
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../build/terra-block-component.cwasm"
-            )),
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../build/terra-vsock-component.cwasm"
-            )),
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../build/terra-network-component.cwasm"
-            )),
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../build/terra-fs-component.cwasm"
-            )),
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../build/terra-mem-component.cwasm"
-            )),
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../build/terra-boot-component.cwasm"
-            )),
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../build/terra-vmm-component.cwasm"
-            )),
-        )
-    }
-}
-
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires a native hypervisor and `make test-component-boot`"]
 async fn kernel_boots_directory_share() {
@@ -151,7 +114,7 @@ async fn kernel_boots_directory_share() {
         volume_disks: Vec::new(),
         shares: vec![terra_runtime::component::fs::host::ShareGrant::new(&mount, false).unwrap()],
         plan: encode_frame(&plan).unwrap(),
-        artifacts: boot_artifacts(),
+        artifacts: crate::test_support::artifacts::trusted_artifacts(),
         network_policy: boot_network_policy(),
         port_mappings: Vec::new(),
         ram_bytes: BOOT_RAM,
@@ -225,7 +188,7 @@ async fn kernel_boots_to_agent_ready() {
         volume_disks: Vec::new(),
         shares: Vec::new(),
         plan: boot_probe_plan(vcpus),
-        artifacts: boot_artifacts(),
+        artifacts: crate::test_support::artifacts::trusted_artifacts(),
         network_policy: boot_network_policy(),
         port_mappings: Vec::new(),
         hard_stop: None,
@@ -268,7 +231,7 @@ async fn kernel_reports_free_pages_after_boot() {
             vec!["sleep".into(), "4".into()],
             false,
         ),
-        artifacts: boot_artifacts(),
+        artifacts: crate::test_support::artifacts::trusted_artifacts(),
         network_policy: boot_network_policy(),
         port_mappings: Vec::new(),
         hard_stop: None,
@@ -559,7 +522,7 @@ async fn kernel_boots_to_agent_bridge() {
         volume_disks: Vec::new(),
         shares: Vec::new(),
         plan: agent_bridge_plan(),
-        artifacts: boot_artifacts(),
+        artifacts: crate::test_support::artifacts::trusted_artifacts(),
         network_policy: boot_network_policy(),
         port_mappings: Vec::new(),
         hard_stop: None,
@@ -609,7 +572,7 @@ async fn kernel_boots_and_agent_stop_ends_workload() {
             vec!["sleep".into(), "120".into()],
             false,
         ),
-        artifacts: boot_artifacts(),
+        artifacts: crate::test_support::artifacts::trusted_artifacts(),
         network_policy: boot_network_policy(),
         port_mappings: Vec::new(),
         hard_stop: None,
@@ -659,7 +622,7 @@ async fn kernel_boots_foreground_session_reports_workload_exit() {
             ],
             true,
         ),
-        artifacts: boot_artifacts(),
+        artifacts: crate::test_support::artifacts::trusted_artifacts(),
         network_policy: boot_network_policy(),
         port_mappings: Vec::new(),
         hard_stop: None,
@@ -718,7 +681,7 @@ async fn assert_policy_dns_http(address: std::net::IpAddr, body: &[u8]) {
         volume_disks: Vec::new(),
         shares: Vec::new(),
         plan: agent_bridge_plan(),
-        artifacts: boot_artifacts(),
+        artifacts: crate::test_support::artifacts::trusted_artifacts(),
         network_policy: std::sync::Arc::new(LocalHttpPolicy { address, port }),
         port_mappings: Vec::new(),
         hard_stop: None,
@@ -763,7 +726,7 @@ async fn assert_policy_dns_upload(address: std::net::IpAddr, bytes: usize) {
         volume_disks: Vec::new(),
         shares: Vec::new(),
         plan: agent_bridge_plan(),
-        artifacts: boot_artifacts(),
+        artifacts: crate::test_support::artifacts::trusted_artifacts(),
         network_policy: std::sync::Arc::new(LocalHttpPolicy { address, port }),
         port_mappings: Vec::new(),
         hard_stop: None,
@@ -884,7 +847,7 @@ async fn assert_published_loopback_http(host_closes_first: bool) {
             ],
             false,
         ),
-        artifacts: boot_artifacts(),
+        artifacts: crate::test_support::artifacts::trusted_artifacts(),
         network_policy: boot_network_policy(),
         port_mappings: vec![terra_network::PortMapping::new(host_port, GUEST_PORT)],
         hard_stop: None,

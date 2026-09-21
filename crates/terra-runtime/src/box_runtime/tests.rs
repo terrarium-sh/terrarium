@@ -451,13 +451,8 @@ async fn competing_failures_publish_the_primary_error_before_native_cleanup() {
 
     let engine = device_engine().unwrap();
     let mut root = BoxRuntime::new(&engine, BoxHost::new()).unwrap();
-    let router = wasmtime::component::Component::new(
-        &engine,
-        include_bytes!(
-            "../../../../components/target/wasm32-wasip3/release/terra_vmm_component.wasm"
-        ),
-    )
-    .unwrap();
+    let router =
+        wasmtime::component::Component::new(&engine, crate::test_fixtures::wasm::VMM).unwrap();
     root.initialize_mmio(&router).await.unwrap();
     let failure = root.mmio.as_ref().unwrap().failure_sink();
     let outcome = root.lifecycle_notifier().subscribe();

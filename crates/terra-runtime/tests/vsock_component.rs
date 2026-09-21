@@ -1,8 +1,11 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use terra_runtime::box_runtime::store::test_support::device_store;
+#[path = "support/artifacts.rs"]
+mod support;
+
 use terra_runtime::component::vsock::host::{VsockDeviceHost, vsock_component_linker};
 use terra_runtime::engine::device_engine;
+use terra_runtime::test_support::device_store;
 use wasmtime::component::{Component, TypedFunc, wit_parser::ItemName};
 
 #[derive(
@@ -46,8 +49,7 @@ struct ComponentReply {
     payload: Vec<u8>,
 }
 
-const COMPONENT: &[u8] =
-    include_bytes!("../../../components/target/wasm32-wasip3/release/terra_vsock_component.wasm");
+const COMPONENT: &[u8] = support::artifacts::wasm::VSOCK;
 
 type ComponentResult<T> = (Result<T, ComponentError>,);
 type Receive = TypedFunc<(Vec<u8>,), ComponentResult<()>>;

@@ -17,14 +17,14 @@ mod worker;
 
 pub use vmm::mmio::MmioDevice as DeviceChannel;
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 #[derive(Clone)]
-pub struct StandaloneDevice {
+pub(crate) struct StandaloneDevice {
     device: DeviceChannel,
     _runtime: std::sync::Arc<crate::box_runtime::BoxRuntimeHandle>,
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 impl std::ops::Deref for StandaloneDevice {
     type Target = DeviceChannel;
     fn deref(&self) -> &Self::Target {

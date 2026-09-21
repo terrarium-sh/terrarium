@@ -1,5 +1,8 @@
 #![allow(clippy::expect_used)]
 
+#[path = "support/artifacts.rs"]
+mod support;
+
 use terra_runtime::component::block::host::{BlockHost, block_component_linker};
 use terra_runtime::component::fs::host::fs_component_linker;
 use terra_runtime::component::mem::host::mem_component_linker;
@@ -143,48 +146,12 @@ fn host_service_clients_are_exclusive_to_vsock() {
 
 fn assert_components<T: 'static>(linker: &Linker<T>, engine: &wasmtime::Engine, device: &str) {
     for (name, bytes) in [
-        (
-            "block",
-            include_bytes!(
-                "../../../components/target/wasm32-wasip3/release/terra_block_component.wasm"
-            )
-            .as_slice(),
-        ),
-        (
-            "network",
-            include_bytes!(
-                "../../../components/target/wasm32-wasip3/release/terra_network_component.wasm"
-            )
-            .as_slice(),
-        ),
-        (
-            "fs",
-            include_bytes!(
-                "../../../components/target/wasm32-wasip3/release/terra_fs_component.wasm"
-            )
-            .as_slice(),
-        ),
-        (
-            "mem",
-            include_bytes!(
-                "../../../components/target/wasm32-wasip3/release/terra_mem_component.wasm"
-            )
-            .as_slice(),
-        ),
-        (
-            "boot",
-            include_bytes!(
-                "../../../components/target/wasm32-wasip3/release/terra_boot_component.wasm"
-            )
-            .as_slice(),
-        ),
-        (
-            "vsock",
-            include_bytes!(
-                "../../../components/target/wasm32-wasip3/release/terra_vsock_component.wasm"
-            )
-            .as_slice(),
-        ),
+        ("block", support::artifacts::wasm::BLOCK),
+        ("network", support::artifacts::wasm::NETWORK),
+        ("fs", support::artifacts::wasm::FS),
+        ("mem", support::artifacts::wasm::MEM),
+        ("boot", support::artifacts::wasm::BOOT),
+        ("vsock", support::artifacts::wasm::VSOCK),
     ] {
         let component = Component::new(engine, bytes).expect("component compiles");
         let result = linker.instantiate_pre(&component);
@@ -234,11 +201,8 @@ fn mmio_dispatcher_requires_no_device_capabilities() {
     let engine = device_engine().expect("device engine");
     let linker =
         terra_runtime::component::vmm::mmio::mmio_component_linker(&engine).expect("VMM linker");
-    let component = Component::new(
-        &engine,
-        include_bytes!("../../../components/target/wasm32-wasip3/release/terra_vmm_component.wasm"),
-    )
-    .expect("MMIO component compiles");
+    let component =
+        Component::new(&engine, support::artifacts::wasm::VMM).expect("MMIO component compiles");
     linker
         .instantiate_pre(&component)
         .expect("VMM component receives only its scoped platform imports");

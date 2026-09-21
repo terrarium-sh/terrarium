@@ -7,7 +7,7 @@ mod stalled_io;
 #[cfg(test)]
 mod tests;
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 use std::sync::Arc;
 
 use wasmtime::component::Component;
@@ -58,8 +58,8 @@ fn transport_error(operation: &str, error: FsDeviceError) -> wasmtime::Error {
     wasmtime::Error::msg(format!("filesystem {operation}: {error:?}"))
 }
 
-#[cfg(any(test, feature = "test-support"))]
-pub async fn instantiate(
+#[cfg(test)]
+pub(crate) async fn instantiate(
     engine: &wasmtime::Engine,
     host: FsHost,
     component: &Component,

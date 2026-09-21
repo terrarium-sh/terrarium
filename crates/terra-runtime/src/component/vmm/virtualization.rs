@@ -603,22 +603,13 @@ mod tests {
 
         for architecture in [Architecture::X86, Architecture::Arm] {
             let engine = crate::engine::device_engine().unwrap();
-            // SAFETY: the artifact is produced by this repository's matching AOT build.
-            #[allow(unsafe_code)]
-            let vmm = unsafe {
-                wasmtime::component::Component::deserialize(
-                    &engine,
-                    include_bytes!("../../../../../build/terra-vmm-component.cwasm"),
-                )
-                .unwrap()
-            };
-            let boot = wasmtime::component::Component::new(
-            &engine,
-            include_bytes!(
-                "../../../../../components/target/wasm32-wasip3/release/terra_boot_component.wasm"
-            ),
-        )
-        .unwrap();
+            let vmm = crate::test_fixtures::trusted_artifacts()
+                .mmio()
+                .deserialize(&engine)
+                .unwrap();
+            let boot =
+                wasmtime::component::Component::new(&engine, crate::test_fixtures::wasm::BOOT)
+                    .unwrap();
             let base = match architecture {
                 Architecture::X86 => 0,
                 Architecture::Arm => 0x4000_0000,

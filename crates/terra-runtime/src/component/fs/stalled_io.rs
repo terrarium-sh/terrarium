@@ -322,20 +322,8 @@ impl Mounted {
     async fn new(grant: ShareGrant, gate: Arc<IoGate>, capacity: usize) -> Self {
         let ram = GuestRam::new(1024 * 1024).unwrap();
         let engine = device_engine().unwrap();
-        let component = Component::new(
-            &engine,
-            include_bytes!(
-                "../../../../../components/target/wasm32-wasip3/release/terra_fs_component.wasm"
-            ),
-        )
-        .unwrap();
-        let router = Component::new(
-            &engine,
-            include_bytes!(
-                "../../../../../components/target/wasm32-wasip3/release/terra_vmm_component.wasm"
-            ),
-        )
-        .unwrap();
+        let component = Component::new(&engine, crate::test_fixtures::wasm::FS).unwrap();
+        let router = Component::new(&engine, crate::test_fixtures::wasm::VMM).unwrap();
         let mut host =
             FsHost::with_resource_capacity(DeviceContext::with_ram(ram.clone()), grant, capacity);
         host.io_gate = Some(gate);

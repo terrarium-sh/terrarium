@@ -342,13 +342,8 @@ async fn filesystem_actor_alone_publishes_interrupt_levels() {
     let directory = tempfile::tempdir().unwrap();
     let mount = std::fs::canonicalize(directory.path()).unwrap();
     let engine = device_engine().unwrap();
-    let component = wasmtime::component::Component::new(
-        &engine,
-        include_bytes!(
-            "../../../../../components/target/wasm32-wasip3/release/terra_fs_component.wasm"
-        ),
-    )
-    .unwrap();
+    let component =
+        wasmtime::component::Component::new(&engine, crate::test_fixtures::wasm::FS).unwrap();
     let host = FsHost::new(
         DeviceContext::new(64 * 1024).unwrap(),
         ShareGrant::new(&mount, false).unwrap(),

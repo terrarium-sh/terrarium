@@ -2,7 +2,6 @@
 //! requests drive `execute` through the actual memory/disk imports.
 //! Build it first: `make component-block` (nightly `wasm32-wasip3`).
 
-use crate::box_runtime::store::test_support::{StandaloneHost, device_store};
 use crate::component::bindings::{Completion, Range};
 use crate::component::block::backing::BoundedDisk;
 use crate::component::block::backing::DiskGrant;
@@ -11,6 +10,7 @@ use crate::component::vmm::bindings::types::DeviceError;
 use crate::component::vmm::bindings::types::{Operation, Reply, Request};
 use crate::engine::{device_engine, precompile_component};
 use crate::memory::GuestRam;
+use crate::test_support::{StandaloneHost, device_store};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -35,13 +35,6 @@ type Serve = TypedFunc<(StreamReader<Request>,), (StreamReader<Reply>,)>;
 
 fn one(addr: u64, len: u64) -> Vec<Range> {
     vec![Range { addr, len }]
-}
-
-pub(crate) fn component_bytes() -> Vec<u8> {
-    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../components/target/wasm32-wasip3/release/terra_block_component.wasm");
-    std::fs::read(&path)
-        .expect("block component missing; run `make component-block` with the pinned nightly")
 }
 
 fn export_name(func: &str) -> ItemName {
@@ -138,7 +131,8 @@ async fn fixture(
         &engine,
         BlockHost::new(GuestRam::new(RAM).unwrap(), DiskGrant::Mem(disk)),
     );
-    let component = Component::new(&engine, component_bytes()).expect("block component compiles");
+    let component = Component::new(&engine, crate::test_fixtures::wasm::BLOCK)
+        .expect("block component compiles");
     let instance = linker
         .instantiate_async(&mut store, &component)
         .await
@@ -553,7 +547,8 @@ async fn component_reset_fences_stale_epoch() {
 async fn component_aot_deserialize_runs() {
     let engine = device_engine().expect("engine builds");
     let linker = block_component_linker(&engine).expect("block imports link");
-    let artifact = precompile_component(&engine, &component_bytes()).expect("precompiles");
+    let artifact =
+        precompile_component(&engine, crate::test_fixtures::wasm::BLOCK).expect("precompiles");
     assert!(!artifact.is_empty());
     // SAFETY: artifact was just produced by the trusted build above
     // from the checked-in component source; deserialization performs
@@ -648,7 +643,8 @@ async fn component_operates_on_shared_machine_ram() {
     let mut disk = BoundedDisk::new(8 * 512, false);
     disk.write(2 * 512, &[0x5Eu8; 512]).expect("pattern in");
     let mut store = device_store(&engine, BlockHost::new(ram, DiskGrant::Mem(disk)));
-    let component = Component::new(&engine, component_bytes()).expect("block component compiles");
+    let component = Component::new(&engine, crate::test_fixtures::wasm::BLOCK)
+        .expect("block component compiles");
     let instance = linker
         .instantiate_async(&mut store, &component)
         .await

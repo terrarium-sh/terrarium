@@ -39,7 +39,7 @@ fn apply_device_settings(config: &mut Config, fuel: bool) -> wasmtime::Result<()
 /// Precompile a trusted component build into an AOT artifact for
 /// embedding. The shipped runtime deserializes these bytes without
 /// invoking the compiler.
-#[cfg(any(test, feature = "compiler", feature = "test-support"))]
+#[cfg(any(test, feature = "compiler"))]
 pub fn precompile_component(engine: &Engine, bytes: &[u8]) -> wasmtime::Result<Vec<u8>> {
     engine.precompile_component(bytes)
 }

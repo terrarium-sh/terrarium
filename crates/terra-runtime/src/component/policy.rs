@@ -378,12 +378,9 @@ mod tests {
         FACTORY.get_or_init(|| {
             let engine = crate::engine::policy_engine().unwrap();
             let artifact = Box::leak(
-                crate::engine::precompile_component(
-                    &engine,
-                    include_bytes!("../../../../components/target/wasm32-wasip3/release/terra_policy_component.wasm"),
-                )
-                .unwrap()
-                .into_boxed_slice(),
+                crate::engine::precompile_component(&engine, crate::test_fixtures::wasm::POLICY)
+                    .unwrap()
+                    .into_boxed_slice(),
             );
             // SAFETY: `artifact` was produced from this trusted component by this engine.
             let artifact = unsafe { crate::TrustedArtifact::from_trusted_bytes(artifact) };

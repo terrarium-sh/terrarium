@@ -1942,6 +1942,7 @@ dependencies = [
  "terra-limits",
  "terra-network",
  "terra-protocol",
+ "terra-runtime",
  "terra-vsock-device",
  "tokio",
  "tokio-util",

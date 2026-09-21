@@ -1,5 +1,8 @@
 #![allow(clippy::expect_used)]
 
+#[path = "support/artifacts.rs"]
+mod support;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -49,30 +52,11 @@ fn reset_device(
 }
 
 fn load_components(engine: &wasmtime::Engine) -> [Component; 5] {
-    let router = component(
-        engine,
-        include_bytes!("../../../components/target/wasm32-wasip3/release/terra_vmm_component.wasm"),
-    );
-    let block_component = component(
-        engine,
-        include_bytes!(
-            "../../../components/target/wasm32-wasip3/release/terra_block_component.wasm"
-        ),
-    );
-    let fs_component = component(
-        engine,
-        include_bytes!("../../../components/target/wasm32-wasip3/release/terra_fs_component.wasm"),
-    );
-    let mem_component = component(
-        engine,
-        include_bytes!("../../../components/target/wasm32-wasip3/release/terra_mem_component.wasm"),
-    );
-    let network_component = component(
-        engine,
-        include_bytes!(
-            "../../../components/target/wasm32-wasip3/release/terra_network_component.wasm"
-        ),
-    );
+    let router = component(engine, support::artifacts::wasm::VMM);
+    let block_component = component(engine, support::artifacts::wasm::BLOCK);
+    let fs_component = component(engine, support::artifacts::wasm::FS);
+    let mem_component = component(engine, support::artifacts::wasm::MEM);
+    let network_component = component(engine, support::artifacts::wasm::NETWORK);
     [
         router,
         block_component,
@@ -83,13 +67,7 @@ fn load_components(engine: &wasmtime::Engine) -> [Component; 5] {
 }
 
 fn start_vsock(runtime: &mut BoxRuntime, ram: GuestRam) -> VsockChannel {
-    // SAFETY: this test embeds the build's trusted AOT vsock artifact.
-    #[allow(unsafe_code)]
-    let artifact = unsafe {
-        terra_runtime::TrustedArtifact::from_trusted_bytes(include_bytes!(
-            "../../../build/terra-vsock-component.cwasm"
-        ))
-    };
+    let artifact = support::artifacts::trusted_artifacts().vsock();
     VsockChannel::from_trusted_artifact(
         runtime,
         ram,

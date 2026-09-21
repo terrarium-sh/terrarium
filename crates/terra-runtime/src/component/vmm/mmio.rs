@@ -389,15 +389,9 @@ pub fn mmio_component_linker(
     Ok(linker)
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 pub(crate) async fn initialize_test_router(root: &mut BoxRuntime) -> wasmtime::Result<()> {
-    let component = Component::new(
-        root.store.engine(),
-        include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../components/target/wasm32-wasip3/release/terra_vmm_component.wasm"
-        )),
-    )?;
+    let component = Component::new(root.store.engine(), crate::test_fixtures::wasm::VMM)?;
     root.initialize_mmio(&component).await
 }
 

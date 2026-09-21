@@ -1,8 +1,6 @@
 //! Native control streams for the compartmentalized vsock device.
 
 pub mod host;
-#[cfg(any(test, feature = "test-support"))]
-pub mod protocol;
 
 use futures_util::{
     FutureExt,
@@ -542,22 +540,12 @@ mod tests {
                 crate::box_runtime::store::BoxHost::new(),
             )
             .expect("runtime");
-            let router = wasmtime::component::Component::new(
-                &engine,
-                include_bytes!(
-                    "../../../../components/target/wasm32-wasip3/release/terra_vmm_component.wasm"
-                ),
-            )
-            .expect("router component");
+            let router =
+                wasmtime::component::Component::new(&engine, crate::test_fixtures::wasm::VMM)
+                    .expect("router component");
             runtime.initialize_mmio(&router).await.expect("router");
             let ram = GuestRam::new(4096).expect("test RAM maps");
-            // SAFETY: the test embeds the trusted build's component artifact.
-            #[allow(unsafe_code)]
-            let artifact = unsafe {
-                crate::TrustedArtifact::from_trusted_bytes(include_bytes!(
-                    "../../../../build/terra-vsock-component.cwasm"
-                ))
-            };
+            let artifact = crate::test_fixtures::trusted_artifacts().vsock();
             let channel = VsockChannel::from_trusted_artifact(
                 &mut runtime,
                 ram,
@@ -645,21 +633,10 @@ mod tests {
         let mut runtime =
             crate::box_runtime::BoxRuntime::new(&engine, crate::box_runtime::store::BoxHost::new())
                 .unwrap();
-        let router = wasmtime::component::Component::new(
-            &engine,
-            include_bytes!(
-                "../../../../components/target/wasm32-wasip3/release/terra_vmm_component.wasm"
-            ),
-        )
-        .unwrap();
+        let router =
+            wasmtime::component::Component::new(&engine, crate::test_fixtures::wasm::VMM).unwrap();
         runtime.initialize_mmio(&router).await.unwrap();
-        // SAFETY: the artifact is embedded from the trusted build.
-        #[allow(unsafe_code)]
-        let artifact = unsafe {
-            crate::TrustedArtifact::from_trusted_bytes(include_bytes!(
-                "../../../../build/terra-vsock-component.cwasm"
-            ))
-        };
+        let artifact = crate::test_fixtures::trusted_artifacts().vsock();
         let channel = crate::component::vsock::VsockChannel::from_trusted_artifact(
             &mut runtime,
             crate::memory::GuestRam::new(4096).unwrap(),

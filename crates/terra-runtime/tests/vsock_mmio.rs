@@ -1,5 +1,8 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+#[path = "support/artifacts.rs"]
+mod support;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -174,21 +177,11 @@ fn plan_frame() -> Vec<u8> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn posted_receive_queue_drains_handshake_and_plan_without_a_second_bell() {
     let engine = device_engine().expect("engine");
-    let router = Component::new(
-        &engine,
-        include_bytes!("../../../components/target/wasm32-wasip3/release/terra_vmm_component.wasm"),
-    )
-    .expect("MMIO router");
+    let router = Component::new(&engine, support::artifacts::wasm::VMM).expect("MMIO router");
     let ram = GuestRam::new(256 * 1024).expect("RAM");
     let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
     runtime.initialize_mmio(&router).await.expect("MMIO router");
-    // SAFETY: this test embeds the build's trusted AOT vsock artifact.
-    #[allow(unsafe_code)]
-    let artifact = unsafe {
-        terra_runtime::TrustedArtifact::from_trusted_bytes(include_bytes!(
-            "../../../build/terra-vsock-component.cwasm"
-        ))
-    };
+    let artifact = support::artifacts::trusted_artifacts().vsock();
     let channel = VsockChannel::from_trusted_artifact(
         &mut runtime,
         ram.clone(),

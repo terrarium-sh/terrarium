@@ -1,14 +1,17 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+#[path = "support/artifacts.rs"]
+mod support;
+
 use std::io::{Read, Write};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
-use terra_runtime::box_runtime::store::test_support::{StandaloneHost, device_store};
 use terra_runtime::component::vmm::bindings::types::{Operation, Reply as MmioReply, Request};
 use terra_runtime::component::vsock::host::{VsockDeviceHost, vsock_component_linker};
 use terra_runtime::engine::device_engine;
+use terra_runtime::test_support::{StandaloneHost, device_store};
 use terra_vsock_device::VsockHeader;
 use wasmtime::StoreContextMut;
 use wasmtime::component::{
@@ -245,13 +248,7 @@ async fn create_worker(
             .unwrap(),
         ),
     );
-    let component = Component::new(
-        &engine,
-        include_bytes!(
-            "../../../components/target/wasm32-wasip3/release/terra_vsock_component.wasm"
-        ),
-    )
-    .unwrap();
+    let component = Component::new(&engine, support::artifacts::wasm::VSOCK).unwrap();
     let instance = vsock_component_linker(&engine)
         .unwrap()
         .instantiate_async(&mut store, &component)
@@ -613,20 +610,10 @@ async fn shared_close_releases_the_diagnostic_sink() {
         terra_runtime::box_runtime::store::BoxHost::new(),
     )
     .unwrap();
-    let router = Component::new(
-        &engine,
-        include_bytes!("../../../components/target/wasm32-wasip3/release/terra_vmm_component.wasm"),
-    )
-    .unwrap();
+    let router = Component::new(&engine, support::artifacts::wasm::VMM).unwrap();
     runtime.initialize_mmio(&router).await.unwrap();
     let output = tempfile::NamedTempFile::new().unwrap();
-    // SAFETY: the embedded artifact is produced by the trusted build for this runtime.
-    #[allow(unsafe_code)]
-    let artifact = unsafe {
-        terra_runtime::TrustedArtifact::from_trusted_bytes(include_bytes!(
-            "../../../build/terra-vsock-component.cwasm"
-        ))
-    };
+    let artifact = support::artifacts::trusted_artifacts().vsock();
     let channel = terra_runtime::component::vsock::VsockChannel::from_trusted_artifact(
         &mut runtime,
         terra_runtime::memory::GuestRam::new(4096).unwrap(),

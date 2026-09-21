@@ -23,3 +23,6 @@ pub(crate) use linux::runner;
 
 #[cfg(test)]
 mod boot_tests;
+
+#[cfg(test)]
+mod test_support;

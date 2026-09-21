@@ -243,13 +243,9 @@ mod tests {
             terra_runtime::box_runtime::store::BoxHost::new(),
         )
         .unwrap();
-        let component = wasmtime::component::Component::new(
-            &engine,
-            include_bytes!(
-                "../../../components/target/wasm32-wasip3/release/terra_vmm_component.wasm"
-            ),
-        )
-        .unwrap();
+        let component =
+            wasmtime::component::Component::new(&engine, crate::test_support::artifacts::wasm::VMM)
+                .unwrap();
         let devices = [
             (DeviceKind::Block, 11),
             (DeviceKind::Block, 12),
@@ -285,9 +281,7 @@ mod tests {
         kernel[104..112].copy_from_slice(&32_u64.to_le_bytes());
         let boot = wasmtime::component::Component::new(
             &engine,
-            include_bytes!(
-                "../../../components/target/wasm32-wasip3/release/terra_boot_component.wasm"
-            ),
+            crate::test_support::artifacts::wasm::BOOT,
         )
         .unwrap();
         let entry = runtime
@@ -303,13 +297,9 @@ mod tests {
         prepared.accept_boot(entry).unwrap();
         runtime.initialize_mmio(&component).await.unwrap();
         let (mut runtime, machine) = runtime.attach_machine(prepared).await.unwrap();
-        let component = wasmtime::component::Component::new(
-            &engine,
-            include_bytes!(
-                "../../../components/target/wasm32-wasip3/release/terra_mem_component.wasm"
-            ),
-        )
-        .unwrap();
+        let component =
+            wasmtime::component::Component::new(&engine, crate::test_support::artifacts::wasm::MEM)
+                .unwrap();
         let ram = machine.ram();
         let channel = terra_runtime::component::mem::grant_shared(
             &mut runtime,

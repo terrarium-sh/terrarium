@@ -4,7 +4,7 @@ pub mod host;
 mod limits;
 pub mod policy;
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 use std::sync::Arc;
 #[cfg(test)]
 use std::time::Duration;
@@ -91,9 +91,9 @@ async fn configure_state<T: Send + 'static>(
     Ok((instance, state))
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-pub async fn instantiate(
+pub(crate) async fn instantiate(
     engine: &wasmtime::Engine,
     host: crate::component::context::DeviceContext,
     component: &Component,
@@ -219,13 +219,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn actor_configures_and_serves_component_mmio() {
         let engine = device_engine().expect("engine builds");
-        let component_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../components/target/wasm32-wasip3/release/terra_network_component.wasm");
-        let component = Component::new(
-            &engine,
-            std::fs::read(component_path).expect("network component built"),
-        )
-        .expect("component compiles");
+        let component = Component::new(&engine, crate::test_fixtures::wasm::NETWORK)
+            .expect("component compiles");
         let host = crate::component::context::DeviceContext::new(64 * 1024).unwrap();
         let interrupts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed = Arc::clone(&interrupts);
@@ -257,13 +252,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn shared_box_network_serves_and_closes() {
         let engine = device_engine().expect("engine");
-        let component = Component::new(
-            &engine,
-            include_bytes!(
-                "../../../../components/target/wasm32-wasip3/release/terra_network_component.wasm"
-            ),
-        )
-        .expect("component");
+        let component =
+            Component::new(&engine, crate::test_fixtures::wasm::NETWORK).expect("component");
         let mut runtime =
             crate::box_runtime::BoxRuntime::new(&engine, crate::box_runtime::store::BoxHost::new())
                 .expect("runtime");
@@ -299,13 +289,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn queue_doorbell_resyncs_an_overfull_queue_and_accepts_new_work() {
         let engine = device_engine().expect("engine builds");
-        let component = Component::new(
-            &engine,
-            include_bytes!(
-                "../../../../components/target/wasm32-wasip3/release/terra_network_component.wasm"
-            ),
-        )
-        .expect("component compiles");
+        let component = Component::new(&engine, crate::test_fixtures::wasm::NETWORK)
+            .expect("component compiles");
         let mut host = crate::component::context::DeviceContext::new(64 * 1024).unwrap();
         let ram = host.guest_ram().clone();
         host.guest_write(0x2002, &257u16.to_le_bytes())

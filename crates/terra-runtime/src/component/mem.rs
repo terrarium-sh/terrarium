@@ -2,7 +2,7 @@
 
 pub mod host;
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 use std::sync::Arc;
 #[cfg(test)]
 use std::time::Duration;
@@ -41,8 +41,8 @@ async fn configure_state<T: Send + 'static>(
     Ok((instance, state))
 }
 
-#[cfg(any(test, feature = "test-support"))]
-pub async fn instantiate(
+#[cfg(test)]
+pub(crate) async fn instantiate(
     engine: &wasmtime::Engine,
     host: DeviceContext,
     component: &Component,
@@ -111,13 +111,8 @@ mod tests {
 
     async fn channel() -> crate::component::StandaloneDevice {
         let engine = device_engine().expect("engine builds");
-        let component_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../components/target/wasm32-wasip3/release/terra_mem_component.wasm");
-        let component = Component::new(
-            &engine,
-            std::fs::read(component_path).expect("memory component built"),
-        )
-        .expect("component compiles");
+        let component =
+            Component::new(&engine, crate::test_fixtures::wasm::MEM).expect("component compiles");
         let ram = GuestRam::new(64 * 1024).expect("RAM");
         let host = DeviceContext::with_ram(ram.clone());
         crate::component::mem::instantiate(&engine, host, &component, Arc::new(|_| Ok(())))
@@ -143,13 +138,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn shared_box_worker_serves_and_stops() {
         let engine = device_engine().expect("engine builds");
-        let component = Component::new(
-            &engine,
-            include_bytes!(
-                "../../../../components/target/wasm32-wasip3/release/terra_mem_component.wasm"
-            ),
-        )
-        .expect("component compiles");
+        let component =
+            Component::new(&engine, crate::test_fixtures::wasm::MEM).expect("component compiles");
         let ram = GuestRam::new(64 * 1024).expect("RAM");
         let mut runtime =
             crate::box_runtime::BoxRuntime::new(&engine, crate::box_runtime::store::BoxHost::new())
@@ -190,13 +180,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn worker_reclaims_on_third_queue_without_stats_or_hints() {
         let engine = device_engine().unwrap();
-        let component = Component::new(
-            &engine,
-            include_bytes!(
-                "../../../../components/target/wasm32-wasip3/release/terra_mem_component.wasm"
-            ),
-        )
-        .unwrap();
+        let component = Component::new(&engine, crate::test_fixtures::wasm::MEM).unwrap();
         let ram = GuestRam::new(64 * 1024).unwrap();
         let memory = crate::memory::BoundedMemory::new(&ram);
         let host = DeviceContext::with_ram(ram.clone());

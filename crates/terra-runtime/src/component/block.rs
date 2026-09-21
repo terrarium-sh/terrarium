@@ -3,7 +3,7 @@
 pub mod backing;
 pub mod host;
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 use std::sync::Arc;
 
 use wasmtime::component::Component;
@@ -18,8 +18,8 @@ use crate::component::DeviceChannel;
 
 type BlockState = crate::component::worker::Worker<DeviceError>;
 
-#[cfg(any(test, feature = "test-support"))]
-pub async fn instantiate(
+#[cfg(test)]
+pub(crate) async fn instantiate(
     engine: &wasmtime::Engine,
     host: BlockHost,
     component: &Component,
@@ -100,7 +100,6 @@ mod tests {
     use crate::engine::device_engine;
     use crate::memory::BoundedMemory;
     use crate::memory::GuestRam;
-    #[cfg(any(test, feature = "test-support"))]
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use wasmtime::component::Component;
@@ -108,13 +107,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn actor_configures_and_serves_component_mmio() {
         let engine = device_engine().expect("engine builds");
-        let component_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../components/target/wasm32-wasip3/release/terra_block_component.wasm");
-        let component = Component::new(
-            &engine,
-            std::fs::read(component_path).expect("block component built"),
-        )
-        .expect("component compiles");
+        let component =
+            Component::new(&engine, crate::test_fixtures::wasm::BLOCK).expect("component compiles");
         let host = crate::component::block::host::BlockHost::new(
             crate::memory::GuestRam::new(64 * 1024).unwrap(),
             DiskGrant::Mem(BoundedDisk::new(4096, false)),
@@ -151,24 +145,14 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     async fn shared_box_keeps_block_backings_and_readonly_state_separate() {
         let engine = device_engine().expect("engine builds");
-        let component = Component::new(
-            &engine,
-            include_bytes!(
-                "../../../../components/target/wasm32-wasip3/release/terra_block_component.wasm"
-            ),
-        )
-        .expect("component compiles");
+        let component =
+            Component::new(&engine, crate::test_fixtures::wasm::BLOCK).expect("component compiles");
         let ram = GuestRam::new(64 * 1024).expect("RAM");
         let mut runtime =
             crate::box_runtime::BoxRuntime::new(&engine, crate::box_runtime::store::BoxHost::new())
                 .expect("box runtime");
-        let router = Component::new(
-            &engine,
-            include_bytes!(
-                "../../../../components/target/wasm32-wasip3/release/terra_vmm_component.wasm"
-            ),
-        )
-        .expect("MMIO router compiles");
+        let router =
+            Component::new(&engine, crate::test_fixtures::wasm::VMM).expect("MMIO router compiles");
         runtime
             .initialize_mmio(&router)
             .await
@@ -265,13 +249,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn component_resyncs_overfull_guest_queue_and_completes_new_work() {
         let engine = device_engine().unwrap();
-        let component = Component::new(
-            &engine,
-            include_bytes!(
-                "../../../../components/target/wasm32-wasip3/release/terra_block_component.wasm"
-            ),
-        )
-        .unwrap();
+        let component = Component::new(&engine, crate::test_fixtures::wasm::BLOCK).unwrap();
         let mut host = crate::component::block::host::BlockHost::new(
             crate::memory::GuestRam::new(64 * 1024).unwrap(),
             DiskGrant::Mem(BoundedDisk::new(4096, false)),
@@ -337,13 +315,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn worker_completes_queue_and_injects_interrupt() {
         let engine = device_engine().unwrap();
-        let component = Component::new(
-            &engine,
-            include_bytes!(
-                "../../../../components/target/wasm32-wasip3/release/terra_block_component.wasm"
-            ),
-        )
-        .unwrap();
+        let component = Component::new(&engine, crate::test_fixtures::wasm::BLOCK).unwrap();
         let ram = GuestRam::new(64 * 1024).unwrap();
         let memory = BoundedMemory::new(&ram);
         let host = crate::component::block::host::BlockHost::new(

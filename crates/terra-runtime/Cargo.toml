@@ -12,7 +12,7 @@ default = []
 # trusted build. Keep Cranelift out of that dependency graph.
 compiler = ["wasmtime/cranelift"]
 thread-experiments = ["wasmtime/threads"]
-test-support = ["wasmtime/cranelift", "dep:terra-vsock-device", "dep:virtio-bindings"]
+test-support = []
 
 [dependencies]
 futures-util = { version = "0.3", default-features = false, features = ["alloc", "std"] }
@@ -21,12 +21,10 @@ terra-io = { path = "../terra-io", features = ["tokio"] }
 terra-limits = { path = "../terra-limits" }
 terra-network = { path = "../terra-network" }
 log = "0.4.34"
-terra-vsock-device = { path = "../../components/vsock-device", optional = true }
 rustix = { workspace = true }
 target-lexicon = "0.13"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
-virtio-bindings = { version = "0.2.7", optional = true }
 wasmtime = { version = "=48.0.2", default-features = false, features = ["async", "component-model-async", "runtime", "std"] }
 wasmtime-wasi = { version = "=48.0.2", default-features = false, features = ["p3"] }
 
@@ -38,6 +36,8 @@ vm-memory = { version = "0.18", features = ["backend-mmap"] }
 windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Win32_Security", "Wdk_Storage_FileSystem", "Wdk_System_SystemServices", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_Memory", "Win32_System_SystemInformation"] }
 
 [dev-dependencies]
+# Integration tests link the library without cfg(test).
+terra-runtime = { path = ".", features = ["test-support"] }
 virtio-bindings = "0.2.7"
 terra-protocol = { path = "../terra-protocol" }
 terra-vsock-device = { path = "../../components/vsock-device" }
