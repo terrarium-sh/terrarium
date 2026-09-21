@@ -8,7 +8,6 @@ pub mod mmio;
 pub mod reaper;
 pub mod teardown;
 pub mod virtualization;
-pub(crate) mod workers;
 
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
@@ -20,7 +19,7 @@ pub use crate::component::vmm::bindings::platform::{Completion, Error, Exit};
 use crate::memory::BoundedMemory;
 
 const MAX_VCPUS: usize = terra_limits::X86_MAX_VCPUS as usize;
-const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct Pending {
     exit: Exit,

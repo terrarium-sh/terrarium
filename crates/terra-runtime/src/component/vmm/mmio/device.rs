@@ -43,7 +43,7 @@ impl MmioDevice {
     pub(crate) fn grant_worker(
         root: &mut BoxRuntime,
         kind: crate::component::vmm::bindings::machine::DeviceKind,
-        setup: crate::component::vmm::workers::Setup,
+        setup: crate::box_runtime::setup::Setup,
     ) -> wasmtime::Result<Self> {
         root.mmio
             .as_ref()
@@ -416,7 +416,7 @@ mod tests {
             let cancelled = tokio_util::sync::CancellationToken::new();
             let owner = cancelled.clone().drop_guard();
             let (entered, started) = tokio::sync::oneshot::channel();
-            let setup: crate::component::vmm::workers::Setup = Box::new(move |_| {
+            let setup: crate::box_runtime::setup::Setup = Box::new(move |_| {
                 Box::pin(async move {
                     let _owner = owner;
                     let _ = entered.send(());
@@ -463,7 +463,7 @@ mod tests {
             let worker = runtime.new_child(crate::box_runtime::store::RootHost::new());
             runtime.attach_child(worker).unwrap();
         }
-        let setup: crate::component::vmm::workers::Setup =
+        let setup: crate::box_runtime::setup::Setup =
             Box::new(|_| Box::pin(async { panic!("over-capacity setup must not run") }));
         let error = MmioDevice::grant_worker(
             &mut runtime,
@@ -490,7 +490,7 @@ mod tests {
         let engine = crate::engine::device_engine().expect("engine");
         let mut runtime =
             BoxRuntime::new(&engine, crate::box_runtime::store::BoxHost::new()).expect("runtime");
-        let setup: crate::component::vmm::workers::Setup =
+        let setup: crate::box_runtime::setup::Setup =
             Box::new(|_| Box::pin(async { unreachable!() }));
 
         let error = MmioDevice::grant_worker(

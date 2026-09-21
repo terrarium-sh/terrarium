@@ -346,9 +346,9 @@ pub(crate) fn add_to_linker(
     virtualization::add_to_linker::<BoxHost, Platform>(linker, |host| &mut host.platform)
 }
 
-impl BoxRuntime {
+impl PlatformHost {
     pub(crate) fn validate_runtime_start(&self) -> wasmtime::Result<()> {
-        match self.store.data().platform.virtualization.state {
+        match self.virtualization.state {
             MachineState::Detached | MachineState::Running(_) => Ok(()),
             MachineState::BootReady(_) => {
                 wasmtime::bail!("VM vCPU startup must complete before runtime preparation")
@@ -356,54 +356,22 @@ impl BoxRuntime {
         }
     }
 
-    pub async fn prepare_vcpus(
-        self,
-        start: impl FnOnce(
-            Vec<super::NativeVcpu>,
-            super::boot::BootEntry,
-        ) -> wasmtime::Result<StartedVcpus>
-        + Send
-        + 'static,
-    ) -> wasmtime::Result<(crate::box_runtime::PreparedBoxRuntime, VcpuReaper)> {
+    pub(crate) fn validate_vcpu_start(&self) -> wasmtime::Result<()> {
         wasmtime::ensure!(
-            matches!(
-                self.store.data().platform.virtualization.state,
-                MachineState::BootReady(_)
-            ),
+            matches!(self.virtualization.state, MachineState::BootReady(_)),
             "VM boot must complete before vCPU startup"
         );
-        let mut runtime = self.prepare_devices().await?;
-        let machine = &runtime
-            .mmio
-            .as_ref()
-            .ok_or_else(|| wasmtime::Error::msg("VMM missing"))?
-            .machine;
-        let outcome = tokio::time::timeout(
-            super::EXIT_TIMEOUT,
-            machine.func_compose().call_async(&mut runtime.store, ()),
-        )
-        .await
-        .map_err(wasmtime::Error::from)
-        .and_then(std::convert::identity)
-        .and_then(|(result,)| {
-            result.map_err(|error| {
-                wasmtime::Error::msg(format!("Wasm machine composition: {error:?}"))
-            })
-        });
-        outcome?;
-        let started = runtime.start_native_vcpus(start)?;
-        Ok((runtime.finish()?, started))
+        Ok(())
     }
 
-    fn start_native_vcpus(
+    pub(crate) fn start_native_vcpus(
         &mut self,
         start: impl FnOnce(
             Vec<super::NativeVcpu>,
             super::boot::BootEntry,
         ) -> wasmtime::Result<StartedVcpus>,
     ) -> wasmtime::Result<VcpuReaper> {
-        let host = &mut self.store.data_mut().platform;
-        let virtualization = &mut host.virtualization;
+        let virtualization = &mut self.virtualization;
         let state = std::mem::replace(&mut virtualization.state, MachineState::Detached);
         let MachineState::BootReady(machine) = state else {
             virtualization.state = state;
@@ -412,9 +380,9 @@ impl BoxRuntime {
             ));
         };
         let BootReadyMachine { grant, boot_entry } = machine;
-        let controls = std::mem::take(&mut host.pending_vcpus);
+        let controls = std::mem::take(&mut self.pending_vcpus);
         let StartedVcpus(reaper) = start(controls, boot_entry)?;
-        host.native_teardown.install_machine(MachineRecovery {
+        self.native_teardown.install_machine(MachineRecovery {
             reaper: reaper.clone(),
             _backend: Arc::clone(&grant.backend),
             _ram: grant.ram.clone(),
@@ -422,7 +390,9 @@ impl BoxRuntime {
         virtualization.state = MachineState::Running(grant);
         Ok(reaper)
     }
+}
 
+impl BoxRuntime {
     pub async fn attach_machine<M: VirtualMachine>(
         mut self,
         prepared: PreparedMachine<M>,

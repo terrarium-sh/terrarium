@@ -186,27 +186,6 @@ impl wasmtime::component::HasData for LifecyclePlatform {
 
 impl lifecycle_platform::Host for LifecycleHost {}
 
-impl crate::box_runtime::BoxRuntime {
-    pub fn grant_interrupt_shutdown(
-        &mut self,
-        close: impl Future<Output = Result<(), String>> + Send + 'static,
-    ) -> wasmtime::Result<()> {
-        let teardown = self.store.data().lifecycle.native_teardown();
-        teardown.install_interrupts(Box::pin(close))
-    }
-
-    pub fn add_device_shutdown(
-        &mut self,
-        device: super::teardown::DeviceShutdown,
-    ) -> wasmtime::Result<()> {
-        self.store
-            .data()
-            .lifecycle
-            .native_teardown()
-            .install_device(device)
-    }
-}
-
 impl<T: Send + 'static> lifecycle_platform::HostWithStore<T> for LifecyclePlatform {
     async fn shutdown(
         host: &wasmtime::component::Accessor<T, Self>,

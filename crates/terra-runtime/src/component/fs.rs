@@ -106,11 +106,11 @@ pub fn grant_shared(
     let tag = tag.to_owned();
     let child = runtime.child_factory();
     let component = component.clone();
-    let setup = crate::component::vmm::workers::setup(
+    let setup = crate::box_runtime::setup::setup(
         async move { create_worker(child(host()?), &component, tag, max_nodes, interrupt).await },
         runtime.shutdown_receiver(),
     );
-    let setup: crate::component::vmm::workers::Setup = Box::new(move |requests| {
+    let setup: crate::box_runtime::setup::Setup = Box::new(move |requests| {
         Box::pin(async move {
             let executor = FilesystemRuntime::new()?;
             let handle = executor.handle();

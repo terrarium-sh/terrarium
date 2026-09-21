@@ -61,7 +61,7 @@ struct DeviceRegistration {
 struct DevicePlan {
     device: Arc<DeviceRegistration>,
     mapping: Option<(u64, u64)>,
-    setup: crate::component::vmm::workers::Setup,
+    setup: crate::box_runtime::setup::Setup,
 }
 
 type DeviceRegistry = Arc<OnceLock<Box<[Arc<DeviceRegistration>]>>>;
@@ -410,7 +410,7 @@ impl BoxRuntime {
         {
             let mapping =
                 mapping.ok_or_else(|| wasmtime::Error::msg("worker grant has no mapping"))?;
-            let worker = crate::component::vmm::workers::within_setup_timeout(
+            let worker = crate::box_runtime::setup::within_setup_timeout(
                 device.slot,
                 self.prepare_worker(device.slot, mapping, setup),
             )
@@ -430,7 +430,7 @@ impl BoxRuntime {
         &mut self,
         slot: u32,
         (base, size): (u64, u64),
-        setup: crate::component::vmm::workers::Setup,
+        setup: crate::box_runtime::setup::Setup,
     ) -> wasmtime::Result<crate::box_runtime::WorkerTask> {
         wasmtime::ensure!(
             usize::try_from(slot)? < crate::box_runtime::MAX_BOX_COMPONENTS

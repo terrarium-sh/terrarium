@@ -15,9 +15,10 @@ use tokio_util::task::AbortOnDropHandle;
 use wasmtime::component::Accessor;
 use wasmtime::{Engine, Store};
 
+pub(crate) mod setup;
 pub mod store;
 
-use store::{BoxHost, BoxMemoryBudget, StoreHost, StoreState, create_store};
+use store::{BoxHost, BoxMemoryBudget, StoreHost, StoreState};
 
 pub const BOX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_BOX_COMPONENTS: usize = terra_limits::MAX_DEVICES;
@@ -169,141 +170,6 @@ impl BoxRuntimeHandle {
 }
 
 impl BoxRuntime {
-    #[cfg(test)]
-    pub(crate) fn reserved_component_memory(&self) -> usize {
-        self.memory_budget.reserved()
-    }
-
-    pub fn new(engine: &Engine, host: BoxHost) -> wasmtime::Result<Self> {
-        let memory_budget = Arc::clone(host.memory_budget());
-        let epoch_clock = EpochClock::start(engine.clone())?;
-        let (shutdown, _) = watch::channel(false);
-        Ok(Self {
-            store: create_store(engine, host),
-            mmio: None,
-            epoch_clock,
-            memory_budget,
-            shutdown,
-            children: Vec::new(),
-            component_loops: Vec::new(),
-        })
-    }
-
-    pub fn new_child<H: StoreHost>(&self, host: H) -> DeviceWorker<H> {
-        self.child_factory()(host)
-    }
-
-    pub(crate) fn child_factory<H: StoreHost>(
-        &self,
-    ) -> impl FnOnce(H) -> DeviceWorker<H> + Send + 'static {
-        let memory_budget = Arc::clone(&self.memory_budget);
-        let epoch_clock = Arc::clone(&self.epoch_clock);
-        let engine = self.store.engine().clone();
-        move |host| DeviceWorker {
-            store: create_store(&engine, StoreState::with_budget(host, memory_budget)),
-            epoch_clock,
-            component_loops: Vec::new(),
-        }
-    }
-
-    pub fn attach_child<H: StoreHost>(&mut self, child: DeviceWorker<H>) -> wasmtime::Result<()> {
-        wasmtime::ensure!(
-            self.component_count() < MAX_BOX_COMPONENTS,
-            "box has too many components"
-        );
-        let child = child.prepare(self.shutdown.subscribe());
-        self.attach_worker(child)
-    }
-
-    pub(crate) fn attach_worker(&mut self, child: WorkerTask) -> wasmtime::Result<()> {
-        wasmtime::ensure!(
-            Arc::ptr_eq(&self.epoch_clock, &child.epoch_clock)
-                && Arc::ptr_eq(&self.memory_budget, &child.memory_budget),
-            "child runtime belongs to another box"
-        );
-        wasmtime::ensure!(
-            self.children.len() < MAX_BOX_COMPONENTS,
-            "box has too many components"
-        );
-        wasmtime::ensure!(
-            self.registered_loop_count() + child.loop_count <= MAX_BOX_COMPONENT_LOOPS,
-            "box has too many component loops"
-        );
-        self.children.push(child);
-        Ok(())
-    }
-
-    pub(crate) fn component_count(&self) -> usize {
-        self.children.len()
-            + self
-                .mmio
-                .as_ref()
-                .map_or(0, crate::component::vmm::mmio::Router::unprepared_count)
-    }
-
-    #[must_use]
-    pub fn has_component(
-        &self,
-        kind: crate::component::vmm::bindings::machine::DeviceKind,
-    ) -> bool {
-        self.mmio
-            .as_ref()
-            .is_some_and(|router| router.has_component(kind))
-    }
-
-    pub(crate) fn shutdown_receiver(&self) -> watch::Receiver<bool> {
-        self.shutdown.subscribe()
-    }
-
-    pub fn register_loop(&mut self, component_loop: ComponentLoop) -> wasmtime::Result<()> {
-        if self.registered_loop_count() >= MAX_BOX_COMPONENT_LOOPS {
-            return Err(wasmtime::Error::msg("box has too many component loops"));
-        }
-        self.component_loops.push(component_loop);
-        Ok(())
-    }
-
-    fn registered_loop_count(&self) -> usize {
-        self.component_loops.len()
-            + self
-                .children
-                .iter()
-                .map(|child| child.loop_count)
-                .sum::<usize>()
-    }
-
-    pub async fn prepare(self) -> wasmtime::Result<PreparedBoxRuntime> {
-        self.validate_runtime_start()?;
-        self.prepare_devices().await?.finish()
-    }
-
-    pub(crate) fn finish(mut self) -> wasmtime::Result<PreparedBoxRuntime> {
-        self.validate_runtime_start()?;
-        let failure = if let Some(router) = self.mmio.take() {
-            let crate::component::vmm::mmio::Router {
-                bridge,
-                entrypoint,
-                failure,
-                ..
-            } = router;
-            if self.store.data().platform.is_machine_running() {
-                self.register_loop(entrypoint)?;
-            }
-            self.component_loops.push(bridge);
-            Some(failure)
-        } else {
-            None
-        };
-        Ok(PreparedBoxRuntime {
-            store: self.store,
-            _epoch_clock: self.epoch_clock,
-            shutdown: self.shutdown,
-            children: self.children,
-            component_loops: self.component_loops,
-            failure,
-        })
-    }
-
     #[must_use]
     pub fn lifecycle_notifier(&self) -> crate::component::vmm::lifecycle::LifecycleNotifier {
         self.store.data().lifecycle.notifier()
