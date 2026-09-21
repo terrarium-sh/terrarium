@@ -5,10 +5,10 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use terra_runtime::component::vmm::virtualization::StartedVcpus;
 
-use crate::WindowsRam;
 #[cfg(target_arch = "x86_64")]
 use crate::machine::MAX_VCPUS;
 use crate::worker::{self, PreparedVmm, VmmObservation, WorkerInput};
+use terra_runtime::WindowsRam;
 #[cfg(target_arch = "x86_64")]
 use terra_runtime::component::vmm::interrupts::{IoApicHandle, X86Interrupt};
 use terra_runtime::component::vmm::virtualization::PreparedMachine;

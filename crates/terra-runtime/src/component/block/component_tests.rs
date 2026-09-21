@@ -2,10 +2,12 @@
 //! requests drive `execute` through the actual memory/disk imports.
 //! Build it first: `make component-block` (nightly `wasm32-wasip3`).
 
+use crate::component::block::backing::DiskGrant;
+use crate::component::block::host::{BlockHost, Completion, Range, block_component_linker};
+use crate::component::vmm::mmio::terra::mmio::types::DeviceError;
 use crate::component::vmm::mmio::{Operation, Reply, Request};
 use crate::engine::{
-    Completion, DeviceError, DiskGrant, Range, block_component_linker, device_engine,
-    precompile_component,
+    device_engine, precompile_component,
     test_support::{StandaloneHost, device_store},
 };
 use crate::{BoundedDisk, SyntheticRam};
@@ -28,7 +30,7 @@ const T_GET_ID: u32 = 8;
 const T_DISCARD: u32 = 11;
 
 type Execute = TypedFunc<(u32, u64, Vec<Range>, u64, u64), (u8,)>;
-type Configure = TypedFunc<(bool,), (Result<(), crate::engine::DeviceError>,)>;
+type Configure = TypedFunc<(bool,), (Result<(), DeviceError>,)>;
 type Serve = TypedFunc<(StreamReader<Request>,), (StreamReader<Reply>,)>;
 
 fn one(addr: u64, len: u64) -> Vec<Range> {
@@ -49,7 +51,7 @@ fn export_name(func: &str) -> ItemName {
 }
 
 struct Fixture {
-    store: wasmtime::Store<StandaloneHost<crate::engine::BlockHost>>,
+    store: wasmtime::Store<StandaloneHost<BlockHost>>,
     execute: Execute,
     configure: Configure,
     serve: Serve,
@@ -57,13 +59,13 @@ struct Fixture {
 
 struct ReplySink(Arc<Mutex<Option<Reply>>>);
 
-impl StreamConsumer<StandaloneHost<crate::engine::BlockHost>> for ReplySink {
+impl StreamConsumer<StandaloneHost<BlockHost>> for ReplySink {
     type Item = Reply;
 
     fn poll_consume(
         self: Pin<&mut Self>,
         _: &mut Context<'_>,
-        store: StoreContextMut<StandaloneHost<crate::engine::BlockHost>>,
+        store: StoreContextMut<StandaloneHost<BlockHost>>,
         mut source: Source<'_, Self::Item>,
         finish: bool,
     ) -> Poll<wasmtime::Result<StreamResult>> {
@@ -125,7 +127,7 @@ async fn mmio(
 async fn fixture(
     capacity_sectors: usize,
     readonly: bool,
-) -> (Linker<StandaloneHost<crate::engine::BlockHost>>, Fixture) {
+) -> (Linker<StandaloneHost<BlockHost>>, Fixture) {
     let engine = device_engine().expect("engine builds");
     let linker = block_component_linker(&engine).expect("block imports link");
     let mut disk = BoundedDisk::new(capacity_sectors * 512, readonly);
@@ -134,7 +136,7 @@ async fn fixture(
     }
     let mut store = device_store(
         &engine,
-        crate::engine::BlockHost::new(SyntheticRam::new(RAM).unwrap(), DiskGrant::Mem(disk)),
+        BlockHost::new(SyntheticRam::new(RAM).unwrap(), DiskGrant::Mem(disk)),
     );
     let component = Component::new(&engine, component_bytes()).expect("block component compiles");
     let instance = linker
@@ -559,7 +561,7 @@ async fn component_aot_deserialize_runs() {
     let component = unsafe { Component::deserialize(&engine, &artifact).expect("deserializes") };
     let mut store = device_store(
         &engine,
-        crate::engine::BlockHost::new(
+        BlockHost::new(
             crate::SyntheticRam::new(RAM).unwrap(),
             DiskGrant::Mem(BoundedDisk::new(8 * 512, false)),
         ),
@@ -645,10 +647,7 @@ async fn component_operates_on_shared_machine_ram() {
     let ram = SyntheticRam::from_shared(Arc::clone(&mem)).expect("aliases");
     let mut disk = BoundedDisk::new(8 * 512, false);
     disk.write(2 * 512, &[0x5Eu8; 512]).expect("pattern in");
-    let mut store = device_store(
-        &engine,
-        crate::engine::BlockHost::new(ram, DiskGrant::Mem(disk)),
-    );
+    let mut store = device_store(&engine, BlockHost::new(ram, DiskGrant::Mem(disk)));
     let component = Component::new(&engine, component_bytes()).expect("block component compiles");
     let instance = linker
         .instantiate_async(&mut store, &component)

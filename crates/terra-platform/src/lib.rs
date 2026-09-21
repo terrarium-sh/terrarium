@@ -2,8 +2,6 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
-pub use terra_runtime::*;
-
 pub mod aarch64;
 #[cfg(target_arch = "x86_64")]
 pub mod amd64;

@@ -898,7 +898,7 @@ fn saturated_mount_cleanup_does_not_starve_another_mount_or_guest_disk() {
         .unwrap();
     runtime.block_on(async {
         use crate::component::block::backing::{DiskGrant, FileDisk};
-        use crate::engine::terra::host::disk::HostWithStore;
+        use crate::component::block::host::terra::host::disk::HostWithStore;
         use wasmtime::component::HasSelf;
 
         let (_root, mut stalled, gate) = mount_with_operation(Operation::HostMetadata).await;
@@ -909,7 +909,7 @@ fn saturated_mount_cleanup_does_not_starve_another_mount_or_guest_disk() {
         let disk_root = tempfile::tempdir().unwrap();
         let disk_path = disk_root.path().join("disk");
         std::fs::write(&disk_path, b"disk contents").unwrap();
-        let disk_host = crate::engine::BlockHost::new(
+        let disk_host = crate::component::block::host::BlockHost::new(
             crate::SyntheticRam::new(4096).unwrap(),
             DiskGrant::File(FileDisk::open(&disk_path, false).unwrap()),
         );

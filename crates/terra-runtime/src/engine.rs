@@ -1,12 +1,6 @@
 //! Wasmtime engine configuration and bounded device capability imports.
 
-pub use crate::component::block::backing::DiskGrant;
-pub use crate::component::block::host::{
-    BlockDevice, BlockHost, Completion, Range, block_component_linker, terra,
-};
-pub use crate::component::network::host::NetworkHost;
-pub use crate::component::vmm::mmio::terra::mmio::types::DeviceError;
-pub use crate::component::vsock::host::{VsockDeviceHost, vsock_component_linker};
+use crate::component::block::host::terra;
 
 use super::{BoundedMemory, Interrupt, MAX_SINGLE_BYTES, SyntheticRam};
 use std::sync::Arc;

@@ -6,8 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use terra_runtime::component::vmm::mmio::{Operation, Reply as MmioReply, Request};
+use terra_runtime::component::vsock::host::{VsockDeviceHost, vsock_component_linker};
+use terra_runtime::engine::device_engine;
 use terra_runtime::engine::test_support::{StandaloneHost, device_store};
-use terra_runtime::engine::{device_engine, vsock_component_linker};
 use terra_vsock_device::VsockHeader;
 use wasmtime::StoreContextMut;
 use wasmtime::component::{
@@ -28,7 +29,7 @@ type Receive =
 type Serve = TypedFunc<(StreamReader<Request>,), (StreamReader<MmioReply>,)>;
 
 async fn next_reply(
-    accessor: &Accessor<StandaloneHost<terra_runtime::engine::VsockDeviceHost>>,
+    accessor: &Accessor<StandaloneHost<VsockDeviceHost>>,
     replies: Replies,
     operation: u16,
 ) -> Reply {
@@ -52,7 +53,7 @@ async fn next_reply(
 }
 
 async fn guest_packet(
-    accessor: &Accessor<StandaloneHost<terra_runtime::engine::VsockDeviceHost>>,
+    accessor: &Accessor<StandaloneHost<VsockDeviceHost>>,
     receive: Receive,
     port: u32,
     operation: u16,
@@ -103,7 +104,7 @@ async fn read_until_eof(socket: &mut terra_io::local::LocalStream) -> Vec<u8> {
 }
 
 async fn wait_for_no_connections(
-    accessor: &Accessor<StandaloneHost<terra_runtime::engine::VsockDeviceHost>>,
+    accessor: &Accessor<StandaloneHost<VsockDeviceHost>>,
     count: TypedFunc<(), (u32,)>,
 ) {
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -115,15 +116,11 @@ async fn wait_for_no_connections(
     .expect("closed host client releases its pending guest connection");
 }
 
-fn live_clients(
-    accessor: &Accessor<StandaloneHost<terra_runtime::engine::VsockDeviceHost>>,
-) -> usize {
+fn live_clients(accessor: &Accessor<StandaloneHost<VsockDeviceHost>>) -> usize {
     accessor.with(|mut access| access.get().vsock_service_mut().live_clients())
 }
 
-async fn wait_for_no_clients(
-    accessor: &Accessor<StandaloneHost<terra_runtime::engine::VsockDeviceHost>>,
-) {
+async fn wait_for_no_clients(accessor: &Accessor<StandaloneHost<VsockDeviceHost>>) {
     tokio::time::timeout(Duration::from_secs(2), async {
         while live_clients(accessor) != 0 {
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -134,7 +131,7 @@ async fn wait_for_no_clients(
 }
 
 async fn serve_and_disconnect(
-    accessor: &Accessor<StandaloneHost<terra_runtime::engine::VsockDeviceHost>>,
+    accessor: &Accessor<StandaloneHost<VsockDeviceHost>>,
     replies: Replies,
     receive: Receive,
     count: TypedFunc<(), (u32,)>,
@@ -163,13 +160,13 @@ struct Worker {
 
 struct ReplySink(Arc<Mutex<Vec<MmioReply>>>);
 
-impl StreamConsumer<StandaloneHost<terra_runtime::engine::VsockDeviceHost>> for ReplySink {
+impl StreamConsumer<StandaloneHost<VsockDeviceHost>> for ReplySink {
     type Item = MmioReply;
 
     fn poll_consume(
         self: Pin<&mut Self>,
         _: &mut Context<'_>,
-        store: StoreContextMut<StandaloneHost<terra_runtime::engine::VsockDeviceHost>>,
+        store: StoreContextMut<StandaloneHost<VsockDeviceHost>>,
         mut source: Source<'_, Self::Item>,
         finish: bool,
     ) -> Poll<wasmtime::Result<StreamResult>> {
@@ -186,7 +183,7 @@ impl StreamConsumer<StandaloneHost<terra_runtime::engine::VsockDeviceHost>> for 
 }
 
 async fn drive_transport_ready(
-    store: &mut wasmtime::Store<StandaloneHost<terra_runtime::engine::VsockDeviceHost>>,
+    store: &mut wasmtime::Store<StandaloneHost<VsockDeviceHost>>,
     serve: Serve,
 ) {
     let requests = StreamReader::new(
@@ -234,14 +231,11 @@ async fn drive_transport_ready(
 
 async fn create_worker(
     listener: terra_io::local::LocalListener,
-) -> (
-    wasmtime::Store<StandaloneHost<terra_runtime::engine::VsockDeviceHost>>,
-    Worker,
-) {
+) -> (wasmtime::Store<StandaloneHost<VsockDeviceHost>>, Worker) {
     let engine = device_engine().unwrap();
     let mut store = device_store(
         &engine,
-        terra_runtime::engine::VsockDeviceHost::new(
+        VsockDeviceHost::new(
             terra_runtime::SyntheticRam::new(4096).unwrap(),
             terra_runtime::component::vsock::host::VsockHostService::new(
                 vec![2, 0, 0, 0, b'{', b'}'],
@@ -268,7 +262,7 @@ async fn create_worker(
         .unwrap();
     let export = |name| component.get_export_index(Some(&interface), name).unwrap();
     let configure_device = instance
-        .get_typed_func::<(), (Result<(), terra_runtime::engine::DeviceError>,)>(
+        .get_typed_func::<(), (Result<(), terra_runtime::component::vmm::mmio::terra::mmio::types::DeviceError>,)>(
             &mut store,
             export("configure-device"),
         )

@@ -196,7 +196,7 @@ pub fn network_component_linker<T: wasmtime_wasi::WasiView + AsMut<NetworkHost> 
         NetworkNameLookupHost<T>,
     >(&mut linker, AsMut::as_mut)?;
     crate::engine::add_device_imports(&mut linker, |host: &mut T| &mut host.as_mut().context)?;
-    crate::engine::terra::host::diagnostics::add_to_linker::<
+    crate::component::block::host::terra::host::diagnostics::add_to_linker::<
         T,
         wasmtime::component::HasSelf<crate::engine::DeviceContext>,
     >(&mut linker, |host| &mut host.as_mut().context)?;

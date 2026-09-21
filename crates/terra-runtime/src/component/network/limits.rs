@@ -183,7 +183,8 @@ fn set_option<S>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::{NetworkHost, device_engine};
+    use crate::component::network::host::NetworkHost;
+    use crate::engine::device_engine;
     use wasmtime_wasi::sockets::WasiSocketsView;
 
     struct Deny;
@@ -268,9 +269,10 @@ mod tests {
                 )
                 .is_err()
         );
-        let linker =
-            super::super::host::network_component_linker::<crate::engine::NetworkHost>(&engine)
-                .unwrap();
+        let linker = super::super::host::network_component_linker::<
+            crate::component::network::host::NetworkHost,
+        >(&engine)
+        .unwrap();
         let component = wasmtime::component::Component::new(
             &engine,
             r#"

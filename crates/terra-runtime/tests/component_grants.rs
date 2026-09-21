@@ -1,9 +1,11 @@
 #![allow(clippy::expect_used)]
 
+use terra_runtime::component::block::host::{BlockHost, block_component_linker};
 use terra_runtime::component::fs::host::fs_component_linker;
 use terra_runtime::component::mem::host::mem_component_linker;
-use terra_runtime::component::network::host::network_component_linker;
-use terra_runtime::engine::{block_component_linker, device_engine, vsock_component_linker};
+use terra_runtime::component::network::host::{NetworkHost, network_component_linker};
+use terra_runtime::component::vsock::host::{VsockDeviceHost, vsock_component_linker};
+use terra_runtime::engine::device_engine;
 use wasmtime::component::{Component, Linker};
 
 fn assert_resource<T: 'static>(
@@ -57,16 +59,14 @@ fn wasi_filesystem_and_socket_resources_are_device_specific() {
         ("wasi:sockets/types@0.3.1", "udp-socket"),
     ] {
         assert_resource(
-            &block_component_linker::<terra_runtime::engine::BlockHost>(&engine)
-                .expect("component linker"),
+            &block_component_linker::<BlockHost>(&engine).expect("component linker"),
             &engine,
             interface,
             resource,
             false,
         );
         assert_resource(
-            &vsock_component_linker::<terra_runtime::engine::VsockDeviceHost>(&engine)
-                .expect("component linker"),
+            &vsock_component_linker::<VsockDeviceHost>(&engine).expect("component linker"),
             &engine,
             interface,
             resource,
@@ -89,8 +89,7 @@ fn wasi_filesystem_and_socket_resources_are_device_specific() {
             resource == "descriptor",
         );
         assert_resource(
-            &network_component_linker::<terra_runtime::engine::NetworkHost>(&engine)
-                .expect("component linker"),
+            &network_component_linker::<NetworkHost>(&engine).expect("component linker"),
             &engine,
             interface,
             resource,
@@ -104,15 +103,14 @@ fn host_service_clients_are_exclusive_to_vsock() {
     let engine = device_engine().expect("device engine");
     let interface = "terra:vsock/host-service@0.1.0";
     assert_resource(
-        &vsock_component_linker::<terra_runtime::engine::VsockDeviceHost>(&engine)
-            .expect("vsock linker"),
+        &vsock_component_linker::<VsockDeviceHost>(&engine).expect("vsock linker"),
         &engine,
         interface,
         "client",
         true,
     );
     assert_resource(
-        &block_component_linker::<terra_runtime::engine::BlockHost>(&engine).expect("block linker"),
+        &block_component_linker::<BlockHost>(&engine).expect("block linker"),
         &engine,
         interface,
         "client",
@@ -127,8 +125,7 @@ fn host_service_clients_are_exclusive_to_vsock() {
         false,
     );
     assert_resource(
-        &network_component_linker::<terra_runtime::engine::NetworkHost>(&engine)
-            .expect("network linker"),
+        &network_component_linker::<NetworkHost>(&engine).expect("network linker"),
         &engine,
         interface,
         "client",
@@ -204,14 +201,12 @@ fn assert_components<T: 'static>(linker: &Linker<T>, engine: &wasmtime::Engine, 
 fn component_linkers_exclude_ungranted_interfaces() {
     let engine = device_engine().expect("device engine");
     assert_components(
-        &block_component_linker::<terra_runtime::engine::BlockHost>(&engine)
-            .expect("component linker"),
+        &block_component_linker::<BlockHost>(&engine).expect("component linker"),
         &engine,
         "block",
     );
     assert_components(
-        &network_component_linker::<terra_runtime::engine::NetworkHost>(&engine)
-            .expect("component linker"),
+        &network_component_linker::<NetworkHost>(&engine).expect("component linker"),
         &engine,
         "network",
     );
@@ -228,8 +223,7 @@ fn component_linkers_exclude_ungranted_interfaces() {
         "mem",
     );
     assert_components(
-        &vsock_component_linker::<terra_runtime::engine::VsockDeviceHost>(&engine)
-            .expect("component linker"),
+        &vsock_component_linker::<VsockDeviceHost>(&engine).expect("component linker"),
         &engine,
         "vsock",
     );
@@ -271,16 +265,14 @@ fn only_vmm_receives_virtual_machine_and_vcpu_resources() {
     ] {
         assert_resource(&vmm, &engine, interface, resource, true);
         assert_resource(
-            &block_component_linker::<terra_runtime::engine::BlockHost>(&engine)
-                .expect("block linker"),
+            &block_component_linker::<BlockHost>(&engine).expect("block linker"),
             &engine,
             interface,
             resource,
             false,
         );
         assert_resource(
-            &network_component_linker::<terra_runtime::engine::NetworkHost>(&engine)
-                .expect("network linker"),
+            &network_component_linker::<NetworkHost>(&engine).expect("network linker"),
             &engine,
             interface,
             resource,
@@ -303,8 +295,7 @@ fn only_vmm_receives_virtual_machine_and_vcpu_resources() {
             false,
         );
         assert_resource(
-            &vsock_component_linker::<terra_runtime::engine::VsockDeviceHost>(&engine)
-                .expect("vsock linker"),
+            &vsock_component_linker::<VsockDeviceHost>(&engine).expect("vsock linker"),
             &engine,
             interface,
             resource,
@@ -345,17 +336,15 @@ fn assert_random_grants<T: 'static>(
 #[test]
 fn only_vsock_receives_secure_random_and_no_component_receives_insecure_random() {
     use terra_runtime::box_runtime::StoreState;
-    use terra_runtime::engine::VsockDeviceHost;
 
     let engine = device_engine().expect("device engine");
     assert_random_grants(
-        &block_component_linker::<terra_runtime::engine::BlockHost>(&engine).expect("block linker"),
+        &block_component_linker::<BlockHost>(&engine).expect("block linker"),
         &engine,
         false,
     );
     assert_random_grants(
-        &network_component_linker::<terra_runtime::engine::NetworkHost>(&engine)
-            .expect("network linker"),
+        &network_component_linker::<NetworkHost>(&engine).expect("network linker"),
         &engine,
         false,
     );
@@ -377,8 +366,7 @@ fn only_vsock_receives_secure_random_and_no_component_receives_insecure_random()
         false,
     );
     assert_random_grants(
-        &vsock_component_linker::<terra_runtime::engine::VsockDeviceHost>(&engine)
-            .expect("vsock linker"),
+        &vsock_component_linker::<VsockDeviceHost>(&engine).expect("vsock linker"),
         &engine,
         true,
     );

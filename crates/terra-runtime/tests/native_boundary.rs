@@ -1,7 +1,8 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use terra_runtime::component::block::backing::{BackingError, BlockBacking, FileDisk};
-use terra_runtime::engine::{DeviceContext, terra::host::memory::Host};
+use terra_runtime::component::block::host::terra::host::memory::Host;
+use terra_runtime::engine::DeviceContext;
 use terra_runtime::{
     BoundedDisk, BoundedMemory, DiskError, Interrupt, MAX_SIGNALS_PER_WINDOW, MemoryError,
     SyntheticRam,

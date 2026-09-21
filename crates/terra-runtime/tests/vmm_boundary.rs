@@ -553,9 +553,11 @@ async fn deferred_device_failure_prevents_cpu_launch() {
     let (mut runtime, _) = attach_test_machine(runtime, ram.clone()).await;
     let _channel = terra_runtime::component::block::instantiate_shared(
         &mut runtime,
-        terra_runtime::engine::BlockHost::new(
+        terra_runtime::component::block::host::BlockHost::new(
             ram,
-            terra_runtime::engine::DiskGrant::Mem(terra_runtime::BoundedDisk::new(0, false)),
+            terra_runtime::component::block::backing::DiskGrant::Mem(
+                terra_runtime::BoundedDisk::new(0, false),
+            ),
         ),
         &memory(&engine),
         true,
@@ -588,7 +590,7 @@ async fn deferred_device_failure_prevents_cpu_launch() {
 async fn wasi_composes_multiple_deferred_workers_with_their_final_mappings() {
     use terra_runtime::BoundedDisk;
 
-    use terra_runtime::engine::DiskGrant;
+    use terra_runtime::component::block::backing::DiskGrant;
 
     let engine = device_engine().expect("engine");
     let ram = SyntheticRam::new(8 << 20).expect("RAM");
@@ -607,7 +609,7 @@ async fn wasi_composes_multiple_deferred_workers_with_their_final_mappings() {
     .expect("block component");
     let mut channels = Vec::new();
     for bytes in [4096, 8192, 12288] {
-        let host = terra_runtime::engine::BlockHost::new(
+        let host = terra_runtime::component::block::host::BlockHost::new(
             ram.clone(),
             DiskGrant::Mem(BoundedDisk::new(bytes, false)),
         );

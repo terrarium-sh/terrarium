@@ -76,11 +76,11 @@ fn agent_bridge_plan() -> Vec<u8> {
     )
 }
 
-fn boot_artifacts() -> super::worker::TrustedArtifacts {
+fn boot_artifacts() -> terra_runtime::TrustedArtifacts {
     // SAFETY: these build-tree artifacts are trusted AOT output for this binary's Wasmtime.
     #[allow(unsafe_code)]
     unsafe {
-        super::worker::TrustedArtifacts::new(
+        terra_runtime::TrustedArtifacts::new(
             include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../build/terra-block-component.cwasm"
@@ -131,7 +131,7 @@ async fn kernel_boots_directory_share() {
         permissions.set_mode(0o755);
         std::fs::set_permissions(&executable, permissions).unwrap();
     }
-    let tag = super::component::fs::host::share_tag(0);
+    let tag = terra_runtime::component::fs::host::share_tag(0);
     let encoded = boot_plan(PlanMode::Run, Vec::new(), vec!["/bin/true".into()], false);
     let mut plan: Plan = read_frame(&mut encoded.as_slice()).unwrap().unwrap();
     plan.on_start.push("set -ex; test $(/work/script) = executed; test $(cat /work/host-file) = host-data; printf guest-data >/work/guest-file; ln /work/guest-file /work/hardlink; ln -s guest-file /work/link; test $(cat /work/link) = guest-data; mv /work/guest-file /work/renamed; test $(cat /work/hardlink) = guest-data; cp /work/large-host /work/large-copy; cmp /work/large-host /work/large-copy; test $(wc -c </work/large-copy) = 65537; sync".into());
@@ -148,7 +148,7 @@ async fn kernel_boots_directory_share() {
         boot_disk,
         root_disk: root_disk.to_path_buf(),
         volume_disks: Vec::new(),
-        shares: vec![super::component::fs::host::ShareGrant::new(&mount, false).unwrap()],
+        shares: vec![terra_runtime::component::fs::host::ShareGrant::new(&mount, false).unwrap()],
         plan: encode_frame(&plan).unwrap(),
         artifacts: boot_artifacts(),
         network_policy: boot_network_policy(),

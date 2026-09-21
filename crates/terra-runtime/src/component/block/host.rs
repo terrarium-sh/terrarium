@@ -243,11 +243,11 @@ mod tests {
 
         let mut host = BlockHost::new(
             crate::SyntheticRam::new(4096).unwrap(),
-            crate::engine::DiskGrant::Mem(crate::BoundedDisk::new(0, false)),
+            crate::component::block::backing::DiskGrant::Mem(crate::BoundedDisk::new(0, false)),
         );
         let mut other = BlockHost::new(
             crate::SyntheticRam::new(4096).unwrap(),
-            crate::engine::DiskGrant::Mem(crate::BoundedDisk::new(0, false)),
+            crate::component::block::backing::DiskGrant::Mem(crate::BoundedDisk::new(0, false)),
         );
         let (started, started_rx) = tokio::sync::oneshot::channel();
         let (release, release_rx) = std::sync::mpsc::sync_channel(0);

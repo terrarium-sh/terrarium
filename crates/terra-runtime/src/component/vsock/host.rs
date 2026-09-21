@@ -539,10 +539,10 @@ fn shutdown_write(stream: &mut WriteHalf) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::component::vsock::host::VsockDeviceHost;
     use crate::component::vsock::host::terra::vsock::host_service::{
         HostClient, HostClientWithStore, HostWithStore,
     };
-    use crate::engine::VsockDeviceHost;
     #[cfg(unix)]
     use std::sync::atomic::{AtomicUsize, Ordering};
 

@@ -1,7 +1,8 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use terra_runtime::component::vsock::host::{VsockDeviceHost, vsock_component_linker};
+use terra_runtime::engine::device_engine;
 use terra_runtime::engine::test_support::device_store;
-use terra_runtime::engine::{device_engine, vsock_component_linker};
 use wasmtime::component::{Component, TypedFunc, wit_parser::ItemName};
 
 #[derive(
@@ -82,7 +83,7 @@ async fn component_releases_credit_after_consumer_drains_data() {
     let component = Component::new(&engine, COMPONENT).expect("component");
     let mut store = device_store(
         &engine,
-        terra_runtime::engine::VsockDeviceHost::new(
+        VsockDeviceHost::new(
             terra_runtime::SyntheticRam::new(64 * 1024).unwrap(),
             terra_runtime::component::vsock::host::VsockHostService::default(),
         ),
@@ -157,7 +158,7 @@ async fn component_drains_selected_stream_while_another_is_queued() {
     let component = Component::new(&engine, COMPONENT).expect("component");
     let mut store = device_store(
         &engine,
-        terra_runtime::engine::VsockDeviceHost::new(
+        VsockDeviceHost::new(
             terra_runtime::SyntheticRam::new(64 * 1024).unwrap(),
             terra_runtime::component::vsock::host::VsockHostService::default(),
         ),
@@ -256,7 +257,7 @@ async fn component_close_clears_queued_state() {
     let component = Component::new(&engine, COMPONENT).expect("component");
     let mut store = device_store(
         &engine,
-        terra_runtime::engine::VsockDeviceHost::new(
+        VsockDeviceHost::new(
             terra_runtime::SyntheticRam::new(64 * 1024).unwrap(),
             terra_runtime::component::vsock::host::VsockHostService::default(),
         ),
@@ -313,7 +314,7 @@ async fn component_rejects_backpressure_without_resetting_connection_state() {
     let component = Component::new(&engine, COMPONENT).expect("component");
     let mut store = device_store(
         &engine,
-        terra_runtime::engine::VsockDeviceHost::new(
+        VsockDeviceHost::new(
             terra_runtime::SyntheticRam::new(64 * 1024).unwrap(),
             terra_runtime::component::vsock::host::VsockHostService::default(),
         ),
@@ -389,7 +390,7 @@ async fn lifecycle_decoding_stays_in_component_and_handles_bounded_frames() {
     let component = Component::new(&engine, COMPONENT).unwrap();
     let mut store = device_store(
         &engine,
-        terra_runtime::engine::VsockDeviceHost::new(
+        VsockDeviceHost::new(
             terra_runtime::SyntheticRam::new(65536).unwrap(),
             terra_runtime::component::vsock::host::VsockHostService::default(),
         ),

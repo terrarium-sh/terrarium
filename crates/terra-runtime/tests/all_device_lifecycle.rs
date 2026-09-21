@@ -9,10 +9,11 @@ use terra_runtime::{
     box_runtime::{BoxHost, BoxRuntime},
     component::{
         Interrupt,
+        block::backing::DiskGrant,
         fs::host::{FsHost, ShareGrant},
         vsock::VsockChannel,
     },
-    engine::{DeviceContext, DiskGrant, device_engine},
+    engine::{DeviceContext, device_engine},
 };
 use wasmtime::component::Component;
 
@@ -120,7 +121,7 @@ async fn every_device_resets_and_closes_in_one_box_runtime() {
     let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
     runtime.initialize_mmio(&router).await.expect("MMIO router");
 
-    let block_host = terra_runtime::engine::BlockHost::new(
+    let block_host = terra_runtime::component::block::host::BlockHost::new(
         ram.clone(),
         DiskGrant::Mem(BoundedDisk::new(4096, false)),
     );

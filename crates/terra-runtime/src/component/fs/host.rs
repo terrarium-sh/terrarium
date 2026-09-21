@@ -26,8 +26,8 @@ wasmtime::component::bindgen!({
  "terra:fs/host.statfs": async | store,
  },
     with: {
-        "terra:host/memory@0.1.0": crate::engine::terra::host::memory,
-        "terra:host/interrupt@0.1.0": crate::engine::terra::host::interrupt,
+        "terra:host/memory@0.1.0": crate::component::block::host::terra::host::memory,
+        "terra:host/interrupt@0.1.0": crate::component::block::host::terra::host::interrupt,
         "terra:mmio/types@0.1.0": crate::component::vmm::mmio::terra::mmio::types,
         "wasi:filesystem/types.descriptor": wasmtime_wasi::filesystem::Descriptor,
     },

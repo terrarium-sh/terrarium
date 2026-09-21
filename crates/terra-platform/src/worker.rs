@@ -3,7 +3,6 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-pub use crate::TrustedArtifacts;
 #[cfg(target_arch = "aarch64")]
 pub use crate::aarch64::arm::MAX_VCPUS;
 #[cfg(target_arch = "x86_64")]
@@ -16,9 +15,9 @@ pub struct WorkerInput {
     pub root_disk: PathBuf,
     pub volume_disks: Vec<PathBuf>,
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-    pub shares: Vec<crate::component::fs::host::ShareGrant>,
+    pub shares: Vec<terra_runtime::component::fs::host::ShareGrant>,
     pub plan: Vec<u8>,
-    pub artifacts: crate::TrustedArtifacts,
+    pub artifacts: terra_runtime::TrustedArtifacts,
     pub network_policy: terra_network::PolicyHandle,
     pub port_mappings: Vec<terra_network::PortMapping>,
     pub ram_bytes: u64,
@@ -33,21 +32,21 @@ pub struct WorkerInput {
 
 pub(crate) fn create_runtime(
     input: &WorkerInput,
-) -> wasmtime::Result<crate::box_runtime::BoxRuntime> {
-    crate::box_runtime::BoxRuntime::new(
-        &crate::engine::device_engine()?,
-        crate::box_runtime::BoxHost::with_memory_limits(input.component_memory_limits),
+) -> wasmtime::Result<terra_runtime::box_runtime::BoxRuntime> {
+    terra_runtime::box_runtime::BoxRuntime::new(
+        &terra_runtime::engine::device_engine()?,
+        terra_runtime::box_runtime::BoxHost::with_memory_limits(input.component_memory_limits),
     )
 }
 
 pub(crate) async fn boot_prepared<
     M: terra_runtime::component::vmm::virtualization::VirtualMachine,
 >(
-    mut runtime: crate::box_runtime::BoxRuntime,
+    mut runtime: terra_runtime::box_runtime::BoxRuntime,
     mut prepared: terra_runtime::component::vmm::virtualization::PreparedMachine<M>,
     input: &mut WorkerInput,
 ) -> wasmtime::Result<(
-    crate::box_runtime::BoxRuntime,
+    terra_runtime::box_runtime::BoxRuntime,
     terra_runtime::component::vmm::virtualization::MachineHandle<M>,
 )> {
     let boot = input.artifacts.boot().deserialize(runtime.store.engine())?;
@@ -74,14 +73,14 @@ pub(crate) async fn boot_prepared<
 }
 
 pub(crate) fn assemble_devices(
-    runtime: &mut crate::box_runtime::BoxRuntime,
+    runtime: &mut terra_runtime::box_runtime::BoxRuntime,
     input: &mut WorkerInput,
     ram: terra_runtime::component::vmm::virtualization::RamGrant,
     disks: &[(PathBuf, bool)],
     bind_interrupt: impl Fn(
         terra_runtime::component::vmm::machine::DeviceKind,
         usize,
-    ) -> Result<crate::component::network::Interrupt, String>,
+    ) -> Result<terra_runtime::component::network::Interrupt, String>,
 ) -> Result<(), String> {
     use terra_runtime::component::vmm::machine::DeviceKind;
     blocks(runtime, ram.clone(), input, disks, |index| {
@@ -123,7 +122,7 @@ pub struct WorkerOutcome {
 }
 
 pub struct PreparedVmm {
-    pub runtime: crate::box_runtime::PreparedBoxRuntime,
+    pub runtime: terra_runtime::box_runtime::PreparedBoxRuntime,
     pub observation: VmmObservation,
 }
 
@@ -138,7 +137,7 @@ pub struct VmmObservation {
 impl VmmObservation {
     pub async fn observe(
         self,
-        runtime: crate::box_runtime::BoxRuntimeHandle,
+        runtime: terra_runtime::box_runtime::BoxRuntimeHandle,
     ) -> Result<WorkerOutcome, String> {
         use terra_runtime::component::vmm::lifecycle::{Outcome, wait_for_outcome};
 
@@ -200,7 +199,7 @@ pub async fn run(input: WorkerInput) -> Result<WorkerOutcome, String> {
 }
 
 pub(crate) async fn finish_component_runtime(
-    runtime: crate::box_runtime::BoxRuntimeHandle,
+    runtime: terra_runtime::box_runtime::BoxRuntimeHandle,
     cleanup: Result<(), String>,
     deadline: std::time::Instant,
 ) -> Result<(), String> {
@@ -217,15 +216,14 @@ pub(crate) async fn finish_component_runtime(
 }
 
 pub(crate) fn blocks(
-    runtime: &mut crate::box_runtime::BoxRuntime,
+    runtime: &mut terra_runtime::box_runtime::BoxRuntime,
     ram: impl Into<terra_runtime::component::vmm::virtualization::RamGrant> + Send,
     input: &mut WorkerInput,
     disks: &[(PathBuf, bool)],
-    interrupt: impl Fn(usize) -> Result<crate::component::block::Interrupt, String>,
-) -> Result<Vec<crate::component::DeviceChannel>, String> {
-    use crate::component::block::backing::FileDisk;
-    use crate::component::block::host::BlockHost;
-    use crate::engine::DiskGrant;
+    interrupt: impl Fn(usize) -> Result<terra_runtime::component::block::Interrupt, String>,
+) -> Result<Vec<terra_runtime::component::DeviceChannel>, String> {
+    use terra_runtime::component::block::backing::{DiskGrant, FileDisk};
+    use terra_runtime::component::block::host::BlockHost;
 
     let component = input
         .artifacts
@@ -249,7 +247,7 @@ pub(crate) fn blocks(
     for (index, (disk, readonly)) in disks.enumerate() {
         let ram = ram.clone();
         let host = move || Ok(BlockHost::new(ram.resolve()?, disk));
-        let channel = crate::component::block::grant_shared(
+        let channel = terra_runtime::component::block::grant_shared(
             runtime,
             host,
             &component,
@@ -263,12 +261,12 @@ pub(crate) fn blocks(
 }
 
 pub(crate) fn network(
-    runtime: &mut crate::box_runtime::BoxRuntime,
+    runtime: &mut terra_runtime::box_runtime::BoxRuntime,
     ram: impl Into<terra_runtime::component::vmm::virtualization::RamGrant> + Send,
     input: &WorkerInput,
-    interrupt: crate::component::network::Interrupt,
-) -> Result<crate::component::DeviceChannel, String> {
-    use crate::engine::DeviceContext;
+    interrupt: terra_runtime::component::network::Interrupt,
+) -> Result<terra_runtime::component::DeviceChannel, String> {
+    use terra_runtime::engine::DeviceContext;
 
     let component = input
         .artifacts
@@ -276,7 +274,7 @@ pub(crate) fn network(
         .deserialize(runtime.store.engine())
         .map_err(|error| error.to_string())?;
     let ram = ram.into();
-    crate::component::network::grant_shared(
+    terra_runtime::component::network::grant_shared(
         runtime,
         move || Ok(DeviceContext::with_ram(ram.resolve()?)),
         &component,
@@ -290,12 +288,12 @@ pub(crate) fn network(
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub(crate) fn filesystems(
-    runtime: &mut crate::box_runtime::BoxRuntime,
+    runtime: &mut terra_runtime::box_runtime::BoxRuntime,
     ram: impl Into<terra_runtime::component::vmm::virtualization::RamGrant> + Send,
     input: &WorkerInput,
-    interrupt: impl Fn(usize) -> Result<crate::component::network::Interrupt, String>,
-) -> Result<Vec<crate::component::DeviceChannel>, String> {
-    use crate::engine::DeviceContext;
+    interrupt: impl Fn(usize) -> Result<terra_runtime::component::network::Interrupt, String>,
+) -> Result<Vec<terra_runtime::component::DeviceChannel>, String> {
+    use terra_runtime::engine::DeviceContext;
 
     if input.shares.is_empty() {
         return Ok(Vec::new());
@@ -316,21 +314,23 @@ pub(crate) fn filesystems(
         );
     }
     let mut grants = input.shares.clone();
-    crate::component::fs::host::share_notification_budgets(&mut grants);
+    terra_runtime::component::fs::host::share_notification_budgets(&mut grants);
     for (index, grant) in grants.into_iter().enumerate() {
         let ram = ram.clone();
         let host = move || {
-            Ok(crate::component::fs::host::FsHost::with_resource_capacity(
-                DeviceContext::with_ram(ram.resolve()?),
-                grant,
-                resource_capacity,
-            ))
+            Ok(
+                terra_runtime::component::fs::host::FsHost::with_resource_capacity(
+                    DeviceContext::with_ram(ram.resolve()?),
+                    grant,
+                    resource_capacity,
+                ),
+            )
         };
-        let channel = crate::component::fs::grant_shared(
+        let channel = terra_runtime::component::fs::grant_shared(
             runtime,
             host,
             &component,
-            &crate::component::fs::host::share_tag(index),
+            &terra_runtime::component::fs::host::share_tag(index),
             max_nodes,
             interrupt(index)?,
         )
@@ -359,12 +359,12 @@ fn filesystem_resource_capacity_for(limit: usize, shares: usize) -> usize {
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub(crate) fn memory(
-    runtime: &mut crate::box_runtime::BoxRuntime,
+    runtime: &mut terra_runtime::box_runtime::BoxRuntime,
     ram: impl Into<terra_runtime::component::vmm::virtualization::RamGrant> + Send,
     input: &WorkerInput,
-    interrupt: crate::component::network::Interrupt,
-) -> Result<crate::component::DeviceChannel, String> {
-    use crate::engine::DeviceContext;
+    interrupt: terra_runtime::component::network::Interrupt,
+) -> Result<terra_runtime::component::DeviceChannel, String> {
+    use terra_runtime::engine::DeviceContext;
 
     let component = input
         .artifacts
@@ -373,20 +373,20 @@ pub(crate) fn memory(
         .map_err(|error| error.to_string())?;
     let ram = ram.into();
     let host = move || Ok(DeviceContext::with_ram(ram.resolve()?));
-    crate::component::mem::grant_shared(runtime, host, &component, interrupt)
+    terra_runtime::component::mem::grant_shared(runtime, host, &component, interrupt)
         .map_err(|error| error.to_string())
 }
 
 pub(crate) fn vsock(
-    runtime: &mut crate::box_runtime::BoxRuntime,
+    runtime: &mut terra_runtime::box_runtime::BoxRuntime,
     ram: impl Into<terra_runtime::component::vmm::virtualization::RamGrant> + Send,
     input: &mut WorkerInput,
-    interrupt: crate::component::network::Interrupt,
-) -> Result<crate::component::vsock::VsockChannel, String> {
+    interrupt: terra_runtime::component::network::Interrupt,
+) -> Result<terra_runtime::component::vsock::VsockChannel, String> {
     let listener = input.listener.take();
     let control = input.control.take();
     let diagnostics = input.diagnostics.take();
-    crate::component::vsock::VsockChannel::from_trusted_artifact(
+    terra_runtime::component::vsock::VsockChannel::from_trusted_artifact(
         runtime,
         ram,
         input.artifacts.vsock(),
@@ -509,7 +509,7 @@ mod tests {
         )
         .unwrap();
         let ram = machine.ram();
-        let channel = crate::component::mem::grant_shared(
+        let channel = terra_runtime::component::mem::grant_shared(
             &mut runtime,
             move || Ok(DeviceContext::with_ram(ram.resolve()?)),
             &component,
@@ -600,9 +600,11 @@ mod tests {
         });
 
         let engine = terra_runtime::engine::device_engine().unwrap();
-        let mut runtime =
-            crate::box_runtime::BoxRuntime::new(&engine, crate::box_runtime::BoxHost::new())
-                .unwrap();
+        let mut runtime = terra_runtime::box_runtime::BoxRuntime::new(
+            &engine,
+            terra_runtime::box_runtime::BoxHost::new(),
+        )
+        .unwrap();
         runtime.add_device_shutdown(first).unwrap();
         runtime.add_device_shutdown(second).unwrap();
         let teardown = runtime.native_teardown();

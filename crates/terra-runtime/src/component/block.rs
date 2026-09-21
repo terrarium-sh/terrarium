@@ -92,7 +92,9 @@ async fn create_worker(
 #[cfg(test)]
 mod tests {
 
-    use crate::engine::{BlockHost, DiskGrant, device_engine};
+    use crate::component::block::backing::DiskGrant;
+    use crate::component::block::host::BlockHost;
+    use crate::engine::device_engine;
     use crate::{BoundedDisk, BoundedMemory, SyntheticRam};
     #[cfg(any(test, feature = "test-support"))]
     use std::sync::Arc;
@@ -109,7 +111,7 @@ mod tests {
             std::fs::read(component_path).expect("block component built"),
         )
         .expect("component compiles");
-        let host = crate::engine::BlockHost::new(
+        let host = crate::component::block::host::BlockHost::new(
             crate::SyntheticRam::new(64 * 1024).unwrap(),
             DiskGrant::Mem(BoundedDisk::new(4096, false)),
         );
@@ -197,7 +199,7 @@ mod tests {
             &mut other_box,
             BlockHost::new(
                 crate::SyntheticRam::new(4096).unwrap(),
-                crate::engine::DiskGrant::Mem(crate::BoundedDisk::new(0, false)),
+                crate::component::block::backing::DiskGrant::Mem(crate::BoundedDisk::new(0, false)),
             ),
             &component,
             false,
@@ -264,7 +266,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let mut host = crate::engine::BlockHost::new(
+        let mut host = crate::component::block::host::BlockHost::new(
             crate::SyntheticRam::new(64 * 1024).unwrap(),
             DiskGrant::Mem(BoundedDisk::new(4096, false)),
         );
@@ -332,7 +334,7 @@ mod tests {
         .unwrap();
         let ram = SyntheticRam::new(64 * 1024).unwrap();
         let memory = BoundedMemory::new(&ram);
-        let host = crate::engine::BlockHost::new(
+        let host = crate::component::block::host::BlockHost::new(
             ram.clone(),
             DiskGrant::Mem(BoundedDisk::new(4096, false)),
         );
