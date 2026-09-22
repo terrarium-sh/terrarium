@@ -203,7 +203,7 @@ impl BoxRuntime {
             .store
             .data_mut()
             .grant(config.clone(), ram.clone(), kernel)?;
-        let mut linker = crate::component::context::device_component_linker(self.store.engine())?;
+        let mut linker = wasmtime::component::Linker::new(self.store.engine());
         terra::boot::host::add_to_linker::<
             StoreState<BootHost>,
             wasmtime::component::HasSelf<BootHost>,

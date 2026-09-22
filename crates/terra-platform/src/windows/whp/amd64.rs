@@ -61,16 +61,7 @@ fn encode_pending_invalid_opcode() -> u64 {
 
 impl Partition {
     pub fn contains_guest_memory(&self, address: u64, len: usize) -> bool {
-        let Some(len) = u64::try_from(len).ok() else {
-            return false;
-        };
-        let Some(memory_end) = self.mapped_gpa.checked_add(self.memory.mapped_bytes()) else {
-            return false;
-        };
-        address >= self.mapped_gpa
-            && address
-                .checked_add(len)
-                .is_some_and(|end| end <= memory_end)
+        u64::try_from(len).is_ok_and(|len| self.memory.contains_range(address, len))
     }
 
     pub fn access_guest_memory(

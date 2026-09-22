@@ -4,7 +4,7 @@
 
 use std::time::Instant;
 
-use super::arch::{KVM_MAX_CPUID_ENTRIES, setup_bsp_planned, setup_irqchip};
+use super::arch::{setup_bsp_planned, setup_irqchip};
 use super::kvm::{
     KvmError, Machine, STOP_DEADLINE, park_ap, run_kernel_vcpu, spawn_configured_vcpu_ready,
 };
@@ -12,6 +12,7 @@ use crate::vm::{
     BootState, InterruptControllerConfig, InterruptMode, VcpuHandler, VcpuOutcome, VmCapabilities,
     VmConfig, VmHandle,
 };
+use kvm_bindings::KVM_MAX_CPUID_ENTRIES;
 use terra_limits::X86_MAX_VCPUS;
 
 fn stop_timed_out(outcomes: &[Result<VcpuOutcome, KvmError>]) -> bool {
@@ -57,17 +58,16 @@ impl KvmX86Vm {
         {
             return Err(format!("invalid x86 KVM VM dimensions: {vcpu_count} vCPUs"));
         }
-        let kvm = super::kvm::open().map_err(|error| format!("opening KVM: {error:?}"))?;
-        let cpuid =
-            build_cpuid(&kvm, vcpu_count).map_err(|error| format!("KVM CPUID: {error:?}"))?;
+        let kvm = super::kvm::open().map_err(|error| format!("opening KVM: {error}"))?;
+        let cpuid = build_cpuid(&kvm, vcpu_count).map_err(|error| format!("KVM CPUID: {error}"))?;
         let machine = std::sync::Arc::new(
             Machine::new(&kvm, config.ram_base, config.ram_bytes, vcpu_count)
-                .map_err(|error| format!("creating KVM VM: {error:?}"))?,
+                .map_err(|error| format!("creating KVM VM: {error}"))?,
         );
         setup_irqchip(machine.vm_fd(), &config.irq_routes)
-            .map_err(|error| format!("creating KVM irqchip: {error:?}"))?;
+            .map_err(|error| format!("creating KVM irqchip: {error}"))?;
         let vcpus = NativePreparedVcpus::new(&machine, &cpuid, vcpu_count, hard_stop)
-            .map_err(|error| format!("preparing KVM vCPUs: {error:?}"))?;
+            .map_err(|error| format!("preparing KVM vCPUs: {error}"))?;
         Ok(Self { machine, vcpus })
     }
 
@@ -91,7 +91,7 @@ impl KvmX86Vm {
     ) -> Result<VcpuGroup, String> {
         self.vcpus
             .start(handlers, boot)
-            .map_err(|error| format!("starting KVM vCPUs: {error:?}"))
+            .map_err(|error| format!("starting KVM vCPUs: {error}"))
     }
 }
 
@@ -135,7 +135,7 @@ impl NativePreparedVcpus {
                             return Ok(VcpuOutcome::Stopped);
                         };
                         setup_bsp_planned(&cpu_cpuid, vcpu, boot.entry, boot.boot_argument)
-                            .map_err(|_| KvmError::Memory("bsp"))?;
+                            .map_err(KvmError::Bsp)?;
                         run_kernel_vcpu(vcpu, stop, handler.as_mut())
                     } else {
                         vcpu.set_cpuid2(&cpu_cpuid)?;

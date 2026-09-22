@@ -136,13 +136,12 @@ pub fn check_available() -> Result<(), AvailabilityError> {
     Ok(())
 }
 
-/// A configured WHP partition with one contiguous guest-physical RAM range.
+/// A configured WHP partition with guest-physical RAM ranges.
 pub struct Partition {
     handle: WHV_PARTITION_HANDLE,
     memory: GuestMemory,
     vcpu_count: u32,
-    mapped: bool,
-    mapped_gpa: u64,
+    mapped_ranges: Vec<(u64, u64)>,
     vcpus: Mutex<Vec<u32>>,
     #[cfg(target_arch = "aarch64")]
     gic: GicConfig,
@@ -165,7 +164,9 @@ impl Partition {
         gic: Option<GicConfig>,
     ) -> Result<Self, PartitionError> {
         check_available().map_err(PartitionError::Availability)?;
-        if memory.mapped_bytes() == 0 || !memory.mapped_bytes().is_multiple_of(4096) {
+        if memory.ranges().iter().any(|range| {
+            range.len == 0 || !range.addr.is_multiple_of(4096) || !range.len.is_multiple_of(4096)
+        }) {
             return Err(PartitionError::InvalidMemorySize);
         }
         if vcpu_count == 0 {
@@ -192,13 +193,11 @@ impl Partition {
         let mut handle = 0;
         // SAFETY: handle points to storage for the output partition handle.
         result(unsafe { WHvCreatePartition(&raw mut handle) }).map_err(PartitionError::Api)?;
-        let mapped_gpa = memory.guest_base();
         let mut partition = Self {
             handle,
             memory,
             vcpu_count,
-            mapped: false,
-            mapped_gpa,
+            mapped_ranges: Vec::new(),
             vcpus: Mutex::new(Vec::new()),
             #[cfg(target_arch = "aarch64")]
             gic,
@@ -218,24 +217,22 @@ impl Partition {
         partition.configure_interrupt_controller()?;
         // SAFETY: the configured partition handle is valid until Partition drops it.
         result(unsafe { WHvSetupPartition(partition.handle) }).map_err(PartitionError::Api)?;
-        let address = partition
-            .memory
-            .host_address(mapped_gpa)
-            .ok_or(PartitionError::InvalidMemorySize)?;
-        // SAFETY: GuestMemory owns the page-aligned source range until the partition unmaps it.
-        result(unsafe {
-            WHvMapGpaRange(
-                partition.handle,
-                address.cast(),
-                partition.mapped_gpa,
-                partition.memory.mapped_bytes(),
-                WHV_MAP_GPA_RANGE_FLAG_READ
-                    | WHV_MAP_GPA_RANGE_FLAG_WRITE
-                    | WHV_MAP_GPA_RANGE_FLAG_EXECUTE,
-            )
-        })
-        .map_err(PartitionError::Api)?;
-        partition.mapped = true;
+        for (gpa, address, len) in partition.memory.host_ranges() {
+            // SAFETY: GuestMemory owns the page-aligned source range until the partition unmaps it.
+            result(unsafe {
+                WHvMapGpaRange(
+                    partition.handle,
+                    address.cast(),
+                    gpa,
+                    len,
+                    WHV_MAP_GPA_RANGE_FLAG_READ
+                        | WHV_MAP_GPA_RANGE_FLAG_WRITE
+                        | WHV_MAP_GPA_RANGE_FLAG_EXECUTE,
+                )
+            })
+            .map_err(PartitionError::Api)?;
+            partition.mapped_ranges.push((gpa, len));
+        }
         Ok(partition)
     }
 
@@ -340,9 +337,9 @@ impl Drop for Partition {
             // SAFETY: each index was created in this partition and is deleted once.
             unsafe { WHvDeleteVirtualProcessor(self.handle, index) };
         }
-        if self.mapped {
-            // SAFETY: this is the exact GPA mapping created by Partition::new.
-            unsafe { WHvUnmapGpaRange(self.handle, self.mapped_gpa, self.memory.mapped_bytes()) };
+        for (gpa, len) in self.mapped_ranges.drain(..) {
+            // SAFETY: this is an exact GPA mapping created by Partition::new.
+            unsafe { WHvUnmapGpaRange(self.handle, gpa, len) };
         }
         // SAFETY: handle was returned by WHvCreatePartition and is deleted once here.
         unsafe { WHvDeletePartition(self.handle) };

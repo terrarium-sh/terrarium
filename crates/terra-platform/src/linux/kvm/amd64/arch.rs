@@ -7,7 +7,6 @@ use std::{error, fmt};
 pub const GDT_ADDR: u64 = terra_limits::X86_GDT_ADDR;
 pub const PML4_ADDR: u64 = terra_limits::X86_PML4_ADDR;
 pub const STACK_TOP: u64 = terra_limits::X86_STACK_TOP;
-pub(crate) const KVM_MAX_CPUID_ENTRIES: usize = 80;
 const CR0_PROTECTED_PAGING: u64 = 0x8005_0033;
 const CR4_PAE: u64 = 0x20;
 const EFER_LME_LMA: u64 = 0x500;

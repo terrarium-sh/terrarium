@@ -93,7 +93,7 @@ impl PolicyFactory {
         store.limiter(|host| &mut host.limits);
         store.set_epoch_deadline(u64::MAX);
         store.set_fuel(CALL_FUEL)?;
-        let mut linker = crate::component::context::device_component_linker(&self.engine)?;
+        let mut linker = wasmtime::component::Linker::new(&self.engine);
         crate::component::clocks::add_monotonic_now(&mut linker)?;
         let bindings = complete_decision(Policy::instantiate_async(
             &mut store,
@@ -702,8 +702,7 @@ mod tests {
         assert!(instantiate(&excessive).is_err());
         excessive.allow = vec!["a".repeat(MAX_CONFIG_BYTES + 1)];
         assert!(instantiate(&excessive).is_err());
-        let mut linker =
-            crate::component::context::device_component_linker::<Host>(&factory().engine).unwrap();
+        let mut linker = wasmtime::component::Linker::<Host>::new(&factory().engine);
         crate::component::clocks::add_monotonic_now(&mut linker).unwrap();
         for (interface, name, export) in [
             (

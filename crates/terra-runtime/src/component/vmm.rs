@@ -146,7 +146,7 @@ impl BoxRuntime {
 pub fn vmm_component_linker(
     engine: &wasmtime::Engine,
 ) -> wasmtime::Result<wasmtime::component::Linker<BoxHost>> {
-    let mut linker = crate::component::context::device_component_linker(engine)?;
+    let mut linker = wasmtime::component::Linker::new(engine);
     crate::component::vmm::add_to_linker(&mut linker)?;
     crate::component::mmio::add_vmm_client_to_linker(&mut linker)?;
     Ok(linker)

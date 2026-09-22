@@ -21,8 +21,12 @@ impl WindowsVm {
         {
             return Err("invalid Windows x64 VM dimensions".to_owned());
         }
-        let memory = GuestMemory::allocate_at(config.ram_base, config.ram_bytes)
-            .ok_or("allocating WHP guest RAM")?;
+        let memory = if config.ram_base == 0 {
+            GuestMemory::allocate_x86_ram(config.ram_bytes)
+        } else {
+            GuestMemory::allocate_at(config.ram_base, config.ram_bytes)
+        }
+        .ok_or("allocating WHP guest RAM")?;
         let partition = Arc::new(
             crate::windows::whp::Partition::new(memory, u32::from(config.vcpus), None)
                 .map_err(|error| format!("creating WHP VM: {error}"))?,

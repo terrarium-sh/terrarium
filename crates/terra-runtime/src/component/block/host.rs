@@ -3,9 +3,7 @@
 use super::backing::{BlockBacking, DiskGrant};
 use super::bindings::disk;
 use crate::MAX_SINGLE_BYTES;
-use crate::component::context::{
-    DeviceContext, DeviceHost, add_device_imports, device_component_linker,
-};
+use crate::component::context::{DeviceContext, DeviceHost, add_device_imports};
 use crate::memory::GuestRam;
 use std::sync::{Arc, Mutex};
 use wasmtime::Engine;
@@ -172,7 +170,7 @@ impl disk::Host for BlockHost {
 pub fn block_component_linker<T: WasiView + AsMut<BlockHost> + 'static>(
     engine: &Engine,
 ) -> wasmtime::Result<wasmtime::component::Linker<T>> {
-    let mut linker = device_component_linker(engine)?;
+    let mut linker = wasmtime::component::Linker::new(engine);
     disk::add_to_linker::<T, HasSelf<BlockHost>>(&mut linker, AsMut::as_mut)?;
     add_device_imports(&mut linker, |host: &mut T| host.as_mut().context())?;
     crate::component::bindings::diagnostics::add_to_linker::<T, HasSelf<DeviceContext>>(

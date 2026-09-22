@@ -65,9 +65,35 @@ impl GuestMemory {
         Some(Self { memory, limit })
     }
 
+    /// Allocates x86 RAM below and above the MMIO hole.
+    #[must_use]
+    pub fn allocate_x86_ram(total: u64) -> Option<Self> {
+        use terra_limits::{X86_HIGH_RAM_BASE, X86_RAM_LOW_END};
+
+        let low = total.min(X86_RAM_LOW_END);
+        let high = total.checked_sub(low)?;
+        let mut ranges = vec![(0, usize::try_from(low).ok()?)];
+        if high != 0 {
+            ranges.push((X86_HIGH_RAM_BASE, usize::try_from(high).ok()?));
+        }
+        Self::from_ranges(&ranges)
+    }
+
     /// Allocates the supplied guest-physical mappings.
     #[must_use]
     pub fn from_ranges(ranges: &[(u64, usize)]) -> Option<Self> {
+        let mut ranges = ranges.to_vec();
+        ranges.sort_unstable_by_key(|(base, _)| *base);
+        if ranges.is_empty()
+            || ranges
+                .iter()
+                .any(|&(base, size)| size == 0 || range_end(base, size).is_none())
+            || ranges.windows(2).any(|ranges| {
+                range_end(ranges[0].0, ranges[0].1).is_none_or(|end| end > ranges[1].0)
+            })
+        {
+            return None;
+        }
         #[cfg(unix)]
         {
             let ranges: Vec<_> = ranges
@@ -87,10 +113,12 @@ impl GuestMemory {
         }
         #[cfg(windows)]
         {
-            let &[(base, size)] = ranges else {
-                return None;
-            };
-            Self::allocate_at(base, u64::try_from(size).ok()?)
+            let memory = WindowsMemory::allocate_ranges(&ranges)?;
+            let limit = memory.ranges.iter().map(WindowsMemoryRange::limit).max()?;
+            Some(Self {
+                memory: Arc::new(memory),
+                limit,
+            })
         }
     }
 
@@ -105,7 +133,10 @@ impl GuestMemory {
         }
         #[cfg(windows)]
         {
-            self.memory.guest_base
+            self.memory
+                .ranges
+                .first()
+                .map_or(0, |range| range.guest_base)
         }
     }
 
@@ -123,7 +154,33 @@ impl GuestMemory {
         }
         #[cfg(windows)]
         {
-            self.memory.size as u64
+            self.memory.mapped_bytes
+        }
+    }
+
+    /// Returns the guest-physical RAM ranges in ascending address order.
+    #[must_use]
+    pub fn ranges(&self) -> Vec<MemoryRange> {
+        #[cfg(unix)]
+        {
+            self.memory
+                .iter()
+                .map(|range| MemoryRange {
+                    addr: range.start_addr().0,
+                    len: range.len(),
+                })
+                .collect()
+        }
+        #[cfg(windows)]
+        {
+            self.memory
+                .ranges
+                .iter()
+                .map(|range| MemoryRange {
+                    addr: range.guest_base,
+                    len: range.size as u64,
+                })
+                .collect()
         }
     }
 
@@ -144,7 +201,7 @@ impl GuestMemory {
         }
         #[cfg(windows)]
         {
-            addr >= self.memory.guest_base
+            self.memory.range(addr, len).is_some()
         }
     }
 
@@ -158,14 +215,18 @@ impl GuestMemory {
             .read_slice(&mut bytes, GuestAddress(addr))
             .map_err(|_| MemoryError::Unmapped)?;
         #[cfg(windows)]
+        let range = self
+            .memory
+            .range(addr, len_u64)
+            .expect("checked guest range");
+        #[cfg(windows)]
+        let range_offset = usize::try_from(addr - range.guest_base).expect("checked guest range");
+        #[cfg(windows)]
         for (offset, byte) in bytes.iter_mut().enumerate() {
             // SAFETY: `check_range` confines this byte to the allocation.
             *byte = unsafe {
                 core::sync::atomic::AtomicU8::from_ptr(
-                    self.memory
-                        .address
-                        .as_ptr()
-                        .add(self.offset(addr)? + offset),
+                    range.address.as_ptr().add(range_offset + offset),
                 )
                 .load(core::sync::atomic::Ordering::Relaxed)
             };
@@ -184,14 +245,21 @@ impl GuestMemory {
             .write_slice(bytes, GuestAddress(addr))
             .map_err(|_| MemoryError::Unmapped)?;
         #[cfg(windows)]
+        let range = self
+            .memory
+            .range(
+                addr,
+                u64::try_from(bytes.len()).map_err(|_| MemoryError::OutOfRange)?,
+            )
+            .expect("checked guest range");
+        #[cfg(windows)]
+        let range_offset = usize::try_from(addr - range.guest_base).expect("checked guest range");
+        #[cfg(windows)]
         for (offset, byte) in bytes.iter().copied().enumerate() {
             // SAFETY: `check_range` confines this byte to the allocation.
             unsafe {
                 core::sync::atomic::AtomicU8::from_ptr(
-                    self.memory
-                        .address
-                        .as_ptr()
-                        .add(self.offset(addr)? + offset),
+                    range.address.as_ptr().add(range_offset + offset),
                 )
                 .store(byte, core::sync::atomic::Ordering::Relaxed);
             }
@@ -223,9 +291,11 @@ impl GuestMemory {
         }
         #[cfg(windows)]
         {
-            self.offset(addr)
-                .ok()
-                .map(|offset| self.memory.address.as_ptr().wrapping_add(offset))
+            self.memory.range(addr, 1).and_then(|range| {
+                usize::try_from(addr.checked_sub(range.guest_base)?)
+                    .ok()
+                    .map(|offset| range.address.as_ptr().wrapping_add(offset))
+            })
         }
     }
 
@@ -242,12 +312,11 @@ impl GuestMemory {
     }
 
     #[cfg(windows)]
-    fn offset(&self, addr: u64) -> Result<usize, MemoryError> {
-        usize::try_from(
-            addr.checked_sub(self.memory.guest_base)
-                .ok_or(MemoryError::OutOfRange)?,
-        )
-        .map_err(|_| MemoryError::OutOfRange)
+    pub(crate) fn host_ranges(&self) -> impl ExactSizeIterator<Item = (u64, *mut u8, u64)> + '_ {
+        self.memory
+            .ranges
+            .iter()
+            .map(|range| (range.guest_base, range.address.as_ptr(), range.size as u64))
     }
 
     fn discard_host_range(&self, range: MemoryRange) -> Result<(*mut u8, usize), DiscardError> {
@@ -282,11 +351,7 @@ impl GuestMemory {
                 .map_err(|_| DiscardError::Invalid)?
         };
         #[cfg(windows)]
-        let address = self
-            .memory
-            .address
-            .as_ptr()
-            .wrapping_add(self.offset(range.addr).map_err(|_| DiscardError::Invalid)?);
+        let address = self.host_address(range.addr).ok_or(DiscardError::Invalid)?;
         full_host_pages(address as usize, length, host_page_bytes())
             .map(|(address, length)| (address as *mut u8, length))
             .ok_or(DiscardError::Invalid)
@@ -327,8 +392,18 @@ impl GuestMemory {
     }
 }
 
+fn range_end(base: u64, size: usize) -> Option<u64> {
+    base.checked_add(u64::try_from(size).ok()?)
+}
+
 #[cfg(windows)]
 struct WindowsMemory {
+    ranges: Vec<WindowsMemoryRange>,
+    mapped_bytes: u64,
+}
+
+#[cfg(windows)]
+struct WindowsMemoryRange {
     address: core::ptr::NonNull<u8>,
     size: usize,
     guest_base: u64,
@@ -348,6 +423,42 @@ unsafe impl Sync for WindowsMemory {}
 impl WindowsMemory {
     #[allow(unsafe_code)]
     fn allocate(guest_base: u64, size: usize) -> Option<Arc<Self>> {
+        Some(Arc::new(Self {
+            ranges: vec![WindowsMemoryRange::allocate(guest_base, size)?],
+            mapped_bytes: size as u64,
+        }))
+    }
+
+    fn allocate_ranges(ranges: &[(u64, usize)]) -> Option<Self> {
+        let ranges = ranges
+            .iter()
+            .copied()
+            .map(|(guest_base, size)| WindowsMemoryRange::allocate(guest_base, size))
+            .collect::<Option<Vec<_>>>()?;
+        let mapped_bytes = ranges
+            .iter()
+            .try_fold(0_u64, |total, range| total.checked_add(range.size as u64))?;
+        Some(Self {
+            ranges,
+            mapped_bytes,
+        })
+    }
+
+    fn range(&self, addr: u64, len: u64) -> Option<&WindowsMemoryRange> {
+        let end = addr.checked_add(len)?;
+        self.ranges
+            .iter()
+            .find(|range| addr >= range.guest_base && end <= range.limit())
+    }
+}
+
+#[cfg(windows)]
+impl WindowsMemoryRange {
+    #[allow(unsafe_code)]
+    fn allocate(guest_base: u64, size: usize) -> Option<Self> {
+        if size == 0 {
+            return None;
+        }
         guest_base.checked_add(u64::try_from(size).ok()?)?;
         // SAFETY: VirtualAlloc allocates a new writable mapping or returns null.
         let address = unsafe {
@@ -358,16 +469,20 @@ impl WindowsMemory {
                 PAGE_READWRITE,
             )
         };
-        Some(Arc::new(Self {
+        Some(Self {
             address: core::ptr::NonNull::new(address.cast())?,
             size,
             guest_base,
-        }))
+        })
+    }
+
+    fn limit(&self) -> u64 {
+        self.guest_base + self.size as u64
     }
 }
 
 #[cfg(windows)]
-impl Drop for WindowsMemory {
+impl Drop for WindowsMemoryRange {
     #[allow(unsafe_code)]
     fn drop(&mut self) {
         // SAFETY: WindowsMemory owns this VirtualAlloc allocation.
@@ -424,7 +539,32 @@ mod tests {
         assert_eq!(memory.read(0x2000, 1), Err(MemoryError::OutOfRange));
     }
 
-    #[cfg(unix)]
+    #[test]
+    fn ranges_reject_empty_overlapping_and_overflowing_mappings() {
+        assert!(GuestMemory::from_ranges(&[]).is_none());
+        assert!(GuestMemory::from_ranges(&[(0, 0)]).is_none());
+        assert!(GuestMemory::from_ranges(&[(0, 4096), (2048, 4096)]).is_none());
+        assert!(GuestMemory::from_ranges(&[(u64::MAX - 1024, 4096)]).is_none());
+    }
+
+    #[test]
+    fn ranges_are_sorted_and_reported() {
+        let memory = GuestMemory::from_ranges(&[(0x2000, 0x1000), (0, 0x1000)]).expect("RAM");
+        assert_eq!(
+            memory.ranges(),
+            [
+                MemoryRange {
+                    addr: 0,
+                    len: 0x1000,
+                },
+                MemoryRange {
+                    addr: 0x2000,
+                    len: 0x1000,
+                },
+            ]
+        );
+    }
+
     #[test]
     fn holes_reject_crossing_access() {
         let memory = GuestMemory::from_ranges(&[(0, 0x1000), (0x2000, 0x1000)]).expect("RAM");

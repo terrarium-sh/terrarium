@@ -378,6 +378,9 @@ jobs:
             .
             components
           key: ${{ matrix.target }}
+      - name: Verify build wrapper
+        shell: pwsh
+        run: ./scripts/test-build-host.ps1
       - name: Build distribution
         id: host-build
         shell: pwsh

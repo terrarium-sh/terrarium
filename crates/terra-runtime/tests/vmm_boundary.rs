@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use terra_runtime::box_runtime::{BoxHost, BoxRuntime};
 use terra_runtime::component::InterruptCallback;
-use terra_runtime::component::context::{DeviceContext, device_component_linker};
+use terra_runtime::component::context::DeviceContext;
 use terra_runtime::component::vmm::{
     BootEntry, Completion, Exit, PreparedMachine, StartedVcpus, VirtualMachine,
 };
@@ -252,7 +252,7 @@ async fn vcpu_preparation_requires_a_router_and_boot() {
 async fn device_components_receive_no_platform_or_vcpu_grant() {
     let engine = device_engine().expect("engine");
     let mut store = Store::new(&engine, DeviceContext::new(4096).expect("device host"));
-    let linker = device_component_linker(&engine).expect("device linker");
+    let linker = wasmtime::component::Linker::new(&engine);
     assert!(
         linker
             .instantiate_async(&mut store, &router(&engine))

@@ -4,7 +4,6 @@ use crate::MAX_SINGLE_BYTES;
 use crate::component::bindings::{diagnostics, interrupt, memory};
 use crate::memory::{BoundedMemory, GuestRam};
 use std::sync::Arc;
-use wasmtime::Engine;
 use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 pub use crate::component::bindings::memory::Host as MemoryHost;
@@ -180,12 +179,6 @@ impl DeviceHost for DeviceContext {
     fn context(&mut self) -> &mut DeviceContext {
         self
     }
-}
-
-pub fn device_component_linker<T: 'static>(
-    engine: &Engine,
-) -> wasmtime::Result<wasmtime::component::Linker<T>> {
-    Ok(wasmtime::component::Linker::new(engine))
 }
 
 fn memory_error(error: crate::memory::MemoryError) -> memory::MemoryError {

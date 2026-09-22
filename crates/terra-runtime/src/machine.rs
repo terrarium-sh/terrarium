@@ -205,12 +205,16 @@ fn x86_layout(
     block_count: usize,
     share_count: usize,
 ) -> Result<Layout, LayoutError> {
-    const MMIO_BASE: u64 = 0xd000_0000;
+    const MMIO_BASE: u64 = terra_limits::X86_RAM_LOW_END;
     const MMIO_STRIDE: u64 = 0x1000;
     const MOUNT_IRQS: [u32; 3] = [17, 18, 19];
     const VOLUME_IRQS: [u32; 3] = [20, 21, 22];
-    if ram_size > MMIO_BASE {
-        return Err(LayoutError::Overlap);
+    if ram_size > MMIO_BASE
+        && terra_limits::X86_HIGH_RAM_BASE
+            .checked_add(ram_size - MMIO_BASE)
+            .is_none()
+    {
+        return Err(LayoutError::RamOverflow);
     }
     let base_count = block_count
         .checked_add(2)
@@ -428,8 +432,10 @@ mod tests {
             Err(LayoutError::Unaligned)
         );
         assert_eq!(
-            build_machine_layout_for(Architecture::X86, 0xd000_0000 + PAGE_SIZE, 1, 0),
-            Err(LayoutError::Overlap)
+            build_machine_layout_for(Architecture::X86, 0xd000_0000 + PAGE_SIZE, 1, 0)
+                .unwrap()
+                .ram_size(),
+            0xd000_0000 + PAGE_SIZE
         );
         assert_eq!(
             build_machine_layout_for(Architecture::X86, 512 << 20, usize::MAX, 0),

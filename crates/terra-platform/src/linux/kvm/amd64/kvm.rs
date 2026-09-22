@@ -7,6 +7,7 @@ use std::sync::{Arc, mpsc};
 use std::time::Duration;
 use std::{error, fmt};
 
+use super::arch::ArchError;
 use crate::linux::runner::{PthreadPublication, install_kick_handler, unblock_kick_signal};
 use crate::memory::GuestMemory;
 use crate::vm::{
@@ -30,6 +31,7 @@ pub enum KvmError {
     BadVcpuCount(usize),
     Memory(&'static str),
     Kvm(kvm_ioctls::Error),
+    Bsp(ArchError),
     Dispatch(DispatchError),
     Timeout,
     ThreadGone,
@@ -60,6 +62,7 @@ impl fmt::Display for KvmError {
             Self::BadVcpuCount(count) => write!(formatter, "unsupported vCPU count {count}"),
             Self::Memory(operation) => write!(formatter, "KVM memory {operation} failed"),
             Self::Kvm(error) => write!(formatter, "KVM error: {error}"),
+            Self::Bsp(error) => write!(formatter, "configuring x86 boot CPU: {error}"),
             Self::Dispatch(error) => write!(formatter, "KVM exit dispatch failed: {error}"),
             Self::Timeout => formatter.write_str("KVM vCPU stop timed out"),
             Self::ThreadGone => formatter.write_str("KVM vCPU thread exited"),
@@ -75,6 +78,7 @@ impl error::Error for KvmError {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match self {
             Self::Kvm(error) => Some(error),
+            Self::Bsp(error) => Some(error),
             Self::Dispatch(error) => Some(error),
             Self::KickHandler(error) => Some(error),
             _ => None,
@@ -120,7 +124,7 @@ pub struct Machine {
 }
 
 impl Machine {
-    /// Create the VM and map its RAM as slot 0.
+    /// Create the VM and map its RAM.
     pub fn new(
         kvm: &Kvm,
         ram_base: u64,
@@ -134,23 +138,29 @@ impl Machine {
             return Err(KvmError::BadVcpuCount(vcpu_count));
         }
         let vm = kvm.create_vm()?;
-        let ram = GuestMemory::allocate_at(ram_base, ram_bytes).ok_or(KvmError::Memory("map"))?;
-        let host_addr = ram
-            .host_address(ram_base)
-            .ok_or(KvmError::Memory("host-addr"))?;
-        let region = kvm_userspace_memory_region {
-            slot: 0,
-            flags: 0,
-            guest_phys_addr: ram_base,
-            memory_size: ram_bytes,
-            userspace_addr: host_addr as u64,
-        };
-        // SAFETY: `host_addr` is the base of the live `vm-memory` mapping
-        // held in `self.ram`; slot 0 is unique; size matches the mapping;
-        // `Machine` drops `vm` before `ram` and outlives every runner, so
-        // KVM never touches unmapped memory.
-        unsafe { vm.set_user_memory_region(region)? };
-        Ok(Self { vm, ram })
+        let ram = if ram_base == 0 {
+            GuestMemory::allocate_x86_ram(ram_bytes)
+        } else {
+            GuestMemory::allocate_at(ram_base, ram_bytes)
+        }
+        .ok_or(KvmError::Memory("map"))?;
+        let machine = Self { vm, ram };
+        for (slot, range) in machine.ram.ranges().into_iter().enumerate() {
+            let host_addr = machine
+                .ram
+                .host_address(range.addr)
+                .ok_or(KvmError::Memory("host-addr"))?;
+            let region = kvm_userspace_memory_region {
+                slot: u32::try_from(slot).map_err(|_| KvmError::Memory("slot"))?,
+                flags: 0,
+                guest_phys_addr: range.addr,
+                memory_size: range.len,
+                userspace_addr: host_addr as u64,
+            };
+            // SAFETY: `host_addr` is the base of the live mapping owned by `machine.ram`.
+            unsafe { machine.vm.set_user_memory_region(region)? };
+        }
+        Ok(machine)
     }
 
     pub fn create_vcpu(&self, id: u64) -> Result<VcpuFd, KvmError> {
@@ -683,5 +693,11 @@ mod tests {
         assert!(mmio_width(9).is_err());
         assert!(mmio_value(&[0; MAX_MMIO_BYTES + 1]).is_err());
         assert!(pio_length(MAX_IO_BYTES + 1).is_err());
+    }
+
+    #[test]
+    fn boot_cpu_setup_keeps_the_kvm_error() {
+        let error = KvmError::Bsp(super::super::arch::ArchError::IrqOutOfRange(24));
+        assert!(error.to_string().contains("IRQ 24"));
     }
 }
