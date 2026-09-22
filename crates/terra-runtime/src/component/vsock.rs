@@ -90,6 +90,9 @@ impl<H: 'static> StreamConsumer<H> for EventSink {
             return std::task::Poll::Ready(Ok(StreamResult::Completed));
         };
         match event {
+            VsockEvent::Ready => {
+                self.lifecycle.guest_ready();
+            }
             VsockEvent::Diagnostic(bytes) => {
                 if bytes.len() > MAX_DIAGNOSTIC_BATCH_BYTES {
                     return std::task::Poll::Ready(Err(wasmtime::Error::msg(
@@ -427,8 +430,11 @@ mod tests {
         let engine = crate::engine::device_engine().expect("engine");
         let mut store = Store::new(&engine, ());
         let lifecycle = crate::component::vmm::lifecycle::LifecycleHost::new();
-        let events = wasmtime::component::StreamReader::new(&mut store, vec![VsockEvent::Exit(7)])
-            .expect("event stream");
+        let events = wasmtime::component::StreamReader::new(
+            &mut store,
+            vec![VsockEvent::Ready, VsockEvent::Exit(7)],
+        )
+        .expect("event stream");
         events
             .pipe(
                 &mut store,
@@ -440,6 +446,10 @@ mod tests {
             .expect("event sink");
         store
             .run_concurrent(async |_| {
+                let mut guest_ready = lifecycle.notifier().subscribe_guest_ready();
+                crate::component::vmm::lifecycle::wait_for_guest_ready(&mut guest_ready)
+                    .await
+                    .expect("guest ready");
                 let event = tokio::time::timeout(Duration::from_secs(1), lifecycle.next_event())
                     .await
                     .unwrap()

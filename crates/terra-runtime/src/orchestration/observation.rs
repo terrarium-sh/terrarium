@@ -8,6 +8,7 @@ pub(super) struct VmObservation {
     reaper: crate::component::vmm::VcpuReaper,
     lifecycle: crate::component::vmm::lifecycle::LifecycleNotifier,
     deadline: Option<Duration>,
+    startup_timeout: Option<Duration>,
     failure: crate::component::vmm::FailureObservation,
     teardown: crate::component::vmm::teardown::NativeTeardown,
 }
@@ -15,6 +16,7 @@ pub(super) struct VmObservation {
 pub(super) async fn finish_preparation(
     runtime: crate::box_runtime::BoxRuntime,
     deadline: Option<Duration>,
+    startup_timeout: Option<Duration>,
     start: impl FnOnce(
         Vec<crate::component::vmm::NativeVcpu>,
         crate::component::vmm::BootEntry,
@@ -32,6 +34,7 @@ pub(super) async fn finish_preparation(
             reaper,
             lifecycle,
             deadline,
+            startup_timeout,
             failure,
             teardown,
         },
@@ -43,13 +46,32 @@ impl VmObservation {
         self,
         runtime: crate::box_runtime::BoxRuntimeHandle,
     ) -> Result<VmOutcome, String> {
-        use crate::component::vmm::lifecycle::{Outcome, wait_for_outcome};
-        let outcome = wait_for_outcome(
-            &mut self.lifecycle.subscribe(),
-            self.deadline,
-            &self.lifecycle,
-        )
-        .await;
+        use crate::component::vmm::lifecycle::{Outcome, wait_for_guest_ready, wait_for_outcome};
+        let mut outcomes = self.lifecycle.subscribe();
+        let mut startup_timed_out = None;
+        let outcome_before_ready = if let Some(timeout) = self.startup_timeout {
+            let mut guest_ready = self.lifecycle.subscribe_guest_ready();
+            tokio::select! {
+                biased;
+                outcome = wait_for_outcome(&mut outcomes, None, &self.lifecycle) => Some(outcome),
+                ready = wait_for_guest_ready(&mut guest_ready) => {
+                    ready.map_err(|error| format!("VMM guest startup: {error:?}"))?;
+                    log::info!("guest agent connected; startup complete");
+                    None
+                }
+                () = tokio::time::sleep(timeout) => {
+                    self.lifecycle.deadline();
+                    startup_timed_out = Some(timeout);
+                    Some(Ok(Outcome::Deadline))
+                }
+            }
+        } else {
+            None
+        };
+        let outcome = match outcome_before_ready {
+            Some(outcome) => outcome,
+            None => wait_for_outcome(&mut outcomes, self.deadline, &self.lifecycle).await,
+        };
         let shutdown_deadline = self.lifecycle.begin_shutdown();
         let cleanup = self.teardown.wait_until(shutdown_deadline).await;
         let runtime = finish_component_runtime(runtime, cleanup, shutdown_deadline).await;
@@ -66,6 +88,11 @@ impl VmObservation {
         };
         let vcpu_outcomes = self.reaper.wait_until(shutdown_deadline).await?;
         runtime?;
+        if let Some(timeout) = startup_timed_out {
+            return Err(format!(
+                "guest agent did not connect within {timeout:?}; inspect the guest diagnostics"
+            ));
+        }
         Ok(VmOutcome {
             exit_code,
             vcpu_outcomes,
@@ -188,7 +215,7 @@ mod tests {
         let lifecycle = runtime.lifecycle_notifier();
         let startup_interrupt = Arc::clone(&interrupt);
         let deadline = Some(std::time::Duration::from_secs(5));
-        let prepared = super::finish_preparation(runtime, deadline, move |controls, _| {
+        let prepared = super::finish_preparation(runtime, deadline, None, move |controls, _| {
             startup_interrupt(true)?;
             Ok(StartedVcpus::new(
                 controls,

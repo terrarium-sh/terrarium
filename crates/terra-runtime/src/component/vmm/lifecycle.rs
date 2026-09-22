@@ -12,6 +12,7 @@ pub(crate) use crate::component::vmm::bindings::lifecycle_platform;
 pub struct LifecycleNotifier {
     event: watch::Sender<Option<Event>>,
     outcome: watch::Sender<Option<Outcome>>,
+    guest_ready: watch::Sender<bool>,
     shutdown_deadline: ShutdownDeadline,
 }
 
@@ -59,11 +60,13 @@ impl LifecycleHost {
     pub fn new() -> Self {
         let (event, _) = watch::channel(None);
         let (outcome, _) = watch::channel(None);
+        let (guest_ready, _) = watch::channel(false);
         let shutdown_deadline = ShutdownDeadline(Arc::new(OnceLock::new()));
         Self {
             sender: LifecycleNotifier {
                 event,
                 outcome,
+                guest_ready,
                 shutdown_deadline,
             },
             teardown: super::teardown::NativeTeardown::new(),
@@ -125,6 +128,15 @@ impl LifecycleNotifier {
         self.publish(Event::Deadline);
     }
 
+    pub fn guest_ready(&self) {
+        self.guest_ready.send_replace(true);
+    }
+
+    #[must_use]
+    pub fn subscribe_guest_ready(&self) -> watch::Receiver<bool> {
+        self.guest_ready.subscribe()
+    }
+
     fn publish(&self, event: Event) {
         let _ = self.event.send_if_modified(|current| {
             if current.is_some() {
@@ -180,6 +192,16 @@ pub(crate) async fn wait_for_outcome(
     } else {
         next.await
     }
+}
+
+pub(crate) async fn wait_for_guest_ready(
+    receiver: &mut watch::Receiver<bool>,
+) -> Result<(), WaitError> {
+    receiver
+        .wait_for(|ready| *ready)
+        .await
+        .map(|_| ())
+        .map_err(|_| WaitError::Closed)
 }
 
 impl wasmtime::component::HasData for LifecyclePlatform {
@@ -250,7 +272,9 @@ pub(super) fn create_component_loop(
 mod tests {
     use std::time::Duration;
 
-    use super::{Event, LifecycleHost, Outcome, lifecycle_platform, wait_for_outcome};
+    use super::{
+        Event, LifecycleHost, Outcome, lifecycle_platform, wait_for_guest_ready, wait_for_outcome,
+    };
 
     #[tokio::test]
     async fn retains_the_first_terminal_event() {
@@ -290,6 +314,16 @@ mod tests {
                 .expect("deadline outcome"),
             Outcome::Deadline
         );
+    }
+
+    #[tokio::test]
+    async fn guest_readiness_is_retained_for_late_subscribers() {
+        let host = LifecycleHost::new();
+        let notifier = host.notifier();
+        notifier.guest_ready();
+        let mut guest_ready = notifier.subscribe_guest_ready();
+
+        assert_eq!(wait_for_guest_ready(&mut guest_ready).await, Ok(()));
     }
 
     #[tokio::test]

@@ -2,7 +2,7 @@ package terra:vsock@0.1.0;
 
 interface host-service {
     enum endpoint-error { closed, io, too-large }
-    variant event { diagnostic(list<u8>), exit(s32) }
+    variant event { ready, diagnostic(list<u8>), exit(s32) }
     resource client {
         input: func() -> stream<u8>;
         output: async func(bytes: stream<u8>) -> result<_, endpoint-error>;

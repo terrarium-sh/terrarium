@@ -21,6 +21,8 @@ use terra_runtime::TrustedArtifacts;
 use terra_runtime::component::fs::{ShareGrant, share_tag};
 use terra_runtime::orchestration::VmInput;
 
+const GUEST_AGENT_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[allow(unsafe_code)]
 const ARTIFACTS: TrustedArtifacts = {
     // SAFETY: Make generates these AOT artifacts from repository components for this target.
@@ -187,6 +189,7 @@ pub async fn run(spec: &BootSpec, bx: &BoxRef, lock: &File) -> Result<ExitCode> 
         ram_bytes: u64::from(spec.cfg.hw.mem_mib) << 20,
         vcpus: usize::from(spec.cfg.hw.cpus),
         deadline: None,
+        startup_timeout: Some(GUEST_AGENT_STARTUP_TIMEOUT),
         hard_stop: Some(std::process::abort),
         listener,
         control,

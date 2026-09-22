@@ -26,6 +26,7 @@ pub struct VmInput {
     pub component_memory_limits: crate::box_runtime::ComponentMemoryLimits,
     pub vcpus: usize,
     pub deadline: Option<Duration>,
+    pub startup_timeout: Option<Duration>,
     pub hard_stop: Option<fn() -> !>,
     pub listener: Option<LocalListener>,
     pub control: Option<LocalStream>,
@@ -47,7 +48,9 @@ pub struct PreparedVm {
 
 impl PreparedVm {
     pub async fn run(self) -> Result<VmOutcome, String> {
-        self.observation.observe(self.runtime.start()).await
+        let runtime = self.runtime.start();
+        log::info!("component workers and guest CPUs started; waiting for guest agent");
+        self.observation.observe(runtime).await
     }
 }
 
@@ -113,16 +116,21 @@ pub async fn prepare(mut input: VmInput) -> Result<PreparedVm, String> {
                     interrupts.close().await.map_err(|error| error.to_string())
                 })
                 .map_err(|error| error.to_string())?;
-            return finish_preparation(runtime, input.deadline, move |controls, boot| {
-                let handlers = controls
-                    .into_iter()
-                    .map(|vcpu| {
-                        Box::new(RuntimeVcpu::with_ioapic(vcpu, ioapic.clone()))
-                            as Box<dyn vm::VcpuHandler>
-                    })
-                    .collect();
-                start_native_vcpus(native, boot, handlers)
-            })
+            return finish_preparation(
+                runtime,
+                input.deadline,
+                input.startup_timeout,
+                move |controls, boot| {
+                    let handlers = controls
+                        .into_iter()
+                        .map(|vcpu| {
+                            Box::new(RuntimeVcpu::with_ioapic(vcpu, ioapic.clone()))
+                                as Box<dyn vm::VcpuHandler>
+                        })
+                        .collect();
+                    start_native_vcpus(native, boot, handlers)
+                },
+            )
             .await
             .map_err(|error| error.to_string());
         }
@@ -180,13 +188,18 @@ pub async fn prepare(mut input: VmInput) -> Result<PreparedVm, String> {
         }
     }
 
-    finish_preparation(runtime, input.deadline, move |controls, boot| {
-        let handlers = controls
-            .into_iter()
-            .map(|vcpu| Box::new(RuntimeVcpu::plain(vcpu)) as Box<dyn vm::VcpuHandler>)
-            .collect();
-        start_native_vcpus(native, boot, handlers)
-    })
+    finish_preparation(
+        runtime,
+        input.deadline,
+        input.startup_timeout,
+        move |controls, boot| {
+            let handlers = controls
+                .into_iter()
+                .map(|vcpu| Box::new(RuntimeVcpu::plain(vcpu)) as Box<dyn vm::VcpuHandler>)
+                .collect();
+            start_native_vcpus(native, boot, handlers)
+        },
+    )
     .await
     .map_err(|error| error.to_string())
 }

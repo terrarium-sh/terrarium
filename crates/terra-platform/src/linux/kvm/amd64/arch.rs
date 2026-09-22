@@ -12,6 +12,8 @@ const CR4_PAE: u64 = 0x20;
 const EFER_LME_LMA: u64 = 0x500;
 const IOAPIC_GSI_BASE: u32 = 11;
 const IOAPIC_PINS: u32 = terra_limits::X86_IOAPIC_PINS;
+const PIC_PINS: u32 = 8;
+const PIC_IRQS: u32 = PIC_PINS * 2;
 
 #[derive(Debug)]
 pub enum ArchError {
@@ -121,29 +123,48 @@ pub fn setup_bsp_planned(
     setup_regs(vcpu, entry, boot_argument)
 }
 
-fn unique_gsis(gsis: &[u32]) -> Result<Vec<u32>, ArchError> {
-    let mut unique = Vec::new();
+fn validate_device_gsis(gsis: &[u32]) -> Result<(), ArchError> {
     for gsi in gsis {
         if *gsi < IOAPIC_GSI_BASE || *gsi >= IOAPIC_PINS {
             return Err(ArchError::IrqOutOfRange(*gsi));
         }
-        if !unique.contains(gsi) {
-            unique.push(*gsi);
-        }
     }
-    Ok(unique)
+    Ok(())
 }
 
 pub fn setup_irqchip(vm: &VmFd, gsis: &[u32]) -> Result<(), ArchError> {
-    let gsis = unique_gsis(gsis)?;
-    let mut routing = KvmIrqRouting::new(gsis.len()).map_err(|_| ArchError::Routing)?;
-    for (entry, gsi) in routing.as_mut_slice().iter_mut().zip(gsis) {
+    validate_device_gsis(gsis)?;
+    let route_count = usize::try_from(IOAPIC_PINS + PIC_IRQS).map_err(|_| ArchError::Routing)?;
+    let mut routing = KvmIrqRouting::new(route_count).map_err(|_| ArchError::Routing)?;
+    for (entry, gsi) in routing
+        .as_mut_slice()
+        .iter_mut()
+        .take(usize::try_from(IOAPIC_PINS).map_err(|_| ArchError::Routing)?)
+        .zip(0..IOAPIC_PINS)
+    {
         entry.gsi = gsi;
         entry.type_ = kvm_bindings::KVM_IRQ_ROUTING_IRQCHIP;
         entry.u.irqchip.irqchip = kvm_bindings::KVM_IRQCHIP_IOAPIC;
         entry.u.irqchip.pin = gsi;
     }
+    for (entry, gsi) in routing
+        .as_mut_slice()
+        .iter_mut()
+        .skip(usize::try_from(IOAPIC_PINS).map_err(|_| ArchError::Routing)?)
+        .zip(0..PIC_IRQS)
+    {
+        entry.gsi = gsi;
+        entry.type_ = kvm_bindings::KVM_IRQ_ROUTING_IRQCHIP;
+        if gsi < PIC_PINS {
+            entry.u.irqchip.irqchip = kvm_bindings::KVM_IRQCHIP_PIC_MASTER;
+            entry.u.irqchip.pin = gsi;
+        } else {
+            entry.u.irqchip.irqchip = kvm_bindings::KVM_IRQCHIP_PIC_SLAVE;
+            entry.u.irqchip.pin = gsi - PIC_PINS;
+        }
+    }
     vm.create_irq_chip()?;
+    vm.create_pit2(kvm_bindings::kvm_pit_config::default())?;
     vm.set_gsi_routing(&routing)?;
     Ok(())
 }
@@ -153,10 +174,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn irq_routes_are_deduplicated_before_installation() {
-        assert_eq!(unique_gsis(&[11, 12, 11, 20, 12]).unwrap(), [11, 12, 20]);
+    fn device_routes_stay_within_the_virtio_irq_range() {
+        assert!(validate_device_gsis(&[11, 12, 11, 20, 12]).is_ok());
         assert!(matches!(
-            unique_gsis(&[10]),
+            validate_device_gsis(&[10]),
             Err(ArchError::IrqOutOfRange(10))
         ));
     }

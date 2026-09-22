@@ -252,6 +252,7 @@ mod tests {
             ram_bytes: 4096,
             vcpus: 1,
             deadline: None,
+            startup_timeout: None,
             hard_stop: None,
             listener: None,
             control: None,

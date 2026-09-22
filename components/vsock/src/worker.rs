@@ -56,6 +56,7 @@ static CLOCK_TICK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 static RETRY_TICK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static RETRY_SCHEDULED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static PLAN_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static READY_REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static TRANSPORT_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static TRANSPORT_WAKER: AtomicWaker = AtomicWaker::new();
 static PENDING_CLOCK: LazyLock<Mutex<Option<Vec<u8>>>> = LazyLock::new(|| Mutex::new(None));
@@ -129,6 +130,7 @@ pub(crate) fn events() -> StreamReader<Event> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     PLAN_READY.store(false, std::sync::atomic::Ordering::Release);
+    READY_REPORTED.store(false, std::sync::atomic::Ordering::Release);
     CLIENT_WAKERS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -619,6 +621,19 @@ fn feed_plan(source: Option<u32>) {
     }
 }
 
+fn report_ready(source: Option<u32>, sender: &mut Sender<Event>, pending: &mut VecDeque<Event>) {
+    if source.is_some()
+        && PLAN_READY.load(std::sync::atomic::Ordering::Acquire)
+        && PENDING_PLAN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+        && !READY_REPORTED.swap(true, std::sync::atomic::Ordering::AcqRel)
+    {
+        queue_event(sender, pending, Event::Ready);
+    }
+}
+
 fn feed_stop(source: Option<u32>) {
     if PENDING_STOP.load(std::sync::atomic::Ordering::Acquire)
         && PLAN_READY.load(std::sync::atomic::Ordering::Acquire)
@@ -834,6 +849,7 @@ async fn run_worker(worker: Worker) -> Result<(), Error> {
         }
         let control_source = source(CONTROL_VSOCK_PORT);
         feed_plan(control_source);
+        report_ready(control_source, &mut event_sender, &mut pending_events);
         feed_stop(control_source);
         feed_clock(control_source);
         drain_lifecycle(
