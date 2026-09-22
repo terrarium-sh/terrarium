@@ -305,7 +305,7 @@ impl Guest for Block {
             transport: MmioTransport::new(
                 0,
                 0x200,
-                terra::host::memory::ram_bytes(),
+                terra::host::memory::address_limit(),
                 2,
                 features,
                 256,

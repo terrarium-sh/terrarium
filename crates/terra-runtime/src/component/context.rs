@@ -195,13 +195,10 @@ impl memory::Host for DeviceContext {
     }
 
     fn write(&mut self, offset: u64, data: Vec<u8>) -> Result<(), memory::MemoryError> {
-        if u64::try_from(data.len()).unwrap_or(u64::MAX) > MAX_SINGLE_BYTES {
-            return Err(memory::MemoryError::TooLarge);
-        }
         self.memory().write(offset, &data).map_err(memory_error)
     }
 
-    fn ram_bytes(&mut self) -> u64 {
+    fn address_limit(&mut self) -> u64 {
         self.ram.address_limit()
     }
 }
@@ -239,7 +236,7 @@ pub fn add_device_imports<T: Send + 'static>(
 
 #[cfg(test)]
 mod tests {
-    /// The existing ram-bytes import supplies the exclusive guest address bound
+    /// The address-limit import supplies the exclusive guest address bound
     /// used by device transports to validate descriptor addresses, including ARM RAM.
     #[test]
     fn device_memory_import_preserves_nonzero_guest_address_bounds() {
@@ -248,10 +245,23 @@ mod tests {
             terra_platform::memory::GuestMemory::allocate_at(0x4000_0000, 4096).unwrap(),
         );
         let mut host = super::DeviceContext::with_ram(ram);
-        assert_eq!(host.ram_bytes(), 0x4000_1000);
+        assert_eq!(host.address_limit(), 0x4000_1000);
         host.write(0x4000_0000, vec![7]).unwrap();
         assert_eq!(host.read(0x4000_0000, 1).unwrap(), vec![7]);
         assert!(host.read(0, 1).is_err());
+    }
+
+    #[test]
+    fn device_memory_import_rejects_oversized_writes_without_mutation() {
+        use super::memory::Host as _;
+        let size = usize::try_from(crate::MAX_SINGLE_BYTES).unwrap() + 1;
+        let mut host = super::DeviceContext::new(size as u64).unwrap();
+        host.write(0, vec![7]).unwrap();
+        assert!(matches!(
+            host.write(0, vec![9; size]),
+            Err(super::memory::MemoryError::TooLarge)
+        ));
+        assert_eq!(host.read(0, 1).unwrap(), vec![7]);
     }
 
     #[test]

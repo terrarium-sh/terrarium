@@ -135,10 +135,16 @@ impl<M: VirtualMachine> PreparedMachine<M> {
     pub fn accept_boot(&mut self, entry: super::boot::BootEntry) -> wasmtime::Result<()> {
         wasmtime::ensure!(self.boot_entry.is_none(), "VM boot already accepted");
         match self.config.architecture() {
-            Architecture::X86 => wasmtime::ensure!(
-                entry.boot_argument == 0x7000,
-                "x86 boot argument outside accepted layout"
-            ),
+            Architecture::X86 => {
+                wasmtime::ensure!(
+                    entry.boot_argument == terra_limits::X86_ZERO_PAGE,
+                    "x86 boot argument outside accepted layout"
+                );
+                wasmtime::ensure!(
+                    (0x10_0000..terra_limits::X86_RAM_LOW_END).contains(&entry.entry),
+                    "x86 boot entry outside low RAM"
+                );
+            }
             Architecture::Arm => {
                 wasmtime::ensure!(entry.entry.is_multiple_of(4), "ARM boot entry is unaligned");
                 wasmtime::ensure!(
@@ -419,22 +425,40 @@ mod tests {
 
     #[test]
     fn prepared_machine_accepts_boot_once() {
-        let config = MachineConfig::new(Architecture::X86, 32768, 1, Vec::new()).unwrap();
-        let mut machine = PreparedMachine::new(config, TestVm(GuestRam::new(32768).unwrap()));
+        let config = MachineConfig::new(Architecture::X86, 2 << 20, 1, Vec::new()).unwrap();
+        let mut machine = PreparedMachine::new(config, TestVm(GuestRam::new(2 << 20).unwrap()));
         machine
             .accept_boot(super::super::boot::BootEntry {
-                entry: 0,
-                boot_argument: 0x7000,
+                entry: 0x10_0000,
+                boot_argument: terra_limits::X86_ZERO_PAGE,
             })
             .unwrap();
         assert!(
             machine
                 .accept_boot(super::super::boot::BootEntry {
-                    entry: 0,
-                    boot_argument: 0x7000,
+                    entry: 0x10_0000,
+                    boot_argument: terra_limits::X86_ZERO_PAGE,
                 })
                 .is_err()
         );
+    }
+
+    #[test]
+    fn prepared_machine_rejects_mapped_entry_above_bootstrap_ram() {
+        let config = MachineConfig::new(Architecture::X86, 2 << 20, 1, Vec::new()).unwrap();
+        let memory = terra_platform::memory::GuestMemory::from_ranges(&[
+            (terra_limits::X86_RAM_BASE, 2 << 20),
+            (terra_limits::X86_HIGH_RAM_BASE, 4096),
+        ])
+        .unwrap();
+        let mut machine = PreparedMachine::new(config, TestVm(GuestRam::from_memory(memory)));
+        let error = machine
+            .accept_boot(super::super::boot::BootEntry {
+                entry: terra_limits::X86_HIGH_RAM_BASE,
+                boot_argument: terra_limits::X86_ZERO_PAGE,
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("x86 boot entry outside low RAM"));
     }
 
     #[test]
@@ -520,11 +544,27 @@ mod tests {
             };
             let devices = match architecture {
                 Architecture::X86 => vec![
-                    (DeviceKind::Block, 0xd000_0000, 11),
-                    (DeviceKind::Block, 0xd000_1000, 12),
-                    (DeviceKind::Net, 0xd000_2000, 13),
-                    (DeviceKind::Vsock, 0xd000_3000, 14),
-                    (DeviceKind::Memory, 0xd000_4000, 15),
+                    (DeviceKind::Block, terra_limits::X86_MMIO_BASE, 11),
+                    (
+                        DeviceKind::Block,
+                        terra_limits::X86_MMIO_BASE + terra_limits::X86_MMIO_STRIDE,
+                        12,
+                    ),
+                    (
+                        DeviceKind::Net,
+                        terra_limits::X86_MMIO_BASE + 2 * terra_limits::X86_MMIO_STRIDE,
+                        13,
+                    ),
+                    (
+                        DeviceKind::Vsock,
+                        terra_limits::X86_MMIO_BASE + 3 * terra_limits::X86_MMIO_STRIDE,
+                        14,
+                    ),
+                    (
+                        DeviceKind::Memory,
+                        terra_limits::X86_MMIO_BASE + 4 * terra_limits::X86_MMIO_STRIDE,
+                        15,
+                    ),
                 ],
                 Architecture::Arm => vec![
                     (DeviceKind::Block, 0x0a00_0000, 16),

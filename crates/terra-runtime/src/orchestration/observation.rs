@@ -99,6 +99,7 @@ mod tests {
         use crate::component::vmm::{PreparedMachine, StartedVcpus, VirtualMachine};
         use crate::machine::{Architecture, Device, DeviceKind, MachineConfig};
         use std::sync::Arc;
+        use terra_limits::{X86_MMIO_BASE, X86_MMIO_STRIDE};
 
         struct TestVm(crate::memory::GuestRam);
         impl VirtualMachine for TestVm {
@@ -126,7 +127,7 @@ mod tests {
         .map(|((kind, irq), slot)| Device {
             kind,
             irq,
-            mmio_base: 0xd000_0000 + slot * 0x1000,
+            mmio_base: X86_MMIO_BASE + slot * X86_MMIO_STRIDE,
         })
         .collect();
         let config = MachineConfig::new(Architecture::X86, 8 << 20, 1, devices).unwrap();

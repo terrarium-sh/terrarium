@@ -138,7 +138,7 @@ impl Machine {
             return Err(KvmError::BadVcpuCount(vcpu_count));
         }
         let vm = kvm.create_vm()?;
-        let ram = if ram_base == 0 {
+        let ram = if ram_base == terra_limits::X86_RAM_BASE {
             GuestMemory::allocate_x86_ram(ram_bytes)
         } else {
             GuestMemory::allocate_at(ram_base, ram_bytes)

@@ -21,7 +21,7 @@ impl WindowsVm {
         {
             return Err("invalid Windows x64 VM dimensions".to_owned());
         }
-        let memory = if config.ram_base == 0 {
+        let memory = if config.ram_base == terra_limits::X86_RAM_BASE {
             GuestMemory::allocate_x86_ram(config.ram_bytes)
         } else {
             GuestMemory::allocate_at(config.ram_base, config.ram_bytes)

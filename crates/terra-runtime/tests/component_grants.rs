@@ -119,7 +119,7 @@ fn assert_ram_import_denied<T: 'static>(linker: &Linker<T>, engine: &wasmtime::E
         engine,
         r#"
         (component
-            (type $memory (instance (export "ram-bytes" (func (result u64)))))
+            (type $memory (instance (export "address-limit" (func (result u64)))))
             (import "terra:host/memory@0.1.0" (instance $memory (type $memory))))
         "#,
     )

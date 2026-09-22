@@ -12,7 +12,7 @@
       "signal"
     ],
     "terra:host@0.1.0/memory": [
-      "ram-bytes",
+      "address-limit",
       "read",
       "write"
     ],
@@ -43,7 +43,7 @@
       "signal"
     ],
     "terra:host@0.1.0/memory": [
-      "ram-bytes",
+      "address-limit",
       "read",
       "write"
     ],
@@ -89,7 +89,7 @@
       "signal"
     ],
     "terra:host@0.1.0/memory": [
-      "ram-bytes",
+      "address-limit",
       "read",
       "write"
     ],
@@ -108,7 +108,7 @@
       "signal"
     ],
     "terra:host@0.1.0/memory": [
-      "ram-bytes",
+      "address-limit",
       "read",
       "write"
     ],
@@ -166,7 +166,7 @@
       "signal"
     ],
     "terra:host@0.1.0/memory": [
-      "ram-bytes",
+      "address-limit",
       "read",
       "write"
     ],

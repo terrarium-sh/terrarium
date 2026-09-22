@@ -42,7 +42,7 @@ fn new_state() -> State {
         mmio: MmioTransport::new(
             0,
             0x200,
-            memory::ram_bytes(),
+            memory::address_limit(),
             19,
             1 << 32,
             QUEUE_SIZE,

@@ -717,7 +717,7 @@ mod tests {
             ),
             (
                 "terra:host/memory@0.1.0",
-                "ram-bytes",
+                "address-limit",
                 "(func (result u64))",
             ),
             (

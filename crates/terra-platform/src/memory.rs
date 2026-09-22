@@ -68,15 +68,17 @@ impl GuestMemory {
     /// Allocates x86 RAM below and above the MMIO hole.
     #[must_use]
     pub fn allocate_x86_ram(total: u64) -> Option<Self> {
-        use terra_limits::{X86_HIGH_RAM_BASE, X86_RAM_LOW_END};
-
-        let low = total.min(X86_RAM_LOW_END);
-        let high = total.checked_sub(low)?;
-        let mut ranges = vec![(0, usize::try_from(low).ok()?)];
-        if high != 0 {
-            ranges.push((X86_HIGH_RAM_BASE, usize::try_from(high).ok()?));
-        }
+        let ranges = terra_limits::x86_ram_layout(total)?
+            .regions()
+            .map(|region| Some((region.base, usize::try_from(region.size).ok()?)))
+            .collect::<Option<Vec<_>>>()?;
         Self::from_ranges(&ranges)
+    }
+
+    #[must_use]
+    pub fn allocate_arm_ram(total: u64) -> Option<Self> {
+        let region = terra_limits::arm_ram_layout(total)?.regions().next()?;
+        Self::allocate_at(region.base, region.size)
     }
 
     /// Allocates the supplied guest-physical mappings.
@@ -208,22 +210,18 @@ impl GuestMemory {
     #[allow(unsafe_code)]
     pub fn read(&self, addr: u64, len: usize) -> Result<Vec<u8>, MemoryError> {
         let len_u64 = u64::try_from(len).map_err(|_| MemoryError::OutOfRange)?;
+        #[cfg(unix)]
         self.check_range(addr, len_u64)?;
+        #[cfg(windows)]
+        let (range, range_offset) = self.resolve_range(addr, len_u64)?;
         let mut bytes = vec![0; len];
         #[cfg(unix)]
         self.memory
             .read_slice(&mut bytes, GuestAddress(addr))
             .map_err(|_| MemoryError::Unmapped)?;
         #[cfg(windows)]
-        let range = self
-            .memory
-            .range(addr, len_u64)
-            .expect("checked guest range");
-        #[cfg(windows)]
-        let range_offset = usize::try_from(addr - range.guest_base).expect("checked guest range");
-        #[cfg(windows)]
         for (offset, byte) in bytes.iter_mut().enumerate() {
-            // SAFETY: `check_range` confines this byte to the allocation.
+            // SAFETY: `resolve_range` confines this byte to the allocation.
             *byte = unsafe {
                 core::sync::atomic::AtomicU8::from_ptr(
                     range.address.as_ptr().add(range_offset + offset),
@@ -236,27 +234,18 @@ impl GuestMemory {
 
     #[allow(unsafe_code)]
     pub fn write(&self, addr: u64, bytes: &[u8]) -> Result<(), MemoryError> {
-        self.check_range(
-            addr,
-            u64::try_from(bytes.len()).map_err(|_| MemoryError::OutOfRange)?,
-        )?;
+        let len = u64::try_from(bytes.len()).map_err(|_| MemoryError::OutOfRange)?;
+        #[cfg(unix)]
+        self.check_range(addr, len)?;
+        #[cfg(windows)]
+        let (range, range_offset) = self.resolve_range(addr, len)?;
         #[cfg(unix)]
         self.memory
             .write_slice(bytes, GuestAddress(addr))
             .map_err(|_| MemoryError::Unmapped)?;
         #[cfg(windows)]
-        let range = self
-            .memory
-            .range(
-                addr,
-                u64::try_from(bytes.len()).map_err(|_| MemoryError::OutOfRange)?,
-            )
-            .expect("checked guest range");
-        #[cfg(windows)]
-        let range_offset = usize::try_from(addr - range.guest_base).expect("checked guest range");
-        #[cfg(windows)]
         for (offset, byte) in bytes.iter().copied().enumerate() {
-            // SAFETY: `check_range` confines this byte to the allocation.
+            // SAFETY: `resolve_range` confines this byte to the allocation.
             unsafe {
                 core::sync::atomic::AtomicU8::from_ptr(
                     range.address.as_ptr().add(range_offset + offset),
@@ -299,15 +288,35 @@ impl GuestMemory {
         }
     }
 
+    #[cfg(unix)]
     fn check_range(&self, addr: u64, len: u64) -> Result<(), MemoryError> {
         if self.contains_range(addr, len) {
             Ok(())
-        } else if addr < self.guest_base()
-            || addr.checked_add(len).is_none_or(|end| end > self.limit)
-        {
-            Err(MemoryError::OutOfRange)
         } else {
-            Err(MemoryError::Unmapped)
+            Err(self.range_error(addr, len))
+        }
+    }
+
+    #[cfg(windows)]
+    fn resolve_range(
+        &self,
+        addr: u64,
+        len: u64,
+    ) -> Result<(&WindowsMemoryRange, usize), MemoryError> {
+        let range = self
+            .memory
+            .range(addr, len)
+            .ok_or_else(|| self.range_error(addr, len))?;
+        let offset =
+            usize::try_from(addr - range.guest_base).map_err(|_| MemoryError::OutOfRange)?;
+        Ok((range, offset))
+    }
+
+    fn range_error(&self, addr: u64, len: u64) -> MemoryError {
+        if addr < self.guest_base() || addr.checked_add(len).is_none_or(|end| end > self.limit) {
+            MemoryError::OutOfRange
+        } else {
+            MemoryError::Unmapped
         }
     }
 

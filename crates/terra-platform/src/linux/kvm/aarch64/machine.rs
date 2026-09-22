@@ -27,7 +27,10 @@ pub(crate) struct Machine {
 impl Machine {
     pub(super) fn new(kvm: &Kvm, config: &VmConfig) -> Result<Self, ArmWorkerError> {
         let ram_size = usize::try_from(config.ram_bytes).map_err(|_| ArmWorkerError::Memory)?;
-        if ram_size == 0 || !config.ram_bytes.is_multiple_of(4096) {
+        if config.ram_base != terra_limits::ARM_RAM_BASE
+            || ram_size == 0
+            || !config.ram_bytes.is_multiple_of(4096)
+        {
             return Err(ArmWorkerError::Memory);
         }
         let crate::vm::InterruptControllerConfig::Arm(gic) = &config.interrupt_controller else {
@@ -47,15 +50,14 @@ impl Machine {
             return Err(ArmWorkerError::Memory);
         }
         let vm = Arc::new(kvm.create_vm()?);
-        let ram = GuestMemory::allocate_at(config.ram_base, config.ram_bytes)
-            .ok_or(ArmWorkerError::Memory)?;
+        let ram = GuestMemory::allocate_arm_ram(config.ram_bytes).ok_or(ArmWorkerError::Memory)?;
         let host_address = ram
-            .host_address(config.ram_base)
+            .host_address(terra_limits::ARM_RAM_BASE)
             .ok_or(ArmWorkerError::Memory)?;
         let region = kvm_userspace_memory_region {
             slot: 0,
             flags: 0,
-            guest_phys_addr: config.ram_base,
+            guest_phys_addr: terra_limits::ARM_RAM_BASE,
             memory_size: config.ram_bytes,
             userspace_addr: host_address as u64,
         };

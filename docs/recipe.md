@@ -55,6 +55,12 @@ Both must be positive, and the total must be at least the per-component value.
 The defaults are 16 MiB per component and 128 MiB in total. These limits are
 separate from guest RAM and do not bound all native host-process memory.
 
+On x86_64, RAM starts at zero and skips the reserved device-address region
+from 3.25 GiB to 4 GiB, continuing above 4 GiB when needed. Virtio devices
+and interrupt controllers retain fixed addresses in that gap. `hw.mem_mib`
+counts mapped RAM, excluding the gap; Linux reserves some RAM for boot data.
+RAM capacity is constrained by host resources and the platform's address space.
+
 Increasing a root filesystem or volume limit takes effect on the next boot;
 existing images do not shrink. Renaming a volume leaves its prior image behind
 and creates an empty one under the new name. `terra <box> setup --rebuild`

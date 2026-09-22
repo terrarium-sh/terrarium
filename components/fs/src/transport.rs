@@ -1175,7 +1175,7 @@ pub async fn configure(tag: &str, max_nodes: u32) -> Result<(), DeviceError> {
     *TRANSPORT
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) =
-        Some(new_transport(memory::ram_bytes(), config));
+        Some(new_transport(memory::address_limit(), config));
     publish_interrupt_level(false);
     clear_work();
     RUNNING.store(true, Ordering::Release);

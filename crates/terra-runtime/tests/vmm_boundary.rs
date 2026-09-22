@@ -6,6 +6,7 @@ mod support;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use terra_limits::{X86_MMIO_BASE, X86_MMIO_STRIDE, X86_ZERO_PAGE};
 use terra_runtime::box_runtime::{BoxHost, BoxRuntime};
 use terra_runtime::component::InterruptCallback;
 use terra_runtime::component::context::DeviceContext;
@@ -44,7 +45,7 @@ async fn attach_test_machine(
     .map(|((kind, irq), slot)| Device {
         kind,
         irq,
-        mmio_base: 0xd000_0000 + slot * 0x1000,
+        mmio_base: X86_MMIO_BASE + slot * X86_MMIO_STRIDE,
     })
     .collect();
     let config = MachineConfig::new(Architecture::X86, ram.mapped_bytes(), 1, devices)
@@ -53,7 +54,7 @@ async fn attach_test_machine(
     prepared
         .accept_boot(BootEntry {
             entry: 0x10_0000,
-            boot_argument: 0x7000,
+            boot_argument: X86_ZERO_PAGE,
         })
         .expect("native boot acceptance");
     runtime.attach_machine(prepared).await.expect("attach VM")
@@ -158,7 +159,7 @@ async fn wasm_vmm_routes_native_exits_and_stops_with_the_box() {
     let mmio = tokio::task::block_in_place(|| {
         vcpu.exchange(Exit::MmioRead(
             terra_runtime::component::vmm::platform::MmioRead {
-                address: 0xd000_4000,
+                address: X86_MMIO_BASE + 4 * X86_MMIO_STRIDE,
                 width: 4,
             },
         ))
@@ -168,7 +169,7 @@ async fn wasm_vmm_routes_native_exits_and_stops_with_the_box() {
 
     let arm_read = tokio::task::block_in_place(|| {
         vcpu.exchange_arm_exception(
-            0xd000_4000,
+            X86_MMIO_BASE + 4 * X86_MMIO_STRIDE,
             (0x24 << 26) | (1 << 24) | (2 << 22) | (4 << 16),
             |_| {
                 Err(wasmtime::Error::msg(
@@ -188,7 +189,7 @@ async fn wasm_vmm_routes_native_exits_and_stops_with_the_box() {
     let mut reads = Vec::new();
     let arm_write = tokio::task::block_in_place(|| {
         vcpu.exchange_arm_exception(
-            0xd000_4024,
+            X86_MMIO_BASE + 4 * X86_MMIO_STRIDE + 0x24,
             (0x24 << 26) | (1 << 24) | (2 << 22) | (7 << 16) | (1 << 6),
             |register| {
                 reads.push(register);
