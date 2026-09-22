@@ -13,5 +13,6 @@ interface decisions {
 }
 
 world policy {
+    import wasi:clocks/monotonic-clock@0.3.1;
     export decisions;
 }

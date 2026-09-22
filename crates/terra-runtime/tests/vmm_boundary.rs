@@ -67,6 +67,23 @@ fn router(engine: &wasmtime::Engine) -> Component {
     Component::new(engine, support::artifacts::wasm::VMM).expect("router component")
 }
 
+fn mmio(engine: &wasmtime::Engine) -> Component {
+    Component::new(engine, support::artifacts::wasm::MMIO).expect("MMIO service component")
+}
+
+fn interrupt_controller(engine: &wasmtime::Engine) -> Component {
+    Component::new(engine, support::artifacts::wasm::INTERRUPT_CONTROLLER)
+        .expect("interrupt controller component")
+}
+
+async fn initialize_vmm(runtime: &mut BoxRuntime, engine: &wasmtime::Engine) {
+    runtime
+        .initialize_mmio(&mmio(engine))
+        .await
+        .expect("MMIO service");
+    runtime.initialize_vmm(&router(engine)).await.expect("VMM");
+}
+
 fn memory(engine: &wasmtime::Engine) -> Component {
     Component::new(engine, support::artifacts::wasm::MEM).expect("memory component")
 }
@@ -93,10 +110,7 @@ async fn wasm_vmm_routes_native_exits_and_stops_with_the_box() {
     let engine = device_engine().expect("engine");
     let ram = GuestRam::new(8 << 20).expect("RAM");
     let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
-    runtime
-        .initialize_vmm(&router(&engine))
-        .await
-        .expect("router");
+    initialize_vmm(&mut runtime, &engine).await;
     let (mut runtime, machine) = attach_test_machine(runtime, ram.clone()).await;
     let ram_grant = machine.ram();
     let memory = terra_runtime::component::mem::register_device_with_host_factory(
@@ -222,18 +236,12 @@ async fn vcpu_preparation_requires_a_router_and_boot() {
     for router_present in [false, true] {
         let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("test setup");
         if router_present {
-            runtime
-                .initialize_vmm(&router(&engine))
-                .await
-                .expect("test setup");
+            initialize_vmm(&mut runtime, &engine).await;
         }
         assert!(prepare_test_vcpus(runtime).await.is_err());
     }
     let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("test setup");
-    runtime
-        .initialize_vmm(&router(&engine))
-        .await
-        .expect("test setup");
+    initialize_vmm(&mut runtime, &engine).await;
     let (runtime, _) =
         attach_test_machine(runtime, GuestRam::new(8 << 20).expect("test setup")).await;
     let (_prepared, vcpus) = prepare_test_vcpus(runtime).await.expect("test setup");
@@ -258,10 +266,7 @@ async fn device_components_receive_no_platform_or_vcpu_grant() {
 async fn failed_startup_disconnects_native_vcpus() {
     let engine = device_engine().expect("engine");
     let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
-    runtime
-        .initialize_vmm(&router(&engine))
-        .await
-        .expect("router");
+    initialize_vmm(&mut runtime, &engine).await;
     let (runtime, _) = attach_test_machine(runtime, GuestRam::new(8 << 20).expect("RAM")).await;
     let (sender, receiver) = std::sync::mpsc::channel();
     let started = runtime
@@ -288,10 +293,7 @@ async fn vcpu_failure_preserves_teardown_order_before_runtime_join() {
 
     let engine = device_engine().expect("engine");
     let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
-    runtime
-        .initialize_vmm(&router(&engine))
-        .await
-        .expect("router");
+    initialize_vmm(&mut runtime, &engine).await;
     let (mut runtime, _) = attach_test_machine(runtime, GuestRam::new(8 << 20).expect("RAM")).await;
     let order = Arc::new(std::sync::Mutex::new(Vec::new()));
     let devices = Arc::clone(&order);
@@ -374,10 +376,7 @@ async fn wasi_requests_cpu_stop_before_publishing_terminal_outcomes() {
         Event::Deadline,
     ] {
         let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
-        runtime
-            .initialize_vmm(&router(&engine))
-            .await
-            .expect("router");
+        initialize_vmm(&mut runtime, &engine).await;
         let (mut runtime, machine) =
             attach_test_machine(runtime, GuestRam::new(8 << 20).expect("RAM")).await;
         let calls = Arc::new(AtomicUsize::new(0));
@@ -526,10 +525,7 @@ async fn deferred_device_failure_prevents_cpu_launch() {
     let engine = device_engine().expect("engine");
     let ram = GuestRam::new(8 << 20).expect("RAM");
     let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
-    runtime
-        .initialize_vmm(&router(&engine))
-        .await
-        .expect("router");
+    initialize_vmm(&mut runtime, &engine).await;
     let (mut runtime, _) = attach_test_machine(runtime, ram.clone()).await;
     let _channel = terra_runtime::component::block::register_device(
         &mut runtime,
@@ -575,10 +571,7 @@ async fn wasi_composes_multiple_deferred_workers_with_their_final_mappings() {
     let engine = device_engine().expect("engine");
     let ram = GuestRam::new(8 << 20).expect("RAM");
     let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
-    runtime
-        .initialize_vmm(&router(&engine))
-        .await
-        .expect("router");
+    initialize_vmm(&mut runtime, &engine).await;
     let (mut runtime, _) = attach_test_machine(runtime, ram.clone()).await;
     let block = Component::new(&engine, support::artifacts::wasm::BLOCK).expect("block component");
     let mut channels = Vec::new();
@@ -632,10 +625,7 @@ async fn wasi_lifecycle_closes_a_device_through_the_running_mmio_bridge() {
     let engine = device_engine().expect("engine");
     let ram = GuestRam::new(8 << 20).expect("RAM");
     let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
-    runtime
-        .initialize_vmm(&router(&engine))
-        .await
-        .expect("router");
+    initialize_vmm(&mut runtime, &engine).await;
     let (mut runtime, _) = attach_test_machine(runtime, ram.clone()).await;
     let channel = terra_runtime::component::mem::register_device(
         &mut runtime,
@@ -647,16 +637,24 @@ async fn wasi_lifecycle_closes_a_device_through_the_running_mmio_bridge() {
     let delivered = Arc::new(std::sync::Mutex::new(Vec::new()));
     let injections = Arc::clone(&delivered);
     let ioapic = runtime
-        .grant_ioapic(Arc::new(move |interrupt| {
-            injections
-                .lock()
-                .expect("interrupt observer")
-                .push(interrupt);
-            Ok(())
-        }))
+        .grant_ioapic(
+            &interrupt_controller(&engine),
+            Arc::new(move |interrupt| {
+                injections
+                    .lock()
+                    .expect("interrupt observer")
+                    .push(interrupt);
+                Ok(())
+            }),
+        )
         .await
         .expect("IOAPIC grant");
-    assert!(runtime.grant_ioapic(Arc::new(|_| Ok(()))).await.is_err());
+    assert!(
+        runtime
+            .grant_ioapic(&interrupt_controller(&engine), Arc::new(|_| Ok(())))
+            .await
+            .is_err()
+    );
     let memory_irq = ioapic
         .bind_interrupt(DeviceKind::Memory, 0)
         .expect("bind memory interrupt");
@@ -711,10 +709,7 @@ async fn wasi_lifecycle_closes_a_device_through_the_running_mmio_bridge() {
 async fn wasi_irq_lines_drain_assertions_before_vm_release() {
     let engine = device_engine().expect("engine");
     let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
-    runtime
-        .initialize_vmm(&router(&engine))
-        .await
-        .expect("router");
+    initialize_vmm(&mut runtime, &engine).await;
     let ram = GuestRam::new(8 << 20).expect("RAM");
     let (mut runtime, _) = attach_test_machine(runtime, ram.clone()).await;
     terra_runtime::component::mem::register_device(
@@ -727,7 +722,7 @@ async fn wasi_irq_lines_drain_assertions_before_vm_release() {
     let delivered = Arc::new(std::sync::Mutex::new(Vec::new()));
     let injections = Arc::clone(&delivered);
     let lines = runtime
-        .grant_irq_lines(move |gsi, level| {
+        .grant_irq_lines(&interrupt_controller(&engine), move |gsi, level| {
             injections
                 .lock()
                 .expect("interrupt observer")
@@ -736,8 +731,18 @@ async fn wasi_irq_lines_drain_assertions_before_vm_release() {
         })
         .await
         .expect("IRQ grant");
-    assert!(runtime.grant_irq_lines(|_, _| Ok(())).await.is_err());
-    assert!(runtime.grant_ioapic(Arc::new(|_| Ok(()))).await.is_err());
+    assert!(
+        runtime
+            .grant_irq_lines(&interrupt_controller(&engine), |_, _| Ok(()))
+            .await
+            .is_err()
+    );
+    assert!(
+        runtime
+            .grant_ioapic(&interrupt_controller(&engine), Arc::new(|_| Ok(())))
+            .await
+            .is_err()
+    );
     let memory_irq = lines
         .bind_interrupt(DeviceKind::Memory, 0)
         .expect("bind memory interrupt");
@@ -770,7 +775,15 @@ async fn wasi_irq_lines_drain_assertions_before_vm_release() {
     .expect("IRQ cleanup");
     assert_eq!(
         *delivered.lock().expect("interrupt observer"),
-        [(15, true), (15, false)]
+        [
+            (15, true),
+            (15, false),
+            (11, false),
+            (12, false),
+            (13, false),
+            (14, false),
+            (15, false),
+        ]
     );
     assert!(memory_irq(false).is_err());
     drop(controls);
@@ -784,10 +797,7 @@ async fn failed_native_reaping_retains_vm_and_dependent_cleanup() {
 
     let engine = device_engine().expect("engine");
     let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
-    runtime
-        .initialize_vmm(&router(&engine))
-        .await
-        .expect("router");
+    initialize_vmm(&mut runtime, &engine).await;
     let (mut runtime, machine) =
         attach_test_machine(runtime, GuestRam::new(8 << 20).expect("RAM")).await;
     let backend = Arc::downgrade(&machine.machine());

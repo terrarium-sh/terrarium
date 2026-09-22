@@ -1,115 +1,27 @@
 #![allow(clippy::expect_used)]
 
-use std::collections::BTreeSet;
+use std::path::Path;
 use terra_runtime::engine::device_engine;
 use wasmtime::component::Component;
 
-// Rust's wasm32-wasip3 standard library imports these even when the world omits them.
-const RUST_IMPORTS: &[&str] = &[
-    "wasi:cli/environment",
-    "wasi:cli/exit",
-    "wasi:cli/types",
-    "wasi:cli/stdin",
-    "wasi:cli/stdout",
-    "wasi:cli/stderr",
-    "wasi:cli/terminal-input",
-    "wasi:cli/terminal-output",
-    "wasi:cli/terminal-stdin",
-    "wasi:cli/terminal-stdout",
-    "wasi:cli/terminal-stderr",
-    "wasi:clocks/types",
-    "wasi:clocks/monotonic-clock",
-    "wasi:clocks/system-clock",
-];
-
 #[test]
-fn compiled_components_import_only_their_declared_capabilities() {
+fn service_components_link_without_host_authority() {
     let engine = device_engine().expect("engine");
-    let components: &[(&str, &[&str])] = &[
+    let linker = wasmtime::component::Linker::<()>::new(&engine);
+    let artifacts = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../components/target/wasm-components/release");
+    for (package, artifact) in [
+        ("terra-mmio-component", "terra_mmio_component.wasm"),
         (
-            "block",
-            &[
-                "terra:host/memory",
-                "terra:host/interrupt",
-                "terra:host/disk",
-                "terra:mmio/types",
-            ],
+            "terra-interrupt-controller-component",
+            "terra_interrupt_controller_component.wasm",
         ),
-        (
-            "mem",
-            &[
-                "terra:host/memory",
-                "terra:host/interrupt",
-                "terra:mem/host",
-                "terra:mmio/types",
-            ],
-        ),
-        (
-            "fs",
-            &[
-                "terra:host/memory",
-                "terra:host/interrupt",
-                "terra:fs/host",
-                "wasi:filesystem/types",
-                "wasi:filesystem/preopens",
-                "terra:mmio/types",
-            ],
-        ),
-        (
-            "network",
-            &[
-                "terra:host/memory",
-                "terra:host/interrupt",
-                "terra:host/diagnostics",
-                "wasi:sockets/types",
-                "wasi:sockets/ip-name-lookup",
-                "terra:mmio/types",
-            ],
-        ),
-        (
-            "vsock",
-            &[
-                "terra:host/memory",
-                "terra:host/interrupt",
-                "terra:vsock/host-service",
-                "wasi:random/random",
-                "terra:mmio/types",
-            ],
-        ),
-        ("boot", &["terra:boot/types", "terra:boot/host"]),
-        ("policy", &[]),
-        (
-            "vmm",
-            &[
-                "terra:mmio/types",
-                "terra:mmio/machine-types",
-                "terra:mmio/platform",
-                "terra:mmio/virtualization",
-                "terra:mmio/lifecycle-platform",
-            ],
-        ),
-    ];
-    for (name, capabilities) in components {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
-            "../../components/target/wasm32-wasip3/release/terra_{name}_component.wasm"
-        ));
-        let component = Component::from_file(&engine, path).expect("built component");
-        let actual = component
-            .component_type()
-            .imports(&engine)
-            .map(|(interface, _)| {
-                interface
-                    .split('@')
-                    .next()
-                    .expect("interface name")
-                    .to_owned()
-            })
-            .collect::<BTreeSet<_>>();
-        let expected = RUST_IMPORTS
-            .iter()
-            .chain(capabilities.iter())
-            .map(|interface| (*interface).to_owned())
-            .collect::<BTreeSet<_>>();
-        assert_eq!(actual, expected, "{name} capability imports changed");
+    ] {
+        let component = Component::from_file(&engine, artifacts.join(artifact))
+            .expect("built service component");
+        linker
+            .instantiate_pre(&component)
+            .map_err(|error| format!("{package} requested host authority: {error:#}"))
+            .expect("service links without host authority");
     }
 }

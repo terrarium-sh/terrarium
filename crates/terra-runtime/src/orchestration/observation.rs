@@ -110,8 +110,10 @@ mod tests {
         let mut runtime =
             crate::box_runtime::BoxRuntime::new(&engine, crate::box_runtime::BoxHost::new())
                 .unwrap();
-        let component =
+        let vmm =
             wasmtime::component::Component::new(&engine, crate::test_fixtures::wasm::VMM).unwrap();
+        let mmio =
+            wasmtime::component::Component::new(&engine, crate::test_fixtures::wasm::MMIO).unwrap();
         let devices = [
             (DeviceKind::Block, 11),
             (DeviceKind::Block, 12),
@@ -152,7 +154,8 @@ mod tests {
             .await
             .unwrap();
         machine.accept_boot(entry).unwrap();
-        runtime.initialize_vmm(&component).await.unwrap();
+        runtime.initialize_mmio(&mmio).await.unwrap();
+        runtime.initialize_vmm(&vmm).await.unwrap();
         let (mut runtime, machine) = runtime.attach_machine(machine).await.unwrap();
         let component =
             wasmtime::component::Component::new(&engine, crate::test_fixtures::wasm::MEM).unwrap();

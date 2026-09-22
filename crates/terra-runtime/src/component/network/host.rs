@@ -183,11 +183,8 @@ pub fn network_component_linker<T: wasmtime_wasi::WasiView + AsMut<NetworkHost> 
     engine: &wasmtime::Engine,
 ) -> wasmtime::Result<wasmtime::component::Linker<T>> {
     let mut linker = crate::component::context::device_component_linker(engine)?;
-    wasmtime_wasi::p3::bindings::sockets::types::add_to_linker::<T, WasiSockets>(
-        &mut linker,
-        T::sockets,
-    )?;
-    super::limits::add_socket_limits(&mut linker, T::sockets)?;
+    crate::component::clocks::add_monotonic_now_and_wait_for(&mut linker)?;
+    super::resource_linker::add(&mut linker)?;
     wasmtime_wasi::p3::bindings::sockets::ip_name_lookup::add_to_linker::<
         T,
         NetworkNameLookupHost<T>,

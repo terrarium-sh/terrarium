@@ -2,7 +2,6 @@
 
 use crate::MAX_SINGLE_BYTES;
 use crate::component::bindings::{diagnostics, interrupt, memory};
-use crate::component::vmm::bindings::types;
 use crate::memory::{BoundedMemory, GuestRam};
 use std::sync::Arc;
 use wasmtime::Engine;
@@ -183,13 +182,10 @@ impl DeviceHost for DeviceContext {
     }
 }
 
-pub fn device_component_linker<T: WasiView + 'static>(
+pub fn device_component_linker<T: 'static>(
     engine: &Engine,
 ) -> wasmtime::Result<wasmtime::component::Linker<T>> {
-    let mut linker = wasmtime::component::Linker::new(engine);
-    wasmtime_wasi::p3::cli::add_to_linker(&mut linker)?;
-    wasmtime_wasi::p3::clocks::add_to_linker(&mut linker)?;
-    Ok(linker)
+    Ok(wasmtime::component::Linker::new(engine))
 }
 
 fn memory_error(error: crate::memory::MemoryError) -> memory::MemoryError {
@@ -199,8 +195,6 @@ fn memory_error(error: crate::memory::MemoryError) -> memory::MemoryError {
         crate::memory::MemoryError::Unmapped => memory::MemoryError::Unmapped,
     }
 }
-
-impl types::Host for DeviceContext {}
 
 impl memory::Host for DeviceContext {
     fn read(&mut self, offset: u64, len: u64) -> Result<Vec<u8>, memory::MemoryError> {

@@ -45,12 +45,17 @@ interface device {
 interface router {
     use types.{control-reply, error, operation, reply, request, routed-reply};
 
-    configure-vcpus: func(count: u8) -> result<_, error>;
     open-device: func(slot: u32, base: u64, size: u64) -> result<stream<request>, error>;
     attach-replies: async func(slot: u32, replies: stream<reply>) -> result<_, error>;
     remap-device: func(slot: u32, base: u64, size: u64) -> result<_, error>;
     access: async func(address: u64, width: u8, value: u64, write: bool) -> result<routed-reply, error>;
     control: async func(slot: u32, operation: operation) -> result<control-reply, error>;
+}
+
+interface vmm-mmio-client {
+    use types.{error};
+
+    access: async func(address: u64, width: u8, value: u64, write: bool) -> result<u64, error>;
 }
 
 interface platform {
@@ -102,15 +107,22 @@ interface platform {
         resume: async func(completion: completion) -> result<exit, error>;
     }
 
-    completed: func(slot: u32, failed: bool) -> result<_, error>;
 }
 
 world vmm {
     import platform;
     import virtualization;
     import lifecycle-platform;
+    import vmm-mmio-client;
     export machine;
-    export interrupts;
     export lifecycle;
+}
+
+world mmio {
+    export types;
     export router;
+}
+
+world mmio-types {
+    import types;
 }

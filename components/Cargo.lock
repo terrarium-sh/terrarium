@@ -466,6 +466,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "terra-interrupt-controller-component"
+version = "0.1.0"
+dependencies = [
+ "terra-limits",
+ "wit-bindgen",
+]
+
+[[package]]
 name = "terra-limits"
 version = "0.0.1"
 
@@ -475,6 +483,15 @@ version = "0.1.0"
 dependencies = [
  "futures",
  "terra-device-transport",
+ "wit-bindgen",
+]
+
+[[package]]
+name = "terra-mmio-component"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "terra-limits",
  "wit-bindgen",
 ]
 

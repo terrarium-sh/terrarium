@@ -175,6 +175,10 @@ pub fn block_component_linker<T: WasiView + AsMut<BlockHost> + 'static>(
     let mut linker = device_component_linker(engine)?;
     disk::add_to_linker::<T, HasSelf<BlockHost>>(&mut linker, AsMut::as_mut)?;
     add_device_imports(&mut linker, |host: &mut T| host.as_mut().context())?;
+    crate::component::bindings::diagnostics::add_to_linker::<T, HasSelf<DeviceContext>>(
+        &mut linker,
+        |host| &mut host.as_mut().context,
+    )?;
     Ok(linker)
 }
 

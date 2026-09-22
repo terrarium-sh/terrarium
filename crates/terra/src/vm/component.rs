@@ -33,6 +33,8 @@ const ARTIFACTS: TrustedArtifacts = {
             include_bytes!(env!("TERRA_MEM_AOT")),
             include_bytes!(env!("TERRA_BOOT_AOT")),
             include_bytes!(env!("TERRA_VMM_AOT")),
+            include_bytes!(env!("TERRA_MMIO_AOT")),
+            include_bytes!(env!("TERRA_INTERRUPT_CONTROLLER_AOT")),
         )
     }
 };

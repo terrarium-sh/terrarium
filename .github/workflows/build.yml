@@ -133,7 +133,7 @@ jobs:
           version: 0.16.0
       - name: Install component toolchain
         run: |
-          rustup toolchain install nightly-2026-09-16 --profile minimal --component rustfmt,clippy --target wasm32-wasip3
+          rustup toolchain install nightly-2026-09-16 --profile minimal --component rustfmt,clippy --target wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           cache-on-failure: true
@@ -242,7 +242,7 @@ jobs:
       - name: Install component toolchain
         run: |
           rustup target add aarch64-unknown-linux-musl
-          rustup toolchain install nightly-2026-09-16 --profile minimal --component rustfmt,clippy --target wasm32-wasip3
+          rustup toolchain install nightly-2026-09-16 --profile minimal --component rustfmt,clippy --target wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           cache-on-failure: true
@@ -303,7 +303,7 @@ jobs:
           path: build
       - name: Install component toolchain
         run: |
-          rustup toolchain install nightly-2026-09-16 --profile minimal --component rustfmt,clippy --target wasm32-wasip3
+          rustup toolchain install nightly-2026-09-16 --profile minimal --component rustfmt,clippy --target wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           cache-on-failure: true
@@ -370,7 +370,7 @@ jobs:
           name: terra-guest-${{ matrix.guest }}
           path: build
       - name: Install component toolchain
-        run: rustup toolchain install nightly-2026-09-16 --profile minimal --target wasm32-wasip3
+        run: rustup toolchain install nightly-2026-09-16 --profile minimal --target wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           cache-on-failure: true

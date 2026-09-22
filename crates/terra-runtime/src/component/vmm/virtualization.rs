@@ -584,6 +584,10 @@ mod tests {
             prepared.accept_boot(boot_entry).unwrap();
 
             let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).unwrap();
+            let mmio =
+                wasmtime::component::Component::new(&engine, crate::test_fixtures::wasm::MMIO)
+                    .unwrap();
+            runtime.initialize_mmio(&mmio).await.unwrap();
             runtime.initialize_vmm(&vmm).await.unwrap();
             let (runtime, handle) = runtime.attach_machine(prepared).await.unwrap();
             let (sender, receiver) = std::sync::mpsc::sync_channel(1);

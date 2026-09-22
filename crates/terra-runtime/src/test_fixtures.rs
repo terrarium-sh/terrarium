@@ -1,24 +1,33 @@
 pub mod wasm {
     pub const BLOCK: &[u8] = include_bytes!(
-        "../../../components/target/wasm32-wasip3/release/terra_block_component.wasm"
+        "../../../components/target/wasm-components/release/terra_block_component.wasm"
     );
     pub const VSOCK: &[u8] = include_bytes!(
-        "../../../components/target/wasm32-wasip3/release/terra_vsock_component.wasm"
+        "../../../components/target/wasm-components/release/terra_vsock_component.wasm"
     );
     pub const NETWORK: &[u8] = include_bytes!(
-        "../../../components/target/wasm32-wasip3/release/terra_network_component.wasm"
+        "../../../components/target/wasm-components/release/terra_network_component.wasm"
     );
-    pub const FS: &[u8] =
-        include_bytes!("../../../components/target/wasm32-wasip3/release/terra_fs_component.wasm");
-    pub const MEM: &[u8] =
-        include_bytes!("../../../components/target/wasm32-wasip3/release/terra_mem_component.wasm");
+    pub const FS: &[u8] = include_bytes!(
+        "../../../components/target/wasm-components/release/terra_fs_component.wasm"
+    );
+    pub const MEM: &[u8] = include_bytes!(
+        "../../../components/target/wasm-components/release/terra_mem_component.wasm"
+    );
     pub const BOOT: &[u8] = include_bytes!(
-        "../../../components/target/wasm32-wasip3/release/terra_boot_component.wasm"
+        "../../../components/target/wasm-components/release/terra_boot_component.wasm"
     );
-    pub const VMM: &[u8] =
-        include_bytes!("../../../components/target/wasm32-wasip3/release/terra_vmm_component.wasm");
+    pub const VMM: &[u8] = include_bytes!(
+        "../../../components/target/wasm-components/release/terra_vmm_component.wasm"
+    );
+    pub const MMIO: &[u8] = include_bytes!(
+        "../../../components/target/wasm-components/release/terra_mmio_component.wasm"
+    );
+    pub const INTERRUPT_CONTROLLER: &[u8] = include_bytes!(
+        "../../../components/target/wasm-components/release/terra_interrupt_controller_component.wasm"
+    );
     pub const POLICY: &[u8] = include_bytes!(
-        "../../../components/target/wasm32-wasip3/release/terra_policy_component.wasm"
+        "../../../components/target/wasm-components/release/terra_policy_component.wasm"
     );
 }
 
@@ -35,6 +44,8 @@ pub fn trusted_artifacts() -> super::TrustedArtifacts {
             include_bytes!("../../../build/terra-mem-component.cwasm"),
             include_bytes!("../../../build/terra-boot-component.cwasm"),
             include_bytes!("../../../build/terra-vmm-component.cwasm"),
+            include_bytes!("../../../build/terra-mmio-component.cwasm"),
+            include_bytes!("../../../build/terra-interrupt-controller-component.cwasm"),
         )
     }
 }

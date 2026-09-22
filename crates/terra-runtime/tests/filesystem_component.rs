@@ -75,9 +75,9 @@ async fn mount_with_resource_capacity(
         Some(resource_capacity) => FsHost::with_resource_capacity(device, grant, resource_capacity),
         None => FsHost::new(device, grant),
     };
-    let router = Component::new(&engine, support::artifacts::wasm::VMM).expect("MMIO router");
+    let mmio = Component::new(&engine, support::artifacts::wasm::MMIO).expect("MMIO service");
     let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
-    runtime.initialize_vmm(&router).await.expect("MMIO router");
+    runtime.initialize_mmio(&mmio).await.expect("MMIO service");
     let channel = terra_runtime::component::fs::register_device(
         &mut runtime,
         host,

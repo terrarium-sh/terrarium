@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["block", "boot", "device-transport", "fs", "mem", "network", "policy", "vmm", "vsock"]
+members = ["block", "boot", "device-transport", "fs", "mem", "mmio", "interrupt-controller", "network", "policy", "vmm", "vsock"]
 exclude = ["vsock-device"]
 
 [workspace.dependencies]

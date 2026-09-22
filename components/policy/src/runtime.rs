@@ -6,7 +6,6 @@ use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::num::NonZeroUsize;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
 use terra_network::{
     Cidr, LEARNED_DNS_TTL_SECS, NameLookup, Policy, dns, is_floored, nat64_well_known_v4,
 };
@@ -17,7 +16,7 @@ use super::rules::{
 
 type Result<T> = std::result::Result<T, String>;
 
-const LEARNED_ADDRESS_TTL: Duration = Duration::from_secs(LEARNED_DNS_TTL_SECS as u64);
+const LEARNED_ADDRESS_TTL_NANOS: u64 = LEARNED_DNS_TTL_SECS as u64 * 1_000_000_000;
 
 pub const LEARNED_ADDRESSES_CAPACITY: usize = 4096;
 
@@ -26,7 +25,7 @@ pub struct BoxPolicy {
     mode: NetworkMode,
     address_rules: Vec<(Cidr, Port)>,
     name_rules: Vec<(String, Port)>,
-    pub(crate) learned_dns: Mutex<LruCache<(IpAddr, Port), Instant>>,
+    pub(crate) learned_dns: Mutex<LruCache<(IpAddr, Port), u64>>,
     static_dns: BTreeMap<String, Vec<IpAddr>>,
     host_grants: Vec<Port>,
     host_addresses: Vec<IpAddr>,
@@ -179,14 +178,14 @@ impl BoxPolicy {
         let Ok(mut learned) = self.learned_dns.lock() else {
             return Vec::new();
         };
-        let now = Instant::now();
+        let now = crate::monotonic_now();
         let host = gateway_addresses();
         let mut accepted = Vec::new();
         for ip in addresses.iter().map(IpAddr::to_canonical) {
             if is_floored(ip) || host.contains(&ip) || self.is_host_address(ip) {
                 continue;
             }
-            let expires_at = now + LEARNED_ADDRESS_TTL;
+            let expires_at = now.saturating_add(LEARNED_ADDRESS_TTL_NANOS);
             for grant in &grants {
                 let key = (ip, *grant);
                 if let Some(previous) = learned.get_mut(&key) {
@@ -260,7 +259,7 @@ impl BoxPolicy {
         match self.mode {
             NetworkMode::UnrestrictedPublic => true,
             NetworkMode::Allowlist => self.learned_dns.lock().is_ok_and(|mut learned| {
-                let now = Instant::now();
+                let now = crate::monotonic_now();
                 [None, port].into_iter().any(|grant| {
                     let key = (ip, grant);
                     if learned

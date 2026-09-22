@@ -86,12 +86,21 @@ opaque vCPU resources; device components cannot create or select a hypervisor.
 
 | Component | Scoped authority beyond runtime support |
 | --- | --- |
+| VMM | Scoped VM/vCPU lifecycle resources and access to the MMIO client. |
+| MMIO | Supplied device mappings and explicitly connected request/reply streams; no imported host functions. |
+| Interrupt controller | Supplied interrupt topology and value-based operations; no imported host functions. |
 | Block | Its VM's RAM, assigned interrupt and one fixed-capacity backing disk. |
 | Filesystem | Its VM's RAM, assigned interrupt and one directory preopen. |
 | Network | Its VM's RAM, assigned interrupt, policy-controlled WASI sockets/DNS, and warnings in the capped host log. |
 | Memory | Its VM's RAM, assigned interrupt and bounded reclamation of that RAM. |
 | Vsock | Its VM's RAM, assigned interrupt, supplied local service streams and secure randomness. |
 | Policy | Immutable policy configuration and host-submitted resolver results; no guest RAM, filesystem or sockets. |
+
+The MMIO bridge and software interrupt controller each run in a separate store.
+Native adapters validate their outputs before applying effects. Device connections
+can indirectly trigger host I/O; the services have no ambient host authority.
+These are capability and memory boundaries within the host process, not process
+isolation or protection against Wasmtime vulnerabilities.
 
 Components inherit no host environment, arguments or standard streams. Devices
 can read and corrupt their own VM's RAM: component isolation protects the host

@@ -112,7 +112,7 @@ impl<H: 'static> StreamConsumer<H> for EventSink {
 #[derive(Clone)]
 pub struct VsockChannel {
     close: Shared<BoxFuture<'static, Result<(), String>>>,
-    mmio: crate::component::vmm::mmio::MmioDevice,
+    mmio: crate::component::mmio::MmioDevice,
 }
 
 struct VsockWorkerGrant {
@@ -134,7 +134,7 @@ impl VsockWorkerGrant {
         child: impl FnOnce(VsockDeviceHost) -> crate::box_runtime::DeviceWorker<VsockDeviceHost>,
     ) -> wasmtime::Result<(
         crate::box_runtime::DeviceWorker<VsockDeviceHost>,
-        crate::component::vmm::mmio::Serve,
+        crate::component::mmio::Serve,
     )> {
         let device_host = VsockDeviceHost::new(
             self.ram.resolve()?,
@@ -545,10 +545,10 @@ mod tests {
                 crate::box_runtime::store::BoxHost::new(),
             )
             .expect("runtime");
-            let router =
-                wasmtime::component::Component::new(&engine, crate::test_fixtures::wasm::VMM)
-                    .expect("router component");
-            runtime.initialize_vmm(&router).await.expect("router");
+            let mmio =
+                wasmtime::component::Component::new(&engine, crate::test_fixtures::wasm::MMIO)
+                    .expect("MMIO service component");
+            runtime.initialize_mmio(&mmio).await.expect("MMIO service");
             let ram = GuestRam::new(4096).expect("test RAM maps");
             let artifact = crate::test_fixtures::trusted_artifacts().vsock();
             let channel = VsockChannel::from_trusted_artifact(
@@ -636,9 +636,9 @@ mod tests {
         let mut runtime =
             crate::box_runtime::BoxRuntime::new(&engine, crate::box_runtime::store::BoxHost::new())
                 .unwrap();
-        let router =
-            wasmtime::component::Component::new(&engine, crate::test_fixtures::wasm::VMM).unwrap();
-        runtime.initialize_vmm(&router).await.unwrap();
+        let mmio =
+            wasmtime::component::Component::new(&engine, crate::test_fixtures::wasm::MMIO).unwrap();
+        runtime.initialize_mmio(&mmio).await.unwrap();
         let artifact = crate::test_fixtures::trusted_artifacts().vsock();
         let channel = crate::component::vsock::VsockChannel::from_trusted_artifact(
             &mut runtime,

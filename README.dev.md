@@ -14,7 +14,7 @@ and writable `/dev/kvm`.
 Install the separate component toolchain and validator:
 
 ```sh
-rustup toolchain install nightly-2026-09-16 --component rustfmt,clippy --target wasm32-wasip3
+rustup toolchain install nightly-2026-09-16 --component rustfmt,clippy --target wasm32-unknown-unknown
 cargo install wasm-tools --version 1.248.0 --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
 make dist
 ```
@@ -49,17 +49,18 @@ checkouts require symlink privileges and `core.symlinks=true`.
 Runtime derives the fixed machine layout and asks platform to create the VM,
 RAM, disks and vCPUs. A short-lived boot component plans kernel placement;
 runtime validates its writes and result before CPUs start. The VMM component
-then owns exit interpretation, MMIO routing and lifecycle decisions. Device
-components run in independent stores and communicate through bounded scalar
-bridges. Hypervisor operations and authority checks remain native. See the
+then owns exit interpretation and lifecycle decisions. MMIO routing and software
+interrupt emulation run in separate stores with no imported host functions. Device
+components connect to the MMIO store through bounded request/reply streams. Hypervisor operations and authority checks remain native. See the
 [security model](docs/security.md) for trust boundaries and resource limits.
 
 Runtime entry points live in `terra-runtime::orchestration`; `machine` owns
 layout, validated machine configuration, and conversion to native VM configuration.
 A prepared VM runs through `PreparedVm::run`, which keeps its component runtime
 and outcome observer paired. `box_runtime/setup.rs` owns device preparation and
-startup sequencing. `component/vmm.rs` initializes the VMM; `component/vmm/mmio`
-handles native MMIO requests, and `component/vmm/vcpu.rs` hosts the vCPU rendezvous.
+startup sequencing. `component/vmm.rs` initializes the VMM; `component/mmio.rs` owns routing and device
+streams, and `component/interrupt_controller.rs` validates interrupt effects before
+native injection. `component/vmm/vcpu.rs` hosts the vCPU rendezvous.
 Device module roots own registration and selected public exports; private
 `bindings.rs` files hold generated interfaces, and `host.rs` implements native imports.
 Network socket authorization lives in `component/network/authorization.rs`;

@@ -79,13 +79,21 @@ pub async fn prepare(mut input: VmInput) -> Result<PreparedVm, String> {
     let native_handle = machine.machine();
     match capabilities.interrupt_mode {
         InterruptMode::SoftwareIoapic => {
+            let controller = input
+                .artifacts
+                .interrupt_controller()
+                .deserialize(runtime.store.engine())
+                .map_err(|error| error.to_string())?;
             let inject = Arc::clone(&native_handle);
             let interrupts = runtime
-                .grant_ioapic(Arc::new(move |interrupt| {
-                    inject
-                        .request_x86_interrupt(interrupt.vector, interrupt.destination)
-                        .map_err(wasmtime::Error::msg)
-                }))
+                .grant_ioapic(
+                    &controller,
+                    Arc::new(move |interrupt| {
+                        inject
+                            .request_x86_interrupt(interrupt.vector, interrupt.destination)
+                            .map_err(wasmtime::Error::msg)
+                    }),
+                )
                 .await
                 .map_err(|error| error.to_string())?;
             devices::assemble_devices(
@@ -119,9 +127,14 @@ pub async fn prepare(mut input: VmInput) -> Result<PreparedVm, String> {
             .map_err(|error| error.to_string());
         }
         InterruptMode::X86IrqLines => {
+            let controller = input
+                .artifacts
+                .interrupt_controller()
+                .deserialize(runtime.store.engine())
+                .map_err(|error| error.to_string())?;
             let inject = Arc::clone(&native_handle);
             let interrupts = runtime
-                .grant_irq_lines(move |irq, level| {
+                .grant_irq_lines(&controller, move |irq, level| {
                     inject
                         .inject_interrupt(irq, level)
                         .map_err(wasmtime::Error::msg)
@@ -214,7 +227,7 @@ fn start_native_vcpus(
 
 struct RuntimeVcpu {
     native: crate::component::vmm::NativeVcpu,
-    ioapic: Option<crate::component::vmm::interrupts::IoApicHandle>,
+    ioapic: Option<crate::component::interrupt_controller::IoApicHandle>,
 }
 
 impl RuntimeVcpu {
@@ -227,7 +240,7 @@ impl RuntimeVcpu {
 
     fn with_ioapic(
         native: crate::component::vmm::NativeVcpu,
-        ioapic: crate::component::vmm::interrupts::IoApicHandle,
+        ioapic: crate::component::interrupt_controller::IoApicHandle,
     ) -> Self {
         Self {
             native,
@@ -290,6 +303,7 @@ async fn boot_prepared<M: crate::component::vmm::VirtualMachine>(
         )
         .await?;
     prepared.accept_boot(entry)?;
+    runtime.initialize_mmio_artifact(&input.artifacts).await?;
     runtime.initialize_vmm_artifact(&input.artifacts).await?;
     runtime.attach_machine(prepared).await
 }

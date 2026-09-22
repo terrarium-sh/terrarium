@@ -52,7 +52,7 @@ pub(crate) async fn instantiate(
 ) -> wasmtime::Result<crate::component::StandaloneDevice> {
     let mut runtime =
         crate::box_runtime::BoxRuntime::new(engine, crate::box_runtime::store::BoxHost::new())?;
-    crate::component::vmm::initialize_test_vmm(&mut runtime).await?;
+    crate::component::mmio::initialize_test_mmio(&mut runtime).await?;
     let channel = register_device(&mut runtime, host, component, interrupt)?;
     Ok(crate::component::StandaloneDevice {
         _runtime: Arc::new(runtime.prepare().await?.start()),
@@ -91,7 +91,7 @@ async fn create_worker(
     interrupt: InterruptCallback,
 ) -> wasmtime::Result<(
     crate::box_runtime::DeviceWorker<DeviceContext>,
-    crate::component::vmm::mmio::Serve,
+    crate::component::mmio::Serve,
 )> {
     let wake = child.store.data().interrupt_notification();
     let linker = mem_component_linker(child.store.engine())?;
@@ -145,9 +145,9 @@ mod tests {
         let mut runtime =
             crate::box_runtime::BoxRuntime::new(&engine, crate::box_runtime::store::BoxHost::new())
                 .expect("box runtime");
-        crate::component::vmm::initialize_test_vmm(&mut runtime)
+        crate::component::mmio::initialize_test_mmio(&mut runtime)
             .await
-            .expect("MMIO router");
+            .expect("MMIO service");
         let interrupts = Arc::new(tokio::sync::Notify::new());
         let notification = Arc::clone(&interrupts);
         let channel = crate::component::mem::register_device(

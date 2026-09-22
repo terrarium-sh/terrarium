@@ -37,6 +37,83 @@ fn assert_resource<T: 'static>(
     assert_eq!(result.is_ok(), allowed, "{interface}: {:?}", result.err());
 }
 
+fn assert_function_denied<T: 'static>(
+    linker: &Linker<T>,
+    engine: &wasmtime::Engine,
+    interface: &str,
+    function: &str,
+    signature: &str,
+) {
+    let component = Component::new(
+        engine,
+        format!(
+            r#"(component
+                (import "{interface}" (instance (export "{function}" (func {signature}))))
+            )"#
+        ),
+    )
+    .expect("function import probe compiles");
+    assert!(
+        linker.instantiate_pre(&component).is_err(),
+        "{interface}.{function} must not be linked"
+    );
+}
+
+fn assert_unused_clock_functions<T: 'static>(linker: &Linker<T>, engine: &wasmtime::Engine) {
+    assert_function_denied(
+        linker,
+        engine,
+        "wasi:clocks/monotonic-clock@0.3.1",
+        "get-resolution",
+        "(result u64)",
+    );
+    assert_function_denied(
+        linker,
+        engine,
+        "wasi:clocks/monotonic-clock@0.3.1",
+        "wait-until",
+        "(param \"when\" u64)",
+    );
+}
+
+fn assert_system_clock_now_denied<T: 'static>(linker: &Linker<T>, engine: &wasmtime::Engine) {
+    let component = Component::new(
+        engine,
+        r#"(component
+            (type $api (instance
+                (type (record (field "seconds" s64) (field "nanoseconds" u32)))
+                (export "instant" (type (eq 0)))
+                (type (func (result 1)))
+                (export "now" (func (type 2)))))
+            (import "wasi:clocks/system-clock@0.3.1" (instance $api (type $api))))"#,
+    )
+    .expect("system clock probe compiles");
+    assert!(
+        linker.instantiate_pre(&component).is_err(),
+        "wasi:clocks/system-clock.now must not be linked"
+    );
+}
+
+#[test]
+fn clock_linkers_exclude_unused_methods() {
+    let engine = device_engine().expect("device engine");
+    let fs = fs_component_linker::<terra_runtime::component::fs::FsHost>(&engine)
+        .expect("filesystem linker");
+    let network = network_component_linker::<NetworkHost>(&engine).expect("network linker");
+    let vsock = vsock_component_linker::<VsockDeviceHost>(&engine).expect("vsock linker");
+    assert_unused_clock_functions(&fs, &engine);
+    assert_unused_clock_functions(&network, &engine);
+    assert_unused_clock_functions(&vsock, &engine);
+    assert_function_denied(
+        &fs,
+        &engine,
+        "wasi:clocks/monotonic-clock@0.3.1",
+        "now",
+        "(result u64)",
+    );
+    assert_system_clock_now_denied(&fs, &engine);
+}
+
 fn assert_ram_import_denied<T: 'static>(linker: &Linker<T>, engine: &wasmtime::Engine) {
     let component = Component::new(
         engine,
@@ -98,6 +175,40 @@ fn wasi_filesystem_and_socket_resources_are_device_specific() {
             resource,
             resource != "descriptor",
         );
+    }
+}
+
+fn assert_method_unregistered<T: 'static>(linker: &Linker<T>, interface_name: &str, method: &str) {
+    let mut linker = linker.clone();
+    let mut interface = linker.instance(interface_name).expect("interface exists");
+    assert!(
+        interface
+            .func_wrap(method, |_, (): ()| -> wasmtime::Result<()> { Ok(()) })
+            .is_ok(),
+        "linker exposed {method}"
+    );
+}
+
+#[test]
+fn filesystem_and_socket_linkers_exclude_unused_resource_methods() {
+    let engine = device_engine().expect("device engine");
+    let filesystem = fs_component_linker::<terra_runtime::component::fs::FsHost>(&engine)
+        .expect("filesystem linker");
+    for method in [
+        "[method]descriptor.append-via-stream",
+        "[method]descriptor.advise",
+        "[method]descriptor.is-same-object",
+    ] {
+        assert_method_unregistered(&filesystem, "wasi:filesystem/types@0.3.0", method);
+    }
+    let network = network_component_linker::<NetworkHost>(&engine).expect("network linker");
+    for method in [
+        "[method]tcp-socket.get-address-family",
+        "[method]tcp-socket.get-local-address",
+        "[method]udp-socket.get-send-buffer-size",
+        "[method]tcp-socket.set-listen-backlog-size",
+    ] {
+        assert_method_unregistered(&network, "wasi:sockets/types@0.3.0", method);
     }
 }
 
@@ -197,24 +308,33 @@ fn component_linkers_exclude_ungranted_interfaces() {
 }
 
 #[test]
-fn mmio_dispatcher_requires_no_device_capabilities() {
+fn service_components_receive_no_host_resources() {
     let engine = device_engine().expect("device engine");
-    let linker = terra_runtime::component::vmm::vmm_component_linker(&engine).expect("VMM linker");
-    let component =
-        Component::new(&engine, support::artifacts::wasm::VMM).expect("MMIO component compiles");
-    linker
-        .instantiate_pre(&component)
-        .expect("VMM component receives only its scoped platform imports");
+    let linker = Linker::<()>::new(&engine);
+    for (name, bytes) in [
+        ("MMIO", support::artifacts::wasm::MMIO),
+        (
+            "interrupt controller",
+            support::artifacts::wasm::INTERRUPT_CONTROLLER,
+        ),
+    ] {
+        let component = Component::new(&engine, bytes).expect("service component compiles");
+        linker
+            .instantiate_pre(&component)
+            .map_err(|error| format!("{name} requested host authority: {error:#}"))
+            .expect("service links without host authority");
+    }
 
     for (interface, resource) in [
         ("wasi:filesystem/types@0.3.1", "descriptor"),
         ("wasi:sockets/types@0.3.1", "tcp-socket"),
         ("wasi:sockets/types@0.3.1", "udp-socket"),
+        ("terra:mmio/virtualization@0.1.0", "vm"),
+        ("terra:mmio/platform@0.1.0", "vcpu"),
     ] {
         assert_resource(&linker, &engine, interface, resource, false);
     }
     assert_ram_import_denied(&linker, &engine);
-    assert_components(&linker, &engine, "router");
 }
 
 #[test]
@@ -273,6 +393,7 @@ fn assert_random_grants<T: 'static>(
 ) {
     for (interface, function, result, allowed) in [
         ("random", "get-random-u64", "u64", secure_random_allowed),
+        ("random", "get-random-bytes", "(list u8)", false),
         ("insecure", "get-insecure-random-u64", "u64", false),
         (
             "insecure-seed",

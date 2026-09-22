@@ -5,7 +5,7 @@ wasmtime::component::bindgen!({
     path: "../../components/network/wit",
     exports: { default: async },
     with: {
-        "terra:mmio/types@0.1.0": crate::component::vmm::bindings::types,
+        "terra:mmio/types@0.1.0": crate::component::mmio::bindings::canonical::types,
     },
 });
 

@@ -234,6 +234,8 @@ mod tests {
                 include_bytes!("../../../../build/terra-mem-component.cwasm"),
                 include_bytes!("../../../../build/terra-boot-component.cwasm"),
                 include_bytes!("../../../../build/terra-vmm-component.cwasm"),
+                include_bytes!("../../../../build/terra-mmio-component.cwasm"),
+                include_bytes!("../../../../build/terra-interrupt-controller-component.cwasm"),
             )
         };
         let input = super::VmInput {

@@ -70,11 +70,12 @@ ROOTFS_IMG_MIB := 16
 # recipe added later, for one line.
 .DELETE_ON_ERROR:
 
-COMPONENTS := block vsock network fs mem boot vmm policy
+COMPONENTS := block vsock network fs mem boot vmm mmio interrupt-controller policy
 COMPONENT_TARGETS := $(addprefix component-,$(COMPONENTS))
 COMPONENT_AOT_TARGETS := $(addsuffix -aot,$(COMPONENT_TARGETS))
 COMPONENT_MANIFEST := components/Cargo.toml
-COMPONENT_WASM_DIR := components/target/wasm32-wasip3/release
+COMPONENT_CORE_DIR := components/target/wasm32-unknown-unknown/release
+COMPONENT_WASM_DIR := components/target/wasm-components/release
 
 .PHONY: $(COMPONENT_TARGETS) $(COMPONENT_AOT_TARGETS) verify-source verify-host-components guest-assets check-guest-assets host-build host-dist source-dist verify-wit verify-dependency-boundaries verify-platform build verify verify-components verify-workspace dist man clean test-component-boot test-platform-native-vm test-component-vmm test-install check-zig
 
@@ -296,12 +297,14 @@ verify-wit:
 $(COMPONENT_TARGETS): verify-wit
 
 $(COMPONENT_TARGETS): component-%:
-	RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO_LOCKED) build --release --target wasm32-wasip3 --manifest-path $(COMPONENT_MANIFEST) -p terra-$*-component
-	wasm-tools validate --features cm-async $(COMPONENT_WASM_DIR)/terra_$*_component.wasm
+	RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO_LOCKED) build --release --target wasm32-unknown-unknown --manifest-path $(COMPONENT_MANIFEST) -p terra-$*-component
+	mkdir -p $(COMPONENT_WASM_DIR)
+	wasm-tools component new $(COMPONENT_CORE_DIR)/terra_$(subst -,_,$*)_component.wasm -o $(COMPONENT_WASM_DIR)/terra_$(subst -,_,$*)_component.wasm
+	wasm-tools validate --features cm-async $(COMPONENT_WASM_DIR)/terra_$(subst -,_,$*)_component.wasm
 
 $(COMPONENT_AOT_TARGETS): component-%-aot: component-%
 	mkdir -p $(BUILD)
-	$(CARGO_LOCKED) run --target $(TERRA_TARGET) -p terra-runtime --features compiler --example precompile-component -- $(COMPONENT_WASM_DIR)/terra_$*_component.wasm $(BUILD)/terra-$*-component.cwasm $(if $(filter policy,$*),--policy,)
+	$(CARGO_LOCKED) run --target $(TERRA_TARGET) -p terra-runtime --features compiler --example precompile-component -- $(COMPONENT_WASM_DIR)/terra_$(subst -,_,$*)_component.wasm $(BUILD)/terra-$*-component.cwasm $(if $(filter policy,$*),--policy,)
 
 test-component-boot: $(COMPONENT_AOT_TARGETS) $(KERNEL_GZ) $(ROOTFS_IMG) $(BOOT_IMG)
 	$(CARGO_LOCKED) test $(TEST_FLAGS) -p terra-runtime --lib -- --ignored --nocapture
@@ -359,8 +362,9 @@ verify-host-components: check-guest-assets $(COMPONENT_AOT_TARGETS)
 
 verify-components verify-host-components:
 	@status=0; \
+	python3 -B scripts/check-component-authority.py || $(CHECK_FAILURE); \
 	RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO) fmt --manifest-path $(COMPONENT_MANIFEST) -- --check || $(CHECK_FAILURE); \
-	RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO_LOCKED) clippy --workspace --target wasm32-wasip3 --manifest-path $(COMPONENT_MANIFEST) -- -D warnings || $(CHECK_FAILURE); \
+	RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO_LOCKED) clippy --workspace --target wasm32-unknown-unknown --manifest-path $(COMPONENT_MANIFEST) -- -D warnings || $(CHECK_FAILURE); \
 	RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO_LOCKED) clippy --workspace --all-targets --target $(NATIVE) --manifest-path $(COMPONENT_MANIFEST) -- -D warnings || $(CHECK_FAILURE); \
 	RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO_LOCKED) test $(TEST_FLAGS) --workspace --target $(NATIVE) --manifest-path $(COMPONENT_MANIFEST) || $(CHECK_FAILURE); \
 	exit $$status

@@ -66,12 +66,18 @@ impl crate::box_runtime::store::StoreHost for VsockDeviceHost {}
 pub fn vsock_component_linker<T: WasiView + AsMut<VsockDeviceHost> + 'static>(
     engine: &Engine,
 ) -> wasmtime::Result<wasmtime::component::Linker<T>> {
-    use wasmtime_wasi::{
-        p3::bindings::random::random as random_bindings,
-        random::{WasiRandom, WasiRandomView},
-    };
+    use wasmtime_wasi::{p3::bindings::random::random, random::WasiRandomView};
     let mut linker = device_component_linker(engine)?;
-    random_bindings::add_to_linker::<T, WasiRandom>(&mut linker, WasiRandomView::random)?;
+    crate::component::clocks::add_monotonic_now_and_wait_for(&mut linker)?;
+    crate::component::clocks::add_system_clock_now(&mut linker)?;
+    linker.instance("wasi:random/random@0.3.0")?.func_wrap(
+        "get-random-u64",
+        |mut store, (): ()| {
+            Ok((random::Host::get_random_u64(WasiRandomView::random(
+                store.data_mut(),
+            ))?,))
+        },
+    )?;
     terra::vsock::host_service::add_to_linker::<T, VsockHost>(&mut linker, |host| {
         host.as_mut().vsock_service_mut()
     })?;

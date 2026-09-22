@@ -1,0 +1,15 @@
+[package]
+name = "terra-mmio-component"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+futures-util = { version = "0.3", default-features = false, features = ["alloc", "std"] }
+wit-bindgen = { workspace = true, features = ["async-spawn", "inter-task-wakeup"] }
+terra-limits = { path = "../../crates/terra-limits" }

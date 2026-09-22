@@ -26,8 +26,9 @@ pub use store::{
 
 pub(crate) const BOX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const MAX_BOX_COMPONENTS: usize = terra_limits::MAX_DEVICES;
+const MAX_BOX_COMPONENT_WORKERS: usize = MAX_BOX_COMPONENTS + 2;
 const MAX_BOX_COMPONENT_LOOPS: usize =
-    MAX_BOX_COMPONENTS * 3 + terra_limits::MAX_VCPUS as usize + 2;
+    MAX_BOX_COMPONENTS * 3 + terra_limits::MAX_VCPUS as usize + 4;
 const EPOCH_TICK_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Keeps the runtime engine's epoch interruption advancing.
@@ -89,6 +90,8 @@ pub(crate) type ComponentLoop<T = BoxHost> = Box<
 pub struct BoxRuntime {
     pub store: Store<BoxHost>,
     pub(crate) vmm: Option<crate::component::vmm::VmmInstance>,
+    pub(crate) mmio: Option<crate::component::mmio::MmioInstance>,
+    pub(crate) interrupt_controller_configured: bool,
     epoch_clock: Arc<EpochClock>,
     memory_budget: Arc<BoxMemoryBudget>,
     shutdown: watch::Sender<bool>,
@@ -270,22 +273,21 @@ impl PreparedBoxRuntime {
             }
             lifecycle.component_failed();
             lifecycle.publish_outcome(crate::component::vmm::lifecycle::Outcome::ComponentFailed);
+            shutdown.send_replace(true);
+            if let Err(error) = root.recover_native_until(lifecycle.begin_shutdown()).await {
+                log::warn!("native recovery after component failure: {error:#}");
+            }
         }
         workers.shutdown().await;
-        if result.is_err()
-            && let Err(error) = root.recover_native().await
-        {
-            log::warn!("native recovery after component failure: {error:#}");
-        }
         result
     }
 
-    async fn recover_native(&mut self) -> wasmtime::Result<()> {
+    async fn recover_native_until(&mut self, deadline: std::time::Instant) -> wasmtime::Result<()> {
         self.store
             .data()
             .lifecycle
             .native_teardown()
-            .wait_until_finished()
+            .wait_until(deadline)
             .await
             .map_err(wasmtime::Error::msg)
     }

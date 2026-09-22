@@ -43,13 +43,16 @@ foreach ($asset in $guestAssets) {
     }
 }
 Invoke-Native rustup target add $Target
-Invoke-Native rustup toolchain install $componentToolchain --profile minimal --target wasm32-wasip3
+Invoke-Native rustup toolchain install $componentToolchain --profile minimal --target wasm32-unknown-unknown
 Invoke-Native cargo "+$componentToolchain" install wasm-tools --version 1.248.0 --locked
 
 foreach ($component in $components) {
-    Invoke-Native cargo "+$componentToolchain" build --locked --release --target wasm32-wasip3 --manifest-path components/Cargo.toml --package "terra-$component-component"
-    Invoke-Native wasm-tools validate --features cm-async "components/target/wasm32-wasip3/release/terra_$($component)_component.wasm"
-    $precompileArguments = @("run", "--locked", "--release", "--target", $Target, "-p", "terra-runtime", "--features", "compiler", "--example", "precompile-component", "--", "components/target/wasm32-wasip3/release/terra_$($component)_component.wasm", "build/terra-$component-component.cwasm")
+    $artifactStem = $component.Replace("-", "_")
+    Invoke-Native cargo "+$componentToolchain" build --locked --release --target wasm32-unknown-unknown --manifest-path components/Cargo.toml --package "terra-$component-component"
+    New-Item -ItemType Directory -Force components/target/wasm-components/release | Out-Null
+    Invoke-Native wasm-tools component new "components/target/wasm32-unknown-unknown/release/terra_$($artifactStem)_component.wasm" -o "components/target/wasm-components/release/terra_$($artifactStem)_component.wasm"
+    Invoke-Native wasm-tools validate --features cm-async "components/target/wasm-components/release/terra_$($artifactStem)_component.wasm"
+    $precompileArguments = @("run", "--locked", "--release", "--target", $Target, "-p", "terra-runtime", "--features", "compiler", "--example", "precompile-component", "--", "components/target/wasm-components/release/terra_$($artifactStem)_component.wasm", "build/terra-$component-component.cwasm")
     if ($component -eq "policy") {
         $precompileArguments += "--policy"
     }

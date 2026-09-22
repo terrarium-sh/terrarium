@@ -27,7 +27,9 @@ shared host definitions but receives no disk, filesystem, socket or VM interface
 | network | Bounded guest RAM, its interrupt, policy-controlled TCP/UDP and DNS |
 | vsock | Bounded guest RAM, its interrupt, prebound local clients, plan/stop streams, secure randomness |
 | boot | Kernel-image access and bounded boot writes for the prepared VM |
-| vmm | VM lifecycle, vCPU execution, device worker grants and lifecycle events |
+| vmm | VM lifecycle, vCPU execution, MMIO client and lifecycle events |
+| mmio | No host functions; supplied mappings and per-device streams |
+| interrupt-controller | No host functions; supplied topology and value-based operations |
 | policy | No Terra host interface, filesystem or sockets |
 
 Network uses monotonic timers for protocol polling; policy uses them for DNS
@@ -35,15 +37,13 @@ expiry. Vsock uses timers for retries and clock updates, system time for guest
 clock synchronization, and randomness for the guest seed. Filesystem WIT depends
 on clock types for timestamps; that dependency alone does not grant a clock call.
 
-The current Rust `wasm32-wasip3` artifacts also import WASI CLI and monotonic/system
-clocks, including components whose source world does not declare them. Native
-linkers must satisfy those imports to load the artifacts. CLI contexts do not
-inherit host arguments, environment, working directory or stdio. Removing these
-toolchain imports requires changing the component build/runtime, not unlinking a
-WIT dependency.
+Components build for `wasm32-unknown-unknown` to avoid implicit WASI services from
+the Rust standard library. Clock access uses explicit WIT imports only where
+protocol timers, DNS expiry or guest clock synchronization require it.
 
-`component_imports` pins the exact interface-name set of all eight built
-components. `component_grants` probes native linkers: only VMM receives VM/vCPU
+The [component authority inventory](../../docs/component-authority.md) records each
+remaining imported function and resource scope. `component_imports` checks every
+built component artifact. `component_grants` probes native linkers: only VMM receives VM/vCPU
 resources, only vsock receives secure randomness, and device-specific filesystem,
 socket and local-client resources remain restricted.
 

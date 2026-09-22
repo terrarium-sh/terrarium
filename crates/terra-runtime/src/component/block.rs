@@ -32,7 +32,7 @@ pub(crate) async fn instantiate(
 ) -> wasmtime::Result<crate::component::StandaloneDevice> {
     let mut runtime =
         crate::box_runtime::BoxRuntime::new(engine, crate::box_runtime::store::BoxHost::new())?;
-    crate::component::vmm::initialize_test_vmm(&mut runtime).await?;
+    crate::component::mmio::initialize_test_mmio(&mut runtime).await?;
     let channel = register_device(&mut runtime, host, component, readonly, interrupt)?;
     Ok(crate::component::StandaloneDevice {
         _runtime: Arc::new(runtime.prepare().await?.start()),
@@ -71,7 +71,7 @@ async fn create_worker(
     interrupt: InterruptCallback,
 ) -> wasmtime::Result<(
     crate::box_runtime::DeviceWorker<BlockHost>,
-    crate::component::vmm::mmio::Serve,
+    crate::component::mmio::Serve,
 )> {
     let wake = child.store.data().context.interrupt_notification();
     let linker = block_component_linker(child.store.engine())?;
@@ -154,16 +154,12 @@ mod tests {
         let mut runtime =
             crate::box_runtime::BoxRuntime::new(&engine, crate::box_runtime::store::BoxHost::new())
                 .expect("box runtime");
-        let router =
-            Component::new(&engine, crate::test_fixtures::wasm::VMM).expect("MMIO router compiles");
+        let mmio = Component::new(&engine, crate::test_fixtures::wasm::MMIO)
+            .expect("MMIO service compiles");
         runtime
-            .initialize_vmm(&router)
+            .initialize_mmio(&mmio)
             .await
-            .expect("MMIO router initializes");
-        runtime
-            .configure_mmio_vcpus(2)
-            .await
-            .expect("vCPU router setup");
+            .expect("MMIO service initializes");
         let writable = BlockHost::new(ram.clone(), DiskGrant::Mem(BoundedDisk::new(4096, false)));
         let readonly = BlockHost::new(ram, DiskGrant::Mem(BoundedDisk::new(8192, true)));
         let first = crate::component::block::register_device(
@@ -185,7 +181,7 @@ mod tests {
         let mut other_box =
             crate::box_runtime::BoxRuntime::new(&engine, crate::box_runtime::store::BoxHost::new())
                 .unwrap();
-        other_box.initialize_vmm(&router).await.unwrap();
+        other_box.initialize_mmio(&mmio).await.unwrap();
         let other_device = crate::component::block::register_device(
             &mut other_box,
             BlockHost::new(

@@ -8,7 +8,7 @@ wasmtime::component::bindgen!({
         "terra:host/memory@0.1.0": crate::component::bindings::memory,
         "terra:host/interrupt@0.1.0": crate::component::bindings::interrupt,
         "terra:host/diagnostics@0.1.0": crate::component::bindings::diagnostics,
-        "terra:mmio/types@0.1.0": crate::component::vmm::bindings::types,
+        "terra:mmio/types@0.1.0": crate::component::mmio::bindings::canonical::types,
     },
 });
 
