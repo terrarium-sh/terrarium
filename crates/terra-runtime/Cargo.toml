@@ -29,6 +29,7 @@ wasmtime = { version = "=48.0.2", default-features = false, features = ["async",
 wasmtime-wasi = { version = "=48.0.2", default-features = false, features = ["p3"] }
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 # Integration tests link the library without cfg(test).
 terra-runtime = { path = ".", features = ["test-support"] }

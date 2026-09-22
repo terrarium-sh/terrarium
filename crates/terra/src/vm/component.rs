@@ -8,7 +8,6 @@ use crate::state::BoxRef;
 use crate::{logs, sys};
 use anyhow::{Context, Result};
 use std::fs::File;
-#[cfg(windows)]
 use std::io::Write as _;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -196,7 +195,14 @@ pub async fn run(spec: &BootSpec, bx: &BoxRef, lock: &File) -> Result<ExitCode> 
     let worker_result = match prepared {
         Ok(prepared) => {
             log::info!("component VMM prepared; starting guest CPUs and devices");
-            prepared.run().await
+            prepared
+                .run(|| {
+                    let mut startup = std::io::stdout().lock();
+                    let _ = startup
+                        .write_all(&[terra_protocol::AGENT_READY_NOTIFICATION])
+                        .and_then(|()| startup.flush());
+                })
+                .await
         }
         Err(error) => Err(error),
     };

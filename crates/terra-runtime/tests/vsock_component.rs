@@ -376,6 +376,8 @@ struct ControlResult {
     consumed: u32,
     #[component(name = "exit-code")]
     exit_code: Option<i32>,
+    #[component(name = "agent-ready")]
+    agent_ready: bool,
 }
 
 #[derive(wasmtime::component::ComponentType, wasmtime::component::Lift)]
@@ -408,6 +410,17 @@ async fn lifecycle_decoding_stays_in_component_and_handles_bounded_frames() {
     let diagnostics: TypedFunc<(Vec<u8>,), ComponentResult<DiagnosticResult>> = instance
         .get_typed_func(&mut store, export("decode-diagnostics"))
         .unwrap();
+    let ready = control
+        .call_async(
+            &mut store,
+            (encode_frame(&LifecycleEvent::AgentReady).unwrap(),),
+        )
+        .await
+        .unwrap()
+        .0
+        .unwrap();
+    assert!(ready.agent_ready);
+    assert_eq!(ready.exit_code, None);
     let frame = encode_frame(&LifecycleEvent::Exit { code: -13 }).unwrap();
     let partial = control
         .call_async(&mut store, (frame[..frame.len() - 1].to_vec(),))
@@ -415,6 +428,7 @@ async fn lifecycle_decoding_stays_in_component_and_handles_bounded_frames() {
         .unwrap()
         .0
         .unwrap();
+    assert!(!partial.agent_ready);
     assert_eq!(partial.consumed, 0);
     assert_eq!(partial.exit_code, None);
     let result = control

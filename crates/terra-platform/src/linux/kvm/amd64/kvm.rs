@@ -31,6 +31,7 @@ pub enum KvmError {
     BadVcpuCount(usize),
     Memory(&'static str),
     Kvm(kvm_ioctls::Error),
+    Operation(&'static str, kvm_ioctls::Error),
     Bsp(ArchError),
     Dispatch(DispatchError),
     Timeout,
@@ -62,6 +63,7 @@ impl fmt::Display for KvmError {
             Self::BadVcpuCount(count) => write!(formatter, "unsupported vCPU count {count}"),
             Self::Memory(operation) => write!(formatter, "KVM memory {operation} failed"),
             Self::Kvm(error) => write!(formatter, "KVM error: {error}"),
+            Self::Operation(operation, error) => write!(formatter, "{operation}: {error}"),
             Self::Bsp(error) => write!(formatter, "configuring x86 boot CPU: {error}"),
             Self::Dispatch(error) => write!(formatter, "KVM exit dispatch failed: {error}"),
             Self::Timeout => formatter.write_str("KVM vCPU stop timed out"),
@@ -77,7 +79,7 @@ impl fmt::Display for KvmError {
 impl error::Error for KvmError {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match self {
-            Self::Kvm(error) => Some(error),
+            Self::Kvm(error) | Self::Operation(_, error) => Some(error),
             Self::Bsp(error) => Some(error),
             Self::Dispatch(error) => Some(error),
             Self::KickHandler(error) => Some(error),
@@ -92,6 +94,10 @@ impl fmt::Display for DispatchError {
             Self::Unexpected(exit) => write!(formatter, "unexpected exit {exit}"),
             Self::Fatal(exit, code) => write!(formatter, "fatal exit {exit} ({code:#x})"),
             Self::TooLarge => formatter.write_str("exit payload is too large"),
+            Self::Internal(suberror, data) => write!(
+                formatter,
+                "KVM internal error {suberror:#x}, data {data:x?}"
+            ),
         }
     }
 }
@@ -123,6 +129,18 @@ pub struct Machine {
     ram: GuestMemory,
 }
 
+fn validate_ram_range(base: u64, len: u64) -> Result<(), KvmError> {
+    let end = base
+        .checked_add(len)
+        .ok_or(KvmError::Memory("range overflow"))?;
+    if base < terra_limits::X86_KVM_TSS_ADDR + 3 * terra_limits::RAM_PAGE_SIZE
+        && end > terra_limits::X86_KVM_IDENTITY_MAP_ADDR
+    {
+        return Err(KvmError::Memory("overlaps reserved Intel KVM pages"));
+    }
+    Ok(())
+}
+
 impl Machine {
     /// Create the VM and map its RAM.
     pub fn new(
@@ -137,7 +155,16 @@ impl Machine {
         if vcpu_count > kvm.get_max_vcpus() {
             return Err(KvmError::BadVcpuCount(vcpu_count));
         }
-        let vm = kvm.create_vm()?;
+        let vm = kvm
+            .create_vm()
+            .map_err(|e| KvmError::Operation("KVM_CREATE_VM", e))?;
+        vm.set_tss_address(
+            usize::try_from(terra_limits::X86_KVM_TSS_ADDR)
+                .map_err(|_| KvmError::Memory("TSS address"))?,
+        )
+        .map_err(|e| KvmError::Operation("KVM_SET_TSS_ADDR", e))?;
+        vm.set_identity_map_address(terra_limits::X86_KVM_IDENTITY_MAP_ADDR)
+            .map_err(|e| KvmError::Operation("KVM_SET_IDENTITY_MAP_ADDR", e))?;
         let ram = if ram_base == terra_limits::X86_RAM_BASE {
             GuestMemory::allocate_x86_ram(ram_bytes)
         } else {
@@ -146,6 +173,7 @@ impl Machine {
         .ok_or(KvmError::Memory("map"))?;
         let machine = Self { vm, ram };
         for (slot, range) in machine.ram.ranges().into_iter().enumerate() {
+            validate_ram_range(range.addr, range.len)?;
             let host_addr = machine
                 .ram
                 .host_address(range.addr)
@@ -158,13 +186,16 @@ impl Machine {
                 userspace_addr: host_addr as u64,
             };
             // SAFETY: `host_addr` is the base of the live mapping owned by `machine.ram`.
-            unsafe { machine.vm.set_user_memory_region(region)? };
+            unsafe { machine.vm.set_user_memory_region(region) }
+                .map_err(|e| KvmError::Operation("KVM_SET_USER_MEMORY_REGION", e))?;
         }
         Ok(machine)
     }
 
     pub fn create_vcpu(&self, id: u64) -> Result<VcpuFd, KvmError> {
-        Ok(self.vm.create_vcpu(id)?)
+        self.vm
+            .create_vcpu(id)
+            .map_err(|e| KvmError::Operation("KVM_CREATE_VCPU", e))
     }
 
     #[must_use]
@@ -189,6 +220,7 @@ pub enum DispatchError {
     Unexpected(&'static str),
     /// Entry/hardware failure or an exit newer than this crate release.
     Fatal(&'static str, u64),
+    Internal(u32, Vec<u64>),
     TooLarge,
 }
 
@@ -431,6 +463,18 @@ pub fn run_kernel_vcpu(
             return Ok(outcome);
         }
         match vcpu.run() {
+            Ok(KvmVcpuExit::InternalError) => {
+                // SAFETY: KVM_EXIT_INTERNAL_ERROR selects the internal member of kvm_run.
+                let internal = unsafe { vcpu.get_kvm_run().__bindgen_anon_1.internal };
+                let count = usize::try_from(internal.ndata)
+                    .unwrap_or(internal.data.len())
+                    .min(internal.data.len());
+                return Err(DispatchError::Internal(
+                    internal.suberror,
+                    internal.data[..count].to_vec(),
+                )
+                .into());
+            }
             Ok(exit) => {
                 if let Some(outcome) = dispatch_kernel_exit(handler, stop, exit)? {
                     handler.finished(outcome);
@@ -444,7 +488,7 @@ pub fn run_kernel_vcpu(
                     return Ok(outcome);
                 }
             }
-            Err(error) => return Err(KvmError::Kvm(error)),
+            Err(error) => return Err(KvmError::Operation("KVM_RUN", error)),
         }
     }
 }
@@ -500,14 +544,15 @@ pub fn spawn_configured_vcpu_ready(
     + 'static,
 ) -> Result<VcpuHandle, KvmError> {
     let (ready_tx, ready_rx) = mpsc::sync_channel(0);
-    let handle = spawn_runner(machine, id, move |vcpu, stop| run(vcpu, stop, &ready_tx))?;
-    ready_rx
-        .recv_timeout(STOP_DEADLINE)
-        .map_err(|error| match error {
-            mpsc::RecvTimeoutError::Timeout => KvmError::Timeout,
-            mpsc::RecvTimeoutError::Disconnected => KvmError::ThreadGone,
-        })?;
-    Ok(handle)
+    let mut handle = spawn_runner(machine, id, move |vcpu, stop| run(vcpu, stop, &ready_tx))?;
+    match ready_rx.recv_timeout(STOP_DEADLINE) {
+        Ok(()) => Ok(handle),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(KvmError::Timeout),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            handle.stop(STOP_DEADLINE)?;
+            Err(KvmError::ThreadGone)
+        }
+    }
 }
 
 /// Park an application processor until the guest sends INIT/SIPI.
@@ -515,7 +560,8 @@ pub fn spawn_configured_vcpu_ready(
 pub fn park_ap(vcpu: &VcpuFd) -> Result<(), KvmError> {
     vcpu.set_mp_state(kvm_bindings::kvm_mp_state {
         mp_state: kvm_bindings::KVM_MP_STATE_UNINITIALIZED,
-    })?;
+    })
+    .map_err(|e| KvmError::Operation("KVM_SET_MP_STATE", e))?;
     Ok(())
 }
 
@@ -574,6 +620,21 @@ impl Drop for VcpuHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn intel_kvm_pages_are_outside_guest_ram() {
+        for bytes in [512 << 20, 4 << 30, 64 << 30] {
+            for range in terra_limits::x86_ram_layout(bytes).unwrap().regions() {
+                validate_ram_range(range.base, range.size).unwrap();
+            }
+        }
+        for base in [
+            terra_limits::X86_KVM_IDENTITY_MAP_ADDR,
+            terra_limits::X86_KVM_TSS_ADDR,
+        ] {
+            assert!(validate_ram_range(base, terra_limits::RAM_PAGE_SIZE).is_err());
+        }
+    }
 
     fn test_handle(
         run: impl FnOnce(&AtomicBool) -> Result<VcpuOutcome, KvmError> + Send + 'static,

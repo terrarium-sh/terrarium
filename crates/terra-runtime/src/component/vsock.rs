@@ -101,6 +101,7 @@ impl<H: 'static> StreamConsumer<H> for EventSink {
                 };
                 let _ = sender.try_send(bytes);
             }
+            VsockEvent::AgentReady => self.lifecycle.agent_ready(),
             VsockEvent::Exit(code) => {
                 self.lifecycle.guest_exit(code);
             }
@@ -302,12 +303,14 @@ async fn run_worker(
             shared_closing.load(Ordering::Acquire),
             "vsock worker stopped"
         );
-        if let Some(sink) = diagnostics {
-            sink.finish().await?;
-        }
         Ok(())
     }
     .await;
+    let flushed = match diagnostics {
+        Some(sink) => sink.finish().await.map_err(wasmtime::Error::from),
+        None => Ok(()),
+    };
+    let result = result.and(flushed);
     let error = result
         .as_ref()
         .err()
@@ -455,7 +458,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn saturated_diagnostics_do_not_delay_exit_events() {
+    async fn saturated_diagnostics_do_not_delay_readiness_or_exit() {
         let engine = crate::engine::device_engine().expect("engine");
         let mut store = Store::new(&engine, ());
         let lifecycle = crate::component::vmm::lifecycle::LifecycleHost::new();
@@ -467,6 +470,7 @@ mod tests {
             &mut store,
             vec![
                 VsockEvent::Diagnostic(b"slow disk\n".to_vec()),
+                VsockEvent::AgentReady,
                 VsockEvent::Exit(9),
             ],
         )
@@ -491,6 +495,7 @@ mod tests {
                     event,
                     crate::component::vmm::lifecycle::lifecycle_platform::Event::GuestExit(9)
                 ));
+                assert!(lifecycle.notifier().is_agent_ready());
             })
             .await
             .expect("event stream runs");

@@ -1262,3 +1262,38 @@ fn capacity_32_volumes_reaches_vdah() {
     let output = suite.boot_recipe(&recipe, "capacity-volumes", &[]);
     assert!(output.contains("VOLUME_CAPACITY_OK"), "{output}");
 }
+
+/// Readiness ends the boot deadline before either kind of hook runs. Detached
+/// startup acknowledges readiness while the startup hook is still blocked.
+#[test]
+#[ignore = "requires a native hypervisor and about 130 seconds for hooks"]
+fn agent_readiness_precedes_long_bake_and_start_hooks() {
+    let suite = Suite::new();
+    let project = suite.create_project_dir("server");
+    let share = suite.get_work_dir().join("hook-share");
+    std::fs::create_dir(&share).unwrap();
+    let recipe = suite.get_work_dir().join("server.yaml");
+    std::fs::write(&recipe, format!(
+        "hw: {{cpus: 2, mem_mib: 512}}\nhooks:\n  on_create:\n    - sleep 65; touch /baked\n  on_start:\n    - while [ ! -e /work/release ]; do sleep 1; done; touch /work/finished\nworkload:\n  entrypoint: /bin/sleep\n  args: [infinity]\nmounts:\n  - host: {}\n    guest: /work\n",
+        share.display(),
+    )).unwrap();
+    let project = project.to_str().unwrap();
+    let (_, setup_code) =
+        suite.run_terra_status(&[recipe.to_str().unwrap(), "setup", "--project", project]);
+    assert_eq!(setup_code, 0, "long bake was mistaken for a stalled boot");
+    let (_, start_code) = suite.run_terra_status(&["server", "-d", "--project", project]);
+    assert_eq!(start_code, 0);
+    assert!(
+        !share.join("finished").exists(),
+        "detached startup waited for hooks"
+    );
+    std::thread::sleep(Duration::from_secs(65));
+    std::fs::write(share.join("release"), b"").unwrap();
+    let (_, code) = suite.exec_in(
+        "server",
+        Path::new(project),
+        false,
+        &["/bin/sh", "-ec", "test -e /baked; test -e /work/finished"],
+    );
+    assert_eq!(code, 0, "long startup hook was mistaken for a stalled boot");
+}

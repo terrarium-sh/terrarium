@@ -95,6 +95,19 @@ impl KvmX86Vm {
     }
 }
 
+fn report_vcpu_failure(
+    id: usize,
+    handler: &mut dyn VcpuHandler,
+    outcome: Result<VcpuOutcome, KvmError>,
+) -> Result<VcpuOutcome, KvmError> {
+    if let Err(error) = &outcome {
+        let error = format!("vCPU {id} failed: {error}");
+        log::error!("{error}");
+        handler.failed(&error);
+    }
+    outcome
+}
+
 enum VcpuCommand {
     Start(Box<dyn VcpuHandler>, BootState),
     Stop,
@@ -134,11 +147,14 @@ impl NativePreparedVcpus {
                         else {
                             return Ok(VcpuOutcome::Stopped);
                         };
-                        setup_bsp_planned(&cpu_cpuid, vcpu, boot.entry, boot.boot_argument)
-                            .map_err(KvmError::Bsp)?;
-                        run_kernel_vcpu(vcpu, stop, handler.as_mut())
+                        let outcome =
+                            setup_bsp_planned(&cpu_cpuid, vcpu, boot.entry, boot.boot_argument)
+                                .map_err(KvmError::Bsp)
+                                .and_then(|()| run_kernel_vcpu(vcpu, stop, handler.as_mut()));
+                        report_vcpu_failure(id, handler.as_mut(), outcome)
                     } else {
-                        vcpu.set_cpuid2(&cpu_cpuid)?;
+                        vcpu.set_cpuid2(&cpu_cpuid)
+                            .map_err(|e| KvmError::Operation("KVM_SET_CPUID2", e))?;
                         park_ap(vcpu)?;
                         ready.send(()).map_err(|_| KvmError::ThreadGone)?;
                         let VcpuCommand::Start(mut handler, _) =
@@ -146,7 +162,8 @@ impl NativePreparedVcpus {
                         else {
                             return Ok(VcpuOutcome::Stopped);
                         };
-                        run_kernel_vcpu(vcpu, stop, handler.as_mut())
+                        let outcome = run_kernel_vcpu(vcpu, stop, handler.as_mut());
+                        report_vcpu_failure(id, handler.as_mut(), outcome)
                     }
                 },
             )?);
@@ -225,7 +242,7 @@ impl VcpuGroup {
         }
         Ok(outcomes
             .into_iter()
-            .map(|outcome| outcome.map(|_| ()).map_err(|error| format!("{error:?}")))
+            .map(|outcome| outcome.map(|_| ()).map_err(|error| error.to_string()))
             .collect())
     }
 }
@@ -245,6 +262,35 @@ impl Drop for VcpuGroup {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_failure_notifies_the_host_with_cpu_and_hardware_reason() {
+        struct Handler(Option<String>);
+        impl crate::vm::VcpuHandler for Handler {
+            fn exchange(
+                &mut self,
+                _: crate::vm::VcpuExit,
+            ) -> Result<crate::vm::VcpuAction, String> {
+                panic!("failure reporting must not re-enter the guest")
+            }
+            fn finished(&mut self, _: crate::vm::VcpuOutcome) {
+                panic!("failure must not become a successful stop")
+            }
+            fn failed(&mut self, error: &str) {
+                self.0 = Some(error.to_owned());
+            }
+        }
+        let mut handler = Handler(None);
+        let error = super::KvmError::Dispatch(super::super::kvm::DispatchError::Fatal(
+            "fail-entry",
+            0x8000_0021,
+        ));
+        let result = super::report_vcpu_failure(2, &mut handler, Err(error));
+        assert!(result.is_err());
+        let error = handler.0.unwrap();
+        assert!(error.contains("vCPU 2"));
+        assert!(error.contains("fail-entry (0x80000021)"));
+    }
+
     #[test]
     #[ignore = "needs /dev/kvm"]
     fn cpuid_matches_the_fixed_vcpu_count() {

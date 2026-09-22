@@ -23,6 +23,15 @@ pub const X86_RAM_BASE: u64 = 0;
 pub const X86_MMIO_BASE: u64 = 0xd000_0000;
 pub const X86_MMIO_STRIDE: u64 = 0x1000;
 pub const X86_RAM_LOW_END: u64 = X86_MMIO_BASE;
+pub const X86_KVM_IDENTITY_MAP_ADDR: u64 = 0xfffb_c000;
+pub const X86_KVM_TSS_ADDR: u64 = 0xfffb_d000;
+const _: () = {
+    assert!(X86_RAM_LOW_END <= X86_KVM_IDENTITY_MAP_ADDR);
+    assert!(X86_MMIO_BASE + X86_MAX_DEVICES as u64 * X86_MMIO_STRIDE <= X86_KVM_IDENTITY_MAP_ADDR);
+    assert!(0xfee0_1000 <= X86_KVM_IDENTITY_MAP_ADDR);
+    assert!(X86_KVM_IDENTITY_MAP_ADDR + RAM_PAGE_SIZE == X86_KVM_TSS_ADDR);
+    assert!(X86_KVM_TSS_ADDR + 3 * RAM_PAGE_SIZE <= X86_HIGH_RAM_BASE);
+};
 pub const X86_HIGH_RAM_BASE: u64 = 0x1_0000_0000;
 pub const X86_ZERO_PAGE: u64 = X86_RAM_BASE + 0x7000;
 pub const RAM_PAGE_SIZE: u64 = 4096;

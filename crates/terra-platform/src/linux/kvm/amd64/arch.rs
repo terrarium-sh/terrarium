@@ -1,6 +1,6 @@
 //! KVM x86 CPU state and interrupt routing for boot tables staged by Wasm.
 
-use kvm_bindings::{CpuId, KvmIrqRouting, kvm_regs, kvm_segment, kvm_sregs};
+use kvm_bindings::{CpuId, kvm_regs, kvm_segment, kvm_sregs};
 use kvm_ioctls::{VcpuFd, VmFd};
 use std::{error, fmt};
 
@@ -15,23 +15,21 @@ const IOAPIC_PINS: u32 = terra_limits::X86_IOAPIC_PINS;
 
 #[derive(Debug)]
 pub enum ArchError {
-    Kvm(kvm_ioctls::Error),
+    Kvm(&'static str, kvm_ioctls::Error),
     IrqOutOfRange(u32),
-    Routing,
 }
 
 impl From<kvm_ioctls::Error> for ArchError {
     fn from(error: kvm_ioctls::Error) -> Self {
-        Self::Kvm(error)
+        Self::Kvm("KVM", error)
     }
 }
 
 impl fmt::Display for ArchError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Kvm(error) => write!(formatter, "KVM error: {error}"),
+            Self::Kvm(operation, error) => write!(formatter, "{operation}: {error}"),
             Self::IrqOutOfRange(irq) => write!(formatter, "IRQ {irq} is outside the IOAPIC range"),
-            Self::Routing => formatter.write_str("allocating KVM IRQ routing"),
         }
     }
 }
@@ -39,8 +37,8 @@ impl fmt::Display for ArchError {
 impl error::Error for ArchError {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match self {
-            Self::Kvm(error) => Some(error),
-            Self::IrqOutOfRange(_) | Self::Routing => None,
+            Self::Kvm(_, error) => Some(error),
+            Self::IrqOutOfRange(_) => None,
         }
     }
 }
@@ -82,7 +80,9 @@ fn data_segment() -> kvm_segment {
 }
 
 fn configure_sregs(vcpu: &VcpuFd) -> Result<(), ArchError> {
-    let mut sregs: kvm_sregs = vcpu.get_sregs()?;
+    let mut sregs: kvm_sregs = vcpu
+        .get_sregs()
+        .map_err(|e| ArchError::Kvm("KVM_GET_SREGS", e))?;
     sregs.cs = code_segment();
     sregs.ds = data_segment();
     sregs.es = data_segment();
@@ -95,7 +95,8 @@ fn configure_sregs(vcpu: &VcpuFd) -> Result<(), ArchError> {
     sregs.cr3 = PML4_ADDR;
     sregs.cr4 = CR4_PAE;
     sregs.efer = EFER_LME_LMA;
-    vcpu.set_sregs(&sregs)?;
+    vcpu.set_sregs(&sregs)
+        .map_err(|e| ArchError::Kvm("KVM_SET_SREGS", e))?;
     Ok(())
 }
 
@@ -106,7 +107,8 @@ fn setup_regs(vcpu: &VcpuFd, entry: u64, boot_argument: u64) -> Result<(), ArchE
         rflags: 2,
         rsp: STACK_TOP,
         ..Default::default()
-    })?;
+    })
+    .map_err(|e| ArchError::Kvm("KVM_SET_REGS", e))?;
     Ok(())
 }
 
@@ -116,35 +118,26 @@ pub fn setup_bsp_planned(
     entry: u64,
     boot_argument: u64,
 ) -> Result<(), ArchError> {
-    vcpu.set_cpuid2(cpuid)?;
+    vcpu.set_cpuid2(cpuid)
+        .map_err(|e| ArchError::Kvm("KVM_SET_CPUID2", e))?;
     configure_sregs(vcpu)?;
     setup_regs(vcpu, entry, boot_argument)
 }
 
-fn unique_gsis(gsis: &[u32]) -> Result<Vec<u32>, ArchError> {
-    let mut unique = Vec::new();
+fn validate_device_gsis(gsis: &[u32]) -> Result<(), ArchError> {
     for gsi in gsis {
         if *gsi < IOAPIC_GSI_BASE || *gsi >= IOAPIC_PINS {
             return Err(ArchError::IrqOutOfRange(*gsi));
         }
-        if !unique.contains(gsi) {
-            unique.push(*gsi);
-        }
     }
-    Ok(unique)
+    Ok(())
 }
 
 pub fn setup_irqchip(vm: &VmFd, gsis: &[u32]) -> Result<(), ArchError> {
-    let gsis = unique_gsis(gsis)?;
-    let mut routing = KvmIrqRouting::new(gsis.len()).map_err(|_| ArchError::Routing)?;
-    for (entry, gsi) in routing.as_mut_slice().iter_mut().zip(gsis) {
-        entry.gsi = gsi;
-        entry.type_ = kvm_bindings::KVM_IRQ_ROUTING_IRQCHIP;
-        entry.u.irqchip.irqchip = kvm_bindings::KVM_IRQCHIP_IOAPIC;
-        entry.u.irqchip.pin = gsi;
-    }
-    vm.create_irq_chip()?;
-    vm.set_gsi_routing(&routing)?;
+    validate_device_gsis(gsis)?;
+    // KVM installs the legacy PIC and IOAPIC routes; replacing them with device grants drops IRQ 0.
+    vm.create_irq_chip()
+        .map_err(|e| ArchError::Kvm("KVM_CREATE_IRQCHIP", e))?;
     Ok(())
 }
 
@@ -153,11 +146,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn irq_routes_are_deduplicated_before_installation() {
-        assert_eq!(unique_gsis(&[11, 12, 11, 20, 12]).unwrap(), [11, 12, 20]);
-        assert!(matches!(
-            unique_gsis(&[10]),
-            Err(ArchError::IrqOutOfRange(10))
-        ));
+    fn device_gsis_stay_in_the_virtio_range() {
+        assert!(validate_device_gsis(&[11, 12, 11, 20, 23]).is_ok());
+        for gsi in [0, 10, 24, u32::MAX] {
+            assert!(matches!(
+                validate_device_gsis(&[gsi]),
+                Err(ArchError::IrqOutOfRange(irq)) if irq == gsi
+            ));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires /dev/kvm"]
+    #[allow(unsafe_code)]
+    fn device_grants_preserve_legacy_pic_routing() {
+        let kvm = kvm_ioctls::Kvm::new().unwrap();
+        let vm = kvm.create_vm().unwrap();
+        setup_irqchip(&vm, &[11, 12, 23]).unwrap();
+        let _vcpu = vm.create_vcpu(0).unwrap();
+        for (gsi, chip_id) in [
+            (0, kvm_bindings::KVM_IRQCHIP_PIC_MASTER),
+            (8, kvm_bindings::KVM_IRQCHIP_PIC_SLAVE),
+        ] {
+            vm.set_irq_line(gsi, true).unwrap();
+            let mut chip = kvm_bindings::kvm_irqchip {
+                chip_id,
+                ..Default::default()
+            };
+            vm.get_irqchip(&mut chip).unwrap();
+            // SAFETY: chip_id selects the PIC member populated by KVM_GET_IRQCHIP.
+            assert_ne!(unsafe { chip.chip.pic.irr } & 1, 0, "GSI {gsi}");
+            vm.set_irq_line(gsi, false).unwrap();
+        }
     }
 }

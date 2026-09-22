@@ -70,7 +70,7 @@ fn boot_probe_plan(vcpus: usize) -> Vec<u8> {
 async fn run_vm(
     input: super::orchestration::VmInput,
 ) -> Result<super::orchestration::VmOutcome, String> {
-    super::orchestration::prepare(input).await?.run().await
+    super::orchestration::prepare(input).await?.run(|| {}).await
 }
 
 fn agent_bridge_plan() -> Vec<u8> {

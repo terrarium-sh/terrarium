@@ -12,6 +12,8 @@ mod observation;
 
 use observation::finish_preparation;
 
+pub const GUEST_BOOT_TIMEOUT: Duration = Duration::from_secs(60);
+
 pub struct VmInput {
     pub kernel: Vec<u8>,
     pub boot_disk: Vec<u8>,
@@ -46,8 +48,10 @@ pub struct PreparedVm {
 }
 
 impl PreparedVm {
-    pub async fn run(self) -> Result<VmOutcome, String> {
-        self.observation.observe(self.runtime.start()).await
+    pub async fn run(self, agent_ready: impl FnOnce() + Send) -> Result<VmOutcome, String> {
+        self.observation
+            .observe(self.runtime.start(), agent_ready)
+            .await
     }
 }
 
@@ -77,6 +81,7 @@ pub async fn prepare(mut input: VmInput) -> Result<PreparedVm, String> {
     .map_err(|error| error.to_string())?;
 
     let native_handle = machine.machine();
+    let lifecycle = runtime.lifecycle_notifier();
     match capabilities.interrupt_mode {
         InterruptMode::SoftwareIoapic => {
             let controller = input
@@ -117,8 +122,11 @@ pub async fn prepare(mut input: VmInput) -> Result<PreparedVm, String> {
                 let handlers = controls
                     .into_iter()
                     .map(|vcpu| {
-                        Box::new(RuntimeVcpu::with_ioapic(vcpu, ioapic.clone()))
-                            as Box<dyn vm::VcpuHandler>
+                        Box::new(RuntimeVcpu::with_ioapic(
+                            vcpu,
+                            ioapic.clone(),
+                            lifecycle.clone(),
+                        )) as Box<dyn vm::VcpuHandler>
                     })
                     .collect();
                 start_native_vcpus(native, boot, handlers)
@@ -183,7 +191,9 @@ pub async fn prepare(mut input: VmInput) -> Result<PreparedVm, String> {
     finish_preparation(runtime, input.deadline, move |controls, boot| {
         let handlers = controls
             .into_iter()
-            .map(|vcpu| Box::new(RuntimeVcpu::plain(vcpu)) as Box<dyn vm::VcpuHandler>)
+            .map(|vcpu| {
+                Box::new(RuntimeVcpu::plain(vcpu, lifecycle.clone())) as Box<dyn vm::VcpuHandler>
+            })
             .collect();
         start_native_vcpus(native, boot, handlers)
     })
@@ -228,23 +238,30 @@ fn start_native_vcpus(
 struct RuntimeVcpu {
     native: crate::component::vmm::NativeVcpu,
     ioapic: Option<crate::component::interrupt_controller::IoApicHandle>,
+    lifecycle: crate::component::vmm::lifecycle::LifecycleNotifier,
 }
 
 impl RuntimeVcpu {
-    fn plain(native: crate::component::vmm::NativeVcpu) -> Self {
+    fn plain(
+        native: crate::component::vmm::NativeVcpu,
+        lifecycle: crate::component::vmm::lifecycle::LifecycleNotifier,
+    ) -> Self {
         Self {
             native,
             ioapic: None,
+            lifecycle,
         }
     }
 
     fn with_ioapic(
         native: crate::component::vmm::NativeVcpu,
         ioapic: crate::component::interrupt_controller::IoApicHandle,
+        lifecycle: crate::component::vmm::lifecycle::LifecycleNotifier,
     ) -> Self {
         Self {
             native,
             ioapic: Some(ioapic),
+            lifecycle,
         }
     }
 }
@@ -269,6 +286,10 @@ impl vm::VcpuHandler for RuntimeVcpu {
             }
             exit => vm::VcpuHandler::exchange(&mut self.native, exit),
         }
+    }
+
+    fn failed(&mut self, error: &str) {
+        self.lifecycle.native_failed(error);
     }
 
     fn finished(&mut self, outcome: vm::VcpuOutcome) {

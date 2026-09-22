@@ -19,7 +19,9 @@ pub const STOP_SIGNAL: u8 = b'S';
 pub const DEFAULT_STOP_GRACE_SECS: u64 = 30;
 
 /// Bump when a host and a running guest agent cannot safely communicate.
-pub const AGENT_PROTOCOL_VERSION: u8 = 2;
+pub const AGENT_PROTOCOL_VERSION: u8 = 3;
+
+pub const AGENT_READY_NOTIFICATION: u8 = b'R';
 
 /// The first bytes the agent writes on each accepted connection.
 /// `V` cannot be an escape byte because a session repaints immediately after the hello.
@@ -27,6 +29,7 @@ pub const AGENT_HELLO: [u8; 2] = [b'V', AGENT_PROTOCOL_VERSION];
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LifecycleEvent {
+    AgentReady,
     Diagnostic {
         #[serde(deserialize_with = "deserialize_diagnostic")]
         bytes: Vec<u8>,
@@ -146,6 +149,7 @@ mod tests {
     #[test]
     fn round_trip_lifecycle_events() {
         for event in [
+            LifecycleEvent::AgentReady,
             LifecycleEvent::Diagnostic {
                 bytes: b"hook output".to_vec(),
             },

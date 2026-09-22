@@ -83,6 +83,25 @@ plan over vsock, grows the box's ext4 images and enters the Alpine root with
 then configures mounts and runs hooks and the workload. Boot-plan environment
 values are sent through memory, not persisted as a host plan file.
 
+## Boot readiness and failures
+
+The guest boot deadline is 60 seconds (`terra_runtime::orchestration::GUEST_BOOT_TIMEOUT`),
+starting when guest execution starts. The agent sends `AgentReady` after
+initialization and before hooks. Readiness permanently cancels this deadline;
+long hooks keep their existing limits. `--agent-timeout` separately bounds a
+client's connection wait.
+
+Detached startup waits for the VM child's readiness notification. Its parent
+wait is bounded to 90 seconds: the guest deadline plus 30 seconds for preparation
+and cleanup. If the child never responds, the parent kills it and waits at most
+2 seconds for reaping. An uninterruptible child cannot hold the CLI indefinitely;
+the CLI reports a cleanup failure if the child still cannot exit. A child that exits before
+readiness retains its nonzero exit code, including `128 + signal` on Unix.
+
+Boot failures replay bounded host and guest log tails, explicitly noting empty
+guest diagnostics. Native KVM failures include the vCPU and operation or hardware
+exit reason, even if the guest agent never runs.
+
 ## Guest kernel and images
 
 [pins.mk](pins.mk) records source URLs and SHA-256 hashes for the kernel,

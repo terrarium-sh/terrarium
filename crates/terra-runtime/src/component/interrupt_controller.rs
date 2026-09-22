@@ -679,16 +679,14 @@ mod tests {
             )
             .is_ok()
         );
-        assert!(
-            validate_irq_change(
-                controller::IrqLevel {
-                    gsi: 4,
-                    asserted: true
-                },
-                &[3]
-            )
-            .is_err()
-        );
+        for gsi in [0, 8, 12, 24] {
+            let change = controller::IrqLevel {
+                gsi,
+                asserted: true,
+            };
+            assert!(validate_irq_change(change, &[11, 23]).is_err());
+            assert!(validate_irq_line(0, change, &[11, 23]).is_err());
+        }
     }
 
     #[test]

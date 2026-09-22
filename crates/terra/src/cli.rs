@@ -337,10 +337,10 @@ pub struct SyncArgs {
 /// (`exec`, `sync`).
 #[derive(Args, Debug)]
 pub struct AgentTimeoutArg {
-    /// Give up after this many seconds if the agent has not answered yet (it
-    /// answers once the workload is up, so a boot or an `on_create` bake is
-    /// waited out). Bounds only the wait for the agent, never the command's
-    /// own runtime. Default: wait for as long as the box is running.
+    /// Give up after this many seconds if the agent has not answered yet.
+    /// Bounds the client connection wait, never hooks or command runtime.
+    /// Default: wait while the box runs. New VMs separately require guest
+    /// agent readiness within 60 seconds.
     #[arg(long, value_name = "SECS")]
     pub agent_timeout: Option<u64>,
 }
@@ -471,8 +471,8 @@ pub struct BootArgs {
     #[arg(long)]
     pub root: bool,
 
-    /// Run headless in the background; manage with `terra <box> logs` and
-    /// `terra <box> stop`.
+    /// Run headless after the guest agent becomes ready, before startup hooks
+    /// finish. Boot fails if the agent is not ready within 60 seconds.
     #[arg(short = 'd', long)]
     pub detach: bool,
 
@@ -834,6 +834,33 @@ mod tests {
                 sub.get_name()
             );
         }
+    }
+
+    #[test]
+    fn boot_deadlines_in_help_and_developer_docs_match_runtime() {
+        let seconds = terra_runtime::orchestration::GUEST_BOOT_TIMEOUT.as_secs();
+        let command = Cli::command();
+        for name in ["detach", "agent_timeout"] {
+            let argument = command
+                .get_arguments()
+                .find(|arg| arg.get_id() == name)
+                .unwrap();
+            let help = argument
+                .get_long_help()
+                .or_else(|| argument.get_help())
+                .unwrap()
+                .to_string();
+            assert!(
+                help.contains(&format!("{seconds} seconds")),
+                "{name}: {help}"
+            );
+        }
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains(&format!("{seconds} seconds")));
+        assert!(
+            include_str!("../../../README.dev.md")
+                .contains(&format!("boot deadline is {seconds} seconds"))
+        );
     }
 
     /// The one exit code a script has to know about the bare form: a box that
