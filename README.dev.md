@@ -129,6 +129,14 @@ the companion `.sha256` records the archive checksum. The
 [kernel workflow](.github/workflows/kernel.yml) exports both architectures.
 Cross-compilation does not establish hardware boot acceptance.
 
+The x86 timer patch lets virtual guests calibrate the local APIC timer against
+a known TSC frequency when the APIC timer is always running, avoiding a PIT
+clockevent whose IRQ can register without a timer behind it. The existing
+fallback for failed legacy IRQ registration remains for WHP. The ignored
+`local_apic_timers_work_without_a_legacy_clockevent` boot test checks one and two
+vCPUs for active local timers and no IRQ 0 clockevent on x86 KVM; Intel acceptance
+still requires running it on the affected host.
+
 Root and volume images are prebaked ext4 files. Creating a box decompresses
 and sizes those images; the guest grows the filesystems. Runtime hosts need no
 filesystem formatting tools or image downloads. The kernel and boot disk are

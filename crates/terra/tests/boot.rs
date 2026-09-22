@@ -1263,6 +1263,41 @@ fn capacity_32_volumes_reaches_vdah() {
     assert!(output.contains("VOLUME_CAPACITY_OK"), "{output}");
 }
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+#[ignore = "requires x86 KVM with a known TSC frequency and an always-running APIC timer"]
+fn local_apic_timers_work_without_a_legacy_clockevent() {
+    let suite = Suite::new();
+    for cpus in [1, 2] {
+        let name = format!("pitless-{cpus}");
+        let recipe = suite.get_work_dir().join(format!("{name}.yaml"));
+        std::fs::write(
+            &recipe,
+            format!(
+                r#"hw: {{cpus: {cpus}, mem_mib: 512}}
+workload:
+  entrypoint: /bin/sh
+  args:
+    - -ec
+    - |
+      ! grep -Eq '^[[:space:]]*0:' /proc/interrupts
+      for timer in /sys/devices/system/clockevents/clockevent[0-9]*/current_device; do
+        grep -Eq '^lapic(-deadline)?$' "$timer"
+      done
+      before=$(awk '/LOC:/ {{for (i=2; i<=NF; i++) n+=$i; print n}}' /proc/interrupts)
+      sleep 1
+      after=$(awk '/LOC:/ {{for (i=2; i<=NF; i++) n+=$i; print n}}' /proc/interrupts)
+      test "$after" -gt "$before"
+      echo PITLESS_TIMERS_OK
+"#
+            ),
+        )
+        .unwrap();
+        let output = suite.boot_recipe(&recipe, &name, &[]);
+        assert!(output.contains("PITLESS_TIMERS_OK"), "{output}");
+    }
+}
+
 /// Readiness ends the boot deadline before either kind of hook runs. Detached
 /// startup acknowledges readiness while the startup hook is still blocked.
 #[test]
