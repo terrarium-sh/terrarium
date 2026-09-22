@@ -31,7 +31,7 @@ impl terra::mem::host::Host for DeviceContext {
 pub fn mem_component_linker<T: crate::component::context::DeviceHost>(
     engine: &wasmtime::Engine,
 ) -> wasmtime::Result<wasmtime::component::Linker<T>> {
-    let mut linker = crate::component::context::device_component_linker(engine)?;
+    let mut linker = wasmtime::component::Linker::new(engine);
     crate::component::context::add_device_imports(&mut linker, T::context)?;
     terra::mem::host::add_to_linker::<T, HasSelf<DeviceContext>>(&mut linker, T::context)?;
     Ok(linker)

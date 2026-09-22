@@ -5,7 +5,8 @@ from pathlib import Path
 root = Path(__file__).resolve().parent.parent
 shared = root / 'components/wit'
 links = [root / 'components/block/wit/host.wit']
-links.extend((root / 'components/vmm/wit').glob('*.wit'))
+for component in ('vmm', 'mmio', 'interrupt-controller'):
+    links.extend((root / f'components/{component}/wit').glob('*.wit'))
 for deps in [shared / 'terra/deps', *root.glob('components/*/wit/deps')]:
     links.extend(deps.iterdir())
 for link in links:

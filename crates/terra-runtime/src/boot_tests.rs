@@ -70,7 +70,7 @@ fn boot_probe_plan(vcpus: usize) -> Vec<u8> {
 async fn run_vm(
     input: super::orchestration::VmInput,
 ) -> Result<super::orchestration::VmOutcome, String> {
-    super::orchestration::prepare(input).await?.run().await
+    super::orchestration::prepare(input).await?.run(|| {}).await
 }
 
 fn agent_bridge_plan() -> Vec<u8> {
@@ -171,6 +171,38 @@ fn boot_network_policy() -> terra_network::PolicyHandle {
 /// userspace, and page cache with room to spare.
 const BOOT_RAM: u64 = 512 << 20;
 
+async fn boot_workload(
+    ram_bytes: u64,
+    workload: Vec<String>,
+) -> Result<super::orchestration::VmOutcome, String> {
+    let vcpus = if std::env::var_os("TERRA_BOOT_ONE_CPU").is_some() {
+        1
+    } else {
+        2
+    };
+    let (kernel, boot_disk, root_path) = kernel_boot_assets();
+    run_vm(super::orchestration::VmInput {
+        component_memory_limits: crate::box_runtime::ComponentMemoryLimits::default(),
+        kernel,
+        boot_disk,
+        root_disk: root_path.to_path_buf(),
+        volume_disks: Vec::new(),
+        shares: Vec::new(),
+        plan: boot_plan(terra_protocol::PlanMode::Run, Vec::new(), workload, false),
+        artifacts: crate::test_fixtures::trusted_artifacts(),
+        network_policy: boot_network_policy(),
+        port_mappings: Vec::new(),
+        ram_bytes,
+        vcpus,
+        deadline: Some(std::time::Duration::from_secs(150)),
+        hard_stop: None,
+        listener: None,
+        control: None,
+        diagnostics: None,
+    })
+    .await
+}
+
 /// Phase 1B gate: the pinned kernel boots on two vCPUs with both disks
 /// behind real block components, the agent dials the control port over
 /// the native vsock bridge, reads its plan, proves both CPUs online,
@@ -215,36 +247,27 @@ async fn kernel_boots_to_agent_ready() {
 #[tokio::test]
 #[ignore = "requires a native hypervisor and `make test-component-boot`"]
 async fn kernel_reports_free_pages_after_boot() {
-    let vcpus: usize = if std::env::var_os("TERRA_BOOT_ONE_CPU").is_some() {
-        1
-    } else {
-        2
-    };
-    let (kernel, boot_disk, root_path) = kernel_boot_assets();
-    let outcome = run_vm(super::orchestration::VmInput {
-        component_memory_limits: crate::box_runtime::ComponentMemoryLimits::default(),
-        kernel,
-        boot_disk,
-        root_disk: root_path.to_path_buf(),
-        volume_disks: Vec::new(),
-        shares: Vec::new(),
-        plan: boot_plan(
-            terra_protocol::PlanMode::Run,
-            Vec::new(),
-            vec!["sleep".into(), "4".into()],
-            false,
-        ),
-        artifacts: crate::test_fixtures::trusted_artifacts(),
-        network_policy: boot_network_policy(),
-        port_mappings: Vec::new(),
-        hard_stop: None,
-        ram_bytes: 2048 << 20,
-        vcpus,
-        deadline: Some(std::time::Duration::from_secs(150)),
-        listener: None,
-        control: None,
-        diagnostics: None,
-    })
+    let outcome = boot_workload(2048 << 20, vec!["sleep".into(), "4".into()])
+        .await
+        .expect("worker runs");
+    assert_eq!(
+        outcome.exit_code,
+        Some(0),
+        "agent control outcome: {outcome:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a native hypervisor and `make test-component-boot`"]
+async fn kernel_boots_with_high_ram_above_the_mmio_hole() {
+    let outcome = boot_workload(
+        8 << 30,
+        vec![
+            "sh".into(),
+            "-ec".into(),
+            "awk '/MemTotal:/ { exit !($2 > 7000000) }' /proc/meminfo; mount -o remount,size=4G /dev/shm; dd if=/dev/zero of=/dev/shm/high-ram bs=1M count=3584; test $(stat -c %s /dev/shm/high-ram) -eq 3758096384; test $(stat -c %b /dev/shm/high-ram) -ge 7000000".into(),
+        ],
+    )
     .await
     .expect("worker runs");
     assert_eq!(

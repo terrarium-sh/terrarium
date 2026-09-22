@@ -7,16 +7,16 @@ const MAX_KERNEL_PREFIX_BYTES: usize = 64 * 1024;
 const MAX_KERNEL_BYTES: u64 = 64 * 1024 * 1024;
 pub(crate) const MAX_CMDLINE_BYTES: usize = 2048;
 const X86_HIMEM_START: u64 = 0x10_0000;
-const X86_ZERO_PAGE: u64 = 0x7000;
-const X86_CMDLINE: u64 = 0x20_000;
+const X86_ZERO_PAGE: u64 = terra_limits::X86_ZERO_PAGE;
+const X86_CMDLINE: u64 = terra_limits::X86_RAM_BASE + 0x20_000;
 const X86_MP_TABLE: u64 = 0x9fc00;
 const X86_GDT: u64 = terra_limits::X86_GDT_ADDR;
 const X86_PML4: u64 = terra_limits::X86_PML4_ADDR;
-const X86_PDPT: u64 = 0xa000;
-const X86_PD: u64 = 0xb000;
+const X86_PDPT: u64 = terra_limits::X86_RAM_BASE + 0xa000;
+const X86_PAGE_DIRECTORY: u64 = terra_limits::X86_RAM_BASE + 0xb000;
 const X86_MMIO_SIZE: u64 = 0x200;
-const X86_MMIO_BASE: u64 = 0xd000_0000;
-const X86_MMIO_STRIDE: u64 = 0x1000;
+const X86_MMIO_BASE: u64 = terra_limits::X86_MMIO_BASE;
+const X86_MMIO_STRIDE: u64 = terra_limits::X86_MMIO_STRIDE;
 const X86_IRQ_BASE: u8 = 11;
 const X86_VOLUME_IRQS: [u32; 3] = [20, 21, 22];
 const X86_MOUNT_IRQS: [u32; 3] = [17, 18, 19];
@@ -116,8 +116,27 @@ fn end(base: u64, size: u64) -> Result<u64, Error> {
     base.checked_add(size).ok_or(Error::KernelLayout)
 }
 
-fn range_within(base: u64, size: u64, limit: u64) -> Result<(), Error> {
-    (end(base, size)? <= limit)
+fn x86_ram_regions(ram_bytes: u64) -> Result<Vec<(u64, u64)>, Error> {
+    terra_limits::x86_ram_layout(ram_bytes)
+        .map(|layout| {
+            layout
+                .regions()
+                .map(|region| (region.base, region.size))
+                .collect()
+        })
+        .ok_or(Error::InvalidRam)
+}
+
+fn range_in_regions(base: u64, size: u64, regions: &[(u64, u64)]) -> Result<(), Error> {
+    let end = end(base, size)?;
+    regions
+        .iter()
+        .any(|&(region_base, region_size)| {
+            region_base <= base
+                && region_base
+                    .checked_add(region_size)
+                    .is_some_and(|region_end| end <= region_end)
+        })
         .then_some(())
         .ok_or(Error::KernelLayout)
 }
@@ -242,91 +261,63 @@ fn validate_x86_devices(devices: &[Device]) -> Result<(), Error> {
     (phase == 4).then_some(()).ok_or(Error::InvalidDevice)
 }
 
-fn x86_zero_page(ram_bytes: u64, command_line_len: usize) -> Result<Vec<u8>, Error> {
+fn x86_zero_page(regions: &[(u64, u64)], command_line_len: usize) -> Result<Vec<u8>, Error> {
     let command_line_len =
         u32::try_from(command_line_len).map_err(|_| Error::CommandLineTooLong)?;
-    let high_memory = ram_bytes
-        .checked_sub(X86_HIMEM_START)
-        .ok_or(Error::InvalidRam)?;
     let mut page = vec![0; usize::try_from(PAGE_SIZE).map_err(|_| Error::BootDataTooLarge)?];
-    page[0x1e8] = 2;
+    let low_end = end(regions[0].0, regions[0].1)?;
+    let e820 = [
+        (regions[0].0, X86_MP_TABLE - regions[0].0),
+        (X86_HIMEM_START, low_end - X86_HIMEM_START),
+    ]
+    .into_iter()
+    .chain(regions.iter().skip(1).copied())
+    .collect::<Vec<_>>();
+    page[0x1e8] = u8::try_from(e820.len()).map_err(|_| Error::BootDataTooLarge)?;
     page[0x1fe..0x200].copy_from_slice(&0xaa55_u16.to_le_bytes());
     page[0x202..0x206].copy_from_slice(&0x5372_6448_u32.to_le_bytes());
     page[0x210] = 0xff;
-    page[0x228..0x22c].copy_from_slice(&0x20_000_u32.to_le_bytes());
+    page[0x228..0x22c].copy_from_slice(
+        &u32::try_from(X86_CMDLINE)
+            .map_err(|_| Error::BootDataTooLarge)?
+            .to_le_bytes(),
+    );
     page[0x238..0x23c].copy_from_slice(&command_line_len.to_le_bytes());
-    page[0x2d0..0x2d8].copy_from_slice(&0_u64.to_le_bytes());
-    page[0x2d8..0x2e0].copy_from_slice(&X86_MP_TABLE.to_le_bytes());
-    page[0x2e0..0x2e4].copy_from_slice(&1_u32.to_le_bytes());
-    page[0x2e4..0x2ec].copy_from_slice(&X86_HIMEM_START.to_le_bytes());
-    page[0x2ec..0x2f4].copy_from_slice(&high_memory.to_le_bytes());
-    page[0x2f4..0x2f8].copy_from_slice(&1_u32.to_le_bytes());
+    for (index, (base, size)) in e820.into_iter().enumerate() {
+        let offset = 0x2d0 + index * 20;
+        page[offset..offset + 8].copy_from_slice(&base.to_le_bytes());
+        page[offset + 8..offset + 16].copy_from_slice(&size.to_le_bytes());
+        page[offset + 16..offset + 20].copy_from_slice(&1_u32.to_le_bytes());
+    }
     Ok(page)
 }
 
-fn x86_page_tables(ram_bytes: u64) -> Result<Vec<GuestWrite>, Error> {
-    let regions = [
-        (0, ram_bytes),
-        (X86_MMIO_BASE, X86_MMIO_STRIDE * MAX_DEVICES as u64),
-        (0xfec0_0000, 0x20_0000),
-        (0xfee0_0000, 0x20_0000),
-    ];
-    let mut pages = Vec::new();
-    for (base, len) in regions {
-        let start = base / X86_PAGE_2M;
-        let end = end(base, len)?.div_ceil(X86_PAGE_2M);
-        pages.extend(start..end);
-    }
-    let table_count = pages
-        .iter()
-        .map(|page| page / X86_ENTRIES_PER_TABLE)
-        .max()
-        .unwrap_or(0)
-        .checked_add(1)
-        .ok_or(Error::BootDataTooLarge)?;
-    let pd_bytes = table_count
-        .checked_mul(PAGE_SIZE)
-        .ok_or(Error::BootDataTooLarge)?;
-    if end(X86_PD, pd_bytes)? > X86_CMDLINE {
-        return Err(Error::BootDataTooLarge);
-    }
+fn x86_page_tables() -> Result<Vec<GuestWrite>, Error> {
     let page_size = usize::try_from(PAGE_SIZE).map_err(|_| Error::BootDataTooLarge)?;
     let mut pml4 = vec![0; page_size];
     pml4[..8].copy_from_slice(&(X86_PDPT | X86_PAGE_TABLE_ENTRY).to_le_bytes());
     let mut pdpt = vec![0; page_size];
-    for table in 0..table_count {
-        let offset = usize::try_from(table.checked_mul(8).ok_or(Error::BootDataTooLarge)?)
-            .map_err(|_| Error::BootDataTooLarge)?;
-        let address = X86_PD
-            .checked_add(
-                table
-                    .checked_mul(PAGE_SIZE)
-                    .ok_or(Error::BootDataTooLarge)?,
-            )
-            .ok_or(Error::BootDataTooLarge)?;
+    let mut directories = Vec::with_capacity(4);
+    for directory in 0..4_u64 {
+        let address = X86_PAGE_DIRECTORY + directory * PAGE_SIZE;
+        let offset = usize::try_from(directory * 8).map_err(|_| Error::BootDataTooLarge)?;
         pdpt[offset..offset + 8].copy_from_slice(&(address | X86_PAGE_TABLE_ENTRY).to_le_bytes());
-    }
-    let mut pd = vec![0; usize::try_from(pd_bytes).map_err(|_| Error::BootDataTooLarge)?];
-    for page in pages {
-        let table = page / X86_ENTRIES_PER_TABLE;
-        let index = page % X86_ENTRIES_PER_TABLE;
-        let offset = table
-            .checked_mul(PAGE_SIZE)
-            .and_then(|offset| offset.checked_add(index * 8))
-            .ok_or(Error::BootDataTooLarge)?;
-        let offset = usize::try_from(offset).map_err(|_| Error::BootDataTooLarge)?;
-        pd[offset..offset + 8].copy_from_slice(
-            &(page
-                .checked_mul(X86_PAGE_2M)
-                .ok_or(Error::BootDataTooLarge)?
-                | X86_PAGE_2M_ENTRY)
-                .to_le_bytes(),
-        );
+        let mut entries = vec![0; page_size];
+        for page in 0..X86_ENTRIES_PER_TABLE {
+            let address = (directory * X86_ENTRIES_PER_TABLE + page) * X86_PAGE_2M;
+            let offset = usize::try_from(page * 8).map_err(|_| Error::BootDataTooLarge)?;
+            entries[offset..offset + 8]
+                .copy_from_slice(&(address | X86_PAGE_2M_ENTRY).to_le_bytes());
+        }
+        directories.push(GuestWrite {
+            address,
+            bytes: entries,
+        });
     }
     let mut gdt = Vec::with_capacity(16);
     gdt.extend_from_slice(&X86_GDT_CODE.to_le_bytes());
     gdt.extend_from_slice(&X86_GDT_DATA.to_le_bytes());
-    Ok(vec![
+    let mut writes = vec![
         GuestWrite {
             address: X86_GDT + 8,
             bytes: gdt,
@@ -339,11 +330,21 @@ fn x86_page_tables(ram_bytes: u64) -> Result<Vec<GuestWrite>, Error> {
             address: X86_PDPT,
             bytes: pdpt,
         },
-        GuestWrite {
-            address: X86_PD,
-            bytes: pd,
-        },
-    ])
+    ];
+    writes.extend(directories);
+    Ok(writes)
+}
+
+fn validate_x86_writes(writes: &[GuestWrite], low_ram: &[(u64, u64)]) -> Result<(), Error> {
+    if writes.iter().any(|write| {
+        u64::try_from(write.bytes.len())
+            .ok()
+            .and_then(|size| range_in_regions(write.address, size, low_ram).ok())
+            .is_none()
+    }) {
+        return Err(Error::KernelLayout);
+    }
+    range_in_regions(terra_limits::X86_STACK_TOP - PAGE_SIZE, PAGE_SIZE, low_ram)
 }
 
 fn checksum(bytes: &[u8]) -> u8 {
@@ -410,12 +411,7 @@ pub(crate) fn plan_x86(
     kernel_command_line: &str,
     devices: &[Device],
 ) -> Result<Plan, Error> {
-    if ram_bytes <= X86_HIMEM_START
-        || ram_bytes > 0xd000_0000
-        || !ram_bytes.is_multiple_of(PAGE_SIZE)
-    {
-        return Err(Error::InvalidRam);
-    }
+    let ram_regions = x86_ram_regions(ram_bytes)?;
     validate_kernel_prefix(kernel_prefix, kernel_bytes)?;
     validate_x86_devices(devices)?;
     if kernel_prefix.len() < 64
@@ -455,7 +451,7 @@ pub(crate) fn plan_x86(
             return Err(Error::KernelLayout);
         }
         checked_source(kernel_bytes, source_offset, file_length)?;
-        range_within(guest_address, memory_length, ram_bytes)?;
+        range_in_regions(guest_address, memory_length, &ram_regions[..1])?;
         image_end = image_end.max(end(guest_address, memory_length)?);
         segments.push(KernelSegment {
             source_offset,
@@ -464,7 +460,15 @@ pub(crate) fn plan_x86(
             memory_length,
         });
     }
-    if segments.is_empty() || entry < X86_HIMEM_START || entry >= image_end {
+    if segments.is_empty()
+        || entry < X86_HIMEM_START
+        || entry >= image_end
+        || range_in_regions(entry, 1, &ram_regions[..1]).is_err()
+        || !segments.iter().any(|segment| {
+            end(segment.guest_address, segment.memory_length)
+                .is_ok_and(|segment_end| segment.guest_address <= entry && entry < segment_end)
+        })
+    {
         return Err(Error::KernelLayout);
     }
     for (index, segment) in segments.iter().enumerate() {
@@ -476,9 +480,9 @@ pub(crate) fn plan_x86(
         }
     }
     let command_line = command_line(&hardened_command_line(kernel_command_line), devices)?;
-    let zero_page = x86_zero_page(ram_bytes, command_line.len())?;
     let mp_table = mp_table(vcpus)?;
-    let mut writes = x86_page_tables(ram_bytes)?;
+    let zero_page = x86_zero_page(&ram_regions, command_line.len())?;
+    let mut writes = x86_page_tables()?;
     writes.extend([
         GuestWrite {
             address: X86_CMDLINE,
@@ -493,6 +497,7 @@ pub(crate) fn plan_x86(
             bytes: mp_table,
         },
     ]);
+    validate_x86_writes(&writes, &ram_regions[..1])?;
     Ok(Plan {
         entry,
         boot_argument: X86_ZERO_PAGE,
@@ -641,7 +646,9 @@ pub(crate) fn plan_arm(
     kernel_command_line: &str,
     devices: &[Device],
 ) -> Result<Plan, Error> {
-    if ram_bytes < ARM_FDT_ALIGNMENT || !ram_bytes.is_multiple_of(PAGE_SIZE) {
+    let ram = terra_limits::arm_ram_layout(ram_bytes).ok_or(Error::InvalidRam)?;
+    let ram = ram.regions().next().ok_or(Error::InvalidRam)?;
+    if ram.size < ARM_FDT_ALIGNMENT {
         return Err(Error::InvalidRam);
     }
     if vcpus == 0 || vcpus > terra_limits::ARM_MAX_VCPUS {
@@ -658,12 +665,11 @@ pub(crate) fn plan_arm(
     if memory_length == 0 || memory_length < file_length {
         return Err(Error::KernelLayout);
     }
-    let guest_address = ARM_RAM_BASE
+    let guest_address = ram
+        .base
         .checked_add(text_offset)
         .ok_or(Error::KernelLayout)?;
-    let ram_end = ARM_RAM_BASE
-        .checked_add(ram_bytes)
-        .ok_or(Error::InvalidRam)?;
+    let ram_end = ram.base.checked_add(ram.size).ok_or(Error::InvalidRam)?;
     let fdt_address = ram_end
         .checked_sub(ARM_FDT_ALIGNMENT)
         .map(|address| address & !(ARM_FDT_ALIGNMENT - 1))
@@ -739,6 +745,31 @@ mod tests {
         kernel
     }
 
+    fn x86_devices() -> [Device; 4] {
+        [
+            Device {
+                kind: DeviceKind::Block,
+                mmio_base: X86_MMIO_BASE,
+                irq: 11,
+            },
+            Device {
+                kind: DeviceKind::Net,
+                mmio_base: X86_MMIO_BASE + X86_MMIO_STRIDE,
+                irq: 13,
+            },
+            Device {
+                kind: DeviceKind::Vsock,
+                mmio_base: X86_MMIO_BASE + 2 * X86_MMIO_STRIDE,
+                irq: 14,
+            },
+            Device {
+                kind: DeviceKind::Memory,
+                mmio_base: X86_MMIO_BASE + 3 * X86_MMIO_STRIDE,
+                irq: 15,
+            },
+        ]
+    }
+
     #[test]
     fn x86_plan_copies_segments_by_reference_and_writes_boot_data() {
         let plan = plan_x86(
@@ -775,7 +806,7 @@ mod tests {
         assert_eq!(plan.boot_argument, X86_ZERO_PAGE);
         assert_eq!(plan.kernel_segments.len(), 1);
         assert_eq!(plan.kernel_segments[0].source_offset, 0x100);
-        assert_eq!(plan.writes.len(), 7);
+        assert!(plan.writes.len() >= 7);
         let command_line = plan
             .writes
             .iter()
@@ -788,6 +819,100 @@ mod tests {
                 .windows(14)
                 .any(|word| word == b"init_on_free=1")
         );
+        let zero_page = plan
+            .writes
+            .iter()
+            .find(|write| write.address == X86_ZERO_PAGE)
+            .expect("zero page");
+        assert_eq!(
+            u32::from_le_bytes(zero_page.bytes[0x228..0x22c].try_into().unwrap()),
+            u32::try_from(X86_CMDLINE).unwrap()
+        );
+    }
+
+    #[test]
+    fn x86_ram_above_the_device_hole_is_described_as_high_memory() {
+        let ram_bytes = terra_limits::X86_RAM_LOW_END - terra_limits::X86_RAM_BASE + (2 << 20);
+        let regions = x86_ram_regions(ram_bytes).expect("RAM regions");
+        assert_eq!(
+            regions,
+            [
+                (
+                    terra_limits::X86_RAM_BASE,
+                    terra_limits::X86_RAM_LOW_END - terra_limits::X86_RAM_BASE,
+                ),
+                (terra_limits::X86_HIGH_RAM_BASE, 2 << 20),
+            ]
+        );
+        assert!(range_in_regions(terra_limits::X86_RAM_LOW_END, 4096, &regions).is_err());
+        assert!(range_in_regions(terra_limits::X86_HIGH_RAM_BASE, 4096, &regions).is_ok());
+
+        let page = x86_zero_page(&regions, 1).expect("zero page");
+        assert_eq!(page[0x1e8], 3);
+        let high = 0x2d0 + 2 * 20;
+        assert_eq!(
+            u64::from_le_bytes(page[high..high + 8].try_into().unwrap()),
+            terra_limits::X86_HIGH_RAM_BASE
+        );
+        assert_eq!(
+            u64::from_le_bytes(page[high + 8..high + 16].try_into().unwrap()),
+            2 << 20
+        );
+    }
+
+    #[test]
+    fn x86_kernel_cannot_start_in_high_memory() {
+        let mut kernel = x86_kernel();
+        kernel[24..32].copy_from_slice(&terra_limits::X86_HIGH_RAM_BASE.to_le_bytes());
+        kernel[88..96].copy_from_slice(&terra_limits::X86_HIGH_RAM_BASE.to_le_bytes());
+        assert!(matches!(
+            plan_x86(
+                &kernel,
+                0x200,
+                terra_limits::X86_RAM_LOW_END - terra_limits::X86_RAM_BASE + (2 << 20),
+                1,
+                "",
+                &x86_devices(),
+            ),
+            Err(Error::KernelLayout)
+        ));
+    }
+
+    #[test]
+    fn x86_page_tables_map_the_first_four_gib() {
+        let writes = x86_page_tables().expect("page tables");
+        let pml4 = writes
+            .iter()
+            .find(|write| write.address == X86_PML4)
+            .expect("PML4");
+        assert_eq!(
+            u64::from_le_bytes(pml4.bytes[..8].try_into().unwrap()),
+            X86_PDPT | X86_PAGE_TABLE_ENTRY
+        );
+        let pdpt = writes
+            .iter()
+            .find(|write| write.address == X86_PDPT)
+            .expect("PDPT");
+        for directory in 0..4_u64 {
+            let address = X86_PAGE_DIRECTORY + directory * PAGE_SIZE;
+            let offset = usize::try_from(directory * 8).unwrap();
+            assert_eq!(
+                u64::from_le_bytes(pdpt.bytes[offset..offset + 8].try_into().unwrap()),
+                address | X86_PAGE_TABLE_ENTRY
+            );
+            let entries = writes
+                .iter()
+                .find(|write| write.address == address)
+                .expect("page directory");
+            assert_eq!(
+                u64::from_le_bytes(entries.bytes[..8].try_into().unwrap()),
+                (directory * 1024 * 1024 * 1024) | X86_PAGE_2M_ENTRY
+            );
+            assert_eq!(
+                u64::from_le_bytes(entries.bytes[4088..].try_into().unwrap()),
+                (directory * 1024 * 1024 * 1024 + 1022 * 1024 * 1024) | X86_PAGE_2M_ENTRY
+            );
+        }
     }
 
     #[test]

@@ -1,0 +1,14 @@
+[package]
+name = "terra-interrupt-controller-component"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen.workspace = true
+terra-limits = { path = "../../crates/terra-limits" }

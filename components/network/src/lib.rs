@@ -32,7 +32,6 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::task::Poll;
-use std::time::Instant as MonotonicInstant;
 
 use exports::terra::network::api::{Config, Error, Guest, PublishedPort};
 use exports::terra::network::transport::Guest as TransportGuest;
@@ -291,7 +290,7 @@ struct Gateway {
     published: published::PublishedTable,
     frames: VecDeque<Vec<u8>>,
     frame_bytes: usize,
-    started: MonotonicInstant,
+    started: u64,
     next_flow: u32,
     next_background: u32,
     published_listeners_started: bool,
@@ -312,7 +311,7 @@ impl Gateway {
             published: published::PublishedTable::new(),
             frames: VecDeque::new(),
             frame_bytes: 0,
-            started: MonotonicInstant::now(),
+            started: monotonic_now(),
             next_flow: 0,
             next_background: 0,
             published_listeners_started: false,
@@ -350,7 +349,7 @@ impl Gateway {
         self.published = published::PublishedTable::new();
         self.frames.clear();
         self.frame_bytes = 0;
-        self.started = MonotonicInstant::now();
+        self.started = monotonic_now();
         self.next_flow = 0;
         self.next_background = 0;
         self.published_listeners_started = false;
@@ -593,8 +592,7 @@ impl Gateway {
         let config = self.config.as_ref().ok_or(Error::NotReady)?;
         let mut device = DeviceFrame::new(input, config.mtu);
         self.published.pump(&mut self.sockets);
-        let elapsed = i64::try_from(self.started.elapsed().as_millis()).unwrap_or(i64::MAX);
-        let now = Instant::from_millis(elapsed);
+        let now = protocol_now(self.started);
         self.interface
             .as_mut()
             .ok_or(Error::NotReady)?
@@ -667,10 +665,9 @@ impl Gateway {
             })
     }
     fn protocol_delay(&mut self) -> Option<u64> {
-        let elapsed = i64::try_from(self.started.elapsed().as_millis()).unwrap_or(i64::MAX);
         self.interface
             .as_mut()?
-            .poll_delay(Instant::from_millis(elapsed), &self.sockets)
+            .poll_delay(protocol_now(self.started), &self.sockets)
             .map(|delay| delay.total_micros().saturating_mul(1_000))
     }
     fn take_frames(&mut self, max_items: usize, max_bytes: usize) -> Vec<Vec<u8>> {
@@ -923,6 +920,32 @@ async fn wait_for_work() {
 
 fn protocol_delay() -> Option<u64> {
     gateway().protocol_delay()
+}
+
+fn monotonic_now() -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        wasi::clocks::monotonic_clock::now()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::sync::OnceLock;
+        use std::time::Instant as MonotonicInstant;
+
+        static STARTED: OnceLock<MonotonicInstant> = OnceLock::new();
+        u64::try_from(
+            STARTED
+                .get_or_init(MonotonicInstant::now)
+                .elapsed()
+                .as_nanos(),
+        )
+        .unwrap_or(u64::MAX)
+    }
+}
+
+fn protocol_now(started: u64) -> Instant {
+    let elapsed = monotonic_now().wrapping_sub(started) / 1_000_000;
+    Instant::from_millis(i64::try_from(elapsed).unwrap_or(i64::MAX))
 }
 
 async fn wait_for_activity() -> bool {
@@ -1885,7 +1908,7 @@ mod tests {
         gateway.pump(Some(syn())).unwrap();
         gateway.take_frames(MAX_QUEUED_FRAMES, MAX_FRAME_BYTES);
         let delay = gateway.protocol_delay().expect("TCP retry deadline");
-        gateway.started -= std::time::Duration::from_nanos(delay.saturating_add(1));
+        gateway.started = monotonic_now().wrapping_sub(delay.saturating_add(1));
         gateway.pump(None).unwrap();
         assert!(
             gateway

@@ -39,3 +39,5 @@ TERRA_MEM_AOT = { value = "build/terra-mem-component.cwasm", relative = true }
 TERRA_BOOT_AOT = { value = "build/terra-boot-component.cwasm", relative = true }
 TERRA_VMM_AOT = { value = "build/terra-vmm-component.cwasm", relative = true }
 TERRA_POLICY_AOT = { value = "build/terra-policy-component.cwasm", relative = true }
+TERRA_MMIO_AOT = { value = "build/terra-mmio-component.cwasm", relative = true }
+TERRA_INTERRUPT_CONTROLLER_AOT = { value = "build/terra-interrupt-controller-component.cwasm", relative = true }

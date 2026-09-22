@@ -7,6 +7,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+log = "0.4.34"
 terra-limits = { path = "../terra-limits" }
 
 [target.'cfg(unix)'.dependencies]
@@ -28,7 +29,6 @@ uds_windows = "1.2.1"
 tokio = { version = "1", features = ["io-util", "rt"] }
 async-io = "2.6.0"
 tokio-util = { version = "0.7", features = ["compat"] }
-log = "0.4.34"
 windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Win32_Security", "Wdk_Storage_FileSystem", "Wdk_System_SystemServices", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_Memory", "Win32_System_SystemInformation", "Win32_System_Hypervisor"] }
 
 [dev-dependencies]

@@ -157,6 +157,8 @@ pub trait VcpuHandler: Send {
     fn exchange(&mut self, exit: VcpuExit) -> Result<VcpuAction, String>;
 
     fn finished(&mut self, outcome: VcpuOutcome);
+
+    fn failed(&mut self, _error: &str) {}
 }
 
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]

@@ -11,6 +11,8 @@ pub(crate) use crate::component::vmm::bindings::lifecycle_platform;
 #[derive(Clone)]
 pub struct LifecycleNotifier {
     event: watch::Sender<Option<Event>>,
+    ready: watch::Sender<bool>,
+    native_failure: Arc<OnceLock<String>>,
     outcome: watch::Sender<Option<Outcome>>,
     shutdown_deadline: ShutdownDeadline,
 }
@@ -63,6 +65,8 @@ impl LifecycleHost {
         Self {
             sender: LifecycleNotifier {
                 event,
+                ready: watch::channel(false).0,
+                native_failure: Arc::new(OnceLock::new()),
                 outcome,
                 shutdown_deadline,
             },
@@ -108,6 +112,37 @@ impl Default for LifecycleHost {
 }
 
 impl LifecycleNotifier {
+    pub fn agent_ready(&self) {
+        self.ready.send_replace(true);
+    }
+
+    #[must_use]
+    pub fn is_agent_ready(&self) -> bool {
+        *self.ready.borrow()
+    }
+
+    pub async fn wait_for_agent_ready(&self) {
+        let _ = self.ready.subscribe().wait_for(|ready| *ready).await;
+    }
+
+    /// Returns true when this call publishes the boot deadline event.
+    pub(crate) fn expire_boot_deadline(&self) -> bool {
+        let ready = self.ready.borrow();
+        if *ready {
+            return false;
+        }
+        self.publish(Event::Deadline)
+    }
+
+    pub fn native_failed(&self, error: &str) {
+        let _ = self.native_failure.set(error.to_owned());
+        self.component_failed();
+    }
+
+    pub fn native_failure(&self) -> Option<&str> {
+        self.native_failure.get().map(String::as_str)
+    }
+
     #[must_use]
     pub fn begin_shutdown(&self) -> Instant {
         self.shutdown_deadline.start()
@@ -125,8 +160,8 @@ impl LifecycleNotifier {
         self.publish(Event::Deadline);
     }
 
-    fn publish(&self, event: Event) {
-        let _ = self.event.send_if_modified(|current| {
+    fn publish(&self, event: Event) -> bool {
+        self.event.send_if_modified(|current| {
             if current.is_some() {
                 false
             } else {
@@ -134,7 +169,7 @@ impl LifecycleNotifier {
                 *current = Some(event);
                 true
             }
-        });
+        })
     }
 
     #[must_use]

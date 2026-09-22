@@ -51,13 +51,13 @@ fn reset_device(
 }
 
 fn load_components(engine: &wasmtime::Engine) -> [Component; 5] {
-    let router = component(engine, support::artifacts::wasm::VMM);
+    let mmio = component(engine, support::artifacts::wasm::MMIO);
     let block_component = component(engine, support::artifacts::wasm::BLOCK);
     let fs_component = component(engine, support::artifacts::wasm::FS);
     let mem_component = component(engine, support::artifacts::wasm::MEM);
     let network_component = component(engine, support::artifacts::wasm::NETWORK);
     [
-        router,
+        mmio,
         block_component,
         fs_component,
         mem_component,
@@ -84,7 +84,7 @@ fn start_vsock(runtime: &mut BoxRuntime, ram: GuestRam) -> VsockChannel {
 async fn every_device_resets_and_closes_in_one_box_runtime() {
     let engine = device_engine().expect("engine");
     let [
-        router,
+        mmio,
         block_component,
         fs_component,
         mem_component,
@@ -94,7 +94,7 @@ async fn every_device_resets_and_closes_in_one_box_runtime() {
     let root = tempfile::tempdir().expect("mount directory");
     let mount = std::fs::canonicalize(root.path()).expect("canonical mount directory");
     let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
-    runtime.initialize_vmm(&router).await.expect("MMIO router");
+    runtime.initialize_mmio(&mmio).await.expect("MMIO service");
 
     let block_host = terra_runtime::component::block::BlockHost::new(
         ram.clone(),

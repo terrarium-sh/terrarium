@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
-use terra_runtime::component::vmm::mmio::{Operation, Reply as MmioReply, Request};
+use terra_runtime::component::mmio::{Operation, Reply as MmioReply, Request};
 use terra_runtime::component::vsock::{VsockDeviceHost, vsock_component_linker};
 use terra_runtime::engine::device_engine;
 use terra_runtime::test_support::{StandaloneHost, device_store};
@@ -258,7 +258,7 @@ async fn create_worker(
         .unwrap();
     let export = |name| component.get_export_index(Some(&interface), name).unwrap();
     let configure_device = instance
-        .get_typed_func::<(), (Result<(), terra_runtime::component::vmm::mmio::DeviceError>,)>(
+        .get_typed_func::<(), (Result<(), terra_runtime::component::mmio::DeviceError>,)>(
             &mut store,
             export("configure-device"),
         )
@@ -610,8 +610,8 @@ async fn shared_close_releases_the_diagnostic_sink() {
         terra_runtime::box_runtime::BoxHost::new(),
     )
     .unwrap();
-    let router = Component::new(&engine, support::artifacts::wasm::VMM).unwrap();
-    runtime.initialize_vmm(&router).await.unwrap();
+    let mmio = Component::new(&engine, support::artifacts::wasm::MMIO).unwrap();
+    runtime.initialize_mmio(&mmio).await.unwrap();
     let output = tempfile::NamedTempFile::new().unwrap();
     let artifact = support::artifacts::trusted_artifacts().vsock();
     let channel = terra_runtime::component::vsock::VsockChannel::from_trusted_artifact(

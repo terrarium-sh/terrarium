@@ -4,6 +4,7 @@ mod authorization;
 mod bindings;
 mod host;
 mod limits;
+mod resource_linker;
 
 use crate::machine::DeviceKind;
 
@@ -98,7 +99,7 @@ pub(crate) async fn instantiate(
 ) -> wasmtime::Result<crate::component::StandaloneDevice> {
     let mut runtime =
         crate::box_runtime::BoxRuntime::new(engine, crate::box_runtime::store::BoxHost::new())?;
-    crate::component::vmm::initialize_test_vmm(&mut runtime).await?;
+    crate::component::mmio::initialize_test_mmio(&mut runtime).await?;
     let channel = register_device(
         &mut runtime,
         host,
@@ -170,7 +171,7 @@ async fn create_worker(
     interrupt: InterruptCallback,
 ) -> wasmtime::Result<(
     crate::box_runtime::DeviceWorker<NetworkHost>,
-    crate::component::vmm::mmio::Serve,
+    crate::component::mmio::Serve,
 )> {
     let wake = child.store.data().context.interrupt_notification();
     let linker = network_component_linker(child.store.engine())?;
@@ -250,9 +251,9 @@ mod tests {
         let mut runtime =
             crate::box_runtime::BoxRuntime::new(&engine, crate::box_runtime::store::BoxHost::new())
                 .expect("runtime");
-        crate::component::vmm::initialize_test_vmm(&mut runtime)
+        crate::component::mmio::initialize_test_mmio(&mut runtime)
             .await
-            .expect("MMIO router");
+            .expect("MMIO service");
         let host = crate::component::context::DeviceContext::with_ram(
             crate::memory::GuestRam::new(64 * 1024).expect("RAM"),
         );

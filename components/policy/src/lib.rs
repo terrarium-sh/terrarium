@@ -2,9 +2,11 @@
 
 #[allow(unsafe_code, clippy::same_length_and_capacity)]
 mod bindings {
-    wit_bindgen::generate!({ world: "policy", path: "wit" });
+    wit_bindgen::generate!({ world: "policy", path: "wit", generate_all });
 }
 use bindings::exports;
+#[cfg(target_arch = "wasm32")]
+use bindings::wasi;
 
 mod rules;
 mod runtime;
@@ -34,6 +36,21 @@ use std::sync::Mutex;
 use terra_network::{NameLookup, Policy};
 
 static POLICY: Mutex<Option<runtime::BoxPolicy>> = Mutex::new(None);
+
+fn monotonic_now() -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        wasi::clocks::monotonic_clock::now()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::sync::OnceLock;
+        use std::time::Instant;
+
+        static STARTED: OnceLock<Instant> = OnceLock::new();
+        u64::try_from(STARTED.get_or_init(Instant::now).elapsed().as_nanos()).unwrap_or(u64::MAX)
+    }
+}
 struct Component;
 
 impl Guest for Component {

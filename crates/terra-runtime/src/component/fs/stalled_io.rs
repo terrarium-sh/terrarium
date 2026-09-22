@@ -323,12 +323,12 @@ impl Mounted {
         let ram = GuestRam::new(1024 * 1024).unwrap();
         let engine = device_engine().unwrap();
         let component = Component::new(&engine, crate::test_fixtures::wasm::FS).unwrap();
-        let router = Component::new(&engine, crate::test_fixtures::wasm::VMM).unwrap();
+        let mmio = Component::new(&engine, crate::test_fixtures::wasm::MMIO).unwrap();
         let mut host =
             FsHost::with_resource_capacity(DeviceContext::with_ram(ram.clone()), grant, capacity);
         host.io_gate = Some(gate);
         let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).unwrap();
-        runtime.initialize_vmm(&router).await.unwrap();
+        runtime.initialize_mmio(&mmio).await.unwrap();
         let channel = super::register_device(
             &mut runtime,
             host,

@@ -117,6 +117,7 @@ pub trait StoreHost: WasiView + 'static {
 pub struct RootHost {
     pub(crate) platform: crate::component::vmm::PlatformHost,
     pub(crate) lifecycle: crate::component::vmm::lifecycle::LifecycleHost,
+    pub(crate) mmio_client: Option<crate::component::mmio::Client>,
     ctx: WasiCtx,
     table: ResourceTable,
 }
@@ -197,6 +198,7 @@ impl RootHost {
                 lifecycle.native_teardown(),
             ),
             lifecycle,
+            mmio_client: None,
             ctx: WasiCtxBuilder::new()
                 .max_random_size(crate::MAX_SINGLE_BYTES)
                 .allow_tcp(false)

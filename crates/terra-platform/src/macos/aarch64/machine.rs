@@ -68,7 +68,10 @@ pub struct Cpu {
 impl Machine {
     pub fn new(config: &VmConfig) -> Result<Self, HvError> {
         let ram_size_usize = usize::try_from(config.ram_bytes).map_err(|_| HvError::Memory)?;
-        if ram_size_usize == 0 || !config.ram_bytes.is_multiple_of(PAGE_SIZE as u64) {
+        if config.ram_base != terra_limits::ARM_RAM_BASE
+            || ram_size_usize == 0
+            || !config.ram_bytes.is_multiple_of(PAGE_SIZE as u64)
+        {
             return Err(HvError::Memory);
         }
         let crate::vm::InterruptControllerConfig::Arm(gic) = &config.interrupt_controller else {
@@ -79,14 +82,15 @@ impl Machine {
         gic_config.set_distributor_base(gic.distributor_base)?;
         gic_config.set_redistributor_base(gic.redistributor_base)?;
         let vm = VirtualMachine::with_gic(VirtualMachineConfig::new(), gic_config)?;
-        let ram =
-            GuestMemory::allocate_at(config.ram_base, config.ram_bytes).ok_or(HvError::Memory)?;
-        let host_address = ram.host_address(config.ram_base).ok_or(HvError::Memory)?;
+        let ram = GuestMemory::allocate_arm_ram(config.ram_bytes).ok_or(HvError::Memory)?;
+        let host_address = ram
+            .host_address(terra_limits::ARM_RAM_BASE)
+            .ok_or(HvError::Memory)?;
         // SAFETY: `ram` stays alive until after the Hypervisor.framework VM is destroyed.
         let result = unsafe {
             hv_vm_map(
                 host_address.cast::<c_void>(),
-                config.ram_base,
+                terra_limits::ARM_RAM_BASE,
                 ram_size_usize,
                 u64::from(MemPerms::RWX),
             )

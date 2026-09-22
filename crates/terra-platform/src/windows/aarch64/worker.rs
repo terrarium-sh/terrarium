@@ -22,8 +22,11 @@ impl WindowsVm {
         if config.vcpus == 0 || usize::from(config.vcpus) > ARM_MAX_VCPUS as usize {
             return Err("invalid Windows ARM64 VM dimensions".to_owned());
         }
-        let memory = GuestMemory::allocate_at(config.ram_base, config.ram_bytes)
-            .ok_or("allocating ARM WHP RAM")?;
+        if config.ram_base != terra_limits::ARM_RAM_BASE {
+            return Err("invalid Windows ARM64 RAM base".to_owned());
+        }
+        let memory =
+            GuestMemory::allocate_arm_ram(config.ram_bytes).ok_or("allocating ARM WHP RAM")?;
         let partition = Arc::new(
             crate::windows::whp::Partition::new(memory, u32::from(config.vcpus), Some(gic))
                 .map_err(|error| error.to_string())?,

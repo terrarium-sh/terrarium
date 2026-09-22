@@ -1,0 +1,40 @@
+package terra:interrupt-controller@0.1.0;
+
+interface controller {
+    enum mode { ioapic, irq-lines }
+
+    record config {
+        mode: mode,
+        routes: list<u32>,
+        vcpus: u8,
+    }
+
+    record x86-interrupt {
+        vector: u8,
+        destination: u8,
+        level-triggered: bool,
+    }
+
+    record ioapic-reply {
+        value: u32,
+        interrupts: list<x86-interrupt>,
+    }
+
+    record irq-level {
+        gsi: u32,
+        asserted: bool,
+    }
+
+    enum error { invalid-state, invalid-slot, unmapped, bad-width }
+
+    configure: func(config: config) -> result<_, error>;
+    clear: func() -> result<list<irq-level>, error>;
+    irq-line: func(slot: u8, asserted: bool) -> result<option<irq-level>, error>;
+    ioapic-line: func(slot: u8, asserted: bool) -> result<list<x86-interrupt>, error>;
+    access: func(offset: u8, width: u8, write: bool, value: u32) -> result<ioapic-reply, error>;
+    eoi: func(vector: u8) -> result<list<x86-interrupt>, error>;
+}
+
+world interrupt-controller {
+    export controller;
+}

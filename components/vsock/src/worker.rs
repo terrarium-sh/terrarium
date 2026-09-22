@@ -717,6 +717,9 @@ fn drain_lifecycle(
                 return;
             }
             control.drain(..consumed);
+            if result.agent_ready {
+                queue_event(sender, pending, Event::AgentReady);
+            }
             if let Some(code) = result.exit_code {
                 queue_event(sender, pending, Event::Exit(code));
             }

@@ -284,7 +284,7 @@ pub fn configure() -> Result<(), DeviceError> {
         mmio: MmioTransport::new(
             0,
             0x200,
-            memory::ram_bytes(),
+            memory::address_limit(),
             5,
             host_features(),
             QUEUE_SIZE,

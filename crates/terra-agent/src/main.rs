@@ -107,7 +107,7 @@ async fn run_agent(plan: &Plan, control: &File, diagnostic: File) -> Result<i32>
         shutdown.clone(),
     ));
     diagnostic.record(b"agent received boot plan");
-    let outcome = workload::execute(plan, &diagnostic, &stop, &shutdown, &tasks).await;
+    let outcome = workload::execute(plan, control, &diagnostic, &stop, &shutdown, &tasks).await;
     shutdown.cancel();
     tasks.close();
     tasks.wait().await;
@@ -116,6 +116,22 @@ async fn run_agent(plan: &Plan, control: &File, diagnostic: File) -> Result<i32>
     }
     diagnostic.finish().await;
     outcome
+}
+
+#[cfg(target_os = "linux")]
+async fn report_agent_ready(control: &File) -> Result<()> {
+    use anyhow::Context as _;
+    use tokio::io::AsyncWriteExt as _;
+    let mut control = into_async_file(control.try_clone()?)?;
+    let frame = terra_protocol::encode_frame(&LifecycleEvent::AgentReady)?;
+    control
+        .write_all(&frame)
+        .await
+        .context("reporting guest agent readiness")?;
+    control
+        .flush()
+        .await
+        .context("flushing guest agent readiness")
 }
 
 #[cfg(target_os = "linux")]

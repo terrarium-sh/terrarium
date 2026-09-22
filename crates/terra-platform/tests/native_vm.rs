@@ -28,7 +28,7 @@ mod supported_host {
             ram_base: if cfg!(target_arch = "aarch64") {
                 terra_limits::ARM_RAM_BASE
             } else {
-                0
+                terra_limits::X86_RAM_BASE
             },
             ram_bytes: RAM_BYTES,
             vcpus: 1,
@@ -96,25 +96,30 @@ mod supported_host {
     fn stage_guest(memory: &terra_platform::memory::GuestMemory) -> (BootState, u64) {
         #[cfg(target_arch = "x86_64")]
         {
-            let entry = 0x1000;
-            let marker = 0x2000;
+            let entry = terra_limits::X86_RAM_BASE + 0x1000;
+            let marker = terra_limits::X86_RAM_BASE + 0x2000;
+            let mut code = [
+                0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xc7, 0x00, 0xa5, 0xa5, 0xa5, 0xa5, 0xeb, 0xfe,
+            ];
+            code[2..10].copy_from_slice(&marker.to_le_bytes());
+            memory.write(entry, &code).expect("stage x86 marker loop");
             memory
                 .write(
-                    entry,
-                    &[
-                        0x48, 0xb8, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc7, 0x00,
-                        0xa5, 0xa5, 0xa5, 0xa5, 0xeb, 0xfe,
-                    ],
+                    terra_limits::X86_PML4_ADDR,
+                    &((terra_limits::X86_RAM_BASE + 0xa000) | 3).to_le_bytes(),
                 )
-                .expect("stage x86 marker loop");
-            memory
-                .write(terra_limits::X86_PML4_ADDR, &(0xa000_u64 | 3).to_le_bytes())
                 .expect("stage x86 PML4");
             memory
-                .write(0xa000, &(0xb000_u64 | 3).to_le_bytes())
+                .write(
+                    terra_limits::X86_RAM_BASE + 0xa000,
+                    &((terra_limits::X86_RAM_BASE + 0xb000) | 3).to_le_bytes(),
+                )
                 .expect("stage x86 page-directory pointer table");
             memory
-                .write(0xb000, &(0x83_u64).to_le_bytes())
+                .write(
+                    terra_limits::X86_RAM_BASE + 0xb000,
+                    &(0x83_u64).to_le_bytes(),
+                )
                 .expect("stage x86 page directory");
             (
                 BootState {

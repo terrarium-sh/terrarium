@@ -14,7 +14,7 @@ and writable `/dev/kvm`.
 Install the separate component toolchain and validator:
 
 ```sh
-rustup toolchain install nightly-2026-09-16 --component rustfmt,clippy --target wasm32-wasip3
+rustup toolchain install nightly-2026-09-16 --component rustfmt,clippy --target wasm32-unknown-unknown
 cargo install wasm-tools --version 1.248.0 --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
 make dist
 ```
@@ -49,17 +49,18 @@ checkouts require symlink privileges and `core.symlinks=true`.
 Runtime derives the fixed machine layout and asks platform to create the VM,
 RAM, disks and vCPUs. A short-lived boot component plans kernel placement;
 runtime validates its writes and result before CPUs start. The VMM component
-then owns exit interpretation, MMIO routing and lifecycle decisions. Device
-components run in independent stores and communicate through bounded scalar
-bridges. Hypervisor operations and authority checks remain native. See the
+then owns exit interpretation and lifecycle decisions. MMIO routing and software
+interrupt emulation run in separate stores with no imported host functions. Device
+components connect to the MMIO store through bounded request/reply streams. Hypervisor operations and authority checks remain native. See the
 [security model](docs/security.md) for trust boundaries and resource limits.
 
 Runtime entry points live in `terra-runtime::orchestration`; `machine` owns
 layout, validated machine configuration, and conversion to native VM configuration.
 A prepared VM runs through `PreparedVm::run`, which keeps its component runtime
 and outcome observer paired. `box_runtime/setup.rs` owns device preparation and
-startup sequencing. `component/vmm.rs` initializes the VMM; `component/vmm/mmio`
-handles native MMIO requests, and `component/vmm/vcpu.rs` hosts the vCPU rendezvous.
+startup sequencing. `component/vmm.rs` initializes the VMM; `component/mmio.rs` owns routing and device
+streams, and `component/interrupt_controller.rs` validates interrupt effects before
+native injection. `component/vmm/vcpu.rs` hosts the vCPU rendezvous.
 Device module roots own registration and selected public exports; private
 `bindings.rs` files hold generated interfaces, and `host.rs` implements native imports.
 Network socket authorization lives in `component/network/authorization.rs`;
@@ -81,6 +82,25 @@ plan over vsock, grows the box's ext4 images and enters the Alpine root with
 `pivot_root`. It applies `on_create` when its guest-side recipe stamp differs,
 then configures mounts and runs hooks and the workload. Boot-plan environment
 values are sent through memory, not persisted as a host plan file.
+
+## Boot readiness and failures
+
+The guest boot deadline is 60 seconds (`terra_runtime::orchestration::GUEST_BOOT_TIMEOUT`),
+starting when guest execution starts. The agent sends `AgentReady` after
+initialization and before hooks. Readiness permanently cancels this deadline;
+long hooks keep their existing limits. `--agent-timeout` separately bounds a
+client's connection wait.
+
+Detached startup waits for the VM child's readiness notification. Its parent
+wait is bounded to 90 seconds: the guest deadline plus 30 seconds for preparation
+and cleanup. If the child never responds, the parent kills it and waits at most
+2 seconds for reaping. An uninterruptible child cannot hold the CLI indefinitely;
+the CLI reports a cleanup failure if the child still cannot exit. A child that exits before
+readiness retains its nonzero exit code, including `128 + signal` on Unix.
+
+Boot failures replay bounded host and guest log tails, explicitly noting empty
+guest diagnostics. Native KVM failures include the vCPU and operation or hardware
+exit reason, even if the guest agent never runs.
 
 ## Guest kernel and images
 
@@ -108,6 +128,14 @@ Exports contain the compressed kernel, resolved configuration and input digest;
 the companion `.sha256` records the archive checksum. The
 [kernel workflow](.github/workflows/kernel.yml) exports both architectures.
 Cross-compilation does not establish hardware boot acceptance.
+
+The x86 timer patch lets virtual guests calibrate the local APIC timer against
+a known TSC frequency when the APIC timer is always running, avoiding a PIT
+clockevent whose IRQ can register without a timer behind it. The existing
+fallback for failed legacy IRQ registration remains for WHP. The ignored
+`local_apic_timers_work_without_a_legacy_clockevent` boot test checks one and two
+vCPUs for active local timers and no IRQ 0 clockevent on x86 KVM; Intel acceptance
+still requires running it on the affected host.
 
 Root and volume images are prebaked ext4 files. Creating a box decompresses
 and sizes those images; the guest grows the filesystems. Runtime hosts need no

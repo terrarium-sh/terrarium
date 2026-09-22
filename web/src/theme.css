@@ -96,8 +96,8 @@ nav a[aria-current] { color: var(--accent); text-decoration: underline; }
 .isolation-section { display: grid; grid-template-columns: 1fr 1.2fr; gap: 4rem; align-items: center; padding-block: 4rem; border-bottom: 1px solid var(--frost-border-color); }
 .isolation-section > div > p:not(.eyebrow) { color: var(--hint-color); font-size: 0.9rem; }
 .architecture { min-width: 0; margin: 0; }
-.diagram-label { color: var(--accent-strong); font: 0.65rem ui-monospace, monospace; text-transform: uppercase; letter-spacing: 0.08em; }
-.vm-boundary { border: 2px solid var(--glass-border-color); border-radius: 10px; background: var(--accent-soft); padding: 1.2rem; text-align: center; }
+.diagram-label { color: var(--accent-strong); font: 0.65rem ui-monospace, monospace; text-transform: uppercase; letter-spacing: 0.08em; text-align: center; margin-bottom: 0.65rem; }
+.vm-boundary { border: 2px solid var(--glass-border-color); border-radius: 10px; background: var(--accent-soft); padding: 0.85rem; text-align: center; }
 .workload { display: flex; flex-direction: column; gap: 0.25rem; padding: 0.8rem; border: 1px solid var(--glass-border-color); border-radius: 5px; background: #f5fbfc; color: var(--accent-strong); }
 .workload strong { font-size: 0.95rem; }
 .workload span, .vm-resources { font-size: 0.75rem; }
@@ -105,13 +105,15 @@ nav a[aria-current] { color: var(--accent); text-decoration: underline; }
 .architecture-bridge { display: grid; justify-items: center; color: var(--hint-color); font-size: 0.65rem; }
 .architecture-bridge::before, .architecture-bridge::after { content: ''; width: 1px; height: 0.7rem; background: var(--glass-border-color); }
 .architecture-bridge span { padding: 0.15rem 0.6rem; }
-.host-runtime { padding: 1.2rem; border: 1px solid var(--frost-border-color); border-radius: 10px; }
-.sandbox-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.65rem; }
-.wasm-sandbox { min-width: 0; padding: 0.75rem; border: 1px dashed var(--accent); border-radius: 5px; background: var(--accent-soft); }
-.wasm-sandbox > span { color: var(--accent); font: 0.6rem ui-monospace, monospace; }
-.wasm-sandbox h3 { font-size: 0.85rem; margin: 0.5rem 0 0.3rem; }
-.wasm-sandbox p { margin: 0; font-size: 0.7rem; color: var(--hint-color); }
-.host-api { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 0.3rem 0.75rem; margin-top: 1rem; padding: 0.65rem 0.8rem; border: 1px solid var(--glass-border-color); border-radius: 5px; color: var(--accent-strong); background: var(--glass-color); }
+.host-runtime { padding: 0.85rem; border: 1px solid var(--frost-border-color); border-radius: 10px; }
+.host-runtime .diagram-label { margin-bottom: 0.3rem; }
+.sandbox-legend { margin-bottom: 0.75rem; color: var(--hint-color); font-size: 0.65rem; text-align: center; }
+.sandbox-row { display: flex; flex-wrap: wrap; gap: 0.5rem; list-style: none; padding: 0; margin: 0; }
+.sandbox-row li { flex: 1 1 auto; padding: 0.65rem 0.5rem; border: 1px dashed var(--accent); border-radius: 5px; background: var(--accent-soft); color: var(--accent-strong); font-size: 0.75rem; font-weight: 600; text-align: center; }
+.sandbox-row + .sandbox-row { margin-top: 0.75rem; }
+.devices li { display: flex; flex: 1 1 4rem; flex-direction: column; align-items: center; gap: 0.5rem; padding: 0.85rem 0.5rem; background: var(--accent-strong); border-color: var(--glass-border-color); color: var(--accent-contrast); font-size: 0.75rem; font-weight: 650; }
+.devices svg { width: 1.4rem; height: 1.4rem; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+.host-api { display: flex; flex-direction: column; align-items: center; gap: 0.25rem; text-align: center; margin-top: 0.75rem; padding: 0.65rem 0.8rem; border: 1px solid var(--glass-border-color); border-radius: 5px; color: var(--accent-strong); background: var(--glass-color); }
 .host-api strong { font-size: 0.8rem; }
 .host-api span { font-size: 0.65rem; }
 .host-platform { margin: 0.85rem 0 0; font-size: 0.75rem; text-align: center; }
@@ -175,7 +177,6 @@ nav a[aria-current] { color: var(--accent); text-decoration: underline; }
   .hero-description { max-width: none; }
   .hero-art { width: min(100%, 350px); margin-inline: auto; }
   .principles { gap: 2rem; }
-  .sandbox-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .start-section { margin-block: 3rem; }
   .site-footer { flex-direction: column; margin-top: 3rem; }
   .reference-nav { position: static; flex-direction: row; flex-wrap: wrap; gap: 0.4rem; }

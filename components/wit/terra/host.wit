@@ -10,7 +10,7 @@ interface memory {
     /// batch limits before anything is allocated or copied.
     read: func(offset: u64, len: u64) -> result<list<u8>, memory-error>;
     write: func(offset: u64, data: list<u8>) -> result<_, memory-error>;
-    ram-bytes: func() -> u64;
+    address-limit: func() -> u64;
     enum memory-error { out-of-range, too-large, unmapped }
 }
 

@@ -19,6 +19,7 @@ struct SessionPty {
 
 pub(super) async fn execute(
     plan: &Plan,
+    control: &File,
     diagnostic: &Diagnostics,
     stop: &CancellationToken,
     shutdown: &CancellationToken,
@@ -32,6 +33,7 @@ pub(super) async fn execute(
     crate::sync::ensure_directory(Path::new(terra_protocol::WORKLOAD_HOME), true)
         .with_context(|| format!("creating home {}", terra_protocol::WORKLOAD_HOME))?;
     if plan.mode == PlanMode::Create {
+        crate::report_agent_ready(control).await?;
         return bake_if_stale(&plan.on_create, diagnostic, stop)
             .await
             .map(|()| 0);
@@ -47,6 +49,7 @@ pub(super) async fn execute(
         pts,
         drained,
     } = start_session(plan, port, startup.clone(), stop, shutdown, tasks).await?;
+    crate::report_agent_ready(control).await?;
     if !plan.on_start.is_empty() {
         session
             .feed_output(b"terra: running startup hooks\r\n")

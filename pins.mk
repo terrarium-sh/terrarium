@@ -16,8 +16,8 @@
 # Requires $(ARCH) — include it after those are set.
 
 # --- Terra guest kernel: upstream Linux LTS ---------------------------------
-KERNEL_VERSION := 6.18.52
-KERNEL_SHA256 := 2b69564f7d4fea0c859b1959ba33709ee6e9139bd100e30a853b57159a8221b8
+KERNEL_VERSION := 6.18.53
+KERNEL_SHA256 := 4d6fba95c2244b08a7b4144a4d38b9be4fb31abb5e7682ae40bb5cb11374cfe0
 KERNEL_URL := https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$(KERNEL_VERSION).tar.xz
 
 # --- e2fsprogs --------------------------------------------------------------
@@ -25,12 +25,12 @@ KERNEL_URL := https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$(KERNEL_VERSIO
 # build time; `resize2fs` ships inside the binary and is injected into the guest,
 # which grows them to the configured size. Pinned to the release tarball, not the
 # git tree: the tarball ships a generated `configure`, so no autoconf is needed.
-E2FSPROGS_VERSION := 1.47.2
-E2FSPROGS_SHA256 := 7a959221c1b1cc6e28b7d7a4e204a2ffd8ec6d8a2de4461c482b64c5f4463cca
+E2FSPROGS_VERSION := 1.47.4
+E2FSPROGS_SHA256 := da274408bebbfd13a5a2fc3cfc66e3ffff17c48534673aa67f88d49b99123b96
 E2FSPROGS_URL := https://mirrors.edge.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v$(E2FSPROGS_VERSION)/e2fsprogs-$(E2FSPROGS_VERSION).tar.gz
 
 # --- Alpine root filesystem -------------------------------------------------
-ALPINE_VERSION := 3.24.1
+ALPINE_VERSION := 3.24.2
 # Derived, deliberately: the mirror path is the *branch* (v3.24) while the
 # tarball is the *point release* (3.24.1), and hardcoding both is how a bump to
 # 3.25.0 ends up fetching from the v3.24 branch. $(basename) drops the last
@@ -58,8 +58,8 @@ DOAS_SHIM_APK := doas-sudo-shim-0.2.0-r0.apk
 # the shim, which is a shell script but ships in a per-arch .apk. Suffixed
 # variables rather than a conditional, so adding an arch is three lines and
 # forgetting one is the error below rather than an empty (silently failing) hash.
-ALPINE_SHA256_x86_64 := 41f73e3cf5fa919b8aa5ca6b30dc48f0da2720776d7423e2a7748211456fe081
-ALPINE_SHA256_aarch64 := f55a90f69052c5bd6f92cb09a8f47065970830b194c917a006fb94028e721259
+ALPINE_SHA256_x86_64 := c5ca053cfe1d85c5b96dff8b9bc57045f7f184a30ffb6b65776409ca90388677
+ALPINE_SHA256_aarch64 := 9bf70a7f18ea44094cbb5f70c58f9af129c8214745743db0e68e5502cc2ce773
 DOAS_SHA256_x86_64 := 1b0198d957fee06b484fc0e23783f03213cc97d8003c5f46b8d940d8ca9f57c8
 DOAS_SHA256_aarch64 := 7d35ce1a0a76de43f7621e2099e45bfd83e6d8cf667db657633ab1f374d05f72
 DOAS_SHIM_SHA256_x86_64 := 74361be22e06e395703ea5bef1f53a8f21a3350a06748ab6eb404c2c916bb35b

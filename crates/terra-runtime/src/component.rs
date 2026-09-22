@@ -1,8 +1,11 @@
 pub(crate) mod bindings;
 pub mod block;
+pub(crate) mod clocks;
 pub mod context;
 pub mod fs;
+pub mod interrupt_controller;
 pub mod mem;
+pub mod mmio;
 pub mod network;
 pub mod policy;
 pub(crate) mod relay;
@@ -13,7 +16,7 @@ pub type InterruptCallback = std::sync::Arc<dyn Fn(bool) -> wasmtime::Result<()>
 
 mod device_loop;
 
-pub use vmm::mmio::MmioDevice;
+pub use mmio::MmioDevice;
 
 #[cfg(test)]
 #[derive(Clone)]

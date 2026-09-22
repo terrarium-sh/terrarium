@@ -827,17 +827,16 @@ fn resolved_answers_are_canonical_unique_and_port_scoped() {
 
 #[test]
 fn learned_grants_expire_independently_and_refresh_without_shortening() {
-    use std::time::{Duration, Instant};
     let p = build_box_policy(NetworkMode::Allowlist, &["api.test:443", "api.test:8443"]);
     let ip = "1.1.1.1".parse().unwrap();
     p.accept_resolved("api.test", &[ip]);
-    let now = Instant::now();
+    let now = crate::monotonic_now();
     {
         let mut cache = p.learned_dns.lock().unwrap();
         let expires = *cache.peek(&(ip, Some(443))).unwrap();
-        assert!(expires > now && expires <= now + Duration::from_mins(1));
+        assert!(expires > now && expires <= now + 60_000_000_000);
         cache.put((ip, Some(443)), now);
-        cache.put((ip, Some(8443)), now + Duration::from_mins(2));
+        cache.put((ip, Some(8443)), now + 120_000_000_000);
     }
     assert!(!p.allows(ip, Some(443)));
     assert!(p.allows(ip, Some(8443)));
@@ -850,7 +849,7 @@ fn learned_grants_expire_independently_and_refresh_without_shortening() {
             .unwrap()
             .peek(&(ip, Some(8443)))
             .unwrap(),
-        now + Duration::from_mins(2)
+        now + 120_000_000_000
     );
     p.learned_dns.lock().unwrap().put((ip, None), now);
     assert!(!p.allows(ip, Some(80)));

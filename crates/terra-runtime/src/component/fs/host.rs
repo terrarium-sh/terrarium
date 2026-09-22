@@ -309,9 +309,10 @@ pub fn fs_component_linker<T: WasiView + AsMut<FsHost> + 'static>(
     engine: &wasmtime::Engine,
 ) -> wasmtime::Result<wasmtime::component::Linker<T>> {
     use wasmtime_wasi::filesystem::WasiFilesystemView;
-    let mut linker = crate::component::context::device_component_linker(engine)?;
-    types::add_to_linker::<T, WasiFilesystem>(&mut linker, T::filesystem)?;
+    let mut linker = wasmtime::component::Linker::new(engine);
+    crate::component::clocks::add_monotonic_wait_for(&mut linker)?;
     add_descriptor_lifecycle(&mut linker, T::filesystem, AsMut::as_mut)?;
+    super::resource_linker::add(&mut linker, T::filesystem)?;
     terra::fs::host::add_to_linker::<T, HasSelf<FsHost>>(&mut linker, AsMut::as_mut)?;
     preopens::add_to_linker::<T, HasSelf<FsHost>>(&mut linker, AsMut::as_mut)?;
     crate::component::context::add_device_imports(&mut linker, |host: &mut T| {

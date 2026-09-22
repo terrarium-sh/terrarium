@@ -1,9 +1,15 @@
-Subject: [PATCH] x86/time: discard the legacy clockevent when its IRQ is unavailable
+Subject: [PATCH] x86/time: avoid unavailable legacy clockevents in virtual guests
 
 WHP guests have a local APIC timer but no legacy timer IRQ. Keeping
 global_clock_event after request_irq() fails makes LAPIC calibration verify
 against jiffies that never advance, disabling the working LAPIC timer.
 Clear the unavailable reference so calibration uses the supplied TSC frequency.
+
+Virtual guests with a known TSC frequency and an always-running local APIC
+can calibrate the APIC timer by polling the TSC. Avoid initializing a legacy
+clockevent in that case: IRQ registration may succeed even when the VMM has
+no PIT, leaving verification to reject a working APIC timer against stalled
+jiffies. Keep PIT fallback when frequencies or a usable local APIC are absent.
 
 --- a/arch/x86/kernel/time.c
 +++ b/arch/x86/kernel/time.c
@@ -19,3 +25,16 @@ Clear the unavailable reference so calibration uses the supplied TSC frequency.
  }
  
  /* Default timer init function */
+
+--- a/arch/x86/kernel/apic/apic.c
++++ b/arch/x86/kernel/apic/apic.c
+@@ -781,6 +781,9 @@
+ 	/* APIC timer disabled? */
+ 	if (disable_apic_timer)
+ 		return true;
++	/* Virtual guests can calibrate the always-running APIC timer against TSC. */
++	if (boot_cpu_has(X86_FEATURE_HYPERVISOR))
++		return false;
+ 	/*
+ 	 * The APIC timer frequency is known already, no PIT calibration
+ 	 * required. If unknown, let the PIT be initialized.

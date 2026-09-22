@@ -58,3 +58,15 @@ async fn a_socket_transfers_more_than_its_buffer_without_blocking() {
     .unwrap();
     assert_eq!(output, vec![42; 1 << 20]);
 }
+
+#[tokio::test]
+async fn agent_readiness_uses_control_without_waiting_for_hooks() {
+    let (agent, host) = UnixStream::pair().unwrap();
+    let control = File::from(OwnedFd::from(agent));
+    let mut host = crate::into_async_file(host).unwrap();
+    report_agent_ready(&control).await.unwrap();
+    let event = terra_protocol::read_frame_async::<LifecycleEvent>(&mut host)
+        .await
+        .unwrap();
+    assert_eq!(event, Some(LifecycleEvent::AgentReady));
+}

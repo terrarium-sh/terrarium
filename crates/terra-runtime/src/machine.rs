@@ -89,7 +89,7 @@ impl MachineConfig {
 
         VmConfig {
             ram_base: match self.architecture() {
-                Architecture::X86 => 0,
+                Architecture::X86 => terra_limits::X86_RAM_BASE,
                 Architecture::Arm => terra_limits::ARM_RAM_BASE,
             },
             ram_bytes: self.ram_bytes(),
@@ -205,12 +205,12 @@ fn x86_layout(
     block_count: usize,
     share_count: usize,
 ) -> Result<Layout, LayoutError> {
-    const MMIO_BASE: u64 = 0xd000_0000;
-    const MMIO_STRIDE: u64 = 0x1000;
+    const MMIO_BASE: u64 = terra_limits::X86_MMIO_BASE;
+    const MMIO_STRIDE: u64 = terra_limits::X86_MMIO_STRIDE;
     const MOUNT_IRQS: [u32; 3] = [17, 18, 19];
     const VOLUME_IRQS: [u32; 3] = [20, 21, 22];
-    if ram_size > MMIO_BASE {
-        return Err(LayoutError::Overlap);
+    if terra_limits::x86_ram_layout(ram_size).is_none() {
+        return Err(LayoutError::RamOverflow);
     }
     let base_count = block_count
         .checked_add(2)
@@ -269,7 +269,7 @@ fn arm_layout(
         .and_then(|count| count.checked_add(3))
         .filter(|count| *count <= terra_limits::ARM_MAX_DEVICES)
         .ok_or(LayoutError::TooManyDevices)?;
-    if terra_limits::ARM_RAM_BASE.checked_add(ram_size).is_none() {
+    if terra_limits::arm_ram_layout(ram_size).is_none() {
         return Err(LayoutError::RamOverflow);
     }
     let devices = (0..count)
@@ -314,7 +314,7 @@ mod tests {
             let config = layout.to_machine_config(2).unwrap();
             let expected = VmConfig {
                 ram_base: match architecture {
-                    Architecture::X86 => 0,
+                    Architecture::X86 => terra_limits::X86_RAM_BASE,
                     Architecture::Arm => terra_limits::ARM_RAM_BASE,
                 },
                 ram_bytes: 8 << 20,
@@ -397,7 +397,7 @@ mod tests {
                 DeviceKind::Memory,
             ]
         );
-        assert_eq!(layout.devices()[0].mmio_base, 0xd000_0000);
+        assert_eq!(layout.devices()[0].mmio_base, terra_limits::X86_MMIO_BASE);
         assert_eq!(layout.devices()[5].irq, 15);
     }
 
@@ -428,8 +428,15 @@ mod tests {
             Err(LayoutError::Unaligned)
         );
         assert_eq!(
-            build_machine_layout_for(Architecture::X86, 0xd000_0000 + PAGE_SIZE, 1, 0),
-            Err(LayoutError::Overlap)
+            build_machine_layout_for(
+                Architecture::X86,
+                terra_limits::X86_RAM_LOW_END - terra_limits::X86_RAM_BASE + PAGE_SIZE,
+                1,
+                0,
+            )
+            .unwrap()
+            .ram_size(),
+            terra_limits::X86_RAM_LOW_END - terra_limits::X86_RAM_BASE + PAGE_SIZE
         );
         assert_eq!(
             build_machine_layout_for(Architecture::X86, 512 << 20, usize::MAX, 0),

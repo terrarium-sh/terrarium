@@ -205,6 +205,55 @@ fn dropped_boot_store_releases_its_shared_memory_reservation() {
     assert_eq!(root.memory_budget.reserved(), 0);
 }
 
+#[tokio::test]
+async fn repeated_mmio_service_startup_releases_its_memory_reservation() {
+    let engine = device_engine().expect("engine");
+    let component = wasmtime::component::Component::new(&engine, crate::test_fixtures::wasm::MMIO)
+        .expect("MMIO component");
+    for _ in 0..2 {
+        let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
+        let memory_budget = Arc::clone(&runtime.memory_budget);
+        runtime
+            .initialize_mmio(&component)
+            .await
+            .expect("MMIO service");
+        assert!(memory_budget.reserved() > 0);
+        drop(runtime);
+        assert_eq!(memory_budget.reserved(), 0);
+    }
+}
+
+#[tokio::test]
+async fn mmio_service_does_not_reduce_device_admission() {
+    let engine = device_engine().expect("engine");
+    let component = wasmtime::component::Component::new(&engine, crate::test_fixtures::wasm::MMIO)
+        .expect("MMIO component");
+    let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
+    let controller = runtime.new_child(crate::box_runtime::store::RootHost::new());
+    runtime.attach_child(controller).expect("controller worker");
+    runtime.interrupt_controller_configured = true;
+    runtime
+        .initialize_mmio(&component)
+        .await
+        .expect("MMIO service");
+    for _ in 0..MAX_BOX_COMPONENTS {
+        crate::component::mmio::MmioDevice::grant_worker(
+            &mut runtime,
+            crate::machine::DeviceKind::Block,
+            Box::new(|_| Box::pin(async { unreachable!() })),
+        )
+        .expect("device admission");
+    }
+    assert!(
+        crate::component::mmio::MmioDevice::grant_worker(
+            &mut runtime,
+            crate::machine::DeviceKind::Block,
+            Box::new(|_| Box::pin(async { unreachable!() })),
+        )
+        .is_err()
+    );
+}
+
 struct DropFlag(Arc<AtomicBool>);
 
 impl Drop for DropFlag {
@@ -339,6 +388,83 @@ async fn child_failure_or_panic_stops_a_running_root() {
 }
 
 #[tokio::test]
+async fn child_failure_stops_native_resources_before_healthy_workers_drop() {
+    use crate::component::vmm::teardown::DeviceShutdown;
+    use crate::machine::DeviceKind;
+
+    struct DropAfterNativeStop {
+        native_stopped: Arc<AtomicBool>,
+        dropped_after_stop: Arc<AtomicBool>,
+    }
+
+    impl Drop for DropAfterNativeStop {
+        fn drop(&mut self) {
+            self.dropped_after_stop.store(
+                self.native_stopped.load(Ordering::Acquire),
+                Ordering::Release,
+            );
+        }
+    }
+
+    let engine = device_engine().expect("engine");
+    let mut root = BoxRuntime::new(&engine, BoxHost::new()).expect("root runtime");
+    let native_stopped = Arc::new(AtomicBool::new(false));
+    let native_stop = Arc::clone(&native_stopped);
+    root.add_device_shutdown(DeviceShutdown::new(DeviceKind::Memory, async move {
+        native_stop.store(true, Ordering::Release);
+        Ok(())
+    }))
+    .expect("native teardown");
+    root.register_loop(Box::new(|_| {
+        Box::pin(async { std::future::pending::<wasmtime::Result<()>>().await })
+    }))
+    .expect("root loop");
+
+    let dropped_after_stop = Arc::new(AtomicBool::new(false));
+    let (healthy_ready, failed_child) = tokio::sync::oneshot::channel();
+    let mut healthy = root.new_child(crate::box_runtime::store::RootHost::new());
+    let healthy_native_stopped = Arc::clone(&native_stopped);
+    let healthy_dropped_after_stop = Arc::clone(&dropped_after_stop);
+    healthy
+        .register_loop(Box::new(move |_| {
+            let guard = DropAfterNativeStop {
+                native_stopped: Arc::clone(&healthy_native_stopped),
+                dropped_after_stop: Arc::clone(&healthy_dropped_after_stop),
+            };
+            Box::pin(async move {
+                let _guard = guard;
+                healthy_ready.send(()).expect("healthy worker starts");
+                std::future::pending::<wasmtime::Result<()>>().await
+            })
+        }))
+        .expect("healthy child loop");
+    root.attach_child(healthy).expect("healthy child");
+
+    let mut failing = root.new_child(crate::box_runtime::store::RootHost::new());
+    failing
+        .register_loop(Box::new(move |_| {
+            Box::pin(async move {
+                failed_child.await.expect("healthy worker starts");
+                Err(wasmtime::Error::msg("service worker failed"))
+            })
+        }))
+        .expect("failing child loop");
+    root.attach_child(failing).expect("failing child");
+
+    let error = root
+        .prepare()
+        .await
+        .expect("prepared runtime")
+        .start()
+        .join()
+        .await
+        .expect_err("service worker fails");
+    assert!(error.to_string().contains("service worker failed"));
+    assert!(native_stopped.load(Ordering::Acquire));
+    assert!(dropped_after_stop.load(Ordering::Acquire));
+}
+
+#[tokio::test]
 async fn completed_root_stops_child_workers() {
     let engine = device_engine().expect("engine");
     let mut root = BoxRuntime::new(&engine, BoxHost::new()).expect("root runtime");
@@ -451,9 +577,12 @@ async fn competing_failures_publish_the_primary_error_before_native_cleanup() {
 
     let engine = device_engine().unwrap();
     let mut root = BoxRuntime::new(&engine, BoxHost::new()).unwrap();
-    let router =
+    let vmm =
         wasmtime::component::Component::new(&engine, crate::test_fixtures::wasm::VMM).unwrap();
-    root.initialize_vmm(&router).await.unwrap();
+    let mmio =
+        wasmtime::component::Component::new(&engine, crate::test_fixtures::wasm::MMIO).unwrap();
+    root.initialize_mmio(&mmio).await.unwrap();
+    root.initialize_vmm(&vmm).await.unwrap();
     let failure = root.vmm.as_ref().unwrap().failure_sink();
     let outcome = root.lifecycle_notifier().subscribe();
     let (entered, started) = tokio::sync::oneshot::channel();

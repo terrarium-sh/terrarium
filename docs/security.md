@@ -68,9 +68,13 @@ mount capability.
 
 ## Runtime boundary
 
-Terra creates separate Wasmtime stores and linkers for the VMM and device
-components. Native code owns VM creation, guest-RAM mappings, hypervisor
-handles, host I/O, and the checks that grant filesystem and network authority.
+Terra creates a separate Wasmtime store, linear memory, resource table and host
+state for each VMM and device component, with an explicitly restricted linker.
+This is a software fault isolation security boundary: Wasmtime confines component
+memory accesses and control flow, while native effects require explicitly
+granted functions, resources or stream endpoints. Native code owns VM creation,
+guest-RAM mappings, hypervisor handles,
+host I/O, and the checks that grant filesystem and network authority.
 Guest-memory, block-I/O, and reclaim requests are range- and overflow-checked
 before native access. Block disks are opened as fixed-capacity grants; guest
 writes cannot extend their initial extent. The filesystem component receives a
@@ -86,12 +90,31 @@ opaque vCPU resources; device components cannot create or select a hypervisor.
 
 | Component | Scoped authority beyond runtime support |
 | --- | --- |
+| VMM | Scoped VM/vCPU lifecycle resources and access to the MMIO client. |
+| MMIO | Supplied device mappings and explicitly connected request/reply streams; no imported host functions. |
+| Interrupt controller | Supplied interrupt topology and value-based operations; no imported host functions. |
 | Block | Its VM's RAM, assigned interrupt and one fixed-capacity backing disk. |
 | Filesystem | Its VM's RAM, assigned interrupt and one directory preopen. |
 | Network | Its VM's RAM, assigned interrupt, policy-controlled WASI sockets/DNS, and warnings in the capped host log. |
 | Memory | Its VM's RAM, assigned interrupt and bounded reclamation of that RAM. |
 | Vsock | Its VM's RAM, assigned interrupt, supplied local service streams and secure randomness. |
 | Policy | Immutable policy configuration and host-submitted resolver results; no guest RAM, filesystem or sockets. |
+
+The MMIO bridge and software interrupt controller each run in their own
+restricted store with an empty host-function linker. They have no host memory,
+WASI, filesystem, network, clock, random, VM, vCPU, or guest-RAM capability.
+The MMIO adapter accepts a reply only for the mapped device and access range.
+The controller adapter accepts only granted GSI lines and valid x86 interrupt
+vectors and destinations before injecting an interrupt. These checks make the
+split a security measure against a compromised service component: it cannot
+directly access the host or apply an unchecked native effect. Device connections
+can still indirectly cause the particular host I/O authorized for that device.
+
+This SFI boundary is within one host process. It relies on Wasmtime's Wasm
+memory and control-flow enforcement, the correctness of the registered host
+functions, and the native adapters. It is therefore not a defense against a
+Wasmtime, native-runtime, hypervisor, or host-kernel vulnerability, and it does
+not isolate components into separate operating-system processes.
 
 Components inherit no host environment, arguments or standard streams. Devices
 can read and corrupt their own VM's RAM: component isolation protects the host
@@ -138,8 +161,9 @@ Running Terra as host root expands the impact of a boundary failure.
 - Attached workload output is guest-controlled terminal input. A hostile guest
   can emit terminal control sequences, so use a terminal policy appropriate for
   untrusted output.
-- Component isolation reduces the authority given to device code. It does not
-  make Wasmtime, WASI, native adapters, or the hypervisor untrusted.
+- Component isolation is a host-security boundary for component code within its
+  trusted computing base. It does not protect against a defect in Wasmtime,
+  WASI, native adapters, or the hypervisor.
 - Cancellation and timeouts do not roll back a host write or forcibly interrupt
   an operating-system I/O operation already in progress.
 - Terra does not provide a hard defense against denial of service, hardware

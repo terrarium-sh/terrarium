@@ -32,6 +32,7 @@ pub fn decode_control(bytes: &[u8]) -> Result<ControlResult, Error> {
     let mut result = ControlResult {
         consumed: 0,
         exit_code: None,
+        agent_ready: false,
     };
     for _ in 0..MAX_MESSAGES {
         let unread = &bytes[result.consumed as usize..];
@@ -46,6 +47,7 @@ pub fn decode_control(bytes: &[u8]) -> Result<ControlResult, Error> {
                 result.exit_code = Some(code);
                 return Ok(result);
             }
+            LifecycleEvent::AgentReady => result.agent_ready = true,
             LifecycleEvent::Diagnostic { .. } => {}
         }
     }
@@ -70,7 +72,9 @@ pub fn decode_diagnostics(bytes: &[u8]) -> Result<DiagnosticResult, Error> {
         };
         match event {
             LifecycleEvent::Diagnostic { bytes } => result.output.extend_from_slice(&bytes),
-            LifecycleEvent::Exit { .. } => return Err(Error::Malformed),
+            LifecycleEvent::Exit { .. } | LifecycleEvent::AgentReady => {
+                return Err(Error::Malformed);
+            }
         }
         result.consumed += u32::try_from(consumed).map_err(|_| Error::Malformed)?;
     }
@@ -80,6 +84,23 @@ pub fn decode_diagnostics(bytes: &[u8]) -> Result<DiagnosticResult, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readiness_survives_fragmentation_and_precedes_exit() {
+        let ready = frame(&LifecycleEvent::AgentReady);
+        for end in 0..ready.len() {
+            let partial = decode_control(&ready[..end]).unwrap();
+            assert!(!partial.agent_ready);
+            assert_eq!(partial.consumed, 0);
+        }
+        let mut bytes = ready;
+        bytes.extend_from_slice(&frame(&LifecycleEvent::Exit { code: 7 }));
+        let result = decode_control(&bytes).unwrap();
+        assert!(result.agent_ready);
+        assert_eq!(result.exit_code, Some(7));
+        assert_eq!(result.consumed as usize, bytes.len());
+        assert!(decode_diagnostics(&frame(&LifecycleEvent::AgentReady)).is_err());
+    }
 
     fn frame(event: &impl serde::Serialize) -> Vec<u8> {
         let payload = serde_json::to_vec(event).unwrap();

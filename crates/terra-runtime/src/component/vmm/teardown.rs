@@ -155,6 +155,7 @@ impl NativeTeardown {
         self.task().wait_until(deadline).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn wait_until_finished(&self) -> Outcome {
         self.task().wait_until_finished().await
     }

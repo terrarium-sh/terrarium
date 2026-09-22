@@ -276,7 +276,7 @@ pub fn configure() -> Result<(), DeviceError> {
         mmio: MmioTransport::new(
             0,
             0x200,
-            super::terra::host::memory::ram_bytes(),
+            super::terra::host::memory::address_limit(),
             1,
             1 << 32,
             QUEUE_SIZE,

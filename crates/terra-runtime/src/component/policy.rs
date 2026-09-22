@@ -93,7 +93,8 @@ impl PolicyFactory {
         store.limiter(|host| &mut host.limits);
         store.set_epoch_deadline(u64::MAX);
         store.set_fuel(CALL_FUEL)?;
-        let linker = crate::component::context::device_component_linker(&self.engine)?;
+        let mut linker = wasmtime::component::Linker::new(&self.engine);
+        crate::component::clocks::add_monotonic_now(&mut linker)?;
         let bindings = complete_decision(Policy::instantiate_async(
             &mut store,
             &self.component,
@@ -701,8 +702,8 @@ mod tests {
         assert!(instantiate(&excessive).is_err());
         excessive.allow = vec!["a".repeat(MAX_CONFIG_BYTES + 1)];
         assert!(instantiate(&excessive).is_err());
-        let linker =
-            crate::component::context::device_component_linker::<Host>(&factory().engine).unwrap();
+        let mut linker = wasmtime::component::Linker::<Host>::new(&factory().engine);
+        crate::component::clocks::add_monotonic_now(&mut linker).unwrap();
         for (interface, name, export) in [
             (
                 "wasi:filesystem/types@0.3.1",
@@ -716,13 +717,23 @@ mod tests {
             ),
             (
                 "terra:host/memory@0.1.0",
-                "ram-bytes",
+                "address-limit",
                 "(func (result u64))",
             ),
             (
                 "wasi:random/random@0.3.1",
                 "get-random-u64",
                 "(func (result u64))",
+            ),
+            (
+                "wasi:clocks/monotonic-clock@0.3.1",
+                "get-resolution",
+                "(func (result u64))",
+            ),
+            (
+                "wasi:clocks/monotonic-clock@0.3.1",
+                "wait-until",
+                "(func (param \"when\" u64))",
             ),
         ] {
             let probe = Component::new(

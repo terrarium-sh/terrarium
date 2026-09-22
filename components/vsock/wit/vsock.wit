@@ -2,7 +2,7 @@ package terra:vsock@0.1.0;
 
 interface host-service {
     enum endpoint-error { closed, io, too-large }
-    variant event { diagnostic(list<u8>), exit(s32) }
+    variant event { diagnostic(list<u8>), exit(s32), agent-ready }
     resource client {
         input: func() -> stream<u8>;
         output: async func(bytes: stream<u8>) -> result<_, endpoint-error>;
@@ -21,7 +21,7 @@ interface api {
     record reply { header: list<u8>, payload: list<u8> }
     record connection { guest-port: u32, host-port: u32 }
     enum error { table-full, backpressure, unknown-connection, malformed }
-    record control-result { consumed: u32, exit-code: option<s32> }
+    record control-result { consumed: u32, exit-code: option<s32>, agent-ready: bool }
     record diagnostic-result { consumed: u32, output: list<u8> }
     run: async func() -> result<_, error>;
     decode-control: func(bytes: list<u8>) -> result<control-result, error>;

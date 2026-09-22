@@ -3,13 +3,12 @@
 use crate::cli::BootArgs;
 use crate::session::{self, DETACH_KEY_NAME, SessionOutcome, pump_session};
 use crate::state::BoxRef;
-use crate::sys::POLL;
 use crate::{config, sys};
 use anyhow::{Context, Result};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ExitCode};
+use std::process::{Child, ExitCode, ExitStatus};
 use std::time::{Duration, Instant};
 use terra_platform::io::local::AsyncLocalStream;
 
@@ -55,7 +54,10 @@ impl BootSpec {
     }
 }
 
-const DETACH_CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
+const DETACH_READY_DEADLINE: Duration =
+    Duration::from_secs(terra_runtime::orchestration::GUEST_BOOT_TIMEOUT.as_secs() + 30);
+const KILL_REAP_WAIT: Duration = Duration::from_secs(2);
+
 const MAX_BOOT_SPEC_BYTES: u64 = 64 << 20;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -186,7 +188,7 @@ fn spawn_vm_process(bx: &BoxRef, spec: &BootSpec, lock: &File) -> Result<std::pr
     cmd.arg(VM_PROCESS_FLAG_ARG)
         .arg(bx.get_dir())
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null());
     sys::detach(&mut cmd);
     let inheritance = sys::pass_lock(&mut cmd, lock)?;
@@ -235,24 +237,31 @@ fn read_log_tail(path: &Path) -> String {
     )
 }
 
-/// Replay the tail of the VM's log after a failure - a box that ended well
-/// said what it had to say through its session. The status is the caller's to
-/// decide: each caller's failure means something different.
 fn replay_logs(bx: &BoxRef, status: std::process::ExitStatus) {
     if !status.success() {
-        for (label, path) in [
-            ("host log", bx.get_dir().join(crate::state::LOG_FILE)),
-            (
-                "guest diagnostics",
-                bx.get_dir().join(crate::state::DIAGNOSTICS_LOG),
-            ),
-        ] {
-            let tail = read_log_tail(&path);
-            if !tail.is_empty() {
-                eprint!("terra: {label}:\n{tail}");
-            }
+        let _ = write_boot_logs(bx, &mut std::io::stderr().lock());
+    }
+}
+
+fn write_boot_logs(bx: &BoxRef, output: &mut impl std::io::Write) -> std::io::Result<()> {
+    for (label, path) in [
+        ("host log", bx.get_dir().join(crate::state::LOG_FILE)),
+        (
+            "guest diagnostics",
+            bx.get_dir().join(crate::state::DIAGNOSTICS_LOG),
+        ),
+    ] {
+        let tail = read_log_tail(&path);
+        if !tail.is_empty() {
+            writeln!(output, "terra: {label}:\n{tail}")?;
+        } else if label == "guest diagnostics" {
+            writeln!(
+                output,
+                "terra: no guest diagnostics were received; inspect the host log for boot failures"
+            )?;
         }
     }
+    Ok(())
 }
 
 fn compute_vm_child_exit_byte(bx: &BoxRef, status: std::process::ExitStatus) -> u8 {
@@ -263,63 +272,107 @@ fn compute_vm_child_exit_byte(bx: &BoxRef, status: std::process::ExitStatus) -> 
     crate::exit_status_byte(status.code().unwrap_or(1))
 }
 
-fn claims_the_box(bx: &BoxRef, child_pid: u32) -> bool {
-    bx.read_vm_process().is_some_and(|vm| vm.pid == child_pid)
-}
-
-fn compute_detached_exit_byte(bx: &BoxRef, child_pid: u32, status: std::process::ExitStatus) -> u8 {
-    replay_logs(bx, status);
-    if claims_the_box(bx, child_pid) {
-        return 0;
-    }
-    if !status.success() {
-        eprintln!("terra: {bx} failed to start");
-    }
-    compute_vm_child_exit_byte(bx, status)
-}
-
-/// Spawn the VM and leave it - a child that exits before claiming the box is
-/// reported with its logs and exit code
 fn spawn_detached(bx: &BoxRef, spec: &BootSpec, run_lock: File) -> Result<ExitCode> {
-    let mut child = spawn_vm_process(bx, spec, &run_lock)?;
-    // The child holds the same lock now, and this process is about to leave -
-    // keeping a copy would leave the box reading as running after the VM died.
+    let child = spawn_vm_process(bx, spec, &run_lock)?;
     drop(run_lock);
+    wait_for_detached_agent(bx, child, DETACH_READY_DEADLINE)
+}
 
-    let deadline = Instant::now() + DETACH_CONFIRM_TIMEOUT;
-    loop {
-        if let Some(status) = child.try_wait().context("checking on the VM")? {
-            return Ok(ExitCode::from(compute_detached_exit_byte(
-                bx,
+fn wait_for_detached_agent(bx: &BoxRef, mut child: Child, timeout: Duration) -> Result<ExitCode> {
+    let ready = child.stdout.take().context("opening VM startup pipe")?;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::Builder::new()
+        .name("vm-startup".into())
+        .spawn(move || {
+            let _ = sender.send(read_agent_ready(ready));
+        });
+    let notification = reader
+        .context("starting VM startup reader")
+        .and_then(|_| {
+            receiver
+                .recv_timeout(timeout)
+                .context("waiting for VM startup notification")
+        })
+        .and_then(std::convert::identity);
+    let (startup_pipe_closed, failure) = match notification {
+        Ok(true) => {
+            eprintln!(
+                "terra: started {bx} detached (pid {}); agent ready; logs: {}",
                 child.id(),
-                status,
-            )));
+                bx.build_logs_command()
+            );
+            return Ok(ExitCode::SUCCESS);
         }
-        if claims_the_box(bx, child.id()) || Instant::now() >= deadline {
-            break;
-        }
-        std::thread::sleep(POLL);
-    }
-    // "Started" is claimed only once the child has published its pid -
-    // before that no command can find the box, and saying "started" would
-    // send someone to `terra stop` for nothing. The unclaimed case succeeds
-    // too: the VM is running, which is all `-d` asked for.
-    if claims_the_box(bx, child.id()) {
-        eprintln!(
-            "terra: started {bx} detached (pid {}); logs: {}",
-            child.id(),
-            bx.build_logs_command()
-        );
+        Ok(false) => (
+            true,
+            "closed its startup pipe before reporting guest agent readiness".to_owned(),
+        ),
+        Err(error) => (
+            false,
+            format!(
+                "never reported guest agent readiness (startup deadline {} seconds): {error:#}",
+                timeout.as_secs()
+            ),
+        ),
+    };
+    let status = if startup_pipe_closed {
+        wait_for_child_exit(&mut child, KILL_REAP_WAIT)?
     } else {
-        eprintln!(
-            "terra: {bx} is still starting after {}s and has not claimed the box yet \
-             (pid {}); logs: {}",
-            DETACH_CONFIRM_TIMEOUT.as_secs(),
-            child.id(),
-            bx.build_logs_command()
+        None
+    };
+    let status = match status {
+        Some(status) => Ok(status),
+        None => kill_and_reap_vm(child),
+    };
+    let _ = write_boot_logs(bx, &mut std::io::stderr().lock());
+    eprintln!("terra: {bx} {failure}; see `{}`", bx.build_logs_command());
+    let status = status?;
+    Ok(ExitCode::from(
+        compute_vm_child_exit_byte(bx, status).max(1),
+    ))
+}
+
+fn kill_and_reap_vm(mut child: Child) -> Result<ExitStatus> {
+    if let Some(status) = child.try_wait().context("checking failed VM startup")? {
+        return Ok(status);
+    }
+    child.kill().context("killing VM after failed startup")?;
+    if let Some(status) = wait_for_child_exit(&mut child, KILL_REAP_WAIT)? {
+        return Ok(status);
+    }
+    let pid = child.id();
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    anyhow::bail!(
+        "VM process {pid} did not exit within {} seconds after being killed",
+        KILL_REAP_WAIT.as_secs()
+    )
+}
+
+fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> Result<Option<ExitStatus>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().context("reaping failed VM startup")? {
+            return Ok(Some(status));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(
+            crate::sys::POLL.min(deadline.saturating_duration_since(Instant::now())),
         );
     }
-    Ok(ExitCode::SUCCESS)
+}
+
+fn read_agent_ready(mut reader: impl Read) -> Result<bool> {
+    let mut ready = [0];
+    match reader.read_exact(&mut ready) {
+        Ok(()) if ready == [terra_protocol::AGENT_READY_NOTIFICATION] => Ok(true),
+        Ok(()) => anyhow::bail!("invalid VM startup notification"),
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(error) => Err(error).context("reading VM startup notification"),
+    }
 }
 
 fn reap(owner: Option<&mut Child>) {
@@ -399,6 +452,7 @@ async fn run_attached(
             // A VM that ends before any session was a fast workload or a
             // failed boot - either way its exit code is the answer.
             let Some(status) = child.try_wait().context("checking on the VM")? else {
+                let _ = write_boot_logs(bx, &mut std::io::stderr().lock());
                 return Err(e);
             };
             replay_logs(bx, status);
@@ -472,50 +526,62 @@ mod tests {
         assert!(tail.contains("secret"));
     }
 
-    /// A detached child that exited *without ever claiming the box* never
-    /// started, and says so with the child's own status. Which side of
-    /// [`spawn_detached`]'s deadline the death lands on is timing, so every
-    /// look at the child answers through here - a second look that reported
-    /// plain "started" made `terra <box> -d` exit 0 with nothing running.
-    ///
-    /// A child that *did* claim the box first is the other case: a workload
-    /// fast enough to finish inside the window, where "started" is the honest
-    /// answer whatever it exited with.
     #[test]
-    fn a_detached_child_that_never_claimed_the_box_is_a_failed_start() {
+    fn missing_guest_logs_do_not_hide_host_boot_failure() {
         let dir = tempfile::tempdir().unwrap();
-        let bx = BoxRef::from_state_dir(dir.path().join("dev"), dir.path());
-        std::fs::create_dir_all(bx.get_dir()).unwrap();
-        let exited_with = |code: u8| {
-            use std::io::Write as _;
-            let mut child = sys::build_test_child_command().spawn().unwrap();
-            child.stdin.take().unwrap().write_all(&[code]).unwrap();
-            child.wait().unwrap()
-        };
+        let bx = BoxRef::from_state_dir(dir.path().to_path_buf(), dir.path());
+        std::fs::write(
+            dir.path().join(crate::state::LOG_FILE),
+            b"vCPU 0 failed: KVM_RUN\n",
+        )
+        .unwrap();
+        let mut output = Vec::new();
+        write_boot_logs(&bx, &mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("vCPU 0 failed: KVM_RUN"));
+        assert!(output.contains("no guest diagnostics were received"));
+    }
 
-        // Never claimed: the child's own status, failure and all.
-        assert_eq!(compute_detached_exit_byte(&bx, 4242, exited_with(3)), 3);
-        assert_eq!(compute_detached_exit_byte(&bx, 4242, exited_with(0)), 0);
+    #[test]
+    fn detached_start_requires_an_explicit_agent_ready_notification() {
+        assert!(read_agent_ready(b"R".as_slice()).unwrap());
+        assert!(!read_agent_ready(b"".as_slice()).unwrap());
+        assert!(read_agent_ready(b"X".as_slice()).is_err());
+    }
 
-        // A child a host signal took has no code of its own: the shell's
-        // 128+signal spelling, not a bare 1 that reads as the workload's.
-        #[cfg(unix)]
-        {
-            let killed = std::process::Command::new("/bin/sh")
-                .arg("-c")
-                .arg("kill -KILL $$")
-                .status()
+    #[test]
+    fn detached_deadline_in_developer_docs_matches_supervision() {
+        let docs = include_str!("../../../../README.dev.md");
+        assert!(docs.contains(&format!(
+            "bounded to {} seconds",
+            DETACH_READY_DEADLINE.as_secs()
+        )));
+        assert!(docs.contains(&format!("{} seconds for reaping", KILL_REAP_WAIT.as_secs())));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn detached_start_bounds_a_stopped_child_and_preserves_exit_status() {
+        use std::process::{Command, Stdio};
+        let directory = tempfile::tempdir().unwrap();
+        let bx = BoxRef::from_state_dir(directory.path().to_path_buf(), directory.path());
+        for (script, timeout, expected) in [
+            ("kill -STOP $$", Duration::from_millis(50), 137),
+            ("exit 23", Duration::from_secs(5), 23),
+            ("kill -TERM $$", Duration::from_secs(5), 143),
+            ("exit 0", Duration::from_secs(5), 1),
+            ("exec 1>&-; kill -STOP $$", Duration::from_secs(5), 137),
+        ] {
+            let child = Command::new("/bin/sh")
+                .args(["-c", script])
+                .stdout(Stdio::piped())
+                .spawn()
                 .unwrap();
-            assert_eq!(compute_detached_exit_byte(&bx, 4242, killed), 128 + 9);
+            let started = Instant::now();
+            let code = wait_for_detached_agent(&bx, child, timeout).unwrap();
+            assert_eq!(code, ExitCode::from(expected), "{script}");
+            assert!(started.elapsed() < Duration::from_secs(5), "{script}");
         }
-
-        // Claimed, then finished - a fast workload, reported as started.
-        let lock = bx.lock_run().unwrap();
-        bx.publish_pid(&lock, 4242, false);
-        assert_eq!(compute_detached_exit_byte(&bx, 4242, exited_with(3)), 0);
-        // …and a *different* pid in the file is somebody else's box, not this
-        // child's claim.
-        assert_eq!(compute_detached_exit_byte(&bx, 5353, exited_with(3)), 3);
     }
 
     #[test]

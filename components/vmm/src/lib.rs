@@ -1,4 +1,4 @@
-//! Routes MMIO requests between a trusted hypervisor adapter and device components.
+//! Runs vCPUs and architecture-specific exit handling.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
@@ -7,24 +7,16 @@ mod bindings {
     wit_bindgen::generate!({ world: "vmm", path: "wit", generate_all });
 }
 
-use bindings::{exports, terra, wit_stream};
+use bindings::{exports, terra};
 
-mod ioapic;
 mod lifecycle;
 mod machine;
-mod scheduler;
 
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex};
 
-use futures_util::lock::Mutex as AsyncMutex;
-use wit_bindgen::rt::async_support::{StreamReader, StreamResult, StreamWriter};
-
-use exports::terra::mmio::router::{
-    ControlReply, Error, Guest, Operation, Reply, Request, RoutedReply,
-};
 use terra::mmio::platform;
+use terra::mmio::types::Error;
 
-const MAX_DEVICES: usize = terra_limits::MAX_DEVICES;
 const MAX_VCPUS: usize = terra_limits::MAX_VCPUS as usize;
 const PSCI_CPU_OFF: u64 = 0x8400_0002;
 const PSCI_CPU_ON: u64 = 0xc400_0003;
@@ -35,7 +27,6 @@ const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
 const PSCI_SYSTEM_RESET: u64 = 0x8400_0009;
 const PSCI_VERSION: u64 = 0x8400_0000;
 const PSCI_FEATURES: u64 = 0x8400_000a;
-const MAX_STALE_REPLIES: usize = 16;
 
 const MSRS: [(u32, u64); 12] = [
     (0x10, 0),
@@ -51,24 +42,6 @@ const MSRS: [(u32, u64); 12] = [
     (0xC000_0102, 0),
     (0xC000_0103, 0),
 ];
-
-enum DeviceState {
-    AwaitingReplies {
-        writer: StreamWriter<Request>,
-    },
-    Ready {
-        next_sequence: u64,
-        writer: StreamWriter<Request>,
-        replies: StreamReader<Reply>,
-    },
-    Closed,
-}
-
-struct Device {
-    base: u64,
-    size: u64,
-    state: Arc<AsyncMutex<DeviceState>>,
-}
 
 #[derive(Clone)]
 struct MsrBank {
@@ -99,8 +72,7 @@ impl MsrBank {
 }
 
 #[derive(Default)]
-struct Router {
-    devices: Vec<Option<Device>>,
+struct CpuState {
     vcpus: Option<Vec<Vcpu>>,
     started: bool,
 }
@@ -111,74 +83,16 @@ struct Vcpu {
     powered: bool,
 }
 
-static ROUTER: LazyLock<Mutex<Router>> = LazyLock::new(|| Mutex::new(Router::default()));
-static IOAPIC: LazyLock<Mutex<ioapic::IoApic>> =
-    LazyLock::new(|| Mutex::new(ioapic::IoApic::new()));
+static CPU_STATE: LazyLock<Mutex<CpuState>> = LazyLock::new(|| Mutex::new(CpuState::default()));
 
-fn router() -> std::sync::MutexGuard<'static, Router> {
-    ROUTER
+fn cpu_state() -> std::sync::MutexGuard<'static, CpuState> {
+    CPU_STATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn valid_width(width: u8) -> bool {
-    matches!(width, 1 | 2 | 4 | 8)
-}
-
-fn range_end(base: u64, size: u64) -> Result<u64, Error> {
-    base.checked_add(size).ok_or(Error::Overflow)
-}
-
-fn device_range_overlaps(
-    router: &Router,
-    ignored_slot: Option<usize>,
-    base: u64,
-    end: u64,
-) -> bool {
-    router
-        .devices
-        .iter()
-        .enumerate()
-        .filter(|(slot, _)| Some(*slot) != ignored_slot)
-        .filter_map(|(_, device)| device.as_ref())
-        .any(|device| {
-            device
-                .base
-                .checked_add(device.size)
-                .is_some_and(|device_end| base < device_end && device.base < end)
-        })
-}
-
-fn device_for_address(router: &Router, address: u64, width: u8) -> Result<(usize, u64), Error> {
-    if !valid_width(width) {
-        return Err(Error::BadWidth);
-    }
-    let end = address
-        .checked_add(u64::from(width))
-        .ok_or(Error::Overflow)?;
-    router
-        .devices
-        .iter()
-        .enumerate()
-        .find_map(|(slot, device)| {
-            let device = device.as_ref()?;
-            let device_end = device.base.checked_add(device.size)?;
-            (address >= device.base && end <= device_end).then(|| (slot, address - device.base))
-        })
-        .ok_or(Error::Unmapped)
-}
-
-fn device_state(slot: usize) -> Result<Arc<AsyncMutex<DeviceState>>, Error> {
-    router()
-        .devices
-        .get(slot)
-        .and_then(Option::as_ref)
-        .map(|device| Arc::clone(&device.state))
-        .ok_or(Error::InvalidSlot)
-}
-
-fn vcpu_bank(router: &mut Router, vcpu: u8) -> Result<&mut MsrBank, Error> {
-    router
+fn vcpu_bank(state: &mut CpuState, vcpu: u8) -> Result<&mut MsrBank, Error> {
+    state
         .vcpus
         .as_mut()
         .and_then(|vcpus| vcpus.get_mut(usize::from(vcpu)))
@@ -186,14 +100,14 @@ fn vcpu_bank(router: &mut Router, vcpu: u8) -> Result<&mut MsrBank, Error> {
         .ok_or(Error::InvalidVcpu)
 }
 
-fn start_vcpu(router: &mut Router, vcpu: u8) -> Result<(), Error> {
-    vcpu_bank(router, vcpu)?;
-    router.started = true;
+fn start_vcpu(state: &mut CpuState, vcpu: u8) -> Result<(), Error> {
+    vcpu_bank(state, vcpu)?;
+    state.started = true;
     Ok(())
 }
 
-fn powered(router: &mut Router, vcpu: u8) -> Result<&mut bool, Error> {
-    router
+fn powered(state: &mut CpuState, vcpu: u8) -> Result<&mut bool, Error> {
+    state
         .vcpus
         .as_mut()
         .and_then(|vcpus| vcpus.get_mut(usize::from(vcpu)))
@@ -217,11 +131,11 @@ fn psci_features(function: u64) -> i64 {
 }
 
 fn psci_hvc(id: u8, hvc: Hvc) -> Result<platform::Completion, Error> {
-    let mut router = router();
-    psci_hvc_for(&mut router, id, &hvc)
+    let mut state = cpu_state();
+    psci_hvc_for(&mut state, id, &hvc)
 }
 
-fn psci_hvc_for(router: &mut Router, id: u8, hvc: &Hvc) -> Result<platform::Completion, Error> {
+fn psci_hvc_for(state: &mut CpuState, id: u8, hvc: &Hvc) -> Result<platform::Completion, Error> {
     let status = match hvc.function {
         PSCI_VERSION => return Ok(platform::Completion::HvcReturn(0x0001_0000)),
         PSCI_FEATURES => {
@@ -236,7 +150,7 @@ fn psci_hvc_for(router: &mut Router, id: u8, hvc: &Hvc) -> Result<platform::Comp
                 let Ok(target) = u8::try_from(hvc.argument0) else {
                     return Ok(platform::Completion::HvcReturn(-3));
                 };
-                let Some(powered) = router
+                let Some(powered) = state
                     .vcpus
                     .as_mut()
                     .and_then(|vcpus| vcpus.get_mut(usize::from(target)))
@@ -251,7 +165,7 @@ fn psci_hvc_for(router: &mut Router, id: u8, hvc: &Hvc) -> Result<platform::Comp
             let Ok(target) = u8::try_from(hvc.argument0) else {
                 return Ok(platform::Completion::HvcReturn(-3));
             };
-            let Some(powered) = router
+            let Some(powered) = state
                 .vcpus
                 .as_mut()
                 .and_then(|vcpus| vcpus.get_mut(usize::from(target)))
@@ -270,7 +184,7 @@ fn psci_hvc_for(router: &mut Router, id: u8, hvc: &Hvc) -> Result<platform::Comp
             }
         }
         PSCI_CPU_OFF => {
-            *powered(router, id)? = false;
+            *powered(state, id)? = false;
             return Ok(platform::Completion::CpuOff);
         }
         PSCI_SYSTEM_OFF | PSCI_SYSTEM_RESET => return Ok(platform::Completion::SystemStop),
@@ -280,172 +194,34 @@ fn psci_hvc_for(router: &mut Router, id: u8, hvc: &Hvc) -> Result<platform::Comp
 }
 
 fn psci_start_result(result: platform::HvcResult) -> Result<platform::Completion, Error> {
-    let mut router = router();
-    psci_start_result_for(&mut router, result)
+    let mut state = cpu_state();
+    psci_start_result_for(&mut state, result)
 }
 
 fn psci_start_result_for(
-    router: &mut Router,
+    state: &mut CpuState,
     result: platform::HvcResult,
 ) -> Result<platform::Completion, Error> {
     if result.status == 0 {
-        *powered(router, result.target)? = true;
+        *powered(state, result.target)? = true;
     }
     Ok(platform::Completion::HvcReturn(result.status))
 }
 
-fn mark_closed(state: &mut DeviceState) {
-    *state = DeviceState::Closed;
-}
-
-enum ReplySequence {
-    Stale,
-    Current,
-    Future,
-}
-
-fn reply_sequence(reply: &Reply, sequence: u64) -> ReplySequence {
-    match reply.sequence.cmp(&sequence) {
-        std::cmp::Ordering::Less => ReplySequence::Stale,
-        std::cmp::Ordering::Equal => ReplySequence::Current,
-        std::cmp::Ordering::Greater => ReplySequence::Future,
-    }
-}
-
-async fn dispatch(
-    slot: usize,
-    operation: Operation,
-    offset: u64,
-    width: u8,
-    value: u64,
-) -> Result<Reply, Error> {
-    let state = device_state(slot)?;
-    let mut state = state.lock().await;
-    dispatch_state(&mut state, operation, offset, width, value).await
-}
-
-async fn dispatch_state(
-    state: &mut DeviceState,
-    operation: Operation,
-    offset: u64,
-    width: u8,
-    value: u64,
-) -> Result<Reply, Error> {
-    let (sequence, writer, replies) = match state {
-        DeviceState::AwaitingReplies { .. } => return Err(Error::Busy),
-        DeviceState::Ready {
-            next_sequence,
-            writer,
-            replies,
-        } => {
-            let sequence = *next_sequence;
-            *next_sequence = next_sequence.wrapping_add(1);
-            (sequence, writer, replies)
-        }
-        DeviceState::Closed => return Err(Error::Closed),
-    };
-    let request = Request {
-        sequence,
-        operation,
-        offset,
-        width,
-        value,
-    };
-    let unwritten = writer.write_all(vec![request]).await;
-    if !unwritten.is_empty() {
-        mark_closed(state);
-        return Err(Error::Closed);
-    }
-    for stale_replies in 0..=MAX_STALE_REPLIES {
-        let (result, replies) = replies.read(Vec::with_capacity(1)).await;
-        let reply = match result {
-            StreamResult::Complete(1) => {
-                let Some(reply) = replies.into_iter().next() else {
-                    mark_closed(state);
-                    return Err(Error::Device);
-                };
-                reply
-            }
-            StreamResult::Complete(_) | StreamResult::Dropped | StreamResult::Cancelled => {
-                mark_closed(state);
-                return Err(Error::Closed);
-            }
-        };
-        match reply_sequence(&reply, sequence) {
-            ReplySequence::Current => return Ok(reply),
-            ReplySequence::Stale if stale_replies < MAX_STALE_REPLIES => {}
-            ReplySequence::Stale | ReplySequence::Future => {
-                mark_closed(state);
-                return Err(Error::Device);
-            }
-        }
-    }
-    unreachable!()
-}
-
-async fn route_access(
-    address: u64,
-    width: u8,
-    value: u64,
-    write: bool,
-) -> Result<RoutedReply, Error> {
-    let _permit = scheduler::acquire(scheduler::Class::Data).await?;
-    let (slot, offset) = {
-        let mut router = router();
-        router.started = true;
-        device_for_address(&router, address, width)?
-    };
-    let reply = dispatch(
-        slot,
-        if write {
-            Operation::Write
-        } else {
-            Operation::Read
-        },
-        offset,
-        width,
-        value,
-    )
-    .await?;
-    Ok(RoutedReply {
-        slot: u32::try_from(slot).map_err(|_| Error::InvalidSlot)?,
-        reply,
-    })
-}
-
-fn complete_routed(routed: &RoutedReply) -> Result<(), Error> {
-    platform::completed(routed.slot, routed.reply.error != 0).map_err(|_| Error::Device)?;
-    Ok(())
-}
-
 async fn vcpu_access(address: u64, width: u8, value: u64, write: bool) -> Result<u64, Error> {
-    let routed = match route_access(address, width, value, write).await {
-        Ok(routed) => routed,
-        Err(Error::Unmapped | Error::BadWidth | Error::Overflow) => return Ok(0),
-        Err(error) => return Err(error),
-    };
-    complete_routed(&routed)?;
-    Ok(if routed.reply.error == 0 {
-        routed.reply.value
-    } else {
-        0
-    })
-}
-
-fn ioapic_error(error: ioapic::IoApicError) -> Error {
-    match error {
-        ioapic::IoApicError::Unconfigured => Error::Busy,
-        ioapic::IoApicError::InvalidSlot => Error::InvalidSlot,
-        ioapic::IoApicError::BadOffset => Error::Unmapped,
-        ioapic::IoApicError::BadWidth => Error::BadWidth,
-    }
-}
-
-fn interrupt(interrupt: ioapic::X86Interrupt) -> exports::terra::mmio::interrupts::X86Interrupt {
-    exports::terra::mmio::interrupts::X86Interrupt {
-        vector: interrupt.vector,
-        destination: interrupt.destination,
-        level_triggered: interrupt.level_triggered,
+    match terra::mmio::vmm_mmio_client::access(address, width, value, write).await {
+        Ok(value) => Ok(value),
+        Err(Error::Unmapped | Error::BadWidth | Error::Overflow) => Ok(0),
+        Err(
+            error @ (Error::InvalidSlot
+            | Error::InvalidVcpu
+            | Error::UnsupportedMsr
+            | Error::BadArmExit
+            | Error::Overlap
+            | Error::Busy
+            | Error::Closed
+            | Error::Device),
+        ) => Err(error),
     }
 }
 
@@ -523,8 +299,8 @@ async fn handle_arm_exception(
 
 async fn run_vcpu(cpu: platform::Vcpu, id: u8) -> Result<(), Error> {
     {
-        let mut router = router();
-        start_vcpu(&mut router, id)?;
+        let mut state = cpu_state();
+        start_vcpu(&mut state, id)?;
     }
     let mut completion = platform::Completion::Start;
     loop {
@@ -549,16 +325,16 @@ async fn run_vcpu(cpu: platform::Vcpu, id: u8) -> Result<(), Error> {
             }
             platform::Exit::PioRead(_) => platform::Completion::PioZero,
             platform::Exit::Rdmsr(request) => {
-                let mut router = router();
-                match vcpu_bank(&mut router, id)?.read(request.index) {
+                let mut state = cpu_state();
+                match vcpu_bank(&mut state, id)?.read(request.index) {
                     Ok(value) => platform::Completion::Rdmsr(value),
                     Err(Error::UnsupportedMsr) => platform::Completion::MsrFault,
                     Err(error) => return Err(error),
                 }
             }
             platform::Exit::Wrmsr(request) => {
-                let mut router = router();
-                match vcpu_bank(&mut router, id)?.write(request.index, request.value) {
+                let mut state = cpu_state();
+                match vcpu_bank(&mut state, id)?.write(request.index, request.value) {
                     Ok(()) => platform::Completion::Wrmsr,
                     Err(Error::UnsupportedMsr) => platform::Completion::MsrFault,
                     Err(error) => return Err(error),
@@ -645,255 +421,30 @@ mod component_exports {
     bindings::export!(Dispatcher with_types_in bindings);
 }
 
-impl exports::terra::mmio::interrupts::Guest for Dispatcher {
-    fn stage_irq_lines() -> Result<(), Error> {
-        machine::stage_irq_lines().map_err(|_| Error::Device)
+pub fn configure_vcpus(count: u8) -> Result<(), Error> {
+    let count = usize::from(count);
+    if count == 0 || count > MAX_VCPUS {
+        return Err(Error::InvalidVcpu);
     }
-
-    fn clear_irq_lines() -> Result<Vec<exports::terra::mmio::interrupts::IrqLevel>, Error> {
-        machine::clear_irq_lines().map_err(|_| Error::Device)
+    let mut state = cpu_state();
+    if state.started || state.vcpus.is_some() {
+        return Err(Error::Busy);
     }
-
-    fn device_irq_line(
-        slot: u8,
-        asserted: bool,
-    ) -> Result<Option<exports::terra::mmio::interrupts::IrqLevel>, Error> {
-        machine::device_irq_line(slot, asserted).map_err(|_| Error::Device)
-    }
-
-    fn stage_ioapic() -> Result<(), Error> {
-        machine::stage_ioapic().map_err(|_| Error::Device)
-    }
-
-    fn ioapic_access(
-        offset: u8,
-        width: u8,
-        write: bool,
-        value: u32,
-    ) -> Result<exports::terra::mmio::interrupts::IoapicReply, Error> {
-        router().started = true;
-        let access = IOAPIC
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .access(offset, width, write, value)
-            .map_err(ioapic_error)?;
-        Ok(exports::terra::mmio::interrupts::IoapicReply {
-            value: access.value,
-            interrupts: access.interrupts.into_iter().map(interrupt).collect(),
-        })
-    }
-
-    fn ioapic_line(
-        slot: u8,
-        asserted: bool,
-    ) -> Result<Vec<exports::terra::mmio::interrupts::X86Interrupt>, Error> {
-        IOAPIC
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .set_line(slot, asserted)
-            .map(|interrupts| interrupts.into_iter().map(interrupt).collect())
-            .map_err(ioapic_error)
-    }
-
-    fn ioapic_eoi(
-        vector: u8,
-    ) -> Result<Vec<exports::terra::mmio::interrupts::X86Interrupt>, Error> {
-        Ok(IOAPIC
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .eoi(vector)
-            .into_iter()
-            .map(interrupt)
-            .collect())
-    }
-}
-
-fn open_device(slot: u32, base: u64, size: u64) -> Result<StreamReader<Request>, Error> {
-    let slot = usize::try_from(slot).map_err(|_| Error::InvalidSlot)?;
-    if slot >= MAX_DEVICES || size == 0 {
-        return Err(Error::InvalidSlot);
-    }
-    let end = range_end(base, size)?;
-    let mut router = router();
-    if router.devices.len() <= slot {
-        router.devices.resize_with(slot + 1, || None);
-    }
-    if router.devices[slot].is_some() || device_range_overlaps(&router, None, base, end) {
-        return Err(Error::Overlap);
-    }
-    let (writer, reader) = wit_stream::new();
-    router.devices[slot] = Some(Device {
-        base,
-        size,
-        state: Arc::new(AsyncMutex::new(DeviceState::AwaitingReplies { writer })),
-    });
-    Ok(reader)
-}
-
-async fn attach_replies(slot: u32, replies: StreamReader<Reply>) -> Result<(), Error> {
-    let slot = usize::try_from(slot).map_err(|_| Error::InvalidSlot)?;
-    let state = device_state(slot)?;
-    let mut state = state.lock().await;
-    match std::mem::replace(&mut *state, DeviceState::Closed) {
-        DeviceState::AwaitingReplies { writer } => {
-            *state = DeviceState::Ready {
-                next_sequence: 0,
-                writer,
-                replies,
-            };
-            Ok(())
-        }
-        ready @ DeviceState::Ready { .. } => {
-            *state = ready;
-            Err(Error::Busy)
-        }
-        DeviceState::Closed => Err(Error::Closed),
-    }
-}
-
-impl Guest for Dispatcher {
-    fn configure_vcpus(count: u8) -> Result<(), Error> {
-        let count = usize::from(count);
-        if count == 0 || count > MAX_VCPUS {
-            return Err(Error::InvalidVcpu);
-        }
-        let mut router = router();
-        if router.started || router.vcpus.is_some() {
-            return Err(Error::Busy);
-        }
-        let mut vcpus = vec![
-            Vcpu {
-                msrs: MsrBank::new(),
-                powered: false,
-            };
-            count
-        ];
-        vcpus[0].powered = true;
-        router.vcpus = Some(vcpus);
-        Ok(())
-    }
-
-    fn open_device(slot: u32, base: u64, size: u64) -> Result<StreamReader<Request>, Error> {
-        open_device(slot, base, size)
-    }
-
-    async fn attach_replies(slot: u32, replies: StreamReader<Reply>) -> Result<(), Error> {
-        attach_replies(slot, replies).await
-    }
-
-    fn remap_device(slot: u32, base: u64, size: u64) -> Result<(), Error> {
-        let slot = usize::try_from(slot).map_err(|_| Error::InvalidSlot)?;
-        if size == 0 {
-            return Err(Error::InvalidSlot);
-        }
-        let end = range_end(base, size)?;
-        let mut router = router();
-        if router.devices.get(slot).and_then(Option::as_ref).is_none() {
-            return Err(Error::InvalidSlot);
-        }
-        if router.started {
-            return Err(Error::Busy);
-        }
-        if device_range_overlaps(&router, Some(slot), base, end) {
-            return Err(Error::Overlap);
-        }
-        let device = router.devices[slot].as_mut().ok_or(Error::InvalidSlot)?;
-        device.base = base;
-        device.size = size;
-        Ok(())
-    }
-
-    async fn access(
-        address: u64,
-        width: u8,
-        value: u64,
-        write: bool,
-    ) -> Result<RoutedReply, Error> {
-        route_access(address, width, value, write).await
-    }
-
-    async fn control(slot: u32, operation: Operation) -> Result<ControlReply, Error> {
-        let _permit = scheduler::acquire(scheduler::Class::Control).await?;
-        let slot = usize::try_from(slot).map_err(|_| Error::InvalidSlot)?;
-        router().started = true;
-        if !matches!(
-            operation,
-            Operation::Reset | Operation::Close | Operation::InterruptLevel
-        ) {
-            return Err(Error::Device);
-        }
-        let closes_device = operation == Operation::Close;
-        let result = dispatch(slot, operation, 0, 0, 0).await;
-        if closes_device && let Some(device) = router().devices.get_mut(slot) {
-            *device = None;
-        }
-        result.map(|reply| ControlReply {
-            reply,
-            all_closed: closes_device && router().devices.iter().all(Option::is_none),
-        })
-    }
+    let mut vcpus = vec![
+        Vcpu {
+            msrs: MsrBank::new(),
+            powered: false
+        };
+        count
+    ];
+    vcpus[0].powered = true;
+    state.vcpus = Some(vcpus);
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn device(base: u64, size: u64) -> Device {
-        Device {
-            base,
-            size,
-            state: Arc::new(AsyncMutex::new(DeviceState::Closed)),
-        }
-    }
-
-    #[test]
-    fn routing_rejects_invalid_width_and_outside_ranges() {
-        let router = Router {
-            devices: vec![Some(device(0x1000, 0x200))],
-            vcpus: None,
-            started: false,
-        };
-        assert_eq!(device_for_address(&router, 0x1000, 3), Err(Error::BadWidth));
-        assert_eq!(device_for_address(&router, 0x1200, 1), Err(Error::Unmapped));
-        assert_eq!(device_for_address(&router, 0x11ff, 2), Err(Error::Unmapped));
-        assert_eq!(device_for_address(&router, 0x1008, 8), Ok((0, 8)));
-    }
-
-    #[test]
-    fn routing_skips_devices_above_the_address() {
-        let router = Router {
-            devices: vec![Some(device(0x2000, 0x200)), Some(device(0x1000, 0x200))],
-            vcpus: None,
-            started: false,
-        };
-        assert_eq!(device_for_address(&router, 0x800, 4), Err(Error::Unmapped));
-        assert_eq!(device_for_address(&router, 0x1008, 4), Ok((1, 8)));
-    }
-
-    #[test]
-    fn remapping_rejects_overlap_and_overflow() {
-        let router = Router {
-            devices: vec![Some(device(0x1000, 0x200)), Some(device(0x2000, 0x200))],
-            vcpus: None,
-            started: false,
-        };
-        assert!(device_range_overlaps(&router, Some(0), 0x1f00, 0x2100));
-        assert!(!device_range_overlaps(&router, Some(0), 0x1000, 0x1200));
-        assert_eq!(range_end(u64::MAX, 1), Err(Error::Overflow));
-    }
-
-    #[test]
-    fn stale_replies_are_distinct_from_future_replies() {
-        let reply = Reply {
-            sequence: 7,
-            value: 7,
-            error: 0,
-            interrupt: true,
-        };
-        assert!(matches!(reply_sequence(&reply, 7), ReplySequence::Current));
-        assert!(matches!(reply_sequence(&reply, 8), ReplySequence::Stale));
-        assert!(matches!(reply_sequence(&reply, 3), ReplySequence::Future));
-    }
 
     #[test]
     fn msr_banks_are_fixed_and_independent() {
@@ -961,8 +512,7 @@ mod tests {
 
     #[test]
     fn psci_updates_cpu_state_only_after_native_start_succeeds() {
-        let mut router = Router {
-            devices: Vec::new(),
+        let mut router = CpuState {
             vcpus: Some(vec![
                 Vcpu {
                     msrs: MsrBank::new(),
@@ -1017,8 +567,7 @@ mod tests {
 
     #[test]
     fn psci_rejects_an_invalid_cpu_without_failing_the_router() {
-        let mut router = Router {
-            devices: Vec::new(),
+        let mut router = CpuState {
             vcpus: Some(vec![Vcpu {
                 msrs: MsrBank::new(),
                 powered: true,

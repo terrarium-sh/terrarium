@@ -33,6 +33,8 @@ pub struct TrustedArtifacts {
     mem: TrustedArtifact,
     boot: TrustedArtifact,
     vmm: TrustedArtifact,
+    mmio: TrustedArtifact,
+    interrupt_controller: TrustedArtifact,
 }
 
 impl TrustedArtifacts {
@@ -41,7 +43,7 @@ impl TrustedArtifacts {
     /// All byte slices must be trusted AOT artifacts produced for this exact
     /// Wasmtime build; they must never come from a user or network input.
     #[must_use]
-    #[allow(unsafe_code)]
+    #[allow(unsafe_code, clippy::too_many_arguments)]
     pub const unsafe fn new(
         block: &'static [u8],
         vsock: &'static [u8],
@@ -50,6 +52,8 @@ impl TrustedArtifacts {
         mem: &'static [u8],
         boot: &'static [u8],
         vmm: &'static [u8],
+        mmio: &'static [u8],
+        interrupt_controller: &'static [u8],
     ) -> Self {
         Self {
             block: TrustedArtifact(block),
@@ -59,6 +63,8 @@ impl TrustedArtifacts {
             mem: TrustedArtifact(mem),
             boot: TrustedArtifact(boot),
             vmm: TrustedArtifact(vmm),
+            mmio: TrustedArtifact(mmio),
+            interrupt_controller: TrustedArtifact(interrupt_controller),
         }
     }
 
@@ -90,6 +96,16 @@ impl TrustedArtifacts {
     #[must_use]
     pub const fn boot(&self) -> TrustedArtifact {
         self.boot
+    }
+
+    #[must_use]
+    pub const fn mmio(&self) -> TrustedArtifact {
+        self.mmio
+    }
+
+    #[must_use]
+    pub const fn interrupt_controller(&self) -> TrustedArtifact {
+        self.interrupt_controller
     }
 
     #[must_use]

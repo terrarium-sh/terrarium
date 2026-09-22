@@ -104,7 +104,7 @@ mod tests {
     use wasmtime::component::{Source, StreamConsumer, StreamReader};
 
     struct TrackedSink {
-        sink: Sink<crate::component::vmm::bindings::types::Request>,
+        sink: Sink<crate::component::mmio::Request>,
         dropped: Arc<AtomicBool>,
     }
 
@@ -115,7 +115,7 @@ mod tests {
     }
 
     impl StreamConsumer<()> for TrackedSink {
-        type Item = crate::component::vmm::bindings::types::Request;
+        type Item = crate::component::mmio::Request;
 
         fn poll_consume(
             mut self: Pin<&mut Self>,
@@ -131,7 +131,7 @@ mod tests {
     struct CollectSink(Arc<std::sync::Mutex<Vec<u64>>>);
 
     impl StreamConsumer<()> for CollectSink {
-        type Item = crate::component::vmm::bindings::types::Request;
+        type Item = crate::component::mmio::Request;
 
         fn poll_consume(
             self: Pin<&mut Self>,
@@ -153,10 +153,10 @@ mod tests {
         }
     }
 
-    fn request(sequence: u64) -> crate::component::vmm::bindings::types::Request {
-        crate::component::vmm::bindings::types::Request {
+    fn request(sequence: u64) -> crate::component::mmio::Request {
+        crate::component::mmio::Request {
             sequence,
-            operation: crate::component::vmm::bindings::types::Operation::Read,
+            operation: crate::component::mmio::Operation::Read,
             offset: 0,
             width: 4,
             value: 0,
@@ -167,9 +167,8 @@ mod tests {
     async fn sink_reserves_capacity_before_lowering_and_preserves_order() {
         let engine = crate::engine::device_engine().expect("engine");
         let mut store = Store::new(&engine, ());
-        let (sink, mut stream) = channel::<crate::component::vmm::bindings::types::Request>(
-            NonZeroUsize::new(2).expect("capacity"),
-        );
+        let (sink, mut stream) =
+            channel::<crate::component::mmio::Request>(NonZeroUsize::new(2).expect("capacity"));
         let input =
             StreamReader::new(&mut store, vec![request(1), request(2), request(3)]).expect("input");
         input.pipe(&mut store, sink).expect("attach sink");
@@ -191,9 +190,8 @@ mod tests {
         let engine = crate::engine::device_engine().expect("engine");
         let mut root = Store::new(&engine, ());
         let mut child = Store::new(&engine, ());
-        let (sink, stream) = channel::<crate::component::vmm::bindings::types::Request>(
-            NonZeroUsize::new(2).expect("capacity"),
-        );
+        let (sink, stream) =
+            channel::<crate::component::mmio::Request>(NonZeroUsize::new(2).expect("capacity"));
         let input =
             StreamReader::new(&mut root, vec![request(1), request(2), request(3)]).expect("input");
         input.pipe(&mut root, sink).expect("attach root sink");
@@ -240,12 +238,11 @@ mod tests {
     async fn closed_receiver_drops_the_source_stream() {
         let engine = crate::engine::device_engine().expect("engine");
         let mut store = Store::new(&engine, ());
-        let (sink, stream) =
-            channel::<crate::component::vmm::bindings::types::Reply>(MMIO_CAPACITY);
+        let (sink, stream) = channel::<crate::component::mmio::Reply>(MMIO_CAPACITY);
         drop(stream);
         let input = StreamReader::new(
             &mut store,
-            vec![crate::component::vmm::bindings::types::Reply {
+            vec![crate::component::mmio::Reply {
                 sequence: 1,
                 value: 0,
                 error: 0,
@@ -264,9 +261,8 @@ mod tests {
     async fn dropping_the_other_store_cancels_a_blocked_relay() {
         let engine = crate::engine::device_engine().expect("engine");
         let mut store = Store::new(&engine, ());
-        let (sink, mut stream) = channel::<crate::component::vmm::bindings::types::Request>(
-            NonZeroUsize::new(1).expect("capacity"),
-        );
+        let (sink, mut stream) =
+            channel::<crate::component::mmio::Request>(NonZeroUsize::new(1).expect("capacity"));
         let dropped = Arc::new(AtomicBool::new(false));
         let input =
             StreamReader::new(&mut store, vec![request(1), request(2), request(3)]).expect("input");
