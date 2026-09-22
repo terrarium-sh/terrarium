@@ -49,7 +49,7 @@
   <div>
     <p class="eyebrow">Isolation at every layer</p>
     <h2 id="isolation-heading">Your workload in a VM.<br />Its machinery in Wasm.</h2>
-    <p>Your agent and tools run inside the VM, on a guest Linux kernel. The virtual machine monitor (VMM) and each device instance run in separate Wasm sandboxes on the host.</p>
+    <p>Your agent and tools run inside the VM, on a guest Linux kernel. The VMM, MMIO router, interrupt controller, and each device run in separate Wasm instances on the host.</p>
     <p>A thin native host API provides checked access to memory, I/O, and hypervisor operations. Each component receives only the capabilities it needs.</p>
     <a href="{base}/docs/security/">Explore the security model <span aria-hidden="true">→</span></a>
   </div>
@@ -62,18 +62,23 @@
     <div class="architecture-bridge"><span>VM exits · device requests</span></div>
     <div class="host-runtime">
       <p class="diagram-label">Host · Terra runtime</p>
-      <div class="sandbox-grid">
-        <div class="wasm-sandbox"><span>Wasm sandbox</span><h3>VMM</h3><p>VM exits &amp; routing</p></div>
-        <div class="wasm-sandbox"><span>Wasm sandbox</span><h3>Filesystem</h3><p>Directory grant</p></div>
-        <div class="wasm-sandbox"><span>Wasm sandbox</span><h3>Network</h3><p>Allowed sockets</p></div>
-        <div class="wasm-sandbox"><span>Wasm sandbox</span><h3>Block</h3><p>Backing disk</p></div>
-        <div class="wasm-sandbox"><span>Wasm sandbox</span><h3>Memory</h3><p>Memory reclaim</p></div>
-        <div class="wasm-sandbox"><span>Wasm sandbox</span><h3>Vsock</h3><p>Host–guest streams</p></div>
-      </div>
+      <p class="sandbox-legend">Each outlined component is a separate Wasm instance</p>
+      <ul class="sandbox-row devices" aria-label="Devices">
+        <li><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7V5h6l2 2h10v12H3Z" /><path d="M3 10h18" /></svg><span>Filesystem</span></li>
+        <li><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="5" rx="1" /><path d="M12 8v5M5 16v-3h14v3" /><rect x="2" y="16" width="6" height="5" rx="1" /><rect x="16" y="16" width="6" height="5" rx="1" /></svg><span>Network</span></li>
+        <li><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="7" rx="2" /><rect x="3" y="13" width="18" height="7" rx="2" /><path d="M6 7.5h2M6 16.5h2" /></svg><span>Block</span></li>
+        <li><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2" /><path d="M9 2v4m6-4v4M9 18v4m6-4v4M2 9h4m-4 6h4M18 9h4m-4 6h4" /></svg><span>Memory</span></li>
+        <li><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h18m-5-5 5 5-5 5M21 17H3m5-5-5 5 5 5" /></svg><span>Vsock</span></li>
+      </ul>
+      <ul class="sandbox-row" aria-label="Runtime components">
+        <li>VMM</li>
+        <li>MMIO router</li>
+        <li>Interrupt controller</li>
+      </ul>
       <div class="host-api"><strong>Thin host API</strong><span>Capability checks · memory · native I/O</span></div>
     </div>
     <p class="host-platform">Host OS &amp; hypervisor<br /><span>KVM · Hypervisor.framework · WHP</span></p>
-    <figcaption id="architecture-caption">Selected components shown. A separate Wasm sandbox for the VMM and each device instance; a separate Wasm policy component checks access.</figcaption>
+    <figcaption id="architecture-caption">Selected components shown. A separate Wasm policy component checks access.</figcaption>
   </figure>
 </section>
 
