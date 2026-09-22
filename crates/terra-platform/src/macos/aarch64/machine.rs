@@ -77,7 +77,7 @@ impl Machine {
         let crate::vm::InterruptControllerConfig::Arm(gic) = &config.interrupt_controller else {
             return Err(HvError::GicLayout);
         };
-        let gic = gic_layout(gic)?;
+        validate_gic_layout(gic, config.vcpus)?;
         let mut gic_config = HvGicConfig::new();
         gic_config.set_distributor_base(gic.distributor_base)?;
         gic_config.set_redistributor_base(gic.redistributor_base)?;
@@ -175,11 +175,13 @@ impl Cpu {
     }
 }
 
-fn gic_layout(gic: &NativeGicConfig) -> Result<NativeGicConfig, HvError> {
+fn validate_gic_layout(gic: &NativeGicConfig, vcpus: u8) -> Result<(), HvError> {
     let distributor_size =
         u64::try_from(HvGicConfig::get_distributor_size()?).map_err(|_| HvError::GicLayout)?;
-    let redistributor_size = u64::try_from(HvGicConfig::get_redistributor_region_size()?)
-        .map_err(|_| HvError::GicLayout)?;
+    let redistributor_size = u64::try_from(HvGicConfig::get_redistributor_size()?)
+        .map_err(|_| HvError::GicLayout)?
+        .checked_mul(u64::from(vcpus))
+        .ok_or(HvError::GicLayout)?;
     let distributor_alignment = u64::try_from(HvGicConfig::get_distributor_base_alignment()?)
         .map_err(|_| HvError::GicLayout)?;
     let redistributor_alignment = u64::try_from(HvGicConfig::get_redistributor_base_alignment()?)
@@ -195,11 +197,7 @@ fn gic_layout(gic: &NativeGicConfig) -> Result<NativeGicConfig, HvError> {
     {
         return Err(HvError::GicLayout);
     }
-    Ok(NativeGicConfig {
-        distributor_size,
-        redistributor_size,
-        ..*gic
-    })
+    Ok(())
 }
 
 fn decode_exit(exit: VcpuExit) -> RunExit {
@@ -251,5 +249,35 @@ fn general_register(number: u8) -> Option<Reg> {
         29 => Some(Reg::X29),
         30 => Some(Reg::X30),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The guest window must cover configured CPUs, not every CPU supported by HVF.
+    #[test]
+    fn gic_window_covers_configured_cpus() -> Result<(), HvError> {
+        let gic = NativeGicConfig {
+            distributor_base: terra_limits::ARM_GIC_DIST_BASE,
+            distributor_size: terra_limits::ARM_GIC_DIST_SIZE,
+            redistributor_base: terra_limits::ARM_GIC_REDIST_BASE,
+            redistributor_size: terra_limits::ARM_GIC_REDIST_SIZE,
+        };
+        for vcpus in 1..=terra_limits::ARM_MAX_VCPUS {
+            assert!(validate_gic_layout(&gic, vcpus).is_ok());
+        }
+        let one_cpu = NativeGicConfig {
+            redistributor_size: u64::try_from(HvGicConfig::get_redistributor_size()?)
+                .map_err(|_| HvError::GicLayout)?,
+            ..gic
+        };
+        validate_gic_layout(&one_cpu, 1)?;
+        assert!(matches!(
+            validate_gic_layout(&one_cpu, 2),
+            Err(HvError::GicLayout)
+        ));
+        Ok(())
     }
 }
