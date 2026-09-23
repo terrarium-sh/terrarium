@@ -44,22 +44,6 @@ impl CpuStarts {
         Ok(())
     }
 
-    fn replace_handle(&self, old: u64, handle: VcpuHandle) -> Result<(), String> {
-        let mut handles = self
-            .handles
-            .lock()
-            .map_err(|_| "secondary CPU handles poisoned")?;
-        handles.retain(|current| current.id() != old);
-        handles.push(handle.clone());
-        drop(handles);
-        if self.stopped.load(Ordering::SeqCst) {
-            self.machine
-                .exit(&[handle])
-                .map_err(|error| error.to_string())?;
-        }
-        Ok(())
-    }
-
     fn start(&self, mpidr: u64, entry: u64, context: u64) -> i64 {
         let Ok(cpu) = usize::try_from(mpidr) else {
             return -2;
@@ -107,6 +91,35 @@ impl CpuStarts {
         if let Ok(handles) = self.handles.lock() {
             let _ = self.machine.exit(&handles);
         }
+    }
+}
+
+struct RegisteredCpu<'a> {
+    cpu: Cpu,
+    starts: &'a CpuStarts,
+}
+
+impl<'a> RegisteredCpu<'a> {
+    fn create(starts: &'a CpuStarts, cpu_id: usize) -> Result<Self, String> {
+        let cpu = starts
+            .machine
+            .create_secondary(u64::try_from(cpu_id).map_err(|_| "CPU ID overflow")?, 0, 0)
+            .map_err(|error| error.to_string())?;
+        let registered = Self { cpu, starts };
+        starts.add_handle(registered.cpu.handle())?;
+        Ok(registered)
+    }
+}
+
+impl Drop for RegisteredCpu<'_> {
+    fn drop(&mut self) {
+        let id = self.cpu.handle().id();
+        let mut handles = self
+            .starts
+            .handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        handles.retain(|handle| handle.id() != id);
     }
 }
 
@@ -222,7 +235,6 @@ impl VcpuGroup {
         };
         for (cpu_id, receiver) in receivers.into_iter().enumerate() {
             group.threads.push(spawn_cpu(
-                Arc::clone(machine),
                 cpu_id,
                 Arc::clone(&starts),
                 receiver,
@@ -287,7 +299,6 @@ impl VcpuGroup {
 }
 
 fn spawn_cpu(
-    machine: Arc<Machine>,
     cpu_id: usize,
     starts: Arc<CpuStarts>,
     receiver: mpsc::Receiver<CpuCommand>,
@@ -296,10 +307,7 @@ fn spawn_cpu(
     thread::Builder::new()
         .spawn(move || {
             let result = (|| -> Result<(), String> {
-                let mut cpu = machine
-                    .create_secondary(u64::try_from(cpu_id).map_err(|_| "CPU ID overflow")?, 0, 0)
-                    .map_err(|error| error.to_string())?;
-                starts.add_handle(cpu.handle())?;
+                let mut registered = RegisteredCpu::create(&starts, cpu_id)?;
                 ready_sender
                     .send(Ok(()))
                     .map_err(|_| "vCPU setup receiver disappeared")?;
@@ -315,12 +323,16 @@ fn spawn_cpu(
                 };
                 if cpu_id == 0 {
                     let boot = boot.ok_or("bootstrap vCPU missing boot entry")?;
-                    cpu.set_reg(applevisor::prelude::Reg::PC, boot.entry)
+                    registered
+                        .cpu
+                        .set_reg(applevisor::prelude::Reg::PC, boot.entry)
                         .map_err(|error| error.to_string())?;
-                    cpu.set_reg(applevisor::prelude::Reg::X0, boot.boot_argument)
+                    registered
+                        .cpu
+                        .set_reg(applevisor::prelude::Reg::X0, boot.boot_argument)
                         .map_err(|error| error.to_string())?;
                     loop {
-                        match run_one(&cpu, cpu_id, handler.as_mut(), &starts)? {
+                        match run_one(&registered.cpu, cpu_id, handler.as_mut(), &starts)? {
                             CpuRun::Continue => {}
                             CpuRun::Off | CpuRun::Stop => {
                                 handler.finished(VcpuOutcome::Stopped);
@@ -340,25 +352,21 @@ fn spawn_cpu(
                             return Err("secondary vCPU started twice".to_owned());
                         }
                     };
-                    cpu.set_reg(applevisor::prelude::Reg::PC, entry)
+                    registered
+                        .cpu
+                        .set_reg(applevisor::prelude::Reg::PC, entry)
                         .map_err(|error| error.to_string())?;
-                    cpu.set_reg(applevisor::prelude::Reg::X0, context)
+                    registered
+                        .cpu
+                        .set_reg(applevisor::prelude::Reg::X0, context)
                         .map_err(|error| error.to_string())?;
                     loop {
-                        match run_one(&cpu, cpu_id, handler.as_mut(), &starts)? {
+                        match run_one(&registered.cpu, cpu_id, handler.as_mut(), &starts)? {
                             CpuRun::Continue => {}
                             CpuRun::Off => {
                                 starts.powered_off(cpu_id);
-                                let old = cpu.handle().id();
-                                drop(cpu);
-                                cpu = machine
-                                    .create_secondary(
-                                        u64::try_from(cpu_id).map_err(|_| "CPU ID overflow")?,
-                                        0,
-                                        0,
-                                    )
-                                    .map_err(|error| error.to_string())?;
-                                starts.replace_handle(old, cpu.handle())?;
+                                drop(registered);
+                                registered = RegisteredCpu::create(&starts, cpu_id)?;
                                 break;
                             }
                             CpuRun::Stop => {
@@ -457,5 +465,96 @@ fn run_one(
             }
         }
         RunExit::Unknown => Err(format!("unexpected HVF exit on CPU {cpu_id}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vm::GicConfig;
+    use std::time::Duration;
+
+    struct PowerOffHandler(mpsc::Sender<()>);
+
+    impl VcpuHandler for PowerOffHandler {
+        fn exchange(&mut self, exit: VcpuExit) -> Result<VcpuAction, String> {
+            assert!(matches!(exit, VcpuExit::ArmException(_)));
+            self.0.send(()).unwrap();
+            Ok(VcpuAction::CpuOff)
+        }
+
+        fn finished(&mut self, _outcome: VcpuOutcome) {}
+    }
+
+    /// Hold teardown's handle lock across guest `CPU_OFF`, then issue the native exit.
+    /// `CPU_OFF` must not destroy the registered CPU until that exit finishes, and
+    /// the replacement CPU must also unregister when it receives Stop.
+    #[test]
+    #[ignore = "requires Apple Silicon Hypervisor.framework and hypervisor entitlement"]
+    fn cpu_off_waits_for_teardown_before_destroying_cpu() {
+        let machine = Arc::new(
+            Machine::new(&VmConfig {
+                ram_base: terra_limits::ARM_RAM_BASE,
+                ram_bytes: 16 * 1024 * 1024,
+                vcpus: 2,
+                interrupt_controller: InterruptControllerConfig::Arm(GicConfig {
+                    distributor_base: terra_limits::ARM_GIC_DIST_BASE,
+                    distributor_size: terra_limits::ARM_GIC_DIST_SIZE,
+                    redistributor_base: terra_limits::ARM_GIC_REDIST_BASE,
+                    redistributor_size: terra_limits::ARM_GIC_REDIST_SIZE,
+                }),
+                irq_routes: Vec::new(),
+            })
+            .unwrap(),
+        );
+        let entry = terra_limits::ARM_RAM_BASE;
+        machine
+            .memory()
+            .write(entry, &0xd400_0002_u32.to_le_bytes())
+            .unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let starts = Arc::new(CpuStarts {
+            machine,
+            handles: Mutex::new(Vec::new()),
+            started: Mutex::new(vec![false; 2]),
+            senders: vec![sender.clone(), sender.clone()],
+            stopped: AtomicBool::new(false),
+        });
+        let (ready_sender, ready_receiver) = mpsc::channel();
+        let worker = spawn_cpu(1, Arc::clone(&starts), receiver, ready_sender).unwrap();
+        ready_receiver.recv_timeout(STOP_WAIT).unwrap().unwrap();
+        let (off_sender, off_receiver) = mpsc::channel();
+        sender
+            .send(CpuCommand::Start {
+                handler: Box::new(PowerOffHandler(off_sender)),
+                boot: None,
+            })
+            .unwrap();
+
+        let handles = starts.handles.lock().unwrap();
+        let handle = handles[0].clone();
+        assert_eq!(starts.start(1, entry, 0), 0);
+        off_receiver.recv_timeout(STOP_WAIT).unwrap();
+        let deadline = Instant::now() + STOP_WAIT;
+        while starts.started.lock().unwrap()[1] && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert!(!starts.started.lock().unwrap()[1]);
+        starts.stopped.store(true, Ordering::SeqCst);
+        sender.send(CpuCommand::Stop).unwrap();
+        let deadline = Instant::now() + Duration::from_millis(100);
+        while handle.is_valid() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        let was_alive_during_exit = handle.is_valid();
+        let exit_result = starts.machine.exit(&handles);
+        drop(handles);
+
+        stop_threads(&starts, std::slice::from_ref(&worker), None).unwrap();
+        worker.join().unwrap().unwrap();
+        assert!(was_alive_during_exit);
+        exit_result.unwrap();
+        assert!(!handle.is_valid());
+        assert!(starts.handles.lock().unwrap().is_empty());
     }
 }

@@ -311,6 +311,9 @@ test-component-boot: $(COMPONENT_AOT_TARGETS) $(KERNEL_GZ) $(ROOTFS_IMG) $(BOOT_
 
 test-platform-native-vm:
 	CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER="sh scripts/run-macos-vm-test" $(CARGO_LOCKED) test $(TEST_FLAGS) -p terra-platform --test native_vm -- --ignored --test-threads=1 --nocapture
+ifeq ($(shell uname -s),Darwin)
+	CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER="sh scripts/run-macos-vm-test" $(CARGO_LOCKED) test $(TEST_FLAGS) -p terra-platform --lib cpu_off_waits_for_teardown_before_destroying_cpu -- --ignored --nocapture
+endif
 ifeq ($(ARCH),x86_64)
 	$(CARGO_LOCKED) test $(TEST_FLAGS) -p terra-platform --lib cpuid_matches_the_fixed_vcpu_count -- --ignored --nocapture
 endif

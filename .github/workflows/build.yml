@@ -335,7 +335,7 @@ jobs:
       - name: Native VM acceptance
         if: ${{ !cancelled() && steps.host-build.outcome == 'success' && (inputs.native_vm_tests || matrix.native_vm_tests) }}
         run: |
-          CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER="sh scripts/run-macos-vm-test" cargo test --no-fail-fast --locked --target aarch64-apple-darwin -p terra-platform --test native_vm -- --ignored --test-threads=1
+          CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER="sh scripts/run-macos-vm-test" cargo test --no-fail-fast --locked --target aarch64-apple-darwin -p terra-platform --lib --test native_vm -- --ignored --test-threads=1
           TERRA_BIN="$PWD/dist/terra" cargo test --no-fail-fast --locked --target aarch64-apple-darwin -p terra --test native_boot --test boot --test memory -- --ignored --test-threads=1 --nocapture
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
