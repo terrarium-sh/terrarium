@@ -8,57 +8,62 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-fn signal_vm(bx: &BoxRef, signal: sys::VmSignal) -> Result<Option<(VmProcess, sys::SignalResult)>> {
-    let Some(vm) = bx.read_vm_process() else {
-        return Ok(None);
-    };
-    #[cfg(windows)]
-    if matches!(signal, sys::VmSignal::GracefulStop) {
-        if vm.process_identity.is_none()
-            || sys::read_process_start_time(vm.pid) != vm.process_identity
-        {
-            return Ok(Some((vm, sys::SignalResult::IdentityUnknown)));
-        }
-        if bx.get_holder() == Holder::SettingUp {
-            let result = sys::signal_pid(vm.pid, vm.process_identity, sys::VmSignal::ForcedStop)?;
-            return Ok(Some((vm, result)));
-        }
-        return bx
-            .request_stop()
-            .map(|()| Some((vm, sys::SignalResult::Sent)));
-    }
-    let result = sys::signal_pid(vm.pid, vm.process_identity, signal)
-        .with_context(|| format!("signalling the VM process (pid {}) of {bx}", vm.pid))?;
-    Ok(Some((vm, result)))
+enum StopAttempt {
+    AlreadyStopped,
+    StoppedGracefully,
+    NeedsForce(VmProcess),
 }
 
-/// Ask the box's VM to stop, returning it for the forced kill if the grace
-/// runs out; `Ok(None)` means the box was already stopped.
-fn request_stop(
-    bx: &BoxRef,
-    deadline: Instant,
-    setup_action: SetupAction,
-) -> Result<Option<(VmProcess, sys::SignalResult)>> {
+fn request_stop(bx: &BoxRef, deadline: Instant, setup_action: SetupAction) -> Result<StopAttempt> {
     loop {
         match bx.get_holder() {
-            Holder::Free => return Ok(None),
-            Holder::SettingUp
-                if matches!(setup_action, SetupAction::Refuse)
-                    || bx.read_vm_process().is_none() =>
-            {
+            Holder::Free => return Ok(StopAttempt::AlreadyStopped),
+            Holder::SettingUp if matches!(setup_action, SetupAction::Refuse) => {
                 return Err(bx.setup_holds_it());
             }
-            Holder::Running | Holder::SettingUp => {}
+            Holder::SettingUp => {
+                return bx
+                    .read_vm_process()
+                    .map(StopAttempt::NeedsForce)
+                    .ok_or_else(|| bx.setup_holds_it());
+            }
+            Holder::Running => {}
         }
-        if let Some(vm) = signal_vm(bx, sys::VmSignal::GracefulStop)? {
-            return Ok(Some(vm));
+        match bx.request_stop() {
+            Ok(()) => {
+                eprintln!("terra: stopping {bx}");
+                break;
+            }
+            Err(error) if can_retry_stop(&error) => {}
+            Err(error) => return Err(error),
         }
-        anyhow::ensure!(
-            Instant::now() < deadline,
-            "{bx} is running but its VM published no pid to signal before the wait ran out"
-        );
+        if Instant::now() >= deadline {
+            break;
+        }
         std::thread::sleep(sys::POLL);
     }
+    if wait_until_stopped(bx, deadline) {
+        return Ok(StopAttempt::StoppedGracefully);
+    }
+    bx.read_vm_process()
+        .map(StopAttempt::NeedsForce)
+        .with_context(|| {
+            format!("{bx} is running but its VM published no pid to signal before the wait ran out")
+        })
+}
+
+fn can_retry_stop(error: &anyhow::Error) -> bool {
+    use std::io::ErrorKind;
+
+    error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+        matches!(
+            error.kind(),
+            ErrorKind::NotFound
+                | ErrorKind::ConnectionRefused
+                | ErrorKind::ConnectionReset
+                | ErrorKind::BrokenPipe
+        )
+    })
 }
 
 const KILL_REAP_WAIT: Duration = Duration::from_secs(2);
@@ -101,22 +106,13 @@ pub(crate) fn stop_and_wait(
     setup_action: SetupAction,
 ) -> Result<StopOutcome> {
     let deadline = sys::deadline_after(grace);
-    let Some((vm, signal_result)) = request_stop(bx, deadline, setup_action)? else {
-        return Ok(StopOutcome::AlreadyStopped);
+    let vm = match request_stop(bx, deadline, setup_action)? {
+        StopAttempt::AlreadyStopped => return Ok(StopOutcome::AlreadyStopped),
+        StopAttempt::StoppedGracefully => return Ok(StopOutcome::StoppedGracefully),
+        StopAttempt::NeedsForce(vm) => vm,
     };
-    eprintln!("terra: stopping {bx} (pid {})", vm.pid);
-    if wait_until_stopped(bx, deadline) {
-        return Ok(StopOutcome::StoppedGracefully);
-    }
-    if signal_result == sys::SignalResult::IdentityUnknown {
-        return Ok(StopOutcome::IdentityUnknown);
-    }
-    eprintln!(
-        "terra: {bx} did not stop within {}s - killing pid {}",
-        grace.as_secs(),
-        vm.pid
-    );
-    let signal_result = sys::signal_pid(vm.pid, vm.process_identity, sys::VmSignal::ForcedStop)
+    eprintln!("terra: forcing {bx} to stop (pid {})", vm.pid);
+    let signal_result = sys::terminate_process(vm.pid, vm.process_identity)
         .with_context(|| format!("killing the VM process (pid {}) of {bx}", vm.pid))?;
     if signal_result == sys::SignalResult::IdentityUnknown {
         return Ok(StopOutcome::IdentityUnknown);
@@ -258,43 +254,91 @@ mod tests {
             .expect_err("stop must leave setup running");
         assert!(error.to_string().contains("being set up"));
         assert!(child.try_wait().unwrap().is_none());
-        assert!(
-            request_stop(&bx, Instant::now(), SetupAction::Stop)
-                .unwrap()
-                .is_some()
-        );
+        let outcome = stop_and_wait(&bx, Duration::ZERO, SetupAction::Stop).unwrap();
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+        assert!(matches!(outcome, StopOutcome::Wedged));
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+        {
+            assert!(matches!(outcome, StopOutcome::IdentityUnknown));
+            assert!(child.try_wait().unwrap().is_none());
+            child.kill().unwrap();
+        }
         assert!(!child.wait().unwrap().success());
         drop(marked);
     }
 
-    /// The graceful path end to end: the published pid is signalled, and the
-    /// box being let go is what says the stop landed - the lock, not the
-    /// signal's own return, which says only that it was delivered.
+    /// The socket identifies the box even without a usable published process identity.
+    /// A stop during startup waits for the listener rather than signalling a numeric PID.
     #[test]
-    #[cfg(unix)]
-    fn a_vm_that_takes_the_signal_stops_gracefully() {
-        let dir = tempfile::tempdir().unwrap();
-        let (bx, _home) = create_box_in(dir.path());
-        let mut child = spawn_vm_child(&bx, "echo up; exec sleep 30");
+    fn graceful_stop_waits_for_the_control_socket_and_releases_the_box() {
+        use std::io::Read as _;
+        use terra_platform::io::local::LocalListener;
 
-        assert!(matches!(
-            stop_and_wait(&bx, Duration::from_secs(10), SetupAction::Refuse).unwrap(),
-            StopOutcome::StoppedGracefully
-        ));
-        assert!(!bx.get_holder().holds(), "the box is still held");
-        child.wait().unwrap();
+        for (pid_line, delay) in [
+            (std::process::id().to_string(), Duration::ZERO),
+            (String::new(), Duration::ZERO),
+            ("malformed".to_owned(), Duration::ZERO),
+            (String::new(), Duration::from_millis(200)),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (bx, _home) = create_box_in(dir.path());
+            let lock = bx.lock_run().unwrap();
+            BoxRef::rewrite_lock_line(&lock, &pid_line).unwrap();
+            let path = bx.get_dir().join(crate::state::CONTROL_SOCKET);
+            let server = std::thread::spawn(move || {
+                std::thread::sleep(delay);
+                let listener = LocalListener::bind(path).unwrap();
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                assert_eq!(byte, [terra_protocol::STOP_SIGNAL]);
+                drop(lock);
+            });
+            assert!(matches!(
+                stop_and_wait(&bx, Duration::from_secs(5), SetupAction::Refuse).unwrap(),
+                StopOutcome::StoppedGracefully
+            ));
+            server.join().unwrap();
+            assert!(!bx.get_holder().holds());
+        }
     }
 
-    /// A VM that will not take SIGTERM is killed once the grace runs out, and
-    /// the outcome says which of the two happened: `terra stop` reports both as
-    /// stopped, but a `pre_stop` that never ran is the difference between a
-    /// clean shutdown and a workload cut off mid-write.
-    ///
-    /// An ignored SIGTERM survives `exec`, so it is `sleep` itself that refuses
-    /// the signal here rather than a shell that would have to forward it.
+    #[test]
+    fn forced_stop_reads_pid_metadata_after_the_grace_period() {
+        use std::io::Read as _;
+        use terra_platform::io::local::LocalListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (bx, _home) = create_box_in(dir.path());
+        let lock = bx.lock_run().unwrap();
+        BoxRef::rewrite_lock_line(&lock, "100").unwrap();
+        let listener =
+            LocalListener::bind(bx.get_dir().join(crate::state::CONTROL_SOCKET)).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut byte = [0];
+            stream.read_exact(&mut byte).unwrap();
+            assert_eq!(byte, [terra_protocol::STOP_SIGNAL]);
+            BoxRef::rewrite_lock_line(&lock, "200").unwrap();
+            lock
+        });
+        let attempt = request_stop(
+            &bx,
+            sys::deadline_after(Duration::from_millis(200)),
+            SetupAction::Refuse,
+        )
+        .unwrap();
+        let _lock = server.join().unwrap();
+        assert!(matches!(
+            attempt,
+            StopAttempt::NeedsForce(VmProcess { pid: 200, .. })
+        ));
+    }
+
+    /// An unavailable control socket still permits identity-bound forced termination.
     #[test]
     #[cfg(unix)]
-    fn a_vm_that_ignores_the_signal_is_killed_once_the_grace_runs_out() {
+    fn a_vm_without_a_control_socket_is_killed_once_the_grace_runs_out() {
         let dir = tempfile::tempdir().unwrap();
         let (bx, _home) = create_box_in(dir.path());
         let mut child = spawn_vm_child(&bx, "trap '' TERM; echo up; exec sleep 30");

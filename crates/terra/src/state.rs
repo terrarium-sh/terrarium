@@ -169,7 +169,6 @@ impl BoxRef {
         })
     }
 
-    #[cfg(any(windows, test))]
     pub fn request_stop(&self) -> Result<()> {
         use std::io::Write as _;
 
@@ -327,7 +326,7 @@ impl Drop for BakeMark<'_> {
 pub struct VmProcess {
     pub pid: u32,
     /// The process start identity when the pid was published, by which
-    /// [`crate::sys::signal_pid`] tells this VM from a stranger later
+    /// [`crate::sys::terminate_process`] tells this VM from a stranger later
     /// recycled onto the pid. `None` - an old line, or the host had no
     /// identity - cannot be signalled.
     pub process_identity: Option<u64>,

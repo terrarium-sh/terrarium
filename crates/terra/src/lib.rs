@@ -58,7 +58,7 @@ pub async fn run() -> Result<ExitCode> {
     let name = args.name.as_deref();
     match &args.cmd {
         None => cmd::start::run(name, &args.boot, &project_dir, &cwd, is_at_a_terminal).await,
-        Some(Cmd::Setup(a)) => cmd::setup::run(a, name, &project_dir, &cwd, is_at_a_terminal),
+        Some(Cmd::Setup(a)) => cmd::setup::run(a, name, &project_dir, &cwd, is_at_a_terminal).await,
         Some(Cmd::Exec(a)) => cmd::exec::run(a, name, &project_dir, is_at_a_terminal).await,
         Some(Cmd::Sync(a)) => cmd::sync::run(a, name, &project_dir).await,
         Some(Cmd::Stop(a)) => cmd::stop::run(a, name, &project_dir),

@@ -8,7 +8,7 @@ use crate::state::BoxRef;
 use crate::{logs, sys};
 use anyhow::{Context, Result};
 use std::fs::File;
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::process::ExitCode;
 use std::sync::Arc;
 use terra_platform::io::local::{LocalListener, LocalStream};
@@ -91,7 +91,6 @@ fn agent_listener(bx: &BoxRef) -> Result<LocalListener> {
     Ok(listener)
 }
 
-#[cfg(windows)]
 fn stop_listener(bx: &BoxRef) -> Result<LocalListener> {
     let path = bx.get_dir().join(crate::state::CONTROL_SOCKET);
     let _ = std::fs::remove_file(&path);
@@ -101,11 +100,13 @@ fn stop_listener(bx: &BoxRef) -> Result<LocalListener> {
     Ok(listener)
 }
 
-#[cfg(windows)]
 fn relay_stop(listener: LocalListener, mut control: LocalStream) {
     std::thread::spawn(move || {
-        if listener.accept().is_ok() {
-            let _ = control.write_all(&[terra_protocol::STOP_SIGNAL]);
+        if let Ok((mut request, _)) = listener.accept() {
+            let mut byte = [0];
+            if request.read_exact(&mut byte).is_ok() && byte == [terra_protocol::STOP_SIGNAL] {
+                let _ = control.write_all(&byte);
+            }
         }
     });
 }
@@ -130,9 +131,7 @@ pub async fn run(spec: &BootSpec, bx: &BoxRef, lock: &File) -> Result<ExitCode> 
     let plan = build_plan(spec, plan_shares, volumes);
     let plan = encode_frame_with_limit(&plan, MAX_PLAN_BYTES - MAX_PLAN_HOST_STATE_BYTES)
         .context("serializing the boot plan")?;
-    let listener = (spec.mode == PlanMode::Run)
-        .then(|| agent_listener(bx))
-        .transpose()?;
+    let listener = Some(agent_listener(bx)?);
     let port_mappings = if spec.mode == PlanMode::Run {
         rules::parse_port_mappings(&spec.cfg.network.ports)?
     } else {
@@ -163,8 +162,7 @@ pub async fn run(spec: &BootSpec, bx: &BoxRef, lock: &File) -> Result<ExitCode> 
     let control = if spec.mode == PlanMode::Run {
         let (host, worker) = LocalStream::pair().context("creating the VM stop channel")?;
         #[cfg(unix)]
-        sys::register_stop_channel(host.into());
-        #[cfg(windows)]
+        sys::register_stop_channel(host.try_clone()?.into());
         relay_stop(stop_listener(bx)?, host);
         Some(worker)
     } else {
@@ -225,6 +223,23 @@ mod tests {
     use super::*;
     use crate::config::{Config, Mount};
     use std::path::PathBuf;
+
+    #[test]
+    fn stop_socket_relays_the_request_to_the_vm_control_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let bx = BoxRef::from_state_dir(dir.path().join("state"), dir.path());
+        std::fs::create_dir(bx.get_dir()).unwrap();
+        let listener = stop_listener(&bx).unwrap();
+        let (host, mut worker) = LocalStream::pair().unwrap();
+        worker
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        relay_stop(listener, host);
+        bx.request_stop().unwrap();
+        let mut byte = [0];
+        worker.read_exact(&mut byte).unwrap();
+        assert_eq!(byte, [terra_protocol::STOP_SIGNAL]);
+    }
 
     #[test]
     fn workload_mounts_have_matching_grants_and_plan_tags() {

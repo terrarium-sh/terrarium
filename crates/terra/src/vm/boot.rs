@@ -83,7 +83,7 @@ pub async fn start(
 }
 
 /// The caller keeps its lock while the isolated bake child uses a duplicate.
-pub fn run_bake(cfg: &config::Config, bx: &BoxRef, lock: &File) -> Result<()> {
+pub async fn run_bake(cfg: &config::Config, bx: &BoxRef, lock: &File) -> Result<()> {
     let bake = BootSpec {
         cfg: cfg.clone(),
         project_dir: bx.get_project_dir().to_path_buf(),
@@ -92,18 +92,36 @@ pub fn run_bake(cfg: &config::Config, bx: &BoxRef, lock: &File) -> Result<()> {
         // never in-process
         foreground: false,
     };
-    eprintln!(
-        "terra: baking on_create for {bx} in an isolated VM (no shares) - \
-         `terra {} logs --diagnostics --follow` follows it",
-        bx.get_name()
-    );
-    // Marked for as long as the bake holds the box: it serves no agent port, so
-    // a second terra finding the lock held must not offer a session to join.
+    eprintln!("terra: baking on_create for {bx} in an isolated VM (no shares)");
     let baking = bx.mark_baking(lock);
     let mut child = spawn_vm_process(bx, &bake, lock)?;
+    let deadline = Instant::now() + DETACH_READY_DEADLINE;
+    let output = async {
+        let stream =
+            session::connect_to_agent(bx, terra_protocol::AgentService::Session, "bake", || {
+                anyhow::ensure!(
+                    child.try_wait()?.is_none(),
+                    "the bake stopped before opening its console"
+                );
+                anyhow::ensure!(
+                    Instant::now() < deadline,
+                    "timed out opening the bake console"
+                );
+                Ok(())
+            })
+            .await?;
+        session::pump_session_output(stream, &mut std::io::stdout()).await
+    }
+    .await;
+    if output.is_err() {
+        let _ = child.kill();
+    }
     let status = child.wait().context("waiting for the on_create bake")?;
     if !status.success() {
         replay_logs(bx, status);
+    }
+    output.context("streaming the on_create bake")?;
+    if !status.success() {
         if let Some(signal) = sys::find_terminating_signal(status) {
             anyhow::bail!(
                 "the on_create bake was killed (signal {signal}) before it finished.\n\
@@ -113,7 +131,7 @@ pub fn run_bake(cfg: &config::Config, bx: &BoxRef, lock: &File) -> Result<()> {
         }
         anyhow::bail!(
             "the on_create bake failed - fix the recipe, then `terra {} setup` re-runs \
-             it (`--rebuild` for a clean slate); the guest console is in diagnostics.log",
+             it (`--rebuild` for a clean slate); agent diagnostics are in diagnostics.log",
             bx.get_name()
         );
     }

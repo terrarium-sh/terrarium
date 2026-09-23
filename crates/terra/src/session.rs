@@ -592,8 +592,7 @@ pub async fn pump_session(stream: AsyncLocalStream) -> Result<SessionOutcome> {
     }
 }
 
-#[cfg(test)]
-async fn pump_session_output(
+pub(crate) async fn pump_session_output(
     mut reader: impl tokio::io::AsyncRead + Unpin,
     out: &mut impl Write,
 ) -> Result<SessionOutcome> {
@@ -880,16 +879,7 @@ mod tests {
         }
     }
 
-    /// A bake holds the box's lock but binds no agent port, so a box mid-`terra
-    /// setup` answers "running" to every check and then never answers at all:
-    /// `terra exec` and `terra put`/`get` used to sit on a socket nothing would bind
-    /// until the bake ended, and then report that the box had stopped.
-    ///
-    /// Both halves are here, because the wait is the one that outlived the
-    /// fix: a bake the box was already in is refused at the door, and one that
-    /// takes the box *mid-wait* is refused the next time the wait looks. Every
-    /// waiter for an agent port reads [`still_serving`], `attach` included, so
-    /// there is one answer rather than one per verb.
+    /// Ordinary clients must not attach to a setup bake as though it were a running workload.
     #[test]
     fn a_box_mid_bake_is_refused_rather_than_waited_on() {
         let dir = tempfile::tempdir().unwrap();

@@ -33,10 +33,13 @@ pub(super) async fn execute(
     crate::sync::ensure_directory(Path::new(terra_protocol::WORKLOAD_HOME), true)
         .with_context(|| format!("creating home {}", terra_protocol::WORKLOAD_HOME))?;
     if plan.mode == PlanMode::Create {
+        let startup = crate::vsock::StartupGate::new();
+        let SessionPty { session, .. } =
+            start_session(plan, port, startup, stop, shutdown, tasks).await?;
         crate::report_agent_ready(control).await?;
-        return bake_if_stale(&plan.on_create, diagnostic, stop)
-            .await
-            .map(|()| 0);
+        let outcome = bake_if_stale(&plan.on_create, diagnostic, &session, stop).await;
+        session.broadcast_exit(i32::from(outcome.is_err())).await;
+        return outcome.map(|()| 0);
     }
     config::ensure_baked(&plan.on_create)?;
     config::mount_filesystems(plan)?;
@@ -56,15 +59,7 @@ pub(super) async fn execute(
             .await;
     }
     for line in &plan.on_start {
-        if let Err(error) = hooks::run(
-            line,
-            Some(HOOK_TIMEOUT),
-            Some(diagnostic),
-            Some(&session),
-            stop,
-        )
-        .await
-        {
+        if let Err(error) = hooks::run(line, Some(HOOK_TIMEOUT), None, Some(&session), stop).await {
             return Err(fail_startup(&startup, &session, error).await);
         }
     }
@@ -90,14 +85,8 @@ pub(super) async fn execute(
         session.feed_output(b"terra: running stop hooks\r\n").await;
     }
     for line in &plan.pre_stop {
-        if let Err(error) = hooks::run(
-            line,
-            Some(HOOK_TIMEOUT),
-            Some(diagnostic),
-            Some(&session),
-            shutdown,
-        )
-        .await
+        if let Err(error) =
+            hooks::run(line, Some(HOOK_TIMEOUT), None, Some(&session), shutdown).await
         {
             session
                 .feed_output(format!("terra-agent: stop hook failed: {error:#}\r\n").as_bytes())
@@ -127,6 +116,7 @@ async fn fail_startup(
 async fn bake_if_stale(
     on_create: &[String],
     diagnostic: &Diagnostics,
+    session: &Arc<crate::term::session::Session>,
     stop: &CancellationToken,
 ) -> Result<()> {
     let recipe = on_create.join("\n");
@@ -137,7 +127,7 @@ async fn bake_if_stale(
         diagnostic.record(b"terra: baking on_create...\n");
     }
     for line in on_create {
-        hooks::run(line, Some(HOOK_TIMEOUT), Some(diagnostic), None, stop).await?;
+        hooks::run(line, Some(HOOK_TIMEOUT), None, Some(session), stop).await?;
     }
     fs::write(terra_protocol::RECIPE_STAMP_PATH, &recipe)
         .with_context(|| format!("stamping {}", terra_protocol::RECIPE_STAMP_PATH))

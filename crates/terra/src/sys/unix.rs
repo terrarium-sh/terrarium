@@ -1,10 +1,12 @@
 //! Unix process, file and control-channel operations.
-use super::VmSignal;
 use std::fs::File;
 use std::io::Result;
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+
+#[cfg(target_os = "macos")]
+mod macos;
 
 pub(crate) fn file_link_count(path: &Path) -> Result<u64> {
     use std::os::unix::fs::MetadataExt;
@@ -210,7 +212,7 @@ pub fn find_terminating_signal(status: std::process::ExitStatus) -> Option<i32> 
 }
 
 /// Process start identity: Linux clock ticks since boot, or Darwin wall-clock
-/// microseconds. Two processes can wear one pid in sequence, never one starttime.
+/// microseconds.
 #[cfg_attr(target_os = "macos", allow(unsafe_code))]
 pub fn read_process_start_time(pid: u32) -> Option<u64> {
     #[cfg(target_os = "linux")]
@@ -257,23 +259,11 @@ pub fn read_process_start_time(pid: u32) -> Option<u64> {
     }
 }
 
-fn published_process_is_current(pid: u32, published_start_time: Option<u64>) -> bool {
-    match published_start_time {
-        None => false,
-        Some(published) => read_process_start_time(pid) == Some(published),
-    }
-}
-
-/// `IdentityUnknown` means the process is gone or its published identity cannot be verified.
-pub fn signal_pid(
+/// `IdentityUnknown` means the process cannot be pinned and verified against its published identity.
+pub fn terminate_process(
     pid: u32,
     published_start_time: Option<u64>,
-    signal: VmSignal,
 ) -> Result<super::SignalResult> {
-    let sig = match signal {
-        VmSignal::GracefulStop => rustix::process::Signal::TERM,
-        VmSignal::ForcedStop => rustix::process::Signal::KILL,
-    };
     let Ok(target) = i32::try_from(pid) else {
         return Err(std::io::Error::other(format!(
             "{pid} is not a process id, so nothing was signalled \
@@ -287,21 +277,45 @@ pub fn signal_pid(
         )));
     };
     #[cfg(target_os = "linux")]
-    if let Ok(fd) = rustix::process::pidfd_open(target, rustix::process::PidfdFlags::empty()) {
-        if !published_process_is_current(pid, published_start_time) {
-            return Ok(super::SignalResult::IdentityUnknown);
-        }
-        return match rustix::process::pidfd_send_signal(&fd, sig) {
-            Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(super::SignalResult::Sent),
-            Err(e) => Err(std::io::Error::from(e)),
-        };
+    {
+        signal_pidfd(
+            target,
+            published_start_time,
+            rustix::process::Signal::KILL,
+            |target| rustix::process::pidfd_open(target, rustix::process::PidfdFlags::empty()),
+            read_process_start_time,
+        )
     }
-    if !published_process_is_current(pid, published_start_time) {
+    #[cfg(target_os = "macos")]
+    {
+        macos::terminate_process(target.as_raw_pid(), published_start_time)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (target, published_start_time);
+        Ok(super::SignalResult::IdentityUnknown)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn signal_pidfd(
+    target: rustix::process::Pid,
+    published_start_time: Option<u64>,
+    signal: rustix::process::Signal,
+    open_pidfd: impl FnOnce(rustix::process::Pid) -> rustix::io::Result<std::os::fd::OwnedFd>,
+    read_start_time: impl FnOnce(u32) -> Option<u64>,
+) -> Result<super::SignalResult> {
+    let Ok(fd) = open_pidfd(target) else {
+        return Ok(super::SignalResult::IdentityUnknown);
+    };
+    if published_start_time.is_none_or(|published| {
+        read_start_time(target.as_raw_pid().cast_unsigned()) != Some(published)
+    }) {
         return Ok(super::SignalResult::IdentityUnknown);
     }
-    match rustix::process::kill_process(target, sig) {
+    match rustix::process::pidfd_send_signal(&fd, signal) {
         Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(super::SignalResult::Sent),
-        Err(e) => Err(std::io::Error::from(e)),
+        Err(error) => Err(std::io::Error::from(error)),
     }
 }
 
@@ -391,56 +405,65 @@ mod tests {
         let pid = child.id();
         child.wait().unwrap(); // reaped: the pid names nothing at all now
         assert_eq!(
-            signal_pid(pid, None, VmSignal::GracefulStop).unwrap(),
-            SignalResult::IdentityUnknown
-        );
-        assert_eq!(
-            signal_pid(pid, None, VmSignal::ForcedStop).unwrap(),
+            terminate_process(pid, None).unwrap(),
             SignalResult::IdentityUnknown
         );
     }
 
-    /// The pid file outlives its VM by however long it takes a boot to empty
-    /// it, and the kernel hands that number to strangers in between. A stored
-    /// starttime that no longer matches is exactly such a stranger: signalled
-    /// with nothing - `Ok`, because "already gone" is the truth about the box -
-    /// while the same pid with *its* starttime takes the signal.
+    #[cfg(target_os = "linux")]
     #[test]
-    fn an_unverified_pid_is_left_alone_and_the_real_one_is_signalled() {
+    fn failed_pidfd_open_never_falls_back_to_numeric_signalling() {
         let mut child = Command::new("sleep").arg("30").spawn().unwrap();
-        let pid = child.id();
-        let started_at = read_process_start_time(pid).expect("a live child has a stat");
-
-        assert_eq!(
-            signal_pid(pid, None, VmSignal::ForcedStop).unwrap(),
-            SignalResult::IdentityUnknown
-        );
-        assert!(child.try_wait().unwrap().is_none());
-
-        // One tick off is nobody's process as far as the check is concerned.
-        assert_eq!(
-            signal_pid(pid, Some(started_at + 1), VmSignal::GracefulStop).unwrap(),
-            SignalResult::IdentityUnknown
-        );
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "a living child was signalled through a recycled identity"
-        );
-
-        // The published starttime is the one that reaches it; `sleep` dies of
-        // SIGTERM outright.
-        assert_eq!(
-            signal_pid(pid, Some(started_at), VmSignal::GracefulStop).unwrap(),
-            SignalResult::Sent
-        );
+        let target = rustix::process::Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
+        let identity = read_process_start_time(child.id());
+        for signal in [rustix::process::Signal::TERM, rustix::process::Signal::KILL] {
+            let result = signal_pidfd(
+                target,
+                identity,
+                signal,
+                |_| Err(rustix::io::Errno::ACCESS),
+                |_| panic!("identity checks cannot make numeric signalling safe"),
+            )
+            .unwrap();
+            assert_eq!(result, SignalResult::IdentityUnknown);
+            assert!(child.try_wait().unwrap().is_none());
+        }
+        child.kill().unwrap();
         child.wait().unwrap();
+    }
 
-        // …and once gone, any starttime reads as already-gone rather than
-        // reaching whoever wears the pid now.
-        assert_eq!(
-            signal_pid(pid, Some(started_at), VmSignal::ForcedStop).unwrap(),
-            SignalResult::IdentityUnknown
-        );
+    /// Simulate PID reuse by resolving a numeric PID to the original child's handle,
+    /// then reaping that child during identity verification. The numeric PID names
+    /// a live stranger; only the original handle may receive the signal.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_exit_after_identity_verification_cannot_signal_a_replacement() {
+        for signal in [rustix::process::Signal::TERM, rustix::process::Signal::KILL] {
+            let mut original = Command::new("sleep").arg("30").spawn().unwrap();
+            let mut stranger = Command::new("sleep").arg("30").spawn().unwrap();
+            let original_pid =
+                rustix::process::Pid::from_raw(i32::try_from(original.id()).unwrap()).unwrap();
+            let reused_pid =
+                rustix::process::Pid::from_raw(i32::try_from(stranger.id()).unwrap()).unwrap();
+            let identity = read_process_start_time(original.id()).unwrap();
+            let result = signal_pidfd(
+                reused_pid,
+                Some(identity),
+                signal,
+                |_| rustix::process::pidfd_open(original_pid, rustix::process::PidfdFlags::empty()),
+                |_| {
+                    original.kill().unwrap();
+                    original.wait().unwrap();
+                    Some(identity)
+                },
+            )
+            .unwrap();
+            let stranger_survived = stranger.try_wait().unwrap().is_none();
+            stranger.kill().unwrap();
+            stranger.wait().unwrap();
+            assert_eq!(result, SignalResult::Sent);
+            assert!(stranger_survived);
+        }
     }
 
     /// A pid too large for `pid_t` used to convert to `-1`, and `kill(-1)`
@@ -450,15 +473,12 @@ mod tests {
     #[test]
     fn a_number_that_is_not_a_pid_signals_nothing() {
         for not_a_pid in [u32::MAX, u32::MAX / 2 + 1] {
-            for signal in [VmSignal::GracefulStop, VmSignal::ForcedStop] {
-                let err = signal_pid(not_a_pid, None, signal)
-                    .expect_err("a number past pid_t must not be signalled")
-                    .to_string();
-                assert!(err.contains("not a process id"), "{err}");
-            }
+            let err = terminate_process(not_a_pid, None)
+                .expect_err("a number past pid_t must not be signalled")
+                .to_string();
+            assert!(err.contains("not a process id"), "{err}");
         }
-        // The largest real pid is still signalled - as ESRCH, which is `Ok`.
-        assert!(signal_pid(u32::MAX / 2, None, VmSignal::GracefulStop).is_ok());
+        assert!(terminate_process(u32::MAX / 2, None).is_ok());
     }
 
     /// The starttime field is counted from the end of the comm field, which

@@ -129,7 +129,7 @@ pub async fn run(
                 .join(crate::state::BAKE_STAMP)
                 .exists())
     {
-        boot::run_bake(&spec.cfg, &approved.bx, &prepared.lock)?;
+        boot::run_bake(&spec.cfg, &approved.bx, &prepared.lock).await?;
     }
     boot::start(
         &spec,
@@ -223,11 +223,7 @@ mod tests {
         }
     }
 
-    /// A bake holds the box's lock but serves no agent port, so "is it
-    /// running" is the wrong question for a box being set up: `terra <box>`
-    /// used to answer "already running - attaching" and then sit on a socket
-    /// nothing would ever bind, until `terra setup` finished and the wait died
-    /// with "stopped before it had a session to join". Neither line was true.
+    /// Ordinary clients must not attach to a setup bake as though it were a running workload.
     #[test]
     fn a_box_being_baked_is_not_offered_as_a_session_to_join() {
         let dir = tempfile::tempdir().unwrap();

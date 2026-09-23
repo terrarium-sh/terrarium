@@ -29,8 +29,8 @@ pub use imp::register_stop_channel;
 pub use imp::{
     MAX_SOCK_PATH, allocated_size, claim_inherited_lock, detach, find_terminating_signal,
     holds_run_lock, host_addresses, install_stop_signal_handlers, make_sparse, pass_lock,
-    read_process_start_time, restrict_new_files, set_open_file_mode, set_owner_only, signal_pid,
-    try_lock_run,
+    read_process_start_time, restrict_new_files, set_open_file_mode, set_owner_only,
+    terminate_process, try_lock_run,
 };
 
 pub(crate) fn validate_host_root() -> anyhow::Result<()> {
@@ -54,16 +54,6 @@ pub const POLL: std::time::Duration = std::time::Duration::from_millis(100);
 #[must_use]
 pub(crate) fn deadline_after(wait: std::time::Duration) -> std::time::Instant {
     std::time::Instant::now() + wait.min(std::time::Duration::from_secs(u64::from(u32::MAX)))
-}
-
-/// What a stop asks of the VM process - terra's own two words, so a host
-/// answers the same question however it delivers the answer.
-#[derive(Copy, Clone, Debug)]
-pub enum VmSignal {
-    /// Ask the guest to shut down: `pre_stop`, then the VM exits.
-    GracefulStop,
-    /// Take the process without asking - the escape hatch for a wedged one.
-    ForcedStop,
 }
 
 /// Whether the published process identity accepted a signal.
@@ -327,18 +317,23 @@ mod tests {
         let started = read_process_start_time(pid).unwrap();
         for identity in [None, Some(started + 1)] {
             assert_eq!(
-                signal_pid(pid, identity, VmSignal::ForcedStop).unwrap(),
+                terminate_process(pid, identity).unwrap(),
                 SignalResult::IdentityUnknown
             );
             assert!(child.try_wait().unwrap().is_none());
         }
-        assert_eq!(
-            signal_pid(pid, Some(started), VmSignal::ForcedStop).unwrap(),
-            SignalResult::Sent
-        );
+        let result = terminate_process(pid, Some(started)).unwrap();
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+        assert_eq!(result, SignalResult::Sent);
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+        {
+            assert_eq!(result, SignalResult::IdentityUnknown);
+            assert!(child.try_wait().unwrap().is_none());
+            child.kill().unwrap();
+        }
         assert!(!child.wait().unwrap().success());
         assert_eq!(
-            signal_pid(pid, Some(started), VmSignal::ForcedStop).unwrap(),
+            terminate_process(pid, Some(started)).unwrap(),
             SignalResult::IdentityUnknown
         );
     }

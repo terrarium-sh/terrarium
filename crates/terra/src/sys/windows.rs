@@ -2,7 +2,7 @@
 
 #![allow(unsafe_code)]
 
-use super::{SignalResult, VmSignal};
+use super::SignalResult;
 use std::fs::File;
 use std::io::{Error, Result};
 use std::os::windows::{
@@ -293,32 +293,33 @@ pub fn find_terminating_signal(_status: std::process::ExitStatus) -> Option<i32>
 }
 
 pub fn read_process_start_time(pid: u32) -> Option<u64> {
-    with_process(pid, PROCESS_QUERY_LIMITED_INFORMATION, |process| {
-        let mut created = FILETIME::default();
-        let mut exited = FILETIME::default();
-        let mut kernel = FILETIME::default();
-        let mut user = FILETIME::default();
-        // SAFETY: `process` is open and every FILETIME pointer is writable.
-        let ok = unsafe {
-            GetProcessTimes(
-                process,
-                &raw mut created,
-                &raw mut exited,
-                &raw mut kernel,
-                &raw mut user,
-            )
-        };
-        (ok != 0)
-            .then(|| u64::from(created.dwLowDateTime) | (u64::from(created.dwHighDateTime) << 32))
-    })
+    with_process(
+        pid,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+        read_process_handle_start_time,
+    )
     .flatten()
 }
 
-pub fn signal_pid(
-    pid: u32,
-    published_start_time: Option<u64>,
-    signal: VmSignal,
-) -> Result<SignalResult> {
+fn read_process_handle_start_time(process: *mut std::ffi::c_void) -> Option<u64> {
+    let mut created = FILETIME::default();
+    let mut exited = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    // SAFETY: `process` is open and every FILETIME pointer is writable.
+    let ok = unsafe {
+        GetProcessTimes(
+            process,
+            &raw mut created,
+            &raw mut exited,
+            &raw mut kernel,
+            &raw mut user,
+        )
+    };
+    (ok != 0).then(|| u64::from(created.dwLowDateTime) | (u64::from(created.dwHighDateTime) << 32))
+}
+
+pub fn terminate_process(pid: u32, published_start_time: Option<u64>) -> Result<SignalResult> {
     let rights = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE;
     let Some(result) = with_process(pid, rights, |process| {
         let mut exit = 0;
@@ -328,20 +329,15 @@ pub fn signal_pid(
             return Ok(SignalResult::IdentityUnknown);
         }
         if published_start_time
-            .is_none_or(|published| read_process_start_time(pid) != Some(published))
+            .is_none_or(|published| read_process_handle_start_time(process) != Some(published))
         {
             return Ok(SignalResult::IdentityUnknown);
         }
-        match signal {
-            VmSignal::GracefulStop => Err(Error::other("use the box's local stop service")),
-            VmSignal::ForcedStop => {
-                // SAFETY: `process` has PROCESS_TERMINATE access and belongs to this box.
-                if unsafe { TerminateProcess(process, 1) } == 0 {
-                    return Err(Error::last_os_error());
-                }
-                Ok(SignalResult::Sent)
-            }
+        // SAFETY: `process` has PROCESS_TERMINATE access and its identity was verified through this handle.
+        if unsafe { TerminateProcess(process, 1) } == 0 {
+            return Err(Error::last_os_error());
         }
+        Ok(SignalResult::Sent)
     }) else {
         return Ok(SignalResult::IdentityUnknown);
     };

@@ -131,8 +131,8 @@ mod tests {
     /// The other half is what makes the leniency safe to have: a pin exports
     /// those values into the guest, so `terra setup` still refuses the same
     /// recipe rather than pinning one whose environment is half there.
-    #[test]
-    fn show_prints_a_recipe_whose_env_file_is_not_there_yet() {
+    #[tokio::test]
+    async fn show_prints_a_recipe_whose_env_file_is_not_there_yet() {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
@@ -160,6 +160,7 @@ mod tests {
             &project,
             false,
         )
+        .await
         .expect_err("a pin must still refuse a dotenv it cannot read")
         .to_string();
         assert!(err.contains("resolving env file"), "{err}");

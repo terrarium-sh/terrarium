@@ -110,7 +110,7 @@ pub(super) fn build_plan(spec: &BootSpec, shares: Vec<Share>, volumes: Vec<Disk>
         on_start: cfg.hooks.on_start.clone(),
         pre_stop: cfg.hooks.pre_stop.clone(),
         daemons: cfg.daemons.clone(),
-        await_initial_session: spec.foreground,
+        await_initial_session: spec.foreground || spec.mode == PlanMode::Create,
         workload: std::iter::once(cfg.workload.entrypoint.to_string_lossy().into_owned())
             .chain(cfg.workload.args.iter().cloned())
             .collect(),
@@ -231,6 +231,18 @@ mod tests {
         };
         let foreground_plan = build_plan(&foreground, vec![], vec![]);
         assert!(foreground_plan.await_initial_session);
+    }
+
+    #[test]
+    fn a_bake_waits_for_its_console_before_running_hooks() {
+        let spec = BootSpec {
+            cfg: yaml_serde::from_str("{}").unwrap(),
+            project_dir: PathBuf::from("/proj"),
+            root: false,
+            mode: PlanMode::Create,
+            foreground: false,
+        };
+        assert!(build_plan(&spec, vec![], vec![]).await_initial_session);
     }
 
     /// A bake installs software into the box's filesystem, so it runs as guest

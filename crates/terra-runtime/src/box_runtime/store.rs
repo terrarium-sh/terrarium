@@ -312,6 +312,9 @@ pub(super) fn create_store<H: StoreHost>(
     host: StoreState<H>,
 ) -> Store<StoreState<H>> {
     let mut store = Store::new(engine, host);
+    if let Some(table) = store.concurrent_resource_table() {
+        table.set_max_capacity(crate::component::context::MAX_DEVICE_RESOURCES);
+    }
     store.set_epoch_deadline(COMPONENT_EPOCH_DEADLINE);
     store.epoch_deadline_async_yield_and_update(COMPONENT_EPOCH_DEADLINE);
     store.limiter(|host| host);

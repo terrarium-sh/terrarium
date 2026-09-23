@@ -113,6 +113,29 @@ impl Drop for BoxFixture {
 
 #[test]
 #[ignore = "requires a release binary and usable KVM, Hypervisor.framework, or WHP"]
+fn bake_hook_output_uses_the_console_and_agent_diagnostics_use_the_log() {
+    let fixture = BoxFixture::new();
+    let recipe = fixture.directory.path().join("native.yaml");
+    let config = serde_json::json!({
+        "hw": {"cpus": 1, "mem_mib": 256},
+        "hooks": {"on_create": ["echo BAKE_STDOUT; echo BAKE_STDERR >&2"]}
+    });
+    std::fs::write(&recipe, yaml_serde::to_string(&config).unwrap()).unwrap();
+    let output = fixture.successful(&[recipe.to_str().unwrap(), "setup"]);
+    assert!(output.contains("BAKE_STDOUT"), "{output}");
+    assert!(output.contains("BAKE_STDERR"), "{output}");
+    let diagnostics = fixture.diagnostics();
+    assert!(
+        diagnostics.contains("agent received boot plan"),
+        "{diagnostics}"
+    );
+    assert!(!diagnostics.contains("BAKE_STDOUT"), "{diagnostics}");
+    assert!(!diagnostics.contains("BAKE_STDERR"), "{diagnostics}");
+    assert!(!output.contains("agent received boot plan"), "{output}");
+}
+
+#[test]
+#[ignore = "requires a release binary and usable KVM, Hypervisor.framework, or WHP"]
 fn native_boot_executes_shell() {
     for cpus in [1, 2] {
         let fixture = BoxFixture::new();

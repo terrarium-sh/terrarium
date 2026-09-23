@@ -443,7 +443,7 @@ fn prepare_box_state_dir(bx: &BoxRef) -> Result<()> {
 }
 
 /// `terra [BOX] setup` - pin a recipe, build the filesystem, bake `on_create`.
-pub fn run(
+pub async fn run(
     args: &cli::SetupArgs,
     name: Option<&str>,
     project_dir: &Path,
@@ -492,7 +492,7 @@ pub fn run(
     // Ungated: the guest skips a bake its stamp says already ran, so
     // re-running setup stays cheap.
     if !cfg.hooks.on_create.is_empty() {
-        boot::run_bake(&cfg, &bx, &prepared.lock)?;
+        boot::run_bake(&cfg, &bx, &prepared.lock).await?;
     }
     eprintln!("terra: {bx} is ready - `terra {}` boots it", bx.get_name());
     Ok(ExitCode::SUCCESS)
@@ -972,8 +972,8 @@ mod tests {
     /// mount of the box's own state - and a box that was never set up is still
     /// never set up afterwards, so nothing about a `--dry-run` can be the
     /// reason a later real setup behaves differently.
-    #[test]
-    fn a_dry_run_reaches_the_refusals_and_leaves_nothing_behind() {
+    #[tokio::test]
+    async fn a_dry_run_reaches_the_refusals_and_leaves_nothing_behind() {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
@@ -987,7 +987,9 @@ mod tests {
 
         // A recipe a setup would take: reported, and nothing is built.
         std::fs::write(project.join("dev.yaml"), "hw:\n  cpus: 1\n").unwrap();
-        run(&dry_run, Some("./dev.yaml"), &project, &project, false).unwrap();
+        run(&dry_run, Some("./dev.yaml"), &project, &project, false)
+            .await
+            .unwrap();
         assert!(
             !bx.get_dir().join(state::ROOTFS_FILE).exists(),
             "a dry run built the guest filesystem"
@@ -1012,6 +1014,7 @@ mod tests {
         let err = format!(
             "{:#}",
             run(&dry_run, Some("./dev.yaml"), &project, &project, false)
+                .await
                 .expect_err("a dry run must not pass a recipe `terra setup` would refuse")
         );
         assert!(err.contains("this box's own state"), "{err}");

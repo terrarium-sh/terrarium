@@ -100,8 +100,8 @@ impl Suite {
     }
 
     /// Boot `recipe` in a fresh box named `name` under WORK: `setup` pins the
-    /// recipe (and bakes `on_create` in its isolated VM - whose console goes to
-    /// the box's log, not setup's stdout), then the bare form boots it. The
+    /// recipe and bakes `on_create` with its console on setup's stdout, then
+    /// the bare form boots it. The
     /// recipes live outside any share, so nothing is ever asked about.
     /// Foreground, because this harness has no terminal and wants the VM's
     /// whole run as one captured process; a failed boot also appends the box
@@ -812,13 +812,14 @@ fn run_boot_suite() {
     )
     .unwrap();
     let bad_project = s.create_project_dir("bad-bake");
-    let (_, bake_code) = s.run_terra_status(&[
+    let (bake_output, bake_code) = s.run_terra_status(&[
         bad_bake.to_str().unwrap(),
         "setup",
         "--project",
         bad_project.to_str().unwrap(),
     ]);
     assert_ne!(bake_code, 0, "a failing on_create bake reported success");
+    assert!(bake_output.contains("BAKE_RAN"), "{bake_output}");
     assert!(
         s.run_terra_command(&[
             "logs",
@@ -826,8 +827,8 @@ fn run_boot_suite() {
             "--project",
             bad_project.to_str().unwrap()
         ])
-        .contains("BAKE_RAN"),
-        "the failed bake's console did not reach the log"
+        .contains("init failed"),
+        "the failed bake's diagnostic did not reach the log"
     );
 }
 
