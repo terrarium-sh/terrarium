@@ -34,11 +34,16 @@ the matching Terra build; guest or network input must never supply them.
 | `mounts` | Access to the selected host directory. A writable mount permits creation, modification, and deletion in that directory; `readonly` is enforced by the host-side directory capability. |
 | `network.allow` | Outbound access to the allowed destination and port. An explicit `HOST_LOOPBACK` grant can reach services on the Terra host. |
 | `network.hosts` | Local DNS records; a record alone does not authorize a connection. Add a matching `allow` rule. |
-| `network.mode: unrestricted-public` | Public egress without individual rules. Host, LAN, private, link-local, and cloud-metadata addresses remain blocked unless separately allowed. |
+| `network.mode: unrestricted-public` | Public egress without individual rules, including public addresses on a LAN. IPs collected from host interfaces at VM startup, including public IPs, and blocked private, link-local, and cloud-metadata ranges require explicit grants. |
 | `network.ports` | A guest listener published on host loopback. |
 | `env` and `env_file` | Values delivered to guest hooks and workload processes. Secrets delivered to a guest may be copied or persisted by it. |
 | `hooks`, `sudo`, and `terra exec --root` | Guest-root authority inside that box only. |
 | `terra sync` | A host-initiated synchronization of files and directories. The operator chooses the host path and authorizes guest input or output. |
+
+Filtering uses destination addresses, not network location or the identity of
+machines behind them. A public address that forwards to the host through NAT
+may remain reachable if it is not among the collected host interface addresses.
+The host address list is a startup snapshot, not a live inventory.
 
 The default network mode is an empty allowlist. An allowed network service is
 trusted for every action a guest can take over that connection; destination
