@@ -175,13 +175,15 @@ and nightly, Zig, Cargo build tools, container digests, abuild, and Debian
 snapshot timestamps. Cargo dependencies and GitHub Actions remain covered by
 Dependabot. Kernel LTS-series changes stay manual.
 
-The updaters download guest artifacts before recording their SHA-256 hashes;
-Alpine rootfs and e2fsprogs downloads are checked against upstream checksums.
-Alpine and its packages move together, and mismatched architecture versions
-stop the update. Tool updates keep build entry points synchronized and refresh
-wit-bindgen lockfiles. Generated PRs require review; they are opened with the
-`WORKFLOW_TOKEN` repository secret (fine-grained PAT with Contents, Pull
-requests, Workflows, and Actions write) because `GITHUB_TOKEN` cannot push
+The updaters download guest artifacts before recording their SHA-256 hashes.
+e2fsprogs tarballs and Alpine rootfs images are verified against PGP signatures
+from the committed [.github/keys](.github/keys); Alpine indexes and packages are
+verified against the committed Alpine repository keys and each package's
+signed datahash. Alpine and its packages move together, and mismatched architecture
+versions stop the update. Tool updates keep build entry points synchronized and
+refresh wit-bindgen lockfiles. Generated PRs require review; they are opened
+with the `WORKFLOW_TOKEN` repository secret (fine-grained PAT with Contents,
+Pull requests, Workflows, and Actions write) because `GITHUB_TOKEN` cannot push
 workflow-file changes or open PRs, falling back to `GITHUB_TOKEN` when the
 secret is unset. The jobs explicitly dispatch Build because PRs opened with
 `GITHUB_TOKEN` do not trigger pull-request CI.
