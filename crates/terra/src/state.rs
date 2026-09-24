@@ -511,8 +511,10 @@ pub fn read_origin(project: &Path) -> Option<PathBuf> {
                 return None;
             }
             let wide = wide
-                .chunks_exact(2)
-                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&pair| u16::from_le_bytes(pair))
                 .collect::<Vec<_>>();
             Some(std::ffi::OsString::from_wide(&wide).into())
         } else {
