@@ -16,7 +16,7 @@ enum StopAttempt {
 
 fn request_stop(bx: &BoxRef, deadline: Instant, setup_action: SetupAction) -> Result<StopAttempt> {
     loop {
-        match bx.get_holder() {
+        match bx.get_holder()? {
             Holder::Free => return Ok(StopAttempt::AlreadyStopped),
             Holder::SettingUp if matches!(setup_action, SetupAction::Refuse) => {
                 return Err(bx.setup_holds_it());
@@ -42,7 +42,7 @@ fn request_stop(bx: &BoxRef, deadline: Instant, setup_action: SetupAction) -> Re
         }
         std::thread::sleep(sys::POLL);
     }
-    if wait_until_stopped(bx, deadline) {
+    if wait_until_stopped(bx, deadline)? {
         return Ok(StopAttempt::StoppedGracefully);
     }
     bx.read_vm_process()
@@ -68,15 +68,15 @@ fn can_retry_stop(error: &anyhow::Error) -> bool {
 
 const KILL_REAP_WAIT: Duration = Duration::from_secs(2);
 
-fn wait_until_stopped(bx: &BoxRef, deadline: Instant) -> bool {
+fn wait_until_stopped(bx: &BoxRef, deadline: Instant) -> Result<bool> {
     loop {
-        if !bx.get_holder().holds() {
-            return true;
+        if !bx.get_holder()?.holds() {
+            return Ok(true);
         }
         // An instant, not a duration: each hop that re-derives the deadline
         // spends a little of the wait.
         if Instant::now() >= deadline {
-            return false;
+            return Ok(false);
         }
         std::thread::sleep(sys::POLL);
     }
@@ -117,11 +117,13 @@ pub(crate) fn stop_and_wait(
     if signal_result == sys::SignalResult::IdentityUnknown {
         return Ok(StopOutcome::IdentityUnknown);
     }
-    Ok(if wait_until_stopped(bx, Instant::now() + KILL_REAP_WAIT) {
-        StopOutcome::Killed
-    } else {
-        StopOutcome::Wedged
-    })
+    Ok(
+        if wait_until_stopped(bx, Instant::now() + KILL_REAP_WAIT)? {
+            StopOutcome::Killed
+        } else {
+            StopOutcome::Wedged
+        },
+    )
 }
 
 pub fn run(
@@ -176,7 +178,7 @@ mod tests {
         let inheritance = sys::pass_lock(&mut cmd, &lock).unwrap();
         let mut child = cmd.spawn().unwrap();
         drop(inheritance);
-        bx.publish_pid(&lock, child.id(), false);
+        BoxRef::publish_pid(&lock, child.id(), false).unwrap();
         // From here the child alone holds the box, as it does after a boot.
         drop(lock);
         let mut up = [0u8; 1];
@@ -187,6 +189,17 @@ mod tests {
             .read_exact(&mut up)
             .expect("the child never reported that it was up");
         child
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_probe_errors_fail_stop_and_its_completion_poll() {
+        let dir = tempfile::tempdir().unwrap();
+        let invalid_parent = dir.path().join("file");
+        std::fs::write(&invalid_parent, b"not a directory").unwrap();
+        let bx = BoxRef::from_state_dir(invalid_parent, dir.path());
+        assert!(stop_and_wait(&bx, Duration::ZERO, SetupAction::Refuse).is_err());
+        assert!(wait_until_stopped(&bx, Instant::now()).is_err());
     }
 
     /// Nothing to stop is not a failure: `terra stop` is what a script runs
@@ -227,7 +240,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (bx, _home) = create_box_in(dir.path());
         let lock = bx.lock_run().unwrap();
-        let marked = bx.mark_baking(&lock);
+        let marked = BoxRef::mark_baking(&lock).unwrap();
         assert_eq!(bx.read_vm_process(), None, "the mark precedes any child");
 
         // Long enough that a regression to wait-it-out would fail the test run
@@ -246,10 +259,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (bx, _home) = create_box_in(dir.path());
         let lock = bx.lock_run().unwrap();
-        let marked = bx.mark_baking(&lock);
+        let marked = BoxRef::mark_baking(&lock).unwrap();
         let mut child = sys::build_test_child_command().spawn().unwrap();
-        bx.publish_pid(&lock, child.id(), true);
-        assert!(matches!(bx.get_holder(), Holder::SettingUp));
+        BoxRef::publish_pid(&lock, child.id(), true).unwrap();
+        assert!(matches!(bx.get_holder().unwrap(), Holder::SettingUp));
         let error = stop_and_wait(&bx, Duration::ZERO, SetupAction::Refuse)
             .expect_err("stop must leave setup running");
         assert!(error.to_string().contains("being set up"));
@@ -299,7 +312,7 @@ mod tests {
                 StopOutcome::StoppedGracefully
             ));
             server.join().unwrap();
-            assert!(!bx.get_holder().holds());
+            assert!(!bx.get_holder().unwrap().holds());
         }
     }
 
@@ -347,7 +360,7 @@ mod tests {
             stop_and_wait(&bx, Duration::from_millis(300), SetupAction::Refuse).unwrap(),
             StopOutcome::Killed
         ));
-        assert!(!bx.get_holder().holds(), "the box is still held");
+        assert!(!bx.get_holder().unwrap().holds(), "the box is still held");
         child.wait().unwrap();
     }
 }

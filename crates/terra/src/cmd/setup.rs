@@ -482,7 +482,7 @@ pub async fn run(
 ) -> Result<ExitCode> {
     let target = resolve::resolve_for_setup(name, project_dir, cwd)?;
 
-    match target.bx.get_holder() {
+    match target.bx.get_holder()? {
         Holder::Free => {}
         Holder::SettingUp => return Err(target.bx.setup_holds_it()),
         Holder::Running => anyhow::bail!(

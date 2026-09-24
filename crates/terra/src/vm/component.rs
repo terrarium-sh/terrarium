@@ -112,7 +112,12 @@ fn relay_stop(listener: LocalListener, mut control: LocalStream) {
 }
 
 #[allow(clippy::too_many_lines)]
-pub async fn run(spec: &BootSpec, bx: &BoxRef, lock: &File) -> Result<ExitCode> {
+pub async fn run(
+    spec: &BootSpec,
+    bx: &BoxRef,
+    lock: &File,
+    on_ready: impl FnOnce() + Send,
+) -> Result<ExitCode> {
     logs::init(bx)?;
     let component_memory_limits = spec.cfg.components.memory_limits()?;
     let _resources = super::resources::admit(
@@ -169,7 +174,8 @@ pub async fn run(spec: &BootSpec, bx: &BoxRef, lock: &File) -> Result<ExitCode> 
         None
     };
 
-    bx.publish_pid(lock, std::process::id(), spec.mode == PlanMode::Create);
+    BoxRef::publish_pid(lock, std::process::id(), spec.mode == PlanMode::Create)
+        .context("publishing the VM process identity")?;
     let prepared = terra_runtime::orchestration::prepare(VmInput {
         component_memory_limits,
         kernel,
@@ -193,14 +199,7 @@ pub async fn run(spec: &BootSpec, bx: &BoxRef, lock: &File) -> Result<ExitCode> 
     let worker_result = match prepared {
         Ok(prepared) => {
             log::info!("component VMM prepared; starting guest CPUs and devices");
-            prepared
-                .run(|| {
-                    let mut startup = std::io::stdout().lock();
-                    let _ = startup
-                        .write_all(&[terra_protocol::AGENT_READY_NOTIFICATION])
-                        .and_then(|()| startup.flush());
-                })
-                .await
+            prepared.run(on_ready).await
         }
         Err(error) => Err(error),
     };

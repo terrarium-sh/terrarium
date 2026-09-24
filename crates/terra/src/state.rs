@@ -192,44 +192,37 @@ impl BoxRef {
         file.seek(std::io::SeekFrom::Start(0))?;
         file.set_len(0)?;
         file.write_all(line.as_bytes())?;
-        Ok(())
+        file.sync_all()
     }
 
-    /// A failed write is worth a warning: `terra stop` finds this VM by the pid
-    /// published here.
-    pub fn publish_pid(&self, lock: &File, pid: u32, baking: bool) {
-        use std::fmt::Write as _;
-        let mut line = pid.to_string();
-        if let Some(process_identity) = crate::sys::read_process_start_time(pid) {
-            let _ = write!(line, " {process_identity}");
-        }
+    pub fn publish_pid(lock: &File, pid: u32, baking: bool) -> std::io::Result<()> {
+        let process_identity = crate::sys::read_process_start_time(pid).ok_or_else(|| {
+            std::io::Error::other(format!("reading start identity for pid {pid}"))
+        })?;
+        let mut line = format!("{pid} {process_identity}");
         if baking {
             line.push(' ');
             line.push_str(BAKE_MARK);
         }
-        if let Err(e) = Self::rewrite_lock_line(lock, &line) {
-            log::warn!("terra: warning: could not publish pid {pid} for {self}: {e}");
-        }
+        Self::rewrite_lock_line(lock, &line)
     }
 
-    /// A host that cannot lock at all reads as [`Holder::Free`], and leaves the
-    /// real complaint to `lock_run`.
-    pub fn get_holder(&self) -> Holder {
-        if !crate::sys::holds_run_lock(&self.dir.join(PID_FILE)) {
-            return Holder::Free;
+    pub fn get_holder(&self) -> Result<Holder> {
+        let path = self.dir.join(PID_FILE);
+        if !crate::sys::holds_run_lock(&path)
+            .with_context(|| format!("probing run lock {}", path.display()))?
+        {
+            return Ok(Holder::Free);
         }
         if self.is_marked_baking() {
-            return Holder::SettingUp;
+            return Ok(Holder::SettingUp);
         }
-        Holder::Running
+        Ok(Holder::Running)
     }
 
-    #[must_use = "the bake mark is cleared when this drops"]
-    pub fn mark_baking<'a>(&self, lock: &'a File) -> BakeMark<'a> {
-        if let Err(e) = Self::rewrite_lock_line(lock, BAKE_MARK) {
-            log::warn!("terra: warning: could not mark {self} as baking: {e}");
-        }
-        BakeMark(lock)
+    pub fn mark_baking(lock: &File) -> std::io::Result<BakeMark<'_>> {
+        Self::rewrite_lock_line(lock, BAKE_MARK)?;
+        Ok(BakeMark(lock))
     }
 
     pub fn setup_holds_it(&self) -> anyhow::Error {
@@ -241,15 +234,15 @@ impl BoxRef {
         )
     }
 
-    pub fn get_state(&self) -> BoxState {
-        match self.get_holder() {
+    pub fn get_state(&self) -> Result<BoxState> {
+        Ok(match self.get_holder()? {
             Holder::Running => BoxState::Running,
             Holder::SettingUp => BoxState::SettingUp,
             // "Stopped" would invite booting a box whose project directory is gone.
             Holder::Free if !self.project_dir.is_dir() => BoxState::Gone,
             Holder::Free if self.dir.join(ROOTFS_FILE).exists() => BoxState::Stopped,
             Holder::Free => BoxState::NotCreated,
-        }
+        })
     }
 
     /// Take the box's exclusive lock, held for as long as the returned `File`
@@ -309,7 +302,7 @@ pub struct BakeMark<'a>(&'a File);
 
 impl BakeMark<'_> {
     pub(crate) fn clear(self) -> std::io::Result<()> {
-        self.0.set_len(0)
+        BoxRef::rewrite_lock_line(self.0, "")
     }
 }
 
@@ -551,7 +544,7 @@ mod tests {
     /// it out, bounded, so a lock that never releases still fails.
     fn wait_until_free(b: &BoxRef) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while b.get_holder() != Holder::Free && std::time::Instant::now() < deadline {
+        while b.get_holder().unwrap() != Holder::Free && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
@@ -1000,15 +993,18 @@ mod tests {
         std::fs::create_dir_all(b.get_dir()).unwrap();
 
         let lock = b.lock_run().unwrap();
-        b.publish_pid(&lock, 4242, false);
+        BoxRef::publish_pid(&lock, std::process::id(), false).unwrap();
         let err = b.lock_run().expect_err("the box is held").to_string();
         assert!(
-            err.contains("locked by another terra command (pid 4242)"),
+            err.contains(&format!(
+                "locked by another terra command (pid {})",
+                std::process::id()
+            )),
             "{err}"
         );
         assert!(!err.contains("terra stop"), "no stop advice: {err}");
 
-        let marked = b.mark_baking(&lock);
+        let marked = BoxRef::mark_baking(&lock).unwrap();
         let err = format!("{:#}", b.lock_run().expect_err("the box is held"));
         assert!(err.contains("being set up"), "{err}");
         drop(marked);
@@ -1033,7 +1029,7 @@ mod tests {
             .unwrap();
         in_flight.try_lock_shared().unwrap();
         assert_eq!(
-            b.get_holder(),
+            b.get_holder().unwrap(),
             Holder::Free,
             "another probe was mistaken for a live holder"
         );
@@ -1042,10 +1038,10 @@ mod tests {
         // …and a box that really is held still reads as running, which is the
         // half a probe that always answered "no" would also satisfy.
         let held = b.lock_run().unwrap();
-        assert_eq!(b.get_holder(), Holder::Running);
+        assert_eq!(b.get_holder().unwrap(), Holder::Running);
         drop(held);
         wait_until_free(&b);
-        assert_eq!(b.get_holder(), Holder::Free);
+        assert_eq!(b.get_holder().unwrap(), Holder::Free);
     }
 
     /// The lock, the pid and the bake mark are one file: taking the lock empties
@@ -1068,7 +1064,11 @@ mod tests {
         for bad in ["", "  ", "0", "-1", "nonsense", BAKE_MARK] {
             std::fs::write(b.get_dir().join(PID_FILE), bad).unwrap();
             assert_eq!(b.read_vm_process(), None, "{bad:?} is not a pid");
-            assert_eq!(b.get_holder(), Holder::Free, "{bad:?} under no lock");
+            assert_eq!(
+                b.get_holder().unwrap(),
+                Holder::Free,
+                "{bad:?} under no lock"
+            );
         }
 
         let lock = b.lock_run().unwrap();
@@ -1078,22 +1078,26 @@ mod tests {
             "the last run's pid outlived its lock"
         );
         assert_eq!(
-            b.get_holder(),
+            b.get_holder().unwrap(),
             Holder::Running,
             "a killed bake's mark outlived its lock"
         );
 
-        b.publish_pid(&lock, 4242, false);
+        BoxRef::publish_pid(&lock, std::process::id(), false).unwrap();
         let published = b.read_vm_process().unwrap();
-        assert_eq!(published.pid, 4242);
+        assert_eq!(published.pid, std::process::id());
         assert_eq!(
             published.process_identity,
-            crate::sys::read_process_start_time(4242),
+            crate::sys::read_process_start_time(std::process::id()),
             "the start identity is read from the host and round-trips"
         );
-        b.publish_pid(&lock, 4242, true);
+        BoxRef::publish_pid(&lock, std::process::id(), true).unwrap();
         let marked = b.read_vm_process().unwrap();
-        assert_eq!(marked.pid, 4242, "a marked line still names its pid");
+        assert_eq!(
+            marked.pid,
+            std::process::id(),
+            "a marked line still names its pid"
+        );
         assert_eq!(
             marked.process_identity, published.process_identity,
             "the mark rides behind the start identity"
@@ -1121,9 +1125,9 @@ mod tests {
         // A bake that has not spawned its child yet: marked, with no pid to
         // signal - which is what `terra stop` waits out rather than mistaking
         // for a stopped box. The guard puts the file back however it ended.
-        let marked = b.mark_baking(&lock);
+        let marked = BoxRef::mark_baking(&lock).unwrap();
         assert_eq!(
-            b.get_holder(),
+            b.get_holder().unwrap(),
             Holder::SettingUp,
             "the mark alone is a mark"
         );
@@ -1132,22 +1136,22 @@ mod tests {
             None,
             "a bake marks the box before it has a pid"
         );
-        b.publish_pid(&lock, 4242, true);
-        assert_eq!(b.get_holder(), Holder::SettingUp);
+        BoxRef::publish_pid(&lock, std::process::id(), true).unwrap();
+        assert_eq!(b.get_holder().unwrap(), Holder::SettingUp);
         assert_eq!(
             b.read_vm_process().map(|vm| vm.pid),
-            Some(4242),
+            Some(std::process::id()),
             "and publishes both once it has one"
         );
         drop(marked);
-        assert_eq!(b.get_holder(), Holder::Running);
+        assert_eq!(b.get_holder().unwrap(), Holder::Running);
         assert_eq!(
             b.read_vm_process(),
             None,
             "the bake child's pid outlived the bake"
         );
 
-        b.publish_pid(&lock, std::process::id(), false);
+        BoxRef::publish_pid(&lock, std::process::id(), false).unwrap();
         assert_eq!(
             b.read_vm_process().map(|vm| vm.pid),
             Some(std::process::id())
@@ -1155,7 +1159,32 @@ mod tests {
 
         drop(lock);
         wait_until_free(&b);
-        assert_eq!(b.get_holder(), Holder::Free);
+        assert_eq!(b.get_holder().unwrap(), Holder::Free);
+    }
+
+    #[test]
+    fn publication_requires_a_live_identity_and_a_writable_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = BoxRef::from_state_dir(dir.path().to_owned(), dir.path());
+        let lock = b.lock_run().unwrap();
+        BoxRef::publish_pid(&lock, std::process::id(), false).unwrap();
+        let original = std::fs::read(b.get_dir().join(PID_FILE)).unwrap();
+        assert!(BoxRef::publish_pid(&lock, u32::MAX, false).is_err());
+        assert_eq!(std::fs::read(b.get_dir().join(PID_FILE)).unwrap(), original);
+        let readonly = File::open(b.get_dir().join(PID_FILE)).unwrap();
+        assert!(BoxRef::publish_pid(&readonly, std::process::id(), false).is_err());
+        assert!(BoxRef::mark_baking(&readonly).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_lock_is_not_a_free_box() {
+        let dir = tempfile::tempdir().unwrap();
+        let invalid_parent = dir.path().join("file");
+        std::fs::write(&invalid_parent, b"not a directory").unwrap();
+        let b = BoxRef::from_state_dir(invalid_parent, dir.path());
+        assert!(b.get_holder().is_err());
+        assert!(b.get_state().is_err());
     }
 
     /// The pid file is rewritten in place, never renamed over: the run lock
@@ -1166,14 +1195,13 @@ mod tests {
     fn publishing_a_pid_preserves_the_held_lock() {
         #[cfg(unix)]
         use std::os::unix::fs::MetadataExt;
-        const ABSENT_PID: u32 = u32::MAX;
         let _home = TestHome::new();
         let dir = tempfile::tempdir().unwrap();
         let b = resolve_box_ref(dir.path());
         std::fs::create_dir_all(b.get_dir()).unwrap();
         let held = b.lock_run().unwrap();
 
-        b.publish_pid(&held, ABSENT_PID, false);
+        BoxRef::publish_pid(&held, std::process::id(), false).unwrap();
         #[cfg(unix)]
         let identity = |p: &Path| {
             let meta = std::fs::metadata(p).unwrap();
@@ -1183,8 +1211,8 @@ mod tests {
         let before = identity(&b.get_dir().join(PID_FILE));
 
         // Longer, then shorter than what it replaced - no tail may survive.
-        b.publish_pid(&held, u32::MAX - 1, true);
-        b.publish_pid(&held, ABSENT_PID, false);
+        BoxRef::publish_pid(&held, std::process::id(), true).unwrap();
+        BoxRef::publish_pid(&held, std::process::id(), false).unwrap();
         #[cfg(unix)]
         assert_eq!(
             identity(&b.get_dir().join(PID_FILE)),
@@ -1193,9 +1221,16 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(b.get_dir().join(PID_FILE)).unwrap(),
-            ABSENT_PID.to_string()
+            format!(
+                "{} {}",
+                std::process::id(),
+                crate::sys::read_process_start_time(std::process::id()).unwrap()
+            )
         );
-        assert!(b.get_holder().holds(), "the lock outlived the rewrites");
+        assert!(
+            b.get_holder().unwrap().holds(),
+            "the lock outlived the rewrites"
+        );
         drop(held);
     }
 
@@ -1230,15 +1265,15 @@ mod tests {
         let b = resolve_box_ref(dir.path());
         std::fs::create_dir_all(b.get_dir()).unwrap();
 
-        assert!(matches!(b.get_state(), BoxState::NotCreated));
+        assert!(matches!(b.get_state().unwrap(), BoxState::NotCreated));
         std::fs::write(b.get_dir().join(ROOTFS_FILE), b"image").unwrap();
-        assert!(matches!(b.get_state(), BoxState::Stopped));
+        assert!(matches!(b.get_state().unwrap(), BoxState::Stopped));
 
         let lock = b.lock_run().unwrap();
-        assert!(matches!(b.get_state(), BoxState::Running));
-        let marked = b.mark_baking(&lock);
-        assert!(matches!(b.get_state(), BoxState::SettingUp));
-        assert_eq!(b.get_state().to_string(), "setting_up");
+        assert!(matches!(b.get_state().unwrap(), BoxState::Running));
+        let marked = BoxRef::mark_baking(&lock).unwrap();
+        assert!(matches!(b.get_state().unwrap(), BoxState::SettingUp));
+        assert_eq!(b.get_state().unwrap().to_string(), "setting_up");
         drop(marked);
         drop(lock);
 
@@ -1246,10 +1281,10 @@ mod tests {
         drop(dir);
         wait_until_free(&b);
         assert!(
-            matches!(b.get_state(), BoxState::Gone),
+            matches!(b.get_state().unwrap(), BoxState::Gone),
             "state was {} (holder {:?})",
-            b.get_state(),
-            b.get_holder()
+            b.get_state().unwrap(),
+            b.get_holder().unwrap()
         );
     }
 }

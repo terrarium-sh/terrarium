@@ -10,25 +10,21 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitCode, ExitStatus};
 use std::time::{Duration, Instant};
-use terra_platform::io::local::AsyncLocalStream;
 
 /// The background VM process's own first argv: `terra __vm <dir>` skips the
 /// command line and takes its boot off stdin.
 pub const VM_PROCESS_FLAG_ARG: &str = "__vm";
 
-pub fn get_vm_process_box_dir() -> Option<PathBuf> {
-    let mut args = std::env::args_os().skip(1);
-    if args.next()? != VM_PROCESS_FLAG_ARG {
-        return None;
-    }
-    args.next().map(PathBuf::from)
-}
+const DETACH_READY_DEADLINE: Duration =
+    Duration::from_secs(terra_runtime::orchestration::GUEST_BOOT_TIMEOUT.as_secs() + 30);
+const KILL_REAP_WAIT: Duration = Duration::from_secs(2);
+const CONSOLE_DRAIN_WAIT: Duration = Duration::from_secs(2);
+const MAX_BOOT_SPEC_BYTES: u64 = 64 << 20;
+const REPLAY_LOG_TAIL_BYTES: u64 = 64 << 10;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct BootSpec {
-    /// The recipe with this boot's flag overrides folded in
     pub cfg: config::Config,
-    /// The box's project directory
     pub project_dir: PathBuf,
     pub root: bool,
     pub mode: terra_protocol::PlanMode,
@@ -36,7 +32,6 @@ pub struct BootSpec {
 }
 
 impl BootSpec {
-    /// fold this boot's flag overrides into the pinned recipe
     pub fn resolve(
         mut cfg: config::Config,
         args: &BootArgs,
@@ -54,17 +49,19 @@ impl BootSpec {
     }
 }
 
-const DETACH_READY_DEADLINE: Duration =
-    Duration::from_secs(terra_runtime::orchestration::GUEST_BOOT_TIMEOUT.as_secs() + 30);
-const KILL_REAP_WAIT: Duration = Duration::from_secs(2);
-
-const MAX_BOOT_SPEC_BYTES: u64 = 64 << 20;
-
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) enum BootMode {
     Foreground,
     Detached,
     DetachedWithJoin,
+}
+
+pub fn get_vm_process_box_dir() -> Option<PathBuf> {
+    let mut args = std::env::args_os().skip(1);
+    if args.next()? != VM_PROCESS_FLAG_ARG {
+        return None;
+    }
+    args.next().map(PathBuf::from)
 }
 
 pub async fn start(
@@ -76,10 +73,22 @@ pub async fn start(
 ) -> Result<ExitCode> {
     match boot {
         BootMode::Detached => spawn_detached(bx, spec, run_lock),
-        BootMode::DetachedWithJoin | BootMode::Foreground => {
-            run_attached(bx, spec, run_lock, agent_timeout).await
+        BootMode::Foreground => {
+            eprintln!(
+                "terra: starting {bx} in the foreground; `terra {} stop` stops it",
+                bx.get_name()
+            );
+            print_mount_summary(&spec.cfg.mounts);
+            run_in_process(bx, spec, &run_lock, agent_timeout).await
         }
+        BootMode::DetachedWithJoin => spawn_and_attach(bx, spec, run_lock, agent_timeout).await,
     }
+}
+
+/// Join a running box's multiplexed terminal; the detach key detaches without
+/// stopping the workload.
+pub async fn attach(bx: &BoxRef, agent_timeout: Option<u64>) -> Result<ExitCode> {
+    finish_session(bx, &pump_box_console(bx, agent_timeout).await?, None)
 }
 
 /// The caller keeps its lock while the isolated bake child uses a duplicate.
@@ -89,11 +98,10 @@ pub async fn run_bake(cfg: &config::Config, bx: &BoxRef, lock: &File) -> Result<
         project_dir: bx.get_project_dir().to_path_buf(),
         root: false,
         mode: terra_protocol::PlanMode::Create,
-        // never in-process
         foreground: false,
     };
     eprintln!("terra: baking on_create for {bx} in an isolated VM (no shares)");
-    let baking = bx.mark_baking(lock);
+    let baking = BoxRef::mark_baking(lock).context("marking the on_create bake")?;
     let mut child = spawn_vm_process(bx, &bake, lock)?;
     let deadline = Instant::now() + DETACH_READY_DEADLINE;
     let output = async {
@@ -117,9 +125,7 @@ pub async fn run_bake(cfg: &config::Config, bx: &BoxRef, lock: &File) -> Result<
         let _ = child.kill();
     }
     let status = child.wait().context("waiting for the on_create bake")?;
-    if !status.success() {
-        replay_logs(bx, status);
-    }
+    replay_logs(bx, status);
     output.context("streaming the on_create bake")?;
     if !status.success() {
         if let Some(signal) = sys::find_terminating_signal(status) {
@@ -146,7 +152,7 @@ pub async fn run_bake(cfg: &config::Config, bx: &BoxRef, lock: &File) -> Result<
     Ok(())
 }
 
-pub async fn run_detached_vm(dir: PathBuf, is_at_a_terminal: bool) -> Result<ExitCode> {
+pub async fn run_vm_process(dir: PathBuf, is_at_a_terminal: bool) -> Result<ExitCode> {
     sys::validate_host_root()?;
     // A real child's stdin is the parent's pipe; a person who typed `terra
     // __vm` at a shell would otherwise sit in a silent read of their terminal.
@@ -164,130 +170,117 @@ pub async fn run_detached_vm(dir: PathBuf, is_at_a_terminal: bool) -> Result<Exi
         "no run lock was handed to this process - a VM process is spawned by a boot, \
          not started by hand",
     )?;
-    crate::vm::run(&spec, &bx, &lock)
-        .await
-        .inspect_err(|error| log::error!("VM failed: {error:#}"))
+    run_in_process(&bx, &spec, &lock, None).await
 }
 
-fn validate_boot_spec_size(bytes: usize) -> Result<()> {
-    anyhow::ensure!(
-        bytes as u64 <= MAX_BOOT_SPEC_BYTES,
-        "boot specification exceeds {MAX_BOOT_SPEC_BYTES} bytes; reduce the recipe or environment"
-    );
-    Ok(())
-}
-
-fn read_boot_spec(reader: impl Read) -> Result<BootSpec> {
-    let mut json = Vec::new();
-    reader
-        .take(MAX_BOOT_SPEC_BYTES + 1)
-        .read_to_end(&mut json)
-        .context("reading the boot to run")?;
-    validate_boot_spec_size(json.len())?;
-    serde_json::from_slice(&json).context("decoding the boot to run")
-}
-
-fn override_workload(cfg: &mut config::Config, command: &[String]) {
-    if let Some((entrypoint, args)) = command.split_first() {
-        cfg.workload.entrypoint = PathBuf::from(entrypoint);
-        cfg.workload.args = args.to_vec();
+async fn run_in_process(
+    bx: &BoxRef,
+    spec: &BootSpec,
+    lock: &File,
+    agent_timeout: Option<u64>,
+) -> Result<ExitCode> {
+    if spec.foreground {
+        let vm = Box::pin(crate::vm::run(spec, bx, lock, || {}));
+        let console = pump_box_console(bx, agent_timeout);
+        supervise_foreground(bx, vm, console)
+            .await
+            .inspect_err(|error| log::error!("VM failed: {error:#}"))
+    } else {
+        crate::vm::run(spec, bx, lock, write_agent_ready)
+            .await
+            .inspect_err(|error| log::error!("VM failed: {error:#}"))
     }
 }
 
-/// We pass the boot through stdin, a pipe - not argv (any user can read
-/// `/proc/<pid>/cmdline`) or the environment (it lands in core dumps). The
-/// pipe is read once and exists nowhere else.
-fn spawn_vm_process(bx: &BoxRef, spec: &BootSpec, lock: &File) -> Result<std::process::Child> {
-    use std::process::{Command, Stdio};
-    let exe = std::env::current_exe().context("locating the terra binary")?;
-    let json = serde_json::to_string(spec).context("encoding the boot for the VM process")?;
-    validate_boot_spec_size(json.len())?;
-    let mut cmd = Command::new(exe);
-    cmd.arg(VM_PROCESS_FLAG_ARG)
-        .arg(bx.get_dir())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    sys::detach(&mut cmd);
-    let inheritance = sys::pass_lock(&mut cmd, lock)?;
-    let spawned = cmd.spawn();
-    drop(inheritance);
-    let mut child = spawned.context("starting the background terra")?;
-    if let Some(mut stdin) = child.stdin.take() {
-        use std::io::Write;
-        // EPIPE here means the child already died; its exit reports the cause.
-        let _ = stdin.write_all(json.as_bytes());
-    }
-    Ok(child)
-}
-
-const REPLAY_LOG_TAIL_BYTES: u64 = 64 << 10; // 64 KiB
-
-fn read_log_tail(path: &Path) -> String {
-    use std::io::{Read, Seek, SeekFrom};
-    // Plain open, symlinks followed: the log name is terra's own symlink to
-    // the appender's current generation.
-    let Ok(mut f) = std::fs::File::open(path) else {
-        return String::new();
-    };
-    let len = f.metadata().map(|m| m.len()).unwrap_or_default();
-    let omitted = len.saturating_sub(REPLAY_LOG_TAIL_BYTES);
-    let mut tail = Vec::new();
-    if f.seek(SeekFrom::Start(omitted)).is_err()
-        || f.take(REPLAY_LOG_TAIL_BYTES)
-            .read_to_end(&mut tail)
-            .is_err()
-    {
-        return String::new();
-    }
-    // Lossy: the tail starts mid-stream, so it can open inside a character.
-    let text = String::from_utf8_lossy(&tail)
-        .split('\n')
-        .map(crate::render::escape_printable)
-        .collect::<Vec<_>>()
-        .join("\n");
-    if omitted == 0 {
-        return text;
-    }
-    format!(
-        "terra: (the first {omitted} bytes are left out here - \
-         `terra logs` has the whole log)\n{text}"
+async fn pump_box_console(bx: &BoxRef, agent_timeout: Option<u64>) -> Result<SessionOutcome> {
+    let stream = session::connect_to_agent(
+        bx,
+        terra_protocol::AgentService::Session,
+        "session",
+        session::wait_while_running(bx, agent_timeout),
     )
+    .await?;
+    pump_session(stream).await
 }
 
-fn replay_logs(bx: &BoxRef, status: std::process::ExitStatus) {
-    if !status.success() {
-        let _ = write_boot_logs(bx, &mut std::io::stderr().lock());
-    }
-}
-
-fn write_boot_logs(bx: &BoxRef, output: &mut impl std::io::Write) -> std::io::Result<()> {
-    for (label, path) in [
-        ("host log", bx.get_dir().join(crate::state::LOG_FILE)),
-        (
-            "guest diagnostics",
-            bx.get_dir().join(crate::state::DIAGNOSTICS_LOG),
-        ),
-    ] {
-        let tail = read_log_tail(&path);
-        if !tail.is_empty() {
-            writeln!(output, "terra: {label}:\n{tail}")?;
-        } else if label == "guest diagnostics" {
-            writeln!(
-                output,
-                "terra: no guest diagnostics were received; inspect the host log for boot failures"
-            )?;
+async fn supervise_foreground(
+    bx: &BoxRef,
+    vm: impl std::future::Future<Output = Result<ExitCode>>,
+    console: impl std::future::Future<Output = Result<SessionOutcome>>,
+) -> Result<ExitCode> {
+    tokio::pin!(vm, console);
+    tokio::select! {
+        result = &mut vm => {
+            let status = result?;
+            let _ = tokio::time::timeout(CONSOLE_DRAIN_WAIT, &mut console).await;
+            Ok(status)
+        }
+        result = &mut console => {
+            match result {
+                Ok(SessionOutcome::Detached) => eprintln!("terra: console detached; {bx} still runs in this foreground process"),
+                Ok(SessionOutcome::Exited(_) | SessionOutcome::Closed) => {}
+                Err(error) => eprintln!("terra: console failed: {error:#}; {bx} still runs in this foreground process"),
+            }
+            vm.await
         }
     }
-    Ok(())
 }
 
-fn compute_vm_child_exit_byte(bx: &BoxRef, status: std::process::ExitStatus) -> u8 {
-    if let Some(signal) = sys::find_terminating_signal(status) {
-        eprintln!("terra: {bx}'s VM was killed (signal {signal})");
-        return crate::exit_status_byte(128 + signal);
+fn print_mount_summary(mounts: &[config::Mount]) {
+    if mounts.is_empty() {
+        eprintln!("terra: mounts: none (no host filesystem in the sandbox)");
+    } else {
+        for mount in mounts {
+            eprintln!("terra: mount: {}", crate::render::format_mount_line(mount));
+        }
     }
-    crate::exit_status_byte(status.code().unwrap_or(1))
+}
+
+/// Spawn the VM and attach to its console. This process is only the
+/// session's first client - but it is still the child's parent, so the
+/// workload's exit code comes through unless you detach.
+async fn spawn_and_attach(
+    bx: &BoxRef,
+    spec: &BootSpec,
+    run_lock: File,
+    agent_timeout: Option<u64>,
+) -> Result<ExitCode> {
+    eprintln!(
+        "terra: starting {bx} - {DETACH_KEY_NAME} detaches, `terra {} stop` stops it",
+        bx.get_name()
+    );
+    print_mount_summary(&spec.cfg.mounts);
+    let mut child = spawn_vm_process(bx, spec, &run_lock)?;
+    // The child owns the lock from here on; a copy held by this client would
+    // keep the box reading as running, VM or no VM.
+    drop(run_lock);
+
+    let mut wait_for_agent = session::wait_while_running(bx, agent_timeout);
+    let joined =
+        session::connect_to_agent(bx, terra_protocol::AgentService::Session, "session", || {
+            wait_for_agent()?;
+            anyhow::ensure!(
+                child.try_wait().context("checking on the VM")?.is_none(),
+                "{bx} stopped before it had a session to join"
+            );
+            Ok(())
+        })
+        .await;
+    let stream = match joined {
+        Ok(stream) => stream,
+        Err(e) => {
+            // A VM that ends before any session was a fast workload or a
+            // failed boot - either way its exit code is the answer.
+            let Some(status) = child.try_wait().context("checking on the VM")? else {
+                let _ = write_boot_logs(bx, &mut std::io::stderr().lock());
+                return Err(e);
+            };
+            replay_logs(bx, status);
+            return Ok(ExitCode::from(compute_vm_child_exit_byte(bx, status)));
+        }
+    };
+
+    finish_session(bx, &pump_session(stream).await?, Some(&mut child))
 }
 
 fn spawn_detached(bx: &BoxRef, spec: &BootSpec, run_lock: File) -> Result<ExitCode> {
@@ -350,6 +343,105 @@ fn wait_for_detached_agent(bx: &BoxRef, mut child: Child, timeout: Duration) -> 
     ))
 }
 
+/// We pass the boot through stdin, a pipe - not argv (any user can read
+/// `/proc/<pid>/cmdline`) or the environment (it lands in core dumps). The
+/// pipe is read once and exists nowhere else.
+fn spawn_vm_process(bx: &BoxRef, spec: &BootSpec, lock: &File) -> Result<std::process::Child> {
+    use std::process::{Command, Stdio};
+    let exe = std::env::current_exe().context("locating the terra binary")?;
+    let json = serde_json::to_string(spec).context("encoding the boot for the VM process")?;
+    anyhow::ensure!(
+        json.len() as u64 <= MAX_BOOT_SPEC_BYTES,
+        "boot specification exceeds {MAX_BOOT_SPEC_BYTES} bytes; reduce the recipe or environment"
+    );
+    let mut cmd = Command::new(exe);
+    cmd.arg(VM_PROCESS_FLAG_ARG)
+        .arg(bx.get_dir())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    sys::detach(&mut cmd);
+    let inheritance = sys::pass_lock(&mut cmd, lock)?;
+    let spawned = cmd.spawn();
+    drop(inheritance);
+    let mut child = spawned.context("starting the background terra")?;
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        // EPIPE here means the child already died; its exit reports the cause.
+        let _ = stdin.write_all(json.as_bytes());
+    }
+    Ok(child)
+}
+
+fn finish_session(
+    bx: &BoxRef,
+    outcome: &SessionOutcome,
+    owner: Option<&mut Child>,
+) -> Result<ExitCode> {
+    match outcome {
+        SessionOutcome::Detached => {
+            eprintln!(
+                "\nterra: detached - {bx} keeps running (`terra {}` rejoins)",
+                bx.get_name()
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        SessionOutcome::Exited(code) => {
+            if let Some(child) = owner {
+                let _ = child.wait();
+            }
+            Ok(ExitCode::from(crate::exit_status_byte(*code)))
+        }
+        // Closed with no status: the VM was killed (`terra rm --force`) or
+        // died. Reported as a failure, because a script cannot tell that from
+        // a clean success.
+        SessionOutcome::Closed => {
+            if let Some(child) = owner {
+                let _ = child.wait();
+            }
+            anyhow::bail!("{bx} stopped without reporting a status - its VM was killed or died")
+        }
+    }
+}
+
+fn read_boot_spec(reader: impl Read) -> Result<BootSpec> {
+    let mut json = Vec::new();
+    reader
+        .take(MAX_BOOT_SPEC_BYTES + 1)
+        .read_to_end(&mut json)
+        .context("reading the boot to run")?;
+    anyhow::ensure!(
+        json.len() as u64 <= MAX_BOOT_SPEC_BYTES,
+        "boot specification exceeds {MAX_BOOT_SPEC_BYTES} bytes; reduce the recipe or environment"
+    );
+    serde_json::from_slice(&json).context("decoding the boot to run")
+}
+
+fn override_workload(cfg: &mut config::Config, command: &[String]) {
+    if let Some((entrypoint, args)) = command.split_first() {
+        cfg.workload.entrypoint = PathBuf::from(entrypoint);
+        cfg.workload.args = args.to_vec();
+    }
+}
+
+fn write_agent_ready() {
+    use std::io::Write as _;
+    let mut startup = std::io::stdout().lock();
+    let _ = startup
+        .write_all(&[terra_protocol::AGENT_READY_NOTIFICATION])
+        .and_then(|()| startup.flush());
+}
+
+fn read_agent_ready(mut reader: impl Read) -> Result<bool> {
+    let mut ready = [0];
+    match reader.read_exact(&mut ready) {
+        Ok(()) if ready == [terra_protocol::AGENT_READY_NOTIFICATION] => Ok(true),
+        Ok(()) => anyhow::bail!("invalid VM startup notification"),
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(error) => Err(error).context("reading VM startup notification"),
+    }
+}
+
 fn kill_and_reap_vm(mut child: Child) -> Result<ExitStatus> {
     if let Some(status) = child.try_wait().context("checking failed VM startup")? {
         return Ok(status);
@@ -383,121 +475,146 @@ fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> Result<Option<Ex
     }
 }
 
-fn read_agent_ready(mut reader: impl Read) -> Result<bool> {
-    let mut ready = [0];
-    match reader.read_exact(&mut ready) {
-        Ok(()) if ready == [terra_protocol::AGENT_READY_NOTIFICATION] => Ok(true),
-        Ok(()) => anyhow::bail!("invalid VM startup notification"),
-        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
-        Err(error) => Err(error).context("reading VM startup notification"),
+fn compute_vm_child_exit_byte(bx: &BoxRef, status: std::process::ExitStatus) -> u8 {
+    if let Some(signal) = sys::find_terminating_signal(status) {
+        eprintln!("terra: {bx}'s VM was killed (signal {signal})");
+        return crate::exit_status_byte(128 + signal);
+    }
+    crate::exit_status_byte(status.code().unwrap_or(1))
+}
+
+fn replay_logs(bx: &BoxRef, status: std::process::ExitStatus) {
+    if !status.success() {
+        let _ = write_boot_logs(bx, &mut std::io::stderr().lock());
     }
 }
 
-fn reap(owner: Option<&mut Child>) {
-    if let Some(child) = owner {
-        let _ = child.wait();
+fn write_boot_logs(bx: &BoxRef, output: &mut impl std::io::Write) -> std::io::Result<()> {
+    for (label, path) in [
+        ("host log", bx.get_dir().join(crate::state::LOG_FILE)),
+        (
+            "guest diagnostics",
+            bx.get_dir().join(crate::state::DIAGNOSTICS_LOG),
+        ),
+    ] {
+        let tail = read_log_tail(&path);
+        if !tail.is_empty() {
+            writeln!(output, "terra: {label}:\n{tail}")?;
+        } else if label == "guest diagnostics" {
+            writeln!(
+                output,
+                "terra: no guest diagnostics were received; inspect the host log for boot failures"
+            )?;
+        }
     }
+    Ok(())
 }
 
-async fn join_session(
-    bx: &BoxRef,
-    stream: AsyncLocalStream,
-    owner: Option<&mut Child>,
-) -> Result<ExitCode> {
-    match pump_session(stream).await? {
-        SessionOutcome::Detached => {
-            eprintln!(
-                "\nterra: detached - {bx} keeps running (`terra {}` rejoins)",
-                bx.get_name()
-            );
-            Ok(ExitCode::SUCCESS)
-        }
-        SessionOutcome::Exited(code) => {
-            reap(owner);
-            Ok(ExitCode::from(crate::exit_status_byte(code)))
-        }
-        // Closed with no status: the VM was killed (`terra rm --force`) or
-        // died. Reported as a failure, because a script cannot tell that from
-        // a clean success.
-        SessionOutcome::Closed => {
-            reap(owner);
-            anyhow::bail!("{bx} stopped without reporting a status - its VM was killed or died")
-        }
-    }
-}
-
-/// Spawn the VM and attach to its console. This process is only the
-/// session's first client - but it is still the child's parent, so the
-/// workload's exit code comes through unless you detach.
-async fn run_attached(
-    bx: &BoxRef,
-    spec: &BootSpec,
-    run_lock: File,
-    agent_timeout: Option<u64>,
-) -> Result<ExitCode> {
-    eprintln!(
-        "terra: starting {bx} - {DETACH_KEY_NAME} detaches, `terra {} stop` stops it",
-        bx.get_name()
-    );
-    // The sandbox's view is worth a line on the terminal - the boot banner
-    // only lands in the log.
-    if spec.cfg.mounts.is_empty() {
-        eprintln!("terra: mounts: none (no host filesystem in the sandbox)");
-    } else {
-        for mount in &spec.cfg.mounts {
-            eprintln!("terra: mount: {}", crate::render::format_mount_line(mount));
-        }
-    }
-    let mut child = spawn_vm_process(bx, spec, &run_lock)?;
-    // The child owns the lock from here on; a copy held by this client would
-    // keep the box reading as running, VM or no VM.
-    drop(run_lock);
-
-    let mut wait_for_agent = session::wait_while_running(bx, agent_timeout);
-    let joined =
-        session::connect_to_agent(bx, terra_protocol::AgentService::Session, "session", || {
-            wait_for_agent()?;
-            anyhow::ensure!(
-                child.try_wait().context("checking on the VM")?.is_none(),
-                "{bx} stopped before it had a session to join"
-            );
-            Ok(())
-        })
-        .await;
-    let stream = match joined {
-        Ok(stream) => stream,
-        Err(e) => {
-            // A VM that ends before any session was a fast workload or a
-            // failed boot - either way its exit code is the answer.
-            let Some(status) = child.try_wait().context("checking on the VM")? else {
-                let _ = write_boot_logs(bx, &mut std::io::stderr().lock());
-                return Err(e);
-            };
-            replay_logs(bx, status);
-            return Ok(ExitCode::from(compute_vm_child_exit_byte(bx, status)));
-        }
+fn read_log_tail(path: &Path) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    // Plain open, symlinks followed: the log name is terra's own symlink to
+    // the appender's current generation.
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return String::new();
     };
-
-    join_session(bx, stream, Some(&mut child)).await
-}
-
-/// Join a running box's multiplexed terminal; the detach key detaches without
-/// stopping the workload. Waits for the session rather than taking the
-/// socket's word for it: a box can hold its lock long before there is anything
-/// to join.
-pub async fn attach(bx: &BoxRef, agent_timeout: Option<u64>) -> Result<ExitCode> {
-    let mut wait_for_agent = session::wait_while_running(bx, agent_timeout);
-    let stream =
-        session::connect_to_agent(bx, terra_protocol::AgentService::Session, "session", || {
-            wait_for_agent()
-        })
-        .await?;
-    join_session(bx, stream, None).await
+    let len = f.metadata().map(|m| m.len()).unwrap_or_default();
+    let omitted = len.saturating_sub(REPLAY_LOG_TAIL_BYTES);
+    let mut tail = Vec::new();
+    if f.seek(SeekFrom::Start(omitted)).is_err()
+        || f.take(REPLAY_LOG_TAIL_BYTES)
+            .read_to_end(&mut tail)
+            .is_err()
+    {
+        return String::new();
+    }
+    // Lossy: the tail starts mid-stream, so it can open inside a character.
+    let text = String::from_utf8_lossy(&tail)
+        .split('\n')
+        .map(crate::render::escape_printable)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if omitted == 0 {
+        return text;
+    }
+    format!(
+        "terra: (the first {omitted} bytes are left out here - \
+         `terra logs` has the whole log)\n{text}"
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn foreground_console_completion_never_replaces_the_vm_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let bx = BoxRef::from_state_dir(dir.path().to_path_buf(), dir.path());
+        for outcome in [
+            Ok(SessionOutcome::Detached),
+            Ok(SessionOutcome::Exited(0)),
+            Ok(SessionOutcome::Closed),
+            Err(anyhow::anyhow!("console failed")),
+        ] {
+            let vm = async {
+                tokio::task::yield_now().await;
+                Ok(ExitCode::from(7))
+            };
+            let status = supervise_foreground(&bx, vm, std::future::ready(outcome))
+                .await
+                .unwrap();
+            assert_eq!(status, ExitCode::from(7));
+        }
+    }
+
+    #[tokio::test]
+    async fn foreground_vm_completion_drains_the_console_but_never_waits_forever() {
+        let dir = tempfile::tempdir().unwrap();
+        let bx = BoxRef::from_state_dir(dir.path().to_path_buf(), dir.path());
+        let drained = std::cell::Cell::new(false);
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let vm = async {
+            sender.send(()).unwrap();
+            Ok(ExitCode::from(7))
+        };
+        let console = async {
+            receiver.await.unwrap();
+            tokio::task::yield_now().await;
+            drained.set(true);
+            Ok(SessionOutcome::Exited(7))
+        };
+        assert_eq!(
+            supervise_foreground(&bx, vm, console).await.unwrap(),
+            ExitCode::from(7)
+        );
+        assert!(drained.get());
+
+        let status = tokio::time::timeout(
+            CONSOLE_DRAIN_WAIT + Duration::from_secs(1),
+            supervise_foreground(
+                &bx,
+                std::future::ready(Ok(ExitCode::SUCCESS)),
+                std::future::pending(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(status, ExitCode::SUCCESS);
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            supervise_foreground(
+                &bx,
+                std::future::ready(Err(anyhow::anyhow!("VM failed"))),
+                std::future::pending(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(error.to_string(), "VM failed");
+    }
 
     /// A failure replays the *end* of a log, never the whole of it: a bake's
     /// `apk add` output runs to megabytes, and the line that says what broke is

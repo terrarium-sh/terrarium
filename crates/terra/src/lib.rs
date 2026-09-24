@@ -47,7 +47,7 @@ pub async fn run() -> Result<ExitCode> {
     // box, the boot and the project directory, so the child re-resolves nothing
     // - not even its own cwd - and never reaches clap.
     if let Some(dir) = vm::boot::get_vm_process_box_dir() {
-        return vm::boot::run_detached_vm(dir, is_at_a_terminal).await;
+        return vm::boot::run_vm_process(dir, is_at_a_terminal).await;
     }
 
     let args = cli::parse_or_exit();

@@ -23,7 +23,7 @@ pub(crate) enum StartPlan {
 }
 
 fn build_start_plan(bx: &BoxRef, args: &BootArgs, is_at_a_terminal: bool) -> Result<StartPlan> {
-    match bx.get_holder() {
+    match bx.get_holder()? {
         Holder::Free => return Ok(StartPlan::Boot),
         Holder::SettingUp => return Err(bx.setup_holds_it()),
         Holder::Running => {}
@@ -229,8 +229,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (bx, lock, _home) = create_box_in(dir.path(), true);
 
-        let baking = bx.mark_baking(lock.as_ref().unwrap());
-        assert_eq!(bx.get_holder(), Holder::SettingUp);
+        let baking = BoxRef::mark_baking(lock.as_ref().unwrap()).unwrap();
+        assert_eq!(bx.get_holder().unwrap(), Holder::SettingUp);
         let err = build_start_plan(&bx, &build_boot_args(&[]), false)
             .expect_err("a box mid-bake must not be offered as a session to join")
             .to_string();
@@ -243,7 +243,7 @@ mod tests {
         // box: with no terminal to attach from, this is the 125 a script reads
         // as "already running".
         drop(baking);
-        assert_eq!(bx.get_holder(), Holder::Running);
+        assert_eq!(bx.get_holder().unwrap(), Holder::Running);
         assert_eq!(
             build_start_plan(&bx, &build_boot_args(&[]), false).unwrap(),
             StartPlan::NothingToDo

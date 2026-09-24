@@ -294,6 +294,14 @@ mod tests {
         assert!(try_lock_run(&path).is_ok());
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn lock_probe_propagates_open_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(holds_run_lock(directory.path()).is_err());
+        assert!(!holds_run_lock(&directory.path().join("missing")).unwrap());
+    }
+
     #[test]
     fn ordinary_handle_is_not_a_run_lock() {
         let directory = tempfile::tempdir().unwrap();
@@ -301,12 +309,12 @@ mod tests {
         std::fs::write(&path, []).unwrap();
         let ordinary = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         let duplicate = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-        assert!(!holds_run_lock(&path));
+        assert!(!holds_run_lock(&path).unwrap());
         drop(duplicate);
         drop(ordinary);
 
         let lock = try_lock_run(&path).unwrap();
-        assert!(holds_run_lock(&path));
+        assert!(holds_run_lock(&path).unwrap());
         drop(lock);
     }
 

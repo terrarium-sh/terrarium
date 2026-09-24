@@ -163,7 +163,7 @@ fn write_log(
     }
 
     loop {
-        let alive = bx.get_holder().holds();
+        let alive = bx.get_holder()?.holds();
         let n = text.drain(&mut f, &mut out).context("streaming log")?;
         out.flush().context("writing to stdout")?;
         if n == 0 {

@@ -132,7 +132,7 @@ pub async fn connect_to_running_agent(
 }
 
 pub fn still_serving(bx: &BoxRef, stopped: &str) -> Result<()> {
-    match bx.get_holder() {
+    match bx.get_holder()? {
         Holder::Running => Ok(()),
         Holder::SettingUp => Err(bx.setup_holds_it()),
         Holder::Free => Err(anyhow::anyhow!("{bx} {stopped}")),
@@ -888,7 +888,7 @@ mod tests {
         std::fs::create_dir_all(bx.get_dir()).unwrap();
         let lock = bx.lock_run().unwrap();
 
-        let baking = bx.mark_baking(&lock);
+        let baking = BoxRef::mark_baking(&lock).unwrap();
         for verb in ["exec", "sync"] {
             let err = ensure_running(&bx, verb).unwrap_err().to_string();
             assert_eq!(err, bx.setup_holds_it().to_string(), "{verb}");
@@ -899,7 +899,7 @@ mod tests {
 
         let mut still_waiting = wait_while_running(&bx, None);
         assert!(still_waiting().is_ok(), "a served box is waited on");
-        let baking = bx.mark_baking(&lock);
+        let baking = BoxRef::mark_baking(&lock).unwrap();
         let err = still_waiting()
             .expect_err("a bake that took the box mid-wait was waited out")
             .to_string();
@@ -911,7 +911,8 @@ mod tests {
         // child holds the pid-file fd between its fork and its exec; wait the
         // microseconds out so the box reads as stopped.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while bx.get_holder() != crate::state::Holder::Free && std::time::Instant::now() < deadline
+        while bx.get_holder().unwrap() != crate::state::Holder::Free
+            && std::time::Instant::now() < deadline
         {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }

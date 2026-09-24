@@ -260,7 +260,7 @@ pub fn pass_lock(command: &mut Command, lock: &File) -> Result<File> {
 pub fn claim_inherited_lock(expected: &Path) -> Option<File> {
     let handle = std::env::var(LOCK_HANDLE_ENV).ok()?;
     let raw = usize::from_str_radix(handle.strip_prefix("0x")?, 16).ok()? as *mut std::ffi::c_void;
-    let same = file_handle_matches_path(raw, expected) && holds_run_lock(expected);
+    let same = file_handle_matches_path(raw, expected) && holds_run_lock(expected).ok()?;
     same.then(|| {
         // SAFETY: `pass_lock` marked precisely this live file handle inheritable for this child.
         let file = unsafe { File::from_raw_handle(raw) };
@@ -274,18 +274,25 @@ pub fn claim_inherited_lock(expected: &Path) -> Option<File> {
     .flatten()
 }
 
-pub fn holds_run_lock(path: &Path) -> bool {
+pub fn holds_run_lock(path: &Path) -> Result<bool> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
 
-    std::fs::OpenOptions::new()
+    match std::fs::OpenOptions::new()
         .write(true)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .open(path)
-        .is_err_and(|error| error.raw_os_error() == Some(ERROR_SHARING_VIOLATION.cast_signed()))
+    {
+        Ok(_) => Ok(false),
+        Err(error) if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION.cast_signed()) => {
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 pub fn find_terminating_signal(_status: std::process::ExitStatus) -> Option<i32> {

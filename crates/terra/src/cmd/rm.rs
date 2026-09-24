@@ -24,7 +24,7 @@ pub fn run(args: &crate::cli::RmArgs, name: Option<&str>, project_dir: &Path) ->
     // A wedged VM's holder never releases the lock, so `--force` alone removes
     // without it - accepting the race against whatever boots once the wedge ends.
     let _lock = if args.force {
-        let stopped = if bx.get_holder().holds() {
+        let stopped = if bx.get_holder()?.holds() {
             eprintln!("terra: {bx} is running - asking it to stop before removing it");
             stop_and_wait(bx, Duration::from_secs(args.timeout), SetupAction::Stop)
         } else {
@@ -275,7 +275,7 @@ mod tests {
         std::fs::create_dir_all(bx.get_dir()).unwrap();
         std::fs::write(bx.get_dir().join(state::ROOTFS_FILE), b"image").unwrap();
         let lock = bx.lock_run().unwrap();
-        let marked = bx.mark_baking(&lock);
+        let marked = BoxRef::mark_baking(&lock).unwrap();
 
         let args = crate::cli::RmArgs {
             purge: true,

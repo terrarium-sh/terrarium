@@ -1100,6 +1100,77 @@ fn console_input() -> (std::fs::File, std::fs::File) {
     }
 }
 
+/// Foreground owns the VM process and lock, so killing the command cannot leave a detached VM.
+#[test]
+#[ignore = "boots a real VM and requires a native hypervisor"]
+fn foreground_process_owns_the_vm_and_releases_its_lock_on_death() {
+    use std::io::BufRead as _;
+
+    let suite = Suite::new();
+    let project = suite.create_project_dir("server");
+    let recipe = suite.get_work_dir().join("server.yaml");
+    std::fs::write(
+        &recipe,
+        "workload:\n  entrypoint: /bin/sh\n  args: [-c, 'echo FOREGROUND_READY; sleep 300']\n",
+    )
+    .unwrap();
+    let (_, setup_code) = suite.run_terra_status(&[
+        recipe.to_str().unwrap(),
+        "setup",
+        "--project",
+        project.to_str().unwrap(),
+    ]);
+    assert_eq!(setup_code, 0);
+    let box_dir = suite.get_box_files_path("server");
+    let mut child = Command::new(&suite.terra)
+        .args([
+            "server",
+            "--foreground",
+            "--project",
+            project.to_str().unwrap(),
+        ])
+        .env("HOME", &suite.home)
+        .env("USERPROFILE", &suite.home)
+        .env_remove("RUST_LOG")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let result = std::io::BufReader::new(stdout).read_line(&mut line);
+        let _ = sender.send(result.map(|_| line));
+    });
+    let ready = receiver.recv_timeout(Duration::from_secs(90));
+    let published = std::fs::read_to_string(box_dir.join("terra.pid"));
+    let _ = child.kill();
+    child.wait().unwrap();
+    assert_eq!(ready.unwrap().unwrap().trim(), "FOREGROUND_READY");
+    let published_pid: u32 = published
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        published_pid,
+        child.id(),
+        "foreground spawned a separate VM process"
+    );
+    let (listing, code) =
+        suite.run_terra_status(&["ls", "--json", "--project", project.to_str().unwrap()]);
+    assert_eq!(code, 0);
+    let boxes: serde_json::Value = serde_json::from_str(&listing).unwrap();
+    assert_eq!(
+        boxes[0]["state"], "stopped",
+        "the VM lock survived foreground death"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 #[ignore = "boots a real VM and requires a native hypervisor"]

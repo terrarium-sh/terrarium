@@ -24,17 +24,16 @@ pub fn try_lock_run(path: &Path) -> std::result::Result<File, std::fs::TryLockEr
     Ok(file)
 }
 
-pub fn holds_run_lock(path: &Path) -> bool {
-    let Ok(file) = std::fs::OpenOptions::new().read(true).open(path) else {
-        return false;
+pub fn holds_run_lock(path: &Path) -> Result<bool> {
+    let file = match std::fs::OpenOptions::new().read(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
     };
     match file.try_lock_shared() {
-        Ok(()) => {
-            let _ = file.unlock();
-            false
-        }
-        Err(std::fs::TryLockError::WouldBlock) => true,
-        Err(std::fs::TryLockError::Error(_)) => false,
+        Ok(()) => Ok(false),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(true),
+        Err(std::fs::TryLockError::Error(error)) => Err(error),
     }
 }
 

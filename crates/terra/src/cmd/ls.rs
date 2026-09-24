@@ -16,7 +16,7 @@ pub fn run(args: &crate::cli::LsArgs, project_dir: &Path) -> Result<ExitCode> {
     if args.tsv {
         let mut out = std::io::stdout().lock();
         for bx in boxes {
-            render::finish_stdout_write(writeln!(out, "{}", format_tsv_line(&bx)))?;
+            render::finish_stdout_write(writeln!(out, "{}", format_tsv_line(&bx)?))?;
         }
         return Ok(ExitCode::SUCCESS);
     }
@@ -24,23 +24,23 @@ pub fn run(args: &crate::cli::LsArgs, project_dir: &Path) -> Result<ExitCode> {
         let entries: Vec<BoxEntry<'_>> = boxes
             .iter()
             .map(|bx| {
-                let box_state = bx.get_state();
+                let box_state = bx.get_state()?;
                 let (pid, process_identity) = if box_state == state::BoxState::Running {
                     bx.read_vm_process()
                         .map_or((None, None), |vm| (Some(vm.pid), vm.process_identity))
                 } else {
                     (None, None)
                 };
-                BoxEntry {
+                Ok(BoxEntry {
                     name: bx.get_name(),
                     state: box_state,
                     project_dir: bx.get_project_dir(),
                     dir: bx.get_dir(),
                     pid,
                     process_identity,
-                }
+                })
             })
-            .collect();
+            .collect::<Result<_>>()?;
         let json = serde_json::to_string_pretty(&entries).context("serializing boxes to json")?;
         let mut out = std::io::stdout().lock();
         render::finish_stdout_write(writeln!(out, "{json}"))?;
@@ -60,7 +60,7 @@ pub fn run(args: &crate::cli::LsArgs, project_dir: &Path) -> Result<ExitCode> {
     }
     let mut out = std::io::stdout().lock();
     for bx in boxes {
-        let box_state = bx.get_state();
+        let box_state = bx.get_state()?;
         if args.all {
             render::finish_stdout_write(writeln!(
                 out,
@@ -78,14 +78,14 @@ pub fn run(args: &crate::cli::LsArgs, project_dir: &Path) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn format_tsv_line(bx: &BoxRef) -> String {
-    format!(
+fn format_tsv_line(bx: &BoxRef) -> Result<String> {
+    Ok(format!(
         "{}\t{}\t{}\t{}",
-        bx.get_state(),
+        bx.get_state()?,
         render::escape_printable(bx.get_name()),
         render::escape_printable_path(bx.get_project_dir()),
         render::escape_printable_path(bx.get_dir())
-    )
+    ))
 }
 
 #[derive(serde::Serialize)]
@@ -198,7 +198,7 @@ mod tests {
         std::fs::create_dir_all(bx.get_dir()).unwrap();
         std::fs::write(bx.get_dir().join(crate::state::ROOTFS_FILE), b"image").unwrap();
 
-        let line = format_tsv_line(&bx);
+        let line = format_tsv_line(&bx).unwrap();
         let fields: Vec<&str> = line.split('\t').collect();
         assert_eq!(
             fields,
@@ -223,7 +223,7 @@ mod tests {
         let entries = vec![
             BoxEntry {
                 name: bx.get_name(),
-                state: bx.get_state(),
+                state: bx.get_state().unwrap(),
                 project_dir: bx.get_project_dir(),
                 dir: bx.get_dir(),
                 pid: None,

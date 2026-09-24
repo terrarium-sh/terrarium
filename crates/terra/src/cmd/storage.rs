@@ -137,7 +137,7 @@ fn show(bx: &BoxRef, json: bool) -> Result<()> {
     let width = named.iter().map(|(name, _)| name.len()).max().unwrap_or(0);
 
     let mut out = std::io::stdout().lock();
-    crate::render::finish_stdout_write(writeln!(out, "{:<12} {}", bx.get_state(), bx.get_name()))?;
+    crate::render::finish_stdout_write(writeln!(out, "{:<12} {}", bx.get_state()?, bx.get_name()))?;
     let mut total = 0;
     for (name, path) in &named {
         let meta = std::fs::metadata(path)
@@ -183,6 +183,20 @@ fn format_mib(bytes: u64) -> String {
 const STORAGE_ARTIFACT_MAGIC: &[u8; 16] = b"terra-storage-1\n";
 
 fn export(bx: &BoxRef, to: &Path) -> Result<()> {
+    let destination = std::path::absolute(to).context("resolving export destination")?;
+    let rename_destination = destination
+        .parent()
+        .zip(destination.file_name())
+        .map(|(parent, name)| crate::sys::canonicalize_existing_prefix(parent).join(name));
+    let destination = crate::sys::canonicalize_existing_prefix(&destination);
+    let box_dir = crate::sys::canonicalize_existing_prefix(bx.get_dir());
+    anyhow::ensure!(
+        !destination.starts_with(&box_dir)
+            && rename_destination.is_none_or(|path| !path.starts_with(&box_dir)),
+        "export destination {} is inside box state; choose a destination outside {}",
+        escape_printable_path(to),
+        escape_printable_path(&box_dir)
+    );
     let _lock = bx.lock_run()?;
     recover_import(bx)?;
     let rootfs = bx.get_dir().join(crate::state::ROOTFS_FILE);
@@ -884,6 +898,62 @@ mod tests {
 
         let into = build_box_ref(&dir.path().join("elsewhere"), &["data"]);
         import(&into, &artifact).unwrap();
+    }
+
+    #[test]
+    fn export_refuses_box_state_and_preserves_its_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = TestHome::new();
+        let bx = build_box_ref(dir.path(), &[]);
+        let pid = bx.get_dir().join(crate::state::PID_FILE);
+        std::fs::write(&pid, b"keep identity").unwrap();
+        for name in [
+            crate::state::ROOTFS_FILE,
+            crate::state::RECIPE_FILE,
+            crate::state::PID_FILE,
+        ] {
+            let destination = bx.get_dir().join(name);
+            let original = std::fs::read(&destination).unwrap();
+            let error = export(&bx, &destination).unwrap_err().to_string();
+            assert!(error.contains("inside box state"), "{error}");
+            assert_eq!(std::fs::read(destination).unwrap(), original);
+        }
+        for destination in [
+            bx.get_dir().to_path_buf(),
+            bx.get_dir().join("new/artifact"),
+        ] {
+            assert!(
+                export(&bx, &destination)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("inside box state")
+            );
+        }
+        let alias = dir.path().join("state-alias");
+        crate::sys::symlink_dir(bx.get_dir(), &alias).unwrap();
+        assert!(
+            export(&bx, &alias.join("artifact"))
+                .unwrap_err()
+                .to_string()
+                .contains("inside box state")
+        );
+
+        let outside = dir.path().join("outside");
+        std::fs::write(&outside, b"keep outside").unwrap();
+        let internal_link = bx.get_dir().join("link");
+        crate::sys::symlink_file(&outside, &internal_link).unwrap();
+        assert!(
+            export(&bx, &internal_link)
+                .unwrap_err()
+                .to_string()
+                .contains("inside box state")
+        );
+        assert!(
+            std::fs::symlink_metadata(internal_link)
+                .unwrap()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(pid).unwrap(), b"keep identity");
     }
 
     #[test]

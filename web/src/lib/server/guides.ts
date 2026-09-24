@@ -38,11 +38,20 @@ const rewriteLink = (href: string) => {
 	return `${new URL(path, `${repository}docs/`)}${anchor && `#${anchor}`}`;
 };
 
+const stripTags = (html: string) => {
+	let text = html;
+	let previous = '';
+	while (previous !== text) {
+		previous = text;
+		text = text.replace(/<[^>]+>/g, '');
+	}
+	return text;
+};
+
 const addHeadingIds = (html: string) => {
 	const ids = new Map<string, number>();
 	return html.replace(/<h([1-6])>(.*?)<\/h\1>/g, (_, level, content) => {
-		const stem = content
-			.replace(/<[^>]+>/g, '')
+		const stem = stripTags(content)
 			.toLowerCase()
 			.replace(/[^\w -]/g, '')
 			.trim()

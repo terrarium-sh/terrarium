@@ -77,6 +77,7 @@ pub async fn run(
     _spec: &BootSpec,
     _bx: &crate::state::BoxRef,
     _lock: &File,
+    _on_ready: impl FnOnce() + Send,
 ) -> Result<std::process::ExitCode> {
     bail!(
         "VM execution requires Linux x86_64/aarch64, macOS Apple Silicon, or Windows x86_64/aarch64"
