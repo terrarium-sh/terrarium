@@ -12,7 +12,7 @@ pub struct TermSize {
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientInput {
-    Keys(Vec<u8>),
+    Keys(#[serde(with = "serde_bytes")] Vec<u8>),
     Resize(TermSize),
     Eof,
 }
@@ -20,8 +20,8 @@ pub enum ClientInput {
 /// A framed response from the agent to a terminal or exec client.
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AgentOutput {
-    Out(Vec<u8>),
-    Err(Vec<u8>),
+    Out(#[serde(with = "serde_bytes")] Vec<u8>),
+    Err(#[serde(with = "serde_bytes")] Vec<u8>),
     Exit {
         code: i32,
     },
@@ -53,9 +53,9 @@ pub struct ExecRequest {
     pub argv: Vec<String>,
     pub as_root: bool,
     pub tty: Option<TermSize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub workdir: Option<String>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     pub env: BTreeMap<String, String>,
 }
 
@@ -82,55 +82,63 @@ mod tests {
 
     #[test]
     fn terminal_and_session_messages_retain_their_wire_format() {
-        assert_eq!(serde_json::to_string(&ClientInput::Eof).unwrap(), "\"Eof\"");
+        assert_eq!(&encode_frame(&ClientInput::Eof).unwrap()[4..], &[2]);
         assert_eq!(
-            serde_json::to_string(&AgentOutput::Exit { code: -1 }).unwrap(),
-            "{\"Exit\":{\"code\":-1}}"
+            &encode_frame(&AgentOutput::Exit { code: -1 }).unwrap()[4..],
+            &[2, 1]
         );
         assert_eq!(
-            serde_json::to_string(&ControlRequest::Detach { id: 7 }).unwrap(),
-            "{\"Detach\":{\"id\":7}}"
+            &encode_frame(&ControlRequest::Detach { id: 7 }).unwrap()[4..],
+            &[1, 7]
         );
         assert_eq!(
-            serde_json::to_string(&ControlReply::Client {
+            &encode_frame(&ControlReply::Client {
                 id: 7,
                 size: Some(TermSize {
                     rows: 40,
                     cols: 120
                 }),
             })
-            .unwrap(),
-            "{\"Client\":{\"id\":7,\"size\":{\"rows\":40,\"cols\":120}}}"
-        );
-        assert_eq!(
-            serde_json::to_string(&ExecRequest {
-                argv: vec!["echo".into(), "ok".into()],
-                as_root: false,
-                tty: None,
-                workdir: None,
-                env: BTreeMap::new(),
-            })
-            .unwrap(),
-            "{\"argv\":[\"echo\",\"ok\"],\"as_root\":false,\"tty\":null}"
+            .unwrap()[4..],
+            &[0, 7, 1, 40, 120]
         );
     }
 
     #[test]
-    fn reject_invalid_exec_requests() {
-        for argv in [
-            serde_json::json!([]),
-            serde_json::json!(["/bin/sh", "bad\0arg"]),
-        ] {
-            assert!(
-                serde_json::from_value::<ExecRequest>(serde_json::json!({
-                    "argv": argv,
-                    "as_root": false,
-                    "tty": null
-                }))
-                .is_err()
-            );
+    fn exec_requests_round_trip_optional_fields() {
+        for workdir in [None, Some("/work".into())] {
+            for env in [
+                BTreeMap::new(),
+                BTreeMap::from([("KEY".into(), "value".into())]),
+            ] {
+                let request = ExecRequest {
+                    argv: vec!["echo".into(), "ok".into()],
+                    as_root: false,
+                    tty: None,
+                    workdir: workdir.clone(),
+                    env,
+                };
+                let frame = encode_frame(&request).unwrap();
+                assert_eq!(read_frame(&mut frame.as_slice()).unwrap(), Some(request));
+            }
         }
     }
+
+    #[test]
+    fn reject_invalid_exec_requests() {
+        for argv in [vec![], vec!["/bin/sh".into(), "bad\0arg".into()]] {
+            let request = ExecRequest {
+                argv,
+                as_root: false,
+                tty: None,
+                workdir: None,
+                env: BTreeMap::new(),
+            };
+            let frame = encode_frame(&request).unwrap();
+            assert!(read_frame::<ExecRequest>(&mut frame.as_slice()).is_err());
+        }
+    }
+
     #[test]
     fn round_trip_client_input_frames() {
         for msg in [

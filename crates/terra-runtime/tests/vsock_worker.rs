@@ -148,7 +148,8 @@ async fn create_worker(
         VsockDeviceHost::new(
             terra_runtime::memory::GuestRam::new(4096).expect("guest memory"),
             terra_runtime::component::vsock::VsockHostService::new(
-                vec![2, 0, 0, 0, b'{', b'}'],
+                terra_protocol::encode_frame(&support::artifacts::create_boot_plan())
+                    .expect("plan encodes"),
                 Some(listener),
                 None,
             )

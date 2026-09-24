@@ -202,45 +202,39 @@ async fn read_all(mut stream: StreamReader<u8>, limit: usize) -> Option<Vec<u8>>
     }
 }
 
-fn enrich_plan(frame: Vec<u8>) -> Option<Vec<u8>> {
+fn enrich_plan(frame: &[u8]) -> Option<Vec<u8>> {
     let instant = system_clock::now();
     let seed = (0..4)
         .flat_map(|_| random::get_random_u64().to_le_bytes())
-        .map(serde_json::Value::from)
-        .collect();
+        .collect::<Vec<_>>()
+        .try_into()
+        .ok()?;
     enrich_plan_with_host_state(frame, instant.seconds, instant.nanoseconds, seed)
 }
 
 fn enrich_plan_with_host_state(
-    mut frame: Vec<u8>,
+    frame: &[u8],
     seconds: i64,
     nanoseconds: u32,
-    seed: Vec<serde_json::Value>,
+    seed: [u8; 32],
 ) -> Option<Vec<u8>> {
     let payload_len = usize::try_from(u32::from_le_bytes(frame.get(..4)?.try_into().ok()?)).ok()?;
     if payload_len > MAX_PLAN_BYTES || frame.len() != payload_len.checked_add(4)? {
         return None;
     }
-    let mut plan: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_slice(&frame[4..]).ok()?;
-    if nanoseconds >= 1_000_000_000 || seed.len() != 32 {
+    let mut plan: terra_protocol::Plan = terra_protocol::decode_frame_payload(&frame[4..]).ok()?;
+    if nanoseconds >= 1_000_000_000 {
         return None;
     }
-    plan.insert(
-        "host_time".into(),
-        serde_json::json!({"seconds": seconds, "nanoseconds": nanoseconds}),
-    );
-    plan.insert("host_seed".into(), serde_json::Value::Array(seed));
-    let payload = serde_json::to_vec(&plan).ok()?;
-    if payload.len() > MAX_PLAN_BYTES
-        || payload.len().saturating_sub(payload_len) > MAX_PLAN_HOST_STATE_BYTES
-        || payload.len() > u32::MAX as usize
-    {
+    plan.host_time = Some(terra_protocol::HostTime {
+        seconds,
+        nanoseconds,
+    });
+    plan.host_seed = Some(seed);
+    let frame = terra_protocol::encode_frame_with_limit(&plan, MAX_PLAN_BYTES).ok()?;
+    if (frame.len() - 4).saturating_sub(payload_len) > MAX_PLAN_HOST_STATE_BYTES {
         return None;
     }
-    frame.clear();
-    frame.extend_from_slice(&u32::try_from(payload.len()).ok()?.to_le_bytes());
-    frame.extend_from_slice(&payload);
     Some(frame)
 }
 
@@ -248,7 +242,7 @@ fn start_plan(plan: StreamReader<u8>) {
     let _ = TASKS.spawn(async move {
         let Some(frame) = read_all(plan, MAX_PLAN_FRAME_BYTES)
             .await
-            .and_then(enrich_plan)
+            .and_then(|frame| enrich_plan(&frame))
         else {
             CLOSED.store(true, Ordering::Release);
             wake_worker();
@@ -662,34 +656,71 @@ async fn run_worker(worker: Worker) -> Result<(), Error> {
 mod tests {
     use super::*;
 
+    fn test_plan() -> terra_protocol::Plan {
+        terra_protocol::Plan {
+            mode: terra_protocol::PlanMode::Run,
+            workdir: Some("/work".into()),
+            shares: vec![terra_protocol::Share {
+                tag: "work".into(),
+                guest: "/work".into(),
+                readonly: false,
+            }],
+            volumes: vec![],
+            net: terra_protocol::Net {
+                guest_ip: "100.96.0.2".parse().unwrap(),
+                prefix: 30,
+                gateway: "100.96.0.1".parse().unwrap(),
+                dns: "100.96.0.1".parse().unwrap(),
+            },
+            env: BTreeMap::new(),
+            root: false,
+            sudo: vec![],
+            on_create: vec![],
+            on_start: vec![],
+            pre_stop: vec![],
+            daemons: vec![],
+            workload: vec!["sh".into()],
+            sandbox_info: String::new(),
+            await_initial_session: false,
+            host_tz: Some(vec![1, 2, 3]),
+            host_time: None,
+            host_seed: None,
+        }
+    }
+
     #[test]
     fn plan_enrichment_preserves_plan_fields_and_adds_host_state() {
-        let payload = br#"{"timezone":"Europe/Bratislava","mounts":["work"]}"#;
-        let mut frame = u32::try_from(payload.len()).unwrap().to_le_bytes().to_vec();
-        frame.extend_from_slice(payload);
-        let seed = (0..32).map(serde_json::Value::from).collect();
-        let frame = enrich_plan_with_host_state(frame, 12, 34, seed).unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&frame[4..]).unwrap();
-        assert_eq!(value["timezone"], "Europe/Bratislava");
-        assert_eq!(value["mounts"][0], "work");
-        assert_eq!(value["host_time"]["seconds"], 12);
-        assert_eq!(value["host_seed"].as_array().unwrap().len(), 32);
+        let mut plan = test_plan();
+        let frame = terra_protocol::encode_frame(&plan).unwrap();
+        let seed = std::array::from_fn(|index| u8::try_from(index).unwrap());
+        let frame = enrich_plan_with_host_state(&frame, 12, 34, seed).unwrap();
+        let decoded: terra_protocol::Plan = terra_protocol::read_frame(&mut frame.as_slice())
+            .unwrap()
+            .unwrap();
+        plan.host_time = Some(terra_protocol::HostTime {
+            seconds: 12,
+            nanoseconds: 34,
+        });
+        plan.host_seed = Some(seed);
+        assert_eq!(decoded, plan);
     }
+
     #[test]
     fn maximum_host_plan_fits_after_host_state_enrichment() {
         let limit = MAX_PLAN_BYTES - MAX_PLAN_HOST_STATE_BYTES;
-        let mut plan = serde_json::json!({"padding": ""});
-        let overhead = serde_json::to_vec(&plan).unwrap().len();
-        plan["padding"] = serde_json::Value::String("x".repeat(limit - overhead));
+        let mut plan = test_plan();
+        plan.sandbox_info = "x".repeat(limit);
+        let overhead = terra_protocol::encode_frame(&plan).unwrap().len() - 4 - limit;
+        plan.sandbox_info.truncate(limit - overhead);
         let frame = terra_protocol::encode_frame_with_limit(&plan, limit).unwrap();
         assert_eq!(frame.len(), limit + 4);
-        let seed = vec![serde_json::Value::from(u8::MAX); 32];
-        let frame = enrich_plan_with_host_state(frame, i64::MIN, 999_999_999, seed).unwrap();
+        let frame =
+            enrich_plan_with_host_state(&frame, i64::MIN, 999_999_999, [u8::MAX; 32]).unwrap();
         assert!(frame.len() <= MAX_PLAN_FRAME_BYTES);
-        let decoded: serde_json::Value =
+        let decoded: terra_protocol::Plan =
             terra_protocol::read_frame_with_limit(&mut frame.as_slice(), MAX_PLAN_BYTES)
                 .unwrap()
                 .unwrap();
-        assert_eq!(decoded["padding"], plan["padding"]);
+        assert_eq!(decoded.sandbox_info, plan.sandbox_info);
     }
 }

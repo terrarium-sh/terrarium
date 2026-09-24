@@ -30,15 +30,8 @@ pub fn run(
         );
     }
 
+    let is_pinned = matches!(target.source, resolve::Source::Pinned);
     let mut cfg = target.parse_recipe_without_env_file()?;
-    if let Err(e) =
-        config::resolve_env_file(&mut cfg).and_then(|()| config::merge_env_file(&mut cfg))
-    {
-        eprintln!(
-            "terra: warning: {e:#}\n\
-             terra: printing the recipe without those values - a boot would refuse it"
-        );
-    }
     match mount::resolve_mounts(&cfg, &target.bx) {
         Ok(mounts) => {
             for s in mount::find_sensitive_mounts(&mounts) {
@@ -55,7 +48,23 @@ pub fn run(
             }
             cfg.mounts = mounts;
         }
+        Err(e) if is_pinned => return Err(e),
         Err(e) => eprintln!("terra: warning: `terra setup` would refuse this recipe:\n{e:#}"),
+    }
+    let env_values = config::resolve_env_file(&mut cfg).and_then(|()| {
+        if is_pinned {
+            mount::verify_pinned_paths(&target.bx, &mount::PinnedPaths::from_config(&cfg))?;
+        }
+        config::merge_env_file(&mut cfg)
+    });
+    if let Err(e) = env_values {
+        if is_pinned {
+            return Err(e);
+        }
+        eprintln!(
+            "terra: warning: {e:#}\n\
+             terra: printing the recipe without those values - a boot would refuse it"
+        );
     }
     let target;
     let to_show = if args.with_env_values {
@@ -76,7 +85,7 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::BoxRef;
+    use crate::state::{self, BoxRef};
 
     /// `show` is what a recipe is reviewed with before it is trusted, so it
     /// runs the checks that decide whether `terra setup` would take it - and
@@ -179,6 +188,54 @@ mod tests {
         config::resolve_env_file(&mut cfg).unwrap();
         config::merge_env_file(&mut cfg).unwrap();
         assert_eq!(cfg.env["API_KEY"], "sk-1");
+    }
+
+    /// `show` promises the configuration a boot runs, and a boot refuses a pin
+    /// whose share moved: it used to print the repointed target, a mount no
+    /// boot would grant.
+    #[test]
+    fn show_refuses_a_pinned_recipe_whose_paths_moved() {
+        let _home = crate::sys::TestHome::new();
+        for recipe in [
+            "mounts:\n  - host: ./share\n    guest: /work\n",
+            "env_file: ./share/values.env\n",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let project = dir.path().join("project");
+            let safe = dir.path().join("safe");
+            let private = dir.path().join("private");
+            std::fs::create_dir_all(&project).unwrap();
+            std::fs::create_dir_all(&safe).unwrap();
+            std::fs::create_dir_all(&private).unwrap();
+            std::fs::write(safe.join("values.env"), "KEY=value\n").unwrap();
+            std::fs::write(private.join("values.env"), [0xff]).unwrap();
+            crate::sys::symlink_dir(&safe, project.join("share")).unwrap();
+
+            let bx = BoxRef::resolve(&project, "dev").unwrap();
+            std::fs::create_dir_all(bx.get_dir()).unwrap();
+            std::fs::write(bx.get_dir().join(state::RECIPE_FILE), recipe).unwrap();
+            let mut cfg = config::parse_recipe(recipe, &project, Path::new("dev.yaml")).unwrap();
+            cfg.mounts = mount::resolve_mounts(&cfg, &bx).unwrap();
+            config::resolve_env_file(&mut cfg).unwrap();
+            std::fs::write(
+                bx.get_dir().join(state::PINNED_PATHS_FILE),
+                yaml_serde::to_string(&mount::PinnedPaths::from_config(&cfg)).unwrap(),
+            )
+            .unwrap();
+
+            let show = crate::cli::ShowArgs {
+                with_env_values: false,
+                json: false,
+            };
+            assert!(run(&show, Some("dev"), &project, &project).is_ok());
+
+            crate::sys::remove_directory_symlink(project.join("share")).unwrap();
+            crate::sys::symlink_dir(&private, project.join("share")).unwrap();
+            let err = run(&show, Some("dev"), &project, &project)
+                .expect_err("a repointed path must not print clean")
+                .to_string();
+            assert!(err.contains("moved since it was pinned"), "{err}");
+        }
     }
 
     #[test]

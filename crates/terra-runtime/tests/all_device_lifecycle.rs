@@ -71,7 +71,8 @@ fn start_vsock(runtime: &mut BoxRuntime, ram: GuestRam) -> VsockChannel {
         runtime,
         ram,
         artifact,
-        vec![2, 0, 0, 0, b'{', b'}'],
+        terra_protocol::encode_frame(&support::artifacts::create_boot_plan())
+            .expect("plan encodes"),
         None,
         None,
         None,

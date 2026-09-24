@@ -16,7 +16,9 @@ pub use control::{
     MAX_DIAGNOSTIC_FRAME_BYTES, MAX_SERVICE_FRAME_BYTES, STOP_SIGNAL, decode_clock_sync,
     encode_clock_sync,
 };
-pub use frames::{encode_frame, encode_frame_with_limit, read_frame, read_frame_with_limit};
+pub use frames::{
+    decode_frame_payload, encode_frame, encode_frame_with_limit, read_frame, read_frame_with_limit,
+};
 #[cfg(feature = "tokio")]
 pub use frames::{read_frame_async, read_frame_async_with_limit, write_frame_async};
 pub use plan::{

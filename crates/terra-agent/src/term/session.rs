@@ -20,6 +20,7 @@ pub(crate) const MAX_COLS: u16 = 1024;
 
 const INPUT_QUEUE_CAPACITY: usize = 1;
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
+const REPAINT_CHUNK_BYTES: usize = 64 << 10;
 
 /// Downstream connection for an attached vsock client.
 #[derive(Clone)]
@@ -50,6 +51,13 @@ impl ClientConn {
         })
         .await
         .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))?
+    }
+
+    async fn write_out_chunks(&self, bytes: &[u8]) -> std::io::Result<()> {
+        for chunk in bytes.chunks(REPAINT_CHUNK_BYTES) {
+            self.write(&AgentOutput::Out(chunk.to_vec())).await?;
+        }
+        Ok(())
     }
 
     fn close(&self) {
@@ -193,10 +201,10 @@ impl Session {
             if inner.closed {
                 let output = inner
                     .saw_output
-                    .then(|| AgentOutput::Out(inner.parser.screen().contents_formatted()));
+                    .then(|| inner.parser.screen().contents_formatted());
                 (id, output, Some(inner.exit_code))
             } else {
-                let output = AgentOutput::Out(inner.parser.screen().contents_formatted());
+                let output = inner.parser.screen().contents_formatted();
                 inner.clients.push(Client {
                     id,
                     conn: conn.clone(),
@@ -206,7 +214,7 @@ impl Session {
             }
         };
         if let Some(output) = output
-            && conn.write(&output).await.is_err()
+            && conn.write_out_chunks(&output).await.is_err()
         {
             self.inner
                 .lock()
@@ -441,6 +449,110 @@ mod tests {
         };
         assert!(String::from_utf8_lossy(&output).contains("one-shot"));
         assert_eq!(frame(&mut reader).await, AgentOutput::Exit { code: 0 });
+    }
+
+    /// A supported 512×1024 attributed screen repaints to more than the 8 MiB
+    /// frame limit, so the repaint goes out as consecutive frames no larger
+    /// than `REPAINT_CHUNK_BYTES` - as one frame the protocol refused it and
+    /// the attaching client received nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_repaint_above_the_frame_limit_is_chunked() {
+        let (session, _) = session();
+        session
+            .inner
+            .lock()
+            .await
+            .parser
+            .screen_mut()
+            .set_size(MAX_ROWS, MAX_COLS);
+        let cells = usize::from(MAX_ROWS) * usize::from(MAX_COLS);
+        let bytes = "\x1b[38;2;0;0;0mX\x1b[38;2;255;255;255mX".repeat(cells / 2);
+        session.feed_output(bytes.as_bytes()).await;
+        let expected = session
+            .inner
+            .lock()
+            .await
+            .parser
+            .screen()
+            .contents_formatted();
+        assert!(
+            expected.len() > (8 << 20),
+            "the screen must overflow the frame limit: {}",
+            expected.len()
+        );
+        session.broadcast_exit(0).await;
+
+        let (client, mut reader) = client();
+        let attach = tokio::spawn({
+            let session = session.clone();
+            let client = client.clone();
+            async move { session.attach_client(&client).await }
+        });
+        let mut painted = Vec::new();
+        loop {
+            match frame(&mut reader).await {
+                AgentOutput::Out(chunk) => {
+                    assert!(chunk.len() <= REPAINT_CHUNK_BYTES, "{}", chunk.len());
+                    painted.extend_from_slice(&chunk);
+                }
+                AgentOutput::Exit { code: 0 } => break,
+                other => panic!("unexpected frame: {other:?}"),
+            }
+        }
+        assert_eq!(attach.await.unwrap().unwrap(), 0);
+        assert_eq!(painted, expected);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_output_waits_for_all_repaint_chunks() {
+        let (session, _) = session();
+        session
+            .inner
+            .lock()
+            .await
+            .parser
+            .screen_mut()
+            .set_size(100, 200);
+        let bytes = "\x1b[38;2;0;0;0mX\x1b[38;2;255;255;255mX".repeat(10_000);
+        session.feed_output(bytes.as_bytes()).await;
+        let expected = session
+            .inner
+            .lock()
+            .await
+            .parser
+            .screen()
+            .contents_formatted();
+        assert!(expected.len() > REPAINT_CHUNK_BYTES);
+        let (client, mut reader) = client();
+        let attach = tokio::spawn({
+            let session = session.clone();
+            async move { session.attach_client(&client).await }
+        });
+        let AgentOutput::Out(mut painted) = frame(&mut reader).await else {
+            panic!("expected repaint");
+        };
+        let output = tokio::spawn({
+            let session = session.clone();
+            async move {
+                session.feed_output(b"live output").await;
+                session.broadcast_exit(0).await;
+            }
+        });
+        while painted.len() < expected.len() {
+            let AgentOutput::Out(chunk) = frame(&mut reader).await else {
+                panic!("repaint interrupted");
+            };
+            assert!(chunk.len() <= REPAINT_CHUNK_BYTES);
+            painted.extend_from_slice(&chunk);
+        }
+        assert_eq!(painted, expected);
+        assert_eq!(
+            frame(&mut reader).await,
+            AgentOutput::Out(b"live output".to_vec())
+        );
+        assert_eq!(frame(&mut reader).await, AgentOutput::Exit { code: 0 });
+        assert!(attach.await.unwrap().is_some());
+        output.await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

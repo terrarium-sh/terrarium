@@ -49,3 +49,32 @@ pub fn trusted_artifacts() -> super::TrustedArtifacts {
         )
     }
 }
+
+#[must_use]
+pub fn create_boot_plan() -> terra_protocol::Plan {
+    terra_protocol::Plan {
+        mode: terra_protocol::PlanMode::Run,
+        workdir: None,
+        shares: Vec::new(),
+        volumes: Vec::new(),
+        net: terra_protocol::Net {
+            guest_ip: std::net::Ipv4Addr::new(100, 96, 0, 2).into(),
+            prefix: 30,
+            gateway: std::net::Ipv4Addr::new(100, 96, 0, 1).into(),
+            dns: std::net::Ipv4Addr::new(100, 96, 0, 1).into(),
+        },
+        env: std::collections::BTreeMap::new(),
+        root: false,
+        sudo: Vec::new(),
+        on_create: Vec::new(),
+        on_start: Vec::new(),
+        pre_stop: Vec::new(),
+        daemons: Vec::new(),
+        workload: vec!["/bin/sh".into()],
+        sandbox_info: String::new(),
+        await_initial_session: false,
+        host_tz: None,
+        host_time: None,
+        host_seed: None,
+    }
+}

@@ -38,14 +38,14 @@ fn make_oversized_error(len: usize, max_bytes: usize) -> io::Error {
     )
 }
 
-struct FramePayload {
+struct FrameWriter {
     bytes: Vec<u8>,
     max_bytes: usize,
 }
 
-impl Write for FramePayload {
+impl Write for FrameWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let len = self.bytes.len().saturating_add(bytes.len());
+        let len = (self.bytes.len() - 4).saturating_add(bytes.len());
         if len > self.max_bytes {
             return Err(make_oversized_error(len, self.max_bytes));
         }
@@ -59,7 +59,7 @@ impl Write for FramePayload {
 }
 
 /// Encode any message as the one wire shape every terra channel uses: a
-/// `u32` LE length prefix plus JSON.
+/// `u32` LE length prefix plus Postcard.
 #[allow(clippy::cast_possible_truncation)]
 pub fn encode_frame<T: Serialize>(value: &T) -> io::Result<Vec<u8>> {
     encode_frame_with_limit(value, MAX_FRAME_BYTES)
@@ -68,15 +68,14 @@ pub fn encode_frame<T: Serialize>(value: &T) -> io::Result<Vec<u8>> {
 /// Encode one frame with a payload limit.
 #[allow(clippy::cast_possible_truncation)]
 pub fn encode_frame_with_limit<T: Serialize>(value: &T, max_bytes: usize) -> io::Result<Vec<u8>> {
-    let mut payload = FramePayload {
-        bytes: Vec::new(),
+    let mut frame = FrameWriter {
+        bytes: vec![0; 4],
         max_bytes: max_bytes.min(MAX_FRAME_BYTES),
     };
-    serde_json::to_writer(&mut payload, value).map_err(io::Error::other)?;
-    let mut frame = Vec::with_capacity(4 + payload.bytes.len());
-    frame.extend_from_slice(&(payload.bytes.len() as u32).to_le_bytes());
-    frame.extend_from_slice(&payload.bytes);
-    Ok(frame)
+    postcard::to_io(value, &mut frame).map_err(io::Error::other)?;
+    let len = (frame.bytes.len() - 4) as u32;
+    frame.bytes[..4].copy_from_slice(&len.to_le_bytes());
+    Ok(frame.bytes)
 }
 
 /// Read one frame; `None` on a clean EOF at a frame boundary.
@@ -107,9 +106,7 @@ pub async fn read_frame_async_with_limit<T: DeserializeOwned>(
     reader.read_exact(&mut bytes[1..]).await?;
     let mut payload = vec![0u8; checked_len(bytes, max_bytes.min(MAX_FRAME_BYTES))?];
     reader.read_exact(&mut payload).await?;
-    serde_json::from_slice(&payload)
-        .map(Some)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    decode_frame_payload(&payload).map(Some)
 }
 
 /// Encode and write one frame asynchronously.
@@ -131,9 +128,23 @@ pub fn read_frame_with_limit<T: DeserializeOwned>(
     };
     let mut payload = vec![0u8; len];
     reader.read_exact(&mut payload)?;
-    serde_json::from_slice(&payload)
-        .map(Some)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    decode_frame_payload(&payload).map(Some)
+}
+
+/// Decode a complete Postcard payload, rejecting trailing bytes.
+pub fn decode_frame_payload<T: DeserializeOwned>(payload: &[u8]) -> io::Result<T> {
+    if payload.len() > MAX_FRAME_BYTES {
+        return Err(make_oversized_error(payload.len(), MAX_FRAME_BYTES));
+    }
+    let (value, remaining) = postcard::take_from_bytes(payload)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if !remaining.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "trailing frame bytes",
+        ));
+    }
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -227,9 +238,34 @@ mod tests {
     }
 
     #[test]
+    fn binary_frames_reject_trailing_and_malformed_payloads() {
+        for payload in [&[7, 0][..], &[0x80][..]] {
+            let mut frame = u32::try_from(payload.len()).unwrap().to_le_bytes().to_vec();
+            frame.extend_from_slice(payload);
+            let error = read_frame::<u64>(&mut frame.as_slice()).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[test]
+    fn terminal_bytes_have_constant_small_overhead() {
+        let bytes: Vec<u8> = (0..=255).cycle().take(65536).collect();
+        let message = crate::AgentOutput::Out(bytes.clone());
+        let frame = encode_frame(&message).unwrap();
+        assert_eq!(frame.len(), bytes.len() + 8);
+        assert_eq!(&frame[8..], bytes);
+        assert_eq!(read_frame(&mut frame.as_slice()).unwrap(), Some(message));
+    }
+
+    #[test]
     fn encoding_with_a_limit_rejects_the_payload() {
         let value = "input";
-        let payload_bytes = encode_frame(&value).unwrap().len() - 4;
+        let frame = encode_frame(&value).unwrap();
+        let payload_bytes = frame.len() - 4;
+        assert_eq!(
+            encode_frame_with_limit(&value, payload_bytes).unwrap(),
+            frame
+        );
         let error = encode_frame_with_limit(&value, payload_bytes - 1).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Other);
     }
@@ -238,7 +274,7 @@ mod tests {
     fn refuse_oversized_frame() {
         let big = "x".repeat(MAX_FRAME_BYTES + 1);
         let err = encode_frame(&big).unwrap_err();
-        assert!(err.to_string().contains("exceeds"), "{err}");
+        assert_eq!(err.kind(), io::ErrorKind::Other);
     }
 
     /// The reader runs as guest init, on a length its peer chose.

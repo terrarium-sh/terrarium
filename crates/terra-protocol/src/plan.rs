@@ -148,6 +148,7 @@ pub struct Plan {
     /// Wait for the foreground host session before starting the workload.
     #[serde(default)]
     pub await_initial_session: bool,
+    #[serde(default, with = "serde_bytes")]
     pub host_tz: Option<Vec<u8>>,
     #[serde(default)]
     pub host_time: Option<HostTime>,
@@ -168,10 +169,7 @@ mod tests {
 
     #[test]
     fn plan_mode_retains_its_wire_format() {
-        assert_eq!(
-            serde_json::to_string(&PlanMode::Create).unwrap(),
-            "\"Create\""
-        );
+        assert_eq!(&encode_frame(&PlanMode::Create).unwrap()[4..], &[1]);
     }
 
     #[test]
@@ -184,7 +182,7 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_plan_through_json() {
+    fn round_trip_plan() {
         for host_tz in [None, Some(vec![1, 2, 3])] {
             let plan = Plan {
                 mode: PlanMode::Create,
@@ -259,24 +257,19 @@ mod tests {
 
     #[test]
     fn reject_invalid_network_requests() {
-        assert!(
-            serde_json::from_value::<Net>(serde_json::json!({
-                "guest_ip": "192.0.2.2",
-                "prefix": 33,
-                "gateway": "192.0.2.1",
-                "dns": "192.0.2.1"
-            }))
-            .is_err()
-        );
-        for field in ["gateway", "dns"] {
-            let mut net = serde_json::json!({
-                "guest_ip": "192.0.2.2",
-                "prefix": 24,
-                "gateway": "192.0.2.1",
-                "dns": "192.0.2.1"
-            });
-            net[field] = serde_json::json!("2001:db8::1");
-            assert!(serde_json::from_value::<Net>(net).is_err());
+        for (prefix, gateway, dns) in [
+            (33, "192.0.2.1", "192.0.2.1"),
+            (24, "2001:db8::1", "192.0.2.1"),
+            (24, "192.0.2.1", "2001:db8::1"),
+        ] {
+            let net = Net {
+                guest_ip: "192.0.2.2".parse().unwrap(),
+                prefix,
+                gateway: gateway.parse().unwrap(),
+                dns: dns.parse().unwrap(),
+            };
+            let frame = encode_frame(&net).unwrap();
+            assert!(read_frame::<Net>(&mut frame.as_slice()).is_err());
         }
     }
 }

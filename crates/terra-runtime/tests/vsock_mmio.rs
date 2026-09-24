@@ -277,13 +277,9 @@ fn replies(memory: &BoundedMemory<'_>) -> Vec<(VsockHeader, Vec<u8>)> {
 }
 
 fn plan_frame() -> Vec<u8> {
-    let payload = format!(r#"{{"pad":"{}"}}"#, "x".repeat(20 * 1024)).into_bytes();
-    let mut frame = u32::try_from(payload.len())
-        .expect("plan length")
-        .to_le_bytes()
-        .to_vec();
-    frame.extend_from_slice(&payload);
-    frame
+    let mut plan = support::artifacts::create_boot_plan();
+    plan.sandbox_info = "x".repeat(20 * 1024);
+    terra_protocol::encode_frame(&plan).expect("plan encodes")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

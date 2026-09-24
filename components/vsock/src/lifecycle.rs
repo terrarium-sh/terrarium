@@ -3,7 +3,7 @@ use serde::de::DeserializeOwned;
 use terra_protocol::control::LifecycleEvent;
 
 const MAX_CONTROL_BYTES: usize = 1 << 20;
-const MAX_DIAGNOSTIC_BYTES: usize = 65536;
+const MAX_DIAGNOSTIC_BYTES: usize = terra_protocol::MAX_DIAGNOSTIC_FRAME_BYTES - 4;
 const MAX_MESSAGES: usize = 16;
 
 fn decode_frame<T: DeserializeOwned>(
@@ -17,12 +17,12 @@ fn decode_frame<T: DeserializeOwned>(
     if length > max {
         return Err(Error::Malformed);
     }
-    let Some(payload) = bytes.get(4..4 + length) else {
+    let Some(frame) = bytes.get(..4 + length) else {
         return Ok(None);
     };
-    serde_json::from_slice(payload)
-        .map(|value| Some((value, length + 4)))
-        .map_err(|_| Error::Malformed)
+    let value =
+        terra_protocol::decode_frame_payload::<T>(&frame[4..]).map_err(|_| Error::Malformed)?;
+    Ok(Some((value, frame.len())))
 }
 
 pub fn decode_control(bytes: &[u8]) -> Result<ControlResult, Error> {
@@ -103,10 +103,7 @@ mod tests {
     }
 
     fn frame(event: &impl serde::Serialize) -> Vec<u8> {
-        let payload = serde_json::to_vec(event).unwrap();
-        let mut bytes = u32::try_from(payload.len()).unwrap().to_le_bytes().to_vec();
-        bytes.extend_from_slice(&payload);
-        bytes
+        terra_protocol::encode_frame(event).unwrap()
     }
 
     #[test]
@@ -121,6 +118,16 @@ mod tests {
         assert_eq!(result.consumed as usize, bytes.len());
         assert_eq!(result.exit_code, Some(-7));
         assert!(decode_control(&frame(&-7)).is_err());
+    }
+
+    #[test]
+    fn maximum_diagnostic_fits_the_frame_budget() {
+        let bytes = vec![255; terra_protocol::MAX_DIAGNOSTIC_EVENT_BYTES];
+        let frame = frame(&LifecycleEvent::Diagnostic {
+            bytes: bytes.clone(),
+        });
+        assert_eq!(frame.len(), terra_protocol::MAX_DIAGNOSTIC_FRAME_BYTES);
+        assert_eq!(decode_diagnostics(&frame).unwrap().output, bytes);
     }
 
     #[test]

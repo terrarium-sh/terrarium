@@ -110,15 +110,18 @@ async fn bridge(stream: yamux::Stream, local: File) {
     };
     let (mut stream_reader, mut stream_writer) = futures_util::io::AsyncReadExt::split(stream);
     let to_stream = async move {
-        futures_util::io::copy(reader, &mut stream_writer).await?;
-        stream_writer.close().await
+        let copied = futures_util::io::copy(reader, &mut stream_writer).await;
+        let closed = stream_writer.close().await;
+        copied?;
+        closed
     };
     let to_local = async move {
         futures_util::io::copy(&mut stream_reader, &mut writer).await?;
         rustix::net::shutdown(writer.get_ref(), rustix::net::Shutdown::Write)
             .map_err(std::io::Error::from)
     };
-    if let Err(error) = tokio::try_join!(to_stream, to_local) {
+    let (output, input) = tokio::join!(to_stream, to_local);
+    if let Err(error) = output.and(input) {
         eprintln!("terra-agent: mux bridge failed: {error}");
     }
 }
@@ -266,6 +269,34 @@ mod tests {
             .unwrap();
         assert_eq!(reply, *b"guest");
         assert_eq!(promptly(client_stream.read(&mut reply)).await.unwrap(), 0);
+    }
+
+    /// A finished exec can close stdin before the host's EOF arrives. A failed
+    /// input write must not cancel the bridge carrying the exec's final response.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn closed_agent_input_preserves_the_final_response() {
+        let mut carrier = carrier(1).await;
+        let mut client = carrier.client_streams.pop().unwrap();
+        promptly(client.write(&[])).await.unwrap();
+        let guest = promptly(carrier.clients.recv()).await.unwrap();
+        rustix::net::shutdown(&guest, rustix::net::Shutdown::Read).unwrap();
+        promptly(client.write_all(b"late input")).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let response =
+            terra_protocol::encode_frame(&terra_protocol::AgentOutput::Exit { code: 7 }).unwrap();
+        let mut guest = crate::into_async_file(guest).unwrap();
+        promptly(tokio::io::AsyncWriteExt::write_all(&mut guest, &response))
+            .await
+            .unwrap();
+        drop(guest);
+        let mut received = vec![0; response.len()];
+        promptly(client.read_exact(&mut received)).await.unwrap();
+        assert_eq!(received, response);
+        assert_eq!(promptly(client.read(&mut received)).await.unwrap(), 0);
+        promptly(client.close()).await.unwrap();
+        carrier.driver.abort();
+        let _ = carrier.driver.await;
+        wait_for_guest_driver(carrier.guest_driver).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

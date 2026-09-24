@@ -19,7 +19,7 @@ pub const STOP_SIGNAL: u8 = b'S';
 pub const DEFAULT_STOP_GRACE_SECS: u64 = 30;
 
 /// Bump when a host and a running guest agent cannot safely communicate.
-pub const AGENT_PROTOCOL_VERSION: u8 = 3;
+pub const AGENT_PROTOCOL_VERSION: u8 = 1;
 
 pub const AGENT_READY_NOTIFICATION: u8 = b'R';
 
@@ -31,7 +31,10 @@ pub const AGENT_HELLO: [u8; 2] = [b'V', AGENT_PROTOCOL_VERSION];
 pub enum LifecycleEvent {
     AgentReady,
     Diagnostic {
-        #[serde(deserialize_with = "deserialize_diagnostic")]
+        #[serde(
+            serialize_with = "serde_bytes::serialize",
+            deserialize_with = "deserialize_diagnostic"
+        )]
         bytes: Vec<u8>,
     },
     Exit {
@@ -40,13 +43,13 @@ pub enum LifecycleEvent {
 }
 
 pub const MAX_DIAGNOSTIC_EVENT_BYTES: usize = 64 << 10;
-pub const MAX_DIAGNOSTIC_FRAME_BYTES: usize = MAX_DIAGNOSTIC_EVENT_BYTES + 4;
+pub const MAX_DIAGNOSTIC_FRAME_BYTES: usize = MAX_DIAGNOSTIC_EVENT_BYTES + 8;
 
 fn deserialize_diagnostic<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Vec<u8>, D::Error> {
-    use serde::{Deserialize as _, de::Error as _};
-    let bytes = Vec::<u8>::deserialize(deserializer)?;
+    use serde::de::Error as _;
+    let bytes: Vec<u8> = serde_bytes::deserialize(deserializer)?;
     if bytes.len() > MAX_DIAGNOSTIC_EVENT_BYTES {
         return Err(D::Error::custom("diagnostic exceeds the 65536-byte limit"));
     }
@@ -103,13 +106,13 @@ mod tests {
     #[test]
     fn service_selection_retains_its_wire_format() {
         for (service, wire) in [
-            (AgentService::Session, "\"session\""),
-            (AgentService::Sync, "\"sync\""),
-            (AgentService::Exec, "\"exec\""),
-            (AgentService::SessionControl, "\"session_control\""),
+            (AgentService::Session, 0),
+            (AgentService::Sync, 1),
+            (AgentService::Exec, 2),
+            (AgentService::SessionControl, 3),
         ] {
             let frame = crate::encode_frame(&service).unwrap();
-            assert_eq!(&frame[4..], wire.as_bytes());
+            assert_eq!(&frame[4..], &[wire]);
             assert_eq!(
                 crate::read_frame_with_limit::<AgentService>(
                     &mut frame.as_slice(),
@@ -139,8 +142,8 @@ mod tests {
     #[test]
     fn lifecycle_events_retain_their_wire_format() {
         assert_eq!(
-            serde_json::to_string(&LifecycleEvent::Exit { code: 23 }).unwrap(),
-            "{\"Exit\":{\"code\":23}}"
+            &crate::encode_frame(&LifecycleEvent::Exit { code: 23 }).unwrap()[4..],
+            &[2, 46]
         );
     }
     #[test]

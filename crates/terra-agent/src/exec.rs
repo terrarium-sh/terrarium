@@ -540,19 +540,12 @@ mod tests {
             true,
             CancellationToken::new(),
         ));
-        client
-            .write_all(&terra_protocol::encode_frame(&req).unwrap())
-            .unwrap();
+        let mut input = terra_protocol::encode_frame(&req).unwrap();
         if !stdin.is_empty() {
-            client
-                .write_all(
-                    &terra_protocol::encode_frame(&ClientInput::Keys(stdin.to_vec())).unwrap(),
-                )
-                .unwrap();
+            input.extend(terra_protocol::encode_frame(&ClientInput::Keys(stdin.to_vec())).unwrap());
         }
-        client
-            .write_all(&terra_protocol::encode_frame(&ClientInput::Eof).unwrap())
-            .unwrap();
+        input.extend(terra_protocol::encode_frame(&ClientInput::Eof).unwrap());
+        client.write_all(&input).unwrap();
         let result = read_exec_output(&mut client);
         if result.2 != NO_EXIT {
             agent.await.unwrap();

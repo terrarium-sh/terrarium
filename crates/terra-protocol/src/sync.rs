@@ -115,7 +115,7 @@ pub struct SyncEntry {
     pub mtime_secs: i64,
     #[serde(deserialize_with = "deserialize_nanos")]
     pub mtime_nanos: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub link_target: Option<String>,
 }
 
@@ -401,8 +401,8 @@ mod tests {
         let req = SyncRequest::BeginSession {
             guest_root: "/app".to_string(),
         };
-        let encoded = serde_json::to_string(&req).unwrap();
-        let decoded: SyncRequest = serde_json::from_str(&encoded).unwrap();
+        let encoded = crate::encode_frame(&req).unwrap();
+        let decoded: SyncRequest = crate::read_frame(&mut encoded.as_slice()).unwrap().unwrap();
         assert_eq!(req, decoded);
 
         let entry = SyncEntry {
@@ -415,36 +415,27 @@ mod tests {
             link_target: None,
         };
         let rep = SyncReply::Entry(entry);
-        let encoded = serde_json::to_string(&rep).unwrap();
-        let decoded: SyncReply = serde_json::from_str(&encoded).unwrap();
+        let encoded = crate::encode_frame(&rep).unwrap();
+        let decoded: SyncReply = crate::read_frame(&mut encoded.as_slice()).unwrap().unwrap();
         assert_eq!(rep, decoded);
     }
 
     #[test]
-    fn reject_oversized_file_size() {
-        let json = serde_json::json!({
-            "WriteFile": {
-                "relative_path": "big.bin",
-                "size": MAX_FILE_BYTES + 1,
-                "mode": 0o644,
-                "mtime_secs": 0,
-                "mtime_nanos": 0,
-            }
-        });
-        assert!(serde_json::from_value::<SyncRequest>(json).is_err());
-    }
-
-    #[test]
-    fn reject_invalid_nanoseconds() {
-        let json = serde_json::json!({
-            "WriteFile": {
-                "relative_path": "time.bin",
-                "size": 10,
-                "mode": 0o644,
-                "mtime_secs": 0,
-                "mtime_nanos": 1_000_000_000,
-            }
-        });
-        assert!(serde_json::from_value::<SyncRequest>(json).is_err());
+    fn binary_sync_requests_reject_invalid_metadata() {
+        for (path, size, nanos) in [
+            ("big.bin", MAX_FILE_BYTES + 1, 0),
+            ("time.bin", 10, 1_000_000_000),
+            ("../escape", 10, 0),
+        ] {
+            let request = SyncRequest::WriteFile {
+                relative_path: path.into(),
+                size,
+                mode: 0o644,
+                mtime_secs: 0,
+                mtime_nanos: nanos,
+            };
+            let frame = crate::encode_frame(&request).unwrap();
+            assert!(crate::read_frame::<SyncRequest>(&mut frame.as_slice()).is_err());
+        }
     }
 }
