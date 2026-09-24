@@ -58,7 +58,7 @@ cat > dev.yaml <<'EOF'
 hw: { cpus: 2, mem_mib: 1024 }
 components: { memory_mib: 16, total_memory_mib: 128 }
 network:
-  mode: unrestricted-public              # public egress; host and private networks stay blocked
+  mode: unrestricted-public              # public egress; private ranges stay blocked
 workload:
   entrypoint: /bin/sh                    # a shell instead of your app's cmd
 EOF
@@ -81,9 +81,10 @@ files and directories with `terra sync`. Detailed instructions:
 
 - **Real isolation.** Each box is a dedicated microVM with its own kernel and 
   rootfs—sharing only what you explicitly allow.
-- **Explicit access.** No host files or network by default; the host, LAN, and
-  private ranges stay blocked unless a recipe names them. Grant host directories
-  with `mounts`, or sync files and directories with `sync`.
+- **Explicit access.** No host files or network by default. `unrestricted-public`
+  permits public destinations, including public LAN addresses, except IPs collected
+  from host interfaces at VM startup. Those IPs and private ranges require explicit
+  grants. Grant host directories with `mounts`, or sync files with `sync`.
 - **One binary.** The guest kernel, base guest filesystem, and VM components
   are embedded in `terra`; no daemon required. The kernel loads directly into
   memory on each boot. Upgrade Terra and stop/start a box to use the kernel

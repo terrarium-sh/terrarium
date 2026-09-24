@@ -146,10 +146,13 @@ The default `mode: allowlist` permits no egress until an `allow` entry grants a
 hostname, IP address, or CIDR, optionally limited with `:PORT`. A hostname rule
 is exact; `*.example.com` matches subdomains, not `example.com` itself.
 
-`mode: unrestricted-public` permits public destinations. The host, LAN,
-private ranges, link-local addresses, and cloud-metadata addresses still need
-an explicit rule. `HOST_LOOPBACK` names the host running Terra. A `hosts`
-record only provides local DNS; add a matching `allow` rule before connecting.
+`mode: unrestricted-public` permits public destinations, including public
+addresses on a LAN. Filtering is based on destination addresses, not network
+location. IPs collected from host interfaces at VM startup (including public
+IPs), private ranges, link-local addresses, and blocked cloud-metadata addresses
+still need an explicit rule. `HOST_LOOPBACK` names the host running Terra.
+A `hosts` record only provides local DNS; add a matching `allow` rule before
+connecting.
 `ports` publishes a guest listener on host loopback: `"8080"` maps the same
 port and `"3000:80"` maps host 3000 to guest 80.
 

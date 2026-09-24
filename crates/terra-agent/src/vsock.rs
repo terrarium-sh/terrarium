@@ -9,26 +9,21 @@ use crate::AsyncFile;
 use crate::term::session::{ClientConn, DetachOutcome, Session};
 use crate::term::tty::set_winsize;
 use rustix::net::addr::{SocketAddrArg, SocketAddrLen, SocketAddrOpaque};
-use rustix::net::{
-    AddressFamily, SocketFlags, SocketType, acceptfrom_with, bind, listen, socket_with,
-};
+use rustix::net::{AddressFamily, SocketFlags, SocketType, socket_with};
 use std::fs::File;
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use terra_protocol::{
     AGENT_HELLO, AgentService, ClientInput, ControlReply, ControlRequest, MAX_SERVICE_FRAME_BYTES,
     TermSize, read_frame_async_with_limit,
 };
 use tokio::io::AsyncWriteExt as _;
-use tokio::io::unix::AsyncFd;
 use tokio::sync::{mpsc, watch};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 pub const VMADDR_CID_HOST: u32 = 2;
 
-const ACCEPT_RETRY: Duration = Duration::from_millis(100);
-const REFUSED_CONNECTION_LOG_INTERVAL: Duration = Duration::from_secs(1);
 const STARTUP_WAIT: Duration = Duration::from_mins(5);
 const SERVICE_SELECT_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -79,11 +74,6 @@ struct SockaddrVm {
     svm_zero: [u8; 4],
 }
 
-pub struct VsockListener {
-    fd: AsyncFd<OwnedFd>,
-    last_refusal: Option<Instant>,
-}
-
 fn create_vsock_socket(cid: u32, port: u32) -> std::io::Result<(OwnedFd, SockaddrVm)> {
     let fd = socket_with(
         AddressFamily::VSOCK,
@@ -117,95 +107,34 @@ unsafe impl SocketAddrArg for SockaddrVm {
     }
 }
 
-impl VsockListener {
-    pub fn bind(port: u32) -> std::io::Result<Self> {
-        let (fd, addr) = create_vsock_socket(u32::MAX, port)?;
-        bind(&fd, &addr)?;
-        listen(&fd, 8)?;
-        let flags = rustix::fs::fcntl_getfl(&fd)?;
-        rustix::fs::fcntl_setfl(&fd, flags | rustix::fs::OFlags::NONBLOCK)?;
-        Ok(Self {
-            fd: AsyncFd::new(fd)?,
-            last_refusal: None,
-        })
-    }
-
-    /// Accepts the next connection from the host, refusing all other peers.
-    #[allow(unsafe_code)]
-    async fn accept_host(&mut self) -> std::io::Result<File> {
-        loop {
-            let mut readiness = self.fd.readable().await?;
-            let accepted =
-                readiness.try_io(|fd| Ok(acceptfrom_with(fd.get_ref(), SocketFlags::CLOEXEC)?));
-            let (fd, peer) = match accepted {
-                Ok(result) => result?,
-                Err(_) => continue,
-            };
-            let file = File::from(fd);
-            let cid = peer
-                .filter(|peer| {
-                    peer.address_family() == AddressFamily::VSOCK
-                        && peer.addr_len() as usize >= std::mem::size_of::<SockaddrVm>()
-                })
-                .map_or(u32::MAX, |peer| {
-                    // SAFETY: the kernel returned a complete sockaddr_vm.
-                    unsafe { std::ptr::read_unaligned(peer.as_ptr().cast::<SockaddrVm>()) }.svm_cid
-                });
-            if cid == VMADDR_CID_HOST {
-                return Ok(file);
-            }
-            drop(file);
-            let now = Instant::now();
-            if self
-                .last_refusal
-                .is_none_or(|last| now.duration_since(last) >= REFUSED_CONNECTION_LOG_INTERVAL)
-            {
-                eprintln!(
-                    "terra-agent: refused vsock connection from inside the guest (cid {cid})"
-                );
-                self.last_refusal = Some(now);
-            }
-        }
-    }
-}
-
 pub fn connect(cid: u32, port: u32) -> std::io::Result<File> {
     let (fd, addr) = create_vsock_socket(cid, port)?;
     rustix::net::connect(&fd, &addr)?;
     Ok(File::from(fd))
 }
 
-pub(crate) async fn serve_agent_port(
+pub(crate) async fn serve_clients(
     session: Arc<Session>,
-    mut listener: VsockListener,
+    mut clients: mpsc::Receiver<File>,
     workload_is_root: bool,
     initial_session: Option<mpsc::Sender<()>>,
     startup: StartupGate,
     cancellation: CancellationToken,
 ) {
     let tasks = TaskTracker::new();
-    while let Some(accepted) = cancellation
-        .run_until_cancelled(listener.accept_host())
+    while let Some(conn) = cancellation
+        .run_until_cancelled(clients.recv())
         .await
+        .flatten()
     {
-        match accepted {
-            Ok(conn) => {
-                tasks.spawn(serve_connection(
-                    session.clone(),
-                    conn,
-                    workload_is_root,
-                    initial_session.clone(),
-                    startup.clone(),
-                    cancellation.clone(),
-                ));
-            }
-            Err(error) => {
-                eprintln!("terra-agent: accept failed: {error}");
-                cancellation
-                    .run_until_cancelled(tokio::time::sleep(ACCEPT_RETRY))
-                    .await;
-            }
-        }
+        tasks.spawn(serve_connection(
+            session.clone(),
+            conn,
+            workload_is_root,
+            initial_session.clone(),
+            startup.clone(),
+            cancellation.clone(),
+        ));
     }
     tasks.close();
     tasks.wait().await;

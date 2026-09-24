@@ -48,14 +48,16 @@ Egress policy: {egress}.
 
 - Guest address `{ip}/{prefix}`, gateway `{gw}`, DNS `{dns}`.
 - All traffic goes through a filtering gateway; there is no other route out.
-- The host machine, its LAN, and every private address range are unreachable
-  unless an `allow` rule names them. The one way to reach services on the
-  machine terra runs on is `HOST_LOOPBACK` in `allow` (or a `hosts:` name
-  pointing there that `allow` covers).
+- IPs collected from host interfaces at VM startup, including public IPs, and
+  private address ranges require explicit `allow` rules.
+  `HOST_LOOPBACK` in `allow` grants access to services on the host's loopback
+  interface (or use a `hosts:` name pointing there that `allow` covers).
 - `mode: allowlist` - only what the `allow` rules cover connects, and only the
   names they list resolve. With no rules at all, nothing gets out - not even
   DNS queries.
-- `mode: unrestricted-public` - any public address is reachable; private
-  ranges stay blocked.
+- `mode: unrestricted-public` - public destinations are reachable, including
+  public addresses on a LAN, except the collected host interface IPs. Filtering
+  uses addresses, not network location; a public NAT address forwarding to the
+  host may still be reachable.
 - A `hosts:` record only pins where a name resolves. Whether that address may
   be reached is still decided by `allow`, as for any other name.

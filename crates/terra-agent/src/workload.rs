@@ -24,10 +24,8 @@ pub(super) async fn execute(
     stop: &CancellationToken,
     shutdown: &CancellationToken,
     tasks: &TaskTracker,
+    clients: tokio::sync::mpsc::Receiver<File>,
 ) -> Result<i32> {
-    // Bind before guest code runs so it cannot hijack agent services over vsock loopback.
-    let port = crate::vsock::VsockListener::bind(terra_protocol::AGENT_VSOCK_PORT)
-        .map_err(|error| anyhow::anyhow!("binding the agent port: {error}"))?;
     restrict_ptrace();
     config::configure_network(&plan.net, stop).await?;
     crate::sync::ensure_directory(Path::new(terra_protocol::WORKLOAD_HOME), true)
@@ -35,7 +33,7 @@ pub(super) async fn execute(
     if plan.mode == PlanMode::Create {
         let startup = crate::vsock::StartupGate::new();
         let SessionPty { session, .. } =
-            start_session(plan, port, startup, stop, shutdown, tasks).await?;
+            start_session(plan, clients, startup, stop, shutdown, tasks).await?;
         crate::report_agent_ready(control).await?;
         let outcome = bake_if_stale(&plan.on_create, diagnostic, &session, stop).await;
         session.broadcast_exit(i32::from(outcome.is_err())).await;
@@ -51,7 +49,7 @@ pub(super) async fn execute(
         session,
         pts,
         drained,
-    } = start_session(plan, port, startup.clone(), stop, shutdown, tasks).await?;
+    } = start_session(plan, clients, startup.clone(), stop, shutdown, tasks).await?;
     crate::report_agent_ready(control).await?;
     if !plan.on_start.is_empty() {
         session
@@ -142,7 +140,7 @@ fn restrict_ptrace() {
 
 async fn start_session(
     plan: &Plan,
-    port: crate::vsock::VsockListener,
+    clients: tokio::sync::mpsc::Receiver<File>,
     startup: crate::vsock::StartupGate,
     stop: &CancellationToken,
     shutdown: &CancellationToken,
@@ -163,9 +161,9 @@ async fn start_session(
         .map_or((None, None), |(sender, receiver)| {
             (Some(sender), Some(receiver))
         });
-    tasks.spawn(crate::vsock::serve_agent_port(
+    tasks.spawn(crate::vsock::serve_clients(
         session.clone(),
-        port,
+        clients,
         plan.root,
         initial_session,
         startup,

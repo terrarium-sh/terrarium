@@ -10,12 +10,14 @@ workspace = true
 crate-type = ["cdylib"]
 
 [dependencies]
-terra-protocol = { path = "../../crates/terra-protocol" }
+terra-protocol = { path = "../../crates/terra-protocol", features = ["mux"] }
 terra-device-transport = { path = "../device-transport" }
 terra-limits = { path = "../../crates/terra-limits" }
 terra-vsock-device = { path = "../vsock-device" }
 wit-bindgen = { workspace = true, features = ["async-spawn", "inter-task-wakeup"] }
-futures-util = { version = "0.3", default-features = false, features = ["std"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "io"] }
 futures-channel = "0.3"
+futures-io = "0.3"
+yamux = "=0.14.1"
 serde = "1"
 serde_json = "1"

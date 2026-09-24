@@ -66,6 +66,7 @@ pub fn vsock_component_linker<T: WasiView + AsMut<VsockDeviceHost> + 'static>(
 ) -> wasmtime::Result<wasmtime::component::Linker<T>> {
     use wasmtime_wasi::{p3::bindings::random::random, random::WasiRandomView};
     let mut linker = wasmtime::component::Linker::new(engine);
+    wasmtime_wasi::p3::cli::add_to_linker(&mut linker)?;
     crate::component::clocks::add_monotonic_now_and_wait_for(&mut linker)?;
     crate::component::clocks::add_system_clock_now(&mut linker)?;
     linker.instance("wasi:random/random@0.3.0")?.func_wrap(

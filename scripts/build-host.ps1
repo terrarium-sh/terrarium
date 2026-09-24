@@ -30,16 +30,23 @@ foreach ($asset in $guestAssets) {
     }
 }
 Invoke-Native -Command rustup -Arguments @("target", "add", $Target)
-Invoke-Native -Command rustup -Arguments @("toolchain", "install", $componentToolchain, "--profile", "minimal", "--target", "wasm32-unknown-unknown")
+Invoke-Native -Command rustup -Arguments @("toolchain", "install", $componentToolchain, "--profile", "minimal", "--target", "wasm32-unknown-unknown", "--target", "wasm32-wasip3")
 Invoke-Native -Command cargo -Arguments @("+$componentToolchain", "install", "wasm-tools", "--version", "1.248.0", "--locked")
 
 foreach ($component in $components) {
     $artifactStem = $component.Replace("-", "_")
-    Invoke-Native -Command cargo -Arguments @("+$componentToolchain", "build", "--locked", "--release", "--target", "wasm32-unknown-unknown", "--manifest-path", "components/Cargo.toml", "--package", "terra-$component-component")
+    $componentTarget = if ($component -eq "vsock") { "wasm32-wasip3" } else { "wasm32-unknown-unknown" }
+    Invoke-Native -Command cargo -Arguments @("+$componentToolchain", "build", "--locked", "--release", "--target", $componentTarget, "--manifest-path", "components/Cargo.toml", "--package", "terra-$component-component")
     New-Item -ItemType Directory -Force components/target/wasm-components/release | Out-Null
-    Invoke-Native -Command wasm-tools -Arguments @("component", "new", "components/target/wasm32-unknown-unknown/release/terra_$($artifactStem)_component.wasm", "-o", "components/target/wasm-components/release/terra_$($artifactStem)_component.wasm")
-    Invoke-Native -Command wasm-tools -Arguments @("validate", "--features", "cm-async", "components/target/wasm-components/release/terra_$($artifactStem)_component.wasm")
-    $precompileArguments = @("run", "--locked", "--release", "--target", $Target, "-p", "terra-runtime", "--features", "compiler", "--example", "precompile-component", "--", "components/target/wasm-components/release/terra_$($artifactStem)_component.wasm", "build/terra-$component-component.cwasm")
+    $componentArtifact = "components/target/$componentTarget/release/terra_$($artifactStem)_component.wasm"
+    $wrappedArtifact = "components/target/wasm-components/release/terra_$($artifactStem)_component.wasm"
+    if ($component -eq "vsock") {
+        Copy-Item -Force $componentArtifact $wrappedArtifact
+    } else {
+        Invoke-Native -Command wasm-tools -Arguments @("component", "new", $componentArtifact, "-o", $wrappedArtifact)
+    }
+    Invoke-Native -Command wasm-tools -Arguments @("validate", "--features", "cm-async", $wrappedArtifact)
+    $precompileArguments = @("run", "--locked", "--release", "--target", $Target, "-p", "terra-runtime", "--features", "compiler", "--example", "precompile-component", "--", $wrappedArtifact, "build/terra-$component-component.cwasm")
     if ($component -eq "policy") {
         $precompileArguments += "--policy"
     }

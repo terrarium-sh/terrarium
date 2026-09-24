@@ -1,8 +1,9 @@
 # Component authority
 
-Every shipped component is compiled for `wasm32-unknown-unknown`. Its imports
-are read from the wrapped production artifact, rather than inferred from its
-source WIT. [`check-component-authority.py`](../scripts/check-component-authority.py)
+Every shipped component except vsock is compiled for `wasm32-unknown-unknown`.
+Vsock targets `wasm32-wasip3` so upstream Yamux can use the standard monotonic clock.
+Its imports are read from the wrapped production artifact, rather than inferred
+from its source WIT. [`check-component-authority.py`](../scripts/check-component-authority.py)
 compares that result with
 [`component-authority.json`](../scripts/component-authority.json), and
 `component_imports` proves that MMIO and the interrupt controller link
@@ -29,7 +30,7 @@ component the union of all capabilities.
 | Filesystem | Guest RAM, interrupt, selected filesystem descriptor/preopen methods, `wait-for` | One recipe-selected directory preopen. Descriptor resource methods are registered individually; clock types carry timestamps and do not grant a clock call. |
 | Memory | Guest RAM, interrupt, discard | Reclaims checked ranges of the assigned guest RAM only. |
 | Network | Guest RAM, interrupt, diagnostics, policy-filtered socket/DNS methods, monotonic `now`/`wait-for` | Socket resources are created and used through policy-enforcing hosts. The only diagnostic sink is capped logging. |
-| Vsock | Guest RAM, interrupt, supplied local clients and control streams, monotonic/system clocks, `get-random-u64` | Local listener/client resources come from the configured box service; randomness seeds the guest service. No general filesystem or sockets are linked. |
+| Vsock | Guest RAM, interrupt, supplied local clients and control streams, monotonic/system clocks, `get-random-u64`, WASI CLI interfaces | Local listener/client resources come from the configured box service; randomness seeds the guest service. The standard-library CLI bindings receive an empty environment, closed stdin, and output sinks. No general filesystem or sockets are linked. |
 | Policy | Monotonic `now` | Computes policy and DNS-expiry decisions with no Terra host, guest RAM, filesystem or socket imports. |
 
 The checked list is exact, including resource destructors and empty imported

@@ -115,9 +115,8 @@ pub struct Mount {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum NetworkMode {
-    /// Public addresses without a rule. The host, its LAN and every private
-    /// range stay out of reach in this mode too - `allow` / `hosts` rules are
-    /// how a recipe opens one.
+    /// Allows public destinations except addresses collected from host interfaces at VM startup.
+    /// Explicit `allow` rules can grant access to those addresses and private ranges.
     #[serde(rename = "unrestricted-public")]
     UnrestrictedPublic,
     /// Nothing without a rule; an empty allowlist reaches nothing.

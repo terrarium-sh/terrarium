@@ -5,15 +5,16 @@
 
 pub mod control;
 mod frames;
+pub mod mux;
 mod plan;
 pub mod session;
 pub mod sync;
 
 pub use control::{
-    AGENT_HELLO, AGENT_PROTOCOL_VERSION, AGENT_READY_NOTIFICATION, AGENT_VSOCK_PORT, AgentService,
-    CLOCK_SYNC, CLOCK_SYNC_BYTES, CONTROL_VSOCK_PORT, DEFAULT_STOP_GRACE_SECS,
-    DIAGNOSTIC_VSOCK_PORT, LifecycleEvent, MAX_DIAGNOSTIC_EVENT_BYTES, MAX_DIAGNOSTIC_FRAME_BYTES,
-    MAX_SERVICE_FRAME_BYTES, STOP_SIGNAL, decode_clock_sync, encode_clock_sync,
+    AGENT_HELLO, AGENT_PROTOCOL_VERSION, AGENT_READY_NOTIFICATION, AgentService, CLOCK_SYNC,
+    CLOCK_SYNC_BYTES, DEFAULT_STOP_GRACE_SECS, LifecycleEvent, MAX_DIAGNOSTIC_EVENT_BYTES,
+    MAX_DIAGNOSTIC_FRAME_BYTES, MAX_SERVICE_FRAME_BYTES, STOP_SIGNAL, decode_clock_sync,
+    encode_clock_sync,
 };
 pub use frames::{encode_frame, encode_frame_with_limit, read_frame, read_frame_with_limit};
 #[cfg(feature = "tokio")]

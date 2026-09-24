@@ -6,6 +6,7 @@ mod bindings {
 }
 use bindings::{exports, terra, wasi, wit_stream};
 
+mod carrier;
 mod lifecycle;
 mod mmio;
 mod transport;
@@ -124,7 +125,7 @@ impl exports::terra::vsock::api::Guest for Vsock {
         }
         let (header, data) = VsockHeader::parse(&packet).map_err(|_| Error::Malformed)?;
         switch().rx(&header, data);
-        worker::wake_clients();
+        carrier::wake();
         worker::schedule_receive_queue();
         Ok(())
     }
@@ -138,17 +139,6 @@ impl exports::terra::vsock::api::Guest for Vsock {
                 payload: reply.payload,
             })
             .collect()
-    }
-
-    fn connect(guest_port: u32) -> Result<u32, Error> {
-        if CLOSED.load(Ordering::Acquire) {
-            return Err(Error::Backpressure);
-        }
-        let result = switch().connect(guest_port);
-        if result.is_ok() {
-            worker::schedule_receive_queue();
-        }
-        result.map_err(error)
     }
 
     fn deliver(guest_port: u32, host_port: u32, data: Vec<u8>) -> Result<(), Error> {
@@ -213,24 +203,22 @@ impl exports::terra::vsock::api::Guest for Vsock {
 
     fn reset() {
         if !CLOSED.load(Ordering::Acquire) {
-            *switch() = VsockSwitch::new();
             *LAST_CLOCK_SAMPLE
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
             transport::reset();
-            worker::wake_clients();
+            carrier::wake();
             wake_worker();
         }
     }
 
     async fn close() {
         CLOSED.store(true, Ordering::Release);
-        *switch() = VsockSwitch::new();
         *LAST_CLOCK_SAMPLE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         transport::close();
-        worker::wake_clients();
+        carrier::wake();
         wake_worker();
         worker::finish().await;
     }

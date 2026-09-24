@@ -352,14 +352,23 @@ class BuildToolsTest(unittest.TestCase):
 
     def test_rust_updates_channels_and_requires_the_wasm_target(self):
         self.feeds["https://static.rust-lang.org/dist/channel-rust-stable.toml"] = b'[pkg.rust]\nversion = "1.100.0 (hash date)"\n'
-        nightly = b'date = "2026-02-01"\n[pkg.rust-std.target.wasm32-unknown-unknown]\navailable = true\n'
+        nightly = b'date = "2026-02-01"\n[pkg.rust-std.target.wasm32-unknown-unknown]\navailable = true\n[pkg.rust-std.target.wasm32-wasip3]\navailable = true\n'
         self.feeds["https://static.rust-lang.org/dist/channel-rust-nightly.toml"] = nightly
         original = self.files.copy()
         tools.update_rust(self.files)
         self.assertIn('channel = "1.100.0"', self.files["rust-toolchain.toml"])
         self.assertIn("nightly-2026-02-01", self.files["build.yml"])
-        self.feeds["https://static.rust-lang.org/dist/channel-rust-nightly.toml"] = nightly.replace(b"true", b"false")
+        self.feeds["https://static.rust-lang.org/dist/channel-rust-nightly.toml"] = nightly.replace(
+            b"[pkg.rust-std.target.wasm32-unknown-unknown]\navailable = true",
+            b"[pkg.rust-std.target.wasm32-unknown-unknown]\navailable = false",
+        )
         with self.assertRaisesRegex(ValueError, "wasm32-unknown-unknown"):
+            tools.update_rust(original)
+        self.feeds["https://static.rust-lang.org/dist/channel-rust-nightly.toml"] = nightly.replace(
+            b"[pkg.rust-std.target.wasm32-wasip3]\navailable = true",
+            b"[pkg.rust-std.target.wasm32-wasip3]\navailable = false",
+        )
+        with self.assertRaisesRegex(ValueError, "wasm32-wasip3"):
             tools.update_rust(original)
 
     def test_containers_update_digests_abuild_and_each_snapshot(self):
