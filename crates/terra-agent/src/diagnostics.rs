@@ -85,7 +85,11 @@ pub(super) async fn write(writer: &mut crate::AsyncFile, bytes: &[u8]) -> std::i
 mod tests {
     use crate::diagnostics::{CHUNK_BYTES as DIAGNOSTIC_CHUNK_BYTES, Diagnostics};
     use crate::hooks::run;
+    use std::fs::File;
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
     use std::time::Duration;
+    use terra_protocol::LifecycleEvent;
     use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -107,10 +111,7 @@ mod tests {
         .await
         .expect("hook exits despite a full diagnostic queue");
     }
-    use std::fs::File;
-    use std::os::fd::OwnedFd;
-    use std::os::unix::net::UnixStream;
-    use terra_protocol::LifecycleEvent;
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn diagnostics_finish_flushes_a_queued_line() {
         let (agent, mut host) = UnixStream::pair().unwrap();

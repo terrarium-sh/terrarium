@@ -27,7 +27,7 @@ pub(super) fn enter_root() -> Result<Boot> {
     fs::create_dir_all("/dev/shm")?;
     for (target, fstype) in [("/dev/shm", "tmpfs"), ("/sys/fs/cgroup", "cgroup2")] {
         if let Err(e) = mount(None, target, Some(fstype), MountFlags::empty()) {
-            eprintln!("terra: warning: could not mount {target}: {e:#}");
+            eprintln!("terra-agent: warning: could not mount {target}: {e:#}");
         }
     }
     mount(None, "/mnt", Some("tmpfs"), MountFlags::empty())
@@ -62,9 +62,11 @@ pub(super) fn enter_root() -> Result<Boot> {
         fs::create_dir_all(format!("{NEWROOT}/{directory}"))?;
     }
     for directory in ["proc", "sys", "dev"] {
+        let source = format!("/{directory}");
+        let target = format!("{NEWROOT}/{directory}");
         mount(
-            Some(&format!("/{directory}")),
-            &format!("{NEWROOT}/{directory}"),
+            Some(&source),
+            &target,
             None,
             MountFlags::BIND | MountFlags::REC,
         )
@@ -100,14 +102,16 @@ pub(super) fn enter_root() -> Result<Boot> {
 
 fn grow_filesystem(device: &str) {
     if let Err(error) = mount(Some(device), CLEAN_MOUNT, Some("ext4"), MountFlags::empty()) {
-        eprintln!("terra: warning: {device} would not mount ({error:#}) - skipping resize");
+        eprintln!("terra-agent: warning: {device} would not mount ({error:#}) - skipping resize");
         return;
     }
     if let Err(error) = rustix::mount::unmount(CLEAN_MOUNT, rustix::mount::UnmountFlags::empty())
         .map_err(std::io::Error::from)
         .with_context(|| format!("umount {CLEAN_MOUNT}"))
     {
-        eprintln!("terra: warning: could not unmount {CLEAN_MOUNT} ({error:#}) - skipping resize");
+        eprintln!(
+            "terra-agent: warning: could not unmount {CLEAN_MOUNT} ({error:#}) - skipping resize"
+        );
         let _ = rustix::mount::unmount(CLEAN_MOUNT, rustix::mount::UnmountFlags::DETACH);
         return;
     }
@@ -117,9 +121,11 @@ fn grow_filesystem(device: &str) {
     {
         Ok(status) if status.success() => {}
         Ok(status) => eprintln!(
-            "terra: warning: resize2fs {device} exited {status} - image may be undersized"
+            "terra-agent: warning: resize2fs {device} exited {status} - image may be undersized"
         ),
-        Err(error) => eprintln!("terra: warning: could not run resize2fs for {device}: {error}"),
+        Err(error) => {
+            eprintln!("terra-agent: warning: could not run resize2fs for {device}: {error}");
+        }
     }
 }
 
@@ -238,7 +244,7 @@ fn setup_env(plan: &Plan) {
         std::env::set_var("TERM", "xterm-256color");
         for (key, value) in &plan.env {
             if key.is_empty() || key.contains(['=', '\0']) || value.contains('\0') {
-                eprintln!("terra: warning: skipping invalid env key `{key}`");
+                eprintln!("terra-agent: warning: skipping invalid env key `{key}`");
                 continue;
             }
             std::env::set_var(key, value);

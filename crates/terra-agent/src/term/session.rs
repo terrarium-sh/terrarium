@@ -22,7 +22,6 @@ const INPUT_QUEUE_CAPACITY: usize = 1;
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 const REPAINT_CHUNK_BYTES: usize = 64 << 10;
 
-/// Downstream connection for an attached vsock client.
 #[derive(Clone)]
 pub(crate) struct ClientConn(Arc<ClientConnInner>);
 
@@ -67,10 +66,7 @@ impl ClientConn {
 
 impl Drop for ClientConnInner {
     fn drop(&mut self) {
-        let _ = rustix::net::shutdown(
-            self.file.get_mut().get_ref().as_fd(),
-            rustix::net::Shutdown::Both,
-        );
+        let _ = rustix::net::shutdown(&self.shutdown, rustix::net::Shutdown::Both);
     }
 }
 
@@ -143,7 +139,6 @@ impl Session {
         self.input_fd.as_fd()
     }
 
-    /// Broadcasts output, dropping clients that do not finish a frame within one second.
     pub(crate) async fn feed_output(&self, bytes: &[u8]) {
         let _delivery = self.delivery.lock().await;
         let clients = {
@@ -176,7 +171,6 @@ impl Session {
         }
     }
 
-    /// Broadcasts the workload exit code and closes attached connections.
     pub(crate) async fn broadcast_exit(&self, code: i32) {
         let _delivery = self.delivery.lock().await;
         let clients = {
@@ -191,7 +185,6 @@ impl Session {
         }
     }
 
-    /// Attaches a client and repaints the current screen.
     pub(crate) async fn attach_client(&self, conn: &ClientConn) -> Option<u64> {
         let _delivery = self.delivery.lock().await;
         let (id, output, exit) = {
@@ -258,11 +251,13 @@ impl Session {
             let size = inner.update_shared_size();
             (clients, size)
         };
-        for client in &clients {
+        let mut ids = Vec::with_capacity(clients.len());
+        for client in clients {
+            ids.push(client.id);
             let _ = client.conn.write(&AgentOutput::Detached).await;
             client.conn.close();
         }
-        (clients.into_iter().map(|client| client.id).collect(), size)
+        (ids, size)
     }
 
     pub(crate) async fn list_clients(&self) -> Vec<(u64, Option<(u16, u16)>)> {
@@ -275,7 +270,6 @@ impl Session {
             .collect()
     }
 
-    /// Records a client terminal size, returning the changed shared size.
     pub(crate) async fn set_client_size(
         &self,
         id: u64,

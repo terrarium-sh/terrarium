@@ -57,11 +57,15 @@ pub(super) async fn run(
     let (mut child, child_pidfd) = crate::reap::spawn_owned(|| command.spawn())
         .with_context(|| format!("spawning hook `{sh_cmd_line}`"))?;
     let pumps = if diagnostic.is_some() || session.is_some() {
-        let stdout = child.stdout.take().map(OwnedFd::from);
-        let stderr = child.stderr.take().map(OwnedFd::from);
         let cancellation = CancellationToken::new();
         let tasks = TaskTracker::new();
-        for stream in [stdout, stderr] {
+        for stream in [
+            child.stdout.take().map(OwnedFd::from),
+            child.stderr.take().map(OwnedFd::from),
+        ]
+        .into_iter()
+        .flatten()
+        {
             tasks.spawn(pump_output(
                 stream,
                 diagnostic.cloned(),
@@ -94,16 +98,13 @@ struct HookOutput {
 }
 
 async fn pump_output(
-    stream: Option<OwnedFd>,
+    stream: OwnedFd,
     diagnostic: Option<Diagnostics>,
     session: Option<Arc<Session>>,
     cancellation: CancellationToken,
 ) {
     cancellation
         .run_until_cancelled(async move {
-            let Some(stream) = stream else {
-                return;
-            };
             let Ok(mut stream) = crate::into_async_file(stream) else {
                 return;
             };
@@ -305,8 +306,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_timed_out_hook_kills_its_children() {
-        let pid_file =
-            std::env::temp_dir().join(format!("terra-hook-child-{}", std::process::id()));
+        let pid_file = crate::create_scratch_path("hook", "child");
         let _ = fs::remove_file(&pid_file);
         run_hook(
             &format!("sleep 600 & echo $! > {}; wait", pid_file.display()),

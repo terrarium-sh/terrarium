@@ -1,8 +1,4 @@
 //! PID 1's orphan reaper.
-//!
-//! Every outliving process is reparented here with no other waiter, so
-//! without this a box leaks a zombie per backgrounded child until `fork`
-//! fails guest-wide.
 
 use crate::mutex::lock_or_abort;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -89,7 +85,6 @@ where
     Ok((child, OwnedPidfd { pidfd, status }))
 }
 
-/// Waits asynchronously for a child registered with [`spawn_owned`].
 pub async fn wait_owned(pidfd: &OwnedPidfd) -> std::io::Result<ExitStatus> {
     let pidfd_ready = tokio::io::unix::AsyncFd::new(pidfd.try_clone()?)?;
     loop {
@@ -148,7 +143,6 @@ pub async fn watch_orphans(cancellation: tokio_util::sync::CancellationToken) {
     }
 }
 
-/// Reaps one exited child, parking owned children's statuses. Returns true if a child was reaped.
 fn reap_one_orphan() -> bool {
     let owned = lock_or_abort(&OWNED);
     let Ok(Some((pid, status))) = rustix::process::wait(rustix::process::WaitOptions::NOHANG)

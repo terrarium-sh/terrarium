@@ -16,7 +16,6 @@ use tokio_util::sync::CancellationToken;
 const EXEC_NOT_RUN: i32 = 127;
 const EXEC_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Root-capable host-only channel, matching the file service authority.
 pub async fn serve_exec(conn: AsyncFile, workload_root: bool, cancel: CancellationToken) {
     let Ok(disconnect) = conn
         .get_ref()
@@ -459,7 +458,7 @@ async fn write_exec<W: AsyncWrite + Unpin>(
     tokio::select! {
         biased;
         () = cancel.cancelled() => false,
-        result = tokio::time::timeout(EXEC_SETUP_TIMEOUT, write_frame(conn, msg)) => result.is_ok_and(|result| result.is_ok()),
+        result = tokio::time::timeout(EXEC_SETUP_TIMEOUT, write_frame(conn, msg)) => matches!(result, Ok(Ok(()))),
     }
 }
 

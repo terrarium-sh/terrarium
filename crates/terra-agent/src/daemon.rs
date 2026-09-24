@@ -102,13 +102,10 @@ async fn supervise(
         let mut command = Command::new("sh");
         command.arg("-c").arg(line).process_group(0);
         if let Some(output) = output {
-            let (stdout, stderr) = match output
-                .try_clone()
-                .and_then(|stdout| output.try_clone().map(|stderr| (stdout, stderr)))
-            {
-                Ok(output) => output,
-                Err(error) => {
-                    eprintln!("terra: daemon `{line}` could not clone its output ({error})");
+            let (stdout, stderr) = match (output.try_clone(), output.try_clone()) {
+                (Ok(stdout), Ok(stderr)) => (stdout, stderr),
+                (Err(error), _) | (_, Err(error)) => {
+                    eprintln!("terra-agent: daemon `{line}` could not clone its output ({error})");
                     return;
                 }
             };
@@ -126,7 +123,7 @@ async fn supervise(
         let (child, pidfd) = match crate::reap::spawn_owned(|| command.spawn()) {
             Ok(pair) => pair,
             Err(e) => {
-                eprintln!("terra: daemon `{line}` could not spawn ({e})");
+                eprintln!("terra-agent: daemon `{line}` could not spawn ({e})");
                 tokio::select! {
                     () = tokio::time::sleep(RESTART_DELAY) => {}
                     () = cancellation.cancelled() => return,
@@ -169,8 +166,8 @@ async fn supervise(
         }
         match status {
             Ok(s) if s.success() => return,
-            Ok(s) => eprintln!("terra: daemon `{line}` exited {s} - restarting"),
-            Err(e) => eprintln!("terra: daemon `{line}` wait failed ({e})"),
+            Ok(s) => eprintln!("terra-agent: daemon `{line}` exited {s} - restarting"),
+            Err(e) => eprintln!("terra-agent: daemon `{line}` wait failed ({e})"),
         }
         tokio::select! {
             () = tokio::time::sleep(RESTART_DELAY) => {}

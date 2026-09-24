@@ -134,7 +134,7 @@ async fn bake_if_stale(
 fn restrict_ptrace() {
     const PATH: &str = "/proc/sys/kernel/yama/ptrace_scope";
     if let Err(error) = fs::write(PATH, "1\n") {
-        eprintln!("terra: warning: could not restrict ptrace ({PATH}): {error}");
+        eprintln!("terra-agent: warning: could not restrict ptrace ({PATH}): {error}");
     }
 }
 
@@ -155,12 +155,12 @@ async fn start_session(
     let reader = master.try_clone()?;
     let input = crate::into_async_file(master)?;
     let session = crate::term::session::Session::new(input, shutdown, tasks)?;
-    let (initial_session, connected) = plan
-        .await_initial_session
-        .then(|| tokio::sync::mpsc::channel(1))
-        .map_or((None, None), |(sender, receiver)| {
-            (Some(sender), Some(receiver))
-        });
+    let (initial_session, connected) = if plan.await_initial_session {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        (Some(sender), Some(receiver))
+    } else {
+        (None, None)
+    };
     tasks.spawn(crate::vsock::serve_clients(
         session.clone(),
         clients,
@@ -224,6 +224,8 @@ async fn run_workload(
     drop(daemon_output);
     let mut command = PtyCommand::new(cmd).args(args);
     if !plan.root {
+        // SAFETY: a post-fork/pre-exec hook that only calls async-signal-safe
+        // id-setting syscalls.
         unsafe {
             command = command.pre_exec(drop_privileges);
         }
@@ -237,7 +239,10 @@ async fn run_workload(
     };
     let code = tokio::select! {
         code = crate::exec::wait_for_exit_code(&child_pidfd) => code,
-        () = stop.cancelled() => { stop_gracefully(&child_pidfd, stop_grace).await; crate::exec::wait_for_exit_code(&child_pidfd).await }
+        () = stop.cancelled() => {
+            stop_gracefully(&child_pidfd, stop_grace).await;
+            crate::exec::wait_for_exit_code(&child_pidfd).await
+        }
     };
     let _ = tokio::time::timeout(OUTPUT_DRAIN_GRACE, drained).await;
     Ok((code, daemons))
@@ -249,7 +254,11 @@ async fn wait_for_initial_session(
 ) -> Result<()> {
     tokio::select! {
         () = stop.cancelled() => bail!("the host stopped the box before its foreground session connected"),
-        connected = tokio::time::timeout(Duration::from_secs(30), connected.recv()) => match connected { Ok(Some(())) => Ok(()), Ok(None) => bail!("the foreground session listener stopped"), Err(_) => bail!("the foreground session did not connect within 30 seconds"), }
+        connected = tokio::time::timeout(Duration::from_secs(30), connected.recv()) => match connected {
+            Ok(Some(())) => Ok(()),
+            Ok(None) => bail!("the foreground session listener stopped"),
+            Err(_) => bail!("the foreground session did not connect within 30 seconds"),
+        }
     }
 }
 
@@ -285,6 +294,8 @@ pub(crate) fn spawn_on_pty(
         command = command.env(key, value);
     }
     if !as_root {
+        // SAFETY: a post-fork/pre-exec hook that only calls async-signal-safe
+        // id-setting syscalls.
         unsafe {
             command = command.pre_exec(drop_privileges);
         }
