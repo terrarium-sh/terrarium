@@ -33,13 +33,15 @@ shared host definitions but receives no disk, filesystem, socket or VM interface
 | policy | No Terra host interface, filesystem or sockets |
 
 Network uses monotonic timers for protocol polling; policy uses them for DNS
-expiry. Vsock uses timers for retries and clock updates, system time for guest
+expiry. Vsock uses timers for clock updates, system time for guest
 clock synchronization, and randomness for the guest seed. Filesystem WIT depends
 on clock types for timestamps; that dependency alone does not grant a clock call.
 
-Components build for `wasm32-unknown-unknown` to avoid implicit WASI services from
-the Rust standard library. Clock access uses explicit WIT imports only where
-protocol timers, DNS expiry or guest clock synchronization require it.
+Components except vsock build for `wasm32-unknown-unknown` to avoid implicit WASI
+services from the Rust standard library. Vsock targets `wasm32-wasip3` so upstream
+Yamux can use the standard monotonic clock. Its WASI imports are checked with the
+same authority inventory and linked explicitly. Clock access uses explicit WIT imports
+only where protocol timers, DNS expiry or guest clock synchronization require it.
 
 The [component authority inventory](../../docs/component-authority.md) records each
 remaining imported function and resource scope. `component_imports` checks every

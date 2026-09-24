@@ -28,7 +28,6 @@ interface api {
     decode-diagnostics: func(bytes: list<u8>) -> result<diagnostic-result, error>;
     receive: func(packet: list<u8>) -> result<_, error>;
     take-replies: func(max-items: u32, max-bytes: u32) -> list<reply>;
-    connect: func(guest-port: u32) -> result<u32, error>;
     deliver: func(guest-port: u32, host-port: u32, data: list<u8>) -> result<_, error>;
     shutdown: func(guest-port: u32, host-port: u32) -> result<_, error>;
     reset-connection: func(guest-port: u32, host-port: u32) -> result<_, error>;

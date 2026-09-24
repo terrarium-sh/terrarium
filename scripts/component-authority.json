@@ -179,6 +179,38 @@
       "plan",
       "stop"
     ],
+    "wasi:cli@0.3.0/environment": [
+      "get-environment"
+    ],
+    "wasi:cli@0.3.0/exit": [
+      "exit",
+      "exit-with-code"
+    ],
+    "wasi:cli@0.3.0/stderr": [
+      "write-via-stream"
+    ],
+    "wasi:cli@0.3.0/stdin": [
+      "read-via-stream"
+    ],
+    "wasi:cli@0.3.0/stdout": [
+      "write-via-stream"
+    ],
+    "wasi:cli@0.3.0/terminal-input": [
+      "[resource-drop]terminal-input"
+    ],
+    "wasi:cli@0.3.0/terminal-output": [
+      "[resource-drop]terminal-output"
+    ],
+    "wasi:cli@0.3.0/terminal-stderr": [
+      "get-terminal-stderr"
+    ],
+    "wasi:cli@0.3.0/terminal-stdin": [
+      "get-terminal-stdin"
+    ],
+    "wasi:cli@0.3.0/terminal-stdout": [
+      "get-terminal-stdout"
+    ],
+    "wasi:cli@0.3.0/types": [],
     "wasi:clocks@0.3.1/monotonic-clock": [
       "now",
       "wait-for"

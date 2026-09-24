@@ -68,7 +68,7 @@ fn packet(op: u16, len: u32) -> Vec<u8> {
     packet.extend_from_slice(&3_u64.to_le_bytes());
     packet.extend_from_slice(&2_u64.to_le_bytes());
     packet.extend_from_slice(&100_u32.to_le_bytes());
-    packet.extend_from_slice(&6001_u32.to_le_bytes());
+    packet.extend_from_slice(&6000_u32.to_le_bytes());
     packet.extend_from_slice(&len.to_le_bytes());
     packet.extend_from_slice(&1_u16.to_le_bytes());
     packet.extend_from_slice(&op.to_le_bytes());
@@ -126,7 +126,7 @@ async fn component_releases_credit_after_consumer_drains_data() {
     );
     assert_eq!(
         consume
-            .call_async(&mut store, (100, 6001, 4))
+            .call_async(&mut store, (100, 6000, 4))
             .await
             .expect("bounded")
             .0,
@@ -134,7 +134,7 @@ async fn component_releases_credit_after_consumer_drains_data() {
     );
     assert_eq!(
         consume
-            .call_async(&mut store, (100, 6001, 1))
+            .call_async(&mut store, (100, 6000, 1))
             .await
             .expect("drain")
             .0,
@@ -154,7 +154,7 @@ async fn component_releases_credit_after_consumer_drains_data() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn component_drains_selected_stream_while_another_is_queued() {
+async fn component_drains_the_single_carrier() {
     let engine = device_engine().expect("engine");
     let linker = vsock_component_linker(&engine).expect("linker");
     let component = Component::new(&engine, COMPONENT).expect("component");
@@ -190,39 +190,21 @@ async fn component_drains_selected_stream_while_another_is_queued() {
     let connections: Connections = instance
         .get_typed_func(&mut store, export("connections"))
         .expect("connections");
-    let mut diagnostic_request = packet(1, 0);
-    diagnostic_request[20..24].copy_from_slice(&6002_u32.to_le_bytes());
     assert_eq!(
         receive
             .call_async(&mut store, (packet(1, 0),))
             .await
-            .expect("control request"),
+            .expect("carrier request"),
         (Ok(()),)
     );
-    assert_eq!(
-        receive
-            .call_async(&mut store, (diagnostic_request,))
-            .await
-            .expect("diagnostic request"),
-        (Ok(()),)
-    );
-    let mut control = packet(5, 5);
-    control.extend_from_slice(b"first");
-    let mut diagnostic = packet(5, 6);
-    diagnostic[20..24].copy_from_slice(&6002_u32.to_le_bytes());
-    diagnostic.extend_from_slice(b"second");
+    let mut data = packet(5, 5);
+    data.extend_from_slice(b"hello");
     receive
-        .call_async(&mut store, (control,))
+        .call_async(&mut store, (data,))
         .await
-        .expect("control data")
+        .expect("carrier data")
         .0
-        .expect("control packet accepted");
-    receive
-        .call_async(&mut store, (diagnostic,))
-        .await
-        .expect("diagnostic data")
-        .0
-        .expect("diagnostic packet accepted");
+        .expect("carrier packet accepted");
     assert_eq!(
         connections
             .call_async(&mut store, (2,))
@@ -232,23 +214,15 @@ async fn component_drains_selected_stream_while_another_is_queued() {
             .iter()
             .map(|connection| (connection.guest_port, connection.host_port))
             .collect::<Vec<_>>(),
-        vec![(100, 6001), (100, 6002)]
+        vec![(100, 6000)]
     );
     assert_eq!(
         consume
-            .call_async(&mut store, (100, 6002, 6))
+            .call_async(&mut store, (100, 6000, 5))
             .await
-            .expect("diagnostic drain")
+            .expect("carrier drain")
             .0,
-        b"second"
-    );
-    assert_eq!(
-        consume
-            .call_async(&mut store, (100, 6001, 5))
-            .await
-            .expect("control drain")
-            .0,
-        b"first"
+        b"hello"
     );
 }
 
@@ -340,14 +314,14 @@ async fn component_rejects_backpressure_without_resetting_connection_state() {
     );
     assert_eq!(
         deliver
-            .call_async(&mut store, (100, 6001, vec![0; 64 * 1024]))
+            .call_async(&mut store, (100, 6000, vec![0; 64 * 1024]))
             .await
             .expect("first delivery"),
         (Ok(()),)
     );
     assert_eq!(
         deliver
-            .call_async(&mut store, (100, 6001, b"blocked".to_vec()))
+            .call_async(&mut store, (100, 6000, b"blocked".to_vec()))
             .await
             .expect("backpressure call"),
         (Err(ComponentError::Backpressure),)
@@ -363,7 +337,7 @@ async fn component_rejects_backpressure_without_resetting_connection_state() {
     );
     assert_eq!(
         deliver
-            .call_async(&mut store, (100, 6001, b"ok".to_vec()))
+            .call_async(&mut store, (100, 6000, b"ok".to_vec()))
             .await
             .expect("connection remains usable"),
         (Ok(()),)

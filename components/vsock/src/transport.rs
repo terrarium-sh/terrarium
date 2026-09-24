@@ -31,6 +31,7 @@ struct State {
 }
 
 fn reset_transport(state: &mut State) {
+    super::worker::reset_session();
     state.next = [0; 2];
     state.pending_rx = None;
     state.pending = [false; 2];
@@ -345,18 +346,20 @@ pub fn interrupt_level() -> bool {
 
 pub fn reset() {
     if !super::CLOSED.load(std::sync::atomic::Ordering::Acquire) {
+        super::worker::reset_session();
         let _ = configure();
-        *super::switch() = terra_vsock_device::VsockSwitch::new();
+        super::switch().restart();
     }
 }
 pub fn close() {
+    super::worker::reset_session();
     super::CLOSED.store(true, std::sync::atomic::Ordering::Release);
     super::worker::set_transport_ready(false);
     if let Ok(mut state) = STATE.lock() {
         *state = None;
     }
     publish_interrupt_level(false);
-    *super::switch() = terra_vsock_device::VsockSwitch::new();
+    super::switch().restart();
 }
 
 #[cfg(test)]
@@ -390,7 +393,7 @@ mod tests {
     }
 
     #[test]
-    fn guest_status_reset_keeps_lifecycle_policy() {
+    fn guest_status_reset_keeps_carrier_policy() {
         let _guard = crate::SWITCH_TEST_LOCK.lock().unwrap();
         super::super::CLOSED.store(false, std::sync::atomic::Ordering::Release);
         *super::super::switch() = terra_vsock_device::VsockSwitch::new();
@@ -410,21 +413,11 @@ mod tests {
             pending: [false; 2],
         };
         write_transport(&mut state, 0x70, &0_u32.to_le_bytes()).unwrap();
-        super::super::switch().rx(
-            &request(terra_vsock_device::DIAGNOSTIC_VSOCK_PORT, 100),
-            &[],
-        );
+        super::super::switch().rx(&request(terra_vsock_device::MUX_VSOCK_PORT, 100), &[]);
         assert_eq!(super::super::switch().take_replies()[0].header.op, RESPONSE);
 
-        super::super::switch().rx(&request(terra_vsock_device::CONTROL_VSOCK_PORT, 100), &[]);
-        super::super::switch().take_replies();
         write_transport(&mut state, 0x70, &0_u32.to_le_bytes()).unwrap();
-        for port in [
-            terra_vsock_device::CONTROL_VSOCK_PORT,
-            terra_vsock_device::DIAGNOSTIC_VSOCK_PORT,
-        ] {
-            super::super::switch().rx(&request(port, 101), &[]);
-        }
+        super::super::switch().rx(&request(terra_vsock_device::MUX_VSOCK_PORT, 101), &[]);
         assert!(
             super::super::switch()
                 .take_replies()

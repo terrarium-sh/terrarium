@@ -1,20 +1,21 @@
-use crate::vsock::{VMADDR_CID_HOST, connect};
 use anyhow::{Context, Result, bail};
 use rustix::mount::{MountFlags, MountPropagationFlags};
 use std::fs::{self, File};
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
-use std::time::Duration;
-use terra_protocol::{
-    CLOCK_SYNC, CLOCK_SYNC_BYTES, CONTROL_VSOCK_PORT, DIAGNOSTIC_VSOCK_PORT, Plan,
-    RESIZE2FS_GUEST_PATH, ROOT_DEVICE,
-};
+use terra_protocol::{CLOCK_SYNC, CLOCK_SYNC_BYTES, Plan, RESIZE2FS_GUEST_PATH, ROOT_DEVICE};
 
 const CLEAN_MOUNT: &str = "/mnt/clean";
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-const DIAGNOSTIC_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
+pub(super) struct Boot {
+    pub(super) plan: Plan,
+    pub(super) control: File,
+    pub(super) diagnostic: File,
+    pub(super) clients: tokio::sync::mpsc::Receiver<File>,
+    pub(super) mux: crate::mux::GuestMux,
+}
 
-pub(super) fn enter_root() -> Result<(Plan, File, File)> {
+pub(super) fn enter_root() -> Result<Boot> {
     const NEWROOT: &str = "/mnt/root";
 
     mount(None, "/proc", Some("proc"), MountFlags::empty()).context("mounting /proc")?;
@@ -34,23 +35,18 @@ pub(super) fn enter_root() -> Result<(Plan, File, File)> {
     fs::create_dir_all(NEWROOT)?;
     fs::create_dir_all(CLEAN_MOUNT)?;
 
-    let mut control =
-        connect(VMADDR_CID_HOST, CONTROL_VSOCK_PORT).context("dialling the host control port")?;
+    let crate::mux::Streams {
+        mut control,
+        diagnostic,
+        clients,
+        driver: mux,
+    } = crate::mux::GuestMux::connect()?;
     let plan: Plan =
         terra_protocol::read_frame_with_limit(&mut control, terra_protocol::MAX_PLAN_BYTES)
             .context("reading the boot plan")?
             .ok_or_else(|| anyhow::anyhow!("control channel closed before receiving boot plan"))?;
     setup_env(&plan);
     apply_host_state(&plan)?;
-    let diagnostic = connect(VMADDR_CID_HOST, DIAGNOSTIC_VSOCK_PORT)
-        .context("dialling the host diagnostic port")?;
-    rustix::net::sockopt::set_socket_timeout(
-        &diagnostic,
-        rustix::net::sockopt::Timeout::Send,
-        Some(DIAGNOSTIC_WRITE_TIMEOUT),
-    )
-    .context("setting the host diagnostic write deadline")?;
-
     grow_filesystem(ROOT_DEVICE);
     for volume in &plan.volumes {
         grow_filesystem(&volume.dev);
@@ -93,7 +89,13 @@ pub(super) fn enter_root() -> Result<(Plan, File, File)> {
     )?;
     fs::set_permissions("/run", fs::Permissions::from_mode(0o755))?;
     apply_tz(plan.host_tz.as_deref());
-    Ok((plan, control, diagnostic))
+    Ok(Boot {
+        plan,
+        control,
+        diagnostic,
+        clients,
+        mux,
+    })
 }
 
 fn grow_filesystem(device: &str) {

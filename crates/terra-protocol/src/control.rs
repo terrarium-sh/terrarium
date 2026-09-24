@@ -53,9 +53,6 @@ fn deserialize_diagnostic<'de, D: serde::Deserializer<'de>>(
     Ok(bytes)
 }
 
-pub const AGENT_VSOCK_PORT: u32 = 6000;
-pub const CONTROL_VSOCK_PORT: u32 = 6001;
-pub const DIAGNOSTIC_VSOCK_PORT: u32 = 6002;
 pub const CLOCK_SYNC: u8 = b'T';
 pub const CLOCK_SYNC_BYTES: usize = 13;
 

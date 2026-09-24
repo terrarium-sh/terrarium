@@ -40,8 +40,10 @@ def update_rust(files):
             latest = "nightly-" + manifest["date"]
             if latest <= current:
                 continue
-            if not manifest["pkg"]["rust-std"]["target"].get("wasm32-unknown-unknown", {}).get("available"):
-                raise ValueError(f"{latest} does not provide wasm32-unknown-unknown")
+            targets = manifest["pkg"]["rust-std"]["target"]
+            for target in ("wasm32-unknown-unknown", "wasm32-wasip3"):
+                if not targets.get(target, {}).get("available"):
+                    raise ValueError(f"{latest} does not provide {target}")
             replace_pattern(files, re.escape(current), latest)
 
 

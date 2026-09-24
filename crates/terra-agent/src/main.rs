@@ -15,6 +15,8 @@ mod hooks;
 #[cfg(target_os = "linux")]
 mod mutex;
 #[cfg(target_os = "linux")]
+mod mux;
+#[cfg(target_os = "linux")]
 mod reap;
 #[cfg(target_os = "linux")]
 mod sync;
@@ -56,15 +58,21 @@ const AGENT_FAILED: i32 = 1;
 
 #[cfg(target_os = "linux")]
 fn main() -> ! {
-    let (control, outcome) = match bootstrap::enter_root() {
-        Ok((plan, control, diagnostic)) => {
-            let outcome = run_agent(&plan, &control, diagnostic);
+    let (control, outcome, _mux) = match bootstrap::enter_root() {
+        Ok(bootstrap::Boot {
+            plan,
+            control,
+            diagnostic,
+            clients,
+            mux,
+        }) => {
+            let outcome = run_agent(&plan, &control, diagnostic, clients);
             if let Ok(flags) = rustix::fs::fcntl_getfl(&control) {
                 let _ = rustix::fs::fcntl_setfl(&control, flags & !rustix::fs::OFlags::NONBLOCK);
             }
-            (Some(control), outcome)
+            (Some(control), outcome, Some(mux))
         }
-        Err(error) => (None, Err(error)),
+        Err(error) => (None, Err(error), None),
     };
     if let Err(error) = &outcome {
         eprintln!("terra-agent: init failed: {error:#}");
@@ -94,7 +102,12 @@ fn main() -> ! {
 
 #[cfg(target_os = "linux")]
 #[tokio::main]
-async fn run_agent(plan: &Plan, control: &File, diagnostic: File) -> Result<i32> {
+async fn run_agent(
+    plan: &Plan,
+    control: &File,
+    diagnostic: File,
+    clients: tokio::sync::mpsc::Receiver<File>,
+) -> Result<i32> {
     let control_reader = crate::into_async_file(control.try_clone()?)?;
     let diagnostic = Diagnostics::new(diagnostic)?;
     let stop = CancellationToken::new();
@@ -107,7 +120,16 @@ async fn run_agent(plan: &Plan, control: &File, diagnostic: File) -> Result<i32>
         shutdown.clone(),
     ));
     diagnostic.record(b"agent received boot plan");
-    let outcome = workload::execute(plan, control, &diagnostic, &stop, &shutdown, &tasks).await;
+    let outcome = workload::execute(
+        plan,
+        control,
+        &diagnostic,
+        &stop,
+        &shutdown,
+        &tasks,
+        clients,
+    )
+    .await;
     shutdown.cancel();
     tasks.close();
     tasks.wait().await;
