@@ -1,5 +1,4 @@
-//! What may name a box: the name alphabet, the words terra's CLI keeps for
-//! itself, and how arbitrary text is reduced to that alphabet.
+//! Storage names and the additional restrictions on box names.
 
 use anyhow::{Result, bail};
 use std::ffi::OsStr;
@@ -26,6 +25,22 @@ pub(crate) fn is_recipe_ext(extension: &OsStr) -> bool {
     extension == "yaml" || extension == "yml"
 }
 
+pub(crate) fn validate_storage_name(name: &str) -> Result<()> {
+    anyhow::ensure!(
+        !name.is_empty()
+            && name.len() <= 255
+            && !name.ends_with('.')
+            && !is_windows_device_name(name)
+            && name
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-' | b'_')),
+        "invalid storage name '{}': use 1-255 ASCII letters, digits, '.', '-', or '_', \
+         without a trailing dot or a Windows device name",
+        crate::render::escape_printable(name)
+    );
+    Ok(())
+}
+
 /// Refuse a name that could not be a state subdirectory or fit a socket path,
 /// before anything is built under it.
 pub fn validate_box_name(name: &str) -> Result<()> {
@@ -43,14 +58,9 @@ pub fn validate_box_name(name: &str) -> Result<()> {
         );
     }
     // A leading `_` is reserved for terra's own argv words (`__vm`).
-    let ok = !name.is_empty()
+    let ok = validate_storage_name(name).is_ok()
         && name.len() <= 32
-        && !name.starts_with(['.', '-', '_'])
-        && !name.ends_with('.')
-        && !is_windows_device_name(name)
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_');
+        && !name.starts_with(['.', '-', '_']);
     if !ok {
         bail!(
             "'{}' cannot name a box: a name is 1-32 characters of [a-z A-Z 0-9 . - _], \
@@ -97,6 +107,37 @@ fn is_windows_device_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storage_names_have_one_alphabet_on_every_platform() {
+        for name in ["data", "DATA", ".gitignore", "a-b_c.txt", &"x".repeat(255)] {
+            assert!(validate_storage_name(name).is_ok(), "{name}");
+        }
+        for name in [
+            "",
+            ".",
+            "..",
+            "café",
+            "cafe\u{301}",
+            "ß",
+            "ſ",
+            "CON",
+            "con.txt",
+            "LPT9",
+            "COM1.log",
+            "a/b",
+            "a\\b",
+            "a:stream",
+            "a b",
+            "a.",
+            "a ",
+            "LONGFI~1",
+            "a\0b",
+            &"x".repeat(256),
+        ] {
+            assert!(validate_storage_name(name).is_err(), "{name}");
+        }
+    }
 
     #[test]
     fn box_names_are_validated() {

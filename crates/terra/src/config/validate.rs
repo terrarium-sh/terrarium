@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::{Config, MIN_MEM_MIB};
@@ -110,23 +110,14 @@ fn validate_volumes(cfg: &Config) -> Result<()> {
     }
     let mut seen = HashSet::new();
     for v in &cfg.volumes {
-        // The name becomes a host filename in the box's state dir: no
-        // separators, no traversal.
-        if matches!(v.name.as_str(), "" | "." | "..")
-            || v.name
-                .contains(['/', '\\', ':', '*', '?', '"', '<', '>', '|'])
-            || v.name.chars().any(char::is_control)
-            || v.name.len() > 247
-        {
+        crate::name::validate_storage_name(&v.name).context("invalid volume name")?;
+        anyhow::ensure!(
+            v.name.len() <= 247,
+            "volume names must be at most 247 characters; shorten the name"
+        );
+        if !seen.insert(v.name.to_ascii_lowercase()) {
             bail!(
-                "volume name '{}' must be a plain name (it names the image file)",
-                crate::render::escape_printable(&v.name)
-            );
-        }
-        // Two volumes on one image would mount the same ext4 read-write twice.
-        if !seen.insert(v.name.to_lowercase()) {
-            bail!(
-                "duplicate volume name '{}'",
+                "duplicate volume name '{}' (names are case-insensitive); rename one volume",
                 crate::render::escape_printable(&v.name)
             );
         }

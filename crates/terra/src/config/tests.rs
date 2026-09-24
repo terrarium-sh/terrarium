@@ -745,3 +745,41 @@ fn volume_names_reject_windows_filename_metacharacters() {
         assert!(validate(&cfg).is_err());
     }
 }
+
+/// Unicode normalization and case aliases must never attach one ext4 image twice.
+#[test]
+fn volume_names_reject_unicode_and_ascii_case_aliases_on_every_platform() {
+    for (first, second) in [
+        ("café", "cafe\u{301}"),
+        ("ß", "ss"),
+        ("ſ", "S"),
+        ("data", "DATA"),
+    ] {
+        let mut cfg = Config::default();
+        for (name, guest) in [(first, "/a"), (second, "/b")] {
+            cfg.volumes.push(Volume {
+                name: name.into(),
+                guest: guest.into(),
+                size_mib: 64,
+            });
+        }
+        assert!(validate(&cfg).is_err(), "{first}, {second}");
+    }
+    for name in [
+        "café",
+        "cafe\u{301}",
+        "ß",
+        "ſ",
+        "CON",
+        "data.",
+        "data space",
+    ] {
+        let mut cfg = Config::default();
+        cfg.volumes.push(Volume {
+            name: name.into(),
+            guest: "/data".into(),
+            size_mib: 64,
+        });
+        assert!(validate(&cfg).is_err(), "{name}");
+    }
+}

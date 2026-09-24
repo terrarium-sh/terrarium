@@ -25,8 +25,10 @@ pinned copy, so changing either file has no effect until `terra <box> setup`
 runs again. `terra <box> show` displays the pinned recipe and notes if the
 manifest now points elsewhere.
 
-The manifest is a map of references because a project directory can be mounted
-into a guest. Terra asks before pinning a recipe that a guest might have
-written; in noninteractive use, review it and pass `--trust-recipe`. Keep
-recipes as the policy document and read [security](security.md) before granting
-mounts or network access.
+Prefer keeping the manifest and its recipes outside guest-writable shares.
+Terra asks before pinning a recipe when current pins indicate that a guest
+could have written the recipe or manifest; in noninteractive use, review both
+and pass `--trust-recipe`. Removed shares are not tracked, so this warning
+cannot identify every guest-written file. See
+[recipe storage and trust](security.md#recipe-storage) before granting mounts
+or network access.

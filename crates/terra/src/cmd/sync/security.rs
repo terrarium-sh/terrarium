@@ -108,44 +108,9 @@ fn validate_windows_name(name: &str) -> Result<()> {
             && !name.ends_with(['.', ' '])
             && !name
                 .chars()
-                .any(|c| c.is_control() || "<>:\"/\\|?*".contains(c)),
-        "guest filename is not representable on Windows"
+                .any(|c| c.is_control() || "<>:\"/\\|?*~".contains(c)),
+        "sync name is not supported on Windows; rename devices, short-name aliases, or invalid characters"
     );
-    Ok(())
-}
-
-fn manifest_lookup_key(path: &str) -> String {
-    #[cfg(target_os = "macos")]
-    {
-        macos_manifest_lookup_key(path)
-    }
-    #[cfg(not(target_os = "macos"))]
-    if cfg!(windows) {
-        path.to_lowercase()
-    } else {
-        path.to_owned()
-    }
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn macos_manifest_lookup_key(path: &str) -> String {
-    use unicode_normalization::UnicodeNormalization;
-    path.nfd().flat_map(char::to_lowercase).nfd().collect()
-}
-
-pub(super) fn validate_case_aliases(
-    source: &BTreeMap<String, SyncEntry>,
-    target: &BTreeMap<String, SyncEntry>,
-) -> Result<()> {
-    let mut names = BTreeMap::new();
-    for path in source.keys().chain(target.keys()) {
-        if let Some(previous) = names.insert(manifest_lookup_key(path), path) {
-            anyhow::ensure!(
-                previous == path,
-                "sync paths differ only in case or Unicode normalization; rename one before syncing"
-            );
-        }
-    }
     Ok(())
 }
 
@@ -175,12 +140,13 @@ pub(super) fn validate_root_kind(
 pub(super) fn validate_download_links(
     source: &BTreeMap<String, SyncEntry>,
     destination: &BTreeMap<String, SyncEntry>,
+    resolve_component: &impl Fn(&str, &str) -> Result<String>,
 ) -> Result<()> {
     let mut links = BTreeMap::new();
     for (path, entry) in source.iter().chain(destination) {
         if entry.link_target.is_some() {
             links.insert(
-                manifest_lookup_key(path),
+                path.clone(),
                 [
                     source
                         .get(path)
@@ -195,7 +161,13 @@ pub(super) fn validate_download_links(
     let mut remaining_work = MAX_SYNC_LINK_WORK_BYTES;
     for (path, entry) in source {
         if let Some(target) = &entry.link_target {
-            validate_link_resolutions(path, target, &links, &mut remaining_work)?;
+            validate_link_resolutions(
+                path,
+                target,
+                &links,
+                &mut remaining_work,
+                resolve_component,
+            )?;
         }
     }
     Ok(())
@@ -213,6 +185,7 @@ fn validate_link_resolutions(
     target: &str,
     links: &BTreeMap<String, [Option<&str>; 2]>,
     remaining_work: &mut usize,
+    resolve_component: &impl Fn(&str, &str) -> Result<String>,
 ) -> Result<()> {
     validate_download_symlink_target(path, target)?;
     spend_link_work(remaining_work, path.len() + target.len() + 1)?;
@@ -236,10 +209,12 @@ fn validate_link_resolutions(
             }
             #[cfg(windows)]
             validate_windows_name(&component)?;
-            resolved.push(component);
+            let parent = resolved.join("/");
+            spend_link_work(remaining_work, parent.len())?;
+            resolved.push(resolve_component(&parent, &component)?);
             let name = resolved.join("/");
             spend_link_work(remaining_work, name.len())?;
-            if let Some(targets) = links.get(&manifest_lookup_key(&name)) {
+            if let Some(targets) = links.get(&name) {
                 for (index, target) in targets.iter().enumerate() {
                     if index == 1 && target == &targets[0] {
                         continue;
@@ -285,11 +260,11 @@ pub(super) fn validate_download_symlink_target(entry_rel_path: &str, target: &st
         "rejecting absolute symlink target '{target}' from guest"
     );
     #[cfg(windows)]
+    for component in target
+        .split('/')
+        .filter(|part| !matches!(*part, "" | "." | ".."))
     {
-        anyhow::ensure!(
-            !target.starts_with('\\') && !target.contains(':'),
-            "rejecting Windows absolute/drive symlink target '{target}' from guest"
-        );
+        validate_windows_name(component)?;
     }
     let parent_depth = if entry_rel_path.is_empty() {
         0
@@ -321,32 +296,42 @@ mod tests {
     use super::super::test_support::entry;
     use super::*;
 
+    fn validate_links(
+        source: &BTreeMap<String, SyncEntry>,
+        destination: &BTreeMap<String, SyncEntry>,
+    ) -> Result<()> {
+        validate_download_links(
+            source,
+            destination,
+            &|_, component| Ok(component.to_owned()),
+        )
+    }
+
     #[test]
-    fn macos_lookup_keys_match_canonical_unicode_variants() {
-        for (composed, decomposed) in [("CAFÉ", "cafe\u{301}"), ("각", "\u{1100}\u{1161}\u{11a8}")]
-        {
-            assert_eq!(
-                macos_manifest_lookup_key(composed),
-                macos_manifest_lookup_key(decomposed)
-            );
+    fn sync_manifests_accept_unicode_names() {
+        for name in [
+            "café",
+            "cafe\u{301}",
+            "ß",
+            "ſ",
+            "日本語",
+            "file with spaces",
+        ] {
+            let entries = BTreeMap::from([(name.into(), entry(name, SyncEntryKind::File, None))]);
+            validate_manifest(&entries).unwrap();
+            validate_download_symlink_target("link", name).unwrap();
         }
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
-    fn downloaded_links_cannot_escape_through_unicode_aliases() {
-        for (name, alias) in [("café", "cafe\u{301}"), ("cafe\u{301}", "café")] {
-            let destination = BTreeMap::from([(
-                name.into(),
-                entry(name, SyncEntryKind::Symlink, Some("/outside")),
-            )]);
-            let source = BTreeMap::from([(
-                "link".into(),
-                entry("link", SyncEntryKind::Symlink, Some(alias)),
-            )]);
-            assert!(validate_download_links(&source, &destination).is_err());
-            let source = BTreeMap::from([(alias.into(), entry(alias, SyncEntryKind::File, None))]);
-            assert!(validate_case_aliases(&source, &destination).is_err());
+    fn windows_names_reject_devices_streams_and_short_aliases() {
+        for name in [
+            "NUL", "con.txt", "COM1", "COM¹", "a:stream", "a\\b", "a.", "a ", "LONGFI~1",
+        ] {
+            assert!(validate_windows_name(name).is_err(), "{name}");
+        }
+        for name in ["café", "日本語", "file with spaces.txt"] {
+            validate_windows_name(name).unwrap();
         }
     }
 
@@ -356,15 +341,15 @@ mod tests {
             ("a".into(), entry("a", SyncEntryKind::Symlink, Some("."))),
             ("b".into(), entry("b", SyncEntryKind::Symlink, Some("a/.."))),
         ]);
-        assert!(validate_download_links(&source, &BTreeMap::new()).is_err());
+        assert!(validate_links(&source, &BTreeMap::new()).is_err());
         source.get_mut("b").unwrap().link_target = Some("a/safe".into());
-        assert!(validate_download_links(&source, &BTreeMap::new()).is_ok());
+        assert!(validate_links(&source, &BTreeMap::new()).is_ok());
         let destination = BTreeMap::from([(
             "outside".into(),
             entry("outside", SyncEntryKind::Symlink, Some("/tmp")),
         )]);
         source.get_mut("b").unwrap().link_target = Some("outside/file".into());
-        assert!(validate_download_links(&source, &destination).is_err());
+        assert!(validate_links(&source, &destination).is_err());
     }
 
     #[test]
@@ -383,8 +368,8 @@ mod tests {
             "d/up".into(),
             entry("d/up", SyncEntryKind::Symlink, Some("..")),
         )]);
-        assert!(validate_download_links(&source, &BTreeMap::new()).is_ok());
-        assert!(validate_download_links(&source, &destination).is_err());
+        assert!(validate_links(&source, &BTreeMap::new()).is_ok());
+        assert!(validate_links(&source, &destination).is_err());
     }
 
     /// Resolution work, including branches through old and new targets, consumes
@@ -393,29 +378,33 @@ mod tests {
     fn link_resolution_budget_is_shared_across_source_links() {
         let links = BTreeMap::from([("alias".into(), [Some("."), Some("subdir")])]);
         let mut remaining = MAX_SYNC_LINK_WORK_BYTES;
-        validate_link_resolutions("a", "alias/file", &links, &mut remaining).unwrap();
+        validate_link_resolutions(
+            "a",
+            "alias/file",
+            &links,
+            &mut remaining,
+            &|_, component| Ok(component.to_owned()),
+        )
+        .unwrap();
         let used = MAX_SYNC_LINK_WORK_BYTES - remaining;
         remaining = 2 * used - 1;
-        validate_link_resolutions("a", "alias/file", &links, &mut remaining).unwrap();
-        let error =
-            validate_link_resolutions("b", "alias/file", &links, &mut remaining).unwrap_err();
+        validate_link_resolutions(
+            "a",
+            "alias/file",
+            &links,
+            &mut remaining,
+            &|_, component| Ok(component.to_owned()),
+        )
+        .unwrap();
+        let error = validate_link_resolutions(
+            "b",
+            "alias/file",
+            &links,
+            &mut remaining,
+            &|_, component| Ok(component.to_owned()),
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("work limit"), "{error:#}");
-    }
-
-    #[test]
-    fn windows_names_cannot_alias_devices_or_streams() {
-        for name in [
-            "NUL",
-            "con.txt",
-            "COM1",
-            "a:stream",
-            "a\\b",
-            "trailing.",
-            "trailing ",
-        ] {
-            assert!(validate_windows_name(name).is_err(), "{name}");
-        }
-        assert!(validate_windows_name("normal.txt").is_ok());
     }
 
     #[test]

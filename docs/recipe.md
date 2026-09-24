@@ -5,6 +5,11 @@ and workload. `terra setup` pins a copy in the box. Edit the source recipe and
 run setup again to apply a change. A project's `terra.yaml` maps box names to
 recipes; see [the manifest reference](manifest.md).
 
+Prefer storing recipes and manifests outside guest-writable shares. If your
+workflow requires sharing them writable, review them before setup, even after
+removing the share: guest-written files remain on the host. See
+[recipe storage and trust](security.md#recipe-storage).
+
 An empty recipe creates a box with 2 vCPUs, 1024 MiB RAM, a 512 MiB writable
 root filesystem, an interactive shell, no host mounts, and no network.
 
@@ -68,8 +73,12 @@ removes images for volumes no longer named by the recipe; `storage prune` remove
 those orphaned volume images without rebuilding the root filesystem. A box has
 at most 32 combined host-directory mounts and volumes on x86_64, or 11 on AArch64.
 
-`volumes` are persistent private guest disks. Each needs a unique plain `name`,
+`volumes` are persistent private guest disks. Each needs a unique portable `name`,
 an absolute `guest` path, and a positive `size_mib`; writes past the size fail.
+Names use 1-247 ASCII letters, digits, `.`, `-`, or `_`, without a trailing dot or
+a Windows device name such as `CON`. Names must be distinct ignoring ASCII case
+on every platform; Unicode volume IDs are unsupported. The length limit leaves
+room for the image filename prefix and suffix.
 They survive restarts and are removed by `terra rm`.
 
 ## Mounts and environment

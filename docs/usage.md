@@ -72,7 +72,8 @@ compares SHA-256 instead; matching contents need no transfer. `--delete` removes
 extras only inside the selected destination subtree, after successful transfers.
 File-to-directory and directory-to-file conflicts still fail with `--delete`;
 remove the conflicting destination entry before retrying.
-`--dry-run` previews these actions without modifying either side.
+`--dry-run` previews these actions without copying, replacing, or deleting
+destination entries. Download validation still creates temporary name probes.
 
 Sync preserves modification times and supported permission bits. It copies
 symlinks without following them; downloaded links must resolve within the
@@ -85,8 +86,21 @@ stop and restart the box before syncing.
 Links inside the synchronized tree are copied as links, never traversed as
 directories. A selected root that is itself a symlink is treated as a link;
 use its target path to synchronize the directory's contents. Parents above
-the selected root resolve normally. On macOS, paths that differ only in case
-or Unicode normalization are rejected when they would alias another entry.
+the selected root resolve normally. Unicode filenames are supported. Before a
+download, temporary name-only entries on the destination filesystem check for
+collisions between incoming and existing names and resolve aliases in symlink
+chains. Distinct spellings that identify the same destination entry are rejected;
+rename one before syncing. Case-sensitive filesystems can retain distinct names.
+
+Name probes require writable destination directories, even for a dry run. Missing
+directories are modeled under an existing ancestor. Probes are removed and parent
+modification times restored before transfers begin; filesystem change events and
+change times may still reflect the probes. Directories whose comparison settings
+are not inherited by the probes are rejected. Windows additionally rejects device
+names, invalid filename characters, trailing dots or spaces, and names or link
+targets containing `~`, because DOS short-name aliases cannot be reproduced
+reliably in a temporary directory.
+
 Metadata-only downloads to files with multiple hard links fail; replace the
 destination file with an independent copy before retrying. Keep the host
 destination quiet during a download, including any guest-writable share of it.

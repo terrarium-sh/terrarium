@@ -2,6 +2,7 @@
 
 mod endpoint;
 mod exec;
+mod names;
 mod plan;
 mod scan;
 mod security;
@@ -497,6 +498,148 @@ mod tests {
         assert_eq!(
             meta_mtime_secs(&std::fs::metadata(&destination).unwrap()),
             100
+        );
+    }
+
+    #[tokio::test]
+    async fn unicode_download_preserves_dry_run_contents_and_directory_timestamps() {
+        let scratch = tempfile::tempdir().unwrap();
+        let destination = scratch.path().join("destination");
+        std::fs::create_dir_all(destination.join("日本語")).unwrap();
+        std::fs::write(destination.join("extra"), b"keep until successful transfer").unwrap();
+        let root_modified = destination.metadata().unwrap().modified().unwrap();
+        let child_modified = destination
+            .join("日本語")
+            .metadata()
+            .unwrap()
+            .modified()
+            .unwrap();
+        let mut args = SyncArgs {
+            src: ":/source/".into(),
+            dst: destination.to_str().unwrap().into(),
+            delete: true,
+            checksum: false,
+            dry_run: true,
+            agent: crate::cli::AgentTimeoutArg {
+                agent_timeout: None,
+            },
+        };
+        let Transfer::Download {
+            guest: src,
+            host: dst,
+        } = parse_endpoints(&args.src, &args.dst).unwrap()
+        else {
+            panic!("expected download");
+        };
+        let replies = [
+            SyncReply::SessionReady {
+                root_status: RootStatus::ExistingDirectory,
+            },
+            SyncReply::Entry(entry("", SyncEntryKind::Directory, None)),
+            SyncReply::Entry(entry("日本語", SyncEntryKind::Directory, None)),
+            SyncReply::Entry(entry("日本語/café.txt", SyncEntryKind::File, None)),
+            SyncReply::ScanComplete,
+            SyncReply::ReadFileReady {
+                size: 0,
+                mode: 0o755,
+                mtime_secs: 100,
+                mtime_nanos: 0,
+            },
+            SyncReply::Success,
+            SyncReply::Success,
+        ];
+        sync_guest_to_host(&mut peer(&replies), &src, &dst, &args)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(destination.join("extra")).unwrap(),
+            b"keep until successful transfer"
+        );
+        assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 2);
+        assert_eq!(
+            std::fs::read_dir(destination.join("日本語"))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert_eq!(
+            destination.metadata().unwrap().modified().unwrap(),
+            root_modified
+        );
+        assert_eq!(
+            destination
+                .join("日本語")
+                .metadata()
+                .unwrap()
+                .modified()
+                .unwrap(),
+            child_modified
+        );
+
+        args.dry_run = false;
+        sync_guest_to_host(&mut peer(&replies), &src, &dst, &args)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(destination.join("日本語/café.txt")).unwrap(),
+            b""
+        );
+        assert!(!destination.join("extra").exists());
+        assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 1);
+        assert_eq!(
+            std::fs::read_dir(destination.join("日本語"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn unrepresentable_names_fail_before_transfers_or_deletions() {
+        let destination = tempfile::tempdir().unwrap();
+        std::fs::write(destination.path().join("extra"), b"keep").unwrap();
+        let modified = destination.path().metadata().unwrap().modified().unwrap();
+        let args = SyncArgs {
+            src: ":/source/".into(),
+            dst: destination.path().to_str().unwrap().into(),
+            delete: true,
+            checksum: false,
+            dry_run: false,
+            agent: crate::cli::AgentTimeoutArg {
+                agent_timeout: None,
+            },
+        };
+        let Transfer::Download {
+            guest: src,
+            host: dst,
+        } = parse_endpoints(&args.src, &args.dst).unwrap()
+        else {
+            panic!("expected download");
+        };
+        let replies = [
+            SyncReply::SessionReady {
+                root_status: RootStatus::ExistingDirectory,
+            },
+            SyncReply::Entry(entry("", SyncEntryKind::Directory, None)),
+            SyncReply::Entry(entry("a", SyncEntryKind::File, None)),
+            SyncReply::Entry(entry(&"x".repeat(300), SyncEntryKind::File, None)),
+            SyncReply::ScanComplete,
+        ];
+        let error = sync_guest_to_host(&mut peer(&replies), &src, &dst, &args)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("cannot be created"),
+            "{error:#}"
+        );
+        assert_eq!(
+            std::fs::read(destination.path().join("extra")).unwrap(),
+            b"keep"
+        );
+        assert_eq!(std::fs::read_dir(destination.path()).unwrap().count(), 1);
+        assert_eq!(
+            destination.path().metadata().unwrap().modified().unwrap(),
+            modified
         );
     }
 }

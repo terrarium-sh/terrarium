@@ -164,7 +164,7 @@ pub enum Cmd {
                            terra dev sync box:/app/output/ ./output/ Sync guest output into host\n    \
                            terra dev sync --delete ./src/ :/app/     Sync and delete destination extras\n    \
                            terra dev sync --checksum ./src/ :/app/   Compare file contents using SHA-256\n    \
-                           terra dev sync --dry-run ./src/ :/app/    Preview planned actions without modifying anything")]
+                           terra dev sync --dry-run ./src/ :/app/    Preview planned transfers and deletions")]
     Sync(SyncArgs),
     /// Show a box's host diagnostics, rotated as it grows. `--diagnostics` shows guest VM
     /// diagnostics instead; both are replayed after a failed boot. The workload's
@@ -326,7 +326,7 @@ pub struct SyncArgs {
     /// Compare file contents by SHA-256 digest instead of size and timestamp.
     #[arg(long)]
     pub checksum: bool,
-    /// Show what would be transferred or deleted without performing any changes.
+    /// Preview transfers and deletions; downloads create temporary name probes.
     #[arg(long)]
     pub dry_run: bool,
     #[command(flatten)]

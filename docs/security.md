@@ -27,6 +27,26 @@ The shipped binary embeds precompiled Wasmtime components. Deserializing an
 AOT component is trusted native-code loading, so those artifacts must come from
 the matching Terra build; guest or network input must never supply them.
 
+### Recipe storage
+
+Ideally, keep source recipes and the `terra.yaml` manifest outside every
+guest-writable share. Share only the workload's files, or use a read-only
+mount where the guest needs to read recipes. A separate read-only mount does
+not protect a recipe that the guest can also reach through a writable share.
+
+Terra permits recipes in writable shares when a workflow requires it, but a
+guest can create or modify those recipes, or change which recipe a manifest
+selects. Review both files before approving setup; `--trust-recipe` is the
+operator's approval of their contents.
+
+The guest-authorship check uses currently pinned writable shares, without a
+history of removed grants. Removing a share and running setup removes its
+mount pin, but does not delete or make trustworthy any files the guest left
+on the host. If you later select such a recipe, especially for a new box,
+Terra may no longer warn that a guest could have authored it. This remains
+possible after the guest has shut down. Review files from former shares as
+untrusted input rather than relying on the absence of a warning.
+
 ## Recipe grants
 
 | Recipe feature | Authority it grants |

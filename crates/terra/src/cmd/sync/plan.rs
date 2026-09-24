@@ -1,7 +1,6 @@
 use super::exec::{COPY_DATA_TIMEOUT, read_reply, send_request};
-use super::security::{
-    effective_mode, validate_case_aliases, validate_download_links, validate_manifest,
-};
+use super::names::HostNames;
+use super::security::{effective_mode, validate_download_links, validate_manifest};
 use crate::sys;
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
@@ -58,7 +57,6 @@ pub(super) fn validate_plan_conflicts(
 ) -> Result<()> {
     validate_manifest(source_entries)?;
     validate_manifest(target_entries)?;
-    validate_case_aliases(source_entries, target_entries)?;
 
     for (path, src) in source_entries {
         if let Some(dst) = target_entries.get(path) {
@@ -239,7 +237,14 @@ pub(super) async fn build_plan(
 ) -> Result<Vec<PlanAction>> {
     validate_plan_conflicts(source_entries, target_entries)?;
     if direction == SyncDirection::GuestToHost {
-        validate_download_links(source_entries, target_entries)?;
+        let names = HostNames::new(host_target_root, source_entries, target_entries)?;
+        let validation =
+            validate_download_links(source_entries, target_entries, &|parent, component| {
+                names.resolve_component(parent, component)
+            });
+        let cleanup = names.close();
+        validation?;
+        cleanup?;
     }
 
     let mut actions = Vec::new();

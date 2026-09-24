@@ -36,6 +36,7 @@ terra-platform = { path = "../terra-platform" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "sync", "time"] }
 libc.workspace = true
 rustix.workspace = true
+tempfile.workspace = true
 sha2 = { version = "0.11", default-features = false }
 tracing-appender = "0.2"
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
@@ -43,17 +44,12 @@ log = "0.4.34"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "registry", "tracing-log", "std"] }
 
 
-[target.'cfg(target_os = "macos")'.dependencies]
-unicode-normalization = "0.1"
-
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_Pipes", "Win32_System_Threading"] }
 
 [dev-dependencies]
 notify = "8.2"
-unicode-normalization = "0.1"
 clap_mangen = "0.3"
-tempfile.workspace = true
 
 [lints]
 workspace = true
