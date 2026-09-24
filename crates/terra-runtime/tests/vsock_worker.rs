@@ -391,7 +391,7 @@ async fn pump_carrier(
             sent = sent.wrapping_add(u32::try_from(count).expect("frame length"));
         }
         let (batch,) = replies
-            .call_concurrent(&accessor, (16, 64 * 1024))
+            .call_concurrent(&accessor, (16, 32 * 1024))
             .await
             .expect("carrier replies");
         for reply in batch {

@@ -515,14 +515,7 @@ fn commit_import(bx: &BoxRef, staged: &[(PathBuf, PathBuf)]) -> Result<()> {
     }
     record.committed = true;
     write_import_journal(&journal, &record)?;
-    for (_, backup) in committed {
-        if let Some(backup) = backup {
-            std::fs::remove_file(&backup).with_context(|| {
-                format!("images restored; removing backup {}", backup.display())
-            })?;
-        }
-    }
-    std::fs::remove_file(&journal).with_context(|| format!("removing {}", journal.display()))
+    recover_import(bx)
 }
 
 fn write_import_journal(path: &Path, record: &ImportJournal) -> Result<()> {
@@ -543,6 +536,22 @@ pub(crate) fn recover_import(bx: &BoxRef) -> Result<()> {
     );
     let staging = bx.get_dir().join(&record.staging);
     if record.committed {
+        if record
+            .entries
+            .iter()
+            .any(|entry| entry.image == crate::state::ROOTFS_FILE)
+        {
+            let stamp = bx.get_dir().join(crate::state::BAKE_STAMP);
+            match std::fs::remove_file(&stamp) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| format!("removing {}", stamp.display()));
+                }
+            }
+            #[cfg(unix)]
+            File::open(bx.get_dir())?.sync_all()?;
+        }
         if let Err(error) = std::fs::remove_dir_all(&staging)
             && error.kind() != std::io::ErrorKind::NotFound
         {
@@ -670,6 +679,43 @@ mod tests {
     }
 
     #[test]
+    fn only_rootfs_imports_clear_the_bake_stamp() {
+        for name in [crate::state::ROOTFS_FILE, "vol-data.img"] {
+            let dir = tempfile::tempdir().unwrap();
+            let bx = BoxRef::from_state_dir(dir.path().to_owned(), dir.path());
+            let stamp = bx.get_dir().join(crate::state::BAKE_STAMP);
+            std::fs::write(&stamp, b"baked").unwrap();
+            let staging = dir.path().join(".import.test");
+            std::fs::create_dir(&staging).unwrap();
+            let stage = staging.join(name);
+            std::fs::write(&stage, b"new").unwrap();
+            commit_import(&bx, &[(dir.path().join(name), stage)]).unwrap();
+            assert_eq!(stamp.exists(), name != crate::state::ROOTFS_FILE);
+        }
+    }
+
+    #[test]
+    fn failed_stamp_removal_keeps_the_committed_journal_for_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let bx = BoxRef::from_state_dir(dir.path().to_owned(), dir.path());
+        let stamp = bx.get_dir().join(crate::state::BAKE_STAMP);
+        std::fs::create_dir(&stamp).unwrap();
+        let staging = dir.path().join(".import.test");
+        std::fs::create_dir(&staging).unwrap();
+        let stage = staging.join(crate::state::ROOTFS_FILE);
+        std::fs::write(&stage, b"new").unwrap();
+        let rootfs = dir.path().join(crate::state::ROOTFS_FILE);
+        std::fs::write(&rootfs, b"old").unwrap();
+        assert!(commit_import(&bx, &[(rootfs.clone(), stage)]).is_err());
+        assert!(dir.path().join(IMPORT_JOURNAL).exists());
+        assert!(recover_import(&bx).is_err());
+        std::fs::remove_dir(&stamp).unwrap();
+        recover_import(&bx).unwrap();
+        assert_eq!(std::fs::read(rootfs).unwrap(), b"new");
+        assert!(!dir.path().join(IMPORT_JOURNAL).exists());
+    }
+
+    #[test]
     fn import_commit_creates_missing_images() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("new.img");
@@ -755,6 +801,8 @@ mod tests {
                 let staging = dir.path().join(".import.test");
                 std::fs::create_dir(&staging).unwrap();
                 let names = ["rootfs.img", "vol-data.img", "vol-new.img"];
+                let stamp = bx.get_dir().join(crate::state::BAKE_STAMP);
+                std::fs::write(&stamp, b"baked").unwrap();
                 for (index, name) in names.iter().enumerate() {
                     if index < 2 {
                         std::fs::write(dir.path().join(name), b"old").unwrap();
@@ -798,6 +846,7 @@ mod tests {
                 .unwrap();
                 let lock = bx.lock_run().unwrap();
                 recover_import(&bx).unwrap();
+                assert_eq!(stamp.exists(), !committed);
                 for (index, name) in names.iter().enumerate() {
                     if committed || index < 2 {
                         assert_eq!(

@@ -173,7 +173,7 @@ mod tests {
         let unreadable = BoxRef::resolve(&projects.path().join("unreadable"), "dev").unwrap();
         for bx in [&visible, &unreadable] {
             std::fs::create_dir_all(bx.get_dir()).unwrap();
-            bx.write_origin();
+            bx.write_origin().unwrap();
         }
         let unreadable_project = unreadable.get_dir().parent().unwrap();
         std::fs::set_permissions(unreadable_project, std::fs::Permissions::from_mode(0o100))

@@ -262,6 +262,13 @@ pub fn request_recipe_approval(
     }
     let pinned_paths = (previous_paths.as_ref() != Some(&paths)).then_some(paths);
     config::merge_env_file(&mut cfg)?;
+    crate::vm::encode_boot_plan(&boot::BootSpec {
+        cfg: cfg.clone(),
+        project_dir: bx.get_project_dir().to_path_buf(),
+        root: false,
+        mode: terra_protocol::PlanMode::Run,
+        foreground: false,
+    })?;
     Ok(ApprovedRecipe {
         bx,
         cfg,
@@ -468,7 +475,7 @@ fn prepare_box_state_dir(bx: &BoxRef) -> Result<()> {
         .with_context(|| format!("creating box state {}", bx.get_dir().display()))?;
     sys::set_owner_only(bx.get_dir(), true)
         .with_context(|| format!("securing box state {}", bx.get_dir().display()))?;
-    bx.write_origin();
+    bx.write_origin()?;
     Ok(())
 }
 
@@ -533,6 +540,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn oversized_boot_plans_are_refused_after_dotenv_merge_before_preparation() {
+        let _home = crate::sys::TestHome::new();
+        let dir = tempfile::tempdir().unwrap();
+        for dotenv in [false, true] {
+            let bx = BoxRef::resolve(dir.path(), if dotenv { "merged" } else { "recipe" }).unwrap();
+            let recipe = if dotenv {
+                let value = "x".repeat(600 << 10);
+                std::fs::write(dir.path().join("large.env"), format!("EXTRA={value}")).unwrap();
+                format!("env:\n  RECIPE: {value}\nenv_file: large.env\n")
+            } else {
+                format!(
+                    "env:\n  RECIPE: {}\n",
+                    "x".repeat(terra_protocol::MAX_PLAN_BYTES)
+                )
+            };
+            assert!((recipe.len() as u64) < config::MAX_RECIPE_BYTES);
+            let target = ResolvedBox {
+                bx: bx.clone(),
+                source: resolve::Source::File(resolve::Recipe {
+                    from: dir.path().join("large.yaml"),
+                    text: recipe,
+                }),
+                manifest_divergence: None,
+            };
+            let error = request_recipe_approval(
+                target,
+                &Approval::ChosenByHand { trust_recipe: true },
+                false,
+                true,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("boot plan"), "{error:#}");
+            assert!(!bx.get_dir().exists());
+        }
+    }
+
+    #[test]
     fn another_projects_relative_share_makes_recipe_and_manifest_suspect() {
         let _home = crate::sys::TestHome::new();
         let root = tempfile::tempdir().unwrap();
@@ -542,7 +586,7 @@ mod tests {
         std::fs::create_dir_all(&target).unwrap();
         let writer = BoxRef::resolve(&origin, "writer").unwrap();
         std::fs::create_dir_all(writer.get_dir()).unwrap();
-        writer.write_origin();
+        writer.write_origin().unwrap();
         std::fs::write(
             writer.get_dir().join(state::RECIPE_FILE),
             "mounts:\n  - host: ../target\n    guest: /work\n",

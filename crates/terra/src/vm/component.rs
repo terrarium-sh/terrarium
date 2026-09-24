@@ -1,7 +1,7 @@
 //! Prepare native capabilities and start the embedded WASI VMM.
 
 use super::boot::BootSpec;
-use super::{build_plan, image};
+use super::{encode_boot_plan, image};
 use crate::policy::network::rules;
 use crate::policy::network::runtime;
 use crate::state::BoxRef;
@@ -12,12 +12,9 @@ use std::io::{Read as _, Write as _};
 use std::process::ExitCode;
 use std::sync::Arc;
 use terra_platform::io::local::{LocalListener, LocalStream};
-use terra_protocol::{
-    Disk, MAX_PLAN_BYTES, MAX_PLAN_HOST_STATE_BYTES, PlanMode, Share, encode_frame_with_limit,
-    to_volume_device,
-};
+use terra_protocol::PlanMode;
 use terra_runtime::TrustedArtifacts;
-use terra_runtime::component::fs::{ShareGrant, share_tag};
+use terra_runtime::component::fs::ShareGrant;
 use terra_runtime::orchestration::VmInput;
 
 #[allow(unsafe_code)]
@@ -38,32 +35,25 @@ const ARTIFACTS: TrustedArtifacts = {
     }
 };
 
-fn volume_disks(spec: &BootSpec, bx: &BoxRef) -> Result<(Vec<std::path::PathBuf>, Vec<Disk>)> {
+fn prepare_volume_disks(spec: &BootSpec, bx: &BoxRef) -> Result<Vec<std::path::PathBuf>> {
     let mut paths = Vec::with_capacity(spec.cfg.volumes.len());
-    let mut plan = Vec::with_capacity(spec.cfg.volumes.len());
-    for (index, volume) in spec.cfg.volumes.iter().enumerate() {
+    for volume in &spec.cfg.volumes {
         let path = bx.get_volume_image(&volume.name);
         image::ensure_volume_image(&path, volume.size_mib)
             .with_context(|| format!("preparing volume image {}", path.display()))?;
         paths.push(path);
-        plan.push(Disk {
-            dev: to_volume_device(index)
-                .with_context(|| format!("volume {index} is past the last guest block device"))?,
-            guest: volume.guest.to_string_lossy().into_owned(),
-        });
     }
-    Ok((paths, plan))
+    Ok(paths)
 }
 
-fn shares(spec: &BootSpec) -> Result<(Vec<ShareGrant>, Vec<Share>)> {
+fn open_shares(spec: &BootSpec) -> Result<Vec<ShareGrant>> {
     if spec.mode == PlanMode::Create {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok(Vec::new());
     }
 
     let mounts = &spec.cfg.mounts;
     let mut grants = Vec::with_capacity(mounts.len());
-    let mut plan = Vec::with_capacity(mounts.len());
-    for (index, mount) in mounts.iter().enumerate() {
+    for mount in mounts {
         grants.push(
             ShareGrant::new(&mount.host, mount.readonly).with_context(|| {
                 format!(
@@ -72,13 +62,8 @@ fn shares(spec: &BootSpec) -> Result<(Vec<ShareGrant>, Vec<Share>)> {
                 )
             })?,
         );
-        plan.push(Share {
-            tag: share_tag(index),
-            guest: mount.guest.to_string_lossy().into_owned(),
-            readonly: mount.readonly,
-        });
     }
-    Ok((grants, plan))
+    Ok(grants)
 }
 
 fn agent_listener(bx: &BoxRef) -> Result<LocalListener> {
@@ -131,11 +116,9 @@ pub async fn run(
     let kernel = image::load_kernel()?;
     let boot_disk = image::load_boot_image()?;
     let root_disk = bx.get_dir().join(crate::state::ROOTFS_FILE);
-    let (volume_disks, volumes) = volume_disks(spec, bx)?;
-    let (shares, plan_shares) = shares(spec)?;
-    let plan = build_plan(spec, plan_shares, volumes);
-    let plan = encode_frame_with_limit(&plan, MAX_PLAN_BYTES - MAX_PLAN_HOST_STATE_BYTES)
-        .context("serializing the boot plan")?;
+    let plan = encode_boot_plan(spec)?;
+    let volume_disks = prepare_volume_disks(spec, bx)?;
+    let shares = open_shares(spec)?;
     let listener = Some(agent_listener(bx)?);
     let port_mappings = if spec.mode == PlanMode::Run {
         rules::parse_port_mappings(&spec.cfg.network.ports)?
@@ -258,7 +241,8 @@ mod tests {
             mode: PlanMode::Run,
             foreground: false,
         };
-        let (grants, plan) = shares(&spec).unwrap();
+        let grants = open_shares(&spec).unwrap();
+        let plan = super::super::build_plan(&spec).unwrap().shares;
 
         assert!(grants[0].readonly);
         assert_eq!(plan[0].tag, "terra-share-0");
@@ -290,10 +274,10 @@ mod tests {
             mode: PlanMode::Run,
             foreground: false,
         };
-        assert!(shares(&spec).is_ok());
+        assert!(open_shares(&spec).is_ok());
         std::fs::remove_dir(&share).unwrap();
         crate::sys::symlink_dir(bx.get_dir(), &share).unwrap();
-        let error = shares(&spec).err().unwrap().to_string();
+        let error = open_shares(&spec).err().unwrap().to_string();
         assert!(error.contains("opening share"), "{error}");
 
         crate::sys::remove_directory_symlink(&share).unwrap();
@@ -302,11 +286,11 @@ mod tests {
         std::fs::create_dir(&child).unwrap();
         let mut spec = spec;
         spec.cfg.mounts[0].host = child;
-        assert!(shares(&spec).is_ok());
+        assert!(open_shares(&spec).is_ok());
         std::fs::remove_dir_all(&share).unwrap();
         std::fs::create_dir(bx.get_dir().join("child")).unwrap();
         crate::sys::symlink_dir(bx.get_dir(), &share).unwrap();
-        assert!(shares(&spec).is_err());
+        assert!(open_shares(&spec).is_err());
     }
 
     #[test]
@@ -325,7 +309,8 @@ mod tests {
             mode: PlanMode::Create,
             foreground: false,
         };
-        let (grants, plan) = shares(&spec).unwrap();
+        let grants = open_shares(&spec).unwrap();
+        let plan = super::super::build_plan(&spec).unwrap().shares;
 
         assert!(grants.is_empty());
         assert!(plan.is_empty());

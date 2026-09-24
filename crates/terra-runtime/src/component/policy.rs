@@ -90,6 +90,7 @@ impl PolicyFactory {
                 .build(),
         };
         let mut store = Store::new(&self.engine, host);
+        store.set_hostcall_fuel(terra_limits::MAX_COMPONENT_HOSTCALL_BYTES);
         store.limiter(|host| &mut host.limits);
         store.set_epoch_deadline(u64::MAX);
         store.set_fuel(CALL_FUEL)?;

@@ -34,7 +34,8 @@ use crate::render::{format_workload_line, redact_config_env, render_config_yaml}
     all(target_os = "macos", target_arch = "aarch64"),
     target_os = "windows"
 )))]
-use anyhow::{Result, bail};
+use anyhow::bail;
+use anyhow::{Context as _, Result};
 #[cfg(unix)]
 use std::fs::File;
 #[cfg(unix)]
@@ -84,12 +85,46 @@ pub async fn run(
     )
 }
 
+pub(crate) fn encode_boot_plan(spec: &BootSpec) -> Result<Vec<u8>> {
+    terra_protocol::encode_frame_with_limit(
+        &build_plan(spec)?,
+        terra_protocol::MAX_PLAN_BYTES - terra_protocol::MAX_PLAN_HOST_STATE_BYTES,
+    )
+    .context("boot plan exceeds its encoded size limit; reduce the recipe or environment")
+}
+
 /// The resolved config the agent runs as PID 1.
-pub(super) fn build_plan(spec: &BootSpec, shares: Vec<Share>, volumes: Vec<Disk>) -> Plan {
+fn build_plan(spec: &BootSpec) -> Result<Plan> {
     let cfg = &spec.cfg;
     let net = GUEST_NETWORK;
     let baking = spec.mode == PlanMode::Create;
-    Plan {
+    let shares = if baking {
+        Vec::new()
+    } else {
+        cfg.mounts
+            .iter()
+            .enumerate()
+            .map(|(index, mount)| Share {
+                tag: terra_runtime::component::fs::share_tag(index),
+                guest: mount.guest.to_string_lossy().into_owned(),
+                readonly: mount.readonly,
+            })
+            .collect()
+    };
+    let volumes = cfg
+        .volumes
+        .iter()
+        .enumerate()
+        .map(|(index, volume)| {
+            Ok(Disk {
+                dev: terra_protocol::to_volume_device(index).with_context(|| {
+                    format!("volume {index} is past the last guest block device")
+                })?,
+                guest: volume.guest.to_string_lossy().into_owned(),
+            })
+        })
+        .collect::<Result<_>>()?;
+    Ok(Plan {
         mode: spec.mode,
         workdir: cfg
             .workload
@@ -119,7 +154,7 @@ pub(super) fn build_plan(spec: &BootSpec, shares: Vec<Share>, volumes: Vec<Disk>
         host_tz: read_host_timezone(),
         host_time: None,
         host_seed: None,
-    }
+    })
 }
 
 /// What the agent writes to `/terra/README.md`, so an AI agent looking
@@ -206,16 +241,18 @@ mod tests {
             mode: PlanMode::Run,
             foreground: false,
         };
-        let shares = vec![Share {
-            tag: "sh0".into(),
+        let mut spec = spec;
+        spec.cfg.mounts = vec![config::Mount {
+            host: "/host/work".into(),
             guest: "/work".into(),
             readonly: true,
         }];
-        let volumes = vec![Disk {
-            dev: "/dev/vdc".into(),
+        spec.cfg.volumes = vec![config::Volume {
+            name: "data".into(),
             guest: "/data".into(),
+            size_mib: 1,
         }];
-        let plan = build_plan(&spec, shares, volumes);
+        let plan = build_plan(&spec).unwrap();
 
         assert_eq!(plan.workload, ["/bin/sh", "-c", "make"]);
         assert_eq!(plan.daemons, ["ascend --serve"]);
@@ -230,7 +267,7 @@ mod tests {
             foreground: true,
             ..spec
         };
-        let foreground_plan = build_plan(&foreground, vec![], vec![]);
+        let foreground_plan = build_plan(&foreground).unwrap();
         assert!(foreground_plan.await_initial_session);
     }
 
@@ -243,7 +280,7 @@ mod tests {
             mode: PlanMode::Create,
             foreground: false,
         };
-        assert!(build_plan(&spec, vec![], vec![]).await_initial_session);
+        assert!(build_plan(&spec).unwrap().await_initial_session);
     }
 
     /// A bake installs software into the box's filesystem, so it runs as guest
@@ -259,7 +296,7 @@ mod tests {
             mode,
             foreground: false,
         };
-        let plan = |root, mode| build_plan(&spec(root, mode), vec![], vec![]).root;
+        let plan = |root, mode| build_plan(&spec(root, mode)).unwrap().root;
 
         assert!(plan(false, PlanMode::Create), "a bake is root");
         assert!(plan(true, PlanMode::Create));

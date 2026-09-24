@@ -117,9 +117,10 @@ pub async fn run(
     let approved =
         setup::request_recipe_approval(target, &setup::Approval::Offer, is_at_a_terminal, false)?;
     let mode = choose_boot_mode(args, is_at_a_terminal)?;
-    let prepared = setup::prepare_box(&approved, setup::Rebuild::No)?;
     let project_dir = approved.bx.get_project_dir().to_path_buf();
-    let spec = boot::BootSpec::resolve(approved.cfg, args, project_dir, mode);
+    let spec = boot::BootSpec::resolve(approved.cfg.clone(), args, project_dir, mode);
+    crate::vm::encode_boot_plan(&spec)?;
+    let prepared = setup::prepare_box(&approved, setup::Rebuild::No)?;
 
     if !spec.cfg.hooks.on_create.is_empty()
         && (prepared.fresh_rootfs
@@ -146,6 +147,30 @@ mod tests {
     use super::*;
     use crate::sys::TestHome;
     use clap::Parser;
+
+    #[tokio::test]
+    async fn oversized_command_override_is_refused_before_preparing_the_box() {
+        let _home = TestHome::new();
+        let dir = tempfile::tempdir().unwrap();
+        let bx = BoxRef::resolve(dir.path(), "dev").unwrap();
+        std::fs::create_dir_all(bx.get_dir()).unwrap();
+        std::fs::write(bx.get_dir().join(crate::state::RECIPE_FILE), "{}").unwrap();
+        let paths =
+            crate::policy::mount::PinnedPaths::from_config(&crate::config::Config::default());
+        std::fs::write(
+            bx.get_dir().join(crate::state::PINNED_PATHS_FILE),
+            yaml_serde::to_string(&paths).unwrap(),
+        )
+        .unwrap();
+        let mut args = build_boot_args(&["--foreground"]);
+        args.command = vec!["echo".into(), "x".repeat(terra_protocol::MAX_PLAN_BYTES)];
+        let error = run(Some("dev"), &args, dir.path(), dir.path(), false)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("boot plan"), "{error:#}");
+        assert!(!bx.get_dir().join(crate::state::PID_FILE).exists());
+        assert!(!bx.get_dir().join(crate::state::ROOTFS_FILE).exists());
+    }
 
     /// The flags of a bare invocation, as clap parses them.
     fn build_boot_args(flags: &[&str]) -> BootArgs {

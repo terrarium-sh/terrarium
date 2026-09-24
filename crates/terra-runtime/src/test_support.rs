@@ -65,6 +65,7 @@ pub fn device_store_with_limits<H: DeviceHost>(
         .tables(8)
         .build();
     let mut store = Store::new(engine, StandaloneHost { host, limits });
+    store.set_hostcall_fuel(terra_limits::MAX_COMPONENT_HOSTCALL_BYTES);
     store.set_epoch_deadline(1);
     store.limiter(|host| &mut host.limits);
     store

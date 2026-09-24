@@ -263,17 +263,29 @@ mod tests {
     use super::*;
     use terra_protocol::{Net, Plan, PlanMode};
     #[test]
-    #[allow(unsafe_code)]
     fn setup_env_allows_plan_to_override_path_and_term_while_preserving_home() {
-        let orig_path = std::env::var("PATH").ok();
-        let orig_term = std::env::var("TERM").ok();
-        let orig_home = std::env::var("HOME").ok();
+        const CHILD: &str = "TERRA_TEST_SETUP_ENV_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "bootstrap::tests::setup_env_allows_plan_to_override_path_and_term_while_preserving_home", "--test-threads=1"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let inherited_path = std::env::var("PATH").ok();
         let mut env = std::collections::BTreeMap::new();
         env.insert(
             "PATH".to_string(),
             format!(
                 "/custom/bin:{}",
-                orig_path.as_deref().unwrap_or(DEFAULT_PATH)
+                inherited_path.as_deref().unwrap_or(DEFAULT_PATH)
             ),
         );
         env.insert("TERM".to_string(), "custom-term".to_string());
@@ -310,17 +322,5 @@ mod tests {
             std::env::var("HOME").unwrap(),
             terra_protocol::WORKLOAD_HOME
         );
-
-        unsafe {
-            if let Some(path) = orig_path {
-                std::env::set_var("PATH", path);
-            }
-            if let Some(term) = orig_term {
-                std::env::set_var("TERM", term);
-            }
-            if let Some(home) = orig_home {
-                std::env::set_var("HOME", home);
-            }
-        }
     }
 }

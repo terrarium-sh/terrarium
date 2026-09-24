@@ -312,6 +312,7 @@ pub(super) fn create_store<H: StoreHost>(
     host: StoreState<H>,
 ) -> Store<StoreState<H>> {
     let mut store = Store::new(engine, host);
+    store.set_hostcall_fuel(terra_limits::MAX_COMPONENT_HOSTCALL_BYTES);
     if let Some(table) = store.concurrent_resource_table() {
         table.set_max_capacity(crate::component::context::MAX_DEVICE_RESOURCES);
     }
@@ -324,6 +325,49 @@ pub(super) fn create_store<H: StoreHost>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn hostcall_limit_sums_all_lifted_arguments() {
+        use wasmtime::component::{Component, Linker};
+        let engine = crate::engine::device_engine().unwrap();
+        let component = Component::new(&engine, r#"(component
+            (import "copy" (func $copy (param "a" (list u8)) (param "b" (list u8)) (result u32)))
+            (core module $memory (memory (export "memory") 1))
+            (core instance $memory (instantiate $memory))
+            (alias core export $memory "memory" (core memory $memory))
+            (core func $copy (canon lower (func $copy) (memory $memory)))
+            (core module $caller
+                (import "host" "copy" (func $copy (param i32 i32 i32 i32) (result i32)))
+                (func (export "copy") (param i32) (result i32)
+                    i32.const 0 local.get 0 i32.const 0 local.get 0 call $copy))
+            (core instance $caller (instantiate $caller (with "host" (instance (export "copy" (func $copy))))))
+            (func (export "copy") (param "bytes" u32) (result u32)
+                (canon lift (core func $caller "copy"))))"#).unwrap();
+        let mut linker = Linker::<BoxHost>::new(&engine);
+        linker
+            .root()
+            .func_wrap("copy", |_, (a, b): (Vec<u8>, Vec<u8>)| {
+                Ok((u32::try_from(a.len() + b.len()).unwrap(),))
+            })
+            .unwrap();
+        for bytes in [32768, 32769] {
+            let mut store = create_store(&engine, BoxHost::new());
+            let instance = linker
+                .instantiate_async(&mut store, &component)
+                .await
+                .unwrap();
+            let copy = instance
+                .get_typed_func::<(u32,), (u32,)>(&mut store, "copy")
+                .unwrap();
+            let copied = copy.call_async(&mut store, (bytes,)).await;
+            if bytes == 32768 {
+                assert_eq!(copied.unwrap(), (65536,));
+            } else {
+                let error = copied.unwrap_err();
+                assert!(format!("{error:#}").contains("fuel"), "{error:#}");
+            }
+        }
+    }
 
     #[test]
     fn resource_limits_apply_per_independent_store() {

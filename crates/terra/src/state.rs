@@ -287,14 +287,34 @@ impl BoxRef {
         }
     }
 
-    pub fn write_origin(&self) {
-        if let Some(project) = self.dir.parent() {
-            let Some(text) = self.project_dir.to_str() else {
-                let _ = std::fs::remove_file(project.join(ORIGIN_FILE));
-                return;
-            };
-            let _ = std::fs::write(project.join(ORIGIN_FILE), text);
-        }
+    pub fn write_origin(&self) -> Result<()> {
+        use std::io::Write as _;
+        let project = self
+            .dir
+            .parent()
+            .context("box state has no project directory")?;
+        #[cfg(unix)]
+        let bytes = {
+            use std::os::unix::ffi::OsStrExt as _;
+            self.project_dir.as_os_str().as_bytes().to_vec()
+        };
+        #[cfg(windows)]
+        let bytes = {
+            use std::os::windows::ffi::OsStrExt as _;
+            [0xff, 0xfe]
+                .into_iter()
+                .chain(
+                    self.project_dir
+                        .as_os_str()
+                        .encode_wide()
+                        .flat_map(u16::to_le_bytes),
+                )
+                .collect::<Vec<_>>()
+        };
+        crate::vm::image::staged_write(&project.join(ORIGIN_FILE), |file| {
+            Ok(file.write_all(&bytes)?)
+        })
+        .context("recording project origin")
     }
 }
 
@@ -474,9 +494,31 @@ fn compute_slug(project_dir: &Path) -> String {
 }
 
 pub fn read_origin(project: &Path) -> Option<PathBuf> {
-    let text = std::fs::read_to_string(project.join(ORIGIN_FILE)).ok()?;
-    let text = text.trim();
-    (!text.is_empty()).then(|| PathBuf::from(text))
+    let bytes = std::fs::read(project.join(ORIGIN_FILE)).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt as _;
+        Some(std::ffi::OsString::from_vec(bytes).into())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStringExt as _;
+        if let Some(wide) = bytes.strip_prefix(&[0xff, 0xfe]) {
+            if wide.is_empty() || !wide.len().is_multiple_of(2) {
+                return None;
+            }
+            let wide = wide
+                .chunks_exact(2)
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .collect::<Vec<_>>();
+            Some(std::ffi::OsString::from_wide(&wide).into())
+        } else {
+            String::from_utf8(bytes).ok().map(PathBuf::from)
+        }
+    }
 }
 
 /// Whether a box has a guest filesystem, and whether a terra is holding it.
@@ -516,6 +558,46 @@ mod tests {
     /// one taken afterwards would be a box in the developer's real `~/.terra`.
     fn resolve_box_ref(project_dir: &Path) -> BoxRef {
         BoxRef::resolve(project_dir, "dev").unwrap()
+    }
+
+    #[test]
+    fn project_origins_preserve_native_paths_and_reject_failed_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let box_dir = dir.path().join("box");
+        let mut paths = vec![PathBuf::from(" project \t"), dir.path().join("project ")];
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt as _;
+            paths.push(std::ffi::OsString::from_vec(b"/project-\xff ".to_vec()).into());
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt as _;
+            paths.push(
+                std::ffi::OsString::from_wide(&[
+                    u16::from(b'C'),
+                    u16::from(b':'),
+                    u16::from(b'\\'),
+                    0xd800,
+                ])
+                .into(),
+            );
+        }
+        for path in paths {
+            let bx = BoxRef::from_state_dir(box_dir.clone(), &path);
+            bx.write_origin().unwrap();
+            assert_eq!(read_origin(dir.path()), Some(path));
+        }
+        std::fs::write(dir.path().join(ORIGIN_FILE), b"/legacy project ").unwrap();
+        assert_eq!(
+            read_origin(dir.path()),
+            Some(PathBuf::from("/legacy project "))
+        );
+        std::fs::remove_file(dir.path().join(ORIGIN_FILE)).unwrap();
+        std::fs::create_dir(dir.path().join(ORIGIN_FILE)).unwrap();
+        let bx = BoxRef::from_state_dir(box_dir, dir.path());
+        assert!(bx.write_origin().is_err());
+        assert!(dir.path().join(ORIGIN_FILE).is_dir());
     }
 
     #[test]
