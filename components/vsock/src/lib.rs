@@ -125,7 +125,7 @@ impl exports::terra::vsock::api::Guest for Vsock {
         }
         let (header, data) = VsockHeader::parse(&packet).map_err(|_| Error::Malformed)?;
         switch().rx(&header, data);
-        worker::wake_carrier();
+        carrier::wake();
         worker::schedule_receive_queue();
         Ok(())
     }
@@ -207,7 +207,7 @@ impl exports::terra::vsock::api::Guest for Vsock {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
             transport::reset();
-            worker::wake_carrier();
+            carrier::wake();
             wake_worker();
         }
     }
@@ -218,7 +218,7 @@ impl exports::terra::vsock::api::Guest for Vsock {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         transport::close();
-        worker::wake_carrier();
+        carrier::wake();
         wake_worker();
         worker::finish().await;
     }

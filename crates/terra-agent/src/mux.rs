@@ -6,7 +6,7 @@ use std::{fs::File, os::fd::OwnedFd, os::unix::net::UnixStream, thread};
 use tokio::sync::mpsc;
 
 pub(super) struct GuestMux {
-    _thread: thread::JoinHandle<()>,
+    thread: thread::JoinHandle<()>,
 }
 
 pub(super) struct Streams {
@@ -17,6 +17,12 @@ pub(super) struct Streams {
 }
 
 impl GuestMux {
+    pub(super) fn wait(self) {
+        if self.thread.join().is_err() {
+            eprintln!("terra-agent: mux thread panicked");
+        }
+    }
+
     pub(super) fn connect() -> Result<Streams> {
         let carrier = crate::vsock::connect(
             crate::vsock::VMADDR_CID_HOST,
@@ -40,71 +46,59 @@ impl GuestMux {
                 else {
                     return;
                 };
-                runtime.block_on(run(
+                if let Err(error) = runtime.block_on(run(
                     carrier,
                     File::from(OwnedFd::from(driver_control)),
                     File::from(OwnedFd::from(driver_diagnostic)),
                     clients,
-                ));
+                )) {
+                    eprintln!("terra-agent: mux failed: {error:#}");
+                }
             })
             .context("starting mux driver")?;
         Ok(Streams {
             control: File::from(OwnedFd::from(control)),
             diagnostic: File::from(OwnedFd::from(diagnostic)),
             clients: client_streams,
-            driver: Self { _thread: driver },
+            driver: Self { thread: driver },
         })
     }
 }
 
-async fn run(carrier: File, control: File, diagnostic: File, clients: mpsc::Sender<File>) {
-    let Ok(carrier) = async_io::Async::new(carrier) else {
-        return;
-    };
-    let config = terra_protocol::mux::yamux_config();
-    let mut connection = yamux::Connection::new(carrier, config, yamux::Mode::Client);
-    let mut control_stream = match poll_fn(|cx| connection.poll_new_outbound(cx)).await {
-        Ok(stream) => stream,
-        Err(error) => {
-            eprintln!("terra-agent: mux control stream failed: {error}");
-            return;
-        }
-    };
-    let mut diagnostic_stream = match poll_fn(|cx| connection.poll_new_outbound(cx)).await {
-        Ok(stream) => stream,
-        Err(error) => {
-            eprintln!("terra-agent: mux diagnostic stream failed: {error}");
-            return;
-        }
-    };
-    if control_stream.write(&[]).await.is_err() {
-        return;
+async fn run(
+    carrier: File,
+    control: File,
+    diagnostic: File,
+    clients: mpsc::Sender<File>,
+) -> Result<()> {
+    let carrier = async_io::Async::new(carrier).context("registering carrier")?;
+    let mut connection = yamux::Connection::new(
+        carrier,
+        terra_protocol::mux::yamux_config(),
+        yamux::Mode::Client,
+    );
+    for (name, local) in [("control", control), ("diagnostic", diagnostic)] {
+        let mut stream = poll_fn(|cx| connection.poll_new_outbound(cx))
+            .await
+            .with_context(|| format!("opening mux {name} stream"))?;
+        // Yamux sends the opening SYN on the first write, including an empty write.
+        stream
+            .write(&[])
+            .await
+            .with_context(|| format!("sending mux {name} SYN"))?;
+        tokio::spawn(bridge(stream, local));
     }
-    if diagnostic_stream.write(&[]).await.is_err() {
-        return;
-    }
-    tokio::spawn(bridge(control_stream, control));
-    tokio::spawn(bridge(diagnostic_stream, diagnostic));
 
-    loop {
-        let Some(stream) = poll_fn(|cx| connection.poll_next_inbound(cx)).await else {
-            return;
-        };
-        let Ok(stream) = stream else {
-            return;
-        };
-        if !stream.id().is_server() {
-            return;
-        }
-        let Ok((agent, driver)) = UnixStream::pair() else {
-            return;
-        };
-        let agent = File::from(OwnedFd::from(agent));
-        if clients.try_send(agent).is_err() {
+    while let Some(stream) = poll_fn(|cx| connection.poll_next_inbound(cx)).await {
+        let stream = stream?;
+        anyhow::ensure!(stream.id().is_server(), "unexpected guest-initiated stream");
+        let (agent, driver) = UnixStream::pair().context("creating client bridge")?;
+        if clients.try_send(File::from(OwnedFd::from(agent))).is_err() {
             continue;
         }
         tokio::spawn(bridge(stream, File::from(OwnedFd::from(driver))));
     }
+    Ok(())
 }
 
 async fn bridge(stream: yamux::Stream, local: File) {
@@ -142,6 +136,7 @@ mod tests {
         diagnostic_stream: yamux::Stream,
         client_streams: Vec<yamux::Stream>,
         driver: tokio::task::JoinHandle<()>,
+        guest_driver: GuestMux,
     }
 
     async fn promptly<T>(future: impl std::future::Future<Output = T>) -> T {
@@ -150,13 +145,23 @@ mod tests {
             .expect("mux operation stalled")
     }
 
+    async fn wait_for_guest_driver(driver: GuestMux) {
+        promptly(async {
+            while !driver.thread.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        driver.wait();
+    }
+
     async fn carrier(client_count: usize) -> Carrier {
         let (host, guest) = UnixStream::pair().unwrap();
         let Streams {
             control,
             diagnostic,
             clients,
-            driver: _driver,
+            driver: guest_driver,
         } = GuestMux::start(File::from(OwnedFd::from(guest))).unwrap();
         let carrier = async_io::Async::new(File::from(OwnedFd::from(host))).unwrap();
         let mut connection = yamux::Connection::new(
@@ -194,7 +199,32 @@ mod tests {
             diagnostic_stream,
             client_streams,
             driver,
+            guest_driver,
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn carrier_loss_cancels_the_workload_and_finishes_the_guest_driver() {
+        let Carrier {
+            control,
+            diagnostic: _diagnostic,
+            clients: _clients,
+            control_stream: _control_stream,
+            diagnostic_stream: _diagnostic_stream,
+            client_streams: _client_streams,
+            driver,
+            guest_driver,
+        } = carrier(0).await;
+        let stop = tokio_util::sync::CancellationToken::new();
+        let watcher = tokio::spawn(crate::watch_control(
+            control,
+            stop.clone(),
+            tokio_util::sync::CancellationToken::new(),
+        ));
+        driver.abort();
+        promptly(stop.cancelled()).await;
+        promptly(watcher).await.unwrap();
+        wait_for_guest_driver(guest_driver).await;
     }
 
     async fn client_fin_keeps_the_reply_open(
@@ -248,6 +278,7 @@ mod tests {
             diagnostic_stream: _diagnostic_stream,
             client_streams,
             driver,
+            guest_driver: _guest_driver,
         } = carrier(2).await;
         let mut client_streams = client_streams.into_iter();
         let mut blocked_client = client_streams.next().unwrap();
@@ -315,6 +346,7 @@ mod tests {
             mut diagnostic_stream,
             mut client_streams,
             driver,
+            guest_driver,
         } = carrier(1).await;
         assert_eq!(
             control_stream.id().val(),
@@ -357,5 +389,6 @@ mod tests {
                 .unwrap(),
             0
         );
+        wait_for_guest_driver(guest_driver).await;
     }
 }

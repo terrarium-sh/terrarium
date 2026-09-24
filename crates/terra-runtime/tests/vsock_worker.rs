@@ -29,7 +29,7 @@ use wasmtime::component::{
 
 const CARRIER_SOURCE: u32 = 6003;
 const CARRIER_PORT: u32 = terra_protocol::mux::MUX_VSOCK_PORT;
-const PAYLOAD_BYTES: usize = 300 * 1024;
+const PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(ComponentType, Lift)]
 #[component(record)]
@@ -262,6 +262,7 @@ async fn write_local(stream: &mut terra_platform::io::local::LocalStream, bytes:
     let mut written = 0;
     while written < bytes.len() {
         match stream.write(&bytes[written..]) {
+            Ok(0) => panic!("host input closed early"),
             Ok(count) => written += count,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 tokio::time::sleep(Duration::from_millis(1)).await;
@@ -466,7 +467,8 @@ fn guest_carrier(
 }
 
 /// The component carries control, diagnostics, and every host client through
-/// one guest-initiated Yamux connection.
+/// one guest-initiated Yamux connection. Each sender runs alongside its receiver
+/// so payloads larger than socket buffers and stream windows make progress.
 #[tokio::test(flavor = "current_thread")]
 #[allow(clippy::too_many_lines)]
 async fn client_round_trip_uses_the_shared_carrier() {
@@ -515,34 +517,44 @@ async fn client_round_trip_uses_the_shared_carrier() {
                     )
                     .await
                     .expect("guest diagnostic");
+                diagnostics.close().await.expect("diagnostic EOF");
                 let request = vec![b'q'; PAYLOAD_BYTES];
                 let mut stream = poll_fn(|context| connection.poll_next_inbound(context))
                     .await
                     .expect("carrier remains open")
                     .expect("client stream");
                 let exchange = async {
-                    write_local(&mut client, &request).await;
                     let mut received = vec![0; PAYLOAD_BYTES];
-                    stream.read_exact(&mut received).await.expect("guest input");
+                    let ((), result) = tokio::join!(
+                        write_local(&mut client, &request),
+                        stream.read_exact(&mut received),
+                    );
+                    result.expect("guest input");
                     assert_eq!(received, request);
                     let response = vec![b'r'; PAYLOAD_BYTES];
-                    stream.write_all(&response).await.expect("guest output");
-                    stream.close().await.expect("guest finish");
-                    let mut received = Vec::with_capacity(PAYLOAD_BYTES);
-                    loop {
-                        let mut buffer = [0; 16 * 1024];
-                        match std::io::Read::read(&mut client, &mut buffer) {
-                            Ok(0) => panic!("host output closed early"),
-                            Ok(count) => received.extend_from_slice(&buffer[..count]),
-                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                                tokio::time::sleep(Duration::from_millis(1)).await;
+                    let send = async {
+                        stream.write_all(&response).await.expect("guest output");
+                        stream.close().await.expect("guest finish");
+                    };
+                    let receive = async {
+                        let mut received = Vec::with_capacity(PAYLOAD_BYTES);
+                        loop {
+                            let mut buffer = [0; 16 * 1024];
+                            match std::io::Read::read(&mut client, &mut buffer) {
+                                Ok(0) => panic!("host output closed early"),
+                                Ok(count) => received.extend_from_slice(&buffer[..count]),
+                                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                    tokio::time::sleep(Duration::from_millis(1)).await;
+                                }
+                                Err(error) => panic!("host output: {error}"),
                             }
-                            Err(error) => panic!("host output: {error}"),
+                            if received.len() == PAYLOAD_BYTES {
+                                return received;
+                            }
                         }
-                        if received.len() == PAYLOAD_BYTES {
-                            return received;
-                        }
-                    }
+                    };
+                    let ((), received) = tokio::join!(send, receive);
+                    received
                 };
                 let driver = async {
                     loop {
@@ -590,6 +602,26 @@ async fn client_round_trip_uses_the_shared_carrier() {
 /// the carrier tuple.
 #[tokio::test(flavor = "current_thread")]
 async fn reset_releases_the_open_client() {
+    assert_session_releases_client(SessionEnd::DeviceReset).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn control_eof_releases_the_open_client() {
+    assert_session_releases_client(SessionEnd::ControlEof).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn malformed_lifecycle_releases_the_open_client() {
+    assert_session_releases_client(SessionEnd::MalformedLifecycle).await;
+}
+
+enum SessionEnd {
+    DeviceReset,
+    ControlEof,
+    MalformedLifecycle,
+}
+
+async fn assert_session_releases_client(end: SessionEnd) {
     let directory = tempfile::tempdir().expect("directory");
     let path = directory.path().join("reset.sock");
     let listener = terra_platform::io::local::LocalListener::bind(&path).expect("listener");
@@ -602,7 +634,7 @@ async fn reset_releases_the_open_client() {
             let (carrier, started, pump) =
                 guest_carrier(accessor, worker.receive, worker.replies, CARRIER_SOURCE);
             let run = worker.run.call_concurrent(accessor, ());
-            let reset = async {
+            let end_session = async {
                 started.await.expect("carrier handshake");
                 let mut connection = yamux::Connection::new(
                     carrier,
@@ -621,29 +653,44 @@ async fn reset_releases_the_open_client() {
                     .await
                     .expect("carrier remains open")
                     .expect("client stream");
-                worker
-                    .reset
-                    .call_concurrent(accessor, ())
-                    .await
-                    .expect("reset");
+                match end {
+                    SessionEnd::DeviceReset => worker
+                        .reset
+                        .call_concurrent(accessor, ())
+                        .await
+                        .expect("reset"),
+                    SessionEnd::ControlEof => control.close().await.expect("control EOF"),
+                    SessionEnd::MalformedLifecycle => control
+                        .write_all(&u32::MAX.to_le_bytes())
+                        .await
+                        .expect("malformed lifecycle"),
+                }
                 (connection, control, diagnostics, guest_client)
             };
             let close = async {
-                let _guest_session = reset.await;
-                tokio::time::timeout(Duration::from_secs(2), async {
-                    loop {
-                        match client.read(&mut [0; 1]) {
-                            Ok(0) => return,
-                            Ok(_) => panic!("reset client received data"),
-                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                                tokio::time::sleep(Duration::from_millis(1)).await;
+                let (mut connection, _control, _diagnostics, _guest_client) = end_session.await;
+                let drive = poll_fn(|context| {
+                    let _ = connection.poll_next_inbound(context);
+                    Poll::<()>::Pending
+                });
+                let disconnected = async {
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        loop {
+                            match client.read(&mut [0; 1]) {
+                                Ok(0) => return,
+                                Ok(_) => panic!("closed session client received data"),
+                                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                    tokio::time::sleep(Duration::from_millis(1)).await;
+                                }
+                                Err(error) => panic!("closed session client read: {error}"),
                             }
-                            Err(error) => panic!("reset client read: {error}"),
                         }
-                    }
-                })
-                .await
-                .expect("reset closes host client");
+                    })
+                    .await
+                    .expect("session end closes host client");
+                };
+                futures_util::pin_mut!(disconnected, drive);
+                let _ = futures_util::future::select(disconnected, drive).await;
                 assert_eq!(
                     accessor.with(|mut access| access.get().vsock_service_mut().live_clients()),
                     0
@@ -660,7 +707,7 @@ async fn reset_releases_the_open_client() {
         }),
     )
     .await
-    .expect("reset test timeout")
+    .expect("session teardown test timeout")
     .expect("component run")
     .expect("component result");
 }

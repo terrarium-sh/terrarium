@@ -8,7 +8,7 @@ use std::{
     task::{Context, Poll},
 };
 use terra_protocol::mux::MUX_VSOCK_PORT;
-use terra_vsock_device::VsockError;
+use terra_vsock_device::{VsockError, VsockSwitch};
 
 const READ_CHUNK_BYTES: usize = 16 * 1024;
 
@@ -33,41 +33,17 @@ impl Carrier {
         )
     }
 
-    pub(crate) fn is_current(&self) -> bool {
+    fn lock_current_switch(&self) -> io::Result<std::sync::MutexGuard<'static, VsockSwitch>> {
         let switch = switch();
-        switch.generation() == self.generation
-            && switch.connection_exists(self.source, MUX_VSOCK_PORT)
-    }
-
-    fn stale() -> io::Error {
-        io::Error::new(io::ErrorKind::ConnectionAborted, "vsock carrier reset")
-    }
-
-    fn fill_received(&mut self) -> io::Result<()> {
-        let mut switch = switch();
         if switch.generation() != self.generation
             || !switch.connection_exists(self.source, MUX_VSOCK_PORT)
         {
-            return Err(Self::stale());
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "vsock carrier reset",
+            ));
         }
-        self.received.extend(
-            switch
-                .take_upstream_for_up_to(self.source, MUX_VSOCK_PORT, READ_CHUNK_BYTES)
-                .into_iter()
-                .flat_map(|item| item.data),
-        );
-        drop(switch);
-        if !self.received.is_empty() {
-            worker::schedule_receive_queue();
-        }
-        Ok(())
-    }
-
-    fn read_closed(&self) -> bool {
-        let switch = switch();
-        switch.generation() == self.generation
-            && switch.connection_exists(self.source, MUX_VSOCK_PORT)
-            && switch.guest_send_closed(self.source, MUX_VSOCK_PORT)
+        Ok(switch)
     }
 }
 
@@ -77,10 +53,9 @@ pub(crate) fn wake() {
 
 impl Drop for Carrier {
     fn drop(&mut self) {
-        let mut switch = switch();
-        let reset = switch.generation() == self.generation
-            && switch.reset_connection(self.source, MUX_VSOCK_PORT).is_ok();
-        drop(switch);
+        let reset = self
+            .lock_current_switch()
+            .is_ok_and(|mut switch| switch.reset_connection(self.source, MUX_VSOCK_PORT).is_ok());
         if reset {
             worker::schedule_receive_queue();
         }
@@ -97,23 +72,22 @@ impl AsyncRead for Carrier {
             return Poll::Ready(Ok(0));
         }
         WAKER.register(context.waker());
-        if !self.is_current() {
-            self.received.clear();
-            return Poll::Ready(Err(Self::stale()));
-        }
+        let mut switch = self.lock_current_switch()?;
         if self.received.is_empty() {
-            if let Err(error) = self.fill_received() {
-                return Poll::Ready(Err(error));
-            }
+            let upstream =
+                switch.take_upstream_for_up_to(self.source, MUX_VSOCK_PORT, READ_CHUNK_BYTES);
+            self.received
+                .extend(upstream.into_iter().flat_map(|item| item.data));
+            let read_closed = switch.guest_send_closed(self.source, MUX_VSOCK_PORT);
+            drop(switch);
             if self.received.is_empty() {
-                if !self.is_current() {
-                    return Poll::Ready(Err(Self::stale()));
-                }
-                if self.read_closed() {
-                    return Poll::Ready(Ok(0));
-                }
-                return Poll::Pending;
+                return if read_closed {
+                    Poll::Ready(Ok(0))
+                } else {
+                    Poll::Pending
+                };
             }
+            worker::schedule_receive_queue();
         }
         let count = bytes.len().min(self.received.len());
         for (destination, byte) in bytes[..count].iter_mut().zip(self.received.drain(..count)) {
@@ -135,12 +109,7 @@ impl AsyncWrite for Carrier {
         }
         WAKER.register(context.waker());
         let (result, count, has_new_reply) = {
-            let mut switch = switch();
-            if switch.generation() != this.generation
-                || !switch.connection_exists(this.source, MUX_VSOCK_PORT)
-            {
-                return Poll::Ready(Err(Self::stale()));
-            }
+            let mut switch = this.lock_current_switch()?;
             let count = bytes
                 .len()
                 .min(READ_CHUNK_BYTES)
@@ -156,55 +125,34 @@ impl AsyncWrite for Carrier {
         if has_new_reply {
             worker::schedule_receive_queue();
         }
-        match result {
-            Ok(()) => Poll::Ready(Ok(count)),
-            Err(VsockError::Backpressure) => {
-                if this.is_current() {
-                    Poll::Pending
-                } else {
-                    Poll::Ready(Err(Self::stale()))
-                }
-            }
-            Err(VsockError::UnknownConnection | VsockError::TableFull) => {
-                Poll::Ready(Err(Self::stale()))
-            }
-        }
+        poll_delivery(result.map(|()| count))
     }
 
     fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.is_current()
-            .then_some(Ok(()))
-            .map_or_else(|| Poll::Ready(Err(Self::stale())), Poll::Ready)
+        Poll::Ready(self.lock_current_switch().map(|_| ()))
     }
 
     fn poll_close(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         WAKER.register(context.waker());
         let result = {
-            let mut switch = switch();
-            if switch.generation() != this.generation
-                || !switch.connection_exists(this.source, MUX_VSOCK_PORT)
-            {
-                return Poll::Ready(Err(Self::stale()));
-            }
+            let mut switch = this.lock_current_switch()?;
             switch.shutdown(this.source, MUX_VSOCK_PORT)
         };
-        match result {
-            Ok(()) => {
-                worker::schedule_receive_queue();
-                Poll::Ready(Ok(()))
-            }
-            Err(VsockError::Backpressure) => {
-                if this.is_current() {
-                    Poll::Pending
-                } else {
-                    Poll::Ready(Err(Self::stale()))
-                }
-            }
-            Err(VsockError::UnknownConnection | VsockError::TableFull) => {
-                Poll::Ready(Err(Self::stale()))
-            }
+        if result.is_ok() {
+            worker::schedule_receive_queue();
         }
+        poll_delivery(result)
+    }
+}
+
+fn poll_delivery<T>(result: Result<T, VsockError>) -> Poll<io::Result<T>> {
+    match result {
+        Ok(value) => Poll::Ready(Ok(value)),
+        Err(VsockError::Backpressure) => Poll::Pending,
+        Err(VsockError::UnknownConnection | VsockError::TableFull) => Poll::Ready(Err(
+            io::Error::new(io::ErrorKind::ConnectionAborted, "vsock carrier reset"),
+        )),
     }
 }
 
@@ -266,7 +214,7 @@ mod tests {
             Poll::Ready(Err(_))
         ));
         drop(old);
-        assert!(current.is_current());
+        assert!(current.lock_current_switch().is_ok());
         let mut bytes = [0; 3];
         assert!(matches!(
             Pin::new(&mut current).poll_read(&mut context, &mut bytes),

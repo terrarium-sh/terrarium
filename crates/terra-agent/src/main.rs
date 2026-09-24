@@ -58,7 +58,7 @@ const AGENT_FAILED: i32 = 1;
 
 #[cfg(target_os = "linux")]
 fn main() -> ! {
-    let (control, outcome, _mux) = match bootstrap::enter_root() {
+    let (control, outcome, mux) = match bootstrap::enter_root() {
         Ok(bootstrap::Boot {
             plan,
             control,
@@ -87,11 +87,9 @@ fn main() -> ! {
     if let Some(mut control) = control {
         if let Err(error) = write_exit_report(&mut control, code) {
             eprintln!("terra-agent: warning: could not report the exit status ({code}): {error}");
-        } else {
-            // Powering off would reset virtio before the host drains the exit frame.
-            loop {
-                std::thread::park();
-            }
+        } else if let Some(mux) = mux {
+            // Keep virtio alive for the exit frame until the host closes the carrier.
+            mux.wait();
         }
     }
     if let Err(error) = rustix::system::reboot(rustix::system::RebootCommand::PowerOff) {
