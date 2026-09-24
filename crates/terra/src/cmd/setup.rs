@@ -224,67 +224,43 @@ pub fn request_recipe_approval(
     cfg.mounts = mount::resolve_mounts(&cfg, &bx)?;
     validate_storage_devices(&cfg)?;
 
-    let mut new_pin = None;
-    if let Some(r) = source {
-        let pinned_text =
-            std::fs::read_to_string(bx.get_dir().join(state::RECIPE_FILE)).unwrap_or_default();
-        if r.text != pinned_text {
-            let guest_writable = find_guest_writable_share_containing(&bx, &r.from, via_manifest);
-            let sensitive_mounts = mount::find_sensitive_mounts(&cfg.mounts);
-            let has_readwrite_sensitive = sensitive_mounts.iter().any(|s| !s.mount.readonly);
-            let is_suspect = guest_writable.is_some() || has_readwrite_sensitive;
-            let lead = match approval {
-                // A dry run's refusal reads as the real setup's would.
-                Approval::ChosenByHand { .. } | Approval::Reported => {
-                    format!("pinning {} to {bx}", escape_printable_path(&r.from))
-                }
-                Approval::Offer => format!(
-                    "no box '{}' in {} yet - {} would build it",
-                    bx.get_name(),
-                    bx.get_project_dir().display(),
-                    escape_printable_path(&r.from)
-                ),
-            };
-            let mut warnings = Vec::new();
-            if let Some(authorship) = &guest_writable {
-                warnings.push(format!(
-                    "WARNING: {}.",
-                    build_adoption_reason(&r.from, authorship)
-                ));
-            }
-            for s in &sensitive_mounts {
-                let access = if s.mount.readonly {
-                    "read-only"
-                } else {
-                    "read-write"
-                };
-                warnings.push(format!(
-                    "WARNING: mount '{}' shares sensitive host {} ({access}) with the sandbox.",
-                    escape_printable_path(&s.mount.host),
-                    s.category
-                ));
-            }
-            let warning = (!warnings.is_empty()).then(|| warnings.join("\n"));
-            put_the_question(
-                decide_pinning(approval, is_suspect, is_at_a_terminal),
-                &lead,
-                warning.as_deref(),
-                &cfg,
-                bx.get_name(),
-            )?;
-            new_pin = Some(r);
-        }
-    }
     config::resolve_env_file(&mut cfg)?;
     let paths = mount::PinnedPaths::from_config(&cfg);
-    let pinned_paths = if mount::load_pinned_paths(&bx)?.as_ref() == Some(&paths) {
-        None
-    } else if refresh_pinned_paths || new_pin.is_some() {
-        Some(paths)
-    } else {
+    let previous_paths = mount::load_pinned_paths(&bx)?;
+    let has_changed_targets = previous_paths
+        .as_ref()
+        .is_some_and(|pinned| pinned != &paths);
+    let new_pin = source.filter(|recipe| {
+        let pinned_text =
+            std::fs::read_to_string(bx.get_dir().join(state::RECIPE_FILE)).unwrap_or_default();
+        recipe.text != pinned_text
+    });
+    if !refresh_pinned_paths && new_pin.is_none() {
         mount::verify_pinned_paths(&bx, &paths)?;
-        None
-    };
+    }
+    if new_pin.is_some() || has_changed_targets {
+        let guest_writable = new_pin
+            .as_ref()
+            .and_then(|r| find_guest_writable_share_containing(&bx, &r.from, via_manifest));
+        let sensitive_mounts = mount::find_sensitive_mounts(&cfg.mounts);
+        let has_readwrite_sensitive = sensitive_mounts.iter().any(|s| !s.mount.readonly);
+        let is_suspect = has_changed_targets || guest_writable.is_some() || has_readwrite_sensitive;
+        let lead = build_pinning_lead(&bx, new_pin.as_ref(), approval);
+        let warning = build_pinning_warning(
+            new_pin.as_ref(),
+            guest_writable.as_ref(),
+            &sensitive_mounts,
+            has_changed_targets,
+        );
+        put_the_question(
+            decide_pinning(approval, is_suspect, is_at_a_terminal),
+            &lead,
+            (!warning.is_empty()).then_some(warning.as_str()),
+            &cfg,
+            bx.get_name(),
+        )?;
+    }
+    let pinned_paths = (previous_paths.as_ref() != Some(&paths)).then_some(paths);
     config::merge_env_file(&mut cfg)?;
     Ok(ApprovedRecipe {
         bx,
@@ -292,6 +268,60 @@ pub fn request_recipe_approval(
         new_pin,
         pinned_paths,
     })
+}
+
+fn build_pinning_lead(
+    bx: &BoxRef,
+    recipe: Option<&resolve::Recipe>,
+    approval: &Approval,
+) -> String {
+    let Some(recipe) = recipe else {
+        return format!("updating pinned paths for {bx}");
+    };
+    match approval {
+        Approval::ChosenByHand { .. } | Approval::Reported => {
+            format!("pinning {} to {bx}", escape_printable_path(&recipe.from))
+        }
+        Approval::Offer => format!(
+            "no box '{}' in {} yet - {} would build it",
+            bx.get_name(),
+            bx.get_project_dir().display(),
+            escape_printable_path(&recipe.from)
+        ),
+    }
+}
+
+fn build_pinning_warning(
+    recipe: Option<&resolve::Recipe>,
+    guest_writable: Option<&RecipeAuthorship>,
+    sensitive_mounts: &[mount::SensitiveMount<'_>],
+    has_changed_targets: bool,
+) -> String {
+    let mut warnings = Vec::new();
+    if has_changed_targets {
+        warnings.push(
+            "WARNING: a share or env_file target changed since it was pinned; review the new host paths before approving.".to_string(),
+        );
+    }
+    if let (Some(recipe), Some(authorship)) = (recipe, guest_writable) {
+        warnings.push(format!(
+            "WARNING: {}.",
+            build_adoption_reason(&recipe.from, authorship)
+        ));
+    }
+    for sensitive in sensitive_mounts {
+        let access = if sensitive.mount.readonly {
+            "read-only"
+        } else {
+            "read-write"
+        };
+        warnings.push(format!(
+            "WARNING: mount '{}' shares sensitive host {} ({access}) with the sandbox.",
+            escape_printable_path(&sensitive.mount.host),
+            sensitive.category
+        ));
+    }
+    warnings.join("\n")
 }
 
 fn validate_storage_devices(cfg: &config::Config) -> Result<()> {
@@ -609,10 +639,10 @@ mod tests {
             manifest_divergence: None,
         };
 
-        // Approval must precede reading even a missing env_file.
+        std::fs::write(project.join("unreadable.env"), [0xff]).unwrap();
         let mut refused = target();
         if let resolve::Source::File(recipe) = &mut refused.source {
-            recipe.text.push_str("env_file: missing.env\n");
+            recipe.text.push_str("env_file: unreadable.env\n");
         }
         let err = request_recipe_approval(
             refused,
@@ -696,7 +726,7 @@ mod tests {
     }
 
     #[test]
-    fn a_changed_pinned_target_needs_setup_before_any_source_can_boot_it() {
+    fn a_changed_pinned_target_needs_explicit_trust_before_any_source_can_boot_it() {
         for changed_env_file in [false, true] {
             let _home = crate::sys::TestHome::new();
             let dir = tempfile::tempdir().unwrap();
@@ -717,13 +747,13 @@ mod tests {
                 from: project.join("dev.yaml"),
                 text: recipe_text.clone(),
             };
-            let initial = ResolvedBox {
+            let target = |source| ResolvedBox {
                 bx: bx.clone(),
-                source: resolve::Source::File(recipe()),
+                source,
                 manifest_divergence: None,
             };
             let approved = request_recipe_approval(
-                initial,
+                target(resolve::Source::File(recipe())),
                 &Approval::ChosenByHand {
                     trust_recipe: false,
                 },
@@ -751,41 +781,48 @@ mod tests {
             }
 
             for source in [resolve::Source::Pinned, resolve::Source::File(recipe())] {
-                let error = request_recipe_approval(
-                    ResolvedBox {
-                        bx: bx.clone(),
-                        source,
-                        manifest_divergence: None,
-                    },
-                    &Approval::Offer,
-                    true,
-                    false,
-                )
-                .expect_err("a changed target must not boot")
-                .to_string();
+                let error = request_recipe_approval(target(source), &Approval::Offer, true, false)
+                    .expect_err("a changed target must not boot")
+                    .to_string();
                 assert!(error.contains("moved since it was pinned"), "{error}");
             }
 
+            for source in [
+                resolve::Source::Pinned,
+                resolve::Source::File(recipe()),
+                resolve::Source::Manifest(recipe()),
+                resolve::Source::File(resolve::Recipe {
+                    text: format!("{recipe_text}# edited recipe\n"),
+                    ..recipe()
+                }),
+            ] {
+                let error = request_recipe_approval(
+                    target(source),
+                    &Approval::ChosenByHand {
+                        trust_recipe: false,
+                    },
+                    false,
+                    true,
+                )
+                .expect_err("changed targets require explicit trust")
+                .to_string();
+                assert!(
+                    error.contains("target changed since it was pinned"),
+                    "{error}"
+                );
+                assert!(error.contains("--trust-recipe"), "{error}");
+            }
+
             let refreshed = request_recipe_approval(
-                ResolvedBox {
-                    bx: bx.clone(),
-                    source: resolve::Source::Pinned,
-                    manifest_divergence: None,
-                },
-                &Approval::ChosenByHand {
-                    trust_recipe: false,
-                },
+                target(resolve::Source::Pinned),
+                &Approval::ChosenByHand { trust_recipe: true },
                 true,
                 true,
             )
-            .expect("an explicit setup refreshes pinned targets");
+            .expect("explicit trust refreshes pinned targets");
             prepare_box(&refreshed, Rebuild::No).unwrap();
             request_recipe_approval(
-                ResolvedBox {
-                    bx,
-                    source: resolve::Source::Pinned,
-                    manifest_divergence: None,
-                },
+                target(resolve::Source::Pinned),
                 &Approval::Offer,
                 true,
                 false,
