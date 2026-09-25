@@ -625,23 +625,30 @@ fn component_memory_defaults_overrides_and_validation() {
     let try_parse = |yaml: &str| parse_recipe(yaml, Path::new("/proj"), Path::new("/proj/r.yaml"));
     let defaults = try_parse("{}").unwrap();
     assert_eq!(defaults.components.memory_mib, 16);
-    assert_eq!(defaults.components.total_memory_mib, 128);
-    let custom = try_parse("components: {memory_mib: 32, total_memory_mib: 256}").unwrap();
-    assert_eq!(custom.components.memory_mib, 32);
     assert_eq!(
-        custom.components.memory_limits().unwrap().total_bytes(),
-        256 << 20
+        defaults.components.memory_limits().unwrap().network_bytes(),
+        16 << 20
     );
+    let custom = try_parse("components: {memory_mib: 32, network: {memory_mib: 64}}").unwrap();
+    assert_eq!(
+        custom.components.memory_limits().unwrap().network_bytes(),
+        64 << 20
+    );
+    assert_eq!(custom.components.memory_mib, 32);
+    assert!(try_parse("components: {memory_mib: 256, network: {memory_mib: 512}}").is_ok());
     let encoded = yaml_serde::to_string(&custom).unwrap();
     assert_eq!(try_parse(&encoded).unwrap(), custom);
     for yaml in [
         "components: {memory_mib: 0}",
-        "components: {memory_mib: 129}",
+        "components: {memory_mib: 15}",
         "components: {total_memory_mib: 0}",
         "components: {memory_mib: 16, total_memory_mib: 16}",
         "components: {memory_mib: -1}",
         "components: {memory_mib: 4294967296}",
         "components: {unknown: 1}",
+        "components: {network: {memory_mib: 0}}",
+        "components: {network: {memory_mib: 15}}",
+        "components: {network: {memory_mib: 32, unknown: 1}}",
     ] {
         assert!(try_parse(yaml).is_err(), "{yaml}");
     }

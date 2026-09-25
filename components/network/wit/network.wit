@@ -2,7 +2,7 @@ package terra:network@0.1.0;
 
 interface api {
     record published-port { host-port: u16, guest-port: u16 }
-    record config { gateway-mac: list<u8>, gateway-ip: list<u8>, gateway-ip6: list<u8>, host-service-ports: list<option<u16>>, published-ports: list<published-port>, mtu: u32 }
+    record config { gateway-mac: list<u8>, gateway-ip: list<u8>, gateway-ip6: list<u8>, host-service-ports: list<option<u16>>, published-ports: list<published-port>, mtu: u32, flow-capacity: u32 }
     enum error { malformed, backpressure, not-ready }
     configure: func(config: config) -> result<_, error>;
     run: async func() -> result<_, error>;

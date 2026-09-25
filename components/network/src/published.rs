@@ -6,9 +6,8 @@ use smoltcp::iface::{Interface, SocketHandle, SocketSet};
 use smoltcp::socket::tcp::{Socket, SocketBuffer};
 use smoltcp::wire::IpListenEndpoint;
 
-const MAX_FLOWS: usize = 64;
-const FLOW_BUFFER_BYTES: usize = 32 * 1024;
-const PUMP_BYTES: usize = 4096;
+const FLOW_BUFFER_BYTES: usize = super::TCP_BUFFER_BYTES;
+const PUMP_BYTES: usize = super::TCP_CHUNK_BYTES;
 const FIRST_SOURCE_PORT: u16 = 49_152;
 
 pub enum Error {
@@ -50,9 +49,6 @@ impl PublishedTable {
         interface: &mut Interface,
         sockets: &mut SocketSet<'_>,
     ) -> Result<(), Error> {
-        if self.flows.len() == MAX_FLOWS {
-            return Err(Error::Full);
-        }
         if self.flows.iter().any(|flow| flow.grant == grant) {
             return Err(Error::Backpressure);
         }
@@ -82,10 +78,6 @@ impl PublishedTable {
             host_eof: false,
         });
         Ok(())
-    }
-
-    pub fn is_full(&self) -> bool {
-        self.flows.len() == MAX_FLOWS
     }
 
     pub fn register_send_waker(

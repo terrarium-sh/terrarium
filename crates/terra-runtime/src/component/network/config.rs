@@ -44,6 +44,7 @@ impl GuestNetworkConfig {
         self,
         host_service_ports: Vec<Option<u16>>,
         port_mappings: Vec<PortMapping>,
+        memory_limit: usize,
     ) -> NetworkConfig {
         NetworkConfig {
             gateway_mac: self.gateway_mac.to_vec(),
@@ -58,8 +59,17 @@ impl GuestNetworkConfig {
                 })
                 .collect(),
             mtu: 1500,
+            flow_capacity: flow_capacity(memory_limit),
         }
     }
+}
+
+fn flow_capacity(memory_limit: usize) -> u32 {
+    u32::try_from(
+        memory_limit.saturating_sub(terra_limits::NETWORK_SHARED_MEMORY_BYTES)
+            / terra_limits::NETWORK_FLOW_MEMORY_BYTES,
+    )
+    .unwrap_or(u32::MAX)
 }
 
 #[cfg(test)]
@@ -69,8 +79,12 @@ mod tests {
     #[test]
     fn component_config_uses_the_guest_layout() {
         let layout = GuestNetworkConfig::default();
-        let config =
-            layout.into_component_config(vec![Some(5432)], vec![PortMapping::new(8080, 80)]);
+        let config = layout.into_component_config(
+            vec![Some(5432)],
+            vec![PortMapping::new(8080, 80)],
+            32 << 20,
+        );
+        assert_eq!(config.flow_capacity, 960);
         assert_eq!(config.gateway_ip, layout.gateway_ip.octets());
         assert_eq!(config.gateway_ip6, layout.gateway_ip6.octets());
         assert_eq!(config.gateway_mac, layout.gateway_mac);

@@ -31,7 +31,7 @@ pub(super) fn admit(ram_bytes: u64, component_memory_bytes: usize) -> Result<Fil
     );
     ensure!(
         reservation_bytes <= available,
-        "insufficient available host memory: box needs {} MiB including native headroom; stop another box or reduce guest RAM",
+        "insufficient available host memory: box needs {} MiB including component memory and native headroom; stop another box or reduce guest RAM",
         reservation_bytes >> 20
     );
     let directory = crate::state::get_terra_home_path()?.join("admission");

@@ -36,6 +36,13 @@ pub const X86_HIGH_RAM_BASE: u64 = 0x1_0000_0000;
 pub const X86_ZERO_PAGE: u64 = X86_RAM_BASE + 0x7000;
 pub const RAM_PAGE_SIZE: u64 = 4096;
 const _: () = assert!(X86_RAM_LOW_END <= X86_MMIO_BASE);
+pub const NETWORK_TCP_BUFFER_BYTES: usize = 4096;
+pub const NETWORK_TCP_CHUNK_BYTES: usize = 2048;
+pub const NETWORK_SHARED_MEMORY_BYTES: usize = 2 << 20;
+// Admission estimates include payload queues, task state, and allocation overhead.
+pub const NETWORK_FLOW_MEMORY_BYTES: usize =
+    2 * NETWORK_TCP_BUFFER_BYTES + 4 * NETWORK_TCP_CHUNK_BYTES + (16 << 10);
+
 pub const MAX_VM_OPEN_FILES: usize = 4096;
 pub const MAX_SINGLE_GUEST_COPY_BYTES: u64 = 16 * 1024;
 pub const MAX_COMPONENT_HOSTCALL_BYTES: usize = 64 * 1024;

@@ -1,50 +1,50 @@
-//! Component store state and per-store and box-wide resource accounting.
+//! Component store state and per-store resource accounting.
 
 use crate::component::context::{DeviceContext, DeviceHost};
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-};
 use wasmtime::component::ResourceTable;
 use wasmtime::{Engine, ResourceLimiter, Store};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 pub const DEFAULT_COMPONENT_MEMORY_MIB: u32 = 16;
-pub const DEFAULT_TOTAL_MEMORY_MIB: u32 = 128;
-pub const BOX_WASM_MEMORY_BYTES: usize = (DEFAULT_TOTAL_MEMORY_MIB as usize) << 20;
 
 #[derive(Clone, Copy, Debug)]
 pub struct ComponentMemoryLimits {
     component_bytes: usize,
-    total_bytes: usize,
+    network_override: Option<usize>,
 }
 
 impl ComponentMemoryLimits {
-    pub fn new(component_bytes: usize, total_bytes: usize) -> wasmtime::Result<Self> {
+    pub fn new(component_bytes: usize) -> wasmtime::Result<Self> {
         wasmtime::ensure!(
-            component_bytes > 0 && component_bytes <= total_bytes,
-            "component memory limit must be positive and no larger than the total memory limit"
+            component_bytes >= STORE_MEMORY_BYTES,
+            "increase the component memory limit to at least {DEFAULT_COMPONENT_MEMORY_MIB} MiB"
         );
         Ok(Self {
             component_bytes,
-            total_bytes,
+            network_override: None,
         })
     }
 
-    /// Returns the remaining device limits and the reserved policy memory bytes.
-    pub fn reserve_policy(self) -> wasmtime::Result<(Self, usize)> {
-        let remaining = self.total_bytes.checked_sub(self.component_bytes)
-            .filter(|remaining| *remaining > 0)
-            .ok_or_else(|| wasmtime::Error::msg("network policy needs a separate component budget; increase components.total_memory_mib above components.memory_mib"))?;
-        Ok((
-            Self::new(self.component_bytes.min(remaining), remaining)?,
-            self.component_bytes,
-        ))
+    pub fn with_network_memory(mut self, bytes: usize) -> wasmtime::Result<Self> {
+        wasmtime::ensure!(
+            bytes >= STORE_MEMORY_BYTES,
+            "increase the network component memory limit to at least {DEFAULT_COMPONENT_MEMORY_MIB} MiB"
+        );
+        self.network_override = Some(bytes);
+        Ok(self)
+    }
+
+    pub fn admission_bytes(self) -> wasmtime::Result<usize> {
+        // Include root, temporary boot, and policy stores alongside the admitted workers.
+        self.component_bytes
+            .checked_mul(super::MAX_BOX_COMPONENT_WORKERS + 2)
+            .and_then(|bytes| bytes.checked_add(self.network_bytes().max(self.component_bytes)))
+            .ok_or_else(|| wasmtime::Error::msg("component memory reservation overflow"))
     }
 
     #[must_use]
-    pub fn total_bytes(self) -> usize {
-        self.total_bytes
+    pub fn network_bytes(self) -> usize {
+        self.network_override.unwrap_or(self.component_bytes)
     }
 
     #[must_use]
@@ -57,7 +57,7 @@ impl Default for ComponentMemoryLimits {
     fn default() -> Self {
         Self {
             component_bytes: STORE_MEMORY_BYTES,
-            total_bytes: BOX_WASM_MEMORY_BYTES,
+            network_override: None,
         }
     }
 }
@@ -67,43 +67,6 @@ impl Default for ComponentMemoryLimits {
 pub const STORE_MEMORY_BYTES: usize =
     (crate::box_runtime::store::DEFAULT_COMPONENT_MEMORY_MIB as usize) << 20;
 const COMPONENT_EPOCH_DEADLINE: u64 = 10;
-
-pub(super) struct BoxMemoryBudget {
-    limits: ComponentMemoryLimits,
-    reserved: AtomicUsize,
-}
-
-impl BoxMemoryBudget {
-    fn new(limits: ComponentMemoryLimits) -> Self {
-        Self {
-            limits,
-            reserved: AtomicUsize::new(0),
-        }
-    }
-
-    fn reserve(&self, bytes: usize) -> bool {
-        self.reserved
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                current
-                    .checked_add(bytes)
-                    .filter(|next| *next <= self.limits.total_bytes)
-            })
-            .is_ok()
-    }
-
-    fn release(&self, bytes: usize) {
-        let _ = self
-            .reserved
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                current.checked_sub(bytes)
-            });
-    }
-
-    #[cfg(test)]
-    pub(super) fn reserved(&self) -> usize {
-        self.reserved.load(Ordering::Acquire)
-    }
-}
 
 pub trait StoreHost: WasiView + 'static {
     fn retire(self)
@@ -126,23 +89,33 @@ pub type BoxHost = StoreState<RootHost>;
 
 pub struct StoreState<H: StoreHost> {
     host: Option<H>,
+    component_memory_limit: usize,
     wasm_memory_bytes: usize,
     pending_memory_growth: usize,
-    memory_budget: Arc<BoxMemoryBudget>,
+    memory_limits: ComponentMemoryLimits,
 }
 
 impl<H: StoreHost> StoreState<H> {
-    pub(super) fn with_budget(host: H, memory_budget: Arc<BoxMemoryBudget>) -> Self {
+    pub(super) fn with_limits(host: H, memory_limits: ComponentMemoryLimits) -> Self {
         Self {
             host: Some(host),
+            component_memory_limit: memory_limits.component_bytes(),
             wasm_memory_bytes: 0,
             pending_memory_growth: 0,
-            memory_budget,
+            memory_limits,
         }
     }
 
-    pub(super) fn memory_budget(&self) -> &Arc<BoxMemoryBudget> {
-        &self.memory_budget
+    pub(crate) fn network_memory_limit(&self) -> usize {
+        self.memory_limits.network_bytes()
+    }
+
+    pub(crate) fn use_network_memory_limit(&mut self) {
+        self.component_memory_limit = self.network_memory_limit();
+    }
+
+    pub(super) fn memory_limits(&self) -> ComponentMemoryLimits {
+        self.memory_limits
     }
 }
 
@@ -183,15 +156,12 @@ impl<H: StoreHost> Drop for StoreState<H> {
         if let Some(host) = self.host.take() {
             host.retire();
         }
-        self.memory_budget.release(self.wasm_memory_bytes);
     }
 }
 
 impl RootHost {
     #[must_use]
     pub fn new() -> Self {
-        let mut router_table = ResourceTable::new();
-        router_table.set_max_capacity(crate::component::context::MAX_DEVICE_RESOURCES);
         let lifecycle = crate::component::vmm::lifecycle::LifecycleHost::new();
         Self {
             platform: crate::component::vmm::PlatformHost::with_native_teardown(
@@ -205,7 +175,7 @@ impl RootHost {
                 .allow_udp(false)
                 .allow_ip_name_lookup(false)
                 .build(),
-            table: router_table,
+            table: ResourceTable::new(),
         }
     }
 }
@@ -234,7 +204,7 @@ impl BoxHost {
 
     #[must_use]
     pub fn with_memory_limits(limits: ComponentMemoryLimits) -> Self {
-        Self::with_budget(RootHost::new(), Arc::new(BoxMemoryBudget::new(limits)))
+        Self::with_limits(RootHost::new(), limits)
     }
 }
 impl WasiView for RootHost {
@@ -265,8 +235,7 @@ impl<H: StoreHost> ResourceLimiter for StoreState<H> {
         if self
             .wasm_memory_bytes
             .checked_add(growth)
-            .is_none_or(|total| total > self.memory_budget.limits.component_bytes)
-            || !self.memory_budget.reserve(growth)
+            .is_none_or(|total| total > self.component_memory_limit)
         {
             return Ok(false);
         }
@@ -280,7 +249,6 @@ impl<H: StoreHost> ResourceLimiter for StoreState<H> {
         self.wasm_memory_bytes = self
             .wasm_memory_bytes
             .saturating_sub(self.pending_memory_growth);
-        self.memory_budget.release(self.pending_memory_growth);
         self.pending_memory_growth = 0;
         Ok(())
     }
@@ -313,9 +281,6 @@ pub(super) fn create_store<H: StoreHost>(
 ) -> Store<StoreState<H>> {
     let mut store = Store::new(engine, host);
     store.set_hostcall_fuel(terra_limits::MAX_COMPONENT_HOSTCALL_BYTES);
-    if let Some(table) = store.concurrent_resource_table() {
-        table.set_max_capacity(crate::component::context::MAX_DEVICE_RESOURCES);
-    }
     store.set_epoch_deadline(COMPONENT_EPOCH_DEADLINE);
     store.epoch_deadline_async_yield_and_update(COMPONENT_EPOCH_DEADLINE);
     store.limiter(|host| host);
@@ -379,12 +344,23 @@ mod tests {
     }
 
     #[test]
-    fn router_host_resources_have_a_native_limit() {
-        let mut host = BoxHost::new();
-        for _ in 0..crate::component::context::MAX_DEVICE_RESOURCES {
-            host.table.push(0_u8).expect("resource slot");
+    fn concurrent_streams_do_not_exhaust_the_host_resource_budget() {
+        use wasmtime::component::StreamReader;
+
+        let engine = crate::engine::device_engine().unwrap();
+        let mut store = create_store(&engine, BoxHost::new());
+        for _ in 0..2 {
+            let mut streams = Vec::new();
+            for _ in 0..128 {
+                for _ in 0..2 {
+                    streams.push(StreamReader::new(&mut store, Vec::<u8>::new()).unwrap());
+                }
+            }
+            for mut stream in streams {
+                stream.close(&mut store).unwrap();
+            }
+            assert!(store.concurrent_resource_table().unwrap().is_empty());
         }
-        assert!(host.table.push(0_u8).is_err());
     }
 
     #[test]
@@ -431,7 +407,6 @@ mod tests {
         )
         .expect("memory type rejection");
         assert_eq!(host.wasm_memory_bytes, 4096);
-        assert_eq!(host.memory_budget.reserved(), 4096);
         assert!(
             !ResourceLimiter::memory_growing(
                 &mut host,
@@ -445,10 +420,9 @@ mod tests {
 
     #[test]
     fn component_limits_can_be_raised_and_invalid_limits_are_rejected() {
-        assert!(ComponentMemoryLimits::new(0, 1).is_err());
-        assert!(ComponentMemoryLimits::new(2, 1).is_err());
+        assert!(ComponentMemoryLimits::new(0).is_err());
         let mut host = BoxHost::with_memory_limits(
-            ComponentMemoryLimits::new(STORE_MEMORY_BYTES * 2, BOX_WASM_MEMORY_BYTES).unwrap(),
+            ComponentMemoryLimits::new(STORE_MEMORY_BYTES * 2).unwrap(),
         );
         assert!(
             ResourceLimiter::memory_growing(&mut host, 0, STORE_MEMORY_BYTES * 2, None).unwrap()
@@ -456,16 +430,51 @@ mod tests {
     }
 
     #[test]
-    fn policy_memory_reservation_preserves_the_total_box_limit() {
-        let limits = ComponentMemoryLimits::new(16 << 20, 128 << 20).unwrap();
-        let (remaining, policy_bytes) = limits.reserve_policy().unwrap();
-        assert_eq!(policy_bytes, 16 << 20);
-        assert_eq!(remaining.total_bytes() + policy_bytes, limits.total_bytes());
-        assert!(
-            ComponentMemoryLimits::new(16 << 20, 16 << 20)
+    fn admission_accounts_for_all_stores_and_network_overrides() {
+        let limits = ComponentMemoryLimits::default();
+        let baseline = limits.admission_bytes().unwrap();
+        assert_eq!(
+            baseline,
+            (super::super::MAX_BOX_COMPONENT_WORKERS + 3) * STORE_MEMORY_BYTES
+        );
+        assert_eq!(
+            limits
+                .with_network_memory(64 << 20)
                 .unwrap()
-                .reserve_policy()
+                .admission_bytes()
+                .unwrap(),
+            baseline + (48 << 20)
+        );
+        let raised = ComponentMemoryLimits::new(32 << 20).unwrap();
+        assert_eq!(raised.admission_bytes().unwrap(), baseline * 2);
+        assert_eq!(
+            raised
+                .with_network_memory(16 << 20)
+                .unwrap()
+                .admission_bytes()
+                .unwrap(),
+            baseline * 2
+        );
+        assert!(
+            ComponentMemoryLimits::new(usize::MAX)
+                .unwrap()
+                .admission_bytes()
                 .is_err()
         );
+    }
+
+    #[test]
+    fn network_override_preserves_other_store_limits() {
+        let limits = ComponentMemoryLimits::new(16 << 20)
+            .unwrap()
+            .with_network_memory(32 << 20)
+            .unwrap();
+        let mut ordinary = BoxHost::with_memory_limits(limits);
+        let mut network = BoxHost::with_memory_limits(limits);
+        network.use_network_memory_limit();
+        assert!(!ResourceLimiter::memory_growing(&mut ordinary, 0, 17 << 20, None).unwrap());
+        assert!(ResourceLimiter::memory_growing(&mut network, 0, 32 << 20, None).unwrap());
+        assert!(!ResourceLimiter::memory_growing(&mut network, 32 << 20, 33 << 20, None).unwrap());
+        assert!(ResourceLimiter::memory_growing(&mut ordinary, 0, 16 << 20, None).unwrap());
     }
 }

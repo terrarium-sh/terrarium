@@ -132,7 +132,11 @@ pub fn register_device_with_host_factory(
             "box network component already configured",
         ));
     }
-    let config = config.into_component_config(host_service_ports, port_mappings);
+    let config = config.into_component_config(
+        host_service_ports,
+        port_mappings,
+        runtime.store.data().network_memory_limit(),
+    );
     let child = runtime.child_factory();
     let component = component.clone();
     runtime.grant_device_worker(DeviceKind::Net, async move {
@@ -150,6 +154,7 @@ async fn create_worker(
     crate::box_runtime::DeviceWorker<NetworkHost>,
     crate::component::mmio::Serve,
 )> {
+    child.store.data_mut().use_network_memory_limit();
     let wake = child.store.data().context.interrupt_notification();
     let linker = network_component_linker(child.store.engine())?;
     let (instance, device_loop) =

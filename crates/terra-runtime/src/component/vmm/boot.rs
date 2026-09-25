@@ -42,11 +42,9 @@ pub struct BootHost {
 }
 impl Default for BootHost {
     fn default() -> Self {
-        let mut table = ResourceTable::new();
-        table.set_max_capacity(crate::component::context::MAX_DEVICE_RESOURCES);
         Self {
             grant: None,
-            table,
+            table: ResourceTable::new(),
             ctx: WasiCtxBuilder::new()
                 .max_random_size(crate::MAX_SINGLE_BYTES)
                 .allow_tcp(false)
@@ -262,7 +260,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn boot_traps_and_releases_the_isolated_store() {
+    async fn boot_component_traps_are_reported() {
         let engine = crate::engine::device_engine().expect("engine");
         let runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
         let component = hostile_component(&engine, "unreachable");
@@ -276,11 +274,10 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert_eq!(runtime.reserved_component_memory(), 0);
     }
 
     #[tokio::test]
-    async fn boot_deadline_releases_the_isolated_store() {
+    async fn boot_component_infinite_loop_reaches_deadline() {
         let engine = crate::engine::device_engine().expect("engine");
         let runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
         let component = hostile_component(&engine, "(loop br 0)");
@@ -294,11 +291,10 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert_eq!(runtime.reserved_component_memory(), 0);
     }
 
     #[tokio::test]
-    async fn boot_component_rejects_a_malformed_kernel_without_retaining_a_store() {
+    async fn boot_component_rejects_a_malformed_kernel() {
         let engine = crate::engine::device_engine().expect("engine");
         let runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
         let component =
@@ -313,7 +309,6 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert_eq!(runtime.reserved_component_memory(), 0);
     }
 
     #[test]

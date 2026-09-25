@@ -37,13 +37,7 @@ pub(crate) struct PreparedWorker {
 }
 
 impl BoxRuntime {
-    #[cfg(test)]
-    pub(crate) fn reserved_component_memory(&self) -> usize {
-        self.memory_budget.reserved()
-    }
-
     pub fn new(engine: &Engine, host: BoxHost) -> wasmtime::Result<Self> {
-        let memory_budget = Arc::clone(host.memory_budget());
         let epoch_clock = EpochClock::start(engine.clone())?;
         let (shutdown, _) = watch::channel(false);
         Ok(Self {
@@ -52,7 +46,6 @@ impl BoxRuntime {
             mmio: None,
             interrupt_controller_configured: false,
             epoch_clock,
-            memory_budget,
             shutdown,
             children: Vec::new(),
             component_loops: Vec::new(),
@@ -66,11 +59,11 @@ impl BoxRuntime {
     pub(crate) fn child_factory<H: StoreHost>(
         &self,
     ) -> impl FnOnce(H) -> DeviceWorker<H> + Send + 'static {
-        let memory_budget = Arc::clone(&self.memory_budget);
+        let memory_limits = self.store.data().memory_limits();
         let epoch_clock = Arc::clone(&self.epoch_clock);
         let engine = self.store.engine().clone();
         move |host| DeviceWorker {
-            store: create_store(&engine, StoreState::with_budget(host, memory_budget)),
+            store: create_store(&engine, StoreState::with_limits(host, memory_limits)),
             epoch_clock,
             component_loops: Vec::new(),
         }
@@ -91,8 +84,7 @@ impl BoxRuntime {
 
     pub(crate) fn attach_worker(&mut self, child: WorkerTask) -> wasmtime::Result<()> {
         wasmtime::ensure!(
-            Arc::ptr_eq(&self.epoch_clock, &child.epoch_clock)
-                && Arc::ptr_eq(&self.memory_budget, &child.memory_budget),
+            Arc::ptr_eq(&self.epoch_clock, &child.epoch_clock),
             "child runtime belongs to another box"
         );
         wasmtime::ensure!(

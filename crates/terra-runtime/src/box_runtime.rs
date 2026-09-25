@@ -18,10 +18,8 @@ use wasmtime::{Engine, Store};
 pub(crate) mod setup;
 pub(crate) mod store;
 
-use store::BoxMemoryBudget;
 pub use store::{
-    BoxHost, ComponentMemoryLimits, DEFAULT_COMPONENT_MEMORY_MIB, DEFAULT_TOTAL_MEMORY_MIB,
-    RootHost, StoreHost, StoreState,
+    BoxHost, ComponentMemoryLimits, DEFAULT_COMPONENT_MEMORY_MIB, RootHost, StoreHost, StoreState,
 };
 
 pub(crate) const BOX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -93,7 +91,6 @@ pub struct BoxRuntime {
     pub(crate) mmio: Option<crate::component::mmio::MmioInstance>,
     pub(crate) interrupt_controller_configured: bool,
     epoch_clock: Arc<EpochClock>,
-    memory_budget: Arc<BoxMemoryBudget>,
     shutdown: watch::Sender<bool>,
     children: Vec<WorkerTask>,
     component_loops: Vec<ComponentLoop>,
@@ -118,7 +115,6 @@ pub(crate) struct WorkerTask {
     run: Pin<Box<dyn Future<Output = wasmtime::Result<()>> + Send>>,
     executor: Option<tokio::runtime::Handle>,
     epoch_clock: Arc<EpochClock>,
-    memory_budget: Arc<BoxMemoryBudget>,
     loop_count: usize,
 }
 
@@ -315,7 +311,6 @@ impl<H: StoreHost> DeviceWorker<H> {
         WorkerTask {
             executor: None,
             epoch_clock: Arc::clone(&self.epoch_clock),
-            memory_budget: Arc::clone(self.store.data().memory_budget()),
             loop_count: self.component_loops.len(),
             run: Box::pin(async move { self.run(shutdown).await }),
         }

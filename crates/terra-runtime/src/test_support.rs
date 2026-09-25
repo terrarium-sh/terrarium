@@ -78,18 +78,19 @@ mod tests {
         use wasmtime::ResourceLimiter as _;
 
         let engine = crate::engine::device_engine().expect("engine");
-        let limits = crate::box_runtime::store::ComponentMemoryLimits::new(65_536, 65_536)
+        let limits = crate::box_runtime::store::ComponentMemoryLimits::new(16 << 20)
             .expect("component limits");
         let mut store = super::device_store_with_limits(
             &engine,
             super::DeviceContext::new(4096).expect("RAM"),
             limits,
         );
-        let memory = wasmtime::Memory::new(&mut store, wasmtime::MemoryType::new(1, None)).unwrap();
+        let memory =
+            wasmtime::Memory::new(&mut store, wasmtime::MemoryType::new(256, None)).unwrap();
         assert!(memory.grow(&mut store, 1).is_err());
-        assert_eq!(memory.size(&store), 1);
-        wasmtime::Memory::new(&mut store, wasmtime::MemoryType::new(1, None)).unwrap();
-        assert!(wasmtime::Memory::new(&mut store, wasmtime::MemoryType::new(2, None)).is_err());
+        assert_eq!(memory.size(&store), 256);
+        wasmtime::Memory::new(&mut store, wasmtime::MemoryType::new(256, None)).unwrap();
+        assert!(wasmtime::Memory::new(&mut store, wasmtime::MemoryType::new(257, None)).is_err());
         let limits = &mut store.data_mut().limits;
         assert!(limits.table_growing(0, 1024, None).unwrap());
         assert!(!limits.table_growing(0, 1025, None).unwrap());

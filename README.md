@@ -56,7 +56,7 @@ Then sandbox a project:
 cd ~/code/my-app
 cat > dev.yaml <<'EOF'
 hw: { cpus: 2, mem_mib: 1024 }
-components: { memory_mib: 16, total_memory_mib: 128 }
+components: { memory_mib: 16 }
 network:
   mode: unrestricted-public              # public egress; private ranges stay blocked
 workload:

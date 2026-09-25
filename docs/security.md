@@ -161,12 +161,19 @@ Guest diagnostic events are limited to 64 KiB, enter a bounded queue, and are
 written through an 8 MiB per-file cap. This prevents diagnostic floods from
 growing the host log without bound; it is not a general storage quota.
 
-Component memory has configurable per-store and box-wide Wasm linear-memory
-limits (16 MiB and 128 MiB by default). Those limits do not bound guest RAM,
+Component memory has independent per-store Wasm linear-memory limits, with
+a default and minimum configurable ceiling of 16 MiB. There is no combined
+component memory cap. Those limits do not bound guest RAM,
 native/WASI allocations, kernel socket memory, CPU time, disk use in writable
-shares, or bandwidth. Terra also performs per-home admission accounting, but
-that is not a host-wide resource quota. Apply operating-system limits or a
-dedicated host when hard resource isolation is required.
+shares, or bandwidth. Terra's per-home admission accounting reserves the maximum
+configured component footprint plus guest RAM and native headroom. This is not
+a host-wide resource quota. Apply operating-system limits or a dedicated host
+when hard resource isolation is required.
+
+Native resource tables use Wasmtime's default capacity except where a device
+sets its own limit, such as filesystem descriptors. Network flow admission
+bounds concurrent socket work; Wasm memory ceilings do not bound native table
+allocations or the size of their entries.
 
 Terra keeps its box state, recipes, images, logs, and local control sockets
 under `~/.terra` with owner-only permissions where the platform supports them.

@@ -145,11 +145,10 @@ pub fn render_policy_summary(cfg: &config::Config) -> String {
         "  hardware: {} vCPU, {} MiB RAM, {} MiB rootfs",
         hw.cpus, hw.mem_mib, hw.rootfs_mib
     );
-    let _ = writeln!(
-        out,
-        "  components: {} MiB each, {} MiB total",
-        components.memory_mib, components.total_memory_mib
-    );
+    let _ = writeln!(out, "  components: {} MiB each", components.memory_mib);
+    if let Some(network) = &components.network {
+        let _ = writeln!(out, "  network component: {} MiB", network.memory_mib);
+    }
     let _ = writeln!(out, "  egress:   {}", network::describe(network));
     for rule in allow {
         let _ = writeln!(out, "  allow:    {}", escape_printable(rule));
@@ -455,7 +454,7 @@ mod tests {
         let cfg = config::Config {
             components: config::Components {
                 memory_mib: 32,
-                total_memory_mib: 256,
+                network: Some(config::NetworkComponent { memory_mib: 64 }),
             },
             hw: config::Hw {
                 cpus: 4,
@@ -465,7 +464,8 @@ mod tests {
             ..yaml_serde::from_str("{}").unwrap()
         };
         let summary = render_policy_summary(&cfg);
-        assert!(summary.contains("components: 32 MiB each, 256 MiB total"));
+        assert!(summary.contains("components: 32 MiB each"));
+        assert!(summary.contains("network component: 64 MiB"));
         assert!(
             summary.contains("hardware: 4 vCPU, 4096 MiB RAM, 2048 MiB rootfs"),
             "{summary}"

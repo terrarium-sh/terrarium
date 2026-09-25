@@ -107,7 +107,9 @@ pub async fn run(
     let component_memory_limits = spec.cfg.components.memory_limits()?;
     let _resources = super::resources::admit(
         u64::from(spec.cfg.hw.mem_mib) << 20,
-        component_memory_limits.total_bytes(),
+        component_memory_limits
+            .admission_bytes()
+            .map_err(|error| anyhow::anyhow!("{error}"))?,
     )?;
     if spec.mode == PlanMode::Run {
         sys::install_stop_signal_handlers();
@@ -125,13 +127,9 @@ pub async fn run(
     } else {
         Vec::new()
     };
-    let (component_memory_limits, policy_memory_bytes) =
-        component_memory_limits
-            .reserve_policy()
-            .map_err(|error| anyhow::anyhow!("{error:#}"))?;
     let policy = Arc::new(runtime::BoxPolicy::with_memory_limit(
         &spec.cfg.network,
-        policy_memory_bytes,
+        component_memory_limits.component_bytes(),
     )?);
 
     log::info!(

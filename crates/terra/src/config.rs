@@ -40,14 +40,21 @@ pub struct Config {
 #[serde(default, deny_unknown_fields)]
 pub struct Components {
     pub memory_mib: u32,
-    pub total_memory_mib: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network: Option<NetworkComponent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkComponent {
+    pub memory_mib: u32,
 }
 
 impl Default for Components {
     fn default() -> Self {
         Self {
             memory_mib: terra_runtime::box_runtime::DEFAULT_COMPONENT_MEMORY_MIB,
-            total_memory_mib: terra_runtime::box_runtime::DEFAULT_TOTAL_MEMORY_MIB,
+            network: None,
         }
     }
 }
@@ -56,11 +63,18 @@ impl Components {
     pub fn memory_limits(&self) -> Result<terra_runtime::box_runtime::ComponentMemoryLimits> {
         let component_bytes = usize::try_from(u64::from(self.memory_mib) << 20)
             .context("components.memory_mib is too large for this host")?;
-        let total_bytes = usize::try_from(u64::from(self.total_memory_mib) << 20)
-            .context("components.total_memory_mib is too large for this host")?;
-        terra_runtime::box_runtime::ComponentMemoryLimits::new(component_bytes, total_bytes)
+        let mut limits = terra_runtime::box_runtime::ComponentMemoryLimits::new(component_bytes)
             .map_err(|error| anyhow::anyhow!("{error}"))
-            .context("set components.memory_mib > 0 and components.total_memory_mib >= components.memory_mib")
+            .context("invalid components.memory_mib")?;
+        if let Some(network) = &self.network {
+            let bytes = usize::try_from(u64::from(network.memory_mib) << 20)
+                .context("components.network.memory_mib is too large for this host")?;
+            limits = limits
+                .with_network_memory(bytes)
+                .map_err(|error| anyhow::anyhow!("{error}"))
+                .context("invalid components.network.memory_mib")?;
+        }
+        Ok(limits)
     }
 }
 

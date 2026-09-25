@@ -58,8 +58,8 @@ const MAX_FRAME_BYTES: usize = 65_536;
 const MAX_QUEUED_FRAMES: usize = 128;
 const MAX_QUEUED_BYTES: usize = 512 * 1024;
 const MAX_WORK_PER_WAKE: usize = 8;
-const MAX_FLOWS: usize = 128;
-const TCP_BUFFER_BYTES: usize = 32 * 1024;
+const TCP_BUFFER_BYTES: usize = terra_limits::NETWORK_TCP_BUFFER_BYTES;
+const TCP_CHUNK_BYTES: usize = terra_limits::NETWORK_TCP_CHUNK_BYTES;
 const TCP_FLOW_TIMEOUT_SECS: u64 = 30;
 const DNS_PORT: u16 = 53;
 const LEARNED_DNS_TTL_SECS: u32 = 60;
@@ -75,6 +75,7 @@ struct GatewayConfig {
     host_service_ports: Vec<Option<u16>>,
     published_ports: Vec<PublishedPort>,
     mtu: usize,
+    flow_capacity: usize,
 }
 
 struct DeviceFrame {
@@ -127,7 +128,7 @@ impl TxToken for Tx<'_> {
 struct Flow {
     id: u32,
     guest: TcpFlow,
-    socket: SocketHandle,
+    socket: Option<SocketHandle>,
     outgoing: Sender<Vec<u8>>,
     pending_guest_data: Option<Vec<u8>>,
     abort: AbortHandle,
@@ -362,6 +363,19 @@ impl Gateway {
             .then_some(())
             .ok_or(Error::Malformed)
     }
+    fn flow_capacity(&self) -> usize {
+        self.config
+            .as_ref()
+            .map_or(0, |config| config.flow_capacity)
+    }
+    fn has_flow_capacity(&self, slots: usize) -> bool {
+        self.flows.len()
+            + self.udp_flows.len()
+            + self.background.len()
+            + 2 * self.published_flows.len()
+            + slots
+            <= self.flow_capacity()
+    }
     fn add_flow(&mut self, guest: TcpFlow) -> Result<Option<HostFlowStart>, Error> {
         if self.flows.iter().any(|flow| flow.guest == guest) {
             return Ok(None);
@@ -371,9 +385,43 @@ impl Gateway {
         let Some(connect_destination) = connect_destination else {
             return Err(Error::NotReady);
         };
-        if self.flows.len() + self.udp_flows.len() == MAX_FLOWS {
+        if !self.has_flow_capacity(1) {
             return Err(Error::Backpressure);
         }
+        let id = self.next_flow;
+        self.next_flow = self.next_flow.wrapping_add(1);
+        let (outgoing, incoming) = channel(1);
+        let (abort, registration) = AbortHandle::new_pair();
+        self.flows.push(Flow {
+            id,
+            guest,
+            socket: None,
+            outgoing,
+            pending_guest_data: None,
+            abort: abort.clone(),
+        });
+        Ok(Some(HostFlowStart {
+            generation: GENERATION.load(Ordering::Acquire),
+            id,
+            destination: connect_destination,
+            port: guest.destination_port,
+            outgoing: incoming,
+            registration,
+        }))
+    }
+    fn activate_flow(&mut self, generation: u64, id: u32) -> Result<(), Error> {
+        if generation != GENERATION.load(Ordering::Acquire) {
+            return Err(Error::NotReady);
+        }
+        let flow = self
+            .flows
+            .iter_mut()
+            .find(|flow| flow.id == id)
+            .ok_or(Error::NotReady)?;
+        if flow.socket.is_some() {
+            return Ok(());
+        }
+        let guest = flow.guest;
         let mut socket = tcp::Socket::new(
             SocketBuffer::new(vec![0; TCP_BUFFER_BYTES]),
             SocketBuffer::new(vec![0; TCP_BUFFER_BYTES]),
@@ -388,33 +436,25 @@ impl Gateway {
             })
             .map_err(|_| Error::Backpressure)?;
         let socket = self.sockets.add(socket);
-        let id = self.next_flow;
-        self.next_flow = self.next_flow.wrapping_add(1);
-        let (outgoing, incoming) = channel(4);
-        let (abort, registration) = AbortHandle::new_pair();
-        self.flows.push(Flow {
-            id,
-            guest,
-            socket,
-            outgoing,
-            pending_guest_data: None,
-            abort: abort.clone(),
-        });
-        Ok(Some(HostFlowStart {
-            generation: GENERATION.load(Ordering::Acquire),
-            id,
-            destination: connect_destination,
-            port: guest.destination_port,
-            outgoing: incoming,
-            registration,
-        }))
+        flow.socket = Some(socket);
+        Ok(())
     }
+
+    #[cfg(test)]
+    fn add_connected_flow(&mut self, guest: TcpFlow) -> Result<Option<HostFlowStart>, Error> {
+        let flow = self.add_flow(guest)?;
+        if let Some(flow) = &flow {
+            self.activate_flow(flow.generation, flow.id)?;
+        }
+        Ok(flow)
+    }
+
     fn add_udp_flow(&mut self, request: UdpRequest) -> Result<UdpFlowStart, Error> {
         let destination = self.socket_destination(request.destination, request.destination_port);
         let Some(destination) = destination else {
             return Err(Error::NotReady);
         };
-        if self.flows.len() + self.udp_flows.len() == MAX_FLOWS {
+        if !self.has_flow_capacity(1) {
             return Err(Error::Backpressure);
         }
         let id = self.next_flow;
@@ -434,21 +474,36 @@ impl Gateway {
             return;
         }
         self.udp_flows.retain(|flow| flow.id != id);
+        PUBLISHED_FLOW_WAKER.wake();
+    }
+    fn reject_pending_flow(&mut self, generation: u64, id: u32, syn_frame: &[u8]) {
+        if generation != GENERATION.load(Ordering::Acquire)
+            || !self
+                .flows
+                .iter()
+                .any(|flow| flow.id == id && flow.socket.is_none())
+        {
+            return;
+        }
+        self.finish_flow(generation, id);
+        if let Some(reset) = tcp_reset(syn_frame) {
+            let _ = self.enqueue(reset);
+        }
     }
     fn finish_flow(&mut self, generation: u64, id: u32) {
         if GENERATION.load(Ordering::Acquire) != generation {
             return;
         }
-        let Some(socket) = self
-            .flows
-            .iter()
-            .find(|flow| flow.id == id)
-            .map(|flow| flow.socket)
-        else {
+        let Some(index) = self.flows.iter().position(|flow| flow.id == id) else {
+            return;
+        };
+        let Some(socket) = self.flows[index].socket else {
+            self.flows.swap_remove(index);
+            PUBLISHED_FLOW_WAKER.wake();
             return;
         };
         self.sockets.get_mut::<tcp::Socket>(socket).abort();
-        if self.finished_flows.len() < MAX_FLOWS && !self.finished_flows.contains(&id) {
+        if !self.finished_flows.contains(&id) {
             self.finished_flows.push_back(id);
         }
         WORK_WAKER.wake();
@@ -457,8 +512,13 @@ impl Gateway {
         if GENERATION.load(Ordering::Acquire) != generation {
             return;
         }
-        if let Some(flow) = self.flows.iter().find(|flow| flow.id == id) {
-            self.sockets.get_mut::<tcp::Socket>(flow.socket).close();
+        if let Some(socket) = self
+            .flows
+            .iter()
+            .find(|flow| flow.id == id)
+            .and_then(|flow| flow.socket)
+        {
+            self.sockets.get_mut::<tcp::Socket>(socket).close();
             let _ = self.pump(None);
             WORK_WAKER.wake();
         }
@@ -469,8 +529,8 @@ impl Gateway {
             .flows
             .iter()
             .filter(|flow| {
-                let socket = self.sockets.get::<tcp::Socket>(flow.socket);
-                !socket.is_open()
+                flow.socket
+                    .is_some_and(|socket| !self.sockets.get::<tcp::Socket>(socket).is_open())
             })
             .map(|flow| flow.id)
             .collect::<Vec<_>>();
@@ -484,21 +544,20 @@ impl Gateway {
             let Some(index) = self.flows.iter().position(|flow| flow.id == id) else {
                 continue;
             };
-            if self
-                .sockets
-                .get::<tcp::Socket>(self.flows[index].socket)
-                .state()
-                != tcp::State::Closed
-            {
+            let Some(socket) = self.flows[index].socket else {
+                continue;
+            };
+            if self.sockets.get::<tcp::Socket>(socket).state() != tcp::State::Closed {
                 self.finished_flows.push_back(id);
                 continue;
             }
-            let flow = self.flows.swap_remove(index);
-            self.sockets.remove(flow.socket);
+            self.flows.swap_remove(index);
+            self.sockets.remove(socket);
+            PUBLISHED_FLOW_WAKER.wake();
         }
     }
     fn add_background(&mut self) -> Result<(u64, u32, AbortRegistration), Error> {
-        if self.background.len() == MAX_FLOWS {
+        if !self.has_flow_capacity(1) {
             return Err(Error::Backpressure);
         }
         let id = self.next_background;
@@ -516,6 +575,7 @@ impl Gateway {
         if GENERATION.load(Ordering::Acquire) == generation {
             self.background
                 .retain(|task| task.generation != generation || task.id != id);
+            PUBLISHED_FLOW_WAKER.wake();
         }
     }
     fn add_published_flow(
@@ -523,7 +583,7 @@ impl Gateway {
         guest_port: u16,
         socket: wasi::sockets::types::TcpSocket,
     ) -> Result<PublishedFlowStart, AddPublishedFlowError> {
-        if self.published.is_full() {
+        if !self.has_flow_capacity(2) {
             return Err(AddPublishedFlowError::Full(socket));
         }
         let config = self.config.as_ref().ok_or(AddPublishedFlowError::Failed)?;
@@ -548,7 +608,7 @@ impl Gateway {
             }
         }
         let _ = self.pump(None);
-        let (outgoing, incoming) = channel(4);
+        let (outgoing, incoming) = channel(1);
         let (abort, registration) = AbortHandle::new_pair();
         self.published_flows.push(PublishedFlow {
             id,
@@ -605,7 +665,7 @@ impl Gateway {
         for flow in &mut self.published_flows {
             for data in self
                 .published
-                .take_upstream(flow.id, 4096)
+                .take_upstream(flow.id, TCP_CHUNK_BYTES)
                 .map_err(|_| Error::Backpressure)?
             {
                 if let Err(error) = flow.outgoing.try_send(data) {
@@ -693,15 +753,18 @@ impl Gateway {
     }
     fn guest_data(&mut self) {
         for flow in &mut self.flows {
+            let Some(socket) = flow.socket else {
+                continue;
+            };
             if let Some(data) = flow.pending_guest_data.take()
                 && let Err(error) = flow.outgoing.try_send(data)
             {
                 flow.pending_guest_data = Some(error.into_inner());
                 continue;
             }
-            let socket = self.sockets.get_mut::<tcp::Socket>(flow.socket);
+            let socket = self.sockets.get_mut::<tcp::Socket>(socket);
             while socket.can_recv() {
-                let mut data = vec![0; socket.recv_queue().min(4096)];
+                let mut data = vec![0; socket.recv_queue().min(TCP_CHUNK_BYTES)];
                 match socket.recv_slice(&mut data) {
                     Ok(size) if size > 0 => {
                         data.truncate(size);
@@ -732,7 +795,7 @@ impl Gateway {
             .flows
             .iter()
             .find(|flow| flow.id == id)
-            .map(|flow| flow.socket)
+            .and_then(|flow| flow.socket)
             .ok_or(Error::Malformed)?;
         let size = self
             .sockets
@@ -753,7 +816,7 @@ impl Gateway {
             .flows
             .iter()
             .find(|flow| flow.id == id)
-            .map(|flow| flow.socket)
+            .and_then(|flow| flow.socket)
         {
             self.sockets
                 .get_mut::<tcp::Socket>(socket)
@@ -824,6 +887,62 @@ fn tcp_syn(frame: &[u8]) -> Option<TcpFlow> {
         _ => None,
     }
 }
+fn tcp_reset(frame: &[u8]) -> Option<Vec<u8>> {
+    use smoltcp::phy::ChecksumCapabilities;
+    use smoltcp::wire::{IpRepr, TcpControl, TcpRepr, TcpSeqNumber};
+
+    let flow = tcp_syn(frame)?;
+    let ethernet = EthernetFrame::new_checked(frame).ok()?;
+    let acknowledgement = match ethernet.ethertype() {
+        EthernetProtocol::Ipv4 => {
+            let ip = Ipv4Packet::new_checked(ethernet.payload()).ok()?;
+            let tcp = TcpPacket::new_checked(ip.payload()).ok()?;
+            tcp.seq_number() + tcp.segment_len()
+        }
+        EthernetProtocol::Ipv6 => {
+            let ip = Ipv6Packet::new_checked(ethernet.payload()).ok()?;
+            let tcp = TcpPacket::new_checked(ip.payload()).ok()?;
+            tcp.seq_number() + tcp.segment_len()
+        }
+        _ => return None,
+    };
+    let reset = TcpRepr {
+        src_port: flow.destination_port,
+        dst_port: flow.source_port,
+        control: TcpControl::Rst,
+        seq_number: TcpSeqNumber(0),
+        ack_number: Some(acknowledgement),
+        window_len: 0,
+        window_scale: None,
+        max_seg_size: None,
+        sack_permitted: false,
+        sack_ranges: [None; 3],
+        timestamp: None,
+        payload: &[],
+    };
+    let ip = IpRepr::new(
+        flow.destination.into(),
+        flow.source.into(),
+        IpProtocol::Tcp,
+        reset.buffer_len(),
+        64,
+    );
+    let mut frame = vec![0; 14 + ip.buffer_len()];
+    let mut reply = EthernetFrame::new_unchecked(&mut frame);
+    reply.set_src_addr(ethernet.dst_addr());
+    reply.set_dst_addr(ethernet.src_addr());
+    reply.set_ethertype(ethernet.ethertype());
+    let checksums = ChecksumCapabilities::default();
+    ip.emit(reply.payload_mut(), &checksums);
+    reset.emit(
+        &mut TcpPacket::new_unchecked(&mut reply.payload_mut()[ip.header_len()..]),
+        &ip.src_addr(),
+        &ip.dst_addr(),
+        &checksums,
+    );
+    Some(frame)
+}
+
 fn udp_request(frame: &[u8]) -> Option<UdpRequest> {
     let ethernet = EthernetFrame::new_checked(frame).ok()?;
     let (source, destination, payload) = match ethernet.ethertype() {
@@ -984,6 +1103,7 @@ fn config(config: Config) -> Result<GatewayConfig, Error> {
             host_service_ports: config.host_service_ports,
             published_ports: config.published_ports,
             mtu,
+            flow_capacity: usize::try_from(config.flow_capacity).map_err(|_| Error::Malformed)?,
         })
         .ok_or(Error::Malformed)
 }
@@ -1104,7 +1224,7 @@ async fn add_published_flow(guest_port: u16, socket: wasi::sockets::types::TcpSo
             Err(AddPublishedFlowError::Full(socket)) => {
                 pending_socket = Some(socket);
                 PUBLISHED_FLOW_WAKER.register(context.waker());
-                if !gateway().published.is_full() {
+                if gateway().has_flow_capacity(2) {
                     context.waker().wake_by_ref();
                 }
                 Poll::Pending
@@ -1114,6 +1234,14 @@ async fn add_published_flow(guest_port: u16, socket: wasi::sockets::types::TcpSo
     })
     .await
 }
+async fn next_host_chunk(
+    outgoing: &mut (impl futures::Stream<Item = Vec<u8>> + Unpin),
+) -> Option<Vec<u8>> {
+    let chunk = outgoing.next().await?;
+    tick();
+    Some(chunk)
+}
+
 fn start_published_flow(flow: PublishedFlowStart) {
     let PublishedFlowStart {
         generation,
@@ -1132,7 +1260,10 @@ fn start_published_flow(flow: PublishedFlowStart) {
                 let mut outgoing = outgoing.fuse();
                 let input = async {
                     loop {
-                        match incoming_stream.read(Vec::with_capacity(4096)).await {
+                        match incoming_stream
+                            .read(Vec::with_capacity(TCP_CHUNK_BYTES))
+                            .await
+                        {
                             (
                                 wit_bindgen::rt::async_support::StreamResult::Complete(size),
                                 data,
@@ -1147,7 +1278,7 @@ fn start_published_flow(flow: PublishedFlowStart) {
                 }
                 .fuse();
                 let output = async move {
-                    while let Some(data) = outgoing.next().await {
+                    while let Some(data) = next_host_chunk(&mut outgoing).await {
                         if !writer.write_all(data).await.is_empty() {
                             return false;
                         }
@@ -1216,7 +1347,30 @@ async fn deliver_host_tcp(generation: u64, id: u32, mut data: Vec<u8>) -> bool {
     true
 }
 
-fn start_host_flow(flow: HostFlowStart) {
+async fn connect_host_tcp(socket: &TcpSocket, destination: IpAddr, port: u16) -> bool {
+    let address = match destination {
+        IpAddr::V4(address) => IpSocketAddress::Ipv4(Ipv4SocketAddress {
+            address: address.octets().into(),
+            port,
+        }),
+        IpAddr::V6(address) => IpSocketAddress::Ipv6(Ipv6SocketAddress {
+            address: address.segments().into(),
+            port,
+            flow_info: 0,
+            scope_id: 0,
+        }),
+    };
+    let connect = socket.connect(address).fuse();
+    let timeout =
+        wasi::clocks::monotonic_clock::wait_for(TCP_FLOW_TIMEOUT_SECS * 1_000_000_000).fuse();
+    futures::pin_mut!(connect, timeout);
+    futures::select! {
+        result = connect => result.is_ok(),
+        () = timeout => false,
+    }
+}
+
+fn start_host_flow(flow: HostFlowStart, syn_frame: Vec<u8>) {
     let HostFlowStart {
         generation,
         id,
@@ -1232,30 +1386,22 @@ fn start_host_flow(flow: HostFlowStart) {
                     IpAddr::V4(_) => IpAddressFamily::Ipv4,
                     IpAddr::V6(_) => IpAddressFamily::Ipv6,
                 }) else {
+                    gateway().reject_pending_flow(generation, id, &syn_frame);
                     return false;
                 };
-                if socket
-                    .connect(match destination {
-                        IpAddr::V4(address) => IpSocketAddress::Ipv4(Ipv4SocketAddress {
-                            address: (
-                                address.octets()[0],
-                                address.octets()[1],
-                                address.octets()[2],
-                                address.octets()[3],
-                            ),
-                            port,
-                        }),
-                        IpAddr::V6(address) => IpSocketAddress::Ipv6(Ipv6SocketAddress {
-                            address: address.segments().into(),
-                            port,
-                            flow_info: 0,
-                            scope_id: 0,
-                        }),
-                    })
-                    .await
-                    .is_err()
-                {
+                if !connect_host_tcp(&socket, destination, port).await {
+                    gateway().reject_pending_flow(generation, id, &syn_frame);
                     return false;
+                }
+                {
+                    let mut state = gateway();
+                    if state
+                        .activate_flow(generation, id)
+                        .and_then(|()| state.pump(Some(syn_frame)))
+                        .is_err()
+                    {
+                        return false;
+                    }
                 }
                 let (mut writer, outgoing_stream) = wit_stream::new();
                 let send = socket.send(outgoing_stream).into_future().fuse();
@@ -1263,7 +1409,7 @@ fn start_host_flow(flow: HostFlowStart) {
                 let receive = receive.into_future().fuse();
                 let mut outgoing = outgoing.fuse();
                 let forward = async move {
-                    while let Some(data) = outgoing.next().await {
+                    while let Some(data) = next_host_chunk(&mut outgoing).await {
                         if !writer.write_all(data).await.is_empty() {
                             return;
                         }
@@ -1272,7 +1418,10 @@ fn start_host_flow(flow: HostFlowStart) {
                 .fuse();
                 let incoming = async {
                     loop {
-                        match incoming_stream.read(Vec::with_capacity(4096)).await {
+                        match incoming_stream
+                            .read(Vec::with_capacity(TCP_CHUNK_BYTES))
+                            .await
+                        {
                             (StreamResult::Complete(size), data) if size > 0 => {
                                 if !deliver_host_tcp(generation, id, data[..size].to_vec()).await {
                                     return false;
@@ -1478,9 +1627,20 @@ pub(crate) fn receive_frame(frame: Vec<u8>) -> Result<(), Error> {
         gateway().enqueue(reply)?;
         return Ok(());
     }
-    let host_flow = tcp_syn(&frame)
-        .map(|flow| gateway().add_flow(flow))
-        .transpose()?;
+    if let Some(guest) = tcp_syn(&frame) {
+        let host_flow = gateway().add_flow(guest)?;
+        if let Some(flow) = host_flow {
+            start_host_flow(flow, frame);
+            return Ok(());
+        }
+        if gateway()
+            .flows
+            .iter()
+            .any(|flow| flow.guest == guest && flow.socket.is_none())
+        {
+            return Ok(());
+        }
+    }
     let udp_request = udp_request(&frame);
     let is_udp = udp_request.is_some();
     let udp_flow = udp_request
@@ -1494,9 +1654,6 @@ pub(crate) fn receive_frame(frame: Vec<u8>) -> Result<(), Error> {
     };
     for (query, meta) in queries {
         start_dns(query, meta)?;
-    }
-    if let Some(flow) = host_flow.flatten() {
-        start_host_flow(flow);
     }
     if let Some(flow) = udp_flow {
         start_udp_flow(flow);
@@ -1564,6 +1721,7 @@ mod tests {
             host_service_ports: Vec::new(),
             published_ports: Vec::new(),
             mtu: 1500,
+            flow_capacity: 448,
         });
         gateway
     }
@@ -1581,6 +1739,7 @@ mod tests {
             host_service_ports: Vec::new(),
             published_ports: Vec::new(),
             mtu: 1500,
+            flow_capacity: 448,
         })
         .expect("network configures");
         for _ in 0..=MAX_WORK_PER_WAKE {
@@ -1595,7 +1754,40 @@ mod tests {
         assert!(matches!(run.as_mut().poll(&mut context), Poll::Pending));
         assert!(WORK.lock().expect("work lock").is_empty());
         RUNNING.store(false, Ordering::Release);
+        draining_host_queue_wakes_pending_guest_data();
     }
+
+    fn draining_host_queue_wakes_pending_guest_data() {
+        struct WakeFlag(AtomicBool);
+        impl std::task::Wake for WakeFlag {
+            fn wake(self: std::sync::Arc<Self>) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let flag = std::sync::Arc::new(WakeFlag(AtomicBool::new(false)));
+        let waker = Waker::from(std::sync::Arc::clone(&flag));
+        let mut gateway = gateway();
+        let mut flow = gateway
+            .add_connected_flow(tcp_syn(&syn()).unwrap())
+            .unwrap()
+            .unwrap();
+        gateway.flows[0].outgoing.try_send(vec![1]).unwrap();
+        gateway.flows[0].outgoing.try_send(vec![2]).unwrap();
+        gateway.flows[0].pending_guest_data = Some(vec![3]);
+        gateway.guest_data();
+        assert_eq!(gateway.flows[0].pending_guest_data, Some(vec![3]));
+        WORK_WAKER.register(&waker);
+        assert_eq!(
+            next_host_chunk(&mut flow.outgoing).now_or_never(),
+            Some(Some(vec![1]))
+        );
+        assert!(flag.0.load(Ordering::Acquire));
+        gateway.guest_data();
+        assert!(gateway.flows[0].pending_guest_data.is_none());
+        assert_eq!(flow.outgoing.next().now_or_never(), Some(Some(vec![2])));
+        assert_eq!(flow.outgoing.next().now_or_never(), Some(Some(vec![3])));
+    }
+
     fn syn() -> Vec<u8> {
         syn_to(Ipv4Addr::new(1, 1, 1, 1), 443)
     }
@@ -1684,7 +1876,7 @@ mod tests {
             dst_port: 443,
             control,
             seq_number: TcpSeqNumber(2),
-            ack_number: Some(tcp.seq_number() + 1),
+            ack_number: Some(tcp.seq_number() + tcp.segment_len()),
             window_len: 65535,
             window_scale: None,
             max_seg_size: None,
@@ -1816,12 +2008,15 @@ mod tests {
             tcp_syn(&frame),
             Some(flow(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 443))
         );
-        gateway.add_flow(tcp_syn(&frame).unwrap()).unwrap().unwrap();
+        gateway
+            .add_connected_flow(tcp_syn(&frame).unwrap())
+            .unwrap()
+            .unwrap();
         gateway.pump(Some(frame)).unwrap();
         assert_eq!(
             gateway
                 .sockets
-                .get::<tcp::Socket>(gateway.flows[0].socket)
+                .get::<tcp::Socket>(gateway.flows[0].socket.unwrap())
                 .state(),
             tcp::State::SynReceived
         );
@@ -1881,7 +2076,7 @@ mod tests {
         let destination = Ipv4Addr::new(100, 96, 0, 1);
         let frame = syn_to(destination, 5432);
         let flow = gateway
-            .add_flow(tcp_syn(&frame).unwrap())
+            .add_connected_flow(tcp_syn(&frame).unwrap())
             .expect("host service flow")
             .unwrap();
         assert_eq!(flow.destination, IpAddr::V4(Ipv4Addr::LOCALHOST));
@@ -1890,7 +2085,7 @@ mod tests {
         assert_eq!(
             gateway
                 .sockets
-                .get::<tcp::Socket>(gateway.flows[0].socket)
+                .get::<tcp::Socket>(gateway.flows[0].socket.unwrap())
                 .state(),
             tcp::State::SynReceived
         );
@@ -1901,7 +2096,10 @@ mod tests {
         let mut gateway = gateway();
         gateway.pump(Some(arp_request())).unwrap();
         gateway.take_frames(MAX_QUEUED_FRAMES, MAX_FRAME_BYTES);
-        gateway.add_flow(tcp_syn(&syn()).unwrap()).unwrap().unwrap();
+        gateway
+            .add_connected_flow(tcp_syn(&syn()).unwrap())
+            .unwrap()
+            .unwrap();
         gateway.pump(Some(syn())).unwrap();
         gateway.take_frames(MAX_QUEUED_FRAMES, MAX_FRAME_BYTES);
         let delay = gateway.protocol_delay().expect("TCP retry deadline");
@@ -1924,64 +2122,173 @@ mod tests {
     }
 
     #[test]
-    fn outbound_flows_stop_at_the_capacity() {
-        let mut gateway = gateway();
-        let destination = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
-        for id in 0..MAX_FLOWS {
-            let mut socket = tcp::Socket::new(
-                SocketBuffer::new(vec![0; TCP_BUFFER_BYTES]),
-                SocketBuffer::new(vec![0; TCP_BUFFER_BYTES]),
-            );
-            socket
-                .listen(IpListenEndpoint {
-                    addr: Some(destination.into()),
-                    port: 443,
-                })
-                .unwrap();
-            let socket = gateway.sockets.add(socket);
-            let (outgoing, _) = channel(4);
-            let (abort, _) = AbortHandle::new_pair();
-            gateway.flows.push(Flow {
-                id: id as u32,
-                guest: TcpFlow {
-                    source: IpAddr::V4(Ipv4Addr::new(100, 96, 0, 2)),
-                    source_port: id as u16,
-                    destination,
-                    destination_port: 443,
-                },
-                socket,
-                outgoing,
-                pending_guest_data: None,
-                abort,
-            });
+    fn failed_pending_connections_send_a_reset_without_allocating_tcp_buffers() {
+        for syn_frame in [syn(), syn6()] {
+            let mut gateway = gateway();
+            let guest = tcp_syn(&syn_frame).unwrap();
+            let pending = gateway.add_flow(guest).unwrap().unwrap();
+            let sockets = gateway.sockets.iter().count();
+            gateway.reject_pending_flow(pending.generation.wrapping_add(1), pending.id, &syn_frame);
+            assert_eq!(gateway.flows.len(), 1);
+            gateway.reject_pending_flow(pending.generation, pending.id, &syn_frame);
+            assert!(gateway.flows.is_empty());
+            assert_eq!(gateway.sockets.iter().count(), sockets);
+            let frames = gateway.take_frames(MAX_QUEUED_FRAMES, MAX_FRAME_BYTES);
+            let frame = frames.last().expect("TCP reset");
+            let ethernet = EthernetFrame::new_checked(frame).unwrap();
+            let (source, destination, payload) = match ethernet.ethertype() {
+                EthernetProtocol::Ipv4 => {
+                    let ip = Ipv4Packet::new_checked(ethernet.payload()).unwrap();
+                    assert!(ip.verify_checksum());
+                    (
+                        IpAddress::Ipv4(ip.src_addr()),
+                        IpAddress::Ipv4(ip.dst_addr()),
+                        &ethernet.payload()[20..],
+                    )
+                }
+                EthernetProtocol::Ipv6 => {
+                    let ip = Ipv6Packet::new_checked(ethernet.payload()).unwrap();
+                    (
+                        IpAddress::Ipv6(ip.src_addr()),
+                        IpAddress::Ipv6(ip.dst_addr()),
+                        &ethernet.payload()[40..],
+                    )
+                }
+                _ => panic!("expected TCP reset"),
+            };
+            let tcp = TcpPacket::new_checked(payload).unwrap();
+            assert_eq!(IpAddr::from(source), guest.destination);
+            assert_eq!(IpAddr::from(destination), guest.source);
+            assert_eq!(tcp.src_port(), guest.destination_port);
+            assert_eq!(tcp.dst_port(), guest.source_port);
+            assert!(tcp.rst() && tcp.ack());
+            assert_eq!(tcp.ack_number(), TcpSeqNumber(2));
+            assert!(tcp.verify_checksum(&source, &destination));
         }
+    }
+
+    #[test]
+    fn pending_connections_allocate_socket_buffers_only_after_connecting() {
+        let mut gateway = gateway();
+        let initial_sockets = gateway.sockets.iter().count();
+        let guest = flow(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 443);
+        let pending = gateway.add_flow(guest).unwrap().unwrap();
+        assert_eq!(gateway.sockets.iter().count(), initial_sockets);
+        assert!(gateway.flows[0].socket.is_none());
+        assert!(gateway.add_flow(guest).unwrap().is_none());
+        gateway.finish_flow(pending.generation, pending.id);
+        assert!(gateway.flows.is_empty());
+        assert!(
+            gateway
+                .activate_flow(pending.generation, pending.id)
+                .is_err()
+        );
+        let connected = gateway.add_flow(guest).unwrap().unwrap();
+        gateway
+            .activate_flow(connected.generation, connected.id)
+            .unwrap();
+        let socket = gateway
+            .sockets
+            .get::<tcp::Socket>(gateway.flows[0].socket.unwrap());
+        assert_eq!(socket.recv_capacity(), TCP_BUFFER_BYTES);
+        assert_eq!(socket.send_capacity(), TCP_BUFFER_BYTES);
+        assert_eq!(gateway.sockets.iter().count(), initial_sockets + 1);
+        gateway.pump(Some(syn())).unwrap();
+        gateway
+            .take_frames(MAX_QUEUED_FRAMES, MAX_FRAME_BYTES)
+            .pop()
+            .expect("handshake reply");
+    }
+
+    #[test]
+    fn configured_flow_capacity_releases_closed_flows() {
+        for expected_capacity in [128_u16, 448] {
+            let mut gateway = gateway();
+            gateway.config.as_mut().unwrap().flow_capacity = usize::from(expected_capacity);
+            let destination = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+            for port in 0..expected_capacity {
+                gateway
+                    .add_connected_flow(TcpFlow {
+                        source_port: port,
+                        ..flow(destination, 443)
+                    })
+                    .unwrap()
+                    .unwrap();
+            }
+            assert!(matches!(
+                gateway.add_connected_flow(flow(destination, 443)),
+                Err(Error::Backpressure)
+            ));
+            assert_eq!(gateway.flows.len(), usize::from(expected_capacity));
+            let closed = gateway.flows[0].id;
+            gateway.finish_flow(GENERATION.load(Ordering::Acquire), closed);
+            gateway.reap_finished_flows();
+            gateway
+                .add_connected_flow(flow(destination, 443))
+                .expect("closed flow frees a slot")
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn dns_and_socket_work_share_capacity_and_release_slots() {
+        let mut gateway = gateway();
+        gateway.config.as_mut().unwrap().flow_capacity = 2;
+        let pending = gateway.add_flow(tcp_syn(&syn()).unwrap()).unwrap().unwrap();
+        let (generation, id, _registration) = gateway.add_background().unwrap();
+        assert!(!gateway.has_flow_capacity(1));
+        assert!(matches!(gateway.add_background(), Err(Error::Backpressure)));
         assert!(matches!(
-            gateway.add_flow(flow(destination, 443)),
+            gateway.add_flow(flow(IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)), 443)),
             Err(Error::Backpressure)
         ));
-        assert_eq!(gateway.flows.len(), MAX_FLOWS);
+        gateway.finish_background(generation.wrapping_add(1), id);
+        assert!(!gateway.has_flow_capacity(1));
+        gateway.finish_background(generation, id);
+        assert!(gateway.has_flow_capacity(1));
+        gateway.finish_flow(pending.generation, pending.id);
+        assert!(gateway.has_flow_capacity(2));
+    }
 
-        let closed = gateway.flows[0].id;
-        gateway.finish_flow(GENERATION.load(Ordering::Acquire), closed);
-        gateway.reap_finished_flows();
-        assert_eq!(gateway.flows.len(), MAX_FLOWS - 1);
+    #[test]
+    fn published_flows_share_the_memory_budget_with_outbound_flows() {
+        let mut gateway = gateway();
+        gateway.config.as_mut().unwrap().flow_capacity = 2;
+        let (outgoing, _) = channel(1);
+        let (abort, _) = AbortHandle::new_pair();
+        gateway.published_flows.push(PublishedFlow {
+            id: 7,
+            outgoing,
+            abort,
+        });
+        assert!(!gateway.has_flow_capacity(1));
+        assert!(!gateway.has_flow_capacity(2));
+        let destination = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+        assert!(matches!(
+            gateway.add_connected_flow(flow(destination, 443)),
+            Err(Error::Backpressure)
+        ));
+        gateway.finish_published_flow(GENERATION.load(Ordering::Acquire), 7);
+        assert!(gateway.has_flow_capacity(2));
         gateway
-            .add_flow(flow(destination, 443))
-            .expect("closed flow frees a slot")
+            .add_connected_flow(flow(destination, 443))
+            .unwrap()
             .unwrap();
+        assert!(gateway.has_flow_capacity(1));
+        assert!(!gateway.has_flow_capacity(2));
     }
 
     #[test]
     fn outbound_flow_has_a_timeout() {
         let mut gateway = gateway();
         gateway
-            .add_flow(flow(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 443))
+            .add_connected_flow(flow(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 443))
             .expect("flow starts")
             .unwrap();
         assert_eq!(
             gateway
                 .sockets
-                .get::<tcp::Socket>(gateway.flows[0].socket)
+                .get::<tcp::Socket>(gateway.flows[0].socket.unwrap())
                 .timeout(),
             Some(smoltcp::time::Duration::from_secs(TCP_FLOW_TIMEOUT_SECS))
         );
@@ -1991,16 +2298,19 @@ mod tests {
     fn retransmitted_syn_reuses_its_flow() {
         let mut gateway = gateway();
         let flow = tcp_syn(&syn()).unwrap();
-        assert!(gateway.add_flow(flow).unwrap().is_some());
-        assert!(gateway.add_flow(flow).unwrap().is_none());
+        assert!(gateway.add_connected_flow(flow).unwrap().is_some());
+        assert!(gateway.add_connected_flow(flow).unwrap().is_none());
         assert_eq!(gateway.flows.len(), 1);
     }
 
     #[test]
     fn closed_flow_reaps_pending_guest_data_without_a_host_task_exit() {
         let mut gateway = gateway();
-        let _host_flow = gateway.add_flow(tcp_syn(&syn()).unwrap()).unwrap().unwrap();
-        let socket = gateway.flows[0].socket;
+        let _host_flow = gateway
+            .add_connected_flow(tcp_syn(&syn()).unwrap())
+            .unwrap()
+            .unwrap();
+        let socket = gateway.flows[0].socket.unwrap();
         gateway.flows[0].pending_guest_data = Some(vec![1]);
         gateway.flows[0].outgoing.try_send(vec![2]).unwrap();
         gateway.sockets.get_mut::<tcp::Socket>(socket).abort();
@@ -2030,7 +2340,10 @@ mod tests {
         let mut gateway = gateway();
         gateway.pump(Some(arp_request())).unwrap();
         gateway.take_frames(MAX_QUEUED_FRAMES, MAX_FRAME_BYTES);
-        let flow = gateway.add_flow(tcp_syn(&syn()).unwrap()).unwrap().unwrap();
+        let flow = gateway
+            .add_connected_flow(tcp_syn(&syn()).unwrap())
+            .unwrap()
+            .unwrap();
         gateway.pump(Some(syn())).unwrap();
         let syn_ack = gateway
             .take_frames(MAX_QUEUED_FRAMES, MAX_FRAME_BYTES)
@@ -2041,9 +2354,47 @@ mod tests {
         gateway.close_host_input(GENERATION.load(Ordering::Acquire), flow.id);
         gateway.reap_finished_flows();
         assert_eq!(gateway.flows.len(), 1);
-        let socket = gateway.sockets.get::<tcp::Socket>(gateway.flows[0].socket);
+        let socket = gateway
+            .sockets
+            .get::<tcp::Socket>(gateway.flows[0].socket.unwrap());
         assert_eq!(socket.state(), tcp::State::FinWait1);
         assert_eq!(socket.send_queue(), 8);
+    }
+
+    #[test]
+    fn small_tcp_buffers_resume_after_acknowledgement() {
+        let mut gateway = gateway();
+        gateway.pump(Some(arp_request())).unwrap();
+        gateway.take_frames(MAX_QUEUED_FRAMES, MAX_FRAME_BYTES);
+        let flow = gateway
+            .add_connected_flow(tcp_syn(&syn()).unwrap())
+            .unwrap()
+            .unwrap();
+        gateway.pump(Some(syn())).unwrap();
+        let syn_ack = gateway
+            .take_frames(MAX_QUEUED_FRAMES, MAX_FRAME_BYTES)
+            .pop()
+            .unwrap();
+        gateway.pump(Some(ack(&syn_ack))).unwrap();
+        let payload = vec![42; TCP_BUFFER_BYTES * 4];
+        let mut sent = 0;
+        let mut received = Vec::new();
+        for iteration in 0..64 {
+            sent += gateway.send_tcp(flow.id, &payload[sent..]).unwrap();
+            if iteration == 0 {
+                assert_eq!(gateway.send_tcp(flow.id, &[1]).unwrap(), 0);
+            }
+            let frames = gateway.take_frames(MAX_QUEUED_FRAMES, MAX_FRAME_BYTES);
+            for frame in frames {
+                let ethernet = EthernetFrame::new_checked(&frame).unwrap();
+                let ip = Ipv4Packet::new_checked(ethernet.payload()).unwrap();
+                let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+                received.extend_from_slice(tcp.payload());
+                gateway.pump(Some(ack(&frame))).unwrap();
+            }
+        }
+        assert_eq!(received.len(), payload.len());
+        assert_eq!(received, payload);
     }
 
     #[test]
@@ -2053,7 +2404,7 @@ mod tests {
             gateway.pump(Some(arp_request())).expect("guest ARP");
             gateway.take_frames(MAX_QUEUED_FRAMES, MAX_FRAME_BYTES);
             let mut flow = gateway
-                .add_flow(tcp_syn(&syn()).unwrap())
+                .add_connected_flow(tcp_syn(&syn()).unwrap())
                 .expect("flow starts")
                 .unwrap();
             gateway.pump(Some(syn())).expect("guest SYN");
@@ -2160,12 +2511,15 @@ mod tests {
                 destination_port: 443,
             })
         );
-        gateway.add_flow(tcp_syn(&frame).unwrap()).unwrap().unwrap();
+        gateway
+            .add_connected_flow(tcp_syn(&frame).unwrap())
+            .unwrap()
+            .unwrap();
         gateway.pump(Some(frame)).unwrap();
         assert_eq!(
             gateway
                 .sockets
-                .get::<tcp::Socket>(gateway.flows[0].socket)
+                .get::<tcp::Socket>(gateway.flows[0].socket.unwrap())
                 .state(),
             tcp::State::SynReceived
         );
@@ -2226,9 +2580,9 @@ mod tests {
             destination_port: 22,
             data: Vec::new(),
         };
-        for _ in 0..MAX_FLOWS {
+        for _ in 0..gateway.flow_capacity() {
             assert!(matches!(
-                gateway.add_flow(flow(request.destination, request.destination_port)),
+                gateway.add_connected_flow(flow(request.destination, request.destination_port)),
                 Err(Error::NotReady)
             ));
             assert!(matches!(
@@ -2254,7 +2608,7 @@ mod tests {
         };
         let generation = GENERATION.load(Ordering::Acquire);
         let first = gateway.add_udp_flow(request.clone()).unwrap().id;
-        for _ in 1..MAX_FLOWS {
+        for _ in 1..gateway.flow_capacity() {
             gateway.add_udp_flow(request.clone()).unwrap();
         }
         assert!(matches!(

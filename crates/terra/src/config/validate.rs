@@ -135,11 +135,7 @@ fn validate_network(cfg: &Config) -> Result<()> {
     // A broken `network:` would otherwise fail mid-boot, in the background
     // gateway - after the recipe was pinned - so it is refused here instead.
     crate::policy::network::rules::parse_port_mappings(&cfg.network.ports)?;
-    let (_, policy_memory_bytes) = cfg
-        .components
-        .memory_limits()?
-        .reserve_policy()
-        .map_err(|error| anyhow::anyhow!(crate::render::escape_printable(&format!("{error:#}"))))?;
+    let policy_memory_bytes = cfg.components.memory_limits()?.component_bytes();
     let _ = crate::policy::network::runtime::BoxPolicy::with_memory_limit(
         &cfg.network,
         policy_memory_bytes,

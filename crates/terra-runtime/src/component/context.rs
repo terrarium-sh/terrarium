@@ -8,8 +8,6 @@ use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiVie
 
 pub use crate::component::bindings::memory::Host as MemoryHost;
 
-pub const MAX_DEVICE_RESOURCES: usize = 512;
-
 /// Interrupts coalesced per window before further signals drop.
 pub const MAX_SIGNALS_PER_WINDOW: u32 = 64;
 
@@ -97,8 +95,6 @@ impl DeviceContext {
     /// bounds; only the backing mapping changes.
     #[must_use]
     pub fn with_ram(ram: GuestRam) -> Self {
-        let mut table = ResourceTable::new();
-        table.set_max_capacity(MAX_DEVICE_RESOURCES);
         Self {
             ctx: WasiCtxBuilder::new()
                 .max_random_size(MAX_SINGLE_BYTES)
@@ -106,7 +102,7 @@ impl DeviceContext {
                 .allow_udp(false)
                 .allow_ip_name_lookup(false)
                 .build(),
-            table,
+            table: ResourceTable::new(),
             ram,
             irq: InterruptSignals::new(),
             interrupt_level: false,

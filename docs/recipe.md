@@ -20,7 +20,8 @@ hw:
   rootfs_mib: 4096
 components:
   memory_mib: 16
-  total_memory_mib: 128
+  network:
+    memory_mib: 32
 mounts:
   - host: .
     guest: /work
@@ -55,10 +56,26 @@ workload:
 `hw.cpus`, `hw.mem_mib`, and `hw.rootfs_mib` set virtual CPUs, guest RAM, and
 the private writable root filesystem capacity. The root filesystem is sparse,
 but it cannot exceed `rootfs_mib`. `components.memory_mib` limits each Wasm
-component's linear memory and `components.total_memory_mib` limits their total.
-Both must be positive, and the total must be at least the per-component value.
-The defaults are 16 MiB per component and 128 MiB in total. These limits are
-separate from guest RAM and do not bound all native host-process memory.
+component's linear memory independently. The default and minimum configurable
+ceiling are 16 MiB. There is no combined component memory limit. Host admission
+reserves the maximum component footprint, including overrides, in addition to
+guest RAM and native headroom. Component ceilings are separate from guest RAM
+and do not bound all native host-process memory.
+
+The optional `components.network.memory_mib` overrides the network component's
+ceiling; otherwise it inherits `components.memory_mib`. This override also
+requires at least 16 MiB.
+
+Network flow capacity scales with that ceiling: 16 MiB allows 448
+slots, shared by outbound TCP, pending UDP requests, and DNS lookups; 32 MiB
+allows 960 slots and 64 MiB allows 1984. Published-port connections share this
+capacity and count twice because of their additional queues. At capacity, new flows encounter backpressure until existing flows close.
+
+TCP uses 4 KiB buffers per direction and 2 KiB transfer chunks to admit more
+concurrent connections. The TCP connection between the guest and proxy is
+separate from the host's connection to the remote server: the 4 KiB window
+applies to the local guest/proxy RTT, not the remote server's RTT. Smaller
+buffers can still reduce throughput when local processing is delayed.
 
 On x86_64, RAM starts at zero and skips the reserved device-address region
 from 3.25 GiB to 4 GiB, continuing above 4 GiB when needed. Virtio devices
