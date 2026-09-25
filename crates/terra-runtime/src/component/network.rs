@@ -2,30 +2,28 @@
 
 mod authorization;
 mod bindings;
+mod config;
 mod host;
 mod limits;
+mod policy;
 mod resource_linker;
 
+use crate::component::device_loop::DeviceLoop;
+use crate::component::{InterruptCallback, MmioDevice};
 use crate::machine::DeviceKind;
-
-#[cfg(test)]
-use std::sync::Arc;
-#[cfg(test)]
-use std::time::Duration;
-
-use terra_network::{GuestNetworkConfig, PolicyHandle, PortMapping};
+use bindings::{DeviceError, NetworkComponent, NetworkConfig, NetworkError};
 use wasmtime::Store;
 use wasmtime::component::Component;
+
+#[cfg(test)]
+use std::{sync::Arc, time::Duration};
 
 pub(crate) use authorization::MAX_POLICY_CALLS;
 #[cfg(test)]
 pub(crate) use authorization::PolicyClient;
-use bindings::{DeviceError, NetworkComponent, NetworkConfig, NetworkError, PublishedPort};
+pub use config::{GuestNetworkConfig, PortMapping};
 pub use host::{NetworkHost, network_component_linker};
-
-use crate::component::InterruptCallback;
-use crate::component::MmioDevice;
-use crate::component::device_loop::DeviceLoop;
+pub use policy::{AsyncPolicy, DecisionFuture, DecisionLease, NameLookup, Policy, PolicyHandle};
 
 fn transport_error(error: DeviceError) -> wasmtime::Error {
     wasmtime::Error::msg(format!("network transport: {error:?}"))
@@ -33,27 +31,6 @@ fn transport_error(error: DeviceError) -> wasmtime::Error {
 
 fn api_error(error: NetworkError) -> wasmtime::Error {
     wasmtime::Error::msg(format!("network configuration: {error:?}"))
-}
-
-fn network_config(
-    config: GuestNetworkConfig,
-    host_service_ports: Vec<Option<u16>>,
-    port_mappings: Vec<PortMapping>,
-) -> NetworkConfig {
-    NetworkConfig {
-        gateway_mac: config.gateway_mac.to_vec(),
-        gateway_ip: config.gateway_ip.octets().to_vec(),
-        gateway_ip6: config.gateway_ip6.octets().to_vec(),
-        host_service_ports,
-        published_ports: port_mappings
-            .into_iter()
-            .map(|mapping| PublishedPort {
-                host_port: mapping.host,
-                guest_port: mapping.guest,
-            })
-            .collect(),
-        mtu: 1500,
-    }
 }
 
 async fn configure_device<T: Send + 'static>(
@@ -155,7 +132,7 @@ pub fn register_device_with_host_factory(
             "box network component already configured",
         ));
     }
-    let config = network_config(config, host_service_ports, port_mappings);
+    let config = config.into_component_config(host_service_ports, port_mappings);
     let child = runtime.child_factory();
     let component = component.clone();
     runtime.grant_device_worker(DeviceKind::Net, async move {
@@ -189,7 +166,7 @@ mod tests {
 
     struct Open;
 
-    impl terra_network::Policy for Open {
+    impl Policy for Open {
         fn allows(&self, _: std::net::IpAddr, _: Option<u16>) -> bool {
             true
         }

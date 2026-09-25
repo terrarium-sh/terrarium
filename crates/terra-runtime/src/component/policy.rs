@@ -1,9 +1,12 @@
 //! WIT adapter for an isolated network policy sidecar.
 
+use super::network;
+use crate::component::network::{
+    DecisionFuture, DecisionLease, GuestNetworkConfig, NameLookup, Policy as NetworkPolicy,
+};
 use futures_util::FutureExt;
 use std::net::IpAddr;
 use std::sync::{Arc, mpsc};
-use terra_network::{NameLookup, Policy as NetworkPolicy};
 use wasmtime::component::Component;
 use wasmtime::{Engine, Store, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
@@ -101,11 +104,12 @@ impl PolicyFactory {
             &self.component,
             &linker,
         ))?;
-        let grants = complete_decision(
-            bindings
-                .terra_policy_decisions()
-                .call_configure(&mut store, config),
-        )?
+        let grants = complete_decision(bindings.terra_policy_decisions().call_configure(
+            &mut store,
+            config,
+            &GuestNetworkConfig::default().gateway_ip.to_string(),
+            &GuestNetworkConfig::default().gateway_ip6.to_string(),
+        ))?
         .map_err(wasmtime::Error::msg)?;
         let (sender, receiver) =
             mpsc::sync_channel::<Decision>(crate::component::network::MAX_POLICY_CALLS);
@@ -205,7 +209,7 @@ impl ComponentPolicy {
     fn call_async<T: Send + 'static, F>(
         &self,
         call: F,
-        lease: terra_network::policy::DecisionLease,
+        lease: DecisionLease,
     ) -> impl std::future::Future<Output = Option<T>> + Send + use<T, F>
     where
         F: FnOnce(&Policy, &mut Store<Host>) -> wasmtime::Result<T> + Send + 'static,
@@ -220,7 +224,7 @@ impl ComponentPolicy {
 }
 
 impl NetworkPolicy for ComponentPolicy {
-    fn asynchronous(self: Arc<Self>) -> Option<Arc<dyn terra_network::policy::AsyncPolicy>> {
+    fn asynchronous(self: Arc<Self>) -> Option<Arc<dyn network::AsyncPolicy>> {
         Some(self)
     }
 
@@ -242,6 +246,7 @@ impl NetworkPolicy for ComponentPolicy {
     }
 
     fn lookup_name(&self, name: &str) -> NameLookup {
+        let name = name.trim_end_matches('.');
         if name.len() > MAX_NAME_BYTES {
             return NameLookup::Denied;
         }
@@ -268,24 +273,21 @@ impl NetworkPolicy for ComponentPolicy {
     }
 }
 
-impl terra_network::policy::AsyncPolicy for ComponentPolicy {
+impl network::AsyncPolicy for ComponentPolicy {
     fn allows(
         &self,
         address: IpAddr,
         port: Option<u16>,
-        lease: terra_network::policy::DecisionLease,
-    ) -> terra_network::policy::DecisionFuture<bool> {
+        lease: DecisionLease,
+    ) -> DecisionFuture<bool> {
         let response = self.call_async(
             move |bindings, store| decide_allows(bindings, store, address, port),
             lease,
         );
         Box::pin(async move { response.await.unwrap_or(false) })
     }
-    fn lookup_name(
-        &self,
-        name: String,
-        lease: terra_network::policy::DecisionLease,
-    ) -> terra_network::policy::DecisionFuture<NameLookup> {
+    fn lookup_name(&self, mut name: String, lease: DecisionLease) -> DecisionFuture<NameLookup> {
+        name.truncate(name.trim_end_matches('.').len());
         if name.len() > MAX_NAME_BYTES {
             return Box::pin(async { NameLookup::Denied });
         }
@@ -300,8 +302,8 @@ impl terra_network::policy::AsyncPolicy for ComponentPolicy {
         &self,
         name: String,
         addresses: Vec<IpAddr>,
-        lease: terra_network::policy::DecisionLease,
-    ) -> terra_network::policy::DecisionFuture<Vec<IpAddr>> {
+        lease: DecisionLease,
+    ) -> DecisionFuture<Vec<IpAddr>> {
         if name.len() > MAX_NAME_BYTES || addresses.len() > MAX_ADDRESSES {
             return Box::pin(async { Vec::new() });
         }
@@ -346,7 +348,7 @@ fn decide_lookup(
                 .map(|address| address.parse())
                 .collect::<Result<Vec<_>, _>>()
                 .map_or(NameLookup::Denied, NameLookup::Static),
-            Lookup::Resolve => NameLookup::Resolve,
+            Lookup::Resolve(name) => NameLookup::Resolve(name),
             Lookup::Denied => NameLookup::Denied,
         },
     )
@@ -406,7 +408,7 @@ mod tests {
 
     #[test]
     fn asynchronous_policy_does_not_use_the_tokio_blocking_pool() {
-        let policy: terra_network::PolicyHandle =
+        let policy: crate::component::network::PolicyHandle =
             Arc::new(instantiate(&config(&["api.test:443"])).unwrap());
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -430,7 +432,7 @@ mod tests {
         });
         release.send(()).unwrap();
         runtime.block_on(occupied).unwrap();
-        assert!(matches!(result.unwrap(), Some(NameLookup::Resolve)));
+        assert!(matches!(result.unwrap(), Some(NameLookup::Resolve(_))));
     }
 
     #[tokio::test]
@@ -467,7 +469,7 @@ mod tests {
         assert!(response.await.is_none());
         assert!(!policy.is_available());
         assert!(
-            !terra_network::policy::AsyncPolicy::allows(
+            !network::AsyncPolicy::allows(
                 policy.as_ref(),
                 "1.1.1.1".parse().unwrap(),
                 Some(443),
@@ -523,6 +525,27 @@ mod tests {
         assert!(!available.load(std::sync::atomic::Ordering::Acquire));
     }
 
+    #[tokio::test]
+    async fn policy_component_validates_and_normalizes_names_for_native_callers() {
+        let mut configuration = config(&[]);
+        configuration.mode = Mode::UnrestrictedPublic;
+        let policy = instantiate(&configuration).unwrap();
+        for name in ["API.Test.", "", "a..test", "a_b.test", "-a.test", "a-.test"] {
+            let synchronous = policy.lookup_name(name);
+            let asynchronous =
+                network::AsyncPolicy::lookup_name(&policy, name.to_owned(), Box::new(())).await;
+            for lookup in [synchronous, asynchronous] {
+                if name == "API.Test." {
+                    assert!(
+                        matches!(lookup, NameLookup::Resolve(normalized) if normalized == "api.test")
+                    );
+                } else {
+                    assert!(matches!(lookup, NameLookup::Denied), "{name}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn wasm_policy_learns_only_public_answers_for_granted_names_and_ports() {
         let policy = instantiate(&config(&["*.example.test:443"])).unwrap();
@@ -531,7 +554,7 @@ mod tests {
         assert!(!policy.allows(public, Some(443)));
         assert!(matches!(
             policy.lookup_name("api.example.test"),
-            NameLookup::Resolve
+            NameLookup::Resolve(_)
         ));
         assert!(matches!(
             policy.lookup_name("other.test"),
@@ -566,8 +589,12 @@ mod tests {
         assert_eq!(qualified.len(), MAX_NAME_BYTES);
         assert!(matches!(
             policy.lookup_name(&qualified),
-            NameLookup::Resolve
+            NameLookup::Resolve(_)
         ));
+        let rooted = format!("{qualified}..");
+        assert!(
+            matches!(policy.lookup_name(&rooted), NameLookup::Resolve(normalized) if normalized == name)
+        );
         let public = "1.1.1.1".parse().unwrap();
         assert_eq!(policy.accept_resolved(&qualified, &[public]), [public]);
         let excessive = "x".repeat(MAX_NAME_BYTES + 1);
@@ -600,11 +627,12 @@ mod tests {
             assert!(!policy.allows(address, Some(22)));
         }
         let response = policy.call(|bindings, store| {
-            complete_decision(
-                bindings
-                    .terra_policy_decisions()
-                    .call_configure(store, &config(&["HOST_LOOPBACK"])),
-            )
+            complete_decision(bindings.terra_policy_decisions().call_configure(
+                store,
+                &config(&["HOST_LOOPBACK"]),
+                &GuestNetworkConfig::default().gateway_ip.to_string(),
+                &GuestNetworkConfig::default().gateway_ip6.to_string(),
+            ))
         });
         assert!(response.unwrap().is_err());
         assert_eq!(policy.host_service_ports(), &[Some(5432), Some(5432)]);
@@ -639,7 +667,7 @@ mod tests {
                 let public = "1.1.1.1".parse().unwrap();
                 assert!(matches!(
                     policy.lookup_name("api.test"),
-                    NameLookup::Resolve
+                    NameLookup::Resolve(_)
                 ));
                 assert_eq!(policy.accept_resolved("api.test", &[public]), [public]);
                 assert!(policy.allows(public, Some(443)));

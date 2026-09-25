@@ -39,9 +39,8 @@ checkouts require symlink privileges and `core.symlinks=true`.
 | `crates/terra` | CLI, recipes and manifests, box storage, policy construction, VM launch and clients |
 | `crates/terra-agent` | Linux guest initialization, hooks, workload and interactive services |
 | `crates/terra-protocol` | Shared guest wire protocol |
-| `crates/terra-network` | Shared network policy types and address rules |
 | `crates/terra-platform` | Native VM, memory, filesystem and local-I/O APIs over KVM, Hypervisor.framework and WHP |
-| `crates/terra-runtime` | Wasmtime stores, guest layout, scoped host capabilities and component/VM lifecycle orchestration |
+| `crates/terra-runtime` | Wasmtime stores, guest layout, scoped host capabilities, network configuration and policy contracts, and component/VM lifecycle orchestration |
 | `components` | Boot planning, VMM and device protocols, network policy, transport and WIT |
 | `kernel`, `pins.mk` | Guest kernel configuration and pinned build inputs |
 | `fuzz`, `scripts` | Boundary fuzz targets, build checks and benchmark tools |

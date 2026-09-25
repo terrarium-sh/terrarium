@@ -1,5 +1,6 @@
 //! VM component orchestration and guest device assembly.
 
+use crate::component::network::{PolicyHandle, PortMapping};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -22,8 +23,8 @@ pub struct VmInput {
     pub shares: Vec<crate::component::fs::ShareGrant>,
     pub plan: Vec<u8>,
     pub artifacts: crate::TrustedArtifacts,
-    pub network_policy: terra_network::PolicyHandle,
-    pub port_mappings: Vec<terra_network::PortMapping>,
+    pub network_policy: PolicyHandle,
+    pub port_mappings: Vec<PortMapping>,
     pub ram_bytes: u64,
     pub component_memory_limits: crate::box_runtime::ComponentMemoryLimits,
     pub vcpus: usize,

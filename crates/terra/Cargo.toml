@@ -30,7 +30,6 @@ yaml_serde.workspace = true
 serde_json = { workspace = true }
 crossterm = { version = "0.29", default-features = false, features = ["windows"] }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
-terra-network = { path = "../terra-network" }
 terra-runtime = { path = "../terra-runtime" }
 terra-platform = { path = "../terra-platform" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "sync", "time"] }

@@ -14,5 +14,4 @@ wit-bindgen = { workspace = true, features = ["async-spawn", "inter-task-wakeup"
 smoltcp = { version = "0.14", default-features = false, features = ["alloc", "async", "medium-ethernet", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp"] }
 futures = "0.3"
 terra-device-transport = { path = "../device-transport" }
-terra-network = { path = "../../crates/terra-network" }
 terra-limits = { path = "../../crates/terra-limits" }

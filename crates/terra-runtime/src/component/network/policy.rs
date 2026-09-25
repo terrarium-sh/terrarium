@@ -20,11 +20,9 @@ pub trait AsyncPolicy: Send + Sync {
 
 /// The result a policy permits for one standard name lookup.
 pub enum NameLookup {
-    /// Return configured addresses without consulting a resolver.
     Static(Vec<IpAddr>),
-    /// Resolve the name with the host resolver, then filter and learn results.
-    Resolve,
-    /// Do not reveal or resolve the name.
+    /// The hostname to resolve; implementations must validate and normalize it.
+    Resolve(String),
     Denied,
 }
 
@@ -50,7 +48,6 @@ pub trait Policy: Send + Sync {
         &[]
     }
 
-    /// Decides whether one hostname may use the standard resolver.
     fn lookup_name(&self, _name: &str) -> NameLookup {
         NameLookup::Denied
     }
@@ -128,7 +125,6 @@ mod tests {
         let egress: PolicyHandle = Arc::new(Custom);
         let other: IpAddr = "1.1.1.1".parse().unwrap();
 
-        // Per-port grants — what the built-in allow-list has no way to say.
         assert!(egress.allows(STANDIN, Some(5432)));
         assert!(!egress.allows(STANDIN, Some(22)));
         assert!(!egress.allows(STANDIN, None));

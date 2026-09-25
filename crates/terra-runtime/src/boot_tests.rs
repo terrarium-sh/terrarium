@@ -1,3 +1,7 @@
+use crate::component::network::{
+    GuestNetworkConfig, NameLookup, Policy, PolicyHandle, PortMapping,
+};
+
 fn kernel_boot_assets() -> (Vec<u8>, Vec<u8>, tempfile::TempPath) {
     use std::io::Read;
     let build = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../build");
@@ -36,10 +40,10 @@ fn boot_plan(
         shares: Vec::new(),
         volumes: Vec::new(),
         net: Net {
-            guest_ip: std::net::IpAddr::V4(terra_network::GuestNetworkConfig::default().guest_ip),
-            prefix: terra_network::GuestNetworkConfig::default().prefix_len,
-            gateway: std::net::IpAddr::V4(terra_network::GuestNetworkConfig::default().gateway_ip),
-            dns: std::net::IpAddr::V4(terra_network::GuestNetworkConfig::default().dns_server),
+            guest_ip: std::net::IpAddr::V4(GuestNetworkConfig::default().guest_ip),
+            prefix: GuestNetworkConfig::default().prefix_len,
+            gateway: std::net::IpAddr::V4(GuestNetworkConfig::default().gateway_ip),
+            dns: std::net::IpAddr::V4(GuestNetworkConfig::default().dns_server),
         },
         env: BTreeMap::new(),
         root: true,
@@ -157,13 +161,13 @@ async fn kernel_boots_directory_share() {
 
 struct DenyAllPolicy;
 
-impl terra_network::Policy for DenyAllPolicy {
+impl Policy for DenyAllPolicy {
     fn allows(&self, _: std::net::IpAddr, _: Option<u16>) -> bool {
         false
     }
 }
 
-fn boot_network_policy() -> terra_network::PolicyHandle {
+fn boot_network_policy() -> PolicyHandle {
     std::sync::Arc::new(DenyAllPolicy)
 }
 
@@ -434,13 +438,13 @@ struct LocalHttpPolicy {
     port: u16,
 }
 
-impl terra_network::Policy for LocalHttpPolicy {
+impl Policy for LocalHttpPolicy {
     fn allows(&self, ip: std::net::IpAddr, port: Option<u16>) -> bool {
         ip == self.address && port == Some(self.port)
     }
 
-    fn lookup_name(&self, _: &str) -> terra_network::NameLookup {
-        terra_network::NameLookup::Static(vec![self.address])
+    fn lookup_name(&self, _: &str) -> NameLookup {
+        NameLookup::Static(vec![self.address])
     }
 
     fn blocks_direct_dns(&self) -> bool {
@@ -875,7 +879,7 @@ async fn assert_published_loopback_http(host_closes_first: bool) {
         ),
         artifacts: crate::test_fixtures::trusted_artifacts(),
         network_policy: boot_network_policy(),
-        port_mappings: vec![terra_network::PortMapping::new(host_port, GUEST_PORT)],
+        port_mappings: vec![PortMapping::new(host_port, GUEST_PORT)],
         hard_stop: None,
         ram_bytes: BOOT_RAM,
         vcpus: 2,

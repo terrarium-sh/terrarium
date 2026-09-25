@@ -28,22 +28,6 @@ const DNS_MAX_COMPRESSION_JUMPS: usize = 16;
 const DNS_MAX_LABEL_LEN: usize = 63;
 const DNS_MAX_NAME_BYTES: usize = 253;
 
-/// Lowercase + strip a trailing dot. `None` for an empty name.
-#[must_use]
-pub fn normalize_hostname(hostname: &str) -> Option<String> {
-    let hostname = hostname.trim_end_matches('.').to_ascii_lowercase();
-    ((1..=253).contains(&hostname.len())
-        && hostname.split('.').all(|label| {
-            (1..=63).contains(&label.len())
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-                && label
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        }))
-    .then_some(hostname)
-}
-
 /// The question name in a DNS query (first question only). `None` on malformed input.
 #[must_use]
 pub fn question_name(packet: &[u8]) -> Option<String> {
@@ -255,17 +239,6 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_only_hostname_labels() {
-        assert_eq!(
-            normalize_hostname("WWW.Example.COM."),
-            Some("www.example.com".into())
-        );
-        for name in ["", "a..example", "-a.example", "a-.example", "a_b.example"] {
-            assert_eq!(normalize_hostname(name), None, "{name}");
-        }
-    }
-
-    #[test]
     fn rejects_names_larger_than_the_hostname_limit() {
         let name = std::iter::repeat_n("a", 128).collect::<Vec<_>>().join(".");
         assert!(name.len() > DNS_MAX_NAME_BYTES);
@@ -284,18 +257,18 @@ mod tests {
     }
 
     #[test]
-    fn build_ip_response_has_the_requested_family_on_the_wire() {
+    fn build_ip_response_preserves_the_requested_family_and_ttl() {
         let query = query_for("api.internal");
         let ips = vec![
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),
             IpAddr::V6("2606:4700::1".parse().unwrap()),
         ];
         assert_eq!(
-            build_ip_response(&query, &ips, 60),
+            build_ip_response(&query, &ips, 17),
             [
                 0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x03, b'a',
                 b'p', b'i', 0x08, b'i', b'n', b't', b'e', b'r', b'n', b'a', b'l', 0x00, 0x00, 0x01,
-                0x00, 0x01, 0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x04,
+                0x00, 0x01, 0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x11, 0x00, 0x04,
                 10, 0, 0, 5,
             ]
         );
@@ -304,11 +277,11 @@ mod tests {
         let qtype = aaaa.len() - 4;
         aaaa[qtype..qtype + 2].copy_from_slice(&DNS_TYPE_AAAA.to_be_bytes());
         assert_eq!(
-            build_ip_response(&aaaa, &ips, 60),
+            build_ip_response(&aaaa, &ips, 17),
             [
                 0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x03, b'a',
                 b'p', b'i', 0x08, b'i', b'n', b't', b'e', b'r', b'n', b'a', b'l', 0x00, 0x00, 0x1c,
-                0x00, 0x01, 0xc0, 0x0c, 0x00, 0x1c, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x10,
+                0x00, 0x01, 0xc0, 0x0c, 0x00, 0x1c, 0x00, 0x01, 0x00, 0x00, 0x00, 0x11, 0x00, 0x10,
                 0x26, 0x06, 0x47, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                 0x00, 0x01,
             ]

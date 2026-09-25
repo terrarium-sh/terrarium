@@ -1,14 +1,13 @@
 //! Egress grants and bounded DNS learning.
 
+use crate::address::{Cidr, is_floored, nat64_well_known_v4};
 use crate::config::{Network, NetworkMode};
+use crate::hostname::normalize_hostname;
 use lru::LruCache;
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::num::NonZeroUsize;
 use std::sync::Mutex;
-use terra_network::{
-    Cidr, LEARNED_DNS_TTL_SECS, NameLookup, Policy, dns, is_floored, nat64_well_known_v4,
-};
 
 use super::rules::{
     HOST_LOOPBACK_SYMBOL, Port, Rule, is_single_address, name_covers, parse_allow, parse_dns_record,
@@ -16,9 +15,14 @@ use super::rules::{
 
 type Result<T> = std::result::Result<T, String>;
 
-const LEARNED_ADDRESS_TTL_NANOS: u64 = LEARNED_DNS_TTL_SECS as u64 * 1_000_000_000;
-
 pub const LEARNED_ADDRESSES_CAPACITY: usize = 4096;
+const LEARNED_DNS_TTL_SECS: u64 = 60;
+
+pub(crate) enum NameLookup {
+    Static(Vec<IpAddr>),
+    Resolve(String),
+    Denied,
+}
 
 #[derive(Debug)]
 pub struct BoxPolicy {
@@ -29,11 +33,11 @@ pub struct BoxPolicy {
     static_dns: BTreeMap<String, Vec<IpAddr>>,
     host_grants: Vec<Port>,
     host_addresses: Vec<IpAddr>,
+    gateway_addresses: [IpAddr; 2],
 }
 
 impl BoxPolicy {
-    pub fn new(net: &Network) -> Result<Self> {
-        let addrs = gateway_addresses();
+    pub fn new(net: &Network, gateway_addresses: [IpAddr; 2]) -> Result<Self> {
         let host_addresses = net
             .host_addresses
             .iter()
@@ -44,9 +48,9 @@ impl BoxPolicy {
                     .map_err(|_| "invalid host address".to_owned())
             })
             .collect::<Result<Vec<_>>>()?;
-        let static_dns = Self::parse_static_dns(net, &addrs)?;
+        let static_dns = Self::parse_static_dns(net, &gateway_addresses)?;
         let (address_rules, name_rules, host_grants) =
-            Self::parse_allow_rules(net, &static_dns, &addrs)?;
+            Self::parse_allow_rules(net, &static_dns, &gateway_addresses)?;
         Ok(Self {
             mode: net.mode,
             address_rules,
@@ -60,6 +64,7 @@ impl BoxPolicy {
             static_dns,
             host_grants,
             host_addresses,
+            gateway_addresses,
         })
     }
 
@@ -138,7 +143,7 @@ impl BoxPolicy {
 
     #[must_use]
     pub(crate) fn grants_for(&self, name: &str) -> Vec<Port> {
-        let Some(name) = dns::normalize_hostname(name) else {
+        let Some(name) = normalize_hostname(name) else {
             return Vec::new();
         };
         self.name_rules
@@ -150,11 +155,11 @@ impl BoxPolicy {
 
     pub(crate) fn static_answer(&self, name: &str) -> Option<&[IpAddr]> {
         self.static_dns
-            .get(&dns::normalize_hostname(name)?)
+            .get(&normalize_hostname(name)?)
             .map(Vec::as_slice)
     }
 
-    pub(crate) fn accept_resolved_name(&self, name: &str, addresses: &[IpAddr]) -> Vec<IpAddr> {
+    pub(crate) fn accept_resolved(&self, name: &str, addresses: &[IpAddr]) -> Vec<IpAddr> {
         let grants = self.grants_for(name);
         if self.mode == NetworkMode::Allowlist && grants.is_empty() {
             return Vec::new();
@@ -165,7 +170,7 @@ impl BoxPolicy {
                 .map(IpAddr::to_canonical)
                 .filter(|ip| {
                     !is_floored(*ip)
-                        && !gateway_addresses().contains(ip)
+                        && !self.gateway_addresses.contains(ip)
                         && !self.is_host_address(*ip)
                 })
                 .fold(Vec::new(), |mut accepted, ip| {
@@ -179,13 +184,13 @@ impl BoxPolicy {
             return Vec::new();
         };
         let now = crate::monotonic_now();
-        let host = gateway_addresses();
+        let host = self.gateway_addresses;
         let mut accepted = Vec::new();
         for ip in addresses.iter().map(IpAddr::to_canonical) {
             if is_floored(ip) || host.contains(&ip) || self.is_host_address(ip) {
                 continue;
             }
-            let expires_at = now.saturating_add(LEARNED_ADDRESS_TTL_NANOS);
+            let expires_at = now.saturating_add(LEARNED_DNS_TTL_SECS * 1_000_000_000);
             for grant in &grants {
                 let key = (ip, *grant);
                 if let Some(previous) = learned.get_mut(&key) {
@@ -204,7 +209,7 @@ impl BoxPolicy {
     #[cfg(test)]
     #[must_use]
     pub(crate) fn forwards(&self, name: &str) -> bool {
-        matches!(self.name_lookup(name), NameLookup::Resolve)
+        matches!(self.lookup_name(name), NameLookup::Resolve(_))
     }
 
     #[cfg(test)]
@@ -213,34 +218,31 @@ impl BoxPolicy {
             .iter()
             .map(|(address, _)| *address)
             .collect::<Vec<_>>();
-        self.accept_resolved_name(name, &addresses);
+        self.accept_resolved(name, &addresses);
     }
 
     #[must_use]
-    pub(crate) fn name_lookup(&self, name: &str) -> NameLookup {
-        if let Some(ips) = self.static_answer(name) {
+    pub(crate) fn lookup_name(&self, name: &str) -> NameLookup {
+        let Some(name) = normalize_hostname(name) else {
+            return NameLookup::Denied;
+        };
+        if let Some(ips) = self.static_answer(&name) {
             return NameLookup::Static(ips.to_vec());
         }
         match self.mode {
-            NetworkMode::Allowlist if self.grants_for(name).is_empty() => NameLookup::Denied,
-            NetworkMode::UnrestrictedPublic | NetworkMode::Allowlist => NameLookup::Resolve,
+            NetworkMode::Allowlist if self.grants_for(&name).is_empty() => NameLookup::Denied,
+            NetworkMode::UnrestrictedPublic | NetworkMode::Allowlist => NameLookup::Resolve(name),
         }
     }
-}
 
-const fn gateway_addresses() -> [IpAddr; 2] {
-    terra_network::GuestNetworkConfig::default().gateway_addresses()
-}
-
-impl BoxPolicy {
     fn is_host_address(&self, ip: IpAddr) -> bool {
         self.host_addresses.contains(&ip)
             || matches!(ip, IpAddr::V6(ip) if nat64_well_known_v4(ip).is_some_and(|ip| self.host_addresses.contains(&IpAddr::V4(ip))))
     }
 
-    pub(crate) fn is_granted(&self, ip: IpAddr, port: Option<u16>) -> bool {
+    pub(crate) fn allows(&self, ip: IpAddr, port: Option<u16>) -> bool {
         let ip = ip.to_canonical();
-        if gateway_addresses().contains(&ip) {
+        if self.gateway_addresses.contains(&ip) {
             return false;
         }
         if self
@@ -275,26 +277,12 @@ impl BoxPolicy {
             }),
         }
     }
-}
 
-impl Policy for BoxPolicy {
-    fn allows(&self, ip: IpAddr, port: Option<u16>) -> bool {
-        self.is_granted(ip, port)
-    }
-
-    fn host_service_ports(&self) -> &[Option<u16>] {
+    pub(crate) fn host_service_ports(&self) -> &[Option<u16>] {
         &self.host_grants
     }
 
-    fn lookup_name(&self, name: &str) -> NameLookup {
-        self.name_lookup(name)
-    }
-
-    fn accept_resolved(&self, name: &str, addresses: &[IpAddr]) -> Vec<IpAddr> {
-        self.accept_resolved_name(name, addresses)
-    }
-
-    fn blocks_direct_dns(&self) -> bool {
+    pub(crate) fn blocks_direct_dns(&self) -> bool {
         self.mode == NetworkMode::Allowlist || !self.static_dns.is_empty()
     }
 }

@@ -4,10 +4,13 @@ Copyright 2026 Berry Studio s.r.o.
 This product includes software developed as part of the Terrarium project,
 licensed under the Apache License, Version 2.0 (see LICENSE).
 
-This product includes `terra-network`, a Terra-maintained derivative of
-smolvm-network from https://github.com/cryi/smolvm, commit d2573ac. Copyright smolvm contributors; licensed
-under Apache-2.0. See crates/terra-network/LICENSE and
-crates/terra-network/PROVENANCE.md.
+The DNS helpers in components/network/src/dns.rs, CIDR parsing in
+components/policy/src/address.rs, and guest-network configuration in
+crates/terra-runtime/src/component/network/config.rs include code adapted from
+smolvm-network (https://github.com/cryi/smolvm), commit
+d2573acb0e1c929fb9a9cb79ca6655da42015d70.
+Copyright 2024-2025 smolvm contributors; licensed under Apache-2.0.
+The upstream license is in packaging/licenses/smolvm-network-Apache-2.0.txt.
 
 This product includes WASI filesystem, socket, clock, and random interface
 specifications from WebAssembly/WASI v0.3.1, commit

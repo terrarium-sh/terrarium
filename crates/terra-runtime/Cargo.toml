@@ -20,7 +20,6 @@ terra-protocol = { path = "../terra-protocol" }
 futures-util = { version = "0.3", default-features = false, features = ["alloc", "std"] }
 notify = "8.2"
 terra-limits = { path = "../terra-limits" }
-terra-network = { path = "../terra-network" }
 log = "0.4.34"
 target-lexicon = "0.13"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }

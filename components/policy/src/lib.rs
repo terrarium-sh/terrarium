@@ -8,6 +8,8 @@ use bindings::exports;
 #[cfg(target_arch = "wasm32")]
 use bindings::wasi;
 
+mod address;
+mod hostname;
 mod rules;
 mod runtime;
 #[cfg(test)]
@@ -32,8 +34,8 @@ mod config {
 }
 
 use exports::terra::policy::decisions::{Config, Grants, Guest, Lookup};
+use runtime::NameLookup;
 use std::sync::Mutex;
-use terra_network::{NameLookup, Policy};
 
 static POLICY: Mutex<Option<runtime::BoxPolicy>> = Mutex::new(None);
 
@@ -54,12 +56,20 @@ fn monotonic_now() -> u64 {
 struct Component;
 
 impl Guest for Component {
-    fn configure(config: Config) -> Result<Grants, String> {
+    fn configure(
+        config: Config,
+        gateway_ip: String,
+        gateway_ip6: String,
+    ) -> Result<Grants, String> {
         let mut state = POLICY.lock().map_err(|_| "policy unavailable")?;
         if state.is_some() {
             return Err("policy already configured".into());
         }
-        let policy = runtime::BoxPolicy::new(&config)?;
+        let gateways = [
+            std::net::IpAddr::V4(gateway_ip.parse().map_err(|_| "invalid IPv4 gateway")?),
+            std::net::IpAddr::V6(gateway_ip6.parse().map_err(|_| "invalid IPv6 gateway")?),
+        ];
+        let policy = runtime::BoxPolicy::new(&config, gateways)?;
         let grants = Grants {
             host_ports: policy.host_service_ports().to_vec(),
             blocks_direct_dns: policy.blocks_direct_dns(),
@@ -85,7 +95,7 @@ impl Guest for Component {
         };
         match policy.lookup_name(&name) {
             NameLookup::Denied => Lookup::Denied,
-            NameLookup::Resolve => Lookup::Resolve,
+            NameLookup::Resolve(name) => Lookup::Resolve(name),
             NameLookup::Static(addresses) => {
                 Lookup::Static(addresses.iter().map(ToString::to_string).collect())
             }

@@ -1697,7 +1697,6 @@ dependencies = [
  "sysinfo",
  "tempfile",
  "terra-limits",
- "terra-network",
  "terra-platform",
  "terra-protocol",
  "terra-runtime",
@@ -1724,10 +1723,6 @@ dependencies = [
 
 [[package]]
 name = "terra-limits"
-version = "0.0.1"
-
-[[package]]
-name = "terra-network"
 version = "0.0.1"
 
 [[package]]
@@ -1761,7 +1756,6 @@ dependencies = [
  "terra",
  "terra-device-transport",
  "terra-fs-component",
- "terra-network",
  "terra-protocol",
  "terra-runtime",
  "terra-vsock-device",
@@ -1787,7 +1781,6 @@ dependencies = [
  "notify",
  "target-lexicon",
  "terra-limits",
- "terra-network",
  "terra-platform",
  "terra-protocol",
  "tokio",

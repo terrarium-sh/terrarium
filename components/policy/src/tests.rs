@@ -1,11 +1,14 @@
 use super::rules::*;
 use super::runtime::{BoxPolicy, LEARNED_ADDRESSES_CAPACITY};
 use crate::config::{Network, NetworkMode, StaticDnsRecord};
+use crate::runtime::NameLookup;
 use std::net::IpAddr;
-use terra_network::{GuestNetworkConfig, NameLookup, Policy};
 
 fn gateway_addresses() -> [IpAddr; 2] {
-    GuestNetworkConfig::default().gateway_addresses()
+    [
+        "100.96.0.1".parse().unwrap(),
+        "fd53:4d00::1".parse().unwrap(),
+    ]
 }
 
 fn build_network(mode: NetworkMode, allow: &[&str]) -> Network {
@@ -18,7 +21,7 @@ fn build_network(mode: NetworkMode, allow: &[&str]) -> Network {
 }
 
 fn build_policy(network: &Network) -> Result<BoxPolicy, String> {
-    BoxPolicy::new(network)
+    BoxPolicy::new(network, gateway_addresses())
 }
 
 fn build_box_policy(mode: NetworkMode, allow: &[&str]) -> BoxPolicy {
@@ -189,7 +192,7 @@ fn allowlist_name_lookup_learns_only_granted_public_addresses() {
         p.lookup_name("db.local"),
         NameLookup::Static(addresses) if addresses == gateway_addresses()
     ));
-    assert!(matches!(p.lookup_name("api.test"), NameLookup::Resolve));
+    assert!(matches!(p.lookup_name("api.test"), NameLookup::Resolve(_)));
     let ip: IpAddr = "93.184.216.34".parse().unwrap();
     assert_eq!(p.accept_resolved("api.test", &[ip]), [ip]);
     assert!(p.allows(ip, Some(443)));
@@ -226,7 +229,7 @@ fn unrestricted_public_name_lookup_keeps_the_floor_closed() {
     assert!(matches!(p.lookup_name("db.local"), NameLookup::Static(_)));
     assert!(matches!(
         p.lookup_name("anything.test"),
-        NameLookup::Resolve
+        NameLookup::Resolve(_)
     ));
 
     // Public is open by default; the floor and the host are not.
@@ -259,7 +262,7 @@ fn name_lookup_is_static_resolved_or_denied() {
     let p = build_policy(&network).unwrap();
 
     assert!(matches!(p.lookup_name("db.local"), NameLookup::Static(_)));
-    assert!(matches!(p.lookup_name("api.test"), NameLookup::Resolve));
+    assert!(matches!(p.lookup_name("api.test"), NameLookup::Resolve(_)));
     for denied in ["v2.api.test", "payload.db.local", "exfil.example"] {
         assert!(
             matches!(p.lookup_name(denied), NameLookup::Denied),
@@ -270,7 +273,7 @@ fn name_lookup_is_static_resolved_or_denied() {
     let open = build_box_policy(NetworkMode::UnrestrictedPublic, &[]);
     assert!(matches!(
         open.lookup_name("anything.test"),
-        NameLookup::Resolve
+        NameLookup::Resolve(_)
     ));
 
     // An address rule does not turn that gate exclusive - it is read there,
@@ -969,5 +972,55 @@ fn concurrent_learning_preserves_port_scope_and_box_isolation() {
     assert_eq!(p.learned_dns.lock().unwrap().len(), 8);
     for i in 1..=8 {
         assert!(!other.allows(IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, i)), Some(443)));
+    }
+}
+
+#[test]
+fn resolution_returns_only_valid_normalized_hostnames() {
+    for mode in [NetworkMode::Allowlist, NetworkMode::UnrestrictedPublic] {
+        let policy = build_box_policy(
+            mode,
+            if mode == NetworkMode::Allowlist {
+                &["api.test:443"]
+            } else {
+                &[]
+            },
+        );
+        assert!(
+            matches!(policy.lookup_name("API.Test."), NameLookup::Resolve(name) if name == "api.test")
+        );
+        for invalid in [
+            "",
+            ".",
+            "a..test",
+            "a_b.test",
+            "-a.test",
+            "a-.test",
+            "a.test/path",
+        ] {
+            assert!(
+                matches!(policy.lookup_name(invalid), NameLookup::Denied),
+                "{mode:?}: {invalid}"
+            );
+        }
+    }
+}
+
+#[test]
+fn configured_gateway_addresses_control_policy() {
+    let gateways = ["10.23.0.1".parse().unwrap(), "fd12::1".parse().unwrap()];
+    let mut network = build_network(
+        NetworkMode::Allowlist,
+        &["api.test:443", "HOST_LOOPBACK:5432"],
+    );
+    network.hosts = vec![build_dns_record("host.test", HOST_LOOPBACK_SYMBOL)];
+    let policy = BoxPolicy::new(&network, gateways).unwrap();
+    assert!(
+        matches!(policy.lookup_name("host.test"), NameLookup::Static(addresses) if addresses == gateways)
+    );
+    for gateway in gateways {
+        assert!(!policy.allows(gateway, Some(5432)));
+        let explicit = build_network(NetworkMode::Allowlist, &[&gateway.to_string()]);
+        assert!(BoxPolicy::new(&explicit, gateways).is_err());
     }
 }

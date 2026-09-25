@@ -1,8 +1,9 @@
 //! Recipe allow rules and static DNS records.
 
+use crate::address::Cidr;
 use crate::config::StaticDnsRecord;
+use crate::hostname::normalize_hostname;
 use std::net::{IpAddr, Ipv6Addr};
-use terra_network::{Cidr, dns, parse_port};
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -105,7 +106,7 @@ fn classify(entry: &str, host: &str, port: Port) -> Result<Rule> {
             "allow rule '{entry}': a wildcard must name a hostname"
         ));
     }
-    let name = dns::normalize_hostname(name_without_wildcard)
+    let name = normalize_hostname(name_without_wildcard)
         .map(|normalized| format!("{wildcard}{normalized}"))
         .ok_or_else(|| format!("allow rule '{entry}': not a name the gateway can match"))?;
     Ok(Rule::Name(name, port))
@@ -125,7 +126,7 @@ pub(crate) fn parse_dns_record(
             rule.name
         ));
     }
-    let key = dns::normalize_hostname(&rule.name).ok_or_else(|| {
+    let key = normalize_hostname(&rule.name).ok_or_else(|| {
         format!(
             "hosts record '{}' is not a name the gateway can answer",
             rule.name
@@ -146,4 +147,11 @@ pub(crate) fn parse_dns_record(
             })?],
     };
     Ok((key, addrs))
+}
+
+fn parse_port(text: &str) -> Option<u16> {
+    let text = text.trim();
+    text.parse::<u16>()
+        .ok()
+        .filter(|port| *port != 0 && !text.starts_with('+'))
 }

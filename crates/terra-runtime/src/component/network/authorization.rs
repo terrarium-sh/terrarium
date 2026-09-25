@@ -5,10 +5,9 @@ use std::{
     sync::Arc,
 };
 
+use super::{AsyncPolicy, DecisionFuture, NameLookup, Policy, PolicyHandle, PortMapping};
 use futures_util::FutureExt;
 use std::panic::AssertUnwindSafe;
-use terra_network::policy::{AsyncPolicy, DecisionFuture};
-use terra_network::{NameLookup, Policy, PolicyHandle, PortMapping};
 use tokio::sync::Semaphore;
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, sockets::SocketAddrUse};
 
@@ -233,6 +232,7 @@ fn is_host_loopback(ip: IpAddr) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{DecisionLease, GuestNetworkConfig};
     use super::*;
     use std::{
         net::{IpAddr, Ipv4Addr},
@@ -352,7 +352,7 @@ mod tests {
             SocketAddr::from(([127, 0, 0, 1], 22)),
             SocketAddrUse::TcpConnect,
         ));
-        let gateway = terra_network::GuestNetworkConfig::default().gateway_ip;
+        let gateway = GuestNetworkConfig::default().gateway_ip;
         assert!(!authorize_socket(
             &Restricted,
             &[Some(5432)],
@@ -415,12 +415,7 @@ mod tests {
     }
 
     impl AsyncPolicy for AsyncProbe {
-        fn allows(
-            &self,
-            _: IpAddr,
-            _: Option<u16>,
-            lease: terra_network::policy::DecisionLease,
-        ) -> DecisionFuture<bool> {
+        fn allows(&self, _: IpAddr, _: Option<u16>, lease: DecisionLease) -> DecisionFuture<bool> {
             Box::pin(async move {
                 let _lease = lease;
                 let visited = std::cell::Cell::new(false);
@@ -429,11 +424,7 @@ mod tests {
                 visited.get()
             })
         }
-        fn lookup_name(
-            &self,
-            _: String,
-            lease: terra_network::policy::DecisionLease,
-        ) -> DecisionFuture<NameLookup> {
+        fn lookup_name(&self, _: String, lease: DecisionLease) -> DecisionFuture<NameLookup> {
             Box::pin(async move {
                 let _lease = lease;
                 panic!("lookup failed")
@@ -443,7 +434,7 @@ mod tests {
             &self,
             _: String,
             _: Vec<IpAddr>,
-            lease: terra_network::policy::DecisionLease,
+            lease: DecisionLease,
         ) -> DecisionFuture<Vec<IpAddr>> {
             Box::pin(async move {
                 let _lease = lease;

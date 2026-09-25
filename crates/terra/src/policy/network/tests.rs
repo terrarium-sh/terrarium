@@ -78,7 +78,7 @@ fn describe_names_the_posture() {
 #[test]
 fn decision_logs_preserve_address_and_optional_port() {
     use super::runtime::BoxPolicy;
-    use terra_network::Policy;
+    use terra_runtime::component::network::Policy;
 
     struct Capture(std::sync::Mutex<Vec<String>>);
     impl log::Log for Capture {
@@ -103,7 +103,18 @@ fn decision_logs_preserve_address_and_optional_port() {
         assert!(allowed.allows(ip, port));
         assert!(!denied.allows(ip, port));
     }
+    assert!(matches!(
+        denied.lookup_name("8.8.4.4\nforged"),
+        terra_runtime::component::network::NameLookup::Denied
+    ));
     let messages = CAPTURE.0.lock().unwrap();
+    assert!(messages.iter().all(|message| !message.contains('\n')));
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("8.8.4.4\\nforged"))
+    );
+
     for expected in [
         "allowed 8.8.4.4",
         "allowed 8.8.4.4:443",

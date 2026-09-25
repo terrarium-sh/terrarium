@@ -6,7 +6,14 @@ use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use terra::BoxPolicy;
 use terra::config::{Network, NetworkMode, StaticDnsRecord};
-use terra_network::{GuestNetworkConfig, NameLookup, Policy, is_floored};
+use terra_runtime::component::network::{GuestNetworkConfig, NameLookup, Policy};
+
+#[allow(dead_code)]
+#[path = "../../components/policy/src/address.rs"]
+mod address;
+#[path = "../../components/policy/src/hostname.rs"]
+mod hostname;
+use address::is_floored;
 
 #[derive(Arbitrary, Debug)]
 enum Address {
@@ -161,7 +168,7 @@ fuzz_target!(|data: &[u8]| {
             }
             Ok(Step::Lookup(name)) => {
                 let lookup = policy.lookup_name(&name);
-                let Some(normalized) = terra_network::dns::normalize_hostname(&name) else {
+                let Some(normalized) = hostname::normalize_hostname(&name) else {
                     assert!(matches!(lookup, NameLookup::Denied));
                     continue;
                 };
@@ -174,7 +181,10 @@ fuzz_target!(|data: &[u8]| {
                         assert_eq!(normalized, "static.test");
                         assert_eq!(addresses, [IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))]);
                     }
-                    NameLookup::Resolve => assert!(open || allowed),
+                    NameLookup::Resolve(resolved_name) => {
+                        assert_eq!(resolved_name, normalized);
+                        assert!(open || allowed);
+                    }
                     NameLookup::Denied => {
                         assert!(!open && !allowed && normalized != "static.test");
                     }

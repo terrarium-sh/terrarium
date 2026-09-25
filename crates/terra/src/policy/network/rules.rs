@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use terra_network::{PortMapping, parse_port};
+use terra_runtime::component::network::PortMapping;
 
 /// Parse `network.ports` - `"HOST[:GUEST]"`, bare = same on both. The host
 /// side always binds `127.0.0.1`.
@@ -26,4 +26,11 @@ pub fn parse_port_mappings(ports: &[String]) -> Result<Vec<PortMapping>> {
         mappings.push(mapping);
     }
     Ok(mappings)
+}
+
+fn parse_port(text: &str) -> Option<u16> {
+    let text = text.trim();
+    text.parse::<u16>()
+        .ok()
+        .filter(|port| *port != 0 && !text.starts_with('+'))
 }

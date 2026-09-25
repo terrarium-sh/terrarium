@@ -6,12 +6,12 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use terra_network::{GuestNetworkConfig, Policy, PolicyHandle};
 use terra_runtime::box_runtime::{BoxHost, BoxRuntime};
 use terra_runtime::component::InterruptCallback;
 use terra_runtime::component::block::backing::{BoundedDisk, DiskGrant};
 use terra_runtime::component::context::DeviceContext;
 use terra_runtime::component::fs::{FsHost, ShareGrant};
+use terra_runtime::component::network::{GuestNetworkConfig, Policy, PolicyHandle};
 use terra_runtime::component::vsock::VsockChannel;
 use terra_runtime::engine::device_engine;
 use terra_runtime::memory::GuestRam;

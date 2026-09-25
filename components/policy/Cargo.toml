@@ -11,5 +11,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 lru = "0.18"
-terra-network = { path = "../../crates/terra-network" }
 wit-bindgen.workspace = true

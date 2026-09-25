@@ -1,8 +1,8 @@
 //! Native authority for standard WASI name lookups in the network component.
 
 use super::authorization::PolicyClient;
+use super::{NameLookup, PolicyHandle, PortMapping};
 use std::{marker::PhantomData, sync::Arc, time::Duration};
-use terra_network::NameLookup;
 use tokio::sync::Semaphore;
 use wasmtime::component::Accessor;
 use wasmtime_wasi::sockets::{WasiSockets, WasiSocketsView};
@@ -20,8 +20,8 @@ impl NetworkHost {
     #[must_use]
     pub fn new(
         mut context: DeviceContext,
-        policy: terra_network::PolicyHandle,
-        published_ports: Vec<terra_network::PortMapping>,
+        policy: PolicyHandle,
+        published_ports: Vec<PortMapping>,
     ) -> Self {
         let host_service_ports = policy.host_service_ports().to_vec();
         let policy = PolicyClient::new(policy, Arc::new(Semaphore::new(super::MAX_POLICY_CALLS)));
@@ -80,27 +80,25 @@ async fn resolve_name<T>(
     policy: PolicyClient,
     lookups: Arc<Semaphore>,
     accessor: Accessor<T, WasiSockets>,
-    name: String,
+    mut name: String,
 ) -> Result<
     Vec<wasmtime_wasi::p3::bindings::sockets::types::IpAddress>,
     wasmtime_wasi::p3::bindings::sockets::ip_name_lookup::ErrorCode,
 > {
     use wasmtime_wasi::p3::bindings::sockets::ip_name_lookup::ErrorCode;
 
-    let Some(name) = terra_network::dns::normalize_hostname(&name) else {
-        return Err(ErrorCode::InvalidArgument);
-    };
+    name.truncate(name.trim_end_matches('.').len());
     if name.len() > MAX_NAME_BYTES {
         return Err(ErrorCode::InvalidArgument);
     }
     let addresses = match policy
-        .lookup_name(name.clone())
+        .lookup_name(name)
         .await
         .ok_or(ErrorCode::TemporaryResolverFailure)?
     {
         NameLookup::Static(addresses) => addresses,
         NameLookup::Denied => return Err(ErrorCode::AccessDenied),
-        NameLookup::Resolve => {
+        NameLookup::Resolve(name) => {
             let permit = lookups
                 .try_acquire_owned()
                 .map_err(|_| ErrorCode::TemporaryResolverFailure)?;
@@ -201,11 +199,10 @@ pub fn network_component_linker<T: wasmtime_wasi::WasiView + AsMut<NetworkHost> 
 
 #[cfg(test)]
 mod tests {
+    use super::super::Policy;
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
     use std::thread;
-    use terra_network::Policy;
-    use terra_network::PolicyHandle;
 
     struct Static;
 

@@ -2,7 +2,8 @@ use crate::config::{Network, NetworkMode};
 use anyhow::Result;
 use std::net::IpAddr;
 use std::sync::{Arc, OnceLock};
-use terra_network::{NameLookup, Policy, dns::normalize_hostname};
+use terra_runtime::component::network as network_api;
+use terra_runtime::component::network::{DecisionFuture, DecisionLease, NameLookup, Policy};
 use terra_runtime::component::policy::{ComponentPolicy, Config, HostRecord, Mode, PolicyFactory};
 
 pub struct BoxPolicy(ComponentPolicy);
@@ -54,7 +55,7 @@ impl BoxPolicy {
 }
 
 impl Policy for BoxPolicy {
-    fn asynchronous(self: Arc<Self>) -> Option<Arc<dyn terra_network::policy::AsyncPolicy>> {
+    fn asynchronous(self: Arc<Self>) -> Option<Arc<dyn network_api::AsyncPolicy>> {
         Some(self)
     }
 
@@ -71,12 +72,8 @@ impl Policy for BoxPolicy {
         self.0.host_service_ports()
     }
     fn lookup_name(&self, name: &str) -> NameLookup {
-        let Some(name) = normalize_hostname(name) else {
-            log::warn!("terra: egress: blocked name lookup - invalid hostname");
-            return NameLookup::Denied;
-        };
-        let lookup = self.0.lookup_name(&name);
-        log_lookup(&name, &lookup);
+        let lookup = self.0.lookup_name(name);
+        log_lookup(name, &lookup);
         lookup
     }
     fn accept_resolved(&self, name: &str, addresses: &[IpAddr]) -> Vec<IpAddr> {
@@ -87,31 +84,22 @@ impl Policy for BoxPolicy {
     }
 }
 
-impl terra_network::policy::AsyncPolicy for BoxPolicy {
+impl network_api::AsyncPolicy for BoxPolicy {
     fn allows(
         &self,
         address: IpAddr,
         port: Option<u16>,
-        lease: terra_network::policy::DecisionLease,
-    ) -> terra_network::policy::DecisionFuture<bool> {
-        let response = terra_network::policy::AsyncPolicy::allows(&self.0, address, port, lease);
+        lease: DecisionLease,
+    ) -> DecisionFuture<bool> {
+        let response = network_api::AsyncPolicy::allows(&self.0, address, port, lease);
         Box::pin(async move {
             let allowed = response.await;
             log_decision(address, port, allowed);
             allowed
         })
     }
-    fn lookup_name(
-        &self,
-        name: String,
-        lease: terra_network::policy::DecisionLease,
-    ) -> terra_network::policy::DecisionFuture<NameLookup> {
-        let Some(name) = normalize_hostname(&name) else {
-            log::warn!("terra: egress: blocked name lookup - invalid hostname");
-            return Box::pin(async { NameLookup::Denied });
-        };
-        let response =
-            terra_network::policy::AsyncPolicy::lookup_name(&self.0, name.clone(), lease);
+    fn lookup_name(&self, name: String, lease: DecisionLease) -> DecisionFuture<NameLookup> {
+        let response = network_api::AsyncPolicy::lookup_name(&self.0, name.clone(), lease);
         Box::pin(async move {
             let lookup = response.await;
             log_lookup(&name, &lookup);
@@ -122,9 +110,9 @@ impl terra_network::policy::AsyncPolicy for BoxPolicy {
         &self,
         name: String,
         addresses: Vec<IpAddr>,
-        lease: terra_network::policy::DecisionLease,
-    ) -> terra_network::policy::DecisionFuture<Vec<IpAddr>> {
-        terra_network::policy::AsyncPolicy::accept_resolved(&self.0, name, addresses, lease)
+        lease: DecisionLease,
+    ) -> DecisionFuture<Vec<IpAddr>> {
+        network_api::AsyncPolicy::accept_resolved(&self.0, name, addresses, lease)
     }
 }
 
@@ -139,6 +127,9 @@ fn log_decision(address: IpAddr, port: Option<u16>, allowed: bool) {
 
 fn log_lookup(name: &str, lookup: &NameLookup) {
     if matches!(lookup, NameLookup::Denied) {
-        log::warn!("terra: egress: blocked {name} - policy denied name lookup");
+        log::warn!(
+            "terra: egress: blocked {} - policy denied name lookup",
+            name.escape_debug()
+        );
     }
 }

@@ -19,6 +19,7 @@ use wasi::sockets::types::{
 };
 use wit_bindgen::rt::async_support::StreamResult;
 
+mod dns;
 mod icmp;
 mod mmio;
 mod published;
@@ -61,6 +62,7 @@ const MAX_FLOWS: usize = 128;
 const TCP_BUFFER_BYTES: usize = 32 * 1024;
 const TCP_FLOW_TIMEOUT_SECS: u64 = 30;
 const DNS_PORT: u16 = 53;
+const LEARNED_DNS_TTL_SECS: u32 = 60;
 const MAX_UDP_PACKET_BYTES: usize = 4096;
 const UDP_RECEIVE_TIMEOUT: u64 = 5_000_000_000;
 const PUBLISHED_LISTENER_RETRY_DELAY: u64 = 1_000_000_000;
@@ -986,11 +988,8 @@ fn config(config: Config) -> Result<GatewayConfig, Error> {
         .ok_or(Error::Malformed)
 }
 fn start_dns(query: Vec<u8>, meta: UdpMetadata) -> Result<(), Error> {
-    let Some(name) = terra_network::dns::question_name(&query) else {
-        return gateway().dns_reply(
-            &terra_network::dns::error_response(&query, terra_network::dns::DNS_RCODE_SERVFAIL),
-            meta,
-        );
+    let Some(name) = dns::question_name(&query) else {
+        return gateway().dns_reply(&dns::error_response(&query, dns::DNS_RCODE_SERVFAIL), meta);
     };
     let (generation, id, registration) = gateway().add_background()?;
     wit_bindgen::rt::async_support::spawn_local(async move {
@@ -1007,20 +1006,18 @@ fn start_dns(query: Vec<u8>, meta: UdpMetadata) -> Result<(), Error> {
 
 async fn resolve_dns(name: String, query: Vec<u8>) -> Vec<u8> {
     match wasi::sockets::ip_name_lookup::resolve_addresses(name).await {
-        Ok(addresses) => terra_network::dns::build_ip_response(
+        Ok(addresses) => dns::build_ip_response(
             &query,
             &addresses
                 .into_iter()
                 .map(host_ip_address)
                 .collect::<Vec<_>>(),
-            terra_network::LEARNED_DNS_TTL_SECS,
+            LEARNED_DNS_TTL_SECS,
         ),
         Err(wasi::sockets::ip_name_lookup::ErrorCode::AccessDenied) => {
-            terra_network::dns::error_response(&query, terra_network::dns::DNS_RCODE_NXDOMAIN)
+            dns::error_response(&query, dns::DNS_RCODE_NXDOMAIN)
         }
-        Err(_) => {
-            terra_network::dns::error_response(&query, terra_network::dns::DNS_RCODE_SERVFAIL)
-        }
+        Err(_) => dns::error_response(&query, dns::DNS_RCODE_SERVFAIL),
     }
 }
 

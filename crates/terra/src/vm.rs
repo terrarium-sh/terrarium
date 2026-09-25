@@ -40,8 +40,8 @@ use anyhow::{Context as _, Result};
 use std::fs::File;
 #[cfg(unix)]
 use std::io::Read as _;
-use terra_network::GuestNetworkConfig;
 use terra_protocol::{Disk, Net, Plan, PlanMode, Share, WORKLOAD_ID, WORKLOAD_USER_NAME};
+use terra_runtime::component::network::GuestNetworkConfig;
 
 pub(crate) const GUEST_NETWORK: GuestNetworkConfig = GuestNetworkConfig::default();
 pub(crate) use terra_runtime::machine::MAX_GUEST_STORAGE_DEVICES;

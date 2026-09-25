@@ -99,7 +99,7 @@ fn network(
         &component,
         input.network_policy.clone(),
         input.port_mappings.clone(),
-        terra_network::GuestNetworkConfig::default(),
+        crate::component::network::GuestNetworkConfig::default(),
         interrupt,
     )
     .map_err(|error| error.to_string())?;
@@ -216,7 +216,7 @@ mod tests {
 
     struct DenyAll;
 
-    impl terra_network::Policy for DenyAll {
+    impl crate::component::network::Policy for DenyAll {
         fn allows(&self, _: std::net::IpAddr, _: Option<u16>) -> bool {
             false
         }

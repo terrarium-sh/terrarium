@@ -653,10 +653,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "terra-network"
-version = "0.0.1"
-
-[[package]]
 name = "terra-network-component"
 version = "0.1.0"
 dependencies = [
@@ -664,7 +660,6 @@ dependencies = [
  "smoltcp",
  "terra-device-transport",
  "terra-limits",
- "terra-network",
  "wit-bindgen",
 ]
 
@@ -673,7 +668,6 @@ name = "terra-policy-component"
 version = "0.1.0"
 dependencies = [
  "lru",
- "terra-network",
  "wit-bindgen",
 ]
 

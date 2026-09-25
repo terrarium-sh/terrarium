@@ -57,12 +57,12 @@ pub(super) async fn create_udp(
 
 #[cfg(test)]
 mod tests {
+    use super::super::{NetworkHost, Policy};
     use super::*;
-    use crate::component::network::NetworkHost;
     use wasmtime_wasi::sockets::WasiSocketsView;
 
     struct Deny;
-    impl terra_network::Policy for Deny {
+    impl Policy for Deny {
         fn allows(&self, _: std::net::IpAddr, _: Option<u16>) -> bool {
             false
         }
