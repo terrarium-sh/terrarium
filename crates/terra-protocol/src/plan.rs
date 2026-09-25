@@ -141,18 +141,14 @@ pub struct Plan {
     pub on_start: Vec<String>,
     pub pre_stop: Vec<String>,
     /// Background shell lines, restarted on failure until the box stops.
-    #[serde(default)]
     pub daemons: Vec<String>,
     pub workload: Vec<String>,
     pub sandbox_info: String,
     /// Wait for the foreground host session before starting the workload.
-    #[serde(default)]
     pub await_initial_session: bool,
-    #[serde(default, with = "serde_bytes")]
+    #[serde(with = "serde_bytes")]
     pub host_tz: Option<Vec<u8>>,
-    #[serde(default)]
     pub host_time: Option<HostTime>,
-    #[serde(default)]
     pub host_seed: Option<[u8; 32]>,
 }
 
@@ -222,26 +218,6 @@ mod tests {
             let mut cursor = std::io::Cursor::new(encode_frame(&plan).unwrap());
             assert_eq!(read_frame::<Plan>(&mut cursor).unwrap(), Some(plan));
         }
-        // Optional plan fields retain their defaults when absent.
-        let json_without = serde_json::json!({
-            "mode": "Create",
-            "workdir": "/work",
-            "shares": [],
-            "volumes": [],
-            "net": {"guest_ip":"100.96.0.2","prefix":30,"gateway":"100.96.0.1","dns":"100.96.0.1"},
-            "env": {},
-            "root": false,
-            "sudo": [],
-            "on_create": [],
-            "on_start": [],
-            "pre_stop": [],
-            "workload": [],
-            "sandbox_info": ""
-        });
-        let decoded: Plan = serde_json::from_value(json_without).unwrap();
-        assert_eq!(decoded.host_tz, None);
-        assert!(!decoded.await_initial_session);
-        assert!(decoded.daemons.is_empty());
     }
 
     #[test]

@@ -18,7 +18,6 @@ tokio = ["dep:tokio"]
 mux = ["dep:yamux"]
 
 [dev-dependencies]
-serde_json.workspace = true
 tokio = { version = "1", default-features = false, features = ["io-util", "macros", "rt"] }
 
 [lints]

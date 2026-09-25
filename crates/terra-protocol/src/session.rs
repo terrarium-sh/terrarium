@@ -53,9 +53,7 @@ pub struct ExecRequest {
     pub argv: Vec<String>,
     pub as_root: bool,
     pub tty: Option<TermSize>,
-    #[serde(default)]
     pub workdir: Option<String>,
-    #[serde(default)]
     pub env: BTreeMap<String, String>,
 }
 

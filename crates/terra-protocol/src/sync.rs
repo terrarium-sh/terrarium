@@ -115,7 +115,6 @@ pub struct SyncEntry {
     pub mtime_secs: i64,
     #[serde(deserialize_with = "deserialize_nanos")]
     pub mtime_nanos: u32,
-    #[serde(default)]
     pub link_target: Option<String>,
 }
 

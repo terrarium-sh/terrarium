@@ -1971,7 +1971,6 @@ dependencies = [
  "postcard",
  "serde",
  "serde_bytes",
- "serde_json",
  "tokio",
  "yamux",
 ]
