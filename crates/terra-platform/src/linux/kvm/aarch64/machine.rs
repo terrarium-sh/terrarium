@@ -1,6 +1,6 @@
 #![allow(unsafe_code)]
 
-use super::ArmWorkerError;
+use super::super::KvmError;
 use crate::memory::GuestMemory;
 use crate::vm::VmConfig;
 use kvm_bindings::{
@@ -25,16 +25,17 @@ pub(crate) struct Machine {
 }
 
 impl Machine {
-    pub(super) fn new(kvm: &Kvm, config: &VmConfig) -> Result<Self, ArmWorkerError> {
-        let ram_size = usize::try_from(config.ram_bytes).map_err(|_| ArmWorkerError::Memory)?;
+    pub(super) fn new(kvm: &Kvm, config: &VmConfig) -> Result<Self, KvmError> {
+        let ram_size =
+            usize::try_from(config.ram_bytes).map_err(|_| KvmError::Memory("ARM guest memory"))?;
         if config.ram_base != terra_limits::ARM_RAM_BASE
             || ram_size == 0
             || !config.ram_bytes.is_multiple_of(4096)
         {
-            return Err(ArmWorkerError::Memory);
+            return Err(KvmError::Memory("ARM guest memory"));
         }
         let crate::vm::InterruptControllerConfig::Arm(gic) = &config.interrupt_controller else {
-            return Err(ArmWorkerError::Memory);
+            return Err(KvmError::Memory("ARM guest memory"));
         };
         if gic.distributor_size == 0
             || gic.redistributor_size == 0
@@ -47,13 +48,14 @@ impl Machine {
                 .checked_add(gic.redistributor_size)
                 .is_none()
         {
-            return Err(ArmWorkerError::Memory);
+            return Err(KvmError::Memory("ARM guest memory"));
         }
         let vm = Arc::new(kvm.create_vm()?);
-        let ram = GuestMemory::allocate_arm_ram(config.ram_bytes).ok_or(ArmWorkerError::Memory)?;
+        let ram = GuestMemory::allocate_arm_ram(config.ram_bytes)
+            .ok_or(KvmError::Memory("ARM guest memory"))?;
         let host_address = ram
             .host_address(terra_limits::ARM_RAM_BASE)
-            .ok_or(ArmWorkerError::Memory)?;
+            .ok_or(KvmError::Memory("ARM guest memory"))?;
         let region = kvm_userspace_memory_region {
             slot: 0,
             flags: 0,
@@ -85,15 +87,15 @@ impl Machine {
         })
     }
 
-    pub(super) fn prepare_vcpus(&self, count: usize) -> Result<Vec<VcpuFd>, ArmWorkerError> {
+    pub(super) fn prepare_vcpus(&self, count: usize) -> Result<Vec<VcpuFd>, KvmError> {
         if count == 0 || count > ARM_MAX_VCPUS as usize {
-            return Err(ArmWorkerError::BadVcpuCount(count));
+            return Err(KvmError::BadVcpuCount(count));
         }
         let mut vcpus = Vec::with_capacity(count);
         for id in 0..count {
-            let vcpu = self
-                .vm
-                .create_vcpu(u64::try_from(id).map_err(|_| ArmWorkerError::Memory)?)?;
+            let vcpu = self.vm.create_vcpu(
+                u64::try_from(id).map_err(|_| KvmError::Memory("ARM guest memory"))?,
+            )?;
             let mut init = kvm_vcpu_init::default();
             self.vm.get_preferred_target(&mut init)?;
             init.features[0] |= 1 << KVM_ARM_VCPU_PSCI_0_2;
@@ -116,7 +118,7 @@ impl Machine {
         self.ram.clone()
     }
 
-    pub(crate) fn clear_interrupts(&self) -> Result<(), ArmWorkerError> {
+    pub(crate) fn clear_interrupts(&self) -> Result<(), KvmError> {
         self.irqs
             .iter()
             .try_for_each(|irq| self.set_irq_line(*irq, false))
@@ -127,10 +129,10 @@ impl Machine {
             .map_err(|error| format!("ARM interrupt: {error:?}"))
     }
 
-    fn set_irq_line(&self, irq: u32, level: bool) -> Result<(), ArmWorkerError> {
+    fn set_irq_line(&self, irq: u32, level: bool) -> Result<(), KvmError> {
         let irq = GIC_SPI_OFFSET
             .checked_add(irq)
-            .ok_or(ArmWorkerError::TooManyDevices)?;
+            .ok_or(KvmError::TooManyDevices)?;
         self.vm.set_irq_line(
             (KVM_ARM_IRQ_TYPE_SPI << KVM_ARM_IRQ_TYPE_SHIFT) | irq,
             level,
@@ -139,7 +141,7 @@ impl Machine {
     }
 }
 
-fn set_vgic_address(vgic: &DeviceFd, kind: u32, address: u64) -> Result<(), ArmWorkerError> {
+fn set_vgic_address(vgic: &DeviceFd, kind: u32, address: u64) -> Result<(), KvmError> {
     vgic.set_device_attr(&kvm_device_attr {
         group: KVM_DEV_ARM_VGIC_GRP_ADDR,
         attr: u64::from(kind),

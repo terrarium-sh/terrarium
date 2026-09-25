@@ -2,12 +2,11 @@
 
 #![allow(unsafe_code)]
 
+use super::super::{KvmError, STOP_DEADLINE, VcpuCommand, VcpuHandle, spawn_configured_vcpu_ready};
 use std::time::Instant;
 
 use super::arch::{setup_bsp_planned, setup_irqchip};
-use super::kvm::{
-    KvmError, Machine, STOP_DEADLINE, park_ap, run_kernel_vcpu, spawn_configured_vcpu_ready,
-};
+use super::kvm::{Machine, park_ap, run_kernel_vcpu};
 use crate::vm::{
     BootState, InterruptControllerConfig, InterruptMode, VcpuHandler, VcpuOutcome, VmCapabilities,
     VmConfig, VmHandle,
@@ -108,11 +107,6 @@ fn report_vcpu_failure(
     outcome
 }
 
-enum VcpuCommand {
-    Start(Box<dyn VcpuHandler>, BootState),
-    Stop,
-}
-
 pub(crate) struct NativePreparedVcpus {
     group: VcpuGroup,
     senders: Vec<std::sync::mpsc::SyncSender<VcpuCommand>>,
@@ -136,10 +130,12 @@ impl NativePreparedVcpus {
         for id in 0..vcpu_count {
             let (sender, receiver) = std::sync::mpsc::sync_channel(1);
             let cpu_cpuid = cpuid.clone();
-            group.runners.push(spawn_configured_vcpu_ready(
-                std::sync::Arc::clone(machine),
-                u64::try_from(id).map_err(|_| KvmError::BadVcpuCount(vcpu_count))?,
-                move |vcpu, stop, ready| {
+            let machine = std::sync::Arc::clone(machine);
+            let vcpu_id = u64::try_from(id).map_err(|_| KvmError::BadVcpuCount(vcpu_count))?;
+            group
+                .runners
+                .push(spawn_configured_vcpu_ready(vcpu_id, move |stop, ready| {
+                    let mut vcpu = machine.create_vcpu(vcpu_id)?;
                     if id == 0 {
                         ready.send(()).map_err(|_| KvmError::ThreadGone)?;
                         let VcpuCommand::Start(mut handler, boot) =
@@ -148,25 +144,24 @@ impl NativePreparedVcpus {
                             return Ok(VcpuOutcome::Stopped);
                         };
                         let outcome =
-                            setup_bsp_planned(&cpu_cpuid, vcpu, boot.entry, boot.boot_argument)
+                            setup_bsp_planned(&cpu_cpuid, &vcpu, boot.entry, boot.boot_argument)
                                 .map_err(KvmError::Bsp)
-                                .and_then(|()| run_kernel_vcpu(vcpu, stop, handler.as_mut()));
+                                .and_then(|()| run_kernel_vcpu(&mut vcpu, stop, handler.as_mut()));
                         report_vcpu_failure(id, handler.as_mut(), outcome)
                     } else {
                         vcpu.set_cpuid2(&cpu_cpuid)
                             .map_err(|e| KvmError::Operation("KVM_SET_CPUID2", e))?;
-                        park_ap(vcpu)?;
+                        park_ap(&vcpu)?;
                         ready.send(()).map_err(|_| KvmError::ThreadGone)?;
                         let VcpuCommand::Start(mut handler, _) =
                             receiver.recv().map_err(|_| KvmError::ThreadGone)?
                         else {
                             return Ok(VcpuOutcome::Stopped);
                         };
-                        let outcome = run_kernel_vcpu(vcpu, stop, handler.as_mut());
+                        let outcome = run_kernel_vcpu(&mut vcpu, stop, handler.as_mut());
                         report_vcpu_failure(id, handler.as_mut(), outcome)
                     }
-                },
-            )?);
+                })?);
             senders.push(sender);
         }
         Ok(Self { group, senders })
@@ -214,7 +209,7 @@ impl Drop for NativePreparedVcpus {
 }
 
 pub struct VcpuGroup {
-    runners: Vec<super::kvm::VcpuHandle>,
+    runners: Vec<VcpuHandle>,
     hard_stop: Option<fn() -> !>,
 }
 
@@ -312,9 +307,7 @@ mod tests {
 
     #[test]
     fn a_stop_timeout_requires_the_process_supervisor() {
-        assert!(super::stop_timed_out(&[Err(
-            super::super::kvm::KvmError::Timeout
-        )]));
+        assert!(super::stop_timed_out(&[Err(super::KvmError::Timeout)]));
         assert!(!super::stop_timed_out(&[Ok(
             crate::vm::VcpuOutcome::Stopped
         )]));

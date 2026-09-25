@@ -161,7 +161,7 @@ impl PthreadPublication {
         }
     }
 
-    #[cfg(all(test, target_arch = "x86_64"))]
+    #[cfg(test)]
     pub(crate) fn is_published(&self) -> bool {
         self.0
             .lock()
