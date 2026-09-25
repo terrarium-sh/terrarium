@@ -71,7 +71,7 @@ impl fmt::Display for KvmError {
             }
             #[cfg(target_arch = "x86_64")]
             Self::NoVcpus => formatter.write_str("KVM supports no vCPUs"),
-            Self::BadVcpuCount(count) => write!(formatter, "unsupported vCPU count {count}"),
+            Self::BadVcpuCount(count) => write!(formatter, "invalid vCPU count: {count}"),
             Self::Memory(operation) => write!(formatter, "KVM memory {operation} failed"),
             Self::Kvm(error) => write!(formatter, "KVM error: {error}"),
             Self::Operation(operation, error) => write!(formatter, "{operation}: {error}"),
