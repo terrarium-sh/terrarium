@@ -35,7 +35,6 @@ yamux = "=0.14.1"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 # Integration tests link the library without cfg(test).
 terra-runtime = { path = ".", features = ["test-support"] }
-virtio-bindings = "0.2.7"
 terra-vsock-device = { path = "../../components/vsock-device" }
 tempfile = { workspace = true }
 # Core-Wasm spike tests compile WAT and components; release builds do not.
@@ -43,9 +42,6 @@ wasmtime = { version = "=48.0.2", default-features = false, features = ["craneli
 
 [target.'cfg(unix)'.dev-dependencies]
 libc.workspace = true
-vm-memory = { version = "0.18", features = ["backend-mmap"] }
-virtio-blk = { git = "https://github.com/rust-vmm/vm-virtio", rev = "87bf424736548126983c278b0d49a7b061e38b12" }
-virtio-queue-git = { package = "virtio-queue", git = "https://github.com/rust-vmm/vm-virtio", rev = "87bf424736548126983c278b0d49a7b061e38b12", features = ["test-utils"] }
 
 [target.'cfg(windows)'.dev-dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }

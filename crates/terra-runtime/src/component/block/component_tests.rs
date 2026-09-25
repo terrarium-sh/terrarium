@@ -29,6 +29,7 @@ const T_GET_ID: u32 = 8;
 const T_DISCARD: u32 = 11;
 
 type Execute = TypedFunc<(u32, u64, Vec<Range>, u64, u64), (u8,)>;
+type ExecuteChain = TypedFunc<(u16, u64, u16, u64), (Result<Completion, DeviceError>,)>;
 type Configure = TypedFunc<(bool,), (Result<(), DeviceError>,)>;
 type Serve = TypedFunc<(StreamReader<Request>,), (StreamReader<Reply>,)>;
 
@@ -45,6 +46,7 @@ fn export_name(func: &str) -> ItemName {
 struct Fixture {
     store: wasmtime::Store<StandaloneHost<BlockHost>>,
     execute: Execute,
+    execute_chain: ExecuteChain,
     configure: Configure,
     serve: Serve,
 }
@@ -142,6 +144,9 @@ async fn fixture(
             export_name("execute"),
         )
         .expect("execute exported");
+    let execute_chain = instance
+        .get_typed_func(&mut store, export_name("execute-chain"))
+        .expect("execute-chain exported");
     let configure = instance
         .get_typed_func(&mut store, export_name("configure"))
         .unwrap();
@@ -161,6 +166,7 @@ async fn fixture(
         Fixture {
             store,
             execute,
+            execute_chain,
             configure,
             serve,
         },
@@ -477,6 +483,18 @@ async fn component_flush_identify_and_unsupported() {
         .expect("flush runs");
     assert_eq!(result, 0);
     assert!(fixture.store.data_mut().context.drain_signal());
+    for (request_type, sector, ranges) in [(T_FLUSH, 7, vec![]), (T_FLUSH, 0, one(DATA, 512))] {
+        let (result,) = fixture
+            .execute
+            .call_async(
+                &mut fixture.store,
+                (request_type, sector, ranges, STATUS, 0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result, 1);
+        assert_eq!(status(&fixture), 1);
+    }
     let (result,) = fixture
         .execute
         .call_async(&mut fixture.store, (0xFFFF, 0, one(DATA, 512), STATUS, 0))
@@ -657,4 +675,135 @@ async fn component_operates_on_shared_machine_ram() {
     assert_eq!(back, [0x5Eu8; 512]);
     let status = mem.read(STATUS, 1).expect("mapped");
     assert_eq!(status, [0]);
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn component_rejects_malformed_chains_without_writing_the_disk() {
+    let (_, mut fixture) = fixture(8, false).await;
+    let header_addr = 0x1000;
+    let table_addr = 0x4000;
+    let mut header = [0; 16];
+    header[..4].copy_from_slice(&T_OUT.to_le_bytes());
+    fixture
+        .store
+        .data_mut()
+        .context
+        .guest_write(header_addr, &header)
+        .unwrap();
+    fixture
+        .store
+        .data_mut()
+        .context
+        .guest_write(DATA, &[0xCD; 512])
+        .unwrap();
+    let header = (header_addr, 16_u32, 1_u16, 1_u16);
+    let data = (DATA, 512, 1, 2);
+    let tail = (STATUS, 1, 2, 0);
+    let mut too_many_ranges = vec![header];
+    too_many_ranges.extend((2..=18).map(|next| (DATA, 512, 1, next)));
+    too_many_ranges.push(tail);
+    let cases = [
+        (
+            "short header",
+            vec![(header_addr, 15, 1, 1), data, tail],
+            true,
+        ),
+        (
+            "writable header",
+            vec![(header_addr, 16, 3, 1), data, tail],
+            true,
+        ),
+        ("missing status", vec![(header_addr, 16, 0, 0)], false),
+        (
+            "read-only status",
+            vec![header, data, (STATUS, 1, 0, 0)],
+            false,
+        ),
+        ("empty status", vec![header, data, (STATUS, 0, 2, 0)], false),
+        ("long status", vec![header, data, (STATUS, 2, 2, 0)], false),
+        (
+            "status outside RAM",
+            vec![header, data, (u64::MAX, 1, 2, 0)],
+            false,
+        ),
+        (
+            "wrong direction",
+            vec![header, (DATA, 512, 3, 2), tail],
+            true,
+        ),
+        (
+            "mixed directions",
+            vec![header, data, (DATA + 512, 512, 3, 3), tail],
+            true,
+        ),
+        (
+            "oversized buffer",
+            vec![header, (DATA, 32 * 1024, 1, 2), tail],
+            true,
+        ),
+        (
+            "data outside RAM",
+            vec![header, (u64::MAX, 512, 1, 2), tail],
+            true,
+        ),
+        ("indirect descriptor", vec![header, (DATA, 32, 4, 0)], false),
+        ("cycle", vec![(header_addr, 16, 1, 0)], false),
+        ("invalid next", vec![(header_addr, 16, 1, 99)], false),
+        ("too many ranges", too_many_ranges, false),
+        (
+            "partial sector",
+            vec![header, (DATA, 100, 1, 2), tail],
+            true,
+        ),
+    ];
+    for (name, descriptors, completes_with_ioerr) in cases {
+        fixture
+            .store
+            .data_mut()
+            .context
+            .guest_write(STATUS, &[0xFF])
+            .unwrap();
+        for (index, (addr, len, flags, next)) in descriptors.into_iter().enumerate() {
+            let mut bytes = [0; 16];
+            bytes[..8].copy_from_slice(&addr.to_le_bytes());
+            bytes[8..12].copy_from_slice(&len.to_le_bytes());
+            bytes[12..14].copy_from_slice(&flags.to_le_bytes());
+            bytes[14..].copy_from_slice(&next.to_le_bytes());
+            fixture
+                .store
+                .data_mut()
+                .context
+                .guest_write(table_addr + u64::try_from(index).unwrap() * 16, &bytes)
+                .unwrap();
+        }
+        let (completion,) = fixture
+            .execute_chain
+            .call_async(&mut fixture.store, (0, table_addr, 32, 0))
+            .await
+            .unwrap();
+        if completes_with_ioerr {
+            let completion = completion.unwrap_or_else(|error| panic!("{name}: {error:?}"));
+            assert_eq!((completion.status, completion.used_len), (1, 1), "{name}");
+            assert_eq!(status(&fixture), 1, "{name}");
+        } else {
+            assert!(completion.is_err(), "{name}");
+            assert_eq!(status(&fixture), 0xFF, "{name}");
+        }
+    }
+    let (result,) = fixture
+        .execute
+        .call_async(&mut fixture.store, (T_IN, 0, one(DATA, 512), STATUS, 0))
+        .await
+        .unwrap();
+    assert_eq!(result, 0);
+    assert_eq!(
+        fixture
+            .store
+            .data_mut()
+            .context
+            .guest_read(DATA, 512)
+            .unwrap(),
+        [0; 512]
+    );
 }

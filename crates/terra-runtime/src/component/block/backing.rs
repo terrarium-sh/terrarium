@@ -64,13 +64,6 @@ impl BoundedDisk {
     }
 }
 
-pub const STATUS_OK: u8 = 0;
-#[cfg(test)]
-#[path = "reference.rs"]
-mod reference;
-#[cfg(test)]
-pub(crate) use reference::*;
-
 /// Host storage operations exposed to the block component.
 pub trait BlockBacking {
     fn capacity(&self) -> u64;
@@ -270,5 +263,60 @@ mod tests {
         assert_eq!(disk.read_at(1, &mut bytes), Err(BackingError::OutOfRange));
         assert_eq!(disk.read_at(0, &mut bytes), Ok(()));
         assert_eq!(bytes, [1, 2, 3, 4]);
+    }
+}
+
+#[cfg(all(test, any(unix, windows)))]
+mod file_tests {
+    use super::{BackingError, BlockBacking, FileDisk};
+
+    fn backing_file() -> tempfile::NamedTempFile {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len(4096).unwrap();
+        file
+    }
+
+    #[test]
+    fn file_round_trip_persists_across_reopen() {
+        let file = backing_file();
+        {
+            let mut disk = FileDisk::open(file.path(), false).unwrap();
+            disk.write_at(1536, &[0xAB; 512]).unwrap();
+            disk.sync().unwrap();
+        }
+        let disk = FileDisk::open(file.path(), true).unwrap();
+        let mut bytes = [0; 512];
+        disk.read_at(1536, &mut bytes).unwrap();
+        assert_eq!(bytes, [0xAB; 512]);
+    }
+
+    #[test]
+    fn file_bounds_reject_past_end_and_overflow_without_extending_the_image() {
+        let file = backing_file();
+        let mut disk = FileDisk::open(file.path(), false).unwrap();
+        assert_eq!(disk.capacity(), 4096);
+        for offset in [4096, u64::MAX] {
+            assert_eq!(
+                disk.read_at(offset, &mut [0]),
+                Err(BackingError::OutOfRange)
+            );
+            assert_eq!(disk.write_at(offset, &[1]), Err(BackingError::OutOfRange));
+            assert_eq!(disk.discard(offset, 1), Err(BackingError::OutOfRange));
+        }
+        assert_eq!(file.as_file().metadata().unwrap().len(), 4096);
+        file.as_file().set_len(8192).unwrap();
+        assert_eq!(disk.capacity(), 4096);
+        assert_eq!(disk.write_at(4096, &[1]), Err(BackingError::OutOfRange));
+    }
+
+    #[test]
+    fn file_readonly_rejects_writes_and_discard() {
+        let file = backing_file();
+        let mut disk = FileDisk::open(file.path(), true).unwrap();
+        assert_eq!(disk.write_at(0, &[1]), Err(BackingError::ReadOnly));
+        assert_eq!(disk.discard(0, 512), Err(BackingError::ReadOnly));
+        let mut bytes = [1; 512];
+        disk.read_at(0, &mut bytes).unwrap();
+        assert_eq!(bytes, [0; 512]);
     }
 }

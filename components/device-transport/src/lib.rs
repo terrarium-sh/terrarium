@@ -871,6 +871,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn device_status_enforces_sequence_failure_and_reset() {
+        for (current, written, expected) in [
+            (0, 1, Some(1)),
+            (0, 2, None),
+            (1, 3, Some(3)),
+            (3, 3, Some(3)),
+            (3, 15, None),
+            (3, 11, Some(11)),
+            (11, 15, Some(15)),
+            (15, 0, Some(0)),
+            (0, 0, Some(0)),
+            (1, 65, None),
+            (1, 129, Some(129)),
+            (129, 3, None),
+            (129, 129, Some(129)),
+            (129, 0, Some(0)),
+            (1, 2, None),
+        ] {
+            assert_eq!(
+                drive_status(current, written).ok(),
+                expected,
+                "{current} -> {written}"
+            );
+        }
+    }
+
+    #[test]
     fn queue_sizes_match_virtio_queue_rules() {
         for (max, size, valid) in [
             (0, 0, false),

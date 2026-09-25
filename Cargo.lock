@@ -1995,10 +1995,6 @@ dependencies = [
  "terra-vsock-device",
  "tokio",
  "tokio-util",
- "virtio-bindings 0.2.7 (registry+https://github.com/rust-lang/crates.io-index)",
- "virtio-blk",
- "virtio-queue 0.18.0 (git+https://github.com/rust-vmm/vm-virtio?rev=87bf424736548126983c278b0d49a7b061e38b12)",
- "vm-memory",
  "wasmtime",
  "wasmtime-wasi",
  "windows-sys 0.61.2",
@@ -2264,35 +2260,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "091f1f09cfbf2a78563b562e7a949465cce1aef63b6065645188d995162f8868"
 
 [[package]]
-name = "virtio-bindings"
-version = "0.2.7"
-source = "git+https://github.com/rust-vmm/vm-virtio?rev=87bf424736548126983c278b0d49a7b061e38b12#87bf424736548126983c278b0d49a7b061e38b12"
-
-[[package]]
-name = "virtio-blk"
-version = "0.1.0"
-source = "git+https://github.com/rust-vmm/vm-virtio?rev=87bf424736548126983c278b0d49a7b061e38b12#87bf424736548126983c278b0d49a7b061e38b12"
-dependencies = [
- "log",
- "virtio-bindings 0.2.7 (git+https://github.com/rust-vmm/vm-virtio?rev=87bf424736548126983c278b0d49a7b061e38b12)",
- "virtio-device",
- "virtio-queue 0.18.0 (git+https://github.com/rust-vmm/vm-virtio?rev=87bf424736548126983c278b0d49a7b061e38b12)",
- "vm-memory",
- "vmm-sys-util",
-]
-
-[[package]]
-name = "virtio-device"
-version = "0.1.0"
-source = "git+https://github.com/rust-vmm/vm-virtio?rev=87bf424736548126983c278b0d49a7b061e38b12#87bf424736548126983c278b0d49a7b061e38b12"
-dependencies = [
- "log",
- "virtio-bindings 0.2.7 (git+https://github.com/rust-vmm/vm-virtio?rev=87bf424736548126983c278b0d49a7b061e38b12)",
- "virtio-queue 0.18.0 (git+https://github.com/rust-vmm/vm-virtio?rev=87bf424736548126983c278b0d49a7b061e38b12)",
- "vm-memory",
-]
-
-[[package]]
 name = "virtio-queue"
 version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2300,19 +2267,7 @@ checksum = "f631bfd09362a9b17f0cfd5ca3b0a1b179d153fa276f9ce86919d560891e61d6"
 dependencies = [
  "libc",
  "log",
- "virtio-bindings 0.2.7 (registry+https://github.com/rust-lang/crates.io-index)",
- "vm-memory",
- "vmm-sys-util",
-]
-
-[[package]]
-name = "virtio-queue"
-version = "0.18.0"
-source = "git+https://github.com/rust-vmm/vm-virtio?rev=87bf424736548126983c278b0d49a7b061e38b12#87bf424736548126983c278b0d49a7b061e38b12"
-dependencies = [
- "libc",
- "log",
- "virtio-bindings 0.2.7 (git+https://github.com/rust-vmm/vm-virtio?rev=87bf424736548126983c278b0d49a7b061e38b12)",
+ "virtio-bindings",
  "vm-memory",
  "vmm-sys-util",
 ]
@@ -2323,8 +2278,8 @@ version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "79123315dc0bad0a2923891c0cdf76269cc64f553548e7b090c2676776ea6baf"
 dependencies = [
- "virtio-bindings 0.2.7 (registry+https://github.com/rust-lang/crates.io-index)",
- "virtio-queue 0.18.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "virtio-bindings",
+ "virtio-queue",
  "vm-memory",
 ]
 

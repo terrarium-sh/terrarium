@@ -274,4 +274,56 @@ mod tests {
         drop(permit);
         disk_sync(&mut host).await.expect("disk available again");
     }
+
+    #[tokio::test]
+    async fn component_completes_host_io_failures_with_ioerr() {
+        use super::{BlockHost, DiskGrant, block_component_linker};
+        use crate::component::block::bindings::Range;
+        use crate::engine::device_engine;
+        use crate::test_support::device_store;
+
+        let host = BlockHost::new(
+            crate::memory::GuestRam::new(4096).unwrap(),
+            DiskGrant::Mem(BoundedDisk::new(4096, false)),
+        );
+        let disk = std::sync::Arc::clone(&host.disk);
+        assert!(
+            std::panic::catch_unwind(|| {
+                let _guard = disk.lock().unwrap();
+                panic!("disk failed");
+            })
+            .is_err()
+        );
+        let engine = device_engine().unwrap();
+        let component =
+            wasmtime::component::Component::new(&engine, crate::test_fixtures::wasm::BLOCK)
+                .unwrap();
+        let linker = block_component_linker(&engine).unwrap();
+        let mut store = device_store(&engine, host);
+        let instance = linker
+            .instantiate_async(&mut store, &component)
+            .await
+            .unwrap();
+        let execute = instance
+            .get_typed_func::<(u32, u64, Vec<Range>, u64, u64), (u8,)>(
+                &mut store,
+                "terra:host/device-api.execute@0.1.0"
+                    .parse::<wasmtime::component::wit_parser::ItemName>()
+                    .unwrap(),
+            )
+            .unwrap();
+        for (request_type, data) in [
+            (0, vec![Range { addr: 0, len: 512 }]),
+            (1, vec![Range { addr: 0, len: 512 }]),
+            (4, vec![]),
+        ] {
+            store.data_mut().context.guest_write(1024, &[0xFF]).unwrap();
+            let (status,) = execute
+                .call_async(&mut store, (request_type, 0, data, 1024, 0))
+                .await
+                .unwrap();
+            assert_eq!(status, 1);
+            assert_eq!(store.data().context.guest_read(1024, 1).unwrap(), [1]);
+        }
+    }
 }
