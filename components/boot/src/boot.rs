@@ -200,7 +200,7 @@ fn command_line(base: &str, devices: &[Device]) -> Result<Vec<u8>, Error> {
 
 fn hardened_command_line(kernel_command_line: &str) -> String {
     format!(
-        "{kernel_command_line} init_on_alloc=1 init_on_free=1 initcall_blacklist=print_s5_reset_status_mmio"
+        "{kernel_command_line} init_on_alloc=1 init_on_free=0 initcall_blacklist=print_s5_reset_status_mmio"
     )
 }
 
@@ -816,8 +816,8 @@ mod tests {
         assert!(
             command_line
                 .bytes
-                .windows(14)
-                .any(|word| word == b"init_on_free=1")
+                .windows(b"init_on_alloc=1 init_on_free=0".len())
+                .any(|word| word == b"init_on_alloc=1 init_on_free=0")
         );
         let zero_page = plan
             .writes
@@ -1093,8 +1093,8 @@ mod tests {
         assert!(
             plan.writes[0]
                 .bytes
-                .windows(14)
-                .any(|word| word == b"init_on_free=1")
+                .windows(b"init_on_alloc=1 init_on_free=0".len())
+                .any(|word| word == b"init_on_alloc=1 init_on_free=0")
         );
     }
 }

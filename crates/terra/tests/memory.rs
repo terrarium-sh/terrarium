@@ -228,6 +228,15 @@ fn guest_memory_grows_and_shrinks_with_its_working_set() {
     };
     running.run(&["mem", "-d", "--project", project_path]);
     running.exec(&["true"]);
+    let command_line = running.exec(&["cat", "/proc/cmdline"]);
+    for flag in ["init_on_alloc=1", "init_on_free=0"] {
+        assert!(
+            command_line
+                .split_ascii_whitespace()
+                .any(|word| word == flag),
+            "missing {flag} in guest command line: {command_line}"
+        );
+    }
 
     let pid = vm_pid(&running);
     let initial = wait_for_rss(

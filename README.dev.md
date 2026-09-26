@@ -148,8 +148,9 @@ boot disk without rebuilding its root filesystem.
 Guest RAM is demand-backed and Linux reports free pages through the memory
 component for native discard. Guest capacity stays fixed; host RSS includes
 runtime overhead and reclaim is asynchronous. The kernel command line uses
-`init_on_alloc=1 init_on_free=1`: allocation and free-time clearing remain
-enabled. See [usage](docs/usage.md) and
+`init_on_alloc=1 init_on_free=0`: memory is cleared on allocation, avoiding
+a full RAM clear during boot. Freed memory is cleared when reused rather than
+immediately on release. See [usage](docs/usage.md) and
 [security](docs/security.md) for the user contract and isolation limits.
 
 Guest ext4 images are not byte reproducible: filesystem UUIDs, timestamps, and
