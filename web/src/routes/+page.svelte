@@ -2,10 +2,21 @@
   import { base } from '$app/paths';
   import { releaseTag } from '$lib/generated/version.json';
   import { onMount } from 'svelte';
+  import { Select, type SelectItem } from '@alis-is/starlight';
   import { detectClientPlatform, type ClientPlatform } from '$lib/client-platform';
+  import CopyButton from '$lib/CopyButton.svelte';
 
+  const platforms: SelectItem<ClientPlatform>[] = [
+    { label: 'Linux', value: 'linux' },
+    { label: 'macOS on Apple Silicon', value: 'macos' },
+    { label: 'Windows', value: 'windows' }
+  ];
   let platform = $state<ClientPlatform>('');
   let isClient = $state(false);
+  let linuxInstallCode = $state<HTMLElement>();
+  let windowsInstallCode = $state<HTMLElement>();
+  let setupCode = $state<HTMLElement>();
+  let recipeCode = $state<HTMLElement>();
 
   onMount(() => {
     platform = detectClientPlatform(navigator);
@@ -90,13 +101,7 @@
     <p>Install Terra and save this recipe as <code>dev.yaml</code>. Then set up and enter your box.</p>
     {#if isClient}
       <div class="platform-choice">
-        <label for="install-platform">Install for</label>
-        <select id="install-platform" bind:value={platform} aria-controls="install-commands">
-          <option value="">Choose a platform</option>
-          <option value="linux">Linux</option>
-          <option value="macos">macOS on Apple Silicon</option>
-          <option value="windows">Windows</option>
-        </select>
+        <Select label="Install for" options={platforms} value={platforms.find(item => item.value === platform)} onselected={(item: SelectItem<ClientPlatform>) => platform = item.value} />
       </div>
       {#if !platform}<p class="small muted">Choose the desktop computer you’ll install Terra on.</p>{/if}
     {/if}
@@ -104,22 +109,22 @@
     <div id="install-commands">
       {#if platform !== 'windows'}
         <h3>{platform === 'macos' ? 'macOS on Apple Silicon · Terminal' : platform === 'linux' ? 'Linux · Terminal' : 'Linux & macOS on Apple Silicon · Terminal'}</h3>
-        <pre><code>curl -fsSLO https://raw.githubusercontent.com/terrarium-sh/terrarium/main/install.sh &amp;&amp; sh install.sh</code></pre>
+        <div class="copyable-block"><pre><code bind:this={linuxInstallCode}>curl -fsSLO https://raw.githubusercontent.com/terrarium-sh/terrarium/main/install.sh &amp;&amp; sh install.sh</code></pre><CopyButton text={() => linuxInstallCode?.textContent?.trimEnd() ?? ''} label="Copy Linux and macOS install command" /></div>
       {/if}
       {#if platform === 'windows' || !platform}
         <h3>Windows · PowerShell</h3>
-        <pre><code>Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/terrarium-sh/terrarium/main/install.ps1 -OutFile install.ps1; if ($?) &#123; powershell -ExecutionPolicy Bypass -File install.ps1 &#125;</code></pre>
+        <div class="copyable-block"><pre><code bind:this={windowsInstallCode}>Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/terrarium-sh/terrarium/main/install.ps1 -OutFile install.ps1; if ($?) &#123; powershell -ExecutionPolicy Bypass -File install.ps1 &#125;</code></pre><CopyButton text={() => windowsInstallCode?.textContent?.trimEnd() ?? ''} label="Copy Windows install command" /></div>
         <p class="small muted">After installing on Windows, open a new terminal so <code>terra</code> is on your PATH.</p>
       {/if}
     </div>
     <h3>Set up your box</h3>
-    <pre><code>terra ./dev.yaml setup
-terra</code></pre>
+    <div class="copyable-block"><pre><code bind:this={setupCode}>terra ./dev.yaml setup
+terra</code></pre><CopyButton text={() => setupCode?.textContent?.trimEnd() ?? ''} label="Copy setup commands" /></div>
     <a href="{base}/docs/usage/">Read the usage guide <span aria-hidden="true">→</span></a>
   </div>
   <div class="recipe-preview">
     <div class="code-heading"><span class="status-dot"></span><span>dev.yaml</span><span class="muted">your box, your rules</span></div>
-    <pre><code><span class="code-key">hw:</span>
+    <div class="copyable-block"><pre><code bind:this={recipeCode}><span class="code-key">hw:</span>
   cpus: 2
   mem_mib: 1024
 
@@ -127,8 +132,8 @@ terra</code></pre>
   mode: unrestricted-public
 
 <span class="code-key">workload:</span>
-  entrypoint: /bin/sh</code></pre>
-    <div class="terminal-line"><span aria-hidden="true">$</span> terra ./dev.yaml setup<br /><span aria-hidden="true">$</span> terra</div>
+  entrypoint: /bin/sh</code></pre><CopyButton text={() => recipeCode?.textContent?.trimEnd() ?? ''} label="Copy dev.yaml recipe" /></div>
+    <div class="copyable-block"><div class="terminal-line"><span aria-hidden="true">$</span> terra ./dev.yaml setup<br /><span aria-hidden="true">$</span> terra</div><CopyButton text={'terra ./dev.yaml setup\nterra'} label="Copy terminal commands" /></div>
     <p>Public network access is opt-in.<br />Host files stay private until you share them.</p>
   </div>
 </section>

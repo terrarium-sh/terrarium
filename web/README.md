@@ -22,8 +22,8 @@ pnpm preview
 
 Deploy the contents of `build/`. All pages are prerendered, with local styles,
 scripts, and assets; no runtime server, external fonts, or search service is
-required. Client JavaScript powers platform detection on the homepage and
-command search, plus the live GitHub star count on every page. All content
+required. Client JavaScript powers platform detection, command search,
+click-to-copy code controls, and the live GitHub star count. All content
 is readable without JavaScript.
 Set `BASE_PATH=/terrarium` at build time for a GitHub Pages project site;
 leave it empty for a domain root. Deep links use directory `index.html` files.

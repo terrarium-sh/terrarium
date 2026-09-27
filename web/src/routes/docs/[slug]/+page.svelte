@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { base } from '$app/paths';
 	import { releaseTag } from '$lib/generated/version.json';
+	import { copyGuideCode } from '$lib/copy-guide-code';
 
 	let { data } = $props();
 </script>
@@ -21,4 +22,4 @@
 
 <p class="docs-notice">Development guide, built from the current repository. Features may differ from {releaseTag ?? 'the published release'}; consult the <a href={`${base}/commands/`}>command reference</a> for the binary documented on this site.</p>
 
-<article class="prose">{@html data.guide.html}</article>
+{#key data.guide.slug}<article class="prose" use:copyGuideCode>{@html data.guide.html}</article>{/key}

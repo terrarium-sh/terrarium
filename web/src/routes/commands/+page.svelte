@@ -2,6 +2,7 @@
   import { Input, Button } from '@alis-is/starlight';
   import commands from '$lib/generated/commands.json';
   import { version } from '$lib/generated/version.json';
+  import CopyButton from '$lib/CopyButton.svelte';
 
   let query = $state('');
   const terms = $derived(query.toLowerCase().trim().split(/\s+/).filter(Boolean));
@@ -34,7 +35,7 @@
   <div>
     {#each matches as command}
       <section class="command" id={command.slug}>
-        <h2><a href="#{command.slug}"><code>{command.title}</code></a></h2>
+        <div class="command-heading"><h2><a href="#{command.slug}"><code>{command.title}</code></a></h2><CopyButton text={command.title.replace(' [BOX]', '')} label={`Copy ${command.title.replace(' [BOX]', '')} command`} /></div>
         <p>{command.description}</p>
         <pre><code>{command.help}</code></pre>
       </section>
