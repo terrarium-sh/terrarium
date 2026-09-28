@@ -37,7 +37,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install component formatter
-        run: rustup toolchain install nightly-2026-09-16 --profile minimal --component rustfmt
+        run: rustup toolchain install "$(sed -n 's/^channel = "\(nightly-[^"]*\)"/\1/p' components/rust-toolchain.toml)" --profile minimal --component rustfmt
       - run: make KEEP_GOING=1 verify-source
 
   guest-assets:
@@ -63,9 +63,13 @@ jobs:
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
           unshare -U -r true
+      - name: Read Zig version
+        id: zig-version
+        run: |
+          echo "version=$(sed -n 's/^ZIG_VERSION := //p' Makefile)" >> "$GITHUB_OUTPUT"
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          version: 0.16.0
+          version: ${{ steps.zig-version.outputs.version }}
       - run: rustup target add ${{ matrix.rust_target }}
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
@@ -128,12 +132,18 @@ jobs:
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
           unshare -U -r true
+      - name: Read Zig version
+        id: zig-version
+        run: |
+          echo "version=$(sed -n 's/^ZIG_VERSION := //p' Makefile)" >> "$GITHUB_OUTPUT"
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          version: 0.16.0
+          version: ${{ steps.zig-version.outputs.version }}
       - name: Install component toolchain
         run: |
-          rustup toolchain install nightly-2026-09-16 --profile minimal --component rustfmt,clippy --target wasm32-unknown-unknown --target wasm32-wasip3
+          nightly=$(sed -n 's/^channel = "\(nightly-[^"]*\)"/\1/p' components/rust-toolchain.toml)
+          echo "NIGHTLY_TOOLCHAIN=$nightly" >> "$GITHUB_ENV"
+          rustup toolchain install "$nightly" --profile minimal --component rustfmt,clippy --target wasm32-unknown-unknown --target wasm32-wasip3
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           cache-on-failure: true
@@ -141,7 +151,7 @@ jobs:
           key: x86_64-linux
       - name: Install wasm-tools
         run: |
-          cargo install wasm-tools --version 1.248.0 --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
+          cargo install wasm-tools --version "$(sed -n 's/^WASM_TOOLS_VERSION := //p' Makefile)" --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: terra-guest-x86_64
@@ -191,15 +201,15 @@ jobs:
       - name: Fuzz smoke
         if: ${{ !cancelled() && steps.host-build.outcome == 'success' }}
         run: |
-          cargo install cargo-fuzz --version 0.13.1 --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
+          cargo install cargo-fuzz --version "$(sed -n 's/^CARGO_FUZZ_VERSION := //p' Makefile)" --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
           cargo metadata --locked --manifest-path fuzz/Cargo.toml --format-version 1
           status=0
-          cargo +nightly-2026-09-16 fuzz run network_policy -- -max_total_time=60 -max_len=4096 || status=1
-          cargo +nightly-2026-09-16 fuzz run native_memory -- -max_total_time=60 -max_len=32768 || status=1
-          cargo +nightly-2026-09-16 fuzz run device_queue -- -max_total_time=60 -max_len=4096 || status=1
-          cargo +nightly-2026-09-16 fuzz run fuse_wire -- -max_total_time=60 -max_len=4096 || status=1
-          cargo +nightly-2026-09-16 fuzz run vsock_header -- -max_total_time=60 -max_len=4096 || status=1
-          cargo +nightly-2026-09-16 fuzz run protocol_frames -- -max_total_time=60 -max_len=4096 || status=1
+          cargo +"$NIGHTLY_TOOLCHAIN" fuzz run network_policy -- -max_total_time=60 -max_len=4096 || status=1
+          cargo +"$NIGHTLY_TOOLCHAIN" fuzz run native_memory -- -max_total_time=60 -max_len=32768 || status=1
+          cargo +"$NIGHTLY_TOOLCHAIN" fuzz run device_queue -- -max_total_time=60 -max_len=4096 || status=1
+          cargo +"$NIGHTLY_TOOLCHAIN" fuzz run fuse_wire -- -max_total_time=60 -max_len=4096 || status=1
+          cargo +"$NIGHTLY_TOOLCHAIN" fuzz run vsock_header -- -max_total_time=60 -max_len=4096 || status=1
+          cargo +"$NIGHTLY_TOOLCHAIN" fuzz run protocol_frames -- -max_total_time=60 -max_len=4096 || status=1
           exit "$status"
       - name: Reclaim fuzz build space
         if: ${{ !cancelled() }}
@@ -209,7 +219,7 @@ jobs:
         env:
           RUSTFLAGS: -Zsanitizer=address
           CARGO_TARGET_DIR: target/asan
-        run: cargo +nightly-2026-09-16 test --no-fail-fast --locked -p terra-runtime --test native_boundary --target x86_64-unknown-linux-gnu
+        run: cargo +"$NIGHTLY_TOOLCHAIN" test --no-fail-fast --locked -p terra-runtime --test native_boundary --target x86_64-unknown-linux-gnu
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: terra-x86_64-linux
@@ -232,17 +242,21 @@ jobs:
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
           unshare -U -r true
+      - name: Read Zig version
+        id: zig-version
+        run: |
+          echo "version=$(sed -n 's/^ZIG_VERSION := //p' Makefile)" >> "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: terra-guest-aarch64
           path: build
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          version: 0.16.0
+          version: ${{ steps.zig-version.outputs.version }}
       - name: Install component toolchain
         run: |
           rustup target add aarch64-unknown-linux-musl
-          rustup toolchain install nightly-2026-09-16 --profile minimal --component rustfmt,clippy --target wasm32-unknown-unknown --target wasm32-wasip3
+          rustup toolchain install "$(sed -n 's/^channel = "\(nightly-[^"]*\)"/\1/p' components/rust-toolchain.toml)" --profile minimal --component rustfmt,clippy --target wasm32-unknown-unknown --target wasm32-wasip3
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           cache-on-failure: true
@@ -252,7 +266,7 @@ jobs:
           key: aarch64-linux
       - name: Install wasm-tools
         run: |
-          cargo install wasm-tools --version 1.248.0 --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
+          cargo install wasm-tools --version "$(sed -n 's/^WASM_TOOLS_VERSION := //p' Makefile)" --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
       - name: Build native ARM target
         id: host-build
         run: make host-dist
@@ -297,13 +311,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Read Zig version
+        id: zig-version
+        run: |
+          echo "version=$(sed -n 's/^ZIG_VERSION := //p' Makefile)" >> "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: terra-guest-aarch64
           path: build
       - name: Install component toolchain
         run: |
-          rustup toolchain install nightly-2026-09-16 --profile minimal --component rustfmt,clippy --target wasm32-unknown-unknown --target wasm32-wasip3
+          rustup toolchain install "$(sed -n 's/^channel = "\(nightly-[^"]*\)"/\1/p' components/rust-toolchain.toml)" --profile minimal --component rustfmt,clippy --target wasm32-unknown-unknown --target wasm32-wasip3
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           cache-on-failure: true
@@ -313,7 +331,7 @@ jobs:
           key: aarch64-macos
       - name: Install wasm-tools
         run: |
-          cargo install wasm-tools --version 1.248.0 --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
+          cargo install wasm-tools --version "$(sed -n 's/^WASM_TOOLS_VERSION := //p' Makefile)" --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
       - name: Build and sign
         id: host-build
         run: |
@@ -329,11 +347,11 @@ jobs:
         if: ${{ !cancelled() && steps.host-build.outcome == 'success' }}
         run: cargo test --no-fail-fast --locked --target aarch64-apple-darwin --workspace
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
-        if: ${{ !cancelled() && steps.host-build.outcome == 'success' && (inputs.native_vm_tests || matrix.native_vm_tests) }}
+        if: ${{ !cancelled() && steps.host-build.outcome == 'success' && inputs.native_vm_tests }}
         with:
-          version: 0.16.0
+          version: ${{ steps.zig-version.outputs.version }}
       - name: Native VM acceptance
-        if: ${{ !cancelled() && steps.host-build.outcome == 'success' && (inputs.native_vm_tests || matrix.native_vm_tests) }}
+        if: ${{ !cancelled() && steps.host-build.outcome == 'success' && inputs.native_vm_tests }}
         run: |
           CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER="sh scripts/run-macos-vm-test" cargo test --no-fail-fast --locked --target aarch64-apple-darwin -p terra-platform --lib --test native_vm -- --ignored --test-threads=1
           TERRA_BIN="$PWD/dist/terra" cargo test --no-fail-fast --locked --target aarch64-apple-darwin -p terra --test native_boot --test boot --test memory -- --ignored --test-threads=1 --nocapture
@@ -365,12 +383,21 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Read Zig version
+        id: zig-version
+        shell: pwsh
+        run: |
+          $zigVersion = (Select-String -LiteralPath Makefile -Pattern '^ZIG_VERSION := (.+)$').Matches[0].Groups[1].Value
+          "version=$zigVersion" >> $env:GITHUB_OUTPUT
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: terra-guest-${{ matrix.guest }}
           path: build
       - name: Install component toolchain
-        run: rustup toolchain install nightly-2026-09-16 --profile minimal --target wasm32-unknown-unknown --target wasm32-wasip3
+        shell: pwsh
+        run: |
+          $nightly = (Select-String -LiteralPath components/rust-toolchain.toml -Pattern '^channel = "(nightly-[^"]+)"$').Matches[0].Groups[1].Value
+          rustup toolchain install $nightly --profile minimal --target wasm32-unknown-unknown --target wasm32-wasip3
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           cache-on-failure: true
@@ -421,7 +448,7 @@ jobs:
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         if: ${{ !cancelled() && steps.host-build.outcome == 'success' && inputs.native_vm_tests }}
         with:
-          version: 0.16.0
+          version: ${{ steps.zig-version.outputs.version }}
       - name: Native VM acceptance
         if: ${{ !cancelled() && steps.host-build.outcome == 'success' && inputs.native_vm_tests }}
         shell: pwsh

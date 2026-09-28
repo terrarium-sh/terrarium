@@ -16,6 +16,11 @@ if ($null -eq $toolchainLine) {
     throw "could not find component toolchain"
 }
 $componentToolchain = $toolchainLine.Matches[0].Groups[1].Value
+$wasmToolsLine = Select-String -LiteralPath Makefile -Pattern '^WASM_TOOLS_VERSION := (.+)$' | Select-Object -First 1
+if ($null -eq $wasmToolsLine) {
+    throw "could not find WASM_TOOLS_VERSION in Makefile"
+}
+$wasmToolsVersion = $wasmToolsLine.Matches[0].Groups[1].Value
 $guest = if ($Target -like "aarch64-*") { "aarch64" } else { "x86_64" }
 $hostArchitecture = if ($Target -like "aarch64-*") { "ARM64" } else { "AMD64" }
 
@@ -31,7 +36,7 @@ foreach ($asset in $guestAssets) {
 }
 Invoke-Native -Command rustup -Arguments @("target", "add", $Target)
 Invoke-Native -Command rustup -Arguments @("toolchain", "install", $componentToolchain, "--profile", "minimal", "--target", "wasm32-unknown-unknown", "--target", "wasm32-wasip3")
-Invoke-Native -Command cargo -Arguments @("+$componentToolchain", "install", "wasm-tools", "--version", "1.248.0", "--locked")
+Invoke-Native -Command cargo -Arguments @("+$componentToolchain", "install", "wasm-tools", "--version", $wasmToolsVersion, "--locked")
 
 foreach ($component in $components) {
     $artifactStem = $component.Replace("-", "_")

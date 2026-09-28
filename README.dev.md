@@ -14,8 +14,8 @@ and writable `/dev/kvm`.
 Install the separate component toolchain and validator:
 
 ```sh
-rustup toolchain install nightly-2026-09-16 --component rustfmt,clippy --target wasm32-unknown-unknown
-cargo install wasm-tools --version 1.248.0 --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
+rustup toolchain install nightly-2026-09-28 --component rustfmt,clippy --target wasm32-unknown-unknown
+cargo install wasm-tools --version 1.259.0 --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
 make dist
 ```
 
@@ -181,12 +181,12 @@ from the committed [.github/keys](.github/keys); Alpine indexes and packages are
 verified against the committed Alpine repository keys and each package's
 signed datahash. Alpine and its packages move together, and mismatched architecture
 versions stop the update. Tool updates keep build entry points synchronized and
-refresh wit-bindgen lockfiles. Generated PRs require review; they are opened
-with the `WORKFLOW_TOKEN` repository secret (fine-grained PAT with Contents,
-Pull requests, Workflows, and Actions write) because `GITHUB_TOKEN` cannot push
-workflow-file changes or open PRs, falling back to `GITHUB_TOKEN` when the
-secret is unset. The jobs explicitly dispatch Build because PRs opened with
-`GITHUB_TOKEN` do not trigger pull-request CI.
+refresh wit-bindgen lockfiles. CI reads tool versions from the committed pins,
+so generated PRs do not change workflow files. Generated PRs require review
+and use `GITHUB_TOKEN`; enable **Settings → Actions → General → Workflow
+permissions → Allow GitHub Actions to create and approve pull requests** for
+PR creation. The jobs explicitly dispatch Build so token-created PRs receive
+validation.
 
 Preview updates without modifying files:
 
@@ -271,8 +271,8 @@ Network policy coverage and boundary fuzzing use the existing tools:
 
 ```sh
 python3 scripts/coverage-network-policy.py
-cargo +nightly-2026-09-16 fuzz run network_policy -- -max_total_time=60 -max_len=4096
-cargo +nightly-2026-09-16 fuzz run native_memory -- -max_total_time=60 -max_len=32768
+cargo +nightly-2026-09-28 fuzz run network_policy -- -max_total_time=60 -max_len=4096
+cargo +nightly-2026-09-28 fuzz run native_memory -- -max_total_time=60 -max_len=32768
 ```
 
 Coverage requires matching LLVM tools (`LLVM_COV` and `LLVM_PROFDATA` can override

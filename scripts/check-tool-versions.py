@@ -21,13 +21,10 @@ def make_value(name):
 versions = {
     "nightly": toolchain,
     "wasm-tools": make_value("WASM_TOOLS_VERSION"),
-    "cargo-fuzz": make_value("CARGO_FUZZ_VERSION"),
-    "cargo-audit": make_value("CARGO_AUDIT_VERSION"),
     "wit-bindgen": make_value("WIT_BINDGEN_VERSION"),
     "Zig": make_value("ZIG_VERSION"),
 }
 sources = [
-    *sorted((ROOT / ".github/workflows").glob("*.yml")),
     ROOT / "scripts/build-host.ps1",
     ROOT / "README.dev.md",
     ROOT / "components/Cargo.toml",
@@ -35,10 +32,8 @@ sources = [
 patterns = {
     "nightly": re.compile(r"nightly-[0-9-]+"),
     "wasm-tools": re.compile(r"wasm-tools --version ([0-9.]+)"),
-    "cargo-fuzz": re.compile(r"cargo-fuzz --version ([0-9.]+)"),
-    "cargo-audit": re.compile(r"cargo-audit --version ([0-9.]+)"),
     "wit-bindgen": re.compile(r'wit-bindgen\s*=\s*(?:\{\s*version\s*=\s*)?"?=([0-9.]+)'),
-    "Zig": re.compile(r"(?<=version: )[0-9]+\.[0-9]+\.[0-9]+"),
+    "Zig": re.compile(r"Zig ([0-9]+\.[0-9]+\.[0-9]+)"),
 }
 
 found = {name: False for name in versions}

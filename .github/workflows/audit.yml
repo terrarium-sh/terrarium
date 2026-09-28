@@ -9,11 +9,13 @@ on:
     paths:
       - '**/Cargo.lock'
       - '**/Cargo.toml'
+      - Makefile
       - .github/workflows/audit.yml
   pull_request:
     paths:
       - '**/Cargo.lock'
       - '**/Cargo.toml'
+      - Makefile
       - .github/workflows/audit.yml
   workflow_dispatch:
 
@@ -35,7 +37,8 @@ jobs:
         with:
           cache-targets: false
           cache-on-failure: true
-      - run: cargo install cargo-audit --version 0.22.0 --locked
+      - run: |
+          cargo install cargo-audit --version "$(sed -n 's/^CARGO_AUDIT_VERSION := //p' Makefile)" --locked
       - run: |
           git ls-files -z -- Cargo.lock '*/Cargo.lock' | while IFS= read -r -d '' lockfile; do
             cargo audit --file "$lockfile"

@@ -313,10 +313,9 @@ class BuildToolsTest(unittest.TestCase):
             "Makefile": "WASM_TOOLS_VERSION := 1.2.0\nCARGO_FUZZ_VERSION := 0.1.0\nCARGO_AUDIT_VERSION := 0.1.0\nWIT_BINDGEN_VERSION := 0.1.0\nZIG_VERSION := 0.9.0\n",
             "rust-toolchain.toml": '[toolchain]\nchannel = "1.90.0"\n',
             "components/rust-toolchain.toml": '[toolchain]\nchannel = "nightly-2026-01-01"\n',
-            "build.yml": "run: cargo install wasm-tools --version 1.2.0\nrun: cargo install cargo-fuzz --version 0.1.0\nrun: cargo install cargo-audit --version 0.1.0\nversion: 0.9.0\nrun: cargo +nightly-2026-01-01 build\n",
-            "README.dev.md": "Install Zig 0.9.0\n",
-            "component/Cargo.toml": 'wit-bindgen = { version = "=0.1.0", features = ["async-spawn"] }\n',
-            "policy/Cargo.toml": 'wit-bindgen = "=0.1.0"\n',
+            "README.dev.md": "Install Zig 0.9.0\nInstall wasm-tools --version 1.2.0\ncargo +nightly-2026-01-01 fuzz run example\n",
+            "components/Cargo.toml": 'wit-bindgen = { version = "=0.1.0", features = ["async-spawn"] }\n',
+            "scripts/build-host.ps1": "",
             "pins.mk": "ALPINE_VERSION := 3.24.1\n",
             "scripts/alpine-sources.sh": "image='docker.io/library/alpine@sha256:" + "a" * 64 + "'\napk add abuild=3.17.0-r0\n",
             "kernel/Containerfile": "FROM docker.io/library/debian:bookworm-slim@sha256:" + "a" * 64 + "\nhttp://snapshot.debian.org/archive/debian/20260101T000000Z/\nhttp://snapshot.debian.org/archive/debian-security/20260101T000000Z/\n",
@@ -334,20 +333,18 @@ class BuildToolsTest(unittest.TestCase):
             ]}).encode()
         tools.update_cargo_tools(self.files)
         self.assertIn("WASM_TOOLS_VERSION := 1.10.0", self.files["Makefile"])
-        self.assertIn("wasm-tools --version 1.10.0", self.files["build.yml"])
-        self.assertIn("cargo-fuzz --version 1.10.0", self.files["build.yml"])
-        self.assertIn("cargo-audit --version 1.10.0", self.files["build.yml"])
-        self.assertIn('version = "=1.10.0"', self.files["component/Cargo.toml"])
-        self.assertIn('wit-bindgen = "=1.10.0"', self.files["policy/Cargo.toml"])
+        self.assertIn("CARGO_FUZZ_VERSION := 1.10.0", self.files["Makefile"])
+        self.assertIn("CARGO_AUDIT_VERSION := 1.10.0", self.files["Makefile"])
+        self.assertIn("wasm-tools --version 1.10.0", self.files["README.dev.md"])
+        self.assertIn('version = "=1.10.0"', self.files["components/Cargo.toml"])
         unchanged = self.files.copy()
         tools.update_cargo_tools(self.files)
         self.assertEqual(self.files, unchanged)
 
-    def test_zig_ignores_master_and_updates_workflows_and_documentation(self):
+    def test_zig_ignores_master_and_updates_documentation(self):
         self.feeds["https://ziglang.org/download/index.json"] = b'{"master": {}, "0.10.0": {}, "0.9.0": {}}'
         tools.update_zig(self.files)
         self.assertIn("ZIG_VERSION := 0.10.0", self.files["Makefile"])
-        self.assertIn("version: 0.10.0", self.files["build.yml"])
         self.assertIn("Zig 0.10.0", self.files["README.dev.md"])
 
     def test_rust_updates_channels_and_requires_the_wasm_target(self):
@@ -357,7 +354,7 @@ class BuildToolsTest(unittest.TestCase):
         original = self.files.copy()
         tools.update_rust(self.files)
         self.assertIn('channel = "1.100.0"', self.files["rust-toolchain.toml"])
-        self.assertIn("nightly-2026-02-01", self.files["build.yml"])
+        self.assertIn("nightly-2026-02-01", self.files["README.dev.md"])
         self.feeds["https://static.rust-lang.org/dist/channel-rust-nightly.toml"] = nightly.replace(
             b"[pkg.rust-std.target.wasm32-unknown-unknown]\navailable = true",
             b"[pkg.rust-std.target.wasm32-unknown-unknown]\navailable = false",
@@ -383,6 +380,22 @@ class BuildToolsTest(unittest.TestCase):
         self.assertIn("debian/20260201T000000Z/", self.files["kernel/Containerfile"])
         self.assertIn("debian-security/20260202T000000Z/", self.files["kernel/Containerfile"])
 
+    def test_update_pr_does_not_edit_workflow_files(self):
+        self.feeds["https://ziglang.org/download/index.json"] = b'{"0.10.0": {}, "0.9.0": {}}'
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for path, content in self.files.items():
+                target = root / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content)
+            workflow = root / ".github/workflows/build.yml"
+            workflow.parent.mkdir(parents=True)
+            workflow.write_text("version: 0.9.0\n")
+            with patch("sys.argv", ["update-build-tools.py", "zig", "--root", str(root)]), patch("sys.stdout", io.StringIO()):
+                tools.main()
+            self.assertIn("ZIG_VERSION := 0.10.0", (root / "Makefile").read_text())
+            self.assertEqual(workflow.read_text(), "version: 0.9.0\n")
+
 
 class PinPullRequestTest(unittest.TestCase):
     def run_workflow(self, **settings):
@@ -399,6 +412,8 @@ if name == "git" and args[:2] == ["diff", "--quiet"]:
     raise SystemExit(0 if os.environ.get("NO_CHANGES") else 1)
 if name == "git" and args[0] == "diff":
     print("test pin diff")
+if name == "git" and args[0] == "ls-remote" and os.environ.get("REMOTE_HEAD"):
+    print(os.environ["REMOTE_HEAD"] + "\t" + args[-1])
 if name == "gh" and args[:2] == ["pr", "list"]:
     print("1" if os.environ.get("EXISTING_PR") else "0")
 if name == "gh" and args[:2] == ["pr", "create"]:
@@ -420,6 +435,15 @@ if name == "gh" and args[:2] == ["pr", "create"]:
         self.assertIn(["git", "add", "--", "pins.mk"], commands)
         self.assertTrue(any(command[:3] == ["gh", "pr", "create"] for command in commands))
         self.assertTrue(any(command[:4] == ["gh", "workflow", "run", "build.yml"] for command in commands))
+
+    def test_retry_after_pr_creation_failure_leases_existing_branch(self):
+        remote_head = "a" * 40
+        commands = self.run_workflow(REMOTE_HEAD=remote_head)
+        push = next(command for command in commands if command[:2] == ["git", "push"])
+        branch = push[-1]
+        self.assertIn(["git", "ls-remote", "origin", f"refs/heads/{branch}"], commands)
+        self.assertIn(f"--force-with-lease=refs/heads/{branch}:{remote_head}", push)
+        self.assertTrue(any(command[:3] == ["gh", "pr", "create"] for command in commands))
 
     def test_no_changes_or_existing_pr_do_not_commit_or_push(self):
         for settings in ({"NO_CHANGES": "1"}, {"EXISTING_PR": "1"}):

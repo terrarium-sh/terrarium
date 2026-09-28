@@ -27,7 +27,9 @@ git config user.email 'github-actions[bot]@users.noreply.github.com'
 git checkout -b "$branch"
 git add -- "$@"
 git commit -m "build: update $group pins"
-git push -u origin "$branch"
+# Retry a failed PR creation without rejecting the previously pushed pin commit.
+remote_head=$(git ls-remote origin "refs/heads/$branch" | cut -f1)
+git push --force-with-lease="refs/heads/$branch:$remote_head" -u origin "$branch"
 gh pr create --base "$BASE_BRANCH" --head "$branch" --title "build: update $group pins" --body-file "$body"
-# GITHUB_TOKEN PRs do not trigger pull_request workflows.
+# Dispatch validation explicitly for token-created PRs.
 gh workflow run build.yml --ref "$branch"
