@@ -66,16 +66,21 @@ The optional `components.network.memory_mib` overrides the network component's
 ceiling; otherwise it inherits `components.memory_mib`. This override also
 requires at least 16 MiB.
 
-Network flow capacity scales with that ceiling: 16 MiB allows 448
+Network flow capacity scales with that ceiling: 16 MiB allows 179
 slots, shared by outbound TCP, pending UDP requests, and DNS lookups; 32 MiB
-allows 960 slots and 64 MiB allows 1984. Published-port connections share this
+allows 384 slots and 64 MiB allows 793. Published-port connections share this
 capacity and count twice because of their additional queues. At capacity, new flows encounter backpressure until existing flows close.
 
-TCP uses 4 KiB buffers per direction and 2 KiB transfer chunks to admit more
-concurrent connections. The TCP connection between the guest and proxy is
-separate from the host's connection to the remote server: the 4 KiB window
+TCP uses 16 KiB buffers per direction and 8 KiB transfer chunks. Larger buffers
+reduce small-transfer overhead while consuming more memory per connection. The TCP connection between the guest and proxy is
+separate from the host's connection to the remote server: the 16 KiB window
 applies to the local guest/proxy RTT, not the remote server's RTT. Smaller
 buffers can still reduce throughput when local processing is delayed.
+
+Each TCP connection reuses its own transfer buffer until the input stream ends.
+Connection admission limits concurrent buffers, and reads waiting for data keep
+independent buffers so an idle connection cannot block another connection's
+download.
 
 On x86_64, RAM starts at zero and skips the reserved device-address region
 from 3.25 GiB to 4 GiB, continuing above 4 GiB when needed. Virtio devices

@@ -167,19 +167,20 @@ pub fn resync_pending_queue_entries(next: &mut u16, available: u16, size: u16) -
     })
 }
 
-pub fn read_split_ring_available_head<E>(
+/// Returns the published available index and the next descriptor head.
+pub fn read_split_ring_available<E>(
     available_ring: u64,
     size: core::num::NonZeroU16,
     next: &mut u16,
     address: impl Fn(u64, u64) -> Result<u64, E>,
     read_u16: impl Fn(u64) -> Result<u16, E>,
-) -> Result<Option<u16>, E> {
+) -> Result<(u16, Option<u16>), E> {
     let available = read_u16(address(available_ring, 2)?)?;
     if resync_pending_queue_entries(next, available, size.get()) == 0 {
-        return Ok(None);
+        return Ok((available, None));
     }
     let offset = 4 + u64::from(*next % size) * 2;
-    read_u16(address(available_ring, offset)?).map(Some)
+    read_u16(address(available_ring, offset)?).map(|head| (available, Some(head)))
 }
 
 pub fn complete_split_ring_entry<E>(
@@ -193,8 +194,10 @@ pub fn complete_split_ring_entry<E>(
 ) -> Result<(), E> {
     let index = read_u16(address(used_ring, 2)?)?;
     let slot = address(used_ring, 4 + u64::from(index % size) * 8)?;
-    write(slot, &u32::from(head).to_le_bytes())?;
-    write(address(slot, 4)?, &len.to_le_bytes())?;
+    let mut entry = [0; 8];
+    entry[..4].copy_from_slice(&u32::from(head).to_le_bytes());
+    entry[4..].copy_from_slice(&len.to_le_bytes());
+    write(slot, &entry)?;
     write(address(used_ring, 2)?, &index.wrapping_add(1).to_le_bytes())
 }
 
@@ -388,7 +391,7 @@ impl MmioTransport {
             return Ok(None);
         };
         let ring_size = core::num::NonZeroU16::new(size).ok_or(MmioError::BadLen)?;
-        let head = read_split_ring_available_head(
+        let (_, head) = read_split_ring_available(
             available_ring,
             ring_size,
             next,
@@ -764,9 +767,12 @@ mod tests {
     #[test]
     fn split_ring_helpers_advance_available_and_used_entries() {
         let memory = std::cell::RefCell::new(vec![0; 64]);
+        let reads = std::cell::Cell::new(0);
+        let writes = std::cell::RefCell::new(Vec::new());
         memory.borrow_mut()[2..4].copy_from_slice(&1_u16.to_le_bytes());
         memory.borrow_mut()[4..6].copy_from_slice(&7_u16.to_le_bytes());
         let read_u16 = |address| {
+            reads.set(reads.get() + 1);
             let address = usize::try_from(address).unwrap();
             let memory = memory.borrow();
             Ok::<_, ()>(u16::from_le_bytes(
@@ -775,15 +781,16 @@ mod tests {
         };
         let mut next = 0;
         assert_eq!(
-            super::read_split_ring_available_head(
+            super::read_split_ring_available(
                 0,
                 core::num::NonZeroU16::new(8).unwrap(),
                 &mut next,
                 |base, offset| Ok(base + offset),
                 read_u16,
             ),
-            Ok(Some(7))
+            Ok((1, Some(7)))
         );
+        assert_eq!(reads.get(), 2);
         super::complete_split_ring_entry(
             32,
             core::num::NonZeroU16::new(8).unwrap(),
@@ -798,16 +805,67 @@ mod tests {
                 ))
             },
             |address, bytes| {
+                writes.borrow_mut().push((address, bytes.len()));
                 let address = usize::try_from(address).unwrap();
                 memory.borrow_mut()[address..address + bytes.len()].copy_from_slice(bytes);
                 Ok(())
             },
         )
         .unwrap();
+        assert_eq!(*writes.borrow(), [(36, 8), (34, 2)]);
         let memory = memory.borrow();
         assert_eq!(&memory[36..40], &7_u32.to_le_bytes());
         assert_eq!(&memory[40..44], &12_u32.to_le_bytes());
         assert_eq!(&memory[34..36], &1_u16.to_le_bytes());
+    }
+
+    #[test]
+    fn available_snapshot_handles_wrap_and_resynchronizes_overfull_ring() {
+        for (start, available, head, expected_next) in [
+            (u16::MAX, 0, Some(7), u16::MAX),
+            (0, 9, None, 9),
+            (5, 5, None, 5),
+        ] {
+            let mut next = start;
+            let result = super::read_split_ring_available(
+                0,
+                core::num::NonZeroU16::new(8).unwrap(),
+                &mut next,
+                |base, offset| Ok::<_, ()>(base + offset),
+                |address| match address {
+                    2 => Ok(available),
+                    18 => Ok(7),
+                    _ => panic!("unexpected available-ring read"),
+                },
+            );
+            assert_eq!(result, Ok((available, head)));
+            assert_eq!(next, expected_next);
+        }
+    }
+
+    #[test]
+    fn failed_used_entry_write_does_not_publish_completion() {
+        for failed_address in [36, 34] {
+            let memory = std::cell::RefCell::new(vec![0; 64]);
+            let result = super::complete_split_ring_entry(
+                32,
+                core::num::NonZeroU16::new(8).unwrap(),
+                7,
+                12,
+                |base, offset| Ok::<_, ()>(base + offset),
+                |_| Ok(0),
+                |address, bytes| {
+                    if address == failed_address {
+                        return Err(());
+                    }
+                    let address = usize::try_from(address).unwrap();
+                    memory.borrow_mut()[address..address + bytes.len()].copy_from_slice(bytes);
+                    Ok(())
+                },
+            );
+            assert_eq!(result, Err(()));
+            assert_eq!(&memory.borrow()[34..36], &[0; 2]);
+        }
     }
 
     #[test]

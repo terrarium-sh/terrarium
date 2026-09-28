@@ -11,7 +11,7 @@ use futures::{FutureExt, StreamExt, future::poll_fn};
 
 use terra_device_transport::{
     INT_USED_BUFFER, MmioError, MmioTransport, SPLIT_RING_DESC_F_NEXT, SplitRingDescriptor,
-    complete_split_ring_entry, read_split_ring_available_head, split_ring_chain,
+    complete_split_ring_entry, read_split_ring_available, split_ring_chain,
 };
 
 use crate::host;
@@ -689,6 +689,14 @@ fn read(addr: u64, len: usize) -> Result<Vec<u8>, DeviceError> {
     if len > MAX_REQUEST {
         return Err(DeviceError::TooLarge);
     }
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    if len <= MAX_COPY {
+        let bytes = memory::read(addr, u64::try_from(len).map_err(|_| DeviceError::TooLarge)?)
+            .map_err(|_| DeviceError::Unmapped)?;
+        return (bytes.len() == len).then_some(bytes).ok_or(DeviceError::Io);
+    }
     let mut out = Vec::with_capacity(len);
     for offset in (0..len).step_by(MAX_COPY) {
         let count = (len - offset).min(MAX_COPY);
@@ -747,7 +755,7 @@ fn available(queue: usize) -> Result<Option<(u16, u64, u64, u16)>, DeviceError> 
     })?;
     let mut next = next;
     let ring_size = core::num::NonZeroU16::new(size).ok_or(DeviceError::BadLen)?;
-    let head = read_split_ring_available_head(avail, ring_size, &mut next, at, |address| {
+    let (_, head) = read_split_ring_available(avail, ring_size, &mut next, at, |address| {
         Ok(u16::from_le_bytes(
             read(address, 2)?
                 .try_into()
@@ -877,12 +885,17 @@ fn read_request_buffers(desc: u64, head: u16, size: u16) -> Result<RequestBuffer
         return Err(DeviceError::BadLen);
     }
     let mut request = Vec::new();
-    for descriptor in input {
+    for (index, descriptor) in input.iter().enumerate() {
         let length = usize::try_from(descriptor.len).map_err(|_| DeviceError::TooLarge)?;
         if length > MAX_REQUEST.saturating_sub(request.len()) {
             return Err(DeviceError::TooLarge);
         }
-        request.extend(read(descriptor.addr, length)?);
+        let bytes = read(descriptor.addr, length)?;
+        if index == 0 {
+            request = bytes;
+        } else {
+            request.extend(bytes);
+        }
     }
     Ok(RequestBuffers {
         input: request,
@@ -993,13 +1006,13 @@ fn process_request(
     {
         cancel_event_request(state)?;
     }
-    let response = match &parsed {
-        Ok(request) => {
+    let response = match parsed {
+        Ok(parsed_request) => {
             let target = PendingReply {
                 queue,
                 head,
                 output: output.clone(),
-                unique: request.unique,
+                unique: parsed_request.unique,
                 generation: request_generation,
             };
             let Some(response) = execute_request(state, scheduler, request, target) else {
@@ -1007,7 +1020,7 @@ fn process_request(
             };
             response
         }
-        Err(errno) => wire::reply(0, *errno, &[]),
+        Err(errno) => wire::reply(0, errno, &[]),
     };
     let _completion = COMPLETION_GATE
         .lock()
@@ -1025,23 +1038,28 @@ fn process_request(
 fn execute_request(
     state: &mut State,
     scheduler: &mut io::IoScheduler,
-    request: &wire::Request<'_>,
+    request_bytes: Vec<u8>,
     target: PendingReply,
 ) -> Option<Vec<u8>> {
+    let request = match wire::request(&request_bytes) {
+        Ok(request) => request,
+        Err(errno) => return Some(wire::reply(target.unique, errno, &[])),
+    };
     if request.opcode == wire::INIT && scheduler.contains_generation(target.generation) {
         return Some(wire::reply(request.unique, 16, &[]));
     }
-    let result = if let Some(result) = requests::execute_immediate(state, request) {
+    let unique = request.unique;
+    let result = if let Some(result) = requests::execute_immediate(state, &request) {
         result
     } else {
-        match requests::prepare_io(state, request, target.generation)
+        match requests::prepare_io(state, request_bytes, target.generation)
             .and_then(|operation| scheduler.enqueue(operation, target))
         {
             Ok(()) => return None,
             Err(errno) => Err(errno),
         }
     };
-    Some(encode_response(request.unique, result))
+    Some(encode_response(unique, result))
 }
 
 fn dispatch_event(state: &mut State, payload: &[u8]) {

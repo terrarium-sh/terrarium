@@ -22,11 +22,21 @@ const AVAIL: u64 = 0x2000;
 const USED: u64 = 0x3000;
 const INPUT: u64 = 0x4000;
 const OUTPUT: u64 = 0x6000;
+const LARGE_INPUT: u64 = 0x8000;
 const SECOND_INPUT: u64 = 0x5000;
 const SECOND_OUTPUT: u64 = 0x7000;
 
 fn write(memory: &BoundedMemory<'_>, offset: u64, bytes: &[u8]) {
-    memory.write(offset, bytes).expect("guest memory write");
+    let chunk_size =
+        usize::try_from(terra_limits::MAX_SINGLE_GUEST_COPY_BYTES).expect("copy limit");
+    for (index, chunk) in bytes.chunks(chunk_size).enumerate() {
+        memory
+            .write(
+                offset + u64::try_from(index * chunk_size).expect("guest offset"),
+                chunk,
+            )
+            .expect("guest memory write");
+    }
 }
 
 fn request(opcode: u32, unique: u64, node: u64, body: &[u8]) -> Vec<u8> {
@@ -62,7 +72,7 @@ async fn mount_with_resource_capacity(
     readonly: bool,
     resource_capacity: Option<usize>,
 ) -> Mounted {
-    let ram = GuestRam::new(64 * 1024).expect("ram");
+    let ram = GuestRam::new(128 * 1024).expect("ram");
     let engine = device_engine().expect("engine");
     let component = Component::new(&engine, support::artifacts::wasm::FS).expect("component");
     let grant = ShareGrant::new(
@@ -130,9 +140,14 @@ async fn submit(
     index: u16,
     request: &[u8],
 ) -> Vec<u8> {
-    write(memory, INPUT, request);
+    let input = if u64::try_from(request.len()).expect("request length") > OUTPUT - INPUT {
+        LARGE_INPUT
+    } else {
+        INPUT
+    };
+    write(memory, input, request);
     let mut descriptor = [0; 32];
-    descriptor[..8].copy_from_slice(&INPUT.to_le_bytes());
+    descriptor[..8].copy_from_slice(&input.to_le_bytes());
     descriptor[8..12].copy_from_slice(
         &u32::try_from(request.len())
             .expect("request length")
@@ -242,6 +257,89 @@ fn dirents(reply: &[u8]) -> Vec<(u64, String)> {
         entries.push((next, name));
     }
     entries
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn negotiated_big_write_crosses_guest_pages_and_survives_fsync() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let path = root.path().join("large");
+    std::fs::write(&path, []).expect("fixture");
+    let mounted = mount(root.path(), false).await;
+    let memory = BoundedMemory::new(&mounted.ram);
+    let channel = &mounted.channel;
+
+    let mut init = vec![0; 16];
+    init[..4].copy_from_slice(&7_u32.to_le_bytes());
+    init[4..8].copy_from_slice(&40_u32.to_le_bytes());
+    init[12..16].copy_from_slice(&(1_u32 << 5).to_le_bytes());
+    let initialized = submit(channel, &memory, 0, &request(26, 1, 1, &init)).await;
+    assert_eq!(reply_error(&initialized), 0);
+    assert_eq!(
+        u32::from_le_bytes(initialized[28..32].try_into().expect("negotiated flags")),
+        1 << 5
+    );
+    assert_eq!(
+        u32::from_le_bytes(initialized[36..40].try_into().expect("max write")),
+        64 * 1024
+    );
+
+    let lookup = submit(channel, &memory, 1, &request(1, 2, 1, b"large\0")).await;
+    assert_eq!(reply_error(&lookup), 0);
+    let inode = u64::from_le_bytes(lookup[16..24].try_into().expect("inode"));
+    let opened = submit(
+        channel,
+        &memory,
+        2,
+        &request(14, 3, inode, &2_u32.to_le_bytes()),
+    )
+    .await;
+    assert_eq!(reply_error(&opened), 0);
+    let handle = u64::from_le_bytes(opened[16..24].try_into().expect("handle"));
+
+    let payload: Vec<u8> = (0..64 * 1024)
+        .map(|index| u8::try_from((index * 37 + 13) % 251).expect("payload byte"))
+        .collect();
+    let mut write_body = vec![0; 40];
+    write_body[..8].copy_from_slice(&handle.to_le_bytes());
+    write_body[8..16].copy_from_slice(&123_u64.to_le_bytes());
+    write_body[16..20].copy_from_slice(&(64 * 1024_u32).to_le_bytes());
+    write_body.extend_from_slice(&payload);
+    let written = submit(channel, &memory, 3, &request(16, 4, inode, &write_body)).await;
+    assert_eq!(reply_error(&written), 0);
+    assert_eq!(
+        u32::from_le_bytes(written[16..20].try_into().expect("written bytes")),
+        64 * 1024
+    );
+
+    let overwrite = b"across-page-boundary";
+    let mut overwrite_body = vec![0; 40];
+    overwrite_body[..8].copy_from_slice(&handle.to_le_bytes());
+    overwrite_body[8..16].copy_from_slice(&4093_u64.to_le_bytes());
+    overwrite_body[16..20].copy_from_slice(
+        &u32::try_from(overwrite.len())
+            .expect("overwrite length")
+            .to_le_bytes(),
+    );
+    overwrite_body.extend_from_slice(overwrite);
+    let overwritten = submit(channel, &memory, 4, &request(16, 5, inode, &overwrite_body)).await;
+    assert_eq!(reply_error(&overwritten), 0);
+    assert_eq!(
+        u32::from_le_bytes(overwritten[16..20].try_into().expect("overwritten bytes")),
+        u32::try_from(overwrite.len()).expect("overwrite length")
+    );
+
+    let mut fsync = vec![0; 16];
+    fsync[..8].copy_from_slice(&handle.to_le_bytes());
+    assert_eq!(
+        reply_error(&submit(channel, &memory, 5, &request(20, 6, inode, &fsync)).await),
+        0
+    );
+    let mut expected = vec![0; 123];
+    expected.extend_from_slice(&payload);
+    expected[4093..4093 + overwrite.len()].copy_from_slice(overwrite);
+    let actual = std::fs::read(&path).expect("host readback");
+    assert_eq!(actual, expected);
+    channel.close().expect("close");
 }
 
 /// WASI's Windows handles omit delete sharing, so rename and unlink of an
@@ -712,6 +810,7 @@ async fn wasm_worker_drains_a_single_doorbell_without_native_queue_scheduling() 
     channel.close().expect("close");
 }
 
+/// ENOSYS lets Linux cache unsupported xattr opcodes and report EOPNOTSUPP to callers.
 #[tokio::test(flavor = "multi_thread")]
 async fn wasm_filesystem_component_rejects_unsupported_opcodes_without_parsing() {
     let root = tempfile::tempdir().expect("tempdir");
@@ -730,7 +829,12 @@ async fn wasm_filesystem_component_rejects_unsupported_opcodes_without_parsing()
             &request(opcode, u64::from(index) + 1, u64::MAX, &[]),
         )
         .await;
-        assert_eq!(reply_error(&reply), -95, "opcode {opcode}");
+        let error = if (21..=24).contains(&opcode) {
+            -38
+        } else {
+            -95
+        };
+        assert_eq!(reply_error(&reply), error, "opcode {opcode}");
     }
     channel.close().expect("close");
 }

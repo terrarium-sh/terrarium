@@ -259,6 +259,158 @@ fn http_get(addr: &str, host: &str) -> Option<String> {
     (!body.is_empty()).then_some(body)
 }
 
+#[test]
+#[ignore = "boots a real microVM - requires a native hypervisor: cargo test --test boot -- --ignored"]
+fn pending_network_reads_do_not_block_other_downloads() {
+    let s = Suite::new();
+    let payloads = s.get_work_dir().join("payloads");
+    std::fs::create_dir(&payloads).unwrap();
+    let first: Vec<u8> = (0_u8..=255)
+        .cycle()
+        .map(|byte| byte.wrapping_mul(73).wrapping_add(19))
+        .take(512 * 1024 + 137)
+        .collect();
+    let second: Vec<u8> = (0_u8..=255)
+        .cycle()
+        .map(|byte| byte.wrapping_mul(37).wrapping_add(101))
+        .take(64 * 1024 + 29)
+        .collect();
+    std::fs::write(payloads.join("first"), &first).unwrap();
+    std::fs::write(payloads.join("second"), &second).unwrap();
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
+    let server = std::thread::spawn(move || {
+        use std::io::{BufRead, Write};
+
+        let deadline = Instant::now() + Duration::from_secs(90);
+        let mut pending = Vec::new();
+        let mut completed = 0;
+        while completed < 2 && Instant::now() < deadline {
+            let Ok((mut stream, _)) = listener.accept() else {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut request = String::new();
+            std::io::BufReader::new(&stream)
+                .read_line(&mut request)
+                .unwrap();
+            if request.starts_with("GET /idle ") {
+                stream
+                    .write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 999999\r\n\r\nx")
+                    .unwrap();
+                pending.push(stream);
+                continue;
+            }
+            assert!(pending.len() >= 2, "active download preceded idle streams");
+            let body = match request.split_whitespace().nth(1) {
+                Some("/first") => &first,
+                Some("/second") => &second,
+                _ => panic!("unexpected HTTP request: {request}"),
+            };
+            stream
+                .write_all(
+                    format!("HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).as_bytes(),
+                )
+                .unwrap();
+            for chunk in body.chunks(1371) {
+                stream.write_all(chunk).unwrap();
+            }
+            completed += 1;
+        }
+        assert_eq!(pending.len(), 2, "guest did not open both idle streams");
+        assert_eq!(completed, 2, "guest did not complete both downloads");
+    });
+
+    let recipe = s.get_work_dir().join("network-buffer-reuse.yaml");
+    let script = format!(
+        "wget -q -T 20 -O /tmp/idle-one http://buffer.test:{port}/idle &\n\
+         idle_one=$!\n\
+         wget -q -T 20 -O /tmp/idle-two http://buffer.test:{port}/idle &\n\
+         idle_two=$!\n\
+         timeout 10 sh -c 'until test -s /tmp/idle-one && test -s /tmp/idle-two; do sleep 0.05; done'\n\
+         wget -q -T 10 -O /tmp/first http://buffer.test:{port}/first\n\
+         cmp /work/first /tmp/first\n\
+         wget -q -T 10 -O /tmp/second http://buffer.test:{port}/second\n\
+         cmp /work/second /tmp/second\n\
+         kill \"$idle_one\" \"$idle_two\" 2>/dev/null || true\n\
+         wait \"$idle_one\" \"$idle_two\" 2>/dev/null || true\n\
+         echo NETWORK_BUFFER_REUSE_OK"
+    )
+    .replace('\n', "\n      ");
+    std::fs::write(
+        &recipe,
+        format!(
+            "network:\n  allow: [\"buffer.test:{port}\"]\n  hosts:\n    - {{name: buffer.test, addr: HOST_LOOPBACK}}\nworkload:\n  entrypoint: /bin/sh\n  args:\n    - -ec\n    - |\n      {script}\nmounts:\n  - host: {}\n    guest: /work\n    readonly: true\n",
+            payloads.display()
+        ),
+    )
+    .unwrap();
+    let out = s.boot_recipe(&recipe, "network-buffer-reuse", &[]);
+    assert!(out.contains("NETWORK_BUFFER_REUSE_OK"), "{out}");
+    server.join().unwrap();
+}
+
+/// Completed execs release their vsock streams and client slots before the 64-stream limit.
+#[test]
+#[ignore = "boots a real microVM - requires a native hypervisor: cargo test --test boot -- --ignored"]
+fn sequential_execs_reuse_vsock_client_slots() {
+    let suite = Suite::new();
+    let project = suite.create_project_dir("server");
+    let recipe = suite.get_work_dir().join("server.yaml");
+    std::fs::write(
+        &recipe,
+        "workload:\n  entrypoint: /bin/sleep\n  args: [infinity]\n",
+    )
+    .unwrap();
+    let project = project.to_str().unwrap();
+    assert_eq!(
+        suite
+            .run_terra_status(&[recipe.to_str().unwrap(), "setup", "--project", project])
+            .1,
+        0
+    );
+    assert_eq!(
+        suite
+            .run_terra_status(&["server", "-d", "--project", project])
+            .1,
+        0
+    );
+
+    for attempt in 1..=70 {
+        let mut command = Command::new(&suite.terra)
+            .args(["server", "exec", "--project", project, "--", "/bin/true"])
+            .env("HOME", &suite.home)
+            .env("USERPROFILE", &suite.home)
+            .env_remove("RUST_LOG")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = command.try_wait().unwrap() {
+                assert!(status.success(), "exec {attempt} failed: {status}");
+                break;
+            }
+            if Instant::now() >= deadline {
+                command.kill().unwrap();
+                command.wait().unwrap();
+                panic!("exec {attempt} stalled");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
 /// One sequential run: later groups lean on the detached server VM the ports
 /// group boots, so the order is part of the suite.
 #[allow(clippy::too_many_lines)]
@@ -1030,7 +1182,11 @@ def unsupported(name, operation):
         raise AssertionError(f'{name} unexpectedly succeeded')
 
 HOST_MODE_ASSERTIONS
-unsupported('xattr', lambda: os.setxattr(path, 'user.terra', b'guest-value'))
+for _ in range(2):
+    unsupported('setxattr', lambda: os.setxattr(path, 'user.terra', b'guest-value'))
+    unsupported('getxattr', lambda: os.getxattr(path, 'user.terra'))
+    unsupported('listxattr', lambda: os.listxattr(path))
+    unsupported('removexattr', lambda: os.removexattr(path, 'user.terra'))
 with open(path, 'r+b') as file:
     unsupported('fallocate', lambda: os.posix_fallocate(file.fileno(), 0, 1))
     unsupported('seek-data', lambda: os.lseek(file.fileno(), 0, os.SEEK_DATA))

@@ -36,6 +36,7 @@ pub const INIT_OUT: usize = 64;
 pub const ENOSYS: i32 = 38;
 pub const EINVAL: i32 = 22;
 pub const INIT_EXT: u32 = 1 << 30;
+const BIG_WRITES: u32 = 1 << 5;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Request<'a> {
@@ -99,7 +100,7 @@ pub fn init(body: &[u8]) -> Result<Vec<u8>, i32> {
     out[0..4].copy_from_slice(&7_u32.to_le_bytes());
     out[4..8].copy_from_slice(&minor.min(40).to_le_bytes());
     out[8..12].copy_from_slice(&(64 * 1024_u32).to_le_bytes());
-    out[12..16].copy_from_slice(&(if extended { INIT_EXT } else { 0 }).to_le_bytes());
+    out[12..16].copy_from_slice(&(flags & (INIT_EXT | BIG_WRITES)).to_le_bytes());
     out[16..18].copy_from_slice(&64_u16.to_le_bytes());
     out[18..20].copy_from_slice(&48_u16.to_le_bytes());
     out[20..24].copy_from_slice(&(64 * 1024_u32).to_le_bytes());
@@ -120,6 +121,19 @@ mod tests {
         let mut bytes = vec![0; HEADER];
         bytes[..4].copy_from_slice(&u32::try_from(HEADER + 1).unwrap().to_le_bytes());
         assert_eq!(request(&bytes), Err(EINVAL));
+    }
+
+    #[test]
+    fn big_writes_require_negotiation_and_keep_the_write_limit() {
+        let mut body = vec![0; 16];
+        body[..4].copy_from_slice(&7_u32.to_le_bytes());
+        body[4..8].copy_from_slice(&40_u32.to_le_bytes());
+        for flags in [0, BIG_WRITES, INIT_EXT, INIT_EXT | BIG_WRITES] {
+            body[12..16].copy_from_slice(&flags.to_le_bytes());
+            let reply = init(&body).unwrap();
+            assert_eq!(u32_at(&reply, 12), Some(flags));
+            assert_eq!(u32_at(&reply, 20), Some(64 * 1024));
+        }
     }
 
     #[test]

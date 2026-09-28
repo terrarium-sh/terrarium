@@ -650,6 +650,18 @@ impl Gateway {
             .map_err(|_| Error::Backpressure)?;
         self.pump(None)
     }
+    fn ingest_frame(&mut self, frame: Vec<u8>) -> Result<(), Error> {
+        let config = self.config.as_ref().ok_or(Error::NotReady)?;
+        let mut device = DeviceFrame::new(Some(frame), config.mtu);
+        self.interface
+            .as_mut()
+            .ok_or(Error::NotReady)?
+            .poll_ingress_single(protocol_now(self.started), &mut device, &mut self.sockets);
+        for frame in device.output {
+            self.enqueue(frame)?;
+        }
+        Ok(())
+    }
     fn pump(&mut self, input: Option<Vec<u8>>) -> Result<(), Error> {
         let config = self.config.as_ref().ok_or(Error::NotReady)?;
         let mut device = DeviceFrame::new(input, config.mtu);
@@ -736,21 +748,24 @@ impl Gateway {
         let mut bytes: usize = 0;
         let mut frames = Vec::new();
         while frames.len() < max_items {
-            let Some(frame) = self.frames.front() else {
-                break;
-            };
-            if bytes.saturating_add(frame.len()) > max_bytes {
-                break;
-            }
-            let Some(frame) = self.frames.pop_front() else {
+            let Some(frame) = self.take_frame(max_bytes.saturating_sub(bytes)) else {
                 break;
             };
             bytes += frame.len();
-            self.frame_bytes -= frame.len();
             frames.push(frame);
         }
         frames
     }
+
+    fn take_frame(&mut self, max_bytes: usize) -> Option<Vec<u8>> {
+        if self.frames.front()?.len() > max_bytes {
+            return None;
+        }
+        let frame = self.frames.pop_front()?;
+        self.frame_bytes -= frame.len();
+        Some(frame)
+    }
+
     fn guest_data(&mut self) {
         for flow in &mut self.flows {
             let Some(socket) = flow.socket else {
@@ -1259,16 +1274,17 @@ fn start_published_flow(flow: PublishedFlowStart) {
                 let receive = receive.into_future().fuse();
                 let mut outgoing = outgoing.fuse();
                 let input = async {
+                    let mut buffer = Vec::new();
+                    if buffer.try_reserve_exact(TCP_CHUNK_BYTES).is_err() {
+                        return false;
+                    }
                     loop {
-                        match incoming_stream
-                            .read(Vec::with_capacity(TCP_CHUNK_BYTES))
-                            .await
-                        {
-                            (
-                                wit_bindgen::rt::async_support::StreamResult::Complete(size),
-                                data,
-                            ) if size > 0 => {
-                                if !deliver_published(generation, id, &data[..size]).await {
+                        buffer.clear();
+                        let (result, bytes) = incoming_stream.read(buffer).await;
+                        buffer = bytes;
+                        match result {
+                            StreamResult::Complete(size) if size > 0 => {
+                                if !deliver_published(generation, id, &buffer[..size]).await {
                                     return false;
                                 }
                             }
@@ -1325,11 +1341,11 @@ async fn deliver_published(generation: u64, id: u32, data: &[u8]) -> bool {
     .await
 }
 
-async fn deliver_host_tcp(generation: u64, id: u32, mut data: Vec<u8>) -> bool {
+async fn deliver_host_tcp(generation: u64, id: u32, mut data: &[u8]) -> bool {
     while !data.is_empty() {
         let sent = poll_fn(|context| {
             let mut state = gateway();
-            match state.send_current_tcp(generation, id, &data) {
+            match state.send_current_tcp(generation, id, data) {
                 Ok(size) if size > 0 => Poll::Ready(Ok(size)),
                 Ok(_) | Err(Error::Backpressure) => {
                     state.register_tcp_send_waker(id, context.waker());
@@ -1342,7 +1358,7 @@ async fn deliver_host_tcp(generation: u64, id: u32, mut data: Vec<u8>) -> bool {
         let Ok(sent) = sent else {
             return false;
         };
-        data = data.split_off(sent);
+        data = &data[sent..];
     }
     true
 }
@@ -1417,20 +1433,24 @@ fn start_host_flow(flow: HostFlowStart, syn_frame: Vec<u8>) {
                 }
                 .fuse();
                 let incoming = async {
+                    let mut buffer = Vec::new();
+                    if buffer.try_reserve_exact(TCP_CHUNK_BYTES).is_err() {
+                        return false;
+                    }
                     loop {
-                        match incoming_stream
-                            .read(Vec::with_capacity(TCP_CHUNK_BYTES))
-                            .await
-                        {
-                            (StreamResult::Complete(size), data) if size > 0 => {
-                                if !deliver_host_tcp(generation, id, data[..size].to_vec()).await {
+                        buffer.clear();
+                        let (result, bytes) = incoming_stream.read(buffer).await;
+                        buffer = bytes;
+                        match result {
+                            StreamResult::Complete(size) if size > 0 => {
+                                if !deliver_host_tcp(generation, id, &buffer[..size]).await {
                                     return false;
                                 }
                             }
-                            (StreamResult::Dropped | StreamResult::Complete(0), _) => {
+                            StreamResult::Dropped | StreamResult::Complete(0) => {
                                 return true;
                             }
-                            (StreamResult::Complete(_) | StreamResult::Cancelled, _) => {
+                            StreamResult::Complete(_) | StreamResult::Cancelled => {
                                 return false;
                             }
                         }
@@ -1591,15 +1611,16 @@ impl Guest for Network {
                 processed += 1;
             }
             let signalled = TICK.swap(false, Ordering::AcqRel);
-            if signalled || timer_elapsed {
-                let _ = gateway().pump(None);
-                gateway().guest_data();
-                gateway().reap_finished_flows();
+            if processed != 0 || signalled || timer_elapsed {
+                let mut state = gateway();
+                let _ = state.pump(None);
+                state.guest_data();
+                state.reap_finished_flows();
             }
             let queue_work = signalled || TICK.swap(false, Ordering::AcqRel);
             if (processed != 0 || queue_work) && transport::is_configured() {
                 // An unaddressable ring cannot be completed; wait for reset or another doorbell.
-                let _ = transport::service_queues().await;
+                let _ = transport::service_queues();
             }
             if processed == MAX_WORK_PER_WAKE {
                 wit_bindgen::rt::async_support::yield_async().await;
@@ -1621,9 +1642,13 @@ impl Guest for Network {
 }
 
 pub(crate) fn receive_frame(frame: Vec<u8>) -> Result<(), Error> {
-    gateway().validate(&frame)?;
-    let config = gateway().config.clone().ok_or(Error::NotReady)?;
-    if let Some(reply) = icmp::reply(&frame, IpAddr::V4(config.ip), IpAddr::V6(config.ip6))? {
+    let (gateway_ip, gateway_ip6) = {
+        let state = gateway();
+        state.validate(&frame)?;
+        let config = state.config.as_ref().ok_or(Error::NotReady)?;
+        (config.ip, config.ip6)
+    };
+    if let Some(reply) = icmp::reply(&frame, IpAddr::V4(gateway_ip), IpAddr::V6(gateway_ip6))? {
         gateway().enqueue(reply)?;
         return Ok(());
     }
@@ -1648,8 +1673,9 @@ pub(crate) fn receive_frame(frame: Vec<u8>) -> Result<(), Error> {
         .transpose()?;
     let queries = {
         let mut state = gateway();
-        state.pump((!is_udp).then_some(frame))?;
-        state.guest_data();
+        if !is_udp {
+            state.ingest_frame(frame)?;
+        }
         state.dns_queries()
     };
     for (query, meta) in queries {
@@ -1712,6 +1738,7 @@ mod tests {
     };
     use std::future::Future;
     use std::task::{Context, Poll, Waker};
+    use std::time::{Duration, Instant as Clock};
     fn gateway() -> Gateway {
         let mut gateway = Gateway::new();
         gateway.configure(GatewayConfig {
@@ -2397,6 +2424,209 @@ mod tests {
         assert_eq!(received, payload);
     }
 
+    fn open_benchmark_flow() -> (Gateway, HostFlowStart, Vec<u8>) {
+        let mut gateway = gateway();
+        gateway.pump(Some(arp_request())).unwrap();
+        gateway.take_frames(MAX_QUEUED_FRAMES, MAX_FRAME_BYTES);
+        let flow = gateway
+            .add_connected_flow(tcp_syn(&syn()).unwrap())
+            .unwrap()
+            .unwrap();
+        gateway.pump(Some(syn())).unwrap();
+        let syn_ack = gateway
+            .take_frames(MAX_QUEUED_FRAMES, MAX_FRAME_BYTES)
+            .pop()
+            .unwrap();
+        gateway.pump(Some(ack(&syn_ack))).unwrap();
+        gateway.take_frames(MAX_QUEUED_FRAMES, MAX_FRAME_BYTES);
+        (gateway, flow, syn_ack)
+    }
+
+    #[test]
+    fn batched_guest_payload_waits_for_host_capacity_without_losing_bytes() {
+        let (mut gateway, mut flow, syn_ack) = open_benchmark_flow();
+        let payload: Vec<_> = (0_u8..=255)
+            .cycle()
+            .take(MAX_WORK_PER_WAKE * 1460)
+            .collect();
+        for (index, segment) in payload.chunks(1460).enumerate() {
+            gateway
+                .ingest_frame(guest_payload(&syn_ack, index * 1460, segment))
+                .unwrap();
+        }
+        gateway.pump(None).unwrap();
+        gateway.flows[0].outgoing.try_send(vec![1]).unwrap();
+        gateway.flows[0].outgoing.try_send(vec![2]).unwrap();
+        gateway.guest_data();
+        assert!(gateway.flows[0].pending_guest_data.is_some());
+        assert_eq!(flow.outgoing.next().now_or_never(), Some(Some(vec![1])));
+        assert_eq!(flow.outgoing.next().now_or_never(), Some(Some(vec![2])));
+        gateway.guest_data();
+        let mut received = Vec::new();
+        while let Some(Some(chunk)) = flow.outgoing.next().now_or_never() {
+            received.extend(chunk);
+        }
+        assert_eq!(received, payload);
+        assert!(gateway.flows[0].pending_guest_data.is_none());
+        let socket = gateway.flows[0].socket.unwrap();
+        assert_eq!(gateway.sockets.get::<tcp::Socket>(socket).recv_queue(), 0);
+    }
+
+    #[test]
+    fn taking_frames_preserves_byte_and_item_budgets() {
+        let mut gateway = gateway();
+        for length in [14, 16, 20] {
+            gateway.enqueue(vec![42; length]).unwrap();
+        }
+        assert_eq!(gateway.take_frames(0, 50), Vec::<Vec<u8>>::new());
+        assert_eq!(gateway.take_frame(13), None);
+        assert_eq!(gateway.frame_bytes, 50);
+        assert_eq!(gateway.take_frame(14), Some(vec![42; 14]));
+        assert_eq!(gateway.take_frames(2, 35), vec![vec![42; 16]]);
+        assert_eq!(gateway.frame_bytes, 20);
+        assert_eq!(gateway.take_frames(1, 20), vec![vec![42; 20]]);
+        assert_eq!(gateway.frame_bytes, 0);
+        assert_eq!(gateway.take_frame(20), None);
+    }
+
+    fn guest_payload(syn_ack: &[u8], offset: usize, data: &[u8]) -> Vec<u8> {
+        let ethernet = EthernetFrame::new_checked(syn_ack).unwrap();
+        let ip = Ipv4Packet::new_checked(ethernet.payload()).unwrap();
+        let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+        let mut frame = vec![0; 14 + 20 + 20 + data.len()];
+        let mut ethernet = EthernetFrame::new_unchecked(&mut frame);
+        ethernet.set_dst_addr(EthernetAddress([2, 0, 0, 0, 0, 1]));
+        ethernet.set_src_addr(EthernetAddress([2, 0, 0, 0, 0, 2]));
+        ethernet.set_ethertype(EthernetProtocol::Ipv4);
+        let mut ip = Ipv4Packet::new_unchecked(ethernet.payload_mut());
+        ip.set_version(4);
+        ip.set_header_len(20);
+        ip.set_total_len(u16::try_from(40 + data.len()).unwrap());
+        ip.set_next_header(IpProtocol::Tcp);
+        ip.set_src_addr(Ipv4Addr::new(100, 96, 0, 2));
+        ip.set_dst_addr(Ipv4Addr::new(1, 1, 1, 1));
+        let source = IpAddress::Ipv4(ip.src_addr());
+        let destination = IpAddress::Ipv4(ip.dst_addr());
+        TcpRepr {
+            src_port: 40000,
+            dst_port: 443,
+            control: TcpControl::None,
+            seq_number: TcpSeqNumber(2 + i32::try_from(offset).unwrap()),
+            ack_number: Some(tcp.seq_number() + tcp.segment_len()),
+            window_len: 65535,
+            window_scale: None,
+            max_seg_size: None,
+            sack_permitted: false,
+            sack_ranges: [None; 3],
+            timestamp: None,
+            payload: data,
+        }
+        .emit(
+            &mut TcpPacket::new_unchecked(ip.payload_mut()),
+            &source,
+            &destination,
+            &ChecksumCapabilities::default(),
+        );
+        ip.fill_checksum();
+        frame
+    }
+
+    fn benchmark_host_to_guest(payload: &[u8]) -> (Duration, usize) {
+        let (mut gateway, flow, _) = open_benchmark_flow();
+        let mut received = Vec::with_capacity(payload.len());
+        let mut sent = 0;
+        let mut packets = 0;
+        let start = Clock::now();
+        for _ in 0..100_000 {
+            if sent < payload.len() {
+                sent += gateway.send_tcp(flow.id, &payload[sent..]).unwrap();
+            }
+            for frame in gateway.take_frames(MAX_QUEUED_FRAMES, MAX_FRAME_BYTES) {
+                let ethernet = EthernetFrame::new_checked(&frame).unwrap();
+                let ip = Ipv4Packet::new_checked(ethernet.payload()).unwrap();
+                let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+                if !tcp.payload().is_empty() {
+                    received.extend_from_slice(tcp.payload());
+                    packets += 1;
+                    gateway.pump(Some(ack(&frame))).unwrap();
+                }
+            }
+            if received.len() == payload.len() {
+                break;
+            }
+            gateway.pump(None).unwrap();
+        }
+        let elapsed = start.elapsed();
+        assert_eq!(received, payload);
+        (elapsed, packets)
+    }
+
+    fn benchmark_guest_to_host(payload: &[u8]) -> (Duration, usize) {
+        let (mut gateway, mut flow, syn_ack) = open_benchmark_flow();
+        let mut received = Vec::with_capacity(payload.len());
+        let mut chunks = 0;
+        let start = Clock::now();
+        for (pair_index, pair) in payload.chunks(2 * 1460).enumerate() {
+            for (index, segment) in pair.chunks(1460).enumerate() {
+                let offset = pair_index * 2 * 1460 + index * 1460;
+                gateway
+                    .pump(Some(guest_payload(&syn_ack, offset, segment)))
+                    .unwrap();
+            }
+            gateway.take_frames(MAX_QUEUED_FRAMES, MAX_FRAME_BYTES);
+            for _ in 0..4 {
+                gateway.guest_data();
+                while let Some(Some(chunk)) = flow.outgoing.next().now_or_never() {
+                    received.extend_from_slice(&chunk);
+                    chunks += 1;
+                }
+                let socket = gateway.flows[0].socket.unwrap();
+                if gateway.sockets.get::<tcp::Socket>(socket).recv_queue() == 0
+                    && gateway.flows[0].pending_guest_data.is_none()
+                {
+                    break;
+                }
+            }
+            gateway.pump(None).unwrap();
+            gateway.take_frames(MAX_QUEUED_FRAMES, MAX_FRAME_BYTES);
+        }
+        let elapsed = start.elapsed();
+        assert_eq!(received, payload);
+        (elapsed, chunks)
+    }
+
+    #[test]
+    #[ignore = "microbenchmark: run with --ignored --nocapture in --release mode"]
+    fn tcp_buffer_throughput() {
+        let payload = vec![42; 16 * 1024 * 1024];
+        for (name, sample) in [
+            (
+                "host_to_guest",
+                benchmark_host_to_guest as fn(&[u8]) -> (Duration, usize),
+            ),
+            ("guest_to_host", benchmark_guest_to_host),
+        ] {
+            sample(&payload);
+            let mut elapsed = Vec::with_capacity(7);
+            let mut units = Vec::with_capacity(7);
+            for _ in 0..7 {
+                let (duration, count) = sample(&payload);
+                elapsed.push(duration);
+                units.push(count);
+            }
+            elapsed.sort_unstable();
+            units.sort_unstable();
+            let median = elapsed[3];
+            let throughput_mib_s = f64::from(u32::try_from(payload.len()).unwrap())
+                / median.as_secs_f64()
+                / 1_048_576.0;
+            println!(
+                "{name}: median={median:?}, throughput={throughput_mib_s:.1} MiB/s, median_packets_or_chunks={}",
+                units[3]
+            );
+        }
+    }
+
     #[test]
     fn guest_fin_closes_the_host_input_stream() {
         for host_closes_first in [false, true] {
@@ -2472,6 +2702,27 @@ mod tests {
         gateway.pump(Some(dns_query())).unwrap();
         assert_eq!(gateway.dns_queries().len(), 1);
     }
+
+    #[test]
+    fn ingress_batch_drains_dns_before_polling_egress() {
+        let mut gateway = gateway();
+        for id in 0..u16::try_from(MAX_WORK_PER_WAKE).unwrap() {
+            let mut frame = dns_query();
+            let mut ip = Ipv4Packet::new_unchecked(&mut frame[14..]);
+            let source = IpAddress::Ipv4(ip.src_addr());
+            let destination = IpAddress::Ipv4(ip.dst_addr());
+            let mut udp = UdpPacket::new_unchecked(ip.payload_mut());
+            udp.payload_mut()[..2].copy_from_slice(&id.to_be_bytes());
+            udp.fill_checksum(&source, &destination);
+            gateway.ingest_frame(frame).unwrap();
+            let queries = gateway.dns_queries();
+            assert_eq!(queries.len(), 1);
+            assert_eq!(queries[0].0[..2], id.to_be_bytes());
+        }
+        gateway.pump(None).unwrap();
+        assert_eq!(gateway.dns_queries(), Vec::new());
+    }
+
     #[test]
     fn raw_udp_packet_builds_a_guest_reply() {
         let mut frame = dns_query();

@@ -4,7 +4,7 @@ use super::security::{effective_mode, validate_download_links, validate_manifest
 use crate::sys;
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::Path;
 use std::time::Instant;
@@ -223,6 +223,23 @@ async fn plan_file_update(
     }
 }
 
+fn find_changed_parent(action: &PlanAction) -> Option<String> {
+    let path = match action {
+        PlanAction::CreateDir { rel_path, .. }
+        | PlanAction::TransferFile { rel_path, .. }
+        | PlanAction::CreateSymlink { rel_path, .. }
+        | PlanAction::RemoveEntry { rel_path, .. } => rel_path,
+        PlanAction::UpdateFileMetadata { .. }
+        | PlanAction::UpdateDirMetadata { .. }
+        | PlanAction::Skip { .. } => return None,
+    };
+    (!path.is_empty()).then(|| {
+        path.rsplit_once('/')
+            .map_or("", |(parent, _)| parent)
+            .to_owned()
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)]
 pub(super) async fn build_plan(
@@ -248,17 +265,6 @@ pub(super) async fn build_plan(
     }
 
     let mut actions = Vec::new();
-    let tree_differs = source_entries.iter().any(|(path, source)| {
-        target_entries.get(path).is_none_or(|target| {
-            let mut expected = source.clone();
-            expected.mode = effective_mode(source.mode, direction, source.kind);
-            expected != *target
-        })
-    }) || (is_delete
-        && target_entries
-            .keys()
-            .any(|path| !source_entries.contains_key(path)));
-
     for (rel_path, src) in source_entries {
         match target_entries.get(rel_path) {
             None => match src.kind {
@@ -298,7 +304,7 @@ pub(super) async fn build_plan(
                     let mode_differs = effective_mode(src.mode, direction, src.kind) != dst.mode;
                     let mtime_differs =
                         src.mtime_secs != dst.mtime_secs || src.mtime_nanos != dst.mtime_nanos;
-                    if mode_differs || mtime_differs || tree_differs {
+                    if mode_differs || mtime_differs {
                         actions.push(PlanAction::UpdateDirMetadata {
                             rel_path: rel_path.clone(),
                             mode: src.mode,
@@ -360,6 +366,23 @@ pub(super) async fn build_plan(
         }
     }
 
+    let changed_parents: BTreeSet<String> =
+        actions.iter().filter_map(find_changed_parent).collect();
+    for action in &mut actions {
+        if let PlanAction::Skip { rel_path } = action
+            && changed_parents.contains(rel_path)
+            && let Some(source) = source_entries.get(rel_path)
+            && source.kind == SyncEntryKind::Directory
+        {
+            *action = PlanAction::UpdateDirMetadata {
+                rel_path: rel_path.clone(),
+                mode: source.mode,
+                mtime_secs: source.mtime_secs,
+                mtime_nanos: source.mtime_nanos,
+            };
+        }
+    }
+
     Ok(actions)
 }
 
@@ -367,6 +390,217 @@ pub(super) async fn build_plan(
 mod tests {
     use super::super::test_support::peer;
     use super::*;
+
+    #[tokio::test]
+    async fn directory_updates_follow_actual_child_mutations() {
+        use super::super::test_support::entry;
+
+        for direction in [SyncDirection::HostToGuest, SyncDirection::GuestToHost] {
+            let root = tempfile::tempdir().unwrap();
+            let mut unchanged = BTreeMap::new();
+            for path in ["", "changed", "changed/nested", "untouched"] {
+                std::fs::create_dir_all(root.path().join(path)).unwrap();
+                unchanged.insert(path.into(), entry(path, SyncEntryKind::Directory, None));
+            }
+            let path = "changed/nested/file";
+            let file = entry(path, SyncEntryKind::File, None);
+            let mut replaced = file.clone();
+            replaced.mtime_secs += 1;
+            let mut metadata_only = file.clone();
+            metadata_only.mode = 0o644;
+            let directory = entry(path, SyncEntryKind::Directory, None);
+            let link = entry(path, SyncEntryKind::Symlink, Some("../nested"));
+            for (source_file, target_file, is_delete, expected) in [
+                (Some(file.clone()), Some(file.clone()), false, vec![]),
+                (
+                    Some(file.clone()),
+                    Some(replaced),
+                    false,
+                    vec!["changed/nested"],
+                ),
+                (Some(metadata_only), Some(file.clone()), false, vec![]),
+                (Some(file.clone()), None, false, vec!["changed/nested"]),
+                (None, Some(file.clone()), true, vec!["changed/nested"]),
+                (None, Some(file.clone()), false, vec![]),
+                (Some(link), None, false, vec!["changed/nested"]),
+                (Some(directory), None, false, vec!["changed/nested", path]),
+            ] {
+                let mut source = unchanged.clone();
+                let mut target = unchanged.clone();
+                source.extend(source_file.map(|entry| (path.into(), entry)));
+                target.extend(target_file.map(|entry| (path.into(), entry)));
+                for entry in target.values_mut() {
+                    entry.mode = effective_mode(entry.mode, direction, entry.kind);
+                }
+                let actions = build_plan(
+                    &source,
+                    &target,
+                    false,
+                    is_delete,
+                    direction,
+                    &mut peer(&[]),
+                    root.path(),
+                    root.path(),
+                )
+                .await
+                .unwrap();
+                let updates: Vec<_> = actions
+                    .iter()
+                    .filter_map(|action| match action {
+                        PlanAction::UpdateDirMetadata { rel_path, .. } => Some(rel_path.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(updates, expected, "{direction:?}: {actions:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn root_child_changes_and_directory_metadata_are_both_preserved() {
+        use super::super::test_support::entry;
+
+        let target: BTreeMap<_, _> = [
+            entry("", SyncEntryKind::Directory, None),
+            entry("metadata", SyncEntryKind::Directory, None),
+        ]
+        .into_iter()
+        .map(|entry| (entry.relative_path.clone(), entry))
+        .collect();
+        let mut source = target.clone();
+        source.get_mut("metadata").unwrap().mtime_secs += 1;
+        source.insert("file".into(), entry("file", SyncEntryKind::File, None));
+        let actions = build_plan(
+            &source,
+            &target,
+            false,
+            false,
+            SyncDirection::HostToGuest,
+            &mut peer(&[]),
+            Path::new("."),
+            Path::new("."),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(&actions[0], PlanAction::UpdateDirMetadata { rel_path, .. } if rel_path.is_empty())
+        );
+        assert!(
+            matches!(&actions[2], PlanAction::UpdateDirMetadata { rel_path, mtime_secs: 101, .. } if rel_path == "metadata")
+        );
+    }
+
+    /// Equal metadata can hide a checksum-detected replacement, which still changes the parent mtime.
+    #[tokio::test]
+    async fn checksum_replacement_restores_only_the_direct_parent() {
+        use super::super::test_support::entry;
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("nested")).unwrap();
+        std::fs::write(root.path().join("nested/file"), []).unwrap();
+        let source: BTreeMap<_, _> = [
+            entry("", SyncEntryKind::Directory, None),
+            entry("nested", SyncEntryKind::Directory, None),
+            entry("nested/file", SyncEntryKind::File, None),
+        ]
+        .into_iter()
+        .map(|entry| (entry.relative_path.clone(), entry))
+        .collect();
+        let actions = build_plan(
+            &source,
+            &source,
+            true,
+            false,
+            SyncDirection::HostToGuest,
+            &mut peer(&[SyncReply::Digest { sha256: [0; 32] }]),
+            root.path(),
+            root.path(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(&actions[0], PlanAction::Skip { rel_path } if rel_path.is_empty()));
+        assert!(
+            matches!(&actions[1], PlanAction::UpdateDirMetadata { rel_path, .. } if rel_path == "nested")
+        );
+        assert!(matches!(&actions[2], PlanAction::TransferFile { .. }));
+    }
+
+    #[tokio::test]
+    #[ignore = "microbenchmark: run in release mode with --ignored --nocapture"]
+    async fn benchmark_one_file_delta_directory_updates() {
+        use super::super::exec::execute_plan;
+        use super::super::test_support::entry;
+        use terra_protocol::{read_frame_async, write_frame_async};
+
+        let mut source = BTreeMap::new();
+        for path in
+            std::iter::once(String::new()).chain((0..10_000).map(|index| format!("dir{index:05}")))
+        {
+            source.insert(path.clone(), entry(&path, SyncEntryKind::Directory, None));
+        }
+        let path = "dir00000/file";
+        source.insert(path.into(), entry(path, SyncEntryKind::File, None));
+        let mut target = source.clone();
+        target.get_mut(path).unwrap().mtime_secs += 1;
+        for sample in 0..11 {
+            let start = Instant::now();
+            let actions = build_plan(
+                &source,
+                &target,
+                false,
+                false,
+                SyncDirection::HostToGuest,
+                &mut peer(&[]),
+                Path::new("."),
+                Path::new("."),
+            )
+            .await
+            .unwrap();
+            let planning = start.elapsed();
+            let updates: Vec<_> = actions
+                .into_iter()
+                .filter(|action| matches!(action, PlanAction::UpdateDirMetadata { .. }))
+                .collect();
+            let (mut client, mut server) = tokio::io::duplex(4096);
+            let respond = async {
+                let mut requests = 0;
+                loop {
+                    let request: SyncRequest =
+                        read_frame_async(&mut server).await.unwrap().unwrap();
+                    write_frame_async(&mut server, &SyncReply::Success)
+                        .await
+                        .unwrap();
+                    if matches!(request, SyncRequest::EndSession) {
+                        break;
+                    }
+                    assert!(matches!(request, SyncRequest::UpdateMetadata { .. }));
+                    requests += 1;
+                }
+                requests
+            };
+            let start = Instant::now();
+            let (result, requests) = tokio::join!(
+                execute_plan(
+                    &updates,
+                    SyncDirection::HostToGuest,
+                    &mut client,
+                    Path::new("."),
+                    Path::new("."),
+                    false
+                ),
+                respond,
+            );
+            result.unwrap();
+            assert_eq!(requests, updates.len());
+            if sample != 0 {
+                println!(
+                    "sync_bench sample={sample} directories=10001 updates={requests} plan_ns={} metadata_protocol_ns={}",
+                    planning.as_nanos(),
+                    start.elapsed().as_nanos()
+                );
+            }
+        }
+    }
 
     #[tokio::test]
     async fn plan_detects_conflicts_between_directories_and_files() {

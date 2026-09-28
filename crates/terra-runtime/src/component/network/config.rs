@@ -77,6 +77,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn flow_capacity_reserves_shared_memory_and_scales_with_buffer_cost() {
+        for (memory_mib, expected) in [(0, 0), (2, 0), (16, 179), (32, 384), (64, 793)] {
+            assert_eq!(flow_capacity(memory_mib << 20), expected);
+        }
+    }
+
+    #[test]
     fn component_config_uses_the_guest_layout() {
         let layout = GuestNetworkConfig::default();
         let config = layout.into_component_config(
@@ -84,7 +91,7 @@ mod tests {
             vec![PortMapping::new(8080, 80)],
             32 << 20,
         );
-        assert_eq!(config.flow_capacity, 960);
+        assert_eq!(config.flow_capacity, 384);
         assert_eq!(config.gateway_ip, layout.gateway_ip.octets());
         assert_eq!(config.gateway_ip6, layout.gateway_ip6.octets());
         assert_eq!(config.gateway_mac, layout.gateway_mac);

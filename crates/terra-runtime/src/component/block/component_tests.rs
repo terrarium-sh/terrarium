@@ -123,19 +123,24 @@ async fn fixture(
     readonly: bool,
 ) -> (Linker<StandaloneHost<BlockHost>>, Fixture) {
     let engine = device_engine().expect("engine builds");
-    let linker = block_component_linker(&engine).expect("block imports link");
     let mut disk = BoundedDisk::new(capacity_sectors * 512, readonly);
     if !readonly {
         disk.write(3 * 512, &[0xABu8; 512]).ok();
     }
-    let mut store = device_store(
-        &engine,
-        BlockHost::new(GuestRam::new(RAM).unwrap(), DiskGrant::Mem(disk)),
-    );
     let component = Component::new(&engine, crate::test_fixtures::wasm::BLOCK)
         .expect("block component compiles");
+    fixture_with_disk(&engine, DiskGrant::Mem(disk), &component).await
+}
+
+async fn fixture_with_disk(
+    engine: &wasmtime::Engine,
+    disk: DiskGrant,
+    component: &Component,
+) -> (Linker<StandaloneHost<BlockHost>>, Fixture) {
+    let linker = block_component_linker(engine).expect("block imports link");
+    let mut store = device_store(engine, BlockHost::new(GuestRam::new(RAM).unwrap(), disk));
     let instance = linker
-        .instantiate_async(&mut store, &component)
+        .instantiate_async(&mut store, component)
         .await
         .expect("block imports satisfied");
     let execute = instance
@@ -171,6 +176,139 @@ async fn fixture(
             serve,
         },
     )
+}
+
+#[cfg(any(unix, windows))]
+async fn benchmark_block_io(
+    fixture: &mut Fixture,
+    disk_path: &std::path::Path,
+    request_type: u32,
+    ranges: &[Range],
+    pattern: u8,
+) {
+    const CALLS_PER_SAMPLE: usize = 128;
+    const MEASURED_SAMPLES: usize = 7;
+
+    let bytes = ranges.iter().map(|range| range.len).sum::<u64>();
+    let mut ns_per_call = Vec::with_capacity(MEASURED_SAMPLES);
+    for sample in 0..=MEASURED_SAMPLES {
+        if request_type == T_IN {
+            for range in ranges {
+                fixture
+                    .store
+                    .data_mut()
+                    .context
+                    .guest_write(
+                        range.addr,
+                        &vec![0; usize::try_from(range.len).expect("range fits usize")],
+                    )
+                    .expect("read destination cleared");
+            }
+        }
+        let start = std::time::Instant::now();
+        for _ in 0..CALLS_PER_SAMPLE {
+            let (result,) = fixture
+                .execute
+                .call_async(
+                    &mut fixture.store,
+                    (request_type, 0, ranges.to_vec(), 0x20000, 0),
+                )
+                .await
+                .expect("block operation runs");
+            assert_eq!(result, 0);
+        }
+        let elapsed = start.elapsed();
+        assert_eq!(
+            fixture
+                .store
+                .data()
+                .context
+                .guest_read(0x20000, 1)
+                .expect("status readable"),
+            [0]
+        );
+        if request_type == T_IN {
+            for range in ranges {
+                let data = fixture
+                    .store
+                    .data()
+                    .context
+                    .guest_read(range.addr, range.len)
+                    .expect("read payload readable");
+                assert!(data.iter().all(|byte| *byte == pattern));
+            }
+        } else {
+            let data = std::fs::read(disk_path).expect("disk readable");
+            assert!(
+                data[..usize::try_from(bytes).expect("transfer fits usize")]
+                    .iter()
+                    .all(|byte| *byte == pattern)
+            );
+        }
+        if sample != 0 {
+            ns_per_call.push(
+                elapsed.as_nanos() / u128::try_from(CALLS_PER_SAMPLE).expect("count fits u128"),
+            );
+        }
+    }
+    ns_per_call.sort_unstable();
+    let median_ns = ns_per_call[MEASURED_SAMPLES / 2];
+    let p95_ns = ns_per_call[(MEASURED_SAMPLES * 95).div_ceil(100) - 1];
+    let bytes_per_second = u128::from(bytes) * 1_000_000_000 / median_ns;
+    println!(
+        "terra_block_bench operation={} bytes={bytes} calls_per_sample={CALLS_PER_SAMPLE} samples={MEASURED_SAMPLES} median_ns_per_call={median_ns} p95_ns_per_call={p95_ns} median_bytes_per_second={bytes_per_second}",
+        if request_type == T_IN {
+            "read"
+        } else {
+            "write"
+        },
+    );
+}
+
+#[cfg(any(unix, windows))]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "AOT file-backed microbenchmark; run with --release --ignored --nocapture"]
+async fn benchmark_aot_file_backed_block_transfers() {
+    use crate::component::block::backing::FileDisk;
+
+    let engine = device_engine().expect("engine builds");
+    let component = crate::test_fixtures::trusted_artifacts()
+        .block()
+        .deserialize(&engine)
+        .expect("block AOT artifact");
+    for (bytes, ranges, pattern) in [
+        (4 * 1024, one(0x4000, 4 * 1024), 0x41),
+        (
+            64 * 1024,
+            (0..4)
+                .map(|index| Range {
+                    addr: 0x4000 + index * 16 * 1024,
+                    len: 16 * 1024,
+                })
+                .collect(),
+            0x64,
+        ),
+    ] {
+        let disk = tempfile::NamedTempFile::new().expect("disk file");
+        disk.as_file().set_len(128 * 1024).expect("disk capacity");
+        let backing = FileDisk::open(disk.path(), false).expect("file-backed disk");
+        let (_, mut fixture) =
+            fixture_with_disk(&engine, DiskGrant::File(backing), &component).await;
+        for range in &ranges {
+            fixture
+                .store
+                .data_mut()
+                .context
+                .guest_write(
+                    range.addr,
+                    &vec![pattern; usize::try_from(range.len).expect("range fits usize")],
+                )
+                .expect("write payload staged");
+        }
+        assert_eq!(ranges.iter().map(|range| range.len).sum::<u64>(), bytes);
+        benchmark_block_io(&mut fixture, disk.path(), T_OUT, &ranges, pattern).await;
+        benchmark_block_io(&mut fixture, disk.path(), T_IN, &ranges, pattern).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -431,6 +569,187 @@ async fn component_scatters_across_ranges_in_order() {
             .guest_read(DATA + 512, 512)
             .expect("second back"),
         [0x22u8; 512]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn component_transfers_the_full_batch_across_distinct_ranges() {
+    let (_, mut fixture) = fixture(256, false).await;
+    let ranges: Vec<_> = (0..4u64)
+        .map(|index| Range {
+            addr: 0x4000 + index * 16 * 1024,
+            len: 16 * 1024,
+        })
+        .collect();
+    for (range, pattern) in ranges.iter().zip([0x11, 0x22, 0x33, 0x44]) {
+        fixture
+            .store
+            .data_mut()
+            .context
+            .guest_write(range.addr, &[pattern; 16 * 1024])
+            .expect("batch payload staged");
+    }
+    let (write_status,) = fixture
+        .execute
+        .call_async(&mut fixture.store, (T_OUT, 0, ranges.clone(), STATUS, 0))
+        .await
+        .expect("full batch write runs");
+    assert_eq!(write_status, 0);
+    for range in &ranges {
+        fixture
+            .store
+            .data_mut()
+            .context
+            .guest_write(range.addr, &[0; 16 * 1024])
+            .expect("batch destination cleared");
+    }
+    let (read_status,) = fixture
+        .execute
+        .call_async(&mut fixture.store, (T_IN, 0, ranges.clone(), STATUS, 0))
+        .await
+        .expect("full batch read runs");
+    assert_eq!(read_status, 0);
+    for (range, pattern) in ranges.iter().zip([0x11, 0x22, 0x33, 0x44]) {
+        assert_eq!(
+            fixture
+                .store
+                .data()
+                .context
+                .guest_read(range.addr, range.len)
+                .expect("batch payload readable"),
+            [pattern; 16 * 1024]
+        );
+    }
+    let mut over_total = ranges;
+    over_total.push(Range {
+        addr: 0x14000,
+        len: 512,
+    });
+    let (oversize_status,) = fixture
+        .execute
+        .call_async(&mut fixture.store, (T_OUT, 0, over_total, STATUS, 0))
+        .await
+        .expect("oversized batch completes");
+    assert_eq!(oversize_status, 1);
+    let (oversize_status,) = fixture
+        .execute
+        .call_async(
+            &mut fixture.store,
+            (T_OUT, 0, one(0x4000, 16 * 1024 + 1), STATUS, 0),
+        )
+        .await
+        .expect("oversized descriptor completes");
+    assert_eq!(oversize_status, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn component_ignores_zero_length_ranges_at_invalid_addresses() {
+    let (_, mut fixture) = fixture(8, false).await;
+    fixture
+        .store
+        .data_mut()
+        .context
+        .guest_write(DATA, &[0xA5; 512])
+        .expect("payload staged");
+    let ranges = vec![
+        Range {
+            addr: u64::MAX,
+            len: 0,
+        },
+        Range {
+            addr: DATA,
+            len: 512,
+        },
+        Range {
+            addr: u64::MAX,
+            len: 0,
+        },
+    ];
+    let (write_status,) = fixture
+        .execute
+        .call_async(&mut fixture.store, (T_OUT, 0, ranges.clone(), STATUS, 0))
+        .await
+        .expect("write skips empty ranges");
+    assert_eq!(write_status, 0);
+    fixture
+        .store
+        .data_mut()
+        .context
+        .guest_write(DATA, &[0; 512])
+        .expect("destination cleared");
+    let (read_status,) = fixture
+        .execute
+        .call_async(&mut fixture.store, (T_IN, 0, ranges, STATUS, 0))
+        .await
+        .expect("read skips empty ranges");
+    assert_eq!(read_status, 0);
+    assert_eq!(
+        fixture
+            .store
+            .data()
+            .context
+            .guest_read(DATA, 512)
+            .expect("payload readable"),
+        [0xA5; 512]
+    );
+    let (empty_status,) = fixture
+        .execute
+        .call_async(&mut fixture.store, (T_IN, 0, one(u64::MAX, 0), STATUS, 0))
+        .await
+        .expect("empty transfer completes");
+    assert_eq!(empty_status, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn invalid_later_range_does_not_partially_write_a_batch() {
+    let (_, mut fixture) = fixture(8, false).await;
+    fixture
+        .store
+        .data_mut()
+        .context
+        .guest_write(DATA, &[0xA5; 512])
+        .expect("first range staged");
+    let (write_status,) = fixture
+        .execute
+        .call_async(
+            &mut fixture.store,
+            (
+                T_OUT,
+                0,
+                vec![
+                    Range {
+                        addr: DATA,
+                        len: 512,
+                    },
+                    Range {
+                        addr: u64::MAX,
+                        len: 512,
+                    },
+                ],
+                STATUS,
+                0,
+            ),
+        )
+        .await
+        .expect("invalid batch completes");
+    assert_eq!(write_status, 1);
+    let (read_status,) = fixture
+        .execute
+        .call_async(
+            &mut fixture.store,
+            (T_IN, 0, one(DATA + 1024, 1024), STATUS, 0),
+        )
+        .await
+        .expect("disk contents readable");
+    assert_eq!(read_status, 0);
+    assert_eq!(
+        fixture
+            .store
+            .data()
+            .context
+            .guest_read(DATA + 1024, 1024)
+            .expect("disk contents copied"),
+        [0; 1024]
     );
 }
 

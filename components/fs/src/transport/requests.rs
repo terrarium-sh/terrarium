@@ -22,7 +22,8 @@ pub(super) fn execute_immediate(
         wire::RELEASE => release_file(state, request),
         wire::RELEASEDIR => Ok(release_directory(state, request)),
         wire::FLUSH => flush_body(request.body).map(|()| Vec::new()),
-        21..=24 | 31..=33 | 43 | 46 | 50 => Err(95),
+        21..=24 => Err(wire::ENOSYS),
+        31..=33 | 43 | 46 | 50 => Err(95),
         wire::GETATTR
         | wire::LOOKUP
         | wire::READLINK
@@ -337,11 +338,14 @@ async fn read_directory(state: RequestState, request: &Request<'_>) -> Result<Ve
 
 pub(super) fn prepare_io(
     state: &State,
-    request: &Request<'_>,
+    request_bytes: Vec<u8>,
     generation: u64,
 ) -> Result<PreparedIo, i32> {
+    let request = wire::request(&request_bytes)?;
     match request.opcode {
-        wire::READ | wire::WRITE | wire::FSYNC | wire::FSYNCDIR => prepare_file_io(state, request),
+        wire::READ | wire::WRITE | wire::FSYNC | wire::FSYNCDIR => {
+            prepare_file_io(state, request_bytes)
+        }
         _ => {
             let identity = file_identity(state, request.node)?;
             let body = request.body.to_vec();
@@ -374,7 +378,8 @@ pub(super) fn prepare_io(
     }
 }
 
-fn prepare_file_io(state: &State, request: &Request<'_>) -> Result<PreparedIo, i32> {
+fn prepare_file_io(state: &State, request_bytes: Vec<u8>) -> Result<PreparedIo, i32> {
+    let request = wire::request(&request_bytes)?;
     let id = u64_at(request.body, 0)?;
     if request.opcode == wire::FSYNCDIR {
         let directory = directory(state, id).map_err(|_| 9)?;
@@ -408,9 +413,10 @@ fn prepare_file_io(state: &State, request: &Request<'_>) -> Result<PreparedIo, i
             if !handle.writable {
                 return Err(9);
             }
-            let bytes = bytes.to_vec();
+            let payload_len = bytes.len();
+            let request_bytes = take_write_payload(request_bytes, payload_len);
             async move {
-                write_file(&descriptor, offset, bytes).await?;
+                write_file(&descriptor, offset, request_bytes).await?;
                 Ok(sized_out(size))
             }
             .boxed_local()
@@ -428,7 +434,53 @@ fn prepare_file_io(state: &State, request: &Request<'_>) -> Result<PreparedIo, i
     })
 }
 
+fn take_write_payload(mut request_bytes: Vec<u8>, payload_len: usize) -> Vec<u8> {
+    let payload_start = wire::HEADER + 40;
+    let payload_end = payload_start + payload_len;
+    if request_bytes.capacity() > payload_end {
+        return request_bytes[payload_start..payload_end].to_vec();
+    }
+    request_bytes.truncate(payload_end);
+    request_bytes.drain(..payload_start);
+    request_bytes
+}
+
 fn file_identity(state: &State, node: u64) -> Result<(u64, u64), i32> {
     let record = state.nodes.get(&node).ok_or(9)?;
     Ok((record.dev, record.ino))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::take_write_payload;
+    use crate::wire;
+
+    #[test]
+    fn write_payload_reuses_tight_request_allocation() {
+        let mut request_bytes = Vec::with_capacity(wire::HEADER + 40 + 7);
+        request_bytes.resize(wire::HEADER + 40, 0);
+        request_bytes.extend_from_slice(b"payload");
+        let allocation = request_bytes.as_ptr();
+
+        let payload = take_write_payload(request_bytes, 7);
+
+        assert_eq!(payload, b"payload");
+        assert_eq!(payload.as_ptr(), allocation);
+        assert_eq!(payload.capacity(), wire::HEADER + 40 + 7);
+    }
+
+    #[test]
+    fn write_payload_discards_padded_request_capacity() {
+        let mut request_bytes = Vec::with_capacity(4096);
+        request_bytes.resize(wire::HEADER + 40, 0);
+        request_bytes.extend_from_slice(b"payload");
+        request_bytes.extend_from_slice(b"trailing");
+        let allocation = request_bytes.as_ptr();
+
+        let payload = take_write_payload(request_bytes, 7);
+
+        assert_eq!(payload, b"payload");
+        assert_ne!(payload.as_ptr(), allocation);
+        assert!(payload.capacity() <= 7);
+    }
 }

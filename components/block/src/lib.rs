@@ -18,7 +18,7 @@ use terra::mmio::types::DeviceError;
 use terra_device_transport::{
     INT_USED_BUFFER, MmioTransport, SPLIT_RING_DESC_F_NEXT, SPLIT_RING_DESC_F_WRITE,
     SPLIT_RING_DESCRIPTOR_BYTES, SplitRingDescriptor, SplitRingError, complete_split_ring_entry,
-    read_split_ring_available_head, split_ring_chain,
+    read_split_ring_available, split_ring_chain,
 };
 
 mod mmio;
@@ -205,6 +205,22 @@ fn sector_start(sector: u64, total: u64, capacity: u64) -> Option<u64> {
     Some(start)
 }
 
+fn read_write_payload(data: &[Range], total_len: usize) -> Option<Vec<u8>> {
+    if let [range] = data
+        && range.len != 0
+    {
+        return terra::host::memory::read(range.addr, range.len).ok();
+    }
+    let mut bytes = Vec::with_capacity(total_len);
+    for range in data {
+        if range.len != 0 {
+            let chunk = terra::host::memory::read(range.addr, range.len).ok()?;
+            bytes.extend_from_slice(&chunk);
+        }
+    }
+    Some(bytes)
+}
+
 fn is_current(epoch: u64) -> bool {
     !CLOSED.load(Ordering::Acquire) && epoch == EPOCH.load(Ordering::Acquire)
 }
@@ -353,51 +369,51 @@ impl Guest for Block {
         let fail = || write_status(status_addr, STATUS_IOERR, epoch).unwrap_or(STATUS_IOERR);
         match req_type {
             T_IN => {
-                let Some(mut disk_off) = sector_start(sector, total, capacity) else {
+                let Some(disk_offset) = sector_start(sector, total, capacity) else {
                     return fail();
                 };
+                let Ok(bytes) = terra::host::disk::read_at(disk_offset, total).await else {
+                    return fail();
+                };
+                if bytes.len() as u64 != total {
+                    return fail();
+                }
+                let mut remaining = bytes.as_slice();
                 for range in &data {
-                    let mut remaining = range.len;
-                    let mut guest_addr = range.addr;
-                    while remaining > 0 {
-                        let take = remaining.min(MAX_SINGLE);
-                        match terra::host::disk::read_at(disk_off, take).await {
-                            Ok(chunk) => {
-                                if write_guest(guest_addr, &chunk, epoch).is_err() {
-                                    return fail();
-                                }
-                                disk_off += take;
-                                guest_addr += take;
-                                remaining -= take;
-                            }
-                            Err(_) => return fail(),
-                        }
+                    if range.len == 0 {
+                        continue;
                     }
+                    let Ok(len) = usize::try_from(range.len) else {
+                        return fail();
+                    };
+                    let Some((chunk, rest)) = remaining.split_at_checked(len) else {
+                        return fail();
+                    };
+                    if write_guest(range.addr, chunk, epoch).is_err() {
+                        return fail();
+                    }
+                    remaining = rest;
                 }
                 write_status(status_addr, STATUS_OK, epoch).unwrap_or(STATUS_IOERR)
             }
             T_OUT => {
-                let Some(mut disk_off) = sector_start(sector, total, capacity) else {
+                let Some(disk_offset) = sector_start(sector, total, capacity) else {
                     return fail();
                 };
-                for range in &data {
-                    let mut remaining = range.len;
-                    let mut guest_addr = range.addr;
-                    while remaining > 0 {
-                        let take = remaining.min(MAX_SINGLE);
-                        let Ok(chunk) = terra::host::memory::read(guest_addr, take) else {
-                            return fail();
-                        };
-                        if terra::host::disk::write_at(disk_off, chunk).await.is_err() {
-                            return fail();
-                        }
-                        if !is_current(epoch) {
-                            return STATUS_IOERR;
-                        }
-                        disk_off += take;
-                        guest_addr += take;
-                        remaining -= take;
-                    }
+                let Ok(total_len) = usize::try_from(total) else {
+                    return fail();
+                };
+                let Some(bytes) = read_write_payload(&data, total_len) else {
+                    return fail();
+                };
+                if !is_current(epoch) {
+                    return STATUS_IOERR;
+                }
+                if terra::host::disk::write_at(disk_offset, bytes)
+                    .await
+                    .is_err()
+                {
+                    return fail();
                 }
                 write_status(status_addr, STATUS_OK, epoch).unwrap_or(STATUS_IOERR)
             }
@@ -613,7 +629,7 @@ async fn process_pending() -> Result<bool, DeviceError> {
         Err(DeviceError::NotReady) => return Ok(false),
         Err(error) => return Err(error),
     };
-    let head = read_split_ring_available_head(
+    let (available, head) = read_split_ring_available(
         avail,
         core::num::NonZeroU16::new(size).ok_or(DeviceError::BadLen)?,
         &mut next,
@@ -625,9 +641,6 @@ async fn process_pending() -> Result<bool, DeviceError> {
             ))
         },
     )?;
-    let available = terra::host::memory::read(ring_addr(avail, 2, 0, 0)?, 2)
-        .map_err(|_| DeviceError::BadLen)?;
-    let available = u16::from_le_bytes(available.try_into().map_err(|_| DeviceError::BadLen)?);
     let Some(head) = head else {
         let _gate = RESET_GATE
             .lock()

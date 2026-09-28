@@ -435,7 +435,7 @@ fn bridge_client(stream: yamux::Stream, client: host_service::Client) {
     let (mut output_writer, output) = crate::wit_stream::new();
     let started = SESSION_TASKS.spawn(async move {
         let client_output = client.output(output);
-        let to_host = async {
+        let to_host = async move {
             let mut buffer = [0; MAX_STREAM_FRAME_BYTES];
             loop {
                 let Ok(count) = reader.read(&mut buffer).await else {
@@ -451,7 +451,7 @@ fn bridge_client(stream: yamux::Stream, client: host_service::Client) {
                 }
             }
         };
-        let to_guest = async {
+        let to_guest = async move {
             loop {
                 let (result, bytes) = input.read(Vec::with_capacity(MAX_STREAM_FRAME_BYTES)).await;
                 match result {

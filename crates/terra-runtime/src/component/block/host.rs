@@ -2,7 +2,7 @@
 
 use super::backing::{BlockBacking, DiskGrant};
 use super::bindings::disk;
-use crate::MAX_SINGLE_BYTES;
+use crate::MAX_BATCH_BYTES;
 use crate::component::context::{DeviceContext, DeviceHost, add_device_imports};
 use crate::memory::GuestRam;
 use std::sync::{Arc, Mutex};
@@ -119,7 +119,7 @@ fn disk_read_at(
     offset: u64,
     len: u64,
 ) -> impl core::future::Future<Output = Result<Vec<u8>, disk::DiskError>> + Send + use<> {
-    run_disk_job(host, offset, len, MAX_SINGLE_BYTES, move |disk| {
+    run_disk_job(host, offset, len, MAX_BATCH_BYTES, move |disk| {
         let len = usize::try_from(len).map_err(|_| super::backing::BackingError::OutOfRange)?;
         let mut bytes = vec![0; len];
         disk.read_at(offset, &mut bytes)?;
@@ -136,7 +136,7 @@ fn disk_write_at(
         host,
         offset,
         data.len() as u64,
-        MAX_SINGLE_BYTES,
+        MAX_BATCH_BYTES,
         move |disk| disk.write_at(offset, &data),
     )
 }
@@ -158,7 +158,7 @@ fn disk_discard(
 fn disk_sync(
     host: &mut BlockHost,
 ) -> impl core::future::Future<Output = Result<(), disk::DiskError>> + Send + use<> {
-    run_disk_job(host, 0, 0, MAX_SINGLE_BYTES, |disk| disk.sync())
+    run_disk_job(host, 0, 0, MAX_BATCH_BYTES, |disk| disk.sync())
 }
 
 impl disk::Host for BlockHost {
@@ -184,6 +184,24 @@ pub fn block_component_linker<T: WasiView + AsMut<BlockHost> + 'static>(
 mod tests {
     use crate::component::block::backing::BoundedDisk;
     #[tokio::test]
+    async fn disk_imports_accept_one_bounded_batch() {
+        use super::{BlockHost, DiskGrant, MAX_BATCH_BYTES, disk, disk_read_at, disk_write_at};
+
+        let capacity = usize::try_from(MAX_BATCH_BYTES).unwrap();
+        let mut host = BlockHost::new(
+            crate::memory::GuestRam::new(4096).unwrap(),
+            DiskGrant::Mem(BoundedDisk::new(capacity, false)),
+        );
+        let bytes = vec![0xA5; capacity];
+        assert_eq!(disk_write_at(&mut host, 0, bytes.clone()).await, Ok(()));
+        assert_eq!(disk_read_at(&mut host, 0, MAX_BATCH_BYTES).await, Ok(bytes));
+        assert_eq!(
+            disk_write_at(&mut host, 0, vec![0; capacity + 1]).await,
+            Err(disk::DiskError::TooLarge)
+        );
+    }
+
+    #[tokio::test]
     async fn disk_imports_enforce_bounds_and_readonly_without_a_guest() {
         use super::disk::DiskError;
         use super::{BlockHost, DiskGrant, disk_discard, disk_read_at, disk_sync, disk_write_at};
@@ -195,7 +213,7 @@ mod tests {
         assert_eq!(disk_write_at(&mut host, 4095, vec![7]).await, Ok(()));
         assert_eq!(disk_read_at(&mut host, 4095, 1).await, Ok(vec![7]));
         assert!(matches!(
-            disk_read_at(&mut host, 0, super::MAX_SINGLE_BYTES + 1).await,
+            disk_read_at(&mut host, 0, super::MAX_BATCH_BYTES + 1).await,
             Err(DiskError::TooLarge)
         ));
         assert!(matches!(
