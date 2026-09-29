@@ -211,14 +211,16 @@ fn read_write_payload(data: &[Range], total_len: usize) -> Option<Vec<u8>> {
     {
         return terra::host::memory::read(range.addr, range.len).ok();
     }
-    let mut bytes = Vec::with_capacity(total_len);
-    for range in data {
-        if range.len != 0 {
-            let chunk = terra::host::memory::read(range.addr, range.len).ok()?;
-            bytes.extend_from_slice(&chunk);
-        }
-    }
-    Some(bytes)
+    let ranges = data
+        .iter()
+        .filter(|range| range.len != 0)
+        .map(|range| terra::host::memory::ReadRange {
+            offset: range.addr,
+            len: range.len,
+        })
+        .collect::<Vec<_>>();
+    let bytes = terra::host::memory::read_ranges(&ranges).ok()?;
+    (bytes.len() == total_len).then_some(bytes)
 }
 
 fn is_current(epoch: u64) -> bool {

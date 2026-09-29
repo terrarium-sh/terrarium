@@ -5,10 +5,12 @@ package terra:host@0.1.0;
 /// and authoritative resource grants. Component-supplied IDs never select
 /// a disk, VM, interrupt line, or foreign resource table.
 interface memory {
+    record read-range { offset: u64, len: u64 }
     /// One bounded guest-physical copy. Offsets and lengths are checked
     /// for arithmetic overflow, mapped RAM regions, holes, and aggregate
     /// batch limits before anything is allocated or copied.
     read: func(offset: u64, len: u64) -> result<list<u8>, memory-error>;
+    read-ranges: func(ranges: list<read-range>) -> result<list<u8>, memory-error>;
     write: func(offset: u64, data: list<u8>) -> result<_, memory-error>;
     address-limit: func() -> u64;
     enum memory-error { out-of-range, too-large, unmapped }

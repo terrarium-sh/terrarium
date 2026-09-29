@@ -268,6 +268,7 @@ mod tests {
         let component = Component::new(&engine, crate::test_fixtures::wasm::NETWORK)
             .expect("component compiles");
         let mut host = crate::component::context::DeviceContext::new(64 * 1024).unwrap();
+        let memory_calls = host.memory_read_import_counters();
         let ram = host.guest_ram().clone();
         host.guest_write(0x2002, &257u16.to_le_bytes())
             .expect("avail index writes");
@@ -333,11 +334,21 @@ mod tests {
             .expect("notify bad request");
         wait_for_used(&channel, &memory, [2, 0]).await;
         descriptor[..8].copy_from_slice(&0x4000_u64.to_le_bytes());
-        memory.write(0x1030, &descriptor).expect("valid descriptor");
+        descriptor[8..12].copy_from_slice(&12_u32.to_le_bytes());
+        descriptor[12..14].copy_from_slice(&1_u16.to_le_bytes());
+        descriptor[14..16].copy_from_slice(&4_u16.to_le_bytes());
+        memory.write(0x1030, &descriptor).expect("first descriptor");
+        descriptor[..8].copy_from_slice(&0x4010_u64.to_le_bytes());
+        descriptor[8..12].copy_from_slice(&14_u32.to_le_bytes());
+        descriptor[12..14].copy_from_slice(&0_u16.to_le_bytes());
+        memory
+            .write(0x1040, &descriptor)
+            .expect("second descriptor");
         memory
             .write(0x200a, &3_u16.to_le_bytes())
             .expect("valid head");
         memory.write(0x4000, &[0; 26]).expect("valid frame");
+        let before = memory_calls[1].load(std::sync::atomic::Ordering::Relaxed);
         memory
             .write(0x2002, &260_u16.to_le_bytes())
             .expect("valid request");
@@ -345,6 +356,133 @@ mod tests {
             .write(0x50, &1_u32.to_le_bytes())
             .expect("notify valid request");
         wait_for_used(&channel, &memory, [3, 0]).await;
+        assert_eq!(
+            memory_calls[1].load(std::sync::atomic::Ordering::Relaxed) - before,
+            1
+        );
         channel.close().expect("close worker");
+    }
+
+    fn stage_scattered_tx_queue(memory: &crate::memory::BoundedMemory<'_>) {
+        let mut descriptors = [0; 32];
+        descriptors[..8].copy_from_slice(&0x4000_u64.to_le_bytes());
+        descriptors[8..12].copy_from_slice(&12_u32.to_le_bytes());
+        descriptors[12..14].copy_from_slice(&1_u16.to_le_bytes());
+        descriptors[14..16].copy_from_slice(&1_u16.to_le_bytes());
+        descriptors[16..24].copy_from_slice(&0x4010_u64.to_le_bytes());
+        descriptors[24..28].copy_from_slice(&14_u32.to_le_bytes());
+        memory.write(0x1000, &descriptors).expect("descriptors");
+        memory.write(0x2004, &[0; 512]).expect("available heads");
+        memory.write(0x4000, &[0; 26]).expect("frame");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "component transport microbenchmark; run with --release --ignored --nocapture"]
+    #[allow(unsafe_code)]
+    async fn benchmark_scattered_tx_component_memory_calls() {
+        use crate::engine::precompile_component;
+        use std::sync::atomic::Ordering;
+
+        const FRAMES_PER_SAMPLE: u16 = 128;
+        const SAMPLES: usize = 7;
+
+        let engine = device_engine().expect("engine");
+        let current_wasm =
+            std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+                "../../components/target/wasm-components/release/terra_network_component.wasm",
+            ))
+            .expect("current network component");
+        let mut components = Vec::new();
+        if let Some(path) = std::env::var_os("TERRA_BASELINE_NETWORK_COMPONENT") {
+            let baseline_aot = std::fs::read(path).expect("baseline network AOT");
+            // SAFETY: The benchmark reads the trusted artifact saved from this repository's baseline build.
+            let baseline = unsafe { Component::deserialize(&engine, baseline_aot) }
+                .expect("baseline network component");
+            components.push(("baseline", baseline));
+        }
+        let current_aot =
+            precompile_component(&engine, &current_wasm).expect("current network AOT");
+        // SAFETY: `precompile_component` produced this artifact with the same engine above.
+        let current = unsafe { Component::deserialize(&engine, current_aot) }
+            .expect("current network component");
+        components.push(("candidate", current));
+
+        if std::env::var_os("TERRA_BENCH_CANDIDATE_FIRST").is_some() {
+            components.reverse();
+        }
+        for (version, component) in components {
+            let host = crate::component::context::DeviceContext::new(64 * 1024).expect("RAM");
+            let calls = host.memory_read_import_counters();
+            let ram = host.guest_ram().clone();
+            let channel = crate::component::network::instantiate(
+                &engine,
+                host,
+                &component,
+                Arc::new(Open),
+                Vec::new(),
+                GuestNetworkConfig::default(),
+                Arc::new(|_| Ok(())),
+            )
+            .await
+            .expect("network actor");
+            for (offset, value) in [
+                (0x70, 1_u32),
+                (0x70, 3),
+                (0x24, 1),
+                (0x20, 1),
+                (0x70, 11),
+                (0x30, 1),
+                (0x38, 256),
+                (0x80, 0x1000),
+                (0x90, 0x2000),
+                (0xa0, 0x3000),
+                (0x44, 1),
+                (0x70, 15),
+            ] {
+                channel
+                    .write(offset, &value.to_le_bytes())
+                    .expect("queue setup");
+            }
+            let memory = crate::memory::BoundedMemory::new(&ram);
+            stage_scattered_tx_queue(&memory);
+            let mut times = Vec::new();
+            for sample in 0..=SAMPLES {
+                let before = [
+                    calls[0].load(Ordering::Relaxed),
+                    calls[1].load(Ordering::Relaxed),
+                ];
+                let available = u16::try_from(sample + 1).expect("sample") * FRAMES_PER_SAMPLE;
+                let start = std::time::Instant::now();
+                memory
+                    .write(0x2002, &available.to_le_bytes())
+                    .expect("available index");
+                channel
+                    .write(0x50, &1_u32.to_le_bytes())
+                    .expect("queue bell");
+                wait_for_used(&channel, &memory, available.to_le_bytes()).await;
+                let elapsed = start.elapsed();
+                let direct = calls[0].load(Ordering::Relaxed) - before[0];
+                let batched = calls[1].load(Ordering::Relaxed) - before[1];
+                if sample != 0 {
+                    assert_eq!(
+                        batched,
+                        if version == "baseline" {
+                            0
+                        } else {
+                            u64::from(FRAMES_PER_SAMPLE)
+                        }
+                    );
+                    times.push(elapsed.as_nanos() / u128::from(FRAMES_PER_SAMPLE));
+                }
+                if sample == SAMPLES {
+                    times.sort_unstable();
+                    println!(
+                        "terra_network_memory_bench version={version} workload=transport_tx_scattered frames_per_sample={FRAMES_PER_SAMPLE} samples={SAMPLES} median_ns_per_frame={} direct_read_calls_per_sample={direct} read_ranges_calls_per_sample={batched}",
+                        times[SAMPLES / 2],
+                    );
+                }
+            }
+            channel.close().expect("network close");
+        }
     }
 }

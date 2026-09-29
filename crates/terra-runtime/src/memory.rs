@@ -5,6 +5,7 @@ use terra_platform::memory::{
 };
 
 use crate::MAX_SINGLE_BYTES;
+use terra_limits::{MAX_BATCH_GUEST_COPY_BYTES, MAX_BATCH_GUEST_COPY_RANGES};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryError {
@@ -70,6 +71,35 @@ impl<'a> BoundedMemory<'a> {
             .memory()
             .read(offset, len)
             .map_err(map_memory_error)
+    }
+
+    pub fn read_ranges(&self, ranges: &[MemoryRange]) -> Result<Vec<u8>, MemoryError> {
+        if ranges.len() > MAX_BATCH_GUEST_COPY_RANGES {
+            return Err(MemoryError::TooLarge);
+        }
+        let mut total = 0_u64;
+        for range in ranges {
+            Self::copy_len(range.len)?;
+            total = total.checked_add(range.len).ok_or(MemoryError::TooLarge)?;
+            if total > MAX_BATCH_GUEST_COPY_BYTES {
+                return Err(MemoryError::TooLarge);
+            }
+            self.ram
+                .memory()
+                .validate_range(range.addr, range.len)
+                .map_err(map_memory_error)?;
+        }
+        let mut bytes = vec![0; usize::try_from(total).map_err(|_| MemoryError::TooLarge)?];
+        let mut start = 0;
+        for range in ranges {
+            let end = start + Self::copy_len(range.len)?;
+            self.ram
+                .memory()
+                .read_into(range.addr, &mut bytes[start..end])
+                .map_err(map_memory_error)?;
+            start = end;
+        }
+        Ok(bytes)
     }
 
     pub fn write(&self, offset: u64, data: &[u8]) -> Result<(), MemoryError> {
@@ -190,5 +220,70 @@ mod tests {
             len: MAX_DISCARD_BYTES,
         }])
         .expect("second discard");
+    }
+
+    /// A batched read copies ranges in order and rejects an invalid later range before copying.
+    #[test]
+    fn read_ranges_validate_whole_bounded_batch() {
+        let ram = GuestRam::from_memory(
+            GuestMemory::from_ranges(&[(0, 4096), (8192, 4096)]).expect("RAM"),
+        );
+        let memory = BoundedMemory::new(&ram);
+        memory.write(0, b"first").unwrap();
+        memory.write(8192, b"second").unwrap();
+        assert_eq!(
+            memory
+                .read_ranges(&[
+                    MemoryRange { addr: 0, len: 5 },
+                    MemoryRange { addr: 8192, len: 6 },
+                ])
+                .unwrap(),
+            b"firstsecond"
+        );
+        assert_eq!(
+            memory.read_ranges(&[
+                MemoryRange { addr: 0, len: 5 },
+                MemoryRange { addr: 4096, len: 1 },
+            ]),
+            Err(MemoryError::Unmapped)
+        );
+        assert_eq!(
+            memory.read_ranges(&[MemoryRange {
+                addr: 0,
+                len: MAX_SINGLE_BYTES + 1
+            }]),
+            Err(MemoryError::TooLarge)
+        );
+        assert_eq!(
+            memory.read_ranges(&vec![MemoryRange { addr: 0, len: 1 }; 33]),
+            Err(MemoryError::TooLarge)
+        );
+        assert_eq!(
+            memory.read_ranges(&[
+                MemoryRange { addr: 0, len: 1 },
+                MemoryRange {
+                    addr: u64::MAX,
+                    len: 1,
+                },
+            ]),
+            Err(MemoryError::OutOfRange)
+        );
+    }
+
+    #[test]
+    fn read_ranges_enforces_aggregate_limit() {
+        let ram = GuestRam::new(128 * 1024).expect("RAM");
+        let memory = BoundedMemory::new(&ram);
+        let full = vec![
+            MemoryRange {
+                addr: 0,
+                len: MAX_SINGLE_BYTES,
+            };
+            4
+        ];
+        assert_eq!(memory.read_ranges(&full).unwrap().len(), 64 * 1024);
+        let mut oversized = full;
+        oversized.push(MemoryRange { addr: 0, len: 1 });
+        assert_eq!(memory.read_ranges(&oversized), Err(MemoryError::TooLarge));
     }
 }

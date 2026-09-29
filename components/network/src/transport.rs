@@ -171,14 +171,33 @@ fn read_tx_frame(head: u16, table: &[u8], size: u16) -> Result<Vec<u8>, DeviceEr
     else {
         return Err(DeviceError::BadLen);
     };
-    let mut descriptors = chain.into_iter();
-    let first = descriptors.next().ok_or(DeviceError::BadLen)?;
-    let mut frame = read(first.addr, u64::from(first.len))?;
-    if frame.len() != length {
-        frame.reserve_exact(length - frame.len());
-        for descriptor in descriptors {
+    let frame = if chain.len() == 1 {
+        read(chain[0].addr, u64::from(chain[0].len))?
+    } else if u64::try_from(length).map_err(|_| DeviceError::TooLarge)?
+        > terra_limits::MAX_BATCH_GUEST_COPY_BYTES
+    {
+        let mut frame = Vec::with_capacity(length);
+        for descriptor in &chain {
             frame.extend(read(descriptor.addr, u64::from(descriptor.len))?);
         }
+        frame
+    } else {
+        let mut ranges = Vec::new();
+        let max_chunk =
+            u32::try_from(MAX_MEMORY_IMPORT_BYTES).map_err(|_| DeviceError::TooLarge)?;
+        for descriptor in &chain {
+            for offset in (0..descriptor.len).step_by(MAX_MEMORY_IMPORT_BYTES) {
+                let len = (descriptor.len - offset).min(max_chunk);
+                ranges.push(super::terra::host::memory::ReadRange {
+                    offset: at(descriptor.addr, u64::from(offset))?,
+                    len: u64::from(len),
+                });
+            }
+        }
+        super::terra::host::memory::read_ranges(&ranges).map_err(|_| DeviceError::Unmapped)?
+    };
+    if frame.len() != length {
+        return Err(DeviceError::Io);
     }
     ethernet_frame(frame).ok_or(DeviceError::BadLen)
 }

@@ -207,17 +207,34 @@ impl GuestMemory {
         }
     }
 
-    #[allow(unsafe_code)]
+    pub fn validate_range(&self, addr: u64, len: u64) -> Result<(), MemoryError> {
+        if self.contains_range(addr, len) {
+            Ok(())
+        } else {
+            Err(self.range_error(addr, len))
+        }
+    }
+
     pub fn read(&self, addr: u64, len: usize) -> Result<Vec<u8>, MemoryError> {
-        let len_u64 = u64::try_from(len).map_err(|_| MemoryError::OutOfRange)?;
-        #[cfg(unix)]
-        self.check_range(addr, len_u64)?;
-        #[cfg(windows)]
-        let (range, range_offset) = self.resolve_range(addr, len_u64)?;
+        self.validate_range(
+            addr,
+            u64::try_from(len).map_err(|_| MemoryError::OutOfRange)?,
+        )?;
         let mut bytes = vec![0; len];
+        self.read_into(addr, &mut bytes)?;
+        Ok(bytes)
+    }
+
+    #[allow(unsafe_code)]
+    pub fn read_into(&self, addr: u64, bytes: &mut [u8]) -> Result<(), MemoryError> {
+        let len = u64::try_from(bytes.len()).map_err(|_| MemoryError::OutOfRange)?;
+        #[cfg(unix)]
+        self.check_range(addr, len)?;
+        #[cfg(windows)]
+        let (range, range_offset) = self.resolve_range(addr, len)?;
         #[cfg(unix)]
         self.memory
-            .read_slice(&mut bytes, GuestAddress(addr))
+            .read_slice(bytes, GuestAddress(addr))
             .map_err(|_| MemoryError::Unmapped)?;
         #[cfg(windows)]
         for (offset, byte) in bytes.iter_mut().enumerate() {
@@ -229,7 +246,7 @@ impl GuestMemory {
                 .load(core::sync::atomic::Ordering::Relaxed)
             };
         }
-        Ok(bytes)
+        Ok(())
     }
 
     #[allow(unsafe_code)]

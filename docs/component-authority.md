@@ -33,6 +33,11 @@ component the union of all capabilities.
 | Vsock | Guest RAM, interrupt, supplied local clients and control streams, monotonic/system clocks, `get-random-u64`, WASI CLI interfaces | Local listener/client resources come from the configured box service; randomness seeds the guest service. The standard-library CLI bindings receive an empty environment, closed stdin, and output sinks. No general filesystem or sockets are linked. |
 | Policy | Monotonic `now` | Computes policy and DNS-expiry decisions with no Terra host, guest RAM, filesystem or socket imports. |
 
+Block and network import `memory.read-ranges` for scattered input
+buffers. The host validates every range before copying, limits each range to
+16 KiB, each call to 32 ranges and 64 KiB total, and returns one concatenated
+byte sequence. The import grants no address authority beyond `memory.read`.
+
 The checked list is exact, including resource destructors and empty imported
 type interfaces. For the individual function names, see the machine-readable
 allowlist. The native linker implementations and their focused negative tests

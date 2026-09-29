@@ -182,6 +182,7 @@ async fn fixture_with_disk(
 async fn benchmark_block_io(
     fixture: &mut Fixture,
     disk_path: &std::path::Path,
+    version: &str,
     request_type: u32,
     ranges: &[Range],
     pattern: u8,
@@ -191,6 +192,7 @@ async fn benchmark_block_io(
 
     let bytes = ranges.iter().map(|range| range.len).sum::<u64>();
     let mut ns_per_call = Vec::with_capacity(MEASURED_SAMPLES);
+    let mut memory_calls_per_operation = (0, 0);
     for sample in 0..=MEASURED_SAMPLES {
         if request_type == T_IN {
             for range in ranges {
@@ -205,6 +207,7 @@ async fn benchmark_block_io(
                     .expect("read destination cleared");
             }
         }
+        let before = fixture.store.data().context.memory_read_import_counts();
         let start = std::time::Instant::now();
         for _ in 0..CALLS_PER_SAMPLE {
             let (result,) = fixture
@@ -218,6 +221,11 @@ async fn benchmark_block_io(
             assert_eq!(result, 0);
         }
         let elapsed = start.elapsed();
+        let after = fixture.store.data().context.memory_read_import_counts();
+        memory_calls_per_operation = (
+            (after.0 - before.0) / CALLS_PER_SAMPLE as u64,
+            (after.1 - before.1) / CALLS_PER_SAMPLE as u64,
+        );
         assert_eq!(
             fixture
                 .store
@@ -256,58 +264,83 @@ async fn benchmark_block_io(
     let p95_ns = ns_per_call[(MEASURED_SAMPLES * 95).div_ceil(100) - 1];
     let bytes_per_second = u128::from(bytes) * 1_000_000_000 / median_ns;
     println!(
-        "terra_block_bench operation={} bytes={bytes} calls_per_sample={CALLS_PER_SAMPLE} samples={MEASURED_SAMPLES} median_ns_per_call={median_ns} p95_ns_per_call={p95_ns} median_bytes_per_second={bytes_per_second}",
+        "terra_block_bench version={version} operation={} bytes={bytes} calls_per_sample={CALLS_PER_SAMPLE} samples={MEASURED_SAMPLES} median_ns_per_call={median_ns} p95_ns_per_call={p95_ns} median_bytes_per_second={bytes_per_second} memory_read_calls_per_operation={} memory_read_ranges_calls_per_operation={}",
         if request_type == T_IN {
             "read"
         } else {
             "write"
         },
+        memory_calls_per_operation.0,
+        memory_calls_per_operation.1,
     );
 }
 
 #[cfg(any(unix, windows))]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "AOT file-backed microbenchmark; run with --release --ignored --nocapture"]
+#[allow(unsafe_code)]
 async fn benchmark_aot_file_backed_block_transfers() {
     use crate::component::block::backing::FileDisk;
 
     let engine = device_engine().expect("engine builds");
-    let component = crate::test_fixtures::trusted_artifacts()
-        .block()
-        .deserialize(&engine)
-        .expect("block AOT artifact");
-    for (bytes, ranges, pattern) in [
-        (4 * 1024, one(0x4000, 4 * 1024), 0x41),
-        (
-            64 * 1024,
-            (0..4)
-                .map(|index| Range {
-                    addr: 0x4000 + index * 16 * 1024,
-                    len: 16 * 1024,
-                })
-                .collect(),
-            0x64,
-        ),
-    ] {
-        let disk = tempfile::NamedTempFile::new().expect("disk file");
-        disk.as_file().set_len(128 * 1024).expect("disk capacity");
-        let backing = FileDisk::open(disk.path(), false).expect("file-backed disk");
-        let (_, mut fixture) =
-            fixture_with_disk(&engine, DiskGrant::File(backing), &component).await;
-        for range in &ranges {
-            fixture
-                .store
-                .data_mut()
-                .context
-                .guest_write(
-                    range.addr,
-                    &vec![pattern; usize::try_from(range.len).expect("range fits usize")],
-                )
-                .expect("write payload staged");
+    let current_wasm = std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../components/target/wasm-components/release/terra_block_component.wasm"),
+    )
+    .expect("current block component");
+    let current_aot = precompile_component(&engine, &current_wasm).expect("current block AOT");
+    let mut components = Vec::new();
+    if let Some(path) = std::env::var_os("TERRA_BASELINE_BLOCK_COMPONENT") {
+        let baseline_aot = std::fs::read(path).expect("baseline block AOT");
+        components.push((
+            "baseline",
+            // SAFETY: The benchmark reads the trusted artifact saved from this repository's baseline build.
+            unsafe { Component::deserialize(&engine, baseline_aot) }
+                .expect("baseline block component"),
+        ));
+    }
+    components.push((
+        "candidate",
+        // SAFETY: `precompile_component` produced this artifact with the same engine above.
+        unsafe { Component::deserialize(&engine, current_aot) }.expect("current block component"),
+    ));
+    if std::env::var_os("TERRA_BENCH_CANDIDATE_FIRST").is_some() {
+        components.reverse();
+    }
+    for (version, component) in components {
+        for (bytes, ranges, pattern) in [
+            (4 * 1024, one(0x4000, 4 * 1024), 0x41),
+            (
+                64 * 1024,
+                (0..4)
+                    .map(|index| Range {
+                        addr: 0x4000 + index * 16 * 1024,
+                        len: 16 * 1024,
+                    })
+                    .collect(),
+                0x64,
+            ),
+        ] {
+            let disk = tempfile::NamedTempFile::new().expect("disk file");
+            disk.as_file().set_len(128 * 1024).expect("disk capacity");
+            let backing = FileDisk::open(disk.path(), false).expect("file-backed disk");
+            let (_, mut fixture) =
+                fixture_with_disk(&engine, DiskGrant::File(backing), &component).await;
+            for range in &ranges {
+                fixture
+                    .store
+                    .data_mut()
+                    .context
+                    .guest_write(
+                        range.addr,
+                        &vec![pattern; usize::try_from(range.len).expect("range fits usize")],
+                    )
+                    .expect("write payload staged");
+            }
+            assert_eq!(ranges.iter().map(|range| range.len).sum::<u64>(), bytes);
+            benchmark_block_io(&mut fixture, disk.path(), version, T_OUT, &ranges, pattern).await;
+            benchmark_block_io(&mut fixture, disk.path(), version, T_IN, &ranges, pattern).await;
         }
-        assert_eq!(ranges.iter().map(|range| range.len).sum::<u64>(), bytes);
-        benchmark_block_io(&mut fixture, disk.path(), T_OUT, &ranges, pattern).await;
-        benchmark_block_io(&mut fixture, disk.path(), T_IN, &ranges, pattern).await;
     }
 }
 
@@ -589,12 +622,15 @@ async fn component_transfers_the_full_batch_across_distinct_ranges() {
             .guest_write(range.addr, &[pattern; 16 * 1024])
             .expect("batch payload staged");
     }
+    let before = fixture.store.data().context.memory_read_import_counts();
     let (write_status,) = fixture
         .execute
         .call_async(&mut fixture.store, (T_OUT, 0, ranges.clone(), STATUS, 0))
         .await
         .expect("full batch write runs");
     assert_eq!(write_status, 0);
+    let after = fixture.store.data().context.memory_read_import_counts();
+    assert_eq!((after.0 - before.0, after.1 - before.1), (0, 1));
     for range in &ranges {
         fixture
             .store

@@ -82,6 +82,8 @@ pub struct DeviceContext {
     irq: InterruptSignals,
     interrupt_level: bool,
     interrupt_notification: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    memory_read_calls: Arc<[std::sync::atomic::AtomicU64; 2]>,
 }
 
 impl DeviceContext {
@@ -107,6 +109,11 @@ impl DeviceContext {
             irq: InterruptSignals::new(),
             interrupt_level: false,
             interrupt_notification: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            memory_read_calls: Arc::new([
+                std::sync::atomic::AtomicU64::new(0),
+                std::sync::atomic::AtomicU64::new(0),
+            ]),
         }
     }
 
@@ -145,6 +152,20 @@ impl DeviceContext {
     /// Read back bytes staged in this device's guest RAM.
     pub fn guest_read(&self, offset: u64, len: u64) -> Result<Vec<u8>, crate::memory::MemoryError> {
         self.memory().read(offset, len)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn memory_read_import_counts(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering;
+        (
+            self.memory_read_calls[0].load(Ordering::Relaxed),
+            self.memory_read_calls[1].load(Ordering::Relaxed),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn memory_read_import_counters(&self) -> Arc<[std::sync::atomic::AtomicU64; 2]> {
+        Arc::clone(&self.memory_read_calls)
     }
 
     pub(crate) fn interrupt_level(&self) -> bool {
@@ -187,7 +208,32 @@ fn memory_error(error: crate::memory::MemoryError) -> memory::MemoryError {
 
 impl memory::Host for DeviceContext {
     fn read(&mut self, offset: u64, len: u64) -> Result<Vec<u8>, memory::MemoryError> {
+        #[cfg(test)]
+        {
+            self.memory_read_calls[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         self.memory().read(offset, len).map_err(memory_error)
+    }
+
+    fn read_ranges(
+        &mut self,
+        ranges: Vec<memory::ReadRange>,
+    ) -> Result<Vec<u8>, memory::MemoryError> {
+        if ranges.len() > terra_limits::MAX_BATCH_GUEST_COPY_RANGES {
+            return Err(memory::MemoryError::TooLarge);
+        }
+        #[cfg(test)]
+        {
+            self.memory_read_calls[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let ranges = ranges
+            .into_iter()
+            .map(|range| terra_platform::memory::MemoryRange {
+                addr: range.offset,
+                len: range.len,
+            })
+            .collect::<Vec<_>>();
+        self.memory().read_ranges(&ranges).map_err(memory_error)
     }
 
     fn write(&mut self, offset: u64, data: Vec<u8>) -> Result<(), memory::MemoryError> {
