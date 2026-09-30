@@ -797,6 +797,154 @@ fn ls_reports_a_state_line_per_box() {
     assert!(empty.stdout.is_empty(), "{:?}", empty.stdout);
 }
 
+#[test]
+fn ls_state_filters_apply_to_every_format() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let removed_project = tempfile::tempdir().unwrap();
+    let project_dir_label = project_path(project.path());
+    let removed_path = project_path(removed_project.path());
+
+    for dir in [project.path(), removed_project.path()] {
+        std::fs::write(dir.join("b.yaml"), "hw:\n  cpus: 1\n").unwrap();
+    }
+    std::fs::write(project.path().join("c.yaml"), "hw:\n  cpus: 1\n").unwrap();
+    std::fs::write(
+        project.path().join("terra.yaml"),
+        "boxes:\n  b: ./b.yaml\n  c: ./c.yaml\n",
+    )
+    .unwrap();
+    for (dir, name) in [(project.path(), "b"), (removed_project.path(), "./b.yaml")] {
+        let setup = run_terra_in(dir, home.path(), &[name, "setup"]);
+        assert!(
+            setup.status.success(),
+            "{}",
+            String::from_utf8_lossy(&setup.stderr)
+        );
+    }
+    removed_project.close().unwrap();
+
+    // Repeated values and comma-separated values form the same union.
+    let human = run_terra_in(
+        project.path(),
+        home.path(),
+        &["ls", "--state", "stopped", "--state", "not_created"],
+    );
+    assert!(human.status.success());
+    let stdout = String::from_utf8_lossy(&human.stdout);
+    let rows: Vec<(&str, &str)> = stdout
+        .lines()
+        .filter(|line| !line.starts_with("  files:"))
+        .map(|line| {
+            let mut fields = line.split_whitespace();
+            (fields.next().unwrap(), fields.next().unwrap())
+        })
+        .collect();
+    assert_eq!(rows, [("stopped", "b"), ("not_created", "c")]);
+
+    let json = run_terra_in(
+        project.path(),
+        home.path(),
+        &["ls", "--state", "stopped,not_created", "--json"],
+    );
+    assert!(json.status.success());
+    let entries: Vec<serde_json::Value> = serde_json::from_slice(&json.stdout).unwrap();
+    let states: Vec<(&str, &str)> = entries
+        .iter()
+        .map(|entry| {
+            (
+                entry["name"].as_str().unwrap(),
+                entry["state"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(states, [("b", "stopped"), ("c", "not_created")]);
+
+    let tsv = run_terra_in(
+        project.path(),
+        home.path(),
+        &[
+            "ls",
+            "--state",
+            "stopped",
+            "--state",
+            "not_created",
+            "--tsv",
+        ],
+    );
+    assert!(tsv.status.success());
+    let stdout = String::from_utf8_lossy(&tsv.stdout);
+    let rows: Vec<Vec<&str>> = stdout
+        .lines()
+        .map(|line| line.split('\t').take(2).collect())
+        .collect();
+    assert_eq!(rows, [["stopped", "b"], ["not_created", "c"]]);
+
+    // `--all` keeps same-named boxes from different projects as separate lines.
+    let quiet = run_terra_in(
+        project.path(),
+        home.path(),
+        &["ls", "--all", "--state", "stopped,gone", "--quiet"],
+    );
+    assert!(quiet.status.success());
+    assert_eq!(String::from_utf8_lossy(&quiet.stdout), "b\nb\n");
+
+    // The origin directory is gone, but its box remains available to --all.
+    let all = run_terra_in(
+        project.path(),
+        home.path(),
+        &["ls", "--all", "--state", "gone"],
+    );
+    let stdout = String::from_utf8_lossy(&all.stdout);
+    assert!(
+        stdout.contains(&format!("{} (b)", removed_path.display())),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains(&format!("{} (b)", project_dir_label.display())),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn ls_state_filters_succeed_with_no_matches() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join("terra.yaml"),
+        "boxes:\n  dev: ./dev.yaml\n",
+    )
+    .unwrap();
+
+    let no_match = run_terra_in(project.path(), home.path(), &["ls", "--state", "running"]);
+    assert!(no_match.status.success());
+    assert!(no_match.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&no_match.stderr).contains("no boxes match the requested states")
+    );
+    let empty_json = run_terra_in(
+        project.path(),
+        home.path(),
+        &["ls", "--state", "setting_up", "--json"],
+    );
+    assert!(empty_json.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Vec<serde_json::Value>>(&empty_json.stdout)
+            .unwrap()
+            .len(),
+        0
+    );
+    for format in ["--tsv", "--quiet"] {
+        let empty = run_terra_in(
+            project.path(),
+            home.path(),
+            &["ls", "--state", "setting_up", format],
+        );
+        assert!(empty.status.success(), "{format}");
+        assert!(empty.stdout.is_empty(), "{format}: {:?}", empty.stdout);
+    }
+}
+
 /// A recipe *path* names a file to pin, so a missing file is an error - not a
 /// silent re-check of whatever recipe happens to be pinned under the same stem.
 /// A bare *name* still answers from the box's own pinned recipe: the box is

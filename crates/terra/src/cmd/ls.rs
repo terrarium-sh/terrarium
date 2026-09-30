@@ -13,42 +13,61 @@ pub fn run(args: &crate::cli::LsArgs, project_dir: &Path) -> Result<ExitCode> {
     } else {
         list_boxes_of_project(project_dir)?
     };
+    let mut selected_boxes = Vec::new();
+    for bx in boxes {
+        let box_state = bx.get_state()?;
+        if args.states.is_empty() || args.states.contains(&box_state) {
+            selected_boxes.push((bx, box_state));
+        }
+    }
+    if args.quiet {
+        let mut out = std::io::stdout().lock();
+        for (bx, _) in selected_boxes {
+            render::finish_stdout_write(writeln!(
+                out,
+                "{}",
+                render::escape_printable(bx.get_name())
+            ))?;
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
     if args.tsv {
         let mut out = std::io::stdout().lock();
-        for bx in boxes {
-            render::finish_stdout_write(writeln!(out, "{}", format_tsv_line(&bx)?))?;
+        for (bx, box_state) in selected_boxes {
+            render::finish_stdout_write(writeln!(out, "{}", format_tsv_line(&bx, box_state)))?;
         }
         return Ok(ExitCode::SUCCESS);
     }
     if args.json {
-        let entries: Vec<BoxEntry<'_>> = boxes
+        let entries: Vec<BoxEntry<'_>> = selected_boxes
             .iter()
-            .map(|bx| {
-                let box_state = bx.get_state()?;
-                let (pid, process_identity) = if box_state == state::BoxState::Running {
+            .map(|(bx, box_state)| {
+                let (pid, process_identity) = if *box_state == state::BoxState::Running {
                     bx.read_vm_process()
                         .map_or((None, None), |vm| (Some(vm.pid), vm.process_identity))
                 } else {
                     (None, None)
                 };
-                Ok(BoxEntry {
+                BoxEntry {
                     name: bx.get_name(),
-                    state: box_state,
+                    state: *box_state,
                     project_dir: bx.get_project_dir(),
                     dir: bx.get_dir(),
                     pid,
                     process_identity,
-                })
+                }
             })
-            .collect::<Result<_>>()?;
+            .collect();
         let json = serde_json::to_string_pretty(&entries).context("serializing boxes to json")?;
         let mut out = std::io::stdout().lock();
         render::finish_stdout_write(writeln!(out, "{json}"))?;
         return Ok(ExitCode::SUCCESS);
     }
 
-    if boxes.is_empty() {
-        if args.all {
+    if selected_boxes.is_empty() {
+        if !args.states.is_empty() {
+            eprintln!("terra: no boxes match the requested states");
+        } else if args.all {
             eprintln!("terra: no boxes on this machine");
         } else {
             eprintln!(
@@ -59,8 +78,7 @@ pub fn run(args: &crate::cli::LsArgs, project_dir: &Path) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     let mut out = std::io::stdout().lock();
-    for bx in boxes {
-        let box_state = bx.get_state()?;
+    for (bx, box_state) in selected_boxes {
         if args.all {
             render::finish_stdout_write(writeln!(
                 out,
@@ -78,14 +96,14 @@ pub fn run(args: &crate::cli::LsArgs, project_dir: &Path) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn format_tsv_line(bx: &BoxRef) -> Result<String> {
-    Ok(format!(
+fn format_tsv_line(bx: &BoxRef, box_state: state::BoxState) -> String {
+    format!(
         "{}\t{}\t{}\t{}",
-        bx.get_state()?,
+        box_state,
         render::escape_printable(bx.get_name()),
         render::escape_printable_path(bx.get_project_dir()),
         render::escape_printable_path(bx.get_dir())
-    ))
+    )
 }
 
 #[derive(serde::Serialize)]
@@ -198,7 +216,7 @@ mod tests {
         std::fs::create_dir_all(bx.get_dir()).unwrap();
         std::fs::write(bx.get_dir().join(crate::state::ROOTFS_FILE), b"image").unwrap();
 
-        let line = format_tsv_line(&bx).unwrap();
+        let line = format_tsv_line(&bx, bx.get_state().unwrap());
         let fields: Vec<&str> = line.split('\t').collect();
         assert_eq!(
             fields,

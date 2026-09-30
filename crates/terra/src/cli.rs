@@ -189,7 +189,13 @@ pub enum Cmd {
     Show(ShowArgs),
     /// List this directory's boxes and what state each is in - or, with
     /// `--all`, every box on this machine.
-    #[command(alias = "ps")]
+    #[command(
+        alias = "ps",
+        after_long_help = "EXAMPLES:\n    \
+                           terra ls --state running --quiet         Print running box names\n    \
+                           terra ls --state stopped,not_created     Find boxes ready to start\n    \
+                           terra ls --all --state running --json    Inspect running boxes across projects"
+    )]
     Ls(LsArgs),
     /// Stop a running box: the guest runs `pre_stop`, then the VM exits.
     Stop(StopArgs),
@@ -411,11 +417,23 @@ pub struct StorageFileArgs {
 }
 
 #[derive(Args, Debug)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct LsArgs {
     /// Every box on this machine instead, each with the directory it belongs
     /// to.
     #[arg(long)]
     pub all: bool,
+    /// Include only these states; repeat or separate with commas to match any.
+    #[arg(
+        long = "state",
+        value_enum,
+        value_delimiter = ',',
+        value_name = "STATE"
+    )]
+    pub states: Vec<crate::state::BoxState>,
+    /// Print only box names, one per line. With --all, names may repeat across projects.
+    #[arg(short, long, conflicts_with_all = ["json", "tsv"])]
+    pub quiet: bool,
     /// One box per line - state, name, directory, files - separated by tabs,
     /// with no prose around them. This is the format scripts may rely on; the
     /// human listing is prose and may change.
@@ -986,6 +1004,48 @@ mod tests {
         };
         assert!(args.json);
         assert!(!args.tsv);
+    }
+
+    #[test]
+    fn ls_filters_use_the_displayed_and_serialized_states() {
+        use crate::state::BoxState;
+        use clap::ValueEnum as _;
+
+        for &box_state in BoxState::value_variants() {
+            let value = box_state.to_possible_value().unwrap();
+            assert_eq!(value.get_name(), box_state.to_string());
+            assert_eq!(serde_json::to_value(box_state).unwrap(), value.get_name());
+            let Some(Cmd::Ls(args)) =
+                Cli::parse_from(["terra", "ls", "--state", value.get_name()]).cmd
+            else {
+                panic!("expected ls");
+            };
+            assert_eq!(args.states, [box_state]);
+        }
+        let Some(Cmd::Ls(args)) = Cli::parse_from([
+            "terra",
+            "ps",
+            "--state",
+            "stopped,not_created",
+            "--state",
+            "running",
+            "-q",
+        ])
+        .cmd
+        else {
+            panic!("expected ls");
+        };
+        assert_eq!(
+            args.states,
+            [BoxState::Stopped, BoxState::NotCreated, BoxState::Running]
+        );
+        assert!(args.quiet);
+        for state in ["", "unknown", "running,", "setting-up"] {
+            assert!(Cli::try_parse_from(["terra", "ls", "--state", state]).is_err());
+        }
+        for format in ["--json", "--tsv"] {
+            assert!(Cli::try_parse_from(["terra", "ls", "--quiet", format]).is_err());
+        }
     }
 
     /// Whether an exec'd command gets a PTY was read off terra's own stdin and

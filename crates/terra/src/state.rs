@@ -524,8 +524,9 @@ pub fn read_origin(project: &Path) -> Option<PathBuf> {
 }
 
 /// Whether a box has a guest filesystem, and whether a terra is holding it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
+#[value(rename_all = "snake_case")]
 pub enum BoxState {
     Running,
     SettingUp,

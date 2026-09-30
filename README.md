@@ -109,7 +109,7 @@ files and directories with `terra sync`. Detailed instructions:
 | `terra [BOX] sessions` | list attached console clients |
 | `terra [BOX] detach [ID]` | disconnect an attached client (`--all`: every client) |
 | `terra [BOX] show` | print the resolved recipe and configuration |
-| `terra ls` | list boxes in this directory (`--all`: every project, alias: `ps`) |
+| `terra ls` | list boxes (`--all`: every project, `--state`: filter, `-q`: names only; alias: `ps`) |
 | `terra [BOX] stop` | stop a running box gracefully |
 | `terra [BOX] storage` | inspect or manage box storage (`show`, `export`, `import`, `prune`) |
 | `terra [BOX] rm` | delete a box's storage and logs (`--purge`: remove recipe too) |

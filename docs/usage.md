@@ -16,6 +16,26 @@ terra dev stop
 `./ci.yaml`; a recipe path names the box from its filename. See
 [the manifest reference](manifest.md) and [the recipe reference](recipe.md).
 
+## List boxes
+
+`terra ls` lists the current project's boxes; `--all` includes boxes stored
+across projects. Filter by `--state` and use `-q` (`--quiet`) for one box name
+per line:
+
+```sh
+terra ls --state running --quiet
+terra ls --state stopped,not_created
+terra ls --all --state running --json
+```
+
+States are `running`, `setting_up`, `stopped`, `not_created`, and `gone`.
+Repeat `--state` or separate states with commas to match any of them. Filters
+work with every output format, including `--json` and `--tsv`. An empty match
+succeeds with no entries (`[]` for JSON). Quiet output cannot be combined with
+JSON or TSV; with `--all`, the same name can appear in multiple projects, so
+use JSON or TSV when you also need project paths. `terra ps` is an alias for
+`terra ls`.
+
 ## Set up and start
 
 `terra <box> setup` reads the recipe, asks for approval when required, pins it,
