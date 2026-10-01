@@ -105,8 +105,9 @@ before native access. Block disks are opened as fixed-capacity grants; guest
 writes cannot extend their initial extent. The filesystem component receives a
 scoped directory preopen only when a mount is configured. Network socket and
 name-resolution operations are checked against the box policy before the host
-operation proceeds. Device components do not receive arbitrary host filesystem
-or hypervisor handles.
+operation proceeds. The network component and its native socket hosts run in
+the VM process, inside the jail when using built-in Bubblewrap. Device
+components do not receive arbitrary host filesystem or hypervisor handles.
 
 Native preparation fixes the machine resources before a separate boot store
 parses the kernel. Native code validates its bounded writes and one-time result,
@@ -141,6 +142,23 @@ functions, and the native adapters. It is therefore not a defense against a
 Wasmtime, native-runtime, hypervisor, or host-kernel vulnerability, and it does
 not isolate components into separate operating-system processes.
 
+The default Linux [host VM launcher](vm-launchers.md) restricts the native VM
+process outside this component boundary. The built-in Bubblewrap launcher
+restricts its mount view, process namespaces, capabilities, and syscalls while
+sharing the host network namespace. Releases require a native KVM boot with the
+default jail and built-in policy on each Linux architecture; missing KVM or a
+failed boot blocks publication. Generated-policy enforcement is optional CI
+coverage and does not gate releases. Linux
+uses an explicitly configured raw seccomp policy, then the override at
+`~/.terra/config/seccomp.bpf`, then the built-in minimal syscall denylist.
+Selected files must contain raw classic BPF for the host architecture; Terra
+checks their size and the kernel validates installation, without release metadata
+or downloads. The built-in policy does not provide the generated policy’s syscall
+or ioctl allowlist. Set `vm.bwrap.allow_fallback: false` to require a policy file.
+An invalid selected policy stops boot. Operators can select `vm.init: direct` or
+a custom launcher globally.
+Custom launchers are trusted host code and define their own boundary.
+
 Components inherit no host environment, arguments or standard streams. Devices
 can read and corrupt their own VM's RAM: component isolation protects the host
 and other boxes, not the guest from its devices. A directory preopen authorizes
@@ -165,9 +183,8 @@ Component memory has independent per-store Wasm linear-memory limits, with
 a default and minimum configurable ceiling of 16 MiB. There is no combined
 component memory cap. Those limits do not bound guest RAM,
 native/WASI allocations, kernel socket memory, CPU time, disk use in writable
-shares, or bandwidth. Terra's per-home admission accounting reserves the maximum
-configured component footprint plus guest RAM and native headroom. This is not
-a host-wide resource quota. Apply operating-system limits or a dedicated host
+shares, or bandwidth. Operators control aggregate VM resource budgets.
+Apply operating-system limits or a dedicated host
 when hard resource isolation is required.
 
 Native resource tables use Wasmtime's default capacity except where a device
@@ -179,6 +196,23 @@ Terra keeps its box state, recipes, images, logs, and local control sockets
 under `~/.terra` with owner-only permissions where the platform supports them.
 `terra setup` refuses to run as host root unless `TERRA_ALLOW_ROOT=1` is set.
 Running Terra as host root expands the impact of a boundary failure.
+
+### Network policy limits
+
+Recipe network rules and the Wasm policy boundary govern guest traffic during
+normal operation, including a compromised Wasm network component that remains
+within its granted host calls. Native code execution in the VM process can
+bypass those rules and open sockets directly in the shared host network
+namespace. The jail's filesystem, process, capability, and seccomp restrictions
+still apply, but they do not enforce the recipe's destination policy.
+
+A compromised native VM process can reach host-loopback and LAN services, and
+Linux abstract Unix sockets, subject to operating-system permissions, the
+selected seccomp filter, and external network controls. Vulnerabilities or
+privileged APIs in those services can provide an indirect path out of the jail.
+Operators who need network restrictions that survive native VM compromise must
+apply independent host controls, such as root-managed filtering for the Terra
+service. Ordinary IP firewall rules do not cover abstract Unix sockets.
 
 ## Outside the boundary
 

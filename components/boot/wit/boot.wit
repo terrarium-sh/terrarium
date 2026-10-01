@@ -32,7 +32,6 @@ interface types {
         kernel-layout,
         kernel-too-large,
         boot-data-too-large,
-        unavailable,
         bounds,
     }
 }

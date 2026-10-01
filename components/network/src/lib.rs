@@ -27,7 +27,7 @@ mod transport;
 
 use std::collections::VecDeque;
 use std::future::IntoFuture;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{
     LazyLock, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -64,7 +64,7 @@ const TCP_FLOW_TIMEOUT_SECS: u64 = 30;
 const DNS_PORT: u16 = 53;
 const LEARNED_DNS_TTL_SECS: u32 = 60;
 const MAX_UDP_PACKET_BYTES: usize = 4096;
-const UDP_RECEIVE_TIMEOUT: u64 = 5_000_000_000;
+const UDP_IDLE_TIMEOUT: u64 = 5_000_000_000;
 const PUBLISHED_LISTENER_RETRY_DELAY: u64 = 1_000_000_000;
 
 #[derive(Clone)]
@@ -155,6 +155,9 @@ struct HostFlowStart {
 }
 struct UdpFlow {
     id: u32,
+    guest: (SocketAddr, SocketAddr),
+    outgoing: Sender<Vec<u8>>,
+    last_activity: u64,
     abort: AbortHandle,
 }
 struct UdpFlowStart {
@@ -162,6 +165,7 @@ struct UdpFlowStart {
     id: u32,
     destination: IpAddr,
     request: UdpRequest,
+    outgoing: futures::channel::mpsc::Receiver<Vec<u8>>,
     registration: AbortRegistration,
 }
 struct Background {
@@ -449,7 +453,20 @@ impl Gateway {
         Ok(flow)
     }
 
-    fn add_udp_flow(&mut self, request: UdpRequest) -> Result<UdpFlowStart, Error> {
+    fn add_udp_flow(&mut self, mut request: UdpRequest) -> Result<Option<UdpFlowStart>, Error> {
+        let now = monotonic_now();
+        self.reap_idle_udp_flows(now);
+        let guest = (
+            SocketAddr::new(request.source, request.source_port),
+            SocketAddr::new(request.destination, request.destination_port),
+        );
+        if let Some(flow) = self.udp_flows.iter_mut().find(|flow| flow.guest == guest) {
+            flow.outgoing
+                .try_send(request.data)
+                .map_err(|_| Error::Backpressure)?;
+            flow.last_activity = now;
+            return Ok(None);
+        }
         let destination = self.socket_destination(request.destination, request.destination_port);
         let Some(destination) = destination else {
             return Err(Error::NotReady);
@@ -459,15 +476,41 @@ impl Gateway {
         }
         let id = self.next_flow;
         self.next_flow = self.next_flow.wrapping_add(1);
+        let (mut outgoing, incoming) = channel(1);
+        outgoing
+            .try_send(std::mem::take(&mut request.data))
+            .map_err(|_| Error::Backpressure)?;
         let (abort, registration) = AbortHandle::new_pair();
-        self.udp_flows.push(UdpFlow { id, abort });
-        Ok(UdpFlowStart {
+        self.udp_flows.push(UdpFlow {
+            id,
+            guest,
+            outgoing,
+            last_activity: now,
+            abort,
+        });
+        tick();
+        Ok(Some(UdpFlowStart {
             generation: GENERATION.load(Ordering::Acquire),
             id,
             destination,
             request,
+            outgoing: incoming,
             registration,
-        })
+        }))
+    }
+    fn reap_idle_udp_flows(&mut self, now: u64) {
+        let count = self.udp_flows.len();
+        self.udp_flows
+            .retain(|flow| now.saturating_sub(flow.last_activity) < UDP_IDLE_TIMEOUT);
+        if self.udp_flows.len() != count {
+            PUBLISHED_FLOW_WAKER.wake();
+        }
+    }
+    fn deliver_udp_reply(&mut self, id: u32, frame: Vec<u8>) {
+        if let Some(flow) = self.udp_flows.iter_mut().find(|flow| flow.id == id) {
+            flow.last_activity = monotonic_now();
+            let _ = self.enqueue(frame);
+        }
     }
     fn finish_udp_flow(&mut self, generation: u64, id: u32) {
         if GENERATION.load(Ordering::Acquire) != generation {
@@ -524,6 +567,7 @@ impl Gateway {
         }
     }
     fn reap_finished_flows(&mut self) {
+        self.reap_idle_udp_flows(monotonic_now());
         let generation = GENERATION.load(Ordering::Acquire);
         let timed_out = self
             .flows
@@ -675,15 +719,18 @@ impl Gateway {
         let mut terminal = Vec::new();
         let mut guest_eof = Vec::new();
         for flow in &mut self.published_flows {
-            for data in self
+            let mut upstream = self
                 .published
                 .take_upstream(flow.id, TCP_CHUNK_BYTES)
                 .map_err(|_| Error::Backpressure)?
-            {
+                .into_iter();
+            while let Some(data) = upstream.next() {
                 if let Err(error) = flow.outgoing.try_send(data) {
-                    self.published
-                        .restore_upstream(flow.id, error.into_inner())
-                        .map_err(|_| Error::Backpressure)?;
+                    for data in std::iter::once(error.into_inner()).chain(upstream).rev() {
+                        self.published
+                            .restore_upstream(flow.id, data)
+                            .map_err(|_| Error::Backpressure)?;
+                    }
                     break;
                 }
             }
@@ -739,11 +786,20 @@ impl Gateway {
             })
     }
     fn protocol_delay(&mut self) -> Option<u64> {
-        self.interface
-            .as_mut()?
-            .poll_delay(protocol_now(self.started), &self.sockets)
-            .map(|delay| delay.total_micros().saturating_mul(1_000))
+        let now = monotonic_now();
+        let protocol = self.interface.as_mut().and_then(|interface| {
+            interface
+                .poll_delay(protocol_now(self.started), &self.sockets)
+                .map(|delay| delay.total_micros().saturating_mul(1_000))
+        });
+        protocol
+            .into_iter()
+            .chain(self.udp_flows.iter().map(|flow| {
+                UDP_IDLE_TIMEOUT.saturating_sub(now.saturating_sub(flow.last_activity))
+            }))
+            .min()
     }
+    #[cfg(test)]
     fn take_frames(&mut self, max_items: usize, max_bytes: usize) -> Vec<Vec<u8>> {
         let mut bytes: usize = 0;
         let mut frames = Vec::new();
@@ -1485,10 +1541,11 @@ fn start_udp_flow(flow: UdpFlowStart) {
         id,
         destination,
         request,
+        mut outgoing,
         registration,
     } = flow;
     wit_bindgen::rt::async_support::spawn_local(async move {
-        let reply = Abortable::new(
+        let _ = Abortable::new(
             async move {
                 let socket = WasiUdpSocket::create(match destination {
                     IpAddr::V4(_) => IpAddressFamily::Ipv4,
@@ -1514,23 +1571,33 @@ fn start_udp_flow(flow: UdpFlowStart) {
                         }),
                     })
                     .ok()?;
-                socket.send(request.data.clone(), None).await.ok()?;
-                let receive = socket.receive().fuse();
-                let timeout = wasi::clocks::monotonic_clock::wait_for(UDP_RECEIVE_TIMEOUT).fuse();
-                futures::pin_mut!(receive, timeout);
+                let forward = async {
+                    while let Some(data) = outgoing.next().await {
+                        socket.send(data, None).await.ok()?;
+                    }
+                    Some(())
+                }
+                .fuse();
+                let receive = async {
+                    loop {
+                        let (data, _) = socket.receive().await.ok()?;
+                        if GENERATION.load(Ordering::Acquire) == generation
+                            && let Some(frame) = request.reply(&data)
+                        {
+                            gateway().deliver_udp_reply(id, frame);
+                        }
+                    }
+                }
+                .fuse();
+                futures::pin_mut!(forward, receive);
                 futures::select! {
-                    received = receive => request.reply(&received.ok()?.0),
-                    () = timeout => None,
+                    result = forward => result,
+                    result = receive => result,
                 }
             },
             registration,
         )
         .await;
-        if GENERATION.load(Ordering::Acquire) == generation
-            && let Ok(Some(frame)) = reply
-        {
-            let _ = gateway().enqueue(frame);
-        }
         gateway().finish_udp_flow(generation, id);
     });
 }
@@ -1554,10 +1621,6 @@ impl Guest for Network {
         let config = config(value)?;
         gateway().configure(config);
         Ok(())
-    }
-    #[allow(clippy::unused_async_trait_impl)]
-    async fn receive(frame: Vec<u8>) -> Result<(), Error> {
-        queue_frame(frame)
     }
     async fn run() -> Result<(), Error> {
         let published_ports = {
@@ -1628,17 +1691,6 @@ impl Guest for Network {
         }
         Ok(())
     }
-    fn take_frames(max_items: u32, max_bytes: u32) -> Vec<Vec<u8>> {
-        gateway().take_frames(max_items as usize, max_bytes as usize)
-    }
-    fn reset() {
-        GENERATION.fetch_add(1, Ordering::Relaxed);
-        WORK.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
-        TICK.store(false, Ordering::Release);
-        *gateway() = Gateway::new();
-    }
 }
 
 pub(crate) fn receive_frame(frame: Vec<u8>) -> Result<(), Error> {
@@ -1681,7 +1733,7 @@ pub(crate) fn receive_frame(frame: Vec<u8>) -> Result<(), Error> {
     for (query, meta) in queries {
         start_dns(query, meta)?;
     }
-    if let Some(flow) = udp_flow {
+    if let Some(Some(flow)) = udp_flow {
         start_udp_flow(flow);
     }
     Ok(())
@@ -2653,6 +2705,53 @@ mod tests {
     }
 
     #[test]
+    fn published_backpressure_preserves_the_entire_unsent_batch() {
+        let mut gateway = gateway();
+        assert!(
+            gateway
+                .published
+                .accept(
+                    7,
+                    Ipv4Addr::new(100, 96, 0, 2),
+                    8080,
+                    Ipv4Addr::new(100, 96, 0, 1),
+                    gateway.interface.as_mut().expect("interface"),
+                    &mut gateway.sockets,
+                )
+                .is_ok()
+        );
+        for data in [b"ef", b"cd", b"ab"] {
+            assert!(gateway.published.restore_upstream(7, data.to_vec()).is_ok());
+        }
+        let (mut outgoing, mut incoming) = channel(1);
+        outgoing.try_send(b"first".to_vec()).unwrap();
+        outgoing.try_send(b"second".to_vec()).unwrap();
+        let (abort, _) = AbortHandle::new_pair();
+        gateway.published_flows.push(PublishedFlow {
+            id: 7,
+            outgoing,
+            abort,
+        });
+
+        gateway.pump(None).unwrap();
+        gateway.pump(None).unwrap();
+        assert_eq!(
+            incoming.next().now_or_never(),
+            Some(Some(b"first".to_vec()))
+        );
+        gateway.pump(None).unwrap();
+        assert_eq!(
+            incoming.next().now_or_never(),
+            Some(Some(b"second".to_vec()))
+        );
+        assert_eq!(incoming.next().now_or_never(), Some(Some(b"ab".to_vec())));
+        gateway.pump(None).unwrap();
+        assert_eq!(incoming.next().now_or_never(), Some(Some(b"cd".to_vec())));
+        assert_eq!(incoming.next().now_or_never(), Some(Some(b"ef".to_vec())));
+        assert_eq!(incoming.next().now_or_never(), None);
+    }
+
+    #[test]
     fn published_accept_emits_a_guest_syn() {
         let mut gateway = gateway();
         gateway.pump(Some(arp_request())).expect("guest ARP");
@@ -2857,20 +2956,83 @@ mod tests {
             destination_port: 443,
             data: Vec::new(),
         };
-        let generation = GENERATION.load(Ordering::Acquire);
-        let first = gateway.add_udp_flow(request.clone()).unwrap().id;
-        for _ in 1..gateway.flow_capacity() {
-            gateway.add_udp_flow(request.clone()).unwrap();
+        let first = gateway.add_udp_flow(request.clone()).unwrap().unwrap().id;
+        for offset in 1..gateway.flow_capacity() {
+            let mut request = request.clone();
+            request.source_port += u16::try_from(offset).unwrap();
+            gateway.add_udp_flow(request).unwrap();
+        }
+        let mut extra = request.clone();
+        extra.source_port = 50000;
+        assert!(matches!(
+            gateway.add_udp_flow(extra),
+            Err(Error::Backpressure)
+        ));
+
+        gateway.finish_udp_flow(GENERATION.load(Ordering::Acquire), first);
+
+        gateway
+            .add_udp_flow(request)
+            .expect("finished UDP flow frees a slot");
+    }
+
+    #[test]
+    fn udp_mapping_reuses_one_flow_and_receives_until_idle_expiry() {
+        let mut gateway = gateway();
+        gateway.config.as_mut().unwrap().flow_capacity = 1;
+        let request = udp_request(&udp6()).unwrap();
+        let mut flow = gateway.add_udp_flow(request.clone()).unwrap().unwrap();
+        let first = futures::executor::block_on(flow.outgoing.next()).unwrap();
+        assert_eq!(first, request.data);
+        let old_activity = monotonic_now().saturating_sub(1);
+        gateway.udp_flows[0].last_activity = old_activity;
+        assert!(gateway.add_udp_flow(request.clone()).unwrap().is_none());
+        assert_eq!(gateway.udp_flows.len(), 1);
+        assert_eq!(gateway.udp_flows[0].id, flow.id);
+        assert!(
+            gateway
+                .protocol_delay()
+                .is_some_and(|delay| delay <= UDP_IDLE_TIMEOUT)
+        );
+        assert!(gateway.udp_flows[0].last_activity >= old_activity);
+        assert_eq!(
+            futures::executor::block_on(flow.outgoing.next()).unwrap(),
+            first
+        );
+        for _ in 0..2 {
+            assert!(gateway.add_udp_flow(request.clone()).unwrap().is_none());
         }
         assert!(matches!(
             gateway.add_udp_flow(request.clone()),
             Err(Error::Backpressure)
         ));
 
-        gateway.finish_udp_flow(generation, first);
-
-        gateway
-            .add_udp_flow(request)
-            .expect("finished UDP flow frees a slot");
+        for data in [b"first reply".as_slice(), b"second reply".as_slice()] {
+            gateway.deliver_udp_reply(flow.id, request.reply(data).unwrap());
+        }
+        let replies = gateway.take_frames(2, MAX_QUEUED_BYTES);
+        assert_eq!(replies.len(), 2);
+        for (reply, data) in replies
+            .iter()
+            .zip([b"first reply".as_slice(), b"second reply".as_slice()])
+        {
+            let ethernet = EthernetFrame::new_checked(reply).unwrap();
+            let ip = Ipv6Packet::new_checked(ethernet.payload()).unwrap();
+            let udp = UdpPacket::new_checked(ip.payload()).unwrap();
+            assert_eq!(udp.payload(), data);
+        }
+        let last_activity = gateway.udp_flows[0].last_activity;
+        gateway.reap_idle_udp_flows(last_activity + UDP_IDLE_TIMEOUT - 1);
+        assert_eq!(gateway.udp_flows.len(), 1);
+        gateway.reap_idle_udp_flows(last_activity + UDP_IDLE_TIMEOUT);
+        assert!(gateway.udp_flows.is_empty());
+        assert!(
+            futures::executor::block_on(Abortable::new(
+                futures::future::pending::<()>(),
+                flow.registration,
+            ))
+            .is_err()
+        );
+        assert!(gateway.add_udp_flow(request).unwrap().is_some());
     }
 }

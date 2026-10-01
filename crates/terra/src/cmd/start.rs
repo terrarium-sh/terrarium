@@ -44,8 +44,8 @@ fn build_start_plan(bx: &BoxRef, args: &BootArgs, is_at_a_terminal: bool) -> Res
     }
     if args.foreground {
         anyhow::bail!(
-            "{bx} is already running, so there is no VM to run in this process - \
-             `terra {name} stop` first to run it here, or leave --foreground off \
+            "{bx} is already running, so there is no VM to start in the foreground - \
+             `terra {name} stop` first to start it, or leave --foreground off \
              to attach to the one that is up",
             name = bx.get_name()
         );
@@ -71,7 +71,7 @@ fn choose_boot_mode(args: &BootArgs, is_at_a_terminal: bool) -> Result<BootMode>
     }
     anyhow::bail!(
         "no terminal to join - say which way to run the box: `-d` boots it in \
-         the background, `--foreground` runs the VM in this process (for a \
+         the background, `--foreground` owns the VM in the foreground (for a \
          service manager)"
     )
 }
@@ -120,6 +120,7 @@ pub async fn run(
     let project_dir = approved.bx.get_project_dir().to_path_buf();
     let spec = boot::BootSpec::resolve(approved.cfg.clone(), args, project_dir, mode);
     crate::vm::encode_boot_plan(&spec)?;
+    let launcher = crate::vm::launcher_config::load()?;
     let prepared = setup::prepare_box(&approved, setup::Rebuild::No)?;
 
     if !spec.cfg.hooks.on_create.is_empty()
@@ -130,7 +131,7 @@ pub async fn run(
                 .join(crate::state::BAKE_STAMP)
                 .exists())
     {
-        boot::run_bake(&spec.cfg, &approved.bx, &prepared.lock).await?;
+        boot::run_bake(&spec.cfg, &approved.bx, &prepared.lock, &launcher).await?;
     }
     boot::start(
         &spec,
@@ -138,6 +139,7 @@ pub async fn run(
         mode,
         prepared.lock,
         args.agent.agent_timeout,
+        &launcher,
     )
     .await
 }
@@ -312,7 +314,7 @@ mod tests {
         // one it was dropped and the session attached instead.
         for is_at_a_terminal in [false, true] {
             let err = refused(&["--foreground"], is_at_a_terminal);
-            assert!(err.contains("no VM to run in this process"), "{err}");
+            assert!(err.contains("no VM to start in the foreground"), "{err}");
             assert!(err.contains("terra dev stop"), "the way to do it: {err}");
         }
 

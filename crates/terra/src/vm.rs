@@ -1,6 +1,10 @@
 //! Configuring the component VMM and the boot plan it sends to the guest.
 
 pub mod boot;
+#[cfg(target_os = "linux")]
+mod bwrap;
+#[cfg(target_os = "linux")]
+pub(crate) use bwrap::embedded_command as embedded_bwrap_command;
 #[cfg(any(
     all(
         target_os = "linux",
@@ -10,6 +14,12 @@ pub mod boot;
     target_os = "windows"
 ))]
 mod component;
+#[cfg(target_os = "linux")]
+mod fallback_policy;
+mod launcher;
+pub(crate) mod launcher_config;
+#[cfg(target_os = "linux")]
+mod launcher_policy;
 #[cfg(any(
     all(
         target_os = "linux",
@@ -240,6 +250,7 @@ mod tests {
             root: false,
             mode: PlanMode::Run,
             foreground: false,
+            builtin_bwrap: false,
         };
         let mut spec = spec;
         spec.cfg.mounts = vec![config::Mount {
@@ -279,6 +290,7 @@ mod tests {
             root: false,
             mode: PlanMode::Create,
             foreground: false,
+            builtin_bwrap: false,
         };
         assert!(build_plan(&spec).unwrap().await_initial_session);
     }
@@ -295,6 +307,7 @@ mod tests {
             root,
             mode,
             foreground: false,
+            builtin_bwrap: false,
         };
         let plan = |root, mode| build_plan(&spec(root, mode)).unwrap().root;
 

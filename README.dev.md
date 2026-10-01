@@ -20,10 +20,13 @@ make dist
 ```
 
 `make dist` produces `dist/terra` with embedded guest images and trusted,
-precompiled Wasmtime components, plus license notices. Linux releases target
-static musl; ordinary Cargo commands use the native host target. Production
-loads embedded AOT components without a Wasm compiler. Run image-building Make
-targets sequentially in a shared checkout.
+precompiled Wasmtime components and, on Linux, Bubblewrap, plus license notices.
+Linux releases target static musl; ordinary Cargo commands use the native host
+target. Production loads embedded AOT components without a Wasm compiler. Run
+image-building Make targets sequentially in a shared checkout.
+The default Linux launcher can boot with its built-in minimal seccomp policy.
+To use the generated syscall and ioctl allowlist, generate a policy for the
+exact `dist/terra`; see [policy generation](#verification).
 
 The guest is Alpine Linux on the host's CPU architecture. Guest images are
 built on Linux; macOS and Windows builds consume those images and compile AOT
@@ -165,8 +168,65 @@ checks formatting, WIT links, tool pins, and build scripts without guest images;
 Rust/component tests run in the host jobs against the staged guest assets.
 Build runs on pull requests and `main`; `v*` tags trigger releases for every
 platform. Release reuses the Build workflow, adds source archives, then publishes
-only after every build and check passes. Security audits run on dependency changes and weekly. Kernel changes
+after required build and check jobs pass. Security audits run on dependency changes and weekly. Kernel changes
 run tooling checks; kernel archive export is available through manual dispatch.
+
+Linux policy jobs separately consume the exact x86-64 and AArch64 distribution
+artifacts. With native `/dev/kvm`, they trace VM workloads, compile a seccomp
+policy, rerun the workloads under Bubblewrap enforcement, and upload a policy
+set only after the complete set passes validation against that executable. The
+enforced gate also runs a native containment probe that checks denied host
+filesystem writes, shared host-loopback reachability, and seccomp inheritance.
+It is excluded from syscall collection because its static fixture and restrictive test filter are not the
+release VM process.
+Unavailable KVM or a failed policy job is reported in normal Build CI without
+blocking its other jobs. Releases require the default Bubblewrap launcher and
+built-in policy to boot successfully on both Linux architectures; a missing or
+failed native gate blocks publication. Generated-policy enforcement remains
+optional. Set `LINUX_X64_VM_RUNNER` and `LINUX_ARM64_VM_RUNNER`
+repository variables to KVM-capable runner labels when the default runners
+cannot provide `/dev/kvm`. A release verifies each available policy against its
+exact binary before publishing an optional `terra-seccomp-<target>.tar.gz`
+archive with the readable policy, raw BPF, and validation manifest. `SHA256SUMS`
+covers these archives. Policies are installed manually; Terra does not download
+or automatically select release policies. Missing policies use the built-in
+minimal policy; invalid generated artifacts stop policy publication.
+Regenerate policies after changing the executable, including changes to network
+operations inside the jail; generated filters must cover those socket syscalls.
+
+On a native Linux host with working KVM, `strace`, and libseccomp,
+generate a policy from an existing exact executable without rebuilding it:
+
+```sh
+make guest-assets stage_seccomp_harnesses  # source and test harnesses for this release tag
+make TERRA_BIN=/absolute/path/to/terra \
+  SECCOMP_HARNESS_DIR="$PWD/build/seccomp-harnesses/$(uname -m)-unknown-linux-musl" \
+  generate_seccomp
+python3 scripts/verify-seccomp-artifact.py \
+  build/seccomp/$(uname -m)-unknown-linux-musl /absolute/path/to/terra \
+  $(uname -m)-unknown-linux-musl
+mkdir -p ~/.terra/config
+cp -L build/seccomp/$(uname -m)-unknown-linux-musl/terra.seccomp.bpf \
+  ~/.terra/config/seccomp.bpf
+```
+
+The output path is an atomic symlink to the latest validated set. Traces and
+failure details remain under `build/seccomp-traces/`. The workload inventory
+records tracing exclusions explicitly: the native jail probe and file-event
+overflow recovery still run under enforcement. Node reload supplies traced
+file-event coverage; ptrace overhead distorts the overflow recovery test.
+The manual
+[Backfill Linux policy](.github/workflows/policy-backfill.yml) workflow downloads
+and verifies an existing release's exact binary, runs the same enforced
+validation on native x86-64 and AArch64 runners, and attaches successful policy
+sets to supported historical releases. Both native architectures must pass;
+unavailable KVM, missing release-tag policy tooling, or a binary without embedded
+Bubblewrap fails the workflow before publication. Tags predating the policy
+generator and harness-staging targets cannot be backfilled. Preflight also requires
+the release tag's workload inventory to match the workflow revision's inventory.
+The workflow uses its own revision's verifier when publishing and updates the release's `SHA256SUMS`
+after upload. A retry validates any existing policy archive against the release
+binary and hashes that archive's bytes to repair a missing checksum.
 
 Two weekly workflows open pin-update PRs: `Guest pins bump` checks same-series
 kernel LTS patches, stable e2fsprogs releases, and Alpine releases with doas and

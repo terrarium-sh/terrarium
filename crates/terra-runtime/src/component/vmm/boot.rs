@@ -237,7 +237,7 @@ mod tests {
                 r#"
                 (component
                     (type $entry (record (field "entry" u64) (field "boot-argument" u64)))
-                    (type $error (enum "invalid-ram" "invalid-vcpus" "invalid-device" "command-line-too-long" "invalid-kernel" "kernel-architecture" "kernel-layout" "kernel-too-large" "boot-data-too-large" "unavailable" "bounds"))
+                    (type $error (enum "invalid-ram" "invalid-vcpus" "invalid-device" "command-line-too-long" "invalid-kernel" "kernel-architecture" "kernel-layout" "kernel-too-large" "boot-data-too-large" "bounds"))
                     (type $stage-type (func (param "kernel-command-line" string) (result (result $entry (error $error)))))
                     (core module $module
                         (memory (export "memory") 1)

@@ -12,43 +12,113 @@ use std::{
     future::Future,
     io::{self, Read as _, Write as _},
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     task::{Context, Poll},
     time::Duration,
 };
 use terra_runtime::component::mmio::{Operation, Reply as MmioReply, Request};
 use terra_runtime::component::vsock::{VsockDeviceHost, VsockEvent, vsock_component_linker};
 use terra_runtime::engine::device_engine;
+use terra_runtime::memory::{BoundedMemory, GuestRam};
 use terra_runtime::test_support::{StandaloneHost, device_store};
-use terra_vsock_device::VsockHeader;
+use terra_vsock_device::{VSOCK_HEADER_BYTES, VsockHeader};
 use wasmtime::StoreContextMut;
 use wasmtime::component::{
-    Accessor, Component, ComponentType, Lift, Source, StreamConsumer, StreamReader, StreamResult,
-    TypedFunc,
+    Component, Destination, Source, StreamConsumer, StreamProducer, StreamReader, StreamResult,
+    TypedFunc, VecBuffer,
 };
 
 const CARRIER_SOURCE: u32 = 6003;
 const CARRIER_PORT: u32 = terra_protocol::mux::MUX_VSOCK_PORT;
 const PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
+const QUEUE_SIZE: u16 = 16;
+const RX_DESC: u64 = 0x1000;
+const RX_AVAIL: u64 = 0x2000;
+const RX_USED: u64 = 0x3000;
+const RX_DATA: u64 = 0x4000;
+const TX_DESC: u64 = 0x1_5000;
+const TX_AVAIL: u64 = 0x1_6000;
+const TX_USED: u64 = 0x1_7000;
+const TX_HEADER: u64 = 0x1_8000;
+const TX_DATA: u64 = 0x1_9000;
+const RX_PACKET_BYTES: u32 = 4096;
 
-#[derive(ComponentType, Lift)]
-#[component(record)]
-struct Reply {
-    header: Vec<u8>,
-    payload: Vec<u8>,
-}
-
-type Replies = TypedFunc<(u32, u32), (Vec<Reply>,)>;
-type Receive = TypedFunc<(Vec<u8>,), (Result<(), terra_runtime::component::vsock::VsockError>,)>;
 type Serve = TypedFunc<(StreamReader<Request>,), (StreamReader<MmioReply>,)>;
 
 struct Worker {
     run: TypedFunc<(), (Result<(), terra_runtime::component::vsock::VsockError>,)>,
     close: TypedFunc<(), ()>,
-    reset: TypedFunc<(), ()>,
-    replies: Replies,
-    receive: Receive,
+    mmio: Mmio,
+    ram: GuestRam,
     events: Arc<Mutex<Vec<VsockEvent>>>,
+}
+
+struct Mmio {
+    requests: mpsc::UnboundedSender<Request>,
+    replies: Arc<Mutex<Vec<MmioReply>>>,
+    sequence: AtomicU64,
+    is_reset: AtomicBool,
+}
+
+impl Mmio {
+    async fn write(&self, offset: u64, value: u32) {
+        if offset == 0x70 && value == 0 {
+            self.is_reset.store(true, Ordering::Release);
+        }
+        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
+        self.requests
+            .unbounded_send(Request {
+                sequence,
+                operation: Operation::Write,
+                offset,
+                width: 4,
+                value: u64::from(value),
+            })
+            .expect("MMIO request");
+        loop {
+            let reply = {
+                let mut replies = self.replies.lock().expect("reply sink lock");
+                replies
+                    .iter()
+                    .position(|reply| reply.sequence == sequence)
+                    .map(|index| replies.remove(index))
+            };
+            if let Some(reply) = reply {
+                assert_eq!(reply.error, 0, "MMIO write at {offset:#x}");
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+}
+
+struct RequestSource(mpsc::UnboundedReceiver<Request>);
+
+impl StreamProducer<StandaloneHost<VsockDeviceHost>> for RequestSource {
+    type Item = Request;
+    type Buffer = VecBuffer<Request>;
+
+    fn poll_produce<'a>(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        _: StoreContextMut<'a, StandaloneHost<VsockDeviceHost>>,
+        mut destination: Destination<'a, Self::Item, Self::Buffer>,
+        finish: bool,
+    ) -> Poll<wasmtime::Result<StreamResult>> {
+        if finish {
+            return Poll::Ready(Ok(StreamResult::Cancelled));
+        }
+        match std::task::ready!(Pin::new(&mut self.0).poll_next(context)) {
+            Some(request) => {
+                destination.set_buffer(vec![request].into());
+                Poll::Ready(Ok(StreamResult::Completed))
+            }
+            None => Poll::Ready(Ok(StreamResult::Dropped)),
+        }
+    }
 }
 
 struct ReplySink(Arc<Mutex<Vec<MmioReply>>>);
@@ -99,54 +169,119 @@ impl StreamConsumer<StandaloneHost<VsockDeviceHost>> for EventSink {
     }
 }
 
-async fn drive_transport_ready(
+fn write_memory(ram: &GuestRam, address: u64, bytes: &[u8]) {
+    BoundedMemory::new(ram)
+        .write(address, bytes)
+        .expect("guest memory write");
+}
+
+fn read_memory(ram: &GuestRam, address: u64, len: u64) -> Vec<u8> {
+    BoundedMemory::new(ram)
+        .read(address, len)
+        .expect("guest memory read")
+}
+
+fn read_index(ram: &GuestRam, address: u64) -> u16 {
+    u16::from_le_bytes(
+        read_memory(ram, address + 2, 2)
+            .try_into()
+            .expect("ring index"),
+    )
+}
+
+fn descriptor(address: u64, len: u32, flags: u16, next: u16) -> [u8; 16] {
+    let mut bytes = [0; 16];
+    bytes[..8].copy_from_slice(&address.to_le_bytes());
+    bytes[8..12].copy_from_slice(&len.to_le_bytes());
+    bytes[12..14].copy_from_slice(&flags.to_le_bytes());
+    bytes[14..].copy_from_slice(&next.to_le_bytes());
+    bytes
+}
+
+async fn configure_transport(mmio: &Mmio, ram: &GuestRam) {
+    for index in 0..QUEUE_SIZE {
+        write_memory(
+            ram,
+            RX_DESC + u64::from(index) * 16,
+            &descriptor(
+                RX_DATA + u64::from(index) * u64::from(RX_PACKET_BYTES),
+                RX_PACKET_BYTES,
+                2,
+                0,
+            ),
+        );
+        write_memory(
+            ram,
+            RX_AVAIL + 4 + u64::from(index) * 2,
+            &index.to_le_bytes(),
+        );
+    }
+    write_memory(ram, RX_AVAIL + 2, &QUEUE_SIZE.to_le_bytes());
+    for (offset, value) in [(0x70, 1), (0x70, 3), (0x24, 1), (0x20, 1), (0x70, 11)] {
+        mmio.write(offset, value).await;
+    }
+    for (queue, desc, avail, used) in [
+        (0, RX_DESC, RX_AVAIL, RX_USED),
+        (1, TX_DESC, TX_AVAIL, TX_USED),
+    ] {
+        for (offset, value) in [
+            (0x30, queue),
+            (0x38, u32::from(QUEUE_SIZE)),
+            (0x80, u32::try_from(desc).expect("descriptor address")),
+            (0x90, u32::try_from(avail).expect("available address")),
+            (0xa0, u32::try_from(used).expect("used address")),
+            (0x44, 1),
+        ] {
+            mmio.write(offset, value).await;
+        }
+    }
+    mmio.write(0x70, 15).await;
+    mmio.write(0x50, 0).await;
+}
+
+async fn start_mmio(
     store: &mut wasmtime::Store<StandaloneHost<VsockDeviceHost>>,
     serve: Serve,
-) {
-    let requests = StreamReader::new(
-        &mut *store,
-        [1_u8, 3, 11, 15]
-            .into_iter()
-            .map(|status| Request {
-                sequence: u64::from(status),
-                operation: Operation::Write,
-                offset: 0x70,
-                width: 4,
-                value: u64::from(status),
-            })
-            .collect::<Vec<_>>(),
-    )
-    .expect("status stream");
+    ram: &GuestRam,
+) -> Mmio {
+    let (request_sender, request_receiver) = mpsc::unbounded();
+    let requests =
+        StreamReader::new(&mut *store, RequestSource(request_receiver)).expect("MMIO stream");
     let (replies,) = serve
         .call_async(&mut *store, (requests,))
         .await
         .expect("MMIO server starts");
-    let received = Arc::new(Mutex::new(Vec::new()));
+    let received_replies = Arc::new(Mutex::new(Vec::new()));
     replies
-        .pipe(&mut *store, ReplySink(Arc::clone(&received)))
+        .pipe(&mut *store, ReplySink(Arc::clone(&received_replies)))
         .expect("reply stream attaches");
-    tokio::time::timeout(Duration::from_secs(2), async {
-        store
-            .run_concurrent(async |_| {
-                while received.lock().expect("reply sink lock").len() != 4 {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("MMIO server runs");
-    })
+    let mmio = Mmio {
+        requests: request_sender,
+        replies: received_replies,
+        sequence: AtomicU64::new(1),
+        is_reset: AtomicBool::new(false),
+    };
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        store.run_concurrent(async |_| {
+            configure_transport(&mmio, ram).await;
+        }),
+    )
     .await
-    .expect("MMIO status replies");
+    .expect("transport configuration timeout")
+    .expect("transport configured");
+    mmio
 }
 
 async fn create_worker(
     listener: terra_platform::io::local::LocalListener,
 ) -> (wasmtime::Store<StandaloneHost<VsockDeviceHost>>, Worker) {
     let engine = device_engine().expect("engine");
+    let ram = GuestRam::new(256 * 1024).expect("guest memory");
     let mut store = device_store(
         &engine,
         VsockDeviceHost::new(
-            terra_runtime::memory::GuestRam::new(4096).expect("guest memory"),
+            ram.clone(),
             terra_runtime::component::vsock::VsockHostService::new(
                 terra_protocol::encode_frame(&support::artifacts::create_boot_plan())
                     .expect("plan encodes"),
@@ -187,7 +322,7 @@ async fn create_worker(
     let device = component
         .get_export_index(None, "terra:mmio/device@0.1.0")
         .expect("device interface");
-    let serve = instance
+    let serve: Serve = instance
         .get_typed_func(
             &mut store,
             component
@@ -195,7 +330,7 @@ async fn create_worker(
                 .expect("serve"),
         )
         .expect("serve function");
-    drive_transport_ready(&mut store, serve).await;
+    let mmio = start_mmio(&mut store, serve, &ram).await;
     let events = instance
         .get_typed_func::<(), (StreamReader<terra_runtime::component::vsock::VsockEvent>,)>(
             &mut store,
@@ -219,23 +354,13 @@ async fn create_worker(
     let close = instance
         .get_typed_func::<(), ()>(&mut store, export("close"))
         .expect("close");
-    let reset = instance
-        .get_typed_func::<(), ()>(&mut store, export("reset"))
-        .expect("reset");
-    let replies = instance
-        .get_typed_func(&mut store, export("take-replies"))
-        .expect("replies");
-    let receive = instance
-        .get_typed_func(&mut store, export("receive"))
-        .expect("receive");
     (
         store,
         Worker {
             run,
             close,
-            reset,
-            replies,
-            receive,
+            mmio,
+            ram,
             events: received_events,
         },
     )
@@ -347,21 +472,103 @@ impl futures_util::io::AsyncWrite for GuestCarrier {
     }
 }
 
+async fn send_guest_packet(worker: &Worker, available: &mut u16, bytes: &[u8]) -> bool {
+    if worker.mmio.is_reset.load(Ordering::Acquire) {
+        return false;
+    }
+    let (header, payload) = bytes.split_at(VSOCK_HEADER_BYTES);
+    write_memory(&worker.ram, TX_HEADER, header);
+    write_memory(
+        &worker.ram,
+        TX_DESC,
+        &descriptor(
+            TX_HEADER,
+            u32::try_from(VSOCK_HEADER_BYTES).expect("header length"),
+            u16::from(!payload.is_empty()),
+            1,
+        ),
+    );
+    if !payload.is_empty() {
+        write_memory(&worker.ram, TX_DATA, payload);
+        write_memory(
+            &worker.ram,
+            TX_DESC + 16,
+            &descriptor(
+                TX_DATA,
+                u32::try_from(payload.len()).expect("payload length"),
+                0,
+                0,
+            ),
+        );
+    }
+    write_memory(
+        &worker.ram,
+        TX_AVAIL + 4 + u64::from(*available % QUEUE_SIZE) * 2,
+        &0_u16.to_le_bytes(),
+    );
+    *available = available.wrapping_add(1);
+    write_memory(&worker.ram, TX_AVAIL + 2, &available.to_le_bytes());
+    worker.mmio.write(0x50, 1).await;
+    while read_index(&worker.ram, TX_USED) != *available {
+        if worker.mmio.is_reset.load(Ordering::Acquire) {
+            return false;
+        }
+        tokio::task::yield_now().await;
+    }
+    true
+}
+
+async fn read_guest_replies(
+    worker: &Worker,
+    used: &mut u16,
+    available: &mut u16,
+) -> Vec<(VsockHeader, Vec<u8>)> {
+    let mut replies = Vec::new();
+    while *used != read_index(&worker.ram, RX_USED) {
+        let entry = read_memory(
+            &worker.ram,
+            RX_USED + 4 + u64::from(*used % QUEUE_SIZE) * 8,
+            8,
+        );
+        let head = u32::from_le_bytes(entry[..4].try_into().expect("used head"));
+        let len = u32::from_le_bytes(entry[4..].try_into().expect("used length"));
+        assert!(head < u32::from(QUEUE_SIZE));
+        assert!(len <= RX_PACKET_BYTES);
+        let bytes = read_memory(
+            &worker.ram,
+            RX_DATA + u64::from(head) * u64::from(RX_PACKET_BYTES),
+            u64::from(len),
+        );
+        let (header, payload) = VsockHeader::parse(&bytes).expect("reply packet");
+        replies.push((header, payload.to_vec()));
+        write_memory(
+            &worker.ram,
+            RX_AVAIL + 4 + u64::from(*available % QUEUE_SIZE) * 2,
+            &u16::try_from(head).expect("descriptor head").to_le_bytes(),
+        );
+        *available = available.wrapping_add(1);
+        *used = used.wrapping_add(1);
+    }
+    if !replies.is_empty() && !worker.mmio.is_reset.load(Ordering::Acquire) {
+        write_memory(&worker.ram, RX_AVAIL + 2, &available.to_le_bytes());
+        worker.mmio.write(0x50, 0).await;
+    }
+    replies
+}
+
 async fn pump_carrier(
-    accessor: &Accessor<StandaloneHost<VsockDeviceHost>>,
-    receive: Receive,
-    replies: Replies,
+    worker: &Worker,
     source: u32,
     mut outbound_data: mpsc::UnboundedReceiver<Vec<u8>>,
     incoming_data: mpsc::UnboundedSender<io::Result<Vec<u8>>>,
     started: oneshot::Sender<()>,
 ) {
-    receive
-        .call_concurrent(&accessor, (packet(source, 1, 0, &[]),))
-        .await
-        .expect("carrier request call")
-        .0
-        .expect("carrier request accepted");
+    let mut tx_available = 0;
+    let mut rx_used = 0;
+    let mut rx_available = QUEUE_SIZE;
+    if !send_guest_packet(worker, &mut tx_available, &packet(source, 1, 0, &[])).await {
+        return;
+    }
     let mut started = Some(started);
     let mut received = 0_u32;
     let mut sent = 0_u32;
@@ -382,20 +589,21 @@ async fn pump_carrier(
                 .min(usize::try_from(available).expect("credit fits usize"))
                 .min(terra_protocol::mux::MAX_STREAM_FRAME_BYTES);
             let bytes = pending.drain(..count).collect::<Vec<_>>();
-            receive
-                .call_concurrent(&accessor, (packet(source, 5, received, &bytes),))
-                .await
-                .expect("carrier write call")
-                .0
-                .expect("carrier write accepted");
+            if !send_guest_packet(
+                worker,
+                &mut tx_available,
+                &packet(source, 5, received, &bytes),
+            )
+            .await
+            {
+                return;
+            }
             sent = sent.wrapping_add(u32::try_from(count).expect("frame length"));
         }
-        let (batch,) = replies
-            .call_concurrent(&accessor, (16, 32 * 1024))
-            .await
-            .expect("carrier replies");
-        for reply in batch {
-            let (header, _) = VsockHeader::parse(&reply.header).expect("reply header");
+        if worker.mmio.is_reset.load(Ordering::Acquire) {
+            return;
+        }
+        for (header, payload) in read_guest_replies(worker, &mut rx_used, &mut rx_available).await {
             assert_eq!(header.src_port, CARRIER_PORT);
             assert_eq!(header.dst_port, source);
             peer_credit = header.buf_alloc;
@@ -408,9 +616,9 @@ async fn pump_carrier(
                 }
                 5 => {
                     received = received.wrapping_add(header.len);
-                    incoming_data
-                        .unbounded_send(Ok(reply.payload))
-                        .expect("guest remains connected");
+                    if incoming_data.unbounded_send(Ok(payload)).is_err() {
+                        return;
+                    }
                 }
                 3 => {
                     let _ = incoming_data.unbounded_send(Err(io::Error::new(
@@ -423,21 +631,18 @@ async fn pump_carrier(
             }
         }
         if acknowledged != received {
-            receive
-                .call_concurrent(&accessor, (packet(source, 6, received, &[]),))
+            if !send_guest_packet(worker, &mut tx_available, &packet(source, 6, received, &[]))
                 .await
-                .expect("carrier credit update call")
-                .0
-                .expect("carrier credit update accepted");
+            {
+                return;
+            }
             acknowledged = received;
         }
     }
 }
 
 fn guest_carrier(
-    accessor: &Accessor<StandaloneHost<VsockDeviceHost>>,
-    receive: Receive,
-    replies: Replies,
+    worker: &Worker,
     source: u32,
 ) -> (
     GuestCarrier,
@@ -449,9 +654,7 @@ fn guest_carrier(
     let (started_sender, started_receiver) = oneshot::channel();
     let pump = async move {
         pump_carrier(
-            accessor,
-            receive,
-            replies,
+            worker,
             source,
             outbound_receiver,
             incoming_sender,
@@ -482,8 +685,7 @@ async fn client_round_trip_uses_the_shared_carrier() {
     Box::pin(tokio::time::timeout(
         Duration::from_secs(15),
         store.run_concurrent(async |accessor| {
-            let (carrier, started, pump) =
-                guest_carrier(accessor, worker.receive, worker.replies, CARRIER_SOURCE);
+            let (carrier, started, pump) = guest_carrier(&worker, CARRIER_SOURCE);
             let run = worker.run.call_concurrent(accessor, ());
             let guest = Box::pin(async {
                 started.await.expect("carrier handshake");
@@ -580,7 +782,7 @@ async fn client_round_trip_uses_the_shared_carrier() {
                 }
             });
             let close = async {
-                guest.await;
+                tokio::join!(guest, pump);
                 wait_for_lifecycle_events(&worker.events).await;
                 worker
                     .close
@@ -588,7 +790,7 @@ async fn client_round_trip_uses_the_shared_carrier() {
                     .await
                     .expect("close");
             };
-            let ((), (), result) = tokio::join!(close, pump, run);
+            let ((), result) = tokio::join!(close, run);
             result.expect("worker call").0.expect("worker result");
             Ok::<(), wasmtime::Error>(())
         }),
@@ -632,8 +834,7 @@ async fn assert_session_releases_client(end: SessionEnd) {
     tokio::time::timeout(
         Duration::from_secs(5),
         store.run_concurrent(async |accessor| {
-            let (carrier, started, pump) =
-                guest_carrier(accessor, worker.receive, worker.replies, CARRIER_SOURCE);
+            let (carrier, started, pump) = guest_carrier(&worker, CARRIER_SOURCE);
             let run = worker.run.call_concurrent(accessor, ());
             let end_session = async {
                 started.await.expect("carrier handshake");
@@ -655,11 +856,7 @@ async fn assert_session_releases_client(end: SessionEnd) {
                     .expect("carrier remains open")
                     .expect("client stream");
                 match end {
-                    SessionEnd::DeviceReset => worker
-                        .reset
-                        .call_concurrent(accessor, ())
-                        .await
-                        .expect("reset"),
+                    SessionEnd::DeviceReset => worker.mmio.write(0x70, 0).await,
                     SessionEnd::ControlEof => control.close().await.expect("control EOF"),
                     SessionEnd::MalformedLifecycle => control
                         .write_all(&u32::MAX.to_le_bytes())
@@ -668,7 +865,7 @@ async fn assert_session_releases_client(end: SessionEnd) {
                 }
                 (connection, control, diagnostics, guest_client)
             };
-            let close = async {
+            let guest = async {
                 let (mut connection, _control, _diagnostics, _guest_client) = end_session.await;
                 let drive = poll_fn(|context| {
                     let _ = connection.poll_next_inbound(context);
@@ -696,13 +893,16 @@ async fn assert_session_releases_client(end: SessionEnd) {
                     accessor.with(|mut access| access.get().vsock_service_mut().live_clients()),
                     0
                 );
+            };
+            let close = async {
+                tokio::join!(guest, pump);
                 worker
                     .close
                     .call_concurrent(accessor, ())
                     .await
                     .expect("close");
             };
-            let ((), (), result) = tokio::join!(close, pump, run);
+            let ((), result) = tokio::join!(close, run);
             result.expect("worker call").0.expect("worker result");
             Ok::<(), wasmtime::Error>(())
         }),

@@ -2,6 +2,7 @@ use crate::memory::GuestMemory;
 use crate::vm::{
     ArmException, ArmRead, BootState, CpuStart, InterruptControllerConfig, InterruptMode,
     VcpuAction, VcpuExit, VcpuHandler, VcpuOutcome, VmCapabilities, VmConfig, VmHandle,
+    report_vcpu_failure,
 };
 use crate::windows::worker::VcpuGroup;
 use std::sync::Arc;
@@ -69,12 +70,15 @@ impl WindowsVm {
         let mut group = VcpuGroup::new(partition, self.hard_stop);
         let (starts, receivers) = ArmCpuStarts::new(Arc::clone(&group.partition));
         group.secondary = Some(Arc::clone(&starts));
-        for ((id, handler), receiver) in (0_u32..).zip(handlers).zip(receivers) {
+        for ((id, mut handler), receiver) in (0_u32..).zip(handlers).zip(receivers) {
             let partition = Arc::clone(&group.partition);
             let stop = Arc::clone(&group.stop);
             let starts = Arc::clone(&starts);
-            group
-                .spawn(move || arm_run_vcpu(&partition, id, handler, &receiver, &starts, &stop))?;
+            group.spawn(move || {
+                let outcome =
+                    arm_run_vcpu(&partition, id, handler.as_mut(), &receiver, &starts, &stop);
+                report_vcpu_failure(id, handler.as_mut(), outcome)
+            })?;
         }
         Ok(group)
     }
@@ -83,7 +87,7 @@ impl WindowsVm {
 fn arm_run_vcpu(
     partition: &Arc<crate::windows::whp::Partition>,
     vcpu: u32,
-    mut handler: Box<dyn VcpuHandler>,
+    handler: &mut dyn VcpuHandler,
     receiver: &mpsc::Receiver<ArmCpuCommand>,
     starts: &ArmCpuStarts,
     stop: &Arc<AtomicBool>,
@@ -106,22 +110,20 @@ fn arm_run_vcpu(
             {
                 crate::windows::whp::RunExit::MemoryAccess {
                     gpa, pc, syndrome, ..
-                } => {
-                    match arm_mmio(partition, vcpu, handler.as_mut(), starts, gpa, pc, syndrome)? {
-                        ArmRun::Continue => {}
-                        ArmRun::Off => {
-                            starts.powered_off(vcpu);
-                            active = false;
-                            break;
-                        }
-                        ArmRun::Stop => {
-                            stop.store(true, Ordering::Relaxed);
-                            starts.stop();
-                            handler.finished(VcpuOutcome::Shutdown);
-                            return Ok(());
-                        }
+                } => match arm_mmio(partition, vcpu, handler, starts, gpa, pc, syndrome)? {
+                    ArmRun::Continue => {}
+                    ArmRun::Off => {
+                        starts.powered_off(vcpu);
+                        active = false;
+                        break;
                     }
-                }
+                    ArmRun::Stop => {
+                        stop.store(true, Ordering::Relaxed);
+                        starts.stop();
+                        handler.finished(VcpuOutcome::Shutdown);
+                        return Ok(());
+                    }
+                },
                 crate::windows::whp::RunExit::Canceled => {
                     handler.finished(VcpuOutcome::Stopped);
                     return Ok(());

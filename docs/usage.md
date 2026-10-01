@@ -16,6 +16,36 @@ terra dev stop
 `./ci.yaml`; a recipe path names the box from its filename. See
 [the manifest reference](manifest.md) and [the recipe reference](recipe.md).
 
+## Installation options
+
+Use the [quickstart installers](../README.md#quickstart) or
+[build from source](../README.dev.md) with the pinned Rust toolchains.
+See [platform requirements](../packaging/README.md) before installing.
+
+The installer verifies the release checksum and also verifies its GitHub
+attestation when the GitHub CLI is installed. Re-run the installer to upgrade.
+On Linux and macOS, pin a version with `TERRA_VERSION=x.y.z sh install.sh`, or
+use `sh install.sh --prerelease` to include prereleases.
+
+On Windows, `install.ps1` installs `terra.exe` to
+`%LOCALAPPDATA%\Programs\terra` and adds that directory to the user `PATH`.
+Open a new terminal afterwards. The installer accepts `-Prerelease` and honors
+`$env:TERRA_VERSION`.
+
+To verify a downloaded release archive's attestation, use its filename:
+
+```sh
+gh attestation verify terra-x86_64-linux.tar.gz --repo terrarium-sh/terrarium
+```
+
+Linux releases may publish a matching Bubblewrap policy in a separate
+`terra-seccomp-<target>.tar.gz` archive. The installer does not install that
+archive, and Terra does not search beside the executable; install the policy
+at `~/.terra/config/seccomp.bpf` or set `vm.bwrap.policy`. Without a selected
+policy, Terra uses its built-in minimal seccomp policy by default; set
+`vm.bwrap.allow_fallback: false` to require a file. See
+[host VM launchers](vm-launchers.md) for configuration details.
+
 ## List boxes
 
 `terra ls` lists the current project's boxes; `--all` includes boxes stored
@@ -48,6 +78,8 @@ noninteractive setup of a recipe that a guest might have written requires
 starts the recipe's workload unless `-- CMD…` supplies one command for that
 boot. `--root` runs that boot's workload and daemons as guest root. Use `-d` to start
 headless; `--foreground` is for a service manager that owns the VM process.
+On every platform, the VM runs in a separate child process. With `--foreground`,
+the VM terminates when the parent command exits.
 A noninteractive start needs `-d` or `--foreground`.
 
 The workload has one shared session. Press `Ctrl-\` to detach without stopping
@@ -141,6 +173,9 @@ the guest agent and resize helper bundled with the Terra binary. `terra ls` list
 `terra ls --all` lists every local project. `terra <box> storage show` inspects
 the root filesystem and volumes; `export`, `import`, and `prune` manage images.
 Export and import require a stopped box and the same recipe.
+With the built-in Linux Bubblewrap launcher, `host.pid` in that box directory
+holds the host-visible VM PID and start identity for stop and liveness checks.
+Terra's parent writes it, and the jailed VM sees it read-only.
 
 The root filesystem and volumes use discard/TRIM to return freed guest blocks
 to the host automatically. Their configured capacity stays the same; physical

@@ -107,12 +107,11 @@ VM behavior.
 ## Containment and sustained operation
 
 - [ ] **Native resource limits:** define enforceable per-box CPU, native-memory,
-  persistent-disk, bandwidth, and connection limits beyond existing admission,
+  persistent-disk, bandwidth, and connection limits beyond component ceilings,
   fixed disk extents and capped logs. Test exhaustion and peer isolation.
   Clearly distinguish Terra's current component
-  memory/admission limits from deployment-owned hard native and kernel-memory
-  limits. Relevant admission and worker code is
-  [`crates/terra/src/vm/resources.rs`](../crates/terra/src/vm/resources.rs) and
+  memory limits from deployment-owned hard native and kernel-memory
+  limits. Relevant worker code is
   [`crates/terra-runtime/src/box_runtime.rs`](../crates/terra-runtime/src/box_runtime.rs).
   Document the required deployment-owned OS controls for hard worker/process
   and kernel-memory containment.

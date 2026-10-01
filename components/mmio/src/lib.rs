@@ -43,7 +43,6 @@ struct Device {
 #[derive(Default)]
 struct Router {
     devices: Vec<Option<Device>>,
-    started: bool,
 }
 
 static ROUTER: LazyLock<Mutex<Router>> = LazyLock::new(|| Mutex::new(Router::default()));
@@ -62,18 +61,11 @@ fn range_end(base: u64, size: u64) -> Result<u64, Error> {
     base.checked_add(size).ok_or(Error::Overflow)
 }
 
-fn device_range_overlaps(
-    router: &Router,
-    ignored_slot: Option<usize>,
-    base: u64,
-    end: u64,
-) -> bool {
+fn device_range_overlaps(router: &Router, base: u64, end: u64) -> bool {
     router
         .devices
         .iter()
-        .enumerate()
-        .filter(|(slot, _)| Some(*slot) != ignored_slot)
-        .filter_map(|(_, device)| device.as_ref())
+        .filter_map(Option::as_ref)
         .any(|device| {
             device
                 .base
@@ -207,11 +199,7 @@ async fn route_access(
     value: u64,
     write: bool,
 ) -> Result<RoutedReply, Error> {
-    let (slot, offset) = {
-        let mut router = router();
-        router.started = true;
-        device_for_address(&router, address, width)?
-    };
+    let (slot, offset) = device_for_address(&router(), address, width)?;
     let reply = dispatch(
         slot,
         scheduler::Class::Data,
@@ -241,7 +229,7 @@ fn open_device(slot: u32, base: u64, size: u64) -> Result<StreamReader<Request>,
     if router.devices.len() <= slot {
         router.devices.resize_with(slot + 1, || None);
     }
-    if router.devices[slot].is_some() || device_range_overlaps(&router, None, base, end) {
+    if router.devices[slot].is_some() || device_range_overlaps(&router, base, end) {
         return Err(Error::Overlap);
     }
     let (writer, reader) = wit_stream::new();
@@ -289,27 +277,6 @@ impl Guest for Dispatcher {
     async fn attach_replies(slot: u32, replies: StreamReader<Reply>) -> Result<(), Error> {
         attach_replies(slot, replies).await
     }
-    fn remap_device(slot: u32, base: u64, size: u64) -> Result<(), Error> {
-        let slot = usize::try_from(slot).map_err(|_| Error::InvalidSlot)?;
-        if size == 0 {
-            return Err(Error::InvalidSlot);
-        }
-        let end = range_end(base, size)?;
-        let mut router = router();
-        if router.devices.get(slot).and_then(Option::as_ref).is_none() {
-            return Err(Error::InvalidSlot);
-        }
-        if router.started {
-            return Err(Error::Busy);
-        }
-        if device_range_overlaps(&router, Some(slot), base, end) {
-            return Err(Error::Overlap);
-        }
-        let device = router.devices[slot].as_mut().ok_or(Error::InvalidSlot)?;
-        device.base = base;
-        device.size = size;
-        Ok(())
-    }
     async fn access(
         address: u64,
         width: u8,
@@ -320,7 +287,6 @@ impl Guest for Dispatcher {
     }
     async fn control(slot: u32, operation: Operation) -> Result<ControlReply, Error> {
         let slot = usize::try_from(slot).map_err(|_| Error::InvalidSlot)?;
-        router().started = true;
         if !matches!(
             operation,
             Operation::Reset | Operation::Close | Operation::InterruptLevel
@@ -353,7 +319,6 @@ mod tests {
     fn routing_rejects_invalid_width_and_outside_ranges() {
         let router = Router {
             devices: vec![Some(device(0x1000, 0x200))],
-            started: false,
         };
         assert_eq!(device_for_address(&router, 0x1000, 3), Err(Error::BadWidth));
         assert_eq!(device_for_address(&router, 0x1200, 1), Err(Error::Unmapped));
@@ -364,7 +329,6 @@ mod tests {
     fn routing_skips_devices_above_the_address() {
         let router = Router {
             devices: vec![Some(device(0x2000, 0x200)), Some(device(0x1000, 0x200))],
-            started: false,
         };
         assert_eq!(device_for_address(&router, 0x800, 4), Err(Error::Unmapped));
         assert_eq!(device_for_address(&router, 0x1008, 4), Ok((1, 8)));
@@ -384,13 +348,12 @@ mod tests {
     }
 
     #[test]
-    fn remapping_rejects_overlap_and_overflow() {
+    fn device_ranges_reject_overlap_and_overflow() {
         let router = Router {
             devices: vec![Some(device(0x1000, 0x200)), Some(device(0x2000, 0x200))],
-            started: false,
         };
-        assert!(device_range_overlaps(&router, Some(0), 0x1f00, 0x2100));
-        assert!(!device_range_overlaps(&router, Some(0), 0x1000, 0x1200));
+        assert!(device_range_overlaps(&router, 0x1f00, 0x2100));
+        assert!(!device_range_overlaps(&router, 0x1200, 0x2000));
         assert_eq!(range_end(u64::MAX, 1), Err(Error::Overflow));
     }
 }

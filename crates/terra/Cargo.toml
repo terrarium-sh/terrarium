@@ -38,17 +38,20 @@ rustix.workspace = true
 tempfile.workspace = true
 sha2 = { version = "0.11", default-features = false }
 tracing-appender = "0.2"
-sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 log = "0.4.34"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "registry", "tracing-log", "std"] }
 
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_Pipes", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Threading"] }
 
 [dev-dependencies]
+sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 notify = "8.2"
 clap_mangen = "0.3"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+linux-raw-sys.workspace = true
 
 [lints]
 workspace = true

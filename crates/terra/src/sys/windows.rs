@@ -20,8 +20,9 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
 use windows_sys::Win32::System::Threading::{
-    CREATE_NEW_PROCESS_GROUP, GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, OpenProcess,
-    OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, TerminateProcess,
+    CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, GetCurrentProcess, GetExitCodeProcess,
+    GetProcessTimes, OpenProcess, OpenProcessToken, OpenThread, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_TERMINATE, ResumeThread, THREAD_SUSPEND_RESUME, TerminateProcess,
 };
 
 pub const MAX_SOCK_PATH: usize = 108;
@@ -238,23 +239,105 @@ pub fn detach(command: &mut Command) {
     command.creation_flags(CREATE_NEW_PROCESS_GROUP);
 }
 
+pub struct VmChildGuard(OwnedHandle);
+
+pub fn supervise_vm_child(command: &mut Command, foreground: bool) -> Result<Option<VmChildGuard>> {
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::System::JobObjects::{
+        CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectExtendedLimitInformation, SetInformationJobObject,
+    };
+    if !foreground {
+        detach(command);
+        return Ok(None);
+    }
+    use std::os::windows::process::CommandExt;
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED);
+    // SAFETY: null means no security attributes or name; OwnedHandle closes the returned job.
+    let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if raw.is_null() {
+        return Err(Error::last_os_error());
+    }
+    // SAFETY: CreateJobObjectW returned this live, owned job handle.
+    let job = unsafe { OwnedHandle::from_raw_handle(raw) };
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    // SAFETY: job is live and the extended limit structure has the reported size.
+    win_ok(unsafe {
+        SetInformationJobObject(
+            job.as_raw_handle(),
+            JobObjectExtendedLimitInformation,
+            (&raw const limits).cast(),
+            u32::try_from(std::mem::size_of_val(&limits)).map_err(Error::other)?,
+        )
+    })?;
+    Ok(Some(VmChildGuard(job)))
+}
+
+pub fn attach_vm_child(guard: &VmChildGuard, child: &std::process::Child) -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    };
+    use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+    // SAFETY: both handles remain live through the assignment.
+    win_ok(unsafe { AssignProcessToJobObject(guard.0.as_raw_handle(), child.as_raw_handle()) })?;
+    // SAFETY: the system returns an owned snapshot or INVALID_HANDLE_VALUE.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(Error::last_os_error());
+    }
+    // SAFETY: CreateToolhelp32Snapshot returned this owned snapshot handle.
+    let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot) };
+    let mut entry = THREADENTRY32 {
+        dwSize: u32::try_from(std::mem::size_of::<THREADENTRY32>()).map_err(Error::other)?,
+        ..THREADENTRY32::default()
+    };
+    // SAFETY: snapshot remains live and entry has the required size.
+    let mut found = unsafe { Thread32First(snapshot.as_raw_handle(), &raw mut entry) } != 0;
+    while found {
+        if entry.th32OwnerProcessID == child.id() {
+            // SAFETY: the thread ID comes from the live system snapshot; null reports a failed open.
+            let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
+            if thread.is_null() {
+                return Err(Error::last_os_error());
+            }
+            // SAFETY: OpenThread returned this owned thread handle.
+            let thread = unsafe { OwnedHandle::from_raw_handle(thread) };
+            // SAFETY: the new process was created suspended, and this thread belongs to it.
+            if unsafe { ResumeThread(thread.as_raw_handle()) } == u32::MAX {
+                return Err(Error::last_os_error());
+            }
+            return Ok(());
+        }
+        // SAFETY: snapshot remains live and entry remains writable for each iteration.
+        found = unsafe { Thread32Next(snapshot.as_raw_handle(), &raw mut entry) } != 0;
+    }
+    Err(Error::other("created VM process has no initial thread"))
+}
+
+pub fn kill_vm_child(child: &mut std::process::Child) -> Result<()> {
+    child.kill()
+}
+
 pub fn pass_lock(command: &mut Command, lock: &File) -> Result<File> {
     use std::os::windows::io::AsRawHandle;
-    let inherited_lock = lock.try_clone()?;
-    let handle = inherited_lock.as_raw_handle();
+    let inherited = lock.try_clone()?;
+    let handle = inherited.as_raw_handle();
     // SAFETY: the `File` keeps this handle valid until CreateProcess duplicates it into the child.
-    let inherited = unsafe {
+    let ok = unsafe {
         windows_sys::Win32::Foundation::SetHandleInformation(
             handle,
             HANDLE_FLAG_INHERIT,
             HANDLE_FLAG_INHERIT,
         )
     };
-    if inherited == 0 {
+    if ok == 0 {
         return Err(Error::last_os_error());
     }
     command.env(LOCK_HANDLE_ENV, format!("{handle:p}"));
-    Ok(inherited_lock)
+    Ok(inherited)
 }
 
 pub fn claim_inherited_lock(expected: &Path) -> Option<File> {

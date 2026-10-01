@@ -31,18 +31,6 @@ interface device-api {
     use terra:mmio/types@0.1.0.{device-error};
     configure: async func(readonly: bool) -> result<_, device-error>;
     run: async func() -> result<_, device-error>;
-    /// Execute a pre-parsed request for focused component tests.
-    record range {
-        addr: u64,
-        len: u64,
-    }
-    execute: async func(req-type: u32, sector: u64, data: list<range>, status-addr: u64, epoch: u64) -> u8;
-    record completion {
-        status-addr: u64,
-        used-len: u32,
-        status: u8,
-    }
-    execute-chain: async func(head: u16, desc-table: u64, queue-size: u16, epoch: u64) -> result<completion, device-error>;
 }
 
 interface disk {
@@ -60,11 +48,6 @@ interface disk {
     enum disk-error { out-of-range, readonly, io, too-large, busy }
 }
 
-world device {
-    import memory;
-    import interrupt;
-}
-
 world host-interfaces {
     import memory;
     import interrupt;
@@ -74,7 +57,6 @@ world host-interfaces {
 world block-device {
     import memory;
     import interrupt;
-    import diagnostics;
     import disk;
     export device-api;
     export terra:mmio/device@0.1.0;

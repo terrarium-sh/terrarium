@@ -9,7 +9,7 @@ use super::super::{STOP_DEADLINE, VcpuCommand, VcpuHandle, spawn_configured_vcpu
 use super::machine::Machine;
 use crate::vm::{
     BootState, InterruptControllerConfig, InterruptMode, VcpuAction, VcpuExit as NativeExit,
-    VcpuHandler, VcpuOutcome, VmCapabilities, VmConfig, VmHandle,
+    VcpuHandler, VcpuOutcome, VmCapabilities, VmConfig, VmHandle, report_vcpu_failure,
 };
 use kvm_bindings::{
     KVM_REG_ARM_CORE, KVM_REG_ARM64, KVM_REG_SIZE_U64, KVM_SYSTEM_EVENT_RESET,
@@ -135,10 +135,13 @@ impl VcpuGroup {
                     if stop.load(Ordering::Acquire) {
                         return Ok(VcpuOutcome::Stopped);
                     }
-                    if id == 0 {
-                        configure_boot_vcpu(&vcpu, boot.entry, boot.boot_argument)?;
+                    let outcome = if id == 0 {
+                        configure_boot_vcpu(&vcpu, boot.entry, boot.boot_argument)
+                    } else {
+                        Ok(())
                     }
-                    let outcome = run_vcpu(&mut vcpu, stop, handler.as_mut())?;
+                    .and_then(|()| run_vcpu(&mut vcpu, stop, handler.as_mut()));
+                    let outcome = report_vcpu_failure(id, handler.as_mut(), outcome)?;
                     handler.finished(outcome);
                     Ok(outcome)
                 },

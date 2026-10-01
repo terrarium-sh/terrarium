@@ -1902,6 +1902,7 @@ dependencies = [
  "crossterm",
  "flate2",
  "libc",
+ "linux-raw-sys",
  "log",
  "notify",
  "rustix",

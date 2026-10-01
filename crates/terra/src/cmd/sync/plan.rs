@@ -1,5 +1,6 @@
 use super::exec::{COPY_DATA_TIMEOUT, read_reply, send_request};
 use super::names::HostNames;
+use super::scan::{optional_metadata, scan_host_directory};
 use super::security::{effective_mode, validate_download_links, validate_manifest};
 use crate::sys;
 use anyhow::{Context, Result};
@@ -254,11 +255,36 @@ pub(super) async fn build_plan(
 ) -> Result<Vec<PlanAction>> {
     validate_plan_conflicts(source_entries, target_entries)?;
     if direction == SyncDirection::GuestToHost {
-        let names = HostNames::new(host_target_root, source_entries, target_entries)?;
-        let validation =
-            validate_download_links(source_entries, target_entries, &|parent, component| {
-                names.resolve_component(parent, component)
-            });
+        let standalone_source;
+        let sibling_entries;
+        let (link_root, link_source, link_target) = if let Some(entry) = source_entries
+            .get("")
+            .filter(|entry| entry.kind == SyncEntryKind::Symlink)
+        {
+            let parent = host_target_root
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let name = host_target_root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .context("symlink destination name is not valid UTF-8")?;
+            let mut entry = entry.clone();
+            name.clone_into(&mut entry.relative_path);
+            standalone_source = BTreeMap::from([(name.to_owned(), entry)]);
+            sibling_entries = if optional_metadata(parent)?.is_some() {
+                scan_host_directory(parent)?
+            } else {
+                BTreeMap::new()
+            };
+            (parent, &standalone_source, &sibling_entries)
+        } else {
+            (host_target_root, source_entries, target_entries)
+        };
+        let names = HostNames::new(link_root, link_source, link_target)?;
+        let validation = validate_download_links(link_source, link_target, &|parent, component| {
+            names.resolve_component(parent, component)
+        });
         let cleanup = names.close();
         validation?;
         cleanup?;

@@ -458,6 +458,61 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
+    async fn standalone_download_checks_existing_sibling_link_chains() {
+        let scratch = tempfile::tempdir().unwrap();
+        let destination = scratch.path().join("destination");
+        std::fs::create_dir(&destination).unwrap();
+        std::os::unix::fs::symlink("..", destination.join("outside")).unwrap();
+        let mut args = SyncArgs {
+            src: ":/link".into(),
+            dst: destination.to_str().unwrap().into(),
+            delete: false,
+            checksum: false,
+            dry_run: false,
+            agent: crate::cli::AgentTimeoutArg {
+                agent_timeout: None,
+            },
+        };
+        let Transfer::Download {
+            guest: src,
+            host: dst,
+        } = parse_endpoints(&args.src, &args.dst).unwrap()
+        else {
+            panic!("expected download transfer");
+        };
+        let replies = [
+            SyncReply::SessionReady {
+                root_status: RootStatus::ExistingSymlink,
+            },
+            SyncReply::Entry(entry("", SyncEntryKind::Symlink, Some("outside/secret"))),
+            SyncReply::ScanComplete,
+            SyncReply::Success,
+        ];
+        for dry_run in [true, false] {
+            args.dry_run = dry_run;
+            let error = sync_guest_to_host(&mut peer(&replies), &src, &dst, &args)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("escapes"), "{error:#}");
+            assert!(std::fs::symlink_metadata(destination.join("link")).is_err());
+        }
+        std::fs::remove_file(destination.join("outside")).unwrap();
+        std::fs::create_dir(destination.join("nested")).unwrap();
+        std::fs::create_dir(destination.join("safe")).unwrap();
+        std::os::unix::fs::symlink("nested/alias", destination.join("outside")).unwrap();
+        std::os::unix::fs::symlink("../safe", destination.join("nested/alias")).unwrap();
+        sync_guest_to_host(&mut peer(&replies), &src, &dst, &args)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_link(destination.join("link")).unwrap(),
+            Path::new("outside/secret")
+        );
+        assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 4);
+    }
+
+    #[tokio::test]
     async fn empty_directory_download_creates_root_but_dry_run_does_not() {
         let scratch = tempfile::tempdir().unwrap();
         let destination = scratch.path().join("new");

@@ -268,6 +268,7 @@ pub fn request_recipe_approval(
         root: false,
         mode: terra_protocol::PlanMode::Run,
         foreground: false,
+        builtin_bwrap: false,
     })?;
     Ok(ApprovedRecipe {
         bx,
@@ -523,13 +524,14 @@ pub async fn run(
     } else {
         Rebuild::No
     };
+    let launcher = crate::vm::launcher_config::load()?;
     let prepared = prepare_box(&approved, rebuild)?;
     let ApprovedRecipe { bx, cfg, .. } = approved;
 
     // Ungated: the guest skips a bake its stamp says already ran, so
     // re-running setup stays cheap.
     if !cfg.hooks.on_create.is_empty() {
-        boot::run_bake(&cfg, &bx, &prepared.lock).await?;
+        boot::run_bake(&cfg, &bx, &prepared.lock, &launcher).await?;
     }
     eprintln!("terra: {bx} is ready - `terra {}` boots it", bx.get_name());
     Ok(ExitCode::SUCCESS)

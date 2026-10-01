@@ -34,14 +34,6 @@ impl ComponentMemoryLimits {
         Ok(self)
     }
 
-    pub fn admission_bytes(self) -> wasmtime::Result<usize> {
-        // Include root, temporary boot, and policy stores alongside the admitted workers.
-        self.component_bytes
-            .checked_mul(super::MAX_BOX_COMPONENT_WORKERS + 2)
-            .and_then(|bytes| bytes.checked_add(self.network_bytes().max(self.component_bytes)))
-            .ok_or_else(|| wasmtime::Error::msg("component memory reservation overflow"))
-    }
-
     #[must_use]
     pub fn network_bytes(self) -> usize {
         self.network_override.unwrap_or(self.component_bytes)
@@ -426,40 +418,6 @@ mod tests {
         );
         assert!(
             ResourceLimiter::memory_growing(&mut host, 0, STORE_MEMORY_BYTES * 2, None).unwrap()
-        );
-    }
-
-    #[test]
-    fn admission_accounts_for_all_stores_and_network_overrides() {
-        let limits = ComponentMemoryLimits::default();
-        let baseline = limits.admission_bytes().unwrap();
-        assert_eq!(
-            baseline,
-            (super::super::MAX_BOX_COMPONENT_WORKERS + 3) * STORE_MEMORY_BYTES
-        );
-        assert_eq!(
-            limits
-                .with_network_memory(64 << 20)
-                .unwrap()
-                .admission_bytes()
-                .unwrap(),
-            baseline + (48 << 20)
-        );
-        let raised = ComponentMemoryLimits::new(32 << 20).unwrap();
-        assert_eq!(raised.admission_bytes().unwrap(), baseline * 2);
-        assert_eq!(
-            raised
-                .with_network_memory(16 << 20)
-                .unwrap()
-                .admission_bytes()
-                .unwrap(),
-            baseline * 2
-        );
-        assert!(
-            ComponentMemoryLimits::new(usize::MAX)
-                .unwrap()
-                .admission_bytes()
-                .is_err()
         );
     }
 

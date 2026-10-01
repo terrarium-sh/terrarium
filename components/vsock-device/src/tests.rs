@@ -54,6 +54,35 @@ fn data_flows_through_carrier_and_advances_credit() {
 }
 
 #[test]
+fn partial_carrier_drains_advance_credit_by_consumed_bytes() {
+    let mut switch = VsockSwitch::new();
+    connect(&mut switch, 100);
+    switch.rx(&guest(5, 100, MUX_VSOCK_PORT, 5, 0), b"hello");
+    assert_eq!(switch.take_upstream_up_to(4)[0].data, b"hell");
+    assert_eq!(switch.take_replies()[0].header.fwd_cnt, 4);
+    assert_eq!(switch.take_upstream_up_to(1)[0].data, b"o");
+    assert_eq!(switch.take_replies()[0].header.fwd_cnt, 5);
+}
+
+#[test]
+fn credit_after_backpressure_keeps_the_carrier_usable() {
+    let mut switch = VsockSwitch::new();
+    connect(&mut switch, 100);
+    switch
+        .deliver(100, MUX_VSOCK_PORT, &vec![0; RX_ALLOC as usize])
+        .expect("initial delivery");
+    assert_eq!(
+        switch.deliver(100, MUX_VSOCK_PORT, b"blocked"),
+        Err(VsockError::Backpressure)
+    );
+    switch.rx(&guest(6, 100, MUX_VSOCK_PORT, 0, RX_ALLOC), &[]);
+    switch
+        .deliver(100, MUX_VSOCK_PORT, b"ok")
+        .expect("credit restores delivery");
+    assert!(switch.connection_exists(100, MUX_VSOCK_PORT));
+}
+
+#[test]
 fn guest_half_close_preserves_buffered_data() {
     let mut switch = VsockSwitch::new();
     connect(&mut switch, 100);
@@ -64,7 +93,7 @@ fn guest_half_close_preserves_buffered_data() {
     assert!(switch.guest_send_closed(100, MUX_VSOCK_PORT));
     assert_eq!(switch.take_upstream()[0].data, b"guest");
     switch.shutdown(100, MUX_VSOCK_PORT).expect("closes");
-    assert_eq!(switch.connection_count(), 0);
+    assert!(!switch.connection_exists(100, MUX_VSOCK_PORT));
 }
 
 #[test]
@@ -74,7 +103,7 @@ fn forged_credit_resets_the_carrier() {
     switch.deliver(100, MUX_VSOCK_PORT, b"hello").expect("fits");
     switch.take_replies();
     switch.rx(&guest(6, 100, MUX_VSOCK_PORT, 0, 6), &[]);
-    assert_eq!(switch.connection_count(), 0);
+    assert!(!switch.connection_exists(100, MUX_VSOCK_PORT));
     assert!(
         switch
             .take_replies()
@@ -114,7 +143,7 @@ fn carrier_send_and_receive_bounds_apply_before_growth() {
     let receive = vec![0; MAX_DATA_BYTES as usize];
     switch.rx(&guest(5, 100, MUX_VSOCK_PORT, MAX_DATA_BYTES, 0), &receive);
     switch.rx(&guest(5, 100, MUX_VSOCK_PORT, 1, MAX_DATA_BYTES), b"x");
-    assert_eq!(switch.connection_count(), 0);
+    assert!(!switch.connection_exists(100, MUX_VSOCK_PORT));
 }
 
 #[test]
@@ -153,7 +182,7 @@ fn reset_does_not_allow_a_second_guest_to_hijack_the_carrier() {
     switch.reset_connections();
     switch.rx(&guest(1, 101, MUX_VSOCK_PORT, 0, 0), &[]);
     assert_eq!(switch.take_replies()[0].header.op, 3);
-    assert_eq!(switch.connection_count(), 0);
+    assert!(switch.connections_up_to(1).is_empty());
 }
 
 #[test]

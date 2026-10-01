@@ -29,7 +29,7 @@ component the union of all capabilities.
 | Block | Guest RAM, interrupt, disk capacity/read/write/discard/sync | One fixed-capacity disk grant and its assigned interrupt line; every disk range is checked. |
 | Filesystem | Guest RAM, interrupt, selected filesystem descriptor/preopen methods, `wait-for` | One recipe-selected directory preopen. Descriptor resource methods are registered individually; clock types carry timestamps and do not grant a clock call. |
 | Memory | Guest RAM, interrupt, discard | Reclaims checked ranges of the assigned guest RAM only. |
-| Network | Guest RAM, interrupt, diagnostics, policy-filtered socket/DNS methods, monotonic `now`/`wait-for` | Socket resources are created and used through policy-enforcing hosts. The only diagnostic sink is capped logging. |
+| Network | Guest RAM, interrupt, diagnostics, socket/DNS methods, monotonic `now`/`wait-for` | Policy-enforcing socket hosts run in the VM process, inside the jail with built-in Bubblewrap. The only diagnostic sink is capped logging. |
 | Vsock | Guest RAM, interrupt, supplied local clients and control streams, monotonic/system clocks, `get-random-u64`, WASI CLI interfaces | Local listener/client resources come from the configured box service; randomness seeds the guest service. The standard-library CLI bindings receive an empty environment, closed stdin, and output sinks. No general filesystem or sockets are linked. |
 | Policy | Monotonic `now` | Computes policy and DNS-expiry decisions with no Terra host, guest RAM, filesystem or socket imports. |
 

@@ -168,20 +168,6 @@ impl wasmtime::component::HasData for VsockHost {
 impl terra::vsock::host_service::Host for VsockHostService {}
 
 impl terra::vsock::host_service::HostClient for VsockHostService {
-    fn shutdown_write(
-        &mut self,
-        resource: Resource<terra::vsock::host_service::Client>,
-    ) -> wasmtime::Result<()> {
-        let Some(client) = self.client_mut(&resource) else {
-            return Ok(());
-        };
-        let output = client.output.take();
-        if let Some(mut output) = output {
-            shutdown_write(&mut output);
-        }
-        Ok(())
-    }
-
     fn drop(
         &mut self,
         resource: Resource<terra::vsock::host_service::Client>,

@@ -173,10 +173,6 @@ pub fn block_component_linker<T: WasiView + AsMut<BlockHost> + 'static>(
     let mut linker = wasmtime::component::Linker::new(engine);
     disk::add_to_linker::<T, HasSelf<BlockHost>>(&mut linker, AsMut::as_mut)?;
     add_device_imports(&mut linker, |host: &mut T| host.as_mut().context())?;
-    crate::component::bindings::diagnostics::add_to_linker::<T, HasSelf<DeviceContext>>(
-        &mut linker,
-        |host| &mut host.as_mut().context,
-    )?;
     Ok(linker)
 }
 
@@ -293,15 +289,15 @@ mod tests {
         disk_sync(&mut host).await.expect("disk available again");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn component_completes_host_io_failures_with_ioerr() {
-        use super::{BlockHost, DiskGrant, block_component_linker};
-        use crate::component::block::bindings::Range;
+        use super::{BlockHost, DiskGrant};
+        use crate::component::block::component_tests::fixture_with_host;
         use crate::engine::device_engine;
-        use crate::test_support::device_store;
+        use terra_platform::memory::MemoryRange;
 
         let host = BlockHost::new(
-            crate::memory::GuestRam::new(4096).unwrap(),
+            crate::memory::GuestRam::new(256 * 1024).unwrap(),
             DiskGrant::Mem(BoundedDisk::new(4096, false)),
         );
         let disk = std::sync::Arc::clone(&host.disk);
@@ -316,32 +312,107 @@ mod tests {
         let component =
             wasmtime::component::Component::new(&engine, crate::test_fixtures::wasm::BLOCK)
                 .unwrap();
-        let linker = block_component_linker(&engine).unwrap();
-        let mut store = device_store(&engine, host);
-        let instance = linker
-            .instantiate_async(&mut store, &component)
-            .await
-            .unwrap();
-        let execute = instance
-            .get_typed_func::<(u32, u64, Vec<Range>, u64, u64), (u8,)>(
-                &mut store,
-                "terra:host/device-api.execute@0.1.0"
-                    .parse::<wasmtime::component::wit_parser::ItemName>()
-                    .unwrap(),
-            )
-            .unwrap();
-        for (request_type, data) in [
-            (0, vec![Range { addr: 0, len: 512 }]),
-            (1, vec![Range { addr: 0, len: 512 }]),
+        let mut fixture = fixture_with_host(&engine, host, &component, false).await;
+        for (request_type, ranges) in [
+            (
+                0,
+                vec![MemoryRange {
+                    addr: 0x2000,
+                    len: 512,
+                }],
+            ),
+            (
+                1,
+                vec![MemoryRange {
+                    addr: 0x2000,
+                    len: 512,
+                }],
+            ),
             (4, vec![]),
         ] {
-            store.data_mut().context.guest_write(1024, &[0xFF]).unwrap();
-            let (status,) = execute
-                .call_async(&mut store, (request_type, 0, data, 1024, 0))
-                .await
-                .unwrap();
-            assert_eq!(status, 1);
-            assert_eq!(store.data().context.guest_read(1024, 1).unwrap(), [1]);
+            fixture.stage_request(request_type, 0, &ranges, 0x3000);
+            assert_eq!(fixture.complete_request().await, 1);
+            assert_eq!(fixture.read(0x3000, 1).unwrap(), [1]);
         }
+    }
+
+    /// A reset while host I/O is suspended fences the old request's guest writes and
+    /// used-ring completion, and the worker then accepts a newly negotiated queue.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn component_reset_fences_inflight_host_io() {
+        use super::{BlockHost, DiskGrant};
+        use crate::component::block::component_tests::fixture_with_host;
+        use crate::engine::device_engine;
+        use terra_platform::memory::MemoryRange;
+
+        let mut backing = BoundedDisk::new(4096, false);
+        backing.write(0, &[0xA5; 512]).unwrap();
+        let host = BlockHost::new(
+            crate::memory::GuestRam::new(256 * 1024).unwrap(),
+            DiskGrant::Mem(backing),
+        );
+        let disk = std::sync::Arc::clone(&host.disk);
+        let disk_slot = std::sync::Arc::clone(&host.disk_slot);
+        let engine = device_engine().unwrap();
+        let component =
+            wasmtime::component::Component::new(&engine, crate::test_fixtures::wasm::BLOCK)
+                .unwrap();
+        let mut fixture = fixture_with_host(&engine, host, &component, false).await;
+        let (locked, locked_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = std::sync::mpsc::sync_channel(0);
+        let blocker = std::thread::spawn(move || {
+            let _guard = disk.lock().unwrap();
+            locked.send(()).unwrap();
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+        });
+        locked_rx.await.unwrap();
+        fixture.write(0x2000, &[0xCD; 512]).unwrap();
+        fixture.stage_request(
+            0,
+            0,
+            &[MemoryRange {
+                addr: 0x2000,
+                len: 512,
+            }],
+            0x3000,
+        );
+        fixture.device.write(0x050, &0_u32.to_le_bytes()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while disk_slot.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("host read is suspended");
+        fixture.device.reset().unwrap();
+        release.send(()).unwrap();
+        blocker.join().unwrap();
+        let permit = tokio::time::timeout(std::time::Duration::from_secs(2), disk_slot.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(permit);
+        fixture.clear_queue();
+        assert_eq!(
+            fixture
+                .submit_request(
+                    0,
+                    0,
+                    &[MemoryRange {
+                        addr: 0x4000,
+                        len: 512
+                    }],
+                    0x3100
+                )
+                .await,
+            0
+        );
+        assert_eq!(fixture.read(0x4000, 512).unwrap(), [0xA5; 512]);
+        assert_eq!(fixture.read(0x2000, 512).unwrap(), [0xCD; 512]);
+        assert_eq!(fixture.read(0x3000, 1).unwrap(), [0xFF]);
+        assert_eq!(fixture.read(0x23002, 2).unwrap(), 1_u16.to_le_bytes());
+        fixture.device.close().unwrap();
     }
 }

@@ -15,7 +15,10 @@ use terra_protocol::DEFAULT_STOP_GRACE_SECS;
                   it is already up. A verb after the box names one operation on it \
                   instead - `terra dev stop`, `terra dev sync :/etc/x .` - and every verb \
                   defaults to this directory's only box. With a box already up and \
-                  neither a terminal to attach from nor `-d`, terra exits 125.",
+                  neither a terminal to attach from nor `-d`, terra exits 125.\n\n\
+                  Linux uses Bubblewrap by default. Set vm.init in ~/.terra/config.yaml to \
+                  direct to disable it, bwrap to select it explicitly, or an executable \
+                  path for a custom launcher.",
     after_long_help = "EXAMPLES:\n    \
                        terra dev                   Start this directory's box `dev`, or attach\n    \
                        terra dev exec -- ls        Run a command in the running box\n    \
@@ -352,7 +355,8 @@ pub struct AgentTimeoutArg {
 }
 
 const STOP_TEARDOWN_ALLOWANCE_SECS: u64 = 35;
-const DEFAULT_STOP_TIMEOUT_SECS: u64 = DEFAULT_STOP_GRACE_SECS + STOP_TEARDOWN_ALLOWANCE_SECS;
+pub(crate) const DEFAULT_STOP_TIMEOUT_SECS: u64 =
+    DEFAULT_STOP_GRACE_SECS + STOP_TEARDOWN_ALLOWANCE_SECS;
 
 #[derive(Args, Debug)]
 pub struct StopArgs {
@@ -494,7 +498,7 @@ pub struct BootArgs {
     #[arg(short = 'd', long)]
     pub detach: bool,
 
-    /// Run the VM in this process, in the foreground - for a service manager
+    /// Run the VM in the foreground - for a service manager
     /// (systemd), which wants the VM as its own child and has no terminal to
     /// join.
     #[arg(long, conflicts_with = "detach")]

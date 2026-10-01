@@ -14,7 +14,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-const ASSETS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/assets");
+fn assets_dir() -> PathBuf {
+    std::env::var_os("TERRA_TEST_ASSETS").map_or_else(
+        || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/assets"),
+        PathBuf::from,
+    )
+}
 
 struct Suite {
     terra: PathBuf,
@@ -39,6 +44,8 @@ impl Suite {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
         std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir(home.join(".terra")).unwrap();
+        std::fs::write(home.join(".terra/config.yaml"), "vm:\n  init: direct\n").unwrap();
         #[cfg(unix)]
         let host_uid = {
             use std::os::unix::fs::MetadataExt;
@@ -132,7 +139,7 @@ impl Suite {
 
     /// The common case: boot `<name>.yaml` from the assets directory.
     fn boot(&self, name: &str, extra: &[&str]) -> String {
-        self.boot_recipe(&Path::new(ASSETS).join(format!("{name}.yaml")), name, extra)
+        self.boot_recipe(&assets_dir().join(format!("{name}.yaml")), name, extra)
     }
 
     /// The asset plus a `mounts:` entry pointing /work at a directory this
@@ -141,7 +148,7 @@ impl Suite {
         let prj = self.get_work_dir().join(format!("{name}-proj"));
         std::fs::create_dir_all(&prj).unwrap();
         let recipe = self.get_work_dir().join(format!("{name}.yaml"));
-        let base = std::fs::read_to_string(Path::new(ASSETS).join(format!("{name}.yaml"))).unwrap();
+        let base = std::fs::read_to_string(assets_dir().join(format!("{name}.yaml"))).unwrap();
         std::fs::write(
             &recipe,
             format!(
@@ -214,7 +221,7 @@ impl Suite {
 
     fn compile_probe(&self, name: &str) -> PathBuf {
         let probe = self.get_work_dir().join(format!("terra-{name}-probe"));
-        let source = Path::new(ASSETS).join(format!("{name}_probe.c"));
+        let source = assets_dir().join(format!("{name}_probe.c"));
         let status = Command::new("zig")
             .args([
                 "cc",
@@ -480,7 +487,7 @@ fn run_boot_suite() {
     // == ports + isolation: one VM publishes, another reaches it via hosts ==
     let server = s.create_project_dir("server");
     s.run_terra_command(&[
-        &format!("{ASSETS}/server.yaml"),
+        &assets_dir().join("server.yaml").to_string_lossy(),
         "setup",
         "--project",
         server.to_str().unwrap(),
@@ -1304,7 +1311,8 @@ fn foreground_process_owns_the_vm_and_releases_its_lock_on_death() {
     let published = std::fs::read_to_string(box_dir.join("terra.pid"));
     let _ = child.kill();
     child.wait().unwrap();
-    assert_eq!(ready.unwrap().unwrap().trim(), "FOREGROUND_READY");
+    let ready = ready.unwrap().unwrap();
+    assert!(ready.trim_end().ends_with("FOREGROUND_READY"), "{ready:?}");
     let published_pid: u32 = published
         .unwrap()
         .split_whitespace()
@@ -1312,19 +1320,27 @@ fn foreground_process_owns_the_vm_and_releases_its_lock_on_death() {
         .unwrap()
         .parse()
         .unwrap();
-    assert_eq!(
-        published_pid,
-        child.id(),
-        "foreground spawned a separate VM process"
-    );
-    let (listing, code) =
-        suite.run_terra_status(&["ls", "--json", "--project", project.to_str().unwrap()]);
-    assert_eq!(code, 0);
-    let boxes: serde_json::Value = serde_json::from_str(&listing).unwrap();
-    assert_eq!(
-        boxes[0]["state"], "stopped",
-        "the VM lock survived foreground death"
-    );
+    assert_ne!(published_pid, child.id(), "foreground VM ran in the parent");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let (listing, code) =
+            suite.run_terra_status(&["ls", "--json", "--project", project.to_str().unwrap()]);
+        assert_eq!(code, 0);
+        let boxes: serde_json::Value = serde_json::from_str(&listing).unwrap();
+        let stopped = boxes[0]["state"] == "stopped";
+        #[cfg(target_os = "linux")]
+        let vm_exited = !linux_process_is_live(published_pid);
+        #[cfg(not(target_os = "linux"))]
+        let vm_exited = true;
+        if stopped && vm_exited {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "foreground death left VM running: {listing}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 #[cfg(unix)]
@@ -1559,4 +1575,122 @@ fn agent_readiness_precedes_long_bake_and_start_hooks() {
         &["/bin/sh", "-ec", "test -e /baked; test -e /work/finished"],
     );
     assert_eq!(code, 0, "long startup hook was mistaken for a stalled boot");
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_is_live(pid: u32) -> bool {
+    let status = match std::fs::read_to_string(format!("/proc/{pid}/status")) {
+        Ok(status) => status,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(error) => panic!("reading VM status: {error}"),
+    };
+    !status
+        .lines()
+        .any(|line| line.starts_with("State:") && line.split_whitespace().nth(1) == Some("Z"))
+}
+
+/// The enforced policy reaches the live VM and every thread, including vCPUs.
+/// Trace mode runs the same VM lifecycle before the policy exists.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires a native hypervisor and an enforced Bubblewrap policy"]
+fn bwrap_enforces_vm_and_vcpu_threads() {
+    let suite = Suite::new();
+    let enforced = std::env::var("TERRA_SECCOMP_ENFORCED").as_deref() == Ok("1");
+    if enforced {
+        std::fs::remove_file(suite.home.join(".terra/config.yaml")).unwrap();
+    }
+    let project = suite.create_project_dir("server");
+    let recipe = suite.get_work_dir().join("server.yaml");
+    std::fs::write(
+        &recipe,
+        "hw: {cpus: 2, mem_mib: 512}\nworkload:\n  entrypoint: /bin/sleep\n  args: [infinity]\n",
+    )
+    .unwrap();
+    let project = project.to_str().unwrap();
+    assert_eq!(
+        suite
+            .run_terra_status(&[recipe.to_str().unwrap(), "setup", "--project", project])
+            .1,
+        0
+    );
+    assert_eq!(
+        suite
+            .run_terra_status(&["server", "-d", "--project", project])
+            .1,
+        0
+    );
+
+    let box_dir = suite.get_box_files_path("server");
+    let identity = if enforced { "host.pid" } else { "terra.pid" };
+    let published = std::fs::read_to_string(box_dir.join(identity)).unwrap();
+    let pid: u32 = published
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    if enforced {
+        for namespace in ["pid", "mnt", "user", "ipc", "uts"] {
+            let parent_ns = std::fs::read_link(format!("/proc/self/ns/{namespace}")).unwrap();
+            let vm_ns = std::fs::read_link(format!("/proc/{pid}/ns/{namespace}")).unwrap();
+            assert_ne!(
+                vm_ns, parent_ns,
+                "VM still uses the parent's {namespace} namespace"
+            );
+        }
+
+        let parent_net = std::fs::read_link("/proc/self/ns/net").unwrap();
+        let vm_net = std::fs::read_link(format!("/proc/{pid}/ns/net")).unwrap();
+        assert_eq!(vm_net, parent_net, "VM does not share host networking");
+
+        let task_dir = format!("/proc/{pid}/task");
+        let tasks = std::fs::read_dir(&task_dir)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(tasks.len() > 1, "VM has no visible vCPU or worker threads");
+        let mut checked_threads = 0;
+        for task in tasks {
+            let status = match std::fs::read_to_string(task.path().join("status")) {
+                Ok(status) => status,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => panic!("reading thread {}: {error}", task.path().display()),
+            };
+            checked_threads += 1;
+            for (field, expected) in [("Seccomp:", "2"), ("NoNewPrivs:", "1")] {
+                let actual = status
+                    .lines()
+                    .find_map(|line| line.strip_prefix(field))
+                    .map(str::trim);
+                assert_eq!(
+                    actual,
+                    Some(expected),
+                    "thread {} has wrong {field}: {status}",
+                    task.path().display()
+                );
+            }
+        }
+        assert!(
+            checked_threads > 1,
+            "VM threads exited before policy inspection"
+        );
+    }
+
+    if enforced {
+        std::fs::write(box_dir.join("terra.pid"), b"forged by a guest").unwrap();
+        std::fs::remove_file(box_dir.join("c")).unwrap();
+    }
+
+    let stop_args: &[&str] = if enforced {
+        &["server", "stop", "--timeout", "0", "--project", project]
+    } else {
+        &["server", "stop", "--project", project]
+    };
+    assert_eq!(suite.run_terra_status(stop_args).1, 0);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while linux_process_is_live(pid) {
+        assert!(Instant::now() < deadline, "VM {pid} survived stop");
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }

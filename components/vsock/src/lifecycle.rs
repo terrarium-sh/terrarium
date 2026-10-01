@@ -1,6 +1,17 @@
-use crate::exports::terra::vsock::api::{ControlResult, DiagnosticResult, Error};
+use crate::exports::terra::vsock::api::Error;
 use serde::de::DeserializeOwned;
 use terra_protocol::control::LifecycleEvent;
+
+pub(crate) struct ControlResult {
+    pub consumed: u32,
+    pub exit_code: Option<i32>,
+    pub agent_ready: bool,
+}
+
+pub(crate) struct DiagnosticResult {
+    pub consumed: u32,
+    pub output: Vec<u8>,
+}
 
 const MAX_CONTROL_BYTES: usize = 1 << 20;
 const MAX_DIAGNOSTIC_BYTES: usize = terra_protocol::MAX_DIAGNOSTIC_FRAME_BYTES - 4;
@@ -25,7 +36,7 @@ fn decode_frame<T: DeserializeOwned>(
     Ok(Some((value, frame.len())))
 }
 
-pub fn decode_control(bytes: &[u8]) -> Result<ControlResult, Error> {
+pub(crate) fn decode_control(bytes: &[u8]) -> Result<ControlResult, Error> {
     if bytes.len() > MAX_CONTROL_BYTES {
         return Err(Error::Malformed);
     }
@@ -54,7 +65,7 @@ pub fn decode_control(bytes: &[u8]) -> Result<ControlResult, Error> {
     Ok(result)
 }
 
-pub fn decode_diagnostics(bytes: &[u8]) -> Result<DiagnosticResult, Error> {
+pub(crate) fn decode_diagnostics(bytes: &[u8]) -> Result<DiagnosticResult, Error> {
     if bytes.len() > MAX_DIAGNOSTIC_BYTES + 4 {
         return Err(Error::Malformed);
     }

@@ -35,6 +35,15 @@ packaging/licenses/uds_windows-MIT.txt; its bundled third-party notices are in
 packaging/licenses/uds_windows-THIRDPARTYNOTICES.txt. It supplies the native
 AF_UNIX control channel implementation.
 
+Linux releases embed Bubblewrap 0.13.0
+(https://github.com/containers/bubblewrap), with source files marked
+LGPL-2.0-or-later. Its upstream LGPL license text is included in
+packaging/licenses/bubblewrap-LGPL-2.1.txt. The embedded build uses libcap
+2.78 (https://www.kernel.org/pub/linux/libs/security/linux-privs/libcap2/),
+distributed under its BSD-3-Clause option. Its upstream license is included in
+packaging/licenses/libcap-License.txt. Corresponding upstream source
+archives are included in `terra-source.tar.gz`.
+
 The Windows ARM64 Hypervisor Platform register values come from Microsoft
 WinHvPlatformDefs.h, Copyright (c) Microsoft Corporation, under MIT.
 The Microsoft MIT license text is included in

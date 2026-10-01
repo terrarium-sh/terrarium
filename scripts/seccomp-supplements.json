@@ -1,0 +1,11 @@
+{
+  "version": 2,
+  "rules": [
+    {
+      "syscall": "rt_sigreturn",
+      "targets": ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"],
+      "reason": "Signal return can bypass the ordinary syscall entry visible to strace.",
+      "source": "crates/terra/tests/boot.rs:foreground_process_owns_the_vm_and_releases_its_lock_on_death"
+    }
+  ]
+}

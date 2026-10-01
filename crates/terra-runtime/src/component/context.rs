@@ -155,15 +155,6 @@ impl DeviceContext {
     }
 
     #[cfg(test)]
-    pub(crate) fn memory_read_import_counts(&self) -> (u64, u64) {
-        use std::sync::atomic::Ordering;
-        (
-            self.memory_read_calls[0].load(Ordering::Relaxed),
-            self.memory_read_calls[1].load(Ordering::Relaxed),
-        )
-    }
-
-    #[cfg(test)]
     pub(crate) fn memory_read_import_counters(&self) -> Arc<[std::sync::atomic::AtomicU64; 2]> {
         Arc::clone(&self.memory_read_calls)
     }

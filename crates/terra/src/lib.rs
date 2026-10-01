@@ -43,6 +43,21 @@ pub async fn run() -> Result<ExitCode> {
 
     let is_at_a_terminal = sys::is_at_a_terminal();
 
+    #[cfg(target_os = "linux")]
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|argument| argument == "__bwrap")
+    {
+        anyhow::ensure!(
+            std::env::args_os()
+                .skip(2)
+                .eq([std::ffi::OsString::from("--version")]),
+            "terra __bwrap accepts only --version"
+        );
+        let status = vm::embedded_bwrap_command()?.arg("--version").status()?;
+        return Ok(ExitCode::from(exit_status_byte(status.code().unwrap_or(1))));
+    }
+
     // The background VM process (`terra __vm <dir>`): its parent settled the
     // box, the boot and the project directory, so the child re-resolves nothing
     // - not even its own cwd - and never reaches clap.

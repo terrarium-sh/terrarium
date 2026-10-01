@@ -35,15 +35,12 @@ const ARTIFACTS: TrustedArtifacts = {
     }
 };
 
-fn prepare_volume_disks(spec: &BootSpec, bx: &BoxRef) -> Result<Vec<std::path::PathBuf>> {
-    let mut paths = Vec::with_capacity(spec.cfg.volumes.len());
-    for volume in &spec.cfg.volumes {
-        let path = bx.get_volume_image(&volume.name);
-        image::ensure_volume_image(&path, volume.size_mib)
-            .with_context(|| format!("preparing volume image {}", path.display()))?;
-        paths.push(path);
-    }
-    Ok(paths)
+fn volume_disk_paths(spec: &BootSpec, bx: &BoxRef) -> Vec<std::path::PathBuf> {
+    spec.cfg
+        .volumes
+        .iter()
+        .map(|volume| bx.get_volume_image(&volume.name))
+        .collect()
 }
 
 fn open_shares(spec: &BootSpec) -> Result<Vec<ShareGrant>> {
@@ -103,14 +100,9 @@ pub async fn run(
     lock: &File,
     on_ready: impl FnOnce() + Send,
 ) -> Result<ExitCode> {
+    super::resources::limit_vm_process()?;
     logs::init(bx)?;
     let component_memory_limits = spec.cfg.components.memory_limits()?;
-    let _resources = super::resources::admit(
-        u64::from(spec.cfg.hw.mem_mib) << 20,
-        component_memory_limits
-            .admission_bytes()
-            .map_err(|error| anyhow::anyhow!("{error}"))?,
-    )?;
     if spec.mode == PlanMode::Run {
         sys::install_stop_signal_handlers();
     }
@@ -119,7 +111,7 @@ pub async fn run(
     let boot_disk = image::load_boot_image()?;
     let root_disk = bx.get_dir().join(crate::state::ROOTFS_FILE);
     let plan = encode_boot_plan(spec)?;
-    let volume_disks = prepare_volume_disks(spec, bx)?;
+    let volume_disks = volume_disk_paths(spec, bx);
     let shares = open_shares(spec)?;
     let listener = Some(agent_listener(bx)?);
     let port_mappings = if spec.mode == PlanMode::Run {
@@ -155,8 +147,10 @@ pub async fn run(
         None
     };
 
-    BoxRef::publish_pid(lock, std::process::id(), spec.mode == PlanMode::Create)
-        .context("publishing the VM process identity")?;
+    if !spec.builtin_bwrap {
+        BoxRef::publish_pid(lock, std::process::id(), spec.mode == PlanMode::Create)
+            .context("publishing the VM process identity")?;
+    }
     let prepared = terra_runtime::orchestration::prepare(VmInput {
         component_memory_limits,
         kernel,
@@ -238,6 +232,7 @@ mod tests {
             root: false,
             mode: PlanMode::Run,
             foreground: false,
+            builtin_bwrap: false,
         };
         let grants = open_shares(&spec).unwrap();
         let plan = super::super::build_plan(&spec).unwrap().shares;
@@ -271,6 +266,7 @@ mod tests {
             root: false,
             mode: PlanMode::Run,
             foreground: false,
+            builtin_bwrap: false,
         };
         assert!(open_shares(&spec).is_ok());
         std::fs::remove_dir(&share).unwrap();
@@ -306,6 +302,7 @@ mod tests {
             root: false,
             mode: PlanMode::Create,
             foreground: false,
+            builtin_bwrap: false,
         };
         let grants = open_shares(&spec).unwrap();
         let plan = super::super::build_plan(&spec).unwrap().shares;

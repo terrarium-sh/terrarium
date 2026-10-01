@@ -47,7 +47,6 @@ interface router {
 
     open-device: func(slot: u32, base: u64, size: u64) -> result<stream<request>, error>;
     attach-replies: async func(slot: u32, replies: stream<reply>) -> result<_, error>;
-    remap-device: func(slot: u32, base: u64, size: u64) -> result<_, error>;
     access: async func(address: u64, width: u8, value: u64, write: bool) -> result<routed-reply, error>;
     control: async func(slot: u32, operation: operation) -> result<control-reply, error>;
 }

@@ -1,151 +1,112 @@
 # 🪴 Terrarium
 
-> ⚠️ **Under construction — docs are incomplete and the code is still under
-> internal review. Use with caution.** ⚠️
+**Give your agent room to work. Decide what it can touch.**
 
-> Give your agent room to work. Decide what it can touch.
+Run coding agents and development tools in a hardware-virtualized microVM,
+with explicit control over host files and network access. Get started with
+one `terra` executable and a YAML recipe.
 
 [![CI](https://github.com/terrarium-sh/terrarium/actions/workflows/build.yml/badge.svg)](https://github.com/terrarium-sh/terrarium/actions)
 [![Latest release](https://img.shields.io/github/v/release/terrarium-sh/terrarium)](https://github.com/terrarium-sh/terrarium/releases/latest)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-Run coding agents and development tools in a hardware-virtualized microVM.
-One self-contained `terra` binary, one YAML recipe, and explicit grants for
-host files and network access. No host files or network access by default.
+- **A dedicated kernel for every box.** Hardware virtualization isolates the
+  workload from the host, including guest root.
+- **Device components are sandboxed too.** Separate WebAssembly sandboxes
+  restrict the code handling guest requests to scoped host capabilities.
+  Linux adds Bubblewrap containment around the VM process by default.
+- **Access starts at zero.** No host files or network access by default.
+  Grant specific directories, enforce read-only mounts, and allow network
+  destinations by hostname, IP, or CIDR and port.
+- **An embedded runtime, no daemon to manage.** The guest kernel, base filesystem,
+  and VM components ship inside `terra`. Recipes define resources, access,
+  package installation, and the workload.
+- **Keep working in the same box.** Detach and rejoin, run commands, or sync
+  files without rebuilding. Guest storage persists between restarts.
 
-**Keep it simple, keep it auditable.** Terrarium keeps a small core that is easy
-to understand and review. Recipes, lifecycle hooks, and external tools add what
-you need without growing the core.
-
-**The virtual devices are sandboxed too.** Device components run in separate
-WebAssembly sandboxes with scoped host access: a filesystem device gets its
-granted directory, a network device policy-controlled sockets. The microVM
-isolates the workload; the sandboxes limit what the code handling guest requests
-can do. See the [security model](docs/security.md).
-
-Supported hosts: Linux amd64 and aarch64, macOS on Apple Silicon, and Windows
-amd64. Build requirements: [README.dev.md](README.dev.md).
+Read the [security model and its limits](docs/security.md).
+**Under construction:** docs are incomplete and code is still under internal review.
 
 ## Quickstart
 
+Supported hosts: Linux amd64 and aarch64, macOS on Apple Silicon, and Windows
+amd64 and ARM64. Linux requires access to `/dev/kvm`; Windows requires Windows
+Hypervisor Platform. See [platform requirements](packaging/README.md#native-host-builds).
+
+Install on Linux or macOS:
+
 ```sh
 curl -fsSLO https://raw.githubusercontent.com/terrarium-sh/terrarium/main/install.sh && sh install.sh
-terra --version
 ```
 
-On Windows (PowerShell):
+<details>
+<summary>Install on Windows (PowerShell)</summary>
 
 ```powershell
 Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/terrarium-sh/terrarium/main/install.ps1 -OutFile install.ps1; if ($?) { powershell -ExecutionPolicy Bypass -File install.ps1 }
 ```
 
-`install.ps1` installs `terra.exe` to `%LOCALAPPDATA%\Programs\terra`, adds that
-directory to the user `PATH` (open a new terminal afterwards), takes
-`-Prerelease`, and honors `$env:TERRA_VERSION`.
+Open a new terminal after installation.
 
-The installer verifies the release checksum and also verifies its GitHub attestation when the GitHub CLI is installed. Pin a release with
-`TERRA_VERSION=x.y.z sh install.sh`; re-run it to upgrade, or pass
-`--prerelease` to take the newest release even when it is a prerelease. Build from source:
-[README.dev.md](README.dev.md) using the pinned Rust toolchains. Verify a release archive with
-`gh attestation verify terra-x86_64-linux.tar.gz --repo terrarium-sh/terrarium`
-after downloading the matching release archive.
+</details>
 
-Then sandbox a project:
+In your project directory, create `dev.yaml`. Here's a Node.js development box:
 
-```sh
-cd ~/code/my-app
-cat > dev.yaml <<'EOF'
-hw: { cpus: 2, mem_mib: 1024 }
-components: { memory_mib: 16 }
+```yaml
+hw:
+  cpus: 2
+  mem_mib: 2048
+  rootfs_mib: 4096
+mounts:
+  - host: .
+    guest: /work
+    readonly: false
 network:
-  mode: unrestricted-public              # public egress; private ranges stay blocked
+  mode: allowlist
+  allow:
+    - dl-cdn.alpinelinux.org:443
+    - registry.npmjs.org:443
+hooks:
+  on_create:
+    - apk add --no-cache nodejs npm git
 workload:
-  entrypoint: /bin/sh                    # a shell instead of your app's cmd
-EOF
-terra ./dev.yaml setup      # pin the recipe, build the box
-terra                       # boot it — a shell in the guest
+  entrypoint: /bin/sh
+  workdir: /work
 ```
 
-The example opts in to public egress for package managers and agents. Remove
-`network:` for no network, or use `mode: allowlist` for a narrower policy.
+This installs Node.js, npm, and Git, shares your project read-write at `/work`,
+and allows HTTPS access to the Alpine and npm package registries. Add the
+destinations your tools need to `network.allow`.
+
+```sh
+terra ./dev.yaml setup   # create the box and install tools
+terra                   # enter the guest shell at /work
+```
+
+Project edits are shared with the host. This includes `dev.yaml`, so review
+the recipe before rerunning setup. See [recipe trust](docs/security.md#recipe-storage).
+
+Press `Ctrl-\` to detach while keeping the box running. From the host:
+
+```sh
+terra exec -- node --version   # run a command in the guest
+terra                         # rejoin the shell
+```
+
+Use `terra stop` to stop the box and `terra rm` to delete its storage.
+See the [recipe reference](docs/recipe.md) to customize tools, access, and workloads.
 
 ![Terminal demo: create a box from dev.yaml, then enter it.](docs/demo.gif)
 
-`terra` boots the only box in the directory, or joins it if already up. Detach
-with `Ctrl-\`, rejoin with `terra`, stop with `terra stop`, delete with `terra rm`.
-List boxes with `terra ls`, inspect configuration with `terra show`, and transfer
-files and directories with `terra sync`. Detailed instructions:
-[docs/usage.md](docs/usage.md).
+## Go further
 
-## What you get
-
-- **Real isolation.** Each box is a dedicated microVM with its own kernel and 
-  rootfs—sharing only what you explicitly allow.
-- **Explicit access.** No host files or network by default. `unrestricted-public`
-  permits public destinations, including public LAN addresses, except IPs collected
-  from host interfaces at VM startup. Those IPs and private ranges require explicit
-  grants. Grant host directories with `mounts`, or sync files with `sync`.
-- **One binary.** The guest kernel, base guest filesystem, and VM components
-  are embedded in `terra`; no daemon required. The kernel loads directly into
-  memory on each boot. Upgrade Terra and stop/start a box to use the kernel
-  bundled with that release, without rebuilding the box.
-  Recipe hooks can install additional packages.
-- **Lifecycle hooks.** `on_create`, `on_start`, and `pre_stop` run as guest
-  root. Startup and stop output appears live in the attached console, with the
-  workload between them. Package installation usually belongs in `on_create`.
-- **Work without rebuilding.** Detach, rejoin, sync files, or run `terra exec`
-  in a live box.
-
-## Commands
-
-| command | what it does |
-|---|---|
-| `terra [BOX] setup` | pin the recipe, build the box |
-| `terra [BOX]` | boot the box — or join if it is up (`-d`: headless) |
-| `terra [BOX] -- CMD…` | run CMD instead of the recipe's workload, for one boot |
-| `terra [BOX] exec -- CMD…` | run a command in a running box |
-| `terra [BOX] sync SRC DST` | sync files and directories between host and box |
-| `terra [BOX] logs` | show host diagnostics (`-f`: follow, `--diagnostics`: VM log) |
-| `terra [BOX] sessions` | list attached console clients |
-| `terra [BOX] detach [ID]` | disconnect an attached client (`--all`: every client) |
-| `terra [BOX] show` | print the resolved recipe and configuration |
-| `terra ls` | list boxes (`--all`: every project, `--state`: filter, `-q`: names only; alias: `ps`) |
-| `terra [BOX] stop` | stop a running box gracefully |
-| `terra [BOX] storage` | inspect or manage box storage (`show`, `export`, `import`, `prune`) |
-| `terra [BOX] rm` | delete a box's storage and logs (`--purge`: remove recipe too) |
-| `terra completions SHELL` | output shell completion code (`bash`, `zsh`, `fish`) |
-
-`[BOX]` defaults to the directory's only box. Every command accepts `--project DIR`
-to target another project directory. Full reference: [docs/usage.md](docs/usage.md).
-
-## Storage
-
-Boxes live at `~/.terra/box/t-<project-slug>/<box>/`, where the slug is a stable
-base32 hash of the project path. The kernel and read-only boot disk load into
-memory from the Terra binary on every boot. `terra ls --all` finds boxes, and
-`terra <box> rm --purge --project <project-dir>` removes one completely. To use
-another disk, stop boxes, move `~/.terra`, then symlink it back; the target must
-honour owner-only permissions.
-
-## Security
-
-The VM is the boundary. Each host-directory mount has its own filesystem
-component and directory grant, with read-only enforcement on the host.
-Read the [security model](docs/security.md), or
-[report a vulnerability privately](https://github.com/terrarium-sh/terrarium/security/advisories/new).
-
-## Documentation
-
-- [Recipe reference](docs/recipe.md)
-- [Project manifest (`terra.yaml`)](docs/manifest.md)
-- [Usage and storage](docs/usage.md)
-- [Demo](docs/demo.gif)
-- [Security model](docs/security.md)
-- [Development and release](README.dev.md)
-- [Audit follow-up](docs/audit-followup.md)
-- [Systemd and man pages](packaging/README.md)
-- [Security policy](SECURITY.md)
-
-## License
+- [Usage guide](docs/usage.md) — installation options, commands, file sync, and storage.
+- [Recipe reference](docs/recipe.md) — network access, mounts, packages, and workloads.
+- [Project manifest](docs/manifest.md) — manage multiple boxes with `terra.yaml`.
+- [Security model](docs/security.md) — trust boundaries, enforcement, and limitations.
+- [Host VM launchers](docs/vm-launchers.md) — Linux containment and seccomp policies.
+- [Development](README.dev.md) — build from source, test, and release.
+- [Packaging](packaging/README.md) — platform requirements, systemd, and man pages.
+- [Security policy](SECURITY.md) — report a vulnerability privately.
 
 Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).

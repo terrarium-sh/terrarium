@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "workloads": [
+    {"suite": "boot", "test": "pending_network_reads_do_not_block_other_downloads", "timeout_seconds": 360},
+    {"suite": "boot", "test": "sequential_execs_reuse_vsock_client_slots", "timeout_seconds": 360},
+    {"suite": "boot", "test": "run_boot_suite", "timeout_seconds": 900},
+    {"suite": "boot", "test": "run_mount_boot_suite", "timeout_seconds": 900},
+    {"suite": "boot", "test": "foreground_process_owns_the_vm_and_releases_its_lock_on_death", "timeout_seconds": 240},
+    {"suite": "boot", "test": "attached_console_streams_hooks_before_workload_and_exit", "timeout_seconds": 240},
+    {"suite": "boot", "test": "capacity_machine_vcpus_and_storage_devices", "timeout_seconds": 600},
+    {"suite": "boot", "test": "capacity_32_volumes_reaches_vdah", "timeout_seconds": 600},
+    {"suite": "boot", "test": "local_apic_timers_work_without_a_legacy_clockevent", "timeout_seconds": 240, "targets": ["x86_64-unknown-linux-musl"]},
+    {"suite": "boot", "test": "agent_readiness_precedes_long_bake_and_start_hooks", "timeout_seconds": 360},
+    {"suite": "boot", "test": "bwrap_enforces_vm_and_vcpu_threads", "timeout_seconds": 360},
+    {"suite": "native_boot", "test": "native_boot_mounts_network_storage_and_restart", "timeout_seconds": 600},
+    {"suite": "native_boot", "test": "bake_hook_output_uses_the_console_and_agent_diagnostics_use_the_log", "timeout_seconds": 360},
+    {"suite": "native_boot", "test": "native_boot_executes_shell", "timeout_seconds": 360},
+    {"suite": "native_boot", "test": "native_boot_shares_host_changes_between_running_boxes", "timeout_seconds": 600},
+    {"suite": "native_boot", "test": "native_boot_runs_rootless_podman_on_a_private_disk", "timeout_seconds": 900},
+    {"suite": "native_boot", "test": "native_boot_forwards_shared_file_events", "timeout_seconds": 600, "trace_exclusion_reason": "strace overloads the bounded shared-file event queue and prevents deterministic flood recovery; Node reload still traces event syscalls and this test remains required under Bubblewrap"},
+    {"suite": "native_boot", "test": "native_boot_reloads_node_server_from_host_events", "timeout_seconds": 900},
+    {"suite": "lib", "test": "vm::bwrap::tests::production_jail_restricts_native_probe", "timeout_seconds": 180, "trace_exclusion_reason": "Native jail probe runs a compiled fixture and its own restrictive filter, without a terra __vm syscall boundary"}
+  ]
+}

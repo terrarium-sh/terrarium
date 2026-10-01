@@ -38,7 +38,7 @@ SOURCE_DIST := $(BUILD)/terra-source.tar.gz
 ALPINE_SOURCE_DIST := $(BUILD)/alpine-corresponding-source.tar.gz
 
 # Versions, URLs and sha256s of everything downloaded and baked into the binary
-# — the guest kernel, e2fsprogs, the Alpine rootfs and doas. Kept in its own file
+# — the guest kernel, e2fsprogs, Bubblewrap, libcap, Alpine rootfs and doas. Kept in its own file
 # so a bump is a reviewable diff of provenance and nothing else; the recipes that
 # consume it are below. Needs $(ARCH), hence included here.
 # NOTE: the CI cache key hashes this file — keep it listed there.
@@ -48,6 +48,11 @@ KERNEL_GZ := $(BUILD)/vmlinux.gz
 E2FSPROGS_SRC := $(BUILD)/e2fsprogs-$(E2FSPROGS_VERSION)
 MKE2FS := $(BUILD)/mke2fs
 RESIZE2FS := $(BUILD)/resize2fs
+BWRAP := $(BUILD)/bwrap-$(ARCH)
+BWRAP_CC := $(MKE2FS_CC_$(ARCH))
+LINUX_BWRAP_ASSET := $(if $(findstring -linux-,$(TERRA_TARGET)),$(BWRAP),)
+BUBBLEWRAP_TARBALL := $(BUILD)/bubblewrap-$(BUBBLEWRAP_VERSION).tar.xz
+LIBCAP_TARBALL := $(BUILD)/libcap-$(LIBCAP_VERSION).tar.xz
 
 # The guest root filesystem is prebaked here, at build time, on Linux — where we
 # have mke2fs and user namespaces — and shipped inside the binary as bytes. That
@@ -76,7 +81,7 @@ COMPONENT_AOT_TARGETS := $(addsuffix -aot,$(COMPONENT_TARGETS))
 COMPONENT_MANIFEST := components/Cargo.toml
 COMPONENT_WASM_DIR := components/target/wasm-components/release
 
-.PHONY: $(COMPONENT_TARGETS) $(COMPONENT_AOT_TARGETS) verify-source verify-host-components guest-assets check-guest-assets host-build host-dist source-dist verify-wit verify-dependency-boundaries verify-platform build verify verify-components verify-workspace dist man clean test-component-boot test-platform-native-vm test-component-vmm test-install check-zig
+.PHONY: $(COMPONENT_TARGETS) $(COMPONENT_AOT_TARGETS) verify-source verify-host-components guest-assets check-guest-assets host-build host-dist source-dist verify-wit verify-dependency-boundaries verify-platform build verify verify-components verify-workspace dist man clean test-component-boot test-platform-native-vm test-component-vmm test-install check-zig generate_seccomp stage_seccomp_harnesses
 
 # Pin changes invalidate every embedded guest payload.
 PINS := $(ARCH) $(KERNEL_VERSION) $(KERNEL_SHA256) $(E2FSPROGS_VERSION) $(E2FSPROGS_SHA256) \
@@ -183,6 +188,34 @@ $(MKE2FS): $(PIN_STAMP)
 	cp $(E2FSPROGS_SRC)/misc/mke2fs $(MKE2FS)
 	strip $(MKE2FS)
 
+$(BUBBLEWRAP_TARBALL): pins.mk
+	mkdir -p $(BUILD)
+	curl -fsSL '$(BUBBLEWRAP_URL)' -o $@.tmp
+	echo '$(BUBBLEWRAP_SHA256)  $@.tmp' | sha256sum -c -
+	mv $@.tmp $@
+
+$(LIBCAP_TARBALL): pins.mk
+	mkdir -p $(BUILD)
+	curl -fsSL '$(LIBCAP_URL)' -o $@.tmp
+	echo '$(LIBCAP_SHA256)  $@.tmp' | sha256sum -c -
+	mv $@.tmp $@
+
+$(BWRAP): $(BUBBLEWRAP_TARBALL) $(LIBCAP_TARBALL) pins.mk Makefile scripts/zig-musl-cc scripts/zig-musl-cc-aarch64 scripts/zig-musl-ar
+	$(MAKE) check-zig
+	echo '$(BUBBLEWRAP_SHA256)  $(BUBBLEWRAP_TARBALL)' | sha256sum -c -
+	echo '$(LIBCAP_SHA256)  $(LIBCAP_TARBALL)' | sha256sum -c -
+	rm -rf $(BUILD)/bubblewrap-$(ARCH)-src $(BUILD)/libcap-$(ARCH)-src
+	mkdir -p $(BUILD)/bubblewrap-$(ARCH)-src $(BUILD)/libcap-$(ARCH)-src
+	tar -xf $(BUBBLEWRAP_TARBALL) --strip-components=1 -C $(BUILD)/bubblewrap-$(ARCH)-src
+	tar -xf $(LIBCAP_TARBALL) --strip-components=1 -C $(BUILD)/libcap-$(ARCH)-src
+	$(MAKE) -C $(BUILD)/libcap-$(ARCH)-src/libcap libcap.a CC=$(abspath $(BWRAP_CC)) BUILD_CC=cc AR=$(abspath scripts/zig-musl-ar) RANLIB='zig ranlib' SHARED=no PTHREADS=no USE_GPERF=no COPTS='-O2 -fstack-protector-strong -D_FORTIFY_SOURCE=2'
+	printf '#define PACKAGE_STRING "bubblewrap $(BUBBLEWRAP_VERSION)"\n' > $(BUILD)/bubblewrap-$(ARCH)-src/config.h
+	$(BWRAP_CC) -static-pie -fPIE -fstack-protector-strong -D_FORTIFY_SOURCE=2 -Wno-unused-command-line-argument -s -O2 -D_GNU_SOURCE \
+		-I$(BUILD)/libcap-$(ARCH)-src/libcap/include -I$(BUILD)/libcap-$(ARCH)-src/libcap/include/uapi \
+		$(addprefix $(BUILD)/bubblewrap-$(ARCH)-src/,bubblewrap.c bind-mount.c network.c utils.c chroot_realpath.c safe_openat.c) \
+		$(BUILD)/libcap-$(ARCH)-src/libcap/libcap.a -o $@.tmp
+	mv $@.tmp $@
+
 # resize2fs runs inside the guest; cross builds must not reuse the host mke2fs binary's tree.
 ifeq ($(ARCH),$(BUILD_ARCH))
 $(RESIZE2FS): $(MKE2FS)
@@ -267,25 +300,37 @@ $(BOOT_IMG): $(MKE2FS) $(RESIZE2FS) $(AGENT_BIN) $(PIN_STAMP) Makefile
 
 ## Build the static terra binary (embeds vmlinux, prebaked images, and trusted
 ## component artifacts).
-build: $(COMPONENT_AOT_TARGETS) $(KERNEL_GZ) $(ROOTFS_IMG) $(VOLUME_IMG) $(BOOT_IMG)
+build: $(COMPONENT_AOT_TARGETS) $(KERNEL_GZ) $(ROOTFS_IMG) $(VOLUME_IMG) $(BOOT_IMG) $(BWRAP)
 	$(CARGO_LOCKED) build --release -p terra --target $(TERRA_TARGET)
 
 # Guest payloads are produced on Linux and then embedded by each native host
 # build. This keeps macOS and Windows releases free of host mkfs/container
 # tooling while preserving one architecture-specific Linux guest per executable.
-guest-assets: $(KERNEL_GZ) $(ROOTFS_IMG) $(VOLUME_IMG) $(BOOT_IMG)
+guest-assets: $(KERNEL_GZ) $(ROOTFS_IMG) $(VOLUME_IMG) $(BOOT_IMG) $(BWRAP)
 
 # A host build receives these architecture-matched files from a Linux guest
 # build. Check them as inputs so a fresh macOS checkout never tries to rebuild
 # the guest kernel, rootfs, or Linux agent because artifact mtimes changed.
 check-guest-assets:
-	@for asset in $(KERNEL_GZ) $(ROOTFS_IMG) $(VOLUME_IMG) $(BOOT_IMG); do test -s $$asset || { echo "missing staged guest asset: $$asset" >&2; exit 1; }; done
+	@for asset in $(KERNEL_GZ) $(ROOTFS_IMG) $(VOLUME_IMG) $(BOOT_IMG) $(LINUX_BWRAP_ASSET); do test -s $$asset || { echo "missing staged guest asset: $$asset" >&2; exit 1; }; done
 
 host-build: check-guest-assets $(COMPONENT_AOT_TARGETS)
 	$(CARGO_LOCKED) build --release -p terra --target $(TERRA_TARGET)
 
 test-component-vmm: dist
 	TERRA_BIN=$(abspath $(DIST)/terra) $(CARGO_LOCKED) test $(TEST_FLAGS) -p terra --test boot --test memory -- --ignored
+
+# Consumes the exact supplied executable. Native KVM, strace, Bubblewrap and
+# libseccomp are required only for this explicit release-policy operation.
+TERRA_BIN ?= $(DIST)/terra
+SECCOMP_OUTPUT ?= $(BUILD)/seccomp/$(TERRA_TARGET)
+SECCOMP_DIAGNOSTICS ?= $(BUILD)/seccomp-traces
+SECCOMP_HARNESS_OUTPUT ?= $(BUILD)/seccomp-harnesses/$(TERRA_TARGET)
+stage_seccomp_harnesses: check-guest-assets $(COMPONENT_AOT_TARGETS)
+	python3 scripts/stage-seccomp-harnesses.py --target $(TERRA_TARGET) --output $(SECCOMP_HARNESS_OUTPUT)
+
+generate_seccomp:
+	python3 scripts/generate-seccomp.py --bin $(abspath $(TERRA_BIN)) --target $(TERRA_TARGET) --output $(SECCOMP_OUTPUT) --diagnostics $(SECCOMP_DIAGNOSTICS) $(if $(SECCOMP_HARNESS_DIR),--harness-dir $(SECCOMP_HARNESS_DIR),)
 
 ## Components use their pinned nightly wasm toolchain in their own workspace,
 ## then the trusted native compiler produces each embedded AOT blob.
@@ -339,6 +384,8 @@ verify-source:
 	python3 -B scripts/test-kernel-tools.py || $(CHECK_FAILURE); \
 	python3 -B scripts/test-alpine-sources.py || $(CHECK_FAILURE); \
 	python3 -B scripts/test-pin-updates.py || $(CHECK_FAILURE); \
+	python3 -B scripts/test-generate-seccomp.py || $(CHECK_FAILURE); \
+	python3 -B scripts/test-policy-backfill.py || $(CHECK_FAILURE); \
 	scripts/test-install.sh || $(CHECK_FAILURE); \
 	$(CARGO) fmt --all -- --check || $(CHECK_FAILURE); \
 	$(CARGO) fmt --manifest-path fuzz/Cargo.toml -- --check || $(CHECK_FAILURE); \
@@ -365,7 +412,7 @@ verify-platform:
 test-install:
 	scripts/test-install.sh
 
-verify-components: $(COMPONENT_AOT_TARGETS) $(KERNEL_GZ) $(ROOTFS_IMG) $(VOLUME_IMG) $(BOOT_IMG)
+verify-components: $(COMPONENT_AOT_TARGETS) $(KERNEL_GZ) $(ROOTFS_IMG) $(VOLUME_IMG) $(BOOT_IMG) $(BWRAP)
 verify-host-components: check-guest-assets $(COMPONENT_AOT_TARGETS)
 
 verify-components verify-host-components:
@@ -399,18 +446,18 @@ dist host-dist:
 	# binary (ETXTBSY) never blocks a rebuild.
 	install -m 755 target/$(TERRA_TARGET)/release/terra $(DIST)/terra
 	install -m 644 LICENSE NOTICE $(DIST)
-	install -m 644 packaging/licenses/GPL-2.0.txt packaging/licenses/applevisor-MIT.txt packaging/licenses/uds_windows-MIT.txt packaging/licenses/uds_windows-THIRDPARTYNOTICES.txt $(DIST)/LICENSES
+	install -m 644 packaging/licenses/GPL-2.0.txt packaging/licenses/applevisor-MIT.txt packaging/licenses/uds_windows-MIT.txt packaging/licenses/uds_windows-THIRDPARTYNOTICES.txt packaging/licenses/bubblewrap-LGPL-2.1.txt packaging/licenses/libcap-License.txt $(DIST)/LICENSES
 	cp -R packaging/man $(DIST)
 	@echo "assembled $(DIST)/terra for $(TERRA_TARGET)"
 
-## Source inputs for the GPL programs embedded in a release. The release
+## Source inputs for third-party programs embedded in a release. The release
 ## workflow publishes this archive beside the platform archives.
 $(ALPINE_SOURCE_DIST): $(ROOTFS_IMG) scripts/alpine-sources.sh
 	scripts/alpine-sources.sh
 
-source-dist: $(KERNEL_TARBALL) $(MKE2FS) $(ROOTFS_IMG) $(ALPINE_SOURCE_DIST)
+source-dist: $(KERNEL_TARBALL) $(MKE2FS) $(ROOTFS_IMG) $(ALPINE_SOURCE_DIST) $(BUBBLEWRAP_TARBALL) $(LIBCAP_TARBALL)
 	git archive --format=tar --prefix=terrarium/ HEAD > $(BUILD)/terra-source.tar
-	tar --append --file=$(BUILD)/terra-source.tar --transform='s|^$(BUILD)/|terrarium/$(BUILD)/|' $(KERNEL_TARBALL) $(BUILD)/e2fsprogs.tar.gz $(ALPINE_SOURCE_DIST) $(BUILD)/alpine-minirootfs.tar.gz $(BUILD)/$(DOAS_APK) $(BUILD)/$(DOAS_SHIM_APK)
+	tar --append --file=$(BUILD)/terra-source.tar --transform='s|^$(BUILD)/|terrarium/$(BUILD)/|' $(KERNEL_TARBALL) $(BUILD)/e2fsprogs.tar.gz $(ALPINE_SOURCE_DIST) $(BUILD)/alpine-minirootfs.tar.gz $(BUILD)/$(DOAS_APK) $(BUILD)/$(DOAS_SHIM_APK) $(BUBBLEWRAP_TARBALL) $(LIBCAP_TARBALL)
 	gzip -9nc $(BUILD)/terra-source.tar > $(SOURCE_DIST)
 	rm -f $(BUILD)/terra-source.tar
 

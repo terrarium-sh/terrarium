@@ -88,6 +88,7 @@ jobs:
             build/rootfs.img.gz
             build/volume.img.gz
             build/boot.img.gz
+            build/bwrap-${{ matrix.arch }}
           if-no-files-found: error
           compression-level: 0
 
@@ -224,6 +225,23 @@ jobs:
         with:
           name: terra-x86_64-linux
           path: dist
+      - name: Stage policy test harnesses
+        id: policy-harnesses
+        if: ${{ steps.host-build.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          make stage_seccomp_harnesses
+          mkdir -p build/seccomp-harness-artifact
+          cp -R -L build/seccomp-harnesses/x86_64-unknown-linux-musl/. build/seccomp-harness-artifact/
+          test -x build/seccomp-harness-artifact/boot
+          test -x build/seccomp-harness-artifact/native_boot
+          test -x build/seccomp-harness-artifact/terra_lib
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ steps.policy-harnesses.outcome == 'success' }}
+        with:
+          name: terra-policy-harnesses-x86_64
+          path: build/seccomp-harness-artifact/
+          if-no-files-found: error
 
   linux-aarch64:
     name: Build Linux (aarch64)
@@ -301,6 +319,170 @@ jobs:
         with:
           name: terra-aarch64-linux
           path: dist
+      - name: Stage policy test harnesses
+        id: policy-harnesses
+        if: ${{ steps.host-build.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          make stage_seccomp_harnesses
+          mkdir -p build/seccomp-harness-artifact
+          cp -R -L build/seccomp-harnesses/aarch64-unknown-linux-musl/. build/seccomp-harness-artifact/
+          test -x build/seccomp-harness-artifact/boot
+          test -x build/seccomp-harness-artifact/native_boot
+          test -x build/seccomp-harness-artifact/terra_lib
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ steps.policy-harnesses.outcome == 'success' }}
+        with:
+          name: terra-policy-harnesses-aarch64
+          path: build/seccomp-harness-artifact/
+          if-no-files-found: error
+
+  linux-policy:
+    name: Enforce Linux policy (${{ matrix.arch }})
+    needs: [linux-x86_64, linux-aarch64]
+    if: ${{ !cancelled() }}
+    continue-on-error: ${{ !inputs.release_sources }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-musl
+            runner: ${{ vars.LINUX_X64_VM_RUNNER || 'ubuntu-latest' }}
+          - arch: aarch64
+            target: aarch64-unknown-linux-musl
+            runner: ${{ vars.LINUX_ARM64_VM_RUNNER || 'ubuntu-24.04-arm' }}
+    steps:
+      - name: Check matching build
+        id: build
+        env:
+          X86_RESULT: ${{ needs.linux-x86_64.result }}
+          ARM_RESULT: ${{ needs.linux-aarch64.result }}
+        run: |
+          if { [ "${{ matrix.arch }}" = x86_64 ] && [ "$X86_RESULT" = success ]; } ||
+             { [ "${{ matrix.arch }}" = aarch64 ] && [ "$ARM_RESULT" = success ]; }; then
+            echo 'ready=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'Matching Linux build did not succeed; no policy was generated.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ steps.build.outputs.ready == 'true' }}
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ steps.build.outputs.ready == 'true' }}
+        with:
+          name: terra-${{ matrix.arch }}-linux
+          path: dist
+      - name: Restore executable distribution
+        if: ${{ steps.build.outputs.ready == 'true' }}
+        run: chmod 755 dist/terra
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        id: harness-download
+        if: ${{ steps.build.outputs.ready == 'true' }}
+        continue-on-error: true
+        with:
+          name: terra-policy-harnesses-${{ matrix.arch }}
+          path: build/seccomp-harnesses/${{ matrix.target }}
+      - name: Restore executable test harnesses
+        id: harness-ready
+        if: ${{ steps.harness-download.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          chmod 755 "build/seccomp-harnesses/${{ matrix.target }}/boot" "build/seccomp-harnesses/${{ matrix.target }}/native_boot" "build/seccomp-harnesses/${{ matrix.target }}/terra_lib"
+          test -s crates/terra/tests/assets/bwrap_jail_probe.c
+      - name: Check native KVM
+        id: kvm
+        if: ${{ steps.build.outputs.ready == 'true' }}
+        run: |
+          if [ -c /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+            echo 'available=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'Native /dev/kvm is unavailable; no policy was generated.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Read Zig version
+        id: zig-version
+        if: ${{ steps.kvm.outputs.available == 'true' }}
+        run: echo "version=$(sed -n 's/^ZIG_VERSION := //p' Makefile)" >> "$GITHUB_OUTPUT"
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        id: zig
+        if: ${{ steps.kvm.outputs.available == 'true' }}
+        continue-on-error: true
+        with:
+          version: ${{ steps.zig-version.outputs.version }}
+      - name: Install policy tools
+        id: tools
+        if: ${{ steps.kvm.outputs.available == 'true' }}
+        continue-on-error: true
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          unshare -U -r true
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap libseccomp-dev strace
+      - name: Boot with the default jail
+        id: default-jail
+        if: ${{ steps.kvm.outputs.available == 'true' && steps.harness-ready.outcome == 'success' && steps.tools.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 6
+        env:
+          TERRA_SECCOMP_ENFORCED: '1'
+        run: |
+          set -o pipefail
+          TERRA_BIN="$PWD/dist/terra" "build/seccomp-harnesses/${{ matrix.target }}/boot" --exact bwrap_enforces_vm_and_vcpu_threads --ignored --nocapture | tee default-jail.log
+          rg -q 'test result: ok\. 1 passed; 0 failed; 0 ignored;' default-jail.log
+      - name: Generate and enforce policy
+        id: generate
+        if: ${{ steps.kvm.outputs.available == 'true' && steps.harness-ready.outcome == 'success' && steps.zig.outcome == 'success' && steps.tools.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 120
+        run: TERRA_BIN="$PWD/dist/terra" SECCOMP_HARNESS_DIR="$PWD/build/seccomp-harnesses/${{ matrix.target }}" SECCOMP_OUTPUT="$PWD/build/seccomp/${{ matrix.target }}" make generate_seccomp
+      - name: Check complete validated set
+        id: validated
+        if: ${{ steps.generate.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          mkdir -p "build/seccomp-artifact/${{ matrix.target }}"
+          cp -L "build/seccomp/${{ matrix.target }}/terra.seccomp.json" \
+            "build/seccomp/${{ matrix.target }}/terra.seccomp.bpf" \
+            "build/seccomp/${{ matrix.target }}/terra.seccomp-manifest.json" \
+            "build/seccomp/${{ matrix.target }}/.validated" \
+            "build/seccomp-artifact/${{ matrix.target }}/"
+          python3 scripts/verify-seccomp-artifact.py "build/seccomp-artifact/${{ matrix.target }}" "$PWD/dist/terra" "${{ matrix.target }}"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ steps.validated.outcome == 'success' }}
+        continue-on-error: true
+        with:
+          name: terra-seccomp-${{ matrix.target }}
+          path: build/seccomp-artifact/${{ matrix.target }}/
+          if-no-files-found: error
+          include-hidden-files: true
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ always() && steps.generate.outcome != 'skipped' }}
+        continue-on-error: true
+        with:
+          name: seccomp-diagnostics-${{ matrix.target }}
+          path: build/seccomp-traces/
+          if-no-files-found: warn
+      - name: Report policy result
+        if: ${{ always() && steps.build.outputs.ready == 'true' && steps.kvm.outputs.available == 'true' }}
+        run: |
+          if [ "${{ steps.validated.outcome }}" = success ]; then
+            echo 'Enforced policy validation passed for ${{ matrix.target }}; complete policy set uploaded.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'Policy preparation, generation, or enforced validation failed for ${{ matrix.target }}; no policy set was uploaded. See the failed step and available diagnostics.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Require the default jail for release
+        if: ${{ always() && inputs.release_sources }}
+        env:
+          JAIL_RESULT: ${{ steps.default-jail.outcome }}
+        run: |
+          if [ "$JAIL_RESULT" != success ]; then
+            echo '::error::Release requires a successful default-jail KVM boot on ${{ matrix.target }}. Configure the matching LINUX_X64_VM_RUNNER or LINUX_ARM64_VM_RUNNER when hosted runners lack KVM.'
+            exit 1
+          fi
 
   macos-aarch64:
     name: Build macOS (aarch64)

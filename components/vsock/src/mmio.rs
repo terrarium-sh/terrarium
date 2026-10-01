@@ -6,7 +6,7 @@ terra_device_transport::mmio_device!(
     DeviceError,
     transport::mmio_read,
     write,
-    Vsock::reset,
+    super::reset_device,
     close,
     transport::interrupt_level
 );
