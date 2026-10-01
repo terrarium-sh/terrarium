@@ -432,7 +432,7 @@ jobs:
         run: |
           set -o pipefail
           TERRA_BIN="$PWD/dist/terra" "build/seccomp-harnesses/${{ matrix.target }}/boot" --exact bwrap_enforces_vm_and_vcpu_threads --ignored --nocapture | tee default-jail.log
-          rg -q 'test result: ok\. 1 passed; 0 failed; 0 ignored;' default-jail.log
+          grep -Fq 'test result: ok. 1 passed; 0 failed; 0 ignored;' default-jail.log
       - name: Generate and enforce policy
         id: generate
         if: ${{ steps.kvm.outputs.available == 'true' && steps.harness-ready.outcome == 'success' && steps.zig.outcome == 'success' && steps.tools.outcome == 'success' }}

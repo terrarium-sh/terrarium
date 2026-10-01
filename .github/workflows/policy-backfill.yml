@@ -64,7 +64,7 @@ jobs:
             fi
           done
           for target in generate_seccomp stage_seccomp_harnesses; do
-            if ! rg -q "^$target:" Makefile; then
+            if ! grep -q "^$target:" Makefile; then
               echo "::error::Release $RELEASE_TAG lacks the $target target. Choose a release with policy-generation support."
               exit 1
             fi
@@ -251,7 +251,7 @@ jobs:
             archive="terra-seccomp-$target.tar.gz"
             test -f "stage/$archive"
             checksum_archive="stage/$archive"
-            if rg -Fxq "$archive" <<< "$assets"; then
+            if grep -Fxq "$archive" <<< "$assets"; then
               gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$archive" --dir published
               python3 scripts/verify-seccomp-artifact.py --archive "published/$archive" "published/$target/terra" "$target"
               checksum_archive="published/$archive"
