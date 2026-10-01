@@ -24,8 +24,8 @@ log = "0.4.34"
 target-lexicon = "0.13"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
-wasmtime = { version = "=48.0.2", default-features = false, features = ["async", "component-model-async", "runtime", "std"] }
-wasmtime-wasi = { version = "=48.0.2", default-features = false, features = ["p3"] }
+wasmtime = { version = "=49.0.1", default-features = false, features = ["component-model-async", "std"] }
+wasmtime-wasi = { version = "=49.0.1", default-features = false, features = ["p3"] }
 
 [dev-dependencies]
 terra-protocol = { path = "../terra-protocol", features = ["mux"] }
@@ -38,7 +38,7 @@ terra-runtime = { path = ".", features = ["test-support"] }
 terra-vsock-device = { path = "../../components/vsock-device" }
 tempfile = { workspace = true }
 # Core-Wasm spike tests compile WAT and components; release builds do not.
-wasmtime = { version = "=48.0.2", default-features = false, features = ["cranelift", "wit-parser", "wat"] }
+wasmtime = { version = "=49.0.1", default-features = false, features = ["cranelift", "wat"] }
 
 [target.'cfg(unix)'.dev-dependencies]
 libc.workspace = true
