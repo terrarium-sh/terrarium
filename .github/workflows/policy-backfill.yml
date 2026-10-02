@@ -38,7 +38,10 @@ jobs:
         if: ${{ runner.environment == 'github-hosted' }}
         run: |
           if [ -c /dev/kvm ]; then
-            sudo setfacl -m "u:$(id -u):rw" /dev/kvm
+            printf 'KERNEL=="kvm", OWNER="%s", MODE="0600", OPTIONS+="static_node=kvm"\n' "$(id -u)" | sudo tee /etc/udev/rules.d/99-terra-kvm.rules
+            sudo udevadm control --reload-rules
+            sudo chown "$(id -u)" /dev/kvm
+            sudo chmod 0600 /dev/kvm
           fi
       - name: Check native KVM
         id: kvm

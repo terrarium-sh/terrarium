@@ -24,7 +24,8 @@ def workflow_command(name, workflow=WORKFLOW):
 
 
 class NativeGateTests(unittest.TestCase):
-    def test_kvm_permissions_repaired_before_mandatory_gate(self):
+    def test_kvm_permissions_survive_device_initialization(self):
+        """KVM's first open can trigger udev to discard a one-time user ACL."""
         backfill = (ROOT / '.github/workflows/policy-backfill.yml').read_text()
         for workflow, expected_setups in ((WORKFLOW, 3), (backfill, 1)):
             self.assertEqual(workflow.count('      - name: Enable KVM access\n'), expected_setups)
@@ -32,32 +33,57 @@ class NativeGateTests(unittest.TestCase):
                 self.assertIn("runner.environment == 'github-hosted'", step.split('        run:', 1)[0])
                 command = workflow_command('Enable KVM access', '      - name: Enable KVM access\n' + step)
                 for device in ('/dev/null', '/dev/terra-ci-missing-kvm'):
-                    with self.subTest(device=device):
+                    with self.subTest(device=device), tempfile.TemporaryDirectory() as directory:
                         setup = command.replace('/dev/kvm', device)
                         gate = workflow_command('KVM gates').replace('/dev/kvm', device)
                         shell = f'''
-kvm_access=0
+kvm_acl=0
+kvm_owner=''
+kvm_mode=0660
+kvm_rule=''
 sudo() {{
-    test "$*" = "setfacl -m u:{os.getuid()}:rw {device}"
-    kvm_access=1
+    case "$*" in
+        'setfacl -m u:{os.getuid()}:rw {device}') kvm_acl=1 ;;
+        'tee /etc/udev/rules.d/99-terra-kvm.rules') cat > kvm.rules ;;
+        'udevadm control --reload-rules') kvm_rule=$(cat kvm.rules) ;;
+        'chown {os.getuid()} {device}') kvm_owner={os.getuid()} ;;
+        'chmod 0600 {device}') kvm_mode=0600 ;;
+        *) echo "unexpected sudo: $*"; return 1 ;;
+    esac
+}}
+can_open_kvm() {{
+    test "$kvm_acl" = 1 || {{ test "$kvm_owner" = {os.getuid()} && test "$kvm_mode" = 0600; }}
 }}
 [() {{
-    if {{ test "$1" = -r || test "$1" = -w; }} && test "$2" = /dev/null; then
-        test "$kvm_access" = 1
+    if test "$1" = '!'; then
+        shift
+        ! [ "$@"
+    elif {{ test "$1" = -r || test "$1" = -w; }} && test "$2" = /dev/null; then
+        can_open_kvm
     else
         builtin [ "$@"
     fi
 }}
-cargo() {{ echo native-test-command; }}
+cargo() {{
+    can_open_kvm || return 1
+    echo native-test-command
+    kvm_acl=0
+    kvm_owner=''
+    kvm_mode=0660
+    if test "$kvm_rule" = 'KERNEL=="kvm", OWNER="{os.getuid()}", MODE="0600", OPTIONS+="static_node=kvm"'; then
+        kvm_owner={os.getuid()}
+        kvm_mode=0600
+    fi
+}}
 {setup}
 {gate}
 '''
                         result = subprocess.run(
-                            ['bash', '-e', '-o', 'pipefail', '-c', shell], text=True,
+                            ['bash', '-e', '-o', 'pipefail', '-c', shell], text=True, cwd=directory,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
                         )
                         self.assertEqual(result.returncode, int(device != '/dev/null'), result.stdout)
-                        self.assertEqual('native-test-command' in result.stdout, device == '/dev/null')
+                        self.assertEqual(result.stdout.count('native-test-command'), 4 if device == '/dev/null' else 0)
                         if device != '/dev/null':
                             self.assertIn('require a native /dev/terra-ci-missing-kvm device', result.stdout)
 
