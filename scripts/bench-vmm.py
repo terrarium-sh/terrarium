@@ -72,11 +72,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def digest(path: Path) -> str:
-    hasher = hashlib.sha256()
     with path.open("rb") as file:
-        for chunk in iter(lambda: file.read(1024 * 1024), b""):
-            hasher.update(chunk)
-    return hasher.hexdigest()
+        return hashlib.file_digest(file, "sha256").hexdigest()
 
 
 def output_summary(path: Path) -> dict[str, Any]:

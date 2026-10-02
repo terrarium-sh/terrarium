@@ -71,8 +71,14 @@ fn resolve_exec_env(inherit_env: bool, entries: &[String]) -> Result<BTreeMap<St
             std::env::var(k)
                 .map_err(|_| anyhow::anyhow!("environment variable `{k}` is not set on the host"))
         },
-        std::env::vars,
+        || std::env::vars_os().filter_map(utf8_env_entry),
     )
+}
+
+fn utf8_env_entry(
+    (name, value): (std::ffi::OsString, std::ffi::OsString),
+) -> Option<(String, String)> {
+    name.into_string().ok().zip(value.into_string().ok())
 }
 
 fn resolve_exec_env_from<I>(
@@ -128,6 +134,21 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn inherited_environment_skips_non_utf8_names_and_values() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        assert_eq!(
+            utf8_env_entry(("APP".into(), "value".into())),
+            Some(("APP".into(), "value".into()))
+        );
+        let invalid = OsString::from_vec(vec![0xff]);
+        assert!(utf8_env_entry((invalid.clone(), "value".into())).is_none());
+        assert!(utf8_env_entry(("APP".into(), invalid)).is_none());
+    }
 
     #[test]
     fn invalid_env_entries_are_refused() {

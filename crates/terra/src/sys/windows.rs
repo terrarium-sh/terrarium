@@ -20,24 +20,29 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
 use windows_sys::Win32::System::Threading::{
-    CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, GetCurrentProcess, GetExitCodeProcess,
-    GetProcessTimes, OpenProcess, OpenProcessToken, OpenThread, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_TERMINATE, ResumeThread, THREAD_SUSPEND_RESUME, TerminateProcess,
+    CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, DETACHED_PROCESS, GetCurrentProcess,
+    GetExitCodeProcess, GetProcessTimes, OpenProcess, OpenProcessToken, OpenThread,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, ResumeThread, THREAD_SUSPEND_RESUME,
+    TerminateProcess,
 };
 
 pub const MAX_SOCK_PATH: usize = 108;
 const LOCK_HANDLE_ENV: &str = "TERRA_INHERITED_LOCK_HANDLE";
 
 pub fn try_lock_run(path: &Path) -> std::result::Result<File, std::fs::TryLockError> {
-    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
-    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+        FILE_SHARE_READ,
+    };
 
-    std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(false)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
         .map_err(|error| {
             if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION.cast_signed()) {
@@ -45,7 +50,14 @@ pub fn try_lock_run(path: &Path) -> std::result::Result<File, std::fs::TryLockEr
             } else {
                 std::fs::TryLockError::Error(error)
             }
-        })
+        })?;
+    let metadata = file.metadata().map_err(std::fs::TryLockError::Error)?;
+    if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(std::fs::TryLockError::Error(Error::other(
+            "run lock must be a regular file",
+        )));
+    }
+    Ok(file)
 }
 
 pub fn host_addresses() -> Result<Vec<std::net::IpAddr>> {
@@ -236,7 +248,7 @@ pub fn set_owner_only(path: &Path, directory: bool) -> Result<()> {
 
 pub fn detach(command: &mut Command) {
     use std::os::windows::process::CommandExt;
-    command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    command.creation_flags(DETACHED_PROCESS);
 }
 
 pub struct VmChildGuard(OwnedHandle);
@@ -434,7 +446,54 @@ pub fn terminate_process(pid: u32, published_start_time: Option<u64>) -> Result<
     result
 }
 
-pub fn install_stop_signal_handlers() {}
+// Retained through process exit so console callbacks cannot race socket reuse.
+static STOP_SOCKET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+static STOP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn send_stop() {
+    use std::sync::atomic::Ordering;
+    use windows_sys::Win32::Networking::WinSock::{INVALID_SOCKET, send};
+
+    let Ok(socket) = usize::try_from(STOP_SOCKET.swap(u64::MAX, Ordering::SeqCst)) else {
+        return;
+    };
+    if socket != INVALID_SOCKET {
+        let byte = [terra_protocol::STOP_SIGNAL];
+        // SAFETY: the retained socket stays open through process exit, and byte has the stated length.
+        let _ = unsafe { send(socket, byte.as_ptr(), 1, 0) };
+    }
+}
+
+pub fn register_stop_channel(channel: terra_platform::io::local::LocalStream) {
+    use std::os::windows::io::IntoRawSocket;
+    use std::sync::atomic::Ordering;
+
+    STOP_SOCKET.store(channel.into_raw_socket(), Ordering::SeqCst);
+    if STOP_REQUESTED.load(Ordering::SeqCst) {
+        send_stop();
+    }
+}
+
+extern "system" fn handle_console_control(event: u32) -> i32 {
+    use std::sync::atomic::Ordering;
+    use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT};
+
+    if !matches!(event, CTRL_C_EVENT | CTRL_BREAK_EVENT) {
+        return 0;
+    }
+    STOP_REQUESTED.store(true, Ordering::SeqCst);
+    send_stop();
+    1
+}
+
+pub fn install_stop_signal_handlers() {
+    use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+
+    // SAFETY: the callback has the required ABI and remains available through process exit.
+    if let Err(error) = win_ok(unsafe { SetConsoleCtrlHandler(Some(handle_console_control), 1) }) {
+        log::warn!("could not install console stop handler: {error}");
+    }
+}
 
 pub fn is_host_root() -> bool {
     false
@@ -561,6 +620,121 @@ mod tests {
     use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_SPARSE_FILE;
 
     #[test]
+    fn detached_launch_keeps_startup_pipes_without_parent_console() {
+        use std::io::{Read as _, Write as _};
+        use std::os::windows::process::CommandExt;
+        use std::process::Stdio;
+        use windows_sys::Win32::System::Console::{
+            CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent, GetConsoleProcessList,
+        };
+        use windows_sys::Win32::System::Threading::CREATE_NEW_CONSOLE;
+
+        let mut console_process = 0;
+        // SAFETY: the buffer has the one process-ID slot reported to Windows.
+        let console_processes = unsafe { GetConsoleProcessList(&raw mut console_process, 1) };
+        let role = std::env::var("TERRA_TEST_DETACH_ROLE").ok();
+        if role.as_deref() == Some("child") {
+            assert_eq!(console_processes, 0);
+            let mut input = String::new();
+            std::io::stdin().read_to_string(&mut input).unwrap();
+            assert_eq!(input, "startup input");
+            std::io::stdout().write_all(b"startup output").unwrap();
+            std::io::stderr().write_all(b"startup diagnostics").unwrap();
+            return;
+        }
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args([
+            "--exact",
+            "sys::imp::tests::detached_launch_keeps_startup_pipes_without_parent_console",
+            "--nocapture",
+        ]);
+        let mut stop_receiver = None;
+        if role.as_deref() == Some("parent") {
+            assert_ne!(console_processes, 0);
+            let (host, receiver) = terra_platform::io::local::create_local_pair().unwrap();
+            receiver
+                .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                .unwrap();
+            register_stop_channel(host);
+            stop_receiver = Some(receiver);
+            install_stop_signal_handlers();
+            command.env("TERRA_TEST_DETACH_ROLE", "child");
+            assert!(supervise_vm_child(&mut command, false).unwrap().is_none());
+            command.stdin(Stdio::piped());
+        } else {
+            command.env("TERRA_TEST_DETACH_ROLE", "parent");
+            command.creation_flags(CREATE_NEW_CONSOLE);
+        }
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        if role.as_deref() == Some("parent") {
+            // SAFETY: this subprocess owns an isolated console and installed a Ctrl+Break handler.
+            assert_ne!(unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, 0) }, 0);
+            let mut stop = [0];
+            stop_receiver
+                .as_mut()
+                .unwrap()
+                .read_exact(&mut stop)
+                .unwrap();
+            assert_eq!(stop, [terra_protocol::STOP_SIGNAL]);
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(b"startup input")
+                .unwrap();
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed;"));
+        if role.as_deref() == Some("parent") {
+            assert!(
+                String::from_utf8(output.stdout)
+                    .unwrap()
+                    .contains("startup output")
+            );
+            assert_eq!(output.stderr, b"startup diagnostics");
+        }
+    }
+
+    #[test]
+    fn console_interrupts_relay_one_stop_and_latch_before_registration() {
+        use std::io::Read as _;
+        use std::sync::atomic::Ordering;
+        use terra_platform::io::local::create_local_pair;
+        use windows_sys::Win32::System::Console::{
+            CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT,
+            CTRL_SHUTDOWN_EVENT,
+        };
+
+        for event in [CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT] {
+            assert_eq!(handle_console_control(event), 0);
+            assert!(!STOP_REQUESTED.load(Ordering::SeqCst));
+        }
+        for event in [CTRL_C_EVENT, CTRL_BREAK_EVENT] {
+            let (host, mut guest) = create_local_pair().unwrap();
+            guest
+                .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                .unwrap();
+            if event == CTRL_C_EVENT {
+                assert_eq!(handle_console_control(event), 1);
+                assert!(STOP_REQUESTED.load(Ordering::SeqCst));
+            }
+            register_stop_channel(host);
+            assert_eq!(handle_console_control(event), 1);
+            let mut byte = [0];
+            guest.read_exact(&mut byte).unwrap();
+            assert_eq!(byte, [terra_protocol::STOP_SIGNAL]);
+            assert_eq!(handle_console_control(event), 1);
+            guest
+                .set_read_timeout(Some(std::time::Duration::from_millis(50)))
+                .unwrap();
+            assert!(guest.read_exact(&mut byte).is_err());
+            STOP_REQUESTED.store(false, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
     fn a_sparse_file_keeps_the_sparse_attribute() {
         let file = tempfile::NamedTempFile::new().unwrap();
         make_sparse(file.as_file()).unwrap();
@@ -583,6 +757,20 @@ mod tests {
             unrelated.as_file().as_raw_handle(),
             &lock_path
         ));
+    }
+
+    #[test]
+    fn run_locks_reject_symlink_redirection() {
+        let directory = tempfile::tempdir().unwrap();
+        let redirected = directory.path().join("outside");
+        let lock_path = directory.path().join("terra.pid");
+        std::fs::write(&redirected, b"original").unwrap();
+        std::os::windows::fs::symlink_file(&redirected, &lock_path).unwrap();
+        assert!(try_lock_run(&lock_path).is_err());
+        assert_eq!(std::fs::read(&redirected).unwrap(), b"original");
+        std::fs::remove_file(&redirected).unwrap();
+        assert!(try_lock_run(&lock_path).is_err());
+        assert!(!redirected.exists());
     }
 
     #[test]

@@ -11,15 +11,20 @@ when its stated acceptance condition has been recorded with the relevant test
 or host result. Build-only and cross-compilation checks do not establish native
 VM behavior.
 
+The [cross-platform follow-up](linux-amd64-acceptance.md#cross-platform-follow-up)
+records ARM timer, macOS lifecycle, Windows WHP/console/socket and release-gate fixes.
+The corresponding native host gates below remain open until executed.
+
 ## Product acceptance
 
-- [x] **Fresh Linux x86_64 KVM acceptance:** the 2026-09-13 packaged build
-  passed all 9 boot, memory, and native workflow gates, including rootless
-  Podman and two running boxes sharing host files. All 12 platform KVM gates
-  passed, plus 5 repeated two-vCPU network/storage/restart runs. The review
-  fixed TCP truncation at host EOF and a native-cleanup mutex stall.
-  Commands, artifact hash, results, and validation limits are recorded in
-  [Linux amd64 acceptance](linux-amd64-acceptance.md).
+- [x] **Fresh Linux x86_64 KVM acceptance:** the 2026-10-02 packaged build
+  passed all 19 boot, memory, and native workflow gates, including rootless
+  Podman and two running boxes sharing host files. All 12 runtime KVM gates,
+  five platform/native VM gates, and both native-probe and packaged sandbox
+  checks passed. The review fixed nine boundary and lifecycle defects and
+  removed unused code. Commands, artifact hash, results, retries, and validation
+  limits are recorded in the
+  [Linux amd64 review](linux-amd64-acceptance.md#2026-10-02-review).
 
 - [ ] **Linux AArch64 KVM:** run the packaged binary's boot, mount, networking,
   SMP, memory-reclaim, shutdown, and ARM GIC-routing gates on AArch64 hardware.
@@ -39,7 +44,7 @@ VM behavior.
   ordinary Alpine user without granting host TUN access or host privileges.
   Start from the existing TUN/namespace setup in
   [`kernel/terra.config`](../kernel/terra.config) and the guest initialization in
-  [`crates/terra-agent/src/init.rs`](../crates/terra-agent/src/init.rs). Add an
+  [`crates/terra-agent/src/bootstrap.rs`](../crates/terra-agent/src/bootstrap.rs). Add an
   ignored native-boot gate that creates and stops a rootless container on a
   private disk, proves allowed egress, and proves existing denials remain.
   The ignored `native_boot_runs_rootless_podman_on_a_private_disk` gate passed

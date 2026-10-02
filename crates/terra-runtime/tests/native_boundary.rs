@@ -223,18 +223,17 @@ fn writable_disk_enforces_capacity() {
 }
 
 #[test]
-fn interrupt_storm_coalesces_and_drops() {
+fn interrupt_storm_drops_signals_past_the_window_budget() {
     let mut irq = InterruptSignals::new();
-    for _ in 0..(MAX_SIGNALS_PER_WINDOW + 10) {
-        irq.signal();
+    for _ in 0..MAX_SIGNALS_PER_WINDOW {
+        assert!(irq.signal());
     }
-    assert!(irq.take());
-    assert!(!irq.take());
-    assert_eq!(irq.delivered(), 1);
+    for _ in 0..10 {
+        assert!(!irq.signal());
+    }
     assert_eq!(irq.dropped(), 10);
     irq.end_window();
-    irq.signal();
-    assert!(irq.take());
+    assert!(irq.signal());
 }
 
 #[cfg(unix)]

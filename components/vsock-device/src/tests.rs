@@ -97,6 +97,27 @@ fn guest_half_close_preserves_buffered_data() {
 }
 
 #[test]
+fn guest_half_close_keeps_the_opposite_direction_open() {
+    for flags in [1, 2] {
+        let mut switch = VsockSwitch::new();
+        connect(&mut switch, 100);
+        let mut close = guest(4, 100, MUX_VSOCK_PORT, 0, 0);
+        close.flags = flags;
+        switch.rx(&close, &[]);
+        assert!(switch.take_replies().is_empty());
+        if flags == 2 {
+            switch.deliver(100, MUX_VSOCK_PORT, b"reply").unwrap();
+            let reply = switch.take_replies().pop().unwrap();
+            assert_eq!(reply.header.op, 5);
+            assert_eq!(reply.payload, b"reply");
+        } else {
+            switch.rx(&guest(5, 100, MUX_VSOCK_PORT, 5, 0), b"input");
+            assert_eq!(switch.take_upstream()[0].data, b"input");
+        }
+    }
+}
+
+#[test]
 fn forged_credit_resets_the_carrier() {
     let mut switch = VsockSwitch::new();
     connect(&mut switch, 100);

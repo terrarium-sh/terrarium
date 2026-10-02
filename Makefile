@@ -386,6 +386,7 @@ verify-source:
 	python3 -B scripts/test-pin-updates.py || $(CHECK_FAILURE); \
 	python3 -B scripts/test-generate-seccomp.py || $(CHECK_FAILURE); \
 	python3 -B scripts/test-policy-backfill.py || $(CHECK_FAILURE); \
+	python3 -B scripts/test-native-gates.py || $(CHECK_FAILURE); \
 	scripts/test-install.sh || $(CHECK_FAILURE); \
 	$(CARGO) fmt --all -- --check || $(CHECK_FAILURE); \
 	$(CARGO) fmt --manifest-path fuzz/Cargo.toml -- --check || $(CHECK_FAILURE); \

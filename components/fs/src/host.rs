@@ -285,13 +285,14 @@ impl Node {
         }
     }
 
-    pub fn clear_path(&mut self) {
-        self.path = None;
-    }
-
     async fn checked_path(&self) -> Result<&(Descriptor, String), Error> {
         let path = self.path.as_ref().ok_or(Error::NoEntry)?;
-        if let Some(expected) = &self.path_identity {
+        let expected = if let Some(descriptor) = &self.descriptor {
+            Some(descriptor.metadata_hash().await.map_err(error)?)
+        } else {
+            self.path_identity
+        };
+        if let Some(expected) = expected {
             let actual = path
                 .0
                 .metadata_hash_at(types::PathFlags::empty(), path.1.clone())
@@ -467,7 +468,7 @@ impl Node {
     }
 
     pub async fn readlink(&self) -> Result<Vec<u8>, Error> {
-        let (parent, name) = self.path.as_ref().ok_or(Error::Unsupported)?;
+        let (parent, name) = self.checked_path().await?;
         parent
             .readlink_at(name.clone())
             .await

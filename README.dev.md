@@ -179,11 +179,10 @@ enforced gate also runs a native containment probe that checks denied host
 filesystem writes, shared host-loopback reachability, and seccomp inheritance.
 It is excluded from syscall collection because its static fixture and restrictive test filter are not the
 release VM process.
-Unavailable KVM or a failed policy job is reported in normal Build CI without
-blocking its other jobs. Releases require the default Bubblewrap launcher and
-built-in policy to boot successfully on both Linux architectures; a missing or
-failed native gate blocks publication. Generated-policy enforcement remains
-optional. Set `LINUX_X64_VM_RUNNER` and `LINUX_ARM64_VM_RUNNER`
+Policy generation is optional in normal Build CI. Releases require the default
+Bubblewrap launcher and built-in policy to boot successfully on Linux amd64;
+the ARM64 policy job remains optional. Generated-policy enforcement is optional
+on both architectures. Set `LINUX_X64_VM_RUNNER` and `LINUX_ARM64_VM_RUNNER`
 repository variables to KVM-capable runner labels when the default runners
 cannot provide `/dev/kvm`. A release verifies each available policy against its
 exact binary before publishing an optional `terra-seccomp-<target>.tar.gz`
@@ -301,18 +300,32 @@ make test-component-vmm
 
 These exercise runtime/device integration, CLI boots, mounts, networking,
 capacity and memory growth/reclamation. Ignored tests are not covered by an
-ordinary workspace test pass. CI runs Linux VM gates when KVM is available;
+ordinary workspace test pass. CI requires Linux amd64 VM gates; other platforms
+run VM gates when explicitly requested or assigned a native runner;
 see the [build workflow](.github/workflows/build.yml) for exact conditions.
 
 `make test-platform-native-vm` checks preparation cleanup and repeated stop/join
 on a native hypervisor without guest artifacts. On Apple Silicon the target
 signs the test executable with the hypervisor entitlement before running it.
 
-macOS and Windows have an opt-in `native_vm_tests` workflow input. After a native
-host build (and signing on macOS), install Zig 0.16.0 for the guest probes and run:
+Build and release CI require native platform, runtime, and packaged VM acceptance
+on Linux amd64. ARM64 Linux, macOS and Windows VM gates are opt-in until native
+runners are available. Set `native_vm_tests` to request those gates explicitly;
+an explicitly requested gate fails when virtualization is unavailable. Configure
+`LINUX_X64_VM_RUNNER`, `LINUX_ARM64_VM_RUNNER`, `MACOS_ARM64_VM_RUNNER`,
+`WINDOWS_X64_VM_RUNNER`, and `WINDOWS_ARM64_VM_RUNNER` with native runner labels.
+Linux needs read/write KVM and unprivileged user namespaces, macOS needs Apple
+Silicon with Hypervisor.framework access, and Windows needs working WHP. Configured
+native runners run the full gates automatically. Hosted builds on the other
+platforms run compiler and unit checks and report missing boot coverage.
+
+After a native host build (and signing on macOS), install Zig 0.16.0 for the guest
+probes. Use a short temporary directory with enough disk space (`TMPDIR` on Unix,
+`TEMP`/`TMP` on Windows); fixture control sockets must fit the local-socket path
+limit. Run the packaged gates:
 
 ```sh
-TERRA_BIN="$PWD/dist/terra" cargo test --locked -p terra --test native_boot --test boot --test memory -- --ignored --test-threads=1 --nocapture
+TMPDIR=/tmp TERRA_BIN="$PWD/dist/terra" cargo test --locked -p terra --test native_boot --test boot --test memory -- --ignored --test-threads=1 --nocapture
 ```
 
 On Windows PowerShell:

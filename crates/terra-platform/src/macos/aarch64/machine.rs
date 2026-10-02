@@ -63,6 +63,7 @@ pub struct Machine {
 /// A vCPU which stays on the thread that created it.
 pub struct Cpu {
     vcpu: Vcpu,
+    reset_sctlr: u64,
 }
 
 impl Machine {
@@ -108,7 +109,8 @@ impl Machine {
         vcpu.set_reg(Reg::PC, entry)?;
         vcpu.set_reg(Reg::X0, context)?;
         vcpu.set_sys_reg(SysReg::MPIDR_EL1, mpidr)?;
-        Ok(Cpu { vcpu })
+        let reset_sctlr = vcpu.get_sys_reg(SysReg::SCTLR_EL1)?;
+        Ok(Cpu { vcpu, reset_sctlr })
     }
 
     pub fn exit(&self, cpus: &[VcpuHandle]) -> Result<(), HvError> {
@@ -132,6 +134,16 @@ impl Machine {
 }
 
 impl Cpu {
+    pub fn reset_for_start(&self, entry: u64, context: u64) -> Result<(), HvError> {
+        self.vcpu.set_sys_reg(SysReg::SCTLR_EL1, self.reset_sctlr)?;
+        self.vcpu.set_sys_reg(SysReg::CNTV_CTL_EL0, 0)?;
+        self.vcpu
+            .set_reg(Reg::CPSR, terra_limits::ARM_PSTATE_EL1H_DAIF)?;
+        self.vcpu.set_reg(Reg::PC, entry)?;
+        self.vcpu.set_reg(Reg::X0, context)?;
+        Ok(())
+    }
+
     pub fn set_arm_mmio_read(&self, register: Option<u8>, value: u64) -> Result<(), HvError> {
         if let Some(register) = register {
             let register = general_register(register).ok_or(HvError::InvalidRegister)?;
@@ -255,6 +267,39 @@ fn general_register(number: u8) -> Option<Reg> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `CPU_ON` must discard the previous guest's MMU, cache, timer and PSTATE controls.
+    #[test]
+    #[ignore = "requires Apple Silicon Hypervisor.framework and hypervisor entitlement"]
+    fn cpu_on_restores_boot_controls() -> Result<(), HvError> {
+        let machine = Machine::new(&VmConfig {
+            ram_base: terra_limits::ARM_RAM_BASE,
+            ram_bytes: 16 * 1024 * 1024,
+            vcpus: 1,
+            interrupt_controller: crate::vm::InterruptControllerConfig::Arm(NativeGicConfig {
+                distributor_base: terra_limits::ARM_GIC_DIST_BASE,
+                distributor_size: terra_limits::ARM_GIC_DIST_SIZE,
+                redistributor_base: terra_limits::ARM_GIC_REDIST_BASE,
+                redistributor_size: terra_limits::ARM_GIC_REDIST_SIZE,
+            }),
+            irq_routes: Vec::new(),
+        })?;
+        let cpu = machine.create_secondary(0, 0, 0)?;
+        cpu.vcpu
+            .set_sys_reg(SysReg::SCTLR_EL1, cpu.reset_sctlr | 1 | (1 << 2))?;
+        cpu.vcpu.set_sys_reg(SysReg::CNTV_CTL_EL0, 1)?;
+        cpu.vcpu.set_reg(Reg::CPSR, 0)?;
+        cpu.reset_for_start(terra_limits::ARM_RAM_BASE, 42)?;
+        assert_eq!(cpu.vcpu.get_sys_reg(SysReg::SCTLR_EL1)?, cpu.reset_sctlr);
+        assert_eq!(cpu.vcpu.get_sys_reg(SysReg::CNTV_CTL_EL0)? & 3, 0);
+        assert_eq!(
+            cpu.vcpu.get_reg(Reg::CPSR)?,
+            terra_limits::ARM_PSTATE_EL1H_DAIF
+        );
+        assert_eq!(cpu.vcpu.get_reg(Reg::PC)?, terra_limits::ARM_RAM_BASE);
+        assert_eq!(cpu.vcpu.get_reg(Reg::X0)?, 42);
+        Ok(())
+    }
 
     /// The guest window must cover configured CPUs, not every CPU supported by HVF.
     #[test]

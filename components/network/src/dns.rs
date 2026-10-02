@@ -45,19 +45,18 @@ pub fn error_response(query: &[u8], rcode: u16) -> Vec<u8> {
         | DNS_FLAG_RECURSION_AVAILABLE
         | (rcode & DNS_RCODE_MASK);
 
-    // Echo the question section (qdcount stays as in the query) when parseable.
-    let question_end = question_section_end(query);
-    let qdcount = u16::from(question_end.is_some());
+    let question = first_question(query).map(|(_, question)| question);
+    let qdcount = u16::from(question.is_some());
 
-    let mut response = Vec::with_capacity(question_end.unwrap_or(DNS_HEADER_LEN));
+    let mut response = Vec::with_capacity(DNS_HEADER_LEN + question.as_ref().map_or(0, Vec::len));
     response.extend_from_slice(id);
     response.extend_from_slice(&flags.to_be_bytes());
     response.extend_from_slice(&qdcount.to_be_bytes());
     response.extend_from_slice(&0u16.to_be_bytes()); // ancount
     response.extend_from_slice(&0u16.to_be_bytes()); // nscount
     response.extend_from_slice(&0u16.to_be_bytes()); // arcount
-    if let Some(end) = question_end {
-        response.extend_from_slice(&query[DNS_HEADER_LEN..end]);
+    if let Some(question) = question {
+        response.extend_from_slice(&question);
     }
     response
 }
@@ -67,10 +66,10 @@ pub fn error_response(query: &[u8], rcode: u16) -> Vec<u8> {
 /// types are answered.
 #[must_use]
 pub fn build_ip_response(query: &[u8], ips: &[IpAddr], ttl: u32) -> Vec<u8> {
-    let Some(question_end) = question_section_end(query) else {
+    let Some((_, question)) = first_question(query) else {
         return error_response(query, DNS_RCODE_SERVFAIL);
     };
-    let qtype = read_u16(query, question_end - 4).unwrap_or(0);
+    let qtype = read_u16(&question, question.len() - 4).unwrap_or(0);
     let ips: Vec<IpAddr> = ips
         .iter()
         .copied()
@@ -89,15 +88,16 @@ pub fn build_ip_response(query: &[u8], ips: &[IpAddr], ttl: u32) -> Vec<u8> {
         return error_response(query, DNS_RCODE_SERVFAIL);
     };
 
-    let mut response =
-        Vec::with_capacity(question_end + ips.len() * (DNS_RR_FIXED_LEN + DNS_AAAA_RDATA_LEN));
+    let mut response = Vec::with_capacity(
+        DNS_HEADER_LEN + question.len() + ips.len() * (DNS_RR_FIXED_LEN + DNS_AAAA_RDATA_LEN),
+    );
     response.extend_from_slice(&query[..DNS_ID_LEN]);
     response.extend_from_slice(&flags.to_be_bytes());
     response.extend_from_slice(&DNS_ONE_QUESTION.to_be_bytes()); // qdcount
     response.extend_from_slice(&ancount.to_be_bytes());
     response.extend_from_slice(&0u16.to_be_bytes()); // nscount
     response.extend_from_slice(&0u16.to_be_bytes()); // arcount
-    response.extend_from_slice(&query[DNS_HEADER_LEN..question_end]); // echo question
+    response.extend_from_slice(&question);
 
     // Name pointer to the question name at the fixed header offset.
     let name_pointer = [DNS_POINTER_TAG, DNS_HEADER_POINTER];
@@ -116,25 +116,27 @@ pub fn build_ip_response(query: &[u8], ips: &[IpAddr], ttl: u32) -> Vec<u8> {
     response
 }
 
-fn question_section_end(packet: &[u8]) -> Option<usize> {
-    Some(first_question(packet)?.1)
-}
-
-fn first_question(packet: &[u8]) -> Option<(String, usize)> {
+fn first_question(packet: &[u8]) -> Option<(String, Vec<u8>)> {
     if packet.len() < DNS_HEADER_LEN || read_u16(packet, DNS_QDCOUNT_OFFSET)? != DNS_ONE_QUESTION {
         return None;
     }
-    let (name, after_name) = read_name(packet, DNS_HEADER_LEN)?;
+    let (labels, after_name) = read_name(packet, DNS_HEADER_LEN)?;
     let end = after_name + DNS_QUESTION_FIXED_LEN;
     if end > packet.len() {
         return None;
     }
-    Some((name, end))
+    let mut question = Vec::new();
+    for label in &labels {
+        question.push(u8::try_from(label.len()).ok()?);
+        question.extend_from_slice(label.as_bytes());
+    }
+    question.push(0);
+    question.extend_from_slice(&packet[after_name..end]);
+    Some((labels.join(".").to_ascii_lowercase(), question))
 }
 
-/// Parse a DNS name (with compression pointers), returning `(name, next_offset)`.
-/// `next_offset` is the byte after the name in the *original* (non-jumped) stream.
-fn read_name(packet: &[u8], offset: usize) -> Option<(String, usize)> {
+/// The returned offset follows the encoded name in the original stream.
+fn read_name(packet: &[u8], offset: usize) -> Option<(Vec<String>, usize)> {
     let mut labels = Vec::new();
     let mut name_bytes = 0;
     let mut pos = offset;
@@ -182,14 +184,14 @@ fn read_name(packet: &[u8], offset: usize) -> Option<(String, usize)> {
             return None;
         }
         let label = std::str::from_utf8(&packet[pos..pos + len]).ok()?;
-        labels.push(label.to_ascii_lowercase());
+        labels.push(label.to_owned());
         pos += len;
         if !jumped {
             next_offset = pos;
         }
     }
 
-    Some((labels.join("."), next_offset))
+    Some((labels, next_offset))
 }
 
 fn read_u16(buf: &[u8], offset: usize) -> Option<u16> {
@@ -236,6 +238,26 @@ mod tests {
             0,
         ]);
         assert_eq!(question_name(&query).as_deref(), Some("www.example.com"));
+    }
+
+    #[test]
+    fn compressed_questions_are_self_contained_in_responses() {
+        let ordinary = query_for("WwW.Example.COM");
+        let mut compressed = ordinary[..DNS_HEADER_LEN].to_vec();
+        compressed.extend_from_slice(&[0xc0, 0x12]);
+        compressed.extend_from_slice(&ordinary[ordinary.len() - DNS_QUESTION_FIXED_LEN..]);
+        compressed
+            .extend_from_slice(&ordinary[DNS_HEADER_LEN..ordinary.len() - DNS_QUESTION_FIXED_LEN]);
+        let addresses = [IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))];
+
+        assert_eq!(
+            build_ip_response(&compressed, &addresses, 60),
+            build_ip_response(&ordinary, &addresses, 60)
+        );
+        assert_eq!(
+            error_response(&compressed, DNS_RCODE_NXDOMAIN),
+            error_response(&ordinary, DNS_RCODE_NXDOMAIN)
+        );
     }
 
     #[test]

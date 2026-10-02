@@ -509,6 +509,39 @@ async fn mount_with_registration(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn cached_inode_paths_keep_surviving_hardlinks_and_reject_replacements() {
+    let (root, mut mounted, _gate) = mount_with_operation(Operation::Write).await;
+    let (node, handle) = mounted.open(b"slow\0").await;
+    let mut link = node.to_le_bytes().to_vec();
+    link.extend_from_slice(b"alias\0");
+    mounted.request(13, 1, &link).await;
+    mounted.request(1, 1, b"alias\0").await;
+    mounted.request(10, 1, b"slow\0").await;
+    link.truncate(8);
+    link.extend_from_slice(b"survivor\0");
+    mounted.request(13, 1, &link).await;
+    assert_eq!(
+        std::fs::read(root.path().join("survivor")).unwrap(),
+        b"slow"
+    );
+
+    let mut rename = 1_u64.to_le_bytes().to_vec();
+    rename.extend_from_slice(b"fast\0alias\0");
+    mounted.request(12, 1, &rename).await;
+    link.truncate(8);
+    link.extend_from_slice(b"replacement-link\0");
+    let request = mounted.submit(2, 13, 1, &link);
+    let response = mounted.receive(request).await;
+    assert_eq!(&response[4..8], &(-2_i32).to_le_bytes());
+    assert!(!root.path().join("replacement-link").exists());
+    assert_eq!(std::fs::read(root.path().join("alias")).unwrap(), b"fast");
+    let response = mounted.request(15, node, &read_body(handle, 0)).await;
+    assert_eq!(&response[16..], b"s");
+    mounted.channel.close().unwrap();
+    mounted.runtime.abort_and_join().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 /// Native blocking reads may outlive their WASI readers; close must finish before the read is released.
 async fn stalled_read_allows_other_io_events_cancellation_and_shutdown() {
     let (root, mut mounted, gate) = mount().await;

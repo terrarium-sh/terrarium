@@ -24,14 +24,19 @@ compile_error!(
 pub(crate) use imp::file_handle_matches_path;
 pub(crate) use imp::file_link_count;
 pub use imp::is_host_root;
-#[cfg(unix)]
-pub use imp::register_stop_channel;
 pub use imp::{
     MAX_SOCK_PATH, VmChildGuard, allocated_size, attach_vm_child, claim_inherited_lock,
     find_terminating_signal, holds_run_lock, host_addresses, install_stop_signal_handlers,
     kill_vm_child, make_sparse, pass_lock, read_process_start_time, restrict_new_files,
     set_open_file_mode, set_owner_only, supervise_vm_child, terminate_process, try_lock_run,
 };
+
+pub fn register_stop_channel(channel: terra_platform::io::local::LocalStream) {
+    #[cfg(unix)]
+    imp::register_stop_channel(channel.into());
+    #[cfg(windows)]
+    imp::register_stop_channel(channel);
+}
 #[cfg(target_os = "linux")]
 pub use imp::{pass_bwrap_info, pass_seccomp};
 

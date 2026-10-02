@@ -84,20 +84,6 @@ impl<M: VirtualMachine> MachineHandle<M> {
         Ok(Arc::new(move |level| inject(&machine, irq, level)))
     }
 
-    pub fn inject_irq(
-        &self,
-        gsi: u32,
-        level: bool,
-        inject: impl FnOnce(&M, u32, bool) -> wasmtime::Result<()>,
-    ) -> wasmtime::Result<()> {
-        let created = &self.0;
-        if !created.devices.iter().any(|device| device.irq == gsi) {
-            return Err(wasmtime::Error::msg("interrupt line outside VM grant"));
-        }
-        let machine = self.machine();
-        inject(&machine, gsi, level)
-    }
-
     #[must_use]
     pub fn ram(&self) -> RamGrant {
         let handle = self.clone();

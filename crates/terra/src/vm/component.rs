@@ -11,7 +11,7 @@ use std::fs::File;
 use std::io::{Read as _, Write as _};
 use std::process::ExitCode;
 use std::sync::Arc;
-use terra_platform::io::local::{LocalListener, LocalStream};
+use terra_platform::io::local::{LocalListener, LocalStream, create_local_pair};
 use terra_protocol::PlanMode;
 use terra_runtime::TrustedArtifacts;
 use terra_runtime::component::fs::ShareGrant;
@@ -139,9 +139,8 @@ pub async fn run(
     image::staged_write(&diagnostics_path, |_| Ok(()))?;
     let diagnostics = Some(sys::create_regular_file(&diagnostics_path)?);
     let control = if spec.mode == PlanMode::Run {
-        let (host, worker) = LocalStream::pair().context("creating the VM stop channel")?;
-        #[cfg(unix)]
-        sys::register_stop_channel(host.try_clone()?.into());
+        let (host, worker) = create_local_pair().context("creating the VM stop channel")?;
+        sys::register_stop_channel(host.try_clone()?);
         relay_stop(stop_listener(bx)?, host);
         Some(worker)
     } else {
@@ -205,7 +204,7 @@ mod tests {
         let bx = BoxRef::from_state_dir(dir.path().join("state"), dir.path());
         std::fs::create_dir(bx.get_dir()).unwrap();
         let listener = stop_listener(&bx).unwrap();
-        let (host, mut worker) = LocalStream::pair().unwrap();
+        let (host, mut worker) = create_local_pair().unwrap();
         worker
             .set_read_timeout(Some(std::time::Duration::from_secs(2)))
             .unwrap();

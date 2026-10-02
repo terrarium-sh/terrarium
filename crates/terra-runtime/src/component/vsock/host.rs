@@ -140,6 +140,31 @@ impl VsockHostService {
             .ok()
             .map(Arc::new)
     }
+
+    fn poll_accept_client(
+        &mut self,
+        listener: &mut Listener,
+        context: &mut core::task::Context<'_>,
+        finish: bool,
+    ) -> core::task::Poll<io::Result<Option<Resource<ClientState>>>> {
+        let stream = match poll_listener_accept(listener, context, finish) {
+            core::task::Poll::Ready(Ok(Some(stream))) => stream,
+            result => return result.map_ok(|_| None),
+        };
+        let resource = if let Some(lease) = self.reserve_client() {
+            self.resources.push(client_state(stream, lease)?).ok()
+        } else {
+            None
+        };
+        match resource {
+            Some(resource) => core::task::Poll::Ready(Ok(Some(resource))),
+            None if finish => core::task::Poll::Ready(Ok(None)),
+            None => {
+                context.waker().wake_by_ref();
+                core::task::Poll::Pending
+            }
+        }
+    }
 }
 
 impl Default for VsockHostService {
@@ -302,8 +327,9 @@ impl<T: 'static> StreamProducer<T> for ListenerProducer<T> {
         if destination.remaining(&mut store) == Some(0) {
             return poll_listener_ready(&mut this.listener, context, finish);
         }
-        let stream = match poll_listener_accept(&mut this.listener, context, finish) {
-            core::task::Poll::Ready(Ok(Some(stream))) => stream,
+        let service = (this.getter)(store.data_mut());
+        let resource = match service.poll_accept_client(&mut this.listener, context, finish) {
+            core::task::Poll::Ready(Ok(Some(resource))) => resource,
             core::task::Poll::Ready(Ok(None)) => {
                 return core::task::Poll::Ready(Ok(StreamResult::Cancelled));
             }
@@ -312,21 +338,7 @@ impl<T: 'static> StreamProducer<T> for ListenerProducer<T> {
             }
             core::task::Poll::Pending => return core::task::Poll::Pending,
         };
-        let service = (this.getter)(store.data_mut());
-        let Some(lease) = service.reserve_client() else {
-            return core::task::Poll::Ready(Ok(StreamResult::Completed));
-        };
-        let state = match client_state(stream, lease) {
-            Ok(state) => state,
-            Err(error) => {
-                return core::task::Poll::Ready(Err(error.into()));
-            }
-        };
-        let resource = match service.resources.push(state) {
-            Ok(resource) => Resource::new_own(resource.rep()),
-            Err(_) => return core::task::Poll::Ready(Ok(StreamResult::Completed)),
-        };
-        destination.set_buffer(Some(resource));
+        destination.set_buffer(Some(Resource::new_own(resource.rep())));
         core::task::Poll::Ready(Ok(StreamResult::Completed))
     }
 }
@@ -643,5 +655,53 @@ mod tests {
         assert!(service.reserve_client().is_none());
         drop(leases);
         assert_eq!(service.live_clients(), 0);
+    }
+
+    #[tokio::test]
+    async fn listener_recovers_after_rejecting_a_client_at_capacity() {
+        for exhaust_leases in [true, false] {
+            let mut service = VsockHostService::default();
+            let leases = if exhaust_leases {
+                (0..MAX_CLIENTS)
+                    .map(|_| service.reserve_client().unwrap())
+                    .collect::<Vec<_>>()
+            } else {
+                service.resources.set_max_capacity(0);
+                Vec::new()
+            };
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("socket");
+            let mut listener = prepare_listener(LocalListener::bind(&path).unwrap()).unwrap();
+            let rejected = LocalStream::connect(&path).unwrap();
+            std::future::poll_fn(|context| listener.poll_read_ready(context))
+                .await
+                .unwrap();
+            assert!(
+                service
+                    .poll_accept_client(
+                        &mut listener,
+                        &mut core::task::Context::from_waker(core::task::Waker::noop()),
+                        false,
+                    )
+                    .is_pending()
+            );
+            drop(rejected);
+            drop(leases);
+            service.resources.set_max_capacity(MAX_CLIENTS);
+            let _accepted = LocalStream::connect(&path).unwrap();
+            let resource = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                std::future::poll_fn(|context| {
+                    service.poll_accept_client(&mut listener, context, false)
+                }),
+            )
+            .await
+            .expect("capacity rejection must preserve the listener")
+            .unwrap()
+            .unwrap();
+            assert_eq!(service.live_clients(), 1);
+            service.resources.delete(resource).unwrap();
+            assert_eq!(service.live_clients(), 0);
+        }
     }
 }

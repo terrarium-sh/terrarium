@@ -117,9 +117,11 @@ identity.
 Windows x64 requires Windows 10 version 1809 or newer with Windows Hypervisor
 Platform enabled. Windows ARM64 requires Windows 11 24H2 build 26100.3915 or
 newer with the same feature. Terra checks the hypervisor capability before it
-creates a partition, and checks ARM64 support on ARM hosts. The Windows CI jobs
-run shared/VMM unit tests and exercise the CLI; they do not establish VM boot
-coverage.
+creates a partition, and checks ARM64 support on ARM hosts. Ordinary hosted CI
+checks compilation and unit tests; configured native runners run VM acceptance.
+Windows and macOS native VM acceptance is opt-in in CI until native runners are
+available. Releases require VM acceptance on Linux amd64; see
+[native test setup](../README.dev.md#verification).
 
 `make dist` includes `LICENSE`, `NOTICE`, GPL-2.0, and the selected MIT license texts
 beside the executable. Windows builds select windows-sys under Apache-2.0; its

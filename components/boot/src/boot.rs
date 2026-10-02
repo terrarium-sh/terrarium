@@ -608,7 +608,7 @@ fn arm_fdt(
         .map_err(|_| Error::BootDataTooLarge)?;
     fdt.property_null("always-on")
         .map_err(|_| Error::BootDataTooLarge)?;
-    fdt.property_array_u32("interrupts", &[1, 13, 4, 1, 10, 4, 1, 11, 4, 1, 14, 4])
+    fdt.property_array_u32("interrupts", &[1, 13, 4, 1, 14, 4, 1, 11, 4, 1, 10, 4])
         .map_err(|_| Error::BootDataTooLarge)?;
     fdt.end_node(timer).map_err(|_| Error::BootDataTooLarge)?;
     let psci = fdt
@@ -1016,6 +1016,14 @@ mod tests {
         assert_eq!(word(4) as usize, fdt.len());
         assert!((word(8) as usize) < fdt.len());
         assert!((word(12) as usize) < fdt.len());
+        let timer_interrupts = [1_u32, 13, 4, 1, 14, 4, 1, 11, 4, 1, 10, 4]
+            .into_iter()
+            .flat_map(u32::to_be_bytes)
+            .collect::<Vec<_>>();
+        assert!(
+            fdt.windows(timer_interrupts.len())
+                .any(|bytes| bytes == timer_interrupts)
+        );
         for name in [
             "memory@40000000",
             "intc@8000000",

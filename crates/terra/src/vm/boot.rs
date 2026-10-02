@@ -526,10 +526,7 @@ async fn spawn_foreground(
 ) -> Result<ExitCode> {
     let LaunchedVm { mut child, _guard } = spawn_vm_process(bx, spec, &run_lock, launcher)?;
     drop(run_lock);
-    #[cfg(unix)]
     let ready = relay_foreground_stop(bx).and_then(|()| start_ready_reader(&mut child));
-    #[cfg(not(unix))]
-    let ready = start_ready_reader(&mut child);
     let ready = match ready {
         Ok(ready) => ready,
         Err(error) => {
@@ -575,10 +572,9 @@ async fn spawn_foreground(
     result
 }
 
-#[cfg(unix)]
 fn relay_foreground_stop(bx: &BoxRef) -> Result<()> {
-    use terra_platform::io::local::LocalStream;
-    let (host, mut receiver) = LocalStream::pair().context("creating foreground stop channel")?;
+    let (host, mut receiver) = terra_platform::io::local::create_local_pair()
+        .context("creating foreground stop channel")?;
     let bx = bx.clone();
     std::thread::Builder::new()
         .name("foreground-stop".into())
@@ -593,7 +589,7 @@ fn relay_foreground_stop(bx: &BoxRef) -> Result<()> {
             }
         })
         .context("starting foreground stop relay")?;
-    sys::register_stop_channel(host.into());
+    sys::register_stop_channel(host);
     sys::install_stop_signal_handlers();
     Ok(())
 }

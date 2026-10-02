@@ -1694,6 +1694,7 @@ dependencies = [
  "libc",
  "log",
  "rustix",
+ "tempfile",
  "terra-limits",
  "tokio",
  "tokio-util",

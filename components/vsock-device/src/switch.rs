@@ -306,9 +306,6 @@ impl VsockSwitch {
             return;
         }
         self.connection = Some(connection);
-        if !self.respond(&connection, OP_SHUTDOWN, header.flags) {
-            self.drop_connection();
-        }
     }
 
     fn on_data(&mut self, header: &VsockHeader, data: &[u8]) {

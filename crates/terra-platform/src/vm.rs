@@ -170,7 +170,8 @@ pub trait VcpuHandler: Send {
     all(
         target_os = "windows",
         any(target_arch = "x86_64", target_arch = "aarch64")
-    )
+    ),
+    all(target_os = "macos", target_arch = "aarch64")
 ))]
 pub(crate) fn report_vcpu_failure<T, E: std::fmt::Display>(
     id: impl std::fmt::Display,
