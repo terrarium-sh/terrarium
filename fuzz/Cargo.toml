@@ -18,7 +18,7 @@ terra-protocol = { path = "../crates/terra-protocol" }
 terra-device-transport = { path = "../components/device-transport" }
 terra-fs-component = { path = "../components/fs" }
 terra-vsock-device = { path = "../components/vsock-device" }
-wasmtime = { version = "=49.0.1", default-features = false, features = ["std"] }
+wasmtime = { version = "=49.0.2", default-features = false, features = ["std"] }
 
 [[bin]]
 name = "network_policy"
