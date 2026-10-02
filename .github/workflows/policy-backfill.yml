@@ -34,13 +34,24 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       RELEASE_TAG: ${{ inputs.release_tag }}
     steps:
+      - name: Enable KVM access
+        if: ${{ runner.environment == 'github-hosted' }}
+        run: |
+          if [ -c /dev/kvm ]; then
+            sudo setfacl -m "u:$(id -u):rw" /dev/kvm
+          fi
       - name: Check native KVM
         id: kvm
         run: |
           if [ -c /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
             echo 'available=true' >> "$GITHUB_OUTPUT"
+          elif [ -c /dev/kvm ]; then
+            ls -l /dev/kvm
+            id
+            echo '::error::The runner cannot read/write /dev/kvm; grant KVM access or select a KVM-capable policy runner.'
+            exit 1
           else
-            echo '::error::Native /dev/kvm is unavailable; select a KVM-capable policy runner.'
+            echo '::error::Native /dev/kvm is absent; select a KVM-capable policy runner.'
             exit 1
           fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

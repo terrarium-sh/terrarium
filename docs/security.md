@@ -146,7 +146,7 @@ The default Linux [host VM launcher](vm-launchers.md) restricts the native VM
 process outside this component boundary. The built-in Bubblewrap launcher
 restricts its mount view, process namespaces, capabilities, and syscalls while
 sharing the host network namespace. Releases require a native KVM boot with the
-default jail and built-in policy on each Linux architecture; missing KVM or a
+default jail and built-in policy on Linux amd64; missing KVM or a
 failed boot blocks publication. Generated-policy enforcement is optional CI
 coverage and does not gate releases. Linux
 uses an explicitly configured raw seccomp policy, then the override at

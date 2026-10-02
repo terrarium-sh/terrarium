@@ -318,6 +318,9 @@ Linux needs read/write KVM and unprivileged user namespaces, macOS needs Apple
 Silicon with Hypervisor.framework access, and Windows needs working WHP. Configured
 native runners run the full gates automatically. Hosted builds on the other
 platforms run compiler and unit checks and report missing boot coverage.
+Hosted Linux jobs grant the runner account read/write access to an existing
+`/dev/kvm` before VM and policy checks. A missing device still fails required VM
+gates; self-hosted runners must configure their own KVM permissions.
 
 After a native host build (and signing on macOS), install Zig 0.16.0 for the guest
 probes. Use a short temporary directory with enough disk space (`TMPDIR` on Unix,

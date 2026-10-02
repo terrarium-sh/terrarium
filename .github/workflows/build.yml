@@ -125,6 +125,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Enable KVM access
+        if: ${{ runner.environment == 'github-hosted' }}
+        run: |
+          if [ -c /dev/kvm ]; then
+            sudo setfacl -m "u:$(id -u):rw" /dev/kvm
+          fi
       - name: Free runner disk
         if: ${{ runner.environment == 'github-hosted' }}
         run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache /usr/local/.ghcup /usr/local/share/boost
@@ -185,8 +191,14 @@ jobs:
         if: ${{ !cancelled() && steps.host-build.outcome == 'success' }}
         timeout-minutes: 45
         run: |
+          if [ ! -c /dev/kvm ]; then
+            echo '::error::Linux amd64 VM tests require a native /dev/kvm device; configure LINUX_X64_VM_RUNNER.'
+            exit 1
+          fi
           if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
-            echo '::error::Linux amd64 VM tests require read/write /dev/kvm; configure LINUX_X64_VM_RUNNER.'
+            ls -l /dev/kvm
+            id
+            echo '::error::The runner cannot read/write /dev/kvm; grant KVM access or configure LINUX_X64_VM_RUNNER.'
             exit 1
           fi
           status=0
@@ -251,6 +263,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Enable KVM access
+        if: ${{ runner.environment == 'github-hosted' }}
+        run: |
+          if [ -c /dev/kvm ]; then
+            sudo setfacl -m "u:$(id -u):rw" /dev/kvm
+          fi
       - name: Free runner disk
         if: ${{ runner.environment == 'github-hosted' }}
         run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache /usr/local/.ghcup /usr/local/share/boost
@@ -310,8 +328,14 @@ jobs:
             echo '::notice title=KVM gates skipped::ARM64 VM tests require native_vm_tests or LINUX_ARM64_VM_RUNNER.'
             exit 0
           fi
+          if [ ! -c /dev/kvm ]; then
+            echo '::error::Native VM acceptance requires a native /dev/kvm device; configure LINUX_ARM64_VM_RUNNER.'
+            exit 1
+          fi
           if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
-            echo '::error::Native VM acceptance requires read/write /dev/kvm; configure LINUX_ARM64_VM_RUNNER.'
+            ls -l /dev/kvm
+            id
+            echo '::error::The runner cannot read/write /dev/kvm; grant KVM access or configure LINUX_ARM64_VM_RUNNER.'
             exit 1
           fi
           status=0
@@ -397,14 +421,24 @@ jobs:
         run: |
           chmod 755 "build/seccomp-harnesses/${{ matrix.target }}/boot" "build/seccomp-harnesses/${{ matrix.target }}/native_boot" "build/seccomp-harnesses/${{ matrix.target }}/terra_lib"
           test -s crates/terra/tests/assets/bwrap_jail_probe.c
+      - name: Enable KVM access
+        if: ${{ runner.environment == 'github-hosted' && steps.build.outputs.ready == 'true' }}
+        run: |
+          if [ -c /dev/kvm ]; then
+            sudo setfacl -m "u:$(id -u):rw" /dev/kvm
+          fi
       - name: Check native KVM
         id: kvm
         if: ${{ steps.build.outputs.ready == 'true' }}
         run: |
           if [ -c /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
             echo 'available=true' >> "$GITHUB_OUTPUT"
+          elif [ -c /dev/kvm ]; then
+            ls -l /dev/kvm
+            id
+            echo 'The runner cannot read/write /dev/kvm; no policy was generated.' >> "$GITHUB_STEP_SUMMARY"
           else
-            echo 'Native /dev/kvm is unavailable; no policy was generated.' >> "$GITHUB_STEP_SUMMARY"
+            echo 'Native /dev/kvm is absent; no policy was generated.' >> "$GITHUB_STEP_SUMMARY"
           fi
       - name: Read Zig version
         id: zig-version
