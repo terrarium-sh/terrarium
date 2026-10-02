@@ -100,6 +100,7 @@ pub async fn run(
     lock: &File,
     on_ready: impl FnOnce() + Send,
 ) -> Result<ExitCode> {
+    #[cfg(unix)]
     super::resources::limit_vm_process()?;
     logs::init(bx)?;
     let component_memory_limits = spec.cfg.components.memory_limits()?;

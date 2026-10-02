@@ -243,6 +243,7 @@ pub struct VmChildGuard(OwnedHandle);
 
 pub fn supervise_vm_child(command: &mut Command, foreground: bool) -> Result<Option<VmChildGuard>> {
     use std::os::windows::io::FromRawHandle;
+    use std::os::windows::process::CommandExt;
     use windows_sys::Win32::System::JobObjects::{
         CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
         JobObjectExtendedLimitInformation, SetInformationJobObject,
@@ -251,7 +252,6 @@ pub fn supervise_vm_child(command: &mut Command, foreground: bool) -> Result<Opt
         detach(command);
         return Ok(None);
     }
-    use std::os::windows::process::CommandExt;
     command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED);
     // SAFETY: null means no security attributes or name; OwnedHandle closes the returned job.
     let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
