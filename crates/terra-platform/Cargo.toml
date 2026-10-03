@@ -26,6 +26,7 @@ applevisor-sys = { version = "=1.0.0", default-features = false, features = ["ma
 
 [target.'cfg(target_os = "windows")'.dependencies]
 uds_windows = "1.2.1"
+tempfile.workspace = true
 tokio = { version = "1", features = ["io-util", "rt"] }
 async-io = "2.6.0"
 tokio-util = { version = "0.7", features = ["compat"] }

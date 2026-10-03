@@ -9,8 +9,6 @@ pub struct VcpuGroup {
     pub(super) stop: Arc<AtomicBool>,
     threads: Vec<std::thread::JoinHandle<Result<(), String>>>,
     hard_stop: Option<fn() -> !>,
-    #[cfg(target_arch = "aarch64")]
-    pub(super) secondary: Option<Arc<crate::windows::aarch64::worker::ArmCpuStarts>>,
 }
 
 impl VcpuGroup {
@@ -23,8 +21,6 @@ impl VcpuGroup {
             stop: Arc::new(AtomicBool::new(false)),
             threads: Vec::new(),
             hard_stop,
-            #[cfg(target_arch = "aarch64")]
-            secondary: None,
         }
     }
 
@@ -44,10 +40,6 @@ impl VcpuGroup {
 
     pub fn request_stop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        #[cfg(target_arch = "aarch64")]
-        if let Some(secondary) = &self.secondary {
-            secondary.stop();
-        }
         for id in (0_u32..).take(self.threads.len()) {
             let _ = self.partition.cancel_vcpu(id);
         }

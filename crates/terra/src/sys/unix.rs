@@ -14,12 +14,8 @@ pub(crate) fn file_link_count(path: &Path) -> Result<u64> {
 }
 
 pub fn try_lock_run(path: &Path) -> std::result::Result<File, std::fs::TryLockError> {
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(path)
-        .map_err(std::fs::TryLockError::Error)?;
+    let file =
+        super::open_regular_file_for_write(path, true).map_err(std::fs::TryLockError::Error)?;
     file.try_lock()?;
     Ok(file)
 }
@@ -121,47 +117,156 @@ pub fn set_owner_only(path: &Path, dir: bool) -> Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
 }
 
-/// Give the child its own process group, so Ctrl-C in the starting terminal
-/// does not reach the VM.
+#[allow(unsafe_code)]
 pub fn detach(cmd: &mut Command) {
     use std::os::unix::process::CommandExt;
-    cmd.process_group(0);
+    // SAFETY: setsid is async-signal-safe between fork and exec.
+    unsafe {
+        cmd.pre_exec(|| {
+            rustix::process::setsid()
+                .map(|_| ())
+                .map_err(std::io::Error::from)
+        });
+    }
 }
 
 /// The descriptor a boot hands its VM process the box's run lock on, already
 /// held.
 const LOCK_FD: std::os::fd::RawFd = 3;
 
-/// Hand `lock` to the spawned child as [`LOCK_FD`]. A duplicate descriptor
-/// holds the same `flock`, released only when every one of them closes.
 #[allow(unsafe_code)]
-pub fn pass_lock(cmd: &mut Command, lock: &File) -> Result<File> {
+fn duplicate_above_handoff(file: &File) -> Result<File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    // SAFETY: fcntl duplicates an open descriptor; File takes ownership only on success.
+    let fd = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 16) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: successful fcntl returned a new descriptor owned only here.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[allow(unsafe_code)]
+pub(crate) fn pass_descriptor(cmd: &mut Command, file: &File, target: i32) -> Result<File> {
     use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
-    let inherited = lock.try_clone()?;
-    let fd = inherited.as_raw_fd();
-    // SAFETY: the closure runs between fork and exec, where only
-    // async-signal-safe calls are allowed - `dup2` and `fcntl` are both.
+    let inherited = duplicate_above_handoff(file)?;
+    let source = inherited.as_raw_fd();
+    // SAFETY: dup2 is async-signal-safe between fork and exec; source remains open until spawn.
     unsafe {
         cmd.pre_exec(move || {
-            let borrowed = rustix::fd::BorrowedFd::borrow_raw(fd);
-            // `dup2` onto the same number is a no-op that leaves CLOEXEC set,
-            // and the lock is commonly opened as fd 3 already.
-            if fd == LOCK_FD {
-                rustix::io::fcntl_setfd(borrowed, rustix::io::FdFlags::empty())
-                    .map_err(std::io::Error::from)?;
-            } else {
-                if libc::dup2(fd, LOCK_FD) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                let target = rustix::fd::BorrowedFd::borrow_raw(LOCK_FD);
-                rustix::io::fcntl_setfd(target, rustix::io::FdFlags::empty())
-                    .map_err(std::io::Error::from)?;
+            if libc::dup2(source, target) < 0 {
+                return Err(std::io::Error::last_os_error());
             }
             Ok(())
         });
     }
     Ok(inherited)
+}
+
+/// Hand `lock` to the spawned child as [`LOCK_FD`]. A duplicate descriptor
+/// holds the same `flock`, released only when every one of them closes.
+pub fn pass_lock(cmd: &mut Command, lock: &File) -> Result<File> {
+    pass_descriptor(cmd, lock, LOCK_FD)
+}
+
+pub struct VmChildGuard {
+    _write: File,
+    _read: File,
+}
+
+#[allow(unsafe_code)]
+pub fn supervise_vm_child(cmd: &mut Command, foreground: bool) -> Result<Option<VmChildGuard>> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::process::CommandExt;
+    if !foreground {
+        detach(cmd);
+        return Ok(None);
+    }
+    detach(cmd);
+    let mut ends = [0; 2];
+    // SAFETY: pipe initializes both integer descriptors on success.
+    if unsafe { libc::pipe(ends.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: successful pipe returned two distinct owned descriptors.
+    let read = unsafe { File::from_raw_fd(ends[0]) };
+    // SAFETY: the write descriptor is the other owned pipe endpoint.
+    let write = unsafe { File::from_raw_fd(ends[1]) };
+    rustix::io::fcntl_setfd(&read, rustix::io::FdFlags::CLOEXEC).map_err(std::io::Error::from)?;
+    rustix::io::fcntl_setfd(&write, rustix::io::FdFlags::CLOEXEC).map_err(std::io::Error::from)?;
+    let inherited_read = duplicate_above_handoff(&read)?;
+    let inherited_write = duplicate_above_handoff(&write)?;
+    let read_fd = inherited_read.as_raw_fd();
+    let write_fd = inherited_write.as_raw_fd();
+    #[cfg(target_os = "linux")]
+    // SAFETY: getpid reads the current process identity without pointers.
+    let parent_pid = unsafe { libc::getpid() };
+    // SAFETY: getdtablesize reads the current descriptor limit without pointers.
+    let max_fd = unsafe { libc::getdtablesize() };
+    // SAFETY: fork, close, read, kill, and _exit are async-signal-safe after Command's fork.
+    unsafe {
+        cmd.pre_exec(move || {
+            #[cfg(target_os = "linux")]
+            {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != parent_pid {
+                    return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+                }
+            }
+            let watchdog = libc::fork();
+            if watchdog < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if watchdog == 0 {
+                for fd in 0..max_fd {
+                    if fd != read_fd {
+                        libc::close(fd);
+                    }
+                }
+                let mut byte = 0_u8;
+                loop {
+                    let count = libc::read(read_fd, (&raw mut byte).cast(), 1);
+                    if count == 0 {
+                        libc::kill(-libc::getpgrp(), libc::SIGKILL);
+                        libc::_exit(0);
+                    }
+                    if count < 0 {
+                        libc::_exit(1);
+                    }
+                }
+            }
+            libc::close(read_fd);
+            libc::close(write_fd);
+            Ok(())
+        });
+    }
+    Ok(Some(VmChildGuard {
+        _write: inherited_write,
+        _read: inherited_read,
+    }))
+}
+
+#[allow(clippy::unnecessary_wraps, reason = "matches fallible Windows setup")]
+pub fn attach_vm_child(_guard: &VmChildGuard, _child: &std::process::Child) -> Result<()> {
+    Ok(())
+}
+
+#[allow(unsafe_code)]
+pub fn kill_vm_child(child: &mut std::process::Child) -> Result<()> {
+    let pid = i32::try_from(child.id()).map_err(std::io::Error::other)?;
+    // SAFETY: an unreaped child cannot have its PID reused; signal the group only if it owns it.
+    let group = unsafe { libc::getpgid(pid) };
+    if group == pid {
+        // SAFETY: the unreaped child is the group leader, so its PID cannot be reused.
+        if unsafe { libc::kill(-pid, libc::SIGKILL) } == 0 {
+            return Ok(());
+        }
+        return Err(std::io::Error::last_os_error());
+    }
+    child.kill()
 }
 
 /// The run lock a boot passed down, or `None` when [`LOCK_FD`] is not the file
@@ -358,8 +463,7 @@ pub fn register_stop_channel(channel: std::os::fd::OwnedFd) {
 
 /// SIGINT/SIGTERM/SIGHUP ask the guest for its graceful stop - a host
 /// shutdown and a closed `--foreground` terminal included. Detached boxes
-/// hear none of this: [`detach`] puts them in their own process group, past
-/// any terminal's reach.
+/// hear none of this: [`detach`] starts a session without a controlling terminal.
 #[allow(unsafe_code)]
 pub fn install_stop_signal_handlers() {
     // SAFETY: `handler` does atomic stores and one `write`, both

@@ -9,7 +9,7 @@ mod bindings {
     });
 }
 
-use bindings::exports::terra::host::device_api::{Completion, Guest, Range};
+use bindings::exports::terra::host::device_api::Guest;
 use bindings::{exports, terra, wit_stream};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use futures::task::AtomicWaker;
@@ -259,13 +259,9 @@ fn request_type(header: &SplitRingDescriptor) -> Result<(u32, u64), DeviceError>
     ))
 }
 
-fn ioerr_completion(status_addr: u64, epoch: u64) -> Result<Completion, DeviceError> {
-    let status = write_status(status_addr, STATUS_IOERR, epoch).ok_or(DeviceError::NotReady)?;
-    Ok(Completion {
-        status_addr,
-        used_len: 1,
-        status,
-    })
+fn ioerr_completion(status_addr: u64, epoch: u64) -> Result<u32, DeviceError> {
+    write_status(status_addr, STATUS_IOERR, epoch).ok_or(DeviceError::NotReady)?;
+    Ok(1)
 }
 
 fn malformed_chain<F>(
@@ -273,9 +269,9 @@ fn malformed_chain<F>(
     epoch: u64,
     error: DeviceError,
     complete: F,
-) -> Result<Completion, DeviceError>
+) -> Result<u32, DeviceError>
 where
-    F: FnOnce(u64, u64) -> Result<Completion, DeviceError>,
+    F: FnOnce(u64, u64) -> Result<u32, DeviceError>,
 {
     status_addr.map_or(Err(error), |addr| complete(addr, epoch))
 }
@@ -296,6 +292,11 @@ fn ring_addr(base: u64, header: u64, index: u64, entry_size: u64) -> Result<u64,
                 .and_then(|offset| addr.checked_add(offset))
         })
         .ok_or(DeviceError::BadLen)
+}
+
+struct Range {
+    addr: u64,
+    len: u64,
 }
 
 struct Block;
@@ -346,7 +347,9 @@ impl Guest for Block {
         }
         Ok(())
     }
+}
 
+impl Block {
     async fn execute(
         req_type: u32,
         sector: u64,
@@ -451,7 +454,7 @@ impl Guest for Block {
         desc_table: u64,
         queue_size: u16,
         epoch: u64,
-    ) -> Result<Completion, DeviceError> {
+    ) -> Result<u32, DeviceError> {
         if !is_current(epoch) {
             return Err(DeviceError::NotReady);
         }
@@ -507,11 +510,7 @@ impl Guest for Block {
                 };
                 let used_len = u32::try_from(payload.checked_add(1).ok_or(DeviceError::TooLarge)?)
                     .map_err(|_| DeviceError::TooLarge)?;
-                return Ok(Completion {
-                    status_addr: desc.addr,
-                    used_len,
-                    status,
-                });
+                return Ok(used_len);
             }
             if (desc.flags & SPLIT_RING_DESC_F_WRITE != 0) != writable_data
                 || u64::from(desc.len) > MAX_SINGLE
@@ -656,14 +655,10 @@ async fn process_pending() -> Result<bool, DeviceError> {
         })?;
         return Ok(false);
     };
-    let completion = match Block::execute_chain(head, desc, size, epoch).await {
-        Ok(completion) => completion,
+    let used_len = match Block::execute_chain(head, desc, size, epoch).await {
+        Ok(used_len) => used_len,
         Err(DeviceError::NotReady) => return Ok(false),
-        Err(DeviceError::BadLen | DeviceError::BadQueue | DeviceError::TooLarge) => Completion {
-            status_addr: 0,
-            used_len: 0,
-            status: STATUS_IOERR,
-        },
+        Err(DeviceError::BadLen | DeviceError::BadQueue | DeviceError::TooLarge) => 0,
         Err(error) => return Err(error),
     };
     let _gate = RESET_GATE
@@ -676,7 +671,7 @@ async fn process_pending() -> Result<bool, DeviceError> {
         used,
         core::num::NonZeroU16::new(size).ok_or(DeviceError::BadLen)?,
         head,
-        completion.used_len,
+        used_len,
         |base, offset| ring_addr(base, offset, 0, 0),
         |address| {
             let bytes = terra::host::memory::read(address, 2).map_err(|_| DeviceError::BadLen)?;
@@ -808,23 +803,17 @@ mod tests {
             flags: SPLIT_RING_DESC_F_WRITE,
             next: 0,
         };
-        let completion = malformed_chain(
+        let used_len = malformed_chain(
             status_tail(&[header, status]),
             7,
             DeviceError::BadLen,
             |status_addr, epoch| {
                 assert_eq!((status_addr, epoch), (0x1000, 7));
-                Ok(Completion {
-                    status_addr,
-                    used_len: 1,
-                    status: STATUS_IOERR,
-                })
+                Ok(1)
             },
         )
         .unwrap();
-        assert_eq!(completion.status_addr, 0x1000);
-        assert_eq!(completion.used_len, 1);
-        assert_eq!(completion.status, STATUS_IOERR);
+        assert_eq!(used_len, 1);
         assert_eq!(status_tail(&[status]), None);
     }
 }

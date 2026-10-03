@@ -1,10 +1,10 @@
 use super::io::PreparedIo;
 use super::{
-    MAX_DIRECTORIES, MAX_READ, OpenDirectory, State, attr_out, clear_node_path, clear_runtime,
-    create_flags, directory, dirents, entry, flush_body, handle, host, host_error,
-    increment_lookup, mark_unused_if_unheld, name, names, node, node_id, open, open_flags,
-    read_file, rename_mode, repoint_node, sized_out, statfs, store_handle, symlink_parts,
-    timestamp, u32_at, u64_at, wasi_error, wire, write_file,
+    MAX_DIRECTORIES, MAX_READ, OpenDirectory, State, attr_out, clear_runtime, create_flags,
+    directory, dirents, entry, flush_body, handle, host, host_error, increment_lookup,
+    mark_unused_if_unheld, name, names, node, node_id, open, open_flags, read_file, rename_mode,
+    repoint_node, sized_out, statfs, store_handle, symlink_parts, timestamp, u32_at, u64_at,
+    wasi_error, wire, write_file,
 };
 use futures::FutureExt;
 use wire::Request;
@@ -165,19 +165,9 @@ async fn create_file(state: RequestState, request: &Request<'_>) -> Result<Vec<u
 async fn remove_entry(state: RequestState, request: &Request<'_>) -> Result<Vec<u8>, i32> {
     let name = name(request.body)?;
     let parent = request_node(state, request.node)?;
-    let removed_stat = match host::lookup(&parent, name.clone()).await {
-        Ok(removed) => removed.stat().await.ok(),
-        Err(_) => None,
-    };
     host::unlink(&parent, name, request.opcode == wire::RMDIR)
         .await
         .map_err(host_error)?;
-    if let Some(stat) = removed_stat {
-        state.with(|state| {
-            clear_node_path(state, &stat);
-            Ok(())
-        })?;
-    }
     Ok(Vec::new())
 }
 
@@ -198,10 +188,6 @@ async fn rename_entry(state: RequestState, request: &Request<'_>) -> Result<Vec<
     let old_parent = request_node(state, request.node)?;
     let new_parent = request_node(state, new_parent_id)?;
     let new_parent_descriptor = new_parent.resolve_descriptor().await.map_err(host_error)?;
-    let replaced_stat = match host::lookup(&new_parent, new_name.clone()).await {
-        Ok(replaced) => replaced.stat().await.ok(),
-        Err(_) => None,
-    };
     let renamed = host::lookup(&old_parent, old_name.clone())
         .await
         .map_err(host_error)?;
@@ -213,14 +199,6 @@ async fn rename_entry(state: RequestState, request: &Request<'_>) -> Result<Vec<
         repoint_node(state, &stat, new_parent_descriptor, new_name);
         Ok(())
     })?;
-    if let Some(replaced_stat) = replaced_stat
-        && (replaced_stat.dev, replaced_stat.ino) != (stat.dev, stat.ino)
-    {
-        state.with(|state| {
-            clear_node_path(state, &replaced_stat);
-            Ok(())
-        })?;
-    }
     Ok(Vec::new())
 }
 

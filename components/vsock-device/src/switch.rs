@@ -7,7 +7,6 @@ pub use terra_protocol::mux::MUX_VSOCK_PORT;
 
 pub const HOST_CID: u64 = 2;
 pub const GUEST_CID: u64 = 3;
-pub const MAX_CONNECTIONS: usize = 1;
 pub const MAX_DATA_BYTES: u32 = 64 * 1024;
 pub const RX_ALLOC: u32 = 64 * 1024;
 pub const MAX_TX_BYTES: usize = 256 * 1024;
@@ -72,7 +71,6 @@ pub struct Upstream {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VsockError {
-    TableFull,
     Backpressure,
     UnknownConnection,
 }
@@ -308,9 +306,6 @@ impl VsockSwitch {
             return;
         }
         self.connection = Some(connection);
-        if !self.respond(&connection, OP_SHUTDOWN, header.flags) {
-            self.drop_connection();
-        }
     }
 
     fn on_data(&mut self, header: &VsockHeader, data: &[u8]) {
@@ -487,15 +482,7 @@ impl VsockSwitch {
     }
 
     #[must_use]
-    pub fn connection_count(&self) -> usize {
-        self.connection.is_some().into()
-    }
-    #[must_use]
     pub fn connection_exists(&self, guest_port: u32, host_port: u32) -> bool {
-        self.connected(guest_port, host_port)
-    }
-    #[must_use]
-    pub fn connection_connected(&self, guest_port: u32, host_port: u32) -> bool {
         self.connected(guest_port, host_port)
     }
     #[must_use]

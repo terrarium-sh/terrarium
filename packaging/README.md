@@ -25,19 +25,22 @@ the first one's workload had been writing to.
 
 ## What terra needs from the environment
 
-These are the requirements the unit satisfies; anything stricter breaks it.
+These are the requirements the unit satisfies. Additional restrictions must
+permit the configured workload.
 
 | Requirement | Why | Unit knob |
 |---|---|---|
 | `/dev/kvm` read-write | the native VMM runs on KVM | `SupplementaryGroups=kvm`, `DeviceAllow=/dev/kvm rw`, no `PrivateDevices` |
 | Executable mappings | loading embedded AOT components | `MemoryDenyWriteExecute=no` |
-| Real host network | WASI capability imports open authorized host sockets | no `PrivateNetwork`, no `IPAddressDeny` |
+| Real host network | The VM opens policy-authorized host sockets; built-in Bubblewrap shares the host network namespace | no `PrivateNetwork`; IP filtering must permit configured destinations |
 | Writable `$HOME/.terra` | persistent box state | `StateDirectory=terra` + `Environment=HOME=%S/terra` |
 | A recipe to boot | `~/.terra/%i.yaml`, read by the `ExecStartPre` setup | yours to install; see below |
 
 The runtime needs no host namespace privileges. Host-directory mounts use the
 paths granted by the recipe. Run the service as the unprivileged `terra` user with KVM
 access; host-root execution is refused unless `TERRA_ALLOW_ROOT=1` is set.
+Root-managed service filtering can enforce network restrictions independently
+of recipe policy; see [network policy limits](../docs/security.md#network-policy-limits).
 
 ## One-time host setup
 
@@ -65,6 +68,11 @@ journalctl -u terra@pi-dev -f
 The recipe should define a `workload:` — headless there's no interactive shell to
 fall back to. Use recipe mounts for shared directories, and `terra sync`
 or volumes for guest files.
+For a custom seccomp policy, set `vm.bwrap.policy` to a raw BPF file. Validated
+policies are available as separate `terra-seccomp-<target>.tar.gz` release
+archives for manual use. Terra checks that setting, then
+`~/.terra/config/seccomp.bpf`, before using its built-in fallback when allowed; see the
+[host VM launcher guide](../docs/vm-launchers.md).
 
 ## Graceful stop
 
@@ -72,9 +80,9 @@ or volumes for guest files.
 the guest's control connection, the agent stops the workload (SIGTERM, then
 SIGKILL if it is still there 30 seconds later — an interactive shell ignores
 SIGTERM) and runs the recipe's `pre_stop` hooks, then the VM exits. The unit's
-`TimeoutStopSec` is 65 seconds; after that systemd
-escalates to SIGKILL, which still leaves no orphan (the VM runs inside terra's
-process).
+`TimeoutStopSec` is 65 seconds; after that systemd escalates to SIGKILL. The
+foreground CLI and its VM worker stay in the service cgroup, so systemd's
+cleanup reaches the worker too.
 
 ## Where the output goes
 
@@ -109,9 +117,11 @@ identity.
 Windows x64 requires Windows 10 version 1809 or newer with Windows Hypervisor
 Platform enabled. Windows ARM64 requires Windows 11 24H2 build 26100.3915 or
 newer with the same feature. Terra checks the hypervisor capability before it
-creates a partition, and checks ARM64 support on ARM hosts. The Windows CI jobs
-run shared/VMM unit tests and exercise the CLI; they do not establish VM boot
-coverage.
+creates a partition, and checks ARM64 support on ARM hosts. Ordinary hosted CI
+checks compilation and unit tests; configured native runners run VM acceptance.
+Windows and macOS native VM acceptance is opt-in in CI until native runners are
+available. Releases require VM acceptance on Linux amd64; see
+[native test setup](../README.dev.md#verification).
 
 `make dist` includes `LICENSE`, `NOTICE`, GPL-2.0, and the selected MIT license texts
 beside the executable. Windows builds select windows-sys under Apache-2.0; its

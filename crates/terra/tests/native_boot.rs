@@ -22,6 +22,8 @@ impl BoxFixture {
         let home = directory.path().join("home");
         std::fs::create_dir(&project).unwrap();
         std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(home.join(".terra")).unwrap();
+        std::fs::write(home.join(".terra/config.yaml"), "vm:\n  init: direct\n").unwrap();
         Self {
             terra: std::env::var_os("TERRA_BIN")
                 .map_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_terra")), PathBuf::from),
@@ -430,7 +432,14 @@ fn native_boot_forwards_shared_file_events() {
             "-o",
         ])
         .arg(&probe)
-        .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/assets/file_events_probe.c"))
+        .arg(
+            std::env::var_os("TERRA_TEST_ASSETS")
+                .map_or_else(
+                    || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/assets"),
+                    PathBuf::from,
+                )
+                .join("file_events_probe.c"),
+        )
         .status()
         .unwrap();
     assert!(status.success());

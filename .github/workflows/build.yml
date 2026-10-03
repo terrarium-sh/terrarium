@@ -7,13 +7,13 @@ on:
   workflow_dispatch:
     inputs:
       native_vm_tests:
-        description: Run macOS and Windows VM gates (requires hypervisor access on the runners)
+        description: Also require native VM tests on ARM64 Linux, macOS and Windows
         type: boolean
         default: false
   workflow_call:
     inputs:
       native_vm_tests:
-        description: Run macOS and Windows VM gates
+        description: Also require native VM tests on ARM64 Linux, macOS and Windows
         type: boolean
         default: false
       release_sources:
@@ -88,6 +88,7 @@ jobs:
             build/rootfs.img.gz
             build/volume.img.gz
             build/boot.img.gz
+            build/bwrap-${{ matrix.arch }}
           if-no-files-found: error
           compression-level: 0
 
@@ -119,12 +120,22 @@ jobs:
     name: Build Linux (x86_64)
     needs: guest-assets
     if: ${{ !cancelled() }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LINUX_X64_VM_RUNNER || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Enable KVM access
+        if: ${{ runner.environment == 'github-hosted' }}
+        run: |
+          if [ -c /dev/kvm ]; then
+            printf 'KERNEL=="kvm", OWNER="%s", MODE="0600", OPTIONS+="static_node=kvm"\n' "$(id -u)" | sudo tee /etc/udev/rules.d/99-terra-kvm.rules
+            sudo udevadm control --reload-rules
+            sudo chown "$(id -u)" /dev/kvm
+            sudo chmod 0600 /dev/kvm
+          fi
       - name: Free runner disk
+        if: ${{ runner.environment == 'github-hosted' }}
         run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache /usr/local/.ghcup /usr/local/share/boost
       - name: Allow unprivileged user namespaces
         run: |
@@ -181,19 +192,26 @@ jobs:
           LLVM_COV="$llvm_bin/llvm-cov" LLVM_PROFDATA="$llvm_bin/llvm-profdata" python3 scripts/coverage-network-policy.py
       - name: KVM gates
         if: ${{ !cancelled() && steps.host-build.outcome == 'success' }}
-        timeout-minutes: 15
+        timeout-minutes: 45
         run: |
+          if [ ! -c /dev/kvm ]; then
+            echo '::error::Linux amd64 VM tests require a native /dev/kvm device; configure LINUX_X64_VM_RUNNER.'
+            exit 1
+          fi
           if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
-            echo '::notice title=KVM gates skipped::This hosted runner has no read/write /dev/kvm.'
-            exit 0
+            ls -l /dev/kvm
+            id
+            echo '::error::The runner cannot read/write /dev/kvm; grant KVM access or configure LINUX_X64_VM_RUNNER.'
+            exit 1
           fi
           status=0
-          TERRA_BIN="$PWD/dist/terra" cargo test --no-fail-fast --locked --target x86_64-unknown-linux-musl -p terra --test native_boot native_boot_executes_shell -- --ignored --test-threads=1 --nocapture || status=1
-          TERRA_BIN="$PWD/dist/terra" cargo test --no-fail-fast --locked --target x86_64-unknown-linux-musl -p terra --test native_boot native_boot_forwards_shared_file_events -- --ignored --test-threads=1 --nocapture || status=1
+          TERRA_BIN="$PWD/dist/terra" cargo test --no-fail-fast --locked --target x86_64-unknown-linux-musl -p terra --test native_boot -- --ignored --test-threads=1 --nocapture || status=1
           cargo test --no-fail-fast --locked --target x86_64-unknown-linux-musl -p terra-runtime --lib -- --ignored --test-threads=1 || status=1
-          cargo test --no-fail-fast --locked --target x86_64-unknown-linux-musl -p terra-platform --test native_vm -- --ignored --test-threads=1 || status=1
-          cargo test --no-fail-fast --locked --target x86_64-unknown-linux-musl -p terra-platform --lib cpuid_matches_the_fixed_vcpu_count -- --ignored --test-threads=1 || status=1
+          cargo test --no-fail-fast --locked --target x86_64-unknown-linux-musl -p terra-platform --lib --test native_vm -- --ignored --test-threads=1 || status=1
           TERRA_BIN="$PWD/dist/terra" cargo test --no-fail-fast --locked --target x86_64-unknown-linux-musl -p terra --test boot --test memory -- --ignored --test-threads=1 || status=1
+          set -o pipefail
+          TERRA_BIN="$PWD/dist/terra" TERRA_SECCOMP_ENFORCED=1 cargo test --locked --target x86_64-unknown-linux-musl -p terra --test boot -- --exact bwrap_enforces_vm_and_vcpu_threads --ignored --nocapture | tee default-jail.log || status=1
+          grep -Fq 'test result: ok. 1 passed; 0 failed; 0 ignored;' default-jail.log || status=1
           exit "$status"
       - name: Reclaim component build space
         if: ${{ !cancelled() }}
@@ -229,12 +247,22 @@ jobs:
     name: Build Linux (aarch64)
     needs: guest-assets
     if: ${{ !cancelled() }}
-    runs-on: ubuntu-24.04-arm
+    runs-on: ${{ vars.LINUX_ARM64_VM_RUNNER || 'ubuntu-24.04-arm' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Enable KVM access
+        if: ${{ runner.environment == 'github-hosted' }}
+        run: |
+          if [ -c /dev/kvm ]; then
+            printf 'KERNEL=="kvm", OWNER="%s", MODE="0600", OPTIONS+="static_node=kvm"\n' "$(id -u)" | sudo tee /etc/udev/rules.d/99-terra-kvm.rules
+            sudo udevadm control --reload-rules
+            sudo chown "$(id -u)" /dev/kvm
+            sudo chmod 0600 /dev/kvm
+          fi
       - name: Free runner disk
+        if: ${{ runner.environment == 'github-hosted' }}
         run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache /usr/local/.ghcup /usr/local/share/boost
       - name: Allow unprivileged user namespaces
         run: |
@@ -286,27 +314,157 @@ jobs:
           ./dist/terra --help
       - name: KVM product gates
         if: ${{ !cancelled() && steps.host-build.outcome == 'success' }}
+        timeout-minutes: 45
         run: |
-          if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
-            echo '::notice title=KVM gates skipped::This hosted runner has no read/write /dev/kvm.'
+          if [ "${{ inputs.native_vm_tests }}" != true ] && [ -z "${{ vars.LINUX_ARM64_VM_RUNNER }}" ]; then
+            echo '::notice title=KVM gates skipped::ARM64 VM tests require native_vm_tests or LINUX_ARM64_VM_RUNNER.'
             exit 0
+          fi
+          if [ ! -c /dev/kvm ]; then
+            echo '::error::Native VM acceptance requires a native /dev/kvm device; configure LINUX_ARM64_VM_RUNNER.'
+            exit 1
+          fi
+          if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
+            ls -l /dev/kvm
+            id
+            echo '::error::The runner cannot read/write /dev/kvm; grant KVM access or configure LINUX_ARM64_VM_RUNNER.'
+            exit 1
           fi
           status=0
           cargo test --no-fail-fast --locked --target aarch64-unknown-linux-musl -p terra-runtime --lib -- --ignored --test-threads=1 || status=1
-          cargo test --no-fail-fast --locked --target aarch64-unknown-linux-musl -p terra-platform --test native_vm -- --ignored --test-threads=1 || status=1
-          TERRA_BIN="$PWD/dist/terra" cargo test --no-fail-fast --locked --target aarch64-unknown-linux-musl -p terra --test native_boot native_boot_forwards_shared_file_events -- --ignored --test-threads=1 --nocapture || status=1
+          cargo test --no-fail-fast --locked --target aarch64-unknown-linux-musl -p terra-platform --lib --test native_vm -- --ignored --test-threads=1 || status=1
+          TERRA_BIN="$PWD/dist/terra" cargo test --no-fail-fast --locked --target aarch64-unknown-linux-musl -p terra --test native_boot -- --ignored --test-threads=1 --nocapture || status=1
           TERRA_BIN="$PWD/dist/terra" cargo test --no-fail-fast --locked --target aarch64-unknown-linux-musl -p terra --test boot --test memory -- --ignored --test-threads=1 || status=1
+          set -o pipefail
+          TERRA_BIN="$PWD/dist/terra" TERRA_SECCOMP_ENFORCED=1 cargo test --locked --target aarch64-unknown-linux-musl -p terra --test boot -- --exact bwrap_enforces_vm_and_vcpu_threads --ignored --nocapture | tee default-jail.log || status=1
+          grep -Fq 'test result: ok. 1 passed; 0 failed; 0 ignored;' default-jail.log || status=1
           exit "$status"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: terra-aarch64-linux
           path: dist
 
+  linux-policy:
+    name: Enforce Linux policy (${{ matrix.arch }})
+    needs: [linux-x86_64, linux-aarch64]
+    if: ${{ !cancelled() }}
+    continue-on-error: ${{ !inputs.release_sources || matrix.arch != 'x86_64' }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-musl
+            runner: ${{ vars.LINUX_X64_VM_RUNNER || 'ubuntu-latest' }}
+          - arch: aarch64
+            target: aarch64-unknown-linux-musl
+            runner: ${{ vars.LINUX_ARM64_VM_RUNNER || 'ubuntu-24.04-arm' }}
+    steps:
+      - name: Check matching build
+        id: build
+        env:
+          X86_RESULT: ${{ needs.linux-x86_64.result }}
+          ARM_RESULT: ${{ needs.linux-aarch64.result }}
+        run: |
+          if { [ "${{ matrix.arch }}" = x86_64 ] && [ "$X86_RESULT" = success ]; } ||
+             { [ "${{ matrix.arch }}" = aarch64 ] && [ "$ARM_RESULT" = success ]; }; then
+            echo 'ready=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'Matching Linux build did not succeed; no policy was generated.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ steps.build.outputs.ready == 'true' }}
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ steps.build.outputs.ready == 'true' }}
+        with:
+          name: terra-${{ matrix.arch }}-linux
+          path: dist
+      - name: Restore executable distribution
+        if: ${{ steps.build.outputs.ready == 'true' }}
+        run: chmod 755 dist/terra
+      - name: Enable KVM access
+        if: ${{ runner.environment == 'github-hosted' && steps.build.outputs.ready == 'true' }}
+        run: |
+          if [ -c /dev/kvm ]; then
+            printf 'KERNEL=="kvm", OWNER="%s", MODE="0600", OPTIONS+="static_node=kvm"\n' "$(id -u)" | sudo tee /etc/udev/rules.d/99-terra-kvm.rules
+            sudo udevadm control --reload-rules
+            sudo chown "$(id -u)" /dev/kvm
+            sudo chmod 0600 /dev/kvm
+          fi
+      - name: Check native KVM
+        id: kvm
+        if: ${{ steps.build.outputs.ready == 'true' }}
+        run: |
+          if [ -c /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+            echo 'available=true' >> "$GITHUB_OUTPUT"
+          elif [ -c /dev/kvm ]; then
+            ls -l /dev/kvm
+            id
+            echo 'The runner cannot read/write /dev/kvm; no policy was generated.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'Native /dev/kvm is absent; no policy was generated.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Prepare policy validation
+        id: tools
+        if: ${{ steps.kvm.outputs.available == 'true' }}
+        continue-on-error: true
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          unshare -U -r true
+      - name: Generate and enforce policy
+        id: generate
+        if: ${{ steps.kvm.outputs.available == 'true' && steps.tools.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 120
+        run: ./dist/terra self-test --generate-policy --validate-vm --policy-output "build/seccomp/${{ matrix.target }}" --policy-diagnostics "build/seccomp-traces/${{ matrix.target }}"
+      - name: Check complete validated set
+        id: validated
+        if: ${{ steps.generate.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 libseccomp2
+          mkdir -p "build/seccomp-artifact/${{ matrix.target }}"
+          cp -L "build/seccomp/${{ matrix.target }}/terra.seccomp.json" \
+            "build/seccomp/${{ matrix.target }}/terra.seccomp.bpf" \
+            "build/seccomp/${{ matrix.target }}/terra.seccomp-manifest.json" \
+            "build/seccomp/${{ matrix.target }}/.validated" \
+            "build/seccomp-artifact/${{ matrix.target }}/"
+          python3 scripts/verify-seccomp-artifact.py "build/seccomp-artifact/${{ matrix.target }}" "$PWD/dist/terra" "${{ matrix.target }}"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ steps.validated.outcome == 'success' }}
+        continue-on-error: true
+        with:
+          name: terra-seccomp-${{ matrix.target }}
+          path: build/seccomp-artifact/${{ matrix.target }}/
+          if-no-files-found: error
+          include-hidden-files: true
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ always() && steps.generate.outcome != 'skipped' }}
+        continue-on-error: true
+        with:
+          name: seccomp-diagnostics-${{ matrix.target }}
+          path: build/seccomp-traces/
+          if-no-files-found: warn
+      - name: Report policy result
+        if: ${{ always() && steps.build.outputs.ready == 'true' && steps.kvm.outputs.available == 'true' }}
+        run: |
+          if [ "${{ steps.validated.outcome }}" = success ]; then
+            echo 'Enforced policy validation passed for ${{ matrix.target }}; complete policy set uploaded.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'Policy preparation, generation, or enforced validation failed for ${{ matrix.target }}; no policy set was uploaded. See the failed step and available diagnostics.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   macos-aarch64:
     name: Build macOS (aarch64)
     needs: guest-assets
     if: ${{ !cancelled() }}
-    runs-on: macos-15
+    runs-on: ${{ vars.MACOS_ARM64_VM_RUNNER || 'macos-15' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -347,14 +505,23 @@ jobs:
         if: ${{ !cancelled() && steps.host-build.outcome == 'success' }}
         run: cargo test --no-fail-fast --locked --target aarch64-apple-darwin --workspace
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
-        if: ${{ !cancelled() && steps.host-build.outcome == 'success' && inputs.native_vm_tests }}
+        if: ${{ !cancelled() && steps.host-build.outcome == 'success' && (inputs.native_vm_tests || vars.MACOS_ARM64_VM_RUNNER != '') }}
         with:
           version: ${{ steps.zig-version.outputs.version }}
       - name: Native VM acceptance
-        if: ${{ !cancelled() && steps.host-build.outcome == 'success' && inputs.native_vm_tests }}
+        if: ${{ !cancelled() && steps.host-build.outcome == 'success' && (inputs.native_vm_tests || vars.MACOS_ARM64_VM_RUNNER != '') }}
+        timeout-minutes: 45
+        env:
+          CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER: sh scripts/run-macos-vm-test
+          TMPDIR: /tmp
         run: |
-          CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER="sh scripts/run-macos-vm-test" cargo test --no-fail-fast --locked --target aarch64-apple-darwin -p terra-platform --lib --test native_vm -- --ignored --test-threads=1
+          cargo test --no-fail-fast --locked --target aarch64-apple-darwin -p terra-platform --lib --test native_vm -- --ignored --test-threads=1
+          cargo test --no-fail-fast --locked --target aarch64-apple-darwin -p terra-runtime --lib -- --ignored --test-threads=1
           TERRA_BIN="$PWD/dist/terra" cargo test --no-fail-fast --locked --target aarch64-apple-darwin -p terra --test native_boot --test boot --test memory -- --ignored --test-threads=1 --nocapture
+      - name: Report macOS boot coverage
+        if: ${{ !(inputs.native_vm_tests || vars.MACOS_ARM64_VM_RUNNER != '') }}
+        run: |
+          echo 'macOS native VM acceptance was not run; configure MACOS_ARM64_VM_RUNNER with Hypervisor.framework access or request native_vm_tests.' >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: terra-aarch64-macos
@@ -431,28 +598,27 @@ jobs:
         if: ${{ !cancelled() && steps.host-build.outcome == 'success' && (inputs.native_vm_tests || matrix.native_vm_tests) }}
         timeout-minutes: 5
         shell: pwsh
-        run: cargo test --no-fail-fast --locked --target ${{ matrix.target }} -p terra-platform --test native_vm -- --ignored --test-threads=1
-      - name: Native boot and shell gate
-        if: ${{ !cancelled() && steps.host-build.outcome == 'success' && (inputs.native_vm_tests || matrix.native_vm_tests) }}
-        timeout-minutes: 10
-        shell: pwsh
-        run: |
-          $env:TERRA_BIN = (Resolve-Path ./dist/terra.exe).Path
-          cargo test --no-fail-fast --locked --target ${{ matrix.target }} -p terra --test native_boot native_boot_executes_shell -- --ignored --test-threads=1 --nocapture
+        run: cargo test --no-fail-fast --locked --target ${{ matrix.target }} -p terra-platform --lib --test native_vm -- --ignored --test-threads=1
       - name: Report Windows boot coverage
         if: ${{ !(inputs.native_vm_tests || matrix.native_vm_tests) }}
         shell: pwsh
         run: |
           '### Windows boot was not tested' >> $env:GITHUB_STEP_SUMMARY
-          'Set WINDOWS_X64_VM_RUNNER or WINDOWS_ARM64_VM_RUNNER to a runner label with working WHP to enable the required boot and shell gate.' >> $env:GITHUB_STEP_SUMMARY
+          'Set WINDOWS_X64_VM_RUNNER or WINDOWS_ARM64_VM_RUNNER to a runner label with working WHP to enable full native VM acceptance.' >> $env:GITHUB_STEP_SUMMARY
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
-        if: ${{ !cancelled() && steps.host-build.outcome == 'success' && inputs.native_vm_tests }}
+        if: ${{ !cancelled() && steps.host-build.outcome == 'success' && (inputs.native_vm_tests || matrix.native_vm_tests) }}
         with:
           version: ${{ steps.zig-version.outputs.version }}
       - name: Native VM acceptance
-        if: ${{ !cancelled() && steps.host-build.outcome == 'success' && inputs.native_vm_tests }}
+        if: ${{ !cancelled() && steps.host-build.outcome == 'success' && (inputs.native_vm_tests || matrix.native_vm_tests) }}
+        timeout-minutes: 45
         shell: pwsh
+        env:
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
         run: |
+          cargo test --no-fail-fast --locked --target ${{ matrix.target }} -p terra-runtime --lib -- --ignored --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $env:TERRA_BIN = (Resolve-Path ./dist/terra.exe).Path
           cargo test --no-fail-fast --locked --target ${{ matrix.target }} -p terra --test native_boot --test boot --test memory -- --ignored --test-threads=1 --nocapture
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

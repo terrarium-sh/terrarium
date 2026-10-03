@@ -266,14 +266,6 @@ fn repoint_node(
     }
 }
 
-fn clear_node_path(state: &mut State, stat: &host::Stat) {
-    if let Some(&id) = state.node_id_by_identity.get(&(stat.dev, stat.ino))
-        && let Some(record) = state.nodes.get_mut(&id)
-    {
-        record.node.clear_path();
-    }
-}
-
 fn increment_lookup(state: &mut State, id: u64) {
     if let Some(record) = state.nodes.get_mut(&id) {
         record.lookups = record.lookups.saturating_add(1);

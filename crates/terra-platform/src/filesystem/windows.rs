@@ -165,3 +165,45 @@ pub(super) fn open_metadata_file(directory: &File, name: &str) -> Result<File, E
     }
     Ok(file)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read as _, Write as _};
+
+    #[test]
+    fn metadata_handles_retain_the_opened_file() {
+        let root = tempfile::tempdir().expect("root");
+        let root_path = root.path().canonicalize().expect("canonical root");
+        let original = root_path.join("original");
+        std::fs::write(&original, b"original").expect("write original");
+        let directory = super::super::open_share_root(&root_path).expect("open root");
+        let mut file = open_metadata_file(&directory, "original").expect("open metadata");
+        assert!(file.read(&mut [0]).is_err());
+        assert!(file.write(b"changed").is_err());
+        let moved = root_path.join("moved");
+        std::fs::rename(&original, &moved).expect("rename original");
+        std::fs::write(&original, b"replacement").expect("replace original");
+        set_readonly(&file, true).expect("set readonly");
+        assert!(
+            moved
+                .metadata()
+                .expect("moved metadata")
+                .permissions()
+                .readonly()
+        );
+        assert!(
+            !original
+                .metadata()
+                .expect("replacement metadata")
+                .permissions()
+                .readonly()
+        );
+        assert_eq!(file.metadata().expect("retained metadata").len(), 8);
+        set_readonly(&file, false).expect("clear readonly");
+        let filesystem = stat(&directory).expect("filesystem statistics");
+        assert!(filesystem.block_size > 0);
+        assert!(filesystem.name_max > 0);
+        assert!(filesystem.blocks_free <= filesystem.blocks);
+    }
+}

@@ -6,9 +6,6 @@ interface api {
     enum error { malformed, backpressure, not-ready }
     configure: func(config: config) -> result<_, error>;
     run: async func() -> result<_, error>;
-    receive: async func(frame: list<u8>) -> result<_, error>;
-    take-frames: func(max-items: u32, max-bytes: u32) -> list<list<u8>>;
-    reset: func();
 }
 
 interface transport {

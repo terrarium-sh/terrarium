@@ -1,0 +1,231 @@
+name: Backfill Linux policy
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag whose exact Linux binaries need policy assets
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  attestations: read
+
+concurrency:
+  group: policy-backfill-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  generate:
+    name: Enforce policy (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-musl
+            runner: ${{ vars.LINUX_X64_VM_RUNNER || 'ubuntu-latest' }}
+          - arch: aarch64
+            target: aarch64-unknown-linux-musl
+            runner: ${{ vars.LINUX_ARM64_VM_RUNNER || 'ubuntu-24.04-arm' }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+    steps:
+      - name: Enable KVM access
+        if: ${{ runner.environment == 'github-hosted' }}
+        run: |
+          if [ -c /dev/kvm ]; then
+            printf 'KERNEL=="kvm", OWNER="%s", MODE="0600", OPTIONS+="static_node=kvm"\n' "$(id -u)" | sudo tee /etc/udev/rules.d/99-terra-kvm.rules
+            sudo udevadm control --reload-rules
+            sudo chown "$(id -u)" /dev/kvm
+            sudo chmod 0600 /dev/kvm
+          fi
+      - name: Check native KVM
+        id: kvm
+        run: |
+          if [ -c /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+            echo 'available=true' >> "$GITHUB_OUTPUT"
+          elif [ -c /dev/kvm ]; then
+            ls -l /dev/kvm
+            id
+            echo '::error::The runner cannot read/write /dev/kvm; grant KVM access or select a KVM-capable policy runner.'
+            exit 1
+          else
+            echo '::error::Native /dev/kvm is absent; select a KVM-capable policy runner.'
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Download verified release executable
+        id: binary
+        if: ${{ steps.kvm.outputs.available == 'true' }}
+        run: |
+          mkdir -p release-bin
+          archive="terra-${{ matrix.arch }}-linux.tar.gz"
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$archive" --dir release-bin
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS --dir release-bin
+          (cd release-bin && sha256sum --check --ignore-missing SHA256SUMS)
+          gh attestation verify "release-bin/$archive" --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml"
+          tar -xzf "release-bin/$archive" -C release-bin
+          test -x release-bin/terra
+      - name: Check release self-test policy support
+        run: |
+          if ! help=$(release-bin/terra self-test --help) ||
+             ! grep -Fq -- '--generate-policy' <<< "$help" ||
+             ! grep -Fq -- '--policy-output' <<< "$help" ||
+             ! grep -Fq -- '--policy-diagnostics' <<< "$help" ||
+             ! grep -Fq -- '--policy-timeout' <<< "$help" ||
+             ! grep -Fq -- '--validate-vm' <<< "$help"; then
+            echo "::error::Release $RELEASE_TAG executable lacks terra self-test VM policy generation. Choose a release with self-test --generate-policy --validate-vm support."
+            exit 1
+          fi
+      - name: Free runner disk
+        if: ${{ steps.binary.outcome == 'success' }}
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache /usr/local/.ghcup /usr/local/share/boost
+      - name: Allow unprivileged user namespaces
+        if: ${{ steps.binary.outcome == 'success' }}
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          unshare -U -r true
+      - name: Generate and enforce policy
+        id: generate
+        if: ${{ steps.binary.outcome == 'success' }}
+        timeout-minutes: 120
+        run: ./release-bin/terra self-test --generate-policy --validate-vm --policy-output "build/seccomp/${{ matrix.target }}" --policy-diagnostics "build/seccomp-traces/${{ matrix.target }}"
+      - name: Check complete validated set
+        id: validated
+        if: ${{ steps.generate.outcome == 'success' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 libseccomp2
+          mkdir -p "build/seccomp-artifact/${{ matrix.target }}"
+          cp -L "build/seccomp/${{ matrix.target }}/terra.seccomp.json" \
+            "build/seccomp/${{ matrix.target }}/terra.seccomp.bpf" \
+            "build/seccomp/${{ matrix.target }}/terra.seccomp-manifest.json" \
+            "build/seccomp/${{ matrix.target }}/.validated" \
+            "build/seccomp-artifact/${{ matrix.target }}/"
+          python3 scripts/verify-seccomp-artifact.py "build/seccomp-artifact/${{ matrix.target }}" "$PWD/release-bin/terra" "${{ matrix.target }}"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ steps.validated.outcome == 'success' }}
+        with:
+          name: terra-seccomp-${{ matrix.target }}
+          path: build/seccomp-artifact/${{ matrix.target }}/
+          if-no-files-found: error
+          include-hidden-files: true
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ always() && steps.generate.outcome != 'skipped' }}
+        with:
+          name: seccomp-diagnostics-${{ matrix.target }}
+          path: build/seccomp-traces/
+          if-no-files-found: warn
+      - name: Report policy result
+        if: ${{ always() && steps.kvm.outputs.available == 'true' }}
+        run: |
+          if [ "${{ steps.validated.outcome }}" = success ]; then
+            echo 'Enforced policy validation passed for ${{ matrix.target }}; complete policy set uploaded.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'Policy preparation, generation, or enforced validation failed for ${{ matrix.target }}; no policy set was uploaded. See the failed step and available diagnostics.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  publish:
+    name: Attach validated policy assets
+    needs: generate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      attestations: write
+      id-token: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: terra-seccomp-*-unknown-linux-musl
+          path: policies
+      - name: Install policy verifier
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libseccomp2
+      - name: Prepare matching assets and checksums
+        id: prepare
+        run: |
+          mkdir -p stage published
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS --dir stage
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            arch="${target%%-*}"
+            policy="policies/terra-seccomp-$target"
+            if [ ! -d "$policy" ] && [ -f policies/terra.seccomp-manifest.json ]; then
+              policy=policies
+            fi
+            if [ ! -d "$policy" ]; then
+              echo "::error::No validated policy for $target."
+              exit 1
+            fi
+            archive="terra-$arch-linux.tar.gz"
+            if ! gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$archive" --dir published; then
+              echo "::error::Could not download the release executable for $target."
+              exit 1
+            fi
+            expected=$(awk -v name="$archive" '$2 == name { print $1 }' stage/SHA256SUMS)
+            actual=$(sha256sum "published/$archive" | cut -d ' ' -f 1)
+            if [ -z "$expected" ] || [ "$actual" != "$expected" ]; then
+              echo "::error::Release executable checksum failed for $target."
+              exit 1
+            fi
+            mkdir -p "published/$target"
+            if ! tar -xzf "published/$archive" -C "published/$target" ||
+               ! python3 scripts/verify-seccomp-artifact.py "$policy" "published/$target/terra" "$target"; then
+              echo "::error::Policy did not match the published executable for $target."
+              exit 1
+            fi
+            tar -czf "stage/terra-seccomp-$target.tar.gz" -C "$policy" \
+              terra.seccomp.json terra.seccomp.bpf terra.seccomp-manifest.json
+          done
+          shopt -s nullglob
+          assets=(stage/terra-seccomp-*.tar.gz)
+          if [ "${#assets[@]}" -gt 0 ]; then echo 'any=true' >> "$GITHUB_OUTPUT"; fi
+      - name: Attest policy assets
+        id: policy-attest
+        if: ${{ steps.prepare.outputs.any == 'true' }}
+        continue-on-error: true
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: stage/terra-seccomp-*.tar.gz
+      - name: Report optional attestation failure
+        if: ${{ steps.policy-attest.outcome == 'failure' }}
+        run: echo 'Policy attestation failed; validated assets can still be published with release checksums.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Attach assets and update checksums
+        if: ${{ steps.prepare.outputs.any == 'true' }}
+        run: |
+          assets=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            archive="terra-seccomp-$target.tar.gz"
+            test -f "stage/$archive"
+            checksum_archive="stage/$archive"
+            if grep -Fxq "$archive" <<< "$assets"; then
+              gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$archive" --dir published
+              python3 scripts/verify-seccomp-artifact.py --archive "published/$archive" "published/$target/terra" "$target"
+              checksum_archive="published/$archive"
+            else
+              gh release upload "$RELEASE_TAG" "stage/$archive" --repo "$GITHUB_REPOSITORY"
+            fi
+            digest=$(sha256sum "$checksum_archive" | cut -d ' ' -f 1)
+            awk -v name="$archive" '$2 != name' stage/SHA256SUMS > stage/SHA256SUMS.next
+            mv stage/SHA256SUMS.next stage/SHA256SUMS
+            printf '%s  %s\n' "$digest" "$archive" >> stage/SHA256SUMS
+            echo "Validated policy archive attached for $target." >> "$GITHUB_STEP_SUMMARY"
+          done
+          gh release upload "$RELEASE_TAG" stage/SHA256SUMS --repo "$GITHUB_REPOSITORY" --clobber

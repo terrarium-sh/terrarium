@@ -31,12 +31,7 @@ pub(crate) fn write_sparse_chunk(out: &mut File, chunk: &[u8]) -> std::io::Resul
 }
 
 fn to_stage_path(path: &Path, attempt: u64) -> PathBuf {
-    let name = path
-        .file_name()
-        .unwrap_or(path.as_os_str())
-        .to_string_lossy()
-        .into_owned();
-    path.with_file_name(format!(".{name}.{attempt}.{}.tmp", std::process::id()))
+    path.with_file_name(format!(".terra-stage.{attempt}.{}.tmp", std::process::id()))
 }
 
 fn parse_staged_pid(name: &str) -> Option<u32> {
@@ -108,15 +103,17 @@ impl StagedFile {
         let mut attempt = 0u64;
         let (temporary, file) = loop {
             let temporary = to_stage_path(path, attempt);
-            match options.open(&temporary) {
-                Ok(file) => break (temporary, file),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    attempt = attempt.checked_add(1).context("too many staging files")?;
-                }
-                Err(error) => {
-                    return Err(error).with_context(|| format!("creating {}", temporary.display()));
+            if temporary != path {
+                match options.open(&temporary) {
+                    Ok(file) => break (temporary, file),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => {
+                        return Err(error)
+                            .with_context(|| format!("creating {}", temporary.display()));
+                    }
                 }
             }
+            attempt = attempt.checked_add(1).context("too many staging files")?;
         };
         Ok(Self {
             file,
@@ -206,7 +203,10 @@ fn ensure_image(path: &Path, size_mib: u32, gz: &[u8], field: &str) -> Result<()
 /// Growing a sparse image is free; shrinking would truncate the filesystem
 /// inside it, so a smaller size only warns and keeps the current size.
 fn resize_image(path: &Path, target: u64, field: &str) -> Result<()> {
-    let current = std::fs::metadata(path)
+    let image = crate::sys::open_regular_file_for_write(path, false)
+        .with_context(|| format!("opening {}", path.display()))?;
+    let current = image
+        .metadata()
         .with_context(|| format!("reading {}", path.display()))?
         .len();
     let mib = |n: u64| n.div_ceil(BYTES_PER_MIB);
@@ -214,10 +214,6 @@ fn resize_image(path: &Path, target: u64, field: &str) -> Result<()> {
     match target.cmp(&current) {
         std::cmp::Ordering::Equal => {}
         std::cmp::Ordering::Greater => {
-            let image = OpenOptions::new()
-                .write(true)
-                .open(path)
-                .with_context(|| format!("opening {}", path.display()))?;
             crate::sys::make_sparse(&image)
                 .with_context(|| format!("making {} sparse", path.display()))?;
             image
@@ -316,6 +312,22 @@ mod tests {
 
         resize_image(&img, 8 * mib, "hw.rootfs_mib").unwrap(); // refuses to shrink
         assert_eq!(std::fs::metadata(&img).unwrap().len(), 16 * mib);
+    }
+
+    #[test]
+    fn resizing_an_image_rejects_symlink_redirection() {
+        let directory = tempfile::tempdir().unwrap();
+        let image = directory.path().join("vol-data.img");
+        let redirected = directory.path().join("outside");
+        std::fs::write(&redirected, b"original").unwrap();
+        crate::sys::symlink_file(&redirected, &image).unwrap();
+
+        for target in [0, 8, 16] {
+            assert!(resize_image(&image, target, "size_mib").is_err());
+            assert_eq!(std::fs::read(&redirected).unwrap(), b"original");
+        }
+        assert!(ensure_rootfs_image(&image, 1).is_err());
+        assert!(ensure_volume_image(&image, 1).is_err());
     }
 
     #[test]
@@ -428,6 +440,35 @@ mod tests {
         assert_eq!(std::fs::read(&target).unwrap(), b"new");
         assert_eq!(std::fs::read(to_stage_path(&target, 0)).unwrap(), b"stale");
         assert!(!to_stage_path(&target, 3).exists());
+    }
+
+    #[test]
+    fn staging_names_stay_bounded_and_do_not_use_the_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let reserved_name = to_stage_path(&dir.path().join("file"), 0);
+        for target in [dir.path().join("x".repeat(255)), reserved_name] {
+            let mut staged = StagedFile::new(&target).unwrap();
+            assert_ne!(staged.staging.temporary, target);
+            assert_eq!(staged.staging.temporary.parent(), target.parent());
+            assert_eq!(
+                parse_staged_pid(
+                    staged
+                        .staging
+                        .temporary
+                        .file_name()
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                ),
+                Some(std::process::id())
+            );
+            std::io::Write::write_all(staged.file_mut(), b"new").unwrap();
+            assert!(!target.exists());
+            staged.commit().unwrap();
+            assert_eq!(std::fs::read(&target).unwrap(), b"new");
+            std::fs::remove_file(target).unwrap();
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        }
     }
 
     #[test]

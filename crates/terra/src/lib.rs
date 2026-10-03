@@ -12,11 +12,13 @@ pub mod config;
 mod logs;
 mod name;
 mod policy;
+mod process;
 
 #[cfg(feature = "fuzzing")]
 pub use policy::network::runtime::BoxPolicy;
 mod render;
 mod resolve;
+mod sandbox;
 mod session;
 mod state;
 mod sys;
@@ -42,6 +44,20 @@ pub async fn run() -> Result<ExitCode> {
     sys::restrict_new_files();
 
     let is_at_a_terminal = sys::is_at_a_terminal();
+
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|argument| argument == sandbox::policy::WORKER_ARG)
+    {
+        return sandbox::policy::run_worker(&mut std::env::args_os().skip(2));
+    }
+
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|argument| argument == sandbox::LAUNCHER_WORKER_ARG)
+    {
+        return sandbox::run_launcher_worker(std::env::args_os().skip(2));
+    }
 
     // The background VM process (`terra __vm <dir>`): its parent settled the
     // box, the boot and the project directory, so the child re-resolves nothing
@@ -70,5 +86,6 @@ pub async fn run() -> Result<ExitCode> {
         Some(Cmd::Sessions(a)) => cmd::sessions::run(a, name, &project_dir).await,
         Some(Cmd::Detach(a)) => cmd::detach::run(a, name, &project_dir).await,
         Some(Cmd::Completions(a)) => cmd::completions::run(a),
+        Some(Cmd::SelfTest(a)) => cmd::self_test::run(a, &project_dir).await,
     }
 }

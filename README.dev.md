@@ -20,10 +20,13 @@ make dist
 ```
 
 `make dist` produces `dist/terra` with embedded guest images and trusted,
-precompiled Wasmtime components, plus license notices. Linux releases target
-static musl; ordinary Cargo commands use the native host target. Production
-loads embedded AOT components without a Wasm compiler. Run image-building Make
-targets sequentially in a shared checkout.
+precompiled Wasmtime components and, on Linux, Bubblewrap, plus license notices.
+Linux releases target static musl; ordinary Cargo commands use the native host
+target. Production loads embedded AOT components without a Wasm compiler. Run
+image-building Make targets sequentially in a shared checkout.
+The default Linux launcher can boot with its built-in minimal seccomp policy.
+To use the generated syscall and ioctl allowlist, generate a policy for the
+exact `dist/terra`; see [policy generation](#verification).
 
 The guest is Alpine Linux on the host's CPU architecture. Guest images are
 built on Linux; macOS and Windows builds consume those images and compile AOT
@@ -44,6 +47,15 @@ checkouts require symlink privileges and `core.symlinks=true`.
 | `components` | Boot planning, VMM and device protocols, network policy, transport and WIT |
 | `kernel`, `pins.mk` | Guest kernel configuration and pinned build inputs |
 | `fuzz`, `scripts` | Boundary fuzz targets, build checks and benchmark tools |
+
+Host confinement lives in `crates/terra/src/sandbox.rs`, with Linux implementation files
+under `sandbox/linux/`. `sandbox/config.rs` selects and resolves launchers and policies.
+VM launch planning supplies explicit filesystem grants and environment values;
+the common prepared-launch API owns platform dispatch, descriptors, and host-PID handoff.
+`sandbox/policy.rs` exposes command-factory policy generation on every
+platform, backed by `sandbox/linux/generation.rs` on Linux. Absent policies leave
+commands unchanged; requested enforcement and generation report unsupported on
+platforms without a backend. Self-test and foreground generation share this API.
 
 Runtime derives the fixed machine layout and asks platform to create the VM,
 RAM, disks and vCPUs. A short-lived boot component plans kernel placement;
@@ -165,8 +177,61 @@ checks formatting, WIT links, tool pins, and build scripts without guest images;
 Rust/component tests run in the host jobs against the staged guest assets.
 Build runs on pull requests and `main`; `v*` tags trigger releases for every
 platform. Release reuses the Build workflow, adds source archives, then publishes
-only after every build and check passes. Security audits run on dependency changes and weekly. Kernel changes
+after required build and check jobs pass. Security audits run on dependency changes and weekly. Kernel changes
 run tooling checks; kernel archive export is available through manual dispatch.
+
+Linux policy jobs consume the exact x86-64 and AArch64 distribution artifacts
+and run `terra self-test --generate-policy --validate-vm`. The binary traces its
+guestless host checks, compiles a policy with reviewed virtualization supplements, and checks
+both host components and the full guest suite under that policy. The policy job
+needs native KVM and Bubblewrap user namespaces; self-tests, syscall tracing,
+and classic BPF compilation are embedded in Terra, using ptrace and the Rust `seccompiler`
+and `syscalls` crates. The separate CI artifact
+verifier uses Python 3 and libseccomp to independently resolve syscall names;
+the policy job does not build source or test harnesses. Native host test jobs independently
+check the default jail and embedded fallback policy.
+
+Policy generation is optional in normal Build CI. Releases require the default
+Bubblewrap launcher and built-in policy to boot successfully on Linux amd64;
+the ARM64 policy job remains optional. Generated-policy enforcement is optional
+on both architectures. Set `LINUX_X64_VM_RUNNER` and `LINUX_ARM64_VM_RUNNER`
+repository variables to KVM-capable runner labels. A release verifies each
+available policy against its exact binary before publishing an optional
+`terra-seccomp-<target>.tar.gz` archive with the readable policy, raw BPF, and
+validation manifest. `SHA256SUMS` covers these archives. Invalid or merely
+host-validated artifacts fail publication. Policies are installed manually;
+Terra does not download or automatically select release policies.
+
+Run `terra self-test` for host checks without tracing or generation. For local
+policy generation without virtualization, run `terra self-test --generate-policy`.
+To reproduce
+CI's VM validation using an installed binary:
+
+```sh
+terra self-test --generate-policy --validate-vm --policy-output ./policy --policy-diagnostics ./policy-logs
+mkdir -p ~/.terra/config
+cp -L ./policy/terra.seccomp.bpf ~/.terra/config/seccomp.bpf
+```
+
+The output path is an atomic symlink to a successful generation. Traces and
+failure details remain under the diagnostics directory. See
+[self-tests and foreground generation](docs/vm-launchers.md#generate-a-policy-from-the-installed-binary)
+for custom guest commands and recipes. Policy generation runs the selected
+workload twice and can repeat writes and external effects; foreground generation
+preserves the selected box between passes. For a box or recipe, `--generate-policy`
+selects foreground execution automatically and rejects `-d` or a running box.
+Generating a policy does not install
+or select it. Every new feature must update the bundled self-tests and any
+guest-only coverage as required by [AGENTS.md](AGENTS.md).
+
+The manual [Backfill Linux policy](.github/workflows/policy-backfill.yml) workflow
+downloads and verifies an existing release's exact binary, invokes its embedded
+`self-test --generate-policy --validate-vm` command on native x86-64 and AArch64 runners, and attaches
+successful policy sets. Both architectures must pass. Binaries predating the
+self-test policy generation or lacking VM validation fail the capability check; the workflow
+does not build historical sources. The workflow uses its current verifier before
+publication and updates the release's `SHA256SUMS` after upload. A retry verifies
+an existing archive against the binary before repairing a missing checksum.
 
 Two weekly workflows open pin-update PRs: `Guest pins bump` checks same-series
 kernel LTS patches, stable e2fsprogs releases, and Alpine releases with doas and
@@ -241,18 +306,36 @@ make test-component-vmm
 
 These exercise runtime/device integration, CLI boots, mounts, networking,
 capacity and memory growth/reclamation. Ignored tests are not covered by an
-ordinary workspace test pass. CI runs Linux VM gates when KVM is available;
+ordinary workspace test pass. CI requires Linux amd64 VM gates; other platforms
+run VM gates when explicitly requested or assigned a native runner;
 see the [build workflow](.github/workflows/build.yml) for exact conditions.
 
 `make test-platform-native-vm` checks preparation cleanup and repeated stop/join
 on a native hypervisor without guest artifacts. On Apple Silicon the target
 signs the test executable with the hypervisor entitlement before running it.
 
-macOS and Windows have an opt-in `native_vm_tests` workflow input. After a native
-host build (and signing on macOS), install Zig 0.16.0 for the guest probes and run:
+Build and release CI require native platform, runtime, and packaged VM acceptance
+on Linux amd64. ARM64 Linux, macOS and Windows VM gates are opt-in until native
+runners are available. Set `native_vm_tests` to request those gates explicitly;
+an explicitly requested gate fails when virtualization is unavailable. Configure
+`LINUX_X64_VM_RUNNER`, `LINUX_ARM64_VM_RUNNER`, `MACOS_ARM64_VM_RUNNER`,
+`WINDOWS_X64_VM_RUNNER`, and `WINDOWS_ARM64_VM_RUNNER` with native runner labels.
+Linux needs read/write KVM and unprivileged user namespaces, macOS needs Apple
+Silicon with Hypervisor.framework access, and Windows needs working WHP. Configured
+native runners run the full gates automatically. Hosted builds on the other
+platforms run compiler and unit checks and report missing boot coverage.
+Hosted Linux jobs give the runner account ownership of an existing `/dev/kvm`
+with mode `0600` and a persistent udev rule before VM and policy checks. A missing
+device still fails required VM gates; self-hosted runners must configure their
+own KVM permissions.
+
+After a native host build (and signing on macOS), install Zig 0.16.0 for the guest
+probes. Use a short temporary directory with enough disk space (`TMPDIR` on Unix,
+`TEMP`/`TMP` on Windows); fixture control sockets must fit the local-socket path
+limit. Run the packaged gates:
 
 ```sh
-TERRA_BIN="$PWD/dist/terra" cargo test --locked -p terra --test native_boot --test boot --test memory -- --ignored --test-threads=1 --nocapture
+TMPDIR=/tmp TERRA_BIN="$PWD/dist/terra" cargo test --locked -p terra --test native_boot --test boot --test memory -- --ignored --test-threads=1 --nocapture
 ```
 
 On Windows PowerShell:

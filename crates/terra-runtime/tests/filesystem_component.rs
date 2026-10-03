@@ -637,7 +637,7 @@ async fn wasm_filesystem_component_refreshes_a_relooked_up_node_path() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn wasm_filesystem_component_clears_an_unlinked_node_path() {
+async fn wasm_filesystem_component_rejects_an_unlinked_node_path() {
     let root = tempfile::tempdir().expect("tempdir");
     symlink_file("first", root.path().join("link")).expect("symlink fixture");
     let Mounted {
@@ -655,7 +655,7 @@ async fn wasm_filesystem_component_clears_an_unlinked_node_path() {
     );
     assert_eq!(
         reply_error(&submit(&channel, &memory, 3, &request(5, 4, node, &[])).await),
-        -95
+        -2
     );
     channel.close().expect("close");
 }

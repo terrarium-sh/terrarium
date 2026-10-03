@@ -12,6 +12,14 @@
 *   **CLI Updates:** `crates/terra/src/cli.rs` is the source of truth for the man
     pages; `make man` re-renders them (they are generated, not committed).
 *   **Boot Tests:** Requires `/dev/kvm`. Run: `make dist && TERRA_BIN=$PWD/dist/terra cargo test -p terra --test boot -- --ignored`
+*   **Default self-test coverage:** Every new feature must update the bundled
+    self-tests so generated seccomp policies include its host operations. Exercise
+    guestless paths in `crates/terra-runtime/src/self_test.rs`; cover guest-only
+    paths in `crates/terra/src/cmd/self_test/guest.rs` and document their reviewed rules in
+    `scripts/seccomp-supplements.json`. Verify
+    `terra self-test --generate-policy` without virtualization and
+    `terra self-test --generate-policy --validate-vm`
+    on native Linux before publishing policies.
 
 ## Threat model
 

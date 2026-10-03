@@ -546,7 +546,7 @@ fn runtime_vmm_cannot_import_boot_resources_or_vm_memory_methods() {
             (component
                 (import "terra:mmio/virtualization@0.1.0" (instance
                     (export "vm" (type $vm (sub resource)))
-                    (type $error-type (enum "unavailable" "invalid-config" "bounds"))
+                    (type $error-type (enum "unavailable"))
                     (export "error" (type $error (eq $error-type)))
                     (export "[method]vm.{method}" (func
                         (param "self" (borrow $vm)) {parameters} {result})))))

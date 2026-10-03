@@ -5,9 +5,15 @@ root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/bin" "$tmp/release"
-printf 'terra test binary\n' > "$tmp/release/terra"
+cat > "$tmp/release/terra" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+chmod +x "$tmp/release/terra"
 tar -czf "$tmp/release/terra-x86_64-linux.tar.gz" -C "$tmp/release" terra
+tar -czf "$tmp/release/terra-aarch64-linux.tar.gz" -C "$tmp/release" terra
 tar -czf "$tmp/release/terra-aarch64-macos.tar.gz" -C "$tmp/release" terra
+cp "$tmp/release/terra" "$tmp/original-terra"
 printf '{"tag_name": "v1.3.0-rc.1"}\n' > "$tmp/release/releases.json"
 (
   cd "$tmp/release"
@@ -43,7 +49,10 @@ cat > "$tmp/bin/install" <<'EOF'
 if [ "$1" = -d ]; then
   exit 0
 fi
-cp "$3" "$INSTALL_DEST"
+case "$4" in
+  */terra) cp "$3" "$INSTALL_DEST" ;;
+  *) exit 1 ;;
+esac
 EOF
 cat > "$tmp/bin/gh" <<'EOF'
 #!/bin/sh
@@ -53,7 +62,13 @@ chmod +x "$tmp/bin/uname" "$tmp/bin/curl" "$tmp/bin/install" "$tmp/bin/gh"
 
 PATH="$tmp/bin:$PATH" INSTALL_FIXTURES="$tmp/release" INSTALL_DEST="$tmp/installed-terra" \
   TERRA_VERSION=1.2.3 sh "$root/install.sh" >/dev/null
-cmp "$tmp/release/terra" "$tmp/installed-terra"
+cmp "$tmp/original-terra" "$tmp/installed-terra"
+
+rm -f "$tmp/installed-terra"
+PATH="$tmp/bin:$PATH" INSTALL_FIXTURES="$tmp/release" INSTALL_DEST="$tmp/installed-terra" \
+  INSTALL_ARCH=aarch64 \
+  TERRA_VERSION=1.2.3 sh "$root/install.sh" >/dev/null
+cmp "$tmp/original-terra" "$tmp/installed-terra"
 
 rm -f "$tmp/installed-terra"
 PATH="$tmp/bin:$PATH" INSTALL_FIXTURES="$tmp/release" INSTALL_DEST="$tmp/installed-terra" \
@@ -71,4 +86,4 @@ test ! -e "$tmp/installed-terra"
 rm "$tmp/release/terra-x86_64-linux.tar.gz"
 PATH="$tmp/bin:$PATH" INSTALL_FIXTURES="$tmp/release" INSTALL_DEST="$tmp/installed-terra" \
   INSTALL_OS=Darwin INSTALL_ARCH=arm64 TERRA_VERSION=1.2.3 sh "$root/install.sh" >/dev/null
-cmp "$tmp/release/terra" "$tmp/installed-terra"
+cmp "$tmp/original-terra" "$tmp/installed-terra"

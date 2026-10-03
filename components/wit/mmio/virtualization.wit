@@ -9,7 +9,7 @@ interface virtualization {
         vcpus: u8,
         devices: list<device>,
     }
-    enum error { unavailable, invalid-config, bounds }
+    enum error { unavailable }
 
     resource vm {
         request-stop: func() -> result<_, error>;

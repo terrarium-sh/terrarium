@@ -1,439 +1,153 @@
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![allow(clippy::expect_used)]
 
 #[path = "support/artifacts.rs"]
 mod support;
 
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+use std::time::Duration;
+use terra_runtime::component::mmio::{DeviceError, Operation, Reply, Request};
 use terra_runtime::component::vsock::{VsockDeviceHost, vsock_component_linker};
 use terra_runtime::engine::device_engine;
-use terra_runtime::test_support::device_store;
-use wasmtime::component::{Component, TypedFunc, wit_parser::ItemName};
+use terra_runtime::test_support::{StandaloneHost, device_store};
+use wasmtime::StoreContextMut;
+use wasmtime::component::{
+    Component, Source, StreamConsumer, StreamReader, StreamResult, TypedFunc,
+};
 
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    PartialEq,
-    Eq,
-    wasmtime::component::ComponentType,
-    wasmtime::component::Lift,
-    wasmtime::component::Lower,
-)]
-#[component(enum)]
-#[repr(u8)]
-#[allow(dead_code)]
-enum ComponentError {
-    #[component(name = "table-full")]
-    TableFull,
-    #[component(name = "backpressure")]
-    Backpressure,
-    #[component(name = "unknown-connection")]
-    UnknownConnection,
-    #[component(name = "malformed")]
-    Malformed,
+type Serve = TypedFunc<(StreamReader<Request>,), (StreamReader<Reply>,)>;
+
+struct ReplySink(Arc<Mutex<Vec<Reply>>>);
+
+impl StreamConsumer<StandaloneHost<VsockDeviceHost>> for ReplySink {
+    type Item = Reply;
+
+    fn poll_consume(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        store: StoreContextMut<StandaloneHost<VsockDeviceHost>>,
+        mut source: Source<'_, Reply>,
+        finish: bool,
+    ) -> Poll<wasmtime::Result<StreamResult>> {
+        if finish {
+            return Poll::Ready(Ok(StreamResult::Cancelled));
+        }
+        let mut reply = None;
+        source.read(store, &mut reply)?;
+        if let Some(reply) = reply {
+            self.0.lock().expect("reply sink").push(reply);
+        }
+        Poll::Ready(Ok(StreamResult::Completed))
+    }
 }
 
-#[derive(wasmtime::component::ComponentType, wasmtime::component::Lift)]
-#[component(record)]
-struct ComponentConnection {
-    #[component(name = "guest-port")]
-    guest_port: u32,
-    #[component(name = "host-port")]
-    host_port: u32,
+async fn reset_and_read(
+    store: &mut wasmtime::Store<StandaloneHost<VsockDeviceHost>>,
+    serve: Serve,
+) -> Vec<Reply> {
+    let requests = [Operation::Reset, Operation::Read]
+        .into_iter()
+        .enumerate()
+        .map(|(sequence, operation)| Request {
+            sequence: sequence as u64,
+            operation,
+            offset: 0,
+            width: 4,
+            value: 0,
+        })
+        .collect::<Vec<_>>();
+    let requests = StreamReader::new(&mut *store, requests).expect("MMIO requests");
+    let (replies,) = serve
+        .call_async(&mut *store, (requests,))
+        .await
+        .expect("MMIO server");
+    let received = Arc::new(Mutex::new(Vec::new()));
+    replies
+        .pipe(&mut *store, ReplySink(Arc::clone(&received)))
+        .expect("MMIO reply sink");
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        store.run_concurrent(async |_| {
+            while received.lock().expect("reply sink").len() < 2 {
+                tokio::task::yield_now().await;
+            }
+        }),
+    )
+    .await
+    .expect("MMIO reply deadline")
+    .expect("MMIO server runs");
+    std::mem::take(&mut *received.lock().expect("reply sink"))
 }
 
-#[derive(wasmtime::component::ComponentType, wasmtime::component::Lift)]
-#[component(record)]
-#[allow(dead_code)]
-struct ComponentReply {
-    header: Vec<u8>,
-    payload: Vec<u8>,
-}
-
-const COMPONENT: &[u8] = support::artifacts::wasm::VSOCK;
-
-type ComponentResult<T> = (Result<T, ComponentError>,);
-type Receive = TypedFunc<(Vec<u8>,), ComponentResult<()>>;
-type Deliver = TypedFunc<(u32, u32, Vec<u8>), ComponentResult<()>>;
-type Consume = TypedFunc<(u32, u32, u32), (Vec<u8>,)>;
-type Connections = TypedFunc<(u32,), (Vec<ComponentConnection>,)>;
-
-fn export(name: &str) -> ItemName {
-    format!("terra:vsock/api.{name}@0.1.0")
-        .parse()
-        .expect("component export name")
-}
-
-fn packet(op: u16, len: u32) -> Vec<u8> {
-    let mut packet = Vec::with_capacity(44 + len as usize);
-    packet.extend_from_slice(&3_u64.to_le_bytes());
-    packet.extend_from_slice(&2_u64.to_le_bytes());
-    packet.extend_from_slice(&100_u32.to_le_bytes());
-    packet.extend_from_slice(&6000_u32.to_le_bytes());
-    packet.extend_from_slice(&len.to_le_bytes());
-    packet.extend_from_slice(&1_u16.to_le_bytes());
-    packet.extend_from_slice(&op.to_le_bytes());
-    packet.extend_from_slice(&0_u32.to_le_bytes());
-    packet.extend_from_slice(&65536_u32.to_le_bytes());
-    packet.extend_from_slice(&0_u32.to_le_bytes());
-    packet
-}
-
+/// Closing the component stays terminal across MMIO reset and configure calls.
 #[tokio::test(flavor = "current_thread")]
-async fn component_releases_credit_after_consumer_drains_data() {
+async fn component_close_keeps_transport_terminal() {
     let engine = device_engine().expect("engine");
-    let linker = vsock_component_linker(&engine).expect("linker");
-    let component = Component::new(&engine, COMPONENT).expect("component");
+    let component = Component::new(&engine, support::artifacts::wasm::VSOCK).expect("component");
     let mut store = device_store(
         &engine,
         VsockDeviceHost::new(
-            terra_runtime::memory::GuestRam::new(64 * 1024).unwrap(),
-            terra_runtime::component::vsock::VsockHostService::default(),
-        ),
-    );
-    let instance = linker
-        .instantiate_async(&mut store, &component)
-        .await
-        .expect("instance");
-    let reset: TypedFunc<(), ()> = instance
-        .get_typed_func(&mut store, export("reset"))
-        .expect("reset");
-    reset.call_async(&mut store, ()).await.expect("fresh state");
-    let receive: Receive = instance
-        .get_typed_func(&mut store, export("receive"))
-        .expect("receive");
-    let replies: TypedFunc<(u32, u32), (Vec<ComponentReply>,)> = instance
-        .get_typed_func(&mut store, export("take-replies"))
-        .expect("replies");
-    assert_eq!(
-        receive
-            .call_async(&mut store, (packet(1, 0),))
-            .await
-            .expect("request"),
-        (Ok(()),)
-    );
-    let _ = replies
-        .call_async(&mut store, (8, 4096))
-        .await
-        .expect("response");
-    let consume: Consume = instance
-        .get_typed_func(&mut store, export("consume-upstream"))
-        .expect("consume");
-    let mut data = packet(5, 5);
-    data.extend_from_slice(b"hello");
-    assert_eq!(
-        receive.call_async(&mut store, (data,)).await.expect("data"),
-        (Ok(()),)
-    );
-    assert_eq!(
-        consume
-            .call_async(&mut store, (100, 6000, 4))
-            .await
-            .expect("bounded")
-            .0,
-        b"hell"
-    );
-    assert_eq!(
-        consume
-            .call_async(&mut store, (100, 6000, 1))
-            .await
-            .expect("drain")
-            .0,
-        b"o"
-    );
-    let reply = replies
-        .call_async(&mut store, (8, 4096))
-        .await
-        .expect("credit")
-        .0
-        .pop()
-        .expect("credit reply");
-    assert_eq!(
-        u32::from_le_bytes(reply.header[40..44].try_into().expect("counter")),
-        5
-    );
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn component_drains_the_single_carrier() {
-    let engine = device_engine().expect("engine");
-    let linker = vsock_component_linker(&engine).expect("linker");
-    let component = Component::new(&engine, COMPONENT).expect("component");
-    let mut store = device_store(
-        &engine,
-        VsockDeviceHost::new(
-            terra_runtime::memory::GuestRam::new(64 * 1024).unwrap(),
-            terra_runtime::component::vsock::VsockHostService::default(),
-        ),
-    );
-    let instance = linker
-        .instantiate_async(&mut store, &component)
-        .await
-        .expect("instance");
-    let events =
-        instance
-            .get_typed_func::<(), (
-                wasmtime::component::StreamReader<
-                    terra_runtime::component::vsock::VsockEvent,
-                >,
-            )>(&mut store, export("events"))
-            .expect("events");
-    let (_events,) = events
-        .call_async(&mut store, ())
-        .await
-        .expect("framed lifecycle");
-    let receive: Receive = instance
-        .get_typed_func(&mut store, export("receive"))
-        .expect("receive");
-    let consume: Consume = instance
-        .get_typed_func(&mut store, export("consume-upstream"))
-        .expect("consume");
-    let connections: Connections = instance
-        .get_typed_func(&mut store, export("connections"))
-        .expect("connections");
-    assert_eq!(
-        receive
-            .call_async(&mut store, (packet(1, 0),))
-            .await
-            .expect("carrier request"),
-        (Ok(()),)
-    );
-    let mut data = packet(5, 5);
-    data.extend_from_slice(b"hello");
-    receive
-        .call_async(&mut store, (data,))
-        .await
-        .expect("carrier data")
-        .0
-        .expect("carrier packet accepted");
-    assert_eq!(
-        connections
-            .call_async(&mut store, (2,))
-            .await
-            .expect("connections")
-            .0
-            .iter()
-            .map(|connection| (connection.guest_port, connection.host_port))
-            .collect::<Vec<_>>(),
-        vec![(100, 6000)]
-    );
-    assert_eq!(
-        consume
-            .call_async(&mut store, (100, 6000, 5))
-            .await
-            .expect("carrier drain")
-            .0,
-        b"hello"
-    );
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn component_close_clears_queued_state() {
-    let engine = device_engine().expect("engine");
-    let linker = vsock_component_linker(&engine).expect("linker");
-    let component = Component::new(&engine, COMPONENT).expect("component");
-    let mut store = device_store(
-        &engine,
-        VsockDeviceHost::new(
-            terra_runtime::memory::GuestRam::new(64 * 1024).unwrap(),
-            terra_runtime::component::vsock::VsockHostService::default(),
-        ),
-    );
-    let instance = linker
-        .instantiate_async(&mut store, &component)
-        .await
-        .expect("instance");
-    let receive: Receive = instance
-        .get_typed_func(&mut store, export("receive"))
-        .expect("receive");
-    let close: TypedFunc<(), ()> = instance
-        .get_typed_func(&mut store, export("close"))
-        .expect("close");
-    let replies: TypedFunc<(u32, u32), (Vec<ComponentReply>,)> = instance
-        .get_typed_func(&mut store, export("take-replies"))
-        .expect("replies");
-    assert_eq!(
-        receive
-            .call_async(&mut store, (packet(1, 0),))
-            .await
-            .expect("request"),
-        (Ok(()),)
-    );
-    close.call_async(&mut store, ()).await.expect("close");
-    let reset: TypedFunc<(), ()> = instance
-        .get_typed_func(&mut store, export("reset"))
-        .expect("reset");
-    reset
-        .call_async(&mut store, ())
-        .await
-        .expect("reset remains terminal");
-    assert!(
-        replies
-            .call_async(&mut store, (8, 4096))
-            .await
-            .expect("empty")
-            .0
-            .is_empty()
-    );
-    assert_eq!(
-        receive
-            .call_async(&mut store, (packet(1, 0),))
-            .await
-            .expect("closed request"),
-        (Err(ComponentError::Backpressure),)
-    );
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn component_rejects_backpressure_without_resetting_connection_state() {
-    let engine = device_engine().expect("engine");
-    let linker = vsock_component_linker(&engine).expect("linker");
-    let component = Component::new(&engine, COMPONENT).expect("component");
-    let mut store = device_store(
-        &engine,
-        VsockDeviceHost::new(
-            terra_runtime::memory::GuestRam::new(64 * 1024).unwrap(),
-            terra_runtime::component::vsock::VsockHostService::default(),
-        ),
-    );
-    let instance = linker
-        .instantiate_async(&mut store, &component)
-        .await
-        .expect("instance");
-    let receive: Receive = instance
-        .get_typed_func(&mut store, export("receive"))
-        .expect("receive");
-    let deliver: Deliver = instance
-        .get_typed_func(&mut store, export("deliver"))
-        .expect("deliver");
-    assert_eq!(
-        receive
-            .call_async(&mut store, (packet(1, 0),))
-            .await
-            .expect("request"),
-        (Ok(()),)
-    );
-    assert_eq!(
-        deliver
-            .call_async(&mut store, (100, 6000, vec![0; 64 * 1024]))
-            .await
-            .expect("first delivery"),
-        (Ok(()),)
-    );
-    assert_eq!(
-        deliver
-            .call_async(&mut store, (100, 6000, b"blocked".to_vec()))
-            .await
-            .expect("backpressure call"),
-        (Err(ComponentError::Backpressure),)
-    );
-    let mut credit = packet(6, 0);
-    credit[40..44].copy_from_slice(&(64 * 1024_u32).to_le_bytes());
-    assert_eq!(
-        receive
-            .call_async(&mut store, (credit,))
-            .await
-            .expect("credit"),
-        (Ok(()),)
-    );
-    assert_eq!(
-        deliver
-            .call_async(&mut store, (100, 6000, b"ok".to_vec()))
-            .await
-            .expect("connection remains usable"),
-        (Ok(()),)
-    );
-}
-
-#[derive(wasmtime::component::ComponentType, wasmtime::component::Lift)]
-#[component(record)]
-struct ControlResult {
-    consumed: u32,
-    #[component(name = "exit-code")]
-    exit_code: Option<i32>,
-    #[component(name = "agent-ready")]
-    agent_ready: bool,
-}
-
-#[derive(wasmtime::component::ComponentType, wasmtime::component::Lift)]
-#[component(record)]
-struct DiagnosticResult {
-    consumed: u32,
-    output: Vec<u8>,
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn lifecycle_decoding_stays_in_component_and_handles_bounded_frames() {
-    use terra_protocol::{LifecycleEvent, encode_frame};
-    let engine = device_engine().unwrap();
-    let component = Component::new(&engine, COMPONENT).unwrap();
-    let mut store = device_store(
-        &engine,
-        VsockDeviceHost::new(
-            terra_runtime::memory::GuestRam::new(65536).unwrap(),
+            terra_runtime::memory::GuestRam::new(64 * 1024).expect("guest memory"),
             terra_runtime::component::vsock::VsockHostService::default(),
         ),
     );
     let instance = vsock_component_linker(&engine)
-        .unwrap()
+        .expect("linker")
         .instantiate_async(&mut store, &component)
         .await
-        .unwrap();
-    let control: TypedFunc<(Vec<u8>,), ComponentResult<ControlResult>> = instance
-        .get_typed_func(&mut store, export("decode-control"))
-        .unwrap();
-    let diagnostics: TypedFunc<(Vec<u8>,), ComponentResult<DiagnosticResult>> = instance
-        .get_typed_func(&mut store, export("decode-diagnostics"))
-        .unwrap();
-    let ready = control
-        .call_async(
+        .expect("instance");
+    let api = component
+        .get_export_index(None, "terra:vsock/api@0.1.0")
+        .expect("API");
+    let configure = instance
+        .get_typed_func::<(), (Result<(), DeviceError>,)>(
             &mut store,
-            (encode_frame(&LifecycleEvent::AgentReady).unwrap(),),
+            component
+                .get_export_index(Some(&api), "configure-device")
+                .expect("configure export"),
         )
+        .expect("configure");
+    let close = instance
+        .get_typed_func::<(), ()>(
+            &mut store,
+            component
+                .get_export_index(Some(&api), "close")
+                .expect("close export"),
+        )
+        .expect("close");
+    let mmio = component
+        .get_export_index(None, "terra:mmio/device@0.1.0")
+        .expect("MMIO");
+    let serve: Serve = instance
+        .get_typed_func(
+            &mut store,
+            component
+                .get_export_index(Some(&mmio), "serve")
+                .expect("serve export"),
+        )
+        .expect("serve");
+    configure
+        .call_async(&mut store, ())
         .await
-        .unwrap()
+        .expect("configure call")
         .0
-        .unwrap();
-    assert!(ready.agent_ready);
-    assert_eq!(ready.exit_code, None);
-    let frame = encode_frame(&LifecycleEvent::Exit { code: -13 }).unwrap();
-    let partial = control
-        .call_async(&mut store, (frame[..frame.len() - 1].to_vec(),))
-        .await
-        .unwrap()
-        .0
-        .unwrap();
-    assert!(!partial.agent_ready);
-    assert_eq!(partial.consumed, 0);
-    assert_eq!(partial.exit_code, None);
-    let result = control
-        .call_async(&mut store, (frame.clone(),))
-        .await
-        .unwrap()
-        .0
-        .unwrap();
-    assert_eq!(result.consumed as usize, frame.len());
-    assert_eq!(result.exit_code, Some(-13));
-    assert!(
-        control
-            .call_async(&mut store, (encode_frame(&-13).unwrap(),))
+        .expect("configure result");
+    let ready = reset_and_read(&mut store, serve).await;
+    assert_eq!(ready[0].error, 0);
+    assert_eq!(ready[1].error, 0);
+    assert_eq!(ready[1].value, 0x7472_6976);
+
+    close.call_async(&mut store, ()).await.expect("close");
+    let closed = reset_and_read(&mut store, serve).await;
+    assert_eq!(closed[0].error, 0);
+    assert_eq!(closed[1].error, 4);
+    assert!(matches!(
+        configure
+            .call_async(&mut store, ())
             .await
-            .unwrap()
-            .0
-            .is_err()
-    );
-    for bytes in [vec![255; 16300], vec![0; 32700]] {
-        let frame = encode_frame(&LifecycleEvent::Diagnostic {
-            bytes: bytes.clone(),
-        })
-        .unwrap();
-        assert!(frame.len() < 65540);
-        let result = diagnostics
-            .call_async(&mut store, (frame.clone(),))
-            .await
-            .unwrap()
-            .0
-            .unwrap();
-        assert_eq!(result.consumed as usize, frame.len());
-        assert_eq!(result.output, bytes);
-    }
+            .expect("configure after close")
+            .0,
+        Err(DeviceError::NotReady)
+    ));
 }

@@ -1,11 +1,13 @@
-use super::{AvailabilityError, Partition, PartitionError, RunExit, WhpError, result};
+use super::{
+    AlignedRegisterValue, AvailabilityError, Partition, PartitionError, RunExit, WhpError, result,
+};
 use windows_sys::Win32::System::Hypervisor::{
     WHV_CAPABILITY, WHV_REGISTER_VALUE, WHvGetCapability, WHvRequestInterrupt,
     WHvRunVirtualProcessor, WHvSetPartitionProperty, WHvSetVirtualProcessorRegisters,
 };
 const ARM64_SUPPORT: u64 = 1 << 11;
 
-#[repr(C)]
+#[repr(C, align(16))]
 #[derive(Default)]
 struct Arm64RunVpExitContext {
     exit_reason: i32,
@@ -14,7 +16,11 @@ struct Arm64RunVpExitContext {
     payload: [u64; 32],
 }
 
-const _: () = assert!(size_of::<Arm64RunVpExitContext>() == 272);
+const _: () = {
+    assert!(size_of::<Arm64RunVpExitContext>() == 272);
+    assert!(align_of::<Arm64RunVpExitContext>() == 16);
+    assert!(std::mem::offset_of!(Arm64RunVpExitContext, payload) == 16);
+};
 
 #[repr(C)]
 struct Arm64MemoryAccessContext {
@@ -198,16 +204,25 @@ impl Partition {
             .redistributor_base
             .checked_add(offset)
             .ok_or(PartitionError::InvalidGic)?;
-        let names = [crate::windows::aarch64::WHV_ARM64_REGISTER_GICR_BASE_GPA];
-        let values = [WHV_REGISTER_VALUE { Reg64: gicr_base }];
-        // SAFETY: the just-created vCPU accepts the documented GICR base register.
+        let names = [
+            crate::windows::aarch64::WHV_ARM64_REGISTER_GICR_BASE_GPA,
+            crate::windows::aarch64::WHV_ARM64_REGISTER_INTERNAL_ACTIVITY_STATE,
+        ];
+        // Hyper-V handles PSCI CPU_ON and releases StartupSuspend itself.
+        let values = [
+            AlignedRegisterValue(WHV_REGISTER_VALUE { Reg64: gicr_base }),
+            AlignedRegisterValue(WHV_REGISTER_VALUE {
+                Reg64: u64::from(index != 0),
+            }),
+        ];
+        // SAFETY: the just-created vCPU accepts these documented ARM64 registers.
         result(unsafe {
             WHvSetVirtualProcessorRegisters(
                 self.handle,
                 index,
                 names.as_ptr(),
                 names.len() as u32,
-                values.as_ptr(),
+                values.as_ptr().cast(),
             )
         })
         .map_err(PartitionError::Api)

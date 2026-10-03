@@ -18,5 +18,4 @@ interface lifecycle {
     use lifecycle-platform.{event, error};
 
     run: async func() -> result<event, error>;
-    wait: async func() -> result<event, error>;
 }

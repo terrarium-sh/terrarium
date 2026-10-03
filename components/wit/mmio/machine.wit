@@ -4,7 +4,7 @@ interface machine-types {
     enum architecture { x86, arm }
     enum device-kind { block, net, vsock, fs, memory }
     record device { kind: device-kind, mmio-base: u64, irq: u32 }
-    enum error { invalid-ram, invalid-vcpus, too-many-devices, platform, already-created, invalid-state }
+    enum error { invalid-vcpus, platform, already-created, invalid-state }
 }
 
 interface machine {

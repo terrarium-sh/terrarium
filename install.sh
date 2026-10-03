@@ -118,8 +118,8 @@ if [ -e "$bin/terra" ] && ! [ -f "$bin/terra" ] && ! [ -L "$bin/terra" ]; then
   echo "terrarium: $bin/terra exists but is not a regular file - move it aside first" >&2
   exit 1
 fi
-
-if install -d "$bin" 2>/dev/null && install -m 755 "$tmp/terra" "$bin/terra" 2>/dev/null; then
+if install -d "$bin" 2>/dev/null &&
+   install -m 755 "$tmp/terra" "$bin/terra" 2>/dev/null; then
   :
 else
   printf 'install to %s needs root privileges - run sudo install? [y/N] ' "$bin"
@@ -131,10 +131,11 @@ else
         echo "terrarium: sudo is unavailable" >&2
         exit 1
       fi
-      "$sudo" install -d "$bin" && "$sudo" install -m 755 "$tmp/terra" "$bin/terra"
+      "$sudo" install -d "$bin" &&
+        "$sudo" install -m 755 "$tmp/terra" "$bin/terra"
       ;;
     *)
-      echo "nothing was installed" >&2
+      echo "installation was not completed" >&2
       exit 1
       ;;
   esac

@@ -161,6 +161,75 @@ pub trait VcpuHandler: Send {
     fn failed(&mut self, _error: &str) {}
 }
 
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(
+        target_os = "windows",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
+pub(crate) fn report_vcpu_failure<T, E: std::fmt::Display>(
+    id: impl std::fmt::Display,
+    handler: &mut dyn VcpuHandler,
+    outcome: Result<T, E>,
+) -> Result<T, E> {
+    if let Err(error) = &outcome {
+        let error = format!("vCPU {id} failed: {error}");
+        log::error!("{error}");
+        handler.failed(&error);
+    }
+    outcome
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::*;
+
+    #[test]
+    fn worker_errors_notify_once_and_successes_remain_successful() {
+        #[derive(Default)]
+        struct Handler(Vec<String>);
+        impl VcpuHandler for Handler {
+            fn exchange(&mut self, _: VcpuExit) -> Result<VcpuAction, String> {
+                panic!("worker outcome must not resume the guest")
+            }
+            fn finished(&mut self, _: VcpuOutcome) {
+                panic!("failure reporting must not send a successful outcome")
+            }
+            fn failed(&mut self, error: &str) {
+                self.0.push(error.to_owned());
+            }
+        }
+        let mut handler = Handler::default();
+        let hardware_error = std::io::Error::other("boot register write failed");
+        let hardware_outcome: Result<(), _> =
+            report_vcpu_failure(0, &mut handler, Err(hardware_error));
+        assert_eq!(
+            hardware_outcome.unwrap_err().to_string(),
+            "boot register write failed"
+        );
+        let emulation_outcome: Result<(), _> =
+            report_vcpu_failure(1_u32, &mut handler, Err("WHP emulation failed".to_owned()));
+        assert_eq!(emulation_outcome, Err("WHP emulation failed".to_owned()));
+        assert_eq!(
+            report_vcpu_failure(2, &mut handler, Ok::<_, String>(VcpuOutcome::Stopped)),
+            Ok(VcpuOutcome::Stopped)
+        );
+        assert_eq!(
+            handler.0,
+            [
+                "vCPU 0 failed: boot register write failed",
+                "vCPU 1 failed: WHP emulation failed"
+            ]
+        );
+    }
+}
+
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 use crate::linux::kvm::aarch64::{
     machine::Machine as NativeMachine,

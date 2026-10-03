@@ -57,10 +57,10 @@ workload:
 the private writable root filesystem capacity. The root filesystem is sparse,
 but it cannot exceed `rootfs_mib`. `components.memory_mib` limits each Wasm
 component's linear memory independently. The default and minimum configurable
-ceiling are 16 MiB. There is no combined component memory limit. Host admission
-reserves the maximum component footprint, including overrides, in addition to
-guest RAM and native headroom. Component ceilings are separate from guest RAM
-and do not bound all native host-process memory.
+ceiling are 16 MiB. There is no combined component memory limit. Component
+ceilings are separate from guest RAM and do not bound all native host-process
+memory. Operators set aggregate VM resource budgets through operating-system
+controls.
 
 The optional `components.network.memory_mib` overrides the network component's
 ceiling; otherwise it inherits `components.memory_mib`. This override also
@@ -172,6 +172,10 @@ comments are allowed. `terra <box> show` redacts environment values unless
 `--with-env-values` is specified.
 
 ## Network
+
+Network rules apply at the Wasm component boundary. The built-in Linux jail
+shares the host network namespace; native VM-process compromise can bypass
+recipe rules. See [network policy limits](security.md#network-policy-limits).
 
 The default `mode: allowlist` permits no egress until an `allow` entry grants a
 hostname, IP address, or CIDR, optionally limited with `:PORT`. A hostname rule

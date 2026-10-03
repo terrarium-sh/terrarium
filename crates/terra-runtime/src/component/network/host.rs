@@ -2,10 +2,9 @@
 
 use super::authorization::PolicyClient;
 use super::{NameLookup, PolicyHandle, PortMapping};
-use std::{marker::PhantomData, sync::Arc, time::Duration};
+use std::{marker::PhantomData, net::ToSocketAddrs, sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
 use wasmtime::component::Accessor;
-use wasmtime_wasi::sockets::{WasiSockets, WasiSocketsView};
 
 use crate::component::context::{DeviceContext, DeviceHost};
 use wasmtime_wasi::{WasiCtxView, WasiView};
@@ -76,10 +75,9 @@ impl<T: 'static> wasmtime::component::HasData for NetworkNameLookupHost<T> {
     type Data<'a> = &'a mut NetworkHost;
 }
 
-async fn resolve_name<T>(
+async fn resolve_name(
     policy: PolicyClient,
     lookups: Arc<Semaphore>,
-    accessor: Accessor<T, WasiSockets>,
     mut name: String,
 ) -> Result<
     Vec<wasmtime_wasi::p3::bindings::sockets::types::IpAddress>,
@@ -102,19 +100,23 @@ async fn resolve_name<T>(
             let permit = lookups
                 .try_acquire_owned()
                 .map_err(|_| ErrorCode::TemporaryResolverFailure)?;
-            let resolved = tokio::time::timeout(
-                NAME_LOOKUP_TIMEOUT,
-                <WasiSockets as wasmtime_wasi::p3::bindings::sockets::ip_name_lookup::HostWithStore<T>>::resolve_addresses(&accessor, name.clone()),
-            )
+            let resolver_name = name.clone();
+            let lookup_task = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                (resolver_name.as_str(), 0)
+                    .to_socket_addrs()
+                    .map(|addresses| {
+                        addresses
+                            .take(MAX_NAME_ADDRESSES)
+                            .map(|address| address.ip().to_canonical())
+                            .collect::<Vec<_>>()
+                    })
+            });
+            let resolved = tokio::time::timeout(NAME_LOOKUP_TIMEOUT, lookup_task)
                 .await
                 .map_err(|_| ErrorCode::TemporaryResolverFailure)?
                 .map_err(|_| ErrorCode::Other(None))?
-                ?
-                .into_iter()
-                .take(MAX_NAME_ADDRESSES)
-                .map(native_address)
-                .collect::<Vec<_>>();
-            drop(permit);
+                .map_err(|_| ErrorCode::NameUnresolvable)?;
             policy
                 .accept_resolved(name, resolved)
                 .await
@@ -140,19 +142,6 @@ fn wasi_address(
     }
 }
 
-fn native_address(
-    address: wasmtime_wasi::p3::bindings::sockets::types::IpAddress,
-) -> std::net::IpAddr {
-    match address {
-        wasmtime_wasi::p3::bindings::sockets::types::IpAddress::Ipv4((a, b, c, d)) => {
-            std::net::IpAddr::V4(std::net::Ipv4Addr::new(a, b, c, d))
-        }
-        wasmtime_wasi::p3::bindings::sockets::types::IpAddress::Ipv6(segments) => {
-            std::net::IpAddr::V6(std::net::Ipv6Addr::from(<[u16; 8]>::from(segments)))
-        }
-    }
-}
-
 impl wasmtime_wasi::p3::bindings::sockets::ip_name_lookup::Host for &mut NetworkHost {}
 
 impl<T: wasmtime_wasi::WasiView + 'static>
@@ -172,8 +161,7 @@ impl<T: wasmtime_wasi::WasiView + 'static>
             let host = access.get();
             (host.network_policy(), host.network_lookups())
         });
-        let resolver = host.with_getter::<WasiSockets>(T::sockets);
-        Ok(resolve_name(policy, lookups, resolver, name).await)
+        Ok(resolve_name(policy, lookups, name).await)
     }
 }
 
@@ -248,6 +236,70 @@ mod tests {
             &first.network_lookups(),
             &second.network_lookups()
         ));
+    }
+
+    #[test]
+    fn cancelled_name_lookup_retains_admission_until_native_resolution_completes() {
+        use super::super::{AsyncPolicy, DecisionFuture, DecisionLease};
+
+        struct Resolver;
+        impl Policy for Resolver {
+            fn asynchronous(self: Arc<Self>) -> Option<Arc<dyn AsyncPolicy>> {
+                Some(self)
+            }
+            fn allows(&self, _: IpAddr, _: Option<u16>) -> bool {
+                false
+            }
+        }
+        impl AsyncPolicy for Resolver {
+            fn allows(&self, _: IpAddr, _: Option<u16>, _: DecisionLease) -> DecisionFuture<bool> {
+                Box::pin(async { false })
+            }
+            fn lookup_name(&self, name: String, _: DecisionLease) -> DecisionFuture<NameLookup> {
+                Box::pin(async move { NameLookup::Resolve(name) })
+            }
+            fn accept_resolved(
+                &self,
+                _: String,
+                addresses: Vec<IpAddr>,
+                _: DecisionLease,
+            ) -> DecisionFuture<Vec<IpAddr>> {
+                Box::pin(async move { addresses })
+            }
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        let (entered, started) = std::sync::mpsc::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let occupied = runtime.spawn_blocking(move || {
+            entered.send(()).unwrap();
+            blocked.recv().unwrap();
+        });
+        started.recv().unwrap();
+        let lookups = Arc::new(Semaphore::new(1));
+        let client = PolicyClient::new(Arc::new(Resolver), Arc::new(Semaphore::new(1)));
+        let result = runtime.block_on(async {
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                resolve_name(client, lookups.clone(), "localhost".into()),
+            )
+            .await
+        });
+        let available = lookups.available_permits();
+        release.send(()).unwrap();
+        runtime.block_on(occupied).unwrap();
+        assert!(result.is_err());
+        assert_eq!(available, 0);
+        runtime.block_on(async {
+            let _permit = tokio::time::timeout(Duration::from_secs(2), lookups.acquire())
+                .await
+                .unwrap()
+                .unwrap();
+        });
     }
 
     struct Slow;

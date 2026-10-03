@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import importlib.util
 import json
 import os
@@ -60,14 +59,6 @@ def arguments() -> argparse.Namespace:
     if not Path("/dev/kvm").exists():
         parser.error("this benchmark needs /dev/kvm")
     return args
-
-
-def digest(path: Path) -> str:
-    hasher = hashlib.sha256()
-    with path.open("rb") as file:
-        for chunk in iter(lambda: file.read(1024 * 1024), b""):
-            hasher.update(chunk)
-    return hasher.hexdigest()
 
 
 def percentile(values: list[float], point: int) -> float:
@@ -313,7 +304,7 @@ def binary_result(label: str, binary: Path) -> dict[str, object]:
     return {
         "label": label,
         "path": str(binary.resolve()),
-        "sha256": digest(binary),
+        "sha256": BENCH.digest(binary),
         "runs": [],
     }
 
@@ -353,7 +344,7 @@ def main() -> None:
         if args.baseline_label not in binaries:
             raise SystemExit(f"missing retained baseline: {args.baseline_label}")
         retained = binaries[args.baseline_label]
-        if retained.get("sha256") != digest(args.baseline) or retained.get("path") != str(args.baseline.resolve()):
+        if retained.get("sha256") != BENCH.digest(args.baseline) or retained.get("path") != str(args.baseline.resolve()):
             raise SystemExit("retained baseline does not match --baseline")
         expected_topology = f"{args.devices_per_pool} mounts plus {args.devices_per_pool} volumes;"
         if not retained_topology.startswith(expected_topology):

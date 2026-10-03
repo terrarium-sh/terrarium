@@ -19,8 +19,8 @@ use std::sync::{
 };
 use std::task::Poll;
 
-use exports::terra::vsock::api::{Connection, Error, Reply};
-use terra_vsock_device::{VsockError, VsockHeader, VsockSwitch};
+use exports::terra::vsock::api::Error;
+use terra_vsock_device::VsockSwitch;
 
 static SWITCH: LazyLock<Mutex<VsockSwitch>> = LazyLock::new(|| Mutex::new(VsockSwitch::new()));
 #[cfg(test)]
@@ -77,14 +77,6 @@ pub(crate) async fn wait_for_work() {
     .await;
 }
 
-fn error(error: VsockError) -> Error {
-    match error {
-        VsockError::TableFull => Error::TableFull,
-        VsockError::Backpressure => Error::Backpressure,
-        VsockError::UnknownConnection => Error::UnknownConnection,
-    }
-}
-
 struct Vsock;
 
 impl exports::terra::mmio::device::Guest for Vsock {
@@ -110,108 +102,6 @@ impl exports::terra::vsock::api::Guest for Vsock {
         worker::run().await
     }
 
-    fn decode_control(bytes: Vec<u8>) -> Result<exports::terra::vsock::api::ControlResult, Error> {
-        lifecycle::decode_control(&bytes)
-    }
-
-    fn decode_diagnostics(
-        bytes: Vec<u8>,
-    ) -> Result<exports::terra::vsock::api::DiagnosticResult, Error> {
-        lifecycle::decode_diagnostics(&bytes)
-    }
-    fn receive(packet: Vec<u8>) -> Result<(), Error> {
-        if CLOSED.load(Ordering::Acquire) {
-            return Err(Error::Backpressure);
-        }
-        let (header, data) = VsockHeader::parse(&packet).map_err(|_| Error::Malformed)?;
-        switch().rx(&header, data);
-        carrier::wake();
-        worker::schedule_receive_queue();
-        Ok(())
-    }
-
-    fn take_replies(max_items: u32, max_bytes: u32) -> Vec<Reply> {
-        switch()
-            .take_replies_up_to(max_items as usize, max_bytes as usize)
-            .into_iter()
-            .map(|reply| Reply {
-                header: reply.header.encode().to_vec(),
-                payload: reply.payload,
-            })
-            .collect()
-    }
-
-    fn deliver(guest_port: u32, host_port: u32, data: Vec<u8>) -> Result<(), Error> {
-        if CLOSED.load(Ordering::Acquire) {
-            return Err(Error::Backpressure);
-        }
-        let result = switch().deliver(guest_port, host_port, &data);
-        if result.is_ok() {
-            worker::schedule_receive_queue();
-        }
-        result.map_err(error)
-    }
-
-    fn shutdown(guest_port: u32, host_port: u32) -> Result<(), Error> {
-        if CLOSED.load(Ordering::Acquire) {
-            return Err(Error::Backpressure);
-        }
-        let result = switch().shutdown(guest_port, host_port);
-        if result.is_ok() {
-            worker::schedule_receive_queue();
-        }
-        result.map_err(error)
-    }
-
-    fn reset_connection(guest_port: u32, host_port: u32) -> Result<(), Error> {
-        if CLOSED.load(Ordering::Acquire) {
-            return Err(Error::Backpressure);
-        }
-        let result = switch().reset_connection(guest_port, host_port);
-        if result.is_ok() {
-            worker::schedule_receive_queue();
-        }
-        result.map_err(error)
-    }
-
-    fn consume_upstream(guest_port: u32, host_port: u32, max_bytes: u32) -> Vec<u8> {
-        switch()
-            .take_upstream_for_up_to(guest_port, host_port, max_bytes as usize)
-            .into_iter()
-            .flat_map(|item| item.data)
-            .collect()
-    }
-
-    fn connection_count() -> u32 {
-        u32::try_from(switch().connection_count()).unwrap_or(u32::MAX)
-    }
-
-    fn connection_exists(guest_port: u32, host_port: u32) -> bool {
-        switch().connection_exists(guest_port, host_port)
-    }
-
-    fn connections(max_items: u32) -> Vec<Connection> {
-        switch()
-            .connections_up_to(max_items as usize)
-            .into_iter()
-            .map(|(guest_port, host_port)| Connection {
-                guest_port,
-                host_port,
-            })
-            .collect()
-    }
-
-    fn reset() {
-        if !CLOSED.load(Ordering::Acquire) {
-            *LAST_CLOCK_SAMPLE
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-            transport::reset();
-            carrier::wake();
-            wake_worker();
-        }
-    }
-
     async fn close() {
         CLOSED.store(true, Ordering::Release);
         *LAST_CLOCK_SAMPLE
@@ -221,6 +111,17 @@ impl exports::terra::vsock::api::Guest for Vsock {
         carrier::wake();
         wake_worker();
         worker::finish().await;
+    }
+}
+
+fn reset_device() {
+    if !CLOSED.load(Ordering::Acquire) {
+        *LAST_CLOCK_SAMPLE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        transport::reset();
+        carrier::wake();
+        wake_worker();
     }
 }
 

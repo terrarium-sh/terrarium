@@ -322,12 +322,18 @@ mod tests {
     /// the escalation is what the grace is for.
     #[tokio::test]
     async fn a_straggler_is_killed_once_the_grace_runs_out() {
-        let daemons = spawn(&["trap '' TERM; sleep 600".to_string()], true, None);
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while lock_or_abort(&daemons.processes).is_empty() {
-            assert!(std::time::Instant::now() < deadline, "never spawned");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        let ready = crate::create_scratch_path("daemon", "straggler-ready");
+        let _ = std::fs::remove_file(&ready);
+        let daemons = spawn(
+            &[format!(
+                "trap '' TERM; echo $$ > {}; sleep 600",
+                ready.display()
+            )],
+            true,
+            None,
+        );
+        let _ = read_child_pid(&ready).await;
+        std::fs::remove_file(&ready).unwrap();
         let grace = Duration::from_millis(500);
         let start = std::time::Instant::now();
         daemons.stop(grace).await;

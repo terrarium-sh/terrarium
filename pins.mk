@@ -2,16 +2,10 @@
 # its version, where it comes from, and the sha256 it must have. Included by the
 # Makefile, which holds the recipes; nothing here runs anything.
 #
-# It is a separate file so that "what does the shipped guest actually contain"
-# is one page to read and one page to diff — a bump is a reviewable change to
-# this file alone, and `git log -p pins.mk` is the provenance history of every
-# byte of guest that ships.
+# It is a separate file so that a bump is a reviewable provenance change.
 #
-# Two mechanisms depend on it, so nothing here is decorative:
-#   * every hash is checked when its input is downloaded or its payload rebuilds.
-#   * the Makefile hashes all of these into $(PIN_STAMP); edit any value and the
-#     guest images rebuild. Without that a bumped version is a silent no-op, which
-#     is the wrong failure for a security update.
+# Every hash is checked when its source is downloaded or its payload rebuilds.
+# Guest pins also feed $(PIN_STAMP); the launcher target depends on this file.
 #
 # Requires $(ARCH) — include it after those are set.
 
@@ -28,6 +22,14 @@ KERNEL_URL := https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$(KERNEL_VERSIO
 E2FSPROGS_VERSION := 1.47.4
 E2FSPROGS_SHA256 := da274408bebbfd13a5a2fc3cfc66e3ffff17c48534673aa67f88d49b99123b96
 E2FSPROGS_URL := https://mirrors.edge.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v$(E2FSPROGS_VERSION)/e2fsprogs-$(E2FSPROGS_VERSION).tar.gz
+
+# --- Linux VM launcher ------------------------------------------------------
+BUBBLEWRAP_VERSION := 0.13.0
+BUBBLEWRAP_SHA256 := 4734237473c0e5d695e4e9034a34e43b2dbf5164655bd13fa59ae376b2b7a765
+BUBBLEWRAP_URL := https://github.com/containers/bubblewrap/releases/download/v$(BUBBLEWRAP_VERSION)/bubblewrap-$(BUBBLEWRAP_VERSION).tar.xz
+LIBCAP_VERSION := 2.78
+LIBCAP_SHA256 := 0d621e562fd932ccf67b9660fb018e468a683d7b827541df27813228c996bb11
+LIBCAP_URL := https://www.kernel.org/pub/linux/libs/security/linux-privs/libcap2/libcap-$(LIBCAP_VERSION).tar.xz
 
 # --- Alpine root filesystem -------------------------------------------------
 ALPINE_VERSION := 3.24.2

@@ -11,6 +11,7 @@ const BOX_HOME: &str = "box";
 
 pub(crate) const ROOTFS_FILE: &str = "rootfs.img";
 pub(crate) const PID_FILE: &str = "terra.pid";
+pub(crate) const HOST_PID_FILE: &str = "host.pid";
 pub(crate) const CONTROL_SOCKET: &str = "c";
 pub(crate) const AGENT_SOCKET: &str = "a";
 pub(crate) const BAKE_STAMP: &str = "baked";
@@ -159,14 +160,34 @@ impl BoxRef {
     }
 
     pub fn read_vm_process(&self) -> Option<VmProcess> {
-        let line = self.read_lock_line();
+        let (line, is_host_pid) = match std::fs::read_to_string(self.dir.join(HOST_PID_FILE)) {
+            Ok(line) => (line, true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                (self.read_lock_line(), false)
+            }
+            Err(_) => return None,
+        };
         let mut words = line.split_whitespace();
         let pid = words.next()?.parse().ok().filter(|pid| *pid > 0)?;
         let process_identity = words.next().and_then(|w| w.parse().ok());
+        if is_host_pid {
+            process_identity?;
+            if words.next().is_some_and(|word| word != BAKE_MARK) || words.next().is_some() {
+                return None;
+            }
+        }
         Some(VmProcess {
             pid,
             process_identity,
         })
+    }
+
+    pub(crate) fn clear_host_pid(&self) -> std::io::Result<()> {
+        match std::fs::remove_file(self.dir.join(HOST_PID_FILE)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     pub fn request_stop(&self) -> Result<()> {
@@ -1259,6 +1280,60 @@ mod tests {
         let readonly = File::open(b.get_dir().join(PID_FILE)).unwrap();
         assert!(BoxRef::publish_pid(&readonly, std::process::id(), false).is_err());
         assert!(BoxRef::mark_baking(&readonly).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn taking_a_run_lock_rejects_symlink_redirection() {
+        let directory = tempfile::tempdir().unwrap();
+        let box_dir = directory.path().join("box");
+        std::fs::create_dir(&box_dir).unwrap();
+        let bx = BoxRef::from_state_dir(box_dir, directory.path());
+        let redirected = directory.path().join("outside");
+        std::fs::write(&redirected, b"original").unwrap();
+        crate::sys::symlink_file(&redirected, bx.get_dir().join(PID_FILE)).unwrap();
+
+        assert!(bx.lock_run().is_err());
+        assert_eq!(std::fs::read(&redirected).unwrap(), b"original");
+        std::fs::remove_file(&redirected).unwrap();
+        assert!(bx.lock_run().is_err());
+        assert!(!redirected.exists());
+    }
+
+    #[test]
+    fn protected_host_pid_takes_precedence_and_invalid_records_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let bx = BoxRef::from_state_dir(dir.path().to_owned(), dir.path());
+        let lock = bx.lock_run().unwrap();
+        BoxRef::rewrite_lock_line(&lock, "42 7").unwrap();
+        let host_pid = bx.get_dir().join(HOST_PID_FILE);
+
+        std::fs::write(&host_pid, "123 456").unwrap();
+        assert_eq!(
+            bx.read_vm_process(),
+            Some(VmProcess {
+                pid: 123,
+                process_identity: Some(456),
+            })
+        );
+        for invalid in ["", "123", "123 invalid", "123 456 stranger"] {
+            std::fs::write(&host_pid, invalid).unwrap();
+            assert_eq!(bx.read_vm_process(), None, "{invalid:?}");
+        }
+        std::fs::remove_file(&host_pid).unwrap();
+        std::fs::create_dir(&host_pid).unwrap();
+        assert_eq!(bx.read_vm_process(), None);
+        assert!(bx.clear_host_pid().is_err());
+        std::fs::remove_dir(&host_pid).unwrap();
+
+        bx.clear_host_pid().unwrap();
+        assert_eq!(
+            bx.read_vm_process(),
+            Some(VmProcess {
+                pid: 42,
+                process_identity: Some(7),
+            })
+        );
     }
 
     #[cfg(unix)]

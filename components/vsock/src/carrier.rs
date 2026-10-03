@@ -24,7 +24,7 @@ impl Carrier {
     pub(crate) fn accept() -> Option<Self> {
         let switch = switch();
         let (source, destination) = switch.connections_up_to(1).into_iter().next()?;
-        (destination == MUX_VSOCK_PORT && switch.connection_connected(source, destination)).then(
+        (destination == MUX_VSOCK_PORT && switch.connection_exists(source, destination)).then(
             || Self {
                 source,
                 generation: switch.generation(),
@@ -150,9 +150,10 @@ fn poll_delivery<T>(result: Result<T, VsockError>) -> Poll<io::Result<T>> {
     match result {
         Ok(value) => Poll::Ready(Ok(value)),
         Err(VsockError::Backpressure) => Poll::Pending,
-        Err(VsockError::UnknownConnection | VsockError::TableFull) => Poll::Ready(Err(
-            io::Error::new(io::ErrorKind::ConnectionAborted, "vsock carrier reset"),
-        )),
+        Err(VsockError::UnknownConnection) => Poll::Ready(Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "vsock carrier reset",
+        ))),
     }
 }
 

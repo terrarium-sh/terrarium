@@ -197,7 +197,7 @@ impl VcpuHandle {
     pub fn stop(&mut self, deadline: Duration) -> Result<VcpuOutcome, KvmError> {
         self.request_stop();
         let start = std::time::Instant::now();
-        while start.elapsed() < deadline {
+        loop {
             self.runner.kick();
             let remaining = deadline.saturating_sub(start.elapsed());
             let wait = remaining.min(Duration::from_millis(20));
@@ -208,6 +208,9 @@ impl VcpuHandle {
                     }
                     return outcome;
                 }
+                Err(mpsc::RecvTimeoutError::Timeout) if start.elapsed() >= deadline => {
+                    return Err(KvmError::Timeout);
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     if let Some(thread) = self.thread.take() {
@@ -217,7 +220,6 @@ impl VcpuHandle {
                 }
             }
         }
-        Err(KvmError::Timeout)
     }
 }
 
@@ -344,6 +346,17 @@ mod tests {
             VcpuOutcome::Stopped
         );
         assert!(resource_lifetime.upgrade().is_none());
+    }
+
+    #[test]
+    fn completed_runner_is_reaped_with_no_remaining_stop_budget() {
+        let mut handle = spawn_runner(0, |_| Ok(VcpuOutcome::Stopped)).unwrap();
+        while !handle.thread.as_ref().unwrap().is_finished() {
+            std::thread::yield_now();
+        }
+        assert_eq!(handle.stop(Duration::ZERO).unwrap(), VcpuOutcome::Stopped);
+        assert!(handle.thread.is_none());
+        assert!(!handle.runner.is_published());
     }
 
     #[test]

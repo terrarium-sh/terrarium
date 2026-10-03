@@ -8,15 +8,11 @@ use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiVie
 
 pub use crate::component::bindings::memory::Host as MemoryHost;
 
-/// Interrupts coalesced per window before further signals drop.
 pub const MAX_SIGNALS_PER_WINDOW: u32 = 64;
 
-/// One device's interrupt line. The device cannot name an IRQ; the native
-/// side coalesces bursts and drops past the per-window budget.
+/// One device's interrupt notification budget.
 pub struct InterruptSignals {
-    pending: bool,
     window_count: u32,
-    delivered: u64,
     dropped: u64,
 }
 
@@ -24,9 +20,7 @@ impl InterruptSignals {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            pending: false,
             window_count: 0,
-            delivered: 0,
             dropped: 0,
         }
     }
@@ -37,29 +31,11 @@ impl InterruptSignals {
             return false;
         }
         self.window_count += 1;
-        self.pending = true;
         true
-    }
-
-    /// Drain one coalesced notification. Returns true when the guest
-    /// needs an injection.
-    pub fn take(&mut self) -> bool {
-        if self.pending {
-            self.pending = false;
-            self.delivered += 1;
-            true
-        } else {
-            false
-        }
     }
 
     pub fn end_window(&mut self) {
         self.window_count = 0;
-    }
-
-    #[must_use]
-    pub fn delivered(&self) -> u64 {
-        self.delivered
     }
 
     #[must_use]
@@ -135,32 +111,12 @@ impl DeviceContext {
         self.irq.dropped()
     }
 
-    /// Drain one coalesced notification for injection. True when the
-    /// guest needs an interrupt.
-    pub fn drain_signal(&mut self) -> bool {
-        self.irq.take()
-    }
-
     pub fn guest_write(
         &mut self,
         offset: u64,
         data: &[u8],
     ) -> Result<(), crate::memory::MemoryError> {
         self.memory().write(offset, data)
-    }
-
-    /// Read back bytes staged in this device's guest RAM.
-    pub fn guest_read(&self, offset: u64, len: u64) -> Result<Vec<u8>, crate::memory::MemoryError> {
-        self.memory().read(offset, len)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn memory_read_import_counts(&self) -> (u64, u64) {
-        use std::sync::atomic::Ordering;
-        (
-            self.memory_read_calls[0].load(Ordering::Relaxed),
-            self.memory_read_calls[1].load(Ordering::Relaxed),
-        )
     }
 
     #[cfg(test)]

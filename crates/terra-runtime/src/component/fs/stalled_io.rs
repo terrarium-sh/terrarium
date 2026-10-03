@@ -436,9 +436,23 @@ impl Mounted {
     }
 
     async fn request(&mut self, opcode: u32, node: u64, body: &[u8]) -> Vec<u8> {
+        self.request_with_error(opcode, node, body, 0).await
+    }
+
+    async fn request_with_error(
+        &mut self,
+        opcode: u32,
+        node: u64,
+        body: &[u8],
+        expected_error: i32,
+    ) -> Vec<u8> {
         let target = self.submit(self.request_head, opcode, node, body);
         let response = self.receive(target).await;
-        assert_eq!(&response[4..8], &[0; 4]);
+        assert_eq!(
+            i32::from_le_bytes(response[4..8].try_into().unwrap()),
+            expected_error,
+            "FUSE opcode {opcode} on node {node}"
+        );
         response
     }
 
@@ -506,6 +520,48 @@ async fn mount_with_registration(
     grant.watch_registration = registration;
     let mounted = Mounted::new(grant, gate.clone(), capacity).await;
     (root, mounted, gate)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cached_inode_paths_preserve_open_file_identity() {
+    let (root, mut mounted, _gate) = mount_with_operation(Operation::Write).await;
+    let (node, handle) = mounted.open(b"slow\0").await;
+    let mut link = node.to_le_bytes().to_vec();
+    link.extend_from_slice(b"alias\0");
+    mounted.request(13, 1, &link).await;
+    mounted.request(1, 1, b"alias\0").await;
+    let expected_mutation_error = if cfg!(windows) { -13 } else { 0 };
+    mounted
+        .request_with_error(10, 1, b"slow\0", expected_mutation_error)
+        .await;
+    assert_eq!(root.path().join("slow").exists(), cfg!(windows));
+    link.truncate(8);
+    link.extend_from_slice(b"survivor\0");
+    mounted.request(13, 1, &link).await;
+    assert_eq!(
+        std::fs::read(root.path().join("survivor")).unwrap(),
+        b"slow"
+    );
+
+    let mut rename = 1_u64.to_le_bytes().to_vec();
+    rename.extend_from_slice(b"fast\0alias\0");
+    mounted
+        .request_with_error(12, 1, &rename, expected_mutation_error)
+        .await;
+    link.truncate(8);
+    link.extend_from_slice(b"replacement-link\0");
+    mounted
+        .request_with_error(13, 1, &link, if cfg!(windows) { 0 } else { -2 })
+        .await;
+    assert_eq!(root.path().join("replacement-link").exists(), cfg!(windows));
+    assert_eq!(
+        std::fs::read(root.path().join("alias")).unwrap(),
+        if cfg!(windows) { b"slow" } else { b"fast" }
+    );
+    let response = mounted.request(15, node, &read_body(handle, 0)).await;
+    assert_eq!(&response[16..], b"s");
+    mounted.channel.close().unwrap();
+    mounted.runtime.abort_and_join().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

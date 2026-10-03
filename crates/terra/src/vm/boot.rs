@@ -1,6 +1,7 @@
 //! Booting a prepared box into its VM process.
 
 use crate::cli::BootArgs;
+use crate::sandbox::{self, LauncherConfig, PreparedLaunch};
 use crate::session::{self, DETACH_KEY_NAME, SessionOutcome, pump_session};
 use crate::state::BoxRef;
 use crate::{config, sys};
@@ -8,7 +9,7 @@ use anyhow::{Context, Result};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ExitCode, ExitStatus};
+use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 /// The background VM process's own first argv: `terra __vm <dir>` skips the
@@ -29,6 +30,8 @@ pub struct BootSpec {
     pub root: bool,
     pub mode: terra_protocol::PlanMode,
     pub foreground: bool,
+    #[serde(default)]
+    pub host_publishes_pid: bool,
 }
 
 impl BootSpec {
@@ -45,6 +48,7 @@ impl BootSpec {
             project_dir,
             mode: terra_protocol::PlanMode::Run,
             foreground: boot == BootMode::Foreground,
+            host_publishes_pid: false,
         }
     }
 }
@@ -70,18 +74,21 @@ pub async fn start(
     boot: BootMode,
     run_lock: File,
     agent_timeout: Option<u64>,
+    launcher: &LauncherConfig,
 ) -> Result<ExitCode> {
     match boot {
-        BootMode::Detached => spawn_detached(bx, spec, run_lock),
+        BootMode::Detached => spawn_detached(bx, spec, run_lock, launcher),
         BootMode::Foreground => {
             eprintln!(
                 "terra: starting {bx} in the foreground; `terra {} stop` stops it",
                 bx.get_name()
             );
             print_mount_summary(&spec.cfg.mounts);
-            run_in_process(bx, spec, &run_lock, agent_timeout).await
+            spawn_foreground(bx, spec, run_lock, agent_timeout, launcher).await
         }
-        BootMode::DetachedWithJoin => spawn_and_attach(bx, spec, run_lock, agent_timeout).await,
+        BootMode::DetachedWithJoin => {
+            spawn_and_attach(bx, spec, run_lock, agent_timeout, launcher).await
+        }
     }
 }
 
@@ -92,17 +99,23 @@ pub async fn attach(bx: &BoxRef, agent_timeout: Option<u64>) -> Result<ExitCode>
 }
 
 /// The caller keeps its lock while the isolated bake child uses a duplicate.
-pub async fn run_bake(cfg: &config::Config, bx: &BoxRef, lock: &File) -> Result<()> {
+pub async fn run_bake(
+    cfg: &config::Config,
+    bx: &BoxRef,
+    lock: &File,
+    launcher: &LauncherConfig,
+) -> Result<()> {
     let bake = BootSpec {
         cfg: cfg.clone(),
         project_dir: bx.get_project_dir().to_path_buf(),
         root: false,
         mode: terra_protocol::PlanMode::Create,
         foreground: false,
+        host_publishes_pid: false,
     };
     eprintln!("terra: baking on_create for {bx} in an isolated VM (no shares)");
     let baking = BoxRef::mark_baking(lock).context("marking the on_create bake")?;
-    let mut child = spawn_vm_process(bx, &bake, lock)?;
+    let LaunchedVm { mut child, _guard } = spawn_vm_process(bx, &bake, lock, launcher)?;
     let deadline = Instant::now() + DETACH_READY_DEADLINE;
     let output = async {
         let stream =
@@ -122,7 +135,7 @@ pub async fn run_bake(cfg: &config::Config, bx: &BoxRef, lock: &File) -> Result<
     }
     .await;
     if output.is_err() {
-        let _ = child.kill();
+        let _ = sys::kill_vm_child(&mut child);
     }
     let status = child.wait().context("waiting for the on_create bake")?;
     replay_logs(bx, status);
@@ -170,26 +183,7 @@ pub async fn run_vm_process(dir: PathBuf, is_at_a_terminal: bool) -> Result<Exit
         "no run lock was handed to this process - a VM process is spawned by a boot, \
          not started by hand",
     )?;
-    run_in_process(&bx, &spec, &lock, None).await
-}
-
-async fn run_in_process(
-    bx: &BoxRef,
-    spec: &BootSpec,
-    lock: &File,
-    agent_timeout: Option<u64>,
-) -> Result<ExitCode> {
-    if spec.foreground {
-        let vm = Box::pin(crate::vm::run(spec, bx, lock, || {}));
-        let console = pump_box_console(bx, agent_timeout);
-        supervise_foreground(bx, vm, console)
-            .await
-            .inspect_err(|error| log::error!("VM failed: {error:#}"))
-    } else {
-        crate::vm::run(spec, bx, lock, write_agent_ready)
-            .await
-            .inspect_err(|error| log::error!("VM failed: {error:#}"))
-    }
+    crate::vm::run(&spec, &bx, &lock, write_agent_ready).await
 }
 
 async fn pump_box_console(bx: &BoxRef, agent_timeout: Option<u64>) -> Result<SessionOutcome> {
@@ -217,9 +211,9 @@ async fn supervise_foreground(
         }
         result = &mut console => {
             match result {
-                Ok(SessionOutcome::Detached) => eprintln!("terra: console detached; {bx} still runs in this foreground process"),
+                Ok(SessionOutcome::Detached) => eprintln!("terra: console detached; {bx} still runs under this foreground command"),
                 Ok(SessionOutcome::Exited(_) | SessionOutcome::Closed) => {}
-                Err(error) => eprintln!("terra: console failed: {error:#}; {bx} still runs in this foreground process"),
+                Err(error) => eprintln!("terra: console failed: {error:#}; {bx} still runs under this foreground command"),
             }
             vm.await
         }
@@ -244,21 +238,27 @@ async fn spawn_and_attach(
     spec: &BootSpec,
     run_lock: File,
     agent_timeout: Option<u64>,
+    launcher: &LauncherConfig,
 ) -> Result<ExitCode> {
     eprintln!(
         "terra: starting {bx} - {DETACH_KEY_NAME} detaches, `terra {} stop` stops it",
         bx.get_name()
     );
     print_mount_summary(&spec.cfg.mounts);
-    let mut child = spawn_vm_process(bx, spec, &run_lock)?;
+    let LaunchedVm { mut child, _guard } = spawn_vm_process(bx, spec, &run_lock, launcher)?;
     // The child owns the lock from here on; a copy held by this client would
     // keep the box reading as running, VM or no VM.
     drop(run_lock);
 
     let mut wait_for_agent = session::wait_while_running(bx, agent_timeout);
+    let deadline = Instant::now() + DETACH_READY_DEADLINE;
     let joined =
         session::connect_to_agent(bx, terra_protocol::AgentService::Session, "session", || {
             wait_for_agent()?;
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "timed out opening the VM console"
+            );
             anyhow::ensure!(
                 child.try_wait().context("checking on the VM")?.is_none(),
                 "{bx} stopped before it had a session to join"
@@ -272,6 +272,7 @@ async fn spawn_and_attach(
             // A VM that ends before any session was a fast workload or a
             // failed boot - either way its exit code is the answer.
             let Some(status) = child.try_wait().context("checking on the VM")? else {
+                let _ = kill_and_reap_vm(child);
                 let _ = write_boot_logs(bx, &mut std::io::stderr().lock());
                 return Err(e);
             };
@@ -280,26 +281,24 @@ async fn spawn_and_attach(
         }
     };
 
-    finish_session(bx, &pump_session(stream).await?, Some(&mut child))
+    let outcome = pump_session(stream).await?;
+    finish_session(bx, &outcome, Some(&mut child))
 }
 
-fn spawn_detached(bx: &BoxRef, spec: &BootSpec, run_lock: File) -> Result<ExitCode> {
-    let child = spawn_vm_process(bx, spec, &run_lock)?;
+fn spawn_detached(
+    bx: &BoxRef,
+    spec: &BootSpec,
+    run_lock: File,
+    launcher: &LauncherConfig,
+) -> Result<ExitCode> {
+    let LaunchedVm { child, _guard } = spawn_vm_process(bx, spec, &run_lock, launcher)?;
     drop(run_lock);
     wait_for_detached_agent(bx, child, DETACH_READY_DEADLINE)
 }
 
 fn wait_for_detached_agent(bx: &BoxRef, mut child: Child, timeout: Duration) -> Result<ExitCode> {
-    let ready = child.stdout.take().context("opening VM startup pipe")?;
-    let (sender, receiver) = std::sync::mpsc::channel();
-    let reader = std::thread::Builder::new()
-        .name("vm-startup".into())
-        .spawn(move || {
-            let _ = sender.send(read_agent_ready(ready));
-        });
-    let notification = reader
-        .context("starting VM startup reader")
-        .and_then(|_| {
+    let notification = start_ready_reader(&mut child)
+        .and_then(|receiver| {
             receiver
                 .recv_timeout(timeout)
                 .context("waiting for VM startup notification")
@@ -309,7 +308,8 @@ fn wait_for_detached_agent(bx: &BoxRef, mut child: Child, timeout: Duration) -> 
         Ok(true) => {
             eprintln!(
                 "terra: started {bx} detached (pid {}); agent ready; logs: {}",
-                child.id(),
+                bx.read_vm_process()
+                    .map_or(child.id(), |process| process.pid),
                 bx.build_logs_command()
             );
             return Ok(ExitCode::SUCCESS);
@@ -343,34 +343,217 @@ fn wait_for_detached_agent(bx: &BoxRef, mut child: Child, timeout: Duration) -> 
     ))
 }
 
-/// We pass the boot through stdin, a pipe - not argv (any user can read
-/// `/proc/<pid>/cmdline`) or the environment (it lands in core dumps). The
-/// pipe is read once and exists nowhere else.
-fn spawn_vm_process(bx: &BoxRef, spec: &BootSpec, lock: &File) -> Result<std::process::Child> {
-    use std::process::{Command, Stdio};
+struct LaunchedVm {
+    child: Child,
+    _guard: Option<sys::VmChildGuard>,
+}
+
+fn spawn_vm_process(
+    bx: &BoxRef,
+    spec: &BootSpec,
+    lock: &File,
+    launcher: &LauncherConfig,
+) -> Result<LaunchedVm> {
+    super::launcher::validate_assets(launcher, spec, bx)?;
+    bx.clear_host_pid()
+        .context("clearing previous VM identity")?;
     let exe = std::env::current_exe().context("locating the terra binary")?;
-    let json = serde_json::to_string(spec).context("encoding the boot for the VM process")?;
-    anyhow::ensure!(
-        json.len() as u64 <= MAX_BOOT_SPEC_BYTES,
-        "boot specification exceeds {MAX_BOOT_SPEC_BYTES} bytes; reduce the recipe or environment"
-    );
-    let mut cmd = Command::new(exe);
-    cmd.arg(VM_PROCESS_FLAG_ARG)
-        .arg(bx.get_dir())
-        .stdin(Stdio::piped())
+    let mut child_spec = spec.clone();
+    child_spec.host_publishes_pid = matches!(launcher, LauncherConfig::Sandboxed { .. });
+    let json = encode_boot_spec(&child_spec)?;
+    super::resources::prepare_volumes(&child_spec, bx)?;
+    let diagnostics = sys::create_regular_file(&bx.get_dir().join("launcher.log"))
+        .context("opening VM launcher diagnostics")?;
+    let mut inherited_files = Vec::new();
+    let identity = if child_spec.host_publishes_pid {
+        Some(
+            sys::create_regular_file(&bx.get_dir().join(crate::state::HOST_PID_FILE))
+                .context("preparing protected VM identity")?,
+        )
+    } else {
+        None
+    };
+    let mut launch = match launcher {
+        LauncherConfig::Direct => PreparedLaunch::Direct(build_direct_vm_command(&exe, bx)?),
+        LauncherConfig::Custom(init) => {
+            PreparedLaunch::Direct(super::launcher::custom_command(init, &exe, spec, bx)?)
+        }
+        LauncherConfig::Sandboxed {
+            policy,
+            allow_fallback,
+        } => {
+            let validated = sandbox::resolve_policy(policy.as_deref(), *allow_fallback)?;
+            super::launcher::prepare_sandbox_launch(spec, bx, &exe, &validated)?
+        }
+    };
+    let cmd = launch.command_mut();
+    cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    sys::detach(&mut cmd);
-    let inheritance = sys::pass_lock(&mut cmd, lock)?;
-    let spawned = cmd.spawn();
-    drop(inheritance);
-    let mut child = spawned.context("starting the background terra")?;
-    if let Some(mut stdin) = child.stdin.take() {
-        use std::io::Write;
-        // EPIPE here means the child already died; its exit reports the cause.
-        let _ = stdin.write_all(json.as_bytes());
+        .stderr(diagnostics);
+    let guard = sys::supervise_vm_child(
+        cmd,
+        spec.foreground || spec.mode == terra_protocol::PlanMode::Create,
+    )?;
+    inherited_files.push(sys::pass_lock(cmd, lock)?);
+    let spawned = launch.spawn(DETACH_READY_DEADLINE);
+    drop(inherited_files);
+    let sandbox::SpawnedLaunch { mut child, pid } = spawned
+        .context("starting the configured VM launcher; check vm.init and launcher diagnostics")?;
+    if let Some(guard) = &guard
+        && let Err(error) = sys::attach_vm_child(guard, &child)
+    {
+        let _ = sys::kill_vm_child(&mut child);
+        let _ = child.wait();
+        return Err(error).context("attaching foreground VM supervision");
     }
-    Ok(child)
+    if let Some(identity) = identity
+        && let Err(error) = publish_sandbox_pid(pid, bx, lock, &identity, spec.mode)
+    {
+        let _ = kill_and_reap_vm(child);
+        let _ = write_boot_logs(bx, &mut std::io::stderr().lock());
+        return Err(error);
+    }
+    if let Err(error) = send_startup_input(&mut child, json) {
+        let _ = sys::kill_vm_child(&mut child);
+        let _ = child.wait();
+        return Err(error).context("starting process startup writer");
+    }
+    Ok(LaunchedVm {
+        child,
+        _guard: guard,
+    })
+}
+
+fn build_direct_vm_command(exe: &Path, bx: &BoxRef) -> Result<Command> {
+    let mut command = Command::new(exe);
+    if let Some(directory) = std::env::var_os("TERRA_SYSCALL_TRACE") {
+        let output = tempfile::Builder::new()
+            .prefix("vm-")
+            .suffix(".json")
+            .tempfile_in(directory)?
+            .into_temp_path()
+            .keep()?;
+        command.arg(VM_PROCESS_FLAG_ARG).arg(bx.get_dir());
+        return crate::sandbox::policy::trace_command(&command, &output);
+    }
+    command.arg(VM_PROCESS_FLAG_ARG);
+    command.arg(bx.get_dir());
+    Ok(command)
+}
+
+fn send_startup_input(child: &mut Child, json: Vec<u8>) -> Result<()> {
+    let mut stdin = child.stdin.take().context("opening process startup pipe")?;
+    std::thread::Builder::new()
+        .name("process-startup-input".into())
+        .spawn(move || {
+            use std::io::Write;
+            // A launcher that exits or ignores stdin must not block the startup deadline.
+            let _ = stdin.write_all(&json);
+        })
+        .context("starting process startup writer")?;
+    Ok(())
+}
+
+fn publish_sandbox_pid(
+    pid: u32,
+    bx: &BoxRef,
+    lock: &File,
+    identity: &File,
+    mode: terra_protocol::PlanMode,
+) -> Result<()> {
+    BoxRef::publish_pid(identity, pid, mode == terra_protocol::PlanMode::Create)
+        .with_context(|| format!("publishing protected host VM identity for {bx}"))?;
+    BoxRef::publish_pid(lock, pid, mode == terra_protocol::PlanMode::Create)
+        .with_context(|| format!("publishing host VM identity for {bx}"))
+}
+
+fn start_ready_reader(child: &mut Child) -> Result<std::sync::mpsc::Receiver<Result<bool>>> {
+    let ready = child.stdout.take().context("opening VM startup pipe")?;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("vm-startup".into())
+        .spawn(move || {
+            let _ = sender.send(read_agent_ready(ready));
+        })
+        .context("starting VM startup reader")?;
+    Ok(receiver)
+}
+
+async fn spawn_foreground(
+    bx: &BoxRef,
+    spec: &BootSpec,
+    run_lock: File,
+    agent_timeout: Option<u64>,
+    launcher: &LauncherConfig,
+) -> Result<ExitCode> {
+    let LaunchedVm { mut child, _guard } = spawn_vm_process(bx, spec, &run_lock, launcher)?;
+    drop(run_lock);
+    let ready = relay_foreground_stop(bx).and_then(|()| start_ready_reader(&mut child));
+    let ready = match ready {
+        Ok(ready) => ready,
+        Err(error) => {
+            let _ = kill_and_reap_vm(child);
+            return Err(error);
+        }
+    };
+    let deadline = Instant::now() + DETACH_READY_DEADLINE;
+    let vm = async {
+        let mut is_ready = false;
+        loop {
+            if let Some(status) = child.try_wait().context("waiting for foreground VM")? {
+                replay_logs(bx, status);
+                return Ok(ExitCode::from(compute_vm_child_exit_byte(bx, status)));
+            }
+            if !is_ready {
+                match ready.try_recv() {
+                    Ok(notification) => {
+                        anyhow::ensure!(
+                            notification?,
+                            "VM closed its startup pipe before readiness"
+                        );
+                        is_ready = true;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        anyhow::bail!("VM startup reader disconnected")
+                    }
+                }
+                anyhow::ensure!(
+                    is_ready || Instant::now() < deadline,
+                    "timed out waiting for VM startup notification"
+                );
+            }
+            tokio::time::sleep(sys::POLL).await;
+        }
+    };
+    let result = supervise_foreground(bx, vm, pump_box_console(bx, agent_timeout)).await;
+    if result.is_err() {
+        let _ = kill_and_reap_vm(child);
+        let _ = write_boot_logs(bx, &mut std::io::stderr().lock());
+    }
+    result
+}
+
+fn relay_foreground_stop(bx: &BoxRef) -> Result<()> {
+    let (host, mut receiver) = terra_platform::io::local::create_local_pair()
+        .context("creating foreground stop channel")?;
+    let bx = bx.clone();
+    std::thread::Builder::new()
+        .name("foreground-stop".into())
+        .spawn(move || {
+            let mut byte = [0];
+            if receiver.read_exact(&mut byte).is_ok() && byte == [terra_protocol::STOP_SIGNAL] {
+                let _ = crate::cmd::stop::stop_and_wait(
+                    &bx,
+                    Duration::from_secs(crate::cli::DEFAULT_STOP_TIMEOUT_SECS),
+                    crate::cmd::stop::SetupAction::Stop,
+                );
+            }
+        })
+        .context("starting foreground stop relay")?;
+    sys::register_stop_channel(host);
+    sys::install_stop_signal_handlers();
+    Ok(())
 }
 
 fn finish_session(
@@ -402,6 +585,15 @@ fn finish_session(
             anyhow::bail!("{bx} stopped without reporting a status - its VM was killed or died")
         }
     }
+}
+
+fn encode_boot_spec(spec: &BootSpec) -> Result<Vec<u8>> {
+    let json = serde_json::to_vec(spec).context("encoding the boot for the VM process")?;
+    anyhow::ensure!(
+        json.len() as u64 <= MAX_BOOT_SPEC_BYTES,
+        "boot specification exceeds {MAX_BOOT_SPEC_BYTES} bytes; reduce the recipe or environment"
+    );
+    Ok(json)
 }
 
 fn read_boot_spec(reader: impl Read) -> Result<BootSpec> {
@@ -446,7 +638,7 @@ fn kill_and_reap_vm(mut child: Child) -> Result<ExitStatus> {
     if let Some(status) = child.try_wait().context("checking failed VM startup")? {
         return Ok(status);
     }
-    child.kill().context("killing VM after failed startup")?;
+    sys::kill_vm_child(&mut child).context("killing VM after failed startup")?;
     if let Some(status) = wait_for_child_exit(&mut child, KILL_REAP_WAIT)? {
         return Ok(status);
     }
@@ -491,6 +683,7 @@ fn replay_logs(bx: &BoxRef, status: std::process::ExitStatus) {
 
 fn write_boot_logs(bx: &BoxRef, output: &mut impl std::io::Write) -> std::io::Result<()> {
     for (label, path) in [
+        ("launcher diagnostics", bx.get_dir().join("launcher.log")),
         ("host log", bx.get_dir().join(crate::state::LOG_FILE)),
         (
             "guest diagnostics",
@@ -545,6 +738,38 @@ fn read_log_tail(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sandbox_identity_publishes_the_host_pid_before_boot() {
+        let directory = tempfile::tempdir().unwrap();
+        let bx = BoxRef::from_state_dir(directory.path().to_path_buf(), directory.path());
+        let lock = File::create(directory.path().join(crate::state::PID_FILE)).unwrap();
+        let identity = File::create(directory.path().join(crate::state::HOST_PID_FILE)).unwrap();
+        publish_sandbox_pid(
+            std::process::id(),
+            &bx,
+            &lock,
+            &identity,
+            terra_protocol::PlanMode::Run,
+        )
+        .unwrap();
+        let process = bx.read_vm_process().unwrap();
+        assert_eq!(process.pid, std::process::id());
+        assert_eq!(
+            process.process_identity,
+            sys::read_process_start_time(std::process::id())
+        );
+        assert!(
+            publish_sandbox_pid(
+                u32::MAX,
+                &bx,
+                &lock,
+                &identity,
+                terra_protocol::PlanMode::Run
+            )
+            .is_err()
+        );
+    }
 
     #[tokio::test]
     async fn foreground_console_completion_never_replaces_the_vm_result() {
@@ -697,7 +922,6 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn detached_start_bounds_a_stopped_child_and_preserves_exit_status() {
-        use std::process::{Command, Stdio};
         let directory = tempfile::tempdir().unwrap();
         let bx = BoxRef::from_state_dir(directory.path().to_path_buf(), directory.path());
         for (script, timeout, expected) in [
@@ -755,15 +979,10 @@ mod tests {
         assert_eq!(back.cfg.workload.args, ["test"]);
     }
 
-    /// Running the VM in this process is one fact with two spellings - the
-    /// [`BootMode`] a boot runs under, and the flag the VM process reads off
-    /// its spec - so the spec takes it from the mode rather than deciding it
-    /// again from the flags. Two derivations can disagree, and nothing would
-    /// say so: the console and the workload's terminal both turn on this, and
-    /// a boot with them pointed different ways is a silent misbehaviour, not
-    /// an error.
+    /// Foreground supervision and the workload's terminal use the same flag,
+    /// derived from the resolved boot mode.
     #[test]
-    fn the_spec_takes_running_in_this_process_from_the_boot_mode() {
+    fn the_spec_takes_foreground_supervision_from_the_boot_mode() {
         use clap::Parser;
         let foreground_of = |flags: &[&str], boot| {
             let argv: Vec<&str> = std::iter::once("terra")
@@ -781,8 +1000,6 @@ mod tests {
         assert!(foreground_of(&["--foreground"], BootMode::Foreground));
         for spawned in [BootMode::Detached, BootMode::DetachedWithJoin] {
             assert!(!foreground_of(&[], spawned), "{spawned:?}");
-            // The mode is what decides, so the flag alone cannot make a VM
-            // that is being spawned believe it runs here.
             assert!(!foreground_of(&["--foreground"], spawned), "{spawned:?}");
         }
     }
