@@ -164,7 +164,7 @@ TMPDIR=/tmp TERRA_BIN=$PWD/dist/terra TERRA_SECCOMP_ENFORCED=1 \
   cargo test --locked --target x86_64-unknown-linux-musl -p terra --test boot \
   bwrap_enforces_vm_and_vcpu_threads -- --exact --ignored --test-threads=1
 TMPDIR=$PWD/build/t cargo test --locked --target x86_64-unknown-linux-musl \
-  -p terra --lib vm::bwrap::tests::production_jail_restricts_native_probe \
+  -p terra --lib sandbox::linux::bwrap::tests::production_jail_restricts_native_probe \
   -- --exact --ignored
 ```
 

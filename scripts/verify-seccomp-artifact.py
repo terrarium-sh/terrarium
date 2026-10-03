@@ -19,7 +19,11 @@ def require(condition, message):
 
 
 def sha256(path):
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    hasher = hashlib.sha256()
+    with path.open("rb") as file:
+        while chunk := file.read(1024 * 1024):
+            hasher.update(chunk)
+    return hasher.hexdigest()
 
 
 def verify_bpf(bpf, rules, target):
@@ -113,6 +117,8 @@ def verify(directory, binary, target, *, require_marker=True):
     require(isinstance(manifest["release_identity"], str) and
             re.fullmatch(r"[A-Za-z0-9.+_-]+", manifest["release_identity"]),
             "manifest has an invalid Terra build identity")
+    require(manifest["policy_compiler"] == "seccompiler_0_5_0",
+            "manifest must identify seccompiler 0.5.0")
     require(policy["format_version"] == manifest["format_version"] == 1,
             "policy and manifest must use format version 1")
     require(policy["target"] == target and policy["default_action"] == "kill_process" and policy["rules"],
@@ -123,32 +129,27 @@ def verify(directory, binary, target, *, require_marker=True):
     results = manifest["validation"]["workload_results"]
     traced = policy["workload_coverage"]["traced"]
     excluded = policy["workload_coverage"]["enforced_only"]
-    inventory = json.loads(Path(__file__).with_name("seccomp-workloads.json").read_text())
-    required = [workload for workload in inventory["workloads"] if target in workload.get("targets", [target])]
-    required_names = [f"{workload['suite']}.{workload['test']}" for workload in required]
-    required_traced = [f"{workload['suite']}.{workload['test']}" for workload in required
-                       if not workload.get("trace_exclusion_reason")]
-    required_excluded = [{"name": f"{workload['suite']}.{workload['test']}",
-                          "reason": workload["trace_exclusion_reason"]} for workload in required
-                         if workload.get("trace_exclusion_reason")]
-    require(workloads == required_names and traced == required_traced and excluded == required_excluded,
-            "artifact coverage differs from the required workload inventory")
-    require(traced and [result["name"] for result in manifest["trace_workload_results"]] == traced and
+    validation = manifest["validation"]
+    require(validation["scope"] == policy["workload_coverage"]["scope"] == "host_components" and
+            validation["vm_validated"] is True,
+            "release policy requires guest validation of the host-generated candidate; run terra self-test --generate-policy --validate-vm")
+    require(traced == ["self_test.host_components"] and
+            workloads == ["self_test.host_components", "self_test.built_in_guest"] and
+            [entry["name"] for entry in excluded] == ["self_test.built_in_guest"] and
+            all(entry["reason"] for entry in excluded) and excluded == manifest["trace_exclusions"],
+            "artifact must trace host components and enforce the same policy against the complete built-in guest workload")
+    require([result["name"] for result in manifest["trace_workload_results"]] == traced and
             all(result["passed"] is True for result in manifest["trace_workload_results"]),
             "traced workload results differ from policy coverage")
-    require(excluded == manifest["trace_exclusions"] and
-            all(entry["name"] and entry["reason"] for entry in excluded) and
-            len({entry["name"] for entry in excluded}) == len(excluded),
-            "trace exclusions lack explicit reasons or differ from manifest")
-    require(len(traced) == len(set(traced)) and
-            set(traced).isdisjoint({entry["name"] for entry in excluded}),
-            "traced and enforced-only workloads overlap or repeat")
-    require(set(workloads) == set(traced) | {entry["name"] for entry in excluded},
-            "enforced inventory does not cover every traced and explicitly excluded workload")
-    require(len(workloads) == len(results) > 0 and len(workloads) == len(set(workloads)) and
-            [result["name"] for result in results] == workloads and
+    require([result["name"] for result in results] == workloads and
             all(result["passed"] is True for result in results),
             "manifest workloads and successful enforced results differ")
+    require(type(validation["traced_execs"]) is int and type(validation["traced_processes"]) is int and
+            validation["traced_processes"] >= validation["traced_execs"] > 0,
+            "artifact lacks traced host-component execution evidence")
+    require(type(policy["supplement_version"]) is int and
+            policy["supplement_version"] == manifest["supplement_version"] > 0,
+            "policy and manifest supplement versions differ")
     require(manifest["target"] == target and
             manifest["executable_sha256"] == binary_hash and manifest["bpf_sha256"] == bpf_hash,
             "artifact identity or digest differs from executable/BPF")

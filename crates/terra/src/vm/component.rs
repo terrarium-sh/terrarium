@@ -35,6 +35,61 @@ const ARTIFACTS: TrustedArtifacts = {
     }
 };
 
+pub async fn run_host_self_test() -> Result<()> {
+    #[cfg(unix)]
+    super::resources::limit_vm_process()?;
+    sys::validate_host_root()?;
+    let directory = tempfile::tempdir().context("creating host self-test directory")?;
+    let launcher_config = directory.path().join("launcher.json");
+    crate::sandbox::config::write_policy_workload(&launcher_config, None)?;
+    anyhow::ensure!(
+        crate::sandbox::config::load_from(&launcher_config)?
+            == crate::sandbox::LauncherConfig::Direct,
+        "host self-test launcher configuration did not preserve direct execution"
+    );
+    let bx = BoxRef::from_state_dir(directory.path().join("box"), directory.path());
+    let run_lock = bx.lock_run().context("acquiring host self-test run lock")?;
+    BoxRef::publish_pid(&run_lock, std::process::id(), false)
+        .context("publishing host self-test process identity")?;
+    anyhow::ensure!(
+        bx.read_vm_process()
+            .is_some_and(|owner| owner.pid == std::process::id()),
+        "host self-test process identity was not published"
+    );
+    logs::init(&bx)?;
+    anyhow::ensure!(
+        !image::load_kernel()?.is_empty(),
+        "embedded kernel is empty"
+    );
+    anyhow::ensure!(
+        !image::load_boot_image()?.is_empty(),
+        "embedded boot image is empty"
+    );
+    let diagnostics = bx.get_dir().join(crate::state::DIAGNOSTICS_LOG);
+    image::staged_write(&diagnostics, |_| Ok(()))?;
+    anyhow::ensure!(
+        sys::create_regular_file(&diagnostics)?.metadata()?.len() == 0,
+        "host self-test diagnostics did not start empty"
+    );
+    let listener = agent_listener(&bx)?;
+    let client = LocalStream::connect(bx.get_dir().join(crate::state::AGENT_SOCKET))?;
+    let (accepted, _) = listener.accept()?;
+    drop((client, accepted, listener));
+    let (host, mut worker) = create_local_pair().context("creating host self-test stop channel")?;
+    worker.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
+    relay_stop(stop_listener(&bx)?, host);
+    bx.request_stop()?;
+    let mut stop = [0];
+    worker.read_exact(&mut stop)?;
+    anyhow::ensure!(
+        stop == [terra_protocol::STOP_SIGNAL],
+        "host self-test stop request was not relayed"
+    );
+    terra_runtime::self_test::run_self_test(ARTIFACTS, directory.path())
+        .await
+        .map_err(|error| anyhow::anyhow!("{error:#}"))
+}
+
 fn volume_disk_paths(spec: &BootSpec, bx: &BoxRef) -> Vec<std::path::PathBuf> {
     spec.cfg
         .volumes
@@ -147,7 +202,7 @@ pub async fn run(
         None
     };
 
-    if !spec.builtin_bwrap {
+    if !spec.host_publishes_pid {
         BoxRef::publish_pid(lock, std::process::id(), spec.mode == PlanMode::Create)
             .context("publishing the VM process identity")?;
     }
@@ -232,7 +287,7 @@ mod tests {
             root: false,
             mode: PlanMode::Run,
             foreground: false,
-            builtin_bwrap: false,
+            host_publishes_pid: false,
         };
         let grants = open_shares(&spec).unwrap();
         let plan = super::super::build_plan(&spec).unwrap().shares;
@@ -266,7 +321,7 @@ mod tests {
             root: false,
             mode: PlanMode::Run,
             foreground: false,
-            builtin_bwrap: false,
+            host_publishes_pid: false,
         };
         assert!(open_shares(&spec).is_ok());
         std::fs::remove_dir(&share).unwrap();
@@ -302,7 +357,7 @@ mod tests {
             root: false,
             mode: PlanMode::Create,
             foreground: false,
-            builtin_bwrap: false,
+            host_publishes_pid: false,
         };
         let grants = open_shares(&spec).unwrap();
         let plan = super::super::build_plan(&spec).unwrap().shares;

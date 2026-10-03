@@ -133,10 +133,6 @@ pub fn detach(cmd: &mut Command) {
 /// The descriptor a boot hands its VM process the box's run lock on, already
 /// held.
 const LOCK_FD: std::os::fd::RawFd = 3;
-#[cfg(target_os = "linux")]
-const SECCOMP_FD: std::os::fd::RawFd = 5;
-#[cfg(target_os = "linux")]
-const BWRAP_INFO_FD: std::os::fd::RawFd = 6;
 
 #[allow(unsafe_code)]
 fn duplicate_above_handoff(file: &File) -> Result<File> {
@@ -151,7 +147,7 @@ fn duplicate_above_handoff(file: &File) -> Result<File> {
 }
 
 #[allow(unsafe_code)]
-fn pass_descriptor(cmd: &mut Command, file: &File, target: i32) -> Result<File> {
+pub(crate) fn pass_descriptor(cmd: &mut Command, file: &File, target: i32) -> Result<File> {
     use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
     let inherited = duplicate_above_handoff(file)?;
@@ -172,16 +168,6 @@ fn pass_descriptor(cmd: &mut Command, file: &File, target: i32) -> Result<File> 
 /// holds the same `flock`, released only when every one of them closes.
 pub fn pass_lock(cmd: &mut Command, lock: &File) -> Result<File> {
     pass_descriptor(cmd, lock, LOCK_FD)
-}
-
-#[cfg(target_os = "linux")]
-pub fn pass_seccomp(cmd: &mut Command, seccomp: &File) -> Result<File> {
-    pass_descriptor(cmd, seccomp, SECCOMP_FD)
-}
-
-#[cfg(target_os = "linux")]
-pub fn pass_bwrap_info(cmd: &mut Command, info: &File) -> Result<File> {
-    pass_descriptor(cmd, info, BWRAP_INFO_FD)
 }
 
 pub struct VmChildGuard {

@@ -104,7 +104,13 @@ See the [recipe reference](docs/recipe.md) to customize tools, access, and workl
 - [Recipe reference](docs/recipe.md) — network access, mounts, packages, and workloads.
 - [Project manifest](docs/manifest.md) — manage multiple boxes with `terra.yaml`.
 - [Security model](docs/security.md) — trust boundaries, enforcement, and limitations.
-- [Host VM launchers](docs/vm-launchers.md) — Linux containment and seccomp policies.
+- [Host VM launchers](docs/vm-launchers.md) — Linux containment and seccomp policies;
+  `terra self-test` runs guestless feature checks. Add `--validate-vm` for the
+  bundled guest suite or `--generate-policy` to generate a policy on Linux.
+  Self-tests, tracing, and policy compilation are embedded in Terra.
+  Generate one for a custom workload with
+  `terra ./dev.yaml --generate-policy -- npm test`; generation runs
+  the workload twice and leaves installation to you.
 - [Development](README.dev.md) — build from source, test, and release.
 - [Packaging](packaging/README.md) — platform requirements, systemd, and man pages.
 - [Security policy](SECURITY.md) — report a vulnerability privately.

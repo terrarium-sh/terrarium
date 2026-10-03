@@ -23,7 +23,10 @@ use terra_protocol::DEFAULT_STOP_GRACE_SECS;
                        terra dev                   Start this directory's box `dev`, or attach\n    \
                        terra dev exec -- ls        Run a command in the running box\n    \
                        terra ./pi-dev.yaml setup   Set up a box from a recipe\n    \
-                       terra dev logs -f           Follow the box's log"
+                       terra dev logs -f           Follow the box's log\n    \
+                       terra self-test             Run bundled host checks\n    \
+                       terra dev --generate-policy\n    \
+                                                   Trace and enforce the box workload"
 )]
 pub struct Cli {
     /// Box name. Default: this directory's only box.
@@ -47,11 +50,22 @@ impl Cli {
             foreground,
             command,
             agent,
+            policy,
         } = &self.boot;
-        *root || *detach || *foreground || agent.agent_timeout.is_some() || !command.is_empty()
+        *root
+            || *detach
+            || *foreground
+            || agent.agent_timeout.is_some()
+            || policy.generate_policy
+            || !command.is_empty()
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
+        let generate_policy = self.boot.policy.generate_policy
+            || matches!(&self.cmd, Some(Cmd::SelfTest(args)) if args.policy.generate_policy);
+        if generate_policy {
+            crate::sandbox::policy::require_policy_support()?;
+        }
         let Some(cmd) = &self.cmd else {
             return Ok(());
         };
@@ -62,7 +76,7 @@ impl Cli {
                 box_name = self.name.as_deref().unwrap_or("<box>"),
             )
         } else {
-            "or run `terra ls` without a box".to_owned()
+            format!("or run `terra {verb}` without a box")
         };
         anyhow::ensure!(
             !self.has_boot_flags(),
@@ -82,7 +96,7 @@ fn build_reversal_hint(typed: &[String]) -> Option<String> {
     let (verb_idx, verb) = typed.iter().enumerate().find_map(|(i, arg)| {
         let sub = command.find_subcommand(arg)?;
         let name = sub.get_name();
-        (!matches!(name, "ls" | "completions" | "help")).then_some((i, name))
+        (!matches!(name, "ls" | "completions" | "self-test" | "help")).then_some((i, name))
     })?;
 
     for (idx, arg) in typed.iter().enumerate() {
@@ -212,6 +226,18 @@ pub enum Cmd {
                                  source <(terra completions bash)\n    \
                                  eval \"$(terra completions zsh)\"")]
     Completions(CompletionsArgs),
+    /// Run the bundled host feature checks without starting a VM.
+    ///
+    /// Use `--validate-vm` to also run the bundled guest suite on the native
+    /// virtualization platform. Policy generation is opt-in and requires native
+    /// Linux with permission to trace child processes.
+    #[command(after_long_help = "EXAMPLES:\n    \
+        terra self-test                              Run bundled host checks\n    \
+        terra self-test --validate-vm                Also run the guest suite\n    \
+        terra self-test --generate-policy            Generate and enforce a host policy\n    \
+        terra self-test --validate-vm --generate-policy\n    \
+                                                    Also validate the generated policy in a VM")]
+    SelfTest(SelfTestArgs),
 }
 
 impl Cmd {
@@ -229,6 +255,7 @@ impl Cmd {
             Self::Storage(_) => "storage",
             Self::Rm(_) => "rm",
             Self::Completions(_) => "completions",
+            Self::SelfTest(_) => "self-test",
         }
     }
 
@@ -246,9 +273,66 @@ impl Cmd {
             | Cmd::Stop(_)
             | Cmd::Storage(_)
             | Cmd::Rm(_) => true,
-            Cmd::Ls(_) | Cmd::Completions(_) => false,
+            Cmd::Ls(_) | Cmd::Completions(_) | Cmd::SelfTest(_) => false,
         }
     }
+}
+
+#[derive(Args, Debug)]
+#[command(args_conflicts_with_subcommands = true, disable_help_subcommand = true)]
+pub struct SelfTestArgs {
+    #[command(subcommand)]
+    pub command: Option<SelfTestCommand>,
+    /// Also run the bundled guest suite on the native virtualization platform.
+    #[arg(long)]
+    pub validate_vm: bool,
+    /// Directory for guest self-test logs.
+    #[arg(
+        long,
+        value_name = "DIR",
+        default_value = "terra-workload-logs",
+        requires = "validate_vm",
+        conflicts_with = "generate_policy"
+    )]
+    pub diagnostics: PathBuf,
+    /// Maximum seconds for the guest self-test.
+    #[arg(long, default_value_t = 900, value_parser = clap::value_parser!(u64).range(1..), requires = "validate_vm", conflicts_with = "generate_policy")]
+    pub timeout: u64,
+    #[command(flatten)]
+    pub policy: PolicyArgs,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SelfTestCommand {
+    #[command(hide = true)]
+    Host,
+    #[command(hide = true)]
+    Guest,
+}
+
+#[derive(Args, Debug)]
+pub struct PolicyArgs {
+    /// Generate and validate a seccomp policy on native Linux.
+    ///
+    /// Runs the selected workload twice: once for tracing and once under the
+    /// generated policy. Custom workloads can repeat writes and external effects.
+    /// Box execution runs in the foreground. Generation does not install the policy.
+    #[arg(long)]
+    pub generate_policy: bool,
+    /// Policy output directory, published after enforced validation.
+    #[arg(long, value_name = "DIR", requires = "generate_policy")]
+    pub policy_output: Option<PathBuf>,
+    /// Directory for policy generation logs and syscall traces.
+    #[arg(
+        long,
+        value_name = "DIR",
+        default_value = "terra-workload-logs",
+        requires = "generate_policy"
+    )]
+    pub policy_diagnostics: PathBuf,
+    /// Maximum seconds for each policy generation pass.
+    #[arg(long, default_value_t = 900, value_parser = clap::value_parser!(u64).range(1..), requires = "generate_policy")]
+    pub policy_timeout: u64,
 }
 
 #[derive(Args, Debug)]
@@ -495,7 +579,7 @@ pub struct BootArgs {
 
     /// Run headless after the guest agent becomes ready, before startup hooks
     /// finish. Boot fails if the agent is not ready within 60 seconds.
-    #[arg(short = 'd', long)]
+    #[arg(short = 'd', long, conflicts_with = "generate_policy")]
     pub detach: bool,
 
     /// Run the VM in the foreground - for a service manager
@@ -506,6 +590,9 @@ pub struct BootArgs {
 
     #[command(flatten)]
     pub agent: AgentTimeoutArg,
+
+    #[command(flatten)]
+    pub policy: PolicyArgs,
 
     /// Command to run instead of the recipe's `workload:`, after `--`. argv is
     /// passed literally to the guest exec, so use `-- sh -c '…'` for a shell
@@ -547,6 +634,325 @@ mod tests {
             panic!("expected rm")
         };
         assert!(rm_args.purge);
+    }
+
+    #[test]
+    fn self_test_is_boxless_and_generation_is_opt_in() {
+        for argv in [
+            vec!["terra", "self-test"],
+            vec!["terra", "self-test", "--validate-vm"],
+        ] {
+            let cli = Cli::parse_from(&argv);
+            cli.validate().unwrap();
+            assert!(cli.name.is_none());
+            let Some(Cmd::SelfTest(args)) = cli.cmd else {
+                panic!("expected self-test")
+            };
+            assert!(!args.policy.generate_policy);
+            assert_eq!(args.validate_vm, argv.contains(&"--validate-vm"));
+            assert_eq!(args.timeout, 900);
+            assert_eq!(args.diagnostics, Path::new("terra-workload-logs"));
+        }
+        let error = Cli::parse_from(["terra", "dev", "self-test"])
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("terra self-test"), "{error}");
+        for flag in ["--root", "-d", "--foreground", "--agent-timeout"] {
+            assert!(Cli::try_parse_from(["terra", "self-test", flag]).is_err());
+        }
+        for flag in ["--root", "-d", "--foreground"] {
+            assert!(
+                Cli::parse_from(["terra", flag, "self-test"])
+                    .validate()
+                    .is_err()
+            );
+        }
+        for removed in ["--run-only", "--recipe", "--output"] {
+            assert!(Cli::try_parse_from(["terra", "self-test", removed]).is_err());
+        }
+        assert!(Cli::try_parse_from(["terra", "self-test", "--", "true"]).is_err());
+        assert!(Cli::try_parse_from(["terra", "self-test", "--timeout", "0"]).is_err());
+        assert!(Cli::parse_from(["terra", "workload"]).cmd.is_none());
+        assert!(name::validate_box_name("workload").is_ok());
+    }
+
+    #[test]
+    fn self_test_workers_accept_global_project() {
+        for worker in ["host", "guest"] {
+            for argv in [
+                vec!["terra", "--project", "/project", "self-test", worker],
+                vec!["terra", "self-test", worker, "--project", "/project"],
+            ] {
+                let cli = Cli::parse_from(argv);
+                cli.validate().unwrap();
+                assert_eq!(cli.project.as_deref(), Some(Path::new("/project")));
+                let Some(Cmd::SelfTest(args)) = cli.cmd else {
+                    panic!("expected self-test")
+                };
+                match args.command.unwrap() {
+                    SelfTestCommand::Host => assert_eq!(worker, "host"),
+                    SelfTestCommand::Guest => assert_eq!(worker, "guest"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn self_test_workers_reject_public_options_and_extra_arguments() {
+        let workers = [vec!["host"], vec!["guest"]];
+        for worker in workers {
+            for option in [
+                vec!["--validate-vm"],
+                vec!["--timeout", "30"],
+                vec!["--diagnostics", "logs"],
+                vec!["--generate-policy"],
+                vec!["--policy-output", "policy"],
+                vec!["--policy-diagnostics", "logs"],
+                vec!["--policy-timeout", "30"],
+            ] {
+                for args in [option.iter().chain(&worker), worker.iter().chain(&option)] {
+                    assert!(
+                        Cli::try_parse_from(
+                            ["terra", "self-test"].into_iter().chain(args.copied())
+                        )
+                        .is_err()
+                    );
+                }
+            }
+        }
+        for args in [vec!["host", "extra"], vec!["guest", "extra"]] {
+            assert!(Cli::try_parse_from(["terra", "self-test"].into_iter().chain(args)).is_err());
+        }
+    }
+
+    #[test]
+    fn self_test_workers_are_hidden_from_public_help() {
+        let command = Cli::command();
+        let self_test = command.find_subcommand("self-test").unwrap();
+        for worker in self_test.get_subcommands() {
+            assert!(worker.is_hide_set());
+        }
+        for mut command in [command.clone(), self_test.clone()] {
+            for help in [
+                command.render_help().to_string(),
+                command.render_long_help().to_string(),
+            ] {
+                for worker in ["host", "guest"] {
+                    assert!(
+                        !help
+                            .lines()
+                            .any(|line| line.split_whitespace().next() == Some(worker))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn policy_options_require_generation_on_both_entry_points() {
+        for entry in [vec!["terra", "dev"], vec!["terra", "self-test"]] {
+            for option in [
+                ["--policy-output", "policy"],
+                ["--policy-diagnostics", "logs"],
+                ["--policy-timeout", "30"],
+            ] {
+                assert!(Cli::try_parse_from(entry.iter().copied().chain(option)).is_err());
+                let cli = Cli::parse_from(
+                    entry
+                        .iter()
+                        .copied()
+                        .chain(["--generate-policy"])
+                        .chain(option),
+                );
+                assert_eq!(cli.validate().is_ok(), cfg!(target_os = "linux"));
+                let policy = if let Some(Cmd::SelfTest(args)) = &cli.cmd {
+                    &args.policy
+                } else {
+                    assert!(cli.cmd.is_none());
+                    &cli.boot.policy
+                };
+                assert!(policy.generate_policy);
+                assert_eq!(
+                    policy.policy_output.as_deref(),
+                    (option[0] == "--policy-output").then_some(Path::new("policy")),
+                );
+                assert_eq!(
+                    policy.policy_diagnostics,
+                    Path::new(if option[0] == "--policy-diagnostics" {
+                        "logs"
+                    } else {
+                        "terra-workload-logs"
+                    }),
+                );
+                assert_eq!(
+                    policy.policy_timeout,
+                    if option[0] == "--policy-timeout" {
+                        30
+                    } else {
+                        900
+                    }
+                );
+            }
+            assert!(
+                Cli::try_parse_from(entry.iter().copied().chain([
+                    "--generate-policy",
+                    "--policy-timeout",
+                    "0"
+                ]),)
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn policy_generation_rejects_detach_and_preserves_literal_guest_argv() {
+        for argv in [
+            ["terra", "dev", "--generate-policy", "-d"],
+            ["terra", "dev", "-d", "--generate-policy"],
+            ["terra", "dev", "--generate-policy", "--detach"],
+            ["terra", "dev", "--detach", "--generate-policy"],
+        ] {
+            assert!(Cli::try_parse_from(argv).is_err());
+        }
+        for argv in [
+            vec!["terra", "dev", "--generate-policy"],
+            vec!["terra", "dev", "--foreground", "--generate-policy"],
+        ] {
+            let cli = Cli::parse_from(argv);
+            assert_eq!(cli.validate().is_ok(), cfg!(target_os = "linux"));
+            assert!(cli.boot.policy.generate_policy);
+        }
+        let cli = Cli::parse_from([
+            "terra",
+            "./dev.yaml",
+            "--generate-policy",
+            "--root",
+            "--agent-timeout",
+            "42",
+            "--project",
+            "/project",
+            "--",
+            "sh",
+            "-c",
+            "echo $HOME; touch output",
+            "--policy-timeout",
+            "0",
+        ]);
+        assert_eq!(cli.validate().is_ok(), cfg!(target_os = "linux"));
+        assert_eq!(cli.name.as_deref(), Some("./dev.yaml"));
+        assert_eq!(cli.project.as_deref(), Some(Path::new("/project")));
+        assert!(cli.boot.root && cli.boot.policy.generate_policy);
+        assert!(!cli.boot.foreground);
+        assert_eq!(cli.boot.agent.agent_timeout, Some(42));
+        assert_eq!(
+            cli.boot.command,
+            [
+                "sh",
+                "-c",
+                "echo $HOME; touch output",
+                "--policy-timeout",
+                "0"
+            ]
+        );
+        assert!(Cli::try_parse_from(["terra", "dev", "--validate-vm"]).is_err());
+        assert!(Cli::try_parse_from(["terra", "dev", "--timeout", "30"]).is_err());
+        assert!(Cli::try_parse_from(["terra", "dev", "--diagnostics", "logs"]).is_err());
+        assert!(
+            Cli::parse_from(["terra", "--generate-policy", "ls"])
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn self_test_vm_validation_accepts_generation_and_has_separate_runner_options() {
+        let cli = Cli::parse_from([
+            "terra",
+            "self-test",
+            "--validate-vm",
+            "--generate-policy",
+            "--policy-timeout",
+            "60",
+            "--policy-diagnostics",
+            "policy-logs",
+        ]);
+        assert_eq!(cli.validate().is_ok(), cfg!(target_os = "linux"));
+        let Some(Cmd::SelfTest(args)) = cli.cmd else {
+            panic!("expected self-test")
+        };
+        assert!(args.validate_vm && args.policy.generate_policy);
+        assert_eq!(args.policy.policy_timeout, 60);
+        assert_eq!(args.policy.policy_diagnostics, Path::new("policy-logs"));
+        let cli = Cli::parse_from([
+            "terra",
+            "self-test",
+            "--validate-vm",
+            "--timeout",
+            "45",
+            "--diagnostics",
+            "guest-logs",
+        ]);
+        cli.validate().unwrap();
+        let Some(Cmd::SelfTest(args)) = cli.cmd else {
+            panic!("expected self-test")
+        };
+        assert_eq!(args.timeout, 45);
+        assert_eq!(args.diagnostics, Path::new("guest-logs"));
+        for option in [["--timeout", "45"], ["--diagnostics", "guest-logs"]] {
+            assert!(Cli::try_parse_from(["terra", "self-test"].into_iter().chain(option)).is_err());
+            assert!(
+                Cli::try_parse_from(
+                    ["terra", "self-test", "--validate-vm", "--generate-policy"]
+                        .into_iter()
+                        .chain(option),
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn policy_help_and_defaults_are_shared() {
+        let command = Cli::command();
+        let self_test = command.find_subcommand("self-test").unwrap().clone();
+        assert!(command.find_subcommand("workload").is_none());
+        for id in [
+            "generate_policy",
+            "policy_output",
+            "policy_diagnostics",
+            "policy_timeout",
+        ] {
+            let boot_arg = command
+                .get_arguments()
+                .find(|arg| arg.get_id() == id)
+                .unwrap();
+            let self_test_arg = self_test
+                .get_arguments()
+                .find(|arg| arg.get_id() == id)
+                .unwrap();
+            assert_eq!(boot_arg.get_help(), self_test_arg.get_help());
+            assert_eq!(boot_arg.get_long_help(), self_test_arg.get_long_help());
+            assert_eq!(
+                boot_arg.get_default_values(),
+                self_test_arg.get_default_values()
+            );
+        }
+        let cli = Cli::parse_from(["terra", "dev", "--generate-policy"]);
+        assert!(cli.boot.policy.policy_output.is_none());
+        assert_eq!(
+            cli.boot.policy.policy_diagnostics,
+            Path::new("terra-workload-logs")
+        );
+        assert_eq!(cli.boot.policy.policy_timeout, 900);
+        for mut help in [command, self_test] {
+            let help = help.render_long_help().to_string();
+            assert!(help.contains("Runs the selected workload twice"), "{help}");
+            assert!(
+                help.contains("repeat writes and external effects"),
+                "{help}"
+            );
+        }
     }
 
     /// The box comes first and the verb second, and every verb that addresses
@@ -717,8 +1123,7 @@ mod tests {
         );
     }
 
-    /// `ls` and `completions` take no box: a box written before them is refused
-    /// with the spelling that works. Every other verb takes the box.
+    /// Commands without a box reject a preceding name with the working spelling.
     #[test]
     fn ls_and_completions_take_no_box() {
         let err = Cli::parse_from(["terra", "dev", "ls"])
@@ -750,7 +1155,7 @@ mod tests {
             };
             assert_eq!(
                 cmd.takes_the_box(),
-                word != "ls" && word != "completions",
+                !matches!(word, "ls" | "completions" | "self-test"),
                 "'{word}' disagrees with taking no box"
             );
         }
@@ -833,6 +1238,7 @@ mod tests {
             &["sessions"],
             &["detach", "--all"],
             &["completions", "bash"],
+            &["self-test"],
         ];
         let mut worded: Vec<&str> = Vec::new();
         for argv in typed {

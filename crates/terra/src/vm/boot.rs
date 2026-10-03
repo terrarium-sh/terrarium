@@ -1,7 +1,7 @@
 //! Booting a prepared box into its VM process.
 
-use super::launcher_config::LauncherConfig;
 use crate::cli::BootArgs;
+use crate::sandbox::{self, LauncherConfig, PreparedLaunch};
 use crate::session::{self, DETACH_KEY_NAME, SessionOutcome, pump_session};
 use crate::state::BoxRef;
 use crate::{config, sys};
@@ -31,7 +31,7 @@ pub struct BootSpec {
     pub mode: terra_protocol::PlanMode,
     pub foreground: bool,
     #[serde(default)]
-    pub builtin_bwrap: bool,
+    pub host_publishes_pid: bool,
 }
 
 impl BootSpec {
@@ -48,7 +48,7 @@ impl BootSpec {
             project_dir,
             mode: terra_protocol::PlanMode::Run,
             foreground: boot == BootMode::Foreground,
-            builtin_bwrap: false,
+            host_publishes_pid: false,
         }
     }
 }
@@ -111,7 +111,7 @@ pub async fn run_bake(
         root: false,
         mode: terra_protocol::PlanMode::Create,
         foreground: false,
-        builtin_bwrap: false,
+        host_publishes_pid: false,
     };
     eprintln!("terra: baking on_create for {bx} in an isolated VM (no shares)");
     let baking = BoxRef::mark_baking(lock).context("marking the on_create bake")?;
@@ -359,62 +359,45 @@ fn spawn_vm_process(
         .context("clearing previous VM identity")?;
     let exe = std::env::current_exe().context("locating the terra binary")?;
     let mut child_spec = spec.clone();
-    child_spec.builtin_bwrap = matches!(launcher, LauncherConfig::Bwrap { .. });
+    child_spec.host_publishes_pid = matches!(launcher, LauncherConfig::Sandboxed { .. });
     let json = encode_boot_spec(&child_spec)?;
     super::resources::prepare_volumes(&child_spec, bx)?;
     let diagnostics = sys::create_regular_file(&bx.get_dir().join("launcher.log"))
         .context("opening VM launcher diagnostics")?;
     let mut inherited_files = Vec::new();
-    #[cfg(target_os = "linux")]
-    let mut bwrap_info = None;
-    let mut cmd = match launcher {
-        LauncherConfig::Direct => {
-            let mut command = Command::new(&exe);
-            command.arg(VM_PROCESS_FLAG_ARG).arg(bx.get_dir());
-            command
+    let identity = if child_spec.host_publishes_pid {
+        Some(
+            sys::create_regular_file(&bx.get_dir().join(crate::state::HOST_PID_FILE))
+                .context("preparing protected VM identity")?,
+        )
+    } else {
+        None
+    };
+    let mut launch = match launcher {
+        LauncherConfig::Direct => PreparedLaunch::Direct(build_direct_vm_command(&exe, bx)?),
+        LauncherConfig::Custom(init) => {
+            PreparedLaunch::Direct(super::launcher::custom_command(init, &exe, spec, bx)?)
         }
-        LauncherConfig::Custom(init) => super::launcher::custom_command(init, &exe, spec, bx)?,
-        LauncherConfig::Bwrap {
+        LauncherConfig::Sandboxed {
             policy,
             allow_fallback,
         } => {
-            #[cfg(target_os = "linux")]
-            {
-                use std::io::{Seek, Write};
-                let validated =
-                    super::launcher_policy::resolve(policy.as_deref(), *allow_fallback)?;
-                let mut file = tempfile::tempfile().context("opening private seccomp policy")?;
-                file.write_all(&validated.bpf)?;
-                file.rewind()?;
-                let (reader, writer) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)?;
-                let writer = File::from(writer);
-                let identity =
-                    sys::create_regular_file(&bx.get_dir().join(crate::state::HOST_PID_FILE))
-                        .context("preparing protected VM identity")?;
-                let mut command = super::bwrap::command(spec, bx, &exe, 5, 6)?;
-                inherited_files.push(sys::pass_bwrap_info(&mut command, &writer)?);
-                bwrap_info = Some((File::from(reader), identity));
-                inherited_files.push(sys::pass_seccomp(&mut command, &file)?);
-                command
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                let _ = (policy, allow_fallback);
-                anyhow::bail!("vm.init: bwrap requires Linux; configure a native custom launcher");
-            }
+            let validated = sandbox::resolve_policy(policy.as_deref(), *allow_fallback)?;
+            super::launcher::prepare_sandbox_launch(spec, bx, &exe, &validated)?
         }
     };
+    let cmd = launch.command_mut();
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(diagnostics);
     let guard = sys::supervise_vm_child(
-        &mut cmd,
+        cmd,
         spec.foreground || spec.mode == terra_protocol::PlanMode::Create,
     )?;
-    inherited_files.push(sys::pass_lock(&mut cmd, lock)?);
-    let spawned = cmd.spawn();
+    inherited_files.push(sys::pass_lock(cmd, lock)?);
+    let spawned = launch.spawn(DETACH_READY_DEADLINE);
     drop(inherited_files);
-    let mut child = spawned
+    let sandbox::SpawnedLaunch { mut child, pid } = spawned
         .context("starting the configured VM launcher; check vm.init and launcher diagnostics")?;
     if let Some(guard) = &guard
         && let Err(error) = sys::attach_vm_child(guard, &child)
@@ -423,9 +406,8 @@ fn spawn_vm_process(
         let _ = child.wait();
         return Err(error).context("attaching foreground VM supervision");
     }
-    #[cfg(target_os = "linux")]
-    if let Some((reader, identity)) = bwrap_info
-        && let Err(error) = publish_bwrap_pid(reader, bx, lock, &identity, spec.mode)
+    if let Some(identity) = identity
+        && let Err(error) = publish_sandbox_pid(pid, bx, lock, &identity, spec.mode)
     {
         let _ = kill_and_reap_vm(child);
         let _ = write_boot_logs(bx, &mut std::io::stderr().lock());
@@ -442,6 +424,23 @@ fn spawn_vm_process(
     })
 }
 
+fn build_direct_vm_command(exe: &Path, bx: &BoxRef) -> Result<Command> {
+    let mut command = Command::new(exe);
+    if let Some(directory) = std::env::var_os("TERRA_SYSCALL_TRACE") {
+        let output = tempfile::Builder::new()
+            .prefix("vm-")
+            .suffix(".json")
+            .tempfile_in(directory)?
+            .into_temp_path()
+            .keep()?;
+        command.arg(VM_PROCESS_FLAG_ARG).arg(bx.get_dir());
+        return crate::sandbox::policy::trace_command(&command, &output);
+    }
+    command.arg(VM_PROCESS_FLAG_ARG);
+    command.arg(bx.get_dir());
+    Ok(command)
+}
+
 fn send_startup_input(child: &mut Child, json: Vec<u8>) -> Result<()> {
     let mut stdin = child.stdin.take().context("opening process startup pipe")?;
     std::thread::Builder::new()
@@ -455,54 +454,17 @@ fn send_startup_input(child: &mut Child, json: Vec<u8>) -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
-fn publish_bwrap_pid(
-    reader: File,
+fn publish_sandbox_pid(
+    pid: u32,
     bx: &BoxRef,
     lock: &File,
     identity: &File,
     mode: terra_protocol::PlanMode,
 ) -> Result<()> {
-    #[derive(serde::Deserialize)]
-    struct ChildInfo {
-        #[serde(rename = "child-pid")]
-        child_pid: u32,
-    }
-    let (sender, receiver) = std::sync::mpsc::channel();
-    std::thread::Builder::new()
-        .name("bwrap-identity".into())
-        .spawn(move || {
-            let mut bytes = Vec::new();
-            let result = reader
-                .take(4097)
-                .read_to_end(&mut bytes)
-                .context("reading Bubblewrap child identity")
-                .and_then(|_| {
-                    anyhow::ensure!(
-                        bytes.len() <= 4096,
-                        "Bubblewrap identity exceeds 4096 bytes"
-                    );
-                    serde_json::from_slice::<ChildInfo>(&bytes)
-                        .context("decoding Bubblewrap child identity")
-                });
-            let _ = sender.send(result);
-        })
-        .context("starting Bubblewrap identity reader")?;
-    let info = receiver
-        .recv_timeout(DETACH_READY_DEADLINE)
-        .context("waiting for Bubblewrap child identity")??;
-    BoxRef::publish_pid(
-        identity,
-        info.child_pid,
-        mode == terra_protocol::PlanMode::Create,
-    )
-    .with_context(|| format!("publishing protected host VM identity for {bx}"))?;
-    BoxRef::publish_pid(
-        lock,
-        info.child_pid,
-        mode == terra_protocol::PlanMode::Create,
-    )
-    .with_context(|| format!("publishing host VM identity for {bx}"))
+    BoxRef::publish_pid(identity, pid, mode == terra_protocol::PlanMode::Create)
+        .with_context(|| format!("publishing protected host VM identity for {bx}"))?;
+    BoxRef::publish_pid(lock, pid, mode == terra_protocol::PlanMode::Create)
+        .with_context(|| format!("publishing host VM identity for {bx}"))
 }
 
 fn start_ready_reader(child: &mut Child) -> Result<std::sync::mpsc::Receiver<Result<bool>>> {
@@ -777,37 +739,36 @@ fn read_log_tail(path: &Path) -> String {
 mod tests {
     use super::*;
 
-    #[cfg(target_os = "linux")]
     #[test]
-    fn bubblewrap_identity_publishes_the_host_pid_before_boot() {
-        use std::io::{Seek, Write};
+    fn sandbox_identity_publishes_the_host_pid_before_boot() {
         let directory = tempfile::tempdir().unwrap();
         let bx = BoxRef::from_state_dir(directory.path().to_path_buf(), directory.path());
         let lock = File::create(directory.path().join(crate::state::PID_FILE)).unwrap();
         let identity = File::create(directory.path().join(crate::state::HOST_PID_FILE)).unwrap();
-        let mut info = tempfile::tempfile().unwrap();
-        write!(info, "{{\"child-pid\":{}}}", std::process::id()).unwrap();
-        info.rewind().unwrap();
-        publish_bwrap_pid(info, &bx, &lock, &identity, terra_protocol::PlanMode::Run).unwrap();
+        publish_sandbox_pid(
+            std::process::id(),
+            &bx,
+            &lock,
+            &identity,
+            terra_protocol::PlanMode::Run,
+        )
+        .unwrap();
         let process = bx.read_vm_process().unwrap();
         assert_eq!(process.pid, std::process::id());
         assert_eq!(
             process.process_identity,
             sys::read_process_start_time(std::process::id())
         );
-        for invalid in [
-            b"{}".as_slice(),
-            b"{\"child-pid\":4294967295}",
-            &[b' '; 4097],
-        ] {
-            let mut info = tempfile::tempfile().unwrap();
-            info.write_all(invalid).unwrap();
-            info.rewind().unwrap();
-            assert!(
-                publish_bwrap_pid(info, &bx, &lock, &identity, terra_protocol::PlanMode::Run)
-                    .is_err()
-            );
-        }
+        assert!(
+            publish_sandbox_pid(
+                u32::MAX,
+                &bx,
+                &lock,
+                &identity,
+                terra_protocol::PlanMode::Run
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]

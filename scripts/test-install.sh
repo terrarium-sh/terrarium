@@ -7,7 +7,7 @@ trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/bin" "$tmp/release"
 cat > "$tmp/release/terra" <<'EOF'
 #!/bin/sh
-if [ "${1:-}" = __bwrap ]; then echo 'bubblewrap 0.13.0'; fi
+exit 0
 EOF
 chmod +x "$tmp/release/terra"
 tar -czf "$tmp/release/terra-x86_64-linux.tar.gz" -C "$tmp/release" terra

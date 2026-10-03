@@ -60,13 +60,76 @@ vm:
 
 `allow_fallback` defaults to `true`. With `false`, either the explicit file or
 `~/.terra/config/seccomp.bpf` must be present. This setting does not assess the
-selected policy's restrictiveness. Policy compilation and generation remain
-build-time tasks; runtime hosts do not need a policy compiler.
+selected policy's restrictiveness. Normal boots do not need a policy compiler.
 
 Bubblewrap settings are unused when `vm.init` selects another launcher.
 Terra refuses a configured launcher or selected local policy inside a
 guest-writable share or writable Terra box state, so a guest cannot replace
 an asset used for a later boot.
+
+## Generate a policy from the installed binary
+
+`terra self-test` exercises the embedded host components without starting a VM,
+tracing, or generating a policy. The host checks cover block storage, shared files
+and host file-change notifications, memory, networking, vsock, and device lifecycle.
+`terra self-test --validate-vm` also runs the bundled guest suite using the normal
+platform launcher and policy settings. Windows host filesystem checks require
+Developer Mode or permission to create symbolic links.
+
+On Linux, `--generate-policy` traces the selected checks, compiles a syscall/ioctl
+allowlist, and repeats the host checks under the generated filter. Reviewed
+supplements cover virtualization operations that cannot be observed without a
+hypervisor. Terra embeds the guest suite and syscall tracer, uses the Rust
+`seccompiler` crate to compile classic BPF, and resolves syscall names with the
+Rust `syscalls` crate.
+Host checks and their policy generation need no source checkout, Rust toolchain,
+Python, `strace`, libseccomp, or `/dev/kvm`. The Linux tracer uses `ptrace`, so the
+host must permit tracing Terra child processes.
+
+```sh
+terra self-test
+terra self-test --validate-vm
+terra self-test --generate-policy --policy-output ./policy
+terra self-test --generate-policy --validate-vm --policy-output ./vm-validated-policy
+terra dev --generate-policy --policy-output ./dev-policy
+terra ./dev.yaml --generate-policy --policy-output ./test-policy -- npm test
+```
+
+With self-test policy generation, `--validate-vm` additionally runs the full guest
+feature suite under Bubblewrap using the same generated policy; it requires
+native Linux KVM and working Bubblewrap user namespaces. Release CI uses this
+mode on each policy architecture. It fails instead of silently broadening a
+policy when guest validation finds an uncovered operation.
+
+For a box or recipe, `--generate-policy` selects foreground execution automatically
+and requires a stopped box. An explicit `--foreground` is also accepted; `-d`
+and already-running boxes are rejected before tracing.
+Terra traces the selected VM workload and repeats it under enforcement. Recipe
+paths, mounts, hooks, network settings, and commands after `--` follow ordinary
+foreground execution. Relative recipe paths resolve against the shell's current
+directory; `--project` selects the project's boxes. This mode requires native Linux KVM.
+
+Policy generation executes the selected workload twice: once for tracing and
+once under the generated policy. Custom workloads can repeat writes to box files,
+host shares, and external services. Both passes use the same box and preserve its
+files and configuration, so the second pass sees effects from the first.
+Self-tests use private Terra state. `--policy-timeout` limits each generation
+pass to 900 seconds by default. Policy options require `--generate-policy`.
+
+Successful generation publishes `terra.seccomp.bpf`, readable `terra.seccomp.json`,
+and a validation manifest beneath `./terra-seccomp` (or `--policy-output`). The
+manifest distinguishes host-component validation from built-in guest validation
+and foreground workload validation. The output is an atomic symlink to a
+successful generation; an existing real directory is refused. Logs and traces
+remain in `./terra-workload-logs` (or `--policy-diagnostics`). Generation does not
+install or select the policy. To use the filter, set `vm.bwrap.policy` to its
+absolute BPF path, or copy it to `~/.terra/config/seccomp.bpf`.
+
+Policies cover the observed paths and reviewed supplements for that binary and
+architecture. Host-only enforcement does not certify a VM run; use
+`self-test --generate-policy --validate-vm` for that assurance. No finite workload
+covers every error or timing-dependent path. Regenerate after changing Terra or
+the workload.
 
 ## Custom launcher contract
 

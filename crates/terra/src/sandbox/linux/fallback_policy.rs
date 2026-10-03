@@ -69,7 +69,7 @@ mod tests {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "vm::fallback_policy::tests::filter_allows_getpid_and_denies_ptrace_in_child",
+                    "sandbox::linux::fallback_policy::tests::filter_allows_getpid_and_denies_ptrace_in_child",
                 ])
                 .env(CHILD, "1")
                 .output()
@@ -84,7 +84,7 @@ mod tests {
                 let output = std::process::Command::new(std::env::current_exe().unwrap())
                     .args([
                         "--exact",
-                        "vm::fallback_policy::tests::filter_allows_getpid_and_denies_ptrace_in_child",
+                        "sandbox::linux::fallback_policy::tests::filter_allows_getpid_and_denies_ptrace_in_child",
                     ])
                     .env(CHILD, "x32")
                     .output()

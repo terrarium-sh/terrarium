@@ -13,6 +13,7 @@ pub(crate) const RESERVED_NAMES: &[&str] = &[
     "ls",
     "ps",
     "rm",
+    "self-test",
     "sessions",
     "setup",
     "show",

@@ -11,6 +11,7 @@ pub mod engine;
 pub mod machine;
 pub mod memory;
 pub mod orchestration;
+pub mod self_test;
 
 pub(crate) use terra_limits::MAX_BATCH_GUEST_COPY_BYTES as MAX_BATCH_BYTES;
 pub(crate) use terra_limits::MAX_SINGLE_GUEST_COPY_BYTES as MAX_SINGLE_BYTES;

@@ -1,12 +1,5 @@
-//! Boot suite - the product gate. Boots real microVMs with the native hypervisor and
-//! asserts what host-side tests cannot: egress enforcement, the uid/ownership
-//! model, the guest-side `on_create` bake, cross-VM port publishing and
-//! isolation, exec, cp, and detach. Excluded from a default `cargo test`:
-//!
-//!   cargo test -p terra --test boot -- --ignored
-//!
-//! `TERRA_BIN` overrides the binary under test (CI points it at `dist/terra`,
-//! the shipped artifact); default is the cargo-built one.
+//! Integration checks for bundled self-tests and native VM behavior.
+//! `TERRA_BIN` overrides the Cargo-built binary; VM tests require `--ignored`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -19,6 +12,210 @@ fn assets_dir() -> PathBuf {
         || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/assets"),
         PathBuf::from,
     )
+}
+
+fn copy_installed_binary(directory: &Path) -> PathBuf {
+    let binary = std::env::var_os("TERRA_BIN")
+        .map_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_terra")), PathBuf::from);
+    let installed = directory.join(if cfg!(windows) { "terra.exe" } else { "terra" });
+    std::fs::copy(binary, &installed).unwrap();
+    installed
+}
+
+#[test]
+fn bundled_self_test_runs_without_a_source_checkout_or_generation_tools() {
+    let directory = tempfile::tempdir().unwrap();
+    let installed = copy_installed_binary(directory.path());
+    let result = Command::new(installed)
+        .arg("self-test")
+        .current_dir(directory.path())
+        .env("PATH", "")
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(!directory.path().join("terra-seccomp").exists());
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn assert_generated_policy(output: &Path, binary: &Path, vm_validated: bool) -> serde_json::Value {
+    fn hash_bytes(bytes: &[u8]) -> String {
+        use sha2::{Digest as _, Sha256};
+        use std::fmt::Write as _;
+
+        let mut hash = String::new();
+        for byte in Sha256::digest(bytes) {
+            write!(hash, "{byte:02x}").unwrap();
+        }
+        hash
+    }
+
+    assert!(output.symlink_metadata().unwrap().is_symlink());
+    let policy_bytes = std::fs::read(output.join("terra.seccomp.json")).unwrap();
+    let bpf = std::fs::read(output.join("terra.seccomp.bpf")).unwrap();
+    let policy: serde_json::Value = serde_json::from_slice(&policy_bytes).unwrap();
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(output.join("terra.seccomp-manifest.json")).unwrap())
+            .unwrap();
+    let binary_hash = hash_bytes(&std::fs::read(binary).unwrap());
+    assert_eq!(manifest["executable_sha256"], binary_hash);
+    assert_eq!(manifest["policy_sha256"], hash_bytes(&policy_bytes));
+    assert_eq!(manifest["bpf_sha256"], hash_bytes(&bpf));
+    assert_eq!(
+        std::fs::read_to_string(output.join(".validated"))
+            .unwrap()
+            .trim(),
+        binary_hash
+    );
+    assert!((8..=4096 * 8).contains(&bpf.len()) && bpf.len().is_multiple_of(8));
+    assert_eq!(manifest["format_version"], 1);
+    assert_eq!(manifest["policy_compiler"], "seccompiler_0_5_0");
+    assert_eq!(manifest["target"], policy["target"]);
+    assert_eq!(policy["default_action"], "kill_process");
+    assert!(!policy["rules"].as_array().unwrap().is_empty());
+    assert_eq!(manifest["validation"]["passed"], true);
+    assert_eq!(manifest["validation"]["vm_validated"], vm_validated);
+    assert!(manifest["validation"]["traced_execs"].as_u64().unwrap() > 0);
+    assert!(
+        manifest["validation"]["traced_processes"].as_u64().unwrap()
+            >= manifest["validation"]["traced_execs"].as_u64().unwrap()
+    );
+    for result in manifest["validation"]["workload_results"]
+        .as_array()
+        .unwrap()
+    {
+        assert_eq!(result["passed"], true);
+    }
+    manifest
+}
+
+/// A copied binary generates without tools, and timeout or failure preserves the published policy.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+fn bundled_policy_generation_needs_no_tools_and_preserves_previous_publication() {
+    let directory = tempfile::tempdir().unwrap();
+    let installed = copy_installed_binary(directory.path());
+    let output = directory.path().join("policy");
+    let diagnostics = directory.path().join("diagnostics");
+    let mut command = Command::new(&installed);
+    command
+        .args(["self-test", "--generate-policy", "--policy-output"])
+        .arg(&output)
+        .arg("--policy-diagnostics")
+        .arg(&diagnostics)
+        .current_dir(directory.path())
+        .env("PATH", "")
+        .env_remove("RUST_LOG");
+    let result = command.output().unwrap();
+    assert!(result.status.success(), "{result:?}");
+    let manifest = assert_generated_policy(&output, &installed, false);
+    assert_eq!(manifest["validation"]["scope"], "host_components");
+    assert_eq!(
+        manifest["validation"]["workloads"],
+        serde_json::json!(["self_test.host_components"])
+    );
+    let previous = std::fs::read_link(&output).unwrap();
+    let started = Instant::now();
+    let mut generation = command
+        .args(["--policy-timeout", "1"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let children = format!("/proc/{0}/task/{0}/children", generation.id());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(pid) = std::fs::read_to_string(&children)
+            .unwrap_or_default()
+            .split_whitespace()
+            .next()
+            .and_then(|pid| pid.parse().ok())
+        {
+            rustix::process::kill_process(
+                rustix::process::Pid::from_raw(pid).unwrap(),
+                rustix::process::Signal::STOP,
+            )
+            .unwrap();
+            break;
+        }
+        if generation.try_wait().unwrap().is_some() || Instant::now() >= deadline {
+            let _ = generation.kill();
+            let result = generation.wait_with_output().unwrap();
+            panic!("generation did not launch its supervised child: {result:?}");
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let result = generation.wait_with_output().unwrap();
+    assert!(!result.status.success(), "{result:?}");
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("timed out"),
+        "{result:?}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert_eq!(std::fs::read_link(&output).unwrap(), previous);
+    assert_eq!(
+        assert_generated_policy(&output, &installed, false),
+        manifest
+    );
+
+    std::fs::remove_dir_all(&diagnostics).unwrap();
+    std::fs::write(&diagnostics, b"blocked diagnostics directory").unwrap();
+    let result = command.output().unwrap();
+    assert!(!result.status.success(), "{result:?}");
+    assert_eq!(std::fs::read_link(&output).unwrap(), previous);
+    assert_eq!(
+        assert_generated_policy(&output, &installed, false),
+        manifest
+    );
+}
+
+/// The installed binary embeds the guest suite, tracer, and compiler needed for VM validation.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+#[ignore = "requires native KVM and Bubblewrap user namespaces"]
+fn bundled_guest_policy_generation_runs_with_an_empty_path() {
+    let directory = tempfile::tempdir().unwrap();
+    let installed = copy_installed_binary(directory.path());
+    let output = directory.path().join("policy");
+    let result = Command::new(&installed)
+        .args([
+            "self-test",
+            "--generate-policy",
+            "--validate-vm",
+            "--policy-output",
+        ])
+        .arg(&output)
+        .arg("--policy-diagnostics")
+        .arg(directory.path().join("diagnostics"))
+        .current_dir(directory.path())
+        .env("PATH", "")
+        .env_remove("RUST_LOG")
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "{result:?}");
+    let manifest = assert_generated_policy(&output, &installed, true);
+    assert_eq!(manifest["validation"]["scope"], "host_components");
+    assert_eq!(
+        manifest["validation"]["workloads"],
+        serde_json::json!(["self_test.host_components", "self_test.built_in_guest"])
+    );
+    assert_eq!(
+        manifest["trace_exclusions"][0]["name"],
+        "self_test.built_in_guest"
+    );
 }
 
 struct Suite {
@@ -252,6 +449,164 @@ impl Drop for Suite {
             .stderr(Stdio::null())
             .status();
     }
+}
+
+/// Foreground generation repeats writes in one existing box and refuses a running VM.
+/// An enforced-pass failure retains the old policy and both passes' writes in a usable box.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+#[ignore = "requires native KVM and Bubblewrap user namespaces"]
+#[allow(clippy::too_many_lines)]
+fn generated_foreground_policy_reuses_box_storage_and_refuses_a_running_box() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let suite = Suite::new();
+    let project = suite.create_project_dir("server");
+    let recipe = suite.get_work_dir().join("server.yaml");
+    std::fs::write(
+        &recipe,
+        format!(
+            "hooks:\n  on_create:\n    - cat /proc/sys/kernel/random/uuid > /policy-created\nworkload:\n  entrypoint: /bin/sleep\n  args: [infinity]\nmounts:\n  - host: {}\n    guest: /work\n",
+            project.display()
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        suite
+            .run_terra_status(&[
+                recipe.to_str().unwrap(),
+                "setup",
+                "--project",
+                project.to_str().unwrap(),
+            ])
+            .1,
+        0
+    );
+    let rootfs = suite.get_box_files_path("server").join("rootfs.img");
+    let rootfs_before = rootfs.metadata().unwrap();
+    let output = suite.get_work_dir().join("policy");
+    let script = r#"test -f /policy-created
+count=$(cat /policy-count 2>/dev/null || printf 0)
+count=$((count + 1))
+printf '%s\n' "$count" > /policy-count
+printf '%s\n' "$count" >> /work/effects
+cat /policy-created >> /work/created
+"#;
+    let mut generation = prepare_foreground_generation_command(&suite, &project, &output, script);
+    let result = generation.output().unwrap();
+    assert!(result.status.success(), "{result:?}");
+    let manifest = assert_generated_policy(&output, &suite.terra, true);
+    assert_eq!(manifest["validation"]["scope"], "guest");
+    assert_eq!(
+        manifest["validation"]["workloads"],
+        serde_json::json!(["workload.foreground"])
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.join("effects")).unwrap(),
+        "1\n2\n"
+    );
+    let created = std::fs::read_to_string(project.join("created")).unwrap();
+    let creations: Vec<_> = created.lines().collect();
+    assert_eq!(creations.len(), 2);
+    assert!(!creations[0].is_empty());
+    assert_eq!(
+        creations[0], creations[1],
+        "on_create ran again between generation passes"
+    );
+    let rootfs_after = rootfs.metadata().unwrap();
+    assert_eq!(rootfs_before.ino(), rootfs_after.ino());
+    assert_eq!(rootfs_before.dev(), rootfs_after.dev());
+    assert_eq!(rootfs_before.len(), rootfs_after.len());
+
+    assert_eq!(
+        suite
+            .run_terra_status(&["server", "-d", "--project", project.to_str().unwrap()])
+            .1,
+        0
+    );
+    let previous = std::fs::read_link(&output).unwrap();
+    let result = generation.output().unwrap();
+    assert!(!result.status.success(), "{result:?}");
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("already running"),
+        "{result:?}"
+    );
+    assert_eq!(std::fs::read_link(&output).unwrap(), previous);
+    assert_eq!(
+        std::fs::read_to_string(project.join("effects")).unwrap(),
+        "1\n2\n"
+    );
+    assert_eq!(
+        suite.exec(true, &["cat", "/policy-count"]),
+        ("2\n".to_owned(), 0)
+    );
+
+    assert_eq!(
+        suite
+            .run_terra_status(&["server", "stop", "--project", project.to_str().unwrap()])
+            .1,
+        0
+    );
+    let failing_script = format!("{script}test \"$count\" -ne 4\n");
+    let result = prepare_foreground_generation_command(&suite, &project, &output, &failing_script)
+        .output()
+        .unwrap();
+    assert!(!result.status.success(), "{result:?}");
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("enforce-workload.foreground.log"),
+        "{result:?}"
+    );
+    assert_eq!(std::fs::read_link(&output).unwrap(), previous);
+    assert_eq!(
+        assert_generated_policy(&output, &suite.terra, true),
+        manifest
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.join("effects")).unwrap(),
+        "1\n2\n3\n4\n"
+    );
+    assert_eq!(
+        suite
+            .run_terra_status(&["server", "-d", "--project", project.to_str().unwrap()])
+            .1,
+        0
+    );
+    assert_eq!(
+        suite.exec(true, &["cat", "/policy-count"]),
+        ("4\n".to_owned(), 0)
+    );
+    let rootfs_after_failure = rootfs.metadata().unwrap();
+    assert_eq!(rootfs_before.ino(), rootfs_after_failure.ino());
+    assert_eq!(rootfs_before.dev(), rootfs_after_failure.dev());
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn prepare_foreground_generation_command(
+    suite: &Suite,
+    project: &Path,
+    output: &Path,
+    script: &str,
+) -> Command {
+    let mut command = Command::new(&suite.terra);
+    command
+        .args(["server", "--generate-policy", "--root", "--project"])
+        .arg(project)
+        .arg("--policy-output")
+        .arg(output)
+        .arg("--policy-diagnostics")
+        .arg(suite.get_work_dir().join("diagnostics"))
+        .args(["--", "/bin/sh", "-ec", script])
+        .env("HOME", &suite.home)
+        .env("PATH", "")
+        .env_remove("RUST_LOG")
+        .stdin(Stdio::null());
+    command
 }
 
 /// One plain HTTP/1.0 GET against the host loopback; `None` until it answers.

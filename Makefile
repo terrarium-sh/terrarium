@@ -81,7 +81,7 @@ COMPONENT_AOT_TARGETS := $(addsuffix -aot,$(COMPONENT_TARGETS))
 COMPONENT_MANIFEST := components/Cargo.toml
 COMPONENT_WASM_DIR := components/target/wasm-components/release
 
-.PHONY: $(COMPONENT_TARGETS) $(COMPONENT_AOT_TARGETS) verify-source verify-host-components guest-assets check-guest-assets host-build host-dist source-dist verify-wit verify-dependency-boundaries verify-platform build verify verify-components verify-workspace dist man clean test-component-boot test-platform-native-vm test-component-vmm test-install check-zig generate_seccomp stage_seccomp_harnesses
+.PHONY: $(COMPONENT_TARGETS) $(COMPONENT_AOT_TARGETS) verify-source verify-host-components guest-assets check-guest-assets host-build host-dist source-dist verify-wit verify-dependency-boundaries verify-platform build verify verify-components verify-workspace dist man clean test-component-boot test-platform-native-vm test-component-vmm test-install check-zig
 
 # Pin changes invalidate every embedded guest payload.
 PINS := $(ARCH) $(KERNEL_VERSION) $(KERNEL_SHA256) $(E2FSPROGS_VERSION) $(E2FSPROGS_SHA256) \
@@ -320,18 +320,6 @@ host-build: check-guest-assets $(COMPONENT_AOT_TARGETS)
 test-component-vmm: dist
 	TERRA_BIN=$(abspath $(DIST)/terra) $(CARGO_LOCKED) test $(TEST_FLAGS) -p terra --test boot --test memory -- --ignored
 
-# Consumes the exact supplied executable. Native KVM, strace, Bubblewrap and
-# libseccomp are required only for this explicit release-policy operation.
-TERRA_BIN ?= $(DIST)/terra
-SECCOMP_OUTPUT ?= $(BUILD)/seccomp/$(TERRA_TARGET)
-SECCOMP_DIAGNOSTICS ?= $(BUILD)/seccomp-traces
-SECCOMP_HARNESS_OUTPUT ?= $(BUILD)/seccomp-harnesses/$(TERRA_TARGET)
-stage_seccomp_harnesses: check-guest-assets $(COMPONENT_AOT_TARGETS)
-	python3 scripts/stage-seccomp-harnesses.py --target $(TERRA_TARGET) --output $(SECCOMP_HARNESS_OUTPUT)
-
-generate_seccomp:
-	python3 scripts/generate-seccomp.py --bin $(abspath $(TERRA_BIN)) --target $(TERRA_TARGET) --output $(SECCOMP_OUTPUT) --diagnostics $(SECCOMP_DIAGNOSTICS) $(if $(SECCOMP_HARNESS_DIR),--harness-dir $(SECCOMP_HARNESS_DIR),)
-
 ## Components use their pinned nightly wasm toolchain in their own workspace,
 ## then the trusted native compiler produces each embedded AOT blob.
 BLOCK_COMPONENT_AOT := $(BUILD)/terra-block-component.cwasm
@@ -384,7 +372,7 @@ verify-source:
 	python3 -B scripts/test-kernel-tools.py || $(CHECK_FAILURE); \
 	python3 -B scripts/test-alpine-sources.py || $(CHECK_FAILURE); \
 	python3 -B scripts/test-pin-updates.py || $(CHECK_FAILURE); \
-	python3 -B scripts/test-generate-seccomp.py || $(CHECK_FAILURE); \
+	python3 -B scripts/test-verify-seccomp-artifact.py || $(CHECK_FAILURE); \
 	python3 -B scripts/test-policy-backfill.py || $(CHECK_FAILURE); \
 	python3 -B scripts/test-native-gates.py || $(CHECK_FAILURE); \
 	scripts/test-install.sh || $(CHECK_FAILURE); \
@@ -447,7 +435,7 @@ dist host-dist:
 	# binary (ETXTBSY) never blocks a rebuild.
 	install -m 755 target/$(TERRA_TARGET)/release/terra $(DIST)/terra
 	install -m 644 LICENSE NOTICE $(DIST)
-	install -m 644 packaging/licenses/GPL-2.0.txt packaging/licenses/applevisor-MIT.txt packaging/licenses/uds_windows-MIT.txt packaging/licenses/uds_windows-THIRDPARTYNOTICES.txt packaging/licenses/bubblewrap-LGPL-2.1.txt packaging/licenses/libcap-License.txt $(DIST)/LICENSES
+	install -m 644 packaging/licenses/GPL-2.0.txt packaging/licenses/applevisor-MIT.txt packaging/licenses/uds_windows-MIT.txt packaging/licenses/uds_windows-THIRDPARTYNOTICES.txt packaging/licenses/bubblewrap-LGPL-2.1.txt packaging/licenses/libcap-License.txt packaging/licenses/seccompiler-BSD-3-Clause.txt packaging/licenses/syscalls-BSD-2-Clause.txt $(DIST)/LICENSES
 	cp -R packaging/man $(DIST)
 	@echo "assembled $(DIST)/terra for $(TERRA_TARGET)"
 

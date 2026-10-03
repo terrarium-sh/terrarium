@@ -209,6 +209,9 @@ jobs:
           cargo test --no-fail-fast --locked --target x86_64-unknown-linux-musl -p terra-runtime --lib -- --ignored --test-threads=1 || status=1
           cargo test --no-fail-fast --locked --target x86_64-unknown-linux-musl -p terra-platform --lib --test native_vm -- --ignored --test-threads=1 || status=1
           TERRA_BIN="$PWD/dist/terra" cargo test --no-fail-fast --locked --target x86_64-unknown-linux-musl -p terra --test boot --test memory -- --ignored --test-threads=1 || status=1
+          set -o pipefail
+          TERRA_BIN="$PWD/dist/terra" TERRA_SECCOMP_ENFORCED=1 cargo test --locked --target x86_64-unknown-linux-musl -p terra --test boot -- --exact bwrap_enforces_vm_and_vcpu_threads --ignored --nocapture | tee default-jail.log || status=1
+          grep -Fq 'test result: ok. 1 passed; 0 failed; 0 ignored;' default-jail.log || status=1
           exit "$status"
       - name: Reclaim component build space
         if: ${{ !cancelled() }}
@@ -239,23 +242,6 @@ jobs:
         with:
           name: terra-x86_64-linux
           path: dist
-      - name: Stage policy test harnesses
-        id: policy-harnesses
-        if: ${{ steps.host-build.outcome == 'success' }}
-        continue-on-error: true
-        run: |
-          make stage_seccomp_harnesses
-          mkdir -p build/seccomp-harness-artifact
-          cp -R -L build/seccomp-harnesses/x86_64-unknown-linux-musl/. build/seccomp-harness-artifact/
-          test -x build/seccomp-harness-artifact/boot
-          test -x build/seccomp-harness-artifact/native_boot
-          test -x build/seccomp-harness-artifact/terra_lib
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: ${{ steps.policy-harnesses.outcome == 'success' }}
-        with:
-          name: terra-policy-harnesses-x86_64
-          path: build/seccomp-harness-artifact/
-          if-no-files-found: error
 
   linux-aarch64:
     name: Build Linux (aarch64)
@@ -349,28 +335,14 @@ jobs:
           cargo test --no-fail-fast --locked --target aarch64-unknown-linux-musl -p terra-platform --lib --test native_vm -- --ignored --test-threads=1 || status=1
           TERRA_BIN="$PWD/dist/terra" cargo test --no-fail-fast --locked --target aarch64-unknown-linux-musl -p terra --test native_boot -- --ignored --test-threads=1 --nocapture || status=1
           TERRA_BIN="$PWD/dist/terra" cargo test --no-fail-fast --locked --target aarch64-unknown-linux-musl -p terra --test boot --test memory -- --ignored --test-threads=1 || status=1
+          set -o pipefail
+          TERRA_BIN="$PWD/dist/terra" TERRA_SECCOMP_ENFORCED=1 cargo test --locked --target aarch64-unknown-linux-musl -p terra --test boot -- --exact bwrap_enforces_vm_and_vcpu_threads --ignored --nocapture | tee default-jail.log || status=1
+          grep -Fq 'test result: ok. 1 passed; 0 failed; 0 ignored;' default-jail.log || status=1
           exit "$status"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: terra-aarch64-linux
           path: dist
-      - name: Stage policy test harnesses
-        id: policy-harnesses
-        if: ${{ steps.host-build.outcome == 'success' }}
-        continue-on-error: true
-        run: |
-          make stage_seccomp_harnesses
-          mkdir -p build/seccomp-harness-artifact
-          cp -R -L build/seccomp-harnesses/aarch64-unknown-linux-musl/. build/seccomp-harness-artifact/
-          test -x build/seccomp-harness-artifact/boot
-          test -x build/seccomp-harness-artifact/native_boot
-          test -x build/seccomp-harness-artifact/terra_lib
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: ${{ steps.policy-harnesses.outcome == 'success' }}
-        with:
-          name: terra-policy-harnesses-aarch64
-          path: build/seccomp-harness-artifact/
-          if-no-files-found: error
 
   linux-policy:
     name: Enforce Linux policy (${{ matrix.arch }})
@@ -413,20 +385,6 @@ jobs:
       - name: Restore executable distribution
         if: ${{ steps.build.outputs.ready == 'true' }}
         run: chmod 755 dist/terra
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        id: harness-download
-        if: ${{ steps.build.outputs.ready == 'true' }}
-        continue-on-error: true
-        with:
-          name: terra-policy-harnesses-${{ matrix.arch }}
-          path: build/seccomp-harnesses/${{ matrix.target }}
-      - name: Restore executable test harnesses
-        id: harness-ready
-        if: ${{ steps.harness-download.outcome == 'success' }}
-        continue-on-error: true
-        run: |
-          chmod 755 "build/seccomp-harnesses/${{ matrix.target }}/boot" "build/seccomp-harnesses/${{ matrix.target }}/native_boot" "build/seccomp-harnesses/${{ matrix.target }}/terra_lib"
-          test -s crates/terra/tests/assets/bwrap_jail_probe.c
       - name: Enable KVM access
         if: ${{ runner.environment == 'github-hosted' && steps.build.outputs.ready == 'true' }}
         run: |
@@ -449,17 +407,7 @@ jobs:
           else
             echo 'Native /dev/kvm is absent; no policy was generated.' >> "$GITHUB_STEP_SUMMARY"
           fi
-      - name: Read Zig version
-        id: zig-version
-        if: ${{ steps.kvm.outputs.available == 'true' }}
-        run: echo "version=$(sed -n 's/^ZIG_VERSION := //p' Makefile)" >> "$GITHUB_OUTPUT"
-      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
-        id: zig
-        if: ${{ steps.kvm.outputs.available == 'true' }}
-        continue-on-error: true
-        with:
-          version: ${{ steps.zig-version.outputs.version }}
-      - name: Install policy tools
+      - name: Prepare policy validation
         id: tools
         if: ${{ steps.kvm.outputs.available == 'true' }}
         continue-on-error: true
@@ -468,30 +416,19 @@ jobs:
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
           unshare -U -r true
-          sudo apt-get update
-          sudo apt-get install -y bubblewrap libseccomp-dev strace
-      - name: Boot with the default jail
-        id: default-jail
-        if: ${{ steps.kvm.outputs.available == 'true' && steps.harness-ready.outcome == 'success' && steps.tools.outcome == 'success' }}
-        continue-on-error: true
-        timeout-minutes: 6
-        env:
-          TERRA_SECCOMP_ENFORCED: '1'
-        run: |
-          set -o pipefail
-          TERRA_BIN="$PWD/dist/terra" "build/seccomp-harnesses/${{ matrix.target }}/boot" --exact bwrap_enforces_vm_and_vcpu_threads --ignored --nocapture | tee default-jail.log
-          grep -Fq 'test result: ok. 1 passed; 0 failed; 0 ignored;' default-jail.log
       - name: Generate and enforce policy
         id: generate
-        if: ${{ steps.kvm.outputs.available == 'true' && steps.harness-ready.outcome == 'success' && steps.zig.outcome == 'success' && steps.tools.outcome == 'success' }}
+        if: ${{ steps.kvm.outputs.available == 'true' && steps.tools.outcome == 'success' }}
         continue-on-error: true
         timeout-minutes: 120
-        run: TERRA_BIN="$PWD/dist/terra" SECCOMP_HARNESS_DIR="$PWD/build/seccomp-harnesses/${{ matrix.target }}" SECCOMP_OUTPUT="$PWD/build/seccomp/${{ matrix.target }}" make generate_seccomp
+        run: ./dist/terra self-test --generate-policy --validate-vm --policy-output "build/seccomp/${{ matrix.target }}" --policy-diagnostics "build/seccomp-traces/${{ matrix.target }}"
       - name: Check complete validated set
         id: validated
         if: ${{ steps.generate.outcome == 'success' }}
         continue-on-error: true
         run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 libseccomp2
           mkdir -p "build/seccomp-artifact/${{ matrix.target }}"
           cp -L "build/seccomp/${{ matrix.target }}/terra.seccomp.json" \
             "build/seccomp/${{ matrix.target }}/terra.seccomp.bpf" \
@@ -521,15 +458,6 @@ jobs:
             echo 'Enforced policy validation passed for ${{ matrix.target }}; complete policy set uploaded.' >> "$GITHUB_STEP_SUMMARY"
           else
             echo 'Policy preparation, generation, or enforced validation failed for ${{ matrix.target }}; no policy set was uploaded. See the failed step and available diagnostics.' >> "$GITHUB_STEP_SUMMARY"
-          fi
-      - name: Require the default jail for release
-        if: ${{ always() && inputs.release_sources && matrix.arch == 'x86_64' }}
-        env:
-          JAIL_RESULT: ${{ steps.default-jail.outcome }}
-        run: |
-          if [ "$JAIL_RESULT" != success ]; then
-            echo '::error::Release requires a successful default-jail KVM boot on Linux amd64. Configure LINUX_X64_VM_RUNNER when hosted runners lack KVM.'
-            exit 1
           fi
 
   macos-aarch64:

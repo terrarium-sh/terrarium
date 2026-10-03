@@ -1,14 +1,86 @@
 //! Build custom VM launches and protect launcher assets from guest-written shares.
 
 use super::boot::{BootSpec, VM_PROCESS_FLAG_ARG};
-use super::launcher_config::LauncherConfig;
 use crate::config;
 use crate::policy::mount;
+use crate::sandbox::{self, Access, Grant, Launch, LauncherConfig};
 use crate::state::{self, BoxRef};
 use crate::sys::canonicalize_existing_prefix;
 use anyhow::{Context as _, Result, ensure};
 use std::path::Path;
 use std::process::Command;
+
+pub(super) fn prepare_sandbox_launch(
+    spec: &BootSpec,
+    bx: &BoxRef,
+    exe: &Path,
+    policy: &[u8],
+) -> Result<sandbox::PreparedLaunch> {
+    let grants = build_sandbox_grants(spec, bx, exe)?;
+    let mut command = Command::new(exe);
+    command.arg(VM_PROCESS_FLAG_ARG).arg(bx.get_dir());
+    for name in ["RUST_LOG", "TERRA_BOOT_TRACE"] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    sandbox::prepare_launch(Launch {
+        command,
+        grants,
+        die_with_parent: spec.foreground || spec.mode == terra_protocol::PlanMode::Create,
+        policy: Some(policy),
+    })
+}
+
+fn build_sandbox_grants(spec: &BootSpec, bx: &BoxRef, exe: &Path) -> Result<Vec<Grant>> {
+    ensure!(
+        bx.get_dir().is_absolute(),
+        "the box state path must be absolute"
+    );
+    ensure!(
+        bx.get_dir().is_dir(),
+        "box state directory {} does not exist",
+        bx.get_dir().display()
+    );
+    let mut grants = sandbox::host_runtime_grants();
+    grants.push(Grant::new(exe, Access::ReadOnly));
+    if spec.mode == terra_protocol::PlanMode::Run {
+        for share in &spec.cfg.mounts {
+            let mut grant = Grant::new(
+                &share.host,
+                if share.readonly {
+                    Access::ReadOnly
+                } else {
+                    Access::ReadWrite
+                },
+            );
+            grant.directory = Some(
+                terra_platform::filesystem::open_share_root(&share.host)
+                    .with_context(|| format!("opening approved share {}", share.host.display()))?,
+            );
+            grants.push(grant);
+        }
+    }
+    grants.push(Grant::new(bx.get_dir(), Access::ReadWrite));
+    for name in [
+        state::RECIPE_FILE,
+        state::PINNED_PATHS_FILE,
+        state::ORIGIN_FILE,
+        state::BAKE_STAMP,
+        state::HOST_PID_FILE,
+    ] {
+        let path = bx.get_dir().join(name);
+        if path.exists() {
+            ensure!(
+                std::fs::symlink_metadata(&path)?.file_type().is_file(),
+                "box metadata {} is not a regular file",
+                path.display()
+            );
+            grants.push(Grant::new(path, Access::ReadOnly));
+        }
+    }
+    Ok(grants)
+}
 
 pub(super) fn custom_command(
     init: &Path,
@@ -49,11 +121,11 @@ pub(super) fn validate_assets(
     bx: &BoxRef,
 ) -> Result<()> {
     let assets: Vec<(&str, &Path)> = match launcher {
-        LauncherConfig::Direct | LauncherConfig::Bwrap { policy: None, .. } => Vec::new(),
+        LauncherConfig::Direct | LauncherConfig::Sandboxed { policy: None, .. } => Vec::new(),
         LauncherConfig::Custom(path) => vec![("VM initializer", path)],
-        LauncherConfig::Bwrap {
+        LauncherConfig::Sandboxed {
             policy: Some(path), ..
-        } => vec![("Bubblewrap policy", path)],
+        } => vec![("Sandbox policy", path)],
     };
     if assets.is_empty() {
         return Ok(());
@@ -116,6 +188,45 @@ mod tests {
     use std::path::PathBuf;
     use terra_protocol::PlanMode;
 
+    #[test]
+    fn sandbox_grants_keep_metadata_readonly_and_exclude_bake_shares() {
+        let root = tempfile::tempdir().unwrap();
+        let box_dir = root.path().join("box");
+        let share = root.path().join("share");
+        std::fs::create_dir_all(&box_dir).unwrap();
+        std::fs::create_dir_all(&share).unwrap();
+        let recipe = box_dir.join(state::RECIPE_FILE);
+        std::fs::write(&recipe, "{}").unwrap();
+        let exe = root.path().join("terra");
+        let bx = BoxRef::from_state_dir(box_dir, root.path());
+        let mut spec = spec(root.path(), terra_protocol::PlanMode::Run);
+        spec.cfg.mounts.push(config::Mount {
+            host: share.clone(),
+            guest: "/share".into(),
+            readonly: true,
+        });
+        let grants = build_sandbox_grants(&spec, &bx, &exe).unwrap();
+        assert!(grants.iter().any(|grant| {
+            grant.path == share && grant.access == Access::ReadOnly && grant.directory.is_some()
+        }));
+        assert!(grants.iter().any(|grant| {
+            grant.path == recipe && grant.access == Access::ReadOnly && grant.directory.is_none()
+        }));
+        assert!(
+            grants
+                .iter()
+                .any(|grant| { grant.path == bx.get_dir() && grant.access == Access::ReadWrite })
+        );
+        spec.mode = terra_protocol::PlanMode::Create;
+        let grants = build_sandbox_grants(&spec, &bx, &exe).unwrap();
+        assert!(!grants.iter().any(|grant| grant.path == share));
+        let moved = root.path().join("moved");
+        std::fs::rename(&share, &moved).unwrap();
+        crate::sys::symlink_dir(&moved, &share).unwrap();
+        spec.mode = terra_protocol::PlanMode::Run;
+        assert!(build_sandbox_grants(&spec, &bx, &exe).is_err());
+    }
+
     fn spec(project_dir: &Path, mode: PlanMode) -> BootSpec {
         BootSpec {
             cfg: config::Config::default(),
@@ -123,7 +234,7 @@ mod tests {
             root: false,
             mode,
             foreground: false,
-            builtin_bwrap: false,
+            host_publishes_pid: false,
         }
     }
 
@@ -256,18 +367,18 @@ mod tests {
             .to_string();
         assert!(error.contains("pinned writable share"), "{error}");
 
-        let policy = LauncherConfig::Bwrap {
+        let policy = LauncherConfig::Sandboxed {
             policy: Some(asset),
             allow_fallback: true,
         };
         let error = validate_assets(&policy, &current, &bx)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("Bubblewrap policy"), "{error}");
+        assert!(error.contains("Sandbox policy"), "{error}");
 
         for launcher in [
             LauncherConfig::Custom(bx.get_dir().join("initializer")),
-            LauncherConfig::Bwrap {
+            LauncherConfig::Sandboxed {
                 policy: Some(sibling.get_dir().join("policy.yml")),
                 allow_fallback: true,
             },

@@ -58,35 +58,9 @@ jobs:
             exit 1
           fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: ${{ steps.kvm.outputs.available == 'true' }}
-        with:
-          ref: ${{ inputs.release_tag }}
-          persist-credentials: false
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
-          path: tooling
           persist-credentials: false
-      - name: Check release policy tooling
-        run: |
-          for file in scripts/generate-seccomp.py scripts/verify-seccomp-artifact.py \
-            scripts/seccomp-workloads.json scripts/seccomp-supplements.json \
-            scripts/stage-seccomp-harnesses.py crates/terra/tests/assets/bwrap_jail_probe.c; do
-            if [ ! -s "$file" ]; then
-              echo "::error::Release $RELEASE_TAG predates policy tooling: missing $file. Choose a release with policy-generation support."
-              exit 1
-            fi
-          done
-          for target in generate_seccomp stage_seccomp_harnesses; do
-            if ! grep -q "^$target:" Makefile; then
-              echo "::error::Release $RELEASE_TAG lacks the $target target. Choose a release with policy-generation support."
-              exit 1
-            fi
-          done
-          if ! cmp -s scripts/seccomp-workloads.json tooling/scripts/seccomp-workloads.json; then
-            echo "::error::Release $RELEASE_TAG workload inventory differs from this workflow's verifier. Choose a workflow revision with the release's workload inventory."
-            exit 1
-          fi
       - name: Download verified release executable
         id: binary
         if: ${{ steps.kvm.outputs.available == 'true' }}
@@ -100,10 +74,15 @@ jobs:
             --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml"
           tar -xzf "release-bin/$archive" -C release-bin
           test -x release-bin/terra
-      - name: Check release Bubblewrap support
+      - name: Check release self-test policy support
         run: |
-          if ! version=$(release-bin/terra __bwrap --version) || [[ "$version" != bubblewrap\ * ]]; then
-            echo "::error::Release $RELEASE_TAG executable lacks embedded Bubblewrap support. Choose a release with the Bubblewrap launcher."
+          if ! help=$(release-bin/terra self-test --help) ||
+             ! grep -Fq -- '--generate-policy' <<< "$help" ||
+             ! grep -Fq -- '--policy-output' <<< "$help" ||
+             ! grep -Fq -- '--policy-diagnostics' <<< "$help" ||
+             ! grep -Fq -- '--policy-timeout' <<< "$help" ||
+             ! grep -Fq -- '--validate-vm' <<< "$help"; then
+            echo "::error::Release $RELEASE_TAG executable lacks terra self-test VM policy generation. Choose a release with self-test --generate-policy --validate-vm support."
             exit 1
           fi
       - name: Free runner disk
@@ -116,53 +95,24 @@ jobs:
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
           unshare -U -r true
-      - name: Read Zig version
-        id: zig-version
-        if: ${{ steps.binary.outcome == 'success' }}
-        run: echo "version=$(sed -n 's/^ZIG_VERSION := //p' Makefile)" >> "$GITHUB_OUTPUT"
-      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
-        if: ${{ steps.binary.outcome == 'success' }}
-        with:
-          version: ${{ steps.zig-version.outputs.version }}
-      - name: Install component toolchain
-        if: ${{ steps.binary.outcome == 'success' }}
-        run: |
-          rustup target add ${{ matrix.target }}
-          rustup toolchain install "$(sed -n 's/^channel = "\(nightly-[^"]*\)"/\1/p' components/rust-toolchain.toml)" --profile minimal --target wasm32-unknown-unknown --target wasm32-wasip3
-      - name: Install wasm-tools
-        if: ${{ steps.binary.outcome == 'success' }}
-        run: |
-          cargo install wasm-tools --version "$(sed -n 's/^WASM_TOOLS_VERSION := //p' Makefile)" --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
-      - name: Build policy test harnesses
-        id: harnesses
-        if: ${{ steps.binary.outcome == 'success' }}
-        run: |
-          make guest-assets
-          make stage_seccomp_harnesses
-          test -x "build/seccomp-harnesses/${{ matrix.target }}/terra_lib"
-          test -s crates/terra/tests/assets/bwrap_jail_probe.c
-      - name: Install policy tools
-        id: tools
-        if: ${{ steps.binary.outcome == 'success' }}
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y bubblewrap libseccomp-dev strace
       - name: Generate and enforce policy
         id: generate
-        if: ${{ steps.binary.outcome == 'success' && steps.harnesses.outcome == 'success' && steps.tools.outcome == 'success' }}
+        if: ${{ steps.binary.outcome == 'success' }}
         timeout-minutes: 120
-        run: TERRA_BIN="$PWD/release-bin/terra" SECCOMP_HARNESS_DIR="$PWD/build/seccomp-harnesses/${{ matrix.target }}" SECCOMP_OUTPUT="$PWD/build/seccomp/${{ matrix.target }}" make generate_seccomp
+        run: ./release-bin/terra self-test --generate-policy --validate-vm --policy-output "build/seccomp/${{ matrix.target }}" --policy-diagnostics "build/seccomp-traces/${{ matrix.target }}"
       - name: Check complete validated set
         id: validated
         if: ${{ steps.generate.outcome == 'success' }}
         run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 libseccomp2
           mkdir -p "build/seccomp-artifact/${{ matrix.target }}"
           cp -L "build/seccomp/${{ matrix.target }}/terra.seccomp.json" \
             "build/seccomp/${{ matrix.target }}/terra.seccomp.bpf" \
             "build/seccomp/${{ matrix.target }}/terra.seccomp-manifest.json" \
             "build/seccomp/${{ matrix.target }}/.validated" \
             "build/seccomp-artifact/${{ matrix.target }}/"
-          python3 tooling/scripts/verify-seccomp-artifact.py "build/seccomp-artifact/${{ matrix.target }}" "$PWD/release-bin/terra" "${{ matrix.target }}"
+          python3 scripts/verify-seccomp-artifact.py "build/seccomp-artifact/${{ matrix.target }}" "$PWD/release-bin/terra" "${{ matrix.target }}"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ steps.validated.outcome == 'success' }}
         with:

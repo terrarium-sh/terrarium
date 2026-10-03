@@ -42,10 +42,10 @@ fn build_start_plan(bx: &BoxRef, args: &BootArgs, is_at_a_terminal: bool) -> Res
             root = if args.root { " --root" } else { "" }
         );
     }
-    if args.foreground {
+    if args.foreground || args.policy.generate_policy {
         anyhow::bail!(
             "{bx} is already running, so there is no VM to start in the foreground - \
-             `terra {name} stop` first to start it, or leave --foreground off \
+             `terra {name} stop` first to start it, or omit --foreground and --generate-policy \
              to attach to the one that is up",
             name = bx.get_name()
         );
@@ -63,7 +63,7 @@ fn choose_boot_mode(args: &BootArgs, is_at_a_terminal: bool) -> Result<BootMode>
     if args.detach {
         return Ok(BootMode::Detached);
     }
-    if args.foreground {
+    if args.foreground || args.policy.generate_policy {
         return Ok(BootMode::Foreground);
     }
     if is_at_a_terminal {
@@ -120,8 +120,13 @@ pub async fn run(
     let project_dir = approved.bx.get_project_dir().to_path_buf();
     let spec = boot::BootSpec::resolve(approved.cfg.clone(), args, project_dir, mode);
     crate::vm::encode_boot_plan(&spec)?;
-    let launcher = crate::vm::launcher_config::load()?;
+    let launcher = crate::sandbox::config::load()?;
     let prepared = setup::prepare_box(&approved, setup::Rebuild::No)?;
+
+    if args.policy.generate_policy {
+        drop(prepared);
+        return super::policy::generate_foreground(args, &approved.bx);
+    }
 
     if !spec.cfg.hooks.on_create.is_empty()
         && (prepared.fresh_rootfs
@@ -209,6 +214,11 @@ mod tests {
             // `--foreground` runs the VM in this process, terminal or not.
             assert_eq!(
                 choose_boot_mode(&build_boot_args(&["--foreground"]), is_at_a_terminal).unwrap(),
+                BootMode::Foreground
+            );
+            assert_eq!(
+                choose_boot_mode(&build_boot_args(&["--generate-policy"]), is_at_a_terminal)
+                    .unwrap(),
                 BootMode::Foreground
             );
         }
@@ -316,6 +326,8 @@ mod tests {
             let err = refused(&["--foreground"], is_at_a_terminal);
             assert!(err.contains("no VM to start in the foreground"), "{err}");
             assert!(err.contains("terra dev stop"), "the way to do it: {err}");
+            let err = refused(&["--generate-policy"], is_at_a_terminal);
+            assert!(err.contains("already running"), "{err}");
         }
 
         // …and `-d`, which shapes nothing about the workload, is not refused:

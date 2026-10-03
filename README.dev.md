@@ -48,6 +48,15 @@ checkouts require symlink privileges and `core.symlinks=true`.
 | `kernel`, `pins.mk` | Guest kernel configuration and pinned build inputs |
 | `fuzz`, `scripts` | Boundary fuzz targets, build checks and benchmark tools |
 
+Host confinement lives in `crates/terra/src/sandbox.rs`, with Linux implementation files
+under `sandbox/linux/`. `sandbox/config.rs` selects and resolves launchers and policies.
+VM launch planning supplies explicit filesystem grants and environment values;
+the common prepared-launch API owns platform dispatch, descriptors, and host-PID handoff.
+`sandbox/policy.rs` exposes command-factory policy generation on every
+platform, backed by `sandbox/linux/generation.rs` on Linux. Absent policies leave
+commands unchanged; requested enforcement and generation report unsupported on
+platforms without a backend. Self-test and foreground generation share this API.
+
 Runtime derives the fixed machine layout and asks platform to create the VM,
 RAM, disks and vCPUs. A short-lived boot component plans kernel placement;
 runtime validates its writes and result before CPUs start. The VMM component
@@ -171,61 +180,58 @@ platform. Release reuses the Build workflow, adds source archives, then publishe
 after required build and check jobs pass. Security audits run on dependency changes and weekly. Kernel changes
 run tooling checks; kernel archive export is available through manual dispatch.
 
-Linux policy jobs separately consume the exact x86-64 and AArch64 distribution
-artifacts. With native `/dev/kvm`, they trace VM workloads, compile a seccomp
-policy, rerun the workloads under Bubblewrap enforcement, and upload a policy
-set only after the complete set passes validation against that executable. The
-enforced gate also runs a native containment probe that checks denied host
-filesystem writes, shared host-loopback reachability, and seccomp inheritance.
-It is excluded from syscall collection because its static fixture and restrictive test filter are not the
-release VM process.
+Linux policy jobs consume the exact x86-64 and AArch64 distribution artifacts
+and run `terra self-test --generate-policy --validate-vm`. The binary traces its
+guestless host checks, compiles a policy with reviewed virtualization supplements, and checks
+both host components and the full guest suite under that policy. The policy job
+needs native KVM and Bubblewrap user namespaces; self-tests, syscall tracing,
+and classic BPF compilation are embedded in Terra, using ptrace and the Rust `seccompiler`
+and `syscalls` crates. The separate CI artifact
+verifier uses Python 3 and libseccomp to independently resolve syscall names;
+the policy job does not build source or test harnesses. Native host test jobs independently
+check the default jail and embedded fallback policy.
+
 Policy generation is optional in normal Build CI. Releases require the default
 Bubblewrap launcher and built-in policy to boot successfully on Linux amd64;
 the ARM64 policy job remains optional. Generated-policy enforcement is optional
 on both architectures. Set `LINUX_X64_VM_RUNNER` and `LINUX_ARM64_VM_RUNNER`
-repository variables to KVM-capable runner labels when the default runners
-cannot provide `/dev/kvm`. A release verifies each available policy against its
-exact binary before publishing an optional `terra-seccomp-<target>.tar.gz`
-archive with the readable policy, raw BPF, and validation manifest. `SHA256SUMS`
-covers these archives. Policies are installed manually; Terra does not download
-or automatically select release policies. Missing policies use the built-in
-minimal policy; invalid generated artifacts stop policy publication.
-Regenerate policies after changing the executable, including changes to network
-operations inside the jail; generated filters must cover those socket syscalls.
+repository variables to KVM-capable runner labels. A release verifies each
+available policy against its exact binary before publishing an optional
+`terra-seccomp-<target>.tar.gz` archive with the readable policy, raw BPF, and
+validation manifest. `SHA256SUMS` covers these archives. Invalid or merely
+host-validated artifacts fail publication. Policies are installed manually;
+Terra does not download or automatically select release policies.
 
-On a native Linux host with working KVM, `strace`, and libseccomp,
-generate a policy from an existing exact executable without rebuilding it:
+Run `terra self-test` for host checks without tracing or generation. For local
+policy generation without virtualization, run `terra self-test --generate-policy`.
+To reproduce
+CI's VM validation using an installed binary:
 
 ```sh
-make guest-assets stage_seccomp_harnesses  # source and test harnesses for this release tag
-make TERRA_BIN=/absolute/path/to/terra \
-  SECCOMP_HARNESS_DIR="$PWD/build/seccomp-harnesses/$(uname -m)-unknown-linux-musl" \
-  generate_seccomp
-python3 scripts/verify-seccomp-artifact.py \
-  build/seccomp/$(uname -m)-unknown-linux-musl /absolute/path/to/terra \
-  $(uname -m)-unknown-linux-musl
+terra self-test --generate-policy --validate-vm --policy-output ./policy --policy-diagnostics ./policy-logs
 mkdir -p ~/.terra/config
-cp -L build/seccomp/$(uname -m)-unknown-linux-musl/terra.seccomp.bpf \
-  ~/.terra/config/seccomp.bpf
+cp -L ./policy/terra.seccomp.bpf ~/.terra/config/seccomp.bpf
 ```
 
-The output path is an atomic symlink to the latest validated set. Traces and
-failure details remain under `build/seccomp-traces/`. The workload inventory
-records tracing exclusions explicitly: the native jail probe and file-event
-overflow recovery still run under enforcement. Node reload supplies traced
-file-event coverage; ptrace overhead distorts the overflow recovery test.
-The manual
-[Backfill Linux policy](.github/workflows/policy-backfill.yml) workflow downloads
-and verifies an existing release's exact binary, runs the same enforced
-validation on native x86-64 and AArch64 runners, and attaches successful policy
-sets to supported historical releases. Both native architectures must pass;
-unavailable KVM, missing release-tag policy tooling, or a binary without embedded
-Bubblewrap fails the workflow before publication. Tags predating the policy
-generator and harness-staging targets cannot be backfilled. Preflight also requires
-the release tag's workload inventory to match the workflow revision's inventory.
-The workflow uses its own revision's verifier when publishing and updates the release's `SHA256SUMS`
-after upload. A retry validates any existing policy archive against the release
-binary and hashes that archive's bytes to repair a missing checksum.
+The output path is an atomic symlink to a successful generation. Traces and
+failure details remain under the diagnostics directory. See
+[self-tests and foreground generation](docs/vm-launchers.md#generate-a-policy-from-the-installed-binary)
+for custom guest commands and recipes. Policy generation runs the selected
+workload twice and can repeat writes and external effects; foreground generation
+preserves the selected box between passes. For a box or recipe, `--generate-policy`
+selects foreground execution automatically and rejects `-d` or a running box.
+Generating a policy does not install
+or select it. Every new feature must update the bundled self-tests and any
+guest-only coverage as required by [AGENTS.md](AGENTS.md).
+
+The manual [Backfill Linux policy](.github/workflows/policy-backfill.yml) workflow
+downloads and verifies an existing release's exact binary, invokes its embedded
+`self-test --generate-policy --validate-vm` command on native x86-64 and AArch64 runners, and attaches
+successful policy sets. Both architectures must pass. Binaries predating the
+self-test policy generation or lacking VM validation fail the capability check; the workflow
+does not build historical sources. The workflow uses its current verifier before
+publication and updates the release's `SHA256SUMS` after upload. A retry verifies
+an existing archive against the binary before repairing a missing checksum.
 
 Two weekly workflows open pin-update PRs: `Guest pins bump` checks same-series
 kernel LTS patches, stable e2fsprogs releases, and Alpine releases with doas and

@@ -24,6 +24,22 @@ def workflow_command(name, workflow=WORKFLOW):
 
 
 class NativeGateTests(unittest.TestCase):
+    def test_policy_generation_uses_the_distribution_without_test_harnesses(self):
+        policy = WORKFLOW.split('  linux-policy:\n', 1)[1].split('  macos-aarch64:\n', 1)[0]
+        for legacy in ('make ', 'cargo ', 'rustup ', 'setup-zig', 'harness'):
+            self.assertNotIn(legacy, policy)
+        self.assertIn('./dist/terra self-test --generate-policy --validate-vm --policy-output', policy)
+        self.assertIn('--policy-diagnostics "build/seccomp-traces/${{ matrix.target }}"', policy)
+        self.assertIn('python3 libseccomp2', policy)
+        self.assertNotIn('strace', policy)
+        self.assertNotIn('apt-get', workflow_command('Prepare policy validation'))
+        self.assertNotIn('terra-policy-harnesses-', WORKFLOW)
+        for step in ('KVM gates', 'KVM product gates'):
+            command = workflow_command(step)
+            self.assertIn('TERRA_SECCOMP_ENFORCED=1 cargo test', command)
+            self.assertIn('--exact bwrap_enforces_vm_and_vcpu_threads --ignored --nocapture', command)
+            self.assertIn("grep -Fq 'test result: ok. 1 passed; 0 failed; 0 ignored;'", command)
+
     def test_kvm_permissions_survive_device_initialization(self):
         """KVM's first open can trigger udev to discard a one-time user ACL."""
         backfill = (ROOT / '.github/workflows/policy-backfill.yml').read_text()
@@ -67,6 +83,7 @@ can_open_kvm() {{
 cargo() {{
     can_open_kvm || return 1
     echo native-test-command
+    echo 'test result: ok. 1 passed; 0 failed; 0 ignored;'
     kvm_acl=0
     kvm_owner=''
     kvm_mode=0660
@@ -83,7 +100,7 @@ cargo() {{
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
                         )
                         self.assertEqual(result.returncode, int(device != '/dev/null'), result.stdout)
-                        self.assertEqual(result.stdout.count('native-test-command'), 4 if device == '/dev/null' else 0)
+                        self.assertEqual(result.stdout.count('native-test-command'), 5 if device == '/dev/null' else 0)
                         if device != '/dev/null':
                             self.assertIn('require a native /dev/terra-ci-missing-kvm device', result.stdout)
 
@@ -110,10 +127,10 @@ cargo() {{
                             command = command.replace('${{ vars.' + runner_variable + ' }}', runner)
                             if has_kvm and not has_access:
                                 command = command.replace('[ ! -r /dev/null ]', 'true')
-                            command = 'cargo() { echo native-test-command; }\n' + command
+                            command = "cargo() { echo native-test-command; echo 'test result: ok. 1 passed; 0 failed; 0 ignored;'; }\n" + command
                             result = subprocess.run(
                                 ['bash', '-e', '-o', 'pipefail', '-c', command],
-                                text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, cwd=directory, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 check=False,
                             )
                             self.assertEqual(

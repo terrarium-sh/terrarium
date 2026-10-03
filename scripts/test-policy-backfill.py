@@ -45,43 +45,37 @@ class BackfillTests(unittest.TestCase):
         path.write_text(contents)
         return path
 
-    def prepare_tooling(self):
-        for name in ('generate-seccomp.py', 'verify-seccomp-artifact.py', 'seccomp-workloads.json',
-                     'seccomp-supplements.json', 'stage-seccomp-harnesses.py'):
-            self.write_file(f'scripts/{name}', 'present')
-        self.write_file('crates/terra/tests/assets/bwrap_jail_probe.c', 'present')
-        self.write_file('tooling/scripts/seccomp-workloads.json', 'present')
-        self.write_file('Makefile', 'generate_seccomp:\nstage_seccomp_harnesses:\n')
-
-    def test_historical_tag_preflight(self):
-        result = self.run_step('Check release policy tooling')
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('Release v-old predates policy tooling', result.stdout)
-        self.prepare_tooling()
-        self.write_file('Makefile', 'generate_seccomp:\n')
-        result = self.run_step('Check release policy tooling')
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('lacks the stage_seccomp_harnesses target', result.stdout)
-        self.write_file('Makefile', 'generate_seccomp:\nstage_seccomp_harnesses:\n')
-        self.assertEqual(self.run_step('Check release policy tooling').returncode, 0)
-
-    def test_incompatible_workload_inventory_fails_preflight(self):
-        self.prepare_tooling()
-        self.write_file('scripts/seccomp-workloads.json', 'historical inventory')
-        result = self.run_step('Check release policy tooling')
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("Release v-old workload inventory differs from this workflow's verifier", result.stdout)
+    def test_generation_uses_the_release_binary_without_building_sources(self):
+        generation = WORKFLOW.split('  publish:\n', 1)[0]
+        self.assertNotIn('ref: ${{ inputs.release_tag }}', generation)
+        for legacy in ('make ', 'cargo ', 'rustup ', 'setup-zig', 'harness', 'seccomp-workloads.json'):
+            self.assertNotIn(legacy, generation)
+        self.assertIn('./release-bin/terra self-test --generate-policy --validate-vm --policy-output', generation)
+        self.assertIn('--policy-diagnostics "build/seccomp-traces/${{ matrix.target }}"', generation)
+        self.assertIn('python3 libseccomp2', generation)
+        self.assertNotIn('strace', generation)
 
     def test_old_binary_preflight(self):
         binary = self.write_file('release-bin/terra', '#!/bin/sh\necho terra-old\n')
         binary.chmod(0o755)
-        result = self.run_step('Check release Bubblewrap support')
+        result = self.run_step('Check release self-test policy support')
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('lacks embedded Bubblewrap support', result.stdout)
-        binary.write_text('#!/bin/sh\necho bubblewrap 0.11.0\nexit 1\n')
-        self.assertNotEqual(self.run_step('Check release Bubblewrap support').returncode, 0)
-        binary.write_text('#!/bin/sh\necho bubblewrap 0.11.0\n')
-        self.assertEqual(self.run_step('Check release Bubblewrap support').returncode, 0)
+        self.assertIn('lacks terra self-test VM policy generation', result.stdout)
+        options = ('--generate-policy', '--policy-output', '--policy-diagnostics',
+                   '--policy-timeout', '--validate-vm')
+        help_text = ' '.join(options)
+        binary.write_text(f'#!/bin/sh\necho "{help_text}"\nexit 1\n')
+        self.assertNotEqual(self.run_step('Check release self-test policy support').returncode, 0)
+        binary.write_text('#!/bin/sh\n[ "$*" = "workload --help" ] || exit 1\necho "--output --diagnostics --validate-vm"\n')
+        self.assertNotEqual(self.run_step('Check release self-test policy support').returncode, 0)
+        for missing in options:
+            with self.subTest(missing=missing):
+                available = ' '.join(option for option in options if option != missing)
+                binary.write_text(f'#!/bin/sh\necho "{available}"\n')
+                self.assertNotEqual(self.run_step('Check release self-test policy support').returncode, 0)
+        binary.write_text(f'#!/bin/sh\n[ "$*" = "self-test --help" ] || exit 1\necho "{help_text}"\n')
+        result = self.run_step('Check release self-test policy support')
+        self.assertEqual(result.returncode, 0, result.stdout)
 
     def prepare_release(self):
         gh = self.write_file('bin/gh', '''#!/usr/bin/env python3

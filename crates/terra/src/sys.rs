@@ -38,7 +38,7 @@ pub fn register_stop_channel(channel: terra_platform::io::local::LocalStream) {
     imp::register_stop_channel(channel);
 }
 #[cfg(target_os = "linux")]
-pub use imp::{pass_bwrap_info, pass_seccomp};
+pub(crate) use imp::pass_descriptor;
 
 pub(crate) fn validate_host_root() -> anyhow::Result<()> {
     validate_host_root_for(

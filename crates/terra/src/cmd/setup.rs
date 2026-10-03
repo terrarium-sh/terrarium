@@ -268,7 +268,7 @@ pub fn request_recipe_approval(
         root: false,
         mode: terra_protocol::PlanMode::Run,
         foreground: false,
-        builtin_bwrap: false,
+        host_publishes_pid: false,
     })?;
     Ok(ApprovedRecipe {
         bx,
@@ -524,7 +524,7 @@ pub async fn run(
     } else {
         Rebuild::No
     };
-    let launcher = crate::vm::launcher_config::load()?;
+    let launcher = crate::sandbox::config::load()?;
     let prepared = prepare_box(&approved, rebuild)?;
     let ApprovedRecipe { bx, cfg, .. } = approved;
 
