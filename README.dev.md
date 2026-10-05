@@ -15,7 +15,7 @@ Install the separate component toolchain and validator:
 
 ```sh
 rustup toolchain install nightly-2026-09-28 --component rustfmt,clippy --target wasm32-unknown-unknown
-cargo install wasm-tools --version 1.259.0 --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
+cargo install wasm-tools --version 1.261.0 --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
 make dist
 ```
 
