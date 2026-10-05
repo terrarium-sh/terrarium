@@ -249,7 +249,7 @@ on a native hypervisor without guest artifacts. On Apple Silicon the target
 signs the test executable with the hypervisor entitlement before running it.
 
 macOS and Windows have an opt-in `native_vm_tests` workflow input. After a native
-host build (and signing on macOS), install Zig 0.16.0 for the guest probes and run:
+host build (and signing on macOS), install Zig 0.17.0 for the guest probes and run:
 
 ```sh
 TERRA_BIN="$PWD/dist/terra" cargo test --locked -p terra --test native_boot --test boot --test memory -- --ignored --test-threads=1 --nocapture
