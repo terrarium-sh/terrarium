@@ -181,7 +181,7 @@ mod tests {
         let root = tempfile::tempdir()?;
         let probe = root.path().join("probe");
         std::fs::write(&probe, b"host-only")?;
-        let share = root.path().join("share<&\"'é");
+        let share = root.path().join("share&'é");
         std::fs::create_dir(&share)?;
         let grants = [Grant::new(&share, Access::ReadOnly)];
         let vm = render_entitlements(Role::Vm, &grants, &probe)?;
@@ -189,7 +189,8 @@ mod tests {
         assert!(vm.contains("com.apple.security.hypervisor"));
         assert!(vm.contains("com.apple.security.cs.allow-unsigned-executable-memory"));
         assert!(!vm.contains("com.apple.security.network."));
-        assert!(vm.contains("share&lt;&amp;&quot;&apos;é/</string>"));
+        assert!(vm.contains("share&amp;&apos;é/</string>"));
+        assert_eq!(escape_xml("<>\"")?, "&lt;&gt;&quot;");
         assert!(network.contains("com.apple.security.network.client"));
         assert!(network.contains("com.apple.security.network.server"));
         assert!(!network.contains("com.apple.security.hypervisor"));

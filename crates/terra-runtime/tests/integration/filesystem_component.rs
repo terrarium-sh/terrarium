@@ -338,8 +338,7 @@ async fn negotiated_big_write_crosses_guest_pages_and_survives_fsync() {
     channel.close().expect("close");
 }
 
-/// WASI's Windows handles omit delete sharing, so rename and unlink of an
-/// open file return access denied while the file remains readable.
+/// An open file remains readable after rename and unlink on every host platform.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn wasm_filesystem_component_serves_files_through_standard_wasi() {
@@ -425,19 +424,16 @@ async fn wasm_filesystem_component_serves_files_through_standard_wasi() {
     );
     let mut rename = 1_u64.to_le_bytes().to_vec();
     rename.extend_from_slice(b"written\0renamed\0");
-    let expected_mutation_error = if cfg!(windows) { -13 } else { 0 };
     assert_eq!(
         reply_error(&submit(&channel, &memory, 9, &request(12, 12, 1, &rename)).await),
-        expected_mutation_error
+        0
     );
-    let retained_name = if cfg!(windows) { "written" } else { "renamed" };
     assert_eq!(
-        std::fs::read(root.path().join(retained_name)).expect("retained file"),
+        std::fs::read(root.path().join("renamed")).expect("renamed file"),
         b"new"
     );
-    assert_eq!(root.path().join("written").exists(), cfg!(windows));
-    assert_eq!(root.path().join("renamed").exists(), cfg!(unix));
-    let unlink = format!("{retained_name}\0");
+    assert!(!root.path().join("written").exists());
+    let unlink = "renamed\0";
     assert_eq!(
         reply_error(
             &submit(
@@ -448,7 +444,7 @@ async fn wasm_filesystem_component_serves_files_through_standard_wasi() {
             )
             .await
         ),
-        expected_mutation_error
+        0
     );
     let mut read = vec![0; 24];
     read[..8].copy_from_slice(&handle.to_le_bytes());
@@ -468,7 +464,7 @@ async fn wasm_filesystem_component_serves_files_through_standard_wasi() {
     );
     channel.close().expect("close");
     assert!(!root.path().join("renamed").exists());
-    assert_eq!(root.path().join("written").exists(), cfg!(windows));
+    assert!(!root.path().join("written").exists());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -772,6 +768,44 @@ async fn wasm_filesystem_component_handles_directory_operations_and_deleted_entr
     readdir[8..16].copy_from_slice(&entries[deleted_index - 1].0.to_le_bytes());
     let entries = dirents(&submit(&channel, &memory, 7, &request(28, 8, 1, &readdir)).await);
     assert!(!entries.iter().any(|(_, name)| name == &deleted_name));
+    channel.close().expect("close");
+}
+
+/// Cached directories remain removable; Unix retains the inode and Windows rejects stale paths.
+#[tokio::test(flavor = "multi_thread")]
+async fn wasm_filesystem_component_removes_a_cached_directory() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let Mounted {
+        channel,
+        ram,
+        _runtime,
+    } = mount(root.path(), false).await;
+    let memory = BoundedMemory::new(&ram);
+    initialize(&channel, &memory).await;
+    let mut mkdir = vec![0; 8];
+    mkdir[..4].copy_from_slice(&0o755_u32.to_le_bytes());
+    mkdir.extend_from_slice(b"directory\0");
+    let created = submit(&channel, &memory, 1, &request(9, 2, 1, &mkdir)).await;
+    assert_eq!(reply_error(&created), 0);
+    let inode = u64::from_le_bytes(created[16..24].try_into().expect("directory inode"));
+    assert_eq!(
+        reply_error(&submit(&channel, &memory, 2, &request(1, 3, 1, b"directory\0")).await),
+        0
+    );
+    assert_eq!(
+        reply_error(&submit(&channel, &memory, 3, &request(11, 4, 1, b"directory\0")).await),
+        0
+    );
+    assert!(!root.path().join("directory").exists());
+    assert_eq!(
+        reply_error(&submit(&channel, &memory, 4, &request(3, 5, inode, &[])).await),
+        if cfg!(windows) { -2 } else { 0 }
+    );
+    std::fs::create_dir(root.path().join("directory")).expect("replacement directory");
+    assert_eq!(
+        reply_error(&submit(&channel, &memory, 5, &request(3, 6, inode, &[])).await),
+        if cfg!(windows) { -2 } else { 0 }
+    );
     channel.close().expect("close");
 }
 

@@ -240,7 +240,11 @@ mod tests {
     fn cleanup_reports_a_box_without_its_project_origin() -> Result<()> {
         let stage = tempfile::tempdir()?;
         cleanup_self_test_boxes(stage.path(), "guest-run")?;
-        let project_state = stage.path().join("guest-run/home/.terra/box/project");
+        let project_state = stage
+            .path()
+            .join("guest-run")
+            .join("home/.terra/box")
+            .join("project");
         std::fs::create_dir_all(project_state.join("exercise"))?;
         let error = cleanup_self_test_boxes(stage.path(), "guest-run").unwrap_err();
         let message = format!("{error:#}");

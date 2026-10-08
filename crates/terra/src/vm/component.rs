@@ -214,15 +214,24 @@ fn open_shares(spec: &BootSpec) -> Result<Vec<ShareGrant>> {
 
     let mounts = &spec.cfg.mounts;
     let mut grants = Vec::with_capacity(mounts.len());
-    for mount in mounts {
-        grants.push(
-            ShareGrant::new(&mount.host, mount.readonly).with_context(|| {
-                format!(
-                    "opening share {}",
-                    crate::render::escape_printable_path(&mount.host)
-                )
-            })?,
-        );
+    for (index, mount) in mounts.iter().enumerate() {
+        #[cfg(not(windows))]
+        let _ = index;
+        #[cfg(windows)]
+        let grant = if uses_inherited_listeners() {
+            let identity = std::env::var(format!("TERRA_WINDOWS_MOUNT_ID_{index}"))?.parse()?;
+            ShareGrant::new_host_granted(&mount.host, mount.readonly, identity)
+        } else {
+            ShareGrant::new(&mount.host, mount.readonly)
+        };
+        #[cfg(not(windows))]
+        let grant = ShareGrant::new(&mount.host, mount.readonly);
+        grants.push(grant.with_context(|| {
+            format!(
+                "opening share {}",
+                crate::render::escape_printable_path(&mount.host)
+            )
+        })?);
     }
     Ok(grants)
 }

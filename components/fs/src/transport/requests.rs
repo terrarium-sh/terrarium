@@ -5,6 +5,7 @@ use super::{
     name, names, node, node_id, open, open_flags, read_file, repoint_node, sized_out, statfs,
     store_handle, symlink_parts, timestamp, u32_at, u64_at, wasi_error, wire, write_file,
 };
+use crate::wasi::filesystem::types;
 use futures::FutureExt;
 use wire::Request;
 
@@ -146,7 +147,46 @@ async fn create_file(state: RequestState, request: &Request<'_>) -> Result<Vec<u
 async fn remove_entry(state: RequestState, request: &Request<'_>) -> Result<Vec<u8>, i32> {
     let name = name(request.body)?;
     let parent = request_node(state, request.node)?;
-    host::unlink(&parent, name, request.opcode == wire::RMDIR).await?;
+    let is_directory = request.opcode == wire::RMDIR;
+    match host::unlink(&parent, name.clone(), is_directory).await {
+        Ok(()) => return Ok(Vec::new()),
+        Err(13) if is_directory => {}
+        Err(error) => return Err(error),
+    }
+    let released_descriptor = {
+        let parent_descriptor = parent.resolve_descriptor().await?;
+        let child_name = core::str::from_utf8(&name).map_err(|_| 84)?;
+        if matches!(
+            parent_descriptor
+                .stat_at(types::PathFlags::empty(), child_name.to_owned())
+                .await,
+            Ok(stat) if matches!(stat.type_, types::DescriptorType::Directory)
+        ) && let Ok(identity) = parent_descriptor
+            .metadata_hash_at(types::PathFlags::empty(), child_name.to_owned())
+            .await
+        {
+            state.with(|state| {
+                if let Some(id) = state
+                    .node_id_by_identity
+                    .get(&(identity.upper, identity.lower))
+                    .copied()
+                    && id != 1
+                    && let Some(record) = state.nodes.get_mut(&id)
+                {
+                    return Ok(record.node.release_cached_directory(
+                        &parent_descriptor,
+                        child_name,
+                        identity,
+                    ));
+                }
+                Ok(None)
+            })?
+        } else {
+            None
+        }
+    };
+    host::release_descriptor(released_descriptor.ok_or(13)?).await?;
+    host::unlink(&parent, name, is_directory).await?;
     Ok(Vec::new())
 }
 

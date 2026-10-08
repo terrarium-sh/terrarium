@@ -627,15 +627,23 @@ mod tests {
             bx.write_origin().unwrap();
             assert_eq!(read_origin(dir.path()), Some(path));
         }
-        std::fs::write(
-            dir.path().join(ORIGIN_FILE),
-            b"/project with trailing space ",
-        )
-        .unwrap();
-        assert_eq!(
-            read_origin(dir.path()),
-            Some(PathBuf::from("/project with trailing space "))
-        );
+        #[cfg(unix)]
+        {
+            std::fs::write(
+                dir.path().join(ORIGIN_FILE),
+                b"/project with trailing space ",
+            )
+            .unwrap();
+            assert_eq!(
+                read_origin(dir.path()),
+                Some(PathBuf::from("/project with trailing space "))
+            );
+        }
+        #[cfg(windows)]
+        {
+            std::fs::write(dir.path().join(ORIGIN_FILE), b"invalid UTF-16 origin").unwrap();
+            assert_eq!(read_origin(dir.path()), None);
+        }
         std::fs::remove_file(dir.path().join(ORIGIN_FILE)).unwrap();
         std::fs::create_dir(dir.path().join(ORIGIN_FILE)).unwrap();
         let bx = BoxRef::from_state_dir(box_dir, dir.path());

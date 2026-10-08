@@ -44,6 +44,7 @@ enum Operation {
     Stat,
     MetadataHash,
     ReadDirectory,
+    DirectoryRemoval,
     HostMetadata,
 }
 
@@ -90,6 +91,9 @@ pub(super) fn install_io_gate(
         linker.allow_shadowing(true);
         if matches!(gate.operation, Operation::HostMetadata) {
             return Ok(linker);
+        }
+        if matches!(gate.operation, Operation::DirectoryRemoval) {
+            return install_directory_removal_gate(linker, gate);
         }
         if matches!(
             gate.operation,
@@ -159,6 +163,37 @@ pub(super) fn install_io_gate(
             },
         )?;
     }
+    Ok(linker)
+}
+
+fn install_directory_removal_gate(
+    mut linker: Linker<crate::box_runtime::store::StoreState<FsHost>>,
+    gate: Arc<IoGate>,
+) -> wasmtime::Result<Linker<crate::box_runtime::store::StoreState<FsHost>>> {
+    use wasmtime_wasi::filesystem::{WasiFilesystem, WasiFilesystemView as _};
+    use wasmtime_wasi::p3::bindings::filesystem::types::HostDescriptorWithStore as _;
+    linker
+        .instance("wasi:filesystem/types@0.3.0")?
+        .func_wrap_concurrent(
+            "[method]descriptor.remove-directory-at",
+            move |accessor, (descriptor, path): (Resource<Descriptor>, String)| {
+                let gate = gate.clone();
+                Box::pin(async move {
+                    if gate.armed.swap(false, Ordering::AcqRel) {
+                        return Ok((Err(ErrorCode::Access),));
+                    }
+                    let wasi = accessor.with_getter::<WasiFilesystem>(
+                        crate::box_runtime::store::StoreState::<FsHost>::filesystem,
+                    );
+                    Ok((
+                        match WasiFilesystem::remove_directory_at(&wasi, descriptor, path).await {
+                            Ok(()) => Ok(()),
+                            Err(error) => Err(error.downcast()?),
+                        },
+                    ))
+                })
+            },
+        )?;
     Ok(linker)
 }
 
@@ -556,11 +591,8 @@ async fn cached_inode_paths_preserve_open_file_identity() {
     link.extend_from_slice(b"alias\0");
     mounted.request(13, 1, &link).await;
     mounted.request(1, 1, b"alias\0").await;
-    let expected_mutation_error = if cfg!(windows) { -13 } else { 0 };
-    mounted
-        .request_with_error(10, 1, b"slow\0", expected_mutation_error)
-        .await;
-    assert_eq!(root.path().join("slow").exists(), cfg!(windows));
+    mounted.request_with_error(10, 1, b"slow\0", 0).await;
+    assert!(!root.path().join("slow").exists());
     link.truncate(8);
     link.extend_from_slice(b"survivor\0");
     mounted.request(13, 1, &link).await;
@@ -571,19 +603,12 @@ async fn cached_inode_paths_preserve_open_file_identity() {
 
     let mut rename = 1_u64.to_le_bytes().to_vec();
     rename.extend_from_slice(b"fast\0alias\0");
-    mounted
-        .request_with_error(12, 1, &rename, expected_mutation_error)
-        .await;
+    mounted.request_with_error(12, 1, &rename, 0).await;
     link.truncate(8);
     link.extend_from_slice(b"replacement-link\0");
-    mounted
-        .request_with_error(13, 1, &link, if cfg!(windows) { 0 } else { -2 })
-        .await;
-    assert_eq!(root.path().join("replacement-link").exists(), cfg!(windows));
-    assert_eq!(
-        std::fs::read(root.path().join("alias")).unwrap(),
-        if cfg!(windows) { b"slow" } else { b"fast" }
-    );
+    mounted.request_with_error(13, 1, &link, -2).await;
+    assert!(!root.path().join("replacement-link").exists());
+    assert_eq!(std::fs::read(root.path().join("alias")).unwrap(), b"fast");
     let response = mounted.request(15, node, &read_body(handle, 0)).await;
     assert_eq!(&response[16..], b"s");
     mounted.channel.close().unwrap();
@@ -703,6 +728,7 @@ async fn stalled_writes_and_flushes_do_not_block_shutdown() {
             | Operation::Stat
             | Operation::MetadataHash
             | Operation::ReadDirectory
+            | Operation::DirectoryRemoval
             | Operation::HostMetadata => {
                 unreachable!()
             }
@@ -802,6 +828,7 @@ async fn stalled_metadata_preserves_other_io_events_reset_and_close() {
             | Operation::Write
             | Operation::Sync
             | Operation::MetadataHash
+            | Operation::DirectoryRemoval
             | Operation::HostMetadata => {
                 unreachable!()
             }
@@ -920,6 +947,36 @@ async fn blocked_native_metadata_does_not_block_the_worker() {
     mounted.request(4097, 1, &[]).await;
     mounted.channel.close().unwrap();
     drop(release);
+    mounted.runtime.abort_and_join().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cached_directory_removal_waits_for_its_descriptor_without_stalling_requests() {
+    let (root, mut mounted, gate) = mount_with_operation(Operation::DirectoryRemoval).await;
+    std::fs::create_dir(root.path().join("directory")).unwrap();
+    mounted.request(1, 1, b"directory\0").await;
+    let (release, blocked) = std::sync::mpsc::channel();
+    *gate.blocked_drop.lock().unwrap() = Some(blocked);
+    gate.count_blocked_drops.store(true, Ordering::Release);
+    gate.armed.store(true, Ordering::Release);
+    let removal = mounted.submit(0, 11, 1, b"directory\0");
+    tokio::time::timeout(Duration::from_secs(3), gate.drop_started.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    assert!(root.path().join("directory").is_dir());
+    let getattr = mounted.submit(4, 3, 1, &[]);
+    assert_eq!(&mounted.receive(getattr).await[4..8], &[0; 4]);
+    assert!(
+        removal
+            .read_reply(&BoundedMemory::new(&mounted.ram))
+            .is_none()
+    );
+    drop(release);
+    assert_eq!(&mounted.receive(removal).await[4..8], &[0; 4]);
+    assert!(!root.path().join("directory").exists());
+    mounted.channel.close().unwrap();
     mounted.runtime.abort_and_join().await;
 }
 

@@ -270,18 +270,18 @@ pub fn pass_lock(command: &mut Command, lock: &File) -> Result<File> {
 pub fn claim_inherited_lock(expected: &Path) -> Option<File> {
     let handle = std::env::var(LOCK_HANDLE_ENV).ok()?;
     let raw = usize::from_str_radix(handle.strip_prefix("0x")?, 16).ok()? as *mut std::ffi::c_void;
-    let same = file_handle_matches_path(raw, expected) && holds_run_lock(expected).ok()?;
-    same.then(|| {
-        // SAFETY: `pass_lock` marked precisely this live file handle inheritable for this child.
-        let file = unsafe { File::from_raw_handle(raw) };
-        // SAFETY: file owns raw; subsequent child processes must not inherit the run lock.
-        win_ok(unsafe {
-            windows_sys::Win32::Foundation::SetHandleInformation(raw, HANDLE_FLAG_INHERIT, 0)
+    file_handle_matches_path(raw, expected)
+        .then(|| {
+            // SAFETY: `pass_lock` marked precisely this live file handle inheritable for this child.
+            let file = unsafe { File::from_raw_handle(raw) };
+            // SAFETY: file owns raw; subsequent child processes must not inherit the run lock.
+            win_ok(unsafe {
+                windows_sys::Win32::Foundation::SetHandleInformation(raw, HANDLE_FLAG_INHERIT, 0)
+            })
+            .ok()?;
+            Some(file)
         })
-        .ok()?;
-        Some(file)
-    })
-    .flatten()
+        .flatten()
 }
 
 pub fn holds_run_lock(path: &Path) -> Result<bool> {

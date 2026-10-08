@@ -22,6 +22,19 @@ impl ShareGrant {
         ))
     }
 
+    #[cfg(windows)]
+    pub fn new_host_granted(
+        root: &Path,
+        readonly: bool,
+        expected: terra_platform::filesystem::FileIdentity,
+    ) -> io::Result<Self> {
+        Ok(Self::from_directory(
+            terra_platform::filesystem::open_granted_share_root(root, expected)?,
+            readonly,
+            root,
+        ))
+    }
+
     fn from_directory(directory: std::fs::File, readonly: bool, root: &Path) -> Self {
         let directory = Dir::new(
             directory,

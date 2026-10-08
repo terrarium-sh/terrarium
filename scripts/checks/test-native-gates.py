@@ -7,12 +7,16 @@ import itertools
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import unittest
 
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = (ROOT / '.github/workflows/build.yml').read_text()
+linux_workflow_shell_only = unittest.skipUnless(
+    sys.platform.startswith('linux'), 'workflow command simulation requires Linux bash and account APIs',
+)
 
 
 def workflow_command(name, workflow=WORKFLOW):
@@ -122,6 +126,7 @@ class NativeGateTests(unittest.TestCase):
             with self.subTest(source=source), self.assertRaises(ValueError):
                 module.validate_kernel_buffers(source)
 
+    @linux_workflow_shell_only
     def test_release_requires_all_native_gates_and_matching_policy_uploads(self):
         release = (ROOT / '.github/workflows/release.yml').read_text()
         self.assertIn('      native_vm_tests: true', release)
@@ -139,6 +144,7 @@ class NativeGateTests(unittest.TestCase):
             self.assertEqual(completed.returncode,
                              int(result != 'true' or available != 'true' or validated != 'success' or uploaded != 'success'))
 
+    @linux_workflow_shell_only
     def test_release_asset_assembly_rejects_missing_and_mismatched_policies(self):
         release = (ROOT / '.github/workflows/release.yml').read_text()
         command = workflow_command('Assemble validated policy assets', release)
@@ -175,6 +181,7 @@ tar() { :; }
             self.assertIn('--exact bwrap_enforces_vm_and_vcpu_threads --ignored --nocapture', command)
             self.assertIn("grep -Fq 'test result: ok. 1 passed; 0 failed; 0 ignored;'", command)
 
+    @linux_workflow_shell_only
     def test_component_cleanup_preserves_runtime_wasm_fixtures(self):
         fixture_source = (ROOT / 'crates/terra-runtime/src/test_fixtures.rs').read_text()
         fixture_paths = re.findall(r'components/target/[^"\n]+\.wasm', fixture_source)
@@ -198,6 +205,7 @@ tar() { :; }
             for target in intermediate_targets:
                 self.assertFalse(target.exists(), target)
 
+    @linux_workflow_shell_only
     def test_kvm_permissions_survive_device_initialization(self):
         """KVM's first open can trigger udev to discard a one-time user ACL."""
         backfill = (ROOT / '.github/workflows/policy-backfill.yml').read_text()
@@ -262,6 +270,7 @@ cargo() {{
                         if device != '/dev/null':
                             self.assertIn('require a native /dev/terra-ci-missing-kvm device', result.stdout)
 
+    @linux_workflow_shell_only
     def test_native_gate_admission(self):
         with tempfile.TemporaryDirectory() as directory:
             missing_kvm = str(Path(directory) / 'missing-kvm')

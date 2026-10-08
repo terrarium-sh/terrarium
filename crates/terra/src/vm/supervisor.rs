@@ -309,7 +309,13 @@ fn prepare_vm_outputs(bx: &BoxRef, is_self_test: bool) -> Result<()> {
     sys::create_regular_file(&bx.get_dir().join(state::LOG_FILE))?;
     sys::create_regular_file(&bx.get_dir().join(state::DIAGNOSTICS_LOG))?;
     if is_self_test {
-        std::fs::create_dir_all(self_test_directory(bx))?;
+        let directory = self_test_directory(bx);
+        std::fs::create_dir_all(&directory)?;
+        #[cfg(windows)]
+        {
+            std::fs::create_dir_all(directory.join("writable"))?;
+            std::fs::create_dir_all(directory.join("readonly"))?;
+        }
     }
     Ok(())
 }
@@ -488,6 +494,8 @@ pub(crate) fn run_host_self_test() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let bx = BoxRef::from_state_dir(directory.path().join("box"), directory.path());
     let lock = bx.lock_run()?;
+    #[cfg(windows)]
+    std::fs::write(bx.get_dir().join(state::ROOTFS_FILE), b"")?;
     let spec = BootSpec {
         cfg: crate::config::Config {
             network: crate::config::Network {
@@ -552,6 +560,8 @@ pub(crate) fn run_host_self_test() -> Result<()> {
         .map_err(|error| anyhow::anyhow!("{error:#}"))?;
     let local_box = BoxRef::from_state_dir(directory.path().join("local-only"), directory.path());
     let local_lock = local_box.lock_run()?;
+    #[cfg(windows)]
+    std::fs::write(local_box.get_dir().join(state::ROOTFS_FILE), b"")?;
     let mut local_spec = spec;
     local_spec.cfg.network = crate::config::Network {
         enabled: false,
@@ -681,17 +691,26 @@ fn run_network_native_probe(sentinel: &Path, policy: Option<&[u8]>) -> Result<()
     wait_probe_ready(child.child_mut())?;
     ensure!(
         child.wait(BROKER_STARTUP_TIMEOUT, true)?.success(),
-        "network broker VM-grant enforcement probe failed"
+        "network broker native confinement probe failed"
     );
     Ok(())
 }
 
 pub(crate) fn run_network_native_probe_worker(sentinel: &Path) -> Result<ExitCode> {
     boot::write_agent_ready();
+    #[cfg(not(windows))]
     ensure!(
         File::open(sentinel).is_err() && File::open("/dev/kvm").is_err(),
         "network broker can access VM file or KVM grants"
     );
+    #[cfg(windows)]
+    {
+        File::open(sentinel).context("restricted broker cannot read host probe file")?;
+        std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .context("restricted broker cannot create a TCP listener")?;
+        std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .context("restricted broker cannot create a UDP socket")?;
+    }
     Ok(ExitCode::SUCCESS)
 }
 

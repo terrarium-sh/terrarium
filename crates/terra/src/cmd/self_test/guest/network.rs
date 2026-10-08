@@ -270,6 +270,24 @@ mod tests {
         Ok(())
     }
 
+    /// A delayed HTTP header completes on a connection accepted from a nonblocking listener.
+    #[test]
+    fn host_service_reads_split_http_headers() -> Result<()> {
+        let service = HostService::start()?;
+        let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, service.port()))?;
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        stream.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n")?;
+        thread::sleep(Duration::from_millis(50));
+        stream.write_all(b"Connection: close\r\n\r\n")?;
+        stream.shutdown(std::net::Shutdown::Write)?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response)?;
+        assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        assert!(response.ends_with(b"HOST_NETWORK"));
+        assert_eq!(service.requests(), 1);
+        Ok(())
+    }
+
     #[test]
     fn host_service_echoes_datagram_boundaries_and_payloads_on_both_families() -> Result<()> {
         let service = HostService::start()?;

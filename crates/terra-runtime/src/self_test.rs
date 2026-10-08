@@ -203,9 +203,11 @@ async fn submit_block(
     }
     descriptors.push((STATUS, 1, 2));
     submit_descriptors(device, ram, 0, index, &descriptors).await?;
+    let status = read_memory(ram, STATUS, 1)?;
     wasmtime::ensure!(
-        read_memory(ram, STATUS, 1)? == [0],
-        "block self-test request failed"
+        status == [0],
+        "block self-test request {index} (operation {operation}) failed with status {}",
+        status[0]
     );
     read_memory(ram, DATA, u64::try_from(data.len())?)
 }

@@ -88,7 +88,10 @@ impl FsHost {
         Ok(resource)
     }
 
-    fn retire_descriptor(&mut self, representation: u32) -> wasmtime::Result<()> {
+    fn retire_descriptor(
+        &mut self,
+        representation: u32,
+    ) -> wasmtime::Result<tokio::task::JoinHandle<()>> {
         let descriptor = self
             .ctx()
             .table
@@ -96,15 +99,14 @@ impl FsHost {
         let permit = self.descriptor_permits.remove(&representation);
         #[cfg(test)]
         let gate = self.io_gate.clone();
-        tokio::task::spawn_blocking(move || {
+        Ok(tokio::task::spawn_blocking(move || {
             #[cfg(test)]
             if let Some(gate) = gate {
                 gate.wait_on_descriptor_drop();
             }
             drop(descriptor);
             drop(permit);
-        });
-        Ok(())
+        }))
     }
 
     fn clone_descriptor(
@@ -117,6 +119,58 @@ impl FsHost {
             .cloned()
             .map_err(|_| terra::fs::host::Error::Access)
     }
+
+    #[cfg(windows)]
+    fn reopen_file_for_delete_sharing(
+        &mut self,
+        resource: &Resource<Descriptor>,
+    ) -> Result<(), types::ErrorCode> {
+        let descriptor = self
+            .ctx()
+            .table
+            .get_mut(resource)
+            .map_err(|_| types::ErrorCode::Io)?;
+        let Descriptor::File(file) = descriptor else {
+            return Ok(());
+        };
+        let access = terra_platform::filesystem::FileAccess {
+            read: file.open_mode.contains(OpenMode::READ),
+            write: file.open_mode.contains(OpenMode::WRITE),
+        };
+        let reopened =
+            terra_platform::filesystem::reopen_file_with_delete_sharing(&file.file, access)
+                .map_err(|_| types::ErrorCode::Io)?;
+        file.file = std::sync::Arc::new(reopened);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    pub(super) fn directory(
+        &mut self,
+        resource: &Resource<Descriptor>,
+    ) -> Result<Dir, types::ErrorCode> {
+        let descriptor = self
+            .ctx()
+            .table
+            .get(resource)
+            .map_err(|_| types::ErrorCode::BadDescriptor)?;
+        let Descriptor::Dir(directory) = descriptor else {
+            return Err(types::ErrorCode::NotDirectory);
+        };
+        Ok(directory.clone())
+    }
+
+    #[cfg(windows)]
+    fn writable_directory(
+        &mut self,
+        resource: &Resource<Descriptor>,
+    ) -> Result<Dir, types::ErrorCode> {
+        let directory = self.directory(resource)?;
+        if directory.perms.write_not_permitted() {
+            return Err(types::ErrorCode::NotPermitted);
+        }
+        Ok(directory)
+    }
 }
 
 impl WasiView for FsHost {
@@ -126,6 +180,17 @@ impl WasiView for FsHost {
 }
 
 impl<T: Send + 'static> terra::fs::host::HostWithStore<T> for HasSelf<FsHost> {
+    async fn release_descriptor(
+        accessor: &wasmtime::component::Accessor<T, Self>,
+        descriptor: Resource<Descriptor>,
+    ) -> Result<(), terra::fs::host::Error> {
+        accessor
+            .with(|mut access| access.get().retire_descriptor(descriptor.rep()))
+            .map_err(|_| terra::fs::host::Error::Io)?
+            .await
+            .map_err(|_| terra::fs::host::Error::Io)
+    }
+
     async fn open_metadata_at(
         accessor: &wasmtime::component::Accessor<T, Self>,
         parent: Resource<Descriptor>,
@@ -307,7 +372,11 @@ fn add_descriptor_lifecycle<T: Send + 'static>(
     interface.resource(
         "descriptor",
         wasmtime::component::ResourceType::host::<Descriptor>(),
-        move |mut store, representation| host(store.data_mut()).retire_descriptor(representation),
+        move |mut store, representation| {
+            host(store.data_mut())
+                .retire_descriptor(representation)
+                .map(drop)
+        },
     )?;
     interface.func_wrap_concurrent(
         "[method]descriptor.open-at",
@@ -336,19 +405,189 @@ fn add_descriptor_lifecycle<T: Send + 'static>(
                 .await
                 {
                     Ok(resource) => {
-                        accessor.with(|mut access| {
-                            host(access.data_mut())
-                                .descriptor_permits
-                                .insert(resource.rep(), permit);
-                        });
-                        Ok((Ok(resource),))
+                        let opened: Result<Resource<Descriptor>, types::ErrorCode> =
+                            accessor.with(|mut access| {
+                                let host = host(access.data_mut());
+                                #[cfg(windows)]
+                                if let Err(error) = host.reopen_file_for_delete_sharing(&resource) {
+                                    host.ctx()
+                                        .table
+                                        .delete(resource)
+                                        .map_err(|_| types::ErrorCode::Io)?;
+                                    return Err(error);
+                                }
+                                host.descriptor_permits.insert(resource.rep(), permit);
+                                Ok(resource)
+                            });
+                        Ok((opened,))
                     }
                     Err(error) => Ok((Err(error.downcast()?),)),
                 }
             })
         },
     )?;
+    #[cfg(windows)]
+    super::read_directory::add_windows_read_directory(&mut interface, host)?;
+    #[cfg(windows)]
+    add_windows_mutations(&mut interface, host)?;
     linker.allow_shadowing(false);
+    Ok(())
+}
+
+#[cfg(windows)]
+fn add_windows_mutations<T: Send + 'static>(
+    interface: &mut wasmtime::component::LinkerInstance<'_, T>,
+    host: for<'a> fn(&'a mut T) -> &'a mut FsHost,
+) -> wasmtime::Result<()> {
+    interface.func_wrap_concurrent(
+        "[method]descriptor.create-directory-at",
+        move |accessor, (descriptor, path): (Resource<Descriptor>, String)| {
+            let directory =
+                accessor.with(|mut access| host(access.data_mut()).writable_directory(&descriptor));
+            Box::pin(async move {
+                let result = match directory {
+                    Ok(directory) => tokio::task::spawn_blocking(move || {
+                        terra_platform::filesystem::create_directory_at(
+                            &directory.dir,
+                            path.as_ref(),
+                        )
+                    })
+                    .await
+                    .map_err(|_| types::ErrorCode::Io)
+                    .and_then(|result| result.map_err(Into::into)),
+                    Err(error) => Err(error),
+                };
+                Ok((result,))
+            })
+        },
+    )?;
+    interface.func_wrap_concurrent(
+        "[method]descriptor.link-at",
+        move |accessor,
+              (descriptor, old_flags, old_path, new_descriptor, new_path): (
+            Resource<Descriptor>,
+            types::PathFlags,
+            String,
+            Resource<Descriptor>,
+            String,
+        )| {
+            let directories = accessor.with(|mut access| {
+                let host = host(access.data_mut());
+                let old = host.writable_directory(&descriptor)?;
+                let new = host.writable_directory(&new_descriptor)?;
+                if old_flags.contains(types::PathFlags::SYMLINK_FOLLOW) {
+                    return Err(types::ErrorCode::Invalid);
+                }
+                if old.perms != new.perms {
+                    return Err(types::ErrorCode::NotPermitted);
+                }
+                Ok((old, new))
+            });
+            Box::pin(async move {
+                let result = match directories {
+                    Ok((old, new)) => tokio::task::spawn_blocking(move || {
+                        terra_platform::filesystem::hard_link_at(
+                            &old.dir,
+                            old_path.as_ref(),
+                            &new.dir,
+                            new_path.as_ref(),
+                        )
+                    })
+                    .await
+                    .map_err(|_| types::ErrorCode::Io)
+                    .and_then(|result| result.map_err(Into::into)),
+                    Err(error) => Err(error),
+                };
+                Ok((result,))
+            })
+        },
+    )?;
+    add_windows_rename_and_delete(interface, host)
+}
+
+#[cfg(windows)]
+fn add_windows_rename_and_delete<T: Send + 'static>(
+    interface: &mut wasmtime::component::LinkerInstance<'_, T>,
+    host: for<'a> fn(&'a mut T) -> &'a mut FsHost,
+) -> wasmtime::Result<()> {
+    interface.func_wrap_concurrent(
+        "[method]descriptor.rename-at",
+        move |accessor,
+              (descriptor, old_path, new_descriptor, new_path): (
+            Resource<Descriptor>,
+            String,
+            Resource<Descriptor>,
+            String,
+        )| {
+            let directories = accessor.with(|mut access| {
+                let host = host(access.data_mut());
+                let old = host.writable_directory(&descriptor)?;
+                let new = host.writable_directory(&new_descriptor)?;
+                if old.perms != new.perms {
+                    return Err(types::ErrorCode::NotPermitted);
+                }
+                Ok((old, new))
+            });
+            Box::pin(async move {
+                let result = match directories {
+                    Ok((old, new)) => tokio::task::spawn_blocking(move || {
+                        terra_platform::filesystem::rename_at(
+                            &old.dir,
+                            old_path.as_ref(),
+                            &new.dir,
+                            new_path.as_ref(),
+                        )
+                    })
+                    .await
+                    .map_err(|_| types::ErrorCode::Io)
+                    .and_then(|result| result.map_err(Into::into)),
+                    Err(error) => Err(error),
+                };
+                Ok((result,))
+            })
+        },
+    )?;
+    interface.func_wrap_concurrent(
+        "[method]descriptor.remove-directory-at",
+        move |accessor, (descriptor, path): (Resource<Descriptor>, String)| {
+            let directory =
+                accessor.with(|mut access| host(access.data_mut()).writable_directory(&descriptor));
+            Box::pin(async move {
+                let result = match directory {
+                    Ok(directory) => tokio::task::spawn_blocking(move || {
+                        terra_platform::filesystem::remove_directory_at(
+                            &directory.dir,
+                            path.as_ref(),
+                        )
+                    })
+                    .await
+                    .map_err(|_| types::ErrorCode::Io)
+                    .and_then(|result| result.map_err(Into::into)),
+                    Err(error) => Err(error),
+                };
+                Ok((result,))
+            })
+        },
+    )?;
+    interface.func_wrap_concurrent(
+        "[method]descriptor.unlink-file-at",
+        move |accessor, (descriptor, path): (Resource<Descriptor>, String)| {
+            let directory =
+                accessor.with(|mut access| host(access.data_mut()).writable_directory(&descriptor));
+            Box::pin(async move {
+                let result = match directory {
+                    Ok(directory) => tokio::task::spawn_blocking(move || {
+                        terra_platform::filesystem::unlink_file_at(&directory.dir, path.as_ref())
+                    })
+                    .await
+                    .map_err(|_| types::ErrorCode::Io)
+                    .and_then(|result| result.map_err(Into::into)),
+                    Err(error) => Err(error),
+                };
+                Ok((result,))
+            })
+        },
+    )?;
     Ok(())
 }
 
@@ -422,9 +661,9 @@ mod tests {
                     {
                         let descriptor = opened.unwrap();
                         assert_eq!(budget.available_permits(), 0);
-                        accessor.with(|mut access| {
-                            access.get().retire_descriptor(descriptor.rep()).unwrap();
-                        });
+                        HasSelf::<FsHost>::release_descriptor(&accessor, descriptor)
+                            .await
+                            .unwrap();
                     }
                 })
                 .await

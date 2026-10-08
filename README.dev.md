@@ -34,9 +34,9 @@ exact `dist/terra`; see [policy generation](#verification).
 The guest is Alpine Linux on the host's CPU architecture. Guest images are
 built on Linux; macOS and Windows builds consume those images and compile AOT
 components for their own host target. See [native host builds](packaging/README.md#native-host-builds)
-for staging, platform requirements, and signing. WIT packages share
-[interface sources](components/wit/README.md) through symlinks; Windows
-checkouts require symlink privileges and `core.symlinks=true`.
+for the Windows build command, Linux asset staging, platform requirements, and
+signing. Windows builds use PowerShell and require a checkout with the shared
+WIT [interface symlinks](components/wit/README.md) materialized correctly.
 
 ## Code layout
 
@@ -49,7 +49,7 @@ checkouts require symlink privileges and `core.symlinks=true`.
 | `crates/terra-network` | Host network broker and its IPC client |
 | `crates/terra-limits` | Shared resource limits |
 | `crates/terra-platform` | Native VM, memory, filesystem, local-I/O and child-process APIs over KVM, Hypervisor.framework and WHP |
-| `crates/terra-sandbox` | Host confinement of VM and broker workers: Bubblewrap and seccomp, macOS App Sandbox, Windows AppContainer |
+| `crates/terra-sandbox` | Host confinement of VM and broker workers: Bubblewrap and seccomp, macOS App Sandbox, Windows AppContainer and restricted-token jobs |
 | `crates/terra-build` | Build-script logic: fallback seccomp filters, Bubblewrap asset lookup, version string |
 | `crates/terra-runtime` | Wasmtime stores, guest layout, scoped host capabilities, network configuration and policy contracts, and component/VM lifecycle orchestration |
 | `components` | Wasm devices and services, reusable transport code, and shared WIT interfaces |
@@ -415,6 +415,8 @@ platform for Windows; native VM gates remain required for execution behavior.
 
 Windows tests run symlink fixtures by default. Enable Developer Mode or grant
 the account permission to create symbolic links before running the suite.
+Inside AppContainer, creating symlinks in host shares remains unsupported even
+with Developer Mode; see [Windows sandbox limits](docs/sandboxing.md#windows).
 
 Real Linux guest gates require `/dev/kvm`:
 
@@ -464,6 +466,10 @@ On Windows PowerShell:
 $env:TERRA_BIN = (Resolve-Path ./dist/terra.exe).Path
 cargo test --locked -p terra --test native_boot --test boot --test memory -- --ignored --test-threads=1 --nocapture
 ```
+
+The native file-events test can use `TERRA_FILE_EVENTS_PROBE` instead of Zig:
+point it to a static Linux binary built from `crates/terra/tests/assets/file_events_probe.c`
+for the guest architecture.
 
 Those gates cover guest CPUs, hooks, writable/read-only mounts, granted networking,
 volume persistence, and rootless Podman image import/run/stop on a private disk.

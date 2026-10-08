@@ -7,6 +7,7 @@ wasmtime::component::bindgen!({
     imports: {
  "terra:fs/host.file-events": store | trappable,
  "terra:fs/host.open-metadata-at": async | store,
+ "terra:fs/host.release-descriptor": async | store,
  "terra:fs/host.set-mode": async | store,
  "terra:fs/host.get-mode": async | store,
  "terra:fs/host.get-mode-at": async | store,

@@ -19,7 +19,7 @@ pub(super) fn prepare_sandbox_launch(
     self_test: Option<[u16; 3]>,
 ) -> Result<terra_sandbox::PreparedLaunch> {
     let grants = build_sandbox_grants(spec, bx, exe)?;
-    #[cfg(any(target_os = "macos", windows))]
+    #[cfg(target_os = "macos")]
     let grants = {
         let mut grants = grants;
         if self_test.is_some() {
@@ -27,6 +27,25 @@ pub(super) fn prepare_sandbox_launch(
                 super::supervisor::self_test_directory(bx),
                 Access::ReadWrite,
             ));
+        }
+        grants
+    };
+    #[cfg(windows)]
+    let grants = {
+        let mut grants = grants;
+        if self_test.is_some() {
+            let directory = super::supervisor::self_test_directory(bx);
+            for path in [
+                directory.clone(),
+                directory.join("writable"),
+                directory.join("readonly"),
+            ] {
+                let mut grant = Grant::new(&path, Access::ReadWrite);
+                grant.directory = Some(terra_platform::filesystem::open_share_root(
+                    &path.canonicalize()?,
+                )?);
+                grants.push(grant);
+            }
         }
         grants
     };
@@ -46,6 +65,36 @@ pub(super) fn prepare_sandbox_launch(
             command.env(name, value);
         }
     }
+    #[cfg(windows)]
+    {
+        if spec.mode == terra_protocol::PlanMode::Run {
+            for (index, mount) in spec.cfg.mounts.iter().enumerate() {
+                let identity = granted_directory_identity(&grants, &mount.host)?;
+                command.env(
+                    format!("TERRA_WINDOWS_MOUNT_ID_{index}"),
+                    identity.to_string(),
+                );
+            }
+        }
+        if self_test.is_some() {
+            let directory = super::supervisor::self_test_directory(bx);
+            for (name, path) in [
+                (
+                    "TERRA_WINDOWS_SELF_TEST_WRITABLE_ID",
+                    directory.join("writable"),
+                ),
+                (
+                    "TERRA_WINDOWS_SELF_TEST_READONLY_ID",
+                    directory.join("readonly"),
+                ),
+            ] {
+                command.env(
+                    name,
+                    granted_directory_identity(&grants, &path)?.to_string(),
+                );
+            }
+        }
+    }
     terra_sandbox::prepare_launch(Launch {
         role: terra_sandbox::Role::Vm,
         command,
@@ -54,6 +103,19 @@ pub(super) fn prepare_sandbox_launch(
         policy,
         staging_directory: &crate::state::get_terra_home_path()?,
     })
+}
+
+#[cfg(windows)]
+fn granted_directory_identity(
+    grants: &[Grant],
+    path: &Path,
+) -> Result<terra_platform::filesystem::FileIdentity> {
+    let directory = grants
+        .iter()
+        .find(|grant| grant.path == path)
+        .and_then(|grant| grant.directory.as_ref())
+        .with_context(|| format!("missing validated Windows share root {}", path.display()))?;
+    Ok(terra_platform::filesystem::file_identity(directory)?)
 }
 
 fn build_sandbox_grants(spec: &BootSpec, bx: &BoxRef, exe: &Path) -> Result<Vec<Grant>> {

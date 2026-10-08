@@ -1196,6 +1196,14 @@ async fn assert_vsock_reset_effect(shared_reset: bool) {
             &format!("{}-linux-musl", std::env::consts::ARCH),
         ])
         .args(["-static", "-O2", "-Wall", "-Wextra", "-Werror"])
+        .arg(format!(
+            "-DTERRA_SOCKET_ABI={}",
+            terra_protocol::socket::VERSION
+        ))
+        .arg(format!(
+            "-DTERRA_NETWORK_ABI={}",
+            terra_protocol::application::VERSION
+        ))
         .arg("-o")
         .arg(&probe)
         .arg(source)
@@ -1328,7 +1336,9 @@ async fn kernel_boots_libc_dns_tcp_fallback() {
             "-target",
             &format!("{}-linux-musl", std::env::consts::ARCH),
         ])
-        .args(["-static", "-O2", "-Wall", "-Wextra", "-Werror", "-o"])
+        .args(["-static", "-O2", "-Wall", "-Wextra", "-Werror"])
+        // musl's CMSG_NXTHDR mixes unsigned lengths with signed pointer differences.
+        .args(["-Wno-sign-compare", "-o"])
         .arg(&probe)
         .arg(source)
         .status()

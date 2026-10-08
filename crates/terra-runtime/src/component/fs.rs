@@ -5,6 +5,8 @@ mod file_events;
 mod grant;
 mod host;
 mod metadata;
+#[cfg(windows)]
+mod read_directory;
 mod resource_linker;
 #[cfg(test)]
 mod stalled_io;

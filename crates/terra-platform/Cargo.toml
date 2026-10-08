@@ -25,6 +25,7 @@ applevisor = { version = "=1.0.0", default-features = false, features = ["macos-
 applevisor-sys = { version = "=1.0.0", default-features = false, features = ["macos-15-0"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+cap-primitives = "=4.0.3"
 uds_windows = "1.2.1"
 tempfile.workspace = true
 tokio = { version = "1", features = ["io-util", "rt"] }

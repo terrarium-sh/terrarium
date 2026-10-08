@@ -65,6 +65,11 @@ impl PolicyBundle {
             Role::Network => &self.network,
         }
     }
+
+    #[cfg(windows)]
+    pub fn uses_app_container(&self, role: Role) -> anyhow::Result<bool> {
+        windows::uses_app_container(self.get(role), role)
+    }
 }
 
 pub const LAUNCHER_WORKER_ARG: &str = "__sandbox_launcher";
@@ -138,6 +143,8 @@ pub enum PreparedLaunch {
 pub struct SpawnedLaunch {
     pub child: Child,
     pub pid: u32,
+    #[cfg(target_os = "windows")]
+    pub trusted_directories: Vec<File>,
     #[cfg(target_os = "macos")]
     pub sandbox_bundle: Option<tempfile::TempDir>,
 }
@@ -159,6 +166,8 @@ impl PreparedLaunch {
                 Ok(SpawnedLaunch {
                     pid: child.id(),
                     child,
+                    #[cfg(target_os = "windows")]
+                    trusted_directories: Vec::new(),
                     #[cfg(target_os = "macos")]
                     sandbox_bundle: None,
                 })

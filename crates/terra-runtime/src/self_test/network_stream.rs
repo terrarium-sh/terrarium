@@ -249,7 +249,8 @@ impl GuestStream {
             .await
             .map_err(|error| {
                 wasmtime::Error::msg(format!(
-                    "vsock stream {stream:?} timed out waiting for {length} bytes: {error}"
+                    "vsock stream {stream:?} drained {} of {length} bytes: {error}",
+                    drained.len()
                 ))
             })?;
             let bytes = self.bytes.entry(stream).or_default();

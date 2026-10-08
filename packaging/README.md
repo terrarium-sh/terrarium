@@ -120,6 +120,20 @@ executable with the matching `build/` directory:
 | `x86_64-pc-windows-msvc` | `make ARCH=x86_64 guest-assets` | `pwsh ./scripts/toolchain/build-host.ps1 -Target x86_64-pc-windows-msvc` |
 | `aarch64-pc-windows-msvc` | `make ARCH=aarch64 guest-assets` | `pwsh ./scripts/toolchain/build-host.ps1 -Target aarch64-pc-windows-msvc` |
 
+Windows host builds use PowerShell 7, Rustup and the MSVC build tools on a
+machine matching the target architecture. Enable Developer Mode and clone with
+`git -c core.symlinks=true clone https://github.com/terrarium-sh/terrarium.git`
+so the shared WIT links are checked out correctly.
+
+Copy `vmlinux.gz`, `rootfs.img.gz`, `volume.img.gz`, `boot.img.gz`, and
+`socket-probe` from the matching Linux guest-assets build into `build/`.
+Use the same source revision and guest architecture. Then run the Windows host
+build command above; it installs the pinned component toolchain and `wasm-tools`,
+builds the WASM components, compiles their Windows AOT versions, and builds Terra.
+
+Optionally, pass `-ComponentsDirectory <directory>` to reuse matching prebuilt
+WASM components instead of building them locally.
+
 macOS requires Apple Silicon and macOS 15 or newer. The release executable must
 be signed with `packaging/macos.entitlements`, which grants
 `com.apple.security.hypervisor`. CI uses an ad-hoc signature to check the

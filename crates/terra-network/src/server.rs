@@ -7,7 +7,11 @@ use socket2::SockRef;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+#[cfg(windows)]
+use std::os::windows::io::AsRawSocket;
 use std::sync::Arc;
+#[cfg(windows)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use terra_policy::{BoxPolicy, NameLookup};
 use terra_protocol::network::{
@@ -37,6 +41,8 @@ enum Resource {
         socket: Arc<TcpStream>,
         peer: SocketAddr,
         write_closed: bool,
+        #[cfg(windows)]
+        write_shutdown_started: Arc<AtomicBool>,
         write_poisoned: Arc<Mutex<bool>>,
         write_slots: Arc<Semaphore>,
     },
@@ -110,16 +116,102 @@ struct ActiveTcpWrite {
     socket: Arc<TcpStream>,
     poisoned: OwnedMutexGuard<bool>,
     incomplete_prefix: bool,
+    #[cfg(windows)]
+    write_shutdown_started: Arc<AtomicBool>,
 }
 
 impl Drop for ActiveTcpWrite {
     fn drop(&mut self) {
         if self.incomplete_prefix {
-            // A cancelled upload may have sent a prefix; later chunks must never follow it.
             *self.poisoned = true;
-            let _ = SockRef::from(self.socket.as_ref()).shutdown(std::net::Shutdown::Write);
+            #[cfg(windows)]
+            self.write_shutdown_started.store(true, Ordering::SeqCst);
+            let shutdown = SockRef::from(self.socket.as_ref()).shutdown(std::net::Shutdown::Write);
+            #[cfg(windows)]
+            if shutdown.is_err() {
+                self.write_shutdown_started.store(false, Ordering::SeqCst);
+            }
+            let _ = shutdown;
         }
     }
+}
+
+#[cfg(not(windows))]
+async fn wait_tcp_error(socket: &TcpStream) -> Error {
+    if let Err(error) = socket.ready(tokio::io::Interest::ERROR).await {
+        return map_io_error(error);
+    }
+    match socket.take_error() {
+        Ok(None) => Error::ConnectionReset,
+        Ok(Some(error)) | Err(error) => map_io_error(error),
+    }
+}
+
+#[cfg(windows)]
+async fn wait_tcp_error(socket: &TcpStream, write_shutdown_started: &AtomicBool) -> Error {
+    loop {
+        tokio::select! {
+            ready = socket.ready(tokio::io::Interest::ERROR) => {
+                if let Err(error) = ready {
+                    return map_io_error(error);
+                }
+                return match socket.take_error() {
+                    Ok(None) => Error::ConnectionReset,
+                    Ok(Some(error)) | Err(error) => map_io_error(error),
+                };
+            }
+            () = tokio::time::sleep(Duration::from_millis(50)) => {
+                match socket.take_error() {
+                    Ok(None) => {}
+                    Ok(Some(error)) | Err(error) => return map_io_error(error),
+                }
+                match read_windows_tcp_state(socket) {
+                    Ok(windows_sys::Win32::Networking::WinSock::TCPSTATE_CLOSED)
+                        if !write_shutdown_started.load(Ordering::SeqCst) => return Error::ConnectionReset,
+                    Ok(_) => {}
+                    Err(error) => return map_io_error(error),
+                }
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn read_windows_tcp_state(socket: &TcpStream) -> io::Result<i32> {
+    use windows_sys::Win32::Networking::WinSock::{
+        SIO_TCP_INFO, SOCKET_ERROR, TCP_INFO_v0, WSAGetLastError, WSAIoctl,
+    };
+
+    let version = 0u32;
+    let mut info = TCP_INFO_v0::default();
+    let info_bytes = u32::try_from(std::mem::size_of::<TCP_INFO_v0>())
+        .map_err(|_| io::Error::other("TCP info size exceeds ioctl limit"))?;
+    let raw_socket = usize::try_from(socket.as_raw_socket())
+        .map_err(|_| io::Error::other("socket handle exceeds ioctl limit"))?;
+    let mut returned = 0u32;
+    // SAFETY: WSAIoctl completes synchronously with live input and output buffers.
+    let status = unsafe {
+        WSAIoctl(
+            raw_socket,
+            SIO_TCP_INFO,
+            (&raw const version).cast(),
+            4,
+            (&raw mut info).cast(),
+            info_bytes,
+            &raw mut returned,
+            std::ptr::null_mut(),
+            None,
+        )
+    };
+    if status == SOCKET_ERROR {
+        // SAFETY: WSAGetLastError reads the calling thread's last Winsock error.
+        return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
+    }
+    if returned < info_bytes {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "short TCP info"));
+    }
+    Ok(info.State)
 }
 
 type Work = BoxFuture<'static, (RequestId, Result<Completion, Error>)>;
@@ -358,6 +450,8 @@ impl Broker {
                             socket: Arc::new(stream),
                             peer,
                             write_closed: false,
+                            #[cfg(windows)]
+                            write_shutdown_started: Arc::new(AtomicBool::new(false)),
                             write_poisoned: Arc::new(Mutex::new(false)),
                             write_slots: Arc::new(Semaphore::new(crate::MAX_TCP_WRITE_REQUESTS)),
                         }))
@@ -423,6 +517,8 @@ impl Broker {
                             socket: Arc::new(stream),
                             peer,
                             write_closed: false,
+                            #[cfg(windows)]
+                            write_shutdown_started: Arc::new(AtomicBool::new(false)),
                             write_poisoned: Arc::new(Mutex::new(false)),
                             write_slots: Arc::new(Semaphore::new(crate::MAX_TCP_WRITE_REQUESTS)),
                         }))
@@ -454,18 +550,26 @@ impl Broker {
                 )
             }
             Operation::WaitError(handle) => {
-                let socket = self.tcp(handle)?;
+                let Resource::Tcp {
+                    socket,
+                    #[cfg(windows)]
+                    write_shutdown_started,
+                    ..
+                } = self.resources.get(&handle).ok_or(Error::StaleHandle)?
+                else {
+                    return Err(Error::WrongKind);
+                };
+                let socket = socket.clone();
+                #[cfg(windows)]
+                let write_shutdown_started = write_shutdown_started.clone();
                 (
                     Some(WorkKey::Error(handle)),
                     Box::pin(async move {
-                        socket
-                            .ready(tokio::io::Interest::ERROR)
-                            .await
-                            .map_err(map_io_error)?;
-                        Err(socket
-                            .take_error()
-                            .map_err(map_io_error)?
-                            .map_or(Error::ConnectionReset, map_io_error))
+                        #[cfg(windows)]
+                        let error = wait_tcp_error(&socket, &write_shutdown_started).await;
+                        #[cfg(not(windows))]
+                        let error = wait_tcp_error(&socket).await;
+                        Err(error)
                     }),
                 )
             }
@@ -476,6 +580,8 @@ impl Broker {
                 let Resource::Tcp {
                     socket,
                     write_closed,
+                    #[cfg(windows)]
+                    write_shutdown_started,
                     write_poisoned,
                     write_slots,
                     ..
@@ -487,6 +593,8 @@ impl Broker {
                     return Err(Error::InvalidState);
                 }
                 let socket = socket.clone();
+                #[cfg(windows)]
+                let write_shutdown_started = write_shutdown_started.clone();
                 let write_poisoned = write_poisoned.clone();
                 let permit = write_slots
                     .clone()
@@ -504,6 +612,8 @@ impl Broker {
                             socket,
                             poisoned,
                             incomplete_prefix: false,
+                            #[cfg(windows)]
+                            write_shutdown_started,
                         };
                         let mut offset = 0;
                         loop {
@@ -546,6 +656,8 @@ impl Broker {
                 let Resource::Tcp {
                     socket,
                     write_closed,
+                    #[cfg(windows)]
+                    write_shutdown_started,
                     write_poisoned,
                     ..
                 } = self.resources.get_mut(&handle).ok_or(Error::StaleHandle)?
@@ -557,6 +669,8 @@ impl Broker {
                 }
                 *write_closed = true;
                 let socket = socket.clone();
+                #[cfg(windows)]
+                let write_shutdown_started = write_shutdown_started.clone();
                 let write_poisoned = write_poisoned.clone();
                 (
                     Some(WorkKey::Upload(handle)),
@@ -566,9 +680,15 @@ impl Broker {
                             return Err(Error::InvalidState);
                         }
                         *poisoned = true;
-                        SockRef::from(socket.as_ref())
-                            .shutdown(std::net::Shutdown::Write)
-                            .map_err(map_io_error)?;
+                        #[cfg(windows)]
+                        write_shutdown_started.store(true, Ordering::SeqCst);
+                        let shutdown =
+                            SockRef::from(socket.as_ref()).shutdown(std::net::Shutdown::Write);
+                        #[cfg(windows)]
+                        if shutdown.is_err() {
+                            write_shutdown_started.store(false, Ordering::SeqCst);
+                        }
+                        shutdown.map_err(map_io_error)?;
                         Ok(Completion::Reply(Reply::Done))
                     }),
                 )
@@ -1476,6 +1596,8 @@ mod tests {
                 peer: socket.peer_addr().unwrap(),
                 socket: Arc::new(socket),
                 write_closed: false,
+                #[cfg(windows)]
+                write_shutdown_started: Arc::new(AtomicBool::new(false)),
                 write_poisoned: poisoned.clone(),
                 write_slots: slots.clone(),
             },
@@ -1692,10 +1814,14 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), async {
             let (mut broker, mut external, poisoned, slots) = blocked_tcp().await;
             let socket = broker.tcp(1).unwrap();
+            #[cfg(windows)]
+            let write_shutdown_started = Arc::new(AtomicBool::new(false));
             let active = ActiveTcpWrite {
                 socket: socket.clone(),
                 poisoned: poisoned.clone().lock_owned().await,
                 incomplete_prefix: true,
+                #[cfg(windows)]
+                write_shutdown_started: write_shutdown_started.clone(),
             };
             socket.writable().await.unwrap();
             assert_eq!(socket.try_write(&[1]).unwrap(), 1);
@@ -1714,6 +1840,8 @@ mod tests {
                 queued.push(write);
             }
             drop(active);
+            #[cfg(windows)]
+            assert!(write_shutdown_started.load(Ordering::SeqCst));
             let mut remaining = Vec::new();
             external.read_to_end(&mut remaining).await.unwrap();
             assert!(remaining.is_empty());
@@ -2025,8 +2153,9 @@ mod tests {
         assert_eq!(other.read(&mut bytes).await.unwrap(), 0);
     }
 
+    /// An unread payload makes a reset after FIN observable to the error waiter on every host OS.
     #[tokio::test]
-    async fn tcp_error_wait_observes_reset_after_fin_and_releases_on_close() {
+    async fn tcp_error_wait_observes_reset_after_fin() {
         tokio::time::timeout(Duration::from_secs(5), async {
             let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
             let address = listener.local_addr().unwrap();
@@ -2059,6 +2188,20 @@ mod tests {
                     .await
                     .is_err()
             );
+            assert_eq!(
+                client
+                    .request(Operation::WriteAll {
+                        handle,
+                        bytes: b"RX".to_vec(),
+                    })
+                    .await,
+                Ok(Reply::Written(2))
+            );
+            let mut received = [0];
+            remote.read_exact(&mut received).await.unwrap();
+            assert_eq!(received, [b'R']);
+            remote.peek(&mut received).await.unwrap();
+            assert_eq!(received, [b'X']);
             SockRef::from(&remote)
                 .set_linger(Some(Duration::ZERO))
                 .unwrap();
@@ -2068,8 +2211,21 @@ mod tests {
                 client.request(Operation::Close(handle)).await,
                 Ok(Reply::Done)
             );
+            drop(client);
+            broker.await.unwrap().unwrap();
+        })
+        .await
+        .unwrap();
+    }
 
-            let replacement = open(
+    /// An orderly pair of FINs leaves the error waiter pending until Close cancels it.
+    #[tokio::test]
+    async fn tcp_error_wait_ignores_orderly_close_and_releases_on_handle_close() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (client, broker) = start(config());
+            let handle = open(
                 &client,
                 Operation::OpenTcp {
                     peer: address,
@@ -2077,10 +2233,20 @@ mod tests {
                 },
             )
             .await;
-            let (_remote, _) = listener.accept().await.unwrap();
+            let (mut remote, _) = listener.accept().await.unwrap();
+            remote.shutdown().await.unwrap();
+            assert_eq!(
+                client
+                    .request(Operation::Read {
+                        handle,
+                        max_bytes: 8
+                    })
+                    .await,
+                Ok(Reply::Eof)
+            );
             let mut monitor = tokio::spawn({
                 let client = client.clone();
-                async move { client.request(Operation::WaitError(replacement)).await }
+                async move { client.request(Operation::WaitError(handle)).await }
             });
             assert!(
                 tokio::time::timeout(Duration::from_millis(20), &mut monitor)
@@ -2088,7 +2254,18 @@ mod tests {
                     .is_err()
             );
             assert_eq!(
-                client.request(Operation::Close(replacement)).await,
+                client.request(Operation::ShutdownWrite(handle)).await,
+                Ok(Reply::Done)
+            );
+            let mut received = [0];
+            assert_eq!(remote.read(&mut received).await.unwrap(), 0);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(150), &mut monitor)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                client.request(Operation::Close(handle)).await,
                 Ok(Reply::Done)
             );
             assert_eq!(monitor.await.unwrap(), Err(Error::Cancelled));

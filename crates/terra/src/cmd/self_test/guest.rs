@@ -369,7 +369,19 @@ fn exercise_exec(self_test: &SelfTest) -> Result<()> {
 
 fn exercise_shares(self_test: &SelfTest, writable: &Path, readonly: &Path) -> Result<()> {
     println!("self-test: writable/read-only shares, file events and synchronization");
-    self_test.execute(include_str!("scripts/shares.sh"), &[])?;
+    #[cfg(windows)]
+    let expects_symlink_denial = vm_uses_app_container()?;
+    #[cfg(not(windows))]
+    let expects_symlink_denial = false;
+    let flags: &[&str] = if expects_symlink_denial {
+        println!(
+            "self-test: Windows AppContainer cannot create symbolic links in shared filesystems"
+        );
+        &["--env", "TERRA_SELF_TEST_EXPECT_SYMLINK_DENIAL=1"]
+    } else {
+        &["--env", "TERRA_SELF_TEST_EXPECT_SYMLINK_DENIAL=0"]
+    };
+    self_test.execute(include_str!("scripts/shares.sh"), flags)?;
     #[cfg(unix)]
     self_test.execute("test \"$(/work/host-run)\" = HOST_EXECUTABLE", &[])?;
     require_file(&writable.join("host"), b"linked")?;
@@ -385,6 +397,19 @@ fn exercise_shares(self_test: &SelfTest, writable: &Path, readonly: &Path) -> Re
     exercise_file_events(self_test, writable)?;
     self_test.execute(include_str!("scripts/shares-persisted.sh"), &[])?;
     Ok(())
+}
+
+#[cfg(windows)]
+fn vm_uses_app_container() -> Result<bool> {
+    match crate::sandbox::config::load()? {
+        crate::sandbox::config::LauncherConfig::Sandboxed {
+            policy,
+            allow_fallback,
+        } => terra_sandbox::resolve_policy(policy.as_deref(), allow_fallback)?
+            .uses_app_container(terra_sandbox::Role::Vm),
+        crate::sandbox::config::LauncherConfig::Direct
+        | crate::sandbox::config::LauncherConfig::Custom(_) => Ok(false),
+    }
 }
 
 fn exercise_file_events(self_test: &SelfTest, writable: &Path) -> Result<()> {

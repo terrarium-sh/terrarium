@@ -93,8 +93,8 @@ impl Policy {
             Role::Network => Self {
                 schema_version: SCHEMA_VERSION,
                 role,
-                mode: Mode::AppContainer,
-                less_privileged: true,
+                mode: Mode::RestrictedTokenJob,
+                less_privileged: false,
                 memory_limit_bytes: BROKER_COMMIT_LIMIT_BYTES,
             },
         }
@@ -119,10 +119,12 @@ impl Policy {
         match (role, policy.mode) {
             (Role::Supervisor, Mode::Supervisor)
             | (Role::Vm, Mode::AppContainer | Mode::RestrictedTokenJob)
-            | (Role::Network, Mode::AppContainer) => {}
+            | (Role::Network, Mode::RestrictedTokenJob) => {}
+            (Role::Network, Mode::AppContainer) => {
+                bail!("Windows network broker AppContainer mode is unsupported")
+            }
             (Role::Supervisor, Mode::AppContainer | Mode::RestrictedTokenJob)
-            | (Role::Vm | Role::Network, Mode::Supervisor)
-            | (Role::Network, Mode::RestrictedTokenJob) => {
+            | (Role::Vm | Role::Network, Mode::Supervisor) => {
                 bail!("invalid Windows sandbox mode for {}", role.name())
             }
         }
@@ -154,6 +156,7 @@ struct WorkerSpec {
 struct WorkerGrant {
     path: PathBuf,
     writable: bool,
+    identity: Option<String>,
 }
 
 pub struct PreparedLaunch {
@@ -162,6 +165,7 @@ pub struct PreparedLaunch {
     inherited_identity: File,
     _parent: Option<OwnedHandle>,
     _spec: tempfile::NamedTempFile,
+    trusted_directories: Vec<File>,
 }
 
 pub fn prepare_launch(launch: Launch<'_>) -> Result<PreparedLaunch> {
@@ -173,12 +177,12 @@ pub fn prepare_launch(launch: Launch<'_>) -> Result<PreparedLaunch> {
         .policy
         .context("Windows sandbox launch requires its role policy")?;
     let policy = Policy::decode(policy, launch.role)?;
-    if policy.mode == Mode::RestrictedTokenJob {
+    if launch.role == Role::Vm && policy.mode == Mode::RestrictedTokenJob {
         log::warn!(
             "Windows VM restricted_token_job mode permits native host networking; select app_container for native network denial"
         );
     }
-    let grants = build_worker_grants(launch.grants)?;
+    let (grants, trusted_directories) = build_worker_grants(launch.grants)?;
     let executable = std::fs::canonicalize(launch.command.get_program())
         .context("resolving Windows sandbox worker executable")?;
     ensure!(
@@ -252,28 +256,39 @@ pub fn prepare_launch(launch: Launch<'_>) -> Result<PreparedLaunch> {
         inherited_identity,
         _parent: parent,
         _spec: spec,
+        trusted_directories,
     })
 }
 
-fn build_worker_grants(grants: Vec<Grant>) -> Result<Vec<WorkerGrant>> {
-    grants
-        .into_iter()
-        .map(|grant| {
-            ensure!(
-                grant.path.is_absolute(),
-                "Windows sandbox grant must be absolute: {}",
-                grant.path.display()
-            );
-            ensure!(
-                grant.access != Access::Device,
-                "Windows AppContainer device grants are unsupported"
-            );
-            Ok(WorkerGrant {
-                path: grant.path,
-                writable: grant.access == Access::ReadWrite,
-            })
-        })
-        .collect()
+fn build_worker_grants(grants: Vec<Grant>) -> Result<(Vec<WorkerGrant>, Vec<File>)> {
+    let mut worker_grants = Vec::with_capacity(grants.len());
+    let mut trusted_directories = Vec::new();
+    for grant in grants {
+        ensure!(
+            grant.path.is_absolute(),
+            "Windows sandbox grant must be absolute: {}",
+            grant.path.display()
+        );
+        ensure!(
+            grant.access != Access::Device,
+            "Windows AppContainer device grants are unsupported"
+        );
+        let identity = grant
+            .directory
+            .as_ref()
+            .map(terra_platform::filesystem::file_identity)
+            .transpose()?
+            .map(|identity| identity.to_string());
+        if let Some(directory) = grant.directory {
+            trusted_directories.push(directory);
+        }
+        worker_grants.push(WorkerGrant {
+            path: grant.path,
+            writable: grant.access == Access::ReadWrite,
+            identity,
+        });
+    }
+    Ok((worker_grants, trusted_directories))
 }
 
 impl PreparedLaunch {
@@ -285,7 +300,11 @@ impl PreparedLaunch {
         drop(self.inherited_identity);
         let result = read_identity(&mut self.identity, &mut child, timeout);
         match result {
-            Ok(pid) => Ok(SpawnedLaunch { child, pid }),
+            Ok(pid) => Ok(SpawnedLaunch {
+                child,
+                pid,
+                trusted_directories: self.trusted_directories,
+            }),
             Err(error) => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -367,6 +386,10 @@ pub fn resolve_policy(path: Option<&Path>, _allow_fallback: bool) -> Result<Poli
     })
 }
 
+pub(super) fn uses_app_container(policy: &[u8], role: Role) -> Result<bool> {
+    Ok(Policy::decode(policy, role)?.mode == Mode::AppContainer)
+}
+
 pub fn role_grants(_role: Role) -> Vec<Grant> {
     Vec::new()
 }
@@ -407,8 +430,8 @@ pub fn verify_worker_role(role: Role) -> Result<()> {
         }
         "restricted_token_job" => {
             ensure!(
-                role == Role::Vm && is_app_container == 0,
-                "restricted_token_job is a VM-only launch mode"
+                role != Role::Supervisor && is_app_container == 0,
+                "restricted_token_job requires a VM or network worker"
             );
             let mut has_restrictions = 0_u32;
             // SAFETY: token is live and this token-information class initializes a DWORD.
@@ -512,6 +535,10 @@ fn run_worker(
     let mut grants = profile.as_ref().map(acl::Grants::new);
     if let Some(grants) = &mut grants {
         for grant in &spec.grants {
+            if let Some(identity) = &grant.identity {
+                let expected = identity.parse()?;
+                terra_platform::filesystem::open_granted_share_root(&grant.path, expected)?;
+            }
             grants.add(&grant.path, grant.writable)?;
         }
     }
@@ -703,8 +730,9 @@ mod tests {
             }
         }
         let mut policy = Policy::builtin(Role::Network);
-        policy.mode = Mode::RestrictedTokenJob;
-        policy.less_privileged = false;
+        assert_eq!(policy.mode, Mode::RestrictedTokenJob);
+        policy.mode = Mode::AppContainer;
+        policy.less_privileged = true;
         assert!(Policy::decode(&serde_json::to_vec(&policy).unwrap(), Role::Network).is_err());
     }
 
@@ -741,7 +769,7 @@ mod tests {
         for quote in [
             format!("{}-MiB commit limit", BROKER_COMMIT_LIMIT_BYTES >> 20),
             format!(
-                "broker `app_container`, less-privileged, {}-byte limit",
+                "broker `restricted_token_job`, {}-byte limit",
                 group_digits(BROKER_COMMIT_LIMIT_BYTES)
             ),
             format!(
@@ -761,8 +789,21 @@ mod tests {
     }
 
     #[test]
+    fn policy_bundle_reports_the_validated_app_container_mode() {
+        let mut policies = resolve_policy(None, true).unwrap();
+        assert!(policies.uses_app_container(Role::Vm).unwrap());
+        assert!(!policies.uses_app_container(Role::Network).unwrap());
+        assert!(!policies.uses_app_container(Role::Supervisor).unwrap());
+        let mut restricted = Policy::builtin(Role::Vm);
+        restricted.mode = Mode::RestrictedTokenJob;
+        restricted.less_privileged = false;
+        policies.vm = serde_json::to_vec(&restricted).unwrap();
+        assert!(!policies.uses_app_container(Role::Vm).unwrap());
+    }
+
+    #[test]
     #[ignore = "requires native Windows and TERRA_BIN pointing to the newly built terra executable"]
-    fn native_roles_enforce_network_and_metadata_grants() -> Result<()> {
+    fn native_roles_enforce_vm_grants_and_broker_job() -> Result<()> {
         use std::net::{TcpListener, TcpStream};
         use std::process::Stdio;
         use terra_platform::io::local::{LocalListener, LocalStream};
@@ -774,6 +815,9 @@ mod tests {
         ensure!(wrapper.is_absolute(), "TERRA_BIN must be an absolute path");
         let executable = std::env::current_exe()?;
         let directory = tempfile::tempdir()?;
+        let directory_handle =
+            terra_platform::filesystem::open_share_root(&directory.path().canonicalize()?)?;
+        let directory_identity = terra_platform::filesystem::file_identity(&directory_handle)?;
         let protected = directory.path().join("protected");
         std::fs::write(&protected, b"read-only metadata")?;
         let local_path = directory.path().join("host.sock");
@@ -796,6 +840,10 @@ mod tests {
                     "--nocapture",
                 ])
                 .env("TERRA_WINDOWS_TEST_DIRECTORY", directory.path())
+                .env(
+                    "TERRA_WINDOWS_TEST_DIRECTORY_ID",
+                    directory_identity.to_string(),
+                )
                 .env("TERRA_WINDOWS_TEST_OUTSIDE", outside.path())
                 .env("TERRA_WINDOWS_TEST_ADDRESS", address.to_string());
             let mut grants = vec![Grant::new(&executable, Access::ReadOnly)];
@@ -848,7 +896,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "internal subprocess for native_roles_enforce_network_and_metadata_grants"]
+    #[ignore = "internal subprocess for native_roles_enforce_vm_grants_and_broker_job"]
     fn native_role_probe() -> Result<()> {
         use std::net::{SocketAddr, TcpStream, UdpSocket};
 
@@ -866,16 +914,19 @@ mod tests {
             std::env::var_os("TERRA_WINDOWS_TEST_OUTSIDE")
                 .context("native test outside file is missing")?,
         );
-        ensure!(
-            std::fs::read(outside).is_err(),
-            "Windows worker read a host file outside its grants"
-        );
         let protected = directory.join("protected");
         match role {
             Role::Vm => {
                 ensure!(
+                    std::fs::read(outside).is_err(),
+                    "Windows VM read a host file outside its grants"
+                );
+                terra_platform::vm::PreparedVm::capabilities()
+                    .map_err(anyhow::Error::msg)
+                    .context("AppContainer VM cannot access Windows Hypervisor Platform")?;
+                ensure!(
                     std::fs::read(&protected)? == b"read-only metadata",
-                    "Windows worker cannot read approved metadata"
+                    "Windows VM cannot read approved metadata"
                 );
                 ensure!(
                     std::fs::write(&protected, b"replace").is_err(),
@@ -891,6 +942,7 @@ mod tests {
                     "AppContainer VM reached a host AF_UNIX endpoint inside an approved share"
                 );
                 std::fs::write(directory.join("writable"), b"approved")?;
+                probe_granted_share_mutations(&directory)?;
                 let address: SocketAddr = std::env::var("TERRA_WINDOWS_TEST_ADDRESS")?.parse()?;
                 ensure!(
                     TcpStream::connect_timeout(&address, Duration::from_secs(1)).is_err(),
@@ -903,12 +955,64 @@ mod tests {
                     "AppContainer VM sent a host UDP datagram"
                 );
             }
-            Role::Network => ensure!(
-                std::fs::read(&protected).is_err(),
-                "network broker read VMM metadata"
-            ),
+            Role::Network => {
+                let address: SocketAddr = std::env::var("TERRA_WINDOWS_TEST_ADDRESS")?.parse()?;
+                TcpStream::connect_timeout(&address, Duration::from_secs(1))
+                    .context("restricted-token broker cannot use native loopback sockets")?;
+                UdpSocket::bind("127.0.0.1:0")
+                    .and_then(|socket| socket.send_to(b"probe", address))
+                    .context("restricted-token broker cannot send native loopback datagrams")?;
+            }
             Role::Supervisor => bail!("supervisor cannot run a worker probe"),
         }
+        Ok(())
+    }
+
+    fn probe_granted_share_mutations(directory: &Path) -> Result<()> {
+        let expected_directory = std::env::var("TERRA_WINDOWS_TEST_DIRECTORY_ID")?.parse()?;
+        let directory_handle =
+            terra_platform::filesystem::open_granted_share_root(directory, expected_directory)?;
+        terra_platform::filesystem::create_directory_at(
+            &directory_handle,
+            Path::new("platform-ops"),
+        )?;
+        std::fs::write(directory.join("platform-ops/source"), b"approved")?;
+        terra_platform::filesystem::rename_at(
+            &directory_handle,
+            Path::new("platform-ops/source"),
+            &directory_handle,
+            Path::new("platform-ops/renamed"),
+        )?;
+        terra_platform::filesystem::hard_link_at(
+            &directory_handle,
+            Path::new("platform-ops/renamed"),
+            &directory_handle,
+            Path::new("platform-ops/linked"),
+        )?;
+        terra_platform::filesystem::unlink_file_at(
+            &directory_handle,
+            Path::new("platform-ops/renamed"),
+        )?;
+        ensure!(
+            std::fs::read(directory.join("platform-ops/linked"))? == b"approved",
+            "AppContainer VM hard link lost its source content"
+        );
+        terra_platform::filesystem::unlink_file_at(
+            &directory_handle,
+            Path::new("platform-ops/linked"),
+        )?;
+        terra_platform::filesystem::remove_directory_at(
+            &directory_handle,
+            Path::new("platform-ops"),
+        )?;
+        ensure!(
+            terra_platform::filesystem::create_directory_at(
+                &directory_handle,
+                Path::new("../escape"),
+            )
+            .is_err(),
+            "AppContainer VM escaped its share through parent resolution"
+        );
         Ok(())
     }
 }

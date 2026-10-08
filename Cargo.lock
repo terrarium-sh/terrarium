@@ -2003,6 +2003,7 @@ dependencies = [
  "applevisor",
  "applevisor-sys",
  "async-io",
+ "cap-primitives",
  "kvm-bindings",
  "kvm-ioctls",
  "libc",

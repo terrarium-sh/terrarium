@@ -17,6 +17,7 @@ interface host {
     }
     file-events: func() -> stream<file-event>;
     open-metadata-at: async func(parent: borrow<descriptor>, name: string) -> result<descriptor, error>;
+    release-descriptor: async func(descriptor: descriptor) -> result<_, error>;
     record filesystem-stat {
         blocks: u64,
         blocks-free: u64,

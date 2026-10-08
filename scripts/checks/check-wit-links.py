@@ -16,6 +16,8 @@ for link in links:
             'enable core.symlinks before checkout (Windows also requires symlink privileges)'
         )
     target = link.resolve(strict=True)
-    if not target.is_relative_to(shared):
+    try:
+        target.relative_to(shared)
+    except ValueError:
         raise SystemExit(f'{link.relative_to(root)} points outside components/wit/')
 print(f'Validated {len(links)} shared WIT links')

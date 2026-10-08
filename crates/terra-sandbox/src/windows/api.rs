@@ -40,11 +40,8 @@ use windows_sys::Win32::System::Threading::{
     STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
-const NETWORK_CAPABILITIES: [&str; 3] = [
-    "internetClient",
-    "internetClientServer",
-    "privateNetworkClientServer",
-];
+// VidExo gates WHP access behind this capability even for capability queries.
+const HYPERVISOR_CAPABILITY: &str = "HypervisorPlatform";
 const DISABLE_WIN32K: u64 = 1 << 28;
 const DISABLE_DYNAMIC_CODE: u64 = 1 << 36;
 
@@ -161,22 +158,24 @@ pub(super) fn verify_capabilities(token: &OwnedHandle, role: Role) -> Result<()>
         )
     };
     match role {
-        Role::Vm => ensure!(
-            capabilities.is_empty(),
-            "Windows VM token has capabilities that may permit host networking"
-        ),
-        Role::Network => {
-            for name in NETWORK_CAPABILITIES {
-                let sid = derive_capability(name)?;
-                ensure!(
-                    capabilities.iter().any(|capability| {
+        Role::Vm => {
+            let registry_read = derive_capability("registryRead")?;
+            let hypervisor = derive_capability(HYPERVISOR_CAPABILITY)?;
+            ensure!(
+                capabilities.len() <= 2
+                    && capabilities.iter().any(|capability| {
                         // SAFETY: both SIDs are initialized and retained throughout the comparison.
-                        (unsafe { EqualSid(capability.Sid, sid.0) }) != 0
+                        (unsafe { EqualSid(capability.Sid, hypervisor.0) }) != 0
+                    })
+                    && capabilities.iter().all(|capability| {
+                        // SAFETY: both SIDs are initialized and retained throughout the comparison.
+                        (unsafe { EqualSid(capability.Sid, registry_read.0) }) != 0
+                            || (unsafe { EqualSid(capability.Sid, hypervisor.0) }) != 0
                     }),
-                    "Windows network broker lacks {name} capability"
-                );
-            }
+                "Windows VM token must have HypervisorPlatform and no other capabilities beyond registryRead"
+            );
         }
+        Role::Network => anyhow::bail!("network broker AppContainer mode is unsupported"),
         Role::Supervisor => ensure!(
             capabilities.is_empty(),
             "supervisor cannot use a worker AppContainer"
@@ -565,14 +564,11 @@ fn create_restricted_token() -> Result<OwnedHandle> {
 }
 
 fn build_capability_sids(policy: &Policy) -> Result<Vec<LocalAllocation>> {
-    if policy.role != Role::Network {
-        return Ok(Vec::new());
+    let mut sids = Vec::new();
+    if policy.role == Role::Vm && policy.mode == Mode::AppContainer {
+        sids.push(derive_capability(HYPERVISOR_CAPABILITY)?);
     }
-    let mut sids = NETWORK_CAPABILITIES
-        .into_iter()
-        .map(derive_capability)
-        .collect::<Result<Vec<_>>>()?;
-    if policy.less_privileged {
+    if policy.less_privileged && policy.role != Role::Supervisor {
         sids.push(derive_capability("registryRead")?);
     }
     Ok(sids)

@@ -186,6 +186,24 @@ fn verify_identity(
 }
 
 impl Node {
+    pub fn release_cached_directory(
+        &mut self,
+        parent: &Descriptor,
+        name: &str,
+        identity: types::MetadataHashValue,
+    ) -> Option<types::Descriptor> {
+        let descriptor = match std::sync::Arc::try_unwrap(self.descriptor.take()?) {
+            Ok(descriptor) => descriptor,
+            Err(descriptor) => {
+                self.descriptor = Some(descriptor);
+                return None;
+            }
+        };
+        self.path = Some((parent.clone(), name.to_owned()));
+        self.path_identity = Some(identity);
+        Some(descriptor)
+    }
+
     pub fn repoint(&mut self, parent: &Descriptor, name: &[u8]) {
         if let Ok(name) = text(name) {
             self.path = Some((parent.clone(), name.to_owned()));
@@ -410,6 +428,12 @@ impl Node {
             name_max: stat.name_max,
         })
     }
+}
+
+pub async fn release_descriptor(descriptor: types::Descriptor) -> Result<(), i32> {
+    crate::terra::fs::host::release_descriptor(descriptor)
+        .await
+        .map_err(extension_error)
 }
 
 impl Directory {

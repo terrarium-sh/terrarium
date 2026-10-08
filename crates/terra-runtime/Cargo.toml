@@ -28,6 +28,9 @@ tokio-util = { version = "0.7", features = ["rt"] }
 wasmtime = { version = "=49.0.2", default-features = false, features = ["component-model-async", "std"] }
 wasmtime-wasi = { version = "=49.0.2", default-features = false, features = ["p3"] }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation"] }
+
 [dev-dependencies]
 terra-protocol = { path = "../terra-protocol", features = ["mux"] }
 tokio = { version = "1", features = ["test-util"] }

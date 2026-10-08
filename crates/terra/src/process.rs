@@ -129,6 +129,8 @@ fn read_capture(file: &mut File) -> Result<Vec<u8>> {
 pub(crate) struct SupervisedChild {
     child: Child,
     guard: Option<sys::VmChildGuard>,
+    #[cfg(windows)]
+    trusted_directories: Vec<File>,
     #[cfg(target_os = "macos")]
     sandbox_bundle: Option<tempfile::TempDir>,
     is_reaped: bool,
@@ -139,6 +141,8 @@ impl SupervisedChild {
         let supervised = Self {
             child,
             guard,
+            #[cfg(windows)]
+            trusted_directories: Vec::new(),
             #[cfg(target_os = "macos")]
             sandbox_bundle: None,
             is_reaped: false,
@@ -154,6 +158,12 @@ impl SupervisedChild {
         guard: Option<sys::VmChildGuard>,
     ) -> Result<Self> {
         let supervised = Self::new(spawned.child, guard)?;
+        #[cfg(windows)]
+        let supervised = {
+            let mut supervised = supervised;
+            supervised.trusted_directories = spawned.trusted_directories;
+            supervised
+        };
         #[cfg(target_os = "macos")]
         let supervised = {
             let mut supervised = supervised;

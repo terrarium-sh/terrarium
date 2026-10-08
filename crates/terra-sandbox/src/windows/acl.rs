@@ -13,7 +13,9 @@ use windows_sys::Win32::Security::Authorization::{
 use windows_sys::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
     CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, DeleteAce, EqualSid, GetAce,
-    GetAclInformation, OBJECT_INHERIT_ACE, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    GetAclInformation, GetSecurityDescriptorControl, INHERITED_ACE, OBJECT_INHERIT_ACE,
+    PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    UNPROTECTED_DACL_SECURITY_INFORMATION,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_APPEND_DATA, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD,
@@ -38,8 +40,14 @@ const READONLY_DENY: u32 = FILE_WRITE_DATA
 
 pub(super) struct Grants<'a> {
     profile: &'a Profile,
-    objects: Vec<File>,
+    objects: Vec<GrantedObject>,
     roots: Vec<PathBuf>,
+}
+
+struct GrantedObject {
+    file: File,
+    restore_dacl_protection: Option<bool>,
+    inherited_aces: Vec<Vec<u8>>,
 }
 
 impl<'a> Grants<'a> {
@@ -62,7 +70,6 @@ impl<'a> Grants<'a> {
                 "Windows sandbox exceeds {MAX_GRANTED_OBJECTS} filesystem grants"
             );
             let object = open_security_object(&path)?;
-            remove_profile_aces(&object, self.profile)?;
             let directory = object.metadata()?.is_dir();
             let inheritance = if directory {
                 OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
@@ -94,7 +101,14 @@ impl<'a> Grants<'a> {
                     Trustee: allow.Trustee,
                 });
             }
-            let (acl, _descriptor) = read_acl(&object)?;
+            let (acl, descriptor) = read_acl(&object)?;
+            let was_dacl_protected = is_dacl_protected(&descriptor)?;
+            remove_profile_aces_from_acl(acl, self.profile)?;
+            let inherited_aces = if !writable && !was_dacl_protected {
+                collect_inherited_aces(acl)?
+            } else {
+                Vec::new()
+            };
             let mut updated = std::ptr::null_mut();
             // SAFETY: old ACL, SID, and entry array stay live; updated receives the owned ACL allocation.
             win_error(unsafe {
@@ -106,9 +120,17 @@ impl<'a> Grants<'a> {
                 )
             })?;
             let updated_owner = LocalAllocation(updated.cast());
-            write_acl(&object, updated)?;
+            write_acl(
+                &object,
+                updated,
+                (!writable && !was_dacl_protected).then_some(true),
+            )?;
             drop(updated_owner);
-            self.objects.push(object);
+            self.objects.push(GrantedObject {
+                file: object,
+                restore_dacl_protection: (!writable && !was_dacl_protected).then_some(false),
+                inherited_aces,
+            });
         }
         Ok(())
     }
@@ -117,7 +139,12 @@ impl<'a> Grants<'a> {
         let _lock = AclLock::acquire()?;
         let mut first_error = None;
         for object in self.objects.drain(..).rev() {
-            if let Err(error) = remove_profile_aces(&object, self.profile) {
+            if let Err(error) = remove_profile_aces(
+                &object.file,
+                self.profile,
+                object.restore_dacl_protection,
+                &object.inherited_aces,
+            ) {
                 first_error.get_or_insert(error);
             }
         }
@@ -198,7 +225,7 @@ fn remove_grants_from_paths(paths: &[PathBuf], profile: &Profile) -> Result<()> 
             }
             Err(error) => return Err(error),
         };
-        remove_profile_aces(&object, profile)?;
+        remove_profile_aces(&object, profile, None, &[])?;
     }
     Ok(())
 }
@@ -247,14 +274,29 @@ fn read_acl(object: &File) -> Result<(*mut ACL, LocalAllocation)> {
     Ok((acl, descriptor))
 }
 
-fn write_acl(object: &File, acl: *mut ACL) -> Result<()> {
+fn is_dacl_protected(descriptor: &LocalAllocation) -> Result<bool> {
+    let mut control = 0;
+    let mut revision = 0;
+    // SAFETY: read_acl returns a live security descriptor owned by descriptor.
+    api::win_ok(unsafe {
+        GetSecurityDescriptorControl(descriptor.0, &raw mut control, &raw mut revision)
+    })?;
+    Ok(control & SE_DACL_PROTECTED != 0)
+}
+
+fn write_acl(object: &File, acl: *mut ACL, dacl_protected: Option<bool>) -> Result<()> {
+    let protection = match dacl_protected {
+        Some(true) => PROTECTED_DACL_SECURITY_INFORMATION,
+        Some(false) => UNPROTECTED_DACL_SECURITY_INFORMATION,
+        None => 0,
+    };
     // SAFETY: directory handles use MAXIMUM_ALLOWED to prevent recursive propagation through reparse points.
     // Existing children are visited explicitly; future regular children inherit from the granted directory.
     win_error(unsafe {
         SetSecurityInfo(
             object.as_raw_handle(),
             SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
+            DACL_SECURITY_INFORMATION | protection,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             acl,
@@ -277,8 +319,24 @@ fn count_acl_entries(acl: *const ACL) -> Result<u32> {
     Ok(information.AceCount)
 }
 
-fn remove_profile_aces(object: &File, profile: &Profile) -> Result<()> {
+fn remove_profile_aces(
+    object: &File,
+    profile: &Profile,
+    dacl_protected: Option<bool>,
+    inherited_aces: &[Vec<u8>],
+) -> Result<()> {
     let (acl, _descriptor) = read_acl(object)?;
+    let changed = remove_profile_aces_from_acl(acl, profile)?;
+    if dacl_protected == Some(false) {
+        remove_converted_inherited_aces(acl, inherited_aces)?;
+    }
+    if changed || dacl_protected.is_some() {
+        write_acl(object, acl, dacl_protected)?;
+    }
+    Ok(())
+}
+
+fn remove_profile_aces_from_acl(acl: *mut ACL, profile: &Profile) -> Result<bool> {
     let count = count_acl_entries(acl)?;
     let mut changed = false;
     for index in (0..count).rev() {
@@ -300,8 +358,53 @@ fn remove_profile_aces(object: &File, profile: &Profile) -> Result<()> {
             }
         }
     }
-    if changed {
-        write_acl(object, acl)?;
+    Ok(changed)
+}
+
+fn collect_inherited_aces(acl: *mut ACL) -> Result<Vec<Vec<u8>>> {
+    let mut inherited = Vec::new();
+    for index in 0..count_acl_entries(acl)? {
+        let mut entry = std::ptr::null_mut();
+        // SAFETY: each index is within the initialized ACL.
+        api::win_ok(unsafe { GetAce(acl, index, &raw mut entry) })?;
+        ensure!(!entry.is_null(), "Windows returned a null ACL entry");
+        // SAFETY: every ACL entry starts with the fixed ACE header.
+        let header = unsafe { &*entry.cast::<ACE_HEADER>() };
+        if u32::from(header.AceFlags) & INHERITED_ACE != 0 {
+            inherited.push(ace_bytes(entry, header)?);
+        }
+    }
+    Ok(inherited)
+}
+
+fn ace_bytes(entry: *mut std::ffi::c_void, header: &ACE_HEADER) -> Result<Vec<u8>> {
+    ensure!(
+        usize::from(header.AceSize) >= std::mem::size_of::<ACE_HEADER>(),
+        "Windows returned a truncated ACL entry"
+    );
+    // SAFETY: GetAce returns an ACL entry whose initialized byte length is AceSize.
+    let mut bytes = unsafe {
+        std::slice::from_raw_parts(entry.cast::<u8>(), usize::from(header.AceSize)).to_vec()
+    };
+    bytes[1] &= !u8::try_from(INHERITED_ACE)?;
+    Ok(bytes)
+}
+
+fn remove_converted_inherited_aces(acl: *mut ACL, inherited_aces: &[Vec<u8>]) -> Result<()> {
+    for inherited_ace in inherited_aces {
+        for index in (0..count_acl_entries(acl)?).rev() {
+            let mut entry = std::ptr::null_mut();
+            // SAFETY: each index is within the initialized ACL; reverse iteration preserves lower indices after deletion.
+            api::win_ok(unsafe { GetAce(acl, index, &raw mut entry) })?;
+            ensure!(!entry.is_null(), "Windows returned a null ACL entry");
+            // SAFETY: every ACL entry starts with the fixed ACE header.
+            let header = unsafe { &*entry.cast::<ACE_HEADER>() };
+            if ace_bytes(entry, header)? == *inherited_ace {
+                // SAFETY: the current ACE index is valid and ACL memory is mutable API-owned storage.
+                api::win_ok(unsafe { DeleteAce(acl, index) })?;
+                break;
+            }
+        }
     }
     Ok(())
 }
@@ -388,6 +491,72 @@ mod tests {
         count_acl_entries(acl)
     }
 
+    fn file_dacl_protected(path: &Path) -> Result<bool> {
+        let object = open_security_object(path)?;
+        let (_acl, descriptor) = read_acl(&object)?;
+        is_dacl_protected(&descriptor)
+    }
+
+    #[test]
+    fn readonly_child_grants_restore_inherited_and_protected_dacls() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let inherited = directory.path().join("inherited");
+        let protected = directory.path().join("protected");
+        std::fs::write(&inherited, b"inherited")?;
+        std::fs::write(&protected, b"protected")?;
+        let inherited_object = open_security_object(&inherited)?;
+        let protected_object = open_security_object(&protected)?;
+        let (inherited_acl, _descriptor) = read_acl(&inherited_object)?;
+        write_acl(&inherited_object, inherited_acl, Some(false))?;
+        let (protected_acl, _descriptor) = read_acl(&protected_object)?;
+        write_acl(&protected_object, protected_acl, Some(true))?;
+        let inherited_entries = count_file_acl_entries(&inherited)?;
+        let protected_entries = count_file_acl_entries(&protected)?;
+
+        let profile = Profile::create(Role::Vm)?;
+        let mut grants = Grants::new(&profile);
+        grants.add(directory.path(), true)?;
+        grants.add(&inherited, false)?;
+        grants.add(&protected, false)?;
+        assert!(file_dacl_protected(&inherited)?);
+        assert!(file_dacl_protected(&protected)?);
+
+        grants.clear()?;
+        assert!(!file_dacl_protected(&inherited)?);
+        assert!(file_dacl_protected(&protected)?);
+        assert_eq!(count_file_acl_entries(&inherited)?, inherited_entries);
+        assert_eq!(count_file_acl_entries(&protected)?, protected_entries);
+        Ok(())
+    }
+
+    /// Overlapping workers must not restore another worker's temporary protection on a shared executable.
+    #[test]
+    fn overlapping_readonly_grants_restore_inheritance_in_either_exit_order() -> Result<()> {
+        for first_exits_first in [true, false] {
+            let file = tempfile::NamedTempFile::new()?;
+            let object = open_security_object(file.path())?;
+            let (acl, _descriptor) = read_acl(&object)?;
+            write_acl(&object, acl, Some(false))?;
+            let original_entries = count_file_acl_entries(file.path())?;
+            let first_profile = Profile::create(Role::Vm)?;
+            let second_profile = Profile::create(Role::Vm)?;
+            let mut first_grants = Grants::new(&first_profile);
+            let mut second_grants = Grants::new(&second_profile);
+            first_grants.add(file.path(), false)?;
+            second_grants.add(file.path(), false)?;
+            if first_exits_first {
+                first_grants.clear()?;
+                second_grants.clear()?;
+            } else {
+                second_grants.clear()?;
+                first_grants.clear()?;
+            }
+            assert!(!file_dacl_protected(file.path())?);
+            assert_eq!(count_file_acl_entries(file.path())?, original_entries);
+        }
+        Ok(())
+    }
+
     /// A file can disappear after the cleanup walk; its surviving siblings still lose their grants.
     #[test]
     fn cleanup_skips_deleted_paths_and_revokes_surviving_grants() -> Result<()> {
@@ -402,7 +571,7 @@ mod tests {
         grants.add(directory.path(), true)?;
         assert!(count_file_acl_entries(&surviving)? > original_entries);
 
-        let paths = vec![deleted.clone(), surviving.clone()];
+        let paths = walk_objects(directory.path(), false)?;
         grants.objects.clear();
         std::fs::remove_file(&deleted)?;
         remove_grants_from_paths(&paths, &profile)?;

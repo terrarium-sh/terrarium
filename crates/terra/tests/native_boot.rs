@@ -438,6 +438,7 @@ fn serve_request(listener: &TcpListener, body: &[u8]) {
     loop {
         match listener.accept() {
             Ok((mut stream, _)) => {
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(10)))
                     .unwrap();
@@ -464,34 +465,14 @@ fn serve_request(listener: &TcpListener, body: &[u8]) {
 }
 
 #[test]
-#[ignore = "requires a release binary, Zig, and usable KVM, Hypervisor.framework, or WHP"]
+#[ignore = "requires a release binary, a file-events probe or Zig, and usable KVM, Hypervisor.framework, or WHP"]
 fn native_boot_forwards_shared_file_events() {
     let writer = BoxFixture::new();
     let reader = BoxFixture::new();
     let shared = writer.directory.path().join("shared");
     std::fs::create_dir(&shared).unwrap();
     let probe = shared.join("probe");
-    let status = Command::new("zig")
-        .args([
-            "cc",
-            "-target",
-            &format!("{}-linux-musl", std::env::consts::ARCH),
-            "-static",
-            "-O2",
-            "-o",
-        ])
-        .arg(&probe)
-        .arg(
-            std::env::var_os("TERRA_TEST_ASSETS")
-                .map_or_else(
-                    || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/assets"),
-                    PathBuf::from,
-                )
-                .join("file_events_probe.c"),
-        )
-        .status()
-        .unwrap();
-    assert!(status.success());
+    prepare_file_events_probe(&probe);
     for (fixture, readonly) in [(&writer, false), (&reader, true)] {
         let recipe = fixture.directory.path().join("native.yaml");
         let config = serde_json::json!({
@@ -568,6 +549,34 @@ fn native_boot_forwards_shared_file_events() {
     reader.successful(&["native", "stop"]);
 }
 
+fn prepare_file_events_probe(probe: &std::path::Path) {
+    if let Some(prebuilt) = std::env::var_os("TERRA_FILE_EVENTS_PROBE") {
+        std::fs::copy(prebuilt, probe).unwrap();
+    } else {
+        let status = Command::new("zig")
+            .args([
+                "cc",
+                "-target",
+                &format!("{}-linux-musl", std::env::consts::ARCH),
+                "-static",
+                "-O2",
+                "-o",
+            ])
+            .arg(probe)
+            .arg(
+                std::env::var_os("TERRA_TEST_ASSETS")
+                    .map_or_else(
+                        || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/assets"),
+                        PathBuf::from,
+                    )
+                    .join("file_events_probe.c"),
+            )
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+}
+
 fn assert_guest_write_notifies_host(writer: &BoxFixture, shared: &std::path::Path) {
     use notify::Watcher as _;
     let (sender, receiver) = std::sync::mpsc::channel();
@@ -629,4 +638,293 @@ fn native_boot_reloads_node_server_from_host_events() {
         fixture.successful(&["native", "exec", "--", "sh", "-ec", &format!("for i in $(seq 1 150); do if test \"$(wget -q -T 1 -O - http://127.0.0.1:3000/ || true)\" = {value}; then exit 0; fi; sleep .1; done; exit 1")]);
     }
     fixture.successful(&["native", "stop"]);
+}
+
+#[cfg(windows)]
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct WindowsProcessRow {
+    process_id: u32,
+    parent_process_id: u32,
+    name: String,
+    command_line: Option<String>,
+}
+
+#[cfg(windows)]
+fn windows_process_descendants(supervisor_pid: u32) -> Vec<WindowsProcessRow> {
+    use std::os::windows::process::CommandExt as _;
+    use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+
+    let script = format!(
+        "$children = @(Get-CimInstance Win32_Process -Filter 'ParentProcessId = {supervisor_pid}' -ErrorAction Stop | Select-Object ProcessId,ParentProcessId,Name,CommandLine); $all = @($children); foreach ($child in $children) {{ $all += @(Get-CimInstance Win32_Process -Filter \"ParentProcessId = $($child.ProcessId)\" -ErrorAction Stop | Select-Object ProcessId,ParentProcessId,Name,CommandLine) }}; ConvertTo-Json -InputObject $all -Compress"
+    );
+    let output = Command::new("powershell")
+        .creation_flags(CREATE_NO_WINDOW)
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "querying Windows worker processes: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[cfg(windows)]
+struct WindowsProcessWatch {
+    pid: u32,
+    handle: std::os::windows::io::OwnedHandle,
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+impl WindowsProcessWatch {
+    fn open(pid: u32) -> Self {
+        use std::os::windows::io::FromRawHandle as _;
+        use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+        };
+
+        // SAFETY: pid comes from this test's supervisor ancestry; the returned handle is owned.
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | SYNCHRONIZE,
+                0,
+                pid,
+            )
+        };
+        assert!(
+            !handle.is_null(),
+            "opening process {pid}: {}",
+            std::io::Error::last_os_error()
+        );
+        Self {
+            pid,
+            // SAFETY: OpenProcess returned a unique owned handle.
+            handle: unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(handle) },
+        }
+    }
+
+    fn is_running(&self) -> bool {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+        // SAFETY: the process handle is live and zero waits only query status.
+        let status = unsafe { WaitForSingleObject(self.handle.as_raw_handle(), 0) };
+        assert!(
+            status == WAIT_OBJECT_0 || status == WAIT_TIMEOUT,
+            "querying process {}: {}",
+            self.pid,
+            std::io::Error::last_os_error()
+        );
+        status == WAIT_TIMEOUT
+    }
+
+    fn terminate(&self) {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::System::Threading::TerminateProcess;
+
+        // SAFETY: the retained handle pins this exact process rather than a reused PID.
+        assert_ne!(
+            unsafe { TerminateProcess(self.handle.as_raw_handle(), 1) },
+            0,
+            "terminating process {}: {}",
+            self.pid,
+            std::io::Error::last_os_error()
+        );
+    }
+
+    fn wait_exited(&self, deadline: Instant) {
+        while self.is_running() {
+            assert!(
+                Instant::now() < deadline,
+                "process {} survived teardown",
+                self.pid
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+#[cfg(windows)]
+struct WindowsNativeBoxGuard<'a> {
+    fixture: &'a BoxFixture,
+    processes: Vec<WindowsProcessWatch>,
+}
+
+#[cfg(windows)]
+impl<'a> WindowsNativeBoxGuard<'a> {
+    fn new(fixture: &'a BoxFixture, supervisor_pid: u32, rows: &[WindowsProcessRow]) -> Self {
+        let mut processes = vec![WindowsProcessWatch::open(supervisor_pid)];
+        processes.extend(
+            rows.iter()
+                .map(|row| WindowsProcessWatch::open(row.process_id)),
+        );
+        Self { fixture, processes }
+    }
+
+    fn process(&self, pid: u32) -> &WindowsProcessWatch {
+        self.processes
+            .iter()
+            .find(|process| process.pid == pid)
+            .unwrap()
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+impl Drop for WindowsNativeBoxGuard<'_> {
+    fn drop(&mut self) {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
+        use windows_sys::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
+
+        for process in &self.processes {
+            // SAFETY: retained handles pin only the exact processes spawned by this fixture.
+            if unsafe { WaitForSingleObject(process.handle.as_raw_handle(), 0) } == WAIT_TIMEOUT {
+                let _ = unsafe { TerminateProcess(process.handle.as_raw_handle(), 1) };
+            }
+        }
+        for process in &self.processes {
+            // SAFETY: each retained handle remains live until this guard drops.
+            let _ = unsafe { WaitForSingleObject(process.handle.as_raw_handle(), 5_000) };
+        }
+        let _ = self.fixture.force_remove();
+    }
+}
+
+#[cfg(windows)]
+fn windows_box_state(fixture: &BoxFixture) -> PathBuf {
+    let boxes = std::fs::read_dir(fixture.home.join(".terra/box"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        boxes.len(),
+        1,
+        "fixture must own exactly one box: {boxes:?}"
+    );
+    boxes[0].join("native")
+}
+
+#[cfg(windows)]
+fn windows_box_pid(path: &std::path::Path) -> u32 {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+#[cfg(windows)]
+fn windows_ports_available(tcp_port: u16, udp_port: u16) -> bool {
+    TcpListener::bind(("127.0.0.1", tcp_port)).is_ok()
+        && std::net::UdpSocket::bind(("127.0.0.1", udp_port)).is_ok()
+}
+
+/// Abrupt Windows worker and supervisor deaths release published sockets.
+#[cfg(windows)]
+#[test]
+#[ignore = "requires bundled guest artifacts, native WHP, AppContainer, and PowerShell CIM"]
+fn windows_broker_and_supervisor_death_release_published_ports() {
+    for kill_supervisor in [false, true] {
+        let fixture = BoxFixture::new();
+        std::fs::write(
+            fixture.home.join(".terra/config.yaml"),
+            "vm:\n  init: bwrap\n",
+        )
+        .unwrap();
+        let tcp_reservation = TcpListener::bind("127.0.0.1:0").unwrap();
+        let udp_reservation = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let tcp_port = tcp_reservation.local_addr().unwrap().port();
+        let udp_port = udp_reservation.local_addr().unwrap().port();
+        let recipe = fixture.directory.path().join("native.yaml");
+        let config = serde_json::json!({
+            "network": {"ports": [format!("{tcp_port}:8080/tcp"), format!("{udp_port}:8081/udp")]},
+            "workload": {"entrypoint": "/bin/sleep", "args": ["300"]}
+        });
+        std::fs::write(&recipe, yaml_serde::to_string(&config).unwrap()).unwrap();
+        fixture.successful(&[recipe.to_str().unwrap(), "setup"]);
+        drop((tcp_reservation, udp_reservation));
+        fixture.successful(&["native", "-d"]);
+        assert!(
+            TcpListener::bind(("127.0.0.1", tcp_port)).is_err(),
+            "published TCP port is not held by the box"
+        );
+        assert!(
+            std::net::UdpSocket::bind(("127.0.0.1", udp_port)).is_err(),
+            "published UDP port is not held by the box"
+        );
+
+        let state = windows_box_state(&fixture);
+        let supervisor_pid = windows_box_pid(&state.join("supervisor.pid"));
+        let vm_pid = windows_box_pid(&state.join("host.pid"));
+        let rows = windows_process_descendants(supervisor_pid);
+        assert!(rows.iter().any(|row| row.process_id == vm_pid));
+        let broker_wrappers = rows
+            .iter()
+            .filter(|row| {
+                row.parent_process_id == supervisor_pid
+                    && row.command_line.as_deref().is_some_and(|line| {
+                        line.contains(" __sandbox_launcher") && line.contains(" __network")
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            broker_wrappers.len(),
+            1,
+            "box must own exactly one broker wrapper"
+        );
+        let broker_wrapper_pid = broker_wrappers[0].process_id;
+        let worker_name = fixture.terra.file_name().unwrap().to_str().unwrap();
+        let brokers = rows
+            .iter()
+            .filter(|row| {
+                row.parent_process_id == broker_wrapper_pid
+                    && row.name.eq_ignore_ascii_case(worker_name)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            brokers.len(),
+            1,
+            "broker wrapper must own exactly one worker"
+        );
+        let broker_pid = brokers[0].process_id;
+        let guard = WindowsNativeBoxGuard::new(&fixture, supervisor_pid, &rows);
+        assert!(guard.process(vm_pid).is_running());
+        assert!(guard.process(broker_pid).is_running());
+        let deadline = Instant::now() + Duration::from_secs(15);
+        if kill_supervisor {
+            guard.process(supervisor_pid).terminate();
+            for process in &guard.processes {
+                process.wait_exited(deadline);
+            }
+        } else {
+            guard.process(broker_pid).terminate();
+            guard.process(broker_pid).wait_exited(deadline);
+            guard.process(broker_wrapper_pid).wait_exited(deadline);
+            assert!(guard.process(supervisor_pid).is_running());
+            assert!(guard.process(vm_pid).is_running());
+        }
+        while !windows_ports_available(tcp_port, udp_port) {
+            assert!(
+                Instant::now() < deadline,
+                "published ports survived process death"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if !kill_supervisor {
+            fixture.successful(&["native", "stop"]);
+            let stop_deadline = Instant::now() + Duration::from_secs(15);
+            for process in &guard.processes {
+                process.wait_exited(stop_deadline);
+            }
+        }
+    }
 }
