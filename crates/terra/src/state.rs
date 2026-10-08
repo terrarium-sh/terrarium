@@ -1045,7 +1045,9 @@ mod tests {
         std::fs::create_dir(b.get_volume_image("directory")).unwrap();
         std::fs::write(b.get_dir().join(ROOTFS_FILE), b"rootfs").unwrap();
         std::fs::write(b.get_dir().join(RECIPE_FILE), "hw:\n  cpus: 1\n").unwrap();
-        std::fs::write(b.get_dir().join(LOG_FILE), b"output").unwrap();
+        let log = b.get_dir().join(LOG_FILE);
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        std::fs::write(log, b"output").unwrap();
 
         let mut unused = b.list_unused_volume_images(&["data".to_string()]).unwrap();
         unused.sort();

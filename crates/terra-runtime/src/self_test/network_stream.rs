@@ -143,13 +143,15 @@ impl GuestStream {
             Ok(this.connected.contains(&stream))
         })
         .await
+        .map_err(|error| error.context(format!("connecting vsock stream {stream:?}")))
     }
 
     /// Accept the next frontend-initiated publication stream.
     pub(super) async fn accept(&mut self) -> wasmtime::Result<Stream> {
         if self.requests.is_empty() {
             self.wait_until(|this| Ok(!this.requests.is_empty()))
-                .await?;
+                .await
+                .map_err(|error| error.context("waiting for a vsock publication stream request"))?;
         }
         let host_port = self.requests.pop_front().ok_or_else(|| {
             wasmtime::Error::msg("network self-test publication request vanished")
@@ -183,7 +185,8 @@ impl GuestStream {
                     );
                     Ok(this.send_credit(stream) != 0)
                 })
-                .await?;
+                .await
+                .map_err(|error| error.context(format!("vsock stream {stream:?} send credit")))?;
             }
             let count = remaining
                 .len()
@@ -302,7 +305,8 @@ impl GuestStream {
             );
             Ok(false)
         })
-        .await?;
+        .await
+        .map_err(|error| error.context(format!("vsock stream {stream:?} EOF")))?;
         wasmtime::ensure!(
             self.buffered_bytes(stream) == 0,
             "network FIN follows all expected raw bytes"
@@ -313,6 +317,7 @@ impl GuestStream {
     pub(super) async fn require_reset(&mut self, stream: Stream) -> wasmtime::Result<()> {
         self.wait_until(|this| Ok(this.reset.contains(&stream)))
             .await
+            .map_err(|error| error.context(format!("vsock stream {stream:?} reset")))
     }
 
     pub(super) async fn wait_buffered(
@@ -325,6 +330,11 @@ impl GuestStream {
             Ok(this.buffered_bytes(stream) >= length)
         })
         .await
+        .map_err(|error| {
+            error.context(format!(
+                "vsock stream {stream:?} waiting for {length} buffered bytes"
+            ))
+        })
     }
 
     pub(super) fn is_reset(&self, stream: Stream) -> bool {

@@ -34,19 +34,35 @@ pub fn open_file_limit() -> Option<u64> {
 
 pub fn open_share_root(root: &Path) -> io::Result<File> {
     #[cfg(unix)]
+    if !root.is_absolute()
+        || root.components().any(|component| {
+            !matches!(
+                component,
+                std::path::Component::RootDir | std::path::Component::Normal(_)
+            )
+        })
+    {
+        return Err(io::Error::other("mount source is not an absolute path"));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use rustix::fs::{Mode, OFlags, open};
+
+        Ok(open(
+            root,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW_ANY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?
+        .into())
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
     {
         use rustix::fs::{Mode, OFlags, openat};
         use std::path::Component;
 
-        if !root.is_absolute() {
-            return Err(io::Error::other("mount source is not an absolute path"));
-        }
         let mut directory = File::open("/")?;
         for component in root.components() {
             let Component::Normal(name) = component else {
-                if component != Component::RootDir {
-                    return Err(io::Error::other("mount source is not an absolute path"));
-                }
                 continue;
             };
             directory = openat(
@@ -515,13 +531,14 @@ pub use windows::set_owner_only;
 #[path = "filesystem/windows.rs"]
 mod windows;
 
-#[cfg(all(test, unix, not(target_os = "macos")))]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::io::{Read as _, Write as _};
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn share_root_and_metadata_handles_reject_symlinks_and_retain_inodes() {
+        use std::io::{Read as _, Write as _};
         use std::os::unix::fs::{PermissionsExt as _, symlink};
 
         let root = tempfile::tempdir().expect("root");

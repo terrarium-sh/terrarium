@@ -122,12 +122,10 @@ fn foreground_arguments(args: &BootArgs, bx: &BoxRef) -> Vec<OsString> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sandbox::config::{LauncherConfig, load_from};
     use clap::Parser as _;
 
     #[test]
-    fn foreground_passes_keep_literal_arguments_without_recursion_and_deliver_policy() -> Result<()>
-    {
+    fn foreground_arguments_keep_literal_arguments_without_recursion() -> Result<()> {
         let cli = crate::cli::Cli::parse_from([
             "terra",
             "dev",
@@ -144,15 +142,28 @@ mod tests {
         let root = tempfile::tempdir()?;
         let bx = BoxRef::from_state_dir(root.path().join("box"), root.path());
         let arguments = foreground_arguments(&cli.boot, &bx);
-        let forwarded = crate::cli::Cli::parse_from(
-            std::iter::once(OsString::from("terra")).chain(arguments.clone()),
-        );
+        let forwarded =
+            crate::cli::Cli::parse_from(std::iter::once(OsString::from("terra")).chain(arguments));
         assert_eq!(forwarded.name.as_deref(), Some(bx.get_name()));
         assert_eq!(forwarded.project.as_deref(), Some(root.path()));
         assert!(forwarded.boot.foreground && forwarded.boot.root);
         assert_eq!(forwarded.boot.agent.agent_timeout, Some(42));
         assert!(!forwarded.boot.policy.generate_policy);
         assert_eq!(forwarded.boot.command, cli.boot.command);
+        Ok(())
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn foreground_passes_keep_literal_arguments_and_deliver_policy() -> Result<()> {
+        use crate::sandbox::config::{LauncherConfig, load_from};
+
+        let root = tempfile::tempdir()?;
+        let arguments =
+            ["dev", "--", "printf", "a b", "--generate-policy", "$HOME"].map(OsString::from);
         let candidate = root.path().join("candidate");
         for phase in [
             Phase::Collect {

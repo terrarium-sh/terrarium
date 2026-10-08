@@ -788,6 +788,7 @@ mod tests {
     fn a_replayed_log_is_bounded_and_says_what_it_left_out() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join(crate::state::LOG_FILE);
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
 
         // A short log comes back whole and unannotated.
         std::fs::write(&log, b"the only line\n").unwrap();
@@ -829,11 +830,9 @@ mod tests {
     fn missing_guest_logs_do_not_hide_host_boot_failure() {
         let dir = tempfile::tempdir().unwrap();
         let bx = BoxRef::from_state_dir(dir.path().to_path_buf(), dir.path());
-        std::fs::write(
-            dir.path().join(crate::state::LOG_FILE),
-            b"vCPU 0 failed: KVM_RUN\n",
-        )
-        .unwrap();
+        let log = dir.path().join(crate::state::LOG_FILE);
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        std::fs::write(log, b"vCPU 0 failed: KVM_RUN\n").unwrap();
         let mut output = Vec::new();
         write_boot_logs(&bx, &mut output).unwrap();
         let output = String::from_utf8(output).unwrap();

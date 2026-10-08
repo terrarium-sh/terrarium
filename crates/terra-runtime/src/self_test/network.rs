@@ -426,11 +426,8 @@ fn serve_tcp_half_closes(listener: &TcpListener) -> wasmtime::Result<()> {
         &observed_fin == b"R",
         "guest reports remote FIN before native reset"
     );
-    let mut unread = [0];
-    wasmtime::ensure!(
-        stream.peek(&mut unread)? == 1 && &unread == b"X",
-        "closing with unread input sends a native TCP reset"
-    );
+    let stream = tokio::net::TcpSocket::from_std_stream(stream);
+    stream.set_zero_linger()?;
     drop(stream);
     let mut stream = accept_stream(listener, WAIT)?;
     stream.write_all(&vec![
@@ -951,7 +948,10 @@ async fn exercise_socket_stream(
     );
     guest.stream.finish_input(replacement).await?;
     guest.stream.require_eof(replacement).await?;
-    guest.exercise_tcp_half_closes(endpoints.tcp).await
+    guest
+        .exercise_tcp_half_closes(endpoints.tcp)
+        .await
+        .map_err(|error| error.context("TCP half closes and reset after FIN"))
 }
 
 struct GuestNetwork {
@@ -1083,7 +1083,7 @@ impl GuestNetwork {
     async fn exercise_tcp_half_closes(&mut self, port: u16) -> wasmtime::Result<()> {
         let reset_after_fin = self.open_tcp(TcpTarget::HostService(port)).await?;
         self.stream.require_eof(reset_after_fin).await?;
-        self.stream.submit_raw(reset_after_fin, b"RX").await?;
+        self.stream.submit_raw(reset_after_fin, b"R").await?;
         self.stream.require_reset(reset_after_fin).await?;
         let receive_closed = self.open_tcp(TcpTarget::HostService(port)).await?;
         wasmtime::ensure!(

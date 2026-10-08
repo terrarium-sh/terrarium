@@ -24,9 +24,10 @@ fn host(grant: ShareGrant) -> FsHost {
 #[tokio::test]
 async fn shares_report_filesystem_statistics() {
     let root = tempfile::tempdir().unwrap();
+    let base = root.path().canonicalize().unwrap();
     let engine = crate::engine::device_engine().unwrap();
     for readonly in [false, true] {
-        let mut fs = host(ShareGrant::new(root.path(), readonly).unwrap());
+        let mut fs = host(ShareGrant::new(&base, readonly).unwrap());
         let descriptor = fs.get_directories().unwrap().remove(0).0;
         let mut store = wasmtime::Store::new(&engine, fs);
         let stat = store
@@ -46,7 +47,8 @@ async fn shares_report_filesystem_statistics() {
 #[tokio::test]
 async fn filesystem_statistics_reject_unknown_descriptors() {
     let root = tempfile::tempdir().unwrap();
-    let fs = host(ShareGrant::new(root.path(), true).unwrap());
+    let base = root.path().canonicalize().unwrap();
+    let fs = host(ShareGrant::new(&base, true).unwrap());
     let engine = crate::engine::device_engine().unwrap();
     let mut store = wasmtime::Store::new(&engine, fs);
     let stat = store

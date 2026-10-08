@@ -241,15 +241,16 @@ mod tests {
     #[test]
     fn sandbox_grants_keep_metadata_readonly_and_exclude_bake_shares() {
         let root = tempfile::tempdir().unwrap();
-        let box_dir = root.path().join("box");
-        let share = root.path().join("share");
+        let base = root.path().canonicalize().unwrap();
+        let box_dir = base.join("box");
+        let share = base.join("share");
         std::fs::create_dir_all(&box_dir).unwrap();
         std::fs::create_dir_all(&share).unwrap();
         let recipe = box_dir.join(state::RECIPE_FILE);
         std::fs::write(&recipe, "{}").unwrap();
-        let exe = root.path().join("terra");
-        let bx = BoxRef::from_state_dir(box_dir, root.path());
-        let mut spec = spec(root.path(), terra_protocol::PlanMode::Run);
+        let exe = base.join("terra");
+        let bx = BoxRef::from_state_dir(box_dir, &base);
+        let mut spec = spec(&base, terra_protocol::PlanMode::Run);
         spec.cfg.mounts.push(config::Mount {
             host: share.clone(),
             guest: "/share".into(),
@@ -280,7 +281,7 @@ mod tests {
         spec.mode = terra_protocol::PlanMode::Create;
         let grants = build_sandbox_grants(&spec, &bx, &exe).unwrap();
         assert!(!grants.iter().any(|grant| grant.path == share));
-        let moved = root.path().join("moved");
+        let moved = base.join("moved");
         std::fs::rename(&share, &moved).unwrap();
         crate::sys::symlink_dir(&moved, &share).unwrap();
         spec.mode = terra_protocol::PlanMode::Run;

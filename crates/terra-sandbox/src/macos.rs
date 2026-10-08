@@ -381,7 +381,7 @@ mod tests {
         match role {
             Role::Vm => {
                 require_permission_denied(connection, "connecting to the host test listener")?;
-                verify_share_socket_denial()?;
+                verify_share_access_and_socket_denial()?;
                 // SAFETY: the native acceptance parent prebinds and inherits this owned listener.
                 let listener = unsafe { UnixListener::from_raw_fd(TEST_LISTENER_FD) };
                 listener.set_nonblocking(true)?;
@@ -404,10 +404,17 @@ mod tests {
         Ok(())
     }
 
-    fn verify_share_socket_denial() -> Result<()> {
+    fn verify_share_access_and_socket_denial() -> Result<()> {
         let root = std::env::var_os(TEST_SHARE_ROOT).context("missing native test shares")?;
+        require_permission_denied(
+            std::fs::read_dir(&root),
+            "listing the parent of approved shares",
+        )?;
         for share in ["read-only", "writable"] {
             let directory = Path::new(&root).join(share);
+            let opened = terra_platform::filesystem::open_share_root(&directory)
+                .context("opening an approved share without ancestor read grants")?;
+            ensure!(opened.metadata()?.is_dir(), "approved share is a directory");
             require_permission_denied(
                 UnixStream::connect(directory.join("stream.socket")),
                 "connecting to a host Unix stream inside an approved share",
@@ -447,7 +454,8 @@ mod tests {
     }
 
     /// This check proves runtime App Sandbox activation, VM host-network
-    /// denial including Unix sockets inside shares, broker connectivity,
+    /// denial including Unix sockets inside shares, share opening without
+    /// ancestor read grants, broker connectivity,
     /// inherited IPC, and read-only metadata.
     /// A code signature by itself cannot pass the activation handshake.
     #[test]

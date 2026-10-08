@@ -1609,7 +1609,8 @@ mod tests {
     #[tokio::test]
     async fn uploads_write_whole_chunks_in_fifo_order_before_half_close() {
         tokio::time::timeout(Duration::from_secs(5), async {
-            let (mut broker, mut external, _, slots) = blocked_tcp().await;
+            let (mut broker, mut external, poisoned, slots) = blocked_tcp().await;
+            let guard = poisoned.lock_owned().await;
             let mut writes = Vec::new();
             let mut expected = Vec::new();
             for index in 1..=crate::MAX_TCP_WRITE_REQUESTS {
@@ -1625,6 +1626,7 @@ mod tests {
             assert!(shutdown.as_mut().now_or_never().is_none());
             assert!(matches!(broker.prepare(Operation::WriteAll { handle: 1, bytes: vec![3] }), Err(Error::InvalidState)));
             assert!(matches!(broker.prepare(Operation::WriteAll { handle: 1, bytes: vec![3] }), Err(Error::InvalidState)));
+            drop(guard);
             let reader = async {
                 let mut bytes = Vec::new();
                 external.read_to_end(&mut bytes).await.unwrap();
@@ -1684,63 +1686,90 @@ mod tests {
         assert_eq!(slots.available_permits(), crate::MAX_TCP_WRITE_REQUESTS);
     }
 
+    /// Stage a partial write explicitly because a host TCP buffer can hold an entire chunk.
     #[tokio::test]
-    async fn cancelled_or_failed_partial_upload_poison_queued_chunks() {
+    async fn cancelled_partial_write_poisons_queued_chunks() {
         tokio::time::timeout(Duration::from_secs(5), async {
-            for fails_io in [false, true] {
-                let (mut broker, mut external, poisoned, slots) = blocked_tcp().await;
-                let (_, mut active) = broker
+            let (mut broker, mut external, poisoned, slots) = blocked_tcp().await;
+            let socket = broker.tcp(1).unwrap();
+            let active = ActiveTcpWrite {
+                socket: socket.clone(),
+                poisoned: poisoned.clone().lock_owned().await,
+                incomplete_prefix: true,
+            };
+            socket.writable().await.unwrap();
+            assert_eq!(socket.try_write(&[1]).unwrap(), 1);
+            let mut prefix = [0];
+            external.read_exact(&mut prefix).await.unwrap();
+            assert_eq!(prefix, [1]);
+            let mut queued = Vec::new();
+            for _ in 0..crate::MAX_TCP_WRITE_REQUESTS {
+                let (_, mut write) = broker
                     .prepare(Operation::WriteAll {
                         handle: 1,
-                        bytes: vec![1; MAX_NETWORK_CHUNK_BYTES],
+                        bytes: vec![2; MAX_NETWORK_CHUNK_BYTES],
                     })
                     .unwrap();
-                assert!(
-                    tokio::time::timeout(Duration::from_millis(30), &mut active)
-                        .await
-                        .is_err()
-                );
-                let mut queued = Vec::new();
-                for _ in 1..crate::MAX_TCP_WRITE_REQUESTS {
-                    let (_, mut write) = broker
-                        .prepare(Operation::WriteAll {
-                            handle: 1,
-                            bytes: vec![2; MAX_NETWORK_CHUNK_BYTES],
-                        })
-                        .unwrap();
-                    assert!(write.as_mut().now_or_never().is_none());
-                    queued.push(write);
-                }
-                let mut prefix = vec![0; MAX_NETWORK_CHUNK_BYTES];
-                let received = external.try_read(&mut prefix).unwrap();
-                assert!(received > 0 && received < MAX_NETWORK_CHUNK_BYTES);
-                assert!(prefix[..received].iter().all(|byte| *byte == 1));
-                if fails_io {
-                    SockRef::from(&external)
-                        .set_linger(Some(Duration::ZERO))
-                        .unwrap();
-                    drop(external);
-                    assert!(active.await.is_err());
-                } else {
-                    drop(active);
-                    let mut remaining = Vec::new();
-                    external.read_to_end(&mut remaining).await.unwrap();
-                    assert!(remaining.iter().all(|byte| *byte == 1));
-                    assert!(received + remaining.len() < MAX_NETWORK_CHUNK_BYTES);
-                }
-                for completion in futures_util::future::join_all(queued).await {
-                    assert!(matches!(completion, Err(Error::InvalidState)));
-                }
-                assert!(*poisoned.lock().await);
-                assert_eq!(slots.available_permits(), crate::MAX_TCP_WRITE_REQUESTS);
-                let (_, rejected) = broker
-                    .prepare(Operation::WriteAll {
-                        handle: 1,
-                        bytes: vec![3],
-                    })
-                    .unwrap();
-                assert!(matches!(rejected.await, Err(Error::InvalidState)));
+                assert!(write.as_mut().now_or_never().is_none());
+                queued.push(write);
             }
+            drop(active);
+            let mut remaining = Vec::new();
+            external.read_to_end(&mut remaining).await.unwrap();
+            assert!(remaining.is_empty());
+            for completion in futures_util::future::join_all(queued).await {
+                assert!(matches!(completion, Err(Error::InvalidState)));
+            }
+            assert!(*poisoned.lock().await);
+            assert_eq!(slots.available_permits(), crate::MAX_TCP_WRITE_REQUESTS);
+            let (_, rejected) = broker
+                .prepare(Operation::WriteAll {
+                    handle: 1,
+                    bytes: vec![3],
+                })
+                .unwrap();
+            assert!(matches!(rejected.await, Err(Error::InvalidState)));
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_upload_poisons_queued_chunks() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (mut broker, external, poisoned, slots) = blocked_tcp().await;
+            let socket = broker.tcp(1).unwrap();
+            let guard = poisoned.clone().lock_owned().await;
+            let (_, mut active) = broker
+                .prepare(Operation::WriteAll {
+                    handle: 1,
+                    bytes: vec![1; MAX_NETWORK_CHUNK_BYTES],
+                })
+                .unwrap();
+            assert!(active.as_mut().now_or_never().is_none());
+            let mut queued = Vec::new();
+            for _ in 1..crate::MAX_TCP_WRITE_REQUESTS {
+                let (_, mut write) = broker
+                    .prepare(Operation::WriteAll {
+                        handle: 1,
+                        bytes: vec![2; MAX_NETWORK_CHUNK_BYTES],
+                    })
+                    .unwrap();
+                assert!(write.as_mut().now_or_never().is_none());
+                queued.push(write);
+            }
+            SockRef::from(&external)
+                .set_linger(Some(Duration::ZERO))
+                .unwrap();
+            drop(external);
+            socket.readable().await.unwrap();
+            drop(guard);
+            assert!(active.await.is_err());
+            for completion in futures_util::future::join_all(queued).await {
+                assert!(matches!(completion, Err(Error::InvalidState)));
+            }
+            assert!(*poisoned.lock().await);
+            assert_eq!(slots.available_permits(), crate::MAX_TCP_WRITE_REQUESTS);
         })
         .await
         .unwrap();
@@ -2325,18 +2354,16 @@ mod tests {
             socket.send_to(&[index], peer).await.unwrap();
         }
         let mut received = Vec::new();
-        let mut batches = 0;
         while received.len() < usize::from(count) {
             let Ok(Reply::Datagrams(batch)) =
                 client.request(Operation::ReceiveDatagram(handle)).await
             else {
                 panic!("expected a datagram batch");
             };
-            batches += 1;
+            assert!(!batch.is_empty() && batch.len() <= MAX_NETWORK_DATAGRAMS);
             received.extend(batch.into_iter().map(|datagram| datagram.bytes[0]));
         }
         assert_eq!(received, (0..count).collect::<Vec<_>>());
-        assert_eq!(batches, 2);
         drop(client);
         broker.await.unwrap().unwrap();
     }

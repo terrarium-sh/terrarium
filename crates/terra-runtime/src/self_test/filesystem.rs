@@ -34,7 +34,12 @@ impl Share {
         let ram = GuestRam::new(64 * 1024)
             .ok_or_else(|| wasmtime::Error::msg("filesystem self-test RAM allocation"))?;
         let component = artifacts.fs().deserialize(engine)?;
-        let grant = ShareGrant::new(&directory.canonicalize()?, readonly)?;
+        let grant = ShareGrant::new(&directory.canonicalize()?, readonly).map_err(|error| {
+            wasmtime::Error::from(error).context(format!(
+                "opening filesystem self-test share {}",
+                directory.display()
+            ))
+        })?;
         let host = FsHost::new(DeviceContext::with_ram(ram.clone()), grant);
         let mut runtime = BoxRuntime::new(engine, BoxHost::new())?;
         runtime.initialize_mmio()?;

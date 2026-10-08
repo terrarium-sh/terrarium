@@ -307,10 +307,11 @@ mod tests {
         let _home = crate::sys::TestHome::new();
         let bx = BoxRef::resolve(dir.path(), "dev").unwrap();
         let build = || {
-            std::fs::create_dir_all(bx.get_dir()).unwrap();
+            let log = bx.get_dir().join(state::LOG_FILE);
+            std::fs::create_dir_all(log.parent().unwrap()).unwrap();
             std::fs::write(bx.get_dir().join(state::RECIPE_FILE), "hw:\n  cpus: 1\n").unwrap();
             std::fs::write(bx.get_dir().join(state::ROOTFS_FILE), b"image").unwrap();
-            std::fs::write(bx.get_dir().join(state::LOG_FILE), b"output").unwrap();
+            std::fs::write(log, b"output").unwrap();
         };
 
         let rm = |purge| crate::cli::RmArgs {
