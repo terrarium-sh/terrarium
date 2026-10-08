@@ -120,11 +120,7 @@ impl<'a> Grants<'a> {
                 )
             })?;
             let updated_owner = LocalAllocation(updated.cast());
-            write_acl(
-                &object,
-                updated,
-                (!writable && !was_dacl_protected).then_some(true),
-            )?;
+            write_acl(&object, updated, !writable || was_dacl_protected)?;
             drop(updated_owner);
             self.objects.push(GrantedObject {
                 file: object,
@@ -284,11 +280,11 @@ fn is_dacl_protected(descriptor: &LocalAllocation) -> Result<bool> {
     Ok(control & SE_DACL_PROTECTED != 0)
 }
 
-fn write_acl(object: &File, acl: *mut ACL, dacl_protected: Option<bool>) -> Result<()> {
-    let protection = match dacl_protected {
-        Some(true) => PROTECTED_DACL_SECURITY_INFORMATION,
-        Some(false) => UNPROTECTED_DACL_SECURITY_INFORMATION,
-        None => 0,
+fn write_acl(object: &File, acl: *mut ACL, dacl_protected: bool) -> Result<()> {
+    let protection = if dacl_protected {
+        PROTECTED_DACL_SECURITY_INFORMATION
+    } else {
+        UNPROTECTED_DACL_SECURITY_INFORMATION
     };
     // SAFETY: directory handles use MAXIMUM_ALLOWED to prevent recursive propagation through reparse points.
     // Existing children are visited explicitly; future regular children inherit from the granted directory.
@@ -325,13 +321,17 @@ fn remove_profile_aces(
     dacl_protected: Option<bool>,
     inherited_aces: &[Vec<u8>],
 ) -> Result<()> {
-    let (acl, _descriptor) = read_acl(object)?;
+    let (acl, descriptor) = read_acl(object)?;
     let changed = remove_profile_aces_from_acl(acl, profile)?;
     if dacl_protected == Some(false) {
         remove_converted_inherited_aces(acl, inherited_aces)?;
     }
     if changed || dacl_protected.is_some() {
-        write_acl(object, acl, dacl_protected)?;
+        write_acl(
+            object,
+            acl,
+            dacl_protected.unwrap_or(is_dacl_protected(&descriptor)?),
+        )?;
     }
     Ok(())
 }
@@ -497,6 +497,64 @@ mod tests {
         is_dacl_protected(&descriptor)
     }
 
+    fn read_file_acl_entries(path: &Path) -> Result<Vec<Vec<u8>>> {
+        let object = open_security_object(path)?;
+        let (acl, _descriptor) = read_acl(&object)?;
+        let mut entries = Vec::new();
+        for index in 0..count_acl_entries(acl)? {
+            let mut entry = std::ptr::null_mut();
+            // SAFETY: each index is within the initialized ACL retained by descriptor.
+            api::win_ok(unsafe { GetAce(acl, index, &raw mut entry) })?;
+            ensure!(!entry.is_null(), "Windows returned a null ACL entry");
+            // SAFETY: every ACL entry starts with the fixed ACE header.
+            let header = unsafe { &*entry.cast::<ACE_HEADER>() };
+            let mut bytes = ace_bytes(entry, header)?;
+            bytes[1] = header.AceFlags;
+            entries.push(bytes);
+        }
+        entries.sort_unstable();
+        Ok(entries)
+    }
+
+    /// Writable grants preserve existing ACEs and inheritance modes through handle and path cleanup.
+    #[test]
+    fn writable_grants_restore_inherited_and_protected_dacls() -> Result<()> {
+        for cleanup_by_paths in [false, true] {
+            let directory = tempfile::tempdir()?;
+            let inherited = directory.path().join("inherited");
+            let protected = directory.path().join("protected");
+            std::fs::write(&inherited, b"inherited")?;
+            std::fs::write(&protected, b"protected")?;
+            let protected_object = open_security_object(&protected)?;
+            let (acl, _descriptor) = read_acl(&protected_object)?;
+            write_acl(&protected_object, acl, true)?;
+            let paths = [directory.path(), inherited.as_path(), protected.as_path()];
+            let original_acls = paths
+                .iter()
+                .map(|path| Ok((read_file_acl_entries(path)?, file_dacl_protected(path)?)))
+                .collect::<Result<Vec<_>>>()?;
+
+            let profile = Profile::create(Role::Vm)?;
+            let mut grants = Grants::new(&profile);
+            grants.add(directory.path(), true)?;
+            if cleanup_by_paths {
+                grants.objects.clear();
+            }
+            grants.clear()?;
+
+            for (path, (original_entries, original_protection)) in paths.iter().zip(original_acls) {
+                assert_eq!(
+                    read_file_acl_entries(path)?,
+                    original_entries,
+                    "{}",
+                    path.display()
+                );
+                assert_eq!(file_dacl_protected(path)?, original_protection);
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn readonly_child_grants_restore_inherited_and_protected_dacls() -> Result<()> {
         let directory = tempfile::tempdir()?;
@@ -507,9 +565,9 @@ mod tests {
         let inherited_object = open_security_object(&inherited)?;
         let protected_object = open_security_object(&protected)?;
         let (inherited_acl, _descriptor) = read_acl(&inherited_object)?;
-        write_acl(&inherited_object, inherited_acl, Some(false))?;
+        write_acl(&inherited_object, inherited_acl, false)?;
         let (protected_acl, _descriptor) = read_acl(&protected_object)?;
-        write_acl(&protected_object, protected_acl, Some(true))?;
+        write_acl(&protected_object, protected_acl, true)?;
         let inherited_entries = count_file_acl_entries(&inherited)?;
         let protected_entries = count_file_acl_entries(&protected)?;
 
@@ -536,8 +594,8 @@ mod tests {
             let file = tempfile::NamedTempFile::new()?;
             let object = open_security_object(file.path())?;
             let (acl, _descriptor) = read_acl(&object)?;
-            write_acl(&object, acl, Some(false))?;
-            let original_entries = count_file_acl_entries(file.path())?;
+            write_acl(&object, acl, false)?;
+            let original_entries = read_file_acl_entries(file.path())?;
             let first_profile = Profile::create(Role::Vm)?;
             let second_profile = Profile::create(Role::Vm)?;
             let mut first_grants = Grants::new(&first_profile);
@@ -552,7 +610,7 @@ mod tests {
                 first_grants.clear()?;
             }
             assert!(!file_dacl_protected(file.path())?);
-            assert_eq!(count_file_acl_entries(file.path())?, original_entries);
+            assert_eq!(read_file_acl_entries(file.path())?, original_entries);
         }
         Ok(())
     }

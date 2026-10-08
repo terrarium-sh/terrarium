@@ -46,6 +46,10 @@ buffers. The host validates every range before copying, limits each range to
 16 KiB, each call to 32 ranges and 64 KiB total, and returns one concatenated
 byte sequence. The import grants no address authority beyond `memory.read`.
 
+The filesystem `release-descriptor` import consumes an owned descriptor and waits
+for its host handle to close before retrying directory removal on Windows. It can
+only release a descriptor already held by that component store.
+
 The checked list is exact, including resource destructors and empty imported
 type interfaces. For the individual function names, see the machine-readable
 allowlist. The native linker implementations and their focused negative tests

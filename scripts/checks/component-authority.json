@@ -79,6 +79,7 @@
       "get-mode",
       "get-mode-at",
       "open-metadata-at",
+      "release-descriptor",
       "set-mode",
       "set-mode-at",
       "statfs"
