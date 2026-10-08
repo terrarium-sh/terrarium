@@ -11,8 +11,9 @@ use windows_sys::Win32::Security::Authorization::{
     GetSecurityInfo, SE_FILE_OBJECT, SetEntriesInAclW, SetSecurityInfo,
 };
 use windows_sys::Win32::Security::{
-    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
-    DeleteAce, EqualSid, GetAce, OBJECT_INHERIT_ACE, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
+    CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, DeleteAce, EqualSid, GetAce,
+    GetAclInformation, OBJECT_INHERIT_ACE, TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_APPEND_DATA, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD,
@@ -262,15 +263,29 @@ fn write_acl(object: &File, acl: *mut ACL) -> Result<()> {
     })
 }
 
+fn count_acl_entries(acl: *const ACL) -> Result<u32> {
+    let mut information = ACL_SIZE_INFORMATION::default();
+    // SAFETY: callers retain the descriptor returned by read_acl; information matches the requested class and size.
+    api::win_ok(unsafe {
+        GetAclInformation(
+            acl,
+            (&raw mut information).cast(),
+            u32::try_from(std::mem::size_of::<ACL_SIZE_INFORMATION>())?,
+            AclSizeInformation,
+        )
+    })?;
+    Ok(information.AceCount)
+}
+
 fn remove_profile_aces(object: &File, profile: &Profile) -> Result<()> {
     let (acl, _descriptor) = read_acl(object)?;
-    // SAFETY: GetSecurityInfo initialized the ACL header and owns all ACE bytes.
-    let count = unsafe { (*acl).AceCount };
+    let count = count_acl_entries(acl)?;
     let mut changed = false;
-    for index in (0..u32::from(count)).rev() {
+    for index in (0..count).rev() {
         let mut entry = std::ptr::null_mut();
         // SAFETY: each index is within the initialized ACL; reverse iteration preserves lower indices after deletion.
         api::win_ok(unsafe { GetAce(acl, index, &raw mut entry) })?;
+        ensure!(!entry.is_null(), "Windows returned a null ACL entry");
         // SAFETY: every ACL entry starts with the fixed ACE header.
         let header = unsafe { &*entry.cast::<ACE_HEADER>() };
         if [ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE].contains(&u32::from(header.AceType)) {
@@ -367,11 +382,10 @@ mod tests {
         Ok(())
     }
 
-    fn count_acl_entries(path: &Path) -> Result<u16> {
+    fn count_file_acl_entries(path: &Path) -> Result<u32> {
         let object = open_security_object(path)?;
         let (acl, _descriptor) = read_acl(&object)?;
-        // SAFETY: read_acl returned a valid ACL retained by the descriptor.
-        Ok(unsafe { (*acl).AceCount })
+        count_acl_entries(acl)
     }
 
     /// A file can disappear after the cleanup walk; its surviving siblings still lose their grants.
@@ -382,18 +396,38 @@ mod tests {
         let surviving = directory.path().join("surviving");
         std::fs::write(&deleted, b"deleted")?;
         std::fs::write(&surviving, b"surviving")?;
-        let original_entries = count_acl_entries(&surviving)?;
+        let original_entries = count_file_acl_entries(&surviving)?;
         let profile = Profile::create(Role::Vm)?;
         let mut grants = Grants::new(&profile);
         grants.add(directory.path(), true)?;
-        assert!(count_acl_entries(&surviving)? > original_entries);
+        assert!(count_file_acl_entries(&surviving)? > original_entries);
 
         let paths = vec![deleted.clone(), surviving.clone()];
         grants.objects.clear();
         std::fs::remove_file(&deleted)?;
         remove_grants_from_paths(&paths, &profile)?;
-        assert_eq!(count_acl_entries(&surviving)?, original_entries);
+        assert_eq!(count_file_acl_entries(&surviving)?, original_entries);
         grants.clear()?;
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_removes_allow_and_deny_entries_only_for_its_profile() -> Result<()> {
+        let file = tempfile::NamedTempFile::new()?;
+        let original_entries = count_file_acl_entries(file.path())?;
+        let readonly_profile = Profile::create(Role::Vm)?;
+        let writable_profile = Profile::create(Role::Vm)?;
+        let mut readonly_grants = Grants::new(&readonly_profile);
+        let mut writable_grants = Grants::new(&writable_profile);
+        readonly_grants.add(file.path(), false)?;
+        assert_eq!(count_file_acl_entries(file.path())?, original_entries + 2);
+        writable_grants.add(file.path(), true)?;
+        assert_eq!(count_file_acl_entries(file.path())?, original_entries + 3);
+
+        readonly_grants.clear()?;
+        assert_eq!(count_file_acl_entries(file.path())?, original_entries + 1);
+        writable_grants.clear()?;
+        assert_eq!(count_file_acl_entries(file.path())?, original_entries);
         Ok(())
     }
 
