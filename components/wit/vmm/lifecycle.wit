@@ -1,0 +1,21 @@
+package terra:vmm@0.1.0;
+
+interface lifecycle-platform {
+    variant event {
+        guest-exit(s32),
+        component-failed(string),
+        vcpu-finished,
+        deadline,
+    }
+
+    enum error { closed }
+
+    next-event: async func() -> result<event, error>;
+    shutdown: async func() -> result<_, error>;
+}
+
+interface lifecycle {
+    use lifecycle-platform.{event, error};
+
+    run: async func() -> result<event, error>;
+}

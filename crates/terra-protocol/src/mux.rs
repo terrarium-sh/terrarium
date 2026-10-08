@@ -1,8 +1,5 @@
 //! Shared limits for the agent's Yamux carrier.
 
-/// The one vsock port carrying control, diagnostics, and clients.
-pub const MUX_VSOCK_PORT: u32 = 6000;
-/// Persistent streams opened by the guest before client streams.
 pub const RESERVED_STREAMS: usize = 2;
 pub const CONTROL_STREAM_ID: u32 = 1;
 pub const DIAGNOSTIC_STREAM_ID: u32 = 3;

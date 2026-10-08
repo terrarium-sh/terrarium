@@ -11,14 +11,13 @@ mod bindings {
 
 use bindings::exports::terra::host::device_api::Guest;
 use bindings::{exports, terra, wit_stream};
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use futures::task::AtomicWaker;
+use core::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 use terra::mmio::types::DeviceError;
 use terra_device_transport::{
-    INT_USED_BUFFER, MmioTransport, SPLIT_RING_DESC_F_NEXT, SPLIT_RING_DESC_F_WRITE,
-    SPLIT_RING_DESCRIPTOR_BYTES, SplitRingDescriptor, SplitRingError, complete_split_ring_entry,
-    read_split_ring_available, split_ring_chain,
+    Doorbell, INT_USED_BUFFER, MmioTransport, SPLIT_RING_DESC_F_NEXT, SPLIT_RING_DESC_F_WRITE,
+    SPLIT_RING_DESCRIPTOR_BYTES, SplitRingDescriptor, WriteOutcome, complete_split_ring_entry,
+    publish_interrupt_level, read_split_ring_available, split_ring_chain,
 };
 
 mod mmio;
@@ -141,31 +140,9 @@ async fn execute_discard(data: &[Range], capacity: u64) -> Result<(), u8> {
         .map_err(|_| STATUS_IOERR)
 }
 
-static CLOSED: AtomicBool = AtomicBool::new(false);
 static EPOCH: AtomicU64 = AtomicU64::new(0);
-static QUEUE_PENDING: AtomicBool = AtomicBool::new(false);
-static QUEUE_WAKER: AtomicWaker = AtomicWaker::new();
+static QUEUES: Doorbell = Doorbell::new();
 static RESET_GATE: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
-fn wake_queue_worker() {
-    QUEUE_PENDING.store(true, Ordering::Release);
-    QUEUE_WAKER.wake();
-}
-
-async fn wait_for_queue_work() {
-    std::future::poll_fn(|context| {
-        if QUEUE_PENDING.swap(false, Ordering::AcqRel) {
-            return std::task::Poll::Ready(());
-        }
-        QUEUE_WAKER.register(context.waker());
-        if QUEUE_PENDING.swap(false, Ordering::AcqRel) {
-            std::task::Poll::Ready(())
-        } else {
-            std::task::Poll::Pending
-        }
-    })
-    .await;
-}
 
 struct TransportState {
     transport: MmioTransport,
@@ -174,12 +151,6 @@ struct TransportState {
 
 static TRANSPORT: LazyLock<Mutex<Option<TransportState>>> = LazyLock::new(|| Mutex::new(None));
 
-fn publish_interrupt_level(level: bool) {
-    if cfg!(target_arch = "wasm32") {
-        terra::host::interrupt::set_level(level);
-    }
-}
-
 fn transport<T>(
     f: impl FnOnce(&mut TransportState) -> Result<T, DeviceError>,
 ) -> Result<T, DeviceError> {
@@ -187,14 +158,12 @@ fn transport<T>(
     let state = state.as_mut().ok_or(DeviceError::NotReady)?;
     let result = f(state);
     if let Some(level) = state.transport.take_irq() {
-        publish_interrupt_level(level);
+        publish_interrupt_level(level, terra::host::interrupt::set_level);
     }
     result
 }
 
-fn device_error(error: terra_device_transport::MmioError) -> DeviceError {
-    terra_device_transport::device_error!(error, DeviceError)
-}
+terra_device_transport::device_error!(DeviceError);
 
 fn sector_start(sector: u64, total: u64, capacity: u64) -> Option<u64> {
     let start = sector.checked_mul(SECTOR_BYTES)?;
@@ -224,7 +193,7 @@ fn read_write_payload(data: &[Range], total_len: usize) -> Option<Vec<u8>> {
 }
 
 fn is_current(epoch: u64) -> bool {
-    !CLOSED.load(Ordering::Acquire) && epoch == EPOCH.load(Ordering::Acquire)
+    !QUEUES.is_closed() && epoch == EPOCH.load(Ordering::Acquire)
 }
 
 fn write_status(status_addr: u64, status: u8, epoch: u64) -> Option<u8> {
@@ -234,7 +203,6 @@ fn write_status(status_addr: u64, status: u8, epoch: u64) -> Option<u8> {
     if !is_current(epoch) || terra::host::memory::write(status_addr, &[status]).is_err() {
         return None;
     }
-    terra::host::interrupt::signal();
     Some(status)
 }
 
@@ -246,6 +214,26 @@ fn write_guest(addr: u64, data: &[u8], epoch: u64) -> Result<(), DeviceError> {
         return Err(DeviceError::NotReady);
     }
     terra::host::memory::write(addr, data).map_err(|_| DeviceError::BadLen)
+}
+
+fn write_guest_ranges(ranges: &[Range], mut bytes: &[u8], epoch: u64) -> Result<(), DeviceError> {
+    let mut writes = Vec::with_capacity(ranges.len());
+    for range in ranges.iter().filter(|range| range.len != 0) {
+        let len = usize::try_from(range.len).map_err(|_| DeviceError::TooLarge)?;
+        let (chunk, rest) = bytes.split_at_checked(len).ok_or(DeviceError::BadLen)?;
+        writes.push(terra::host::memory::WriteRange {
+            offset: range.addr,
+            data: chunk.to_vec(),
+        });
+        bytes = rest;
+    }
+    let _gate = RESET_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !is_current(epoch) {
+        return Err(DeviceError::NotReady);
+    }
+    terra::host::memory::write_ranges(&writes).map_err(|_| DeviceError::BadLen)
 }
 
 fn request_type(header: &SplitRingDescriptor) -> Result<(u32, u64), DeviceError> {
@@ -264,16 +252,12 @@ fn ioerr_completion(status_addr: u64, epoch: u64) -> Result<u32, DeviceError> {
     Ok(1)
 }
 
-fn malformed_chain<F>(
+fn malformed_chain(
     status_addr: Option<u64>,
     epoch: u64,
     error: DeviceError,
-    complete: F,
-) -> Result<u32, DeviceError>
-where
-    F: FnOnce(u64, u64) -> Result<u32, DeviceError>,
-{
-    status_addr.map_or(Err(error), |addr| complete(addr, epoch))
+) -> Result<u32, DeviceError> {
+    status_addr.map_or(Err(error), |addr| ioerr_completion(addr, epoch))
 }
 
 fn status_tail(chain: &[SplitRingDescriptor]) -> Option<u64> {
@@ -282,16 +266,6 @@ fn status_tail(chain: &[SplitRingDescriptor]) -> Option<u64> {
         .flatten()
         .filter(|status| status.len == 1 && status.flags & SPLIT_RING_DESC_F_WRITE != 0)
         .map(|status| status.addr)
-}
-
-fn ring_addr(base: u64, header: u64, index: u64, entry_size: u64) -> Result<u64, DeviceError> {
-    base.checked_add(header)
-        .and_then(|addr| {
-            index
-                .checked_mul(entry_size)
-                .and_then(|offset| addr.checked_add(offset))
-        })
-        .ok_or(DeviceError::BadLen)
 }
 
 struct Range {
@@ -312,18 +286,16 @@ impl exports::terra::mmio::device::Guest for Block {
 impl Guest for Block {
     #[allow(clippy::unused_async_trait_impl)]
     async fn configure(readonly: bool) -> Result<(), DeviceError> {
-        if CLOSED.load(Ordering::Acquire) {
+        if QUEUES.is_closed() {
             return Err(DeviceError::NotReady);
         }
         EPOCH.fetch_add(1, Ordering::AcqRel);
-        QUEUE_PENDING.store(false, Ordering::Release);
+        QUEUES.clear();
         let capacity = terra::host::disk::capacity();
         let (features, config) = build_block_configuration(capacity, readonly)?;
-        publish_interrupt_level(false);
+        publish_interrupt_level(false, terra::host::interrupt::set_level);
         *TRANSPORT.lock().map_err(|_| DeviceError::Io)? = Some(TransportState {
             transport: MmioTransport::new(
-                0,
-                0x200,
                 terra::host::memory::address_limit(),
                 2,
                 features,
@@ -336,9 +308,9 @@ impl Guest for Block {
     }
 
     async fn run() -> Result<(), DeviceError> {
-        while !CLOSED.load(Ordering::Acquire) {
-            wait_for_queue_work().await;
-            if CLOSED.load(Ordering::Acquire) {
+        while !QUEUES.is_closed() {
+            QUEUES.wait().await;
+            if QUEUES.is_closed() {
                 break;
             }
             while process_pending().await? {
@@ -354,21 +326,12 @@ impl Block {
         req_type: u32,
         sector: u64,
         data: Vec<Range>,
+        total: u64,
         status_addr: u64,
         epoch: u64,
     ) -> u8 {
-        if !is_current(epoch) || data.len() > MAX_RANGES {
+        if !is_current(epoch) {
             return STATUS_IOERR;
-        }
-        let mut total: u64 = 0;
-        for range in &data {
-            if range.len > MAX_SINGLE {
-                return STATUS_IOERR;
-            }
-            total = match total.checked_add(range.len) {
-                Some(total) if total <= MAX_TOTAL => total,
-                _ => return STATUS_IOERR,
-            };
         }
         let capacity = terra::host::disk::capacity();
         let fail = || write_status(status_addr, STATUS_IOERR, epoch).unwrap_or(STATUS_IOERR);
@@ -383,21 +346,8 @@ impl Block {
                 if bytes.len() as u64 != total {
                     return fail();
                 }
-                let mut remaining = bytes.as_slice();
-                for range in &data {
-                    if range.len == 0 {
-                        continue;
-                    }
-                    let Ok(len) = usize::try_from(range.len) else {
-                        return fail();
-                    };
-                    let Some((chunk, rest)) = remaining.split_at_checked(len) else {
-                        return fail();
-                    };
-                    if write_guest(range.addr, chunk, epoch).is_err() {
-                        return fail();
-                    }
-                    remaining = rest;
+                if write_guest_ranges(&data, &bytes, epoch).is_err() {
+                    return fail();
                 }
                 write_status(status_addr, STATUS_OK, epoch).unwrap_or(STATUS_IOERR)
             }
@@ -477,15 +427,12 @@ impl Block {
             MAX_RANGES + 2,
             SPLIT_RING_DESC_F_NEXT | SPLIT_RING_DESC_F_WRITE,
         )
-        .map_err(|error| match error {
-            SplitRingError::BadDescriptor => DeviceError::BadLen,
-            SplitRingError::ChainTooLong => DeviceError::TooLarge,
-        })?;
+        .map_err(DeviceError::from)?;
         let status_addr = status_tail(&chain);
         let header = chain.first().ok_or(DeviceError::BadLen)?;
         let (req_type, sector) = match request_type(header) {
             Ok(request) => request,
-            Err(error) => return malformed_chain(status_addr, epoch, error, ioerr_completion),
+            Err(error) => return malformed_chain(status_addr, epoch, error),
         };
         if chain.len() < 2 {
             return Err(DeviceError::BadLen);
@@ -499,7 +446,7 @@ impl Block {
                     return Err(DeviceError::BadLen);
                 }
                 terra::host::memory::read(desc.addr, 1).map_err(|_| DeviceError::BadLen)?;
-                let status = Self::execute(req_type, sector, data, desc.addr, epoch).await;
+                let status = Self::execute(req_type, sector, data, total, desc.addr, epoch).await;
                 if !is_current(epoch) {
                     return Err(DeviceError::NotReady);
                 }
@@ -515,79 +462,60 @@ impl Block {
             if (desc.flags & SPLIT_RING_DESC_F_WRITE != 0) != writable_data
                 || u64::from(desc.len) > MAX_SINGLE
             {
-                return malformed_chain(status_addr, epoch, DeviceError::BadLen, ioerr_completion);
+                return malformed_chain(status_addr, epoch, DeviceError::BadLen);
             }
             total = match total.checked_add(u64::from(desc.len)) {
                 Some(total) => total,
                 None => {
-                    return malformed_chain(
-                        status_addr,
-                        epoch,
-                        DeviceError::TooLarge,
-                        ioerr_completion,
-                    );
+                    return malformed_chain(status_addr, epoch, DeviceError::TooLarge);
                 }
             };
             if total > MAX_TOTAL {
-                return malformed_chain(
-                    status_addr,
-                    epoch,
-                    DeviceError::TooLarge,
-                    ioerr_completion,
-                );
+                return malformed_chain(status_addr, epoch, DeviceError::TooLarge);
             }
             data.push(Range {
                 addr: desc.addr,
                 len: u64::from(desc.len),
             });
         }
-        malformed_chain(status_addr, epoch, DeviceError::TooLarge, ioerr_completion)
+        malformed_chain(status_addr, epoch, DeviceError::TooLarge)
     }
 }
 
 impl Block {
-    fn mmio_read(addr: u64, len: u32) -> Result<Vec<u8>, DeviceError> {
-        transport(|state| {
-            state
-                .transport
-                .read(addr, usize::try_from(len).map_err(|_| DeviceError::BadLen)?)
-                .map_err(device_error)
-        })
+    fn mmio_read(addr: u64, width: u8) -> Result<u64, DeviceError> {
+        transport(|state| state.transport.read(addr, width).map_err(DeviceError::from))
     }
 
     #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
-    async fn mmio_write(addr: u64, data: Vec<u8>) -> Result<bool, DeviceError> {
+    async fn mmio_write(addr: u64, width: u8, value: u64) -> Result<(), DeviceError> {
         let _gate = RESET_GATE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (bell, reset) = transport(|state| {
-            let generation = state.transport.reset_generation();
-            let bell = state.transport.write(addr, &data).map_err(device_error)?;
-            let reset = generation != state.transport.reset_generation();
-            if reset {
+        let outcome = transport(|state| {
+            let outcome = state
+                .transport
+                .write(addr, width, value)
+                .map_err(DeviceError::from)?;
+            if outcome == WriteOutcome::Reset {
                 state.avail = 0;
             }
-            Ok((bell, reset))
+            Ok(outcome)
         })?;
-        if reset {
-            EPOCH.fetch_add(1, Ordering::AcqRel);
-            QUEUE_PENDING.store(false, Ordering::Release);
+        match outcome {
+            WriteOutcome::None => {}
+            WriteOutcome::QueueNotify(_) => QUEUES.ring(1),
+            WriteOutcome::Reset => {
+                EPOCH.fetch_add(1, Ordering::AcqRel);
+                QUEUES.clear();
+            }
         }
-        if bell.is_some() {
-            wake_queue_worker();
-        }
-        Ok(false)
+        Ok(())
     }
 
     fn interrupt_level() -> bool {
-        transport(|state| {
-            state
-                .transport
-                .read(0x060, 4)
-                .map(|status| u32::from_le_bytes(status.try_into().unwrap_or([0; 4])) & 1 != 0)
-                .map_err(device_error)
-        })
-        .unwrap_or(false)
+        transport(|state| Ok(state.transport.interrupt_status() & INT_USED_BUFFER != 0))
+            .unwrap_or(false)
     }
 
     fn reset() {
@@ -595,27 +523,26 @@ impl Block {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         EPOCH.fetch_add(1, Ordering::AcqRel);
-        QUEUE_PENDING.store(false, Ordering::Release);
+        QUEUES.clear();
         let _ = transport(|state| {
             state
                 .transport
-                .write(0x070, &[0; 4])
-                .map_err(device_error)?;
+                .write(0x070, 4, 0)
+                .map_err(DeviceError::from)?;
             state.avail = 0;
             Ok(())
         });
     }
 
     async fn close() -> Result<(), DeviceError> {
-        CLOSED.store(true, Ordering::Release);
+        QUEUES.close();
         Self::reset();
-        wake_queue_worker();
         terra::host::disk::sync().await.map_err(|_| DeviceError::Io)
     }
 }
 
 async fn process_pending() -> Result<bool, DeviceError> {
-    if CLOSED.load(Ordering::Acquire) {
+    if QUEUES.is_closed() {
         return Ok(false);
     }
     let epoch = EPOCH.load(Ordering::Acquire);
@@ -634,13 +561,7 @@ async fn process_pending() -> Result<bool, DeviceError> {
         avail,
         core::num::NonZeroU16::new(size).ok_or(DeviceError::BadLen)?,
         &mut next,
-        |base, offset| ring_addr(base, offset, 0, 0),
-        |address| {
-            let bytes = terra::host::memory::read(address, 2).map_err(|_| DeviceError::BadLen)?;
-            Ok(u16::from_le_bytes(
-                bytes.try_into().map_err(|_| DeviceError::BadLen)?,
-            ))
-        },
+        |address, len| terra::host::memory::read(address, len).map_err(|_| DeviceError::BadLen),
     )?;
     let Some(head) = head else {
         let _gate = RESET_GATE
@@ -672,19 +593,12 @@ async fn process_pending() -> Result<bool, DeviceError> {
         core::num::NonZeroU16::new(size).ok_or(DeviceError::BadLen)?,
         head,
         used_len,
-        |base, offset| ring_addr(base, offset, 0, 0),
-        |address| {
-            let bytes = terra::host::memory::read(address, 2).map_err(|_| DeviceError::BadLen)?;
-            Ok(u16::from_le_bytes(
-                bytes.try_into().map_err(|_| DeviceError::BadLen)?,
-            ))
-        },
+        |address, len| terra::host::memory::read(address, len).map_err(|_| DeviceError::BadLen),
         |address, bytes| {
             terra::host::memory::write(address, bytes).map_err(|_| DeviceError::BadLen)
         },
     )?;
     next = next.wrapping_add(1);
-    terra::host::interrupt::signal();
     match transport(|state| {
         if !is_current(epoch) {
             return Err(DeviceError::NotReady);
@@ -784,13 +698,7 @@ mod tests {
     }
 
     #[test]
-    fn ring_addresses_reject_overflow() {
-        assert_eq!(ring_addr(u64::MAX, 2, 0, 0), Err(DeviceError::BadLen));
-        assert_eq!(ring_addr(u64::MAX - 3, 4, 0, 0), Err(DeviceError::BadLen));
-    }
-
-    #[test]
-    fn malformed_request_completes_through_a_valid_status_tail() {
+    fn malformed_request_retains_a_valid_status_tail() {
         let header = SplitRingDescriptor {
             addr: 0,
             len: 0,
@@ -803,17 +711,7 @@ mod tests {
             flags: SPLIT_RING_DESC_F_WRITE,
             next: 0,
         };
-        let used_len = malformed_chain(
-            status_tail(&[header, status]),
-            7,
-            DeviceError::BadLen,
-            |status_addr, epoch| {
-                assert_eq!((status_addr, epoch), (0x1000, 7));
-                Ok(1)
-            },
-        )
-        .unwrap();
-        assert_eq!(used_len, 1);
+        assert_eq!(status_tail(&[header, status]), Some(0x1000));
         assert_eq!(status_tail(&[status]), None);
     }
 }

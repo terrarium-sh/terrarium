@@ -1,0 +1,23 @@
+[package]
+name = "terra-agent-component"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+fuzzing = []
+
+[dependencies]
+terra-device-transport = { path = "../device-transport" }
+terra-protocol = { path = "../../crates/terra-protocol", features = ["mux"] }
+wit-bindgen = { workspace = true, features = ["async-spawn", "inter-task-wakeup"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "io", "sink"] }
+futures-channel = "0.3"
+futures-io = "0.3"
+yamux = "=0.14.1"
+serde = "1"

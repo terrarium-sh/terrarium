@@ -84,9 +84,7 @@ fn prepare_foreground(
         }
         Phase::Enforce { policy } => {
             command.env("TERRA_SECCOMP_ENFORCED", "1");
-            let path = stage.join("policy.bpf");
-            std::fs::write(&path, policy)?;
-            ("enforce", Some(path))
+            ("enforce", Some(policy.to_path_buf()))
         }
         Phase::Validate { name, .. } => anyhow::bail!("unknown foreground validation: {name}"),
     };
@@ -95,7 +93,10 @@ fn prepare_foreground(
     command
         .env("TERRA_SECCOMP_CONFIG", config)
         .env("TERRA_WORKLOAD_RUN_ID", stage.join(mode));
-    Ok(command)
+    match phase {
+        Phase::Collect { traces } => policy::trace_command(&command, &traces.join("workload.json")),
+        Phase::Enforce { .. } | Phase::Validate { .. } => Ok(command),
+    }
 }
 
 fn foreground_arguments(args: &BootArgs, bx: &BoxRef) -> Vec<OsString> {
@@ -121,6 +122,7 @@ fn foreground_arguments(args: &BootArgs, bx: &BoxRef) -> Vec<OsString> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sandbox::config::{LauncherConfig, load_from};
     use clap::Parser as _;
 
     #[test]
@@ -151,13 +153,12 @@ mod tests {
         assert_eq!(forwarded.boot.agent.agent_timeout, Some(42));
         assert!(!forwarded.boot.policy.generate_policy);
         assert_eq!(forwarded.boot.command, cli.boot.command);
+        let candidate = root.path().join("candidate");
         for phase in [
             Phase::Collect {
                 traces: root.path(),
             },
-            Phase::Enforce {
-                policy: b"raw policy",
-            },
+            Phase::Enforce { policy: &candidate },
         ] {
             let command = prepare_foreground(
                 Path::new("/terra"),
@@ -166,18 +167,26 @@ mod tests {
                 root.path(),
                 phase,
             )?;
-            assert_eq!(command.get_args().collect::<Vec<_>>(), arguments);
+            let forwarded = command.get_args().collect::<Vec<_>>();
+            match phase {
+                Phase::Collect { .. } => assert_eq!(&forwarded[4..], arguments),
+                Phase::Enforce { .. } | Phase::Validate { .. } => assert_eq!(forwarded, arguments),
+            }
             assert_eq!(command.get_current_dir(), Some(root.path()));
         }
         assert_eq!(
-            std::fs::read(root.path().join("policy.bpf"))?,
-            b"raw policy"
+            load_from(&root.path().join("collect.json"))?,
+            LauncherConfig::Sandboxed {
+                policy: None,
+                allow_fallback: true,
+            }
         );
-        let config: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(root.path().join("enforce.json"))?)?;
         assert_eq!(
-            config["vm"]["bwrap"]["policy"],
-            root.path().join("policy.bpf").to_str().unwrap()
+            load_from(&root.path().join("enforce.json"))?,
+            LauncherConfig::Sandboxed {
+                policy: Some(candidate),
+                allow_fallback: false,
+            }
         );
         Ok(())
     }

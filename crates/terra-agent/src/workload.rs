@@ -27,15 +27,21 @@ pub(super) async fn execute(
     clients: tokio::sync::mpsc::Receiver<File>,
 ) -> Result<i32> {
     restrict_ptrace();
-    config::configure_network(&plan.net, stop).await?;
+    config::enable_loopback()?;
+    crate::network::start(plan, shutdown, tasks, diagnostic).await?;
+    diagnostic.record_boot_stage("networking_ready");
     crate::sync::ensure_directory(Path::new(terra_protocol::WORKLOAD_HOME), true)
         .with_context(|| format!("creating home {}", terra_protocol::WORKLOAD_HOME))?;
     if plan.mode == PlanMode::Create {
-        let startup = crate::vsock::StartupGate::new();
+        let startup = crate::channel::StartupGate::new();
         let SessionPty { session, .. } =
             start_session(plan, clients, startup, stop, shutdown, tasks).await?;
         crate::report_agent_ready(control).await?;
+        diagnostic.record_boot_stage("hooks_start");
         let outcome = bake_if_stale(&plan.on_create, diagnostic, &session, stop).await;
+        if outcome.is_ok() {
+            diagnostic.record_boot_stage("workload_ready");
+        }
         session.broadcast_exit(i32::from(outcome.is_err())).await;
         return outcome.map(|()| 0);
     }
@@ -44,7 +50,7 @@ pub(super) async fn execute(
     fs::write("/terra/README.md", &plan.sandbox_info).context("writing sandbox description")?;
     config::configure_user(plan.root, stop).await?;
     config::configure_sudo(plan.root, &plan.sudo)?;
-    let startup = crate::vsock::StartupGate::new();
+    let startup = crate::channel::StartupGate::new();
     let SessionPty {
         session,
         pts,
@@ -56,6 +62,7 @@ pub(super) async fn execute(
             .feed_output(b"terra: running startup hooks\r\n")
             .await;
     }
+    diagnostic.record_boot_stage("hooks_start");
     for line in &plan.on_start {
         if let Err(error) = hooks::run(line, Some(HOOK_TIMEOUT), None, Some(&session), stop).await {
             return Err(fail_startup(&startup, &session, error).await);
@@ -76,7 +83,7 @@ pub(super) async fn execute(
     }
     startup.ready();
     let mut drained = drained;
-    let (code, daemons) = run_workload(plan, pts, &mut drained, stop, shutdown, tasks)
+    let (code, daemons) = run_workload(plan, pts, &mut drained, diagnostic, stop, shutdown, tasks)
         .await
         .context("running the workload")?;
     if !plan.pre_stop.is_empty() {
@@ -99,7 +106,7 @@ pub(super) async fn execute(
 }
 
 async fn fail_startup(
-    startup: &crate::vsock::StartupGate,
+    startup: &crate::channel::StartupGate,
     session: &crate::term::session::Session,
     error: anyhow::Error,
 ) -> anyhow::Error {
@@ -141,7 +148,7 @@ fn restrict_ptrace() {
 async fn start_session(
     plan: &Plan,
     clients: tokio::sync::mpsc::Receiver<File>,
-    startup: crate::vsock::StartupGate,
+    startup: crate::channel::StartupGate,
     stop: &CancellationToken,
     shutdown: &CancellationToken,
     tasks: &TaskTracker,
@@ -161,7 +168,7 @@ async fn start_session(
     } else {
         (None, None)
     };
-    tasks.spawn(crate::vsock::serve_clients(
+    tasks.spawn(crate::channel::serve_clients(
         session.clone(),
         clients,
         plan.root,
@@ -205,6 +212,7 @@ async fn run_workload(
     plan: &Plan,
     pts: Pts,
     drained: &mut tokio::sync::oneshot::Receiver<()>,
+    diagnostic: &Diagnostics,
     stop: &CancellationToken,
     shutdown: &CancellationToken,
     tasks: &TaskTracker,
@@ -237,6 +245,7 @@ async fn run_workload(
             return Err(error.into());
         }
     };
+    diagnostic.record_boot_stage("workload_ready");
     let code = tokio::select! {
         code = crate::exec::wait_for_exit_code(&child_pidfd) => code,
         () = stop.cancelled() => {

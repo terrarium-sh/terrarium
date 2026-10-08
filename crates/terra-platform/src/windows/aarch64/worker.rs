@@ -122,23 +122,12 @@ fn arm_mmio(
     pc: u64,
     syndrome: u64,
 ) -> Result<(), String> {
-    let mut action = handler.exchange(VcpuExit::ArmException(ArmException {
-        address: gpa,
-        syndrome,
-    }))?;
-    while let VcpuAction::ArmRegister(register) = action {
-        if register > 31 {
-            return Err("ARM register outside vCPU grant".to_owned());
-        }
-        let value = if register == 31 {
-            0
-        } else {
-            partition
-                .register_u64(vcpu, arm_general_register(register)?)
-                .map_err(|error| error.to_string())?
-        };
-        action = handler.exchange(VcpuExit::ArmRegisterValue(value))?;
-    }
+    let exception = ArmException::capture(gpa, syndrome, |register| {
+        partition
+            .register_u64(vcpu, arm_general_register(register)?)
+            .map_err(|error| error.to_string())
+    })?;
+    let action = handler.exchange(VcpuExit::ArmException(exception))?;
     let pc = pc.checked_add(4).ok_or("ARM PC overflow")?;
     match action {
         VcpuAction::ArmRead(ArmRead { register, value }) => {
@@ -156,7 +145,6 @@ fn arm_mmio(
         | VcpuAction::Rdmsr(_)
         | VcpuAction::MsrFault
         | VcpuAction::Wrmsr
-        | VcpuAction::ArmRegister(_)
         | VcpuAction::IoApicValue(_)
         | VcpuAction::HvcReturn(_)
         | VcpuAction::CpuStart(_)
@@ -211,16 +199,13 @@ mod tests {
 
     impl VcpuHandler for MmioSentinel {
         fn exchange(&mut self, exit: VcpuExit) -> Result<VcpuAction, String> {
-            if let VcpuExit::ArmException(exception) = exit {
-                assert_eq!(exception.address, 0x1000_0000);
-                assert_eq!(exception.syndrome >> 26, 0x24);
-                assert_ne!(exception.syndrome & (1 << 6), 0);
-                let register = u8::try_from((exception.syndrome >> 16) & 31).unwrap();
-                return Ok(VcpuAction::ArmRegister(register));
-            }
-            let VcpuExit::ArmRegisterValue(value) = exit else {
+            let VcpuExit::ArmException(exception) = exit else {
                 return Err(format!("unexpected sentinel exit {exit:?}"));
             };
+            assert_eq!(exception.address, 0x1000_0000);
+            assert_eq!(exception.syndrome >> 26, 0x24);
+            assert_ne!(exception.syndrome & (1 << 6), 0);
+            let value = exception.write_value.expect("MMIO source register");
             self.writes.send((self.vcpu, value)).unwrap();
             Ok(VcpuAction::ArmRead(ArmRead {
                 register: None,

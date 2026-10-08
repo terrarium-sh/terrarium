@@ -1,41 +1,241 @@
-use std::io::{Read as _, Write as _};
-use std::path::Path;
+//! Exercise virtio-vsock descriptors, local-only routing, and physical reset.
+
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use terra_platform::io::local::{LocalListener, LocalStream};
+use terra_protocol::vsock::{AGENT_PORT, CONTROL_PORT, GUEST_CID, HOST_CID, UDP_PORT};
 
+use crate::TrustedArtifacts;
 use crate::box_runtime::{BoxHost, BoxRuntime};
-use crate::component::vsock::VsockChannel;
+use crate::component::MmioDevice;
+use crate::component::vsock::streams::{FrontendStreams, StreamEndpoint};
 use crate::memory::GuestRam;
 
 use super::{read_memory, write_memory};
 
+const WAIT: Duration = Duration::from_secs(5);
+const HEADER_BYTES: usize = 44;
 const QUEUE_SIZE: u16 = 16;
-const RX_DESC: u64 = 0x1000;
-const RX_AVAIL: u64 = 0x2000;
-const RX_USED: u64 = 0x3000;
-const RX_DATA: u64 = 0x4000;
-const TX_DESC: u64 = 0x1_5000;
-const TX_AVAIL: u64 = 0x1_6000;
-const TX_USED: u64 = 0x1_7000;
-const TX_DATA: u64 = 0x1_8000;
-const PACKET_BYTES: u32 = 4096;
-const VSOCK_HEADER_BYTES: usize = 44;
-const YAMUX_HEADER_BYTES: usize = 12;
-const GUEST_PORT: u32 = 7000;
+const RECEIVE_DESCRIPTOR: u64 = 0x1000;
+const RECEIVE_AVAILABLE: u64 = 0x2000;
+const RECEIVE_USED: u64 = 0x3000;
+const TRANSMIT_DESCRIPTOR: u64 = 0x5000;
+const TRANSMIT_AVAILABLE: u64 = 0x6000;
+const TRANSMIT_USED: u64 = 0x7000;
+const TRANSMIT_HEADER: u64 = 0x8000;
+const TRANSMIT_PAYLOAD: u64 = 0x9000;
+const RECEIVE_DATA: u64 = 0x20000;
+const RECEIVE_BYTES: u32 = 512;
 
-struct GuestTransport {
-    channel: VsockChannel,
+pub(super) async fn run(
+    artifacts: &TrustedArtifacts,
+    engine: &wasmtime::Engine,
+) -> wasmtime::Result<()> {
+    let ram = GuestRam::new(2 * 1024 * 1024)
+        .ok_or_else(|| wasmtime::Error::msg("vsock self-test RAM allocation"))?;
+    let mut runtime = BoxRuntime::new(engine, BoxHost::new())?;
+    runtime.initialize_mmio()?;
+    let (streams, mut agent) = FrontendStreams::new();
+    let (interrupt, events) = create_interrupt();
+    let device = crate::component::vsock::register_device(
+        &mut runtime,
+        ram.clone(),
+        artifacts.vsock(),
+        streams,
+        None,
+        Vec::new(),
+        interrupt,
+    )?;
+    let running = runtime.prepare().await?.start();
+    let mut guest = GuestVsock::new(device.clone(), ram, events);
+    let exercised = async {
+        guest.configure()?;
+        for (source, destination) in [
+            (AGENT_PORT, CONTROL_PORT),
+            (CONTROL_PORT, AGENT_PORT),
+            (7000, 7000),
+            (CONTROL_PORT, CONTROL_PORT),
+            (7000, terra_protocol::vsock::TCP_PORT),
+            (7001, UDP_PORT),
+        ] {
+            guest.send(source, destination, 1, 0, &[]).await?;
+        }
+        guest.send(AGENT_PORT, AGENT_PORT, 1, 65536, &[]).await?;
+        let generation = wait_connected(&mut agent)
+            .await
+            .map_err(|error| error.context("initial agent transport admission"))?;
+        let replies = guest.receive()?;
+        wasmtime::ensure!(
+            replies.iter().filter(|reply| reply.op == 3).count() >= 6,
+            "local-only vsock rejects network and cross-endpoint tuples"
+        );
+        for bytes in [b"split-".as_slice(), b"agent-request"] {
+            guest.send(AGENT_PORT, AGENT_PORT, 5, 65536, bytes).await?;
+        }
+        wasmtime::ensure!(
+            read_stream(&mut agent, generation, 19)
+                .await
+                .map_err(|error| error.context("fragmented agent input"))?
+                == b"split-agent-request",
+            "vsock preserves fragmented agent bytes"
+        );
+        let payload = vec![91; 5000];
+        agent
+            .try_write(generation, &payload)
+            .map_err(stream_error)?;
+        wasmtime::ensure!(
+            guest
+                .read_payload(AGENT_PORT, payload.len())
+                .await
+                .map_err(|error| error.context("agent output through small receive descriptors"))?
+                == payload,
+            "small receive descriptors preserve partially delivered vsock payloads"
+        );
+        exercise_ready_receive_without_notification(&mut guest, &mut agent, generation).await?;
+        guest.device.write(0x70, &0_u32.to_le_bytes())?;
+        wait_disconnected(&mut agent)
+            .await
+            .map_err(|error| error.context("agent retirement after physical reset"))?;
+        wasmtime::ensure!(
+            agent.try_write(generation, &[1]).is_err(),
+            "physical reset rejects retired agent generation"
+        );
+        guest.configure()?;
+        guest.send(AGENT_PORT, AGENT_PORT, 1, 65536, &[]).await?;
+        let replacement = wait_connected(&mut agent)
+            .await
+            .map_err(|error| error.context("agent admission after physical reset"))?;
+        wasmtime::ensure!(
+            replacement > generation,
+            "physical reset admits a fresh agent generation"
+        );
+        exercise_stream_half_closes(&mut guest, &mut agent, replacement).await?;
+        Ok(())
+    }
+    .await;
+    let closed = device.close_async().await;
+    let joined = running.join().await;
+    exercised?;
+    closed?;
+    joined
+}
+
+async fn exercise_stream_half_closes(
+    guest: &mut GuestVsock,
+    agent: &mut StreamEndpoint,
+    generation: u64,
+) -> wasmtime::Result<()> {
+    guest
+        .send_with_flags(AGENT_PORT, AGENT_PORT, 4, 1, 65536, &[])
+        .await?;
+    tokio::time::timeout(WAIT, async {
+        while agent.try_write(generation, &[]).is_ok() {
+            agent.wait().await;
+        }
+    })
+    .await?;
+    guest
+        .send(AGENT_PORT, AGENT_PORT, 5, 65536, b"half-open")
+        .await?;
+    wasmtime::ensure!(
+        read_stream(agent, generation, 9).await? == b"half-open",
+        "dropping frontend output preserves guest input"
+    );
+    guest
+        .send_with_flags(AGENT_PORT, AGENT_PORT, 4, 2, 65536, &[])
+        .await?;
+    wait_disconnected(agent).await?;
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if guest
+                .receive()?
+                .iter()
+                .any(|packet| packet.port == AGENT_PORT && packet.op == 3)
+            {
+                return Ok::<(), wasmtime::Error>(());
+            }
+            guest.wait_for_receive_work().await?;
+        }
+    })
+    .await??;
+    guest.set_receive_window(AGENT_PORT, AGENT_PORT, 0);
+    guest.send(AGENT_PORT, AGENT_PORT, 1, 0, &[]).await?;
+    let generation = wait_connected(agent).await?;
+    agent.close(generation);
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if guest
+                .receive()?
+                .iter()
+                .any(|packet| packet.port == AGENT_PORT && packet.op == 4 && packet.flags & 2 != 0)
+            {
+                return Ok::<(), wasmtime::Error>(());
+            }
+            guest.wait_for_receive_work().await?;
+        }
+    })
+    .await??;
+    guest
+        .send(AGENT_PORT, AGENT_PORT, 5, 0, b"after-eof")
+        .await?;
+    wasmtime::ensure!(
+        read_stream(agent, generation, 9).await? == b"after-eof",
+        "role EOF ignores guest output credit and preserves guest input"
+    );
+    guest
+        .send_with_flags(AGENT_PORT, AGENT_PORT, 4, 2, 0, &[])
+        .await?;
+    wait_disconnected(agent).await
+}
+
+async fn exercise_ready_receive_without_notification(
+    guest: &mut GuestVsock,
+    agent: &mut StreamEndpoint,
+    generation: u64,
+) -> wasmtime::Result<()> {
+    guest.device.write(0x64, &3_u32.to_le_bytes())?;
+    agent
+        .try_write(generation, b"queued")
+        .map_err(stream_error)?;
+    tokio::time::timeout(WAIT, async {
+        while guest.used_index(RECEIVE_USED)? == guest.received {
+            guest.events.changed().await?;
+        }
+        Ok::<(), wasmtime::Error>(())
+    })
+    .await??;
+    let (notification, quiet_events) = tokio::sync::watch::channel(0);
+    let events = std::mem::replace(&mut guest.events, quiet_events);
+    let ready = tokio::time::timeout(WAIT, guest.wait_for_receive_work()).await;
+    guest.events = events;
+    drop(notification);
+    ready??;
+    wasmtime::ensure!(
+        guest.read_payload(AGENT_PORT, 6).await? == b"queued",
+        "a consumed interrupt notification cannot hide available receive descriptors"
+    );
+    Ok(())
+}
+
+pub(super) struct GuestVsock {
+    pub(super) device: MmioDevice,
     ram: GuestRam,
     transmitted: u16,
     received: u16,
-    carrier_bytes: Vec<u8>,
-    is_connected: bool,
+    forwarded: BTreeMap<(u32, u32), u32>,
+    receive_windows: BTreeMap<(u32, u32), u32>,
+    events: tokio::sync::watch::Receiver<u64>,
 }
 
-fn write_word(channel: &VsockChannel, offset: u64, value: u32) -> wasmtime::Result<()> {
-    channel.write_mmio(offset, &value.to_le_bytes())
+pub(super) struct Packet {
+    pub(super) port: u32,
+    pub(super) guest_port: u32,
+    pub(super) op: u16,
+    pub(super) flags: u32,
+    pub(super) forwarded: u32,
+    pub(super) window: u32,
+    pub(super) payload: Vec<u8>,
 }
 
 fn descriptor(address: u64, length: u32, flags: u16, next: u16) -> [u8; 16] {
@@ -47,391 +247,387 @@ fn descriptor(address: u64, length: u32, flags: u16, next: u16) -> [u8; 16] {
     bytes
 }
 
-fn field<const N: usize>(bytes: &[u8], offset: usize) -> wasmtime::Result<[u8; N]> {
-    bytes
-        .get(offset..offset + N)
-        .ok_or_else(|| wasmtime::Error::msg("short vsock self-test packet"))?
-        .try_into()
-        .map_err(wasmtime::Error::from)
+pub(super) fn create_interrupt() -> (
+    crate::component::InterruptCallback,
+    tokio::sync::watch::Receiver<u64>,
+) {
+    let (interrupt, events) = tokio::sync::watch::channel(0_u64);
+    (
+        Arc::new(move |_| {
+            interrupt.send_modify(|revision| *revision = revision.wrapping_add(1));
+            Ok(())
+        }),
+        events,
+    )
 }
 
-fn yamux_frame(kind: u8, flags: u16, stream: u32, payload: &[u8]) -> wasmtime::Result<Vec<u8>> {
-    let mut bytes = vec![0, kind];
-    bytes.extend_from_slice(&flags.to_be_bytes());
-    bytes.extend_from_slice(&stream.to_be_bytes());
-    bytes.extend_from_slice(&u32::try_from(payload.len())?.to_be_bytes());
-    bytes.extend_from_slice(payload);
-    Ok(bytes)
-}
+impl GuestVsock {
+    pub(super) fn new(
+        device: MmioDevice,
+        ram: GuestRam,
+        events: tokio::sync::watch::Receiver<u64>,
+    ) -> Self {
+        Self {
+            device,
+            ram,
+            transmitted: 0,
+            received: 0,
+            forwarded: BTreeMap::new(),
+            receive_windows: BTreeMap::new(),
+            events,
+        }
+    }
 
-impl GuestTransport {
-    fn configure(&self) -> wasmtime::Result<()> {
+    pub(super) fn set_receive_window(&mut self, guest_port: u32, host_port: u32, window: u32) {
+        self.receive_windows.insert((guest_port, host_port), window);
+    }
+
+    pub(super) fn receive_window(&self, guest_port: u32, host_port: u32) -> u32 {
+        self.receive_windows
+            .get(&(guest_port, host_port))
+            .copied()
+            .unwrap_or(65536)
+    }
+
+    pub(super) async fn wait_for_receive_work(&mut self) -> wasmtime::Result<()> {
+        if self.used_index(RECEIVE_USED)? == self.received {
+            self.events.changed().await?;
+        }
+        Ok(())
+    }
+
+    pub(super) async fn acknowledge(
+        &mut self,
+        guest_port: u32,
+        host_port: u32,
+        count: usize,
+    ) -> wasmtime::Result<()> {
+        let forwarded = self.forwarded.entry((guest_port, host_port)).or_default();
+        *forwarded = forwarded.wrapping_add(u32::try_from(count)?);
+        self.send(
+            guest_port,
+            host_port,
+            6,
+            self.receive_window(guest_port, host_port),
+            &[],
+        )
+        .await
+    }
+
+    pub(super) fn configure(&mut self) -> wasmtime::Result<()> {
+        self.transmitted = 0;
+        self.received = 0;
+        self.forwarded.clear();
+        self.receive_windows.clear();
+        wasmtime::ensure!(
+            self.device.read(8, 4)? == 19_u32.to_le_bytes(),
+            "vsock device ID"
+        );
+        wasmtime::ensure!(
+            self.device.read(0x100, 4)? == GUEST_CID.to_le_bytes()
+                && self.device.read(0x104, 4)? == 0_u32.to_le_bytes(),
+            "fixed guest CID"
+        );
+        for (offset, value) in [(0x70, 1_u32), (0x70, 3), (0x24, 1), (0x20, 1), (0x70, 11)] {
+            self.device.write(offset, &value.to_le_bytes())?;
+        }
+        for (queue, descriptors, available, used) in [
+            (0_u32, RECEIVE_DESCRIPTOR, RECEIVE_AVAILABLE, RECEIVE_USED),
+            (1, TRANSMIT_DESCRIPTOR, TRANSMIT_AVAILABLE, TRANSMIT_USED),
+        ] {
+            write_memory(&self.ram, available, &[0; 4])?;
+            write_memory(&self.ram, used, &[0; 4])?;
+            for (offset, value) in [
+                (0x30, queue),
+                (0x38, u32::from(QUEUE_SIZE)),
+                (0x80, u32::try_from(descriptors)?),
+                (0x90, u32::try_from(available)?),
+                (0xa0, u32::try_from(used)?),
+                (0x44, 1),
+            ] {
+                self.device.write(offset, &value.to_le_bytes())?;
+            }
+        }
         for index in 0..QUEUE_SIZE {
             write_memory(
                 &self.ram,
-                RX_DESC + u64::from(index) * 16,
+                RECEIVE_DESCRIPTOR + u64::from(index) * 16,
                 &descriptor(
-                    RX_DATA + u64::from(index) * u64::from(PACKET_BYTES),
-                    PACKET_BYTES,
+                    RECEIVE_DATA + u64::from(index) * u64::from(RECEIVE_BYTES),
+                    RECEIVE_BYTES,
                     2,
                     0,
                 ),
             )?;
             write_memory(
                 &self.ram,
-                RX_AVAIL + 4 + u64::from(index) * 2,
+                RECEIVE_AVAILABLE + 4 + u64::from(index) * 2,
                 &index.to_le_bytes(),
             )?;
         }
-        write_memory(&self.ram, RX_AVAIL + 2, &QUEUE_SIZE.to_le_bytes())?;
-        for (offset, value) in [(0x70, 1), (0x70, 3), (0x24, 1), (0x20, 1), (0x70, 11)] {
-            write_word(&self.channel, offset, value)?;
-        }
-        for (queue, desc, avail, used) in [
-            (0, RX_DESC, RX_AVAIL, RX_USED),
-            (1, TX_DESC, TX_AVAIL, TX_USED),
-        ] {
-            for (offset, value) in [
-                (0x30, queue),
-                (0x38, u32::from(QUEUE_SIZE)),
-                (0x80, u32::try_from(desc)?),
-                (0x90, u32::try_from(avail)?),
-                (0xa0, u32::try_from(used)?),
-                (0x44, 1),
-            ] {
-                write_word(&self.channel, offset, value)?;
-            }
-        }
-        write_word(&self.channel, 0x70, 15)?;
-        write_word(&self.channel, 0x50, 0)
+        write_memory(&self.ram, RECEIVE_AVAILABLE + 2, &QUEUE_SIZE.to_le_bytes())?;
+        self.device.write(0x70, &15_u32.to_le_bytes())?;
+        self.device.write(0x50, &0_u32.to_le_bytes())
     }
 
-    async fn send_packet(&mut self, operation: u16, payload: &[u8]) -> wasmtime::Result<()> {
-        let mut packet = Vec::with_capacity(VSOCK_HEADER_BYTES + payload.len());
-        packet.extend_from_slice(&3_u64.to_le_bytes());
-        packet.extend_from_slice(&2_u64.to_le_bytes());
-        packet.extend_from_slice(&GUEST_PORT.to_le_bytes());
-        packet.extend_from_slice(&terra_protocol::mux::MUX_VSOCK_PORT.to_le_bytes());
-        packet.extend_from_slice(&u32::try_from(payload.len())?.to_le_bytes());
-        packet.extend_from_slice(&1_u16.to_le_bytes());
-        packet.extend_from_slice(&operation.to_le_bytes());
-        packet.extend_from_slice(&0_u32.to_le_bytes());
-        packet.extend_from_slice(&65536_u32.to_le_bytes());
-        packet.extend_from_slice(&0_u32.to_le_bytes());
-        packet.extend_from_slice(payload);
-        wasmtime::ensure!(
-            packet.len() <= usize::try_from(PACKET_BYTES)?,
-            "vsock self-test packet limit"
+    fn used_index(&self, address: u64) -> wasmtime::Result<u16> {
+        Ok(u16::from_le_bytes(
+            read_memory(&self.ram, address + 2, 2)?
+                .as_slice()
+                .try_into()?,
+        ))
+    }
+
+    pub(super) async fn send(
+        &mut self,
+        source: u32,
+        destination: u32,
+        op: u16,
+        credit: u32,
+        bytes: &[u8],
+    ) -> wasmtime::Result<()> {
+        self.send_with_flags(source, destination, op, 0, credit, bytes)
+            .await
+    }
+
+    pub(super) async fn send_with_flags(
+        &mut self,
+        source: u32,
+        destination: u32,
+        op: u16,
+        flags: u32,
+        credit: u32,
+        bytes: &[u8],
+    ) -> wasmtime::Result<()> {
+        if op == 1 || op == 2 {
+            self.forwarded.remove(&(source, destination));
+        }
+        let mut header = [0; HEADER_BYTES];
+        header[..8].copy_from_slice(&u64::from(GUEST_CID).to_le_bytes());
+        header[8..16].copy_from_slice(&u64::from(HOST_CID).to_le_bytes());
+        header[16..20].copy_from_slice(&source.to_le_bytes());
+        header[20..24].copy_from_slice(&destination.to_le_bytes());
+        header[24..28].copy_from_slice(&u32::try_from(bytes.len())?.to_le_bytes());
+        header[28..30].copy_from_slice(&1_u16.to_le_bytes());
+        header[30..32].copy_from_slice(&op.to_le_bytes());
+        header[32..36].copy_from_slice(&flags.to_le_bytes());
+        header[36..40].copy_from_slice(&credit.to_le_bytes());
+        header[40..44].copy_from_slice(
+            &self
+                .forwarded
+                .get(&(source, destination))
+                .copied()
+                .unwrap_or(0)
+                .to_le_bytes(),
         );
-        write_memory(&self.ram, TX_DATA, &packet)?;
+        write_memory(&self.ram, TRANSMIT_HEADER, &header)?;
+        for (index, chunk) in bytes
+            .chunks(usize::try_from(crate::MAX_SINGLE_BYTES)?)
+            .enumerate()
+        {
+            write_memory(
+                &self.ram,
+                TRANSMIT_PAYLOAD + u64::try_from(index)? * crate::MAX_SINGLE_BYTES,
+                chunk,
+            )?;
+        }
         write_memory(
             &self.ram,
-            TX_DESC,
+            TRANSMIT_DESCRIPTOR,
             &descriptor(
-                TX_DATA,
-                u32::try_from(VSOCK_HEADER_BYTES)?,
-                u16::from(!payload.is_empty()),
+                TRANSMIT_HEADER,
+                u32::try_from(HEADER_BYTES)?,
+                u16::from(!bytes.is_empty()),
                 1,
             ),
         )?;
-        if !payload.is_empty() {
+        if !bytes.is_empty() {
             write_memory(
                 &self.ram,
-                TX_DESC + 16,
-                &descriptor(
-                    TX_DATA + u64::try_from(VSOCK_HEADER_BYTES)?,
-                    u32::try_from(payload.len())?,
-                    0,
-                    0,
-                ),
+                TRANSMIT_DESCRIPTOR + 16,
+                &descriptor(TRANSMIT_PAYLOAD, u32::try_from(bytes.len())?, 0, 0),
             )?;
         }
         write_memory(
             &self.ram,
-            TX_AVAIL + 4 + u64::from(self.transmitted % QUEUE_SIZE) * 2,
+            TRANSMIT_AVAILABLE + 4 + u64::from(self.transmitted % QUEUE_SIZE) * 2,
             &0_u16.to_le_bytes(),
         )?;
         self.transmitted = self.transmitted.wrapping_add(1);
-        write_memory(&self.ram, TX_AVAIL + 2, &self.transmitted.to_le_bytes())?;
-        write_word(&self.channel, 0x50, 1)?;
-        while read_memory(&self.ram, TX_USED + 2, 2)? != self.transmitted.to_le_bytes() {
-            self.check_failure()?;
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-        Ok(())
-    }
-
-    fn check_failure(&self) -> wasmtime::Result<()> {
-        match self.channel.failure() {
-            Some(error) => Err(wasmtime::Error::msg(error)),
-            None => Ok(()),
-        }
-    }
-
-    fn receive_packets(&mut self) -> wasmtime::Result<()> {
-        let used = u16::from_le_bytes(field(&read_memory(&self.ram, RX_USED + 2, 2)?, 0)?);
-        let received_before = self.received;
-        while self.received != used {
-            let entry = read_memory(
-                &self.ram,
-                RX_USED + 4 + u64::from(self.received % QUEUE_SIZE) * 8,
-                8,
-            )?;
-            let head = u32::from_le_bytes(field(&entry, 0)?);
-            let length = u32::from_le_bytes(field(&entry, 4)?);
-            wasmtime::ensure!(
-                head < u32::from(QUEUE_SIZE) && length <= PACKET_BYTES,
-                "invalid vsock self-test reply"
-            );
-            let packet = read_memory(
-                &self.ram,
-                RX_DATA + u64::from(head) * u64::from(PACKET_BYTES),
-                u64::from(length),
-            )?;
-            wasmtime::ensure!(
-                u32::from_le_bytes(field(&packet, 16)?) == terra_protocol::mux::MUX_VSOCK_PORT
-                    && u32::from_le_bytes(field(&packet, 20)?) == GUEST_PORT,
-                "vsock self-test reply ports"
-            );
-            match u16::from_le_bytes(field(&packet, 30)?) {
-                2 => self.is_connected = true,
-                3 => wasmtime::bail!("vsock self-test carrier reset"),
-                5 => {
-                    let payload = packet
-                        .get(VSOCK_HEADER_BYTES..)
-                        .ok_or_else(|| wasmtime::Error::msg("short vsock self-test reply"))?;
-                    wasmtime::ensure!(
-                        payload.len() == usize::try_from(u32::from_le_bytes(field(&packet, 24)?))?,
-                        "vsock self-test reply length"
-                    );
-                    self.carrier_bytes.extend_from_slice(payload);
-                }
-                _ => {}
+        write_memory(
+            &self.ram,
+            TRANSMIT_AVAILABLE + 2,
+            &self.transmitted.to_le_bytes(),
+        )?;
+        self.device.write(0x64, &3_u32.to_le_bytes())?;
+        self.device.write(0x50, &1_u32.to_le_bytes())?;
+        tokio::time::timeout(WAIT, async {
+            while self.used_index(TRANSMIT_USED)? != self.transmitted {
+                self.device.write(0x64, &3_u32.to_le_bytes())?;
+                self.events.changed().await?;
             }
-            write_memory(
-                &self.ram,
-                RX_AVAIL + 4 + u64::from(self.received % QUEUE_SIZE) * 2,
-                &u16::try_from(head)?.to_le_bytes(),
-            )?;
-            self.received = self.received.wrapping_add(1);
-        }
-        if self.received != received_before {
-            write_memory(
-                &self.ram,
-                RX_AVAIL + 2,
-                &self.received.wrapping_add(QUEUE_SIZE).to_le_bytes(),
-            )?;
-            write_word(&self.channel, 0x50, 0)?;
-        }
-        Ok(())
-    }
-
-    async fn read_data(&mut self, stream: u32) -> wasmtime::Result<Vec<u8>> {
-        let result =
-            tokio::time::timeout(Duration::from_secs(2), self.read_data_inner(stream)).await;
-        result.map_err(|_| {
+            wasmtime::Result::Ok(())
+        })
+        .await
+        .map_err(|error| {
             wasmtime::Error::msg(format!(
-                "vsock self-test stream {stream} timed out (connected={}, receive_packets={}, carrier_bytes={})",
-                self.is_connected,
-                self.received,
-                self.carrier_bytes.len(),
+                "vsock transmit {source}:{destination} operation {op}: {error}"
             ))
         })?
     }
 
-    async fn read_data_inner(&mut self, stream: u32) -> wasmtime::Result<Vec<u8>> {
-        loop {
-            self.check_failure()?;
-            self.receive_packets()?;
-            if self.carrier_bytes.len() < YAMUX_HEADER_BYTES {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-                continue;
-            }
-            let kind = self.carrier_bytes[1];
-            let flags = u16::from_be_bytes(field(&self.carrier_bytes, 2)?);
-            let id = u32::from_be_bytes(field(&self.carrier_bytes, 4)?);
-            let length = if kind == 0 {
-                usize::try_from(u32::from_be_bytes(field(&self.carrier_bytes, 8)?))?
-            } else {
-                0
-            };
+    pub(super) fn receive(&mut self) -> wasmtime::Result<Vec<Packet>> {
+        self.device.write(0x64, &3_u32.to_le_bytes())?;
+        let used = self.used_index(RECEIVE_USED)?;
+        let mut packets = Vec::new();
+        while self.received != used {
+            let slot = self.received % QUEUE_SIZE;
+            let entry = read_memory(&self.ram, RECEIVE_USED + 4 + u64::from(slot) * 8, 8)?;
+            let head = u32::from_le_bytes(entry[..4].try_into()?);
+            let length = u32::from_le_bytes(entry[4..].try_into()?);
             wasmtime::ensure!(
-                length <= usize::try_from(PACKET_BYTES)?,
-                "vsock self-test Yamux frame limit"
+                head < u32::from(QUEUE_SIZE) && length <= RECEIVE_BYTES,
+                "vsock receive descriptor bounds"
             );
-            let end = YAMUX_HEADER_BYTES + length;
-            if self.carrier_bytes.len() < end {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-                continue;
+            if length != 0 {
+                wasmtime::ensure!(
+                    usize::try_from(length)? >= HEADER_BYTES,
+                    "vsock receive header length"
+                );
+                let bytes = read_memory(
+                    &self.ram,
+                    RECEIVE_DATA + u64::from(head) * u64::from(RECEIVE_BYTES),
+                    u64::from(length),
+                )?;
+                wasmtime::ensure!(
+                    bytes[..8] == u64::from(HOST_CID).to_le_bytes()
+                        && bytes[8..16] == u64::from(GUEST_CID).to_le_bytes(),
+                    "vsock response CIDs"
+                );
+                let payload_len = u32::from_le_bytes(bytes[24..28].try_into()?);
+                wasmtime::ensure!(
+                    u64::from(payload_len) + u64::try_from(HEADER_BYTES)? == u64::from(length),
+                    "vsock receive payload length"
+                );
+                packets.push(Packet {
+                    port: u32::from_le_bytes(bytes[16..20].try_into()?),
+                    guest_port: u32::from_le_bytes(bytes[20..24].try_into()?),
+                    op: u16::from_le_bytes(bytes[30..32].try_into()?),
+                    flags: u32::from_le_bytes(bytes[32..36].try_into()?),
+                    forwarded: u32::from_le_bytes(bytes[40..44].try_into()?),
+                    window: u32::from_le_bytes(bytes[36..40].try_into()?),
+                    payload: bytes[HEADER_BYTES..].to_vec(),
+                });
             }
-            let payload = self.carrier_bytes[YAMUX_HEADER_BYTES..end].to_vec();
-            self.carrier_bytes.drain(..end);
-            if flags & 1 != 0 {
-                self.send_packet(5, &yamux_frame(1, 2, id, &[])?).await?;
-            }
-            if id == stream && !payload.is_empty() {
-                return Ok(payload);
-            }
+            write_memory(
+                &self.ram,
+                RECEIVE_AVAILABLE + 4 + u64::from(slot) * 2,
+                &u16::try_from(head)?.to_le_bytes(),
+            )?;
+            self.received = self.received.wrapping_add(1);
         }
+        write_memory(
+            &self.ram,
+            RECEIVE_AVAILABLE + 2,
+            &self.received.wrapping_add(QUEUE_SIZE).to_le_bytes(),
+        )?;
+        self.device.write(0x50, &0_u32.to_le_bytes())?;
+        Ok(packets)
     }
 
-    async fn read_stream_bytes(&mut self, stream: u32, length: usize) -> wasmtime::Result<Vec<u8>> {
-        let mut bytes = Vec::new();
-        while bytes.len() < length {
-            bytes.extend(self.read_data(stream).await?);
-        }
-        wasmtime::ensure!(bytes.len() == length, "vsock self-test stream length");
-        Ok(bytes)
+    pub(super) async fn read_payload(
+        &mut self,
+        port: u32,
+        length: usize,
+    ) -> wasmtime::Result<Vec<u8>> {
+        tokio::time::timeout(WAIT, async {
+            let mut bytes = Vec::new();
+            while bytes.len() < length {
+                for packet in self.receive()? {
+                    if packet.op == 5 {
+                        wasmtime::ensure!(
+                            packet.port == port,
+                            "stalled connection emitted unexpected payload"
+                        );
+                        let count = packet.payload.len();
+                        bytes.extend(packet.payload);
+                        self.acknowledge(packet.guest_port, packet.port, count)
+                            .await?;
+                    }
+                }
+                wasmtime::ensure!(bytes.len() <= length, "vsock returned excess stream bytes");
+                if bytes.len() < length {
+                    self.device.write(0x64, &3_u32.to_le_bytes())?;
+                    self.wait_for_receive_work().await?;
+                }
+            }
+            Ok(bytes)
+        })
+        .await?
     }
 }
 
-fn encode_plan() -> wasmtime::Result<Vec<u8>> {
-    let gateway = std::net::Ipv4Addr::new(100, 96, 0, 1).into();
-    Ok(terra_protocol::encode_frame(&terra_protocol::Plan {
-        mode: terra_protocol::PlanMode::Run,
-        workdir: None,
-        shares: Vec::new(),
-        volumes: Vec::new(),
-        net: terra_protocol::Net {
-            guest_ip: std::net::Ipv4Addr::new(100, 96, 0, 2).into(),
-            prefix: 30,
-            gateway,
-            dns: gateway,
-        },
-        env: std::collections::BTreeMap::new(),
-        root: false,
-        sudo: Vec::new(),
-        on_create: Vec::new(),
-        on_start: Vec::new(),
-        pre_stop: Vec::new(),
-        daemons: Vec::new(),
-        workload: vec!["/bin/true".into()],
-        sandbox_info: String::new(),
-        await_initial_session: false,
-        host_tz: None,
-        host_time: None,
-        host_seed: None,
-    })?)
+fn stream_error(
+    error: crate::component::vsock::streams::stream_types::StreamError,
+) -> wasmtime::Error {
+    wasmtime::Error::msg(format!("vsock self-test stream: {error:?}"))
 }
 
-pub(super) async fn run(
-    artifacts: &crate::TrustedArtifacts,
-    engine: &wasmtime::Engine,
-    directory: &Path,
-) -> wasmtime::Result<()> {
-    let control_path = directory.join("vsock-control.sock");
-    let control_listener = LocalListener::bind(&control_path)?;
-    let mut control = LocalStream::connect(&control_path)?;
-    let (control_grant, _) = control_listener.accept()?;
-    drop(control_listener);
-    let client_path = directory.join("vsock-agent.sock");
-    let listener = LocalListener::bind(&client_path)?;
-    let ram = GuestRam::new(256 * 1024)
-        .ok_or_else(|| wasmtime::Error::msg("allocating vsock self-test memory"))?;
-    let mut runtime = BoxRuntime::new(engine, BoxHost::new())?;
-    runtime.initialize_mmio_artifact(artifacts).await?;
-    let channel = VsockChannel::from_trusted_artifact(
-        &mut runtime,
-        ram.clone(),
-        artifacts.vsock(),
-        encode_plan()?,
-        Some(listener),
-        Some(control_grant),
-        None,
-        Arc::new(|_| Ok(())),
-    )?;
-    let runtime = runtime.prepare().await?.start();
-    let mut guest = GuestTransport {
-        channel: channel.clone(),
-        ram,
-        transmitted: 0,
-        received: 0,
-        carrier_bytes: Vec::new(),
-        is_connected: false,
-    };
-    let result = tokio::time::timeout(
-        Duration::from_secs(5),
-        exercise_transport(&mut guest, &mut control, &client_path),
-    )
+pub(super) async fn wait_connected(endpoint: &mut StreamEndpoint) -> wasmtime::Result<u64> {
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if let Some(generation) = endpoint.current() {
+                return generation;
+            }
+            endpoint.wait().await;
+        }
+    })
     .await
     .map_err(wasmtime::Error::from)
-    .and_then(std::convert::identity);
-    let closed = channel.close_async().await;
-    let joined = runtime.join().await;
-    result?;
-    closed?;
-    joined
 }
 
-async fn exercise_transport(
-    guest: &mut GuestTransport,
-    control: &mut LocalStream,
-    client_path: &Path,
-) -> wasmtime::Result<()> {
-    wasmtime::ensure!(
-        guest.channel.read_mmio(0, 4)? == 0x7472_6976_u32.to_le_bytes(),
-        "vsock self-test MMIO magic"
-    );
-    wasmtime::ensure!(
-        guest.channel.read_mmio(8, 4)? == 19_u32.to_le_bytes(),
-        "vsock self-test device ID"
-    );
-    guest.configure()?;
-    guest.send_packet(1, &[]).await?;
-    let mut syns = yamux_frame(0, 1, terra_protocol::mux::CONTROL_STREAM_ID, &[])?;
-    syns.extend(yamux_frame(
-        0,
-        1,
-        terra_protocol::mux::DIAGNOSTIC_STREAM_ID,
-        &[],
-    )?);
-    guest.send_packet(5, &syns).await?;
-    let plan = guest
-        .read_data(terra_protocol::mux::CONTROL_STREAM_ID)
-        .await?;
-    wasmtime::ensure!(guest.is_connected, "vsock self-test handshake response");
-    let decoded: terra_protocol::Plan = terra_protocol::decode_frame_payload(
-        plan.get(4..)
-            .ok_or_else(|| wasmtime::Error::msg("short vsock self-test plan"))?,
-    )?;
-    wasmtime::ensure!(
-        decoded.host_time.is_some() && decoded.host_seed.is_some(),
-        "vsock self-test host plan enrichment"
-    );
-    let mut client = LocalStream::connect(client_path)?;
-    client.write_all(b"guestless input")?;
-    client.set_nonblocking(true)?;
-    let input = guest.read_stream_bytes(2, b"guestless input".len()).await?;
-    wasmtime::ensure!(input == b"guestless input", "vsock self-test local input");
-    guest
-        .send_packet(5, &yamux_frame(0, 0, 2, b"guestless output")?)
-        .await?;
-    let mut output = Vec::new();
-    while output.len() < b"guestless output".len() {
-        let mut bytes = [0; 32];
-        match client.read(&mut bytes) {
-            Ok(0) => wasmtime::bail!("vsock self-test client closed early"),
-            Ok(length) => output.extend_from_slice(&bytes[..length]),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-            Err(error) => return Err(error.into()),
+async fn wait_disconnected(endpoint: &mut StreamEndpoint) -> wasmtime::Result<()> {
+    tokio::time::timeout(WAIT, async {
+        while endpoint.current().is_some() {
+            endpoint.wait().await;
         }
-    }
-    wasmtime::ensure!(
-        output == b"guestless output",
-        "vsock self-test local output"
-    );
-    control.write_all(&[terra_protocol::STOP_SIGNAL])?;
-    while guest
-        .read_data(terra_protocol::mux::CONTROL_STREAM_ID)
-        .await?
-        != [terra_protocol::STOP_SIGNAL]
-    {}
-    write_word(&guest.channel, 0x70, 0)?;
-    wasmtime::ensure!(
-        guest.channel.read_mmio(0x70, 4)? == [0; 4],
-        "vsock self-test reset status"
-    );
+    })
+    .await?;
     Ok(())
+}
+
+pub(super) async fn read_stream(
+    endpoint: &mut StreamEndpoint,
+    generation: u64,
+    length: usize,
+) -> wasmtime::Result<Vec<u8>> {
+    tokio::time::timeout(WAIT, async {
+        let mut bytes = Vec::new();
+        while bytes.len() < length {
+            let chunk = endpoint
+                .try_read(generation, u32::try_from(length - bytes.len())?)
+                .map_err(stream_error)?;
+            if chunk.is_empty() {
+                endpoint.wait().await;
+            } else {
+                bytes.extend(chunk);
+            }
+        }
+        Ok(bytes)
+    })
+    .await?
+}
+
+#[cfg(test)]
+mod tests {
+    /// Receive readiness remains observable after another wait consumes the interrupt notification.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn frontend_exercises_agent_descriptors_local_only_and_physical_reset() {
+        super::run(
+            &crate::test_fixtures::trusted_artifacts(),
+            &crate::engine::device_engine().unwrap(),
+        )
+        .await
+        .unwrap();
+    }
 }

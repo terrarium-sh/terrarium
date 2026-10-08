@@ -5,8 +5,7 @@ use crate::box_runtime::store::{StoreHost, StoreState};
 use crate::machine::{Architecture, DeviceKind, MachineConfig};
 use std::sync::{Arc, Mutex, mpsc};
 use tokio::sync::{mpsc as queue, watch};
-use wasmtime::component::{Component, ResourceTable};
-use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+use wasmtime::component::Component;
 
 #[allow(clippy::same_length_and_capacity)]
 mod bindings {
@@ -25,28 +24,7 @@ const RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub type Inject = Arc<dyn Fn(X86Interrupt) -> wasmtime::Result<()> + Send + Sync>;
 
-struct ControllerHost {
-    ctx: WasiCtx,
-    table: ResourceTable,
-}
-
-impl ControllerHost {
-    fn new() -> Self {
-        Self {
-            ctx: WasiCtxBuilder::new().build(),
-            table: ResourceTable::new(),
-        }
-    }
-}
-
-impl WasiView for ControllerHost {
-    fn ctx(&mut self) -> WasiCtxView<'_> {
-        WasiCtxView {
-            ctx: &mut self.ctx,
-            table: &mut self.table,
-        }
-    }
-}
+struct ControllerHost;
 
 impl StoreHost for ControllerHost {}
 
@@ -68,14 +46,6 @@ fn validate_x86_interrupts(interrupts: &[X86Interrupt], vcpus: u8) -> wasmtime::
     Ok(())
 }
 
-fn validate_irq_change(change: controller::IrqLevel, routes: &[u32]) -> wasmtime::Result<()> {
-    wasmtime::ensure!(
-        routes.contains(&change.gsi),
-        "interrupt GSI outside device grant"
-    );
-    Ok(())
-}
-
 fn validate_irq_line(
     slot: u8,
     change: controller::IrqLevel,
@@ -85,18 +55,6 @@ fn validate_irq_line(
         routes.get(usize::from(slot)) == Some(&change.gsi),
         "interrupt GSI outside device line grant"
     );
-    Ok(())
-}
-
-fn validate_irq_cleanup(changes: &[controller::IrqLevel], routes: &[u32]) -> wasmtime::Result<()> {
-    wasmtime::ensure!(
-        changes.len() <= IOAPIC_PINS,
-        "IRQ cleanup batch exceeds grants"
-    );
-    for change in changes {
-        validate_irq_change(*change, routes)?;
-        wasmtime::ensure!(!change.asserted, "IRQ cleanup asserted a line");
-    }
     Ok(())
 }
 
@@ -127,6 +85,21 @@ impl<T> InterruptQueue<T> {
             .map_err(|error| wasmtime::Error::msg(format!("interrupt queue: {error}")))
     }
 
+    fn send_if_open(&self, command: T) -> wasmtime::Result<()> {
+        if let Some(sender) = self
+            .sender
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            sender
+                .try_send(command)
+                .map_err(|error| wasmtime::Error::msg(format!("interrupt queue: {error}")))
+        } else {
+            Ok(())
+        }
+    }
+
     async fn close(&self) -> wasmtime::Result<()> {
         self.sender
             .lock()
@@ -148,6 +121,7 @@ impl<T> InterruptQueue<T> {
 }
 
 fn interrupt_queue<T>() -> (InterruptQueue<T>, queue::Receiver<T>, CompletionSender) {
+    // ponytail: 256 pending transitions; raise capacity if bursts overflow, since coalescing loses edge pulses.
     let (sender, receiver) = queue::channel(256);
     let (finished, completion) = watch::channel(None);
     (
@@ -192,13 +166,6 @@ pub struct IoApicHandle {
 }
 
 impl IoApicHandle {
-    pub fn set_line(&self, slot: u8, level: bool) -> wasmtime::Result<()> {
-        self.queue.send(IoApicPending {
-            command: IoApicCommand::Line(slot, level),
-            response: None,
-        })
-    }
-
     pub fn bind_interrupt(
         &self,
         kind: DeviceKind,
@@ -207,7 +174,7 @@ impl IoApicHandle {
         let slot = self.config.device_slot(kind, ordinal)?;
         let queue = self.queue.clone();
         Ok(Arc::new(move |level| {
-            queue.send(IoApicPending {
+            queue.send_if_open(IoApicPending {
                 command: IoApicCommand::Line(slot, level),
                 response: None,
             })
@@ -255,7 +222,9 @@ impl IrqHandle {
     ) -> wasmtime::Result<crate::component::InterruptCallback> {
         let slot = self.config.device_slot(kind, ordinal)?;
         let queue = self.queue.clone();
-        Ok(Arc::new(move |level| queue.send(GsiCommand(slot, level))))
+        Ok(Arc::new(move |level| {
+            queue.send_if_open(GsiCommand(slot, level))
+        }))
     }
     pub async fn close(&self) -> wasmtime::Result<()> {
         let result = self.queue.close().await;
@@ -280,7 +249,6 @@ fn controller_config(config: &MachineConfig, mode: controller::Mode) -> controll
     controller::Config {
         mode,
         routes: config.devices().iter().map(|device| device.irq).collect(),
-        vcpus: config.vcpus(),
     }
 }
 
@@ -292,7 +260,7 @@ async fn instantiate(
     crate::box_runtime::DeviceWorker<ControllerHost>,
     controller::Guest,
 )> {
-    let mut worker = root.new_child(ControllerHost::new());
+    let mut worker = root.new_child(ControllerHost);
     let linker =
         wasmtime::component::Linker::<StoreState<ControllerHost>>::new(worker.store.engine());
     let instance =
@@ -307,23 +275,25 @@ async fn instantiate(
     Ok((worker, controller.clone()))
 }
 
+async fn call_bounded<T>(
+    operation: impl Future<Output = wasmtime::Result<T>>,
+) -> wasmtime::Result<T> {
+    tokio::time::timeout(RESPONSE_TIMEOUT, operation)
+        .await
+        .map_err(|_| wasmtime::Error::msg("interrupt controller call timed out"))?
+}
+
 impl BoxRuntime {
-    #[allow(clippy::too_many_lines)]
-    pub async fn grant_ioapic(
-        &mut self,
-        component: &Component,
-        inject: Inject,
-    ) -> wasmtime::Result<IoApicHandle> {
+    fn claim_x86_controller(&self) -> wasmtime::Result<MachineConfig> {
         let config = self
             .store
             .data()
             .platform
             .machine_config()
-            .ok_or_else(|| wasmtime::Error::msg("VM has no machine configuration"))?
-            .clone();
+            .ok_or_else(|| wasmtime::Error::msg("VM has no machine configuration"))?;
         wasmtime::ensure!(
             config.architecture() == Architecture::X86,
-            "software IOAPIC requires x86"
+            "software interrupt controller requires x86"
         );
         wasmtime::ensure!(
             !self.store.data().platform.is_machine_running(),
@@ -333,16 +303,21 @@ impl BoxRuntime {
             !self.interrupt_controller_configured,
             "interrupt controller already configured"
         );
-        let (mut worker, controller) = tokio::time::timeout(
-            RESPONSE_TIMEOUT,
-            instantiate(
-                self,
-                component,
-                controller_config(&config, controller::Mode::Ioapic),
-            ),
-        )
-        .await
-        .map_err(|_| wasmtime::Error::msg("interrupt controller setup timed out"))??;
+        Ok(config.clone())
+    }
+
+    pub async fn grant_ioapic(
+        &mut self,
+        component: &Component,
+        inject: Inject,
+    ) -> wasmtime::Result<IoApicHandle> {
+        let config = self.claim_x86_controller()?;
+        let (mut worker, controller) = call_bounded(instantiate(
+            self,
+            component,
+            controller_config(&config, controller::Mode::Ioapic),
+        ))
+        .await?;
         let (queue, mut receiver, completion) = interrupt_queue::<IoApicPending>();
         let access = controller.func_access();
         let line = controller.func_ioapic_line();
@@ -352,50 +327,29 @@ impl BoxRuntime {
             Box::pin(complete_worker(
                 async move {
                     while let Some(pending) = receiver.recv().await {
-                        let result = async {
+                        let result: wasmtime::Result<u32> = async {
                             let (value, interrupts) = match pending.command {
                                 IoApicCommand::Line(slot, level) => {
-                                    let (result,) = tokio::time::timeout(
-                                        RESPONSE_TIMEOUT,
-                                        line.call_concurrent(accessor, (slot, level)),
-                                    )
-                                    .await
-                                    .map_err(|_| {
-                                        wasmtime::Error::msg("interrupt controller call timed out")
-                                    })??;
+                                    let (result,) =
+                                        call_bounded(line.call_concurrent(accessor, (slot, level)))
+                                            .await?;
                                     (0, result.map_err(controller_error)?)
                                 }
                                 IoApicCommand::Eoi(vector) => {
-                                    let (result,) = tokio::time::timeout(
-                                        RESPONSE_TIMEOUT,
-                                        eoi.call_concurrent(accessor, (vector,)),
-                                    )
-                                    .await
-                                    .map_err(|_| {
-                                        wasmtime::Error::msg("interrupt controller call timed out")
-                                    })??;
+                                    let (result,) =
+                                        call_bounded(eoi.call_concurrent(accessor, (vector,)))
+                                            .await?;
                                     (0, result.map_err(controller_error)?)
                                 }
                                 IoApicCommand::Access(offset, width, write, value) => {
-                                    let (result,) = tokio::time::timeout(
-                                        RESPONSE_TIMEOUT,
-                                        access.call_concurrent(
+                                    let (result,) =
+                                        call_bounded(access.call_concurrent(
                                             accessor,
                                             (offset, width, write, value),
-                                        ),
-                                    )
-                                    .await
-                                    .map_err(|_| {
-                                        wasmtime::Error::msg("interrupt controller call timed out")
-                                    })??;
-                                    match result {
-                                        Ok(reply) => (reply.value, reply.interrupts),
-                                        Err(
-                                            controller::Error::BadWidth
-                                            | controller::Error::Unmapped,
-                                        ) => (0, Vec::new()),
-                                        Err(error) => return Err(controller_error(error)),
-                                    }
+                                        ))
+                                        .await?;
+                                    let reply = result.map_err(controller_error)?;
+                                    (reply.value, reply.interrupts)
                                 }
                             };
                             validate_x86_interrupts(&interrupts, vcpus)?;
@@ -433,69 +387,29 @@ impl BoxRuntime {
         component: &Component,
         inject: impl Fn(u32, bool) -> wasmtime::Result<()> + Send + Sync + 'static,
     ) -> wasmtime::Result<IrqHandle> {
-        let config = self
-            .store
-            .data()
-            .platform
-            .machine_config()
-            .ok_or_else(|| wasmtime::Error::msg("VM has no machine configuration"))?
-            .clone();
-        wasmtime::ensure!(
-            config.architecture() == Architecture::X86,
-            "software IRQ lines require x86"
-        );
-        wasmtime::ensure!(
-            !self.store.data().platform.is_machine_running(),
-            "interrupt controller must be configured before vCPUs start"
-        );
-        wasmtime::ensure!(
-            !self.interrupt_controller_configured,
-            "interrupt controller already configured"
-        );
+        let config = self.claim_x86_controller()?;
         let routes: Arc<[u32]> = config.devices().iter().map(|device| device.irq).collect();
         let inject: Arc<dyn Fn(u32, bool) -> wasmtime::Result<()> + Send + Sync> = Arc::new(inject);
-        let (mut worker, controller) = tokio::time::timeout(
-            RESPONSE_TIMEOUT,
-            instantiate(
-                self,
-                component,
-                controller_config(&config, controller::Mode::IrqLines),
-            ),
-        )
-        .await
-        .map_err(|_| wasmtime::Error::msg("interrupt controller setup timed out"))??;
+        let (mut worker, controller) = call_bounded(instantiate(
+            self,
+            component,
+            controller_config(&config, controller::Mode::IrqLines),
+        ))
+        .await?;
         let (queue, mut receiver, completion) = interrupt_queue::<GsiCommand>();
         let line = controller.func_irq_line();
-        let clear = controller.func_clear();
         let worker_routes = Arc::clone(&routes);
         let worker_inject = Arc::clone(&inject);
         worker.register_loop(Box::new(move |accessor| {
             Box::pin(complete_worker(
                 async move {
                     while let Some(GsiCommand(slot, level)) = receiver.recv().await {
-                        let (result,) = tokio::time::timeout(
-                            RESPONSE_TIMEOUT,
-                            line.call_concurrent(accessor, (slot, level)),
-                        )
-                        .await
-                        .map_err(|_| {
-                            wasmtime::Error::msg("interrupt controller call timed out")
-                        })??;
+                        let (result,) =
+                            call_bounded(line.call_concurrent(accessor, (slot, level))).await?;
                         if let Some(change) = result.map_err(controller_error)? {
                             validate_irq_line(slot, change, &worker_routes)?;
                             worker_inject(change.gsi, change.asserted)?;
                         }
-                    }
-                    let (result,) =
-                        tokio::time::timeout(RESPONSE_TIMEOUT, clear.call_concurrent(accessor, ()))
-                            .await
-                            .map_err(|_| {
-                                wasmtime::Error::msg("interrupt controller call timed out")
-                            })??;
-                    let changes = result.map_err(controller_error)?;
-                    validate_irq_cleanup(&changes, &worker_routes)?;
-                    for change in changes {
-                        worker_inject(change.gsi, false)?;
                     }
                     Ok(())
                 },
@@ -522,16 +436,13 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn busy_mmio_store_yields_to_controller_progress_and_cancellation() {
+    async fn busy_sibling_store_yields_to_controller_progress_and_cancellation() {
         use std::future::{Future as _, poll_fn};
         use std::task::Poll;
         use std::time::Duration;
 
         let engine = crate::engine::device_engine().unwrap();
         let mut root = BoxRuntime::new(&engine, crate::box_runtime::BoxHost::new()).unwrap();
-        crate::component::mmio::initialize_test_mmio(&mut root)
-            .await
-            .unwrap();
         let component = crate::test_fixtures::trusted_artifacts()
             .interrupt_controller()
             .deserialize(&engine)
@@ -542,20 +453,19 @@ mod tests {
             controller::Config {
                 mode: controller::Mode::IrqLines,
                 routes: vec![3],
-                vcpus: 1,
             },
         )
         .await
         .unwrap();
-        let mmio = root.mmio.as_mut().unwrap().worker.as_mut().unwrap();
+        let mut sibling = root.new_child(ControllerHost);
         let spin =
             wasmtime::Module::new(&engine, "(module (func (export \"run\") (loop br 0)))").unwrap();
-        let spin = wasmtime::Instance::new_async(&mut mmio.store, &spin, &[])
+        let spin = wasmtime::Instance::new_async(&mut sibling.store, &spin, &[])
             .await
             .unwrap()
-            .get_typed_func::<(), ()>(&mut mmio.store, "run")
+            .get_typed_func::<(), ()>(&mut sibling.store, "run")
             .unwrap();
-        let busy = spin.call_async(&mut mmio.store, ());
+        let busy = spin.call_async(&mut sibling.store, ());
         tokio::pin!(busy);
         poll_fn(|context| {
             assert!(busy.as_mut().poll(context).is_pending());
@@ -565,7 +475,7 @@ mod tests {
         let line = controller.func_irq_line();
         let progress = async {
             tokio::select! {
-                result = &mut busy => panic!("MMIO spin ended unexpectedly: {result:?}"),
+                result = &mut busy => panic!("sibling spin ended unexpectedly: {result:?}"),
                 result = line.call_async(&mut interrupts.store, (0, true)) => result,
             }
         };
@@ -584,7 +494,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn saturated_interrupt_queue_drains_after_a_cancelled_close() {
+    async fn explicit_close_drains_and_ignores_late_device_lines_but_rejects_cpu_requests() {
         use futures_util::FutureExt;
 
         let (queue, mut receiver, completion) = interrupt_queue();
@@ -593,12 +503,14 @@ mod tests {
             queue.send(value).unwrap();
         }
         assert!(queue.send(256).is_err());
+        assert!(queue.send_if_open(256).is_err());
         {
             let closing = queue.close();
             tokio::pin!(closing);
             assert!(closing.as_mut().now_or_never().is_none());
         }
         assert!(retained.send(257).is_err());
+        retained.send_if_open(257).unwrap();
         complete_worker(
             async move {
                 for value in 0..256 {
@@ -638,6 +550,13 @@ mod tests {
     }
 
     #[test]
+    fn device_lines_report_unexpected_worker_shutdown() {
+        let (queue, receiver, _completion) = interrupt_queue::<()>();
+        drop(receiver);
+        assert!(queue.send_if_open(()).is_err());
+    }
+
+    #[test]
     fn interrupt_output_stays_within_native_vcpu_grants() {
         let interrupt = X86Interrupt {
             vector: 32,
@@ -670,7 +589,8 @@ mod tests {
     #[test]
     fn gsi_output_needs_a_native_line_grant() {
         assert!(
-            validate_irq_change(
+            validate_irq_line(
+                0,
                 controller::IrqLevel {
                     gsi: 3,
                     asserted: true
@@ -680,12 +600,17 @@ mod tests {
             .is_ok()
         );
         for gsi in [0, 8, 12, 24] {
-            let change = controller::IrqLevel {
-                gsi,
-                asserted: true,
-            };
-            assert!(validate_irq_change(change, &[11, 23]).is_err());
-            assert!(validate_irq_line(0, change, &[11, 23]).is_err());
+            assert!(
+                validate_irq_line(
+                    0,
+                    controller::IrqLevel {
+                        gsi,
+                        asserted: true
+                    },
+                    &[11, 23]
+                )
+                .is_err()
+            );
         }
     }
 
@@ -697,28 +622,6 @@ mod tests {
         };
         assert!(validate_irq_line(1, change, &[3, 4]).is_ok());
         assert!(validate_irq_line(0, change, &[3, 4]).is_err());
-    }
-
-    #[test]
-    fn cleanup_validates_the_whole_batch_before_injection() {
-        let valid = controller::IrqLevel {
-            gsi: 3,
-            asserted: false,
-        };
-        assert!(validate_irq_cleanup(&[valid], &[3]).is_ok());
-        for invalid in [
-            controller::IrqLevel {
-                gsi: 4,
-                asserted: false,
-            },
-            controller::IrqLevel {
-                gsi: 3,
-                asserted: true,
-            },
-        ] {
-            assert!(validate_irq_cleanup(&[valid, invalid], &[3]).is_err());
-        }
-        assert!(validate_irq_cleanup(&[valid; IOAPIC_PINS + 1], &[3]).is_err());
     }
 
     #[tokio::test]

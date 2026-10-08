@@ -36,7 +36,7 @@
 <a class="skip-link" href="#main">Skip to content</a>
 <header class="site-header">
   <a class="wordmark" href="{base}/" aria-label="Terrarium home">
-    <img src="{base}/terrarium-placeholder.png" alt="" width="44" height="44" />
+    <img src="{base}/logo.svg" alt="" width="44" height="42" />
     <span>terra<span class="muted">rium</span></span>
   </a>
   <nav aria-label="Main navigation">

@@ -32,7 +32,7 @@ pub(crate) async fn instantiate(
 ) -> wasmtime::Result<crate::component::StandaloneDevice> {
     let mut runtime =
         crate::box_runtime::BoxRuntime::new(engine, crate::box_runtime::store::BoxHost::new())?;
-    crate::component::mmio::initialize_test_mmio(&mut runtime).await?;
+    crate::component::mmio::initialize_test_mmio(&mut runtime)?;
     let channel = register_device(&mut runtime, host, component, readonly, interrupt)?;
     Ok(crate::component::StandaloneDevice {
         _runtime: Arc::new(runtime.prepare().await?.start()),
@@ -154,12 +154,7 @@ mod tests {
         let mut runtime =
             crate::box_runtime::BoxRuntime::new(&engine, crate::box_runtime::store::BoxHost::new())
                 .expect("box runtime");
-        let mmio = Component::new(&engine, crate::test_fixtures::wasm::MMIO)
-            .expect("MMIO service compiles");
-        runtime
-            .initialize_mmio(&mmio)
-            .await
-            .expect("MMIO service initializes");
+        runtime.initialize_mmio().expect("MMIO service initializes");
         let writable = BlockHost::new(ram.clone(), DiskGrant::Mem(BoundedDisk::new(4096, false)));
         let readonly = BlockHost::new(ram, DiskGrant::Mem(BoundedDisk::new(8192, true)));
         let first = crate::component::block::register_device(
@@ -181,7 +176,7 @@ mod tests {
         let mut other_box =
             crate::box_runtime::BoxRuntime::new(&engine, crate::box_runtime::store::BoxHost::new())
                 .unwrap();
-        other_box.initialize_mmio(&mmio).await.unwrap();
+        other_box.initialize_mmio().unwrap();
         let other_device = crate::component::block::register_device(
             &mut other_box,
             BlockHost::new(

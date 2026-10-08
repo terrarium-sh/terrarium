@@ -15,18 +15,13 @@ interface types {
     record reply {
         sequence: u64,
         value: u64,
-        error: u32,
+        error: option<device-error>,
         interrupt: bool,
     }
 
-    record routed-reply { slot: u32, reply: reply }
-    record control-reply { reply: reply, all-closed: bool }
 
     enum error {
         invalid-slot,
-        invalid-vcpu,
-        unsupported-msr,
-        bad-arm-exit,
         overlap,
         unmapped,
         bad-width,
@@ -40,86 +35,6 @@ interface types {
 interface device {
     use types.{request, reply};
     serve: async func(requests: stream<request>) -> stream<reply>;
-}
-
-interface router {
-    use types.{control-reply, error, operation, reply, request, routed-reply};
-
-    open-device: func(slot: u32, base: u64, size: u64) -> result<stream<request>, error>;
-    attach-replies: async func(slot: u32, replies: stream<reply>) -> result<_, error>;
-    access: async func(address: u64, width: u8, value: u64, write: bool) -> result<routed-reply, error>;
-    control: async func(slot: u32, operation: operation) -> result<control-reply, error>;
-}
-
-interface vmm-mmio-client {
-    use types.{error};
-
-    access: async func(address: u64, width: u8, value: u64, write: bool) -> result<u64, error>;
-}
-
-interface platform {
-    record mmio-read { address: u64, width: u8 }
-    record mmio-write { address: u64, width: u8, value: u64 }
-    record pio-read { port: u16, length: u32 }
-    record pio-write { port: u16, length: u32 }
-    record msr { index: u32, value: u64 }
-    record arm-exception { address: u64, syndrome: u64 }
-    record arm-read { register: option<u8>, value: u64 }
-    record hvc-result { target: u8, status: s64 }
-    record cpu-start { target: u8, entry: u64, context: u64 }
-
-    variant exit {
-        halt,
-        shutdown,
-        interrupted,
-        mmio-read(mmio-read),
-        mmio-write(mmio-write),
-        pio-read(pio-read),
-        pio-write(pio-write),
-        rdmsr(msr),
-        wrmsr(msr),
-        arm-exception(arm-exception),
-        arm-register-value(u64),
-        hvc-result(hvc-result),
-        stopped,
-    }
-
-    variant completion {
-        start,
-        reenter,
-        mmio-read(u64),
-        pio-zero,
-        rdmsr(u64),
-        msr-fault,
-        wrmsr,
-        arm-read(arm-read),
-        arm-register(u8),
-        hvc-return(s64),
-        cpu-start(cpu-start),
-        cpu-off,
-        system-stop,
-    }
-
-    enum error { unavailable, bad-exit, cancelled }
-
-    resource vcpu {
-        resume: async func(completion: completion) -> result<exit, error>;
-    }
-
-}
-
-world vmm {
-    import platform;
-    import virtualization;
-    import lifecycle-platform;
-    import vmm-mmio-client;
-    export machine;
-    export lifecycle;
-}
-
-world mmio {
-    export types;
-    export router;
 }
 
 world mmio-types {

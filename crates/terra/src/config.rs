@@ -40,21 +40,12 @@ pub struct Config {
 #[serde(default, deny_unknown_fields)]
 pub struct Components {
     pub memory_mib: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub network: Option<NetworkComponent>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct NetworkComponent {
-    pub memory_mib: u32,
 }
 
 impl Default for Components {
     fn default() -> Self {
         Self {
             memory_mib: terra_runtime::box_runtime::DEFAULT_COMPONENT_MEMORY_MIB,
-            network: None,
         }
     }
 }
@@ -63,18 +54,9 @@ impl Components {
     pub fn memory_limits(&self) -> Result<terra_runtime::box_runtime::ComponentMemoryLimits> {
         let component_bytes = usize::try_from(u64::from(self.memory_mib) << 20)
             .context("components.memory_mib is too large for this host")?;
-        let mut limits = terra_runtime::box_runtime::ComponentMemoryLimits::new(component_bytes)
+        terra_runtime::box_runtime::ComponentMemoryLimits::new(component_bytes)
             .map_err(|error| anyhow::anyhow!("{error}"))
-            .context("invalid components.memory_mib")?;
-        if let Some(network) = &self.network {
-            let bytes = usize::try_from(u64::from(network.memory_mib) << 20)
-                .context("components.network.memory_mib is too large for this host")?;
-            limits = limits
-                .with_network_memory(bytes)
-                .map_err(|error| anyhow::anyhow!("{error}"))
-                .context("invalid components.network.memory_mib")?;
-        }
-        Ok(limits)
+            .context("invalid components.memory_mib")
     }
 }
 
@@ -138,16 +120,52 @@ pub enum NetworkMode {
     Allowlist,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Network {
+    pub enabled: bool,
     pub mode: NetworkMode,
     /// `HOST-or-IP-or-CIDR[:PORT]`, or `[v6]:port`. No port means any port.
     pub allow: Vec<String>,
     pub hosts: Vec<StaticDnsRecord>,
-    /// Expose a guest listener on the host loopback: `"HOST[:GUEST]"`, so a bare
-    /// `"8080"` means `8080:8080`. IPv4 is required; IPv6 loopback is best-effort.
+    /// Publish a guest listener on host loopback with `HOST[:GUEST][/tcp|/udp]`; TCP is the default.
+    /// IPv4 is required; IPv6 loopback is best-effort.
     pub ports: Vec<String>,
+}
+
+impl From<&Network> for terra_policy::config::Network {
+    fn from(network: &Network) -> Self {
+        Self {
+            mode: match network.mode {
+                NetworkMode::Allowlist => terra_policy::config::NetworkMode::Allowlist,
+                NetworkMode::UnrestrictedPublic => {
+                    terra_policy::config::NetworkMode::UnrestrictedPublic
+                }
+            },
+            allow: network.allow.clone(),
+            hosts: network
+                .hosts
+                .iter()
+                .map(|record| terra_policy::config::StaticDnsRecord {
+                    name: record.name.clone(),
+                    addr: record.addr.clone(),
+                })
+                .collect(),
+            host_addresses: Vec::new(),
+        }
+    }
+}
+
+impl Default for Network {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            mode: NetworkMode::default(),
+            allow: Vec::new(),
+            hosts: Vec::new(),
+            ports: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 pub(super) const CHUNK_BYTES: usize = 4096;
@@ -11,6 +11,7 @@ pub(super) struct Diagnostics {
     sender: tokio::sync::mpsc::Sender<Vec<u8>>,
     tasks: TaskTracker,
     cancellation: CancellationToken,
+    started: Instant,
 }
 
 impl Diagnostics {
@@ -37,6 +38,7 @@ impl Diagnostics {
             sender,
             tasks,
             cancellation,
+            started: Instant::now(),
         })
     }
 
@@ -48,11 +50,26 @@ impl Diagnostics {
         }
     }
 
+    pub(super) fn record_boot_stage(&self, stage: &str) {
+        self.record(
+            format!(
+                "terra boot_stage={stage} unix_time_ns={} agent_elapsed_ns={}\n",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos(),
+                self.started.elapsed().as_nanos()
+            )
+            .as_bytes(),
+        );
+    }
+
     pub(super) async fn finish(self) {
         let Self {
             sender,
             tasks,
             cancellation,
+            started: _,
         } = self;
         drop(sender);
         if tokio::time::timeout(Duration::from_secs(1), tasks.wait())
@@ -100,6 +117,7 @@ mod tests {
             sender,
             tasks: TaskTracker::new(),
             cancellation: CancellationToken::new(),
+            started: std::time::Instant::now(),
         };
         run(
             "dd if=/dev/zero bs=4096 count=512 2>/dev/null",

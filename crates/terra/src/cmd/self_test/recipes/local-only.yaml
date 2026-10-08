@@ -1,0 +1,5 @@
+hw: {hardware}
+network: {enabled: false}
+workload:
+  entrypoint: /bin/sh
+  args: ['-ec', 'while true; do sleep 60; done']

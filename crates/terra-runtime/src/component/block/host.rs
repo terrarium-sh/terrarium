@@ -60,7 +60,7 @@ where
 {
     let disk = Arc::clone(&host.disk);
     let capacity = host.disk_capacity;
-    let job = Arc::clone(&host.disk_slot).try_acquire_owned();
+    let disk_slot = Arc::clone(&host.disk_slot);
     async move {
         use super::backing::BackingError;
         use disk::DiskError;
@@ -70,7 +70,7 @@ where
         if offset.checked_add(len).is_none_or(|end| end > capacity) {
             return Err(DiskError::OutOfRange);
         }
-        let job = job.map_err(|_| DiskError::Busy)?;
+        let job = disk_slot.acquire_owned().await.map_err(|_| DiskError::Io)?;
         tokio::task::spawn_blocking(move || {
             let _job = job;
             let mut disk = disk.lock().map_err(|_| DiskError::Io)?;
@@ -266,7 +266,6 @@ mod tests {
                 .expect("work released");
             Ok(())
         });
-        assert!(matches!(disk_sync(&mut host).await, Err(DiskError::Busy)));
         assert!(matches!(
             disk_read_at(&mut host, u64::MAX, 1).await,
             Err(DiskError::OutOfRange)
@@ -275,18 +274,21 @@ mod tests {
         started_rx.await.expect("work is running");
         waiter.abort();
         assert!(waiter.await.unwrap_err().is_cancelled());
-        assert!(matches!(disk_sync(&mut host).await, Err(DiskError::Busy)));
+        let sync = disk_sync(&mut host);
+        tokio::pin!(sync);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut sync)
+                .await
+                .is_err()
+        );
         disk_sync(&mut other)
             .await
             .expect("other disk stays available");
         release.send(()).expect("work unblocked");
-        let permit =
-            tokio::time::timeout(std::time::Duration::from_secs(2), host.disk_slot.acquire())
-                .await
-                .expect("disk slot released")
-                .expect("slot open");
-        drop(permit);
-        disk_sync(&mut host).await.expect("disk available again");
+        tokio::time::timeout(std::time::Duration::from_secs(2), sync)
+            .await
+            .expect("queued sync completes after cancelled work")
+            .expect("disk synced");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -346,7 +348,7 @@ mod tests {
         use terra_platform::memory::MemoryRange;
 
         let mut backing = BoundedDisk::new(4096, false);
-        backing.write(0, &[0xA5; 512]).unwrap();
+        super::BlockBacking::write_at(&mut backing, 0, &[0xA5; 512]).unwrap();
         let host = BlockHost::new(
             crate::memory::GuestRam::new(256 * 1024).unwrap(),
             DiskGrant::Mem(backing),

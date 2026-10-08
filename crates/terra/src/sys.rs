@@ -25,10 +25,13 @@ pub(crate) use imp::file_handle_matches_path;
 pub(crate) use imp::file_link_count;
 pub use imp::is_host_root;
 pub use imp::{
-    MAX_SOCK_PATH, VmChildGuard, allocated_size, attach_vm_child, claim_inherited_lock,
-    find_terminating_signal, holds_run_lock, host_addresses, install_stop_signal_handlers,
-    kill_vm_child, make_sparse, pass_lock, read_process_start_time, restrict_new_files,
-    set_open_file_mode, set_owner_only, supervise_vm_child, terminate_process, try_lock_run,
+    MAX_SOCK_PATH, allocated_size, claim_inherited_lock, find_terminating_signal, holds_run_lock,
+    host_addresses, install_stop_signal_handlers, make_sparse, pass_lock, read_process_start_time,
+    restrict_new_files, set_open_file_mode, terminate_process, try_lock_run,
+};
+pub use terra_platform::filesystem::{open_regular_file, set_owner_only};
+pub use terra_platform::process::{
+    VmChildGuard, attach_vm_child, kill_vm_child, supervise_vm_child,
 };
 
 pub fn register_stop_channel(channel: terra_platform::io::local::LocalStream) {
@@ -37,8 +40,23 @@ pub fn register_stop_channel(channel: terra_platform::io::local::LocalStream) {
     #[cfg(windows)]
     imp::register_stop_channel(channel);
 }
-#[cfg(target_os = "linux")]
-pub(crate) use imp::pass_descriptor;
+#[cfg(unix)]
+pub(crate) use imp::close_unrelated_descriptors;
+pub(crate) use imp::supervise_supervisor_child;
+#[cfg(any(target_os = "macos", windows))]
+pub(crate) use imp::{claim_listener, pass_listener};
+pub(crate) use terra_platform::process::{claim_ipc, pass_ipc};
+
+#[cfg(windows)]
+pub(crate) fn listener_handle_environment(target: i32) -> std::io::Result<&'static str> {
+    match target {
+        10 => Ok("TERRA_AGENT_LISTENER_HANDLE"),
+        11 => Ok("TERRA_CONTROL_LISTENER_HANDLE"),
+        12 => Ok("TERRA_AGENT_CONTROL_LISTENER_HANDLE"),
+        13 => Ok("TERRA_AGENT_AGENT_LISTENER_HANDLE"),
+        _ => Err(std::io::Error::other("unsupported inherited listener")),
+    }
+}
 
 pub(crate) fn validate_host_root() -> anyhow::Result<()> {
     validate_host_root_for(
@@ -179,21 +197,6 @@ mod test_paths;
 
 #[cfg(test)]
 pub(crate) use test_paths::TestHome;
-
-pub fn open_regular_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(rustix::fs::OFlags::NONBLOCK.bits().cast_signed());
-    }
-    let file = options.open(path)?;
-    if !file.metadata()?.is_file() {
-        return Err(std::io::Error::other("expected a regular file"));
-    }
-    Ok(file)
-}
 
 pub fn create_regular_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     let file = open_regular_file_for_write(path, true)?;

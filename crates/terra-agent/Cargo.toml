@@ -14,7 +14,8 @@ terra-protocol = { path = "../terra-protocol", features = ["tokio", "mux"] }
 yamux = "0.14.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-linux-raw-sys.workspace = true
+libc.workspace = true
+linux-raw-sys = { workspace = true, features = ["ioctl", "net", "vm_sockets"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
 tokio-util = { version = "0.7", features = ["rt", "compat"] }
 async-io = "2.6"
@@ -23,6 +24,9 @@ rustix.workspace = true
 # Terminal screen model so a client attaching to a running TUI gets repainted
 # with the current screen instead of missing history.
 vt100 = "0.16"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 
 [lints]
 workspace = true

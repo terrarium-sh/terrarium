@@ -424,16 +424,11 @@ fn run_one(
             physical_address,
             ..
         } => {
-            let mut action = handler.exchange(VcpuExit::ArmException(ArmException {
-                address: physical_address,
-                syndrome,
-            }))?;
-            while let VcpuAction::ArmRegister(register) = action {
-                let value = cpu
-                    .arm_register_value(register)
-                    .map_err(|error| error.to_string())?;
-                action = handler.exchange(VcpuExit::ArmRegisterValue(value))?;
-            }
+            let exception = ArmException::capture(physical_address, syndrome, |register| {
+                cpu.arm_register_value(register)
+                    .map_err(|error| error.to_string())
+            })?;
+            let action = handler.exchange(VcpuExit::ArmException(exception))?;
             match action {
                 VcpuAction::ArmRead(ArmRead { register, value }) => {
                     cpu.set_arm_mmio_read(register, value)
@@ -474,7 +469,6 @@ fn run_one(
                 | VcpuAction::Rdmsr(_)
                 | VcpuAction::MsrFault
                 | VcpuAction::Wrmsr
-                | VcpuAction::ArmRegister(_)
                 | VcpuAction::IoApicValue(_) => Err("unexpected ARM VMM completion".to_owned()),
             }
         }

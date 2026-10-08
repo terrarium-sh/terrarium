@@ -3,32 +3,56 @@
 use super::boot::{BootSpec, VM_PROCESS_FLAG_ARG};
 use crate::config;
 use crate::policy::mount;
-use crate::sandbox::{self, Access, Grant, Launch, LauncherConfig};
+use crate::sandbox::config::LauncherConfig;
 use crate::state::{self, BoxRef};
 use crate::sys::canonicalize_existing_prefix;
 use anyhow::{Context as _, Result, ensure};
 use std::path::Path;
 use std::process::Command;
+use terra_sandbox::{Access, Grant, Launch};
 
 pub(super) fn prepare_sandbox_launch(
     spec: &BootSpec,
     bx: &BoxRef,
     exe: &Path,
-    policy: &[u8],
-) -> Result<sandbox::PreparedLaunch> {
+    policy: Option<&[u8]>,
+    self_test: Option<[u16; 3]>,
+) -> Result<terra_sandbox::PreparedLaunch> {
     let grants = build_sandbox_grants(spec, bx, exe)?;
+    #[cfg(any(target_os = "macos", windows))]
+    let grants = {
+        let mut grants = grants;
+        if self_test.is_some() {
+            grants.push(Grant::new(
+                super::supervisor::self_test_directory(bx),
+                Access::ReadWrite,
+            ));
+        }
+        grants
+    };
     let mut command = Command::new(exe);
-    command.arg(VM_PROCESS_FLAG_ARG).arg(bx.get_dir());
-    for name in ["RUST_LOG", "TERRA_BOOT_TRACE"] {
+    command
+        .arg(if self_test.is_some() {
+            super::supervisor::VM_SELF_TEST_ARG
+        } else {
+            VM_PROCESS_FLAG_ARG
+        })
+        .arg(bx.get_dir());
+    if let Some(ports) = self_test {
+        command.args(ports.map(|port| port.to_string()));
+    }
+    for name in ["RUST_LOG", "TERRA_BOOT_TRACE", "TERRA_ALLOW_ROOT"] {
         if let Some(value) = std::env::var_os(name) {
             command.env(name, value);
         }
     }
-    sandbox::prepare_launch(Launch {
+    terra_sandbox::prepare_launch(Launch {
+        role: terra_sandbox::Role::Vm,
         command,
         grants,
-        die_with_parent: spec.foreground || spec.mode == terra_protocol::PlanMode::Create,
-        policy: Some(policy),
+        die_with_parent: true,
+        policy,
+        staging_directory: &crate::state::get_terra_home_path()?,
     })
 }
 
@@ -42,7 +66,7 @@ fn build_sandbox_grants(spec: &BootSpec, bx: &BoxRef, exe: &Path) -> Result<Vec<
         "box state directory {} does not exist",
         bx.get_dir().display()
     );
-    let mut grants = sandbox::host_runtime_grants();
+    let mut grants = terra_sandbox::role_grants(terra_sandbox::Role::Vm);
     grants.push(Grant::new(exe, Access::ReadOnly));
     if spec.mode == terra_protocol::PlanMode::Run {
         for share in &spec.cfg.mounts {
@@ -61,13 +85,39 @@ fn build_sandbox_grants(spec: &BootSpec, bx: &BoxRef, exe: &Path) -> Result<Vec<
             grants.push(grant);
         }
     }
+    #[cfg(target_os = "linux")]
     grants.push(Grant::new(bx.get_dir(), Access::ReadWrite));
+    #[cfg(any(target_os = "macos", windows))]
+    {
+        grants.push(Grant::new(bx.get_dir(), Access::ReadOnly));
+        for name in [state::ROOTFS_FILE, state::DIAGNOSTICS_LOG] {
+            grants.push(Grant::new(bx.get_dir().join(name), Access::ReadWrite));
+        }
+        #[cfg(target_os = "macos")]
+        grants.push(Grant::new(
+            bx.get_dir().join("runtime-logs"),
+            Access::ReadWrite,
+        ));
+        #[cfg(windows)]
+        grants.push(Grant::new(
+            bx.get_dir().join(state::LOG_FILE),
+            Access::ReadWrite,
+        ));
+        for volume in &spec.cfg.volumes {
+            grants.push(Grant::new(
+                bx.get_volume_image(&volume.name),
+                Access::ReadWrite,
+            ));
+        }
+    }
     for name in [
         state::RECIPE_FILE,
         state::PINNED_PATHS_FILE,
         state::ORIGIN_FILE,
         state::BAKE_STAMP,
         state::HOST_PID_FILE,
+        state::SUPERVISOR_PID_FILE,
+        state::PID_FILE,
     ] {
         let path = bx.get_dir().join(name);
         if path.exists() {
@@ -212,11 +262,21 @@ mod tests {
         assert!(grants.iter().any(|grant| {
             grant.path == recipe && grant.access == Access::ReadOnly && grant.directory.is_none()
         }));
+        #[cfg(target_os = "linux")]
+        let box_access = Access::ReadWrite;
+        #[cfg(any(target_os = "macos", windows))]
+        let box_access = Access::ReadOnly;
         assert!(
             grants
                 .iter()
-                .any(|grant| { grant.path == bx.get_dir() && grant.access == Access::ReadWrite })
+                .any(|grant| { grant.path == bx.get_dir() && grant.access == box_access })
         );
+        #[cfg(any(target_os = "macos", windows))]
+        for name in [state::ROOTFS_FILE, state::DIAGNOSTICS_LOG] {
+            assert!(grants.iter().any(|grant| {
+                grant.path == bx.get_dir().join(name) && grant.access == Access::ReadWrite
+            }));
+        }
         spec.mode = terra_protocol::PlanMode::Create;
         let grants = build_sandbox_grants(&spec, &bx, &exe).unwrap();
         assert!(!grants.iter().any(|grant| grant.path == share));
@@ -235,6 +295,7 @@ mod tests {
             mode,
             foreground: false,
             host_publishes_pid: false,
+            network_broker: None,
         }
     }
 
@@ -290,7 +351,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn custom_script_can_exec_vm_with_stdin_intact() {
+    fn custom_script_preserves_boot_input_and_network_broker_channel() {
         use std::io::Write as _;
         use std::os::unix::fs::PermissionsExt as _;
         use std::process::Stdio;
@@ -303,27 +364,37 @@ mod tests {
             b"#!/bin/sh\nwhile [ \"$1\" != '--' ]; do shift; done\nshift\nexec \"$@\"\n",
         )
         .unwrap();
-        std::fs::write(&exe, b"#!/bin/sh\ncat\n").unwrap();
+        std::fs::write(&exe, b"#!/bin/sh\ncat\ncat <&7\n").unwrap();
         for path in [&init, &exe] {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
         let bx = BoxRef::from_state_dir(dir.path().join("box"), dir.path());
         let mut command =
             custom_command(&init, &exe, &spec(dir.path(), PlanMode::Run), &bx).unwrap();
+        let (mut broker, worker) = terra_platform::io::local::create_local_pair().unwrap();
+        let inherited =
+            crate::sys::pass_ipc(&mut command, &worker, super::super::supervisor::NETWORK_FD)
+                .unwrap();
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
+        drop((inherited, worker));
         child
             .stdin
             .take()
             .unwrap()
             .write_all(b"boot JSON stays on stdin")
             .unwrap();
+        broker.write_all(b"; broker requests stay on IPC").unwrap();
+        broker.shutdown(std::net::Shutdown::Write).unwrap();
         let output = child.wait_with_output().unwrap();
         assert!(output.status.success());
-        assert_eq!(output.stdout, b"boot JSON stays on stdin");
+        assert_eq!(
+            output.stdout,
+            b"boot JSON stays on stdin; broker requests stay on IPC"
+        );
     }
 
     #[test]

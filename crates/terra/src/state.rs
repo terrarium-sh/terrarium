@@ -12,10 +12,14 @@ const BOX_HOME: &str = "box";
 pub(crate) const ROOTFS_FILE: &str = "rootfs.img";
 pub(crate) const PID_FILE: &str = "terra.pid";
 pub(crate) const HOST_PID_FILE: &str = "host.pid";
+pub(crate) const SUPERVISOR_PID_FILE: &str = "supervisor.pid";
 pub(crate) const CONTROL_SOCKET: &str = "c";
 pub(crate) const AGENT_SOCKET: &str = "a";
 pub(crate) const BAKE_STAMP: &str = "baked";
+#[cfg(not(target_os = "macos"))]
 pub(crate) const LOG_FILE: &str = "terra.log";
+#[cfg(target_os = "macos")]
+pub(crate) const LOG_FILE: &str = "runtime-logs/terra.log";
 pub(crate) const DIAGNOSTICS_LOG: &str = "diagnostics.log";
 
 const VOLUME_PREFIX: &str = "vol-";
@@ -159,35 +163,49 @@ impl BoxRef {
         )
     }
 
-    pub fn read_vm_process(&self) -> Option<VmProcess> {
-        let (line, is_host_pid) = match std::fs::read_to_string(self.dir.join(HOST_PID_FILE)) {
-            Ok(line) => (line, true),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                (self.read_lock_line(), false)
-            }
+    pub fn read_vm_process(&self) -> Option<ProcessIdentity> {
+        let line = match std::fs::read_to_string(self.dir.join(HOST_PID_FILE)) {
+            Ok(line) => line,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => self.read_lock_line(),
             Err(_) => return None,
         };
         let mut words = line.split_whitespace();
         let pid = words.next()?.parse().ok().filter(|pid| *pid > 0)?;
-        let process_identity = words.next().and_then(|w| w.parse().ok());
-        if is_host_pid {
-            process_identity?;
-            if words.next().is_some_and(|word| word != BAKE_MARK) || words.next().is_some() {
-                return None;
-            }
+        let process_identity = Some(words.next()?.parse().ok()?);
+        if words.next().is_some_and(|word| word != BAKE_MARK) || words.next().is_some() {
+            return None;
         }
-        Some(VmProcess {
+        Some(ProcessIdentity {
             pid,
             process_identity,
         })
     }
 
     pub(crate) fn clear_host_pid(&self) -> std::io::Result<()> {
+        match std::fs::remove_file(self.dir.join(SUPERVISOR_PID_FILE)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
         match std::fs::remove_file(self.dir.join(HOST_PID_FILE)) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error),
         }
+    }
+
+    pub(crate) fn read_supervisor_process(&self) -> Option<ProcessIdentity> {
+        let line = std::fs::read_to_string(self.dir.join(SUPERVISOR_PID_FILE)).ok()?;
+        let mut words = line.split_whitespace();
+        let pid = words.next()?.parse().ok().filter(|pid| *pid > 0)?;
+        let process_identity = Some(words.next()?.parse().ok()?);
+        if words.next().is_some() {
+            return None;
+        }
+        Some(ProcessIdentity {
+            pid,
+            process_identity,
+        })
     }
 
     pub fn request_stop(&self) -> Result<()> {
@@ -355,12 +373,12 @@ impl Drop for BakeMark<'_> {
     }
 }
 
-/// The VM process a box's pid file names.
+/// A published host process and its start identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VmProcess {
+pub struct ProcessIdentity {
     pub pid: u32,
     /// The process start identity when the pid was published, by which
-    /// [`crate::sys::terminate_process`] tells this VM from a stranger later
+    /// [`crate::sys::terminate_process`] tells this process from a stranger later
     /// recycled onto the pid. `None` - an old line, or the host had no
     /// identity - cannot be signalled.
     pub process_identity: Option<u64>,
@@ -527,20 +545,17 @@ pub fn read_origin(project: &Path) -> Option<PathBuf> {
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStringExt as _;
-        if let Some(wide) = bytes.strip_prefix(&[0xff, 0xfe]) {
-            if wide.is_empty() || !wide.len().is_multiple_of(2) {
-                return None;
-            }
-            let wide = wide
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|&pair| u16::from_le_bytes(pair))
-                .collect::<Vec<_>>();
-            Some(std::ffi::OsString::from_wide(&wide).into())
-        } else {
-            String::from_utf8(bytes).ok().map(PathBuf::from)
+        let wide = bytes.strip_prefix(&[0xff, 0xfe])?;
+        if wide.is_empty() || !wide.len().is_multiple_of(2) {
+            return None;
         }
+        let wide = wide
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&pair| u16::from_le_bytes(pair))
+            .collect::<Vec<_>>();
+        Some(std::ffi::OsString::from_wide(&wide).into())
     }
 }
 
@@ -612,10 +627,14 @@ mod tests {
             bx.write_origin().unwrap();
             assert_eq!(read_origin(dir.path()), Some(path));
         }
-        std::fs::write(dir.path().join(ORIGIN_FILE), b"/legacy project ").unwrap();
+        std::fs::write(
+            dir.path().join(ORIGIN_FILE),
+            b"/project with trailing space ",
+        )
+        .unwrap();
         assert_eq!(
             read_origin(dir.path()),
-            Some(PathBuf::from("/legacy project "))
+            Some(PathBuf::from("/project with trailing space "))
         );
         std::fs::remove_file(dir.path().join(ORIGIN_FILE)).unwrap();
         std::fs::create_dir(dir.path().join(ORIGIN_FILE)).unwrap();
@@ -1209,20 +1228,14 @@ mod tests {
             "the mark rides behind the start identity"
         );
 
-        // A line from before start identity was recorded still reads.
-        BoxRef::rewrite_lock_line(&lock, "4242").unwrap();
-        let legacy = b.read_vm_process().unwrap();
-        assert_eq!(legacy.pid, 4242);
-        assert_eq!(
-            legacy.process_identity, None,
-            "the old format has no start identity"
-        );
-        BoxRef::rewrite_lock_line(&lock, "4242 bake").unwrap();
-        assert_eq!(
-            b.read_vm_process().unwrap().process_identity,
-            None,
-            "a bare word where the start identity belongs reads as absent"
-        );
+        for line in ["4242", "4242 bake", "4242 7 other"] {
+            BoxRef::rewrite_lock_line(&lock, line).unwrap();
+            assert_eq!(
+                b.read_vm_process(),
+                None,
+                "a lock line without a start identity, or with trailing words, names no process: {line}"
+            );
+        }
 
         // Still the same inode being locked, not a fresh file beside it.
         assert!(b.get_dir().join(PID_FILE).exists());
@@ -1311,7 +1324,7 @@ mod tests {
         std::fs::write(&host_pid, "123 456").unwrap();
         assert_eq!(
             bx.read_vm_process(),
-            Some(VmProcess {
+            Some(ProcessIdentity {
                 pid: 123,
                 process_identity: Some(456),
             })
@@ -1329,11 +1342,35 @@ mod tests {
         bx.clear_host_pid().unwrap();
         assert_eq!(
             bx.read_vm_process(),
-            Some(VmProcess {
+            Some(ProcessIdentity {
                 pid: 42,
                 process_identity: Some(7),
             })
         );
+    }
+
+    #[test]
+    fn supervisor_identity_is_separate_validated_and_cleared_before_boot() {
+        let directory = tempfile::tempdir().unwrap();
+        let bx = BoxRef::from_state_dir(directory.path().into(), directory.path());
+        let lock = bx.lock_run().unwrap();
+        BoxRef::rewrite_lock_line(&lock, "42 7").unwrap();
+        let supervisor_pid = bx.get_dir().join(SUPERVISOR_PID_FILE);
+        std::fs::write(&supervisor_pid, "123 456").unwrap();
+        assert_eq!(
+            bx.read_supervisor_process(),
+            Some(ProcessIdentity {
+                pid: 123,
+                process_identity: Some(456),
+            })
+        );
+        assert_eq!(bx.read_vm_process().map(|process| process.pid), Some(42));
+        for invalid in ["", "123", "123 invalid", "0 456", "123 456 bake"] {
+            std::fs::write(&supervisor_pid, invalid).unwrap();
+            assert_eq!(bx.read_supervisor_process(), None, "{invalid:?}");
+        }
+        bx.clear_host_pid().unwrap();
+        assert!(!supervisor_pid.exists());
     }
 
     #[cfg(unix)]

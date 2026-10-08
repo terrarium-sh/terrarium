@@ -16,8 +16,8 @@ use terra_protocol::DEFAULT_STOP_GRACE_SECS;
                   instead - `terra dev stop`, `terra dev sync :/etc/x .` - and every verb \
                   defaults to this directory's only box. With a box already up and \
                   neither a terminal to attach from nor `-d`, terra exits 125.\n\n\
-                  Linux uses Bubblewrap by default. Set vm.init in ~/.terra/config.yaml to \
-                  direct to disable it, bwrap to select it explicitly, or an executable \
+                  Native sandboxes isolate the VM and network broker by default. Set vm.init in ~/.terra/config.yaml to \
+                  direct to disable them, bwrap to select them explicitly, or an executable \
                   path for a custom launcher.",
     after_long_help = "EXAMPLES:\n    \
                        terra dev                   Start this directory's box `dev`, or attach\n    \
@@ -312,14 +312,14 @@ pub enum SelfTestCommand {
 
 #[derive(Args, Debug)]
 pub struct PolicyArgs {
-    /// Generate and validate a seccomp policy on native Linux.
+    /// Generate and validate a role-specific seccomp bundle on native Linux.
     ///
     /// Runs the selected workload twice: once for tracing and once under the
-    /// generated policy. Custom workloads can repeat writes and external effects.
-    /// Box execution runs in the foreground. Generation does not install the policy.
+    /// generated supervisor, VM and network policies. Custom workloads can repeat writes and external effects.
+    /// Box execution runs in the foreground. Generation does not install the bundle.
     #[arg(long)]
     pub generate_policy: bool,
-    /// Policy output directory, published after enforced validation.
+    /// Policy bundle directory, published after enforced validation.
     #[arg(long, value_name = "DIR", requires = "generate_policy")]
     pub policy_output: Option<PathBuf>,
     /// Directory for policy generation logs and syscall traces.

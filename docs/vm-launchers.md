@@ -1,55 +1,60 @@
 # Host VM launchers
 
 Terra can start its host VM process directly, through a custom launcher, or
-through its built-in Linux Bubblewrap launcher. Configure the choice globally in
-`~/.terra/config.yaml`; a project recipe cannot change it. On Linux, an absent
-or null `vm.init` selects Bubblewrap. On macOS and Windows it starts the VM
-directly. A launcher that fails stops the launch.
+through its built-in native sandbox. Configure the choice globally in
+`~/.terra/config.yaml`; a project recipe cannot change it. An absent or null
+`vm.init` selects `bwrap`: Bubblewrap on Linux and native App Sandbox/AppContainer
+launchers on macOS/Windows. The native launch separates the VM and network
+broker and applies an independent policy to each. Linux also uses a supervisor
+seccomp filter. A failed sandbox launch stops the box without automatic fallback.
+
+Network-enabled launches use a supervised network broker; local-only launches
+(`network.enabled: false`) omit it. [Host process sandboxing](sandboxing.md)
+describes each role and platform.
 
 ```yaml
 vm:
   init: direct
 ```
 
-`vm.init: direct` opts out of the Linux Bubblewrap launcher. Terra embeds the
-Bubblewrap executable and provides a built-in minimal seccomp policy on Linux.
-To select a raw classic BPF policy explicitly:
+`vm.init: direct` opts out of the built-in process confinement for both the VM
+and its broker. On Linux,
+Terra embeds Bubblewrap and separate fallback filters for the supervisor, VM,
+and network broker. Select a generated policy bundle with:
 
 ```yaml
 vm:
   init: bwrap
   bwrap:
-    policy: /path/to/terra.seccomp.bpf
+    policy: /path/to/terra-seccomp
 ```
 
 Policy selection has three steps:
 
-1. Use `vm.bwrap.policy` when set. Relative paths resolve against `~/.terra`,
-   the directory containing `config.yaml`.
-2. Otherwise use `~/.terra/config/seccomp.bpf` if present.
-3. Otherwise use the built-in minimal policy.
+1. Use `vm.bwrap.policy` when set. Relative paths resolve against the directory
+   containing `config.yaml`.
+2. Otherwise use `~/.terra/config/seccomp` if present; `install.sh` installs
+   the release bundle there.
+3. Otherwise use the built-in role policies.
 
-Terra never downloads policies or searches beside the executable. Both file
-options require regular files containing raw classic BPF, with no YAML envelope
-or Base64. A missing explicit file or an invalid selected file fails startup;
-Terra never silently replaces it with the built-in policy. Terra checks the file
-size and instruction alignment, and the kernel validates the filter when
-Bubblewrap installs it.
-Operators must choose a policy appropriate for their host architecture and
-Terra binary. Regenerate and validate generated filters after changing the
-executable; older filters may omit required network syscalls now that socket
-operations run in the jailed VM process.
+A bundle contains `manifest.json` and separate `supervisor.seccomp.bpf`,
+`vm.seccomp.bpf`, and `network.seccomp.bpf` files. Generated bundles also include
+readable JSON for each filter. Terra checks the version, target, per-role hashes,
+filter sizes, and instruction alignment; the kernel validates installation.
+Missing or invalid selected bundles fail startup without fallback.
 
-The built-in policy is compiled for the target architecture and embedded during
-the Cargo build, including CI builds. Boot loads those bytes without generating
-a filter. The policy allows ordinary syscalls and returns `EPERM` for ptrace,
-BPF, performance monitoring, kernel/module loading, reboot, and kernel keyring
-operations. Alternate syscall ABIs are killed. This denylist is less restrictive
-than the generated syscall/ioctl allowlist; Bubblewrap's filesystem, namespace,
-and capability restrictions still apply. The jail shares the host network
-namespace.
+Legacy single-policy files, including `~/.terra/config/seccomp.bpf`, are rejected.
+To migrate, run `terra self-test --generate-policy`, then select the resulting
+bundle directory. Regenerate after changing Terra and validate on the intended
+host architecture. Terra never downloads a policy or searches beside its binary.
 
-To require a policy file and refuse the built-in policy, set:
+The built-in filters deny dangerous kernel interfaces and alternate syscall
+ABIs and keep each role's socket limits ([Linux sandboxing](sandboxing.md#linux));
+generated bundles add tighter syscall and ioctl allowlists. A permanent role
+filter stays active alongside a selected bundle, so a permissive custom bundle
+cannot lift the socket and parent-death restrictions.
+
+To require a generated bundle, set:
 
 ```yaml
 vm:
@@ -58,9 +63,9 @@ vm:
     allow_fallback: false
 ```
 
-`allow_fallback` defaults to `true`. With `false`, either the explicit file or
-`~/.terra/config/seccomp.bpf` must be present. This setting does not assess the
-selected policy's restrictiveness. Normal boots do not need a policy compiler.
+`allow_fallback` defaults to `true`. With `false`, an explicit bundle or
+`~/.terra/config/seccomp` must exist. This setting does not assess how restrictive
+the selected filters are. Normal boots do not need a policy compiler.
 
 Bubblewrap settings are unused when `vm.init` selects another launcher.
 Terra refuses a configured launcher or selected local policy inside a
@@ -71,13 +76,14 @@ an asset used for a later boot.
 
 `terra self-test` exercises the embedded host components without starting a VM,
 tracing, or generating a policy. The host checks cover block storage, shared files
-and host file-change notifications, memory, networking, vsock, and device lifecycle.
+and host file-change notifications, memory, networking, agent streams, and device lifecycle.
 `terra self-test --validate-vm` also runs the bundled guest suite using the normal
 platform launcher and policy settings. Windows host filesystem checks require
 Developer Mode or permission to create symbolic links.
 
 On Linux, `--generate-policy` traces the selected checks, compiles a syscall/ioctl
-allowlist, and repeats the host checks under the generated filter. Reviewed
+allowlist for each process role, and repeats the host checks under the complete
+generated bundle. Reviewed
 supplements cover virtualization operations that cannot be observed without a
 hypervisor. Terra embeds the guest suite and syscall tracer, uses the Rust
 `seccompiler` crate to compile classic BPF, and resolves syscall names with the
@@ -96,7 +102,7 @@ terra ./dev.yaml --generate-policy --policy-output ./test-policy -- npm test
 ```
 
 With self-test policy generation, `--validate-vm` additionally runs the full guest
-feature suite under Bubblewrap using the same generated policy; it requires
+feature suite under Bubblewrap using the same generated bundle; it requires
 native Linux KVM and working Bubblewrap user namespaces. Release CI uses this
 mode on each policy architecture. It fails instead of silently broadening a
 policy when guest validation finds an uncovered operation.
@@ -114,16 +120,27 @@ once under the generated policy. Custom workloads can repeat writes to box files
 host shares, and external services. Both passes use the same box and preserve its
 files and configuration, so the second pass sees effects from the first.
 Self-tests use private Terra state. `--policy-timeout` limits each generation
-pass to 900 seconds by default. Policy options require `--generate-policy`.
+pass; `--help` shows its default. Policy options require `--generate-policy`.
 
-Successful generation publishes `terra.seccomp.bpf`, readable `terra.seccomp.json`,
-and a validation manifest beneath `./terra-seccomp` (or `--policy-output`). The
-manifest distinguishes host-component validation from built-in guest validation
-and foreground workload validation. The output is an atomic symlink to a
-successful generation; an existing real directory is refused. Logs and traces
-remain in `./terra-workload-logs` (or `--policy-diagnostics`). Generation does not
-install or select the policy. To use the filter, set `vm.bwrap.policy` to its
-absolute BPF path, or copy it to `~/.terra/config/seccomp.bpf`.
+Successful generation publishes a bundle beneath `./terra-seccomp`
+(or `--policy-output`):
+
+```text
+supervisor.seccomp.json / supervisor.seccomp.bpf
+vm.seccomp.json         / vm.seccomp.bpf
+network.seccomp.json    / network.seccomp.bpf
+manifest.json
+```
+
+The manifest records executable identity, role hashes and coverage, reviewed
+supplements, and validation results. Test servers and launcher setup do not
+supply VM network permissions. Missing role coverage fails generation. The
+complete bundle must pass enforcement and negative boundary probes before
+atomic publication. An existing real output directory is refused; published
+outputs are symlinks to successful generations. Logs and traces remain in
+`./terra-workload-logs` (or `--policy-diagnostics`). Generation does not install
+the bundle. Select its directory with `vm.bwrap.policy`, or install the bundle
+at `~/.terra/config/seccomp`.
 
 Policies cover the observed paths and reviewed supplements for that binary and
 architecture. Host-only enforcement does not certify a VM run; use
@@ -148,6 +165,7 @@ Spaces, quotes, Unicode and shell metacharacters in paths remain within their
 own arguments. The launcher must execute the command after `--`, preserving its
 standard input, inherited box lock descriptor or handle, environment, exit
 status, termination, and readiness notification. On Unix, the box lock is FD 3.
+The launcher must also preserve the inherited broker IPC endpoint (FD 7 on Unix).
 Standard input carries the effective
 boot plan; the launcher must leave it for `__vm`, not read it to infer mounts.
 The boot plan is not passed in arguments. On Unix, a simple script can use
@@ -192,33 +210,3 @@ namespace is unsupported: the VM publishes its namespace-local PID, which
 Terra cannot use to identify and force-stop the host process after graceful
 shutdown fails. Use the built-in Bubblewrap launcher for PID isolation; it
 provides the required host-PID handoff.
-
-## Built-in Linux boundary
-
-The embedded Bubblewrap launcher uses a restricted mount view, user, mount,
-IPC, UTS, and PID namespaces, drops capabilities, and installs the selected
-seccomp filter before starting the VM. It grants the selected box's required
-files, approved run-mode shares, and `/dev/kvm`. The VM shares the host network
-namespace. Its network component and policy-enforcing socket hosts run inside
-the jailed VM process.
-
-The built-in launcher clears the inherited host environment and forwards only
-`RUST_LOG` and `TERRA_BOOT_TRACE` for diagnostics. Recipe guest environment
-grants are carried separately in the boot plan.
-
-Bubblewrap's PID namespace gives the VM a different PID from its host PID.
-Terra's parent records the host PID and start identity in the box's `host.pid`
-before sending the boot plan. That file is read-only inside the jail, so a
-compromised native VM process cannot rewrite the signal target used by `stop`.
-The inherited FD 3 remains the cooperative box run lock; it is not a defense
-against native code deliberately unlocking or disrupting its own box.
-
-Recipe network policies remain enforced at the component boundary, but native
-VM-process compromise can bypass them and reach host-network services while
-remaining subject to the jail's other restrictions. See
-[network policy limits](security.md#network-policy-limits) for indirect escape
-risks and independent host controls. Native KVM tests under the enforced
-launcher are required to validate containment on each architecture.
-Bubblewrap does not supply cgroups or a hard CPU, memory, disk, or bandwidth
-quota. The built-in launcher targets the statically linked Linux musl release executable; custom launchers can supply a
-different host layout.

@@ -1,0 +1,9 @@
+hw: {hardware}
+network:
+  hosts: [{name: gate.test, addr: HOST_LOOPBACK}]
+workload:
+  entrypoint: /bin/sh
+  args:
+    - -ec
+    - >-
+      if wget -q -T 2 -O - http://gate.test:{allowed_port}/; then exit 1; fi; echo ISOLATED_OK

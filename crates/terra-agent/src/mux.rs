@@ -1,4 +1,4 @@
-//! The guest side of the agent's single vsock carrier.
+//! The agent's diagnostic and client session multiplexer.
 
 use anyhow::{Context as _, Result};
 use futures_util::{future::poll_fn, io::AsyncWriteExt as _};
@@ -24,12 +24,7 @@ impl GuestMux {
     }
 
     pub(super) fn connect() -> Result<Streams> {
-        let carrier = crate::vsock::connect(
-            crate::vsock::VMADDR_CID_HOST,
-            terra_protocol::mux::MUX_VSOCK_PORT,
-        )
-        .context("dialling the host mux port")?;
-        Self::start(carrier)
+        Self::start(connect_agent_vsock()?)
     }
 
     fn start(carrier: File) -> Result<Streams> {
@@ -65,6 +60,59 @@ impl GuestMux {
     }
 }
 
+#[allow(unsafe_code)]
+pub(super) fn vsock_address(cid: u32, port: u32) -> rustix::net::SocketAddrAny {
+    #[repr(C)]
+    struct VsockAddress {
+        family: u16,
+        reserved: u16,
+        port: u32,
+        cid: u32,
+        flags: u8,
+        padding: [u8; 3],
+    }
+
+    const _: () = assert!(std::mem::size_of::<VsockAddress>() == 16);
+
+    let address = VsockAddress {
+        family: rustix::net::AddressFamily::VSOCK.as_raw(),
+        reserved: 0,
+        port,
+        cid,
+        flags: 0,
+        padding: [0; 3],
+    };
+    // SAFETY: the initialized C layout is Linux sockaddr_vm; read copies exactly its 16 bytes.
+    unsafe { rustix::net::SocketAddrAny::read(std::ptr::from_ref(&address).cast(), 16) }
+}
+
+fn connect_agent_vsock() -> Result<File> {
+    let socket = rustix::net::socket_with(
+        rustix::net::AddressFamily::VSOCK,
+        rustix::net::SocketType::STREAM,
+        rustix::net::SocketFlags::CLOEXEC,
+        None,
+    )
+    .context("creating the agent vsock")?;
+    rustix::net::bind(
+        &socket,
+        &vsock_address(
+            terra_protocol::vsock::GUEST_CID,
+            terra_protocol::vsock::AGENT_PORT,
+        ),
+    )
+    .context("binding the fixed guest agent endpoint")?;
+    rustix::net::connect(
+        &socket,
+        &vsock_address(
+            terra_protocol::vsock::HOST_CID,
+            terra_protocol::vsock::AGENT_PORT,
+        ),
+    )
+    .context("connecting the fixed host agent endpoint")?;
+    Ok(File::from(socket))
+}
+
 async fn run(
     carrier: File,
     control: File,
@@ -77,15 +125,18 @@ async fn run(
         terra_protocol::mux::yamux_config(),
         yamux::Mode::Client,
     );
-    for (name, local) in [("control", control), ("diagnostic", diagnostic)] {
+    for (id, local) in [
+        (terra_protocol::mux::CONTROL_STREAM_ID, control),
+        (terra_protocol::mux::DIAGNOSTIC_STREAM_ID, diagnostic),
+    ] {
         let mut stream = poll_fn(|cx| connection.poll_new_outbound(cx))
             .await
-            .with_context(|| format!("opening mux {name} stream"))?;
-        // Yamux sends the opening SYN on the first write, including an empty write.
+            .context("opening reserved mux stream")?;
+        anyhow::ensure!(stream.id().val() == id, "invalid reserved mux stream");
         stream
             .write(&[])
             .await
-            .with_context(|| format!("sending mux {name} SYN"))?;
+            .context("sending reserved mux SYN")?;
         tokio::spawn(bridge(stream, local));
     }
 
@@ -212,7 +263,7 @@ mod tests {
             control,
             diagnostic: _diagnostic,
             clients: _clients,
-            control_stream: _control_stream,
+            control_stream,
             diagnostic_stream: _diagnostic_stream,
             client_streams: _client_streams,
             driver,
@@ -225,6 +276,7 @@ mod tests {
             tokio_util::sync::CancellationToken::new(),
         ));
         driver.abort();
+        drop(control_stream);
         promptly(stop.cancelled()).await;
         promptly(watcher).await.unwrap();
         wait_for_guest_driver(guest_driver).await;
@@ -379,10 +431,6 @@ mod tests {
             driver,
             guest_driver,
         } = carrier(1).await;
-        assert_eq!(
-            control_stream.id().val(),
-            terra_protocol::mux::CONTROL_STREAM_ID
-        );
         assert_eq!(
             diagnostic_stream.id().val(),
             terra_protocol::mux::DIAGNOSTIC_STREAM_ID

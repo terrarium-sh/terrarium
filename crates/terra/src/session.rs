@@ -749,32 +749,33 @@ mod tests {
 
     #[tokio::test]
     async fn an_agent_on_a_different_protocol_is_refused() {
-        let home = crate::sys::TestHome::new();
-        let bx = BoxRef::resolve(home.get_path(), "dev").unwrap();
-        std::fs::create_dir_all(bx.get_dir()).unwrap();
-        let _lock = bx.lock_run().unwrap();
-        let listener = LocalListener::bind(bx.get_dir().join(crate::state::AGENT_SOCKET)).unwrap();
-        let agent = std::thread::spawn(move || {
-            let (mut conn, _) = listener.accept().unwrap();
-            conn.write_all(&[
-                protocol::AGENT_HELLO[0],
-                protocol::AGENT_PROTOCOL_VERSION.wrapping_add(1),
-            ])
-            .unwrap();
-        });
+        const { assert!(protocol::AGENT_PROTOCOL_VERSION > 1) };
+        for version in [1, protocol::AGENT_PROTOCOL_VERSION.wrapping_add(1)] {
+            let home = crate::sys::TestHome::new();
+            let bx = BoxRef::resolve(home.get_path(), "dev").unwrap();
+            std::fs::create_dir_all(bx.get_dir()).unwrap();
+            let _lock = bx.lock_run().unwrap();
+            let listener =
+                LocalListener::bind(bx.get_dir().join(crate::state::AGENT_SOCKET)).unwrap();
+            let agent = std::thread::spawn(move || {
+                let (mut conn, _) = listener.accept().unwrap();
+                conn.write_all(&[protocol::AGENT_HELLO[0], version])
+                    .unwrap();
+            });
 
-        let Err(error) =
-            connect_to_agent(&bx, protocol::AgentService::Session, "session", || Ok(())).await
-        else {
-            panic!("accepted incompatible agent");
-        };
-        assert!(
-            error
-                .to_string()
-                .contains("does not speak this terra's protocol"),
-            "{error}"
-        );
-        agent.join().unwrap();
+            let Err(error) =
+                connect_to_agent(&bx, protocol::AgentService::Session, "session", || Ok(())).await
+            else {
+                panic!("accepted incompatible agent version {version}");
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("does not speak this terra's protocol"),
+                "{error}"
+            );
+            agent.join().unwrap();
+        }
     }
 
     #[tokio::test]

@@ -1,10 +1,11 @@
 use super::bootstrap::mount;
 use super::hooks::{HOOK_TIMEOUT, wait_for_child};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use rustix::mount::MountFlags;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 use std::process::Command;
 use tokio_util::sync::CancellationToken;
@@ -14,43 +15,125 @@ const SUBORDINATE_ID_COUNT: u32 = 65_536;
 const DOAS_CONF: &str = "/etc/doas.conf";
 const DOAS_DIR: &str = "/etc/doas.d";
 
-pub(super) async fn configure_network(
-    net: &terra_protocol::Net,
-    cancellation: &CancellationToken,
-) -> Result<()> {
-    run_ip(&["link", "set", "lo", "up"], cancellation).await?;
-    run_ip(
-        &[
-            "addr",
-            "add",
-            &format!("{}/{}", net.guest_ip, net.prefix),
-            "dev",
-            "eth0",
-        ],
-        cancellation,
-    )
-    .await?;
-    run_ip(&["link", "set", "eth0", "up"], cancellation).await?;
-    run_ip(
-        &["route", "add", "default", "via", &net.gateway.to_string()],
-        cancellation,
-    )
-    .await?;
-    fs::write("/etc/resolv.conf", format!("nameserver {}\n", net.dns))
-        .context("writing /etc/resolv.conf")
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct InterfaceRequest {
+    name: [u8; 16],
+    data: [u8; 24],
 }
 
-async fn run_ip(args: &[&str], cancellation: &CancellationToken) -> Result<()> {
-    let mut command = Command::new("ip");
-    command.args(args);
-    let (mut child, pidfd) = crate::reap::spawn_owned(|| command.spawn()).context("running ip")?;
-    let status = wait_for_child(&mut child, &pidfd, Some(HOOK_TIMEOUT), cancellation)
-        .await
-        .context("waiting for ip")?;
-    if !status.success() {
-        bail!("ip {args:?} failed ({status})");
+#[allow(unsafe_code)]
+pub(super) fn enable_loopback() -> Result<()> {
+    let socket = rustix::net::socket_with(
+        rustix::net::AddressFamily::INET,
+        rustix::net::SocketType::DGRAM,
+        rustix::net::SocketFlags::CLOEXEC,
+        None,
+    )
+    .context("opening the guest interface control socket")?;
+    let mut interface = InterfaceRequest {
+        name: [0; 16],
+        data: [0; 24],
+    };
+    interface.name[..2].copy_from_slice(b"lo");
+    // SAFETY: SIOCGIFFLAGS reads the terminated name and writes the flags at offset 16 in Linux ifreq.
+    unsafe {
+        let request = rustix::ioctl::Updater::<{ linux_raw_sys::ioctl::SIOCGIFFLAGS }, _>::new(
+            &mut interface,
+        );
+        rustix::ioctl::ioctl(&socket, request)
     }
+    .context("reading guest loopback flags")?;
+    let flags = i16::from_ne_bytes([interface.data[0], interface.data[1]])
+        | i16::try_from(linux_raw_sys::net::net_device_flags::IFF_UP as u32)
+            .context("encoding the guest loopback flag")?;
+    interface.data[..2].copy_from_slice(&flags.to_ne_bytes());
+    // SAFETY: SIOCSIFFLAGS reads the same initialized Linux ifreq name and updated flags.
+    unsafe {
+        let request =
+            rustix::ioctl::Setter::<{ linux_raw_sys::ioctl::SIOCSIFFLAGS }, _>::new(interface);
+        rustix::ioctl::ioctl(&socket, request)
+    }
+    .context("enabling guest loopback")?;
     Ok(())
+}
+
+#[allow(unsafe_code)]
+pub(super) fn configure_loopback_address(name: &str, address: std::net::Ipv4Addr) -> Result<()> {
+    let socket = rustix::net::socket_with(
+        rustix::net::AddressFamily::INET,
+        rustix::net::SocketType::DGRAM,
+        rustix::net::SocketFlags::CLOEXEC,
+        None,
+    )?;
+    let mut interface = InterfaceRequest {
+        name: [0; 16],
+        data: [0; 24],
+    };
+    interface.name[..name.len()].copy_from_slice(name.as_bytes());
+    interface.data[..16].copy_from_slice(&encode_interface_address(address));
+    // SAFETY: SIOCSIFADDR reads a terminated alias name and an initialized IPv4 sockaddr at offset 16.
+    unsafe {
+        let request =
+            rustix::ioctl::Setter::<{ linux_raw_sys::ioctl::SIOCSIFADDR }, _>::new(interface);
+        rustix::ioctl::ioctl(&socket, request)
+    }
+    .with_context(|| format!("assigning the guest loopback address {address}"))?;
+    interface.data[..16].copy_from_slice(&encode_interface_address(std::net::Ipv4Addr::BROADCAST));
+    // SAFETY: SIOCSIFNETMASK reads the same alias name and an initialized IPv4 sockaddr netmask.
+    unsafe {
+        let request =
+            rustix::ioctl::Setter::<{ linux_raw_sys::ioctl::SIOCSIFNETMASK }, _>::new(interface);
+        rustix::ioctl::ioctl(&socket, request)
+    }
+    .with_context(|| format!("setting the guest loopback address {address} prefix"))?;
+    Ok(())
+}
+
+pub(super) async fn configure_publication_addresses(
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    for (name, address) in [
+        ("lo:terra-src", crate::network::RELAY_SOURCE),
+        ("lo:terra-dst", crate::network::PUBLISHED_DESTINATION),
+    ] {
+        configure_loopback_address(name, address)?;
+    }
+    let relay_route = format!("{}/32", crate::network::RELAY_SOURCE);
+    let service_source = crate::network::PUBLISHED_DESTINATION.to_string();
+    let mut command = Command::new("ip");
+    command
+        .args([
+            "route",
+            "replace",
+            "local",
+            &relay_route,
+            "dev",
+            "lo",
+            "src",
+            &service_source,
+            "table",
+            "local",
+        ])
+        .process_group(0);
+    let (mut child, pidfd) = crate::reap::spawn_owned(|| command.spawn())
+        .context("configuring the guest publication reply source")?;
+    let timeout = std::time::Duration::from_secs(terra_protocol::application::OPEN_TIMEOUT_SECS);
+    let status = wait_for_child(&mut child, &pidfd, Some(timeout), cancellation)
+        .await
+        .context("configuring the guest publication reply source")?;
+    ensure!(
+        status.success(),
+        "guest publication reply route exited {status}"
+    );
+    Ok(())
+}
+
+fn encode_interface_address(address: std::net::Ipv4Addr) -> [u8; 16] {
+    let mut bytes = [0; 16];
+    bytes[..2].copy_from_slice(&rustix::net::AddressFamily::INET.as_raw().to_ne_bytes());
+    bytes[4..8].copy_from_slice(&address.octets());
+    bytes
 }
 
 pub(super) fn mount_filesystems(plan: &terra_protocol::Plan) -> Result<()> {
@@ -247,7 +330,6 @@ fn setup_subordinate_ids(path: &str) -> Result<()> {
 }
 
 async fn run_quiet_command(command_name: &str, args: &[&str], cancellation: &CancellationToken) {
-    use std::os::unix::process::CommandExt as _;
     let mut command = Command::new(command_name);
     command
         .args(args)

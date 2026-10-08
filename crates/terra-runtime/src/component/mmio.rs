@@ -1,24 +1,32 @@
-//! Native MMIO requests, device handles, and the Wasm routing bridge.
+//! Native MMIO routing and device lifecycle requests.
 
 pub(crate) mod bindings;
-pub(super) mod bridge;
+pub(crate) mod bridge;
 mod device;
 
 use crate::machine::DeviceKind;
 pub use device::MmioDevice;
 
-use crate::box_runtime::store::{StoreHost, StoreState};
-use crate::box_runtime::{BoxRuntime, DeviceWorker};
+use crate::box_runtime::BoxRuntime;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
-use wasmtime::component::{Component, ResourceTable, StreamReader, TypedFunc};
-use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+use wasmtime::component::{StreamReader, TypedFunc};
 
-use bindings::types::{ControlReply, Error, RoutedReply};
+use bindings::types::Error;
 pub use bindings::types::{DeviceError, Operation, Reply, Request};
 pub type Serve = TypedFunc<(StreamReader<Request>,), (StreamReader<Reply>,)>;
-type Access = TypedFunc<(u64, u8, u64, bool), (Result<RoutedReply, Error>,)>;
-type Control = TypedFunc<(u32, Operation), (Result<ControlReply, Error>,)>;
+#[derive(Debug)]
+struct RoutedReply {
+    slot: u32,
+    reply: Reply,
+}
+
+pub(crate) struct DeviceChannel {
+    pub requests: crate::component::relay::Sink<Request>,
+    pub replies: crate::component::relay::Stream<Reply>,
+    pub sequence: u64,
+}
+
 const DEVICE_SPAN: u64 = 0x1000;
 pub(super) const COMMAND_CAPACITY: usize = 64;
 pub(super) const CONTROL_CAPACITY: usize = 64;
@@ -118,8 +126,8 @@ struct DeviceRequestCounts {
 pub(crate) struct DeviceRegistration {
     pub(super) kind: DeviceKind,
     pub(crate) slot: u32,
-    base: AtomicU64,
-    size: AtomicU64,
+    pub(crate) base: AtomicU64,
+    pub(crate) size: AtomicU64,
     closing: AtomicBool,
     closed: AtomicBool,
     counts: DeviceRequestCounts,
@@ -130,7 +138,8 @@ fn owns_access(device: &DeviceRegistration, address: u64, width: u8) -> bool {
     let Some(end) = base.checked_add(device.size.load(Ordering::Acquire)) else {
         return false;
     };
-    address >= base
+    !device.closed.load(Ordering::Acquire)
+        && address >= base
         && address
             .checked_add(u64::from(width))
             .is_some_and(|access_end| access_end <= end)
@@ -144,35 +153,9 @@ pub(crate) struct DevicePlan {
 
 pub(crate) type DeviceRegistry = Arc<OnceLock<Box<[Arc<DeviceRegistration>]>>>;
 
-pub(crate) struct MmioHost {
-    ctx: WasiCtx,
-    table: ResourceTable,
-}
-
-impl MmioHost {
-    fn new() -> Self {
-        Self {
-            ctx: WasiCtxBuilder::new().build(),
-            table: ResourceTable::new(),
-        }
-    }
-}
-
-impl WasiView for MmioHost {
-    fn ctx(&mut self) -> WasiCtxView<'_> {
-        WasiCtxView {
-            ctx: &mut self.ctx,
-            table: &mut self.table,
-        }
-    }
-}
-
-impl StoreHost for MmioHost {}
-
 pub(crate) struct MmioInstance {
-    pub(crate) worker: Option<DeviceWorker<MmioHost>>,
-    pub(crate) bridge: crate::box_runtime::ComponentLoop<StoreState<MmioHost>>,
-    pub(crate) routing: bindings::router::Guest,
+    pub(crate) receiver: tokio::sync::mpsc::Receiver<Pending>,
+    pub(crate) channels: Vec<Option<DeviceChannel>>,
     pub(crate) sender: Queue,
     pub(crate) admission: Arc<Mutex<Option<String>>>,
     pub(crate) devices: DeviceRegistry,
@@ -261,55 +244,25 @@ pub(crate) fn add_vmm_client_to_linker(
 }
 
 impl BoxRuntime {
-    pub async fn initialize_mmio(&mut self, component: &Component) -> wasmtime::Result<()> {
+    pub fn initialize_mmio(&mut self) -> wasmtime::Result<()> {
         wasmtime::ensure!(self.mmio.is_none(), "MMIO already initialized");
-        let mut worker = self.new_child(MmioHost::new());
-        let linker = wasmtime::component::Linker::new(worker.store.engine());
-        let instance = crate::box_runtime::setup::within_setup_timeout(
-            0,
-            bindings::Mmio::instantiate_async(&mut worker.store, component, &linker),
-        )
-        .await?;
-        let routing = instance.terra_mmio_router();
         let (sender, receiver) = Queue::new();
-        let admission = Arc::new(Mutex::new(None));
-        let devices: DeviceRegistry = Arc::new(OnceLock::new());
-        let bridge = bridge::create_component_loop(
-            bridge::BridgeContext {
-                access: routing.func_access(),
-                control: routing.func_control(),
-                devices: Arc::clone(&devices),
-                admission: Arc::clone(&admission),
-            },
-            sender.clone(),
-            receiver,
-        );
         self.mmio = Some(MmioInstance {
-            worker: Some(worker),
-            bridge,
-            routing: routing.clone(),
+            receiver,
+            channels: Vec::new(),
             sender,
-            admission,
-            devices,
+            admission: Arc::new(Mutex::new(None)),
+            devices: Arc::new(OnceLock::new()),
             device_plan: Vec::new(),
             failure: Arc::new(Mutex::new(None)),
         });
         Ok(())
     }
-
-    pub async fn initialize_mmio_artifact(
-        &mut self,
-        artifacts: &crate::TrustedArtifacts,
-    ) -> wasmtime::Result<()> {
-        let component = artifacts.mmio().deserialize(self.store.engine())?;
-        self.initialize_mmio(&component).await
-    }
 }
 
 #[cfg(test)]
-pub(crate) async fn initialize_test_mmio(root: &mut BoxRuntime) -> wasmtime::Result<()> {
-    let component = Component::new(root.store.engine(), crate::test_fixtures::wasm::MMIO)?;
-    root.initialize_mmio(&component).await
+pub(crate) fn initialize_test_mmio(root: &mut BoxRuntime) -> wasmtime::Result<()> {
+    root.initialize_mmio()
 }
 
 fn submit(

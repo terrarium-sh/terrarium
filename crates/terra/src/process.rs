@@ -78,11 +78,8 @@ fn capture_output(command: &mut Command, timeout: Duration, can_interrupt: bool)
         .stdin(Stdio::null())
         .stdout(stdout.try_clone()?)
         .stderr(stderr.try_clone()?);
-    let mut child = SupervisedChild {
-        child: command.spawn().context("starting workload command")?,
-        guard: None,
-        is_reaped: false,
-    };
+    let mut child =
+        SupervisedChild::new(command.spawn().context("starting workload command")?, None)?;
     let status = child.wait(timeout, can_interrupt)?;
     Ok(Output {
         status,
@@ -104,14 +101,9 @@ pub(crate) fn run_logged(command: &mut Command, timeout: Duration, log: &Path) -
         .stdout(output.try_clone()?)
         .stderr(output);
     let guard = sys::supervise_vm_child(command, true).context("supervising workload command")?;
-    let mut child = SupervisedChild {
-        child: command.spawn().context("starting workload command")?,
-        guard,
-        is_reaped: false,
-    };
-    if let Some(guard) = &child.guard {
-        sys::attach_vm_child(guard, &child.child).context("attaching workload command")?;
-    }
+    let mut child =
+        SupervisedChild::new(command.spawn().context("starting workload command")?, guard)
+            .context("attaching workload command")?;
     let status = child
         .wait(timeout, true)
         .with_context(|| format!("workload log: {}", log.display()))?;
@@ -134,14 +126,56 @@ fn read_capture(file: &mut File) -> Result<Vec<u8>> {
     Ok(output)
 }
 
-struct SupervisedChild {
+pub(crate) struct SupervisedChild {
     child: Child,
     guard: Option<sys::VmChildGuard>,
+    #[cfg(target_os = "macos")]
+    sandbox_bundle: Option<tempfile::TempDir>,
     is_reaped: bool,
 }
 
 impl SupervisedChild {
-    fn wait(&mut self, timeout: Duration, can_interrupt: bool) -> Result<ExitStatus> {
+    pub(crate) fn new(child: Child, guard: Option<sys::VmChildGuard>) -> Result<Self> {
+        let supervised = Self {
+            child,
+            guard,
+            #[cfg(target_os = "macos")]
+            sandbox_bundle: None,
+            is_reaped: false,
+        };
+        if let Some(guard) = &supervised.guard {
+            sys::attach_vm_child(guard, &supervised.child)?;
+        }
+        Ok(supervised)
+    }
+
+    pub(crate) fn from_launch(
+        spawned: terra_sandbox::SpawnedLaunch,
+        guard: Option<sys::VmChildGuard>,
+    ) -> Result<Self> {
+        let supervised = Self::new(spawned.child, guard)?;
+        #[cfg(target_os = "macos")]
+        let supervised = {
+            let mut supervised = supervised;
+            supervised.sandbox_bundle = spawned.sandbox_bundle;
+            supervised
+        };
+        Ok(supervised)
+    }
+
+    pub(crate) fn child_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+
+    pub(crate) fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
+        let status = self.child.try_wait()?;
+        if status.is_some() {
+            self.is_reaped = true;
+        }
+        Ok(status)
+    }
+
+    pub(crate) fn wait(&mut self, timeout: Duration, can_interrupt: bool) -> Result<ExitStatus> {
         let deadline = sys::deadline_after(timeout);
         loop {
             anyhow::ensure!(!can_interrupt || !is_interrupted(), "workload interrupted");

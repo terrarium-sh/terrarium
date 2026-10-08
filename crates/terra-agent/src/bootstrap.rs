@@ -3,7 +3,9 @@ use rustix::mount::{MountFlags, MountPropagationFlags};
 use std::fs::{self, File};
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
-use terra_protocol::{CLOCK_SYNC, CLOCK_SYNC_BYTES, Plan, RESIZE2FS_GUEST_PATH, ROOT_DEVICE};
+use terra_protocol::{
+    BootPlan, CLOCK_SYNC, CLOCK_SYNC_BYTES, Plan, RESIZE2FS_GUEST_PATH, ROOT_DEVICE,
+};
 
 const CLEAN_MOUNT: &str = "/mnt/clean";
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -41,10 +43,7 @@ pub(super) fn enter_root() -> Result<Boot> {
         clients,
         driver: mux,
     } = crate::mux::GuestMux::connect()?;
-    let plan: Plan =
-        terra_protocol::read_frame_with_limit(&mut control, terra_protocol::MAX_PLAN_BYTES)
-            .context("reading the boot plan")?
-            .ok_or_else(|| anyhow::anyhow!("control channel closed before receiving boot plan"))?;
+    let plan = read_boot_plan(&mut control)?;
     setup_env(&plan);
     apply_host_state(&plan)?;
     grow_filesystem(ROOT_DEVICE);
@@ -98,6 +97,21 @@ pub(super) fn enter_root() -> Result<Boot> {
         clients,
         mux,
     })
+}
+
+fn read_boot_plan(reader: &mut impl std::io::Read) -> Result<Plan> {
+    let boot_plan: BootPlan =
+        terra_protocol::read_frame_with_limit(reader, terra_protocol::MAX_PLAN_BYTES)
+            .context("reading the boot plan")?
+            .ok_or_else(|| anyhow::anyhow!("control channel closed before receiving boot plan"))?;
+    boot_plan
+        .validate_protocol_versions()
+        .context("validating boot protocol versions")?;
+    boot_plan
+        .plan
+        .validate_network()
+        .context("validating guest network configuration")?;
+    Ok(boot_plan.plan)
 }
 
 fn grow_filesystem(device: &str) {
@@ -262,6 +276,65 @@ fn setup_env(plan: &Plan) {
 mod tests {
     use super::*;
     use terra_protocol::{Net, Plan, PlanMode};
+
+    fn test_plan() -> Plan {
+        Plan {
+            mode: PlanMode::Run,
+            workdir: None,
+            shares: Vec::new(),
+            volumes: Vec::new(),
+            net: Net::Tsi,
+            published_ports: Vec::new(),
+            published_udp_ports: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            root: false,
+            sudo: Vec::new(),
+            on_create: Vec::new(),
+            on_start: Vec::new(),
+            pre_stop: Vec::new(),
+            daemons: Vec::new(),
+            workload: Vec::new(),
+            sandbox_info: String::new(),
+            await_initial_session: false,
+            host_tz: None,
+            host_time: None,
+            host_seed: None,
+        }
+    }
+
+    #[test]
+    fn boot_plan_versions_are_checked_before_host_state_or_hooks() {
+        let mut boot_plan = BootPlan::new(test_plan());
+        boot_plan.plan.on_start.push("exit 99".into());
+        boot_plan.plan.host_time = Some(terra_protocol::HostTime {
+            seconds: 12,
+            nanoseconds: 34,
+        });
+        boot_plan.plan.host_seed = Some([0; 32]);
+        let frame = terra_protocol::encode_frame(&boot_plan).unwrap();
+        assert_eq!(
+            read_boot_plan(&mut frame.as_slice()).unwrap(),
+            boot_plan.plan
+        );
+        for (agent_version, socket_version) in [
+            (
+                terra_protocol::AGENT_PROTOCOL_VERSION - 1,
+                terra_protocol::socket::VERSION,
+            ),
+            (
+                terra_protocol::AGENT_PROTOCOL_VERSION,
+                terra_protocol::socket::VERSION + 1,
+            ),
+        ] {
+            boot_plan.agent_version = agent_version;
+            boot_plan.socket_version = socket_version;
+            let frame = terra_protocol::encode_frame(&boot_plan).unwrap();
+            assert!(read_boot_plan(&mut frame.as_slice()).is_err());
+        }
+        let bare_plan = terra_protocol::encode_frame(&test_plan()).unwrap();
+        assert!(read_boot_plan(&mut bare_plan.as_slice()).is_err());
+    }
+
     #[test]
     fn setup_env_allows_plan_to_override_path_and_term_while_preserving_home() {
         const CHILD: &str = "TERRA_TEST_SETUP_ENV_CHILD";
@@ -290,31 +363,8 @@ mod tests {
         );
         env.insert("TERM".to_string(), "custom-term".to_string());
         env.insert("HOME".to_string(), "/attempted/home".to_string());
-        let plan = Plan {
-            mode: PlanMode::Run,
-            workdir: None,
-            shares: Vec::new(),
-            volumes: Vec::new(),
-            net: Net {
-                guest_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 2, 15)),
-                prefix: 24,
-                gateway: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 2, 2)),
-                dns: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 2, 3)),
-            },
-            env,
-            root: false,
-            sudo: Vec::new(),
-            on_create: Vec::new(),
-            on_start: Vec::new(),
-            pre_stop: Vec::new(),
-            daemons: Vec::new(),
-            workload: Vec::new(),
-            sandbox_info: String::new(),
-            await_initial_session: false,
-            host_tz: None,
-            host_time: None,
-            host_seed: None,
-        };
+        let mut plan = test_plan();
+        plan.env = env;
         setup_env(&plan);
         assert!(std::env::var("PATH").unwrap().starts_with("/custom/bin:"));
         assert_eq!(std::env::var("TERM").unwrap(), "custom-term");

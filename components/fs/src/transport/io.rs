@@ -9,12 +9,12 @@ const MAX_ACTIVE_IO: usize = 32;
 const MAX_PENDING_IO: usize = super::QUEUE_SIZE as usize;
 
 pub(super) struct PreparedIo {
-    pub identity: (u64, u64),
+    pub identity: Option<(u64, u64)>,
     pub work: LocalBoxFuture<'static, Result<Vec<u8>, i32>>,
 }
 
 pub(super) struct CompletedIo {
-    identity: (u64, u64),
+    identity: Option<(u64, u64)>,
     pub reply: PendingReply,
     pub result: Result<Vec<u8>, i32>,
 }
@@ -24,6 +24,7 @@ pub(super) struct IoScheduler {
     pending: VecDeque<(PreparedIo, PendingReply)>,
     active: FuturesUnordered<LocalBoxFuture<'static, CompletedIo>>,
     active_files: BTreeMap<(u64, u64), u64>,
+    active_generations: BTreeMap<u64, usize>,
 }
 
 impl IoScheduler {
@@ -32,9 +33,7 @@ impl IoScheduler {
     }
 
     pub fn contains_generation(&self, generation: u64) -> bool {
-        self.active_files
-            .values()
-            .any(|active| *active == generation)
+        self.active_generations.contains_key(&generation)
             || self
                 .pending
                 .iter()
@@ -51,18 +50,20 @@ impl IoScheduler {
 
     pub fn poll_complete(&mut self, context: &mut Context<'_>) -> Option<CompletedIo> {
         while self.active.len() < MAX_ACTIVE_IO {
-            let Some(index) = self
-                .pending
-                .iter()
-                .position(|(operation, _)| !self.active_files.contains_key(&operation.identity))
-            else {
+            let Some(index) = self.pending.iter().position(|(operation, _)| {
+                operation
+                    .identity
+                    .is_none_or(|identity| !self.active_files.contains_key(&identity))
+            }) else {
                 break;
             };
             let Some((operation, reply)) = self.pending.remove(index) else {
                 break;
             };
-            self.active_files
-                .insert(operation.identity, reply.generation);
+            if let Some(identity) = operation.identity {
+                self.active_files.insert(identity, reply.generation);
+            }
+            *self.active_generations.entry(reply.generation).or_default() += 1;
             self.active.push(
                 async move {
                     CompletedIo {
@@ -75,7 +76,15 @@ impl IoScheduler {
             );
         }
         if let Poll::Ready(Some(completed)) = self.active.poll_next_unpin(context) {
-            self.active_files.remove(&completed.identity);
+            if let Some(identity) = completed.identity {
+                self.active_files.remove(&identity);
+            }
+            if let Some(count) = self.active_generations.get_mut(&completed.reply.generation) {
+                *count -= 1;
+                if *count == 0 {
+                    self.active_generations.remove(&completed.reply.generation);
+                }
+            }
             Some(completed)
         } else {
             None
@@ -104,7 +113,7 @@ mod tests {
         let mut io = IoScheduler::default();
         io.enqueue(
             PreparedIo {
-                identity: (0, 1),
+                identity: Some((0, 1)),
                 work: async move { stalled.await.map_err(|_| 5) }.boxed_local(),
             },
             reply(1),
@@ -118,7 +127,7 @@ mod tests {
         after_reset.generation = 2;
         io.enqueue(
             PreparedIo {
-                identity: (0, 1),
+                identity: Some((0, 1)),
                 work: async { Ok(vec![2]) }.boxed_local(),
             },
             after_reset,
@@ -126,7 +135,7 @@ mod tests {
         .unwrap();
         io.enqueue(
             PreparedIo {
-                identity: (0, 2),
+                identity: Some((0, 2)),
                 work: async { Ok(vec![3]) }.boxed_local(),
             },
             reply(3),
@@ -141,6 +150,38 @@ mod tests {
     }
 
     #[test]
+    fn metadata_bypasses_stalled_io_but_still_blocks_reinitialization() {
+        let (release, stalled) = oneshot::channel();
+        let mut io = IoScheduler::default();
+        io.enqueue(
+            PreparedIo {
+                identity: Some((0, 1)),
+                work: async move { stalled.await.map_err(|_| 5) }.boxed_local(),
+            },
+            reply(1),
+        )
+        .unwrap();
+        let (finish_metadata, metadata) = oneshot::channel();
+        io.enqueue(
+            PreparedIo {
+                identity: None,
+                work: async move { metadata.await.map_err(|_| 5) }.boxed_local(),
+            },
+            reply(2),
+        )
+        .unwrap();
+        let waker = noop_waker();
+        let mut context = Context::from_waker(&waker);
+        assert!(io.poll_complete(&mut context).is_none());
+        finish_metadata.send(Vec::new()).unwrap();
+        assert_eq!(io.poll_complete(&mut context).unwrap().reply.unique, 2);
+        assert!(io.contains_generation(1));
+        release.send(Vec::new()).unwrap();
+        assert_eq!(io.poll_complete(&mut context).unwrap().reply.unique, 1);
+        assert!(!io.contains_generation(1));
+    }
+
+    #[test]
     fn io_admission_and_execution_are_bounded_and_drop_cancels_reads() {
         let mut releases = Vec::new();
         let mut io = IoScheduler::default();
@@ -149,7 +190,7 @@ mod tests {
             releases.push(release);
             io.enqueue(
                 PreparedIo {
-                    identity: (0, node as u64),
+                    identity: Some((0, node as u64)),
                     work: async move { stalled.await.map_err(|_| 5) }.boxed_local(),
                 },
                 reply(node as u64),
@@ -159,7 +200,7 @@ mod tests {
         assert_eq!(
             io.enqueue(
                 PreparedIo {
-                    identity: (0, u64::MAX),
+                    identity: Some((0, u64::MAX)),
                     work: async { Ok(Vec::new()) }.boxed_local(),
                 },
                 reply(u64::MAX)

@@ -1,0 +1,204 @@
+{
+  "terra-agent-component": {
+    "terra:agent@0.1.0/host-service": [
+      "[method]client.input",
+      "[method]client.output",
+      "[resource-drop]client",
+      "listener",
+      "plan",
+      "stop"
+    ],
+    "terra:vsock@0.1.0/role-stream": [
+      "accept"
+    ],
+    "wasi:cli@0.3.0/environment": [
+      "get-environment"
+    ],
+    "wasi:cli@0.3.0/exit": [
+      "exit",
+      "exit-with-code"
+    ],
+    "wasi:cli@0.3.0/stderr": [
+      "write-via-stream"
+    ],
+    "wasi:cli@0.3.0/stdin": [
+      "read-via-stream"
+    ],
+    "wasi:cli@0.3.0/stdout": [
+      "write-via-stream"
+    ],
+    "wasi:cli@0.3.0/terminal-input": [
+      "[resource-drop]terminal-input"
+    ],
+    "wasi:cli@0.3.0/terminal-output": [
+      "[resource-drop]terminal-output"
+    ],
+    "wasi:cli@0.3.0/terminal-stderr": [
+      "get-terminal-stderr"
+    ],
+    "wasi:cli@0.3.0/terminal-stdin": [
+      "get-terminal-stdin"
+    ],
+    "wasi:cli@0.3.0/terminal-stdout": [
+      "get-terminal-stdout"
+    ],
+    "wasi:cli@0.3.0/types": [],
+    "wasi:clocks@0.3.1/monotonic-clock": [
+      "now",
+      "wait-for"
+    ],
+    "wasi:clocks@0.3.1/system-clock": [
+      "now"
+    ],
+    "wasi:clocks@0.3.1/types": []
+  },
+  "terra-block-component": {
+    "terra:host@0.1.0/disk": [
+      "capacity",
+      "discard",
+      "read-at",
+      "sync",
+      "write-at"
+    ],
+    "terra:host@0.1.0/interrupt": [
+      "set-level"
+    ],
+    "terra:host@0.1.0/memory": [
+      "address-limit",
+      "read",
+      "read-ranges",
+      "write",
+      "write-ranges"
+    ],
+    "terra:mmio@0.1.0/types": []
+  },
+  "terra-boot-component": {},
+  "terra-fs-component": {
+    "terra:fs@0.1.0/host": [
+      "file-events",
+      "get-mode",
+      "get-mode-at",
+      "open-metadata-at",
+      "set-mode",
+      "set-mode-at",
+      "statfs"
+    ],
+    "terra:host@0.1.0/interrupt": [
+      "set-level"
+    ],
+    "terra:host@0.1.0/memory": [
+      "address-limit",
+      "read",
+      "read-ranges",
+      "write",
+      "write-ranges"
+    ],
+    "terra:mmio@0.1.0/types": [],
+    "wasi:clocks@0.3.1/monotonic-clock": [
+      "wait-for"
+    ],
+    "wasi:clocks@0.3.1/system-clock": [],
+    "wasi:clocks@0.3.1/types": [],
+    "wasi:filesystem@0.3.1/preopens": [
+      "get-directories"
+    ],
+    "wasi:filesystem@0.3.1/types": [
+      "[method]descriptor.create-directory-at",
+      "[method]descriptor.get-flags",
+      "[method]descriptor.get-type",
+      "[method]descriptor.link-at",
+      "[method]descriptor.metadata-hash",
+      "[method]descriptor.metadata-hash-at",
+      "[method]descriptor.open-at",
+      "[method]descriptor.read-directory",
+      "[method]descriptor.read-via-stream",
+      "[method]descriptor.readlink-at",
+      "[method]descriptor.remove-directory-at",
+      "[method]descriptor.rename-at",
+      "[method]descriptor.set-size",
+      "[method]descriptor.set-times",
+      "[method]descriptor.set-times-at",
+      "[method]descriptor.stat",
+      "[method]descriptor.stat-at",
+      "[method]descriptor.symlink-at",
+      "[method]descriptor.sync",
+      "[method]descriptor.sync-data",
+      "[method]descriptor.unlink-file-at",
+      "[method]descriptor.write-via-stream",
+      "[resource-drop]descriptor"
+    ]
+  },
+  "terra-interrupt-controller-component": {},
+  "terra-mem-component": {
+    "terra:host@0.1.0/interrupt": [
+      "set-level"
+    ],
+    "terra:host@0.1.0/memory": [
+      "address-limit",
+      "read",
+      "write"
+    ],
+    "terra:mem@0.1.0/host": [
+      "discard"
+    ],
+    "terra:mmio@0.1.0/types": []
+  },
+  "terra-vmm-component": {
+    "terra:mmio@0.1.0/types": [],
+    "terra:vmm@0.1.0/lifecycle-platform": [
+      "next-event",
+      "shutdown"
+    ],
+    "terra:vmm@0.1.0/machine-types": [],
+    "terra:vmm@0.1.0/platform": [
+      "[method]vcpu.resume",
+      "[resource-drop]vcpu"
+    ],
+    "terra:vmm@0.1.0/virtualization": [
+      "[method]vm.request-stop",
+      "[resource-drop]vm"
+    ],
+    "terra:vmm@0.1.0/vmm-mmio-client": [
+      "access"
+    ]
+  },
+  "terra-vsock-frontend-component": {
+    "terra:host@0.1.0/interrupt": [
+      "set-level"
+    ],
+    "terra:host@0.1.0/memory": [
+      "address-limit",
+      "read",
+      "read-ranges",
+      "write",
+      "write-ranges"
+    ],
+    "terra:mmio@0.1.0/types": [],
+    "terra:network@0.1.0/broker": [
+      "[method]listener.accept",
+      "[method]tcp.peer-address",
+      "[method]tcp.receive",
+      "[method]tcp.send",
+      "[method]udp.receive-from",
+      "[method]udp.send-to",
+      "[resource-drop]listener",
+      "[resource-drop]tcp",
+      "[resource-drop]udp",
+      "closed",
+      "open-tcp",
+      "open-udp",
+      "published-listener",
+      "published-udp",
+      "resolve"
+    ],
+    "terra:network@0.1.0/types": [],
+    "terra:vsock@0.1.0/frontend-stream": [
+      "connect"
+    ],
+    "terra:vsock@0.1.0/stream-types": [],
+    "wasi:clocks@0.3.1/monotonic-clock": [
+      "wait-for"
+    ],
+    "wasi:clocks@0.3.1/types": []
+  }
+}

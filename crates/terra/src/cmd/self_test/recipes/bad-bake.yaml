@@ -1,0 +1,3 @@
+hw: {hardware}
+hooks:
+  on_create: ['echo FAILED_BAKE; exit 9']

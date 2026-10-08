@@ -23,35 +23,9 @@ enum VcpuState {
 
 pub struct NativeVcpu {
     sender: tokio::sync::mpsc::Sender<Pending>,
-    arm_registers: u8,
 }
 
 impl NativeVcpu {
-    pub fn exchange_arm_exception(
-        &self,
-        address: u64,
-        syndrome: u64,
-        mut read_register: impl FnMut(u8) -> wasmtime::Result<u64>,
-    ) -> wasmtime::Result<Completion> {
-        let mut completion = self.exchange(Exit::ArmException(platform::ArmException {
-            address,
-            syndrome,
-        }))?;
-        for _ in 0..4 {
-            let Completion::ArmRegister(register) = completion else {
-                return Ok(completion);
-            };
-            wasmtime::ensure!(register <= 31, "ARM register outside vCPU grant");
-            let value = read_register(register)?;
-            completion = self.exchange(Exit::ArmRegisterValue(value))?;
-        }
-        wasmtime::ensure!(
-            !matches!(completion, Completion::ArmRegister(_)),
-            "VMM exceeded ARM register access budget"
-        );
-        Ok(completion)
-    }
-
     pub fn exchange(&self, exit: Exit) -> wasmtime::Result<Completion> {
         let (reply, response) = mpsc::sync_channel(1);
         self.sender
@@ -92,13 +66,17 @@ fn native_exit(exit: vm::VcpuExit) -> Option<Exit> {
         vm::VcpuExit::Wrmsr(vm::Msr { index, value }) => {
             Some(Exit::Wrmsr(platform::Msr { index, value }))
         }
-        vm::VcpuExit::ArmException(vm::ArmException { address, syndrome }) => {
-            Some(Exit::ArmException(platform::ArmException {
-                address,
-                syndrome,
-            }))
-        }
-        vm::VcpuExit::ArmRegisterValue(value) => Some(Exit::ArmRegisterValue(value)),
+        vm::VcpuExit::ArmException(vm::ArmException {
+            address,
+            syndrome,
+            write_value,
+            hvc_registers,
+        }) => Some(Exit::ArmException(platform::ArmException {
+            address,
+            syndrome,
+            write_value,
+            hvc_registers: hvc_registers.map(|[x0, x1, x2, x3]| (x0, x1, x2, x3)),
+        })),
         vm::VcpuExit::HvcResult(vm::HvcResult { target, status }) => {
             Some(Exit::HvcResult(platform::HvcResult { target, status }))
         }
@@ -119,7 +97,6 @@ fn native_action(action: Completion) -> vm::VcpuAction {
         Completion::ArmRead(platform::ArmRead { register, value }) => {
             vm::VcpuAction::ArmRead(vm::ArmRead { register, value })
         }
-        Completion::ArmRegister(register) => vm::VcpuAction::ArmRegister(register),
         Completion::HvcReturn(status) => vm::VcpuAction::HvcReturn(status),
         Completion::CpuStart(platform::CpuStart {
             target,
@@ -137,21 +114,11 @@ fn native_action(action: Completion) -> vm::VcpuAction {
 
 impl vm::VcpuHandler for NativeVcpu {
     fn exchange(&mut self, exit: vm::VcpuExit) -> Result<vm::VcpuAction, String> {
-        if matches!(exit, vm::VcpuExit::ArmException(_)) {
-            self.arm_registers = 0;
-        }
         let exit = native_exit(exit)
             .ok_or_else(|| "IOAPIC exits require the runtime interrupt adapter".to_owned())?;
-        let action = NativeVcpu::exchange(self, exit)
+        NativeVcpu::exchange(self, exit)
             .map(native_action)
-            .map_err(|error| error.to_string())?;
-        if let vm::VcpuAction::ArmRegister(register) = action {
-            if register > 31 || self.arm_registers == 4 {
-                return Err("VMM exceeded ARM register access grant".to_owned());
-            }
-            self.arm_registers += 1;
-        }
-        Ok(action)
+            .map_err(|error| error.to_string())
     }
 
     fn finished(&mut self, outcome: vm::VcpuOutcome) {
@@ -171,13 +138,18 @@ struct Rendezvous {
 
 pub struct Vcpu(Option<Rendezvous>);
 
+impl PlatformHost {
+    #[cfg(test)]
+    pub(crate) fn add_test_vcpu(&mut self) -> (NativeVcpu, Resource<Vcpu>) {
+        let (native, vcpu) = vcpu_channel();
+        (native, self.table.push(vcpu).unwrap())
+    }
+}
+
 pub(super) fn vcpu_channel() -> (NativeVcpu, Vcpu) {
     let (sender, exits) = tokio::sync::mpsc::channel(1);
     (
-        NativeVcpu {
-            sender,
-            arm_registers: 0,
-        },
+        NativeVcpu { sender },
         Vcpu(Some(Rendezvous {
             exits,
             state: VcpuState::AwaitingStart,
@@ -198,9 +170,7 @@ fn accepts_completion(
         Exit::PioRead(_) => matches!(completion, Completion::PioZero),
         Exit::Rdmsr(_) => matches!(completion, Completion::Rdmsr(_) | Completion::MsrFault),
         Exit::Wrmsr(_) => matches!(completion, Completion::Wrmsr | Completion::MsrFault),
-        Exit::ArmException(_) | Exit::ArmRegisterValue(_) => {
-            accepts_arm_completion(completion, completion_grant)
-        }
+        Exit::ArmException(_) => accepts_arm_completion(completion, completion_grant),
         Exit::HvcResult(_) => matches!(completion, Completion::HvcReturn(_)),
         Exit::Shutdown | Exit::Stopped => false,
     }
@@ -212,7 +182,6 @@ fn accepts_arm_completion(
 ) -> bool {
     match completion {
         Completion::ArmRead(read) => read.register.is_none_or(|register| register < 31),
-        Completion::ArmRegister(register) => *register <= 31,
         Completion::HvcReturn(_) | Completion::CpuOff | Completion::SystemStop => true,
         Completion::CpuStart(start) => completion_grant.is_some_and(|(config, ram)| {
             config.architecture() == Architecture::Arm
@@ -257,10 +226,7 @@ impl<T: Send + 'static> platform::HostVcpuWithStore<T> for Platform {
             VcpuState::AwaitingCompletion(pending) => {
                 let valid = if matches!(
                     (&pending.exit, &completion),
-                    (
-                        Exit::ArmException(_) | Exit::ArmRegisterValue(_),
-                        Completion::CpuStart(_)
-                    )
+                    (Exit::ArmException(_), Completion::CpuStart(_))
                 ) {
                     accessor.with(|mut store| {
                         let (config, ram) = store.get().completion_grant()?;
@@ -301,6 +267,139 @@ mod tests {
     use super::*;
     use std::future::Future;
     use std::task::{Context, Poll, Waker};
+
+    #[test]
+    fn dropping_platform_disconnects_pending_vcpu_completion() {
+        let (_native, mut vcpu) = vcpu_channel();
+        let (reply, response) = mpsc::sync_channel(1);
+        vcpu.0.as_mut().unwrap().state = VcpuState::AwaitingCompletion(Pending {
+            exit: Exit::MmioWrite(platform::MmioWrite {
+                address: 0x70,
+                width: 4,
+                value: 128,
+            }),
+            reply,
+        });
+        let mut host = PlatformHost::default();
+        host.table.push(vcpu).unwrap();
+        assert!(matches!(
+            response.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        drop(host);
+        assert!(matches!(
+            response.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+    }
+
+    /// Wasmtime keeps spawned host tasks in the Store after `run_concurrent` is
+    /// dropped. A pending resume owns the receiver outside the resource table,
+    /// so retiring the failed Store must disconnect queued native completions
+    /// before native teardown begins.
+    #[tokio::test]
+    async fn child_failure_disconnects_a_queued_exit_in_a_retained_resume() {
+        use crate::box_runtime::{BoxHost, BoxRuntime};
+        use crate::component::vmm::teardown::DeviceShutdown;
+        use crate::machine::DeviceKind;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        use wasmtime::component::AccessorTask;
+
+        struct RetainedResume {
+            resource_index: u32,
+            sender: tokio::sync::mpsc::Sender<Pending>,
+            pending: Pending,
+            ready: tokio::sync::oneshot::Sender<()>,
+        }
+
+        impl AccessorTask<BoxHost> for RetainedResume {
+            async fn run(self, accessor: &Accessor<BoxHost>) -> wasmtime::Result<()> {
+                let platform = accessor.with_getter::<Platform>(|host| &mut host.platform);
+                let mut resume =
+                    Box::pin(<Platform as platform::HostVcpuWithStore<BoxHost>>::resume(
+                        &platform,
+                        Resource::new_borrow(self.resource_index),
+                        Completion::Start,
+                    ));
+                assert!(
+                    std::future::poll_fn(|context| { Poll::Ready(resume.as_mut().poll(context)) })
+                        .await
+                        .is_pending()
+                );
+                platform.with(|mut access| {
+                    let vcpu = access
+                        .get()
+                        .table
+                        .get(&Resource::<Vcpu>::new_borrow(self.resource_index))
+                        .unwrap();
+                    assert!(vcpu.0.is_none());
+                });
+                self.sender.try_send(self.pending).unwrap();
+                self.ready.send(()).unwrap();
+                std::future::pending::<()>().await;
+                drop(resume);
+                Ok(())
+            }
+        }
+
+        let engine = crate::engine::device_engine().unwrap();
+        let mut root = BoxRuntime::new(&engine, BoxHost::new()).unwrap();
+        let (native, resource) = root.store.data_mut().platform.add_test_vcpu();
+        let (reply, response) = mpsc::sync_channel(1);
+        let (ready, failed_child) = tokio::sync::oneshot::channel();
+        let task = RetainedResume {
+            resource_index: resource.rep(),
+            sender: native.sender,
+            pending: Pending {
+                exit: Exit::Halt,
+                reply,
+            },
+            ready,
+        };
+        root.register_loop(Box::new(move |accessor| {
+            Box::pin(async move {
+                drop(accessor.spawn(task)?);
+                std::future::pending::<wasmtime::Result<()>>().await
+            })
+        }))
+        .unwrap();
+        let disconnected = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&disconnected);
+        root.add_device_shutdown(DeviceShutdown::new(DeviceKind::Memory, async move {
+            let is_disconnected =
+                matches!(response.try_recv(), Err(mpsc::TryRecvError::Disconnected));
+            observed.store(is_disconnected, Ordering::Release);
+            if is_disconnected {
+                Ok(())
+            } else {
+                Err("queued native completion retained during teardown".to_owned())
+            }
+        }))
+        .unwrap();
+        let mut child = root.new_child(crate::box_runtime::RootHost::new());
+        child
+            .register_loop(Box::new(move |_| {
+                Box::pin(async move {
+                    failed_child.await.unwrap();
+                    Err(wasmtime::Error::msg("child failed"))
+                })
+            }))
+            .unwrap();
+        root.attach_child(child).unwrap();
+        let error = root
+            .prepare()
+            .await
+            .unwrap()
+            .start()
+            .join()
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("child failed"), "{error}");
+        assert!(disconnected.load(Ordering::Acquire));
+    }
 
     #[test]
     fn native_terminal_notifications_preserve_the_outcome() {
@@ -388,15 +487,15 @@ mod tests {
                 vm::VcpuExit::ArmException(vm::ArmException {
                     address: 0x1234,
                     syndrome: 0x5678,
+                    write_value: Some(42),
+                    hvc_registers: None,
                 }),
                 Exit::ArmException(platform::ArmException {
                     address: 0x1234,
                     syndrome: 0x5678,
+                    write_value: Some(42),
+                    hvc_registers: None,
                 }),
-            ),
-            (
-                vm::VcpuExit::ArmRegisterValue(0x1234),
-                Exit::ArmRegisterValue(0x1234),
             ),
             (
                 vm::VcpuExit::HvcResult(vm::HvcResult {
@@ -458,7 +557,6 @@ mod tests {
                     value: 0x4567,
                 }),
             ),
-            (Completion::ArmRegister(31), vm::VcpuAction::ArmRegister(31)),
             (Completion::HvcReturn(-3), vm::VcpuAction::HvcReturn(-3)),
             (
                 Completion::CpuStart(platform::CpuStart {
@@ -613,6 +711,8 @@ mod tests {
         let arm_exception = Exit::ArmException(platform::ArmException {
             address: 0,
             syndrome: 0,
+            write_value: None,
+            hvc_registers: None,
         });
         let arm_read = Completion::ArmRead(platform::ArmRead {
             register: Some(31),
@@ -639,11 +739,6 @@ mod tests {
                 width: 4,
             }),
             &Completion::Reenter,
-            None
-        ));
-        assert!(accepts_completion(
-            &arm_exception,
-            &Completion::ArmRegister(31),
             None
         ));
         assert!(!accepts_completion(&arm_exception, &arm_read, None));
@@ -696,51 +791,36 @@ mod tests {
     }
 
     #[test]
-    fn arm_register_requests_are_bounded_independently_of_wasm() {
-        for registers in [vec![255], vec![0, 1, 2, 3, 4]] {
-            let (native, mut component) = vcpu_channel();
-            let mut rendezvous = component.0.take().unwrap();
-            let reads = std::sync::atomic::AtomicUsize::new(0);
-            std::thread::scope(|scope| {
-                let task = scope.spawn(|| {
-                    native.exchange_arm_exception(0, 0, |_| {
-                        reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        Ok(42)
-                    })
-                });
-                for register in &registers {
-                    let pending = rendezvous.exits.blocking_recv().unwrap();
-                    pending
-                        .reply
-                        .send(Completion::ArmRegister(*register))
-                        .unwrap();
-                }
-                assert!(task.join().unwrap().is_err());
-                assert_eq!(
-                    reads.load(std::sync::atomic::Ordering::Relaxed),
-                    registers.len() - 1
-                );
-            });
-        }
-    }
-
-    #[test]
-    fn arm_register_31_is_a_zero_source() {
-        let (native, mut component) = vcpu_channel();
+    fn arm_write_source_is_carried_in_one_rendezvous() {
+        let (mut native, mut component) = vcpu_channel();
         let mut rendezvous = component.0.take().unwrap();
         std::thread::scope(|scope| {
             let task = scope.spawn(|| {
-                native.exchange_arm_exception(0, 0, |register| {
-                    assert_eq!(register, 31);
-                    Ok(0)
-                })
+                let exception =
+                    vm::ArmException::capture(0, (0x24 << 26) | (1 << 24) | (1 << 6), |register| {
+                        assert_eq!(register, 0);
+                        Ok::<_, String>(42)
+                    })
+                    .unwrap();
+                vm::VcpuHandler::exchange(&mut native, vm::VcpuExit::ArmException(exception))
             });
             let pending = rendezvous.exits.blocking_recv().unwrap();
-            pending.reply.send(Completion::ArmRegister(31)).unwrap();
-            let pending = rendezvous.exits.blocking_recv().unwrap();
-            assert!(matches!(pending.exit, Exit::ArmRegisterValue(0)));
-            pending.reply.send(Completion::Reenter).unwrap();
-            assert!(matches!(task.join().unwrap().unwrap(), Completion::Reenter));
+            let Exit::ArmException(exception) = pending.exit else {
+                panic!("ARM exception")
+            };
+            assert_eq!(exception.write_value, Some(42));
+            pending
+                .reply
+                .send(Completion::ArmRead(platform::ArmRead {
+                    register: None,
+                    value: 0,
+                }))
+                .unwrap();
+            assert!(matches!(
+                task.join().unwrap().unwrap(),
+                vm::VcpuAction::ArmRead(_)
+            ));
+            assert!(rendezvous.exits.try_recv().is_err());
         });
     }
 }

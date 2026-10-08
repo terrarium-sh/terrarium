@@ -65,7 +65,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -76,7 +76,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -209,7 +209,7 @@ dependencies = [
  "maybe-owned",
  "rustix",
  "rustix-linux-procfs",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
  "winx",
 ]
 
@@ -660,7 +660,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1203,6 +1203,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
+name = "lru"
+version = "0.18.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef9ac18847474e638e3702b76c65d4eb93428471a74778ef0f1be711717f89b5"
+dependencies = [
+ "hashbrown 0.17.1",
+]
+
+[[package]]
 name = "mach2"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1605,7 +1614,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1798,7 +1807,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1894,7 +1903,7 @@ dependencies = [
  "getrandom",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1917,7 +1926,6 @@ dependencies = [
  "crossterm",
  "flate2",
  "libc",
- "linux-raw-sys",
  "log",
  "notify",
  "rustix",
@@ -1928,10 +1936,14 @@ dependencies = [
  "syscalls",
  "sysinfo",
  "tempfile",
+ "terra-build",
  "terra-limits",
+ "terra-network",
  "terra-platform",
+ "terra-policy",
  "terra-protocol",
  "terra-runtime",
+ "terra-sandbox",
  "tokio",
  "tracing-appender",
  "tracing-subscriber",
@@ -1946,6 +1958,7 @@ dependencies = [
  "anyhow",
  "async-io",
  "futures-util",
+ "libc",
  "linux-raw-sys",
  "pty-process",
  "rustix",
@@ -1958,8 +1971,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "terra-build"
+version = "0.0.1"
+dependencies = [
+ "syscalls",
+]
+
+[[package]]
 name = "terra-limits"
 version = "0.0.1"
+
+[[package]]
+name = "terra-network"
+version = "0.0.1"
+dependencies = [
+ "futures-util",
+ "serde",
+ "socket2",
+ "terra-limits",
+ "terra-policy",
+ "terra-protocol",
+ "tokio",
+ "tokio-util",
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "terra-platform"
@@ -1983,9 +2018,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "terra-policy"
+version = "0.0.1"
+dependencies = [
+ "lru",
+ "serde",
+]
+
+[[package]]
 name = "terra-protocol"
 version = "0.0.1"
 dependencies = [
+ "flate2",
  "postcard",
  "serde",
  "serde_bytes",
@@ -1998,7 +2042,6 @@ name = "terra-runtime"
 version = "0.0.1"
 dependencies = [
  "flate2",
- "futures-channel",
  "futures-util",
  "libc",
  "log",
@@ -2006,24 +2049,34 @@ dependencies = [
  "target-lexicon",
  "tempfile",
  "terra-limits",
+ "terra-network",
  "terra-platform",
  "terra-protocol",
  "terra-runtime",
- "terra-vsock-device",
  "tokio",
  "tokio-util",
  "wasmtime",
  "wasmtime-wasi",
  "windows-sys 0.61.2",
- "yamux",
 ]
 
 [[package]]
-name = "terra-vsock-device"
+name = "terra-sandbox"
 version = "0.0.1"
 dependencies = [
- "terra-protocol",
- "virtio-vsock",
+ "anyhow",
+ "libc",
+ "linux-raw-sys",
+ "log",
+ "rustix",
+ "seccompiler",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "terra-build",
+ "terra-platform",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2219,7 +2272,7 @@ checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
 dependencies = [
  "memoffset",
  "tempfile",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2269,36 +2322,6 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
-name = "virtio-bindings"
-version = "0.2.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "091f1f09cfbf2a78563b562e7a949465cce1aef63b6065645188d995162f8868"
-
-[[package]]
-name = "virtio-queue"
-version = "0.18.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f631bfd09362a9b17f0cfd5ca3b0a1b179d153fa276f9ce86919d560891e61d6"
-dependencies = [
- "libc",
- "log",
- "virtio-bindings",
- "vm-memory",
- "vmm-sys-util",
-]
-
-[[package]]
-name = "virtio-vsock"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "79123315dc0bad0a2923891c0cdf76269cc64f553548e7b090c2676776ea6baf"
-dependencies = [
- "virtio-bindings",
- "virtio-queue",
- "vm-memory",
-]
 
 [[package]]
 name = "vm-memory"
@@ -2765,7 +2788,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

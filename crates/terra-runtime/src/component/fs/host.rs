@@ -117,31 +117,6 @@ impl FsHost {
             .cloned()
             .map_err(|_| terra::fs::host::Error::Access)
     }
-
-    pub fn set_mode_for_descriptor(
-        &mut self,
-        descriptor: &Resource<Descriptor>,
-        mode: u32,
-    ) -> Result<(), terra::fs::host::Error> {
-        if self.grant.readonly {
-            return Err(terra::fs::host::Error::Access);
-        }
-        set_mode(&self.clone_descriptor(descriptor)?, mode)
-    }
-
-    pub fn mode_for_descriptor(
-        &mut self,
-        descriptor: &Resource<Descriptor>,
-    ) -> Result<Option<u32>, terra::fs::host::Error> {
-        get_mode(&self.clone_descriptor(descriptor)?)
-    }
-
-    pub fn statfs_for_descriptor(
-        &mut self,
-        descriptor: &Resource<Descriptor>,
-    ) -> Result<terra::fs::host::FilesystemStat, terra::fs::host::Error> {
-        statfs(&self.clone_descriptor(descriptor)?)
-    }
 }
 
 impl WasiView for FsHost {

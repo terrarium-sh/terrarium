@@ -7,6 +7,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+// Forked siblings can retain a concurrent copy's writable descriptor until exec.
+static INSTALLED_BINARY_FIXTURES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn assets_dir() -> PathBuf {
     std::env::var_os("TERRA_TEST_ASSETS").map_or_else(
         || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/assets"),
@@ -24,6 +27,7 @@ fn copy_installed_binary(directory: &Path) -> PathBuf {
 
 #[test]
 fn bundled_self_test_runs_without_a_source_checkout_or_generation_tools() {
+    let _guard = INSTALLED_BINARY_FIXTURES.lock().unwrap();
     let directory = tempfile::tempdir().unwrap();
     let installed = copy_installed_binary(directory.path());
     let result = Command::new(installed)
@@ -37,6 +41,45 @@ fn bundled_self_test_runs_without_a_source_checkout_or_generation_tools() {
         "{}\n{}",
         String::from_utf8_lossy(&result.stdout),
         String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(!directory.path().join("terra-seccomp").exists());
+}
+
+#[test]
+#[ignore = "requires native virtualization"]
+fn bundled_guest_self_test_runs_with_an_empty_path() {
+    let _guard = INSTALLED_BINARY_FIXTURES.lock().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let installed = copy_installed_binary(directory.path());
+    let diagnostics = directory.path().join("diagnostics");
+    let result = Command::new(installed)
+        .args(["self-test", "--validate-vm", "--diagnostics"])
+        .arg(&diagnostics)
+        .current_dir(directory.path())
+        .env("PATH", "")
+        .env_remove("RUST_LOG")
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&result.stdout).contains("self-test: passed; diagnostics:"),
+        "{result:?}"
+    );
+    let guest_log = std::fs::read_dir(&diagnostics)
+        .unwrap()
+        .map(|entry| entry.unwrap().path().join("self_test.built_in_guest.log"))
+        .find(|path| path.is_file())
+        .expect("guest self-test diagnostics");
+    assert!(
+        std::fs::read_to_string(guest_log)
+            .unwrap()
+            .contains("self-test: passed"),
+        "guest self-test did not report success"
     );
     assert!(!directory.path().join("terra-seccomp").exists());
 }
@@ -58,28 +101,34 @@ fn assert_generated_policy(output: &Path, binary: &Path, vm_validated: bool) -> 
     }
 
     assert!(output.symlink_metadata().unwrap().is_symlink());
-    let policy_bytes = std::fs::read(output.join("terra.seccomp.json")).unwrap();
-    let bpf = std::fs::read(output.join("terra.seccomp.bpf")).unwrap();
-    let policy: serde_json::Value = serde_json::from_slice(&policy_bytes).unwrap();
     let manifest: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(output.join("terra.seccomp-manifest.json")).unwrap())
-            .unwrap();
+        serde_json::from_slice(&std::fs::read(output.join("manifest.json")).unwrap()).unwrap();
     let binary_hash = hash_bytes(&std::fs::read(binary).unwrap());
     assert_eq!(manifest["executable_sha256"], binary_hash);
-    assert_eq!(manifest["policy_sha256"], hash_bytes(&policy_bytes));
-    assert_eq!(manifest["bpf_sha256"], hash_bytes(&bpf));
+    assert_eq!(manifest["roles"].as_object().unwrap().len(), 3);
+    for role in ["supervisor", "vm", "network"] {
+        let policy_bytes = std::fs::read(output.join(format!("{role}.seccomp.json"))).unwrap();
+        let bpf = std::fs::read(output.join(format!("{role}.seccomp.bpf"))).unwrap();
+        let policy: serde_json::Value = serde_json::from_slice(&policy_bytes).unwrap();
+        assert_eq!(
+            manifest["roles"][role]["policy_sha256"],
+            hash_bytes(&policy_bytes)
+        );
+        assert_eq!(manifest["roles"][role]["bpf_sha256"], hash_bytes(&bpf));
+        assert!(manifest["roles"][role]["verified_execs"].as_u64().unwrap() > 0);
+        assert!((8..=4096 * 8).contains(&bpf.len()) && bpf.len().is_multiple_of(8));
+        assert_eq!(manifest["target"], policy["target"]);
+        assert_eq!(policy["default_action"], "kill_process");
+        assert!(!policy["rules"].as_array().unwrap().is_empty());
+    }
     assert_eq!(
         std::fs::read_to_string(output.join(".validated"))
             .unwrap()
             .trim(),
         binary_hash
     );
-    assert!((8..=4096 * 8).contains(&bpf.len()) && bpf.len().is_multiple_of(8));
     assert_eq!(manifest["format_version"], 1);
     assert_eq!(manifest["policy_compiler"], "seccompiler_0_5_0");
-    assert_eq!(manifest["target"], policy["target"]);
-    assert_eq!(policy["default_action"], "kill_process");
-    assert!(!policy["rules"].as_array().unwrap().is_empty());
     assert_eq!(manifest["validation"]["passed"], true);
     assert_eq!(manifest["validation"]["vm_validated"], vm_validated);
     assert!(manifest["validation"]["traced_execs"].as_u64().unwrap() > 0);
@@ -103,6 +152,7 @@ fn assert_generated_policy(output: &Path, binary: &Path, vm_validated: bool) -> 
 ))]
 #[test]
 fn bundled_policy_generation_needs_no_tools_and_preserves_previous_publication() {
+    let _guard = INSTALLED_BINARY_FIXTURES.lock().unwrap();
     let directory = tempfile::tempdir().unwrap();
     let installed = copy_installed_binary(directory.path());
     let output = directory.path().join("policy");
@@ -135,11 +185,15 @@ fn bundled_policy_generation_needs_no_tools_and_preserves_previous_publication()
     let children = format!("/proc/{0}/task/{0}/children", generation.id());
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
+        // Stopping before exec blocks Command::spawn before the workload timeout starts.
         if let Some(pid) = std::fs::read_to_string(&children)
             .unwrap_or_default()
             .split_whitespace()
             .next()
             .and_then(|pid| pid.parse().ok())
+            && std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|arguments| {
+                arguments.split(|byte| *byte == 0).nth(1) == Some(b"__sandbox_policy".as_slice())
+            })
         {
             rustix::process::kill_process(
                 rustix::process::Pid::from_raw(pid).unwrap(),
@@ -187,6 +241,7 @@ fn bundled_policy_generation_needs_no_tools_and_preserves_previous_publication()
 #[test]
 #[ignore = "requires native KVM and Bubblewrap user namespaces"]
 fn bundled_guest_policy_generation_runs_with_an_empty_path() {
+    let _guard = INSTALLED_BINARY_FIXTURES.lock().unwrap();
     let directory = tempfile::tempdir().unwrap();
     let installed = copy_installed_binary(directory.path());
     let output = directory.path().join("policy");
@@ -357,21 +412,6 @@ impl Suite {
         (self.boot_recipe(&recipe, name, extra), prj)
     }
 
-    fn boot_with_mount(&self, name: &str, host: &Path, readonly: bool, script: &str) -> String {
-        let recipe = self.get_work_dir().join(format!("{name}.yaml"));
-        let script = script.replace('\n', "\n      ");
-        let readonly = if readonly { "    readonly: true\n" } else { "" };
-        std::fs::write(
-            &recipe,
-            format!(
-                "workload:\n  entrypoint: /bin/sh\n  args:\n    - -ec\n    - |\n      {script}\nmounts:\n  - host: {}\n    guest: /work\n{readonly}",
-                host.display()
-            ),
-        )
-        .unwrap();
-        self.boot_recipe(&recipe, name, &[])
-    }
-
     fn boot_with_repository_mount(
         &self,
         name: &str,
@@ -417,7 +457,12 @@ impl Suite {
     }
 
     fn compile_probe(&self, name: &str) -> PathBuf {
-        let probe = self.get_work_dir().join(format!("terra-{name}-probe"));
+        let directory = self.get_work_dir().join("probes");
+        std::fs::create_dir_all(&directory).unwrap();
+        if let Some(reader) = std::env::var_os("TERRA_SOCKET_KMSG_READER") {
+            std::fs::copy(reader, directory.join("kmsg-reader")).unwrap();
+        }
+        let probe = directory.join(format!("terra-{name}-probe"));
         let source = assets_dir().join(format!("{name}_probe.c"));
         let status = Command::new("zig")
             .args([
@@ -427,6 +472,14 @@ impl Suite {
             ])
             .args(["-static", "-O2", "-o"])
             .arg(&probe)
+            .arg(format!(
+                "-DTERRA_SOCKET_ABI={}",
+                terra_protocol::socket::VERSION
+            ))
+            .arg(format!(
+                "-DTERRA_NETWORK_ABI={}",
+                terra_protocol::application::VERSION
+            ))
             .arg(source)
             .status()
             .expect("compiling guest probe");
@@ -720,10 +773,789 @@ fn pending_network_reads_do_not_block_other_downloads() {
     server.join().unwrap();
 }
 
-/// Completed execs release their vsock streams and client slots before the 64-stream limit.
+fn select_socket_probe_flags() -> &'static [&'static str] {
+    if std::env::var_os("TERRA_SOCKET_DMESG").is_some() {
+        &["--root"]
+    } else {
+        &[]
+    }
+}
+
+fn render_socket_probe_workload(arguments: Vec<String>) -> String {
+    let collect_kernel_log = !select_socket_probe_flags().is_empty();
+    let (entrypoint, arguments) = if collect_kernel_log {
+        let mut shell_arguments = vec![
+            "-c".into(),
+            "mknod /dev/kmsg c 1 11 2>/dev/null || true; /work/kmsg-reader & kernel_log_reader=$!; /work/terra-socket-probe \"$@\"; status=$?; kill \"$kernel_log_reader\"; wait \"$kernel_log_reader\" || true; dmesg; exit \"$status\"".into(),
+            "socket-probe".into(),
+        ];
+        shell_arguments.extend(arguments);
+        ("/bin/sh", shell_arguments)
+    } else {
+        ("/work/terra-socket-probe", arguments)
+    };
+    format!(
+        "workload:\n  entrypoint: {entrypoint}\n  args: {}\n",
+        serde_json::to_string(&arguments).unwrap()
+    )
+}
+
+/// A 24-KiB raw TCP carrier refills after consuming its separate 4-KiB first skb,
+/// even when the resulting 20-KiB queue is below `SO_RCVLOWAT=21` KiB.
+#[cfg(unix)]
+#[test]
+#[ignore = "boots a real microVM; requires a native hypervisor and Zig"]
+fn raw_vsock_tcp_receive_credit_preserves_high_lowat() {
+    use std::io::{Read, Write};
+    use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use terra_protocol::application::{Message, TcpTarget};
+
+    fn serve_credit_payload(
+        listener: &TcpListener,
+        marker: &Path,
+        payload: &[u8],
+        stop: &AtomicBool,
+    ) -> std::io::Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(90);
+        let (mut stream, _) = loop {
+            if stop.load(Ordering::Relaxed) || Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "raw receive-credit connection",
+                ));
+            }
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        stream.set_nodelay(true)?;
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+        stream.write_all(&payload[..4 * 1024])?;
+        while !std::fs::read_to_string(marker).is_ok_and(|value| value.trim() == "4096 1") {
+            if stop.load(Ordering::Relaxed) || Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "guest did not confirm separately queued first payload",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        stream.write_all(&payload[4 * 1024..])?;
+        stream.shutdown(Shutdown::Write)?;
+        let mut byte = [0];
+        assert_eq!(
+            stream.read(&mut byte)?,
+            0,
+            "guest sent no application payload"
+        );
+        Ok(())
+    }
+
+    let suite = Suite::new();
+    let probe = suite.compile_probe("vsock");
+    let directory = probe.parent().unwrap();
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let peer = SocketAddr::new(IpAddr::V4(terra_protocol::socket::HOST_SERVICE_IPV4), port);
+    let opening = Message::TcpOpen {
+        target: TcpTarget::Peer(peer),
+        inline_urgent: false,
+    }
+    .encode()
+    .unwrap();
+    let opened = Message::TcpOpened(Ok(peer)).encode().unwrap();
+    assert_eq!(opening.len(), 36);
+    assert_eq!(opened.len(), 32);
+    let payload: Vec<_> = (0..32 * 1024)
+        .map(|offset| u8::try_from(offset % 251).unwrap())
+        .collect();
+    std::fs::write(directory.join("VSOCK_CREDIT_OPEN"), opening).unwrap();
+    std::fs::write(directory.join("VSOCK_CREDIT_OPENED"), opened).unwrap();
+    std::fs::write(directory.join("VSOCK_CREDIT_PAYLOAD"), &payload).unwrap();
+    let marker = directory.join("VSOCK_CREDIT_INITIAL");
+    let recipe = suite.get_work_dir().join("raw-vsock-credit-lowat.yaml");
+    let configuration = serde_json::json!({
+        "network": {"allow": [format!("HOST_LOOPBACK:{port}")]},
+        "mounts": [{"host": directory, "guest": "/work", "readonly": false}],
+        "workload": {
+            "entrypoint": "/bin/sh",
+            "args": ["-ec", "exec /work/terra-vsock-probe receive-credit-lowat > /work/VSOCK_CREDIT_PROBE_LOG 2>&1"],
+        },
+    });
+    std::fs::write(&recipe, serde_json::to_vec(&configuration).unwrap()).unwrap();
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|threads| {
+        let server = threads.spawn(|| serve_credit_payload(&listener, &marker, &payload, &stop));
+        let output = suite.boot_recipe(&recipe, "raw-vsock-credit-lowat", &["--root"]);
+        let guest_log = std::fs::read_to_string(directory.join("VSOCK_CREDIT_PROBE_LOG"))
+            .unwrap_or_else(|error| format!("guest probe log unavailable: {error}"));
+        stop.store(true, Ordering::Relaxed);
+        let result = server.join().unwrap();
+        assert!(result.is_ok(), "{result:?}\n{output}\n{guest_log}");
+        assert!(
+            guest_log.contains("VSOCK_RECEIVE_CREDIT_LOWAT_OK"),
+            "{output}\n{guest_log}"
+        );
+    });
+}
+
+#[test]
+#[ignore = "boots real microVMs; requires a native hypervisor and Zig"]
+fn static_vsock_endpoint_classes_reject_unknown_duplicate_and_malformed_connections() {
+    let suite = Suite::new();
+    let probe = suite.compile_probe("vsock");
+    for enabled in [false, true] {
+        let name = if enabled {
+            "vsock-network"
+        } else {
+            "vsock-local"
+        };
+        let mode = if enabled {
+            "endpoints-network"
+        } else {
+            "endpoints"
+        };
+        let recipe = suite.get_work_dir().join(format!("{name}.yaml"));
+        std::fs::write(&recipe, format!(
+            "network:\n  enabled: {enabled}\nworkload:\n  entrypoint: /work/terra-vsock-probe\n  args: [{mode}]\nmounts:\n  - host: {}\n    guest: /work\n    readonly: true\n", probe.parent().unwrap().display()
+        )).unwrap();
+        let output = suite.boot_recipe(&recipe, name, &["--root"]);
+        assert!(
+            output.contains("VSOCK_ENDPOINT_CLASSES_OK"),
+            "{name}: {output}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "boots real microVMs; requires a native hypervisor"]
+fn static_socket_selection_preserves_local_and_namespace_routes() {
+    let suite = Suite::new();
+    let probe = suite.compile_probe("socket");
+    for (name, enabled, mode, marker) in [
+        (
+            "socket-local",
+            false,
+            "--namespaces",
+            "SOCKET_NAMESPACES_OK",
+        ),
+        ("socket-tsi", true, "--namespaces", "SOCKET_NAMESPACES_OK"),
+        ("socket-routes", true, "--routes", "SOCKET_ROUTES_OK"),
+        ("socket-errors", true, "--errors", "SOCKET_ERRORS_OK"),
+    ] {
+        let recipe = suite.get_work_dir().join(format!("{name}.yaml"));
+        std::fs::write(
+            &recipe,
+            format!(
+                "network:\n  enabled: {enabled}\n{}mounts:\n  - host: {}\n    guest: /work\n    readonly: true\n",
+                render_socket_probe_workload(vec![mode.into()]),
+                probe.parent().unwrap().display()
+            ),
+        )
+        .unwrap();
+        let output = suite.boot_recipe(&recipe, name, select_socket_probe_flags());
+        assert!(output.contains("SOCKET_LOCAL_OK"), "{name}: {output}");
+        assert!(output.contains(marker), "{name}: {output}");
+    }
+}
+
+#[test]
+#[ignore = "boots real microVMs; requires a native hypervisor"]
+fn static_libc_dns_resolves_configured_names() {
+    let suite = Suite::new();
+    let probe = suite.compile_probe("socket");
+    let recipe = suite.get_work_dir().join("socket-dns.yaml");
+    let text = format!(
+        "network:\n  hosts:\n    - name: many.test\n      addr: 192.0.2.1\nworkload:\n  entrypoint: /work/terra-socket-probe\n  args: [--dns]\nmounts:\n  - host: {}\n    guest: /work\n    readonly: true\n",
+        probe.parent().unwrap().display()
+    );
+    std::fs::write(&recipe, text).unwrap();
+    let output = suite.boot_recipe(&recipe, "socket-dns", &[]);
+    assert!(output.contains("SOCKET_DNS_OK"), "{output}");
+}
+
+fn serve_socket_probe_tcp(listener: &std::net::TcpListener, stop: &std::sync::atomic::AtomicBool) {
+    use std::io::{Read, Write};
+
+    listener.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while !stop.load(std::sync::atomic::Ordering::Relaxed) && Instant::now() < deadline {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(15)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(15)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                std::io::Read::by_ref(&mut stream)
+                    .take(8 << 20)
+                    .read_to_end(&mut bytes)
+                    .unwrap();
+                stream.write_all(&bytes).unwrap();
+                stream.shutdown(std::net::Shutdown::Write).unwrap();
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("socket probe accept: {error}"),
+        }
+    }
+}
+
+fn serve_socket_probe_udp(
+    socket: &std::net::UdpSocket,
+    stop: &std::sync::atomic::AtomicBool,
+    reply_marker: &Path,
+) -> Vec<usize> {
+    socket
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut bytes = [0; 8192];
+    let mut datagram_lengths = Vec::new();
+    while !stop.load(std::sync::atomic::Ordering::Relaxed) && Instant::now() < deadline {
+        match socket.recv_from(&mut bytes) {
+            Ok((length, peer)) => {
+                assert_ne!(&bytes[..length], b"TERRA_NESTED_FORWARDING");
+                datagram_lengths.push(length);
+                assert_eq!(socket.send_to(&bytes[..length], peer).unwrap(), length);
+                if &bytes[..length] == b"TERRA_ERRQUEUE_RESUME" {
+                    std::fs::write(reply_marker, []).unwrap();
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) => panic!("socket probe UDP: {error}"),
+        }
+    }
+    datagram_lengths
+}
+
+#[test]
+#[ignore = "boots a real microVM; requires a native hypervisor and matching kernel"]
+fn static_tcp_send_limits_preserve_user_overrides_and_queued_fin() {
+    use std::io::{Read, Write};
+
+    let suite = Suite::new();
+    let probe = suite.compile_probe("socket");
+    let directory = probe.parent().unwrap();
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let refused = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let refused_port = refused.local_addr().unwrap().port();
+    drop(refused);
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let output = std::thread::scope(|threads| {
+        let server = threads.spawn(|| {
+            let deadline = Instant::now() + Duration::from_secs(90);
+            let mut connections = 0;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) && Instant::now() < deadline {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(stream) => stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(error) => panic!("send limit peer: {error}"),
+                };
+                connections += 1;
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(15)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(15)))
+                    .unwrap();
+                let mut expected_prefix = None;
+                if connections == 6 {
+                    std::fs::write(directory.join("SEND_LIMIT_PEER_READY"), []).unwrap();
+                    loop {
+                        expected_prefix =
+                            std::fs::read_to_string(directory.join("SEND_LIMIT_SHRINK_READY"))
+                                .ok()
+                                .and_then(|length| length.trim().parse::<usize>().ok());
+                        if expected_prefix.is_some()
+                            || stop.load(std::sync::atomic::Ordering::Relaxed)
+                        {
+                            break;
+                        }
+                        assert!(
+                            Instant::now() < deadline,
+                            "guest did not release paused peer"
+                        );
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                let mut bytes = Vec::new();
+                Read::by_ref(&mut stream)
+                    .take((16 << 20) + 1)
+                    .read_to_end(&mut bytes)
+                    .unwrap();
+                assert_eq!(bytes.len(), expected_prefix.unwrap_or(0));
+                stream.write_all(&bytes).unwrap();
+                stream.shutdown(std::net::Shutdown::Write).unwrap();
+            }
+            connections
+        });
+        let recipe = suite.get_work_dir().join("socket-send-limits.yaml");
+        std::fs::write(&recipe, format!(
+            "network:\n  allow: [HOST_LOOPBACK:{port}, HOST_LOOPBACK:{refused_port}]\n{}mounts:\n  - host: {}\n    guest: /work\n    readonly: false\n",
+            render_socket_probe_workload(vec!["--send-limits".into(), "100.96.0.1".into(), port.to_string(), refused_port.to_string()]),
+            directory.display()
+        )).unwrap();
+        let mut flags = select_socket_probe_flags().to_vec();
+        if !flags.contains(&"--root") {
+            flags.push("--root");
+        }
+        let output = suite.boot_recipe(&recipe, "socket-send-limits", &flags);
+        eprintln!("{output}");
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(server.join().unwrap(), 6, "{output}");
+        output
+    });
+    assert!(output.contains("SOCKET_SEND_LIMITS_OK"), "{output}");
+    assert!(output.contains("SOCKET_SEND_LIMIT_SHRINK_OK"), "{output}");
+}
+
+/// Consuming only `MSG_ERRQUEUE` frees the shared UDP receive budget and resumes a buffered reply.
+#[test]
+#[ignore = "boots a real microVM; requires a native hypervisor and matching kernel"]
+fn static_udp_error_queue_consumption_resumes_buffered_reply() {
+    let suite = Suite::new();
+    let probe = suite.compile_probe("socket");
+    let socket = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+    let port = socket.local_addr().unwrap().port();
+    let reply_marker = probe.parent().unwrap().join("UDP_ERROR_REPLY_SENT");
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let output = std::thread::scope(|threads| {
+        threads.spawn(|| serve_socket_probe_udp(&socket, &stop, &reply_marker));
+        let recipe = suite.get_work_dir().join("socket-udp-error-budget.yaml");
+        std::fs::write(&recipe, format!(
+            "network:\n  allow: [HOST_LOOPBACK:{port}]\n{}mounts:\n  - host: {}\n    guest: /work\n    readonly: true\n",
+            render_socket_probe_workload(vec!["--udp-error-budget".into(), "100.96.0.1".into(), port.to_string()]),
+            probe.parent().unwrap().display()
+        )).unwrap();
+        let output = suite.boot_recipe(
+            &recipe,
+            "socket-udp-error-budget",
+            select_socket_probe_flags(),
+        );
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        output
+    });
+    assert!(
+        output.contains("SOCKET_ERROR_QUEUE_BUDGET_PAUSED"),
+        "{output}"
+    );
+    assert!(output.contains("SOCKET_ERROR_QUEUE_BUDGET_OK"), "{output}");
+}
+
+/// QUIC options survive the first external send; ECN/GSO controls preserve native delivery,
+/// external GSO reaches the host as separate intact datagrams, and rejected controls send nothing.
+#[test]
+#[ignore = "boots a real microVM; requires a native hypervisor and matching kernel"]
+fn static_quic_socket_options_and_gso_preserve_udp_boundaries() {
+    let suite = Suite::new();
+    let probe = suite.compile_probe("socket");
+    let ipv4 = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+    let port = ipv4.local_addr().unwrap().port();
+    let ipv6 = std::net::UdpSocket::bind(("::1", port)).unwrap();
+    let reply_marker = probe.parent().unwrap().join("UDP_ERROR_REPLY_SENT");
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let output = std::thread::scope(|threads| {
+        let ipv4_server = threads.spawn(|| serve_socket_probe_udp(&ipv4, &stop, &reply_marker));
+        let ipv6_server = threads.spawn(|| serve_socket_probe_udp(&ipv6, &stop, &reply_marker));
+        let recipe = suite.get_work_dir().join("socket-quic.yaml");
+        std::fs::write(&recipe, format!(
+            "network:\n  allow: [HOST_LOOPBACK:{port}]\n{}mounts:\n  - host: {}\n    guest: /work\n    readonly: true\n",
+            render_socket_probe_workload(vec!["--quic-socket".into(), "100.96.0.1".into(), port.to_string()]),
+            probe.parent().unwrap().display()
+        )).unwrap();
+        let output = suite.boot_recipe(&recipe, "socket-quic", select_socket_probe_flags());
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            ipv4_server.join().unwrap(),
+            [
+                7, 7, 7, 7, 1200, 1200, 1200, 1200, 1200, 1200, 1200, 1200, 1000, 1000, 401, 7, 7
+            ],
+            "IPv4 host datagrams: {output}"
+        );
+        assert_eq!(
+            ipv6_server.join().unwrap(),
+            [
+                7, 7, 7, 1200, 1200, 1200, 1200, 1200, 1200, 1200, 1200, 1000, 1000, 401, 7, 7
+            ],
+            "IPv6 host datagrams: {output}"
+        );
+        output
+    });
+    assert!(output.contains("SOCKET_QUIC_OK"), "{output}");
+}
+
+/// A consumed seven-byte datagram leaves 49,117 bytes of a 48-KiB peer window available.
+/// A 49,120-byte GSO batch must request fresh credit from a peer that sends no replies.
+#[test]
+#[ignore = "boots a real microVM; requires a native hypervisor and matching kernel"]
+fn static_quic_gso_requests_credit_for_an_atomic_batch() {
+    let suite = Suite::new();
+    let probe = suite.compile_probe("socket");
+    let socket = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let port = socket.local_addr().unwrap().port();
+    let directory = probe.parent().unwrap();
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let output = std::thread::scope(|threads| {
+        let sink = threads.spawn(|| {
+            let deadline = Instant::now() + Duration::from_secs(90);
+            let mut datagrams = 0;
+            let mut bytes = [0; 1201];
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) && Instant::now() < deadline {
+                match socket.recv_from(&mut bytes) {
+                    Ok((length, _peer)) => {
+                        if datagrams == 0 {
+                            assert_eq!(&bytes[..length], b"CREDIT!");
+                            std::fs::write(directory.join("UDP_CREDIT_FIRST_RECEIVED"), [])
+                                .unwrap();
+                        } else {
+                            assert!(datagrams <= 40);
+                            assert_eq!(length, 1200);
+                            let payload_start = (datagrams - 1) * 1200;
+                            assert!(bytes[..length].iter().enumerate().all(|(offset, byte)| {
+                                let index = payload_start + offset;
+                                usize::from(*byte) == (index * 17 + index / 1200) % 251
+                            }));
+                        }
+                        datagrams += 1;
+                        if datagrams == 41 {
+                            std::fs::write(directory.join("UDP_CREDIT_BATCH_RECEIVED"), [])
+                                .unwrap();
+                        }
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(error) => panic!("one-way QUIC credit sink: {error}"),
+                }
+            }
+            datagrams
+        });
+        let recipe = suite.get_work_dir().join("socket-quic-credit.yaml");
+        std::fs::write(&recipe, format!(
+            "network:\n  allow: [HOST_LOOPBACK:{port}]\n{}mounts:\n  - host: {}\n    guest: /work\n    readonly: true\n",
+            render_socket_probe_workload(vec!["--quic-credit".into(), "100.96.0.1".into(), port.to_string()]),
+            directory.display()
+        )).unwrap();
+        let output = suite.boot_recipe(&recipe, "socket-quic-credit", select_socket_probe_flags());
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(sink.join().unwrap(), 41, "{output}");
+        output
+    });
+    assert!(output.contains("SOCKET_QUIC_CREDIT_OK"), "{output}");
+}
+
+#[test]
+#[ignore = "boots a real microVM; requires a native hypervisor"]
+fn static_socket_calls_forward_tcp_and_udp_through_authorized_broker() {
+    let suite = Suite::new();
+    let probe = suite.compile_probe("socket");
+    let tcp = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let first_udp = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+    let second_udp = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+    let ports = [
+        tcp.local_addr().unwrap().port(),
+        first_udp.local_addr().unwrap().port(),
+        second_udp.local_addr().unwrap().port(),
+    ];
+    let ipv6_udp = std::net::UdpSocket::bind(("::1", ports[1])).unwrap();
+    let reply_marker = probe.parent().unwrap().join("UDP_ERROR_REPLY_SENT");
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let output = std::thread::scope(|threads| {
+        threads.spawn(|| serve_socket_probe_tcp(&tcp, &stop));
+        threads.spawn(|| serve_socket_probe_udp(&first_udp, &stop, &reply_marker));
+        threads.spawn(|| serve_socket_probe_udp(&second_udp, &stop, &reply_marker));
+        threads.spawn(|| serve_socket_probe_udp(&ipv6_udp, &stop, &reply_marker));
+        let recipe = suite.get_work_dir().join("socket-external.yaml");
+        std::fs::write(&recipe, format!(
+            "network:\n  allow: [HOST_LOOPBACK:{}, HOST_LOOPBACK:{}, HOST_LOOPBACK:{}]\n{}mounts:\n  - host: {}\n    guest: /work\n    readonly: true\n",
+            ports[0], ports[1], ports[2],
+            render_socket_probe_workload(vec!["--external".into(), "100.96.0.1".into(), ports[0].to_string(), ports[1].to_string(), ports[2].to_string()]),
+            probe.parent().unwrap().display()
+        )).unwrap();
+        let output = suite.boot_recipe(&recipe, "socket-external", select_socket_probe_flags());
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        output
+    });
+    assert!(output.contains("SOCKET_EXTERNAL_OK"), "{output}");
+    assert!(output.contains("SOCKET_TCP_PEEK_OFFSET_OK"), "{output}");
+    assert!(
+        output.contains("SOCKET_NESTED_FORWARDING_UNSUPPORTED_OK"),
+        "{output}"
+    );
+}
+
+/// UDP publication retains datagrams and distinct relay peers, excludes loopback-only services,
+/// and releases both transport listeners on stop before the same box restarts.
+#[test]
+#[ignore = "boots a real microVM; requires a native hypervisor and Zig"]
+#[allow(clippy::too_many_lines)]
+fn published_udp_preserves_peers_datagrams_and_transport_isolation() {
+    use std::io::{Read as _, Write as _};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+
+    let suite = Suite::new();
+    let probe = suite.compile_probe("socket");
+    let project = suite.create_project_dir("server");
+    let (tcp_reservation, udp_reservation) = loop {
+        let tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        match UdpSocket::bind(tcp.local_addr().unwrap()) {
+            Ok(udp) => break (tcp, udp),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {}
+            Err(error) => panic!("reserve publication port: {error}"),
+        }
+    };
+    let port = udp_reservation.local_addr().unwrap().port();
+    let local_reservation = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let local_port = local_reservation.local_addr().unwrap().port();
+    let recipe = suite.get_work_dir().join("server.yaml");
+    let configuration = serde_json::json!({
+        "network": {"ports": [format!("{port}:18083/udp"), format!("{port}:18085/tcp"), format!("{local_port}:18084/udp")]},
+        "mounts": [{"host": probe.parent().unwrap(), "guest": "/work", "readonly": true}],
+        "daemons": [
+            "/work/terra-socket-probe --published-udp 18083 > /tmp/udp-published.log 2>&1",
+            "/work/terra-socket-probe --published-udp-loopback 18084 > /tmp/udp-loopback.log 2>&1",
+            "while true; do printf 'TCP_PUBLICATION' | busybox nc -l -p 18085; done",
+        ],
+        "workload": {"entrypoint": "/bin/sleep", "args": ["infinity"]},
+    });
+    std::fs::write(&recipe, serde_json::to_vec(&configuration).unwrap()).unwrap();
+    let project = project.to_str().unwrap();
+    assert_eq!(
+        suite
+            .run_terra_status(&[recipe.to_str().unwrap(), "setup", "--project", project])
+            .1,
+        0
+    );
+    drop((tcp_reservation, udp_reservation, local_reservation));
+    let clients = [
+        UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap(),
+        UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap(),
+        UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)).unwrap(),
+    ];
+    for client in &clients {
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+    }
+    let mut bytes = [0; 4097];
+    for _ in 1..=2 {
+        assert_eq!(
+            suite
+                .run_terra_status(&["server", "-d", "--project", project])
+                .1,
+            0
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let (logs, _) = suite.exec_in(
+                "server",
+                Path::new(project),
+                false,
+                &[
+                    "sh",
+                    "-c",
+                    "cat /tmp/udp-published.log /tmp/udp-loopback.log 2>/dev/null || true",
+                ],
+            );
+            if logs.matches("UDP_PUBLISHED_READY").count() == 2 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "UDP publication guest service did not start: {logs}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        for (index, client) in clients.iter().enumerate() {
+            let address = SocketAddr::new(client.local_addr().unwrap().ip(), port);
+            for payload in [
+                vec![u8::try_from(index).unwrap(), 0, 255, 7],
+                Vec::new(),
+                vec![91; 4096],
+            ] {
+                client.send_to(&payload, address).unwrap();
+                let received = client.recv_from(&mut bytes);
+                if let Err(error) = &received {
+                    let (guest_logs, _) = suite.exec_in(
+                        "server",
+                        Path::new(project),
+                        false,
+                        &[
+                            "sh",
+                            "-c",
+                            "cat /tmp/udp-published.log /tmp/udp-loopback.log",
+                        ],
+                    );
+                    let diagnostics = suite.run_terra_command(&[
+                        "server",
+                        "logs",
+                        "--diagnostics",
+                        "--project",
+                        project,
+                    ]);
+                    panic!(
+                        "UDP peer {index}, payload {} bytes: {error}\nguest services:\n{guest_logs}\ndiagnostics:\n{diagnostics}",
+                        payload.len()
+                    );
+                }
+                let (length, peer) = received.unwrap();
+                assert_eq!(peer, address);
+                assert_eq!(&bytes[..length], payload);
+            }
+        }
+        let client = &clients[0];
+        client
+            .set_read_timeout(Some(Duration::from_millis(150)))
+            .unwrap();
+        client
+            .send_to(&[73; 4097], (Ipv4Addr::LOCALHOST, port))
+            .unwrap();
+        let oversized = client.recv_from(&mut bytes).unwrap_err();
+        assert!(matches!(
+            oversized.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ));
+        client
+            .send_to(b"local-only", (Ipv4Addr::LOCALHOST, local_port))
+            .unwrap();
+        let isolated = client.recv_from(&mut bytes).unwrap_err();
+        assert!(matches!(
+            isolated.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ));
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client
+            .send_to(b"after-oversize", (Ipv4Addr::LOCALHOST, port))
+            .unwrap();
+        let (length, _) = client.recv_from(&mut bytes).unwrap();
+        assert_eq!(&bytes[..length], b"after-oversize");
+        let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+        let mut tcp = TcpStream::connect_timeout(&address, Duration::from_secs(2)).unwrap();
+        tcp.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        tcp.write_all(b"tcp-request").unwrap();
+        tcp.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut response = Vec::new();
+        tcp.read_to_end(&mut response).unwrap();
+        assert_eq!(response, b"TCP_PUBLICATION");
+        let (logs, status) = suite.exec_in(
+            "server",
+            Path::new(project),
+            false,
+            &["cat", "/tmp/udp-published.log"],
+        );
+        assert_eq!(status, 0);
+        let relay_ports: std::collections::BTreeSet<_> = logs
+            .lines()
+            .filter_map(|line| {
+                line.split_once("UDP_PUBLISHED_PEER_OK port=")?
+                    .1
+                    .split_whitespace()
+                    .next()
+            })
+            .collect();
+        assert!(
+            relay_ports.len() == 3,
+            "UDP publication must keep one distinct guest relay socket per host peer: {logs}"
+        );
+        assert_eq!(
+            suite
+                .exec_in(
+                    "server",
+                    Path::new(project),
+                    false,
+                    &[
+                        "rm",
+                        "-f",
+                        "/tmp/udp-published.log",
+                        "/tmp/udp-loopback.log"
+                    ]
+                )
+                .1,
+            0
+        );
+        assert_eq!(
+            suite
+                .run_terra_status(&["server", "stop", "--project", project])
+                .1,
+            0
+        );
+        assert!(TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok());
+        assert!(UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).is_ok());
+        assert!(UdpSocket::bind((Ipv6Addr::LOCALHOST, port)).is_ok());
+        assert!(UdpSocket::bind((Ipv4Addr::LOCALHOST, local_port)).is_ok());
+    }
+}
+
+/// A native reset after remote FIN reaches the guest while the guest write half remains open.
+#[cfg(unix)]
+#[test]
+#[ignore = "boots a real microVM; requires a native hypervisor and Zig"]
+fn native_tcp_reset_after_fin_preserves_the_socket_error() {
+    use std::io::Read as _;
+    use std::net::{Ipv4Addr, Shutdown, TcpListener};
+
+    let suite = Suite::new();
+    let probe = suite.compile_probe("socket");
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        stream.shutdown(Shutdown::Write).unwrap();
+        let mut observed_fin = [0];
+        stream.read_exact(&mut observed_fin).unwrap();
+        assert_eq!(&observed_fin, b"R");
+        rustix::net::sockopt::set_socket_linger(&stream, Some(Duration::ZERO)).unwrap();
+    });
+    let recipe = suite.get_work_dir().join("socket-reset-after-fin.yaml");
+    let configuration = serde_json::json!({
+        "network": {"allow": [format!("HOST_LOOPBACK:{port}")]},
+        "mounts": [{"host": probe.parent().unwrap(), "guest": "/work", "readonly": true}],
+        "workload": {"entrypoint": "/work/terra-socket-probe", "args": ["--reset-after-fin", "100.96.0.1", port.to_string()]},
+    });
+    std::fs::write(&recipe, serde_json::to_vec(&configuration).unwrap()).unwrap();
+    let output = suite.boot_recipe(
+        &recipe,
+        "socket-reset-after-fin",
+        select_socket_probe_flags(),
+    );
+    server.join().unwrap();
+    assert!(output.contains("SOCKET_RESET_AFTER_FIN_OK"), "{output}");
+}
+
+/// Completed execs release their agent streams and client slots before the 64-stream limit.
 #[test]
 #[ignore = "boots a real microVM - requires a native hypervisor: cargo test --test boot -- --ignored"]
-fn sequential_execs_reuse_vsock_client_slots() {
+fn sequential_execs_reuse_agent_client_slots() {
     let suite = Suite::new();
     let project = suite.create_project_dir("server");
     let recipe = suite.get_work_dir().join("server.yaml");
@@ -902,16 +1734,6 @@ fn run_boot_suite() {
         "VM without a hosts rule reached the port:\n{out}"
     );
 
-    // == exec: a second process beside the workload, root on request ==
-    // An exec inherits the agent's cwd - the plan's `workdir` - not the home
-    // dir: `exec pwd` must answer the recipe's `/work`, not `/home/terri`.
-    assert_eq!(
-        s.exec(false, &["pwd"]).0.trim(),
-        "/work",
-        "exec did not start in the plan workdir"
-    );
-    assert!(s.exec(false, &["id", "-u"]).0.contains("1000"));
-    assert!(s.exec(true, &["id", "-u"]).0.contains('0'));
     let (namespaces, status) = s.exec(
         false,
         &[
@@ -940,45 +1762,13 @@ fn run_boot_suite() {
         &[
             "sh",
             "-ec",
-            "grep -q ' - cgroup2 ' /proc/self/mountinfo; d=/tmp/terra-kernel-probe; rm -rf $d; mkdir -p $d/lower $d/upper $d/work $d/merged; echo lower > $d/lower/file; mount -t overlay overlay -o lowerdir=$d/lower,upperdir=$d/upper,workdir=$d/work $d/merged; test $(cat $d/merged/file) = lower; echo upper > $d/merged/file; test $(cat $d/upper/file) = upper; umount $d/merged; rm -rf $d; mkdir -p /dev/net; if test ! -e /dev/net/tun; then mknod /dev/net/tun c 10 200; fi; test -c /dev/net/tun; : <> /dev/net/tun; apk add --no-cache iproute2; ip link add terra-veth0 type veth peer name terra-veth1; ip link add terra-br0 type bridge; ip link set terra-veth0 master terra-br0; ip link del terra-veth0; ip link del terra-br0",
+            "mkdir -p /dev/net; if test ! -e /dev/net/tun; then mknod /dev/net/tun c 10 200; fi; test -c /dev/net/tun; : <> /dev/net/tun; apk add --no-cache iproute2; ip link add terra-veth0 type veth peer name terra-veth1; ip link add terra-br0 type bridge; ip link set terra-veth0 master terra-br0; ip link del terra-veth0; ip link del terra-br0",
         ],
     );
     assert_eq!(status, 0, "guest kernel container basics: {kernel_basics}");
     // The workload beside it is untouched: still uid 1000, no standing
     // escalation of its own - a `sudo:` grant is the thing this is not.
     assert!(s.exec(false, &["id", "-u"]).0.contains("1000"));
-    let (_, denied) = s.exec(false, &["sh", "-c", "id -u > /dev/null; doas id -u"]);
-    assert_ne!(denied, 0, "doas succeeded without a sudo: grant");
-
-    // The exit status is the command's - what makes exec usable from scripts.
-    assert_eq!(s.exec(false, &["sh", "-c", "exit 7"]).1, 7);
-    assert_eq!(s.exec(false, &["true"]).1, 0);
-
-    s.exec(
-        true,
-        &["sh", "-c", "echo ROOTWROTE > /etc/terra-exec-probe"],
-    );
-    assert!(
-        s.exec(false, &["cat", "/etc/terra-exec-probe"])
-            .0
-            .contains("ROOTWROTE"),
-        "exec --root did not write a root-only path"
-    );
-
-    // No terminal on this end, so the command gets pipes, not a PTY: line
-    // endings kept, isatty says no, stderr separate (it was suppressed).
-    assert_eq!(s.exec(false, &["printf", "a\\nb\\n"]).0, "a\nb\n");
-    assert!(
-        s.exec(false, &["sh", "-c", "test -t 1 && echo yes || echo no"])
-            .0
-            .contains("no")
-    );
-    let split = s.exec(false, &["sh", "-c", "echo OUT; echo ERR >&2"]).0;
-    assert!(
-        split.contains("OUT") && !split.contains("ERR"),
-        "pipe exec merged the streams: {split:?}"
-    );
-
     // == detach: -d hands the box to a background VM ==
     // Fire-and-forget once the box is confirmed up: exit 0 whatever the
     // workload later does; console and state stay reachable via logs/status.
@@ -1042,205 +1832,6 @@ fn run_boot_suite() {
         "the workload's terminal reached the log:\n{log}"
     );
 
-    // == sessions/detach: the agent names and drops attached clients ==
-    #[cfg(unix)]
-    {
-        let project = server.to_str().unwrap();
-        let sessions =
-            |s: &Suite| s.run_terra_command(&["server", "sessions", "--project", project]);
-        assert!(
-            sessions(&s).trim().is_empty(),
-            "a box nobody is attached to lists clients:\n{}",
-            sessions(&s)
-        );
-
-        // The PTY master stays open until the client detaches.
-        let attach = |s: &Suite| {
-            let (terminal, input) = console_input();
-            let child = Command::new(&s.terra)
-                .args(["server", "--project", project])
-                .env("HOME", &s.home)
-                .env("USERPROFILE", &s.home)
-                .stdin(input)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("spawning a terminal client");
-            (child, terminal)
-        };
-        let (mut client, _terminal) = attach(&s);
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let mut listed = String::new();
-        while Instant::now() < deadline {
-            listed = sessions(&s);
-            if listed.trim().starts_with("0\t") {
-                break;
-            }
-            std::thread::sleep(Duration::from_secs(1));
-        }
-        assert!(
-            listed.trim().starts_with("0\t"),
-            "the attached client never reached the session:\n{listed}"
-        );
-
-        // The detach closes the client's connection from the agent's side, so the
-        // client's process ends on its own - and the session is empty again.
-        s.run_terra_command(&["server", "detach", "0", "--project", project]);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Some(status) = client.try_wait().expect("waiting on the attach") {
-                assert_eq!(
-                    status.code(),
-                    Some(0),
-                    "the detached client did not exit cleanly"
-                );
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the detached client never exited"
-            );
-            std::thread::sleep(Duration::from_secs(1));
-        }
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline && !sessions(&s).trim().is_empty() {
-            std::thread::sleep(Duration::from_secs(1));
-        }
-        assert!(
-            sessions(&s).trim().is_empty(),
-            "a detached client is still listed:\n{}",
-            sessions(&s)
-        );
-        // A client that is already gone is refused, not silently re-detached.
-        let (_, code) = s.run_terra_status(&["server", "detach", "0", "--project", project]);
-        assert_ne!(code, 0, "re-detaching a gone client must fail");
-
-        // Two clients, and `--all` takes both of them.
-        let (mut a, _a_terminal) = attach(&s);
-        let (mut b, _b_terminal) = attach(&s);
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let mut listed = String::new();
-        while Instant::now() < deadline {
-            listed = sessions(&s);
-            let ids: Vec<&str> = listed
-                .lines()
-                .filter_map(|l| l.split('\t').next())
-                .collect();
-            if ids.len() >= 2 {
-                break;
-            }
-            std::thread::sleep(Duration::from_secs(1));
-        }
-        assert!(
-            sessions(&s).lines().count() >= 2,
-            "the second client never reached the session:\n{listed}"
-        );
-        s.run_terra_command(&["server", "detach", "--all", "--project", project]);
-        for client in [&mut a, &mut b] {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            loop {
-                if client.try_wait().expect("waiting on the attach").is_some() {
-                    break;
-                }
-                assert!(Instant::now() < deadline, "a detached client never exited");
-                std::thread::sleep(Duration::from_secs(1));
-            }
-        }
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline && !sessions(&s).trim().is_empty() {
-            std::thread::sleep(Duration::from_secs(1));
-        }
-        assert!(
-            sessions(&s).trim().is_empty(),
-            "clients survive a detach --all:\n{}",
-            sessions(&s)
-        );
-    }
-
-    // == sync: files travel in and out of the running box ==
-    let payload = format!("sync-roundtrip-{}", std::process::id());
-    let src = s.get_work_dir().join("sync-src.txt");
-    std::fs::write(&src, &payload).unwrap();
-    let dst = s.get_work_dir().join("sync-out.txt");
-    s.run_terra_command(&[
-        "server",
-        "sync",
-        src.to_str().unwrap(),
-        ":/tmp/sync.txt",
-        "--project",
-        server.to_str().unwrap(),
-    ]);
-    // …and back out with the box left off, which is the directory's only one:
-    // named or defaulted, both have to reach the same agent.
-    s.run_terra_command(&[
-        "sync",
-        ":/tmp/sync.txt",
-        dst.to_str().unwrap(),
-        "--project",
-        server.to_str().unwrap(),
-    ]);
-    assert_eq!(
-        std::fs::read_to_string(&dst).unwrap_or_default(),
-        payload,
-        "sync did not round-trip through the guest"
-    );
-
-    // == sync tree: directory tree synchronization, deletion, and checksum ==
-    let tree_dir = s.get_work_dir().join("sync-tree-src");
-    std::fs::create_dir_all(tree_dir.join("subdir")).unwrap();
-    std::fs::write(tree_dir.join("file1.txt"), b"file1-content").unwrap();
-    std::fs::write(tree_dir.join("subdir/file2.txt"), b"file2-content").unwrap();
-
-    s.run_terra_command(&[
-        "server",
-        "sync",
-        &format!("{}/", tree_dir.display()),
-        ":/tmp/synced-tree/",
-        "--project",
-        server.to_str().unwrap(),
-    ]);
-
-    let tree_out = s.get_work_dir().join("sync-tree-out");
-    s.run_terra_command(&[
-        "sync",
-        ":/tmp/synced-tree/",
-        &format!("{}/", tree_out.display()),
-        "--project",
-        server.to_str().unwrap(),
-    ]);
-    assert_eq!(
-        std::fs::read(tree_out.join("file1.txt")).unwrap(),
-        b"file1-content"
-    );
-    assert_eq!(
-        std::fs::read(tree_out.join("subdir/file2.txt")).unwrap(),
-        b"file2-content"
-    );
-
-    std::fs::remove_file(tree_dir.join("file1.txt")).unwrap();
-    std::fs::write(tree_dir.join("file3.txt"), b"file3-content").unwrap();
-    s.run_terra_command(&[
-        "server",
-        "sync",
-        "--delete",
-        &format!("{}/", tree_dir.display()),
-        ":/tmp/synced-tree/",
-        "--project",
-        server.to_str().unwrap(),
-    ]);
-
-    let (ls_out, status) = s.exec(false, &["sh", "-c", "ls /tmp/synced-tree"]);
-    assert_eq!(status, 0);
-    assert!(
-        !ls_out.contains("file1.txt"),
-        "file1.txt should have been deleted: {ls_out}"
-    );
-    assert!(
-        ls_out.contains("file3.txt"),
-        "file3.txt should exist: {ls_out}"
-    );
-    assert!(ls_out.contains("subdir"), "subdir should exist: {ls_out}");
-
     // == daemons: background commands restarted on failure ==
     // Each line runs beside the workload as guest root; a non-zero exit
     // respawns it after a second, exit 0 leaves it done. The workload waits a
@@ -1273,11 +1864,6 @@ fn run_boot_suite() {
         "the crashing daemon was not restarted:\n{out}"
     );
 
-    // == exit status: the workload's own, out of a VM that cannot carry one ==
-    // The hypervisor exits with 0 however the guest ended - its own exit-code
-    // channel wants a virtiofs root, and a box roots on a block device - so the
-    // status rides the control connection instead. Without it every boot looked
-    // successful to a script, and a failed `on_create` bake did too (below).
     let status_recipe = s.get_work_dir().join("exit-status.yaml");
     std::fs::write(&status_recipe, "workload:\n  entrypoint: /bin/true\n").unwrap();
     let status_project = s.create_project_dir("exit-status");
@@ -1301,48 +1887,12 @@ fn run_boot_suite() {
         ])
         .1
     };
-    assert_eq!(boot_with("exit 0"), 0, "a clean boot did not exit 0");
-    assert_eq!(
-        boot_with("exit 7"),
-        7,
-        "a boot did not exit with its workload's status"
-    );
     // A signal death is `128 + signal`, the way a shell spells it - and the way
     // `terra exec` already reports one, so a box and a command agree.
     assert_eq!(
         boot_with("kill -TERM $$"),
         128 + 15,
         "a signalled workload was not reported as 128 + signal"
-    );
-
-    // == a failing on_create fails the command that ran it ==
-    // It used to exit 0 and call the box ready, leaving a filesystem with no
-    // stamp - so the *next* boot refused instead, naming a bake nobody knew had
-    // failed.
-    let bad_bake = s.get_work_dir().join("bad-bake.yaml");
-    std::fs::write(
-        &bad_bake,
-        "hooks:\n  on_create:\n    - \"echo BAKE_RAN; exit 9\"\n",
-    )
-    .unwrap();
-    let bad_project = s.create_project_dir("bad-bake");
-    let (bake_output, bake_code) = s.run_terra_status(&[
-        bad_bake.to_str().unwrap(),
-        "setup",
-        "--project",
-        bad_project.to_str().unwrap(),
-    ]);
-    assert_ne!(bake_code, 0, "a failing on_create bake reported success");
-    assert!(bake_output.contains("BAKE_RAN"), "{bake_output}");
-    assert!(
-        s.run_terra_command(&[
-            "logs",
-            "--diagnostics",
-            "--project",
-            bad_project.to_str().unwrap()
-        ])
-        .contains("init failed"),
-        "the failed bake's diagnostic did not reach the log"
     );
 }
 
@@ -1384,89 +1934,6 @@ fn run_mount_boot_suite() {
     assert_eq!(std::fs::read(prj.join("wf")).unwrap(), b"w\n");
     #[cfg(unix)]
     assert_eq!(Suite::read_file_uid(&prj.join("wf")), Some(s.host_uid));
-
-    // == a writable share preserves ordinary repository-file operations ==
-    let writable = s.get_work_dir().join("mount-writable");
-    std::fs::create_dir(&writable).unwrap();
-    std::fs::write(writable.join("host.txt"), "host-visible").unwrap();
-    let executable = writable.join("run");
-    std::fs::write(&executable, "#!/bin/sh\necho EXECUTABLE\n").unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&executable, permissions).unwrap();
-    }
-    std::fs::write(s.get_work_dir().join("outside-sentinel"), "host-secret").unwrap();
-    let out = s.boot_with_mount(
-        "mount-writable",
-        &writable,
-        false,
-        r#"
-test "$(cat /work/host.txt)" = host-visible
-test "$(/work/run)" = EXECUTABLE
-printf guest-visible > /work/guest.txt
-ln /work/host.txt /work/hard.txt
-printf hard-linked > /work/hard.txt
-test "$(cat /work/host.txt)" = hard-linked
-ln -s host.txt /work/relative
-test "$(cat /work/relative)" = hard-linked
-if ln -s /work/host.txt /work/absolute; then
-  echo absolute symlink accepted
-  exit 1
-fi
-if ln -s /outside-sentinel /work/outside; then
-  echo escaping absolute symlink accepted
-  exit 1
-fi
-test ! -e /work/outside
-printf open-unlink > /work/open
-exec 3</work/open
-rm /work/open
-test "$(cat <&3)" = open-unlink
-printf renamed > /work/before
-mv /work/before /work/after
-test "$(cat /work/after)" = renamed
-echo WRITABLE_OK
-"#,
-    );
-    assert!(out.contains("WRITABLE_OK"), "{out}");
-    assert_eq!(
-        std::fs::read_to_string(writable.join("guest.txt")).unwrap(),
-        "guest-visible"
-    );
-    assert_eq!(
-        std::fs::read_to_string(writable.join("host.txt")).unwrap(),
-        "hard-linked"
-    );
-    // == a read-only alias sees the writer's files but cannot mutate any alias ==
-    let out = s.boot_with_mount(
-        "mount-readonly",
-        &writable,
-        true,
-        r#"
-test "$(cat /work/guest.txt)" = guest-visible
-for command in \
-  ': > /work/new' \
-  'ln /work/host.txt /work/extra-link' \
-  'ln -s host.txt /work/extra-symlink' \
-  'mv /work/host.txt /work/renamed' \
-  'rm -f /work/guest.txt'; do
-  if sh -c "$command"; then
-    echo "readonly accepted: $command"
-    exit 1
-  fi
-done
-echo READONLY_OK
-"#,
-    );
-    assert!(out.contains("READONLY_OK"), "{out}");
-    assert_eq!(
-        std::fs::read_to_string(writable.join("guest.txt")).unwrap(),
-        "guest-visible"
-    );
-    assert!(writable.join("host.txt").is_file());
 
     // == a guest repository keeps Git metadata, links, mmap writes, and atomic replaces ==
     let repository = s.get_work_dir().join("mount-repository");
@@ -1944,11 +2411,183 @@ fn linux_process_is_live(pid: u32) -> bool {
         .any(|line| line.starts_with("State:") && line.split_whitespace().nth(1) == Some("Z"))
 }
 
+#[cfg(target_os = "linux")]
+fn linux_descendant_pids(pid: u32) -> Vec<u32> {
+    let children = std::fs::read_dir(format!("/proc/{pid}/task"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|task| std::fs::read_to_string(task.path().join("children")).unwrap_or_default())
+        .collect::<String>();
+    let mut descendants = Vec::new();
+    for child in children.split_whitespace() {
+        let child = child.parse().unwrap();
+        descendants.push(child);
+        descendants.extend(linux_descendant_pids(child));
+    }
+    descendants
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_process_identity(path: &Path) -> u32 {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+#[cfg(target_os = "linux")]
+fn find_network_broker(workers: &[u32]) -> u32 {
+    let brokers = workers
+        .iter()
+        .copied()
+        .filter(|worker| {
+            std::fs::read(format!("/proc/{worker}/cmdline"))
+                .unwrap_or_default()
+                .split(|byte| *byte == 0)
+                .nth(1)
+                == Some(b"__network".as_slice())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(brokers.len(), 1, "box must own exactly one network broker");
+    brokers[0]
+}
+
+/// Broker loss disables networking while agent exec and stop remain live;
+/// supervisor loss tears down all workers, and the same box can start again.
+/// Pidfds wait for every thread even when a process leader is already a zombie.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires native KVM and Bubblewrap user namespaces"]
+#[allow(clippy::too_many_lines)]
+fn broker_loss_preserves_agent_and_supervisor_loss_stops_the_box() {
+    let suite = Suite::new();
+    std::fs::remove_file(suite.home.join(".terra/config.yaml")).unwrap();
+    let project = suite.create_project_dir("server");
+    let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = reservation.local_addr().unwrap().port();
+    let recipe = suite.get_work_dir().join("server.yaml");
+    std::fs::write(
+        &recipe,
+        format!("network:\n  ports: ['{port}:8080']\nworkload:\n  entrypoint: /bin/sleep\n  args: [infinity]\n"),
+    )
+    .unwrap();
+    let project = project.to_str().unwrap();
+    assert_eq!(
+        suite
+            .run_terra_status(&[recipe.to_str().unwrap(), "setup", "--project", project])
+            .1,
+        0
+    );
+    drop(reservation);
+    for kill_supervisor in [true, false] {
+        assert_eq!(
+            suite
+                .run_terra_status(&["server", "-d", "--project", project])
+                .1,
+            0
+        );
+        let directory = suite.get_box_files_path("server");
+        let supervisor = read_linux_process_identity(&directory.join("supervisor.pid"));
+        let vm = read_linux_process_identity(&directory.join("host.pid"));
+        let mut workers = linux_descendant_pids(supervisor);
+        assert!(
+            workers.contains(&vm),
+            "VM {vm} is outside supervisor {supervisor} descendants: {workers:?}",
+        );
+        let broker = find_network_broker(&workers);
+        workers.push(supervisor);
+        let worker_exit_handles = workers
+            .iter()
+            .map(|worker| {
+                let pid = rustix::process::Pid::from_raw(i32::try_from(*worker).unwrap()).unwrap();
+                let descriptor =
+                    rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()).unwrap();
+                (*worker, descriptor)
+            })
+            .collect::<Vec<_>>();
+        assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_err());
+        rustix::process::kill_process(
+            rustix::process::Pid::from_raw(
+                i32::try_from(if kill_supervisor { supervisor } else { broker }).unwrap(),
+            )
+            .unwrap(),
+            rustix::process::Signal::KILL,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        if !kill_supervisor {
+            loop {
+                let diagnostics =
+                    std::fs::read_to_string(directory.join("diagnostics.log")).unwrap_or_default();
+                if !linux_process_is_live(broker)
+                    && diagnostics.contains("network unavailable: owner: Network is down")
+                    && std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "broker loss did not retire networking: {diagnostics}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(linux_process_is_live(vm), "VM died with broker");
+            assert!(
+                linux_process_is_live(supervisor),
+                "supervisor died with broker"
+            );
+            assert_eq!(
+                suite.exec_in(
+                    "server",
+                    Path::new(project),
+                    false,
+                    &["printf", "agent-after-broker-loss"]
+                ),
+                ("agent-after-broker-loss".into(), 0),
+            );
+            assert_eq!(
+                suite
+                    .run_terra_status(&["server", "stop", "--project", project])
+                    .1,
+                0,
+                "agent stop failed after broker loss",
+            );
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        for (worker, descriptor) in worker_exit_handles {
+            let timeout = rustix::event::Timespec::try_from(
+                deadline.saturating_duration_since(Instant::now()),
+            )
+            .unwrap();
+            let mut exited = [rustix::event::PollFd::new(
+                &descriptor,
+                rustix::event::PollFlags::IN,
+            )];
+            assert_eq!(
+                rustix::event::poll(&mut exited, Some(&timeout)).unwrap(),
+                1,
+                "worker {worker} survived {}",
+                if kill_supervisor {
+                    "supervisor loss"
+                } else {
+                    "agent stop"
+                }
+            );
+        }
+        drop(std::net::TcpListener::bind(("127.0.0.1", port)).unwrap());
+    }
+}
+
 /// The enforced policy reaches the live VM and every thread, including vCPUs.
 /// Trace mode runs the same VM lifecycle before the policy exists.
 #[cfg(target_os = "linux")]
 #[test]
 #[ignore = "requires a native hypervisor and an enforced Bubblewrap policy"]
+#[allow(clippy::too_many_lines)]
 fn bwrap_enforces_vm_and_vcpu_threads() {
     let suite = Suite::new();
     let enforced = std::env::var("TERRA_SECCOMP_ENFORCED").as_deref() == Ok("1");
@@ -1978,15 +2617,25 @@ fn bwrap_enforces_vm_and_vcpu_threads() {
 
     let box_dir = suite.get_box_files_path("server");
     let identity = if enforced { "host.pid" } else { "terra.pid" };
-    let published = std::fs::read_to_string(box_dir.join(identity)).unwrap();
-    let pid: u32 = published
-        .split_whitespace()
-        .next()
-        .unwrap()
-        .parse()
-        .unwrap();
+    let pid = read_linux_process_identity(&box_dir.join(identity));
+    let mut workers = vec![pid];
     if enforced {
-        for namespace in ["pid", "mnt", "user", "ipc", "uts"] {
+        let supervisor = read_linux_process_identity(&box_dir.join("supervisor.pid"));
+        assert_ne!(supervisor, pid);
+        workers.extend(linux_descendant_pids(supervisor));
+        workers.push(supervisor);
+        let broker = find_network_broker(&workers);
+        assert_eq!(
+            std::fs::read_link(format!("/proc/{broker}/ns/net")).unwrap(),
+            std::fs::read_link("/proc/self/ns/net").unwrap(),
+            "broker lost host networking"
+        );
+        assert_ne!(
+            std::fs::read_link(format!("/proc/{broker}/ns/mnt")).unwrap(),
+            std::fs::read_link(format!("/proc/{pid}/ns/mnt")).unwrap(),
+            "broker shares VM filesystem grants"
+        );
+        for namespace in ["pid", "mnt", "user", "ipc", "uts", "net"] {
             let parent_ns = std::fs::read_link(format!("/proc/self/ns/{namespace}")).unwrap();
             let vm_ns = std::fs::read_link(format!("/proc/{pid}/ns/{namespace}")).unwrap();
             assert_ne!(
@@ -1994,10 +2643,6 @@ fn bwrap_enforces_vm_and_vcpu_threads() {
                 "VM still uses the parent's {namespace} namespace"
             );
         }
-
-        let parent_net = std::fs::read_link("/proc/self/ns/net").unwrap();
-        let vm_net = std::fs::read_link(format!("/proc/{pid}/ns/net")).unwrap();
-        assert_eq!(vm_net, parent_net, "VM does not share host networking");
 
         let task_dir = format!("/proc/{pid}/task");
         let tasks = std::fs::read_dir(&task_dir)
@@ -2044,8 +2689,15 @@ fn bwrap_enforces_vm_and_vcpu_threads() {
     };
     assert_eq!(suite.run_terra_status(stop_args).1, 0);
     let deadline = Instant::now() + Duration::from_secs(5);
-    while linux_process_is_live(pid) {
-        assert!(Instant::now() < deadline, "VM {pid} survived stop");
+    while let Some(worker) = workers
+        .iter()
+        .copied()
+        .find(|pid| linux_process_is_live(*pid))
+    {
+        assert!(
+            Instant::now() < deadline,
+            "box worker {worker} survived stop"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
 }

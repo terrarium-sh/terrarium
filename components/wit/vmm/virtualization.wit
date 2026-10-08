@@ -1,0 +1,11 @@
+package terra:vmm@0.1.0;
+
+interface virtualization {
+    use machine-types.{architecture};
+
+    enum error { unavailable }
+
+    resource vm {
+        request-stop: func() -> result<_, error>;
+    }
+}

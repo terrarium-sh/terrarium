@@ -2,7 +2,6 @@
 //! resolve, and what it may reach.
 
 pub mod rules;
-pub mod runtime;
 
 #[cfg(test)]
 mod tests;
@@ -10,6 +9,9 @@ mod tests;
 use crate::config::{Network, NetworkMode};
 
 pub fn describe(net: &Network) -> &'static str {
+    if !net.enabled {
+        return "local-only (guest networking; no host network broker)";
+    }
     match net.mode {
         NetworkMode::UnrestrictedPublic if net.allow.is_empty() => {
             "unrestricted-public (public egress only)"

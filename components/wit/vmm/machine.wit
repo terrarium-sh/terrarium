@@ -1,0 +1,16 @@
+package terra:vmm@0.1.0;
+
+interface machine-types {
+    enum architecture { x86, arm }
+    enum device-kind { block, vsock, fs, memory }
+    record device { kind: device-kind, mmio-base: u64, irq: u32 }
+    enum error { invalid-vcpus, platform, already-created, invalid-state }
+}
+
+interface machine {
+    use machine-types.{error};
+    use virtualization.{architecture, vm};
+    use platform.{vcpu};
+
+    initialize: func(architecture: architecture, vm: own<vm>, vcpus: list<own<vcpu>>) -> result<_, error>;
+}

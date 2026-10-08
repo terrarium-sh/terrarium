@@ -42,6 +42,7 @@ enum Operation {
     Sync,
     Lookup,
     Stat,
+    MetadataHash,
     ReadDirectory,
     HostMetadata,
 }
@@ -92,7 +93,10 @@ pub(super) fn install_io_gate(
         }
         if matches!(
             gate.operation,
-            Operation::Lookup | Operation::Stat | Operation::ReadDirectory
+            Operation::Lookup
+                | Operation::Stat
+                | Operation::MetadataHash
+                | Operation::ReadDirectory
         ) {
             return install_metadata_gate(linker, gate);
         }
@@ -105,8 +109,7 @@ pub(super) fn install_io_gate(
                     move |_accessor, (_descriptor,): (Resource<Descriptor>,)| {
                         let gate = sync_gate.clone();
                         Box::pin(async move {
-                            gate.started.add_permits(1);
-                            gate.release.notified().await;
+                            gate.begin_release_wait().await;
                             Ok((Ok::<(), ErrorCode>(()),))
                         })
                     },
@@ -121,10 +124,9 @@ pub(super) fn install_io_gate(
                     StreamReader<u8>,
                     u64,
                 )| {
-                    let gate = gate.clone();
-                    gate.started.add_permits(1);
+                    let released = gate.begin_release_wait();
                     let completion = FutureReader::new(&mut store, async move {
-                        gate.release.notified().await;
+                        released.await;
                         Ok::<Result<(), ErrorCode>, wasmtime::Error>(Ok(()))
                     })?;
                     Ok((completion,))
@@ -197,18 +199,38 @@ fn install_metadata_gate(
                     })
                 },
             )?;
+    } else if matches!(gate.operation, Operation::MetadataHash) {
+        linker
+            .instance("wasi:filesystem/types@0.3.0")?
+            .func_wrap_concurrent(
+                "[method]descriptor.metadata-hash",
+                move |accessor, (descriptor,): (Resource<Descriptor>,)| {
+                    let gate = gate.clone();
+                    Box::pin(async move {
+                        gate.wait_if_armed().await;
+                        let wasi = accessor.with_getter::<WasiFilesystem>(
+                            wasmtime_wasi::filesystem::WasiFilesystemView::filesystem,
+                        );
+                        Ok((
+                            match WasiFilesystem::metadata_hash(&wasi, descriptor).await {
+                                Ok(value) => Ok(value),
+                                Err(error) => Err(error.downcast()?),
+                            },
+                        ))
+                    })
+                },
+            )?;
     } else {
         linker.instance("wasi:filesystem/types@0.3.0")?.func_wrap(
             "[method]descriptor.read-directory",
             move |mut store, (_descriptor,): (Resource<Descriptor>,)| {
-                let gate = gate.clone();
-                gate.started.add_permits(1);
+                let released = gate.begin_release_wait();
                 let stream = StreamReader::new(
                     &mut store,
                     Vec::<wasmtime_wasi::p3::bindings::filesystem::types::DirectoryEntry>::new(),
                 )?;
                 let completion = FutureReader::new(&mut store, async move {
-                    gate.release.notified().await;
+                    released.await;
                     Ok::<Result<(), ErrorCode>, wasmtime::Error>(Ok(()))
                 })?;
                 Ok(((stream, completion),))
@@ -219,6 +241,12 @@ fn install_metadata_gate(
 }
 
 impl IoGate {
+    fn begin_release_wait(&self) -> tokio::sync::futures::OwnedNotified {
+        let released = self.release.clone().notified_owned();
+        self.started.add_permits(1);
+        released
+    }
+
     pub(super) fn wait_on_descriptor_drop(&self) {
         if self.count_blocked_drops.load(Ordering::Acquire) {
             self.drop_started.add_permits(1);
@@ -240,8 +268,7 @@ impl IoGate {
 
     async fn wait_if_armed(&self) {
         if self.armed.swap(false, Ordering::AcqRel) {
-            self.started.add_permits(1);
-            self.release.notified().await;
+            self.begin_release_wait().await;
         }
     }
 }
@@ -323,12 +350,11 @@ impl Mounted {
         let ram = GuestRam::new(1024 * 1024).unwrap();
         let engine = device_engine().unwrap();
         let component = Component::new(&engine, crate::test_fixtures::wasm::FS).unwrap();
-        let mmio = Component::new(&engine, crate::test_fixtures::wasm::MMIO).unwrap();
         let mut host =
             FsHost::with_resource_capacity(DeviceContext::with_ram(ram.clone()), grant, capacity);
         host.io_gate = Some(gate);
         let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).unwrap();
-        runtime.initialize_mmio(&mmio).await.unwrap();
+        runtime.initialize_mmio().unwrap();
         let channel = super::register_device(
             &mut runtime,
             host,
@@ -580,6 +606,8 @@ async fn stalled_read_allows_other_io_events_cancellation_and_shutdown() {
         .request(15, fast_node, &read_body(fast_handle, 1))
         .await;
     assert_eq!(&fast[16..], &[9]);
+    mounted.request(3, slow_node, &[]).await;
+    mounted.request(1, 1, b"slow\0").await;
     let notification = mounted.submit(4, 4096, 1, &[]);
     std::fs::write(root.path().join("changed"), "new").unwrap();
     for _ in 0..32 {
@@ -673,6 +701,7 @@ async fn stalled_writes_and_flushes_do_not_block_shutdown() {
             Operation::Read
             | Operation::Lookup
             | Operation::Stat
+            | Operation::MetadataHash
             | Operation::ReadDirectory
             | Operation::HostMetadata => {
                 unreachable!()
@@ -717,10 +746,26 @@ async fn stalled_writes_and_flushes_do_not_block_shutdown() {
     }
 }
 
+/// Announced gate waits retain a broadcast release before either future's first poll.
+#[tokio::test(flavor = "multi_thread")]
+async fn announced_gate_waits_keep_release_before_first_poll() {
+    let (_root, mounted, gate) = mount_with_operation(Operation::Sync).await;
+    let releases = [gate.begin_release_wait(), gate.begin_release_wait()];
+    gate.started.try_acquire_many(2).unwrap().forget();
+    gate.release.notify_waiters();
+    for released in releases {
+        tokio::pin!(released);
+        assert!(futures_util::poll!(released).is_ready());
+    }
+    mounted.channel.close().unwrap();
+    mounted.runtime.abort_and_join().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn close_waits_for_responsive_flush() {
     let (_root, mut mounted, gate) = mount_with_operation(Operation::Sync).await;
     mounted.open_with_flags(b"slow\0", 2).await;
+    mounted.open_with_flags(b"fast\0", 2).await;
     let channel = mounted.channel.clone();
     let close = tokio::task::spawn_blocking(move || channel.close());
     tokio::time::timeout(Duration::from_secs(3), gate.started.acquire())
@@ -728,8 +773,13 @@ async fn close_waits_for_responsive_flush() {
         .unwrap()
         .unwrap()
         .forget();
+    tokio::time::timeout(Duration::from_secs(3), gate.started.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
     assert!(!close.is_finished());
-    gate.release.notify_one();
+    gate.release.notify_waiters();
     close.await.unwrap().unwrap();
     mounted.runtime.abort_and_join().await;
 }
@@ -748,7 +798,11 @@ async fn stalled_metadata_preserves_other_io_events_reset_and_close() {
                 let handle = u64::from_le_bytes(opened[16..24].try_into().unwrap());
                 (28, 1, read_body(handle, 0))
             }
-            Operation::Read | Operation::Write | Operation::Sync | Operation::HostMetadata => {
+            Operation::Read
+            | Operation::Write
+            | Operation::Sync
+            | Operation::MetadataHash
+            | Operation::HostMetadata => {
                 unreachable!()
             }
         };
@@ -786,7 +840,7 @@ async fn stalled_metadata_preserves_other_io_events_reset_and_close() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn stalled_event_resolution_preserves_requests_and_cancellation() {
-    let (root, mut mounted, gate) = mount_with_operation(Operation::Stat).await;
+    let (root, mut mounted, gate) = mount_with_operation(Operation::MetadataHash).await;
     let (node, handle) = mounted.open(b"fast\0").await;
     gate.armed.store(true, Ordering::Release);
     let notification = mounted.submit(4, 4096, 1, &[]);

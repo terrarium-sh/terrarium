@@ -5,25 +5,14 @@
 use super::SignalResult;
 use std::fs::File;
 use std::io::{Error, Result};
-use std::os::windows::{
-    ffi::OsStrExt,
-    io::{AsRawHandle, FromRawHandle, OwnedHandle},
-};
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
 use std::process::Command;
+use terra_platform::process::{VmChildGuard, supervise_vm_child};
 use windows_sys::Win32::Foundation::{FILETIME, HANDLE_FLAG_INHERIT, STILL_ACTIVE};
-use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW};
-use windows_sys::Win32::Security::{
-    ACL, ACL_REVISION, AddAccessAllowedAceEx, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
-    GetLengthSid, GetTokenInformation, InitializeAcl, OBJECT_INHERIT_ACE,
-    PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER, TokenUser,
-};
-use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
 use windows_sys::Win32::System::Threading::{
-    CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, DETACHED_PROCESS, GetCurrentProcess,
-    GetExitCodeProcess, GetProcessTimes, OpenProcess, OpenProcessToken, OpenThread,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, ResumeThread, THREAD_SUSPEND_RESUME,
-    TerminateProcess,
+    GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_TERMINATE, TerminateProcess,
 };
 
 pub const MAX_SOCK_PATH: usize = 108;
@@ -196,141 +185,67 @@ pub fn allocated_size(path: &Path, metadata: &std::fs::Metadata) -> u64 {
     (u64::from(high) << 32) | u64::from(low)
 }
 
-pub fn set_owner_only(path: &Path, directory: bool) -> Result<()> {
-    let sid = current_user_sid()?;
-    let acl_size = std::mem::size_of::<ACL>()
-        + std::mem::size_of::<u32>() * 2
-        + std::mem::size_of_val(sid.as_slice());
-    let mut acl = vec![0_u32; acl_size.div_ceil(std::mem::size_of::<u32>())];
-    let acl_ptr = acl.as_mut_ptr().cast::<ACL>();
-    let inherit = if directory {
-        OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
-    } else {
-        0
-    };
-    // SAFETY: `acl` has the exact header, ACE, and SID capacity; `sid` remains live while
-    // Windows copies it into the ACL.
-    unsafe {
-        win_ok(InitializeAcl(
-            acl_ptr,
-            u32::try_from(acl_size).unwrap_or(u32::MAX),
-            ACL_REVISION,
-        ))?;
-        win_ok(AddAccessAllowedAceEx(
-            acl_ptr,
-            ACL_REVISION,
-            inherit,
-            FILE_ALL_ACCESS,
-            sid.as_ptr().cast_mut().cast(),
-        ))?;
-    }
-    let mut wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    // SAFETY: the path is NUL-terminated and `acl` lives for the call.
-    let result = unsafe {
-        SetNamedSecurityInfoW(
-            wide.as_mut_ptr(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            acl_ptr,
-            std::ptr::null(),
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(Error::from_raw_os_error(
-            i32::try_from(result).unwrap_or(i32::MAX),
-        ))
-    }
+pub(crate) fn supervise_supervisor_child(
+    command: &mut Command,
+    die_with_parent: bool,
+) -> Result<Option<VmChildGuard>> {
+    supervise_vm_child(command, die_with_parent)
 }
 
-pub fn detach(command: &mut Command) {
-    use std::os::windows::process::CommandExt;
-    command.creation_flags(DETACHED_PROCESS);
-}
-
-pub struct VmChildGuard(OwnedHandle);
-
-pub fn supervise_vm_child(command: &mut Command, foreground: bool) -> Result<Option<VmChildGuard>> {
-    use std::os::windows::io::FromRawHandle;
-    use std::os::windows::process::CommandExt;
-    use windows_sys::Win32::System::JobObjects::{
-        CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JobObjectExtendedLimitInformation, SetInformationJobObject,
-    };
-    if !foreground {
-        detach(command);
-        return Ok(None);
-    }
-    command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED);
-    // SAFETY: null means no security attributes or name; OwnedHandle closes the returned job.
-    let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
-    if raw.is_null() {
-        return Err(Error::last_os_error());
-    }
-    // SAFETY: CreateJobObjectW returned this live, owned job handle.
-    let job = unsafe { OwnedHandle::from_raw_handle(raw) };
-    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    // SAFETY: job is live and the extended limit structure has the reported size.
+pub(crate) fn pass_listener(
+    command: &mut Command,
+    listener: &terra_platform::io::local::LocalListener,
+    target: i32,
+) -> Result<terra_platform::io::local::LocalListener> {
+    use std::os::windows::io::AsRawSocket;
+    let inherited = listener.try_clone()?;
+    let socket = inherited.as_raw_socket();
+    // SAFETY: inherited owns this live listener; the launcher whitelists the socket handle.
     win_ok(unsafe {
-        SetInformationJobObject(
-            job.as_raw_handle(),
-            JobObjectExtendedLimitInformation,
-            (&raw const limits).cast(),
-            u32::try_from(std::mem::size_of_val(&limits)).map_err(Error::other)?,
+        windows_sys::Win32::Foundation::SetHandleInformation(
+            socket as *mut std::ffi::c_void,
+            HANDLE_FLAG_INHERIT,
+            HANDLE_FLAG_INHERIT,
         )
     })?;
-    Ok(Some(VmChildGuard(job)))
+    command.env(
+        super::listener_handle_environment(target)?,
+        socket.to_string(),
+    );
+    Ok(inherited)
 }
 
-pub fn attach_vm_child(guard: &VmChildGuard, child: &std::process::Child) -> Result<()> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
-    };
-    use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
-    // SAFETY: both handles remain live through the assignment.
-    win_ok(unsafe { AssignProcessToJobObject(guard.0.as_raw_handle(), child.as_raw_handle()) })?;
-    // SAFETY: the system returns an owned snapshot or INVALID_HANDLE_VALUE.
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
-    if snapshot == INVALID_HANDLE_VALUE {
-        return Err(Error::last_os_error());
+pub(crate) fn claim_listener(
+    target: i32,
+    expected: &Path,
+) -> Result<terra_platform::io::local::LocalListener> {
+    use std::os::windows::io::FromRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{WSADATA, WSAStartup};
+    let socket = std::env::var(super::listener_handle_environment(target)?)
+        .map_err(Error::other)?
+        .parse::<usize>()
+        .map_err(Error::other)?;
+    let mut data = WSADATA::default();
+    // SAFETY: data has the Winsock structure's full writable size and initialization lasts until process exit.
+    let result = unsafe { WSAStartup(0x0202, &raw mut data) };
+    if result != 0 {
+        return Err(Error::from_raw_os_error(result));
     }
-    // SAFETY: CreateToolhelp32Snapshot returned this owned snapshot handle.
-    let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot) };
-    let mut entry = THREADENTRY32 {
-        dwSize: u32::try_from(std::mem::size_of::<THREADENTRY32>()).map_err(Error::other)?,
-        ..THREADENTRY32::default()
-    };
-    // SAFETY: snapshot remains live and entry has the required size.
-    let mut found = unsafe { Thread32First(snapshot.as_raw_handle(), &raw mut entry) } != 0;
-    while found {
-        if entry.th32OwnerProcessID == child.id() {
-            // SAFETY: the thread ID comes from the live system snapshot; null reports a failed open.
-            let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
-            if thread.is_null() {
-                return Err(Error::last_os_error());
-            }
-            // SAFETY: OpenThread returned this owned thread handle.
-            let thread = unsafe { OwnedHandle::from_raw_handle(thread) };
-            // SAFETY: the new process was created suspended, and this thread belongs to it.
-            if unsafe { ResumeThread(thread.as_raw_handle()) } == u32::MAX {
-                return Err(Error::last_os_error());
-            }
-            return Ok(());
-        }
-        // SAFETY: snapshot remains live and entry remains writable for each iteration.
-        found = unsafe { Thread32Next(snapshot.as_raw_handle(), &raw mut entry) } != 0;
+    // SAFETY: the whitelisted launcher transfers this prebound listener exclusively to the worker.
+    let listener =
+        unsafe { terra_platform::io::local::LocalListener::from_raw_socket(socket as u64) };
+    // SAFETY: listener owns socket; no descendant may inherit the grant.
+    win_ok(unsafe {
+        windows_sys::Win32::Foundation::SetHandleInformation(
+            socket as *mut std::ffi::c_void,
+            HANDLE_FLAG_INHERIT,
+            0,
+        )
+    })?;
+    if listener.local_addr()?.as_pathname() != Some(expected) {
+        return Err(Error::other("inherited listener does not match its grant"));
     }
-    Err(Error::other("created VM process has no initial thread"))
-}
-
-pub fn kill_vm_child(child: &mut std::process::Child) -> Result<()> {
-    child.kill()
+    Ok(listener)
 }
 
 pub fn pass_lock(command: &mut Command, lock: &File) -> Result<File> {
@@ -499,61 +414,6 @@ pub fn is_host_root() -> bool {
     false
 }
 
-fn current_user_sid() -> Result<Vec<u32>> {
-    let mut token = std::ptr::null_mut();
-    // SAFETY: GetCurrentProcess is a pseudo-handle and token is writable.
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) } == 0 {
-        return Err(Error::last_os_error());
-    }
-    // SAFETY: OpenProcessToken returned this owned token handle.
-    let token = unsafe { OwnedHandle::from_raw_handle(token) };
-    let mut needed = 0;
-    // SAFETY: this query intentionally has no buffer and reports the required size.
-    let _ = unsafe {
-        GetTokenInformation(
-            token.as_raw_handle(),
-            TokenUser,
-            std::ptr::null_mut(),
-            0,
-            &raw mut needed,
-        )
-    };
-    let mut user = vec![
-        0_usize;
-        usize::try_from(needed)
-            .unwrap_or(0)
-            .div_ceil(std::mem::size_of::<usize>())
-    ];
-    // SAFETY: `user` has the size returned by the preceding query.
-    let ok = unsafe {
-        GetTokenInformation(
-            token.as_raw_handle(),
-            TokenUser,
-            user.as_mut_ptr().cast(),
-            needed,
-            &raw mut needed,
-        )
-    };
-    if ok == 0 {
-        return Err(Error::last_os_error());
-    }
-    // SAFETY: a successful TokenUser query initializes a TOKEN_USER at the buffer start.
-    let token_user = unsafe { user.as_ptr().cast::<TOKEN_USER>().read_unaligned() };
-    // SAFETY: TOKEN_USER contains a valid SID whose length Windows reports.
-    let len = unsafe { GetLengthSid(token_user.User.Sid) };
-    if len == 0 {
-        return Err(Error::last_os_error());
-    }
-    // SAFETY: GetLengthSid bounds this source slice.
-    Ok(unsafe {
-        std::slice::from_raw_parts(
-            token_user.User.Sid.cast::<u32>(),
-            usize::try_from(len).unwrap_or(0) / std::mem::size_of::<u32>(),
-        )
-        .to_vec()
-    })
-}
-
 fn with_process<T>(pid: u32, rights: u32, f: impl FnOnce(*mut std::ffi::c_void) -> T) -> Option<T> {
     if pid == 0 {
         return None;
@@ -612,11 +472,7 @@ fn win_ok(ok: i32) -> Result<()> {
 mod tests {
     use super::*;
     use std::os::windows::fs::MetadataExt;
-    use windows_sys::Win32::Foundation::{INVALID_HANDLE_VALUE, LocalFree};
-    use windows_sys::Win32::Security::Authorization::GetNamedSecurityInfoW;
-    use windows_sys::Win32::Security::{
-        ACCESS_ALLOWED_ACE, EqualSid, GetAce, GetSecurityDescriptorControl, SE_DACL_PROTECTED,
-    };
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_SPARSE_FILE;
 
     #[test]
@@ -771,75 +627,5 @@ mod tests {
         std::fs::remove_file(&redirected).unwrap();
         assert!(try_lock_run(&lock_path).is_err());
         assert!(!redirected.exists());
-    }
-
-    #[test]
-    fn owner_only_acl_grants_only_the_current_user_and_blocks_inheritance() {
-        let root = tempfile::tempdir().unwrap();
-        let sid = current_user_sid().unwrap();
-        for directory in [false, true] {
-            let path = root
-                .path()
-                .join(if directory { "directory" } else { "file" });
-            if directory {
-                std::fs::create_dir(&path).unwrap();
-            } else {
-                std::fs::write(&path, b"private").unwrap();
-            }
-            set_owner_only(&path, directory).unwrap();
-            let wide = path
-                .as_os_str()
-                .encode_wide()
-                .chain(Some(0))
-                .collect::<Vec<_>>();
-            let mut acl = std::ptr::null_mut();
-            let mut descriptor = std::ptr::null_mut();
-            let mut control = 0;
-            let mut revision = 0;
-            let mut entry = std::mem::MaybeUninit::uninit();
-            // SAFETY: Windows owns the queried descriptor until LocalFree; every output pointer
-            // is writable, and the successful queries bound the ACL and ACE reads.
-            unsafe {
-                assert_eq!(
-                    GetNamedSecurityInfoW(
-                        wide.as_ptr(),
-                        SE_FILE_OBJECT,
-                        DACL_SECURITY_INFORMATION,
-                        std::ptr::null_mut(),
-                        std::ptr::null_mut(),
-                        &raw mut acl,
-                        std::ptr::null_mut(),
-                        &raw mut descriptor,
-                    ),
-                    0
-                );
-                assert_ne!(
-                    GetSecurityDescriptorControl(descriptor, &raw mut control, &raw mut revision),
-                    0
-                );
-                assert_ne!(control & SE_DACL_PROTECTED, 0);
-                assert!(!acl.is_null());
-                assert_eq!((*acl).AceCount, 1);
-                assert_ne!(GetAce(acl, 0, entry.as_mut_ptr()), 0);
-                // SAFETY: `GetAce` succeeded, so `entry` names the ACL's first ACE.
-                let entry = &*entry.assume_init().cast::<ACCESS_ALLOWED_ACE>();
-                assert_eq!(entry.Header.AceType, 0);
-                assert_eq!(entry.Mask, FILE_ALL_ACCESS);
-                assert_ne!(
-                    EqualSid(
-                        (&raw const entry.SidStart).cast_mut().cast(),
-                        sid.as_ptr().cast_mut().cast()
-                    ),
-                    0
-                );
-                let inheritance = if directory {
-                    OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
-                } else {
-                    0
-                };
-                assert_eq!(u32::from(entry.Header.AceFlags), inheritance);
-                assert!(LocalFree(descriptor).is_null());
-            }
-        }
     }
 }

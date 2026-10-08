@@ -3,8 +3,7 @@
 pub const VSOCK_HEADER_BYTES: usize = 44;
 const HDR_BYTES: usize = VSOCK_HEADER_BYTES;
 
-/// One parsed header. Field order and widths are the kernel ABI;
-/// offsets are pinned by test, not by a foreign struct.
+/// A standard virtio-vsock packet header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VsockHeader {
     pub src_cid: u64,

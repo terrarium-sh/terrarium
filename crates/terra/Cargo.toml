@@ -21,6 +21,9 @@ fuzzing = []
 
 [dependencies]
 terra-limits = { path = "../terra-limits" }
+terra-network = { path = "../terra-network" }
+terra-policy = { path = "../terra-policy" }
+terra-sandbox = { path = "../terra-sandbox" }
 terra-protocol = { path = "../terra-protocol", features = ["tokio"] }
 clap.workspace = true
 clap_complete = "4"
@@ -47,15 +50,15 @@ seccompiler = "=0.5.0"
 syscalls = { version = "0.8.1", default-features = false, features = ["x86_64", "aarch64"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Isolation", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_SystemServices", "Win32_System_Threading"] }
+
+[build-dependencies]
+terra-build = { path = "../terra-build" }
 
 [dev-dependencies]
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 notify = "8.2"
 clap_mangen = "0.3"
-
-[target.'cfg(target_os = "linux")'.dev-dependencies]
-linux-raw-sys.workspace = true
 
 [lints]
 workspace = true

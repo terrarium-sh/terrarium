@@ -1,0 +1,65 @@
+package terra:vmm@0.1.0;
+
+interface vmm-mmio-client {
+    use terra:mmio/types@0.1.0.{error};
+
+    access: async func(address: u64, width: u8, value: u64, write: bool) -> result<u64, error>;
+}
+
+interface platform {
+    record mmio-read { address: u64, width: u8 }
+    record mmio-write { address: u64, width: u8, value: u64 }
+    record pio-read { port: u16, length: u32 }
+    record pio-write { port: u16, length: u32 }
+    record msr { index: u32, value: u64 }
+    record arm-exception { address: u64, syndrome: u64, write-value: option<u64>, hvc-registers: option<tuple<u64, u64, u64, u64>> }
+    record arm-read { register: option<u8>, value: u64 }
+    record hvc-result { target: u8, status: s64 }
+    record cpu-start { target: u8, entry: u64, context: u64 }
+
+    variant exit {
+        halt,
+        shutdown,
+        interrupted,
+        mmio-read(mmio-read),
+        mmio-write(mmio-write),
+        pio-read(pio-read),
+        pio-write(pio-write),
+        rdmsr(msr),
+        wrmsr(msr),
+        arm-exception(arm-exception),
+        hvc-result(hvc-result),
+        stopped,
+    }
+
+    variant completion {
+        start,
+        reenter,
+        mmio-read(u64),
+        pio-zero,
+        rdmsr(u64),
+        msr-fault,
+        wrmsr,
+        arm-read(arm-read),
+        hvc-return(s64),
+        cpu-start(cpu-start),
+        cpu-off,
+        system-stop,
+    }
+
+    enum error { unavailable, bad-exit, cancelled }
+
+    resource vcpu {
+        resume: async func(completion: completion) -> result<exit, error>;
+    }
+
+}
+
+world vmm {
+    import platform;
+    import virtualization;
+    import lifecycle-platform;
+    import vmm-mmio-client;
+    export machine;
+    export lifecycle;
+}

@@ -38,12 +38,15 @@ To verify a downloaded release archive's attestation, use its filename:
 gh attestation verify terra-x86_64-linux.tar.gz --repo terrarium-sh/terrarium
 ```
 
-Linux releases may publish a matching Bubblewrap policy in a separate
-`terra-seccomp-<target>.tar.gz` archive. The installer does not install that
-archive, and Terra does not search beside the executable; install the policy
-at `~/.terra/config/seccomp.bpf` or set `vm.bwrap.policy`. Without a selected
-policy, Terra uses its built-in minimal seccomp policy by default; set
-`vm.bwrap.allow_fallback: false` to require a file. See
+Linux releases publish a matching Bubblewrap policy bundle in a separate
+`terra-seccomp-<target>.tar.gz` archive. `install.sh` verifies it like the
+binary and installs it at `~/.terra/config/seccomp`, keeping any previous
+bundle as `seccomp.previous`. A bundle matches one executable, so reinstall
+both together after a manual upgrade. Terra does not search beside the
+executable; set `vm.bwrap.policy` to use another bundle directory.
+Without a selected bundle, Terra uses its built-in role policies; set
+`vm.bwrap.allow_fallback: false` to require a bundle. Legacy single-filter
+overrides must be replaced with a newly generated bundle. See
 [host VM launchers](vm-launchers.md) for configuration details.
 
 ## List boxes
@@ -85,6 +88,15 @@ A noninteractive start needs `-d` or `--foreground`.
 The workload has one shared session. Press `Ctrl-\` to detach without stopping
 it, then run `terra <box>` to join again. `terra <box> sessions` lists attached
 clients, and `terra <box> detach ID` or `--all` removes them.
+
+## Network access
+
+Recipes grant external destinations through `network.allow` and publish guest
+services through `network.ports` (TCP by default, `/udp` for UDP). Guest localhost and guest-local routes stay
+inside the guest. `network.enabled: false` keeps local networking and agent
+commands available while omitting the host broker and external connections.
+See [the recipe reference](recipe.md#network) for configuration and
+[the security model](security.md#network-policy-limits) for enforcement limits.
 
 ## Kernel updates
 

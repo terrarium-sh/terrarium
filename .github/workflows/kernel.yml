@@ -8,20 +8,32 @@ on:
       - pins.mk
       - Makefile
       - kernel/**
-      - scripts/check-kernel-config.py
-      - scripts/kernel-container.sh
-      - scripts/kernel-artifact.py
-      - scripts/test-kernel-tools.py
+      - scripts/kernel/check-kernel-config.py
+      - scripts/kernel/kernel-container.sh
+      - scripts/kernel/kernel-artifact.py
+      - scripts/kernel/test-kernel-tools.py
+      - scripts/kernel/test-kernel-vsock.py
+      - scripts/kernel/check-vsock-abi.py
+      - components/vsock-frontend/src/transport.rs
+      - crates/terra-protocol/src/application.rs
+      - crates/terra-protocol/src/socket.rs
+      - crates/terra-protocol/src/vsock.rs
       - .github/workflows/kernel.yml
   pull_request:
     paths:
       - pins.mk
       - Makefile
       - kernel/**
-      - scripts/check-kernel-config.py
-      - scripts/kernel-container.sh
-      - scripts/kernel-artifact.py
-      - scripts/test-kernel-tools.py
+      - scripts/kernel/check-kernel-config.py
+      - scripts/kernel/kernel-container.sh
+      - scripts/kernel/kernel-artifact.py
+      - scripts/kernel/test-kernel-tools.py
+      - scripts/kernel/test-kernel-vsock.py
+      - scripts/kernel/check-vsock-abi.py
+      - components/vsock-frontend/src/transport.rs
+      - crates/terra-protocol/src/application.rs
+      - crates/terra-protocol/src/socket.rs
+      - crates/terra-protocol/src/vsock.rs
       - .github/workflows/kernel.yml
 
 permissions:
@@ -39,7 +51,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: python3 -B scripts/test-kernel-tools.py
+      - run: python3 -B scripts/kernel/test-kernel-tools.py
+      - run: python3 -B scripts/kernel/test-kernel-vsock.py
+      - run: python3 -B scripts/kernel/check-vsock-abi.py
 
   export:
     needs: verify
@@ -59,7 +73,7 @@ jobs:
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: build
-          key: kernel-${{ matrix.arch }}-${{ hashFiles('pins.mk', 'Makefile', 'kernel/Containerfile', 'kernel/*.config', 'kernel/patches/*.patch', 'scripts/kernel-container.sh', 'scripts/*.py') }}
+          key: kernel-${{ matrix.arch }}-${{ hashFiles('pins.mk', 'Makefile', 'kernel/Containerfile', 'kernel/*.config', 'kernel/patches/*.patch', 'kernel/overlay/**', 'scripts/kernel/kernel-container.sh', 'scripts/**/*.py') }}
       - name: Build kernel archive
         run: make ARCH=${{ matrix.arch }} kernel-export
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

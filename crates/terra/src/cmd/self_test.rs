@@ -189,30 +189,26 @@ fn generate_policy(args: &SelfTestArgs, project: &Path) -> Result<ExitCode> {
                 Phase::Collect { traces } => {
                     command.args(["self-test", "host"]);
                     prepare_self_test(&mut command, stage.path(), "host-collect")?;
+                    command.env("TERRA_SYSCALL_TRACE", traces);
                     policy::trace_command(&command, &traces.join("host.json"))
                 }
-                Phase::Enforce {
-                    policy: policy_bytes,
-                } => {
-                    let path = stage.path().join("policy.bpf");
-                    std::fs::write(&path, policy_bytes)?;
+                Phase::Enforce { policy: path } => {
+                    let config = stage.path().join("launcher.json");
+                    crate::sandbox::config::write_policy_workload(&config, Some(path))?;
                     command.args(["self-test", "host"]);
                     prepare_self_test(&mut command, stage.path(), "host-enforce")?;
-                    command.env("TERRA_SECCOMP_ENFORCED", "1");
-                    policy::enforce_command(command, Some(&path))
+                    command
+                        .env("TERRA_SECCOMP_ENFORCED", "1")
+                        .env("TERRA_SECCOMP_CONFIG", config);
+                    Ok(command)
                 }
-                Phase::Validate {
-                    name,
-                    policy: policy_bytes,
-                } => {
+                Phase::Validate { name, policy: path } => {
                     anyhow::ensure!(
                         name == "self_test.built_in_guest",
                         "unknown self-test validation: {name}"
                     );
-                    let path = stage.path().join("policy.bpf");
-                    std::fs::write(&path, policy_bytes)?;
                     let config = stage.path().join("launcher.json");
-                    crate::sandbox::config::write_policy_workload(&config, Some(&path))?;
+                    crate::sandbox::config::write_policy_workload(&config, Some(path))?;
                     command.args(["self-test", "guest"]);
                     prepare_self_test(&mut command, stage.path(), "guest-enforce")?;
                     command

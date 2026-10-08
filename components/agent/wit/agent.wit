@@ -1,0 +1,27 @@
+package terra:agent@0.1.0;
+
+interface host-service {
+    enum endpoint-error { closed, io }
+    variant event { connected, disconnected, diagnostic(list<u8>), exit(s32), agent-ready }
+    resource client {
+        input: func() -> stream<u8>;
+        output: async func(bytes: stream<u8>) -> result<_, endpoint-error>;
+    }
+    listener: func() -> option<stream<own<client>>>;
+    plan: func() -> list<u8>;
+    stop: func() -> stream<u8>;
+}
+
+interface api {
+    use host-service.{event};
+    events: async func() -> stream<event>;
+    close: async func();
+}
+
+world role {
+    import host-service;
+    import terra:vsock/role-stream@0.1.0;
+    import wasi:clocks/monotonic-clock@0.3.1;
+    import wasi:clocks/system-clock@0.3.1;
+    export api;
+}

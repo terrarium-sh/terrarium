@@ -46,14 +46,22 @@ pub struct Request<'a> {
     pub body: &'a [u8],
 }
 
-fn u32_at(bytes: &[u8], start: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(
-        bytes.get(start..start + 4)?.try_into().ok()?,
+pub(crate) fn u32_at(bytes: &[u8], start: usize) -> Result<u32, i32> {
+    Ok(u32::from_le_bytes(
+        bytes
+            .get(start..start + 4)
+            .ok_or(EINVAL)?
+            .try_into()
+            .map_err(|_| EINVAL)?,
     ))
 }
-fn u64_at(bytes: &[u8], start: usize) -> Option<u64> {
-    Some(u64::from_le_bytes(
-        bytes.get(start..start + 8)?.try_into().ok()?,
+pub(crate) fn u64_at(bytes: &[u8], start: usize) -> Result<u64, i32> {
+    Ok(u64::from_le_bytes(
+        bytes
+            .get(start..start + 8)
+            .ok_or(EINVAL)?
+            .try_into()
+            .map_err(|_| EINVAL)?,
     ))
 }
 
@@ -61,15 +69,15 @@ pub fn request(bytes: &[u8]) -> Result<Request<'_>, i32> {
     if bytes.len() < HEADER {
         return Err(EINVAL);
     }
-    let len = u32_at(bytes, 0).ok_or(EINVAL)?;
+    let len = u32_at(bytes, 0)?;
     let len = usize::try_from(len).map_err(|_| EINVAL)?;
     if len < HEADER || len > bytes.len() {
         return Err(EINVAL);
     }
     Ok(Request {
-        opcode: u32_at(bytes, 4).ok_or(EINVAL)?,
-        unique: u64_at(bytes, 8).ok_or(EINVAL)?,
-        node: u64_at(bytes, 16).ok_or(EINVAL)?,
+        opcode: u32_at(bytes, 4)?,
+        unique: u64_at(bytes, 8)?,
+        node: u64_at(bytes, 16)?,
         body: &bytes[HEADER..len],
     })
 }
@@ -89,12 +97,12 @@ pub fn init(body: &[u8]) -> Result<Vec<u8>, i32> {
     if body.len() < 16 {
         return Err(EINVAL);
     }
-    let major = u32_at(body, 0).ok_or(EINVAL)?;
+    let major = u32_at(body, 0)?;
     if major != 7 {
         return Err(EINVAL);
     }
-    let minor = u32_at(body, 4).ok_or(EINVAL)?;
-    let flags = u32_at(body, 12).ok_or(EINVAL)?;
+    let minor = u32_at(body, 4)?;
+    let flags = u32_at(body, 12)?;
     let extended = flags & INIT_EXT != 0;
     let mut out = vec![0; INIT_OUT];
     out[0..4].copy_from_slice(&7_u32.to_le_bytes());
@@ -131,8 +139,8 @@ mod tests {
         for flags in [0, BIG_WRITES, INIT_EXT, INIT_EXT | BIG_WRITES] {
             body[12..16].copy_from_slice(&flags.to_le_bytes());
             let reply = init(&body).unwrap();
-            assert_eq!(u32_at(&reply, 12), Some(flags));
-            assert_eq!(u32_at(&reply, 20), Some(64 * 1024));
+            assert_eq!(u32_at(&reply, 12), Ok(flags));
+            assert_eq!(u32_at(&reply, 20), Ok(64 * 1024));
         }
     }
 
@@ -145,11 +153,11 @@ mod tests {
         body[16..20].copy_from_slice(&(1_u32 << 8).to_le_bytes());
         let reply = init(&body).unwrap();
         assert_eq!(reply.len(), INIT_OUT);
-        assert_eq!(u32_at(&reply, 12), Some(INIT_EXT));
-        assert_eq!(u32_at(&reply, 32), Some(0));
+        assert_eq!(u32_at(&reply, 12), Ok(INIT_EXT));
+        assert_eq!(u32_at(&reply, 32), Ok(0));
         assert_eq!(u16::from_le_bytes(reply[16..18].try_into().unwrap()), 64);
         assert_eq!(u16::from_le_bytes(reply[18..20].try_into().unwrap()), 48);
-        assert_eq!(u32_at(&reply, 20), Some(64 * 1024));
+        assert_eq!(u32_at(&reply, 20), Ok(64 * 1024));
     }
 
     #[test]
@@ -158,10 +166,10 @@ mod tests {
         body[..4].copy_from_slice(&7_u32.to_le_bytes());
         body[4..8].copy_from_slice(&40_u32.to_le_bytes());
         body[16..20].copy_from_slice(&FILE_EVENTS.to_le_bytes());
-        assert_eq!(u32_at(&init(&body).unwrap(), 32), Some(0));
+        assert_eq!(u32_at(&init(&body).unwrap(), 32), Ok(0));
         body[12..16].copy_from_slice(&INIT_EXT.to_le_bytes());
-        assert_eq!(u32_at(&init(&body).unwrap(), 32), Some(FILE_EVENTS));
-        assert_eq!(u32_at(&init(&body[..16]).unwrap(), 32), Some(0));
+        assert_eq!(u32_at(&init(&body).unwrap(), 32), Ok(FILE_EVENTS));
+        assert_eq!(u32_at(&init(&body[..16]).unwrap(), 32), Ok(0));
     }
 
     #[test]
@@ -170,7 +178,7 @@ mod tests {
         body[..4].copy_from_slice(&7_u32.to_le_bytes());
         body[4..8].copy_from_slice(&40_u32.to_le_bytes());
         let reply = init(&body).unwrap();
-        assert_eq!(u32_at(&reply, 12), Some(0));
+        assert_eq!(u32_at(&reply, 12), Ok(0));
     }
 
     #[test]
@@ -182,8 +190,8 @@ mod tests {
     #[test]
     fn error_reply_keeps_request_identity() {
         let reply = reply(17, ENOSYS, &[]);
-        assert_eq!(u32_at(&reply, 0), Some(u32::try_from(OUT_HEADER).unwrap()));
+        assert_eq!(u32_at(&reply, 0), Ok(u32::try_from(OUT_HEADER).unwrap()));
         assert_eq!(i32::from_le_bytes(reply[4..8].try_into().unwrap()), -ENOSYS);
-        assert_eq!(u64_at(&reply, 8), Some(17));
+        assert_eq!(u64_at(&reply, 8), Ok(17));
     }
 }

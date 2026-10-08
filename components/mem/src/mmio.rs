@@ -10,8 +10,8 @@ terra_device_transport::mmio_device!(
     transport::interrupt_level
 );
 
-async fn write(offset: u64, bytes: Vec<u8>) -> Result<(), DeviceError> {
-    transport::mmio_write(offset, &bytes).map(|_| ())
+async fn write(offset: u64, width: u8, value: u64) -> Result<(), DeviceError> {
+    transport::mmio_write(offset, width, value)
 }
 
 async fn close() -> Result<(), DeviceError> {

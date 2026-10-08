@@ -16,6 +16,7 @@ test-support = []
 
 [dependencies]
 terra-platform = { path = "../terra-platform" }
+terra-network = { path = "../terra-network" }
 terra-protocol = { path = "../terra-protocol" }
 futures-util = { version = "0.3", default-features = false, features = ["alloc", "std"] }
 notify = "8.2"
@@ -30,12 +31,9 @@ wasmtime-wasi = { version = "=49.0.2", default-features = false, features = ["p3
 [dev-dependencies]
 terra-protocol = { path = "../terra-protocol", features = ["mux"] }
 tokio = { version = "1", features = ["test-util"] }
-futures-channel = "0.3"
-yamux = "=0.14.1"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 # Integration tests link the library without cfg(test).
 terra-runtime = { path = ".", features = ["test-support"] }
-terra-vsock-device = { path = "../../components/vsock-device" }
 tempfile = { workspace = true }
 # Core-Wasm spike tests compile WAT and components; release builds do not.
 wasmtime = { version = "=49.0.2", default-features = false, features = ["cranelift", "wat"] }
@@ -45,14 +43,6 @@ libc.workspace = true
 
 [target.'cfg(windows)'.dev-dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
-
-[[test]]
-name = "shared_component_memory"
-required-features = ["thread-experiments"]
-
-[[test]]
-name = "shared_worker_memory"
-required-features = ["thread-experiments"]
 
 [[example]]
 name = "precompile-component"

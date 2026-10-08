@@ -1,11 +1,11 @@
 //! The guest boot plan, built host-side and read by the agent.
 
-use serde::de::Error as _;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub const MAX_PLAN_BYTES: usize = 1 << 20;
 pub const MAX_PLAN_HOST_STATE_BYTES: usize = 1024;
+pub const MAX_PUBLISHED_PORTS: usize = 32;
 
 pub const RESIZE2FS_GUEST_PATH: &str = "/terra-resize2fs";
 
@@ -70,12 +70,11 @@ pub struct Disk {
     pub guest: String,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct Net {
-    pub guest_ip: std::net::IpAddr,
-    pub prefix: u8,
-    pub gateway: std::net::IpAddr,
-    pub dns: std::net::IpAddr,
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Net {
+    Tsi,
+    LocalOnly,
 }
 
 /// A UTC sample captured immediately before the guest receives its boot plan.
@@ -85,46 +84,6 @@ pub struct HostTime {
     pub nanoseconds: u32,
 }
 
-impl<'de> Deserialize<'de> for Net {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct Fields {
-            guest_ip: std::net::IpAddr,
-            prefix: u8,
-            gateway: std::net::IpAddr,
-            dns: std::net::IpAddr,
-        }
-
-        let Fields {
-            guest_ip,
-            prefix,
-            gateway,
-            dns,
-        } = Fields::deserialize(deserializer)?;
-        let guest_uses_ipv4 = guest_ip.is_ipv4();
-        let max_prefix_bits = if guest_uses_ipv4 { 32 } else { 128 };
-        if prefix > max_prefix_bits {
-            return Err(D::Error::custom(format!(
-                "network prefix {prefix} exceeds the {max_prefix_bits}-bit address limit"
-            )));
-        }
-        if gateway.is_ipv4() != guest_uses_ipv4 || dns.is_ipv4() != guest_uses_ipv4 {
-            return Err(D::Error::custom(
-                "network gateway and DNS addresses must use the same address family as guest_ip",
-            ));
-        }
-        Ok(Self {
-            guest_ip,
-            prefix,
-            gateway,
-            dns,
-        })
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Plan {
     pub mode: PlanMode,
@@ -132,6 +91,8 @@ pub struct Plan {
     pub shares: Vec<Share>,
     pub volumes: Vec<Disk>,
     pub net: Net,
+    pub published_ports: Vec<u16>,
+    pub published_udp_ports: Vec<u16>,
     pub env: BTreeMap<String, String>,
     /// Run the workload as root instead of dropping to the workload user
     /// (`--root`; also set for the `terra setup` bake).
@@ -150,6 +111,62 @@ pub struct Plan {
     pub host_tz: Option<Vec<u8>>,
     pub host_time: Option<HostTime>,
     pub host_seed: Option<[u8; 32]>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BootPlan {
+    pub agent_version: u8,
+    pub socket_version: u16,
+    pub plan: Plan,
+}
+
+impl BootPlan {
+    #[must_use]
+    pub const fn new(plan: Plan) -> Self {
+        Self {
+            agent_version: crate::AGENT_PROTOCOL_VERSION,
+            socket_version: crate::socket::VERSION,
+            plan,
+        }
+    }
+
+    pub fn validate_protocol_versions(&self) -> std::io::Result<()> {
+        if self.agent_version != crate::AGENT_PROTOCOL_VERSION
+            || self.socket_version != crate::socket::VERSION
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "boot protocol mismatch: host agent {}/socket {}, guest agent {}/socket {}; rebuild the kernel, agent, components, and runtime together",
+                    self.agent_version,
+                    self.socket_version,
+                    crate::AGENT_PROTOCOL_VERSION,
+                    crate::socket::VERSION
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Plan {
+    pub fn validate_network(&self) -> std::io::Result<()> {
+        if self.published_ports.len() + self.published_udp_ports.len() > MAX_PUBLISHED_PORTS
+            || [&self.published_ports, &self.published_udp_ports]
+                .iter()
+                .any(|ports| {
+                    ports.contains(&0)
+                        || ports.windows(2).any(|ports| ports[0] >= ports[1])
+                        || (self.net == Net::LocalOnly && !ports.is_empty())
+                })
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "published guest ports must be sorted, unique, nonzero, within the listener limit, and empty in local-only mode",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -192,12 +209,9 @@ mod tests {
                     dev: to_volume_device(0).unwrap(),
                     guest: "/data".into(),
                 }],
-                net: Net {
-                    guest_ip: "100.96.0.2".parse().unwrap(),
-                    prefix: 30,
-                    gateway: "100.96.0.1".parse().unwrap(),
-                    dns: "100.96.0.1".parse().unwrap(),
-                },
+                net: Net::Tsi,
+                published_ports: vec![80, 443],
+                published_udp_ports: vec![53],
                 env: BTreeMap::from([("FOO".to_string(), "bar".to_string())]),
                 root: false,
                 sudo: vec!["apk".into()],
@@ -215,8 +229,56 @@ mod tests {
                 }),
                 host_seed: Some([3; 32]),
             };
+            assert!(plan.validate_network().is_ok());
+            for ports in [vec![0], vec![443, 80], vec![80, 80], (1..=33).collect()] {
+                let mut invalid = plan.clone();
+                invalid.published_ports = ports.clone();
+                assert!(invalid.validate_network().is_err());
+                invalid = plan.clone();
+                invalid.published_udp_ports = ports;
+                assert!(invalid.validate_network().is_err());
+            }
+            let mut combined_limit = plan.clone();
+            combined_limit.published_ports = (1..=16).collect();
+            combined_limit.published_udp_ports = (1..=16).collect();
+            assert!(combined_limit.validate_network().is_ok());
+            combined_limit.published_udp_ports.push(17);
+            assert!(combined_limit.validate_network().is_err());
+            let mut local_only = plan.clone();
+            local_only.net = Net::LocalOnly;
+            assert!(local_only.validate_network().is_err());
+            local_only.published_ports.clear();
+            assert!(local_only.validate_network().is_err());
+            local_only.published_udp_ports.clear();
+            assert!(local_only.validate_network().is_ok());
             let mut cursor = std::io::Cursor::new(encode_frame(&plan).unwrap());
-            assert_eq!(read_frame::<Plan>(&mut cursor).unwrap(), Some(plan));
+            assert_eq!(read_frame::<Plan>(&mut cursor).unwrap(), Some(plan.clone()));
+            let boot = BootPlan::new(plan.clone());
+            assert!(boot.validate_protocol_versions().is_ok());
+            let frame = encode_frame(&boot).unwrap();
+            assert_eq!(
+                read_frame::<BootPlan>(&mut frame.as_slice()).unwrap(),
+                Some(boot.clone())
+            );
+            for agent_version in [0, crate::AGENT_PROTOCOL_VERSION + 1] {
+                let mut invalid = boot.clone();
+                invalid.agent_version = agent_version;
+                assert_eq!(
+                    invalid.validate_protocol_versions().unwrap_err().kind(),
+                    std::io::ErrorKind::InvalidData
+                );
+            }
+            for socket_version in [0, crate::socket::VERSION + 1] {
+                let mut invalid = boot.clone();
+                invalid.socket_version = socket_version;
+                assert_eq!(
+                    invalid.validate_protocol_versions().unwrap_err().kind(),
+                    std::io::ErrorKind::InvalidData
+                );
+            }
+            let bare = encode_frame(&plan).unwrap();
+            assert!(read_frame::<BootPlan>(&mut bare.as_slice()).is_err());
+            assert!(read_frame::<Plan>(&mut frame.as_slice()).is_err());
         }
     }
 
@@ -232,20 +294,16 @@ mod tests {
     }
 
     #[test]
-    fn reject_invalid_network_requests() {
-        for (prefix, gateway, dns) in [
-            (33, "192.0.2.1", "192.0.2.1"),
-            (24, "2001:db8::1", "192.0.2.1"),
-            (24, "192.0.2.1", "2001:db8::1"),
-        ] {
-            let net = Net {
-                guest_ip: "192.0.2.2".parse().unwrap(),
-                prefix,
-                gateway: gateway.parse().unwrap(),
-                dns: dns.parse().unwrap(),
-            };
+    fn network_modes_round_trip_by_name() {
+        for (net, name) in [(Net::Tsi, "tsi"), (Net::LocalOnly, "local_only")] {
             let frame = encode_frame(&net).unwrap();
-            assert!(read_frame::<Net>(&mut frame.as_slice()).is_err());
+            assert_eq!(read_frame::<Net>(&mut frame.as_slice()).unwrap(), Some(net));
+            let decoder = serde::de::value::StrDeserializer::<serde::de::value::Error>::new(name);
+            assert_eq!(Net::deserialize(decoder).unwrap(), net);
+        }
+        for name in ["packet", "Tsi", "LocalOnly"] {
+            let decoder = serde::de::value::StrDeserializer::<serde::de::value::Error>::new(name);
+            assert!(Net::deserialize(decoder).is_err());
         }
     }
 }

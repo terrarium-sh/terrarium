@@ -1,7 +1,7 @@
 # One fully-static `terra` binary embeds a minimal Terra guest kernel and
 # trusted AOT device components.
 #
-# musl C toolchain is provided by zig (scripts/zig-musl-*), so no cross-gcc need
+# musl C toolchain is provided by zig (scripts/toolchain/zig-musl-*), so no cross-gcc need
 # be installed.
 
 CARGO ?= cargo
@@ -29,15 +29,15 @@ TERRA_TARGET ?= $(MUSL)
 # machine rather than the guest. This lets an x86_64 Linux builder prepare the
 # aarch64 guest payload used by macOS and Windows ARM64 releases.
 BUILD_ARCH ?= $(shell uname -m | sed 's/^arm64$$/aarch64/')
-MKE2FS_CC_x86_64 := scripts/zig-musl-cc
-MKE2FS_CC_aarch64 := scripts/zig-musl-cc-aarch64
+MKE2FS_CC_x86_64 := scripts/toolchain/zig-musl-cc
+MKE2FS_CC_aarch64 := scripts/toolchain/zig-musl-cc-aarch64
 MKE2FS_CC := $(MKE2FS_CC_$(BUILD_ARCH))
 BUILD := build
 DIST := dist
 SOURCE_DIST := $(BUILD)/terra-source.tar.gz
 ALPINE_SOURCE_DIST := $(BUILD)/alpine-corresponding-source.tar.gz
 
-# Versions, URLs and sha256s of everything downloaded and baked into the binary
+# Versions, source pins and sha256s of everything baked into the binary
 # — the guest kernel, e2fsprogs, Bubblewrap, libcap, Alpine rootfs and doas. Kept in its own file
 # so a bump is a reviewable diff of provenance and nothing else; the recipes that
 # consume it are below. Needs $(ARCH), hence included here.
@@ -49,9 +49,13 @@ E2FSPROGS_SRC := $(BUILD)/e2fsprogs-$(E2FSPROGS_VERSION)
 MKE2FS := $(BUILD)/mke2fs
 RESIZE2FS := $(BUILD)/resize2fs
 BWRAP := $(BUILD)/bwrap-$(ARCH)
+SOCKET_PROBE := $(BUILD)/socket-probe
 BWRAP_CC := $(MKE2FS_CC_$(ARCH))
 LINUX_BWRAP_ASSET := $(if $(findstring -linux-,$(TERRA_TARGET)),$(BWRAP),)
-BUBBLEWRAP_TARBALL := $(BUILD)/bubblewrap-$(BUBBLEWRAP_VERSION).tar.xz
+BUBBLEWRAP_SRC := vendor/bubblewrap
+BUBBLEWRAP_SOURCES := $(addprefix $(BUBBLEWRAP_SRC)/,bubblewrap.c bind-mount.c network.c utils.c chroot_realpath.c safe_openat.c)
+BUBBLEWRAP_HEADERS := $(wildcard $(BUBBLEWRAP_SRC)/*.h)
+BUBBLEWRAP_CONFIG := $(BUILD)/bubblewrap-$(ARCH)-config
 LIBCAP_TARBALL := $(BUILD)/libcap-$(LIBCAP_VERSION).tar.xz
 
 # The guest root filesystem is prebaked here, at build time, on Linux — where we
@@ -75,13 +79,13 @@ ROOTFS_IMG_MIB := 16
 # recipe added later, for one line.
 .DELETE_ON_ERROR:
 
-COMPONENTS := block vsock network fs mem boot vmm mmio interrupt-controller policy
+COMPONENTS := block agent vsock-frontend fs mem boot vmm interrupt-controller
 COMPONENT_TARGETS := $(addprefix component-,$(COMPONENTS))
 COMPONENT_AOT_TARGETS := $(addsuffix -aot,$(COMPONENT_TARGETS))
 COMPONENT_MANIFEST := components/Cargo.toml
 COMPONENT_WASM_DIR := components/target/wasm-components/release
 
-.PHONY: $(COMPONENT_TARGETS) $(COMPONENT_AOT_TARGETS) verify-source verify-host-components guest-assets check-guest-assets host-build host-dist source-dist verify-wit verify-dependency-boundaries verify-platform build verify verify-components verify-workspace dist man clean test-component-boot test-platform-native-vm test-component-vmm test-install check-zig
+.PHONY: $(COMPONENT_TARGETS) $(COMPONENT_AOT_TARGETS) verify-source verify-host-components guest-assets check-guest-assets host-build host-dist source-dist verify-wit verify-dependency-boundaries verify-platform build verify verify-components verify-workspace dist man clean test-component-boot test-platform-native-vm test-component-vmm test-install check-zig check-bubblewrap
 
 # Pin changes invalidate every embedded guest payload.
 PINS := $(ARCH) $(KERNEL_VERSION) $(KERNEL_SHA256) $(E2FSPROGS_VERSION) $(E2FSPROGS_SHA256) \
@@ -102,6 +106,9 @@ KERNEL_SOURCE := $(BUILD)/linux-$(KERNEL_VERSION)
 KERNEL_OUTPUT := $(BUILD)/kernel-$(ARCH)
 KERNEL_FRAGMENTS := kernel/terra.config kernel/$(ARCH).config
 KERNEL_PATCHES := $(sort $(wildcard kernel/patches/*.patch))
+KERNEL_OVERLAY := $(shell find kernel/overlay -type f | sort)
+KERNEL_PACKAGING_INPUTS := crates/terra-protocol/src/guest_image.rs crates/terra-protocol/src/socket.rs \
+	crates/terra-protocol/src/application.rs crates/terra-protocol/src/vsock.rs crates/terra-protocol/examples/package-guest-image.rs
 KERNEL_INPUTS := $(BUILD)/.kernel-inputs
 KERNEL_PATCH_STAMP := $(KERNEL_SOURCE)/.terra-patches
 KERNEL_JOBS ?= $(shell nproc)
@@ -109,7 +116,7 @@ KERNEL_CC_x86_64 := gcc
 KERNEL_CC_aarch64 := $(if $(filter aarch64,$(BUILD_ARCH)),gcc,aarch64-linux-gnu-gcc)
 KERNEL_CC ?= $(KERNEL_CC_$(ARCH))
 KERNEL_CROSS_aarch64 := $(if $(filter aarch64,$(BUILD_ARCH)),,aarch64-linux-gnu-)
-KERNEL_MAKE := scripts/kernel-container.sh $(MAKE) --no-print-directory -C $(KERNEL_SOURCE) O=$(abspath $(KERNEL_OUTPUT)) \
+KERNEL_MAKE := scripts/kernel/kernel-container.sh $(MAKE) --no-print-directory -C $(KERNEL_SOURCE) O=$(abspath $(KERNEL_OUTPUT)) \
 	ARCH=$(KERNEL_ARCH) CC="$(KERNEL_CC)" CROSS_COMPILE=$(KERNEL_CROSS_$(ARCH)) KBUILD_BUILD_USER=terra KBUILD_BUILD_HOST=terra \
 	KBUILD_BUILD_VERSION=1 KBUILD_BUILD_TIMESTAMP='2026-09-09 00:00:00 UTC'
 KERNEL_BINARY_x86_64 := vmlinux
@@ -118,7 +125,7 @@ KERNEL_BINARY := $(KERNEL_BINARY_$(ARCH))
 
 $(KERNEL_INPUTS): FORCE
 	@mkdir -p $(BUILD)
-	@{ echo '$(ARCH) $(KERNEL_VERSION) $(KERNEL_SHA256)'; cat $(KERNEL_FRAGMENTS) $(KERNEL_PATCHES) kernel/Containerfile scripts/kernel-container.sh | sha256sum; } > $@.tmp
+	@{ echo '$(ARCH) $(KERNEL_VERSION) $(KERNEL_SHA256)'; printf '%s\n' $(KERNEL_PATCHES) $(KERNEL_OVERLAY); cat $(KERNEL_FRAGMENTS) $(KERNEL_PATCHES) $(KERNEL_OVERLAY) kernel/Containerfile scripts/kernel/kernel-container.sh $(KERNEL_PACKAGING_INPUTS) | sha256sum; } > $@.tmp
 	@cmp -s $@.tmp $@ || cp $@.tmp $@
 	@rm -f $@.tmp
 
@@ -135,9 +142,9 @@ ifneq ($(strip $(KERNEL_ARCHIVE)),)
 ifeq ($(strip $(KERNEL_ARCHIVE_SHA256)),)
 $(error KERNEL_ARCHIVE_SHA256 is required for a prebuilt kernel)
 endif
-$(KERNEL_GZ): $(KERNEL_ARCHIVE) $(KERNEL_INPUTS) scripts/kernel-artifact.py scripts/check-kernel-config.py
-	python3 scripts/kernel-artifact.py import $(KERNEL_ARCHIVE) $(KERNEL_ARCHIVE_SHA256) $(KERNEL_INPUTS) $(BUILD)/vmlinux $(KERNEL_OUTPUT)/.config
-	python3 scripts/check-kernel-config.py $(KERNEL_OUTPUT)/.config $(KERNEL_FRAGMENTS)
+$(KERNEL_GZ): $(KERNEL_ARCHIVE) $(KERNEL_INPUTS) $(KERNEL_PACKAGING_INPUTS) scripts/kernel/kernel-artifact.py scripts/kernel/check-kernel-config.py
+	python3 scripts/kernel/kernel-artifact.py import $(KERNEL_ARCHIVE) $(KERNEL_ARCHIVE_SHA256) $(KERNEL_INPUTS) $(BUILD)/vmlinux $(KERNEL_OUTPUT)/.config
+	python3 scripts/kernel/check-kernel-config.py $(KERNEL_OUTPUT)/.config $(KERNEL_FRAGMENTS)
 else
 $(KERNEL_TARBALL):
 	mkdir -p $(BUILD)
@@ -150,25 +157,27 @@ $(KERNEL_PATCH_STAMP): $(KERNEL_TARBALL) $(KERNEL_INPUTS)
 	rm -rf $(KERNEL_SOURCE) $(KERNEL_OUTPUT)
 	tar -xf $(KERNEL_TARBALL) -C $(BUILD)
 	set -e; for patch in $(abspath $(KERNEL_PATCHES)); do git apply --directory=$(KERNEL_SOURCE) --check $$patch && git apply --directory=$(KERNEL_SOURCE) $$patch; done
-	sha256sum $(KERNEL_PATCHES) </dev/null > $@
+	cp -a kernel/overlay/. $(KERNEL_SOURCE)/
+	sha256sum $(KERNEL_PATCHES) $(KERNEL_OVERLAY) > $@
 
 $(KERNEL_OUTPUT)/.config: $(KERNEL_PATCH_STAMP) $(KERNEL_INPUTS) $(KERNEL_FRAGMENTS)
 	mkdir -p $(KERNEL_OUTPUT)
 	cat $(KERNEL_FRAGMENTS) > $(KERNEL_OUTPUT)/seed.config
 	$(KERNEL_MAKE) KCONFIG_ALLCONFIG=$(abspath $(KERNEL_OUTPUT)/seed.config) allnoconfig
-	python3 scripts/check-kernel-config.py $@ $(KERNEL_FRAGMENTS)
+	python3 scripts/kernel/check-kernel-config.py $@ $(KERNEL_FRAGMENTS)
 
-$(KERNEL_GZ): $(KERNEL_OUTPUT)/.config $(KERNEL_INPUTS) scripts/check-kernel-config.py
-	python3 scripts/check-kernel-config.py $(KERNEL_OUTPUT)/.config $(KERNEL_FRAGMENTS)
+$(KERNEL_GZ): $(KERNEL_OUTPUT)/.config $(KERNEL_INPUTS) $(KERNEL_PACKAGING_INPUTS) scripts/kernel/check-kernel-config.py
+	python3 scripts/kernel/check-kernel-config.py $(KERNEL_OUTPUT)/.config $(KERNEL_FRAGMENTS)
 	$(KERNEL_MAKE) -j$(KERNEL_JOBS) $(notdir $(KERNEL_BINARY))
-	scripts/kernel-container.sh $(if $(filter x86_64,$(ARCH)),objcopy --strip-all,cp) $(KERNEL_OUTPUT)/$(KERNEL_BINARY) $(BUILD)/vmlinux
-	gzip -9nc $(BUILD)/vmlinux > $@.tmp && mv $@.tmp $@
+	scripts/kernel/kernel-container.sh $(if $(filter x86_64,$(ARCH)),objcopy --strip-all,cp) $(KERNEL_OUTPUT)/$(KERNEL_BINARY) $(BUILD)/vmlinux
+	$(CARGO_LOCKED) run -p terra-protocol --example package-guest-image -- kernel $(BUILD)/vmlinux $@.tmp
+	mv $@.tmp $@
 endif
 
 .PHONY: kernel kernel-export
 kernel: $(KERNEL_GZ)
 kernel-export: $(KERNEL_GZ)
-	python3 scripts/kernel-artifact.py export $(KERNEL_GZ) $(KERNEL_OUTPUT)/.config $(KERNEL_INPUTS) $(BUILD)/terra-kernel-$(ARCH).tar.gz
+	python3 scripts/kernel/kernel-artifact.py export $(KERNEL_GZ) $(KERNEL_OUTPUT)/.config $(KERNEL_INPUTS) $(BUILD)/terra-kernel-$(ARCH).tar.gz
 	sha256sum $(BUILD)/terra-kernel-$(ARCH).tar.gz > $(BUILD)/terra-kernel-$(ARCH).tar.gz.sha256
 
 ## Static mke2fs — a *build-time* tool only: it bakes the prebaked images below.
@@ -188,11 +197,13 @@ $(MKE2FS): $(PIN_STAMP)
 	cp $(E2FSPROGS_SRC)/misc/mke2fs $(MKE2FS)
 	strip $(MKE2FS)
 
-$(BUBBLEWRAP_TARBALL): pins.mk
-	mkdir -p $(BUILD)
-	curl -fsSL '$(BUBBLEWRAP_URL)' -o $@.tmp
-	echo '$(BUBBLEWRAP_SHA256)  $@.tmp' | sha256sum -c -
-	mv $@.tmp $@
+$(BUBBLEWRAP_SOURCES) $(BUBBLEWRAP_SRC)/meson.build:
+	@echo 'missing Bubblewrap sources; run git submodule update --init --recursive' >&2
+	@exit 1
+
+check-bubblewrap: $(BUBBLEWRAP_SRC)/meson.build
+	@test "$$(sed -n "s/^  version : '\([^']*\)',/\1/p" $(BUBBLEWRAP_SRC)/meson.build | head -n 1)" = '$(BUBBLEWRAP_VERSION)' || { echo 'Bubblewrap version differs from pins.mk; update its version and submodule together' >&2; exit 1; }
+	@if test -e $(BUBBLEWRAP_SRC)/.git; then test "$$(git -C $(BUBBLEWRAP_SRC) rev-parse HEAD)" = '$(BUBBLEWRAP_COMMIT)' || { echo 'Bubblewrap commit differs from pins.mk; run git submodule update --init --recursive or update the pin' >&2; exit 1; }; fi
 
 $(LIBCAP_TARBALL): pins.mk
 	mkdir -p $(BUILD)
@@ -200,19 +211,18 @@ $(LIBCAP_TARBALL): pins.mk
 	echo '$(LIBCAP_SHA256)  $@.tmp' | sha256sum -c -
 	mv $@.tmp $@
 
-$(BWRAP): $(BUBBLEWRAP_TARBALL) $(LIBCAP_TARBALL) pins.mk Makefile scripts/zig-musl-cc scripts/zig-musl-cc-aarch64 scripts/zig-musl-ar
+$(BWRAP): $(BUBBLEWRAP_SOURCES) $(BUBBLEWRAP_HEADERS) $(BUBBLEWRAP_SRC)/meson.build $(LIBCAP_TARBALL) pins.mk Makefile scripts/toolchain/zig-musl-cc scripts/toolchain/zig-musl-cc-aarch64 scripts/toolchain/zig-musl-ar | check-bubblewrap
 	$(MAKE) check-zig
-	echo '$(BUBBLEWRAP_SHA256)  $(BUBBLEWRAP_TARBALL)' | sha256sum -c -
 	echo '$(LIBCAP_SHA256)  $(LIBCAP_TARBALL)' | sha256sum -c -
-	rm -rf $(BUILD)/bubblewrap-$(ARCH)-src $(BUILD)/libcap-$(ARCH)-src
-	mkdir -p $(BUILD)/bubblewrap-$(ARCH)-src $(BUILD)/libcap-$(ARCH)-src
-	tar -xf $(BUBBLEWRAP_TARBALL) --strip-components=1 -C $(BUILD)/bubblewrap-$(ARCH)-src
+	rm -rf $(BUBBLEWRAP_CONFIG) $(BUILD)/libcap-$(ARCH)-src
+	mkdir -p $(BUBBLEWRAP_CONFIG) $(BUILD)/libcap-$(ARCH)-src
 	tar -xf $(LIBCAP_TARBALL) --strip-components=1 -C $(BUILD)/libcap-$(ARCH)-src
-	$(MAKE) -C $(BUILD)/libcap-$(ARCH)-src/libcap libcap.a CC=$(abspath $(BWRAP_CC)) BUILD_CC=cc AR=$(abspath scripts/zig-musl-ar) RANLIB='zig ranlib' SHARED=no PTHREADS=no USE_GPERF=no COPTS='-O2 -fstack-protector-strong -D_FORTIFY_SOURCE=2'
-	printf '#define PACKAGE_STRING "bubblewrap $(BUBBLEWRAP_VERSION)"\n' > $(BUILD)/bubblewrap-$(ARCH)-src/config.h
+	$(MAKE) -C $(BUILD)/libcap-$(ARCH)-src/libcap libcap.a CC=$(abspath $(BWRAP_CC)) BUILD_CC=cc AR=$(abspath scripts/toolchain/zig-musl-ar) RANLIB='zig ranlib' SHARED=no PTHREADS=no USE_GPERF=no COPTS='-O2 -fstack-protector-strong -D_FORTIFY_SOURCE=2'
+	printf '#define PACKAGE_STRING "bubblewrap $(BUBBLEWRAP_VERSION)"\n' > $(BUBBLEWRAP_CONFIG)/config.h
 	$(BWRAP_CC) -static-pie -fPIE -fstack-protector-strong -D_FORTIFY_SOURCE=2 -Wno-unused-command-line-argument -s -O2 -D_GNU_SOURCE \
+		-I$(BUBBLEWRAP_CONFIG) \
 		-I$(BUILD)/libcap-$(ARCH)-src/libcap/include -I$(BUILD)/libcap-$(ARCH)-src/libcap/include/uapi \
-		$(addprefix $(BUILD)/bubblewrap-$(ARCH)-src/,bubblewrap.c bind-mount.c network.c utils.c chroot_realpath.c safe_openat.c) \
+		$(BUBBLEWRAP_SOURCES) \
 		$(BUILD)/libcap-$(ARCH)-src/libcap/libcap.a -o $@.tmp
 	mv $@.tmp $@
 
@@ -227,7 +237,7 @@ GUEST_E2FSPROGS_SRC := $(BUILD)/e2fsprogs-guest-$(ARCH)
 $(RESIZE2FS): $(MKE2FS)
 	mkdir -p $(GUEST_E2FSPROGS_SRC)
 	tar -xzf $(BUILD)/e2fsprogs.tar.gz --strip-components=1 -C $(GUEST_E2FSPROGS_SRC)
-	cd $(GUEST_E2FSPROGS_SRC) && CC=$(abspath $(MKE2FS_CC_$(ARCH))) AR=$(abspath scripts/zig-musl-ar) ./configure \
+	cd $(GUEST_E2FSPROGS_SRC) && CC=$(abspath $(MKE2FS_CC_$(ARCH))) AR=$(abspath scripts/toolchain/zig-musl-ar) ./configure \
 		--host=$(ARCH)-linux-musl --disable-nls --disable-uuidd --disable-fuse2fs \
 		--disable-e2initrd-helper --disable-testio-debug LDFLAGS="-static -s" >/dev/null
 	$(MAKE) -C $(GUEST_E2FSPROGS_SRC) libs
@@ -281,11 +291,15 @@ AGENT_BIN := target/$(MUSL)/release/terra-agent
 $(AGENT_BIN): FORCE
 	$(CARGO_LOCKED) build --release -p terra-agent --target $(MUSL)
 
+$(SOCKET_PROBE): crates/terra/tests/assets/socket_probe.c $(PIN_STAMP) Makefile scripts/toolchain/zig-musl-cc scripts/toolchain/zig-musl-cc-aarch64
+	$(MAKE) check-zig
+	$(MKE2FS_CC_$(ARCH)) -static -s -O2 -std=c11 -pthread $< -o $@
+
 # Built-in drivers let the kernel boot directly from this small read-only disk.
 BOOT_TREE := $(BUILD)/boot-tree
 BOOT_IMG := $(BUILD)/boot.img.gz
 BOOT_IMG_MIB := 3
-$(BOOT_IMG): $(MKE2FS) $(RESIZE2FS) $(AGENT_BIN) $(PIN_STAMP) Makefile
+$(BOOT_IMG): $(MKE2FS) $(RESIZE2FS) $(AGENT_BIN) $(PIN_STAMP) Makefile crates/terra-protocol/src/guest_image.rs crates/terra-protocol/examples/package-guest-image.rs
 	rm -rf $(BOOT_TREE)
 	# /dev is where the kernel auto-mounts devtmpfs (CONFIG_DEVTMPFS_MOUNT), which
 	# is what gives init a console and the disk nodes; /proc, /sys and /mnt are
@@ -296,23 +310,23 @@ $(BOOT_IMG): $(MKE2FS) $(RESIZE2FS) $(AGENT_BIN) $(PIN_STAMP) Makefile
 	rm -f $(BUILD)/boot.img
 	truncate -s $(BOOT_IMG_MIB)M $(BUILD)/boot.img
 	unshare -U -r $(MKE2FS) -F -q -t ext4 -b 4096 -m 0 -O ^has_journal -d $(BOOT_TREE) $(BUILD)/boot.img
-	gzip -9 -c $(BUILD)/boot.img > $(BOOT_IMG)
+	$(CARGO_LOCKED) run -p terra-protocol --example package-guest-image -- boot $(BUILD)/boot.img $(BOOT_IMG)
 
 ## Build the static terra binary (embeds vmlinux, prebaked images, and trusted
 ## component artifacts).
-build: $(COMPONENT_AOT_TARGETS) $(KERNEL_GZ) $(ROOTFS_IMG) $(VOLUME_IMG) $(BOOT_IMG) $(BWRAP)
+build: $(COMPONENT_AOT_TARGETS) $(KERNEL_GZ) $(ROOTFS_IMG) $(VOLUME_IMG) $(BOOT_IMG) $(BWRAP) $(SOCKET_PROBE)
 	$(CARGO_LOCKED) build --release -p terra --target $(TERRA_TARGET)
 
 # Guest payloads are produced on Linux and then embedded by each native host
 # build. This keeps macOS and Windows releases free of host mkfs/container
 # tooling while preserving one architecture-specific Linux guest per executable.
-guest-assets: $(KERNEL_GZ) $(ROOTFS_IMG) $(VOLUME_IMG) $(BOOT_IMG) $(BWRAP)
+guest-assets: $(KERNEL_GZ) $(ROOTFS_IMG) $(VOLUME_IMG) $(BOOT_IMG) $(BWRAP) $(SOCKET_PROBE)
 
 # A host build receives these architecture-matched files from a Linux guest
 # build. Check them as inputs so a fresh macOS checkout never tries to rebuild
 # the guest kernel, rootfs, or Linux agent because artifact mtimes changed.
 check-guest-assets:
-	@for asset in $(KERNEL_GZ) $(ROOTFS_IMG) $(VOLUME_IMG) $(BOOT_IMG) $(LINUX_BWRAP_ASSET); do test -s $$asset || { echo "missing staged guest asset: $$asset" >&2; exit 1; }; done
+	@for asset in $(KERNEL_GZ) $(ROOTFS_IMG) $(VOLUME_IMG) $(BOOT_IMG) $(LINUX_BWRAP_ASSET) $(SOCKET_PROBE); do test -s $$asset || { echo "missing staged guest asset: $$asset" >&2; exit 1; }; done
 
 host-build: check-guest-assets $(COMPONENT_AOT_TARGETS)
 	$(CARGO_LOCKED) build --release -p terra --target $(TERRA_TARGET)
@@ -324,37 +338,42 @@ test-component-vmm: dist
 ## then the trusted native compiler produces each embedded AOT blob.
 BLOCK_COMPONENT_AOT := $(BUILD)/terra-block-component.cwasm
 verify-wit:
-	python3 scripts/check-wit-links.py
+	python3 scripts/checks/check-wit-links.py
 
 $(COMPONENT_TARGETS): verify-wit
 
-$(filter-out component-vsock,$(COMPONENT_TARGETS)): component-%:
+$(filter-out component-agent,$(COMPONENT_TARGETS)): component-%:
 	RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO_LOCKED) build --release --target wasm32-unknown-unknown --manifest-path $(COMPONENT_MANIFEST) -p terra-$*-component
 	mkdir -p $(COMPONENT_WASM_DIR)
 	wasm-tools component new components/target/wasm32-unknown-unknown/release/terra_$(subst -,_,$*)_component.wasm -o $(COMPONENT_WASM_DIR)/terra_$(subst -,_,$*)_component.wasm
 	wasm-tools validate --features cm-async $(COMPONENT_WASM_DIR)/terra_$(subst -,_,$*)_component.wasm
 
-component-vsock: verify-wit
-	RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO_LOCKED) build --release --target wasm32-wasip3 --manifest-path $(COMPONENT_MANIFEST) -p terra-vsock-component
+component-agent: verify-wit
+	RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO_LOCKED) build --release --target wasm32-wasip3 --manifest-path $(COMPONENT_MANIFEST) -p terra-agent-component
 	mkdir -p $(COMPONENT_WASM_DIR)
-	cp components/target/wasm32-wasip3/release/terra_vsock_component.wasm $(COMPONENT_WASM_DIR)/terra_vsock_component.wasm
-	wasm-tools validate --features cm-async $(COMPONENT_WASM_DIR)/terra_vsock_component.wasm
+	cp components/target/wasm32-wasip3/release/terra_agent_component.wasm $(COMPONENT_WASM_DIR)/terra_agent_component.wasm
+	wasm-tools validate --features cm-async $(COMPONENT_WASM_DIR)/terra_agent_component.wasm
 
 $(COMPONENT_AOT_TARGETS): component-%-aot: component-%
 	mkdir -p $(BUILD)
-	$(CARGO_LOCKED) run --target $(TERRA_TARGET) -p terra-runtime --features compiler --example precompile-component -- $(COMPONENT_WASM_DIR)/terra_$(subst -,_,$*)_component.wasm $(BUILD)/terra-$*-component.cwasm $(if $(filter policy,$*),--policy,)
+	$(CARGO_LOCKED) run --target $(TERRA_TARGET) -p terra-runtime --features compiler --example precompile-component -- $(COMPONENT_WASM_DIR)/terra_$(subst -,_,$*)_component.wasm $(BUILD)/terra-$*-component.cwasm
 
 test-component-boot: $(COMPONENT_AOT_TARGETS) $(KERNEL_GZ) $(ROOTFS_IMG) $(BOOT_IMG)
 	$(CARGO_LOCKED) test $(TEST_FLAGS) -p terra-runtime --lib -- --ignored --nocapture
 
 test-platform-native-vm:
-	CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER="sh scripts/run-macos-vm-test" $(CARGO_LOCKED) test $(TEST_FLAGS) -p terra-platform --test native_vm -- --ignored --test-threads=1 --nocapture
+	CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER="sh scripts/toolchain/run-macos-vm-test" $(CARGO_LOCKED) test $(TEST_FLAGS) -p terra-platform --test native_vm -- --ignored --test-threads=1 --nocapture
 ifeq ($(shell uname -s),Darwin)
-	CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER="sh scripts/run-macos-vm-test" $(CARGO_LOCKED) test $(TEST_FLAGS) -p terra-platform --lib cpu_off_waits_for_teardown_before_destroying_cpu -- --ignored --nocapture
+	CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER="sh scripts/toolchain/run-macos-vm-test" $(CARGO_LOCKED) test $(TEST_FLAGS) -p terra-platform --lib cpu_off_waits_for_teardown_before_destroying_cpu -- --ignored --nocapture
 endif
 ifeq ($(ARCH),x86_64)
 	$(CARGO_LOCKED) test $(TEST_FLAGS) -p terra-platform --lib cpuid_matches_the_fixed_vcpu_count -- --ignored --nocapture
 endif
+
+.PHONY: test-http3
+test-http3:
+	cd crates/terra/tests/assets/http3_probe && go test ./...
+	python3 scripts/bench/bench-http3.py --terra dist/terra --runs 1 --mib 1 --output build/http3-test/report.json
 
 ## Format check, lints, and the test suite. Generating the man pages is
 ## `man`'s job, not this one's — a test that writes to the working tree is a
@@ -368,14 +387,19 @@ verify-source:
 	@status=0; \
 	$(MAKE) verify-wit || $(CHECK_FAILURE); \
 	$(MAKE) verify-dependency-boundaries || $(CHECK_FAILURE); \
-	python3 -B scripts/check-tool-versions.py || $(CHECK_FAILURE); \
-	python3 -B scripts/test-kernel-tools.py || $(CHECK_FAILURE); \
-	python3 -B scripts/test-alpine-sources.py || $(CHECK_FAILURE); \
-	python3 -B scripts/test-pin-updates.py || $(CHECK_FAILURE); \
-	python3 -B scripts/test-verify-seccomp-artifact.py || $(CHECK_FAILURE); \
-	python3 -B scripts/test-policy-backfill.py || $(CHECK_FAILURE); \
-	python3 -B scripts/test-native-gates.py || $(CHECK_FAILURE); \
-	scripts/test-install.sh || $(CHECK_FAILURE); \
+	python3 -B scripts/pins/check-tool-versions.py || $(CHECK_FAILURE); \
+	python3 -B scripts/bench/bench-vmm.py --help >/dev/null || $(CHECK_FAILURE); \
+	python3 -B scripts/bench/bench-network.py --help >/dev/null || $(CHECK_FAILURE); \
+	python3 -B scripts/kernel/test-kernel-tools.py || $(CHECK_FAILURE); \
+	python3 -B scripts/kernel/test-kernel-vsock.py || $(CHECK_FAILURE); \
+	python3 -B scripts/sources/test-vendor-sources.py || $(CHECK_FAILURE); \
+	python3 -B scripts/sources/test-alpine-sources.py || $(CHECK_FAILURE); \
+	python3 -B scripts/pins/test-pin-updates.py || $(CHECK_FAILURE); \
+	python3 -B scripts/seccomp/test-verify-seccomp-artifact.py || $(CHECK_FAILURE); \
+	python3 -B scripts/seccomp/test-policy-backfill.py || $(CHECK_FAILURE); \
+	python3 -B scripts/kernel/check-vsock-abi.py || $(CHECK_FAILURE); \
+	python3 -B scripts/checks/test-native-gates.py || $(CHECK_FAILURE); \
+	scripts/checks/test-install.sh || $(CHECK_FAILURE); \
 	$(CARGO) fmt --all -- --check || $(CHECK_FAILURE); \
 	$(CARGO) fmt --manifest-path fuzz/Cargo.toml -- --check || $(CHECK_FAILURE); \
 	RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO) fmt --manifest-path $(COMPONENT_MANIFEST) -- --check || $(CHECK_FAILURE); \
@@ -389,27 +413,27 @@ verify-workspace:
 	$(CARGO_LOCKED) clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings || $(CHECK_FAILURE); \
 	$(CARGO_LOCKED) doc --workspace --no-deps --document-private-items --target $(MUSL) || $(CHECK_FAILURE); \
 	$(CARGO_LOCKED) test $(TEST_FLAGS) --workspace --target $(MUSL) || $(CHECK_FAILURE); \
-	$(CARGO_LOCKED) test $(TEST_FLAGS) -p terra-runtime --target $(MUSL) --features thread-experiments --test shared_component_memory --test shared_worker_memory || $(CHECK_FAILURE); \
+	$(CARGO_LOCKED) test $(TEST_FLAGS) -p terra-runtime --target $(MUSL) --features thread-experiments --test integration -- shared_component_memory:: shared_worker_memory:: || $(CHECK_FAILURE); \
 	exit $$status
 
 verify-dependency-boundaries:
-	python3 -B scripts/check-dependency-boundaries.py
+	python3 -B scripts/checks/check-dependency-boundaries.py
 
 verify-platform:
 	$(CARGO_LOCKED) test $(TEST_FLAGS) -p terra-platform --target $(MUSL)
 
 test-install:
-	scripts/test-install.sh
+	scripts/checks/test-install.sh
 
-verify-components: $(COMPONENT_AOT_TARGETS) $(KERNEL_GZ) $(ROOTFS_IMG) $(VOLUME_IMG) $(BOOT_IMG) $(BWRAP)
+verify-components: $(COMPONENT_AOT_TARGETS) $(KERNEL_GZ) $(ROOTFS_IMG) $(VOLUME_IMG) $(BOOT_IMG) $(BWRAP) $(SOCKET_PROBE)
 verify-host-components: check-guest-assets $(COMPONENT_AOT_TARGETS)
 
 verify-components verify-host-components:
 	@status=0; \
-	python3 -B scripts/check-component-authority.py || $(CHECK_FAILURE); \
+	python3 -B scripts/checks/check-component-authority.py || $(CHECK_FAILURE); \
 	RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO) fmt --manifest-path $(COMPONENT_MANIFEST) -- --check || $(CHECK_FAILURE); \
-	RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO_LOCKED) clippy --workspace --exclude terra-vsock-component --target wasm32-unknown-unknown --manifest-path $(COMPONENT_MANIFEST) -- -D warnings || $(CHECK_FAILURE); \
-	RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO_LOCKED) clippy -p terra-vsock-component --target wasm32-wasip3 --manifest-path $(COMPONENT_MANIFEST) -- -D warnings || $(CHECK_FAILURE); \
+	RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO_LOCKED) clippy --workspace --exclude terra-agent-component --target wasm32-unknown-unknown --manifest-path $(COMPONENT_MANIFEST) -- -D warnings || $(CHECK_FAILURE); \
+	RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO_LOCKED) clippy -p terra-agent-component --target wasm32-wasip3 --manifest-path $(COMPONENT_MANIFEST) -- -D warnings || $(CHECK_FAILURE); \
 	RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO_LOCKED) clippy --workspace --all-targets --target $(NATIVE) --manifest-path $(COMPONENT_MANIFEST) -- -D warnings || $(CHECK_FAILURE); \
 	RUSTUP_TOOLCHAIN=$(COMPONENT_TOOLCHAIN) $(CARGO_LOCKED) test $(TEST_FLAGS) --workspace --target $(NATIVE) --manifest-path $(COMPONENT_MANIFEST) || $(CHECK_FAILURE); \
 	exit $$status
@@ -441,14 +465,16 @@ dist host-dist:
 
 ## Source inputs for third-party programs embedded in a release. The release
 ## workflow publishes this archive beside the platform archives.
-$(ALPINE_SOURCE_DIST): $(ROOTFS_IMG) scripts/alpine-sources.sh
-	scripts/alpine-sources.sh
+$(ALPINE_SOURCE_DIST): $(ROOTFS_IMG) scripts/sources/alpine-sources.sh
+	scripts/sources/alpine-sources.sh
 
-source-dist: $(KERNEL_TARBALL) $(MKE2FS) $(ROOTFS_IMG) $(ALPINE_SOURCE_DIST) $(BUBBLEWRAP_TARBALL) $(LIBCAP_TARBALL)
+source-dist: $(KERNEL_TARBALL) $(MKE2FS) $(ROOTFS_IMG) $(ALPINE_SOURCE_DIST) $(LIBCAP_TARBALL) | check-bubblewrap
 	git archive --format=tar --prefix=terrarium/ HEAD > $(BUILD)/terra-source.tar
-	tar --append --file=$(BUILD)/terra-source.tar --transform='s|^$(BUILD)/|terrarium/$(BUILD)/|' $(KERNEL_TARBALL) $(BUILD)/e2fsprogs.tar.gz $(ALPINE_SOURCE_DIST) $(BUILD)/alpine-minirootfs.tar.gz $(BUILD)/$(DOAS_APK) $(BUILD)/$(DOAS_SHIM_APK) $(BUBBLEWRAP_TARBALL) $(LIBCAP_TARBALL)
+	git -C $(BUBBLEWRAP_SRC) archive --format=tar --prefix=terrarium/$(BUBBLEWRAP_SRC)/ $(BUBBLEWRAP_COMMIT) > $(BUILD)/bubblewrap-source.tar
+	tar --concatenate --file=$(BUILD)/terra-source.tar $(BUILD)/bubblewrap-source.tar
+	tar --append --file=$(BUILD)/terra-source.tar --transform='s|^$(BUILD)/|terrarium/$(BUILD)/|' $(KERNEL_TARBALL) $(BUILD)/e2fsprogs.tar.gz $(ALPINE_SOURCE_DIST) $(BUILD)/alpine-minirootfs.tar.gz $(BUILD)/$(DOAS_APK) $(BUILD)/$(DOAS_SHIM_APK) $(LIBCAP_TARBALL)
 	gzip -9nc $(BUILD)/terra-source.tar > $(SOURCE_DIST)
-	rm -f $(BUILD)/terra-source.tar
+	rm -f $(BUILD)/terra-source.tar $(BUILD)/bubblewrap-source.tar
 
 clean:
 	$(CARGO) clean

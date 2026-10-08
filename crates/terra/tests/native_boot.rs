@@ -155,7 +155,21 @@ fn native_boot_executes_shell() {
             "--",
             "/bin/sh",
             "-ec",
-            &format!("test \"$(nproc)\" = {cpus}; sleep 1; echo BOOT_SHELL_OK"),
+            &format!(
+                r#"test "$(nproc)" = {cpus}
+                test "$(cat /sys/kernel/terra_socket_abi)" = {socket_abi}
+                vsocks=0
+                for device in /sys/bus/virtio/devices/*/device; do
+                    if test "$(cat "$device")" = 0x0013; then vsocks=$((vsocks + 1)); fi
+                done
+                test "$vsocks" = 1
+                test ! -e /sys/class/net/eth0
+                test ! -e /dev/terra-agent-control
+                test ! -e /dev/terra-network-control
+                sleep 1
+                echo BOOT_SHELL_OK"#,
+                socket_abi = terra_protocol::socket::VERSION,
+            ),
         ]);
         assert!(
             output.contains("BOOT_SHELL_OK"),
@@ -163,67 +177,6 @@ fn native_boot_executes_shell() {
             fixture.diagnostics()
         );
         fixture.successful(&["native", "stop"]);
-    }
-}
-
-#[test]
-#[ignore = "requires a release binary and usable KVM, Hypervisor.framework, or WHP"]
-fn native_boot_mounts_network_storage_and_restart() {
-    let fixture = BoxFixture::new();
-    let writable = fixture.directory.path().join("writable");
-    let readonly = fixture.directory.path().join("readonly");
-    std::fs::create_dir(&writable).unwrap();
-    std::fs::create_dir(&readonly).unwrap();
-    std::fs::write(readonly.join("seed"), "HOST_SEED").unwrap();
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let recipe = fixture.directory.path().join("native.yaml");
-    let script = format!(
-        r#"test "$(nproc)" = 2
- test "$(cat /readonly/seed)" = HOST_SEED
- if echo forbidden > /readonly/new-file; then exit 1; fi
- echo GUEST_WRITE > /work/result
- test "$(wget -q -T 10 -O - http://gate.test:{port}/)" = HOST_NETWORK
- if test -f /data/persisted; then
-   test "$(cat /data/persisted)" = DISK_WRITE
-   echo RESTART_OK
- else
-   echo DISK_WRITE > /data/persisted
-   echo FIRST_BOOT_OK
- fi
- sync
- echo NATIVE_GATE_OK"#
-    );
-    let config = serde_json::json!({
-        "hw": {"cpus": 2, "mem_mib": 512},
-        "network": {
-            "allow": [format!("gate.test:{port}")],
-            "hosts": [{"name": "gate.test", "addr": "HOST_LOOPBACK"}]
-        },
-        "mounts": [
-            {"host": writable, "guest": "/work"},
-            {"host": readonly, "guest": "/readonly", "readonly": true}
-        ],
-        "volumes": [{"name": "data", "guest": "/data", "size_mib": 8}],
-        "hooks": {"on_start": ["echo START_HOOK"], "pre_stop": ["echo STOP_HOOK"]},
-        "workload": {"entrypoint": "/bin/sh", "args": ["-ec", script]}
-    });
-    std::fs::write(&recipe, yaml_serde::to_string(&config).unwrap()).unwrap();
-    fixture.successful(&[recipe.to_str().unwrap(), "setup"]);
-    for marker in ["FIRST_BOOT_OK", "RESTART_OK"] {
-        let server = listener.try_clone().unwrap();
-        let response = std::thread::spawn(move || serve_request(&server));
-        let output = fixture.successful(&["native", "--foreground"]);
-        response.join().unwrap();
-        for expected in [marker, "NATIVE_GATE_OK", "START_HOOK", "STOP_HOOK"] {
-            assert!(output.contains(expected), "missing {expected}:\n{output}");
-        }
-        assert_eq!(
-            std::fs::read_to_string(writable.join("result")).unwrap(),
-            "GUEST_WRITE\n"
-        );
-        assert!(!readonly.join("new-file").exists());
     }
 }
 
@@ -295,6 +248,16 @@ fn native_boot_shares_host_changes_between_running_boxes() {
 #[test]
 #[ignore = "requires a release binary and usable KVM, Hypervisor.framework, or WHP"]
 fn native_boot_runs_rootless_podman_on_a_private_disk() {
+    run_rootless_podman_on_a_private_disk(None);
+}
+
+#[test]
+#[ignore = "requires a release binary and usable KVM, Hypervisor.framework, or WHP"]
+fn native_boot_runs_rootless_podman_with_slirp4netns_on_a_private_disk() {
+    run_rootless_podman_on_a_private_disk(Some("slirp4netns"));
+}
+
+fn run_rootless_podman_on_a_private_disk(network: Option<&str>) {
     let fixture = BoxFixture::new();
     let allowed = TcpListener::bind("127.0.0.1:0").unwrap();
     allowed.set_nonblocking(true).unwrap();
@@ -305,10 +268,42 @@ fn native_boot_runs_rootless_podman_on_a_private_disk() {
     let readonly = fixture.directory.path().join("readonly");
     std::fs::create_dir(&readonly).unwrap();
     std::fs::write(readonly.join("seed"), "HOST_SEED").unwrap();
+    let large_body = vec![b'L'; 128 * 1024];
+    std::fs::write(readonly.join("large"), &large_body).unwrap();
     let recipe = fixture.directory.path().join("native.yaml");
-    let on_create = r"set -e
-apk add --no-cache podman fuse-overlayfs
-d=/home/terri/rootfs
+    let packages = if network.is_some() {
+        " slirp4netns"
+    } else {
+        ""
+    };
+    let network_option = network.map_or(String::new(), |network| format!("--network={network} "));
+    let helper_logging = if std::env::var_os("TERRA_SLIRP_DEBUG").is_some() {
+        r#"case "${1:-}" in
+--help|--version|-h|-v) exec /usr/bin/slirp4netns.real "$@" ;;
+esac
+export SLIRP_DEBUG=call,misc G_MESSAGES_DEBUG=all
+exec >>/tmp/terra-slirp-helper.log 2>&1
+"#
+    } else {
+        ""
+    };
+    let helper_wrapper = if network.is_some() {
+        format!(
+            r#"mv /usr/bin/slirp4netns /usr/bin/slirp4netns.real
+cat > /usr/bin/slirp4netns <<'SLIRP_WRAPPER'
+#!/bin/sh
+{helper_logging}exec /usr/bin/slirp4netns.real "$@" 2>>/tmp/terra-slirp-helper.log
+SLIRP_WRAPPER
+chmod 755 /usr/bin/slirp4netns
+"#
+        )
+    } else {
+        String::new()
+    };
+    let on_create = format!(
+        r"set -e
+apk add --no-cache podman fuse-overlayfs{packages}
+{helper_wrapper}d=/home/terri/rootfs
 mkdir -p $d/bin $d/lib $d/etc $d/dev $d/proc $d/sys $d/tmp
 chmod 1777 $d/tmp
 cp -a /bin/busybox $d/bin
@@ -318,9 +313,52 @@ ln -s busybox $d/bin/sleep
 ln -s busybox $d/bin/wget
 tar -C $d -cf /home/terri/rootfs.tar .
 rm -rf $d
-chown 1000:1000 /home/terri/rootfs.tar";
+chown 1000:1000 /home/terri/rootfs.tar"
+    );
     let script = format!(
-        r#"test "$(id -u)" = 1000
+        r#"network_diagnostics() {{
+status=$?
+if test "$status" -eq 0; then return; fi
+echo GUEST_RESOLVER
+cat /etc/resolv.conf
+if podman container exists rootless; then
+echo CONTAINER_RESOLVER
+podman exec rootless /bin/busybox cat /etc/resolv.conf || :
+echo CONTAINER_NETWORK
+podman inspect --format '{{{{.NetworkSettings}}}}' rootless || :
+echo PODMAN_NETWORK_MODE
+podman inspect --format '{{{{.HostConfig.NetworkMode}}}}' rootless || :
+echo CONTAINER_NETNS
+podman exec rootless /bin/busybox readlink /proc/self/ns/net || :
+container_pid="$(podman inspect --format '{{{{.State.Pid}}}}' rootless)"
+readlink /proc/"$container_pid"/ns/net || :
+echo HELPER_PROCESSES
+for process in /proc/[0-9]*; do
+process_name="$(cat "$process/comm" 2>/dev/null)" || continue
+case "$process_name" in slirp4netns*|conmon)
+echo "$process $process_name"
+/bin/busybox tr '\0' ' ' < "$process/cmdline" || :
+echo
+readlink "$process/ns/net" || :
+ls -l "$process/fd" || :
+if test -f "$process/fd/2"; then cat "$process/fd/2" 2>/dev/null || :; fi
+;; esac
+done
+echo SLIRP_HELPER_STDERR
+cat /tmp/terra-slirp-helper.log 2>/dev/null || :
+echo CONTAINER_ADDRESSES
+podman exec rootless /bin/busybox ip address || :
+echo CONTAINER_ROUTES
+podman exec rootless /bin/busybox ip route || :
+echo GUEST_LOOKUP
+/bin/busybox timeout 8 /bin/busybox nslookup gate.test || :
+echo CONTAINER_LOOKUP
+podman exec rootless /bin/busybox timeout 8 /bin/busybox nslookup gate.test 10.0.2.3 || :
+fi
+return "$status"
+}}
+trap network_diagnostics EXIT
+test "$(id -u)" = 1000
 test "$(stat -c %u /dev/net/tun)" = 0
 test "$(stat -c %a /dev/net/tun)" = 666
 test "$(stat -c '%u:%a' "$XDG_RUNTIME_DIR")" = 1000:700
@@ -335,11 +373,13 @@ echo PODMAN_STORAGE_REUSED
 else
 podman import "$HOME/rootfs.tar" local
 fi
-podman run -d --name rootless --volume /readonly:/readonly:ro local sleep 60
+podman run {network_option}-d --name rootless --volume /readonly:/readonly:ro local sleep 60
 container_id="$(podman ps -aq --filter name=rootless)"
 test -n "$container_id"
 test -d /podman/containers/storage
 test "$(podman exec rootless wget -q -T 10 -O - http://gate.test:{allowed_port}/)" = HOST_NETWORK
+podman exec rootless wget -q -T 10 -O /tmp/large http://gate.test:{allowed_port}/
+podman exec rootless /bin/busybox cmp /readonly/large /tmp/large
 if podman exec rootless wget -q -T 10 -O /dev/null http://blocked.test:{denied_port}/; then exit 1; fi
 if podman exec rootless wget -q -T 10 -O /dev/null http://169.254.169.254/; then exit 1; fi
 test "$(podman exec rootless /bin/busybox cat /readonly/seed)" = HOST_SEED
@@ -368,7 +408,11 @@ echo ROOTLESS_PODMAN_OK"#
     fixture.successful(&[recipe.to_str().unwrap(), "setup"]);
     for boot in 0..2 {
         let server = allowed.try_clone().unwrap();
-        let response = std::thread::spawn(move || serve_request(&server));
+        let response_body = large_body.clone();
+        let response = std::thread::spawn(move || {
+            serve_request(&server, b"HOST_NETWORK");
+            serve_request(&server, &response_body);
+        });
         let output = fixture.successful(&["native", "--foreground"]);
         response.join().unwrap();
         assert!(output.contains("ROOTLESS_PODMAN_OK"), "{output}");
@@ -389,7 +433,7 @@ echo ROOTLESS_PODMAN_OK"#
     );
 }
 
-fn serve_request(listener: &TcpListener) {
+fn serve_request(listener: &TcpListener, body: &[u8]) {
     let deadline = Instant::now() + Duration::from_mins(1);
     loop {
         match listener.accept() {
@@ -402,7 +446,12 @@ fn serve_request(listener: &TcpListener) {
                     .unwrap();
                 let mut request = [0; 4096];
                 assert!(stream.read(&mut request).unwrap() > 0);
-                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\nHOST_NETWORK").unwrap();
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(header.as_bytes()).unwrap();
+                stream.write_all(body).unwrap();
                 return;
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {

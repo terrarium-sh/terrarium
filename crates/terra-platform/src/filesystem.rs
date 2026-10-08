@@ -484,6 +484,33 @@ fn ignore_unsupported(error: io::Error) -> io::Result<()> {
         .ok_or(error)
 }
 
+pub fn open_regular_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(rustix::fs::OFlags::NONBLOCK.bits().cast_signed());
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("expected a regular file"));
+    }
+    Ok(file)
+}
+
+/// Restrict an existing path to its owner: `0700` for a directory, `0600` for a
+/// file.
+#[cfg(unix)]
+pub fn set_owner_only(path: &Path, dir: bool) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = if dir { 0o700 } else { 0o600 };
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
+#[cfg(windows)]
+pub use windows::set_owner_only;
+
 #[cfg(windows)]
 #[path = "filesystem/windows.rs"]
 mod windows;

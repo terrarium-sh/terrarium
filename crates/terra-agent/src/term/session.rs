@@ -32,7 +32,7 @@ struct ClientConnInner {
 
 impl ClientConn {
     #[cfg(test)]
-    pub(crate) fn from_vsock(conn: File) -> std::io::Result<Self> {
+    pub(crate) fn from_file(conn: File) -> std::io::Result<Self> {
         Self::from_async(crate::into_async_file(conn)?)
     }
 
@@ -356,7 +356,7 @@ mod tests {
     fn client() -> (ClientConn, AsyncFile) {
         let (client, agent) = std::os::unix::net::UnixStream::pair().unwrap();
         (
-            ClientConn::from_vsock(File::from(std::os::fd::OwnedFd::from(agent))).unwrap(),
+            ClientConn::from_file(File::from(std::os::fd::OwnedFd::from(agent))).unwrap(),
             crate::into_async_file(client).unwrap(),
         )
     }

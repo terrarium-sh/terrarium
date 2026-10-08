@@ -34,11 +34,10 @@ impl Share {
         let ram = GuestRam::new(64 * 1024)
             .ok_or_else(|| wasmtime::Error::msg("filesystem self-test RAM allocation"))?;
         let component = artifacts.fs().deserialize(engine)?;
-        let mmio = artifacts.mmio().deserialize(engine)?;
         let grant = ShareGrant::new(&directory.canonicalize()?, readonly)?;
         let host = FsHost::new(DeviceContext::with_ram(ram.clone()), grant);
         let mut runtime = BoxRuntime::new(engine, BoxHost::new())?;
-        runtime.initialize_mmio(&mmio).await?;
+        runtime.initialize_mmio()?;
         let channel = crate::component::fs::register_device(
             &mut runtime,
             host,
@@ -349,15 +348,15 @@ async fn run_readonly(
         &read[16..] == b"readonly fixture",
         "readonly filesystem read"
     );
-    share.request(14, node, &2_u32.to_le_bytes(), -13).await?;
+    share.request(14, node, &2_u32.to_le_bytes(), -1).await?;
     share.request(4, node, &setattr_body(), -13).await?;
-    share.request(35, 1, &create_body(b"new\0"), -13).await?;
-    share.request(9, 1, &mkdir_body(), -13).await?;
-    share.request(12, 1, &rename_body(), -13).await?;
-    share.request(13, 1, &link_body(node), -13).await?;
-    share.request(6, 1, b"symlink\0file\0", -13).await?;
-    share.request(10, 1, b"file\0", -13).await?;
-    share.request(11, 1, b"directory\0", -13).await?;
+    share.request(35, 1, &create_body(b"new\0"), -1).await?;
+    share.request(9, 1, &mkdir_body(), -1).await?;
+    share.request(12, 1, &rename_body(), -1).await?;
+    share.request(13, 1, &link_body(node), -1).await?;
+    share.request(6, 1, b"symlink\0file\0", -1).await?;
+    share.request(10, 1, b"file\0", -1).await?;
+    share.request(11, 1, b"directory\0", -1).await?;
     let mut write = file_io_body(handle, 0, 1);
     write.push(b'x');
     share.request(16, node, &write, -9).await?;

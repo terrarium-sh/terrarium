@@ -7,6 +7,17 @@ use windows_sys::Wdk::System::SystemServices::FILE_FS_FULL_SIZE_INFORMATION;
 use windows_sys::Win32::Storage::FileSystem::GetVolumeInformationByHandleW;
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
+use std::os::windows::ffi::OsStrExt as _;
+use std::os::windows::io::{FromRawHandle as _, OwnedHandle};
+use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW};
+use windows_sys::Win32::Security::{
+    ACL, ACL_REVISION, AddAccessAllowedAceEx, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
+    GetLengthSid, GetTokenInformation, InitializeAcl, OBJECT_INHERIT_ACE,
+    PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER, TokenUser,
+};
+use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
 use super::{Error, FilesystemStat};
 
 #[allow(unsafe_code)]
@@ -166,6 +177,119 @@ pub(super) fn open_metadata_file(directory: &File, name: &str) -> Result<File, E
     Ok(file)
 }
 
+#[allow(unsafe_code)]
+pub fn set_owner_only(path: &std::path::Path, directory: bool) -> std::io::Result<()> {
+    let sid = current_user_sid()?;
+    let acl_size = std::mem::size_of::<ACL>()
+        + std::mem::size_of::<u32>() * 2
+        + std::mem::size_of_val(sid.as_slice());
+    let mut acl = vec![0_u32; acl_size.div_ceil(std::mem::size_of::<u32>())];
+    let acl_ptr = acl.as_mut_ptr().cast::<ACL>();
+    let inherit = if directory {
+        OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
+    } else {
+        0
+    };
+    // SAFETY: `acl` has the exact header, ACE, and SID capacity; `sid` remains live while
+    // Windows copies it into the ACL.
+    unsafe {
+        win_ok(InitializeAcl(
+            acl_ptr,
+            u32::try_from(acl_size).unwrap_or(u32::MAX),
+            ACL_REVISION,
+        ))?;
+        win_ok(AddAccessAllowedAceEx(
+            acl_ptr,
+            ACL_REVISION,
+            inherit,
+            FILE_ALL_ACCESS,
+            sid.as_ptr().cast_mut().cast(),
+        ))?;
+    }
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: the path is NUL-terminated and `acl` lives for the call.
+    let result = unsafe {
+        SetNamedSecurityInfoW(
+            wide.as_mut_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            acl_ptr,
+            std::ptr::null(),
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::from_raw_os_error(
+            i32::try_from(result).unwrap_or(i32::MAX),
+        ))
+    }
+}
+
+#[allow(unsafe_code)]
+fn current_user_sid() -> std::io::Result<Vec<u32>> {
+    let mut token = std::ptr::null_mut();
+    // SAFETY: GetCurrentProcess is a pseudo-handle and token is writable.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: OpenProcessToken returned this owned token handle.
+    let token = unsafe { OwnedHandle::from_raw_handle(token) };
+    let mut needed = 0;
+    // SAFETY: this query intentionally has no buffer and reports the required size.
+    let _ = unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TokenUser,
+            std::ptr::null_mut(),
+            0,
+            &raw mut needed,
+        )
+    };
+    let mut user = vec![
+        0_usize;
+        usize::try_from(needed)
+            .unwrap_or(0)
+            .div_ceil(std::mem::size_of::<usize>())
+    ];
+    // SAFETY: `user` has the size returned by the preceding query.
+    let ok = unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TokenUser,
+            user.as_mut_ptr().cast(),
+            needed,
+            &raw mut needed,
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a successful TokenUser query initializes a TOKEN_USER at the buffer start.
+    let token_user = unsafe { user.as_ptr().cast::<TOKEN_USER>().read_unaligned() };
+    // SAFETY: TOKEN_USER contains a valid SID whose length Windows reports.
+    let len = unsafe { GetLengthSid(token_user.User.Sid) };
+    if len == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: GetLengthSid bounds this source slice.
+    Ok(unsafe {
+        std::slice::from_raw_parts(
+            token_user.User.Sid.cast::<u32>(),
+            usize::try_from(len).unwrap_or(0) / std::mem::size_of::<u32>(),
+        )
+        .to_vec()
+    })
+}
+
+fn win_ok(ok: i32) -> std::io::Result<()> {
+    (ok != 0)
+        .then_some(())
+        .ok_or_else(std::io::Error::last_os_error)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,5 +329,81 @@ mod tests {
         assert!(filesystem.block_size > 0);
         assert!(filesystem.name_max > 0);
         assert!(filesystem.blocks_free <= filesystem.blocks);
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn owner_only_acl_grants_only_the_current_user_and_blocks_inheritance() {
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::GetNamedSecurityInfoW;
+        use windows_sys::Win32::Security::{
+            ACCESS_ALLOWED_ACE, EqualSid, GetAce, GetSecurityDescriptorControl, SE_DACL_PROTECTED,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let sid = current_user_sid().unwrap();
+        for directory in [false, true] {
+            let path = root
+                .path()
+                .join(if directory { "directory" } else { "file" });
+            if directory {
+                std::fs::create_dir(&path).unwrap();
+            } else {
+                std::fs::write(&path, b"private").unwrap();
+            }
+            set_owner_only(&path, directory).unwrap();
+            let wide = path
+                .as_os_str()
+                .encode_wide()
+                .chain(Some(0))
+                .collect::<Vec<_>>();
+            let mut acl = std::ptr::null_mut();
+            let mut descriptor = std::ptr::null_mut();
+            let mut control = 0;
+            let mut revision = 0;
+            let mut entry = std::mem::MaybeUninit::uninit();
+            // SAFETY: Windows owns the queried descriptor until LocalFree; every output pointer
+            // is writable, and the successful queries bound the ACL and ACE reads.
+            unsafe {
+                assert_eq!(
+                    GetNamedSecurityInfoW(
+                        wide.as_ptr(),
+                        SE_FILE_OBJECT,
+                        DACL_SECURITY_INFORMATION,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        &raw mut acl,
+                        std::ptr::null_mut(),
+                        &raw mut descriptor,
+                    ),
+                    0
+                );
+                assert_ne!(
+                    GetSecurityDescriptorControl(descriptor, &raw mut control, &raw mut revision),
+                    0
+                );
+                assert_ne!(control & SE_DACL_PROTECTED, 0);
+                assert!(!acl.is_null());
+                assert_eq!((*acl).AceCount, 1);
+                assert_ne!(GetAce(acl, 0, entry.as_mut_ptr()), 0);
+                // SAFETY: `GetAce` succeeded, so `entry` names the ACL's first ACE.
+                let entry = &*entry.assume_init().cast::<ACCESS_ALLOWED_ACE>();
+                assert_eq!(entry.Header.AceType, 0);
+                assert_eq!(entry.Mask, FILE_ALL_ACCESS);
+                assert_ne!(
+                    EqualSid(
+                        (&raw const entry.SidStart).cast_mut().cast(),
+                        sid.as_ptr().cast_mut().cast()
+                    ),
+                    0
+                );
+                let inheritance = if directory {
+                    OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
+                } else {
+                    0
+                };
+                assert_eq!(u32::from(entry.Header.AceFlags), inheritance);
+                assert!(LocalFree(descriptor).is_null());
+            }
+        }
     }
 }

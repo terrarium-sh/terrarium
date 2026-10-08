@@ -1,17 +1,37 @@
 //! Stopping a box: ask the guest to shut down, wait out the grace, kill what is
 //! still there.
 
-use crate::state::{BoxRef, Holder, VmProcess};
+use crate::state::{BoxRef, Holder, ProcessIdentity};
 use crate::sys;
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
+use terra_sandbox::Role;
 
 enum StopAttempt {
     AlreadyStopped,
     StoppedGracefully,
-    NeedsForce(VmProcess),
+    NeedsForce(StopTarget),
+}
+
+struct StopTarget {
+    process: ProcessIdentity,
+    role: Role,
+}
+
+fn locate_stop_target(bx: &BoxRef) -> Option<StopTarget> {
+    if let Some(process) = bx.read_supervisor_process() {
+        Some(StopTarget {
+            process,
+            role: Role::Supervisor,
+        })
+    } else {
+        bx.read_vm_process().map(|process| StopTarget {
+            process,
+            role: Role::Vm,
+        })
+    }
 }
 
 fn request_stop(bx: &BoxRef, deadline: Instant, setup_action: SetupAction) -> Result<StopAttempt> {
@@ -22,8 +42,7 @@ fn request_stop(bx: &BoxRef, deadline: Instant, setup_action: SetupAction) -> Re
                 return Err(bx.setup_holds_it());
             }
             Holder::SettingUp => {
-                return bx
-                    .read_vm_process()
+                return locate_stop_target(bx)
                     .map(StopAttempt::NeedsForce)
                     .ok_or_else(|| bx.setup_holds_it());
             }
@@ -45,10 +64,12 @@ fn request_stop(bx: &BoxRef, deadline: Instant, setup_action: SetupAction) -> Re
     if wait_until_stopped(bx, deadline)? {
         return Ok(StopAttempt::StoppedGracefully);
     }
-    bx.read_vm_process()
+    locate_stop_target(bx)
         .map(StopAttempt::NeedsForce)
         .with_context(|| {
-            format!("{bx} is running but its VM published no pid to signal before the wait ran out")
+            format!(
+                "{bx} is running but its owner published no pid to signal before the wait ran out"
+            )
         })
 }
 
@@ -106,14 +127,25 @@ pub(crate) fn stop_and_wait(
     setup_action: SetupAction,
 ) -> Result<StopOutcome> {
     let deadline = sys::deadline_after(grace);
-    let vm = match request_stop(bx, deadline, setup_action)? {
+    let target = match request_stop(bx, deadline, setup_action)? {
         StopAttempt::AlreadyStopped => return Ok(StopOutcome::AlreadyStopped),
         StopAttempt::StoppedGracefully => return Ok(StopOutcome::StoppedGracefully),
-        StopAttempt::NeedsForce(vm) => vm,
+        StopAttempt::NeedsForce(target) => target,
     };
-    eprintln!("terra: forcing {bx} to stop (pid {})", vm.pid);
-    let signal_result = sys::terminate_process(vm.pid, vm.process_identity)
-        .with_context(|| format!("killing the VM process (pid {}) of {bx}", vm.pid))?;
+    let owner = target.process;
+    eprintln!(
+        "terra: forcing {bx} to stop ({} pid {})",
+        target.role.name(),
+        owner.pid
+    );
+    let signal_result =
+        sys::terminate_process(owner.pid, owner.process_identity).with_context(|| {
+            format!(
+                "killing the {} process (pid {}) of {bx}",
+                target.role.name(),
+                owner.pid
+            )
+        })?;
     if signal_result == sys::SignalResult::IdentityUnknown {
         return Ok(StopOutcome::IdentityUnknown);
     }
@@ -138,10 +170,10 @@ pub fn run(
         StopOutcome::AlreadyStopped => eprintln!("terra: {bx} is already stopped"),
         StopOutcome::StoppedGracefully | StopOutcome::Killed => eprintln!("terra: {bx} stopped"),
         StopOutcome::IdentityUnknown => {
-            anyhow::bail!("{bx} is still held but its VM process identity is unknown")
+            anyhow::bail!("{bx} is still held but its owner process identity is unknown")
         }
         StopOutcome::Wedged => anyhow::bail!(
-            "{bx} is still running after SIGKILL - its VM process is wedged in the kernel"
+            "{bx} is still running after SIGKILL - its owner process is wedged in the kernel"
         ),
     }
     Ok(ExitCode::SUCCESS)
@@ -324,7 +356,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (bx, _home) = create_box_in(dir.path());
         let lock = bx.lock_run().unwrap();
-        BoxRef::rewrite_lock_line(&lock, "100").unwrap();
+        BoxRef::rewrite_lock_line(&lock, "100 1").unwrap();
         let listener =
             LocalListener::bind(bx.get_dir().join(crate::state::CONTROL_SOCKET)).unwrap();
         let server = std::thread::spawn(move || {
@@ -332,7 +364,7 @@ mod tests {
             let mut byte = [0];
             stream.read_exact(&mut byte).unwrap();
             assert_eq!(byte, [terra_protocol::STOP_SIGNAL]);
-            BoxRef::rewrite_lock_line(&lock, "200").unwrap();
+            BoxRef::rewrite_lock_line(&lock, "200 1").unwrap();
             lock
         });
         let attempt = request_stop(
@@ -344,7 +376,10 @@ mod tests {
         let _lock = server.join().unwrap();
         assert!(matches!(
             attempt,
-            StopAttempt::NeedsForce(VmProcess { pid: 200, .. })
+            StopAttempt::NeedsForce(StopTarget {
+                process: ProcessIdentity { pid: 200, .. },
+                role: Role::Vm
+            })
         ));
     }
 

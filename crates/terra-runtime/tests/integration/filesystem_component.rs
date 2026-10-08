@@ -1,0 +1,1177 @@
+use crate::support;
+
+#[cfg(unix)]
+use std::os::unix::fs::symlink as symlink_file;
+#[cfg(windows)]
+use std::os::windows::fs::symlink_file;
+use std::sync::Arc;
+
+use terra_runtime::box_runtime::{BoxHost, BoxRuntime, BoxRuntimeHandle};
+use terra_runtime::component::context::DeviceContext;
+use terra_runtime::component::fs::{FsHost, ShareGrant};
+use terra_runtime::engine::device_engine;
+use terra_runtime::memory::{BoundedMemory, GuestRam};
+use wasmtime::component::Component;
+
+const REQUEST_QUEUE: u32 = 1;
+const DESC: u64 = 0x1000;
+const AVAIL: u64 = 0x2000;
+const USED: u64 = 0x3000;
+const INPUT: u64 = 0x4000;
+const OUTPUT: u64 = 0x6000;
+const LARGE_INPUT: u64 = 0x8000;
+const SECOND_INPUT: u64 = 0x5000;
+const SECOND_OUTPUT: u64 = 0x7000;
+
+fn write(memory: &BoundedMemory<'_>, offset: u64, bytes: &[u8]) {
+    let chunk_size =
+        usize::try_from(terra_limits::MAX_SINGLE_GUEST_COPY_BYTES).expect("copy limit");
+    for (index, chunk) in bytes.chunks(chunk_size).enumerate() {
+        memory
+            .write(
+                offset + u64::try_from(index * chunk_size).expect("guest offset"),
+                chunk,
+            )
+            .expect("guest memory write");
+    }
+}
+
+fn request(opcode: u32, unique: u64, node: u64, body: &[u8]) -> Vec<u8> {
+    let mut request = vec![0; 40];
+    request[..4].copy_from_slice(
+        &u32::try_from(40 + body.len())
+            .expect("request length")
+            .to_le_bytes(),
+    );
+    request[4..8].copy_from_slice(&opcode.to_le_bytes());
+    request[8..16].copy_from_slice(&unique.to_le_bytes());
+    request[16..24].copy_from_slice(&node.to_le_bytes());
+    request.extend_from_slice(body);
+    request
+}
+
+fn reply_error(reply: &[u8]) -> i32 {
+    i32::from_le_bytes(reply[4..8].try_into().expect("reply error"))
+}
+
+struct Mounted {
+    channel: terra_runtime::component::MmioDevice,
+    ram: GuestRam,
+    _runtime: BoxRuntimeHandle,
+}
+
+async fn mount(path: &std::path::Path, readonly: bool) -> Mounted {
+    mount_with_resource_capacity(path, readonly, None).await
+}
+
+async fn mount_with_resource_capacity(
+    path: &std::path::Path,
+    readonly: bool,
+    resource_capacity: Option<usize>,
+) -> Mounted {
+    let ram = GuestRam::new(128 * 1024).expect("ram");
+    let engine = device_engine().expect("engine");
+    let component = Component::new(&engine, support::artifacts::wasm::FS).expect("component");
+    let grant = ShareGrant::new(
+        &std::fs::canonicalize(path).expect("canonical mount"),
+        readonly,
+    )
+    .expect("grant");
+    let device = DeviceContext::with_ram(ram.clone());
+    let host = match resource_capacity {
+        Some(resource_capacity) => FsHost::with_resource_capacity(device, grant, resource_capacity),
+        None => FsHost::new(device, grant),
+    };
+    let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
+    runtime.initialize_mmio().expect("MMIO service");
+    let channel = terra_runtime::component::fs::register_device(
+        &mut runtime,
+        host,
+        &component,
+        "test",
+        u32::try_from(resource_capacity.unwrap_or(8192).saturating_sub(16) / 2)
+            .expect("node capacity"),
+        Arc::new(|_| Ok(())),
+    )
+    .expect("channel");
+    let runtime = runtime.prepare().await.expect("runtime prepared").start();
+    for (offset, value) in [
+        (0x70, 1_u32),
+        (0x70, 3),
+        (0x24, 1),
+        (0x20, 1),
+        (0x70, 11),
+        (0x30, REQUEST_QUEUE),
+        (0x38, 8),
+        (0x80, u32::try_from(DESC).expect("descriptor address")),
+        (0x90, u32::try_from(AVAIL).expect("available address")),
+        (0xa0, u32::try_from(USED).expect("used address")),
+        (0x44, 1),
+        (0x70, 15),
+    ] {
+        channel
+            .write(offset, &value.to_le_bytes())
+            .expect("MMIO setup");
+    }
+    Mounted {
+        channel,
+        ram,
+        _runtime: runtime,
+    }
+}
+
+async fn initialize(channel: &terra_runtime::component::MmioDevice, memory: &BoundedMemory<'_>) {
+    let mut init = vec![0; 16];
+    init[..4].copy_from_slice(&7_u32.to_le_bytes());
+    init[4..8].copy_from_slice(&40_u32.to_le_bytes());
+    assert_eq!(
+        reply_error(&submit(channel, memory, 0, &request(26, 1, 1, &init)).await),
+        0
+    );
+}
+
+async fn submit(
+    channel: &terra_runtime::component::MmioDevice,
+    memory: &BoundedMemory<'_>,
+    index: u16,
+    request: &[u8],
+) -> Vec<u8> {
+    let input = if u64::try_from(request.len()).expect("request length") > OUTPUT - INPUT {
+        LARGE_INPUT
+    } else {
+        INPUT
+    };
+    write(memory, input, request);
+    let mut descriptor = [0; 32];
+    descriptor[..8].copy_from_slice(&input.to_le_bytes());
+    descriptor[8..12].copy_from_slice(
+        &u32::try_from(request.len())
+            .expect("request length")
+            .to_le_bytes(),
+    );
+    descriptor[12..14].copy_from_slice(&1_u16.to_le_bytes());
+    descriptor[14..16].copy_from_slice(&1_u16.to_le_bytes());
+    descriptor[16..24].copy_from_slice(&OUTPUT.to_le_bytes());
+    descriptor[24..28].copy_from_slice(&4096_u32.to_le_bytes());
+    descriptor[28..30].copy_from_slice(&2_u16.to_le_bytes());
+    write(memory, DESC, &descriptor);
+    write(memory, AVAIL + 2, &index.wrapping_add(1).to_le_bytes());
+    write(
+        memory,
+        AVAIL + 4 + u64::from(index % 8) * 2,
+        &0_u16.to_le_bytes(),
+    );
+    channel
+        .write(0x50, &REQUEST_QUEUE.to_le_bytes())
+        .expect("queue bell");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if memory.read(USED + 2, 2).expect("used index") == index.wrapping_add(1).to_le_bytes()
+            {
+                let header = memory.read(OUTPUT, 16).expect("reply header");
+                let len = u32::from_le_bytes(header[..4].try_into().expect("reply length"));
+                return memory.read(OUTPUT, u64::from(len)).expect("reply");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("filesystem request completion")
+}
+
+async fn submit_pair(
+    channel: &terra_runtime::component::MmioDevice,
+    memory: &BoundedMemory<'_>,
+    first: &[u8],
+    second: &[u8],
+) -> (Vec<u8>, Vec<u8>) {
+    write(memory, INPUT, first);
+    write(memory, SECOND_INPUT, second);
+    let mut descriptors = [0; 64];
+    for (offset, input, output, next) in [
+        (0, INPUT, OUTPUT, 1_u16),
+        (32, SECOND_INPUT, SECOND_OUTPUT, 3_u16),
+    ] {
+        descriptors[offset..offset + 8].copy_from_slice(&input.to_le_bytes());
+        descriptors[offset + 8..offset + 12].copy_from_slice(
+            &u32::try_from(if offset == 0 {
+                first.len()
+            } else {
+                second.len()
+            })
+            .expect("request length")
+            .to_le_bytes(),
+        );
+        descriptors[offset + 12..offset + 14].copy_from_slice(&1_u16.to_le_bytes());
+        descriptors[offset + 14..offset + 16].copy_from_slice(&next.to_le_bytes());
+        descriptors[offset + 16..offset + 24].copy_from_slice(&output.to_le_bytes());
+        descriptors[offset + 24..offset + 28].copy_from_slice(&4096_u32.to_le_bytes());
+        descriptors[offset + 28..offset + 30].copy_from_slice(&2_u16.to_le_bytes());
+    }
+    write(memory, DESC, &descriptors);
+    write(memory, AVAIL + 2, &3_u16.to_le_bytes());
+    write(memory, AVAIL + 4 + 2, &0_u16.to_le_bytes());
+    write(memory, AVAIL + 4 + 4, &2_u16.to_le_bytes());
+    channel
+        .write(0x50, &REQUEST_QUEUE.to_le_bytes())
+        .expect("queue bell");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if memory.read(USED + 2, 2).expect("used index") == 3_u16.to_le_bytes() {
+                let first = read_reply(memory, OUTPUT);
+                let second = read_reply(memory, SECOND_OUTPUT);
+                return (first, second);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("both filesystem requests complete")
+}
+
+fn read_reply(memory: &BoundedMemory<'_>, output: u64) -> Vec<u8> {
+    let header = memory.read(output, 16).expect("reply header");
+    let len = u32::from_le_bytes(header[..4].try_into().expect("reply length"));
+    memory.read(output, u64::from(len)).expect("reply")
+}
+
+fn dirents(reply: &[u8]) -> Vec<(u64, String)> {
+    let mut entries = Vec::new();
+    let mut offset = 16;
+    while offset < reply.len() {
+        let next = u64::from_le_bytes(reply[offset + 8..offset + 16].try_into().expect("cookie"));
+        let name_len = usize::try_from(u32::from_le_bytes(
+            reply[offset + 16..offset + 20]
+                .try_into()
+                .expect("name length"),
+        ))
+        .expect("name length fits");
+        let name = std::str::from_utf8(&reply[offset + 24..offset + 24 + name_len])
+            .expect("UTF-8 fixture")
+            .to_owned();
+        offset += (24 + name_len).next_multiple_of(8);
+        entries.push((next, name));
+    }
+    entries
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn negotiated_big_write_crosses_guest_pages_and_survives_fsync() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let path = root.path().join("large");
+    std::fs::write(&path, []).expect("fixture");
+    let mounted = mount(root.path(), false).await;
+    let memory = BoundedMemory::new(&mounted.ram);
+    let channel = &mounted.channel;
+
+    let mut init = vec![0; 16];
+    init[..4].copy_from_slice(&7_u32.to_le_bytes());
+    init[4..8].copy_from_slice(&40_u32.to_le_bytes());
+    init[12..16].copy_from_slice(&(1_u32 << 5).to_le_bytes());
+    let initialized = submit(channel, &memory, 0, &request(26, 1, 1, &init)).await;
+    assert_eq!(reply_error(&initialized), 0);
+    assert_eq!(
+        u32::from_le_bytes(initialized[28..32].try_into().expect("negotiated flags")),
+        1 << 5
+    );
+    assert_eq!(
+        u32::from_le_bytes(initialized[36..40].try_into().expect("max write")),
+        64 * 1024
+    );
+
+    let lookup = submit(channel, &memory, 1, &request(1, 2, 1, b"large\0")).await;
+    assert_eq!(reply_error(&lookup), 0);
+    let inode = u64::from_le_bytes(lookup[16..24].try_into().expect("inode"));
+    let opened = submit(
+        channel,
+        &memory,
+        2,
+        &request(14, 3, inode, &2_u32.to_le_bytes()),
+    )
+    .await;
+    assert_eq!(reply_error(&opened), 0);
+    let handle = u64::from_le_bytes(opened[16..24].try_into().expect("handle"));
+
+    let payload: Vec<u8> = (0..64 * 1024)
+        .map(|index| u8::try_from((index * 37 + 13) % 251).expect("payload byte"))
+        .collect();
+    let mut write_body = vec![0; 40];
+    write_body[..8].copy_from_slice(&handle.to_le_bytes());
+    write_body[8..16].copy_from_slice(&123_u64.to_le_bytes());
+    write_body[16..20].copy_from_slice(&(64 * 1024_u32).to_le_bytes());
+    write_body.extend_from_slice(&payload);
+    let written = submit(channel, &memory, 3, &request(16, 4, inode, &write_body)).await;
+    assert_eq!(reply_error(&written), 0);
+    assert_eq!(
+        u32::from_le_bytes(written[16..20].try_into().expect("written bytes")),
+        64 * 1024
+    );
+
+    let overwrite = b"across-page-boundary";
+    let mut overwrite_body = vec![0; 40];
+    overwrite_body[..8].copy_from_slice(&handle.to_le_bytes());
+    overwrite_body[8..16].copy_from_slice(&4093_u64.to_le_bytes());
+    overwrite_body[16..20].copy_from_slice(
+        &u32::try_from(overwrite.len())
+            .expect("overwrite length")
+            .to_le_bytes(),
+    );
+    overwrite_body.extend_from_slice(overwrite);
+    let overwritten = submit(channel, &memory, 4, &request(16, 5, inode, &overwrite_body)).await;
+    assert_eq!(reply_error(&overwritten), 0);
+    assert_eq!(
+        u32::from_le_bytes(overwritten[16..20].try_into().expect("overwritten bytes")),
+        u32::try_from(overwrite.len()).expect("overwrite length")
+    );
+
+    let mut fsync = vec![0; 16];
+    fsync[..8].copy_from_slice(&handle.to_le_bytes());
+    assert_eq!(
+        reply_error(&submit(channel, &memory, 5, &request(20, 6, inode, &fsync)).await),
+        0
+    );
+    let mut expected = vec![0; 123];
+    expected.extend_from_slice(&payload);
+    expected[4093..4093 + overwrite.len()].copy_from_slice(overwrite);
+    let actual = std::fs::read(&path).expect("host readback");
+    assert_eq!(actual, expected);
+    channel.close().expect("close");
+}
+
+/// WASI's Windows handles omit delete sharing, so rename and unlink of an
+/// open file return access denied while the file remains readable.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn wasm_filesystem_component_serves_files_through_standard_wasi() {
+    let root = tempfile::tempdir().expect("tempdir");
+    std::fs::write(root.path().join("visible"), b"data").expect("fixture");
+    let Mounted {
+        channel,
+        ram,
+        _runtime,
+    } = mount(root.path(), false).await;
+    let memory = BoundedMemory::new(&ram);
+    initialize(&channel, &memory).await;
+    let lookup = submit(&channel, &memory, 1, &request(1, 2, 1, b"visible\0")).await;
+    assert_eq!(reply_error(&lookup), 0);
+    let visible = u64::from_le_bytes(lookup[16..24].try_into().expect("inode"));
+    assert_ne!(visible, 0);
+    let open = submit(
+        &channel,
+        &memory,
+        2,
+        &request(14, 3, visible, &0_u32.to_le_bytes()),
+    )
+    .await;
+    assert_eq!(reply_error(&open), 0);
+    let handle = u64::from_le_bytes(open[16..24].try_into().expect("handle"));
+    let mut read = vec![0; 24];
+    read[..8].copy_from_slice(&handle.to_le_bytes());
+    read[16..20].copy_from_slice(&4_u32.to_le_bytes());
+    let read = submit(&channel, &memory, 3, &request(15, 4, visible, &read)).await;
+    assert_eq!(reply_error(&read), 0);
+    assert_eq!(&read[16..], b"data");
+
+    let mut create = vec![0; 16];
+    create[..4].copy_from_slice(&(0o100_u32 | 2).to_le_bytes());
+    create[4..8].copy_from_slice(&0o600_u32.to_le_bytes());
+    create.extend_from_slice(b"written\0");
+    let created = submit(&channel, &memory, 4, &request(35, 7, 1, &create)).await;
+    assert_eq!(reply_error(&created), 0);
+    let inode = u64::from_le_bytes(created[16..24].try_into().expect("created inode"));
+    let expected_mode = if cfg!(unix) { 0o100_600 } else { 0o100_755 };
+    assert_eq!(
+        u32::from_le_bytes(created[116..120].try_into().expect("created mode")),
+        expected_mode
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        std::os::unix::fs::MetadataExt::mode(
+            &std::fs::metadata(root.path().join("written")).expect("created metadata")
+        ),
+        expected_mode
+    );
+    let handle = u64::from_le_bytes(created[144..152].try_into().expect("created handle"));
+    let mut write = vec![0; 40];
+    write[..8].copy_from_slice(&handle.to_le_bytes());
+    write[16..20].copy_from_slice(&3_u32.to_le_bytes());
+    write.extend_from_slice(b"new");
+    let written = submit(&channel, &memory, 5, &request(16, 8, inode, &write)).await;
+    assert_eq!(reply_error(&written), 0);
+    assert_eq!(
+        u32::from_le_bytes(written[16..20].try_into().expect("written bytes")),
+        3
+    );
+    let mut read = vec![0; 24];
+    read[..8].copy_from_slice(&handle.to_le_bytes());
+    read[16..20].copy_from_slice(&3_u32.to_le_bytes());
+    let read = submit(&channel, &memory, 6, &request(15, 9, inode, &read)).await;
+    assert_eq!(reply_error(&read), 0);
+    assert_eq!(&read[16..], b"new");
+    let getattr = submit(&channel, &memory, 7, &request(3, 10, inode, &[])).await;
+    assert_eq!(reply_error(&getattr), 0);
+    assert_eq!(
+        u32::from_le_bytes(getattr[92..96].try_into().expect("getattr mode")),
+        expected_mode
+    );
+    let mut setattr = vec![0; 84];
+    setattr[..4].copy_from_slice(&1_u32.to_le_bytes());
+    setattr[68..72].copy_from_slice(&0o100_640_u32.to_le_bytes());
+    let setattr = submit(&channel, &memory, 8, &request(4, 11, inode, &setattr)).await;
+    assert_eq!(reply_error(&setattr), 0);
+    assert_eq!(
+        u32::from_le_bytes(setattr[92..96].try_into().expect("setattr mode")),
+        if cfg!(unix) { 0o100_640 } else { 0o100_755 }
+    );
+    let mut rename = 1_u64.to_le_bytes().to_vec();
+    rename.extend_from_slice(b"written\0renamed\0");
+    let expected_mutation_error = if cfg!(windows) { -13 } else { 0 };
+    assert_eq!(
+        reply_error(&submit(&channel, &memory, 9, &request(12, 12, 1, &rename)).await),
+        expected_mutation_error
+    );
+    let retained_name = if cfg!(windows) { "written" } else { "renamed" };
+    assert_eq!(
+        std::fs::read(root.path().join(retained_name)).expect("retained file"),
+        b"new"
+    );
+    assert_eq!(root.path().join("written").exists(), cfg!(windows));
+    assert_eq!(root.path().join("renamed").exists(), cfg!(unix));
+    let unlink = format!("{retained_name}\0");
+    assert_eq!(
+        reply_error(
+            &submit(
+                &channel,
+                &memory,
+                10,
+                &request(10, 13, 1, unlink.as_bytes())
+            )
+            .await
+        ),
+        expected_mutation_error
+    );
+    let mut read = vec![0; 24];
+    read[..8].copy_from_slice(&handle.to_le_bytes());
+    read[16..20].copy_from_slice(&3_u32.to_le_bytes());
+    let reply = submit(&channel, &memory, 11, &request(15, 14, inode, &read)).await;
+    assert_eq!(reply_error(&reply), 0);
+    assert_eq!(&reply[16..], b"new");
+    let statfs = submit(&channel, &memory, 12, &request(17, 17, 1, &[])).await;
+    assert_eq!(reply_error(&statfs), 0);
+    assert_ne!(
+        u64::from_le_bytes(statfs[16..24].try_into().expect("blocks")),
+        0
+    );
+    assert_ne!(
+        u32::from_le_bytes(statfs[56..60].try_into().expect("block size")),
+        0
+    );
+    channel.close().expect("close");
+    assert!(!root.path().join("renamed").exists());
+    assert_eq!(root.path().join("written").exists(), cfg!(windows));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wasm_filesystem_component_retains_symlink_targets_after_rename() {
+    let root = tempfile::tempdir().expect("tempdir");
+    std::fs::write(root.path().join("visible"), b"data").expect("fixture");
+    symlink_file("visible", root.path().join("link")).expect("symlink fixture");
+    let Mounted {
+        channel,
+        ram,
+        _runtime,
+    } = mount(root.path(), false).await;
+    let memory = BoundedMemory::new(&ram);
+    initialize(&channel, &memory).await;
+    let link = submit(&channel, &memory, 1, &request(1, 5, 1, b"link\0")).await;
+    assert_eq!(reply_error(&link), 0);
+    let link = u64::from_le_bytes(link[16..24].try_into().expect("link inode"));
+    let target = submit(&channel, &memory, 2, &request(5, 6, link, &[])).await;
+    assert_eq!(reply_error(&target), 0);
+    assert_eq!(&target[16..], b"visible");
+
+    let mut rename_link = 1_u64.to_le_bytes().to_vec();
+    rename_link.extend_from_slice(b"link\0renamed-link\0");
+    assert_eq!(
+        reply_error(&submit(&channel, &memory, 3, &request(12, 15, 1, &rename_link)).await),
+        0
+    );
+    let target = submit(&channel, &memory, 4, &request(5, 16, link, &[])).await;
+    assert_eq!(reply_error(&target), 0);
+    assert_eq!(&target[16..], b"visible");
+    channel.close().expect("close");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wasm_filesystem_component_retains_linked_nodes_after_forget() {
+    let root = tempfile::tempdir().expect("tempdir");
+    for name in ["linked", "spare", "replacement"] {
+        std::fs::write(root.path().join(name), []).expect("fixture");
+    }
+    let Mounted {
+        channel,
+        ram,
+        _runtime,
+    } = mount_with_resource_capacity(root.path(), false, Some(22)).await;
+    let memory = BoundedMemory::new(&ram);
+    initialize(&channel, &memory).await;
+    let linked = submit(&channel, &memory, 1, &request(1, 2, 1, b"linked\0")).await;
+    let linked_node = u64::from_le_bytes(linked[16..24].try_into().expect("linked node"));
+    let mut link = linked_node.to_le_bytes().to_vec();
+    link.extend_from_slice(b"second-link\0");
+    assert_eq!(
+        reply_error(&submit(&channel, &memory, 2, &request(13, 3, 1, &link)).await),
+        0
+    );
+    submit(
+        &channel,
+        &memory,
+        3,
+        &request(2, 4, linked_node, &1_u64.to_le_bytes()),
+    )
+    .await;
+    let spare = submit(&channel, &memory, 4, &request(1, 5, 1, b"spare\0")).await;
+    let spare_node = u64::from_le_bytes(spare[16..24].try_into().expect("spare node"));
+    submit(
+        &channel,
+        &memory,
+        5,
+        &request(2, 6, spare_node, &1_u64.to_le_bytes()),
+    )
+    .await;
+    assert_eq!(
+        reply_error(&submit(&channel, &memory, 6, &request(1, 7, 1, b"replacement\0")).await),
+        0
+    );
+    assert_eq!(
+        reply_error(&submit(&channel, &memory, 7, &request(3, 8, linked_node, &[])).await),
+        0
+    );
+    channel.close().expect("close");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(unix)]
+#[allow(unsafe_code)]
+async fn wasm_filesystem_component_create_rejects_existing_fifo() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let root = tempfile::tempdir().expect("tempdir");
+    let fifo = root.path().join("fifo");
+    let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("fifo path");
+    // SAFETY: `fifo_c` stays alive for the call and the tempdir owns the path.
+    assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+    let Mounted {
+        channel,
+        ram,
+        _runtime,
+    } = mount(root.path(), false).await;
+    let memory = BoundedMemory::new(&ram);
+    initialize(&channel, &memory).await;
+    let mut create = vec![0; 16];
+    create[..4].copy_from_slice(&(0o100_u32 | 2).to_le_bytes());
+    create[4..8].copy_from_slice(&0o600_u32.to_le_bytes());
+    create.extend_from_slice(b"fifo\0");
+    let reply = submit(&channel, &memory, 1, &request(35, 2, 1, &create)).await;
+    assert_eq!(reply_error(&reply), -95);
+    channel.close().expect("close");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wasm_filesystem_component_enforces_readonly_grant() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let Mounted {
+        channel,
+        ram,
+        _runtime,
+    } = mount(root.path(), true).await;
+    let memory = BoundedMemory::new(&ram);
+    initialize(&channel, &memory).await;
+    let mut create = vec![0; 16];
+    create[..4].copy_from_slice(&(0o100_u32 | 2).to_le_bytes());
+    create[4..8].copy_from_slice(&0o644_u32.to_le_bytes());
+    create.extend_from_slice(b"denied\0");
+    let reply = submit(&channel, &memory, 1, &request(35, 2, 1, &create)).await;
+    assert_eq!(reply_error(&reply), -1);
+    channel.close().expect("close");
+    assert!(!root.path().join("denied").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wasm_filesystem_component_refreshes_a_relooked_up_node_path() {
+    let root = tempfile::tempdir().expect("tempdir");
+    symlink_file("first", root.path().join("old")).expect("symlink fixture");
+    std::fs::hard_link(root.path().join("old"), root.path().join("new"))
+        .expect("hard link fixture");
+    let Mounted {
+        channel,
+        ram,
+        _runtime,
+    } = mount(root.path(), false).await;
+    let memory = BoundedMemory::new(&ram);
+    initialize(&channel, &memory).await;
+    let old = submit(&channel, &memory, 1, &request(1, 2, 1, b"old\0")).await;
+    let node = u64::from_le_bytes(old[16..24].try_into().expect("old node"));
+    let new = submit(&channel, &memory, 2, &request(1, 3, 1, b"new\0")).await;
+    assert_eq!(reply_error(&new), 0);
+    assert_eq!(
+        u64::from_le_bytes(new[16..24].try_into().expect("new node")),
+        node
+    );
+    assert_eq!(
+        reply_error(&submit(&channel, &memory, 3, &request(10, 4, 1, b"old\0")).await),
+        0
+    );
+    assert_eq!(
+        reply_error(&submit(&channel, &memory, 4, &request(1, 5, 1, b"new\0")).await),
+        0
+    );
+    let target = submit(&channel, &memory, 5, &request(5, 6, node, &[])).await;
+    assert_eq!(reply_error(&target), 0);
+    assert_eq!(&target[16..], b"first");
+    channel.close().expect("close");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wasm_filesystem_component_rejects_an_unlinked_node_path() {
+    let root = tempfile::tempdir().expect("tempdir");
+    symlink_file("first", root.path().join("link")).expect("symlink fixture");
+    let Mounted {
+        channel,
+        ram,
+        _runtime,
+    } = mount(root.path(), false).await;
+    let memory = BoundedMemory::new(&ram);
+    initialize(&channel, &memory).await;
+    let lookup = submit(&channel, &memory, 1, &request(1, 2, 1, b"link\0")).await;
+    let node = u64::from_le_bytes(lookup[16..24].try_into().expect("link node"));
+    assert_eq!(
+        reply_error(&submit(&channel, &memory, 2, &request(10, 3, 1, b"link\0")).await),
+        0
+    );
+    assert_eq!(
+        reply_error(&submit(&channel, &memory, 3, &request(5, 4, node, &[])).await),
+        -2
+    );
+    channel.close().expect("close");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wasm_filesystem_component_recovers_after_resource_table_exhaustion() {
+    let root = tempfile::tempdir().expect("tempdir");
+    for index in 0..128 {
+        std::fs::write(root.path().join(format!("file-{index}")), []).expect("fixture");
+    }
+    let Mounted {
+        channel,
+        ram,
+        _runtime,
+    } = mount_with_resource_capacity(root.path(), false, Some(64)).await;
+    let memory = BoundedMemory::new(&ram);
+    initialize(&channel, &memory).await;
+
+    let mut nodes = Vec::new();
+    let mut exhausted = None;
+    for index in 0..128_u16 {
+        let name = format!("file-{index}\0");
+        let reply = submit(
+            &channel,
+            &memory,
+            index.wrapping_add(1),
+            &request(1, u64::from(index) + 2, 1, name.as_bytes()),
+        )
+        .await;
+        if reply_error(&reply) == 0 {
+            nodes.push(u64::from_le_bytes(reply[16..24].try_into().expect("node")));
+        } else {
+            exhausted = Some((index, reply_error(&reply)));
+            break;
+        }
+    }
+    let (index, error) = exhausted.expect("resource table fills");
+    assert_eq!(error, -24);
+    let node = nodes.pop().expect("a node before exhaustion");
+    submit(
+        &channel,
+        &memory,
+        index.wrapping_add(2),
+        &request(2, u64::from(index) + 130, node, &1_u64.to_le_bytes()),
+    )
+    .await;
+    tokio::task::yield_now().await;
+    let name = format!("file-{index}\0");
+    let reply = submit(
+        &channel,
+        &memory,
+        index.wrapping_add(3),
+        &request(1, u64::from(index) + 131, 1, name.as_bytes()),
+    )
+    .await;
+    assert_eq!(reply_error(&reply), 0);
+    channel.close().expect("close");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wasm_filesystem_component_handles_directory_operations_and_deleted_entries() {
+    let root = tempfile::tempdir().expect("tempdir");
+    for name in ["a", "b", "c"] {
+        std::fs::write(root.path().join(name), b"data").expect("fixture");
+    }
+    let Mounted {
+        channel,
+        ram,
+        _runtime,
+    } = mount(root.path(), false).await;
+    let memory = BoundedMemory::new(&ram);
+    initialize(&channel, &memory).await;
+
+    let source = submit(&channel, &memory, 1, &request(1, 2, 1, b"a\0")).await;
+    let source = u64::from_le_bytes(source[16..24].try_into().expect("source inode"));
+
+    let mut mkdir = vec![0; 8];
+    mkdir[..4].copy_from_slice(&0o755_u32.to_le_bytes());
+    mkdir.extend_from_slice(b"directory\0");
+    assert_eq!(
+        reply_error(&submit(&channel, &memory, 2, &request(9, 3, 1, &mkdir)).await),
+        0
+    );
+
+    let mut link = source.to_le_bytes().to_vec();
+    link.extend_from_slice(b"linked\0");
+    assert_eq!(
+        reply_error(&submit(&channel, &memory, 3, &request(13, 4, 1, &link)).await),
+        0
+    );
+
+    let mut truncate = vec![0; 84];
+    truncate[..4].copy_from_slice(&8_u32.to_le_bytes());
+    truncate[16..24].copy_from_slice(&2_u64.to_le_bytes());
+    assert_eq!(
+        reply_error(&submit(&channel, &memory, 4, &request(4, 5, source, &truncate)).await),
+        0
+    );
+    assert_eq!(
+        std::fs::read(root.path().join("linked")).expect("hard link"),
+        b"da"
+    );
+
+    let directory = submit(&channel, &memory, 5, &request(27, 6, 1, &[])).await;
+    let directory = u64::from_le_bytes(directory[16..24].try_into().expect("directory handle"));
+    let mut readdir = vec![0; 24];
+    readdir[..8].copy_from_slice(&directory.to_le_bytes());
+    readdir[16..20].copy_from_slice(&4096_u32.to_le_bytes());
+    let entries = dirents(&submit(&channel, &memory, 6, &request(28, 7, 1, &readdir)).await);
+    assert!(entries.iter().any(|(_, name)| name == "directory"));
+    let (deleted_index, (_, deleted_name)) = entries
+        .iter()
+        .enumerate()
+        .find(|(index, (_, name))| *index > 0 && matches!(name.as_str(), "a" | "b" | "c"))
+        .expect("a removable entry after the first");
+    let deleted_name = deleted_name.clone();
+    std::fs::remove_file(root.path().join(&deleted_name)).expect("remove cached entry");
+    readdir[8..16].copy_from_slice(&entries[deleted_index - 1].0.to_le_bytes());
+    let entries = dirents(&submit(&channel, &memory, 7, &request(28, 8, 1, &readdir)).await);
+    assert!(!entries.iter().any(|(_, name)| name == &deleted_name));
+    channel.close().expect("close");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn readdir_skips_a_full_batch_of_deleted_entries() {
+    let root = tempfile::tempdir().expect("tempdir");
+    for index in 0..130 {
+        std::fs::write(root.path().join(format!("file-{index}")), []).expect("fixture");
+    }
+    let mounted = mount(root.path(), false).await;
+    let memory = BoundedMemory::new(&mounted.ram);
+    initialize(&mounted.channel, &memory).await;
+    let opened = submit(&mounted.channel, &memory, 1, &request(27, 2, 1, &[])).await;
+    let mut body = vec![0; 24];
+    body[..8].copy_from_slice(&opened[16..24]);
+    body[16..20].copy_from_slice(&4096_u32.to_le_bytes());
+    let mut entries = Vec::new();
+    for head in 2..=4 {
+        let page = dirents(
+            &submit(
+                &mounted.channel,
+                &memory,
+                head,
+                &request(28, u64::from(head) + 1, 1, &body),
+            )
+            .await,
+        );
+        body[8..16].copy_from_slice(&page.last().expect("page").0.to_le_bytes());
+        entries.extend(page);
+    }
+    assert_eq!(entries.len(), 130);
+    for (_, name) in &entries[1..65] {
+        std::fs::remove_file(root.path().join(name)).expect("delete cached entry");
+    }
+    body[8..16].copy_from_slice(&entries[0].0.to_le_bytes());
+    let page = dirents(&submit(&mounted.channel, &memory, 5, &request(28, 6, 1, &body)).await);
+    assert_eq!(page, entries[65..129]);
+    mounted.channel.close().expect("close");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wasm_worker_drains_a_single_doorbell_without_native_queue_scheduling() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let Mounted {
+        channel,
+        ram,
+        _runtime,
+    } = mount(root.path(), false).await;
+    let memory = BoundedMemory::new(&ram);
+    initialize(&channel, &memory).await;
+    let first = request(3, 2, 1, &[]);
+    let second = request(3, 3, 1, &[]);
+    let (first, second) = submit_pair(&channel, &memory, &first, &second).await;
+    assert_eq!(reply_error(&first), 0);
+    assert_eq!(reply_error(&second), 0);
+    // Concurrent requests may complete in either order; virtio only requires each head once.
+    let mut used_heads = [USED + 12, USED + 20].map(|offset| {
+        let bytes = memory.read(offset, 4).expect("used head");
+        u32::from_le_bytes(bytes.try_into().expect("u32 head"))
+    });
+    used_heads.sort_unstable();
+    assert_eq!(used_heads, [0, 2]);
+    channel.reset().expect("reset stays live");
+    assert_eq!(
+        channel.read(0, 4).expect("MMIO remains live"),
+        0x7472_6976_u32.to_le_bytes()
+    );
+    channel.close().expect("close");
+}
+
+/// ENOSYS lets Linux cache unsupported xattr opcodes and report EOPNOTSUPP to callers.
+#[tokio::test(flavor = "multi_thread")]
+async fn wasm_filesystem_component_rejects_unsupported_opcodes_without_parsing() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let Mounted {
+        channel,
+        ram,
+        _runtime,
+    } = mount(root.path(), false).await;
+    let memory = BoundedMemory::new(&ram);
+    initialize(&channel, &memory).await;
+    for (index, opcode) in (1_u16..).zip([21, 22, 23, 24, 31, 32, 33, 43, 46, 50]) {
+        let reply = submit(
+            &channel,
+            &memory,
+            index,
+            &request(opcode, u64::from(index) + 1, u64::MAX, &[]),
+        )
+        .await;
+        let error = if (21..=24).contains(&opcode) {
+            -38
+        } else {
+            -95
+        };
+        assert_eq!(reply_error(&reply), error, "opcode {opcode}");
+    }
+    channel.close().expect("close");
+}
+
+async fn initialize_events(mounted: &Mounted) {
+    let mut init = vec![0; 20];
+    init[..4].copy_from_slice(&7_u32.to_le_bytes());
+    init[4..8].copy_from_slice(&40_u32.to_le_bytes());
+    init[12..16].copy_from_slice(&(1_u32 << 30).to_le_bytes());
+    init[16..20].copy_from_slice(&(1_u32 << 31).to_le_bytes());
+    let reply = submit(
+        &mounted.channel,
+        &BoundedMemory::new(&mounted.ram),
+        0,
+        &request(26, 1, 1, &init),
+    )
+    .await;
+    assert_eq!(reply_error(&reply), 0);
+    assert_eq!(&reply[48..52], &(1_u32 << 31).to_le_bytes());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_events_complete_filesystem_receive_requests_on_readonly_mounts() {
+    let directory = tempfile::tempdir().expect("share");
+    let mounted = mount(directory.path(), true).await;
+    initialize_events(&mounted).await;
+    std::fs::write(directory.path().join("changed"), "contents").expect("host write");
+    let reply = submit(
+        &mounted.channel,
+        &BoundedMemory::new(&mounted.ram),
+        1,
+        &request(4096, 2, 1, &[]),
+    )
+    .await;
+    assert_eq!(reply_error(&reply), 0);
+    assert_eq!(reply.len(), 296);
+    assert_eq!(&reply[16..24], &1_u64.to_le_bytes());
+    assert_eq!(&reply[36..40], &7_u32.to_le_bytes());
+    assert_eq!(&reply[40..47], b"changed");
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("changed")).expect("contents"),
+        "contents"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelling_an_idle_receive_does_not_block_the_filesystem_worker() {
+    let directory = tempfile::tempdir().expect("share");
+    let mounted = mount(directory.path(), false).await;
+    initialize_events(&mounted).await;
+    let (receive, cancel) = submit_pair(
+        &mounted.channel,
+        &BoundedMemory::new(&mounted.ram),
+        &request(4096, 2, 1, &[]),
+        &request(4097, 3, 1, &[]),
+    )
+    .await;
+    assert_eq!(reply_error(&receive), -19);
+    assert_eq!(reply_error(&cancel), 0);
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn native_events_keep_inode_identity_across_atomic_replacement() {
+    let directory = tempfile::tempdir().expect("share");
+    std::fs::write(directory.path().join("value"), "old").expect("original");
+    let mounted = mount(directory.path(), true).await;
+    initialize_events(&mounted).await;
+    let memory = BoundedMemory::new(&mounted.ram);
+    let lookup = submit(&mounted.channel, &memory, 1, &request(1, 2, 1, b"value\0")).await;
+    let inode = &lookup[16..24];
+    std::fs::write(directory.path().join("temporary"), "new").expect("replacement");
+    std::fs::rename(
+        directory.path().join("temporary"),
+        directory.path().join("value"),
+    )
+    .expect("atomic save");
+    let mut saw_replacement = false;
+    for index in 2..16 {
+        let reply = submit(
+            &mounted.channel,
+            &memory,
+            index,
+            &request(4096, u64::from(index) + 1, 1, &[]),
+        )
+        .await;
+        if reply.get(40..45) == Some(b"value") {
+            assert_eq!(&reply[24..32], inode);
+            let kind = u32::from_le_bytes(reply[32..36].try_into().expect("event kind"));
+            assert_eq!(kind & 0x200, 0);
+            saw_replacement = true;
+            break;
+        }
+    }
+    assert!(saw_replacement, "atomic replacement was not forwarded");
+}
+
+/// Native backends can deliver delayed creation events that invalidate the cache.
+/// Refresh the lookup until a content event resolves against the cached inode.
+#[tokio::test(flavor = "multi_thread")]
+async fn content_events_reuse_confirmed_cached_inode_identity() {
+    let directory = tempfile::tempdir().expect("share");
+    std::fs::write(directory.path().join("value"), "initial").expect("original");
+    let mounted = mount(directory.path(), true).await;
+    initialize_events(&mounted).await;
+    let memory = BoundedMemory::new(&mounted.ram);
+    let mut saw_content = false;
+    for index in (0..64).step_by(2) {
+        let lookup = submit(
+            &mounted.channel,
+            &memory,
+            index,
+            &request(1, u64::from(index) + 1, 1, b"value\0"),
+        )
+        .await;
+        assert_eq!(reply_error(&lookup), 0);
+        std::fs::write(directory.path().join("value"), format!("update {index}"))
+            .expect("host write");
+        let reply = submit(
+            &mounted.channel,
+            &memory,
+            index + 1,
+            &request(4096, u64::from(index) + 2, 1, &[]),
+        )
+        .await;
+        let kind = u32::from_le_bytes(reply[32..36].try_into().expect("event kind"));
+        if !matches!(kind & 0xff, 3 | 4) || reply[24..32] != lookup[16..24] {
+            continue;
+        }
+        assert_eq!(kind & 0x200, 0x200);
+        saw_content = true;
+        break;
+    }
+    assert!(saw_content, "content change was not forwarded");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn metadata_lookup_and_chmod_do_not_require_file_read_access() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    for readonly in [true, false] {
+        let root = tempfile::tempdir().expect("root");
+        let path = root.path().join("locked");
+        std::fs::write(&path, b"original").expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let mounted = mount(root.path(), readonly).await;
+        let memory = BoundedMemory::new(&mounted.ram);
+        let channel = &mounted.channel;
+        let lookup = submit(channel, &memory, 0, &request(1, 1, 1, b"locked\0")).await;
+        assert_eq!(reply_error(&lookup), 0);
+        let inode = u64::from_le_bytes(lookup[16..24].try_into().expect("inode"));
+        assert_eq!(
+            u32::from_le_bytes(lookup[116..120].try_into().expect("mode")),
+            0o100_000
+        );
+        let getattr = submit(channel, &memory, 1, &request(3, 2, inode, &[])).await;
+        assert_eq!(reply_error(&getattr), 0);
+        let mut chmod = vec![0; 84];
+        chmod[..4].copy_from_slice(&1_u32.to_le_bytes());
+        chmod[68..72].copy_from_slice(&0o600_u32.to_le_bytes());
+        let changed = submit(channel, &memory, 2, &request(4, 3, inode, &chmod)).await;
+        assert_eq!(reply_error(&changed), if readonly { -13 } else { 0 });
+        if readonly {
+            assert_eq!(
+                std::fs::metadata(&path).expect("metadata").mode() & 0o777,
+                0
+            );
+            channel.close().expect("close");
+            continue;
+        }
+        assert_eq!(
+            std::fs::metadata(&path).expect("metadata").mode() & 0o777,
+            0o600
+        );
+        let opened = submit(
+            channel,
+            &memory,
+            3,
+            &request(14, 4, inode, &1_u32.to_le_bytes()),
+        )
+        .await;
+        assert_eq!(reply_error(&opened), 0);
+        let handle = u64::from_le_bytes(opened[16..24].try_into().expect("handle"));
+        let mut write_body = vec![0; 40];
+        write_body[..8].copy_from_slice(&handle.to_le_bytes());
+        write_body[16..20].copy_from_slice(&3_u32.to_le_bytes());
+        write_body.extend_from_slice(b"new");
+        assert_eq!(
+            reply_error(&submit(channel, &memory, 4, &request(16, 5, inode, &write_body)).await),
+            0
+        );
+        assert_eq!(std::fs::read(&path).expect("read"), b"newginal");
+        channel.close().expect("close");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn write_only_files_open_for_write_without_read_access() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().expect("root");
+    let path = root.path().join("writeonly");
+    std::fs::write(&path, b"original").expect("write");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200)).expect("chmod");
+    let mounted = mount(root.path(), false).await;
+    let memory = BoundedMemory::new(&mounted.ram);
+    let channel = &mounted.channel;
+    let lookup = submit(channel, &memory, 0, &request(1, 1, 1, b"writeonly\0")).await;
+    assert_eq!(reply_error(&lookup), 0);
+    let inode = u64::from_le_bytes(lookup[16..24].try_into().expect("inode"));
+    let opened = submit(
+        channel,
+        &memory,
+        1,
+        &request(14, 2, inode, &(1_u32 | 0o1000).to_le_bytes()),
+    )
+    .await;
+    assert_eq!(reply_error(&opened), 0);
+    assert_eq!(std::fs::metadata(&path).expect("metadata").len(), 0);
+    std::fs::rename(&path, root.path().join("moved")).expect("rename");
+    std::fs::write(&path, b"replacement").expect("replace");
+    let reopened = submit(
+        channel,
+        &memory,
+        2,
+        &request(14, 3, inode, &(1_u32 | 0o1000).to_le_bytes()),
+    )
+    .await;
+    assert!(matches!(reply_error(&reopened), 0 | -2));
+    assert_eq!(
+        std::fs::read(&path).expect("replacement contents"),
+        b"replacement"
+    );
+    channel.close().expect("close");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("restore mode");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn inaccessible_directories_allow_metadata_and_permission_repair() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().expect("root");
+    let path = root.path().join("locked");
+    std::fs::create_dir(&path).expect("directory");
+    std::fs::write(path.join("child"), b"contents").expect("child");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    let mounted = mount(root.path(), false).await;
+    let memory = BoundedMemory::new(&mounted.ram);
+    let channel = &mounted.channel;
+    let lookup = submit(channel, &memory, 0, &request(1, 1, 1, b"locked\0")).await;
+    assert_eq!(reply_error(&lookup), 0);
+    let inode = u64::from_le_bytes(lookup[16..24].try_into().expect("inode"));
+    assert_eq!(
+        u32::from_le_bytes(lookup[116..120].try_into().expect("mode")),
+        0o040_000
+    );
+    let mut chmod = vec![0; 84];
+    chmod[..4].copy_from_slice(&1_u32.to_le_bytes());
+    chmod[68..72].copy_from_slice(&0o700_u32.to_le_bytes());
+    assert_eq!(
+        reply_error(&submit(channel, &memory, 1, &request(4, 2, inode, &chmod)).await),
+        0
+    );
+    let child = submit(channel, &memory, 2, &request(1, 3, inode, b"child\0")).await;
+    assert_eq!(reply_error(&child), 0);
+    channel.close().expect("close");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn inaccessible_metadata_nodes_never_chmod_replacements() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    for replace_with_symlink in [false, true] {
+        let root = tempfile::tempdir().expect("root");
+        let path = root.path().join("locked");
+        std::fs::write(&path, b"original").expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let mounted = mount(root.path(), false).await;
+        let memory = BoundedMemory::new(&mounted.ram);
+        let lookup = submit(&mounted.channel, &memory, 0, &request(1, 1, 1, b"locked\0")).await;
+        assert_eq!(reply_error(&lookup), 0);
+        let inode = u64::from_le_bytes(lookup[16..24].try_into().expect("inode"));
+        std::fs::rename(&path, root.path().join("moved")).expect("rename");
+        let replacement = root.path().join("replacement");
+        std::fs::write(&replacement, b"replacement").expect("replacement");
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o640))
+            .expect("chmod");
+        if replace_with_symlink {
+            symlink(&replacement, &path).expect("symlink");
+        } else {
+            std::fs::hard_link(&replacement, &path).expect("link");
+        }
+        let mut chmod = vec![0; 84];
+        chmod[..4].copy_from_slice(&1_u32.to_le_bytes());
+        chmod[68..72].copy_from_slice(&0o777_u32.to_le_bytes());
+        let reply = submit(&mounted.channel, &memory, 1, &request(4, 2, inode, &chmod)).await;
+        assert!(matches!(reply_error(&reply), 0 | -2));
+        assert_eq!(
+            std::fs::metadata(&replacement)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+        mounted.channel.close().expect("close");
+    }
+}

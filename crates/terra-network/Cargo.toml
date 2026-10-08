@@ -1,0 +1,26 @@
+[package]
+name = "terra-network"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+terra-policy = { path = "../terra-policy" }
+terra-protocol = { path = "../terra-protocol", features = ["tokio"] }
+terra-limits = { path = "../terra-limits" }
+serde.workspace = true
+tokio = { version = "1", features = ["rt", "net", "io-util", "sync", "time", "macros"] }
+futures-util = { version = "0.3", default-features = false, features = ["alloc", "std"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+socket2 = "0.6"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+
+[lints]
+workspace = true

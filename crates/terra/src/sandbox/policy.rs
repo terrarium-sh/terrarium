@@ -45,8 +45,8 @@ pub(crate) struct Options<'a> {
 #[derive(Clone, Copy)]
 pub(crate) enum Phase<'a> {
     Collect { traces: &'a Path },
-    Enforce { policy: &'a [u8] },
-    Validate { name: &'a str, policy: &'a [u8] },
+    Enforce { policy: &'a Path },
+    Validate { name: &'a str, policy: &'a Path },
 }
 
 pub(crate) fn generate(
@@ -57,7 +57,7 @@ pub(crate) fn generate(
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
-    return super::linux::generation::generate(options, prepare_launch);
+    return super::generation::generate(options, prepare_launch);
     #[cfg(not(all(
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")
@@ -78,6 +78,7 @@ pub(crate) fn trace_command(command: &Command, output: &Path) -> Result<Command>
 }
 
 /// `None` leaves the command unchanged.
+#[cfg(test)]
 pub(crate) fn enforce_command(command: Command, policy: Option<&Path>) -> Result<Command> {
     match policy {
         None => Ok(command),
@@ -129,7 +130,7 @@ pub(crate) fn run_worker(arguments: &mut impl Iterator<Item = OsString>) -> Resu
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
-    return super::linux::generation::run_worker(arguments);
+    return super::generation::run_worker(arguments);
     #[cfg(not(all(
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")

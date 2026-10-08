@@ -1,14 +1,10 @@
 # Security model
 
-Terra runs a workload in a hardware-virtualized VM. The VM boundary is intended
-to protect the host from a hostile guest, subject to the trusted computing base
-and limits below. Linux uses KVM, macOS uses Hypervisor.framework, and Windows
-uses WHP. Current-build hardware acceptance remains tracked in
-[todo.md](todo.md); earlier Linux results do not validate every later change.
-
-This document describes the boundary Terra implements. It is not an assurance
-against flaws in the host kernel, hypervisor, Wasmtime, WASI, native runtime,
-or the trusted build pipeline.
+Terra runs a workload in a hardware-virtualized VM (KVM on Linux,
+Hypervisor.framework on macOS, WHP on Windows) to protect the host from a
+hostile guest, within the trusted computing base and limits below. Only Linux
+has passed native acceptance; macOS and Windows gates are open in
+[todo.md](todo.md).
 
 ## Trust and authority
 
@@ -56,6 +52,7 @@ untrusted input rather than relying on the absence of a warning.
 | `network.hosts` | Local DNS records; a record alone does not authorize a connection. Add a matching `allow` rule. |
 | `network.mode: unrestricted-public` | Public egress without individual rules, including public addresses on a LAN. IPs collected from host interfaces at VM startup, including public IPs, and blocked private, link-local, and cloud-metadata ranges require explicit grants. |
 | `network.ports` | A guest listener published on host loopback. |
+| `network.enabled: false` | Guest-local networking with no broker or external network connections. Agent control remains available. |
 | `env` and `env_file` | Values delivered to guest hooks and workload processes. Secrets delivered to a guest may be copied or persisted by it. |
 | `hooks`, `sudo`, and `terra exec --root` | Guest-root authority inside that box only. |
 | `terra sync` | A host-initiated synchronization of files and directories. The operator chooses the host path and authorizes guest input or output. |
@@ -93,71 +90,37 @@ mount capability.
 
 ## Runtime boundary
 
-Terra creates a separate Wasmtime store, linear memory, resource table and host
-state for each VMM and device component, with an explicitly restricted linker.
-This is a software fault isolation security boundary: Wasmtime confines component
-memory accesses and control flow, while native effects require explicitly
-granted functions, resources or stream endpoints. Native code owns VM creation,
-guest-RAM mappings, hypervisor handles,
-host I/O, and the checks that grant filesystem and network authority.
-Guest-memory, block-I/O, and reclaim requests are range- and overflow-checked
-before native access. Block disks are opened as fixed-capacity grants; guest
-writes cannot extend their initial extent. The filesystem component receives a
-scoped directory preopen only when a mount is configured. Network socket and
-name-resolution operations are checked against the box policy before the host
-operation proceeds. The network component and its native socket hosts run in
-the VM process, inside the jail when using built-in Bubblewrap. Device
-components do not receive arbitrary host filesystem or hypervisor handles.
+Each VMM and device component runs in its own Wasmtime store with its own
+linear memory, resource table and an explicitly restricted linker. Wasmtime
+confines each component's memory and control flow; native effects need an
+explicitly granted function, resource or stream. Native code owns VM creation,
+guest-RAM mappings, hypervisor handles and host I/O, and range- and
+overflow-checks every guest-memory, block and reclaim request before acting on
+it. Block disks are fixed-capacity grants that guest writes cannot extend.
+[Component authority](component-authority.md) lists what each component may
+import and why.
 
-Native preparation fixes the machine resources before a separate boot store
-parses the kernel. Native code validates its bounded writes and one-time result,
-then destroys the boot store before starting the VMM. Only the VMM receives
-opaque vCPU resources; device components cannot create or select a hypervisor.
+A separate boot store parses the kernel after native preparation fixes the
+machine resources. Native code validates every planned kernel segment and
+boot-data write, then destroys the boot store before the VMM starts. Only the
+VMM receives vCPU resources; native MMIO routing validates mappings, access
+ranges, reply sequences and deadlines, and the interrupt adapter accepts only
+granted lines and valid x86 vectors and destinations.
 
-| Component | Scoped authority beyond runtime support |
-| --- | --- |
-| VMM | Scoped VM/vCPU lifecycle resources and access to the MMIO client. |
-| MMIO | Supplied device mappings and explicitly connected request/reply streams; no imported host functions. |
-| Interrupt controller | Supplied interrupt topology and value-based operations; no imported host functions. |
-| Block | Its VM's RAM, assigned interrupt and one fixed-capacity backing disk. |
-| Filesystem | Its VM's RAM, assigned interrupt and one directory preopen. |
-| Network | Its VM's RAM, assigned interrupt, policy-controlled WASI sockets/DNS, and warnings in the capped host log. |
-| Memory | Its VM's RAM, assigned interrupt and bounded reclamation of that RAM. |
-| Vsock | Its VM's RAM, assigned interrupt, supplied local service streams and secure randomness. |
-| Policy | Immutable policy configuration and host-submitted resolver results; no guest RAM, filesystem or sockets. |
+The combined vsock device/network frontend validates transport packets, opening
+handshakes and UDP/control frames, then submits bounded socket requests to the
+separate broker, which authorizes each one even if the frontend is compromised.
+Device reset disconnects every connection; losing the broker or network control
+retires networking while agent control stays available. The
+[network transport](../README.dev.md#network-transport) defines these streams.
 
-The MMIO bridge and software interrupt controller each run in their own
-restricted store with an empty host-function linker. They have no host memory,
-WASI, filesystem, network, clock, random, VM, vCPU, or guest-RAM capability.
-The MMIO adapter accepts a reply only for the mapped device and access range.
-The controller adapter accepts only granted GSI lines and valid x86 interrupt
-vectors and destinations before injecting an interrupt. These checks make the
-split a security measure against a compromised service component: it cannot
-directly access the host or apply an unchecked native effect. Device connections
-can still indirectly cause the particular host I/O authorized for that device.
-
-This SFI boundary is within one host process. It relies on Wasmtime's Wasm
-memory and control-flow enforcement, the correctness of the registered host
-functions, and the native adapters. It is therefore not a defense against a
-Wasmtime, native-runtime, hypervisor, or host-kernel vulnerability, and it does
-not isolate components into separate operating-system processes.
-
-The default Linux [host VM launcher](vm-launchers.md) restricts the native VM
-process outside this component boundary. The built-in Bubblewrap launcher
-restricts its mount view, process namespaces, capabilities, and syscalls while
-sharing the host network namespace. Releases require a native KVM boot with the
-default jail and built-in policy on Linux amd64; missing KVM or a
-failed boot blocks publication. Generated-policy enforcement is optional CI
-coverage and does not gate releases. Linux
-uses an explicitly configured raw seccomp policy, then the override at
-`~/.terra/config/seccomp.bpf`, then the built-in minimal syscall denylist.
-Selected files must contain raw classic BPF for the host architecture; Terra
-checks their size and the kernel validates installation, without release metadata
-or downloads. The built-in policy does not provide the generated policy’s syscall
-or ioctl allowlist. Set `vm.bwrap.allow_fallback: false` to require a policy file.
-An invalid selected policy stops boot. Operators can select `vm.init: direct` or
-a custom launcher globally.
-Custom launchers are trusted host code and define their own boundary.
+The default [host VM launcher](vm-launchers.md) runs the VM and the broker as
+separately confined processes; [host process sandboxing](sandboxing.md)
+describes each role, its grants and its filters. Without a generated policy
+bundle, the built-in fallback filters allow broader syscall access within the
+same namespace and filesystem boundaries; `install.sh` installs the release
+bundle. Direct and custom launchers are trusted host code with their own
+boundaries; a successful launch does not establish confinement.
 
 Components inherit no host environment, arguments or standard streams. Devices
 can read and corrupt their own VM's RAM: component isolation protects the host
@@ -165,9 +128,10 @@ and other boxes, not the guest from its devices. A directory preopen authorizes
 its contents even when a compromised filesystem component bypasses FUSE parsing;
 Wasm-only special-file filters are not a host restriction.
 
-The policy sidecar has bounded input and per-call fuel. Traps fail authorization
-closed. Device stores use epoch interruption, and production shared memory is
-disabled. Learned DNS grants expire for new connections after 60 seconds unless
+The CLI validates network policies with the broker's own policy core. Explicit
+configuration, rule, name, resolver and learned-address bounds constrain policy
+work, and authorization errors fail closed. Device stores use epoch
+interruption, and production shared memory is disabled. Learned DNS grants expire for new connections after 60 seconds unless
 renewed; existing connections continue.
 
 Component setup and device requests have bounded runtime interfaces and
@@ -175,12 +139,13 @@ deadlines. These controls limit malformed requests and waiting work; they do
 not make host I/O interruptible or turn component failures into durable
 transactions.
 
-Guest diagnostic events are limited to 64 KiB, enter a bounded queue, and are
+Guest diagnostic events are size-limited, enter a bounded queue, and are
 written through an 8 MiB per-file cap. This prevents diagnostic floods from
 growing the host log without bound; it is not a general storage quota.
 
-Component memory has independent per-store Wasm linear-memory limits, with
-a default and minimum configurable ceiling of 16 MiB. There is no combined
+Component memory has independent per-store Wasm linear-memory limits. The
+default is 16 MiB, raised to 200 MiB for the combined network frontend so its
+1024-flow table fits; configurable ceilings require at least 16 MiB. There is no combined
 component memory cap. Those limits do not bound guest RAM,
 native/WASI allocations, kernel socket memory, CPU time, disk use in writable
 shares, or bandwidth. Operators control aggregate VM resource budgets.
@@ -188,9 +153,10 @@ Apply operating-system limits or a dedicated host
 when hard resource isolation is required.
 
 Native resource tables use Wasmtime's default capacity except where a device
-sets its own limit, such as filesystem descriptors. Network flow admission
-bounds concurrent socket work; Wasm memory ceilings do not bound native table
-allocations or the size of their entries.
+sets its own limit, such as filesystem descriptors. The combined frontend caps
+its resource table using broker resource, listener and pending-operation limits.
+These entry counts and network flow admission bound concurrent socket work;
+Wasm memory ceilings do not bound native allocations or entry sizes.
 
 Terra keeps its box state, recipes, images, logs, and local control sockets
 under `~/.terra` with owner-only permissions where the platform supports them.
@@ -199,20 +165,26 @@ Running Terra as host root expands the impact of a boundary failure.
 
 ### Network policy limits
 
-Recipe network rules and the Wasm policy boundary govern guest traffic during
-normal operation, including a compromised Wasm network component that remains
-within its granted host calls. Native code execution in the VM process can
-bypass those rules and open sockets directly in the shared host network
-namespace. The jail's filesystem, process, capability, and seccomp restrictions
-still apply, but they do not enforce the recipe's destination policy.
+In the confined Linux launch, the broker enforces recipe network rules even if
+the VM process is compromised. Broker requests are untrusted, bounded, and
+validated independently. Only broker-controlled resolution establishes learned
+address grants. TCP connections retain established-stream semantics; UDP
+rechecks authorization on send and receive as DNS-derived grants expire.
 
-A compromised native VM process can reach host-loopback and LAN services, and
-Linux abstract Unix sockets, subject to operating-system permissions, the
-selected seccomp filter, and external network controls. Vulnerabilities or
-privileged APIs in those services can provide an indirect path out of the jail.
-Operators who need network restrictions that survive native VM compromise must
-apply independent host controls, such as root-managed filtering for the Terra
-service. Ordinary IP firewall rules do not cover abstract Unix sockets.
+Pipelined TCP uploads admit at most 4 chunks of 8 KiB per connection, including
+the active write, within the broker's global request and byte limits. The broker
+writes whole chunks in FIFO order. Cancelling a partly written chunk closes the
+write direction so later chunks cannot follow its truncated prefix. A queued
+half-close commits to draining earlier writes and rejects subsequent writes.
+
+The broker's native policy engine is trusted code. A native broker compromise
+can bypass its in-process destination rules and use networking allowed by its OS
+sandbox. Host-loopback and LAN services may expose privileged APIs or their own
+vulnerabilities. Independent host network controls can further restrict broker
+authority. Direct launches and custom launchers without equivalent isolation
+also allow native VM code to bypass component-level policy using host sockets.
+On Windows, the `restricted_token_job` mode is weaker; see
+[sandboxing](sandboxing.md#windows).
 
 ## Outside the boundary
 
@@ -227,9 +199,9 @@ service. Ordinary IP firewall rules do not cover abstract Unix sockets.
 - Attached workload output is guest-controlled terminal input. A hostile guest
   can emit terminal control sequences, so use a terminal policy appropriate for
   untrusted output.
-- Component isolation is a host-security boundary for component code within its
-  trusted computing base. It does not protect against a defect in Wasmtime,
-  WASI, native adapters, or the hypervisor.
+- Component isolation runs inside one host process. It does not protect against
+  a defect in Wasmtime, WASI, the native adapters, the hypervisor or the host
+  kernel.
 - Cancellation and timeouts do not roll back a host write or forcibly interrupt
   an operating-system I/O operation already in progress.
 - Terra does not provide a hard defense against denial of service, hardware

@@ -57,13 +57,13 @@ GitHub's Pages configuration supplies the deployment base path.
 
 ## Theme and dependencies
 
-`src/theme.css` defines the custom Starlight theme, preserving the original
-`#f9f6ed` background, with blue-green glass accents and pale glass buttons.
+`src/theme.css` defines the custom Starlight theme with a `#f8f5ee` background,
+blue-green glass accents, and pale glass buttons.
 Fonts are system fonts; the favicon is local SVG.
-The title-free `static/terrarium-placeholder.png` was derived from the supplied
-frog illustration and can be replaced by the forthcoming SVG in the header and
-homepage. CSS provides short entrance animations and hover transitions, with
-all motion disabled when the visitor requests reduced motion.
+`static/logo.svg` supplies the header and homepage illustration. Its plants
+bend, the frog blinks, and a dragonfly loops back to the flower. CSS provides
+short entrance animations and hover transitions.
+All motion respects reduced-motion settings.
 
 Starlight is pinned to a public GitHub source commit because its package
 registry requires authentication. pnpm packages that source using its upstream

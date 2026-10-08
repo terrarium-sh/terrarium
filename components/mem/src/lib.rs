@@ -2,14 +2,14 @@
 
 #[allow(unsafe_code, clippy::same_length_and_capacity)]
 mod bindings {
-    wit_bindgen::generate!({ world: "device", path: "wit", generate_all });
+    wit_bindgen::generate!({ world: "device", path: "wit", generate_all, additional_derives: [PartialEq, Eq] });
 }
 use bindings::{exports, terra, wit_stream};
 
 mod mmio;
 mod transport;
 
-use exports::terra::mem::transport::Guest;
+use exports::terra::host::device_api::Guest;
 use terra::mmio::types::DeviceError;
 
 struct Mem;
@@ -23,7 +23,8 @@ impl exports::terra::mmio::device::Guest for Mem {
 }
 
 impl Guest for Mem {
-    fn configure() -> Result<(), DeviceError> {
+    #[allow(clippy::unused_async_trait_impl)]
+    async fn configure(_readonly: bool) -> Result<(), DeviceError> {
         transport::configure()
     }
 

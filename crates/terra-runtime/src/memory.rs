@@ -5,6 +5,7 @@ use terra_platform::memory::{
 };
 
 use crate::MAX_SINGLE_BYTES;
+use std::sync::atomic::{Ordering, fence};
 use terra_limits::{MAX_BATCH_GUEST_COPY_BYTES, MAX_BATCH_GUEST_COPY_RANGES};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +68,8 @@ impl<'a> BoundedMemory<'a> {
 
     pub fn read(&self, offset: u64, len: u64) -> Result<Vec<u8>, MemoryError> {
         let len = Self::copy_len(len)?;
+        // Queue notification suppression must observe interrupt reenabling after used publication.
+        fence(Ordering::SeqCst);
         self.ram
             .memory()
             .read(offset, len)
@@ -90,6 +93,7 @@ impl<'a> BoundedMemory<'a> {
                 .map_err(map_memory_error)?;
         }
         let mut bytes = vec![0; usize::try_from(total).map_err(|_| MemoryError::TooLarge)?];
+        fence(Ordering::SeqCst);
         let mut start = 0;
         for range in ranges {
             let end = start + Self::copy_len(range.len)?;
@@ -104,10 +108,35 @@ impl<'a> BoundedMemory<'a> {
 
     pub fn write(&self, offset: u64, data: &[u8]) -> Result<(), MemoryError> {
         Self::copy_len(u64::try_from(data.len()).map_err(|_| MemoryError::TooLarge)?)?;
+        // Used-ring publication must follow the completed payload and ring entries.
+        fence(Ordering::Release);
         self.ram
             .memory()
             .write(offset, data)
             .map_err(map_memory_error)
+    }
+
+    pub fn write_ranges(&self, ranges: &[(u64, &[u8])]) -> Result<(), MemoryError> {
+        if ranges.len() > MAX_BATCH_GUEST_COPY_RANGES {
+            return Err(MemoryError::TooLarge);
+        }
+        let mut total = 0_u64;
+        for &(offset, data) in ranges {
+            let len = u64::try_from(data.len()).map_err(|_| MemoryError::TooLarge)?;
+            Self::copy_len(len)?;
+            total = total.checked_add(len).ok_or(MemoryError::TooLarge)?;
+            if total > MAX_BATCH_GUEST_COPY_BYTES {
+                return Err(MemoryError::TooLarge);
+            }
+            self.ram
+                .memory()
+                .validate_range(offset, len)
+                .map_err(map_memory_error)?;
+        }
+        for &(offset, data) in ranges {
+            self.write(offset, data)?;
+        }
+        Ok(())
     }
 }
 
@@ -285,5 +314,70 @@ mod tests {
         let mut oversized = full;
         oversized.push(MemoryRange { addr: 0, len: 1 });
         assert_eq!(memory.read_ranges(&oversized), Err(MemoryError::TooLarge));
+    }
+
+    #[test]
+    fn write_ranges_validate_every_range_before_mutation() {
+        let ram = GuestRam::from_memory(
+            GuestMemory::from_ranges(&[(0, 4096), (8192, 4096)]).expect("RAM"),
+        );
+        let memory = BoundedMemory::new(&ram);
+        memory.write(0, b"seed").unwrap();
+        for (offset, error) in [
+            (4096, MemoryError::Unmapped),
+            (4095, MemoryError::Unmapped),
+            (u64::MAX, MemoryError::OutOfRange),
+            (12_287, MemoryError::OutOfRange),
+        ] {
+            assert_eq!(
+                memory.write_ranges(&[(0, b"edit"), (offset, b"bad")]),
+                Err(error)
+            );
+            assert_eq!(memory.read(0, 4).unwrap(), b"seed");
+        }
+        let oversized = vec![9; usize::try_from(MAX_SINGLE_BYTES).unwrap() + 1];
+        assert_eq!(
+            memory.write_ranges(&[(0, b"edit"), (8192, &oversized)]),
+            Err(MemoryError::TooLarge)
+        );
+        assert_eq!(memory.read(0, 4).unwrap(), b"seed");
+        let too_many = vec![(0, b"edit".as_slice()); MAX_BATCH_GUEST_COPY_RANGES + 1];
+        assert_eq!(memory.write_ranges(&too_many), Err(MemoryError::TooLarge));
+        assert_eq!(memory.read(0, 4).unwrap(), b"seed");
+    }
+
+    #[test]
+    fn write_ranges_enforce_aggregate_and_range_count_limits() {
+        let ram = GuestRam::new(128 * 1024).expect("RAM");
+        let memory = BoundedMemory::new(&ram);
+        memory.write(0, b"seed").unwrap();
+        let payload = vec![9; usize::try_from(MAX_SINGLE_BYTES).unwrap()];
+        let full = vec![(0, payload.as_slice()); 4];
+        let mut oversized = full.clone();
+        oversized.push((0, b"x"));
+        assert_eq!(memory.write_ranges(&oversized), Err(MemoryError::TooLarge));
+        assert_eq!(memory.read(0, 4).unwrap(), b"seed");
+        memory.write_ranges(&full).unwrap();
+        assert_eq!(memory.read(0, MAX_SINGLE_BYTES).unwrap(), payload);
+        memory
+            .write_ranges(&vec![(0, b"x".as_slice()); MAX_BATCH_GUEST_COPY_RANGES])
+            .unwrap();
+        assert_eq!(memory.read(0, 1).unwrap(), b"x");
+    }
+
+    #[test]
+    fn write_ranges_preserve_input_order_for_overlapping_ranges() {
+        let ram = GuestRam::new(4096).expect("RAM");
+        let memory = BoundedMemory::new(&ram);
+        memory.write_ranges(&[]).unwrap();
+        memory
+            .write_ranges(&[(8, b"first"), (0, b"second"), (8, b"last"), (1, b"")])
+            .unwrap();
+        assert_eq!(memory.read(0, 13).unwrap(), b"second\0\0lastt");
+        assert_eq!(
+            memory.write_ranges(&[(0, b"edit"), (u64::MAX, b"")]),
+            Err(MemoryError::OutOfRange)
+        );
+        assert_eq!(memory.read(0, 6).unwrap(), b"second");
     }
 }

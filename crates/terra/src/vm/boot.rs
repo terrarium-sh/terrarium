@@ -1,7 +1,7 @@
 //! Booting a prepared box into its VM process.
 
 use crate::cli::BootArgs;
-use crate::sandbox::{self, LauncherConfig, PreparedLaunch};
+use crate::sandbox::config::LauncherConfig;
 use crate::session::{self, DETACH_KEY_NAME, SessionOutcome, pump_session};
 use crate::state::BoxRef;
 use crate::{config, sys};
@@ -9,7 +9,9 @@ use anyhow::{Context, Result};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
+use std::process::{Child, ExitCode, ExitStatus};
+#[cfg(all(test, unix))]
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// The background VM process's own first argv: `terra __vm <dir>` skips the
@@ -32,6 +34,14 @@ pub struct BootSpec {
     pub foreground: bool,
     #[serde(default)]
     pub host_publishes_pid: bool,
+    #[serde(default)]
+    pub network_broker: Option<BrokerMetadata>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct BrokerMetadata {
+    pub ready: terra_network::config::Ready,
+    pub listeners: Vec<terra_network::config::PublishedListener>,
 }
 
 impl BootSpec {
@@ -49,6 +59,7 @@ impl BootSpec {
             mode: terra_protocol::PlanMode::Run,
             foreground: boot == BootMode::Foreground,
             host_publishes_pid: false,
+            network_broker: None,
         }
     }
 }
@@ -112,6 +123,7 @@ pub async fn run_bake(
         mode: terra_protocol::PlanMode::Create,
         foreground: false,
         host_publishes_pid: false,
+        network_broker: None,
     };
     eprintln!("terra: baking on_create for {bx} in an isolated VM (no shares)");
     let baking = BoxRef::mark_baking(lock).context("marking the on_create bake")?;
@@ -138,8 +150,15 @@ pub async fn run_bake(
         let _ = sys::kill_vm_child(&mut child);
     }
     let status = child.wait().context("waiting for the on_create bake")?;
-    replay_logs(bx, status);
-    output.context("streaming the on_create bake")?;
+    if !status.success() || output.is_err() {
+        let _ = write_boot_logs(bx, &mut std::io::stderr().lock());
+    }
+    output.with_context(|| {
+        format!(
+            "streaming the on_create bake (box process {status}; launcher diagnostics: {})",
+            bx.get_dir().join("launcher.log").display()
+        )
+    })?;
     if !status.success() {
         if let Some(signal) = sys::find_terminating_signal(status) {
             anyhow::bail!(
@@ -183,7 +202,7 @@ pub async fn run_vm_process(dir: PathBuf, is_at_a_terminal: bool) -> Result<Exit
         "no run lock was handed to this process - a VM process is spawned by a boot, \
          not started by hand",
     )?;
-    crate::vm::run(&spec, &bx, &lock, write_agent_ready).await
+    crate::vm::run(&spec, &bx, Some(&lock), write_agent_ready).await
 }
 
 async fn pump_box_console(bx: &BoxRef, agent_timeout: Option<u64>) -> Result<SessionOutcome> {
@@ -213,7 +232,7 @@ async fn supervise_foreground(
             match result {
                 Ok(SessionOutcome::Detached) => eprintln!("terra: console detached; {bx} still runs under this foreground command"),
                 Ok(SessionOutcome::Exited(_) | SessionOutcome::Closed) => {}
-                Err(error) => eprintln!("terra: console failed: {error:#}; {bx} still runs under this foreground command"),
+                Err(error) => eprintln!("terra: console failed: {}; {bx} still runs under this foreground command", crate::render::render_error(&error)),
             }
             vm.await
         }
@@ -306,10 +325,12 @@ fn wait_for_detached_agent(bx: &BoxRef, mut child: Child, timeout: Duration) -> 
         .and_then(std::convert::identity);
     let (startup_pipe_closed, failure) = match notification {
         Ok(true) => {
+            let vm = bx
+                .read_vm_process()
+                .context("box reported readiness without publishing its VM identity")?;
             eprintln!(
                 "terra: started {bx} detached (pid {}); agent ready; logs: {}",
-                bx.read_vm_process()
-                    .map_or(child.id(), |process| process.pid),
+                vm.pid,
                 bx.build_logs_command()
             );
             return Ok(ExitCode::SUCCESS);
@@ -343,9 +364,9 @@ fn wait_for_detached_agent(bx: &BoxRef, mut child: Child, timeout: Duration) -> 
     ))
 }
 
-struct LaunchedVm {
-    child: Child,
-    _guard: Option<sys::VmChildGuard>,
+pub(super) struct LaunchedVm {
+    pub(super) child: Child,
+    pub(super) _guard: Option<sys::VmChildGuard>,
 }
 
 fn spawn_vm_process(
@@ -358,90 +379,10 @@ fn spawn_vm_process(
     bx.clear_host_pid()
         .context("clearing previous VM identity")?;
     let exe = std::env::current_exe().context("locating the terra binary")?;
-    let mut child_spec = spec.clone();
-    child_spec.host_publishes_pid = matches!(launcher, LauncherConfig::Sandboxed { .. });
-    let json = encode_boot_spec(&child_spec)?;
-    super::resources::prepare_volumes(&child_spec, bx)?;
-    let diagnostics = sys::create_regular_file(&bx.get_dir().join("launcher.log"))
-        .context("opening VM launcher diagnostics")?;
-    let mut inherited_files = Vec::new();
-    let identity = if child_spec.host_publishes_pid {
-        Some(
-            sys::create_regular_file(&bx.get_dir().join(crate::state::HOST_PID_FILE))
-                .context("preparing protected VM identity")?,
-        )
-    } else {
-        None
-    };
-    let mut launch = match launcher {
-        LauncherConfig::Direct => PreparedLaunch::Direct(build_direct_vm_command(&exe, bx)?),
-        LauncherConfig::Custom(init) => {
-            PreparedLaunch::Direct(super::launcher::custom_command(init, &exe, spec, bx)?)
-        }
-        LauncherConfig::Sandboxed {
-            policy,
-            allow_fallback,
-        } => {
-            let validated = sandbox::resolve_policy(policy.as_deref(), *allow_fallback)?;
-            super::launcher::prepare_sandbox_launch(spec, bx, &exe, &validated)?
-        }
-    };
-    let cmd = launch.command_mut();
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(diagnostics);
-    let guard = sys::supervise_vm_child(
-        cmd,
-        spec.foreground || spec.mode == terra_protocol::PlanMode::Create,
-    )?;
-    inherited_files.push(sys::pass_lock(cmd, lock)?);
-    let spawned = launch.spawn(DETACH_READY_DEADLINE);
-    drop(inherited_files);
-    let sandbox::SpawnedLaunch { mut child, pid } = spawned
-        .context("starting the configured VM launcher; check vm.init and launcher diagnostics")?;
-    if let Some(guard) = &guard
-        && let Err(error) = sys::attach_vm_child(guard, &child)
-    {
-        let _ = sys::kill_vm_child(&mut child);
-        let _ = child.wait();
-        return Err(error).context("attaching foreground VM supervision");
-    }
-    if let Some(identity) = identity
-        && let Err(error) = publish_sandbox_pid(pid, bx, lock, &identity, spec.mode)
-    {
-        let _ = kill_and_reap_vm(child);
-        let _ = write_boot_logs(bx, &mut std::io::stderr().lock());
-        return Err(error);
-    }
-    if let Err(error) = send_startup_input(&mut child, json) {
-        let _ = sys::kill_vm_child(&mut child);
-        let _ = child.wait();
-        return Err(error).context("starting process startup writer");
-    }
-    Ok(LaunchedVm {
-        child,
-        _guard: guard,
-    })
+    super::supervisor::spawn(bx, spec, lock, &exe, launcher)
 }
 
-fn build_direct_vm_command(exe: &Path, bx: &BoxRef) -> Result<Command> {
-    let mut command = Command::new(exe);
-    if let Some(directory) = std::env::var_os("TERRA_SYSCALL_TRACE") {
-        let output = tempfile::Builder::new()
-            .prefix("vm-")
-            .suffix(".json")
-            .tempfile_in(directory)?
-            .into_temp_path()
-            .keep()?;
-        command.arg(VM_PROCESS_FLAG_ARG).arg(bx.get_dir());
-        return crate::sandbox::policy::trace_command(&command, &output);
-    }
-    command.arg(VM_PROCESS_FLAG_ARG);
-    command.arg(bx.get_dir());
-    Ok(command)
-}
-
-fn send_startup_input(child: &mut Child, json: Vec<u8>) -> Result<()> {
+pub(super) fn send_startup_input(child: &mut Child, json: Vec<u8>) -> Result<()> {
     let mut stdin = child.stdin.take().context("opening process startup pipe")?;
     std::thread::Builder::new()
         .name("process-startup-input".into())
@@ -454,7 +395,7 @@ fn send_startup_input(child: &mut Child, json: Vec<u8>) -> Result<()> {
     Ok(())
 }
 
-fn publish_sandbox_pid(
+pub(super) fn publish_vm_pid(
     pid: u32,
     bx: &BoxRef,
     lock: &File,
@@ -467,7 +408,9 @@ fn publish_sandbox_pid(
         .with_context(|| format!("publishing host VM identity for {bx}"))
 }
 
-fn start_ready_reader(child: &mut Child) -> Result<std::sync::mpsc::Receiver<Result<bool>>> {
+pub(super) fn start_ready_reader(
+    child: &mut Child,
+) -> Result<std::sync::mpsc::Receiver<Result<bool>>> {
     let ready = child.stdout.take().context("opening VM startup pipe")?;
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::Builder::new()
@@ -587,7 +530,7 @@ fn finish_session(
     }
 }
 
-fn encode_boot_spec(spec: &BootSpec) -> Result<Vec<u8>> {
+pub(super) fn encode_boot_spec(spec: &BootSpec) -> Result<Vec<u8>> {
     let json = serde_json::to_vec(spec).context("encoding the boot for the VM process")?;
     anyhow::ensure!(
         json.len() as u64 <= MAX_BOOT_SPEC_BYTES,
@@ -596,7 +539,7 @@ fn encode_boot_spec(spec: &BootSpec) -> Result<Vec<u8>> {
     Ok(json)
 }
 
-fn read_boot_spec(reader: impl Read) -> Result<BootSpec> {
+pub(super) fn read_boot_spec(reader: impl Read) -> Result<BootSpec> {
     let mut json = Vec::new();
     reader
         .take(MAX_BOOT_SPEC_BYTES + 1)
@@ -616,7 +559,7 @@ fn override_workload(cfg: &mut config::Config, command: &[String]) {
     }
 }
 
-fn write_agent_ready() {
+pub(super) fn write_agent_ready() {
     use std::io::Write as _;
     let mut startup = std::io::stdout().lock();
     let _ = startup
@@ -721,11 +664,7 @@ fn read_log_tail(path: &Path) -> String {
         return String::new();
     }
     // Lossy: the tail starts mid-stream, so it can open inside a character.
-    let text = String::from_utf8_lossy(&tail)
-        .split('\n')
-        .map(crate::render::escape_printable)
-        .collect::<Vec<_>>()
-        .join("\n");
+    let text = crate::render::escape_printable_lines(&String::from_utf8_lossy(&tail));
     if omitted == 0 {
         return text;
     }
@@ -745,7 +684,7 @@ mod tests {
         let bx = BoxRef::from_state_dir(directory.path().to_path_buf(), directory.path());
         let lock = File::create(directory.path().join(crate::state::PID_FILE)).unwrap();
         let identity = File::create(directory.path().join(crate::state::HOST_PID_FILE)).unwrap();
-        publish_sandbox_pid(
+        publish_vm_pid(
             std::process::id(),
             &bx,
             &lock,
@@ -760,7 +699,7 @@ mod tests {
             sys::read_process_start_time(std::process::id())
         );
         assert!(
-            publish_sandbox_pid(
+            publish_vm_pid(
                 u32::MAX,
                 &bx,
                 &lock,

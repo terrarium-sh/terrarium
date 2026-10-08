@@ -11,12 +11,28 @@ use crate::component::block::backing::{DiskGrant, FileDisk};
 use crate::component::context::DeviceContext;
 use crate::memory::{BoundedMemory, GuestRam};
 
+mod agent;
+mod boot;
 mod filesystem;
-mod network;
+pub mod network;
+pub mod network_stream;
 mod vsock;
+
+const FIXTURE_STARTUP_WAIT: Duration = Duration::from_secs(120);
+
+pub struct AgentListeners {
+    pub control: terra_platform::io::local::LocalListener,
+    pub agent: terra_platform::io::local::LocalListener,
+}
 
 pub async fn run_self_test(artifacts: TrustedArtifacts, directory: &Path) -> wasmtime::Result<()> {
     let engine = crate::engine::device_engine()?;
+    boot::run(&artifacts, &engine)
+        .await
+        .map_err(|error| error.context("boot self-test"))?;
+    vsock::run(&artifacts, &engine)
+        .await
+        .map_err(|error| error.context("vsock frontend self-test"))?;
     exercise_storage_and_memory(&artifacts, &engine, directory)
         .await
         .map_err(|error| error.context("storage and memory self-test"))?;
@@ -26,10 +42,59 @@ pub async fn run_self_test(artifacts: TrustedArtifacts, directory: &Path) -> was
     network::run(&artifacts, &engine)
         .await
         .map_err(|error| error.context("network self-test"))?;
-    vsock::run(&artifacts, &engine, directory)
+    agent::run(&artifacts, &engine, directory)
         .await
-        .map_err(|error| error.context("vsock self-test"))?;
+        .map_err(|error| error.context("agent self-test"))?;
     Ok(())
+}
+
+pub async fn run_self_test_with_network(
+    artifacts: TrustedArtifacts,
+    directory: &Path,
+    backend: crate::component::network::NetworkBackend,
+    endpoints: network::Endpoints,
+    agent_listeners: Option<AgentListeners>,
+) -> wasmtime::Result<()> {
+    let engine = crate::engine::device_engine()?;
+    boot::run(&artifacts, &engine)
+        .await
+        .map_err(|error| error.context("boot self-test"))?;
+    vsock::run(&artifacts, &engine)
+        .await
+        .map_err(|error| error.context("vsock frontend self-test"))?;
+    exercise_storage_and_memory(&artifacts, &engine, directory)
+        .await
+        .map_err(|error| error.context("storage and memory self-test"))?;
+    filesystem::run(&artifacts, &engine, directory)
+        .await
+        .map_err(|error| error.context("filesystem self-test"))?;
+    network::run_with_backend(&artifacts, &engine, backend, endpoints)
+        .await
+        .map_err(|error| error.context("network self-test"))?;
+    agent::run_with_external_clients(&artifacts, &engine, directory, agent_listeners)
+        .await
+        .map_err(|error| error.context("agent self-test"))
+}
+
+pub fn run_agent_clients(directory: &Path) -> wasmtime::Result<()> {
+    agent::run_clients(directory)
+}
+
+pub async fn run_self_test_local_only(
+    artifacts: TrustedArtifacts,
+    directory: &Path,
+    agent_listeners: Option<AgentListeners>,
+) -> wasmtime::Result<()> {
+    let engine = crate::engine::device_engine()?;
+    boot::run(&artifacts, &engine)
+        .await
+        .map_err(|error| error.context("boot self-test"))?;
+    vsock::run(&artifacts, &engine)
+        .await
+        .map_err(|error| error.context("vsock frontend self-test"))?;
+    exercise_storage_and_memory(&artifacts, &engine, directory).await?;
+    filesystem::run(&artifacts, &engine, directory).await?;
+    agent::run_with_external_clients(&artifacts, &engine, directory, agent_listeners).await
 }
 
 const DESCRIPTORS: u64 = 0x1000;
@@ -157,7 +222,7 @@ async fn exercise_storage_and_memory(
     let memory_ram = GuestRam::new(128 * 1024)
         .ok_or_else(|| wasmtime::Error::msg("allocating memory self-test memory"))?;
     let mut runtime = BoxRuntime::new(engine, BoxHost::new())?;
-    runtime.initialize_mmio_artifact(artifacts).await?;
+    runtime.initialize_mmio()?;
     let block = crate::component::block::register_device(
         &mut runtime,
         crate::component::block::BlockHost::new(
@@ -235,5 +300,50 @@ mod tests {
         super::run_self_test(crate::test_fixtures::trusted_artifacts(), directory.path())
             .await
             .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_uses_trusted_listeners_without_binding_in_the_vm() {
+        use terra_platform::io::local::LocalListener;
+
+        let directory = tempfile::tempdir().unwrap();
+        let listeners = super::AgentListeners {
+            control: LocalListener::bind(directory.path().join("agent-control.sock")).unwrap(),
+            agent: LocalListener::bind(directory.path().join("agent-agent.sock")).unwrap(),
+        };
+        let client_directory = directory.path().to_owned();
+        let clients =
+            tokio::task::spawn_blocking(move || super::run_agent_clients(&client_directory));
+        super::agent::run_with_external_clients(
+            &crate::test_fixtures::trusted_artifacts(),
+            &crate::engine::device_engine().unwrap(),
+            &directory.path().join("absent-directory"),
+            Some(listeners),
+        )
+        .await
+        .unwrap();
+        clients.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn local_only_devices_run_without_a_network_backend() {
+        use terra_platform::io::local::LocalListener;
+
+        let directory = tempfile::tempdir().unwrap();
+        let listeners = super::AgentListeners {
+            control: LocalListener::bind(directory.path().join("agent-control.sock")).unwrap(),
+            agent: LocalListener::bind(directory.path().join("agent-agent.sock")).unwrap(),
+        };
+        let client_directory = directory.path().to_owned();
+        let clients =
+            tokio::task::spawn_blocking(move || super::run_agent_clients(&client_directory));
+        super::run_self_test_local_only(
+            crate::test_fixtures::trusted_artifacts(),
+            directory.path(),
+            Some(listeners),
+        )
+        .await
+        .unwrap();
+        clients.await.unwrap().unwrap();
     }
 }

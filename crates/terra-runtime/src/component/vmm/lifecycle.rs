@@ -90,6 +90,7 @@ impl LifecycleHost {
     > + Send
     + use<> {
         let mut receiver = self.sender.event.subscribe();
+        let notifier = self.sender.clone();
         async move {
             let event = receiver
                 .wait_for(Option::is_some)
@@ -98,7 +99,12 @@ impl LifecycleHost {
                 .ok_or_else(|| wasmtime::Error::msg("lifecycle event missing"))?;
             Ok(Ok(match event {
                 Event::GuestExit(code) => lifecycle_platform::Event::GuestExit(code),
-                Event::ComponentFailed => lifecycle_platform::Event::ComponentFailed,
+                Event::ComponentFailed => lifecycle_platform::Event::ComponentFailed(
+                    notifier
+                        .native_failure()
+                        .unwrap_or("component failed")
+                        .to_owned(),
+                ),
                 Event::Deadline => lifecycle_platform::Event::Deadline,
             }))
         }
@@ -114,6 +120,10 @@ impl Default for LifecycleHost {
 impl LifecycleNotifier {
     pub fn agent_ready(&self) {
         self.ready.send_replace(true);
+    }
+
+    pub fn agent_disconnected(&self) {
+        self.ready.send_replace(false);
     }
 
     #[must_use]
@@ -268,7 +278,11 @@ pub(super) fn create_component_loop(
             let (result,) = function.call_concurrent(accessor, ()).await?;
             let outcome = match result {
                 Ok(lifecycle_platform::Event::GuestExit(code)) => Outcome::GuestExit(code),
-                Ok(lifecycle_platform::Event::ComponentFailed) => Outcome::ComponentFailed,
+                Ok(lifecycle_platform::Event::ComponentFailed(error)) => {
+                    lifecycle.native_failed(&error);
+                    lifecycle.publish_outcome(Outcome::ComponentFailed);
+                    return Err(wasmtime::Error::msg(error));
+                }
                 Ok(lifecycle_platform::Event::VcpuFinished) => Outcome::VcpuFinished,
                 Ok(lifecycle_platform::Event::Deadline) => Outcome::Deadline,
                 Err(error) => {

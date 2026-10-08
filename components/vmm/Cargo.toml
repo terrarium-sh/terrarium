@@ -11,5 +11,5 @@ crate-type = ["cdylib"]
 
 [dependencies]
 futures-util = { version = "0.3", default-features = false, features = ["alloc", "std"] }
-wit-bindgen = { workspace = true, features = ["async-spawn", "inter-task-wakeup"] }
+wit-bindgen.workspace = true
 terra-limits = { path = "../../crates/terra-limits" }

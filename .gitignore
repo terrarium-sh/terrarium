@@ -14,3 +14,6 @@
 # Preserved performance baselines survive make clean.
 /performance-baselines/
 __pycache__/
+/.agents/
+/.codex/
+/.aws/

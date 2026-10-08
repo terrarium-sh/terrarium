@@ -5,4 +5,4 @@ wasmtime::component::bindgen!({
     path: "../../components/wit/terra",
 });
 
-pub use terra::host::{diagnostics, interrupt, memory};
+pub use terra::host::{interrupt, memory};

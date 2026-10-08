@@ -3,7 +3,8 @@ use std::os::unix::fs::{MetadataExt as _, symlink as symlink_file};
 #[cfg(windows)]
 use std::os::windows::fs::symlink_file;
 
-use wasmtime::component::Resource;
+use super::bindings::wit::fs::host::HostWithStore as _;
+use wasmtime::component::{HasSelf, Resource};
 use wasmtime_wasi::{
     WasiView,
     filesystem::{Descriptor, FsPerms, WasiFilesystem, WasiFilesystemView},
@@ -18,6 +19,44 @@ use crate::component::fs::{FsHost, ShareGrant};
 
 fn host(grant: ShareGrant) -> FsHost {
     FsHost::new(DeviceContext::new(4096).unwrap(), grant)
+}
+
+#[tokio::test]
+async fn shares_report_filesystem_statistics() {
+    let root = tempfile::tempdir().unwrap();
+    let engine = crate::engine::device_engine().unwrap();
+    for readonly in [false, true] {
+        let mut fs = host(ShareGrant::new(root.path(), readonly).unwrap());
+        let descriptor = fs.get_directories().unwrap().remove(0).0;
+        let mut store = wasmtime::Store::new(&engine, fs);
+        let stat = store
+            .run_concurrent(async |accessor| {
+                let host = accessor.with_getter::<HasSelf<FsHost>>(|host| host);
+                HasSelf::<FsHost>::statfs(&host, Resource::new_borrow(descriptor.rep())).await
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(stat.blocks, 0);
+        assert_ne!(stat.block_size, 0);
+        assert_ne!(stat.name_max, 0);
+    }
+}
+
+#[tokio::test]
+async fn filesystem_statistics_reject_unknown_descriptors() {
+    let root = tempfile::tempdir().unwrap();
+    let fs = host(ShareGrant::new(root.path(), true).unwrap());
+    let engine = crate::engine::device_engine().unwrap();
+    let mut store = wasmtime::Store::new(&engine, fs);
+    let stat = store
+        .run_concurrent(async |accessor| {
+            let host = accessor.with_getter::<HasSelf<FsHost>>(|host| host);
+            HasSelf::<FsHost>::statfs(&host, Resource::new_borrow(u32::MAX)).await
+        })
+        .await
+        .unwrap();
+    assert!(stat.is_err());
 }
 
 #[tokio::test]
@@ -254,53 +293,54 @@ async fn mode_capability_changes_writable_files_and_rejects_readonly_files() {
             })
             .await
             .unwrap();
-        let result = store
-            .data_mut()
-            .set_mode_for_descriptor(&Resource::new_borrow(descriptor), 0o7600);
-        assert_eq!(result.is_ok(), !readonly);
-        #[cfg(windows)]
-        {
-            assert_eq!(
-                store
-                    .data_mut()
-                    .mode_for_descriptor(&Resource::new_borrow(descriptor))
-                    .unwrap(),
-                Some(0o100_755)
-            );
-            if !readonly {
-                store
-                    .data_mut()
-                    .set_mode_for_descriptor(&Resource::new_borrow(descriptor), 0o444)
-                    .unwrap();
-                assert_eq!(
-                    store
-                        .data_mut()
-                        .mode_for_descriptor(&Resource::new_borrow(descriptor))
-                        .unwrap(),
-                    Some(0o100_555)
-                );
-                store
-                    .data_mut()
-                    .set_mode_for_descriptor(&Resource::new_borrow(descriptor), 0o644)
-                    .unwrap();
-                assert_eq!(
-                    store
-                        .data_mut()
-                        .mode_for_descriptor(&Resource::new_borrow(descriptor))
-                        .unwrap(),
-                    Some(0o100_755)
-                );
-            }
-        }
-        if !readonly && cfg!(unix) {
-            assert_eq!(
-                store
-                    .data_mut()
-                    .mode_for_descriptor(&Resource::new_borrow(descriptor))
-                    .unwrap(),
-                Some(0o100_600)
-            );
-        }
+        store
+            .run_concurrent(async |accessor| {
+                let host = accessor.with_getter::<HasSelf<FsHost>>(|host| host);
+                let result =
+                    HasSelf::<FsHost>::set_mode(&host, Resource::new_borrow(descriptor), 0o7600)
+                        .await;
+                assert_eq!(result.is_ok(), !readonly);
+                #[cfg(windows)]
+                {
+                    assert_eq!(
+                        HasSelf::<FsHost>::get_mode(&host, Resource::new_borrow(descriptor))
+                            .await
+                            .unwrap(),
+                        Some(0o100_755)
+                    );
+                    if !readonly {
+                        HasSelf::<FsHost>::set_mode(&host, Resource::new_borrow(descriptor), 0o444)
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            HasSelf::<FsHost>::get_mode(&host, Resource::new_borrow(descriptor))
+                                .await
+                                .unwrap(),
+                            Some(0o100_555)
+                        );
+                        HasSelf::<FsHost>::set_mode(&host, Resource::new_borrow(descriptor), 0o644)
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            HasSelf::<FsHost>::get_mode(&host, Resource::new_borrow(descriptor))
+                                .await
+                                .unwrap(),
+                            Some(0o100_755)
+                        );
+                    }
+                }
+                #[cfg(unix)]
+                if !readonly {
+                    assert_eq!(
+                        HasSelf::<FsHost>::get_mode(&host, Resource::new_borrow(descriptor))
+                            .await
+                            .unwrap(),
+                        Some(0o100_600)
+                    );
+                }
+            })
+            .await
+            .unwrap();
     }
 }
 

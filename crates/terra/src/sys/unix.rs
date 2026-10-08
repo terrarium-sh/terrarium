@@ -4,6 +4,7 @@ use std::io::Result;
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use terra_platform::process::{VmChildGuard, pass_descriptor};
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -109,60 +110,9 @@ pub fn allocated_size(_path: &Path, metadata: &std::fs::Metadata) -> u64 {
     metadata.blocks() * 512
 }
 
-/// Restrict an existing path to its owner: `0700` for a directory, `0600` for a
-/// file.
-pub fn set_owner_only(path: &Path, dir: bool) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mode = if dir { 0o700 } else { 0o600 };
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
-}
-
-#[allow(unsafe_code)]
-pub fn detach(cmd: &mut Command) {
-    use std::os::unix::process::CommandExt;
-    // SAFETY: setsid is async-signal-safe between fork and exec.
-    unsafe {
-        cmd.pre_exec(|| {
-            rustix::process::setsid()
-                .map(|_| ())
-                .map_err(std::io::Error::from)
-        });
-    }
-}
-
 /// The descriptor a boot hands its VM process the box's run lock on, already
 /// held.
 const LOCK_FD: std::os::fd::RawFd = 3;
-
-#[allow(unsafe_code)]
-fn duplicate_above_handoff(file: &File) -> Result<File> {
-    use std::os::fd::{AsRawFd, FromRawFd};
-    // SAFETY: fcntl duplicates an open descriptor; File takes ownership only on success.
-    let fd = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 16) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: successful fcntl returned a new descriptor owned only here.
-    Ok(unsafe { File::from_raw_fd(fd) })
-}
-
-#[allow(unsafe_code)]
-pub(crate) fn pass_descriptor(cmd: &mut Command, file: &File, target: i32) -> Result<File> {
-    use std::os::fd::AsRawFd;
-    use std::os::unix::process::CommandExt;
-    let inherited = duplicate_above_handoff(file)?;
-    let source = inherited.as_raw_fd();
-    // SAFETY: dup2 is async-signal-safe between fork and exec; source remains open until spawn.
-    unsafe {
-        cmd.pre_exec(move || {
-            if libc::dup2(source, target) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    Ok(inherited)
-}
 
 /// Hand `lock` to the spawned child as [`LOCK_FD`]. A duplicate descriptor
 /// holds the same `flock`, released only when every one of them closes.
@@ -170,103 +120,109 @@ pub fn pass_lock(cmd: &mut Command, lock: &File) -> Result<File> {
     pass_descriptor(cmd, lock, LOCK_FD)
 }
 
-pub struct VmChildGuard {
-    _write: File,
-    _read: File,
-}
-
+#[cfg(target_os = "linux")]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "other platforms retain a parent guard"
+)]
 #[allow(unsafe_code)]
-pub fn supervise_vm_child(cmd: &mut Command, foreground: bool) -> Result<Option<VmChildGuard>> {
-    use std::os::fd::{AsRawFd, FromRawFd};
+pub(crate) fn supervise_supervisor_child(
+    command: &mut Command,
+    die_with_parent: bool,
+) -> Result<Option<VmChildGuard>> {
     use std::os::unix::process::CommandExt;
-    if !foreground {
-        detach(cmd);
-        return Ok(None);
-    }
-    detach(cmd);
-    let mut ends = [0; 2];
-    // SAFETY: pipe initializes both integer descriptors on success.
-    if unsafe { libc::pipe(ends.as_mut_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: successful pipe returned two distinct owned descriptors.
-    let read = unsafe { File::from_raw_fd(ends[0]) };
-    // SAFETY: the write descriptor is the other owned pipe endpoint.
-    let write = unsafe { File::from_raw_fd(ends[1]) };
-    rustix::io::fcntl_setfd(&read, rustix::io::FdFlags::CLOEXEC).map_err(std::io::Error::from)?;
-    rustix::io::fcntl_setfd(&write, rustix::io::FdFlags::CLOEXEC).map_err(std::io::Error::from)?;
-    let inherited_read = duplicate_above_handoff(&read)?;
-    let inherited_write = duplicate_above_handoff(&write)?;
-    let read_fd = inherited_read.as_raw_fd();
-    let write_fd = inherited_write.as_raw_fd();
-    #[cfg(target_os = "linux")]
-    // SAFETY: getpid reads the current process identity without pointers.
-    let parent_pid = unsafe { libc::getpid() };
-    // SAFETY: getdtablesize reads the current descriptor limit without pointers.
-    let max_fd = unsafe { libc::getdtablesize() };
-    // SAFETY: fork, close, read, kill, and _exit are async-signal-safe after Command's fork.
-    unsafe {
-        cmd.pre_exec(move || {
-            #[cfg(target_os = "linux")]
-            {
+    terra_platform::process::detach(command);
+    if die_with_parent {
+        // SAFETY: getpid and the child callback's prctl/getppid calls use no pointers or allocations.
+        unsafe {
+            let parent = libc::getpid();
+            command.pre_exec(move || {
                 if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
-                if libc::getppid() != parent_pid {
+                if libc::getppid() != parent {
                     return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
                 }
-            }
-            let watchdog = libc::fork();
-            if watchdog < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if watchdog == 0 {
-                for fd in 0..max_fd {
-                    if fd != read_fd {
-                        libc::close(fd);
-                    }
-                }
-                let mut byte = 0_u8;
-                loop {
-                    let count = libc::read(read_fd, (&raw mut byte).cast(), 1);
-                    if count == 0 {
-                        libc::kill(-libc::getpgrp(), libc::SIGKILL);
-                        libc::_exit(0);
-                    }
-                    if count < 0 {
-                        libc::_exit(1);
-                    }
-                }
-            }
-            libc::close(read_fd);
-            libc::close(write_fd);
-            Ok(())
-        });
+                Ok(())
+            });
+        }
     }
-    Ok(Some(VmChildGuard {
-        _write: inherited_write,
-        _read: inherited_read,
-    }))
+    Ok(None)
 }
 
-#[allow(clippy::unnecessary_wraps, reason = "matches fallible Windows setup")]
-pub fn attach_vm_child(_guard: &VmChildGuard, _child: &std::process::Child) -> Result<()> {
-    Ok(())
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn supervise_supervisor_child(
+    command: &mut Command,
+    die_with_parent: bool,
+) -> Result<Option<VmChildGuard>> {
+    terra_platform::process::supervise_vm_child(command, die_with_parent)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn pass_listener(
+    command: &mut Command,
+    listener: &std::os::unix::net::UnixListener,
+    target: i32,
+) -> Result<std::os::unix::net::UnixListener> {
+    Ok(std::os::unix::net::UnixListener::from(
+        std::os::fd::OwnedFd::from(pass_descriptor(command, listener, target)?),
+    ))
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+pub(crate) fn claim_listener(
+    descriptor: i32,
+    expected: &Path,
+) -> Result<std::os::unix::net::UnixListener> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: fcntl checks the inherited descriptor before ownership is claimed.
+    if unsafe { libc::fcntl(descriptor, libc::F_GETFD) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the supervisor transfers this prebound listener exclusively to the worker.
+    let listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(descriptor) };
+    if rustix::net::sockopt::socket_type(&listener).map_err(std::io::Error::from)?
+        != rustix::net::SocketType::STREAM
+        || listener.local_addr()?.as_pathname() != Some(expected)
+    {
+        return Err(std::io::Error::other(
+            "inherited listener does not match its grant",
+        ));
+    }
+    rustix::io::fcntl_setfd(&listener, rustix::io::FdFlags::CLOEXEC)
+        .map_err(std::io::Error::from)?;
+    Ok(listener)
 }
 
 #[allow(unsafe_code)]
-pub fn kill_vm_child(child: &mut std::process::Child) -> Result<()> {
-    let pid = i32::try_from(child.id()).map_err(std::io::Error::other)?;
-    // SAFETY: an unreaped child cannot have its PID reused; signal the group only if it owns it.
-    let group = unsafe { libc::getpgid(pid) };
-    if group == pid {
-        // SAFETY: the unreaped child is the group leader, so its PID cannot be reused.
-        if unsafe { libc::kill(-pid, libc::SIGKILL) } == 0 {
-            return Ok(());
+pub(crate) fn close_unrelated_descriptors(kept: &[i32]) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    let descriptors = std::fs::read_dir("/proc/self/fd")?
+        .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().parse::<i32>().ok()))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    #[cfg(not(target_os = "linux"))]
+    // SAFETY: getdtablesize reads the descriptor limit without pointers.
+    let descriptors = {
+        let max_fd = unsafe { libc::getdtablesize() };
+        if max_fd < 0 {
+            return Err(std::io::Error::last_os_error());
         }
-        return Err(std::io::Error::last_os_error());
+        (3..max_fd).collect::<Vec<_>>()
+    };
+    for descriptor in descriptors
+        .into_iter()
+        .filter(|fd| *fd > 2 && !kept.contains(fd))
+    {
+        // SAFETY: role dispatch runs before threads and closes only unrelated inherited descriptors.
+        unsafe {
+            libc::close(descriptor);
+        }
     }
-    child.kill()
+    Ok(())
 }
 
 /// The run lock a boot passed down, or `None` when [`LOCK_FD`] is not the file
@@ -463,7 +419,7 @@ pub fn register_stop_channel(channel: std::os::fd::OwnedFd) {
 
 /// SIGINT/SIGTERM/SIGHUP ask the guest for its graceful stop - a host
 /// shutdown and a closed `--foreground` terminal included. Detached boxes
-/// hear none of this: [`detach`] starts a session without a controlling terminal.
+/// hear none of this: [`detach`](terra_platform::process::detach) starts a session without a controlling terminal.
 #[allow(unsafe_code)]
 pub fn install_stop_signal_handlers() {
     // SAFETY: `handler` does atomic stores and one `write`, both

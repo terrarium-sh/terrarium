@@ -83,9 +83,7 @@ MemoryDenyWriteExecute=no
 PrivateNetwork=false
 
 # --- Optional hardening (safe additions) ----------------------------------
-# The address families terra and its gateway actually use: AF_UNIX for every
-# socket bridge (vsock ports, virtio-net), INET/INET6 for terminating guest
-# traffic. No netlink: the gateway sets interface flags by ioctl, by design.
+# Local IPC uses AF_UNIX; the confined network broker uses INET/INET6.
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 CapabilityBoundingSet=
 LockPersonality=true

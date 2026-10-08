@@ -4,20 +4,12 @@ use wasmtime::{Config, Engine};
 
 /// Engine for device stores with epoch interruption and async components.
 pub fn device_engine() -> wasmtime::Result<Engine> {
-    configured_device_engine(false)
-}
-
-pub fn policy_engine() -> wasmtime::Result<Engine> {
-    configured_device_engine(true)
-}
-
-fn configured_device_engine(fuel: bool) -> wasmtime::Result<Engine> {
     let mut config = Config::new();
-    apply_device_settings(&mut config, fuel)?;
+    apply_device_settings(&mut config)?;
     Engine::new(&config)
 }
 
-fn apply_device_settings(config: &mut Config, fuel: bool) -> wasmtime::Result<()> {
+fn apply_device_settings(config: &mut Config) -> wasmtime::Result<()> {
     // An explicit host triple disables Wasmtime's CPU feature inference, so
     // embedded AOT components load on any host of the build architecture
     // instead of only hosts matching the build machine's CPU.
@@ -25,7 +17,6 @@ fn apply_device_settings(config: &mut Config, fuel: bool) -> wasmtime::Result<()
     #[cfg(feature = "thread-experiments")]
     config.wasm_threads(false);
     config
-        .consume_fuel(fuel)
         .epoch_interruption(true)
         .shared_memory(false)
         .wasm_memory64(false)
@@ -63,7 +54,7 @@ mod tests {
         let producer = super::device_engine().expect("engine");
         let artifact = super::precompile_component(&producer, b"(component)").expect("compiles");
         let mut config = wasmtime::Config::new();
-        super::apply_device_settings(&mut config, false).expect("settings");
+        super::apply_device_settings(&mut config).expect("settings");
         // SAFETY: the probe only gates ISA flags recorded in the artifact, and
         // denying every feature is exactly a host weaker than the producer's.
         unsafe {

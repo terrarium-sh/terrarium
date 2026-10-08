@@ -34,6 +34,23 @@ fn parse_port_mappings_and_reject_invalid_entries() {
         .to_string();
     assert!(err.contains("already carries"), "{err}");
     assert!(parse_port_mappings(&["8080:80".into(), "8081:80".into()]).is_ok());
+    let mappings = parse_port_mappings(&["8080:80/tcp".into(), "8080:53/udp".into()]).unwrap();
+    assert_eq!(
+        mappings[0].transport,
+        terra_protocol::network::ResourceKind::Tcp
+    );
+    assert_eq!(
+        mappings[1].transport,
+        terra_protocol::network::ResourceKind::Udp
+    );
+    assert_eq!(mappings[1].guest, 53);
+    for ports in [
+        vec!["8080/udp".into(), "8080:53/udp".into()],
+        vec!["8080/sctp".into()],
+        vec!["8080/udp/udp".into()],
+    ] {
+        assert!(parse_port_mappings(&ports).is_err());
+    }
 
     let refused = crate::config::parse_recipe(
         "network:\n  ports: [\"8080\", \"8080:90\"]\n",
@@ -43,6 +60,29 @@ fn parse_port_mappings_and_reject_invalid_entries() {
     .unwrap_err()
     .to_string();
     assert!(refused.contains("already carries"), "{refused}");
+}
+
+#[test]
+fn published_mapping_limit_counts_host_listeners_even_for_one_guest_port() {
+    let mut ports = (1..=terra_protocol::MAX_PUBLISHED_PORTS)
+        .map(|host| format!("{host}:80"))
+        .collect::<Vec<_>>();
+    assert!(parse_port_mappings(&ports).is_ok());
+    ports.push("1:80/udp".into());
+    let limit = format!("at most {}", terra_protocol::MAX_PUBLISHED_PORTS);
+    let error = parse_port_mappings(&ports).unwrap_err();
+    assert!(error.to_string().contains(&limit), "{error}");
+    let yaml = format!(
+        "network:\n  ports: {}",
+        serde_json::to_string(&ports).unwrap()
+    );
+    let error = crate::config::parse_recipe(
+        &yaml,
+        std::path::Path::new("/proj"),
+        std::path::Path::new("/proj/r.yaml"),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains(&limit), "{error}");
 }
 
 /// The banner tells the truth about the posture - including that records
@@ -73,57 +113,4 @@ fn describe_names_the_posture() {
     );
     closed.allow = vec!["db.local:5432".into()];
     assert_eq!(describe(&closed), "allowlist active (deny by default)");
-}
-
-#[test]
-fn decision_logs_preserve_address_and_optional_port() {
-    use super::runtime::BoxPolicy;
-    use terra_runtime::component::network::Policy;
-
-    struct Capture(std::sync::Mutex<Vec<String>>);
-    impl log::Log for Capture {
-        fn enabled(&self, _: &log::Metadata<'_>) -> bool {
-            true
-        }
-        fn log(&self, record: &log::Record<'_>) {
-            let message = record.args().to_string();
-            if message.contains("8.8.4.4") {
-                self.0.lock().unwrap().push(message);
-            }
-        }
-        fn flush(&self) {}
-    }
-    static CAPTURE: Capture = Capture(std::sync::Mutex::new(Vec::new()));
-    log::set_logger(&CAPTURE).unwrap();
-    log::set_max_level(log::LevelFilter::Trace);
-    let ip = "8.8.4.4".parse().unwrap();
-    let denied = BoxPolicy::new(&build_network(NetworkMode::Allowlist, &[])).unwrap();
-    let allowed = BoxPolicy::new(&build_network(NetworkMode::UnrestrictedPublic, &[])).unwrap();
-    for port in [None, Some(443)] {
-        assert!(allowed.allows(ip, port));
-        assert!(!denied.allows(ip, port));
-    }
-    assert!(matches!(
-        denied.lookup_name("8.8.4.4\nforged"),
-        terra_runtime::component::network::NameLookup::Denied
-    ));
-    let messages = CAPTURE.0.lock().unwrap();
-    assert!(messages.iter().all(|message| !message.contains('\n')));
-    assert!(
-        messages
-            .iter()
-            .any(|message| message.contains("8.8.4.4\\nforged"))
-    );
-
-    for expected in [
-        "allowed 8.8.4.4",
-        "allowed 8.8.4.4:443",
-        "blocked 8.8.4.4 -",
-        "blocked 8.8.4.4:443 -",
-    ] {
-        assert!(
-            messages.iter().any(|message| message.contains(expected)),
-            "{expected}: {messages:?}"
-        );
-    }
 }

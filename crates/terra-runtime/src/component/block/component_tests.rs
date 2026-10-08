@@ -2,7 +2,7 @@
 
 use crate::component::StandaloneDevice;
 use crate::component::block::BlockHost;
-use crate::component::block::backing::{BoundedDisk, DiskGrant};
+use crate::component::block::backing::{BlockBacking, BoundedDisk, DiskGrant};
 use crate::engine::{device_engine, precompile_component};
 use crate::memory::{BoundedMemory, GuestRam, MemoryError};
 use std::sync::Arc;
@@ -148,7 +148,11 @@ impl Fixture {
         let expected = self.used.wrapping_add(1).to_le_bytes();
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while self.read(USED + 2, 2).unwrap() != expected {
-                assert!(self.device.failure().is_none());
+                assert!(
+                    self.device.failure().is_none(),
+                    "{:?}",
+                    self.device.failure()
+                );
                 tokio::task::yield_now().await;
             }
         })
@@ -178,7 +182,7 @@ async fn fixture(capacity_sectors: usize, readonly: bool) -> Fixture {
     let engine = device_engine().expect("engine builds");
     let mut disk = BoundedDisk::new(capacity_sectors * 512, readonly);
     if !readonly {
-        disk.write(3 * 512, &[0xAB; 512]).ok();
+        disk.write_at(3 * 512, &[0xAB; 512]).ok();
     }
     let component = Component::new(&engine, crate::test_fixtures::wasm::BLOCK)
         .expect("block component compiles");
@@ -724,7 +728,7 @@ async fn component_operates_on_shared_machine_ram() {
     let engine = device_engine().expect("engine builds");
     let mem = GuestMemory::allocate(RAM).expect("maps");
     let mut disk = BoundedDisk::new(8 * 512, false);
-    disk.write(2 * 512, &[0x5E; 512]).expect("pattern in");
+    disk.write_at(2 * 512, &[0x5E; 512]).expect("pattern in");
     let component =
         Component::new(&engine, crate::test_fixtures::wasm::BLOCK).expect("component compiles");
     let mut fixture = fixture_with_host(

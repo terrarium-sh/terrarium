@@ -46,8 +46,10 @@ What each option means from inside the sandbox:
 
 Egress policy: {egress}.
 
-- Guest address `{ip}/{prefix}`, gateway `{gw}`, DNS `{dns}`.
-- All traffic goes through a filtering gateway; there is no other route out.
+- {network_mode}
+- Guest localhost, Unix sockets and guest-local network routes stay inside this
+  VM. Guest localhost identifies this VM; host loopback requires an explicit
+  `HOST_LOOPBACK` grant.
 - IPs collected from host interfaces at VM startup, including public IPs, and
   private address ranges require explicit `allow` rules.
   `HOST_LOOPBACK` in `allow` grants access to services on the host's loopback

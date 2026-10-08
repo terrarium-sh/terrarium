@@ -6,12 +6,15 @@ package terra:host@0.1.0;
 /// a disk, VM, interrupt line, or foreign resource table.
 interface memory {
     record read-range { offset: u64, len: u64 }
+    record write-range { offset: u64, data: list<u8> }
     /// One bounded guest-physical copy. Offsets and lengths are checked
     /// for arithmetic overflow, mapped RAM regions, holes, and aggregate
     /// batch limits before anything is allocated or copied.
     read: func(offset: u64, len: u64) -> result<list<u8>, memory-error>;
     read-ranges: func(ranges: list<read-range>) -> result<list<u8>, memory-error>;
     write: func(offset: u64, data: list<u8>) -> result<_, memory-error>;
+    /// Validate the whole bounded batch, then write in order with a release fence before each range.
+    write-ranges: func(ranges: list<write-range>) -> result<_, memory-error>;
     address-limit: func() -> u64;
     enum memory-error { out-of-range, too-large, unmapped }
 }
@@ -21,10 +24,6 @@ interface interrupt {
     /// native side coalesces and rate-bounds.
     signal: func();
     set-level: func(level: bool);
-}
-
-interface diagnostics {
-    event: func(message: string);
 }
 
 interface device-api {
@@ -45,13 +44,12 @@ interface disk {
     discard: async func(offset: u64, len: u64) -> result<_, disk-error>;
     sync: async func() -> result<_, disk-error>;
     capacity: func() -> u64;
-    enum disk-error { out-of-range, readonly, io, too-large, busy }
+    enum disk-error { out-of-range, readonly, io, too-large }
 }
 
 world host-interfaces {
     import memory;
     import interrupt;
-    import diagnostics;
 }
 
 world block-device {

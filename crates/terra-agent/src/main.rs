@@ -17,6 +17,8 @@ mod mutex;
 #[cfg(target_os = "linux")]
 mod mux;
 #[cfg(target_os = "linux")]
+mod network;
+#[cfg(target_os = "linux")]
 mod reap;
 #[cfg(target_os = "linux")]
 mod sync;
@@ -25,10 +27,10 @@ mod term {
     pub mod session;
     pub mod tty;
 }
+#[cfg(target_os = "linux")]
+mod channel;
 #[cfg(all(test, target_os = "linux"))]
 mod tests;
-#[cfg(target_os = "linux")]
-mod vsock;
 #[cfg(target_os = "linux")]
 mod workload;
 
@@ -118,6 +120,7 @@ async fn run_agent(
         shutdown.clone(),
     ));
     diagnostic.record(b"agent received boot plan");
+    diagnostic.record_boot_stage("boot_plan_received");
     let outcome = workload::execute(
         plan,
         control,

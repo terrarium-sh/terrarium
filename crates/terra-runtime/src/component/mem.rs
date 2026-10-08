@@ -32,12 +32,12 @@ async fn configure_device<T: Send + 'static>(
     interrupt: InterruptCallback,
 ) -> wasmtime::Result<(MemComponent, DeviceLoop<MemDeviceError>)> {
     let instance = MemComponent::instantiate_async(&mut *store, component, linker).await?;
-    let transport = instance.terra_mem_transport();
-    let configure = transport.func_configure();
-    let (configured,) = configure.call_async(&mut *store, ()).await?;
+    let api = instance.terra_host_device_api();
+    let configure = api.func_configure();
+    let (configured,) = configure.call_async(&mut *store, (false,)).await?;
     configured.map_err(|error| transport_error("configure", error))?;
     let device_loop = DeviceLoop {
-        run: transport.func_run(),
+        run: api.func_run(),
         interrupt,
     };
     Ok((instance, device_loop))
@@ -52,7 +52,7 @@ pub(crate) async fn instantiate(
 ) -> wasmtime::Result<crate::component::StandaloneDevice> {
     let mut runtime =
         crate::box_runtime::BoxRuntime::new(engine, crate::box_runtime::store::BoxHost::new())?;
-    crate::component::mmio::initialize_test_mmio(&mut runtime).await?;
+    crate::component::mmio::initialize_test_mmio(&mut runtime)?;
     let channel = register_device(&mut runtime, host, component, interrupt)?;
     Ok(crate::component::StandaloneDevice {
         _runtime: Arc::new(runtime.prepare().await?.start()),
@@ -145,9 +145,7 @@ mod tests {
         let mut runtime =
             crate::box_runtime::BoxRuntime::new(&engine, crate::box_runtime::store::BoxHost::new())
                 .expect("box runtime");
-        crate::component::mmio::initialize_test_mmio(&mut runtime)
-            .await
-            .expect("MMIO service");
+        crate::component::mmio::initialize_test_mmio(&mut runtime).expect("MMIO service");
         let interrupts = Arc::new(tokio::sync::Notify::new());
         let notification = Arc::clone(&interrupts);
         let channel = crate::component::mem::register_device(

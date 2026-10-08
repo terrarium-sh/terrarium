@@ -269,6 +269,7 @@ pub fn request_recipe_approval(
         mode: terra_protocol::PlanMode::Run,
         foreground: false,
         host_publishes_pid: false,
+        network_broker: None,
     })?;
     Ok(ApprovedRecipe {
         bx,

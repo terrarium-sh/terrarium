@@ -30,7 +30,7 @@ struct Controller {
 
 impl Controller {
     fn new(config: Config) -> Result<Self, Error> {
-        if config.routes.len() > terra_limits::MAX_DEVICES || config.vcpus == 0 {
+        if config.routes.len() > terra_limits::MAX_DEVICES {
             return Err(Error::InvalidSlot);
         }
         let routes = config
@@ -62,7 +62,10 @@ impl Controller {
             return Err(Error::InvalidState);
         }
         if width != 4 {
-            return Err(Error::BadWidth);
+            return Ok(IoapicReply {
+                value: 0,
+                interrupts: Vec::new(),
+            });
         }
         match (offset, write) {
             (REGISTER_SELECT, false) => Ok(IoapicReply {
@@ -89,7 +92,10 @@ impl Controller {
                     .into_iter()
                     .collect(),
             }),
-            _ => Err(Error::Unmapped),
+            _ => Ok(IoapicReply {
+                value: 0,
+                interrupts: Vec::new(),
+            }),
         }
     }
 
@@ -125,23 +131,6 @@ impl Controller {
         Ok((Some(change), interrupts))
     }
 
-    fn clear(&mut self) -> Result<Vec<IrqLevel>, Error> {
-        if self.mode != Mode::IrqLines {
-            return Err(Error::InvalidState);
-        }
-        let mut changes = Vec::new();
-        for slot in 0..self.levels.len() {
-            if self.levels[slot] {
-                let (change, _) =
-                    self.line(u8::try_from(slot).map_err(|_| Error::InvalidSlot)?, false)?;
-                if let Some(change) = change {
-                    changes.push(change);
-                }
-            }
-        }
-        Ok(changes)
-    }
-
     fn eoi(&self, vector: u8) -> Result<Vec<X86Interrupt>, Error> {
         if self.mode != Mode::Ioapic {
             return Err(Error::InvalidState);
@@ -158,7 +147,7 @@ impl Controller {
 
     fn read_register(&self) -> u32 {
         match self.register {
-            1 => 0x0017_0011,
+            1 => ((terra_limits::X86_IOAPIC_PINS - 1) << 16) | 0x11,
             0 | 2 => 0,
             register if register >= REDIRECTION_BASE => {
                 let entry = usize::from(register - REDIRECTION_BASE) / 2;
@@ -230,10 +219,6 @@ impl bindings::exports::terra::interrupt_controller::controller::Guest for Compo
         Ok(())
     }
 
-    fn clear() -> Result<Vec<IrqLevel>, Error> {
-        controller().as_mut().ok_or(Error::InvalidState)?.clear()
-    }
-
     fn irq_line(slot: u8, asserted: bool) -> Result<Option<IrqLevel>, Error> {
         let mut state = controller();
         let controller = state.as_mut().ok_or(Error::InvalidState)?;
@@ -274,12 +259,7 @@ mod tests {
     use super::*;
 
     fn controller(mode: Mode, routes: Vec<u32>) -> Controller {
-        Controller::new(Config {
-            mode,
-            routes,
-            vcpus: 2,
-        })
-        .unwrap()
+        Controller::new(Config { mode, routes }).unwrap()
     }
 
     fn access(controller: &mut Controller, offset: u8, write: bool, value: u32) -> IoapicReply {
@@ -318,6 +298,15 @@ mod tests {
         assert_eq!(controller.line(1, true).unwrap().1, []);
         assert_eq!(controller.line(0, false).unwrap().0, None);
         assert_eq!(controller.line(1, false).unwrap().0.unwrap().gsi, 5);
+    }
+
+    #[test]
+    fn version_register_advertises_the_available_pins() {
+        let mut controller = controller(Mode::Ioapic, vec![]);
+        access(&mut controller, REGISTER_SELECT, true, 1);
+        let version = access(&mut controller, WINDOW, false, 0).value;
+        assert_eq!(((version >> 16) & 0xff) + 1, u32::try_from(PINS).unwrap());
+        assert_eq!(version & 0xff, 0x11);
     }
 
     #[test]
@@ -387,28 +376,6 @@ mod tests {
     }
 
     #[test]
-    fn irq_cleanup_deasserts_each_shared_gsi_once() {
-        let mut controller = controller(Mode::IrqLines, vec![3, 3, 4]);
-        controller.line(0, true).unwrap();
-        controller.line(1, true).unwrap();
-        controller.line(2, true).unwrap();
-        let changes = controller.clear().unwrap();
-        assert_eq!(
-            changes,
-            [
-                IrqLevel {
-                    gsi: 3,
-                    asserted: false
-                },
-                IrqLevel {
-                    gsi: 4,
-                    asserted: false
-                }
-            ]
-        );
-    }
-
-    #[test]
     fn accepts_every_device_slot_and_rejects_invalid_configuration() {
         let mut controller = controller(Mode::Ioapic, vec![5; terra_limits::MAX_DEVICES]);
         assert!(
@@ -420,7 +387,6 @@ mod tests {
             Controller::new(Config {
                 mode: Mode::Ioapic,
                 routes: vec![24],
-                vcpus: 2
             }),
             Err(Error::InvalidSlot)
         ));
@@ -428,12 +394,18 @@ mod tests {
             Controller::new(Config {
                 mode: Mode::Ioapic,
                 routes: vec![5; terra_limits::MAX_DEVICES + 1],
-                vcpus: 2,
             }),
             Err(Error::InvalidSlot)
         ));
         assert_eq!(controller.line(u8::MAX, true), Err(Error::InvalidSlot));
-        assert_eq!(controller.access(4, 4, false, 0), Err(Error::Unmapped));
-        assert_eq!(controller.access(0, 1, false, 0), Err(Error::BadWidth));
+        for (offset, width) in [(4, 4), (0, 1)] {
+            assert_eq!(
+                controller.access(offset, width, false, 0).unwrap(),
+                IoapicReply {
+                    value: 0,
+                    interrupts: Vec::new(),
+                }
+            );
+        }
     }
 }

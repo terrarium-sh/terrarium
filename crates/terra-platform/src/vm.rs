@@ -81,6 +81,91 @@ pub struct Msr {
 pub struct ArmException {
     pub address: u64,
     pub syndrome: u64,
+    pub write_value: Option<u64>,
+    pub hvc_registers: Option<[u64; 4]>,
+}
+
+impl ArmException {
+    pub fn capture<E>(
+        address: u64,
+        syndrome: u64,
+        mut read_register: impl FnMut(u8) -> Result<u64, E>,
+    ) -> Result<Self, E> {
+        let hvc_registers = if syndrome >> 26 == 0x16 {
+            Some([
+                read_register(0)?,
+                read_register(1)?,
+                read_register(2)?,
+                read_register(3)?,
+            ])
+        } else {
+            None
+        };
+        let write_value = if matches!(syndrome >> 26, 0x24 | 0x25)
+            && syndrome & (1 << 24) != 0
+            && syndrome & (1 << 6) != 0
+        {
+            let register = ((syndrome >> 16) & 31) as u8;
+            Some(if register == 31 {
+                0
+            } else {
+                read_register(register)?
+            })
+        } else {
+            None
+        };
+        Ok(Self {
+            address,
+            syndrome,
+            write_value,
+            hvc_registers,
+        })
+    }
+}
+
+#[cfg(test)]
+mod arm_exception_tests {
+    use super::ArmException;
+
+    #[test]
+    fn exceptions_capture_only_the_registers_the_exit_needs() {
+        let mut reads = Vec::new();
+        let mut read = |register| {
+            reads.push(register);
+            Ok::<_, &'static str>(u64::from(register) + 42)
+        };
+        let hvc = ArmException::capture(0, 0x16 << 26, &mut read).unwrap();
+        assert_eq!(hvc.hvc_registers, Some([42, 43, 44, 45]));
+        assert_eq!(hvc.write_value, None);
+        assert_eq!(reads, [0, 1, 2, 3]);
+        let syndrome = (0x24 << 26) | (1 << 24) | (1 << 6);
+        reads.clear();
+        let store = ArmException::capture(17, syndrome | (7 << 16), |register| {
+            reads.push(register);
+            Ok::<_, &'static str>(99)
+        })
+        .unwrap();
+        assert_eq!(store.address, 17);
+        assert_eq!(store.write_value, Some(99));
+        assert_eq!(store.hvc_registers, None);
+        assert_eq!(reads, [7]);
+        for (syndrome, value) in [
+            (syndrome | (31 << 16), Some(0)),
+            (syndrome & !(1 << 6), None),
+            (syndrome & !(1 << 24), None),
+            (0, None),
+        ] {
+            let exception =
+                ArmException::capture(syndrome, syndrome, |_| Err("unexpected register read"))
+                    .unwrap();
+            assert_eq!(exception.write_value, value);
+            assert_eq!(exception.hvc_registers, None);
+        }
+        assert_eq!(
+            ArmException::capture(0, syndrome, |_| Err("register failure")),
+            Err("register failure")
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,7 +207,6 @@ pub enum VcpuExit {
     Rdmsr(Msr),
     Wrmsr(Msr),
     ArmException(ArmException),
-    ArmRegisterValue(u64),
     HvcResult(HvcResult),
     IoApicAccess(IoApicAccess),
     IoApicEoi(u8),
@@ -139,7 +223,6 @@ pub enum VcpuAction {
     MsrFault,
     Wrmsr,
     ArmRead(ArmRead),
-    ArmRegister(u8),
     HvcReturn(i64),
     CpuStart(CpuStart),
     CpuOff,

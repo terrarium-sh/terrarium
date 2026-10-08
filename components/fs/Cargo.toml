@@ -11,6 +11,5 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 terra-device-transport = { path = "../device-transport" }
-terra-limits = { path = "../../crates/terra-limits" }
 wit-bindgen = { workspace = true, features = ["async-spawn", "inter-task-wakeup", "futures-stream"] }
 futures = "0.3"

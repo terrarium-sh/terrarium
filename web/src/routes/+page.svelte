@@ -43,10 +43,12 @@
     <div class="actions"><a class="primary-link" href="#start">Get started <span aria-hidden="true">→</span></a><a href="{base}/commands/">Explore the commands</a></div>
     <p class="small muted">Linux · macOS on Apple Silicon · Windows</p>
   </div>
-  <figure class="hero-art">
-    <img src="{base}/terrarium-placeholder.png" width="1254" height="1254" fetchpriority="high" alt="A turquoise frog among ferns and a yellow flower, inside a glass terrarium." />
-    <figcaption>A little world. A clear boundary.</figcaption>
-  </figure>
+  <div class="hero-art">
+    <figure>
+      <img src="{base}/logo.svg" width="969" height="914" alt="A frog and dragonfly among ferns and a yellow flower, inside a glass terrarium." />
+      <figcaption>A little world. A clear boundary.</figcaption>
+    </figure>
+  </div>
 </section>
 
 <section class="principles" aria-label="Why Terrarium">
@@ -79,7 +81,7 @@
         <li><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="5" rx="1" /><path d="M12 8v5M5 16v-3h14v3" /><rect x="2" y="16" width="6" height="5" rx="1" /><rect x="16" y="16" width="6" height="5" rx="1" /></svg><span>Network</span></li>
         <li><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="7" rx="2" /><rect x="3" y="13" width="18" height="7" rx="2" /><path d="M6 7.5h2M6 16.5h2" /></svg><span>Block</span></li>
         <li><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2" /><path d="M9 2v4m6-4v4M9 18v4m6-4v4M2 9h4m-4 6h4M18 9h4m-4 6h4" /></svg><span>Memory</span></li>
-        <li><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h18m-5-5 5 5-5 5M21 17H3m5-5-5 5 5 5" /></svg><span>Vsock</span></li>
+        <li><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h18m-5-5 5 5-5 5M21 17H3m5-5-5 5 5 5" /></svg><span>Agent channel</span></li>
       </ul>
       <ul class="sandbox-row" aria-label="Runtime components">
         <li>VMM</li>

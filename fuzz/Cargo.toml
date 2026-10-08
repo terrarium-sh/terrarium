@@ -13,11 +13,14 @@ arbitrary = { version = "1.4.2", features = ["derive"] }
 serde_json = "1"
 serde = "1"
 terra = { path = "../crates/terra", features = ["fuzzing"] }
-terra-runtime = { path = "../crates/terra-runtime" }
+terra-runtime = { path = "../crates/terra-runtime", features = ["test-support"] }
 terra-protocol = { path = "../crates/terra-protocol" }
+terra-policy = { path = "../crates/terra-policy" }
 terra-device-transport = { path = "../components/device-transport" }
+terra-agent-component = { path = "../components/agent", features = ["fuzzing"] }
+terra-vsock-device = { path = "../components/vsock-device", features = ["fuzzing"] }
+terra-vsock-frontend-component = { path = "../components/vsock-frontend", features = ["fuzzing"] }
 terra-fs-component = { path = "../components/fs" }
-terra-vsock-device = { path = "../components/vsock-device" }
 wasmtime = { version = "=49.0.2", default-features = false, features = ["std"] }
 
 [[bin]]
@@ -52,8 +55,8 @@ doc = false
 bench = false
 
 [[bin]]
-name = "vsock_header"
-path = "fuzz_targets/vsock_header.rs"
+name = "network_application"
+path = "fuzz_targets/network_application.rs"
 test = false
 doc = false
 bench = false
@@ -80,3 +83,10 @@ missing_errors_doc = "allow"
 unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
+
+[[bin]]
+name = "vsock_packets"
+path = "fuzz_targets/vsock_packets.rs"
+test = false
+doc = false
+bench = false

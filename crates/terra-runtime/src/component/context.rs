@@ -1,7 +1,7 @@
 //! Shared device capabilities and host imports.
 
 use crate::MAX_SINGLE_BYTES;
-use crate::component::bindings::{diagnostics, interrupt, memory};
+use crate::component::bindings::{interrupt, memory};
 use crate::memory::{BoundedMemory, GuestRam};
 use std::sync::Arc;
 use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
@@ -196,6 +196,17 @@ impl memory::Host for DeviceContext {
         self.memory().write(offset, &data).map_err(memory_error)
     }
 
+    fn write_ranges(&mut self, ranges: Vec<memory::WriteRange>) -> Result<(), memory::MemoryError> {
+        if ranges.len() > terra_limits::MAX_BATCH_GUEST_COPY_RANGES {
+            return Err(memory::MemoryError::TooLarge);
+        }
+        let ranges = ranges
+            .iter()
+            .map(|range| (range.offset, range.data.as_slice()))
+            .collect::<Vec<_>>();
+        self.memory().write_ranges(&ranges).map_err(memory_error)
+    }
+
     fn address_limit(&mut self) -> u64 {
         self.ram.address_limit()
     }
@@ -213,12 +224,6 @@ impl interrupt::Host for DeviceContext {
         if self.irq.signal() {
             self.interrupt_notification.notify_one();
         }
-    }
-}
-
-impl diagnostics::Host for DeviceContext {
-    fn event(&mut self, message: String) {
-        log::warn!("network: {message}");
     }
 }
 
@@ -247,6 +252,20 @@ mod tests {
         host.write(0x4000_0000, vec![7]).unwrap();
         assert_eq!(host.read(0x4000_0000, 1).unwrap(), vec![7]);
         assert!(host.read(0, 1).is_err());
+        assert_eq!(
+            host.write_ranges(vec![
+                super::memory::WriteRange {
+                    offset: 0x4000_0000,
+                    data: vec![9],
+                },
+                super::memory::WriteRange {
+                    offset: 0,
+                    data: vec![1],
+                },
+            ]),
+            Err(super::memory::MemoryError::OutOfRange)
+        );
+        assert_eq!(host.read(0x4000_0000, 1).unwrap(), vec![7]);
     }
 
     #[test]
@@ -260,6 +279,39 @@ mod tests {
             Err(super::memory::MemoryError::TooLarge)
         ));
         assert_eq!(host.read(0, 1).unwrap(), vec![7]);
+    }
+
+    #[test]
+    fn device_memory_import_validates_batched_writes_before_mutation() {
+        use super::memory::{Host as _, MemoryError, WriteRange};
+        let mut host = super::DeviceContext::new(4096).unwrap();
+        host.write(0, b"seed".to_vec()).unwrap();
+        assert_eq!(
+            host.write_ranges(vec![
+                WriteRange {
+                    offset: 0,
+                    data: b"edit".to_vec(),
+                },
+                WriteRange {
+                    offset: 4096,
+                    data: vec![1],
+                },
+            ]),
+            Err(MemoryError::OutOfRange)
+        );
+        assert_eq!(host.read(0, 4).unwrap(), b"seed");
+        host.write_ranges(vec![
+            WriteRange {
+                offset: 0,
+                data: b"first".to_vec(),
+            },
+            WriteRange {
+                offset: 0,
+                data: b"last".to_vec(),
+            },
+        ])
+        .unwrap();
+        assert_eq!(host.read(0, 5).unwrap(), b"lastt");
     }
 
     #[test]
@@ -321,13 +373,23 @@ mod tests {
         first.set_level(true);
         assert!(first.interrupt_level());
         assert!(!second.interrupt_level());
+        let mut context = Context::from_waker(Waker::noop());
+        assert_eq!(
+            std::pin::pin!(wake.notified()).poll(&mut context),
+            Poll::Ready(())
+        );
+        first.set_level(true);
+        assert!(
+            std::pin::pin!(wake.notified())
+                .poll(&mut context)
+                .is_pending()
+        );
         for _ in 0..crate::component::context::MAX_SIGNALS_PER_WINDOW {
             first.signal();
         }
         first.set_level(false);
         assert!(!first.interrupt_level());
         assert!(first.signals_dropped() > 0);
-        let mut context = Context::from_waker(Waker::noop());
         assert_eq!(
             std::pin::pin!(wake.notified()).poll(&mut context),
             Poll::Ready(())

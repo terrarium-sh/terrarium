@@ -1,5 +1,5 @@
-# Every third-party input that gets downloaded and baked into a terra binary:
-# its version, where it comes from, and the sha256 it must have. Included by the
+# Every third-party input baked into a terra binary: its version, source,
+# and checksum or submodule commit. Included by the
 # Makefile, which holds the recipes; nothing here runs anything.
 #
 # It is a separate file so that a bump is a reviewable provenance change.
@@ -25,8 +25,7 @@ E2FSPROGS_URL := https://mirrors.edge.kernel.org/pub/linux/kernel/people/tytso/e
 
 # --- Linux VM launcher ------------------------------------------------------
 BUBBLEWRAP_VERSION := 0.13.0
-BUBBLEWRAP_SHA256 := 4734237473c0e5d695e4e9034a34e43b2dbf5164655bd13fa59ae376b2b7a765
-BUBBLEWRAP_URL := https://github.com/containers/bubblewrap/releases/download/v$(BUBBLEWRAP_VERSION)/bubblewrap-$(BUBBLEWRAP_VERSION).tar.xz
+BUBBLEWRAP_COMMIT := 719a4fd474d44b26906bcf2b1b0fb6eddd8d56d0
 LIBCAP_VERSION := 2.78
 LIBCAP_SHA256 := 0d621e562fd932ccf67b9660fb018e468a683d7b827541df27813228c996bb11
 LIBCAP_URL := https://www.kernel.org/pub/linux/libs/security/linux-privs/libcap2/libcap-$(LIBCAP_VERSION).tar.xz

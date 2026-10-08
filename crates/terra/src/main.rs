@@ -3,11 +3,11 @@
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    match run_with_runtime(terra::run()) {
+    match terra::run_internal_role().unwrap_or_else(|| run_with_runtime(terra::run())) {
         Ok(code) => code,
         Err(error) if terra::is_stdout_broken_pipe(&error) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("terra: {e:#}");
+            eprintln!("terra: {}", terra::render_error(&e));
             ExitCode::FAILURE
         }
     }
@@ -18,6 +18,7 @@ where
     F: std::future::Future<Output = anyhow::Result<T>>,
 {
     let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()?;
     let result = runtime.block_on(operation);

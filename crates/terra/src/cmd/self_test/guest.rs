@@ -6,7 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 mod network;
 mod sessions;
@@ -61,7 +61,7 @@ impl SelfTest {
     fn setup(&mut self, name: &str, recipe: &Value, expected: Option<i32>) -> Result<Output> {
         self.boxes.push(name.to_owned());
         let path = self.directory.join(format!("{name}.yaml"));
-        fs::write(&path, serde_json::to_vec(recipe)?)?;
+        fs::write(&path, yaml_serde::to_string(recipe)?)?;
         Self::capture(
             self.command([path.as_os_str()])
                 .args(["setup", "--trust-recipe"]),
@@ -187,6 +187,18 @@ fn require_file(path: &Path, expected: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn fill_share_path(host: &mut Value, placeholder: &str, path: &Path) -> Result<()> {
+    let path = path
+        .to_str()
+        .context("self-test shares require a UTF-8 project path")?;
+    *host = Value::String(
+        host.as_str()
+            .context("self-test share path must be a string")?
+            .replace(placeholder, path),
+    );
+    Ok(())
+}
+
 fn run_exercises(self_test: &mut SelfTest) -> Result<()> {
     let allowed = network::HostService::start()?;
     let denied = network::HostService::start()?;
@@ -198,34 +210,24 @@ fn run_exercises(self_test: &mut SelfTest) -> Result<()> {
     fs::write(writable.join("host"), "HOST_SEED")?;
     fs::write(writable.join("host-update"), "INITIAL")?;
     fs::write(readonly.join("seed"), "READ_ONLY")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let executable = writable.join("host-run");
+        fs::write(&executable, "#!/bin/sh\necho HOST_EXECUTABLE\n")?;
+        fs::set_permissions(executable, fs::Permissions::from_mode(0o755))?;
+    }
     let reservation = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
     let published_port = reservation.local_addr()?.port();
     drop(reservation);
     let allowed_port = allowed.port();
-    let recipe = json!({
-        "hw": {"cpus": 2, "mem_mib": 512, "rootfs_mib": 128},
-        "network": {
-            "allow": [format!("gate.test:{allowed_port}")],
-            "hosts": [{"name": "gate.test", "addr": "HOST_LOOPBACK"}],
-            "ports": [format!("{published_port}:18080")],
-        },
-        "mounts": [{"host": writable, "guest": "/work"},
-                   {"host": readonly, "guest": "/readonly", "readonly": true}],
-        "volumes": [{"name": "data", "guest": "/data", "size_mib": 8}],
-        "env": {"WORKLOAD_ENV": "recipe-value"},
-        "hooks": {
-            "on_create": ["mkdir -p /opt/workload; echo baked >> /opt/workload/bake; echo BAKE_OK"],
-            "on_start": ["echo start >> /work/hooks; echo START_OK"],
-            "pre_stop": ["echo stop >> /work/hooks; echo STOP_OK"],
-        },
-        "daemons": [
-            "echo daemon >> /work/daemon; test $(wc -l < /work/daemon) -ge 2",
-            "echo $$ > /tmp/workload-watcher-pid; exec busybox inotifyd - /work/host-update:c /work:nmdy > /tmp/workload-events",
-            "while true; do printf 'HTTP/1.1 200 OK\\r\\nContent-Length: 13\\r\\nConnection: close\\r\\n\\r\\nGUEST_NETWORK' | busybox nc -l -p 18080; done"
-        ],
-        "workload": {"entrypoint": "/bin/sh", "workdir": "/work/nested/deep",
-            "args": ["-ec", "echo ready > /work/ready; while true; do sleep 60; done"]},
-    });
+    let mut recipe: Value = yaml_serde::from_str(
+        &include_str!("recipes/exercise.yaml")
+            .replace("{allowed_port}", &allowed_port.to_string())
+            .replace("{published_port}", &published_port.to_string()),
+    )?;
+    fill_share_path(&mut recipe["mounts"][0]["host"], "{writable}", &writable)?;
+    fill_share_path(&mut recipe["mounts"][1]["host"], "{readonly}", &readonly)?;
     require_output(&self_test.setup("exercise", &recipe, Some(0))?, "BAKE_OK")?;
     self_test.run(&["exercise", "setup"])?;
     let resolved = self_test.read_json(&["exercise", "show", "--json", "--with-env-values"])?;
@@ -234,20 +236,23 @@ fn run_exercises(self_test: &mut SelfTest) -> Result<()> {
         "recipe environment missing: {resolved}"
     );
     self_test.run(&["exercise", "-d"])?;
-    self_test.execute(
-        "for i in $(seq 1 100); do test ! -f /work/ready || break; sleep .1; done; \
-         test -f /work/ready; test $(wc -l < /opt/workload/bake) = 1; \
-         test -s /terra/recipe; test $(nproc) = 2",
-        &[],
-    )?;
+    self_test.execute(include_str!("scripts/exercise-ready.sh"), &[])?;
     self_test.require_box_state("exercise", "running")?;
     wait_until(
         || Ok(network::read_published_port(published_port)),
         "published HTTP port",
         Duration::from_secs(60),
     )?;
+    wait_until(
+        || Ok(network::read_published_datagram(published_port)),
+        "published UDP port",
+        Duration::from_secs(60),
+    )?;
     ensure!(
-        allowed.requests() == 0 && denied.requests() == 0,
+        allowed.requests() == 0
+            && denied.requests() == 0
+            && allowed.datagrams() == 0
+            && denied.datagrams() == 0,
         "unexpected host network request"
     );
 
@@ -255,6 +260,7 @@ fn run_exercises(self_test: &mut SelfTest) -> Result<()> {
     exercise_shares(self_test, &writable, &readonly)?;
     exercise_sync(self_test)?;
     exercise_network(self_test, &allowed, &denied, &recipe["hw"])?;
+    exercise_local_only_network(self_test, &recipe["hw"])?;
     exercise_storage(self_test, &writable, &recipe["hw"])?;
     Ok(())
 }
@@ -265,39 +271,64 @@ fn exercise_network(
     denied: &network::HostService,
     hardware: &Value,
 ) -> Result<()> {
+    const CONCURRENT_NETWORK_FLOWS: usize = 8;
     let allowed_port = allowed.port();
     let denied_port = denied.port();
-    println!("self-test: local DNS, host services, ports and denial");
+    println!("self-test: local DNS, TCP/UDP host services, ports and denial");
     self_test.execute(
-        &format!(
-            "test \"$(wget -q -T 5 -O - http://gate.test:{allowed_port}/)\" = HOST_NETWORK; \
-             if wget -q -T 2 -O - http://gate.test:{denied_port}/; then exit 1; fi; \
-             if wget -q -T 2 -O - http://blocked.invalid:{allowed_port}/; then exit 1; fi; \
-             if nslookup blocked.invalid; then exit 1; fi"
-        ),
+        &include_str!("scripts/network.sh")
+            .replace(
+                "{concurrent_network_flows}",
+                &CONCURRENT_NETWORK_FLOWS.to_string(),
+            )
+            .replace("{allowed_port}", &allowed_port.to_string())
+            .replace("{denied_port}", &denied_port.to_string()),
         &[],
     )?;
     ensure!(
-        allowed.requests() == 1 && denied.requests() == 0,
+        allowed.requests() == CONCURRENT_NETWORK_FLOWS
+            && denied.requests() == 0
+            && allowed.datagrams() == 1
+            && denied.datagrams() == 0,
         "network allow/deny request counts differ"
     );
-    let isolated = json!({
-        "hw": hardware,
-        "network": {"hosts": [{"name": "gate.test", "addr": "HOST_LOOPBACK"}]},
-        "workload": {"entrypoint": "/bin/sh", "args": ["-ec", format!(
-            "if wget -q -T 2 -O - http://gate.test:{allowed_port}/; then exit 1; fi; echo ISOLATED_OK"
-        )]},
-    });
+    let isolated: Value = yaml_serde::from_str(
+        &include_str!("recipes/isolated.yaml")
+            .replace("{hardware}", &serde_json::to_string(hardware)?)
+            .replace("{allowed_port}", &allowed_port.to_string()),
+    )?;
     self_test.setup("isolated", &isolated, Some(0))?;
     require_output(
         &self_test.run(&["isolated", "--foreground"])?,
         "ISOLATED_OK",
     )?;
     ensure!(
-        allowed.requests() == 1 && denied.requests() == 0,
+        allowed.requests() == CONCURRENT_NETWORK_FLOWS
+            && denied.requests() == 0
+            && allowed.datagrams() == 1
+            && denied.datagrams() == 0,
         "isolated box reached host services"
     );
-    Ok(())
+    network::exercise_quic(self_test, allowed)
+}
+
+fn exercise_local_only_network(self_test: &mut SelfTest, hardware: &Value) -> Result<()> {
+    println!("self-test: local-only loopback, agent exec and shutdown");
+    let recipe: Value = yaml_serde::from_str(
+        &include_str!("recipes/local-only.yaml")
+            .replace("{hardware}", &serde_json::to_string(hardware)?),
+    )?;
+    self_test.setup("local-only", &recipe, Some(0))?;
+    self_test.run(&["local-only", "-d"])?;
+    let script = include_str!("scripts/local-only.sh");
+    let output = SelfTest::capture(
+        &mut self_test.command(["local-only", "exec", "--", "/bin/sh", "-ec", script]),
+        Some(0),
+        COMMAND_TIMEOUT,
+    )?;
+    require_output(&output, "LOCAL_ONLY_OK")?;
+    self_test.run(&["local-only", "stop"])?;
+    self_test.require_box_state("local-only", "stopped")
 }
 
 fn exercise_exec(self_test: &SelfTest) -> Result<()> {
@@ -331,42 +362,16 @@ fn exercise_exec(self_test: &SelfTest) -> Result<()> {
     self_test.execute("test -t 0; test -t 1; echo TTY_OK", &["--tty"])?;
     sessions::exercise(self_test)?;
     self_test.execute("echo ROOT_WRITE > /etc/workload-probe", &["--root"])?;
-    self_test.execute(
-        "test \"$(cat /etc/workload-probe)\" = ROOT_WRITE; \
-         test -e /proc/self/ns/user; test -e /proc/self/ns/net; test -e /proc/self/ns/pid",
-        &[],
-    )?;
-    self_test.execute(
-        "grep -q ' - cgroup2 ' /proc/self/mountinfo; \
-         mkdir -p /tmp/overlay/lower /tmp/overlay/upper /tmp/overlay/work /tmp/overlay/merged; \
-         echo lower > /tmp/overlay/lower/value; \
-         mount -t overlay overlay -o lowerdir=/tmp/overlay/lower,upperdir=/tmp/overlay/upper,workdir=/tmp/overlay/work /tmp/overlay/merged; \
-         test $(cat /tmp/overlay/merged/value) = lower; echo upper > /tmp/overlay/merged/value; \
-         test $(cat /tmp/overlay/upper/value) = upper; umount /tmp/overlay/merged",
-        &["--root"],
-    )?;
+    self_test.execute(include_str!("scripts/namespaces.sh"), &[])?;
+    self_test.execute(include_str!("scripts/overlay.sh"), &["--root"])?;
     Ok(())
 }
 
 fn exercise_shares(self_test: &SelfTest, writable: &Path, readonly: &Path) -> Result<()> {
     println!("self-test: writable/read-only shares, file events and synchronization");
-    self_test.execute(
-        "test \"$(cat /work/host)\" = HOST_SEED; \
-         printf linked > /work/host; ln /work/host /work/hard; \
-         ln -s host /work/link; test \"$(cat /work/link)\" = linked; \
-         printf open-unlink > /work/open; exec 3</work/open; rm /work/open; \
-         test \"$(cat <&3)\" = open-unlink; \
-         printf renamed > /work/before; mv /work/before /work/after; \
-         test \"$(cat /work/after)\" = renamed; \
-         printf \"#!/bin/sh\\necho EXECUTABLE\\n\" > /work/run; chmod 755 /work/run; \
-         test \"$(/work/run)\" = EXECUTABLE; \
-         if ln -s /etc/passwd /work/escape; then exit 1; fi; \
-         test \"$(cat /readonly/seed)\" = READ_ONLY; \
-         for command in \": > /readonly/new\" \"rm /readonly/seed\" \
-         \"mv /readonly/seed /readonly/moved\" \"ln /readonly/seed /readonly/link\"; do \
-         if sh -c \"$command\"; then exit 1; fi; done",
-        &[],
-    )?;
+    self_test.execute(include_str!("scripts/shares.sh"), &[])?;
+    #[cfg(unix)]
+    self_test.execute("test \"$(/work/host-run)\" = HOST_EXECUTABLE", &[])?;
     require_file(&writable.join("host"), b"linked")?;
     require_file(&writable.join("after"), b"renamed")?;
     require_file(&readonly.join("seed"), b"READ_ONLY")?;
@@ -378,40 +383,17 @@ fn exercise_shares(self_test: &SelfTest, writable: &Path, readonly: &Path) -> Re
         "read-only share was modified: {readonly_names:?}"
     );
     exercise_file_events(self_test, writable)?;
-    self_test.execute(
-        "test \"$(cat /work/host-update)\" = LIVE_UPDATE; \
-         for i in $(seq 1 100); do test $(wc -l < /work/daemon) -lt 2 || break; sleep .1; done; \
-         test $(wc -l < /work/daemon) -ge 2; echo PERSISTED > /data/value; sync",
-        &[],
-    )?;
+    self_test.execute(include_str!("scripts/shares-persisted.sh"), &[])?;
     Ok(())
 }
 
 fn exercise_file_events(self_test: &SelfTest, writable: &Path) -> Result<()> {
-    self_test.execute(
-        "busybox --list | grep -qx inotifyd; \
-         for i in $(seq 1 100); do if test -f /tmp/workload-watcher-pid; then \
-         pid=$(cat /tmp/workload-watcher-pid); \
-         test $(grep -h '^inotify wd:' /proc/$pid/fdinfo/* | wc -l) -lt 2 || exit 0; \
-         fi; sleep .1; done; exit 1",
-        &["--root"],
-    )?;
+    self_test.execute(include_str!("scripts/watcher-ready.sh"), &["--root"])?;
     fs::write(writable.join("host-update"), "LIVE_UPDATE")?;
     fs::write(writable.join("host-created"), "CREATED")?;
-    self_test.execute(
-        "for i in $(seq 1 100); do \
-         if grep -q '^c.*host-update' /tmp/workload-events && grep -q '^n.*host-created' /tmp/workload-events; then \
-         test $(cat /work/host-update) = LIVE_UPDATE; test $(cat /work/host-created) = CREATED; exit 0; fi; \
-         sleep .1; done; cat /tmp/workload-events; exit 1",
-        &["--root"],
-    )?;
+    self_test.execute(include_str!("scripts/file-events-created.sh"), &["--root"])?;
     fs::remove_file(writable.join("host-created"))?;
-    self_test.execute(
-        "for i in $(seq 1 100); do if grep -q '^d.*host-created' /tmp/workload-events; then \
-         test ! -e /work/host-created; exit 0; fi; \
-         sleep .1; done; cat /tmp/workload-events; exit 1",
-        &["--root"],
-    )?;
+    self_test.execute(include_str!("scripts/file-events-deleted.sh"), &["--root"])?;
     Ok(())
 }
 
@@ -533,8 +515,7 @@ fn exercise_storage(self_test: &mut SelfTest, writable: &Path, hardware: &Value)
         "--",
         "sh",
         "-ec",
-        "test $(id -u) = 0; test $(cat /data/value) = PERSISTED; \
-         test $(wc -l < /opt/workload/bake) = 1; echo CHANGED > /data/value; sync; echo RESTART_OK",
+        include_str!("scripts/storage-restart.sh"),
     ])?;
     for marker in ["START_OK", "RESTART_OK", "STOP_OK"] {
         require_output(&foreground, marker)?;
@@ -565,14 +546,16 @@ fn exercise_storage(self_test: &mut SelfTest, writable: &Path, hardware: &Value)
     )?;
     self_test.run(&["exercise", "logs", "--tail", "20"])?;
     self_test.run(&["exercise", "logs", "--diagnostics", "--tail", "20"])?;
-    let bad_bake = self_test.setup(
-        "bad-bake",
-        &json!({
-            "hw": hardware, "hooks": {"on_create": ["echo FAILED_BAKE; exit 9"]},
-        }),
-        None,
+    let recipe: Value = yaml_serde::from_str(
+        &include_str!("recipes/bad-bake.yaml")
+            .replace("{hardware}", &serde_json::to_string(hardware)?),
     )?;
+    let bad_bake = self_test.setup("bad-bake", &recipe, None)?;
     require_output(&bad_bake, "FAILED_BAKE")?;
+    require_output(
+        &self_test.run(&["bad-bake", "logs", "--diagnostics"])?,
+        "init failed",
+    )?;
     self_test.run(&["exercise", "rm"])?;
     self_test.require_box_state("exercise", "not_created")?;
     self_test.run(&["exercise", "rm", "--purge"])?;
@@ -585,4 +568,61 @@ fn exercise_storage(self_test: &mut SelfTest, writable: &Path, hardware: &Value)
     );
     self_test.boxes.retain(|name| name != "exercise");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_recipes_preserve_escaped_share_paths_and_recipe_settings() -> Result<()> {
+        let mut exercise: Value = yaml_serde::from_str(
+            &include_str!("recipes/exercise.yaml")
+                .replace("{allowed_port}", "12345")
+                .replace("{published_port}", "54321"),
+        )?;
+        let writable = Path::new(
+            "C:\\self test\\{readonly}\\'quoted' \"double\"
+next: value",
+        );
+        let readonly = Path::new(
+            "/self test/{writable}/'quoted' \"double\"
+next: value",
+        );
+        fill_share_path(&mut exercise["mounts"][0]["host"], "{writable}", writable)?;
+        fill_share_path(&mut exercise["mounts"][1]["host"], "{readonly}", readonly)?;
+        let serialized = yaml_serde::to_string(&exercise)?;
+        let reparsed: Value = yaml_serde::from_str(&serialized)?;
+        assert_eq!(reparsed, exercise);
+        let config: crate::config::Config = yaml_serde::from_str(&serialized)?;
+        assert_eq!(config.mounts[0].host, writable);
+        assert_eq!(config.mounts[1].host, readonly);
+        assert_eq!(config.hw.cpus, 2);
+        assert_eq!(config.hw.mem_mib, 512);
+        assert_eq!(config.hw.rootfs_mib, 128);
+        assert_eq!(
+            exercise["network"]["allow"],
+            serde_json::json!(["gate.test:12345"])
+        );
+        assert_eq!(
+            exercise["network"]["ports"],
+            serde_json::json!(["54321:18080", "54321:18082/udp"])
+        );
+        assert!(config.daemons[2].contains("200 OK\\r\\nContent-Length: 13"));
+        let hardware = serde_json::to_string(&exercise["hw"])?;
+        for template in [
+            include_str!("recipes/isolated.yaml"),
+            include_str!("recipes/local-only.yaml"),
+            include_str!("recipes/bad-bake.yaml"),
+        ] {
+            let recipe = template
+                .replace("{hardware}", &hardware)
+                .replace("{allowed_port}", "12345");
+            let config: crate::config::Config = yaml_serde::from_str(&recipe)?;
+            assert_eq!(config.hw.cpus, 2);
+            assert_eq!(config.hw.mem_mib, 512);
+            assert_eq!(config.hw.rootfs_mib, 128);
+        }
+        Ok(())
+    }
 }

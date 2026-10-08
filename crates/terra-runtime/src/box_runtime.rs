@@ -19,14 +19,15 @@ pub(crate) mod setup;
 pub(crate) mod store;
 
 pub use store::{
-    BoxHost, ComponentMemoryLimits, DEFAULT_COMPONENT_MEMORY_MIB, RootHost, StoreHost, StoreState,
+    BoxHost, ComponentMemoryLimits, DEFAULT_COMPONENT_MEMORY_MIB, NETWORK_FRONTEND_MEMORY_BYTES,
+    RootHost, StoreHost, StoreState,
 };
 
 pub(crate) const BOX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const MAX_BOX_COMPONENTS: usize = terra_limits::MAX_DEVICES;
-const MAX_BOX_COMPONENT_WORKERS: usize = MAX_BOX_COMPONENTS + 2;
+const MAX_BOX_COMPONENT_WORKERS: usize = MAX_BOX_COMPONENTS + 3;
 const MAX_BOX_COMPONENT_LOOPS: usize =
-    MAX_BOX_COMPONENTS * 3 + terra_limits::MAX_VCPUS as usize + 4;
+    MAX_BOX_COMPONENTS * 3 + terra_limits::MAX_VCPUS as usize + 3;
 const EPOCH_TICK_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Keeps the runtime engine's epoch interruption advancing.
@@ -94,6 +95,12 @@ pub struct BoxRuntime {
     shutdown: watch::Sender<bool>,
     children: Vec<WorkerTask>,
     component_loops: Vec<ComponentLoop>,
+    roles: Vec<(ComponentRole, setup::RoleSetup)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ComponentRole {
+    Agent,
 }
 
 pub struct PreparedBoxRuntime {
@@ -270,22 +277,15 @@ impl PreparedBoxRuntime {
             lifecycle.component_failed();
             lifecycle.publish_outcome(crate::component::vmm::lifecycle::Outcome::ComponentFailed);
             shutdown.send_replace(true);
-            if let Err(error) = root.recover_native_until(lifecycle.begin_shutdown()).await {
+            let teardown = root.native_teardown();
+            let deadline = lifecycle.begin_shutdown();
+            drop(root);
+            if let Err(error) = teardown.wait_until(deadline).await {
                 log::warn!("native recovery after component failure: {error:#}");
             }
         }
         workers.shutdown().await;
         result
-    }
-
-    async fn recover_native_until(&mut self, deadline: std::time::Instant) -> wasmtime::Result<()> {
-        self.store
-            .data()
-            .lifecycle
-            .native_teardown()
-            .wait_until(deadline)
-            .await
-            .map_err(wasmtime::Error::msg)
     }
 
     async fn run(&mut self) -> wasmtime::Result<()> {

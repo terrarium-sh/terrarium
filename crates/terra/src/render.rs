@@ -53,6 +53,22 @@ pub fn escape_printable(text: &str) -> String {
     out
 }
 
+/// [`escape_printable`] per line, keeping the line breaks.
+#[must_use]
+pub(crate) fn escape_printable_lines(text: &str) -> String {
+    text.split('\n')
+        .map(escape_printable)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The error chain with terminal controls escaped: guest-supplied paths, link
+/// targets and messages reach error text unescaped from many sites.
+#[must_use]
+pub fn render_error(error: &anyhow::Error) -> String {
+    escape_printable_lines(&format!("{error:#}"))
+}
+
 const REDACTED_ENV_VALUE: &str = "(set - value not printable)";
 
 #[must_use]
@@ -128,6 +144,7 @@ pub fn render_policy_summary(cfg: &config::Config) -> String {
         env_file,
     } = cfg;
     let config::Network {
+        enabled: _,
         mode: _,
         allow,
         hosts,
@@ -145,10 +162,7 @@ pub fn render_policy_summary(cfg: &config::Config) -> String {
         "  hardware: {} vCPU, {} MiB RAM, {} MiB rootfs",
         hw.cpus, hw.mem_mib, hw.rootfs_mib
     );
-    let _ = writeln!(out, "  components: {} MiB each", components.memory_mib);
-    if let Some(network) = &components.network {
-        let _ = writeln!(out, "  network component: {} MiB", network.memory_mib);
-    }
+    let _ = writeln!(out, "  components: {} MiB", components.memory_mib);
     let _ = writeln!(out, "  egress:   {}", network::describe(network));
     for rule in allow {
         let _ = writeln!(out, "  allow:    {}", escape_printable(rule));
@@ -193,6 +207,17 @@ pub fn render_policy_summary(cfg: &config::Config) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A guest-chosen symlink target or path embedded anywhere in an error
+    /// chain cannot drive the host terminal, while multi-line hints keep their lines.
+    #[test]
+    fn rendered_errors_escape_terminal_controls_but_keep_lines() {
+        let error =
+            anyhow::anyhow!("rejecting '\x1b]0;pwned\x07'\nhint: \r retry").context("sync failed");
+        let rendered = render_error(&error);
+        assert!(!rendered.contains(['\x1b', '\x07', '\r']), "{rendered:?}");
+        assert_eq!(rendered.lines().count(), 2, "{rendered:?}");
+    }
 
     #[test]
     fn only_stdout_broken_pipes_get_the_stdout_marker() {
@@ -452,10 +477,7 @@ mod tests {
     #[test]
     fn the_approval_summary_lists_hardware_and_component_requirements() {
         let cfg = config::Config {
-            components: config::Components {
-                memory_mib: 32,
-                network: Some(config::NetworkComponent { memory_mib: 64 }),
-            },
+            components: config::Components { memory_mib: 32 },
             hw: config::Hw {
                 cpus: 4,
                 mem_mib: 4096,
@@ -464,8 +486,7 @@ mod tests {
             ..yaml_serde::from_str("{}").unwrap()
         };
         let summary = render_policy_summary(&cfg);
-        assert!(summary.contains("components: 32 MiB each"));
-        assert!(summary.contains("network component: 64 MiB"));
+        assert!(summary.contains("components: 32 MiB"));
         assert!(
             summary.contains("hardware: 4 vCPU, 4096 MiB RAM, 2048 MiB rootfs"),
             "{summary}"

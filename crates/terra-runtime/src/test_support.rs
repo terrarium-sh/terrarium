@@ -41,15 +41,6 @@ impl<H: DeviceHost> DeviceHost for StandaloneHost<H> {
     }
 }
 
-#[must_use]
-pub fn device_store<H: DeviceHost>(engine: &Engine, host: H) -> Store<StandaloneHost<H>> {
-    device_store_with_limits(
-        engine,
-        host,
-        crate::box_runtime::store::ComponentMemoryLimits::default(),
-    )
-}
-
 /// Store for one standalone device with a per-linear-memory limit.
 #[must_use]
 pub fn device_store_with_limits<H: DeviceHost>(
@@ -65,7 +56,7 @@ pub fn device_store_with_limits<H: DeviceHost>(
         .tables(8)
         .build();
     let mut store = Store::new(engine, StandaloneHost { host, limits });
-    store.set_hostcall_fuel(terra_limits::MAX_COMPONENT_HOSTCALL_BYTES);
+    store.set_hostcall_fuel(crate::box_runtime::store::MAX_COMPONENT_HOSTCALL_ALLOCATION_BYTES);
     store.set_epoch_deadline(1);
     store.limiter(|host| &mut host.limits);
     store

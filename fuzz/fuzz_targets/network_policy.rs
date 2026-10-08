@@ -4,15 +4,14 @@ use arbitrary::{Arbitrary, Unstructured};
 use libfuzzer_sys::fuzz_target;
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use terra::BoxPolicy;
 use terra::config::{Network, NetworkMode, StaticDnsRecord};
-use terra_runtime::component::network::{GuestNetworkConfig, NameLookup, Policy};
+use terra_policy::normalize_hostname;
+use terra_policy::{BoxPolicy, NameLookup};
+use terra_runtime::component::network::HostServiceAddresses;
 
 #[allow(dead_code)]
-#[path = "../../components/policy/src/address.rs"]
+#[path = "../../crates/terra-policy/src/address.rs"]
 mod address;
-#[path = "../../components/policy/src/hostname.rs"]
-mod hostname;
 use address::is_floored;
 
 #[derive(Arbitrary, Debug)]
@@ -30,7 +29,7 @@ impl Address {
             Self::V6(bytes) => Ipv6Addr::from(bytes).into(),
             Self::Mapped(bytes) => Ipv4Addr::from(bytes).to_ipv6_mapped().into(),
             Self::Special(index) => {
-                let layout = GuestNetworkConfig::default();
+                let layout = HostServiceAddresses::default();
                 let choices = [
                     layout.gateway_ip.into(),
                     layout.gateway_ip6.into(),
@@ -57,8 +56,16 @@ enum Step {
     Lookup(String),
 }
 
+fn build_policy(network: &Network) -> Result<BoxPolicy, String> {
+    let layout = HostServiceAddresses::default();
+    BoxPolicy::new(
+        &network.into(),
+        [layout.gateway_ip.into(), layout.gateway_ip6.into()],
+    )
+}
+
 fn check_host(policy: &BoxPolicy) {
-    let layout = GuestNetworkConfig::default();
+    let layout = HostServiceAddresses::default();
     for address in [
         IpAddr::V4(layout.gateway_ip),
         IpAddr::V6(layout.gateway_ip6),
@@ -73,12 +80,12 @@ fn check_host(policy: &BoxPolicy) {
 fuzz_target!(|data: &[u8]| {
     // Exercise recipe parsing separately so rejected syntax cannot starve the state machine.
     if let Ok(network) = serde_json::from_slice::<Network>(data)
-        && let Ok(policy) = BoxPolicy::new(&network)
+        && let Ok(policy) = build_policy(&network)
     {
         check_host(&policy);
     }
     if let Ok(text) = std::str::from_utf8(data)
-        && let Ok(policy) = BoxPolicy::new(&Network {
+        && let Ok(policy) = build_policy(&Network {
             allow: text.lines().take(16).map(str::to_owned).collect(),
             ..Network::default()
         })
@@ -110,10 +117,10 @@ fuzz_target!(|data: &[u8]| {
     if grant_host {
         network.allow.push("HOST_LOOPBACK:443".into());
     }
-    let Ok(policy) = BoxPolicy::new(&network) else {
+    let Ok(policy) = build_policy(&network) else {
         return;
     };
-    let Ok(isolated) = BoxPolicy::new(&Network::default()) else {
+    let Ok(isolated) = build_policy(&Network::default()) else {
         return;
     };
     let mut learned = HashSet::new();
@@ -149,7 +156,7 @@ fuzz_target!(|data: &[u8]| {
             Ok(Step::Check(address, query_port)) => {
                 let ip = address.ip();
                 let canonical = ip.to_canonical();
-                let layout = GuestNetworkConfig::default();
+                let layout = HostServiceAddresses::default();
                 let host = canonical == IpAddr::V4(layout.gateway_ip)
                     || canonical == IpAddr::V6(layout.gateway_ip6);
                 let expected = if host {
@@ -168,7 +175,7 @@ fuzz_target!(|data: &[u8]| {
             }
             Ok(Step::Lookup(name)) => {
                 let lookup = policy.lookup_name(&name);
-                let Some(normalized) = hostname::normalize_hostname(&name) else {
+                let Some(normalized) = normalize_hostname(&name) else {
                     assert!(matches!(lookup, NameLookup::Denied));
                     continue;
                 };
