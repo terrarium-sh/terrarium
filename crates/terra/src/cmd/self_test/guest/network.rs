@@ -126,6 +126,7 @@ fn serve_requests(
 }
 
 fn serve_request(mut stream: TcpStream, requests: &AtomicUsize) -> io::Result<()> {
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
     let mut reader = BufReader::new(&mut stream).take(16 * 1024);
@@ -220,6 +221,34 @@ pub(super) fn exercise_quic(self_test: &super::SelfTest, allowed: &HostService) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_service_waits_for_requests_on_a_nonblocking_accepted_stream() -> Result<()> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let mut client = TcpStream::connect(listener.local_addr()?)?;
+        client.set_read_timeout(Some(Duration::from_secs(2)))?;
+        client.set_write_timeout(Some(Duration::from_secs(2)))?;
+        let (stream, _) = listener.accept()?;
+        stream.set_nonblocking(true)?;
+        let requests = AtomicUsize::new(0);
+        thread::scope(|scope| -> io::Result<()> {
+            let server = scope.spawn(|| serve_request(stream, &requests));
+            thread::sleep(Duration::from_millis(50));
+            client.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")?;
+            let mut response = Vec::new();
+            client.read_to_end(&mut response)?;
+            server
+                .join()
+                .map_err(|_| io::Error::other("HTTP fixture panicked"))??;
+            assert_eq!(
+                response,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\nHOST_NETWORK"
+            );
+            Ok(())
+        })?;
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
 
     #[test]
     fn host_service_counts_gets_and_serves_the_fixture() -> Result<()> {

@@ -222,7 +222,10 @@ jobs:
           exit "$status"
       - name: Reclaim component build space
         if: ${{ !cancelled() }}
-        run: rm -rf components/target
+        run: |
+          if [ -d components/target ]; then
+            find components/target -mindepth 1 -maxdepth 1 ! -name wasm-components -exec rm -rf {} +
+          fi
       - name: Fuzz smoke
         if: ${{ !cancelled() && steps.host-build.outcome == 'success' }}
         run: |

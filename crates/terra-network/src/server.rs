@@ -2428,6 +2428,7 @@ mod tests {
             let mut expected = Vec::new();
             if has_prefix {
                 sender.send_to(b"first", destination).unwrap();
+                socket.peek_from(&mut [0; 5]).await.unwrap();
                 expected.push(Datagram {
                     peer,
                     bytes: b"first".to_vec(),
@@ -2442,21 +2443,60 @@ mod tests {
                     stranger.send_to(b"rejected", destination).unwrap();
                 }
             }
+            socket.readable().await.unwrap();
+            let (_, mut receive) = broker.prepare(Operation::ReceiveDatagram(1)).unwrap();
+            let mut received = Vec::new();
+            if let Some(completed) = receive.as_mut().now_or_never() {
+                let Completion::Reply(Reply::Datagrams(batch)) = completed.unwrap() else {
+                    panic!("expected a datagram batch");
+                };
+                assert_eq!(batch, expected);
+                received.extend(batch);
+                (_, receive) = broker.prepare(Operation::ReceiveDatagram(1)).unwrap();
+            }
+            let mut rejected = [0; MAX_NETWORK_DATAGRAM_BYTES + 1];
+            let (length, rejected_peer) =
+                tokio::time::timeout(Duration::from_secs(1), socket.peek_from(&mut rejected))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(
+                rejected_peer,
+                if is_oversized {
+                    peer
+                } else {
+                    stranger.local_addr().unwrap()
+                }
+            );
+            assert_eq!(
+                length,
+                if is_oversized {
+                    MAX_NETWORK_DATAGRAM_BYTES + 1
+                } else {
+                    b"rejected".len()
+                }
+            );
+            assert!(receive.as_mut().now_or_never().is_none());
             sender.send_to(b"last", destination).unwrap();
             expected.push(Datagram {
                 peer,
                 bytes: b"last".to_vec(),
             });
-            socket.readable().await.unwrap();
-            let (_, mut receive) = broker.prepare(Operation::ReceiveDatagram(1)).unwrap();
-            assert!(receive.as_mut().now_or_never().is_none());
-            let completed = tokio::time::timeout(Duration::from_secs(1), receive)
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(
-                matches!(completed, Completion::Reply(reply) if reply == Reply::Datagrams(expected))
-            );
+            while received.len() < expected.len() {
+                let completed = tokio::time::timeout(Duration::from_secs(1), &mut receive)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let Completion::Reply(Reply::Datagrams(batch)) = completed else {
+                    panic!("expected a datagram batch");
+                };
+                assert!(!batch.is_empty() && batch.len() <= MAX_NETWORK_DATAGRAMS);
+                received.extend(batch);
+                if received.len() < expected.len() {
+                    (_, receive) = broker.prepare(Operation::ReceiveDatagram(1)).unwrap();
+                }
+            }
+            assert_eq!(received, expected);
         }
     }
 

@@ -5,6 +5,7 @@ from pathlib import Path
 import importlib.util
 import itertools
 import os
+import re
 import subprocess
 import tempfile
 import unittest
@@ -173,6 +174,29 @@ tar() { :; }
             self.assertIn('TERRA_SECCOMP_ENFORCED=1 cargo test', command)
             self.assertIn('--exact bwrap_enforces_vm_and_vcpu_threads --ignored --nocapture', command)
             self.assertIn("grep -Fq 'test result: ok. 1 passed; 0 failed; 0 ignored;'", command)
+
+    def test_component_cleanup_preserves_runtime_wasm_fixtures(self):
+        fixture_source = (ROOT / 'crates/terra-runtime/src/test_fixtures.rs').read_text()
+        fixture_paths = re.findall(r'components/target/[^"\n]+\.wasm', fixture_source)
+        self.assertTrue(fixture_paths)
+        command = workflow_command('Reclaim component build space')
+        with tempfile.TemporaryDirectory() as directory:
+            subprocess.run(['bash', '-e', '-c', command], cwd=directory, check=True)
+            for fixture in fixture_paths:
+                artifact = Path(directory) / fixture
+                artifact.parent.mkdir(parents=True, exist_ok=True)
+                artifact.write_bytes(b'wasm-fixture')
+            intermediate_targets = [Path(directory) / 'components/target' / target for target in (
+                'release', 'debug', 'wasm32-unknown-unknown', 'wasm32-wasip3', 'x86_64-unknown-linux-gnu',
+            )]
+            for target in intermediate_targets:
+                target.mkdir()
+                (target / 'intermediate-artifact').write_bytes(b'intermediate')
+            subprocess.run(['bash', '-e', '-c', command], cwd=directory, check=True)
+            for fixture in fixture_paths:
+                self.assertEqual((Path(directory) / fixture).read_bytes(), b'wasm-fixture')
+            for target in intermediate_targets:
+                self.assertFalse(target.exists(), target)
 
     def test_kvm_permissions_survive_device_initialization(self):
         """KVM's first open can trigger udev to discard a one-time user ACL."""

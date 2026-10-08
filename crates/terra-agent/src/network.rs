@@ -110,7 +110,7 @@ impl NetworkClient {
             let _permit = self.queries.acquire().await.map_err(io::Error::other)?;
             let id = self
                 .next_id
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
                 .map_err(|_| io::Error::other("DNS query identifiers exhausted"))?;
             let (sender, reply) = oneshot::channel();
             self.pending

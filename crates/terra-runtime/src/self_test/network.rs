@@ -565,6 +565,7 @@ fn accept_stream(listener: &TcpListener, wait: Duration) -> wasmtime::Result<Tcp
 }
 
 fn configure_stream(stream: &TcpStream) -> wasmtime::Result<()> {
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(WAIT))?;
     stream.set_write_timeout(Some(WAIT))?;
     stream.set_nodelay(true)?;
@@ -1465,6 +1466,28 @@ impl GuestNetwork {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Accepted sockets inherit nonblocking mode on macOS; fixture reads must wait for delayed input.
+    #[test]
+    fn configured_fixture_stream_waits_for_delayed_input() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let mut stream = listener.accept().unwrap().0;
+        stream.set_nonblocking(true).unwrap();
+        let mut bytes = [0];
+        assert_eq!(
+            stream.read(&mut bytes).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        configure_stream(&stream).unwrap();
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            client.write_all(b"R").unwrap();
+        });
+        stream.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"R");
+        sender.join().unwrap();
+    }
 
     /// The host self-test starts these servers before its boot, vsock, storage and filesystem
     /// stages; a server that gave up after `WAIT` refused the guest's later connection under
