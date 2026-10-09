@@ -3,8 +3,9 @@ use std::sync::{LazyLock, Mutex};
 
 use terra_device_transport::{
     Doorbell, INT_USED_BUFFER, MmioTransport, SPLIT_RING_DESC_F_NEXT, SPLIT_RING_DESC_F_WRITE,
-    SPLIT_RING_DESCRIPTOR_BYTES, SplitRingDescriptor, WriteOutcome, complete_split_ring_entry,
-    publish_interrupt_asserted, read_split_ring_available, split_ring_chain,
+    SPLIT_RING_DESCRIPTOR_BYTES, SplitRingDescriptor, VIRTIO_F_VERSION_1, WriteOutcome,
+    complete_split_ring_entry, publish_interrupt_asserted, read_split_ring_available,
+    split_ring_chain,
 };
 
 use crate::terra::host::{interrupt, memory};
@@ -28,7 +29,6 @@ const DESC_BYTES: u64 = SPLIT_RING_DESCRIPTOR_BYTES as u64;
 const MAX_CHAIN: usize = 32;
 const MAX_REPORT_BYTES: u64 = 128 * 1024 * 1024;
 const PAGE_SIZE: u64 = 4096;
-const VIRTIO_F_VERSION_1: u64 = 1 << 32;
 const VIRTIO_BALLOON_F_PAGE_POISON: u64 = 1 << 4;
 const VIRTIO_BALLOON_F_PAGE_REPORTING: u64 = 1 << 5;
 const HOST_FEATURES: u64 =

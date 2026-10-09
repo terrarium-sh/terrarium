@@ -73,8 +73,8 @@ mod tests {
             Ok(Event::VcpuFinished)
         ));
         assert!(matches!(
-            completed_vcpus_event(Err(super::super::Error::UnsupportedMsr), Some(Ok(Event::Deadline))),
-            Ok(Event::ComponentFailed(error)) if error.contains("UnsupportedMsr")
+            completed_vcpus_event(Err(super::super::Error::BadArmExit), Some(Ok(Event::Deadline))),
+            Ok(Event::ComponentFailed(error)) if error.contains("BadArmExit")
         ));
     }
 }

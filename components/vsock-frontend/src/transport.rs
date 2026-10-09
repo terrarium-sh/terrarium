@@ -2,8 +2,8 @@ use std::sync::{LazyLock, Mutex};
 
 use terra_device_transport::{
     INT_USED_BUFFER, MmioTransport, SPLIT_RING_DESC_F_NEXT, SPLIT_RING_DESC_F_WRITE,
-    SPLIT_RING_DESCRIPTOR_BYTES, SplitRingDescriptor, WriteOutcome, resync_pending_queue_entries,
-    split_ring_chain,
+    SPLIT_RING_DESCRIPTOR_BYTES, SplitRingDescriptor, VIRTIO_F_VERSION_1, WriteOutcome,
+    resync_pending_queue_entries, split_ring_chain,
 };
 use terra_vsock_device::{Reply, VSOCK_HEADER_BYTES, VsockHeader};
 
@@ -17,8 +17,6 @@ const QUEUE_SIZE: u16 = 256;
 const DESC_BYTES: u64 = SPLIT_RING_DESCRIPTOR_BYTES as u64;
 const MAX_CHAIN: usize = 16;
 const MAX_PACKET: usize = VSOCK_HEADER_BYTES + terra_vsock_device::MAX_DATA_BYTES as usize;
-const NEXT: u16 = SPLIT_RING_DESC_F_NEXT;
-const WRITE: u16 = SPLIT_RING_DESC_F_WRITE;
 const NO_INTERRUPT: u16 = 1;
 const NO_NOTIFY: u16 = 1;
 
@@ -75,7 +73,7 @@ fn new_state() -> State {
         mmio: MmioTransport::new(
             memory::address_limit(),
             19,
-            1 << 32,
+            VIRTIO_F_VERSION_1,
             QUEUE_SIZE,
             terra_vsock_device::GUEST_CID.to_le_bytes().to_vec(),
         )
@@ -129,7 +127,14 @@ fn at(base: u64, offset: u64) -> Result<u64, DeviceError> {
 }
 
 fn chain(table: &[u8], index: u16, size: u16) -> Result<Vec<SplitRingDescriptor>, DeviceError> {
-    split_ring_chain(table, index, size, MAX_CHAIN, NEXT | WRITE).map_err(DeviceError::from)
+    split_ring_chain(
+        table,
+        index,
+        size,
+        MAX_CHAIN,
+        SPLIT_RING_DESC_F_NEXT | SPLIT_RING_DESC_F_WRITE,
+    )
+    .map_err(DeviceError::from)
 }
 
 fn capture_queue_batch(
@@ -317,7 +322,8 @@ fn read_tx_packet(
     mut read_memory: impl FnMut(u64, u64) -> Result<Vec<u8>, DeviceError>,
 ) -> Result<Option<(VsockHeader, Vec<u8>)>, DeviceError> {
     let Some(first) = descriptors.first().filter(|descriptor| {
-        descriptor.flags & WRITE == 0 && descriptor.len as usize == VSOCK_HEADER_BYTES
+        descriptor.flags & SPLIT_RING_DESC_F_WRITE == 0
+            && descriptor.len as usize == VSOCK_HEADER_BYTES
     }) else {
         return Ok(None);
     };
@@ -333,7 +339,7 @@ fn read_tx_packet(
         || data_len != Some(payload_len)
         || descriptors[1..]
             .iter()
-            .any(|descriptor| descriptor.flags & WRITE != 0)
+            .any(|descriptor| descriptor.flags & SPLIT_RING_DESC_F_WRITE != 0)
     {
         return Ok(None);
     }
@@ -385,7 +391,7 @@ fn process_rx(
     let Some(capacity) = capacity else {
         return RxStep::Completed(0);
     };
-    if chain.iter().any(|d| d.flags & WRITE == 0) {
+    if chain.iter().any(|d| d.flags & SPLIT_RING_DESC_F_WRITE == 0) {
         return RxStep::Completed(0);
     }
     if !(VSOCK_HEADER_BYTES..=MAX_PACKET).contains(&capacity) {
@@ -707,7 +713,7 @@ mod tests {
             SplitRingDescriptor {
                 addr: 100,
                 len: u32::try_from(VSOCK_HEADER_BYTES).unwrap(),
-                flags: NEXT,
+                flags: SPLIT_RING_DESC_F_NEXT,
                 next: 1,
             },
             SplitRingDescriptor {
@@ -732,14 +738,14 @@ mod tests {
             bytes[offset..offset + 8].copy_from_slice(&(100 + u64::from(index)).to_le_bytes());
             bytes[offset + 8..offset + 12]
                 .copy_from_slice(&u32::try_from(VSOCK_HEADER_BYTES).unwrap().to_le_bytes());
-            bytes[offset + 12..offset + 14].copy_from_slice(&WRITE.to_le_bytes());
+            bytes[offset + 12..offset + 14].copy_from_slice(&SPLIT_RING_DESC_F_WRITE.to_le_bytes());
         }
         bytes
     }
 
     fn queue_mmio(size: u16) -> MmioTransport {
-        let mut mmio =
-            MmioTransport::new(65536, 19, 1 << 32, QUEUE_SIZE, Vec::new()).with_queue_count(3);
+        let mut mmio = MmioTransport::new(65536, 19, VIRTIO_F_VERSION_1, QUEUE_SIZE, Vec::new())
+            .with_queue_count(3);
         for (offset, value) in [
             (0x38, u32::from(size)),
             (0x80, 0x1000),
@@ -1414,13 +1420,13 @@ mod tests {
             SplitRingDescriptor {
                 addr: 0,
                 len: 44,
-                flags: NEXT | WRITE,
+                flags: SPLIT_RING_DESC_F_NEXT | SPLIT_RING_DESC_F_WRITE,
                 next: 1,
             },
             SplitRingDescriptor {
                 addr: 100,
                 len: 2,
-                flags: WRITE,
+                flags: SPLIT_RING_DESC_F_WRITE,
                 next: 0,
             },
         ];
@@ -1472,7 +1478,7 @@ mod tests {
         short_header[0].len -= 1;
         invalid_chains.push(short_header);
         let mut writable_header = descriptors(5);
-        writable_header[0].flags |= WRITE;
+        writable_header[0].flags |= SPLIT_RING_DESC_F_WRITE;
         invalid_chains.push(writable_header);
         for descriptors in invalid_chains {
             assert!(
@@ -1542,7 +1548,7 @@ mod tests {
 
     #[test]
     fn malformed_descriptor_metadata_is_rejected_before_reading_payload() {
-        for (payload_len, flags) in [(MAX_DATA_BYTES + 1, 0), (5, WRITE)] {
+        for (payload_len, flags) in [(MAX_DATA_BYTES + 1, 0), (5, SPLIT_RING_DESC_F_WRITE)] {
             let mut descriptors = descriptors(payload_len);
             descriptors[1].flags = flags;
             let mut reads = 0;
@@ -1607,7 +1613,7 @@ mod tests {
                 mmio: MmioTransport::new(
                     4096,
                     19,
-                    1 << 32,
+                    VIRTIO_F_VERSION_1,
                     QUEUE_SIZE,
                     GUEST_CID.to_le_bytes().to_vec(),
                 )

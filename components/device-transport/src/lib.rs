@@ -195,6 +195,7 @@ const MAGIC: u32 = 0x7472_6976;
 const VERSION: u32 = 2;
 const VENDOR_ID: u32 = 0x5445_5252;
 pub const INT_USED_BUFFER: u32 = 1;
+pub const VIRTIO_F_VERSION_1: u64 = 1 << 32;
 const REGION_BYTES: u64 = 0x200;
 
 #[macro_export]
@@ -1240,7 +1241,7 @@ mod tests {
 
     #[test]
     fn arms_notifies_acks_and_resets() {
-        let mut transport = MmioTransport::new(0x10_000, 2, 1 << 32, 256, vec![]);
+        let mut transport = MmioTransport::new(0x10_000, 2, VIRTIO_F_VERSION_1, 256, vec![]);
         for status in [1u8, 3, 11, 15] {
             transport.write(0x70, 1, u64::from(status)).unwrap();
         }

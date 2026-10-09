@@ -15,8 +15,8 @@ use futures::{
 
 use terra_device_transport::{
     Doorbell, INT_USED_BUFFER, MmioTransport, SPLIT_RING_DESC_F_NEXT, SPLIT_RING_DESC_F_WRITE,
-    SplitRingDescriptor, WriteOutcome, complete_split_ring_entry, read_split_ring_available,
-    split_ring_chain,
+    SplitRingDescriptor, VIRTIO_F_VERSION_1, WriteOutcome, complete_split_ring_entry,
+    read_split_ring_available, split_ring_chain,
 };
 
 use crate::host;
@@ -32,7 +32,6 @@ const REQUEST_QUEUE: usize = 1;
 const STATUS: u64 = 0x70;
 const QUEUE_SIZE: u16 = 256;
 const DEVICE_ID: u32 = 26;
-const VIRTIO_F_VERSION_1: u64 = 1 << 32;
 const MAX_CHAIN: usize = 32;
 const MAX_REQUEST: usize = 128 * 1024;
 const MAX_READ: usize = 64 * 1024;

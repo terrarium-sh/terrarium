@@ -16,8 +16,9 @@ use std::sync::{LazyLock, Mutex};
 use terra::mmio::types::DeviceError;
 use terra_device_transport::{
     Doorbell, INT_USED_BUFFER, MmioTransport, SPLIT_RING_DESC_F_NEXT, SPLIT_RING_DESC_F_WRITE,
-    SPLIT_RING_DESCRIPTOR_BYTES, SplitRingDescriptor, WriteOutcome, complete_split_ring_entry,
-    publish_interrupt_asserted, read_split_ring_available, split_ring_chain,
+    SPLIT_RING_DESCRIPTOR_BYTES, SplitRingDescriptor, VIRTIO_F_VERSION_1, WriteOutcome,
+    complete_split_ring_entry, publish_interrupt_asserted, read_split_ring_available,
+    split_ring_chain,
 };
 
 mod mmio {
@@ -46,7 +47,6 @@ const VIRTIO_BLK_F_SEG_MAX: u32 = 2;
 const VIRTIO_BLK_F_RO: u32 = 5;
 const VIRTIO_BLK_F_FLUSH: u32 = 9;
 const VIRTIO_BLK_F_DISCARD: u32 = 13;
-const VIRTIO_F_VERSION_1: u32 = 32;
 const CONFIG_SIZE_MAX: usize = 8;
 const CONFIG_SEG_MAX: usize = 12;
 const CONFIG_MAX_DISCARD_SECTORS: usize = 36;
@@ -76,7 +76,7 @@ fn build_block_configuration(capacity: u64, readonly: bool) -> Result<(u64, Vec<
     let mut features = (1u64 << VIRTIO_BLK_F_SIZE_MAX)
         | (1u64 << VIRTIO_BLK_F_SEG_MAX)
         | (1u64 << VIRTIO_BLK_F_FLUSH)
-        | (1u64 << VIRTIO_F_VERSION_1);
+        | VIRTIO_F_VERSION_1;
     if readonly {
         features |= 1u64 << VIRTIO_BLK_F_RO;
     } else {

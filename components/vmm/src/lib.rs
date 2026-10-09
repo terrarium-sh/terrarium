@@ -17,7 +17,6 @@ use terra::vmm::platform;
 #[derive(Debug, Eq, PartialEq)]
 enum Error {
     InvalidVcpu,
-    UnsupportedMsr,
     BadArmExit,
     Mmio(terra::mmio::types::Error),
     Platform(platform::Error),
@@ -31,6 +30,11 @@ const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
 const PSCI_SYSTEM_RESET: u64 = 0x8400_0009;
 const PSCI_VERSION: u64 = 0x8400_0000;
 const PSCI_FEATURES: u64 = 0x8400_000a;
+const PSCI_SUCCESS: i64 = 0;
+const PSCI_NOT_SUPPORTED: i64 = -1;
+const PSCI_INVALID_PARAMETERS: i64 = -2;
+const PSCI_DENIED: i64 = -3;
+const PSCI_ALREADY_ON: i64 = -4;
 
 const MSRS: [(u32, u64); 12] = [
     (0x10, 0),
@@ -47,31 +51,21 @@ const MSRS: [(u32, u64); 12] = [
     (0xC000_0103, 0),
 ];
 
-struct MsrBank {
-    values: [u64; 12],
+/// Returns the vCPU's value for an emulated MSR; `None` means the guest gets a fault.
+fn msr(msrs: &mut [(u32, u64)], index: u32) -> Option<&mut u64> {
+    msrs.iter_mut()
+        .find(|(candidate, _)| *candidate == index)
+        .map(|(_, value)| value)
 }
 
-impl MsrBank {
-    fn new() -> Self {
-        Self {
-            values: MSRS.map(|(_, default)| default),
-        }
-    }
+/// Completes an MMIO exit that loads no guest register.
+const NO_ARM_READ: platform::ArmRead = platform::ArmRead {
+    register: None,
+    value: 0,
+};
 
-    fn slot(index: u32) -> Result<usize, Error> {
-        MSRS.iter()
-            .position(|(candidate, _)| *candidate == index)
-            .ok_or(Error::UnsupportedMsr)
-    }
-
-    fn read(&self, index: u32) -> Result<u64, Error> {
-        Ok(self.values[Self::slot(index)?])
-    }
-
-    fn write(&mut self, index: u32, value: u64) -> Result<(), Error> {
-        self.values[Self::slot(index)?] = value;
-        Ok(())
-    }
+fn width_mask(width: u8) -> u64 {
+    u64::MAX >> (64 - u32::from(width) * 8)
 }
 
 fn psci_features(function: u64) -> i64 {
@@ -84,8 +78,8 @@ fn psci_features(function: u64) -> i64 {
         | PSCI_AFFINITY_INFO
         | PSCI_32_AFFINITY_INFO
         | PSCI_SYSTEM_OFF
-        | PSCI_SYSTEM_RESET => 0,
-        _ => -1,
+        | PSCI_SYSTEM_RESET => PSCI_SUCCESS,
+        _ => PSCI_NOT_SUPPORTED,
     }
 }
 
@@ -98,43 +92,28 @@ fn psci_hvc_for(
     id: u8,
     hvc: &Hvc,
 ) -> Result<platform::Completion, Error> {
+    let target = u8::try_from(hvc.argument0)
+        .ok()
+        .and_then(|target| Some((target, *powered_cpus.get(usize::from(target))?)));
     let status = match hvc.function {
-        PSCI_VERSION => return Ok(platform::Completion::HvcReturn(0x0001_0000)),
-        PSCI_FEATURES => {
-            return Ok(platform::Completion::HvcReturn(psci_features(
-                hvc.argument0,
-            )));
-        }
-        PSCI_AFFINITY_INFO | PSCI_32_AFFINITY_INFO => {
-            if hvc.argument1 != 0 {
-                -2
-            } else {
-                let Ok(target) = u8::try_from(hvc.argument0) else {
-                    return Ok(platform::Completion::HvcReturn(-3));
-                };
-                let Some(powered) = powered_cpus.get_mut(usize::from(target)) else {
-                    return Ok(platform::Completion::HvcReturn(-3));
-                };
-                i64::from(!*powered)
-            }
-        }
-        PSCI_CPU_ON | PSCI_32_CPU_ON => {
-            let Ok(target) = u8::try_from(hvc.argument0) else {
-                return Ok(platform::Completion::HvcReturn(-3));
-            };
-            let Some(powered) = powered_cpus.get_mut(usize::from(target)) else {
-                return Ok(platform::Completion::HvcReturn(-3));
-            };
-            if target == 0 || *powered {
-                -4
-            } else {
+        PSCI_VERSION => 0x0001_0000,
+        PSCI_FEATURES => psci_features(hvc.argument0),
+        PSCI_AFFINITY_INFO | PSCI_32_AFFINITY_INFO => match target {
+            _ if hvc.argument1 != 0 => PSCI_INVALID_PARAMETERS,
+            Some((_, powered)) => i64::from(!powered),
+            None => PSCI_DENIED,
+        },
+        PSCI_CPU_ON | PSCI_32_CPU_ON => match target {
+            Some((0, _) | (_, true)) => PSCI_ALREADY_ON,
+            Some((target, false)) => {
                 return Ok(platform::Completion::CpuStart(platform::CpuStart {
                     target,
                     entry: hvc.argument1,
                     context: hvc.argument2,
                 }));
             }
-        }
+            None => PSCI_DENIED,
+        },
         PSCI_CPU_OFF => {
             *powered_cpus
                 .get_mut(usize::from(id))
@@ -142,7 +121,7 @@ fn psci_hvc_for(
             return Ok(platform::Completion::CpuOff);
         }
         PSCI_SYSTEM_OFF | PSCI_SYSTEM_RESET => return Ok(platform::Completion::SystemStop),
-        _ => -1,
+        _ => PSCI_NOT_SUPPORTED,
     };
     Ok(platform::Completion::HvcReturn(status))
 }
@@ -155,7 +134,7 @@ fn psci_start_result_for(
     powered_cpus: &mut [bool],
     result: platform::HvcResult,
 ) -> Result<platform::Completion, Error> {
-    if result.status == 0 {
+    if result.status == PSCI_SUCCESS {
         *powered_cpus
             .get_mut(usize::from(result.target))
             .ok_or(Error::InvalidVcpu)? = true;
@@ -204,17 +183,13 @@ async fn handle_arm_exception(
     }
     let fields = arm_mmio_fields(request.syndrome)?;
     let value = if fields.write {
-        request.write_value.ok_or(Error::BadArmExit)?
-            & (u64::MAX >> (64 - u32::from(fields.width) * 8))
+        request.write_value.ok_or(Error::BadArmExit)? & width_mask(fields.width)
     } else {
         0
     };
     let value = vcpu_access(request.address, fields.width, value, fields.write).await?;
     let read = if fields.write || fields.register == 31 {
-        platform::ArmRead {
-            register: None,
-            value: 0,
-        }
+        NO_ARM_READ
     } else {
         platform::ArmRead {
             register: Some(fields.register),
@@ -225,7 +200,7 @@ async fn handle_arm_exception(
 }
 
 async fn run_vcpu(cpu: platform::Vcpu, id: u8) -> Result<(), Error> {
-    let mut msrs = MsrBank::new();
+    let mut msrs = MSRS;
     let mut completion = platform::Completion::Start;
     loop {
         let exit = match cpu.resume(completion).await {
@@ -248,24 +223,21 @@ async fn run_vcpu(cpu: platform::Vcpu, id: u8) -> Result<(), Error> {
                 platform::Completion::Reenter
             }
             platform::Exit::PioRead(_) => platform::Completion::PioZero,
-            platform::Exit::Rdmsr(request) => match msrs.read(request.index) {
-                Ok(value) => platform::Completion::Rdmsr(value),
-                Err(Error::UnsupportedMsr) => platform::Completion::MsrFault,
-                Err(error) => return Err(error),
-            },
-            platform::Exit::Wrmsr(request) => match msrs.write(request.index, request.value) {
-                Ok(()) => platform::Completion::Wrmsr,
-                Err(Error::UnsupportedMsr) => platform::Completion::MsrFault,
-                Err(error) => return Err(error),
-            },
+            platform::Exit::Rdmsr(request) => msr(&mut msrs, request.index)
+                .map_or(platform::Completion::MsrFault, |value| {
+                    platform::Completion::Rdmsr(*value)
+                }),
+            platform::Exit::Wrmsr(request) => {
+                msr(&mut msrs, request.index).map_or(platform::Completion::MsrFault, |value| {
+                    *value = request.value;
+                    platform::Completion::Wrmsr
+                })
+            }
             platform::Exit::ArmException(request) => {
                 match handle_arm_exception(id, request).await {
                     Ok(completion) => completion,
                     Err(Error::Mmio(terra::mmio::types::Error::Closed)) => return Ok(()),
-                    Err(Error::BadArmExit) => platform::Completion::ArmRead(platform::ArmRead {
-                        register: None,
-                        value: 0,
-                    }),
+                    Err(Error::BadArmExit) => platform::Completion::ArmRead(NO_ARM_READ),
                     Err(error) => return Err(error),
                 }
             }
@@ -315,10 +287,9 @@ fn arm_mmio_fields(syndrome: u64) -> Result<ArmMmioFields, Error> {
 }
 
 fn arm_load_value(value: u64, width: u8, sign_extend: bool, sf: bool) -> u64 {
-    let bits = u32::from(width) * 8;
-    let value = value & (u64::MAX >> (64 - bits));
+    let value = value & width_mask(width);
     let value = if sign_extend {
-        let shift = 64 - bits;
+        let shift = 64 - u32::from(width) * 8;
         ((value << shift).cast_signed() >> shift).cast_unsigned()
     } else {
         value
@@ -344,14 +315,13 @@ mod tests {
 
     #[test]
     fn msr_banks_are_fixed_and_independent() {
-        let mut first = MsrBank::new();
-        let second = MsrBank::new();
-        assert_eq!(first.read(0x277), Ok(0x0007_0406_0007_0406));
-        assert_eq!(first.write(0xC000_0103, 7), Ok(()));
-        assert_eq!(first.read(0xC000_0103), Ok(7));
-        assert_eq!(second.read(0xC000_0103), Ok(0));
-        assert_eq!(first.read(0), Err(Error::UnsupportedMsr));
-        assert_eq!(first.write(0, 1), Err(Error::UnsupportedMsr));
+        let mut first = MSRS;
+        let mut second = MSRS;
+        assert_eq!(msr(&mut first, 0x277).copied(), Some(0x0007_0406_0007_0406));
+        *msr(&mut first, 0xC000_0103).unwrap() = 7;
+        assert_eq!(msr(&mut first, 0xC000_0103).copied(), Some(7));
+        assert_eq!(msr(&mut second, 0xC000_0103).copied(), Some(0));
+        assert_eq!(msr(&mut first, 0), None);
     }
 
     #[test]
