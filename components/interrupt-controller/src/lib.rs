@@ -8,23 +8,26 @@ mod bindings {
 }
 
 use bindings::exports::terra::interrupt_controller::controller::{
-    Config, Error, IoapicReply, IrqLevel, Mode, X86Interrupt,
+    Config, Error, Guest, IoapicReply, IrqLevel, Mode, X86Interrupt,
 };
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
 
 const PINS: usize = terra_limits::X86_IOAPIC_PINS as usize;
 const REGISTER_SELECT: u8 = 0;
 const WINDOW: u8 = 0x10;
+const VERSION_REGISTER: u8 = 1;
+const VERSION: u32 = ((terra_limits::X86_IOAPIC_PINS - 1) << 16) | 0x11;
 const REDIRECTION_BASE: u8 = 0x10;
-const MASKED: u64 = 1 << 16;
-const LEVEL_TRIGGERED: u64 = 1 << 15;
+const MASKED: u32 = 1 << 16;
+const LEVEL_TRIGGERED: u32 = 1 << 15;
 
 struct Controller {
     mode: Mode,
-    routes: Vec<usize>,
+    routes: Vec<u8>,
     levels: Vec<bool>,
     register: u8,
-    redirection: [u64; PINS],
+    /// Low and high register halves of each redirection entry.
+    redirection: [[u32; 2]; PINS],
     asserted: [bool; PINS],
 }
 
@@ -36,169 +39,122 @@ impl Controller {
         let routes = config
             .routes
             .into_iter()
-            .map(|route| usize::try_from(route).map_err(|_| Error::InvalidSlot))
+            .map(|route| {
+                u8::try_from(route)
+                    .ok()
+                    .filter(|route| usize::from(*route) < PINS)
+                    .ok_or(Error::InvalidSlot)
+            })
             .collect::<Result<Vec<_>, _>>()?;
-        if routes.iter().any(|route| *route >= PINS) {
-            return Err(Error::InvalidSlot);
-        }
         Ok(Self {
             mode: config.mode,
             levels: vec![false; routes.len()],
             routes,
             register: 0,
-            redirection: [MASKED; PINS],
+            redirection: [[MASKED, 0]; PINS],
             asserted: [false; PINS],
         })
     }
 
-    fn access(
-        &mut self,
-        offset: u8,
-        width: u8,
-        write: bool,
-        value: u32,
-    ) -> Result<IoapicReply, Error> {
-        if self.mode != Mode::Ioapic {
-            return Err(Error::InvalidState);
-        }
-        if width != 4 {
-            return Ok(IoapicReply {
-                value: 0,
-                interrupts: Vec::new(),
-            });
-        }
-        match (offset, write) {
-            (REGISTER_SELECT, false) => Ok(IoapicReply {
-                value: u32::from(self.register),
-                interrupts: Vec::new(),
-            }),
-            (REGISTER_SELECT, true) => {
-                self.register = value.to_le_bytes()[0];
-                Ok(IoapicReply {
-                    value: 0,
-                    interrupts: Vec::new(),
-                })
-            }
-            (WINDOW, false) => Ok(IoapicReply {
-                value: self.read_register(),
-                interrupts: Vec::new(),
-            }),
-            (WINDOW, true) => Ok(IoapicReply {
-                value: 0,
-                interrupts: self
-                    .write_register(value)
+    fn access(&mut self, offset: u8, width: u8, write: bool, value: u32) -> IoapicReply {
+        let mut reply = IoapicReply {
+            value: 0,
+            interrupts: Vec::new(),
+        };
+        match (offset, width, write) {
+            (REGISTER_SELECT, 4, false) => reply.value = u32::from(self.register),
+            (REGISTER_SELECT, 4, true) => self.register = value.to_le_bytes()[0],
+            (WINDOW, 4, false) => reply.value = self.read_register(),
+            (WINDOW, 4, true) => reply.interrupts.extend(
+                self.write_register(value)
                     .filter(|pin| self.asserted[*pin])
-                    .and_then(|pin| self.deliver(pin))
-                    .into_iter()
-                    .collect(),
-            }),
-            _ => Ok(IoapicReply {
-                value: 0,
-                interrupts: Vec::new(),
-            }),
+                    .and_then(|pin| self.deliver(pin)),
+            ),
+            _ => {}
         }
+        reply
     }
 
-    fn line(
-        &mut self,
-        slot: u8,
-        level: bool,
-    ) -> Result<(Option<IrqLevel>, Vec<X86Interrupt>), Error> {
+    /// Returns the GSI whose aggregate level changed.
+    fn line(&mut self, slot: u8, level: bool) -> Result<Option<u8>, Error> {
         let slot = usize::from(slot);
         let gsi = *self.routes.get(slot).ok_or(Error::InvalidSlot)?;
-        if self.levels[slot] == level {
-            return Ok((None, Vec::new()));
-        }
         self.levels[slot] = level;
         let aggregated = self
             .routes
             .iter()
-            .enumerate()
-            .any(|(candidate, route)| *route == gsi && self.levels[candidate]);
-        if self.asserted[gsi] == aggregated {
-            return Ok((None, Vec::new()));
+            .zip(&self.levels)
+            .any(|(route, level)| *route == gsi && *level);
+        let asserted = &mut self.asserted[usize::from(gsi)];
+        if *asserted == aggregated {
+            return Ok(None);
         }
-        self.asserted[gsi] = aggregated;
-        let change = IrqLevel {
-            gsi: u32::try_from(gsi).map_err(|_| Error::InvalidSlot)?,
-            asserted: aggregated,
-        };
-        let interrupts = aggregated
-            .then(|| self.deliver(gsi))
-            .flatten()
-            .into_iter()
-            .collect();
-        Ok((Some(change), interrupts))
+        *asserted = aggregated;
+        Ok(Some(gsi))
     }
 
-    fn eoi(&self, vector: u8) -> Result<Vec<X86Interrupt>, Error> {
-        if self.mode != Mode::Ioapic {
-            return Err(Error::InvalidState);
-        }
-        Ok((0..PINS)
-            .filter(|pin| {
-                self.asserted[*pin]
-                    && self.redirection[*pin].to_le_bytes()[0] == vector
-                    && self.redirection[*pin] & LEVEL_TRIGGERED != 0
-            })
+    fn ioapic_line(&mut self, slot: u8, level: bool) -> Result<Option<X86Interrupt>, Error> {
+        Ok(self
+            .line(slot, level)?
+            .map(usize::from)
+            .filter(|pin| self.asserted[*pin])
+            .and_then(|pin| self.deliver(pin)))
+    }
+
+    fn eoi(&self, vector: u8) -> Vec<X86Interrupt> {
+        (0..PINS)
+            .filter(|pin| self.asserted[*pin])
             .filter_map(|pin| self.deliver(pin))
-            .collect())
+            .filter(|interrupt| interrupt.level_triggered && interrupt.vector == vector)
+            .collect()
+    }
+
+    fn redirection_half(&self) -> Option<(usize, usize)> {
+        let index = usize::from(self.register.checked_sub(REDIRECTION_BASE)?);
+        (index / 2 < PINS).then_some((index / 2, index % 2))
     }
 
     fn read_register(&self) -> u32 {
-        match self.register {
-            1 => ((terra_limits::X86_IOAPIC_PINS - 1) << 16) | 0x11,
-            0 | 2 => 0,
-            register if register >= REDIRECTION_BASE => {
-                let entry = usize::from(register - REDIRECTION_BASE) / 2;
-                if entry >= PINS {
-                    return 0;
-                }
-                let bytes = self.redirection[entry].to_le_bytes();
-                if (register - REDIRECTION_BASE).is_multiple_of(2) {
-                    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
-                } else {
-                    u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]])
-                }
-            }
-            _ => 0,
+        if self.register == VERSION_REGISTER {
+            return VERSION;
         }
+        self.redirection_half()
+            .map_or(0, |(pin, half)| self.redirection[pin][half])
     }
 
+    /// Returns the pin whose redirection entry was written.
     fn write_register(&mut self, value: u32) -> Option<usize> {
-        if self.register < REDIRECTION_BASE {
-            return None;
-        }
-        let entry = usize::from(self.register - REDIRECTION_BASE) / 2;
-        if entry >= PINS {
-            return None;
-        }
-        if (self.register - REDIRECTION_BASE).is_multiple_of(2) {
-            self.redirection[entry] =
-                (self.redirection[entry] & !u64::from(u32::MAX)) | u64::from(value);
-        } else {
-            self.redirection[entry] =
-                (self.redirection[entry] & u64::from(u32::MAX)) | (u64::from(value) << 32);
-        }
-        Some(entry)
+        let (pin, half) = self.redirection_half()?;
+        self.redirection[pin][half] = value;
+        Some(pin)
     }
 
     fn deliver(&self, pin: usize) -> Option<X86Interrupt> {
-        let entry = self.redirection[pin];
-        (entry & MASKED == 0).then_some(X86Interrupt {
-            vector: entry.to_le_bytes()[0],
-            destination: entry.to_le_bytes()[7],
-            level_triggered: entry & LEVEL_TRIGGERED != 0,
+        let [low, high] = self.redirection[pin];
+        (low & MASKED == 0).then_some(X86Interrupt {
+            vector: low.to_le_bytes()[0],
+            destination: high.to_le_bytes()[3],
+            level_triggered: low & LEVEL_TRIGGERED != 0,
         })
     }
 }
 
 static CONTROLLER: LazyLock<Mutex<Option<Controller>>> = LazyLock::new(|| Mutex::new(None));
 
-fn controller() -> std::sync::MutexGuard<'static, Option<Controller>> {
-    CONTROLLER
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+fn controller() -> MutexGuard<'static, Option<Controller>> {
+    CONTROLLER.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn with_controller<T>(
+    mode: Mode,
+    operate: impl FnOnce(&mut Controller) -> Result<T, Error>,
+) -> Result<T, Error> {
+    let mut state = controller();
+    let controller = state
+        .as_mut()
+        .filter(|controller| controller.mode == mode)
+        .ok_or(Error::InvalidState)?;
+    operate(controller)
 }
 
 struct Component;
@@ -209,7 +165,7 @@ mod component_exports {
     bindings::export!(Component with_types_in bindings);
 }
 
-impl bindings::exports::terra::interrupt_controller::controller::Guest for Component {
+impl Guest for Component {
     fn configure(config: Config) -> Result<(), Error> {
         let mut controller = controller();
         if controller.is_some() {
@@ -220,37 +176,31 @@ impl bindings::exports::terra::interrupt_controller::controller::Guest for Compo
     }
 
     fn irq_line(slot: u8, asserted: bool) -> Result<Option<IrqLevel>, Error> {
-        let mut state = controller();
-        let controller = state.as_mut().ok_or(Error::InvalidState)?;
-        if controller.mode != Mode::IrqLines {
-            return Err(Error::InvalidState);
-        }
-        let (change, _) = controller.line(slot, asserted)?;
-        Ok(change)
+        with_controller(Mode::IrqLines, |controller| {
+            Ok(controller.line(slot, asserted)?.map(|gsi| IrqLevel {
+                gsi: u32::from(gsi),
+                asserted: controller.asserted[usize::from(gsi)],
+            }))
+        })
     }
 
     fn ioapic_line(slot: u8, asserted: bool) -> Result<Vec<X86Interrupt>, Error> {
-        let mut state = controller();
-        let controller = state.as_mut().ok_or(Error::InvalidState)?;
-        if controller.mode != Mode::Ioapic {
-            return Err(Error::InvalidState);
-        }
-        let (_, interrupts) = controller.line(slot, asserted)?;
-        Ok(interrupts)
+        with_controller(Mode::Ioapic, |controller| {
+            Ok(controller
+                .ioapic_line(slot, asserted)?
+                .into_iter()
+                .collect())
+        })
     }
 
     fn access(offset: u8, width: u8, write: bool, value: u32) -> Result<IoapicReply, Error> {
-        controller()
-            .as_mut()
-            .ok_or(Error::InvalidState)?
-            .access(offset, width, write, value)
+        with_controller(Mode::Ioapic, |controller| {
+            Ok(controller.access(offset, width, write, value))
+        })
     }
 
     fn eoi(vector: u8) -> Result<Vec<X86Interrupt>, Error> {
-        controller()
-            .as_ref()
-            .ok_or(Error::InvalidState)?
-            .eoi(vector)
+        with_controller(Mode::Ioapic, |controller| Ok(controller.eoi(vector)))
     }
 }
 
@@ -263,7 +213,7 @@ mod tests {
     }
 
     fn access(controller: &mut Controller, offset: u8, write: bool, value: u32) -> IoapicReply {
-        controller.access(offset, 4, write, value).unwrap()
+        controller.access(offset, 4, write, value)
     }
 
     fn redirection(controller: &mut Controller, pin: u8, low: u32, high: u32) {
@@ -288,16 +238,17 @@ mod tests {
         let mut controller = controller(Mode::Ioapic, vec![5, 5]);
         redirection(&mut controller, 5, 0x31, 2 << 24);
         assert_eq!(
-            controller.line(0, true).unwrap().1,
-            vec![X86Interrupt {
+            controller.ioapic_line(0, true).unwrap(),
+            Some(X86Interrupt {
                 vector: 0x31,
                 destination: 2,
                 level_triggered: false,
-            }]
+            })
         );
-        assert_eq!(controller.line(1, true).unwrap().1, []);
-        assert_eq!(controller.line(0, false).unwrap().0, None);
-        assert_eq!(controller.line(1, false).unwrap().0.unwrap().gsi, 5);
+        assert_eq!(controller.ioapic_line(1, true).unwrap(), None);
+        assert_eq!(controller.line(0, false).unwrap(), None);
+        assert_eq!(controller.line(1, false).unwrap(), Some(5));
+        assert!(!controller.asserted[5]);
     }
 
     #[test]
@@ -346,23 +297,18 @@ mod tests {
     #[test]
     fn eoi_redelivers_an_asserted_level_interrupt() {
         let mut controller = controller(Mode::Ioapic, vec![5]);
-        redirection(
-            &mut controller,
-            5,
-            0x31 | u32::try_from(LEVEL_TRIGGERED).unwrap(),
-            0,
-        );
-        let (_, delivered) = controller.line(0, true).unwrap();
-        assert_eq!(delivered.len(), 1);
-        assert_eq!(controller.eoi(0x31).unwrap(), delivered);
-        assert_eq!(controller.eoi(0x32).unwrap(), []);
+        redirection(&mut controller, 5, 0x31 | LEVEL_TRIGGERED, 0);
+        let delivered = controller.ioapic_line(0, true).unwrap();
+        assert!(delivered.is_some());
+        assert_eq!(controller.eoi(0x31), Vec::from_iter(delivered));
+        assert_eq!(controller.eoi(0x32), []);
     }
 
     #[test]
     fn writing_an_asserted_redirection_entry_redelivers_it() {
         let mut controller = controller(Mode::Ioapic, vec![5]);
         redirection(&mut controller, 5, 0x31, 0);
-        assert_eq!(controller.line(0, true).unwrap().1.len(), 1);
+        assert!(controller.ioapic_line(0, true).unwrap().is_some());
         access(
             &mut controller,
             REGISTER_SELECT,
@@ -400,7 +346,7 @@ mod tests {
         assert_eq!(controller.line(u8::MAX, true), Err(Error::InvalidSlot));
         for (offset, width) in [(4, 4), (0, 1)] {
             assert_eq!(
-                controller.access(offset, width, false, 0).unwrap(),
+                controller.access(offset, width, false, 0),
                 IoapicReply {
                     value: 0,
                     interrupts: Vec::new(),

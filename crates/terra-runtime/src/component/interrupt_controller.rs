@@ -1,7 +1,7 @@
 //! Native boundary for the isolated interrupt-controller component.
 
-use crate::box_runtime::BoxRuntime;
 use crate::box_runtime::store::{StoreHost, StoreState};
+use crate::box_runtime::{BoxRuntime, DeviceWorker};
 use crate::machine::{Architecture, DeviceKind, MachineConfig};
 use std::sync::{Arc, Mutex, mpsc};
 use tokio::sync::{mpsc as queue, watch};
@@ -21,8 +21,6 @@ pub use controller::{IoapicReply, X86Interrupt};
 
 const IOAPIC_PINS: usize = terra_limits::X86_IOAPIC_PINS as usize;
 const RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-pub type Inject = Arc<dyn Fn(X86Interrupt) -> wasmtime::Result<()> + Send + Sync>;
 
 struct ControllerHost;
 
@@ -74,7 +72,21 @@ impl<T> Clone for InterruptQueue<T> {
     }
 }
 
-impl<T> InterruptQueue<T> {
+impl<T: Send + 'static> InterruptQueue<T> {
+    fn bind_line(
+        &self,
+        config: &MachineConfig,
+        kind: DeviceKind,
+        ordinal: usize,
+        line_command: fn(u8, bool) -> T,
+    ) -> wasmtime::Result<crate::component::InterruptCallback> {
+        let slot = config.device_slot(kind, ordinal)?;
+        let queue = self.clone();
+        Ok(Arc::new(move |level| {
+            queue.send_if_open(line_command(slot, level))
+        }))
+    }
+
     fn send(&self, command: T) -> wasmtime::Result<()> {
         self.sender
             .lock()
@@ -171,14 +183,11 @@ impl IoApicHandle {
         kind: DeviceKind,
         ordinal: usize,
     ) -> wasmtime::Result<crate::component::InterruptCallback> {
-        let slot = self.config.device_slot(kind, ordinal)?;
-        let queue = self.queue.clone();
-        Ok(Arc::new(move |level| {
-            queue.send_if_open(IoApicPending {
+        self.queue
+            .bind_line(&self.config, kind, ordinal, |slot, level| IoApicPending {
                 command: IoApicCommand::Line(slot, level),
                 response: None,
             })
-        }))
     }
 
     pub fn access(&self, offset: u8, width: u8, write: bool, value: u32) -> wasmtime::Result<u32> {
@@ -220,11 +229,8 @@ impl IrqHandle {
         kind: DeviceKind,
         ordinal: usize,
     ) -> wasmtime::Result<crate::component::InterruptCallback> {
-        let slot = self.config.device_slot(kind, ordinal)?;
-        let queue = self.queue.clone();
-        Ok(Arc::new(move |level| {
-            queue.send_if_open(GsiCommand(slot, level))
-        }))
+        self.queue
+            .bind_line(&self.config, kind, ordinal, GsiCommand)
     }
     pub async fn close(&self) -> wasmtime::Result<()> {
         let result = self.queue.close().await;
@@ -245,21 +251,11 @@ impl IrqHandle {
     }
 }
 
-fn controller_config(config: &MachineConfig, mode: controller::Mode) -> controller::Config {
-    controller::Config {
-        mode,
-        routes: config.devices().iter().map(|device| device.irq).collect(),
-    }
-}
-
 async fn instantiate(
     root: &mut BoxRuntime,
     component: &Component,
     config: controller::Config,
-) -> wasmtime::Result<(
-    crate::box_runtime::DeviceWorker<ControllerHost>,
-    controller::Guest,
-)> {
+) -> wasmtime::Result<(DeviceWorker<ControllerHost>, controller::Guest)> {
     let mut worker = root.new_child(ControllerHost);
     let linker =
         wasmtime::component::Linker::<StoreState<ControllerHost>>::new(worker.store.engine());
@@ -284,6 +280,25 @@ async fn call_bounded<T>(
 }
 
 impl BoxRuntime {
+    async fn start_controller(
+        &mut self,
+        component: &Component,
+        mode: controller::Mode,
+    ) -> wasmtime::Result<(
+        MachineConfig,
+        DeviceWorker<ControllerHost>,
+        controller::Guest,
+    )> {
+        let config = self.claim_x86_controller()?;
+        let controller_config = controller::Config {
+            mode,
+            routes: config.devices().iter().map(|device| device.irq).collect(),
+        };
+        let (worker, controller) =
+            call_bounded(instantiate(self, component, controller_config)).await?;
+        Ok((config, worker, controller))
+    }
+
     fn claim_x86_controller(&self) -> wasmtime::Result<MachineConfig> {
         let config = self
             .store
@@ -309,15 +324,11 @@ impl BoxRuntime {
     pub async fn grant_ioapic(
         &mut self,
         component: &Component,
-        inject: Inject,
+        inject: impl Fn(X86Interrupt) -> wasmtime::Result<()> + Send + Sync + 'static,
     ) -> wasmtime::Result<IoApicHandle> {
-        let config = self.claim_x86_controller()?;
-        let (mut worker, controller) = call_bounded(instantiate(
-            self,
-            component,
-            controller_config(&config, controller::Mode::Ioapic),
-        ))
-        .await?;
+        let (config, mut worker, controller) = self
+            .start_controller(component, controller::Mode::Ioapic)
+            .await?;
         let (queue, mut receiver, completion) = interrupt_queue::<IoApicPending>();
         let access = controller.func_access();
         let line = controller.func_ioapic_line();
@@ -387,15 +398,11 @@ impl BoxRuntime {
         component: &Component,
         inject: impl Fn(u32, bool) -> wasmtime::Result<()> + Send + Sync + 'static,
     ) -> wasmtime::Result<IrqHandle> {
-        let config = self.claim_x86_controller()?;
+        let (config, mut worker, controller) = self
+            .start_controller(component, controller::Mode::IrqLines)
+            .await?;
         let routes: Arc<[u32]> = config.devices().iter().map(|device| device.irq).collect();
         let inject: Arc<dyn Fn(u32, bool) -> wasmtime::Result<()> + Send + Sync> = Arc::new(inject);
-        let (mut worker, controller) = call_bounded(instantiate(
-            self,
-            component,
-            controller_config(&config, controller::Mode::IrqLines),
-        ))
-        .await?;
         let (queue, mut receiver, completion) = interrupt_queue::<GsiCommand>();
         let line = controller.func_irq_line();
         let worker_routes = Arc::clone(&routes);

@@ -625,21 +625,18 @@ async fn wasi_lifecycle_closes_a_device_through_the_running_mmio_bridge() {
     let delivered = Arc::new(std::sync::Mutex::new(Vec::new()));
     let injections = Arc::clone(&delivered);
     let ioapic = runtime
-        .grant_ioapic(
-            &interrupt_controller(&engine),
-            Arc::new(move |interrupt| {
-                injections
-                    .lock()
-                    .expect("interrupt observer")
-                    .push(interrupt);
-                Ok(())
-            }),
-        )
+        .grant_ioapic(&interrupt_controller(&engine), move |interrupt| {
+            injections
+                .lock()
+                .expect("interrupt observer")
+                .push(interrupt);
+            Ok(())
+        })
         .await
         .expect("IOAPIC grant");
     assert!(
         runtime
-            .grant_ioapic(&interrupt_controller(&engine), Arc::new(|_| Ok(())))
+            .grant_ioapic(&interrupt_controller(&engine), |_| Ok(()))
             .await
             .is_err()
     );
@@ -735,7 +732,7 @@ async fn wasi_irq_lines_drain_assertions_before_vm_release() {
     );
     assert!(
         runtime
-            .grant_ioapic(&interrupt_controller(&engine), Arc::new(|_| Ok(())))
+            .grant_ioapic(&interrupt_controller(&engine), |_| Ok(()))
             .await
             .is_err()
     );

@@ -95,14 +95,11 @@ pub async fn prepare(mut input: VmInput) -> Result<PreparedVm, String> {
                 .map_err(|error| error.to_string())?;
             let inject = Arc::clone(&native_handle);
             let interrupts = runtime
-                .grant_ioapic(
-                    &controller,
-                    Arc::new(move |interrupt| {
-                        inject
-                            .request_x86_interrupt(interrupt.vector, interrupt.destination)
-                            .map_err(wasmtime::Error::msg)
-                    }),
-                )
+                .grant_ioapic(&controller, move |interrupt| {
+                    inject
+                        .request_x86_interrupt(interrupt.vector, interrupt.destination)
+                        .map_err(wasmtime::Error::msg)
+                })
                 .await
                 .map_err(|error| error.to_string())?;
             devices::assemble_devices(
