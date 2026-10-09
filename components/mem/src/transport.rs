@@ -1,14 +1,23 @@
 use std::sync::{LazyLock, Mutex};
 
 use terra_device_transport::{
-    Doorbell, INT_USED_BUFFER, MmioTransport, QueueEntry, SPLIT_RING_DESC_F_NEXT,
-    SPLIT_RING_DESCRIPTOR_BYTES, SplitRingDescriptor, WriteOutcome, complete_split_ring_entry,
-    publish_interrupt_asserted, read_split_ring_available, split_ring_chain,
+    Doorbell, INT_USED_BUFFER, MmioTransport, SPLIT_RING_DESC_F_NEXT, SPLIT_RING_DESCRIPTOR_BYTES,
+    SplitRingDescriptor, WriteOutcome, complete_split_ring_entry, publish_interrupt_asserted,
+    read_split_ring_available, split_ring_chain,
 };
 
 use crate::terra::host::{interrupt, memory};
 use crate::terra::mem::host::{self, Range};
 use crate::terra::mmio::types::DeviceError;
+
+#[derive(Debug, PartialEq, Eq)]
+struct QueueEntry {
+    descriptor_table: u64,
+    available_ring: u64,
+    used_ring: u64,
+    size: u16,
+    head: u16,
+}
 
 const REPORT: usize = 2;
 const QUEUE_COUNT_U16: u16 = 3;
@@ -78,12 +87,7 @@ fn available(state: &mut State, queue: usize) -> Result<Option<QueueEntry>, Devi
         .mmio
         .queue_addrs_for(queue)
         .ok_or(DeviceError::NotReady)?;
-    let (_, head) = read_split_ring_available(
-        available_ring,
-        core::num::NonZeroU16::new(size).ok_or(DeviceError::BadQueue)?,
-        &mut state.next[queue],
-        read,
-    )?;
+    let (_, head) = read_split_ring_available(available_ring, size, &mut state.next[queue], read)?;
     Ok(head.map(|head| QueueEntry {
         descriptor_table,
         available_ring,
@@ -94,14 +98,7 @@ fn available(state: &mut State, queue: usize) -> Result<Option<QueueEntry>, Devi
 }
 
 fn complete(state: &mut State, queue: usize, ring: &QueueEntry) -> Result<(), DeviceError> {
-    complete_split_ring_entry(
-        ring.used_ring,
-        core::num::NonZeroU16::new(ring.size).ok_or(DeviceError::BadQueue)?,
-        ring.head,
-        0,
-        read,
-        write,
-    )?;
+    complete_split_ring_entry(ring.used_ring, ring.size, ring.head, 0, read, write)?;
     state.next[queue] = state.next[queue].wrapping_add(1);
     state.mmio.signal(INT_USED_BUFFER);
     Ok(())

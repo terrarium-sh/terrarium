@@ -46,7 +46,6 @@ interface boot {
         kernel-layout,
         kernel-too-large,
         boot-data-too-large,
-        bounds,
     }
 
     stage: func(machine: machine, kernel-prefix: list<u8>, kernel-size: u64,

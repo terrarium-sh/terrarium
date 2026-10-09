@@ -649,8 +649,7 @@ fn available(queue: usize) -> Result<Option<(u16, u64, u64, u16)>, DeviceError> 
         ))
     })?;
     let mut next = next;
-    let ring_size = core::num::NonZeroU16::new(size).ok_or(DeviceError::BadLen)?;
-    let (_, head) = read_split_ring_available(avail, ring_size, &mut next, read)?;
+    let (_, head) = read_split_ring_available(avail, size, &mut next, read)?;
     if !transport(|transport| {
         if generation != transport.generation {
             return Ok(false);
@@ -671,14 +670,7 @@ fn complete(queue: usize, head: u16, used: u32) -> Result<(), DeviceError> {
             .ok_or(DeviceError::NotReady)?;
         Ok((used_ring, size))
     })?;
-    complete_split_ring_entry(
-        used_ring,
-        core::num::NonZeroU16::new(size).ok_or(DeviceError::BadLen)?,
-        head,
-        used,
-        read,
-        write,
-    )?;
+    complete_split_ring_entry(used_ring, size, head, used, read, write)?;
     transport(|transport| {
         transport.mmio.signal(INT_USED_BUFFER);
         Ok(())

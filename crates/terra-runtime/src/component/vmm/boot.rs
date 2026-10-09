@@ -217,7 +217,7 @@ mod tests {
                     (type $write (record (field "address" u64) (field "bytes" (list u8))))
                     (type $writes (list $write))
                     (type $plan (record (field "entry" u64) (field "boot-argument" u64) (field "kernel-segments" $segments) (field "writes" $writes)))
-                    (type $error (enum "invalid-ram" "invalid-vcpus" "invalid-device" "command-line-too-long" "invalid-kernel" "kernel-architecture" "kernel-layout" "kernel-too-large" "boot-data-too-large" "bounds"))
+                    (type $error (enum "invalid-ram" "invalid-vcpus" "invalid-device" "command-line-too-long" "invalid-kernel" "kernel-architecture" "kernel-layout" "kernel-too-large" "boot-data-too-large"))
                     (type $stage-type (func (param "machine" $machine) (param "kernel-prefix" (list u8)) (param "kernel-size" u64) (param "kernel-command-line" string) (result (result $plan (error $error)))))
                     (core module $module
                         (memory (export "memory") 1)

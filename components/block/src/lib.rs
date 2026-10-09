@@ -481,12 +481,9 @@ async fn process_pending() -> Result<bool, DeviceError> {
         Err(DeviceError::NotReady) => return Ok(false),
         Err(error) => return Err(error),
     };
-    let (available, head) = read_split_ring_available(
-        avail,
-        core::num::NonZeroU16::new(size).ok_or(DeviceError::BadLen)?,
-        &mut next,
-        |address, len| terra::host::memory::read(address, len).map_err(|_| DeviceError::BadLen),
-    )?;
+    let (available, head) = read_split_ring_available(avail, size, &mut next, |address, len| {
+        terra::host::memory::read(address, len).map_err(|_| DeviceError::BadLen)
+    })?;
     let Some(head) = head else {
         if !is_current(epoch) {
             return Ok(false);
@@ -508,7 +505,7 @@ async fn process_pending() -> Result<bool, DeviceError> {
     }
     complete_split_ring_entry(
         used,
-        core::num::NonZeroU16::new(size).ok_or(DeviceError::BadLen)?,
+        size,
         head,
         used_len,
         |address, len| terra::host::memory::read(address, len).map_err(|_| DeviceError::BadLen),

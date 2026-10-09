@@ -85,6 +85,31 @@ pub enum MemoryCopyError {
     TooLarge,
 }
 
+fn for_each_batch<P: Copy, E>(
+    pieces: impl IntoIterator<Item = (P, u64)>,
+    mut issue: impl FnMut(&[P], u64) -> Result<(), E>,
+) -> Result<(), E> {
+    let mut batch = Vec::new();
+    let mut batch_bytes = 0_u64;
+    for (piece, len) in pieces {
+        if !batch.is_empty()
+            && (batch.len() == MAX_BATCH_GUEST_COPY_RANGES
+                || batch_bytes + len > MAX_BATCH_GUEST_COPY_BYTES)
+        {
+            issue(&batch, batch_bytes)?;
+            batch.clear();
+            batch_bytes = 0;
+        }
+        batch.push(piece);
+        batch_bytes += len;
+    }
+    if batch.is_empty() {
+        Ok(())
+    } else {
+        issue(&batch, batch_bytes)
+    }
+}
+
 pub fn read_guest_ranges<E: From<MemoryCopyError>>(
     ranges: &[(u64, u64)],
     read: impl Fn(u64, u64) -> Result<Vec<u8>, E>,
@@ -100,40 +125,26 @@ pub fn read_guest_ranges<E: From<MemoryCopyError>>(
     bytes
         .try_reserve_exact(capacity)
         .map_err(|_| MemoryCopyError::TooLarge)?;
-    let mut batch = Vec::new();
-    let mut batch_bytes = 0_u64;
-    let mut flush = |batch: &mut Vec<(u64, u64)>, batch_bytes: &mut u64| -> Result<(), E> {
-        if batch.is_empty() {
-            return Ok(());
-        }
-        let chunk = if batch.len() == 1 {
-            read(batch[0].0, batch[0].1)?
+    let chunk_bytes =
+        usize::try_from(MAX_SINGLE_GUEST_COPY_BYTES).map_err(|_| MemoryCopyError::TooLarge)?;
+    let pieces = ranges.iter().flat_map(|&(address, len)| {
+        (0..len).step_by(chunk_bytes).map(move |offset| {
+            let piece_len = (len - offset).min(MAX_SINGLE_GUEST_COPY_BYTES);
+            ((address + offset, piece_len), piece_len)
+        })
+    });
+    for_each_batch(pieces, |batch, batch_bytes| -> Result<(), E> {
+        let chunk = if let &[(address, len)] = batch {
+            read(address, len)?
         } else {
             read_batch(batch)?
         };
-        if u64::try_from(chunk.len()).map_err(|_| MemoryCopyError::TooLarge)? != *batch_bytes {
+        if u64::try_from(chunk.len()).map_err(|_| MemoryCopyError::TooLarge)? != batch_bytes {
             return Err(MemoryCopyError::BadLen.into());
         }
         bytes.extend_from_slice(&chunk);
-        batch.clear();
-        *batch_bytes = 0;
         Ok(())
-    };
-    for &(mut address, mut remaining) in ranges {
-        while remaining != 0 {
-            let len = remaining.min(MAX_SINGLE_GUEST_COPY_BYTES);
-            if batch.len() == MAX_BATCH_GUEST_COPY_RANGES
-                || batch_bytes + len > MAX_BATCH_GUEST_COPY_BYTES
-            {
-                flush(&mut batch, &mut batch_bytes)?;
-            }
-            batch.push((address, len));
-            batch_bytes += len;
-            address += len;
-            remaining -= len;
-        }
-    }
-    flush(&mut batch, &mut batch_bytes)?;
+    })?;
     Ok(bytes)
 }
 
@@ -147,34 +158,21 @@ pub fn write_guest_ranges<E: From<MemoryCopyError>>(
             .checked_add(u64::try_from(bytes.len()).map_err(|_| MemoryCopyError::TooLarge)?)
             .ok_or(MemoryCopyError::Unmapped)?;
     }
-    let mut batch = Vec::new();
-    let mut batch_bytes = 0_u64;
-    let flush = |batch: &mut Vec<(u64, &[u8])>, batch_bytes: &mut u64| {
-        if batch.len() == 1 {
-            write(batch[0].0, batch[0].1)?;
-        } else if !batch.is_empty() {
-            write_batch(batch)?;
-        }
-        batch.clear();
-        *batch_bytes = 0;
-        Ok::<(), E>(())
-    };
     let chunk_bytes =
         usize::try_from(MAX_SINGLE_GUEST_COPY_BYTES).map_err(|_| MemoryCopyError::TooLarge)?;
-    for &(mut address, bytes) in ranges {
-        for chunk in bytes.chunks(chunk_bytes) {
-            let len = u64::try_from(chunk.len()).map_err(|_| MemoryCopyError::TooLarge)?;
-            if batch.len() == MAX_BATCH_GUEST_COPY_RANGES
-                || batch_bytes + len > MAX_BATCH_GUEST_COPY_BYTES
-            {
-                flush(&mut batch, &mut batch_bytes)?;
-            }
-            batch.push((address, chunk));
-            batch_bytes += len;
-            address += len;
+    let pieces = ranges.iter().flat_map(|&(address, bytes)| {
+        bytes
+            .chunks(chunk_bytes)
+            .zip((address..).step_by(chunk_bytes))
+            .map(|(chunk, address)| ((address, chunk), chunk.len() as u64))
+    });
+    for_each_batch(pieces, |batch, _| {
+        if let &[(address, bytes)] = batch {
+            write(address, bytes)
+        } else {
+            write_batch(batch)
         }
-    }
-    flush(&mut batch, &mut batch_bytes)
+    })
 }
 
 pub fn publish_interrupt_asserted(asserted: bool, publish: impl FnOnce(bool)) {
@@ -193,18 +191,27 @@ mod status {
     pub const FAILED: u8 = 128;
 }
 
-pub const MAGIC: u32 = 0x7472_6976;
-pub const VERSION: u32 = 2;
-pub const VENDOR_ID: u32 = 0x5445_5252;
+const MAGIC: u32 = 0x7472_6976;
+const VERSION: u32 = 2;
+const VENDOR_ID: u32 = 0x5445_5252;
 pub const INT_USED_BUFFER: u32 = 1;
-pub const REGION_BYTES: u64 = 0x200;
+const REGION_BYTES: u64 = 0x200;
 
 #[macro_export]
 macro_rules! device_error {
     ($output:ident) => {
         impl From<$crate::MmioError> for $output {
             fn from(error: $crate::MmioError) -> Self {
-                $crate::device_error!(error, $output)
+                match error {
+                    $crate::MmioError::Unmapped => Self::Unmapped,
+                    $crate::MmioError::BadQueue => Self::BadQueue,
+                    $crate::MmioError::NotReady => Self::NotReady,
+                    $crate::MmioError::BadLen
+                    | $crate::MmioError::Unaligned
+                    | $crate::MmioError::BadFeatures
+                    | $crate::MmioError::BadStatus
+                    | $crate::MmioError::ReadOnly => Self::BadLen,
+                }
             }
         }
         impl From<$crate::SplitRingError> for $output {
@@ -223,18 +230,6 @@ macro_rules! device_error {
                     $crate::MemoryCopyError::TooLarge => Self::TooLarge,
                 }
             }
-        }
-    };
-    ($error:expr, $output:ident) => {
-        match $error {
-            $crate::MmioError::Unmapped => $output::Unmapped,
-            $crate::MmioError::BadQueue => $output::BadQueue,
-            $crate::MmioError::NotReady => $output::NotReady,
-            $crate::MmioError::BadLen
-            | $crate::MmioError::Unaligned
-            | $crate::MmioError::BadFeatures
-            | $crate::MmioError::BadStatus
-            | $crate::MmioError::ReadOnly => $output::BadLen,
         }
     };
 }
@@ -336,28 +331,28 @@ macro_rules! mmio_device {
     };
 }
 
-#[must_use]
-fn count_pending_queue_entries(next: u16, available: u16, size: u16) -> Option<u16> {
-    let count = available.wrapping_sub(next);
-    (size != 0 && count <= size).then_some(count)
-}
-
 pub fn resync_pending_queue_entries(next: &mut u16, available: u16, size: u16) -> u16 {
-    count_pending_queue_entries(*next, available, size).unwrap_or_else(|| {
+    let count = available.wrapping_sub(*next);
+    if size != 0 && count <= size {
+        count
+    } else {
         *next = available;
         0
-    })
+    }
 }
 
 /// Returns the published available index and the next descriptor head.
 pub fn read_split_ring_available<E: From<MmioError>>(
     available_ring: u64,
-    size: core::num::NonZeroU16,
+    size: u16,
     next: &mut u16,
     read: impl Fn(u64, u64) -> Result<Vec<u8>, E>,
 ) -> Result<(u16, Option<u16>), E> {
+    if size == 0 {
+        return Err(MmioError::BadQueue.into());
+    }
     let available = read_ring_index(ring_address(available_ring, 2)?, &read)?;
-    if resync_pending_queue_entries(next, available, size.get()) == 0 {
+    if resync_pending_queue_entries(next, available, size) == 0 {
         return Ok((available, None));
     }
     let offset = 4 + u64::from(*next % size) * 2;
@@ -367,12 +362,15 @@ pub fn read_split_ring_available<E: From<MmioError>>(
 
 pub fn complete_split_ring_entry<E: From<MmioError>>(
     used_ring: u64,
-    size: core::num::NonZeroU16,
+    size: u16,
     head: u16,
     len: u32,
     read: impl Fn(u64, u64) -> Result<Vec<u8>, E>,
     write: impl Fn(u64, &[u8]) -> Result<(), E>,
 ) -> Result<(), E> {
+    if size == 0 {
+        return Err(MmioError::BadQueue.into());
+    }
     let index = read_ring_index(ring_address(used_ring, 2)?, &read)?;
     let slot = ring_address(used_ring, 4 + u64::from(index % size) * 8)?;
     let mut entry = [0; 8];
@@ -425,34 +423,37 @@ pub fn split_ring_chain(
         }
         visited[usize::from(index)] = true;
         let offset = usize::from(index) * SPLIT_RING_DESCRIPTOR_BYTES;
-        let bytes = table
+        let bytes: &[u8; SPLIT_RING_DESCRIPTOR_BYTES] = table
             .get(offset..offset + SPLIT_RING_DESCRIPTOR_BYTES)
+            .and_then(|bytes| bytes.try_into().ok())
             .ok_or(SplitRingError::BadDescriptor)?;
-        let flags = u16::from_le_bytes(
-            bytes[12..14]
-                .try_into()
-                .map_err(|_| SplitRingError::BadDescriptor)?,
-        );
+        let &[
+            a0,
+            a1,
+            a2,
+            a3,
+            a4,
+            a5,
+            a6,
+            a7,
+            l0,
+            l1,
+            l2,
+            l3,
+            f0,
+            f1,
+            n0,
+            n1,
+        ] = bytes;
+        let flags = u16::from_le_bytes([f0, f1]);
         if flags & !allowed_flags != 0 {
             return Err(SplitRingError::BadDescriptor);
         }
         let descriptor = SplitRingDescriptor {
-            addr: u64::from_le_bytes(
-                bytes[..8]
-                    .try_into()
-                    .map_err(|_| SplitRingError::BadDescriptor)?,
-            ),
-            len: u32::from_le_bytes(
-                bytes[8..12]
-                    .try_into()
-                    .map_err(|_| SplitRingError::BadDescriptor)?,
-            ),
+            addr: u64::from_le_bytes([a0, a1, a2, a3, a4, a5, a6, a7]),
+            len: u32::from_le_bytes([l0, l1, l2, l3]),
             flags,
-            next: u16::from_le_bytes(
-                bytes[14..]
-                    .try_into()
-                    .map_err(|_| SplitRingError::BadDescriptor)?,
-            ),
+            next: u16::from_le_bytes([n0, n1]),
         };
         let has_next = descriptor.flags & SPLIT_RING_DESC_F_NEXT != 0;
         chain.push(descriptor);
@@ -538,15 +539,6 @@ pub struct MmioTransport {
     config: Vec<u8>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub struct QueueEntry {
-    pub head: u16,
-    pub descriptor_table: u64,
-    pub available_ring: u64,
-    pub used_ring: u64,
-    pub size: u16,
-}
-
 pub fn read_ring_index<E: From<MmioError>>(
     address: u64,
     read: impl FnOnce(u64, u64) -> Result<Vec<u8>, E>,
@@ -624,18 +616,18 @@ impl MmioTransport {
             return Err(MmioError::BadLen);
         }
         let value = match offset {
-            MAGIC_VALUE if width == 4 => MAGIC,
-            REG_VERSION if width == 4 => VERSION,
-            DEVICE_ID if width == 4 => self.device_id,
-            VENDOR if width == 4 => VENDOR_ID,
-            HOST_FEATURES if width == 4 => self.feature_word(self.host_features)?,
-            GUEST_FEATURES if width == 4 => self.feature_word(self.guest_features)?,
-            QUEUE_NUM_MAX if width == 4 => u32::from(self.queue_max),
-            QUEUE_NUM if width == 4 => u32::from(self.selected_regs().num),
-            QUEUE_READY if width == 4 => u32::from(self.selected_regs().ready),
-            INTERRUPT_STATUS if width == 4 => self.interrupt_status,
+            MAGIC_VALUE => MAGIC,
+            REG_VERSION => VERSION,
+            DEVICE_ID => self.device_id,
+            VENDOR => VENDOR_ID,
+            HOST_FEATURES => self.feature_word(self.host_features)?,
+            GUEST_FEATURES => self.feature_word(self.guest_features)?,
+            QUEUE_NUM_MAX => u32::from(self.queue_max),
+            QUEUE_NUM => u32::from(self.selected_regs().num),
+            QUEUE_READY => u32::from(self.selected_regs().ready),
+            INTERRUPT_STATUS => self.interrupt_status,
             REG_STATUS if width == 1 || width == 4 => u32::from(self.status),
-            CONFIG_GENERATION if width == 4 => 0,
+            CONFIG_GENERATION => 0,
             _ if offset >= CONFIG_BASE => return self.config_read(offset - CONFIG_BASE, width),
             _ => return Err(MmioError::Unmapped),
         };
@@ -665,16 +657,19 @@ impl MmioTransport {
 
     pub fn write(&mut self, offset: u64, width: u8, value: u64) -> Result<WriteOutcome, MmioError> {
         Self::check(offset, width)?;
+        if offset < CONFIG_BASE && offset != REG_STATUS && width != 4 {
+            return Err(MmioError::Unmapped);
+        }
         let word = u32::try_from(value & u64::from(u32::MAX)).map_err(|_| MmioError::BadLen)?;
         match offset {
-            HOST_FEATURES_SEL | GUEST_FEATURES_SEL if width == 4 => {
+            HOST_FEATURES_SEL | GUEST_FEATURES_SEL => {
                 let selected = word;
                 if selected > 1 {
                     return Err(MmioError::BadFeatures);
                 }
                 self.feature_sel = selected;
             }
-            GUEST_FEATURES if width == 4 => {
+            GUEST_FEATURES => {
                 let value = u64::from(word);
                 let features = match self.feature_sel {
                     0 => self.guest_features & 0xffff_ffff_0000_0000 | value,
@@ -686,30 +681,30 @@ impl MmioTransport {
                 }
                 self.guest_features = features;
             }
-            QUEUE_SEL if width == 4 => {
+            QUEUE_SEL => {
                 let selected = usize::try_from(word).map_err(|_| MmioError::BadQueue)?;
                 if selected >= self.queues.len() {
                     return Err(MmioError::BadQueue);
                 }
                 self.selected = selected;
             }
-            QUEUE_NUM if width == 4 => {
+            QUEUE_NUM => {
                 let num = u16::try_from(word).map_err(|_| MmioError::BadQueue)?;
                 if self.selected_regs().ready || !valid_queue_size(self.queue_max, num) {
                     return Err(MmioError::BadQueue);
                 }
                 self.selected_regs_mut()?.num = num;
             }
-            QUEUE_READY if width == 4 => match word {
+            QUEUE_READY => match word {
                 0 => self.selected_regs_mut()?.ready = false,
                 1 => self.arm_queue()?,
                 _ => return Err(MmioError::BadQueue),
             },
-            QUEUE_NOTIFY if width == 4 => {
+            QUEUE_NOTIFY => {
                 let bell = self.ring_bell(word)?;
                 return Ok(WriteOutcome::QueueNotify(bell));
             }
-            INTERRUPT_ACK if width == 4 => {
+            INTERRUPT_ACK => {
                 self.interrupt_status &= !word;
                 if self.interrupt_status == 0 {
                     self.set_irq_level(false);
@@ -722,23 +717,14 @@ impl MmioTransport {
                     return Ok(WriteOutcome::Reset);
                 }
             }
-            QUEUE_DESC_LOW if width == 4 => {
-                self.update_addr(|r| &mut r.desc, word, false)?;
+            QUEUE_DESC_LOW | QUEUE_DESC_HIGH => {
+                self.update_addr(|r| &mut r.desc, word, offset == QUEUE_DESC_HIGH)?;
             }
-            QUEUE_DESC_HIGH if width == 4 => {
-                self.update_addr(|r| &mut r.desc, word, true)?;
+            QUEUE_AVAIL_LOW | QUEUE_AVAIL_HIGH => {
+                self.update_addr(|r| &mut r.avail, word, offset == QUEUE_AVAIL_HIGH)?;
             }
-            QUEUE_AVAIL_LOW if width == 4 => {
-                self.update_addr(|r| &mut r.avail, word, false)?;
-            }
-            QUEUE_AVAIL_HIGH if width == 4 => {
-                self.update_addr(|r| &mut r.avail, word, true)?;
-            }
-            QUEUE_USED_LOW if width == 4 => {
-                self.update_addr(|r| &mut r.used, word, false)?;
-            }
-            QUEUE_USED_HIGH if width == 4 => {
-                self.update_addr(|r| &mut r.used, word, true)?;
+            QUEUE_USED_LOW | QUEUE_USED_HIGH => {
+                self.update_addr(|r| &mut r.used, word, offset == QUEUE_USED_HIGH)?;
             }
             _ if offset >= CONFIG_BASE => return Err(MmioError::ReadOnly),
             _ => return Err(MmioError::Unmapped),
@@ -889,7 +875,7 @@ mod tests {
             Ok::<_, MmioError>(memory.borrow()[address..address + len].to_vec())
         };
         let mut next = 0;
-        let size = core::num::NonZeroU16::new(8).unwrap();
+        let size = 8;
         assert_eq!(
             read_split_ring_available(0, size, &mut next, read),
             Ok((1, Some(7)))
@@ -916,19 +902,14 @@ mod tests {
             (5, 5, None, 5),
         ] {
             let mut next = start;
-            let result = read_split_ring_available(
-                0,
-                core::num::NonZeroU16::new(8).unwrap(),
-                &mut next,
-                |address, len| {
-                    assert_eq!(len, 2);
-                    match address {
-                        2 => Ok::<_, MmioError>(available.to_le_bytes().to_vec()),
-                        18 => Ok(7_u16.to_le_bytes().to_vec()),
-                        _ => panic!("unexpected available-ring read"),
-                    }
-                },
-            );
+            let result = read_split_ring_available(0, 8, &mut next, |address, len| {
+                assert_eq!(len, 2);
+                match address {
+                    2 => Ok::<_, MmioError>(available.to_le_bytes().to_vec()),
+                    18 => Ok(7_u16.to_le_bytes().to_vec()),
+                    _ => panic!("unexpected available-ring read"),
+                }
+            });
             assert_eq!(result, Ok((available, head)));
             assert_eq!(next, expected_next);
         }
@@ -940,7 +921,7 @@ mod tests {
             let memory = std::cell::RefCell::new(vec![0; 64]);
             let result = complete_split_ring_entry(
                 32,
-                core::num::NonZeroU16::new(8).unwrap(),
+                8,
                 7,
                 12,
                 |_, _| Ok(vec![0; 2]),
@@ -961,12 +942,9 @@ mod tests {
             Err(MmioError::BadLen)
         );
         assert_eq!(
-            read_split_ring_available(
-                u64::MAX,
-                core::num::NonZeroU16::new(8).unwrap(),
-                &mut 0,
-                |_, _| panic!("overflow must fail before reading")
-            ),
+            read_split_ring_available(u64::MAX, 8, &mut 0, |_, _| panic!(
+                "overflow must fail before reading"
+            )),
             Err(MmioError::Unmapped)
         );
     }
@@ -1135,13 +1113,21 @@ mod tests {
 
     #[test]
     fn pending_entries_handle_wraparound_and_reject_ring_overruns() {
-        use super::count_pending_queue_entries;
-        assert_eq!(count_pending_queue_entries(4, 4, 256), Some(0));
-        assert_eq!(count_pending_queue_entries(4, 260, 256), Some(256));
-        assert_eq!(count_pending_queue_entries(u16::MAX - 1, 1, 256), Some(3));
-        assert_eq!(count_pending_queue_entries(4, 261, 256), None);
-        assert_eq!(count_pending_queue_entries(4, 3, 256), None);
-        assert_eq!(count_pending_queue_entries(0, 0, 0), None);
+        for (start, available, size, count, next) in [
+            (4, 4, 256, 0, 4),
+            (4, 260, 256, 256, 4),
+            (u16::MAX - 1, 1, 256, 3, u16::MAX - 1),
+            (4, 261, 256, 0, 261),
+            (4, 3, 256, 0, 3),
+            (0, 0, 0, 0, 0),
+        ] {
+            let mut resulting_next = start;
+            assert_eq!(
+                resync_pending_queue_entries(&mut resulting_next, available, size),
+                count
+            );
+            assert_eq!(resulting_next, next);
+        }
     }
 
     #[test]

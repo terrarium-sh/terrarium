@@ -4,23 +4,20 @@ use crate::exports::terra::boot::boot::{
     Device, DeviceKind, Error, GuestWrite, KernelSegment, Plan,
 };
 
-const PAGE_SIZE: u64 = terra_limits::RAM_PAGE_SIZE;
-const MAX_VCPUS: u8 = terra_limits::X86_MAX_VCPUS;
-const MAX_DEVICES: usize = terra_limits::X86_MAX_DEVICES;
-const MAX_KERNEL_PREFIX_BYTES: usize = terra_limits::MAX_BOOT_KERNEL_PREFIX_BYTES;
-const MAX_KERNEL_BYTES: u64 = terra_limits::MAX_BOOT_KERNEL_BYTES;
-const MAX_CMDLINE_BYTES: usize = terra_limits::MAX_BOOT_COMMAND_LINE_BYTES;
+use terra_limits::{
+    ARM_GIC_DIST_BASE, ARM_GIC_DIST_SIZE, ARM_GIC_REDIST_BASE, ARM_GIC_REDIST_SIZE,
+    ARM_MAX_DEVICES, ARM_RAM_BASE, ARM_VIRTIO_IRQ_BASE, ARM_VIRTIO_MMIO_BASE,
+    ARM_VIRTIO_MMIO_STRIDE, MAX_BOOT_COMMAND_LINE_BYTES, MAX_BOOT_KERNEL_BYTES,
+    MAX_BOOT_KERNEL_PREFIX_BYTES, MAX_BOOT_WRITE_BYTES, RAM_PAGE_SIZE, X86_GDT_ADDR,
+    X86_MAX_DEVICES, X86_MAX_VCPUS, X86_MMIO_BASE, X86_MMIO_STRIDE, X86_PML4_ADDR, X86_ZERO_PAGE,
+};
+
 const X86_HIMEM_START: u64 = 0x10_0000;
-const X86_ZERO_PAGE: u64 = terra_limits::X86_ZERO_PAGE;
 const X86_CMDLINE: u64 = terra_limits::X86_RAM_BASE + 0x20_000;
 const X86_MP_TABLE: u64 = 0x9fc00;
-const X86_GDT: u64 = terra_limits::X86_GDT_ADDR;
-const X86_PML4: u64 = terra_limits::X86_PML4_ADDR;
 const X86_PDPT: u64 = terra_limits::X86_RAM_BASE + 0xa000;
 const X86_PAGE_DIRECTORY: u64 = terra_limits::X86_RAM_BASE + 0xb000;
 const X86_MMIO_SIZE: u64 = 0x200;
-const X86_MMIO_BASE: u64 = terra_limits::X86_MMIO_BASE;
-const X86_MMIO_STRIDE: u64 = terra_limits::X86_MMIO_STRIDE;
 const X86_IRQ_BASE: u8 = 11;
 const X86_VOLUME_IRQS: [u32; 3] = [20, 21, 22];
 const X86_MOUNT_IRQS: [u32; 3] = [17, 18, 19];
@@ -30,22 +27,13 @@ const X86_PAGE_TABLE_ENTRY: u64 = 0x03;
 const X86_PAGE_2M_ENTRY: u64 = 0x83;
 const X86_GDT_CODE: u64 = 0x00af_9b00_0000_ffff;
 const X86_GDT_DATA: u64 = 0x00cf_9300_0000_ffff;
-const ARM_RAM_BASE: u64 = terra_limits::ARM_RAM_BASE;
 const ARM_FDT_ALIGNMENT: u64 = 0x0020_0000;
-const ARM_FDT_MAX_BYTES: usize = terra_limits::MAX_BOOT_WRITE_BYTES;
-const ARM_MMIO_BASE: u64 = terra_limits::ARM_VIRTIO_MMIO_BASE;
-const ARM_MMIO_STRIDE: u64 = terra_limits::ARM_VIRTIO_MMIO_STRIDE;
-const ARM_MMIO_SIZE: u64 = terra_limits::ARM_VIRTIO_MMIO_STRIDE;
-const ARM_IRQ_BASE: u32 = terra_limits::ARM_VIRTIO_IRQ_BASE;
-const ARM_MAX_DEVICES: usize = terra_limits::ARM_MAX_DEVICES;
-const ARM_GIC_DIST_BASE: u64 = terra_limits::ARM_GIC_DIST_BASE;
-const ARM_GIC_DIST_SIZE: u64 = terra_limits::ARM_GIC_DIST_SIZE;
-const ARM_GIC_REDIST_BASE: u64 = terra_limits::ARM_GIC_REDIST_BASE;
-const ARM_GIC_REDIST_SIZE: u64 = terra_limits::ARM_GIC_REDIST_SIZE;
 
 const _: () = assert!(ARM_GIC_DIST_BASE + ARM_GIC_DIST_SIZE <= ARM_GIC_REDIST_BASE);
-const _: () = assert!(ARM_GIC_REDIST_BASE + ARM_GIC_REDIST_SIZE <= ARM_MMIO_BASE);
-const _: () = assert!(ARM_MMIO_BASE + ARM_MAX_DEVICES as u64 * ARM_MMIO_STRIDE <= ARM_RAM_BASE);
+const _: () = assert!(ARM_GIC_REDIST_BASE + ARM_GIC_REDIST_SIZE <= ARM_VIRTIO_MMIO_BASE);
+const _: () =
+    assert!(ARM_VIRTIO_MMIO_BASE + ARM_MAX_DEVICES as u64 * ARM_VIRTIO_MMIO_STRIDE <= ARM_RAM_BASE);
+const _: () = assert!(MAX_BOOT_WRITE_BYTES as u64 <= ARM_FDT_ALIGNMENT);
 
 fn end(base: u64, size: u64) -> Result<u64, Error> {
     base.checked_add(size).ok_or(Error::KernelLayout)
@@ -84,8 +72,8 @@ fn checked_source(kernel_bytes: u64, offset: u64, len: u64) -> Result<(), Error>
 }
 
 fn validate_kernel_prefix(prefix: &[u8], kernel_bytes: u64) -> Result<(), Error> {
-    if prefix.len() > MAX_KERNEL_PREFIX_BYTES
-        || kernel_bytes > MAX_KERNEL_BYTES
+    if prefix.len() > MAX_BOOT_KERNEL_PREFIX_BYTES
+        || kernel_bytes > MAX_BOOT_KERNEL_BYTES
         || kernel_bytes < u64::try_from(prefix.len()).map_err(|_| Error::InvalidKernel)?
     {
         return Err(Error::KernelTooLarge);
@@ -111,31 +99,25 @@ fn u64_at(bytes: &[u8], offset: usize) -> Option<u64> {
     ))
 }
 
-fn command_line(base: &str, devices: &[Device]) -> Result<String, Error> {
-    let mut command_line = base.split_ascii_whitespace().collect::<Vec<_>>().join(" ");
+fn command_line(kernel_command_line: &str, devices: &[Device]) -> Result<String, Error> {
+    use std::fmt::Write as _;
+    let mut command_line = format!(
+        "{kernel_command_line} init_on_alloc=1 init_on_free=0 initcall_blacklist=print_s5_reset_status_mmio"
+    )
+    .split_ascii_whitespace()
+    .collect::<Vec<_>>()
+    .join(" ");
     for device in devices {
-        use std::fmt::Write as _;
-        write!(
+        let _ = write!(
             command_line,
             " virtio_mmio.device={X86_MMIO_SIZE:#x}@{:#x}:{}",
             device.mmio_base, device.irq
-        )
-        .map_err(|_| Error::CommandLineTooLong)?;
+        );
     }
-    if command_line
-        .len()
-        .checked_add(1)
-        .is_none_or(|len| len > MAX_CMDLINE_BYTES)
-    {
+    if command_line.len() >= MAX_BOOT_COMMAND_LINE_BYTES {
         return Err(Error::CommandLineTooLong);
     }
     Ok(command_line)
-}
-
-fn hardened_command_line(kernel_command_line: &str) -> String {
-    format!(
-        "{kernel_command_line} init_on_alloc=1 init_on_free=0 initcall_blacklist=print_s5_reset_status_mmio"
-    )
 }
 
 fn x86_irq(kind: DeviceKind, ordinal: usize) -> u32 {
@@ -151,46 +133,49 @@ fn x86_irq(kind: DeviceKind, ordinal: usize) -> u32 {
     }
 }
 
+fn validate_device_order(devices: &[Device], rank: fn(DeviceKind) -> u8) -> Result<(), Error> {
+    let count_of = |kind| devices.iter().filter(|device| device.kind == kind).count();
+    let is_ordered = devices
+        .windows(2)
+        .all(|pair| rank(pair[0].kind) <= rank(pair[1].kind));
+    (is_ordered && count_of(DeviceKind::Vsock) == 1 && count_of(DeviceKind::Memory) == 1)
+        .then_some(())
+        .ok_or(Error::InvalidDevice)
+}
+
+fn x86_rank(kind: DeviceKind) -> u8 {
+    match kind {
+        DeviceKind::Block => 0,
+        DeviceKind::Vsock => 1,
+        DeviceKind::Fs => 2,
+        DeviceKind::Memory => 3,
+    }
+}
+
 fn validate_x86_devices(devices: &[Device]) -> Result<(), Error> {
-    if devices.len() < 2 || devices.len() > MAX_DEVICES {
+    if devices.len() > X86_MAX_DEVICES {
         return Err(Error::InvalidDevice);
     }
-    let mut phase = 0;
-    let mut ordinals = [0; 4];
+    validate_device_order(devices, x86_rank)?;
     for (slot, device) in devices.iter().enumerate() {
-        let kind = match device.kind {
-            DeviceKind::Block if phase == 0 => 0,
-            DeviceKind::Vsock if phase == 0 => {
-                phase = 1;
-                1
-            }
-            DeviceKind::Fs if phase == 1 || phase == 2 => {
-                phase = 2;
-                2
-            }
-            DeviceKind::Memory if phase == 1 || phase == 2 => {
-                phase = 3;
-                3
-            }
-            DeviceKind::Block | DeviceKind::Vsock | DeviceKind::Fs | DeviceKind::Memory => {
-                return Err(Error::InvalidDevice);
-            }
-        };
+        let ordinal = devices[..slot]
+            .iter()
+            .filter(|earlier| earlier.kind == device.kind)
+            .count();
         let expected_base = X86_MMIO_BASE
             .checked_add(u64::try_from(slot).map_err(|_| Error::InvalidDevice)? * X86_MMIO_STRIDE)
             .ok_or(Error::InvalidDevice)?;
-        if device.mmio_base != expected_base || device.irq != x86_irq(device.kind, ordinals[kind]) {
+        if device.mmio_base != expected_base || device.irq != x86_irq(device.kind, ordinal) {
             return Err(Error::InvalidDevice);
         }
-        ordinals[kind] += 1;
     }
-    (phase == 3).then_some(()).ok_or(Error::InvalidDevice)
+    Ok(())
 }
 
 fn x86_zero_page(regions: &[(u64, u64)], command_line_len: usize) -> Result<Vec<u8>, Error> {
     let command_line_len =
         u32::try_from(command_line_len).map_err(|_| Error::CommandLineTooLong)?;
-    let mut page = vec![0; usize::try_from(PAGE_SIZE).map_err(|_| Error::BootDataTooLarge)?];
+    let mut page = vec![0; usize::try_from(RAM_PAGE_SIZE).map_err(|_| Error::BootDataTooLarge)?];
     let low_end = end(regions[0].0, regions[0].1)?;
     let e820 = [
         (regions[0].0, X86_MP_TABLE - regions[0].0),
@@ -218,22 +203,19 @@ fn x86_zero_page(regions: &[(u64, u64)], command_line_len: usize) -> Result<Vec<
     Ok(page)
 }
 
-fn x86_page_tables() -> Result<Vec<GuestWrite>, Error> {
+fn x86_page_tables() -> Vec<GuestWrite> {
     const PAGE: usize = 4096;
     let mut pml4 = vec![0; PAGE];
     pml4[..8].copy_from_slice(&(X86_PDPT | X86_PAGE_TABLE_ENTRY).to_le_bytes());
     let mut pdpt = vec![0; PAGE];
     let mut directories = Vec::with_capacity(4);
-    for directory in 0..4_u64 {
-        let address = X86_PAGE_DIRECTORY + directory * PAGE_SIZE;
-        let offset = usize::try_from(directory * 8).map_err(|_| Error::BootDataTooLarge)?;
-        pdpt[offset..offset + 8].copy_from_slice(&(address | X86_PAGE_TABLE_ENTRY).to_le_bytes());
+    for (directory, slot) in (0..4_u64).zip(pdpt.as_chunks_mut::<8>().0) {
+        let address = X86_PAGE_DIRECTORY + directory * RAM_PAGE_SIZE;
+        *slot = (address | X86_PAGE_TABLE_ENTRY).to_le_bytes();
         let mut entries = vec![0; PAGE];
-        for page in 0..X86_ENTRIES_PER_TABLE {
-            let address = (directory * X86_ENTRIES_PER_TABLE + page) * X86_PAGE_2M;
-            let offset = usize::try_from(page * 8).map_err(|_| Error::BootDataTooLarge)?;
-            entries[offset..offset + 8]
-                .copy_from_slice(&(address | X86_PAGE_2M_ENTRY).to_le_bytes());
+        for (page, entry) in (0..X86_ENTRIES_PER_TABLE).zip(entries.as_chunks_mut::<8>().0) {
+            let page_address = (directory * X86_ENTRIES_PER_TABLE + page) * X86_PAGE_2M;
+            *entry = (page_address | X86_PAGE_2M_ENTRY).to_le_bytes();
         }
         directories.push(GuestWrite {
             address,
@@ -245,11 +227,11 @@ fn x86_page_tables() -> Result<Vec<GuestWrite>, Error> {
     gdt.extend_from_slice(&X86_GDT_DATA.to_le_bytes());
     let mut writes = vec![
         GuestWrite {
-            address: X86_GDT + 8,
+            address: X86_GDT_ADDR + 8,
             bytes: gdt,
         },
         GuestWrite {
-            address: X86_PML4,
+            address: X86_PML4_ADDR,
             bytes: pml4,
         },
         GuestWrite {
@@ -258,7 +240,7 @@ fn x86_page_tables() -> Result<Vec<GuestWrite>, Error> {
         },
     ];
     writes.extend(directories);
-    Ok(writes)
+    writes
 }
 
 fn validate_x86_writes(writes: &[GuestWrite], low_ram: &[(u64, u64)]) -> Result<(), Error> {
@@ -270,7 +252,11 @@ fn validate_x86_writes(writes: &[GuestWrite], low_ram: &[(u64, u64)]) -> Result<
     }) {
         return Err(Error::KernelLayout);
     }
-    range_in_regions(terra_limits::X86_STACK_TOP - PAGE_SIZE, PAGE_SIZE, low_ram)
+    range_in_regions(
+        terra_limits::X86_STACK_TOP - RAM_PAGE_SIZE,
+        RAM_PAGE_SIZE,
+        low_ram,
+    )
 }
 
 fn checksum(bytes: &[u8]) -> u8 {
@@ -281,7 +267,7 @@ fn checksum(bytes: &[u8]) -> u8 {
 }
 
 fn mp_table(vcpus: u8) -> Result<Vec<u8>, Error> {
-    if vcpus == 0 || vcpus > MAX_VCPUS {
+    if vcpus == 0 || vcpus > X86_MAX_VCPUS {
         return Err(Error::InvalidVcpus);
     }
     let mut bytes = Vec::new();
@@ -355,7 +341,6 @@ pub(crate) fn plan_x86(
         .map_err(|_| Error::InvalidKernel)?;
     let count = usize::from(u16_at(kernel_prefix, 56).ok_or(Error::InvalidKernel)?);
     let mut segments = Vec::new();
-    let mut image_end = 0;
     for index in 0..count {
         let offset = program_headers
             .checked_add(index.checked_mul(56).ok_or(Error::InvalidKernel)?)
@@ -378,7 +363,6 @@ pub(crate) fn plan_x86(
         }
         checked_source(kernel_bytes, source_offset, file_length)?;
         range_in_regions(guest_address, memory_length, &ram_regions[..1])?;
-        image_end = image_end.max(end(guest_address, memory_length)?);
         segments.push(KernelSegment {
             source_offset,
             guest_address,
@@ -386,15 +370,10 @@ pub(crate) fn plan_x86(
             memory_length,
         });
     }
-    if segments.is_empty()
-        || entry < X86_HIMEM_START
-        || entry >= image_end
-        || range_in_regions(entry, 1, &ram_regions[..1]).is_err()
-        || !segments.iter().any(|segment| {
-            end(segment.guest_address, segment.memory_length)
-                .is_ok_and(|segment_end| segment.guest_address <= entry && entry < segment_end)
-        })
-    {
+    if !segments.iter().any(|segment| {
+        end(segment.guest_address, segment.memory_length)
+            .is_ok_and(|segment_end| segment.guest_address <= entry && entry < segment_end)
+    }) {
         return Err(Error::KernelLayout);
     }
     for (index, segment) in segments.iter().enumerate() {
@@ -405,12 +384,11 @@ pub(crate) fn plan_x86(
             return Err(Error::KernelLayout);
         }
     }
-    let mut command_line =
-        command_line(&hardened_command_line(kernel_command_line), devices)?.into_bytes();
+    let mut command_line = command_line(kernel_command_line, devices)?.into_bytes();
     command_line.push(0);
     let mp_table = mp_table(vcpus)?;
     let zero_page = x86_zero_page(&ram_regions, command_line.len())?;
-    let mut writes = x86_page_tables()?;
+    let mut writes = x86_page_tables();
     writes.extend([
         GuestWrite {
             address: X86_CMDLINE,
@@ -434,32 +412,34 @@ pub(crate) fn plan_x86(
     })
 }
 
+fn arm_rank(kind: DeviceKind) -> u8 {
+    match kind {
+        DeviceKind::Block => 0,
+        DeviceKind::Fs => 1,
+        DeviceKind::Memory => 2,
+        DeviceKind::Vsock => 3,
+    }
+}
+
 fn validate_arm_devices(devices: &[Device]) -> Result<(), Error> {
-    if devices.len() < 2 || devices.len() > ARM_MAX_DEVICES {
+    if devices.len() > ARM_MAX_DEVICES {
         return Err(Error::InvalidDevice);
     }
-    let mut phase = 0;
+    validate_device_order(devices, arm_rank)?;
     for (slot, device) in devices.iter().enumerate() {
-        match device.kind {
-            DeviceKind::Block if phase == 0 => {}
-            DeviceKind::Fs if phase == 0 || phase == 1 => phase = 1,
-            DeviceKind::Memory if phase == 0 || phase == 1 => phase = 2,
-            DeviceKind::Vsock if phase == 2 => phase = 3,
-            DeviceKind::Block | DeviceKind::Fs | DeviceKind::Memory | DeviceKind::Vsock => {
-                return Err(Error::InvalidDevice);
-            }
-        }
-        let expected_base = ARM_MMIO_BASE
-            .checked_add(u64::try_from(slot).map_err(|_| Error::InvalidDevice)? * ARM_MMIO_STRIDE)
+        let expected_base = ARM_VIRTIO_MMIO_BASE
+            .checked_add(
+                u64::try_from(slot).map_err(|_| Error::InvalidDevice)? * ARM_VIRTIO_MMIO_STRIDE,
+            )
             .ok_or(Error::InvalidDevice)?;
-        let expected_irq = ARM_IRQ_BASE
+        let expected_irq = ARM_VIRTIO_IRQ_BASE
             .checked_add(u32::try_from(slot).map_err(|_| Error::InvalidDevice)?)
             .ok_or(Error::InvalidDevice)?;
         if device.mmio_base != expected_base || device.irq != expected_irq {
             return Err(Error::InvalidDevice);
         }
     }
-    (phase == 3).then_some(()).ok_or(Error::InvalidDevice)
+    Ok(())
 }
 
 fn arm_fdt(
@@ -522,7 +502,7 @@ fn arm_fdt(
     for device in devices {
         let node = fdt.begin_node(&format!("virtio_mmio@{:x}", device.mmio_base))?;
         fdt.property_string("compatible", "virtio,mmio")?;
-        fdt.property_array_u64("reg", &[device.mmio_base, ARM_MMIO_SIZE])?;
+        fdt.property_array_u64("reg", &[device.mmio_base, ARM_VIRTIO_MMIO_STRIDE])?;
         fdt.property_array_u32("interrupts", &[0, device.irq, 4])?;
         fdt.end_node(node)?;
     }
@@ -569,18 +549,11 @@ pub(crate) fn plan_arm(
     if end(guest_address, memory_length)? > fdt_address {
         return Err(Error::KernelLayout);
     }
-    let command_line = command_line(&hardened_command_line(kernel_command_line), &[])?;
+    let command_line = command_line(kernel_command_line, &[])?;
     let fdt =
         arm_fdt(ram_bytes, vcpus, devices, &command_line).map_err(|_| Error::BootDataTooLarge)?;
-    if fdt.len() > ARM_FDT_MAX_BYTES {
+    if fdt.len() > MAX_BOOT_WRITE_BYTES {
         return Err(Error::BootDataTooLarge);
-    }
-    if end(
-        fdt_address,
-        u64::try_from(fdt.len()).map_err(|_| Error::BootDataTooLarge)?,
-    )? > ram_end
-    {
-        return Err(Error::KernelLayout);
     }
     Ok(Plan {
         entry: guest_address,
@@ -643,8 +616,8 @@ mod tests {
         let kinds = [DeviceKind::Block, DeviceKind::Memory, DeviceKind::Vsock];
         core::array::from_fn(|slot| Device {
             kind: kinds[slot],
-            mmio_base: ARM_MMIO_BASE + u64::try_from(slot).unwrap() * ARM_MMIO_STRIDE,
-            irq: ARM_IRQ_BASE + u32::try_from(slot).unwrap(),
+            mmio_base: ARM_VIRTIO_MMIO_BASE + u64::try_from(slot).unwrap() * ARM_VIRTIO_MMIO_STRIDE,
+            irq: ARM_VIRTIO_IRQ_BASE + u32::try_from(slot).unwrap(),
         })
     }
 
@@ -666,8 +639,9 @@ mod tests {
                 .enumerate()
                 .map(|(slot, &kind)| Device {
                     kind,
-                    mmio_base: ARM_MMIO_BASE + u64::try_from(slot).unwrap() * ARM_MMIO_STRIDE,
-                    irq: ARM_IRQ_BASE + u32::try_from(slot).unwrap(),
+                    mmio_base: ARM_VIRTIO_MMIO_BASE
+                        + u64::try_from(slot).unwrap() * ARM_VIRTIO_MMIO_STRIDE,
+                    irq: ARM_VIRTIO_IRQ_BASE + u32::try_from(slot).unwrap(),
                 })
                 .collect::<Vec<_>>();
             assert!(validate_arm_devices(&devices).is_err());
@@ -770,10 +744,10 @@ mod tests {
 
     #[test]
     fn x86_page_tables_map_the_first_four_gib() {
-        let writes = x86_page_tables().expect("page tables");
+        let writes = x86_page_tables();
         let pml4 = writes
             .iter()
-            .find(|write| write.address == X86_PML4)
+            .find(|write| write.address == X86_PML4_ADDR)
             .expect("PML4");
         assert_eq!(
             u64::from_le_bytes(pml4.bytes[..8].try_into().unwrap()),
@@ -784,7 +758,7 @@ mod tests {
             .find(|write| write.address == X86_PDPT)
             .expect("PDPT");
         for directory in 0..4_u64 {
-            let address = X86_PAGE_DIRECTORY + directory * PAGE_SIZE;
+            let address = X86_PAGE_DIRECTORY + directory * RAM_PAGE_SIZE;
             let offset = usize::try_from(directory * 8).unwrap();
             assert_eq!(
                 u64::from_le_bytes(pdpt.bytes[offset..offset + 8].try_into().unwrap()),
@@ -846,6 +820,43 @@ mod tests {
             validate_x86_devices(&devices),
             Err(Error::InvalidDevice)
         ));
+    }
+
+    #[test]
+    fn x86_devices_require_ordered_storage_one_vsock_and_one_memory() {
+        use DeviceKind::{Block, Fs, Memory, Vsock};
+        let build = |kinds: &[DeviceKind]| {
+            let mut counts = [0; 4];
+            kinds
+                .iter()
+                .enumerate()
+                .map(|(slot, &kind)| {
+                    let ordinal = &mut counts[usize::from(x86_rank(kind))];
+                    let irq = x86_irq(kind, *ordinal);
+                    *ordinal += 1;
+                    Device {
+                        kind,
+                        mmio_base: X86_MMIO_BASE + u64::try_from(slot).unwrap() * X86_MMIO_STRIDE,
+                        irq,
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        for kinds in [
+            &[][..],
+            &[Block][..],
+            &[Block, Vsock][..],
+            &[Block, Memory][..],
+            &[Memory, Vsock][..],
+            &[Block, Memory, Vsock][..],
+            &[Block, Vsock, Vsock, Memory][..],
+            &[Block, Vsock, Memory, Memory][..],
+            &[Block, Vsock, Memory, Fs][..],
+            &[Vsock, Block, Memory][..],
+        ] {
+            assert!(validate_x86_devices(&build(kinds)).is_err(), "{kinds:?}");
+        }
+        assert!(validate_x86_devices(&build(&[Block, Vsock, Fs, Fs, Memory])).is_ok());
     }
 
     #[test]
@@ -934,7 +945,7 @@ mod tests {
         }
         assert!(fdt.windows(12).any(|bytes| {
             bytes
-                == [0_u32, ARM_IRQ_BASE, 4]
+                == [0_u32, ARM_VIRTIO_IRQ_BASE, 4]
                     .into_iter()
                     .flat_map(u32::to_be_bytes)
                     .collect::<Vec<_>>()
