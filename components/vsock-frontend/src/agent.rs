@@ -31,7 +31,7 @@ pub(crate) fn service(relay: &mut Option<network::Flow>) -> bool {
 
 async fn run(connection: ConnectionId) -> Result<(), ()> {
     let (input, host_input) = wit_stream::new();
-    let output = frontend_stream::connect(connection.generation, host_input).map_err(|_| ())?;
+    let output = frontend_stream::connect(connection.number, host_input).map_err(|_| ())?;
     try_join(
         network::pump_upstream(connection, input),
         network::pump_downstream(connection, output, None),

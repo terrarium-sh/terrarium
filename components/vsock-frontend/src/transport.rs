@@ -1303,7 +1303,7 @@ mod tests {
             mmio: queue_mmio(8),
             next: [0; 2],
             pending_rx: Some(Reply {
-                generation: 0,
+                connection_number: 0,
                 header: header(0),
                 payload: Vec::new(),
             }),
@@ -1366,7 +1366,7 @@ mod tests {
     #[test]
     fn invalid_batch_heads_and_rx_write_failures_preserve_pending_control() {
         let pending = Reply {
-            generation: 0,
+            connection_number: 0,
             header: VsockHeader {
                 src_port: u32::MAX,
                 dst_port: u32::MAX,
@@ -1410,7 +1410,7 @@ mod tests {
     #[test]
     fn partial_rx_packet_drains_only_after_every_write_succeeds() {
         let mut reply = Reply {
-            generation: 0,
+            connection_number: 0,
             header: header(5),
             payload: b"abcde".to_vec(),
         };

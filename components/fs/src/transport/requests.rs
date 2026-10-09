@@ -61,7 +61,7 @@ impl RequestState {
         let mut state = super::STATE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if super::generation().ok() != Some(self.0) {
+        if super::current_reset_count().ok() != Some(self.0) {
             return Err(wire::EIO);
         }
         operation(state.as_mut().ok_or(wire::EIO)?)
@@ -335,7 +335,7 @@ impl OwnedRequest {
 pub(super) fn prepare_io(
     state: &State,
     owned_request: OwnedRequest,
-    generation: u64,
+    reset_count: u64,
 ) -> Result<PreparedIo, i32> {
     let request = owned_request.borrow();
     match request.opcode {
@@ -354,11 +354,11 @@ pub(super) fn prepare_io(
                 identity,
                 work: async move {
                     let request = owned_request.borrow();
-                    let result = execute(RequestState(generation), &request).await;
+                    let result = execute(RequestState(reset_count), &request).await;
                     if opcode == wire::LOOKUP
                         && let Ok(response) = &result
                     {
-                        RequestState(generation).with(|state| {
+                        RequestState(reset_count).with(|state| {
                             super::remember_lookup(state, &request, response);
                             Ok(())
                         })?;

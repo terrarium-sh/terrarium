@@ -174,6 +174,6 @@ mod tests {
 
         drop(appender);
         build_appender(&bx).unwrap();
-        assert!(std::fs::read(path).unwrap().is_empty());
+        assert_eq!(std::fs::read(path).unwrap(), [] as [u8; 0]);
     }
 }

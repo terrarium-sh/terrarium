@@ -90,7 +90,7 @@ fn ack_ahead(acknowledged: u32, sent: u32) -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reply {
-    pub generation: u64,
+    pub connection_number: u64,
     pub header: VsockHeader,
     pub payload: Vec<u8>,
 }
@@ -167,7 +167,7 @@ impl StreamConnection {
 
     fn rst(&mut self, guest_port: u32, host_port: u32) -> bool {
         self.queue_reply(Reply {
-            generation: 0,
+            connection_number: 0,
             header: VsockHeader {
                 op: OP_RST,
                 ..Self::host_header(host_port, guest_port)
@@ -190,7 +190,7 @@ impl StreamConnection {
             return true;
         }
         self.queue_reply(Reply {
-            generation: 0,
+            connection_number: 0,
             header: VsockHeader {
                 op,
                 flags,
@@ -339,7 +339,7 @@ impl StreamConnection {
             return false;
         }
         let queued = self.queue_reply(Reply {
-            generation: 0,
+            connection_number: 0,
             header: VsockHeader {
                 op: OP_REQUEST,
                 buf_alloc: self.rx_alloc,
@@ -411,7 +411,7 @@ impl StreamConnection {
             return false;
         }
         if self.queue_reply(Reply {
-            generation: 0,
+            connection_number: 0,
             header: VsockHeader {
                 op: OP_CREDIT_REQUEST,
                 buf_alloc: self.rx_alloc,
@@ -471,7 +471,7 @@ impl StreamConnection {
             ..connection
         });
         if !self.queue_reply(Reply {
-            generation: 0,
+            connection_number: 0,
             header: VsockHeader {
                 len,
                 op: OP_RW,
@@ -608,50 +608,50 @@ pub struct ConnectionId {
     pub role: Role,
     pub guest_port: u32,
     pub host_port: u32,
-    pub generation: u64,
+    pub number: u64,
 }
 
 struct Endpoint {
     role: Role,
     stream: StreamConnection,
-    generation: u64,
+    connection_number: u64,
     retiring: Option<u64>,
 }
 
 impl Endpoint {
-    fn new(role: Role, guest_port: u32, host_port: u32, generation: u64) -> Self {
+    fn new(role: Role, guest_port: u32, host_port: u32, connection_number: u64) -> Self {
         let (rx_alloc, max_tx_bytes) = role.buffers();
         Self {
             role,
             stream: StreamConnection::new(guest_port, host_port, rx_alloc, max_tx_bytes),
-            generation,
+            connection_number,
             retiring: None,
         }
     }
 
-    fn identity(&self, generation: u64) -> ConnectionId {
+    fn identity(&self, connection_number: u64) -> ConnectionId {
         ConnectionId {
             role: self.role,
             guest_port: self.stream.guest_port,
             host_port: self.stream.host_port,
-            generation,
+            number: connection_number,
         }
     }
 
     fn connected(&self) -> Option<ConnectionId> {
         self.stream
             .connection
-            .map(|_| self.identity(self.generation))
+            .map(|_| self.identity(self.connection_number))
     }
 
     fn is_live(&self) -> bool {
         self.stream.connection.is_some() || self.stream.is_connecting
     }
 
-    fn retire(&mut self, generation: u64) {
+    fn retire(&mut self, connection_number: u64) {
         if self.is_live() || self.retiring.is_none() {
-            self.retiring = Some(self.generation);
-            self.generation = generation;
+            self.retiring = Some(self.connection_number);
+            self.connection_number = connection_number;
         }
         self.stream.drop_connection();
         self.stream
@@ -664,7 +664,7 @@ impl Endpoint {
 /// Fixed agent and control endpoints followed by at most [`MAX_NETWORK_SOCKETS`] flows.
 pub struct VsockSwitch {
     endpoints: Vec<Endpoint>,
-    next_generation: u64,
+    next_connection_number: u64,
     network_enabled: bool,
     network_socket_capacity: usize,
     next_reply: usize,
@@ -698,7 +698,7 @@ impl VsockSwitch {
                 Endpoint::new(Role::Agent, AGENT_VSOCK_PORT, AGENT_VSOCK_PORT, 1),
                 Endpoint::new(Role::Control, CONTROL_VSOCK_PORT, CONTROL_VSOCK_PORT, 2),
             ],
-            next_generation: 3,
+            next_connection_number: 3,
             network_enabled,
             network_socket_capacity: network_socket_capacity.min(MAX_NETWORK_SOCKETS),
             next_reply: 0,
@@ -707,12 +707,12 @@ impl VsockSwitch {
         }
     }
 
-    fn allocate_generation(&mut self) -> u64 {
-        let generation = self.next_generation;
-        self.next_generation = generation
+    fn allocate_connection_number(&mut self) -> u64 {
+        let connection_number = self.next_connection_number;
+        self.next_connection_number = connection_number
             .checked_add(1)
             .unwrap_or_else(|| std::process::abort());
-        generation
+        connection_number
     }
 
     fn classify(&self, guest_port: u32, host_port: u32) -> Option<Role> {
@@ -751,11 +751,11 @@ impl VsockSwitch {
 
     fn reject(&mut self, header: &VsockHeader) {
         if header.op != OP_RST && self.rejected.len() < 32 {
-            let generation = self
+            let connection_number = self
                 .endpoint_index(header.src_port, header.dst_port)
-                .map_or(0, |index| self.endpoints[index].generation);
+                .map_or(0, |index| self.endpoints[index].connection_number);
             self.rejected.push_back(Reply {
-                generation,
+                connection_number,
                 header: VsockHeader {
                     op: OP_RST,
                     ..StreamConnection::host_header(header.dst_port, header.src_port)
@@ -795,12 +795,12 @@ impl VsockSwitch {
             self.rejected.retain(|reply| {
                 reply.header.dst_port != header.src_port || reply.header.src_port != header.dst_port
             });
-            let generation = self.allocate_generation();
+            let connection_number = self.allocate_connection_number();
             self.endpoints.push(Endpoint::new(
                 role,
                 header.src_port,
                 header.dst_port,
-                generation,
+                connection_number,
             ));
             self.endpoints.len() - 1
         };
@@ -808,7 +808,7 @@ impl VsockSwitch {
             self.reject(header);
             return None;
         }
-        let touched = self.endpoints[index].identity(self.endpoints[index].generation);
+        let touched = self.endpoints[index].identity(self.endpoints[index].connection_number);
         let was_live = self.endpoints[index].is_live();
         self.endpoints[index].stream.rx(header, bytes);
         if was_live && !self.endpoints[index].is_live() {
@@ -818,8 +818,8 @@ impl VsockSwitch {
     }
 
     fn retire_endpoint(&mut self, index: usize) {
-        let generation = self.allocate_generation();
-        self.endpoints[index].retire(generation);
+        let connection_number = self.allocate_connection_number();
+        self.endpoints[index].retire(connection_number);
     }
 
     /// Queue a host-initiated request to the guest publication listener.
@@ -836,17 +836,17 @@ impl VsockSwitch {
         {
             return Err(VsockError::Busy);
         }
-        let generation = self.allocate_generation();
+        let connection_number = self.allocate_connection_number();
         let mut endpoint = Endpoint::new(
             Role::Publication,
             PUBLICATION_VSOCK_PORT,
             host_port,
-            generation,
+            connection_number,
         );
         if !endpoint.stream.request() {
             return Err(VsockError::Backpressure);
         }
-        let connection = endpoint.identity(generation);
+        let connection = endpoint.identity(connection_number);
         self.endpoints.push(endpoint);
         Ok(connection)
     }
@@ -856,7 +856,7 @@ impl VsockSwitch {
         self.endpoint_index(connection.guest_port, connection.host_port)
             .is_some_and(|index| {
                 let endpoint = &self.endpoints[index];
-                endpoint.generation == connection.generation && endpoint.stream.is_connecting
+                endpoint.connection_number == connection.number && endpoint.stream.is_connecting
             })
     }
 
@@ -913,14 +913,14 @@ impl VsockSwitch {
         Ok(&mut self.endpoints[index].stream)
     }
 
-    /// Return true when the retired generation and its queued reset have been released.
+    /// Return true when the retired connection number and its queued reset have been released.
     pub fn retire_connection(&mut self, connection: ConnectionId) -> bool {
         let Some(index) = self.endpoint_index(connection.guest_port, connection.host_port) else {
             return false;
         };
         let endpoint = &self.endpoints[index];
         if endpoint.role != connection.role
-            || endpoint.retiring != Some(connection.generation)
+            || endpoint.retiring != Some(connection.number)
             || !endpoint.stream.replies.is_empty()
         {
             return false;
@@ -928,10 +928,10 @@ impl VsockSwitch {
         if index >= FIXED_ENDPOINTS {
             self.endpoints.remove(index);
         } else {
-            let generation = self.allocate_generation();
+            let connection_number = self.allocate_connection_number();
             let endpoint = &mut self.endpoints[index];
             endpoint.retiring = None;
-            endpoint.generation = generation;
+            endpoint.connection_number = connection_number;
         }
         self.rejected.retain(|reply| {
             reply.header.dst_port != connection.guest_port
@@ -944,7 +944,7 @@ impl VsockSwitch {
         self.endpoints.iter().filter_map(|endpoint| {
             endpoint
                 .retiring
-                .map(|generation| endpoint.identity(generation))
+                .map(|connection_number| endpoint.identity(connection_number))
         })
     }
 
@@ -953,7 +953,7 @@ impl VsockSwitch {
         self.endpoint_index(connection.guest_port, connection.host_port)
             .is_some_and(|index| {
                 let endpoint = &self.endpoints[index];
-                endpoint.role == connection.role && endpoint.retiring == Some(connection.generation)
+                endpoint.role == connection.role && endpoint.retiring == Some(connection.number)
             })
     }
 
@@ -1030,7 +1030,7 @@ impl VsockSwitch {
             .endpoint_index(connection.guest_port, connection.host_port)
             .filter(|&index| {
                 let endpoint = &self.endpoints[index];
-                endpoint.generation == connection.generation && endpoint.is_live()
+                endpoint.connection_number == connection.number && endpoint.is_live()
             })
             .ok_or(VsockError::UnknownConnection)?;
         self.endpoints[index]
@@ -1085,9 +1085,9 @@ impl VsockSwitch {
     #[must_use]
     pub fn is_reply_current(&self, reply: &Reply) -> bool {
         self.endpoint_index(reply.header.dst_port, reply.header.src_port)
-            .map_or(reply.generation == 0, |index| {
+            .map_or(reply.connection_number == 0, |index| {
                 let endpoint = &self.endpoints[index];
-                endpoint.generation == reply.generation
+                endpoint.connection_number == reply.connection_number
                     && (reply.header.op != OP_RW
                         || !endpoint
                             .stream
@@ -1101,8 +1101,8 @@ impl VsockSwitch {
         self.endpoint_index(connection.guest_port, connection.host_port)
             .is_some_and(|index| {
                 let endpoint = &self.endpoints[index];
-                (endpoint.generation == connection.generation
-                    || endpoint.retiring == Some(connection.generation))
+                (endpoint.connection_number == connection.number
+                    || endpoint.retiring == Some(connection.number))
                     && !endpoint.stream.replies.is_empty()
             })
     }
@@ -1121,7 +1121,7 @@ impl VsockSwitch {
             .stream
             .take_reply(max_bytes)
             .map(|reply| Reply {
-                generation: self.endpoints[index].generation,
+                connection_number: self.endpoints[index].connection_number,
                 ..reply
             })
     }

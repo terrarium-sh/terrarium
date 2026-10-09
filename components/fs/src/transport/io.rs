@@ -25,7 +25,7 @@ pub(super) struct IoScheduler {
     pending: VecDeque<(PreparedIo, PendingReply)>,
     active: FuturesUnordered<LocalBoxFuture<'static, CompletedIo>>,
     active_files: BTreeMap<(u64, u64), u64>,
-    active_generations: BTreeMap<u64, usize>,
+    active_reset_counts: BTreeMap<u64, usize>,
 }
 
 impl IoScheduler {
@@ -33,12 +33,12 @@ impl IoScheduler {
         self.pending.clear();
     }
 
-    pub fn contains_generation(&self, generation: u64) -> bool {
-        self.active_generations.contains_key(&generation)
+    pub fn has_work_from_reset_count(&self, reset_count: u64) -> bool {
+        self.active_reset_counts.contains_key(&reset_count)
             || self
                 .pending
                 .iter()
-                .any(|(_, reply)| reply.generation == generation)
+                .any(|(_, reply)| reply.reset_count == reset_count)
     }
 
     pub fn enqueue(&mut self, operation: PreparedIo, reply: PendingReply) -> Result<(), i32> {
@@ -62,9 +62,12 @@ impl IoScheduler {
                 break;
             };
             if let Some(identity) = operation.identity {
-                self.active_files.insert(identity, reply.generation);
+                self.active_files.insert(identity, reply.reset_count);
             }
-            *self.active_generations.entry(reply.generation).or_default() += 1;
+            *self
+                .active_reset_counts
+                .entry(reply.reset_count)
+                .or_default() += 1;
             self.active.push(
                 async move {
                     CompletedIo {
@@ -80,10 +83,14 @@ impl IoScheduler {
             if let Some(identity) = completed.identity {
                 self.active_files.remove(&identity);
             }
-            if let Some(count) = self.active_generations.get_mut(&completed.reply.generation) {
+            if let Some(count) = self
+                .active_reset_counts
+                .get_mut(&completed.reply.reset_count)
+            {
                 *count -= 1;
                 if *count == 0 {
-                    self.active_generations.remove(&completed.reply.generation);
+                    self.active_reset_counts
+                        .remove(&completed.reply.reset_count);
                 }
             }
             Some(completed)
@@ -104,7 +111,7 @@ mod tests {
             head: 0,
             output: Vec::new(),
             unique,
-            generation: 1,
+            reset_count: 1,
         }
     }
 
@@ -125,7 +132,7 @@ mod tests {
         assert!(io.poll_complete(&mut context).is_none());
         io.discard_pending();
         let mut after_reset = reply(2);
-        after_reset.generation = 2;
+        after_reset.reset_count = 2;
         io.enqueue(
             PreparedIo {
                 identity: Some((0, 1)),
@@ -176,10 +183,10 @@ mod tests {
         assert!(io.poll_complete(&mut context).is_none());
         finish_metadata.send(Vec::new()).unwrap();
         assert_eq!(io.poll_complete(&mut context).unwrap().reply.unique, 2);
-        assert!(io.contains_generation(1));
+        assert!(io.has_work_from_reset_count(1));
         release.send(Vec::new()).unwrap();
         assert_eq!(io.poll_complete(&mut context).unwrap().reply.unique, 1);
-        assert!(!io.contains_generation(1));
+        assert!(!io.has_work_from_reset_count(1));
     }
 
     #[test]
@@ -225,8 +232,8 @@ mod tests {
                 .iter()
                 .all(oneshot::Sender::is_canceled)
         );
-        assert!(io.contains_generation(1));
-        assert!(!io.contains_generation(2));
+        assert!(io.has_work_from_reset_count(1));
+        assert!(!io.has_work_from_reset_count(2));
         drop(io);
         assert!(releases.iter().all(oneshot::Sender::is_canceled));
     }

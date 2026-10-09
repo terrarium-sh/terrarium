@@ -168,9 +168,12 @@ impl TestServers {
             published,
         } = loop {
             match bind_servers() {
+                // Windows refuses ports in its per-family excluded ranges with WSAEACCES.
                 Err(error)
-                    if error.kind() == std::io::ErrorKind::AddrInUse
-                        && attempts < PORT_ATTEMPTS =>
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+                    ) && attempts < PORT_ATTEMPTS =>
                 {
                     attempts += 1;
                 }
@@ -635,7 +638,7 @@ async fn run_socket_streams(
     .await?;
     let result = async {
         exercise_socket_stream(&mut guest, &mut agent, endpoints).await?;
-        let generation = agent
+        let connection_number = agent
             .current()
             .ok_or_else(|| wasmtime::Error::msg("agent lost before broker failure"))?;
         let (stalled, udp) = exercise_admission_pressure(&mut guest, &mut agent, endpoints.tcp)
@@ -662,7 +665,7 @@ async fn run_socket_streams(
             .send(AGENT_PORT, AGENT_PORT, 5, 65536, b"stop")
             .await?;
         wasmtime::ensure!(
-            read_stream(&mut agent, generation, 4).await? == b"stop",
+            read_stream(&mut agent, connection_number, 4).await? == b"stop",
             "broker loss preserves agent stop progress"
         );
         Ok(())
@@ -705,7 +708,7 @@ async fn exercise_admission_pressure(
             .await?;
         guest.stream.require_reset(refused).await?;
     }
-    let generation = agent
+    let connection_number = agent
         .current()
         .ok_or_else(|| wasmtime::Error::msg("agent under pressure"))?;
     guest
@@ -714,11 +717,11 @@ async fn exercise_admission_pressure(
         .send(AGENT_PORT, AGENT_PORT, 5, 65536, b"cancel")
         .await?;
     wasmtime::ensure!(
-        read_stream(agent, generation, 6).await? == b"cancel",
+        read_stream(agent, connection_number, 6).await? == b"cancel",
         "agent cancellation progresses at full combined network capacity"
     );
     agent
-        .try_write(generation, b"pressure-reply")
+        .try_write(connection_number, b"pressure-reply")
         .map_err(|error| wasmtime::Error::msg(format!("agent pressure output: {error:?}")))?;
     wasmtime::ensure!(
         guest
@@ -824,7 +827,7 @@ async fn exercise_control_failure(
     guest: &mut GuestNetwork,
     agent: &mut StreamEndpoint,
 ) -> wasmtime::Result<()> {
-    let generation = wait_connected(agent).await?;
+    let connection_number = wait_connected(agent).await?;
     let udp = [guest.open_udp(19003).await?, guest.open_udp(19004).await?];
     guest
         .stream
@@ -843,7 +846,7 @@ async fn exercise_control_failure(
         guest.stream.require_reset(refused).await?;
     }
     wasmtime::ensure!(
-        agent.current() == Some(generation),
+        agent.current() == Some(connection_number),
         "control loss preserves agent services"
     );
     guest
@@ -852,12 +855,14 @@ async fn exercise_control_failure(
         .send(AGENT_PORT, AGENT_PORT, 5, 65536, b"after")
         .await?;
     wasmtime::ensure!(
-        read_stream(agent, generation, 5).await? == b"after",
+        read_stream(agent, connection_number, 5).await? == b"after",
         "agent input progresses after network control loss"
     );
-    agent.try_write(generation, b"reply").map_err(|error| {
-        wasmtime::Error::msg(format!("agent output after control loss: {error:?}"))
-    })?;
+    agent
+        .try_write(connection_number, b"reply")
+        .map_err(|error| {
+            wasmtime::Error::msg(format!("agent output after control loss: {error:?}"))
+        })?;
     wasmtime::ensure!(
         guest.stream.read_bytes((AGENT_PORT, AGENT_PORT), 5).await? == b"reply",
         "agent output progresses after network control loss"
@@ -870,7 +875,7 @@ async fn exercise_socket_stream(
     agent: &mut StreamEndpoint,
     endpoints: Endpoints,
 ) -> wasmtime::Result<()> {
-    let agent_generation = wait_connected(agent)
+    let agent_connection_number = wait_connected(agent)
         .await
         .map_err(|error| error.context("agent admission with networking enabled"))?;
     guest.exercise_opening_errors().await?;
@@ -892,11 +897,11 @@ async fn exercise_socket_stream(
         .send(AGENT_PORT, AGENT_PORT, 5, 65536, b"cancel")
         .await?;
     wasmtime::ensure!(
-        read_stream(agent, agent_generation, 6).await? == b"cancel",
+        read_stream(agent, agent_connection_number, 6).await? == b"cancel",
         "agent cancellation input progresses while a TCP peer stalls"
     );
     agent
-        .try_write(agent_generation, b"control-reply")
+        .try_write(agent_connection_number, b"control-reply")
         .map_err(|error| wasmtime::Error::msg(format!("agent output: {error:?}")))?;
     wasmtime::ensure!(
         guest

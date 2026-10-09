@@ -89,8 +89,8 @@ async fn events_start_worker_and_close_keeps_transport_terminal() {
         .await
         .expect("worker lifecycle");
     frontend.disconnect(1);
-    for generation in 2..=3 {
-        frontend.connect(generation).expect("connect");
+    for connection_number in 2..=3 {
+        frontend.connect(connection_number).expect("connect");
         let (mut subscription,) = events
             .call_async(&mut store, ())
             .await
@@ -99,10 +99,10 @@ async fn events_start_worker_and_close_keeps_transport_terminal() {
             .close(&mut store)
             .expect("closed event subscription");
         assert_eq!(
-            frontend.try_read(generation, 65536).expect("output"),
+            frontend.try_read(connection_number, 65536).expect("output"),
             [] as [u8; 0]
         );
-        frontend.disconnect(generation);
+        frontend.disconnect(connection_number);
     }
     close
         .call_async(&mut store, ())

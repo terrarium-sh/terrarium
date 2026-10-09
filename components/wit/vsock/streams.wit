@@ -6,7 +6,7 @@ interface stream-types {
 
 interface frontend-stream {
     use stream-types.{stream-error};
-    connect: func(generation: u64, input: stream<u8>) -> result<stream<u8>, stream-error>;
+    connect: func(connection-number: u64, input: stream<u8>) -> result<stream<u8>, stream-error>;
 }
 
 interface role-stream {

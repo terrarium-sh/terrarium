@@ -24,8 +24,8 @@ items at 128 per connection; rejected tuples retain at most
 32 empty resets. These payload limits exclude bounded queue/header metadata
 and buffers owned by the caller.
 
-A `ConnectionId` binds endpoint kind, guest source port, and a fresh transport
-generation. Host operations reject stale generations. Replies rotate agent,
+A `ConnectionId` binds endpoint kind, guest source port, and a fresh connection
+number. Host operations reject stale connection numbers. Replies rotate agent,
 control, and flow classes; flows rotate within their class. Half-close
 preserves accepted input, and host FIN follows queued output. Network failure
 retires network connections; physical reset retires every connection.

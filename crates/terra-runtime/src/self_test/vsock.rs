@@ -62,7 +62,7 @@ pub(super) async fn run(
             guest.send(source, destination, 1, 0, &[]).await?;
         }
         guest.send(AGENT_PORT, AGENT_PORT, 1, 65536, &[]).await?;
-        let generation = wait_connected(&mut agent)
+        let connection_number = wait_connected(&mut agent)
             .await
             .map_err(|error| error.context("initial agent transport admission"))?;
         let replies = guest.receive()?;
@@ -74,7 +74,7 @@ pub(super) async fn run(
             guest.send(AGENT_PORT, AGENT_PORT, 5, 65536, bytes).await?;
         }
         wasmtime::ensure!(
-            read_stream(&mut agent, generation, 19)
+            read_stream(&mut agent, connection_number, 19)
                 .await
                 .map_err(|error| error.context("fragmented agent input"))?
                 == b"split-agent-request",
@@ -82,7 +82,7 @@ pub(super) async fn run(
         );
         let payload = vec![91; 5000];
         agent
-            .try_write(generation, &payload)
+            .try_write(connection_number, &payload)
             .map_err(stream_error)?;
         wasmtime::ensure!(
             guest
@@ -92,14 +92,15 @@ pub(super) async fn run(
                 == payload,
             "small receive descriptors preserve partially delivered vsock payloads"
         );
-        exercise_ready_receive_without_notification(&mut guest, &mut agent, generation).await?;
+        exercise_ready_receive_without_notification(&mut guest, &mut agent, connection_number)
+            .await?;
         guest.device.write(0x70, &0_u32.to_le_bytes())?;
         wait_disconnected(&mut agent)
             .await
             .map_err(|error| error.context("agent retirement after physical reset"))?;
         wasmtime::ensure!(
-            agent.try_write(generation, &[1]).is_err(),
-            "physical reset rejects retired agent generation"
+            agent.try_write(connection_number, &[1]).is_err(),
+            "physical reset rejects retired agent connection number"
         );
         guest.configure()?;
         guest.send(AGENT_PORT, AGENT_PORT, 1, 65536, &[]).await?;
@@ -107,8 +108,8 @@ pub(super) async fn run(
             .await
             .map_err(|error| error.context("agent admission after physical reset"))?;
         wasmtime::ensure!(
-            replacement > generation,
-            "physical reset admits a fresh agent generation"
+            replacement > connection_number,
+            "physical reset admits a fresh agent connection number"
         );
         exercise_stream_half_closes(&mut guest, &mut agent, replacement).await?;
         Ok(())
@@ -124,13 +125,13 @@ pub(super) async fn run(
 async fn exercise_stream_half_closes(
     guest: &mut GuestVsock,
     agent: &mut StreamEndpoint,
-    generation: u64,
+    connection_number: u64,
 ) -> wasmtime::Result<()> {
     guest
         .send_with_flags(AGENT_PORT, AGENT_PORT, 4, 1, 65536, &[])
         .await?;
     tokio::time::timeout(WAIT, async {
-        while agent.try_write(generation, &[]).is_ok() {
+        while agent.try_write(connection_number, &[]).is_ok() {
             agent.wait().await;
         }
     })
@@ -139,7 +140,7 @@ async fn exercise_stream_half_closes(
         .send(AGENT_PORT, AGENT_PORT, 5, 65536, b"half-open")
         .await?;
     wasmtime::ensure!(
-        read_stream(agent, generation, 9).await? == b"half-open",
+        read_stream(agent, connection_number, 9).await? == b"half-open",
         "dropping frontend output preserves guest input"
     );
     guest
@@ -161,8 +162,8 @@ async fn exercise_stream_half_closes(
     .await??;
     guest.set_receive_window(AGENT_PORT, AGENT_PORT, 0);
     guest.send(AGENT_PORT, AGENT_PORT, 1, 0, &[]).await?;
-    let generation = wait_connected(agent).await?;
-    agent.close(generation);
+    let connection_number = wait_connected(agent).await?;
+    agent.close(connection_number);
     tokio::time::timeout(WAIT, async {
         loop {
             if guest
@@ -180,7 +181,7 @@ async fn exercise_stream_half_closes(
         .send(AGENT_PORT, AGENT_PORT, 5, 0, b"after-eof")
         .await?;
     wasmtime::ensure!(
-        read_stream(agent, generation, 9).await? == b"after-eof",
+        read_stream(agent, connection_number, 9).await? == b"after-eof",
         "role EOF ignores guest output credit and preserves guest input"
     );
     guest
@@ -192,11 +193,11 @@ async fn exercise_stream_half_closes(
 async fn exercise_ready_receive_without_notification(
     guest: &mut GuestVsock,
     agent: &mut StreamEndpoint,
-    generation: u64,
+    connection_number: u64,
 ) -> wasmtime::Result<()> {
     guest.device.write(0x64, &3_u32.to_le_bytes())?;
     agent
-        .try_write(generation, b"queued")
+        .try_write(connection_number, b"queued")
         .map_err(stream_error)?;
     tokio::time::timeout(WAIT, async {
         while guest.used_index(RECEIVE_USED)? == guest.received {
@@ -576,8 +577,8 @@ fn stream_error(
 pub(super) async fn wait_connected(endpoint: &mut StreamEndpoint) -> wasmtime::Result<u64> {
     tokio::time::timeout(WAIT, async {
         loop {
-            if let Some(generation) = endpoint.current() {
-                return generation;
+            if let Some(connection_number) = endpoint.current() {
+                return connection_number;
             }
             endpoint.wait().await;
         }
@@ -598,14 +599,14 @@ async fn wait_disconnected(endpoint: &mut StreamEndpoint) -> wasmtime::Result<()
 
 pub(super) async fn read_stream(
     endpoint: &mut StreamEndpoint,
-    generation: u64,
+    connection_number: u64,
     length: usize,
 ) -> wasmtime::Result<Vec<u8>> {
     tokio::time::timeout(WAIT, async {
         let mut bytes = Vec::new();
         while bytes.len() < length {
             let chunk = endpoint
-                .try_read(generation, u32::try_from(length - bytes.len())?)
+                .try_read(connection_number, u32::try_from(length - bytes.len())?)
                 .map_err(stream_error)?;
             if chunk.is_empty() {
                 endpoint.wait().await;

@@ -19,7 +19,10 @@ async fn fragmented_stream_delivers_plan_and_lifecycle() {
     )
     .await;
     agent.read_limit = 7;
-    agent.endpoint.connect(agent.generation).expect("connect");
+    agent
+        .endpoint
+        .connect(agent.connection_number)
+        .expect("connect");
     let mut frames = yamux_frame(0, 1, terra_protocol::mux::CONTROL_STREAM_ID, 0, &[]);
     frames.extend(yamux_frame(
         0,
@@ -53,7 +56,10 @@ async fn fragmented_stream_delivers_plan_and_lifecycle() {
 async fn wrong_direction_stream_cannot_select_agent_services() {
     for stream in [2, 5] {
         let mut agent = AgentGuest::create(plan_frame(), None, None).await;
-        agent.endpoint.connect(agent.generation).expect("connect");
+        agent
+            .endpoint
+            .connect(agent.connection_number)
+            .expect("connect");
         agent.send_session(&yamux_frame(0, 1, stream, 0, &[])).await;
         if stream == 2 {
             tokio::time::timeout(Duration::from_secs(2), async {
@@ -104,7 +110,7 @@ async fn diagnostic_frame_on_control_stream_is_rejected() {
 /// Replacement invalidates old endpoint handles and the pinned agent worker;
 /// the replacement connection cannot replay the boot plan.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stale_generation_cannot_restart_agent_session() {
+async fn stale_connection_number_cannot_restart_agent_session() {
     let mut agent = AgentGuest::create(plan_frame(), None, None).await;
     agent.negotiate().await;
     agent.read_plan().await;
@@ -121,18 +127,18 @@ async fn stale_generation_cannot_restart_agent_session() {
     })
     .await
     .expect("ready");
-    let old_generation = agent.generation;
-    agent.endpoint.disconnect(old_generation);
+    let old_connection_number = agent.connection_number;
+    agent.endpoint.disconnect(old_connection_number);
     agent
         .endpoint
-        .connect(old_generation + 1)
+        .connect(old_connection_number + 1)
         .expect("replacement");
     assert!(matches!(
-        agent.endpoint.try_write(old_generation, &[0]),
+        agent.endpoint.try_write(old_connection_number, &[0]),
         Err(StreamError::Stale)
     ));
     assert!(matches!(
-        agent.endpoint.try_read(old_generation, 1),
+        agent.endpoint.try_read(old_connection_number, 1),
         Err(StreamError::Stale)
     ));
     let failure = agent.wait_for_failure().await;
@@ -141,7 +147,7 @@ async fn stale_generation_cannot_restart_agent_session() {
     assert_eq!(
         agent
             .endpoint
-            .try_read(old_generation + 1, 65536)
+            .try_read(old_connection_number + 1, 65536)
             .expect("replacement read"),
         [] as [u8; 0]
     );
@@ -153,7 +159,10 @@ async fn stale_generation_cannot_restart_agent_session() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn connection_loss_before_diagnostic_stream_terminates_worker() {
     let mut agent = AgentGuest::create(plan_frame(), None, None).await;
-    agent.endpoint.connect(agent.generation).expect("connect");
+    agent
+        .endpoint
+        .connect(agent.connection_number)
+        .expect("connect");
     agent
         .send_session(&yamux_frame(
             0,
@@ -164,7 +173,7 @@ async fn connection_loss_before_diagnostic_stream_terminates_worker() {
         ))
         .await;
     agent.read_plan().await;
-    agent.endpoint.close(agent.generation);
+    agent.endpoint.close(agent.connection_number);
     let failure = agent.wait_for_failure().await;
     assert!(failure.contains("disconnected"), "{failure}");
     assert!(!agent.lifecycle.is_agent_ready());

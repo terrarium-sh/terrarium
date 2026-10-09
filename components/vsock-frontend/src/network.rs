@@ -691,7 +691,7 @@ mod tests {
             role: Role::Tcp,
             guest_port: u32::MAX - 1,
             host_port: terra_vsock_device::TCP_VSOCK_PORT,
-            generation: u64::MAX - 1,
+            number: u64::MAX - 1,
         };
         let second = ConnectionId {
             guest_port: u32::MAX,

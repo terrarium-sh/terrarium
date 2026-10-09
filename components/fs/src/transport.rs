@@ -64,7 +64,7 @@ struct PendingReply {
     head: u16,
     output: Vec<SplitRingDescriptor>,
     unique: u64,
-    generation: u64,
+    reset_count: u64,
 }
 
 struct EventRequest {
@@ -111,12 +111,12 @@ impl State {
 struct Transport {
     mmio: MmioTransport,
     next: [u16; 2],
-    generation: u64,
+    reset_count: u64,
 }
 
 impl Transport {
     fn invalidate_queues(&mut self) {
-        self.generation = self.generation.wrapping_add(1);
+        self.reset_count = self.reset_count.wrapping_add(1);
         self.next = [0; 2];
     }
 }
@@ -146,8 +146,8 @@ fn transport<T>(
     result
 }
 
-fn generation() -> Result<u64, DeviceError> {
-    transport(|transport| Ok(transport.generation))
+fn current_reset_count() -> Result<u64, DeviceError> {
+    transport(|transport| Ok(transport.reset_count))
 }
 
 fn queue_work(queue: usize) {
@@ -157,8 +157,8 @@ fn queue_work(queue: usize) {
     WORK.ring(1 << queue);
 }
 
-fn queue_work_if_current(queue: usize, expected_generation: u64) -> Result<(), DeviceError> {
-    if generation()? == expected_generation {
+fn queue_work_if_current(queue: usize, expected_reset_count: u64) -> Result<(), DeviceError> {
+    if current_reset_count()? == expected_reset_count {
         queue_work(queue);
     }
     Ok(())
@@ -594,7 +594,7 @@ fn write(addr: u64, bytes: &[u8]) -> Result<(), DeviceError> {
 }
 
 fn available(queue: usize) -> Result<Option<(u16, u64, u64, u16)>, DeviceError> {
-    let (desc, avail, used, size, next, generation) = transport(|transport| {
+    let (desc, avail, used, size, next, reset_count) = transport(|transport| {
         if transport.mmio.negotiated() & VIRTIO_F_VERSION_1 == 0 {
             return Err(DeviceError::NotReady);
         }
@@ -608,13 +608,13 @@ fn available(queue: usize) -> Result<Option<(u16, u64, u64, u16)>, DeviceError> 
             used,
             size,
             transport.next[queue],
-            transport.generation,
+            transport.reset_count,
         ))
     })?;
     let mut next = next;
     let (_, head) = read_split_ring_available(avail, size, &mut next, read)?;
     if !transport(|transport| {
-        if generation != transport.generation {
+        if reset_count != transport.reset_count {
             return Ok(false);
         }
         transport.next[queue] = next;
@@ -747,7 +747,7 @@ fn reply_to_event_request(
     };
     request.abort.abort();
     let pending = request.reply;
-    if generation()? == pending.generation {
+    if current_reset_count()? == pending.reset_count {
         send_reply(
             pending.queue,
             pending.head,
@@ -785,7 +785,7 @@ fn process_request(
     queue: usize,
     event_sender: &mut mpsc::Sender<()>,
 ) -> Result<bool, DeviceError> {
-    let request_generation = generation()?;
+    let request_reset_count = current_reset_count()?;
     let Some((head, desc, _, size)) = available(queue)? else {
         return Ok(false);
     };
@@ -835,7 +835,7 @@ fn process_request(
                 head,
                 output,
                 unique: request.unique,
-                generation: request_generation,
+                reset_count: request_reset_count,
             },
             abort,
             cancellation: Some(cancellation),
@@ -855,7 +855,7 @@ fn process_request(
                 head,
                 output: output.clone(),
                 unique: parsed_request.unique,
-                generation: request_generation,
+                reset_count: request_reset_count,
             };
             let opcode = parsed_request.opcode;
             let node = parsed_request.node;
@@ -875,7 +875,7 @@ fn process_request(
         }
         Err(errno) => wire::reply(0, errno, &[]),
     };
-    if request_generation != generation()? {
+    if request_reset_count != current_reset_count()? {
         clear_runtime(state);
         return Ok(false);
     }
@@ -892,14 +892,14 @@ fn execute_request(
     target: PendingReply,
 ) -> Option<Vec<u8>> {
     let request = owned_request.borrow();
-    if request.opcode == wire::INIT && scheduler.contains_generation(target.generation) {
+    if request.opcode == wire::INIT && scheduler.has_work_from_reset_count(target.reset_count) {
         return Some(wire::reply(request.unique, wire::EBUSY, &[]));
     }
     let unique = request.unique;
     let result = if let Some(result) = requests::execute_immediate(state, &request) {
         result
     } else {
-        match requests::prepare_io(state, owned_request, target.generation)
+        match requests::prepare_io(state, owned_request, target.reset_count)
             .and_then(|operation| scheduler.enqueue(operation, target))
         {
             Ok(()) => return None,
@@ -1029,7 +1029,7 @@ fn new_transport(ram_size: u64, config: Vec<u8>) -> Transport {
         mmio: MmioTransport::new(ram_size, DEVICE_ID, VIRTIO_F_VERSION_1, QUEUE_SIZE, config)
             .with_queue_count(2),
         next: [0; 2],
-        generation: 0,
+        reset_count: 0,
     }
 }
 
@@ -1079,7 +1079,7 @@ fn encode_response(unique: u64, result: Result<Vec<u8>, i32>) -> Vec<u8> {
 
 fn complete_io(completed: io::CompletedIo) {
     let target = completed.reply;
-    if generation().ok() == Some(target.generation)
+    if current_reset_count().ok() == Some(target.reset_count)
         && send_reply(
             target.queue,
             target.head,
@@ -1100,7 +1100,7 @@ struct ReadyWork {
 fn poll_work(
     context: &mut Context<'_>,
     scheduler: &mut io::IoScheduler,
-    current_generation: u64,
+    known_reset_count: u64,
 ) -> Poll<ReadyWork> {
     WORK.register(context.waker());
     let completed = scheduler.poll_complete(context);
@@ -1108,7 +1108,7 @@ fn poll_work(
     if completed.is_some()
         || queue.is_some()
         || WORK.is_closed()
-        || generation().ok() != Some(current_generation)
+        || current_reset_count().ok() != Some(known_reset_count)
     {
         Poll::Ready(ReadyWork { completed, queue })
     } else {
@@ -1128,16 +1128,21 @@ async fn receive_events(
             .and_then(|state| state.event_request.as_mut())
             .and_then(|request| {
                 request.cancellation.take().map(|cancellation| {
-                    (request.reply.generation, request.reply.unique, cancellation)
+                    (
+                        request.reply.reset_count,
+                        request.reply.unique,
+                        cancellation,
+                    )
                 })
             });
-        let Some((generation, unique, cancellation)) = pending else {
+        let Some((reset_count, unique, cancellation)) = pending else {
             continue;
         };
         let payload = async {
             loop {
                 let event = events.next().await?;
-                if let Some(payload) = encode_event(requests::RequestState(generation), event).await
+                if let Some(payload) =
+                    encode_event(requests::RequestState(reset_count), event).await
                 {
                     return Some(payload);
                 }
@@ -1145,7 +1150,7 @@ async fn receive_events(
         };
         match Abortable::new(payload, cancellation).await {
             Ok(Some(payload)) => {
-                let _ = requests::RequestState(generation).with(|state| {
+                let _ = requests::RequestState(reset_count).with(|state| {
                     if state
                         .event_request
                         .as_ref()
@@ -1168,15 +1173,15 @@ pub async fn run() -> Result<(), DeviceError> {
     let (event_worker, _event_handle) = receive_events(events, event_requests).remote_handle();
     wit_bindgen::spawn_local(event_worker);
     let mut scheduler = io::IoScheduler::default();
-    let Ok(mut current_generation) = generation() else {
+    let Ok(mut known_reset_count) = current_reset_count() else {
         return Ok(());
     };
     while !WORK.is_closed() {
         wit_bindgen::rt::async_support::yield_async().await;
-        let Ok(observed_generation) = generation() else {
+        let Ok(observed_reset_count) = current_reset_count() else {
             break;
         };
-        if observed_generation != current_generation {
+        if observed_reset_count != known_reset_count {
             scheduler.discard_pending();
             if let Some(state) = STATE
                 .lock()
@@ -1185,17 +1190,17 @@ pub async fn run() -> Result<(), DeviceError> {
             {
                 clear_runtime(state);
             }
-            current_generation = observed_generation;
+            known_reset_count = observed_reset_count;
         }
         let ReadyWork { completed, queue } =
-            poll_fn(|context| poll_work(context, &mut scheduler, current_generation)).await;
+            poll_fn(|context| poll_work(context, &mut scheduler, known_reset_count)).await;
         if let Some(completed) = completed {
             complete_io(completed);
         }
         if WORK.is_closed() {
             continue;
         }
-        if generation().ok() != Some(current_generation) {
+        if current_reset_count().ok() != Some(known_reset_count) {
             if let Some(queue) = queue {
                 queue_work(queue);
             }
@@ -1216,7 +1221,7 @@ pub async fn run() -> Result<(), DeviceError> {
         };
         drop(state);
         if pending {
-            let _ = queue_work_if_current(queue, current_generation);
+            let _ = queue_work_if_current(queue, known_reset_count);
         }
     }
     Ok(())
@@ -1293,7 +1298,7 @@ mod allocation_tests {
                 head: 0,
                 output: Vec::new(),
                 unique: 1,
-                generation: 0,
+                reset_count: 0,
             },
             abort,
             cancellation: Some(cancellation),
@@ -1325,7 +1330,7 @@ mod allocation_tests {
                         head: 0,
                         output: Vec::new(),
                         unique,
-                        generation: 0,
+                        reset_count: 0,
                     },
                 )
                 .unwrap();
@@ -1359,11 +1364,11 @@ mod allocation_tests {
             mmio: MmioTransport::new(65536, DEVICE_ID, VIRTIO_F_VERSION_1, QUEUE_SIZE, Vec::new())
                 .with_queue_count(2),
             next: [3, 7],
-            generation: 11,
+            reset_count: 11,
         };
         transport.mmio.signal(INT_USED_BUFFER);
         reset_transport(&mut transport).unwrap();
-        assert_eq!(transport.generation, 12);
+        assert_eq!(transport.reset_count, 12);
         assert_eq!(transport.next, [0, 0]);
         assert_eq!(transport.mmio.read(0x60, 4).unwrap(), 0);
     }

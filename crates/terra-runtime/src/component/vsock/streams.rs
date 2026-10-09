@@ -25,8 +25,8 @@ use stream_types::StreamError;
 pub const STREAM_BUFFER_BYTES: usize = 64 * 1024;
 
 struct Pipe {
-    generation: Option<u64>,
-    retired_generation: u64,
+    connection_number: Option<u64>,
+    retired_connection_number: u64,
     is_retired: bool,
     write_open: [bool; 2],
     frontend_ends: u8,
@@ -53,8 +53,8 @@ impl StreamEndpoint {
     #[must_use]
     pub fn pair() -> (Self, Self) {
         let pipe = Arc::new(Mutex::new(Pipe {
-            generation: None,
-            retired_generation: 0,
+            connection_number: None,
+            retired_connection_number: 0,
             is_retired: false,
             write_open: [false; 2],
             frontend_ends: 0,
@@ -93,7 +93,7 @@ impl StreamEndpoint {
             .for_each(Waker::wake);
     }
 
-    pub fn connect(&mut self, generation: u64) -> Result<(), StreamError> {
+    pub fn connect(&mut self, connection_number: u64) -> Result<(), StreamError> {
         let mut pipe = self
             .pipe
             .lock()
@@ -101,11 +101,14 @@ impl StreamEndpoint {
         if pipe.is_retired {
             return Err(StreamError::Closed);
         }
-        if generation == 0 || generation <= pipe.retired_generation || pipe.generation.is_some() {
+        if connection_number == 0
+            || connection_number <= pipe.retired_connection_number
+            || pipe.connection_number.is_some()
+        {
             return Err(StreamError::Stale);
         }
-        pipe.generation = Some(generation);
-        pipe.retired_generation = generation;
+        pipe.connection_number = Some(connection_number);
+        pipe.retired_connection_number = connection_number;
         pipe.write_open = [true; 2];
         pipe.frontend_ends = 2;
         for queue in &mut pipe.queues {
@@ -121,10 +124,10 @@ impl StreamEndpoint {
         self.pipe
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .generation
+            .connection_number
     }
 
-    pub fn try_read(&mut self, generation: u64, max: u32) -> Result<Vec<u8>, StreamError> {
+    pub fn try_read(&mut self, connection_number: u64, max: u32) -> Result<Vec<u8>, StreamError> {
         let max = usize::try_from(max).map_err(|_| StreamError::Io)?;
         if max > STREAM_BUFFER_BYTES {
             return Err(StreamError::Io);
@@ -133,7 +136,7 @@ impl StreamEndpoint {
             .pipe
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if pipe.generation != Some(generation) {
+        if pipe.connection_number != Some(connection_number) {
             return Err(StreamError::Stale);
         }
         let peer = 1 - self.side;
@@ -149,7 +152,7 @@ impl StreamEndpoint {
         Ok(bytes)
     }
 
-    pub fn try_write(&mut self, generation: u64, bytes: &[u8]) -> Result<u32, StreamError> {
+    pub fn try_write(&mut self, connection_number: u64, bytes: &[u8]) -> Result<u32, StreamError> {
         if bytes.len() > STREAM_BUFFER_BYTES {
             return Err(StreamError::Io);
         }
@@ -157,7 +160,7 @@ impl StreamEndpoint {
             .pipe
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if pipe.generation != Some(generation) {
+        if pipe.connection_number != Some(connection_number) {
             return Err(StreamError::Stale);
         }
         if !pipe.write_open[self.side] {
@@ -173,12 +176,12 @@ impl StreamEndpoint {
         u32::try_from(count).map_err(|_| StreamError::Io)
     }
 
-    pub fn close(&mut self, generation: u64) {
+    pub fn close(&mut self, connection_number: u64) {
         let mut pipe = self
             .pipe
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if pipe.generation != Some(generation) {
+        if pipe.connection_number != Some(connection_number) {
             return;
         }
         pipe.write_open[self.side] = false;
@@ -186,15 +189,15 @@ impl StreamEndpoint {
         self.notify();
     }
 
-    pub fn disconnect(&mut self, generation: u64) {
+    pub fn disconnect(&mut self, connection_number: u64) {
         let mut pipe = self
             .pipe
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if pipe.generation != Some(generation) {
+        if pipe.connection_number != Some(connection_number) {
             return;
         }
-        pipe.generation = None;
+        pipe.connection_number = None;
         pipe.write_open = [false; 2];
         for queue in &mut pipe.queues {
             queue.clear();
@@ -203,7 +206,7 @@ impl StreamEndpoint {
         self.notify();
     }
 
-    fn release_frontend_end(&mut self, generation: u64) {
+    fn release_frontend_end(&mut self, connection_number: u64) {
         if self.side != 0 {
             return;
         }
@@ -211,12 +214,12 @@ impl StreamEndpoint {
             .pipe
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if pipe.generation != Some(generation) {
+        if pipe.connection_number != Some(connection_number) {
             return;
         }
         pipe.frontend_ends -= 1;
         if pipe.frontend_ends == 0 {
-            pipe.generation = None;
+            pipe.connection_number = None;
             pipe.write_open = [false; 2];
             for queue in &mut pipe.queues {
                 queue.clear();
@@ -239,7 +242,7 @@ impl StreamEndpoint {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         pipe.is_retired = true;
-        pipe.generation = None;
+        pipe.connection_number = None;
         pipe.write_open = [false; 2];
         for queue in &mut pipe.queues {
             queue.clear();
@@ -248,12 +251,12 @@ impl StreamEndpoint {
         self.notify();
     }
 
-    fn stop_input(&mut self, generation: u64) -> Result<(), StreamError> {
+    fn stop_input(&mut self, connection_number: u64) -> Result<(), StreamError> {
         let mut pipe = self
             .pipe
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if pipe.generation != Some(generation) {
+        if pipe.connection_number != Some(connection_number) {
             return Err(StreamError::Stale);
         }
         let peer = 1 - self.side;
@@ -319,13 +322,13 @@ impl<T: Send + 'static> role_stream::HostWithStore<T>
         mut output: StreamReader<u8>,
     ) -> wasmtime::Result<Option<StreamReader<u8>>> {
         let mut endpoint = host.with(|mut access| access.get().clone());
-        let generation = loop {
+        let connection_number = loop {
             if endpoint.is_retired() {
                 host.with(|mut access| output.close(&mut access))?;
                 return Ok(None);
             }
-            if let Some(generation) = endpoint.current() {
-                break generation;
+            if let Some(connection_number) = endpoint.current() {
+                break connection_number;
             }
             endpoint.wait().await;
         };
@@ -334,14 +337,14 @@ impl<T: Send + 'static> role_stream::HostWithStore<T>
                 &mut access,
                 PipeOutput {
                     endpoint: endpoint.clone(),
-                    generation,
+                    connection_number,
                 },
             )?;
             StreamReader::new(
                 &mut access,
                 PipeInput {
                     endpoint,
-                    generation,
+                    connection_number,
                 },
             )
             .map(Some)
@@ -351,13 +354,13 @@ impl<T: Send + 'static> role_stream::HostWithStore<T>
 
 struct PipeInput {
     endpoint: StreamEndpoint,
-    generation: u64,
+    connection_number: u64,
 }
 
 impl Drop for PipeInput {
     fn drop(&mut self) {
-        let _ = self.endpoint.stop_input(self.generation);
-        self.endpoint.release_frontend_end(self.generation);
+        let _ = self.endpoint.stop_input(self.connection_number);
+        self.endpoint.release_frontend_end(self.connection_number);
     }
 }
 
@@ -377,7 +380,7 @@ impl<T: 'static> StreamProducer<T> for PipeInput {
             .pipe
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if pipe.generation != Some(self.generation) {
+        if pipe.connection_number != Some(self.connection_number) {
             return Poll::Ready(Ok(StreamResult::Dropped));
         }
         let peer = 1 - self.endpoint.side;
@@ -409,13 +412,13 @@ impl<T: 'static> StreamProducer<T> for PipeInput {
 
 struct PipeOutput {
     endpoint: StreamEndpoint,
-    generation: u64,
+    connection_number: u64,
 }
 
 impl Drop for PipeOutput {
     fn drop(&mut self) {
-        self.endpoint.close(self.generation);
-        self.endpoint.release_frontend_end(self.generation);
+        self.endpoint.close(self.connection_number);
+        self.endpoint.release_frontend_end(self.connection_number);
     }
 }
 
@@ -435,7 +438,7 @@ impl<T: 'static> StreamConsumer<T> for PipeOutput {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let side = self.endpoint.side;
-        if pipe.generation != Some(self.generation) || !pipe.write_open[side] {
+        if pipe.connection_number != Some(self.connection_number) || !pipe.write_open[side] {
             return Poll::Ready(Ok(StreamResult::Dropped));
         }
         let capacity = STREAM_BUFFER_BYTES - pipe.queues[side].len();
@@ -466,11 +469,11 @@ impl<T: Send + 'static> frontend_stream::HostWithStore<T>
 {
     fn connect(
         mut access: Access<'_, T, Self>,
-        generation: u64,
+        connection_number: u64,
         mut input: StreamReader<u8>,
     ) -> wasmtime::Result<Result<StreamReader<u8>, StreamError>> {
         let endpoint = &mut access.get().agent;
-        if let Err(error) = endpoint.connect(generation) {
+        if let Err(error) = endpoint.connect(connection_number) {
             input.close(&mut access)?;
             return Ok(Err(error));
         }
@@ -479,14 +482,14 @@ impl<T: Send + 'static> frontend_stream::HostWithStore<T>
             &mut access,
             PipeOutput {
                 endpoint: endpoint.clone(),
-                generation,
+                connection_number,
             },
         )?;
         StreamReader::new(
             &mut access,
             PipeInput {
                 endpoint,
-                generation,
+                connection_number,
             },
         )
         .map(Ok)
@@ -512,7 +515,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bounded_streams_preserve_partial_io_half_close_and_generations() {
+    fn bounded_streams_preserve_partial_io_half_close_and_connection_numbers() {
         let (mut frontend, mut role) = StreamEndpoint::pair();
         frontend.connect(1).unwrap();
         assert!(frontend.connect(2).is_err());
@@ -557,7 +560,7 @@ mod tests {
                     Ok(bytes) if bytes.is_empty() => role.wait().await,
                     Ok(bytes) => received.extend(bytes),
                     Err(StreamError::Closed) => break,
-                    Err(StreamError::Stale | StreamError::Io) => panic!("stream generation remains live"),
+                    Err(StreamError::Stale | StreamError::Io) => panic!("stream connection number remains live"),
                 }
             }
             assert_eq!(received, payload);
@@ -570,18 +573,18 @@ mod tests {
         })).await.unwrap().unwrap();
     }
 
-    /// Closing either frontend stream preserves the other direction; both retire the generation.
+    /// Closing either frontend stream preserves the other direction; both retire the connection number.
     #[test]
     fn frontend_stream_drops_half_close_and_retire_without_affecting_replacements() {
         let (mut frontend, mut role) = StreamEndpoint::pair();
         frontend.connect(1).unwrap();
         let input = PipeOutput {
             endpoint: frontend.clone(),
-            generation: 1,
+            connection_number: 1,
         };
         let output = PipeInput {
             endpoint: frontend.clone(),
-            generation: 1,
+            connection_number: 1,
         };
         frontend.try_write(1, &[7]).unwrap();
         drop(input);
@@ -594,11 +597,11 @@ mod tests {
         frontend.connect(2).unwrap();
         let input = PipeOutput {
             endpoint: frontend.clone(),
-            generation: 2,
+            connection_number: 2,
         };
         let output = PipeInput {
             endpoint: frontend.clone(),
-            generation: 2,
+            connection_number: 2,
         };
         drop(output);
         assert!(matches!(role.try_write(2, &[8]), Err(StreamError::Closed)));
@@ -619,7 +622,7 @@ mod tests {
         frontend.try_write(1, &[7]).unwrap();
         drop(PipeInput {
             endpoint: role.clone(),
-            generation: 1,
+            connection_number: 1,
         });
         assert!(matches!(
             frontend.try_write(1, &[8]),

@@ -164,7 +164,7 @@ async fn control_progress_survives_stalled_bulk_delivery() {
             .iter()
             .all(|frame| frame.stream != 2 || frame.payload.is_empty())
     );
-    agent.endpoint.disconnect(agent.generation);
+    agent.endpoint.disconnect(agent.connection_number);
     wait_for_client_eof(&mut client).await;
     let failure = agent.wait_for_failure().await;
     assert!(failure.contains("disconnected"), "{failure}");
@@ -175,7 +175,7 @@ async fn control_progress_survives_stalled_bulk_delivery() {
 async fn reset_releases_the_open_client() {
     let (_directory, mut agent, mut client) = start_client().await;
     wait_for_client_stream(&mut agent).await;
-    agent.endpoint.disconnect(agent.generation);
+    agent.endpoint.disconnect(agent.connection_number);
     wait_for_client_eof(&mut client).await;
     let failure = agent.wait_for_failure().await;
     assert!(failure.contains("disconnected"), "{failure}");

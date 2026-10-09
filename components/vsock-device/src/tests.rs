@@ -860,7 +860,7 @@ fn network_failure_and_physical_reset_have_distinct_scopes() {
 }
 
 #[test]
-fn malformed_active_tcp_packets_retire_the_generation_and_discard_stale_bytes() {
+fn malformed_active_tcp_packets_retire_the_connection_number_and_discard_stale_bytes() {
     use super::TCP_VSOCK_PORT;
     for malformed in 0..5 {
         let mut switch = VsockSwitch::new();
@@ -1102,7 +1102,7 @@ fn publication_streams_are_host_initiated_and_refuse_guest_requests() {
     assert_eq!(
         switch.retirements().collect::<Vec<_>>(),
         [ConnectionId {
-            generation: refused.generation,
+            number: refused.number,
             ..refused
         }]
     );

@@ -13,7 +13,7 @@ pub struct AgentGuest {
     pub endpoint: StreamEndpoint,
     pub agent: Agent,
     pub lifecycle: LifecycleNotifier,
-    pub generation: u64,
+    pub connection_number: u64,
     pub read_limit: u32,
     runtime: BoxRuntimeHandle,
     root_finished: tokio::sync::oneshot::Sender<()>,
@@ -59,7 +59,7 @@ impl AgentGuest {
             endpoint,
             agent,
             lifecycle,
-            generation: 1,
+            connection_number: 1,
             read_limit: u32::try_from(STREAM_BUFFER_BYTES).expect("stream bound"),
             runtime,
             root_finished,
@@ -71,7 +71,9 @@ impl AgentGuest {
     }
 
     pub async fn negotiate(&mut self) {
-        self.endpoint.connect(self.generation).expect("connect");
+        self.endpoint
+            .connect(self.connection_number)
+            .expect("connect");
         let mut streams = yamux_frame(0, 1, terra_protocol::mux::CONTROL_STREAM_ID, 0, &[]);
         streams.extend(yamux_frame(
             0,
@@ -84,7 +86,10 @@ impl AgentGuest {
     }
 
     pub fn drain_control(&mut self) {
-        while let Ok(bytes) = self.endpoint.try_read(self.generation, self.read_limit) {
+        while let Ok(bytes) = self
+            .endpoint
+            .try_read(self.connection_number, self.read_limit)
+        {
             if bytes.is_empty() {
                 break;
             }
@@ -174,7 +179,7 @@ impl AgentGuest {
                 let chunk = &bytes[written..bytes.len().min(written + STREAM_BUFFER_BYTES)];
                 written += self
                     .endpoint
-                    .try_write(self.generation, chunk)
+                    .try_write(self.connection_number, chunk)
                     .expect("session bytes") as usize;
                 if written < bytes.len() {
                     self.drain_control();

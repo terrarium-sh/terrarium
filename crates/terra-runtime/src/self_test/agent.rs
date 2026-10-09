@@ -13,7 +13,7 @@ const YAMUX_HEADER_BYTES: usize = 12;
 
 struct GuestTransport {
     endpoint: StreamEndpoint,
-    generation: u64,
+    connection_number: u64,
     carrier_bytes: Vec<u8>,
     stream_bytes: BTreeMap<u32, Vec<u8>>,
 }
@@ -44,7 +44,7 @@ impl GuestTransport {
                 .min(sent + terra_protocol::mux::MAX_STREAM_FRAME_BYTES);
             let count = self
                 .endpoint
-                .try_write(self.generation, &bytes[sent..end])
+                .try_write(self.connection_number, &bytes[sent..end])
                 .map_err(|error| {
                     wasmtime::Error::msg(format!("agent self-test write: {error:?}"))
                 })? as usize;
@@ -61,7 +61,7 @@ impl GuestTransport {
         loop {
             let bytes = self
                 .endpoint
-                .try_read(self.generation, 16384)
+                .try_read(self.connection_number, 16384)
                 .map_err(|error| {
                     wasmtime::Error::msg(format!("agent self-test read: {error:?}"))
                 })?;
@@ -270,7 +270,7 @@ pub(super) async fn run_with_external_clients(
     let runtime = runtime.prepare().await?.start();
     let mut guest = GuestTransport {
         endpoint: peer,
-        generation: 1,
+        connection_number: 1,
         carrier_bytes: Vec::new(),
         stream_bytes: BTreeMap::new(),
     };
