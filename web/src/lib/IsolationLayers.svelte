@@ -14,9 +14,9 @@
 
   const layers = [
     { title: 'Hardware VM', text: 'Your agent and tools run on a guest Linux kernel inside a hardware VM: KVM, Hypervisor.framework, or WHP.' },
-    { title: 'Wasm components', text: "The guest's virtio devices, the VMM, and the interrupt controller each run in their own Wasm instance." },
-    { title: 'Thin host API', text: 'Wasm components reach the host only through checked imports for guest memory, disks, shares, and the broker.' },
-    { title: 'OS sandbox', text: 'The whole VM worker runs in an OS sandbox with no host network: Bubblewrap and seccomp, App Sandbox, or AppContainer.' },
+    { title: 'Wasm components', text: 'Each blue case is a separate Wasm store, with isolated memory and scoped host imports for that component.' },
+    { title: 'Thin host API', text: 'Each Wasm store gets only its scoped host imports: VM handles, guest memory, disks, shares, or broker operations.' },
+    { title: 'OS sandbox', text: 'By default, the VM worker runs in an OS sandbox without host networking: Bubblewrap and seccomp, App Sandbox, or AppContainer.' },
     { title: 'Network broker', text: 'A separate process owns host sockets and enforces egress policy. Sandboxed on Linux and macOS.' }
   ];
 
@@ -32,7 +32,7 @@
     funnel: 'M3 5h18l-7 8v6l-4 2v-8Z'
   };
 
-  const ground: Box = { x: 0, y: 0, z: -22, w: 508, d: 376, h: 22 };
+  const ground: Box = { x: 0, y: 0, z: -14, w: 508, d: 376, h: 14 };
   const workerCage: Box = { x: 16, y: 16, z: 0, w: 352, d: 344, h: 120 };
   const hostApi: Box = { x: 28, y: 28, z: 0, w: 328, d: 320, h: 10 };
   const vm: Box = { x: 42, y: 42, z: 10, w: 190, d: 222, h: 92 };
@@ -40,10 +40,9 @@
   const workload: Box = { x: 82, y: 104, z: 18, w: 110, d: 76, h: 40 };
   const brokerCage: Box = { x: 398, y: 201, z: 0, w: 90, d: 90, h: 58 };
   const broker: Box = { x: 412, y: 215, z: 0, w: 62, d: 62, h: 32 };
-  const globe: Point = [552, 246, 34];
-  const GLOBE_RADIUS = 15;
-
   const WIRE_Z = 20;
+  const globe: Point = [552, 246, WIRE_Z];
+  const GLOBE_RADIUS = 15;
   const wasmBlock = (x: number, y: number, w: number): Box => ({ x, y, z: 10, w, d: 40, h: 20 });
   const devices: WasmComponent[] = [
     { name: 'Filesystem', icon: icons.folder, box: wasmBlock(272, 40, 72) },
@@ -53,7 +52,7 @@
   ];
   const vmmBlock: WasmComponent = { name: 'VMM', icon: icons.chip, box: wasmBlock(56, 296, 76) };
   const interruptBlock: WasmComponent = { name: 'Interrupts', icon: icons.bolt, box: wasmBlock(146, 296, 76) };
-  const agentBlock: WasmComponent = { name: 'Agent', icon: icons.terminal, box: wasmBlock(272, 296, 72) };
+  const agentBlock: WasmComponent = { name: 'Host agent', icon: icons.terminal, box: wasmBlock(272, 296, 72) };
   const machineBlocks = [vmmBlock, interruptBlock, agentBlock];
 
   const centerX = ({ x, w }: Box) => x + w / 2;
@@ -70,14 +69,14 @@
   ];
   const brokerWires: Point[][] = [
     [[vsockBox.x + vsockBox.w, centerY(vsockBox), WIRE_Z], [broker.x, centerY(vsockBox), WIRE_Z]],
-    [[broker.x + broker.w, centerY(broker), WIRE_Z], [globe[0] - GLOBE_RADIUS, globe[1], WIRE_Z]]
+    [[broker.x + broker.w, centerY(broker), WIRE_Z], globe]
   ];
 
   const tags: Label[] = [
     { layer: 4, text: 'OS sandbox · VM worker', at: [16, 250, 120], align: 'above' },
     { layer: 1, text: 'Hardware VM', at: [42, 42, 102], align: 'above' },
-    { layer: 2, text: 'Wasm components', at: [344, 40, 44], align: 'right' },
-    { layer: 3, text: 'Thin host API', at: [356, 28, 10], align: 'right' },
+    { layer: 2, text: 'Wasm components', at: [356, 28, 62], align: 'right' },
+    { layer: 3, text: 'Thin host API', at: [356, 28, 0], align: 'right' },
     { layer: 5, text: 'Network broker', at: [488, 201, 58], align: 'right' }
   ];
   const wireLabels: Label[] = [
@@ -167,14 +166,20 @@
 
   let active = $state(1);
   let isHovered = $state(false);
+  let isFocused = $state(false);
   let isVisible = $state(false);
   let canAnimate = $state(false);
+  let isPaused = $state(false);
   let dwellMs = $state(CYCLE_MS);
   let selectionCount = $state(0);
-  const isCycling = $derived(canAnimate && isVisible && !isHovered);
+  const isCycling = $derived(canAnimate && !isPaused && isVisible && !isHovered && !isFocused);
 
   onMount(() => {
-    canAnimate = !matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const motionPreference = matchMedia('(prefers-reduced-motion: reduce)');
+    const updateMotionPreference = () => (canAnimate = !motionPreference.matches);
+    updateMotionPreference();
+    motionPreference.addEventListener('change', updateMotionPreference);
+    return () => motionPreference.removeEventListener('change', updateMotionPreference);
   });
 
   function observeVisibility(node: HTMLElement) {
@@ -226,23 +231,43 @@
 {/snippet}
 
 {#snippet wasmComponent(component: WasmComponent, index: number)}
-  <g class="iso-block iso-lift" style:--i={index}>
-    {@render solid(component.box)}
-    <path class="iso-icon" transform={iconOnTop(component.box, 18)} d={component.icon} />
-    <text class="iso-face-label" transform={textOnLeftFace(component.box)} x={component.box.w / 2} y={component.box.h / 2}>{component.name}</text>
+  {@const box = component.box}
+  {@const enclosure: Box = { x: box.x - 5, y: box.y - 5, z: box.z, w: box.w + 10, d: box.d + 10, h: box.h + 16 }}
+  <g class="iso-wasm-cell">
+    <polygon class="iso-glass iso-glass-back" points={backWall(enclosure)} />
+    <polygon class="iso-glass iso-glass-back" points={sideWall(enclosure)} />
+    <g class="iso-block iso-lift" style:--i={index}>
+      {@render solid(box)}
+      <path class="iso-icon" transform={iconOnTop(box, 18)} d={component.icon} />
+      <text class="iso-face-label" transform={textOnLeftFace(box)} x={box.w / 2} y={box.h / 2}>{component.name}</text>
+    </g>
+    <polygon class="iso-glass" points={leftFace(enclosure)} />
+    <polygon class="iso-glass" points={rightFace(enclosure)} />
+    <polygon class="iso-glass iso-glass-top" points={topFace(enclosure)} />
+    <polygon class="iso-sheen" points={leftFace(enclosure)} />
   </g>
 {/snippet}
 
 {#snippet wires(paths: Point[][])}
   {#each paths as path, index (index)}
-    <polyline class="iso-wire" points={toPoints(path)} />
+    <g class="iso-link" style:--i={index}>
+      <polyline class="iso-wire" points={toPoints(path)} />
+      <polyline class="iso-packet" points={toPoints(path)} pathLength="100" />
+      {#each [path[0], path[path.length - 1]] as endpoint}
+        {@const [cx, cy] = project(endpoint)}
+        <circle class="iso-port" {cx} {cy} r="2" />
+      {/each}
+    </g>
   {/each}
 {/snippet}
 
 <section
   {@attach observeVisibility}
   class="isolation-section"
+  class:is-animated={canAnimate && !isPaused && isVisible}
   aria-labelledby="isolation-heading"
+  onfocusin={() => (isFocused = true)}
+  onfocusout={(event) => (isFocused = event.currentTarget.contains(event.relatedTarget as Node | null))}
   onpointerenter={(event) => setHovered(event, true)}
   onpointerleave={(event) => setHovered(event, false)}
 >
@@ -275,94 +300,145 @@
   <!-- The layer list buttons give keyboard users the same selection the figure gives pointers. -->
   <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_noninteractive_element_interactions -->
   <figure class="iso-figure" onpointerover={previewLayerUnderMouse} onclick={selectTappedLayer}>
-    <svg
-      class="iso"
-      viewBox="{viewBox.x.toFixed(1)} {viewBox.y.toFixed(1)} {viewBox.w.toFixed(1)} {viewBox.h.toFixed(1)}"
-      role="img"
-      aria-label="Your workload runs in a hardware VM. Its virtio devices, VMM, and interrupt controller run as separate Wasm components on a thin host API inside an OS-sandboxed VM worker; network traffic leaves through a separate broker process."
-    >
-      <defs>
-        <linearGradient id="iso-glass-sheen" x1="0" y1="0" x2="1" y2="1">
-          <stop offset="0" stop-color="#fff" stop-opacity="0.55" />
-          <stop offset="0.45" stop-color="#fff" stop-opacity="0" />
-        </linearGradient>
-      </defs>
-
-      <g class="iso-ground">
-        {@render solid(ground)}
-        <text class="iso-ground-label" transform={textOnLeftFace(ground)} x={ground.w / 2} y={ground.h / 2}>HOST OS &amp; HYPERVISOR</text>
-      </g>
-
-      <g class="iso-layer" data-layer="4" class:is-active={active === 4} class:is-dimmed={active !== 4}>
-        <path class="iso-cage" d={workerCagePaths.back} />
-      </g>
-      <g class="iso-layer" data-layer="5" class:is-active={active === 5} class:is-dimmed={active !== 5}>
-        <path class="iso-cage" d={brokerCagePaths.back} />
-      </g>
-
-      <g class="iso-layer iso-slab" data-layer="3" class:is-active={active === 3} class:is-dimmed={active !== 3}>
-        {@render solid(hostApi)}
-      </g>
-
-      <g class="iso-layer iso-vm" data-layer="1" class:is-active={active === 1} class:is-dimmed={active !== 1}>
-        <polygon class="iso-glass iso-glass-back" points={backWall(vm)} />
-        <polygon class="iso-glass iso-glass-back" points={sideWall(vm)} />
-        <g class="iso-kernel">{@render solid(guestKernel)}</g>
-        <g class="iso-workload iso-lift">
-          {@render solid(workload)}
-          <path class="iso-icon" transform={iconOnTop(workload, 22)} d={icons.code} />
-          <text class="iso-face-label iso-workload-label" transform={textOnLeftFace(workload)} x={workload.w / 2} y={workload.h / 2}>Your workload</text>
-        </g>
-        <polygon class="iso-glass" points={leftFace(vm)} />
-        <polygon class="iso-sheen" points={leftFace(vm)} />
-        <polygon class="iso-glass" points={rightFace(vm)} />
-        <polygon class="iso-glass iso-glass-top" points={topFace(vm)} />
-      </g>
-
-      <g class="iso-layer" data-layer="2" class:is-active={active === 2} class:is-dimmed={active !== 2}>
-        {@render wires(virtioWires)}
-        {@render wires(machineWires)}
-        {#each devices as device, index (device.name)}
-          {@render wasmComponent(device, index)}
-        {/each}
-        {#each machineBlocks as block, index (block.name)}
-          {@render wasmComponent(block, devices.length + index)}
-        {/each}
-      </g>
-
-      <g class="iso-layer" data-layer="5" class:is-active={active === 5} class:is-dimmed={active !== 5}>
-        {@render wires(brokerWires)}
-        <g class="iso-broker iso-lift">
-          {@render solid(broker)}
-          <path class="iso-icon" transform={iconOnTop(broker, 20)} d={icons.funnel} />
-        </g>
-        <g class="iso-globe" transform="translate({globeX.toFixed(1)} {globeY.toFixed(1)})">
-          <circle r={GLOBE_RADIUS} />
-          <ellipse rx={GLOBE_RADIUS * 0.42} ry={GLOBE_RADIUS} />
-          <path d="M{-GLOBE_RADIUS} 0H{GLOBE_RADIUS}" />
-        </g>
-        <path class="iso-cage" d={brokerCagePaths.front} />
-      </g>
-
-      <g class="iso-layer" data-layer="4" class:is-active={active === 4} class:is-dimmed={active !== 4}>
-        <path class="iso-cage" d={workerCagePaths.front} />
-      </g>
-    </svg>
-
-    {#each tags as tag (tag.text)}
-      <span
-        class="iso-tag"
-        class:is-active={tag.layer === active}
-        class:is-dimmed={tag.layer !== active}
-        data-layer={tag.layer}
-        data-align={tag.align}
-        style={placeLabel(tag.at)}
+    <div class="iso-scene">
+      <svg
+        class="iso"
+        viewBox="{viewBox.x.toFixed(1)} {viewBox.y.toFixed(1)} {viewBox.w.toFixed(1)} {viewBox.h.toFixed(1)}"
+        role="img"
+        aria-label="Your workload runs in a hardware VM. Its devices, VMM, host agent, and x86 interrupt controller each run inside an individual Wasm enclosure on a thin host API inside an OS-sandboxed VM worker; network traffic leaves through a separate broker process."
       >
-        <span class="layer-number">{tag.layer}</span><span class="iso-tag-text">{tag.text}</span>
+        <defs>
+          <pattern id="iso-api-grid" width="24" height="24" patternUnits="userSpaceOnUse" patternTransform="matrix({ISO_X} 0.5 {-ISO_X} 0.5 0 0)">
+            <path d="M24 0H0V24" fill="none" stroke="#568d88" stroke-width="0.6" />
+          </pattern>
+          <clipPath id="iso-vm-glass">
+            <polygon points={leftFace(vm)} />
+            <polygon points={rightFace(vm)} />
+            <polygon points={topFace(vm)} />
+          </clipPath>
+          <linearGradient id="iso-reflection">
+            <stop stop-color="#fff" stop-opacity="0" />
+            <stop offset="0.5" stop-color="#fff" stop-opacity="0.45" />
+            <stop offset="1" stop-color="#fff" stop-opacity="0" />
+          </linearGradient>
+          <linearGradient id="iso-workload-top" x1="0" y1="0" x2="1" y2="1">
+            <stop stop-color="#51877a" />
+            <stop offset="1" stop-color="#28594f" />
+          </linearGradient>
+          <linearGradient id="iso-component-top" x1="0" y1="0" x2="0.8" y2="1">
+            <stop stop-color="#fffefb" />
+            <stop offset="1" stop-color="#e6eee4" />
+          </linearGradient>
+          <linearGradient id="iso-api-top" x1="0" y1="0" x2="1" y2="1">
+            <stop stop-color="#edf5f4" />
+            <stop offset="1" stop-color="#c2dce0" />
+          </linearGradient>
+          <linearGradient id="iso-glass-sheen" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0" stop-color="#fff" stop-opacity="0.55" />
+            <stop offset="0.45" stop-color="#fff" stop-opacity="0" />
+          </linearGradient>
+        </defs>
+
+        <g class="iso-ground">
+          {@render solid(ground)}
+          <text class="iso-ground-label" transform={textOnLeftFace(ground)} x={ground.w / 2} y={ground.h / 2}>HOST OS &amp; HYPERVISOR</text>
+        </g>
+
+        <g class="iso-layer" data-layer="4" class:is-active={active === 4} class:is-dimmed={active !== 4}>
+          <polygon class="iso-process-glass" points={backWall(workerCage)} />
+          <polygon class="iso-process-glass" points={sideWall(workerCage)} />
+          <path class="iso-cage iso-cage-back" d={workerCagePaths.back} />
+        </g>
+        <g class="iso-layer" data-layer="5" class:is-active={active === 5} class:is-dimmed={active !== 5}>
+          <path class="iso-cage iso-cage-back" d={brokerCagePaths.back} />
+        </g>
+
+        <g class="iso-layer iso-slab" data-layer="3" class:is-active={active === 3} class:is-dimmed={active !== 3}>
+          {@render solid(hostApi)}
+          <polygon class="iso-grid" points={topFace(hostApi)} />
+        </g>
+
+        <g class="iso-layer iso-vm" data-layer="1" class:is-active={active === 1} class:is-dimmed={active !== 1}>
+          <polygon class="iso-glass iso-glass-back" points={backWall(vm)} />
+          <polygon class="iso-glass iso-glass-back" points={sideWall(vm)} />
+          <g class="iso-kernel">
+            {@render solid(guestKernel)}
+            <text class="iso-kernel-label" transform={matrixAt([guestKernel.x, guestKernel.y, guestKernel.z + guestKernel.h], [ISO_X, 0.5], [-ISO_X, 0.5])} x={guestKernel.w / 2} y={guestKernel.d - 16}>Guest Linux</text>
+          </g>
+          <g class="iso-workload iso-lift">
+            {@render solid(workload)}
+            <path class="iso-icon" transform={iconOnTop(workload, 22)} d={icons.code} />
+            <text class="iso-face-label iso-workload-label" transform={textOnLeftFace(workload)} x={workload.w / 2} y={workload.h / 2}>Your workload</text>
+          </g>
+          <polygon class="iso-glass" points={leftFace(vm)} />
+          <polygon class="iso-sheen" points={leftFace(vm)} />
+          <polygon class="iso-glass" points={rightFace(vm)} />
+          <polygon class="iso-glass iso-glass-top" points={topFace(vm)} />
+          <g clip-path="url(#iso-vm-glass)" pointer-events="none">
+            <path class="iso-reflection" d="M-90-100H-30L90 350H30Z" />
+          </g>
+        </g>
+
+        <g class="iso-layer" data-layer="2" class:is-active={active === 2} class:is-dimmed={active !== 2}>
+          {@render wires(virtioWires)}
+          {@render wires(machineWires)}
+          {#each devices as device, index (device.name)}
+            {@render wasmComponent(device, index)}
+          {/each}
+          {#each machineBlocks as block, index (block.name)}
+            {@render wasmComponent(block, devices.length + index)}
+          {/each}
+        </g>
+
+        <g class="iso-layer" data-layer="5" class:is-active={active === 5} class:is-dimmed={active !== 5}>
+          {@render wires(brokerWires)}
+          <g class="iso-broker iso-lift">
+            {@render solid(broker)}
+            <path class="iso-icon" transform={iconOnTop(broker, 20)} d={icons.funnel} />
+          </g>
+          <g class="iso-globe" transform="translate({globeX.toFixed(1)} {globeY.toFixed(1)})">
+            <circle class="iso-pulse" r={GLOBE_RADIUS + 4} />
+            <circle r={GLOBE_RADIUS} />
+            <ellipse rx={GLOBE_RADIUS * 0.42} ry={GLOBE_RADIUS} />
+            <path d="M{-GLOBE_RADIUS} 0H{GLOBE_RADIUS}" />
+          </g>
+          <path class="iso-cage" d={brokerCagePaths.front} />
+        </g>
+
+        <g class="iso-layer" data-layer="4" class:is-active={active === 4} class:is-dimmed={active !== 4}>
+          <polygon class="iso-process-glass" points={leftFace(workerCage)} />
+          <polygon class="iso-process-glass" points={rightFace(workerCage)} />
+          <polygon class="iso-process-glass" points={topFace(workerCage)} />
+          <path class="iso-cage" d={workerCagePaths.front} />
+        </g>
+      </svg>
+
+      {#each tags as tag (tag.text)}
+        <span
+          class="iso-tag"
+          class:is-active={tag.layer === active}
+          class:is-dimmed={tag.layer !== active}
+          data-layer={tag.layer}
+          data-align={tag.align}
+          style={placeLabel(tag.at)}
+        >
+          <span class="layer-number">{tag.layer}</span><span class="iso-tag-text">{tag.text}</span>
+        </span>
+      {/each}
+      {#each wireLabels as label (label.text)}
+        <span class="iso-wire-label" class:is-active={label.layer === active} data-layer={label.layer} data-align={label.align} style={placeLabel(label.at)}>{label.text}</span>
+      {/each}
+    </div>
+    <figcaption class="iso-caption">
+      <span class="iso-boundary-key" aria-label="Isolation boundaries">
+        <span class="iso-boundary-vm">Hardware VM</span>
+        <span class="iso-boundary-wasm">One Wasm store per component</span>
+        <span class="iso-boundary-process">OS sandbox</span>
       </span>
-    {/each}
-    {#each wireLabels as label (label.text)}
-      <span class="iso-wire-label" class:is-active={label.layer === active} data-layer={label.layer} data-align={label.align} style={placeLabel(label.at)}>{label.text}</span>
-    {/each}
+      <span>Interrupts: Wasm controller on x86 · native IRQ lines on ARM.</span>
+      {#if canAnimate}
+        <button class="iso-motion-toggle" type="button" onclick={() => (isPaused = !isPaused)}>{isPaused ? 'Resume motion' : 'Pause motion'}</button>
+      {/if}
+    </figcaption>
   </figure>
 </section>
