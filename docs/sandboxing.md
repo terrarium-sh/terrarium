@@ -3,7 +3,7 @@
 Terra splits each box into a trusted supervisor and confined workers, then
 confines each worker with the host platform's own mechanism. `vm.init: bwrap`
 (the default) selects this built-in sandbox; see [host VM launchers](vm-launchers.md)
-for configuration, custom launchers and policy generation. A failed sandbox
+for configuration and policy generation. A failed sandbox
 launch stops the box; there is no automatic fallback to an unconfined launch.
 
 | Role | Holds | Never receives |

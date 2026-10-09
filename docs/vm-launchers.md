@@ -1,7 +1,7 @@
 # Host VM launchers
 
-Terra can start its host VM process directly, through a custom launcher, or
-through its built-in native sandbox. Configure the choice globally in
+Terra can start its host VM process directly or through its built-in native
+sandbox. Configure the choice globally in
 `~/.terra/config.yaml`; a project recipe cannot change it. An absent or null
 `vm.init` selects `bwrap`: Bubblewrap on Linux and native App Sandbox/AppContainer
 launchers on macOS/Windows. The native launch separates the VM and network
@@ -148,7 +148,11 @@ architecture. Host-only enforcement does not certify a VM run; use
 covers every error or timing-dependent path. Regenerate after changing Terra or
 the workload.
 
-## Custom launcher contract
+## Experimental: custom launchers
+
+> **Experimental.** Custom launchers are unsupported. The contract below
+> exposes Terra internals and can change in any release without notice; do not
+> rely on it.
 
 Set `vm.init` to one executable or script path. Relative paths resolve against
 the directory containing `config.yaml`. The value is a path, not a shell command;

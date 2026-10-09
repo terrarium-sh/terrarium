@@ -14,8 +14,6 @@ fn apply_device_settings(config: &mut Config) -> wasmtime::Result<()> {
     // embedded AOT components load on any host of the build architecture
     // instead of only hosts matching the build machine's CPU.
     config.target(&target_lexicon::Triple::host().to_string())?;
-    #[cfg(feature = "thread-experiments")]
-    config.wasm_threads(false);
     config
         .epoch_interruption(true)
         .shared_memory(false)

@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/terra", "crates/terra-agent", "crates/terra-protocol", "crates/terra-runtime", "crates/terra-platform", "crates/terra-limits", "crates/terra-policy", "crates/terra-network", "crates/terra-build", "crates/terra-sandbox"]
-exclude = ["vendor", "components", "fuzz"]
+exclude = ["vendor", "components", "fuzz", "crates/terra/tests/assets/http3_probe"]
 
 [workspace.package]
 version = "0.0.1"

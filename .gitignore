@@ -17,3 +17,4 @@ __pycache__/
 /.agents/
 /.codex/
 /.aws/
+/.playwright-mcp/

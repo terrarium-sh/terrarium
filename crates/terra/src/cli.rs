@@ -17,8 +17,7 @@ use terra_protocol::DEFAULT_STOP_GRACE_SECS;
                   defaults to this directory's only box. With a box already up and \
                   neither a terminal to attach from nor `-d`, terra exits 125.\n\n\
                   Native sandboxes isolate the VM and network broker by default. Set vm.init in ~/.terra/config.yaml to \
-                  direct to disable them, bwrap to select them explicitly, or an executable \
-                  path for a custom launcher.",
+                  direct to disable them, or bwrap to select them explicitly.",
     after_long_help = "EXAMPLES:\n    \
                        terra dev                   Start this directory's box `dev`, or attach\n    \
                        terra dev exec -- ls        Run a command in the running box\n    \
@@ -369,7 +368,6 @@ pub struct ShowArgs {
 }
 
 #[derive(Args, Debug)]
-#[allow(clippy::struct_excessive_bools)]
 pub struct ExecArgs {
     /// Run as root instead of the workload's own user.
     #[arg(long)]
@@ -388,9 +386,6 @@ pub struct ExecArgs {
     /// Environment variables for the command (KEY=VALUE, or KEY to inherit from the host).
     #[arg(short = 'e', long = "env", value_name = "KEY[=VALUE]")]
     pub env: Vec<String>,
-    /// Inherit the host's environment variables.
-    #[arg(short = 'E', long)]
-    pub inherit_env: bool,
     #[command(flatten)]
     pub agent: AgentTimeoutArg,
     /// The command to run, after `--`. argv is passed literally to the guest
@@ -1627,7 +1622,7 @@ mod tests {
     fn exec_accepts_workdir_and_env_flags() {
         let cli = Cli::parse_from([
             "terra", "dev", "exec", "-w", "/custom", "-e", "FOO=BAR", "--env", "BAZ=QUX", "-e",
-            "BARE", "-E", "--", "pwd",
+            "BARE", "--", "pwd",
         ]);
         assert_eq!(cli.name.as_deref(), Some("dev"));
         let Some(Cmd::Exec(args)) = cli.cmd else {
@@ -1635,14 +1630,7 @@ mod tests {
         };
         assert_eq!(args.workdir.as_deref(), Some("/custom"));
         assert_eq!(args.env, ["FOO=BAR", "BAZ=QUX", "BARE"]);
-        assert!(args.inherit_env);
         assert_eq!(args.command, ["pwd"]);
-
-        let cli_long = Cli::parse_from(["terra", "dev", "exec", "--inherit-env", "--", "pwd"]);
-        let Some(Cmd::Exec(args_long)) = cli_long.cmd else {
-            panic!("expected exec")
-        };
-        assert!(args_long.inherit_env);
     }
 
     /// The version string names the commit this build was made from; outside an

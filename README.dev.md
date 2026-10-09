@@ -285,9 +285,9 @@ rebuilding historical releases.
 
 ## Verification
 
-Real HTTP/3 tests and benchmarks use a static quic-go fixture, with certificate
-verification and no TCP fallback. After `make dist`, run `make test-http3`
-on native Linux/KVM (Go 1.25 or newer is also required). This checks GET/POST
+Real HTTP/3 tests and benchmarks use a static Rust quinn/h3 fixture
+(`crates/terra/tests/assets/http3_probe`), with certificate verification and no
+TCP fallback. After `make dist`, run `make test-http3` on native Linux/KVM. This checks GET/POST
 compatibility and verified 1-MiB uploads/downloads natively and with both Terra
 launchers. For throughput:
 
@@ -496,11 +496,6 @@ component bindings in the component manifests, and component build commands in
 are version 0.3.1. The `wasi_version` runtime integration test checks the actual
 filesystem component's imports and linkage; update that test, the WIT and host
 bindings together when changing runtime versions.
-
-Production shared memory is disabled. `make verify` also runs the feature-gated
-`shared_component_memory` and `shared_worker_memory` experiments. Those probes
-exercise core-Wasm sharing and component API limitations; they do not establish
-a supported transport between the generated device components.
 
 ## Performance tools
 

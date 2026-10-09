@@ -25,7 +25,7 @@ pub async fn run(
     )
     .await?;
 
-    let env = resolve_exec_env(args.inherit_env, &args.env)?;
+    let env = resolve_exec_env(&args.env)?;
 
     let tty = args.wants_a_terminal(is_at_a_terminal);
     let req = ExecRequest {
@@ -43,67 +43,18 @@ pub async fn run(
     )))
 }
 
-/// Host paths, shells, and session sockets would break or misconfigure the guest VM if inherited blindly.
-fn is_host_identity_var(key: &str) -> bool {
-    matches!(
-        key,
-        "HOME"
-            | "PATH"
-            | "USER"
-            | "LOGNAME"
-            | "SHELL"
-            | "PWD"
-            | "OLDPWD"
-            | "_"
-            | "DISPLAY"
-            | "WAYLAND_DISPLAY"
-            | "XAUTHORITY"
-            | "DBUS_SESSION_BUS_ADDRESS"
-            | "SSH_AUTH_SOCK"
-    ) || key.starts_with("TERRA_")
+fn resolve_exec_env(entries: &[String]) -> Result<BTreeMap<String, String>> {
+    resolve_exec_env_from(entries, |k| {
+        std::env::var(k)
+            .map_err(|_| anyhow::anyhow!("environment variable `{k}` is not set on the host"))
+    })
 }
 
-fn resolve_exec_env(inherit_env: bool, entries: &[String]) -> Result<BTreeMap<String, String>> {
-    resolve_exec_env_from(
-        inherit_env,
-        entries,
-        |k| {
-            std::env::var(k)
-                .map_err(|_| anyhow::anyhow!("environment variable `{k}` is not set on the host"))
-        },
-        || std::env::vars_os().filter_map(utf8_env_entry),
-    )
-}
-
-fn utf8_env_entry(
-    (name, value): (std::ffi::OsString, std::ffi::OsString),
-) -> Option<(String, String)> {
-    name.into_string().ok().zip(value.into_string().ok())
-}
-
-fn resolve_exec_env_from<I>(
-    inherit_env: bool,
+fn resolve_exec_env_from(
     entries: &[String],
     lookup_host_var: impl Fn(&str) -> Result<String>,
-    all_host_vars: impl FnOnce() -> I,
-) -> Result<BTreeMap<String, String>>
-where
-    I: IntoIterator<Item = (String, String)>,
-{
+) -> Result<BTreeMap<String, String>> {
     let mut env = BTreeMap::new();
-    if inherit_env {
-        for (k, v) in all_host_vars() {
-            if is_host_identity_var(&k)
-                || k.is_empty()
-                || k.contains(['=', '\0'])
-                || v.contains('\0')
-            {
-                continue;
-            }
-            env.insert(k, v);
-        }
-    }
-
     for entry in entries {
         let (k, v) = if let Some((k, v)) = entry.split_once('=') {
             if k.is_empty() {
@@ -135,31 +86,13 @@ where
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
-    #[test]
-    fn inherited_environment_skips_non_utf8_names_and_values() {
-        use std::ffi::OsString;
-        use std::os::unix::ffi::OsStringExt;
-
-        assert_eq!(
-            utf8_env_entry(("APP".into(), "value".into())),
-            Some(("APP".into(), "value".into()))
-        );
-        let invalid = OsString::from_vec(vec![0xff]);
-        assert!(utf8_env_entry((invalid.clone(), "value".into())).is_none());
-        assert!(utf8_env_entry(("APP".into(), invalid)).is_none());
-    }
-
     #[test]
     fn invalid_env_entries_are_refused() {
         let parse = |entries: &[&str]| {
             let entries: Vec<String> = entries.iter().map(ToString::to_string).collect();
-            resolve_exec_env_from(
-                false,
-                &entries,
-                |k| bail!("environment variable `{k}` is not set on the host"),
-                std::iter::empty,
-            )
+            resolve_exec_env_from(&entries, |k| {
+                bail!("environment variable `{k}` is not set on the host")
+            })
         };
 
         assert!(parse(&["FOO=BAR"]).is_ok());
@@ -180,16 +113,11 @@ mod tests {
         ]);
         let parse = |entries: &[&str]| {
             let entries: Vec<String> = entries.iter().map(ToString::to_string).collect();
-            resolve_exec_env_from(
-                false,
-                &entries,
-                |k| {
-                    host.get(k).cloned().ok_or_else(|| {
-                        anyhow::anyhow!("environment variable `{k}` is not set on the host")
-                    })
-                },
-                std::iter::empty,
-            )
+            resolve_exec_env_from(&entries, |k| {
+                host.get(k).cloned().ok_or_else(|| {
+                    anyhow::anyhow!("environment variable `{k}` is not set on the host")
+                })
+            })
         };
 
         let env = parse(&["SET"]).unwrap();
@@ -199,85 +127,5 @@ mod tests {
         assert!(err.to_string().contains("is not set on the host"), "{err}");
 
         assert!(parse(&["WITH_NUL"]).is_err());
-    }
-
-    #[test]
-    fn blanket_inherit_env_skips_host_identity_vars() {
-        let host = [
-            ("HOME", "/home/hostuser"),
-            ("PATH", "/usr/bin:/bin"),
-            ("USER", "hostuser"),
-            ("LOGNAME", "hostuser"),
-            ("SHELL", "/bin/zsh"),
-            ("PWD", "/host/project"),
-            ("OLDPWD", "/host"),
-            ("_", "/usr/bin/terra"),
-            ("DISPLAY", ":0"),
-            ("WAYLAND_DISPLAY", "wayland-0"),
-            ("SSH_AUTH_SOCK", "/tmp/ssh.sock"),
-            ("TERRA_INTERNAL", "1"),
-            ("APP_SECRET", "supersecret"),
-            ("TERM", "xterm-256color"),
-        ]
-        .into_iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect::<Vec<_>>();
-
-        let env =
-            resolve_exec_env_from(true, &[], |k| bail!("not found: {k}"), || host.clone()).unwrap();
-
-        assert_eq!(
-            env.get("APP_SECRET").map(String::as_str),
-            Some("supersecret")
-        );
-        assert_eq!(env.get("TERM").map(String::as_str), Some("xterm-256color"));
-        for filtered in [
-            "HOME",
-            "PATH",
-            "USER",
-            "LOGNAME",
-            "SHELL",
-            "PWD",
-            "OLDPWD",
-            "_",
-            "DISPLAY",
-            "WAYLAND_DISPLAY",
-            "SSH_AUTH_SOCK",
-            "TERRA_INTERNAL",
-        ] {
-            assert!(
-                !env.contains_key(filtered),
-                "{filtered} should have been filtered"
-            );
-        }
-    }
-
-    #[test]
-    fn explicit_entries_override_blanket_inherit_and_allow_filtered_vars() {
-        let host = [
-            ("APP_VAR".to_string(), "original".to_string()),
-            ("HOME".to_string(), "/home/hostuser".to_string()),
-        ];
-        let entries = vec![
-            "APP_VAR=overridden".to_string(),
-            "HOME".to_string(),
-            "CUSTOM=value".to_string(),
-        ];
-        let env = resolve_exec_env_from(
-            true,
-            &entries,
-            |k| {
-                host.iter()
-                    .find(|(name, _)| name == k)
-                    .map(|(_, v)| v.clone())
-                    .ok_or_else(|| anyhow::anyhow!("not found"))
-            },
-            || host.clone(),
-        )
-        .unwrap();
-
-        assert_eq!(env.get("APP_VAR").map(String::as_str), Some("overridden"));
-        assert_eq!(env.get("HOME").map(String::as_str), Some("/home/hostuser"));
-        assert_eq!(env.get("CUSTOM").map(String::as_str), Some("value"));
     }
 }

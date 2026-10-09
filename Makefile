@@ -372,7 +372,8 @@ endif
 
 .PHONY: test-http3
 test-http3:
-	cd crates/terra/tests/assets/http3_probe && go test ./...
+	$(CARGO_LOCKED) test --manifest-path crates/terra/tests/assets/http3_probe/Cargo.toml
+	$(CARGO_LOCKED) clippy --all-targets --manifest-path crates/terra/tests/assets/http3_probe/Cargo.toml -- -D warnings
 	python3 scripts/bench/bench-http3.py --terra dist/terra --runs 1 --mib 1 --output build/http3-test/report.json
 
 ## Format check, lints, and the test suite. Generating the man pages is
@@ -413,7 +414,6 @@ verify-workspace:
 	$(CARGO_LOCKED) clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings || $(CHECK_FAILURE); \
 	$(CARGO_LOCKED) doc --workspace --no-deps --document-private-items --target $(MUSL) || $(CHECK_FAILURE); \
 	$(CARGO_LOCKED) test $(TEST_FLAGS) --workspace --target $(MUSL) || $(CHECK_FAILURE); \
-	$(CARGO_LOCKED) test $(TEST_FLAGS) -p terra-runtime --target $(MUSL) --features thread-experiments --test integration -- shared_component_memory:: shared_worker_memory:: || $(CHECK_FAILURE); \
 	exit $$status
 
 verify-dependency-boundaries:

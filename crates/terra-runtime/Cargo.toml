@@ -11,7 +11,6 @@ default = []
 # The shipped device runtime only deserializes artifacts produced by the
 # trusted build. Keep Cranelift out of that dependency graph.
 compiler = ["wasmtime/cranelift"]
-thread-experiments = ["wasmtime/threads"]
 test-support = []
 
 [dependencies]

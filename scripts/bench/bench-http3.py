@@ -42,7 +42,7 @@ def summarize(runs):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--terra", type=Path, default=REPOSITORY / "dist/terra")
-    parser.add_argument("--probe", type=Path, help="existing static Linux HTTP/3 probe; otherwise build with Go")
+    parser.add_argument("--probe", type=Path, help="existing static Linux HTTP/3 probe; otherwise build the Rust probe")
     parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--mib", type=int, default=64, help="verified payload MiB per upload/download")
     parser.add_argument("--output", type=Path, required=True)
@@ -55,17 +55,17 @@ def main():
     args.output = args.output.resolve()
     args.output.parent.mkdir(parents=True, exist_ok=True)
     capture = Path(tempfile.mkdtemp(prefix="http3-", dir=args.output.parent))
-    environment = os.environ | {"GOMAXPROCS": "2"}
+    environment = dict(os.environ)
     environment.pop("RUST_LOG", None)
     report = {
         "created_at_utc": datetime.now(UTC).isoformat(), "passed": False,
         "terra_sha256": digest(binary), "capture_path": str(capture),
         "host": {"system": platform.system(), "release": platform.release(), "machine": platform.machine()},
         "workload": {"runs_per_launcher": args.runs, "bytes_per_transfer": args.mib * 1048576,
-                     "guest_vcpus": 2, "guest_memory_mib": 512, "host_go_max_procs": 2},
+                     "guest_vcpus": 2, "guest_memory_mib": 512, "probe_worker_threads": 2},
         "measurement": "One HTTP/3 stream over QUIC/TLS per transfer, after a small GET on the same connection. Client monotonic timing includes payload verification and final response, excludes VM boot, process launch and TLS handshake. Upload receives only a small acknowledgment; download has no payload echo. Native control uses the same probe and UDP-only host server. Loopback results do not model WAN latency or loss.",
         "sources": {str(path.relative_to(REPOSITORY)): digest(path) for path in
-                    [Path(__file__), *sorted(PROBE_SOURCE.glob("*.go")), PROBE_SOURCE / "go.mod", PROBE_SOURCE / "go.sum"]},
+                    [Path(__file__), *sorted(PROBE_SOURCE.glob("src/*.rs")), PROBE_SOURCE / "Cargo.toml", PROBE_SOURCE / "Cargo.lock"]},
         "commands": [], "runs": [],
     }
 
@@ -96,11 +96,12 @@ def main():
         if args.probe:
             probe = args.probe.resolve()
         else:
-            probe = capture / "http3-probe"
-            run(["go", "build", "-trimpath", "-o", probe, "."],
-                env=environment | {"CGO_ENABLED": "0", "GOOS": "linux",
-                                   "GOARCH": "amd64" if platform.machine() == "x86_64" else "arm64"},
-                cwd=PROBE_SOURCE)
+            target = f"{platform.machine()}-unknown-linux-musl"
+            target_dir = REPOSITORY / "build/http3-probe-target"
+            run(["cargo", "build", "--release", "--locked", "--manifest-path", PROBE_SOURCE / "Cargo.toml",
+                 "--target", target], env=environment | {"CARGO_TARGET_DIR": str(target_dir)},
+                timeout=900, cwd=REPOSITORY)
+            probe = target_dir / target / "release/terra-http3-probe"
         report["probe_sha256"] = digest(probe)
         fixture = capture / "fixture"
         fixture.mkdir()
