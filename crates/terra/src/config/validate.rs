@@ -132,14 +132,28 @@ fn validate_volumes(cfg: &Config) -> Result<()> {
 }
 
 fn validate_network(cfg: &Config) -> Result<()> {
-    // A broken `network:` would otherwise fail mid-boot, in the background
-    // gateway - after the recipe was pinned - so it is refused here instead.
+    if !cfg.network.enabled {
+        anyhow::ensure!(
+            cfg.network.mode == super::NetworkMode::Allowlist
+                && cfg.network.allow.is_empty()
+                && cfg.network.hosts.is_empty()
+                && cfg.network.ports.is_empty(),
+            "network.enabled: false requires allowlist mode and empty allow, hosts, and ports; remove those grants or enable networking"
+        );
+        return Ok(());
+    }
     crate::policy::network::rules::parse_port_mappings(&cfg.network.ports)?;
-    let policy_memory_bytes = cfg.components.memory_limits()?.component_bytes();
-    let _ = crate::policy::network::runtime::BoxPolicy::with_memory_limit(
-        &cfg.network,
-        policy_memory_bytes,
-    )?;
+    let mut network = terra_policy::config::Network::from(&cfg.network);
+    network.host_addresses = crate::sys::host_addresses()?
+        .into_iter()
+        .map(|address| address.to_string())
+        .collect();
+    let gateways = terra_runtime::component::network::HostServiceAddresses::default();
+    terra_policy::BoxPolicy::new(
+        &network,
+        [gateways.gateway_ip.into(), gateways.gateway_ip6.into()],
+    )
+    .map_err(anyhow::Error::msg)?;
     Ok(())
 }
 

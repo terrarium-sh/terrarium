@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""Offline checks for alpine-sources.sh."""
+
+import io
+import os
+from pathlib import Path
+import shutil
+import stat
+import subprocess
+import tarfile
+import tempfile
+import unittest
+
+
+ROOT = Path(__file__).resolve().parents[2]
+COLLECTOR = ROOT / "scripts/sources/alpine-sources.sh"
+
+GIT = r'''#!/usr/bin/env python3
+import io, os, pathlib, sys, tarfile
+
+args = sys.argv[1:]
+if "init" in args:
+    pathlib.Path(args[-1]).mkdir(parents=True, exist_ok=True)
+if "fetch" in args and os.environ.get("FAIL_FETCH"):
+    raise SystemExit(23)
+if "archive" in args:
+    path = args[args.index("archive") + 2]
+    data = os.environ.get("APKBUILD", "pkgname=test\npkgver=1\n").encode()
+    with tarfile.open(fileobj=sys.stdout.buffer, mode="w|") as archive:
+        entry = tarfile.TarInfo(path + "/APKBUILD")
+        entry.size = len(data)
+        archive.addfile(entry, io.BytesIO(data))
+'''
+
+PODMAN = r'''#!/usr/bin/env python3
+import os, pathlib, re, subprocess, sys, tempfile
+
+if os.environ.get("FAIL_PODMAN"):
+    raise SystemExit(24)
+env = os.environ.copy()
+script = sys.argv[-1]
+mounts = {}
+for index, argument in enumerate(sys.argv):
+    if argument == "--env":
+        key, value = sys.argv[index + 1].split("=", 1)
+        env[key] = value
+    if argument == "--volume":
+        host, container, mode = sys.argv[index + 1].split(":")
+        mounts[container] = host
+with tempfile.TemporaryDirectory() as directory:
+    script = script.replace("/tmp/package", directory + "/work")
+    for container, host in mounts.items():
+        script = re.sub(re.escape(container) + r"(?=\s|$)", lambda _: host, script)
+    raise SystemExit(subprocess.run(["sh", "-ec", script], env=env).returncode)
+'''
+
+ABUILD = r'''#!/usr/bin/env python3
+import os, pathlib
+
+(pathlib.Path(os.environ["SRCDEST"]) / "source.tar.gz").write_bytes(os.environ["CHOST"].encode())
+'''
+
+WGET = r'''#!/usr/bin/env python3
+import os, pathlib
+import sys
+
+if os.environ.get("FAIL_WGET"):
+    raise SystemExit(25)
+if path := os.environ.get("WGET_LOG"):
+    pathlib.Path(path).write_text(" ".join(sys.argv[1:]))
+'''
+
+
+class AlpineSourcesTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        scripts = self.root / "scripts/sources"
+        scripts.mkdir(parents=True)
+        self.collector = scripts / "alpine-sources.sh"
+        shutil.copy2(COLLECTOR, self.collector)
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        self.command("git", GIT)
+        self.command("podman", PODMAN)
+        self.command("wget", WGET)
+        self.command("apk", "#!/bin/sh\nexit 0\n")
+        self.command("abuild", ABUILD)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def command(self, name, body):
+        path = self.bin / name
+        path.write_text(body)
+        path.chmod(path.stat().st_mode | stat.S_IXUSR)
+
+    def write_database(self, records):
+        image = self.root / "build/alpine-minirootfs.tar.gz"
+        image.parent.mkdir()
+        data = ("A:aarch64\n\n" + "\n\n".join(records)).encode()
+        with tarfile.open(image, "w:gz") as archive:
+            release = b"3.24.1\n"
+            release_entry = tarfile.TarInfo("./etc/alpine-release")
+            release_entry.size = len(release)
+            archive.addfile(release_entry, io.BytesIO(release))
+            entry = tarfile.TarInfo("./lib/apk/db/installed")
+            entry.size = len(data)
+            archive.addfile(entry, io.BytesIO(data))
+
+    def collect(self, **extra):
+        env = os.environ | {"PATH": f"{self.bin}{os.pathsep}{os.environ['PATH']}"} | extra
+        return subprocess.run([self.collector], cwd=self.root, env=env, capture_output=True, text=True)
+
+    def test_collects_each_gpl_origin_once_with_sources_and_distfiles(self):
+        self.write_database([
+            "P:busybox\nV:1\nL:GPL-2.0-only\no:busybox\nc:deadbeef",
+            "P:busybox-doc\nV:1\nL:GPL-2.0-only\no:busybox\nc:deadbeef",
+            "P:musl\nV:1\nL:MIT\no:musl\nc:feedface",
+        ])
+        result = self.collect()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = self.root / "build/alpine-corresponding-source.tar.gz"
+        with tarfile.open(output) as archive:
+            names = archive.getnames()
+            manifest = archive.extractfile("manifest.tsv").read().decode().splitlines()
+            distfile = archive.extractfile("distfiles/source.tar.gz").read()
+        self.assertEqual(len(manifest), 1)
+        self.assertEqual(manifest[0].split("\t")[2:4], ["busybox", "deadbeef"])
+        self.assertIn("sources/busybox-deadbeef/APKBUILD", names)
+        self.assertIn("distfiles/source.tar.gz", names)
+        self.assertEqual(distfile, b"aarch64")
+
+    def test_missing_gpl_metadata_fails_without_an_archive(self):
+        self.write_database(["P:busybox\nV:1\nL:GPL-2.0-only\no:busybox"])
+        result = self.collect()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing Alpine source origin or commit", result.stderr)
+        self.assertFalse((self.root / "build/alpine-corresponding-source.tar.gz").exists())
+
+    def test_apk_tools_uses_the_matching_alpine_distfiles_mirror(self):
+        self.write_database(["P:apk-tools\nV:3.0.6-r0\nL:GPL-2.0-only\no:apk-tools\nc:deadbeef"])
+        wget_log = self.root / "wget.log"
+        result = self.collect(
+            WGET_LOG=str(wget_log),
+            APKBUILD='pkgname=apk-tools\npkgver=4.2\nsource="https://example.org/release-$pkgver.tar.xz local.patch"\n',
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "https://distfiles.alpinelinux.org/distfiles/v3.24/release-4.2.tar.xz",
+            wget_log.read_text(),
+        )
+
+    def test_apk_tools_uses_the_apkbuild_source_alias(self):
+        self.write_database(["P:apk-tools\nV:3.0.6-r0\nL:GPL-2.0-only\no:apk-tools\nc:deadbeef"])
+        wget_log = self.root / "wget.log"
+        result = self.collect(
+            WGET_LOG=str(wget_log),
+            APKBUILD='pkgname=apk-tools\nsource="renamed.tar.gz::https://example.org/download local.patch"\n',
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "https://distfiles.alpinelinux.org/distfiles/v3.24/renamed.tar.gz",
+            wget_log.read_text(),
+        )
+
+    def test_a_failed_apk_tools_mirror_download_does_not_archive_sources(self):
+        self.write_database(["P:apk-tools\nV:3.0.6-r0\nL:GPL-2.0-only\no:apk-tools\nc:deadbeef"])
+        result = self.collect(
+            FAIL_WGET="1",
+            APKBUILD='pkgname=apk-tools\nsource="https://example.org/source.tar.gz"\n',
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.root / "build/alpine-corresponding-source.tar.gz").exists())
+
+    def test_fetch_and_container_failures_do_not_archive_partial_sources(self):
+        self.write_database(["P:busybox\nV:1\nL:GPL-2.0-only\no:busybox\nc:deadbeef"])
+        for failure in ("FAIL_FETCH", "FAIL_PODMAN"):
+            with self.subTest(failure=failure):
+                result = self.collect(**{failure: "1"})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse((self.root / "build/alpine-corresponding-source.tar.gz").exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,3 +1,4 @@
+use crate::transport::wasi_error;
 use crate::wasi::filesystem::{preopens, types};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -22,33 +23,6 @@ pub struct Stat {
     pub ctime: Timestamp,
 }
 
-#[derive(Clone, Copy)]
-pub enum Error {
-    Access,
-    Exist,
-    Invalid,
-    IllegalByteSequence,
-    Io,
-    IsDirectory,
-    Loop,
-    NoEntry,
-    NotDirectory,
-    NotEmpty,
-    ReadOnly,
-    Unsupported,
-    Exhausted,
-    NoSpace,
-    Quota,
-    TooLarge,
-}
-
-#[derive(Clone, Copy)]
-pub enum RenameMode {
-    Replace,
-    NoReplace,
-    Exchange,
-}
-
 pub struct Statfs {
     pub blocks: u64,
     pub blocks_free: u64,
@@ -63,47 +37,6 @@ const FIXED_OWNER: u32 = 1000;
 
 fn fixed_owner(uid: Option<u32>, gid: Option<u32>) -> bool {
     uid.is_none_or(|value| value == FIXED_OWNER) && gid.is_none_or(|value| value == FIXED_OWNER)
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct OpenFlags(u32);
-
-impl OpenFlags {
-    pub const READ: Self = Self(1);
-    pub const WRITE: Self = Self(2);
-    pub const TRUNCATE: Self = Self(4);
-}
-
-impl core::ops::BitOr for OpenFlags {
-    type Output = Self;
-    fn bitor(self, other: Self) -> Self {
-        Self(self.0 | other.0)
-    }
-}
-impl core::ops::BitOrAssign for OpenFlags {
-    fn bitor_assign(&mut self, other: Self) {
-        self.0 |= other.0;
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CreateFlags(u32);
-
-impl CreateFlags {
-    pub const NONE: Self = Self(0);
-    pub const EXCLUSIVE: Self = Self(4);
-    pub const TRUNCATE: Self = Self(8);
-}
-impl core::ops::BitOr for CreateFlags {
-    type Output = Self;
-    fn bitor(self, other: Self) -> Self {
-        Self(self.0 | other.0)
-    }
-}
-impl core::ops::BitOrAssign for CreateFlags {
-    fn bitor_assign(&mut self, other: Self) {
-        self.0 |= other.0;
-    }
 }
 
 type Descriptor = std::sync::Arc<types::Descriptor>;
@@ -143,7 +76,7 @@ impl<'a> CacheReservation<'a> {
         }
     }
 
-    fn grow(&mut self, bytes: usize) -> Result<(), Error> {
+    fn grow(&mut self, bytes: usize) -> Result<(), i32> {
         if self
             .used
             .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -153,7 +86,7 @@ impl<'a> CacheReservation<'a> {
             })
             .is_err()
         {
-            return Err(Error::Exhausted);
+            return Err(24);
         }
         self.bytes += bytes;
         Ok(())
@@ -168,61 +101,20 @@ impl Drop for CacheReservation<'_> {
 
 pub struct DirectoryEntry {
     pub name: Vec<u8>,
-    pub stat: Stat,
+    pub inode: u64,
+    pub type_: types::DescriptorType,
     pub next: u64,
 }
 
-fn text(bytes: &[u8]) -> Result<&str, Error> {
+fn text(bytes: &[u8]) -> Result<&str, i32> {
     if bytes.is_empty()
         || bytes.contains(&0)
         || bytes.contains(&b'/')
         || matches!(bytes, b"." | b"..")
     {
-        return Err(Error::Invalid);
+        return Err(22);
     }
-    core::str::from_utf8(bytes).map_err(|_| Error::IllegalByteSequence)
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn error(code: types::ErrorCode) -> Error {
-    use types::ErrorCode;
-    match code {
-        ErrorCode::Access | ErrorCode::NotPermitted => Error::Access,
-        ErrorCode::Exist | ErrorCode::Already => Error::Exist,
-        ErrorCode::Invalid => Error::Invalid,
-        ErrorCode::IllegalByteSequence => Error::IllegalByteSequence,
-        ErrorCode::NoEntry => Error::NoEntry,
-        ErrorCode::NotDirectory => Error::NotDirectory,
-        ErrorCode::IsDirectory => Error::IsDirectory,
-        ErrorCode::Loop => Error::Loop,
-        ErrorCode::NotEmpty => Error::NotEmpty,
-        ErrorCode::ReadOnly => Error::ReadOnly,
-        ErrorCode::InsufficientMemory => Error::Exhausted,
-        ErrorCode::InsufficientSpace => Error::NoSpace,
-        ErrorCode::Quota => Error::Quota,
-        ErrorCode::FileTooLarge
-        | ErrorCode::MessageSize
-        | ErrorCode::NameTooLong
-        | ErrorCode::Overflow => Error::TooLarge,
-        ErrorCode::Unsupported => Error::Unsupported,
-        ErrorCode::BadDescriptor
-        | ErrorCode::Busy
-        | ErrorCode::Deadlock
-        | ErrorCode::InProgress
-        | ErrorCode::Interrupted
-        | ErrorCode::Io
-        | ErrorCode::TooManyLinks
-        | ErrorCode::NoDevice
-        | ErrorCode::NoLock
-        | ErrorCode::NotRecoverable
-        | ErrorCode::NoTty
-        | ErrorCode::NoSuchDevice
-        | ErrorCode::Pipe
-        | ErrorCode::InvalidSeek
-        | ErrorCode::TextFileBusy
-        | ErrorCode::CrossDevice
-        | ErrorCode::Other(_) => Error::Io,
-    }
+    core::str::from_utf8(bytes).map_err(|_| 84)
 }
 
 fn timestamp(value: Option<crate::wasi::clocks::system_clock::Instant>) -> Timestamp {
@@ -255,8 +147,8 @@ fn stat(value: types::DescriptorStat, identity: types::MetadataHashValue) -> Sta
         ino: identity.lower,
         mode,
         nlink: value.link_count,
-        uid: 1000,
-        gid: 1000,
+        uid: FIXED_OWNER,
+        gid: FIXED_OWNER,
         size: value.size,
         blocks: value.size.div_ceil(512),
         atime: timestamp(value.data_access_timestamp),
@@ -265,46 +157,78 @@ fn stat(value: types::DescriptorStat, identity: types::MetadataHashValue) -> Sta
     }
 }
 
-async fn path_stat(directory: &types::Descriptor, name: &str) -> Result<Stat, Error> {
-    Ok(stat(
-        directory
-            .stat_at(types::PathFlags::empty(), name.to_owned())
-            .await
-            .map_err(error)?,
-        directory
-            .metadata_hash_at(types::PathFlags::empty(), name.to_owned())
-            .await
-            .map_err(error)?,
-    ))
+async fn path_stat(directory: &types::Descriptor, name: &str) -> Result<Stat, i32> {
+    let (metadata, identity) = futures::try_join!(
+        async {
+            directory
+                .stat_at(types::PathFlags::empty(), name.to_owned())
+                .await
+                .map_err(wasi_error)
+        },
+        async {
+            directory
+                .metadata_hash_at(types::PathFlags::empty(), name.to_owned())
+                .await
+                .map_err(wasi_error)
+        },
+    )?;
+    Ok(stat(metadata, identity))
+}
+
+fn verify_identity(
+    expected: types::MetadataHashValue,
+    actual: types::MetadataHashValue,
+) -> Result<(), i32> {
+    if (expected.upper, expected.lower) != (actual.upper, actual.lower) {
+        return Err(2);
+    }
+    Ok(())
 }
 
 impl Node {
+    pub fn release_cached_directory(
+        &mut self,
+        parent: &Descriptor,
+        name: &str,
+        identity: types::MetadataHashValue,
+    ) -> Option<types::Descriptor> {
+        let descriptor = match std::sync::Arc::try_unwrap(self.descriptor.take()?) {
+            Ok(descriptor) => descriptor,
+            Err(descriptor) => {
+                self.descriptor = Some(descriptor);
+                return None;
+            }
+        };
+        self.path = Some((parent.clone(), name.to_owned()));
+        self.path_identity = Some(identity);
+        Some(descriptor)
+    }
+
     pub fn repoint(&mut self, parent: &Descriptor, name: &[u8]) {
         if let Ok(name) = text(name) {
             self.path = Some((parent.clone(), name.to_owned()));
         }
     }
 
-    pub fn clear_path(&mut self) {
-        self.path = None;
-    }
-
-    async fn checked_path(&self) -> Result<&(Descriptor, String), Error> {
-        let path = self.path.as_ref().ok_or(Error::NoEntry)?;
-        if let Some(expected) = &self.path_identity {
+    async fn checked_path(&self) -> Result<&(Descriptor, String), i32> {
+        let path = self.path.as_ref().ok_or(2)?;
+        let expected = if let Some(descriptor) = &self.descriptor {
+            Some(descriptor.metadata_hash().await.map_err(wasi_error)?)
+        } else {
+            self.path_identity
+        };
+        if let Some(expected) = expected {
             let actual = path
                 .0
                 .metadata_hash_at(types::PathFlags::empty(), path.1.clone())
                 .await
-                .map_err(error)?;
-            if (expected.upper, expected.lower) != (actual.upper, actual.lower) {
-                return Err(Error::NoEntry);
-            }
+                .map_err(wasi_error)?;
+            verify_identity(expected, actual)?;
         }
         Ok(path)
     }
 
-    pub async fn resolve_descriptor(&self) -> Result<Descriptor, Error> {
+    pub async fn resolve_descriptor(&self) -> Result<Descriptor, i32> {
         if let Some(descriptor) = &self.descriptor {
             return Ok(descriptor.clone());
         }
@@ -316,90 +240,88 @@ impl Node {
         &self,
         flags: types::OpenFlags,
         access: types::DescriptorFlags,
-    ) -> Result<Descriptor, Error> {
+    ) -> Result<Descriptor, i32> {
         let (parent, name) = if self.descriptor.is_some() {
-            self.path.as_ref().ok_or(Error::Access)?
+            self.path.as_ref().ok_or(13)?
         } else {
             self.checked_path().await?
         };
         let opened = parent
             .open_at(types::PathFlags::empty(), name.clone(), flags, access)
             .await
-            .map_err(error)?;
+            .map_err(wasi_error)?;
         let expected = if let Some(descriptor) = &self.descriptor {
-            Some(descriptor.metadata_hash().await.map_err(error)?)
+            Some(descriptor.metadata_hash().await.map_err(wasi_error)?)
         } else {
             self.path_identity
         };
         if let Some(expected) = expected {
-            let actual = opened.metadata_hash().await.map_err(error)?;
-            if (expected.upper, expected.lower) != (actual.upper, actual.lower) {
-                return Err(Error::NoEntry);
-            }
+            let actual = opened.metadata_hash().await.map_err(wasi_error)?;
+            verify_identity(expected, actual)?;
         }
         Ok(std::sync::Arc::new(opened))
     }
 
-    pub async fn child_identity(&self, name: &str) -> Result<types::MetadataHashValue, Error> {
+    pub async fn child_identity(&self, name: &str) -> Result<types::MetadataHashValue, i32> {
         self.resolve_descriptor()
             .await?
             .metadata_hash_at(types::PathFlags::empty(), name.to_owned())
             .await
-            .map_err(error)
+            .map_err(wasi_error)
     }
 
-    pub async fn stat(&self) -> Result<Stat, Error> {
+    pub async fn stat(&self) -> Result<Stat, i32> {
         let (mut stat, mode) = if let Some(descriptor) = &self.descriptor {
-            (
-                stat(
-                    descriptor.stat().await.map_err(error)?,
-                    descriptor.metadata_hash().await.map_err(error)?,
-                ),
-                crate::terra::fs::host::get_mode(descriptor).await,
-            )
+            let (metadata, identity, mode) = futures::try_join!(
+                async { descriptor.stat().await.map_err(wasi_error) },
+                async { descriptor.metadata_hash().await.map_err(wasi_error) },
+                async {
+                    crate::terra::fs::host::get_mode(descriptor)
+                        .await
+                        .map_err(extension_error)
+                },
+            )?;
+            (stat(metadata, identity), mode)
         } else {
             let (parent, name) = self.checked_path().await?;
-            (
-                path_stat(parent, name).await?,
-                crate::terra::fs::host::get_mode_at(parent, name.clone()).await,
-            )
+            futures::try_join!(path_stat(parent, name), async {
+                crate::terra::fs::host::get_mode_at(parent, name.clone())
+                    .await
+                    .map_err(extension_error)
+            },)?
         };
-        if let Some(mode) = mode.map_err(host_error)? {
+        if let Some(mode) = mode {
             stat.mode = mode;
         }
         Ok(stat)
     }
 
-    pub async fn open(&self, flags: OpenFlags) -> Result<Descriptor, Error> {
-        let mut access = types::DescriptorFlags::empty();
-        if flags.0 & OpenFlags::READ.0 != 0 {
-            access |= types::DescriptorFlags::READ;
-        }
-        if flags.0 & OpenFlags::WRITE.0 != 0 {
-            access |= types::DescriptorFlags::WRITE;
-        }
-
+    pub async fn open(
+        &self,
+        access: types::DescriptorFlags,
+        truncate: bool,
+    ) -> Result<Descriptor, i32> {
         let mut descriptor = if let Some(descriptor) = &self.descriptor {
             descriptor.clone()
         } else {
             self.open_path(types::OpenFlags::empty(), access).await?
         };
         if !matches!(
-            descriptor.get_type().await.map_err(error)?,
+            descriptor.get_type().await.map_err(wasi_error)?,
             types::DescriptorType::RegularFile
         ) {
-            return Err(Error::Unsupported);
+            return Err(95);
         }
         if !descriptor
             .get_flags()
             .await
-            .map_err(error)?
+            .map_err(wasi_error)?
             .contains(access)
         {
             descriptor = self.open_path(types::OpenFlags::empty(), access).await?;
         }
-        if flags.0 & OpenFlags::TRUNCATE.0 != 0 {
-            descriptor.set_size(0).await.map_err(error)?;
+        if truncate {
+            descriptor.set_size(0).await.map_err(wasi_error)?;
         }
         Ok(descriptor)
     }
@@ -412,28 +334,28 @@ impl Node {
         mtime: Option<Timestamp>,
         uid: Option<u32>,
         gid: Option<u32>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), i32> {
         if !fixed_owner(uid, gid) {
-            return Err(Error::Unsupported);
+            return Err(95);
         }
         if let Some(mode) = mode {
             if let Some(descriptor) = &self.descriptor {
                 crate::terra::fs::host::set_mode(descriptor, mode)
                     .await
-                    .map_err(host_error)?;
+                    .map_err(extension_error)?;
             } else {
                 let (parent, name) = self.checked_path().await?;
                 crate::terra::fs::host::set_mode_at(parent, name.clone(), mode)
                     .await
-                    .map_err(host_error)?;
+                    .map_err(extension_error)?;
             }
         }
         if let Some(size) = size {
-            self.open(OpenFlags::WRITE)
+            self.open(types::DescriptorFlags::WRITE, false)
                 .await?
                 .set_size(size)
                 .await
-                .map_err(error)?;
+                .map_err(wasi_error)?;
         }
         if atime.is_some() || mtime.is_some() {
             let convert = |value: Option<Timestamp>| match value {
@@ -449,7 +371,7 @@ impl Node {
                 descriptor
                     .set_times(convert(atime), convert(mtime))
                     .await
-                    .map_err(error)?;
+                    .map_err(wasi_error)?;
             } else {
                 let (parent, name) = self.checked_path().await?;
                 parent
@@ -460,42 +382,42 @@ impl Node {
                         convert(mtime),
                     )
                     .await
-                    .map_err(error)?;
+                    .map_err(wasi_error)?;
             }
         }
         Ok(())
     }
 
-    pub async fn readlink(&self) -> Result<Vec<u8>, Error> {
-        let (parent, name) = self.path.as_ref().ok_or(Error::Unsupported)?;
+    pub async fn readlink(&self) -> Result<Vec<u8>, i32> {
+        let (parent, name) = self.checked_path().await?;
         parent
             .readlink_at(name.clone())
             .await
             .map(std::string::String::into_bytes)
-            .map_err(error)
+            .map_err(wasi_error)
     }
 
-    pub async fn open_directory(&self) -> Result<(Directory, Option<Descriptor>), Error> {
+    pub async fn open_directory(&self) -> Result<(Directory, Descriptor), i32> {
         let descriptor = self.resolve_descriptor().await?;
         if !matches!(
-            descriptor.get_type().await.map_err(error)?,
+            descriptor.get_type().await.map_err(wasi_error)?,
             types::DescriptorType::Directory
         ) {
-            return Err(Error::NotDirectory);
+            return Err(20);
         }
         Ok((
             Directory {
                 descriptor: descriptor.clone(),
                 entries: None,
             },
-            Some(descriptor),
+            descriptor,
         ))
     }
 
-    pub async fn statfs(&self) -> Result<Statfs, Error> {
+    pub async fn statfs(&self) -> Result<Statfs, i32> {
         let stat = crate::terra::fs::host::statfs(self.resolve_descriptor().await?.as_ref())
             .await
-            .map_err(host_error)?;
+            .map_err(extension_error)?;
         Ok(Statfs {
             blocks: stat.blocks,
             blocks_free: stat.blocks_free,
@@ -508,98 +430,135 @@ impl Node {
     }
 }
 
+pub async fn release_descriptor(descriptor: types::Descriptor) -> Result<(), i32> {
+    crate::terra::fs::host::release_descriptor(descriptor)
+        .await
+        .map_err(extension_error)
+}
+
 impl Directory {
+    async fn cache_entries(&mut self) -> Result<(), i32> {
+        let (mut stream, completion) = self.descriptor.read_directory();
+        let mut entries = Vec::new();
+        let mut name_bytes = 0usize;
+        let mut reservation =
+            CacheReservation::new(&DIRECTORY_CACHE_BYTES, MAX_DIRECTORY_CACHE_BYTES);
+        loop {
+            let (stream_result, batch) = stream.read(Vec::with_capacity(64)).await;
+            let (batch_name_bytes, cache_bytes) = batch
+                .iter()
+                .try_fold((0usize, 0usize), |(name_bytes, cache_bytes), entry| {
+                    Some((
+                        name_bytes.checked_add(entry.name.len())?,
+                        cache_bytes
+                            .checked_add(entry.name.capacity())?
+                            .checked_add(2 * std::mem::size_of_val(entry))?,
+                    ))
+                })
+                .ok_or(24)?;
+            name_bytes = name_bytes.checked_add(batch_name_bytes).ok_or(24)?;
+            reservation.grow(cache_bytes)?;
+            if entries.len() + batch.len() > 65_536 || name_bytes > 8 << 20 {
+                return Err(24);
+            }
+            entries.extend(batch);
+            if !matches!(
+                stream_result,
+                wit_bindgen::rt::async_support::StreamResult::Complete(_)
+            ) {
+                break;
+            }
+        }
+        drop(stream);
+        completion.await.map_err(wasi_error)?;
+        self.entries = Some(CachedEntries {
+            entries,
+            _reservation: reservation,
+        });
+        Ok(())
+    }
+
     pub async fn readdir(
         &mut self,
         cookie: u64,
         max_entries: u32,
         max_bytes: u32,
-    ) -> Result<Vec<DirectoryEntry>, Error> {
+    ) -> Result<Vec<DirectoryEntry>, i32> {
         if cookie == 0 {
             self.entries = None;
         }
         if self.entries.is_none() {
-            let (mut stream, completion) = self.descriptor.read_directory();
-            let mut entries = Vec::new();
-            let mut name_bytes = 0usize;
-            let mut reservation =
-                CacheReservation::new(&DIRECTORY_CACHE_BYTES, MAX_DIRECTORY_CACHE_BYTES);
-            loop {
-                let (stream_result, batch) = stream.read(Vec::with_capacity(64)).await;
-                let (batch_name_bytes, cache_bytes) = batch
-                    .iter()
-                    .try_fold((0usize, 0usize), |(name_bytes, cache_bytes), entry| {
-                        Some((
-                            name_bytes.checked_add(entry.name.len())?,
-                            cache_bytes
-                                .checked_add(entry.name.capacity())?
-                                .checked_add(2 * std::mem::size_of_val(entry))?,
-                        ))
-                    })
-                    .ok_or(Error::Exhausted)?;
-                name_bytes = name_bytes
-                    .checked_add(batch_name_bytes)
-                    .ok_or(Error::Exhausted)?;
-                reservation.grow(cache_bytes)?;
-                if entries.len() + batch.len() > 65_536 || name_bytes > 8 << 20 {
-                    return Err(Error::Exhausted);
-                }
-                entries.extend(batch);
-                if !matches!(
-                    stream_result,
-                    wit_bindgen::rt::async_support::StreamResult::Complete(_)
-                ) {
-                    break;
-                }
-            }
-            drop(stream);
-            completion.await.map_err(error)?;
-            self.entries = Some(CachedEntries {
-                entries,
-                _reservation: reservation,
-            });
+            self.cache_entries().await?;
         }
-        let entry_offset = usize::try_from(cookie).map_err(|_| Error::Invalid)?;
-        let mut result = Vec::new();
-        let mut bytes = 0usize;
-        for (index, entry) in self
+        let entry_offset = usize::try_from(cookie).map_err(|_| 22)?;
+        let descriptor = &self.descriptor;
+        let mut entries = self
             .entries
             .as_ref()
-            .ok_or(Error::Io)?
+            .ok_or(5)?
             .entries
             .iter()
             .enumerate()
             .skip(entry_offset)
-        {
-            if result.len() == max_entries.min(64) as usize {
+            .peekable();
+        let mut result = Vec::new();
+        let mut bytes = 0usize;
+        while result.len() < max_entries.min(64) as usize {
+            let mut candidates = Vec::new();
+            let mut candidate_bytes = bytes;
+            while candidates.len() + result.len() < max_entries.min(64) as usize {
+                let Some((_, entry)) = entries.peek() else {
+                    break;
+                };
+                let size = (24_usize + entry.name.len()).next_multiple_of(8);
+                if candidate_bytes + size > max_bytes as usize {
+                    break;
+                }
+                let Some((index, entry)) = entries.next() else {
+                    break;
+                };
+                candidates.push(async move {
+                    let identity = descriptor
+                        .metadata_hash_at(types::PathFlags::empty(), entry.name.clone())
+                        .await
+                        .map_err(wasi_error)?;
+                    Ok((
+                        DirectoryEntry {
+                            name: entry.name.as_bytes().to_vec(),
+                            inode: identity.lower,
+                            type_: entry.type_.clone(),
+                            next: (index + 1) as u64,
+                        },
+                        size,
+                    ))
+                });
+                candidate_bytes += size;
+            }
+            if candidates.is_empty() {
                 break;
             }
-            let size = (24_usize + entry.name.len()).next_multiple_of(8);
-            if bytes + size > max_bytes as usize {
-                break;
+            for entry in futures::future::join_all(candidates).await {
+                match entry {
+                    Ok((entry, size)) => {
+                        result.push(entry);
+                        bytes += size;
+                    }
+                    Err(2) => {}
+                    Err(errno) => return Err(errno),
+                }
             }
-            let entry_stat = match path_stat(&self.descriptor, &entry.name).await {
-                Ok(entry_stat) => entry_stat,
-                Err(Error::NoEntry) => continue,
-                Err(error) => return Err(error),
-            };
-            result.push(DirectoryEntry {
-                name: entry.name.as_bytes().to_vec(),
-                stat: entry_stat,
-                next: (index + 1) as u64,
-            });
-            bytes += size;
         }
+
         Ok(result)
     }
 }
 
-pub fn root() -> Result<Node, Error> {
+pub fn root() -> Result<Node, i32> {
     let mut directories = preopens::get_directories();
     if directories.len() != 1 {
-        return Err(Error::Access);
+        return Err(13);
     }
-    let (descriptor, _) = directories.pop().ok_or(Error::NoEntry)?;
+    let (descriptor, _) = directories.pop().ok_or(2)?;
     Ok(Node {
         descriptor: Some(std::sync::Arc::new(descriptor)),
         path: None,
@@ -607,13 +566,13 @@ pub fn root() -> Result<Node, Error> {
     })
 }
 
-pub async fn lookup(parent: &Node, name: Vec<u8>) -> Result<Node, Error> {
+pub async fn lookup(parent: &Node, name: Vec<u8>) -> Result<Node, i32> {
     let name = text(&name)?.to_owned();
     let directory = parent.resolve_descriptor().await?;
     let metadata = directory
         .stat_at(types::PathFlags::empty(), name.clone())
         .await
-        .map_err(error)?;
+        .map_err(wasi_error)?;
     let flags = match metadata.type_ {
         types::DescriptorType::RegularFile => {
             Some(types::DescriptorFlags::READ | types::DescriptorFlags::WRITE)
@@ -649,7 +608,7 @@ pub async fn lookup(parent: &Node, name: Vec<u8>) -> Result<Node, Error> {
                     | types::ErrorCode::NotPermitted
                     | types::ErrorCode::Access,
                 ) => {}
-                Err(code) => return Err(error(code)),
+                Err(code) => return Err(wasi_error(code)),
             }
         }
         if opened.is_none() {
@@ -657,7 +616,7 @@ pub async fn lookup(parent: &Node, name: Vec<u8>) -> Result<Node, Error> {
             {
                 Ok(descriptor) => Some(descriptor),
                 Err(crate::terra::fs::host::Error::Unsupported) => None,
-                Err(error) => return Err(host_error(error)),
+                Err(error) => return Err(extension_error(error)),
             };
         }
         opened.map(std::sync::Arc::new)
@@ -669,7 +628,7 @@ pub async fn lookup(parent: &Node, name: Vec<u8>) -> Result<Node, Error> {
             directory
                 .metadata_hash_at(types::PathFlags::empty(), name.clone())
                 .await
-                .map_err(error)?,
+                .map_err(wasi_error)?,
         )
     } else {
         None
@@ -684,28 +643,21 @@ pub async fn lookup(parent: &Node, name: Vec<u8>) -> Result<Node, Error> {
 pub async fn create(
     parent: &Node,
     name: Vec<u8>,
-    flags: CreateFlags,
+    open: types::OpenFlags,
     mode: u32,
-) -> Result<(Node, Descriptor), Error> {
+) -> Result<(Node, Descriptor), i32> {
     let name = text(&name)?.to_owned();
-    let mut open = types::OpenFlags::CREATE;
-    if flags.0 & CreateFlags::EXCLUSIVE.0 != 0 {
-        open |= types::OpenFlags::EXCLUSIVE;
-    }
-    if flags.0 & CreateFlags::TRUNCATE.0 != 0 {
-        open |= types::OpenFlags::TRUNCATE;
-    }
     let directory = parent.resolve_descriptor().await?;
     let created = match directory
         .stat_at(types::PathFlags::empty(), name.clone())
         .await
     {
         Ok(metadata) if !matches!(metadata.type_, types::DescriptorType::RegularFile) => {
-            return Err(Error::Unsupported);
+            return Err(95);
         }
         Ok(_) => false,
         Err(types::ErrorCode::NoEntry) => true,
-        Err(code) => return Err(error(code)),
+        Err(code) => return Err(wasi_error(code)),
     };
     let descriptor = std::sync::Arc::new(
         directory
@@ -716,7 +668,7 @@ pub async fn create(
                 types::DescriptorFlags::READ | types::DescriptorFlags::WRITE,
             )
             .await
-            .map_err(error)?,
+            .map_err(wasi_error)?,
     );
     if created {
         apply_create_mode(&descriptor, mode).await?;
@@ -731,48 +683,48 @@ pub async fn create(
     ))
 }
 
-pub async fn mkdir(parent: &Node, name: Vec<u8>, mode: u32) -> Result<Node, Error> {
+pub async fn mkdir(parent: &Node, name: Vec<u8>, mode: u32) -> Result<Node, i32> {
     parent
         .resolve_descriptor()
         .await?
         .create_directory_at(text(&name)?.to_owned())
         .await
-        .map_err(error)?;
+        .map_err(wasi_error)?;
     let node = lookup(parent, name).await?;
     apply_create_mode(&node.resolve_descriptor().await?, mode).await?;
     Ok(node)
 }
 
-async fn apply_create_mode(descriptor: &Descriptor, mode: u32) -> Result<(), Error> {
+async fn apply_create_mode(descriptor: &Descriptor, mode: u32) -> Result<(), i32> {
     match crate::terra::fs::host::set_mode(descriptor, mode).await {
         Ok(()) | Err(crate::terra::fs::host::Error::Unsupported) => Ok(()),
-        Err(error) => Err(host_error(error)),
+        Err(error) => Err(extension_error(error)),
     }
 }
 
-fn host_error(error: crate::terra::fs::host::Error) -> Error {
+fn extension_error(error: crate::terra::fs::host::Error) -> i32 {
     match error {
-        crate::terra::fs::host::Error::Access => Error::Access,
-        crate::terra::fs::host::Error::Io => Error::Io,
-        crate::terra::fs::host::Error::Unsupported => Error::Unsupported,
+        crate::terra::fs::host::Error::Access => 13,
+        crate::terra::fs::host::Error::Io => 5,
+        crate::terra::fs::host::Error::Unsupported => 95,
     }
 }
 
-pub async fn unlink(parent: &Node, name: Vec<u8>, directory: bool) -> Result<(), Error> {
+pub async fn unlink(parent: &Node, name: Vec<u8>, directory: bool) -> Result<(), i32> {
     if directory {
         parent
             .resolve_descriptor()
             .await?
             .remove_directory_at(text(&name)?.to_owned())
             .await
-            .map_err(error)
+            .map_err(wasi_error)
     } else {
         parent
             .resolve_descriptor()
             .await?
             .unlink_file_at(text(&name)?.to_owned())
             .await
-            .map_err(error)
+            .map_err(wasi_error)
     }
 }
 
@@ -781,11 +733,7 @@ pub async fn rename(
     old_name: Vec<u8>,
     new_parent: &Node,
     new_name: Vec<u8>,
-    mode: RenameMode,
-) -> Result<(), Error> {
-    if !matches!(mode, RenameMode::Replace) {
-        return Err(Error::Unsupported);
-    }
+) -> Result<(), i32> {
     old_parent
         .resolve_descriptor()
         .await?
@@ -795,10 +743,10 @@ pub async fn rename(
             text(&new_name)?.to_owned(),
         )
         .await
-        .map_err(error)
+        .map_err(wasi_error)
 }
 
-pub async fn link(old: &Node, parent: &Node, name: Vec<u8>) -> Result<(), Error> {
+pub async fn link(old: &Node, parent: &Node, name: Vec<u8>) -> Result<(), i32> {
     let (source, source_name) = old.checked_path().await?;
     source
         .link_at(
@@ -808,21 +756,19 @@ pub async fn link(old: &Node, parent: &Node, name: Vec<u8>) -> Result<(), Error>
             text(&name)?.to_owned(),
         )
         .await
-        .map_err(error)
+        .map_err(wasi_error)
 }
 
-pub async fn symlink(parent: &Node, name: Vec<u8>, target: Vec<u8>) -> Result<Node, Error> {
+pub async fn symlink(parent: &Node, name: Vec<u8>, target: Vec<u8>) -> Result<Node, i32> {
     parent
         .resolve_descriptor()
         .await?
         .symlink_at(
-            core::str::from_utf8(&target)
-                .map_err(|_| Error::IllegalByteSequence)?
-                .to_owned(),
+            core::str::from_utf8(&target).map_err(|_| 84)?.to_owned(),
             text(&name)?.to_owned(),
         )
         .await
-        .map_err(error)?;
+        .map_err(wasi_error)?;
     lookup(parent, name).await
 }
 
@@ -845,7 +791,7 @@ mod tests {
         let mut first = CacheReservation::new(&used, 4);
         assert!(first.grow(3).is_ok());
         let mut second = CacheReservation::new(&used, 4);
-        assert!(matches!(second.grow(2), Err(Error::Exhausted)));
+        assert!(matches!(second.grow(2), Err(24)));
         drop(first);
         assert!(second.grow(1).is_ok());
         assert_eq!(used.load(Ordering::Relaxed), 1);

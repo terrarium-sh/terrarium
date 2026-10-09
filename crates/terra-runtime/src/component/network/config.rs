@@ -1,64 +1,61 @@
-//! Guest network layout and published ports.
+//! Synthetic host-service addresses and trusted publication grants.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
+use terra_protocol::network::ResourceKind;
 
-use super::bindings::{NetworkConfig, PublishedPort};
+use super::bindings::{NetworkConfig, PublishedPort, Transport};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PortMapping {
     pub host: u16,
     pub guest: u16,
+    pub transport: ResourceKind,
 }
 
 impl PortMapping {
     #[must_use]
     pub const fn new(host: u16, guest: u16) -> Self {
-        Self { host, guest }
+        Self {
+            host,
+            guest,
+            transport: ResourceKind::Tcp,
+        }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GuestNetworkConfig {
-    pub guest_ip: Ipv4Addr,
+pub struct HostServiceAddresses {
     pub gateway_ip: Ipv4Addr,
-    pub prefix_len: u8,
     pub gateway_ip6: Ipv6Addr,
-    pub gateway_mac: [u8; 6],
-    pub dns_server: Ipv4Addr,
 }
 
-impl GuestNetworkConfig {
+impl HostServiceAddresses {
     #[must_use]
     pub const fn default() -> Self {
         Self {
-            guest_ip: Ipv4Addr::new(100, 96, 0, 2),
-            gateway_ip: Ipv4Addr::new(100, 96, 0, 1),
-            prefix_len: 30,
-            gateway_ip6: Ipv6Addr::new(0xfd53, 0x4d00, 0, 0, 0, 0, 0, 1),
-            gateway_mac: [0x02, 0x53, 0x4d, 0x00, 0x00, 0x01],
-            dns_server: Ipv4Addr::new(100, 96, 0, 1),
+            gateway_ip: terra_protocol::socket::HOST_SERVICE_IPV4,
+            gateway_ip6: terra_protocol::socket::HOST_SERVICE_IPV6,
         }
     }
 
-    pub(super) fn into_component_config(
-        self,
+    pub(crate) fn build_component_config(
         host_service_ports: Vec<Option<u16>>,
         port_mappings: Vec<PortMapping>,
         memory_limit: usize,
     ) -> NetworkConfig {
         NetworkConfig {
-            gateway_mac: self.gateway_mac.to_vec(),
-            gateway_ip: self.gateway_ip.octets().to_vec(),
-            gateway_ip6: self.gateway_ip6.octets().to_vec(),
             host_service_ports,
             published_ports: port_mappings
                 .into_iter()
                 .map(|mapping| PublishedPort {
                     host_port: mapping.host,
                     guest_port: mapping.guest,
+                    transport: match mapping.transport {
+                        ResourceKind::Tcp => Transport::Tcp,
+                        ResourceKind::Udp => Transport::Udp,
+                    },
                 })
                 .collect(),
-            mtu: 1500,
             flow_capacity: flow_capacity(memory_limit),
         }
     }
@@ -66,8 +63,9 @@ impl GuestNetworkConfig {
 
 fn flow_capacity(memory_limit: usize) -> u32 {
     u32::try_from(
-        memory_limit.saturating_sub(terra_limits::NETWORK_SHARED_MEMORY_BYTES)
-            / terra_limits::NETWORK_FLOW_MEMORY_BYTES,
+        (memory_limit.saturating_sub(terra_limits::NETWORK_SHARED_MEMORY_BYTES)
+            / terra_limits::NETWORK_FLOW_MEMORY_BYTES)
+            .min(terra_protocol::vsock::MAX_NETWORK_SOCKETS),
     )
     .unwrap_or(u32::MAX)
 }
@@ -78,25 +76,38 @@ mod tests {
 
     #[test]
     fn flow_capacity_reserves_shared_memory_and_scales_with_buffer_cost() {
-        for (memory_mib, expected) in [(0, 0), (2, 0), (16, 179), (32, 384), (64, 793)] {
+        for (memory_mib, expected) in [
+            (0, 0),
+            (8, 0),
+            (16, 42),
+            (32, 128),
+            (200, 1024),
+            (400, 1024),
+        ] {
             assert_eq!(flow_capacity(memory_mib << 20), expected);
         }
     }
 
     #[test]
-    fn component_config_uses_the_guest_layout() {
-        let layout = GuestNetworkConfig::default();
-        let config = layout.into_component_config(
+    fn component_config_preserves_grants_and_memory_capacity() {
+        let config = HostServiceAddresses::build_component_config(
             vec![Some(5432)],
-            vec![PortMapping::new(8080, 80)],
-            32 << 20,
+            vec![
+                PortMapping::new(8080, 80),
+                PortMapping {
+                    host: 8080,
+                    guest: 53,
+                    transport: ResourceKind::Udp,
+                },
+            ],
+            crate::box_runtime::NETWORK_FRONTEND_MEMORY_BYTES,
         );
-        assert_eq!(config.flow_capacity, 384);
-        assert_eq!(config.gateway_ip, layout.gateway_ip.octets());
-        assert_eq!(config.gateway_ip6, layout.gateway_ip6.octets());
-        assert_eq!(config.gateway_mac, layout.gateway_mac);
+        assert_eq!(config.flow_capacity, 1024);
         assert_eq!(config.host_service_ports, [Some(5432)]);
         assert_eq!(config.published_ports[0].host_port, 8080);
         assert_eq!(config.published_ports[0].guest_port, 80);
+        assert_eq!(config.published_ports[0].transport, Transport::Tcp);
+        assert_eq!(config.published_ports[1].transport, Transport::Udp);
+        assert_eq!(config.published_ports[1].guest_port, 53);
     }
 }

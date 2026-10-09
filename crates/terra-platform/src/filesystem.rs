@@ -34,19 +34,35 @@ pub fn open_file_limit() -> Option<u64> {
 
 pub fn open_share_root(root: &Path) -> io::Result<File> {
     #[cfg(unix)]
+    if !root.is_absolute()
+        || root.components().any(|component| {
+            !matches!(
+                component,
+                std::path::Component::RootDir | std::path::Component::Normal(_)
+            )
+        })
+    {
+        return Err(io::Error::other("mount source is not an absolute path"));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use rustix::fs::{Mode, OFlags, open};
+
+        Ok(open(
+            root,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW_ANY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?
+        .into())
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
     {
         use rustix::fs::{Mode, OFlags, openat};
         use std::path::Component;
 
-        if !root.is_absolute() {
-            return Err(io::Error::other("mount source is not an absolute path"));
-        }
         let mut directory = File::open("/")?;
         for component in root.components() {
             let Component::Normal(name) = component else {
-                if component != Component::RootDir {
-                    return Err(io::Error::other("mount source is not an absolute path"));
-                }
                 continue;
             };
             directory = openat(
@@ -72,7 +88,7 @@ pub fn open_share_root(root: &Path) -> io::Result<File> {
         if !directory.metadata()?.is_dir() {
             return Err(io::Error::other("mount source must be a directory"));
         }
-        if windows::read_final_path(&directory)? != root {
+        if !windows::matches_canonical_root(&directory, root)? {
             return Err(io::Error::other("mount source changed while opening it"));
         }
         Ok(directory)
@@ -85,6 +101,78 @@ pub fn open_share_root(root: &Path) -> io::Result<File> {
             "unsupported host",
         ))
     }
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileIdentity {
+    pub volume_serial: u64,
+    pub file_id: [u8; 16],
+}
+
+#[cfg(windows)]
+impl std::fmt::Display for FileIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{}:{}",
+            self.volume_serial,
+            u128::from_le_bytes(self.file_id)
+        )
+    }
+}
+
+#[cfg(windows)]
+impl std::str::FromStr for FileIdentity {
+    type Err = io::Error;
+
+    fn from_str(value: &str) -> io::Result<Self> {
+        let invalid = || io::Error::new(io::ErrorKind::InvalidInput, "invalid share file identity");
+        let (serial, file_id) = value.split_once(':').ok_or_else(invalid)?;
+        Ok(Self {
+            volume_serial: serial.parse().map_err(|_| invalid())?,
+            file_id: file_id
+                .parse::<u128>()
+                .map_err(|_| invalid())?
+                .to_le_bytes(),
+        })
+    }
+}
+
+#[cfg(windows)]
+pub fn file_identity(file: &File) -> io::Result<FileIdentity> {
+    windows::file_identity(file)
+}
+
+#[cfg(windows)]
+pub use windows::{
+    create_directory_at, hard_link_at, read_base_dir, remove_directory_at, rename_at,
+    unlink_file_at,
+};
+
+#[cfg(windows)]
+pub fn open_granted_share_root(root: &Path, expected: FileIdentity) -> io::Result<File> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+
+    let directory = File::options()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(root)?;
+    let metadata = directory.metadata()?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(io::Error::other(
+            "granted share root must be a regular directory",
+        ));
+    }
+    if file_identity(&directory)? != expected {
+        return Err(io::Error::other(
+            "granted share root changed while opening it",
+        ));
+    }
+    Ok(directory)
 }
 
 #[cfg(target_os = "macos")]
@@ -417,8 +505,8 @@ fn discard_file(file: &File, offset: u64, len: u64) -> io::Result<()> {
     use windows_sys::Win32::System::Ioctl::{
         FILE_ZERO_DATA_INFORMATION, FSCTL_SET_SPARSE, FSCTL_SET_ZERO_DATA,
     };
-    let offset = i64::try_from(offset).map_err(io::Error::other)?;
-    let end = offset
+    let start = i64::try_from(offset).map_err(io::Error::other)?;
+    let end = start
         .checked_add(i64::try_from(len).map_err(io::Error::other)?)
         .ok_or_else(|| io::Error::other("discard range overflow"))?;
     let mut returned = 0;
@@ -436,10 +524,10 @@ fn discard_file(file: &File, offset: u64, len: u64) -> io::Result<()> {
         )
     };
     if sparse == 0 {
-        return ignore_unsupported(io::Error::last_os_error());
+        return zero_file_range(file, offset, len);
     }
     let range = FILE_ZERO_DATA_INFORMATION {
-        FileOffset: offset,
+        FileOffset: start,
         BeyondFinalZero: end,
     };
     #[allow(unsafe_code)]
@@ -456,7 +544,25 @@ fn discard_file(file: &File, offset: u64, len: u64) -> io::Result<()> {
         )
     };
     if zeroed == 0 {
-        ignore_unsupported(io::Error::last_os_error())?;
+        return zero_file_range(file, offset, len);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn zero_file_range(file: &File, mut offset: u64, mut len: u64) -> io::Result<()> {
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| io::Error::other("discard range overflow"))?;
+    if end > file.metadata()?.len() {
+        return Err(io::Error::from(io::ErrorKind::InvalidInput));
+    }
+    let zeroes = vec![0; 64 * 1024];
+    while len > 0 {
+        let chunk = usize::try_from(len.min(zeroes.len() as u64)).map_err(io::Error::other)?;
+        write_all_at(file, offset, &zeroes[..chunk])?;
+        offset += chunk as u64;
+        len -= chunk as u64;
     }
     Ok(())
 }
@@ -466,35 +572,75 @@ fn discard_file(_file: &File, _offset: u64, _len: u64) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn ignore_unsupported(error: io::Error) -> io::Result<()> {
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::Foundation::{ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED};
-        if error.raw_os_error().is_some_and(|code| {
-            matches!(
-                code.cast_unsigned(),
-                ERROR_INVALID_FUNCTION | ERROR_NOT_SUPPORTED
-            )
-        }) {
-            return Ok(());
-        }
-    }
     (error.kind() == io::ErrorKind::Unsupported)
         .then_some(())
         .ok_or(error)
 }
 
+#[cfg(all(test, windows))]
+mod windows_discard_tests {
+    use super::*;
+
+    #[test]
+    fn zero_fill_fallback_preserves_neighbors_and_file_length() {
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(200_000).unwrap();
+        write_all_at(&file, 0, &vec![0xa5; 200_000]).unwrap();
+        zero_file_range(&file, 500, 131_000).unwrap();
+        let mut contents = vec![0; 200_000];
+        read_exact_at(&file, 0, &mut contents).unwrap();
+        assert!(contents[..500].iter().all(|byte| *byte == 0xa5));
+        assert!(contents[500..131_500].iter().all(|byte| *byte == 0));
+        assert!(contents[131_500..].iter().all(|byte| *byte == 0xa5));
+        assert!(zero_file_range(&file, 199_999, 2).is_err());
+        assert_eq!(file.metadata().unwrap().len(), 200_000);
+    }
+}
+
+pub fn open_regular_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(rustix::fs::OFlags::NONBLOCK.bits().cast_signed());
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("expected a regular file"));
+    }
+    Ok(file)
+}
+
+/// Restrict an existing path to its owner: `0700` for a directory, `0600` for a
+/// file.
+#[cfg(unix)]
+pub fn set_owner_only(path: &Path, dir: bool) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = if dir { 0o700 } else { 0o600 };
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
+#[cfg(windows)]
+pub use windows::set_owner_only;
+
+#[cfg(windows)]
+pub use windows::{FileAccess, reopen_file_with_delete_sharing};
+
 #[cfg(windows)]
 #[path = "filesystem/windows.rs"]
 mod windows;
 
-#[cfg(all(test, unix, not(target_os = "macos")))]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::io::{Read as _, Write as _};
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn share_root_and_metadata_handles_reject_symlinks_and_retain_inodes() {
+        use std::io::{Read as _, Write as _};
         use std::os::unix::fs::{PermissionsExt as _, symlink};
 
         let root = tempfile::tempdir().expect("root");

@@ -1,0 +1,25 @@
+hw: {cpus: 2, mem_mib: 512, rootfs_mib: 128}
+network:
+  allow: ['gate.test:{allowed_port}']
+  hosts: [{name: gate.test, addr: HOST_LOOPBACK}]
+  ports: ['{published_port}:18080', '{published_port}:18082/udp']
+mounts:
+  - {host: '{writable}', guest: /work}
+  - {host: '{readonly}', guest: /readonly, readonly: true}
+volumes: [{name: data, guest: /data, size_mib: 8}]
+env: {WORKLOAD_ENV: recipe-value}
+hooks:
+  on_create: ['mkdir -p /opt/workload; echo baked >> /opt/workload/bake; echo BAKE_OK']
+  on_start: ['echo start >> /work/hooks; echo START_OK']
+  pre_stop: ['echo stop >> /work/hooks; echo STOP_OK']
+daemons:
+  - echo daemon >> /work/daemon; test $(wc -l < /work/daemon) -ge 2
+  - >-
+    echo $$ > /tmp/workload-watcher-pid; exec busybox inotifyd - /work/host-update:c /work:nmdy > /tmp/workload-events
+  - >-
+    while true; do printf 'HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: close\r\n\r\nGUEST_NETWORK' | busybox nc -l -p 18080; done
+  - while true; do printf GUEST_DATAGRAM | busybox nc -u -l -p 18082 -w 1; done
+workload:
+  entrypoint: /bin/sh
+  workdir: /work/nested/deep
+  args: ['-ec', 'echo ready > /work/ready; while true; do sleep 60; done']

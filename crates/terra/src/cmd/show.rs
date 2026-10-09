@@ -49,7 +49,10 @@ pub fn run(
             cfg.mounts = mounts;
         }
         Err(e) if is_pinned => return Err(e),
-        Err(e) => eprintln!("terra: warning: `terra setup` would refuse this recipe:\n{e:#}"),
+        Err(e) => eprintln!(
+            "terra: warning: `terra setup` would refuse this recipe:\n{}",
+            render::render_error(&e)
+        ),
     }
     let env_values = config::resolve_env_file(&mut cfg).and_then(|()| {
         if is_pinned {

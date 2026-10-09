@@ -7,6 +7,16 @@ use windows_sys::Win32::System::Hypervisor::{
     WHvRequestInterrupt, WHvRunVirtualProcessor, WHvSetPartitionProperty,
 };
 
+#[repr(C, align(16))]
+#[derive(Default)]
+struct AlignedRunVpExitContext(WHV_RUN_VP_EXIT_CONTEXT);
+
+const _: () = {
+    assert!(size_of::<WHV_RUN_VP_EXIT_CONTEXT>() == 224);
+    assert!(size_of::<AlignedRunVpExitContext>() == size_of::<WHV_RUN_VP_EXIT_CONTEXT>());
+    assert!(align_of::<AlignedRunVpExitContext>() == 16);
+};
+
 pub fn query_tsc_frequency() -> Result<u64, WhpError> {
     let mut frequency = 0_u64;
     // SAFETY: ProcessorClockFrequency writes one u64 frequency in Hz.
@@ -89,18 +99,18 @@ impl Partition {
         index: u32,
     ) -> Result<WHV_RUN_VP_EXIT_CONTEXT, PartitionError> {
         self.require_vcpu(index)?;
-        let mut context = WHV_RUN_VP_EXIT_CONTEXT::default();
+        let mut context = AlignedRunVpExitContext::default();
         // SAFETY: context has the exact size and remains valid for the synchronous call.
         result(unsafe {
             WHvRunVirtualProcessor(
                 self.handle,
                 index,
                 (&raw mut context).cast(),
-                size_of::<WHV_RUN_VP_EXIT_CONTEXT>() as u32,
+                size_of::<AlignedRunVpExitContext>() as u32,
             )
         })
         .map_err(PartitionError::Api)?;
-        Ok(context)
+        Ok(context.0)
     }
 
     fn inject_invalid_opcode(&self, index: u32) -> Result<(), PartitionError> {
@@ -191,6 +201,82 @@ mod tests {
         partition.set_registers(0, &names, &input.values).unwrap();
         assert_eq!(partition.register_u64(0, names[0]).unwrap(), 0x1234);
         assert_eq!(partition.register_u64(0, names[1]).unwrap(), 0x5678);
+    }
+
+    #[test]
+    #[ignore = "requires Windows Hypervisor Platform"]
+    fn native_run_exit_buffer_and_busy_vcpu_cancel() {
+        use std::sync::{Arc, mpsc};
+        use std::time::Duration;
+        use windows_sys::Win32::System::Hypervisor::{
+            WHV_X64_SEGMENT_REGISTER, WHV_X64_SEGMENT_REGISTER_0, WHvX64RegisterCr0,
+            WHvX64RegisterCs, WHvX64RegisterDs, WHvX64RegisterRflags, WHvX64RegisterRip,
+        };
+
+        let ram = crate::memory::GuestMemory::allocate(2 << 20).unwrap();
+        ram.write(0, &[0xa2, 0, 0, 0xeb, 0xfe]).unwrap();
+        let partition = Arc::new(Partition::new(ram, 1, None).unwrap());
+        partition.create_vcpu(0).unwrap();
+        partition
+            .set_registers(
+                0,
+                &[
+                    WHvX64RegisterCr0,
+                    WHvX64RegisterCs,
+                    WHvX64RegisterDs,
+                    WHvX64RegisterRip,
+                    WHvX64RegisterRflags,
+                ],
+                &[
+                    WHV_REGISTER_VALUE { Reg64: 0x10 },
+                    WHV_REGISTER_VALUE {
+                        Segment: WHV_X64_SEGMENT_REGISTER {
+                            Base: 0,
+                            Limit: 0xffff,
+                            Selector: 0,
+                            Anonymous: WHV_X64_SEGMENT_REGISTER_0 { Attributes: 0x9b },
+                        },
+                    },
+                    WHV_REGISTER_VALUE {
+                        Segment: WHV_X64_SEGMENT_REGISTER {
+                            Base: 2 << 20,
+                            Limit: 0xffff,
+                            Selector: 0,
+                            Anonymous: WHV_X64_SEGMENT_REGISTER_0 { Attributes: 0x93 },
+                        },
+                    },
+                    WHV_REGISTER_VALUE { Reg64: 0 },
+                    WHV_REGISTER_VALUE { Reg64: 2 },
+                ],
+            )
+            .unwrap();
+        let mut group = crate::windows::worker::VcpuGroup::new(Arc::clone(&partition), None);
+        let (started, ready) = mpsc::channel();
+        group
+            .spawn(move || {
+                let context = partition
+                    .run_vcpu_context(0)
+                    .map_err(|error| error.to_string())?;
+                let super::RunExit::MemoryAccess { gpa, .. } = super::RunExit::from(context) else {
+                    return Err("guest did not write unmapped memory".to_owned());
+                };
+                assert_eq!(gpa, 2 << 20);
+                partition
+                    .set_registers(0, &[WHvX64RegisterRip], &[WHV_REGISTER_VALUE { Reg64: 3 }])
+                    .map_err(|error| error.to_string())?;
+                started.send(()).map_err(|error| error.to_string())?;
+                let context = partition
+                    .run_vcpu_context(0)
+                    .map_err(|error| error.to_string())?;
+                if matches!(super::RunExit::from(context), super::RunExit::Canceled) {
+                    Ok(())
+                } else {
+                    Err("busy vCPU did not exit through cancellation".to_owned())
+                }
+            })
+            .unwrap();
+        ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(group.join().unwrap(), [Ok(())]);
     }
 
     #[test]

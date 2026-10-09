@@ -3,13 +3,14 @@
 use arbitrary::{Arbitrary, Unstructured};
 use libfuzzer_sys::fuzz_target;
 use terra_device_transport::{
-    MmioTransport, SPLIT_RING_DESC_F_NEXT, count_pending_queue_entries, split_ring_chain,
+    MmioTransport, SPLIT_RING_DESC_F_NEXT, resync_pending_queue_entries, split_ring_chain,
 };
 
 #[derive(Arbitrary, Debug)]
 struct Operation {
     address: u64,
-    data: Vec<u8>,
+    width: u8,
+    value: u64,
     read_len: u8,
 }
 
@@ -20,10 +21,14 @@ fuzz_target!(|data: &[u8]| {
     else {
         return;
     };
-    if let Some(count) = count_pending_queue_entries(next, available, size) {
-        assert_ne!(size, 0);
-        assert!(count <= size);
+    let mut cursor = next;
+    let count = resync_pending_queue_entries(&mut cursor, available, size);
+    if size != 0 && available.wrapping_sub(next) <= size {
         assert_eq!(count, available.wrapping_sub(next));
+        assert_eq!(cursor, next);
+    } else {
+        assert_eq!(count, 0);
+        assert_eq!(cursor, available);
     }
     if let Ok(chain) = split_ring_chain(
         data,
@@ -42,13 +47,13 @@ fuzz_target!(|data: &[u8]| {
         assert_eq!(last.flags & SPLIT_RING_DESC_F_NEXT, 0);
     }
 
-    let mut transport = MmioTransport::new(0x1000, 0x2000, 0x4000, 2, u64::MAX, 256, vec![0; 8])
-        .with_queue_count(4);
+    let mut transport =
+        MmioTransport::new(0x4000, 2, u64::MAX, 256, vec![0; 8]).with_queue_count(4);
     let Ok(operations) = input.arbitrary_iter::<Operation>() else {
         return;
     };
     for operation in operations.take(64).flatten() {
-        let _ = transport.write(operation.address, &operation.data);
-        let _ = transport.read(operation.address, usize::from(operation.read_len));
+        let _ = transport.write(operation.address, operation.width, operation.value);
+        let _ = transport.read(operation.address, operation.read_len);
     }
 });

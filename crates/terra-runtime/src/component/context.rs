@@ -1,22 +1,18 @@
 //! Shared device capabilities and host imports.
 
 use crate::MAX_SINGLE_BYTES;
-use crate::component::bindings::{diagnostics, interrupt, memory};
+use crate::component::bindings::{interrupt, memory};
 use crate::memory::{BoundedMemory, GuestRam};
 use std::sync::Arc;
 use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 pub use crate::component::bindings::memory::Host as MemoryHost;
 
-/// Interrupts coalesced per window before further signals drop.
 pub const MAX_SIGNALS_PER_WINDOW: u32 = 64;
 
-/// One device's interrupt line. The device cannot name an IRQ; the native
-/// side coalesces bursts and drops past the per-window budget.
+/// One device's interrupt notification budget.
 pub struct InterruptSignals {
-    pending: bool,
     window_count: u32,
-    delivered: u64,
     dropped: u64,
 }
 
@@ -24,9 +20,7 @@ impl InterruptSignals {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            pending: false,
             window_count: 0,
-            delivered: 0,
             dropped: 0,
         }
     }
@@ -37,29 +31,11 @@ impl InterruptSignals {
             return false;
         }
         self.window_count += 1;
-        self.pending = true;
         true
-    }
-
-    /// Drain one coalesced notification. Returns true when the guest
-    /// needs an injection.
-    pub fn take(&mut self) -> bool {
-        if self.pending {
-            self.pending = false;
-            self.delivered += 1;
-            true
-        } else {
-            false
-        }
     }
 
     pub fn end_window(&mut self) {
         self.window_count = 0;
-    }
-
-    #[must_use]
-    pub fn delivered(&self) -> u64 {
-        self.delivered
     }
 
     #[must_use]
@@ -135,32 +111,12 @@ impl DeviceContext {
         self.irq.dropped()
     }
 
-    /// Drain one coalesced notification for injection. True when the
-    /// guest needs an interrupt.
-    pub fn drain_signal(&mut self) -> bool {
-        self.irq.take()
-    }
-
     pub fn guest_write(
         &mut self,
         offset: u64,
         data: &[u8],
     ) -> Result<(), crate::memory::MemoryError> {
         self.memory().write(offset, data)
-    }
-
-    /// Read back bytes staged in this device's guest RAM.
-    pub fn guest_read(&self, offset: u64, len: u64) -> Result<Vec<u8>, crate::memory::MemoryError> {
-        self.memory().read(offset, len)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn memory_read_import_counts(&self) -> (u64, u64) {
-        use std::sync::atomic::Ordering;
-        (
-            self.memory_read_calls[0].load(Ordering::Relaxed),
-            self.memory_read_calls[1].load(Ordering::Relaxed),
-        )
     }
 
     #[cfg(test)]
@@ -240,6 +196,17 @@ impl memory::Host for DeviceContext {
         self.memory().write(offset, &data).map_err(memory_error)
     }
 
+    fn write_ranges(&mut self, ranges: Vec<memory::WriteRange>) -> Result<(), memory::MemoryError> {
+        if ranges.len() > terra_limits::MAX_BATCH_GUEST_COPY_RANGES {
+            return Err(memory::MemoryError::TooLarge);
+        }
+        let ranges = ranges
+            .iter()
+            .map(|range| (range.offset, range.data.as_slice()))
+            .collect::<Vec<_>>();
+        self.memory().write_ranges(&ranges).map_err(memory_error)
+    }
+
     fn address_limit(&mut self) -> u64 {
         self.ram.address_limit()
     }
@@ -257,12 +224,6 @@ impl interrupt::Host for DeviceContext {
         if self.irq.signal() {
             self.interrupt_notification.notify_one();
         }
-    }
-}
-
-impl diagnostics::Host for DeviceContext {
-    fn event(&mut self, message: String) {
-        log::warn!("network: {message}");
     }
 }
 
@@ -291,6 +252,20 @@ mod tests {
         host.write(0x4000_0000, vec![7]).unwrap();
         assert_eq!(host.read(0x4000_0000, 1).unwrap(), vec![7]);
         assert!(host.read(0, 1).is_err());
+        assert_eq!(
+            host.write_ranges(vec![
+                super::memory::WriteRange {
+                    offset: 0x4000_0000,
+                    data: vec![9],
+                },
+                super::memory::WriteRange {
+                    offset: 0,
+                    data: vec![1],
+                },
+            ]),
+            Err(super::memory::MemoryError::OutOfRange)
+        );
+        assert_eq!(host.read(0x4000_0000, 1).unwrap(), vec![7]);
     }
 
     #[test]
@@ -304,6 +279,39 @@ mod tests {
             Err(super::memory::MemoryError::TooLarge)
         ));
         assert_eq!(host.read(0, 1).unwrap(), vec![7]);
+    }
+
+    #[test]
+    fn device_memory_import_validates_batched_writes_before_mutation() {
+        use super::memory::{Host as _, MemoryError, WriteRange};
+        let mut host = super::DeviceContext::new(4096).unwrap();
+        host.write(0, b"seed".to_vec()).unwrap();
+        assert_eq!(
+            host.write_ranges(vec![
+                WriteRange {
+                    offset: 0,
+                    data: b"edit".to_vec(),
+                },
+                WriteRange {
+                    offset: 4096,
+                    data: vec![1],
+                },
+            ]),
+            Err(MemoryError::OutOfRange)
+        );
+        assert_eq!(host.read(0, 4).unwrap(), b"seed");
+        host.write_ranges(vec![
+            WriteRange {
+                offset: 0,
+                data: b"first".to_vec(),
+            },
+            WriteRange {
+                offset: 0,
+                data: b"last".to_vec(),
+            },
+        ])
+        .unwrap();
+        assert_eq!(host.read(0, 5).unwrap(), b"lastt");
     }
 
     #[test]
@@ -365,13 +373,23 @@ mod tests {
         first.set_level(true);
         assert!(first.interrupt_level());
         assert!(!second.interrupt_level());
+        let mut context = Context::from_waker(Waker::noop());
+        assert_eq!(
+            std::pin::pin!(wake.notified()).poll(&mut context),
+            Poll::Ready(())
+        );
+        first.set_level(true);
+        assert!(
+            std::pin::pin!(wake.notified())
+                .poll(&mut context)
+                .is_pending()
+        );
         for _ in 0..crate::component::context::MAX_SIGNALS_PER_WINDOW {
             first.signal();
         }
         first.set_level(false);
         assert!(!first.interrupt_level());
         assert!(first.signals_dropped() > 0);
-        let mut context = Context::from_waker(Waker::noop());
         assert_eq!(
             std::pin::pin!(wake.notified()).poll(&mut context),
             Poll::Ready(())

@@ -5,6 +5,8 @@ mod file_events;
 mod grant;
 mod host;
 mod metadata;
+#[cfg(windows)]
+mod read_directory;
 mod resource_linker;
 #[cfg(test)]
 mod stalled_io;
@@ -76,7 +78,7 @@ pub(crate) async fn instantiate(
 ) -> wasmtime::Result<crate::component::StandaloneDevice> {
     let mut runtime =
         crate::box_runtime::BoxRuntime::new(engine, crate::box_runtime::store::BoxHost::new())?;
-    crate::component::mmio::initialize_test_mmio(&mut runtime).await?;
+    crate::component::mmio::initialize_test_mmio(&mut runtime)?;
     let channel = register_device(&mut runtime, host, component, tag, max_nodes, interrupt)?;
     Ok(crate::component::StandaloneDevice {
         _runtime: Arc::new(runtime.prepare().await?.start()),

@@ -764,6 +764,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn download_replaces_a_destination_with_a_maximum_length_name() {
+        let scratch = tempfile::tempdir().unwrap();
+        let destination = scratch.path().join("x".repeat(255));
+        std::fs::write(&destination, b"old").unwrap();
+        let mut guest = peer(&[SyncReply::ReadFileReady {
+            size: 3,
+            mode: 0o644,
+            mtime_secs: 100,
+            mtime_nanos: 0,
+        }]);
+        guest.0.get_mut().extend(b"new");
+        guest
+            .0
+            .get_mut()
+            .extend(peer(&[SyncReply::Success]).0.into_inner());
+        assert_eq!(
+            fetch_file_from_guest(
+                &mut guest,
+                "file",
+                &destination,
+                &(3, 0o644, 100, 0),
+                Instant::now() + COPY_DATA_TIMEOUT,
+            )
+            .await
+            .unwrap(),
+            3
+        );
+        assert_eq!(std::fs::read(destination).unwrap(), b"new");
+        assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
     async fn canceled_download_preserves_destination_and_removes_the_staged_file() {
         let scratch = tempfile::tempdir().unwrap();
         let destination = scratch.path().join("file");

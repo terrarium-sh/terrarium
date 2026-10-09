@@ -321,13 +321,10 @@ mod tests {
                 .unwrap();
         let vmm =
             wasmtime::component::Component::new(&engine, crate::test_fixtures::wasm::VMM).unwrap();
-        let mmio =
-            wasmtime::component::Component::new(&engine, crate::test_fixtures::wasm::MMIO).unwrap();
         let devices = [
             (DeviceKind::Block, 11),
             (DeviceKind::Block, 12),
-            (DeviceKind::Net, 13),
-            (DeviceKind::Vsock, 14),
+            (DeviceKind::Vsock, 13),
             (DeviceKind::Memory, 15),
         ]
         .into_iter()
@@ -363,7 +360,7 @@ mod tests {
             .await
             .unwrap();
         machine.accept_boot(entry).unwrap();
-        runtime.initialize_mmio(&mmio).await.unwrap();
+        runtime.initialize_mmio().unwrap();
         runtime.initialize_vmm(&vmm).await.unwrap();
         let (mut runtime, machine) = runtime.attach_machine(machine).await.unwrap();
         let component =

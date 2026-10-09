@@ -20,8 +20,6 @@ hw:
   rootfs_mib: 4096
 components:
   memory_mib: 16
-  network:
-    memory_mib: 32
 mounts:
   - host: .
     guest: /work
@@ -57,30 +55,22 @@ workload:
 the private writable root filesystem capacity. The root filesystem is sparse,
 but it cannot exceed `rootfs_mib`. `components.memory_mib` limits each Wasm
 component's linear memory independently. The default and minimum configurable
-ceiling are 16 MiB. There is no combined component memory limit. Host admission
-reserves the maximum component footprint, including overrides, in addition to
-guest RAM and native headroom. Component ceilings are separate from guest RAM
-and do not bound all native host-process memory.
+ceiling are 16 MiB. There is no combined component memory limit. Component
+ceilings are separate from guest RAM and do not bound all native host-process
+memory. Operators set aggregate VM resource budgets through operating-system
+controls.
 
-The optional `components.network.memory_mib` overrides the network component's
-ceiling; otherwise it inherits `components.memory_mib`. This override also
-requires at least 16 MiB.
+When networking is enabled, the combined device/network frontend's ceiling is
+the larger of `components.memory_mib` and 200 MiB, enough for its full flow
+table. Local-only mode uses the ordinary component ceiling.
 
-Network flow capacity scales with that ceiling: 16 MiB allows 179
-slots, shared by outbound TCP, pending UDP requests, and DNS lookups; 32 MiB
-allows 384 slots and 64 MiB allows 793. Published-port connections share this
-capacity and count twice because of their additional queues. At capacity, new flows encounter backpressure until existing flows close.
+A box has at most 1024 concurrent network flows. Outbound and published connections share this capacity. Requests
+also have separate bounds for TCP, UDP, and DNS work.
 
-TCP uses 16 KiB buffers per direction and 8 KiB transfer chunks. Larger buffers
-reduce small-transfer overhead while consuming more memory per connection. The TCP connection between the guest and proxy is
-separate from the host's connection to the remote server: the 16 KiB window
-applies to the local guest/proxy RTT, not the remote server's RTT. Smaller
-buffers can still reduce throughput when local processing is delayed.
-
-Each TCP connection reuses its own transfer buffer until the input stream ends.
-Connection admission limits concurrent buffers, and reads waiting for data keep
-independent buffers so an idle connection cannot block another connection's
-download.
+External TCP uses one stream per socket; UDP datagrams share a bounded
+UDP/control connection and carry at most 4 KiB. The broker owns and authorizes
+the host sockets. Admission and queue limits bound buffered data; guest-local
+sockets continue to use native Linux networking.
 
 On x86_64, RAM starts at zero and skips the reserved device-address region
 from 3.25 GiB to 4 GiB, continuing above 4 GiB when needed. Virtio devices
@@ -173,6 +163,15 @@ comments are allowed. `terra <box> show` redacts environment values unless
 
 ## Network
 
+`network.enabled` defaults to `true`. Set `network: {enabled: false}` for
+guest-local networking only: loopback and agent sessions stay available,
+external connections fail, and Terra starts no network broker. Local-only
+recipes require allowlist mode and empty `allow`, `hosts`, and `ports`.
+
+Network rules apply at the Wasm component boundary. The built-in Linux jail
+shares the host network namespace; native VM-process compromise can bypass
+recipe rules. See [network policy limits](security.md#network-policy-limits).
+
 The default `mode: allowlist` permits no egress until an `allow` entry grants a
 hostname, IP address, or CIDR, optionally limited with `:PORT`. A hostname rule
 is exact; `*.example.com` matches subdomains, not `example.com` itself.
@@ -185,7 +184,8 @@ still need an explicit rule. `HOST_LOOPBACK` names the host running Terra.
 A `hosts` record only provides local DNS; add a matching `allow` rule before
 connecting.
 `ports` publishes a guest listener on host loopback: `"8080"` maps the same
-port and `"3000:80"` maps host 3000 to guest 80.
+port and `"3000:80"` maps host 3000 to guest 80. TCP is the default; append
+`/udp` for UDP, such as `"5353:53/udp"`. TCP and UDP may share a host port.
 
 External ICMP echo forwarding is unavailable, so TCP or UDP rules do not enable
 external `ping`. DNS returns A and AAAA records only. Terra uses a 60-second DNS

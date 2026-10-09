@@ -1,3 +1,4 @@
+pub mod agent;
 pub(crate) mod bindings;
 pub mod block;
 pub(crate) mod clocks;
@@ -7,7 +8,6 @@ pub mod interrupt_controller;
 pub mod mem;
 pub mod mmio;
 pub mod network;
-pub mod policy;
 pub(crate) mod relay;
 pub mod vmm;
 pub mod vsock;

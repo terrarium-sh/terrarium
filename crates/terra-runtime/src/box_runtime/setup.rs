@@ -12,10 +12,10 @@ use wasmtime::component::StreamReader;
 use super::MAX_BOX_COMPONENTS;
 use super::store::{BoxHost, StoreHost, StoreState, create_store};
 use super::{
-    BoxRuntime, ComponentLoop, DeviceWorker, EpochClock, MAX_BOX_COMPONENT_LOOPS,
+    BoxRuntime, ComponentLoop, ComponentRole, DeviceWorker, EpochClock, MAX_BOX_COMPONENT_LOOPS,
     MAX_BOX_COMPONENT_WORKERS, PreparedBoxRuntime, WorkerTask,
 };
-use crate::component::mmio::{self, DevicePlan, Serve, router_error};
+use crate::component::mmio::{self, DevicePlan, Serve};
 use crate::component::mmio::{Reply, Request};
 use crate::component::relay;
 use crate::component::vmm::boot::BootEntry;
@@ -30,6 +30,8 @@ pub(crate) type Setup = Box<
         ) -> Pin<Box<dyn Future<Output = wasmtime::Result<PreparedWorker>> + Send>>
         + Send,
 >;
+
+pub(crate) type RoleSetup = Pin<Box<dyn Future<Output = wasmtime::Result<WorkerTask>> + Send>>;
 
 pub(crate) struct PreparedWorker {
     pub worker: WorkerTask,
@@ -49,6 +51,7 @@ impl BoxRuntime {
             shutdown,
             children: Vec::new(),
             component_loops: Vec::new(),
+            roles: Vec::new(),
         })
     }
 
@@ -157,32 +160,25 @@ impl BoxRuntime {
                 .as_ref()
                 .map(|instance| Arc::clone(&instance.failure))
         };
-        if let Some(mut instance) = self.mmio.take() {
-            let mut worker = instance
-                .worker
-                .take()
-                .ok_or_else(|| wasmtime::Error::msg("MMIO worker missing"))?;
-            let bridge = instance.bridge;
+        if let Some(instance) = self.mmio.take() {
+            let context = mmio::bridge::BridgeContext {
+                devices: instance.devices,
+                admission: instance.admission,
+            };
+            let bridge = mmio::bridge::create_component_loop(
+                context,
+                instance.sender,
+                instance.receiver,
+                instance.channels,
+            );
             let shutdown = self.shutdown.clone();
-            worker.register_loop(Box::new(move |accessor| {
+            self.register_loop(Box::new(move |accessor| {
                 Box::pin(async move {
                     bridge(accessor).await?;
                     shutdown.send_replace(true);
                     Ok(())
                 })
             }))?;
-            self.attach_worker(worker.prepare(self.shutdown.subscribe()))?;
-            if self.component_loops.is_empty() {
-                let mut shutdown = self.shutdown.subscribe();
-                self.register_loop(Box::new(move |_| {
-                    Box::pin(async move {
-                        while !*shutdown.borrow_and_update() {
-                            shutdown.changed().await?;
-                        }
-                        Ok(())
-                    })
-                }))?;
-            }
         }
         Ok(PreparedBoxRuntime {
             store: self.store,
@@ -202,7 +198,6 @@ impl BoxRuntime {
     ) -> wasmtime::Result<(PreparedBoxRuntime, VcpuReaper)> {
         self.store.data().platform.validate_vcpu_start()?;
         let mut runtime = self.prepare_devices().await?;
-        runtime.compose_machine().await?;
         let started = runtime
             .store
             .data_mut()
@@ -240,13 +235,32 @@ impl BoxRuntime {
         Ok(device)
     }
 
-    pub(crate) fn grant_device_worker_unmanaged<H: StoreHost>(
+    pub(crate) fn grant_role_worker_unmanaged<H: StoreHost>(
         &mut self,
-        kind: DeviceKind,
-        initialize: impl Future<Output = wasmtime::Result<(DeviceWorker<H>, Serve)>> + Send + 'static,
-    ) -> wasmtime::Result<mmio::MmioDevice> {
-        let setup = setup(initialize, self.shutdown_receiver());
-        mmio::MmioDevice::grant_worker(self, kind, setup)
+        role: ComponentRole,
+        initialize: impl Future<Output = wasmtime::Result<(DeviceWorker<H>, ())>> + Send + 'static,
+    ) -> wasmtime::Result<()> {
+        wasmtime::ensure!(
+            !self.roles.iter().any(|(existing, _)| *existing == role),
+            "box already has a {role:?} role"
+        );
+        let shutdown = self.shutdown_receiver();
+        self.roles.push((
+            role,
+            Box::pin(async move {
+                let (worker, ()) = initialize.await?;
+                Ok(worker.prepare(shutdown))
+            }),
+        ));
+        Ok(())
+    }
+
+    pub fn add_role_shutdown(
+        &mut self,
+        role: ComponentRole,
+        close: impl Future<Output = Result<(), String>> + Send + 'static,
+    ) -> wasmtime::Result<()> {
+        self.add_device_shutdown(vmm::teardown::DeviceShutdown::for_role(role, close))
     }
 
     pub fn grant_interrupt_shutdown(
@@ -269,11 +283,17 @@ impl BoxRuntime {
     }
 
     async fn prepare_devices(mut self) -> wasmtime::Result<Self> {
+        for (role, setup) in std::mem::take(&mut self.roles) {
+            let worker = tokio::time::timeout(SETUP_TIMEOUT, setup)
+                .await
+                .map_err(|_| wasmtime::Error::msg(format!("{role:?} role setup timed out")))??;
+            self.attach_worker(worker)?;
+        }
         let Some(instance) = self.mmio.as_mut() else {
             return Ok(self);
         };
         let plans = std::mem::take(&mut instance.device_plan);
-        let devices = plans.iter().map(|plan| Arc::clone(&plan.device)).collect();
+        let devices: Box<[_]> = plans.iter().map(|plan| Arc::clone(&plan.device)).collect();
         for DevicePlan {
             device,
             mapping,
@@ -282,27 +302,38 @@ impl BoxRuntime {
         {
             let mapping =
                 mapping.ok_or_else(|| wasmtime::Error::msg("worker grant has no mapping"))?;
-            let worker = {
-                let instance = self
-                    .mmio
-                    .as_mut()
-                    .ok_or_else(|| wasmtime::Error::msg("MMIO router missing"))?;
-                let mmio_worker = instance
-                    .worker
-                    .as_mut()
-                    .ok_or_else(|| wasmtime::Error::msg("MMIO worker missing"))?;
-                within_setup_timeout(
-                    device.slot,
-                    prepare_mmio_worker(
-                        mmio_worker,
-                        &instance.routing,
-                        device.slot,
-                        mapping,
-                        setup,
-                    ),
-                )
-                .await?
-            };
+            let instance = self
+                .mmio
+                .as_ref()
+                .ok_or_else(|| wasmtime::Error::msg("MMIO router missing"))?;
+            wasmtime::ensure!(
+                instance.channels.len() == device.slot as usize
+                    && mapping.1 != 0
+                    && mapping.0.checked_add(mapping.1).is_some(),
+                "worker grant outside box"
+            );
+            for earlier in &devices[..device.slot as usize] {
+                let base = earlier.base.load(std::sync::atomic::Ordering::Acquire);
+                let end = base
+                    .checked_add(earlier.size.load(std::sync::atomic::Ordering::Acquire))
+                    .ok_or_else(|| wasmtime::Error::msg("MMIO mapping overflow"))?;
+                wasmtime::ensure!(
+                    mapping.0 >= end || base >= mapping.0 + mapping.1,
+                    "overlapping MMIO mappings"
+                );
+            }
+            let (requests, request_stream) = relay::channel(relay::MMIO_CAPACITY);
+            let PreparedWorker { worker, replies } =
+                within_setup_timeout(device.slot, setup(request_stream)).await?;
+            self.mmio
+                .as_mut()
+                .ok_or_else(|| wasmtime::Error::msg("MMIO router missing"))?
+                .channels
+                .push(Some(mmio::DeviceChannel {
+                    requests,
+                    replies,
+                    sequence: 0,
+                }));
             self.attach_worker(worker)?;
         }
         self.mmio
@@ -313,37 +344,6 @@ impl BoxRuntime {
             .map_err(|_| wasmtime::Error::msg("device registry already published"))?;
         Ok(self)
     }
-}
-
-async fn prepare_mmio_worker(
-    mmio_worker: &mut DeviceWorker<mmio::MmioHost>,
-    router: &mmio::bindings::router::Guest,
-    slot: u32,
-    (base, size): (u64, u64),
-    setup: Setup,
-) -> wasmtime::Result<WorkerTask> {
-    wasmtime::ensure!(
-        usize::try_from(slot)? < crate::box_runtime::MAX_BOX_COMPONENTS
-            && size != 0
-            && base.checked_add(size).is_some(),
-        "worker grant outside box"
-    );
-    let (request_reader,) = router
-        .func_open_device()
-        .call_async(&mut mmio_worker.store, (slot, base, size))
-        .await?;
-    let request_reader = request_reader.map_err(router_error)?;
-    let (sink, request_stream) =
-        crate::component::relay::channel(crate::component::relay::MMIO_CAPACITY);
-    request_reader.pipe(&mut mmio_worker.store, sink)?;
-    let prepared = setup(request_stream).await?;
-    let replies = StreamReader::new(&mut mmio_worker.store, prepared.replies)?;
-    let (result,) = router
-        .func_attach_replies()
-        .call_async(&mut mmio_worker.store, (slot, replies))
-        .await?;
-    result.map_err(router_error)?;
-    Ok(prepared.worker)
 }
 
 pub(crate) fn setup<H: StoreHost>(

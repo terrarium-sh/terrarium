@@ -1,46 +1,41 @@
-//! Bounded host requests and shutdown for the Wasm router.
+//! Bounded native MMIO routing and shutdown.
 
-use crate::box_runtime::store::{StoreHost, StoreState};
 use crate::machine::DeviceKind;
 use futures_util::future::BoxFuture;
-use wasmtime::component::Accessor;
-
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use std::collections::{HashSet, VecDeque};
 
 use super::{
-    Access, Arc, COMMAND_CAPACITY, CONTROL_CAPACITY, Command, Control, Mutex, Operation, Ordering,
+    Arc, COMMAND_CAPACITY, CONTROL_CAPACITY, Command, DeviceChannel, Mutex, Operation, Ordering,
     Pending, Queue, QueueError, REQUEST_TIMEOUT, ReplyOwner, RoutedReply,
 };
 
 type BridgeOperation<'a> = BoxFuture<'a, Completion>;
+type Completion = (
+    ReplyOwner,
+    Option<(u32, DeviceChannel)>,
+    Result<RoutedReply, QueueError>,
+);
+type Operations<'a> = FuturesUnordered<BridgeOperation<'a>>;
 
-struct BridgeReply {
-    routed: RoutedReply,
+pub(crate) struct BridgeContext {
+    pub devices: super::DeviceRegistry,
+    pub admission: Arc<Mutex<Option<String>>>,
 }
 
-pub(in crate::component) struct BridgeContext {
-    pub(in crate::component) access: Access,
-    pub(in crate::component) control: Control,
-    pub(in crate::component) devices: super::DeviceRegistry,
-    pub(in crate::component) admission: Arc<Mutex<Option<String>>>,
-}
-
-pub(in crate::component) fn create_component_loop<H: StoreHost>(
+pub(crate) fn create_component_loop(
     context: BridgeContext,
     sender: Queue,
     receiver: tokio::sync::mpsc::Receiver<Pending>,
-) -> crate::box_runtime::ComponentLoop<StoreState<H>> {
-    Box::new(move |accessor| {
+    channels: Vec<Option<DeviceChannel>>,
+) -> crate::box_runtime::ComponentLoop {
+    Box::new(move |_| {
         Box::pin(async move {
             let _sender = sender;
-            run_bridge(accessor, receiver, context).await
+            run_bridge(receiver, context, channels).await
         })
     })
 }
-
-type Operations<'a> = FuturesUnordered<BridgeOperation<'a>>;
-type Completion = (ReplyOwner, Option<u32>, Result<BridgeReply, QueueError>);
 
 enum BridgeEvent {
     Pending(Pending),
@@ -53,37 +48,20 @@ fn complete_device(context: &BridgeContext, routed: &RoutedReply) -> wasmtime::R
         .get()
         .and_then(|devices| devices.get(routed.slot as usize))
         .ok_or_else(|| wasmtime::Error::msg("invalid MMIO reply slot"))?;
-    if routed.reply.error != 0 {
+    if let Some(error) = routed.reply.error {
         device.counts.failed.fetch_add(1, Ordering::Relaxed);
         let kind = match device.kind {
             DeviceKind::Block => "block",
             DeviceKind::Fs => "filesystem",
             DeviceKind::Memory => "memory",
             DeviceKind::Vsock => "vsock",
-            DeviceKind::Net => "network",
         };
         return Err(wasmtime::Error::msg(format!(
-            "MMIO {kind} device error {}",
-            routed.reply.error
+            "MMIO {kind} device error {error:?}"
         )));
     }
     device.counts.completed.fetch_add(1, Ordering::Relaxed);
     Ok(())
-}
-
-fn complete_access(
-    context: &BridgeContext,
-    address: u64,
-    width: u8,
-    routed: &RoutedReply,
-) -> wasmtime::Result<()> {
-    context
-        .devices
-        .get()
-        .and_then(|devices| devices.get(routed.slot as usize))
-        .filter(|device| super::owns_access(device, address, width))
-        .ok_or_else(|| wasmtime::Error::msg("MMIO reply slot does not own the access"))?;
-    complete_device(context, routed)
 }
 
 fn all_devices_closed(context: &BridgeContext) -> bool {
@@ -92,15 +70,6 @@ fn all_devices_closed(context: &BridgeContext) -> bool {
             && devices
                 .iter()
                 .all(|device| device.closed.load(Ordering::Acquire))
-    })
-}
-
-fn all_devices_closing_or_closed(context: &BridgeContext) -> bool {
-    context.devices.get().is_some_and(|devices| {
-        !devices.is_empty()
-            && devices.iter().all(|device| {
-                device.closing.load(Ordering::Acquire) || device.closed.load(Ordering::Acquire)
-            })
     })
 }
 
@@ -149,9 +118,6 @@ fn router_failure(error: super::Error) -> QueueError {
             QueueError::Router(error)
         }
         super::Error::InvalidSlot
-        | super::Error::InvalidVcpu
-        | super::Error::UnsupportedMsr
-        | super::Error::BadArmExit
         | super::Error::Overlap
         | super::Error::Busy
         | super::Error::Closed
@@ -159,12 +125,44 @@ fn router_failure(error: super::Error) -> QueueError {
     }
 }
 
-fn dispatch_pending<'a, H: StoreHost>(
-    accessor: &'a Accessor<StoreState<H>>,
-    context: &'a BridgeContext,
+fn request_fields(
+    context: &BridgeContext,
+    command: &Command,
+    slot: Option<u32>,
+) -> Result<(Operation, u64, u8, u64), QueueError> {
+    match *command {
+        Command::Access(address, width, value, write) => {
+            if !matches!(width, 1 | 2 | 4 | 8) {
+                return Err(router_failure(super::Error::BadWidth));
+            }
+            address
+                .checked_add(u64::from(width))
+                .ok_or_else(|| router_failure(super::Error::Overflow))?;
+            let device = slot
+                .and_then(|slot| context.devices.get()?.get(slot as usize))
+                .filter(|device| !device.closed.load(Ordering::Acquire))
+                .ok_or_else(|| router_failure(super::Error::Unmapped))?;
+            Ok((
+                if write {
+                    Operation::Write
+                } else {
+                    Operation::Read
+                },
+                address - device.base.load(Ordering::Acquire),
+                width,
+                value,
+            ))
+        }
+        Command::Control(_, operation) => Ok((operation, 0, 0, 0)),
+    }
+}
+
+fn dispatch_pending(
+    context: &BridgeContext,
     pending: Pending,
     slot: Option<u32>,
-) -> BridgeOperation<'a> {
+    channel: Option<DeviceChannel>,
+) -> BridgeOperation<'_> {
     let Pending {
         command,
         reply,
@@ -172,45 +170,41 @@ fn dispatch_pending<'a, H: StoreHost>(
     } = pending;
     drop(queue_permit);
     Box::pin(async move {
+        let mut channel = slot.zip(channel);
         let result = tokio::time::timeout(REQUEST_TIMEOUT, async {
-            let reply = match command {
-                Command::Access(address, width, value, write) => {
-                    let (result,) = context
-                        .access
-                        .call_concurrent(accessor, (address, width, value, write))
-                        .await
-                        .map_err(QueueError::Failure)?;
-                    let routed = result.map_err(router_failure)?;
-                    complete_access(context, address, width, &routed)
-                        .map_err(QueueError::Failure)?;
-                    BridgeReply { routed }
-                }
-                Command::Control(slot, operation) => {
-                    let (result,) = context
-                        .control
-                        .call_concurrent(accessor, (slot, operation))
-                        .await
-                        .map_err(QueueError::Failure)?;
-                    let control = result.map_err(router_failure)?;
-                    if control.all_closed && operation != Operation::Close {
-                        return Err(QueueError::Failure(wasmtime::Error::msg(
-                            "MMIO service completed without a close request",
-                        )));
-                    }
-                    if control.all_closed && !all_devices_closing_or_closed(context) {
-                        return Err(QueueError::Failure(wasmtime::Error::msg(
-                            "MMIO service close state disagrees with native devices",
-                        )));
-                    }
-                    let routed = RoutedReply {
-                        slot,
-                        reply: control.reply,
-                    };
-                    complete_device(context, &routed).map_err(QueueError::Failure)?;
-                    BridgeReply { routed }
-                }
+            let (operation, offset, width, value) = request_fields(context, &command, slot)?;
+            let (slot, channel) = channel
+                .as_mut()
+                .ok_or_else(|| router_failure(super::Error::InvalidSlot))?;
+            let sequence = channel.sequence;
+            channel.sequence = sequence
+                .checked_add(1)
+                .ok_or_else(|| router_failure(super::Error::Device))?;
+            channel
+                .requests
+                .send(super::Request {
+                    sequence,
+                    operation,
+                    offset,
+                    width,
+                    value,
+                })
+                .await
+                .map_err(QueueError::Failure)?;
+            let response = channel
+                .replies
+                .next()
+                .await
+                .ok_or_else(|| router_failure(super::Error::Closed))?;
+            if response.sequence != sequence {
+                return Err(router_failure(super::Error::Device));
+            }
+            let routed = RoutedReply {
+                slot: *slot,
+                reply: response,
             };
-            Ok::<_, QueueError>(reply)
+            complete_device(context, &routed).map_err(QueueError::Failure)?;
+            Ok(routed)
         })
         .await
         .unwrap_or_else(|_| {
@@ -218,7 +212,7 @@ fn dispatch_pending<'a, H: StoreHost>(
                 "MMIO request timed out",
             )))
         });
-        (reply, slot, result)
+        (reply, channel, result)
     })
 }
 
@@ -239,14 +233,14 @@ async fn drain_operations<'a>(control_operations: Operations<'a>, data_operation
         .chain(data_operations)
         .collect::<Operations<'a>>();
     while let Some((reply, _, result)) = operations.next().await {
-        reply.send(result.map(|reply| reply.routed));
+        reply.send(result);
     }
 }
 
-async fn run_bridge<H: StoreHost>(
-    accessor: &Accessor<StoreState<H>>,
+async fn run_bridge(
     mut receiver: tokio::sync::mpsc::Receiver<Pending>,
     context: BridgeContext,
+    mut channels: Vec<Option<DeviceChannel>>,
 ) -> wasmtime::Result<()> {
     let mut control_operations = Operations::new();
     let mut data_operations = Operations::new();
@@ -260,13 +254,16 @@ async fn run_bridge<H: StoreHost>(
             data_operations.len(),
         );
         if let Some((request, slot)) = next.and_then(|index| pending.remove(index)) {
-            if let Some(slot) = slot {
+            let channel = slot.and_then(|slot| {
                 active_slots.insert(slot);
-            }
-            if request.command.is_control() {
-                control_operations.push(dispatch_pending(accessor, &context, request, slot));
+                channels.get_mut(slot as usize)?.take()
+            });
+            let is_control = request.command.is_control();
+            let operation = dispatch_pending(&context, request, slot, channel);
+            if is_control {
+                control_operations.push(operation);
             } else {
-                data_operations.push(dispatch_pending(accessor, &context, request, slot));
+                data_operations.push(operation);
             }
             continue;
         }
@@ -278,40 +275,18 @@ async fn run_bridge<H: StoreHost>(
         match event {
             Some(BridgeEvent::Pending(request)) => {
                 let slot = command_slot(&context, &request.command);
-                let capacity = if request.command.is_control() {
-                    control_operations.len() < CONTROL_CAPACITY
-                } else {
-                    data_operations.len() < COMMAND_CAPACITY
-                };
-                let predecessor = slot.is_some_and(|slot| {
-                    pending
-                        .iter()
-                        .any(|(_, earlier_slot)| *earlier_slot == Some(slot))
-                });
-                if capacity && !predecessor && slot.is_none_or(|slot| !active_slots.contains(&slot))
-                {
-                    if let Some(slot) = slot {
-                        active_slots.insert(slot);
-                    }
-                    if request.command.is_control() {
-                        control_operations
-                            .push(dispatch_pending(accessor, &context, request, slot));
-                    } else {
-                        data_operations.push(dispatch_pending(accessor, &context, request, slot));
-                    }
-                } else {
-                    pending.push_back((request, slot));
-                }
+                pending.push_back((request, slot));
             }
-            Some(BridgeEvent::Completion((reply, slot, result))) => {
-                if let Some(slot) = slot {
+            Some(BridgeEvent::Completion((reply, channel, result))) => {
+                if let Some((slot, channel)) = channel {
                     active_slots.remove(&slot);
+                    channels[slot as usize] = Some(channel);
                 }
                 let failure = result.as_ref().err().and_then(|error| match error {
                     QueueError::Router(_) => None,
                     QueueError::Failure(error) => Some(format!("MMIO router failed: {error:#}")),
                 });
-                reply.send(result.map(|reply| reply.routed));
+                reply.send(result);
                 if let Some(reason) = failure {
                     stop_bridge(&context.admission, &mut receiver, &reason);
                     return Err(wasmtime::Error::msg(reason));
@@ -338,6 +313,273 @@ mod tests {
 
     fn access() -> Command {
         Command::Access(0, 4, 0, false)
+    }
+
+    fn native_device(
+        device_count: u32,
+    ) -> (
+        BridgeContext,
+        DeviceChannel,
+        crate::component::relay::Stream<super::super::Request>,
+        crate::component::relay::Sink<Reply>,
+    ) {
+        use super::super::{
+            AtomicBool, AtomicU64, DeviceRegistration, DeviceRequestCounts, OnceLock,
+        };
+        use crate::component::relay::{MMIO_CAPACITY, channel};
+
+        let devices = Arc::new(OnceLock::new());
+        assert!(
+            devices
+                .set(
+                    (0..device_count)
+                        .map(|slot| Arc::new(DeviceRegistration {
+                            kind: DeviceKind::Block,
+                            slot,
+                            base: AtomicU64::new(0x1000 * (u64::from(slot) + 1)),
+                            size: AtomicU64::new(0x200),
+                            closing: AtomicBool::new(false),
+                            closed: AtomicBool::new(false),
+                            counts: DeviceRequestCounts::default(),
+                        }))
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice()
+                )
+                .is_ok()
+        );
+        let (requests, request_stream) = channel(MMIO_CAPACITY);
+        let (reply_sink, replies) = channel(MMIO_CAPACITY);
+        (
+            BridgeContext {
+                devices,
+                admission: Arc::new(Mutex::new(None)),
+            },
+            DeviceChannel {
+                requests,
+                replies,
+                sequence: 7,
+            },
+            request_stream,
+            reply_sink,
+        )
+    }
+
+    #[tokio::test]
+    async fn native_dispatch_rejects_stale_and_future_reply_sequences() {
+        for sequence in [6, 8] {
+            let (context, channel, mut requests, mut replies) = native_device(1);
+            let (queue, mut receiver) = Queue::new();
+            let response = enqueue(
+                &queue,
+                &context.admission,
+                Command::Access(0x1018, 4, 0, false),
+            )
+            .unwrap();
+            replies
+                .send(Reply {
+                    sequence,
+                    value: 0,
+                    error: None,
+                    interrupt: false,
+                })
+                .await
+                .unwrap();
+            let (reply, channel, result) = dispatch_pending(
+                &context,
+                receiver.try_recv().unwrap(),
+                Some(0),
+                Some(channel),
+            )
+            .await;
+            assert_eq!(requests.next().await.unwrap().sequence, 7);
+            assert_eq!(channel.unwrap().1.sequence, 8);
+            assert!(
+                matches!(&result, Err(QueueError::Failure(error)) if error.to_string().contains("Device"))
+            );
+            assert_eq!(
+                context.devices.get().unwrap()[0]
+                    .counts
+                    .completed
+                    .load(Ordering::Relaxed),
+                0
+            );
+            reply.send(result);
+            assert!(matches!(
+                response.recv().unwrap(),
+                Err(QueueError::Failure(_))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn native_dispatch_preserves_typed_device_errors_and_failed_counts() {
+        let (context, channel, mut requests, mut replies) = native_device(1);
+        let (queue, mut receiver) = Queue::new();
+        let response = enqueue(
+            &queue,
+            &context.admission,
+            Command::Control(0, Operation::Reset),
+        )
+        .unwrap();
+        replies
+            .send(Reply {
+                sequence: 7,
+                value: 0,
+                error: Some(super::super::DeviceError::BadLen),
+                interrupt: false,
+            })
+            .await
+            .unwrap();
+        let (reply, _, result) = dispatch_pending(
+            &context,
+            receiver.try_recv().unwrap(),
+            Some(0),
+            Some(channel),
+        )
+        .await;
+        assert_eq!(requests.next().await.unwrap().operation, Operation::Reset);
+        assert!(
+            matches!(&result, Err(QueueError::Failure(error)) if error.to_string() == format!("MMIO block device error {:?}", super::super::DeviceError::BadLen))
+        );
+        let counts = &context.devices.get().unwrap()[0].counts;
+        assert_eq!(counts.completed.load(Ordering::Relaxed), 0);
+        assert_eq!(counts.failed.load(Ordering::Relaxed), 1);
+        reply.send(result);
+        assert!(matches!(
+            response.recv().unwrap(),
+            Err(QueueError::Failure(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn invalid_guest_accesses_leave_native_routing_and_device_sequence_available() {
+        use super::super::{Error, submit_async};
+        use futures_util::FutureExt;
+
+        let (context, channel, mut requests, mut replies) = native_device(1);
+        let devices = Arc::clone(&context.devices);
+        let admission = Arc::clone(&context.admission);
+        let failure = Mutex::new(None);
+        let (queue, receiver) = Queue::new();
+        let bridge = tokio::spawn(run_bridge(receiver, context, vec![Some(channel)]));
+        for (command, expected) in [
+            (Command::Access(0x1000, 3, 0, false), Error::BadWidth),
+            (Command::Access(u64::MAX, 8, 0, false), Error::Overflow),
+            (Command::Access(0x1200, 4, 0, false), Error::Unmapped),
+        ] {
+            assert!(
+                matches!(submit_async(&queue, &admission, &failure, command, None).await,
+                Err(QueueError::Router(error)) if error == expected)
+            );
+            assert!(requests.next().now_or_never().is_none());
+            assert!(admission.lock().unwrap().is_none());
+        }
+        let routed = {
+            let access = submit_async(
+                &queue,
+                &admission,
+                &failure,
+                Command::Access(0x1018, 4, 0xa5, true),
+                None,
+            );
+            tokio::pin!(access);
+            let request = tokio::select! {
+                result = &mut access => panic!("access completed before device reply: {result:?}"),
+                request = requests.next() => request.unwrap(),
+            };
+            assert_eq!(
+                (
+                    request.sequence,
+                    request.operation,
+                    request.offset,
+                    request.width,
+                    request.value
+                ),
+                (7, Operation::Write, 0x18, 4, 0xa5)
+            );
+            replies
+                .send(Reply {
+                    sequence: 7,
+                    value: 0x42,
+                    error: None,
+                    interrupt: true,
+                })
+                .await
+                .unwrap();
+            access.await.unwrap()
+        };
+        assert_eq!(routed.slot, 0);
+        assert_eq!(routed.reply.value, 0x42);
+        assert!(routed.reply.interrupt);
+        assert_eq!(
+            devices.get().unwrap()[0]
+                .counts
+                .completed
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            devices.get().unwrap()[0]
+                .counts
+                .failed
+                .load(Ordering::Relaxed),
+            0
+        );
+        drop(queue);
+        assert_eq!(
+            bridge.await.unwrap().unwrap_err().to_string(),
+            "MMIO bridge closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_device_accesses_are_unmapped_even_when_the_slot_was_already_selected() {
+        use futures_util::FutureExt;
+
+        let (context, channel, mut requests, _replies) = native_device(2);
+        let command = Command::Access(0x1018, 4, 0, false);
+        let queued_slot = command_slot(&context, &command);
+        assert_eq!(queued_slot, Some(0));
+        context.devices.get().unwrap()[0]
+            .closed
+            .store(true, Ordering::Release);
+        assert!(!all_devices_closed(&context));
+        assert_eq!(command_slot(&context, &command), None);
+        assert_eq!(
+            command_slot(&context, &Command::Access(0x2018, 4, 0, false)),
+            Some(1)
+        );
+        let (queue, mut receiver) = Queue::new();
+        let mut channel = Some(channel);
+        for slot in [None, queued_slot] {
+            let response = enqueue(
+                &queue,
+                &context.admission,
+                Command::Access(0x1018, 4, 0, false),
+            )
+            .unwrap();
+            let selected_channel = if slot.is_some() { channel.take() } else { None };
+            let (reply, returned_channel, result) = dispatch_pending(
+                &context,
+                receiver.try_recv().unwrap(),
+                slot,
+                selected_channel,
+            )
+            .await;
+            assert!(matches!(
+                &result,
+                Err(QueueError::Router(super::super::Error::Unmapped))
+            ));
+            assert!(requests.next().now_or_never().is_none());
+            if let Some((_, returned_channel)) = returned_channel {
+                channel = Some(returned_channel);
+            }
+            reply.send(result);
+            assert!(matches!(
+                response.recv().unwrap(),
+                Err(QueueError::Router(super::super::Error::Unmapped))
+            ));
+        }
     }
 
     #[test]
@@ -397,14 +639,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aot_mmio_service_initializes() {
+    async fn native_mmio_service_initializes() {
         let engine = crate::engine::device_engine().expect("engine");
         let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
-        let artifacts = crate::test_fixtures::trusted_artifacts();
         runtime
-            .initialize_mmio_artifact(&artifacts)
-            .await
-            .expect("AOT MMIO service initializes");
+            .initialize_mmio()
+            .expect("native MMIO service initializes");
 
         assert!(runtime.mmio.is_some());
     }
@@ -524,15 +764,13 @@ mod tests {
         let (first_reply, first) = mpsc::sync_channel(1);
         let (second_reply, second) = mpsc::sync_channel(1);
         let (release, released) = tokio::sync::oneshot::channel();
-        let reply = |slot| BridgeReply {
-            routed: RoutedReply {
-                slot,
-                reply: Reply {
-                    sequence: 0,
-                    value: 0,
-                    error: 0,
-                    interrupt: false,
-                },
+        let reply = |slot| RoutedReply {
+            slot,
+            reply: Reply {
+                sequence: 0,
+                value: 0,
+                error: None,
+                interrupt: false,
             },
         };
         let admission = Arc::new(Mutex::new(None));

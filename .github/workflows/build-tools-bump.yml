@@ -24,9 +24,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Test pin updater
-        run: python3 -B scripts/test-pin-updates.py
+        run: python3 -B scripts/pins/test-pin-updates.py
       - name: Update build tools
-        run: python3 scripts/update-build-tools.py '${{ matrix.component }}'
+        run: python3 scripts/pins/update-build-tools.py '${{ matrix.component }}'
       - name: Refresh component lockfiles
         if: matrix.component == 'cargo-tools'
         run: |
@@ -36,9 +36,9 @@ jobs:
           version=$(sed -n 's/^WIT_BINDGEN_VERSION := //p' Makefile)
           cargo update --manifest-path components/Cargo.toml --package wit-bindgen --precise "$version"
       - name: Check synchronized tool versions
-        run: python3 -B scripts/check-tool-versions.py
+        run: python3 -B scripts/pins/check-tool-versions.py
       - name: Open update PR
         env:
           GH_TOKEN: ${{ github.token }}
           BASE_BRANCH: ${{ github.event.repository.default_branch }}
-        run: bash scripts/open-pin-pr.sh '${{ matrix.component }}' Makefile README.dev.md rust-toolchain.toml components kernel/Containerfile scripts/alpine-sources.sh scripts/build-host.ps1
+        run: bash scripts/pins/open-pin-pr.sh '${{ matrix.component }}' Makefile README.dev.md rust-toolchain.toml components kernel/Containerfile scripts/sources/alpine-sources.sh scripts/toolchain/build-host.ps1

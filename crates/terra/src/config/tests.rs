@@ -140,6 +140,32 @@ fn network_mode_parses_from_yaml_scalar() {
 }
 
 #[test]
+fn local_only_networking_is_explicit_and_refuses_host_grants() {
+    let try_parse = |yaml: &str| parse_recipe(yaml, Path::new("/proj"), Path::new("/proj/r.yaml"));
+    assert!(Network::default().enabled);
+    assert!(try_parse("network: {}").unwrap().network.enabled);
+    let local = try_parse("network: {enabled: false}").unwrap();
+    assert!(!local.network.enabled);
+    assert_eq!(
+        crate::policy::network::describe(&local.network),
+        "local-only (guest networking; no host network broker)"
+    );
+    for grant in [
+        "mode: unrestricted-public",
+        "allow: [example.com]",
+        "hosts: [{name: local.test, addr: 127.0.0.1}]",
+        "ports: [\"8080\"]",
+    ] {
+        let recipe = format!("network:\n  enabled: false\n  {grant}\n");
+        let error = try_parse(&recipe).unwrap_err();
+        assert!(
+            error.to_string().contains("network.enabled: false"),
+            "{error:#}"
+        );
+    }
+}
+
+#[test]
 fn env_map_parses() {
     let cfg: Config = yaml_serde::from_str("env:\n  MODEL: gpt-4o\n  DEBUG: \"1\"\n").unwrap();
     assert_eq!(cfg.env.get("MODEL").map(String::as_str), Some("gpt-4o"));
@@ -625,17 +651,11 @@ fn component_memory_defaults_overrides_and_validation() {
     let try_parse = |yaml: &str| parse_recipe(yaml, Path::new("/proj"), Path::new("/proj/r.yaml"));
     let defaults = try_parse("{}").unwrap();
     assert_eq!(defaults.components.memory_mib, 16);
+    let custom = try_parse("components: {memory_mib: 32}").unwrap();
     assert_eq!(
-        defaults.components.memory_limits().unwrap().network_bytes(),
-        16 << 20
+        custom.components.memory_limits().unwrap().component_bytes(),
+        32 << 20
     );
-    let custom = try_parse("components: {memory_mib: 32, network: {memory_mib: 64}}").unwrap();
-    assert_eq!(
-        custom.components.memory_limits().unwrap().network_bytes(),
-        64 << 20
-    );
-    assert_eq!(custom.components.memory_mib, 32);
-    assert!(try_parse("components: {memory_mib: 256, network: {memory_mib: 512}}").is_ok());
     let encoded = yaml_serde::to_string(&custom).unwrap();
     assert_eq!(try_parse(&encoded).unwrap(), custom);
     for yaml in [
@@ -646,9 +666,7 @@ fn component_memory_defaults_overrides_and_validation() {
         "components: {memory_mib: -1}",
         "components: {memory_mib: 4294967296}",
         "components: {unknown: 1}",
-        "components: {network: {memory_mib: 0}}",
-        "components: {network: {memory_mib: 15}}",
-        "components: {network: {memory_mib: 32, unknown: 1}}",
+        "components: {network: {memory_mib: 32}}",
     ] {
         assert!(try_parse(yaml).is_err(), "{yaml}");
     }

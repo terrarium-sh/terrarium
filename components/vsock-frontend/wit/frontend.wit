@@ -1,0 +1,19 @@
+package terra:vsock-frontend@0.1.0;
+
+interface api {
+    use terra:mmio/types@0.1.0.{device-error};
+    use terra:network/types@0.1.0.{config};
+    configure-device: func(network: option<config>) -> result<_, device-error>;
+    run: async func() -> result<_, device-error>;
+    close: async func();
+}
+
+world device {
+    import terra:vsock/frontend-stream@0.1.0;
+    import terra:network/broker@0.1.0;
+    import wasi:clocks/monotonic-clock@0.3.1;
+    import terra:host/memory@0.1.0;
+    import terra:host/interrupt@0.1.0;
+    export api;
+    export terra:mmio/device@0.1.0;
+}

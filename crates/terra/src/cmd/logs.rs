@@ -214,6 +214,7 @@ mod tests {
     fn a_rotated_log_is_a_new_file_under_the_same_name() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join(crate::state::LOG_FILE);
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
         std::fs::write(&log, b"first generation").unwrap();
         let mut f = std::fs::File::open(&log).unwrap();
         assert!(

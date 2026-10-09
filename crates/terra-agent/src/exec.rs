@@ -88,21 +88,13 @@ async fn run_exec<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin +
         &cancel,
     );
 
-    let code = match running.output {
-        ExecOutput::Pty(output) => {
-            drive_pty_output(output, &writer, &running.process, &cancel).await
-        }
-        ExecOutput::Pipes { stdout, stderr } => {
-            Box::pin(drive_pipe_output(
-                stdout,
-                stderr,
-                &writer,
-                &running.process,
-                &cancel,
-            ))
-            .await
-        }
-    };
+    let code = Box::pin(drive_output(
+        running.output,
+        &writer,
+        &running.process,
+        &cancel,
+    ))
+    .await;
     input_stop.cancel();
     let _ = input_task.await;
     let _ = write_output(&writer, AgentOutput::Exit { code }, &cancel).await;
@@ -128,10 +120,6 @@ impl ProcessGroup {
             self.leader,
             rustix::process::Signal::KILL,
         );
-    }
-
-    async fn wait(&self) -> i32 {
-        wait_for_exit_code(&self.pidfd).await
     }
 
     async fn abort<W: AsyncWrite + Unpin>(self, mut conn: W, cancel: &CancellationToken) {
@@ -283,12 +271,8 @@ async fn pump_input<R: AsyncRead + Unpin>(
     let forward = async {
         let mut stdin = Some(stdin);
         while let Some(input) = read_frame(reader).await? {
-            match input {
-                ClientInput::Keys(bytes) => {
-                    if let Some(stdin) = stdin.as_mut() {
-                        stdin.write_all(&bytes).await?;
-                    }
-                }
+            let bytes = match input {
+                ClientInput::Keys(bytes) => bytes,
                 ClientInput::Resize(TermSize { rows, cols }) if is_tty && rows > 0 && cols > 0 => {
                     if let Some(stdin) = stdin.as_ref() {
                         set_winsize(
@@ -297,14 +281,22 @@ async fn pump_input<R: AsyncRead + Unpin>(
                             cols.clamp(MIN_COLS, MAX_COLS),
                         );
                     }
+                    continue;
                 }
-                ClientInput::Resize(_) => {}
-                ClientInput::Eof if is_tty => {
-                    if let Some(stdin) = stdin.as_mut() {
-                        stdin.write_all(&[0x04]).await?;
-                    }
+                ClientInput::Resize(_) => continue,
+                ClientInput::Eof if is_tty => vec![0x04],
+                ClientInput::Eof => {
+                    drop(stdin.take());
+                    continue;
                 }
-                ClientInput::Eof => drop(stdin.take()),
+            };
+            if let Some(child_stdin) = stdin.as_mut()
+                && let Err(error) = child_stdin.write_all(&bytes).await
+            {
+                if error.kind() != std::io::ErrorKind::BrokenPipe {
+                    return Err(error);
+                }
+                drop(stdin.take());
             }
         }
         std::io::Result::Ok(())
@@ -338,26 +330,8 @@ enum ExecOutput {
     },
 }
 
-async fn drive_pty_output<W: AsyncWrite + Unpin>(
-    output: AsyncFile,
-    writer: &Mutex<W>,
-    process: &ProcessGroup,
-    cancel: &CancellationToken,
-) -> i32 {
-    let output_ok = tokio::select! {
-        biased;
-        () = cancel.cancelled() => false,
-        output_ok = pty_output(output, writer, cancel.clone()) => output_ok,
-    };
-    if !output_ok {
-        process.kill();
-    }
-    process.wait().await
-}
-
-async fn drive_pipe_output<W: AsyncWrite + Unpin>(
-    stdout: AsyncFile,
-    stderr: AsyncFile,
+async fn drive_output<W: AsyncWrite + Unpin>(
+    output: ExecOutput,
     writer: &Mutex<W>,
     process: &ProcessGroup,
     cancel: &CancellationToken,
@@ -369,16 +343,23 @@ async fn drive_pipe_output<W: AsyncWrite + Unpin>(
         let _ = exited_tx.send(true);
         status
     });
-    let output = tokio::try_join!(
-        pipe_output(
-            stdout,
-            writer,
-            AgentOutput::Out,
-            exited_rx.clone(),
-            cancel.clone(),
-        ),
-        pipe_output(stderr, writer, AgentOutput::Err, exited_rx, cancel.clone()),
-    );
+    let output = match output {
+        ExecOutput::Pty(output) => {
+            pump_output(output, writer, AgentOutput::Out, true, exited_rx, cancel).await
+        }
+        ExecOutput::Pipes { stdout, stderr } => tokio::try_join!(
+            pump_output(
+                stdout,
+                writer,
+                AgentOutput::Out,
+                false,
+                exited_rx.clone(),
+                cancel
+            ),
+            pump_output(stderr, writer, AgentOutput::Err, false, exited_rx, cancel),
+        )
+        .map(|_| ()),
+    };
     if output.is_err() {
         process.kill();
     }
@@ -390,16 +371,22 @@ async fn drive_pipe_output<W: AsyncWrite + Unpin>(
     if output.is_ok() { code } else { EXEC_NOT_RUN }
 }
 
-async fn pipe_output<R: AsyncRead + Unpin>(
+async fn pump_output<R: AsyncRead + Unpin>(
     mut source: R,
     writer: &Mutex<impl AsyncWrite + Unpin>,
     wrap: fn(Vec<u8>) -> AgentOutput,
+    is_tty: bool,
     mut exited: watch::Receiver<bool>,
-    cancel: CancellationToken,
+    cancel: &CancellationToken,
 ) -> Result<(), ()> {
     let mut deadline = None;
     let mut bytes = [0; 8192];
     loop {
+        if let Some(deadline) = deadline
+            && deadline <= tokio::time::Instant::now()
+        {
+            return Ok(());
+        }
         let read = async {
             match deadline {
                 Some(deadline) => tokio::time::timeout_at(deadline, source.read(&mut bytes))
@@ -408,44 +395,29 @@ async fn pipe_output<R: AsyncRead + Unpin>(
                 None => source.read(&mut bytes).await,
             }
         };
-        tokio::select! {
+        let result = tokio::select! {
             biased;
             () = cancel.cancelled() => return Err(()),
-            result = read => match result {
-                Ok(0) => return Ok(()),
-                Ok(count) if !write_output(writer, wrap(bytes[..count].to_vec()), &cancel).await => return Err(()),
-                Ok(_) => {},
-                Err(_) => return Err(()),
-            },
             result = exited.changed(), if deadline.is_none() => {
                 if result.is_err() || *exited.borrow() {
                     deadline = Some(tokio::time::Instant::now() + crate::hooks::OUTPUT_DRAIN_GRACE);
                 }
+                continue;
             },
-        }
-    }
-}
-
-async fn pty_output<R: AsyncRead + Unpin>(
-    mut source: R,
-    writer: &Mutex<impl AsyncWrite + Unpin>,
-    cancel: CancellationToken,
-) -> bool {
-    let mut bytes = [0; 8192];
-    loop {
-        match source.read(&mut bytes).await {
-            Ok(0) => return true,
-            Err(error) if error.raw_os_error() == Some(rustix::io::Errno::IO.raw_os_error()) => {
-                return true;
-            }
-            Ok(count)
-                if !write_output(writer, AgentOutput::Out(bytes[..count].to_vec()), &cancel)
-                    .await =>
+            result = read => result,
+        };
+        match result {
+            Ok(0) => return Ok(()),
+            Err(error)
+                if is_tty && error.raw_os_error() == Some(rustix::io::Errno::IO.raw_os_error()) =>
             {
-                return false;
+                return Ok(());
+            }
+            Ok(count) if !write_output(writer, wrap(bytes[..count].to_vec()), cancel).await => {
+                return Err(());
             }
             Ok(_) => {}
-            Err(_) => return false,
+            Err(_) => return Err(()),
         }
     }
 }
@@ -577,6 +549,111 @@ mod tests {
         .await;
         assert_eq!((out, err, code), (b"done".to_vec(), b"err".to_vec(), 7));
         assert!(started.elapsed() < Duration::from_secs(4));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tty_exec_finishes_when_a_descendant_keeps_output_open() {
+        let started = std::time::Instant::now();
+        let (out, err, code) = run_exec_request(
+            &["sh", "-c", "trap '' HUP; sleep 6 & printf done; exit 7"],
+            true,
+            b"",
+            BTreeMap::new(),
+        )
+        .await;
+        assert_eq!((out, err, code), (b"done".to_vec(), Vec::new(), 7));
+        assert!(started.elapsed() < Duration::from_secs(4));
+    }
+
+    #[tokio::test]
+    async fn output_grace_preserves_frames_with_continuously_ready_source() {
+        let (sender, mut receiver) = tokio::io::duplex(1024);
+        let reader = tokio::spawn(async move {
+            let mut frames = 0;
+            while let Some(frame) = read_frame::<AgentOutput>(&mut receiver).await.unwrap() {
+                assert_eq!(frame, AgentOutput::Out(vec![b'x'; 8192]));
+                frames += 1;
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+            frames
+        });
+        let (_, exited) = watch::channel(true);
+        let started = std::time::Instant::now();
+        let writer = Mutex::new(sender);
+        tokio::time::timeout(
+            Duration::from_secs(4),
+            pump_output(
+                tokio::io::repeat(b'x'),
+                &writer,
+                AgentOutput::Out,
+                true,
+                exited,
+                &CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("continuously ready output ignored the child's exit")
+        .unwrap();
+        drop(writer);
+        assert!(reader.await.unwrap() > 1);
+        assert!(started.elapsed() < Duration::from_secs(4));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pipe_exec_discards_closed_stdin_and_keeps_monitoring_host_disconnect() {
+        for disconnect_host in [false, true] {
+            let command = if disconnect_host {
+                "exec 0<&-; printf ready; exec sleep 600"
+            } else {
+                "exec 0<&-; printf ready; sleep .1; printf done; exit 7"
+            };
+            let request = ExecRequest {
+                argv: vec!["sh".to_string(), "-c".to_string(), command.to_string()],
+                as_root: false,
+                tty: None,
+                workdir: None,
+                env: BTreeMap::new(),
+            };
+            let (mut client, server) = UnixStream::pair().unwrap();
+            client.set_read_timeout(Some(HARNESS_TIMEOUT)).unwrap();
+            let mut agent = tokio::spawn(serve_exec(
+                crate::into_async_file(server).unwrap(),
+                true,
+                CancellationToken::new(),
+            ));
+            client
+                .write_all(&terra_protocol::encode_frame(&request).unwrap())
+                .unwrap();
+            assert_eq!(
+                terra_protocol::read_frame::<AgentOutput>(&mut client).unwrap(),
+                Some(AgentOutput::Out(b"ready".to_vec()))
+            );
+            for bytes in [b"ignored first".as_slice(), b"ignored second".as_slice()] {
+                client
+                    .write_all(
+                        &terra_protocol::encode_frame(&ClientInput::Keys(bytes.to_vec())).unwrap(),
+                    )
+                    .unwrap();
+            }
+            if disconnect_host {
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), &mut agent)
+                        .await
+                        .is_err()
+                );
+                drop(client);
+                tokio::time::timeout(Duration::from_secs(3), agent)
+                    .await
+                    .expect("closed child stdin disabled host-disconnect cleanup")
+                    .unwrap();
+            } else {
+                assert_eq!(
+                    read_exec_output(&mut client),
+                    (b"done".to_vec(), Vec::new(), 7)
+                );
+                agent.await.unwrap();
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

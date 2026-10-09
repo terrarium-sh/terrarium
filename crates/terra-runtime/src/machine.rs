@@ -2,11 +2,13 @@
 
 pub use crate::component::vmm::bindings::machine::{Device, DeviceKind};
 pub use crate::component::vmm::bindings::virtualization::Architecture;
-use crate::component::vmm::bindings::virtualization::Config;
 
 #[derive(Clone)]
 pub struct MachineConfig {
-    config: Config,
+    architecture: Architecture,
+    ram_bytes: u64,
+    vcpus: u8,
+    devices: Vec<Device>,
 }
 
 impl MachineConfig {
@@ -38,38 +40,36 @@ impl MachineConfig {
             "device count outside VM grant"
         );
         Ok(Self {
-            config: Config {
-                architecture,
-                ram_bytes,
-                vcpus,
-                devices,
-            },
+            architecture,
+            ram_bytes,
+            vcpus,
+            devices,
         })
     }
 
     #[must_use]
     pub fn architecture(&self) -> Architecture {
-        self.config.architecture
+        self.architecture
     }
 
     #[must_use]
     pub fn ram_bytes(&self) -> u64 {
-        self.config.ram_bytes
+        self.ram_bytes
     }
 
     #[must_use]
     pub fn vcpus(&self) -> u8 {
-        self.config.vcpus
+        self.vcpus
     }
 
     #[must_use]
     pub fn devices(&self) -> &[Device] {
-        &self.config.devices
+        &self.devices
     }
 
     #[must_use]
     pub(crate) fn is_valid_cpu(&self, id: u8) -> bool {
-        id < self.config.vcpus
+        id < self.vcpus
     }
 
     pub(crate) fn device_slot(&self, kind: DeviceKind, ordinal: usize) -> wasmtime::Result<u8> {
@@ -105,10 +105,6 @@ impl MachineConfig {
             },
             irq_routes: self.devices().iter().map(|device| device.irq).collect(),
         }
-    }
-
-    pub(crate) fn into_component_config(self) -> Config {
-        self.config
     }
 }
 
@@ -213,7 +209,7 @@ fn x86_layout(
         return Err(LayoutError::RamOverflow);
     }
     let base_count = block_count
-        .checked_add(2)
+        .checked_add(1)
         .ok_or(LayoutError::TooManyDevices)?;
     let count = base_count
         .checked_add(share_count)
@@ -225,8 +221,6 @@ fn x86_layout(
             let kind = if slot < block_count {
                 DeviceKind::Block
             } else if slot == block_count {
-                DeviceKind::Net
-            } else if slot == block_count + 1 {
                 DeviceKind::Vsock
             } else if slot < base_count + share_count {
                 DeviceKind::Fs
@@ -239,8 +233,7 @@ fn x86_layout(
                     1 => 12,
                     _ => VOLUME_IRQS[(slot - 2) % VOLUME_IRQS.len()],
                 },
-                DeviceKind::Net => 13,
-                DeviceKind::Vsock => 14,
+                DeviceKind::Vsock => 13,
                 DeviceKind::Memory => 15,
                 DeviceKind::Fs => MOUNT_IRQS[(slot - base_count) % MOUNT_IRQS.len()],
             };
@@ -266,7 +259,7 @@ fn arm_layout(
 ) -> Result<Layout, LayoutError> {
     let count = block_count
         .checked_add(share_count)
-        .and_then(|count| count.checked_add(3))
+        .and_then(|count| count.checked_add(2))
         .filter(|count| *count <= terra_limits::ARM_MAX_DEVICES)
         .ok_or(LayoutError::TooManyDevices)?;
     if terra_limits::arm_ram_layout(ram_size).is_none() {
@@ -281,8 +274,6 @@ fn arm_layout(
                     DeviceKind::Fs
                 } else if slot == block_count + share_count {
                     DeviceKind::Memory
-                } else if slot == block_count + share_count + 1 {
-                    DeviceKind::Net
                 } else {
                     DeviceKind::Vsock
                 },
@@ -304,6 +295,25 @@ fn arm_layout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_slots_preserve_interrupt_routes() {
+        for architecture in [Architecture::X86, Architecture::Arm] {
+            let layout = build_machine_layout_for(architecture, 8 << 20, 2, 1).unwrap();
+            let config = layout.to_machine_config(2).unwrap();
+            for (index, device) in config.devices().iter().enumerate() {
+                let ordinal = config.devices()[..index]
+                    .iter()
+                    .filter(|earlier| earlier.kind == device.kind)
+                    .count();
+                let slot = config.device_slot(device.kind, ordinal).unwrap();
+                assert_eq!(
+                    config.to_native_config().irq_routes[usize::from(slot)],
+                    device.irq
+                );
+            }
+        }
+    }
 
     #[test]
     fn native_configuration_preserves_the_machine_layout() {
@@ -331,11 +341,10 @@ mod tests {
                 irq_routes: layout.devices().iter().map(|device| device.irq).collect(),
             };
             assert_eq!(config.to_native_config(), expected);
-            let component = config.into_component_config();
-            assert_eq!(component.architecture, architecture);
-            assert_eq!(component.ram_bytes, expected.ram_bytes);
-            assert_eq!(component.vcpus, expected.vcpus);
-            assert_eq!(component.devices, layout.devices());
+            assert_eq!(config.architecture(), architecture);
+            assert_eq!(config.ram_bytes(), expected.ram_bytes);
+            assert_eq!(config.vcpus(), expected.vcpus);
+            assert_eq!(config.devices(), layout.devices());
         }
     }
 
@@ -353,7 +362,6 @@ mod tests {
                 DeviceKind::Block,
                 DeviceKind::Fs,
                 DeviceKind::Memory,
-                DeviceKind::Net,
                 DeviceKind::Vsock,
             ]
         );
@@ -362,8 +370,8 @@ mod tests {
             terra_limits::ARM_VIRTIO_MMIO_BASE
         );
         assert_eq!(
-            layout.devices()[4].irq,
-            terra_limits::ARM_VIRTIO_IRQ_BASE + 4
+            layout.devices()[3].irq,
+            terra_limits::ARM_VIRTIO_IRQ_BASE + 3
         );
         assert_eq!(
             build_machine_layout_for(Architecture::Arm, 0, 0, 0),
@@ -391,30 +399,29 @@ mod tests {
             vec![
                 DeviceKind::Block,
                 DeviceKind::Block,
-                DeviceKind::Net,
                 DeviceKind::Vsock,
                 DeviceKind::Fs,
                 DeviceKind::Memory,
             ]
         );
         assert_eq!(layout.devices()[0].mmio_base, terra_limits::X86_MMIO_BASE);
-        assert_eq!(layout.devices()[5].irq, 15);
+        assert_eq!(layout.devices()[4].irq, 15);
     }
 
     #[test]
     fn fixed_layout_preserves_volume_and_share_capacity() {
         let volumes = build_machine_layout_for(Architecture::X86, 512 << 20, 34, 0).unwrap();
-        assert_eq!(volumes.devices().len(), terra_limits::X86_MAX_DEVICES);
+        assert_eq!(volumes.devices().len(), terra_limits::X86_MAX_DEVICES - 1);
         assert_eq!(volumes.devices()[2].irq, 20);
         assert_eq!(volumes.devices()[33].irq, 21);
-        assert_eq!(volumes.devices()[34].kind, DeviceKind::Net);
-        assert_eq!(volumes.devices()[36].kind, DeviceKind::Memory);
+        assert_eq!(volumes.devices()[34].kind, DeviceKind::Vsock);
+        assert_eq!(volumes.devices()[35].kind, DeviceKind::Memory);
 
         let shares = build_machine_layout_for(Architecture::X86, 512 << 20, 2, 32).unwrap();
-        assert_eq!(shares.devices().len(), terra_limits::X86_MAX_DEVICES);
-        assert_eq!(shares.devices()[4].irq, 17);
-        assert_eq!(shares.devices()[35].irq, 18);
-        assert_eq!(shares.devices()[36].kind, DeviceKind::Memory);
+        assert_eq!(shares.devices().len(), terra_limits::X86_MAX_DEVICES - 1);
+        assert_eq!(shares.devices()[3].irq, 17);
+        assert_eq!(shares.devices()[34].irq, 18);
+        assert_eq!(shares.devices()[35].kind, DeviceKind::Memory);
     }
 
     #[test]
@@ -445,7 +452,7 @@ mod tests {
     }
 
     #[test]
-    fn volume_blocks_precede_network_and_vsock() {
+    fn volume_blocks_precede_vsock() {
         let layout = build_machine_layout_for(Architecture::X86, 512 << 20, 10, 0).unwrap();
         let kinds = layout
             .devices()
@@ -456,7 +463,7 @@ mod tests {
             kinds,
             [
                 vec![DeviceKind::Block; 10],
-                vec![DeviceKind::Net, DeviceKind::Vsock, DeviceKind::Memory],
+                vec![DeviceKind::Vsock, DeviceKind::Memory],
             ]
             .concat()
         );

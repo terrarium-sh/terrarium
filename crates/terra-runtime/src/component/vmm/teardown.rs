@@ -109,7 +109,7 @@ impl NativeTeardown {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let grants = state.grants_mut()?;
         wasmtime::ensure!(
-            grants.devices.len() < crate::box_runtime::MAX_BOX_COMPONENTS,
+            grants.devices.len() < crate::box_runtime::MAX_BOX_COMPONENTS + 1,
             "box has too many device shutdown grants"
         );
         grants.devices.push(device);
@@ -209,25 +209,40 @@ fn run_teardown(mut grants: TeardownGrants) -> Outcome {
 }
 
 pub struct DeviceShutdown {
-    pub(super) kind: DeviceKind,
+    kind: ShutdownKind,
     close: Close,
+}
+
+enum ShutdownKind {
+    Device(DeviceKind),
+    Role(crate::box_runtime::ComponentRole),
 }
 
 impl DeviceShutdown {
     pub fn new(kind: DeviceKind, close: impl Future<Output = Outcome> + Send + 'static) -> Self {
         Self {
-            kind,
+            kind: ShutdownKind::Device(kind),
+            close: Box::pin(close),
+        }
+    }
+
+    pub(crate) fn for_role(
+        role: crate::box_runtime::ComponentRole,
+        close: impl Future<Output = Outcome> + Send + 'static,
+    ) -> Self {
+        Self {
+            kind: ShutdownKind::Role(role),
             close: Box::pin(close),
         }
     }
 
     pub(crate) fn order(&self) -> u8 {
         match self.kind {
-            DeviceKind::Memory => 0,
-            DeviceKind::Fs => 1,
-            DeviceKind::Net => 2,
-            DeviceKind::Vsock => 3,
-            DeviceKind::Block => 4,
+            ShutdownKind::Device(DeviceKind::Memory) => 0,
+            ShutdownKind::Device(DeviceKind::Fs) => 1,
+            ShutdownKind::Role(crate::box_runtime::ComponentRole::Agent) => 2,
+            ShutdownKind::Device(DeviceKind::Vsock) => 3,
+            ShutdownKind::Device(DeviceKind::Block) => 4,
         }
     }
 
@@ -319,40 +334,44 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_finishes_every_cleanup_in_order_and_keeps_the_first_error() {
+        use crate::box_runtime::ComponentRole;
+
         let completed = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let first = Arc::clone(&completed);
-        let second = Arc::clone(&completed);
         let interrupts = Arc::clone(&completed);
         let teardown = NativeTeardown::new();
-        teardown
-            .install_device(DeviceShutdown::new(DeviceKind::Block, async move {
-                let mut completed = second.lock().unwrap();
-                assert_eq!(*completed, ["memory"]);
-                completed.push("block");
-                Err("second failure".to_owned())
-            }))
-            .unwrap();
-        teardown
-            .install_device(DeviceShutdown::new(DeviceKind::Memory, async move {
-                first.lock().unwrap().push("memory");
-                Err("first failure".to_owned())
-            }))
-            .unwrap();
+        for (kind, name) in [
+            (ShutdownKind::Device(DeviceKind::Block), "block"),
+            (ShutdownKind::Device(DeviceKind::Vsock), "vsock"),
+            (ShutdownKind::Role(ComponentRole::Agent), "agent"),
+            (ShutdownKind::Device(DeviceKind::Fs), "fs"),
+            (ShutdownKind::Device(DeviceKind::Memory), "memory"),
+        ] {
+            let completed = Arc::clone(&completed);
+            let close = async move {
+                completed.lock().unwrap().push(name);
+                Err(format!("{name} failure"))
+            };
+            let shutdown = match kind {
+                ShutdownKind::Device(device) => DeviceShutdown::new(device, close),
+                ShutdownKind::Role(role) => DeviceShutdown::for_role(role, close),
+            };
+            teardown.install_device(shutdown).unwrap();
+        }
         teardown
             .install_interrupts(Box::pin(async move {
                 let mut completed = interrupts.lock().unwrap();
-                assert_eq!(*completed, ["memory", "block"]);
+                assert_eq!(*completed, ["memory", "fs", "agent", "vsock", "block"]);
                 completed.push("interrupts");
                 Err("interrupt failure".to_owned())
             }))
             .unwrap();
         assert_eq!(
             teardown.wait_until_finished().await.unwrap_err(),
-            "first failure"
+            "memory failure"
         );
         assert_eq!(
             *completed.lock().unwrap(),
-            ["memory", "block", "interrupts"]
+            ["memory", "fs", "agent", "vsock", "block", "interrupts"]
         );
     }
 

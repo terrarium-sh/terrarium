@@ -77,32 +77,16 @@ pub async fn connect_to_agent(
             Err(_) => last_connect_error = Some("connection attempt timed out".to_owned()),
             Ok(Err(error)) => last_connect_error = Some(error.to_string()),
             Ok(Ok(mut stream)) => {
-                let mut magic = [0];
+                let mut hello = [0; protocol::AGENT_HELLO.len()];
                 if tokio::time::timeout(
                     AGENT_HELLO_WAIT_TIMEOUT,
-                    tokio::io::AsyncReadExt::read_exact(&mut stream, &mut magic),
+                    tokio::io::AsyncReadExt::read_exact(&mut stream, &mut hello),
                 )
                 .await
                 .is_ok_and(|result| result.is_ok())
                 {
                     anyhow::ensure!(
-                        magic[0] == protocol::AGENT_HELLO[0],
-                        "the agent in {bx} does not speak this terra's protocol - \
-                     `terra {name} stop` and start it again on this build",
-                        name = bx.get_name()
-                    );
-                    let mut version = [0];
-                    if tokio::time::timeout(
-                        AGENT_HELLO_WAIT_TIMEOUT,
-                        tokio::io::AsyncReadExt::read_exact(&mut stream, &mut version),
-                    )
-                    .await
-                    .is_err()
-                    {
-                        continue;
-                    }
-                    anyhow::ensure!(
-                        version[0] == protocol::AGENT_PROTOCOL_VERSION,
+                        hello == protocol::AGENT_HELLO,
                         "the agent in {bx} does not speak this terra's protocol - \
                      `terra {name} stop` and start it again on this build",
                         name = bx.get_name()
@@ -386,30 +370,40 @@ fn input_is_ready(fd: impl AsFd) -> bool {
 
 #[allow(unsafe_code)]
 #[cfg(windows)]
-fn input_is_ready(_stdin: &std::io::Stdin) -> bool {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_PIPE, GetFileType};
+fn input_is_ready(stdin: &impl std::os::windows::io::AsRawHandle) -> bool {
+    use windows_sys::Win32::Foundation::{
+        ERROR_BROKEN_PIPE, ERROR_PIPE_NOT_CONNECTED, GetLastError,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_DISK, FILE_TYPE_PIPE, GetFileType};
     use windows_sys::Win32::System::Console::GetNumberOfConsoleInputEvents;
     use windows_sys::Win32::System::Pipes::PeekNamedPipe;
 
-    let handle = std::io::stdin().as_raw_handle();
+    let handle = stdin.as_raw_handle();
     // SAFETY: stdin owns this handle for the duration of the probe and all output pointers are
     // writable locals.
     unsafe {
-        if GetFileType(handle) == FILE_TYPE_PIPE {
+        let file_type = GetFileType(handle);
+        if file_type == FILE_TYPE_DISK {
+            return true;
+        }
+        if file_type == FILE_TYPE_PIPE {
             let mut available = 0;
-            return PeekNamedPipe(
+            let succeeded = PeekNamedPipe(
                 handle,
                 std::ptr::null_mut(),
                 0,
                 std::ptr::null_mut(),
                 &raw mut available,
                 std::ptr::null_mut(),
-            ) != 0
-                && available > 0;
+            ) != 0;
+            return if succeeded {
+                available > 0
+            } else {
+                matches!(GetLastError(), ERROR_BROKEN_PIPE | ERROR_PIPE_NOT_CONNECTED)
+            };
         }
         let mut events = 0;
-        GetNumberOfConsoleInputEvents(handle, &raw mut events) != 0 && events > 0
+        GetNumberOfConsoleInputEvents(handle, &raw mut events) == 0 || events > 0
     }
 }
 
@@ -658,7 +652,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn input_readiness_waits_for_a_byte() {
-        let (mut writer, reader) = terra_platform::io::local::LocalStream::pair().unwrap();
+        let (mut writer, reader) = terra_platform::io::local::create_local_pair().unwrap();
         assert!(!input_is_ready(&reader));
         writer.write_all(b"x").unwrap();
         assert!(input_is_ready(&reader));
@@ -667,7 +661,45 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn input_readiness_reports_eof() {
-        let (writer, mut reader) = terra_platform::io::local::LocalStream::pair().unwrap();
+        let (writer, mut reader) = terra_platform::io::local::create_local_pair().unwrap();
+        drop(writer);
+        assert!(input_is_ready(&reader));
+        assert_eq!(reader.read(&mut [0]).unwrap(), 0);
+    }
+
+    #[cfg(windows)]
+    #[allow(unsafe_code)]
+    #[test]
+    fn input_readiness_accepts_redirected_files_and_pipe_eof() {
+        use std::os::windows::io::FromRawHandle;
+        use windows_sys::Win32::System::Pipes::CreatePipe;
+
+        let mut file = tempfile::tempfile().unwrap();
+        assert!(input_is_ready(&file));
+        assert_eq!(file.read(&mut [0]).unwrap(), 0);
+
+        let mut read_handle = std::ptr::null_mut();
+        let mut write_handle = std::ptr::null_mut();
+        // SAFETY: the writable outputs receive two handles owned by the returned files.
+        let (mut reader, mut writer) = unsafe {
+            assert_ne!(
+                CreatePipe(
+                    &raw mut read_handle,
+                    &raw mut write_handle,
+                    std::ptr::null(),
+                    0
+                ),
+                0
+            );
+            (
+                std::fs::File::from_raw_handle(read_handle),
+                std::fs::File::from_raw_handle(write_handle),
+            )
+        };
+        assert!(!input_is_ready(&reader));
+        writer.write_all(b"x").unwrap();
+        assert!(input_is_ready(&reader));
+        assert_eq!(reader.read(&mut [0]).unwrap(), 1);
         drop(writer);
         assert!(input_is_ready(&reader));
         assert_eq!(reader.read(&mut [0]).unwrap(), 0);
@@ -717,31 +749,56 @@ mod tests {
 
     #[tokio::test]
     async fn an_agent_on_a_different_protocol_is_refused() {
+        const { assert!(protocol::AGENT_PROTOCOL_VERSION > 1) };
+        for version in [1, protocol::AGENT_PROTOCOL_VERSION.wrapping_add(1)] {
+            let home = crate::sys::TestHome::new();
+            let bx = BoxRef::resolve(home.get_path(), "dev").unwrap();
+            std::fs::create_dir_all(bx.get_dir()).unwrap();
+            let _lock = bx.lock_run().unwrap();
+            let listener =
+                LocalListener::bind(bx.get_dir().join(crate::state::AGENT_SOCKET)).unwrap();
+            let agent = std::thread::spawn(move || {
+                let (mut conn, _) = listener.accept().unwrap();
+                conn.write_all(&[protocol::AGENT_HELLO[0], version])
+                    .unwrap();
+            });
+
+            let Err(error) =
+                connect_to_agent(&bx, protocol::AgentService::Session, "session", || Ok(())).await
+            else {
+                panic!("accepted incompatible agent version {version}");
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("does not speak this terra's protocol"),
+                "{error}"
+            );
+            agent.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn an_agent_that_closes_during_hello_is_retried() {
         let home = crate::sys::TestHome::new();
         let bx = BoxRef::resolve(home.get_path(), "dev").unwrap();
         std::fs::create_dir_all(bx.get_dir()).unwrap();
-        let _lock = bx.lock_run().unwrap();
         let listener = LocalListener::bind(bx.get_dir().join(crate::state::AGENT_SOCKET)).unwrap();
         let agent = std::thread::spawn(move || {
             let (mut conn, _) = listener.accept().unwrap();
-            conn.write_all(&[
-                protocol::AGENT_HELLO[0],
-                protocol::AGENT_PROTOCOL_VERSION.wrapping_add(1),
-            ])
-            .unwrap();
+            conn.write_all(&protocol::AGENT_HELLO[..1]).unwrap();
         });
-
-        let Err(error) =
-            connect_to_agent(&bx, protocol::AgentService::Session, "session", || Ok(())).await
+        let mut attempts = 0;
+        let Err(error) = connect_to_agent(&bx, protocol::AgentService::Session, "session", || {
+            attempts += 1;
+            anyhow::ensure!(attempts < 2, "connection retried");
+            Ok(())
+        })
+        .await
         else {
-            panic!("accepted incompatible agent");
+            panic!("partial hello must be retried");
         };
-        assert!(
-            error
-                .to_string()
-                .contains("does not speak this terra's protocol"),
-            "{error}"
-        );
+        assert_eq!(error.to_string(), "connection retried");
         agent.join().unwrap();
     }
 

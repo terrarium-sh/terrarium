@@ -6,12 +6,15 @@ package terra:host@0.1.0;
 /// a disk, VM, interrupt line, or foreign resource table.
 interface memory {
     record read-range { offset: u64, len: u64 }
+    record write-range { offset: u64, data: list<u8> }
     /// One bounded guest-physical copy. Offsets and lengths are checked
     /// for arithmetic overflow, mapped RAM regions, holes, and aggregate
     /// batch limits before anything is allocated or copied.
     read: func(offset: u64, len: u64) -> result<list<u8>, memory-error>;
     read-ranges: func(ranges: list<read-range>) -> result<list<u8>, memory-error>;
     write: func(offset: u64, data: list<u8>) -> result<_, memory-error>;
+    /// Validate the whole bounded batch, then write in order with a release fence before each range.
+    write-ranges: func(ranges: list<write-range>) -> result<_, memory-error>;
     address-limit: func() -> u64;
     enum memory-error { out-of-range, too-large, unmapped }
 }
@@ -23,26 +26,10 @@ interface interrupt {
     set-level: func(level: bool);
 }
 
-interface diagnostics {
-    event: func(message: string);
-}
-
 interface device-api {
     use terra:mmio/types@0.1.0.{device-error};
     configure: async func(readonly: bool) -> result<_, device-error>;
     run: async func() -> result<_, device-error>;
-    /// Execute a pre-parsed request for focused component tests.
-    record range {
-        addr: u64,
-        len: u64,
-    }
-    execute: async func(req-type: u32, sector: u64, data: list<range>, status-addr: u64, epoch: u64) -> u8;
-    record completion {
-        status-addr: u64,
-        used-len: u32,
-        status: u8,
-    }
-    execute-chain: async func(head: u16, desc-table: u64, queue-size: u16, epoch: u64) -> result<completion, device-error>;
 }
 
 interface disk {
@@ -57,24 +44,17 @@ interface disk {
     discard: async func(offset: u64, len: u64) -> result<_, disk-error>;
     sync: async func() -> result<_, disk-error>;
     capacity: func() -> u64;
-    enum disk-error { out-of-range, readonly, io, too-large, busy }
-}
-
-world device {
-    import memory;
-    import interrupt;
+    enum disk-error { out-of-range, readonly, io, too-large }
 }
 
 world host-interfaces {
     import memory;
     import interrupt;
-    import diagnostics;
 }
 
 world block-device {
     import memory;
     import interrupt;
-    import diagnostics;
     import disk;
     export device-api;
     export terra:mmio/device@0.1.0;

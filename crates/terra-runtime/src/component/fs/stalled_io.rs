@@ -42,7 +42,9 @@ enum Operation {
     Sync,
     Lookup,
     Stat,
+    MetadataHash,
     ReadDirectory,
+    DirectoryRemoval,
     HostMetadata,
 }
 
@@ -90,9 +92,15 @@ pub(super) fn install_io_gate(
         if matches!(gate.operation, Operation::HostMetadata) {
             return Ok(linker);
         }
+        if matches!(gate.operation, Operation::DirectoryRemoval) {
+            return install_directory_removal_gate(linker, gate);
+        }
         if matches!(
             gate.operation,
-            Operation::Lookup | Operation::Stat | Operation::ReadDirectory
+            Operation::Lookup
+                | Operation::Stat
+                | Operation::MetadataHash
+                | Operation::ReadDirectory
         ) {
             return install_metadata_gate(linker, gate);
         }
@@ -105,8 +113,7 @@ pub(super) fn install_io_gate(
                     move |_accessor, (_descriptor,): (Resource<Descriptor>,)| {
                         let gate = sync_gate.clone();
                         Box::pin(async move {
-                            gate.started.add_permits(1);
-                            gate.release.notified().await;
+                            gate.begin_release_wait().await;
                             Ok((Ok::<(), ErrorCode>(()),))
                         })
                     },
@@ -121,10 +128,9 @@ pub(super) fn install_io_gate(
                     StreamReader<u8>,
                     u64,
                 )| {
-                    let gate = gate.clone();
-                    gate.started.add_permits(1);
+                    let released = gate.begin_release_wait();
                     let completion = FutureReader::new(&mut store, async move {
-                        gate.release.notified().await;
+                        released.await;
                         Ok::<Result<(), ErrorCode>, wasmtime::Error>(Ok(()))
                     })?;
                     Ok((completion,))
@@ -157,6 +163,37 @@ pub(super) fn install_io_gate(
             },
         )?;
     }
+    Ok(linker)
+}
+
+fn install_directory_removal_gate(
+    mut linker: Linker<crate::box_runtime::store::StoreState<FsHost>>,
+    gate: Arc<IoGate>,
+) -> wasmtime::Result<Linker<crate::box_runtime::store::StoreState<FsHost>>> {
+    use wasmtime_wasi::filesystem::{WasiFilesystem, WasiFilesystemView as _};
+    use wasmtime_wasi::p3::bindings::filesystem::types::HostDescriptorWithStore as _;
+    linker
+        .instance("wasi:filesystem/types@0.3.0")?
+        .func_wrap_concurrent(
+            "[method]descriptor.remove-directory-at",
+            move |accessor, (descriptor, path): (Resource<Descriptor>, String)| {
+                let gate = gate.clone();
+                Box::pin(async move {
+                    if gate.armed.swap(false, Ordering::AcqRel) {
+                        return Ok((Err(ErrorCode::Access),));
+                    }
+                    let wasi = accessor.with_getter::<WasiFilesystem>(
+                        crate::box_runtime::store::StoreState::<FsHost>::filesystem,
+                    );
+                    Ok((
+                        match WasiFilesystem::remove_directory_at(&wasi, descriptor, path).await {
+                            Ok(()) => Ok(()),
+                            Err(error) => Err(error.downcast()?),
+                        },
+                    ))
+                })
+            },
+        )?;
     Ok(linker)
 }
 
@@ -197,18 +234,38 @@ fn install_metadata_gate(
                     })
                 },
             )?;
+    } else if matches!(gate.operation, Operation::MetadataHash) {
+        linker
+            .instance("wasi:filesystem/types@0.3.0")?
+            .func_wrap_concurrent(
+                "[method]descriptor.metadata-hash",
+                move |accessor, (descriptor,): (Resource<Descriptor>,)| {
+                    let gate = gate.clone();
+                    Box::pin(async move {
+                        gate.wait_if_armed().await;
+                        let wasi = accessor.with_getter::<WasiFilesystem>(
+                            wasmtime_wasi::filesystem::WasiFilesystemView::filesystem,
+                        );
+                        Ok((
+                            match WasiFilesystem::metadata_hash(&wasi, descriptor).await {
+                                Ok(value) => Ok(value),
+                                Err(error) => Err(error.downcast()?),
+                            },
+                        ))
+                    })
+                },
+            )?;
     } else {
         linker.instance("wasi:filesystem/types@0.3.0")?.func_wrap(
             "[method]descriptor.read-directory",
             move |mut store, (_descriptor,): (Resource<Descriptor>,)| {
-                let gate = gate.clone();
-                gate.started.add_permits(1);
+                let released = gate.begin_release_wait();
                 let stream = StreamReader::new(
                     &mut store,
                     Vec::<wasmtime_wasi::p3::bindings::filesystem::types::DirectoryEntry>::new(),
                 )?;
                 let completion = FutureReader::new(&mut store, async move {
-                    gate.release.notified().await;
+                    released.await;
                     Ok::<Result<(), ErrorCode>, wasmtime::Error>(Ok(()))
                 })?;
                 Ok(((stream, completion),))
@@ -219,6 +276,12 @@ fn install_metadata_gate(
 }
 
 impl IoGate {
+    fn begin_release_wait(&self) -> tokio::sync::futures::OwnedNotified {
+        let released = self.release.clone().notified_owned();
+        self.started.add_permits(1);
+        released
+    }
+
     pub(super) fn wait_on_descriptor_drop(&self) {
         if self.count_blocked_drops.load(Ordering::Acquire) {
             self.drop_started.add_permits(1);
@@ -240,8 +303,7 @@ impl IoGate {
 
     async fn wait_if_armed(&self) {
         if self.armed.swap(false, Ordering::AcqRel) {
-            self.started.add_permits(1);
-            self.release.notified().await;
+            self.begin_release_wait().await;
         }
     }
 }
@@ -323,12 +385,11 @@ impl Mounted {
         let ram = GuestRam::new(1024 * 1024).unwrap();
         let engine = device_engine().unwrap();
         let component = Component::new(&engine, crate::test_fixtures::wasm::FS).unwrap();
-        let mmio = Component::new(&engine, crate::test_fixtures::wasm::MMIO).unwrap();
         let mut host =
             FsHost::with_resource_capacity(DeviceContext::with_ram(ram.clone()), grant, capacity);
         host.io_gate = Some(gate);
         let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).unwrap();
-        runtime.initialize_mmio(&mmio).await.unwrap();
+        runtime.initialize_mmio().unwrap();
         let channel = super::register_device(
             &mut runtime,
             host,
@@ -436,9 +497,23 @@ impl Mounted {
     }
 
     async fn request(&mut self, opcode: u32, node: u64, body: &[u8]) -> Vec<u8> {
+        self.request_with_error(opcode, node, body, 0).await
+    }
+
+    async fn request_with_error(
+        &mut self,
+        opcode: u32,
+        node: u64,
+        body: &[u8],
+        expected_error: i32,
+    ) -> Vec<u8> {
         let target = self.submit(self.request_head, opcode, node, body);
         let response = self.receive(target).await;
-        assert_eq!(&response[4..8], &[0; 4]);
+        assert_eq!(
+            i32::from_le_bytes(response[4..8].try_into().unwrap()),
+            expected_error,
+            "FUSE opcode {opcode} on node {node}"
+        );
         response
     }
 
@@ -509,6 +584,38 @@ async fn mount_with_registration(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn cached_inode_paths_preserve_open_file_identity() {
+    let (root, mut mounted, _gate) = mount_with_operation(Operation::Write).await;
+    let (node, handle) = mounted.open(b"slow\0").await;
+    let mut link = node.to_le_bytes().to_vec();
+    link.extend_from_slice(b"alias\0");
+    mounted.request(13, 1, &link).await;
+    mounted.request(1, 1, b"alias\0").await;
+    mounted.request_with_error(10, 1, b"slow\0", 0).await;
+    assert!(!root.path().join("slow").exists());
+    link.truncate(8);
+    link.extend_from_slice(b"survivor\0");
+    mounted.request(13, 1, &link).await;
+    assert_eq!(
+        std::fs::read(root.path().join("survivor")).unwrap(),
+        b"slow"
+    );
+
+    let mut rename = 1_u64.to_le_bytes().to_vec();
+    rename.extend_from_slice(b"fast\0alias\0");
+    mounted.request_with_error(12, 1, &rename, 0).await;
+    link.truncate(8);
+    link.extend_from_slice(b"replacement-link\0");
+    mounted.request_with_error(13, 1, &link, -2).await;
+    assert!(!root.path().join("replacement-link").exists());
+    assert_eq!(std::fs::read(root.path().join("alias")).unwrap(), b"fast");
+    let response = mounted.request(15, node, &read_body(handle, 0)).await;
+    assert_eq!(&response[16..], b"s");
+    mounted.channel.close().unwrap();
+    mounted.runtime.abort_and_join().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 /// Native blocking reads may outlive their WASI readers; close must finish before the read is released.
 async fn stalled_read_allows_other_io_events_cancellation_and_shutdown() {
     let (root, mut mounted, gate) = mount().await;
@@ -524,6 +631,8 @@ async fn stalled_read_allows_other_io_events_cancellation_and_shutdown() {
         .request(15, fast_node, &read_body(fast_handle, 1))
         .await;
     assert_eq!(&fast[16..], &[9]);
+    mounted.request(3, slow_node, &[]).await;
+    mounted.request(1, 1, b"slow\0").await;
     let notification = mounted.submit(4, 4096, 1, &[]);
     std::fs::write(root.path().join("changed"), "new").unwrap();
     for _ in 0..32 {
@@ -617,7 +726,9 @@ async fn stalled_writes_and_flushes_do_not_block_shutdown() {
             Operation::Read
             | Operation::Lookup
             | Operation::Stat
+            | Operation::MetadataHash
             | Operation::ReadDirectory
+            | Operation::DirectoryRemoval
             | Operation::HostMetadata => {
                 unreachable!()
             }
@@ -661,10 +772,26 @@ async fn stalled_writes_and_flushes_do_not_block_shutdown() {
     }
 }
 
+/// Announced gate waits retain a broadcast release before either future's first poll.
+#[tokio::test(flavor = "multi_thread")]
+async fn announced_gate_waits_keep_release_before_first_poll() {
+    let (_root, mounted, gate) = mount_with_operation(Operation::Sync).await;
+    let releases = [gate.begin_release_wait(), gate.begin_release_wait()];
+    gate.started.try_acquire_many(2).unwrap().forget();
+    gate.release.notify_waiters();
+    for released in releases {
+        tokio::pin!(released);
+        assert!(futures_util::poll!(released).is_ready());
+    }
+    mounted.channel.close().unwrap();
+    mounted.runtime.abort_and_join().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn close_waits_for_responsive_flush() {
     let (_root, mut mounted, gate) = mount_with_operation(Operation::Sync).await;
     mounted.open_with_flags(b"slow\0", 2).await;
+    mounted.open_with_flags(b"fast\0", 2).await;
     let channel = mounted.channel.clone();
     let close = tokio::task::spawn_blocking(move || channel.close());
     tokio::time::timeout(Duration::from_secs(3), gate.started.acquire())
@@ -672,8 +799,13 @@ async fn close_waits_for_responsive_flush() {
         .unwrap()
         .unwrap()
         .forget();
+    tokio::time::timeout(Duration::from_secs(3), gate.started.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
     assert!(!close.is_finished());
-    gate.release.notify_one();
+    gate.release.notify_waiters();
     close.await.unwrap().unwrap();
     mounted.runtime.abort_and_join().await;
 }
@@ -692,7 +824,12 @@ async fn stalled_metadata_preserves_other_io_events_reset_and_close() {
                 let handle = u64::from_le_bytes(opened[16..24].try_into().unwrap());
                 (28, 1, read_body(handle, 0))
             }
-            Operation::Read | Operation::Write | Operation::Sync | Operation::HostMetadata => {
+            Operation::Read
+            | Operation::Write
+            | Operation::Sync
+            | Operation::MetadataHash
+            | Operation::DirectoryRemoval
+            | Operation::HostMetadata => {
                 unreachable!()
             }
         };
@@ -730,7 +867,7 @@ async fn stalled_metadata_preserves_other_io_events_reset_and_close() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn stalled_event_resolution_preserves_requests_and_cancellation() {
-    let (root, mut mounted, gate) = mount_with_operation(Operation::Stat).await;
+    let (root, mut mounted, gate) = mount_with_operation(Operation::MetadataHash).await;
     let (node, handle) = mounted.open(b"fast\0").await;
     gate.armed.store(true, Ordering::Release);
     let notification = mounted.submit(4, 4096, 1, &[]);
@@ -810,6 +947,36 @@ async fn blocked_native_metadata_does_not_block_the_worker() {
     mounted.request(4097, 1, &[]).await;
     mounted.channel.close().unwrap();
     drop(release);
+    mounted.runtime.abort_and_join().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cached_directory_removal_waits_for_its_descriptor_without_stalling_requests() {
+    let (root, mut mounted, gate) = mount_with_operation(Operation::DirectoryRemoval).await;
+    std::fs::create_dir(root.path().join("directory")).unwrap();
+    mounted.request(1, 1, b"directory\0").await;
+    let (release, blocked) = std::sync::mpsc::channel();
+    *gate.blocked_drop.lock().unwrap() = Some(blocked);
+    gate.count_blocked_drops.store(true, Ordering::Release);
+    gate.armed.store(true, Ordering::Release);
+    let removal = mounted.submit(0, 11, 1, b"directory\0");
+    tokio::time::timeout(Duration::from_secs(3), gate.drop_started.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    assert!(root.path().join("directory").is_dir());
+    let getattr = mounted.submit(4, 3, 1, &[]);
+    assert_eq!(&mounted.receive(getattr).await[4..8], &[0; 4]);
+    assert!(
+        removal
+            .read_reply(&BoundedMemory::new(&mounted.ram))
+            .is_none()
+    );
+    drop(release);
+    assert_eq!(&mounted.receive(removal).await[4..8], &[0; 4]);
+    assert!(!root.path().join("directory").exists());
+    mounted.channel.close().unwrap();
     mounted.runtime.abort_and_join().await;
 }
 

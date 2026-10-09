@@ -10,7 +10,6 @@ pub(crate) mod virtualization;
 
 pub use boot::BootEntry;
 pub use native_task::VcpuReaper;
-pub(crate) use vcpu::EXIT_TIMEOUT;
 pub use vcpu::{NativeVcpu, Vcpu};
 pub use virtualization::{MachineHandle, PreparedMachine, RamGrant, StartedVcpus, VirtualMachine};
 
@@ -83,7 +82,7 @@ impl FailureObservation {
 
 pub(crate) struct VmmInstance {
     pub(crate) lifecycle_loop: crate::box_runtime::ComponentLoop,
-    pub(crate) machine: exports::terra::mmio::machine::Guest,
+    pub(crate) machine: exports::terra::vmm::machine::Guest,
     pub(crate) failure: Arc<Mutex<Option<String>>>,
 }
 
@@ -120,8 +119,8 @@ impl BoxRuntime {
         self.store.data_mut().mmio_client = Some(mmio.client());
         let linker = vmm_component_linker(self.store.engine())?;
         let instance = Vmm::instantiate_async(&mut self.store, component, &linker).await?;
-        let machine = instance.terra_mmio_machine();
-        let lifecycle_bindings = instance.terra_mmio_lifecycle();
+        let machine = instance.terra_vmm_machine();
+        let lifecycle_bindings = instance.terra_vmm_lifecycle();
         let lifecycle_loop = lifecycle::create_component_loop(
             lifecycle_bindings.func_run(),
             self.lifecycle_notifier(),

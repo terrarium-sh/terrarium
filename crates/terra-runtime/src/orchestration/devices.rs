@@ -21,13 +21,18 @@ pub(crate) fn assemble_devices(
         input,
         bind_interrupt(DeviceKind::Memory, 0)?,
     )?;
-    network(
+    let (streams, agent_endpoint) = crate::component::vsock::streams::FrontendStreams::new();
+    agent(runtime, input, agent_endpoint)?;
+    crate::component::vsock::register_device(
         runtime,
-        ram.clone(),
-        input,
-        bind_interrupt(DeviceKind::Net, 0)?,
-    )?;
-    vsock(runtime, ram, input, bind_interrupt(DeviceKind::Vsock, 0)?)?;
+        ram,
+        input.artifacts.vsock(),
+        streams,
+        input.network_backend.take(),
+        input.port_mappings.clone(),
+        bind_interrupt(DeviceKind::Vsock, 0)?,
+    )
+    .map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -77,32 +82,6 @@ fn blocks(
         )
         .map_err(|error| error.to_string())?;
     }
-    Ok(())
-}
-
-fn network(
-    runtime: &mut crate::box_runtime::BoxRuntime,
-    ram: impl Into<crate::component::vmm::RamGrant> + Send,
-    input: &VmInput,
-    interrupt: crate::component::InterruptCallback,
-) -> Result<(), String> {
-    use crate::component::context::DeviceContext;
-    let component = input
-        .artifacts
-        .network()
-        .deserialize(runtime.store.engine())
-        .map_err(|error| error.to_string())?;
-    let ram = ram.into();
-    crate::component::network::register_device_with_host_factory(
-        runtime,
-        move || Ok(DeviceContext::with_ram(ram.resolve()?)),
-        &component,
-        input.network_policy.clone(),
-        input.port_mappings.clone(),
-        crate::component::network::GuestNetworkConfig::default(),
-        interrupt,
-    )
-    .map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -184,21 +163,19 @@ fn memory(
     Ok(())
 }
 
-fn vsock(
+fn agent(
     runtime: &mut crate::box_runtime::BoxRuntime,
-    ram: impl Into<crate::component::vmm::RamGrant> + Send,
     input: &mut VmInput,
-    interrupt: crate::component::InterruptCallback,
+    endpoint: crate::component::vsock::streams::StreamEndpoint,
 ) -> Result<(), String> {
-    crate::component::vsock::VsockChannel::from_trusted_artifact(
+    crate::component::agent::Agent::from_trusted_artifact(
         runtime,
-        ram,
-        input.artifacts.vsock(),
+        endpoint,
+        input.artifacts.agent(),
         std::mem::take(&mut input.plan),
         input.listener.take(),
         input.control.take(),
         input.diagnostics.take(),
-        interrupt,
     )
     .map_err(|error| error.to_string())?;
     Ok(())
@@ -214,27 +191,18 @@ mod tests {
         assert_eq!(super::filesystem_resource_capacity_for(128, 32), 0);
     }
 
-    struct DenyAll;
-
-    impl crate::component::network::Policy for DenyAll {
-        fn allows(&self, _: std::net::IpAddr, _: Option<u16>) -> bool {
-            false
-        }
-    }
-
     #[tokio::test(flavor = "multi_thread")]
     async fn empty_shares_do_not_load_the_filesystem_artifact() {
         #[allow(unsafe_code)]
         let artifacts = unsafe {
             crate::TrustedArtifacts::new(
                 include_bytes!("../../../../build/terra-block-component.cwasm"),
-                include_bytes!("../../../../build/terra-vsock-component.cwasm"),
-                include_bytes!("../../../../build/terra-network-component.cwasm"),
+                include_bytes!("../../../../build/terra-agent-component.cwasm"),
+                include_bytes!("../../../../build/terra-vsock-frontend-component.cwasm"),
                 include_bytes!("../../../../build/terra-block-component.cwasm"),
                 include_bytes!("../../../../build/terra-mem-component.cwasm"),
                 include_bytes!("../../../../build/terra-boot-component.cwasm"),
                 include_bytes!("../../../../build/terra-vmm-component.cwasm"),
-                include_bytes!("../../../../build/terra-mmio-component.cwasm"),
                 include_bytes!("../../../../build/terra-interrupt-controller-component.cwasm"),
             )
         };
@@ -247,7 +215,7 @@ mod tests {
             shares: Vec::new(),
             plan: Vec::new(),
             artifacts,
-            network_policy: std::sync::Arc::new(DenyAll),
+            network_backend: None,
             port_mappings: Vec::new(),
             ram_bytes: 4096,
             vcpus: 1,

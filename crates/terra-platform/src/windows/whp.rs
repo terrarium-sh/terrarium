@@ -66,7 +66,7 @@ impl fmt::Display for AvailabilityError {
             ),
             #[cfg(target_arch = "aarch64")]
             Self::Arm64Unsupported => formatter.write_str(
-                "this Windows Arm64 host needs Windows 11 24H2 or later with Windows Hypervisor Platform enabled",
+                "this Windows Arm64 host needs Windows 11 24H2 build 26100.3915 or later with Windows Hypervisor Platform enabled",
             ),
         }
     }

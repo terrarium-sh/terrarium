@@ -1,0 +1,1414 @@
+--- a/include/net/ip6_fib.h
++++ b/include/net/ip6_fib.h
+@@ -224,6 +224,7 @@
+ 	struct fib6_info	*f6i;
+ 	u32			fib6_flags;
+ 	u8			fib6_type;
++	bool			lookup_matched;
+ 	struct rt6_info		*rt6;
+ };
+ 
+--- a/include/net/ip_fib.h
++++ b/include/net/ip_fib.h
+@@ -178,6 +178,7 @@
+ 	unsigned char		scope;
+ 	u32			tclassid;
+ 	dscp_t			dscp;
++	bool			lookup_matched;
+ 	struct fib_nh_common	*nhc;
+ 	struct fib_info		*fi;
+ 	struct fib_table	*table;
+--- a/net/Kconfig
++++ b/net/Kconfig
+@@ -543,4 +543,10 @@
+ 
+ 	  If unsure, say N.
+ 
++config TERRA_TSI
++	bool "Terra external socket adapter"
++	depends on INET && IPV6 && VIRTIO_VSOCKETS
++	help
++	  Redirect eligible external TCP and UDP sockets through per-socket vsock streams.
++
+ endif   # if NET
+--- a/net/Makefile
++++ b/net/Makefile
+@@ -80,3 +80,5 @@
+ obj-$(CONFIG_MCTP)		+= mctp/
+ obj-$(CONFIG_NET_HANDSHAKE)	+= handshake/
+ obj-$(CONFIG_NET_SHAPER)	+= shaper/
++
++obj-$(CONFIG_TERRA_TSI) += terra/
+--- a/net/ipv4/fib_trie.c
++++ b/net/ipv4/fib_trie.c
+@@ -1562,6 +1562,7 @@
+ 			continue;
+ 		if (fa->fa_info->fib_scope < flp->flowi4_scope)
+ 			continue;
++		res->lookup_matched = true;
+ 		fib_alias_accessed(fa);
+ 		err = fib_props[fa->fa_type].error;
+ 		if (unlikely(err < 0)) {
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@ -365,6 +365,16 @@
+ 	return udp_lib_get_port(sk, snum, hash2_nulladdr);
+ }
+ 
++static bool udp4_has_ipv6_peer(const struct sock *sk)
++{
++#if IS_ENABLED(CONFIG_IPV6)
++	return sk->sk_family == PF_INET6 && sk->sk_state == TCP_ESTABLISHED &&
++		!ipv6_addr_any(&sk->sk_v6_daddr) && !ipv6_addr_v4mapped(&sk->sk_v6_daddr);
++#else
++	return false;
++#endif
++}
++
+ static __always_inline int
+ compute_score(struct sock *sk, const struct net *net,
+ 	      __be32 saddr, __be16 sport, __be32 daddr,
+@@ -376,7 +386,7 @@
+ 
+ 	if (!net_eq(sock_net(sk), net) ||
+ 	    udp_sk(sk)->udp_port_hash != hnum ||
+-	    ipv6_only_sock(sk))
++	    ipv6_only_sock(sk) || udp4_has_ipv6_peer(sk))
+ 		return -1;
+ 
+ 	if (sk->sk_rcv_saddr != daddr)
+@@ -561,7 +571,7 @@
+ 	/* SLAB_TYPESAFE_BY_RCU not used, so we don't need to touch sk_refcnt */
+ 	udp_lrpa_for_each_entry_rcu(up, node, &hslot4->nulls_head) {
+ 		sk = (struct sock *)up;
+-		if (inet_match(net, sk, acookie, ports, dif, sdif))
++		if (!udp4_has_ipv6_peer(sk) && inet_match(net, sk, acookie, ports, dif, sdif))
+ 			return sk;
+ 	}
+ 
+@@ -737,7 +747,7 @@
+ 				  udptable);
+ 
+ done:
+-	if (IS_ERR(result))
++	if (IS_ERR(result) || (result && udp4_has_ipv6_peer(result)))
+ 		return NULL;
+ 	return result;
+ }
+--- a/net/ipv6/route.c
++++ b/net/ipv6/route.c
+@@ -2243,11 +2243,15 @@
+ 		      struct flowi6 *fl6, struct fib6_result *res, int strict)
+ {
+ 	struct fib6_node *fn, *saved_fn;
++	struct fib6_info *candidate;
+ 
+ 	fn = fib6_node_lookup(&table->tb6_root, &fl6->daddr, &fl6->saddr);
+ 	saved_fn = fn;
+ 
+ redo_rt6_select:
++	candidate = rcu_dereference(fn->leaf);
++	if (candidate && candidate != net->ipv6.fib6_null_entry)
++		res->lookup_matched = true;
+ 	rt6_select(net, fn, oif, res, strict);
+ 	if (res->f6i == net->ipv6.fib6_null_entry) {
+ 		fn = fib6_backtrack(fn, &fl6->saddr);
+--- a/net/socket.c
++++ b/net/socket.c
+@@ -59,6 +59,7 @@
+ #include <linux/file.h>
+ #include <linux/splice.h>
+ #include <linux/net.h>
++#include <linux/terra_socket.h>
+ #include <linux/interrupt.h>
+ #include <linux/thread_info.h>
+ #include <linux/rcupdate.h>
+@@ -1626,6 +1627,15 @@
+ 	 * module can have its refcnt decremented
+ 	 */
+ 	module_put(pf->owner);
++#ifdef CONFIG_TERRA_TSI
++	if (!kern && (family == AF_INET || family == AF_INET6) &&
++	    ((type == SOCK_STREAM && sock->sk->sk_protocol == IPPROTO_TCP) ||
++	     (type == SOCK_DGRAM && sock->sk->sk_protocol == IPPROTO_UDP))) {
++		err = terra_tsi_attach(sock);
++		if (err)
++			goto out_sock_release;
++	}
++#endif
+ 	err = security_socket_post_create(sock, family, type, protocol, kern);
+ 	if (err)
+ 		goto out_sock_release;
+--- a/include/linux/virtio_vsock.h
++++ b/include/linux/virtio_vsock.h
+@@ -217,6 +217,7 @@
+ 				   int flags);
+ s64 virtio_transport_stream_has_data(struct vsock_sock *vsk);
+ s64 virtio_transport_stream_has_space(struct vsock_sock *vsk);
++int virtio_transport_send_credit_request(struct vsock_sock *vsk);
+ u32 virtio_transport_seqpacket_has_data(struct vsock_sock *vsk);
+ 
+ ssize_t virtio_transport_unsent_bytes(struct vsock_sock *vsk);
+--- a/net/vmw_vsock/virtio_transport_common.c
++++ b/net/vmw_vsock/virtio_transport_common.c
+@@ -573,471 +573,500 @@
+ {
+ 	u64 skb_overhead = ((u64)skb_queue_len(&vvs->rx_queue) + 1) * SKB_TRUESIZE(0);
+ 
+ 	/* Allow at most buf_alloc * 2 total budget (payload + overhead),
+ 	 * similar to how SO_RCVBUF is doubled to reserve space for sk_buff
+ 	 * metadata. Check payload against buf_alloc to be sure the other
+ 	 * peer is respecting the credit, and sk_buff overhead to bound
+ 	 * queue growth.
+ 	 */
+ 	if ((u64)vvs->buf_used + len > vvs->buf_alloc ||
+ 	    skb_overhead > vvs->buf_alloc)
+ 		return false;
+ 
+ 	vvs->rx_bytes += len;
+ 	vvs->buf_used += len;
+ 	return true;
+ }
+ 
+ static void virtio_transport_dec_rx_pkt(struct virtio_vsock_sock *vvs,
+ 					u32 bytes_read, u32 bytes_dequeued)
+ {
+ 	vvs->rx_bytes -= bytes_read;
+ 	vvs->buf_used -= bytes_dequeued;
+ 	vvs->fwd_cnt += bytes_dequeued;
+ }
+ 
+ void virtio_transport_inc_tx_pkt(struct virtio_vsock_sock *vvs, struct sk_buff *skb)
+ {
+ 	struct virtio_vsock_hdr *hdr = virtio_vsock_hdr(skb);
+ 
+ 	spin_lock_bh(&vvs->rx_lock);
+ 	vvs->last_fwd_cnt = vvs->fwd_cnt;
+ 	hdr->fwd_cnt = cpu_to_le32(vvs->fwd_cnt);
+ 	hdr->buf_alloc = cpu_to_le32(vvs->buf_alloc);
+ 	spin_unlock_bh(&vvs->rx_lock);
+ }
+ EXPORT_SYMBOL_GPL(virtio_transport_inc_tx_pkt);
+ 
+ void virtio_transport_consume_skb_sent(struct sk_buff *skb, bool consume)
+ {
+ 	struct sock *s = skb->sk;
+ 
+ 	if (s && skb->len) {
+ 		struct vsock_sock *vs = vsock_sk(s);
+ 		struct virtio_vsock_sock *vvs;
+ 
+ 		vvs = vs->trans;
+ 
+ 		spin_lock_bh(&vvs->tx_lock);
+ 		vvs->bytes_unsent -= skb->len;
+ 		spin_unlock_bh(&vvs->tx_lock);
+ 	}
+ 
+ 	if (consume)
+ 		consume_skb(skb);
+ }
+ EXPORT_SYMBOL_GPL(virtio_transport_consume_skb_sent);
+ 
+ u32 virtio_transport_get_credit(struct virtio_vsock_sock *vvs, u32 credit)
+ {
+ 	u32 ret;
+ 
+ 	if (!credit)
+ 		return 0;
+ 
+ 	spin_lock_bh(&vvs->tx_lock);
+ 	ret = min_t(u32, credit, virtio_transport_has_space(vvs));
+ 	vvs->tx_cnt += ret;
+ 	vvs->bytes_unsent += ret;
+ 	spin_unlock_bh(&vvs->tx_lock);
+ 
+ 	return ret;
+ }
+ EXPORT_SYMBOL_GPL(virtio_transport_get_credit);
+ 
+ void virtio_transport_put_credit(struct virtio_vsock_sock *vvs, u32 credit)
+ {
+ 	if (!credit)
+ 		return;
+ 
+ 	spin_lock_bh(&vvs->tx_lock);
+ 	vvs->tx_cnt -= credit;
+ 	vvs->bytes_unsent -= credit;
+ 	spin_unlock_bh(&vvs->tx_lock);
+ }
+ EXPORT_SYMBOL_GPL(virtio_transport_put_credit);
+ 
+ static int virtio_transport_send_credit_update(struct vsock_sock *vsk)
+ {
+ 	struct virtio_vsock_pkt_info info = {
+ 		.op = VIRTIO_VSOCK_OP_CREDIT_UPDATE,
+ 		.vsk = vsk,
+ 	};
+ 
+ 	return virtio_transport_send_pkt_info(vsk, &info);
+ }
+ 
++int virtio_transport_send_credit_request(struct vsock_sock *vsk)
++{
++	struct virtio_vsock_pkt_info info = {
++		.op = VIRTIO_VSOCK_OP_CREDIT_REQUEST,
++		.vsk = vsk,
++	};
++	struct sock *sk = sk_vsock(vsk);
++	int error;
++
++	lock_sock(sk);
++	if (sk->sk_state != TCP_ESTABLISHED)
++		error = -ENOTCONN;
++	else
++		error = virtio_transport_send_pkt_info(vsk, &info);
++	release_sock(sk);
++	return error;
++}
++EXPORT_SYMBOL_GPL(virtio_transport_send_credit_request);
++
+ static ssize_t
+ virtio_transport_stream_do_peek(struct vsock_sock *vsk,
+ 				struct msghdr *msg,
+-				size_t len)
++				size_t len, int flags)
+ {
+ 	struct virtio_vsock_sock *vvs = vsk->trans;
+ 	struct sk_buff *skb;
+ 	size_t total = 0;
++	u32 skip = max(sk_peek_offset(sk_vsock(vsk), flags), 0);
+ 	int err;
+ 
+ 	spin_lock_bh(&vvs->rx_lock);
+ 
+ 	skb_queue_walk(&vvs->rx_queue, skb) {
+-		size_t bytes;
+-
+-		bytes = min_t(size_t, len - total,
+-			      skb->len - VIRTIO_VSOCK_SKB_CB(skb)->offset);
++		size_t bytes, offset = VIRTIO_VSOCK_SKB_CB(skb)->offset;
++
++		bytes = skb->len - offset;
++		if (skip >= bytes) {
++			skip -= bytes;
++			continue;
++		}
++		offset += skip;
++		bytes = min_t(size_t, len - total, bytes - skip);
++		skip = 0;
+ 
+ 		spin_unlock_bh(&vvs->rx_lock);
+ 
+ 		/* sk_lock is held by caller so no one else can dequeue.
+ 		 * Unlock rx_lock since skb_copy_datagram_iter() may sleep.
+ 		 */
+-		err = skb_copy_datagram_iter(skb, VIRTIO_VSOCK_SKB_CB(skb)->offset,
+-					     &msg->msg_iter, bytes);
+-		if (err)
+-			goto out;
++		if (!(flags & MSG_TRUNC)) {
++			err = skb_copy_datagram_iter(skb, offset, &msg->msg_iter, bytes);
++			if (err)
++				goto out;
++		}
+ 
+ 		total += bytes;
++		sk_peek_offset_fwd(sk_vsock(vsk), bytes);
+ 
+ 		spin_lock_bh(&vvs->rx_lock);
+ 
+ 		if (total == len)
+ 			break;
+ 	}
+ 
+ 	spin_unlock_bh(&vvs->rx_lock);
+ 
+ 	return total;
+ 
+ out:
+ 	if (total)
+ 		err = total;
+ 	return err;
+ }
+ 
+ static ssize_t
+ virtio_transport_stream_do_dequeue(struct vsock_sock *vsk,
+ 				   struct msghdr *msg,
+-				   size_t len)
++				   size_t len, int flags)
+ {
+ 	struct virtio_vsock_sock *vvs = vsk->trans;
+ 	struct sk_buff *skb;
+ 	u32 fwd_cnt_delta;
+ 	bool low_rx_bytes;
+ 	int err = -EFAULT;
+ 	size_t total = 0;
+-	u32 free_space;
++	u32 receive_window;
++	u32 peer_receive_window;
++	int receive_low_water;
++
++	spin_lock_bh(&vvs->tx_lock);
++	peer_receive_window = vvs->peer_buf_alloc;
++	spin_unlock_bh(&vvs->tx_lock);
+ 
+ 	spin_lock_bh(&vvs->rx_lock);
+ 
+ 	if (WARN_ONCE(skb_queue_empty(&vvs->rx_queue) && vvs->rx_bytes,
+ 		      "rx_queue is empty, but rx_bytes is non-zero\n")) {
+ 		spin_unlock_bh(&vvs->rx_lock);
+ 		return err;
+ 	}
+ 
+ 	while (total < len && !skb_queue_empty(&vvs->rx_queue)) {
+ 		size_t bytes, dequeued = 0;
+ 
+ 		skb = skb_peek(&vvs->rx_queue);
+ 
+ 		bytes = min_t(size_t, len - total,
+ 			      skb->len - VIRTIO_VSOCK_SKB_CB(skb)->offset);
+ 
+ 		/* sk_lock is held by caller so no one else can dequeue.
+ 		 * Unlock rx_lock since skb_copy_datagram_iter() may sleep.
+ 		 */
+ 		spin_unlock_bh(&vvs->rx_lock);
+ 
+-		err = skb_copy_datagram_iter(skb,
+-					     VIRTIO_VSOCK_SKB_CB(skb)->offset,
+-					     &msg->msg_iter, bytes);
+-		if (err)
+-			goto out;
++		if (!(flags & MSG_TRUNC)) {
++			err = skb_copy_datagram_iter(skb,
++						     VIRTIO_VSOCK_SKB_CB(skb)->offset,
++						     &msg->msg_iter, bytes);
++			if (err)
++				goto out;
++		}
+ 
+ 		spin_lock_bh(&vvs->rx_lock);
+ 
+ 		total += bytes;
++		sk_peek_offset_bwd(sk_vsock(vsk), bytes);
+ 
+ 		VIRTIO_VSOCK_SKB_CB(skb)->offset += bytes;
+ 
+ 		if (skb->len == VIRTIO_VSOCK_SKB_CB(skb)->offset) {
+ 			dequeued = le32_to_cpu(virtio_vsock_hdr(skb)->len);
+ 			__skb_unlink(skb, &vvs->rx_queue);
+ 			consume_skb(skb);
+ 		}
+ 
+ 		virtio_transport_dec_rx_pkt(vvs, bytes, dequeued);
+ 	}
+ 
+ 	fwd_cnt_delta = vvs->fwd_cnt - vvs->last_fwd_cnt;
+-	free_space = vvs->buf_alloc - fwd_cnt_delta;
+-	low_rx_bytes = (vvs->rx_bytes <
+-			sock_rcvlowat(sk_vsock(vsk), 0, INT_MAX));
++	receive_window = min(vvs->buf_alloc, peer_receive_window);
++	receive_low_water = sock_rcvlowat(sk_vsock(vsk), 0, INT_MAX);
++	low_rx_bytes = vvs->rx_bytes < receive_low_water;
+ 
+ 	spin_unlock_bh(&vvs->rx_lock);
+ 
+-	/* To reduce the number of credit update messages,
+-	 * don't update credits as long as lots of space is available.
+-	 * Note: the limit chosen here is arbitrary. Setting the limit
+-	 * too high causes extra messages. Too low causes transmitter
+-	 * stalls. As stalls are in theory more expensive than extra
+-	 * messages, we set the limit to a high value. TODO: experiment
+-	 * with different values. Also send credit update message when
+-	 * number of bytes in rx queue is not enough to wake up reader.
+-	 */
+ 	if (fwd_cnt_delta &&
+-	    (free_space < VIRTIO_VSOCK_MAX_PKT_BUF_SIZE || low_rx_bytes))
++	    (fwd_cnt_delta >= max_t(u32, 1, receive_window / 2) ||
++	     (receive_low_water > 1 && low_rx_bytes)))
+ 		virtio_transport_send_credit_update(vsk);
+ 
+ 	return total;
+ 
+ out:
+ 	if (total)
+ 		err = total;
+ 	return err;
+ }
+ 
+ static ssize_t
+ virtio_transport_seqpacket_do_peek(struct vsock_sock *vsk,
+ 				   struct msghdr *msg)
+ {
+ 	struct virtio_vsock_sock *vvs = vsk->trans;
+ 	struct sk_buff *skb;
+ 	size_t total, len;
+ 
+ 	spin_lock_bh(&vvs->rx_lock);
+ 
+ 	if (!vvs->msg_count) {
+ 		spin_unlock_bh(&vvs->rx_lock);
+ 		return 0;
+ 	}
+ 
+ 	total = 0;
+ 	len = msg_data_left(msg);
+ 
+ 	skb_queue_walk(&vvs->rx_queue, skb) {
+ 		struct virtio_vsock_hdr *hdr;
+ 
+ 		if (total < len) {
+ 			size_t bytes;
+ 			int err;
+ 
+ 			bytes = len - total;
+ 			if (bytes > skb->len)
+ 				bytes = skb->len;
+ 
+ 			spin_unlock_bh(&vvs->rx_lock);
+ 
+ 			/* sk_lock is held by caller so no one else can dequeue.
+ 			 * Unlock rx_lock since skb_copy_datagram_iter() may sleep.
+ 			 */
+ 			err = skb_copy_datagram_iter(skb, VIRTIO_VSOCK_SKB_CB(skb)->offset,
+ 						     &msg->msg_iter, bytes);
+ 			if (err)
+ 				return err;
+ 
+ 			spin_lock_bh(&vvs->rx_lock);
+ 		}
+ 
+ 		total += skb->len;
+ 		hdr = virtio_vsock_hdr(skb);
+ 
+ 		if (le32_to_cpu(hdr->flags) & VIRTIO_VSOCK_SEQ_EOM) {
+ 			if (le32_to_cpu(hdr->flags) & VIRTIO_VSOCK_SEQ_EOR)
+ 				msg->msg_flags |= MSG_EOR;
+ 
+ 			break;
+ 		}
+ 	}
+ 
+ 	spin_unlock_bh(&vvs->rx_lock);
+ 
+ 	return total;
+ }
+ 
+ static int virtio_transport_seqpacket_do_dequeue(struct vsock_sock *vsk,
+ 						 struct msghdr *msg,
+ 						 int flags)
+ {
+ 	struct virtio_vsock_sock *vvs = vsk->trans;
+ 	int dequeued_len = 0;
+ 	size_t user_buf_len = msg_data_left(msg);
+ 	bool msg_ready = false;
+ 	struct sk_buff *skb;
+ 
+ 	spin_lock_bh(&vvs->rx_lock);
+ 
+ 	if (vvs->msg_count == 0) {
+ 		spin_unlock_bh(&vvs->rx_lock);
+ 		return 0;
+ 	}
+ 
+ 	while (!msg_ready) {
+ 		struct virtio_vsock_hdr *hdr;
+ 		size_t pkt_len;
+ 
+ 		skb = __skb_dequeue(&vvs->rx_queue);
+ 		if (!skb)
+ 			break;
+ 		hdr = virtio_vsock_hdr(skb);
+ 		pkt_len = (size_t)le32_to_cpu(hdr->len);
+ 
+ 		if (dequeued_len >= 0) {
+ 			size_t bytes_to_copy;
+ 
+ 			bytes_to_copy = min(user_buf_len, pkt_len);
+ 
+ 			if (bytes_to_copy) {
+ 				int err;
+ 
+ 				/* sk_lock is held by caller so no one else can dequeue.
+ 				 * Unlock rx_lock since skb_copy_datagram_iter() may sleep.
+ 				 */
+ 				spin_unlock_bh(&vvs->rx_lock);
+ 
+ 				err = skb_copy_datagram_iter(skb, 0,
+ 							     &msg->msg_iter,
+ 							     bytes_to_copy);
+ 				if (err) {
+ 					/* Copy of message failed. Rest of
+ 					 * fragments will be freed without copy.
+ 					 */
+ 					dequeued_len = err;
+ 				} else {
+ 					user_buf_len -= bytes_to_copy;
+ 				}
+ 
+ 				spin_lock_bh(&vvs->rx_lock);
+ 			}
+ 
+ 			if (dequeued_len >= 0)
+ 				dequeued_len += pkt_len;
+ 		}
+ 
+ 		if (le32_to_cpu(hdr->flags) & VIRTIO_VSOCK_SEQ_EOM) {
+ 			msg_ready = true;
+ 			vvs->msg_count--;
+ 
+ 			if (le32_to_cpu(hdr->flags) & VIRTIO_VSOCK_SEQ_EOR)
+ 				msg->msg_flags |= MSG_EOR;
+ 		}
+ 
+ 		virtio_transport_dec_rx_pkt(vvs, pkt_len, pkt_len);
+ 		kfree_skb(skb);
+ 	}
+ 
+ 	spin_unlock_bh(&vvs->rx_lock);
+ 
+ 	virtio_transport_send_credit_update(vsk);
+ 
+ 	return dequeued_len;
+ }
+ 
+ ssize_t
+ virtio_transport_stream_dequeue(struct vsock_sock *vsk,
+ 				struct msghdr *msg,
+ 				size_t len, int flags)
+ {
+ 	if (flags & MSG_PEEK)
+-		return virtio_transport_stream_do_peek(vsk, msg, len);
++		return virtio_transport_stream_do_peek(vsk, msg, len, flags);
+ 	else
+-		return virtio_transport_stream_do_dequeue(vsk, msg, len);
++		return virtio_transport_stream_do_dequeue(vsk, msg, len, flags);
+ }
+ EXPORT_SYMBOL_GPL(virtio_transport_stream_dequeue);
+ 
+ ssize_t
+ virtio_transport_seqpacket_dequeue(struct vsock_sock *vsk,
+ 				   struct msghdr *msg,
+ 				   int flags)
+ {
+ 	if (flags & MSG_PEEK)
+ 		return virtio_transport_seqpacket_do_peek(vsk, msg);
+ 	else
+ 		return virtio_transport_seqpacket_do_dequeue(vsk, msg, flags);
+ }
+ EXPORT_SYMBOL_GPL(virtio_transport_seqpacket_dequeue);
+ 
+ static u32 virtio_transport_tx_buf_size(struct virtio_vsock_sock *vvs)
+ {
+ 	/* The peer advertises its receive buffer via peer_buf_alloc, but we
+ 	 * cap it to our local buf_alloc so a remote peer cannot force us to
+ 	 * queue more data than our own buffer configuration allows.
+ 	 */
+ 	return min(vvs->peer_buf_alloc, vvs->buf_alloc);
+ }
+ 
+ int
+ virtio_transport_seqpacket_enqueue(struct vsock_sock *vsk,
+ 				   struct msghdr *msg,
+ 				   size_t len)
+ {
+ 	struct virtio_vsock_sock *vvs = vsk->trans;
+ 
+ 	spin_lock_bh(&vvs->tx_lock);
+ 
+ 	if (len > virtio_transport_tx_buf_size(vvs)) {
+ 		spin_unlock_bh(&vvs->tx_lock);
+ 		return -EMSGSIZE;
+ 	}
+ 
+ 	spin_unlock_bh(&vvs->tx_lock);
+ 
+ 	return virtio_transport_stream_enqueue(vsk, msg, len);
+ }
+ EXPORT_SYMBOL_GPL(virtio_transport_seqpacket_enqueue);
+ 
+ int
+ virtio_transport_dgram_dequeue(struct vsock_sock *vsk,
+ 			       struct msghdr *msg,
+ 			       size_t len, int flags)
+ {
+ 	return -EOPNOTSUPP;
+ }
+ EXPORT_SYMBOL_GPL(virtio_transport_dgram_dequeue);
+ 
+ s64 virtio_transport_stream_has_data(struct vsock_sock *vsk)
+ {
+ 	struct virtio_vsock_sock *vvs = vsk->trans;
+ 	s64 bytes;
+ 
+ 	spin_lock_bh(&vvs->rx_lock);
+ 	bytes = vvs->rx_bytes;
+ 	spin_unlock_bh(&vvs->rx_lock);
+ 
+ 	return bytes;
+ }
+ EXPORT_SYMBOL_GPL(virtio_transport_stream_has_data);
+ 
+ u32 virtio_transport_seqpacket_has_data(struct vsock_sock *vsk)
+ {
+ 	struct virtio_vsock_sock *vvs = vsk->trans;
+ 	u32 msg_count;
+ 
+ 	spin_lock_bh(&vvs->rx_lock);
+ 	msg_count = vvs->msg_count;
+ 	spin_unlock_bh(&vvs->rx_lock);
+ 
+ 	return msg_count;
+ }
+ EXPORT_SYMBOL_GPL(virtio_transport_seqpacket_has_data);
+ 
+ static s64 virtio_transport_has_space(struct virtio_vsock_sock *vvs)
+ {
+ 	s64 bytes;
+ 
+ 	/* Use s64 arithmetic so if the peer shrinks peer_buf_alloc while
+ 	 * we have bytes in flight (tx_cnt - peer_fwd_cnt), the subtraction
+ 	 * does not underflow.
+ 	 */
+ 	bytes = (s64)virtio_transport_tx_buf_size(vvs) -
+ 		(vvs->tx_cnt - vvs->peer_fwd_cnt);
+ 	if (bytes < 0)
+ 		bytes = 0;
+ 
+ 	return bytes;
+ }
+ 
+ s64 virtio_transport_stream_has_space(struct vsock_sock *vsk)
+ {
+ 	struct virtio_vsock_sock *vvs = vsk->trans;
+ 	s64 bytes;
+ 
+@@ -1560,215 +1589,230 @@
+ 
+ static int
+ virtio_transport_recv_connected(struct sock *sk,
+ 				struct sk_buff *skb)
+ {
+ 	struct virtio_vsock_hdr *hdr = virtio_vsock_hdr(skb);
+ 	struct vsock_sock *vsk = vsock_sk(sk);
+ 	int err = 0;
+ 
+ 	switch (le16_to_cpu(hdr->op)) {
+ 	case VIRTIO_VSOCK_OP_RW:
+ 		if (!virtio_transport_recv_enqueue(vsk, skb)) {
+ 			/* There is no more space to queue the packet, so let's
+ 			 * close the connection; otherwise, we'll lose data.
+ 			 */
+ 			(void)virtio_transport_reset(vsk, skb);
+ 			virtio_transport_do_close(vsk, true);
+ 			sk->sk_err = ENOBUFS;
+ 			sk_error_report(sk);
+ 			vsock_remove_sock(vsk);
+ 			break;
+ 		}
+ 		vsock_data_ready(sk);
+ 		return err;
+ 	case VIRTIO_VSOCK_OP_CREDIT_REQUEST:
+ 		virtio_transport_send_credit_update(vsk);
+ 		break;
+ 	case VIRTIO_VSOCK_OP_CREDIT_UPDATE:
+ 		sk->sk_write_space(sk);
+ 		break;
+ 	case VIRTIO_VSOCK_OP_SHUTDOWN: {
+ 		u32 peer_shutdown = READ_ONCE(vsk->peer_shutdown);
+ 
+ 		if (le32_to_cpu(hdr->flags) & VIRTIO_VSOCK_SHUTDOWN_RCV)
+ 			peer_shutdown |= RCV_SHUTDOWN;
+ 		if (le32_to_cpu(hdr->flags) & VIRTIO_VSOCK_SHUTDOWN_SEND)
+ 			peer_shutdown |= SEND_SHUTDOWN;
+ 		WRITE_ONCE(vsk->peer_shutdown, peer_shutdown);
+ 		if (peer_shutdown == SHUTDOWN_MASK) {
+ 			if (vsock_stream_has_data(vsk) <= 0 && !sock_flag(sk, SOCK_DONE)) {
+ 				(void)virtio_transport_reset(vsk, NULL);
+ 				virtio_transport_do_close(vsk, true);
+ 			}
+ 			/* Remove this socket anyway because the remote peer sent
+ 			 * the shutdown. This way a new connection will succeed
+ 			 * if the remote peer uses the same source port,
+ 			 * even if the old socket is still unreleased, but now disconnected.
+ 			 */
+ 			vsock_remove_sock(vsk);
+ 		}
+ 		if (le32_to_cpu(virtio_vsock_hdr(skb)->flags))
+ 			sk->sk_state_change(sk);
+ 		break;
+ 	}
+ 	case VIRTIO_VSOCK_OP_RST:
+ 		virtio_transport_do_close(vsk, true);
+ 		break;
+ 	default:
+ 		err = -EINVAL;
+ 		break;
+ 	}
+ 
+ 	kfree_skb(skb);
+ 	return err;
+ }
+ 
+ static void
+ virtio_transport_recv_disconnecting(struct sock *sk,
+ 				    struct sk_buff *skb)
+ {
+ 	struct virtio_vsock_hdr *hdr = virtio_vsock_hdr(skb);
+ 	struct vsock_sock *vsk = vsock_sk(sk);
+ 
+ 	if (le16_to_cpu(hdr->op) == VIRTIO_VSOCK_OP_RST)
+ 		virtio_transport_do_close(vsk, true);
+ }
+ 
+ static int
+ virtio_transport_send_response(struct vsock_sock *vsk,
+ 			       struct sk_buff *skb)
+ {
+ 	struct virtio_vsock_hdr *hdr = virtio_vsock_hdr(skb);
+ 	struct virtio_vsock_pkt_info info = {
+ 		.op = VIRTIO_VSOCK_OP_RESPONSE,
+ 		.remote_cid = le64_to_cpu(hdr->src_cid),
+ 		.remote_port = le32_to_cpu(hdr->src_port),
+ 		.reply = true,
+ 		.vsk = vsk,
+ 	};
+ 
+ 	return virtio_transport_send_pkt_info(vsk, &info);
+ }
+ 
+ static bool virtio_transport_space_update(struct sock *sk,
+ 					  struct sk_buff *skb)
+ {
+ 	struct virtio_vsock_hdr *hdr = virtio_vsock_hdr(skb);
+ 	struct vsock_sock *vsk = vsock_sk(sk);
+ 	struct virtio_vsock_sock *vvs = vsk->trans;
+ 	bool space_available;
++	bool peer_buf_shrank;
++	bool send_update;
++	u16 op = le16_to_cpu(hdr->op);
+ 
+ 	/* Listener sockets are not associated with any transport, so we are
+ 	 * not able to take the state to see if there is space available in the
+ 	 * remote peer, but since they are only used to receive requests, we
+ 	 * can assume that there is always space available in the other peer.
+ 	 */
+ 	if (!vvs)
+ 		return true;
+ 
+ 	/* buf_alloc and fwd_cnt is always included in the hdr */
+ 	spin_lock_bh(&vvs->tx_lock);
++	peer_buf_shrank = le32_to_cpu(hdr->buf_alloc) < vvs->peer_buf_alloc;
+ 	vvs->peer_buf_alloc = le32_to_cpu(hdr->buf_alloc);
+ 	vvs->peer_fwd_cnt = le32_to_cpu(hdr->fwd_cnt);
+ 	space_available = virtio_transport_has_space(vvs);
+ 	spin_unlock_bh(&vvs->tx_lock);
++	if (peer_buf_shrank && sk->sk_type == SOCK_STREAM &&
++	    sk->sk_state == TCP_ESTABLISHED &&
++	    (op == VIRTIO_VSOCK_OP_RW || op == VIRTIO_VSOCK_OP_CREDIT_UPDATE ||
++	     (op == VIRTIO_VSOCK_OP_SHUTDOWN &&
++	      !(le32_to_cpu(hdr->flags) & VIRTIO_VSOCK_SHUTDOWN_SEND)))) {
++		spin_lock_bh(&vvs->rx_lock);
++		send_update = vvs->fwd_cnt != vvs->last_fwd_cnt;
++		spin_unlock_bh(&vvs->rx_lock);
++		if (send_update)
++			virtio_transport_send_credit_update(vsk);
++	}
+ 	return space_available;
+ }
+ 
+ /* Handle server socket */
+ static int
+ virtio_transport_recv_listen(struct sock *sk, struct sk_buff *skb,
+ 			     struct virtio_transport *t)
+ {
+ 	struct virtio_vsock_hdr *hdr = virtio_vsock_hdr(skb);
+ 	struct vsock_sock *vsk = vsock_sk(sk);
+ 	struct vsock_sock *vchild;
+ 	struct sock *child;
+ 	int ret;
+ 
+ 	if (le16_to_cpu(hdr->op) != VIRTIO_VSOCK_OP_REQUEST) {
+ 		virtio_transport_reset_no_sock(t, skb);
+ 		return -EINVAL;
+ 	}
+ 
+ 	if (sk_acceptq_is_full(sk)) {
+ 		virtio_transport_reset_no_sock(t, skb);
+ 		return -ENOMEM;
+ 	}
+ 
+ 	/* __vsock_release() might have already flushed accept_queue.
+ 	 * Subsequent enqueues would lead to a memory leak.
+ 	 */
+ 	if (sk->sk_shutdown == SHUTDOWN_MASK) {
+ 		virtio_transport_reset_no_sock(t, skb);
+ 		return -ESHUTDOWN;
+ 	}
+ 
+ 	child = vsock_create_connected(sk);
+ 	if (!child) {
+ 		virtio_transport_reset_no_sock(t, skb);
+ 		return -ENOMEM;
+ 	}
+ 
+ 	lock_sock_nested(child, SINGLE_DEPTH_NESTING);
+ 
+ 	child->sk_state = TCP_ESTABLISHED;
+ 
+ 	vchild = vsock_sk(child);
+ 	vsock_addr_init(&vchild->local_addr, le64_to_cpu(hdr->dst_cid),
+ 			le32_to_cpu(hdr->dst_port));
+ 	vsock_addr_init(&vchild->remote_addr, le64_to_cpu(hdr->src_cid),
+ 			le32_to_cpu(hdr->src_port));
+ 
+ 	ret = vsock_assign_transport(vchild, vsk);
+ 	/* Transport assigned (looking at remote_addr) must be the same
+ 	 * where we received the request.
+ 	 */
+ 	if (ret || vchild->transport != &t->transport) {
+ 		release_sock(child);
+ 		virtio_transport_reset_no_sock(t, skb);
+ 		sock_put(child);
+ 		return ret;
+ 	}
+ 
+ 	sk_acceptq_added(sk);
+ 	if (virtio_transport_space_update(child, skb))
+ 		child->sk_write_space(child);
+ 
+ 	vsock_insert_connected(vchild);
+ 	vsock_enqueue_accept(sk, child);
+ 	virtio_transport_send_response(vchild, skb);
+ 
+ 	release_sock(child);
+ 
+ 	sk->sk_data_ready(sk);
+ 	return 0;
+ }
+ 
+ static bool virtio_transport_valid_type(u16 type)
+ {
+ 	return (type == VIRTIO_VSOCK_TYPE_STREAM) ||
+ 	       (type == VIRTIO_VSOCK_TYPE_SEQPACKET);
+ }
+ 
+ /* We are under the virtio-vsock's vsock->rx_lock or vhost-vsock's vq->mutex
+  * lock.
+  */
+ void virtio_transport_recv_pkt(struct virtio_transport *t,
+ 			       struct sk_buff *skb)
+ {
+ 	struct virtio_vsock_hdr *hdr = virtio_vsock_hdr(skb);
+ 	struct sockaddr_vm src, dst;
+ 	struct vsock_sock *vsk;
+ 	struct sock *sk;
+ 	bool space_available;
+ 
+ 	vsock_addr_init(&src, le64_to_cpu(hdr->src_cid),
+ 			le32_to_cpu(hdr->src_port));
+ 	vsock_addr_init(&dst, le64_to_cpu(hdr->dst_cid),
+ 			le32_to_cpu(hdr->dst_port));
+ 
+ 	trace_virtio_transport_recv_pkt(src.svm_cid, src.svm_port,
+ 					dst.svm_cid, dst.svm_port,
+ 					le32_to_cpu(hdr->len),
+ 					le16_to_cpu(hdr->type),
+--- a/net/vmw_vsock/af_vsock.c
++++ b/net/vmw_vsock/af_vsock.c
+@@ -2130,479 +2130,492 @@
+ 			timeout = wait_woken(&wait, TASK_INTERRUPTIBLE, timeout);
+ 			lock_sock(sk);
+ 			if (signal_pending(current)) {
+ 				err = sock_intr_errno(timeout);
+ 				remove_wait_queue(sk_sleep(sk), &wait);
+ 				goto out_err;
+ 			} else if (timeout == 0) {
+ 				err = -EAGAIN;
+ 				remove_wait_queue(sk_sleep(sk), &wait);
+ 				goto out_err;
+ 			}
+ 		}
+ 		remove_wait_queue(sk_sleep(sk), &wait);
+ 
+ 		/* These checks occur both as part of and after the loop
+ 		 * conditional since we need to check before and after
+ 		 * sleeping.
+ 		 */
+ 		if (sk->sk_err) {
+ 			err = -sk->sk_err;
+ 			goto out_err;
+ 		} else if ((sk->sk_shutdown & SEND_SHUTDOWN) ||
+ 			   (vsk->peer_shutdown & RCV_SHUTDOWN)) {
+ 			err = -EPIPE;
+ 			goto out_err;
+ 		}
+ 
+ 		err = transport->notify_send_pre_enqueue(vsk, &send_data);
+ 		if (err < 0)
+ 			goto out_err;
+ 
+ 		/* Note that enqueue will only write as many bytes as are free
+ 		 * in the produce queue, so we don't need to ensure len is
+ 		 * smaller than the queue size.  It is the caller's
+ 		 * responsibility to check how many bytes we were able to send.
+ 		 */
+ 
+ 		if (sk->sk_type == SOCK_SEQPACKET) {
+ 			written = transport->seqpacket_enqueue(vsk,
+ 						msg, len - total_written);
+ 		} else {
+ 			written = transport->stream_enqueue(vsk,
+ 					msg, len - total_written);
+ 		}
+ 
+ 		if (written < 0) {
+ 			err = written;
+ 			goto out_err;
+ 		}
+ 
+ 		total_written += written;
+ 
+ 		err = transport->notify_send_post_enqueue(
+ 				vsk, written, &send_data);
+ 		if (err < 0)
+ 			goto out_err;
+ 
+ 	}
+ 
+ out_err:
+ 	if (total_written > 0) {
+ 		/* Return number of written bytes only if:
+ 		 * 1) SOCK_STREAM socket.
+ 		 * 2) SOCK_SEQPACKET socket when whole buffer is sent.
+ 		 */
+ 		if (sk->sk_type == SOCK_STREAM || total_written == len)
+ 			err = total_written;
+ 	}
+ out:
+ 	if (sk->sk_type == SOCK_STREAM)
+ 		err = sk_stream_error(sk, msg->msg_flags, err);
+ 
+ 	release_sock(sk);
+ 	return err;
+ }
+ 
+ static int vsock_connectible_wait_data(struct sock *sk,
+ 				       struct wait_queue_entry *wait,
+ 				       long timeout,
+ 				       struct vsock_transport_recv_notify_data *recv_data,
+-				       size_t target)
++				       size_t target, int flags)
+ {
+ 	const struct vsock_transport *transport;
+ 	struct vsock_sock *vsk;
+ 	s64 data;
+ 	int err;
+ 
+ 	vsk = vsock_sk(sk);
+ 	err = 0;
+ 	transport = vsk->transport;
+ 
+ 	while (1) {
+ 		prepare_to_wait(sk_sleep(sk), wait, TASK_INTERRUPTIBLE);
+ 		data = vsock_connectible_has_data(vsk);
++		if (data > 0 && (flags & MSG_PEEK))
++			data -= min_t(s64, data, max(sk_peek_offset(sk, flags), 0));
+ 		if (data != 0)
+ 			break;
+ 
+ 		if (sk->sk_err != 0 ||
+ 		    (sk->sk_shutdown & RCV_SHUTDOWN) ||
+ 		    (vsk->peer_shutdown & SEND_SHUTDOWN)) {
+ 			break;
+ 		}
+ 
+ 		/* Don't wait for non-blocking sockets. */
+ 		if (timeout == 0) {
+ 			err = -EAGAIN;
+ 			break;
+ 		}
+ 
+ 		if (recv_data) {
+ 			err = transport->notify_recv_pre_block(vsk, target, recv_data);
+ 			if (err < 0)
+ 				break;
+ 		}
+ 
+ 		release_sock(sk);
+ 		timeout = schedule_timeout(timeout);
+ 		lock_sock(sk);
+ 
+ 		if (signal_pending(current)) {
+ 			err = sock_intr_errno(timeout);
+ 			break;
+ 		} else if (timeout == 0) {
+ 			err = -EAGAIN;
+ 			break;
+ 		}
+ 	}
+ 
+ 	finish_wait(sk_sleep(sk), wait);
+ 
+ 	if (err)
+ 		return err;
+ 
+ 	/* Internal transport error when checking for available
+ 	 * data. XXX This should be changed to a connection
+ 	 * reset in a later change.
+ 	 */
+ 	if (data < 0)
+ 		return -ENOMEM;
+ 
+ 	return data;
+ }
+ 
+ static int __vsock_stream_recvmsg(struct sock *sk, struct msghdr *msg,
+ 				  size_t len, int flags)
+ {
+ 	struct vsock_transport_recv_notify_data recv_data;
+ 	const struct vsock_transport *transport;
+ 	struct vsock_sock *vsk;
+ 	ssize_t copied;
+ 	size_t target;
+ 	long timeout;
+ 	int err;
+ 
+ 	DEFINE_WAIT(wait);
+ 
+ 	vsk = vsock_sk(sk);
+ 	transport = vsk->transport;
+ 
+ 	/* We must not copy less than target bytes into the user's buffer
+ 	 * before returning successfully, so we wait for the consume queue to
+ 	 * have that much data to consume before dequeueing.  Note that this
+ 	 * makes it impossible to handle cases where target is greater than the
+ 	 * queue size.
+ 	 */
+ 	target = sock_rcvlowat(sk, flags & MSG_WAITALL, len);
+ 	if (target >= transport->stream_rcvhiwat(vsk)) {
+ 		err = -ENOMEM;
+ 		goto out;
+ 	}
+ 	timeout = sock_rcvtimeo(sk, flags & MSG_DONTWAIT);
+ 	copied = 0;
+ 
+ 	err = transport->notify_recv_init(vsk, target, &recv_data);
+ 	if (err < 0)
+ 		goto out;
+ 
+ 
+ 	while (1) {
+ 		ssize_t read;
+ 
+ 		err = vsock_connectible_wait_data(sk, &wait, timeout,
+-						  &recv_data, target);
++						  &recv_data, target, flags);
+ 		if (err <= 0)
+ 			break;
+ 
+ 		err = transport->notify_recv_pre_dequeue(vsk, target,
+ 							 &recv_data);
+ 		if (err < 0)
+ 			break;
+ 
+ 		read = transport->stream_dequeue(vsk, msg, len - copied, flags);
+ 		if (read < 0) {
+ 			err = read;
+ 			break;
+ 		}
+ 
+ 		copied += read;
+ 
+ 		err = transport->notify_recv_post_dequeue(vsk, target, read,
+ 						!(flags & MSG_PEEK), &recv_data);
+ 		if (err < 0)
+ 			goto out;
+ 
+ 		if (read >= target || flags & MSG_PEEK)
+ 			break;
+ 
+ 		target -= read;
+ 	}
+ 
+ 	if (sk->sk_err)
+ 		err = -sk->sk_err;
+ 	else if (sk->sk_shutdown & RCV_SHUTDOWN)
+ 		err = 0;
+ 
+ 	if (copied > 0)
+ 		err = copied;
+ 
+ out:
+ 	return err;
+ }
+ 
+ static int __vsock_seqpacket_recvmsg(struct sock *sk, struct msghdr *msg,
+ 				     size_t len, int flags)
+ {
+ 	const struct vsock_transport *transport;
+ 	struct vsock_sock *vsk;
+ 	ssize_t msg_len;
+ 	long timeout;
+ 	int err = 0;
+ 	DEFINE_WAIT(wait);
+ 
+ 	vsk = vsock_sk(sk);
+ 	transport = vsk->transport;
+ 
+ 	timeout = sock_rcvtimeo(sk, flags & MSG_DONTWAIT);
+ 
+-	err = vsock_connectible_wait_data(sk, &wait, timeout, NULL, 0);
++	err = vsock_connectible_wait_data(sk, &wait, timeout, NULL, 0, 0);
+ 	if (err <= 0)
+ 		goto out;
+ 
+ 	msg_len = transport->seqpacket_dequeue(vsk, msg, flags);
+ 
+ 	if (msg_len < 0) {
+ 		err = msg_len;
+ 		goto out;
+ 	}
+ 
+ 	if (sk->sk_err) {
+ 		err = -sk->sk_err;
+ 	} else if (sk->sk_shutdown & RCV_SHUTDOWN) {
+ 		err = 0;
+ 	} else {
+ 		/* User sets MSG_TRUNC, so return real length of
+ 		 * packet.
+ 		 */
+ 		if (flags & MSG_TRUNC)
+ 			err = msg_len;
+ 		else
+ 			err = len - msg_data_left(msg);
+ 
+ 		/* Always set MSG_TRUNC if real length of packet is
+ 		 * bigger than user's buffer.
+ 		 */
+ 		if (msg_len > len)
+ 			msg->msg_flags |= MSG_TRUNC;
+ 	}
+ 
+ out:
+ 	return err;
+ }
+ 
+ int
+ __vsock_connectible_recvmsg(struct socket *sock, struct msghdr *msg, size_t len,
+ 			    int flags)
+ {
+ 	struct sock *sk;
+ 	struct vsock_sock *vsk;
+ 	const struct vsock_transport *transport;
+ 	int err;
+ 
+ 	sk = sock->sk;
+ 
+ 	if (unlikely(flags & MSG_ERRQUEUE))
+ 		return sock_recv_errqueue(sk, msg, len, SOL_VSOCK, VSOCK_RECVERR);
+ 
+ 	vsk = vsock_sk(sk);
+ 	err = 0;
+ 
+ 	lock_sock(sk);
+ 
+ 	transport = vsk->transport;
+ 
+ 	if (!transport || sk->sk_state != TCP_ESTABLISHED) {
+ 		/* Recvmsg is supposed to return 0 if a peer performs an
+ 		 * orderly shutdown. Differentiate between that case and when a
+ 		 * peer has not connected or a local shutdown occurred with the
+ 		 * SOCK_DONE flag.
+ 		 */
+ 		if (sock_flag(sk, SOCK_DONE))
+ 			err = 0;
+ 		else
+ 			err = -ENOTCONN;
+ 
+ 		goto out;
+ 	}
+ 
+ 	if (flags & MSG_OOB) {
+ 		err = -EOPNOTSUPP;
+ 		goto out;
+ 	}
+ 
+ 	/* We don't check peer_shutdown flag here since peer may actually shut
+ 	 * down, but there can be data in the queue that a local socket can
+ 	 * receive.
+ 	 */
+ 	if (sk->sk_shutdown & RCV_SHUTDOWN) {
+ 		err = 0;
+ 		goto out;
+ 	}
+ 
+ 	/* It is valid on Linux to pass in a zero-length receive buffer.  This
+ 	 * is not an error.  We may as well bail out now.
+ 	 */
+ 	if (!len) {
+ 		err = 0;
+ 		goto out;
+ 	}
+ 
+ 	if (sk->sk_type == SOCK_STREAM)
+ 		err = __vsock_stream_recvmsg(sk, msg, len, flags);
+ 	else
+ 		err = __vsock_seqpacket_recvmsg(sk, msg, len, flags);
+ 
+ out:
+ 	release_sock(sk);
+ 	return err;
+ }
+ 
+ int
+ vsock_connectible_recvmsg(struct socket *sock, struct msghdr *msg, size_t len,
+ 			  int flags)
+ {
+ #ifdef CONFIG_BPF_SYSCALL
+ 	struct sock *sk = sock->sk;
+ 	const struct proto *prot;
+ 
+ 	prot = READ_ONCE(sk->sk_prot);
+ 	if (prot != &vsock_proto)
+ 		return prot->recvmsg(sk, msg, len, flags);
+ #endif
+ 
+ 	return __vsock_connectible_recvmsg(sock, msg, len, flags);
+ }
+ EXPORT_SYMBOL_GPL(vsock_connectible_recvmsg);
+ 
+ static int vsock_set_rcvlowat(struct sock *sk, int val)
+ {
+ 	const struct vsock_transport *transport;
+ 	struct vsock_sock *vsk;
+ 
+ 	vsk = vsock_sk(sk);
+ 
+ 	if (val > vsk->buffer_size)
+ 		return -EINVAL;
+ 
+ 	transport = vsk->transport;
+ 
+ 	if (transport && transport->notify_set_rcvlowat) {
+ 		int err;
+ 
+ 		err = transport->notify_set_rcvlowat(vsk, val);
+ 		if (err)
+ 			return err;
+ 	}
+ 
+ 	WRITE_ONCE(sk->sk_rcvlowat, val ? : 1);
+ 	return 0;
++}
++
++static int vsock_set_peek_off(struct sock *sk, int offset)
++{
++	int error;
++
++	lock_sock(sk);
++	error = sk_set_peek_off(sk, offset);
++	release_sock(sk);
++	return error;
+ }
+ 
+ static const struct proto_ops vsock_stream_ops = {
+ 	.family = PF_VSOCK,
+ 	.owner = THIS_MODULE,
+ 	.release = vsock_release,
+ 	.bind = vsock_bind,
+ 	.connect = vsock_connect,
+ 	.socketpair = sock_no_socketpair,
+ 	.accept = vsock_accept,
+ 	.getname = vsock_getname,
+ 	.poll = vsock_poll,
+ 	.ioctl = vsock_ioctl,
+ 	.listen = vsock_listen,
+ 	.shutdown = vsock_shutdown,
+ 	.setsockopt = vsock_connectible_setsockopt,
+ 	.getsockopt = vsock_connectible_getsockopt,
+ 	.sendmsg = vsock_connectible_sendmsg,
+ 	.recvmsg = vsock_connectible_recvmsg,
+ 	.mmap = sock_no_mmap,
+ 	.set_rcvlowat = vsock_set_rcvlowat,
++	.set_peek_off = vsock_set_peek_off,
+ 	.read_skb = vsock_read_skb,
+ };
+ 
+ static const struct proto_ops vsock_seqpacket_ops = {
+ 	.family = PF_VSOCK,
+ 	.owner = THIS_MODULE,
+ 	.release = vsock_release,
+ 	.bind = vsock_bind,
+ 	.connect = vsock_connect,
+ 	.socketpair = sock_no_socketpair,
+ 	.accept = vsock_accept,
+ 	.getname = vsock_getname,
+ 	.poll = vsock_poll,
+ 	.ioctl = vsock_ioctl,
+ 	.listen = vsock_listen,
+ 	.shutdown = vsock_shutdown,
+ 	.setsockopt = vsock_connectible_setsockopt,
+ 	.getsockopt = vsock_connectible_getsockopt,
+ 	.sendmsg = vsock_connectible_sendmsg,
+ 	.recvmsg = vsock_connectible_recvmsg,
+ 	.mmap = sock_no_mmap,
+ 	.read_skb = vsock_read_skb,
+ };
+ 
+ static int vsock_create(struct net *net, struct socket *sock,
+ 			int protocol, int kern)
+ {
+ 	struct vsock_sock *vsk;
+ 	struct sock *sk;
+ 	int ret;
+ 
+ 	if (!sock)
+ 		return -EINVAL;
+ 
+ 	if (protocol && protocol != PF_VSOCK)
+ 		return -EPROTONOSUPPORT;
+ 
+ 	switch (sock->type) {
+ 	case SOCK_DGRAM:
+ 		sock->ops = &vsock_dgram_ops;
+ 		break;
+ 	case SOCK_STREAM:
+ 		sock->ops = &vsock_stream_ops;
+ 		break;
+ 	case SOCK_SEQPACKET:
+ 		sock->ops = &vsock_seqpacket_ops;
+ 		break;
+ 	default:
+ 		return -ESOCKTNOSUPPORT;
+ 	}
+ 
+ 	sock->state = SS_UNCONNECTED;
+ 
+ 	sk = __vsock_create(net, sock, NULL, GFP_KERNEL, 0, kern);
+ 	if (!sk)
+ 		return -ENOMEM;
+ 
+ 	vsk = vsock_sk(sk);
+ 
+ 	if (sock->type == SOCK_DGRAM) {
+ 		ret = vsock_assign_transport(vsk, NULL);
+ 		if (ret < 0) {
+ 			sock->sk = NULL;
+ 			sock_put(sk);
+ 			return ret;
+ 		}
+ 	}
+ 
+ 	/* SOCK_DGRAM doesn't have 'setsockopt' callback set in its
+ 	 * proto_ops, so there is no handler for custom logic.
+ 	 */
+ 	if (sock_type_connectible(sock->type))
+ 		set_bit(SOCK_CUSTOM_SOCKOPT, &sk->sk_socket->flags);
+ 
+ 	vsock_insert_unbound(vsk);
+ 
+ 	return 0;
+ }
+ 
+ static const struct net_proto_family vsock_family_ops = {

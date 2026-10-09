@@ -24,14 +24,39 @@ compile_error!(
 pub(crate) use imp::file_handle_matches_path;
 pub(crate) use imp::file_link_count;
 pub use imp::is_host_root;
-#[cfg(unix)]
-pub use imp::register_stop_channel;
 pub use imp::{
-    MAX_SOCK_PATH, allocated_size, claim_inherited_lock, detach, find_terminating_signal,
-    holds_run_lock, host_addresses, install_stop_signal_handlers, make_sparse, pass_lock,
-    read_process_start_time, restrict_new_files, set_open_file_mode, set_owner_only,
-    terminate_process, try_lock_run,
+    MAX_SOCK_PATH, allocated_size, claim_inherited_lock, find_terminating_signal, holds_run_lock,
+    host_addresses, install_stop_signal_handlers, make_sparse, pass_lock, read_process_start_time,
+    restrict_new_files, set_open_file_mode, terminate_process, try_lock_run,
 };
+pub use terra_platform::filesystem::{open_regular_file, set_owner_only};
+pub use terra_platform::process::{
+    VmChildGuard, attach_vm_child, kill_vm_child, supervise_vm_child,
+};
+
+pub fn register_stop_channel(channel: terra_platform::io::local::LocalStream) {
+    #[cfg(unix)]
+    imp::register_stop_channel(channel.into());
+    #[cfg(windows)]
+    imp::register_stop_channel(channel);
+}
+#[cfg(unix)]
+pub(crate) use imp::close_unrelated_descriptors;
+pub(crate) use imp::supervise_supervisor_child;
+#[cfg(any(target_os = "macos", windows))]
+pub(crate) use imp::{claim_listener, pass_listener};
+pub(crate) use terra_platform::process::{claim_ipc, pass_ipc};
+
+#[cfg(windows)]
+pub(crate) fn listener_handle_environment(target: i32) -> std::io::Result<&'static str> {
+    match target {
+        10 => Ok("TERRA_AGENT_LISTENER_HANDLE"),
+        11 => Ok("TERRA_CONTROL_LISTENER_HANDLE"),
+        12 => Ok("TERRA_AGENT_CONTROL_LISTENER_HANDLE"),
+        13 => Ok("TERRA_AGENT_AGENT_LISTENER_HANDLE"),
+        _ => Err(std::io::Error::other("unsupported inherited listener")),
+    }
+}
 
 pub(crate) fn validate_host_root() -> anyhow::Result<()> {
     validate_host_root_for(
@@ -173,36 +198,38 @@ mod test_paths;
 #[cfg(test)]
 pub(crate) use test_paths::TestHome;
 
-pub fn open_regular_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(rustix::fs::OFlags::NONBLOCK.bits().cast_signed());
-    }
-    let file = options.open(path)?;
-    if !file.metadata()?.is_file() {
-        return Err(std::io::Error::other("expected a regular file"));
-    }
+pub fn create_regular_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let file = open_regular_file_for_write(path, true)?;
+    file.set_len(0)?;
     Ok(file)
 }
 
-pub fn create_regular_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+/// `create` permits an absent path; existing files retain their contents.
+pub(crate) fn open_regular_file_for_write(
+    path: &Path,
+    create: bool,
+) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true);
+    options.write(true).create(create);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options
-            .mode(0o600)
-            .custom_flags(rustix::fs::OFlags::NONBLOCK.bits().cast_signed());
+        options.mode(0o600).custom_flags(
+            (rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::NOFOLLOW)
+                .bits()
+                .cast_signed(),
+        );
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
     }
     let file = options.open(path)?;
-    if !file.metadata()?.is_file() {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
         return Err(std::io::Error::other("expected a regular file"));
     }
-    file.set_len(0)?;
     Ok(file)
 }
 
@@ -245,6 +272,20 @@ mod tests {
     use std::fs::TryLockError;
     use std::io::Write as _;
 
+    /// Parallel spawns retain forked lock descriptors until exec closes them.
+    fn wait_for_lock_release(mut probe_lock: impl FnMut() -> Result<(), TryLockError>) {
+        let deadline = deadline_after(std::time::Duration::from_secs(5));
+        loop {
+            match probe_lock() {
+                Ok(()) => return,
+                Err(TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("lock was not released: {error}"),
+            }
+        }
+    }
+
     #[test]
     fn wait_for_test_input() {
         use std::io::Read as _;
@@ -252,6 +293,9 @@ mod tests {
         if std::env::var_os("TERRA_TEST_CHILD").is_none() {
             return;
         }
+        let _lock = std::env::var_os("TERRA_TEST_RUN_LOCK_PATH").map(|path| {
+            claim_inherited_lock(Path::new(&path)).expect("missing inherited run lock")
+        });
         let mut status = [0];
         std::io::stdin().read_exact(&mut status).unwrap();
         std::process::exit(i32::from(status[0]));
@@ -263,6 +307,45 @@ mod tests {
         assert!(error.to_string().contains("TERRA_ALLOW_ROOT=1"));
         assert!(validate_host_root_for(true, true).is_ok());
         assert!(validate_host_root_for(false, false).is_ok());
+    }
+
+    #[test]
+    fn creating_a_regular_file_rejects_symlink_redirection() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("launcher.log");
+        let redirected = directory.path().join("outside");
+        for exists in [true, false] {
+            if exists {
+                std::fs::write(&redirected, b"original").unwrap();
+            }
+            symlink_file(&redirected, &path).unwrap();
+            assert!(create_regular_file(&path).is_err());
+            assert!(
+                std::fs::symlink_metadata(&path)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            if exists {
+                assert_eq!(std::fs::read(&redirected).unwrap(), b"original");
+                std::fs::remove_file(&redirected).unwrap();
+            } else {
+                assert!(!redirected.exists());
+            }
+            std::fs::remove_file(&path).unwrap();
+        }
+        let mut file = create_regular_file(&path).unwrap();
+        file.write_all(b"previous run").unwrap();
+        drop(file);
+        assert_eq!(
+            create_regular_file(&path)
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(create_regular_file(directory.path()).is_err());
     }
 
     /// `-t`/`--timeout` and `--agent-timeout` take any u64, and `Instant + Duration`
@@ -291,7 +374,110 @@ mod tests {
 
         child.stdin.take().unwrap().write_all(&[0]).unwrap();
         assert!(child.wait().unwrap().success());
-        assert!(try_lock_run(&path).is_ok());
+        wait_for_lock_release(|| try_lock_run(&path).map(drop));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn supervision_parent_process() {
+        use std::time::{Duration, Instant};
+
+        let Ok(directory) = std::env::var("TERRA_TEST_SUPERVISION_DIR") else {
+            return;
+        };
+        let directory = Path::new(&directory);
+        let lock = try_lock_run(&directory.join("run.lock")).unwrap();
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("sleep 30 & echo $! > \"$1/grandchild\"; wait")
+            .arg("sh")
+            .arg(directory)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let _inherited_lock = pass_lock(&mut command, &lock).unwrap();
+        let foreground = std::env::var_os("TERRA_TEST_SUPERVISION_DETACHED").is_none();
+        let guard = supervise_vm_child(&mut command, foreground).unwrap();
+        let child = command.spawn().unwrap();
+        let child_pid = rustix::process::Pid::from_child(&child);
+        assert_eq!(rustix::process::getsid(Some(child_pid)).unwrap(), child_pid);
+        if let Some(guard) = &guard {
+            attach_vm_child(guard, &child).unwrap();
+        }
+        std::fs::write(directory.join("wrapper"), child.id().to_string()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !directory.join("grandchild").exists() {
+            assert!(Instant::now() < deadline, "wrapper did not spawn its child");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::process::exit(0);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn supervision_pid_is_running(pid: i32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| stat.rsplit_once(')').map(|(_, tail)| tail.to_owned()))
+            .and_then(|tail| tail.split_whitespace().next().map(str::to_owned))
+            .is_some_and(|state| state != "Z" && state != "X")
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(unsafe_code)]
+    fn foreground_parent_death_kills_wrapper_and_child_but_detached_survives() {
+        use std::time::{Duration, Instant};
+
+        for detached in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", "sys::tests::supervision_parent_process"])
+                .env("TERRA_TEST_SUPERVISION_DIR", directory.path())
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            if detached {
+                command.env("TERRA_TEST_SUPERVISION_DETACHED", "1");
+            }
+            assert!(command.spawn().unwrap().wait().unwrap().success());
+            let wrapper: i32 = std::fs::read_to_string(directory.path().join("wrapper"))
+                .unwrap()
+                .parse()
+                .unwrap();
+            let grandchild: i32 = std::fs::read_to_string(directory.path().join("grandchild"))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            let lock_path = directory.path().join("run.lock");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            if detached {
+                assert!(supervision_pid_is_running(wrapper));
+                assert!(supervision_pid_is_running(grandchild));
+                assert!(matches!(
+                    try_lock_run(&lock_path),
+                    Err(TryLockError::WouldBlock)
+                ));
+                // SAFETY: the live wrapper is the leader of the group created by supervise_vm_child.
+                assert_eq!(unsafe { libc::kill(-wrapper, libc::SIGKILL) }, 0);
+            }
+            while supervision_pid_is_running(wrapper) || supervision_pid_is_running(grandchild) {
+                assert!(
+                    Instant::now() < deadline,
+                    "VM descendants survived parent exit"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            while matches!(try_lock_run(&lock_path), Err(TryLockError::WouldBlock)) {
+                assert!(
+                    Instant::now() < deadline,
+                    "run lock survived VM descendants"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
     }
 
     #[cfg(windows)]

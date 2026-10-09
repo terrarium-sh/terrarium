@@ -27,13 +27,12 @@ impl TrustedArtifact {
 /// Build-embedded AOT artifacts for one exact Wasmtime runtime.
 pub struct TrustedArtifacts {
     block: TrustedArtifact,
+    agent: TrustedArtifact,
     vsock: TrustedArtifact,
-    network: TrustedArtifact,
     fs: TrustedArtifact,
     mem: TrustedArtifact,
     boot: TrustedArtifact,
     vmm: TrustedArtifact,
-    mmio: TrustedArtifact,
     interrupt_controller: TrustedArtifact,
 }
 
@@ -46,24 +45,22 @@ impl TrustedArtifacts {
     #[allow(unsafe_code, clippy::too_many_arguments)]
     pub const unsafe fn new(
         block: &'static [u8],
+        agent: &'static [u8],
         vsock: &'static [u8],
-        network: &'static [u8],
         fs: &'static [u8],
         mem: &'static [u8],
         boot: &'static [u8],
         vmm: &'static [u8],
-        mmio: &'static [u8],
         interrupt_controller: &'static [u8],
     ) -> Self {
         Self {
             block: TrustedArtifact(block),
+            agent: TrustedArtifact(agent),
             vsock: TrustedArtifact(vsock),
-            network: TrustedArtifact(network),
             fs: TrustedArtifact(fs),
             mem: TrustedArtifact(mem),
             boot: TrustedArtifact(boot),
             vmm: TrustedArtifact(vmm),
-            mmio: TrustedArtifact(mmio),
             interrupt_controller: TrustedArtifact(interrupt_controller),
         }
     }
@@ -74,13 +71,13 @@ impl TrustedArtifacts {
     }
 
     #[must_use]
-    pub const fn vsock(&self) -> TrustedArtifact {
-        self.vsock
+    pub const fn agent(&self) -> TrustedArtifact {
+        self.agent
     }
 
     #[must_use]
-    pub const fn network(&self) -> TrustedArtifact {
-        self.network
+    pub const fn vsock(&self) -> TrustedArtifact {
+        self.vsock
     }
 
     #[must_use]
@@ -96,11 +93,6 @@ impl TrustedArtifacts {
     #[must_use]
     pub const fn boot(&self) -> TrustedArtifact {
         self.boot
-    }
-
-    #[must_use]
-    pub const fn mmio(&self) -> TrustedArtifact {
-        self.mmio
     }
 
     #[must_use]

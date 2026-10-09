@@ -1,91 +1,75 @@
-use super::exports::terra::mmio::machine::Guest;
-use super::terra::mmio::machine_types::Error;
-use super::terra::mmio::virtualization::{Architecture, Config, Vm};
-use std::sync::{Arc, Mutex};
-
-#[derive(PartialEq)]
-enum VcpuState {
-    Prepared,
-    Running,
-    Stopped,
-}
+use super::exports::terra::vmm::machine::Guest;
+use super::terra::vmm::machine_types::Error;
+use super::terra::vmm::virtualization::{Architecture, Vm};
+use std::sync::{Mutex, MutexGuard};
 
 struct Machine {
-    vm: Arc<Vm>,
-    vcpu_state: VcpuState,
-    vcpus: Option<Vec<super::terra::mmio::platform::Vcpu>>,
+    vm: Vm,
+    is_running: bool,
+    vcpus: Option<Vec<super::terra::vmm::platform::Vcpu>>,
+    powered_cpus: Vec<bool>,
 }
 
 static VM: Mutex<Option<Machine>> = Mutex::new(None);
 
+fn lock_machine() -> MutexGuard<'static, Option<Machine>> {
+    VM.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 impl Guest for super::Dispatcher {
     fn initialize(
-        config: Config,
+        architecture: Architecture,
         vm: Vm,
-        vcpus: Vec<super::terra::mmio::platform::Vcpu>,
+        vcpus: Vec<super::terra::vmm::platform::Vcpu>,
     ) -> Result<(), Error> {
-        let mut machine = VM.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut machine = lock_machine();
         if machine.is_some() {
             return Err(Error::AlreadyCreated);
         }
-        if vcpus.len() != usize::from(config.vcpus) {
-            return Err(Error::InvalidVcpus);
-        }
-        let (max_devices, max_vcpus) = match config.architecture {
-            Architecture::X86 => (terra_limits::X86_MAX_DEVICES, terra_limits::X86_MAX_VCPUS),
-            Architecture::Arm => (terra_limits::ARM_MAX_DEVICES, terra_limits::ARM_MAX_VCPUS),
+        let max_vcpus = match architecture {
+            Architecture::X86 => terra_limits::X86_MAX_VCPUS,
+            Architecture::Arm => terra_limits::ARM_MAX_VCPUS,
         };
-        if config.devices.len() > max_devices || config.vcpus == 0 || config.vcpus > max_vcpus {
+        if vcpus.is_empty() || vcpus.len() > usize::from(max_vcpus) {
             return Err(Error::InvalidVcpus);
         }
-        super::configure_vcpus(config.vcpus).map_err(|_| Error::Platform)?;
+        let mut powered_cpus = vec![false; vcpus.len()];
+        powered_cpus[0] = true;
         *machine = Some(Machine {
-            vm: Arc::new(vm),
-            vcpu_state: VcpuState::Prepared,
+            vm,
+            is_running: false,
             vcpus: Some(vcpus),
+            powered_cpus,
         });
-        Ok(())
-    }
-
-    fn compose() -> Result<(), Error> {
-        let mut machine = VM.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let machine = machine.as_mut().ok_or(Error::InvalidState)?;
-        if machine.vcpu_state != VcpuState::Prepared {
-            return Err(Error::InvalidState);
-        }
-        machine.vcpu_state = VcpuState::Running;
         Ok(())
     }
 }
 
+pub(super) fn with_powered_cpus<T>(
+    apply: impl FnOnce(&mut [bool]) -> T,
+) -> Result<T, super::Error> {
+    let mut machine = lock_machine();
+    let machine = machine.as_mut().ok_or(super::Error::InvalidVcpu)?;
+    Ok(apply(&mut machine.powered_cpus))
+}
+
 pub fn request_stop() -> Result<(), Error> {
-    let machine = VM.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(machine) = machine
-        .as_ref()
-        .filter(|machine| machine.vcpu_state == VcpuState::Running)
-    {
+    let machine = lock_machine();
+    if let Some(machine) = machine.as_ref().filter(|machine| machine.is_running) {
         machine.vm.request_stop().map_err(|_| Error::Platform)?;
     }
     Ok(())
 }
 
 pub fn mark_stopped() {
-    if let Some(machine) = VM
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .as_mut()
-        .filter(|machine| machine.vcpu_state == VcpuState::Running)
-    {
-        machine.vcpu_state = VcpuState::Stopped;
+    if let Some(machine) = lock_machine().as_mut() {
+        machine.is_running = false;
     }
 }
 
 pub fn release() -> Result<(), Error> {
-    let mut machine = VM.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if machine
-        .as_ref()
-        .is_some_and(|machine| machine.vcpu_state == VcpuState::Running)
-    {
+    let mut machine = lock_machine();
+    if machine.as_ref().is_some_and(|machine| machine.is_running) {
         return Err(Error::InvalidState);
     }
     if let Some(Machine { vm, vcpus, .. }) = machine.take() {
@@ -95,13 +79,14 @@ pub fn release() -> Result<(), Error> {
     Ok(())
 }
 
-pub async fn run_vcpus() -> Result<(), Error> {
-    let vcpus = VM
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .as_mut()
-        .and_then(|machine| machine.vcpus.take())
-        .ok_or(Error::InvalidState)?;
+pub async fn run_vcpus() -> Result<(), super::Error> {
+    let vcpus = {
+        let mut machine = lock_machine();
+        let machine = machine.as_mut().ok_or(super::Error::InvalidVcpu)?;
+        let vcpus = machine.vcpus.take().ok_or(super::Error::InvalidVcpu)?;
+        machine.is_running = true;
+        vcpus
+    };
     futures_util::future::try_join_all(
         vcpus
             .into_iter()
@@ -110,5 +95,4 @@ pub async fn run_vcpus() -> Result<(), Error> {
     )
     .await
     .map(|_| ())
-    .map_err(|_| Error::Platform)
 }

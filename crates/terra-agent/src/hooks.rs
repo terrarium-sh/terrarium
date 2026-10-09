@@ -197,7 +197,7 @@ mod tests {
         )
         .unwrap();
         let (host, guest) = UnixStream::pair().unwrap();
-        let client = ClientConn::from_vsock(File::from(OwnedFd::from(guest))).unwrap();
+        let client = ClientConn::from_file(File::from(OwnedFd::from(guest))).unwrap();
         let _ = session.attach_client(&client).await;
         host.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let mut host = host;

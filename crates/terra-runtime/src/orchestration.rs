@@ -1,6 +1,6 @@
 //! VM component orchestration and guest device assembly.
 
-use crate::component::network::{PolicyHandle, PortMapping};
+use crate::component::network::{NetworkBackend, PortMapping};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -23,7 +23,7 @@ pub struct VmInput {
     pub shares: Vec<crate::component::fs::ShareGrant>,
     pub plan: Vec<u8>,
     pub artifacts: crate::TrustedArtifacts,
-    pub network_policy: PolicyHandle,
+    pub network_backend: Option<NetworkBackend>,
     pub port_mappings: Vec<PortMapping>,
     pub ram_bytes: u64,
     pub component_memory_limits: crate::box_runtime::ComponentMemoryLimits,
@@ -62,6 +62,9 @@ pub async fn prepare(mut input: VmInput) -> Result<PreparedVm, String> {
     let layout =
         crate::machine::build_machine_layout(input.ram_bytes, 1 + disks.len(), input.shares.len())
             .map_err(|error| format!("invalid guest layout: {error:?}"))?;
+    if input.network_backend.is_none() && !input.port_mappings.is_empty() {
+        return Err("local-only VM cannot publish ports".into());
+    }
     let config = layout
         .to_machine_config(input.vcpus)
         .map_err(|error| error.to_string())?;
@@ -207,6 +210,13 @@ fn start_native_vcpus(
     boot: crate::component::vmm::BootEntry,
     handlers: Vec<Box<dyn vm::VcpuHandler>>,
 ) -> wasmtime::Result<crate::component::vmm::StartedVcpus> {
+    log::info!(
+        "terra boot_stage=vm_entry unix_time_ns={}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
     let running = native
         .start(
             vm::BootState {
@@ -325,7 +335,7 @@ async fn boot_prepared<M: crate::component::vmm::VirtualMachine>(
         )
         .await?;
     prepared.accept_boot(entry)?;
-    runtime.initialize_mmio_artifact(&input.artifacts).await?;
+    runtime.initialize_mmio()?;
     runtime.initialize_vmm_artifact(&input.artifacts).await?;
     runtime.attach_machine(prepared).await
 }

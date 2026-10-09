@@ -45,12 +45,12 @@ impl CpuStarts {
     }
 
     fn start(&self, mpidr: u64, entry: u64, context: u64) -> i64 {
+        if self.stopped.load(Ordering::SeqCst) {
+            return -3;
+        }
         let Ok(cpu) = usize::try_from(mpidr) else {
             return -2;
         };
-        if cpu == 0 {
-            return -4;
-        }
         let Some(sender) = self.senders.get(cpu) else {
             return -2;
         };
@@ -113,6 +113,7 @@ impl<'a> RegisteredCpu<'a> {
 
 impl Drop for RegisteredCpu<'_> {
     fn drop(&mut self) {
+        self.starts.stop();
         let id = self.cpu.handle().id();
         let mut handles = self
             .starts
@@ -224,7 +225,7 @@ impl VcpuGroup {
         let starts = Arc::new(CpuStarts {
             machine: Arc::clone(machine),
             handles: Mutex::new(Vec::with_capacity(vcpu_count)),
-            started: Mutex::new(vec![false; vcpu_count]),
+            started: Mutex::new((0..vcpu_count).map(|cpu| cpu == 0).collect()),
             senders,
             stopped: AtomicBool::new(false),
         });
@@ -284,8 +285,8 @@ impl VcpuGroup {
     }
 
     fn stop(&mut self) -> Result<Vec<Result<(), String>>, String> {
+        stop_threads(&self.starts, &self.threads, self.hard_stop)?;
         let threads = std::mem::take(&mut self.threads);
-        stop_threads(&self.starts, &threads, self.hard_stop)?;
         Ok(threads
             .into_iter()
             .map(|thread| {
@@ -306,12 +307,15 @@ fn spawn_cpu(
 ) -> Result<thread::JoinHandle<Result<(), String>>, String> {
     thread::Builder::new()
         .spawn(move || {
-            let result = (|| -> Result<(), String> {
-                let mut registered = RegisteredCpu::create(&starts, cpu_id)?;
+            let mut registered = None;
+            let mut handler = None;
+            let mut result = (|| -> Result<(), String> {
+                registered = Some(RegisteredCpu::create(&starts, cpu_id)?);
+                let registered = registered.as_ref().ok_or("vCPU context missing")?;
                 ready_sender
                     .send(Ok(()))
                     .map_err(|_| "vCPU setup receiver disappeared")?;
-                let (mut handler, boot) = match receiver
+                let (installed_handler, boot) = match receiver
                     .recv()
                     .map_err(|_| "vCPU startup sender disappeared")?
                 {
@@ -321,6 +325,8 @@ fn spawn_cpu(
                         return Err("vCPU started before native startup".to_owned());
                     }
                 };
+                handler = Some(installed_handler);
+                let handler = handler.as_deref_mut().ok_or("vCPU handler missing")?;
                 if cpu_id == 0 {
                     let boot = boot.ok_or("bootstrap vCPU missing boot entry")?;
                     registered
@@ -332,41 +338,41 @@ fn spawn_cpu(
                         .set_reg(applevisor::prelude::Reg::X0, boot.boot_argument)
                         .map_err(|error| error.to_string())?;
                     loop {
-                        match run_one(&registered.cpu, cpu_id, handler.as_mut(), &starts)? {
+                        match run_one(&registered.cpu, cpu_id, handler, &starts)? {
                             CpuRun::Continue => {}
-                            CpuRun::Off | CpuRun::Stop => {
+                            CpuRun::Off => {
+                                starts.powered_off(cpu_id);
+                                break;
+                            }
+                            CpuRun::Stop => {
                                 handler.finished(VcpuOutcome::Stopped);
                                 return Ok(());
                             }
                         }
                     }
-                }
-                if boot.is_some() {
+                } else if boot.is_some() {
                     return Err("secondary vCPU received boot entry".to_owned());
                 }
                 while let Ok(command) = receiver.recv() {
                     let (entry, context) = match command {
                         CpuCommand::CpuStart(entry, context) => (entry, context),
-                        CpuCommand::Stop => return Ok(()),
+                        CpuCommand::Stop => {
+                            handler.finished(VcpuOutcome::Stopped);
+                            return Ok(());
+                        }
                         CpuCommand::Start { .. } => {
                             return Err("secondary vCPU started twice".to_owned());
                         }
                     };
                     registered
                         .cpu
-                        .set_reg(applevisor::prelude::Reg::PC, entry)
-                        .map_err(|error| error.to_string())?;
-                    registered
-                        .cpu
-                        .set_reg(applevisor::prelude::Reg::X0, context)
+                        .reset_for_start(entry, context)
                         .map_err(|error| error.to_string())?;
                     loop {
-                        match run_one(&registered.cpu, cpu_id, handler.as_mut(), &starts)? {
+                        match run_one(&registered.cpu, cpu_id, handler, &starts)? {
                             CpuRun::Continue => {}
                             CpuRun::Off => {
                                 starts.powered_off(cpu_id);
-                                drop(registered);
-                                registered = RegisteredCpu::create(&starts, cpu_id)?;
                                 break;
                             }
                             CpuRun::Stop => {
@@ -378,6 +384,11 @@ fn spawn_cpu(
                 }
                 Ok(())
             })();
+            if let Some(handler) = handler.as_deref_mut() {
+                result = crate::vm::report_vcpu_failure(cpu_id, handler, result);
+            } else if let Err(error) = &result {
+                let _ = ready_sender.send(Err(error.clone()));
+            }
             if result.is_err() {
                 starts.stop();
             }
@@ -400,6 +411,9 @@ fn run_one(
     handler: &mut dyn VcpuHandler,
     starts: &CpuStarts,
 ) -> Result<CpuRun, String> {
+    if starts.stopped.load(Ordering::SeqCst) {
+        return Ok(CpuRun::Stop);
+    }
     match cpu.run().map_err(|error| error.to_string())? {
         RunExit::Canceled => Ok(CpuRun::Stop),
         RunExit::Timer => Err(format!(
@@ -410,16 +424,11 @@ fn run_one(
             physical_address,
             ..
         } => {
-            let mut action = handler.exchange(VcpuExit::ArmException(ArmException {
-                address: physical_address,
-                syndrome,
-            }))?;
-            while let VcpuAction::ArmRegister(register) = action {
-                let value = cpu
-                    .arm_register_value(register)
-                    .map_err(|error| error.to_string())?;
-                action = handler.exchange(VcpuExit::ArmRegisterValue(value))?;
-            }
+            let exception = ArmException::capture(physical_address, syndrome, |register| {
+                cpu.arm_register_value(register)
+                    .map_err(|error| error.to_string())
+            })?;
+            let action = handler.exchange(VcpuExit::ArmException(exception))?;
             match action {
                 VcpuAction::ArmRead(ArmRead { register, value }) => {
                     cpu.set_arm_mmio_read(register, value)
@@ -460,7 +469,6 @@ fn run_one(
                 | VcpuAction::Rdmsr(_)
                 | VcpuAction::MsrFault
                 | VcpuAction::Wrmsr
-                | VcpuAction::ArmRegister(_)
                 | VcpuAction::IoApicValue(_) => Err("unexpected ARM VMM completion".to_owned()),
             }
         }
@@ -486,12 +494,17 @@ mod tests {
         fn finished(&mut self, _outcome: VcpuOutcome) {}
     }
 
-    /// Hold teardown's handle lock across guest `CPU_OFF`, then issue the native exit.
-    /// `CPU_OFF` must not destroy the registered CPU until that exit finishes, and
-    /// the replacement CPU must also unregister when it receives Stop.
+    /// Apple's running GIC topology requires `CPU_OFF`/`CPU_ON` to retain the vCPU.
+    /// Teardown must hold the handle alive until the native exit call returns.
     #[test]
     #[ignore = "requires Apple Silicon Hypervisor.framework and hypervisor entitlement"]
-    fn cpu_off_waits_for_teardown_before_destroying_cpu() {
+    fn cpu_power_cycles_preserve_the_handle_until_teardown() {
+        for cpu_id in [0, 1] {
+            power_cycle_cpu(cpu_id);
+        }
+    }
+
+    fn power_cycle_cpu(cpu_id: usize) {
         let machine = Arc::new(
             Machine::new(&VmConfig {
                 ram_base: terra_limits::ARM_RAM_BASE,
@@ -516,31 +529,40 @@ mod tests {
         let starts = Arc::new(CpuStarts {
             machine,
             handles: Mutex::new(Vec::new()),
-            started: Mutex::new(vec![false; 2]),
+            started: Mutex::new(vec![cpu_id == 0, false]),
             senders: vec![sender.clone(), sender.clone()],
             stopped: AtomicBool::new(false),
         });
         let (ready_sender, ready_receiver) = mpsc::channel();
-        let worker = spawn_cpu(1, Arc::clone(&starts), receiver, ready_sender).unwrap();
+        let worker = spawn_cpu(cpu_id, Arc::clone(&starts), receiver, ready_sender).unwrap();
         ready_receiver.recv_timeout(STOP_WAIT).unwrap().unwrap();
         let (off_sender, off_receiver) = mpsc::channel();
         sender
             .send(CpuCommand::Start {
                 handler: Box::new(PowerOffHandler(off_sender)),
-                boot: None,
+                boot: (cpu_id == 0).then_some(BootState {
+                    entry,
+                    boot_argument: 0,
+                }),
             })
             .unwrap();
 
         let handles = starts.handles.lock().unwrap();
         let handle = handles[0].clone();
-        assert_eq!(starts.start(1, entry, 0), 0);
-        off_receiver.recv_timeout(STOP_WAIT).unwrap();
-        let deadline = Instant::now() + STOP_WAIT;
-        while starts.started.lock().unwrap()[1] && Instant::now() < deadline {
-            thread::yield_now();
+        for context in 0..3 {
+            if cpu_id != 0 || context != 0 {
+                assert_eq!(starts.start(cpu_id as u64, entry, context), 0);
+            }
+            off_receiver.recv_timeout(STOP_WAIT).unwrap();
+            let deadline = Instant::now() + STOP_WAIT;
+            while starts.started.lock().unwrap()[cpu_id] && Instant::now() < deadline {
+                thread::yield_now();
+            }
+            assert!(!starts.started.lock().unwrap()[cpu_id]);
+            assert!(handle.is_valid());
         }
-        assert!(!starts.started.lock().unwrap()[1]);
         starts.stopped.store(true, Ordering::SeqCst);
+        assert_eq!(starts.start(cpu_id as u64, entry, 0), -3);
         sender.send(CpuCommand::Stop).unwrap();
         let deadline = Instant::now() + Duration::from_millis(100);
         while handle.is_valid() && Instant::now() < deadline {

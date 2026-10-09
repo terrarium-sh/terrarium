@@ -1,4 +1,4 @@
-//! Isolated Wasm boot preparation for a fixed native machine.
+//! Validates and applies import-free Wasm boot plans.
 
 use std::time::Duration;
 
@@ -7,20 +7,19 @@ use wasmtime::component::Component;
 use crate::box_runtime::BoxRuntime;
 #[cfg(test)]
 use crate::box_runtime::store::BoxHost;
-use crate::box_runtime::store::StoreState;
-use crate::machine::{Architecture, Device, DeviceKind, MachineConfig};
+use crate::machine::{Architecture, DeviceKind, MachineConfig};
 use crate::memory::{BoundedMemory, GuestRam};
-use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+use terra_limits::{
+    MAX_BOOT_COMMAND_LINE_BYTES, MAX_BOOT_KERNEL_BYTES, MAX_BOOT_KERNEL_PREFIX_BYTES,
+    MAX_BOOT_KERNEL_SEGMENTS, MAX_BOOT_WRITE_BYTES, MAX_BOOT_WRITES,
+};
 
 wasmtime::component::bindgen!({
     world: "boot-component", path: "../../components/boot/wit",
-    imports: { default: trappable },
     exports: { default: async },
 });
 
 const BOOT_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_KERNEL_BYTES: usize = 64 * 1024 * 1024;
-const MAX_KERNEL_PREFIX_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug)]
 pub struct BootEntry {
@@ -28,155 +27,133 @@ pub struct BootEntry {
     pub boot_argument: u64,
 }
 
-struct BootGrant {
-    config: MachineConfig,
-    ram: GuestRam,
-    kernel: Vec<u8>,
-    remaining_kernel_copy_bytes: u64,
-}
+pub struct BootHost;
 
-pub struct BootHost {
-    grant: Option<BootGrant>,
-    ctx: WasiCtx,
-    table: ResourceTable,
-}
-impl Default for BootHost {
-    fn default() -> Self {
-        Self {
-            grant: None,
-            table: ResourceTable::new(),
-            ctx: WasiCtxBuilder::new()
-                .max_random_size(crate::MAX_SINGLE_BYTES)
-                .allow_tcp(false)
-                .allow_udp(false)
-                .allow_ip_name_lookup(false)
-                .build(),
-        }
-    }
-}
-impl WasiView for BootHost {
-    fn ctx(&mut self) -> WasiCtxView<'_> {
-        WasiCtxView {
-            ctx: &mut self.ctx,
-            table: &mut self.table,
-        }
+fn render_machine_config(config: &MachineConfig) -> exports::terra::boot::boot::Machine {
+    exports::terra::boot::boot::Machine {
+        architecture: match config.architecture() {
+            Architecture::X86 => exports::terra::boot::boot::Architecture::X86,
+            Architecture::Arm => exports::terra::boot::boot::Architecture::Arm,
+        },
+        ram_bytes: config.ram_bytes(),
+        vcpus: config.vcpus(),
+        devices: config
+            .devices()
+            .iter()
+            .map(|device| exports::terra::boot::boot::Device {
+                kind: match device.kind {
+                    DeviceKind::Block => exports::terra::boot::boot::DeviceKind::Block,
+                    DeviceKind::Vsock => exports::terra::boot::boot::DeviceKind::Vsock,
+                    DeviceKind::Fs => exports::terra::boot::boot::DeviceKind::Fs,
+                    DeviceKind::Memory => exports::terra::boot::boot::DeviceKind::Memory,
+                },
+                mmio_base: device.mmio_base,
+                irq: device.irq,
+            })
+            .collect(),
     }
 }
 
-fn bounds() -> terra::boot::types::Error {
-    terra::boot::types::Error::Bounds
+fn validate_plan(
+    plan: &exports::terra::boot::boot::Plan,
+    ram: &GuestRam,
+    kernel_bytes: u64,
+) -> wasmtime::Result<()> {
+    wasmtime::ensure!(
+        !plan.kernel_segments.is_empty() && plan.kernel_segments.len() <= MAX_BOOT_KERNEL_SEGMENTS,
+        "boot plan exceeds kernel segment limit"
+    );
+    wasmtime::ensure!(
+        plan.writes.len() <= MAX_BOOT_WRITES,
+        "boot plan exceeds write limit"
+    );
+    let mut copied = 0_u64;
+    for segment in &plan.kernel_segments {
+        wasmtime::ensure!(
+            segment.file_length <= segment.memory_length,
+            "boot segment exceeds its memory range"
+        );
+        let source_end = segment
+            .source_offset
+            .checked_add(segment.file_length)
+            .ok_or_else(|| wasmtime::Error::msg("boot kernel source range overflows"))?;
+        wasmtime::ensure!(
+            source_end <= kernel_bytes,
+            "boot kernel source range exceeds image"
+        );
+        copied = copied
+            .checked_add(segment.file_length)
+            .ok_or_else(|| wasmtime::Error::msg("boot kernel copy budget overflows"))?;
+        wasmtime::ensure!(
+            copied <= kernel_bytes,
+            "boot kernel copies exceed image budget"
+        );
+        ram.memory()
+            .validate_range(segment.guest_address, segment.memory_length)
+            .map_err(|error| wasmtime::Error::msg(format!("boot segment: {error:?}")))?;
+    }
+    for write in &plan.writes {
+        wasmtime::ensure!(
+            write.bytes.len() <= MAX_BOOT_WRITE_BYTES,
+            "boot data exceeds write budget"
+        );
+        ram.memory()
+            .validate_range(write.address, u64::try_from(write.bytes.len())?)
+            .map_err(|error| wasmtime::Error::msg(format!("boot write: {error:?}")))?;
+    }
+    wasmtime::ensure!(
+        plan.kernel_segments.iter().any(|segment| {
+            segment.guest_address <= plan.entry
+                && segment
+                    .guest_address
+                    .checked_add(segment.memory_length)
+                    .is_some_and(|end| plan.entry < end)
+        }),
+        "boot entry is outside kernel segments"
+    );
+    ram.memory()
+        .validate_range(plan.boot_argument, 1)
+        .map_err(|error| wasmtime::Error::msg(format!("boot argument: {error:?}")))?;
+    Ok(())
 }
 
-impl BootHost {
-    fn grant(
-        &mut self,
-        config: MachineConfig,
-        ram: GuestRam,
-        kernel: Vec<u8>,
-    ) -> wasmtime::Result<()> {
-        wasmtime::ensure!(self.grant.is_none(), "boot capabilities already granted");
-        let remaining_kernel_copy_bytes = u64::try_from(kernel.len())?;
-        self.grant = Some(BootGrant {
-            config,
-            ram,
-            kernel,
-            remaining_kernel_copy_bytes,
-        });
-        Ok(())
+fn write_boot_bytes(ram: &GuestRam, address: u64, bytes: &[u8]) -> wasmtime::Result<()> {
+    let memory = BoundedMemory::new(ram);
+    let chunk_bytes = usize::try_from(terra_limits::MAX_SINGLE_GUEST_COPY_BYTES)?;
+    for (offset, chunk) in bytes.chunks(chunk_bytes).enumerate() {
+        let address = address
+            .checked_add(u64::try_from(offset * chunk_bytes)?)
+            .ok_or_else(|| wasmtime::Error::msg("boot write address overflows"))?;
+        memory
+            .write(address, chunk)
+            .map_err(|error| wasmtime::Error::msg(format!("boot memory copy: {error:?}")))?;
     }
-
-    fn get(&mut self) -> Result<&mut BootGrant, terra::boot::types::Error> {
-        self.grant.as_mut().ok_or_else(bounds)
-    }
+    Ok(())
 }
 
-impl terra::boot::host::Host for BootHost {
-    fn machine_config(&mut self) -> wasmtime::Result<terra::boot::types::Machine> {
-        let Some(grant) = self.grant.as_ref() else {
-            return Ok(terra::boot::types::Machine {
-                architecture: terra::boot::types::Architecture::X86,
-                ram_bytes: 0,
-                vcpus: 0,
-                devices: Vec::new(),
-            });
-        };
-        Ok(terra::boot::types::Machine {
-            architecture: match grant.config.architecture() {
-                Architecture::X86 => terra::boot::types::Architecture::X86,
-                Architecture::Arm => terra::boot::types::Architecture::Arm,
-            },
-            ram_bytes: grant.config.ram_bytes(),
-            vcpus: grant.config.vcpus(),
-            devices: grant
-                .config
-                .devices()
-                .iter()
-                .map(|device: &Device| terra::boot::types::Device {
-                    kind: match device.kind {
-                        DeviceKind::Block => terra::boot::types::DeviceKind::Block,
-                        DeviceKind::Net => terra::boot::types::DeviceKind::Net,
-                        DeviceKind::Vsock => terra::boot::types::DeviceKind::Vsock,
-                        DeviceKind::Fs => terra::boot::types::DeviceKind::Fs,
-                        DeviceKind::Memory => terra::boot::types::DeviceKind::Memory,
-                    },
-                    mmio_base: device.mmio_base,
-                    irq: device.irq,
-                })
-                .collect(),
-        })
+fn apply_plan(
+    plan: &exports::terra::boot::boot::Plan,
+    ram: &GuestRam,
+    kernel: &[u8],
+) -> wasmtime::Result<BootEntry> {
+    validate_plan(plan, ram, u64::try_from(kernel.len())?)?;
+    for segment in &plan.kernel_segments {
+        let start = usize::try_from(segment.source_offset)?;
+        let end = start
+            .checked_add(usize::try_from(segment.file_length)?)
+            .ok_or_else(|| wasmtime::Error::msg("boot kernel source range overflows"))?;
+        let bytes = kernel
+            .get(start..end)
+            .ok_or_else(|| wasmtime::Error::msg("boot kernel source range exceeds image"))?;
+        write_boot_bytes(ram, segment.guest_address, bytes)?;
     }
-
-    fn kernel_size(&mut self) -> wasmtime::Result<u64> {
-        Ok(self
-            .grant
-            .as_ref()
-            .and_then(|grant| u64::try_from(grant.kernel.len()).ok())
-            .unwrap_or(0))
+    for write in &plan.writes {
+        write_boot_bytes(ram, write.address, &write.bytes)?;
     }
-
-    fn kernel_prefix(&mut self) -> wasmtime::Result<Result<Vec<u8>, terra::boot::types::Error>> {
-        let grant = self.get()?;
-        Ok(Ok(grant.kernel
-            [..grant.kernel.len().min(MAX_KERNEL_PREFIX_BYTES)]
-            .to_vec()))
-    }
-
-    fn copy_kernel(
-        &mut self,
-        source_offset: u64,
-        guest_address: u64,
-        length: u32,
-    ) -> wasmtime::Result<Result<(), terra::boot::types::Error>> {
-        Ok((|| {
-            let grant = self.get()?;
-            let length = usize::try_from(length).map_err(|_| bounds())?;
-            let source_offset = usize::try_from(source_offset).map_err(|_| bounds())?;
-            let source_end = source_offset.checked_add(length).ok_or_else(bounds)?;
-            let bytes = grant
-                .kernel
-                .get(source_offset..source_end)
-                .ok_or_else(bounds)?;
-            let copied = u64::try_from(length).map_err(|_| bounds())?;
-            if copied > grant.remaining_kernel_copy_bytes {
-                return Err(bounds());
-            }
-            BoundedMemory::new(&grant.ram)
-                .write(guest_address, bytes)
-                .map_err(|_| bounds())?;
-            grant.remaining_kernel_copy_bytes -= copied;
-            Ok(())
-        })())
-    }
-
-    fn write_ram(
-        &mut self,
-        address: u64,
-        bytes: Vec<u8>,
-    ) -> wasmtime::Result<Result<(), terra::boot::types::Error>> {
-        Ok(BoundedMemory::new(&self.get()?.ram)
-            .write(address, &bytes)
-            .map_err(|_| bounds()))
-    }
+    Ok(BootEntry {
+        entry: plan.entry,
+        boot_argument: plan.boot_argument,
+    })
 }
 
 impl BoxRuntime {
@@ -189,45 +166,39 @@ impl BoxRuntime {
         command_line: &str,
     ) -> wasmtime::Result<BootEntry> {
         wasmtime::ensure!(
-            !kernel.is_empty() && kernel.len() <= MAX_KERNEL_BYTES,
+            !kernel.is_empty() && u64::try_from(kernel.len())? <= MAX_BOOT_KERNEL_BYTES,
             "kernel image must be between 1 byte and 64 MiB"
         );
         wasmtime::ensure!(
-            command_line.len() <= 2048,
+            command_line.len() <= MAX_BOOT_COMMAND_LINE_BYTES,
             "kernel command line exceeds boot limit"
         );
-        let mut boot_store = self.new_child(BootHost::default());
-        boot_store
-            .store
-            .data_mut()
-            .grant(config.clone(), ram.clone(), kernel)?;
-        let mut linker = wasmtime::component::Linker::new(self.store.engine());
-        terra::boot::host::add_to_linker::<
-            StoreState<BootHost>,
-            wasmtime::component::HasSelf<BootHost>,
-        >(&mut linker, AsMut::as_mut)?;
-        let entry = tokio::time::timeout(BOOT_TIMEOUT, async {
+        let mut boot_store = self.new_child(BootHost);
+        let linker = wasmtime::component::Linker::new(self.store.engine());
+        let machine = render_machine_config(config);
+        let prefix = &kernel[..kernel.len().min(MAX_BOOT_KERNEL_PREFIX_BYTES)];
+        let plan = tokio::time::timeout(BOOT_TIMEOUT, async {
             let boot =
                 BootComponent::instantiate_async(&mut boot_store.store, component, &linker).await?;
-            let entry = boot
-                .terra_boot_boot()
-                .call_stage(&mut boot_store.store, command_line)
-                .await?;
-            Ok::<_, wasmtime::Error>(entry)
+            boot.terra_boot_boot()
+                .call_stage(
+                    &mut boot_store.store,
+                    &machine,
+                    prefix,
+                    u64::try_from(kernel.len())?,
+                    command_line,
+                )
+                .await
         })
         .await??;
-        let entry = entry.map_err(|error| wasmtime::Error::msg(format!("Wasm boot: {error:?}")))?;
+        let plan = plan.map_err(|error| wasmtime::Error::msg(format!("Wasm boot: {error:?}")))?;
         drop(boot_store);
-        Ok(BootEntry {
-            entry: entry.entry,
-            boot_argument: entry.boot_argument,
-        })
+        apply_plan(&plan, &ram, &kernel)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::terra::boot::host::Host as _;
     use super::*;
 
     fn hostile_component(engine: &wasmtime::Engine, body: &str) -> Component {
@@ -236,13 +207,22 @@ mod tests {
             format!(
                 r#"
                 (component
-                    (type $entry (record (field "entry" u64) (field "boot-argument" u64)))
-                    (type $error (enum "invalid-ram" "invalid-vcpus" "invalid-device" "command-line-too-long" "invalid-kernel" "kernel-architecture" "kernel-layout" "kernel-too-large" "boot-data-too-large" "unavailable" "bounds"))
-                    (type $stage-type (func (param "kernel-command-line" string) (result (result $entry (error $error)))))
+                    (type $architecture (enum "x86" "arm"))
+                    (type $device-kind (enum "block" "vsock" "fs" "memory"))
+                    (type $device (record (field "kind" $device-kind) (field "mmio-base" u64) (field "irq" u32)))
+                    (type $devices (list $device))
+                    (type $machine (record (field "architecture" $architecture) (field "ram-bytes" u64) (field "vcpus" u8) (field "devices" $devices)))
+                    (type $segment (record (field "source-offset" u64) (field "guest-address" u64) (field "file-length" u64) (field "memory-length" u64)))
+                    (type $segments (list $segment))
+                    (type $write (record (field "address" u64) (field "bytes" (list u8))))
+                    (type $writes (list $write))
+                    (type $plan (record (field "entry" u64) (field "boot-argument" u64) (field "kernel-segments" $segments) (field "writes" $writes)))
+                    (type $error (enum "invalid-ram" "invalid-vcpus" "invalid-device" "command-line-too-long" "invalid-kernel" "kernel-architecture" "kernel-layout" "kernel-too-large" "boot-data-too-large" "bounds"))
+                    (type $stage-type (func (param "machine" $machine) (param "kernel-prefix" (list u8)) (param "kernel-size" u64) (param "kernel-command-line" string) (result (result $plan (error $error)))))
                     (core module $module
                         (memory (export "memory") 1)
                         (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) i32.const 64)
-                        (func (export "stage") (param i32 i32) (result i32) {body} i32.const 0)
+                        (func (export "stage") (param i32 i64 i32 i32 i32 i32 i32 i64 i32 i32) (result i32) {body} i32.const 0)
                     )
                     (core instance $instance (instantiate $module))
                     (alias core export $instance "memory" (core memory $memory))
@@ -250,7 +230,15 @@ mod tests {
                     (alias core export $instance "stage" (core func $stage-core))
                     (func $stage (type $stage-type)
                         (canon lift (core func $stage-core) (memory $memory) (realloc $realloc)))
-                    (instance $boot (export "boot-entry" (type $entry)) (export "error" (type $error)) (export "stage" (func $stage)))
+                    (instance $boot
+                        (export "architecture" (type $architecture))
+                        (export "device-kind" (type $device-kind))
+                        (export "device" (type $device))
+                        (export "machine" (type $machine))
+                        (export "kernel-segment" (type $segment))
+                        (export "guest-write" (type $write))
+                        (export "plan" (type $plan))
+                        (export "error" (type $error)) (export "stage" (func $stage)))
                     (export "terra:boot/boot@0.1.0" (instance $boot))
                 )
                 "#
@@ -300,8 +288,11 @@ mod tests {
         let component =
             Component::new(&engine, crate::test_fixtures::wasm::BOOT).expect("boot component");
         let ram = GuestRam::new(2 << 20).expect("test RAM");
-        let config = MachineConfig::new(Architecture::X86, ram.mapped_bytes(), 1, Vec::new())
-            .expect("test machine configuration");
+        let config =
+            crate::machine::build_machine_layout_for(Architecture::X86, ram.mapped_bytes(), 1, 0)
+                .expect("test machine layout")
+                .to_machine_config(1)
+                .expect("test machine configuration");
 
         assert!(
             runtime
@@ -311,31 +302,111 @@ mod tests {
         );
     }
 
+    fn plan() -> exports::terra::boot::boot::Plan {
+        exports::terra::boot::boot::Plan {
+            entry: 0,
+            boot_argument: 16,
+            kernel_segments: vec![exports::terra::boot::boot::KernelSegment {
+                source_offset: 0,
+                guest_address: 0,
+                file_length: 3,
+                memory_length: 4,
+            }],
+            writes: vec![exports::terra::boot::boot::GuestWrite {
+                address: 16,
+                bytes: vec![9; 2],
+            }],
+        }
+    }
+
     #[test]
     fn kernel_copies_are_bounded_and_cannot_exceed_the_image_budget() {
         let ram = GuestRam::new(4096).expect("test RAM");
-        let config = MachineConfig::new(Architecture::X86, 4096, 1, Vec::new())
-            .expect("test machine configuration");
-        let mut host = BootHost::default();
-        host.grant(config, ram.clone(), vec![7; 4])
-            .expect("boot grant");
+        let mut plan = plan();
+        apply_plan(&plan, &ram, &[7; 4]).unwrap();
+        assert_eq!(BoundedMemory::new(&ram).read(0, 4).unwrap(), [7, 7, 7, 0]);
+        assert_eq!(BoundedMemory::new(&ram).read(16, 2).unwrap(), [9, 9]);
+        plan.kernel_segments
+            .push(exports::terra::boot::boot::KernelSegment {
+                source_offset: 0,
+                guest_address: 4,
+                file_length: 2,
+                memory_length: 2,
+            });
+        assert!(apply_plan(&plan, &ram, &[7; 4]).is_err());
+        plan.kernel_segments.pop();
+        plan.kernel_segments[0].source_offset = u64::MAX;
+        assert!(apply_plan(&plan, &ram, &[7; 4]).is_err());
+    }
 
-        assert_eq!(host.copy_kernel(0, 0, 3).expect("host call"), Ok(()));
-        assert!(matches!(
-            host.copy_kernel(0, 3, 2),
-            Ok(Err(terra::boot::types::Error::Bounds))
-        ));
-        assert!(matches!(
-            host.copy_kernel(u64::MAX, 0, 1),
-            Ok(Err(terra::boot::types::Error::Bounds))
-        ));
-        assert!(matches!(
-            host.write_ram(0, vec![0; 16 * 1024 + 1]),
-            Ok(Err(terra::boot::types::Error::Bounds))
-        ));
+    /// The entire hostile plan is rejected before an earlier valid write mutates guest RAM.
+    #[test]
+    fn invalid_boot_plans_do_not_mutate_ram() {
+        let ram = GuestRam::new(4096).unwrap();
+        let mut cases = Vec::new();
+        let mut invalid = plan();
+        invalid.writes.push(exports::terra::boot::boot::GuestWrite {
+            address: 4096,
+            bytes: vec![1],
+        });
+        cases.push(invalid);
+        let mut invalid = plan();
+        invalid.writes[0].bytes = vec![1; MAX_BOOT_WRITE_BYTES + 1];
+        cases.push(invalid);
+        let mut invalid = plan();
+        invalid.writes = (0..=MAX_BOOT_WRITES)
+            .map(|_| exports::terra::boot::boot::GuestWrite {
+                address: 16,
+                bytes: vec![1],
+            })
+            .collect();
+        cases.push(invalid);
+        let mut invalid = plan();
+        invalid.kernel_segments = (0..=MAX_BOOT_KERNEL_SEGMENTS)
+            .map(|_| exports::terra::boot::boot::KernelSegment {
+                source_offset: 0,
+                guest_address: 0,
+                file_length: 0,
+                memory_length: 1,
+            })
+            .collect();
+        cases.push(invalid);
+        let mut invalid = plan();
+        invalid.kernel_segments[0].guest_address = u64::MAX;
+        cases.push(invalid);
+        let mut invalid = plan();
+        invalid.kernel_segments[0].memory_length = 2;
+        cases.push(invalid);
+        let mut invalid = plan();
+        invalid.entry = 4096;
+        cases.push(invalid);
+        let mut invalid = plan();
+        invalid.boot_argument = 4096;
+        cases.push(invalid);
+        for invalid in cases {
+            assert!(apply_plan(&invalid, &ram, &[7; 4]).is_err());
+            assert_eq!(BoundedMemory::new(&ram).read(0, 18).unwrap(), [0; 18]);
+        }
+    }
+
+    #[test]
+    fn boot_copies_large_images_and_data_through_bounded_memory() {
+        let ram = GuestRam::new(128 << 10).unwrap();
+        let kernel = vec![7; 64 << 10];
+        let mut plan = plan();
+        plan.kernel_segments[0].file_length = u64::try_from(kernel.len()).unwrap();
+        plan.kernel_segments[0].memory_length = u64::try_from(kernel.len()).unwrap();
+        plan.writes[0].address = 64 << 10;
+        plan.writes[0].bytes = vec![9; 32 << 10];
+        plan.boot_argument = plan.writes[0].address;
+        apply_plan(&plan, &ram, &kernel).unwrap();
         assert_eq!(
-            BoundedMemory::new(&ram).read(0, 4).expect("bounded read"),
-            [7, 7, 7, 0]
+            BoundedMemory::new(&ram).read(48 << 10, 16 << 10).unwrap(),
+            vec![7; 16 << 10]
+        );
+        assert_eq!(
+            BoundedMemory::new(&ram).read(80 << 10, 16 << 10).unwrap(),
+            vec![9; 16 << 10]
         );
     }
 }

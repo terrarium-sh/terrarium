@@ -6,11 +6,13 @@ use wasmtime::{Engine, ResourceLimiter, Store};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 pub const DEFAULT_COMPONENT_MEMORY_MIB: u32 = 16;
+/// Admits every flow the vsock switch allows.
+pub const NETWORK_FRONTEND_MEMORY_BYTES: usize = terra_limits::NETWORK_SHARED_MEMORY_BYTES
+    + terra_protocol::vsock::MAX_NETWORK_SOCKETS * terra_limits::NETWORK_FLOW_MEMORY_BYTES;
 
 #[derive(Clone, Copy, Debug)]
 pub struct ComponentMemoryLimits {
     component_bytes: usize,
-    network_override: Option<usize>,
 }
 
 impl ComponentMemoryLimits {
@@ -19,32 +21,12 @@ impl ComponentMemoryLimits {
             component_bytes >= STORE_MEMORY_BYTES,
             "increase the component memory limit to at least {DEFAULT_COMPONENT_MEMORY_MIB} MiB"
         );
-        Ok(Self {
-            component_bytes,
-            network_override: None,
-        })
-    }
-
-    pub fn with_network_memory(mut self, bytes: usize) -> wasmtime::Result<Self> {
-        wasmtime::ensure!(
-            bytes >= STORE_MEMORY_BYTES,
-            "increase the network component memory limit to at least {DEFAULT_COMPONENT_MEMORY_MIB} MiB"
-        );
-        self.network_override = Some(bytes);
-        Ok(self)
-    }
-
-    pub fn admission_bytes(self) -> wasmtime::Result<usize> {
-        // Include root, temporary boot, and policy stores alongside the admitted workers.
-        self.component_bytes
-            .checked_mul(super::MAX_BOX_COMPONENT_WORKERS + 2)
-            .and_then(|bytes| bytes.checked_add(self.network_bytes().max(self.component_bytes)))
-            .ok_or_else(|| wasmtime::Error::msg("component memory reservation overflow"))
+        Ok(Self { component_bytes })
     }
 
     #[must_use]
     pub fn network_bytes(self) -> usize {
-        self.network_override.unwrap_or(self.component_bytes)
+        self.component_bytes.max(NETWORK_FRONTEND_MEMORY_BYTES)
     }
 
     #[must_use]
@@ -57,7 +39,6 @@ impl Default for ComponentMemoryLimits {
     fn default() -> Self {
         Self {
             component_bytes: STORE_MEMORY_BYTES,
-            network_override: None,
         }
     }
 }
@@ -67,8 +48,13 @@ impl Default for ComponentMemoryLimits {
 pub const STORE_MEMORY_BYTES: usize =
     (crate::box_runtime::store::DEFAULT_COMPONENT_MEMORY_MIB as usize) << 20;
 const COMPONENT_EPOCH_DEADLINE: u64 = 10;
+// Wasmtime charges lifted range records as well as their payloads.
+pub(crate) const MAX_COMPONENT_HOSTCALL_ALLOCATION_BYTES: usize =
+    terra_limits::MAX_COMPONENT_HOSTCALL_BYTES
+        + terra_limits::MAX_BATCH_GUEST_COPY_RANGES
+            * size_of::<crate::component::bindings::memory::WriteRange>();
 
-pub trait StoreHost: WasiView + 'static {
+pub trait StoreHost: Send + 'static {
     fn retire(self)
     where
         Self: Sized,
@@ -141,7 +127,7 @@ impl<H: StoreHost> AsMut<H> for StoreState<H> {
         self
     }
 }
-impl<H: StoreHost> WasiView for StoreState<H> {
+impl<H: StoreHost + WasiView> WasiView for StoreState<H> {
     fn ctx(&mut self) -> WasiCtxView<'_> {
         (**self).ctx()
     }
@@ -280,7 +266,7 @@ pub(super) fn create_store<H: StoreHost>(
     host: StoreState<H>,
 ) -> Store<StoreState<H>> {
     let mut store = Store::new(engine, host);
-    store.set_hostcall_fuel(terra_limits::MAX_COMPONENT_HOSTCALL_BYTES);
+    store.set_hostcall_fuel(MAX_COMPONENT_HOSTCALL_ALLOCATION_BYTES);
     store.set_epoch_deadline(COMPONENT_EPOCH_DEADLINE);
     store.epoch_deadline_async_yield_and_update(COMPONENT_EPOCH_DEADLINE);
     store.limiter(|host| host);
@@ -315,7 +301,8 @@ mod tests {
                 Ok((u32::try_from(a.len() + b.len()).unwrap(),))
             })
             .unwrap();
-        for bytes in [32768, 32769] {
+        let half_limit = u32::try_from(MAX_COMPONENT_HOSTCALL_ALLOCATION_BYTES / 2).unwrap();
+        for bytes in [half_limit, half_limit + 1] {
             let mut store = create_store(&engine, BoxHost::new());
             let instance = linker
                 .instantiate_async(&mut store, &component)
@@ -325,8 +312,8 @@ mod tests {
                 .get_typed_func::<(u32,), (u32,)>(&mut store, "copy")
                 .unwrap();
             let copied = copy.call_async(&mut store, (bytes,)).await;
-            if bytes == 32768 {
-                assert_eq!(copied.unwrap(), (65536,));
+            if bytes == half_limit {
+                assert_eq!(copied.unwrap(), (bytes * 2,));
             } else {
                 let error = copied.unwrap_err();
                 assert!(format!("{error:#}").contains("fuel"), "{error:#}");
@@ -429,52 +416,22 @@ mod tests {
         );
     }
 
+    /// The network frontend always fits a full flow table, and a larger
+    /// component ceiling raises it without loosening other stores.
     #[test]
-    fn admission_accounts_for_all_stores_and_network_overrides() {
-        let limits = ComponentMemoryLimits::default();
-        let baseline = limits.admission_bytes().unwrap();
-        assert_eq!(
-            baseline,
-            (super::super::MAX_BOX_COMPONENT_WORKERS + 3) * STORE_MEMORY_BYTES
-        );
-        assert_eq!(
-            limits
-                .with_network_memory(64 << 20)
-                .unwrap()
-                .admission_bytes()
-                .unwrap(),
-            baseline + (48 << 20)
-        );
-        let raised = ComponentMemoryLimits::new(32 << 20).unwrap();
-        assert_eq!(raised.admission_bytes().unwrap(), baseline * 2);
-        assert_eq!(
-            raised
-                .with_network_memory(16 << 20)
-                .unwrap()
-                .admission_bytes()
-                .unwrap(),
-            baseline * 2
-        );
-        assert!(
-            ComponentMemoryLimits::new(usize::MAX)
-                .unwrap()
-                .admission_bytes()
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn network_override_preserves_other_store_limits() {
-        let limits = ComponentMemoryLimits::new(16 << 20)
-            .unwrap()
-            .with_network_memory(32 << 20)
-            .unwrap();
-        let mut ordinary = BoxHost::with_memory_limits(limits);
-        let mut network = BoxHost::with_memory_limits(limits);
+    fn network_frontend_memory_fits_full_flow_capacity() {
+        let defaults = ComponentMemoryLimits::default();
+        assert_eq!(defaults.component_bytes(), 16 << 20);
+        assert_eq!(defaults.network_bytes(), 200 << 20);
+        let large = ComponentMemoryLimits::new(512 << 20).unwrap();
+        assert_eq!(large.network_bytes(), 512 << 20);
+        let mut ordinary = BoxHost::with_memory_limits(defaults);
+        let mut network = BoxHost::with_memory_limits(defaults);
         network.use_network_memory_limit();
         assert!(!ResourceLimiter::memory_growing(&mut ordinary, 0, 17 << 20, None).unwrap());
-        assert!(ResourceLimiter::memory_growing(&mut network, 0, 32 << 20, None).unwrap());
-        assert!(!ResourceLimiter::memory_growing(&mut network, 32 << 20, 33 << 20, None).unwrap());
-        assert!(ResourceLimiter::memory_growing(&mut ordinary, 0, 16 << 20, None).unwrap());
+        assert!(ResourceLimiter::memory_growing(&mut network, 0, 200 << 20, None).unwrap());
+        assert!(
+            !ResourceLimiter::memory_growing(&mut network, 200 << 20, 201 << 20, None).unwrap()
+        );
     }
 }

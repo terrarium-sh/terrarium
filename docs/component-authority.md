@@ -1,12 +1,12 @@
 # Component authority
 
-Every shipped component except vsock is compiled for `wasm32-unknown-unknown`.
-Vsock targets `wasm32-wasip3` so upstream Yamux can use the standard monotonic clock.
+Every shipped component except the agent is compiled for `wasm32-unknown-unknown`.
+The agent targets `wasm32-wasip3` so upstream Yamux can use the standard monotonic clock.
 Its imports are read from the wrapped production artifact, rather than inferred
-from its source WIT. [`check-component-authority.py`](../scripts/check-component-authority.py)
+from its source WIT. [`check-component-authority.py`](../scripts/checks/check-component-authority.py)
 compares that result with
-[`component-authority.json`](../scripts/component-authority.json), and
-`component_imports` proves that MMIO and the interrupt controller link
+[`component-authority.json`](../scripts/checks/component-authority.json), and
+`component_imports` proves that boot and the interrupt controller link
 with an empty linker. A new import or component fails `make verify` until this
 inventory and its justification are reviewed.
 
@@ -22,36 +22,53 @@ component the union of all capabilities.
 
 | Component | Imported authority | Why it is present and what bounds it |
 | --- | --- | --- |
-| MMIO | None | Receives only mappings and device streams through exports. Native code validates returned slots and access ranges. |
 | Interrupt controller | None | Receives topology and operations through exports. Native code validates GSI, vector, destination and cleanup outputs. |
 | VMM | VM/vCPU resources; lifecycle events; narrow MMIO `access` | The VM worker owns the prepared machine and can only issue an MMIO access. Resource methods are scoped to that machine. |
-| Boot | Kernel copy, prefix/size, machine configuration and bounded RAM writes | A short-lived boot store writes only the prepared VM's bounded RAM and is destroyed before VMM startup. |
+| Boot | None | Receives machine configuration and kernel bytes through exports. Native code validates every segment and write before copying into bounded guest RAM. |
 | Block | Guest RAM, interrupt, disk capacity/read/write/discard/sync | One fixed-capacity disk grant and its assigned interrupt line; every disk range is checked. |
 | Filesystem | Guest RAM, interrupt, selected filesystem descriptor/preopen methods, `wait-for` | One recipe-selected directory preopen. Descriptor resource methods are registered individually; clock types carry timestamps and do not grant a clock call. |
 | Memory | Guest RAM, interrupt, discard | Reclaims checked ranges of the assigned guest RAM only. |
-| Network | Guest RAM, interrupt, diagnostics, policy-filtered socket/DNS methods, monotonic `now`/`wait-for` | Socket resources are created and used through policy-enforcing hosts. The only diagnostic sink is capped logging. |
-| Vsock | Guest RAM, interrupt, supplied local clients and control streams, monotonic/system clocks, `get-random-u64`, WASI CLI interfaces | Local listener/client resources come from the configured box service; randomness seeds the guest service. The standard-library CLI bindings receive an empty environment, closed stdin, and output sinks. No general filesystem or sockets are linked. |
-| Policy | Monotonic `now` | Computes policy and DNS-expiry decisions with no Terra host, guest RAM, filesystem or socket imports. |
+| Vsock frontend | Guest RAM, assigned interrupt, fixed bounded agent pipe, broker TCP/UDP/DNS methods, configured listener grants and monotonic `wait-for` | Owns one device, per-socket TCP and UDP streams, the agent network control stream and frontend-initiated publication streams. Broker authorization remains authoritative. No agent filesystem/session or VM/vCPU imports. |
+| Agent | Fixed bounded agent endpoint, supplied authorized local clients and control streams, monotonic/system clocks, WASI CLI interfaces | Services retain host authorization. No guest RAM, interrupt, broker or arbitrary filesystem imports. Standard-library CLI bindings receive an empty environment, closed stdin and output sinks. |
 
-Block and network import `memory.read-ranges` for scattered input
+Native MMIO routing connects each device request/reply stream directly. The host
+validates device mappings, access widths, reply sequences and deadlines; routing
+has no separate Wasm store. Network policy validation and enforcement use
+`terra-policy` natively in the CLI and broker.
+
+The host validates each boot plan and stamps its clock and random seed before
+the agent receives the plan. The agent retains clocks for live clock updates;
+its event subscription starts the worker, and stream closure signals completion.
+Diagnostic delivery waits for capacity in the bounded host log queue.
+
+The `memory.read-ranges` import copies scattered input
 buffers. The host validates every range before copying, limits each range to
 16 KiB, each call to 32 ranges and 64 KiB total, and returns one concatenated
 byte sequence. The import grants no address authority beyond `memory.read`.
+
+The filesystem `release-descriptor` import consumes an owned descriptor and waits
+for its host handle to close before retrying directory removal on Windows. It can
+only release a descriptor already held by that component store.
 
 The checked list is exact, including resource destructors and empty imported
 type interfaces. For the individual function names, see the machine-readable
 allowlist. The native linker implementations and their focused negative tests
 live with the capability they expose: filesystem descriptors in
-`component/fs/resource_linker.rs`, sockets in
-`component/network/resource_linker.rs`, and service isolation in
-`tests/component_imports.rs` and `tests/component_grants.rs`.
+`component/fs/resource_linker.rs`, broker operations in
+`component/network/broker_linker.rs`, and service isolation in
+`tests/integration/component_imports.rs` and
+`tests/integration/component_grants.rs`.
 
-This capability inventory is part of the component SFI boundary described in
-[the security model](security.md). It limits a malicious or faulty component to
-its private Wasm memory and its explicitly granted calls. A guest-RAM grant
-permits reads and writes anywhere in that VM's mapped RAM, not just the device's
-queue buffers; it does not isolate devices from corrupting the same guest.
-Native code remains responsible for allocation, mappings, copy-size and address
-validation, and page reclamation. Wasmtime, the native adapters,
-the hypervisor, trusted artifacts and the host kernel remain in the trusted
-computing base.
+The combined frontend owns device interrupts, guest-memory copies and network
+parsing, with broker methods registered directly in its store. The fixed agent
+pipe carries agent bytes to a separate store without RAM, IRQ or broker imports.
+TCP opens carry one typed `inline-urgent` boolean (the broker sets
+`SO_OOBINLINE` before connecting); the interface exposes no generic
+socket-option operation. Stream semantics are defined in the
+[network transport](../README.dev.md#network-transport).
+
+This inventory limits a malicious or faulty component to its private Wasm memory
+and its granted calls; [the security model](security.md#runtime-boundary) covers
+the rest of the boundary. A guest-RAM grant permits reads and writes anywhere in
+that VM's mapped RAM, not just the device's queue buffers, so devices are not
+isolated from corrupting their own guest.

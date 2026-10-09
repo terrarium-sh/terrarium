@@ -1,8 +1,8 @@
 package terra:boot@0.1.0;
 
-interface types {
+interface boot {
     enum architecture { x86, arm }
-    enum device-kind { block, net, vsock, fs, memory }
+    enum device-kind { block, vsock, fs, memory }
 
     record device {
         kind: device-kind,
@@ -17,9 +17,23 @@ interface types {
         devices: list<device>,
     }
 
-    record boot-entry {
+    record kernel-segment {
+        source-offset: u64,
+        guest-address: u64,
+        file-length: u64,
+        memory-length: u64,
+    }
+
+    record guest-write {
+        address: u64,
+        bytes: list<u8>,
+    }
+
+    record plan {
         entry: u64,
         boot-argument: u64,
+        kernel-segments: list<kernel-segment>,
+        writes: list<guest-write>,
     }
 
     enum error {
@@ -32,28 +46,13 @@ interface types {
         kernel-layout,
         kernel-too-large,
         boot-data-too-large,
-        unavailable,
         bounds,
     }
-}
 
-interface host {
-    use types.{machine, error};
-
-    machine-config: func() -> machine;
-    kernel-size: func() -> u64;
-    kernel-prefix: func() -> result<list<u8>, error>;
-    copy-kernel: func(source-offset: u64, guest-address: u64, length: u32) -> result<_, error>;
-    write-ram: func(address: u64, bytes: list<u8>) -> result<_, error>;
-}
-
-interface boot {
-    use types.{boot-entry, error};
-
-    stage: func(kernel-command-line: string) -> result<boot-entry, error>;
+    stage: func(machine: machine, kernel-prefix: list<u8>, kernel-size: u64,
+                kernel-command-line: string) -> result<plan, error>;
 }
 
 world boot-component {
-    import host;
     export boot;
 }

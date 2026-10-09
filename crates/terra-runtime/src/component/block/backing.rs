@@ -1,14 +1,5 @@
 //! Host disk capabilities for the Wasm block device.
 
-use crate::MAX_BATCH_BYTES;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DiskError {
-    OutOfRange,
-    ReadOnly,
-    TooLarge,
-}
-
 /// One disk grant: fixed capacity with the real read-only mode enforced
 /// on every mutation path, mirroring the native WASI wrapper.
 pub struct BoundedDisk {
@@ -33,34 +24,13 @@ impl BoundedDisk {
         }
     }
 
-    #[must_use]
-    pub fn capacity(&self) -> usize {
-        self.data.len()
-    }
-
-    pub fn read(&self, offset: usize, len: usize) -> Result<&[u8], DiskError> {
-        let end = offset.checked_add(len).ok_or(DiskError::OutOfRange)?;
-        let len_u64 = u64::try_from(len).map_err(|_| DiskError::OutOfRange)?;
-        if end > self.data.len() || len_u64 > MAX_BATCH_BYTES {
-            return Err(DiskError::OutOfRange);
-        }
-        Ok(&self.data[offset..end])
-    }
-
-    pub fn write(&mut self, offset: usize, buf: &[u8]) -> Result<(), DiskError> {
-        if self.readonly {
-            return Err(DiskError::ReadOnly);
-        }
-        let len_u64 = u64::try_from(buf.len()).map_err(|_| DiskError::TooLarge)?;
-        if len_u64 > MAX_BATCH_BYTES {
-            return Err(DiskError::TooLarge);
-        }
-        let end = offset.checked_add(buf.len()).ok_or(DiskError::OutOfRange)?;
+    fn range(&self, offset: u64, len: usize) -> Result<std::ops::Range<usize>, BackingError> {
+        let offset = usize::try_from(offset).map_err(|_| BackingError::OutOfRange)?;
+        let end = offset.checked_add(len).ok_or(BackingError::OutOfRange)?;
         if end > self.data.len() {
-            return Err(DiskError::OutOfRange);
+            return Err(BackingError::OutOfRange);
         }
-        self.data[offset..end].copy_from_slice(buf);
-        Ok(())
+        Ok(offset..end)
     }
 }
 
@@ -133,37 +103,30 @@ pub enum BackingError {
 
 impl BlockBacking for BoundedDisk {
     fn capacity(&self) -> u64 {
-        u64::try_from(self.capacity()).unwrap_or(u64::MAX)
+        u64::try_from(self.data.len()).unwrap_or(u64::MAX)
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), BackingError> {
-        let offset = usize::try_from(offset).map_err(|_| BackingError::OutOfRange)?;
-        let chunk = self
-            .read(offset, buf.len())
-            .map_err(|_| BackingError::OutOfRange)?;
-        buf.copy_from_slice(chunk);
+        buf.copy_from_slice(&self.data[self.range(offset, buf.len())?]);
         Ok(())
     }
 
     fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<(), BackingError> {
-        let offset = usize::try_from(offset).map_err(|_| BackingError::OutOfRange)?;
-        self.write(offset, buf).map_err(|error| match error {
-            DiskError::ReadOnly => BackingError::ReadOnly,
-            DiskError::OutOfRange | DiskError::TooLarge => BackingError::OutOfRange,
-        })
+        if self.readonly {
+            return Err(BackingError::ReadOnly);
+        }
+        let range = self.range(offset, buf.len())?;
+        self.data[range].copy_from_slice(buf);
+        Ok(())
     }
 
     fn discard(&mut self, offset: u64, len: u64) -> Result<(), BackingError> {
         if self.readonly {
             return Err(BackingError::ReadOnly);
         }
-        let offset = usize::try_from(offset).map_err(|_| BackingError::OutOfRange)?;
         let len = usize::try_from(len).map_err(|_| BackingError::OutOfRange)?;
-        let end = offset.checked_add(len).ok_or(BackingError::OutOfRange)?;
-        self.data
-            .get_mut(offset..end)
-            .ok_or(BackingError::OutOfRange)?
-            .fill(0);
+        let range = self.range(offset, len)?;
+        self.data[range].fill(0);
         Ok(())
     }
 

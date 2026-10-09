@@ -5,38 +5,33 @@
 use super::SignalResult;
 use std::fs::File;
 use std::io::{Error, Result};
-use std::os::windows::{
-    ffi::OsStrExt,
-    io::{AsRawHandle, FromRawHandle, OwnedHandle},
-};
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
 use std::process::Command;
+use terra_platform::process::{VmChildGuard, supervise_vm_child};
 use windows_sys::Win32::Foundation::{FILETIME, HANDLE_FLAG_INHERIT, STILL_ACTIVE};
-use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW};
-use windows_sys::Win32::Security::{
-    ACL, ACL_REVISION, AddAccessAllowedAceEx, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
-    GetLengthSid, GetTokenInformation, InitializeAcl, OBJECT_INHERIT_ACE,
-    PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER, TokenUser,
-};
-use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
 use windows_sys::Win32::System::Threading::{
-    CREATE_NEW_PROCESS_GROUP, GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, OpenProcess,
-    OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, TerminateProcess,
+    GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_TERMINATE, TerminateProcess,
 };
 
 pub const MAX_SOCK_PATH: usize = 108;
 const LOCK_HANDLE_ENV: &str = "TERRA_INHERITED_LOCK_HANDLE";
 
 pub fn try_lock_run(path: &Path) -> std::result::Result<File, std::fs::TryLockError> {
-    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
-    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+        FILE_SHARE_READ,
+    };
 
-    std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(false)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
         .map_err(|error| {
             if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION.cast_signed()) {
@@ -44,7 +39,14 @@ pub fn try_lock_run(path: &Path) -> std::result::Result<File, std::fs::TryLockEr
             } else {
                 std::fs::TryLockError::Error(error)
             }
-        })
+        })?;
+    let metadata = file.metadata().map_err(std::fs::TryLockError::Error)?;
+    if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(std::fs::TryLockError::Error(Error::other(
+            "run lock must be a regular file",
+        )));
+    }
+    Ok(file)
 }
 
 pub fn host_addresses() -> Result<Vec<std::net::IpAddr>> {
@@ -183,95 +185,103 @@ pub fn allocated_size(path: &Path, metadata: &std::fs::Metadata) -> u64 {
     (u64::from(high) << 32) | u64::from(low)
 }
 
-pub fn set_owner_only(path: &Path, directory: bool) -> Result<()> {
-    let sid = current_user_sid()?;
-    let acl_size = std::mem::size_of::<ACL>()
-        + std::mem::size_of::<u32>() * 2
-        + std::mem::size_of_val(sid.as_slice());
-    let mut acl = vec![0_u32; acl_size.div_ceil(std::mem::size_of::<u32>())];
-    let acl_ptr = acl.as_mut_ptr().cast::<ACL>();
-    let inherit = if directory {
-        OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
-    } else {
-        0
-    };
-    // SAFETY: `acl` has the exact header, ACE, and SID capacity; `sid` remains live while
-    // Windows copies it into the ACL.
-    unsafe {
-        win_ok(InitializeAcl(
-            acl_ptr,
-            u32::try_from(acl_size).unwrap_or(u32::MAX),
-            ACL_REVISION,
-        ))?;
-        win_ok(AddAccessAllowedAceEx(
-            acl_ptr,
-            ACL_REVISION,
-            inherit,
-            FILE_ALL_ACCESS,
-            sid.as_ptr().cast_mut().cast(),
-        ))?;
-    }
-    let mut wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    // SAFETY: the path is NUL-terminated and `acl` lives for the call.
-    let result = unsafe {
-        SetNamedSecurityInfoW(
-            wide.as_mut_ptr(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            acl_ptr,
-            std::ptr::null(),
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(Error::from_raw_os_error(
-            i32::try_from(result).unwrap_or(i32::MAX),
-        ))
-    }
+pub(crate) fn supervise_supervisor_child(
+    command: &mut Command,
+    die_with_parent: bool,
+) -> Result<Option<VmChildGuard>> {
+    supervise_vm_child(command, die_with_parent)
 }
 
-pub fn detach(command: &mut Command) {
-    use std::os::windows::process::CommandExt;
-    command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+pub(crate) fn pass_listener(
+    command: &mut Command,
+    listener: &terra_platform::io::local::LocalListener,
+    target: i32,
+) -> Result<terra_platform::io::local::LocalListener> {
+    use std::os::windows::io::AsRawSocket;
+    let inherited = listener.try_clone()?;
+    let socket = inherited.as_raw_socket();
+    // SAFETY: inherited owns this live listener; the launcher whitelists the socket handle.
+    win_ok(unsafe {
+        windows_sys::Win32::Foundation::SetHandleInformation(
+            socket as *mut std::ffi::c_void,
+            HANDLE_FLAG_INHERIT,
+            HANDLE_FLAG_INHERIT,
+        )
+    })?;
+    command.env(
+        super::listener_handle_environment(target)?,
+        socket.to_string(),
+    );
+    Ok(inherited)
+}
+
+pub(crate) fn claim_listener(
+    target: i32,
+    expected: &Path,
+) -> Result<terra_platform::io::local::LocalListener> {
+    use std::os::windows::io::FromRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{WSADATA, WSAStartup};
+    let socket = std::env::var(super::listener_handle_environment(target)?)
+        .map_err(Error::other)?
+        .parse::<usize>()
+        .map_err(Error::other)?;
+    let mut data = WSADATA::default();
+    // SAFETY: data has the Winsock structure's full writable size and initialization lasts until process exit.
+    let result = unsafe { WSAStartup(0x0202, &raw mut data) };
+    if result != 0 {
+        return Err(Error::from_raw_os_error(result));
+    }
+    // SAFETY: the whitelisted launcher transfers this prebound listener exclusively to the worker.
+    let listener =
+        unsafe { terra_platform::io::local::LocalListener::from_raw_socket(socket as u64) };
+    // SAFETY: listener owns socket; no descendant may inherit the grant.
+    win_ok(unsafe {
+        windows_sys::Win32::Foundation::SetHandleInformation(
+            socket as *mut std::ffi::c_void,
+            HANDLE_FLAG_INHERIT,
+            0,
+        )
+    })?;
+    if listener.local_addr()?.as_pathname() != Some(expected) {
+        return Err(Error::other("inherited listener does not match its grant"));
+    }
+    Ok(listener)
 }
 
 pub fn pass_lock(command: &mut Command, lock: &File) -> Result<File> {
     use std::os::windows::io::AsRawHandle;
-    let inherited_lock = lock.try_clone()?;
-    let handle = inherited_lock.as_raw_handle();
+    let inherited = lock.try_clone()?;
+    let handle = inherited.as_raw_handle();
     // SAFETY: the `File` keeps this handle valid until CreateProcess duplicates it into the child.
-    let inherited = unsafe {
+    let ok = unsafe {
         windows_sys::Win32::Foundation::SetHandleInformation(
             handle,
             HANDLE_FLAG_INHERIT,
             HANDLE_FLAG_INHERIT,
         )
     };
-    if inherited == 0 {
+    if ok == 0 {
         return Err(Error::last_os_error());
     }
     command.env(LOCK_HANDLE_ENV, format!("{handle:p}"));
-    Ok(inherited_lock)
+    Ok(inherited)
 }
 
 pub fn claim_inherited_lock(expected: &Path) -> Option<File> {
     let handle = std::env::var(LOCK_HANDLE_ENV).ok()?;
     let raw = usize::from_str_radix(handle.strip_prefix("0x")?, 16).ok()? as *mut std::ffi::c_void;
-    let same = file_handle_matches_path(raw, expected) && holds_run_lock(expected).ok()?;
-    same.then(|| {
-        // SAFETY: `pass_lock` marked precisely this live file handle inheritable for this child.
-        let file = unsafe { File::from_raw_handle(raw) };
-        // SAFETY: file owns raw; subsequent child processes must not inherit the run lock.
-        win_ok(unsafe {
-            windows_sys::Win32::Foundation::SetHandleInformation(raw, HANDLE_FLAG_INHERIT, 0)
+    file_handle_matches_path(raw, expected)
+        .then(|| {
+            // SAFETY: `pass_lock` marked precisely this live file handle inheritable for this child.
+            let file = unsafe { File::from_raw_handle(raw) };
+            // SAFETY: file owns raw; subsequent child processes must not inherit the run lock.
+            win_ok(unsafe {
+                windows_sys::Win32::Foundation::SetHandleInformation(raw, HANDLE_FLAG_INHERIT, 0)
+            })
+            .ok()?;
+            Some(file)
         })
-        .ok()?;
-        Some(file)
-    })
-    .flatten()
+        .flatten()
 }
 
 pub fn holds_run_lock(path: &Path) -> Result<bool> {
@@ -351,65 +361,57 @@ pub fn terminate_process(pid: u32, published_start_time: Option<u64>) -> Result<
     result
 }
 
-pub fn install_stop_signal_handlers() {}
+// Retained through process exit so console callbacks cannot race socket reuse.
+static STOP_SOCKET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+static STOP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn send_stop() {
+    use std::sync::atomic::Ordering;
+    use windows_sys::Win32::Networking::WinSock::{INVALID_SOCKET, send};
+
+    let Ok(socket) = usize::try_from(STOP_SOCKET.swap(u64::MAX, Ordering::SeqCst)) else {
+        return;
+    };
+    if socket != INVALID_SOCKET {
+        let byte = [terra_protocol::STOP_SIGNAL];
+        // SAFETY: the retained socket stays open through process exit, and byte has the stated length.
+        let _ = unsafe { send(socket, byte.as_ptr(), 1, 0) };
+    }
+}
+
+pub fn register_stop_channel(channel: terra_platform::io::local::LocalStream) {
+    use std::os::windows::io::IntoRawSocket;
+    use std::sync::atomic::Ordering;
+
+    STOP_SOCKET.store(channel.into_raw_socket(), Ordering::SeqCst);
+    if STOP_REQUESTED.load(Ordering::SeqCst) {
+        send_stop();
+    }
+}
+
+extern "system" fn handle_console_control(event: u32) -> i32 {
+    use std::sync::atomic::Ordering;
+    use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT};
+
+    if !matches!(event, CTRL_C_EVENT | CTRL_BREAK_EVENT) {
+        return 0;
+    }
+    STOP_REQUESTED.store(true, Ordering::SeqCst);
+    send_stop();
+    1
+}
+
+pub fn install_stop_signal_handlers() {
+    use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+
+    // SAFETY: the callback has the required ABI and remains available through process exit.
+    if let Err(error) = win_ok(unsafe { SetConsoleCtrlHandler(Some(handle_console_control), 1) }) {
+        log::warn!("could not install console stop handler: {error}");
+    }
+}
 
 pub fn is_host_root() -> bool {
     false
-}
-
-fn current_user_sid() -> Result<Vec<u32>> {
-    let mut token = std::ptr::null_mut();
-    // SAFETY: GetCurrentProcess is a pseudo-handle and token is writable.
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) } == 0 {
-        return Err(Error::last_os_error());
-    }
-    // SAFETY: OpenProcessToken returned this owned token handle.
-    let token = unsafe { OwnedHandle::from_raw_handle(token) };
-    let mut needed = 0;
-    // SAFETY: this query intentionally has no buffer and reports the required size.
-    let _ = unsafe {
-        GetTokenInformation(
-            token.as_raw_handle(),
-            TokenUser,
-            std::ptr::null_mut(),
-            0,
-            &raw mut needed,
-        )
-    };
-    let mut user = vec![
-        0_usize;
-        usize::try_from(needed)
-            .unwrap_or(0)
-            .div_ceil(std::mem::size_of::<usize>())
-    ];
-    // SAFETY: `user` has the size returned by the preceding query.
-    let ok = unsafe {
-        GetTokenInformation(
-            token.as_raw_handle(),
-            TokenUser,
-            user.as_mut_ptr().cast(),
-            needed,
-            &raw mut needed,
-        )
-    };
-    if ok == 0 {
-        return Err(Error::last_os_error());
-    }
-    // SAFETY: a successful TokenUser query initializes a TOKEN_USER at the buffer start.
-    let token_user = unsafe { user.as_ptr().cast::<TOKEN_USER>().read_unaligned() };
-    // SAFETY: TOKEN_USER contains a valid SID whose length Windows reports.
-    let len = unsafe { GetLengthSid(token_user.User.Sid) };
-    if len == 0 {
-        return Err(Error::last_os_error());
-    }
-    // SAFETY: GetLengthSid bounds this source slice.
-    Ok(unsafe {
-        std::slice::from_raw_parts(
-            token_user.User.Sid.cast::<u32>(),
-            usize::try_from(len).unwrap_or(0) / std::mem::size_of::<u32>(),
-        )
-        .to_vec()
-    })
 }
 
 fn with_process<T>(pid: u32, rights: u32, f: impl FnOnce(*mut std::ffi::c_void) -> T) -> Option<T> {
@@ -470,12 +472,123 @@ fn win_ok(ok: i32) -> Result<()> {
 mod tests {
     use super::*;
     use std::os::windows::fs::MetadataExt;
-    use windows_sys::Win32::Foundation::{INVALID_HANDLE_VALUE, LocalFree};
-    use windows_sys::Win32::Security::Authorization::GetNamedSecurityInfoW;
-    use windows_sys::Win32::Security::{
-        ACCESS_ALLOWED_ACE, EqualSid, GetAce, GetSecurityDescriptorControl, SE_DACL_PROTECTED,
-    };
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_SPARSE_FILE;
+
+    #[test]
+    fn detached_launch_keeps_startup_pipes_without_parent_console() {
+        use std::io::{Read as _, Write as _};
+        use std::os::windows::process::CommandExt;
+        use std::process::Stdio;
+        use windows_sys::Win32::System::Console::{
+            CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent, GetConsoleProcessList,
+        };
+        use windows_sys::Win32::System::Threading::CREATE_NEW_CONSOLE;
+
+        let mut console_process = 0;
+        // SAFETY: the buffer has the one process-ID slot reported to Windows.
+        let console_processes = unsafe { GetConsoleProcessList(&raw mut console_process, 1) };
+        let role = std::env::var("TERRA_TEST_DETACH_ROLE").ok();
+        if role.as_deref() == Some("child") {
+            assert_eq!(console_processes, 0);
+            let mut input = String::new();
+            std::io::stdin().read_to_string(&mut input).unwrap();
+            assert_eq!(input, "startup input");
+            std::io::stdout().write_all(b"startup output").unwrap();
+            std::io::stderr().write_all(b"startup diagnostics").unwrap();
+            return;
+        }
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args([
+            "--exact",
+            "sys::imp::tests::detached_launch_keeps_startup_pipes_without_parent_console",
+            "--nocapture",
+        ]);
+        let mut stop_receiver = None;
+        if role.as_deref() == Some("parent") {
+            assert_ne!(console_processes, 0);
+            let (host, receiver) = terra_platform::io::local::create_local_pair().unwrap();
+            receiver
+                .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                .unwrap();
+            register_stop_channel(host);
+            stop_receiver = Some(receiver);
+            install_stop_signal_handlers();
+            command.env("TERRA_TEST_DETACH_ROLE", "child");
+            assert!(supervise_vm_child(&mut command, false).unwrap().is_none());
+            command.stdin(Stdio::piped());
+        } else {
+            command.env("TERRA_TEST_DETACH_ROLE", "parent");
+            command.creation_flags(CREATE_NEW_CONSOLE);
+        }
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        if role.as_deref() == Some("parent") {
+            // SAFETY: this subprocess owns an isolated console and installed a Ctrl+Break handler.
+            assert_ne!(unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, 0) }, 0);
+            let mut stop = [0];
+            stop_receiver
+                .as_mut()
+                .unwrap()
+                .read_exact(&mut stop)
+                .unwrap();
+            assert_eq!(stop, [terra_protocol::STOP_SIGNAL]);
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(b"startup input")
+                .unwrap();
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed;"));
+        if role.as_deref() == Some("parent") {
+            assert!(
+                String::from_utf8(output.stdout)
+                    .unwrap()
+                    .contains("startup output")
+            );
+            assert_eq!(output.stderr, b"startup diagnostics");
+        }
+    }
+
+    #[test]
+    fn console_interrupts_relay_one_stop_and_latch_before_registration() {
+        use std::io::Read as _;
+        use std::sync::atomic::Ordering;
+        use terra_platform::io::local::create_local_pair;
+        use windows_sys::Win32::System::Console::{
+            CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT,
+            CTRL_SHUTDOWN_EVENT,
+        };
+
+        for event in [CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT] {
+            assert_eq!(handle_console_control(event), 0);
+            assert!(!STOP_REQUESTED.load(Ordering::SeqCst));
+        }
+        for event in [CTRL_C_EVENT, CTRL_BREAK_EVENT] {
+            let (host, mut guest) = create_local_pair().unwrap();
+            guest
+                .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                .unwrap();
+            if event == CTRL_C_EVENT {
+                assert_eq!(handle_console_control(event), 1);
+                assert!(STOP_REQUESTED.load(Ordering::SeqCst));
+            }
+            register_stop_channel(host);
+            assert_eq!(handle_console_control(event), 1);
+            let mut byte = [0];
+            guest.read_exact(&mut byte).unwrap();
+            assert_eq!(byte, [terra_protocol::STOP_SIGNAL]);
+            assert_eq!(handle_console_control(event), 1);
+            guest
+                .set_read_timeout(Some(std::time::Duration::from_millis(50)))
+                .unwrap();
+            assert!(guest.read_exact(&mut byte).is_err());
+            STOP_REQUESTED.store(false, Ordering::SeqCst);
+        }
+    }
 
     #[test]
     fn a_sparse_file_keeps_the_sparse_attribute() {
@@ -503,72 +616,16 @@ mod tests {
     }
 
     #[test]
-    fn owner_only_acl_grants_only_the_current_user_and_blocks_inheritance() {
-        let root = tempfile::tempdir().unwrap();
-        let sid = current_user_sid().unwrap();
-        for directory in [false, true] {
-            let path = root
-                .path()
-                .join(if directory { "directory" } else { "file" });
-            if directory {
-                std::fs::create_dir(&path).unwrap();
-            } else {
-                std::fs::write(&path, b"private").unwrap();
-            }
-            set_owner_only(&path, directory).unwrap();
-            let wide = path
-                .as_os_str()
-                .encode_wide()
-                .chain(Some(0))
-                .collect::<Vec<_>>();
-            let mut acl = std::ptr::null_mut();
-            let mut descriptor = std::ptr::null_mut();
-            let mut control = 0;
-            let mut revision = 0;
-            let mut entry = std::mem::MaybeUninit::uninit();
-            // SAFETY: Windows owns the queried descriptor until LocalFree; every output pointer
-            // is writable, and the successful queries bound the ACL and ACE reads.
-            unsafe {
-                assert_eq!(
-                    GetNamedSecurityInfoW(
-                        wide.as_ptr(),
-                        SE_FILE_OBJECT,
-                        DACL_SECURITY_INFORMATION,
-                        std::ptr::null_mut(),
-                        std::ptr::null_mut(),
-                        &raw mut acl,
-                        std::ptr::null_mut(),
-                        &raw mut descriptor,
-                    ),
-                    0
-                );
-                assert_ne!(
-                    GetSecurityDescriptorControl(descriptor, &raw mut control, &raw mut revision),
-                    0
-                );
-                assert_ne!(control & SE_DACL_PROTECTED, 0);
-                assert!(!acl.is_null());
-                assert_eq!((*acl).AceCount, 1);
-                assert_ne!(GetAce(acl, 0, entry.as_mut_ptr()), 0);
-                // SAFETY: `GetAce` succeeded, so `entry` names the ACL's first ACE.
-                let entry = &*entry.assume_init().cast::<ACCESS_ALLOWED_ACE>();
-                assert_eq!(entry.Header.AceType, 0);
-                assert_eq!(entry.Mask, FILE_ALL_ACCESS);
-                assert_ne!(
-                    EqualSid(
-                        (&raw const entry.SidStart).cast_mut().cast(),
-                        sid.as_ptr().cast_mut().cast()
-                    ),
-                    0
-                );
-                let inheritance = if directory {
-                    OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
-                } else {
-                    0
-                };
-                assert_eq!(u32::from(entry.Header.AceFlags), inheritance);
-                assert!(LocalFree(descriptor).is_null());
-            }
-        }
+    fn run_locks_reject_symlink_redirection() {
+        let directory = tempfile::tempdir().unwrap();
+        let redirected = directory.path().join("outside");
+        let lock_path = directory.path().join("terra.pid");
+        std::fs::write(&redirected, b"original").unwrap();
+        std::os::windows::fs::symlink_file(&redirected, &lock_path).unwrap();
+        assert!(try_lock_run(&lock_path).is_err());
+        assert_eq!(std::fs::read(&redirected).unwrap(), b"original");
+        std::fs::remove_file(&redirected).unwrap();
+        assert!(try_lock_run(&lock_path).is_err());
+        assert!(!redirected.exists());
     }
 }

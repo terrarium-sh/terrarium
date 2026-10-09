@@ -33,6 +33,10 @@ impl Write for CappedAppender {
 }
 
 fn build_appender(bx: &BoxRef) -> anyhow::Result<CappedAppender> {
+    let path = bx.get_dir().join(crate::state::LOG_FILE);
+    let directory = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("log path has no parent"))?;
     let builder = RollingFileAppender::builder()
         .filename_prefix("terra")
         .filename_suffix("log");
@@ -40,23 +44,17 @@ fn build_appender(bx: &BoxRef) -> anyhow::Result<CappedAppender> {
     let builder = builder
         .rotation(Rotation::DAILY)
         .max_log_files(KEPT_LOG_GENERATIONS)
-        .latest_symlink(crate::state::LOG_FILE);
+        .latest_symlink("terra.log");
     // Windows symlink creation requires privileges; keep the capped log at its public path.
     #[cfg(windows)]
     let builder = {
-        crate::sys::create_regular_file(&bx.get_dir().join(crate::state::LOG_FILE))?;
+        crate::sys::create_regular_file(&path)?;
         builder.rotation(Rotation::NEVER)
     };
-    let appender = builder.build(bx.get_dir()).map_err(|e| {
-        anyhow::anyhow!(
-            "opening log {}: {e}",
-            bx.get_dir().join(crate::state::LOG_FILE).display()
-        )
-    })?;
-    Ok(CappedAppender {
-        appender,
-        path: bx.get_dir().join(crate::state::LOG_FILE),
-    })
+    let appender = builder
+        .build(directory)
+        .map_err(|e| anyhow::anyhow!("opening log {}: {e}", path.display()))?;
+    Ok(CappedAppender { appender, path })
 }
 
 pub fn init(bx: &BoxRef) -> anyhow::Result<()> {
@@ -142,18 +140,19 @@ mod tests {
             meta.file_type().is_symlink(),
             "terra.log is the appender's symlink"
         );
-        let dated: Vec<_> = std::fs::read_dir(bx.get_dir())
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| {
-                n.starts_with("terra.")
-                    && std::path::Path::new(n)
-                        .extension()
-                        .is_some_and(|e| e == "log")
-            })
-            .collect();
+        let dated: Vec<_> =
+            std::fs::read_dir(bx.get_dir().join(crate::state::LOG_FILE).parent().unwrap())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| {
+                    n.starts_with("terra.")
+                        && std::path::Path::new(n)
+                            .extension()
+                            .is_some_and(|e| e == "log")
+                })
+                .collect();
         assert_eq!(dated.len(), 1, "the current generation is dated: {dated:?}");
         assert_ne!(dated[0], "terra.log", "the live name is the symlink's");
     }

@@ -3,15 +3,11 @@ use futures_util::{
     future::{Either, select},
 };
 
-use super::exports::terra::mmio::lifecycle::Guest;
-use super::terra::mmio::lifecycle_platform::{self, Event};
+use super::exports::terra::vmm::lifecycle::Guest;
+use super::terra::vmm::lifecycle_platform::{self, Event};
 
 impl Guest for super::Dispatcher {
     async fn run() -> Result<Event, lifecycle_platform::Error> {
-        <Self as Guest>::wait().await
-    }
-
-    async fn wait() -> Result<Event, lifecycle_platform::Error> {
         let outcome = wait_for_shutdown().await;
         let released = super::machine::release().map_err(|_| lifecycle_platform::Error::Closed);
         let event = outcome?;
@@ -28,29 +24,26 @@ async fn wait_for_shutdown() -> Result<Event, lifecycle_platform::Error> {
     .await
     {
         Either::Left((result, waiting)) => {
-            let event = completed_vcpus_event(result.is_err(), waiting.now_or_never())?;
-            let outcome = finish_shutdown(event).await?;
-            result.map_err(|_| lifecycle_platform::Error::Closed)?;
-            return Ok(outcome);
+            let event = completed_vcpus_event(result, waiting.now_or_never())?;
+            return finish_shutdown(event).await;
         }
         Either::Right((event, running)) => (event?, running),
     };
     match select(running, Box::pin(finish_shutdown(event))).await {
         Either::Left((result, stopping)) => {
             let outcome = stopping.await?;
-            result.map_err(|_| lifecycle_platform::Error::Closed)?;
-            Ok(outcome)
+            completed_vcpus_event(result, Some(Ok(outcome)))
         }
         Either::Right((outcome, _)) => outcome,
     }
 }
 
 fn completed_vcpus_event(
-    failed: bool,
+    result: Result<(), super::Error>,
     external: Option<Result<Event, lifecycle_platform::Error>>,
 ) -> Result<Event, lifecycle_platform::Error> {
-    if failed {
-        Ok(Event::ComponentFailed)
+    if let Err(error) = result {
+        Ok(Event::ComponentFailed(format!("vCPU exit: {error:?}")))
     } else {
         external
             .transpose()
@@ -72,16 +65,16 @@ mod tests {
     #[test]
     fn completed_vcpus_keep_an_already_ready_external_event() {
         assert!(matches!(
-            completed_vcpus_event(false, Some(Ok(Event::Deadline))),
+            completed_vcpus_event(Ok(()), Some(Ok(Event::Deadline))),
             Ok(Event::Deadline)
         ));
         assert!(matches!(
-            completed_vcpus_event(false, None),
+            completed_vcpus_event(Ok(()), None),
             Ok(Event::VcpuFinished)
         ));
         assert!(matches!(
-            completed_vcpus_event(true, Some(Ok(Event::Deadline))),
-            Ok(Event::ComponentFailed)
+            completed_vcpus_event(Err(super::super::Error::UnsupportedMsr), Some(Ok(Event::Deadline))),
+            Ok(Event::ComponentFailed(error)) if error.contains("UnsupportedMsr")
         ));
     }
 }

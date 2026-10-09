@@ -1,0 +1,21 @@
+package terra:vsock@0.1.0;
+
+interface stream-types {
+    enum stream-error { closed, stale, io }
+    record connection { generation: u64 }
+}
+
+interface frontend-stream {
+    use stream-types.{connection, stream-error};
+    connect: func(connection: connection, input: stream<u8>) -> result<stream<u8>, stream-error>;
+}
+
+interface role-stream {
+    /// Waits for the frontend to connect the role and returns its input; none once the frontend retired.
+    accept: async func(output: stream<u8>) -> option<stream<u8>>;
+}
+
+world stream-hosts {
+    import frontend-stream;
+    import role-stream;
+}

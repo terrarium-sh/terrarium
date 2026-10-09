@@ -5,6 +5,22 @@ pub use std::os::unix::net::{UnixListener as LocalListener, UnixStream as LocalS
 #[cfg(windows)]
 pub use uds_windows::{UnixListener as LocalListener, UnixStream as LocalStream};
 
+pub fn create_local_pair() -> std::io::Result<(LocalStream, LocalStream)> {
+    #[cfg(unix)]
+    {
+        LocalStream::pair()
+    }
+    #[cfg(windows)]
+    {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("socket");
+        let listener = LocalListener::bind(&path)?;
+        let client = LocalStream::connect(&path)?;
+        let (server, _) = listener.accept()?;
+        Ok((client, server))
+    }
+}
+
 #[cfg(unix)]
 pub use tokio::net::UnixStream as AsyncLocalStream;
 
@@ -218,11 +234,42 @@ mod tests {
 
     #[test]
     fn local_stream_pair_round_trip() {
-        let (mut left, mut right) = LocalStream::pair().unwrap();
+        let (mut left, mut right) = create_local_pair().unwrap();
         left.write_all(b"ping").unwrap();
         let mut buffer = [0; 4];
         right.read_exact(&mut buffer).unwrap();
         assert_eq!(&buffer, b"ping");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_stream_pair_returns_long_temp_path_errors() {
+        if std::env::var_os("TERRA_TEST_LONG_PAIR_TEMP").is_some() {
+            let directory = std::env::temp_dir();
+            assert!(directory.is_dir());
+            assert!(directory.to_str().unwrap().len() >= 108);
+            assert_eq!(
+                create_local_pair().unwrap_err().kind(),
+                std::io::ErrorKind::InvalidInput
+            );
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let long_directory = directory.path().join("a".repeat(110));
+        std::fs::create_dir(&long_directory).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "io::local::tests::local_stream_pair_returns_long_temp_path_errors",
+                "--nocapture",
+            ])
+            .env("TERRA_TEST_LONG_PAIR_TEMP", "1")
+            .env("TMP", &long_directory)
+            .env("TEMP", &long_directory)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed;"));
     }
 }
 

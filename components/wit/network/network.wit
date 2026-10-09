@@ -1,0 +1,47 @@
+package terra:network@0.1.0;
+
+interface types {
+    enum transport { tcp, udp }
+    record published-port { host-port: u16, guest-port: u16, transport: transport }
+    record config { host-service-ports: list<option<u16>>, published-ports: list<published-port>, flow-capacity: u32 }
+    enum error { malformed, backpressure, not-ready }
+}
+
+interface broker {
+    closed: func() -> future;
+    variant ip-address {
+        ipv4(tuple<u8, u8, u8, u8>),
+        ipv6(tuple<u16, u16, u16, u16, u16, u16, u16, u16>),
+    }
+    record socket-address { address: ip-address, port: u16 }
+    enum error {
+        access-denied, invalid-argument, invalid-state, stale-handle, wrong-kind,
+        busy, limit-exceeded, duplicate-request, cancelled, connection-refused,
+        connection-reset, timed-out, name-unresolvable, resolver-busy,
+        datagram-too-large, closed, io,
+    }
+    resource tcp {
+        peer-address: func() -> result<socket-address, error>;
+        send: func(data: stream<u8>) -> future<result<_, error>>;
+        receive: func() -> tuple<stream<u8>, future<result<_, error>>>;
+    }
+    record datagram { peer: socket-address, bytes: list<u8> }
+    /// A datagram of a `send-to` batch that was not sent, by its index in the batch.
+    record send-failure { index: u32, error: error }
+    resource udp {
+        send-to: async func(datagrams: list<datagram>) -> result<list<send-failure>, error>;
+        receive-from: func() -> tuple<stream<datagram>, future<result<_, error>>>;
+    }
+    resource listener {
+        accept: func() -> tuple<stream<tcp>, future<result<_, error>>>;
+    }
+    open-tcp: async func(peer: socket-address, inline-urgent: bool) -> result<tcp, error>;
+    open-udp: async func() -> result<udp, error>;
+    published-listener: func(host-port: u16, ipv6: bool) -> result<listener, error>;
+    published-udp: async func(host-port: u16, ipv6: bool) -> result<udp, error>;
+    resolve: async func(name: list<u8>) -> result<list<ip-address>, error>;
+}
+
+world broker-host {
+    import broker;
+}

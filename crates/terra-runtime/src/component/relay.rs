@@ -34,6 +34,23 @@ pub fn channel<T: Lift + Lower + Send + Sync + 'static>(
     )
 }
 
+impl<T: Send> Sink<T> {
+    pub(crate) async fn send(&mut self, item: T) -> wasmtime::Result<()> {
+        std::future::poll_fn(|context| self.sender.poll_reserve(context))
+            .await
+            .map_err(|_| wasmtime::Error::msg("device request stream closed"))?;
+        self.sender
+            .send_item(item)
+            .map_err(|_| wasmtime::Error::msg("device request stream closed"))
+    }
+}
+
+impl<T> Stream<T> {
+    pub(crate) async fn next(&mut self) -> Option<T> {
+        self.receiver.recv().await
+    }
+}
+
 impl<D: 'static, T: Lift + Lower + Send + Sync + 'static> StreamConsumer<D> for Sink<T> {
     type Item = T;
 
@@ -245,7 +262,7 @@ mod tests {
             vec![crate::component::mmio::Reply {
                 sequence: 1,
                 value: 0,
-                error: 0,
+                error: None,
                 interrupt: false,
             }],
         )

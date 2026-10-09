@@ -18,7 +18,7 @@ pub const STOP_SIGNAL: u8 = b'S';
 pub const DEFAULT_STOP_GRACE_SECS: u64 = 30;
 
 /// Bump when a host and a running guest agent cannot safely communicate.
-pub const AGENT_PROTOCOL_VERSION: u8 = 1;
+pub const AGENT_PROTOCOL_VERSION: u8 = 2;
 
 pub const AGENT_READY_NOTIFICATION: u8 = b'R';
 

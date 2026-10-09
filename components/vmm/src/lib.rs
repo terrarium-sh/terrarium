@@ -12,12 +12,16 @@ use bindings::{exports, terra};
 mod lifecycle;
 mod machine;
 
-use std::sync::{LazyLock, Mutex};
+use terra::vmm::platform;
 
-use terra::mmio::platform;
-use terra::mmio::types::Error;
-
-const MAX_VCPUS: usize = terra_limits::MAX_VCPUS as usize;
+#[derive(Debug, Eq, PartialEq)]
+enum Error {
+    InvalidVcpu,
+    UnsupportedMsr,
+    BadArmExit,
+    Mmio(terra::mmio::types::Error),
+    Platform(platform::Error),
+}
 const PSCI_CPU_OFF: u64 = 0x8400_0002;
 const PSCI_CPU_ON: u64 = 0xc400_0003;
 const PSCI_32_CPU_ON: u64 = 0x8400_0003;
@@ -43,7 +47,6 @@ const MSRS: [(u32, u64); 12] = [
     (0xC000_0103, 0),
 ];
 
-#[derive(Clone)]
 struct MsrBank {
     values: [u64; 12],
 }
@@ -71,50 +74,6 @@ impl MsrBank {
     }
 }
 
-#[derive(Default)]
-struct CpuState {
-    vcpus: Option<Vec<Vcpu>>,
-    started: bool,
-}
-
-#[derive(Clone)]
-struct Vcpu {
-    msrs: MsrBank,
-    powered: bool,
-}
-
-static CPU_STATE: LazyLock<Mutex<CpuState>> = LazyLock::new(|| Mutex::new(CpuState::default()));
-
-fn cpu_state() -> std::sync::MutexGuard<'static, CpuState> {
-    CPU_STATE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-fn vcpu_bank(state: &mut CpuState, vcpu: u8) -> Result<&mut MsrBank, Error> {
-    state
-        .vcpus
-        .as_mut()
-        .and_then(|vcpus| vcpus.get_mut(usize::from(vcpu)))
-        .map(|vcpu| &mut vcpu.msrs)
-        .ok_or(Error::InvalidVcpu)
-}
-
-fn start_vcpu(state: &mut CpuState, vcpu: u8) -> Result<(), Error> {
-    vcpu_bank(state, vcpu)?;
-    state.started = true;
-    Ok(())
-}
-
-fn powered(state: &mut CpuState, vcpu: u8) -> Result<&mut bool, Error> {
-    state
-        .vcpus
-        .as_mut()
-        .and_then(|vcpus| vcpus.get_mut(usize::from(vcpu)))
-        .map(|vcpu| &mut vcpu.powered)
-        .ok_or(Error::InvalidVcpu)
-}
-
 fn psci_features(function: u64) -> i64 {
     match function {
         PSCI_VERSION
@@ -131,11 +90,14 @@ fn psci_features(function: u64) -> i64 {
 }
 
 fn psci_hvc(id: u8, hvc: Hvc) -> Result<platform::Completion, Error> {
-    let mut state = cpu_state();
-    psci_hvc_for(&mut state, id, &hvc)
+    machine::with_powered_cpus(|powered_cpus| psci_hvc_for(powered_cpus, id, &hvc))?
 }
 
-fn psci_hvc_for(state: &mut CpuState, id: u8, hvc: &Hvc) -> Result<platform::Completion, Error> {
+fn psci_hvc_for(
+    powered_cpus: &mut [bool],
+    id: u8,
+    hvc: &Hvc,
+) -> Result<platform::Completion, Error> {
     let status = match hvc.function {
         PSCI_VERSION => return Ok(platform::Completion::HvcReturn(0x0001_0000)),
         PSCI_FEATURES => {
@@ -150,12 +112,7 @@ fn psci_hvc_for(state: &mut CpuState, id: u8, hvc: &Hvc) -> Result<platform::Com
                 let Ok(target) = u8::try_from(hvc.argument0) else {
                     return Ok(platform::Completion::HvcReturn(-3));
                 };
-                let Some(powered) = state
-                    .vcpus
-                    .as_mut()
-                    .and_then(|vcpus| vcpus.get_mut(usize::from(target)))
-                    .map(|vcpu| &mut vcpu.powered)
-                else {
+                let Some(powered) = powered_cpus.get_mut(usize::from(target)) else {
                     return Ok(platform::Completion::HvcReturn(-3));
                 };
                 i64::from(!*powered)
@@ -165,12 +122,7 @@ fn psci_hvc_for(state: &mut CpuState, id: u8, hvc: &Hvc) -> Result<platform::Com
             let Ok(target) = u8::try_from(hvc.argument0) else {
                 return Ok(platform::Completion::HvcReturn(-3));
             };
-            let Some(powered) = state
-                .vcpus
-                .as_mut()
-                .and_then(|vcpus| vcpus.get_mut(usize::from(target)))
-                .map(|vcpu| &mut vcpu.powered)
-            else {
+            let Some(powered) = powered_cpus.get_mut(usize::from(target)) else {
                 return Ok(platform::Completion::HvcReturn(-3));
             };
             if target == 0 || *powered {
@@ -184,7 +136,9 @@ fn psci_hvc_for(state: &mut CpuState, id: u8, hvc: &Hvc) -> Result<platform::Com
             }
         }
         PSCI_CPU_OFF => {
-            *powered(state, id)? = false;
+            *powered_cpus
+                .get_mut(usize::from(id))
+                .ok_or(Error::InvalidVcpu)? = false;
             return Ok(platform::Completion::CpuOff);
         }
         PSCI_SYSTEM_OFF | PSCI_SYSTEM_RESET => return Ok(platform::Completion::SystemStop),
@@ -194,34 +148,33 @@ fn psci_hvc_for(state: &mut CpuState, id: u8, hvc: &Hvc) -> Result<platform::Com
 }
 
 fn psci_start_result(result: platform::HvcResult) -> Result<platform::Completion, Error> {
-    let mut state = cpu_state();
-    psci_start_result_for(&mut state, result)
+    machine::with_powered_cpus(|powered_cpus| psci_start_result_for(powered_cpus, result))?
 }
 
 fn psci_start_result_for(
-    state: &mut CpuState,
+    powered_cpus: &mut [bool],
     result: platform::HvcResult,
 ) -> Result<platform::Completion, Error> {
     if result.status == 0 {
-        *powered(state, result.target)? = true;
+        *powered_cpus
+            .get_mut(usize::from(result.target))
+            .ok_or(Error::InvalidVcpu)? = true;
     }
     Ok(platform::Completion::HvcReturn(result.status))
 }
 
 async fn vcpu_access(address: u64, width: u8, value: u64, write: bool) -> Result<u64, Error> {
-    match terra::mmio::vmm_mmio_client::access(address, width, value, write).await {
+    use terra::mmio::types::Error as MmioError;
+    match terra::vmm::vmm_mmio_client::access(address, width, value, write).await {
         Ok(value) => Ok(value),
-        Err(Error::Unmapped | Error::BadWidth | Error::Overflow) => Ok(0),
+        Err(MmioError::Unmapped | MmioError::BadWidth | MmioError::Overflow) => Ok(0),
         Err(
-            error @ (Error::InvalidSlot
-            | Error::InvalidVcpu
-            | Error::UnsupportedMsr
-            | Error::BadArmExit
-            | Error::Overlap
-            | Error::Busy
-            | Error::Closed
-            | Error::Device),
-        ) => Err(error),
+            error @ (MmioError::InvalidSlot
+            | MmioError::Overlap
+            | MmioError::Busy
+            | MmioError::Closed
+            | MmioError::Device),
+        ) => Err(Error::Mmio(error)),
     }
 }
 
@@ -233,51 +186,25 @@ struct Hvc {
     argument2: u64,
 }
 
-async fn read_arm_register(cpu: &platform::Vcpu, register: u8) -> Result<u64, Error> {
-    if register == 31 {
-        return Ok(0);
-    }
-    match cpu
-        .resume(platform::Completion::ArmRegister(register))
-        .await
-    {
-        Ok(platform::Exit::ArmRegisterValue(value)) => Ok(value),
-        Ok(platform::Exit::Stopped) | Err(platform::Error::Cancelled) => Err(Error::Closed),
-        Ok(
-            platform::Exit::Halt
-            | platform::Exit::Shutdown
-            | platform::Exit::Interrupted
-            | platform::Exit::MmioRead(_)
-            | platform::Exit::MmioWrite(_)
-            | platform::Exit::PioRead(_)
-            | platform::Exit::PioWrite(_)
-            | platform::Exit::Rdmsr(_)
-            | platform::Exit::Wrmsr(_)
-            | platform::Exit::ArmException(_)
-            | platform::Exit::HvcResult(_),
-        )
-        | Err(platform::Error::Unavailable | platform::Error::BadExit) => Err(Error::BadArmExit),
-    }
-}
-
 async fn handle_arm_exception(
-    cpu: &platform::Vcpu,
     id: u8,
     request: platform::ArmException,
 ) -> Result<platform::Completion, Error> {
     const HVC64: u64 = 0x16;
     if request.syndrome >> 26 == HVC64 {
+        let (function, argument0, argument1, argument2) =
+            request.hvc_registers.ok_or(Error::BadArmExit)?;
         let hvc = Hvc {
-            function: read_arm_register(cpu, 0).await?,
-            argument0: read_arm_register(cpu, 1).await?,
-            argument1: read_arm_register(cpu, 2).await?,
-            argument2: read_arm_register(cpu, 3).await?,
+            function,
+            argument0,
+            argument1,
+            argument2,
         };
         return psci_hvc(id, hvc);
     }
     let fields = arm_mmio_fields(request.syndrome)?;
     let value = if fields.write {
-        read_arm_register(cpu, fields.register).await?
+        request.write_value.ok_or(Error::BadArmExit)?
             & (u64::MAX >> (64 - u32::from(fields.width) * 8))
     } else {
         0
@@ -298,17 +225,14 @@ async fn handle_arm_exception(
 }
 
 async fn run_vcpu(cpu: platform::Vcpu, id: u8) -> Result<(), Error> {
-    {
-        let mut state = cpu_state();
-        start_vcpu(&mut state, id)?;
-    }
+    let mut msrs = MsrBank::new();
     let mut completion = platform::Completion::Start;
     loop {
         let exit = match cpu.resume(completion).await {
             Ok(exit) => exit,
             Err(platform::Error::Cancelled) => return Ok(()),
-            Err(platform::Error::Unavailable | platform::Error::BadExit) => {
-                return Err(Error::Device);
+            Err(error @ (platform::Error::Unavailable | platform::Error::BadExit)) => {
+                return Err(Error::Platform(error));
             }
         };
         completion = match exit {
@@ -324,26 +248,20 @@ async fn run_vcpu(cpu: platform::Vcpu, id: u8) -> Result<(), Error> {
                 platform::Completion::Reenter
             }
             platform::Exit::PioRead(_) => platform::Completion::PioZero,
-            platform::Exit::Rdmsr(request) => {
-                let mut state = cpu_state();
-                match vcpu_bank(&mut state, id)?.read(request.index) {
-                    Ok(value) => platform::Completion::Rdmsr(value),
-                    Err(Error::UnsupportedMsr) => platform::Completion::MsrFault,
-                    Err(error) => return Err(error),
-                }
-            }
-            platform::Exit::Wrmsr(request) => {
-                let mut state = cpu_state();
-                match vcpu_bank(&mut state, id)?.write(request.index, request.value) {
-                    Ok(()) => platform::Completion::Wrmsr,
-                    Err(Error::UnsupportedMsr) => platform::Completion::MsrFault,
-                    Err(error) => return Err(error),
-                }
-            }
+            platform::Exit::Rdmsr(request) => match msrs.read(request.index) {
+                Ok(value) => platform::Completion::Rdmsr(value),
+                Err(Error::UnsupportedMsr) => platform::Completion::MsrFault,
+                Err(error) => return Err(error),
+            },
+            platform::Exit::Wrmsr(request) => match msrs.write(request.index, request.value) {
+                Ok(()) => platform::Completion::Wrmsr,
+                Err(Error::UnsupportedMsr) => platform::Completion::MsrFault,
+                Err(error) => return Err(error),
+            },
             platform::Exit::ArmException(request) => {
-                match handle_arm_exception(&cpu, id, request).await {
+                match handle_arm_exception(id, request).await {
                     Ok(completion) => completion,
-                    Err(Error::Closed) => return Ok(()),
+                    Err(Error::Mmio(terra::mmio::types::Error::Closed)) => return Ok(()),
                     Err(Error::BadArmExit) => platform::Completion::ArmRead(platform::ArmRead {
                         register: None,
                         value: 0,
@@ -351,7 +269,6 @@ async fn run_vcpu(cpu: platform::Vcpu, id: u8) -> Result<(), Error> {
                     Err(error) => return Err(error),
                 }
             }
-            platform::Exit::ArmRegisterValue(_) => return Err(Error::BadArmExit),
             platform::Exit::HvcResult(result) => psci_start_result(result)?,
         };
         wit_bindgen::rt::async_support::yield_async().await;
@@ -419,27 +336,6 @@ struct Dispatcher;
 mod component_exports {
     use super::{Dispatcher, bindings};
     bindings::export!(Dispatcher with_types_in bindings);
-}
-
-pub fn configure_vcpus(count: u8) -> Result<(), Error> {
-    let count = usize::from(count);
-    if count == 0 || count > MAX_VCPUS {
-        return Err(Error::InvalidVcpu);
-    }
-    let mut state = cpu_state();
-    if state.started || state.vcpus.is_some() {
-        return Err(Error::Busy);
-    }
-    let mut vcpus = vec![
-        Vcpu {
-            msrs: MsrBank::new(),
-            powered: false
-        };
-        count
-    ];
-    vcpus[0].powered = true;
-    state.vcpus = Some(vcpus);
-    Ok(())
 }
 
 #[cfg(test)]
@@ -512,19 +408,7 @@ mod tests {
 
     #[test]
     fn psci_updates_cpu_state_only_after_native_start_succeeds() {
-        let mut router = CpuState {
-            vcpus: Some(vec![
-                Vcpu {
-                    msrs: MsrBank::new(),
-                    powered: true,
-                },
-                Vcpu {
-                    msrs: MsrBank::new(),
-                    powered: false,
-                },
-            ]),
-            started: true,
-        };
+        let mut router = vec![true, false];
         let start = psci_hvc_for(
             &mut router,
             0,
@@ -540,7 +424,7 @@ mod tests {
             panic!("expected CPU start");
         };
         assert_eq!((start.target, start.entry, start.context), (1, 0x8000, 7));
-        assert!(!router.vcpus.as_ref().expect("CPU state")[1].powered);
+        assert!(!router[1]);
         assert!(matches!(
             psci_start_result_for(
                 &mut router,
@@ -551,7 +435,7 @@ mod tests {
             ),
             Ok(platform::Completion::HvcReturn(-3))
         ));
-        assert!(!router.vcpus.as_ref().expect("CPU state")[1].powered);
+        assert!(!router[1]);
         assert!(matches!(
             psci_start_result_for(
                 &mut router,
@@ -562,18 +446,12 @@ mod tests {
             ),
             Ok(platform::Completion::HvcReturn(0))
         ));
-        assert!(router.vcpus.as_ref().expect("CPU state")[1].powered);
+        assert!(router[1]);
     }
 
     #[test]
     fn psci_rejects_an_invalid_cpu_without_failing_the_router() {
-        let mut router = CpuState {
-            vcpus: Some(vec![Vcpu {
-                msrs: MsrBank::new(),
-                powered: true,
-            }]),
-            started: true,
-        };
+        let mut router = vec![true];
         let completion = psci_hvc_for(
             &mut router,
             0,

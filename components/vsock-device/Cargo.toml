@@ -1,11 +1,13 @@
 [package]
-workspace = "../.."
 name = "terra-vsock-device"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-repository.workspace = true
-rust-version.workspace = true
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/terrarium-sh/terrarium"
+rust-version = "1.95"
+
+[features]
+fuzzing = []
 
 [dependencies]
 terra-protocol = { path = "../../crates/terra-protocol" }

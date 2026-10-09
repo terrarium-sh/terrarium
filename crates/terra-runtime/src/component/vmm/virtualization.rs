@@ -8,10 +8,10 @@ use super::{Platform, PlatformHost};
 use crate::box_runtime::BoxRuntime;
 use crate::box_runtime::store::BoxHost;
 use crate::component::vmm::bindings::virtualization;
-use crate::component::vmm::bindings::virtualization::{Config, Error};
+use crate::component::vmm::bindings::virtualization::Error;
 use crate::machine::{Architecture, Device, DeviceKind, MachineConfig};
 pub(crate) type InitializeMachine = wasmtime::component::TypedFunc<
-    (Config, Resource<Vm>, Vec<Resource<super::Vcpu>>),
+    (Architecture, Resource<Vm>, Vec<Resource<super::Vcpu>>),
     (Result<(), super::bindings::machine::Error>,),
 >;
 use crate::memory::{BoundedMemory, GuestRam};
@@ -82,20 +82,6 @@ impl<M: VirtualMachine> MachineHandle<M> {
             .ok_or_else(|| wasmtime::Error::msg("interrupt device outside VM grant"))?;
         let machine = self.machine();
         Ok(Arc::new(move |level| inject(&machine, irq, level)))
-    }
-
-    pub fn inject_irq(
-        &self,
-        gsi: u32,
-        level: bool,
-        inject: impl FnOnce(&M, u32, bool) -> wasmtime::Result<()>,
-    ) -> wasmtime::Result<()> {
-        let created = &self.0;
-        if !created.devices.iter().any(|device| device.irq == gsi) {
-            return Err(wasmtime::Error::msg("interrupt line outside VM grant"));
-        }
-        let machine = self.machine();
-        inject(&machine, gsi, level)
     }
 
     #[must_use]
@@ -322,26 +308,6 @@ impl PlatformHost {
 }
 
 impl BoxRuntime {
-    pub(crate) async fn compose_machine(&mut self) -> wasmtime::Result<()> {
-        let machine = &self
-            .vmm
-            .as_ref()
-            .ok_or_else(|| wasmtime::Error::msg("VMM missing"))?
-            .machine;
-        tokio::time::timeout(
-            super::EXIT_TIMEOUT,
-            machine.func_compose().call_async(&mut self.store, ()),
-        )
-        .await
-        .map_err(wasmtime::Error::from)
-        .and_then(std::convert::identity)
-        .and_then(|(result,)| {
-            result.map_err(|error| {
-                wasmtime::Error::msg(format!("Wasm machine composition: {error:?}"))
-            })
-        })
-    }
-
     pub async fn attach_machine<M: VirtualMachine>(
         mut self,
         prepared: PreparedMachine<M>,
@@ -396,7 +362,7 @@ impl BoxRuntime {
         });
         let initialized = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            initialize.call_async(&mut self.store, (config.into_component_config(), vm, vcpus)),
+            initialize.call_async(&mut self.store, (config.architecture(), vm, vcpus)),
         )
         .await
         .map_err(wasmtime::Error::from)
@@ -551,18 +517,13 @@ mod tests {
                         12,
                     ),
                     (
-                        DeviceKind::Net,
+                        DeviceKind::Vsock,
                         terra_limits::X86_MMIO_BASE + 2 * terra_limits::X86_MMIO_STRIDE,
                         13,
                     ),
                     (
-                        DeviceKind::Vsock,
-                        terra_limits::X86_MMIO_BASE + 3 * terra_limits::X86_MMIO_STRIDE,
-                        14,
-                    ),
-                    (
                         DeviceKind::Memory,
-                        terra_limits::X86_MMIO_BASE + 4 * terra_limits::X86_MMIO_STRIDE,
+                        terra_limits::X86_MMIO_BASE + 3 * terra_limits::X86_MMIO_STRIDE,
                         15,
                     ),
                 ],
@@ -570,8 +531,7 @@ mod tests {
                     (DeviceKind::Block, 0x0a00_0000, 16),
                     (DeviceKind::Block, 0x0a00_0200, 17),
                     (DeviceKind::Memory, 0x0a00_0400, 18),
-                    (DeviceKind::Net, 0x0a00_0600, 19),
-                    (DeviceKind::Vsock, 0x0a00_0800, 20),
+                    (DeviceKind::Vsock, 0x0a00_0600, 19),
                 ],
             }
             .into_iter()
@@ -624,10 +584,7 @@ mod tests {
             prepared.accept_boot(boot_entry).unwrap();
 
             let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).unwrap();
-            let mmio =
-                wasmtime::component::Component::new(&engine, crate::test_fixtures::wasm::MMIO)
-                    .unwrap();
-            runtime.initialize_mmio(&mmio).await.unwrap();
+            runtime.initialize_mmio().unwrap();
             runtime.initialize_vmm(&vmm).await.unwrap();
             let (runtime, handle) = runtime.attach_machine(prepared).await.unwrap();
             let (sender, receiver) = std::sync::mpsc::sync_channel(1);

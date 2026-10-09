@@ -1,4 +1,4 @@
-//! Native VM, memory, filesystem, and local-I/O operations.
+//! Native VM, memory, filesystem, local-I/O, and child-process operations.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
@@ -12,4 +12,5 @@ mod windows;
 pub mod filesystem;
 pub mod io;
 pub mod memory;
+pub mod process;
 pub mod vm;

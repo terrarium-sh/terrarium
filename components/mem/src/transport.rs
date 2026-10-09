@@ -1,19 +1,15 @@
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{LazyLock, Mutex};
 
-use futures::task::AtomicWaker;
-
 use terra_device_transport::{
-    INT_USED_BUFFER, MmioError, MmioTransport, QueueEntry, SPLIT_RING_DESC_F_NEXT,
-    SPLIT_RING_DESCRIPTOR_BYTES, SplitRingDescriptor, SplitRingError, split_ring_chain,
+    Doorbell, INT_USED_BUFFER, MmioTransport, QueueEntry, SPLIT_RING_DESC_F_NEXT,
+    SPLIT_RING_DESCRIPTOR_BYTES, SplitRingDescriptor, WriteOutcome, complete_split_ring_entry,
+    publish_interrupt_level, read_split_ring_available, split_ring_chain,
 };
 
 use crate::terra::host::{interrupt, memory};
 use crate::terra::mem::host::{self, Range};
 use crate::terra::mmio::types::DeviceError;
 
-const INFLATE: usize = 0;
-const DEFLATE: usize = 1;
 const REPORT: usize = 2;
 const QUEUE_COUNT_U16: u16 = 3;
 const QUEUE_COUNT: usize = QUEUE_COUNT_U16 as usize;
@@ -47,55 +43,20 @@ impl BalloonConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct GuestRange {
-    addr: u64,
-    len: u64,
-}
-
 static STATE: LazyLock<Mutex<Option<State>>> = LazyLock::new(|| Mutex::new(None));
-static CLOSED: AtomicBool = AtomicBool::new(false);
-static PENDING_QUEUES: AtomicU32 = AtomicU32::new(0);
-static QUEUE_WAKER: AtomicWaker = AtomicWaker::new();
-
-async fn wait_for_queues() -> u32 {
-    std::future::poll_fn(|context| {
-        let pending = PENDING_QUEUES.swap(0, Ordering::AcqRel);
-        if pending != 0 || CLOSED.load(Ordering::Acquire) {
-            return std::task::Poll::Ready(pending);
-        }
-        QUEUE_WAKER.register(context.waker());
-        let pending = PENDING_QUEUES.swap(0, Ordering::AcqRel);
-        if pending != 0 || CLOSED.load(Ordering::Acquire) {
-            std::task::Poll::Ready(pending)
-        } else {
-            std::task::Poll::Pending
-        }
-    })
-    .await
-}
-
-fn publish_interrupt_level(level: bool) {
-    if cfg!(target_arch = "wasm32") {
-        crate::terra::host::interrupt::set_level(level);
-    }
-}
+static QUEUES: Doorbell = Doorbell::new();
 
 fn state<T>(f: impl FnOnce(&mut State) -> Result<T, DeviceError>) -> Result<T, DeviceError> {
     let mut state = STATE.lock().map_err(|_| DeviceError::Io)?;
     let state = state.as_mut().ok_or(DeviceError::NotReady)?;
     let result = f(state);
     if let Some(level) = state.mmio.take_irq() {
-        publish_interrupt_level(level);
+        publish_interrupt_level(level, interrupt::set_level);
     }
     result
 }
 
-impl From<MmioError> for DeviceError {
-    fn from(error: MmioError) -> Self {
-        terra_device_transport::device_error!(error, DeviceError)
-    }
-}
+terra_device_transport::device_error!(DeviceError);
 
 fn read(addr: u64, len: u64) -> Result<Vec<u8>, DeviceError> {
     memory::read(addr, len).map_err(|_| DeviceError::Unmapped)
@@ -106,32 +67,47 @@ fn write(addr: u64, bytes: &[u8]) -> Result<(), DeviceError> {
 }
 
 fn chain(table: &[u8], index: u16, size: u16) -> Result<Vec<Descriptor>, DeviceError> {
-    split_ring_chain(table, index, size, MAX_CHAIN, NEXT | WRITE).map_err(|error| match error {
-        SplitRingError::BadDescriptor => DeviceError::BadLen,
-        SplitRingError::ChainTooLong => DeviceError::TooLarge,
-    })
+    split_ring_chain(table, index, size, MAX_CHAIN, NEXT | WRITE).map_err(DeviceError::from)
 }
 
 fn available(state: &mut State, queue: usize) -> Result<Option<QueueEntry>, DeviceError> {
-    if state.mmio.negotiated() & VIRTIO_F_VERSION_1 == 0
-        || state.mmio.queue_addrs_for(queue).is_none()
-    {
+    if state.mmio.negotiated() & VIRTIO_F_VERSION_1 == 0 {
         return Err(DeviceError::NotReady);
     }
-    state
+    let (descriptor_table, available_ring, used_ring, size) = state
         .mmio
-        .read_queue_entry(queue, &mut state.next[queue], read)
+        .queue_addrs_for(queue)
+        .ok_or(DeviceError::NotReady)?;
+    let (_, head) = read_split_ring_available(
+        available_ring,
+        core::num::NonZeroU16::new(size).ok_or(DeviceError::BadQueue)?,
+        &mut state.next[queue],
+        read,
+    )?;
+    Ok(head.map(|head| QueueEntry {
+        descriptor_table,
+        available_ring,
+        used_ring,
+        size,
+        head,
+    }))
 }
 
-fn complete(state: &mut State, queue: usize, head: u16) -> Result<(), DeviceError> {
-    state
-        .mmio
-        .complete_queue_entry(queue, &mut state.next[queue], head, 0, read, write)?;
-    interrupt::signal();
+fn complete(state: &mut State, queue: usize, ring: &QueueEntry) -> Result<(), DeviceError> {
+    complete_split_ring_entry(
+        ring.used_ring,
+        core::num::NonZeroU16::new(ring.size).ok_or(DeviceError::BadQueue)?,
+        ring.head,
+        0,
+        read,
+        write,
+    )?;
+    state.next[queue] = state.next[queue].wrapping_add(1);
+    state.mmio.signal(INT_USED_BUFFER);
     Ok(())
 }
 
-fn overlaps(left: GuestRange, right: GuestRange) -> bool {
+fn overlaps(left: Range, right: Range) -> bool {
     let Some(left_end) = left.addr.checked_add(left.len) else {
         return true;
     };
@@ -143,10 +119,10 @@ fn overlaps(left: GuestRange, right: GuestRange) -> bool {
 
 fn report_ranges(
     descriptors: &[Descriptor],
-    descriptor_table: GuestRange,
-    available_ring: GuestRange,
-    used_ring: GuestRange,
-) -> Result<Vec<GuestRange>, DeviceError> {
+    descriptor_table: Range,
+    available_ring: Range,
+    used_ring: Range,
+) -> Result<Vec<Range>, DeviceError> {
     if descriptors.is_empty() || descriptors.len() > MAX_CHAIN {
         return Err(DeviceError::BadLen);
     }
@@ -156,7 +132,7 @@ fn report_ranges(
         if descriptor.flags & WRITE == 0 || descriptor.len == 0 {
             return Err(DeviceError::BadLen);
         }
-        let range = GuestRange {
+        let range = Range {
             addr: descriptor.addr,
             len: u64::from(descriptor.len),
         };
@@ -176,14 +152,6 @@ fn report_ranges(
         ranges.push(range);
     }
     Ok(ranges)
-}
-
-fn process_inflate_or_deflate(state: &mut State, queue: usize) -> Result<bool, DeviceError> {
-    let Some(ring) = available(state, queue)? else {
-        return Ok(false);
-    };
-    complete(state, queue, ring.head)?;
-    Ok(available(state, queue)?.is_some())
 }
 
 fn host_features() -> u64 {
@@ -221,15 +189,17 @@ fn config_write(
     })
 }
 
-fn config_read(config: BalloonConfig, addr: u64, len: u32) -> Option<Vec<u8>> {
-    let len = usize::try_from(len).ok()?;
+fn config_read(config: BalloonConfig, addr: u64, width: u8) -> Option<u64> {
+    let len = usize::from(width);
     let end = addr.checked_add(u64::try_from(len).ok()?)?;
     if addr < 0x100 || end > 0x110 || !matches!(len, 1 | 2 | 4) {
         return None;
     }
     let start = usize::try_from(addr - 0x100).ok()?;
     let end = start.checked_add(len)?;
-    Some(config.0.get(start..end)?.to_vec())
+    let mut value = [0; 8];
+    value[..len].copy_from_slice(config.0.get(start..end)?);
+    Some(u64::from_le_bytes(value))
 }
 
 fn discard_report(state: &State, ring: &QueueEntry) -> Result<(), DeviceError> {
@@ -237,53 +207,31 @@ fn discard_report(state: &State, ring: &QueueEntry) -> Result<(), DeviceError> {
     let descriptors = chain(&table, ring.head, ring.size)?;
     let ranges = report_ranges(
         &descriptors,
-        GuestRange {
+        Range {
             addr: ring.descriptor_table,
             len: u64::from(ring.size) * DESC_BYTES,
         },
-        GuestRange {
+        Range {
             addr: ring.available_ring,
             len: 4 + u64::from(ring.size) * 2,
         },
-        GuestRange {
+        Range {
             addr: ring.used_ring,
             len: 4 + u64::from(ring.size) * 8,
         },
     )?;
     if state.config.page_contents_are_zeroed() {
-        let ranges: Vec<Range> = ranges
-            .into_iter()
-            .map(|range| Range {
-                addr: range.addr,
-                len: range.len,
-            })
-            .collect();
         // Reclaim is advisory; unsupported host pages must not stop the balloon worker.
         let _ = host::discard(&ranges);
     }
     Ok(())
 }
 
-fn process_report(state: &mut State) -> Result<bool, DeviceError> {
-    let Some(ring) = available(state, REPORT)? else {
-        return Ok(false);
-    };
-    if discard_report(state, &ring).is_err() {
-        complete(state, REPORT, ring.head)?;
-        return Ok(true);
-    }
-    complete(state, REPORT, ring.head)?;
-    Ok(available(state, REPORT)?.is_some())
-}
-
 pub fn configure() -> Result<(), DeviceError> {
-    CLOSED.store(false, Ordering::Release);
-    PENDING_QUEUES.store(0, Ordering::Release);
-    publish_interrupt_level(false);
+    QUEUES.reset();
+    publish_interrupt_level(false, interrupt::set_level);
     *STATE.lock().map_err(|_| DeviceError::Io)? = Some(State {
         mmio: MmioTransport::new(
-            0,
-            0x200,
             memory::address_limit(),
             5,
             host_features(),
@@ -297,58 +245,58 @@ pub fn configure() -> Result<(), DeviceError> {
     Ok(())
 }
 
-pub fn mmio_read(addr: u64, len: u32) -> Result<Vec<u8>, DeviceError> {
+pub fn mmio_read(addr: u64, width: u8) -> Result<u64, DeviceError> {
     state(|state| {
-        if let Some(bytes) = config_read(state.config, addr, len) {
-            return Ok(bytes);
+        if let Some(value) = config_read(state.config, addr, width) {
+            return Ok(value);
         }
-        state
-            .mmio
-            .read(addr, usize::try_from(len).map_err(|_| DeviceError::BadLen)?)
-            .map_err(DeviceError::from)
+        state.mmio.read(addr, width).map_err(DeviceError::from)
     })
 }
 
-pub fn mmio_write(addr: u64, data: &[u8]) -> Result<bool, DeviceError> {
+pub fn mmio_write(addr: u64, width: u8, value: u64) -> Result<(), DeviceError> {
     state(|state| {
+        let bytes = value.to_le_bytes();
+        let data = bytes.get(..usize::from(width)).ok_or(DeviceError::BadLen)?;
         if let Some(result) = config_write(&mut state.config, addr, data) {
-            return result.map(|()| false);
+            return result;
         }
-        let generation = state.mmio.reset_generation();
-        let bell = state.mmio.write(addr, data).map_err(DeviceError::from)?;
-        if generation != state.mmio.reset_generation() {
-            state.next = [0; QUEUE_COUNT];
+        match state
+            .mmio
+            .write(addr, width, value)
+            .map_err(DeviceError::from)?
+        {
+            WriteOutcome::None => {}
+            WriteOutcome::Reset => state.next = [0; QUEUE_COUNT],
+            WriteOutcome::QueueNotify(queue) => QUEUES.ring(1_u32 << queue),
         }
-        if bell.is_some() {
-            let queue = u32::from_le_bytes(data.try_into().map_err(|_| DeviceError::BadLen)?);
-            if usize::try_from(queue).is_ok_and(|queue| queue < QUEUE_COUNT) {
-                PENDING_QUEUES.fetch_or(1 << queue, Ordering::Release);
-                QUEUE_WAKER.wake();
-            }
-        }
-        Ok(false)
+        Ok(())
     })
-}
-
-pub fn queue_notify(queue: u32) -> Result<bool, DeviceError> {
-    match usize::try_from(queue).map_err(|_| DeviceError::BadQueue)? {
-        INFLATE | DEFLATE => state(|state| process_inflate_or_deflate(state, queue as usize)),
-        REPORT => state(process_report),
-        _ => Err(DeviceError::BadQueue),
-    }
 }
 
 pub async fn run() -> Result<(), DeviceError> {
-    while !CLOSED.load(Ordering::Acquire) {
-        let queues = wait_for_queues().await;
+    while !QUEUES.is_closed() {
+        let queues = QUEUES.wait().await;
         for queue in 0..QUEUE_COUNT {
             if queues & (1 << queue) == 0 {
                 continue;
             }
-            // An unaddressable ring cannot be completed; wait for reset or another doorbell.
-            while queue_notify(u32::try_from(queue).map_err(|_| DeviceError::BadQueue)?)
-                .unwrap_or(false)
-            {
+            loop {
+                // An unaddressable ring cannot be completed; wait for reset or another doorbell.
+                let processed = state(|state| {
+                    let Some(ring) = available(state, queue)? else {
+                        return Ok(false);
+                    };
+                    if queue == REPORT {
+                        let _ = discard_report(state, &ring);
+                    }
+                    complete(state, queue, &ring)?;
+                    Ok(true)
+                })
+                .unwrap_or(false);
+                if !processed {
+                    break;
+                }
                 wit_bindgen::rt::async_support::yield_async().await;
             }
         }
@@ -357,31 +305,21 @@ pub async fn run() -> Result<(), DeviceError> {
 }
 
 pub fn interrupt_level() -> bool {
-    state(|state| {
-        state
-            .mmio
-            .read(0x60, 4)
-            .map(|bytes| {
-                u32::from_le_bytes(bytes.try_into().unwrap_or([0; 4])) & INT_USED_BUFFER != 0
-            })
-            .map_err(DeviceError::from)
-    })
-    .unwrap_or(false)
+    state(|state| Ok(state.mmio.interrupt_status() & INT_USED_BUFFER != 0)).unwrap_or(false)
 }
 
 pub fn reset() {
-    if CLOSED.load(Ordering::Acquire) {
+    if QUEUES.is_closed() {
         return;
     }
-    PENDING_QUEUES.store(0, Ordering::Release);
+    QUEUES.clear();
     let _ = configure();
 }
 
 pub fn close() -> Result<(), DeviceError> {
-    CLOSED.store(true, Ordering::Release);
-    QUEUE_WAKER.wake();
+    QUEUES.close();
     *STATE.lock().map_err(|_| DeviceError::Io)? = None;
-    publish_interrupt_level(false);
+    publish_interrupt_level(false, interrupt::set_level);
     Ok(())
 }
 
@@ -391,22 +329,22 @@ mod tests {
 
     #[test]
     fn reset_does_not_reopen_a_closed_device() {
-        CLOSED.store(true, Ordering::Release);
+        QUEUES.close();
         *STATE.lock().unwrap() = None;
         reset();
         assert!(STATE.lock().unwrap().is_none());
-        CLOSED.store(false, Ordering::Release);
+        QUEUES.reset();
     }
 
-    const TABLE: GuestRange = GuestRange {
+    const TABLE: Range = Range {
         addr: 0x10_000,
         len: 512,
     };
-    const AVAIL: GuestRange = GuestRange {
+    const AVAIL: Range = Range {
         addr: 0x20_000,
         len: 512,
     };
-    const USED: GuestRange = GuestRange {
+    const USED: Range = Range {
         addr: 0x30_000,
         len: 1024,
     };
@@ -431,7 +369,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             ranges,
-            vec![GuestRange {
+            vec![Range {
                 addr: 0x40_000,
                 len: 8192
             }]
@@ -493,8 +431,6 @@ mod tests {
         let mut state = State {
             mmio: MmioTransport::new(
                 0,
-                0x200,
-                0,
                 5,
                 host_features(),
                 QUEUE_SIZE,
@@ -518,22 +454,13 @@ mod tests {
             config_write(&mut config, CONFIG_ACTUAL, &[1, 2, 3, 4]),
             Some(Ok(()))
         );
-        assert_eq!(
-            config_read(config, CONFIG_ACTUAL, 4),
-            Some(vec![1, 2, 3, 4])
-        );
+        assert_eq!(config_read(config, CONFIG_ACTUAL, 4), Some(0x0403_0201));
         assert_eq!(
             config_write(&mut config, CONFIG_POISON + 1, &[0xaa, 0xbb]),
             Some(Ok(()))
         );
-        assert_eq!(
-            config_read(config, CONFIG_POISON, 4),
-            Some(vec![0, 0xaa, 0xbb, 0])
-        );
-        assert_eq!(
-            config_read(config, CONFIG_POISON - 1, 4),
-            Some(vec![0, 0, 0xaa, 0xbb])
-        );
+        assert_eq!(config_read(config, CONFIG_POISON, 4), Some(0x00bb_aa00));
+        assert_eq!(config_read(config, CONFIG_POISON - 1, 4), Some(0xbbaa_0000));
         assert!(!config.page_contents_are_zeroed());
         assert_eq!(
             config_write(&mut config, CONFIG_POISON, &[0; 4]),

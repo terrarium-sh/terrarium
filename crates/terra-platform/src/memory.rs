@@ -229,7 +229,7 @@ impl GuestMemory {
     pub fn read_into(&self, addr: u64, bytes: &mut [u8]) -> Result<(), MemoryError> {
         let len = u64::try_from(bytes.len()).map_err(|_| MemoryError::OutOfRange)?;
         #[cfg(unix)]
-        self.check_range(addr, len)?;
+        self.validate_range(addr, len)?;
         #[cfg(windows)]
         let (range, range_offset) = self.resolve_range(addr, len)?;
         #[cfg(unix)]
@@ -253,7 +253,7 @@ impl GuestMemory {
     pub fn write(&self, addr: u64, bytes: &[u8]) -> Result<(), MemoryError> {
         let len = u64::try_from(bytes.len()).map_err(|_| MemoryError::OutOfRange)?;
         #[cfg(unix)]
-        self.check_range(addr, len)?;
+        self.validate_range(addr, len)?;
         #[cfg(windows)]
         let (range, range_offset) = self.resolve_range(addr, len)?;
         #[cfg(unix)]
@@ -302,15 +302,6 @@ impl GuestMemory {
                     .ok()
                     .map(|offset| range.address.as_ptr().wrapping_add(offset))
             })
-        }
-    }
-
-    #[cfg(unix)]
-    fn check_range(&self, addr: u64, len: u64) -> Result<(), MemoryError> {
-        if self.contains_range(addr, len) {
-            Ok(())
-        } else {
-            Err(self.range_error(addr, len))
         }
     }
 

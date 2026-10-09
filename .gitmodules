@@ -1,0 +1,3 @@
+[submodule "vendor/bubblewrap"]
+	path = vendor/bubblewrap
+	url = https://github.com/containers/bubblewrap.git

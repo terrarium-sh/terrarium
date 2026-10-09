@@ -4,6 +4,7 @@ use std::io::Result;
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use terra_platform::process::{VmChildGuard, pass_descriptor};
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -14,12 +15,8 @@ pub(crate) fn file_link_count(path: &Path) -> Result<u64> {
 }
 
 pub fn try_lock_run(path: &Path) -> std::result::Result<File, std::fs::TryLockError> {
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(path)
-        .map_err(std::fs::TryLockError::Error)?;
+    let file =
+        super::open_regular_file_for_write(path, true).map_err(std::fs::TryLockError::Error)?;
     file.try_lock()?;
     Ok(file)
 }
@@ -113,55 +110,119 @@ pub fn allocated_size(_path: &Path, metadata: &std::fs::Metadata) -> u64 {
     metadata.blocks() * 512
 }
 
-/// Restrict an existing path to its owner: `0700` for a directory, `0600` for a
-/// file.
-pub fn set_owner_only(path: &Path, dir: bool) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mode = if dir { 0o700 } else { 0o600 };
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
-}
-
-/// Give the child its own process group, so Ctrl-C in the starting terminal
-/// does not reach the VM.
-pub fn detach(cmd: &mut Command) {
-    use std::os::unix::process::CommandExt;
-    cmd.process_group(0);
-}
-
 /// The descriptor a boot hands its VM process the box's run lock on, already
 /// held.
 const LOCK_FD: std::os::fd::RawFd = 3;
 
 /// Hand `lock` to the spawned child as [`LOCK_FD`]. A duplicate descriptor
 /// holds the same `flock`, released only when every one of them closes.
-#[allow(unsafe_code)]
 pub fn pass_lock(cmd: &mut Command, lock: &File) -> Result<File> {
-    use std::os::fd::AsRawFd;
+    pass_descriptor(cmd, lock, LOCK_FD)
+}
+
+#[cfg(target_os = "linux")]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "other platforms retain a parent guard"
+)]
+#[allow(unsafe_code)]
+pub(crate) fn supervise_supervisor_child(
+    command: &mut Command,
+    die_with_parent: bool,
+) -> Result<Option<VmChildGuard>> {
     use std::os::unix::process::CommandExt;
-    let inherited = lock.try_clone()?;
-    let fd = inherited.as_raw_fd();
-    // SAFETY: the closure runs between fork and exec, where only
-    // async-signal-safe calls are allowed - `dup2` and `fcntl` are both.
-    unsafe {
-        cmd.pre_exec(move || {
-            let borrowed = rustix::fd::BorrowedFd::borrow_raw(fd);
-            // `dup2` onto the same number is a no-op that leaves CLOEXEC set,
-            // and the lock is commonly opened as fd 3 already.
-            if fd == LOCK_FD {
-                rustix::io::fcntl_setfd(borrowed, rustix::io::FdFlags::empty())
-                    .map_err(std::io::Error::from)?;
-            } else {
-                if libc::dup2(fd, LOCK_FD) < 0 {
+    terra_platform::process::detach(command);
+    if die_with_parent {
+        // SAFETY: getpid and the child callback's prctl/getppid calls use no pointers or allocations.
+        unsafe {
+            let parent = libc::getpid();
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
-                let target = rustix::fd::BorrowedFd::borrow_raw(LOCK_FD);
-                rustix::io::fcntl_setfd(target, rustix::io::FdFlags::empty())
-                    .map_err(std::io::Error::from)?;
-            }
-            Ok(())
-        });
+                if libc::getppid() != parent {
+                    return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+                }
+                Ok(())
+            });
+        }
     }
-    Ok(inherited)
+    Ok(None)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn supervise_supervisor_child(
+    command: &mut Command,
+    die_with_parent: bool,
+) -> Result<Option<VmChildGuard>> {
+    terra_platform::process::supervise_vm_child(command, die_with_parent)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn pass_listener(
+    command: &mut Command,
+    listener: &std::os::unix::net::UnixListener,
+    target: i32,
+) -> Result<std::os::unix::net::UnixListener> {
+    Ok(std::os::unix::net::UnixListener::from(
+        std::os::fd::OwnedFd::from(pass_descriptor(command, listener, target)?),
+    ))
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+pub(crate) fn claim_listener(
+    descriptor: i32,
+    expected: &Path,
+) -> Result<std::os::unix::net::UnixListener> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: fcntl checks the inherited descriptor before ownership is claimed.
+    if unsafe { libc::fcntl(descriptor, libc::F_GETFD) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the supervisor transfers this prebound listener exclusively to the worker.
+    let listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(descriptor) };
+    if rustix::net::sockopt::socket_type(&listener).map_err(std::io::Error::from)?
+        != rustix::net::SocketType::STREAM
+        || listener.local_addr()?.as_pathname() != Some(expected)
+    {
+        return Err(std::io::Error::other(
+            "inherited listener does not match its grant",
+        ));
+    }
+    rustix::io::fcntl_setfd(&listener, rustix::io::FdFlags::CLOEXEC)
+        .map_err(std::io::Error::from)?;
+    Ok(listener)
+}
+
+#[allow(unsafe_code)]
+pub(crate) fn close_unrelated_descriptors(kept: &[i32]) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    let descriptors = std::fs::read_dir("/proc/self/fd")?
+        .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().parse::<i32>().ok()))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    #[cfg(not(target_os = "linux"))]
+    // SAFETY: getdtablesize reads the descriptor limit without pointers.
+    let descriptors = {
+        let max_fd = unsafe { libc::getdtablesize() };
+        if max_fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        (3..max_fd).collect::<Vec<_>>()
+    };
+    for descriptor in descriptors
+        .into_iter()
+        .filter(|fd| *fd > 2 && !kept.contains(fd))
+    {
+        // SAFETY: role dispatch runs before threads and closes only unrelated inherited descriptors.
+        unsafe {
+            libc::close(descriptor);
+        }
+    }
+    Ok(())
 }
 
 /// The run lock a boot passed down, or `None` when [`LOCK_FD`] is not the file
@@ -358,8 +419,7 @@ pub fn register_stop_channel(channel: std::os::fd::OwnedFd) {
 
 /// SIGINT/SIGTERM/SIGHUP ask the guest for its graceful stop - a host
 /// shutdown and a closed `--foreground` terminal included. Detached boxes
-/// hear none of this: [`detach`] puts them in their own process group, past
-/// any terminal's reach.
+/// hear none of this: [`detach`](terra_platform::process::detach) starts a session without a controlling terminal.
 #[allow(unsafe_code)]
 pub fn install_stop_signal_handlers() {
     // SAFETY: `handler` does atomic stores and one `write`, both

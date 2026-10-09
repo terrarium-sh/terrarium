@@ -370,7 +370,7 @@ mod tests {
                         reply: Reply {
                             sequence: 0,
                             value: 0,
-                            error: 0,
+                            error: None,
                             interrupt: false,
                         },
                     })),
@@ -429,9 +429,7 @@ mod tests {
             let engine = crate::engine::device_engine().unwrap();
             let mut runtime =
                 BoxRuntime::new(&engine, crate::box_runtime::store::BoxHost::new()).unwrap();
-            crate::component::mmio::initialize_test_mmio(&mut runtime)
-                .await
-                .unwrap();
+            crate::component::mmio::initialize_test_mmio(&mut runtime).unwrap();
             let registry = Arc::downgrade(&runtime.mmio.as_ref().unwrap().devices);
             let cancelled = tokio_util::sync::CancellationToken::new();
             let owner = cancelled.clone().drop_guard();
@@ -471,9 +469,7 @@ mod tests {
         let engine = crate::engine::device_engine().unwrap();
         let mut runtime =
             BoxRuntime::new(&engine, crate::box_runtime::store::BoxHost::new()).unwrap();
-        crate::component::mmio::initialize_test_mmio(&mut runtime)
-            .await
-            .unwrap();
+        crate::component::mmio::initialize_test_mmio(&mut runtime).unwrap();
         for _ in 0..crate::box_runtime::MAX_BOX_COMPONENTS {
             let worker = runtime.new_child(crate::box_runtime::store::RootHost::new());
             runtime.attach_child(worker).unwrap();

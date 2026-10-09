@@ -18,6 +18,7 @@ tokio = ["dep:tokio"]
 mux = ["dep:yamux"]
 
 [dev-dependencies]
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 tokio = { version = "1", default-features = false, features = ["io-util", "macros", "rt"] }
 
 [lints]

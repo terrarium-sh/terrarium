@@ -1,7 +1,7 @@
 use crate::memory::GuestMemory;
 use crate::vm::{
     BootState, InterruptControllerConfig, InterruptMode, IoApicAccess, VcpuAction, VcpuExit,
-    VcpuHandler, VcpuOutcome, VmCapabilities, VmConfig, VmHandle,
+    VcpuHandler, VcpuOutcome, VmCapabilities, VmConfig, VmHandle, report_vcpu_failure,
 };
 use crate::windows::worker::VcpuGroup;
 use std::sync::Arc;
@@ -74,10 +74,13 @@ impl WindowsVm {
             boot.boot_argument
         );
         let mut group = VcpuGroup::new(partition, self.hard_stop);
-        for (id, handler) in (0_u32..).zip(handlers) {
+        for (id, mut handler) in (0_u32..).zip(handlers) {
             let partition = Arc::clone(&group.partition);
             let stop = Arc::clone(&group.stop);
-            group.spawn(move || run_x64_vcpu(&partition, id, handler, &stop))?;
+            group.spawn(move || {
+                let outcome = run_x64_vcpu(&partition, id, handler.as_mut(), &stop);
+                report_vcpu_failure(id, handler.as_mut(), outcome)
+            })?;
         }
         Ok(group)
     }
@@ -86,7 +89,7 @@ impl WindowsVm {
 fn run_x64_vcpu(
     partition: &Arc<crate::windows::whp::Partition>,
     vcpu: u32,
-    mut handler: Box<dyn VcpuHandler>,
+    handler: &mut dyn VcpuHandler,
     stop: &Arc<AtomicBool>,
 ) -> Result<(), String> {
     let emulator =
@@ -97,7 +100,7 @@ fn run_x64_vcpu(
             .map_err(|error| error.to_string())?;
         match crate::windows::whp::RunExit::from(raw) {
             crate::windows::whp::RunExit::MemoryAccess { .. } => {
-                let handler = std::cell::RefCell::new(handler.as_mut());
+                let handler = std::cell::RefCell::new(&mut *handler);
                 let mut access =
                     |address: u64,
                      write: bool,
@@ -144,7 +147,7 @@ fn run_x64_vcpu(
                               length,
                               value: &mut u32|
                  -> Result<_, crate::windows::whp::PartitionError> {
-                    pio_access(handler.as_mut(), port, write, length, value)
+                    pio_access(handler, port, write, length, value)
                 };
                 let mut context = crate::windows::whp::amd64::emulator::EmulationContext::new(
                     partition,
@@ -157,10 +160,10 @@ fn run_x64_vcpu(
                     .map_err(|error| error.to_string())?;
             }
             crate::windows::whp::RunExit::ApicEoi(vector) => {
-                require_reentry(handler.as_mut(), VcpuExit::IoApicEoi(vector))?;
+                require_reentry(handler, VcpuExit::IoApicEoi(vector))?;
             }
             crate::windows::whp::RunExit::Halt => {
-                require_reentry(handler.as_mut(), VcpuExit::Halt)?;
+                require_reentry(handler, VcpuExit::Halt)?;
             }
             crate::windows::whp::RunExit::Canceled => {
                 handler.finished(VcpuOutcome::Stopped);
@@ -171,10 +174,11 @@ fn run_x64_vcpu(
             }
         }
     }
-    handler.finished(VcpuOutcome::Stopped);
     partition
         .cancel_vcpu(vcpu)
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    handler.finished(VcpuOutcome::Stopped);
+    Ok(())
 }
 
 fn require_reentry(handler: &mut dyn VcpuHandler, exit: VcpuExit) -> Result<(), String> {

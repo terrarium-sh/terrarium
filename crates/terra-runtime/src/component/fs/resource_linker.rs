@@ -58,6 +58,7 @@ pub(super) fn add<T: Send + 'static>(
     descriptor_async!(interface, filesystem, "[method]descriptor.get-type", get_type, (descriptor: Resource<Descriptor>));
     descriptor_async!(interface, filesystem, "[method]descriptor.set-size", set_size, (descriptor: Resource<Descriptor>, size: types::Filesize));
     descriptor_async!(interface, filesystem, "[method]descriptor.set-times", set_times, (descriptor: Resource<Descriptor>, access_time: types::NewTimestamp, modification_time: types::NewTimestamp));
+    #[cfg(not(windows))]
     interface.func_wrap(
         "[method]descriptor.read-directory",
         move |store, (descriptor,): (Resource<Descriptor>,)| {
@@ -70,15 +71,20 @@ pub(super) fn add<T: Send + 'static>(
         },
     )?;
     descriptor_async!(interface, filesystem, "[method]descriptor.sync", sync, (descriptor: Resource<Descriptor>));
+    #[cfg(not(windows))]
     descriptor_async!(interface, filesystem, "[method]descriptor.create-directory-at", create_directory_at, (descriptor: Resource<Descriptor>, path: String));
     descriptor_async!(interface, filesystem, "[method]descriptor.stat", stat, (descriptor: Resource<Descriptor>));
     descriptor_async!(interface, filesystem, "[method]descriptor.stat-at", stat_at, (descriptor: Resource<Descriptor>, flags: types::PathFlags, path: String));
     descriptor_async!(interface, filesystem, "[method]descriptor.set-times-at", set_times_at, (descriptor: Resource<Descriptor>, flags: types::PathFlags, path: String, access_time: types::NewTimestamp, modification_time: types::NewTimestamp));
+    #[cfg(not(windows))]
     descriptor_async!(interface, filesystem, "[method]descriptor.link-at", link_at, (descriptor: Resource<Descriptor>, old_flags: types::PathFlags, old_path: String, new_descriptor: Resource<Descriptor>, new_path: String));
     descriptor_async!(interface, filesystem, "[method]descriptor.readlink-at", readlink_at, (descriptor: Resource<Descriptor>, path: String));
+    #[cfg(not(windows))]
     descriptor_async!(interface, filesystem, "[method]descriptor.remove-directory-at", remove_directory_at, (descriptor: Resource<Descriptor>, path: String));
+    #[cfg(not(windows))]
     descriptor_async!(interface, filesystem, "[method]descriptor.rename-at", rename_at, (descriptor: Resource<Descriptor>, old_path: String, new_descriptor: Resource<Descriptor>, new_path: String));
     descriptor_async!(interface, filesystem, "[method]descriptor.symlink-at", symlink_at, (descriptor: Resource<Descriptor>, old_path: String, new_path: String));
+    #[cfg(not(windows))]
     descriptor_async!(interface, filesystem, "[method]descriptor.unlink-file-at", unlink_file_at, (descriptor: Resource<Descriptor>, path: String));
     descriptor_async!(interface, filesystem, "[method]descriptor.metadata-hash", metadata_hash, (descriptor: Resource<Descriptor>));
     descriptor_async!(interface, filesystem, "[method]descriptor.metadata-hash-at", metadata_hash_at, (descriptor: Resource<Descriptor>, flags: types::PathFlags, path: String));

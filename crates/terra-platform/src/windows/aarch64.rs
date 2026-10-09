@@ -12,6 +12,7 @@ pub const WHV_ARM64_REGISTER_X2: WHV_REGISTER_NAME = 0x0002_0002;
 pub const WHV_ARM64_REGISTER_X3: WHV_REGISTER_NAME = 0x0002_0003;
 pub const WHV_ARM64_REGISTER_PC: WHV_REGISTER_NAME = 0x0002_0022;
 pub const WHV_ARM64_REGISTER_PSTATE: WHV_REGISTER_NAME = 0x0002_0023;
+pub const WHV_ARM64_REGISTER_INTERNAL_ACTIVITY_STATE: WHV_REGISTER_NAME = 0x0000_0004;
 pub const WHV_ARM64_REGISTER_GICR_BASE_GPA: WHV_REGISTER_NAME = 0x0006_3000;
 
 fn setup_cpu(
@@ -50,14 +51,4 @@ pub fn setup_bsp(
     fdt_address: u64,
 ) -> Result<(), PartitionError> {
     setup_cpu(partition, 0, kernel_entry, fdt_address)
-}
-
-/// Start an `AArch64` secondary with the PSCI `CPU_ON` entry contract.
-pub fn setup_secondary(
-    partition: &Partition,
-    vcpu: u32,
-    entry: u64,
-    context: u64,
-) -> Result<(), PartitionError> {
-    setup_cpu(partition, vcpu, entry, context)
 }

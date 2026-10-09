@@ -159,16 +159,11 @@ fn child_stores_have_independent_memory_limits() {
 #[tokio::test]
 async fn mmio_service_does_not_reduce_device_admission() {
     let engine = device_engine().expect("engine");
-    let component = wasmtime::component::Component::new(&engine, crate::test_fixtures::wasm::MMIO)
-        .expect("MMIO component");
     let mut runtime = BoxRuntime::new(&engine, BoxHost::new()).expect("runtime");
     let controller = runtime.new_child(crate::box_runtime::store::RootHost::new());
     runtime.attach_child(controller).expect("controller worker");
     runtime.interrupt_controller_configured = true;
-    runtime
-        .initialize_mmio(&component)
-        .await
-        .expect("MMIO service");
+    runtime.initialize_mmio().expect("MMIO service");
     for _ in 0..MAX_BOX_COMPONENTS {
         crate::component::mmio::MmioDevice::grant_worker(
             &mut runtime,
@@ -318,6 +313,74 @@ async fn child_failure_or_panic_stops_a_running_root() {
         wait_for_drop(&dropped).await;
         assert_eq!(*outcome.borrow(), Some(Outcome::ComponentFailed));
     }
+}
+
+#[tokio::test]
+async fn child_failure_releases_native_vcpu_rendezvous_before_cleanup() {
+    use crate::component::vmm::platform::HostVcpuWithStore;
+    use crate::component::vmm::teardown::DeviceShutdown;
+    use crate::component::vmm::{Completion, Exit, Platform};
+    use crate::machine::DeviceKind;
+
+    let engine = device_engine().unwrap();
+    let mut root = BoxRuntime::new(&engine, BoxHost::new()).unwrap();
+    let (native, resource) = root.store.data_mut().platform.add_test_vcpu();
+    let resource_index = resource.rep();
+    let (native_finished, native_result) = tokio::sync::oneshot::channel();
+    let (exit_pending, failed_child) = tokio::sync::oneshot::channel();
+    root.register_loop(Box::new(move |accessor| {
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                let _ = native_finished.send(native.exchange(Exit::Halt));
+            });
+            let platform = accessor.with_getter::<Platform>(|store| &mut store.platform);
+            assert!(matches!(
+                <Platform as HostVcpuWithStore<BoxHost>>::resume(
+                    &platform,
+                    wasmtime::component::Resource::new_borrow(resource_index),
+                    Completion::Start,
+                )
+                .await?,
+                Ok(Exit::Halt)
+            ));
+            exit_pending.send(()).unwrap();
+            std::future::pending::<wasmtime::Result<()>>().await
+        })
+    }))
+    .unwrap();
+
+    let native_released = Arc::new(AtomicBool::new(false));
+    let released_during_cleanup = Arc::clone(&native_released);
+    root.add_device_shutdown(DeviceShutdown::new(DeviceKind::Memory, async move {
+        let native_result = tokio::time::timeout(Duration::from_secs(2), native_result)
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        assert!(native_result.is_err(), "{native_result:?}");
+        released_during_cleanup.store(true, Ordering::Release);
+        Ok(())
+    }))
+    .unwrap();
+    let mut child = root.new_child(crate::box_runtime::store::RootHost::new());
+    child
+        .register_loop(Box::new(move |_| {
+            Box::pin(async move {
+                failed_child.await.unwrap();
+                Err(wasmtime::Error::msg("child failed"))
+            })
+        }))
+        .unwrap();
+    root.attach_child(child).unwrap();
+    let error = root
+        .prepare()
+        .await
+        .unwrap()
+        .start()
+        .join()
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("child failed"), "{error}");
+    assert!(native_released.load(Ordering::Acquire));
 }
 
 #[tokio::test]
@@ -512,9 +575,7 @@ async fn competing_failures_publish_the_primary_error_before_native_cleanup() {
     let mut root = BoxRuntime::new(&engine, BoxHost::new()).unwrap();
     let vmm =
         wasmtime::component::Component::new(&engine, crate::test_fixtures::wasm::VMM).unwrap();
-    let mmio =
-        wasmtime::component::Component::new(&engine, crate::test_fixtures::wasm::MMIO).unwrap();
-    root.initialize_mmio(&mmio).await.unwrap();
+    root.initialize_mmio().unwrap();
     root.initialize_vmm(&vmm).await.unwrap();
     let failure = root.vmm.as_ref().unwrap().failure_sink();
     let outcome = root.lifecycle_notifier().subscribe();

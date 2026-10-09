@@ -3,12 +3,18 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 #![deny(rustdoc::broken_intra_doc_links)]
 
+pub mod application;
 pub mod control;
+pub mod dns;
 mod frames;
+pub mod guest_image;
 pub mod mux;
+pub mod network;
 mod plan;
 pub mod session;
+pub mod socket;
 pub mod sync;
+pub mod vsock;
 
 pub use control::{
     AGENT_HELLO, AGENT_PROTOCOL_VERSION, AGENT_READY_NOTIFICATION, AgentService, CLOCK_SYNC,
@@ -22,9 +28,9 @@ pub use frames::{
 #[cfg(feature = "tokio")]
 pub use frames::{read_frame_async, read_frame_async_with_limit, write_frame_async};
 pub use plan::{
-    Disk, HostTime, KERNEL_CMDLINE, MAX_PLAN_BYTES, MAX_PLAN_HOST_STATE_BYTES, MAX_VOLUMES, Net,
-    Plan, PlanMode, RECIPE_STAMP_PATH, RESIZE2FS_GUEST_PATH, ROOT_DEVICE, Share, WORKLOAD_HOME,
-    WORKLOAD_ID, WORKLOAD_USER_NAME, to_volume_device,
+    BootPlan, Disk, HostTime, KERNEL_CMDLINE, MAX_PLAN_BYTES, MAX_PLAN_HOST_STATE_BYTES,
+    MAX_PUBLISHED_PORTS, MAX_VOLUMES, Net, Plan, PlanMode, RECIPE_STAMP_PATH, RESIZE2FS_GUEST_PATH,
+    ROOT_DEVICE, Share, WORKLOAD_HOME, WORKLOAD_ID, WORKLOAD_USER_NAME, to_volume_device,
 };
 pub use session::{AgentOutput, ClientInput, ControlReply, ControlRequest, ExecRequest, TermSize};
 pub use sync::{

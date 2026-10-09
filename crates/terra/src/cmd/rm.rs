@@ -244,7 +244,7 @@ mod tests {
         let inheritance = crate::sys::pass_lock(&mut command, &lock).unwrap();
         let mut child = command.spawn().unwrap();
         drop(inheritance);
-        BoxRef::rewrite_lock_line(&lock, &child.id().to_string()).unwrap();
+        BoxRef::rewrite_lock_line(&lock, &format!("{} 1", child.id())).unwrap();
         drop(lock);
 
         let error = run(
@@ -307,10 +307,11 @@ mod tests {
         let _home = crate::sys::TestHome::new();
         let bx = BoxRef::resolve(dir.path(), "dev").unwrap();
         let build = || {
-            std::fs::create_dir_all(bx.get_dir()).unwrap();
+            let log = bx.get_dir().join(state::LOG_FILE);
+            std::fs::create_dir_all(log.parent().unwrap()).unwrap();
             std::fs::write(bx.get_dir().join(state::RECIPE_FILE), "hw:\n  cpus: 1\n").unwrap();
             std::fs::write(bx.get_dir().join(state::ROOTFS_FILE), b"image").unwrap();
-            std::fs::write(bx.get_dir().join(state::LOG_FILE), b"output").unwrap();
+            std::fs::write(log, b"output").unwrap();
         };
 
         let rm = |purge| crate::cli::RmArgs {

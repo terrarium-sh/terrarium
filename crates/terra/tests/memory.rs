@@ -198,6 +198,8 @@ fn guest_memory_grows_and_shrinks_with_its_working_set() {
     let home = temp.path().join("h");
     let project = temp.path().join("p");
     std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir(home.join(".terra")).unwrap();
+    std::fs::write(home.join(".terra/config.yaml"), "vm:\n  init: direct\n").unwrap();
     std::fs::create_dir_all(&project).unwrap();
     let recipe = project.join("mem.yaml");
     std::fs::write(

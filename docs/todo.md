@@ -1,7 +1,11 @@
 # Remaining work
 
+The network transport uses [per-socket TCP and UDP vsock streams](../README.dev.md#network-transport);
+its native gates on hosts other than Linux x86_64 remain open.
+
 Terra currently has a Linux x86_64 KVM implementation with WASI components for
-boot, block, filesystem, network, vsock, memory, and the VMM. The production
+boot, block, filesystem, a combined vsock device/network frontend, a separate
+agent store, memory, and the VMM. The production
 transport is a bounded scalar bridge between independent Wasmtime stores; shared
 memory, GPU, DAX, PCI, snapshots, whole-box fuel metering, and host-pressure
 reclamation are deferred unless a measured requirement justifies them.
@@ -11,15 +15,10 @@ when its stated acceptance condition has been recorded with the relevant test
 or host result. Build-only and cross-compilation checks do not establish native
 VM behavior.
 
-## Product acceptance
+ARM timer, macOS lifecycle, Windows WHP/console/socket and release-gate fixes are
+implemented; the corresponding native host gates below remain open until executed.
 
-- [x] **Fresh Linux x86_64 KVM acceptance:** the 2026-09-13 packaged build
-  passed all 9 boot, memory, and native workflow gates, including rootless
-  Podman and two running boxes sharing host files. All 12 platform KVM gates
-  passed, plus 5 repeated two-vCPU network/storage/restart runs. The review
-  fixed TCP truncation at host EOF and a native-cleanup mutex stall.
-  Commands, artifact hash, results, and validation limits are recorded in
-  [Linux amd64 acceptance](linux-amd64-acceptance.md).
+## Product acceptance
 
 - [ ] **Linux AArch64 KVM:** run the packaged binary's boot, mount, networking,
   SMP, memory-reclaim, shutdown, and ARM GIC-routing gates on AArch64 hardware.
@@ -34,30 +33,6 @@ VM behavior.
   persistent volumes, and orderly shutdown. On Windows, explicitly verify the
   reduced WASI mount contract, CPU state, and device ordering. The gate is
   [`crates/terra/tests/native_boot.rs`](../crates/terra/tests/native_boot.rs).
-
-- [x] **Guest workflow compatibility:** make rootless Podman work for the
-  ordinary Alpine user without granting host TUN access or host privileges.
-  Start from the existing TUN/namespace setup in
-  [`kernel/terra.config`](../kernel/terra.config) and the guest initialization in
-  [`crates/terra-agent/src/init.rs`](../crates/terra-agent/src/init.rs). Add an
-  ignored native-boot gate that creates and stops a rootless container on a
-  private disk, proves allowed egress, and proves existing denials remain.
-  The ignored `native_boot_runs_rootless_podman_on_a_private_disk` gate passed
-  on Linux/KVM outside the sandbox on 2026-09-13 (55.03 seconds). It covers two
-  boots, image import, persistent private storage, fresh runtime state, allowed
-  egress, denied loopback/metadata destinations, read-only mounts, stop, and
-  denied privilege escalation. Fixes preserve vsock lifecycle policy across
-  guest reset, provide descriptor-based share statistics on Linux, macOS, and
-  Windows hosts, and mount `/run` as tmpfs. Windows reports unavailable inode
-  counts as zero. Native macOS/Windows Podman acceptance still needs those hosts.
-  `make dist` passed; tested binary SHA256:
-  `49b39ff5f125f48e9ba8492afee402b89b5117325fd6b2dcc4951f8d02c60c3d`.
-  Both native acceptance gates passed again together (51.15 seconds), and
-  `make verify` passed, using `TMPDIR=$PWD/build/t`.
-  Run `make dist && mkdir -p build/t && TMPDIR=$PWD/build/t
-  TERRA_BIN=$PWD/dist/terra cargo test -p terra --test
-  native_boot native_boot_runs_rootless_podman_on_a_private_disk -- --ignored
-  --nocapture`. Workspace temporary storage avoids this host's `/tmp` quota.
 
 ## Filesystem and I/O correctness
 
@@ -94,25 +69,24 @@ VM behavior.
   timezone behavior and test TZif/DST handling. Audit early-kernel entropy and
   backend entropy readiness before hooks, TLS, or key generation. The wire
   contract is [`crates/terra-protocol/src/plan.rs`](../crates/terra-protocol/src/plan.rs)
-  and delivery is [`components/vsock`](../components/vsock).
+  and delivery is [`components/agent`](../components/agent).
 
 - [ ] **Measured performance:** use matched previous/current binaries and real
   Git/build, parallel CPU, concurrent network, storage, and multi-box workloads
   to measure setup, ready time, throughput, tail console latency, CPU, RSS,
   MMIO/KVM-exit costs, and shutdown. Investigate the known mount-throughput and
   intermittent CPU-count-hook failures only if reproduced. Keep drivers under
-  [`scripts/bench-vmm.py`](../scripts/bench-vmm.py) and
-  [`scripts/bench-shared-irqs.py`](../scripts/bench-shared-irqs.py).
+  [`scripts/bench/bench-vmm.py`](../scripts/bench/bench-vmm.py) and
+  [`scripts/bench/bench-network.py`](../scripts/bench/bench-network.py).
 
 ## Containment and sustained operation
 
 - [ ] **Native resource limits:** define enforceable per-box CPU, native-memory,
-  persistent-disk, bandwidth, and connection limits beyond existing admission,
+  persistent-disk, bandwidth, and connection limits beyond component ceilings,
   fixed disk extents and capped logs. Test exhaustion and peer isolation.
   Clearly distinguish Terra's current component
-  memory/admission limits from deployment-owned hard native and kernel-memory
-  limits. Relevant admission and worker code is
-  [`crates/terra/src/vm/resources.rs`](../crates/terra/src/vm/resources.rs) and
+  memory limits from deployment-owned hard native and kernel-memory
+  limits. Relevant worker code is
   [`crates/terra-runtime/src/box_runtime.rs`](../crates/terra-runtime/src/box_runtime.rs).
   Document the required deployment-owned OS controls for hard worker/process
   and kernel-memory containment.
@@ -124,7 +98,7 @@ VM behavior.
   only where destination grants cannot constrain an approved operation.
 
 - [ ] **Adversarial validation:** extend [`fuzz/fuzz_targets`](../fuzz/fuzz_targets)
-  beyond network policy, native memory, device queues, FUSE, vsock headers, and
+  beyond network policy, native memory, device queues, FUSE, channel framing, and
   protocol frames to native imports and control input. Prove cross-box RAM, file,
   network, control, and resource isolation during reset and teardown. Run
   multi-box exhaustion and multi-day stress on each native backend, then obtain

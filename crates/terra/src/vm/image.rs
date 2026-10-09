@@ -31,12 +31,7 @@ pub(crate) fn write_sparse_chunk(out: &mut File, chunk: &[u8]) -> std::io::Resul
 }
 
 fn to_stage_path(path: &Path, attempt: u64) -> PathBuf {
-    let name = path
-        .file_name()
-        .unwrap_or(path.as_os_str())
-        .to_string_lossy()
-        .into_owned();
-    path.with_file_name(format!(".{name}.{attempt}.{}.tmp", std::process::id()))
+    path.with_file_name(format!(".terra-stage.{attempt}.{}.tmp", std::process::id()))
 }
 
 fn parse_staged_pid(name: &str) -> Option<u32> {
@@ -108,15 +103,17 @@ impl StagedFile {
         let mut attempt = 0u64;
         let (temporary, file) = loop {
             let temporary = to_stage_path(path, attempt);
-            match options.open(&temporary) {
-                Ok(file) => break (temporary, file),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    attempt = attempt.checked_add(1).context("too many staging files")?;
-                }
-                Err(error) => {
-                    return Err(error).with_context(|| format!("creating {}", temporary.display()));
+            if temporary != path {
+                match options.open(&temporary) {
+                    Ok(file) => break (temporary, file),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => {
+                        return Err(error)
+                            .with_context(|| format!("creating {}", temporary.display()));
+                    }
                 }
             }
+            attempt = attempt.checked_add(1).context("too many staging files")?;
         };
         Ok(Self {
             file,
@@ -206,7 +203,10 @@ fn ensure_image(path: &Path, size_mib: u32, gz: &[u8], field: &str) -> Result<()
 /// Growing a sparse image is free; shrinking would truncate the filesystem
 /// inside it, so a smaller size only warns and keeps the current size.
 fn resize_image(path: &Path, target: u64, field: &str) -> Result<()> {
-    let current = std::fs::metadata(path)
+    let image = crate::sys::open_regular_file_for_write(path, false)
+        .with_context(|| format!("opening {}", path.display()))?;
+    let current = image
+        .metadata()
         .with_context(|| format!("reading {}", path.display()))?
         .len();
     let mib = |n: u64| n.div_ceil(BYTES_PER_MIB);
@@ -214,10 +214,6 @@ fn resize_image(path: &Path, target: u64, field: &str) -> Result<()> {
     match target.cmp(&current) {
         std::cmp::Ordering::Equal => {}
         std::cmp::Ordering::Greater => {
-            let image = OpenOptions::new()
-                .write(true)
-                .open(path)
-                .with_context(|| format!("opening {}", path.display()))?;
             crate::sys::make_sparse(&image)
                 .with_context(|| format!("making {} sparse", path.display()))?;
             image
@@ -255,16 +251,32 @@ fn resize_image(path: &Path, target: u64, field: &str) -> Result<()> {
 }
 
 pub fn load_kernel() -> Result<Vec<u8>> {
+    decode_kernel_image(KERNEL_GZ)
+}
+
+fn decode_kernel_image(gzip: &[u8]) -> Result<Vec<u8>> {
+    let mut decoder = flate2::read::GzDecoder::new(gzip);
+    terra_protocol::guest_image::validate_kernel_image_extra(
+        decoder.header().and_then(flate2::GzHeader::extra),
+    )?;
     let mut kernel = Vec::new();
-    flate2::read::GzDecoder::new(KERNEL_GZ)
+    decoder
         .read_to_end(&mut kernel)
         .context("decompressing guest kernel")?;
     Ok(kernel)
 }
 
 pub fn load_boot_image() -> Result<Vec<u8>> {
+    decode_boot_image(BOOT_IMG_GZ)
+}
+
+fn decode_boot_image(gzip: &[u8]) -> Result<Vec<u8>> {
+    let mut decoder = flate2::read::GzDecoder::new(gzip);
+    terra_protocol::guest_image::validate_boot_image_extra(
+        decoder.header().and_then(flate2::GzHeader::extra),
+    )?;
     let mut image = Vec::new();
-    flate2::read::GzDecoder::new(BOOT_IMG_GZ)
+    decoder
         .read_to_end(&mut image)
         .context("decompressing boot image")?;
     image.shrink_to_fit();
@@ -296,6 +308,42 @@ mod tests {
     }
 
     #[test]
+    fn boot_image_version_is_validated_before_decompression() {
+        use std::io::Write as _;
+
+        let header_without_payload = [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff];
+        let error = decode_boot_image(&header_without_payload).unwrap_err();
+        assert!(error.to_string().contains("rebuild"), "{error}");
+
+        let mut encoder = flate2::GzBuilder::new()
+            .extra(terra_protocol::guest_image::boot_image_extra())
+            .write(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(b"current guest image").unwrap();
+        assert_eq!(
+            decode_boot_image(&encoder.finish().unwrap()).unwrap(),
+            b"current guest image"
+        );
+    }
+
+    #[test]
+    fn kernel_version_is_validated_before_decompression() {
+        use std::io::Write as _;
+
+        let header_without_payload = [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff];
+        let error = decode_kernel_image(&header_without_payload).unwrap_err();
+        assert!(error.to_string().contains("rebuild"), "{error}");
+
+        let mut encoder = flate2::GzBuilder::new()
+            .extra(terra_protocol::guest_image::kernel_image_extra())
+            .write(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(b"current guest kernel").unwrap();
+        assert_eq!(
+            decode_kernel_image(&encoder.finish().unwrap()).unwrap(),
+            b"current guest kernel"
+        );
+    }
+
+    #[test]
     fn resizing_grows_but_never_shrinks() {
         let dir = tempfile::tempdir().unwrap();
         let img = dir.path().join(crate::state::ROOTFS_FILE);
@@ -316,6 +364,22 @@ mod tests {
 
         resize_image(&img, 8 * mib, "hw.rootfs_mib").unwrap(); // refuses to shrink
         assert_eq!(std::fs::metadata(&img).unwrap().len(), 16 * mib);
+    }
+
+    #[test]
+    fn resizing_an_image_rejects_symlink_redirection() {
+        let directory = tempfile::tempdir().unwrap();
+        let image = directory.path().join("vol-data.img");
+        let redirected = directory.path().join("outside");
+        std::fs::write(&redirected, b"original").unwrap();
+        crate::sys::symlink_file(&redirected, &image).unwrap();
+
+        for target in [0, 8, 16] {
+            assert!(resize_image(&image, target, "size_mib").is_err());
+            assert_eq!(std::fs::read(&redirected).unwrap(), b"original");
+        }
+        assert!(ensure_rootfs_image(&image, 1).is_err());
+        assert!(ensure_volume_image(&image, 1).is_err());
     }
 
     #[test]
@@ -428,6 +492,35 @@ mod tests {
         assert_eq!(std::fs::read(&target).unwrap(), b"new");
         assert_eq!(std::fs::read(to_stage_path(&target, 0)).unwrap(), b"stale");
         assert!(!to_stage_path(&target, 3).exists());
+    }
+
+    #[test]
+    fn staging_names_stay_bounded_and_do_not_use_the_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let reserved_name = to_stage_path(&dir.path().join("file"), 0);
+        for target in [dir.path().join("x".repeat(255)), reserved_name] {
+            let mut staged = StagedFile::new(&target).unwrap();
+            assert_ne!(staged.staging.temporary, target);
+            assert_eq!(staged.staging.temporary.parent(), target.parent());
+            assert_eq!(
+                parse_staged_pid(
+                    staged
+                        .staging
+                        .temporary
+                        .file_name()
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                ),
+                Some(std::process::id())
+            );
+            std::io::Write::write_all(staged.file_mut(), b"new").unwrap();
+            assert!(!target.exists());
+            staged.commit().unwrap();
+            assert_eq!(std::fs::read(&target).unwrap(), b"new");
+            std::fs::remove_file(target).unwrap();
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        }
     }
 
     #[test]
