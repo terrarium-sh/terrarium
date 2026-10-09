@@ -604,17 +604,13 @@ fn agent_has_no_guest_memory_or_interrupt_authority() {
     let engine = device_engine().expect("device engine");
     let agent = agent_component_linker::<AgentHost>(&engine).expect("agent linker");
     assert_ram_import_denied(&agent, &engine);
-    for (interface, function) in [
-        ("terra:host/interrupt@0.1.0", "signal"),
-        ("terra:host/interrupt@0.1.0", "set-level"),
-    ] {
-        let signature = if function == "set-level" {
-            "(param \"level\" bool)"
-        } else {
-            ""
-        };
-        assert_function_denied(&agent, &engine, interface, function, signature);
-    }
+    assert_function_denied(
+        &agent,
+        &engine,
+        "terra:host/interrupt@0.1.0",
+        "set-asserted",
+        "(param \"asserted\" bool)",
+    );
 }
 
 #[test]

@@ -347,7 +347,7 @@ async fn mode_capability_changes_writable_files_and_rejects_readonly_files() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn filesystem_actor_alone_publishes_interrupt_levels() {
+async fn filesystem_actor_alone_publishes_interrupt_asserted_states() {
     use crate::component::context::DeviceContext;
     use crate::component::fs::{FsHost, ShareGrant};
     use crate::engine::device_engine;

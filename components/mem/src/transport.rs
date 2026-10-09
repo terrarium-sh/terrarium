@@ -3,7 +3,7 @@ use std::sync::{LazyLock, Mutex};
 use terra_device_transport::{
     Doorbell, INT_USED_BUFFER, MmioTransport, QueueEntry, SPLIT_RING_DESC_F_NEXT,
     SPLIT_RING_DESCRIPTOR_BYTES, SplitRingDescriptor, WriteOutcome, complete_split_ring_entry,
-    publish_interrupt_level, read_split_ring_available, split_ring_chain,
+    publish_interrupt_asserted, read_split_ring_available, split_ring_chain,
 };
 
 use crate::terra::host::{interrupt, memory};
@@ -50,8 +50,8 @@ fn state<T>(f: impl FnOnce(&mut State) -> Result<T, DeviceError>) -> Result<T, D
     let mut state = STATE.lock().map_err(|_| DeviceError::Io)?;
     let state = state.as_mut().ok_or(DeviceError::NotReady)?;
     let result = f(state);
-    if let Some(level) = state.mmio.take_irq() {
-        publish_interrupt_level(level, interrupt::set_level);
+    if let Some(asserted) = state.mmio.take_irq() {
+        publish_interrupt_asserted(asserted, interrupt::set_asserted);
     }
     result
 }
@@ -229,7 +229,7 @@ fn discard_report(state: &State, ring: &QueueEntry) -> Result<(), DeviceError> {
 
 pub fn configure() -> Result<(), DeviceError> {
     QUEUES.reset();
-    publish_interrupt_level(false, interrupt::set_level);
+    publish_interrupt_asserted(false, interrupt::set_asserted);
     *STATE.lock().map_err(|_| DeviceError::Io)? = Some(State {
         mmio: MmioTransport::new(
             memory::address_limit(),
@@ -319,7 +319,7 @@ pub fn reset() {
 pub fn close() -> Result<(), DeviceError> {
     QUEUES.close();
     *STATE.lock().map_err(|_| DeviceError::Io)? = None;
-    publish_interrupt_level(false, interrupt::set_level);
+    publish_interrupt_asserted(false, interrupt::set_asserted);
     Ok(())
 }
 

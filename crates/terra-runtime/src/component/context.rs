@@ -56,7 +56,7 @@ pub struct DeviceContext {
     table: ResourceTable,
     ram: GuestRam,
     irq: InterruptSignals,
-    interrupt_level: bool,
+    interrupt_asserted: bool,
     interrupt_notification: Arc<tokio::sync::Notify>,
     #[cfg(test)]
     memory_read_calls: Arc<[std::sync::atomic::AtomicU64; 2]>,
@@ -83,7 +83,7 @@ impl DeviceContext {
             table: ResourceTable::new(),
             ram,
             irq: InterruptSignals::new(),
-            interrupt_level: false,
+            interrupt_asserted: false,
             interrupt_notification: Arc::new(tokio::sync::Notify::new()),
             #[cfg(test)]
             memory_read_calls: Arc::new([
@@ -124,8 +124,8 @@ impl DeviceContext {
         Arc::clone(&self.memory_read_calls)
     }
 
-    pub(crate) fn interrupt_level(&self) -> bool {
-        self.interrupt_level
+    pub(crate) fn interrupt_asserted(&self) -> bool {
+        self.interrupt_asserted
     }
 
     /// End the interrupt coalescing window so the next burst is counted
@@ -213,16 +213,12 @@ impl memory::Host for DeviceContext {
 }
 
 impl interrupt::Host for DeviceContext {
-    fn set_level(&mut self, level: bool) {
-        if self.interrupt_level != level {
-            self.interrupt_level = level;
-            self.signal();
-        }
-    }
-
-    fn signal(&mut self) {
-        if self.irq.signal() {
-            self.interrupt_notification.notify_one();
+    fn set_asserted(&mut self, asserted: bool) {
+        if self.interrupt_asserted != asserted {
+            self.interrupt_asserted = asserted;
+            if self.irq.signal() {
+                self.interrupt_notification.notify_one();
+            }
         }
     }
 }
@@ -239,6 +235,14 @@ pub fn add_device_imports<T: Send + 'static>(
 
 #[cfg(test)]
 mod tests {
+    use super::interrupt::Host as _;
+
+    /// Flips the line through the import so every call is a change that spends one wakeup.
+    fn toggle_interrupt(context: &mut super::DeviceContext) {
+        let asserted = context.interrupt_asserted();
+        context.set_asserted(!asserted);
+    }
+
     /// The address-limit import supplies the exclusive guest address bound
     /// used by device transports to validate descriptor addresses, including ARM RAM.
     #[test]
@@ -316,7 +320,6 @@ mod tests {
 
     #[test]
     fn interrupt_wakeups_are_coalesced_and_device_scoped() {
-        use super::interrupt::Host as _;
         use std::future::Future as _;
         use std::task::{Context, Poll, Waker};
 
@@ -324,8 +327,8 @@ mod tests {
         let second = super::DeviceContext::new(4096).expect("second device");
         let first_wake = first.interrupt_notification();
         let second_wake = second.interrupt_notification();
-        first.signal();
-        first.signal();
+        toggle_interrupt(&mut first);
+        toggle_interrupt(&mut first);
         let mut context = Context::from_waker(Waker::noop());
         assert_eq!(
             std::pin::pin!(first_wake.notified()).poll(&mut context),
@@ -341,19 +344,19 @@ mod tests {
                 .poll(&mut context)
                 .is_pending()
         );
-        first.signal();
+        toggle_interrupt(&mut first);
         assert_eq!(
             std::pin::pin!(first_wake.notified()).poll(&mut context),
             Poll::Ready(())
         );
         for _ in 0..crate::component::context::MAX_SIGNALS_PER_WINDOW {
-            first.signal();
+            toggle_interrupt(&mut first);
         }
         assert_eq!(
             std::pin::pin!(first_wake.notified()).poll(&mut context),
             Poll::Ready(())
         );
-        first.signal();
+        toggle_interrupt(&mut first);
         assert!(
             std::pin::pin!(first_wake.notified())
                 .poll(&mut context)
@@ -362,33 +365,32 @@ mod tests {
     }
 
     #[test]
-    fn published_interrupt_levels_are_device_scoped_and_survive_coalescing() {
-        use super::interrupt::Host as _;
+    fn published_interrupt_asserted_states_are_device_scoped_and_survive_coalescing() {
         use std::future::Future as _;
         use std::task::{Context, Poll, Waker};
 
         let mut first = super::DeviceContext::new(4096).unwrap();
         let second = super::DeviceContext::new(4096).unwrap();
         let wake = first.interrupt_notification();
-        first.set_level(true);
-        assert!(first.interrupt_level());
-        assert!(!second.interrupt_level());
+        first.set_asserted(true);
+        assert!(first.interrupt_asserted());
+        assert!(!second.interrupt_asserted());
         let mut context = Context::from_waker(Waker::noop());
         assert_eq!(
             std::pin::pin!(wake.notified()).poll(&mut context),
             Poll::Ready(())
         );
-        first.set_level(true);
+        first.set_asserted(true);
         assert!(
             std::pin::pin!(wake.notified())
                 .poll(&mut context)
                 .is_pending()
         );
         for _ in 0..crate::component::context::MAX_SIGNALS_PER_WINDOW {
-            first.signal();
+            toggle_interrupt(&mut first);
         }
-        first.set_level(false);
-        assert!(!first.interrupt_level());
+        first.set_asserted(false);
+        assert!(!first.interrupt_asserted());
         assert!(first.signals_dropped() > 0);
         assert_eq!(
             std::pin::pin!(wake.notified()).poll(&mut context),
@@ -400,13 +402,13 @@ mod tests {
                 .is_pending()
         );
         first.end_window();
-        first.set_level(false);
+        first.set_asserted(false);
         assert!(
             std::pin::pin!(wake.notified())
                 .poll(&mut context)
                 .is_pending()
         );
-        first.set_level(true);
+        first.set_asserted(true);
         assert_eq!(
             std::pin::pin!(wake.notified()).poll(&mut context),
             Poll::Ready(())

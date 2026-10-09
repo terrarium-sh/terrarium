@@ -177,9 +177,9 @@ pub fn write_guest_ranges<E: From<MemoryCopyError>>(
     flush(&mut batch, &mut batch_bytes)
 }
 
-pub fn publish_interrupt_level(level: bool, publish: impl FnOnce(bool)) {
+pub fn publish_interrupt_asserted(asserted: bool, publish: impl FnOnce(bool)) {
     if cfg!(target_arch = "wasm32") {
-        publish(level);
+        publish(asserted);
     }
 }
 
@@ -239,6 +239,48 @@ macro_rules! device_error {
     };
 }
 
+/// Defines `read_guest_memory` and `write_guest_memory` over the invoking
+/// component's `terra::host::memory` bindings.
+// WIT bindings belong to the invoking component.
+#[allow(clippy::crate_in_macro_def)]
+#[macro_export]
+macro_rules! guest_memory {
+    ($error:ident) => {
+        fn read_guest_memory(ranges: &[(u64, u64)]) -> Result<Vec<u8>, $error> {
+            use crate::terra::host::memory;
+            $crate::read_guest_ranges(
+                ranges,
+                |address, len| memory::read(address, len).map_err(|_| $error::Unmapped),
+                |ranges| {
+                    let ranges = ranges
+                        .iter()
+                        .map(|&(offset, len)| memory::ReadRange { offset, len })
+                        .collect::<Vec<_>>();
+                    memory::read_ranges(&ranges).map_err(|_| $error::Unmapped)
+                },
+            )
+        }
+
+        fn write_guest_memory(ranges: &[(u64, &[u8])]) -> Result<(), $error> {
+            use crate::terra::host::memory;
+            $crate::write_guest_ranges(
+                ranges,
+                |address, bytes| memory::write(address, bytes).map_err(|_| $error::Unmapped),
+                |ranges| {
+                    let ranges = ranges
+                        .iter()
+                        .map(|&(offset, data)| memory::WriteRange {
+                            offset,
+                            data: data.to_vec(),
+                        })
+                        .collect::<Vec<_>>();
+                    memory::write_ranges(&ranges).map_err(|_| $error::Unmapped)
+                },
+            )
+        }
+    };
+}
+
 /// Adapts a device's operations to its generated WIT request and reply types.
 // WIT bindings and stream constructors belong to the invoking component.
 #[allow(clippy::crate_in_macro_def)]
@@ -251,9 +293,9 @@ macro_rules! mmio_device {
             let terminal = matches!(request.operation, Operation::Close);
             let result: Result<u64, $error> = match request.operation {
                 Operation::Read => $read(request.offset, request.width),
-                Operation::Write => $write(request.offset, request.width, request.value)
-                    .await
-                    .map(|()| 0),
+                Operation::Write => {
+                    $write(request.offset, request.width, request.value).map(|()| 0)
+                }
                 Operation::Reset => {
                     $reset();
                     Ok(0)

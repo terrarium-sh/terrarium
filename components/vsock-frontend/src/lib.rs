@@ -13,7 +13,25 @@ use std::sync::{
 use terra_vsock_device::VsockSwitch;
 
 mod agent;
-mod mmio;
+mod mmio {
+    use super::{Frontend, transport};
+    use crate::exports::terra::vsock_frontend::api::Guest;
+    use crate::terra::mmio::types::DeviceError;
+
+    terra_device_transport::mmio_device!(
+        DeviceError,
+        transport::mmio_read,
+        transport::mmio_write,
+        super::reset_device,
+        close,
+        transport::interrupt_level
+    );
+
+    async fn close() -> Result<(), DeviceError> {
+        Frontend::close().await;
+        Ok(())
+    }
+}
 mod network;
 mod transport;
 mod worker;

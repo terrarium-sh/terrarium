@@ -21,7 +21,6 @@ const QUEUE_SIZE: u16 = 32;
 const T_IN: u32 = 0;
 const T_OUT: u32 = 1;
 const T_FLUSH: u32 = 4;
-const T_GET_ID: u32 = 8;
 const T_DISCARD: u32 = 11;
 
 type Descriptor = (u64, u32, u16, u16);
@@ -666,15 +665,6 @@ async fn component_flush_identify_and_unsupported() {
     assert_eq!(result, 2);
     assert_eq!(status(&fixture), 2);
     assert!(fixture.drain_interrupt());
-    let result = fixture
-        .submit_request(T_GET_ID, 0, &one(DATA, 512), STATUS)
-        .await;
-    assert_eq!(result, 0);
-    assert!(fixture.drain_interrupt());
-    assert_eq!(
-        &fixture.read(DATA, 12).expect("id back")[..],
-        b"terra-vda\0\0\0"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

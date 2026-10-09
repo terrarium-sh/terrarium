@@ -1,9 +1,7 @@
 package terra:host@0.1.0;
 
-/// Minimal host-device contract for Phase 1A. Wasm owns device/queue
-/// parsing and device state; the native core owns guest RAM, interrupts,
-/// and authoritative resource grants. Component-supplied IDs never select
-/// a disk, VM, interrupt line, or foreign resource table.
+/// Component-supplied IDs never select a disk, VM, interrupt line, or
+/// foreign resource table.
 interface memory {
     record read-range { offset: u64, len: u64 }
     record write-range { offset: u64, data: list<u8> }
@@ -20,10 +18,9 @@ interface memory {
 }
 
 interface interrupt {
-    /// Signal this device's own interrupt. No caller-chosen IRQ; the
-    /// native side coalesces and rate-bounds.
-    signal: func();
-    set-level: func(level: bool);
+    /// Assert or deassert this device's own interrupt. No caller-chosen
+    /// IRQ; the native side coalesces and rate-bounds.
+    set-asserted: func(asserted: bool);
 }
 
 interface device-api {
@@ -33,12 +30,9 @@ interface device-api {
 }
 
 interface disk {
-    /// One fixed-capacity disk grant per component instance. Offsets
-    /// and lengths are checked natively before any byte reaches the
-    /// image; read-only grants reject every mutation path. Sync makes
-    /// prior writes durable. Free functions on the implicit grant keep
-    /// handle plumbing out of the vertical slice; async waits for the
-    /// P3 socket/filesystem scheduler slice.
+    /// One fixed-capacity disk grant per component instance. Offsets and
+    /// lengths are checked natively; read-only grants reject every mutation.
+    /// Sync makes prior writes durable.
     read-at: async func(offset: u64, len: u64) -> result<list<u8>, disk-error>;
     write-at: async func(offset: u64, data: list<u8>) -> result<_, disk-error>;
     discard: async func(offset: u64, len: u64) -> result<_, disk-error>;

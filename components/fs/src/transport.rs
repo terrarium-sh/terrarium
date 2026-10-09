@@ -102,6 +102,7 @@ static WORK: Doorbell = Doorbell::new();
 static NEXT_QUEUE: AtomicUsize = AtomicUsize::new(0);
 
 terra_device_transport::device_error!(DeviceError);
+terra_device_transport::guest_memory!(DeviceError);
 
 fn transport<T>(
     f: impl FnOnce(&mut Transport) -> Result<T, DeviceError>,
@@ -111,10 +112,10 @@ fn transport<T>(
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let transport = transport.as_mut().ok_or(DeviceError::NotReady)?;
     let result = f(transport);
-    if let Some(level) = transport.mmio.take_irq() {
-        terra_device_transport::publish_interrupt_level(
-            level,
-            crate::terra::host::interrupt::set_level,
+    if let Some(asserted) = transport.mmio.take_irq() {
+        terra_device_transport::publish_interrupt_asserted(
+            asserted,
+            crate::terra::host::interrupt::set_asserted,
         );
     }
     result
@@ -615,53 +616,18 @@ async fn write_file(
     }
 }
 
-fn read_memory_ranges(ranges: &[(u64, u64)]) -> Result<Vec<u8>, DeviceError> {
-    terra_device_transport::read_guest_ranges(
-        ranges,
-        |address, len| memory::read(address, len).map_err(|_| DeviceError::Unmapped),
-        |ranges| {
-            memory::read_ranges(
-                &ranges
-                    .iter()
-                    .map(|&(offset, len)| memory::ReadRange { offset, len })
-                    .collect::<Vec<_>>(),
-            )
-            .map_err(|_| DeviceError::Unmapped)
-        },
-    )
-}
-
-fn write_memory_ranges(ranges: &[(u64, &[u8])]) -> Result<(), DeviceError> {
-    terra_device_transport::write_guest_ranges(
-        ranges,
-        |address, bytes| memory::write(address, bytes).map_err(|_| DeviceError::Unmapped),
-        |ranges| {
-            memory::write_ranges(
-                &ranges
-                    .iter()
-                    .map(|&(offset, data)| memory::WriteRange {
-                        offset,
-                        data: data.to_vec(),
-                    })
-                    .collect::<Vec<_>>(),
-            )
-            .map_err(|_| DeviceError::Unmapped)
-        },
-    )
-}
-
 fn read(addr: u64, len: u64) -> Result<Vec<u8>, DeviceError> {
     if len > MAX_REQUEST as u64 {
         return Err(DeviceError::TooLarge);
     }
-    read_memory_ranges(&[(addr, len)])
+    read_guest_memory(&[(addr, len)])
 }
 
 fn write(addr: u64, bytes: &[u8]) -> Result<(), DeviceError> {
     if bytes.len() > MAX_REQUEST {
         return Err(DeviceError::TooLarge);
     }
-    write_memory_ranges(&[(addr, bytes)])
+    write_guest_memory(&[(addr, bytes)])
 }
 
 fn available(queue: usize) -> Result<Option<(u16, u64, u64, u16)>, DeviceError> {
@@ -741,7 +707,7 @@ fn reply(
     if copied != payload.len() {
         return Err(DeviceError::TooLarge);
     }
-    write_memory_ranges(&ranges)?;
+    write_guest_memory(&ranges)?;
     complete(
         queue,
         head,
@@ -811,7 +777,7 @@ fn read_request_buffers(desc: u64, head: u16, size: u16) -> Result<RequestBuffer
     if total > MAX_REQUEST as u64 {
         return Err(DeviceError::TooLarge);
     }
-    let request = read_memory_ranges(&ranges)?;
+    let request = read_guest_memory(&ranges)?;
     Ok(RequestBuffers {
         input: request,
         output: output.to_vec(),
@@ -1118,9 +1084,9 @@ pub async fn configure(tag: &str, max_nodes: u32) -> Result<(), DeviceError> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) =
         Some(new_transport(memory::address_limit(), config));
-    terra_device_transport::publish_interrupt_level(
+    terra_device_transport::publish_interrupt_asserted(
         false,
-        crate::terra::host::interrupt::set_level,
+        crate::terra::host::interrupt::set_asserted,
     );
     clear_work();
     WORK.reset();

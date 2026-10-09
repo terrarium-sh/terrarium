@@ -6,7 +6,23 @@ mod bindings {
 }
 use bindings::{exports, terra, wit_stream};
 
-mod mmio;
+mod mmio {
+    use super::transport;
+    use crate::terra::mmio::types::DeviceError;
+
+    terra_device_transport::mmio_device!(
+        DeviceError,
+        transport::mmio_read,
+        transport::mmio_write,
+        transport::reset,
+        close,
+        transport::interrupt_level
+    );
+
+    async fn close() -> Result<(), DeviceError> {
+        transport::close()
+    }
+}
 mod transport;
 
 use exports::terra::host::device_api::Guest;

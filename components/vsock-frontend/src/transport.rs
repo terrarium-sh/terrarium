@@ -89,11 +89,12 @@ fn new_state() -> State {
 static STATE: LazyLock<Mutex<Option<State>>> = LazyLock::new(|| Mutex::new(None));
 
 terra_device_transport::device_error!(DeviceError);
+terra_device_transport::guest_memory!(DeviceError);
 
-fn publish_interrupt_level(level: bool) {
-    terra_device_transport::publish_interrupt_level(
-        level,
-        crate::terra::host::interrupt::set_level,
+fn publish_interrupt_asserted(asserted: bool) {
+    terra_device_transport::publish_interrupt_asserted(
+        asserted,
+        crate::terra::host::interrupt::set_asserted,
     );
 }
 
@@ -103,8 +104,8 @@ fn state<T>(f: impl FnOnce(&mut State) -> Result<T, DeviceError>) -> Result<T, D
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let state = state.as_mut().ok_or(DeviceError::NotReady)?;
     let result = f(state);
-    if let Some(level) = state.mmio.take_irq() {
-        publish_interrupt_level(level);
+    if let Some(asserted) = state.mmio.take_irq() {
+        publish_interrupt_asserted(asserted);
     }
     result
 }
@@ -113,37 +114,14 @@ fn read(addr: u64, len: u64) -> Result<Vec<u8>, DeviceError> {
     if len > MAX_PACKET as u64 {
         return Err(DeviceError::TooLarge);
     }
-    terra_device_transport::read_guest_ranges(
-        &[(addr, len)],
-        |address, len| memory::read(address, len).map_err(|_| DeviceError::Unmapped),
-        |ranges| {
-            let ranges = ranges
-                .iter()
-                .map(|&(offset, len)| memory::ReadRange { offset, len })
-                .collect::<Vec<_>>();
-            memory::read_ranges(&ranges).map_err(|_| DeviceError::Unmapped)
-        },
-    )
+    read_guest_memory(&[(addr, len)])
 }
 
 fn write(addr: u64, bytes: &[u8]) -> Result<(), DeviceError> {
     if bytes.len() > MAX_PACKET {
         return Err(DeviceError::TooLarge);
     }
-    terra_device_transport::write_guest_ranges(
-        &[(addr, bytes)],
-        |address, bytes| memory::write(address, bytes).map_err(|_| DeviceError::Unmapped),
-        |ranges| {
-            let ranges = ranges
-                .iter()
-                .map(|&(offset, data)| memory::WriteRange {
-                    offset,
-                    data: data.to_vec(),
-                })
-                .collect::<Vec<_>>();
-            memory::write_ranges(&ranges).map_err(|_| DeviceError::Unmapped)
-        },
-    )
+    write_guest_memory(&[(addr, bytes)])
 }
 
 fn at(base: u64, offset: u64) -> Result<u64, DeviceError> {
@@ -485,7 +463,7 @@ pub fn configure() -> Result<(), DeviceError> {
     if super::WORK.is_closed() {
         return Err(DeviceError::NotReady);
     }
-    publish_interrupt_level(false);
+    publish_interrupt_asserted(false);
     *STATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(new_state());
@@ -683,7 +661,7 @@ pub fn close() {
     *STATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-    publish_interrupt_level(false);
+    publish_interrupt_asserted(false);
     super::switch().reset_connections();
 }
 

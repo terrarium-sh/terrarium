@@ -61,7 +61,7 @@
       "write-at"
     ],
     "terra:host@0.1.0/interrupt": [
-      "set-level"
+      "set-asserted"
     ],
     "terra:host@0.1.0/memory": [
       "address-limit",
@@ -85,7 +85,7 @@
       "statfs"
     ],
     "terra:host@0.1.0/interrupt": [
-      "set-level"
+      "set-asserted"
     ],
     "terra:host@0.1.0/memory": [
       "address-limit",
@@ -132,7 +132,7 @@
   "terra-interrupt-controller-component": {},
   "terra-mem-component": {
     "terra:host@0.1.0/interrupt": [
-      "set-level"
+      "set-asserted"
     ],
     "terra:host@0.1.0/memory": [
       "address-limit",
@@ -165,7 +165,7 @@
   },
   "terra-vsock-frontend-component": {
     "terra:host@0.1.0/interrupt": [
-      "set-level"
+      "set-asserted"
     ],
     "terra:host@0.1.0/memory": [
       "address-limit",

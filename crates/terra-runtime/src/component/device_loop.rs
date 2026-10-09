@@ -46,7 +46,7 @@ impl<E: Lift + std::fmt::Debug + Send + Sync + 'static> DeviceLoop<E> {
             let level = accessor.with(|mut store| {
                 let host = store.data_mut().context();
                 host.end_window();
-                host.interrupt_level()
+                host.interrupt_asserted()
             });
             (self.interrupt)(level)?;
             if finished {

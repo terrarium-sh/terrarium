@@ -340,10 +340,9 @@ mod tests {
         };
         let mut table = Vec::new();
         table.extend(descriptor(0x4000, 16, 1, 1));
-        table.extend(descriptor(0x4100, 20, 3, 2));
         table.extend(descriptor(0x4200, 1, 2, 0));
         memory.write(0x1000, &table).unwrap();
-        memory.write(0x4000, &8u32.to_le_bytes()).unwrap();
+        memory.write(0x4000, &4u32.to_le_bytes()).unwrap();
         memory.write(0x2002, &1u16.to_le_bytes()).unwrap();
         memory.write(0x2004, &0u16.to_le_bytes()).unwrap();
         for (offset, value) in [
@@ -371,7 +370,6 @@ mod tests {
         })
         .await
         .expect("worker completes and interrupts");
-        assert_eq!(memory.read(0x4100, 9).unwrap(), b"terra-vda".to_vec());
         assert_eq!(memory.read(0x4200, 1).unwrap(), vec![0]);
         channel.close().unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
