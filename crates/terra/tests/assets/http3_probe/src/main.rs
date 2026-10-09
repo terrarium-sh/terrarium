@@ -141,6 +141,12 @@ async fn respond_text(
     Ok(())
 }
 
+/// Reads the request to its end; dropping it unread makes quinn send `STOP_SENDING(0)`, failing the client's `finish`.
+async fn drain_request(stream: &mut ServerStream) -> Result<()> {
+    while stream.recv_data().await?.is_some() {}
+    Ok(())
+}
+
 async fn verify_upload(stream: &mut ServerStream, size: u64) -> Result<()> {
     let mut verifier = PatternVerifier::new(size);
     while let Some(mut chunk) = stream.recv_data().await? {
@@ -157,12 +163,18 @@ async fn serve_request(
 ) -> Result<()> {
     let (request, mut stream) = resolver.resolve_request().await?;
     match route(request.method(), request.uri()) {
-        Route::Hello => respond_text(&mut stream, 200, None, HELLO).await,
+        Route::Hello => {
+            drain_request(&mut stream).await?;
+            respond_text(&mut stream, 200, None, HELLO).await
+        }
         Route::Reject {
             status,
             message,
             allow,
-        } => respond_text(&mut stream, status, allow, message).await,
+        } => {
+            drain_request(&mut stream).await?;
+            respond_text(&mut stream, status, allow, message).await
+        }
         Route::Echo => {
             stream.send_response(Response::new(())).await?;
             while let Some(mut chunk) = stream.recv_data().await? {
@@ -180,6 +192,7 @@ async fn serve_request(
             }
         }
         Route::Download(size) => {
+            drain_request(&mut stream).await?;
             let response = Response::builder()
                 .header(header::CONTENT_LENGTH, size)
                 .body(())?;
@@ -302,7 +315,11 @@ impl Client {
         if upload_len > 0 {
             request = request.header(header::CONTENT_LENGTH, upload_len);
         }
-        let mut stream = self.sender.send_request(request.body(())?).await?;
+        let mut stream = self
+            .sender
+            .send_request(request.body(())?)
+            .await
+            .context("send request")?;
         let mut buffer = vec![0; CHUNK_BYTES];
         let mut offset = 0;
         while offset < upload_len {
@@ -310,17 +327,18 @@ impl Client {
             fill(offset, &mut buffer[..length]);
             stream
                 .send_data(Bytes::copy_from_slice(&buffer[..length]))
-                .await?;
+                .await
+                .context("send body")?;
             offset += length as u64;
         }
-        stream.finish().await?;
-        let response = stream.recv_response().await?;
+        stream.finish().await.context("finish request")?;
+        let response = stream.recv_response().await.context("receive response")?;
         ensure!(
             response.status() == 200,
             "HTTP/3 response mismatch: {}",
             response.status()
         );
-        while let Some(mut chunk) = stream.recv_data().await? {
+        while let Some(mut chunk) = stream.recv_data().await.context("receive body")? {
             while chunk.has_remaining() {
                 consume(chunk.chunk())?;
                 chunk.advance(chunk.chunk().len());

@@ -595,7 +595,7 @@ mod tests {
                 .kind(),
             ErrorKind::NotFound
         );
-        assert!(walk_objects(&missing, true)?.is_empty());
+        assert_eq!(walk_objects(&missing, true)?, Vec::<PathBuf>::new());
         Ok(())
     }
 

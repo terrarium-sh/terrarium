@@ -24,17 +24,60 @@ pub const WRITE: u32 = 16;
 pub const STATFS: u32 = 17;
 pub const RELEASE: u32 = 18;
 pub const FSYNC: u32 = 20;
+pub const SETXATTR: u32 = 21;
+pub const REMOVEXATTR: u32 = 24;
 pub const FLUSH: u32 = 25;
 pub const OPENDIR: u32 = 27;
 pub const READDIR: u32 = 28;
 pub const RELEASEDIR: u32 = 29;
 pub const FSYNCDIR: u32 = 30;
+pub const GETLK: u32 = 31;
+pub const SETLKW: u32 = 33;
 pub const CREATE: u32 = 35;
 pub const FORGET_MULTI: u32 = 42;
+pub const FALLOCATE: u32 = 43;
 pub const RENAME2: u32 = 45;
+pub const LSEEK: u32 = 46;
+pub const SYNCFS: u32 = 50;
 pub const INIT_OUT: usize = 64;
-pub const ENOSYS: i32 = 38;
+pub const EPERM: i32 = 1;
+pub const ENOENT: i32 = 2;
+pub const EINTR: i32 = 4;
+pub const EIO: i32 = 5;
+pub const ENXIO: i32 = 6;
+pub const EBADF: i32 = 9;
+pub const ENOMEM: i32 = 12;
+pub const EACCES: i32 = 13;
+pub const EBUSY: i32 = 16;
+pub const EEXIST: i32 = 17;
+pub const EXDEV: i32 = 18;
+pub const ENODEV: i32 = 19;
+pub const ENOTDIR: i32 = 20;
+pub const EISDIR: i32 = 21;
 pub const EINVAL: i32 = 22;
+pub const EMFILE: i32 = 24;
+pub const ENOTTY: i32 = 25;
+pub const ETXTBSY: i32 = 26;
+pub const EFBIG: i32 = 27;
+pub const ENOSPC: i32 = 28;
+pub const ESPIPE: i32 = 29;
+pub const EROFS: i32 = 30;
+pub const EMLINK: i32 = 31;
+pub const EPIPE: i32 = 32;
+pub const EDEADLK: i32 = 35;
+pub const ENAMETOOLONG: i32 = 36;
+pub const ENOLCK: i32 = 37;
+pub const ENOSYS: i32 = 38;
+pub const ENOTEMPTY: i32 = 39;
+pub const ELOOP: i32 = 40;
+pub const EOVERFLOW: i32 = 75;
+pub const EILSEQ: i32 = 84;
+pub const EMSGSIZE: i32 = 90;
+pub const EOPNOTSUPP: i32 = 95;
+pub const EALREADY: i32 = 114;
+pub const EINPROGRESS: i32 = 115;
+pub const EDQUOT: i32 = 122;
+pub const ENOTRECOVERABLE: i32 = 131;
 pub const INIT_EXT: u32 = 1 << 30;
 const BIG_WRITES: u32 = 1 << 5;
 
@@ -47,22 +90,19 @@ pub struct Request<'a> {
 }
 
 pub(crate) fn u32_at(bytes: &[u8], start: usize) -> Result<u32, i32> {
-    Ok(u32::from_le_bytes(
-        bytes
-            .get(start..start + 4)
-            .ok_or(EINVAL)?
-            .try_into()
-            .map_err(|_| EINVAL)?,
-    ))
+    bytes
+        .get(start..start + 4)
+        .and_then(|b| b.try_into().ok())
+        .map(u32::from_le_bytes)
+        .ok_or(EINVAL)
 }
+
 pub(crate) fn u64_at(bytes: &[u8], start: usize) -> Result<u64, i32> {
-    Ok(u64::from_le_bytes(
-        bytes
-            .get(start..start + 8)
-            .ok_or(EINVAL)?
-            .try_into()
-            .map_err(|_| EINVAL)?,
-    ))
+    bytes
+        .get(start..start + 8)
+        .and_then(|b| b.try_into().ok())
+        .map(u64::from_le_bytes)
+        .ok_or(EINVAL)
 }
 
 pub fn request(bytes: &[u8]) -> Result<Request<'_>, i32> {

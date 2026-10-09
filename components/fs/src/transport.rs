@@ -14,13 +14,16 @@ use futures::{
 };
 
 use terra_device_transport::{
-    Doorbell, INT_USED_BUFFER, MmioTransport, SPLIT_RING_DESC_F_NEXT, SplitRingDescriptor,
-    WriteOutcome, complete_split_ring_entry, read_split_ring_available, split_ring_chain,
+    Doorbell, INT_USED_BUFFER, MmioTransport, SPLIT_RING_DESC_F_NEXT, SPLIT_RING_DESC_F_WRITE,
+    SplitRingDescriptor, WriteOutcome, complete_split_ring_entry, read_split_ring_available,
+    split_ring_chain,
 };
 
 use crate::host;
+use crate::terra::fs::host::FilesystemStat;
 use crate::terra::host::memory;
 use crate::terra::mmio::types::DeviceError;
+use crate::wasi::clocks::system_clock::Instant;
 use crate::wire;
 use crate::wire::{u32_at, u64_at};
 
@@ -30,7 +33,6 @@ const STATUS: u64 = 0x70;
 const QUEUE_SIZE: u16 = 256;
 const DEVICE_ID: u32 = 26;
 const VIRTIO_F_VERSION_1: u64 = 1 << 32;
-const WRITE: u16 = 2;
 const MAX_CHAIN: usize = 32;
 const MAX_REQUEST: usize = 128 * 1024;
 const MAX_READ: usize = 64 * 1024;
@@ -40,7 +42,6 @@ const MAX_DIRECTORIES: usize = 2048;
 const CLOSE_FLUSH_TIMEOUT: u64 = 1_000_000_000;
 
 struct NodeRecord {
-    id: u64,
     dev: u64,
     ino: u64,
     lookups: u64,
@@ -48,22 +49,21 @@ struct NodeRecord {
 }
 
 struct OpenHandle {
-    id: u64,
     node: u64,
     writable: bool,
-    descriptor: std::sync::Arc<crate::wasi::filesystem::types::Descriptor>,
+    descriptor: host::Descriptor,
 }
 
 struct OpenDirectory {
     node: u64,
     directory: std::sync::Arc<futures::lock::Mutex<host::Directory>>,
-    descriptor: std::sync::Arc<crate::wasi::filesystem::types::Descriptor>,
+    descriptor: host::Descriptor,
 }
 
 struct PendingReply {
     queue: usize,
     head: u16,
-    output: Vec<Descriptor>,
+    output: Vec<SplitRingDescriptor>,
     unique: u64,
     generation: u64,
 }
@@ -82,10 +82,31 @@ struct State {
     nodes: std::collections::BTreeMap<u64, NodeRecord>,
     node_id_by_identity: std::collections::BTreeMap<(u64, u64), u64>,
     unused_nodes: std::collections::BTreeSet<u64>,
-    handles: Vec<OpenHandle>,
-    directories: Vec<(u64, OpenDirectory)>,
+    handles: std::collections::BTreeMap<u64, OpenHandle>,
+    directories: std::collections::BTreeMap<u64, OpenDirectory>,
     next_handle: u64,
     next_node: u64,
+}
+
+impl State {
+    fn new(max_nodes: usize, root: Option<NodeRecord>) -> Self {
+        Self {
+            event_request: None,
+            event_entries: std::collections::BTreeMap::new(),
+            events_enabled: false,
+            max_nodes,
+            node_id_by_identity: root
+                .iter()
+                .map(|record| ((record.dev, record.ino), 1))
+                .collect(),
+            nodes: root.map(|record| (1, record)).into_iter().collect(),
+            unused_nodes: std::collections::BTreeSet::new(),
+            handles: std::collections::BTreeMap::new(),
+            directories: std::collections::BTreeMap::new(),
+            next_handle: 2,
+            next_node: 2,
+        }
+    }
 }
 
 struct Transport {
@@ -94,7 +115,12 @@ struct Transport {
     generation: u64,
 }
 
-type Descriptor = SplitRingDescriptor;
+impl Transport {
+    fn invalidate_queues(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.next = [0; 2];
+    }
+}
 
 static STATE: LazyLock<Mutex<Option<State>>> = LazyLock::new(|| Mutex::new(None));
 static TRANSPORT: LazyLock<Mutex<Option<Transport>>> = LazyLock::new(|| Mutex::new(None));
@@ -158,34 +184,29 @@ fn clear_work() {
     NEXT_QUEUE.store(0, Ordering::Relaxed);
 }
 
-fn node(state: &State, inode: u64) -> Result<&host::Node, DeviceError> {
-    state
-        .nodes
-        .get(&inode)
-        .map(|record| &record.node)
-        .ok_or(DeviceError::Io)
+fn node(state: &State, inode: u64) -> Option<&host::Node> {
+    state.nodes.get(&inode).map(|record| &record.node)
 }
 
 fn node_id(state: &mut State, node: host::Node, stat: &host::Stat) -> Result<u64, i32> {
     if let Some(&id) = state.node_id_by_identity.get(&(stat.dev, stat.ino)) {
-        let record = state.nodes.get_mut(&id).ok_or(5)?;
+        let record = state.nodes.get_mut(&id).ok_or(wire::EIO)?;
         record.node = node;
         record.lookups = record.lookups.saturating_add(1);
         state.unused_nodes.remove(&id);
-        return Ok(record.id);
+        return Ok(id);
     }
     if state.nodes.len() == state.max_nodes {
         evict_unused_node(state);
     }
     if state.nodes.len() == state.max_nodes {
-        return Err(24);
+        return Err(wire::EMFILE);
     }
     let id = state.next_node;
     state.next_node = state.next_node.wrapping_add(1).max(2);
     state.nodes.insert(
         id,
         NodeRecord {
-            id,
             dev: stat.dev,
             ino: stat.ino,
             lookups: 1,
@@ -209,14 +230,9 @@ fn forget(state: &mut State, id: u64, count: u64) {
 fn node_is_held(state: &State, id: u64) -> bool {
     state
         .handles
-        .iter()
+        .values()
         .map(|handle| handle.node)
-        .chain(
-            state
-                .directories
-                .iter()
-                .map(|(_, directory)| directory.node),
-        )
+        .chain(state.directories.values().map(|directory| directory.node))
         .any(|held| held == id)
 }
 
@@ -240,17 +256,11 @@ fn evict_unused_node(state: &mut State) {
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
-fn repoint_node(
-    state: &mut State,
-    stat: &host::Stat,
-    parent: std::sync::Arc<crate::wasi::filesystem::types::Descriptor>,
-    name: Vec<u8>,
-) {
+fn repoint_node(state: &mut State, stat: &host::Stat, parent: &host::Descriptor, name: &[u8]) {
     if let Some(&id) = state.node_id_by_identity.get(&(stat.dev, stat.ino))
         && let Some(record) = state.nodes.get_mut(&id)
     {
-        record.node.repoint(&parent, &name);
+        record.node.repoint(parent, name);
     }
 }
 
@@ -261,20 +271,12 @@ fn increment_lookup(state: &mut State, id: u64) {
     }
 }
 
-fn directory(state: &State, handle: u64) -> Result<&OpenDirectory, DeviceError> {
-    state
-        .directories
-        .iter()
-        .find_map(|(known, directory)| (*known == handle).then_some(directory))
-        .ok_or(DeviceError::Io)
+fn directory(state: &State, handle: u64) -> Option<&OpenDirectory> {
+    state.directories.get(&handle)
 }
 
-fn handle(state: &State, id: u64) -> Result<&OpenHandle, DeviceError> {
-    state
-        .handles
-        .iter()
-        .find(|handle| handle.id == id)
-        .ok_or(DeviceError::Io)
+fn handle(state: &State, id: u64) -> Option<&OpenHandle> {
+    state.handles.get(&id)
 }
 
 fn name(bytes: &[u8]) -> Result<Vec<u8>, i32> {
@@ -310,42 +312,42 @@ fn symlink_parts(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>), i32> {
 pub(crate) fn wasi_error(error: crate::wasi::filesystem::types::ErrorCode) -> i32 {
     use crate::wasi::filesystem::types::ErrorCode;
     match error {
-        ErrorCode::Access => 13,
-        ErrorCode::Already => 114,
-        ErrorCode::BadDescriptor => 9,
-        ErrorCode::Busy => 16,
-        ErrorCode::Deadlock => 35,
-        ErrorCode::Quota => 122,
-        ErrorCode::Exist => 17,
-        ErrorCode::FileTooLarge => 27,
-        ErrorCode::IllegalByteSequence => 84,
-        ErrorCode::InProgress => 115,
-        ErrorCode::Interrupted => 4,
+        ErrorCode::Access => wire::EACCES,
+        ErrorCode::Already => wire::EALREADY,
+        ErrorCode::BadDescriptor => wire::EBADF,
+        ErrorCode::Busy => wire::EBUSY,
+        ErrorCode::Deadlock => wire::EDEADLK,
+        ErrorCode::Quota => wire::EDQUOT,
+        ErrorCode::Exist => wire::EEXIST,
+        ErrorCode::FileTooLarge => wire::EFBIG,
+        ErrorCode::IllegalByteSequence => wire::EILSEQ,
+        ErrorCode::InProgress => wire::EINPROGRESS,
+        ErrorCode::Interrupted => wire::EINTR,
         ErrorCode::Invalid => wire::EINVAL,
-        ErrorCode::Io | ErrorCode::Other(_) => 5,
-        ErrorCode::IsDirectory => 21,
-        ErrorCode::Loop => 40,
-        ErrorCode::TooManyLinks => 31,
-        ErrorCode::MessageSize => 90,
-        ErrorCode::NameTooLong => 36,
-        ErrorCode::NoDevice => 19,
-        ErrorCode::NoEntry => 2,
-        ErrorCode::NoLock => 37,
-        ErrorCode::InsufficientMemory => 12,
-        ErrorCode::InsufficientSpace => 28,
-        ErrorCode::NotDirectory => 20,
-        ErrorCode::NotEmpty => 39,
-        ErrorCode::NotRecoverable => 131,
-        ErrorCode::Unsupported => 95,
-        ErrorCode::NoTty => 25,
-        ErrorCode::NoSuchDevice => 6,
-        ErrorCode::Overflow => 75,
-        ErrorCode::NotPermitted => 1,
-        ErrorCode::Pipe => 32,
-        ErrorCode::ReadOnly => 30,
-        ErrorCode::InvalidSeek => 29,
-        ErrorCode::TextFileBusy => 26,
-        ErrorCode::CrossDevice => 18,
+        ErrorCode::Io | ErrorCode::Other(_) => wire::EIO,
+        ErrorCode::IsDirectory => wire::EISDIR,
+        ErrorCode::Loop => wire::ELOOP,
+        ErrorCode::TooManyLinks => wire::EMLINK,
+        ErrorCode::MessageSize => wire::EMSGSIZE,
+        ErrorCode::NameTooLong => wire::ENAMETOOLONG,
+        ErrorCode::NoDevice => wire::ENODEV,
+        ErrorCode::NoEntry => wire::ENOENT,
+        ErrorCode::NoLock => wire::ENOLCK,
+        ErrorCode::InsufficientMemory => wire::ENOMEM,
+        ErrorCode::InsufficientSpace => wire::ENOSPC,
+        ErrorCode::NotDirectory => wire::ENOTDIR,
+        ErrorCode::NotEmpty => wire::ENOTEMPTY,
+        ErrorCode::NotRecoverable => wire::ENOTRECOVERABLE,
+        ErrorCode::Unsupported => wire::EOPNOTSUPP,
+        ErrorCode::NoTty => wire::ENOTTY,
+        ErrorCode::NoSuchDevice => wire::ENXIO,
+        ErrorCode::Overflow => wire::EOVERFLOW,
+        ErrorCode::NotPermitted => wire::EPERM,
+        ErrorCode::Pipe => wire::EPIPE,
+        ErrorCode::ReadOnly => wire::EROFS,
+        ErrorCode::InvalidSeek => wire::ESPIPE,
+        ErrorCode::TextFileBusy => wire::ETXTBSY,
+        ErrorCode::CrossDevice => wire::EXDEV,
     }
 }
 
@@ -358,24 +360,11 @@ fn attr(stat: &host::Stat) -> Vec<u8> {
     out[0..8].copy_from_slice(&stat.ino.to_le_bytes());
     out[8..16].copy_from_slice(&stat.size.to_le_bytes());
     out[16..24].copy_from_slice(&stat.blocks.to_le_bytes());
-    out[24..32].copy_from_slice(
-        &u64::try_from(stat.atime.seconds)
-            .unwrap_or_default()
-            .to_le_bytes(),
-    );
-    out[32..40].copy_from_slice(
-        &u64::try_from(stat.mtime.seconds)
-            .unwrap_or_default()
-            .to_le_bytes(),
-    );
-    out[40..48].copy_from_slice(
-        &u64::try_from(stat.ctime.seconds)
-            .unwrap_or_default()
-            .to_le_bytes(),
-    );
-    out[48..52].copy_from_slice(&stat.atime.nanoseconds.to_le_bytes());
-    out[52..56].copy_from_slice(&stat.mtime.nanoseconds.to_le_bytes());
-    out[56..60].copy_from_slice(&stat.ctime.nanoseconds.to_le_bytes());
+    for (index, time) in [stat.atime, stat.mtime, stat.ctime].into_iter().enumerate() {
+        let seconds = u64::try_from(time.seconds).unwrap_or_default();
+        out[24 + 8 * index..32 + 8 * index].copy_from_slice(&seconds.to_le_bytes());
+        out[48 + 4 * index..52 + 4 * index].copy_from_slice(&time.nanoseconds.to_le_bytes());
+    }
     out[60..64].copy_from_slice(&stat.mode.to_le_bytes());
     out[64..68].copy_from_slice(&u32::try_from(stat.nlink).unwrap_or(u32::MAX).to_le_bytes());
     out[68..72].copy_from_slice(&stat.uid.to_le_bytes());
@@ -389,7 +378,7 @@ fn attr_out(stat: &host::Stat) -> Vec<u8> {
     out
 }
 
-fn entry(stat: &host::Stat, node: u64) -> Vec<u8> {
+fn entry_out(stat: &host::Stat, node: u64) -> Vec<u8> {
     let mut out = vec![0; 128];
     out[..8].copy_from_slice(&node.to_le_bytes());
     out[40..].copy_from_slice(&attr(stat));
@@ -410,14 +399,14 @@ fn dirent_type(type_: &crate::wasi::filesystem::types::DescriptorType) -> u32 {
     }
 }
 
-fn timestamp(seconds: u64, nanoseconds: u32) -> host::Timestamp {
-    host::Timestamp {
+fn timestamp(seconds: u64, nanoseconds: u32) -> Instant {
+    Instant {
         seconds: i64::try_from(seconds).unwrap_or(i64::MAX),
         nanoseconds,
     }
 }
 
-fn dirents(entries: Vec<host::DirectoryEntry>, max: usize) -> Vec<u8> {
+fn dirents_out(entries: Vec<host::DirectoryEntry>, max: usize) -> Vec<u8> {
     let mut out = Vec::new();
     for entry in entries {
         let size = 24_usize.saturating_add(entry.name.len());
@@ -439,53 +428,47 @@ fn dirents(entries: Vec<host::DirectoryEntry>, max: usize) -> Vec<u8> {
     out
 }
 
-fn open(inode: u64) -> Vec<u8> {
+fn open_out(inode: u64) -> Vec<u8> {
     let mut out = vec![0; 16];
     out[..8].copy_from_slice(&inode.to_le_bytes());
     out
 }
 
-fn sized_out(size: u32) -> Vec<u8> {
+fn write_out(size: u32) -> Vec<u8> {
     let mut out = vec![0; 8];
     out[..4].copy_from_slice(&size.to_le_bytes());
     out
 }
 
-fn create_flags(flags: u32) -> Result<crate::wasi::filesystem::types::OpenFlags, i32> {
-    const O_CREAT: u32 = 0o100;
-    const O_NONBLOCK: u32 = 0o4000;
-    const O_LARGEFILE: u32 = 0o100_000;
-    const O_DIRECTORY: u32 = 0o200_000;
-    const O_NOFOLLOW: u32 = 0o400_000;
-    const O_CLOEXEC: u32 = 0o2_000_000;
-    const FMODE_EXEC: u32 = 0x20;
-    if flags
-        & !(3
-            | O_CREAT
-            | 0o200
-            | 0o1000
-            | 0o2000
-            | O_NONBLOCK
-            | O_LARGEFILE
-            | O_DIRECTORY
-            | O_NOFOLLOW
-            | O_CLOEXEC
-            | FMODE_EXEC)
-        != 0
-        || flags & O_DIRECTORY != 0
-    {
+const O_ACCMODE: u32 = 3;
+const O_CREAT: u32 = 0o100;
+const O_EXCL: u32 = 0o200;
+const O_TRUNC: u32 = 0o1000;
+const O_APPEND: u32 = 0o2000;
+const O_NONBLOCK: u32 = 0o4000;
+const O_LARGEFILE: u32 = 0o100_000;
+const O_NOFOLLOW: u32 = 0o400_000;
+const O_CLOEXEC: u32 = 0o2_000_000;
+const FMODE_EXEC: u32 = 0x20;
+const ACCEPTED_OPEN_FLAGS: u32 =
+    O_ACCMODE | O_TRUNC | O_APPEND | O_NONBLOCK | O_LARGEFILE | O_NOFOLLOW | O_CLOEXEC | FMODE_EXEC;
+
+fn validate_flags(flags: u32, accepted: u32) -> Result<(), i32> {
+    if flags & !accepted != 0 || flags & O_ACCMODE == O_ACCMODE {
         return Err(wire::EINVAL);
     }
-    match flags & 3 {
-        0..=2 => {}
-        _ => return Err(wire::EINVAL),
+    Ok(())
+}
+
+fn create_flags(flags: u32) -> Result<crate::wasi::filesystem::types::OpenFlags, i32> {
+    use crate::wasi::filesystem::types::OpenFlags;
+    validate_flags(flags, ACCEPTED_OPEN_FLAGS | O_CREAT | O_EXCL)?;
+    let mut result = OpenFlags::CREATE;
+    if flags & O_TRUNC != 0 {
+        result |= OpenFlags::TRUNCATE;
     }
-    let mut result = crate::wasi::filesystem::types::OpenFlags::CREATE;
-    if flags & 0o1000 != 0 {
-        result |= crate::wasi::filesystem::types::OpenFlags::TRUNCATE;
-    }
-    if flags & 0o200 != 0 {
-        result |= crate::wasi::filesystem::types::OpenFlags::EXCLUSIVE;
+    if flags & O_EXCL != 0 {
+        result |= OpenFlags::EXCLUSIVE;
     }
     Ok(result)
 }
@@ -493,64 +476,45 @@ fn create_flags(flags: u32) -> Result<crate::wasi::filesystem::types::OpenFlags,
 fn open_flags(
     flags: u32,
 ) -> Result<(crate::wasi::filesystem::types::DescriptorFlags, bool, bool), i32> {
-    const O_NONBLOCK: u32 = 0o4000;
-    const O_LARGEFILE: u32 = 0o100_000;
-    const O_DIRECTORY: u32 = 0o200_000;
-    const O_NOFOLLOW: u32 = 0o400_000;
-    const O_CLOEXEC: u32 = 0o2_000_000;
-    const FMODE_EXEC: u32 = 0x20;
-    if flags
-        & !(3
-            | 0o1000
-            | 0o2000
-            | O_NONBLOCK
-            | O_LARGEFILE
-            | O_DIRECTORY
-            | O_NOFOLLOW
-            | O_CLOEXEC
-            | FMODE_EXEC)
-        != 0
-    {
-        return Err(wire::EINVAL);
-    }
-    if flags & O_DIRECTORY != 0 {
-        return Err(wire::EINVAL);
-    }
-    let (access, writable) = match flags & 3 {
-        0 => (crate::wasi::filesystem::types::DescriptorFlags::READ, false),
-        1 => (crate::wasi::filesystem::types::DescriptorFlags::WRITE, true),
-        2 => (
-            crate::wasi::filesystem::types::DescriptorFlags::READ
-                | crate::wasi::filesystem::types::DescriptorFlags::WRITE,
-            true,
-        ),
-        _ => return Err(wire::EINVAL),
+    use crate::wasi::filesystem::types::DescriptorFlags;
+    validate_flags(flags, ACCEPTED_OPEN_FLAGS)?;
+    let access = match flags & O_ACCMODE {
+        0 => DescriptorFlags::READ,
+        1 => DescriptorFlags::WRITE,
+        _ => DescriptorFlags::READ | DescriptorFlags::WRITE,
     };
-    Ok((access, writable, flags & 0o1000 != 0))
+    Ok((access, flags & O_ACCMODE != 0, flags & O_TRUNC != 0))
+}
+
+fn allocate_handle(state: &mut State) -> u64 {
+    let id = state.next_handle;
+    state.next_handle = state.next_handle.wrapping_add(1).max(2);
+    id
 }
 
 fn store_handle(
     state: &mut State,
     node: u64,
-    descriptor: std::sync::Arc<crate::wasi::filesystem::types::Descriptor>,
+    descriptor: host::Descriptor,
     writable: bool,
 ) -> Result<u64, i32> {
     if state.handles.len() == MAX_HANDLES {
-        return Err(24);
+        return Err(wire::EMFILE);
     }
-    let id = state.next_handle;
-    state.next_handle = state.next_handle.wrapping_add(1).max(2);
-    state.handles.push(OpenHandle {
+    let id = allocate_handle(state);
+    state.handles.insert(
         id,
-        node,
-        writable,
-        descriptor,
-    });
+        OpenHandle {
+            node,
+            writable,
+            descriptor,
+        },
+    );
     state.unused_nodes.remove(&node);
     Ok(id)
 }
 
-fn statfs(stat: &host::Statfs) -> Vec<u8> {
+fn statfs_out(stat: &FilesystemStat) -> Vec<u8> {
     let mut out = vec![0; 80];
     out[0..8].copy_from_slice(&stat.blocks.to_le_bytes());
     out[8..16].copy_from_slice(&stat.blocks_free.to_le_bytes());
@@ -581,13 +545,13 @@ async fn read_file(
                 }
             }
             wit_bindgen::rt::async_support::StreamResult::Dropped => break,
-            wit_bindgen::rt::async_support::StreamResult::Cancelled => return Err(5),
+            wit_bindgen::rt::async_support::StreamResult::Cancelled => return Err(wire::EIO),
         }
     }
     drop(stream);
     match completion.await {
         Ok(()) => Ok(bytes),
-        Err(_) => Err(5),
+        Err(_) => Err(wire::EIO),
     }
 }
 
@@ -597,7 +561,7 @@ fn read_progressed(before: usize, after: usize, read: usize) -> Result<bool, i32
     }
     (after.checked_sub(before) == Some(read))
         .then_some(true)
-        .ok_or(5)
+        .ok_or(wire::EIO)
 }
 
 async fn write_file(
@@ -612,7 +576,7 @@ async fn write_file(
     if remaining.is_empty() && completion.await.is_ok() {
         Ok(())
     } else {
-        Err(5)
+        Err(wire::EIO)
     }
 }
 
@@ -674,16 +638,14 @@ fn complete(queue: usize, head: u16, used: u32) -> Result<(), DeviceError> {
     transport(|transport| {
         transport.mmio.signal(INT_USED_BUFFER);
         Ok(())
-    })?;
-    Ok(())
+    })
 }
 
-#[allow(clippy::needless_pass_by_value)]
-fn reply(
+fn send_reply(
     queue: usize,
     head: u16,
-    output: &[Descriptor],
-    payload: Vec<u8>,
+    output: &[SplitRingDescriptor],
+    payload: &[u8],
 ) -> Result<(), DeviceError> {
     let mut copied = 0_usize;
     let mut ranges = Vec::new();
@@ -730,7 +692,7 @@ fn forget_request(state: &mut State, request: &wire::Request<'_>) -> Result<(), 
 
 struct RequestBuffers {
     input: Vec<u8>,
-    output: Vec<Descriptor>,
+    output: Vec<SplitRingDescriptor>,
 }
 
 fn read_request_buffers(desc: u64, head: u16, size: u16) -> Result<RequestBuffers, DeviceError> {
@@ -743,19 +705,19 @@ fn read_request_buffers(desc: u64, head: u16, size: u16) -> Result<RequestBuffer
         head,
         size,
         MAX_CHAIN,
-        SPLIT_RING_DESC_F_NEXT | WRITE,
+        SPLIT_RING_DESC_F_NEXT | SPLIT_RING_DESC_F_WRITE,
     )
     .map_err(DeviceError::from)?;
     let (input, output) = chain.split_at(
         chain
             .iter()
-            .position(|descriptor| descriptor.flags & WRITE != 0)
+            .position(|descriptor| descriptor.flags & SPLIT_RING_DESC_F_WRITE != 0)
             .unwrap_or(chain.len()),
     );
     if input.is_empty()
         || output
             .iter()
-            .any(|descriptor| descriptor.flags & WRITE == 0)
+            .any(|descriptor| descriptor.flags & SPLIT_RING_DESC_F_WRITE == 0)
     {
         return Err(DeviceError::BadLen);
     }
@@ -776,21 +738,30 @@ fn read_request_buffers(desc: u64, head: u16, size: u16) -> Result<RequestBuffer
     })
 }
 
-fn cancel_event_request(state: &mut State) -> Result<(), DeviceError> {
-    state.events_enabled = false;
-    if let Some(pending) = state.event_request.take() {
-        pending.abort.abort();
-        let pending = pending.reply;
-        if generation()? == pending.generation {
-            reply(
-                pending.queue,
-                pending.head,
-                &pending.output,
-                wire::reply(pending.unique, 19, &[]),
-            )?;
-        }
+fn reply_to_event_request(
+    state: &mut State,
+    errno: i32,
+    payload: &[u8],
+) -> Result<(), DeviceError> {
+    let Some(request) = state.event_request.take() else {
+        return Ok(());
+    };
+    request.abort.abort();
+    let pending = request.reply;
+    if generation()? == pending.generation {
+        send_reply(
+            pending.queue,
+            pending.head,
+            &pending.output,
+            &wire::reply(pending.unique, errno, payload),
+        )?;
     }
     Ok(())
+}
+
+fn cancel_event_request(state: &mut State) -> Result<(), DeviceError> {
+    state.events_enabled = false;
+    reply_to_event_request(state, wire::ENODEV, &[])
 }
 
 fn remember_lookup(state: &mut State, request: &wire::Request<'_>, response: &[u8]) {
@@ -909,7 +880,7 @@ fn process_request(
         clear_runtime(state);
         return Ok(false);
     }
-    if reply(queue, head, &output, response).is_err() {
+    if send_reply(queue, head, &output, &response).is_err() {
         return malformed();
     }
     available(queue).map(|next| next.is_some())
@@ -923,7 +894,7 @@ fn execute_request(
 ) -> Option<Vec<u8>> {
     let request = owned_request.borrow();
     if request.opcode == wire::INIT && scheduler.contains_generation(target.generation) {
-        return Some(wire::reply(request.unique, 16, &[]));
+        return Some(wire::reply(request.unique, wire::EBUSY, &[]));
     }
     let unique = request.unique;
     let result = if let Some(result) = requests::execute_immediate(state, &request) {
@@ -937,21 +908,6 @@ fn execute_request(
         }
     };
     Some(encode_response(unique, result))
-}
-
-fn dispatch_event(state: &mut State, payload: &[u8]) {
-    let Some(request) = state.event_request.take() else {
-        return;
-    };
-    let request = request.reply;
-    if generation().ok() == Some(request.generation) {
-        let _ = reply(
-            request.queue,
-            request.head,
-            &request.output,
-            wire::reply(request.unique, 0, payload),
-        );
-    }
 }
 
 async fn encode_event(
@@ -987,7 +943,7 @@ async fn encode_event(
             let id = *state
                 .node_id_by_identity
                 .get(&(parent_identity.upper, parent_identity.lower))
-                .ok_or(2)?;
+                .ok_or(wire::ENOENT)?;
             let child = state
                 .event_entries
                 .get(&(id, name.as_bytes().to_vec()))
@@ -1047,31 +1003,15 @@ pub async fn configure(tag: &str, max_nodes: u32) -> Result<(), DeviceError> {
     let root_stat = root.stat().await.map_err(|_| DeviceError::Io)?;
     *STATE
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(State {
-        event_request: None,
-        event_entries: std::collections::BTreeMap::new(),
-        events_enabled: false,
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(State::new(
         max_nodes,
-        nodes: std::collections::BTreeMap::from([(
-            1,
-            NodeRecord {
-                id: 1,
-                dev: root_stat.dev,
-                ino: root_stat.ino,
-                lookups: 1,
-                node: root,
-            },
-        )]),
-        node_id_by_identity: std::collections::BTreeMap::from([(
-            (root_stat.dev, root_stat.ino),
-            1,
-        )]),
-        unused_nodes: std::collections::BTreeSet::new(),
-        handles: Vec::new(),
-        directories: Vec::new(),
-        next_handle: 2,
-        next_node: 2,
-    });
+        Some(NodeRecord {
+            dev: root_stat.dev,
+            ino: root_stat.ino,
+            lookups: 1,
+            node: root,
+        }),
+    ));
     *TRANSPORT
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) =
@@ -1102,15 +1042,7 @@ fn clear_runtime(state: &mut State) {
     if let Some(request) = state.event_request.take() {
         request.abort.abort();
     }
-    state.event_entries.clear();
-    state.events_enabled = false;
-    state.handles.clear();
-    state.directories.clear();
-    state.nodes.retain(|_, record| record.id == 1);
-    state.node_id_by_identity.retain(|_, id| *id == 1);
-    state.unused_nodes.clear();
-    state.next_handle = 2;
-    state.next_node = 2;
+    *state = State::new(state.max_nodes, state.nodes.remove(&1));
 }
 
 pub fn mmio_write(addr: u64, width: u8, value: u64) -> Result<(), DeviceError> {
@@ -1123,8 +1055,7 @@ pub fn mmio_write(addr: u64, width: u8, value: u64) -> Result<(), DeviceError> {
             WriteOutcome::None => Ok(None),
             WriteOutcome::QueueNotify(queue) => Ok(Some(usize::from(queue))),
             WriteOutcome::Reset => {
-                transport.generation = transport.generation.wrapping_add(1);
-                transport.next = [0; 2];
+                transport.invalidate_queues();
                 clear_work();
                 WORK.ring(0);
                 Ok(None)
@@ -1150,11 +1081,11 @@ fn encode_response(unique: u64, result: Result<Vec<u8>, i32>) -> Vec<u8> {
 fn complete_io(completed: io::CompletedIo) {
     let target = completed.reply;
     if generation().ok() == Some(target.generation)
-        && reply(
+        && send_reply(
             target.queue,
             target.head,
             &target.output,
-            encode_response(target.unique, completed.result),
+            &encode_response(target.unique, completed.result),
         )
         .is_err()
     {
@@ -1221,7 +1152,7 @@ async fn receive_events(
                         .as_ref()
                         .is_some_and(|request| request.reply.unique == unique)
                     {
-                        dispatch_event(state, &payload);
+                        let _ = reply_to_event_request(state, 0, &payload);
                     }
                     Ok(())
                 });
@@ -1297,18 +1228,13 @@ pub fn interrupt_level() -> bool {
 }
 
 pub fn reset() {
-    invalidate_transport();
+    let _ = transport(reset_transport);
     clear_work();
     WORK.ring(0);
 }
 
-fn invalidate_transport() {
-    let _ = transport(reset_transport);
-}
-
 fn reset_transport(transport: &mut Transport) -> Result<(), DeviceError> {
-    transport.generation = transport.generation.wrapping_add(1);
-    transport.next = [0; 2];
+    transport.invalidate_queues();
     transport
         .mmio
         .write(STATUS, 4, 0)
@@ -1317,7 +1243,7 @@ fn reset_transport(transport: &mut Transport) -> Result<(), DeviceError> {
 }
 
 pub async fn close() -> Result<(), DeviceError> {
-    invalidate_transport();
+    let _ = transport(reset_transport);
     WORK.close();
     clear_work();
     WORK.ring(0);
@@ -1325,25 +1251,26 @@ pub async fn close() -> Result<(), DeviceError> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     let flush = async {
-        let state = STATE
+        let Some(state) = STATE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        let mut result = Ok(());
-        if let Some(state) = state {
-            let results = futures::future::join_all(
-                state
-                    .handles
-                    .iter()
-                    .filter(|handle| handle.writable)
-                    .map(|handle| handle.descriptor.sync_data()),
-            )
-            .await;
-            if results.into_iter().any(|result| result.is_err()) {
-                result = Err(DeviceError::Io);
-            }
+            .take()
+        else {
+            return Ok(());
+        };
+        let results = futures::future::join_all(
+            state
+                .handles
+                .values()
+                .filter(|handle| handle.writable)
+                .map(|handle| handle.descriptor.sync_data()),
+        )
+        .await;
+        if results.iter().any(Result::is_err) {
+            Err(DeviceError::Io)
+        } else {
+            Ok(())
         }
-        result
     };
     let deadline = crate::wasi::clocks::monotonic_clock::wait_for(CLOSE_FLUSH_TIMEOUT);
     futures::pin_mut!(flush, deadline);
@@ -1364,29 +1291,20 @@ mod allocation_tests {
         let mut context = Context::from_waker(&waker);
         let mut scheduler = io::IoScheduler::default();
         let (abort, cancellation) = AbortHandle::new_pair();
-        *STATE.lock().unwrap() = Some(State {
-            event_request: Some(EventRequest {
-                reply: PendingReply {
-                    queue: HIPRIO_QUEUE,
-                    head: 0,
-                    output: Vec::new(),
-                    unique: 1,
-                    generation: 0,
-                },
-                abort,
-                cancellation: Some(cancellation),
-            }),
-            event_entries: std::collections::BTreeMap::new(),
-            events_enabled: true,
-            max_nodes: 1,
-            nodes: std::collections::BTreeMap::new(),
-            node_id_by_identity: std::collections::BTreeMap::new(),
-            unused_nodes: std::collections::BTreeSet::new(),
-            handles: Vec::new(),
-            directories: Vec::new(),
-            next_handle: 2,
-            next_node: 2,
+        let mut state = State::new(1, None);
+        state.event_request = Some(EventRequest {
+            reply: PendingReply {
+                queue: HIPRIO_QUEUE,
+                head: 0,
+                output: Vec::new(),
+                unique: 1,
+                generation: 0,
+            },
+            abort,
+            cancellation: Some(cancellation),
         });
+        state.events_enabled = true;
+        *STATE.lock().unwrap() = Some(state);
         let (mut event_requests, requests) = mpsc::channel(0);
         event_requests.try_send(()).unwrap();
         let (events, stream) = mpsc::unbounded();
@@ -1491,7 +1409,7 @@ mod allocation_tests {
 
     #[test]
     fn attr_out_has_its_cache_timeout_prefix() {
-        let timestamp = host::Timestamp {
+        let timestamp = Instant {
             seconds: 0,
             nanoseconds: 0,
         };
@@ -1516,7 +1434,7 @@ mod allocation_tests {
 
     #[test]
     fn relookup_changes_the_node_handle_not_the_stat_inode() {
-        let timestamp = host::Timestamp {
+        let timestamp = Instant {
             seconds: 0,
             nanoseconds: 0,
         };
@@ -1533,8 +1451,8 @@ mod allocation_tests {
             mtime: timestamp,
             ctime: timestamp,
         };
-        let before_forget = entry(&stat, 2);
-        let after_relookup = entry(&stat, 3);
+        let before_forget = entry_out(&stat, 2);
+        let after_relookup = entry_out(&stat, 3);
         assert_eq!(&before_forget[..8], &2_u64.to_le_bytes());
         assert_eq!(&after_relookup[..8], &3_u64.to_le_bytes());
         assert_eq!(&before_forget[40..48], &99_u64.to_le_bytes());
@@ -1552,7 +1470,7 @@ mod allocation_tests {
 
     #[test]
     fn sized_replies_include_the_kernel_padding() {
-        assert_eq!(sized_out(3), [3, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(write_out(3), [3, 0, 0, 0, 0, 0, 0, 0]);
     }
 
     #[test]
@@ -1565,7 +1483,7 @@ mod allocation_tests {
     fn empty_read_completes_without_retrying() {
         assert_eq!(read_progressed(0, 0, 0), Ok(false));
         assert_eq!(read_progressed(0, 1, 1), Ok(true));
-        assert_eq!(read_progressed(0, 0, 1), Err(5));
-        assert_eq!(read_progressed(1, 3, 1), Err(5));
+        assert_eq!(read_progressed(0, 0, 1), Err(wire::EIO));
+        assert_eq!(read_progressed(1, 3, 1), Err(wire::EIO));
     }
 }

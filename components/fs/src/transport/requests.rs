@@ -1,9 +1,10 @@
 use super::io::PreparedIo;
 use super::{
-    MAX_DIRECTORIES, MAX_READ, OpenDirectory, State, attr_out, clear_runtime, create_flags,
-    directory, dirents, entry, flush_body, handle, host, increment_lookup, mark_unused_if_unheld,
-    name, names, node, node_id, open, open_flags, read_file, repoint_node, sized_out, statfs,
-    store_handle, symlink_parts, timestamp, u32_at, u64_at, wasi_error, wire, write_file,
+    MAX_DIRECTORIES, MAX_READ, O_ACCMODE, OpenDirectory, State, allocate_handle, attr_out,
+    clear_runtime, create_flags, directory, dirents_out, entry_out, flush_body, handle, host,
+    increment_lookup, mark_unused_if_unheld, name, names, node, node_id, open_flags, open_out,
+    read_file, repoint_node, statfs_out, store_handle, symlink_parts, timestamp, u32_at, u64_at,
+    wasi_error, wire, write_file, write_out,
 };
 use crate::wasi::filesystem::types;
 use futures::FutureExt;
@@ -22,8 +23,10 @@ pub(super) fn execute_immediate(
         wire::RELEASE => release_file(state, request),
         wire::RELEASEDIR => Ok(release_directory(state, request)),
         wire::FLUSH => flush_body(request.body).map(|()| Vec::new()),
-        21..=24 => Err(wire::ENOSYS),
-        31..=33 | 43 | 46 | 50 => Err(95),
+        wire::SETXATTR..=wire::REMOVEXATTR => Err(wire::ENOSYS),
+        wire::GETLK..=wire::SETLKW | wire::FALLOCATE | wire::LSEEK | wire::SYNCFS => {
+            Err(wire::EOPNOTSUPP)
+        }
         wire::GETATTR
         | wire::LOOKUP
         | wire::READLINK
@@ -59,9 +62,9 @@ impl RequestState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if super::generation().ok() != Some(self.0) {
-            return Err(5);
+            return Err(wire::EIO);
         }
-        operation(state.as_mut().ok_or(5)?)
+        operation(state.as_mut().ok_or(wire::EIO)?)
     }
 }
 
@@ -80,19 +83,21 @@ async fn execute(state: RequestState, request: &Request<'_>) -> Result<Vec<u8>, 
         wire::OPEN => open_file(state, request).await,
         wire::OPENDIR => open_directory(state, request).await,
         wire::READDIR => read_directory(state, request).await,
-        wire::STATFS => Ok(statfs(&request_node(state, request.node)?.statfs().await?)),
+        wire::STATFS => Ok(statfs_out(
+            &request_node(state, request.node)?.statfs().await?,
+        )),
         _ => Err(wire::ENOSYS),
     }
 }
 
 fn request_node(state: RequestState, id: u64) -> Result<host::Node, i32> {
-    state.with(|state| node(state, id).cloned().map_err(|_| 2))
+    state.with(|state| node(state, id).cloned().ok_or(wire::ENOENT))
 }
 
 async fn insert_entry(state: RequestState, child: host::Node) -> Result<Vec<u8>, i32> {
     let stat = child.stat().await?;
     let inode = state.with(|state| node_id(state, child, &stat))?;
-    Ok(entry(&stat, inode))
+    Ok(entry_out(&stat, inode))
 }
 
 async fn lookup_entry(state: RequestState, request: &Request<'_>) -> Result<Vec<u8>, i32> {
@@ -138,9 +143,10 @@ async fn create_file(state: RequestState, request: &Request<'_>) -> Result<Vec<u
     let (child, descriptor) = host::create(&parent, name, create_flags(flags)?, mode).await?;
     let stat = child.stat().await?;
     let inode = state.with(|state| node_id(state, child, &stat))?;
-    let handle = state.with(|state| store_handle(state, inode, descriptor, flags & 3 != 0))?;
-    let mut out = entry(&stat, inode);
-    out.extend_from_slice(&open(handle));
+    let handle =
+        state.with(|state| store_handle(state, inode, descriptor, flags & O_ACCMODE != 0))?;
+    let mut out = entry_out(&stat, inode);
+    out.extend_from_slice(&open_out(handle));
     Ok(out)
 }
 
@@ -150,12 +156,12 @@ async fn remove_entry(state: RequestState, request: &Request<'_>) -> Result<Vec<
     let is_directory = request.opcode == wire::RMDIR;
     match host::unlink(&parent, name.clone(), is_directory).await {
         Ok(()) => return Ok(Vec::new()),
-        Err(13) if is_directory => {}
+        Err(wire::EACCES) if is_directory => {}
         Err(error) => return Err(error),
     }
     let released_descriptor = {
         let parent_descriptor = parent.resolve_descriptor().await?;
-        let child_name = core::str::from_utf8(&name).map_err(|_| 84)?;
+        let child_name = core::str::from_utf8(&name).map_err(|_| wire::EILSEQ)?;
         if matches!(
             parent_descriptor
                 .stat_at(types::PathFlags::empty(), child_name.to_owned())
@@ -185,7 +191,7 @@ async fn remove_entry(state: RequestState, request: &Request<'_>) -> Result<Vec<
             None
         }
     };
-    host::release_descriptor(released_descriptor.ok_or(13)?).await?;
+    host::release_descriptor(released_descriptor.ok_or(wire::EACCES)?).await?;
     host::unlink(&parent, name, is_directory).await?;
     Ok(Vec::new())
 }
@@ -204,7 +210,11 @@ async fn rename_entry(state: RequestState, request: &Request<'_>) -> Result<Vec<
         0
     };
     if flags != 0 {
-        return Err(if flags <= 2 { 95 } else { wire::ENOSYS });
+        return Err(if flags <= 2 {
+            wire::EOPNOTSUPP
+        } else {
+            wire::ENOSYS
+        });
     }
     let old_parent = request_node(state, request.node)?;
     let new_parent = request_node(state, new_parent_id)?;
@@ -213,7 +223,7 @@ async fn rename_entry(state: RequestState, request: &Request<'_>) -> Result<Vec<
     let stat = renamed.stat().await?;
     host::rename(&old_parent, old_name, &new_parent, new_name.clone()).await?;
     state.with(|state| {
-        repoint_node(state, &stat, new_parent_descriptor, new_name);
+        repoint_node(state, &stat, &new_parent_descriptor, &new_name);
         Ok(())
     })?;
     Ok(Vec::new())
@@ -229,7 +239,7 @@ async fn link_entry(state: RequestState, request: &Request<'_>) -> Result<Vec<u8
         increment_lookup(state, old_inode);
         Ok(())
     })?;
-    Ok(entry(&stat, old_inode))
+    Ok(entry_out(&stat, old_inode))
 }
 
 async fn create_symlink(state: RequestState, request: &Request<'_>) -> Result<Vec<u8>, i32> {
@@ -243,67 +253,49 @@ async fn open_file(state: RequestState, request: &Request<'_>) -> Result<Vec<u8>
     let descriptor = request_node(state, request.node)?
         .open(flags, truncate)
         .await?;
-    state.with(|state| store_handle(state, request.node, descriptor, writable).map(open))
+    state.with(|state| store_handle(state, request.node, descriptor, writable).map(open_out))
 }
 
 async fn open_directory(state: RequestState, request: &Request<'_>) -> Result<Vec<u8>, i32> {
     let (directory, descriptor) = request_node(state, request.node)?.open_directory().await?;
     state.with(|state| {
         if state.directories.len() == MAX_DIRECTORIES {
-            return Err(24);
+            return Err(wire::EMFILE);
         }
-        let handle = state.next_handle;
-        state.next_handle = state.next_handle.wrapping_add(1).max(2);
-        state.directories.push((
+        let handle = allocate_handle(state);
+        state.directories.insert(
             handle,
             OpenDirectory {
                 node: request.node,
                 directory: std::sync::Arc::new(futures::lock::Mutex::new(directory)),
                 descriptor,
             },
-        ));
+        );
         state.unused_nodes.remove(&request.node);
-        Ok(open(handle))
+        Ok(open_out(handle))
     })
 }
 
 fn release_file(state: &mut State, request: &Request<'_>) -> Result<Vec<u8>, i32> {
-    let mut release_error = None;
     if let (Ok(id), Ok(flags), Ok(_owner)) = (
         u64_at(request.body, 0),
         u32_at(request.body, 12),
         u64_at(request.body, 16),
-    ) {
-        if flags & 2 != 0
-            && let Ok(handle) = handle(state, id)
-            && node(state, handle.node).is_ok()
-        {
-            release_error = Some(95);
-        }
-        let released_node = state
-            .handles
-            .iter()
-            .find(|known| known.id == id)
-            .map(|handle| handle.node);
-        state.handles.retain(|known| known.id != id);
-        if let Some(node) = released_node {
-            mark_unused_if_unheld(state, node);
+    ) && let Some(released) = state.handles.remove(&id)
+    {
+        mark_unused_if_unheld(state, released.node);
+        if flags & 2 != 0 && node(state, released.node).is_some() {
+            return Err(wire::EOPNOTSUPP);
         }
     }
-    release_error.map_or_else(|| Ok(Vec::new()), Err)
+    Ok(Vec::new())
 }
 
 fn release_directory(state: &mut State, request: &Request<'_>) -> Vec<u8> {
-    if let Ok(handle) = u64_at(request.body, 0) {
-        let released_node = state
-            .directories
-            .iter()
-            .find(|(known, _)| *known == handle)
-            .map(|(_, directory)| directory.node);
-        state.directories.retain(|(known, _)| *known != handle);
-        if let Some(node) = released_node {
-            mark_unused_if_unheld(state, node);
-        }
+    if let Ok(handle) = u64_at(request.body, 0)
+        && let Some(released) = state.directories.remove(&handle)
+    {
+        mark_unused_if_unheld(state, released.node);
     }
     Vec::new()
 }
@@ -312,10 +304,14 @@ async fn read_directory(state: RequestState, request: &Request<'_>) -> Result<Ve
     let handle = u64_at(request.body, 0)?;
     let cookie = u64_at(request.body, 8)?;
     let size = u32_at(request.body, 16)?;
-    let directory =
-        state.with(|state| Ok(directory(state, handle).map_err(|_| 2)?.directory.clone()))?;
+    let directory = state.with(|state| {
+        Ok(directory(state, handle)
+            .ok_or(wire::ENOENT)?
+            .directory
+            .clone())
+    })?;
     let entries = directory.lock().await.readdir(cookie, 256, size).await?;
-    Ok(dirents(entries, usize::try_from(size).unwrap_or(0)))
+    Ok(dirents_out(entries, usize::try_from(size).unwrap_or(0)))
 }
 
 pub(super) struct OwnedRequest {
@@ -379,7 +375,7 @@ fn prepare_file_io(state: &State, owned_request: OwnedRequest) -> Result<Prepare
     let request = owned_request.borrow();
     let id = u64_at(request.body, 0)?;
     if request.opcode == wire::FSYNCDIR {
-        let directory = directory(state, id).map_err(|_| 9)?;
+        let directory = directory(state, id).ok_or(wire::EBADF)?;
         let descriptor = directory.descriptor.clone();
         return Ok(PreparedIo {
             identity: Some(file_identity(state, directory.node)?),
@@ -390,7 +386,7 @@ fn prepare_file_io(state: &State, owned_request: OwnedRequest) -> Result<Prepare
             .boxed_local(),
         });
     }
-    let handle = handle(state, id).map_err(|_| 9)?;
+    let handle = handle(state, id).ok_or(wire::EBADF)?;
     let descriptor = handle.descriptor.clone();
     let work = match request.opcode {
         wire::READ => {
@@ -408,13 +404,13 @@ fn prepare_file_io(state: &State, owned_request: OwnedRequest) -> Result<Prepare
                 return Err(wire::EINVAL);
             }
             if !handle.writable {
-                return Err(9);
+                return Err(wire::EBADF);
             }
             let payload_len = bytes.len();
             let request_bytes = take_write_payload(owned_request.bytes, payload_len);
             async move {
                 write_file(&descriptor, offset, request_bytes).await?;
-                Ok(sized_out(size))
+                Ok(write_out(size))
             }
             .boxed_local()
         }
@@ -443,7 +439,7 @@ fn take_write_payload(mut request_bytes: Vec<u8>, payload_len: usize) -> Vec<u8>
 }
 
 fn file_identity(state: &State, node: u64) -> Result<(u64, u64), i32> {
-    let record = state.nodes.get(&node).ok_or(9)?;
+    let record = state.nodes.get(&node).ok_or(wire::EBADF)?;
     Ok((record.dev, record.ino))
 }
 

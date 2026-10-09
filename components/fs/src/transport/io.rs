@@ -4,6 +4,7 @@ use std::task::{Context, Poll};
 use futures::{FutureExt, StreamExt, future::LocalBoxFuture, stream::FuturesUnordered};
 
 use super::PendingReply;
+use crate::wire;
 
 const MAX_ACTIVE_IO: usize = 32;
 const MAX_PENDING_IO: usize = super::QUEUE_SIZE as usize;
@@ -42,7 +43,7 @@ impl IoScheduler {
 
     pub fn enqueue(&mut self, operation: PreparedIo, reply: PendingReply) -> Result<(), i32> {
         if self.pending.len() + self.active.len() == MAX_PENDING_IO {
-            return Err(16);
+            return Err(wire::EBUSY);
         }
         self.pending.push_back((operation, reply));
         Ok(())
@@ -114,7 +115,7 @@ mod tests {
         io.enqueue(
             PreparedIo {
                 identity: Some((0, 1)),
-                work: async move { stalled.await.map_err(|_| 5) }.boxed_local(),
+                work: async move { stalled.await.map_err(|_| wire::EIO) }.boxed_local(),
             },
             reply(1),
         )
@@ -156,7 +157,7 @@ mod tests {
         io.enqueue(
             PreparedIo {
                 identity: Some((0, 1)),
-                work: async move { stalled.await.map_err(|_| 5) }.boxed_local(),
+                work: async move { stalled.await.map_err(|_| wire::EIO) }.boxed_local(),
             },
             reply(1),
         )
@@ -165,7 +166,7 @@ mod tests {
         io.enqueue(
             PreparedIo {
                 identity: None,
-                work: async move { metadata.await.map_err(|_| 5) }.boxed_local(),
+                work: async move { metadata.await.map_err(|_| wire::EIO) }.boxed_local(),
             },
             reply(2),
         )
@@ -191,7 +192,7 @@ mod tests {
             io.enqueue(
                 PreparedIo {
                     identity: Some((0, node as u64)),
-                    work: async move { stalled.await.map_err(|_| 5) }.boxed_local(),
+                    work: async move { stalled.await.map_err(|_| wire::EIO) }.boxed_local(),
                 },
                 reply(node as u64),
             )
@@ -205,7 +206,7 @@ mod tests {
                 },
                 reply(u64::MAX)
             ),
-            Err(16)
+            Err(wire::EBUSY)
         );
         let waker = noop_waker();
         assert!(io.poll_complete(&mut Context::from_waker(&waker)).is_none());
