@@ -24,7 +24,7 @@ where
                 terra_protocol::read_frame_with_limit::<T>(&mut remaining, MAX_NETWORK_FRAME_BYTES)
                     .is_ok_and(|decoded| decoded == Some(message))
             );
-            assert!(remaining.is_empty());
+            assert_eq!(remaining, []);
         }
     }
 }
@@ -58,7 +58,7 @@ fn decode_agent(bytes: &[u8]) {
         assert!(decoded.is_ok_and(|boot_plan| {
             boot_plan.is_some_and(|boot_plan| boot_plan.validate_protocol_versions().is_ok())
         }));
-        assert!(frame_bytes.is_empty());
+        assert_eq!(frame_bytes, []);
     }
 }
 

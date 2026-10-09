@@ -589,6 +589,14 @@ impl MmioTransport {
     pub fn negotiated(&self) -> u64 {
         self.guest_features & self.host_features
     }
+    /// Device config space; MMIO writes to it are refused, so writable fields go through here.
+    pub fn config_mut(&mut self) -> &mut [u8] {
+        &mut self.config
+    }
+    #[must_use]
+    pub fn config(&self) -> &[u8] {
+        &self.config
+    }
     #[must_use]
     pub fn queue_addrs_for(&self, queue: usize) -> Option<(u64, u64, u64, u16)> {
         let r = self.queues.get(queue)?;

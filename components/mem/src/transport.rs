@@ -1,9 +1,10 @@
+use std::ops::Range as ByteRange;
 use std::sync::{LazyLock, Mutex};
 
 use terra_device_transport::{
-    Doorbell, INT_USED_BUFFER, MmioTransport, SPLIT_RING_DESC_F_NEXT, SPLIT_RING_DESCRIPTOR_BYTES,
-    SplitRingDescriptor, WriteOutcome, complete_split_ring_entry, publish_interrupt_asserted,
-    read_split_ring_available, split_ring_chain,
+    Doorbell, INT_USED_BUFFER, MmioTransport, SPLIT_RING_DESC_F_NEXT, SPLIT_RING_DESC_F_WRITE,
+    SPLIT_RING_DESCRIPTOR_BYTES, SplitRingDescriptor, WriteOutcome, complete_split_ring_entry,
+    publish_interrupt_asserted, read_split_ring_available, split_ring_chain,
 };
 
 use crate::terra::host::{interrupt, memory};
@@ -27,29 +28,19 @@ const DESC_BYTES: u64 = SPLIT_RING_DESCRIPTOR_BYTES as u64;
 const MAX_CHAIN: usize = 32;
 const MAX_REPORT_BYTES: u64 = 128 * 1024 * 1024;
 const PAGE_SIZE: u64 = 4096;
-const NEXT: u16 = SPLIT_RING_DESC_F_NEXT;
-const WRITE: u16 = 2;
 const VIRTIO_F_VERSION_1: u64 = 1 << 32;
 const VIRTIO_BALLOON_F_PAGE_POISON: u64 = 1 << 4;
 const VIRTIO_BALLOON_F_PAGE_REPORTING: u64 = 1 << 5;
-const CONFIG_ACTUAL: u64 = 0x104;
-const CONFIG_POISON: u64 = 0x10c;
+const HOST_FEATURES: u64 =
+    VIRTIO_F_VERSION_1 | VIRTIO_BALLOON_F_PAGE_POISON | VIRTIO_BALLOON_F_PAGE_REPORTING;
+const CONFIG_BASE: u64 = 0x100;
+const CONFIG_BYTES: usize = 16;
+const CONFIG_ACTUAL: ByteRange<usize> = 4..8;
+const CONFIG_POISON: ByteRange<usize> = 12..16;
 
 struct State {
     mmio: MmioTransport,
     next: [u16; QUEUE_COUNT],
-    config: BalloonConfig,
-}
-
-type Descriptor = SplitRingDescriptor;
-
-#[derive(Clone, Copy, Default)]
-struct BalloonConfig([u8; 16]);
-
-impl BalloonConfig {
-    fn page_contents_are_zeroed(self) -> bool {
-        self.0[12..].iter().all(|byte| *byte == 0)
-    }
 }
 
 static STATE: LazyLock<Mutex<Option<State>>> = LazyLock::new(|| Mutex::new(None));
@@ -75,8 +66,15 @@ fn write(addr: u64, bytes: &[u8]) -> Result<(), DeviceError> {
     memory::write(addr, bytes).map_err(|_| DeviceError::Unmapped)
 }
 
-fn chain(table: &[u8], index: u16, size: u16) -> Result<Vec<Descriptor>, DeviceError> {
-    split_ring_chain(table, index, size, MAX_CHAIN, NEXT | WRITE).map_err(DeviceError::from)
+fn chain(table: &[u8], index: u16, size: u16) -> Result<Vec<SplitRingDescriptor>, DeviceError> {
+    split_ring_chain(
+        table,
+        index,
+        size,
+        MAX_CHAIN,
+        SPLIT_RING_DESC_F_NEXT | SPLIT_RING_DESC_F_WRITE,
+    )
+    .map_err(DeviceError::from)
 }
 
 fn available(state: &mut State, queue: usize) -> Result<Option<QueueEntry>, DeviceError> {
@@ -115,7 +113,7 @@ fn overlaps(left: Range, right: Range) -> bool {
 }
 
 fn report_ranges(
-    descriptors: &[Descriptor],
+    descriptors: &[SplitRingDescriptor],
     descriptor_table: Range,
     available_ring: Range,
     used_ring: Range,
@@ -126,7 +124,7 @@ fn report_ranges(
     let mut bytes = 0_u64;
     let mut ranges = Vec::with_capacity(descriptors.len());
     for descriptor in descriptors {
-        if descriptor.flags & WRITE == 0 || descriptor.len == 0 {
+        if descriptor.flags & SPLIT_RING_DESC_F_WRITE == 0 || descriptor.len == 0 {
             return Err(DeviceError::BadLen);
         }
         let range = Range {
@@ -151,52 +149,24 @@ fn report_ranges(
     Ok(ranges)
 }
 
-fn host_features() -> u64 {
-    VIRTIO_F_VERSION_1 | VIRTIO_BALLOON_F_PAGE_POISON | VIRTIO_BALLOON_F_PAGE_REPORTING
+/// Writes `num_pages`/`actual` or `poison_val`, the only driver-writable config fields.
+fn config_write(config: &mut [u8], offset: u64, data: &[u8]) -> Result<(), DeviceError> {
+    let start = usize::try_from(offset).map_err(|_| DeviceError::BadLen)?;
+    let field = start..start.checked_add(data.len()).ok_or(DeviceError::BadLen)?;
+    let is_writable = [CONFIG_ACTUAL, CONFIG_POISON]
+        .iter()
+        .any(|writable| writable.start <= field.start && field.end <= writable.end);
+    if !is_writable || !matches!(data.len(), 1 | 2 | 4) {
+        return Err(DeviceError::BadLen);
+    }
+    config[field].copy_from_slice(data);
+    Ok(())
 }
 
-fn config_write(
-    config: &mut BalloonConfig,
-    addr: u64,
-    data: &[u8],
-) -> Option<Result<(), DeviceError>> {
-    if addr < 0x100 {
-        return None;
-    }
-    let Ok(len) = u64::try_from(data.len()) else {
-        return Some(Err(DeviceError::BadLen));
-    };
-    let Some(end) = addr.checked_add(len) else {
-        return Some(Err(DeviceError::BadLen));
-    };
-    let field = [CONFIG_ACTUAL, CONFIG_POISON]
-        .into_iter()
-        .find(|field| addr >= *field && end <= *field + 4);
-    Some(match field {
-        Some(field) if matches!(data.len(), 1 | 2 | 4) => {
-            let Ok(relative) = usize::try_from(addr - field) else {
-                return Some(Err(DeviceError::BadLen));
-            };
-            let start = if field == CONFIG_ACTUAL { 4 } else { 12 } + relative;
-            let end = start + data.len();
-            config.0[start..end].copy_from_slice(data);
-            Ok(())
-        }
-        _ => Err(DeviceError::BadLen),
-    })
-}
-
-fn config_read(config: BalloonConfig, addr: u64, width: u8) -> Option<u64> {
-    let len = usize::from(width);
-    let end = addr.checked_add(u64::try_from(len).ok()?)?;
-    if addr < 0x100 || end > 0x110 || !matches!(len, 1 | 2 | 4) {
-        return None;
-    }
-    let start = usize::try_from(addr - 0x100).ok()?;
-    let end = start.checked_add(len)?;
-    let mut value = [0; 8];
-    value[..len].copy_from_slice(config.0.get(start..end)?);
-    Some(u64::from_le_bytes(value))
+fn poison_is_zero(config: &[u8]) -> bool {
+    config
+        .get(CONFIG_POISON)
+        .is_some_and(|poison| poison.iter().all(|byte| *byte == 0))
 }
 
 fn discard_report(state: &State, ring: &QueueEntry) -> Result<(), DeviceError> {
@@ -217,7 +187,8 @@ fn discard_report(state: &State, ring: &QueueEntry) -> Result<(), DeviceError> {
             len: 4 + u64::from(ring.size) * 8,
         },
     )?;
-    if state.config.page_contents_are_zeroed() {
+    // A nonzero poison value means freed pages must keep it, so discarding would zero them.
+    if poison_is_zero(state.mmio.config()) {
         // Reclaim is advisory; unsupported host pages must not stop the balloon worker.
         let _ = host::discard(&ranges);
     }
@@ -231,32 +202,26 @@ pub fn configure() -> Result<(), DeviceError> {
         mmio: MmioTransport::new(
             memory::address_limit(),
             5,
-            host_features(),
+            HOST_FEATURES,
             QUEUE_SIZE,
-            BalloonConfig::default().0.to_vec(),
+            vec![0; CONFIG_BYTES],
         )
         .with_queue_count(QUEUE_COUNT_U16),
         next: [0; QUEUE_COUNT],
-        config: BalloonConfig::default(),
     });
     Ok(())
 }
 
 pub fn mmio_read(addr: u64, width: u8) -> Result<u64, DeviceError> {
-    state(|state| {
-        if let Some(value) = config_read(state.config, addr, width) {
-            return Ok(value);
-        }
-        state.mmio.read(addr, width).map_err(DeviceError::from)
-    })
+    state(|state| state.mmio.read(addr, width).map_err(DeviceError::from))
 }
 
 pub fn mmio_write(addr: u64, width: u8, value: u64) -> Result<(), DeviceError> {
     state(|state| {
-        let bytes = value.to_le_bytes();
-        let data = bytes.get(..usize::from(width)).ok_or(DeviceError::BadLen)?;
-        if let Some(result) = config_write(&mut state.config, addr, data) {
-            return result;
+        if let Some(offset) = addr.checked_sub(CONFIG_BASE) {
+            let bytes = value.to_le_bytes();
+            let data = bytes.get(..usize::from(width)).ok_or(DeviceError::BadLen)?;
+            return config_write(state.mmio.config_mut(), offset, data);
         }
         match state
             .mmio
@@ -306,11 +271,9 @@ pub fn interrupt_level() -> bool {
 }
 
 pub fn reset() {
-    if QUEUES.is_closed() {
-        return;
+    if !QUEUES.is_closed() {
+        let _ = configure();
     }
-    QUEUES.clear();
-    let _ = configure();
 }
 
 pub fn close() -> Result<(), DeviceError> {
@@ -346,8 +309,8 @@ mod tests {
         len: 1024,
     };
 
-    fn data_descriptor(addr: u64, len: u32, flags: u16) -> Descriptor {
-        Descriptor {
+    fn data_descriptor(addr: u64, len: u32, flags: u16) -> SplitRingDescriptor {
+        SplitRingDescriptor {
             addr,
             len,
             flags,
@@ -358,7 +321,7 @@ mod tests {
     #[test]
     fn report_ranges_accept_page_aligned_writable_pages() {
         let ranges = report_ranges(
-            &[data_descriptor(0x40_000, 8192, WRITE)],
+            &[data_descriptor(0x40_000, 8192, SPLIT_RING_DESC_F_WRITE)],
             TABLE,
             AVAIL,
             USED,
@@ -376,13 +339,13 @@ mod tests {
     #[test]
     fn report_ranges_rejects_hostile_ranges() {
         for descriptor in [
-            data_descriptor(0x40_001, 4096, WRITE),
-            data_descriptor(0x40_000, 1, WRITE),
-            data_descriptor(u64::MAX - 4095, 8192, WRITE),
+            data_descriptor(0x40_001, 4096, SPLIT_RING_DESC_F_WRITE),
+            data_descriptor(0x40_000, 1, SPLIT_RING_DESC_F_WRITE),
+            data_descriptor(u64::MAX - 4095, 8192, SPLIT_RING_DESC_F_WRITE),
             data_descriptor(0x40_000, 4096, 0),
-            data_descriptor(TABLE.addr, 4096, WRITE),
-            data_descriptor(AVAIL.addr, 4096, WRITE),
-            data_descriptor(USED.addr, 4096, WRITE),
+            data_descriptor(TABLE.addr, 4096, SPLIT_RING_DESC_F_WRITE),
+            data_descriptor(AVAIL.addr, 4096, SPLIT_RING_DESC_F_WRITE),
+            data_descriptor(USED.addr, 4096, SPLIT_RING_DESC_F_WRITE),
         ] {
             assert!(report_ranges(&[descriptor], TABLE, AVAIL, USED).is_err());
         }
@@ -390,7 +353,8 @@ mod tests {
 
     #[test]
     fn report_ranges_rejects_unbounded_batches() {
-        let descriptors = vec![data_descriptor(0x40_000, 4096, WRITE); MAX_CHAIN + 1];
+        let descriptors =
+            vec![data_descriptor(0x40_000, 4096, SPLIT_RING_DESC_F_WRITE); MAX_CHAIN + 1];
         assert_eq!(
             report_ranges(&descriptors, TABLE, AVAIL, USED),
             Err(DeviceError::BadLen)
@@ -400,7 +364,7 @@ mod tests {
                 &[data_descriptor(
                     0x40_000,
                     u32::try_from(MAX_REPORT_BYTES + PAGE_SIZE).unwrap(),
-                    WRITE
+                    SPLIT_RING_DESC_F_WRITE
                 )],
                 TABLE,
                 AVAIL,
@@ -413,7 +377,7 @@ mod tests {
     #[test]
     fn chain_rejects_loops_and_invalid_directions() {
         let mut table = vec![0; 32];
-        table[12..14].copy_from_slice(&NEXT.to_le_bytes());
+        table[12..14].copy_from_slice(&SPLIT_RING_DESC_F_NEXT.to_le_bytes());
         table[14..16].copy_from_slice(&0_u16.to_le_bytes());
         assert_eq!(chain(&table, 0, 2), Err(DeviceError::BadLen));
         table[12..14].copy_from_slice(&4_u16.to_le_bytes());
@@ -422,63 +386,40 @@ mod tests {
     }
 
     #[test]
-    fn page_poison_is_zero_and_reset_forgets_queue_indices() {
-        assert_ne!(host_features() & VIRTIO_BALLOON_F_PAGE_POISON, 0);
-        assert!(BalloonConfig::default().0.iter().all(|byte| *byte == 0));
-        let mut state = State {
-            mmio: MmioTransport::new(
-                0,
-                5,
-                host_features(),
-                QUEUE_SIZE,
-                BalloonConfig::default().0.to_vec(),
-            ),
-            next: [1, 2, 3],
-            config: BalloonConfig::default(),
-        };
-        state.next = [0; QUEUE_COUNT];
-        assert_eq!(state.next, [0; QUEUE_COUNT]);
-    }
-
-    #[test]
-    fn config_writes_preserve_partial_poison_values() {
-        let mut config = BalloonConfig::default();
-        assert_eq!(config_write(&mut config, 0x70, &[0; 4]), None);
-        for addr in [CONFIG_ACTUAL, CONFIG_ACTUAL + 1, CONFIG_POISON] {
-            assert_eq!(config_write(&mut config, addr, &[0]), Some(Ok(())));
+    fn config_writes_reach_only_driver_fields_and_read_back_through_the_transport() {
+        assert_ne!(HOST_FEATURES & VIRTIO_BALLOON_F_PAGE_POISON, 0);
+        let mut mmio = MmioTransport::new(0, 5, HOST_FEATURES, QUEUE_SIZE, vec![0; CONFIG_BYTES]);
+        assert!(poison_is_zero(mmio.config()));
+        let actual = CONFIG_ACTUAL.start as u64;
+        let poison = CONFIG_POISON.start as u64;
+        for offset in [actual, actual + 1, poison] {
+            assert_eq!(config_write(mmio.config_mut(), offset, &[0]), Ok(()));
         }
         assert_eq!(
-            config_write(&mut config, CONFIG_ACTUAL, &[1, 2, 3, 4]),
-            Some(Ok(()))
+            config_write(mmio.config_mut(), actual, &[1, 2, 3, 4]),
+            Ok(())
         );
-        assert_eq!(config_read(config, CONFIG_ACTUAL, 4), Some(0x0403_0201));
+        assert_eq!(mmio.read(CONFIG_BASE + actual, 4), Ok(0x0403_0201));
         assert_eq!(
-            config_write(&mut config, CONFIG_POISON + 1, &[0xaa, 0xbb]),
-            Some(Ok(()))
+            config_write(mmio.config_mut(), poison + 1, &[0xaa, 0xbb]),
+            Ok(())
         );
-        assert_eq!(config_read(config, CONFIG_POISON, 4), Some(0x00bb_aa00));
-        assert_eq!(config_read(config, CONFIG_POISON - 1, 4), Some(0xbbaa_0000));
-        assert!(!config.page_contents_are_zeroed());
-        assert_eq!(
-            config_write(&mut config, CONFIG_POISON, &[0; 4]),
-            Some(Ok(()))
-        );
-        assert!(config.page_contents_are_zeroed());
-        assert_eq!(
-            config_write(&mut config, CONFIG_POISON, &[0; 8]),
-            Some(Err(DeviceError::BadLen))
-        );
-        assert_eq!(
-            config_write(&mut config, CONFIG_ACTUAL + 3, &[0, 0]),
-            Some(Err(DeviceError::BadLen))
-        );
-        assert_eq!(
-            config_write(&mut config, 0x100, &[0; 4]),
-            Some(Err(DeviceError::BadLen))
-        );
-        assert_eq!(
-            config_write(&mut config, u64::MAX, &[0, 0]),
-            Some(Err(DeviceError::BadLen))
-        );
+        assert_eq!(mmio.read(CONFIG_BASE + poison, 4), Ok(0x00bb_aa00));
+        assert!(!poison_is_zero(mmio.config()));
+        assert_eq!(config_write(mmio.config_mut(), poison, &[0; 4]), Ok(()));
+        assert!(poison_is_zero(mmio.config()));
+        for (offset, data) in [
+            (poison, &[0; 8][..]),
+            (actual + 3, &[0, 0][..]),
+            (0, &[0; 4][..]),
+            (u64::MAX, &[0, 0][..]),
+            (poison, &[0; 3][..]),
+        ] {
+            assert_eq!(
+                config_write(mmio.config_mut(), offset, data),
+                Err(DeviceError::BadLen),
+                "{offset:#x} {data:?}"
+            );
+        }
     }
 }
