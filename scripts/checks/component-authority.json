@@ -145,7 +145,6 @@
     "terra:mmio@0.1.0/types": []
   },
   "terra-vmm-component": {
-    "terra:mmio@0.1.0/types": [],
     "terra:vmm@0.1.0/lifecycle-platform": [
       "next-event",
       "shutdown"

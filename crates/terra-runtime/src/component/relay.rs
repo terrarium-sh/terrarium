@@ -263,7 +263,6 @@ mod tests {
                 sequence: 1,
                 value: 0,
                 error: None,
-                interrupt: false,
             }],
         )
         .expect("input");

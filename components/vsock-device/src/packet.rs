@@ -1,7 +1,6 @@
 //! Virtio-vsock header encoding and validation.
 
 pub const VSOCK_HEADER_BYTES: usize = 44;
-const HDR_BYTES: usize = VSOCK_HEADER_BYTES;
 
 /// A standard virtio-vsock packet header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,21 +17,18 @@ pub struct VsockHeader {
     pub fwd_cnt: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HeaderError {
-    TooShort,
-}
-
 fn le<const N: usize>(bytes: &[u8], offset: usize) -> [u8; N] {
     bytes[offset..offset + N].try_into().unwrap_or([0; N])
 }
 
 impl VsockHeader {
-    pub fn parse(bytes: &[u8]) -> Result<(Self, &[u8]), HeaderError> {
-        if bytes.len() < HDR_BYTES {
-            return Err(HeaderError::TooShort);
+    /// Splits a header off `bytes`; `None` means fewer than [`VSOCK_HEADER_BYTES`] bytes.
+    #[must_use]
+    pub fn parse(bytes: &[u8]) -> Option<(Self, &[u8])> {
+        if bytes.len() < VSOCK_HEADER_BYTES {
+            return None;
         }
-        Ok((
+        Some((
             Self {
                 src_cid: u64::from_le_bytes(le(bytes, 0)),
                 dst_cid: u64::from_le_bytes(le(bytes, 8)),
@@ -45,13 +41,13 @@ impl VsockHeader {
                 buf_alloc: u32::from_le_bytes(le(bytes, 36)),
                 fwd_cnt: u32::from_le_bytes(le(bytes, 40)),
             },
-            &bytes[HDR_BYTES..],
+            &bytes[VSOCK_HEADER_BYTES..],
         ))
     }
 
     #[must_use]
-    pub fn encode(&self) -> [u8; HDR_BYTES] {
-        let mut out = [0u8; HDR_BYTES];
+    pub fn encode(&self) -> [u8; VSOCK_HEADER_BYTES] {
+        let mut out = [0u8; VSOCK_HEADER_BYTES];
         out[0..8].copy_from_slice(&self.src_cid.to_le_bytes());
         out[8..16].copy_from_slice(&self.dst_cid.to_le_bytes());
         out[16..20].copy_from_slice(&self.src_port.to_le_bytes());

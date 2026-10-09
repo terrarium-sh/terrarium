@@ -12,8 +12,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use wasmtime::component::{StreamReader, TypedFunc};
 
-use bindings::types::Error;
 pub use bindings::types::{DeviceError, Operation, Reply, Request};
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Error {
+    InvalidSlot,
+    Unmapped,
+    BadWidth,
+    Overflow,
+    Closed,
+    Device,
+}
 pub type Serve = TypedFunc<(StreamReader<Request>,), (StreamReader<Reply>,)>;
 #[derive(Debug)]
 struct RoutedReply {
@@ -220,15 +228,15 @@ impl<T: Send + 'static> crate::component::vmm::bindings::vmm_mmio_client::HostWi
         width: u8,
         value: u64,
         write: bool,
-    ) -> wasmtime::Result<Result<u64, Error>> {
+    ) -> wasmtime::Result<u64> {
         match accessor
             .with(|mut store| store.get().clone())
             .ok_or_else(|| wasmtime::Error::msg("VMM MMIO client is not initialized"))?
             .access(address, width, value, write)
             .await
         {
-            Ok(value) => Ok(Ok(value)),
-            Err(QueueError::Router(error)) => Ok(Err(error)),
+            Ok(value) => Ok(value),
+            Err(QueueError::Router(_)) => Ok(0),
             Err(QueueError::Failure(error)) => Err(error),
         }
     }

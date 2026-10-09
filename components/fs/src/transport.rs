@@ -1222,10 +1222,6 @@ pub async fn run() -> Result<(), DeviceError> {
     Ok(())
 }
 
-pub fn interrupt_level() -> bool {
-    transport(|transport| Ok(transport.mmio.interrupt_status() != 0)).unwrap_or(false)
-}
-
 pub fn reset() {
     let _ = transport(reset_transport);
     clear_work();

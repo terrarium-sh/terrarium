@@ -29,8 +29,7 @@ mod mmio {
         Block::mmio_read,
         Block::mmio_write,
         Block::reset,
-        Block::close,
-        Block::interrupt_level
+        Block::close
     );
 }
 
@@ -438,11 +437,6 @@ impl Block {
             }
         }
         Ok(())
-    }
-
-    fn interrupt_level() -> bool {
-        transport(|state| Ok(state.transport.interrupt_status() & INT_USED_BUFFER != 0))
-            .unwrap_or(false)
     }
 
     fn reset() {

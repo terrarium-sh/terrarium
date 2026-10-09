@@ -214,13 +214,11 @@ fn disable_networking() {
     switch().disable_network();
     close();
     transport::schedule_receive_queue();
-    wake_worker();
 }
 
 pub(crate) fn reset_flow(connection: ConnectionId) {
     let _ = switch().reset_connection(connection);
     transport::schedule_receive_queue();
-    wake_worker();
 }
 
 fn finish_flow(connection: ConnectionId) {
@@ -237,7 +235,6 @@ fn finish_flow(connection: ConnectionId) {
 pub(crate) fn shutdown_flow(connection: ConnectionId) {
     let _ = switch().shutdown(connection);
     transport::schedule_receive_queue();
-    wake_worker();
 }
 
 pub(crate) async fn wait_upstream(
@@ -266,7 +263,6 @@ pub(crate) fn consume_upstream(connection: ConnectionId, count: usize) -> Result
         .consume_upstream(connection, count)
         .map_err(|_| ())?;
     transport::schedule_receive_queue();
-    wake_worker();
     Ok(())
 }
 
@@ -294,7 +290,6 @@ pub(crate) async fn wait_capacity(
         drop(state);
         if requested {
             transport::schedule_receive_queue();
-            wake_worker();
         }
         Poll::Pending
     })
@@ -332,7 +327,6 @@ pub(crate) async fn deliver_bytes(
             .deliver(connection, chunk)
             .map_err(|_| SocketError::Cancelled)?;
         transport::schedule_receive_queue();
-        wake_worker();
     }
     Ok(())
 }
@@ -355,7 +349,6 @@ async fn deliver_opening(connection: ConnectionId, message: &Message) -> Result<
         .deliver(connection, bytes)
         .map_err(|_| SocketError::Cancelled)?;
     transport::schedule_receive_queue();
-    wake_worker();
     Ok(())
 }
 

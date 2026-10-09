@@ -5,7 +5,6 @@ interface api {
     use terra:network/types@0.1.0.{config};
     configure-device: func(network: option<config>) -> result<_, device-error>;
     run: async func() -> result<_, device-error>;
-    close: async func();
 }
 
 world device {

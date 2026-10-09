@@ -20,7 +20,7 @@ mod bindings {
 }
 
 pub use bindings::terra::vsock::{frontend_stream, role_stream, stream_types};
-use stream_types::{Connection, StreamError};
+use stream_types::StreamError;
 
 pub const STREAM_BUFFER_BYTES: usize = 64 * 1024;
 
@@ -466,11 +466,11 @@ impl<T: Send + 'static> frontend_stream::HostWithStore<T>
 {
     fn connect(
         mut access: Access<'_, T, Self>,
-        connection: Connection,
+        generation: u64,
         mut input: StreamReader<u8>,
     ) -> wasmtime::Result<Result<StreamReader<u8>, StreamError>> {
         let endpoint = &mut access.get().agent;
-        if let Err(error) = endpoint.connect(connection.generation) {
+        if let Err(error) = endpoint.connect(generation) {
             input.close(&mut access)?;
             return Ok(Err(error));
         }
@@ -479,14 +479,14 @@ impl<T: Send + 'static> frontend_stream::HostWithStore<T>
             &mut access,
             PipeOutput {
                 endpoint: endpoint.clone(),
-                generation: connection.generation,
+                generation,
             },
         )?;
         StreamReader::new(
             &mut access,
             PipeInput {
                 endpoint,
-                generation: connection.generation,
+                generation,
             },
         )
         .map(Ok)
@@ -548,7 +548,7 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(2), store.run_concurrent(async |accessor| {
             let mut output = accessor.with(|access| {
                 <wasmtime::component::HasSelf<FrontendStreams> as frontend_stream::HostWithStore<FrontendStreams>>::connect(
-                    access, Connection { generation: 1 }, input,
+                    access, 1, input,
                 )
             }).unwrap().unwrap();
             let mut received = Vec::new();

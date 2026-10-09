@@ -266,10 +266,6 @@ pub async fn run() -> Result<(), DeviceError> {
     Ok(())
 }
 
-pub fn interrupt_level() -> bool {
-    state(|state| Ok(state.mmio.interrupt_status() & INT_USED_BUFFER != 0)).unwrap_or(false)
-}
-
 pub fn reset() {
     if !QUEUES.is_closed() {
         let _ = configure();

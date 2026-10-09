@@ -18,7 +18,6 @@ use terra::vmm::platform;
 enum Error {
     InvalidVcpu,
     BadArmExit,
-    Mmio(terra::mmio::types::Error),
     Platform(platform::Error),
 }
 const PSCI_CPU_OFF: u64 = 0x8400_0002;
@@ -142,19 +141,8 @@ fn psci_start_result_for(
     Ok(platform::Completion::HvcReturn(result.status))
 }
 
-async fn vcpu_access(address: u64, width: u8, value: u64, write: bool) -> Result<u64, Error> {
-    use terra::mmio::types::Error as MmioError;
-    match terra::vmm::vmm_mmio_client::access(address, width, value, write).await {
-        Ok(value) => Ok(value),
-        Err(MmioError::Unmapped | MmioError::BadWidth | MmioError::Overflow) => Ok(0),
-        Err(
-            error @ (MmioError::InvalidSlot
-            | MmioError::Overlap
-            | MmioError::Busy
-            | MmioError::Closed
-            | MmioError::Device),
-        ) => Err(Error::Mmio(error)),
-    }
+async fn vcpu_access(address: u64, width: u8, value: u64, write: bool) -> u64 {
+    terra::vmm::vmm_mmio_client::access(address, width, value, write).await
 }
 
 #[derive(Clone, Copy)]
@@ -187,7 +175,7 @@ async fn handle_arm_exception(
     } else {
         0
     };
-    let value = vcpu_access(request.address, fields.width, value, fields.write).await?;
+    let value = vcpu_access(request.address, fields.width, value, fields.write).await;
     let read = if fields.write || fields.register == 31 {
         NO_ARM_READ
     } else {
@@ -216,10 +204,10 @@ async fn run_vcpu(cpu: platform::Vcpu, id: u8) -> Result<(), Error> {
             }
             platform::Exit::Shutdown | platform::Exit::Stopped => return Ok(()),
             platform::Exit::MmioRead(request) => platform::Completion::MmioRead(
-                vcpu_access(request.address, request.width, 0, false).await?,
+                vcpu_access(request.address, request.width, 0, false).await,
             ),
             platform::Exit::MmioWrite(request) => {
-                vcpu_access(request.address, request.width, request.value, true).await?;
+                vcpu_access(request.address, request.width, request.value, true).await;
                 platform::Completion::Reenter
             }
             platform::Exit::PioRead(_) => platform::Completion::PioZero,
@@ -236,7 +224,6 @@ async fn run_vcpu(cpu: platform::Vcpu, id: u8) -> Result<(), Error> {
             platform::Exit::ArmException(request) => {
                 match handle_arm_exception(id, request).await {
                     Ok(completion) => completion,
-                    Err(Error::Mmio(terra::mmio::types::Error::Closed)) => return Ok(()),
                     Err(Error::BadArmExit) => platform::Completion::ArmRead(NO_ARM_READ),
                     Err(error) => return Err(error),
                 }

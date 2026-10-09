@@ -34,7 +34,7 @@ fuzz_target!(|bytes: &[u8]| {
     let selector = bytes.first().copied().unwrap_or(0);
     terra_vsock_frontend_component::fuzz_tx_descriptors(bytes, 0, 16);
     terra_vsock_frontend_component::fuzz_tx_descriptors(bytes, u16::from(selector), 256);
-    if let Ok((header, _)) = VsockHeader::parse(bytes) {
+    if let Some((header, _)) = VsockHeader::parse(bytes) {
         assert_eq!(header.encode().as_slice(), &bytes[..VSOCK_HEADER_BYTES]);
     }
     let mut switch = VsockSwitch::with_network(bytes.last().is_none_or(|byte| byte & 1 == 0));
@@ -43,7 +43,7 @@ fuzz_target!(|bytes: &[u8]| {
     }
     let _ = switch.connect_publication(PUBLICATION_HOST_PORTS.start);
     for chunk in bytes.chunks(128) {
-        if let Ok((header, payload)) = VsockHeader::parse(chunk) {
+        if let Some((header, payload)) = VsockHeader::parse(chunk) {
             switch.rx(&header, payload);
         }
         let selector = chunk.first().copied().unwrap_or(0);

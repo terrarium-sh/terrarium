@@ -2,7 +2,7 @@ package terra:mmio@0.1.0;
 
 interface types {
     enum device-error { unmapped, bad-len, bad-queue, not-ready, too-large, io }
-    enum operation { read, write, reset, close, interrupt-level }
+    enum operation { read, write, reset, close }
 
     record request {
         sequence: u64,
@@ -16,19 +16,6 @@ interface types {
         sequence: u64,
         value: u64,
         error: option<device-error>,
-        interrupt: bool,
-    }
-
-
-    enum error {
-        invalid-slot,
-        overlap,
-        unmapped,
-        bad-width,
-        overflow,
-        busy,
-        closed,
-        device,
     }
 }
 

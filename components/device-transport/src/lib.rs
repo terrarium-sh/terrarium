@@ -282,7 +282,7 @@ macro_rules! guest_memory {
 #[allow(clippy::crate_in_macro_def)]
 #[macro_export]
 macro_rules! mmio_device {
-    ($error:ident, $read:path, $write:path, $reset:path, $close:path, $interrupt:path) => {
+    ($error:ident, $read:path, $write:path, $reset:path, $close:path) => {
         use crate::terra::mmio::types::{Operation, Reply, Request};
 
         async fn handle(request: Request) -> (Reply, bool) {
@@ -297,7 +297,6 @@ macro_rules! mmio_device {
                     Ok(0)
                 }
                 Operation::Close => $close().await.map(|_| 0),
-                Operation::InterruptLevel => Ok(u64::from($interrupt())),
             };
             let (value, error) = match result {
                 Ok(value) => (value, None),
@@ -308,7 +307,6 @@ macro_rules! mmio_device {
                     sequence: request.sequence,
                     value,
                     error,
-                    interrupt: $interrupt(),
                 },
                 terminal,
             )

@@ -11,8 +11,8 @@ stores the links, not copies of their contents. Edit the shared definition;
 there is no mirror-generation step. Each component world still explicitly
 selects its imports and exports: sharing a package does not grant its interfaces.
 
-`terra:mmio/device.serve` carries device reads, writes, reset, close and interrupt
-queries. Device interfaces retain configuration and device-specific operations;
+`terra:mmio/device.serve` carries device reads, writes, reset and close.
+Device interfaces retain configuration and device-specific operations;
 they share `terra:mmio/types.device-error` instead of defining their own copies.
 
 ## Capability boundary

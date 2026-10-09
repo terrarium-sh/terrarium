@@ -1,9 +1,8 @@
 package terra:vmm@0.1.0;
 
 interface vmm-mmio-client {
-    use terra:mmio/types@0.1.0.{error};
-
-    access: async func(address: u64, width: u8, value: u64, write: bool) -> result<u64, error>;
+    /// Unmapped or invalid accesses read as zero and drop writes; router failures trap.
+    access: async func(address: u64, width: u8, value: u64, write: bool) -> u64;
 }
 
 interface platform {

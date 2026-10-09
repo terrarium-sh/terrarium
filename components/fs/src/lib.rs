@@ -16,8 +16,7 @@ mod mmio {
         transport::mmio_read,
         transport::mmio_write,
         transport::reset,
-        transport::close,
-        transport::interrupt_level
+        transport::close
     );
 }
 mod transport;

@@ -285,11 +285,31 @@ impl StreamConnection {
             OP_REQUEST => self.on_request(header),
             OP_RESPONSE => self.on_response(header),
             OP_RST => self.on_rst(),
-            OP_SHUTDOWN => self.on_shutdown(header),
-            OP_RW => self.on_data(header, data),
-            OP_CREDIT_UPDATE => self.on_credit(header),
-            OP_CREDIT_REQUEST => self.on_credit_request(header),
+            OP_SHUTDOWN | OP_RW | OP_CREDIT_UPDATE | OP_CREDIT_REQUEST => {
+                self.on_connected(header, data);
+            }
             _ => self.reject_packet(header),
+        }
+    }
+
+    /// Handles a packet that needs an established connection; each one carries the peer's credit.
+    fn on_connected(&mut self, header: &VsockHeader, data: &[u8]) {
+        let Some(connection) = self.connection else {
+            self.rst(header.src_port, header.dst_port);
+            return;
+        };
+        if header.op == OP_RW && connection.rx_shutdown {
+            self.reject_packet(header);
+            return;
+        }
+        if !self.note_peer_credit(header) {
+            return;
+        }
+        match header.op {
+            OP_SHUTDOWN => self.on_shutdown(header.flags),
+            OP_RW => self.on_data(header, data),
+            OP_CREDIT_REQUEST => self.on_credit_request(),
+            _ => {}
         }
     }
 
@@ -339,45 +359,22 @@ impl StreamConnection {
         }
     }
 
-    fn on_shutdown(&mut self, header: &VsockHeader) {
-        if self.connection.is_none() {
-            self.rst(header.src_port, header.dst_port);
-            return;
-        }
-        if !self.note_peer_credit(header) {
-            return;
-        }
-        let Some(mut connection) = self.connection else {
-            self.rst(header.src_port, header.dst_port);
+    fn on_shutdown(&mut self, flags: u32) {
+        let Some(connection) = self.connection.as_mut() else {
             return;
         };
-        if header.flags & FLAG_SHUTDOWN_RCV != 0 {
+        if flags & FLAG_SHUTDOWN_RCV != 0 {
             connection.tx_shutdown = true;
             connection.peer_receive_closed = true;
             self.replies.retain(|reply| reply.header.op != OP_RW);
             self.reply_bytes = 0;
         }
-        if header.flags & FLAG_SHUTDOWN_SEND != 0 {
+        if flags & FLAG_SHUTDOWN_SEND != 0 {
             connection.rx_shutdown = true;
         }
-        self.connection = Some(connection);
     }
 
     fn on_data(&mut self, header: &VsockHeader, data: &[u8]) {
-        if self.connection.is_none() {
-            self.rst(header.src_port, header.dst_port);
-            return;
-        }
-        if self
-            .connection
-            .is_none_or(|connection| connection.rx_shutdown)
-        {
-            self.reject_packet(header);
-            return;
-        }
-        if !self.note_peer_credit(header) {
-            return;
-        }
         let Some(connection) = self.connection else {
             return;
         };
@@ -395,22 +392,7 @@ impl StreamConnection {
         self.upstream.extend(data.iter().copied());
     }
 
-    fn on_credit(&mut self, header: &VsockHeader) {
-        if self.connection.is_none() {
-            self.rst(header.src_port, header.dst_port);
-            return;
-        }
-        self.note_peer_credit(header);
-    }
-
-    fn on_credit_request(&mut self, header: &VsockHeader) {
-        if self.connection.is_none() {
-            self.rst(header.src_port, header.dst_port);
-            return;
-        }
-        if !self.note_peer_credit(header) {
-            return;
-        }
+    fn on_credit_request(&mut self) {
         let Some(connection) = self.connection.as_mut() else {
             return;
         };
@@ -691,6 +673,8 @@ pub struct VsockSwitch {
 }
 
 const FIXED_ENDPOINTS: usize = 2;
+/// Agent, control, then every flow as one class.
+const REPLY_CLASSES: usize = FIXED_ENDPOINTS + 1;
 
 impl VsockSwitch {
     #[must_use]
@@ -914,6 +898,11 @@ impl VsockSwitch {
             .collect()
     }
 
+    fn connected_stream(&self, connection: ConnectionId) -> Option<&StreamConnection> {
+        self.connection_index(connection)
+            .map(|index| &self.endpoints[index].stream)
+    }
+
     fn stream_mut(
         &mut self,
         connection: ConnectionId,
@@ -998,27 +987,26 @@ impl VsockSwitch {
     #[must_use]
     #[cfg(test)]
     pub fn input_budget(&self, connection: ConnectionId) -> usize {
-        self.connection_index(connection)
-            .map_or(0, |index| self.endpoints[index].stream.rx_alloc as usize)
+        self.connected_stream(connection)
+            .map_or(0, |stream| stream.rx_alloc as usize)
     }
 
     #[must_use]
     pub fn output_budget(&self, connection: ConnectionId) -> usize {
-        self.connection_index(connection)
-            .map_or(0, |index| self.endpoints[index].stream.max_tx_bytes)
+        self.connected_stream(connection)
+            .map_or(0, |stream| stream.max_tx_bytes)
     }
 
     #[must_use]
     pub fn available_send_credit(&self, connection: ConnectionId) -> usize {
-        self.connection_index(connection).map_or(0, |index| {
-            self.endpoints[index].stream.available_send_credit()
-        })
+        self.connected_stream(connection)
+            .map_or(0, StreamConnection::available_send_credit)
     }
 
     #[must_use]
     pub fn send_capacity(&self, connection: ConnectionId) -> usize {
-        self.connection_index(connection)
-            .map_or(0, |index| self.endpoints[index].stream.send_capacity())
+        self.connected_stream(connection)
+            .map_or(0, StreamConnection::send_capacity)
     }
 
     /// Return true when a fresh credit request was queued.
@@ -1054,9 +1042,8 @@ impl VsockSwitch {
 
     #[must_use]
     pub fn guest_receive_closed(&self, connection: ConnectionId) -> bool {
-        self.connection_index(connection).is_some_and(|index| {
-            self.endpoints[index]
-                .stream
+        self.connected_stream(connection).is_some_and(|stream| {
+            stream
                 .connection
                 .is_some_and(|connection| connection.peer_receive_closed)
         })
@@ -1064,16 +1051,16 @@ impl VsockSwitch {
 
     #[must_use]
     pub fn guest_send_closed(&self, connection: ConnectionId) -> bool {
-        self.connection_index(connection)
-            .is_some_and(|index| self.endpoints[index].stream.guest_send_closed())
+        self.connected_stream(connection)
+            .is_some_and(StreamConnection::guest_send_closed)
     }
 
     #[must_use]
     pub fn peek_upstream(&self, connection: ConnectionId, max_bytes: usize) -> Vec<u8> {
-        let Some(index) = self.connection_index(connection) else {
+        let Some(stream) = self.connected_stream(connection) else {
             return Vec::new();
         };
-        let (first, second) = self.endpoints[index].stream.upstream.as_slices();
+        let (first, second) = stream.upstream.as_slices();
         let mut bytes = Vec::with_capacity(max_bytes.min(first.len() + second.len()));
         bytes.extend_from_slice(&first[..first.len().min(max_bytes)]);
         bytes.extend_from_slice(&second[..second.len().min(max_bytes.saturating_sub(first.len()))]);
@@ -1153,15 +1140,15 @@ impl VsockSwitch {
     }
 
     pub fn take_reply(&mut self, max_bytes: usize) -> Option<Reply> {
-        for offset in 0..3 {
-            let class = (self.next_reply + offset) % 3;
-            let reply = match class {
-                0 | 1 => self.take_reply_from(class, max_bytes),
-                2 => self.take_flow_reply(max_bytes),
-                _ => unreachable!(),
+        for offset in 0..REPLY_CLASSES {
+            let class = (self.next_reply + offset) % REPLY_CLASSES;
+            let reply = if class < FIXED_ENDPOINTS {
+                self.take_reply_from(class, max_bytes)
+            } else {
+                self.take_flow_reply(max_bytes)
             };
             if let Some(reply) = reply {
-                self.next_reply = (class + 1) % 3;
+                self.next_reply = (class + 1) % REPLY_CLASSES;
                 return Some(reply);
             }
         }
@@ -1235,7 +1222,7 @@ pub fn fuzz_rx_sequence(mut bytes: &[u8]) {
             .copied();
         match operation % 9 {
             0 => {
-                if let Ok((header, body)) = VsockHeader::parse(payload) {
+                if let Some((header, body)) = VsockHeader::parse(payload) {
                     switch.rx(&header, body);
                 }
             }

@@ -655,7 +655,7 @@ fn agent_and_frontend_exports_match_their_single_setup_flow() {
         (
             support::artifacts::wasm::VSOCK,
             "terra:vsock-frontend/api@0.1.0",
-            &[("close", true), ("configure-device", false), ("run", true)][..],
+            &[("configure-device", false), ("run", true)][..],
         ),
     ] {
         let component = Component::new(&engine, bytes).expect("component compiles");

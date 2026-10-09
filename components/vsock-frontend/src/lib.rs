@@ -14,8 +14,7 @@ use terra_vsock_device::VsockSwitch;
 
 mod agent;
 mod mmio {
-    use super::{Frontend, transport};
-    use crate::exports::terra::vsock_frontend::api::Guest;
+    use super::transport;
     use crate::terra::mmio::types::DeviceError;
 
     terra_device_transport::mmio_device!(
@@ -23,12 +22,11 @@ mod mmio {
         transport::mmio_read,
         transport::mmio_write,
         super::reset_device,
-        close,
-        transport::interrupt_level
+        close
     );
 
     async fn close() -> Result<(), DeviceError> {
-        Frontend::close().await;
+        super::close_device().await;
         Ok(())
     }
 }
@@ -92,14 +90,14 @@ impl exports::terra::vsock_frontend::api::Guest for Frontend {
     async fn run() -> Result<(), terra::mmio::types::DeviceError> {
         worker::run().await
     }
+}
 
-    async fn close() {
-        WORK.close();
-        network::close();
-        transport::close();
-        wake_worker();
-        worker::finish().await;
-    }
+async fn close_device() {
+    WORK.close();
+    network::close();
+    transport::close();
+    wake_worker();
+    worker::finish().await;
 }
 
 fn reset_device() {

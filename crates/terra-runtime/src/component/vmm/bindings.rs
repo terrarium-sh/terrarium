@@ -6,7 +6,6 @@ wasmtime::component::bindgen!({
     imports: { default: trappable },
     exports: { default: async },
     with: {
-        "terra:mmio/types@0.1.0": crate::component::mmio::bindings::canonical::types,
         "terra:vmm/platform.vcpu": crate::component::vmm::Vcpu,
         "terra:vmm/virtualization.vm": crate::component::vmm::virtualization::Vm,
     },

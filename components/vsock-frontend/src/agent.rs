@@ -1,6 +1,6 @@
 use crate::{network, switch, terra, wit_stream};
 use futures_util::future::try_join;
-use terra::vsock::{frontend_stream, stream_types};
+use terra::vsock::frontend_stream;
 use terra_vsock_device::{ConnectionId, Role};
 
 pub(crate) fn service(relay: &mut Option<network::Flow>) -> bool {
@@ -31,13 +31,7 @@ pub(crate) fn service(relay: &mut Option<network::Flow>) -> bool {
 
 async fn run(connection: ConnectionId) -> Result<(), ()> {
     let (input, host_input) = wit_stream::new();
-    let output = frontend_stream::connect(
-        stream_types::Connection {
-            generation: connection.generation,
-        },
-        host_input,
-    )
-    .map_err(|_| ())?;
+    let output = frontend_stream::connect(connection.generation, host_input).map_err(|_| ())?;
     try_join(
         network::pump_upstream(connection, input),
         network::pump_downstream(connection, output, None),

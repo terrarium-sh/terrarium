@@ -15,8 +15,7 @@ mod mmio {
         transport::mmio_read,
         transport::mmio_write,
         transport::reset,
-        close,
-        transport::interrupt_level
+        close
     );
 
     async fn close() -> Result<(), DeviceError> {

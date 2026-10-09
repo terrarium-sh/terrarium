@@ -371,7 +371,6 @@ mod tests {
                             sequence: 0,
                             value: 0,
                             error: None,
-                            interrupt: false,
                         },
                     })),
                     Some(false) => {

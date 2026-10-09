@@ -2,12 +2,11 @@ package terra:vsock@0.1.0;
 
 interface stream-types {
     enum stream-error { closed, stale, io }
-    record connection { generation: u64 }
 }
 
 interface frontend-stream {
-    use stream-types.{connection, stream-error};
-    connect: func(connection: connection, input: stream<u8>) -> result<stream<u8>, stream-error>;
+    use stream-types.{stream-error};
+    connect: func(generation: u64, input: stream<u8>) -> result<stream<u8>, stream-error>;
 }
 
 interface role-stream {

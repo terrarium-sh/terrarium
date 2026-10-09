@@ -117,11 +117,9 @@ fn router_failure(error: super::Error) -> QueueError {
         super::Error::Unmapped | super::Error::BadWidth | super::Error::Overflow => {
             QueueError::Router(error)
         }
-        super::Error::InvalidSlot
-        | super::Error::Overlap
-        | super::Error::Busy
-        | super::Error::Closed
-        | super::Error::Device => QueueError::Failure(super::router_error(error)),
+        super::Error::InvalidSlot | super::Error::Closed | super::Error::Device => {
+            QueueError::Failure(super::router_error(error))
+        }
     }
 }
 
@@ -380,7 +378,6 @@ mod tests {
                     sequence,
                     value: 0,
                     error: None,
-                    interrupt: false,
                 })
                 .await
                 .unwrap();
@@ -426,7 +423,6 @@ mod tests {
                 sequence: 7,
                 value: 0,
                 error: Some(super::super::DeviceError::BadLen),
-                interrupt: false,
             })
             .await
             .unwrap();
@@ -502,7 +498,6 @@ mod tests {
                     sequence: 7,
                     value: 0x42,
                     error: None,
-                    interrupt: true,
                 })
                 .await
                 .unwrap();
@@ -510,7 +505,6 @@ mod tests {
         };
         assert_eq!(routed.slot, 0);
         assert_eq!(routed.reply.value, 0x42);
-        assert!(routed.reply.interrupt);
         assert_eq!(
             devices.get().unwrap()[0]
                 .counts
@@ -770,7 +764,6 @@ mod tests {
                 sequence: 0,
                 value: 0,
                 error: None,
-                interrupt: false,
             },
         };
         let admission = Arc::new(Mutex::new(None));

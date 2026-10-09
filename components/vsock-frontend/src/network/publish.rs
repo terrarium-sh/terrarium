@@ -7,7 +7,7 @@ use super::{
 };
 use crate::terra::network::broker::{self, Listener, Tcp, Udp};
 use crate::terra::network::types::{PublishedPort, Transport};
-use crate::{switch, transport, wake_worker};
+use crate::{switch, transport};
 use futures_util::future::{AbortHandle, AbortRegistration, Abortable, poll_fn};
 use std::{
     sync::atomic::{AtomicU32, Ordering},
@@ -152,7 +152,6 @@ fn connect_publication() -> Option<ConnectionId> {
         match connected {
             Ok(connection) => {
                 transport::schedule_receive_queue();
-                wake_worker();
                 return Some(connection);
             }
             Err(VsockError::Busy) => {}

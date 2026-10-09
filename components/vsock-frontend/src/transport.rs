@@ -328,7 +328,7 @@ fn read_tx_packet(
         return Ok(None);
     };
     let header_bytes = read_memory(first.addr, u64::from(first.len))?;
-    let Ok((header, _)) = VsockHeader::parse(&header_bytes) else {
+    let Some((header, _)) = VsockHeader::parse(&header_bytes) else {
         return Ok(None);
     };
     let payload_len = header.len as usize;
@@ -634,10 +634,6 @@ pub fn process_pending(max_steps: usize) -> Result<bool, DeviceError> {
     })
 }
 
-pub fn interrupt_level() -> bool {
-    state(|state| Ok(state.mmio.interrupt_status() & INT_USED_BUFFER != 0)).unwrap_or(false)
-}
-
 pub fn has_pending_reply_for(connection: terra_vsock_device::ConnectionId) -> bool {
     state(|state| {
         Ok(state.pending_rx.as_ref().is_some_and(|reply| {
@@ -649,11 +645,13 @@ pub fn has_pending_reply_for(connection: terra_vsock_device::ConnectionId) -> bo
     .unwrap_or(false)
 }
 
+/// Marks the RX queue for service and wakes the worker to fill it.
 pub fn schedule_receive_queue() {
     let _ = state(|state| {
         state.pending[RX] = true;
         Ok(())
     });
+    super::wake_worker();
 }
 
 pub fn reset() {
