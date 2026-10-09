@@ -702,21 +702,11 @@ mod tests {
                 let sources = rule["provenance"]
                     .as_array()
                     .context("missing provenance")?;
-                assert!(!sources.is_empty());
+                assert_ne!(sources.as_slice(), [] as [serde_json::Value; 0]);
                 for source in sources {
                     if source["kind"] == "supplement" {
-                        assert!(
-                            !source["reason"]
-                                .as_str()
-                                .context("missing reason")?
-                                .is_empty()
-                        );
-                        assert!(
-                            !source["source"]
-                                .as_str()
-                                .context("missing source")?
-                                .is_empty()
-                        );
+                        assert_ne!(source["reason"].as_str().context("missing reason")?, "");
+                        assert_ne!(source["source"].as_str().context("missing source")?, "");
                     }
                 }
                 if name == "read" {

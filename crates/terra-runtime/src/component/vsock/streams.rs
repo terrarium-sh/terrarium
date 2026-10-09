@@ -635,7 +635,7 @@ mod tests {
         let (mut frontend, mut role) = StreamEndpoint::pair();
         frontend.connect(1).unwrap();
         role.wait().await;
-        assert!(role.try_read(1, 1).unwrap().is_empty());
+        assert_eq!(role.try_read(1, 1).unwrap(), [] as [u8; 0]);
         frontend.try_write(1, &[8]).unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(1), role.wait())
             .await

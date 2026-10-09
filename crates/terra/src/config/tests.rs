@@ -109,7 +109,7 @@ fn daemons_parse_and_default_empty() {
     let cfg: Config = yaml_serde::from_str("daemons: [ascend]\n").unwrap();
     assert_eq!(cfg.daemons, vec!["ascend"]);
     let none: Config = yaml_serde::from_str("{}").unwrap();
-    assert!(none.daemons.is_empty());
+    assert_eq!(none.daemons, Vec::<String>::new());
 }
 
 /// The recipe's own spellings, refused variants included.

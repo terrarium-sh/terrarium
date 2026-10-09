@@ -517,15 +517,13 @@ fn device_cli_context_has_no_host_data_or_terminal_streams() {
 
     let mut device = DeviceContext::new(4096).expect("device host");
     let mut cli = WasiCliView::cli(&mut device);
-    assert!(
-        EnvironmentHost::get_environment(&mut cli)
-            .expect("environment")
-            .is_empty()
+    assert_eq!(
+        EnvironmentHost::get_environment(&mut cli).expect("environment"),
+        [] as [(std::string::String, std::string::String); 0]
     );
-    assert!(
-        EnvironmentHost::get_arguments(&mut cli)
-            .expect("arguments")
-            .is_empty()
+    assert_eq!(
+        EnvironmentHost::get_arguments(&mut cli).expect("arguments"),
+        [] as [std::string::String; 0]
     );
     assert_eq!(
         EnvironmentHost::get_initial_cwd(&mut cli).expect("initial directory"),

@@ -138,12 +138,12 @@ async fn stale_generation_cannot_restart_agent_session() {
     let failure = agent.wait_for_failure().await;
     assert!(failure.contains("disconnected"), "{failure}");
     assert!(!agent.lifecycle.is_agent_ready());
-    assert!(
+    assert_eq!(
         agent
             .endpoint
             .try_read(old_generation + 1, 65536)
-            .expect("replacement read")
-            .is_empty()
+            .expect("replacement read"),
+        [] as [u8; 0]
     );
     agent.close_disconnected().await;
 }

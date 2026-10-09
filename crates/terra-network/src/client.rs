@@ -294,7 +294,6 @@ impl Client {
         })
     }
 
-    #[must_use]
     pub fn reserve_write_all(&self) -> BoxFuture<'static, Result<WriteAdmission, Error>> {
         let client = self.clone();
         Box::pin(async move {

@@ -918,7 +918,7 @@ fn ls_state_filters_succeed_with_no_matches() {
 
     let no_match = run_terra_in(project.path(), home.path(), &["ls", "--state", "running"]);
     assert!(no_match.status.success());
-    assert!(no_match.stdout.is_empty());
+    assert_eq!(no_match.stdout, [] as [u8; 0]);
     assert!(
         String::from_utf8_lossy(&no_match.stderr).contains("no boxes match the requested states")
     );

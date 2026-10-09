@@ -37,7 +37,7 @@ mod tests {
             let mut out = Vec::new();
             generate_completions(shell, &mut out).unwrap();
             let script = String::from_utf8(out).unwrap();
-            assert!(!script.is_empty());
+            assert_ne!(script, "");
             assert!(script.contains("terra"));
         }
     }

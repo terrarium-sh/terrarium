@@ -582,7 +582,10 @@ mod tests {
         let second = session.attach_client(&second).await.unwrap();
 
         assert_eq!(session.detach_all_clients().await.0, vec![first, second]);
-        assert!(session.list_clients().await.is_empty());
+        assert_eq!(
+            session.list_clients().await,
+            [] as [(u64, std::option::Option<(u16, u16)>); 0]
+        );
         assert_eq!(session.detach_client(99).await, DetachOutcome::Missing);
     }
 
@@ -594,7 +597,10 @@ mod tests {
         drop(reader);
 
         session.feed_output(b"x").await;
-        assert!(session.list_clients().await.is_empty());
+        assert_eq!(
+            session.list_clients().await,
+            [] as [(u64, std::option::Option<(u16, u16)>); 0]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -196,7 +196,10 @@ mod supported_host {
         let outcomes = running.join().expect("bounded native vCPU join");
         assert_eq!(outcomes.len(), usize::from(vcpus));
         assert!(outcomes.into_iter().all(|outcome| outcome.is_ok()));
-        assert!(running.join().expect("repeat native vCPU join").is_empty());
+        assert_eq!(
+            running.join().expect("repeat native vCPU join"),
+            [] as [std::result::Result<(), std::string::String>; 0]
+        );
         assert!(
             marker_was_written,
             "native vCPU did not execute marker loop"

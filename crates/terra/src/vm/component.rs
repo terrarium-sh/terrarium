@@ -554,6 +554,6 @@ mod tests {
         let plan = super::super::build_plan(&spec).unwrap().shares;
 
         assert!(grants.is_empty());
-        assert!(plan.is_empty());
+        assert_eq!(plan, Vec::<terra_protocol::Share>::new());
     }
 }

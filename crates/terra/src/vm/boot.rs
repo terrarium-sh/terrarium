@@ -811,7 +811,7 @@ mod tests {
 
         // A log that is not there replays as nothing, not as an error: the
         // caller is already reporting something of its own.
-        assert!(read_log_tail(&dir.path().join("absent.log")).is_empty());
+        assert_eq!(read_log_tail(&dir.path().join("absent.log")), "");
     }
 
     #[test]

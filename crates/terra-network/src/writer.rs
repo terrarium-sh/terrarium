@@ -154,7 +154,7 @@ mod tests {
                         .all(|count| *count <= MAX_WRITE_BATCH_FRAMES)
                 );
                 if !is_vectored {
-                    assert!(write.vectored_calls.is_empty());
+                    assert_eq!(write.vectored_calls, [] as [usize; 0]);
                 } else if max_write == usize::MAX {
                     assert_eq!(
                         write.vectored_calls,
@@ -209,7 +209,7 @@ mod tests {
                     .await
                     .unwrap_err();
                 assert_eq!(result.kind(), error.unwrap_or(io::ErrorKind::WriteZero));
-                assert!(write.bytes.is_empty());
+                assert_eq!(write.bytes, [] as [u8; 0]);
                 if is_vectored {
                     assert_eq!(write.vectored_calls, [MAX_WRITE_BATCH_FRAMES]);
                 }

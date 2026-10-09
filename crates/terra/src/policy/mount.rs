@@ -646,10 +646,9 @@ mod tests {
         let _home = crate::sys::TestHome::new();
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path();
-        assert!(
-            list_pinned_recipes_across_boxes(project)
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            list_pinned_recipes_across_boxes(project).unwrap(),
+            Vec::<(PathBuf, String)>::new()
         );
 
         for (name, text) in [("a", "hw:\n  cpus: 1\n"), ("b", "hw:\n  cpus: 2\n")] {
@@ -744,6 +743,6 @@ mod tests {
             guest: PathBuf::from("/work"),
             readonly: false,
         }];
-        assert!(find_sensitive_mounts(&mounts).is_empty());
+        assert_eq!(find_sensitive_mounts(&mounts), []);
     }
 }

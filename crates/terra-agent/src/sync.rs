@@ -1012,7 +1012,7 @@ mod tests {
             read_frame::<SyncReply>(&mut replies).unwrap(),
             Some(SyncReply::Success)
         );
-        assert!(replies.is_empty());
+        assert_eq!(replies, []);
         assert_eq!(std::fs::read(scratch.join("file")).unwrap(), b"old");
         std::fs::remove_dir_all(scratch).unwrap();
     }
@@ -1198,7 +1198,7 @@ mod tests {
                     (SyncEntryKind::Symlink, 0, Some("file"))
                 );
             } else {
-                assert!(children.is_empty());
+                assert_eq!(children, [] as [terra_protocol::SyncEntry; 0]);
             }
         }
         std::fs::remove_dir_all(scratch).unwrap();

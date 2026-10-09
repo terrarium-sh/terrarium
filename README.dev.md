@@ -17,8 +17,8 @@ Install the separate component toolchain and validator:
 
 ```sh
 git submodule update --init --recursive
-rustup toolchain install nightly-2026-09-28 --component rustfmt,clippy --target wasm32-unknown-unknown
-cargo install wasm-tools --version 1.259.0 --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
+rustup toolchain install nightly-2026-10-05 --component rustfmt,clippy --target wasm32-unknown-unknown
+cargo install wasm-tools --version 1.261.0 --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
 make dist
 ```
 
@@ -451,7 +451,7 @@ with mode `0600` and a persistent udev rule before VM and policy checks. A missi
 device still fails required VM gates; self-hosted runners must configure their
 own KVM permissions.
 
-After a native host build (and signing on macOS), install Zig 0.16.0 for the guest
+After a native host build (and signing on macOS), install Zig 0.17.0 for the guest
 probes. Use a short temporary directory with enough disk space (`TMPDIR` on Unix,
 `TEMP`/`TMP` on Windows); fixture control sockets must fit the local-socket path
 limit. Run the packaged gates:
@@ -480,8 +480,8 @@ Network policy coverage and boundary fuzzing use the existing tools:
 
 ```sh
 python3 scripts/checks/coverage-network-policy.py
-cargo +nightly-2026-09-28 fuzz run network_policy -- -max_total_time=60 -max_len=4096
-cargo +nightly-2026-09-28 fuzz run native_memory -- -max_total_time=60 -max_len=32768
+cargo +nightly-2026-10-05 fuzz run network_policy -- -max_total_time=60 -max_len=4096
+cargo +nightly-2026-10-05 fuzz run native_memory -- -max_total_time=60 -max_len=32768
 ```
 
 Coverage requires matching LLVM tools (`LLVM_COV` and `LLVM_PROFDATA` can override

@@ -10,11 +10,11 @@ KEEP_GOING ?= 0
 TEST_FLAGS := $(if $(filter 1,$(KEEP_GOING)),--no-fail-fast)
 CHECK_FAILURE = $(if $(filter 1,$(KEEP_GOING)),status=1,exit $$?)
 COMPONENT_TOOLCHAIN := $(shell sed -n 's/^channel = "\(.*\)"/\1/p' components/rust-toolchain.toml)
-WASM_TOOLS_VERSION := 1.259.0
+WASM_TOOLS_VERSION := 1.261.0
 CARGO_FUZZ_VERSION := 0.13.2
 CARGO_AUDIT_VERSION := 0.22.2
 WIT_BINDGEN_VERSION := 0.62.0
-ZIG_VERSION := 0.16.0
+ZIG_VERSION := 0.17.0
 # Host CPU, and therefore guest CPU: a box runs on the same hardware the host
 # does, so the kernel, rootfs, and agent are built for $(ARCH). Darwin's `uname
 # -m` calls it `arm64`; the guest naming (Linux kernel, Alpine) is `aarch64`.

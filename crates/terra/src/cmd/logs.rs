@@ -203,7 +203,7 @@ mod tests {
             String::from_utf8(output).unwrap(),
             "hello\\u{1b}]52;clipboard\\u{7}\\r\n€��"
         );
-        assert!(text.pending.is_empty());
+        assert_eq!(text.pending, Vec::<u8>::new());
     }
 
     /// A rotation is a new file under the same name (the appender repoints

@@ -602,503 +602,6 @@ impl StreamConnection {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{
-        CONTROL_VSOCK_PORT, FLOW_RX_ALLOC, GUEST_CID, HOST_CID, MAX_QUEUED_REPLIES,
-        OP_CREDIT_REQUEST, OP_CREDIT_UPDATE, OP_REQUEST, OP_RW, OP_SHUTDOWN,
-        PUBLICATION_HOST_PORTS, StreamConnection, TCP_VSOCK_PORT, TYPE_STREAM, UDP_VSOCK_PORT,
-        VsockError, VsockHeader, VsockSwitch, ack_ahead, unacked_bytes,
-    };
-
-    #[test]
-    fn credit_wrap_uses_modular_distance() {
-        assert!(!ack_ahead(0, 0));
-        assert!(ack_ahead(0, u32::MAX));
-        assert!(!ack_ahead(u32::MAX, 0));
-        assert_eq!(unacked_bytes(0, u32::MAX), 1);
-
-        let mut switch = VsockSwitch::new();
-        let request = VsockHeader {
-            src_cid: GUEST_CID,
-            dst_cid: HOST_CID,
-            src_port: 12345,
-            dst_port: TCP_VSOCK_PORT,
-            len: 0,
-            type_: TYPE_STREAM,
-            op: OP_REQUEST,
-            flags: 0,
-            buf_alloc: u32::MAX,
-            fwd_cnt: 0,
-        };
-        switch.rx(&request, &[]);
-        switch.take_replies();
-        let connection = switch.connection_for(12345, TCP_VSOCK_PORT).unwrap();
-        let index = switch.connection_index(connection).unwrap();
-        let stream = &mut switch.endpoints[index].stream;
-        stream.max_tx_bytes = 4;
-        let counters = stream.connection.as_mut().unwrap();
-        counters.tx_fwd_cnt = u32::MAX - 1;
-        counters.peer_fwd_cnt = u32::MAX - 1;
-        switch.deliver(connection, b"four".to_vec()).unwrap();
-        switch.take_replies();
-        assert_eq!(switch.available_send_credit(connection), 0);
-        let mut credit = VsockHeader {
-            op: super::OP_CREDIT_UPDATE,
-            fwd_cnt: 0,
-            ..request
-        };
-        switch.rx(&credit, &[]);
-        assert_eq!(switch.available_send_credit(connection), 2);
-        switch.deliver(connection, b"ab".to_vec()).unwrap();
-        switch.take_replies();
-        credit.fwd_cnt = u32::MAX;
-        switch.rx(&credit, &[]);
-        assert_eq!(switch.available_send_credit(connection), 0);
-        assert_eq!(
-            switch.deliver(connection, b"x".to_vec()),
-            Err(VsockError::Backpressure)
-        );
-    }
-
-    fn credit_test_stream(host_port: u32) -> (StreamConnection, VsockHeader) {
-        let mut stream = StreamConnection::new(12345, host_port, 8, 16);
-        let opening = VsockHeader {
-            src_cid: GUEST_CID,
-            dst_cid: HOST_CID,
-            src_port: 12345,
-            dst_port: host_port,
-            buf_alloc: 16,
-            op: OP_REQUEST,
-            ..StreamConnection::host_header(host_port, 12345)
-        };
-        stream.rx(&opening, &[]);
-        stream.take_replies_up_to(usize::MAX, usize::MAX);
-        (stream, opening)
-    }
-
-    #[test]
-    fn network_receive_credit_batches_without_delaying_explicit_requests() {
-        for host_port in [
-            CONTROL_VSOCK_PORT,
-            TCP_VSOCK_PORT,
-            UDP_VSOCK_PORT,
-            PUBLICATION_HOST_PORTS.start,
-        ] {
-            let (mut stream, opening) = credit_test_stream(host_port);
-            stream.rx(
-                &VsockHeader {
-                    op: OP_RW,
-                    len: 8,
-                    ..opening
-                },
-                b"abcdefgh",
-            );
-            stream.consume_upstream(0);
-            stream.consume_upstream(1);
-            assert!(stream.replies.is_empty());
-            stream.deliver(b"reply".to_vec()).unwrap();
-            assert_eq!(stream.connection.unwrap().rx_credit_update_fwd_cnt, 0);
-            stream.consume_upstream(2);
-            assert_eq!(stream.replies.len(), 1);
-            stream.rx(
-                &VsockHeader {
-                    op: OP_CREDIT_REQUEST,
-                    ..opening
-                },
-                &[],
-            );
-            let replies = stream.take_replies_up_to(usize::MAX, usize::MAX);
-            assert_eq!(
-                replies
-                    .iter()
-                    .map(|reply| reply.header.op)
-                    .collect::<Vec<_>>(),
-                [OP_RW, OP_CREDIT_UPDATE]
-            );
-            assert_eq!(
-                replies
-                    .iter()
-                    .map(|reply| reply.header.fwd_cnt)
-                    .collect::<Vec<_>>(),
-                [1, 3]
-            );
-            assert_eq!(stream.connection.unwrap().rx_credit_update_fwd_cnt, 3);
-            stream.consume_upstream(1);
-            assert_eq!(stream.replies[0].header.fwd_cnt, 4);
-            assert!(stream.connection.unwrap().is_receive_credit_requested);
-            stream.take_replies_up_to(usize::MAX, usize::MAX);
-            stream.consume_upstream(3);
-            assert_eq!(stream.replies.len(), 1);
-            assert_eq!(stream.replies[0].header.fwd_cnt, 7);
-            assert!(stream.connection.unwrap().is_receive_credit_requested);
-            stream.take_replies_up_to(usize::MAX, usize::MAX);
-            stream.consume_upstream(1);
-            assert_eq!(stream.replies.len(), 1);
-            assert_eq!(stream.replies[0].header.fwd_cnt, 8);
-            assert_eq!(stream.connection.unwrap().rx_credit_update_fwd_cnt, 8);
-            assert!(!stream.connection.unwrap().is_receive_credit_requested);
-        }
-    }
-
-    #[test]
-    fn early_credit_request_survives_partial_drains_and_counter_wrap() {
-        let (mut stream, opening) = credit_test_stream(UDP_VSOCK_PORT);
-        stream.rx(
-            &VsockHeader {
-                op: OP_RW,
-                len: 3,
-                ..opening
-            },
-            b"abc",
-        );
-        let start = u32::MAX - 1;
-        let connection = stream.connection.as_mut().unwrap();
-        connection.rx_received = start.wrapping_add(3);
-        connection.rx_fwd_cnt = start;
-        connection.rx_credit_update_fwd_cnt = start;
-        stream.rx(
-            &VsockHeader {
-                op: OP_CREDIT_REQUEST,
-                ..opening
-            },
-            &[],
-        );
-        assert_eq!(stream.replies[0].header.fwd_cnt, start);
-        stream.take_replies_up_to(usize::MAX, usize::MAX);
-        stream.consume_upstream(1);
-        assert_eq!(stream.replies[0].header.fwd_cnt, u32::MAX);
-        assert!(stream.connection.unwrap().is_receive_credit_requested);
-        stream.take_replies_up_to(usize::MAX, usize::MAX);
-        stream.consume_upstream(2);
-        assert_eq!(stream.replies[0].header.fwd_cnt, 1);
-        assert!(!stream.connection.unwrap().is_receive_credit_requested);
-        stream.take_replies_up_to(usize::MAX, usize::MAX);
-        stream.rx(
-            &VsockHeader {
-                op: OP_RW,
-                len: 1,
-                ..opening
-            },
-            b"d",
-        );
-        stream.consume_upstream(1);
-        assert!(stream.replies.is_empty());
-        stream.rx(
-            &VsockHeader {
-                op: OP_CREDIT_REQUEST,
-                ..opening
-            },
-            &[],
-        );
-        assert_eq!(stream.replies[0].header.fwd_cnt, 2);
-        assert!(!stream.connection.unwrap().is_receive_credit_requested);
-    }
-
-    #[test]
-    fn requested_credit_flush_failure_retires_demand_before_port_reuse() {
-        for consume_after_request in [false, true] {
-            let (mut stream, opening) = credit_test_stream(UDP_VSOCK_PORT);
-            stream.rx(
-                &VsockHeader {
-                    op: OP_RW,
-                    len: 3,
-                    ..opening
-                },
-                b"abc",
-            );
-            let request = VsockHeader {
-                op: OP_CREDIT_REQUEST,
-                ..opening
-            };
-            if consume_after_request {
-                stream.rx(&request, &[]);
-                stream.take_replies_up_to(usize::MAX, usize::MAX);
-            }
-            for _ in 0..MAX_QUEUED_REPLIES {
-                assert!(stream.rst(opening.src_port, opening.dst_port));
-            }
-            if consume_after_request {
-                stream.consume_upstream(1);
-            } else {
-                stream.rx(&request, &[]);
-            }
-            assert!(stream.connection.is_none());
-            assert!(stream.upstream.is_empty());
-            assert_eq!(stream.replies.len(), MAX_QUEUED_REPLIES);
-            stream.take_replies_up_to(usize::MAX, usize::MAX);
-            stream.rx(&opening, &[]);
-            assert!(!stream.connection.unwrap().is_receive_credit_requested);
-        }
-    }
-
-    /// A discarded data header cannot count as standalone credit already queued.
-    /// The next half-window update restores unidirectional progress without a request.
-    #[test]
-    fn discarded_piggyback_keeps_unidirectional_receive_credit_progress() {
-        let (mut stream, opening) = credit_test_stream(UDP_VSOCK_PORT);
-        stream.rx(
-            &VsockHeader {
-                op: OP_RW,
-                len: 8,
-                ..opening
-            },
-            b"abcdefgh",
-        );
-        stream.consume_upstream(3);
-        stream.deliver(b"reply".to_vec()).unwrap();
-        assert_eq!(stream.replies[0].header.fwd_cnt, 3);
-        stream.rx(
-            &VsockHeader {
-                op: OP_SHUTDOWN,
-                flags: 1,
-                ..opening
-            },
-            &[],
-        );
-        assert!(stream.replies.is_empty());
-        stream.consume_upstream(1);
-        assert_eq!(stream.replies[0].header.op, OP_CREDIT_UPDATE);
-        assert_eq!(stream.replies[0].header.fwd_cnt, 4);
-        stream.take_replies_up_to(usize::MAX, usize::MAX);
-        stream.rx(
-            &VsockHeader {
-                op: OP_RW,
-                len: 4,
-                ..opening
-            },
-            b"more",
-        );
-        assert_eq!(stream.upstream.len(), 8);
-        stream.consume_upstream(8);
-        assert_eq!(stream.replies[0].header.fwd_cnt, 12);
-        assert!(stream.connection.is_some());
-    }
-
-    #[test]
-    fn batched_receive_credit_wrap_preserves_fifo_order() {
-        let (mut stream, opening) = credit_test_stream(TCP_VSOCK_PORT);
-        stream.rx(
-            &VsockHeader {
-                op: OP_RW,
-                len: 8,
-                ..opening
-            },
-            b"abcdefgh",
-        );
-        let start = u32::MAX - 1;
-        let connection = stream.connection.as_mut().unwrap();
-        connection.rx_received = start.wrapping_add(8);
-        connection.rx_fwd_cnt = start;
-        connection.rx_credit_update_fwd_cnt = start;
-        stream.consume_upstream(4);
-        stream.deliver(b"reply".to_vec()).unwrap();
-        stream.consume_upstream(4);
-        let replies = stream.take_replies_up_to(usize::MAX, usize::MAX);
-        assert_eq!(
-            replies
-                .iter()
-                .map(|reply| reply.header.op)
-                .collect::<Vec<_>>(),
-            [OP_CREDIT_UPDATE, OP_RW, OP_CREDIT_UPDATE]
-        );
-        assert_eq!(
-            replies
-                .iter()
-                .map(|reply| reply.header.fwd_cnt)
-                .collect::<Vec<_>>(),
-            [2, 2, 6]
-        );
-        assert_eq!(stream.connection.unwrap().rx_credit_update_fwd_cnt, 6);
-    }
-
-    #[test]
-    fn smaller_peer_window_and_dynamic_shrink_flush_deferred_receive_credit() {
-        let (mut stream, opening) = credit_test_stream(UDP_VSOCK_PORT);
-        stream.rx(
-            &VsockHeader {
-                op: OP_RW,
-                len: 3,
-                ..opening
-            },
-            b"abc",
-        );
-        stream.consume_upstream(3);
-        assert!(stream.upstream.is_empty());
-        assert!(stream.replies.is_empty());
-        stream.rx(
-            &VsockHeader {
-                op: OP_CREDIT_UPDATE,
-                buf_alloc: 2,
-                ..opening
-            },
-            &[],
-        );
-        assert_eq!(stream.replies.len(), 1);
-        assert_eq!(stream.replies[0].header.fwd_cnt, 3);
-        assert_eq!(stream.connection.unwrap().rx_credit_update_fwd_cnt, 3);
-        stream.take_replies_up_to(usize::MAX, usize::MAX);
-        stream.rx(
-            &VsockHeader {
-                op: OP_RW,
-                len: 2,
-                buf_alloc: 2,
-                ..opening
-            },
-            b"de",
-        );
-        stream.consume_upstream(1);
-        assert_eq!(stream.replies[0].header.fwd_cnt, 4);
-        assert_eq!(stream.connection.unwrap().peer_buf_alloc, 2);
-        assert_eq!(stream.upstream.len(), 1);
-    }
-
-    #[test]
-    fn failed_window_shrink_credit_flush_retires_the_connection() {
-        let (mut stream, opening) = credit_test_stream(TCP_VSOCK_PORT);
-        stream.rx(
-            &VsockHeader {
-                op: OP_RW,
-                len: 3,
-                ..opening
-            },
-            b"abc",
-        );
-        stream.consume_upstream(3);
-        for _ in 0..MAX_QUEUED_REPLIES {
-            assert!(stream.rst(opening.src_port, opening.dst_port));
-        }
-        stream.rx(
-            &VsockHeader {
-                op: OP_CREDIT_UPDATE,
-                buf_alloc: 2,
-                ..opening
-            },
-            &[],
-        );
-        assert!(stream.connection.is_none());
-        assert!(stream.upstream.is_empty());
-        assert_eq!(stream.replies.len(), MAX_QUEUED_REPLIES);
-    }
-
-    #[test]
-    fn failed_credit_queue_and_empty_delivery_do_not_advance_advertised_credit() {
-        let (mut stream, opening) = credit_test_stream(TCP_VSOCK_PORT);
-        stream.rx(
-            &VsockHeader {
-                op: OP_RW,
-                len: 8,
-                ..opening
-            },
-            b"abcdefgh",
-        );
-        stream.consume_upstream(3);
-        stream.deliver(b"".to_vec()).unwrap();
-        assert!(stream.replies.is_empty());
-        for _ in 0..MAX_QUEUED_REPLIES {
-            assert!(stream.rst(opening.src_port, opening.dst_port));
-        }
-        let snapshot = stream.connection.unwrap();
-        assert!(!stream.respond(&snapshot, OP_CREDIT_UPDATE, 0));
-        assert_eq!(stream.connection.unwrap().rx_credit_update_fwd_cnt, 0);
-        stream.consume_upstream(1);
-        assert!(stream.connection.is_none());
-        assert!(stream.upstream.is_empty());
-        assert_eq!(stream.replies.len(), MAX_QUEUED_REPLIES);
-    }
-
-    #[test]
-    fn upstream_byte_fifo_preserves_fragment_order_capacity_and_overflow_isolation() {
-        let mut switch = VsockSwitch::new();
-        let request = VsockHeader {
-            src_cid: GUEST_CID,
-            dst_cid: HOST_CID,
-            src_port: 12345,
-            dst_port: TCP_VSOCK_PORT,
-            len: 0,
-            type_: TYPE_STREAM,
-            op: OP_REQUEST,
-            flags: 0,
-            buf_alloc: FLOW_RX_ALLOC,
-            fwd_cnt: 0,
-        };
-        let other = VsockHeader {
-            src_port: 12346,
-            ..request
-        };
-        switch.rx(&request, &[]);
-        switch.rx(&other, &[]);
-        let connection = switch
-            .connection_for(request.src_port, request.dst_port)
-            .unwrap();
-        let unaffected = switch
-            .connection_for(other.src_port, other.dst_port)
-            .unwrap();
-        let index = switch.connection_index(connection).unwrap();
-        let capacity = switch.endpoints[index].stream.upstream.capacity();
-        assert_eq!(capacity, FLOW_RX_ALLOC as usize);
-        switch.take_replies();
-        switch.consume_upstream(connection, 0).unwrap();
-        switch.consume_upstream(connection, usize::MAX).unwrap();
-        assert_eq!(switch.take_replies(), []);
-        switch.rx(
-            &VsockHeader {
-                op: OP_RW,
-                len: 5,
-                ..other
-            },
-            b"other",
-        );
-        let data = VsockHeader {
-            op: OP_RW,
-            len: FLOW_RX_ALLOC - 129,
-            ..request
-        };
-        switch.rx(&data, &vec![b'a'; capacity - 129]);
-        let tiny = VsockHeader { len: 1, ..data };
-        for byte in 0_u8..=128 {
-            switch.rx(&tiny, &[byte]);
-        }
-        assert_eq!(switch.endpoints[index].stream.upstream.len(), capacity);
-        assert_eq!(switch.endpoints[index].stream.upstream.capacity(), capacity);
-        let consumed = capacity - 64;
-        switch.consume_upstream(connection, consumed).unwrap();
-        assert_eq!(switch.take_replies()[0].header.fwd_cnt, FLOW_RX_ALLOC - 64);
-        switch.rx(
-            &VsockHeader {
-                len: FLOW_RX_ALLOC - 64,
-                ..data
-            },
-            &vec![b'z'; consumed],
-        );
-        assert_ne!(switch.endpoints[index].stream.upstream.as_slices().1, b"");
-        assert_eq!(switch.endpoints[index].stream.upstream.capacity(), capacity);
-        assert_eq!(
-            switch.peek_upstream(connection, usize::MAX),
-            (65_u8..=128)
-                .chain(std::iter::repeat_n(b'z', consumed))
-                .collect::<Vec<_>>()
-        );
-        switch.rx(&tiny, b"x");
-        assert!(
-            switch
-                .connection_for(request.src_port, request.dst_port)
-                .is_none()
-        );
-        assert_eq!(
-            switch.consume_upstream(connection, 1),
-            Err(VsockError::UnknownConnection)
-        );
-        assert!(switch.endpoints[index].stream.upstream.is_empty());
-        assert_eq!(switch.endpoints[index].stream.upstream.capacity(), capacity);
-        assert_eq!(
-            switch.connection_for(other.src_port, other.dst_port),
-            Some(unaffected)
-        );
-        assert_eq!(switch.peek_upstream(unaffected, usize::MAX), b"other");
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Role {
     Agent,
@@ -1798,5 +1301,502 @@ pub fn fuzz_rx_sequence(mut bytes: &[u8]) {
             }
         }
         assert!(switch.rejected.len() <= 32);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CONTROL_VSOCK_PORT, FLOW_RX_ALLOC, GUEST_CID, HOST_CID, MAX_QUEUED_REPLIES,
+        OP_CREDIT_REQUEST, OP_CREDIT_UPDATE, OP_REQUEST, OP_RW, OP_SHUTDOWN,
+        PUBLICATION_HOST_PORTS, StreamConnection, TCP_VSOCK_PORT, TYPE_STREAM, UDP_VSOCK_PORT,
+        VsockError, VsockHeader, VsockSwitch, ack_ahead, unacked_bytes,
+    };
+
+    #[test]
+    fn credit_wrap_uses_modular_distance() {
+        assert!(!ack_ahead(0, 0));
+        assert!(ack_ahead(0, u32::MAX));
+        assert!(!ack_ahead(u32::MAX, 0));
+        assert_eq!(unacked_bytes(0, u32::MAX), 1);
+
+        let mut switch = VsockSwitch::new();
+        let request = VsockHeader {
+            src_cid: GUEST_CID,
+            dst_cid: HOST_CID,
+            src_port: 12345,
+            dst_port: TCP_VSOCK_PORT,
+            len: 0,
+            type_: TYPE_STREAM,
+            op: OP_REQUEST,
+            flags: 0,
+            buf_alloc: u32::MAX,
+            fwd_cnt: 0,
+        };
+        switch.rx(&request, &[]);
+        switch.take_replies();
+        let connection = switch.connection_for(12345, TCP_VSOCK_PORT).unwrap();
+        let index = switch.connection_index(connection).unwrap();
+        let stream = &mut switch.endpoints[index].stream;
+        stream.max_tx_bytes = 4;
+        let counters = stream.connection.as_mut().unwrap();
+        counters.tx_fwd_cnt = u32::MAX - 1;
+        counters.peer_fwd_cnt = u32::MAX - 1;
+        switch.deliver(connection, b"four".to_vec()).unwrap();
+        switch.take_replies();
+        assert_eq!(switch.available_send_credit(connection), 0);
+        let mut credit = VsockHeader {
+            op: super::OP_CREDIT_UPDATE,
+            fwd_cnt: 0,
+            ..request
+        };
+        switch.rx(&credit, &[]);
+        assert_eq!(switch.available_send_credit(connection), 2);
+        switch.deliver(connection, b"ab".to_vec()).unwrap();
+        switch.take_replies();
+        credit.fwd_cnt = u32::MAX;
+        switch.rx(&credit, &[]);
+        assert_eq!(switch.available_send_credit(connection), 0);
+        assert_eq!(
+            switch.deliver(connection, b"x".to_vec()),
+            Err(VsockError::Backpressure)
+        );
+    }
+
+    fn credit_test_stream(host_port: u32) -> (StreamConnection, VsockHeader) {
+        let mut stream = StreamConnection::new(12345, host_port, 8, 16);
+        let opening = VsockHeader {
+            src_cid: GUEST_CID,
+            dst_cid: HOST_CID,
+            src_port: 12345,
+            dst_port: host_port,
+            buf_alloc: 16,
+            op: OP_REQUEST,
+            ..StreamConnection::host_header(host_port, 12345)
+        };
+        stream.rx(&opening, &[]);
+        stream.take_replies_up_to(usize::MAX, usize::MAX);
+        (stream, opening)
+    }
+
+    #[test]
+    fn network_receive_credit_batches_without_delaying_explicit_requests() {
+        for host_port in [
+            CONTROL_VSOCK_PORT,
+            TCP_VSOCK_PORT,
+            UDP_VSOCK_PORT,
+            PUBLICATION_HOST_PORTS.start,
+        ] {
+            let (mut stream, opening) = credit_test_stream(host_port);
+            stream.rx(
+                &VsockHeader {
+                    op: OP_RW,
+                    len: 8,
+                    ..opening
+                },
+                b"abcdefgh",
+            );
+            stream.consume_upstream(0);
+            stream.consume_upstream(1);
+            assert!(stream.replies.is_empty());
+            stream.deliver(b"reply".to_vec()).unwrap();
+            assert_eq!(stream.connection.unwrap().rx_credit_update_fwd_cnt, 0);
+            stream.consume_upstream(2);
+            assert_eq!(stream.replies.len(), 1);
+            stream.rx(
+                &VsockHeader {
+                    op: OP_CREDIT_REQUEST,
+                    ..opening
+                },
+                &[],
+            );
+            let replies = stream.take_replies_up_to(usize::MAX, usize::MAX);
+            assert_eq!(
+                replies
+                    .iter()
+                    .map(|reply| reply.header.op)
+                    .collect::<Vec<_>>(),
+                [OP_RW, OP_CREDIT_UPDATE]
+            );
+            assert_eq!(
+                replies
+                    .iter()
+                    .map(|reply| reply.header.fwd_cnt)
+                    .collect::<Vec<_>>(),
+                [1, 3]
+            );
+            assert_eq!(stream.connection.unwrap().rx_credit_update_fwd_cnt, 3);
+            stream.consume_upstream(1);
+            assert_eq!(stream.replies[0].header.fwd_cnt, 4);
+            assert!(stream.connection.unwrap().is_receive_credit_requested);
+            stream.take_replies_up_to(usize::MAX, usize::MAX);
+            stream.consume_upstream(3);
+            assert_eq!(stream.replies.len(), 1);
+            assert_eq!(stream.replies[0].header.fwd_cnt, 7);
+            assert!(stream.connection.unwrap().is_receive_credit_requested);
+            stream.take_replies_up_to(usize::MAX, usize::MAX);
+            stream.consume_upstream(1);
+            assert_eq!(stream.replies.len(), 1);
+            assert_eq!(stream.replies[0].header.fwd_cnt, 8);
+            assert_eq!(stream.connection.unwrap().rx_credit_update_fwd_cnt, 8);
+            assert!(!stream.connection.unwrap().is_receive_credit_requested);
+        }
+    }
+
+    #[test]
+    fn early_credit_request_survives_partial_drains_and_counter_wrap() {
+        let (mut stream, opening) = credit_test_stream(UDP_VSOCK_PORT);
+        stream.rx(
+            &VsockHeader {
+                op: OP_RW,
+                len: 3,
+                ..opening
+            },
+            b"abc",
+        );
+        let start = u32::MAX - 1;
+        let connection = stream.connection.as_mut().unwrap();
+        connection.rx_received = start.wrapping_add(3);
+        connection.rx_fwd_cnt = start;
+        connection.rx_credit_update_fwd_cnt = start;
+        stream.rx(
+            &VsockHeader {
+                op: OP_CREDIT_REQUEST,
+                ..opening
+            },
+            &[],
+        );
+        assert_eq!(stream.replies[0].header.fwd_cnt, start);
+        stream.take_replies_up_to(usize::MAX, usize::MAX);
+        stream.consume_upstream(1);
+        assert_eq!(stream.replies[0].header.fwd_cnt, u32::MAX);
+        assert!(stream.connection.unwrap().is_receive_credit_requested);
+        stream.take_replies_up_to(usize::MAX, usize::MAX);
+        stream.consume_upstream(2);
+        assert_eq!(stream.replies[0].header.fwd_cnt, 1);
+        assert!(!stream.connection.unwrap().is_receive_credit_requested);
+        stream.take_replies_up_to(usize::MAX, usize::MAX);
+        stream.rx(
+            &VsockHeader {
+                op: OP_RW,
+                len: 1,
+                ..opening
+            },
+            b"d",
+        );
+        stream.consume_upstream(1);
+        assert!(stream.replies.is_empty());
+        stream.rx(
+            &VsockHeader {
+                op: OP_CREDIT_REQUEST,
+                ..opening
+            },
+            &[],
+        );
+        assert_eq!(stream.replies[0].header.fwd_cnt, 2);
+        assert!(!stream.connection.unwrap().is_receive_credit_requested);
+    }
+
+    #[test]
+    fn requested_credit_flush_failure_retires_demand_before_port_reuse() {
+        for consume_after_request in [false, true] {
+            let (mut stream, opening) = credit_test_stream(UDP_VSOCK_PORT);
+            stream.rx(
+                &VsockHeader {
+                    op: OP_RW,
+                    len: 3,
+                    ..opening
+                },
+                b"abc",
+            );
+            let request = VsockHeader {
+                op: OP_CREDIT_REQUEST,
+                ..opening
+            };
+            if consume_after_request {
+                stream.rx(&request, &[]);
+                stream.take_replies_up_to(usize::MAX, usize::MAX);
+            }
+            for _ in 0..MAX_QUEUED_REPLIES {
+                assert!(stream.rst(opening.src_port, opening.dst_port));
+            }
+            if consume_after_request {
+                stream.consume_upstream(1);
+            } else {
+                stream.rx(&request, &[]);
+            }
+            assert!(stream.connection.is_none());
+            assert!(stream.upstream.is_empty());
+            assert_eq!(stream.replies.len(), MAX_QUEUED_REPLIES);
+            stream.take_replies_up_to(usize::MAX, usize::MAX);
+            stream.rx(&opening, &[]);
+            assert!(!stream.connection.unwrap().is_receive_credit_requested);
+        }
+    }
+
+    /// A discarded data header cannot count as standalone credit already queued.
+    /// The next half-window update restores unidirectional progress without a request.
+    #[test]
+    fn discarded_piggyback_keeps_unidirectional_receive_credit_progress() {
+        let (mut stream, opening) = credit_test_stream(UDP_VSOCK_PORT);
+        stream.rx(
+            &VsockHeader {
+                op: OP_RW,
+                len: 8,
+                ..opening
+            },
+            b"abcdefgh",
+        );
+        stream.consume_upstream(3);
+        stream.deliver(b"reply".to_vec()).unwrap();
+        assert_eq!(stream.replies[0].header.fwd_cnt, 3);
+        stream.rx(
+            &VsockHeader {
+                op: OP_SHUTDOWN,
+                flags: 1,
+                ..opening
+            },
+            &[],
+        );
+        assert!(stream.replies.is_empty());
+        stream.consume_upstream(1);
+        assert_eq!(stream.replies[0].header.op, OP_CREDIT_UPDATE);
+        assert_eq!(stream.replies[0].header.fwd_cnt, 4);
+        stream.take_replies_up_to(usize::MAX, usize::MAX);
+        stream.rx(
+            &VsockHeader {
+                op: OP_RW,
+                len: 4,
+                ..opening
+            },
+            b"more",
+        );
+        assert_eq!(stream.upstream.len(), 8);
+        stream.consume_upstream(8);
+        assert_eq!(stream.replies[0].header.fwd_cnt, 12);
+        assert!(stream.connection.is_some());
+    }
+
+    #[test]
+    fn batched_receive_credit_wrap_preserves_fifo_order() {
+        let (mut stream, opening) = credit_test_stream(TCP_VSOCK_PORT);
+        stream.rx(
+            &VsockHeader {
+                op: OP_RW,
+                len: 8,
+                ..opening
+            },
+            b"abcdefgh",
+        );
+        let start = u32::MAX - 1;
+        let connection = stream.connection.as_mut().unwrap();
+        connection.rx_received = start.wrapping_add(8);
+        connection.rx_fwd_cnt = start;
+        connection.rx_credit_update_fwd_cnt = start;
+        stream.consume_upstream(4);
+        stream.deliver(b"reply".to_vec()).unwrap();
+        stream.consume_upstream(4);
+        let replies = stream.take_replies_up_to(usize::MAX, usize::MAX);
+        assert_eq!(
+            replies
+                .iter()
+                .map(|reply| reply.header.op)
+                .collect::<Vec<_>>(),
+            [OP_CREDIT_UPDATE, OP_RW, OP_CREDIT_UPDATE]
+        );
+        assert_eq!(
+            replies
+                .iter()
+                .map(|reply| reply.header.fwd_cnt)
+                .collect::<Vec<_>>(),
+            [2, 2, 6]
+        );
+        assert_eq!(stream.connection.unwrap().rx_credit_update_fwd_cnt, 6);
+    }
+
+    #[test]
+    fn smaller_peer_window_and_dynamic_shrink_flush_deferred_receive_credit() {
+        let (mut stream, opening) = credit_test_stream(UDP_VSOCK_PORT);
+        stream.rx(
+            &VsockHeader {
+                op: OP_RW,
+                len: 3,
+                ..opening
+            },
+            b"abc",
+        );
+        stream.consume_upstream(3);
+        assert!(stream.upstream.is_empty());
+        assert!(stream.replies.is_empty());
+        stream.rx(
+            &VsockHeader {
+                op: OP_CREDIT_UPDATE,
+                buf_alloc: 2,
+                ..opening
+            },
+            &[],
+        );
+        assert_eq!(stream.replies.len(), 1);
+        assert_eq!(stream.replies[0].header.fwd_cnt, 3);
+        assert_eq!(stream.connection.unwrap().rx_credit_update_fwd_cnt, 3);
+        stream.take_replies_up_to(usize::MAX, usize::MAX);
+        stream.rx(
+            &VsockHeader {
+                op: OP_RW,
+                len: 2,
+                buf_alloc: 2,
+                ..opening
+            },
+            b"de",
+        );
+        stream.consume_upstream(1);
+        assert_eq!(stream.replies[0].header.fwd_cnt, 4);
+        assert_eq!(stream.connection.unwrap().peer_buf_alloc, 2);
+        assert_eq!(stream.upstream.len(), 1);
+    }
+
+    #[test]
+    fn failed_window_shrink_credit_flush_retires_the_connection() {
+        let (mut stream, opening) = credit_test_stream(TCP_VSOCK_PORT);
+        stream.rx(
+            &VsockHeader {
+                op: OP_RW,
+                len: 3,
+                ..opening
+            },
+            b"abc",
+        );
+        stream.consume_upstream(3);
+        for _ in 0..MAX_QUEUED_REPLIES {
+            assert!(stream.rst(opening.src_port, opening.dst_port));
+        }
+        stream.rx(
+            &VsockHeader {
+                op: OP_CREDIT_UPDATE,
+                buf_alloc: 2,
+                ..opening
+            },
+            &[],
+        );
+        assert!(stream.connection.is_none());
+        assert!(stream.upstream.is_empty());
+        assert_eq!(stream.replies.len(), MAX_QUEUED_REPLIES);
+    }
+
+    #[test]
+    fn failed_credit_queue_and_empty_delivery_do_not_advance_advertised_credit() {
+        let (mut stream, opening) = credit_test_stream(TCP_VSOCK_PORT);
+        stream.rx(
+            &VsockHeader {
+                op: OP_RW,
+                len: 8,
+                ..opening
+            },
+            b"abcdefgh",
+        );
+        stream.consume_upstream(3);
+        stream.deliver(b"".to_vec()).unwrap();
+        assert!(stream.replies.is_empty());
+        for _ in 0..MAX_QUEUED_REPLIES {
+            assert!(stream.rst(opening.src_port, opening.dst_port));
+        }
+        let snapshot = stream.connection.unwrap();
+        assert!(!stream.respond(&snapshot, OP_CREDIT_UPDATE, 0));
+        assert_eq!(stream.connection.unwrap().rx_credit_update_fwd_cnt, 0);
+        stream.consume_upstream(1);
+        assert!(stream.connection.is_none());
+        assert!(stream.upstream.is_empty());
+        assert_eq!(stream.replies.len(), MAX_QUEUED_REPLIES);
+    }
+
+    #[test]
+    fn upstream_byte_fifo_preserves_fragment_order_capacity_and_overflow_isolation() {
+        let mut switch = VsockSwitch::new();
+        let request = VsockHeader {
+            src_cid: GUEST_CID,
+            dst_cid: HOST_CID,
+            src_port: 12345,
+            dst_port: TCP_VSOCK_PORT,
+            len: 0,
+            type_: TYPE_STREAM,
+            op: OP_REQUEST,
+            flags: 0,
+            buf_alloc: FLOW_RX_ALLOC,
+            fwd_cnt: 0,
+        };
+        let other = VsockHeader {
+            src_port: 12346,
+            ..request
+        };
+        switch.rx(&request, &[]);
+        switch.rx(&other, &[]);
+        let connection = switch
+            .connection_for(request.src_port, request.dst_port)
+            .unwrap();
+        let unaffected = switch
+            .connection_for(other.src_port, other.dst_port)
+            .unwrap();
+        let index = switch.connection_index(connection).unwrap();
+        let capacity = switch.endpoints[index].stream.upstream.capacity();
+        assert_eq!(capacity, FLOW_RX_ALLOC as usize);
+        switch.take_replies();
+        switch.consume_upstream(connection, 0).unwrap();
+        switch.consume_upstream(connection, usize::MAX).unwrap();
+        assert_eq!(switch.take_replies(), []);
+        switch.rx(
+            &VsockHeader {
+                op: OP_RW,
+                len: 5,
+                ..other
+            },
+            b"other",
+        );
+        let data = VsockHeader {
+            op: OP_RW,
+            len: FLOW_RX_ALLOC - 129,
+            ..request
+        };
+        switch.rx(&data, &vec![b'a'; capacity - 129]);
+        let tiny = VsockHeader { len: 1, ..data };
+        for byte in 0_u8..=128 {
+            switch.rx(&tiny, &[byte]);
+        }
+        assert_eq!(switch.endpoints[index].stream.upstream.len(), capacity);
+        assert_eq!(switch.endpoints[index].stream.upstream.capacity(), capacity);
+        let consumed = capacity - 64;
+        switch.consume_upstream(connection, consumed).unwrap();
+        assert_eq!(switch.take_replies()[0].header.fwd_cnt, FLOW_RX_ALLOC - 64);
+        switch.rx(
+            &VsockHeader {
+                len: FLOW_RX_ALLOC - 64,
+                ..data
+            },
+            &vec![b'z'; consumed],
+        );
+        assert_ne!(switch.endpoints[index].stream.upstream.as_slices().1, b"");
+        assert_eq!(switch.endpoints[index].stream.upstream.capacity(), capacity);
+        assert_eq!(
+            switch.peek_upstream(connection, usize::MAX),
+            (65_u8..=128)
+                .chain(std::iter::repeat_n(b'z', consumed))
+                .collect::<Vec<_>>()
+        );
+        switch.rx(&tiny, b"x");
+        assert!(
+            switch
+                .connection_for(request.src_port, request.dst_port)
+                .is_none()
+        );
+        assert_eq!(
+            switch.consume_upstream(connection, 1),
+            Err(VsockError::UnknownConnection)
+        );
+        assert!(switch.endpoints[index].stream.upstream.is_empty());
+        assert_eq!(switch.endpoints[index].stream.upstream.capacity(), capacity);
+        assert_eq!(
+            switch.connection_for(other.src_port, other.dst_port),
+            Some(unaffected)
+        );
+        assert_eq!(switch.peek_upstream(unaffected, usize::MAX), b"other");
     }
 }

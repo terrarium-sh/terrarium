@@ -119,7 +119,10 @@ fn assert_generated_policy(output: &Path, binary: &Path, vm_validated: bool) -> 
         assert!((8..=4096 * 8).contains(&bpf.len()) && bpf.len().is_multiple_of(8));
         assert_eq!(manifest["target"], policy["target"]);
         assert_eq!(policy["default_action"], "kill_process");
-        assert!(!policy["rules"].as_array().unwrap().is_empty());
+        assert_ne!(
+            policy["rules"].as_array().unwrap().as_slice(),
+            [] as [serde_json::Value; 0]
+        );
     }
     assert_eq!(
         std::fs::read_to_string(output.join(".validated"))
@@ -564,7 +567,7 @@ cat /policy-created >> /work/created
     let created = std::fs::read_to_string(project.join("created")).unwrap();
     let creations: Vec<_> = created.lines().collect();
     assert_eq!(creations.len(), 2);
-    assert!(!creations[0].is_empty());
+    assert_ne!(creations[0], "");
     assert_eq!(
         creations[0], creations[1],
         "on_create ran again between generation passes"

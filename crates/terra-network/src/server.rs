@@ -1844,7 +1844,7 @@ mod tests {
             assert!(write_shutdown_started.load(Ordering::SeqCst));
             let mut remaining = Vec::new();
             external.read_to_end(&mut remaining).await.unwrap();
-            assert!(remaining.is_empty());
+            assert_eq!(remaining, [] as [u8; 0]);
             for completion in futures_util::future::join_all(queued).await {
                 assert!(matches!(completion, Err(Error::InvalidState)));
             }

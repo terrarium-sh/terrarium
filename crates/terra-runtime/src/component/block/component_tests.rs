@@ -693,7 +693,7 @@ async fn component_aot_deserialize_runs() {
     let engine = device_engine().expect("engine builds");
     let artifact =
         precompile_component(&engine, crate::test_fixtures::wasm::BLOCK).expect("precompiles");
-    assert!(!artifact.is_empty());
+    assert_ne!(artifact, [] as [u8; 0]);
     // SAFETY: The artifact was produced from the trusted component above with the same engine.
     let component = unsafe { Component::deserialize(&engine, &artifact).expect("deserializes") };
     let mut fixture = fixture_with_disk(

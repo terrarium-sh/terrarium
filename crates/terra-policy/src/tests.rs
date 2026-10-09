@@ -1034,13 +1034,12 @@ fn native_limits_deny_unbounded_inputs_and_pin_monotonic_expiry() {
     })
     .unwrap();
     let address = "1.1.1.1".parse().unwrap();
-    assert!(
-        policy
-            .accept_resolved(
-                "api.test",
-                &vec![address; crate::MAX_RESOLVED_ADDRESSES + 1]
-            )
-            .is_empty()
+    assert_eq!(
+        policy.accept_resolved(
+            "api.test",
+            &vec![address; crate::MAX_RESOLVED_ADDRESSES + 1]
+        ),
+        [] as [std::net::IpAddr; 0]
     );
     assert!(!policy.allows(address, Some(443)));
     assert!(matches!(

@@ -98,11 +98,9 @@ async fn events_start_worker_and_close_keeps_transport_terminal() {
         subscription
             .close(&mut store)
             .expect("closed event subscription");
-        assert!(
-            frontend
-                .try_read(generation, 65536)
-                .expect("output")
-                .is_empty()
+        assert_eq!(
+            frontend.try_read(generation, 65536).expect("output"),
+            [] as [u8; 0]
         );
         frontend.disconnect(generation);
     }

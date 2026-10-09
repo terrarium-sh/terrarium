@@ -836,7 +836,7 @@ mod tests {
             BoxState::Gone,
         ] {
             let word = state.to_string();
-            assert!(!word.is_empty());
+            assert_ne!(word, "");
             assert!(
                 !word.chars().any(char::is_whitespace),
                 "{word:?} is not a single word"
@@ -922,7 +922,10 @@ mod tests {
     fn list_existing_names_from_disk() {
         let _home = TestHome::new();
         let dir = tempfile::tempdir().unwrap();
-        assert!(list_existing_names(dir.path()).unwrap().is_empty());
+        assert_eq!(
+            list_existing_names(dir.path()).unwrap(),
+            Vec::<String>::new()
+        );
     }
 
     #[test]

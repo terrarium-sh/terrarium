@@ -836,7 +836,7 @@ mod tests {
         .await;
         let output = String::from_utf8_lossy(&out);
         assert!(output.contains("yes") && output.contains("\r\n") && output.contains("ERR"));
-        assert!(err.is_empty());
+        assert_eq!(err, [] as [u8; 0]);
         assert_eq!(code, 3);
 
         let (out, _, code) = run_exec_request(&["cat"], true, b"payload\n", BTreeMap::new()).await;
@@ -858,7 +858,7 @@ mod tests {
         let (out, err, code) =
             run_exec_request(&["/no/such/command"], false, b"", BTreeMap::new()).await;
         assert_eq!(code, EXEC_NOT_RUN);
-        assert!(out.is_empty());
+        assert_eq!(out, [] as [u8; 0]);
         assert!(String::from_utf8_lossy(&err).contains("cannot run"));
 
         let (out, _, code) =

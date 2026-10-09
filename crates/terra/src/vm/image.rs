@@ -292,7 +292,7 @@ mod tests {
         let home = crate::sys::TestHome::new();
         let kernel = load_kernel().unwrap();
         let expected_size = u32::from_le_bytes(*KERNEL_GZ.last_chunk::<4>().unwrap());
-        assert!(!kernel.is_empty());
+        assert_ne!(kernel, Vec::<u8>::new());
         assert_eq!(kernel.len() as u64, u64::from(expected_size));
         assert_eq!(std::fs::read_dir(home.get_path()).unwrap().count(), 0);
     }
@@ -302,7 +302,7 @@ mod tests {
         let home = crate::sys::TestHome::new();
         let image = load_boot_image().unwrap();
         let expected_size = u32::from_le_bytes(*BOOT_IMG_GZ.last_chunk::<4>().unwrap());
-        assert!(!image.is_empty());
+        assert_ne!(image, Vec::<u8>::new());
         assert_eq!(image.len() as u64, u64::from(expected_size));
         assert_eq!(std::fs::read_dir(home.get_path()).unwrap().count(), 0);
     }
