@@ -8,15 +8,16 @@ use std::path::{Path, PathBuf};
 use windows_sys::Win32::Foundation::{WAIT_ABANDONED_0, WAIT_OBJECT_0};
 use windows_sys::Win32::Security::Authorization::{
     BuildTrusteeWithSidW, ConvertSidToStringSidW, DENY_ACCESS, EXPLICIT_ACCESS_W, GRANT_ACCESS,
-    GetSecurityInfo, SE_FILE_OBJECT, SetEntriesInAclW,
+    SetEntriesInAclW,
 };
 use windows_sys::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
     CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, DeleteAce, EqualSid, GetAce,
-    GetAclInformation, GetSecurityDescriptorControl, INHERITED_ACE, InitializeSecurityDescriptor,
-    OBJECT_INHERIT_ACE, SE_DACL_AUTO_INHERIT_REQ, SE_DACL_AUTO_INHERITED, SE_DACL_PROTECTED,
-    SECURITY_DESCRIPTOR, SetKernelObjectSecurity, SetSecurityDescriptorControl,
-    SetSecurityDescriptorDacl, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    GetAclInformation, GetKernelObjectSecurity, GetSecurityDescriptorControl,
+    GetSecurityDescriptorDacl, INHERITED_ACE, InitializeSecurityDescriptor, OBJECT_INHERIT_ACE,
+    SE_DACL_AUTO_INHERIT_REQ, SE_DACL_AUTO_INHERITED, SE_DACL_PROTECTED, SECURITY_DESCRIPTOR,
+    SetKernelObjectSecurity, SetSecurityDescriptorControl, SetSecurityDescriptorDacl, TOKEN_QUERY,
+    TOKEN_USER, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_APPEND_DATA, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD,
@@ -248,48 +249,73 @@ fn open_security_object(path: &Path) -> Result<File> {
     Ok(object)
 }
 
-fn read_acl(object: &File) -> Result<(*mut ACL, LocalAllocation)> {
-    let mut acl = std::ptr::null_mut();
-    let mut descriptor = std::ptr::null_mut();
-    // SAFETY: the handle is live and the initialized DACL is retained through the returned descriptor owner.
-    win_error(unsafe {
-        GetSecurityInfo(
+/// Reads the stored descriptor; `GetSecurityInfo` would report inheritance flags recomputed from the
+/// parent on objects without `SE_DACL_AUTO_INHERITED`, and `write_acl` would persist them.
+fn read_acl(object: &File) -> Result<(*mut ACL, Vec<u64>)> {
+    let mut length = 0;
+    // SAFETY: a zero-length query writes only the required length.
+    unsafe {
+        GetKernelObjectSecurity(
             object.as_raw_handle(),
-            SE_FILE_OBJECT,
             DACL_SECURITY_INFORMATION,
             std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &raw mut acl,
-            std::ptr::null_mut(),
-            &raw mut descriptor,
+            0,
+            &raw mut length,
+        );
+    }
+    ensure!(length > 0, "{}", std::io::Error::last_os_error());
+    let mut descriptor = vec![0_u64; usize::try_from(length)?.div_ceil(8)];
+    // SAFETY: descriptor is aligned and holds length bytes for the self-relative descriptor.
+    api::win_ok(unsafe {
+        GetKernelObjectSecurity(
+            object.as_raw_handle(),
+            DACL_SECURITY_INFORMATION,
+            descriptor.as_mut_ptr().cast(),
+            length,
+            &raw mut length,
         )
     })?;
-    let descriptor = LocalAllocation(descriptor);
+    let mut present = 0;
+    let mut defaulted = 0;
+    let mut acl = std::ptr::null_mut();
+    // SAFETY: descriptor holds a valid self-relative descriptor; acl points into its heap buffer.
+    api::win_ok(unsafe {
+        GetSecurityDescriptorDacl(
+            descriptor.as_mut_ptr().cast(),
+            &raw mut present,
+            &raw mut acl,
+            &raw mut defaulted,
+        )
+    })?;
     ensure!(
-        !acl.is_null(),
+        present != 0 && !acl.is_null(),
         "Windows sandbox filesystem grants require a non-null DACL"
     );
     Ok((acl, descriptor))
 }
 
-fn read_descriptor_control(descriptor: &LocalAllocation) -> Result<u16> {
+fn read_descriptor_control(descriptor: &[u64]) -> Result<u16> {
     let mut control = 0;
     let mut revision = 0;
-    // SAFETY: read_acl returns a live security descriptor owned by descriptor.
+    // SAFETY: read_acl returns a live self-relative security descriptor.
     api::win_ok(unsafe {
-        GetSecurityDescriptorControl(descriptor.0, &raw mut control, &raw mut revision)
+        GetSecurityDescriptorControl(
+            descriptor.as_ptr().cast_mut().cast(),
+            &raw mut control,
+            &raw mut revision,
+        )
     })?;
     Ok(control)
 }
 
-fn is_dacl_protected(descriptor: &LocalAllocation) -> Result<bool> {
+fn is_dacl_protected(descriptor: &[u64]) -> Result<bool> {
     Ok(read_descriptor_control(descriptor)? & SE_DACL_PROTECTED != 0)
 }
 
 fn write_acl(
     object: &File,
     acl: *mut ACL,
-    original_descriptor: &LocalAllocation,
+    original_descriptor: &[u64],
     dacl_protected: bool,
 ) -> Result<()> {
     let original_control = read_descriptor_control(original_descriptor)?;
