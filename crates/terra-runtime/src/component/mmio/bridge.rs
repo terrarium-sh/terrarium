@@ -522,6 +522,111 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    /// A vCPU thread reaches the device without the VMM component: routed accesses return the
+    /// device's value, unmapped ones read as zero without reaching any device, and a recorded
+    /// bridge failure is an error.
+    async fn vcpu_accesses_reach_the_device_directly_and_unmapped_ones_read_zero() {
+        use super::super::Client;
+        use futures_util::FutureExt;
+
+        let (context, channel, mut requests, mut replies) = native_device(1);
+        let admission = Arc::clone(&context.admission);
+        let devices = Arc::clone(&context.devices);
+        let (queue, receiver) = Queue::new();
+        let bridge = tokio::spawn(run_bridge(receiver, context, vec![Some(channel)]));
+        let client = Client {
+            sender: queue,
+            admission,
+            failure: Arc::new(Mutex::new(None)),
+            devices,
+        };
+        let unmapped = client.clone();
+        assert_eq!(
+            tokio::task::spawn_blocking(move || unmapped.access_from_vcpu(0x1200, 4, 0, false))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        assert!(requests.next().now_or_never().is_none());
+        let routed = client.clone();
+        let access =
+            tokio::task::spawn_blocking(move || routed.access_from_vcpu(0x1018, 4, 0xa5, true));
+        let request = requests.next().await.unwrap();
+        assert_eq!(
+            (request.operation, request.offset, request.value),
+            (Operation::Write, 0x18, 0xa5)
+        );
+        replies
+            .send(Reply {
+                sequence: request.sequence,
+                value: 0x42,
+                error: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(access.await.unwrap().unwrap(), 0x42);
+        *client.failure.lock().unwrap() = Some("device failed".to_owned());
+        assert_eq!(
+            client
+                .access_from_vcpu(0x1018, 4, 0, false)
+                .unwrap_err()
+                .to_string(),
+            "device failed"
+        );
+        drop(client);
+        assert!(bridge.await.unwrap().is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    /// Only a 4-byte write to a device's `QueueNotify` register is posted; the vCPU continues
+    /// at once and collects the device's outcome when it settles the write.
+    async fn only_queue_kicks_are_posted_and_settle_with_the_device_outcome() {
+        use super::super::Client;
+
+        let (context, channel, mut requests, mut replies) = native_device(1);
+        let admission = Arc::clone(&context.admission);
+        let devices = Arc::clone(&context.devices);
+        let (queue, receiver) = Queue::new();
+        let bridge = tokio::spawn(run_bridge(receiver, context, vec![Some(channel)]));
+        let client = Client {
+            sender: queue,
+            admission,
+            failure: Arc::new(Mutex::new(None)),
+            devices,
+        };
+        for (address, width) in [(0x1018, 4), (0x1050, 2), (0x3050, 4)] {
+            assert!(
+                client
+                    .post_queue_notify(address, width, 1)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let posted = client.post_queue_notify(0x1050, 4, 1).unwrap().unwrap();
+        let request = requests.next().await.unwrap();
+        assert_eq!(
+            (request.operation, request.offset, request.value),
+            (Operation::Write, 0x50, 1)
+        );
+        replies
+            .send(Reply {
+                sequence: request.sequence,
+                value: 0,
+                error: None,
+            })
+            .await
+            .unwrap();
+        let settling = client.clone();
+        tokio::task::spawn_blocking(move || settling.settle(&posted))
+            .await
+            .unwrap()
+            .unwrap();
+        drop(client);
+        assert!(bridge.await.unwrap().is_err());
+    }
+
     #[tokio::test]
     async fn closed_device_accesses_are_unmapped_even_when_the_slot_was_already_selected() {
         use futures_util::FutureExt;

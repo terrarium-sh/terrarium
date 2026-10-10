@@ -41,7 +41,7 @@ pub(super) async fn run(
 pub fn create_backend(
     endpoints: Endpoints,
 ) -> wasmtime::Result<(NetworkBackend, tokio::task::JoinHandle<std::io::Result<()>>)> {
-    use terra_network::config::{Config, Limits, Network, PublishedListener, StaticDnsRecord};
+    use terra_network::config::{Config, Network, PublishedListener, StaticDnsRecord};
     use terra_platform::io::local::{AsyncLocalStream, create_local_pair};
     let listeners = vec![
         PublishedListener {
@@ -65,7 +65,7 @@ pub fn create_backend(
             transport: terra_network::ResourceKind::Udp,
         },
     ];
-    let broker = terra_network::Broker::bind(Config {
+    let broker = terra_network::Broker::bind(&Config {
         policy: Network {
             allow: vec![
                 format!("HOST_LOOPBACK:{}", endpoints.tcp),
@@ -87,7 +87,6 @@ pub fn create_backend(
                 .into(),
         ],
         listeners: listeners.clone(),
-        limits: Limits::default(),
     })?;
     let ready = broker.ready();
     let (worker, endpoint) = create_local_pair()?;
@@ -252,52 +251,74 @@ pub(crate) fn create_dns_fallback_backend() -> (
     tokio::sync::oneshot::Sender<()>,
     tokio::task::JoinHandle<wasmtime::Result<()>>,
 ) {
-    use terra_protocol::network::{MAX_NETWORK_FRAME_BYTES, Request, Response};
-    use tokio::io::AsyncWriteExt;
-
-    let (worker, mut endpoint) = tokio::io::duplex(MAX_NETWORK_FRAME_BYTES);
-    let client = terra_network::Client::new(worker);
+    let (worker, endpoint) = tokio::io::duplex(terra_protocol::network::MAX_NETWORK_FRAME_BYTES);
     let backend = NetworkBackend {
-        client,
+        client: terra_network::Client::new(worker),
         ready: terra_network::config::Ready {
-            version: terra_network::config::PROTOCOL_VERSION,
             host_service_ports: Vec::new(),
-            blocks_direct_dns: true,
         },
         listeners: Vec::new(),
     };
     let (stop, stopped) = tokio::sync::oneshot::channel();
     let broker_task = tokio::spawn(async move {
-        for _ in 0..2 {
-            let request = terra_protocol::read_frame_async_with_limit::<Request>(
-                &mut endpoint,
-                MAX_NETWORK_FRAME_BYTES,
-            )
-            .await?
-            .ok_or_else(|| wasmtime::Error::msg("DNS fallback broker request EOF"))?;
-            wasmtime::ensure!(
-                request.operation == terra_network::Operation::Resolve("many.test".into()),
-                "DNS fallback broker resolves only the configured fixture"
-            );
-            let response = Response {
-                id: request.id,
-                result: Ok(terra_network::Reply::Resolved(
-                    (1..=32)
-                        .map(|last| Ipv4Addr::new(192, 0, 2, last).into())
-                        .collect(),
-                )),
-            };
-            endpoint
-                .write_all(&terra_protocol::encode_frame_with_limit(
-                    &response,
-                    MAX_NETWORK_FRAME_BYTES,
-                )?)
-                .await?;
+        tokio::select! {
+            biased;
+            _ = stopped => Ok(()),
+            served = serve_many_addresses(endpoint) => served,
         }
-        let _ = stopped.await;
-        wasmtime::Result::Ok(())
     });
     (backend, stop, broker_task)
+}
+
+/// A broker that answers every stream with the same 32 addresses for `many.test`.
+async fn serve_many_addresses(endpoint: tokio::io::DuplexStream) -> wasmtime::Result<()> {
+    use tokio_util::compat::TokioAsyncReadCompatExt;
+
+    let mut connection = yamux::Connection::new(
+        endpoint.compat(),
+        yamux::Config::default(),
+        yamux::Mode::Server,
+    );
+    let mut answers = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            inbound = std::future::poll_fn(|cx| connection.poll_next_inbound(cx)) => match inbound {
+                Some(stream) => {
+                    answers.spawn(answer_many_addresses(stream?));
+                }
+                None => return Ok(()),
+            },
+            Some(answered) = answers.join_next() => answered??,
+        }
+    }
+}
+
+async fn answer_many_addresses(stream: yamux::Stream) -> wasmtime::Result<()> {
+    use terra_protocol::network::{MAX_NETWORK_FRAME_BYTES, Open, Opened};
+    use tokio::io::AsyncWriteExt;
+    use tokio_util::compat::FuturesAsyncReadCompatExt;
+
+    let mut stream = stream.compat();
+    let open =
+        terra_protocol::read_frame_async_with_limit::<Open>(&mut stream, MAX_NETWORK_FRAME_BYTES)
+            .await?;
+    wasmtime::ensure!(
+        open == Some(Open::Resolve("many.test".into())),
+        "DNS fallback broker resolves only the configured fixture"
+    );
+    let reply: Result<Opened, terra_network::Error> = Ok(Opened::Resolved(
+        (1..=32)
+            .map(|last| Ipv4Addr::new(192, 0, 2, last).into())
+            .collect(),
+    ));
+    stream
+        .write_all(&terra_protocol::encode_frame_with_limit(
+            &reply,
+            MAX_NETWORK_FRAME_BYTES,
+        )?)
+        .await?;
+    stream.shutdown().await?;
+    Ok(())
 }
 
 fn require_broker_peer_shutdown(result: std::io::Result<()>) -> wasmtime::Result<()> {
@@ -607,17 +628,10 @@ async fn run_socket_streams(
     backend: NetworkBackend,
     endpoints: Endpoints,
 ) -> wasmtime::Result<()> {
-    let requests = (0..8).map(|_| {
-        backend
-            .client
-            .request(terra_network::Operation::Resolve("loopback.test".into()))
-    });
+    let requests = (0..8).map(|_| backend.client.resolve("loopback.test".into()));
     for reply in futures_util::future::join_all(requests).await {
         wasmtime::ensure!(
-            reply
-                == Ok(terra_network::Reply::Resolved(vec![
-                    Ipv4Addr::LOCALHOST.into()
-                ])),
+            reply == Ok(vec![Ipv4Addr::LOCALHOST.into()]),
             "network self-test concurrent broker replies"
         );
     }

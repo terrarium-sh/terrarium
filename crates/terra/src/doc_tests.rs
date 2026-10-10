@@ -39,14 +39,6 @@ fn security_docs_quote_the_enforced_bounds() {
             ),
         ),
         (
-            "security.md",
-            format!(
-                "at most {} chunks of {} KiB per connection",
-                terra_network::MAX_TCP_WRITE_REQUESTS,
-                terra_protocol::network::MAX_NETWORK_CHUNK_BYTES >> 10,
-            ),
-        ),
-        (
             "component-authority.md",
             format!(
                 "limits each range to {} KiB, each call to {} ranges and {} KiB total",

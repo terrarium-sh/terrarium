@@ -19,12 +19,17 @@ const MAX_CHAIN: usize = 16;
 const MAX_PACKET: usize = VSOCK_HEADER_BYTES + terra_vsock_device::MAX_DATA_BYTES as usize;
 const NO_INTERRUPT: u16 = 1;
 const NO_NOTIFY: u16 = 1;
+/// Held-back TX completions that force an interrupt, well below a full TX ring.
+const MAX_HELD_TX_COMPLETIONS: usize = 32;
+/// How long a TX-only interrupt waits for an RX delivery to carry it.
+pub const HELD_TX_INTERRUPT_NANOS: u64 = 250_000;
 
 struct State {
     mmio: MmioTransport,
     next: [u16; 2],
     pending_rx: Option<Reply>,
     pending: [bool; 2],
+    held_tx_completions: usize,
 }
 
 struct QueueBatch {
@@ -64,6 +69,7 @@ fn reset_transport(state: &mut State) {
     state.next = [0; 2];
     state.pending_rx = None;
     state.pending = [false; 2];
+    state.held_tx_completions = 0;
     super::switch().reset_connections();
     super::wake_worker();
 }
@@ -81,6 +87,7 @@ fn new_state() -> State {
         next: [0; 2],
         pending_rx: None,
         pending: [false; 2],
+        held_tx_completions: 0,
     }
 }
 
@@ -282,15 +289,16 @@ fn completion_ranges(
     Ok(ranges)
 }
 
+/// `Ok(true)` means the guest wants an interrupt for the published completions.
 fn publish_batch(
     state: &mut State,
     queue: usize,
     batch: &QueueBatch,
     write_memory: impl FnOnce(&[memory::WriteRange]) -> Result<(), DeviceError>,
     read_flags: impl FnOnce(u64, u64) -> Result<Vec<u8>, DeviceError>,
-) -> Result<(), DeviceError> {
+) -> Result<bool, DeviceError> {
     if batch.completions.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     let ranges = completion_ranges(
         batch.used_ring,
@@ -307,10 +315,23 @@ fn publish_batch(
         .and_then(|(_, available_ring, _, _)| read_flags(available_ring, 2).ok())
         .and_then(|bytes| <[u8; 2]>::try_from(bytes).ok())
         .map(u16::from_le_bytes);
-    if flags.is_none_or(|flags| flags & NO_INTERRUPT == 0) {
+    Ok(flags.is_none_or(|flags| flags & NO_INTERRUPT == 0))
+}
+
+/// One interrupt makes the guest service every queue, so completions of header-only TX packets
+/// (credit updates during bulk receive) ride on a later RX interrupt. A TX packet with payload
+/// signals at once: holding a request delays a guest that idles until its reply.
+fn request_used_interrupt(
+    state: &mut State,
+    is_rx_requested: bool,
+    has_tx_payload: bool,
+    tx_requested: usize,
+) {
+    state.held_tx_completions += tx_requested;
+    if is_rx_requested || has_tx_payload || state.held_tx_completions >= MAX_HELD_TX_COMPLETIONS {
+        state.held_tx_completions = 0;
         state.mmio.signal(INT_USED_BUFFER);
     }
-    Ok(())
 }
 
 fn rx_used_len(capacity: usize, payload: &[u8]) -> Option<u32> {
@@ -361,7 +382,8 @@ fn read_tx_packet(
     Ok(Some((header, data)))
 }
 
-fn process_tx(batch: &QueueBatch, head: u16) {
+/// Returns whether the packet carried payload, as opposed to a header-only control packet.
+fn process_tx(batch: &QueueBatch, head: u16) -> bool {
     if let Some(table) = batch.descriptor_table()
         && let Ok(descriptors) = chain(table, head, batch.size)
         && let Ok(Some((header, data))) = read_tx_packet(&descriptors, read)
@@ -370,7 +392,9 @@ fn process_tx(batch: &QueueBatch, head: u16) {
         if let Some(connection) = touched {
             super::network::notify_connection(connection);
         }
+        return !data.is_empty();
     }
+    false
 }
 
 fn process_rx(
@@ -588,12 +612,13 @@ pub fn process_pending(max_steps: usize) -> Result<bool, DeviceError> {
                 .and_then(QueueBatch::next_head)
                 .is_some();
         let mut progressed = false;
+        let mut has_tx_payload = false;
         for _ in 0..max_steps {
             let mut moved = false;
             if let Some(batch) = batches[TX].as_mut()
                 && let Some(head) = batch.next_head()
             {
-                process_tx(batch, head);
+                has_tx_payload |= process_tx(batch, head);
                 batch.completions.push((head, 0));
                 moved = true;
                 rx_enabled = true;
@@ -616,12 +641,13 @@ pub fn process_pending(max_steps: usize) -> Result<bool, DeviceError> {
                 break;
             }
         }
+        let mut is_interrupt_requested = [false; 2];
         for queue in [TX, RX] {
             state.pending[queue] = batches[queue]
                 .as_ref()
                 .is_some_and(|batch| batch.has_remaining() && (queue == TX || rx_enabled));
             if let Some(batch) = batches[queue].as_ref() {
-                publish_batch(
+                is_interrupt_requested[queue] = publish_batch(
                     state,
                     queue,
                     batch,
@@ -630,6 +656,16 @@ pub fn process_pending(max_steps: usize) -> Result<bool, DeviceError> {
                 )?;
             }
         }
+        let tx_requested = batches[TX]
+            .as_ref()
+            .filter(|_| is_interrupt_requested[TX])
+            .map_or(0, |batch| batch.completions.len());
+        request_used_interrupt(
+            state,
+            is_interrupt_requested[RX],
+            has_tx_payload,
+            tx_requested,
+        );
         Ok(progressed)
     })
 }
@@ -643,6 +679,21 @@ pub fn has_pending_reply_for(connection: terra_vsock_device::ConnectionId) -> bo
         }))
     })
     .unwrap_or(false)
+}
+
+#[must_use]
+pub fn has_held_interrupt() -> bool {
+    state(|state| Ok(state.held_tx_completions != 0)).unwrap_or(false)
+}
+
+pub fn flush_held_interrupt() -> Result<(), DeviceError> {
+    state(|state| {
+        if state.held_tx_completions != 0 {
+            state.held_tx_completions = 0;
+            state.mmio.signal(INT_USED_BUFFER);
+        }
+        Ok(())
+    })
 }
 
 /// Marks the RX queue for service and wakes the worker to fill it.
@@ -773,6 +824,7 @@ mod tests {
             next: [0; 2],
             pending_rx: None,
             pending: [false; 2],
+            held_tx_completions: 0,
         }
     }
 
@@ -782,6 +834,46 @@ mod tests {
             decode_queue_batch(&mut 0, 1, 8, 32, used_ring, queue_snapshot(8, 1, 0)).unwrap();
         batch.completions.push((0, 44));
         batch
+    }
+
+    /// Publishes like `process_pending` and raises the interrupt the guest asked for at once.
+    fn publish_and_signal(
+        state: &mut State,
+        queue: usize,
+        batch: &QueueBatch,
+        write_memory: impl FnOnce(&[memory::WriteRange]) -> Result<(), DeviceError>,
+        read_flags: impl FnOnce(u64, u64) -> Result<Vec<u8>, DeviceError>,
+    ) -> Result<(), DeviceError> {
+        if publish_batch(state, queue, batch, write_memory, read_flags)? {
+            state.mmio.signal(INT_USED_BUFFER);
+        }
+        Ok(())
+    }
+
+    /// Header-only TX completions wait for an RX interrupt to carry them; a TX packet with payload
+    /// (a request whose sender idles until its reply) and a burst large enough that the guest could
+    /// run short of TX buffers both signal at once.
+    #[test]
+    fn header_only_tx_interrupts_ride_on_rx_and_payload_signals() {
+        let mut state = notification_state();
+        request_used_interrupt(&mut state, false, false, 1);
+        assert!(!used_interrupt_status(&mut state));
+        assert_eq!(state.held_tx_completions, 1);
+        request_used_interrupt(&mut state, true, false, 0);
+        assert!(used_interrupt_status(&mut state));
+        assert_eq!(state.held_tx_completions, 0);
+
+        let mut state = notification_state();
+        request_used_interrupt(&mut state, false, true, 1);
+        assert!(used_interrupt_status(&mut state));
+        assert_eq!(state.held_tx_completions, 0);
+
+        let mut state = notification_state();
+        request_used_interrupt(&mut state, false, false, MAX_HELD_TX_COMPLETIONS - 1);
+        assert!(!used_interrupt_status(&mut state));
+        request_used_interrupt(&mut state, false, false, 1);
+        assert!(used_interrupt_status(&mut state));
+        assert_eq!(state.held_tx_completions, 0);
     }
 
     fn used_interrupt_status(state: &mut State) -> bool {
@@ -1039,7 +1131,7 @@ mod tests {
         batch.snapshot[..2].copy_from_slice(&NO_INTERRUPT.to_le_bytes());
         let flags = std::cell::Cell::new(NO_INTERRUPT);
         let order = std::cell::RefCell::new(Vec::new());
-        publish_batch(
+        publish_and_signal(
             &mut state,
             RX,
             &batch,
@@ -1069,7 +1161,7 @@ mod tests {
             if has_prior_interrupt {
                 state.mmio.signal(INT_USED_BUFFER);
             }
-            publish_batch(
+            publish_and_signal(
                 &mut state,
                 RX,
                 &completed_batch(RX),
@@ -1086,7 +1178,7 @@ mod tests {
     fn each_queue_reads_its_own_hint_and_either_queue_can_request_notification() {
         let mut state = notification_state();
         for (queue, available_ring, flags) in [(TX, 0x5000, NO_INTERRUPT), (RX, 0x2000, 0)] {
-            publish_batch(
+            publish_and_signal(
                 &mut state,
                 queue,
                 &completed_batch(queue),
@@ -1109,7 +1201,7 @@ mod tests {
             state.mmio.write(0x70, 1, u64::from(status)).unwrap();
         }
         for (queue, transition) in [(RX, Some(true)), (TX, None)] {
-            publish_batch(
+            publish_and_signal(
                 &mut state,
                 queue,
                 &completed_batch(queue),
@@ -1125,7 +1217,7 @@ mod tests {
         assert_eq!(state.mmio.take_irq(), Some(false));
         let mut batch = completed_batch(RX);
         batch.used_index = 1;
-        publish_batch(
+        publish_and_signal(
             &mut state,
             RX,
             &batch,
@@ -1142,7 +1234,7 @@ mod tests {
     fn unreadable_interrupt_hints_notify_conservatively() {
         for result in [Err(DeviceError::Unmapped), Ok(Vec::new()), Ok(vec![1])] {
             let mut state = notification_state();
-            publish_batch(
+            publish_and_signal(
                 &mut state,
                 RX,
                 &completed_batch(RX),
@@ -1158,7 +1250,7 @@ mod tests {
     fn failed_or_empty_completion_does_not_read_the_interrupt_hint() {
         let mut state = notification_state();
         assert_eq!(
-            publish_batch(
+            publish_and_signal(
                 &mut state,
                 RX,
                 &completed_batch(RX),
@@ -1168,7 +1260,7 @@ mod tests {
             Err(DeviceError::Unmapped)
         );
         let batch = decode_queue_batch(&mut 0, 0, 8, 32, 0x3000, queue_snapshot(8, 0, 0)).unwrap();
-        publish_batch(
+        publish_and_signal(
             &mut state,
             RX,
             &batch,
@@ -1308,6 +1400,7 @@ mod tests {
                 payload: Vec::new(),
             }),
             pending: [true; 2],
+            held_tx_completions: 0,
         };
         for head in [0, 1] {
             assert!(matches!(
@@ -1381,6 +1474,7 @@ mod tests {
             next: [0; 2],
             pending_rx: Some(pending.clone()),
             pending: [true; 2],
+            held_tx_completions: 0,
         };
         let batch = decode_queue_batch(&mut 0, 1, 8, 32, 0x3000, queue_snapshot(8, 1, 0)).unwrap();
         assert!(matches!(
@@ -1619,6 +1713,7 @@ mod tests {
                 next: [7, 9],
                 pending_rx: None,
                 pending: [true, true],
+                held_tx_completions: 0,
             };
             super::super::WORK.clear();
             write_transport(&mut state, 0x70, u8::try_from(bytes.len()).unwrap(), 0).unwrap();

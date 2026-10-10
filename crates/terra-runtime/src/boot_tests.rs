@@ -1,6 +1,6 @@
 use crate::component::network::{HostServiceAddresses, NetworkBackend, PortMapping};
 use std::assert_matches;
-use terra_network::config::{Config, Limits, Network, PublishedListener, StaticDnsRecord};
+use terra_network::config::{Config, Network, PublishedListener, StaticDnsRecord};
 
 fn load_boot_disk(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
@@ -204,7 +204,6 @@ fn start_network_broker(policy: Network, port_mappings: &[PortMapping]) -> Netwo
             HostServiceAddresses::default().gateway_ip6.into(),
         ],
         listeners,
-        limits: Limits::default(),
     })
     .expect("network broker starts")
 }

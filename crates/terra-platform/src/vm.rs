@@ -77,114 +77,247 @@ pub struct Msr {
     pub value: u64,
 }
 
+/// A load or store that faulted on device memory, decoded from its ARM data-abort syndrome into
+/// the MMIO exit KVM and WHP on x86 already deliver decoded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ArmException {
-    pub address: u64,
-    pub syndrome: u64,
-    pub write_value: Option<u64>,
-    pub hvc_registers: Option<[u64; 4]>,
+pub struct ArmMmioAccess {
+    width: u8,
+    register: u8,
+    is_write: bool,
+    is_sign_extended: bool,
+    is_64_bit_register: bool,
 }
 
-impl ArmException {
-    pub fn capture<E>(
+impl ArmMmioAccess {
+    /// `Ok(None)` identifies an HVC call for the platform to handle.
+    pub fn decode(syndrome: u64) -> Result<Option<Self>, String> {
+        const EC: u64 = 0b11_1111 << 26;
+        const DATA_ABORT_LOWER: u64 = 0x24 << 26;
+        const DATA_ABORT_SAME: u64 = 0x25 << 26;
+        const HVC64: u64 = 0x16 << 26;
+        const ISV: u64 = 1 << 24;
+        const SAS: u64 = 0b11 << 22;
+        const SSE: u64 = 1 << 21;
+        const SRT: u64 = 0b1_1111 << 16;
+        const SF: u64 = 1 << 15;
+        const WNR: u64 = 1 << 6;
+
+        if syndrome & EC == HVC64 {
+            return Ok(None);
+        }
+        if !matches!(syndrome & EC, DATA_ABORT_LOWER | DATA_ABORT_SAME) {
+            return Err(format!("unexpected ARM exception (syndrome {syndrome:#x})"));
+        }
+        let width = 1_u8 << ((syndrome & SAS) >> 22);
+        let is_64_bit_register = syndrome & SF != 0;
+        if syndrome & ISV == 0 || (!is_64_bit_register && width == 8) {
+            return Err(format!(
+                "undecodable ARM data abort (syndrome {syndrome:#x})"
+            ));
+        }
+        Ok(Some(Self {
+            width,
+            register: ((syndrome & SRT) >> 16) as u8,
+            is_write: syndrome & WNR != 0,
+            is_sign_extended: syndrome & SSE != 0,
+            is_64_bit_register,
+        }))
+    }
+
+    /// A store reads its source register through `read_register`; register 31 is the zero register.
+    pub fn exit<E>(
+        self,
         address: u64,
-        syndrome: u64,
-        mut read_register: impl FnMut(u8) -> Result<u64, E>,
-    ) -> Result<Self, E> {
-        let hvc_registers = if syndrome >> 26 == 0x16 {
-            Some([
-                read_register(0)?,
-                read_register(1)?,
-                read_register(2)?,
-                read_register(3)?,
-            ])
+        read_register: impl FnOnce(u8) -> Result<u64, E>,
+    ) -> Result<VcpuExit, E> {
+        if !self.is_write {
+            return Ok(VcpuExit::MmioRead(MmioRead {
+                address,
+                width: self.width,
+            }));
+        }
+        let value = if self.register == 31 {
+            0
         } else {
-            None
+            read_register(self.register)?
         };
-        let write_value = if matches!(syndrome >> 26, 0x24 | 0x25)
-            && syndrome & (1 << 24) != 0
-            && syndrome & (1 << 6) != 0
-        {
-            let register = ((syndrome >> 16) & 31) as u8;
-            Some(if register == 31 {
-                0
-            } else {
-                read_register(register)?
-            })
-        } else {
-            None
-        };
-        Ok(Self {
+        Ok(VcpuExit::MmioWrite(MmioWrite {
             address,
-            syndrome,
-            write_value,
-            hvc_registers,
-        })
+            width: self.width,
+            value: value & self.width_mask(),
+        }))
+    }
+
+    /// The guest register write that completes the access; the caller then steps past the
+    /// faulting instruction.
+    pub fn complete(self, action: VcpuAction) -> Result<ArmRegisterWrite, String> {
+        match action {
+            VcpuAction::Reenter if self.is_write => Ok(ArmRegisterWrite {
+                register: None,
+                value: 0,
+            }),
+            VcpuAction::MmioRead(value) if !self.is_write => Ok(ArmRegisterWrite {
+                register: (self.register != 31).then_some(self.register),
+                value: self.load_value(value),
+            }),
+            VcpuAction::Start
+            | VcpuAction::Reenter
+            | VcpuAction::MmioRead(_)
+            | VcpuAction::PioZero
+            | VcpuAction::Rdmsr(_)
+            | VcpuAction::MsrFault
+            | VcpuAction::Wrmsr
+            | VcpuAction::IoApicValue(_) => {
+                Err(format!("unexpected ARM MMIO completion {action:?}"))
+            }
+        }
+    }
+
+    fn width_mask(self) -> u64 {
+        u64::MAX >> (64 - u32::from(self.width) * 8)
+    }
+
+    fn load_value(self, value: u64) -> u64 {
+        let value = value & self.width_mask();
+        let value = if self.is_sign_extended {
+            let shift = 64 - u32::from(self.width) * 8;
+            ((value << shift).cast_signed() >> shift).cast_unsigned()
+        } else {
+            value
+        };
+        if self.is_64_bit_register {
+            value
+        } else {
+            value & u64::from(u32::MAX)
+        }
     }
 }
 
 #[cfg(test)]
-mod arm_exception_tests {
-    use super::ArmException;
+mod arm_mmio_tests {
+    use super::{ArmMmioAccess, ArmRegisterWrite, MmioRead, MmioWrite, VcpuAction, VcpuExit};
+
+    const DATA_ABORT: u64 = 0x24 << 26;
+    const ISV: u64 = 1 << 24;
+    const SF: u64 = 1 << 15;
+    const WNR: u64 = 1 << 6;
+
+    /// Only decoded data aborts and platform-handled HVC calls can resume the guest;
+    /// skipping another exception would drop a store or bypass a faulting instruction.
+    #[test]
+    fn decoding_accepts_decoded_data_aborts_and_rejects_undecodable_ones() {
+        assert!(matches!(
+            ArmMmioAccess::decode(DATA_ABORT | ISV | SF),
+            Ok(Some(_))
+        ));
+        assert!(matches!(
+            ArmMmioAccess::decode((0x25 << 26) | ISV | SF),
+            Ok(Some(_))
+        ));
+        assert_eq!(ArmMmioAccess::decode(0x16 << 26), Ok(None));
+        for unexpected in [ISV | SF, 0x01 << 26, 0x20 << 26, 0x21 << 26] {
+            assert!(ArmMmioAccess::decode(unexpected).is_err());
+        }
+        for data_abort in [DATA_ABORT, 0x25 << 26] {
+            for undecodable in [
+                data_abort | SF,
+                data_abort | SF | WNR,
+                data_abort | ISV | (3 << 22),
+                data_abort | ISV | (3 << 22) | WNR,
+            ] {
+                assert!(ArmMmioAccess::decode(undecodable).is_err());
+            }
+        }
+    }
 
     #[test]
-    fn exceptions_capture_only_the_registers_the_exit_needs() {
+    fn stores_become_mmio_writes_of_the_masked_source_register() {
+        let store = ArmMmioAccess::decode(DATA_ABORT | ISV | SF | WNR | (1 << 22) | (7 << 16))
+            .unwrap()
+            .unwrap();
         let mut reads = Vec::new();
-        let mut read = |register| {
-            reads.push(register);
-            Ok::<_, &'static str>(u64::from(register) + 42)
-        };
-        let hvc = ArmException::capture(0, 0x16 << 26, &mut read).unwrap();
-        assert_eq!(hvc.hvc_registers, Some([42, 43, 44, 45]));
-        assert_eq!(hvc.write_value, None);
-        assert_eq!(reads, [0, 1, 2, 3]);
-        let syndrome = (0x24 << 26) | (1 << 24) | (1 << 6);
-        reads.clear();
-        let store = ArmException::capture(17, syndrome | (7 << 16), |register| {
-            reads.push(register);
-            Ok::<_, &'static str>(99)
-        })
-        .unwrap();
-        assert_eq!(store.address, 17);
-        assert_eq!(store.write_value, Some(99));
-        assert_eq!(store.hvc_registers, None);
-        assert_eq!(reads, [7]);
-        for (syndrome, value) in [
-            (syndrome | (31 << 16), Some(0)),
-            (syndrome & !(1 << 6), None),
-            (syndrome & !(1 << 24), None),
-            (0, None),
-        ] {
-            let exception =
-                ArmException::capture(syndrome, syndrome, |_| Err("unexpected register read"))
-                    .unwrap();
-            assert_eq!(exception.write_value, value);
-            assert_eq!(exception.hvc_registers, None);
-        }
+        let exit = store
+            .exit(0x1000, |register| {
+                reads.push(register);
+                Ok::<_, &'static str>(0x1234_5678)
+            })
+            .unwrap();
         assert_eq!(
-            ArmException::capture(0, syndrome, |_| Err("register failure")),
-            Err("register failure")
+            exit,
+            VcpuExit::MmioWrite(MmioWrite {
+                address: 0x1000,
+                width: 2,
+                value: 0x5678,
+            })
         );
+        assert_eq!(reads, [7]);
+        let zero = ArmMmioAccess::decode(DATA_ABORT | ISV | SF | WNR | (31 << 16))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            zero.exit(0x1000, |_| Err("the zero register is never read")),
+            Ok(VcpuExit::MmioWrite(MmioWrite {
+                address: 0x1000,
+                width: 1,
+                value: 0,
+            }))
+        );
+        assert_eq!(
+            store.complete(VcpuAction::Reenter),
+            Ok(ArmRegisterWrite {
+                register: None,
+                value: 0,
+            })
+        );
+        assert!(store.complete(VcpuAction::MmioRead(1)).is_err());
+    }
+
+    #[test]
+    fn loads_fill_the_destination_register_at_its_width() {
+        let load = |syndrome| {
+            ArmMmioAccess::decode(DATA_ABORT | ISV | (4 << 16) | syndrome)
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(
+            load(SF).exit(0x2000, |_| Err::<u64, _>("loads read no register")),
+            Ok(VcpuExit::MmioRead(MmioRead {
+                address: 0x2000,
+                width: 1,
+            }))
+        );
+        let signed_byte = 1 << 21;
+        for (syndrome, device_value, register_value) in [
+            (SF | signed_byte, 0x80, u64::MAX - 0x7f),
+            (signed_byte, 0x80, u64::from(u32::MAX - 0x7f)),
+            (2 << 22, 0x1234_5678_9abc_def0, 0x9abc_def0),
+        ] {
+            assert_eq!(
+                load(syndrome).complete(VcpuAction::MmioRead(device_value)),
+                Ok(ArmRegisterWrite {
+                    register: Some(4),
+                    value: register_value,
+                })
+            );
+        }
+        let discarded = ArmMmioAccess::decode(DATA_ABORT | ISV | SF | (31 << 16))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            discarded.complete(VcpuAction::MmioRead(9)),
+            Ok(ArmRegisterWrite {
+                register: None,
+                value: 9,
+            })
+        );
+        assert!(load(SF).complete(VcpuAction::Reenter).is_err());
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ArmRead {
+pub struct ArmRegisterWrite {
     pub register: Option<u8>,
     pub value: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HvcResult {
-    pub target: u8,
-    pub status: i64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CpuStart {
-    pub target: u8,
-    pub entry: u64,
-    pub context: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -206,8 +339,6 @@ pub enum VcpuExit {
     PioWrite(PioWrite),
     Rdmsr(Msr),
     Wrmsr(Msr),
-    ArmException(ArmException),
-    HvcResult(HvcResult),
     IoApicAccess(IoApicAccess),
     IoApicEoi(u8),
     Stopped,
@@ -222,11 +353,6 @@ pub enum VcpuAction {
     Rdmsr(u64),
     MsrFault,
     Wrmsr,
-    ArmRead(ArmRead),
-    HvcReturn(i64),
-    CpuStart(CpuStart),
-    CpuOff,
-    SystemStop,
     IoApicValue(u32),
 }
 

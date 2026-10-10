@@ -1,11 +1,12 @@
-//! Bounded request/reply messages for the network broker.
+//! Bounded messages for the network broker, one yamux stream per operation.
 
 pub use crate::socket::Error;
 use serde::{Deserialize, Serialize};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 
-pub const MAX_NETWORK_CHUNK_BYTES: usize = 8 * 1024;
-pub const MAX_NETWORK_READ_BYTES: usize = 32704;
+/// One vsock packet's largest payload, so a TCP chunk crosses to the guest as one packet.
+pub const MAX_NETWORK_CHUNK_BYTES: usize = 64 * 1024;
+pub const MAX_NETWORK_READ_BYTES: usize = MAX_NETWORK_CHUNK_BYTES;
 pub const MAX_NETWORK_DATAGRAM_BYTES: usize = 4096;
 pub const MAX_NETWORK_NAME_BYTES: usize = 256;
 pub const MAX_NETWORK_ADDRESSES: usize = 32;
@@ -15,14 +16,9 @@ pub const MAX_NETWORK_DATAGRAMS: usize = 32;
 /// Upper bound on one batched datagram's encoded peer and length prefix.
 pub const DATAGRAM_FRAME_OVERHEAD_BYTES: usize = 32;
 /// Budget for a datagram batch, counting [`Datagram::batch_bytes`], so the batch fits one frame.
-pub const MAX_NETWORK_DATAGRAM_BATCH_BYTES: usize = MAX_NETWORK_READ_BYTES;
+pub const MAX_NETWORK_DATAGRAM_BATCH_BYTES: usize = 32 * 1024 - 64;
 pub const UDP_PEER_TTL_SECS: u64 = 60;
 
-/// The `peer` an unconnected UDP resource reports when opened.
-pub const UNBOUND_UDP_PEER: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
-
-pub type RequestId = u64;
-pub type Handle = u64;
 pub type ListenerGrant = u32;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,61 +51,37 @@ pub enum ResourceKind {
     Udp,
 }
 
+/// First client frame on every stream.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Request {
-    pub id: RequestId,
-    pub operation: Operation,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Operation {
-    OpenTcp {
+pub enum Open {
+    Tcp {
         peer: SocketAddr,
         inline_urgent: bool,
     },
-    OpenUdp,
     Accept(ListenerGrant),
-    Read {
-        handle: Handle,
-        max_bytes: u32,
-    },
-    ReceiveDatagram(Handle),
-    SendDatagrams {
-        handle: Handle,
-        #[serde(deserialize_with = "crate::bounded::vec::<_, _, MAX_NETWORK_DATAGRAMS>")]
-        datagrams: Vec<Datagram>,
-    },
-    ShutdownWrite(Handle),
+    Udp,
+    PublishedUdp(ListenerGrant),
     Resolve(
         #[serde(deserialize_with = "crate::bounded::string::<_, MAX_NETWORK_NAME_BYTES>")] String,
     ),
-    Cancel(RequestId),
-    Close(Handle),
-    WriteAll {
-        handle: Handle,
-        #[serde(
-            serialize_with = "serde_bytes::serialize",
-            deserialize_with = "crate::bounded::bytes::<_, MAX_NETWORK_CHUNK_BYTES>"
-        )]
-        bytes: Vec<u8>,
-    },
-    OpenPublishedUdp(ListenerGrant),
-    WaitError(Handle),
 }
 
+/// Broker reply to [`Open`], sent as `Result<Opened, Error>`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Response {
-    pub id: RequestId,
-    pub result: Result<Reply, Error>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Reply {
-    Opened {
-        handle: Handle,
-        kind: ResourceKind,
+pub enum Opened {
+    Tcp {
         peer: SocketAddr,
     },
+    Udp,
+    Resolved(
+        #[serde(deserialize_with = "crate::bounded::vec::<_, _, MAX_NETWORK_ADDRESSES>")]
+        Vec<IpAddr>,
+    ),
+}
+
+/// Broker frames on a TCP stream; the client's upload is raw bytes ending in FIN.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TcpEvent {
     Data(
         #[serde(
             serialize_with = "serde_bytes::serialize",
@@ -118,21 +90,31 @@ pub enum Reply {
         Vec<u8>,
     ),
     Eof,
-    Written(u32),
-    Datagrams(
+    /// Result of shutting down the write side after the client's FIN.
+    WriteShutdown(Result<(), Error>),
+    Failed(Error),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UdpRequest {
+    Send(
         #[serde(deserialize_with = "crate::bounded::vec::<_, _, MAX_NETWORK_DATAGRAMS>")]
         Vec<Datagram>,
     ),
-    Resolved(
-        #[serde(deserialize_with = "crate::bounded::vec::<_, _, MAX_NETWORK_ADDRESSES>")]
-        Vec<IpAddr>,
-    ),
-    Cancelled(bool),
-    Done,
+    Receive,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UdpReply {
     Sent(
         #[serde(deserialize_with = "crate::bounded::vec::<_, _, MAX_NETWORK_DATAGRAMS>")]
         Vec<SendFailure>,
     ),
+    Datagrams(
+        #[serde(deserialize_with = "crate::bounded::vec::<_, _, MAX_NETWORK_DATAGRAMS>")]
+        Vec<Datagram>,
+    ),
+    Failed(Error),
 }
 
 #[cfg(test)]
@@ -140,97 +122,67 @@ mod tests {
     use super::*;
     use crate::{encode_frame, read_frame_with_limit};
 
+    fn roundtrips<T>(message: &T) -> bool
+    where
+        T: Serialize + serde::de::DeserializeOwned + PartialEq,
+    {
+        read_frame_with_limit::<T>(
+            &mut encode_frame(message).unwrap().as_slice(),
+            MAX_NETWORK_FRAME_BYTES,
+        )
+        .ok()
+        .flatten()
+        .is_some_and(|decoded| decoded == *message)
+    }
+
     #[test]
     fn network_frames_bound_collections_and_preserve_empty_datagrams() {
-        for operation in [
-            Operation::OpenPublishedUdp(1),
-            Operation::WaitError(1),
-            Operation::SendDatagrams {
-                handle: 1,
-                datagrams: vec![Datagram {
-                    peer: "127.0.0.1:9".parse().unwrap(),
-                    bytes: vec![],
-                }],
-            },
-            Operation::SendDatagrams {
-                handle: 1,
-                datagrams: vec![Datagram {
-                    peer: "[::1]:9".parse().unwrap(),
-                    bytes: vec![0; MAX_NETWORK_DATAGRAM_BYTES],
-                }],
-            },
-            Operation::WriteAll {
-                handle: 1,
-                bytes: vec![0; MAX_NETWORK_CHUNK_BYTES],
-            },
+        let datagram = |bytes: usize| Datagram {
+            peer: "[::1]:9".parse().unwrap(),
+            bytes: vec![0; bytes],
+        };
+        for open in [
+            Open::PublishedUdp(1),
+            Open::Resolve("a".repeat(MAX_NETWORK_NAME_BYTES)),
         ] {
-            let request = Request { id: 1, operation };
-            assert_eq!(
-                read_frame_with_limit::<Request>(
-                    &mut encode_frame(&request).unwrap().as_slice(),
-                    MAX_NETWORK_FRAME_BYTES
-                )
-                .unwrap(),
-                Some(request)
-            );
+            assert!(roundtrips(&open));
         }
-        for operation in [
-            Operation::WriteAll {
-                handle: 1,
-                bytes: vec![0; MAX_NETWORK_CHUNK_BYTES + 1],
-            },
-            Operation::SendDatagrams {
-                handle: 1,
-                datagrams: vec![Datagram {
-                    peer: "127.0.0.1:9".parse().unwrap(),
-                    bytes: vec![0; MAX_NETWORK_DATAGRAM_BYTES + 1],
-                }],
-            },
-            Operation::Resolve("a".repeat(MAX_NETWORK_NAME_BYTES + 1)),
+        assert!(!roundtrips(&Open::Resolve(
+            "a".repeat(MAX_NETWORK_NAME_BYTES + 1)
+        )));
+        for request in [
+            UdpRequest::Send(vec![datagram(0)]),
+            UdpRequest::Send(vec![datagram(MAX_NETWORK_DATAGRAM_BYTES)]),
+            UdpRequest::Receive,
         ] {
-            let request = Request { id: 1, operation };
-            assert!(
-                read_frame_with_limit::<Request>(
-                    &mut encode_frame(&request).unwrap().as_slice(),
-                    MAX_NETWORK_FRAME_BYTES
-                )
-                .is_err()
-            );
+            assert!(roundtrips(&request));
         }
-        for reply in [
-            Reply::Data(vec![0; MAX_NETWORK_READ_BYTES + 1]),
-            Reply::Datagrams(vec![Datagram {
-                peer: "127.0.0.1:9".parse().unwrap(),
-                bytes: vec![0; MAX_NETWORK_DATAGRAM_BYTES + 1],
-            }]),
-            Reply::Resolved(vec!["1.1.1.1".parse().unwrap(); MAX_NETWORK_ADDRESSES + 1]),
-        ] {
-            let response = Response {
-                id: 1,
-                result: Ok(reply),
-            };
-            assert!(
-                read_frame_with_limit::<Response>(
-                    &mut encode_frame(&response).unwrap().as_slice(),
-                    MAX_NETWORK_FRAME_BYTES
-                )
-                .is_err()
-            );
-        }
-        let mut malicious = encode_frame(&Request {
-            id: 1,
-            operation: Operation::WriteAll {
-                handle: 1,
-                bytes: vec![],
-            },
-        })
-        .unwrap();
+        assert!(!roundtrips(&UdpRequest::Send(vec![datagram(
+            MAX_NETWORK_DATAGRAM_BYTES + 1
+        )])));
+        assert!(!roundtrips(&UdpReply::Datagrams(vec![datagram(
+            MAX_NETWORK_DATAGRAM_BYTES + 1
+        )])));
+        assert!(roundtrips(&TcpEvent::Data(vec![0; MAX_NETWORK_READ_BYTES])));
+        assert!(!roundtrips(&TcpEvent::Data(vec![
+            0;
+            MAX_NETWORK_READ_BYTES + 1
+        ])));
+        assert!(roundtrips(&Ok::<_, Error>(Opened::Resolved(vec![
+            "1.1.1.1".parse().unwrap();
+            MAX_NETWORK_ADDRESSES
+        ]))));
+        assert!(!roundtrips(&Ok::<_, Error>(Opened::Resolved(vec![
+            "1.1.1.1".parse().unwrap();
+            MAX_NETWORK_ADDRESSES + 1
+        ]))));
+        let mut malicious = encode_frame(&TcpEvent::Data(vec![])).unwrap();
         malicious.pop();
         malicious.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0x0f]);
         let length = u32::try_from(malicious.len() - 4).unwrap();
         malicious[..4].copy_from_slice(&length.to_le_bytes());
         assert!(
-            read_frame_with_limit::<Request>(&mut malicious.as_slice(), MAX_NETWORK_FRAME_BYTES)
+            read_frame_with_limit::<TcpEvent>(&mut malicious.as_slice(), MAX_NETWORK_FRAME_BYTES)
                 .is_err()
         );
     }
@@ -256,19 +208,18 @@ mod tests {
                 break;
             }
         }
-        let request = Request {
-            id: u64::MAX,
-            operation: Operation::SendDatagrams {
-                handle: u64::MAX,
-                datagrams: datagrams.clone(),
-            },
-        };
-        let response = Response {
-            id: u64::MAX,
-            result: Ok(Reply::Datagrams(datagrams)),
-        };
-        assert!(crate::encode_frame_with_limit(&request, MAX_NETWORK_FRAME_BYTES).is_ok());
-        assert!(crate::encode_frame_with_limit(&response, MAX_NETWORK_FRAME_BYTES).is_ok());
+        for frame in [
+            crate::encode_frame_with_limit(
+                &UdpRequest::Send(datagrams.clone()),
+                MAX_NETWORK_FRAME_BYTES,
+            ),
+            crate::encode_frame_with_limit(
+                &UdpReply::Datagrams(datagrams),
+                MAX_NETWORK_FRAME_BYTES,
+            ),
+        ] {
+            assert!(frame.is_ok());
+        }
         let small = vec![
             Datagram {
                 peer,
@@ -276,168 +227,52 @@ mod tests {
             };
             MAX_NETWORK_DATAGRAMS
         ];
-        let request = Request {
-            id: u64::MAX,
-            operation: Operation::SendDatagrams {
-                handle: u64::MAX,
-                datagrams: small,
-            },
-        };
-        assert_eq!(
-            read_frame_with_limit::<Request>(
-                &mut encode_frame(&request).unwrap().as_slice(),
-                MAX_NETWORK_FRAME_BYTES
-            )
-            .unwrap(),
-            Some(request)
-        );
-        let oversized_batch = Request {
-            id: 1,
-            operation: Operation::SendDatagrams {
-                handle: 1,
-                datagrams: vec![
-                    Datagram {
-                        peer,
-                        bytes: vec![],
-                    };
-                    MAX_NETWORK_DATAGRAMS + 1
-                ],
-            },
-        };
-        let oversized_failures = Response {
-            id: 1,
-            result: Ok(Reply::Sent(vec![
-                SendFailure {
-                    index: 0,
-                    error: Error::Io,
-                };
-                MAX_NETWORK_DATAGRAMS + 1
-            ])),
-        };
-        assert!(
-            read_frame_with_limit::<Request>(
-                &mut encode_frame(&oversized_batch).unwrap().as_slice(),
-                MAX_NETWORK_FRAME_BYTES
-            )
-            .is_err()
-        );
-        assert!(
-            read_frame_with_limit::<Response>(
-                &mut encode_frame(&oversized_failures).unwrap().as_slice(),
-                MAX_NETWORK_FRAME_BYTES
-            )
-            .is_err()
-        );
+        assert!(roundtrips(&UdpRequest::Send(small.clone())));
+        let mut oversized = small;
+        oversized.push(oversized[0].clone());
+        assert!(!roundtrips(&UdpRequest::Send(oversized)));
+        assert!(!roundtrips(&UdpReply::Sent(vec![
+            SendFailure {
+                index: 0,
+                error: Error::Io,
+            };
+            MAX_NETWORK_DATAGRAMS + 1
+        ])));
     }
 
     #[test]
-    fn read_replies_grow_without_expanding_native_write_admission() {
-        assert_eq!(MAX_NETWORK_READ_BYTES, 32704);
-        assert_eq!(MAX_NETWORK_CHUNK_BYTES, 8192);
-        let response = Response {
-            id: u64::MAX,
-            result: Ok(Reply::Data(vec![0x42; MAX_NETWORK_READ_BYTES])),
-        };
-        let encoded = encode_frame(&response).unwrap();
-        assert!(encoded.len() <= MAX_NETWORK_FRAME_BYTES);
-        assert_eq!(
-            read_frame_with_limit::<Response>(&mut encoded.as_slice(), MAX_NETWORK_FRAME_BYTES)
-                .unwrap(),
-            Some(response)
-        );
-        let request = Request {
-            id: u64::MAX,
-            operation: Operation::WriteAll {
-                handle: u64::MAX,
-                bytes: vec![0; MAX_NETWORK_READ_BYTES],
-            },
-        };
-        assert!(
-            read_frame_with_limit::<Request>(
-                &mut encode_frame(&request).unwrap().as_slice(),
-                MAX_NETWORK_FRAME_BYTES
-            )
-            .is_err()
-        );
+    fn read_events_fit_one_frame() {
+        let event = TcpEvent::Data(vec![0x42; MAX_NETWORK_READ_BYTES]);
+        assert!(encode_frame(&event).unwrap().len() <= MAX_NETWORK_FRAME_BYTES);
+        assert!(roundtrips(&event));
     }
 
     #[test]
     fn bulk_byte_fields_preserve_the_network_wire_format() {
-        let id = 130;
-        let handle = u64::MAX - 1;
         let peer: SocketAddr = "192.0.2.1:53".parse().unwrap();
-        for length in [
-            0,
-            1,
-            127,
-            128,
-            MAX_NETWORK_DATAGRAM_BYTES,
-            MAX_NETWORK_CHUNK_BYTES,
-        ] {
+        for length in [0, 1, 127, 128, MAX_NETWORK_DATAGRAM_BYTES] {
             let bytes: Vec<u8> = (0..=255).cycle().take(length).collect();
-            let operations = [
-                Some((
-                    Operation::WriteAll {
-                        handle,
-                        bytes: bytes.clone(),
-                    },
-                    encode_frame(&(id, 10_u32, handle, &bytes)).unwrap(),
-                )),
-                (length <= MAX_NETWORK_DATAGRAM_BYTES).then(|| {
-                    (
-                        Operation::SendDatagrams {
-                            handle,
-                            datagrams: vec![Datagram {
-                                peer,
-                                bytes: bytes.clone(),
-                            }],
-                        },
-                        encode_frame(&(id, 5_u32, handle, 1_u8, peer, &bytes)).unwrap(),
-                    )
-                }),
-            ];
-            for (operation, expected) in operations.into_iter().flatten() {
-                let request = Request { id, operation };
-                assert_eq!(encode_frame(&request).unwrap(), expected);
-                assert_eq!(
-                    read_frame_with_limit::<Request>(
-                        &mut encode_frame(&request).unwrap().as_slice(),
-                        MAX_NETWORK_FRAME_BYTES
-                    )
-                    .unwrap(),
-                    Some(request)
-                );
-            }
-            let replies = [
-                Some((
-                    Reply::Data(bytes.clone()),
-                    encode_frame(&(id, 0_u32, 1_u32, &bytes)).unwrap(),
-                )),
-                (length <= MAX_NETWORK_DATAGRAM_BYTES).then(|| {
-                    (
-                        Reply::Datagrams(vec![Datagram {
-                            peer,
-                            bytes: bytes.clone(),
-                        }]),
-                        encode_frame(&(id, 0_u32, 4_u32, 1_u8, peer, &bytes)).unwrap(),
-                    )
-                }),
-            ];
-            for (reply, expected) in replies.into_iter().flatten() {
-                let response = Response {
-                    id,
-                    result: Ok(reply),
-                };
-                assert_eq!(encode_frame(&response).unwrap(), expected);
-                assert_eq!(
-                    read_frame_with_limit::<Response>(
-                        &mut encode_frame(&response).unwrap().as_slice(),
-                        MAX_NETWORK_FRAME_BYTES
-                    )
-                    .unwrap(),
-                    Some(response)
-                );
-            }
+            let event = TcpEvent::Data(bytes.clone());
+            assert_eq!(
+                encode_frame(&event).unwrap(),
+                encode_frame(&(0_u32, &bytes)).unwrap()
+            );
+            assert!(roundtrips(&event));
+            let request = UdpRequest::Send(vec![Datagram {
+                peer,
+                bytes: bytes.clone(),
+            }]);
+            assert_eq!(
+                encode_frame(&request).unwrap(),
+                encode_frame(&(0_u32, 1_u8, peer, &bytes)).unwrap()
+            );
+            assert!(roundtrips(&request));
+            let reply = UdpReply::Datagrams(vec![Datagram { peer, bytes }]);
+            assert!(roundtrips(&reply));
         }
+        assert_eq!(
+            encode_frame(&TcpEvent::WriteShutdown(Ok(()))).unwrap(),
+            encode_frame(&(2_u32, 0_u32)).unwrap()
+        );
     }
 }

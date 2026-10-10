@@ -71,8 +71,8 @@ mod tests {
         );
         assert_matches!(completed_vcpus_event(Ok(()), None), Ok(Event::VcpuFinished));
         assert_matches!(
-            completed_vcpus_event(Err(super::super::Error::BadArmExit), Some(Ok(Event::Deadline))),
-            Ok(Event::ComponentFailed(error)) if error.contains("BadArmExit")
+            completed_vcpus_event(Err(super::super::Error::InvalidVcpu), Some(Ok(Event::Deadline))),
+            Ok(Event::ComponentFailed(error)) if error.contains("InvalidVcpu")
         );
     }
 }

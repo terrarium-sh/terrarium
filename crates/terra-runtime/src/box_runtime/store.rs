@@ -66,7 +66,6 @@ pub trait StoreHost: Send + 'static {
 pub struct RootHost {
     pub(crate) platform: crate::component::vmm::PlatformHost,
     pub(crate) lifecycle: crate::component::vmm::lifecycle::LifecycleHost,
-    pub(crate) mmio_client: Option<crate::component::mmio::Client>,
     ctx: WasiCtx,
     table: ResourceTable,
 }
@@ -154,7 +153,6 @@ impl RootHost {
                 lifecycle.native_teardown(),
             ),
             lifecycle,
-            mmio_client: None,
             ctx: WasiCtxBuilder::new()
                 .max_random_size(crate::MAX_SINGLE_BYTES)
                 .allow_tcp(false)
@@ -422,16 +420,16 @@ mod tests {
     fn network_frontend_memory_fits_full_flow_capacity() {
         let defaults = ComponentMemoryLimits::default();
         assert_eq!(defaults.component_bytes(), 16 << 20);
-        assert_eq!(defaults.network_bytes(), 200 << 20);
+        assert_eq!(defaults.network_bytes(), 216 << 20);
         let large = ComponentMemoryLimits::new(512 << 20).unwrap();
         assert_eq!(large.network_bytes(), 512 << 20);
         let mut ordinary = BoxHost::with_memory_limits(defaults);
         let mut network = BoxHost::with_memory_limits(defaults);
         network.use_network_memory_limit();
         assert!(!ResourceLimiter::memory_growing(&mut ordinary, 0, 17 << 20, None).unwrap());
-        assert!(ResourceLimiter::memory_growing(&mut network, 0, 200 << 20, None).unwrap());
+        assert!(ResourceLimiter::memory_growing(&mut network, 0, 216 << 20, None).unwrap());
         assert!(
-            !ResourceLimiter::memory_growing(&mut network, 200 << 20, 201 << 20, None).unwrap()
+            !ResourceLimiter::memory_growing(&mut network, 216 << 20, 217 << 20, None).unwrap()
         );
     }
 }

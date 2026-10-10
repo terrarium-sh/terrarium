@@ -86,6 +86,11 @@ pub async fn prepare(mut input: VmInput) -> Result<PreparedVm, String> {
 
     let native_handle = machine.machine();
     let lifecycle = runtime.lifecycle_notifier();
+    let mmio = runtime
+        .mmio
+        .as_ref()
+        .map(crate::component::mmio::MmioInstance::client)
+        .ok_or("MMIO service missing")?;
     match capabilities.interrupt_mode {
         InterruptMode::SoftwareIoapic => {
             let controller = input
@@ -125,6 +130,7 @@ pub async fn prepare(mut input: VmInput) -> Result<PreparedVm, String> {
                     .map(|vcpu| {
                         Box::new(RuntimeVcpu::with_ioapic(
                             vcpu,
+                            mmio.clone(),
                             ioapic.clone(),
                             lifecycle.clone(),
                         )) as Box<dyn vm::VcpuHandler>
@@ -193,7 +199,8 @@ pub async fn prepare(mut input: VmInput) -> Result<PreparedVm, String> {
         let handlers = controls
             .into_iter()
             .map(|vcpu| {
-                Box::new(RuntimeVcpu::plain(vcpu, lifecycle.clone())) as Box<dyn vm::VcpuHandler>
+                Box::new(RuntimeVcpu::plain(vcpu, mmio.clone(), lifecycle.clone()))
+                    as Box<dyn vm::VcpuHandler>
             })
             .collect();
         start_native_vcpus(native, boot, handlers)
@@ -243,8 +250,13 @@ fn start_native_vcpus(
     ))
 }
 
+/// Device register exits go straight to the MMIO bridge, which owns address routing; the VMM
+/// component only forwarded them.
 struct RuntimeVcpu {
     native: crate::component::vmm::NativeVcpu,
+    mmio: crate::component::mmio::Client,
+    /// At most one kick in flight per vCPU, settled before the vCPU's next device access.
+    posted_write: Option<crate::component::mmio::PostedWrite>,
     ioapic: Option<crate::component::interrupt_controller::IoApicHandle>,
     lifecycle: crate::component::vmm::lifecycle::LifecycleNotifier,
 }
@@ -252,10 +264,13 @@ struct RuntimeVcpu {
 impl RuntimeVcpu {
     fn plain(
         native: crate::component::vmm::NativeVcpu,
+        mmio: crate::component::mmio::Client,
         lifecycle: crate::component::vmm::lifecycle::LifecycleNotifier,
     ) -> Self {
         Self {
             native,
+            mmio,
+            posted_write: None,
             ioapic: None,
             lifecycle,
         }
@@ -263,13 +278,39 @@ impl RuntimeVcpu {
 
     fn with_ioapic(
         native: crate::component::vmm::NativeVcpu,
+        mmio: crate::component::mmio::Client,
         ioapic: crate::component::interrupt_controller::IoApicHandle,
         lifecycle: crate::component::vmm::lifecycle::LifecycleNotifier,
     ) -> Self {
         Self {
             native,
+            mmio,
+            posted_write: None,
             ioapic: Some(ioapic),
             lifecycle,
+        }
+    }
+
+    fn settle_posted_write(&mut self) -> Result<(), String> {
+        match self.posted_write.take() {
+            Some(posted) => self.mmio.settle(&posted).map_err(|error| error.to_string()),
+            None => Ok(()),
+        }
+    }
+
+    fn write_device(&mut self, address: u64, width: u8, value: u64) -> Result<(), String> {
+        self.settle_posted_write()?;
+        match self.mmio.post_queue_notify(address, width, value) {
+            Ok(Some(posted)) => {
+                self.posted_write = Some(posted);
+                Ok(())
+            }
+            Ok(None) => self
+                .mmio
+                .access_from_vcpu(address, width, value, true)
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            Err(error) => Err(error.to_string()),
         }
     }
 }
@@ -292,6 +333,20 @@ impl vm::VcpuHandler for RuntimeVcpu {
                     .map_err(|error| error.to_string())?;
                 Ok(vm::VcpuAction::Reenter)
             }
+            vm::VcpuExit::MmioRead(vm::MmioRead { address, width }) => {
+                self.settle_posted_write()?;
+                self.mmio
+                    .access_from_vcpu(address, width, 0, false)
+                    .map(vm::VcpuAction::MmioRead)
+                    .map_err(|error| error.to_string())
+            }
+            vm::VcpuExit::MmioWrite(vm::MmioWrite {
+                address,
+                width,
+                value,
+            }) => self
+                .write_device(address, width, value)
+                .map(|()| vm::VcpuAction::Reenter),
             exit => vm::VcpuHandler::exchange(&mut self.native, exit),
         }
     }
@@ -354,6 +409,206 @@ fn kernel_cmdline_for(frequency: Option<u64>) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::component::mmio::{DeviceError, Operation, Reply, Request};
+    use crate::component::relay;
+    use terra_platform::vm::VcpuHandler;
+
+    fn create_device_handler() -> (
+        RuntimeVcpu,
+        relay::Stream<Request>,
+        relay::Sink<Reply>,
+        tokio::task::JoinHandle<wasmtime::Result<()>>,
+    ) {
+        let engine = crate::engine::device_engine().unwrap();
+        let mut runtime =
+            crate::box_runtime::BoxRuntime::new(&engine, crate::box_runtime::BoxHost::new())
+                .unwrap();
+        runtime.initialize_mmio().unwrap();
+        crate::component::mmio::MmioDevice::grant_worker(
+            &mut runtime,
+            crate::machine::DeviceKind::Block,
+            Box::new(|_| Box::pin(async { unreachable!() })),
+        )
+        .unwrap();
+        let (native, _) = runtime.store.data_mut().platform.add_test_vcpu();
+        let instance = runtime.mmio.take().unwrap();
+        let handler = RuntimeVcpu::plain(native, instance.client(), runtime.lifecycle_notifier());
+        assert!(
+            instance
+                .devices
+                .set(
+                    instance
+                        .device_plan
+                        .into_iter()
+                        .map(|plan| plan.device)
+                        .collect()
+                )
+                .is_ok()
+        );
+        let (request_sink, requests) = relay::channel(relay::MMIO_CAPACITY);
+        let (replies, reply_stream) = relay::channel(relay::MMIO_CAPACITY);
+        let bridge = crate::component::mmio::bridge::create_component_loop(
+            crate::component::mmio::bridge::BridgeContext {
+                devices: instance.devices,
+                admission: instance.admission,
+            },
+            instance.sender,
+            instance.receiver,
+            vec![Some(crate::component::mmio::DeviceChannel {
+                requests: request_sink,
+                replies: reply_stream,
+                sequence: 0,
+            })],
+        );
+        let bridge = tokio::spawn(async move {
+            runtime
+                .store
+                .run_concurrent(async |accessor| bridge(accessor).await)
+                .await
+                .unwrap()
+        });
+        (handler, requests, replies, bridge)
+    }
+
+    fn device_accesses() -> [(vm::VcpuExit, Operation, u64, u64, vm::VcpuAction); 3] {
+        [
+            (
+                vm::VcpuExit::MmioRead(vm::MmioRead {
+                    address: 0x18,
+                    width: 4,
+                }),
+                Operation::Read,
+                0x18,
+                0,
+                vm::VcpuAction::MmioRead(0x42),
+            ),
+            (
+                vm::VcpuExit::MmioWrite(vm::MmioWrite {
+                    address: 0x18,
+                    width: 4,
+                    value: 7,
+                }),
+                Operation::Write,
+                0x18,
+                7,
+                vm::VcpuAction::Reenter,
+            ),
+            (
+                vm::VcpuExit::MmioWrite(vm::MmioWrite {
+                    address: 0x50,
+                    width: 4,
+                    value: 2,
+                }),
+                Operation::Write,
+                0x50,
+                2,
+                vm::VcpuAction::Reenter,
+            ),
+        ]
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn next_device_access_settles_the_posted_queue_kick() {
+        for (exit, operation, offset, value, expected) in device_accesses() {
+            let (mut handler, mut requests, mut replies, bridge) = create_device_handler();
+            assert_eq!(
+                handler.exchange(vm::VcpuExit::MmioWrite(vm::MmioWrite {
+                    address: 0x50,
+                    width: 4,
+                    value: 1,
+                })),
+                Ok(vm::VcpuAction::Reenter)
+            );
+            assert!(handler.posted_write.is_some());
+            let kick = requests.next().await.unwrap();
+            assert_eq!(
+                (kick.operation, kick.offset, kick.width, kick.value),
+                (Operation::Write, 0x50, 4, 1)
+            );
+            replies
+                .send(Reply {
+                    sequence: kick.sequence,
+                    value: 0,
+                    error: None,
+                })
+                .await
+                .unwrap();
+            let next_access = tokio::task::spawn_blocking(move || {
+                let action = handler.exchange(exit);
+                (handler, action)
+            });
+            let request = requests.next().await.unwrap();
+            assert_eq!(
+                (
+                    request.operation,
+                    request.offset,
+                    request.width,
+                    request.value
+                ),
+                (operation, offset, 4, value)
+            );
+            replies
+                .send(Reply {
+                    sequence: request.sequence,
+                    value: 0x42,
+                    error: None,
+                })
+                .await
+                .unwrap();
+            let (mut handler, action) = next_access.await.unwrap();
+            assert_eq!(action, Ok(expected));
+            assert_eq!(handler.posted_write.is_some(), offset == 0x50);
+            handler.settle_posted_write().unwrap();
+            bridge.abort();
+            assert!(bridge.await.unwrap_err().is_cancelled());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn next_device_access_reports_the_posted_queue_kick_failure() {
+        for (exit, ..) in device_accesses() {
+            let (mut handler, mut requests, mut replies, bridge) = create_device_handler();
+            assert_eq!(
+                handler.exchange(vm::VcpuExit::MmioWrite(vm::MmioWrite {
+                    address: 0x50,
+                    width: 4,
+                    value: 1,
+                })),
+                Ok(vm::VcpuAction::Reenter)
+            );
+            let kick = requests.next().await.unwrap();
+            replies
+                .send(Reply {
+                    sequence: kick.sequence,
+                    value: 0,
+                    error: Some(DeviceError::Io),
+                })
+                .await
+                .unwrap();
+            let (handler, action) = tokio::task::spawn_blocking(move || {
+                let action = handler.exchange(exit);
+                (handler, action)
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                action.unwrap_err(),
+                "MMIO block device error DeviceError::Io"
+            );
+            assert!(handler.posted_write.is_none());
+            assert!(
+                bridge
+                    .await
+                    .unwrap()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("MMIO block device error DeviceError::Io")
+            );
+            assert!(requests.next().await.is_none());
+        }
+    }
+
     #[test]
     fn kernel_cmdline_uses_the_native_clock_when_present() {
         assert_eq!(

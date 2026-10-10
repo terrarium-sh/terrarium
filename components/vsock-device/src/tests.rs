@@ -910,12 +910,12 @@ fn malformed_active_tcp_packets_retire_the_connection_number_and_discard_stale_b
 
 #[test]
 fn aggregate_transport_payload_limits_match_the_pinned_budget() {
-    assert_eq!(super::MAX_QUEUED_UPSTREAM_BYTES, 49248 * 1024);
+    assert_eq!(super::MAX_QUEUED_UPSTREAM_BYTES, 65632 * 1024);
     assert_eq!(super::MAX_QUEUED_REPLY_BYTES, 82304 * 1024);
     assert_eq!(
         terra_protocol::vsock::MAX_FLOW_UPSTREAM_BYTES
             + terra_protocol::vsock::MAX_FLOW_REPLY_BYTES,
-        128 * 1024 * 1024
+        144 * 1024 * 1024
     );
 }
 

@@ -7,7 +7,6 @@ struct Machine {
     vm: Vm,
     is_running: bool,
     vcpus: Option<Vec<super::terra::vmm::platform::Vcpu>>,
-    powered_cpus: Vec<bool>,
 }
 
 static VM: Mutex<Option<Machine>> = Mutex::new(None);
@@ -33,24 +32,13 @@ impl Guest for super::Dispatcher {
         if vcpus.is_empty() || vcpus.len() > usize::from(max_vcpus) {
             return Err(Error::InvalidVcpus);
         }
-        let mut powered_cpus = vec![false; vcpus.len()];
-        powered_cpus[0] = true;
         *machine = Some(Machine {
             vm,
             is_running: false,
             vcpus: Some(vcpus),
-            powered_cpus,
         });
         Ok(())
     }
-}
-
-pub(super) fn with_powered_cpus<T>(
-    apply: impl FnOnce(&mut [bool]) -> T,
-) -> Result<T, super::Error> {
-    let mut machine = lock_machine();
-    let machine = machine.as_mut().ok_or(super::Error::InvalidVcpu)?;
-    Ok(apply(&mut machine.powered_cpus))
 }
 
 pub fn request_stop() -> Result<(), Error> {
@@ -87,12 +75,7 @@ pub async fn run_vcpus() -> Result<(), super::Error> {
         machine.is_running = true;
         vcpus
     };
-    futures_util::future::try_join_all(
-        vcpus
-            .into_iter()
-            .zip(0_u8..)
-            .map(|(cpu, id)| super::run_vcpu(cpu, id)),
-    )
-    .await
-    .map(|_| ())
+    futures_util::future::try_join_all(vcpus.into_iter().map(super::run_vcpu))
+        .await
+        .map(|_| ())
 }

@@ -73,6 +73,9 @@ fuzz_target!(|bytes: &[u8]| {
     decode::<AgentOutput>(bytes);
     decode::<ControlRequest>(bytes);
     decode::<ControlReply>(bytes);
-    decode_broker::<terra_protocol::network::Request>(bytes);
-    decode_broker::<terra_protocol::network::Response>(bytes);
+    decode_broker::<terra_protocol::network::Open>(bytes);
+    decode_broker::<Result<terra_protocol::network::Opened, terra_protocol::network::Error>>(bytes);
+    decode_broker::<terra_protocol::network::TcpEvent>(bytes);
+    decode_broker::<terra_protocol::network::UdpRequest>(bytes);
+    decode_broker::<terra_protocol::network::UdpReply>(bytes);
 });

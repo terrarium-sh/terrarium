@@ -13,7 +13,8 @@ terra-limits = { path = "../terra-limits" }
 serde.workspace = true
 tokio = { version = "1", features = ["rt", "net", "io-util", "sync", "time", "macros"] }
 futures-util = { version = "0.3", default-features = false, features = ["alloc", "std"] }
-tokio-util = { version = "0.7", features = ["rt"] }
+tokio-util = { version = "0.7", features = ["rt", "compat"] }
+yamux = "=0.14.1"
 socket2 = "0.6"
 
 [target.'cfg(windows)'.dependencies]

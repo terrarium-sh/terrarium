@@ -11,6 +11,4 @@ wasmtime::component::bindgen!({
     },
 });
 
-pub use terra::vmm::{
-    lifecycle_platform, machine_types as machine, platform, virtualization, vmm_mmio_client,
-};
+pub use terra::vmm::{lifecycle_platform, machine_types as machine, platform, virtualization};

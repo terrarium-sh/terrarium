@@ -13,8 +13,7 @@ pub use host::{NetworkBackend, NetworkHost};
 pub fn start_test_broker(
     config: terra_network::config::Config,
 ) -> wasmtime::Result<NetworkBackend> {
-    let listeners = config.listeners.clone();
-    let broker = terra_network::Broker::bind(config)?;
+    let broker = terra_network::Broker::bind(&config)?;
     let ready = broker.ready();
     let (worker, endpoint) =
         tokio::io::duplex(terra_protocol::network::MAX_NETWORK_FRAME_BYTES * 2);
@@ -22,6 +21,6 @@ pub fn start_test_broker(
     Ok(NetworkBackend {
         client: terra_network::Client::new(worker),
         ready,
-        listeners,
+        listeners: config.listeners,
     })
 }

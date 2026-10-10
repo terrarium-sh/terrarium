@@ -13,4 +13,5 @@ pub mod filesystem;
 pub mod io;
 pub mod memory;
 pub mod process;
+pub mod psci;
 pub mod vm;

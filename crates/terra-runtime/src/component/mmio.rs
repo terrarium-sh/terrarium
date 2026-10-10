@@ -36,6 +36,8 @@ pub(crate) struct DeviceChannel {
 }
 
 const DEVICE_SPAN: u64 = 0x1000;
+/// The virtio-mmio `QueueNotify` register: the guest's queue kick, whose outcome it never reads.
+const QUEUE_NOTIFY_OFFSET: u64 = 0x050;
 pub(super) const COMMAND_CAPACITY: usize = 64;
 pub(super) const CONTROL_CAPACITY: usize = 64;
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -177,6 +179,7 @@ impl MmioInstance {
             sender: self.sender.clone(),
             admission: Arc::clone(&self.admission),
             failure: Arc::clone(&self.failure),
+            devices: Arc::clone(&self.devices),
         }
     }
     pub(crate) fn has_component(&self, kind: DeviceKind) -> bool {
@@ -189,66 +192,91 @@ pub(crate) struct Client {
     sender: Queue,
     admission: Arc<Mutex<Option<String>>>,
     failure: Arc<Mutex<Option<String>>>,
+    devices: DeviceRegistry,
 }
 
+/// A queue kick the vCPU did not wait for; [`Client::settle`] collects its outcome.
+pub(crate) struct PostedWrite(mpsc::Receiver<Result<RoutedReply, QueueError>>);
+
 impl Client {
-    async fn access(
+    /// Blocks the calling vCPU thread, so a device register access skips the VMM component.
+    pub(crate) fn access_from_vcpu(
         &self,
         address: u64,
         width: u8,
         value: u64,
         write: bool,
-    ) -> Result<u64, QueueError> {
-        submit_async(
+    ) -> wasmtime::Result<u64> {
+        if let Some(failure) = recorded_failure(&self.failure) {
+            return Err(wasmtime::Error::msg(failure));
+        }
+        let response = enqueue(
             &self.sender,
             &self.admission,
-            &self.failure,
             Command::Access(address, width, value, write),
-            None,
-        )
-        .await
-        .map(|reply| reply.reply.value)
+        )?;
+        self.await_value(&response)
     }
-}
 
-struct VmmMmioClient;
-
-impl wasmtime::component::HasData for VmmMmioClient {
-    type Data<'a> = &'a mut Option<Client>;
-}
-
-impl crate::component::vmm::bindings::vmm_mmio_client::Host for Option<Client> {}
-
-impl<T: Send + 'static> crate::component::vmm::bindings::vmm_mmio_client::HostWithStore<T>
-    for VmmMmioClient
-{
-    async fn access(
-        accessor: &wasmtime::component::Accessor<T, Self>,
+    /// Queues a queue kick without waiting for the device; `Ok(None)` means `address` is not a
+    /// kick and must be accessed with [`Client::access_from_vcpu`].
+    pub(crate) fn post_queue_notify(
+        &self,
         address: u64,
         width: u8,
         value: u64,
-        write: bool,
-    ) -> wasmtime::Result<u64> {
-        match accessor
-            .with(|mut store| store.get().clone())
-            .ok_or_else(|| wasmtime::Error::msg("VMM MMIO client is not initialized"))?
-            .access(address, width, value, write)
-            .await
-        {
-            Ok(value) => Ok(value),
-            Err(QueueError::Router(_)) => Ok(0),
-            Err(QueueError::Failure(error)) => Err(error),
+    ) -> wasmtime::Result<Option<PostedWrite>> {
+        if !self.is_queue_notify(address, width) {
+            return Ok(None);
         }
+        if let Some(failure) = recorded_failure(&self.failure) {
+            return Err(wasmtime::Error::msg(failure));
+        }
+        enqueue(
+            &self.sender,
+            &self.admission,
+            Command::Access(address, width, value, true),
+        )
+        .map(|response| Some(PostedWrite(response)))
+    }
+
+    pub(crate) fn settle(&self, posted: &PostedWrite) -> wasmtime::Result<()> {
+        self.await_value(&posted.0).map(|_| ())
+    }
+
+    fn is_queue_notify(&self, address: u64, width: u8) -> bool {
+        width == 4
+            && self.devices.get().is_some_and(|devices| {
+                devices.iter().any(|device| {
+                    owns_access(device, address, width)
+                        && address - device.base.load(Ordering::Acquire) == QUEUE_NOTIFY_OFFSET
+                })
+            })
+    }
+
+    fn await_value(
+        &self,
+        response: &mpsc::Receiver<Result<RoutedReply, QueueError>>,
+    ) -> wasmtime::Result<u64> {
+        let result = response
+            .recv_timeout(RESPONSE_TIMEOUT)
+            .map_err(|error| wasmtime::Error::msg(format!("MMIO response: {error}")))?
+            .map(|reply| reply.reply.value)
+            .map_err(|error| match recorded_failure(&self.failure) {
+                Some(failure) => QueueError::Failure(wasmtime::Error::msg(failure)),
+                None => error,
+            });
+        guest_access_value(result)
     }
 }
 
-pub(crate) fn add_vmm_client_to_linker(
-    linker: &mut wasmtime::component::Linker<crate::box_runtime::store::BoxHost>,
-) -> wasmtime::Result<()> {
-    crate::component::vmm::bindings::vmm_mmio_client::add_to_linker::<
-        crate::box_runtime::store::BoxHost,
-        VmmMmioClient,
-    >(linker, |host| &mut host.mmio_client)
+/// An access no device owns reads as zero and drops its write; only a bridge failure is an error.
+fn guest_access_value(result: Result<u64, QueueError>) -> wasmtime::Result<u64> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(QueueError::Router(_)) => Ok(0),
+        Err(QueueError::Failure(error)) => Err(error),
+    }
 }
 
 impl BoxRuntime {

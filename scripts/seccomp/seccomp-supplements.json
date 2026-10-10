@@ -2,18 +2,6 @@
   "version": 1,
   "rules": [
     {
-      "syscall": "writev",
-      "roles": ["vm", "network"],
-      "targets": [
-        "x86_64-unknown-linux-musl",
-        "aarch64-unknown-linux-musl",
-        "x86_64-unknown-linux-gnu",
-        "aarch64-unknown-linux-gnu"
-      ],
-      "reason": "Broker IPC writers gather up to eight frames already queued; scheduling can leave only one frame queued during a trace.",
-      "source": "crates/terra-network/src/writer.rs:write_queued_frames; crates/terra-runtime/src/self_test/network.rs:run_with_backend"
-    },
-    {
       "syscall": "sched_yield",
       "roles": ["supervisor", "vm", "network"],
       "targets": [

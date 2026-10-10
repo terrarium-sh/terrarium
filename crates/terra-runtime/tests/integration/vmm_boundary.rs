@@ -146,66 +146,6 @@ async fn wasm_vmm_routes_native_exits_and_stops_with_the_box() {
     .expect("unsupported MSR completion");
     assert_matches!(unsupported_msr, Completion::MsrFault);
 
-    let mmio = tokio::task::block_in_place(|| {
-        vcpu.exchange(Exit::MmioRead(
-            terra_runtime::component::vmm::platform::MmioRead {
-                address: X86_MMIO_BASE + 3 * X86_MMIO_STRIDE,
-                width: 4,
-            },
-        ))
-    })
-    .expect("MMIO completion");
-    assert_matches!(mmio, Completion::MmioRead(0x7472_6976));
-
-    let arm_read = tokio::task::block_in_place(|| {
-        vcpu.exchange(Exit::ArmException(
-            terra_runtime::component::vmm::platform::ArmException {
-                address: X86_MMIO_BASE + 3 * X86_MMIO_STRIDE,
-                syndrome: (0x24 << 26) | (1 << 24) | (2 << 22) | (4 << 16),
-                write_value: None,
-                hvc_registers: None,
-            },
-        ))
-    })
-    .expect("ARM MMIO read");
-    assert_matches!(
-        arm_read,
-        Completion::ArmRead(terra_runtime::component::vmm::platform::ArmRead {
-            register: Some(4),
-            value: 0x7472_6976
-        })
-    );
-    let arm_write = tokio::task::block_in_place(|| {
-        vcpu.exchange(Exit::ArmException(
-            terra_runtime::component::vmm::platform::ArmException {
-                address: X86_MMIO_BASE + 3 * X86_MMIO_STRIDE + 0x24,
-                syndrome: (0x24 << 26) | (1 << 24) | (2 << 22) | (7 << 16) | (1 << 6),
-                write_value: Some(0),
-                hvc_registers: None,
-            },
-        ))
-    })
-    .expect("ARM MMIO write");
-    assert_matches!(
-        arm_write,
-        Completion::ArmRead(terra_runtime::component::vmm::platform::ArmRead {
-            register: None,
-            ..
-        })
-    );
-    let hvc = tokio::task::block_in_place(|| {
-        vcpu.exchange(Exit::ArmException(
-            terra_runtime::component::vmm::platform::ArmException {
-                address: 0,
-                syndrome: 0x16 << 26,
-                write_value: None,
-                hvc_registers: Some((0x8400_0000, 0, 0, 0)),
-            },
-        ))
-    })
-    .expect("ARM HVC");
-    assert_matches!(hvc, Completion::HvcReturn(0x0001_0000));
-
     memory.close().expect("memory close");
     let shutdown_started = std::time::Instant::now();
     let stopped = tokio::task::block_in_place(|| vcpu.exchange(Exit::Shutdown));
@@ -323,29 +263,18 @@ async fn vcpu_failure_preserves_teardown_order_before_runtime_join() {
         })
         .await
         .expect("launch");
-    let cpu = receiver.recv().expect("native controller");
-    let mut outcome = runtime.lifecycle_notifier().subscribe();
+    let _cpu = receiver.recv().expect("native controller");
+    let lifecycle = runtime.lifecycle_notifier();
+    let mut outcome = lifecycle.subscribe();
     let running = runtime.start();
-    tokio::task::spawn_blocking(move || {
-        assert!(
-            cpu.exchange(Exit::HvcResult(
-                terra_runtime::component::vmm::platform::HvcResult {
-                    target: u8::MAX,
-                    status: 0,
-                },
-            ))
-            .is_err()
-        );
-    })
-    .await
-    .expect("native fault");
+    lifecycle.component_failed();
     tokio::time::timeout(Duration::from_secs(2), outcome.changed())
         .await
         .expect("failure outcome timeout")
         .expect("failure outcome");
     assert_eq!(*outcome.borrow_and_update(), Some(Outcome::ComponentFailed));
     let error = running.join().await.expect_err("vCPU failure");
-    assert!(error.to_string().contains("InvalidVcpu"), "{error:#}");
+    assert!(error.to_string().contains("component failed"), "{error:#}");
     assert_eq!(
         *order.lock().expect("order"),
         ["stop", "reap", "device", "interrupt"]

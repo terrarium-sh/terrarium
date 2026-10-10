@@ -1,7 +1,7 @@
 use crate::bindings::wasi::clocks::monotonic_clock;
 use crate::{switch, terra, transport, wake_worker};
 use futures_util::{
-    FutureExt as _,
+    FutureExt as _, StreamExt as _,
     future::{AbortHandle, Abortable, Either, poll_fn, select},
 };
 use std::{
@@ -639,37 +639,52 @@ pub(crate) async fn pump_upstream(
     }
 }
 
+/// Reads the stream in batches of up to `capacity` items; it ends after a batch that is empty or
+/// not `Complete`.
+fn batches<T: 'static>(
+    reader: wit_bindgen::StreamReader<T>,
+    capacity: usize,
+) -> impl futures_util::Stream<Item = Vec<T>> {
+    futures_util::stream::unfold(Some(reader), move |reader| async move {
+        let mut reader = reader?;
+        let (result, items) = reader.read(Vec::with_capacity(capacity)).await;
+        if items.is_empty() {
+            return None;
+        }
+        let is_complete = matches!(result, wit_bindgen::StreamResult::Complete(_));
+        Some((items, is_complete.then_some(reader)))
+    })
+}
+
 pub(crate) async fn pump_downstream(
     connection: ConnectionId,
-    mut output: wit_bindgen::StreamReader<u8>,
+    output: wit_bindgen::StreamReader<u8>,
     completion: Option<wit_bindgen::FutureReader<Result<(), broker::Error>>>,
 ) -> Result<(), broker::Error> {
+    let mut chunks = std::pin::pin!(batches(
+        output,
+        terra_protocol::network::MAX_NETWORK_READ_BYTES
+    ));
     loop {
-        let maximum_read_bytes = switch()
-            .send_capacity(connection)
-            .clamp(1, terra_protocol::network::MAX_NETWORK_READ_BYTES);
-        let read = std::pin::pin!(output.read(Vec::with_capacity(maximum_read_bytes)));
         let closed = std::pin::pin!(wait_receive_closed(connection));
-        let (result, bytes) = match select(read, closed).await {
-            Either::Left((result, _)) => result,
+        let chunk = match select(chunks.next(), closed).await {
+            Either::Left((Some(chunk), _)) => chunk,
+            Either::Left((None, _)) => break,
             Either::Right(_) => return Ok(()),
         };
-        let is_eof = !matches!(result, wit_bindgen::StreamResult::Complete(_)) || bytes.is_empty();
-        if let Err(error) = deliver_bytes(connection, bytes).await {
+        if let Err(error) = deliver_bytes(connection, chunk).await {
             return if error == SocketError::Closed {
                 Ok(())
             } else {
                 Err(broker::Error::Cancelled)
             };
         }
-        if is_eof {
-            if let Some(completion) = completion {
-                completion.await?;
-            }
-            shutdown_flow(connection);
-            return Ok(());
-        }
     }
+    if let Some(completion) = completion {
+        completion.await?;
+    }
+    shutdown_flow(connection);
+    Ok(())
 }
 
 #[cfg(test)]

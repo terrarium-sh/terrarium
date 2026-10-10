@@ -113,7 +113,6 @@ async fn every_device_resets_and_closes_in_one_box_runtime() {
             HostServiceAddresses::default().gateway_ip6.into(),
         ],
         listeners: Vec::new(),
-        limits: terra_network::config::Limits::default(),
     })
     .expect("network broker");
     let artifacts = support::artifacts::trusted_artifacts();

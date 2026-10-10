@@ -1,16 +1,17 @@
 //! One guest UDP socket per vsock stream: open once, then datagram frames both ways.
 
 use super::{
-    broker_error, deliver_message, deliver_opening, finish_flow, host_socket_address,
+    batches, broker_error, deliver_message, deliver_opening, finish_flow, host_socket_address,
     native_socket_address, read_message, read_opening, read_queued_message, reject_opening,
     reset_flow, resolve_destination, run_before_deadline, shutdown_flow,
 };
 use crate::terra::network::broker::{self, Udp};
 use futures_util::{
+    Stream, StreamExt as _,
     future::{Either, select},
     lock::Mutex,
 };
-use std::{cell::RefCell, net::SocketAddr};
+use std::{cell::RefCell, net::SocketAddr, pin::Pin};
 use terra_protocol::application::{Message, OPEN_TIMEOUT_SECS, StreamDecoder};
 use terra_protocol::network::{
     DATAGRAM_FRAME_OVERHEAD_BYTES, MAX_NETWORK_DATAGRAM_BATCH_BYTES, MAX_NETWORK_DATAGRAM_BYTES,
@@ -18,12 +19,12 @@ use terra_protocol::network::{
 };
 use terra_protocol::socket::Error as SocketError;
 use terra_vsock_device::{ConnectionId, Role};
-use wit_bindgen::rt::async_support::{FutureReader, StreamReader, StreamResult};
+use wit_bindgen::rt::async_support::FutureReader;
 
 const MAX_TRANSLATED_PEERS: usize = 16;
 
 pub(super) struct DatagramReceiver {
-    stream: StreamReader<broker::Datagram>,
+    stream: Pin<Box<dyn Stream<Item = Vec<broker::Datagram>>>>,
     completion: Option<FutureReader<Result<(), broker::Error>>>,
     pub(super) first_datagrams: Vec<broker::Datagram>,
 }
@@ -32,7 +33,7 @@ impl DatagramReceiver {
     pub(super) fn new(socket: &Udp) -> Self {
         let (stream, completion) = socket.receive_from();
         Self {
-            stream,
+            stream: Box::pin(batches(stream, MAX_NETWORK_DATAGRAMS)),
             completion: Some(completion),
             first_datagrams: Vec::new(),
         }
@@ -42,11 +43,7 @@ impl DatagramReceiver {
         if !self.first_datagrams.is_empty() {
             return Ok(Some(std::mem::take(&mut self.first_datagrams)));
         }
-        let (result, datagrams) = self
-            .stream
-            .read(Vec::with_capacity(MAX_NETWORK_DATAGRAMS))
-            .await;
-        if matches!(result, StreamResult::Complete(_)) && !datagrams.is_empty() {
+        if let Some(datagrams) = self.stream.next().await {
             return Ok(Some(datagrams));
         }
         if let Some(completion) = self.completion.take() {

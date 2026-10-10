@@ -22,6 +22,8 @@ use crate::machine::DeviceKind;
 use streams::FrontendStreams;
 use wasmtime_wasi::{WasiCtxView, WasiView};
 
+const TABLE_SLACK_ENTRIES: usize = 256;
+
 pub struct VsockHost {
     context: DeviceContext,
     streams: FrontendStreams,
@@ -36,9 +38,7 @@ impl VsockHost {
         backend: Option<NetworkBackend>,
     ) -> Self {
         context.ctx().table.set_max_capacity(
-            terra_network::MAX_RESOURCES
-                + terra_network::MAX_LISTENERS
-                + terra_network::MAX_QUEUED_REQUESTS / 2,
+            terra_network::MAX_RESOURCES + terra_network::MAX_LISTENERS + TABLE_SLACK_ENTRIES,
         );
         Self {
             context,

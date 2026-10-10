@@ -1,8 +1,8 @@
 use crate::macos::aarch64::machine::{Cpu, Machine, RunExit};
+use crate::psci::{self, PsciAction, PsciCall};
 use crate::vm::{
-    ArmException, ArmRead, BootState, CpuStart, HvcResult, InterruptControllerConfig,
-    InterruptMode, VcpuAction, VcpuExit, VcpuHandler, VcpuOutcome, VmCapabilities, VmConfig,
-    VmHandle,
+    ArmMmioAccess, ArmRegisterWrite, BootState, InterruptControllerConfig, InterruptMode,
+    VcpuHandler, VcpuOutcome, VmCapabilities, VmConfig, VmHandle,
 };
 use applevisor::prelude::VcpuHandle;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,13 +44,10 @@ impl CpuStarts {
         Ok(())
     }
 
-    fn start(&self, mpidr: u64, entry: u64, context: u64) -> i64 {
+    fn start(&self, cpu: usize, entry: u64, context: u64) -> i64 {
         if self.stopped.load(Ordering::SeqCst) {
             return -3;
         }
-        let Ok(cpu) = usize::try_from(mpidr) else {
-            return -2;
-        };
         let Some(sender) = self.senders.get(cpu) else {
             return -2;
         };
@@ -405,6 +402,42 @@ impl Drop for VcpuGroup {
     }
 }
 
+fn run_psci(cpu: &Cpu, starts: &CpuStarts) -> Result<CpuRun, String> {
+    let mut registers = [0; 4];
+    for (index, value) in (0..).zip(&mut registers) {
+        *value = cpu
+            .arm_register_value(index)
+            .map_err(|error| error.to_string())?;
+    }
+    let powered_cpus = starts
+        .started
+        .lock()
+        .map_err(|_| "powered CPU state poisoned")?
+        .clone();
+    let is_entry_valid =
+        |entry: u64| entry.is_multiple_of(4) && starts.machine.memory().read(entry, 4).is_ok();
+    let status = match psci::decide(
+        PsciCall::from_registers(registers),
+        &powered_cpus,
+        is_entry_valid,
+    ) {
+        PsciAction::Return(status) => status,
+        PsciAction::StartCpu {
+            target,
+            entry,
+            context,
+        } => starts.start(target, entry, context),
+        PsciAction::PowerOffCaller => return Ok(CpuRun::Off),
+        PsciAction::StopMachine => {
+            starts.stop();
+            return Ok(CpuRun::Stop);
+        }
+    };
+    cpu.set_reg(applevisor::prelude::Reg::X0, status.cast_unsigned())
+        .map_err(|error| error.to_string())?;
+    Ok(CpuRun::Continue)
+}
+
 fn run_one(
     cpu: &Cpu,
     cpu_id: usize,
@@ -424,53 +457,20 @@ fn run_one(
             physical_address,
             ..
         } => {
-            let exception = ArmException::capture(physical_address, syndrome, |register| {
-                cpu.arm_register_value(register)
-                    .map_err(|error| error.to_string())
-            })?;
-            let action = handler.exchange(VcpuExit::ArmException(exception))?;
-            match action {
-                VcpuAction::ArmRead(ArmRead { register, value }) => {
-                    cpu.set_arm_mmio_read(register, value)
-                        .map_err(|error| error.to_string())?;
-                    cpu.advance_pc().map_err(|error| error.to_string())?;
-                    Ok(CpuRun::Continue)
-                }
-
-                VcpuAction::HvcReturn(status) => {
-                    cpu.set_reg(applevisor::prelude::Reg::X0, status.cast_unsigned())
-                        .map_err(|error| error.to_string())?;
-                    Ok(CpuRun::Continue)
-                }
-                VcpuAction::CpuStart(CpuStart {
-                    target,
-                    entry,
-                    context,
-                }) => {
-                    let status = starts.start(u64::from(target), entry, context);
-                    let VcpuAction::HvcReturn(status) =
-                        handler.exchange(VcpuExit::HvcResult(HvcResult { target, status }))?
-                    else {
-                        return Err("unexpected PSCI start completion".to_owned());
-                    };
-                    cpu.set_reg(applevisor::prelude::Reg::X0, status.cast_unsigned())
-                        .map_err(|error| error.to_string())?;
-                    Ok(CpuRun::Continue)
-                }
-                VcpuAction::CpuOff => Ok(CpuRun::Off),
-                VcpuAction::SystemStop => {
-                    starts.stop();
-                    Ok(CpuRun::Stop)
-                }
-                VcpuAction::Start
-                | VcpuAction::Reenter
-                | VcpuAction::MmioRead(_)
-                | VcpuAction::PioZero
-                | VcpuAction::Rdmsr(_)
-                | VcpuAction::MsrFault
-                | VcpuAction::Wrmsr
-                | VcpuAction::IoApicValue(_) => Err("unexpected ARM VMM completion".to_owned()),
+            if let Some(access) = ArmMmioAccess::decode(syndrome)? {
+                let exit = access.exit(physical_address, |register| {
+                    cpu.arm_register_value(register)
+                        .map_err(|error| error.to_string())
+                })?;
+                let ArmRegisterWrite { register, value } =
+                    access.complete(handler.exchange(exit)?)?;
+                cpu.set_arm_mmio_read(register, value)
+                    .map_err(|error| error.to_string())?;
+            } else {
+                return run_psci(cpu, starts);
             }
+            cpu.advance_pc().map_err(|error| error.to_string())?;
+            Ok(CpuRun::Continue)
         }
         RunExit::Unknown => Err(format!("unexpected HVF exit on CPU {cpu_id}")),
     }
@@ -480,16 +480,16 @@ fn run_one(
 mod tests {
     use super::*;
     use crate::vm::GicConfig;
-    use std::assert_matches;
+    use crate::vm::{VcpuAction, VcpuExit};
     use std::time::Duration;
 
-    struct PowerOffHandler(mpsc::Sender<()>);
+    const CPU_OFF: u64 = 0x8400_0002;
 
-    impl VcpuHandler for PowerOffHandler {
+    struct NoExitsHandler;
+
+    impl VcpuHandler for NoExitsHandler {
         fn exchange(&mut self, exit: VcpuExit) -> Result<VcpuAction, String> {
-            assert_matches!(exit, VcpuExit::ArmException(_));
-            self.0.send(()).unwrap();
-            Ok(VcpuAction::CpuOff)
+            Err(format!("PSCI is answered by the platform: {exit:?}"))
         }
 
         fn finished(&mut self, _outcome: VcpuOutcome) {}
@@ -537,24 +537,22 @@ mod tests {
         let (ready_sender, ready_receiver) = mpsc::channel();
         let worker = spawn_cpu(cpu_id, Arc::clone(&starts), receiver, ready_sender).unwrap();
         ready_receiver.recv_timeout(STOP_WAIT).unwrap().unwrap();
-        let (off_sender, off_receiver) = mpsc::channel();
         sender
             .send(CpuCommand::Start {
-                handler: Box::new(PowerOffHandler(off_sender)),
+                handler: Box::new(NoExitsHandler),
                 boot: (cpu_id == 0).then_some(BootState {
                     entry,
-                    boot_argument: 0,
+                    boot_argument: CPU_OFF,
                 }),
             })
             .unwrap();
 
         let handles = starts.handles.lock().unwrap();
         let handle = handles[0].clone();
-        for context in 0..3 {
-            if cpu_id != 0 || context != 0 {
-                assert_eq!(starts.start(cpu_id as u64, entry, context), 0);
+        for round in 0..3 {
+            if cpu_id != 0 || round != 0 {
+                assert_eq!(starts.start(cpu_id, entry, CPU_OFF), 0);
             }
-            off_receiver.recv_timeout(STOP_WAIT).unwrap();
             let deadline = Instant::now() + STOP_WAIT;
             while starts.started.lock().unwrap()[cpu_id] && Instant::now() < deadline {
                 thread::yield_now();
@@ -563,7 +561,7 @@ mod tests {
             assert!(handle.is_valid());
         }
         starts.stopped.store(true, Ordering::SeqCst);
-        assert_eq!(starts.start(cpu_id as u64, entry, 0), -3);
+        assert_eq!(starts.start(cpu_id, entry, CPU_OFF), -3);
         sender.send(CpuCommand::Stop).unwrap();
         let deadline = Instant::now() + Duration::from_millis(100);
         while handle.is_valid() && Instant::now() < deadline {

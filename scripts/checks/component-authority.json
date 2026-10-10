@@ -157,9 +157,6 @@
     "terra:vmm@0.1.0/virtualization": [
       "[method]vm.request-stop",
       "[resource-drop]vm"
-    ],
-    "terra:vmm@0.1.0/vmm-mmio-client": [
-      "access"
     ]
   },
   "terra-vsock-frontend-component": {

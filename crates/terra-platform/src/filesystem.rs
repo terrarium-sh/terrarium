@@ -632,11 +632,11 @@ mod windows;
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::assert_matches;
 
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn share_root_and_metadata_handles_reject_symlinks_and_retain_inodes() {
+        use std::assert_matches;
         use std::io::{Read as _, Write as _};
         use std::os::unix::fs::{PermissionsExt as _, symlink};
 

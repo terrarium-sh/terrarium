@@ -67,11 +67,6 @@ impl MachineConfig {
         &self.devices
     }
 
-    #[must_use]
-    pub(crate) fn is_valid_cpu(&self, id: u8) -> bool {
-        id < self.vcpus
-    }
-
     pub(crate) fn device_slot(&self, kind: DeviceKind, ordinal: usize) -> wasmtime::Result<u8> {
         self.devices()
             .iter()

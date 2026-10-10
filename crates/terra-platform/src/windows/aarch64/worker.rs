@@ -1,7 +1,7 @@
 use crate::memory::GuestMemory;
 use crate::vm::{
-    ArmException, ArmRead, BootState, InterruptControllerConfig, InterruptMode, VcpuAction,
-    VcpuExit, VcpuHandler, VcpuOutcome, VmCapabilities, VmConfig, VmHandle, report_vcpu_failure,
+    ArmMmioAccess, ArmRegisterWrite, BootState, InterruptControllerConfig, InterruptMode,
+    VcpuHandler, VcpuOutcome, VmCapabilities, VmConfig, VmHandle, report_vcpu_failure,
 };
 use crate::windows::worker::VcpuGroup;
 use std::sync::Arc;
@@ -122,35 +122,22 @@ fn arm_mmio(
     pc: u64,
     syndrome: u64,
 ) -> Result<(), String> {
-    let exception = ArmException::capture(gpa, syndrome, |register| {
+    let read_register = |register| {
         partition
             .register_u64(vcpu, arm_general_register(register)?)
             .map_err(|error| error.to_string())
-    })?;
-    let action = handler.exchange(VcpuExit::ArmException(exception))?;
+    };
     let pc = pc.checked_add(4).ok_or("ARM PC overflow")?;
-    match action {
-        VcpuAction::ArmRead(ArmRead { register, value }) => {
-            let mut registers = vec![(crate::windows::aarch64::WHV_ARM64_REGISTER_PC, pc)];
-            if let Some(register) = register {
-                registers.push((arm_general_register(register)?, value));
-            }
-            arm_set_registers(partition, vcpu, &registers)?;
-            Ok(())
-        }
-        VcpuAction::Start
-        | VcpuAction::Reenter
-        | VcpuAction::MmioRead(_)
-        | VcpuAction::PioZero
-        | VcpuAction::Rdmsr(_)
-        | VcpuAction::MsrFault
-        | VcpuAction::Wrmsr
-        | VcpuAction::IoApicValue(_)
-        | VcpuAction::HvcReturn(_)
-        | VcpuAction::CpuStart(_)
-        | VcpuAction::CpuOff
-        | VcpuAction::SystemStop => Err("unexpected ARM VMM completion".to_owned()),
+    let mut registers = vec![(crate::windows::aarch64::WHV_ARM64_REGISTER_PC, pc)];
+    let access = ArmMmioAccess::decode(syndrome)?.ok_or_else(|| {
+        format!("WHP memory access exit without a data abort (syndrome {syndrome:#x})")
+    })?;
+    let ArmRegisterWrite { register, value } =
+        access.complete(handler.exchange(access.exit(gpa, read_register)?)?)?;
+    if let Some(register) = register {
+        registers.push((arm_general_register(register)?, value));
     }
+    arm_set_registers(partition, vcpu, &registers)
 }
 
 fn arm_general_register(
@@ -187,7 +174,7 @@ fn arm_set_registers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vm::GicConfig;
+    use crate::vm::{GicConfig, VcpuAction, VcpuExit};
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -199,18 +186,12 @@ mod tests {
 
     impl VcpuHandler for MmioSentinel {
         fn exchange(&mut self, exit: VcpuExit) -> Result<VcpuAction, String> {
-            let VcpuExit::ArmException(exception) = exit else {
+            let VcpuExit::MmioWrite(write) = exit else {
                 return Err(format!("unexpected sentinel exit {exit:?}"));
             };
-            assert_eq!(exception.address, 0x1000_0000);
-            assert_eq!(exception.syndrome >> 26, 0x24);
-            assert_ne!(exception.syndrome & (1 << 6), 0);
-            let value = exception.write_value.expect("MMIO source register");
-            self.writes.send((self.vcpu, value)).unwrap();
-            Ok(VcpuAction::ArmRead(ArmRead {
-                register: None,
-                value: 0,
-            }))
+            assert_eq!(write.address, 0x1000_0000);
+            self.writes.send((self.vcpu, write.value)).unwrap();
+            Ok(VcpuAction::Reenter)
         }
 
         fn finished(&mut self, outcome: VcpuOutcome) {

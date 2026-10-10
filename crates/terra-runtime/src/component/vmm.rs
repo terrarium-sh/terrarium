@@ -116,7 +116,6 @@ impl BoxRuntime {
             .mmio
             .as_ref()
             .ok_or_else(|| wasmtime::Error::msg("MMIO service missing"))?;
-        self.store.data_mut().mmio_client = Some(mmio.client());
         let linker = vmm_component_linker(self.store.engine())?;
         let instance = Vmm::instantiate_async(&mut self.store, component, &linker).await?;
         let machine = instance.terra_vmm_machine();
@@ -147,6 +146,5 @@ pub fn vmm_component_linker(
 ) -> wasmtime::Result<wasmtime::component::Linker<BoxHost>> {
     let mut linker = wasmtime::component::Linker::new(engine);
     crate::component::vmm::add_to_linker(&mut linker)?;
-    crate::component::mmio::add_vmm_client_to_linker(&mut linker)?;
     Ok(linker)
 }

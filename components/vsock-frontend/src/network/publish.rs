@@ -1,13 +1,14 @@
 //! Trusted TCP and UDP publication over frontend-initiated vsock streams.
 
 use super::{
-    Task, deliver_opening, finish_flow, lock_network, native_socket_address, register_flow,
-    reset_flow, run_before_deadline, shutdown_flow, spawn_task, tcp, udp, wait,
+    Task, batches, deliver_opening, finish_flow, lock_network, native_socket_address,
+    register_flow, reset_flow, run_before_deadline, shutdown_flow, spawn_task, tcp, udp, wait,
     wait_for_publication,
 };
 use crate::terra::network::broker::{self, Listener, Tcp, Udp};
 use crate::terra::network::types::{PublishedPort, Transport};
 use crate::{switch, transport};
+use futures_util::StreamExt as _;
 use futures_util::future::{AbortHandle, AbortRegistration, Abortable, poll_fn};
 use std::{
     sync::atomic::{AtomicU32, Ordering},
@@ -16,7 +17,6 @@ use std::{
 use terra_protocol::application::{Message, OPEN_TIMEOUT_SECS};
 use terra_protocol::socket::Error as SocketError;
 use terra_vsock_device::{ConnectionId, PUBLICATION_HOST_PORTS, VsockError};
-use wit_bindgen::rt::async_support::StreamResult;
 
 const MAX_HOST_PORT_ATTEMPTS: usize = terra_vsock_device::MAX_NETWORK_SOCKETS + 1;
 static NEXT_HOST_PORT: AtomicU32 = AtomicU32::new(PUBLICATION_HOST_PORTS.start);
@@ -52,17 +52,14 @@ pub(super) fn start_listeners(ports: &[PublishedPort]) -> Vec<Task> {
 }
 
 async fn serve_tcp_listener(listener: Listener, guest_port: u16) {
-    let (mut accepted, completion) = listener.accept();
-    loop {
-        let (result, sockets) = accepted.read(Vec::with_capacity(1)).await;
-        if !matches!(result, StreamResult::Complete(_)) || sockets.is_empty() {
-            let _ = completion.await;
-            return;
-        }
+    let (accepted, completion) = listener.accept();
+    let mut sockets = std::pin::pin!(batches(accepted, 1));
+    while let Some(sockets) = sockets.next().await {
         for socket in sockets {
             accept(guest_port, socket);
         }
     }
+    let _ = completion.await;
 }
 
 fn register_udp_flow(connection: ConnectionId) -> AbortRegistration {

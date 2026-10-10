@@ -79,9 +79,10 @@ mod tests {
         for (memory_mib, expected) in [
             (0, 0),
             (8, 0),
-            (16, 42),
-            (32, 128),
-            (200, 1024),
+            (16, 39),
+            (32, 118),
+            (200, 945),
+            (216, 1024),
             (400, 1024),
         ] {
             assert_eq!(flow_capacity(memory_mib << 20), expected);

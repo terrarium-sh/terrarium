@@ -223,6 +223,7 @@ def snapshot_worker_context_switches(processes):
                 fields = (task / "stat").read_text().rsplit(")", 1)[1].split()
                 status = (task / "status").read_text()
                 samples.append({"pid": pid, "tid": int(task.name), "start_ticks": fields[19], "role": process["role"],
+                                "comm": (task / "comm").read_text().strip(), "cpu_ticks": int(fields[11]) + int(fields[12]),
                                 **{name: int(re.search(rf"^{name}:\s+(\d+)$", status, re.MULTILINE)[1])
                                    for name in ("voluntary_ctxt_switches", "nonvoluntary_ctxt_switches")}})
         except (OSError, IndexError, TypeError, ValueError) as error:

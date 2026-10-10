@@ -23,7 +23,7 @@ component the union of all capabilities.
 | Component | Imported authority | Why it is present and what bounds it |
 | --- | --- | --- |
 | Interrupt controller | None | Receives topology and operations through exports. Native code validates GSI, vector, destination and cleanup outputs. |
-| VMM | VM/vCPU resources; lifecycle events; narrow MMIO `access` | The VM worker owns the prepared machine and can only issue an MMIO access. Resource methods are scoped to that machine. |
+| VMM | VM/vCPU resources; lifecycle events | Resource methods are scoped to the prepared machine. |
 | Boot | None | Receives machine configuration and kernel bytes through exports. Native code validates every segment and write before copying into bounded guest RAM. |
 | Block | Guest RAM, interrupt, disk capacity/read/write/discard/sync | One fixed-capacity disk grant and its assigned interrupt line; every disk range is checked. |
 | Filesystem | Guest RAM, interrupt, selected filesystem descriptor/preopen methods, `wait-for` | One recipe-selected directory preopen. Descriptor resource methods are registered individually; clock types carry timestamps and do not grant a clock call. |

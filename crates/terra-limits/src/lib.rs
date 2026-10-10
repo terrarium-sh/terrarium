@@ -34,11 +34,10 @@ const _: () = {
     assert!(X86_KVM_IDENTITY_MAP_ADDR + RAM_PAGE_SIZE == X86_KVM_TSS_ADDR);
     assert!(X86_KVM_TSS_ADDR + 3 * RAM_PAGE_SIZE <= X86_HIGH_RAM_BASE);
 };
-pub const NETWORK_TCP_READ_BUFFER_BYTES: usize = 32 * 1024;
+pub const NETWORK_TCP_READ_BUFFER_BYTES: usize = 64 * 1024;
 pub const NETWORK_SHARED_MEMORY_BYTES: usize = 8 << 20;
 // Admission estimates include payload queues, task state, and allocation overhead.
-pub const NETWORK_FLOW_MEMORY_BYTES: usize = 192 << 10;
-const _: () = assert!(3 * NETWORK_TCP_READ_BUFFER_BYTES + (16 << 10) <= NETWORK_FLOW_MEMORY_BYTES);
+pub const NETWORK_FLOW_MEMORY_BYTES: usize = 3 * NETWORK_TCP_READ_BUFFER_BYTES + (16 << 10);
 
 pub const MAX_BOOT_KERNEL_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_BOOT_KERNEL_PREFIX_BYTES: usize = 64 * 1024;

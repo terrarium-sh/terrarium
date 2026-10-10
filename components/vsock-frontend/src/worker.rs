@@ -1,4 +1,6 @@
+use crate::bindings::wasi::clocks::monotonic_clock;
 use crate::{WORK, agent, network, switch, terra, transport, wait_for_work};
+use futures_util::future::{Either, select};
 use terra::mmio::types::DeviceError;
 
 const MAX_DEVICE_STEPS: usize = 32;
@@ -43,7 +45,7 @@ pub async fn run() -> Result<(), DeviceError> {
             if progressed {
                 wit_bindgen::yield_async().await;
             } else if !transport::rearm_transmit_notifications()? {
-                wait_for_work().await;
+                wait_for_work_or_flush_held_interrupt().await?;
             }
         }
         Ok(())
@@ -54,6 +56,22 @@ pub async fn run() -> Result<(), DeviceError> {
     network::close();
     drop(relay);
     result
+}
+
+/// Idles until new work arrives; a held TX interrupt is raised if none comes in time.
+async fn wait_for_work_or_flush_held_interrupt() -> Result<(), DeviceError> {
+    if !transport::has_held_interrupt() {
+        wait_for_work().await;
+        return Ok(());
+    }
+    let work = std::pin::pin!(wait_for_work());
+    let timer = std::pin::pin!(monotonic_clock::wait_for(
+        transport::HELD_TX_INTERRUPT_NANOS
+    ));
+    if let Either::Right(_) = select(work, timer).await {
+        transport::flush_held_interrupt()?;
+    }
+    Ok(())
 }
 
 pub async fn finish() {

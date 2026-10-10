@@ -1994,6 +1994,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "windows-sys 0.61.2",
+ "yamux",
 ]
 
 [[package]]
@@ -2059,6 +2060,7 @@ dependencies = [
  "wasmtime",
  "wasmtime-wasi",
  "windows-sys 0.61.2",
+ "yamux",
 ]
 
 [[package]]

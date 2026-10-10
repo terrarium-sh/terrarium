@@ -144,7 +144,7 @@ written through an 8 MiB per-file cap. This prevents diagnostic floods from
 growing the host log without bound; it is not a general storage quota.
 
 Component memory has independent per-store Wasm linear-memory limits. The
-default is 16 MiB, raised to 200 MiB for the combined network frontend so its
+default is 16 MiB, raised to 216 MiB for the combined network frontend so its
 1024-flow table fits; configurable ceilings require at least 16 MiB. There is no combined
 component memory cap. Those limits do not bound guest RAM,
 native/WASI allocations, kernel socket memory, CPU time, disk use in writable
@@ -171,11 +171,10 @@ validated independently. Only broker-controlled resolution establishes learned
 address grants. TCP connections retain established-stream semantics; UDP
 rechecks authorization on send and receive as DNS-derived grants expire.
 
-Pipelined TCP uploads admit at most 4 chunks of 8 KiB per connection, including
-the active write, within the broker's global request and byte limits. The broker
-writes whole chunks in FIFO order. Cancelling a partly written chunk closes the
-write direction so later chunks cannot follow its truncated prefix. A queued
-half-close commits to draining earlier writes and rejects subsequent writes.
+Each broker operation is one flow-controlled stream, so a TCP upload buffers
+at most one stream window ahead of the socket. The broker writes upload bytes in
+order and acknowledges a half-close only after every earlier byte is written.
+Dropping the stream aborts the flow and closes the socket.
 
 The broker's native policy engine is trusted code. A native broker compromise
 can bypass its in-process destination rules and use networking allowed by its OS

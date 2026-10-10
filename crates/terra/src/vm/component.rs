@@ -98,69 +98,50 @@ pub(crate) async fn run_host_self_test_worker(
 }
 
 async fn exercise_broker_denials_and_limits(client: &terra_network::Client) -> Result<()> {
-    use terra_network::{Error, Operation, Reply};
+    use terra_network::Error;
     anyhow::ensure!(
-        client
-            .request(Operation::OpenTcp {
-                peer: "192.0.2.1:443".parse()?,
-                inline_urgent: false
-            })
-            .await
-            == Err(Error::AccessDenied),
+        client.open_tcp("192.0.2.1:443".parse()?, false).await.err() == Some(Error::AccessDenied),
         "broker broadened egress grants"
     );
     anyhow::ensure!(
-        client
-            .request(Operation::Resolve("denied.test".into()))
-            .await
-            == Err(Error::AccessDenied),
+        client.resolve("denied.test".into()).await == Err(Error::AccessDenied),
         "broker broadened name grants"
     );
     anyhow::ensure!(
-        client.request(Operation::Resolve("localhost".into())).await
-            == Err(Error::NameUnresolvable),
+        client.resolve("localhost".into()).await == Err(Error::NameUnresolvable),
         "broker learned a floored resolver answer"
     );
     anyhow::ensure!(
-        client.request(Operation::Accept(u32::MAX)).await == Err(Error::AccessDenied),
+        client.accept(u32::MAX).await.err() == Some(Error::AccessDenied),
         "broker broadened listener grants"
     );
-    anyhow::ensure!(
-        client.request(Operation::Cancel(u64::MAX)).await == Ok(Reply::Cancelled(false)),
-        "broker accepted a stale cancellation"
-    );
-    let mut handles = Vec::new();
+    let mut flows = Vec::new();
     for _ in 0..=terra_network::MAX_RESOURCES {
-        match client.request(Operation::OpenUdp).await {
-            Ok(Reply::Opened { handle, .. }) => handles.push(handle),
+        match client.open_udp().await {
+            Ok(flow) => flows.push(flow),
             Err(Error::LimitExceeded) => break,
-            result => anyhow::bail!("unexpected broker resource admission: {result:?}"),
+            Err(error) => anyhow::bail!("unexpected broker resource admission: {error:?}"),
         }
     }
     anyhow::ensure!(
-        !handles.is_empty() && handles.len() <= terra_network::MAX_RESOURCES,
+        !flows.is_empty() && flows.len() <= terra_network::MAX_RESOURCES,
         "broker resource limit failed"
     );
-    let handle = handles[0];
+    drop(flows);
+    let released = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match client.open_udp().await {
+                Err(Error::LimitExceeded) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                result => return result,
+            }
+        }
+    })
+    .await;
     anyhow::ensure!(
-        client
-            .request(Operation::Read {
-                handle,
-                max_bytes: 1
-            })
-            .await
-            == Err(Error::WrongKind),
-        "broker accepted wrong resource kind"
-    );
-    for handle in handles {
-        client
-            .request(Operation::Close(handle))
-            .await
-            .map_err(|error| anyhow::anyhow!("broker close: {error:?}"))?;
-    }
-    anyhow::ensure!(
-        client.request(Operation::Close(handle)).await == Err(Error::StaleHandle),
-        "broker accepted stale handle"
+        matches!(released, Ok(Ok(_))),
+        "broker kept dropped flows admitted"
     );
     Ok(())
 }
@@ -432,9 +413,7 @@ mod tests {
         assert!(super::super::supervisor::build_broker_config(&spec).is_err());
         spec.network_broker = Some(super::super::boot::BrokerMetadata {
             ready: terra_network::config::Ready {
-                version: terra_network::config::PROTOCOL_VERSION,
                 host_service_ports: Vec::new(),
-                blocks_direct_dns: true,
             },
             listeners: Vec::new(),
         });

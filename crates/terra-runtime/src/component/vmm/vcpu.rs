@@ -5,8 +5,6 @@ use std::sync::mpsc;
 use wasmtime::component::{Accessor, Resource};
 
 use super::{Completion, Error, Exit, Platform, PlatformHost, platform};
-use crate::machine::{Architecture, MachineConfig};
-use crate::memory::{BoundedMemory, GuestRam};
 use terra_platform::vm;
 
 pub(crate) const EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -42,18 +40,6 @@ fn native_exit(exit: vm::VcpuExit) -> Option<Exit> {
         vm::VcpuExit::Halt => Some(Exit::Halt),
         vm::VcpuExit::Shutdown => Some(Exit::Shutdown),
         vm::VcpuExit::Interrupted => Some(Exit::Interrupted),
-        vm::VcpuExit::MmioRead(vm::MmioRead { address, width }) => {
-            Some(Exit::MmioRead(platform::MmioRead { address, width }))
-        }
-        vm::VcpuExit::MmioWrite(vm::MmioWrite {
-            address,
-            width,
-            value,
-        }) => Some(Exit::MmioWrite(platform::MmioWrite {
-            address,
-            width,
-            value,
-        })),
         vm::VcpuExit::PioRead(vm::PioRead { port, length }) => {
             Some(Exit::PioRead(platform::PioRead { port, length }))
         }
@@ -66,21 +52,10 @@ fn native_exit(exit: vm::VcpuExit) -> Option<Exit> {
         vm::VcpuExit::Wrmsr(vm::Msr { index, value }) => {
             Some(Exit::Wrmsr(platform::Msr { index, value }))
         }
-        vm::VcpuExit::ArmException(vm::ArmException {
-            address,
-            syndrome,
-            write_value,
-            hvc_registers,
-        }) => Some(Exit::ArmException(platform::ArmException {
-            address,
-            syndrome,
-            write_value,
-            hvc_registers: hvc_registers.map(|[x0, x1, x2, x3]| (x0, x1, x2, x3)),
-        })),
-        vm::VcpuExit::HvcResult(vm::HvcResult { target, status }) => {
-            Some(Exit::HvcResult(platform::HvcResult { target, status }))
-        }
-        vm::VcpuExit::IoApicAccess(_) | vm::VcpuExit::IoApicEoi(_) => None,
+        vm::VcpuExit::MmioRead(_)
+        | vm::VcpuExit::MmioWrite(_)
+        | vm::VcpuExit::IoApicAccess(_)
+        | vm::VcpuExit::IoApicEoi(_) => None,
         vm::VcpuExit::Stopped => Some(Exit::Stopped),
     }
 }
@@ -89,33 +64,18 @@ fn native_action(action: Completion) -> vm::VcpuAction {
     match action {
         Completion::Start => vm::VcpuAction::Start,
         Completion::Reenter => vm::VcpuAction::Reenter,
-        Completion::MmioRead(value) => vm::VcpuAction::MmioRead(value),
         Completion::PioZero => vm::VcpuAction::PioZero,
         Completion::Rdmsr(value) => vm::VcpuAction::Rdmsr(value),
         Completion::MsrFault => vm::VcpuAction::MsrFault,
         Completion::Wrmsr => vm::VcpuAction::Wrmsr,
-        Completion::ArmRead(platform::ArmRead { register, value }) => {
-            vm::VcpuAction::ArmRead(vm::ArmRead { register, value })
-        }
-        Completion::HvcReturn(status) => vm::VcpuAction::HvcReturn(status),
-        Completion::CpuStart(platform::CpuStart {
-            target,
-            entry,
-            context,
-        }) => vm::VcpuAction::CpuStart(vm::CpuStart {
-            target,
-            entry,
-            context,
-        }),
-        Completion::CpuOff => vm::VcpuAction::CpuOff,
-        Completion::SystemStop => vm::VcpuAction::SystemStop,
     }
 }
 
 impl vm::VcpuHandler for NativeVcpu {
     fn exchange(&mut self, exit: vm::VcpuExit) -> Result<vm::VcpuAction, String> {
-        let exit = native_exit(exit)
-            .ok_or_else(|| "IOAPIC exits require the runtime interrupt adapter".to_owned())?;
+        let exit = native_exit(exit).ok_or_else(|| {
+            "MMIO and IOAPIC exits are answered by the runtime, not the VMM".to_owned()
+        })?;
         NativeVcpu::exchange(self, exit)
             .map(native_action)
             .map_err(|error| error.to_string())
@@ -157,46 +117,15 @@ pub(super) fn vcpu_channel() -> (NativeVcpu, Vcpu) {
     )
 }
 
-fn accepts_completion(
-    exit: &Exit,
-    completion: &Completion,
-    completion_grant: Option<(&MachineConfig, &GuestRam)>,
-) -> bool {
+fn accepts_completion(exit: &Exit, completion: &Completion) -> bool {
     match exit {
-        Exit::Halt | Exit::Interrupted | Exit::MmioWrite(_) | Exit::PioWrite(_) => {
+        Exit::Halt | Exit::Interrupted | Exit::PioWrite(_) => {
             matches!(completion, Completion::Reenter)
         }
-        Exit::MmioRead(_) => matches!(completion, Completion::MmioRead(_)),
         Exit::PioRead(_) => matches!(completion, Completion::PioZero),
         Exit::Rdmsr(_) => matches!(completion, Completion::Rdmsr(_) | Completion::MsrFault),
         Exit::Wrmsr(_) => matches!(completion, Completion::Wrmsr | Completion::MsrFault),
-        Exit::ArmException(_) => accepts_arm_completion(completion, completion_grant),
-        Exit::HvcResult(_) => matches!(completion, Completion::HvcReturn(_)),
         Exit::Shutdown | Exit::Stopped => false,
-    }
-}
-
-fn accepts_arm_completion(
-    completion: &Completion,
-    completion_grant: Option<(&MachineConfig, &GuestRam)>,
-) -> bool {
-    match completion {
-        Completion::ArmRead(read) => read.register.is_none_or(|register| register < 31),
-        Completion::HvcReturn(_) | Completion::CpuOff | Completion::SystemStop => true,
-        Completion::CpuStart(start) => completion_grant.is_some_and(|(config, ram)| {
-            config.architecture() == Architecture::Arm
-                && start.target != 0
-                && config.is_valid_cpu(start.target)
-                && start.entry.is_multiple_of(4)
-                && BoundedMemory::new(ram).read(start.entry, 4).is_ok()
-        }),
-        Completion::Start
-        | Completion::Reenter
-        | Completion::MmioRead(_)
-        | Completion::PioZero
-        | Completion::Rdmsr(_)
-        | Completion::MsrFault
-        | Completion::Wrmsr => false,
     }
 }
 
@@ -224,21 +153,7 @@ impl<T: Send + 'static> platform::HostVcpuWithStore<T> for Platform {
         })?;
         match rendezvous.state {
             VcpuState::AwaitingCompletion(pending) => {
-                let valid = if matches!(
-                    (&pending.exit, &completion),
-                    (Exit::ArmException(_), Completion::CpuStart(_))
-                ) {
-                    accessor.with(|mut store| {
-                        let (config, ram) = store.get().completion_grant()?;
-                        Ok::<_, wasmtime::Error>(accepts_completion(
-                            &pending.exit,
-                            &completion,
-                            Some((config, &ram)),
-                        ))
-                    })?
-                } else {
-                    accepts_completion(&pending.exit, &completion, None)
-                };
+                let valid = accepts_completion(&pending.exit, &completion);
                 if !valid {
                     return Ok(Err(Error::BadExit));
                 }
@@ -274,10 +189,9 @@ mod tests {
         let (_native, mut vcpu) = vcpu_channel();
         let (reply, response) = mpsc::sync_channel(1);
         vcpu.0.as_mut().unwrap().state = VcpuState::AwaitingCompletion(Pending {
-            exit: Exit::MmioWrite(platform::MmioWrite {
-                address: 0x70,
-                width: 4,
-                value: 128,
+            exit: Exit::PioWrite(platform::PioWrite {
+                port: 0x70,
+                length: 4,
             }),
             reply,
         });
@@ -417,28 +331,6 @@ mod tests {
             (vm::VcpuExit::Shutdown, Exit::Shutdown),
             (vm::VcpuExit::Interrupted, Exit::Interrupted),
             (
-                vm::VcpuExit::MmioRead(vm::MmioRead {
-                    address: 0x1234,
-                    width: 8,
-                }),
-                Exit::MmioRead(platform::MmioRead {
-                    address: 0x1234,
-                    width: 8,
-                }),
-            ),
-            (
-                vm::VcpuExit::MmioWrite(vm::MmioWrite {
-                    address: 0x2345,
-                    width: 4,
-                    value: 0x5678,
-                }),
-                Exit::MmioWrite(platform::MmioWrite {
-                    address: 0x2345,
-                    width: 4,
-                    value: 0x5678,
-                }),
-            ),
-            (
                 vm::VcpuExit::PioRead(vm::PioRead {
                     port: 0x1234,
                     length: 2,
@@ -478,30 +370,6 @@ mod tests {
                     value: 0x6789,
                 }),
             ),
-            (
-                vm::VcpuExit::ArmException(vm::ArmException {
-                    address: 0x1234,
-                    syndrome: 0x5678,
-                    write_value: Some(42),
-                    hvc_registers: None,
-                }),
-                Exit::ArmException(platform::ArmException {
-                    address: 0x1234,
-                    syndrome: 0x5678,
-                    write_value: Some(42),
-                    hvc_registers: None,
-                }),
-            ),
-            (
-                vm::VcpuExit::HvcResult(vm::HvcResult {
-                    target: 3,
-                    status: -2,
-                }),
-                Exit::HvcResult(platform::HvcResult {
-                    target: 3,
-                    status: -2,
-                }),
-            ),
             (vm::VcpuExit::Stopped, Exit::Stopped),
         ];
         for (input, expected) in cases {
@@ -517,6 +385,21 @@ mod tests {
             None
         );
         assert_eq!(native_exit(vm::VcpuExit::IoApicEoi(32)), None);
+        assert_eq!(
+            native_exit(vm::VcpuExit::MmioRead(vm::MmioRead {
+                address: 0x1234,
+                width: 8,
+            })),
+            None
+        );
+        assert_eq!(
+            native_exit(vm::VcpuExit::MmioWrite(vm::MmioWrite {
+                address: 0x2345,
+                width: 4,
+                value: 0x5678,
+            })),
+            None
+        );
     }
 
     #[test]
@@ -524,49 +407,10 @@ mod tests {
         let cases = [
             (Completion::Start, vm::VcpuAction::Start),
             (Completion::Reenter, vm::VcpuAction::Reenter),
-            (
-                Completion::MmioRead(0x1234),
-                vm::VcpuAction::MmioRead(0x1234),
-            ),
             (Completion::PioZero, vm::VcpuAction::PioZero),
             (Completion::Rdmsr(0x2345), vm::VcpuAction::Rdmsr(0x2345)),
             (Completion::MsrFault, vm::VcpuAction::MsrFault),
             (Completion::Wrmsr, vm::VcpuAction::Wrmsr),
-            (
-                Completion::ArmRead(platform::ArmRead {
-                    register: Some(7),
-                    value: 0x3456,
-                }),
-                vm::VcpuAction::ArmRead(vm::ArmRead {
-                    register: Some(7),
-                    value: 0x3456,
-                }),
-            ),
-            (
-                Completion::ArmRead(platform::ArmRead {
-                    register: None,
-                    value: 0x4567,
-                }),
-                vm::VcpuAction::ArmRead(vm::ArmRead {
-                    register: None,
-                    value: 0x4567,
-                }),
-            ),
-            (Completion::HvcReturn(-3), vm::VcpuAction::HvcReturn(-3)),
-            (
-                Completion::CpuStart(platform::CpuStart {
-                    target: 2,
-                    entry: 0x4567,
-                    context: 0x5678,
-                }),
-                vm::VcpuAction::CpuStart(vm::CpuStart {
-                    target: 2,
-                    entry: 0x4567,
-                    context: 0x5678,
-                }),
-            ),
-            (Completion::CpuOff, vm::VcpuAction::CpuOff),
-            (Completion::SystemStop, vm::VcpuAction::SystemStop),
         ];
         for (input, expected) in cases {
             assert_eq!(native_action(input), expected);
@@ -700,116 +544,12 @@ mod tests {
 
     #[test]
     fn rendezvous_rejects_completions_for_another_exit() {
-        let arm_exception = Exit::ArmException(platform::ArmException {
-            address: 0,
-            syndrome: 0,
-            write_value: None,
-            hvc_registers: None,
-        });
-        let arm_read = Completion::ArmRead(platform::ArmRead {
-            register: Some(31),
-            value: 0,
-        });
-
-        assert!(accepts_completion(&Exit::Halt, &Completion::Reenter, None));
+        assert!(accepts_completion(&Exit::Halt, &Completion::Reenter));
+        assert!(!accepts_completion(&Exit::Halt, &Completion::PioZero));
         assert!(!accepts_completion(
-            &Exit::Halt,
-            &Completion::MmioRead(0),
-            None
+            &Exit::PioRead(platform::PioRead { port: 0, length: 1 }),
+            &Completion::Reenter
         ));
-        assert!(accepts_completion(
-            &Exit::MmioRead(platform::MmioRead {
-                address: 0,
-                width: 4,
-            }),
-            &Completion::MmioRead(0),
-            None
-        ));
-        assert!(!accepts_completion(
-            &Exit::MmioRead(platform::MmioRead {
-                address: 0,
-                width: 4,
-            }),
-            &Completion::Reenter,
-            None
-        ));
-        assert!(!accepts_completion(&arm_exception, &arm_read, None));
-        assert!(!accepts_completion(
-            &Exit::Shutdown,
-            &Completion::Reenter,
-            None
-        ));
-
-        let ram = crate::memory::GuestRam::new(4096).unwrap();
-        let config =
-            MachineConfig::new(Architecture::Arm, ram.mapped_bytes(), 2, Vec::new()).unwrap();
-        for start in [
-            platform::CpuStart {
-                target: 0,
-                entry: 0,
-                context: 0,
-            },
-            platform::CpuStart {
-                target: 2,
-                entry: 0,
-                context: 0,
-            },
-            platform::CpuStart {
-                target: 1,
-                entry: 2,
-                context: 0,
-            },
-            platform::CpuStart {
-                target: 1,
-                entry: ram.address_limit(),
-                context: 0,
-            },
-        ] {
-            assert!(!accepts_completion(
-                &arm_exception,
-                &Completion::CpuStart(start),
-                Some((&config, &ram)),
-            ));
-        }
-        assert!(accepts_completion(
-            &arm_exception,
-            &Completion::CpuStart(platform::CpuStart {
-                target: 1,
-                entry: 0,
-                context: 0,
-            }),
-            Some((&config, &ram)),
-        ));
-    }
-
-    #[test]
-    fn arm_write_source_is_carried_in_one_rendezvous() {
-        let (mut native, mut component) = vcpu_channel();
-        let mut rendezvous = component.0.take().unwrap();
-        std::thread::scope(|scope| {
-            let task = scope.spawn(|| {
-                let exception =
-                    vm::ArmException::capture(0, (0x24 << 26) | (1 << 24) | (1 << 6), |register| {
-                        assert_eq!(register, 0);
-                        Ok::<_, String>(42)
-                    })
-                    .unwrap();
-                vm::VcpuHandler::exchange(&mut native, vm::VcpuExit::ArmException(exception))
-            });
-            let pending = rendezvous.exits.blocking_recv().unwrap();
-            let Exit::ArmException(exception) = pending.exit else {
-                panic!("ARM exception")
-            };
-            assert_eq!(exception.write_value, Some(42));
-            pending
-                .reply
-                .send(Completion::ArmRead(platform::ArmRead {
-                    register: None,
-                    value: 0,
-                }))
-                .unwrap();
-            assert_matches!(task.join().unwrap().unwrap(), vm::VcpuAction::ArmRead(_));
-            assert!(rendezvous.exits.try_recv().is_err());
-        });
+        assert!(!accepts_completion(&Exit::Shutdown, &Completion::Reenter));
     }
 }

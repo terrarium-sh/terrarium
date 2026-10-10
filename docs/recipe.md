@@ -61,7 +61,7 @@ memory. Operators set aggregate VM resource budgets through operating-system
 controls.
 
 When networking is enabled, the combined device/network frontend's ceiling is
-the larger of `components.memory_mib` and 200 MiB, enough for its full flow
+the larger of `components.memory_mib` and 216 MiB, enough for its full flow
 table. Local-only mode uses the ordinary component ceiling.
 
 A box has at most 1024 concurrent network flows. Outbound and published connections share this capacity. Requests

@@ -21,6 +21,7 @@ pub(crate) const MAX_CONTROL_TX_BYTES: usize = vsock::CONTROL_REPLY_BYTES;
 pub const HOST_CID: u64 = vsock::HOST_CID as u64;
 pub const GUEST_CID: u64 = vsock::GUEST_CID as u64;
 pub const MAX_DATA_BYTES: u32 = 64 * 1024;
+const _: () = assert!(terra_protocol::network::MAX_NETWORK_READ_BYTES == MAX_DATA_BYTES as usize);
 #[allow(clippy::cast_possible_truncation)]
 pub const AGENT_RX_ALLOC: u32 = vsock::AGENT_UPSTREAM_BYTES as u32;
 pub(crate) const MAX_AGENT_TX_BYTES: usize = vsock::AGENT_REPLY_BYTES;

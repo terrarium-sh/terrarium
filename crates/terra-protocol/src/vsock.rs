@@ -16,7 +16,7 @@ pub const AGENT_UPSTREAM_BYTES: usize = 64 * 1024;
 pub const AGENT_REPLY_BYTES: usize = 256 * 1024;
 pub const CONTROL_UPSTREAM_BYTES: usize = 32 * 1024;
 pub const CONTROL_REPLY_BYTES: usize = 128 * 1024;
-pub const FLOW_UPSTREAM_BYTES: usize = 48 * 1024;
+pub const FLOW_UPSTREAM_BYTES: usize = 64 * 1024;
 pub const FLOW_REPLY_BYTES: usize = 80 * 1024;
 pub const MAX_FLOW_UPSTREAM_BYTES: usize = MAX_NETWORK_SOCKETS * FLOW_UPSTREAM_BYTES;
 pub const MAX_FLOW_REPLY_BYTES: usize = MAX_NETWORK_SOCKETS * FLOW_REPLY_BYTES;
@@ -31,7 +31,7 @@ pub const fn is_flow_guest_port(port: u32) -> bool {
     port != 0 && port != AGENT_PORT && port != CONTROL_PORT && port != PUBLICATION_PORT
 }
 
-const _: () = assert!(MAX_FLOW_UPSTREAM_BYTES + MAX_FLOW_REPLY_BYTES == 128 * 1024 * 1024);
+const _: () = assert!(MAX_FLOW_UPSTREAM_BYTES + MAX_FLOW_REPLY_BYTES == 144 * 1024 * 1024);
 const _: () = assert!(crate::application::MAX_FRAME_BYTES <= FLOW_UPSTREAM_BYTES);
 const _: () = assert!(crate::application::MAX_FRAME_BYTES <= FLOW_REPLY_BYTES);
 
@@ -50,7 +50,7 @@ mod tests {
         for port in [AGENT_PORT, CONTROL_PORT, TCP_PORT, UDP_PORT] {
             assert!(!PUBLICATION_HOST_PORTS.contains(&port));
         }
-        assert_eq!(MAX_QUEUED_UPSTREAM_BYTES, 49248 * 1024);
+        assert_eq!(MAX_QUEUED_UPSTREAM_BYTES, 65632 * 1024);
         assert_eq!(MAX_QUEUED_REPLY_BYTES, 82304 * 1024);
     }
 }

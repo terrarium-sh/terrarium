@@ -228,13 +228,6 @@ impl PlatformHost {
     pub(crate) fn machine_config(&self) -> Option<&MachineConfig> {
         self.machine_grant().map(|grant| &grant.config)
     }
-
-    pub(crate) fn completion_grant(&self) -> wasmtime::Result<(&MachineConfig, GuestRam)> {
-        let grant = self
-            .machine_grant()
-            .ok_or_else(|| wasmtime::Error::msg("VM has no machine configuration"))?;
-        Ok((&grant.config, grant.ram.clone()))
-    }
 }
 
 impl virtualization::Host for PlatformHost {}

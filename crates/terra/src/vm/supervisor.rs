@@ -478,7 +478,6 @@ pub(crate) fn build_broker_config(spec: &BootSpec) -> Result<terra_network::conf
             super::HOST_SERVICE_ADDRESSES.gateway_ip6.into(),
         ],
         listeners,
-        limits: terra_network::config::Limits::default(),
     };
     config
         .policy
@@ -816,8 +815,7 @@ fn exchange_broker_startup(
                 )?
                 .context("network broker closed its readiness channel")?;
                 ensure!(
-                    ready.version == terra_network::config::PROTOCOL_VERSION
-                        && ready.host_service_ports.len() <= terra_policy::MAX_EXPANDED_RULES,
+                    ready.host_service_ports.len() <= terra_policy::MAX_EXPANDED_RULES,
                     "invalid broker readiness metadata"
                 );
                 Ok(ready)
@@ -869,7 +867,7 @@ pub(crate) fn run_broker() -> Result<ExitCode> {
         .max_blocking_threads(terra_network::MAX_RESOLVERS)
         .build()?;
     let result = runtime.block_on(async move {
-        let broker = terra_network::Broker::bind(config)?;
+        let broker = terra_network::Broker::bind(&config)?;
         startup.write_all(&terra_protocol::encode_frame_with_limit(
             &broker.ready(),
             terra_network::config::MAX_READY_BYTES,
@@ -983,18 +981,10 @@ mod tests {
 
     #[test]
     fn startup_exchange_rejects_invalid_metadata_and_absolute_timeout() {
-        for ready in [
-            terra_network::config::Ready {
-                version: terra_network::config::PROTOCOL_VERSION + 1,
-                host_service_ports: Vec::new(),
-                blocks_direct_dns: true,
-            },
-            terra_network::config::Ready {
-                version: terra_network::config::PROTOCOL_VERSION,
+        {
+            let ready = terra_network::config::Ready {
                 host_service_ports: vec![None; terra_policy::MAX_EXPANDED_RULES + 1],
-                blocks_direct_dns: true,
-            },
-        ] {
+            };
             let (startup, mut broker) = create_local_pair().unwrap();
             let worker = std::thread::spawn(move || {
                 let mut input = Vec::new();

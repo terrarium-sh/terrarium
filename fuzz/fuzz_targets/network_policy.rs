@@ -1,8 +1,8 @@
 #![no_main]
 
-use std::assert_matches;
 use arbitrary::{Arbitrary, Unstructured};
 use libfuzzer_sys::fuzz_target;
+use std::assert_matches;
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use terra::config::{Network, NetworkMode, StaticDnsRecord};
