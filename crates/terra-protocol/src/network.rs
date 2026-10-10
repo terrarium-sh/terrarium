@@ -1,6 +1,7 @@
 //! Bounded request/reply messages for the network broker.
 
-use serde::{Deserialize, Deserializer, Serialize};
+pub use crate::socket::Error;
+use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 pub const MAX_NETWORK_CHUNK_BYTES: usize = 8 * 1024;
@@ -29,7 +30,7 @@ pub struct Datagram {
     pub peer: SocketAddr,
     #[serde(
         serialize_with = "serde_bytes::serialize",
-        deserialize_with = "decode_datagram"
+        deserialize_with = "crate::bounded::bytes::<_, MAX_NETWORK_DATAGRAM_BYTES>"
     )]
     pub bytes: Vec<u8>,
 }
@@ -75,44 +76,25 @@ pub enum Operation {
     ReceiveDatagram(Handle),
     SendDatagrams {
         handle: Handle,
-        #[serde(deserialize_with = "decode_datagrams")]
+        #[serde(deserialize_with = "crate::bounded::vec::<_, _, MAX_NETWORK_DATAGRAMS>")]
         datagrams: Vec<Datagram>,
     },
     ShutdownWrite(Handle),
-    Resolve(#[serde(deserialize_with = "decode_name")] String),
+    Resolve(
+        #[serde(deserialize_with = "crate::bounded::string::<_, MAX_NETWORK_NAME_BYTES>")] String,
+    ),
     Cancel(RequestId),
     Close(Handle),
     WriteAll {
         handle: Handle,
         #[serde(
             serialize_with = "serde_bytes::serialize",
-            deserialize_with = "decode_chunk"
+            deserialize_with = "crate::bounded::bytes::<_, MAX_NETWORK_CHUNK_BYTES>"
         )]
         bytes: Vec<u8>,
     },
     OpenPublishedUdp(ListenerGrant),
     WaitError(Handle),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Error {
-    AccessDenied,
-    InvalidArgument,
-    InvalidState,
-    StaleHandle,
-    WrongKind,
-    Busy,
-    LimitExceeded,
-    DuplicateRequest,
-    Cancelled,
-    ConnectionRefused,
-    ConnectionReset,
-    TimedOut,
-    NameUnresolvable,
-    ResolverBusy,
-    DatagramTooLarge,
-    Closed,
-    Io,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,113 +113,26 @@ pub enum Reply {
     Data(
         #[serde(
             serialize_with = "serde_bytes::serialize",
-            deserialize_with = "decode_read"
+            deserialize_with = "crate::bounded::bytes::<_, MAX_NETWORK_READ_BYTES>"
         )]
         Vec<u8>,
     ),
     Eof,
     Written(u32),
-    Datagrams(#[serde(deserialize_with = "decode_datagrams")] Vec<Datagram>),
-    Resolved(#[serde(deserialize_with = "decode_addresses")] Vec<IpAddr>),
+    Datagrams(
+        #[serde(deserialize_with = "crate::bounded::vec::<_, _, MAX_NETWORK_DATAGRAMS>")]
+        Vec<Datagram>,
+    ),
+    Resolved(
+        #[serde(deserialize_with = "crate::bounded::vec::<_, _, MAX_NETWORK_ADDRESSES>")]
+        Vec<IpAddr>,
+    ),
     Cancelled(bool),
     Done,
-    Sent(#[serde(deserialize_with = "decode_send_failures")] Vec<SendFailure>),
-}
-
-fn decode_bounded_vec<'de, D: Deserializer<'de>, T: Deserialize<'de>, const MAX: usize>(
-    decoder: D,
-) -> Result<Vec<T>, D::Error> {
-    struct Bounded<T, const MAX: usize>(std::marker::PhantomData<T>);
-    impl<'de, T: Deserialize<'de>, const MAX: usize> serde::de::Visitor<'de> for Bounded<T, MAX> {
-        type Value = Vec<T>;
-        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(formatter, "at most {MAX} elements")
-        }
-        fn visit_seq<A: serde::de::SeqAccess<'de>>(
-            self,
-            mut sequence: A,
-        ) -> Result<Vec<T>, A::Error> {
-            if sequence.size_hint().is_some_and(|size| size > MAX) {
-                return Err(serde::de::Error::custom("network collection exceeds limit"));
-            }
-            let mut values = Vec::new();
-            while let Some(value) = sequence.next_element()? {
-                if values.len() == MAX {
-                    return Err(serde::de::Error::custom("network collection exceeds limit"));
-                }
-                values.push(value);
-            }
-            Ok(values)
-        }
-    }
-    decoder.deserialize_seq(Bounded::<T, MAX>(std::marker::PhantomData))
-}
-
-fn decode_chunk<'de, D: Deserializer<'de>>(decoder: D) -> Result<Vec<u8>, D::Error> {
-    decode_bounded_bytes::<D, MAX_NETWORK_CHUNK_BYTES>(decoder)
-}
-fn decode_read<'de, D: Deserializer<'de>>(decoder: D) -> Result<Vec<u8>, D::Error> {
-    decode_bounded_bytes::<D, MAX_NETWORK_READ_BYTES>(decoder)
-}
-fn decode_datagram<'de, D: Deserializer<'de>>(decoder: D) -> Result<Vec<u8>, D::Error> {
-    decode_bounded_bytes::<D, MAX_NETWORK_DATAGRAM_BYTES>(decoder)
-}
-
-fn decode_bounded_bytes<'de, D: Deserializer<'de>, const MAX: usize>(
-    decoder: D,
-) -> Result<Vec<u8>, D::Error> {
-    struct BoundedBytes<const MAX: usize>;
-
-    impl<'de, const MAX: usize> serde::de::Visitor<'de> for BoundedBytes<MAX> {
-        type Value = Vec<u8>;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(formatter, "at most {MAX} bytes")
-        }
-
-        fn visit_bytes<E: serde::de::Error>(self, bytes: &[u8]) -> Result<Vec<u8>, E> {
-            if bytes.len() > MAX {
-                return Err(E::custom("network bytes exceed limit"));
-            }
-            Ok(bytes.to_vec())
-        }
-
-        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, sequence: A) -> Result<Vec<u8>, A::Error> {
-            decode_bounded_vec::<_, u8, MAX>(serde::de::value::SeqAccessDeserializer::new(sequence))
-        }
-    }
-
-    decoder.deserialize_bytes(BoundedBytes::<MAX>)
-}
-fn decode_datagrams<'de, D: Deserializer<'de>>(decoder: D) -> Result<Vec<Datagram>, D::Error> {
-    decode_bounded_vec::<D, Datagram, MAX_NETWORK_DATAGRAMS>(decoder)
-}
-fn decode_send_failures<'de, D: Deserializer<'de>>(
-    decoder: D,
-) -> Result<Vec<SendFailure>, D::Error> {
-    decode_bounded_vec::<D, SendFailure, MAX_NETWORK_DATAGRAMS>(decoder)
-}
-fn decode_addresses<'de, D: Deserializer<'de>>(decoder: D) -> Result<Vec<IpAddr>, D::Error> {
-    decode_bounded_vec::<D, IpAddr, MAX_NETWORK_ADDRESSES>(decoder)
-}
-fn decode_name<'de, D: Deserializer<'de>>(decoder: D) -> Result<String, D::Error> {
-    struct Name;
-    impl serde::de::Visitor<'_> for Name {
-        type Value = String;
-        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(
-                formatter,
-                "a hostname of at most {MAX_NETWORK_NAME_BYTES} bytes"
-            )
-        }
-        fn visit_str<E: serde::de::Error>(self, name: &str) -> Result<String, E> {
-            if name.len() > MAX_NETWORK_NAME_BYTES {
-                return Err(E::custom("network hostname exceeds limit"));
-            }
-            Ok(name.into())
-        }
-    }
-    decoder.deserialize_str(Name)
+    Sent(
+        #[serde(deserialize_with = "crate::bounded::vec::<_, _, MAX_NETWORK_DATAGRAMS>")]
+        Vec<SendFailure>,
+    ),
 }
 
 #[cfg(test)]

@@ -31,14 +31,6 @@ pub struct SyncManifestBudget {
 
 impl SyncManifestBudget {
     #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            entries: 0,
-            metadata_bytes: 0,
-        }
-    }
-
-    #[must_use]
     pub const fn with_existing_entries(entries: usize) -> Self {
         Self {
             entries,
@@ -80,7 +72,7 @@ pub const MAX_SYNC_ERROR_BYTES: usize = 4096;
 
 /// Deterministic timestamp precision in nanoseconds: 1 microsecond (1,000 ns).
 /// Preserved identically across Linux ext4 (1 ns), APFS (1 ns), and Windows NTFS (100 ns).
-pub const SYNC_TIMESTAMP_PRECISION_NANOS: u32 = 1_000;
+const SYNC_TIMESTAMP_PRECISION_NANOS: u32 = 1_000;
 
 /// Truncate nanoseconds to [`SYNC_TIMESTAMP_PRECISION_NANOS`].
 #[must_use]
@@ -217,7 +209,7 @@ pub enum SyncReply {
     /// Operation completed successfully.
     Success,
     /// Operation failed; untrusted guest-chosen error message.
-    Err(#[serde(deserialize_with = "deserialize_sync_error")] String),
+    Err(#[serde(deserialize_with = "crate::bounded::string::<_, MAX_SYNC_ERROR_BYTES>")] String),
 }
 
 pub fn sync_file_times(seconds: i64, nanos: u32) -> std::io::Result<std::fs::FileTimes> {
@@ -264,7 +256,7 @@ where
 
 /// Validates the slash-separated relative path syntax used on the wire.
 /// Allows `""` to represent the synchronized root.
-pub fn validate_wire_relative_path(path: &str) -> Result<(), &'static str> {
+fn validate_wire_relative_path(path: &str) -> Result<(), &'static str> {
     if path.is_empty() {
         return Ok(());
     }
@@ -327,17 +319,6 @@ where
     Ok(truncate_nanos(nanos))
 }
 
-fn deserialize_sync_error<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let message = String::deserialize(deserializer)?;
-    if message.len() > MAX_SYNC_ERROR_BYTES {
-        return Err(D::Error::custom("error message exceeds length limit"));
-    }
-    Ok(message)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,7 +367,7 @@ mod tests {
             Err(SyncManifestLimit::Entries)
         );
 
-        let mut metadata_budget = SyncManifestBudget::new();
+        let mut metadata_budget = SyncManifestBudget::default();
         let metadata = "a".repeat(MAX_SYNC_METADATA_BYTES - 32);
         assert!(metadata_budget.add_entry(&metadata, None).is_ok());
         assert_eq!(

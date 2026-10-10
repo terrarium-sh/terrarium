@@ -4,8 +4,6 @@ use std::net::IpAddr;
 
 const DNS_HEADER_LEN: usize = 12;
 const DNS_HEADER_POINTER: u8 = 12;
-const DNS_ID_LEN: usize = 2;
-const DNS_U16_LEN: usize = 2;
 const DNS_FLAGS_OFFSET: usize = 2;
 const DNS_QDCOUNT_OFFSET: usize = 4;
 const DNS_QUESTION_FIXED_LEN: usize = 4;
@@ -17,14 +15,12 @@ const DNS_AAAA_RDATA_LEN: usize = 16;
 pub const DNS_RCODE_SERVFAIL: u16 = 2;
 pub const DNS_RCODE_NXDOMAIN: u16 = 3;
 const DNS_RCODE_MASK: u16 = 0x000f;
-const DNS_ONE_QUESTION: u16 = 1;
 const DNS_FLAG_RESPONSE: u16 = 0x8000;
 const DNS_FLAG_TRUNCATED: u16 = 0x0200;
-pub const DNS_UDP_RESPONSE_BYTES: usize = 512;
+const DNS_UDP_RESPONSE_BYTES: usize = 512;
 const DNS_FLAG_RECURSION_DESIRED: u16 = 0x0100;
 const DNS_FLAG_RECURSION_AVAILABLE: u16 = 0x0080;
 const DNS_POINTER_TAG: u8 = 0xc0;
-const DNS_POINTER_MASK: u8 = 0xc0;
 const DNS_POINTER_OFFSET_MASK: u8 = 0x3f;
 const DNS_MAX_COMPRESSION_JUMPS: usize = 16;
 const DNS_MAX_LABEL_LEN: usize = 63;
@@ -40,7 +36,7 @@ pub fn question_name(packet: &[u8]) -> Option<String> {
 /// the query id and question. Mirrors libkrun's `build_error_response`.
 #[must_use]
 pub fn error_response(query: &[u8], rcode: u16) -> Vec<u8> {
-    let id = query.get(..DNS_ID_LEN).unwrap_or(&[0, 0]);
+    let id = read_u16(query, 0).unwrap_or(0);
     let req_flags = read_u16(query, DNS_FLAGS_OFFSET).unwrap_or(0);
     let flags = DNS_FLAG_RESPONSE
         | (req_flags & DNS_FLAG_RECURSION_DESIRED)
@@ -48,19 +44,30 @@ pub fn error_response(query: &[u8], rcode: u16) -> Vec<u8> {
         | (rcode & DNS_RCODE_MASK);
 
     let question = first_question(query).map(|(_, question)| question);
-    let qdcount = u16::from(question.is_some());
+    let question_count = u16::from(question.is_some());
 
     let mut response = Vec::with_capacity(DNS_HEADER_LEN + question.as_ref().map_or(0, Vec::len));
-    response.extend_from_slice(id);
-    response.extend_from_slice(&flags.to_be_bytes());
-    response.extend_from_slice(&qdcount.to_be_bytes());
-    response.extend_from_slice(&0u16.to_be_bytes()); // ancount
-    response.extend_from_slice(&0u16.to_be_bytes()); // nscount
-    response.extend_from_slice(&0u16.to_be_bytes()); // arcount
+    response.extend_from_slice(&response_header(id, flags, question_count, 0));
     if let Some(question) = question {
         response.extend_from_slice(&question);
     }
     response
+}
+
+fn response_header(
+    id: u16,
+    flags: u16,
+    question_count: u16,
+    answer_count: u16,
+) -> [u8; DNS_HEADER_LEN] {
+    let mut header = [0; DNS_HEADER_LEN];
+    header[..2].copy_from_slice(&id.to_be_bytes());
+    header[DNS_FLAGS_OFFSET..DNS_FLAGS_OFFSET + 2].copy_from_slice(&flags.to_be_bytes());
+    header[DNS_QDCOUNT_OFFSET..DNS_QDCOUNT_OFFSET + 2]
+        .copy_from_slice(&question_count.to_be_bytes());
+    header[DNS_QDCOUNT_OFFSET + 2..DNS_QDCOUNT_OFFSET + 4]
+        .copy_from_slice(&answer_count.to_be_bytes());
+    header
 }
 
 #[must_use]
@@ -71,8 +78,7 @@ pub fn bound_udp_response(query: &[u8], response: Vec<u8>) -> Vec<u8> {
     let flags = read_u16(&response, DNS_FLAGS_OFFSET).unwrap_or(DNS_RCODE_SERVFAIL);
     let mut truncated = error_response(query, flags & DNS_RCODE_MASK);
     let flags = read_u16(&truncated, DNS_FLAGS_OFFSET).unwrap_or(0) | DNS_FLAG_TRUNCATED;
-    truncated[DNS_FLAGS_OFFSET..DNS_FLAGS_OFFSET + DNS_U16_LEN]
-        .copy_from_slice(&flags.to_be_bytes());
+    truncated[DNS_FLAGS_OFFSET..DNS_FLAGS_OFFSET + 2].copy_from_slice(&flags.to_be_bytes());
     truncated
 }
 
@@ -106,12 +112,8 @@ pub fn build_ip_response(query: &[u8], ips: &[IpAddr], ttl: u32) -> Vec<u8> {
     let mut response = Vec::with_capacity(
         DNS_HEADER_LEN + question.len() + ips.len() * (DNS_RR_FIXED_LEN + DNS_AAAA_RDATA_LEN),
     );
-    response.extend_from_slice(&query[..DNS_ID_LEN]);
-    response.extend_from_slice(&flags.to_be_bytes());
-    response.extend_from_slice(&DNS_ONE_QUESTION.to_be_bytes()); // qdcount
-    response.extend_from_slice(&ancount.to_be_bytes());
-    response.extend_from_slice(&0u16.to_be_bytes()); // nscount
-    response.extend_from_slice(&0u16.to_be_bytes()); // arcount
+    let id = read_u16(query, 0).unwrap_or(0);
+    response.extend_from_slice(&response_header(id, flags, 1, ancount));
     response.extend_from_slice(&question);
 
     // Name pointer to the question name at the fixed header offset.
@@ -132,28 +134,26 @@ pub fn build_ip_response(query: &[u8], ips: &[IpAddr], ttl: u32) -> Vec<u8> {
 }
 
 fn first_question(packet: &[u8]) -> Option<(String, Vec<u8>)> {
-    if packet.len() < DNS_HEADER_LEN || read_u16(packet, DNS_QDCOUNT_OFFSET)? != DNS_ONE_QUESTION {
+    if packet.len() < DNS_HEADER_LEN || read_u16(packet, DNS_QDCOUNT_OFFSET)? != 1 {
         return None;
     }
-    let (labels, after_name) = read_name(packet, DNS_HEADER_LEN)?;
-    let end = after_name + DNS_QUESTION_FIXED_LEN;
-    if end > packet.len() {
-        return None;
-    }
+    let mut name = String::new();
     let mut question = Vec::new();
-    for label in &labels {
-        question.push(u8::try_from(label.len()).ok()?);
-        question.extend_from_slice(label.as_bytes());
-    }
-    question.push(0);
-    question.extend_from_slice(&packet[after_name..end]);
-    Some((labels.join(".").to_ascii_lowercase(), question))
+    let after_name = read_name(packet, DNS_HEADER_LEN, &mut name, &mut question)?;
+    let end = after_name + DNS_QUESTION_FIXED_LEN;
+    question.extend_from_slice(packet.get(after_name..end)?);
+    name.make_ascii_lowercase();
+    Some((name, question))
 }
 
-/// The returned offset follows the encoded name in the original stream.
-fn read_name(packet: &[u8], offset: usize) -> Option<(Vec<String>, usize)> {
-    let mut labels = Vec::new();
-    let mut name_bytes = 0;
+/// Appends the dotted name to `name` and the uncompressed wire name to
+/// `question`. The returned offset follows the encoded name in the original stream.
+fn read_name(
+    packet: &[u8],
+    offset: usize,
+    name: &mut String,
+    question: &mut Vec<u8>,
+) -> Option<usize> {
     let mut pos = offset;
     let mut next_offset = offset;
     let mut jumped = false;
@@ -161,14 +161,14 @@ fn read_name(packet: &[u8], offset: usize) -> Option<(Vec<String>, usize)> {
 
     loop {
         let len = *packet.get(pos)?;
-        if len & DNS_POINTER_MASK == DNS_POINTER_TAG {
+        if len & DNS_POINTER_TAG == DNS_POINTER_TAG {
             let lo = *packet.get(pos + 1)?;
             let pointer = (((len & DNS_POINTER_OFFSET_MASK) as usize) << 8) | lo as usize;
             if pointer >= packet.len() {
                 return None;
             }
             if !jumped {
-                next_offset = pos + DNS_U16_LEN;
+                next_offset = pos + 2;
             }
             pos = pointer;
             jumped = true;
@@ -178,7 +178,7 @@ fn read_name(packet: &[u8], offset: usize) -> Option<(Vec<String>, usize)> {
             }
             continue;
         }
-        if len & DNS_POINTER_MASK != 0 {
+        if len & DNS_POINTER_TAG != 0 {
             return None;
         }
 
@@ -187,30 +187,33 @@ fn read_name(packet: &[u8], offset: usize) -> Option<(Vec<String>, usize)> {
             if !jumped {
                 next_offset = pos;
             }
-            break;
+            question.push(0);
+            return Some(next_offset);
         }
 
         let len = len as usize;
         if len > DNS_MAX_LABEL_LEN || pos + len > packet.len() {
             return None;
         }
-        name_bytes += len + usize::from(!labels.is_empty());
-        if name_bytes > DNS_MAX_NAME_BYTES {
+        if name.len() + len + usize::from(!name.is_empty()) > DNS_MAX_NAME_BYTES {
             return None;
         }
         let label = std::str::from_utf8(&packet[pos..pos + len]).ok()?;
-        labels.push(label.to_owned());
+        if !name.is_empty() {
+            name.push('.');
+        }
+        name.push_str(label);
+        question.push(u8::try_from(len).ok()?);
+        question.extend_from_slice(label.as_bytes());
         pos += len;
         if !jumped {
             next_offset = pos;
         }
     }
-
-    Some((labels, next_offset))
 }
 
 fn read_u16(buf: &[u8], offset: usize) -> Option<u16> {
-    let bytes = buf.get(offset..offset + DNS_U16_LEN)?;
+    let bytes = buf.get(offset..offset + 2)?;
     Some(u16::from_be_bytes([bytes[0], bytes[1]]))
 }
 

@@ -1,9 +1,6 @@
 use std::{env, fs::File, io};
 
-enum ImageKind {
-    Boot,
-    Kernel,
-}
+use terra_protocol::guest_image::GuestImage;
 
 fn main() -> io::Result<()> {
     let arguments: Vec<_> = env::args_os().skip(1).collect();
@@ -14,8 +11,8 @@ fn main() -> io::Result<()> {
         ));
     };
     let kind = match kind.to_str() {
-        Some("boot") => ImageKind::Boot,
-        Some("kernel") => ImageKind::Kernel,
+        Some("boot") => GuestImage::Boot,
+        Some("kernel") => GuestImage::Kernel,
         Some(_) | None => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -23,10 +20,7 @@ fn main() -> io::Result<()> {
             ));
         }
     };
-    let extra = match kind {
-        ImageKind::Boot => terra_protocol::guest_image::boot_image_extra(),
-        ImageKind::Kernel => terra_protocol::guest_image::kernel_image_extra(),
-    };
+    let extra = kind.marker();
     let mut source = File::open(source)?;
     let mut encoder = flate2::GzBuilder::new()
         .mtime(0)

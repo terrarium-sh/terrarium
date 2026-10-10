@@ -32,7 +32,7 @@ pub enum LifecycleEvent {
     Diagnostic {
         #[serde(
             serialize_with = "serde_bytes::serialize",
-            deserialize_with = "deserialize_diagnostic"
+            deserialize_with = "crate::bounded::bytes::<_, MAX_DIAGNOSTIC_EVENT_BYTES>"
         )]
         bytes: Vec<u8>,
     },
@@ -43,17 +43,6 @@ pub enum LifecycleEvent {
 
 pub const MAX_DIAGNOSTIC_EVENT_BYTES: usize = 64 << 10;
 pub const MAX_DIAGNOSTIC_FRAME_BYTES: usize = MAX_DIAGNOSTIC_EVENT_BYTES + 8;
-
-fn deserialize_diagnostic<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Vec<u8>, D::Error> {
-    use serde::de::Error as _;
-    let bytes: Vec<u8> = serde_bytes::deserialize(deserializer)?;
-    if bytes.len() > MAX_DIAGNOSTIC_EVENT_BYTES {
-        return Err(D::Error::custom("diagnostic exceeds the 65536-byte limit"));
-    }
-    Ok(bytes)
-}
 
 pub const CLOCK_SYNC: u8 = b'T';
 pub const CLOCK_SYNC_BYTES: usize = 13;

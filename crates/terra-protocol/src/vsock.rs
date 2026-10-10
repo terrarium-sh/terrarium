@@ -24,8 +24,6 @@ pub const MAX_QUEUED_UPSTREAM_BYTES: usize =
     AGENT_UPSTREAM_BYTES + CONTROL_UPSTREAM_BYTES + MAX_FLOW_UPSTREAM_BYTES;
 pub const MAX_QUEUED_REPLY_BYTES: usize =
     AGENT_REPLY_BYTES + CONTROL_REPLY_BYTES + MAX_FLOW_REPLY_BYTES;
-pub const MAX_GUEST_TCP_BUFFER_BYTES: usize = FLOW_UPSTREAM_BYTES + FLOW_REPLY_BYTES;
-pub const MAX_GUEST_TCP_BUFFERS_BYTES: usize = MAX_NETWORK_SOCKETS * MAX_GUEST_TCP_BUFFER_BYTES;
 
 /// Guest source ports a per-socket TCP or UDP stream may use.
 #[must_use]
@@ -34,7 +32,6 @@ pub const fn is_flow_guest_port(port: u32) -> bool {
 }
 
 const _: () = assert!(MAX_FLOW_UPSTREAM_BYTES + MAX_FLOW_REPLY_BYTES == 128 * 1024 * 1024);
-const _: () = assert!(MAX_GUEST_TCP_BUFFERS_BYTES == 128 * 1024 * 1024);
 const _: () = assert!(crate::application::MAX_FRAME_BYTES <= FLOW_UPSTREAM_BYTES);
 const _: () = assert!(crate::application::MAX_FRAME_BYTES <= FLOW_REPLY_BYTES);
 
@@ -43,19 +40,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fixed_endpoints_reserve_agent_control_and_combined_flow_budgets() {
-        assert_eq!(
-            (
-                HOST_CID,
-                GUEST_CID,
-                AGENT_PORT,
-                CONTROL_PORT,
-                TCP_PORT,
-                UDP_PORT,
-                PUBLICATION_PORT
-            ),
-            (2, 3, 6000, 6001, 6002, 6003, 6004)
-        );
+    fn flow_ports_exclude_reserved_endpoints_and_budgets_sum_agent_control_and_flows() {
         for port in [0, AGENT_PORT, CONTROL_PORT, PUBLICATION_PORT] {
             assert!(!is_flow_guest_port(port));
         }
@@ -65,7 +50,6 @@ mod tests {
         for port in [AGENT_PORT, CONTROL_PORT, TCP_PORT, UDP_PORT] {
             assert!(!PUBLICATION_HOST_PORTS.contains(&port));
         }
-        assert_eq!(MAX_NETWORK_SOCKETS, 1024);
         assert_eq!(MAX_QUEUED_UPSTREAM_BYTES, 49248 * 1024);
         assert_eq!(MAX_QUEUED_REPLY_BYTES, 82304 * 1024);
     }

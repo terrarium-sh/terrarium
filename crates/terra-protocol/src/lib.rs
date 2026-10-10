@@ -4,6 +4,7 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 
 pub mod application;
+mod bounded;
 pub mod control;
 pub mod dns;
 mod frames;
@@ -35,7 +36,7 @@ pub use plan::{
 pub use session::{AgentOutput, ClientInput, ControlReply, ControlRequest, ExecRequest, TermSize};
 pub use sync::{
     MAX_FILE_BYTES, MAX_SYNC_ENTRIES, MAX_SYNC_ERROR_BYTES, MAX_SYNC_METADATA_BYTES,
-    MAX_SYNC_PATH_BYTES, RootStatus, SYNC_TIMESTAMP_PRECISION_NANOS, SyncDirection, SyncEntry,
-    SyncEntryKind, SyncManifestBudget, SyncManifestLimit, SyncReply, SyncRequest, sync_file_times,
-    truncate_nanos, validate_relative_path, validate_wire_relative_path,
+    MAX_SYNC_PATH_BYTES, RootStatus, SyncDirection, SyncEntry, SyncEntryKind, SyncManifestBudget,
+    SyncManifestLimit, SyncReply, SyncRequest, sync_file_times, truncate_nanos,
+    validate_relative_path,
 };

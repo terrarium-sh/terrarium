@@ -5,9 +5,8 @@ fn load_boot_disk(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
 
     let mut decoder = flate2::read::GzDecoder::new(std::fs::File::open(path)?);
-    terra_protocol::guest_image::validate_boot_image_extra(
-        decoder.header().and_then(flate2::GzHeader::extra),
-    )?;
+    terra_protocol::guest_image::GuestImage::Boot
+        .validate(decoder.header().and_then(flate2::GzHeader::extra))?;
     let mut boot_disk = Vec::new();
     decoder.read_to_end(&mut boot_disk)?;
     Ok(boot_disk)
@@ -17,9 +16,8 @@ fn load_kernel(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
 
     let mut decoder = flate2::read::GzDecoder::new(std::fs::File::open(path)?);
-    terra_protocol::guest_image::validate_kernel_image_extra(
-        decoder.header().and_then(flate2::GzHeader::extra),
-    )?;
+    terra_protocol::guest_image::GuestImage::Kernel
+        .validate(decoder.header().and_then(flate2::GzHeader::extra))?;
     let mut kernel = Vec::new();
     decoder.read_to_end(&mut kernel)?;
     Ok(kernel)

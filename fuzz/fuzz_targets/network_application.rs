@@ -52,6 +52,6 @@ fuzz_target!(|bytes: &[u8]| {
             decode_stream(bytes, direction, chunk_bytes);
         }
     }
-    let _ = terra_protocol::guest_image::validate_boot_image_extra(Some(bytes));
-    let _ = terra_protocol::guest_image::validate_kernel_image_extra(Some(bytes));
+    let _ = terra_protocol::guest_image::GuestImage::Boot.validate(Some(bytes));
+    let _ = terra_protocol::guest_image::GuestImage::Kernel.validate(Some(bytes));
 });

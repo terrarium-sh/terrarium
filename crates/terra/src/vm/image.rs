@@ -256,9 +256,8 @@ pub fn load_kernel() -> Result<Vec<u8>> {
 
 fn decode_kernel_image(gzip: &[u8]) -> Result<Vec<u8>> {
     let mut decoder = flate2::read::GzDecoder::new(gzip);
-    terra_protocol::guest_image::validate_kernel_image_extra(
-        decoder.header().and_then(flate2::GzHeader::extra),
-    )?;
+    terra_protocol::guest_image::GuestImage::Kernel
+        .validate(decoder.header().and_then(flate2::GzHeader::extra))?;
     let mut kernel = Vec::new();
     decoder
         .read_to_end(&mut kernel)
@@ -272,9 +271,8 @@ pub fn load_boot_image() -> Result<Vec<u8>> {
 
 fn decode_boot_image(gzip: &[u8]) -> Result<Vec<u8>> {
     let mut decoder = flate2::read::GzDecoder::new(gzip);
-    terra_protocol::guest_image::validate_boot_image_extra(
-        decoder.header().and_then(flate2::GzHeader::extra),
-    )?;
+    terra_protocol::guest_image::GuestImage::Boot
+        .validate(decoder.header().and_then(flate2::GzHeader::extra))?;
     let mut image = Vec::new();
     decoder
         .read_to_end(&mut image)
@@ -316,7 +314,7 @@ mod tests {
         assert!(error.to_string().contains("rebuild"), "{error}");
 
         let mut encoder = flate2::GzBuilder::new()
-            .extra(terra_protocol::guest_image::boot_image_extra())
+            .extra(terra_protocol::guest_image::GuestImage::Boot.marker())
             .write(Vec::new(), flate2::Compression::fast());
         encoder.write_all(b"current guest image").unwrap();
         assert_eq!(
@@ -334,7 +332,7 @@ mod tests {
         assert!(error.to_string().contains("rebuild"), "{error}");
 
         let mut encoder = flate2::GzBuilder::new()
-            .extra(terra_protocol::guest_image::kernel_image_extra())
+            .extra(terra_protocol::guest_image::GuestImage::Kernel.marker())
             .write(Vec::new(), flate2::Compression::fast());
         encoder.write_all(b"current guest kernel").unwrap();
         assert_eq!(

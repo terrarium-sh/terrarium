@@ -1,6 +1,9 @@
 //! Frames for per-socket TCP/UDP streams, network control, and publication headers.
 
-use std::{fmt, net::SocketAddr};
+use std::{
+    fmt,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+};
 
 use crate::socket::{self, Error as ProtocolError};
 
@@ -8,7 +11,8 @@ pub const VERSION: u16 = 1;
 pub const HEADER_BYTES: usize = 8;
 const DNS_PREFIX_BYTES: usize = 8;
 const STATUS_BYTES: usize = 4;
-pub const MAX_PAYLOAD_BYTES: usize = socket::ENDPOINT_BYTES + socket::MAX_DATAGRAM_BYTES;
+const ENDPOINT_BYTES: usize = 20;
+pub const MAX_PAYLOAD_BYTES: usize = ENDPOINT_BYTES + socket::MAX_DATAGRAM_BYTES;
 pub const MAX_FRAME_BYTES: usize = HEADER_BYTES + MAX_PAYLOAD_BYTES;
 pub const MAX_OPENING_BYTES: usize = 64;
 pub const OPEN_TIMEOUT_SECS: u64 = 30;
@@ -24,7 +28,7 @@ pub enum Direction {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u16)]
-pub enum Opcode {
+enum Opcode {
     TcpOpen = 0x01,
     UdpOpen = 0x02,
     UdpSend = 0x03,
@@ -63,8 +67,7 @@ impl TryFrom<u16> for Opcode {
 }
 
 impl Opcode {
-    #[must_use]
-    pub const fn direction(self) -> Direction {
+    const fn direction(self) -> Direction {
         match self {
             Self::TcpOpen | Self::UdpOpen | Self::UdpSend | Self::Hello | Self::DnsQuery => {
                 Direction::GuestToHost
@@ -155,7 +158,7 @@ pub enum Message {
 
 impl Message {
     #[must_use]
-    pub const fn opcode(&self) -> Opcode {
+    const fn opcode(&self) -> Opcode {
         match self {
             Self::TcpOpen { .. } => Opcode::TcpOpen,
             Self::TcpOpened(_) => Opcode::TcpOpened,
@@ -174,7 +177,7 @@ impl Message {
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, ErrorCode> {
-        let mut frame = Vec::with_capacity(HEADER_BYTES + socket::ENDPOINT_BYTES);
+        let mut frame = Vec::with_capacity(HEADER_BYTES + ENDPOINT_BYTES);
         frame.resize(HEADER_BYTES, 0);
         match self {
             Self::TcpOpen {
@@ -190,7 +193,7 @@ impl Message {
                 frame.extend_from_slice(&u16::from(*inline_urgent).to_le_bytes());
                 frame.extend_from_slice(&0_u16.to_le_bytes());
                 match target {
-                    TcpTarget::Peer(peer) => frame.extend_from_slice(&encode_peer(*peer)?),
+                    TcpTarget::Peer(peer) => encode_peer(&mut frame, *peer)?,
                     TcpTarget::HostService(0) => return Err(ErrorCode::InvalidFrame),
                     TcpTarget::HostService(port) => {
                         frame.extend_from_slice(&port.to_le_bytes());
@@ -201,7 +204,7 @@ impl Message {
             Self::TcpOpened(outcome) => {
                 append_status(&mut frame, outcome.as_ref().err().copied());
                 if let Ok(peer) = outcome {
-                    frame.extend_from_slice(&encode_peer(*peer)?);
+                    encode_peer(&mut frame, *peer)?;
                 }
             }
             Self::UdpOpen | Self::Hello | Self::Ready => {
@@ -210,12 +213,12 @@ impl Message {
             }
             Self::UdpOpened(outcome) => append_status(&mut frame, outcome.err()),
             Self::UdpSend { peer, bytes } | Self::UdpDatagram { peer, bytes } => {
-                frame.extend_from_slice(&encode_peer(*peer)?);
+                encode_peer(&mut frame, *peer)?;
                 frame.extend_from_slice(datagram(bytes)?);
             }
             Self::UdpError { peer, error } => {
                 append_status(&mut frame, Some(*error));
-                frame.extend_from_slice(&encode_peer(*peer)?);
+                encode_peer(&mut frame, *peer)?;
             }
             Self::DnsQuery { id, stream, bytes } | Self::DnsResult { id, stream, bytes } => {
                 frame.extend_from_slice(&id.to_le_bytes());
@@ -230,7 +233,7 @@ impl Message {
                 frame.extend_from_slice(&VERSION.to_le_bytes());
                 frame.extend_from_slice(&guest_port.to_le_bytes());
                 if let Self::Publication { peer, .. } = self {
-                    frame.extend_from_slice(&encode_peer(*peer)?);
+                    encode_peer(&mut frame, *peer)?;
                 }
             }
         }
@@ -396,8 +399,41 @@ impl StreamDecoder {
     }
 }
 
-fn encode_peer(peer: SocketAddr) -> Result<Vec<u8>, ErrorCode> {
-    socket::encode_peer(peer).map_err(|_| ErrorCode::InvalidFrame)
+fn encode_peer(frame: &mut Vec<u8>, peer: SocketAddr) -> Result<(), ErrorCode> {
+    match peer {
+        SocketAddr::V4(peer) => {
+            frame.extend_from_slice(&[4, 0]);
+            frame.extend_from_slice(&peer.port().to_le_bytes());
+            frame.extend_from_slice(&peer.ip().octets());
+            frame.extend_from_slice(&[0; 12]);
+        }
+        SocketAddr::V6(peer) => {
+            if peer.flowinfo() != 0 || peer.scope_id() != 0 {
+                return Err(ErrorCode::InvalidFrame);
+            }
+            frame.extend_from_slice(&[6, 0]);
+            frame.extend_from_slice(&peer.port().to_le_bytes());
+            frame.extend_from_slice(&peer.ip().octets());
+        }
+    }
+    Ok(())
+}
+
+fn decode_peer(bytes: &[u8; ENDPOINT_BYTES]) -> Result<SocketAddr, ErrorCode> {
+    if bytes[1] != 0 {
+        return Err(ErrorCode::InvalidFrame);
+    }
+    let port = u16::from_le_bytes([bytes[2], bytes[3]]);
+    let address = match bytes[0] {
+        4 if bytes[8..] == [0; 12] => {
+            IpAddr::V4(Ipv4Addr::new(bytes[4], bytes[5], bytes[6], bytes[7]))
+        }
+        6 => IpAddr::V6(Ipv6Addr::from(
+            <[u8; 16]>::try_from(&bytes[4..]).map_err(|_| ErrorCode::InvalidFrame)?,
+        )),
+        _ => return Err(ErrorCode::InvalidFrame),
+    };
+    Ok(SocketAddr::new(address, port))
 }
 
 fn append_status(body: &mut Vec<u8>, error: Option<ProtocolError>) {
@@ -449,7 +485,9 @@ impl<'a> Body<'a> {
         }
     }
     fn peer(&mut self) -> Result<SocketAddr, ErrorCode> {
-        socket::decode_peer(self.take(socket::ENDPOINT_BYTES)?).map_err(|_| ErrorCode::InvalidFrame)
+        let bytes = <&[u8; ENDPOINT_BYTES]>::try_from(self.take(ENDPOINT_BYTES)?)
+            .map_err(|_| ErrorCode::InvalidFrame)?;
+        decode_peer(bytes)
     }
     fn status(&mut self) -> Result<Option<ProtocolError>, ErrorCode> {
         let status = self.u16()?;
@@ -459,9 +497,9 @@ impl<'a> Body<'a> {
         if status == 0 {
             return Ok(None);
         }
-        socket::Error::decode(u64::from(status))
+        ProtocolError::decode(u64::from(status))
             .map(Some)
-            .map_err(|_| ErrorCode::InvalidFrame)
+            .ok_or(ErrorCode::InvalidFrame)
     }
     fn remaining(&mut self) -> &'a [u8] {
         std::mem::take(&mut self.0)
@@ -475,8 +513,8 @@ impl<'a> Body<'a> {
     }
 }
 
-const _: () = assert!(HEADER_BYTES + 8 + socket::ENDPOINT_BYTES <= MAX_OPENING_BYTES);
-const _: () = assert!(HEADER_BYTES + STATUS_BYTES + socket::ENDPOINT_BYTES <= MAX_OPENING_BYTES);
+const _: () = assert!(HEADER_BYTES + 8 + ENDPOINT_BYTES <= MAX_OPENING_BYTES);
+const _: () = assert!(HEADER_BYTES + STATUS_BYTES + ENDPOINT_BYTES <= MAX_OPENING_BYTES);
 
 #[cfg(test)]
 mod tests {
@@ -512,6 +550,39 @@ mod tests {
                 .map(|(decoded, _)| decoded),
             Some(message.clone())
         );
+    }
+
+    #[test]
+    fn endpoints_pin_address_layout_and_reject_native_only_fields() {
+        let ipv4: SocketAddr = "203.0.113.1:443".parse().unwrap();
+        let mut bytes = Vec::new();
+        encode_peer(&mut bytes, ipv4).unwrap();
+        assert_eq!(
+            bytes,
+            [
+                4, 0, 0xbb, 1, 203, 0, 113, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+            ]
+        );
+        let decode =
+            |bytes: &[u8]| decode_peer(bytes.try_into().map_err(|_| ErrorCode::InvalidFrame)?);
+        assert_eq!(decode(&bytes), Ok(ipv4));
+        for peer in [ipv4, "[2001:db8::1]:53".parse().unwrap()] {
+            let mut encoded = Vec::new();
+            encode_peer(&mut encoded, peer).unwrap();
+            assert_eq!(decode(&encoded), Ok(peer));
+        }
+        for (offset, value) in [(0, 5), (1, 1), (8, 1)] {
+            let mut malformed = bytes.clone();
+            malformed[offset] = value;
+            assert_eq!(decode(&malformed), Err(ErrorCode::InvalidFrame));
+        }
+        for length in 0..ENDPOINT_BYTES {
+            assert!(decode(&bytes[..length]).is_err());
+        }
+        let mut scratch = Vec::new();
+        assert!(encode_peer(&mut scratch, "[fe80::1%1]:53".parse().unwrap()).is_err());
+        let flowinfo = std::net::SocketAddrV6::new(Ipv6Addr::LOCALHOST, 53, 1, 0);
+        assert!(encode_peer(&mut scratch, SocketAddr::V6(flowinfo)).is_err());
     }
 
     #[test]

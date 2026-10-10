@@ -413,7 +413,7 @@ fn scan_directory_tree(
     let mut state = ScanState {
         session_root,
         conn,
-        budget: SyncManifestBudget::new(),
+        budget: SyncManifestBudget::default(),
     };
     let mut queue = VecDeque::new();
     queue.push_back(PathBuf::new());

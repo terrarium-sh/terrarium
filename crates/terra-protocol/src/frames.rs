@@ -60,7 +60,6 @@ impl Write for FrameWriter {
 
 /// Encode any message as the one wire shape every terra channel uses: a
 /// `u32` LE length prefix plus Postcard.
-#[allow(clippy::cast_possible_truncation)]
 pub fn encode_frame<T: Serialize>(value: &T) -> io::Result<Vec<u8>> {
     encode_frame_with_limit(value, MAX_FRAME_BYTES)
 }

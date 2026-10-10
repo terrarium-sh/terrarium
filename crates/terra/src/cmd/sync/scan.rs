@@ -218,7 +218,7 @@ pub(super) async fn scan_guest_entries(
 ) -> Result<BTreeMap<String, SyncEntry>> {
     send_request(stream, &SyncRequest::ScanEntries).await?;
     let mut entries = BTreeMap::new();
-    let mut budget = SyncManifestBudget::new();
+    let mut budget = SyncManifestBudget::default();
 
     let deadline = Instant::now() + COPY_DATA_TIMEOUT;
     loop {

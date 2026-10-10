@@ -543,8 +543,8 @@ impl<T: WasiView + 'static> StreamProducer<T> for Accept {
 fn broker_error(error: Error) -> BrokerError {
     match error {
         Error::AccessDenied => BrokerError::AccessDenied,
-        Error::InvalidArgument => BrokerError::InvalidArgument,
-        Error::InvalidState => BrokerError::InvalidState,
+        Error::InvalidArgument | Error::NotSupported => BrokerError::InvalidArgument,
+        Error::InvalidState | Error::NotReady => BrokerError::InvalidState,
         Error::StaleHandle => BrokerError::StaleHandle,
         Error::WrongKind => BrokerError::WrongKind,
         Error::Busy => BrokerError::Busy,
@@ -558,7 +558,7 @@ fn broker_error(error: Error) -> BrokerError {
         Error::ResolverBusy => BrokerError::ResolverBusy,
         Error::DatagramTooLarge => BrokerError::DatagramTooLarge,
         Error::Closed => BrokerError::Closed,
-        Error::Io => BrokerError::Io,
+        Error::Io | Error::Protocol => BrokerError::Io,
     }
 }
 
