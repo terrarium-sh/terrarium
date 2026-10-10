@@ -116,10 +116,10 @@ pub(super) async fn configure_publication_addresses(
             "local",
         ])
         .process_group(0);
-    let (mut child, pidfd) = crate::reap::spawn_owned(|| command.spawn())
+    let (_, pidfd) = crate::reap::spawn_owned(|| command.spawn())
         .context("configuring the guest publication reply source")?;
     let timeout = std::time::Duration::from_secs(terra_protocol::application::OPEN_TIMEOUT_SECS);
-    let status = wait_for_child(&mut child, &pidfd, Some(timeout), cancellation)
+    let status = wait_for_child(&pidfd, timeout, cancellation)
         .await
         .context("configuring the guest publication reply source")?;
     ensure!(
@@ -148,12 +148,9 @@ pub(super) fn mount_filesystems(plan: &terra_protocol::Plan) -> Result<()> {
             Some("ext4"),
             MountFlags::NOSUID | MountFlags::NODEV,
         )?;
+        let (uid, gid) = crate::workload::workload_owner();
         if !plan.root
-            && let Err(error) = rustix::fs::chown(
-                &volume.guest,
-                Some(rustix::process::Uid::from_raw(terra_protocol::WORKLOAD_ID)),
-                Some(rustix::process::Gid::from_raw(terra_protocol::WORKLOAD_ID)),
-            )
+            && let Err(error) = rustix::fs::chown(&volume.guest, uid, gid)
         {
             eprintln!(
                 "terra-agent: warning: could not chown {}: {error}",
@@ -243,11 +240,8 @@ pub(super) async fn configure_user(as_root: bool, cancellation: &CancellationTok
     let runtime_dir = format!("/run/user/{}", terra_protocol::WORKLOAD_ID);
     fs::create_dir_all(&runtime_dir).with_context(|| format!("creating {runtime_dir}"))?;
     fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o700))?;
-    rustix::fs::chown(
-        &runtime_dir,
-        Some(rustix::process::Uid::from_raw(terra_protocol::WORKLOAD_ID)),
-        Some(rustix::process::Gid::from_raw(terra_protocol::WORKLOAD_ID)),
-    )?;
+    let (uid, gid) = crate::workload::workload_owner();
+    rustix::fs::chown(&runtime_dir, uid, gid)?;
     Ok(())
 }
 
@@ -297,11 +291,8 @@ fn setup_rootless_container_config() -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(error).with_context(|| format!("creating {config}")),
     }
-    rustix::fs::chown(
-        &config,
-        Some(rustix::process::Uid::from_raw(terra_protocol::WORKLOAD_ID)),
-        Some(rustix::process::Gid::from_raw(terra_protocol::WORKLOAD_ID)),
-    )?;
+    let (uid, gid) = crate::workload::workload_owner();
+    rustix::fs::chown(&config, uid, gid)?;
     Ok(())
 }
 
@@ -337,9 +328,7 @@ async fn run_quiet_command(command_name: &str, args: &[&str], cancellation: &Can
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     let status = match crate::reap::spawn_owned(|| command.spawn()) {
-        Ok((mut child, pidfd)) => {
-            wait_for_child(&mut child, &pidfd, Some(HOOK_TIMEOUT), cancellation).await
-        }
+        Ok((_, pidfd)) => wait_for_child(&pidfd, HOOK_TIMEOUT, cancellation).await,
         Err(error) => Err(error),
     };
     match status {

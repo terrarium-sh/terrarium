@@ -1,7 +1,8 @@
 //! The agent's exec service: one command execution per connection.
 
 use crate::AsyncFile;
-use crate::term::session::{MAX_COLS, MAX_ROWS, MIN_COLS, MIN_ROWS};
+use crate::reap::OwnedPidfd;
+use crate::term::session::clamp_term_size;
 use crate::term::tty::set_winsize;
 use std::fmt::Display;
 use std::os::fd::AsFd;
@@ -50,7 +51,7 @@ pub async fn serve_exec(conn: AsyncFile, workload_root: bool, cancel: Cancellati
 }
 
 async fn run_exec<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'static>(
-    reader: R,
+    mut reader: R,
     writer_conn: W,
     req: &ExecRequest,
     workload_root: bool,
@@ -73,20 +74,28 @@ async fn run_exec<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin +
             return;
         }
         Err(SpawnFailure::Setup(process)) => {
-            process.abort(writer_conn, &cancel).await;
+            abort_exec(process, writer_conn, &cancel).await;
             return;
         }
     };
 
     let writer = Mutex::new(writer_conn);
-    let (input_stop, input_task) = spawn_input_pump(
-        reader,
-        running.stdin,
-        is_tty,
-        running.process.clone(),
-        disconnect,
-        &cancel,
-    );
+    let input_stop = cancel.child_token();
+    let input_task = tokio::spawn({
+        let input_cancel = input_stop.clone();
+        let process = running.process.clone();
+        async move {
+            pump_input(
+                &mut reader,
+                running.stdin,
+                is_tty,
+                &process,
+                &disconnect,
+                input_cancel,
+            )
+            .await;
+        }
+    });
 
     let code = Box::pin(drive_output(
         running.output,
@@ -100,44 +109,25 @@ async fn run_exec<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin +
     let _ = write_output(&writer, AgentOutput::Exit { code }, &cancel).await;
 }
 
-#[derive(Clone)]
-struct ProcessGroup {
-    pidfd: Arc<crate::reap::OwnedPidfd>,
-    leader: rustix::process::Pid,
-}
-
-impl ProcessGroup {
-    fn new(pidfd: crate::reap::OwnedPidfd, leader: rustix::process::Pid) -> Self {
-        Self {
-            pidfd: Arc::new(pidfd),
-            leader,
-        }
-    }
-
-    fn kill(&self) {
-        crate::reap::signal_owned_process_group(
-            &self.pidfd,
-            self.leader,
-            rustix::process::Signal::KILL,
-        );
-    }
-
-    async fn abort<W: AsyncWrite + Unpin>(self, mut conn: W, cancel: &CancellationToken) {
-        self.kill();
-        let _ = crate::reap::wait_owned(&self.pidfd).await;
-        let _ = write_exec(&mut conn, &AgentOutput::Exit { code: EXEC_NOT_RUN }, cancel).await;
-    }
+async fn abort_exec<W: AsyncWrite + Unpin>(
+    process: Arc<OwnedPidfd>,
+    mut conn: W,
+    cancel: &CancellationToken,
+) {
+    process.signal_group(rustix::process::Signal::KILL);
+    let _ = crate::reap::wait_owned(&process).await;
+    let _ = write_exec(&mut conn, &AgentOutput::Exit { code: EXEC_NOT_RUN }, cancel).await;
 }
 
 struct RunningProcess {
-    process: ProcessGroup,
+    process: Arc<OwnedPidfd>,
     stdin: AsyncFile,
     output: ExecOutput,
 }
 
 enum SpawnFailure {
     Launch(String),
-    Setup(ProcessGroup),
+    Setup(Arc<OwnedPidfd>),
 }
 
 fn spawn_pty(
@@ -147,7 +137,7 @@ fn spawn_pty(
     workload_root: bool,
     term: TermSize,
 ) -> Result<RunningProcess, SpawnFailure> {
-    let (pty, child, child_pidfd) = match crate::workload::spawn_on_pty(
+    let (pty, _, child_pidfd) = match crate::workload::spawn_on_pty(
         cmd,
         args,
         term,
@@ -161,8 +151,7 @@ fn spawn_pty(
             return Err(SpawnFailure::Launch(error.to_string()));
         }
     };
-    let leader = rustix::process::Pid::from_child(&child);
-    let process = ProcessGroup::new(child_pidfd, leader);
+    let process = Arc::new(child_pidfd);
     let master: std::os::fd::OwnedFd = pty.into();
     let Ok(output_master) = master.try_clone() else {
         return Err(SpawnFailure::Setup(process));
@@ -180,7 +169,6 @@ fn spawn_pty(
     })
 }
 
-#[allow(unsafe_code)]
 fn spawn_pipes(
     cmd: &str,
     args: &[String],
@@ -203,10 +191,7 @@ fn spawn_pipes(
         command.current_dir(workdir);
     }
     if !(req.as_root || workload_root) {
-        // SAFETY: as in `spawn_on_pty` - async-signal-safe id-setting only.
-        unsafe {
-            command.pre_exec(crate::workload::drop_privileges);
-        }
+        crate::workload::run_as_workload(&mut command);
     }
     let (mut child, child_pidfd) = match crate::reap::spawn_owned(|| command.spawn()) {
         Ok(child) => child,
@@ -214,8 +199,7 @@ fn spawn_pipes(
             return Err(SpawnFailure::Launch(error.to_string()));
         }
     };
-    let leader = rustix::process::Pid::from_child(&child);
-    let process = ProcessGroup::new(child_pidfd, leader);
+    let process = Arc::new(child_pidfd);
     let (Some(stdin), Some(stdout), Some(stderr)) =
         (child.stdin.take(), child.stdout.take(), child.stderr.take())
     else {
@@ -235,36 +219,11 @@ fn spawn_pipes(
     })
 }
 
-fn spawn_input_pump<R: AsyncRead + Unpin + Send + 'static>(
-    reader: R,
-    stdin: AsyncFile,
-    is_tty: bool,
-    process: ProcessGroup,
-    disconnect: tokio::io::unix::AsyncFd<std::fs::File>,
-    cancel: &CancellationToken,
-) -> (CancellationToken, tokio::task::JoinHandle<()>) {
-    let input_stop = cancel.child_token();
-    let input_cancel = input_stop.clone();
-    let handle = tokio::spawn(async move {
-        let mut reader = reader;
-        pump_input(
-            &mut reader,
-            stdin,
-            is_tty,
-            &process,
-            &disconnect,
-            input_cancel,
-        )
-        .await;
-    });
-    (input_stop, handle)
-}
-
 async fn pump_input<R: AsyncRead + Unpin>(
     reader: &mut R,
     stdin: AsyncFile,
     is_tty: bool,
-    process: &ProcessGroup,
+    process: &Arc<OwnedPidfd>,
     monitor: &tokio::io::unix::AsyncFd<std::fs::File>,
     cancel: CancellationToken,
 ) {
@@ -275,11 +234,8 @@ async fn pump_input<R: AsyncRead + Unpin>(
                 ClientInput::Keys(bytes) => bytes,
                 ClientInput::Resize(TermSize { rows, cols }) if is_tty && rows > 0 && cols > 0 => {
                     if let Some(stdin) = stdin.as_ref() {
-                        set_winsize(
-                            stdin.get_ref().as_fd(),
-                            rows.clamp(MIN_ROWS, MAX_ROWS),
-                            cols.clamp(MIN_COLS, MAX_COLS),
-                        );
+                        let (rows, cols) = clamp_term_size(rows, cols);
+                        set_winsize(stdin.get_ref().as_fd(), rows, cols);
                     }
                     continue;
                 }
@@ -307,7 +263,7 @@ async fn pump_input<R: AsyncRead + Unpin>(
         _ = forward => {},
         _ = wait_read_closed(monitor) => {},
     }
-    process.kill();
+    process.signal_group(rustix::process::Signal::KILL);
 }
 
 async fn wait_read_closed(
@@ -333,13 +289,13 @@ enum ExecOutput {
 async fn drive_output<W: AsyncWrite + Unpin>(
     output: ExecOutput,
     writer: &Mutex<W>,
-    process: &ProcessGroup,
+    process: &Arc<OwnedPidfd>,
     cancel: &CancellationToken,
 ) -> i32 {
     let (exited_tx, exited_rx) = watch::channel(false);
     let waiter_process = process.clone();
     let waiter = tokio::spawn(async move {
-        let status = crate::reap::wait_owned(&waiter_process.pidfd).await;
+        let status = crate::reap::wait_owned(&waiter_process).await;
         let _ = exited_tx.send(true);
         status
     });
@@ -361,7 +317,7 @@ async fn drive_output<W: AsyncWrite + Unpin>(
         .map(|_| ()),
     };
     if output.is_err() {
-        process.kill();
+        process.signal_group(rustix::process::Signal::KILL);
     }
     let code = exit_code(
         waiter
@@ -797,10 +753,7 @@ mod tests {
         let mut server =
             crate::into_async_file(File::from(std::os::fd::OwnedFd::from(server))).unwrap();
         let pidfd = Arc::new(pidfd);
-        let process = ProcessGroup {
-            pidfd: pidfd.clone(),
-            leader: rustix::process::Pid::from_child(&child),
-        };
+        let process = pidfd.clone();
         let cancel = CancellationToken::new();
         let mut pump = tokio::spawn(async move {
             pump_input(&mut server, stdin, false, &process, &monitor, cancel).await;

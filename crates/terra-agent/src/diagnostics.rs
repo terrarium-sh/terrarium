@@ -72,13 +72,7 @@ impl Diagnostics {
             started: _,
         } = self;
         drop(sender);
-        if tokio::time::timeout(Duration::from_secs(1), tasks.wait())
-            .await
-            .is_err()
-        {
-            cancellation.cancel();
-            tasks.wait().await;
-        }
+        crate::wait_for_tasks_or_cancel(&tasks, &cancellation, Duration::from_secs(1)).await;
     }
 }
 
@@ -101,34 +95,11 @@ pub(super) async fn write(writer: &mut crate::AsyncFile, bytes: &[u8]) -> std::i
 #[cfg(test)]
 mod tests {
     use crate::diagnostics::{CHUNK_BYTES as DIAGNOSTIC_CHUNK_BYTES, Diagnostics};
-    use crate::hooks::run;
     use std::fs::File;
     use std::os::fd::OwnedFd;
     use std::os::unix::net::UnixStream;
     use std::time::Duration;
     use terra_protocol::LifecycleEvent;
-    use tokio_util::{sync::CancellationToken, task::TaskTracker};
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn flood_does_not_block_hook_completion() {
-        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
-        sender.send(vec![b'x']).await.unwrap();
-        let diagnostic = Diagnostics {
-            sender,
-            tasks: TaskTracker::new(),
-            cancellation: CancellationToken::new(),
-            started: std::time::Instant::now(),
-        };
-        run(
-            "dd if=/dev/zero bs=4096 count=512 2>/dev/null",
-            Some(Duration::from_secs(2)),
-            Some(&diagnostic),
-            None,
-            &CancellationToken::new(),
-        )
-        .await
-        .expect("hook exits despite a full diagnostic queue");
-    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn diagnostics_finish_flushes_a_queued_line() {

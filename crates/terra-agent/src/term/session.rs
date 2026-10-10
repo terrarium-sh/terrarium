@@ -1,9 +1,10 @@
 //! Terminal-multiplexer core: broadcast output to attached clients and forward input.
 
 use crate::AsyncFile;
+use crate::term::tty::set_winsize;
 #[cfg(test)]
 use std::fs::File;
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, OwnedFd};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 use terra_protocol::AgentOutput;
@@ -17,6 +18,13 @@ pub(crate) const MIN_ROWS: u16 = 5;
 pub(crate) const MIN_COLS: u16 = 20;
 pub(crate) const MAX_ROWS: u16 = 512;
 pub(crate) const MAX_COLS: u16 = 1024;
+
+pub(crate) fn clamp_term_size(rows: u16, cols: u16) -> (u16, u16) {
+    (
+        rows.clamp(MIN_ROWS, MAX_ROWS),
+        cols.clamp(MIN_COLS, MAX_COLS),
+    )
+}
 
 const INPUT_QUEUE_CAPACITY: usize = 1;
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -135,10 +143,6 @@ impl Session {
         Ok(session)
     }
 
-    pub(crate) fn input_fd(&self) -> BorrowedFd<'_> {
-        self.input_fd.as_fd()
-    }
-
     pub(crate) async fn feed_output(&self, bytes: &[u8]) {
         let _delivery = self.delivery.lock().await;
         let clients = {
@@ -240,6 +244,7 @@ impl Session {
         };
         let _ = client.conn.write(&AgentOutput::Detached).await;
         client.conn.close();
+        self.apply_size(size);
         DetachOutcome::Detached { size }
     }
 
@@ -257,6 +262,7 @@ impl Session {
             let _ = client.conn.write(&AgentOutput::Detached).await;
             client.conn.close();
         }
+        self.apply_size(size);
         (ids, size)
     }
 
@@ -278,11 +284,17 @@ impl Session {
     ) -> Option<(u16, u16)> {
         let mut inner = self.inner.lock().await;
         let client = inner.clients.iter_mut().find(|client| client.id == id)?;
-        client.size = Some((
-            rows.clamp(MIN_ROWS, MAX_ROWS),
-            cols.clamp(MIN_COLS, MAX_COLS),
-        ));
-        inner.update_shared_size()
+        client.size = Some(clamp_term_size(rows, cols));
+        let size = inner.update_shared_size();
+        drop(inner);
+        self.apply_size(size);
+        size
+    }
+
+    fn apply_size(&self, size: Option<(u16, u16)>) {
+        if let Some((rows, cols)) = size {
+            set_winsize(self.input_fd.as_fd(), rows, cols);
+        }
     }
 
     pub(crate) async fn send_input(&self, bytes: &[u8]) -> std::io::Result<()> {
@@ -644,7 +656,7 @@ mod tests {
                 Err(error) => panic!("unexpected input error: {error}"),
             }
         }
-        assert!(rustix::fs::fcntl_getfl(session.input_fd()).is_ok());
+        assert!(rustix::fs::fcntl_getfl(&session.input_fd).is_ok());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

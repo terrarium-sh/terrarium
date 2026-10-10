@@ -1,6 +1,6 @@
 use super::config;
 use super::diagnostics::Diagnostics;
-use super::hooks::{self, HOOK_TIMEOUT, OUTPUT_DRAIN_GRACE};
+use super::hooks::{self, OUTPUT_DRAIN_GRACE};
 use anyhow::{Context, Result, bail};
 use pty_process::blocking::{Command as PtyCommand, Pts, Pty};
 use std::fs::{self, File};
@@ -54,7 +54,7 @@ pub(super) async fn execute(
     let SessionPty {
         session,
         pts,
-        drained,
+        mut drained,
     } = start_session(plan, clients, startup.clone(), stop, shutdown, tasks).await?;
     crate::report_agent_ready(control).await?;
     if !plan.on_start.is_empty() {
@@ -64,7 +64,7 @@ pub(super) async fn execute(
     }
     diagnostic.record_boot_stage("hooks_start");
     for line in &plan.on_start {
-        if let Err(error) = hooks::run(line, Some(HOOK_TIMEOUT), None, Some(&session), stop).await {
+        if let Err(error) = hooks::run(line, Some(&session), stop).await {
             return Err(fail_startup(&startup, &session, error).await);
         }
     }
@@ -82,7 +82,6 @@ pub(super) async fn execute(
         return Err(fail_startup(&startup, &session, error).await);
     }
     startup.ready();
-    let mut drained = drained;
     let (code, daemons) = run_workload(plan, pts, &mut drained, diagnostic, stop, shutdown, tasks)
         .await
         .context("running the workload")?;
@@ -90,9 +89,7 @@ pub(super) async fn execute(
         session.feed_output(b"terra: running stop hooks\r\n").await;
     }
     for line in &plan.pre_stop {
-        if let Err(error) =
-            hooks::run(line, Some(HOOK_TIMEOUT), None, Some(&session), shutdown).await
-        {
+        if let Err(error) = hooks::run(line, Some(&session), shutdown).await {
             session
                 .feed_output(format!("terra-agent: stop hook failed: {error:#}\r\n").as_bytes())
                 .await;
@@ -132,7 +129,7 @@ async fn bake_if_stale(
         diagnostic.record(b"terra: baking on_create...\n");
     }
     for line in on_create {
-        hooks::run(line, Some(HOOK_TIMEOUT), None, Some(session), stop).await?;
+        hooks::run(line, Some(session), stop).await?;
     }
     fs::write(terra_protocol::RECIPE_STAMP_PATH, &recipe)
         .with_context(|| format!("stamping {}", terra_protocol::RECIPE_STAMP_PATH))
@@ -207,7 +204,6 @@ async fn start_session(
     })
 }
 
-#[allow(unsafe_code)]
 async fn run_workload(
     plan: &Plan,
     pts: Pts,
@@ -232,11 +228,7 @@ async fn run_workload(
     drop(daemon_output);
     let mut command = PtyCommand::new(cmd).args(args);
     if !plan.root {
-        // SAFETY: a post-fork/pre-exec hook that only calls async-signal-safe
-        // id-setting syscalls.
-        unsafe {
-            command = command.pre_exec(drop_privileges);
-        }
+        command = run_pty_command_as_workload(command);
     }
     let (_child, child_pidfd) = match crate::reap::spawn_owned(|| command.spawn(pts)) {
         Ok(child) => child,
@@ -271,7 +263,6 @@ async fn wait_for_initial_session(
     }
 }
 
-#[allow(unsafe_code)]
 pub(crate) fn spawn_on_pty(
     cmd: &str,
     args: &[String],
@@ -282,16 +273,8 @@ pub(crate) fn spawn_on_pty(
     env: &std::collections::BTreeMap<String, String>,
 ) -> Result<(Pty, std::process::Child, crate::reap::OwnedPidfd)> {
     let (pty, pts) = pty_process::blocking::open()?;
-    pty.resize(pty_process::Size::new(
-        term.rows.clamp(
-            crate::term::session::MIN_ROWS,
-            crate::term::session::MAX_ROWS,
-        ),
-        term.cols.clamp(
-            crate::term::session::MIN_COLS,
-            crate::term::session::MAX_COLS,
-        ),
-    ))?;
+    let (rows, cols) = crate::term::session::clamp_term_size(term.rows, term.cols);
+    pty.resize(pty_process::Size::new(rows, cols))?;
     let mut command = PtyCommand::new(cmd).args(args);
     if let Some(home_env) = home_env {
         command = command.env("HOME", home_env);
@@ -303,17 +286,37 @@ pub(crate) fn spawn_on_pty(
         command = command.env(key, value);
     }
     if !as_root {
-        // SAFETY: a post-fork/pre-exec hook that only calls async-signal-safe
-        // id-setting syscalls.
-        unsafe {
-            command = command.pre_exec(drop_privileges);
-        }
+        command = run_pty_command_as_workload(command);
     }
     let (child, child_pidfd) = crate::reap::spawn_owned(|| command.spawn(pts))?;
     Ok((pty, child, child_pidfd))
 }
 
-pub(crate) fn drop_privileges() -> std::io::Result<()> {
+pub(crate) fn workload_owner() -> (Option<rustix::process::Uid>, Option<rustix::process::Gid>) {
+    (
+        Some(rustix::process::Uid::from_raw(WORKLOAD_ID)),
+        Some(rustix::process::Gid::from_raw(WORKLOAD_ID)),
+    )
+}
+
+#[allow(unsafe_code)]
+pub(crate) fn run_as_workload(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt as _;
+
+    // SAFETY: a post-fork/pre-exec hook that only calls async-signal-safe
+    // id-setting syscalls.
+    unsafe {
+        command.pre_exec(drop_privileges);
+    }
+}
+
+#[allow(unsafe_code)]
+fn run_pty_command_as_workload(command: PtyCommand) -> PtyCommand {
+    // SAFETY: as in `run_as_workload`.
+    unsafe { command.pre_exec(drop_privileges) }
+}
+
+fn drop_privileges() -> std::io::Result<()> {
     rustix::thread::set_thread_groups(&[]).map_err(std::io::Error::from)?;
     rustix::thread::set_thread_gid(rustix::process::Gid::from_raw(WORKLOAD_ID))
         .map_err(std::io::Error::from)?;

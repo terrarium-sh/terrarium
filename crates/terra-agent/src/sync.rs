@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use terra_protocol::{
     MAX_FILE_BYTES, MAX_SYNC_ENTRIES, MAX_SYNC_METADATA_BYTES, RootStatus, SyncEntry,
-    SyncEntryKind, SyncManifestBudget, SyncManifestLimit, SyncReply, SyncRequest, WORKLOAD_ID,
-    encode_frame, read_frame, truncate_nanos, validate_relative_path,
+    SyncEntryKind, SyncManifestBudget, SyncManifestLimit, SyncReply, SyncRequest, encode_frame,
+    read_frame, truncate_nanos, validate_relative_path,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -145,11 +145,8 @@ fn open_or_create_directory(
         )?
         .into();
         if give_to_workload {
-            rustix::fs::fchown(
-                &parent,
-                Some(rustix::process::Uid::from_raw(WORKLOAD_ID)),
-                Some(rustix::process::Gid::from_raw(WORKLOAD_ID)),
-            )?;
+            let (uid, gid) = crate::workload::workload_owner();
+            rustix::fs::fchown(&parent, uid, gid)?;
         }
     }
     Ok(parent)
@@ -183,6 +180,19 @@ fn open_sync_file(path: &Path) -> std::io::Result<(std::fs::File, std::fs::Metad
 fn send_reply(conn: &mut impl Write, reply: &SyncReply) -> std::io::Result<()> {
     let frame = encode_frame(reply)?;
     conn.write_all(&frame)
+}
+
+fn reply_on_error<T>(
+    conn: &mut impl Write,
+    result: std::io::Result<T>,
+) -> std::io::Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) => {
+            send_reply(conn, &SyncReply::Err(error.to_string()))?;
+            Ok(None)
+        }
+    }
 }
 
 fn resolve_target_path(session_root: &Path, relative_path: &str) -> std::io::Result<PathBuf> {
@@ -275,22 +285,6 @@ fn stream_exact(
     Ok(())
 }
 
-fn set_path_mtime(path: &Path, mtime_secs: i64, mtime_nanos: u32) -> std::io::Result<()> {
-    #[allow(clippy::cast_possible_wrap)]
-    let times = rustix::fs::Timestamps {
-        last_access: rustix::fs::Timespec {
-            tv_sec: 0,
-            tv_nsec: rustix::fs::UTIME_OMIT,
-        },
-        last_modification: rustix::fs::Timespec {
-            tv_sec: mtime_secs as _,
-            tv_nsec: mtime_nanos.into(),
-        },
-    };
-    rustix::fs::utimensat(rustix::fs::CWD, path, &times, rustix::fs::AtFlags::empty())
-        .map_err(std::io::Error::from)
-}
-
 fn build_sync_entry(
     relative_path: String,
     kind: SyncEntryKind,
@@ -324,6 +318,25 @@ impl<W: Write> ScanState<'_, W> {
         name: &str,
         queue: &mut VecDeque<PathBuf>,
     ) -> std::io::Result<bool> {
+        match self.build_child_entry(rel, name, queue)? {
+            Ok(entry) => {
+                send_reply(self.conn, &SyncReply::Entry(entry))?;
+                Ok(true)
+            }
+            Err(message) => {
+                send_reply(self.conn, &SyncReply::Err(message))?;
+                Ok(false)
+            }
+        }
+    }
+
+    /// The outer error aborts the session; the inner error is reported to the peer.
+    fn build_child_entry(
+        &mut self,
+        rel: &Path,
+        name: &str,
+        queue: &mut VecDeque<PathBuf>,
+    ) -> std::io::Result<Result<SyncEntry, String>> {
         let child_rel = if rel.as_os_str().is_empty() {
             PathBuf::from(name)
         } else {
@@ -331,19 +344,14 @@ impl<W: Write> ScanState<'_, W> {
         };
         let rel_str = child_rel.to_string_lossy().into_owned();
         if rel_str.len() > terra_protocol::MAX_SYNC_PATH_BYTES {
-            send_reply(
-                self.conn,
-                &SyncReply::Err(format!("relative path exceeds maximum length: {rel_str}")),
-            )?;
-            return Ok(false);
+            return Ok(Err(format!(
+                "relative path exceeds maximum length: {rel_str}"
+            )));
         }
         let full = self.session_root.join(&child_rel);
         let meta = match std::fs::symlink_metadata(&full) {
             Ok(m) => m,
-            Err(e) => {
-                send_reply(self.conn, &SyncReply::Err(e.to_string()))?;
-                return Ok(false);
-            }
+            Err(e) => return Ok(Err(e.to_string())),
         };
         let mut link_target = None;
         let kind = if meta.is_dir() {
@@ -359,46 +367,27 @@ impl<W: Write> ScanState<'_, W> {
                     link_target = Some(target_str);
                     SyncEntryKind::Symlink
                 }
-                Err(e) => {
-                    send_reply(self.conn, &SyncReply::Err(e.to_string()))?;
-                    return Ok(false);
-                }
+                Err(e) => return Ok(Err(e.to_string())),
             }
         } else if meta.is_file() {
             SyncEntryKind::File
         } else {
-            send_reply(
-                self.conn,
-                &SyncReply::Err(format!("unsupported special file: {rel_str}")),
-            )?;
-            return Ok(false);
+            return Ok(Err(format!("unsupported special file: {rel_str}")));
         };
         match self.budget.add_entry(&rel_str, link_target.as_deref()) {
             Ok(()) => {}
             Err(SyncManifestLimit::Entries) => {
-                send_reply(
-                    self.conn,
-                    &SyncReply::Err(format!(
-                        "manifest exceeds maximum entries limit: {MAX_SYNC_ENTRIES}"
-                    )),
-                )?;
-                return Ok(false);
+                return Ok(Err(format!(
+                    "manifest exceeds maximum entries limit: {MAX_SYNC_ENTRIES}"
+                )));
             }
             Err(SyncManifestLimit::MetadataBytes) => {
-                send_reply(
-                    self.conn,
-                    &SyncReply::Err(format!(
-                        "manifest metadata exceeds maximum bytes limit: {MAX_SYNC_METADATA_BYTES}"
-                    )),
-                )?;
-                return Ok(false);
+                return Ok(Err(format!(
+                    "manifest metadata exceeds maximum bytes limit: {MAX_SYNC_METADATA_BYTES}"
+                )));
             }
         }
-        send_reply(
-            self.conn,
-            &SyncReply::Entry(build_sync_entry(rel_str, kind, &meta, link_target)),
-        )?;
-        Ok(true)
+        Ok(Ok(build_sync_entry(rel_str, kind, &meta, link_target)))
     }
 }
 
@@ -505,9 +494,8 @@ fn handle_compute_digest(
     conn: &mut (impl Read + Write),
     cancellation: &CancellationToken,
 ) -> std::io::Result<()> {
-    let target = match resolve_target_path(root_path, relative_path) {
-        Ok(p) => p,
-        Err(e) => return send_reply(conn, &SyncReply::Err(e.to_string())),
+    let Some(target) = reply_on_error(conn, resolve_target_path(root_path, relative_path))? else {
+        return Ok(());
     };
     match hash_file(&target, cancellation, |bytes_hashed| {
         send_reply(conn, &SyncReply::DigestProgress { bytes_hashed })
@@ -533,13 +521,10 @@ fn handle_write_file(
     conn: &mut (impl Read + Write),
     cancellation: &CancellationToken,
 ) -> std::io::Result<()> {
-    let target = match resolve_target_path(root_path, relative_path) {
-        Ok(p) => p,
-        Err(e) => return send_reply(conn, &SyncReply::Err(e.to_string())),
-    };
-    let mut upload = match prepare_put(&target) {
-        Ok(p) => p,
-        Err(e) => return send_reply(conn, &SyncReply::Err(e.to_string())),
+    let prepared =
+        resolve_target_path(root_path, relative_path).and_then(|target| prepare_put(&target));
+    let Some(mut upload) = reply_on_error(conn, prepared)? else {
+        return Ok(());
     };
     send_reply(conn, &SyncReply::WriteFileReady)?;
 
@@ -556,12 +541,8 @@ fn handle_write_file(
         ensure_not_cancelled(cancellation)?;
         file.set_len(meta.size)?;
         if !workload_is_root {
-            rustix::fs::fchown(
-                &*file,
-                Some(rustix::process::Uid::from_raw(WORKLOAD_ID)),
-                Some(rustix::process::Gid::from_raw(WORKLOAD_ID)),
-            )
-            .map_err(std::io::Error::from)?;
+            let (uid, gid) = crate::workload::workload_owner();
+            rustix::fs::fchown(&*file, uid, gid)?;
         }
         file.set_permissions(std::fs::Permissions::from_mode(meta.mode & 0o777))?;
         file.set_times(terra_protocol::sync_file_times(
@@ -592,13 +573,10 @@ fn handle_read_file(
     conn: &mut (impl Read + Write),
     cancellation: &CancellationToken,
 ) -> std::io::Result<()> {
-    let target = match resolve_target_path(root_path, relative_path) {
-        Ok(p) => p,
-        Err(e) => return send_reply(conn, &SyncReply::Err(e.to_string())),
-    };
-    let (mut file, before) = match open_sync_file(&target) {
-        Ok(res) => res,
-        Err(e) => return send_reply(conn, &SyncReply::Err(e.to_string())),
+    let opened =
+        resolve_target_path(root_path, relative_path).and_then(|target| open_sync_file(&target));
+    let Some((mut file, before)) = reply_on_error(conn, opened)? else {
+        return Ok(());
     };
     send_reply(
         conn,
@@ -660,7 +638,10 @@ fn update_metadata(
         return Err(std::io::Error::other("cannot update symlink metadata"));
     }
     std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode & 0o777))?;
-    set_path_mtime(&target, mtime_secs, mtime_nanos)
+    std::fs::set_times(
+        &target,
+        terra_protocol::sync_file_times(mtime_secs, mtime_nanos)?,
+    )
 }
 
 fn remove_entry(root_path: &Path, relative_path: &str, is_dir: bool) -> std::io::Result<()> {
@@ -710,17 +691,14 @@ fn inspect_root_status(
     }
 }
 
-fn init_session(conn: &mut (impl Read + Write)) -> std::io::Result<Option<(PathBuf, RootStatus)>> {
-    let Some(SyncRequest::BeginSession { guest_root }) = read_frame::<SyncRequest>(&mut *conn)?
-    else {
+fn begin_session(
+    conn: &mut impl Write,
+    guest_root: &str,
+) -> std::io::Result<Option<(PathBuf, RootStatus)>> {
+    let root_path = PathBuf::from(guest_root);
+    let Some(root_status) = inspect_root_status(&root_path, guest_root, conn)? else {
         return Ok(None);
     };
-
-    let root_path = PathBuf::from(&guest_root);
-    let Some(root_status) = inspect_root_status(&root_path, &guest_root, conn)? else {
-        return Ok(None);
-    };
-
     send_reply(conn, &SyncReply::SessionReady { root_status })?;
     Ok(Some((root_path, root_status)))
 }
@@ -731,30 +709,30 @@ fn handle_sync_session(
     cancellation: &CancellationToken,
 ) -> std::io::Result<()> {
     ensure_not_cancelled(cancellation)?;
-    let Some((mut root_path, mut root_status)) = init_session(conn)? else {
-        return Ok(());
-    };
+    let mut session: Option<(PathBuf, RootStatus)> = None;
 
     while let Some(req) = read_frame::<SyncRequest>(&mut *conn)? {
         ensure_not_cancelled(cancellation)?;
+        if let SyncRequest::BeginSession { guest_root } = &req {
+            let Some(begun) = begin_session(conn, guest_root)? else {
+                return Ok(());
+            };
+            session = Some(begun);
+            continue;
+        }
+        let Some((root_path, root_status)) = &session else {
+            return Ok(());
+        };
+        let (root_path, root_status) = (root_path.as_path(), *root_status);
         let result = match req {
+            SyncRequest::BeginSession { .. } => unreachable!("handled before the session lookup"),
             SyncRequest::CommitFile => return Err(std::io::Error::other("unexpected file commit")),
-            SyncRequest::BeginSession { guest_root } => {
-                let p = PathBuf::from(&guest_root);
-                let Some(status) = inspect_root_status(&p, &guest_root, conn)? else {
-                    return Ok(());
-                };
-                root_path = p;
-                root_status = status;
-                send_reply(conn, &SyncReply::SessionReady { root_status })?;
-                continue;
-            }
             SyncRequest::ScanEntries => {
-                handle_scan_entries(&root_path, root_status, conn, cancellation)?;
+                handle_scan_entries(root_path, root_status, conn, cancellation)?;
                 continue;
             }
             SyncRequest::ComputeDigest { relative_path } => {
-                handle_compute_digest(&root_path, &relative_path, conn, cancellation)?;
+                handle_compute_digest(root_path, &relative_path, conn, cancellation)?;
                 continue;
             }
             SyncRequest::WriteFile {
@@ -765,7 +743,7 @@ fn handle_sync_session(
                 mtime_nanos,
             } => {
                 handle_write_file(
-                    &root_path,
+                    root_path,
                     &relative_path,
                     WriteFileMeta {
                         size,
@@ -780,27 +758,27 @@ fn handle_sync_session(
                 continue;
             }
             SyncRequest::ReadFile { relative_path } => {
-                handle_read_file(&root_path, &relative_path, conn, cancellation)?;
+                handle_read_file(root_path, &relative_path, conn, cancellation)?;
                 continue;
             }
             SyncRequest::CreateDir {
                 relative_path,
                 mode,
-            } => create_directory(&root_path, &relative_path, mode, workload_is_root),
+            } => create_directory(root_path, &relative_path, mode, workload_is_root),
             SyncRequest::CreateSymlink {
                 relative_path,
                 target,
-            } => create_symlink(&root_path, &relative_path, &target),
+            } => create_symlink(root_path, &relative_path, &target),
             SyncRequest::UpdateMetadata {
                 relative_path,
                 mode,
                 mtime_secs,
                 mtime_nanos,
-            } => update_metadata(&root_path, &relative_path, mode, mtime_secs, mtime_nanos),
+            } => update_metadata(root_path, &relative_path, mode, mtime_secs, mtime_nanos),
             SyncRequest::RemoveEntry {
                 relative_path,
                 is_dir,
-            } => remove_entry(&root_path, &relative_path, is_dir),
+            } => remove_entry(root_path, &relative_path, is_dir),
             SyncRequest::EndSession => {
                 send_reply(conn, &SyncReply::Success)?;
                 break;
@@ -1111,6 +1089,19 @@ mod tests {
     }
 
     #[test]
+    fn update_metadata_sets_mtime_on_directories_and_keeps_atime() {
+        let scratch = crate::create_scratch_path("sync", "update-metadata-times");
+        let directory = scratch.join("directory");
+        std::fs::create_dir_all(&directory).unwrap();
+        let accessed_before = std::fs::metadata(&directory).unwrap().accessed().unwrap();
+        update_metadata(&scratch, "directory", 0o755, 1000, 500).unwrap();
+        let metadata = std::fs::metadata(&directory).unwrap();
+        assert_eq!((metadata.mtime(), metadata.mtime_nsec()), (1000, 500));
+        assert_eq!(metadata.accessed().unwrap(), accessed_before);
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
+
+    #[test]
     fn random_temp_suffix_has_fixed_hex_shape() {
         let name = generate_random_temp_name().unwrap().into_string().unwrap();
         let suffix = name.strip_prefix(".terra-put-").unwrap();
@@ -1125,7 +1116,7 @@ mod tests {
         let file = scratch.join("file");
         std::fs::write(&file, b"contents").unwrap();
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o640)).unwrap();
-        set_path_mtime(&file, 1000, 0).unwrap();
+        std::fs::set_times(&file, terra_protocol::sync_file_times(1000, 0).unwrap()).unwrap();
         let link = scratch.join("link");
         std::os::unix::fs::symlink("file", &link).unwrap();
 

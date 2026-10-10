@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use terra_protocol::application::{Direction, MAX_DNS_QUERIES, Message, StreamDecoder};
-use terra_protocol::vsock::{CONTROL_PORT, GUEST_CID, HOST_CID, PUBLICATION_PORT};
+use terra_protocol::vsock::{CONTROL_PORT, GUEST_CID, PUBLICATION_PORT};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
 use tokio::net::{TcpListener, TcpSocket, TcpStream, UdpSocket};
 use tokio::sync::{Mutex as AsyncMutex, Semaphore, oneshot};
@@ -113,10 +113,7 @@ impl NetworkClient {
                 .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
                 .map_err(|_| io::Error::other("DNS query identifiers exhausted"))?;
             let (sender, reply) = oneshot::channel();
-            self.pending
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(id, sender);
+            crate::mutex::lock_or_abort(&self.pending).insert(id, sender);
             let _pending = PendingQuery {
                 id,
                 pending: self.pending.clone(),
@@ -163,10 +160,7 @@ struct PendingQuery {
 
 impl Drop for PendingQuery {
     fn drop(&mut self) {
-        self.pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.id);
+        crate::mutex::lock_or_abort(&self.pending).remove(&self.id);
     }
 }
 
@@ -259,24 +253,15 @@ fn limit_vsock_buffer_bytes(socket: impl AsFd, buffer_bytes: usize) -> io::Resul
 }
 
 fn vsock_socket(buffer_bytes: usize) -> io::Result<rustix::fd::OwnedFd> {
-    let socket = rustix::net::socket_with(
-        rustix::net::AddressFamily::VSOCK,
-        rustix::net::SocketType::STREAM,
-        rustix::net::SocketFlags::CLOEXEC,
-        None,
-    )
-    .map_err(io::Error::from)?;
+    let socket = crate::mux::create_vsock_socket()?;
     limit_vsock_buffer_bytes(&socket, buffer_bytes)?;
     Ok(socket)
 }
 
 fn connect_control() -> Result<VsockStream> {
-    let socket = vsock_socket(terra_protocol::vsock::CONTROL_REPLY_BYTES)
-        .context("creating the network control vsock")?;
-    rustix::net::bind(&socket, &crate::mux::vsock_address(GUEST_CID, CONTROL_PORT))
-        .context("binding the fixed guest network control endpoint")?;
-    rustix::net::connect(&socket, &crate::mux::vsock_address(HOST_CID, CONTROL_PORT))
-        .context("connecting the host network control endpoint")?;
+    let socket = crate::mux::connect_vsock(CONTROL_PORT, "network control", |socket| {
+        limit_vsock_buffer_bytes(socket, terra_protocol::vsock::CONTROL_REPLY_BYTES)
+    })?;
     Ok(VsockStream::new(socket)?)
 }
 
@@ -326,11 +311,7 @@ async fn receive_results(
     let error = loop {
         match read_message(&mut reader, &mut decoder).await {
             Ok(Some(message @ Message::DnsResult { id, .. })) => {
-                if let Some(sender) = pending
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&id)
-                {
+                if let Some(sender) = crate::mutex::lock_or_abort(&pending).remove(&id) {
                     let _ = sender.send(message);
                 }
             }
@@ -340,10 +321,7 @@ async fn receive_results(
             Ok(None) | Err(_) => break io::Error::from(rustix::io::Errno::NETDOWN),
         }
     };
-    pending
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clear();
+    crate::mutex::lock_or_abort(&pending).clear();
     error
 }
 
@@ -450,26 +428,17 @@ pub(super) async fn start(
             });
             start_dns(client, &shutdown, tasks, diagnostic).await?;
             if let Some(listener) = publications {
-                let publication_shutdown = shutdown.clone();
-                let publication_diagnostic = diagnostic.clone();
-                let publication_tasks = tasks.clone();
                 let ports = plan.published_ports.clone();
                 let udp_ports = plan.published_udp_ports.clone();
-                tasks.spawn(async move {
-                    run_network_service(
-                        "publication",
-                        serve_publications(
-                            listener,
-                            ports,
-                            udp_ports,
-                            &publication_shutdown,
-                            &publication_tasks,
-                        ),
-                        &publication_shutdown,
-                        &publication_diagnostic,
-                    )
-                    .await;
-                });
+                spawn_network_service(
+                    "publication",
+                    &shutdown,
+                    tasks,
+                    diagnostic,
+                    move |shutdown, tasks| async move {
+                        serve_publications(listener, ports, udp_ports, &shutdown, &tasks).await
+                    },
+                );
             }
             std::fs::write(
                 "/etc/resolv.conf",
@@ -498,30 +467,20 @@ async fn start_dns(
         .await
         .context("binding guest TCP DNS")?;
     let udp_client = client.clone();
-    let udp_shutdown = shutdown.clone();
-    let udp_diagnostic = diagnostic.clone();
-    let udp_tasks = tasks.clone();
-    tasks.spawn(async move {
-        run_network_service(
-            "UDP DNS",
-            serve_udp_dns(udp, udp_client, &udp_shutdown, &udp_tasks),
-            &udp_shutdown,
-            &udp_diagnostic,
-        )
-        .await;
-    });
-    let tcp_shutdown = shutdown.clone();
-    let tcp_diagnostic = diagnostic.clone();
-    let tcp_tasks = tasks.clone();
-    tasks.spawn(async move {
-        run_network_service(
-            "TCP DNS",
-            serve_tcp_dns(tcp, client, &tcp_shutdown, &tcp_tasks),
-            &tcp_shutdown,
-            &tcp_diagnostic,
-        )
-        .await;
-    });
+    spawn_network_service(
+        "UDP DNS",
+        shutdown,
+        tasks,
+        diagnostic,
+        move |shutdown, tasks| async move { serve_udp_dns(udp, udp_client, &shutdown, &tasks).await },
+    );
+    spawn_network_service(
+        "TCP DNS",
+        shutdown,
+        tasks,
+        diagnostic,
+        move |shutdown, tasks| async move { serve_tcp_dns(tcp, client, &shutdown, &tasks).await },
+    );
     Ok(())
 }
 
@@ -543,6 +502,24 @@ async fn resolve_dns(client: &NetworkClient, stream: bool, query: Vec<u8>) -> io
         response.splice(..0, length.to_be_bytes());
     }
     Ok(response)
+}
+
+fn spawn_network_service<Service>(
+    name: &'static str,
+    shutdown: &CancellationToken,
+    tasks: &TaskTracker,
+    diagnostic: &Diagnostics,
+    build_service: impl FnOnce(CancellationToken, TaskTracker) -> Service + Send + 'static,
+) where
+    Service: std::future::Future<Output = io::Result<()>> + Send,
+{
+    let shutdown = shutdown.clone();
+    let service_tasks = tasks.clone();
+    let diagnostic = diagnostic.clone();
+    tasks.spawn(async move {
+        let service = build_service(shutdown.clone(), service_tasks);
+        run_network_service(name, service, &shutdown, &diagnostic).await;
+    });
 }
 
 async fn run_network_service(

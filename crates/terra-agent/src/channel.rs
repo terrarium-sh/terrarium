@@ -7,7 +7,6 @@
 
 use crate::AsyncFile;
 use crate::term::session::{ClientConn, DetachOutcome, Session};
-use crate::term::tty::set_winsize;
 use std::fs::File;
 use std::os::fd::AsFd;
 use std::sync::Arc;
@@ -206,22 +205,14 @@ async fn serve_client(
             }
             Ok(Some(ClientInput::Keys(_) | ClientInput::Eof)) => {}
             Ok(Some(ClientInput::Resize(TermSize { rows, cols }))) => {
-                if rows > 0
-                    && cols > 0
-                    && let Some((rows, cols)) = session.set_client_size(id, rows, cols).await
-                {
-                    set_winsize(session.input_fd(), rows, cols);
+                if rows > 0 && cols > 0 {
+                    session.set_client_size(id, rows, cols).await;
                 }
             }
             Ok(None) | Err(_) => break,
         }
     }
-    if let DetachOutcome::Detached {
-        size: Some((rows, cols)),
-    } = session.detach_client(id).await
-    {
-        set_winsize(session.input_fd(), rows, cols);
-    }
+    session.detach_client(id).await;
 }
 
 async fn serve_session_control(session: &Arc<Session>, mut conn: AsyncFile) {
@@ -247,10 +238,7 @@ async fn serve_session_control(session: &Arc<Session>, mut conn: AsyncFile) {
             let _ = write_control_reply(&mut conn, &ControlReply::Done).await;
         }
         ControlRequest::Detach { id } => match session.detach_client(id).await {
-            DetachOutcome::Detached { size } => {
-                if let Some((rows, cols)) = size {
-                    set_winsize(session.input_fd(), rows, cols);
-                }
+            DetachOutcome::Detached { .. } => {
                 let _ = write_control_reply(&mut conn, &ControlReply::Detached { id }).await;
             }
             DetachOutcome::Missing => {
@@ -258,10 +246,7 @@ async fn serve_session_control(session: &Arc<Session>, mut conn: AsyncFile) {
             }
         },
         ControlRequest::DetachAll => {
-            let (ids, size) = session.detach_all_clients().await;
-            if let Some((rows, cols)) = size {
-                set_winsize(session.input_fd(), rows, cols);
-            }
+            let (ids, _) = session.detach_all_clients().await;
             for id in ids {
                 if write_control_reply(&mut conn, &ControlReply::Detached { id })
                     .await

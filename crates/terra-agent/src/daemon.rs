@@ -1,20 +1,14 @@
 //! Background commands restarted on failure (`daemons:` in the recipe).
 
 use crate::mutex::lock_or_abort;
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::CommandExt as _;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-#[derive(Clone)]
-struct DaemonProcess {
-    pidfd: Arc<crate::reap::OwnedPidfd>,
-    leader: rustix::process::Pid,
-}
-
-type DaemonRegistry = Arc<Mutex<Vec<DaemonProcess>>>;
+type DaemonRegistry = Arc<Mutex<Vec<Arc<crate::reap::OwnedPidfd>>>>;
 
 #[derive(Clone)]
 pub struct Daemons {
@@ -39,7 +33,7 @@ impl Daemons {
     fn signal(&self, sig: rustix::process::Signal) {
         let processes = lock_or_abort(&self.processes).clone();
         for process in &processes {
-            crate::reap::signal_owned_process_group(&process.pidfd, process.leader, sig);
+            process.signal_group(sig);
         }
     }
 }
@@ -53,21 +47,18 @@ pub fn spawn_all(
 ) -> std::io::Result<Daemons> {
     let processes = DaemonRegistry::default();
     let cancellation = parent_cancellation.child_token();
-    let daemon_specs = lines
-        .iter()
-        .map(|line| {
-            Ok((
-                line.clone(),
-                output.map(std::fs::File::try_clone).transpose()?,
-            ))
-        })
-        .collect::<std::io::Result<Vec<_>>>()?;
+    let output = output
+        .map(std::fs::File::try_clone)
+        .transpose()?
+        .map(Arc::new);
     let supervisors = TaskTracker::new();
-    for (line, output) in daemon_specs {
+    for line in lines {
+        let line = line.clone();
+        let output = output.clone();
         let registry = processes.clone();
         let cancellation = cancellation.clone();
         supervisors.spawn(tasks.track_future(async move {
-            supervise(&line, &registry, &cancellation, as_root, output.as_ref()).await;
+            supervise(&line, &registry, &cancellation, as_root, output.as_deref()).await;
         }));
     }
     supervisors.close();
@@ -87,7 +78,6 @@ pub fn spawn_all(
     Ok(daemons)
 }
 
-#[allow(unsafe_code)]
 async fn supervise(
     line: &str,
     registry: &DaemonRegistry,
@@ -114,13 +104,9 @@ async fn supervise(
                 .stderr(Stdio::from(stderr));
         }
         if !as_root {
-            // SAFETY: a post-fork/pre-exec hook that only calls async-signal-safe
-            // id-setting syscalls.
-            unsafe {
-                command.pre_exec(crate::workload::drop_privileges);
-            }
+            crate::workload::run_as_workload(&mut command);
         }
-        let (child, pidfd) = match crate::reap::spawn_owned(|| command.spawn()) {
+        let (_, pidfd) = match crate::reap::spawn_owned(|| command.spawn()) {
             Ok(pair) => pair,
             Err(e) => {
                 eprintln!("terra-agent: daemon `{line}` could not spawn ({e})");
@@ -131,36 +117,23 @@ async fn supervise(
                 continue;
             }
         };
-        let leader = rustix::process::Pid::from_child(&child);
         let pidfd = Arc::new(pidfd);
-        let process = DaemonProcess {
-            pidfd: pidfd.clone(),
-            leader,
-        };
         {
             let mut processes = lock_or_abort(registry);
-            processes.push(process);
+            processes.push(pidfd.clone());
             if cancellation.is_cancelled() {
-                crate::reap::signal_owned_process_group(
-                    &pidfd,
-                    leader,
-                    rustix::process::Signal::TERM,
-                );
+                pidfd.signal_group(rustix::process::Signal::TERM);
             }
         }
         let status = tokio::select! {
             status = crate::reap::wait_owned(&pidfd) => status,
             () = cancellation.cancelled() => {
-                crate::reap::signal_owned_process_group(
-                    &pidfd,
-                    leader,
-                    rustix::process::Signal::TERM,
-                );
+                pidfd.signal_group(rustix::process::Signal::TERM);
                 crate::reap::wait_owned(&pidfd).await
             }
         };
-        let _ = rustix::process::kill_process_group(leader, rustix::process::Signal::KILL);
-        lock_or_abort(registry).retain(|registered| !Arc::ptr_eq(&registered.pidfd, &pidfd));
+        let _ = rustix::process::kill_process_group(pidfd.leader(), rustix::process::Signal::KILL);
+        lock_or_abort(registry).retain(|registered| !Arc::ptr_eq(registered, &pidfd));
         if cancellation.is_cancelled() {
             return;
         }

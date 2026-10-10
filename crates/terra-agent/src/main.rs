@@ -56,6 +56,18 @@ fn into_async_file(file: impl Into<std::os::fd::OwnedFd>) -> std::io::Result<Asy
 }
 
 #[cfg(target_os = "linux")]
+async fn wait_for_tasks_or_cancel(
+    tasks: &tokio_util::task::TaskTracker,
+    cancellation: &tokio_util::sync::CancellationToken,
+    grace: std::time::Duration,
+) {
+    if tokio::time::timeout(grace, tasks.wait()).await.is_err() {
+        cancellation.cancel();
+        tasks.wait().await;
+    }
+}
+
+#[cfg(target_os = "linux")]
 const AGENT_FAILED: i32 = 1;
 
 #[cfg(target_os = "linux")]

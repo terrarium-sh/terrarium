@@ -16,6 +16,7 @@ struct OwnedChild {
 
 pub struct OwnedPidfd {
     pidfd: OwnedFd,
+    leader: rustix::process::Pid,
     status: Arc<Mutex<Option<ExitStatus>>>,
 }
 
@@ -31,22 +32,24 @@ impl AsFd for OwnedPidfd {
     }
 }
 
-/// Signals an owned process group while preventing the orphan reaper from releasing its leader PID.
-pub fn signal_owned_process_group(
-    pidfd: &OwnedPidfd,
-    leader: rustix::process::Pid,
-    sig: rustix::process::Signal,
-) {
-    let owned = lock_or_abort(&OWNED);
-    if lock_or_abort(&pidfd.status).is_none()
-        && owned
-            .iter()
-            .any(|child| Arc::ptr_eq(&child.status, &pidfd.status))
-    {
-        let _ = rustix::process::kill_process_group(leader, sig);
+impl OwnedPidfd {
+    pub fn leader(&self) -> rustix::process::Pid {
+        self.leader
     }
-    drop(owned);
-    let _ = rustix::process::pidfd_send_signal(pidfd, sig);
+
+    /// Signals the process group while preventing the orphan reaper from releasing its leader PID.
+    pub fn signal_group(&self, sig: rustix::process::Signal) {
+        let owned = lock_or_abort(&OWNED);
+        if lock_or_abort(&self.status).is_none()
+            && owned
+                .iter()
+                .any(|child| Arc::ptr_eq(&child.status, &self.status))
+        {
+            let _ = rustix::process::kill_process_group(self.leader, sig);
+        }
+        drop(owned);
+        let _ = rustix::process::pidfd_send_signal(self, sig);
+    }
 }
 
 static OWNED: Mutex<Vec<OwnedChild>> = Mutex::new(Vec::new());
@@ -82,7 +85,14 @@ where
         }
     };
     let status = register_owned(&mut owned, pid);
-    Ok((child, OwnedPidfd { pidfd, status }))
+    Ok((
+        child,
+        OwnedPidfd {
+            pidfd,
+            leader: pid,
+            status,
+        },
+    ))
 }
 
 pub async fn wait_owned(pidfd: &OwnedPidfd) -> std::io::Result<ExitStatus> {
