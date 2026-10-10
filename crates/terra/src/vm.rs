@@ -219,6 +219,7 @@ fn generate_sandbox_info(cfg: &config::Config, root: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
@@ -294,7 +295,7 @@ mod tests {
         assert_eq!(plan.daemons, ["ascend --serve"]);
         assert_eq!(plan.env["API_KEY"], "sk-super-secret");
         assert!(!plan.sandbox_info.contains("sk-super-secret"));
-        assert!(matches!(plan.mode, PlanMode::Run));
+        assert_matches!(plan.mode, PlanMode::Run);
         assert_eq!(plan.shares[0].guest, "/work");
         assert!(plan.shares[0].readonly);
         assert_eq!(plan.volumes[0].dev, "/dev/vdc");

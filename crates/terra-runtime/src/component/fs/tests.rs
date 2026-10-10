@@ -1,4 +1,5 @@
 #[cfg(unix)]
+use std::assert_matches;
 use std::os::unix::fs::{MetadataExt as _, symlink as symlink_file};
 #[cfg(windows)]
 use std::os::windows::fs::symlink_file;
@@ -146,10 +147,7 @@ async fn wasi_itself_denies_escape_and_readonly_mutation() {
                 #[cfg(unix)]
                 synced.unwrap();
                 #[cfg(windows)]
-                assert!(matches!(
-                    synced.unwrap_err().downcast().unwrap(),
-                    ErrorCode::Access
-                ));
+                assert_matches!(synced.unwrap_err().downcast().unwrap(), ErrorCode::Access);
                 let open = async |path: &str, flags, mode| {
                     WasiFilesystem::open_at(
                         &access,
@@ -218,7 +216,7 @@ async fn wasi_itself_denies_escape_and_readonly_mutation() {
                     .unwrap_err()
                     .downcast()
                     .unwrap();
-                    assert!(matches!(error, ErrorCode::NotPermitted));
+                    assert_matches!(error, ErrorCode::NotPermitted);
                     let created = open(
                         "created",
                         OpenFlags::CREATE | OpenFlags::TRUNCATE,

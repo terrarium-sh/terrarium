@@ -20,7 +20,7 @@ struct RunningBox {
 impl RunningBox {
     fn run(&self, args: &[&str]) -> String {
         let output = run_command(&self.terra, &self.home, args, Duration::from_secs(30));
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stdout = String::from_utf8_lossy_owned(output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             output.status.success(),

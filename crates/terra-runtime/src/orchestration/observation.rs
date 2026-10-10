@@ -171,6 +171,7 @@ async fn finish_component_runtime(
 mod tests {
     use super::*;
     use crate::component::vmm::lifecycle::{LifecycleHost, lifecycle_platform};
+    use std::assert_matches;
 
     #[test]
     fn native_errors_take_precedence_over_boot_timeout_and_cleanup() {
@@ -219,10 +220,10 @@ mod tests {
         )
         .await;
         assert!(result.is_none());
-        assert!(matches!(
+        assert_matches!(
             host.next_event().await.unwrap().unwrap(),
             lifecycle_platform::Event::Deadline
-        ));
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -445,10 +446,10 @@ mod tests {
                 .await,
             Err("native task timed out".to_owned())
         );
-        assert!(matches!(
+        assert_matches!(
             second_started_receiver.try_recv(),
             Err(std::sync::mpsc::TryRecvError::Empty)
-        ));
+        );
         release.send(()).expect("release first device");
         assert_eq!(
             teardown

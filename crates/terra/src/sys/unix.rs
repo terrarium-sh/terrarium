@@ -445,6 +445,7 @@ pub fn is_host_root() -> bool {
 mod tests {
     use super::*;
     use crate::sys::SignalResult;
+    use std::assert_matches;
     use std::fs::OpenOptions;
 
     fn create_scratch_path(name: &str) -> std::path::PathBuf {
@@ -628,8 +629,9 @@ mod tests {
         // The taker lets go: from here the box is held by the child alone.
         drop(lock);
         let probe = OpenOptions::new().read(true).open(&path).unwrap();
-        assert!(
-            matches!(probe.try_lock_shared(), Err(TryLockError::WouldBlock)),
+        assert_matches!(
+            probe.try_lock_shared(),
+            Err(TryLockError::WouldBlock),
             "the box was unlocked the moment the boot dropped its copy"
         );
 

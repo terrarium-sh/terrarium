@@ -380,7 +380,7 @@ impl GuestMemory {
         {
             // SAFETY: `discard_host_range` confines this full page range to the allocation.
             let result = unsafe { DiscardVirtualMemory(address.cast(), len) };
-            (result == 0).then_some(()).ok_or(DiscardError::Io)
+            (result == 0).ok_or(DiscardError::Io)
         }
         #[cfg(unix)]
         {
@@ -404,7 +404,7 @@ impl GuestMemory {
             {
                 return Err(DiscardError::Unsupported);
             }
-            (result == 0).then_some(()).ok_or(DiscardError::Io)
+            (result == 0).ok_or(DiscardError::Io)
         }
     }
 }

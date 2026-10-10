@@ -69,6 +69,7 @@ mod tests {
     use super::*;
     use futures_channel::mpsc;
     use futures_util::FutureExt as _;
+    use std::assert_matches;
 
     fn frame(event: &impl serde::Serialize) -> Vec<u8> {
         terra_protocol::encode_frame(event).unwrap()
@@ -87,10 +88,7 @@ mod tests {
         let mut bytes = frame(&LifecycleEvent::AgentReady);
         bytes.extend_from_slice(&frame(&LifecycleEvent::Exit { code: -7 }));
         let events = lifecycle_events(&bytes);
-        assert!(matches!(
-            events.as_slice(),
-            [Event::AgentReady, Event::Exit(-7)]
-        ));
+        assert_matches!(events.as_slice(), [Event::AgentReady, Event::Exit(-7)]);
         let mut bytes = frame(&LifecycleEvent::Diagnostic { bytes: vec![1] });
         bytes.extend_from_slice(&frame(&LifecycleEvent::Exit { code: 0 }));
         assert!(lifecycle_events(&bytes).is_empty());

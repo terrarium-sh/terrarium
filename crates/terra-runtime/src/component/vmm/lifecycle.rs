@@ -297,6 +297,7 @@ pub(super) fn create_component_loop(
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
     use std::time::Duration;
 
     use super::{Event, LifecycleHost, Outcome, lifecycle_platform, wait_for_outcome};
@@ -308,10 +309,10 @@ mod tests {
         notifier.deadline();
         notifier.guest_exit(7);
 
-        assert!(matches!(
+        assert_matches!(
             host.next_event().await.expect("event"),
             Ok(lifecycle_platform::Event::Deadline)
-        ));
+        );
         assert_eq!(*host.sender.event.borrow(), Some(Event::Deadline));
     }
 

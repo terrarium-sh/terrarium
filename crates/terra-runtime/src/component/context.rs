@@ -236,6 +236,7 @@ pub fn add_device_imports<T: Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::interrupt::Host as _;
+    use std::assert_matches;
 
     /// Flips the line through the import so every call is a change that spends one wakeup.
     fn toggle_interrupt(context: &mut super::DeviceContext) {
@@ -278,10 +279,10 @@ mod tests {
         let size = usize::try_from(crate::MAX_SINGLE_BYTES).unwrap() + 1;
         let mut host = super::DeviceContext::new(size as u64).unwrap();
         host.write(0, vec![7]).unwrap();
-        assert!(matches!(
+        assert_matches!(
             host.write(0, vec![9; size]),
             Err(super::memory::MemoryError::TooLarge)
-        ));
+        );
         assert_eq!(host.read(0, 1).unwrap(), vec![7]);
     }
 

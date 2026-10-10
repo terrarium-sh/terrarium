@@ -267,6 +267,7 @@ fn general_register(number: u8) -> Option<Reg> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     /// `CPU_ON` must discard the previous guest's MMU, cache, timer and PSTATE controls.
     #[test]
@@ -319,10 +320,7 @@ mod tests {
             ..gic
         };
         validate_gic_layout(&one_cpu, 1)?;
-        assert!(matches!(
-            validate_gic_layout(&one_cpu, 2),
-            Err(HvError::GicLayout)
-        ));
+        assert_matches!(validate_gic_layout(&one_cpu, 2), Err(HvError::GicLayout));
         Ok(())
     }
 }

@@ -2,6 +2,7 @@ use super::rules::*;
 use super::runtime::{BoxPolicy, LEARNED_ADDRESSES_CAPACITY};
 use crate::config::{Network, NetworkMode, StaticDnsRecord};
 use crate::runtime::NameLookup;
+use std::assert_matches;
 use std::net::IpAddr;
 
 fn gateway_addresses() -> [IpAddr; 2] {
@@ -128,10 +129,7 @@ fn nothing_unwritten_crosses_the_floor() {
     // The allowlist reaches nothing at all without a rule - not even names.
     let closed = build_policy(&Network::default()).unwrap();
     assert!(!closed.allows("1.1.1.1".parse().unwrap(), Some(443)));
-    assert!(matches!(
-        closed.lookup_name("example.com"),
-        NameLookup::Denied
-    ));
+    assert_matches!(closed.lookup_name("example.com"), NameLookup::Denied);
 }
 
 #[test]
@@ -187,11 +185,11 @@ fn allowlist_name_lookup_learns_only_granted_public_addresses() {
         ],
         &["api.test:443", "db.local:5432", "nas.local:445"],
     );
-    assert!(matches!(
+    assert_matches!(
         p.lookup_name("db.local"),
         NameLookup::Static(addresses) if addresses == gateway_addresses()
-    ));
-    assert!(matches!(p.lookup_name("api.test"), NameLookup::Resolve(_)));
+    );
+    assert_matches!(p.lookup_name("api.test"), NameLookup::Resolve(_));
     let ip: IpAddr = "93.184.216.34".parse().unwrap();
     assert_eq!(p.accept_resolved("api.test", &[ip]), [ip]);
     assert!(p.allows(ip, Some(443)));
@@ -212,7 +210,7 @@ fn allowlist_name_lookup_learns_only_granted_public_addresses() {
     let nas: IpAddr = "10.0.0.5".parse().unwrap();
     assert!(p.allows(nas, Some(445)));
 
-    assert!(matches!(p.lookup_name("exfil.example"), NameLookup::Denied));
+    assert_matches!(p.lookup_name("exfil.example"), NameLookup::Denied);
     assert!(!p.allows("1.1.1.1".parse().unwrap(), Some(443)));
 }
 
@@ -225,11 +223,8 @@ fn unrestricted_public_name_lookup_keeps_the_floor_closed() {
         &[build_dns_record("db.local", HOST_LOOPBACK_SYMBOL)],
         &["db.local:5432", "10.0.0.5:445"],
     );
-    assert!(matches!(p.lookup_name("db.local"), NameLookup::Static(_)));
-    assert!(matches!(
-        p.lookup_name("anything.test"),
-        NameLookup::Resolve(_)
-    ));
+    assert_matches!(p.lookup_name("db.local"), NameLookup::Static(_));
+    assert_matches!(p.lookup_name("anything.test"), NameLookup::Resolve(_));
 
     // Public is open by default; the floor and the host are not.
     assert!(p.allows("1.1.1.1".parse().unwrap(), Some(443)));
@@ -260,20 +255,14 @@ fn name_lookup_is_static_resolved_or_denied() {
     network.hosts = vec![build_dns_record("db.local", HOST_LOOPBACK_SYMBOL)];
     let p = build_policy(&network).unwrap();
 
-    assert!(matches!(p.lookup_name("db.local"), NameLookup::Static(_)));
-    assert!(matches!(p.lookup_name("api.test"), NameLookup::Resolve(_)));
+    assert_matches!(p.lookup_name("db.local"), NameLookup::Static(_));
+    assert_matches!(p.lookup_name("api.test"), NameLookup::Resolve(_));
     for denied in ["v2.api.test", "payload.db.local", "exfil.example"] {
-        assert!(
-            matches!(p.lookup_name(denied), NameLookup::Denied),
-            "{denied}"
-        );
+        assert_matches!(p.lookup_name(denied), NameLookup::Denied, "{denied}");
     }
 
     let open = build_box_policy(NetworkMode::UnrestrictedPublic, &[]);
-    assert!(matches!(
-        open.lookup_name("anything.test"),
-        NameLookup::Resolve(_)
-    ));
+    assert_matches!(open.lookup_name("anything.test"), NameLookup::Resolve(_));
 
     // An address rule does not turn that gate exclusive - it is read there,
     // it simply has nothing to say about resolution.
@@ -648,22 +637,16 @@ fn an_entry_is_split_on_the_socketaddr_convention() {
         "::1",
     ] {
         let rule = parse_allow(addr).unwrap();
-        assert!(
-            matches!(rule, Rule::Addr(..)),
-            "{addr} is an address: {rule:?}"
-        );
+        assert_matches!(rule, Rule::Addr(..), "{addr} is an address: {rule:?}");
     }
     for name in ["example.com", "api.openai.com:443", "vma.terra"] {
         let rule = parse_allow(name).unwrap();
-        assert!(matches!(rule, Rule::Name(..)), "{name} is a name: {rule:?}");
+        assert_matches!(rule, Rule::Name(..), "{name} is a name: {rule:?}");
     }
     // …and the one word for the machine terra runs on is neither, in any case.
     for host in [HOST_LOOPBACK_SYMBOL, "host_loopback", "HOST_LOOPBACK:22"] {
         let rule = parse_allow(host).unwrap();
-        assert!(
-            matches!(rule, Rule::Host(_)),
-            "{host} is the host: {rule:?}"
-        );
+        assert_matches!(rule, Rule::Host(_), "{host} is the host: {rule:?}");
     }
 
     // An un-bracketed v6 address whose last group also reads as a port is
@@ -900,10 +883,7 @@ fn poisoned_dns_cache_denies_learning_without_revoking_explicit_grants() {
     assert!(p.allows("10.0.0.5".parse().unwrap(), Some(80)));
     assert_eq!(p.host_service_ports(), [Some(22)]);
     assert!(!p.allows(gateway_addresses()[0], Some(22)));
-    assert!(matches!(
-        p.lookup_name("STATIC.TEST."),
-        NameLookup::Static(_)
-    ));
+    assert_matches!(p.lookup_name("STATIC.TEST."), NameLookup::Static(_));
 }
 
 #[test]
@@ -943,7 +923,7 @@ fn unmatched_or_empty_names_never_gain_allowlist_authority() {
     ] {
         assert!(p.grants_for(name).is_empty(), "{name:?}");
         assert!(p.static_answer(name).is_none());
-        assert!(matches!(p.lookup_name(name), NameLookup::Denied));
+        assert_matches!(p.lookup_name(name), NameLookup::Denied);
         assert_eq!(
             p.accept_resolved(name, &["1.1.1.1".parse().unwrap()]),
             [] as [std::net::IpAddr; 0]
@@ -985,8 +965,9 @@ fn resolution_returns_only_valid_normalized_hostnames() {
                 &[]
             },
         );
-        assert!(
-            matches!(policy.lookup_name("API.Test."), NameLookup::Resolve(name) if name == "api.test")
+        assert_matches!(
+            policy.lookup_name("API.Test."),
+            NameLookup::Resolve(name) if name == "api.test"
         );
         for invalid in [
             "",
@@ -997,8 +978,9 @@ fn resolution_returns_only_valid_normalized_hostnames() {
             "a-.test",
             "a.test/path",
         ] {
-            assert!(
-                matches!(policy.lookup_name(invalid), NameLookup::Denied),
+            assert_matches!(
+                policy.lookup_name(invalid),
+                NameLookup::Denied,
                 "{mode:?}: {invalid}"
             );
         }
@@ -1014,8 +996,9 @@ fn configured_gateway_addresses_control_policy() {
     );
     network.hosts = vec![build_dns_record("host.test", HOST_LOOPBACK_SYMBOL)];
     let policy = BoxPolicy::new(&network, gateways).unwrap();
-    assert!(
-        matches!(policy.lookup_name("host.test"), NameLookup::Static(addresses) if addresses == gateways)
+    assert_matches!(
+        policy.lookup_name("host.test"),
+        NameLookup::Static(addresses) if addresses == gateways
     );
     for gateway in gateways {
         assert!(!policy.allows(gateway, Some(5432)));
@@ -1042,10 +1025,10 @@ fn native_limits_deny_unbounded_inputs_and_pin_monotonic_expiry() {
         [] as [std::net::IpAddr; 0]
     );
     assert!(!policy.allows(address, Some(443)));
-    assert!(matches!(
+    assert_matches!(
         policy.lookup_name(&"a".repeat(crate::MAX_NAME_BYTES + 1)),
         NameLookup::Denied
-    ));
+    );
     policy.accept_resolved("api.test", &[address]);
     NOW.store(59_999_999_999, Ordering::Relaxed);
     assert!(policy.allows(address, Some(443)));

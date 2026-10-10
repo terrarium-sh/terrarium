@@ -308,6 +308,7 @@ mod tests {
     use super::super::{BoxRuntime, Reply, ReplySender, enqueue, mpsc};
     use super::*;
     use crate::box_runtime::BoxHost;
+    use std::assert_matches;
 
     fn access() -> Command {
         Command::Access(0, 4, 0, false)
@@ -390,8 +391,9 @@ mod tests {
             .await;
             assert_eq!(requests.next().await.unwrap().sequence, 7);
             assert_eq!(channel.unwrap().1.sequence, 8);
-            assert!(
-                matches!(&result, Err(QueueError::Failure(error)) if error.to_string().contains("Device"))
+            assert_matches!(
+                &result,
+                Err(QueueError::Failure(error)) if error.to_string().contains("Device")
             );
             assert_eq!(
                 context.devices.get().unwrap()[0]
@@ -401,10 +403,7 @@ mod tests {
                 0
             );
             reply.send(result);
-            assert!(matches!(
-                response.recv().unwrap(),
-                Err(QueueError::Failure(_))
-            ));
+            assert_matches!(response.recv().unwrap(), Err(QueueError::Failure(_)));
         }
     }
 
@@ -434,17 +433,15 @@ mod tests {
         )
         .await;
         assert_eq!(requests.next().await.unwrap().operation, Operation::Reset);
-        assert!(
-            matches!(&result, Err(QueueError::Failure(error)) if error.to_string() == format!("MMIO block device error {:?}", super::super::DeviceError::BadLen))
+        assert_matches!(
+            &result,
+            Err(QueueError::Failure(error)) if error.to_string() == format!("MMIO block device error {:?}", super::super::DeviceError::BadLen)
         );
         let counts = &context.devices.get().unwrap()[0].counts;
         assert_eq!(counts.completed.load(Ordering::Relaxed), 0);
         assert_eq!(counts.failed.load(Ordering::Relaxed), 1);
         reply.send(result);
-        assert!(matches!(
-            response.recv().unwrap(),
-            Err(QueueError::Failure(_))
-        ));
+        assert_matches!(response.recv().unwrap(), Err(QueueError::Failure(_)));
     }
 
     #[tokio::test]
@@ -463,9 +460,8 @@ mod tests {
             (Command::Access(u64::MAX, 8, 0, false), Error::Overflow),
             (Command::Access(0x1200, 4, 0, false), Error::Unmapped),
         ] {
-            assert!(
-                matches!(submit_async(&queue, &admission, &failure, command, None).await,
-                Err(QueueError::Router(error)) if error == expected)
+            assert_matches!(submit_async(&queue, &admission, &failure, command, None).await,
+                Err(QueueError::Router(error)) if error == expected
             );
             assert!(requests.next().now_or_never().is_none());
             assert!(admission.lock().unwrap().is_none());
@@ -560,19 +556,19 @@ mod tests {
                 selected_channel,
             )
             .await;
-            assert!(matches!(
+            assert_matches!(
                 &result,
                 Err(QueueError::Router(super::super::Error::Unmapped))
-            ));
+            );
             assert!(requests.next().now_or_never().is_none());
             if let Some((_, returned_channel)) = returned_channel {
                 channel = Some(returned_channel);
             }
             reply.send(result);
-            assert!(matches!(
+            assert_matches!(
                 response.recv().unwrap(),
                 Err(QueueError::Router(super::super::Error::Unmapped))
-            ));
+            );
         }
     }
 
@@ -583,12 +579,12 @@ mod tests {
             super::super::Error::BadWidth,
             super::super::Error::Overflow,
         ] {
-            assert!(matches!(router_failure(error), QueueError::Router(_)));
+            assert_matches!(router_failure(error), QueueError::Router(_));
         }
-        assert!(matches!(
+        assert_matches!(
             router_failure(super::super::Error::Device),
             QueueError::Failure(_)
-        ));
+        );
     }
 
     #[tokio::test]
@@ -605,10 +601,10 @@ mod tests {
         pending
             .reply
             .send(Err(QueueError::Router(super::super::Error::Unmapped)));
-        assert!(matches!(
+        assert_matches!(
             request.await,
             Err(QueueError::Router(super::super::Error::Unmapped))
-        ));
+        );
     }
 
     #[tokio::test]

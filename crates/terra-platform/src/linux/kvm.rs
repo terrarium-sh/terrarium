@@ -232,6 +232,7 @@ impl Drop for VcpuHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     #[test]
     fn stop_command_wakes_a_runner_waiting_to_start() {
@@ -268,10 +269,7 @@ mod tests {
             panic!("runner failed");
         })
         .unwrap();
-        assert!(matches!(
-            handle.stop(STOP_DEADLINE),
-            Err(KvmError::ThreadGone)
-        ));
+        assert_matches!(handle.stop(STOP_DEADLINE), Err(KvmError::ThreadGone));
         assert!(handle.thread.is_none());
         assert!(!handle.runner.is_published());
     }
@@ -282,10 +280,7 @@ mod tests {
         let _published = runner.publish();
         let (done_tx, done) = mpsc::channel();
         finish_runner(&runner, &done_tx, Ok(VcpuOutcome::Stopped));
-        assert!(matches!(
-            done.recv().expect("outcome"),
-            Ok(VcpuOutcome::Stopped)
-        ));
+        assert_matches!(done.recv().expect("outcome"), Ok(VcpuOutcome::Stopped));
         assert!(!runner.is_published());
     }
 
@@ -334,10 +329,7 @@ mod tests {
         while !handle.runner.is_published() {
             std::thread::yield_now();
         }
-        assert!(matches!(
-            handle.stop(Duration::ZERO),
-            Err(KvmError::Timeout)
-        ));
+        assert_matches!(handle.stop(Duration::ZERO), Err(KvmError::Timeout));
         assert!(handle.thread.is_some());
         assert!(resource_lifetime.upgrade().is_some());
         release.store(true, Ordering::Release);
@@ -378,10 +370,10 @@ mod tests {
     #[test]
     fn runner_failure_is_reaped_and_unpublished() {
         let mut handle = spawn_runner(0, |_| Err(KvmError::ThreadGone)).unwrap();
-        assert!(matches!(
+        assert_matches!(
             handle.stop(Duration::from_secs(1)),
             Err(KvmError::ThreadGone)
-        ));
+        );
         assert!(handle.thread.is_none());
         assert!(!handle.runner.is_published());
     }

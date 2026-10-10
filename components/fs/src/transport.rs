@@ -351,7 +351,7 @@ pub(crate) fn wasi_error(error: crate::wasi::filesystem::types::ErrorCode) -> i3
 }
 
 fn flush_body(body: &[u8]) -> Result<(), i32> {
-    (body.len() == 24).then_some(()).ok_or(wire::EINVAL)
+    (body.len() == 24).ok_or(wire::EINVAL)
 }
 
 fn attr(stat: &host::Stat) -> Vec<u8> {

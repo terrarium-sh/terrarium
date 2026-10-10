@@ -308,6 +308,7 @@ pub fn enrich_boot_plan_for_fuzzing(bytes: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
     use std::collections::BTreeMap;
 
     fn boot_plan() -> Vec<u8> {
@@ -432,10 +433,10 @@ mod tests {
                     .unwrap()
                     .unwrap()
                     .unwrap();
-                assert!(matches!(
+                assert_matches!(
                     event,
                     crate::component::vmm::lifecycle::lifecycle_platform::Event::GuestExit(7)
-                ));
+                );
             })
             .await
             .expect("event stream runs");
@@ -484,10 +485,10 @@ mod tests {
                     .unwrap()
                     .unwrap()
                     .unwrap();
-                assert!(matches!(
+                assert_matches!(
                     event,
                     crate::component::vmm::lifecycle::lifecycle_platform::Event::GuestExit(9)
-                ));
+                );
                 assert!(lifecycle.notifier().is_agent_ready());
                 tokio::time::timeout(Duration::from_secs(1), stream_end)
                     .await

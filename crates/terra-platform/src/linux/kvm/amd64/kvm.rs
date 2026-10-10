@@ -171,7 +171,6 @@ fn handler_action(handler: &mut dyn VcpuHandler, exit: VcpuExit) -> Result<VcpuA
 
 fn require_reentry(action: VcpuAction) -> Result<(), KvmError> {
     matches!(action, VcpuAction::Reenter)
-        .then_some(())
         .ok_or_else(|| KvmError::Handler("vCPU action must reenter".to_owned()))
 }
 

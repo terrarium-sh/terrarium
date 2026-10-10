@@ -1019,6 +1019,7 @@ fn authorize_peer(policy: &BoxPolicy, peer: SocketAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     fn send_datagram(handle: Handle, peer: SocketAddr, bytes: Vec<u8>) -> Operation {
         Operation::SendDatagrams {
@@ -2807,7 +2808,7 @@ mod tests {
         broker.await.unwrap().unwrap();
         let mut broker = Broker::bind(config()).unwrap();
         broker.next_handle = u64::MAX;
-        assert!(matches!(
+        assert_matches!(
             broker.complete(Completion::Open(Resource::Udp(UdpResource {
                 ipv4: Some(Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap())),
                 ipv6: None,
@@ -2815,7 +2816,7 @@ mod tests {
                 publication_grant: None,
             }))),
             Err(Error::LimitExceeded)
-        ));
+        );
         assert!(broker.resources.is_empty());
     }
 

@@ -135,11 +135,8 @@ fn open_or_create_directory(
         let name = dir
             .file_name()
             .ok_or_else(|| std::io::Error::other("missing parent has no name"))?;
-        rustix::fs::mkdirat(&parent, name, Mode::from_raw_mode(0o755)).or_else(|error| {
-            (error == rustix::io::Errno::EXIST)
-                .then_some(())
-                .ok_or(error)
-        })?;
+        rustix::fs::mkdirat(&parent, name, Mode::from_raw_mode(0o755))
+            .or_else(|error| (error == rustix::io::Errno::EXIST).ok_or(error))?;
         parent = rustix::fs::openat(
             &parent,
             name,
@@ -821,6 +818,7 @@ fn handle_sync_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     #[test]
     fn sync_resolves_parents_above_the_root_but_not_links_inside_it() {
@@ -1003,10 +1001,10 @@ mod tests {
             })
         );
         for _ in 0..4 {
-            assert!(matches!(
+            assert_matches!(
                 read_frame::<SyncReply>(&mut replies).unwrap(),
                 Some(SyncReply::Err(_))
-            ));
+            );
         }
         assert_eq!(
             read_frame::<SyncReply>(&mut replies).unwrap(),

@@ -586,6 +586,7 @@ mod tests {
     use super::terra::agent::host_service::{HostClient, HostClientWithStore, HostWithStore};
     use super::*;
     use crate::component::agent::AgentHost;
+    use std::assert_matches;
     #[cfg(unix)]
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -615,14 +616,14 @@ mod tests {
             .await
             .expect("initial readiness");
         let mut buffer = [0; 5];
-        assert!(matches!(
+        assert_matches!(
             poll_read_input(
                 &mut input,
                 &mut Context::from_waker(Waker::noop()),
                 &mut buffer
             ),
             Poll::Ready(Ok(5))
-        ));
+        );
         let wake = Arc::new(ReadWake(AtomicUsize::new(0)));
         let waker = Waker::from(Arc::clone(&wake));
         assert!(
@@ -636,10 +637,10 @@ mod tests {
         })
         .await
         .expect("the new reader must be woken after stale readiness is cleared");
-        assert!(matches!(
+        assert_matches!(
             poll_read_input(&mut input, &mut Context::from_waker(&waker), &mut buffer),
             Poll::Ready(Ok(5))
-        ));
+        );
         assert_eq!(&buffer, b"later");
     }
 

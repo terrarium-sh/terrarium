@@ -128,6 +128,7 @@ pub(super) fn resolve_placement(src: SourcePlacement<'_>, dst: DestinationPlacem
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     #[test]
     fn parse_endpoint_identifies_guest_and_host() {
@@ -187,14 +188,11 @@ mod tests {
     fn exactly_one_guest_endpoint_required() {
         assert!(parse_endpoints("box:/a", "box:/b").is_err());
         assert!(parse_endpoints("./a", "./b").is_err());
-        assert!(matches!(
+        assert_matches!(
             parse_endpoints("./a", "box:/b"),
             Ok(Transfer::Upload { .. })
-        ));
-        assert!(matches!(
-            parse_endpoints(":/a", "./b"),
-            Ok(Transfer::Download { .. })
-        ));
+        );
+        assert_matches!(parse_endpoints(":/a", "./b"), Ok(Transfer::Download { .. }));
     }
 
     #[test]

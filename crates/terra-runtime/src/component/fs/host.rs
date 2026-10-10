@@ -654,7 +654,8 @@ mod tests {
                     .await;
                     #[cfg(target_os = "macos")]
                     {
-                        assert!(matches!(opened, Err(terra::fs::host::Error::Unsupported)));
+                        use std::assert_matches;
+                        assert_matches!(opened, Err(terra::fs::host::Error::Unsupported));
                         assert_eq!(budget.available_permits(), 1);
                     }
                     #[cfg(not(target_os = "macos"))]

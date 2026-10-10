@@ -265,6 +265,7 @@ impl<T: Send + 'static> platform::HostVcpuWithStore<T> for Platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
     use std::future::Future;
     use std::task::{Context, Poll, Waker};
 
@@ -282,15 +283,9 @@ mod tests {
         });
         let mut host = PlatformHost::default();
         host.table.push(vcpu).unwrap();
-        assert!(matches!(
-            response.try_recv(),
-            Err(mpsc::TryRecvError::Empty)
-        ));
+        assert_matches!(response.try_recv(), Err(mpsc::TryRecvError::Empty));
         drop(host);
-        assert!(matches!(
-            response.try_recv(),
-            Err(mpsc::TryRecvError::Disconnected)
-        ));
+        assert_matches!(response.try_recv(), Err(mpsc::TryRecvError::Disconnected));
     }
 
     /// Wasmtime keeps spawned host tasks in the Store after `run_concurrent` is
@@ -625,7 +620,7 @@ mod tests {
                 );
 
                 let native = tokio::task::spawn_blocking(move || native.exchange(Exit::Halt));
-                assert!(matches!(
+                assert_matches!(
                     resume(
                         accessor,
                         Resource::new_borrow(resource.rep()),
@@ -633,8 +628,8 @@ mod tests {
                     )
                     .await?,
                     Ok(Exit::Halt)
-                ));
-                assert!(matches!(
+                );
+                assert_matches!(
                     resume(
                         accessor,
                         Resource::new_borrow(resource.rep()),
@@ -642,7 +637,7 @@ mod tests {
                     )
                     .await?,
                     Err(Error::BadExit)
-                ));
+                );
                 Ok::<_, wasmtime::Error>(native)
             })
             .await
@@ -666,7 +661,7 @@ mod tests {
                     wait.recv().unwrap();
                     completion
                 });
-                assert!(matches!(
+                assert_matches!(
                     resume(
                         accessor,
                         Resource::new_borrow(resource.rep()),
@@ -674,16 +669,16 @@ mod tests {
                     )
                     .await?,
                     Ok(Exit::Halt)
-                ));
+                );
                 let mut first = std::pin::pin!(resume(
                     accessor,
                     Resource::new_borrow(resource.rep()),
                     Completion::Reenter,
                 ));
-                assert!(matches!(
+                assert_matches!(
                     first.as_mut().poll(&mut Context::from_waker(Waker::noop())),
                     Poll::Pending
-                ));
+                );
                 assert!(
                     resume(
                         accessor,
@@ -694,16 +689,13 @@ mod tests {
                     .is_err()
                 );
                 release.send(()).unwrap();
-                assert!(matches!(first.await?, Ok(Exit::Stopped)));
+                assert_matches!(first.await?, Ok(Exit::Stopped));
                 Ok::<_, wasmtime::Error>(native)
             })
             .await
             .unwrap()
             .unwrap();
-        assert!(matches!(
-            native.await.unwrap().unwrap(),
-            Completion::Reenter
-        ));
+        assert_matches!(native.await.unwrap().unwrap(), Completion::Reenter);
     }
 
     #[test]
@@ -816,10 +808,7 @@ mod tests {
                     value: 0,
                 }))
                 .unwrap();
-            assert!(matches!(
-                task.join().unwrap().unwrap(),
-                vm::VcpuAction::ArmRead(_)
-            ));
+            assert_matches!(task.join().unwrap().unwrap(), vm::VcpuAction::ArmRead(_));
             assert!(rendezvous.exits.try_recv().is_err());
         });
     }

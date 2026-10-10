@@ -1,4 +1,5 @@
 use crate::support::agent as support;
+use std::assert_matches;
 
 use std::time::Duration;
 use support::{AgentGuest, plan_frame, yamux_frame};
@@ -133,14 +134,14 @@ async fn stale_connection_number_cannot_restart_agent_session() {
         .endpoint
         .connect(old_connection_number + 1)
         .expect("replacement");
-    assert!(matches!(
+    assert_matches!(
         agent.endpoint.try_write(old_connection_number, &[0]),
         Err(StreamError::Stale)
-    ));
-    assert!(matches!(
+    );
+    assert_matches!(
         agent.endpoint.try_read(old_connection_number, 1),
         Err(StreamError::Stale)
-    ));
+    );
     let failure = agent.wait_for_failure().await;
     assert!(failure.contains("disconnected"), "{failure}");
     assert!(!agent.lifecycle.is_agent_ready());

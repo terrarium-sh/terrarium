@@ -740,6 +740,7 @@ pub async fn symlink(parent: &Node, name: Vec<u8>, target: Vec<u8>) -> Result<No
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     #[test]
     fn fixed_owner_requests_do_not_need_host_mutation() {
@@ -756,7 +757,7 @@ mod tests {
         let mut first = CacheReservation::new(&used, 4);
         assert!(first.grow(3).is_ok());
         let mut second = CacheReservation::new(&used, 4);
-        assert!(matches!(second.grow(2), Err(wire::EMFILE)));
+        assert_matches!(second.grow(2), Err(wire::EMFILE));
         drop(first);
         assert!(second.grow(1).is_ok());
         assert_eq!(used.load(Ordering::Relaxed), 1);

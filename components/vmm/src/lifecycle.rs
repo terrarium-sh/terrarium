@@ -61,20 +61,18 @@ async fn finish_shutdown(event: Event) -> Result<Event, lifecycle_platform::Erro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     #[test]
     fn completed_vcpus_keep_an_already_ready_external_event() {
-        assert!(matches!(
+        assert_matches!(
             completed_vcpus_event(Ok(()), Some(Ok(Event::Deadline))),
             Ok(Event::Deadline)
-        ));
-        assert!(matches!(
-            completed_vcpus_event(Ok(()), None),
-            Ok(Event::VcpuFinished)
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(completed_vcpus_event(Ok(()), None), Ok(Event::VcpuFinished));
+        assert_matches!(
             completed_vcpus_event(Err(super::super::Error::BadArmExit), Some(Ok(Event::Deadline))),
             Ok(Event::ComponentFailed(error)) if error.contains("BadArmExit")
-        ));
+        );
     }
 }

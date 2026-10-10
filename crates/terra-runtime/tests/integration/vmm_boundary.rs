@@ -1,4 +1,5 @@
 use crate::support;
+use std::assert_matches;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -125,7 +126,7 @@ async fn wasm_vmm_routes_native_exits_and_stops_with_the_box() {
         ))
     })
     .expect("PIO completion");
-    assert!(matches!(pio, Completion::PioZero));
+    assert_matches!(pio, Completion::PioZero);
 
     let msr = tokio::task::block_in_place(|| {
         vcpu.exchange(Exit::Rdmsr(terra_runtime::component::vmm::platform::Msr {
@@ -134,7 +135,7 @@ async fn wasm_vmm_routes_native_exits_and_stops_with_the_box() {
         }))
     })
     .expect("MSR completion");
-    assert!(matches!(msr, Completion::Rdmsr(0)));
+    assert_matches!(msr, Completion::Rdmsr(0));
 
     let unsupported_msr = tokio::task::block_in_place(|| {
         vcpu.exchange(Exit::Rdmsr(terra_runtime::component::vmm::platform::Msr {
@@ -143,7 +144,7 @@ async fn wasm_vmm_routes_native_exits_and_stops_with_the_box() {
         }))
     })
     .expect("unsupported MSR completion");
-    assert!(matches!(unsupported_msr, Completion::MsrFault));
+    assert_matches!(unsupported_msr, Completion::MsrFault);
 
     let mmio = tokio::task::block_in_place(|| {
         vcpu.exchange(Exit::MmioRead(
@@ -154,7 +155,7 @@ async fn wasm_vmm_routes_native_exits_and_stops_with_the_box() {
         ))
     })
     .expect("MMIO completion");
-    assert!(matches!(mmio, Completion::MmioRead(0x7472_6976)));
+    assert_matches!(mmio, Completion::MmioRead(0x7472_6976));
 
     let arm_read = tokio::task::block_in_place(|| {
         vcpu.exchange(Exit::ArmException(
@@ -167,13 +168,13 @@ async fn wasm_vmm_routes_native_exits_and_stops_with_the_box() {
         ))
     })
     .expect("ARM MMIO read");
-    assert!(matches!(
+    assert_matches!(
         arm_read,
         Completion::ArmRead(terra_runtime::component::vmm::platform::ArmRead {
             register: Some(4),
             value: 0x7472_6976
         })
-    ));
+    );
     let arm_write = tokio::task::block_in_place(|| {
         vcpu.exchange(Exit::ArmException(
             terra_runtime::component::vmm::platform::ArmException {
@@ -185,13 +186,13 @@ async fn wasm_vmm_routes_native_exits_and_stops_with_the_box() {
         ))
     })
     .expect("ARM MMIO write");
-    assert!(matches!(
+    assert_matches!(
         arm_write,
         Completion::ArmRead(terra_runtime::component::vmm::platform::ArmRead {
             register: None,
             ..
         })
-    ));
+    );
     let hvc = tokio::task::block_in_place(|| {
         vcpu.exchange(Exit::ArmException(
             terra_runtime::component::vmm::platform::ArmException {
@@ -203,7 +204,7 @@ async fn wasm_vmm_routes_native_exits_and_stops_with_the_box() {
         ))
     })
     .expect("ARM HVC");
-    assert!(matches!(hvc, Completion::HvcReturn(0x0001_0000)));
+    assert_matches!(hvc, Completion::HvcReturn(0x0001_0000));
 
     memory.close().expect("memory close");
     let shutdown_started = std::time::Instant::now();

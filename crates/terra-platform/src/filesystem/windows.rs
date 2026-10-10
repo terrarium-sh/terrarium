@@ -484,9 +484,7 @@ fn current_user_sid() -> std::io::Result<Vec<u32>> {
 }
 
 fn win_ok(ok: i32) -> std::io::Result<()> {
-    (ok != 0)
-        .then_some(())
-        .ok_or_else(std::io::Error::last_os_error)
+    (ok != 0).ok_or_else(std::io::Error::last_os_error)
 }
 
 #[cfg(test)]

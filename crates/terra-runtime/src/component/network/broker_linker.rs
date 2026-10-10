@@ -1083,6 +1083,7 @@ fn add_resolve<T: WasiView + AsMut<NetworkHost> + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
     use std::time::Duration;
     use terra_protocol::network::{Request, Response};
     use tokio::io::DuplexStream;
@@ -1140,7 +1141,7 @@ mod tests {
         let address = "127.0.0.1:43210".parse().unwrap();
         let broker = async {
             let request = receive_request(&mut peer).await;
-            assert!(matches!(request.operation, Operation::Accept(11)));
+            assert_matches!(request.operation, Operation::Accept(11));
             respond(
                 &mut peer,
                 &request,
@@ -1270,7 +1271,7 @@ mod tests {
             let mut writes = Vec::new();
             for _ in 0..terra_network::MAX_TCP_WRITE_REQUESTS {
                 let request = receive_request(&mut peer).await;
-                assert!(matches!(&request.operation, Operation::WriteAll { handle: 7, bytes } if bytes.len() == MAX_NETWORK_CHUNK_BYTES));
+                assert_matches!(&request.operation, Operation::WriteAll { handle: 7, bytes } if bytes.len() == MAX_NETWORK_CHUNK_BYTES);
                 writes.push(request);
             }
             assert_no_request(&mut peer).await;
@@ -1278,7 +1279,7 @@ mod tests {
                 respond(&mut peer, &write, Ok(Reply::Written(u32::try_from(MAX_NETWORK_CHUNK_BYTES).unwrap()))).await;
             }
             let write = receive_request(&mut peer).await;
-            assert!(matches!(write.operation, Operation::WriteAll { .. }));
+            assert_matches!(write.operation, Operation::WriteAll { .. });
             assert_no_request(&mut peer).await;
             respond(&mut peer, &write, Ok(Reply::Written(u32::try_from(MAX_NETWORK_CHUNK_BYTES).unwrap()))).await;
             let fin = receive_request(&mut peer).await;
@@ -1309,9 +1310,10 @@ mod tests {
         let broker = async {
             let first = receive_request(&mut peer).await;
             let second = receive_request(&mut peer).await;
-            assert!(matches!(&first.operation, Operation::WriteAll { bytes, .. } if bytes == &[1]));
-            assert!(
-                matches!(&second.operation, Operation::WriteAll { bytes, .. } if bytes == &[2])
+            assert_matches!(&first.operation, Operation::WriteAll { bytes, .. } if bytes == &[1]);
+            assert_matches!(
+                &second.operation,
+                Operation::WriteAll { bytes, .. } if bytes == &[2]
             );
             respond(&mut peer, &second, Err(Error::ConnectionReset)).await;
         };
@@ -1343,13 +1345,13 @@ mod tests {
         input.pipe(&mut store, CollectBytes(collected)).unwrap();
         store.run_concurrent(async |_| {
             let read = receive_request(&mut peer).await;
-            assert!(matches!(read.operation, Operation::Read { handle: 7, max_bytes } if max_bytes as usize == MAX_NETWORK_READ_BYTES));
+            assert_matches!(read.operation, Operation::Read { handle: 7, max_bytes } if max_bytes as usize == MAX_NETWORK_READ_BYTES);
             respond(&mut peer, &read, Ok(Reply::Data(vec![8; MAX_NETWORK_READ_BYTES]))).await;
             let mut received = Vec::new();
             while received.len() < MAX_NETWORK_READ_BYTES { received.extend(chunks.recv().await.unwrap()); }
             assert_eq!(received, vec![8; MAX_NETWORK_READ_BYTES]);
             let read = receive_request(&mut peer).await;
-            assert!(matches!(read.operation, Operation::Read { .. }));
+            assert_matches!(read.operation, Operation::Read { .. });
             respond(&mut peer, &read, Ok(Reply::Eof)).await;
             assert_eq!(outcome.await.unwrap(), Ok(()));
             let monitor = receive_request(&mut peer).await;

@@ -463,6 +463,7 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
     use super::*;
 
     #[test]
@@ -522,18 +523,19 @@ mod tests {
             (&Method::GET, "/download?bytes=0", 400),
             (&Method::POST, "/upload?bytes=x", 400),
         ] {
-            assert!(
-                matches!(get(method, uri), Route::Reject { status: s, .. } if s == status),
+            assert_matches!(
+                get(method, uri),
+                Route::Reject { status: s, .. } if s == status,
                 "{uri}"
             );
         }
-        assert!(matches!(
+        assert_matches!(
             get(&Method::GET, "/upload?bytes=1"),
             Route::Reject {
                 allow: Some("POST"),
                 ..
             }
-        ));
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -183,7 +183,6 @@ fn run_x64_vcpu(
 
 fn require_reentry(handler: &mut dyn VcpuHandler, exit: VcpuExit) -> Result<(), String> {
     matches!(handler.exchange(exit)?, VcpuAction::Reenter)
-        .then_some(())
         .ok_or("unexpected Windows x64 VMM completion".to_owned())
 }
 

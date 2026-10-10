@@ -927,6 +927,7 @@ async fn relay_udp_publication(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     #[tokio::test]
     async fn dns_tcp_framing_bounds_and_preserves_queries() {
@@ -1053,10 +1054,10 @@ mod tests {
             });
             for _ in 0..MAX_DNS_CLIENTS {
                 requester.send_to(&[0; 12], address).await.unwrap();
-                assert!(matches!(
+                assert_matches!(
                     read_host_message(&mut network.host).await,
                     Message::DnsQuery { .. }
-                ));
+                );
             }
             assert_eq!(tasks.len(), MAX_DNS_CLIENTS);
             for _ in 0..MAX_DNS_CLIENTS {

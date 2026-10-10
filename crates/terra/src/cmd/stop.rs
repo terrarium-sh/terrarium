@@ -182,6 +182,7 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
     #[cfg(unix)]
     use std::io::Read as _;
     #[cfg(unix)]
@@ -240,10 +241,10 @@ mod tests {
     fn a_box_nobody_holds_is_already_stopped() {
         let dir = tempfile::tempdir().unwrap();
         let (bx, _home) = create_box_in(dir.path());
-        assert!(matches!(
+        assert_matches!(
             stop_and_wait(&bx, Duration::from_secs(0), SetupAction::Refuse).unwrap(),
             StopOutcome::AlreadyStopped
-        ));
+        );
     }
 
     /// A box held by a VM that never published a pid has nothing to signal, and
@@ -294,17 +295,17 @@ mod tests {
         let marked = BoxRef::mark_baking(&lock).unwrap();
         let mut child = sys::build_test_child_command().spawn().unwrap();
         BoxRef::publish_pid(&lock, child.id(), true).unwrap();
-        assert!(matches!(bx.get_holder().unwrap(), Holder::SettingUp));
+        assert_matches!(bx.get_holder().unwrap(), Holder::SettingUp);
         let error = stop_and_wait(&bx, Duration::ZERO, SetupAction::Refuse)
             .expect_err("stop must leave setup running");
         assert!(error.to_string().contains("being set up"));
         assert!(child.try_wait().unwrap().is_none());
         let outcome = stop_and_wait(&bx, Duration::ZERO, SetupAction::Stop).unwrap();
         #[cfg(any(target_os = "linux", target_os = "macos", windows))]
-        assert!(matches!(outcome, StopOutcome::Wedged));
+        assert_matches!(outcome, StopOutcome::Wedged);
         #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         {
-            assert!(matches!(outcome, StopOutcome::IdentityUnknown));
+            assert_matches!(outcome, StopOutcome::IdentityUnknown);
             assert!(child.try_wait().unwrap().is_none());
             child.kill().unwrap();
         }
@@ -339,10 +340,10 @@ mod tests {
                 assert_eq!(byte, [terra_protocol::STOP_SIGNAL]);
                 drop(lock);
             });
-            assert!(matches!(
+            assert_matches!(
                 stop_and_wait(&bx, Duration::from_secs(5), SetupAction::Refuse).unwrap(),
                 StopOutcome::StoppedGracefully
-            ));
+            );
             server.join().unwrap();
             assert!(!bx.get_holder().unwrap().holds());
         }
@@ -391,10 +392,10 @@ mod tests {
         let (bx, _home) = create_box_in(dir.path());
         let mut child = spawn_vm_child(&bx, "trap '' TERM; echo up; exec sleep 30");
 
-        assert!(matches!(
+        assert_matches!(
             stop_and_wait(&bx, Duration::from_millis(300), SetupAction::Refuse).unwrap(),
             StopOutcome::Killed
-        ));
+        );
         assert!(!bx.get_holder().unwrap().holds(), "the box is still held");
         child.wait().unwrap();
     }

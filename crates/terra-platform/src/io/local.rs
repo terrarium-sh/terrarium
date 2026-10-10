@@ -199,6 +199,7 @@ pub use asynchronous::{AsyncLocalListener, AsyncLocalStream};
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
     use std::io::{Read as _, Write as _};
     use std::net::Shutdown;
     use std::time::Duration;
@@ -218,10 +219,10 @@ mod tests {
             .unwrap();
         let mut buffer = [0; 4];
         let error = server.read(&mut buffer).unwrap_err();
-        assert!(matches!(
+        assert_matches!(
             error.kind(),
             std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-        ));
+        );
         client.write_all(b"ping").unwrap();
         server.read_exact(&mut buffer).unwrap();
         assert_eq!(&buffer, b"ping");

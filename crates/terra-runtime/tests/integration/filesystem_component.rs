@@ -1,4 +1,5 @@
 use crate::support;
+use std::assert_matches;
 
 #[cfg(unix)]
 use std::os::unix::fs::symlink as symlink_file;
@@ -1129,7 +1130,7 @@ async fn write_only_files_open_for_write_without_read_access() {
         &request(14, 3, inode, &(1_u32 | 0o1000).to_le_bytes()),
     )
     .await;
-    assert!(matches!(reply_error(&reopened), 0 | -2));
+    assert_matches!(reply_error(&reopened), 0 | -2);
     assert_eq!(
         std::fs::read(&path).expect("replacement contents"),
         b"replacement"
@@ -1197,7 +1198,7 @@ async fn inaccessible_metadata_nodes_never_chmod_replacements() {
         chmod[..4].copy_from_slice(&1_u32.to_le_bytes());
         chmod[68..72].copy_from_slice(&0o777_u32.to_le_bytes());
         let reply = submit(&mounted.channel, &memory, 1, &request(4, 2, inode, &chmod)).await;
-        assert!(matches!(reply_error(&reply), 0 | -2));
+        assert_matches!(reply_error(&reply), 0 | -2);
         assert_eq!(
             std::fs::metadata(&replacement)
                 .expect("metadata")

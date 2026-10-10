@@ -1,4 +1,5 @@
 use crate::support;
+use std::assert_matches;
 
 use terra_runtime::component::agent::{
     AgentEvent, AgentHost, AgentHostService, agent_component_linker,
@@ -83,7 +84,7 @@ async fn events_start_worker_and_close_keeps_transport_terminal() {
                     .await
                     .expect("worker started")
                     .expect("connected event");
-            assert!(matches!(connected, AgentEvent::Connected));
+            assert_matches!(connected, AgentEvent::Connected);
             close.call_concurrent(accessor, ()).await.expect("close");
         })
         .await

@@ -513,6 +513,7 @@ pub fn add_frontend_stream_to_linker<T: Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     #[test]
     fn bounded_streams_preserve_partial_io_half_close_and_connection_numbers() {
@@ -530,12 +531,12 @@ mod tests {
             frontend.try_read(1, 65536).unwrap().len(),
             STREAM_BUFFER_BYTES - 17
         );
-        assert!(matches!(frontend.try_read(1, 1), Err(StreamError::Closed)));
+        assert_matches!(frontend.try_read(1, 1), Err(StreamError::Closed));
         frontend.try_write(1, &[4]).unwrap();
         assert_eq!(role.try_read(1, 1).unwrap(), [4]);
         frontend.disconnect(1);
         frontend.connect(2).unwrap();
-        assert!(matches!(role.try_write(1, &[5]), Err(StreamError::Stale)));
+        assert_matches!(role.try_write(1, &[5]), Err(StreamError::Stale));
         role.close(1);
         assert_eq!(role.try_write(2, &[6]).unwrap(), 1);
     }
@@ -589,7 +590,7 @@ mod tests {
         frontend.try_write(1, &[7]).unwrap();
         drop(input);
         assert_eq!(role.try_read(1, 1).unwrap(), [7]);
-        assert!(matches!(role.try_read(1, 1), Err(StreamError::Closed)));
+        assert_matches!(role.try_read(1, 1), Err(StreamError::Closed));
         assert_eq!(role.try_write(1, &[8]).unwrap(), 1);
         assert_eq!(frontend.current(), Some(1));
         drop(output);
@@ -604,7 +605,7 @@ mod tests {
             connection_number: 2,
         };
         drop(output);
-        assert!(matches!(role.try_write(2, &[8]), Err(StreamError::Closed)));
+        assert_matches!(role.try_write(2, &[8]), Err(StreamError::Closed));
         assert_eq!(frontend.try_write(2, &[9]).unwrap(), 1);
         assert_eq!(role.try_read(2, 1).unwrap(), [9]);
         frontend.disconnect(2);
@@ -624,10 +625,7 @@ mod tests {
             endpoint: role.clone(),
             connection_number: 1,
         });
-        assert!(matches!(
-            frontend.try_write(1, &[8]),
-            Err(StreamError::Closed)
-        ));
+        assert_matches!(frontend.try_write(1, &[8]), Err(StreamError::Closed));
         assert_eq!(role.try_write(1, &[9]).unwrap(), 1);
         assert_eq!(frontend.try_read(1, 1).unwrap(), [9]);
         assert_eq!(frontend.current(), Some(1));
@@ -651,7 +649,7 @@ mod tests {
         let (mut streams, mut agent) = FrontendStreams::new();
         streams.agent.connect(1).unwrap();
         streams.retire();
-        assert!(matches!(agent.try_read(1, 1), Err(StreamError::Stale)));
-        assert!(matches!(streams.agent.connect(2), Err(StreamError::Closed)));
+        assert_matches!(agent.try_read(1, 1), Err(StreamError::Stale));
+        assert_matches!(streams.agent.connect(2), Err(StreamError::Closed));
     }
 }

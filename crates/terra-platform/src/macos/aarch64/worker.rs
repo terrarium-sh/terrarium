@@ -480,13 +480,14 @@ fn run_one(
 mod tests {
     use super::*;
     use crate::vm::GicConfig;
+    use std::assert_matches;
     use std::time::Duration;
 
     struct PowerOffHandler(mpsc::Sender<()>);
 
     impl VcpuHandler for PowerOffHandler {
         fn exchange(&mut self, exit: VcpuExit) -> Result<VcpuAction, String> {
-            assert!(matches!(exit, VcpuExit::ArmException(_)));
+            assert_matches!(exit, VcpuExit::ArmException(_));
             self.0.send(()).unwrap();
             Ok(VcpuAction::CpuOff)
         }

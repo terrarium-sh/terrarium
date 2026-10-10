@@ -1,4 +1,5 @@
 use crate::support;
+use std::assert_matches;
 
 use terra_runtime::component::agent::{AgentHost, agent_component_linker};
 use terra_runtime::component::block::{BlockHost, block_component_linker};
@@ -663,7 +664,7 @@ fn agent_and_frontend_exports_match_their_single_setup_flow() {
         let interface = component_type
             .get_export(&engine, interface_name)
             .expect("API export");
-        assert!(matches!(&interface.ty, ComponentItem::ComponentInstance(_)));
+        assert_matches!(&interface.ty, ComponentItem::ComponentInstance(_));
         if let ComponentItem::ComponentInstance(interface) = interface.ty {
             let mut functions = Vec::new();
             for (name, export) in interface.exports(&engine) {
@@ -673,10 +674,10 @@ fn agent_and_frontend_exports_match_their_single_setup_flow() {
                         let parameters = function.params().collect::<Vec<_>>();
                         assert_eq!(parameters.len(), 1);
                         assert_eq!(parameters[0].0, "network");
-                        assert!(matches!(
+                        assert_matches!(
                             parameters[0].1,
                             wasmtime::component::types::Type::Option(_)
-                        ));
+                        );
                     }
                 }
             }

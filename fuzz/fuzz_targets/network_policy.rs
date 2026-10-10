@@ -1,5 +1,6 @@
 #![no_main]
 
+use std::assert_matches;
 use arbitrary::{Arbitrary, Unstructured};
 use libfuzzer_sys::fuzz_target;
 use std::collections::HashSet;
@@ -176,7 +177,7 @@ fuzz_target!(|data: &[u8]| {
             Ok(Step::Lookup(name)) => {
                 let lookup = policy.lookup_name(&name);
                 let Some(normalized) = normalize_hostname(&name) else {
-                    assert!(matches!(lookup, NameLookup::Denied));
+                    assert_matches!(lookup, NameLookup::Denied);
                     continue;
                 };
                 let allowed = normalized == "api.test"

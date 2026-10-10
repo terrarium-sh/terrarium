@@ -154,5 +154,5 @@ pub fn kill_vm_child(child: &mut std::process::Child) -> Result<()> {
 }
 
 fn win_ok(ok: i32) -> Result<()> {
-    (ok != 0).then_some(()).ok_or_else(Error::last_os_error)
+    (ok != 0).ok_or_else(Error::last_os_error)
 }

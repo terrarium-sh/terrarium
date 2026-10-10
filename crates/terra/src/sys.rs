@@ -269,6 +269,7 @@ pub(crate) fn build_test_child_command() -> std::process::Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
     use std::fs::TryLockError;
     use std::io::Write as _;
 
@@ -370,7 +371,7 @@ mod tests {
         drop(inheritance);
         drop(lock);
 
-        assert!(matches!(try_lock_run(&path), Err(TryLockError::WouldBlock)));
+        assert_matches!(try_lock_run(&path), Err(TryLockError::WouldBlock));
 
         child.stdin.take().unwrap().write_all(&[0]).unwrap();
         assert!(child.wait().unwrap().success());
@@ -456,10 +457,7 @@ mod tests {
             if detached {
                 assert!(supervision_pid_is_running(wrapper));
                 assert!(supervision_pid_is_running(grandchild));
-                assert!(matches!(
-                    try_lock_run(&lock_path),
-                    Err(TryLockError::WouldBlock)
-                ));
+                assert_matches!(try_lock_run(&lock_path), Err(TryLockError::WouldBlock));
                 // SAFETY: the live wrapper is the leader of the group created by supervise_vm_child.
                 assert_eq!(unsafe { libc::kill(-wrapper, libc::SIGKILL) }, 0);
             }

@@ -60,15 +60,12 @@ fn range_in_regions(base: u64, size: u64, regions: &[(u64, u64)]) -> Result<(), 
                     .checked_add(region_size)
                     .is_some_and(|region_end| end <= region_end)
         })
-        .then_some(())
         .ok_or(Error::KernelLayout)
 }
 
 fn checked_source(kernel_bytes: u64, offset: u64, len: u64) -> Result<(), Error> {
     let end = end(offset, len)?;
-    (end <= kernel_bytes)
-        .then_some(())
-        .ok_or(Error::InvalidKernel)
+    (end <= kernel_bytes).ok_or(Error::InvalidKernel)
 }
 
 fn validate_kernel_prefix(prefix: &[u8], kernel_bytes: u64) -> Result<(), Error> {
@@ -139,7 +136,6 @@ fn validate_device_order(devices: &[Device], rank: fn(DeviceKind) -> u8) -> Resu
         .windows(2)
         .all(|pair| rank(pair[0].kind) <= rank(pair[1].kind));
     (is_ordered && count_of(DeviceKind::Vsock) == 1 && count_of(DeviceKind::Memory) == 1)
-        .then_some(())
         .ok_or(Error::InvalidDevice)
 }
 
@@ -574,6 +570,7 @@ pub(crate) fn plan_arm(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     fn x86_kernel() -> Vec<u8> {
         let mut kernel = vec![0; 0x200];
@@ -729,7 +726,7 @@ mod tests {
         let mut kernel = x86_kernel();
         kernel[24..32].copy_from_slice(&terra_limits::X86_HIGH_RAM_BASE.to_le_bytes());
         kernel[88..96].copy_from_slice(&terra_limits::X86_HIGH_RAM_BASE.to_le_bytes());
-        assert!(matches!(
+        assert_matches!(
             plan_x86(
                 &kernel,
                 0x200,
@@ -739,7 +736,7 @@ mod tests {
                 &x86_devices(),
             ),
             Err(Error::KernelLayout)
-        ));
+        );
     }
 
     #[test]
@@ -810,16 +807,10 @@ mod tests {
         ];
         assert!(validate_x86_devices(&devices).is_ok());
         devices[3].irq = 18;
-        assert!(matches!(
-            validate_x86_devices(&devices),
-            Err(Error::InvalidDevice)
-        ));
+        assert_matches!(validate_x86_devices(&devices), Err(Error::InvalidDevice));
         devices[3].irq = 17;
         devices[3].mmio_base += X86_MMIO_STRIDE;
-        assert!(matches!(
-            validate_x86_devices(&devices),
-            Err(Error::InvalidDevice)
-        ));
+        assert_matches!(validate_x86_devices(&devices), Err(Error::InvalidDevice));
     }
 
     #[test]
@@ -881,10 +872,10 @@ mod tests {
 
     #[test]
     fn malformed_x86_kernel_is_rejected() {
-        assert!(matches!(
+        assert_matches!(
             plan_x86(&[0; 64], 64, 64 << 20, 1, "", &x86_devices()),
             Err(Error::InvalidKernel)
-        ));
+        );
     }
 
     #[test]

@@ -380,6 +380,7 @@ impl BoxRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     struct TestVm(GuestRam);
 
@@ -632,10 +633,10 @@ mod tests {
                 ready.send(()).unwrap();
                 let deadline = Instant::now() + Duration::from_secs(5);
                 while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
-                    assert!(matches!(
+                    assert_matches!(
                         busy_cpu.exchange(super::super::Exit::Halt).unwrap(),
                         super::super::Completion::Reenter
-                    ));
+                    );
                 }
             });
             started.await.unwrap();
@@ -650,10 +651,7 @@ mod tests {
             busy.await.unwrap();
             drop(probe_cpu);
             running.abort_and_join().await;
-            assert!(matches!(
-                completion.unwrap(),
-                super::super::Completion::Reenter
-            ));
+            assert_matches!(completion.unwrap(), super::super::Completion::Reenter);
             assert!(
                 elapsed < Duration::from_secs(1),
                 "a busy vCPU starved its sibling"

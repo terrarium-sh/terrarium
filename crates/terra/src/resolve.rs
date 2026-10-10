@@ -359,6 +359,7 @@ pub(crate) fn is_path(arg: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     fn resolve_recipe_path(reference: &str, source_dir: &Path) -> Result<PathBuf> {
         config::resolve_recipe_path(Path::new(reference), source_dir)
@@ -388,7 +389,7 @@ mod tests {
     fn a_bare_word_names_no_recipe_file() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("pi-dev.yaml"), "hw:\n  cpus: 1\n").unwrap();
-        assert!(matches!(BoxArg::parse("pi-dev").unwrap(), BoxArg::Name(n) if n == "pi-dev"));
+        assert_matches!(BoxArg::parse("pi-dev").unwrap(), BoxArg::Name(n) if n == "pi-dev");
         assert!(read_recipe("pi-dev", dir.path()).unwrap().is_none());
         let err = build_missing_recipe_error("pi-dev", "pi-dev", dir.path()).to_string();
         assert!(err.contains("named by path"), "{err}");
@@ -433,8 +434,9 @@ mod tests {
         }
         assert!(!is_path("ci"));
         assert!(!is_path("ci.v2"), "an extension that is not a recipe's");
-        assert!(
-            matches!(BoxArg::parse("ci.yaml").unwrap(), BoxArg::RecipePath { name, .. } if name == "ci")
+        assert_matches!(
+            BoxArg::parse("ci.yaml").unwrap(),
+            BoxArg::RecipePath { name, .. } if name == "ci"
         );
     }
 
@@ -443,8 +445,9 @@ mod tests {
     /// typed (`My Recipe.yaml` used to become a box called `My_Recipe`).
     #[test]
     fn a_stem_that_is_not_a_name_is_refused_not_munged() {
-        assert!(
-            matches!(BoxArg::parse("./ci.v2.yaml").unwrap(), BoxArg::RecipePath { name, .. } if name == "ci.v2")
+        assert_matches!(
+            BoxArg::parse("./ci.v2.yaml").unwrap(),
+            BoxArg::RecipePath { name, .. } if name == "ci.v2"
         );
         for bad in [
             "./My Recipe.yaml",
@@ -672,7 +675,7 @@ mod tests {
             Existence::MayBeMissing,
         )
         .unwrap();
-        assert!(matches!(agreed.source, Source::Pinned));
+        assert_matches!(agreed.source, Source::Pinned);
         assert_eq!(agreed.manifest_divergence, None);
 
         // …and an edited manifest is named, with the file that would win.
@@ -684,8 +687,9 @@ mod tests {
             Existence::MayBeMissing,
         )
         .unwrap();
-        assert!(
-            matches!(diverged.source, Source::Pinned),
+        assert_matches!(
+            diverged.source,
+            Source::Pinned,
             "the pin is still what a boot runs"
         );
         assert_eq!(
@@ -740,14 +744,14 @@ mod tests {
             Existence::MayBeMissing,
         )
         .unwrap();
-        assert!(matches!(started.source, Source::Pinned));
+        assert_matches!(started.source, Source::Pinned);
 
         // `setup` also tolerates a broken manifest when a pin exists: the
         // lenient `load_manifest_or_warn` reads it as nothing, so the pin wins
         // by default. A broken manifest with no pin still surfaces as
         // no recipe rather than `failed to parse`.
         let t = resolve_for_setup(Some("dev"), dir.path(), dir.path()).unwrap();
-        assert!(matches!(t.source, Source::Pinned));
+        assert_matches!(t.source, Source::Pinned);
     }
 
     /// A manifest reference pointing nowhere is the setup verb's to blame, not

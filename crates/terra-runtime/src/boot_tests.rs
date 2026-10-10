@@ -1,4 +1,5 @@
 use crate::component::network::{HostServiceAddresses, NetworkBackend, PortMapping};
+use std::assert_matches;
 use terra_network::config::{Config, Limits, Network, PublishedListener, StaticDnsRecord};
 
 fn load_boot_disk(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
@@ -756,20 +757,20 @@ fn begin_stalled_download(
     stream.write_all(&encode_frame(&SyncRequest::BeginSession {
         guest_root: "/work".into(),
     })?)?;
-    assert!(matches!(
+    assert_matches!(
         read_frame::<SyncReply>(&mut stream)?,
         Some(SyncReply::SessionReady { .. })
-    ));
+    );
     stream.write_all(&encode_frame(&SyncRequest::ReadFile {
         relative_path: "pressure-file".into(),
     })?)?;
-    assert!(matches!(
+    assert_matches!(
         read_frame::<SyncReply>(&mut stream)?,
         Some(SyncReply::ReadFileReady {
             size: STALLED_FILE_BYTES,
             ..
         })
-    ));
+    );
     Ok(stream)
 }
 

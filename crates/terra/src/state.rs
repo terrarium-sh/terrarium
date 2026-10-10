@@ -590,6 +590,7 @@ impl std::fmt::Display for BoxState {
 mod tests {
     use super::*;
     use crate::sys::TestHome;
+    use std::assert_matches;
     use std::fs::OpenOptions;
 
     /// Every test here holds a [`TestHome`] before it resolves anything:
@@ -1475,14 +1476,14 @@ mod tests {
         let b = resolve_box_ref(dir.path());
         std::fs::create_dir_all(b.get_dir()).unwrap();
 
-        assert!(matches!(b.get_state().unwrap(), BoxState::NotCreated));
+        assert_matches!(b.get_state().unwrap(), BoxState::NotCreated);
         std::fs::write(b.get_dir().join(ROOTFS_FILE), b"image").unwrap();
-        assert!(matches!(b.get_state().unwrap(), BoxState::Stopped));
+        assert_matches!(b.get_state().unwrap(), BoxState::Stopped);
 
         let lock = b.lock_run().unwrap();
-        assert!(matches!(b.get_state().unwrap(), BoxState::Running));
+        assert_matches!(b.get_state().unwrap(), BoxState::Running);
         let marked = BoxRef::mark_baking(&lock).unwrap();
-        assert!(matches!(b.get_state().unwrap(), BoxState::SettingUp));
+        assert_matches!(b.get_state().unwrap(), BoxState::SettingUp);
         assert_eq!(b.get_state().unwrap().to_string(), "setting_up");
         drop(marked);
         drop(lock);
@@ -1490,8 +1491,9 @@ mod tests {
         // A working tree that is gone outranks the filesystem still being there.
         drop(dir);
         wait_until_free(&b);
-        assert!(
-            matches!(b.get_state().unwrap(), BoxState::Gone),
+        assert_matches!(
+            b.get_state().unwrap(),
+            BoxState::Gone,
             "state was {} (holder {:?})",
             b.get_state().unwrap(),
             b.get_holder().unwrap()

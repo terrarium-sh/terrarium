@@ -309,6 +309,7 @@ pub fn run_launcher_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
     use std::os::fd::FromRawFd;
     use std::os::unix::net::{UnixDatagram, UnixListener};
     use std::process::Stdio;
@@ -527,8 +528,9 @@ mod tests {
             drop(sandbox_bundle);
             match role {
                 Role::Vm => {
-                    assert!(
-                        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+                    assert_matches!(
+                        listener.accept(),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
                     );
                     let mut bytes = [0; 3];
                     local_client.read_exact(&mut bytes)?;
@@ -546,12 +548,14 @@ mod tests {
             std::fs::remove_file(socket_path)?;
         }
         for (listener, datagram) in share_sockets {
-            assert!(
-                matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+            assert_matches!(
+                listener.accept(),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
             );
             let mut bytes = [0; 16];
-            assert!(
-                matches!(datagram.recv(&mut bytes), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+            assert_matches!(
+                datagram.recv(&mut bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
             );
         }
         assert_eq!(std::fs::read(&metadata)?, b"supervisor identity");

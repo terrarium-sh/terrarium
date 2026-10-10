@@ -2,6 +2,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use std::assert_matches;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -422,8 +423,9 @@ echo ROOTLESS_PODMAN_OK"#
             "{output}"
         );
     }
-    assert!(
-        matches!(denied.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+    assert_matches!(
+        denied.accept(),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock,
         "guest reached an ungranted host-loopback service"
     );
     let logs = fixture.successful(&["native", "logs"]);

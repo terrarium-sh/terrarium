@@ -1,4 +1,5 @@
 use crate::box_runtime::store::ComponentMemoryLimits;
+use std::assert_matches;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -334,7 +335,7 @@ async fn child_failure_releases_native_vcpu_rendezvous_before_cleanup() {
                 let _ = native_finished.send(native.exchange(Exit::Halt));
             });
             let platform = accessor.with_getter::<Platform>(|store| &mut store.platform);
-            assert!(matches!(
+            assert_matches!(
                 <Platform as HostVcpuWithStore<BoxHost>>::resume(
                     &platform,
                     wasmtime::component::Resource::new_borrow(resource_index),
@@ -342,7 +343,7 @@ async fn child_failure_releases_native_vcpu_rendezvous_before_cleanup() {
                 )
                 .await?,
                 Ok(Exit::Halt)
-            ));
+            );
             exit_pending.send(()).unwrap();
             std::future::pending::<wasmtime::Result<()>>().await
         })
@@ -613,7 +614,7 @@ async fn competing_failures_publish_the_primary_error_before_native_cleanup() {
         .unwrap()
         .unwrap();
     let primary = failure.lock().unwrap().clone().unwrap();
-    assert!(matches!(primary.as_str(), "root failed" | "child failed"));
+    assert_matches!(primary.as_str(), "root failed" | "child failed");
     assert_eq!(*outcome.borrow(), Some(Outcome::ComponentFailed));
     release.send(()).unwrap();
     assert_eq!(running.join().await.unwrap_err().to_string(), primary);

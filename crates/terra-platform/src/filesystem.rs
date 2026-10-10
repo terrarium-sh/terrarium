@@ -293,9 +293,7 @@ pub fn set_mode(file: &File, is_directory: bool, mode: u32) -> Result<(), Error>
     #[cfg(windows)]
     {
         if is_directory {
-            (mode & 0o777 == 0o755)
-                .then_some(())
-                .ok_or(Error::Unsupported)
+            (mode & 0o777 == 0o755).ok_or(Error::Unsupported)
         } else {
             windows::set_readonly(file, mode & 0o222 == 0)
         }
@@ -574,9 +572,7 @@ fn discard_file(_file: &File, _offset: u64, _len: u64) -> io::Result<()> {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn ignore_unsupported(error: io::Error) -> io::Result<()> {
-    (error.kind() == io::ErrorKind::Unsupported)
-        .then_some(())
-        .ok_or(error)
+    (error.kind() == io::ErrorKind::Unsupported).ok_or(error)
 }
 
 #[cfg(all(test, windows))]
@@ -636,6 +632,7 @@ mod windows;
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     #[cfg(not(target_os = "macos"))]
     #[test]
@@ -665,16 +662,10 @@ mod tests {
             b"replacement"
         );
         for name in ["", ".", "..", "../original", "original/child", "original\0"] {
-            assert!(matches!(
-                open_metadata_file(&directory, name),
-                Err(Error::Access)
-            ));
+            assert_matches!(open_metadata_file(&directory, name), Err(Error::Access));
         }
         symlink(&original, root_path.join("link")).expect("symlink");
-        assert!(matches!(
-            open_metadata_file(&directory, "link"),
-            Err(Error::Access)
-        ));
+        assert_matches!(open_metadata_file(&directory, "link"), Err(Error::Access));
     }
 
     #[test]

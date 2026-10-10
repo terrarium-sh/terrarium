@@ -3,6 +3,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use std::assert_matches;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -341,7 +342,7 @@ impl Suite {
             );
         }
         (
-            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy_owned(out.stdout),
             out.status.code().unwrap_or(-1),
         )
     }
@@ -1439,18 +1440,18 @@ fn published_udp_preserves_peers_datagrams_and_transport_isolation() {
             .send_to(&[73; 4097], (Ipv4Addr::LOCALHOST, port))
             .unwrap();
         let oversized = client.recv_from(&mut bytes).unwrap_err();
-        assert!(matches!(
+        assert_matches!(
             oversized.kind(),
             std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-        ));
+        );
         client
             .send_to(b"local-only", (Ipv4Addr::LOCALHOST, local_port))
             .unwrap();
         let isolated = client.recv_from(&mut bytes).unwrap_err();
-        assert!(matches!(
+        assert_matches!(
             isolated.kind(),
             std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-        ));
+        );
         client
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();

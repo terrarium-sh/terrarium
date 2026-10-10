@@ -608,6 +608,7 @@ mod tests {
     use super::*;
     use crate::name;
     use clap::{CommandFactory, Parser};
+    use std::assert_matches;
     use std::path::Path;
 
     #[test]
@@ -621,10 +622,10 @@ mod tests {
         assert_eq!(named.name.as_deref(), Some("pi-dev"));
         assert!(named.boot.detach);
 
-        assert!(matches!(
+        assert_matches!(
             Cli::parse_from(["terra", "pi-dev", "setup"]).cmd,
             Some(Cmd::Setup(_))
-        ));
+        );
         let Some(Cmd::Rm(rm_args)) = Cli::parse_from(["terra", "rm", "--purge"]).cmd else {
             panic!("expected rm")
         };
@@ -1209,7 +1210,7 @@ mod tests {
         let cli = Cli::try_parse_from(&argv)
             .unwrap_or_else(|e| panic!("`{hint}` is not a command terra takes: {e}"));
         assert_eq!(cli.name.as_deref(), Some("dev"), "{hint}");
-        assert!(matches!(cli.cmd, Some(Cmd::Logs(_))), "{hint}");
+        assert_matches!(cli.cmd, Some(Cmd::Logs(_)), "{hint}");
         assert_eq!(cli.project.as_deref(), Some(Path::new("/p")), "{hint}");
         assert!(cli.validate().is_ok(), "{hint}");
     }

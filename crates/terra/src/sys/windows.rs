@@ -465,7 +465,7 @@ pub(crate) fn file_link_count(path: &Path) -> Result<u64> {
 }
 
 fn win_ok(ok: i32) -> Result<()> {
-    (ok != 0).then_some(()).ok_or_else(Error::last_os_error)
+    (ok != 0).ok_or_else(Error::last_os_error)
 }
 
 #[cfg(test)]

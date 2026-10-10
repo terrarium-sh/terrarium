@@ -488,6 +488,7 @@ fn validate_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     fn send_datagram(handle: Handle, peer: SocketAddr, bytes: Vec<u8>) -> Operation {
         Operation::SendDatagrams {
@@ -884,7 +885,7 @@ mod tests {
                     .await
                     .unwrap()
                     .unwrap();
-                assert!(matches!(request.operation, Operation::ReceiveDatagram(_)));
+                assert_matches!(request.operation, Operation::ReceiveDatagram(_));
             }
             assert_eq!(client.0.socket_wait_admission.available_permits(), 0);
             drop(waits);

@@ -328,6 +328,7 @@ fn core_register_id(offset: usize) -> Result<u64, KvmError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     #[test]
     fn dropping_a_partially_started_group_stops_and_reaps_its_threads() {
@@ -347,7 +348,7 @@ mod tests {
         let (command, commands) = mpsc::channel();
         let waiting = spawn_configured_vcpu_ready(1, move |_, ready| {
             ready.send(()).unwrap();
-            assert!(matches!(commands.recv().unwrap(), VcpuCommand::Stop));
+            assert_matches!(commands.recv().unwrap(), VcpuCommand::Stop);
             thread_waiting_stopped.store(true, Ordering::Release);
             Ok(VcpuOutcome::Stopped)
         })

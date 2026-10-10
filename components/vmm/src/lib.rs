@@ -299,6 +299,7 @@ mod component_exports {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     #[test]
     fn msr_banks_are_fixed_and_independent() {
@@ -382,7 +383,7 @@ mod tests {
         };
         assert_eq!((start.target, start.entry, start.context), (1, 0x8000, 7));
         assert!(!router[1]);
-        assert!(matches!(
+        assert_matches!(
             psci_start_result_for(
                 &mut router,
                 platform::HvcResult {
@@ -391,9 +392,9 @@ mod tests {
                 },
             ),
             Ok(platform::Completion::HvcReturn(-3))
-        ));
+        );
         assert!(!router[1]);
-        assert!(matches!(
+        assert_matches!(
             psci_start_result_for(
                 &mut router,
                 platform::HvcResult {
@@ -402,7 +403,7 @@ mod tests {
                 },
             ),
             Ok(platform::Completion::HvcReturn(0))
-        ));
+        );
         assert!(router[1]);
     }
 
@@ -419,9 +420,6 @@ mod tests {
                 argument2: 0,
             },
         );
-        assert!(matches!(
-            completion,
-            Ok(platform::Completion::HvcReturn(-3))
-        ));
+        assert_matches!(completion, Ok(platform::Completion::HvcReturn(-3)));
     }
 }

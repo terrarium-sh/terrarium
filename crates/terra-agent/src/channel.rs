@@ -287,6 +287,7 @@ async fn write_control_reply(conn: &mut AsyncFile, reply: &ControlReply) -> std:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
     use std::os::fd::OwnedFd;
     use terra_protocol::{SyncReply, SyncRequest};
 
@@ -440,12 +441,12 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(matches!(
+        assert_matches!(
             terra_protocol::read_frame_async::<SyncReply>(&mut host)
                 .await
                 .unwrap(),
             Some(SyncReply::SessionReady { .. })
-        ));
+        );
         terra_protocol::write_frame_async(
             &mut host,
             &SyncRequest::WriteFile {
@@ -503,12 +504,12 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(matches!(
+        assert_matches!(
             terra_protocol::read_frame_async::<SyncReply>(&mut host)
                 .await
                 .unwrap(),
             Some(SyncReply::ReadFileReady { .. })
-        ));
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
 
         cancellation.cancel();

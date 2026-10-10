@@ -179,6 +179,7 @@ pub fn block_component_linker<T: WasiView + AsMut<BlockHost> + 'static>(
 #[cfg(test)]
 mod tests {
     use crate::component::block::backing::BoundedDisk;
+    use std::assert_matches;
     #[tokio::test]
     async fn disk_imports_accept_one_bounded_batch() {
         use super::{BlockHost, DiskGrant, MAX_BATCH_BYTES, disk, disk_read_at, disk_write_at};
@@ -208,36 +209,36 @@ mod tests {
         );
         assert_eq!(disk_write_at(&mut host, 4095, vec![7]).await, Ok(()));
         assert_eq!(disk_read_at(&mut host, 4095, 1).await, Ok(vec![7]));
-        assert!(matches!(
+        assert_matches!(
             disk_read_at(&mut host, 0, super::MAX_BATCH_BYTES + 1).await,
             Err(DiskError::TooLarge)
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             disk_write_at(&mut host, u64::MAX, vec![1]).await,
             Err(DiskError::OutOfRange)
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             disk_read_at(&mut host, 4096, 1).await,
             Err(DiskError::OutOfRange)
-        ));
+        );
         assert_eq!(disk_discard(&mut host, 4095, 1).await, Ok(()));
         assert_eq!(disk_read_at(&mut host, 4095, 1).await, Ok(vec![0]));
-        assert!(matches!(
+        assert_matches!(
             disk_discard(&mut host, 0, terra_limits::MAX_GUEST_DISCARD_BYTES + 1).await,
             Err(DiskError::TooLarge)
-        ));
+        );
         let mut host = BlockHost::new(
             crate::memory::GuestRam::new(4096).unwrap(),
             DiskGrant::Mem(BoundedDisk::new(4096, true)),
         );
-        assert!(matches!(
+        assert_matches!(
             disk_write_at(&mut host, 0, vec![1]).await,
             Err(DiskError::Readonly)
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             disk_discard(&mut host, 0, 1).await,
             Err(DiskError::Readonly)
-        ));
+        );
         assert_eq!(disk_sync(&mut host).await, Ok(()));
     }
 
@@ -266,10 +267,10 @@ mod tests {
                 .expect("work released");
             Ok(())
         });
-        assert!(matches!(
+        assert_matches!(
             disk_read_at(&mut host, u64::MAX, 1).await,
             Err(DiskError::OutOfRange)
-        ));
+        );
         let waiter = tokio::spawn(operation);
         started_rx.await.expect("work is running");
         waiter.abort();

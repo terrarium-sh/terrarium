@@ -108,7 +108,7 @@ impl fmt::Display for PartitionError {
 impl Error for PartitionError {}
 
 fn result(status: i32) -> Result<(), WhpError> {
-    (status >= 0).then_some(()).ok_or(WhpError(status))
+    (status >= 0).ok_or(WhpError(status))
 }
 
 /// Check that the installed host can create WHP partitions on this architecture.
@@ -321,7 +321,6 @@ impl Partition {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains(&index)
-            .then_some(())
             .ok_or(PartitionError::InvalidVcpu)
     }
 }

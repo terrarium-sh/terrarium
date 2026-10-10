@@ -144,15 +144,16 @@ pub fn setup_irqchip(vm: &VmFd, gsis: &[u32]) -> Result<(), ArchError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     #[test]
     fn device_gsis_stay_in_the_virtio_range() {
         assert!(validate_device_gsis(&[11, 12, 11, 20, 23]).is_ok());
         for gsi in [0, 10, 24, u32::MAX] {
-            assert!(matches!(
+            assert_matches!(
                 validate_device_gsis(&[gsi]),
                 Err(ArchError::IrqOutOfRange(irq)) if irq == gsi
-            ));
+            );
         }
     }
 

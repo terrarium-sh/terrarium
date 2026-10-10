@@ -416,6 +416,7 @@ pub(super) async fn build_plan(
 mod tests {
     use super::super::test_support::peer;
     use super::*;
+    use std::assert_matches;
 
     #[tokio::test]
     async fn directory_updates_follow_actual_child_mutations() {
@@ -508,11 +509,13 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(
-            matches!(&actions[0], PlanAction::UpdateDirMetadata { rel_path, .. } if rel_path.is_empty())
+        assert_matches!(
+            &actions[0],
+            PlanAction::UpdateDirMetadata { rel_path, .. } if rel_path.is_empty()
         );
-        assert!(
-            matches!(&actions[2], PlanAction::UpdateDirMetadata { rel_path, mtime_secs: 101, .. } if rel_path == "metadata")
+        assert_matches!(
+            &actions[2],
+            PlanAction::UpdateDirMetadata { rel_path, mtime_secs: 101, .. } if rel_path == "metadata"
         );
     }
 
@@ -544,11 +547,12 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(matches!(&actions[0], PlanAction::Skip { rel_path } if rel_path.is_empty()));
-        assert!(
-            matches!(&actions[1], PlanAction::UpdateDirMetadata { rel_path, .. } if rel_path == "nested")
+        assert_matches!(&actions[0], PlanAction::Skip { rel_path } if rel_path.is_empty());
+        assert_matches!(
+            &actions[1],
+            PlanAction::UpdateDirMetadata { rel_path, .. } if rel_path == "nested"
         );
-        assert!(matches!(&actions[2], PlanAction::TransferFile { .. }));
+        assert_matches!(&actions[2], PlanAction::TransferFile { .. });
     }
 
     #[tokio::test]
@@ -599,7 +603,7 @@ mod tests {
                     if matches!(request, SyncRequest::EndSession) {
                         break;
                     }
-                    assert!(matches!(request, SyncRequest::UpdateMetadata { .. }));
+                    assert_matches!(request, SyncRequest::UpdateMetadata { .. });
                     requests += 1;
                 }
                 requests
