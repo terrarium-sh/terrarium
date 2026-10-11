@@ -1,4 +1,4 @@
-use crate::component::network::{HostServiceAddresses, NetworkBackend, PortMapping};
+use crate::component::network::{NetworkBackend, PortMapping};
 use std::assert_matches;
 use terra_network::config::{Config, Network, PublishedListener, StaticDnsRecord};
 
@@ -197,15 +197,8 @@ fn start_network_broker(policy: Network, port_mappings: &[PortMapping]) -> Netwo
             });
         }
     }
-    crate::component::network::start_test_broker(Config {
-        policy,
-        gateways: [
-            HostServiceAddresses::default().gateway_ip.into(),
-            HostServiceAddresses::default().gateway_ip6.into(),
-        ],
-        listeners,
-    })
-    .expect("network broker starts")
+    crate::component::network::start_test_broker(Config { policy, listeners })
+        .expect("network broker starts")
 }
 
 /// 512 MiB of guest RAM for the kernel boot: kernel, Alpine

@@ -1,4 +1,5 @@
 use anyhow::{Result, bail};
+use terra_policy::parse_port;
 use terra_protocol::network::ResourceKind;
 use terra_runtime::component::network::PortMapping;
 
@@ -41,11 +42,4 @@ pub fn parse_port_mappings(ports: &[String]) -> Result<Vec<PortMapping>> {
         mappings.push(mapping);
     }
     Ok(mappings)
-}
-
-fn parse_port(text: &str) -> Option<u16> {
-    let text = text.trim();
-    text.parse::<u16>()
-        .ok()
-        .filter(|port| *port != 0 && !text.starts_with('+'))
 }

@@ -45,9 +45,7 @@ use std::fs::File;
 #[cfg(unix)]
 use std::io::Read as _;
 use terra_protocol::{Disk, Net, Plan, PlanMode, Share, WORKLOAD_ID, WORKLOAD_USER_NAME};
-use terra_runtime::component::network::HostServiceAddresses;
 
-pub(crate) const HOST_SERVICE_ADDRESSES: HostServiceAddresses = HostServiceAddresses::default();
 pub(crate) use terra_runtime::machine::MAX_GUEST_STORAGE_DEVICES;
 
 fn read_host_timezone() -> Option<Vec<u8>> {

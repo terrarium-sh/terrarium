@@ -3,7 +3,7 @@
 use crate::address::Cidr;
 use crate::config::StaticDnsRecord;
 use crate::hostname::normalize_hostname;
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -11,16 +11,7 @@ type Result<T> = std::result::Result<T, String>;
 /// real name can collide with it.
 pub const HOST_LOOPBACK_SYMBOL: &str = "HOST_LOOPBACK";
 
-pub type Port = Option<u16>;
-
-#[must_use]
-pub(crate) fn is_single_address(cidr: Cidr, ip: IpAddr) -> bool {
-    let full_length = match cidr {
-        Cidr::V4 { mask, .. } => mask == u32::MAX,
-        Cidr::V6 { mask, .. } => mask == u128::MAX,
-    };
-    full_length && cidr.contains(ip)
-}
+pub(crate) type Port = Option<u16>;
 
 #[must_use]
 pub(crate) fn name_covers(rule: &str, name: &str) -> bool {
@@ -134,22 +125,28 @@ pub(crate) fn parse_dns_record(
     })?;
     let addrs = match rule.addr.trim() {
         addr if addr.eq_ignore_ascii_case(HOST_LOOPBACK_SYMBOL) => gateway_addrs.to_vec(),
-        addr => vec![addr
-            .parse::<IpAddr>()
-            .map(|ip| ip.to_canonical())
-            .map_err(|_| {
-            format!(
-                "hosts record '{}': '{}' is neither an IP address nor '{HOST_LOOPBACK_SYMBOL}' (the \
-                 machine terra is running on)",
-                rule.name,
-                rule.addr
-            )
-            })?],
+        addr => {
+            let ip = addr.parse::<IpAddr>().map_err(|_| {
+                format!(
+                    "hosts record '{}': '{}' is neither an IP address nor \
+                     '{HOST_LOOPBACK_SYMBOL}' (the machine terra is running on)",
+                    rule.name, rule.addr
+                )
+            })?;
+            vec![ip.to_canonical()]
+        }
     };
     Ok((key, addrs))
 }
 
-fn parse_port(text: &str) -> Option<u16> {
+#[must_use]
+pub fn is_host_loopback(address: IpAddr) -> bool {
+    address == IpAddr::V4(Ipv4Addr::LOCALHOST) || address == IpAddr::V6(Ipv6Addr::LOCALHOST)
+}
+
+/// A port written in a recipe: `1..=65535`, without a sign.
+#[must_use]
+pub fn parse_port(text: &str) -> Option<u16> {
     let text = text.trim();
     text.parse::<u16>()
         .ok()

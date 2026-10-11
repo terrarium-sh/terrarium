@@ -151,7 +151,7 @@ fn validate_config(
     use crate::terra::network::types::{Error, Transport};
     if config.flow_capacity == 0
         || config.flow_capacity as usize > terra_vsock_device::MAX_NETWORK_SOCKETS
-        || config.host_service_ports.len() > terra_policy::MAX_RULES
+        || config.host_service_ports.len() > terra_policy::MAX_EXPANDED_RULES
         || config.host_service_ports.contains(&Some(0))
         || config.published_ports.len() > terra_protocol::MAX_PUBLISHED_PORTS
         || config

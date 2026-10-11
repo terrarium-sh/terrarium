@@ -14,7 +14,7 @@ pub(super) async fn resolve(
 ) -> Result<Vec<IpAddr>, Error> {
     let addresses = match policy.lookup_name(name) {
         NameLookup::Denied => return Err(Error::AccessDenied),
-        NameLookup::Static(addresses) => addresses,
+        NameLookup::Static(addresses) => addresses.to_vec(),
         NameLookup::Resolve(name) => {
             let permit = admission
                 .try_acquire_owned()

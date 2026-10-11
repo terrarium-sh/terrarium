@@ -9,7 +9,7 @@ use terra_runtime::component::agent::Agent;
 use terra_runtime::component::block::backing::{BoundedDisk, DiskGrant};
 use terra_runtime::component::context::DeviceContext;
 use terra_runtime::component::fs::{FsHost, ShareGrant};
-use terra_runtime::component::network::{HostServiceAddresses, start_test_broker};
+use terra_runtime::component::network::start_test_broker;
 use terra_runtime::component::vsock::streams::{FrontendStreams, StreamEndpoint};
 use terra_runtime::engine::device_engine;
 use terra_runtime::memory::GuestRam;
@@ -108,10 +108,6 @@ async fn every_device_resets_and_closes_in_one_box_runtime() {
     .expect("memory");
     let backend = start_test_broker(terra_network::config::Config {
         policy: terra_network::config::Network::default(),
-        gateways: [
-            HostServiceAddresses::default().gateway_ip.into(),
-            HostServiceAddresses::default().gateway_ip6.into(),
-        ],
         listeners: Vec::new(),
     })
     .expect("network broker");

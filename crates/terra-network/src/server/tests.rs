@@ -1,7 +1,7 @@
 //! End-to-end tests: a real client and broker over a Unix socket pair, with real local sockets.
 
 use super::dns::resolve_addresses;
-use super::udp::{UDP_PEER_TTL, UdpResource, receive_datagrams, send_datagrams};
+use super::udp::{UDP_PEER_TTL, UdpPeers, UdpResource, receive_datagrams, send_datagrams};
 use super::*;
 use crate::config::PublishedListener;
 use crate::{Client, TcpDownload, TcpUpload};
@@ -33,10 +33,6 @@ fn config() -> Config {
             }],
             ..Network::default()
         },
-        gateways: [
-            "100.96.0.1".parse().unwrap(),
-            "fd53:4d00::1".parse().unwrap(),
-        ],
         listeners: vec![],
     }
 }
@@ -776,13 +772,17 @@ fn bound_resource(publication_grant: Option<u32>) -> UdpResource {
     UdpResource {
         ipv4: Some(super::udp::bind_udp((Ipv4Addr::LOCALHOST, 0).into()).unwrap()),
         ipv6: None,
-        peers: Arc::default(),
+        peers: UdpPeers::shared(if publication_grant.is_some() {
+            crate::MAX_UDP_PUBLICATION_PEERS
+        } else {
+            crate::MAX_UDP_OUTBOUND_PEERS
+        }),
         publication_grant,
     }
 }
 
 fn test_policy() -> Arc<BoxPolicy> {
-    Arc::new(BoxPolicy::new(&config().policy, config().gateways).unwrap())
+    Arc::new(BoxPolicy::new(&config().policy, crate::config::GATEWAY_ADDRESSES).unwrap())
 }
 
 #[tokio::test]
@@ -791,7 +791,7 @@ async fn udp_peer_filter_refreshes_recent_peers_and_expires_them() {
     let udp = UdpResource {
         ipv4: None,
         ipv6: None,
-        peers: Arc::default(),
+        peers: UdpPeers::shared(crate::MAX_UDP_PUBLICATION_PEERS),
         publication_grant: Some(1),
     };
     let policy = test_policy();
@@ -799,7 +799,7 @@ async fn udp_peer_filter_refreshes_recent_peers_and_expires_them() {
     let second = SocketAddr::from((Ipv4Addr::LOCALHOST, 2));
     let nearly_expired = UDP_PEER_TTL.checked_sub(Duration::from_secs(1)).unwrap();
     assert!(!udp.authorize_send(&policy, first));
-    for port in 1..=u16::try_from(crate::MAX_UDP_PEERS).unwrap() {
+    for port in 1..=u16::try_from(crate::MAX_UDP_PUBLICATION_PEERS).unwrap() {
         udp.remember_peer(SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
     }
     tokio::time::advance(nearly_expired).await;
@@ -810,16 +810,38 @@ async fn udp_peer_filter_refreshes_recent_peers_and_expires_them() {
     udp.remember_peer(newest);
     assert!(udp.knows_peer(first));
     assert!(!udp.knows_peer(second));
-    assert_eq!(udp.peers.lock().unwrap().len(), crate::MAX_UDP_PEERS);
+    assert_eq!(
+        udp.peers.lock().unwrap().remembered.len(),
+        crate::MAX_UDP_PUBLICATION_PEERS
+    );
     tokio::time::advance(Duration::from_secs(1)).await;
     assert!(udp.knows_peer(first));
     assert!(udp.knows_peer(newest));
-    assert_eq!(udp.peers.lock().unwrap().len(), 2);
+    assert_eq!(udp.peers.lock().unwrap().remembered.len(), 2);
     tokio::time::advance(nearly_expired).await;
     assert!(!udp.knows_peer(first));
     assert!(!udp.authorize_send(&policy, first));
     assert!(!udp.knows_peer(newest));
-    assert!(udp.peers.lock().unwrap().is_empty());
+    assert!(udp.peers.lock().unwrap().remembered.is_empty());
+}
+
+/// An outbound socket keeps replies flowing from as many peers as one shared
+/// QUIC endpoint talks to; only the least recent peer past that is forgotten.
+#[tokio::test]
+async fn udp_outbound_sockets_track_more_peers_than_publications() {
+    let udp = bound_resource(None);
+    let peer = |port: usize| SocketAddr::from((Ipv4Addr::LOCALHOST, u16::try_from(port).unwrap()));
+    for port in 1..=crate::MAX_UDP_OUTBOUND_PEERS {
+        udp.remember_peer(peer(port));
+    }
+    assert!(udp.knows_peer(peer(1)));
+    udp.remember_peer(peer(crate::MAX_UDP_OUTBOUND_PEERS + 1));
+    assert!(!udp.knows_peer(peer(1)));
+    assert!(udp.knows_peer(peer(2)));
+    assert_eq!(
+        udp.peers.lock().unwrap().remembered.len(),
+        crate::MAX_UDP_OUTBOUND_PEERS
+    );
 }
 
 #[tokio::test]
@@ -868,13 +890,24 @@ async fn udp_policy_expiry_is_rechecked_by_peer_authorization() {
 
     let mut network = config().policy;
     network.allow = vec!["api.test:443".into()];
-    let policy =
-        BoxPolicy::with_clock(&network, config().gateways, || NOW.load(Ordering::Relaxed)).unwrap();
+    let policy = BoxPolicy::with_clock(&network, crate::config::GATEWAY_ADDRESSES, || {
+        NOW.load(Ordering::Relaxed)
+    })
+    .unwrap();
+    let udp = bound_resource(None);
     let peer = "1.1.1.1:443".parse().unwrap();
     policy.accept_resolved("api.test", &["1.1.1.1".parse().unwrap()]);
-    assert!(authorize_peer(&policy, peer));
+    assert!(udp.authorize_send(&policy, peer));
+    NOW.store(59_999_999_999, Ordering::Relaxed);
+    assert!(
+        udp.authorize_send(&policy, peer),
+        "the cached grant holds until expiry"
+    );
     NOW.store(60_000_000_000, Ordering::Relaxed);
-    assert!(!authorize_peer(&policy, peer));
+    assert!(
+        !udp.authorize_send(&policy, peer),
+        "the cached grant lapses with the policy's"
+    );
 }
 
 /// Queued replies retain only the datagram bytes covered by the broker's batch budget.

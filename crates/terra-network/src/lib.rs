@@ -17,7 +17,9 @@ pub const MAX_RESOURCES: usize = 2 * terra_protocol::vsock::MAX_NETWORK_SOCKETS;
 pub const MAX_DNS_REQUESTS: usize = 16;
 pub const MAX_LISTENERS: usize = 2 * terra_protocol::MAX_PUBLISHED_PORTS;
 pub const MAX_RESOLVERS: usize = 8;
-pub const MAX_UDP_PEERS: usize = terra_protocol::network::MAX_UDP_PEERS;
+pub const MAX_UDP_PUBLICATION_PEERS: usize = terra_protocol::network::MAX_UDP_PUBLICATION_PEERS;
+/// One shared QUIC endpoint talks to every server through one socket, so outbound sockets track more peers.
+pub const MAX_UDP_OUTBOUND_PEERS: usize = 128;
 pub const MAX_SOCKET_BUFFER_BYTES: u32 = 256 << 10;
 const MAX_STREAMS: usize = MAX_RESOURCES + MAX_LISTENERS + MAX_DNS_REQUESTS + 16;
 const _: () = assert!(

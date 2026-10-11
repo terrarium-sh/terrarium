@@ -103,8 +103,11 @@ pub async fn read_frame_async_with_limit<T: DeserializeOwned>(
         Err(error) => return Err(error),
     }
     reader.read_exact(&mut bytes[1..]).await?;
-    let mut payload = vec![0u8; checked_len(bytes, max_bytes.min(MAX_FRAME_BYTES))?];
-    reader.read_exact(&mut payload).await?;
+    let len = checked_len(bytes, max_bytes.min(MAX_FRAME_BYTES))?;
+    let mut payload = Vec::with_capacity(len);
+    if reader.take(len as u64).read_to_end(&mut payload).await? != len {
+        return Err(io::ErrorKind::UnexpectedEof.into());
+    }
     decode_frame_payload(&payload).map(Some)
 }
 
@@ -125,8 +128,10 @@ pub fn read_frame_with_limit<T: DeserializeOwned>(
     let Some(len) = read_len(reader, max_bytes.min(MAX_FRAME_BYTES))? else {
         return Ok(None);
     };
-    let mut payload = vec![0u8; len];
-    reader.read_exact(&mut payload)?;
+    let mut payload = Vec::with_capacity(len);
+    if reader.take(len as u64).read_to_end(&mut payload)? != len {
+        return Err(io::ErrorKind::UnexpectedEof.into());
+    }
     decode_frame_payload(&payload).map(Some)
 }
 

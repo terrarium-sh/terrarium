@@ -870,10 +870,6 @@ mod tests {
                 allow: vec!["HOST_LOOPBACK".into()],
                 ..Network::default()
             },
-            gateways: [
-                "100.96.0.1".parse().unwrap(),
-                "fd53:4d00::1".parse().unwrap(),
-            ],
             listeners,
         })
         .unwrap();

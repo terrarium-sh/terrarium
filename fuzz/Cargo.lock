@@ -1784,6 +1784,7 @@ name = "terra-network"
 version = "0.0.1"
 dependencies = [
  "futures-util",
+ "lru",
  "serde",
  "socket2",
  "terra-limits",

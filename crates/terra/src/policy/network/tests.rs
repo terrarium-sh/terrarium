@@ -15,7 +15,7 @@ fn build_dns_record(name: &str, addr: &str) -> StaticDnsRecord {
         addr: addr.into(),
     }
 }
-const HOST_LOOPBACK_SYMBOL: &str = "HOST_LOOPBACK";
+use terra_policy::HOST_LOOPBACK_SYMBOL;
 
 #[test]
 fn parse_port_mappings_and_reject_invalid_entries() {

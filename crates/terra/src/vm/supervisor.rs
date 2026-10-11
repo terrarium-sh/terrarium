@@ -465,25 +465,10 @@ pub(crate) fn build_broker_config(spec: &BootSpec) -> Result<terra_network::conf
             });
         }
     }
-    let mut policy: terra_policy::config::Network = (&spec.cfg.network).into();
-    // The supervisor reads host interfaces so the broker's filter can refuse netlink sockets.
-    policy.host_addresses = sys::host_addresses()?
-        .into_iter()
-        .map(|address| address.to_string())
-        .collect();
-    let config = terra_network::config::Config {
-        policy,
-        gateways: [
-            super::HOST_SERVICE_ADDRESSES.gateway_ip.into(),
-            super::HOST_SERVICE_ADDRESSES.gateway_ip6.into(),
-        ],
+    Ok(terra_network::config::Config {
+        policy: spec.cfg.network.host_policy()?,
         listeners,
-    };
-    config
-        .policy
-        .validate_limits()
-        .map_err(anyhow::Error::msg)?;
-    Ok(config)
+    })
 }
 
 pub(crate) fn run_host_self_test() -> Result<()> {
@@ -937,11 +922,7 @@ mod tests {
             host_publishes_pid: false,
             network_broker: None,
         };
-        let expected: Vec<String> = sys::host_addresses()
-            .unwrap()
-            .into_iter()
-            .map(|address| address.to_string())
-            .collect();
+        let expected = sys::host_addresses().unwrap();
         assert!(!expected.is_empty(), "host reports no interface addresses");
         assert_eq!(
             build_broker_config(&boot).unwrap().policy.host_addresses,

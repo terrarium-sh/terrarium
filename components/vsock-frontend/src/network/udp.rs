@@ -1,9 +1,9 @@
 //! One guest UDP socket per vsock stream: open once, then datagram frames both ways.
 
 use super::{
-    batches, broker_error, deliver_message, deliver_opening, finish_flow, host_socket_address,
-    native_socket_address, read_message, read_opening, read_queued_message, reject_opening,
-    reset_flow, resolve_destination, run_before_deadline, shutdown_flow,
+    batches, broker_error, deliver_bytes, deliver_message, deliver_opening, finish_flow,
+    host_socket_address, native_socket_address, read_message, read_opening, read_queued_message,
+    reject_opening, reset_flow, resolve_destination, run_before_deadline, shutdown_flow,
 };
 use crate::terra::network::broker::{self, Udp};
 use futures_util::{
@@ -205,16 +205,21 @@ async fn receive_datagrams(
     Ok(())
 }
 
+/// One broker batch becomes one vsock packet, so the guest pays its per-packet costs once per batch.
 async fn deliver_datagrams(
     connection: ConnectionId,
     peers: &PeerTranslations,
     datagrams: Vec<broker::Datagram>,
 ) -> Result<(), SocketError> {
+    let mut frames = Vec::new();
     for broker::Datagram { peer, bytes } in datagrams {
         let peer = peers.guest_peer(native_socket_address(peer));
-        deliver_message(connection, &Message::UdpDatagram { peer, bytes }).await?;
+        let frame = Message::UdpDatagram { peer, bytes }
+            .encode()
+            .map_err(|_| SocketError::Protocol)?;
+        frames.extend_from_slice(&frame);
     }
-    Ok(())
+    deliver_bytes(connection, frames).await
 }
 
 #[cfg(test)]

@@ -108,17 +108,7 @@ pub struct Mount {
     pub readonly: bool,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum NetworkMode {
-    /// Allows public destinations except addresses collected from host interfaces at VM startup.
-    /// Explicit `allow` rules can grant access to those addresses and private ranges.
-    #[serde(rename = "unrestricted-public")]
-    UnrestrictedPublic,
-    /// Nothing without a rule; an empty allowlist reaches nothing.
-    #[default]
-    Allowlist,
-}
+pub use terra_policy::config::{NetworkMode, StaticDnsRecord};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
@@ -136,23 +126,21 @@ pub struct Network {
 impl From<&Network> for terra_policy::config::Network {
     fn from(network: &Network) -> Self {
         Self {
-            mode: match network.mode {
-                NetworkMode::Allowlist => terra_policy::config::NetworkMode::Allowlist,
-                NetworkMode::UnrestrictedPublic => {
-                    terra_policy::config::NetworkMode::UnrestrictedPublic
-                }
-            },
+            mode: network.mode,
             allow: network.allow.clone(),
-            hosts: network
-                .hosts
-                .iter()
-                .map(|record| terra_policy::config::StaticDnsRecord {
-                    name: record.name.clone(),
-                    addr: record.addr.clone(),
-                })
-                .collect(),
+            hosts: network.hosts.clone(),
             host_addresses: Vec::new(),
         }
+    }
+}
+
+impl Network {
+    /// Host interface addresses join the policy so the broker refuses them without a rule.
+    pub(crate) fn host_policy(&self) -> Result<terra_policy::config::Network> {
+        Ok(terra_policy::config::Network {
+            host_addresses: crate::sys::host_addresses()?,
+            ..self.into()
+        })
     }
 }
 
@@ -166,14 +154,6 @@ impl Default for Network {
             ports: Vec::new(),
         }
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct StaticDnsRecord {
-    pub name: String,
-    /// An IP address, or `HOST_LOOPBACK` for the machine terra is running on.
-    pub addr: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]

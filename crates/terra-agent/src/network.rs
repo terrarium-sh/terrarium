@@ -341,7 +341,8 @@ fn reserve_udp_publication_files(
 ) -> Result<rustix::process::Rlimit> {
     let minimum = u64::try_from(
         BASE_AGENT_OPEN_FILES
-            + MAX_UDP_PUBLICATION_CLIENTS * (terra_protocol::network::MAX_UDP_PEERS + 1),
+            + MAX_UDP_PUBLICATION_CLIENTS
+                * (terra_protocol::network::MAX_UDP_PUBLICATION_PEERS + 1),
     )?;
     ensure!(
         limits.maximum.is_none_or(|maximum| maximum >= minimum),
@@ -867,7 +868,7 @@ async fn relay_udp_publication(
                 let entry = if let Some(index) = peers.iter().position(|entry| entry.peer == peer) {
                     peers.remove(index).ok_or_else(|| io::Error::other("missing UDP publication peer"))?
                 } else {
-                    if peers.len() == terra_protocol::network::MAX_UDP_PEERS {
+                    if peers.len() == terra_protocol::network::MAX_UDP_PUBLICATION_PEERS {
                         peers.pop_front();
                     }
                     let socket = connect_published_udp_service(source, destination).await?;
@@ -1510,10 +1511,12 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), async {
             let mut publication = TestUdpPublication::new().await;
             let mut sources = VecDeque::new();
-            for port in 1..=u16::try_from(terra_protocol::network::MAX_UDP_PEERS + 1).unwrap() {
+            for port in
+                1..=u16::try_from(terra_protocol::network::MAX_UDP_PUBLICATION_PEERS + 1).unwrap()
+            {
                 let peer = SocketAddr::from(([203, 0, 113, 9], port));
                 let source = publication.send(peer, &port.to_le_bytes()).await;
-                if sources.len() == terra_protocol::network::MAX_UDP_PEERS {
+                if sources.len() == terra_protocol::network::MAX_UDP_PUBLICATION_PEERS {
                     let oldest = sources.pop_front().unwrap();
                     assert!(std::net::UdpSocket::bind(oldest).is_ok());
                 }

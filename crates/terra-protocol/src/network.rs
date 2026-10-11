@@ -11,7 +11,7 @@ pub const MAX_NETWORK_DATAGRAM_BYTES: usize = 4096;
 pub const MAX_NETWORK_NAME_BYTES: usize = 256;
 pub const MAX_NETWORK_ADDRESSES: usize = 32;
 pub const MAX_NETWORK_FRAME_BYTES: usize = MAX_NETWORK_READ_BYTES + 128;
-pub const MAX_UDP_PEERS: usize = 16;
+pub const MAX_UDP_PUBLICATION_PEERS: usize = 16;
 pub const MAX_NETWORK_DATAGRAMS: usize = 32;
 /// Upper bound on one batched datagram's encoded peer and length prefix.
 pub const DATAGRAM_FRAME_OVERHEAD_BYTES: usize = 32;

@@ -1,26 +1,26 @@
 //! Egress grants and bounded DNS learning.
 
 use crate::address::{Cidr, is_floored, nat64_well_known_v4};
-use crate::config::{Network, NetworkMode};
+use crate::config::{Network, NetworkMode, StaticDnsRecord};
 use crate::hostname::normalize_hostname;
 use lru::LruCache;
 use std::collections::BTreeMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroUsize;
 use std::sync::Mutex;
 
 use super::rules::{
-    HOST_LOOPBACK_SYMBOL, Port, Rule, is_single_address, name_covers, parse_allow, parse_dns_record,
+    HOST_LOOPBACK_SYMBOL, Port, Rule, is_host_loopback, name_covers, parse_allow, parse_dns_record,
 };
 
 type Result<T> = std::result::Result<T, String>;
 
-pub const LEARNED_ADDRESSES_CAPACITY: usize = 4096;
+pub(crate) const LEARNED_ADDRESSES_CAPACITY: usize = 4096;
 pub const LEARNED_DNS_TTL_SECS: u64 = 60;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum NameLookup {
-    Static(Vec<IpAddr>),
+#[derive(Debug)]
+pub enum NameLookup<'a> {
+    Static(&'a [IpAddr]),
     Resolve(String),
     Denied,
 }
@@ -40,7 +40,7 @@ pub struct BoxPolicy {
 
 impl BoxPolicy {
     pub fn new(net: &Network, gateway_addresses: [IpAddr; 2]) -> Result<Self> {
-        Self::with_clock(net, gateway_addresses, crate::monotonic_now)
+        Self::with_clock(net, gateway_addresses, monotonic_now)
     }
 
     pub fn with_clock(
@@ -49,203 +49,168 @@ impl BoxPolicy {
         clock: fn() -> u64,
     ) -> Result<Self> {
         net.validate_limits()?;
-        let host_addresses = net
-            .host_addresses
-            .iter()
-            .map(|address| {
-                address
-                    .parse::<IpAddr>()
-                    .map(|address| address.to_canonical())
-                    .map_err(|_| "invalid host address".to_owned())
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let static_dns = Self::parse_static_dns(net, &gateway_addresses)?;
-        let (address_rules, name_rules, host_grants) =
-            Self::parse_allow_rules(net, &static_dns, &gateway_addresses)?;
-        Ok(Self {
+        let mut policy = Self {
             mode: net.mode,
-            address_rules,
-            name_rules,
+            address_rules: Vec::new(),
+            name_rules: Vec::new(),
             learned_dns: Mutex::new(LruCache::new(
                 #[allow(clippy::unwrap_used)]
                 const {
                     NonZeroUsize::new(LEARNED_ADDRESSES_CAPACITY).unwrap()
                 },
             )),
-            static_dns,
-            host_grants,
-            host_addresses,
+            static_dns: BTreeMap::new(),
+            host_grants: Vec::new(),
+            host_addresses: net
+                .host_addresses
+                .iter()
+                .map(IpAddr::to_canonical)
+                .collect(),
             gateway_addresses,
             clock,
-        })
-    }
-
-    fn parse_static_dns(
-        net: &Network,
-        gateway_addrs: &[IpAddr; 2],
-    ) -> Result<BTreeMap<String, Vec<IpAddr>>> {
-        let mut static_dns: BTreeMap<String, Vec<IpAddr>> = BTreeMap::new();
-        for rule in &net.hosts {
-            let (key, addrs) = parse_dns_record(rule, gateway_addrs)?;
-            if static_dns.insert(key, addrs).is_some() {
+        };
+        for record in &net.hosts {
+            policy.add_dns_record(record)?;
+        }
+        for entry in &net.allow {
+            policy.add_allow_rule(entry)?;
+            if policy.address_rules.len() + policy.host_grants.len() > crate::MAX_EXPANDED_RULES {
                 return Err(format!(
-                    "duplicate hosts record for '{}': it names the same record as an earlier \
-                     rule (a name is matched without case and without a trailing dot)",
-                    rule.name
+                    "network configuration exceeds {} expanded grants",
+                    crate::MAX_EXPANDED_RULES
                 ));
             }
         }
-        Ok(static_dns)
+        Ok(policy)
     }
 
-    #[allow(clippy::type_complexity)]
-    fn parse_allow_rules(
-        net: &Network,
-        static_dns: &BTreeMap<String, Vec<IpAddr>>,
-        gateway_addrs: &[IpAddr; 2],
-    ) -> Result<(Vec<(Cidr, Port)>, Vec<(String, Port)>, Vec<Port>)> {
-        let mut address_rules = Vec::new();
-        let mut name_rules = Vec::new();
-        let mut host_grants = Vec::new();
-        for entry in &net.allow {
-            match parse_allow(entry)? {
-                Rule::Host(port) => host_grants.push(port),
-                Rule::Addr(cidr, port) => {
-                    if let Some(gw) = gateway_addrs.iter().find(|a| is_single_address(cidr, **a)) {
-                        return Err(format!(
-                            "allow rule '{entry}': {gw} is the machine terra is running on, \
-                             which no address rule opens - write '{HOST_LOOPBACK_SYMBOL}' (with the \
-                             same ':PORT', if any) to open the host"
-                        ));
-                    }
-                    address_rules.push((cidr, port));
+    fn add_dns_record(&mut self, record: &StaticDnsRecord) -> Result<()> {
+        let (key, addrs) = parse_dns_record(record, &self.gateway_addresses)?;
+        if self.static_dns.insert(key, addrs).is_some() {
+            return Err(format!(
+                "duplicate hosts record for '{}': it names the same record as an earlier \
+                 rule (a name is matched without case and without a trailing dot)",
+                record.name
+            ));
+        }
+        Ok(())
+    }
+
+    fn add_allow_rule(&mut self, entry: &str) -> Result<()> {
+        match parse_allow(entry)? {
+            Rule::Host(port) => self.host_grants.push(port),
+            Rule::Addr(cidr, port) => {
+                if let Some(gateway) = self
+                    .gateway_addresses
+                    .iter()
+                    .find(|gateway| Cidr::from(**gateway) == cidr)
+                {
+                    return Err(format!(
+                        "allow rule '{entry}': {gateway} is the machine terra is running on, \
+                         which no address rule opens - write '{HOST_LOOPBACK_SYMBOL}' (with the \
+                         same ':PORT', if any) to open the host"
+                    ));
                 }
-                Rule::Name(name, port) => {
-                    let resolved: Vec<IpAddr> = static_dns
-                        .iter()
-                        .filter(|(r, _)| name_covers(&name, r))
-                        .flat_map(|(_, a)| a)
-                        .copied()
-                        .collect();
-                    if resolved.is_empty() && net.mode == NetworkMode::UnrestrictedPublic {
-                        return Err(format!(
-                            "allow rule '{entry}' opens nothing under \
-                             'mode: unrestricted-public': every public address is already \
-                             reachable, and a name resolved upstream cannot open the LAN or \
-                             any other floored range (that is what stops a hostile answer \
-                             from pointing it there).\n\
-                             Write the address itself - 'allow: [10.0.0.5:445]' - or publish \
-                             the name with a 'hosts:' record and keep this rule, or switch \
-                             to 'mode: allowlist' where a name rule gates public egress."
-                        ));
-                    }
-                    for addr in resolved {
-                        if gateway_addrs.contains(&addr) {
-                            host_grants.push(port);
-                        } else if let Some(cidr) = Cidr::parse(&addr.to_string()) {
-                            address_rules.push((cidr, port));
-                        }
-                    }
-                    name_rules.push((name, port));
-                }
+                self.address_rules.push((cidr, port));
             }
-            if address_rules.len() + host_grants.len() > crate::MAX_EXPANDED_RULES {
-                return Err("network configuration exceeds 4096 expanded grants".into());
+            Rule::Name(name, port) => {
+                let resolved: Vec<IpAddr> = self
+                    .static_dns
+                    .iter()
+                    .filter(|(record, _)| name_covers(&name, record))
+                    .flat_map(|(_, addrs)| addrs)
+                    .copied()
+                    .collect();
+                if resolved.is_empty() && self.mode == NetworkMode::UnrestrictedPublic {
+                    return Err(format!(
+                        "allow rule '{entry}' opens nothing under \
+                         'mode: unrestricted-public': every public address is already \
+                         reachable, and a name resolved upstream cannot open the LAN or \
+                         any other floored range (that is what stops a hostile answer \
+                         from pointing it there).\n\
+                         Write the address itself - 'allow: [10.0.0.5:445]' - or publish \
+                         the name with a 'hosts:' record and keep this rule, or switch \
+                         to 'mode: allowlist' where a name rule gates public egress."
+                    ));
+                }
+                for addr in resolved {
+                    if self.gateway_addresses.contains(&addr) {
+                        self.host_grants.push(port);
+                    } else {
+                        self.address_rules.push((addr.into(), port));
+                    }
+                }
+                self.name_rules.push((name, port));
             }
         }
-        Ok((address_rules, name_rules, host_grants))
+        Ok(())
     }
 
-    #[must_use]
-    pub(crate) fn grants_for(&self, name: &str) -> Vec<Port> {
-        let Some(name) = normalize_hostname(name) else {
-            return Vec::new();
-        };
+    pub(crate) fn grants_for(&self, normalized_name: &str) -> Vec<Port> {
         self.name_rules
             .iter()
-            .filter(|(rule, _)| name_covers(rule, &name))
+            .filter(|(rule, _)| name_covers(rule, normalized_name))
             .map(|(_, grant)| *grant)
             .collect()
     }
 
-    pub(crate) fn static_answer(&self, name: &str) -> Option<&[IpAddr]> {
-        self.static_dns
-            .get(&normalize_hostname(name)?)
-            .map(Vec::as_slice)
+    pub(crate) fn static_answer(&self, normalized_name: &str) -> Option<&[IpAddr]> {
+        self.static_dns.get(normalized_name).map(Vec::as_slice)
     }
 
     pub fn accept_resolved(&self, name: &str, addresses: &[IpAddr]) -> Vec<IpAddr> {
-        if addresses.len() > crate::MAX_RESOLVED_ADDRESSES || normalize_hostname(name).is_none() {
+        let Some(name) = normalize_hostname(name) else {
             return Vec::new();
-        }
-        let grants = self.grants_for(name);
+        };
+        let grants = self.grants_for(&name);
         if self.mode == NetworkMode::Allowlist && grants.is_empty() {
             return Vec::new();
         }
-        if self.mode == NetworkMode::UnrestrictedPublic {
-            return addresses
-                .iter()
-                .map(IpAddr::to_canonical)
-                .filter(|ip| {
-                    !is_floored(*ip)
-                        && !self.gateway_addresses.contains(ip)
-                        && !self.is_host_address(*ip)
-                })
-                .fold(Vec::new(), |mut accepted, ip| {
-                    if !accepted.contains(&ip) {
-                        accepted.push(ip);
-                    }
-                    accepted
-                });
-        }
-        let Ok(mut learned) = self.learned_dns.lock() else {
-            return Vec::new();
-        };
-        let now = (self.clock)();
-        let host = self.gateway_addresses;
         let mut accepted = Vec::new();
-        for ip in addresses.iter().map(IpAddr::to_canonical) {
-            if is_floored(ip) || host.contains(&ip) || self.is_host_address(ip) {
-                continue;
-            }
-            let expires_at = now.saturating_add(LEARNED_DNS_TTL_SECS * 1_000_000_000);
-            for grant in &grants {
-                let key = (ip, *grant);
-                if let Some(previous) = learned.get_mut(&key) {
-                    *previous = (*previous).max(expires_at);
-                } else {
-                    learned.put(key, expires_at);
-                }
-            }
-            if !accepted.contains(&ip) {
+        for ip in addresses
+            .iter()
+            .take(crate::MAX_RESOLVED_ADDRESSES)
+            .map(IpAddr::to_canonical)
+        {
+            if !is_floored(ip)
+                && !self.gateway_addresses.contains(&ip)
+                && !self.is_host_address(ip)
+                && !accepted.contains(&ip)
+            {
                 accepted.push(ip);
             }
         }
-        accepted
+        match self.mode {
+            NetworkMode::UnrestrictedPublic => accepted,
+            NetworkMode::Allowlist => {
+                let Ok(mut learned) = self.learned_dns.lock() else {
+                    return Vec::new();
+                };
+                let expires_at = self
+                    .now()
+                    .saturating_add(LEARNED_DNS_TTL_SECS * 1_000_000_000);
+                for key in accepted
+                    .iter()
+                    .flat_map(|ip| grants.iter().map(|grant| (*ip, *grant)))
+                {
+                    if let Some(previous) = learned.get_mut(&key) {
+                        *previous = (*previous).max(expires_at);
+                    } else {
+                        learned.put(key, expires_at);
+                    }
+                }
+                accepted
+            }
+        }
     }
 
-    #[cfg(test)]
     #[must_use]
-    pub(crate) fn forwards(&self, name: &str) -> bool {
-        matches!(self.lookup_name(name), NameLookup::Resolve(_))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn learn_named(&self, name: &str, records: &[(IpAddr, u32)]) {
-        let addresses = records
-            .iter()
-            .map(|(address, _)| *address)
-            .collect::<Vec<_>>();
-        self.accept_resolved(name, &addresses);
-    }
-
-    #[must_use]
-    pub fn lookup_name(&self, name: &str) -> NameLookup {
+    pub fn lookup_name(&self, name: &str) -> NameLookup<'_> {
         let Some(name) = normalize_hostname(name) else {
             return NameLookup::Denied;
         };
         if let Some(ips) = self.static_answer(&name) {
-            return NameLookup::Static(ips.to_vec());
+            return NameLookup::Static(ips);
         }
         match self.mode {
             NetworkMode::Allowlist if self.grants_for(&name).is_empty() => NameLookup::Denied,
@@ -254,53 +219,92 @@ impl BoxPolicy {
     }
 
     fn is_host_address(&self, ip: IpAddr) -> bool {
+        let nat64_target = match ip {
+            IpAddr::V6(ip) => nat64_well_known_v4(ip).map(IpAddr::V4),
+            IpAddr::V4(_) => None,
+        };
         self.host_addresses.contains(&ip)
-            || matches!(ip, IpAddr::V6(ip) if nat64_well_known_v4(ip).is_some_and(|ip| self.host_addresses.contains(&IpAddr::V4(ip))))
+            || nat64_target.is_some_and(|target| self.host_addresses.contains(&target))
     }
 
-    pub fn allows(&self, ip: IpAddr, port: Option<u16>) -> bool {
+    pub fn now(&self) -> u64 {
+        (self.clock)()
+    }
+
+    pub fn authorizes(&self, peer: SocketAddr) -> bool {
+        self.authorized_until(peer).is_some()
+    }
+
+    /// `None` denies `peer`; `Some(t)` allows it until [`Self::now`] reaches `t`.
+    pub fn authorized_until(&self, peer: SocketAddr) -> Option<u64> {
+        if peer.port() == 53 && self.blocks_direct_dns() {
+            return None;
+        }
+        if is_host_loopback(peer.ip())
+            && self
+                .host_grants
+                .iter()
+                .any(|grant| grant.is_none_or(|port| port == peer.port()))
+        {
+            return Some(u64::MAX);
+        }
+        self.allowed_until(peer.ip(), Some(peer.port()))
+    }
+
+    pub fn allows(&self, ip: IpAddr, port: Port) -> bool {
+        self.allowed_until(ip, port).is_some()
+    }
+
+    fn allowed_until(&self, ip: IpAddr, port: Port) -> Option<u64> {
         let ip = ip.to_canonical();
         if self.gateway_addresses.contains(&ip) {
-            return false;
+            return None;
         }
         if self
             .address_rules
             .iter()
             .any(|(cidr, grant)| cidr.contains(ip) && (grant.is_none() || *grant == port))
         {
-            return true;
+            return Some(u64::MAX);
         }
-        if self.is_host_address(ip) {
-            return false;
-        }
-        if is_floored(ip) {
-            return false;
+        if self.is_host_address(ip) || is_floored(ip) {
+            return None;
         }
         match self.mode {
-            NetworkMode::UnrestrictedPublic => true,
-            NetworkMode::Allowlist => self.learned_dns.lock().is_ok_and(|mut learned| {
-                let now = (self.clock)();
-                [None, port].into_iter().any(|grant| {
-                    let key = (ip, grant);
-                    if learned
-                        .get(&key)
-                        .is_some_and(|expires_at| *expires_at > now)
-                    {
-                        true
-                    } else {
-                        learned.pop(&key);
-                        false
-                    }
-                })
-            }),
+            NetworkMode::UnrestrictedPublic => Some(u64::MAX),
+            NetworkMode::Allowlist => {
+                let mut learned = self.learned_dns.lock().ok()?;
+                let now = self.now();
+                [None, port]
+                    .into_iter()
+                    .filter_map(|grant| {
+                        let key = (ip, grant);
+                        match learned.get(&key) {
+                            Some(expires_at) if *expires_at > now => Some(*expires_at),
+                            Some(_) | None => {
+                                learned.pop(&key);
+                                None
+                            }
+                        }
+                    })
+                    .max()
+            }
         }
     }
 
-    pub fn host_service_ports(&self) -> &[Option<u16>] {
+    pub fn host_service_ports(&self) -> &[Port] {
         &self.host_grants
     }
 
-    pub fn blocks_direct_dns(&self) -> bool {
+    fn blocks_direct_dns(&self) -> bool {
         self.mode == NetworkMode::Allowlist || !self.static_dns.is_empty()
     }
+}
+
+pub(crate) fn monotonic_now() -> u64 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    static STARTED: OnceLock<Instant> = OnceLock::new();
+    u64::try_from(STARTED.get_or_init(Instant::now).elapsed().as_nanos()).unwrap_or(u64::MAX)
 }

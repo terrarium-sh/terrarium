@@ -4,7 +4,7 @@ use arbitrary::{Arbitrary, Unstructured};
 use libfuzzer_sys::fuzz_target;
 use std::assert_matches;
 use std::collections::HashSet;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use terra::config::{Network, NetworkMode, StaticDnsRecord};
 use terra_policy::normalize_hostname;
 use terra_policy::{BoxPolicy, NameLookup};
@@ -74,6 +74,9 @@ fn check_host(policy: &BoxPolicy) {
     ] {
         for port in [None, Some(0), Some(22), Some(443), Some(u16::MAX)] {
             assert!(!policy.allows(address, port));
+            if let Some(port) = port {
+                assert!(!policy.authorizes(SocketAddr::new(address, port)));
+            }
         }
     }
 }

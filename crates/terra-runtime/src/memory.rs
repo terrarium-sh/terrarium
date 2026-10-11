@@ -92,16 +92,14 @@ impl<'a> BoundedMemory<'a> {
                 .validate_range(range.addr, range.len)
                 .map_err(map_memory_error)?;
         }
-        let mut bytes = vec![0; usize::try_from(total).map_err(|_| MemoryError::TooLarge)?];
+        let mut bytes =
+            Vec::with_capacity(usize::try_from(total).map_err(|_| MemoryError::TooLarge)?);
         fence(Ordering::SeqCst);
-        let mut start = 0;
         for range in ranges {
-            let end = start + Self::copy_len(range.len)?;
             self.ram
                 .memory()
-                .read_into(range.addr, &mut bytes[start..end])
+                .read_append(range.addr, Self::copy_len(range.len)?, &mut bytes)
                 .map_err(map_memory_error)?;
-            start = end;
         }
         Ok(bytes)
     }

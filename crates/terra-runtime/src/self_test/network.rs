@@ -78,14 +78,6 @@ pub fn create_backend(
             }],
             ..Network::default()
         },
-        gateways: [
-            crate::component::network::HostServiceAddresses::default()
-                .gateway_ip
-                .into(),
-            crate::component::network::HostServiceAddresses::default()
-                .gateway_ip6
-                .into(),
-        ],
         listeners: listeners.clone(),
     })?;
     let ready = broker.ready();

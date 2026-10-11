@@ -5,7 +5,7 @@ mod tcp;
 mod tests;
 mod udp;
 
-use self::peer::{authorize_peer, is_host_loopback, validate_peer};
+use self::peer::validate_peer;
 use self::tcp::bind_tcp_listener;
 use self::udp::bind_udp;
 use crate::config::{Config, Ready};
@@ -112,14 +112,14 @@ impl Broker {
             ));
         }
         let policy = Arc::new(
-            BoxPolicy::new(&config.policy, config.gateways)
+            BoxPolicy::new(&config.policy, crate::config::GATEWAY_ADDRESSES)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?,
         );
         let mut listeners = BTreeMap::new();
         let mut udp_listeners = BTreeMap::new();
         for grant in &config.listeners {
             if grant.grant == 0
-                || !is_host_loopback(grant.address.ip())
+                || !terra_policy::is_host_loopback(grant.address.ip())
                 || grant.address.port() == 0
                 || listeners.contains_key(&grant.grant)
                 || udp_listeners.contains_key(&grant.grant)
@@ -271,7 +271,7 @@ impl Shared {
                 inline_urgent,
             } => {
                 validate_peer(peer)?;
-                if !authorize_peer(&self.policy, peer) {
+                if !self.policy.authorizes(peer) {
                     return Err(Error::AccessDenied);
                 }
                 let permit = self.claim_resource()?;
@@ -300,9 +300,6 @@ impl Shared {
                 })
             }
             Open::Resolve(name) => {
-                if name.len() > terra_policy::MAX_NAME_BYTES {
-                    return Err(Error::InvalidArgument);
-                }
                 let _request = self
                     .dns_requests
                     .clone()

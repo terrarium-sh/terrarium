@@ -11,20 +11,13 @@ mod runtime;
 mod tests;
 
 pub use hostname::normalize_hostname;
-pub use rules::HOST_LOOPBACK_SYMBOL;
-pub use runtime::{BoxPolicy, LEARNED_ADDRESSES_CAPACITY, LEARNED_DNS_TTL_SECS, NameLookup};
+pub use rules::{HOST_LOOPBACK_SYMBOL, is_host_loopback, parse_port};
+pub use runtime::{BoxPolicy, LEARNED_DNS_TTL_SECS, NameLookup};
 
 pub const MAX_CONFIG_BYTES: usize = 64 << 10;
-pub const MAX_RULES: usize = 4096;
+pub(crate) const MAX_RULES: usize = 4096;
 pub const MAX_EXPANDED_RULES: usize = 4096;
-pub const MAX_RULE_BYTES: usize = 512;
-pub const MAX_NAME_BYTES: usize = 256;
+pub(crate) const MAX_RULE_BYTES: usize = 512;
+pub const MAX_HOST_ADDRESSES: usize = 1024;
+pub(crate) const MAX_NAME_BYTES: usize = 256;
 pub const MAX_RESOLVED_ADDRESSES: usize = 32;
-
-fn monotonic_now() -> u64 {
-    use std::sync::OnceLock;
-    use std::time::Instant;
-
-    static STARTED: OnceLock<Instant> = OnceLock::new();
-    u64::try_from(STARTED.get_or_init(Instant::now).elapsed().as_nanos()).unwrap_or(u64::MAX)
-}

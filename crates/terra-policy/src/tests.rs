@@ -3,7 +3,13 @@ use super::runtime::{BoxPolicy, LEARNED_ADDRESSES_CAPACITY};
 use crate::config::{Network, NetworkMode, StaticDnsRecord};
 use crate::runtime::NameLookup;
 use std::assert_matches;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
+
+impl BoxPolicy {
+    fn forwards(&self, name: &str) -> bool {
+        matches!(self.lookup_name(name), NameLookup::Resolve(_))
+    }
+}
 
 fn gateway_addresses() -> [IpAddr; 2] {
     [
@@ -136,7 +142,7 @@ fn nothing_unwritten_crosses_the_floor() {
 fn host_interface_addresses_need_an_explicit_address_rule() {
     let address: IpAddr = "1.1.1.1".parse().unwrap();
     let mut network = build_network(NetworkMode::UnrestrictedPublic, &[]);
-    network.host_addresses = vec![address.to_string()];
+    network.host_addresses = vec![address];
     let blocked = build_policy(&network).unwrap();
     assert!(!blocked.allows(address, Some(443)));
     assert_eq!(
@@ -150,22 +156,12 @@ fn host_interface_addresses_need_an_explicit_address_rule() {
     assert!(!allowed.allows(address, Some(80)));
 }
 
-/// A host address is read as an address or the policy refuses to build: a typo
-/// must not silently become an address that no `allow:` rule can open and no
-/// answer is floored against.
-#[test]
-fn a_host_address_that_is_not_an_address_is_refused_not_ignored() {
-    let mut network = build_network(NetworkMode::Allowlist, &[]);
-    network.host_addresses = vec!["not-an-address".into()];
-    assert_eq!(format_build_error(&network), "invalid host address");
-}
-
 #[test]
 fn nat64_cannot_reach_a_host_interface_address() {
     let address: IpAddr = "1.1.1.1".parse().unwrap();
     let mapped: IpAddr = "64:ff9b::1.1.1.1".parse().unwrap();
     let mut network = build_network(NetworkMode::UnrestrictedPublic, &[]);
-    network.host_addresses = vec![address.to_string()];
+    network.host_addresses = vec![address];
     let policy = build_policy(&network).unwrap();
     assert!(!policy.allows(mapped, Some(443)));
     assert_eq!(
@@ -317,10 +313,10 @@ fn a_name_rule_that_could_not_grant_anything_is_refused_not_ignored() {
     // where it gates public egress rather than opening the floor.
     let gated = build_box_policy(NetworkMode::Allowlist, &["api.test:443"]);
     let public: IpAddr = "93.184.216.34".parse().unwrap();
-    gated.learn_named("api.test", &[(public, 300)]);
+    gated.accept_resolved("api.test", &[public]);
     assert!(gated.allows(public, Some(443)));
     // Even there, a name cannot reach the floor by resolving into it.
-    gated.learn_named("api.test", &[(nas, 300)]);
+    gated.accept_resolved("api.test", &[nas]);
     assert!(!gated.allows(nas, Some(443)));
 }
 
@@ -332,7 +328,7 @@ fn a_learned_address_carries_its_name_s_port() {
     let resolved: IpAddr = "93.184.216.34".parse().unwrap();
 
     assert!(!p.allows(resolved, Some(443)), "nothing is learned yet");
-    p.learn_named("api.test", &[(resolved, 300)]);
+    p.accept_resolved("api.test", &[resolved]);
     assert!(p.allows(resolved, Some(443)));
     assert!(!p.allows(resolved, Some(80)));
     assert!(
@@ -341,12 +337,12 @@ fn a_learned_address_carries_its_name_s_port() {
     );
 
     // The same address under a second name keeps both grants.
-    p.learn_named("open.test", &[(resolved, 300)]);
+    p.accept_resolved("open.test", &[resolved]);
     assert!(p.allows(resolved, Some(80)));
 
     // A name no rule covers learns nothing, however the answer arrives.
     let other: IpAddr = "5.5.5.5".parse().unwrap();
-    p.learn_named("evil.test", &[(other, 300)]);
+    p.accept_resolved("evil.test", &[other]);
     assert!(!p.allows(other, Some(443)));
 }
 
@@ -361,7 +357,7 @@ fn what_a_guest_can_teach_this_policy_is_bounded() {
         let ip: IpAddr = format!("8.{}.{}.{}", (i / 65_536) % 256, (i / 256) % 256, i % 256)
             .parse()
             .unwrap();
-        p.learn_named(&format!("n{i}.attacker.test"), &[(ip, 3600)]);
+        p.accept_resolved(&format!("n{i}.attacker.test"), &[ip]);
     }
     let held = p.learned_dns.lock().unwrap().len();
     assert!(
@@ -371,7 +367,7 @@ fn what_a_guest_can_teach_this_policy_is_bounded() {
 
     // New answers remain usable after the cache reaches capacity.
     let keeper: IpAddr = "9.9.9.7".parse().unwrap();
-    p.learn_named("keep.attacker.test", &[(keeper, 3600)]);
+    p.accept_resolved("keep.attacker.test", &[keeper]);
     assert!(p.allows(keeper, Some(443)));
 }
 
@@ -388,7 +384,7 @@ fn an_answer_cannot_smuggle_in_a_floored_address_or_a_published_addr() {
 
     for hostile in ["10.0.0.5", "127.0.0.1", "169.254.169.254", "100.96.0.1"] {
         let ip: IpAddr = hostile.parse().unwrap();
-        p.learn_named("api.test", &[(ip, 300)]);
+        p.accept_resolved("api.test", &[ip]);
         assert!(!p.allows(ip, Some(443)), "rebound onto {hostile}");
         assert!(!p.allows(ip, Some(22)), "rebound onto {hostile}");
     }
@@ -815,7 +811,7 @@ fn learned_grants_expire_independently_and_refresh_without_shortening() {
     let p = build_box_policy(NetworkMode::Allowlist, &["api.test:443", "api.test:8443"]);
     let ip = "1.1.1.1".parse().unwrap();
     p.accept_resolved("api.test", &[ip]);
-    let now = crate::monotonic_now();
+    let now = crate::runtime::monotonic_now();
     {
         let mut cache = p.learned_dns.lock().unwrap();
         let expires = *cache.peek(&(ip, Some(443))).unwrap();
@@ -890,14 +886,18 @@ fn poisoned_dns_cache_denies_learning_without_revoking_explicit_grants() {
 fn direct_dns_and_host_service_capabilities_match_the_recipe() {
     for mode in [NetworkMode::Allowlist, NetworkMode::UnrestrictedPublic] {
         let empty = build_box_policy(mode, &[]);
-        assert_eq!(empty.blocks_direct_dns(), mode == NetworkMode::Allowlist);
+        let direct_dns = "1.1.1.1:53".parse().unwrap();
+        assert_eq!(
+            empty.authorizes(direct_dns),
+            mode == NetworkMode::UnrestrictedPublic
+        );
         assert_eq!(empty.host_service_ports(), []);
         let static_only = build_published_policy(
             mode,
             &[build_dns_record("host.test", HOST_LOOPBACK_SYMBOL)],
             &[],
         );
-        assert!(static_only.blocks_direct_dns());
+        assert!(!static_only.authorizes(direct_dns));
         assert_eq!(static_only.host_service_ports(), []);
         let p = build_box_policy(mode, &["HOST_LOOPBACK", "HOST_LOOPBACK:443"]);
         assert_eq!(p.host_service_ports(), [None, Some(443)]);
@@ -907,6 +907,42 @@ fn direct_dns_and_host_service_capabilities_match_the_recipe() {
             [] as [std::net::IpAddr; 0]
         );
     }
+}
+
+/// A peer's authorization is the one decision the broker makes: direct DNS
+/// stays closed while the gateway answers names, `HOST_LOOPBACK` grants reach
+/// host loopback, and a learned grant reports when it lapses.
+#[test]
+fn peer_authorization_reports_its_expiry() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NOW: AtomicU64 = AtomicU64::new(5);
+    let network = build_network(
+        NetworkMode::Allowlist,
+        &["api.test:443", "HOST_LOOPBACK:8080", "1.1.1.1"],
+    );
+    let policy = BoxPolicy::with_clock(&network, gateway_addresses(), || {
+        NOW.load(Ordering::Relaxed)
+    })
+    .unwrap();
+    assert_eq!(policy.authorized_until("1.1.1.1:53".parse().unwrap()), None);
+    assert_eq!(
+        policy.authorized_until("1.1.1.1:443".parse().unwrap()),
+        Some(u64::MAX)
+    );
+    for peer in ["127.0.0.1:8080", "[::1]:8080"] {
+        assert_eq!(
+            policy.authorized_until(peer.parse().unwrap()),
+            Some(u64::MAX)
+        );
+    }
+    assert!(!policy.authorizes("127.0.0.1:8081".parse().unwrap()));
+    let resolved = "9.9.9.9".parse().unwrap();
+    policy.accept_resolved("api.test", &[resolved]);
+    assert_eq!(
+        policy.authorized_until(SocketAddr::new(resolved, 443)),
+        Some(5 + crate::LEARNED_DNS_TTL_SECS * 1_000_000_000)
+    );
+    assert!(!policy.authorizes(SocketAddr::new(resolved, 80)));
 }
 
 #[test]
@@ -921,8 +957,6 @@ fn unmatched_or_empty_names_never_gain_allowlist_authority() {
         "a.test:443",
         "☃.test",
     ] {
-        assert!(p.grants_for(name).is_empty(), "{name:?}");
-        assert!(p.static_answer(name).is_none());
         assert_matches!(p.lookup_name(name), NameLookup::Denied);
         assert_eq!(
             p.accept_resolved(name, &["1.1.1.1".parse().unwrap()]),
@@ -1017,14 +1051,16 @@ fn native_limits_deny_unbounded_inputs_and_pin_monotonic_expiry() {
     })
     .unwrap();
     let address = "1.1.1.1".parse().unwrap();
+    let mut answer: Vec<IpAddr> = (1..=crate::MAX_RESOLVED_ADDRESSES)
+        .map(|i| IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, u8::try_from(i).unwrap())))
+        .collect();
+    let beyond = "2.2.2.2".parse().unwrap();
+    answer.push(beyond);
     assert_eq!(
-        policy.accept_resolved(
-            "api.test",
-            &vec![address; crate::MAX_RESOLVED_ADDRESSES + 1]
-        ),
-        [] as [std::net::IpAddr; 0]
+        policy.accept_resolved("api.test", &answer),
+        answer[..crate::MAX_RESOLVED_ADDRESSES]
     );
-    assert!(!policy.allows(address, Some(443)));
+    assert!(!policy.allows(beyond, Some(443)));
     assert_matches!(
         policy.lookup_name(&"a".repeat(crate::MAX_NAME_BYTES + 1)),
         NameLookup::Denied

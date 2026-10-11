@@ -143,15 +143,9 @@ fn validate_network(cfg: &Config) -> Result<()> {
         return Ok(());
     }
     crate::policy::network::rules::parse_port_mappings(&cfg.network.ports)?;
-    let mut network = terra_policy::config::Network::from(&cfg.network);
-    network.host_addresses = crate::sys::host_addresses()?
-        .into_iter()
-        .map(|address| address.to_string())
-        .collect();
-    let gateways = terra_runtime::component::network::HostServiceAddresses::default();
     terra_policy::BoxPolicy::new(
-        &network,
-        [gateways.gateway_ip.into(), gateways.gateway_ip6.into()],
+        &cfg.network.host_policy()?,
+        terra_network::config::GATEWAY_ADDRESSES,
     )
     .map_err(anyhow::Error::msg)?;
     Ok(())

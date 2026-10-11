@@ -1,13 +1,14 @@
 //! UDP sockets and the pull-based request loop of one UDP stream.
 
-use super::peer::{authorize_peer, validate_peer};
+use super::peer::validate_peer;
 use super::tcp::bound_socket_buffers;
 use crate::{Error, map_io_error};
 use futures_util::future::BoxFuture;
+use lru::LruCache;
 use socket2::SockRef;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 use terra_policy::BoxPolicy;
 use terra_protocol::network::{
@@ -26,41 +27,102 @@ pub(super) const UDP_PEER_TTL: Duration =
 pub(super) struct UdpResource {
     pub(super) ipv4: Option<Arc<UdpSocket>>,
     pub(super) ipv6: Option<Arc<UdpSocket>>,
-    pub(super) peers: Arc<std::sync::Mutex<std::collections::VecDeque<(SocketAddr, Instant)>>>,
+    pub(super) peers: Arc<Mutex<UdpPeers>>,
     pub(super) publication_grant: Option<crate::ListenerGrant>,
 }
 
+pub(super) struct UdpPeers {
+    capacity: usize,
+    /// Recency order is refresh order, so the least recent entry expires first.
+    pub(super) remembered: LruCache<SocketAddr, Instant>,
+    /// Policy grants as [`BoxPolicy::authorized_until`] reported them.
+    authorized: LruCache<SocketAddr, u64>,
+}
+
+impl UdpPeers {
+    /// The tables grow on demand: most sockets talk to one peer.
+    pub(super) fn shared(capacity: usize) -> Arc<Mutex<Self>> {
+        Arc::new(Mutex::new(Self {
+            capacity,
+            remembered: LruCache::unbounded(),
+            authorized: LruCache::unbounded(),
+        }))
+    }
+
+    fn forget_expired(&mut self, now: Instant) {
+        while self
+            .remembered
+            .peek_lru()
+            .is_some_and(|(_, expires)| *expires <= now)
+        {
+            self.remembered.pop_lru();
+        }
+    }
+}
+
 impl UdpResource {
+    fn lock_peers(&self) -> MutexGuard<'_, UdpPeers> {
+        self.peers.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     pub(super) fn authorize_send(&self, policy: &BoxPolicy, peer: SocketAddr) -> bool {
         if self.publication_grant.is_some() {
             self.knows_peer(peer)
         } else {
-            authorize_peer(policy, peer)
+            self.authorize(policy, peer)
         }
+    }
+
+    /// Consults `policy` only once the cached grant for `peer` lapses.
+    fn authorize(&self, policy: &BoxPolicy, peer: SocketAddr) -> bool {
+        let now = policy.now();
+        if self
+            .lock_peers()
+            .authorized
+            .get(&peer)
+            .is_some_and(|until| *until > now)
+        {
+            return true;
+        }
+        let granted_until = policy.authorized_until(peer);
+        let peers = &mut *self.lock_peers();
+        if let Some(until) = granted_until {
+            put_bounded(&mut peers.authorized, peers.capacity, peer, until);
+        } else {
+            peers.authorized.pop(&peer);
+        }
+        granted_until.is_some()
     }
 
     pub(super) fn remember_peer(&self, peer: SocketAddr) {
-        let mut peers = self
-            .peers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = Instant::now();
-        peers.retain(|(known, expires)| *known != peer && *expires > now);
-        if peers.len() == crate::MAX_UDP_PEERS {
-            peers.pop_front();
-        }
-        peers.push_back((peer, now + UDP_PEER_TTL));
+        let peers = &mut *self.lock_peers();
+        peers.forget_expired(now);
+        put_bounded(
+            &mut peers.remembered,
+            peers.capacity,
+            peer,
+            now + UDP_PEER_TTL,
+        );
     }
 
     pub(super) fn knows_peer(&self, peer: SocketAddr) -> bool {
-        let mut peers = self
-            .peers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let now = Instant::now();
-        peers.retain(|(_, expires)| *expires > now);
-        peers.iter().any(|(known, _)| *known == peer)
+        let mut peers = self.lock_peers();
+        peers.forget_expired(Instant::now());
+        peers.remembered.contains(&peer)
     }
+}
+
+fn put_bounded<V>(
+    cache: &mut LruCache<SocketAddr, V>,
+    capacity: usize,
+    peer: SocketAddr,
+    value: V,
+) {
+    if cache.len() >= capacity && !cache.contains(&peer) {
+        cache.pop_lru();
+    }
+    cache.put(peer, value);
 }
 
 pub(super) fn bind_udp(local: SocketAddr) -> io::Result<Arc<UdpSocket>> {
@@ -121,7 +183,7 @@ fn accept_datagram_from(udp: &UdpResource, policy: &BoxPolicy, peer: SocketAddr)
         udp.remember_peer(peer);
         true
     } else {
-        udp.knows_peer(peer) && authorize_peer(policy, peer)
+        udp.knows_peer(peer) && udp.authorize(policy, peer)
     }
 }
 
@@ -199,7 +261,7 @@ pub(super) fn open() -> Result<UdpResource, Error> {
     Ok(UdpResource {
         ipv4,
         ipv6,
-        peers: Arc::default(),
+        peers: UdpPeers::shared(crate::MAX_UDP_OUTBOUND_PEERS),
         publication_grant: None,
     })
 }
@@ -212,7 +274,7 @@ pub(super) fn open_published(
     Ok(UdpResource {
         ipv4: is_ipv4.then(|| socket.clone()),
         ipv6: (!is_ipv4).then_some(socket),
-        peers: Arc::default(),
+        peers: UdpPeers::shared(crate::MAX_UDP_PUBLICATION_PEERS),
         publication_grant: Some(grant),
     })
 }

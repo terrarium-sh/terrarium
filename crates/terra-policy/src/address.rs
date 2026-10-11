@@ -1,11 +1,26 @@
 //! IP ranges and the default egress floor.
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cidr {
     V4 { network: u32, mask: u32 },
     V6 { network: u128, mask: u128 },
+}
+
+impl From<IpAddr> for Cidr {
+    fn from(ip: IpAddr) -> Self {
+        match ip.to_canonical() {
+            IpAddr::V4(ip) => Self::V4 {
+                network: ip.into(),
+                mask: u32::MAX,
+            },
+            IpAddr::V6(ip) => Self::V6 {
+                network: ip.into(),
+                mask: u128::MAX,
+            },
+        }
+    }
 }
 
 impl Cidr {
@@ -60,28 +75,24 @@ impl Cidr {
 
 #[must_use]
 pub fn is_floored(ip: IpAddr) -> bool {
-    if let Some(ip) = embedded_ipv4(ip) {
-        return !is_global_v4(ip);
-    }
-    match ip.to_canonical() {
-        IpAddr::V4(ip) => !is_global_v4(ip),
-        IpAddr::V6(ip) => !is_global_v6(ip),
-    }
-}
-
-fn embedded_ipv4(ip: IpAddr) -> Option<Ipv4Addr> {
     match ip {
-        IpAddr::V4(ip) => Some(ip),
-        IpAddr::V6(ip) => ip.to_ipv4().or_else(|| {
-            matches!(ip.segments(), [0, 0, 0, 0, 0xffff, 0, ..]).then(|| {
-                let octets = ip.octets();
-                Ipv4Addr::new(octets[12], octets[13], octets[14], octets[15])
-            })
-        }),
+        IpAddr::V4(ip) => !is_global_v4(ip),
+        IpAddr::V6(ip) => {
+            embedded_ipv4(ip).map_or_else(|| !is_global_v6(ip), |ip| !is_global_v4(ip))
+        }
     }
 }
 
-fn is_global_v4(ip: std::net::Ipv4Addr) -> bool {
+fn embedded_ipv4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
+    ip.to_ipv4().or_else(|| {
+        matches!(ip.segments(), [0, 0, 0, 0, 0xffff, 0, ..]).then(|| {
+            let [.., a, b, c, d] = ip.octets();
+            Ipv4Addr::new(a, b, c, d)
+        })
+    })
+}
+
+fn is_global_v4(ip: Ipv4Addr) -> bool {
     let [a, b, c, d] = ip.octets();
     !(a == 0
         || ip.is_private()
@@ -97,7 +108,7 @@ fn is_global_v4(ip: std::net::Ipv4Addr) -> bool {
         || ip.is_broadcast())
 }
 
-fn is_global_v6(ip: std::net::Ipv6Addr) -> bool {
+fn is_global_v6(ip: Ipv6Addr) -> bool {
     if let Some(ip) = nat64_well_known_v4(ip) {
         return is_global_v4(ip);
     }
@@ -114,11 +125,11 @@ fn is_global_v6(ip: std::net::Ipv6Addr) -> bool {
 }
 
 #[must_use]
-pub fn nat64_well_known_v4(ip: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+pub fn nat64_well_known_v4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
     let segments = ip.segments();
     matches!(segments, [0x64, 0xff9b, 0, 0, 0, 0, ..]).then(|| {
-        let octets = ip.octets();
-        std::net::Ipv4Addr::new(octets[12], octets[13], octets[14], octets[15])
+        let [.., a, b, c, d] = ip.octets();
+        Ipv4Addr::new(a, b, c, d)
     })
 }
 

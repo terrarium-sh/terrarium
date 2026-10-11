@@ -220,31 +220,39 @@ impl GuestMemory {
             addr,
             u64::try_from(len).map_err(|_| MemoryError::OutOfRange)?,
         )?;
-        let mut bytes = vec![0; len];
-        self.read_into(addr, &mut bytes)?;
+        let mut bytes = Vec::with_capacity(len);
+        self.read_append(addr, len, &mut bytes)?;
         Ok(bytes)
     }
 
     #[allow(unsafe_code)]
-    pub fn read_into(&self, addr: u64, bytes: &mut [u8]) -> Result<(), MemoryError> {
-        let len = u64::try_from(bytes.len()).map_err(|_| MemoryError::OutOfRange)?;
+    pub fn read_append(
+        &self,
+        addr: u64,
+        len: usize,
+        bytes: &mut Vec<u8>,
+    ) -> Result<(), MemoryError> {
+        let range_len = u64::try_from(len).map_err(|_| MemoryError::OutOfRange)?;
         #[cfg(unix)]
-        self.validate_range(addr, len)?;
+        {
+            self.validate_range(addr, range_len)?;
+            self.memory
+                .write_all_volatile_to(GuestAddress(addr), bytes, len)
+                .map_err(|_| MemoryError::Unmapped)?;
+        }
         #[cfg(windows)]
-        let (range, range_offset) = self.resolve_range(addr, len)?;
-        #[cfg(unix)]
-        self.memory
-            .read_slice(bytes, GuestAddress(addr))
-            .map_err(|_| MemoryError::Unmapped)?;
-        #[cfg(windows)]
-        for (offset, byte) in bytes.iter_mut().enumerate() {
-            // SAFETY: `resolve_range` confines this byte to the allocation.
-            *byte = unsafe {
-                core::sync::atomic::AtomicU8::from_ptr(
-                    range.address.as_ptr().add(range_offset + offset),
-                )
-                .load(core::sync::atomic::Ordering::Relaxed)
-            };
+        {
+            let (range, range_offset) = self.resolve_range(addr, range_len)?;
+            bytes.reserve(len);
+            for offset in 0..len {
+                // SAFETY: `resolve_range` confines this byte to the allocation.
+                bytes.push(unsafe {
+                    core::sync::atomic::AtomicU8::from_ptr(
+                        range.address.as_ptr().add(range_offset + offset),
+                    )
+                    .load(core::sync::atomic::Ordering::Relaxed)
+                });
+            }
         }
         Ok(())
     }
