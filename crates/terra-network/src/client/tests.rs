@@ -3,7 +3,7 @@
 use super::*;
 use std::future::poll_fn;
 use std::time::Duration;
-use terra_protocol::network::{Datagram, SendFailure, TcpEvent, UdpReply, UdpRequest};
+use terra_protocol::network::{DatagramBatch, SendFailure, TcpEvent, UdpReply, UdpRequest};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
@@ -173,13 +173,15 @@ async fn broker_errors_are_returned_without_disconnecting() {
     .await;
 }
 
+fn one_datagram() -> DatagramBatch {
+    let mut batch = DatagramBatch::default();
+    assert!(batch.push(PEER.parse().unwrap(), &[1]));
+    batch
+}
+
 #[tokio::test]
 async fn unrequested_or_empty_udp_replies_disconnect_the_client() {
-    let datagram = Datagram {
-        peer: PEER.parse().unwrap(),
-        bytes: vec![1],
-    };
-    for reply in [UdpReply::Sent(vec![]), UdpReply::Datagrams(vec![datagram])] {
+    for reply in [UdpReply::Sent(vec![]), UdpReply::Datagrams(one_datagram())] {
         bounded(async {
             let (client, mut broker) = fake_broker();
             let (_flow, (_, mut stream)) = tokio::join!(
@@ -204,7 +206,7 @@ async fn unrequested_or_empty_udp_replies_disconnect_the_client() {
             .await
             .unwrap();
         assert_eq!(request, Some(UdpRequest::Receive));
-        crate::frames::write_frame(&mut stream, &UdpReply::Datagrams(vec![]))
+        crate::frames::write_frame(&mut stream, &UdpReply::Datagrams(DatagramBatch::default()))
             .await
             .unwrap();
         assert_eq!(receiving.await.unwrap(), Err(Error::Closed));
@@ -221,11 +223,7 @@ async fn out_of_range_send_failures_disconnect_the_client() {
             async { client.open_udp().await.unwrap() },
             broker.answer(Ok(Opened::Udp))
         );
-        let datagram = Datagram {
-            peer: PEER.parse().unwrap(),
-            bytes: vec![1],
-        };
-        let sending = tokio::spawn(async move { flow.send(vec![datagram]).await });
+        let sending = tokio::spawn(async move { flow.send(one_datagram()).await });
         let request = crate::frames::read_frame::<UdpRequest>(&mut stream)
             .await
             .unwrap();
@@ -297,7 +295,7 @@ async fn a_broker_failure_ends_the_udp_flow_with_its_error() {
             .unwrap();
         assert_eq!(receiving.await.unwrap(), Err(Error::Io));
         assert_eq!(flow.receive().await, Err(Error::Io));
-        assert_eq!(flow.send(vec![]).await, Err(Error::Io));
+        assert_eq!(flow.send(DatagramBatch::default()).await, Err(Error::Io));
         assert!(client.is_available());
     })
     .await;

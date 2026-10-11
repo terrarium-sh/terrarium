@@ -107,7 +107,8 @@ def validate_kernel_buffers(kernel_source):
     for name, expected in (('TERRA_TCP_SEGMENT_BYTES', 65535),
                            ('TERRA_TCP_RECEIVE_BYTES', 81920),
                            ('TERRA_TCP_SEND_BYTES', 49152),
-                           ('TERRA_UDP_QUEUE_BYTES', 65536),
+                           ('TERRA_UDP_CARRIER_BYTES', 65536),
+                           ('TERRA_UDP_QUEUE_BYTES', 131072),
                            ('TERRA_UDP_QUEUED_DATAGRAMS', 48)):
         value = parse_constant(kernel_source, rf'^#define {name} ([0-9_]+)$', name)
         if value != expected:

@@ -119,7 +119,7 @@ async fn serve_udp_listener(
         let Ok(Some(datagrams)) = receiver.read().await else {
             return;
         };
-        receiver.first_datagrams = datagrams;
+        receiver.first_datagrams = Some(datagrams);
         connection = wait_publication_capacity().await;
         registration = register_udp_flow(connection);
         socket = Some((reopened, receiver));

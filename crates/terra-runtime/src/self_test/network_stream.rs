@@ -267,7 +267,8 @@ impl GuestStream {
             .await?;
         let length = usize::try_from(u32::from_le_bytes(bytes[4..8].try_into()?))?;
         wasmtime::ensure!(
-            length <= terra_protocol::application::MAX_PAYLOAD_BYTES,
+            terra_protocol::application::HEADER_BYTES + length
+                <= terra_protocol::application::MAX_UDP_FRAME_BYTES,
             "network self-test frame bound"
         );
         bytes.extend(self.read_bytes(stream, length).await?);

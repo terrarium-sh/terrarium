@@ -1,7 +1,7 @@
 use super::NetworkHost;
 use super::bindings::terra::network::broker::{
-    Datagram as BrokerDatagram, Error as BrokerError, IpAddress, SendFailure as BrokerSendFailure,
-    SocketAddress,
+    DatagramBatch as BrokerDatagramBatch, DatagramHeader as BrokerDatagramHeader,
+    Error as BrokerError, IpAddress, SendFailure as BrokerSendFailure, SocketAddress,
 };
 use futures_util::StreamExt;
 use futures_util::future::BoxFuture;
@@ -11,8 +11,8 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use terra_network::{Client, Error, TcpDownload, TcpFlow, TcpUpload, UdpFlow};
 use terra_protocol::network::{
-    Datagram, MAX_NETWORK_CHUNK_BYTES, MAX_NETWORK_DATAGRAM_BATCH_BYTES,
-    MAX_NETWORK_DATAGRAM_BYTES, MAX_NETWORK_DATAGRAMS, MAX_NETWORK_NAME_BYTES, ResourceKind,
+    DATAGRAM_FRAME_OVERHEAD_BYTES, DatagramBatch, DatagramHeader, MAX_NETWORK_CHUNK_BYTES,
+    MAX_NETWORK_DATAGRAM_BATCH_BYTES, MAX_NETWORK_DATAGRAMS, MAX_NETWORK_NAME_BYTES, ResourceKind,
     SendFailure,
 };
 use tokio::sync::{mpsc, oneshot};
@@ -269,23 +269,40 @@ async fn next_chunk(
 
 async fn next_datagrams(
     state: ReceiveState<UdpFlow>,
-) -> Option<(Result<Vec<BrokerDatagram>, Error>, ReceiveState<UdpFlow>)> {
+) -> Option<(
+    Result<Vec<BrokerDatagramBatch>, Error>,
+    ReceiveState<UdpFlow>,
+)> {
     let (flow, closed) = state?;
     Some(match until_closed(&closed, flow.receive()).await {
         Ok(datagrams) => (
-            Ok(datagrams.into_iter().map(broker_datagram).collect()),
+            Ok(vec![broker_datagram_batch(datagrams)]),
             Some((flow, closed)),
         ),
         Err(error) => (Err(error), None),
     })
 }
 
-fn broker_datagram(Datagram { peer, bytes }: Datagram) -> BrokerDatagram {
-    BrokerDatagram {
-        peer: SocketAddress {
-            address: ip_address(peer.ip()),
-            port: peer.port(),
-        },
+fn broker_datagram_batch(batch: DatagramBatch) -> BrokerDatagramBatch {
+    let (headers, bytes) = batch.into_parts();
+    BrokerDatagramBatch {
+        headers: headers
+            .into_iter()
+            .map(
+                |DatagramHeader {
+                     peer,
+                     length,
+                     segment,
+                 }| BrokerDatagramHeader {
+                    peer: SocketAddress {
+                        address: ip_address(peer.ip()),
+                        port: peer.port(),
+                    },
+                    length,
+                    segment,
+                },
+            )
+            .collect(),
         bytes,
     }
 }
@@ -696,7 +713,7 @@ fn add_udp<T: WasiView + AsMut<NetworkHost> + 'static>(
 ) -> wasmtime::Result<()> {
     interface.func_wrap_concurrent(
         "[method]udp.send-to",
-        |access, (resource, datagrams): (Resource<BrokerUdp>, Vec<BrokerDatagram>)| {
+        |access, (resource, batch): (Resource<BrokerUdp>, BrokerDatagramBatch)| {
             Box::pin(async move {
                 let (flow, closed) = access.with(|mut store| {
                     store
@@ -706,7 +723,7 @@ fn add_udp<T: WasiView + AsMut<NetworkHost> + 'static>(
                         .get(&resource)
                         .map(|udp| (udp.flow.clone(), udp.closed.clone()))
                 })?;
-                let result = until_closed(&closed, send_datagrams(&flow, datagrams)).await;
+                let result = until_closed(&closed, send_datagrams(&flow, batch)).await;
                 if let Ok((_, denied)) = &result {
                     access.with(|mut store| {
                         for peer in denied {
@@ -746,48 +763,76 @@ fn add_udp<T: WasiView + AsMut<NetworkHost> + 'static>(
     Ok(())
 }
 
-/// Forward one guest batch in a single broker request; failures keep their guest index, and the
-/// second list names the peers the broker denied.
+/// A guest entry as a broker header, or why that entry alone cannot be sent.
+fn forwarded_header(header: &BrokerDatagramHeader) -> Result<DatagramHeader, Error> {
+    let forwarded = DatagramHeader {
+        peer: canonical_peer(header.peer)?,
+        length: header.length,
+        segment: header.segment,
+    };
+    if forwarded.is_valid() {
+        Ok(forwarded)
+    } else if header.segment == 0 {
+        Err(Error::DatagramTooLarge)
+    } else {
+        Err(Error::InvalidArgument)
+    }
+}
+
+/// Forward one guest batch in a single broker request; failures keep their guest entry index, and
+/// the second list names the peers the broker denied.
 async fn send_datagrams(
     flow: &UdpFlow,
-    datagrams: Vec<BrokerDatagram>,
+    BrokerDatagramBatch { headers, bytes }: BrokerDatagramBatch,
 ) -> Result<(Vec<BrokerSendFailure>, Vec<SocketAddr>), Error> {
-    if datagrams.len() > MAX_NETWORK_DATAGRAMS {
+    if headers.len() > MAX_NETWORK_DATAGRAMS {
         return Err(Error::InvalidArgument);
     }
-    let mut failures = Vec::new();
-    let mut denied = Vec::new();
-    let mut forwarded = Vec::new();
-    for (index, BrokerDatagram { peer, bytes }) in (0..).zip(datagrams) {
-        let checked = canonical_peer(peer).and_then(|peer| {
-            if bytes.len() > MAX_NETWORK_DATAGRAM_BYTES {
-                Err(Error::DatagramTooLarge)
-            } else {
-                Ok(peer)
-            }
-        });
-        match checked {
-            Ok(peer) => forwarded.push((index, Datagram { peer, bytes })),
-            Err(error) => failures.push((index, error)),
-        }
-    }
-    if forwarded
+    let lengths_total: usize = headers
         .iter()
-        .map(|(_, datagram)| datagram.batch_bytes())
-        .sum::<usize>()
-        > MAX_NETWORK_DATAGRAM_BATCH_BYTES
+        .map(|header| usize::from(header.length))
+        .sum();
+    if lengths_total != bytes.len()
+        || bytes.len() + headers.len() * DATAGRAM_FRAME_OVERHEAD_BYTES
+            > MAX_NETWORK_DATAGRAM_BATCH_BYTES
     {
         return Err(Error::InvalidArgument);
     }
+    let mut failures = Vec::new();
+    let mut guest_indices = Vec::with_capacity(headers.len());
+    let mut forwarded_headers = Vec::with_capacity(headers.len());
+    let mut kept_ranges = Vec::with_capacity(headers.len());
+    let mut start = 0;
+    for (index, header) in (0..).zip(&headers) {
+        let range = start..start + usize::from(header.length);
+        start = range.end;
+        match forwarded_header(header) {
+            Ok(forwarded) => {
+                guest_indices.push(index);
+                forwarded_headers.push(forwarded);
+                kept_ranges.push(range);
+            }
+            Err(error) => failures.push((index, error)),
+        }
+    }
+    let kept_bytes = if failures.is_empty() {
+        bytes
+    } else {
+        let mut kept = Vec::with_capacity(bytes.len());
+        for range in kept_ranges {
+            kept.extend_from_slice(&bytes[range]);
+        }
+        kept
+    };
+    let peers: Vec<_> = forwarded_headers.iter().map(|header| header.peer).collect();
+    let forwarded =
+        DatagramBatch::from_parts(forwarded_headers, kept_bytes).ok_or(Error::InvalidArgument)?;
+    let mut denied = Vec::new();
     if !forwarded.is_empty() {
-        let (indices, datagrams): (Vec<u32>, Vec<Datagram>) = forwarded.into_iter().unzip();
-        let peers = datagrams
-            .iter()
-            .map(|datagram| datagram.peer)
-            .collect::<Vec<_>>();
-        for SendFailure { index, error } in flow.send(datagrams).await? {
+        for SendFailure { index, error } in flow.send(forwarded).await? {
             let position = index as usize;
-            let (Some(&guest_index), Some(&peer)) = (indices.get(position), peers.get(position))
+            let (Some(&guest_index), Some(&peer)) =
+                (guest_indices.get(position), peers.get(position))
             else {
                 return Err(Error::Io);
             };
@@ -854,7 +899,7 @@ mod tests {
     use super::*;
     use std::time::Duration;
     use terra_network::config::{Config, Network, PublishedListener};
-    use terra_protocol::network::MAX_NETWORK_READ_BYTES;
+    use terra_protocol::network::{MAX_NETWORK_DATAGRAM_BYTES, MAX_NETWORK_READ_BYTES};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
@@ -1247,37 +1292,42 @@ mod tests {
             let flow = client.open_udp().await.unwrap();
             let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let denied: SocketAddr = "192.0.2.1:9".parse().unwrap();
-            let to = |address: SocketAddr, bytes: Vec<u8>| BrokerDatagram {
-                peer: SocketAddress {
-                    address: ip_address(address.ip()),
-                    port: address.port(),
-                },
-                bytes,
+            let to = |address: SocketAddr| SocketAddress {
+                address: ip_address(address.ip()),
+                port: address.port(),
             };
-            let mapped = BrokerDatagram {
-                peer: SocketAddress {
-                    address: IpAddress::Ipv6(
-                        "::ffff:127.0.0.1"
-                            .parse::<Ipv6Addr>()
-                            .unwrap()
-                            .segments()
-                            .into(),
-                    ),
-                    port: 9,
-                },
-                bytes: vec![],
+            let mapped = SocketAddress {
+                address: IpAddress::Ipv6(
+                    "::ffff:127.0.0.1"
+                        .parse::<Ipv6Addr>()
+                        .unwrap()
+                        .segments()
+                        .into(),
+                ),
+                port: 9,
+            };
+            let target_address = to(target.local_addr().unwrap());
+            let mut bytes = vec![1, 2];
+            bytes.extend([0; MAX_NETWORK_DATAGRAM_BYTES + 1]);
+            let header = |peer, length| BrokerDatagramHeader {
+                peer,
+                length,
+                segment: 0,
             };
             let (failures, denied_peers) = send_datagrams(
                 &flow,
-                vec![
-                    mapped,
-                    to(denied, vec![1]),
-                    to(target.local_addr().unwrap(), vec![2]),
-                    to(
-                        target.local_addr().unwrap(),
-                        vec![0; MAX_NETWORK_DATAGRAM_BYTES + 1],
-                    ),
-                ],
+                BrokerDatagramBatch {
+                    headers: vec![
+                        header(mapped, 0),
+                        header(to(denied), 1),
+                        header(target_address, 1),
+                        header(
+                            target_address,
+                            u16::try_from(MAX_NETWORK_DATAGRAM_BYTES + 1).unwrap(),
+                        ),
+                    ],
+                    bytes,
+                },
             )
             .await
             .unwrap();
@@ -1294,6 +1344,124 @@ mod tests {
             let mut received = [0; 4];
             let (length, _) = target.recv_from(&mut received).await.unwrap();
             assert_eq!(&received[..length], [2]);
+            client.disconnect();
+        })
+        .await;
+    }
+
+    /// A segmented entry is checked and reported as one entry; a bad one fails alone by its index
+    /// while the valid segmented entry still arrives as separate datagrams.
+    #[tokio::test]
+    async fn send_to_forwards_segmented_entries_and_fails_invalid_ones_by_index() {
+        bounded(async {
+            let client = broker_client(vec![]);
+            let flow = client.open_udp().await.unwrap();
+            let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let denied: SocketAddr = "192.0.2.1:9".parse().unwrap();
+            let to = |address: SocketAddr| SocketAddress {
+                address: ip_address(address.ip()),
+                port: address.port(),
+            };
+            let target_address = to(target.local_addr().unwrap());
+            let header = |peer, length, segment| BrokerDatagramHeader {
+                peer,
+                length,
+                segment,
+            };
+            let mut bytes = vec![0; 4];
+            bytes.extend([1; 2500]);
+            bytes.extend([2; 6000]);
+            bytes.extend([3; 3000]);
+            bytes.extend([4; 5]);
+            let (failures, denied_peers) = send_datagrams(
+                &flow,
+                BrokerDatagramBatch {
+                    headers: vec![
+                        header(target_address, 4, 5000),
+                        header(target_address, 2500, 1000),
+                        header(target_address, 6000, 5000),
+                        header(to(denied), 3000, 1000),
+                        header(target_address, 5, 0),
+                    ],
+                    bytes,
+                },
+            )
+            .await
+            .unwrap();
+            let failures: Vec<_> = failures.into_iter().map(|f| (f.index, f.error)).collect();
+            assert_eq!(
+                failures,
+                vec![
+                    (0, BrokerError::InvalidArgument),
+                    (2, BrokerError::InvalidArgument),
+                    (3, BrokerError::AccessDenied),
+                ]
+            );
+            assert_eq!(denied_peers, vec![denied]);
+            let mut received = [0; 2000];
+            for expected in [(1000, 1), (1000, 1), (500, 1), (5, 4)] {
+                let (length, _) = target.recv_from(&mut received).await.unwrap();
+                assert_eq!(length, expected.0);
+                assert!(received[..length].iter().all(|byte| *byte == expected.1));
+            }
+            client.disconnect();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn send_to_rejects_malformed_batches_as_a_whole() {
+        bounded(async {
+            let client = broker_client(vec![]);
+            let flow = client.open_udp().await.unwrap();
+            let peer = SocketAddress {
+                address: IpAddress::Ipv4((127, 0, 0, 1)),
+                port: 9,
+            };
+            let header = |length| BrokerDatagramHeader {
+                peer,
+                length,
+                segment: 0,
+            };
+            for (headers, bytes) in [
+                (vec![header(2)], vec![0]),
+                (vec![header(1)], vec![0, 0]),
+                (vec![], vec![0]),
+                (vec![header(0); MAX_NETWORK_DATAGRAMS + 1], vec![]),
+                (vec![header(4096); 16], vec![0; 16 * 4096]),
+            ] {
+                assert_eq!(
+                    send_datagrams(&flow, BrokerDatagramBatch { headers, bytes })
+                        .await
+                        .err(),
+                    Some(Error::InvalidArgument)
+                );
+            }
+            let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let target_address = ip_address(target.local_addr().unwrap().ip());
+            let to_target = BrokerDatagramHeader {
+                peer: SocketAddress {
+                    address: target_address,
+                    port: target.local_addr().unwrap().port(),
+                },
+                length: 1,
+                segment: 0,
+            };
+            let (failures, denied_peers) = send_datagrams(
+                &flow,
+                BrokerDatagramBatch {
+                    headers: vec![to_target, to_target],
+                    bytes: vec![5, 6],
+                },
+            )
+            .await
+            .unwrap();
+            assert!(failures.is_empty() && denied_peers.is_empty());
+            let mut received = [0; 4];
+            for expected in [5, 6] {
+                let (length, _) = target.recv_from(&mut received).await.unwrap();
+                assert_eq!(&received[..length], [expected]);
+            }
             client.disconnect();
         })
         .await;

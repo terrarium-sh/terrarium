@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use terra_policy::BoxPolicy;
 use terra_protocol::network::{ListenerGrant, Open, Opened};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt};
@@ -26,7 +26,7 @@ use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt};
 pub struct Broker {
     policy: Arc<BoxPolicy>,
     listeners: BTreeMap<ListenerGrant, Arc<TcpListener>>,
-    udp_listeners: BTreeMap<ListenerGrant, Arc<UdpSocket>>,
+    udp_listeners: BTreeMap<ListenerGrant, Arc<udp::OffloadSocket>>,
     max_resources: usize,
 }
 
@@ -34,7 +34,7 @@ pub struct Broker {
 struct Shared {
     policy: Arc<BoxPolicy>,
     listeners: BTreeMap<ListenerGrant, Arc<TcpListener>>,
-    udp_listeners: BTreeMap<ListenerGrant, Arc<UdpSocket>>,
+    udp_listeners: BTreeMap<ListenerGrant, Arc<udp::OffloadSocket>>,
     resources: Arc<Semaphore>,
     dns_requests: Arc<Semaphore>,
     resolvers: Arc<Semaphore>,

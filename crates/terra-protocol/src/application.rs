@@ -11,9 +11,20 @@ pub const VERSION: u16 = 1;
 pub const HEADER_BYTES: usize = 8;
 const DNS_PREFIX_BYTES: usize = 8;
 const STATUS_BYTES: usize = 4;
-const ENDPOINT_BYTES: usize = 20;
+pub(crate) const ENDPOINT_BYTES: usize = 20;
 pub const MAX_PAYLOAD_BYTES: usize = ENDPOINT_BYTES + socket::MAX_DATAGRAM_BYTES;
 pub const MAX_FRAME_BYTES: usize = HEADER_BYTES + MAX_PAYLOAD_BYTES;
+pub(crate) const UDP_SEGMENT_HEADER_BYTES: usize = 4;
+/// Segments one UDP frame may carry, matching the kernel's UDP GSO and GRO limit.
+pub const MAX_DATAGRAM_SEGMENTS: usize = 64;
+/// Largest UDP frame: the guest carrier buffer and the host flow upstream buffer are both this size.
+pub const MAX_UDP_FRAME_BYTES: usize = 64 * 1024;
+/// Largest datagram run one UDP frame can carry.
+pub const MAX_UDP_RUN_BYTES: usize =
+    MAX_UDP_FRAME_BYTES - HEADER_BYTES - ENDPOINT_BYTES - UDP_SEGMENT_HEADER_BYTES;
+const MAX_UDP_PAYLOAD_BYTES: usize = MAX_UDP_FRAME_BYTES - HEADER_BYTES;
+const _: () = assert!(MAX_UDP_FRAME_BYTES == crate::vsock::FLOW_UPSTREAM_BYTES);
+const _: () = assert!(MAX_UDP_FRAME_BYTES <= crate::vsock::FLOW_REPLY_BYTES);
 pub const MAX_OPENING_BYTES: usize = 64;
 pub const OPEN_TIMEOUT_SECS: u64 = 30;
 /// Concurrent DNS queries the agent may have outstanding on the control stream.
@@ -82,6 +93,23 @@ impl Opcode {
             | Self::PublicationUdp => Direction::HostToGuest,
         }
     }
+
+    const fn max_payload_bytes(self) -> usize {
+        match self {
+            Self::UdpSend | Self::UdpDatagram => MAX_UDP_PAYLOAD_BYTES,
+            Self::TcpOpen
+            | Self::UdpOpen
+            | Self::Hello
+            | Self::DnsQuery
+            | Self::TcpOpened
+            | Self::UdpOpened
+            | Self::UdpError
+            | Self::Ready
+            | Self::DnsResult
+            | Self::Publication
+            | Self::PublicationUdp => MAX_PAYLOAD_BYTES,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,12 +151,15 @@ pub enum Message {
     TcpOpened(Result<SocketAddr, ProtocolError>),
     UdpOpen,
     UdpOpened(Result<(), ProtocolError>),
+    /// One datagram when `segment` is 0, else equal `segment`-byte datagrams, the last possibly shorter.
     UdpSend {
         peer: SocketAddr,
+        segment: u16,
         bytes: Vec<u8>,
     },
     UdpDatagram {
         peer: SocketAddr,
+        segment: u16,
         bytes: Vec<u8>,
     },
     UdpError {
@@ -212,10 +243,16 @@ impl Message {
                 frame.extend_from_slice(&0_u16.to_le_bytes());
             }
             Self::UdpOpened(outcome) => append_status(&mut frame, outcome.err()),
-            Self::UdpSend { peer, bytes } | Self::UdpDatagram { peer, bytes } => {
-                encode_peer(&mut frame, *peer)?;
-                frame.extend_from_slice(datagram(bytes)?);
+            Self::UdpSend {
+                peer,
+                segment,
+                bytes,
             }
+            | Self::UdpDatagram {
+                peer,
+                segment,
+                bytes,
+            } => append_udp_body(&mut frame, *peer, *segment, bytes)?,
             Self::UdpError { peer, error } => {
                 append_status(&mut frame, Some(*error));
                 encode_peer(&mut frame, *peer)?;
@@ -237,38 +274,18 @@ impl Message {
                 }
             }
         }
-        let length =
-            u32::try_from(frame.len() - HEADER_BYTES).map_err(|_| ErrorCode::LimitExceeded)?;
-        frame[..2].copy_from_slice(&(self.opcode() as u16).to_le_bytes());
-        frame[4..HEADER_BYTES].copy_from_slice(&length.to_le_bytes());
+        seal_frame(&mut frame, self.opcode())?;
         Ok(frame)
     }
 
     /// Return the next complete frame and its encoded length, or `Ok(None)` while more bytes are needed.
     pub fn decode(bytes: &[u8], direction: Direction) -> Result<Option<(Self, usize)>, ErrorCode> {
-        let Some(header) = bytes.get(..HEADER_BYTES) else {
-            return Ok(None);
-        };
-        let opcode = Opcode::try_from(u16::from_le_bytes([header[0], header[1]]))?;
-        if header[2..4] != [0, 0] {
-            return Err(ErrorCode::InvalidFrame);
-        }
-        if opcode.direction() != direction {
-            return Err(ErrorCode::WrongDirection);
-        }
-        let length = usize::try_from(u32::from_le_bytes([
-            header[4], header[5], header[6], header[7],
-        ]))
-        .map_err(|_| ErrorCode::LimitExceeded)?;
-        if length > MAX_PAYLOAD_BYTES {
-            return Err(ErrorCode::LimitExceeded);
-        }
-        let Some(payload) = bytes.get(HEADER_BYTES..HEADER_BYTES + length) else {
+        let Some(frame) = split_frame(bytes, direction, None)? else {
             return Ok(None);
         };
         Ok(Some((
-            Self::decode_payload(opcode, payload)?,
-            HEADER_BYTES + length,
+            Self::decode_payload(frame.opcode, frame.payload)?,
+            frame.frame_bytes,
         )))
     }
 
@@ -315,12 +332,20 @@ impl Message {
             }
             Opcode::UdpOpened => Self::UdpOpened(body.status()?.map_or(Ok(()), Err)),
             Opcode::UdpSend | Opcode::UdpDatagram => {
-                let peer = body.peer()?;
-                let bytes = datagram(body.remaining())?.to_vec();
+                let (peer, segment, bytes) = udp_body(&mut body)?;
+                let bytes = bytes.to_vec();
                 if opcode == Opcode::UdpSend {
-                    Self::UdpSend { peer, bytes }
+                    Self::UdpSend {
+                        peer,
+                        segment,
+                        bytes,
+                    }
                 } else {
-                    Self::UdpDatagram { peer, bytes }
+                    Self::UdpDatagram {
+                        peer,
+                        segment,
+                        bytes,
+                    }
                 }
             }
             Opcode::UdpError => {
@@ -365,6 +390,134 @@ impl Message {
     }
 }
 
+struct SplitFrame<'a> {
+    opcode: Opcode,
+    payload: &'a [u8],
+    frame_bytes: usize,
+}
+
+/// A guest UDP send frame; `segment` is 0 for a single datagram.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UdpSendFrame<'a> {
+    pub peer: SocketAddr,
+    pub segment: u16,
+    pub bytes: &'a [u8],
+    pub frame_bytes: usize,
+}
+
+/// Splits off the next complete frame; `Ok(None)` while more bytes are needed. With `only`, any
+/// other opcode is rejected as soon as its header is whole.
+fn split_frame<'a>(
+    bytes: &'a [u8],
+    direction: Direction,
+    only: Option<&[Opcode]>,
+) -> Result<Option<SplitFrame<'a>>, ErrorCode> {
+    let Some(header) = bytes.get(..HEADER_BYTES) else {
+        return Ok(None);
+    };
+    let opcode = Opcode::try_from(u16::from_le_bytes([header[0], header[1]]))?;
+    if header[2..4] != [0, 0] {
+        return Err(ErrorCode::InvalidFrame);
+    }
+    if opcode.direction() != direction {
+        return Err(ErrorCode::WrongDirection);
+    }
+    if only.is_some_and(|only| !only.contains(&opcode)) {
+        return Err(ErrorCode::InvalidFrame);
+    }
+    let length = usize::try_from(u32::from_le_bytes([
+        header[4], header[5], header[6], header[7],
+    ]))
+    .map_err(|_| ErrorCode::LimitExceeded)?;
+    if length > opcode.max_payload_bytes() {
+        return Err(ErrorCode::LimitExceeded);
+    }
+    Ok(bytes
+        .get(HEADER_BYTES..HEADER_BYTES + length)
+        .map(|payload| SplitFrame {
+            opcode,
+            payload,
+            frame_bytes: HEADER_BYTES + length,
+        }))
+}
+
+/// Borrowed [`Message::decode`] of a guest `UdpSend` frame; any other frame is an error.
+pub fn decode_udp_send(bytes: &[u8]) -> Result<Option<UdpSendFrame<'_>>, ErrorCode> {
+    let Some(frame) = split_frame(bytes, Direction::GuestToHost, Some(&[Opcode::UdpSend]))? else {
+        return Ok(None);
+    };
+    let (peer, segment, bytes) = udp_body(&mut Body(frame.payload))?;
+    Ok(Some(UdpSendFrame {
+        peer,
+        segment,
+        bytes,
+        frame_bytes: frame.frame_bytes,
+    }))
+}
+
+/// Appends one host-to-guest `UdpDatagram` frame to `out`, leaving `out` unchanged on error.
+pub fn append_udp_datagram(
+    out: &mut Vec<u8>,
+    peer: SocketAddr,
+    segment: u16,
+    bytes: &[u8],
+) -> Result<(), ErrorCode> {
+    let start = out.len();
+    out.resize(start + HEADER_BYTES, 0);
+    let sealed = append_udp_body(out, peer, segment, bytes)
+        .and_then(|()| seal_frame(&mut out[start..], Opcode::UdpDatagram));
+    if sealed.is_err() {
+        out.truncate(start);
+    }
+    sealed
+}
+
+/// Appends endpoint, segment field and data. A `segment` that does not split `bytes` into more
+/// than one datagram is written as 0, so every datagram has one encoding.
+fn append_udp_body(
+    frame: &mut Vec<u8>,
+    peer: SocketAddr,
+    segment: u16,
+    bytes: &[u8],
+) -> Result<(), ErrorCode> {
+    let segment = if bytes.len() > usize::from(segment) {
+        segment
+    } else {
+        0
+    };
+    let data = udp_data(bytes, segment)?;
+    encode_peer(frame, peer)?;
+    frame.extend_from_slice(&segment.to_le_bytes());
+    frame.extend_from_slice(&0_u16.to_le_bytes());
+    frame.extend_from_slice(data);
+    Ok(())
+}
+
+fn udp_body<'a>(body: &mut Body<'a>) -> Result<(SocketAddr, u16, &'a [u8]), ErrorCode> {
+    let peer = body.peer()?;
+    let segment = body.u16()?;
+    if body.u16()? != 0 {
+        return Err(ErrorCode::InvalidFrame);
+    }
+    Ok((peer, segment, udp_data(body.remaining(), segment)?))
+}
+
+fn udp_data(bytes: &[u8], segment: u16) -> Result<&[u8], ErrorCode> {
+    if segment == 0 {
+        datagram(bytes)
+    } else {
+        segmented(bytes, segment)
+    }
+}
+
+/// Fills the opcode and payload length of the frame that starts at `frame[0]`.
+fn seal_frame(frame: &mut [u8], opcode: Opcode) -> Result<(), ErrorCode> {
+    let length = u32::try_from(frame.len() - HEADER_BYTES).map_err(|_| ErrorCode::LimitExceeded)?;
+    frame[..2].copy_from_slice(&(opcode as u16).to_le_bytes());
+    frame[4..HEADER_BYTES].copy_from_slice(&length.to_le_bytes());
+    Ok(())
+}
+
 /// Bounded reassembly for frame streams whose reads may split or combine frames.
 #[derive(Default)]
 pub struct StreamDecoder {
@@ -374,7 +527,7 @@ pub struct StreamDecoder {
 impl StreamDecoder {
     #[must_use]
     pub fn remaining_capacity(&self) -> usize {
-        MAX_FRAME_BYTES.saturating_sub(self.bytes.len())
+        MAX_UDP_FRAME_BYTES.saturating_sub(self.bytes.len())
     }
 
     pub fn push(&mut self, bytes: &[u8]) -> Result<(), ErrorCode> {
@@ -446,6 +599,25 @@ fn datagram(bytes: &[u8]) -> Result<&[u8], ErrorCode> {
         return Err(ErrorCode::LimitExceeded);
     }
     Ok(bytes)
+}
+
+/// Whether `length` bytes split into `segment`-byte datagrams, the last possibly shorter, that
+/// fit one UDP frame.
+#[must_use]
+pub const fn is_valid_segmented_run(length: usize, segment: usize) -> bool {
+    segment >= 1
+        && segment <= socket::MAX_DATAGRAM_BYTES
+        && length > segment
+        && length <= MAX_UDP_RUN_BYTES
+        && length.div_ceil(segment) <= MAX_DATAGRAM_SEGMENTS
+}
+
+fn segmented(bytes: &[u8], segment: u16) -> Result<&[u8], ErrorCode> {
+    if is_valid_segmented_run(bytes.len(), usize::from(segment)) {
+        Ok(bytes)
+    } else {
+        Err(ErrorCode::InvalidFrame)
+    }
 }
 
 fn dns(bytes: &[u8], stream: bool) -> Result<&[u8], ErrorCode> {
@@ -588,6 +760,7 @@ mod tests {
     #[test]
     fn udp_datagram_wire_layout_pins_header_endpoint_and_payload() {
         let frame = Message::UdpDatagram {
+            segment: 0,
             peer: "192.0.2.1:48879".parse().unwrap(),
             bytes: vec![0xaa, 0xbb],
         }
@@ -596,8 +769,8 @@ mod tests {
         assert_eq!(
             frame,
             [
-                0x03, 0x01, 0, 0, 22, 0, 0, 0, 4, 0, 0xef, 0xbe, 192, 0, 2, 1, 0, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 0xaa, 0xbb,
+                0x03, 0x01, 0, 0, 26, 0, 0, 0, 4, 0, 0xef, 0xbe, 192, 0, 2, 1, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0xaa, 0xbb,
             ]
         );
     }
@@ -620,12 +793,24 @@ mod tests {
             Message::UdpOpened(Ok(())),
             Message::UdpOpened(Err(ProtocolError::LimitExceeded)),
             Message::UdpSend {
+                segment: 0,
                 peer,
                 bytes: vec![42; socket::MAX_DATAGRAM_BYTES],
             },
             Message::UdpDatagram {
+                segment: 0,
                 peer,
                 bytes: Vec::new(),
+            },
+            Message::UdpSend {
+                peer,
+                segment: 1024,
+                bytes: vec![1; MAX_UDP_RUN_BYTES],
+            },
+            Message::UdpDatagram {
+                peer,
+                segment: 1,
+                bytes: vec![2; 64],
             },
             Message::UdpError {
                 peer,
@@ -730,6 +915,7 @@ mod tests {
         );
         assert!(
             Message::UdpSend {
+                segment: 0,
                 peer: "127.0.0.1:1".parse().unwrap(),
                 bytes: vec![0; socket::MAX_DATAGRAM_BYTES + 1],
             }
@@ -759,9 +945,383 @@ mod tests {
         }
     }
 
+    fn send_frame(
+        peer: SocketAddr,
+        segment: u16,
+        bytes: &[u8],
+        frame_bytes: usize,
+    ) -> UdpSendFrame<'_> {
+        UdpSendFrame {
+            peer,
+            segment,
+            bytes,
+            frame_bytes,
+        }
+    }
+
+    #[test]
+    fn borrowed_udp_codecs_agree_with_message() {
+        let peer: SocketAddr = "[2001:db8::1]:53".parse().unwrap();
+        let direction = Direction::GuestToHost;
+        for payload in [vec![], vec![1, 2, 3], vec![9; socket::MAX_DATAGRAM_BYTES]] {
+            let message = Message::UdpSend {
+                segment: 0,
+                peer,
+                bytes: payload.clone(),
+            };
+            let frame = message.encode().unwrap();
+            assert_eq!(
+                decode_udp_send(&frame),
+                Ok(Some(send_frame(peer, 0, &payload, frame.len())))
+            );
+            for length in 0..frame.len() {
+                assert_eq!(decode_udp_send(&frame[..length]), Ok(None));
+            }
+            let mut coalesced = frame.clone();
+            coalesced.extend_from_slice(&frame);
+            assert_eq!(
+                decode_udp_send(&coalesced),
+                Ok(Some(send_frame(peer, 0, &payload, frame.len())))
+            );
+            let mut sent = Vec::new();
+            append_udp_datagram(&mut sent, peer, 0, &payload).unwrap();
+            let datagram = Message::UdpDatagram {
+                segment: 0,
+                peer,
+                bytes: payload,
+            };
+            assert_eq!(sent, datagram.encode().unwrap());
+        }
+        for message in [Message::Hello, Message::UdpOpen] {
+            let frame = message.encode().unwrap();
+            assert!(Message::decode(&frame, direction).is_ok());
+            assert_eq!(decode_udp_send(&frame), Err(ErrorCode::InvalidFrame));
+        }
+        let datagram = Message::UdpDatagram {
+            segment: 0,
+            peer,
+            bytes: vec![1],
+        }
+        .encode()
+        .unwrap();
+        assert_eq!(
+            decode_udp_send(&datagram),
+            Err(Message::decode(&datagram, direction).unwrap_err())
+        );
+        let mut oversized = Message::UdpSend {
+            segment: 0,
+            peer,
+            bytes: vec![0; 4],
+        }
+        .encode()
+        .unwrap();
+        oversized.resize(
+            HEADER_BYTES
+                + ENDPOINT_BYTES
+                + UDP_SEGMENT_HEADER_BYTES
+                + socket::MAX_DATAGRAM_BYTES
+                + 1,
+            0,
+        );
+        let length = u32::try_from(oversized.len() - HEADER_BYTES).unwrap();
+        oversized[4..HEADER_BYTES].copy_from_slice(&length.to_le_bytes());
+        assert_eq!(
+            decode_udp_send(&oversized),
+            Message::decode(&oversized, direction).map(|_| None)
+        );
+        assert!(decode_udp_send(&oversized).is_err());
+        let mut failed = vec![5];
+        assert!(
+            append_udp_datagram(
+                &mut failed,
+                peer,
+                0,
+                &vec![0; socket::MAX_DATAGRAM_BYTES + 1]
+            )
+            .is_err()
+        );
+        assert_eq!(failed, [5]);
+    }
+
+    #[test]
+    fn segmented_frames_pin_layout_and_the_frame_cap() {
+        let peer: SocketAddr = "192.0.2.1:48879".parse().unwrap();
+        let frame = Message::UdpSend {
+            peer,
+            segment: 2,
+            bytes: vec![0xaa, 0xbb, 0xcc],
+        }
+        .encode()
+        .unwrap();
+        assert_eq!(
+            frame,
+            [
+                0x03, 0, 0, 0, 27, 0, 0, 0, 4, 0, 0xef, 0xbe, 192, 0, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 2, 0, 0, 0, 0xaa, 0xbb, 0xcc,
+            ]
+        );
+        let largest = Message::UdpDatagram {
+            peer: "[ffff::ffff]:65535".parse().unwrap(),
+            segment: 4096,
+            bytes: vec![0; MAX_UDP_RUN_BYTES],
+        }
+        .encode()
+        .unwrap();
+        assert_eq!(largest.len(), MAX_UDP_FRAME_BYTES);
+    }
+
+    #[test]
+    fn segmented_frames_reject_invalid_runs_on_encode_and_decode() {
+        let peer: SocketAddr = "192.0.2.1:9".parse().unwrap();
+        let encode = |segment, length| {
+            Message::UdpSend {
+                peer,
+                segment,
+                bytes: vec![0; length],
+            }
+            .encode()
+        };
+        assert!(encode(1, 2).is_ok());
+        for (segment, length) in [(4097, 8194), (1, 65), (1000, MAX_UDP_RUN_BYTES + 1)] {
+            assert_eq!(
+                encode(segment, length),
+                Err(ErrorCode::InvalidFrame),
+                "{segment} {length}"
+            );
+        }
+        let valid = encode(100, 250).unwrap();
+        let decode = |frame: &[u8]| Message::decode(frame, Direction::GuestToHost);
+        assert!(decode(&valid).is_ok());
+        for (offset, value) in [(29, 0x10), (30, 1), (31, 1)] {
+            let mut forged = valid.clone();
+            forged[offset] = value;
+            assert_eq!(decode(&forged), Err(ErrorCode::InvalidFrame), "{offset}");
+        }
+        let mut oversized = valid.clone();
+        oversized.resize(MAX_UDP_FRAME_BYTES + 1, 0);
+        let payload = u32::try_from(oversized.len() - HEADER_BYTES).unwrap();
+        oversized[4..HEADER_BYTES].copy_from_slice(&payload.to_le_bytes());
+        assert_eq!(decode(&oversized), Err(ErrorCode::LimitExceeded));
+        let mut plain_oversized = Message::UdpSend {
+            peer,
+            segment: 0,
+            bytes: vec![],
+        }
+        .encode()
+        .unwrap();
+        plain_oversized.resize(
+            HEADER_BYTES
+                + ENDPOINT_BYTES
+                + UDP_SEGMENT_HEADER_BYTES
+                + socket::MAX_DATAGRAM_BYTES
+                + 1,
+            0,
+        );
+        let payload = u32::try_from(plain_oversized.len() - HEADER_BYTES).unwrap();
+        plain_oversized[4..HEADER_BYTES].copy_from_slice(&payload.to_le_bytes());
+        assert_eq!(decode(&plain_oversized), Err(ErrorCode::LimitExceeded));
+        for noncanonical_segment in [250_u16, 251, 4096] {
+            let mut forged = valid.clone();
+            forged[28..30].copy_from_slice(&noncanonical_segment.to_le_bytes());
+            assert_eq!(decode(&forged), Err(ErrorCode::InvalidFrame));
+        }
+        assert_eq!(
+            Message::decode(&valid, Direction::HostToGuest),
+            Err(ErrorCode::WrongDirection)
+        );
+    }
+
+    #[test]
+    fn borrowed_codecs_handle_segmented_frames_like_message() {
+        let peer: SocketAddr = "[2001:db8::1]:53".parse().unwrap();
+        for (segment, length) in [(1_u16, 2_usize), (1000, 1001), (4096, 65_504), (7, 64 * 7)] {
+            let bytes = vec![9; length];
+            let sent = Message::UdpSend {
+                peer,
+                segment,
+                bytes: bytes.clone(),
+            }
+            .encode()
+            .unwrap();
+            assert_eq!(
+                decode_udp_send(&sent),
+                Ok(Some(send_frame(peer, segment, &bytes, sent.len())))
+            );
+            for cut in 0..sent.len().min(64) {
+                assert_eq!(decode_udp_send(&sent[..cut]), Ok(None));
+            }
+            let mut appended = Vec::new();
+            append_udp_datagram(&mut appended, peer, segment, &bytes).unwrap();
+            assert_eq!(
+                appended,
+                Message::UdpDatagram {
+                    peer,
+                    segment,
+                    bytes
+                }
+                .encode()
+                .unwrap()
+            );
+        }
+        for (segment, length) in [(0, 100), (100, 100), (100, 50), (5000, 10)] {
+            let mut appended = Vec::new();
+            append_udp_datagram(&mut appended, peer, segment, &vec![1; length]).unwrap();
+            assert_eq!(
+                appended,
+                Message::UdpDatagram {
+                    segment: 0,
+                    peer,
+                    bytes: vec![1; length]
+                }
+                .encode()
+                .unwrap()
+            );
+        }
+        let mut failed = vec![5];
+        for (segment, length) in [(100, 65_505), (0, 4097), (5000, 5001)] {
+            assert!(append_udp_datagram(&mut failed, peer, segment, &vec![0; length]).is_err());
+        }
+        assert_eq!(failed, [5]);
+        let datagram = Message::UdpDatagram {
+            peer,
+            segment: 1,
+            bytes: vec![1, 2],
+        }
+        .encode()
+        .unwrap();
+        assert_eq!(
+            decode_udp_send(&datagram),
+            Err(Message::decode(&datagram, Direction::GuestToHost).unwrap_err())
+        );
+        let mut forged = Message::UdpSend {
+            peer,
+            segment: 1,
+            bytes: vec![1, 2],
+        }
+        .encode()
+        .unwrap();
+        forged[30] = 1;
+        assert_eq!(decode_udp_send(&forged), Err(ErrorCode::InvalidFrame));
+    }
+
+    #[test]
+    fn udp_frames_carry_one_datagram_at_segment_zero_including_empty_and_largest() {
+        let peer: SocketAddr = "192.0.2.1:9".parse().unwrap();
+        for length in [0, 1, socket::MAX_DATAGRAM_BYTES] {
+            let sent = Message::UdpSend {
+                peer,
+                segment: 0,
+                bytes: vec![7; length],
+            };
+            round_trip(&sent);
+            let datagram = Message::UdpDatagram {
+                peer,
+                segment: 0,
+                bytes: vec![7; length],
+            };
+            round_trip(&datagram);
+        }
+        for run in [(1, 2), (4096, 4097), (1024, MAX_UDP_RUN_BYTES), (1, 64)] {
+            round_trip(&Message::UdpDatagram {
+                peer,
+                segment: run.0,
+                bytes: vec![1; run.1],
+            });
+        }
+        let too_large = Message::UdpSend {
+            peer,
+            segment: 0,
+            bytes: vec![0; socket::MAX_DATAGRAM_BYTES + 1],
+        };
+        assert_eq!(too_large.encode(), Err(ErrorCode::LimitExceeded));
+    }
+
+    #[test]
+    fn encode_and_append_write_segment_zero_when_the_run_is_one_datagram() {
+        let peer: SocketAddr = "192.0.2.1:9".parse().unwrap();
+        for (segment, length) in [(100, 100), (100, 50), (5000, 10), (1, 0), (1, 1)] {
+            let bytes = vec![1; length];
+            let canonical = Message::UdpDatagram {
+                peer,
+                segment: 0,
+                bytes: bytes.clone(),
+            }
+            .encode()
+            .unwrap();
+            let mut appended = Vec::new();
+            append_udp_datagram(&mut appended, peer, segment, &bytes).unwrap();
+            assert_eq!(appended, canonical);
+            let encoded = Message::UdpDatagram {
+                peer,
+                segment,
+                bytes,
+            }
+            .encode()
+            .unwrap();
+            assert_eq!(encoded, canonical);
+        }
+    }
+
+    #[test]
+    fn the_retired_segmented_opcodes_are_unknown() {
+        for (opcode, direction) in [
+            (0x06_u16, Direction::GuestToHost),
+            (0x109, Direction::HostToGuest),
+        ] {
+            let mut frame = vec![0; HEADER_BYTES];
+            frame[..2].copy_from_slice(&opcode.to_le_bytes());
+            assert_eq!(
+                Message::decode(&frame, direction),
+                Err(ErrorCode::UnknownOpcode)
+            );
+        }
+    }
+
+    #[test]
+    fn only_udp_frames_may_exceed_the_ordinary_payload_limit() {
+        let peer: SocketAddr = "192.0.2.1:9".parse().unwrap();
+        let big = MAX_PAYLOAD_BYTES + 1;
+        let udp = Message::UdpDatagram {
+            peer,
+            segment: 1024,
+            bytes: vec![0; MAX_UDP_RUN_BYTES],
+        }
+        .encode()
+        .unwrap();
+        assert!(udp.len() - HEADER_BYTES > MAX_PAYLOAD_BYTES);
+        assert!(Message::decode(&udp, Direction::HostToGuest).is_ok());
+        for message in [Message::Hello, Message::Ready, Message::UdpOpen] {
+            let mut frame = message.encode().unwrap();
+            frame.resize(HEADER_BYTES + big, 0);
+            frame[4..HEADER_BYTES].copy_from_slice(&u32::try_from(big).unwrap().to_le_bytes());
+            assert_eq!(
+                Message::decode(&frame, message.opcode().direction()),
+                Err(ErrorCode::LimitExceeded)
+            );
+        }
+    }
+
+    #[test]
+    fn stream_decoder_buffers_a_whole_segmented_frame() {
+        let frame = Message::UdpDatagram {
+            peer: "127.0.0.1:9".parse().unwrap(),
+            segment: 4096,
+            bytes: vec![3; MAX_UDP_RUN_BYTES],
+        };
+        let bytes = frame.encode().unwrap();
+        let mut decoder = StreamDecoder::default();
+        for chunk in bytes.chunks(10_000) {
+            assert_eq!(decoder.next(Direction::HostToGuest), Ok(None));
+            decoder.push(chunk).unwrap();
+        }
+        assert_eq!(decoder.next(Direction::HostToGuest), Ok(Some(frame)));
+        assert!(decoder.is_empty());
+    }
+
     #[test]
     fn stream_decoder_handles_split_coalesced_and_hostile_frames_with_bounded_storage() {
         let first = Message::UdpDatagram {
+            segment: 0,
             peer: "127.0.0.1:9".parse().unwrap(),
             bytes: b"first".to_vec(),
         };
@@ -786,6 +1346,6 @@ mod tests {
             assert!(decoder.is_empty());
         }
         let mut decoder = StreamDecoder::default();
-        assert!(decoder.push(&vec![0; MAX_FRAME_BYTES + 1]).is_err());
+        assert!(decoder.push(&vec![0; MAX_UDP_FRAME_BYTES + 1]).is_err());
     }
 }

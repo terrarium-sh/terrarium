@@ -33,11 +33,37 @@ fn map_io_error(error: std::io::Error) -> Error {
     match error.kind() {
         std::io::ErrorKind::PermissionDenied => Error::AccessDenied,
         std::io::ErrorKind::ConnectionRefused => Error::ConnectionRefused,
-        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe => {
-            Error::ConnectionReset
-        }
+        // Winsock reports a send after the peer's reset as WSAECONNABORTED, not WSAECONNRESET.
+        std::io::ErrorKind::ConnectionReset
+        | std::io::ErrorKind::ConnectionAborted
+        | std::io::ErrorKind::BrokenPipe => Error::ConnectionReset,
         std::io::ErrorKind::TimedOut => Error::TimedOut,
         std::io::ErrorKind::InvalidInput => Error::InvalidArgument,
         _ => Error::Io,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// A peer reset fails the flow as `ConnectionReset` however the host OS spells it.
+    #[test]
+    fn peer_resets_map_to_connection_reset_on_every_host() {
+        for kind in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::BrokenPipe,
+        ] {
+            assert_eq!(
+                super::map_io_error(kind.into()),
+                super::Error::ConnectionReset
+            );
+        }
+        #[cfg(windows)]
+        assert_eq!(
+            super::map_io_error(std::io::Error::from_raw_os_error(
+                windows_sys::Win32::Networking::WinSock::WSAECONNABORTED
+            )),
+            super::Error::ConnectionReset
+        );
     }
 }

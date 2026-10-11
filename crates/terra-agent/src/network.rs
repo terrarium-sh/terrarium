@@ -816,14 +816,87 @@ async fn connect_published_udp_service(
     let socket = UdpSocket::bind((source, 0)).await?;
     rustix::net::sockopt::set_socket_recv_buffer_size(
         &socket,
-        terra_protocol::socket::MAX_DATAGRAM_BYTES,
+        terra_protocol::application::MAX_UDP_FRAME_BYTES,
     )?;
     rustix::net::sockopt::set_socket_send_buffer_size(
         &socket,
-        terra_protocol::socket::MAX_DATAGRAM_BYTES,
+        terra_protocol::application::MAX_UDP_FRAME_BYTES,
     )?;
     socket.connect(destination).await?;
     Ok(socket)
+}
+
+async fn send_publication_datagrams(
+    socket: &UdpSocket,
+    segment: u16,
+    bytes: &[u8],
+) -> io::Result<()> {
+    if segment == 0 || bytes.is_empty() {
+        return socket.send(bytes).await.map(drop);
+    }
+    for datagram in bytes.chunks(usize::from(segment)) {
+        socket.send(datagram).await?;
+    }
+    Ok(())
+}
+
+/// Takes the replies already queued on one publication socket, at most one run's worth, merging
+/// equal-size datagrams that end in at most one shorter datagram into a segmented frame as UDP GRO would.
+fn read_publication_replies(
+    socket: &UdpSocket,
+    peer: SocketAddr,
+    reply: &mut [u8],
+) -> io::Result<Vec<Message>> {
+    fn finish_run(
+        messages: &mut Vec<Message>,
+        peer: SocketAddr,
+        run: &mut Vec<u8>,
+        segment: &mut usize,
+    ) {
+        let bytes = std::mem::take(run);
+        let frame_segment = match u16::try_from(*segment) {
+            Ok(segment) if bytes.len() > usize::from(segment) => segment,
+            _ => 0,
+        };
+        messages.push(Message::UdpSend {
+            peer,
+            segment: frame_segment,
+            bytes,
+        });
+        *segment = 0;
+    }
+    let mut messages = Vec::new();
+    let mut run = Vec::new();
+    let mut segment = 0;
+    for _ in 0..terra_protocol::application::MAX_DATAGRAM_SEGMENTS {
+        let length = match socket.try_recv(reply) {
+            Ok(length) => length,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+            Err(error) if messages.is_empty() && run.is_empty() => return Err(error),
+            Err(_) => break,
+        };
+        if length > terra_protocol::socket::MAX_DATAGRAM_BYTES {
+            continue;
+        }
+        let extends_run = segment != 0
+            && length != 0
+            && length <= segment
+            && run.len() + length <= terra_protocol::application::MAX_UDP_RUN_BYTES;
+        if !extends_run {
+            if !run.is_empty() || segment != 0 {
+                finish_run(&mut messages, peer, &mut run, &mut segment);
+            }
+            segment = length;
+        }
+        run.extend_from_slice(&reply[..length]);
+        if length == 0 || length < segment {
+            finish_run(&mut messages, peer, &mut run, &mut segment);
+        }
+    }
+    if segment != 0 {
+        finish_run(&mut messages, peer, &mut run, &mut segment);
+    }
+    Ok(messages)
 }
 
 async fn relay_udp_publication(
@@ -848,8 +921,8 @@ async fn relay_udp_publication(
                 let Some(message) = message? else {
                     return Ok(());
                 };
-                let (peer, bytes) = match message {
-                    Message::UdpDatagram { peer, bytes } => (peer, bytes),
+                let (peer, segment, bytes) = match message {
+                    Message::UdpDatagram { peer, segment, bytes } => (peer, segment, bytes),
                     Message::UdpError { .. } => continue,
                     Message::TcpOpen { .. }
                     | Message::TcpOpened(_)
@@ -874,7 +947,7 @@ async fn relay_udp_publication(
                     let socket = connect_published_udp_service(source, destination).await?;
                     UdpPublicationPeer { peer, socket, expires: now + UDP_PEER_TTL }
                 };
-                if entry.socket.send(&bytes).await.is_ok() {
+                if send_publication_datagrams(&entry.socket, segment, &bytes).await.is_ok() {
                     peers.push_back(UdpPublicationPeer { expires: Instant::now() + UDP_PEER_TTL, ..entry });
                 }
             }
@@ -884,12 +957,14 @@ async fn relay_udp_publication(
                 if entry.expires <= Instant::now() {
                     continue;
                 }
-                let received = ready.and_then(|()| entry.socket.try_recv(&mut reply));
-                match received {
-                    Ok(length) if length <= terra_protocol::socket::MAX_DATAGRAM_BYTES => {
-                        let frame = Message::UdpSend { peer: entry.peer, bytes: reply[..length].to_vec() }
-                            .encode().map_err(io::Error::other)?;
-                        carrier.write_all(&frame).await?;
+                let replies = ready.and_then(|()| read_publication_replies(&entry.socket, entry.peer, &mut reply));
+                match replies {
+                    Ok(messages) if !messages.is_empty() => {
+                        let mut frames = Vec::new();
+                        for message in messages {
+                            frames.extend(message.encode().map_err(io::Error::other)?);
+                        }
+                        carrier.write_all(&frames).await?;
                         carrier.flush().await?;
                     }
                     Ok(_) => {}
@@ -1225,6 +1300,7 @@ mod tests {
         );
         assert_eq!(carrier, b"GET /");
         let datagram = Message::UdpDatagram {
+            segment: 0,
             peer,
             bytes: b"udp".to_vec(),
         }
@@ -1398,6 +1474,7 @@ mod tests {
             self.host
                 .write_all(
                     &Message::UdpDatagram {
+                        segment: 0,
                         peer,
                         bytes: bytes.to_vec(),
                     }
@@ -1421,6 +1498,7 @@ mod tests {
             let ipv4: SocketAddr = "203.0.113.9:40000".parse().unwrap();
             let ipv6: SocketAddr = "[2001:db8::9]:40001".parse().unwrap();
             let mut coalesced = Message::UdpDatagram {
+                segment: 0,
                 peer: ipv4,
                 bytes: b"\0binary\xff".to_vec(),
             }
@@ -1428,6 +1506,7 @@ mod tests {
             .unwrap();
             coalesced.extend_from_slice(
                 &Message::UdpDatagram {
+                    segment: 0,
                     peer: ipv6,
                     bytes: Vec::new(),
                 }
@@ -1452,7 +1531,11 @@ mod tests {
                 publication.service.send_to(&bytes, source).await.unwrap();
                 assert_eq!(
                     read_host_message(&mut publication.host).await,
-                    Message::UdpSend { peer, bytes }
+                    Message::UdpSend {
+                        segment: 0,
+                        peer,
+                        bytes
+                    }
                 );
             }
             let maximum = vec![0x41; terra_protocol::socket::MAX_DATAGRAM_BYTES];
@@ -1492,6 +1575,7 @@ mod tests {
             assert_eq!(
                 read_host_message(&mut publication.host).await,
                 Message::UdpSend {
+                    segment: 0,
                     peer: ipv4,
                     bytes: b"reply".to_vec()
                 }
@@ -1500,6 +1584,76 @@ mod tests {
             publication.relay.await.unwrap().unwrap().unwrap();
             assert!(std::net::UdpSocket::bind(first).is_ok());
             assert!(std::net::UdpSocket::bind(second).is_ok());
+        })
+        .await
+        .unwrap();
+    }
+
+    /// A segmented host frame reaches the service as separate datagrams, and queued service replies
+    /// return as runs of equal-size datagrams ending at most one shorter one; an empty or longer
+    /// reply ends the run.
+    #[tokio::test]
+    async fn udp_publication_carries_datagram_runs_both_ways() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut publication = TestUdpPublication::new().await;
+            let peer: SocketAddr = "203.0.113.9:40000".parse().unwrap();
+            let run: Vec<u8> = (0..2500_u32).map(|index| (index % 251) as u8).collect();
+            publication
+                .host
+                .write_all(
+                    &Message::UdpDatagram {
+                        peer,
+                        segment: 1000,
+                        bytes: run.clone(),
+                    }
+                    .encode()
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            let mut received = [0; 2000];
+            let mut source = None;
+            for expected in run.chunks(1000) {
+                let (length, from) = publication.service.recv_from(&mut received).await.unwrap();
+                assert_eq!(&received[..length], expected);
+                source = Some(from);
+            }
+            let source = source.unwrap();
+            for datagram in [
+                &run[..1000],
+                &run[1000..2000],
+                &[],
+                &run[..300],
+                &run[300..600],
+                &run[..400],
+                &run[..7],
+            ] {
+                publication.service.try_send_to(datagram, source).unwrap();
+            }
+            for expected in [
+                Message::UdpSend {
+                    peer,
+                    segment: 1000,
+                    bytes: run[..2000].to_vec(),
+                },
+                Message::UdpSend {
+                    segment: 0,
+                    peer,
+                    bytes: Vec::new(),
+                },
+                Message::UdpSend {
+                    peer,
+                    segment: 300,
+                    bytes: run[..600].to_vec(),
+                },
+                Message::UdpSend {
+                    peer,
+                    segment: 400,
+                    bytes: [&run[..400], &run[..7]].concat(),
+                },
+            ] {
+                assert_eq!(read_host_message(&mut publication.host).await, expected);
+            }
         })
         .await
         .unwrap();
@@ -1547,6 +1701,7 @@ mod tests {
         assert_eq!(
             read_host_message(&mut publication.host).await,
             Message::UdpSend {
+                segment: 0,
                 peer,
                 bytes: b"reply".to_vec()
             }
@@ -1657,6 +1812,7 @@ mod tests {
         ] {
             datagrams.extend_from_slice(
                 &Message::UdpDatagram {
+                    segment: 0,
                     peer,
                     bytes: Vec::new(),
                 }
@@ -1680,6 +1836,7 @@ mod tests {
                     .await
                     .unwrap(),
                 Message::UdpSend {
+                    segment: 0,
                     peer,
                     bytes: b"wildcard reply".to_vec()
                 }

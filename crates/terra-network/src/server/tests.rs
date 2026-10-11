@@ -11,8 +11,8 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 use terra_policy::config::{Network, StaticDnsRecord};
 use terra_protocol::network::{
-    DATAGRAM_FRAME_OVERHEAD_BYTES, Datagram, MAX_NETWORK_DATAGRAM_BATCH_BYTES,
-    MAX_NETWORK_DATAGRAM_BYTES, MAX_NETWORK_DATAGRAMS, SendFailure,
+    DatagramBatch, DatagramHeader, MAX_NETWORK_DATAGRAM_BATCH_BYTES, MAX_NETWORK_DATAGRAM_BYTES,
+    MAX_NETWORK_DATAGRAMS, SendFailure,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
@@ -569,8 +569,23 @@ async fn resolver_admission_is_released_after_a_timeout() {
     .await;
 }
 
-fn datagram(peer: SocketAddr, bytes: Vec<u8>) -> Datagram {
-    Datagram { peer, bytes }
+fn datagrams(items: impl IntoIterator<Item = (SocketAddr, Vec<u8>)>) -> DatagramBatch {
+    let mut batch = DatagramBatch::default();
+    for (peer, bytes) in items {
+        assert!(batch.push(peer, &bytes));
+    }
+    batch
+}
+
+fn datagram(peer: SocketAddr, bytes: Vec<u8>) -> DatagramBatch {
+    datagrams([(peer, bytes)])
+}
+
+fn owned(batch: &DatagramBatch) -> Vec<(SocketAddr, Vec<u8>)> {
+    batch
+        .datagrams()
+        .map(|(peer, bytes)| (peer, bytes.to_vec()))
+        .collect()
 }
 
 fn denied_at(index: u32) -> SendFailure {
@@ -588,12 +603,13 @@ async fn udp_batches_preserve_order_and_report_failures_by_index() {
         let address = socket.local_addr().unwrap();
         let (client, session) = start(&config());
         let flow = client.open_udp().await.unwrap();
-        let datagrams = [address, "192.0.2.1:9".parse().unwrap(), address]
-            .into_iter()
-            .zip(0..)
-            .map(|(peer, index)| datagram(peer, vec![index]))
-            .collect();
-        assert_eq!(flow.send(datagrams).await, Ok(vec![denied_at(1)]));
+        let batch = datagrams(
+            [address, "192.0.2.1:9".parse().unwrap(), address]
+                .into_iter()
+                .zip(0..)
+                .map(|(peer, index)| (peer, vec![index])),
+        );
+        assert_eq!(flow.send(batch).await, Ok(vec![denied_at(1)]));
         let mut bytes = [0; 8];
         let (_, peer) = socket.recv_from(&mut bytes).await.unwrap();
         assert_eq!(bytes[0], 0);
@@ -607,7 +623,7 @@ async fn udp_batches_preserve_order_and_report_failures_by_index() {
         while received.len() < usize::from(count) {
             let batch = flow.receive().await.unwrap();
             assert!(batch.len() <= MAX_NETWORK_DATAGRAMS);
-            received.extend(batch.into_iter().map(|datagram| datagram.bytes[0]));
+            received.extend(batch.datagrams().map(|(_, bytes)| bytes[0]));
         }
         assert_eq!(received, (0..count).collect::<Vec<_>>());
         drop(flow);
@@ -624,12 +640,12 @@ async fn udp_preserves_messages_and_drops_truncated_or_unsolicited_datagrams() {
         let stranger = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let (client, session) = start(&config());
         let flow = client.open_udp().await.unwrap();
-        assert_eq!(flow.send(vec![datagram(address, vec![])]).await, Ok(vec![]));
+        assert_eq!(flow.send(datagram(address, vec![])).await, Ok(vec![]));
         let mut bytes = [0; 8];
         let (length, peer) = socket.recv_from(&mut bytes).await.unwrap();
         assert_eq!(length, 0);
         socket.send_to(&[], peer).await.unwrap();
-        assert_eq!(flow.receive().await, Ok(vec![datagram(address, vec![])]));
+        assert_eq!(flow.receive().await, Ok(datagram(address, vec![])));
         stranger.send_to(b"unsolicited", peer).await.unwrap();
         for size in [
             MAX_NETWORK_DATAGRAM_BYTES + 1,
@@ -638,10 +654,7 @@ async fn udp_preserves_messages_and_drops_truncated_or_unsolicited_datagrams() {
             socket.send_to(&vec![0; size], peer).await.unwrap();
         }
         socket.send_to(b"ok", peer).await.unwrap();
-        assert_eq!(
-            flow.receive().await,
-            Ok(vec![datagram(address, b"ok".to_vec())])
-        );
+        assert_eq!(flow.receive().await, Ok(datagram(address, b"ok".to_vec())));
         drop(flow);
         finish_session(client, session).await;
     })
@@ -655,7 +668,7 @@ async fn a_cancelled_receive_leaves_its_request_for_the_next_call() {
         let address = socket.local_addr().unwrap();
         let (client, session) = start(&config());
         let flow = client.open_udp().await.unwrap();
-        flow.send(vec![datagram(address, vec![1])]).await.unwrap();
+        flow.send(datagram(address, vec![1])).await.unwrap();
         let (_, peer) = socket.recv_from(&mut [0; 8]).await.unwrap();
         assert!(
             tokio::time::timeout(Duration::from_millis(50), flow.receive())
@@ -665,7 +678,7 @@ async fn a_cancelled_receive_leaves_its_request_for_the_next_call() {
         socket.send_to(b"late", peer).await.unwrap();
         assert_eq!(
             flow.receive().await,
-            Ok(vec![datagram(address, b"late".to_vec())])
+            Ok(datagram(address, b"late".to_vec()))
         );
         assert!(client.is_available());
         drop(flow);
@@ -728,7 +741,7 @@ async fn udp_publication_grants_one_owner_and_only_received_peers() {
                 .await
                 .unwrap();
             assert_eq!(
-                flow.send(vec![datagram(peer_address, b"unsolicited".to_vec())])
+                flow.send(datagram(peer_address, b"unsolicited".to_vec()))
                     .await,
                 Ok(vec![denied_at(0)])
             );
@@ -736,10 +749,10 @@ async fn udp_publication_grants_one_owner_and_only_received_peers() {
                 peer.send_to(&bytes, published_address).await.unwrap();
                 assert_eq!(
                     flow.receive().await,
-                    Ok(vec![datagram(peer_address, bytes.clone())])
+                    Ok(datagram(peer_address, bytes.clone()))
                 );
                 assert_eq!(
-                    flow.send(vec![datagram(peer_address, bytes.clone())]).await,
+                    flow.send(datagram(peer_address, bytes.clone())).await,
                     Ok(vec![])
                 );
                 let mut response = vec![0; MAX_NETWORK_DATAGRAM_BYTES + 1];
@@ -748,16 +761,14 @@ async fn udp_publication_grants_one_owner_and_only_received_peers() {
                 assert_eq!(&response[..length], &bytes);
             }
             assert_eq!(
-                flow.send(vec![datagram(stranger.local_addr().unwrap(), vec![1])])
+                flow.send(datagram(stranger.local_addr().unwrap(), vec![1]))
                     .await,
                 Ok(vec![denied_at(0)])
             );
             drop(flow);
             let replacement = waiting_owner.await.unwrap().unwrap();
             assert_eq!(
-                replacement
-                    .send(vec![datagram(peer_address, vec![1])])
-                    .await,
+                replacement.send(datagram(peer_address, vec![1])).await,
                 Ok(vec![denied_at(0)])
             );
             drop(replacement);
@@ -778,6 +789,7 @@ fn bound_resource(publication_grant: Option<u32>) -> UdpResource {
             crate::MAX_UDP_OUTBOUND_PEERS
         }),
         publication_grant,
+        receiving: Arc::default(),
     }
 }
 
@@ -793,6 +805,7 @@ async fn udp_peer_filter_refreshes_recent_peers_and_expires_them() {
         ipv6: None,
         peers: UdpPeers::shared(crate::MAX_UDP_PUBLICATION_PEERS),
         publication_grant: Some(1),
+        receiving: Arc::default(),
     };
     let policy = test_policy();
     let first = SocketAddr::from((Ipv4Addr::LOCALHOST, 1));
@@ -851,11 +864,7 @@ async fn udp_send_rechecks_peer_expiry_after_waiting_for_socket_readiness() {
     let udp = bound_resource(Some(1));
     tokio::time::pause();
     udp.remember_peer(peer);
-    let mut send = Box::pin(send_datagrams(
-        udp,
-        test_policy(),
-        vec![datagram(peer, vec![1])],
-    ));
+    let mut send = Box::pin(send_datagrams(udp, test_policy(), datagram(peer, vec![1])));
     assert!(send.as_mut().now_or_never().is_none());
     tokio::time::advance(UDP_PEER_TTL).await;
     assert_eq!(send.await, vec![denied_at(0)]);
@@ -874,7 +883,7 @@ async fn udp_publication_replies_do_not_extend_peer_expiry() {
     udp.remember_peer(peer);
     tokio::time::advance(UDP_PEER_TTL.checked_sub(Duration::from_secs(1)).unwrap()).await;
     let policy = test_policy();
-    let reply = vec![datagram(peer, vec![1])];
+    let reply = datagram(peer, vec![1]);
     assert_eq!(
         send_datagrams(udp.clone(), policy.clone(), reply.clone()).await,
         vec![]
@@ -931,15 +940,147 @@ async fn udp_receive_retained_bytes_fit_batch_budget() {
         .await
         .unwrap()
         .unwrap();
-        assert_eq!(batch.len(), MAX_NETWORK_DATAGRAMS);
-        assert!(batch.iter().all(|datagram| datagram.bytes == payload));
-        let retained_bytes: usize = batch
-            .iter()
-            .map(|datagram| datagram.bytes.capacity() + DATAGRAM_FRAME_OVERHEAD_BYTES)
-            .sum();
-        assert!(retained_bytes <= MAX_NETWORK_DATAGRAM_BATCH_BYTES);
+        assert_eq!(batch.datagrams().count(), MAX_NETWORK_DATAGRAMS);
+        assert!(batch.datagrams().all(|(_, bytes)| bytes == payload));
+        assert!(batch.batch_bytes() <= MAX_NETWORK_DATAGRAM_BATCH_BYTES);
     }
 }
+
+/// A segmented entry reaches the host as its separate datagrams, whatever offload the socket uses.
+#[tokio::test]
+async fn udp_segmented_send_arrives_as_separate_datagrams() {
+    bounded(async {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let (client, session) = start(&config());
+        let flow = client.open_udp().await.unwrap();
+        for (segment, length) in [
+            (1000_u16, 2500_u16),
+            (1000, 64_000),
+            (4096, 65_504),
+            (1, 64),
+        ] {
+            let bytes: Vec<u8> = (0..usize::from(length))
+                .map(|offset| u8::try_from(offset / usize::from(segment) % 251).unwrap())
+                .collect();
+            let header = DatagramHeader {
+                peer: address,
+                length,
+                segment,
+            };
+            let batch = DatagramBatch::from_parts(vec![header], bytes.clone()).unwrap();
+            assert_eq!(flow.send(batch).await, Ok(vec![]));
+            let mut received = vec![0; MAX_NETWORK_DATAGRAM_BYTES + 1];
+            for expected in bytes.chunks(usize::from(segment)) {
+                let (received_length, _) = socket.recv_from(&mut received).await.unwrap();
+                assert_eq!(&received[..received_length], expected);
+            }
+            assert!(socket.try_recv_from(&mut received).is_err());
+        }
+        let denied = DatagramBatch::from_parts(
+            vec![DatagramHeader {
+                peer: "192.0.2.1:9".parse().unwrap(),
+                length: 2000,
+                segment: 1000,
+            }],
+            vec![0; 2000],
+        )
+        .unwrap();
+        assert_eq!(flow.send(denied).await, Ok(vec![denied_at(0)]));
+        drop(flow);
+        finish_session(client, session).await;
+    })
+    .await;
+}
+
+fn entry_shapes(batch: &DatagramBatch) -> Vec<(SocketAddr, u16, usize)> {
+    batch
+        .entries()
+        .map(|(peer, segment, bytes)| (peer, segment, bytes.len()))
+        .collect()
+}
+
+/// Equal-size datagrams from one peer arrive as one segmented entry; a different peer, a size
+/// change after a shorter datagram, or a different size starts a new entry.
+#[tokio::test]
+async fn udp_receive_merges_equal_size_bursts_and_splits_on_peer_or_size_changes() {
+    let udp = bound_resource(None);
+    let destination = udp.ipv4.as_ref().unwrap().local_addr().unwrap();
+    let first = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let second = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let (first_peer, second_peer) = (first.local_addr().unwrap(), second.local_addr().unwrap());
+    udp.remember_peer(first_peer);
+    udp.remember_peer(second_peer);
+    for (sender, size) in [
+        (&first, 100),
+        (&first, 100),
+        (&first, 100),
+        (&first, 40),
+        (&first, 100),
+        (&second, 100),
+        (&second, 100),
+        (&first, 200),
+    ] {
+        sender.send_to(&vec![7; size], destination).unwrap();
+    }
+    let batch = tokio::time::timeout(
+        Duration::from_secs(1),
+        receive_datagrams(udp, test_policy()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        entry_shapes(&batch),
+        [
+            (first_peer, 100, 340),
+            (first_peer, 0, 100),
+            (second_peer, 100, 200),
+            (first_peer, 0, 200),
+        ]
+    );
+}
+
+/// A burst larger than one batch is split between calls without losing or reordering datagrams.
+#[tokio::test]
+async fn udp_receive_keeps_the_rest_of_a_run_that_does_not_fit_the_batch() {
+    let udp = bound_resource(None);
+    let destination = udp.ipv4.as_ref().unwrap().local_addr().unwrap();
+    let sender = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    udp.remember_peer(sender.local_addr().unwrap());
+    let count = 20_u8;
+    for index in 0..count {
+        sender
+            .send_to(&[index; MAX_NETWORK_DATAGRAM_BYTES], destination)
+            .unwrap();
+    }
+    let policy = test_policy();
+    let mut received = Vec::new();
+    let mut calls = 0;
+    while received.len() < usize::from(count) {
+        let batch = tokio::time::timeout(
+            Duration::from_secs(1),
+            receive_datagrams(udp.clone(), policy.clone()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(batch.batch_bytes() <= MAX_NETWORK_DATAGRAM_BATCH_BYTES);
+        received.extend(batch.datagrams().map(|(_, bytes)| bytes.to_vec()));
+        calls += 1;
+    }
+    assert!(calls > 1);
+    for (index, bytes) in received.iter().enumerate() {
+        assert_eq!(
+            bytes,
+            &[u8::try_from(index).unwrap(); MAX_NETWORK_DATAGRAM_BYTES]
+        );
+    }
+    assert_eq!(received.len(), usize::from(count));
+}
+
+/// Few enough oversized datagrams to fit the socket receive buffer beside the accepted one.
+const QUEUED_REJECTIONS: usize = 33;
 
 /// Rejected traffic yields even with readable sockets, while accepted datagrams keep their order.
 #[tokio::test]
@@ -947,6 +1088,7 @@ async fn udp_receive_rejections_yield_before_and_after_first_datagram() {
     for (has_prefix, is_oversized) in [(false, false), (true, false), (false, true)] {
         let udp = bound_resource(None);
         let socket = udp.ipv4.clone().unwrap();
+        let socket = &socket.socket;
         let sender = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let stranger = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let peer = sender.local_addr().unwrap();
@@ -956,9 +1098,9 @@ async fn udp_receive_rejections_yield_before_and_after_first_datagram() {
         if has_prefix {
             sender.send_to(b"first", destination).unwrap();
             socket.peek_from(&mut [0; 5]).await.unwrap();
-            expected.push(datagram(peer, b"first".to_vec()));
+            expected.push((peer, b"first".to_vec()));
         }
-        for _ in 0..=MAX_NETWORK_DATAGRAMS {
+        for _ in 0..QUEUED_REJECTIONS {
             if is_oversized {
                 sender
                     .send_to(&[0; MAX_NETWORK_DATAGRAM_BYTES + 1], destination)
@@ -973,8 +1115,8 @@ async fn udp_receive_rejections_yield_before_and_after_first_datagram() {
         let mut received = Vec::new();
         if let Some(completed) = receive.as_mut().now_or_never() {
             let batch = completed.unwrap();
-            assert_eq!(batch, expected);
-            received.extend(batch);
+            assert_eq!(owned(&batch), expected);
+            received.extend(owned(&batch));
             receive = Box::pin(receive_datagrams(udp.clone(), policy.clone()));
         }
         let mut rejected = [0; MAX_NETWORK_DATAGRAM_BYTES + 1];
@@ -1001,14 +1143,14 @@ async fn udp_receive_rejections_yield_before_and_after_first_datagram() {
         );
         assert!(receive.as_mut().now_or_never().is_none());
         sender.send_to(b"last", destination).unwrap();
-        expected.push(datagram(peer, b"last".to_vec()));
+        expected.push((peer, b"last".to_vec()));
         while received.len() < expected.len() {
             let batch = tokio::time::timeout(Duration::from_secs(1), &mut receive)
                 .await
                 .unwrap()
                 .unwrap();
             assert!(!batch.is_empty() && batch.len() <= MAX_NETWORK_DATAGRAMS);
-            received.extend(batch);
+            received.extend(owned(&batch));
             if received.len() < expected.len() {
                 receive = Box::pin(receive_datagrams(udp.clone(), policy.clone()));
             }
@@ -1066,4 +1208,18 @@ async fn closing_a_shared_udp_publication_lets_it_reopen_at_once() {
         finish_session(client, session).await;
     })
     .await;
+}
+
+/// Broker sockets leave fragmentation to the OS, so a guest datagram above a link's MTU is not
+/// refused locally the way QUIC path-MTU probing sockets refuse it.
+#[cfg(unix)]
+#[tokio::test]
+async fn broker_udp_sockets_leave_fragmentation_to_the_os() {
+    let socket = super::udp::bind_udp("0.0.0.0:0".parse().unwrap()).unwrap();
+    let result = socket.socket.send_to(&[0; 3000], "192.0.2.1:9").await;
+    assert_ne!(
+        result.as_ref().err().and_then(std::io::Error::raw_os_error),
+        Some(libc::EMSGSIZE),
+        "{result:?}"
+    );
 }

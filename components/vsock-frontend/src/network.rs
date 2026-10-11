@@ -237,8 +237,11 @@ pub(crate) fn shutdown_flow(connection: ConnectionId) {
     transport::schedule_receive_queue();
 }
 
+/// Waits for at least `minimum_bytes` of upstream data; fewer (possibly none) are returned only
+/// once the guest has closed its sending side.
 pub(crate) async fn wait_upstream(
     connection: ConnectionId,
+    minimum_bytes: usize,
     max_bytes: usize,
 ) -> Result<Vec<u8>, ()> {
     poll_fn(|context| {
@@ -248,7 +251,7 @@ pub(crate) async fn wait_upstream(
             return Poll::Ready(Err(()));
         }
         let bytes = device.peek_upstream(connection, max_bytes);
-        if !bytes.is_empty() || device.guest_send_closed(connection) {
+        if bytes.len() >= minimum_bytes || device.guest_send_closed(connection) {
             Poll::Ready(Ok(bytes))
         } else {
             wait(&mut state, connection, context.waker());
@@ -394,7 +397,7 @@ async fn read_message(
         if let Some(message) = read_queued_message(connection, decoder)? {
             return Ok(Some(message));
         }
-        let bytes = wait_upstream(connection, decoder.remaining_capacity().min(CHUNK_BYTES))
+        let bytes = wait_upstream(connection, 1, decoder.remaining_capacity().min(CHUNK_BYTES))
             .await
             .map_err(|()| SocketError::Cancelled)?;
         if bytes.is_empty() {
@@ -625,7 +628,7 @@ pub(crate) async fn pump_upstream(
     mut writer: wit_bindgen::StreamWriter<u8>,
 ) -> Result<(), broker::Error> {
     loop {
-        let bytes = wait_upstream(connection, CHUNK_BYTES)
+        let bytes = wait_upstream(connection, 1, CHUNK_BYTES)
             .await
             .map_err(|()| broker::Error::Cancelled)?;
         if bytes.is_empty() {

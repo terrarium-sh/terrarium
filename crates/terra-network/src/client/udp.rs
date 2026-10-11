@@ -5,8 +5,7 @@ use crate::Error;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use terra_protocol::network::{
-    Datagram, MAX_NETWORK_DATAGRAM_BATCH_BYTES, MAX_NETWORK_DATAGRAM_BYTES, MAX_NETWORK_DATAGRAMS,
-    MAX_NETWORK_FRAME_BYTES, SendFailure, UdpReply, UdpRequest,
+    DatagramBatch, MAX_NETWORK_FRAME_BYTES, SendFailure, UdpReply, UdpRequest,
 };
 use tokio::io::{AsyncWriteExt, ReadHalf};
 use tokio::sync::{Mutex, mpsc};
@@ -25,7 +24,7 @@ struct Inner {
     closed: CancellationToken,
     failure: Arc<OnceLock<Error>>,
     sent: Replies<Vec<SendFailure>>,
-    received: Replies<Vec<Datagram>>,
+    received: Replies<DatagramBatch>,
 }
 
 impl Drop for Inner {
@@ -42,7 +41,7 @@ pub struct UdpFlow(Arc<Inner>);
 struct Routes {
     sent: mpsc::Sender<Vec<SendFailure>>,
     is_send_outstanding: Arc<AtomicBool>,
-    received: mpsc::Sender<Vec<Datagram>>,
+    received: mpsc::Sender<DatagramBatch>,
     is_receive_outstanding: Arc<AtomicBool>,
 }
 
@@ -90,7 +89,7 @@ impl UdpFlow {
     }
 
     /// Returns the datagrams that were not sent, by index.
-    pub async fn send(&self, datagrams: Vec<Datagram>) -> Result<Vec<SendFailure>, Error> {
+    pub async fn send(&self, datagrams: DatagramBatch) -> Result<Vec<SendFailure>, Error> {
         let count = datagrams.len();
         let mut replies = self.0.sent.queue.lock().await;
         if self.0.sent.is_outstanding.load(Ordering::SeqCst) {
@@ -119,7 +118,7 @@ impl UdpFlow {
         }
     }
 
-    pub async fn receive(&self) -> Result<Vec<Datagram>, Error> {
+    pub async fn receive(&self) -> Result<DatagramBatch, Error> {
         let mut replies = self.0.received.queue.lock().await;
         if !self.0.received.is_outstanding.swap(true, Ordering::SeqCst) {
             self.0
@@ -151,16 +150,11 @@ fn encode(request: &UdpRequest) -> Result<Vec<u8>, Error> {
         .map_err(|_| Error::InvalidArgument)
 }
 
-fn is_valid_batch(datagrams: &[Datagram]) -> bool {
+fn is_valid_batch(datagrams: &DatagramBatch) -> bool {
     !datagrams.is_empty()
-        && datagrams.len() <= MAX_NETWORK_DATAGRAMS
-        && datagrams.iter().map(Datagram::batch_bytes).sum::<usize>()
-            <= MAX_NETWORK_DATAGRAM_BATCH_BYTES
-        && datagrams.iter().all(|Datagram { peer, bytes }| {
-            bytes.len() <= MAX_NETWORK_DATAGRAM_BYTES
-                && peer.port() != 0
-                && peer.ip() == peer.ip().to_canonical()
-        })
+        && datagrams
+            .entries()
+            .all(|(peer, _, _)| peer.port() != 0 && peer.ip() == peer.ip().to_canonical())
 }
 
 type StreamRead = ReadHalf<Compat<yamux::Stream>>;

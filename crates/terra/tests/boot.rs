@@ -1167,7 +1167,8 @@ fn static_udp_error_queue_consumption_resumes_buffered_reply() {
 }
 
 /// QUIC options survive the first external send; ECN/GSO controls preserve native delivery,
-/// external GSO reaches the host as separate intact datagrams, and rejected controls send nothing.
+/// external GSO reaches the host as separate intact datagrams, echoed segments may return UDP
+/// GRO-merged only as whole same-size runs, and rejected controls send nothing.
 #[test]
 #[ignore = "boots a real microVM; requires a native hypervisor and matching kernel"]
 fn static_quic_socket_options_and_gso_preserve_udp_boundaries() {
@@ -1313,8 +1314,9 @@ fn static_socket_calls_forward_tcp_and_udp_through_authorized_broker() {
     );
 }
 
-/// UDP publication retains datagrams and distinct relay peers, excludes loopback-only services,
-/// and releases both transport listeners on stop before the same box restarts.
+/// UDP publication retains datagrams and distinct relay peers, keeps the boundaries and order of a
+/// burst relayed as segmented runs, excludes loopback-only services, and releases both transport
+/// listeners on stop before the same box restarts.
 #[test]
 #[ignore = "boots a real microVM; requires a native hypervisor and Zig"]
 #[allow(clippy::too_many_lines)]
@@ -1460,6 +1462,16 @@ fn published_udp_preserves_peers_datagrams_and_transport_isolation() {
             .unwrap();
         let (length, _) = client.recv_from(&mut bytes).unwrap();
         assert_eq!(&bytes[..length], b"after-oversize");
+        let burst: Vec<Vec<u8>> = (0..20_u8).map(|index| vec![index; 1200]).collect();
+        for datagram in &burst {
+            client
+                .send_to(datagram, (Ipv4Addr::LOCALHOST, port))
+                .unwrap();
+        }
+        for datagram in &burst {
+            let (length, _) = client.recv_from(&mut bytes).unwrap();
+            assert_eq!(&bytes[..length], datagram.as_slice());
+        }
         let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
         let mut tcp = TcpStream::connect_timeout(&address, Duration::from_secs(2)).unwrap();
         tcp.set_read_timeout(Some(Duration::from_secs(2))).unwrap();

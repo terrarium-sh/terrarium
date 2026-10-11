@@ -13,6 +13,7 @@ on:
       - scripts/kernel/kernel-artifact.py
       - scripts/kernel/test-kernel-tools.py
       - scripts/kernel/test-kernel-vsock.py
+      - scripts/kernel/vsock-tests/**
       - scripts/kernel/check-vsock-abi.py
       - components/vsock-frontend/src/transport.rs
       - crates/terra-protocol/src/application.rs
@@ -29,6 +30,7 @@ on:
       - scripts/kernel/kernel-artifact.py
       - scripts/kernel/test-kernel-tools.py
       - scripts/kernel/test-kernel-vsock.py
+      - scripts/kernel/vsock-tests/**
       - scripts/kernel/check-vsock-abi.py
       - components/vsock-frontend/src/transport.rs
       - crates/terra-protocol/src/application.rs

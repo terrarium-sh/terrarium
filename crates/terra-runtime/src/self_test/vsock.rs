@@ -130,11 +130,14 @@ async fn exercise_stream_half_closes(
     guest
         .send_with_flags(AGENT_PORT, AGENT_PORT, 4, 1, 65536, &[])
         .await?;
-    tokio::time::timeout(WAIT, async {
-        while agent.try_write(connection_number, &[]).is_ok() {
-            agent.wait().await;
-        }
-    })
+    within(
+        "agent output retirement after guest receive shutdown",
+        async {
+            while agent.try_write(connection_number, &[]).is_ok() {
+                agent.wait().await;
+            }
+        },
+    )
     .await?;
     guest
         .send(AGENT_PORT, AGENT_PORT, 5, 65536, b"half-open")
@@ -147,7 +150,7 @@ async fn exercise_stream_half_closes(
         .send_with_flags(AGENT_PORT, AGENT_PORT, 4, 2, 65536, &[])
         .await?;
     wait_disconnected(agent).await?;
-    tokio::time::timeout(WAIT, async {
+    within("reset reply after full guest shutdown", async {
         loop {
             if guest
                 .receive()?
@@ -164,7 +167,7 @@ async fn exercise_stream_half_closes(
     guest.send(AGENT_PORT, AGENT_PORT, 1, 0, &[]).await?;
     let connection_number = wait_connected(agent).await?;
     agent.close(connection_number);
-    tokio::time::timeout(WAIT, async {
+    within("send-shutdown reply after agent close", async {
         loop {
             if guest
                 .receive()?
@@ -195,20 +198,27 @@ async fn exercise_ready_receive_without_notification(
     agent: &mut StreamEndpoint,
     connection_number: u64,
 ) -> wasmtime::Result<()> {
-    guest.device.write(0x64, &3_u32.to_le_bytes())?;
     agent
         .try_write(connection_number, b"queued")
         .map_err(stream_error)?;
-    tokio::time::timeout(WAIT, async {
-        while guest.used_index(RECEIVE_USED)? == guest.received {
+    within("receive descriptor use for queued agent output", async {
+        // A held TX interrupt can raise the line after one acknowledge; RX completion then adds no edge.
+        loop {
+            guest.device.write(0x64, &3_u32.to_le_bytes())?;
+            if guest.used_index(RECEIVE_USED)? != guest.received {
+                return Ok::<(), wasmtime::Error>(());
+            }
             guest.events.changed().await?;
         }
-        Ok::<(), wasmtime::Error>(())
     })
     .await??;
     let (notification, quiet_events) = tokio::sync::watch::channel(0);
     let events = std::mem::replace(&mut guest.events, quiet_events);
-    let ready = tokio::time::timeout(WAIT, guest.wait_for_receive_work()).await;
+    let ready = within(
+        "receive readiness without a fresh interrupt",
+        guest.wait_for_receive_work(),
+    )
+    .await;
     guest.events = events;
     drop(notification);
     ready??;
@@ -462,19 +472,17 @@ impl GuestVsock {
         )?;
         self.device.write(0x64, &3_u32.to_le_bytes())?;
         self.device.write(0x50, &1_u32.to_le_bytes())?;
-        tokio::time::timeout(WAIT, async {
-            while self.used_index(TRANSMIT_USED)? != self.transmitted {
-                self.device.write(0x64, &3_u32.to_le_bytes())?;
-                self.events.changed().await?;
-            }
-            wasmtime::Result::Ok(())
-        })
-        .await
-        .map_err(|error| {
-            wasmtime::Error::msg(format!(
-                "vsock transmit {source}:{destination} operation {op}: {error}"
-            ))
-        })?
+        within(
+            &format!("vsock transmit {source}:{destination} operation {op}"),
+            async {
+                while self.used_index(TRANSMIT_USED)? != self.transmitted {
+                    self.device.write(0x64, &3_u32.to_le_bytes())?;
+                    self.events.changed().await?;
+                }
+                wasmtime::Result::Ok(())
+            },
+        )
+        .await?
     }
 
     pub(super) fn receive(&mut self) -> wasmtime::Result<Vec<Packet>> {
@@ -541,7 +549,7 @@ impl GuestVsock {
         port: u32,
         length: usize,
     ) -> wasmtime::Result<Vec<u8>> {
-        tokio::time::timeout(WAIT, async {
+        within(&format!("{length} payload bytes on port {port}"), async {
             let mut bytes = Vec::new();
             while bytes.len() < length {
                 for packet in self.receive()? {
@@ -568,6 +576,16 @@ impl GuestVsock {
     }
 }
 
+/// Waits up to [`WAIT`] for `step`, naming the step when it makes no progress.
+async fn within<T>(
+    step: &str,
+    future: impl std::future::Future<Output = T>,
+) -> wasmtime::Result<T> {
+    tokio::time::timeout(WAIT, future)
+        .await
+        .map_err(|_| wasmtime::Error::msg(format!("{step}: no progress within {WAIT:?}")))
+}
+
 fn stream_error(
     error: crate::component::vsock::streams::stream_types::StreamError,
 ) -> wasmtime::Error {
@@ -575,7 +593,7 @@ fn stream_error(
 }
 
 pub(super) async fn wait_connected(endpoint: &mut StreamEndpoint) -> wasmtime::Result<u64> {
-    tokio::time::timeout(WAIT, async {
+    within("stream connection", async {
         loop {
             if let Some(connection_number) = endpoint.current() {
                 return connection_number;
@@ -584,11 +602,10 @@ pub(super) async fn wait_connected(endpoint: &mut StreamEndpoint) -> wasmtime::R
         }
     })
     .await
-    .map_err(wasmtime::Error::from)
 }
 
 async fn wait_disconnected(endpoint: &mut StreamEndpoint) -> wasmtime::Result<()> {
-    tokio::time::timeout(WAIT, async {
+    within("stream disconnection", async {
         while endpoint.current().is_some() {
             endpoint.wait().await;
         }
@@ -602,7 +619,7 @@ pub(super) async fn read_stream(
     connection_number: u64,
     length: usize,
 ) -> wasmtime::Result<Vec<u8>> {
-    tokio::time::timeout(WAIT, async {
+    within(&format!("{length} stream bytes"), async {
         let mut bytes = Vec::new();
         while bytes.len() < length {
             let chunk = endpoint

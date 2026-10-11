@@ -121,7 +121,7 @@ class NativeGateTests(unittest.TestCase):
                        kernel.replace('TERRA_TCP_SEGMENT_BYTES 65535', 'TERRA_TCP_SEGMENT_BYTES 65536'),
                        kernel.replace('TERRA_TCP_RECEIVE_BYTES 81920', 'TERRA_TCP_RECEIVE_BYTES 32768'),
                        kernel.replace('TERRA_TCP_SEND_BYTES 49152', 'TERRA_TCP_SEND_BYTES 32768'),
-                       kernel.replace('TERRA_UDP_QUEUE_BYTES 65536', 'TERRA_UDP_QUEUE_BYTES 131072'),
+                       kernel.replace('TERRA_UDP_QUEUE_BYTES 131072', 'TERRA_UDP_QUEUE_BYTES 65536'),
                        kernel.replace('TERRA_UDP_QUEUED_DATAGRAMS 48', 'TERRA_UDP_QUEUED_DATAGRAMS 96')):
             with self.subTest(source=source), self.assertRaises(ValueError):
                 module.validate_kernel_buffers(source)

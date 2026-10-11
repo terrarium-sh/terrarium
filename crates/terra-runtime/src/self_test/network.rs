@@ -20,6 +20,8 @@ use terra_protocol::vsock::{
 const WAIT: Duration = Duration::from_secs(5);
 const STALLED_TCP_COUNT: usize = 8;
 const UDP_BURST_DATAGRAMS: usize = terra_protocol::network::MAX_NETWORK_DATAGRAMS + 1;
+const UDP_SEGMENT_BYTES: u16 = 1200;
+const UDP_SEGMENT_LENGTHS: [usize; 3] = [1200, 1200, 600];
 
 pub(super) async fn run(
     artifacts: &TrustedArtifacts,
@@ -123,14 +125,18 @@ struct BoundServers {
 const PORT_ATTEMPTS: usize = 16;
 
 /// Each IPv6 server reuses its IPv4 port number, and the broker later binds the published port on
-/// both families and protocols, but the kernel picked each number for one socket only.
-fn bind_servers() -> std::io::Result<BoundServers> {
+/// both families and protocols, but the kernel picked each number for one socket only. A nonzero
+/// `first_port` replaces the kernel's picks with `first_port` and the next number.
+fn bind_servers(first_port: u16) -> std::io::Result<BoundServers> {
     use std::net::Ipv6Addr;
-    let tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
-    let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
+    let tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, first_port))?;
+    let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, first_port))?;
     let tcp6 = TcpListener::bind((Ipv6Addr::LOCALHOST, tcp.local_addr()?.port()))?;
     let udp6 = UdpSocket::bind((Ipv6Addr::LOCALHOST, udp.local_addr()?.port()))?;
-    let reserved = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+    let reserved = TcpListener::bind((
+        Ipv4Addr::LOCALHOST,
+        if first_port == 0 { 0 } else { first_port + 1 },
+    ))?;
     let published = reserved.local_addr()?.port();
     // ponytail: the broker binds `published` in another process after these drop; the window is
     // narrow, so a collision there still fails the self-test.
@@ -148,6 +154,19 @@ fn bind_servers() -> std::io::Result<BoundServers> {
     })
 }
 
+/// Port to start attempt `attempt` from: the kernel's pick first, then random ones, because Windows
+/// hands out ephemeral ports in sequence and kernel picks keep landing in the same excluded range.
+fn retry_port(attempt: usize) -> u16 {
+    use std::hash::{BuildHasher as _, Hasher as _};
+    if attempt == 1 {
+        return 0;
+    }
+    let random = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
+    u16::try_from(20_000 + random % 40_000).unwrap_or(0)
+}
+
 impl TestServers {
     pub fn start() -> wasmtime::Result<Self> {
         let mut attempts = 1;
@@ -158,7 +177,7 @@ impl TestServers {
             udp6,
             published,
         } = loop {
-            match bind_servers() {
+            match bind_servers(retry_port(attempts)) {
                 // Windows refuses ports in its per-family excluded ranges with WSAEACCES.
                 Err(error)
                     if matches!(
@@ -381,7 +400,34 @@ fn serve_udp(udp: &UdpSocket) -> wasmtime::Result<()> {
     for (payload, peer) in burst {
         udp.send_to(&payload, peer)?;
     }
+    let mut segments = Vec::new();
+    for (index, length) in UDP_SEGMENT_LENGTHS.into_iter().enumerate() {
+        let (received, peer) = udp.recv_from(&mut bytes)?;
+        wasmtime::ensure!(
+            bytes[..received] == udp_segment(index, length) && Some(peer) == socket_peer,
+            "a segmented UDP send arrives as separate datagrams on its native socket"
+        );
+        segments.push(bytes[..received].to_vec());
+    }
+    for payload in segments {
+        udp.send_to(
+            &payload,
+            socket_peer.ok_or_else(|| wasmtime::Error::msg("UDP peer"))?,
+        )?;
+    }
     Ok(())
+}
+
+fn plain_udp_send(peer: std::net::SocketAddr, bytes: Vec<u8>) -> Message {
+    Message::UdpSend {
+        peer,
+        segment: 0,
+        bytes,
+    }
+}
+
+fn udp_segment(index: usize, length: usize) -> Vec<u8> {
+    vec![0xa0 + u8::try_from(index).unwrap_or(0); length]
 }
 
 fn serve_tcp(listener: &TcpListener, published: u16) -> wasmtime::Result<()> {
@@ -1174,7 +1220,11 @@ impl GuestNetwork {
         }
         let mut ipv4 = None;
         for stream in self.udp_publications.clone() {
-            let Message::UdpDatagram { peer, bytes } = self.stream.read_message(stream).await?
+            let Message::UdpDatagram {
+                segment: 0,
+                peer,
+                bytes,
+            } = self.stream.read_message(stream).await?
             else {
                 wasmtime::bail!("published UDP requires datagram framing");
             };
@@ -1192,11 +1242,12 @@ impl GuestNetwork {
                 "published UDP family and payload"
             );
             self.stream
-                .send_message(stream, &Message::UdpSend { peer, bytes })
+                .send_message(stream, &plain_udp_send(peer, bytes))
                 .await?;
             if peer.is_ipv4() {
                 ipv4 = Some((stream, peer));
                 let Message::UdpDatagram {
+                    segment: 0,
                     peer: second,
                     bytes,
                 } = self.stream.read_message(stream).await?
@@ -1208,20 +1259,18 @@ impl GuestNetwork {
                     "UDP publication admits distinct host peers and maximum datagrams"
                 );
                 self.stream
-                    .send_message(
-                        stream,
-                        &Message::UdpSend {
-                            peer: second,
-                            bytes,
-                        },
-                    )
+                    .send_message(stream, &plain_udp_send(second, bytes))
                     .await?;
             }
         }
         let (stream, first_peer) =
             ipv4.ok_or_else(|| wasmtime::Error::msg("missing IPv4 UDP publication"))?;
         for expected in [b"".as_slice(), b"after-oversize"] {
-            let Message::UdpDatagram { peer, bytes } = self.stream.read_message(stream).await?
+            let Message::UdpDatagram {
+                segment: 0,
+                peer,
+                bytes,
+            } = self.stream.read_message(stream).await?
             else {
                 wasmtime::bail!("published UDP datagram after oversized drop");
             };
@@ -1230,18 +1279,12 @@ impl GuestNetwork {
                 "UDP publication drops oversized input without truncating it"
             );
             self.stream
-                .send_message(stream, &Message::UdpSend { peer, bytes })
+                .send_message(stream, &plain_udp_send(peer, bytes))
                 .await?;
         }
         let peer = (Ipv4Addr::LOCALHOST, 9).into();
         self.stream
-            .send_message(
-                stream,
-                &Message::UdpSend {
-                    peer,
-                    bytes: vec![1],
-                },
-            )
+            .send_message(stream, &plain_udp_send(peer, vec![1]))
             .await?;
         wasmtime::ensure!(
             self.stream.read_message(stream).await?
@@ -1268,7 +1311,12 @@ impl GuestNetwork {
             self.stream.read_message(stream).await? == Message::PublicationUdp { guest_port: 8081 },
             "replacement UDP publication validates its guest port again"
         );
-        let Message::UdpDatagram { peer, bytes } = self.stream.read_message(stream).await? else {
+        let Message::UdpDatagram {
+            segment: 0,
+            peer,
+            bytes,
+        } = self.stream.read_message(stream).await?
+        else {
             wasmtime::bail!("replacement UDP publication first datagram");
         };
         wasmtime::ensure!(
@@ -1276,13 +1324,7 @@ impl GuestNetwork {
             "replacement UDP publication contains only the fresh host peer and datagram"
         );
         self.stream
-            .send_message(
-                stream,
-                &Message::UdpSend {
-                    peer: prior_peer,
-                    bytes: vec![1],
-                },
-            )
+            .send_message(stream, &plain_udp_send(prior_peer, vec![1]))
             .await?;
         wasmtime::ensure!(
             self.stream.read_message(stream).await?
@@ -1293,7 +1335,7 @@ impl GuestNetwork {
             "a retired UDP publication peer cannot authorize replies in the replacement"
         );
         self.stream
-            .send_message(stream, &Message::UdpSend { peer, bytes })
+            .send_message(stream, &plain_udp_send(peer, bytes))
             .await?;
         self.udp_publications
             .retain(|publication| *publication != retired);
@@ -1320,17 +1362,12 @@ impl GuestNetwork {
         .enumerate()
         {
             self.stream
-                .send_message(
-                    stream,
-                    &Message::UdpSend {
-                        peer,
-                        bytes: payload.clone(),
-                    },
-                )
+                .send_message(stream, &plain_udp_send(peer, payload.clone()))
                 .await?;
             wasmtime::ensure!(
                 self.stream.read_message(stream).await?
                     == Message::UdpDatagram {
+                        segment: 0,
                         peer,
                         bytes: payload
                     },
@@ -1339,13 +1376,7 @@ impl GuestNetwork {
             if index == 0 {
                 let denied = (Ipv4Addr::new(192, 0, 2, 23), port).into();
                 self.stream
-                    .send_message(
-                        stream,
-                        &Message::UdpSend {
-                            peer: denied,
-                            bytes: vec![1],
-                        },
-                    )
+                    .send_message(stream, &plain_udp_send(denied, vec![1]))
                     .await?;
                 wasmtime::ensure!(
                     self.stream.read_message(stream).await?
@@ -1361,6 +1392,7 @@ impl GuestNetwork {
         for index in 0..u8::try_from(UDP_BURST_DATAGRAMS)? {
             burst.extend(
                 Message::UdpSend {
+                    segment: 0,
                     peer: ipv4,
                     bytes: vec![index; usize::from(index) + 1],
                 }
@@ -1372,12 +1404,14 @@ impl GuestNetwork {
             wasmtime::ensure!(
                 self.stream.read_message(stream).await?
                     == Message::UdpDatagram {
+                        segment: 0,
                         peer: ipv4,
                         bytes: vec![index; usize::from(index) + 1]
                     },
                 "UDP receive streams retain every datagram across a broker batch boundary"
             );
         }
+        self.exercise_segmented_udp(stream, ipv4).await?;
         self.stream.finish_input(stream).await?;
         self.stream.require_eof(stream).await?;
         self.stream
@@ -1385,6 +1419,53 @@ impl GuestNetwork {
             .await?;
         self.stream.require_reset(replacement).await?;
         self.exercise_dns().await
+    }
+
+    /// Sends one segmented frame and collects the echoed datagrams, which the broker may merge
+    /// into segmented frames depending on how many had arrived when it read.
+    async fn exercise_segmented_udp(
+        &mut self,
+        stream: Stream,
+        peer: std::net::SocketAddr,
+    ) -> wasmtime::Result<()> {
+        let expected: Vec<Vec<u8>> = UDP_SEGMENT_LENGTHS
+            .into_iter()
+            .enumerate()
+            .map(|(index, length)| udp_segment(index, length))
+            .collect();
+        self.stream
+            .send_message(
+                stream,
+                &Message::UdpSend {
+                    peer,
+                    segment: UDP_SEGMENT_BYTES,
+                    bytes: expected.concat(),
+                },
+            )
+            .await?;
+        let mut received = Vec::new();
+        while received.len() < expected.len() {
+            match self.stream.read_message(stream).await? {
+                Message::UdpDatagram {
+                    peer: from,
+                    segment: 0,
+                    bytes,
+                } if from == peer => received.push(bytes),
+                Message::UdpDatagram {
+                    peer: from,
+                    segment,
+                    bytes,
+                } if from == peer => {
+                    received.extend(bytes.chunks(usize::from(segment)).map(<[u8]>::to_vec));
+                }
+                other => wasmtime::bail!("unexpected segmented UDP reply {other:?}"),
+            }
+        }
+        wasmtime::ensure!(
+            received == expected,
+            "UDP preserves segment boundaries in both directions"
+        );
+        Ok(())
     }
 
     async fn query_dns(&mut self, stream: bool, bytes: Vec<u8>) -> wasmtime::Result<u32> {
@@ -1506,6 +1587,17 @@ mod tests {
         sender.join().unwrap();
     }
 
+    /// Retries after the kernel's first pick start from varied ports, so one Windows excluded range
+    /// around the kernel's sequential picks cannot fail every attempt.
+    #[test]
+    fn port_retries_leave_the_kernels_sequence() {
+        assert_eq!(super::retry_port(1), 0);
+        let ports: std::collections::BTreeSet<u16> =
+            (2..=super::PORT_ATTEMPTS).map(super::retry_port).collect();
+        assert!(ports.iter().all(|port| (20_000..60_000).contains(port)));
+        assert!(ports.len() > super::PORT_ATTEMPTS / 2);
+    }
+
     /// The host self-test starts these servers before its boot, vsock, storage and filesystem
     /// stages; a server that gave up after `WAIT` refused the guest's later connection under
     /// tracing or load.
@@ -1560,12 +1652,14 @@ mod tests {
         let peer = (socket::HOST_SERVICE_IPV4, endpoints.udp).into();
         let payload = vec![37; PAYLOAD_BYTES];
         let request = Message::UdpSend {
+            segment: 0,
             peer,
             bytes: payload.clone(),
         }
         .encode()
         .unwrap();
         let expected = Message::UdpDatagram {
+            segment: 0,
             peer,
             bytes: payload,
         };

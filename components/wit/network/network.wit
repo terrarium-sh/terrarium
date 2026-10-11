@@ -25,12 +25,15 @@ interface broker {
         send: func(data: stream<u8>) -> future<result<_, error>>;
         receive: func() -> tuple<stream<u8>, future<result<_, error>>>;
     }
-    record datagram { peer: socket-address, bytes: list<u8> }
+    /// Entry `i` of a batch is the next `length` bytes of the batch's `bytes`: one datagram when
+    /// `segment` is 0, else `segment`-byte datagrams with a possibly shorter last one.
+    record datagram-header { peer: socket-address, length: u16, segment: u16 }
+    record datagram-batch { headers: list<datagram-header>, bytes: list<u8> }
     /// A datagram of a `send-to` batch that was not sent, by its index in the batch.
     record send-failure { index: u32, error: error }
     resource udp {
-        send-to: async func(datagrams: list<datagram>) -> result<list<send-failure>, error>;
-        receive-from: func() -> tuple<stream<datagram>, future<result<_, error>>>;
+        send-to: async func(batch: datagram-batch) -> result<list<send-failure>, error>;
+        receive-from: func() -> tuple<stream<datagram-batch>, future<result<_, error>>>;
     }
     resource listener {
         accept: func() -> tuple<stream<tcp>, future<result<_, error>>>;

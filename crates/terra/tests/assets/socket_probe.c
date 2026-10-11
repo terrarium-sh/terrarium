@@ -727,9 +727,11 @@ static ssize_t send_quic_control(int fd, const struct sockaddr *peer, socklen_t 
     return sendmsg(fd, &message, 0);
 }
 
-static void receive_quic_payload(int fd, const unsigned char *expected, size_t length,
-                                  int expected_ecn) {
-    unsigned char reply[4097];
+/* Receive up to `available` echoed bytes sent as `segment`-byte datagrams; UDP GRO may merge
+ * several into one read, reporting the segment size as its stride. Returns the bytes received. */
+static size_t receive_quic_reply(int fd, const unsigned char *expected, size_t available,
+                                 size_t segment, int expected_ecn) {
+    static unsigned char reply[65536];
     union {
         struct cmsghdr alignment;
         unsigned char bytes[256];
@@ -741,12 +743,16 @@ static void receive_quic_payload(int fd, const unsigned char *expected, size_t l
         .msg_control = control.bytes,
         .msg_controllen = sizeof(control.bytes),
     };
-    require(recvmsg(fd, &message, MSG_TRUNC) == (ssize_t)length &&
+    ssize_t length = recvmsg(fd, &message, MSG_TRUNC);
+    require(length > 0 && (size_t)length <= available &&
             !(message.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) &&
             memcmp(reply, expected, length) == 0, "QUIC datagram boundary and payload integrity");
-    int saw_ecn = 0;
+    int saw_ecn = 0, stride = 0;
     for (struct cmsghdr *entry = CMSG_FIRSTHDR(&message); entry; entry = CMSG_NXTHDR(&message, entry)) {
-        require(!(entry->cmsg_level == SOL_UDP && entry->cmsg_type == UDP_GRO), "QUIC receive stays uncoalesced");
+        if (entry->cmsg_level == SOL_UDP && entry->cmsg_type == UDP_GRO) {
+            require(entry->cmsg_len == CMSG_LEN(sizeof(int)), "QUIC GRO control shape");
+            memcpy(&stride, CMSG_DATA(entry), sizeof(int));
+        }
         if ((entry->cmsg_level == SOL_IP && entry->cmsg_type == IP_TOS) ||
             (entry->cmsg_level == SOL_IPV6 && entry->cmsg_type == IPV6_TCLASS)) {
             require(expected_ecn >= 0, "external QUIC receive omits ECN metadata");
@@ -759,6 +765,24 @@ static void receive_quic_payload(int fd, const unsigned char *expected, size_t l
         }
     }
     require(expected_ecn < 0 || saw_ecn, "native QUIC delivers ECN metadata");
+    require(stride ? (size_t)stride == segment && (size_t)length > segment :
+            (size_t)length == (available < segment ? available : segment),
+            "QUIC GRO merges only whole same-size segments");
+    return length;
+}
+
+static void receive_quic_payload(int fd, const unsigned char *expected, size_t length,
+                                 int expected_ecn) {
+    receive_quic_reply(fd, expected, length, length, expected_ecn);
+}
+
+static void receive_quic_segments(int fd, const unsigned char *expected, size_t length,
+                                  size_t segment, int expected_ecn) {
+    while (length) {
+        size_t received = receive_quic_reply(fd, expected, length, segment, expected_ecn);
+        expected += received;
+        length -= received;
+    }
 }
 
 static void exercise_quic_native(int fd, int family, const unsigned char *payload) {
@@ -797,8 +821,7 @@ static void exercise_quic_native(int fd, int family, const unsigned char *payloa
     require(send_quic_control(fd, (struct sockaddr *)&local, local_length, payload, 3600,
                              SOL_UDP, UDP_SEGMENT, &segment, sizeof(segment)) == 3600,
             "native QUIC GSO send");
-    for (unsigned int index = 0; index < 3; index++)
-        receive_quic_payload(receiver, payload + index * segment, segment, 2);
+    receive_quic_segments(receiver, payload, 3600, segment, 2);
     close(receiver);
 }
 
@@ -849,17 +872,13 @@ static void exercise_quic_family(const struct sockaddr *peer, socklen_t peer_len
     require(send_quic_control(fd, peer, peer_length, payload, 3600, SOL_UDP,
                              UDP_SEGMENT, &segment, sizeof(segment)) == 3600,
             "QUIC GSO control overrides the socket default");
-    for (unsigned int index = 0; index < 3; index++)
-        receive_quic_payload(fd, payload + index * segment, segment, -1);
+    receive_quic_segments(fd, payload, 3600, segment, -1);
     require(send_quic_control(fd, peer, peer_length, payload, sizeof(payload), SOL_UDP,
                              UDP_SEGMENT, &segment, sizeof(segment)) == sizeof(payload),
             "QUIC GSO payload exceeds a single external datagram");
-    for (unsigned int index = 0; index < 5; index++)
-        receive_quic_payload(fd, payload + index * segment, segment, -1);
+    receive_quic_segments(fd, payload, sizeof(payload), segment, -1);
     require(sendto(fd, payload, 2401, 0, peer, peer_length) == 2401, "QUIC socket default GSO send");
-    receive_quic_payload(fd, payload, 1000, -1);
-    receive_quic_payload(fd, payload + 1000, 1000, -1);
-    receive_quic_payload(fd, payload + 2000, 401, -1);
+    receive_quic_segments(fd, payload, 2401, 1000, -1);
     set_quic_option(fd, SOL_UDP, UDP_SEGMENT, 0);
     require(send_quic_control(fd, peer, peer_length, payload, 7, 0x7fff, 1,
                              &ecn, sizeof(ecn)) == -1 && errno == EOPNOTSUPP,
