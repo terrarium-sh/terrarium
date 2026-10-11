@@ -18,37 +18,23 @@ pub(super) fn prepare_sandbox_launch(
     policy: Option<&[u8]>,
     self_test: Option<[u16; 3]>,
 ) -> Result<terra_sandbox::PreparedLaunch> {
-    let grants = build_sandbox_grants(spec, bx, exe)?;
-    #[cfg(target_os = "macos")]
-    let grants = {
-        let mut grants = grants;
-        if self_test.is_some() {
-            grants.push(Grant::new(
-                super::supervisor::self_test_directory(bx),
-                Access::ReadWrite,
-            ));
+    #[cfg_attr(target_os = "linux", allow(unused_mut))]
+    let mut grants = build_sandbox_grants(spec, bx)?;
+    #[cfg(any(target_os = "macos", windows))]
+    if self_test.is_some() {
+        let directory = super::supervisor::self_test_directory(bx);
+        for path in [
+            directory.clone(),
+            directory.join("writable"),
+            directory.join("readonly"),
+        ] {
+            let mut grant = Grant::new(&path, Access::ReadWrite);
+            grant.directory = Some(terra_platform::filesystem::open_share_root(
+                &path.canonicalize()?,
+            )?);
+            grants.push(grant);
         }
-        grants
-    };
-    #[cfg(windows)]
-    let grants = {
-        let mut grants = grants;
-        if self_test.is_some() {
-            let directory = super::supervisor::self_test_directory(bx);
-            for path in [
-                directory.clone(),
-                directory.join("writable"),
-                directory.join("readonly"),
-            ] {
-                let mut grant = Grant::new(&path, Access::ReadWrite);
-                grant.directory = Some(terra_platform::filesystem::open_share_root(
-                    &path.canonicalize()?,
-                )?);
-                grants.push(grant);
-            }
-        }
-        grants
-    };
+    }
     let mut command = Command::new(exe);
     command
         .arg(if self_test.is_some() {
@@ -99,7 +85,6 @@ pub(super) fn prepare_sandbox_launch(
         role: terra_sandbox::Role::Vm,
         command,
         grants,
-        die_with_parent: true,
         policy,
         staging_directory: &crate::state::get_terra_home_path()?,
     })
@@ -118,7 +103,7 @@ fn granted_directory_identity(
     Ok(terra_platform::filesystem::file_identity(directory)?)
 }
 
-fn build_sandbox_grants(spec: &BootSpec, bx: &BoxRef, exe: &Path) -> Result<Vec<Grant>> {
+fn build_sandbox_grants(spec: &BootSpec, bx: &BoxRef) -> Result<Vec<Grant>> {
     ensure!(
         bx.get_dir().is_absolute(),
         "the box state path must be absolute"
@@ -128,8 +113,7 @@ fn build_sandbox_grants(spec: &BootSpec, bx: &BoxRef, exe: &Path) -> Result<Vec<
         "box state directory {} does not exist",
         bx.get_dir().display()
     );
-    let mut grants = terra_sandbox::role_grants(terra_sandbox::Role::Vm);
-    grants.push(Grant::new(exe, Access::ReadOnly));
+    let mut grants = Vec::new();
     if spec.mode == terra_protocol::PlanMode::Run {
         for share in &spec.cfg.mounts {
             let mut grant = Grant::new(
@@ -310,7 +294,6 @@ mod tests {
         std::fs::create_dir_all(&share).unwrap();
         let recipe = box_dir.join(state::RECIPE_FILE);
         std::fs::write(&recipe, "{}").unwrap();
-        let exe = base.join("terra");
         let bx = BoxRef::from_state_dir(box_dir, &base);
         let mut spec = spec(&base, terra_protocol::PlanMode::Run);
         spec.cfg.mounts.push(config::Mount {
@@ -318,7 +301,7 @@ mod tests {
             guest: "/share".into(),
             readonly: true,
         });
-        let grants = build_sandbox_grants(&spec, &bx, &exe).unwrap();
+        let grants = build_sandbox_grants(&spec, &bx).unwrap();
         assert!(grants.iter().any(|grant| {
             grant.path == share && grant.access == Access::ReadOnly && grant.directory.is_some()
         }));
@@ -341,13 +324,13 @@ mod tests {
             }));
         }
         spec.mode = terra_protocol::PlanMode::Create;
-        let grants = build_sandbox_grants(&spec, &bx, &exe).unwrap();
+        let grants = build_sandbox_grants(&spec, &bx).unwrap();
         assert!(!grants.iter().any(|grant| grant.path == share));
         let moved = base.join("moved");
         std::fs::rename(&share, &moved).unwrap();
         crate::sys::symlink_dir(&moved, &share).unwrap();
         spec.mode = terra_protocol::PlanMode::Run;
-        assert!(build_sandbox_grants(&spec, &bx, &exe).is_err());
+        assert!(build_sandbox_grants(&spec, &bx).is_err());
     }
 
     fn spec(project_dir: &Path, mode: PlanMode) -> BootSpec {

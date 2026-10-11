@@ -5,7 +5,7 @@
 use std::io::{Error, Result};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::process::Command;
-use windows_sys::Win32::Foundation::HANDLE_FLAG_INHERIT;
+use windows_sys::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT};
 use windows_sys::Win32::System::Threading::{
     CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, DETACHED_PROCESS, OpenThread, ResumeThread,
     THREAD_SUSPEND_RESUME,
@@ -16,12 +16,83 @@ pub fn detach(command: &mut Command) {
     command.creation_flags(DETACHED_PROCESS);
 }
 
-fn ipc_handle_environment(target: i32) -> Result<&'static str> {
-    match target {
-        7 => Ok("TERRA_NETWORK_HANDLE"),
-        8 => Ok("TERRA_CONFIG_HANDLE"),
-        _ => Err(Error::other("unsupported inherited IPC channel")),
+/// Environment variables naming inherited IPC sockets, keyed by descriptor target.
+pub const IPC_HANDLE_VARIABLES: [(i32, &str); 2] =
+    [(7, "TERRA_NETWORK_HANDLE"), (8, "TERRA_CONFIG_HANDLE")];
+/// Environment variables naming inherited listener sockets, keyed by descriptor target.
+pub const LISTENER_HANDLE_VARIABLES: [(i32, &str); 4] = [
+    (10, "TERRA_AGENT_LISTENER_HANDLE"),
+    (11, "TERRA_CONTROL_LISTENER_HANDLE"),
+    (12, "TERRA_AGENT_CONTROL_LISTENER_HANDLE"),
+    (13, "TERRA_AGENT_AGENT_LISTENER_HANDLE"),
+];
+pub const LOCK_HANDLE_VARIABLE: &str = "TERRA_INHERITED_LOCK_HANDLE";
+
+pub fn handle_variable(variables: &[(i32, &'static str)], target: i32) -> Result<&'static str> {
+    variables
+        .iter()
+        .find(|(candidate, _)| *candidate == target)
+        .map(|(_, variable)| *variable)
+        .ok_or_else(|| Error::other(format!("no inherited handle variable for target {target}")))
+}
+
+/// Marks `handle` inheritable and names it in `variable` for the next child.
+pub fn pass_handle(command: &mut Command, handle: HANDLE, variable: &str) -> Result<()> {
+    set_inheritable(handle, true)?;
+    command.env(variable, (handle as usize).to_string());
+    Ok(())
+}
+
+/// Reads the handle a parent named in `variable`; `Ok(None)` means it passed none.
+pub fn inherited_handle(variable: &str) -> Result<Option<HANDLE>> {
+    let Some(value) = std::env::var_os(variable) else {
+        return Ok(None);
+    };
+    let handle = value
+        .to_str()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|handle| *handle != 0 && *handle != usize::MAX)
+        .ok_or_else(|| Error::other(format!("invalid inherited handle in {variable}")))?;
+    Ok(Some(handle as HANDLE))
+}
+
+#[allow(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "the kernel validates the handle and rejects an invalid one"
+)]
+pub fn set_inheritable(handle: HANDLE, is_inheritable: bool) -> Result<()> {
+    // SAFETY: SetHandleInformation validates the handle and only changes its inheritance flag.
+    win_ok(unsafe {
+        windows_sys::Win32::Foundation::SetHandleInformation(
+            handle,
+            HANDLE_FLAG_INHERIT,
+            if is_inheritable {
+                HANDLE_FLAG_INHERIT
+            } else {
+                0
+            },
+        )
+    })
+}
+
+/// Starts Winsock for the rest of the process; repeated calls are reference-counted by Windows.
+pub fn initialize_winsock() -> Result<()> {
+    use windows_sys::Win32::Networking::WinSock::{WSADATA, WSAStartup};
+    let mut data = WSADATA::default();
+    // SAFETY: data has the Winsock structure's full writable size.
+    match unsafe { WSAStartup(0x0202, &raw mut data) } {
+        0 => Ok(()),
+        error => Err(Error::from_raw_os_error(error)),
     }
+}
+
+/// Takes ownership of the socket a parent named in `variable`, so descendants cannot inherit it.
+pub fn claim_socket(variable: &str) -> Result<std::os::windows::io::RawSocket> {
+    let socket = inherited_handle(variable)?
+        .ok_or_else(|| Error::other(format!("{variable} names no inherited socket")))?;
+    initialize_winsock()?;
+    set_inheritable(socket, false)?;
+    Ok(socket as std::os::windows::io::RawSocket)
 }
 
 pub fn pass_ipc(
@@ -31,42 +102,19 @@ pub fn pass_ipc(
 ) -> Result<crate::io::local::LocalStream> {
     use std::os::windows::io::AsRawSocket;
     let inherited = stream.try_clone()?;
-    let socket = inherited.as_raw_socket();
-    // SAFETY: inherited owns this live socket; the launcher restricts inheritance to its handle list.
-    win_ok(unsafe {
-        windows_sys::Win32::Foundation::SetHandleInformation(
-            socket as *mut std::ffi::c_void,
-            HANDLE_FLAG_INHERIT,
-            HANDLE_FLAG_INHERIT,
-        )
-    })?;
-    command.env(ipc_handle_environment(target)?, socket.to_string());
+    pass_handle(
+        command,
+        inherited.as_raw_socket() as HANDLE,
+        handle_variable(&IPC_HANDLE_VARIABLES, target)?,
+    )?;
     Ok(inherited)
 }
 
 pub fn claim_ipc(target: i32) -> Result<crate::io::local::LocalStream> {
     use std::os::windows::io::FromRawSocket;
-    use windows_sys::Win32::Networking::WinSock::{WSADATA, WSAStartup};
-    let socket = std::env::var(ipc_handle_environment(target)?)
-        .map_err(Error::other)?
-        .parse::<usize>()
-        .map_err(Error::other)?;
-    let mut data = WSADATA::default();
-    // SAFETY: data has the Winsock structure's full writable size and initialization lasts until process exit.
-    let result = unsafe { WSAStartup(0x0202, &raw mut data) };
-    if result != 0 {
-        return Err(Error::from_raw_os_error(result));
-    }
+    let socket = claim_socket(handle_variable(&IPC_HANDLE_VARIABLES, target)?)?;
     // SAFETY: the whitelisted launcher transfers this inherited socket exclusively to the worker.
-    let stream = unsafe { crate::io::local::LocalStream::from_raw_socket(socket as u64) };
-    // SAFETY: stream owns socket; no descendant may inherit this authority.
-    win_ok(unsafe {
-        windows_sys::Win32::Foundation::SetHandleInformation(
-            socket as *mut std::ffi::c_void,
-            HANDLE_FLAG_INHERIT,
-            0,
-        )
-    })?;
+    let stream = unsafe { crate::io::local::LocalStream::from_raw_socket(socket) };
     stream.peer_addr()?;
     Ok(stream)
 }

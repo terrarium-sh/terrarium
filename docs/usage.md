@@ -16,6 +16,31 @@ terra dev stop
 `./ci.yaml`; a recipe path names the box from its filename. See
 [the manifest reference](manifest.md) and [the recipe reference](recipe.md).
 
+## Primary uses
+
+Terra is built around two uses. They are where it starts, not its limit: a box
+fits any workload that needs a clear boundary.
+
+### A terrarium for agents
+
+Give a long-lived agent a box of its own. The root filesystem and volumes
+persist across restarts, so its tools and state stay put. Make the agent the
+recipe's [workload](recipe.md#processes), share only the directories it should
+touch, or none and hand files over with `terra <box> sync`, and
+[allow](recipe.md#network) only the destinations it needs.
+`terra <box> logs --diagnostics` shows hook output and network denials. To keep
+the agent running across host restarts, run the box under the
+[systemd unit](../packaging/README.md#running-terra-under-systemd).
+
+### A dev VM for your harness
+
+Run Claude Code, Codex, or your own tooling against a project without handing
+it your host. [Mount](recipe.md#mounts-and-environment) the project, mark
+anything the harness only reads `readonly`, and allow the registries and APIs
+it calls. Work interactively: detach with `Ctrl-\`, rejoin with `terra dev`,
+and run one-off commands with `terra dev exec`. The
+[quickstart](../README.md#quickstart) builds this shape.
+
 ## Installation options
 
 Use the [quickstart installers](../README.md#quickstart) or
@@ -43,10 +68,9 @@ Linux releases publish a matching Bubblewrap policy bundle in a separate
 binary and installs it at `~/.terra/config/seccomp`, keeping any previous
 bundle as `seccomp.previous`. A bundle matches one executable, so reinstall
 both together after a manual upgrade. Terra does not search beside the
-executable; set `vm.bwrap.policy` to use another bundle directory.
+executable; set `vm.sandbox.policy` to use another bundle directory.
 Without a selected bundle, Terra uses its built-in role policies; set
-`vm.bwrap.allow_fallback: false` to require a bundle. Legacy single-filter
-overrides must be replaced with a newly generated bundle. See
+`vm.sandbox.allow_fallback: false` to require a bundle. See
 [host VM launchers](vm-launchers.md) for configuration details.
 
 ## List boxes
@@ -185,9 +209,9 @@ the guest agent and resize helper bundled with the Terra binary. `terra ls` list
 `terra ls --all` lists every local project. `terra <box> storage show` inspects
 the root filesystem and volumes; `export`, `import`, and `prune` manage images.
 Export and import require a stopped box and the same recipe.
-With the built-in Linux Bubblewrap launcher, `host.pid` in that box directory
-holds the host-visible VM PID and start identity for stop and liveness checks.
-Terra's parent writes it, and the jailed VM sees it read-only.
+`host.pid` in that box directory holds the host-visible VM PID and start
+identity for stop and liveness checks. The box supervisor writes it, and a
+sandboxed VM sees it read-only.
 
 The root filesystem and volumes use discard/TRIM to return freed guest blocks
 to the host automatically. Their configured capacity stays the same; physical

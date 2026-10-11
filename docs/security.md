@@ -165,11 +165,12 @@ Running Terra as host root expands the impact of a boundary failure.
 
 ### Network policy limits
 
-In the confined Linux launch, the broker enforces recipe network rules even if
-the VM process is compromised. Broker requests are untrusted, bounded, and
-validated independently. Only broker-controlled resolution establishes learned
-address grants. TCP connections retain established-stream semantics; UDP
-rechecks authorization on send and receive as DNS-derived grants expire.
+In the default sandboxed launch, the broker enforces recipe network rules even if
+the VM process is compromised, because the VM worker has no host network access.
+Broker requests are untrusted, bounded, and validated independently. Only
+broker-controlled resolution establishes learned address grants. TCP
+connections retain established-stream semantics; UDP rechecks authorization on
+send and receive as DNS-derived grants expire.
 
 Each broker operation is one flow-controlled stream, so a TCP upload buffers
 at most one stream window ahead of the socket. The broker writes upload bytes in

@@ -8,15 +8,15 @@ use std::io::{Error, Result};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
 use std::process::Command;
+use terra_platform::process;
 use terra_platform::process::{VmChildGuard, supervise_vm_child};
-use windows_sys::Win32::Foundation::{FILETIME, HANDLE_FLAG_INHERIT, STILL_ACTIVE};
+use windows_sys::Win32::Foundation::{FILETIME, HANDLE, STILL_ACTIVE};
 use windows_sys::Win32::System::Threading::{
     GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     PROCESS_TERMINATE, TerminateProcess,
 };
 
 pub const MAX_SOCK_PATH: usize = 108;
-const LOCK_HANDLE_ENV: &str = "TERRA_INHERITED_LOCK_HANDLE";
 
 pub fn try_lock_run(path: &Path) -> std::result::Result<File, std::fs::TryLockError> {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
@@ -199,19 +199,11 @@ pub(crate) fn pass_listener(
 ) -> Result<terra_platform::io::local::LocalListener> {
     use std::os::windows::io::AsRawSocket;
     let inherited = listener.try_clone()?;
-    let socket = inherited.as_raw_socket();
-    // SAFETY: inherited owns this live listener; the launcher whitelists the socket handle.
-    win_ok(unsafe {
-        windows_sys::Win32::Foundation::SetHandleInformation(
-            socket as *mut std::ffi::c_void,
-            HANDLE_FLAG_INHERIT,
-            HANDLE_FLAG_INHERIT,
-        )
-    })?;
-    command.env(
-        super::listener_handle_environment(target)?,
-        socket.to_string(),
-    );
+    process::pass_handle(
+        command,
+        inherited.as_raw_socket() as HANDLE,
+        process::handle_variable(&process::LISTENER_HANDLE_VARIABLES, target)?,
+    )?;
     Ok(inherited)
 }
 
@@ -220,28 +212,12 @@ pub(crate) fn claim_listener(
     expected: &Path,
 ) -> Result<terra_platform::io::local::LocalListener> {
     use std::os::windows::io::FromRawSocket;
-    use windows_sys::Win32::Networking::WinSock::{WSADATA, WSAStartup};
-    let socket = std::env::var(super::listener_handle_environment(target)?)
-        .map_err(Error::other)?
-        .parse::<usize>()
-        .map_err(Error::other)?;
-    let mut data = WSADATA::default();
-    // SAFETY: data has the Winsock structure's full writable size and initialization lasts until process exit.
-    let result = unsafe { WSAStartup(0x0202, &raw mut data) };
-    if result != 0 {
-        return Err(Error::from_raw_os_error(result));
-    }
+    let socket = process::claim_socket(process::handle_variable(
+        &process::LISTENER_HANDLE_VARIABLES,
+        target,
+    )?)?;
     // SAFETY: the whitelisted launcher transfers this prebound listener exclusively to the worker.
-    let listener =
-        unsafe { terra_platform::io::local::LocalListener::from_raw_socket(socket as u64) };
-    // SAFETY: listener owns socket; no descendant may inherit the grant.
-    win_ok(unsafe {
-        windows_sys::Win32::Foundation::SetHandleInformation(
-            socket as *mut std::ffi::c_void,
-            HANDLE_FLAG_INHERIT,
-            0,
-        )
-    })?;
+    let listener = unsafe { terra_platform::io::local::LocalListener::from_raw_socket(socket) };
     if listener.local_addr()?.as_pathname() != Some(expected) {
         return Err(Error::other("inherited listener does not match its grant"));
     }
@@ -251,37 +227,24 @@ pub(crate) fn claim_listener(
 pub fn pass_lock(command: &mut Command, lock: &File) -> Result<File> {
     use std::os::windows::io::AsRawHandle;
     let inherited = lock.try_clone()?;
-    let handle = inherited.as_raw_handle();
-    // SAFETY: the `File` keeps this handle valid until CreateProcess duplicates it into the child.
-    let ok = unsafe {
-        windows_sys::Win32::Foundation::SetHandleInformation(
-            handle,
-            HANDLE_FLAG_INHERIT,
-            HANDLE_FLAG_INHERIT,
-        )
-    };
-    if ok == 0 {
-        return Err(Error::last_os_error());
-    }
-    command.env(LOCK_HANDLE_ENV, format!("{handle:p}"));
+    process::pass_handle(
+        command,
+        inherited.as_raw_handle(),
+        process::LOCK_HANDLE_VARIABLE,
+    )?;
     Ok(inherited)
 }
 
 pub fn claim_inherited_lock(expected: &Path) -> Option<File> {
-    let handle = std::env::var(LOCK_HANDLE_ENV).ok()?;
-    let raw = usize::from_str_radix(handle.strip_prefix("0x")?, 16).ok()? as *mut std::ffi::c_void;
-    file_handle_matches_path(raw, expected)
-        .then(|| {
-            // SAFETY: `pass_lock` marked precisely this live file handle inheritable for this child.
-            let file = unsafe { File::from_raw_handle(raw) };
-            // SAFETY: file owns raw; subsequent child processes must not inherit the run lock.
-            win_ok(unsafe {
-                windows_sys::Win32::Foundation::SetHandleInformation(raw, HANDLE_FLAG_INHERIT, 0)
-            })
-            .ok()?;
-            Some(file)
-        })
-        .flatten()
+    let raw = process::inherited_handle(process::LOCK_HANDLE_VARIABLE).ok()??;
+    if !file_handle_matches_path(raw, expected) {
+        return None;
+    }
+    // SAFETY: `pass_lock` marked precisely this live file handle inheritable for this child.
+    let file = unsafe { File::from_raw_handle(raw) };
+    // Subsequent child processes must not inherit the run lock.
+    process::set_inheritable(raw, false).ok()?;
+    Some(file)
 }
 
 pub fn holds_run_lock(path: &Path) -> Result<bool> {

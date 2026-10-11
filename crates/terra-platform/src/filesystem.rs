@@ -55,7 +55,7 @@ pub fn open_share_root(root: &Path) -> io::Result<File> {
         )?
         .into())
     }
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(target_os = "linux")]
     {
         use rustix::fs::{Mode, OFlags, openat};
         use std::path::Component;
@@ -92,14 +92,6 @@ pub fn open_share_root(root: &Path) -> io::Result<File> {
             return Err(io::Error::other("mount source changed while opening it"));
         }
         Ok(directory)
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = root;
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "unsupported host",
-        ))
     }
 }
 
@@ -562,11 +554,6 @@ fn zero_file_range(file: &File, mut offset: u64, mut len: u64) -> io::Result<()>
         offset += chunk as u64;
         len -= chunk as u64;
     }
-    Ok(())
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-fn discard_file(_file: &File, _offset: u64, _len: u64) -> io::Result<()> {
     Ok(())
 }
 

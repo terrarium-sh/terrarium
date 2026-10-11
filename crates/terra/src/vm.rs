@@ -12,7 +12,6 @@ pub mod boot;
 mod component;
 mod launcher;
 pub(crate) mod supervisor;
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub(crate) use component::run_host_self_test_worker;
 #[cfg(any(
     all(

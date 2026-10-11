@@ -3,7 +3,7 @@
 Terra can start its host VM process directly or through its built-in native
 sandbox. Configure the choice globally in
 `~/.terra/config.yaml`; a project recipe cannot change it. An absent or null
-`vm.init` selects `bwrap`: Bubblewrap on Linux and native App Sandbox/AppContainer
+`vm.init` selects `sandbox`: Bubblewrap on Linux and native App Sandbox/AppContainer
 launchers on macOS/Windows. The native launch separates the VM and network
 broker and applies an independent policy to each. Linux also uses a supervisor
 seccomp filter. A failed sandbox launch stops the box without automatic fallback.
@@ -24,14 +24,14 @@ and network broker. Select a generated policy bundle with:
 
 ```yaml
 vm:
-  init: bwrap
-  bwrap:
+  init: sandbox
+  sandbox:
     policy: /path/to/terra-seccomp
 ```
 
 Policy selection has three steps:
 
-1. Use `vm.bwrap.policy` when set. Relative paths resolve against the directory
+1. Use `vm.sandbox.policy` when set. Relative paths resolve against the directory
    containing `config.yaml`.
 2. Otherwise use `~/.terra/config/seccomp` if present; `install.sh` installs
    the release bundle there.
@@ -43,8 +43,7 @@ readable JSON for each filter. Terra checks the version, target, per-role hashes
 filter sizes, and instruction alignment; the kernel validates installation.
 Missing or invalid selected bundles fail startup without fallback.
 
-Legacy single-policy files, including `~/.terra/config/seccomp.bpf`, are rejected.
-To migrate, run `terra self-test --generate-policy`, then select the resulting
+To build a bundle, run `terra self-test --generate-policy`, then select the resulting
 bundle directory. Regenerate after changing Terra and validate on the intended
 host architecture. Terra never downloads a policy or searches beside its binary.
 
@@ -58,8 +57,8 @@ To require a generated bundle, set:
 
 ```yaml
 vm:
-  init: bwrap
-  bwrap:
+  init: sandbox
+  sandbox:
     allow_fallback: false
 ```
 
@@ -67,7 +66,7 @@ vm:
 `~/.terra/config/seccomp` must exist. This setting does not assess how restrictive
 the selected filters are. Normal boots do not need a policy compiler.
 
-Bubblewrap settings are unused when `vm.init` selects another launcher.
+`vm.sandbox` settings are unused when `vm.init` selects another launcher.
 Terra refuses a configured launcher or selected local policy inside a
 guest-writable share or writable Terra box state, so a guest cannot replace
 an asset used for a later boot.
@@ -139,7 +138,7 @@ complete bundle must pass enforcement and negative boundary probes before
 atomic publication. An existing real output directory is refused; published
 outputs are symlinks to successful generations. Logs and traces remain in
 `./terra-workload-logs` (or `--policy-diagnostics`). Generation does not install
-the bundle. Select its directory with `vm.bwrap.policy`, or install the bundle
+the bundle. Select its directory with `vm.sandbox.policy`, or install the bundle
 at `~/.terra/config/seccomp`.
 
 Policies cover the observed paths and reviewed supplements for that binary and

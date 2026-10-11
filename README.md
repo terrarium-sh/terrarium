@@ -2,19 +2,39 @@
 
 **Give your agent room to work. Decide what it can touch.**
 
-Run coding agents and development tools in a hardware-virtualized microVM,
-with explicit control over host files and network access. Get started with
-one `terra` executable and a YAML recipe.
+Terrarium runs agents and development tools in hardware-virtualized microVMs.
+One `terra` executable and a YAML recipe give each box its own kernel, its own
+disk, and only the host files and network destinations you grant.
 
 [![CI](https://github.com/terrarium-sh/terrarium/actions/workflows/build.yml/badge.svg)](https://github.com/terrarium-sh/terrarium/actions)
 [![Latest release](https://img.shields.io/github/v/release/terrarium-sh/terrarium)](https://github.com/terrarium-sh/terrarium/releases/latest)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
+> [!WARNING]
+> **Under construction.** Docs are incomplete and the code is still under
+> internal review.
+
+## What it's for
+
+- **A terrarium for agents.** Give a long-lived agent a box of its own to live
+  and work in. Its tools and state persist across restarts, and systemd can keep
+  it running. [Set one up →](docs/usage.md#a-terrarium-for-agents)
+- **A dev VM for your harness.** Run Claude Code, Codex, or your own tooling
+  against your project in a confined VM instead of on your host.
+  [Start with the quickstart →](#quickstart)
+
+These are the primary uses, not the only ones: untrusted builds, unfamiliar
+installers, one-off recipe runs, and services published on host loopback fit
+the same box.
+
+## Why Terrarium
+
 - **A dedicated kernel for every box.** Hardware virtualization isolates the
   workload from the host, including guest root.
 - **Device components are sandboxed too.** Separate WebAssembly sandboxes
   restrict the code handling guest requests to scoped host capabilities.
-  Linux adds Bubblewrap containment around the VM process by default.
+  The VM process and network broker also run in the host's OS sandbox by
+  default: Bubblewrap and seccomp, App Sandbox, or AppContainer and restricted tokens.
 - **Access starts at zero.** No host files or network access by default.
   Grant specific directories, enforce read-only mounts, and allow network
   destinations by hostname, IP, or CIDR and port.
@@ -24,8 +44,8 @@ one `terra` executable and a YAML recipe.
 - **Keep working in the same box.** Detach and rejoin, run commands, or sync
   files without rebuilding. Guest storage persists between restarts.
 
-Read the [security model and its limits](docs/security.md).
-**Under construction:** docs are incomplete and code is still under internal review.
+Know what it protects against and where it stops: read the
+[security model and its limits](docs/security.md).
 
 ## Quickstart
 
@@ -50,7 +70,8 @@ Open a new terminal after installation.
 
 </details>
 
-In your project directory, create `dev.yaml`. Here's a Node.js development box:
+The quickstart builds a dev VM for a Node.js project. In your project
+directory, create `dev.yaml`:
 
 ```yaml
 hw:

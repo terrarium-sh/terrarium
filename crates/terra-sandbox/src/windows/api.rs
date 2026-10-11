@@ -1,14 +1,14 @@
-use super::{IPC_ENVS, MODE_ENV, Mode, Policy, ROLE_ENV, Result, Role, wide};
+use super::{MODE_ENV, Mode, Policy, ROLE_ENV, Result, Role, wide};
 use anyhow::{Context, ensure};
 use std::ffi::{OsStr, OsString, c_void};
 use std::fs::File;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use terra_platform::process;
 use windows_sys::Win32::Foundation::{
     HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LocalFree, SetHandleInformation,
     WAIT_OBJECT_0,
 };
-use windows_sys::Win32::Networking::WinSock::{WSACleanup, WSADATA, WSAStartup};
 use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
 use windows_sys::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeleteAppContainerProfile,
@@ -58,31 +58,6 @@ pub(super) fn own_handle(handle: HANDLE) -> Result<OwnedHandle> {
     );
     // SAFETY: the caller passes a newly acquired owned kernel handle after its failure check.
     Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
-}
-
-pub(super) struct Winsock;
-
-impl Winsock {
-    pub(super) fn initialize() -> Result<Self> {
-        let mut data = WSADATA::default();
-        // SAFETY: the process-local Winsock initialization writes a correctly sized WSADATA.
-        let status = unsafe { WSAStartup(0x0202, &raw mut data) };
-        ensure!(
-            status == 0,
-            "Windows sandbox Winsock initialization failed: {}",
-            std::io::Error::from_raw_os_error(status)
-        );
-        Ok(Self)
-    }
-}
-
-impl Drop for Winsock {
-    fn drop(&mut self) {
-        // SAFETY: this guard balances WSAStartup after inherited sockets have been closed.
-        unsafe {
-            WSACleanup();
-        }
-    }
 }
 
 pub(super) struct LocalAllocation(pub(super) *mut c_void);
@@ -637,13 +612,13 @@ fn prepare_inherited_handles(role: Role) -> Result<([HANDLE; 3], Vec<HANDLE>)> {
         win_ok(unsafe { SetHandleInformation(*slot, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) })?;
         inherited.push(*slot);
     }
-    for name in IPC_ENVS {
-        if let Some(socket) = super::parse_handle_env(name)? {
+    for (_, name) in process::IPC_HANDLE_VARIABLES {
+        if let Some(socket) = process::inherited_handle(name)? {
             inherited.push(socket);
         }
     }
-    for name in super::VM_LISTENER_ENVS {
-        if let Some(socket) = super::parse_handle_env(name)? {
+    for (_, name) in process::LISTENER_HANDLE_VARIABLES {
+        if let Some(socket) = process::inherited_handle(name)? {
             ensure!(
                 role == Role::Vm,
                 "network broker cannot inherit VM service listeners"
@@ -651,7 +626,7 @@ fn prepare_inherited_handles(role: Role) -> Result<([HANDLE; 3], Vec<HANDLE>)> {
             inherited.push(socket);
         }
     }
-    if let Some(lock) = super::parse_handle_env(super::LOCK_ENV)? {
+    if let Some(lock) = process::inherited_handle(process::LOCK_HANDLE_VARIABLE)? {
         ensure!(
             role == Role::Vm,
             "network broker cannot inherit the box run lock"

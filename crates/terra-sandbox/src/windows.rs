@@ -5,7 +5,7 @@
 mod acl;
 mod api;
 
-use super::{Access, Grant, Launch, PolicyBundle, Role, SpawnedLaunch};
+use super::{Access, Grant, Launch, PolicyBundle, PreparedLaunch, Role};
 use anyhow::{Context, Result, bail, ensure};
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
@@ -13,9 +13,10 @@ use std::io::{Read, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::{Child, Command, ExitCode};
 use std::time::{Duration, Instant};
-use windows_sys::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use terra_platform::process;
+use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::Security::{
     GetTokenInformation, TOKEN_QUERY, TokenHasRestrictions, TokenIsAppContainer,
 };
@@ -36,14 +37,6 @@ const IDENTITY_ENV: &str = "TERRA_WINDOWS_SANDBOX_IDENTITY";
 const PARENT_ENV: &str = "TERRA_WINDOWS_SANDBOX_PARENT";
 const MODE_ENV: &str = "TERRA_WINDOWS_SANDBOX_MODE";
 const ROLE_ENV: &str = "TERRA_WINDOWS_SANDBOX_ROLE";
-const IPC_ENVS: [&str; 2] = ["TERRA_NETWORK_HANDLE", "TERRA_CONFIG_HANDLE"];
-const VM_LISTENER_ENVS: [&str; 4] = [
-    "TERRA_AGENT_LISTENER_HANDLE",
-    "TERRA_CONTROL_LISTENER_HANDLE",
-    "TERRA_AGENT_CONTROL_LISTENER_HANDLE",
-    "TERRA_AGENT_AGENT_LISTENER_HANDLE",
-];
-const LOCK_ENV: &str = "TERRA_INHERITED_LOCK_HANDLE";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -159,11 +152,10 @@ struct WorkerGrant {
     identity: Option<String>,
 }
 
-pub struct PreparedLaunch {
-    pub command: Command,
+pub struct Confinement {
     identity: File,
     inherited_identity: File,
-    _parent: Option<OwnedHandle>,
+    _parent: OwnedHandle,
     _spec: tempfile::NamedTempFile,
     trusted_directories: Vec<File>,
 }
@@ -185,11 +177,6 @@ pub fn prepare_launch(launch: Launch<'_>) -> Result<PreparedLaunch> {
     let (grants, trusted_directories) = build_worker_grants(launch.grants)?;
     let executable = std::fs::canonicalize(launch.command.get_program())
         .context("resolving Windows sandbox worker executable")?;
-    ensure!(
-        grants.iter().any(|grant| !grant.writable
-            && std::fs::canonicalize(&grant.path).ok().as_ref() == Some(&executable)),
-        "Windows sandbox requires a read-only executable grant"
-    );
     let bytes = serde_json::to_vec(&WorkerSpec { policy, grants })?;
     ensure!(
         bytes.len() as u64 <= MAX_SPEC_BYTES,
@@ -201,18 +188,14 @@ pub fn prepare_launch(launch: Launch<'_>) -> Result<PreparedLaunch> {
     spec.write_all(&bytes)?;
     spec.flush()?;
     let (identity, inherited_identity) = api::create_identity_pipe()?;
-    let parent = if launch.die_with_parent {
-        // SAFETY: the current process identity is known; this handle can only observe its lifetime.
-        Some(api::own_handle(unsafe {
-            OpenProcess(
-                PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
-                1,
-                std::process::id(),
-            )
-        })?)
-    } else {
-        None
-    };
+    // SAFETY: the current process identity is known; this handle can only observe its lifetime.
+    let parent = api::own_handle(unsafe {
+        OpenProcess(
+            PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+            1,
+            std::process::id(),
+        )
+    })?;
     let mut command = Command::new(std::env::current_exe()?);
     command.env_clear();
     for name in [
@@ -239,24 +222,25 @@ pub fn prepare_launch(launch: Launch<'_>) -> Result<PreparedLaunch> {
         .arg("--")
         .arg(&executable)
         .args(launch.command.get_args())
-        .env(SPEC_ENV, spec.path())
-        .env(
-            IDENTITY_ENV,
-            encode_handle(inherited_identity.as_raw_handle()),
-        );
+        .env(SPEC_ENV, spec.path());
+    process::pass_handle(
+        &mut command,
+        inherited_identity.as_raw_handle(),
+        IDENTITY_ENV,
+    )?;
     if let Some(directory) = launch.command.get_current_dir() {
         command.current_dir(directory);
     }
-    if let Some(parent) = &parent {
-        command.env(PARENT_ENV, encode_handle(parent.as_raw_handle()));
-    }
+    process::pass_handle(&mut command, parent.as_raw_handle(), PARENT_ENV)?;
     Ok(PreparedLaunch {
         command,
-        identity,
-        inherited_identity,
-        _parent: parent,
-        _spec: spec,
-        trusted_directories,
+        confinement: Some(Confinement {
+            identity,
+            inherited_identity,
+            _parent: parent,
+            _spec: spec,
+            trusted_directories,
+        }),
     })
 }
 
@@ -291,26 +275,18 @@ fn build_worker_grants(grants: Vec<Grant>) -> Result<(Vec<WorkerGrant>, Vec<File
     Ok((worker_grants, trusted_directories))
 }
 
-impl PreparedLaunch {
-    pub fn spawn(mut self, timeout: Duration) -> Result<SpawnedLaunch> {
-        let mut child = self
-            .command
-            .spawn()
-            .context("starting Windows sandbox launcher")?;
+/// Share roots whose identities the worker's grants were checked against.
+pub type Resources = Vec<File>;
+
+impl Confinement {
+    pub(crate) fn confirm(
+        mut self,
+        child: &mut Child,
+        timeout: Duration,
+    ) -> Result<(u32, Resources)> {
         drop(self.inherited_identity);
-        let result = read_identity(&mut self.identity, &mut child, timeout);
-        match result {
-            Ok(pid) => Ok(SpawnedLaunch {
-                child,
-                pid,
-                trusted_directories: self.trusted_directories,
-            }),
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                Err(error)
-            }
-        }
+        let pid = read_identity(&mut self.identity, child, timeout)?;
+        Ok((pid, self.trusted_directories))
     }
 }
 
@@ -360,8 +336,7 @@ pub fn resolve_policy(path: Option<&Path>, _allow_fallback: bool) -> Result<Poli
             "Windows sandbox policy must be a directory containing supervisor.sandbox.json, vm.sandbox.json, and network.sandbox.json"
         );
     }
-    let mut policies = Vec::with_capacity(3);
-    for role in Role::ALL {
+    PolicyBundle::try_from_roles(|role| {
         let bytes = if let Some(path) = path {
             let filename = path.join(format!("{}.sandbox.json", role.name()));
             let mut bytes = Vec::new();
@@ -374,15 +349,7 @@ pub fn resolve_policy(path: Option<&Path>, _allow_fallback: bool) -> Result<Poli
             serde_json::to_vec(&Policy::builtin(role))?
         };
         Policy::decode(&bytes, role)?;
-        policies.push(bytes);
-    }
-    let [supervisor, vm, network] = policies
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("Windows policy bundle is incomplete"))?;
-    Ok(PolicyBundle {
-        supervisor,
-        vm,
-        network,
+        Ok(bytes)
     })
 }
 
@@ -512,7 +479,7 @@ fn run_worker(
     arguments: impl Iterator<Item = OsString>,
     spec: &WorkerSpec,
 ) -> Result<ExitCode> {
-    let _winsock = api::Winsock::initialize()?;
+    process::initialize_winsock()?;
     let identity =
         claim_handle(IDENTITY_ENV)?.context("Windows launcher lacks its identity pipe")?;
     let parent = claim_handle(PARENT_ENV)?;
@@ -559,8 +526,11 @@ fn run_worker(
     let mut identity = File::from(identity);
     identity.write_all(&worker.pid.to_le_bytes())?;
     drop(identity);
-    for name in IPC_ENVS.into_iter().chain(VM_LISTENER_ENVS) {
-        if let Some(socket) = parse_handle_env(name)? {
+    for (_, name) in process::IPC_HANDLE_VARIABLES
+        .into_iter()
+        .chain(process::LISTENER_HANDLE_VARIABLES)
+    {
+        if let Some(socket) = process::inherited_handle(name)? {
             // SAFETY: Winsock is initialized and the worker inherited this socket; release the wrapper's duplicate.
             let status =
                 unsafe { windows_sys::Win32::Networking::WinSock::closesocket(socket as usize) };
@@ -576,7 +546,7 @@ fn run_worker(
         }
     }
     if spec.policy.role == Role::Vm
-        && let Some(lock) = parse_handle_env(LOCK_ENV)?
+        && let Some(lock) = process::inherited_handle(process::LOCK_HANDLE_VARIABLE)?
     {
         // SAFETY: the actual VM inherited the lock; the trusted wrapper releases its extra kernel handle.
         drop(unsafe { OwnedHandle::from_raw_handle(lock) });
@@ -610,47 +580,14 @@ fn run_worker(
     Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)))
 }
 
-fn encode_handle(handle: HANDLE) -> String {
-    format!("{:x}", handle as usize)
-}
-
-fn parse_handle_env(name: &str) -> Result<Option<HANDLE>> {
-    let Some(value) = std::env::var_os(name) else {
+fn claim_handle(name: &str) -> Result<Option<OwnedHandle>> {
+    let Some(handle) = process::inherited_handle(name)? else {
         return Ok(None);
     };
-    let value = value
-        .to_str()
-        .context("Windows sandbox handle is not ASCII")?;
-    let radix = if IPC_ENVS.contains(&name) || VM_LISTENER_ENVS.contains(&name) {
-        10
-    } else {
-        16
-    };
-    let handle = usize::from_str_radix(value.strip_prefix("0x").unwrap_or(value), radix)
-        .with_context(|| format!("invalid Windows sandbox handle in {name}"))?;
-    ensure!(
-        handle != 0 && handle != usize::MAX,
-        "invalid Windows sandbox handle in {name}"
-    );
-    Ok(Some(handle as HANDLE))
-}
-
-fn claim_handle(name: &str) -> Result<Option<OwnedHandle>> {
-    parse_handle_env(name)?
-        .map(|handle| {
-            // SAFETY: the trusted launcher created and inherited this owned kernel handle exactly once.
-            let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
-            // SAFETY: clear inheritance on the live handle before any worker can be created.
-            api::win_ok(unsafe {
-                windows_sys::Win32::Foundation::SetHandleInformation(
-                    handle.as_raw_handle(),
-                    HANDLE_FLAG_INHERIT,
-                    0,
-                )
-            })?;
-            Ok(handle)
-        })
-        .transpose()
+    // SAFETY: the trusted launcher created and inherited this owned kernel handle exactly once.
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+    process::set_inheritable(handle.as_raw_handle(), false)?;
+    Ok(Some(handle))
 }
 
 fn wide(value: &OsStr) -> Result<Vec<u16>> {
@@ -685,7 +622,10 @@ mod tests {
             let mut flags = 0;
             // SAFETY: parent is live and flags is writable.
             api::win_ok(unsafe { GetHandleInformation(parent.as_raw_handle(), &raw mut flags) })?;
-            assert_eq!(flags & HANDLE_FLAG_INHERIT, 0);
+            assert_eq!(
+                flags & windows_sys::Win32::Foundation::HANDLE_FLAG_INHERIT,
+                0
+            );
             return Ok(());
         }
 
@@ -695,7 +635,6 @@ mod tests {
             role: Role::Vm,
             command: Command::new(&executable),
             grants: vec![Grant::new(&executable, Access::ReadOnly)],
-            die_with_parent: true,
             policy: Some(&policy),
             staging_directory: &std::env::temp_dir(),
         })?;
@@ -862,7 +801,6 @@ mod tests {
                 role,
                 command: worker_command,
                 grants,
-                die_with_parent: true,
                 policy: Some(policy),
                 staging_directory: &std::env::temp_dir(),
             })?;

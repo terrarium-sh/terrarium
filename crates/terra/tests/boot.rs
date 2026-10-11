@@ -27,6 +27,10 @@ fn copy_installed_binary(directory: &Path) -> PathBuf {
 }
 
 #[test]
+#[cfg_attr(
+    all(target_os = "linux", not(target_env = "musl")),
+    ignore = "Bubblewrap needs a static terra; run with TERRA_BIN=dist/terra or --target x86_64-unknown-linux-musl"
+)]
 fn bundled_self_test_runs_without_a_source_checkout_or_generation_tools() {
     let _guard = INSTALLED_BINARY_FIXTURES.lock().unwrap();
     let directory = tempfile::tempdir().unwrap();
@@ -155,6 +159,10 @@ fn assert_generated_policy(output: &Path, binary: &Path, vm_validated: bool) -> 
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 #[test]
+#[cfg_attr(
+    all(target_os = "linux", not(target_env = "musl")),
+    ignore = "Bubblewrap needs a static terra; run with TERRA_BIN=dist/terra or --target x86_64-unknown-linux-musl"
+)]
 fn bundled_policy_generation_needs_no_tools_and_preserves_previous_publication() {
     let _guard = INSTALLED_BINARY_FIXTURES.lock().unwrap();
     let directory = tempfile::tempdir().unwrap();

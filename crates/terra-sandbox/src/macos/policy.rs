@@ -3,14 +3,6 @@ use anyhow::{Context, Result, bail, ensure};
 use std::collections::BTreeSet;
 use std::path::Path;
 
-pub(super) const fn marker(role: Role) -> &'static [u8] {
-    match role {
-        Role::Supervisor => b"terra-app-sandbox-v1:supervisor",
-        Role::Vm => b"terra-app-sandbox-v1:vm",
-        Role::Network => b"terra-app-sandbox-v1:network",
-    }
-}
-
 pub(super) fn render_entitlements(
     role: Role,
     grants: &[Grant],
@@ -232,9 +224,6 @@ mod tests {
             )
             .is_ok()
         );
-        for role in Role::ALL {
-            assert!(marker(role).ends_with(role.name().as_bytes()));
-        }
         Ok(())
     }
 

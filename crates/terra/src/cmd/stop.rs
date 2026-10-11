@@ -301,14 +301,7 @@ mod tests {
         assert!(error.to_string().contains("being set up"));
         assert!(child.try_wait().unwrap().is_none());
         let outcome = stop_and_wait(&bx, Duration::ZERO, SetupAction::Stop).unwrap();
-        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
         assert_matches!(outcome, StopOutcome::Wedged);
-        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-        {
-            assert_matches!(outcome, StopOutcome::IdentityUnknown);
-            assert!(child.try_wait().unwrap().is_none());
-            child.kill().unwrap();
-        }
         assert!(!child.wait().unwrap().success());
         drop(marked);
     }

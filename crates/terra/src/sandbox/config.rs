@@ -22,12 +22,12 @@ struct HostConfig {
 #[serde(default, deny_unknown_fields)]
 struct VmConfig {
     init: Option<yaml_serde::Value>,
-    bwrap: Option<BwrapConfig>,
+    sandbox: Option<SandboxConfig>,
 }
 
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-struct BwrapConfig {
+struct SandboxConfig {
     policy: Option<yaml_serde::Value>,
     allow_fallback: Option<bool>,
 }
@@ -53,17 +53,14 @@ pub(crate) fn load() -> Result<LauncherConfig> {
 
 fn find_override_policy() -> Result<Option<PathBuf>> {
     let directory = crate::state::get_terra_home_path()?.join("config");
-    for path in [directory.join("seccomp"), directory.join("seccomp.bpf")] {
-        match std::fs::symlink_metadata(&path) {
-            Ok(_) => return Ok(Some(path)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("checking seccomp bundle {}", path.display()));
-            }
+    let path = directory.join("seccomp");
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => Ok(Some(path)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => {
+            Err(error).with_context(|| format!("checking seccomp bundle {}", path.display()))
         }
     }
-    Ok(None)
 }
 
 pub(crate) fn write_resolved(path: &Path) -> Result<()> {
@@ -87,21 +84,17 @@ impl LauncherConfig {
                 policy,
                 allow_fallback,
             } => serde_json::json!({
-                "vm": {"init": "bwrap", "bwrap": {"policy": policy, "allow_fallback": allow_fallback}}
+                "vm": {"init": "sandbox", "sandbox": {"policy": policy, "allow_fallback": allow_fallback}}
             }),
         };
         std::fs::write(path, serde_json::to_vec(&config)?).context("writing launcher configuration")
     }
 }
 
-fn default_launcher() -> LauncherConfig {
-    if terra_sandbox::DEFAULT_LAUNCHER == "bwrap" {
-        LauncherConfig::Sandboxed {
-            policy: None,
-            allow_fallback: true,
-        }
-    } else {
-        LauncherConfig::Direct
+const fn default_launcher() -> LauncherConfig {
+    LauncherConfig::Sandboxed {
+        policy: None,
+        allow_fallback: true,
     }
 }
 
@@ -118,9 +111,9 @@ pub(crate) fn load_from(path: &Path) -> Result<LauncherConfig> {
     let vm = config.vm.unwrap_or_default();
     let init = match vm.init {
         Some(yaml_serde::Value::String(init)) => init,
-        None => terra_sandbox::DEFAULT_LAUNCHER.to_owned(),
+        None => "sandbox".to_owned(),
         Some(_) => bail!(
-            "{}: vm.init must be direct, bwrap, or an executable path",
+            "{}: vm.init must be direct, sandbox, or an executable path",
             path.display()
         ),
     };
@@ -133,12 +126,10 @@ pub(crate) fn load_from(path: &Path) -> Result<LauncherConfig> {
     let directory = path
         .parent()
         .context("global config has no parent directory")?;
-    if init == "bwrap" {
-        terra_sandbox::require_sandbox_support()
-            .with_context(|| format!("{}: vm.init: bwrap", path.display()))?;
-        let bwrap = vm.bwrap.unwrap_or_default();
-        let allow_fallback = bwrap.allow_fallback.unwrap_or(true);
-        let policy = bwrap
+    if init == "sandbox" {
+        let sandbox = vm.sandbox.unwrap_or_default();
+        let allow_fallback = sandbox.allow_fallback.unwrap_or(true);
+        let policy = sandbox
             .policy
             .map(|policy| resolve_policy_path(policy, path, directory))
             .transpose()?;
@@ -163,16 +154,16 @@ fn resolve_policy_path(
 ) -> Result<PathBuf> {
     let yaml_serde::Value::String(policy) = policy else {
         bail!(
-            "{}: vm.bwrap.policy must be a local bundle directory path",
+            "{}: vm.sandbox.policy must be a local bundle directory path",
             config.display()
         );
     };
     if policy.is_empty() {
-        bail!("{}: vm.bwrap.policy must not be empty", config.display());
+        bail!("{}: vm.sandbox.policy must not be empty", config.display());
     }
     if policy.contains("://") {
         bail!(
-            "{}: vm.bwrap.policy must name a local bundle directory",
+            "{}: vm.sandbox.policy must name a local bundle directory",
             config.display()
         );
     }
@@ -188,20 +179,6 @@ fn resolve_policy_path(
 mod tests {
     use super::*;
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    #[test]
-    fn unsupported_native_launcher_names_the_config_and_returns_unsupported() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("config.yaml");
-        std::fs::write(&path, "vm:\n  init: bwrap\n").unwrap();
-        let error = load_from(&path).unwrap_err();
-        assert!(error.to_string().contains("config.yaml"));
-        assert_eq!(
-            error.downcast_ref::<std::io::Error>().unwrap().kind(),
-            std::io::ErrorKind::Unsupported
-        );
-    }
-
     #[test]
     fn self_test_config_keeps_resolved_launcher_and_policy_paths() {
         let home = crate::sys::TestHome::new();
@@ -209,18 +186,12 @@ mod tests {
         std::fs::create_dir_all(&terra_home).unwrap();
         let bundle = tempfile::tempdir().unwrap();
         let exported = bundle.path().join("launcher.json");
-        let mut configs = vec!["vm:\n  init: direct\n", "vm:\n  init: ./launcher\n"];
-        if cfg!(any(
-            target_os = "linux",
-            target_os = "macos",
-            target_os = "windows"
-        )) {
-            configs.extend([
-                "vm:\n  init: bwrap\n",
-                "vm:\n  bwrap:\n    policy: local.bpf\n    allow_fallback: false\n",
-            ]);
-        }
-        for config in configs {
+        for config in [
+            "vm:\n  init: direct\n",
+            "vm:\n  init: ./launcher\n",
+            "vm:\n  init: sandbox\n",
+            "vm:\n  sandbox:\n    policy: local.bpf\n    allow_fallback: false\n",
+        ] {
             std::fs::write(terra_home.join("config.yaml"), config).unwrap();
             let expected = load().unwrap();
             write_resolved(&exported).unwrap();
@@ -232,13 +203,7 @@ mod tests {
     fn host_config_selects_exact_launcher_and_resolves_paths() {
         let home = tempfile::tempdir().unwrap();
         let config = home.path().join("config.yaml");
-        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-        let platform_default = LauncherConfig::Sandboxed {
-            policy: None,
-            allow_fallback: true,
-        };
-        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-        let platform_default = LauncherConfig::Direct;
+        let platform_default = default_launcher();
         assert_eq!(load_from(&config).unwrap(), platform_default);
         std::fs::write(&config, "vm: {}\n").unwrap();
         assert_eq!(load_from(&config).unwrap(), platform_default);
@@ -248,7 +213,7 @@ mod tests {
         assert_eq!(load_from(&config).unwrap(), LauncherConfig::Direct);
         std::fs::write(
             &config,
-            "vm:\n  init: direct\n  bwrap:\n    policy: unused.yml\n",
+            "vm:\n  init: direct\n  sandbox:\n    policy: unused.yml\n",
         )
         .unwrap();
         assert_eq!(load_from(&config).unwrap(), LauncherConfig::Direct);
@@ -259,16 +224,15 @@ mod tests {
         );
         std::fs::write(
             &config,
-            "vm:\n  init: ./launch vm\n  bwrap:\n    policy: unused.yml\n",
+            "vm:\n  init: ./launch vm\n  sandbox:\n    policy: unused.yml\n",
         )
         .unwrap();
         assert_eq!(
             load_from(&config).unwrap(),
             LauncherConfig::Custom(home.path().join("./launch vm"))
         );
-        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
         {
-            std::fs::write(&config, "vm:\n  bwrap:\n    policy: policy.yml\n").unwrap();
+            std::fs::write(&config, "vm:\n  sandbox:\n    policy: policy.yml\n").unwrap();
             assert_eq!(
                 load_from(&config).unwrap(),
                 LauncherConfig::Sandboxed {
@@ -278,7 +242,7 @@ mod tests {
             );
             std::fs::write(
                 &config,
-                "vm:\n  init: null\n  bwrap:\n    policy: policy.yml\n",
+                "vm:\n  init: null\n  sandbox:\n    policy: policy.yml\n",
             )
             .unwrap();
             assert_eq!(
@@ -290,7 +254,7 @@ mod tests {
             );
             std::fs::write(
                 &config,
-                "vm:\n  init: bwrap\n  bwrap:\n    policy: policy.yml\n",
+                "vm:\n  init: sandbox\n  sandbox:\n    policy: policy.yml\n",
             )
             .unwrap();
             assert_eq!(
@@ -303,7 +267,6 @@ mod tests {
         }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
     fn fallback_is_optional_and_requires_a_boolean() {
         let home = tempfile::tempdir().unwrap();
@@ -311,7 +274,7 @@ mod tests {
         for allow_fallback in [true, false] {
             std::fs::write(
                 &config,
-                format!("vm:\n  bwrap:\n    allow_fallback: {allow_fallback}\n"),
+                format!("vm:\n  sandbox:\n    allow_fallback: {allow_fallback}\n"),
             )
             .unwrap();
             assert_eq!(
@@ -322,11 +285,10 @@ mod tests {
                 }
             );
         }
-        std::fs::write(&config, "vm:\n  bwrap:\n    allow_fallback: sometimes\n").unwrap();
+        std::fs::write(&config, "vm:\n  sandbox:\n    allow_fallback: sometimes\n").unwrap();
         assert!(load_from(&config).is_err());
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
     fn policy_precedence_is_explicit_then_home_override_then_builtin() {
         let home = crate::sys::TestHome::new();
@@ -339,7 +301,7 @@ mod tests {
                 allow_fallback: true
             }
         );
-        let override_path = terra_home.join("config/seccomp.bpf");
+        let override_path = terra_home.join("config/seccomp");
         std::fs::write(&override_path, b"invalid BPF").unwrap();
         let overridden = load().unwrap();
         assert_eq!(
@@ -352,7 +314,7 @@ mod tests {
         assert!(terra_sandbox::resolve_policy(Some(&override_path), true).is_err());
         std::fs::write(
             terra_home.join("config.yaml"),
-            "vm:\n  bwrap:\n    policy: explicit.bpf\n    allow_fallback: false\n",
+            "vm:\n  sandbox:\n    policy: explicit.bpf\n    allow_fallback: false\n",
         )
         .unwrap();
         assert_eq!(
@@ -373,13 +335,13 @@ mod tests {
         for text in [
             "vm:\n  init: ''\n",
             "vm:\n  init: ' '\n",
-            "vm:\n  init: [bwrap]\n",
+            "vm:\n  init: [sandbox]\n",
             "vm:\n  init: true\n",
             "vm:\n  init: 5\n",
-            "vm:\n  int: bwrap\n",
-            "vm:\n  bwrap:\n    polciy: x\n",
-            "vm:\n  init: bwrap\n  bwrap:\n    policy: ''\n",
-            "vm:\n  init: bwrap\n  bwrap:\n    policy: https://example.com/policy.yml\n",
+            "vm:\n  int: sandbox\n",
+            "vm:\n  sandbox:\n    polciy: x\n",
+            "vm:\n  init: sandbox\n  sandbox:\n    policy: ''\n",
+            "vm:\n  init: sandbox\n  sandbox:\n    policy: https://example.com/policy.yml\n",
         ] {
             std::fs::write(&config, text).unwrap();
             let error = load_from(&config).unwrap_err().to_string();
@@ -387,19 +349,18 @@ mod tests {
         }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
-    fn default_bwrap_rejects_invalid_explicit_policy() {
+    fn default_sandbox_rejects_invalid_explicit_policy() {
         let home = tempfile::tempdir().unwrap();
         let config = home.path().join("config.yaml");
         for text in [
-            "vm:\n  bwrap:\n    policy: ''\n",
-            "vm:\n  bwrap:\n    policy: true\n",
-            "vm:\n  bwrap:\n    policy: https://example.com/policy.yml\n",
+            "vm:\n  sandbox:\n    policy: ''\n",
+            "vm:\n  sandbox:\n    policy: true\n",
+            "vm:\n  sandbox:\n    policy: https://example.com/policy.yml\n",
         ] {
             std::fs::write(&config, text).unwrap();
             let error = load_from(&config).unwrap_err().to_string();
-            assert!(error.contains("vm.bwrap.policy"), "{error}");
+            assert!(error.contains("vm.sandbox.policy"), "{error}");
         }
     }
 }

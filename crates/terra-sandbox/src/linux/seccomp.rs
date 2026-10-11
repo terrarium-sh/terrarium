@@ -12,19 +12,22 @@ pub fn resolve_policy(policy: Option<&Path>, allow_fallback: bool) -> Result<cra
     }
     ensure!(
         allow_fallback,
-        "a seccomp bundle is required (vm.bwrap.allow_fallback: false); set vm.bwrap.policy to a generated bundle directory or provide ~/.terra/config/seccomp"
+        "a seccomp bundle is required (vm.sandbox.allow_fallback: false); set vm.sandbox.policy to a generated bundle directory or provide ~/.terra/config/seccomp"
     );
-    Ok(crate::PolicyBundle {
-        supervisor: super::fallback_policy::SUPERVISOR.to_vec(),
-        vm: super::fallback_policy::VM.to_vec(),
-        network: super::fallback_policy::NETWORK.to_vec(),
+    crate::PolicyBundle::try_from_roles(|role| {
+        Ok(match role {
+            crate::Role::Supervisor => super::fallback_policy::SUPERVISOR,
+            crate::Role::Vm => super::fallback_policy::VM,
+            crate::Role::Network => super::fallback_policy::NETWORK,
+        }
+        .to_vec())
     })
 }
 
 fn read_bundle(path: &Path) -> Result<crate::PolicyBundle> {
     ensure!(
         path.is_dir(),
-        "seccomp policy {} is not a bundle directory; run `terra self-test --generate-policy` and set vm.bwrap.policy to the generated bundle directory",
+        "seccomp policy {} is not a bundle directory; run `terra self-test --generate-policy` and set vm.sandbox.policy to the generated bundle directory",
         path.display()
     );
     let file = terra_platform::filesystem::open_regular_file(&path.join("manifest.json"))?;
@@ -40,23 +43,14 @@ fn read_bundle(path: &Path) -> Result<crate::PolicyBundle> {
             && manifest["target"] == env!("TERRA_BUILD_TARGET"),
         "invalid or incompatible seccomp bundle manifest"
     );
-    let mut policies = Vec::new();
-    for role in crate::Role::ALL {
+    crate::PolicyBundle::try_from_roles(|role| {
         let bytes = read_policy(&path.join(format!("{}.seccomp.bpf", role.name())))?;
         ensure!(
             manifest["roles"][role.name()]["bpf_sha256"] == hash_bytes(&bytes),
             "seccomp {} policy hash does not match the manifest",
             role.name()
         );
-        policies.push(bytes);
-    }
-    let [supervisor, vm, network]: [Vec<u8>; 3] = policies
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("missing seccomp role"))?;
-    Ok(crate::PolicyBundle {
-        supervisor,
-        vm,
-        network,
+        Ok(bytes)
     })
 }
 
@@ -128,7 +122,7 @@ mod tests {
     fn non_bundle_or_invalid_policy_never_falls_back() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("policy.bpf");
-        let bpf = super::super::DEFAULT_POLICY;
+        let bpf = super::super::fallback_policy::SUPERVISOR;
         std::fs::write(&path, bpf).unwrap();
         for allow_fallback in [false, true] {
             assert!(resolve_policy(Some(&path), allow_fallback).is_err());

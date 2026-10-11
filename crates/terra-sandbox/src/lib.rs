@@ -2,23 +2,31 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitCode};
+use std::process::{Child, Command};
 use std::time::Duration;
 
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
+use linux as backend;
+#[cfg(target_os = "linux")]
 pub use linux::seccomp;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "macos")]
+use macos as backend;
 #[cfg(all(test, not(target_os = "macos")))]
 #[path = "macos/policy.rs"]
 mod macos_policy_tests;
-#[cfg(target_os = "windows")]
+#[cfg(windows)]
 mod windows;
+#[cfg(windows)]
+use windows as backend;
+
+pub use backend::{install_policy, resolve_policy, run_launcher_worker, verify_worker_role};
 
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
@@ -31,13 +39,6 @@ pub enum Role {
 }
 
 impl Role {
-    #[cfg_attr(
-        not(target_os = "linux"),
-        allow(
-            dead_code,
-            reason = "role bundle generation and policy tests enumerate every role"
-        )
-    )]
     pub const ALL: [Self; 3] = [Self::Supervisor, Self::Vm, Self::Network];
     #[must_use]
     pub const fn name(self) -> &'static str {
@@ -57,6 +58,14 @@ pub struct PolicyBundle {
 }
 
 impl PolicyBundle {
+    fn try_from_roles(mut policy: impl FnMut(Role) -> Result<Vec<u8>>) -> Result<Self> {
+        Ok(Self {
+            supervisor: policy(Role::Supervisor)?,
+            vm: policy(Role::Vm)?,
+            network: policy(Role::Network)?,
+        })
+    }
+
     #[must_use]
     pub fn get(&self, role: Role) -> &[u8] {
         match role {
@@ -67,16 +76,12 @@ impl PolicyBundle {
     }
 
     #[cfg(windows)]
-    pub fn uses_app_container(&self, role: Role) -> anyhow::Result<bool> {
+    pub fn uses_app_container(&self, role: Role) -> Result<bool> {
         windows::uses_app_container(self.get(role), role)
     }
 }
 
 pub const LAUNCHER_WORKER_ARG: &str = "__sandbox_launcher";
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-pub const DEFAULT_LAUNCHER: &str = "bwrap";
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-pub const DEFAULT_LAUNCHER: &str = "direct";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Access {
@@ -89,13 +94,6 @@ pub enum Access {
     Device,
 }
 
-#[cfg_attr(
-    not(any(target_os = "linux", target_os = "macos", target_os = "windows")),
-    allow(
-        dead_code,
-        reason = "filesystem grants require a supported native sandbox"
-    )
-)]
 pub struct Grant {
     pub path: PathBuf,
     pub access: Access,
@@ -112,192 +110,93 @@ impl Grant {
     }
 }
 
-#[cfg_attr(
-    not(any(target_os = "linux", target_os = "macos", target_os = "windows")),
-    allow(
-        dead_code,
-        reason = "confinement inputs require a supported native sandbox"
-    )
-)]
 pub struct Launch<'a> {
     pub role: Role,
     pub command: Command,
+    /// Grants beyond the role's platform files and the read-only executable.
     pub grants: Vec<Grant>,
-    pub die_with_parent: bool,
     /// Where macOS stages each signed worker bundle.
     pub staging_directory: &'a Path,
     /// `None` uses only the platform's mandatory role restrictions.
     pub policy: Option<&'a [u8]>,
 }
 
-pub enum PreparedLaunch {
-    Direct(Command),
-    #[cfg(target_os = "linux")]
-    Sandboxed(linux::PreparedLaunch),
-    #[cfg(target_os = "macos")]
-    Sandboxed(macos::PreparedLaunch),
-    #[cfg(target_os = "windows")]
-    Sandboxed(windows::PreparedLaunch),
+pub struct PreparedLaunch {
+    pub command: Command,
+    /// `None` runs `command` unconfined.
+    confinement: Option<backend::Confinement>,
+}
+
+/// Host resources a confined child needs until it exits.
+pub struct LaunchResources {
+    _retained: Option<backend::Resources>,
 }
 
 pub struct SpawnedLaunch {
     pub child: Child,
     pub pid: u32,
-    #[cfg(target_os = "windows")]
-    pub trusted_directories: Vec<File>,
-    #[cfg(target_os = "macos")]
-    pub sandbox_bundle: Option<tempfile::TempDir>,
+    pub resources: LaunchResources,
 }
 
 impl PreparedLaunch {
-    pub fn command_mut(&mut self) -> &mut Command {
-        match self {
-            Self::Direct(command) => command,
-            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-            Self::Sandboxed(launch) => &mut launch.command,
+    #[must_use]
+    pub const fn direct(command: Command) -> Self {
+        Self {
+            command,
+            confinement: None,
         }
     }
 
-    pub fn spawn(self, identity_timeout: Duration) -> Result<SpawnedLaunch> {
-        let _ = identity_timeout;
-        match self {
-            Self::Direct(mut command) => {
-                let child = command.spawn()?;
-                Ok(SpawnedLaunch {
-                    pid: child.id(),
-                    child,
-                    #[cfg(target_os = "windows")]
-                    trusted_directories: Vec::new(),
-                    #[cfg(target_os = "macos")]
-                    sandbox_bundle: None,
-                })
+    pub fn spawn(self, confirmation_timeout: Duration) -> Result<SpawnedLaunch> {
+        let Self {
+            mut command,
+            confinement,
+        } = self;
+        let spawned = command.spawn();
+        drop(command);
+        let mut child = spawned.context("starting the worker process")?;
+        let Some(confinement) = confinement else {
+            return Ok(SpawnedLaunch {
+                pid: child.id(),
+                child,
+                resources: LaunchResources { _retained: None },
+            });
+        };
+        match confinement.confirm(&mut child, confirmation_timeout) {
+            Ok((pid, retained)) => Ok(SpawnedLaunch {
+                child,
+                pid,
+                resources: LaunchResources {
+                    _retained: Some(retained),
+                },
+            }),
+            Err(error) => {
+                if terra_platform::process::kill_vm_child(&mut child).is_err() {
+                    let _ = child.kill();
+                }
+                let _ = child.wait();
+                Err(error)
             }
-            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-            Self::Sandboxed(launch) => launch.spawn(identity_timeout),
         }
     }
 }
 
-pub fn prepare_launch(launch: Launch<'_>) -> Result<PreparedLaunch> {
-    #[cfg(target_os = "linux")]
-    return linux::prepare_launch(launch).map(PreparedLaunch::Sandboxed);
-    #[cfg(target_os = "macos")]
-    return macos::prepare_launch(launch).map(PreparedLaunch::Sandboxed);
-    #[cfg(target_os = "windows")]
-    return windows::prepare_launch(launch).map(PreparedLaunch::Sandboxed);
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    {
-        drop(launch);
-        Err(unsupported_sandbox().into())
-    }
+/// Confines `launch.command` to its grants; the worker dies with this process.
+pub fn prepare_launch(mut launch: Launch<'_>) -> Result<PreparedLaunch> {
+    let executable = Grant::new(launch.command.get_program(), Access::ReadOnly);
+    launch.grants.extend(backend::role_grants(launch.role));
+    launch.grants.push(executable);
+    backend::prepare_launch(launch)
 }
 
-pub fn resolve_policy(policy: Option<&Path>, allow_fallback: bool) -> Result<PolicyBundle> {
-    #[cfg(target_os = "linux")]
-    return linux::seccomp::resolve_policy(policy, allow_fallback);
-    #[cfg(target_os = "macos")]
-    return macos::resolve_policy(policy, allow_fallback);
-    #[cfg(target_os = "windows")]
-    return windows::resolve_policy(policy, allow_fallback);
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    {
-        let _ = (policy, allow_fallback);
-        Err(unsupported_sandbox().into())
-    }
-}
-
-#[must_use]
-pub fn role_grants(role: Role) -> Vec<Grant> {
-    #[cfg(target_os = "linux")]
-    return linux::role_grants(role);
-    #[cfg(target_os = "macos")]
-    return macos::role_grants(role);
-    #[cfg(target_os = "windows")]
-    return windows::role_grants(role);
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    {
-        let _ = role;
-        Vec::new()
-    }
-}
-
-#[cfg_attr(
-    any(target_os = "linux", target_os = "macos", target_os = "windows"),
-    allow(
-        clippy::unnecessary_wraps,
-        reason = "unsupported platforms return an error"
-    )
-)]
-pub fn require_sandbox_support() -> Result<()> {
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-    return Ok(());
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    Err(unsupported_sandbox().into())
-}
-
-pub fn install_policy(policy: &[u8]) -> Result<()> {
-    #[cfg(target_os = "linux")]
-    return linux::seccomp::install_policy(policy);
-    #[cfg(target_os = "macos")]
-    return macos::install_policy(policy);
-    #[cfg(target_os = "windows")]
-    return windows::install_policy(policy);
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    {
-        let _ = policy;
-        Err(unsupported_sandbox().into())
-    }
-}
-
-#[cfg_attr(
-    not(any(target_os = "macos", target_os = "windows")),
-    allow(
-        clippy::unnecessary_wraps,
-        reason = "native role verification is fallible on macOS and Windows"
-    )
-)]
-pub fn verify_worker_role(role: Role) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    return macos::verify_worker_role(role);
-    #[cfg(target_os = "windows")]
-    return windows::verify_worker_role(role);
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        let _ = role;
-        Ok(())
-    }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn unsupported_sandbox() -> std::io::Error {
-    std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "native command confinement requires Linux, macOS, or Windows; choose direct or a custom launcher",
-    )
-}
-
-pub fn run_launcher_worker(
-    arguments: impl Iterator<Item = std::ffi::OsString>,
-) -> Result<ExitCode> {
-    #[cfg(target_os = "linux")]
-    {
-        anyhow::ensure!(
-            arguments.eq([std::ffi::OsString::from("--version")]),
-            "terra {LAUNCHER_WORKER_ARG} accepts only --version"
-        );
-        let status = linux::embedded_command()?.arg("--version").status()?;
-        Ok(ExitCode::from(
-            u8::try_from(status.code().unwrap_or(1)).unwrap_or(1),
-        ))
-    }
-    #[cfg(target_os = "macos")]
-    return macos::run_launcher_worker(arguments);
-    #[cfg(target_os = "windows")]
-    return windows::run_launcher_worker(arguments);
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    {
-        let _ = arguments;
-        Err(unsupported_sandbox().into())
+/// Gives `confined` only the variables `requested` sets explicitly.
+#[cfg(unix)]
+fn copy_explicit_environment(confined: &mut Command, requested: &Command) {
+    confined.env_clear();
+    for (name, value) in requested.get_envs() {
+        if let Some(value) = value {
+            confined.env(name, value);
+        }
     }
 }
 
@@ -306,12 +205,22 @@ mod tests {
     use super::*;
     use std::process::Stdio;
 
+    /// The build script compiles one fallback filter per terra-build role; a role
+    /// missing there would leave the runtime without its embedded policy.
+    #[test]
+    fn build_script_roles_match_runtime_roles() {
+        assert_eq!(
+            terra_build::seccomp::Role::ALL.map(terra_build::seccomp::Role::name),
+            Role::ALL.map(Role::name)
+        );
+    }
+
     #[test]
     fn direct_launch_preserves_command_and_reports_the_child_pid() -> Result<()> {
         let directory = tempfile::tempdir()?;
-        let mut launch = PreparedLaunch::Direct(Command::new(std::env::current_exe()?));
+        let mut launch = PreparedLaunch::direct(Command::new(std::env::current_exe()?));
         launch
-            .command_mut()
+            .command
             .arg("--list")
             .current_dir(directory.path())
             .stdout(Stdio::piped())
@@ -325,31 +234,5 @@ mod tests {
                 .contains("tests::direct_launch_preserves_command_and_reports_the_child_pid")
         );
         Ok(())
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    #[test]
-    fn unsupported_confinement_fails_before_running_the_command() {
-        let error = prepare_launch(Launch {
-            role: Role::Vm,
-            command: Command::new("missing-workload"),
-            grants: Vec::new(),
-            die_with_parent: false,
-            policy: None,
-            staging_directory: &std::env::temp_dir(),
-        })
-        .err()
-        .unwrap();
-        for error in [
-            error,
-            resolve_policy(Some(Path::new("missing-policy")), true).unwrap_err(),
-            resolve_policy(None, true).unwrap_err(),
-            run_launcher_worker(["--version".into()].into_iter()).unwrap_err(),
-        ] {
-            assert_eq!(
-                error.downcast_ref::<std::io::Error>().unwrap().kind(),
-                std::io::ErrorKind::Unsupported
-            );
-        }
     }
 }

@@ -14,12 +14,6 @@ mod imp;
 #[path = "sys/windows.rs"]
 mod imp;
 
-#[cfg(not(any(unix, windows)))]
-compile_error!(
-    "terra has no platform layer for this target - add crates/terra/src/sys/<host>.rs, \
-     for which crates/terra/src/sys/unix.rs is the worked example"
-);
-
 #[cfg(windows)]
 pub(crate) use imp::file_handle_matches_path;
 pub(crate) use imp::file_link_count;
@@ -46,17 +40,6 @@ pub(crate) use imp::supervise_supervisor_child;
 #[cfg(any(target_os = "macos", windows))]
 pub(crate) use imp::{claim_listener, pass_listener};
 pub(crate) use terra_platform::process::{claim_ipc, pass_ipc};
-
-#[cfg(windows)]
-pub(crate) fn listener_handle_environment(target: i32) -> std::io::Result<&'static str> {
-    match target {
-        10 => Ok("TERRA_AGENT_LISTENER_HANDLE"),
-        11 => Ok("TERRA_CONTROL_LISTENER_HANDLE"),
-        12 => Ok("TERRA_AGENT_CONTROL_LISTENER_HANDLE"),
-        13 => Ok("TERRA_AGENT_AGENT_LISTENER_HANDLE"),
-        _ => Err(std::io::Error::other("unsupported inherited listener")),
-    }
-}
 
 pub(crate) fn validate_host_root() -> anyhow::Result<()> {
     validate_host_root_for(
@@ -515,14 +498,7 @@ mod tests {
             assert!(child.try_wait().unwrap().is_none());
         }
         let result = terminate_process(pid, Some(started)).unwrap();
-        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
         assert_eq!(result, SignalResult::Sent);
-        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-        {
-            assert_eq!(result, SignalResult::IdentityUnknown);
-            assert!(child.try_wait().unwrap().is_none());
-            child.kill().unwrap();
-        }
         assert!(!child.wait().unwrap().success());
         assert_eq!(
             terminate_process(pid, Some(started)).unwrap(),

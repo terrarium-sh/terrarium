@@ -26,6 +26,9 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Network
 [build-dependencies]
 terra-build = { path = "../terra-build" }
 
+[dev-dependencies]
+terra-build = { path = "../terra-build" }
+
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 linux-raw-sys.workspace = true
 

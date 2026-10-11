@@ -48,7 +48,6 @@ pub trait BlockBacking {
 /// a check inside the component never constrains it after compromise.
 pub enum DiskGrant {
     Mem(BoundedDisk),
-    #[cfg(any(unix, windows))]
     File(FileDisk),
 }
 
@@ -56,7 +55,6 @@ impl BlockBacking for DiskGrant {
     fn capacity(&self) -> u64 {
         match self {
             Self::Mem(disk) => BlockBacking::capacity(disk),
-            #[cfg(any(unix, windows))]
             Self::File(disk) => BlockBacking::capacity(disk),
         }
     }
@@ -64,7 +62,6 @@ impl BlockBacking for DiskGrant {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), BackingError> {
         match self {
             Self::Mem(disk) => BlockBacking::read_at(disk, offset, buf),
-            #[cfg(any(unix, windows))]
             Self::File(disk) => BlockBacking::read_at(disk, offset, buf),
         }
     }
@@ -72,7 +69,6 @@ impl BlockBacking for DiskGrant {
     fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<(), BackingError> {
         match self {
             Self::Mem(disk) => BlockBacking::write_at(disk, offset, buf),
-            #[cfg(any(unix, windows))]
             Self::File(disk) => BlockBacking::write_at(disk, offset, buf),
         }
     }
@@ -80,7 +76,6 @@ impl BlockBacking for DiskGrant {
     fn discard(&mut self, offset: u64, len: u64) -> Result<(), BackingError> {
         match self {
             Self::Mem(disk) => BlockBacking::discard(disk, offset, len),
-            #[cfg(any(unix, windows))]
             Self::File(disk) => BlockBacking::discard(disk, offset, len),
         }
     }
@@ -88,7 +83,6 @@ impl BlockBacking for DiskGrant {
     fn sync(&self) -> Result<(), BackingError> {
         match self {
             Self::Mem(disk) => BlockBacking::sync(disk),
-            #[cfg(any(unix, windows))]
             Self::File(disk) => BlockBacking::sync(disk),
         }
     }
@@ -140,14 +134,12 @@ impl BlockBacking for BoundedDisk {
 /// no resize or truncate path, so a compromised component cannot grow
 /// the image through this handle; writes are positional loops that
 /// either complete fully or report `Io`.
-#[cfg(any(unix, windows))]
 pub struct FileDisk {
     file: std::fs::File,
     capacity: u64,
     readonly: bool,
 }
 
-#[cfg(any(unix, windows))]
 impl FileDisk {
     pub fn open(path: &std::path::Path, readonly: bool) -> std::io::Result<Self> {
         let file = terra_platform::filesystem::open_disk(path, readonly)?;
@@ -160,7 +152,6 @@ impl FileDisk {
     }
 }
 
-#[cfg(any(unix, windows))]
 impl BlockBacking for FileDisk {
     fn capacity(&self) -> u64 {
         self.capacity
@@ -194,7 +185,6 @@ impl BlockBacking for FileDisk {
     }
 }
 
-#[cfg(any(unix, windows))]
 impl FileDisk {
     fn check_range(&self, offset: u64, len: usize) -> Result<(), BackingError> {
         let len = u64::try_from(len).map_err(|_| BackingError::OutOfRange)?;
@@ -229,7 +219,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, any(unix, windows)))]
+#[cfg(test)]
 mod file_tests {
     use super::{BackingError, BlockBacking, FileDisk};
 

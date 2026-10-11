@@ -1,7 +1,7 @@
 # Host process sandboxing
 
 Terra splits each box into a trusted supervisor and confined workers, then
-confines each worker with the host platform's own mechanism. `vm.init: bwrap`
+confines each worker with the host platform's own mechanism. `vm.init: sandbox`
 (the default) selects this built-in sandbox; see [host VM launchers](vm-launchers.md)
 for configuration and policy generation. A failed sandbox
 launch stops the box; there is no automatic fallback to an unconfined launch.
@@ -31,9 +31,11 @@ under Bubblewrap.
   all capabilities. The VM also gets a private network namespace, so its native
   sockets cannot reach host networking; the broker keeps the host network
   namespace.
-- Each worker installs its own seccomp filter after namespace setup, and the
-  supervisor installs a separate lifecycle filter. Filters are generated from
+- Bubblewrap installs each worker's seccomp filters after namespace setup and
+  before exec: a permanent role filter plus the selected bundle's filter. The
+  supervisor installs its own lifecycle filter. Bundles are generated from
   traced self-tests and reviewed supplements (`scripts/seccomp/seccomp-supplements.json`).
+- The broker gets no `/dev` device nodes and no `/tmp`.
 - Workers stay in the host session, so the built-in filters and every generated
   bundle deny the `TIOCSTI` and `TIOCLINUX` terminal-injection ioctls.
 - The broker shares the host network namespace, where abstract Unix sockets
@@ -137,7 +139,7 @@ child-process denial and handle allowlist. **This mode does not deny native VM
 sockets and imposes no AppContainer file or process isolation**: a compromised
 VM keeps the user's access. Terra logs this and changes no firewall settings.
 
-Policy overrides live in a directory set by `vm.bwrap.policy`, holding
+Policy overrides live in a directory set by `vm.sandbox.policy`, holding
 `supervisor.sandbox.json`, `vm.sandbox.json` and `network.sandbox.json`. Unknown
 fields, wrong roles and unsupported versions are rejected, and Linux seccomp files
 are not accepted.

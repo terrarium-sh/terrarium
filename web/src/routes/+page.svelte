@@ -27,7 +27,7 @@
 
 <svelte:head>
   <title>Terrarium — room to work</title>
-  <meta name="description" content="Run coding agents and development tools in a microVM. One static core, Wasm-isolated devices, explicit access, and native support for Linux and Windows (x86_64 / ARM64), and macOS on Apple Silicon." />
+  <meta name="description" content="A home for persistent agents and a confined dev VM for your harness. One static core, Wasm-isolated devices, explicit access, and native support for Linux and Windows (x86_64 / ARM64), and macOS on Apple Silicon." />
 </svelte:head>
 
 <aside class="construction-notice" aria-label="Project status">
@@ -52,6 +52,12 @@
   </div>
 </section>
 
+<section class="principles use-cases" aria-label="What Terrarium is for">
+  <div><span class="eyebrow">Primary use / Agents</span><h2>A terrarium for agents.</h2><p>Give a long-lived agent a box of its own. Its storage persists across restarts, and it reaches only the files and destinations you grant.</p><a href="{base}/docs/usage/#a-terrarium-for-agents">Set one up <span aria-hidden="true">→</span></a></div>
+  <div><span class="eyebrow">Primary use / Development</span><h2>A dev VM for your harness.</h2><p>Run Claude Code, Codex, or your own tooling against your project in a confined VM instead of on your host.</p><a href="#start">Start with the quickstart <span aria-hidden="true">→</span></a></div>
+  <div><span class="eyebrow">And more</span><h2>Room for more.</h2><p>Anything that needs a clear boundary: untrusted builds, unfamiliar installers, one-off recipe runs, or a service published on host loopback.</p><a href="{base}/docs/usage/#primary-uses">Read the usage guide <span aria-hidden="true">→</span></a></div>
+</section>
+
 <section class="principles" aria-label="Why Terrarium">
   <div><span class="eyebrow">01 / Self-contained</span><h2>One static core.</h2><p>The kernel, base filesystem, and device components ship in one binary. A small core you can inspect, with recipes and hooks to extend it.</p></div>
   <div><span class="eyebrow">02 / Isolated</span><h2>Wasm-isolated devices.</h2><p>Software fault isolation (SFI) gives the VMM and every device instance a separate WebAssembly sandbox, with scoped access to a thin host API.</p></div>
@@ -66,7 +72,7 @@
     <p class="eyebrow">From a recipe to a running box</p>
     <h2>Make a little room.</h2>
     {#if releaseTag}<p class="release-note">Current release <a target="_blank" rel="noopener noreferrer" href={`https://github.com/terrarium-sh/terrarium/releases/tag/${releaseTag}`}>{releaseTag}</a></p>{/if}
-    <p>Install Terra and save this recipe as <code>dev.yaml</code>. Then set up and enter your box.</p>
+    <p>Start with a dev VM: install Terra and save this recipe as <code>dev.yaml</code>. Then set up and enter your box.</p>
     {#if isClient}
       <div class="platform-choice">
         <Select label="Install for" options={platforms} value={platforms.find(item => item.value === platform)} onselected={(item: SelectItem<ClientPlatform>) => platform = item.value} />

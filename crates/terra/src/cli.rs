@@ -17,7 +17,7 @@ use terra_protocol::DEFAULT_STOP_GRACE_SECS;
                   defaults to this directory's only box. With a box already up and \
                   neither a terminal to attach from nor `-d`, terra exits 125.\n\n\
                   Native sandboxes isolate the VM and network broker by default. Set vm.init in ~/.terra/config.yaml to \
-                  direct to disable them, or bwrap to select them explicitly.",
+                  direct to disable them, or sandbox to select them explicitly.",
     after_long_help = "EXAMPLES:\n    \
                        terra dev                   Start this directory's box `dev`, or attach\n    \
                        terra dev exec -- ls        Run a command in the running box\n    \

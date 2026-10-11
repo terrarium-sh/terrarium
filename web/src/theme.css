@@ -102,6 +102,9 @@ nav a[aria-current] { color: var(--accent-strong); background: var(--accent-soft
 .principles { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1.75rem; padding: 2rem; background: #eeefe580; border: 1px solid var(--frost-border-color); border-radius: 18px; }
 .principles h2 { font-size: 1.2rem; margin-top: 1rem; }
 .principles p { color: var(--hint-color); font-size: 0.88rem; margin-bottom: 0; }
+.use-cases { grid-template-columns: 1fr 1fr 0.85fr; margin-bottom: 1.5rem; }
+.use-cases > :last-child { padding-left: 1.75rem; border-left: 1px solid var(--frost-border-color); }
+.use-cases a { display: inline-block; margin-top: 1rem; font-size: 0.88rem; }
 .isolation-section { display: grid; grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.7fr); grid-template-areas: ". figure" "heading figure" "steps figure" ". figure"; grid-template-rows: 1fr auto auto 1fr; gap: 0 3.5rem; padding-block: 5.5rem; border-bottom: 1px solid var(--frost-border-color); }
 .isolation-heading { grid-area: heading; }
 .isolation-heading h2 { margin-bottom: 0; font-size: clamp(1.6rem, 2.4vw, 1.85rem); }
@@ -249,6 +252,8 @@ nav a[aria-current] { color: var(--accent-strong); background: var(--accent-soft
   .hero h1 { font-size: 3rem; }
   .start-section { gap: 2rem; }
   .principles { grid-template-columns: repeat(2, 1fr); gap: 2rem; }
+  .use-cases { grid-template-columns: 1fr; }
+  .use-cases > :last-child { padding: 2rem 0 0; border-left: 0; border-top: 1px solid var(--frost-border-color); }
   .reading-grid { grid-template-columns: 1fr; }
   .reference-layout { grid-template-columns: 170px minmax(0, 1fr); gap: 1.5rem; }
 }

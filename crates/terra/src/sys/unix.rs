@@ -312,11 +312,6 @@ pub fn read_process_start_time(pid: u32) -> Option<u64> {
             .checked_mul(1_000_000)?
             .checked_add(info.pbi_start_tvusec)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        let _ = pid;
-        None
-    }
 }
 
 /// `IdentityUnknown` means the process cannot be pinned and verified against its published identity.
@@ -349,11 +344,6 @@ pub fn terminate_process(
     #[cfg(target_os = "macos")]
     {
         macos::terminate_process(target.as_raw_pid(), published_start_time)
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        let _ = (target, published_start_time);
-        Ok(super::SignalResult::IdentityUnknown)
     }
 }
 

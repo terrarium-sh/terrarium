@@ -129,47 +129,36 @@ fn read_capture(file: &mut File) -> Result<Vec<u8>> {
 pub(crate) struct SupervisedChild {
     child: Child,
     guard: Option<sys::VmChildGuard>,
-    #[cfg(windows)]
-    trusted_directories: Vec<File>,
-    #[cfg(target_os = "macos")]
-    sandbox_bundle: Option<tempfile::TempDir>,
+    _launch_resources: Option<terra_sandbox::LaunchResources>,
     is_reaped: bool,
 }
 
 impl SupervisedChild {
     pub(crate) fn new(child: Child, guard: Option<sys::VmChildGuard>) -> Result<Self> {
-        let supervised = Self {
-            child,
-            guard,
-            #[cfg(windows)]
-            trusted_directories: Vec::new(),
-            #[cfg(target_os = "macos")]
-            sandbox_bundle: None,
-            is_reaped: false,
-        };
-        if let Some(guard) = &supervised.guard {
-            sys::attach_vm_child(guard, &supervised.child)?;
-        }
-        Ok(supervised)
+        Self::attach(child, guard, None)
     }
 
     pub(crate) fn from_launch(
         spawned: terra_sandbox::SpawnedLaunch,
         guard: Option<sys::VmChildGuard>,
     ) -> Result<Self> {
-        let supervised = Self::new(spawned.child, guard)?;
-        #[cfg(windows)]
-        let supervised = {
-            let mut supervised = supervised;
-            supervised.trusted_directories = spawned.trusted_directories;
-            supervised
+        Self::attach(spawned.child, guard, Some(spawned.resources))
+    }
+
+    fn attach(
+        child: Child,
+        guard: Option<sys::VmChildGuard>,
+        launch_resources: Option<terra_sandbox::LaunchResources>,
+    ) -> Result<Self> {
+        let supervised = Self {
+            child,
+            guard,
+            _launch_resources: launch_resources,
+            is_reaped: false,
         };
-        #[cfg(target_os = "macos")]
-        let supervised = {
-            let mut supervised = supervised;
-            supervised.sandbox_bundle = spawned.sandbox_bundle;
-            supervised
-        };
+        if let Some(guard) = &supervised.guard {
+            sys::attach_vm_child(guard, &supervised.child)?;
+        }
         Ok(supervised)
     }
 
@@ -514,6 +503,7 @@ mod tests {
         let mut unrelated = SupervisedChild {
             child: unrelated,
             guard: None,
+            _launch_resources: None,
             is_reaped: false,
         };
         let pid_file = directory.path().join("child.pid");
@@ -548,6 +538,7 @@ mod tests {
         let mut child = SupervisedChild {
             child: command.spawn().unwrap(),
             guard: None,
+            _launch_resources: None,
             is_reaped: false,
         };
         let error = cleanup_tagged_processes(directory.path().as_os_str(), |_, _| {

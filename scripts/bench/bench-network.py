@@ -588,7 +588,7 @@ def measure_box(binary, probe, launcher, run, args, fixtures):
 
 def summarize(runs: list[dict]) -> dict:
     summary = {}
-    for launcher in ("direct", "bwrap"):
+    for launcher in ("direct", "sandbox"):
         completed = [run for run in runs if run["launcher"] == launcher and "failure" not in run]
         if not completed:
             continue
@@ -614,10 +614,10 @@ def summarize_pairs(runs: list[dict]) -> dict:
     completed = {(run["run"], run["launcher"]): run for run in runs if "failure" not in run}
     cases = {}
     for run_number in sorted({run["run"] for run in runs}):
-        if (run_number, "direct") not in completed or (run_number, "bwrap") not in completed:
+        if (run_number, "direct") not in completed or (run_number, "sandbox") not in completed:
             continue
         direct = {operation["case"]: operation for operation in completed[run_number, "direct"]["operations"]}
-        broker = {operation["case"]: operation for operation in completed[run_number, "bwrap"]["operations"]}
+        broker = {operation["case"]: operation for operation in completed[run_number, "sandbox"]["operations"]}
         for case in sorted(direct.keys() & broker.keys()):
             metrics = cases.setdefault(case, {})
             for field in ("mib_per_second", "p50_us", "p95_us", "first_connect_us", "connections_per_second", "host_box_cpu_seconds", "host_total_cpu_seconds", "host_box_cpu_seconds_per_mib"):
@@ -725,7 +725,7 @@ def main():
                 report["counter_self_check"] = {"process_tree_pss": pss, "worker_context_switches": stable, "host_irqs": snapshot_host_irqs()}
                 paired = []
                 for run_number, (direct_rate, broker_rate) in enumerate(((100, 10), (100, 200), (1, 2))):
-                    for launcher, rate in (("direct", direct_rate), ("bwrap", broker_rate)):
+                    for launcher, rate in (("direct", direct_rate), ("sandbox", broker_rate)):
                         paired.append({"run": run_number, "launcher": launcher, "operations": [{"case": "tcp_download", "mib_per_second": rate}]})
                 ratios = summarize_pairs(list(reversed(paired)))["tcp_download"]["mib_per_second"]
                 if ratios["median_ratio"] != 2 or len(ratios["pairs"]) != 3:
@@ -814,7 +814,7 @@ def main():
                 binary = args.terra.resolve()
                 report.update({"terra": str(binary), "terra_sha256": BENCH.digest(binary)})
                 for run in range(args.runs):
-                    for launcher in (("direct", "bwrap") if run % 2 == 0 else ("bwrap", "direct")):
+                    for launcher in (("direct", "sandbox") if run % 2 == 0 else ("sandbox", "direct")):
                         result = measure_box(binary, probe, launcher, run, args, fixtures)
                         report["runs"].append(result)
                         if args.profile_download is None and not args.sample_memory:

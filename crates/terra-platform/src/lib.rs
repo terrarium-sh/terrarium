@@ -2,6 +2,9 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+compile_error!("terra runs VMs only on Linux (KVM), macOS (HVF), and Windows (WHP)");
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]

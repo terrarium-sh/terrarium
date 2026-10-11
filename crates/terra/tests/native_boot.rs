@@ -839,7 +839,7 @@ fn windows_broker_and_supervisor_death_release_published_ports() {
         let fixture = BoxFixture::new();
         std::fs::write(
             fixture.home.join(".terra/config.yaml"),
-            "vm:\n  init: bwrap\n",
+            "vm:\n  init: sandbox\n",
         )
         .unwrap();
         let tcp_reservation = TcpListener::bind("127.0.0.1:0").unwrap();

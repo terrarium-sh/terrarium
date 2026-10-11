@@ -1,7 +1,7 @@
 //! Bubblewrap confinement and child identity handoff.
 
 use super::seccomp;
-use crate::{Access, Grant, Launch, Role, SpawnedLaunch};
+use crate::{Access, Grant, Launch, PreparedLaunch, Role};
 use anyhow::{Context, Result, ensure};
 use std::collections::BTreeSet;
 use std::fs::File;
@@ -9,7 +9,7 @@ use std::io::Write;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Child, Command};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -19,31 +19,15 @@ const SECCOMP_FD: RawFd = 5;
 const INFO_FD: RawFd = 6;
 const WORKER_FLOOR_FD: RawFd = 10;
 
-pub struct PreparedLaunch {
-    pub command: Command,
+pub struct Confinement {
     inherited_files: Vec<File>,
     identity: File,
 }
 
-impl PreparedLaunch {
-    pub fn spawn(self, identity_timeout: Duration) -> Result<SpawnedLaunch> {
-        let Self {
-            mut command,
-            inherited_files,
-            identity,
-        } = self;
-        let spawned = command.spawn();
-        drop((command, inherited_files));
-        let mut child = spawned.context("starting Bubblewrap sandbox")?;
-        match read_child_pid(identity, identity_timeout) {
-            Ok(pid) => Ok(SpawnedLaunch { child, pid }),
-            Err(error) => {
-                let _ = terra_platform::process::kill_vm_child(&mut child);
-                let _ = child.kill();
-                let _ = child.wait();
-                Err(error)
-            }
-        }
+impl Confinement {
+    pub(crate) fn confirm(self, _child: &mut Child, timeout: Duration) -> Result<(u32, ())> {
+        drop(self.inherited_files);
+        Ok((read_child_pid(self.identity, timeout)?, ()))
     }
 }
 
@@ -83,7 +67,6 @@ pub fn prepare_launch(launch: Launch<'_>) -> Result<PreparedLaunch> {
         role,
         command,
         mut grants,
-        die_with_parent,
         policy,
         staging_directory: _,
     } = launch;
@@ -107,7 +90,7 @@ pub fn prepare_launch(launch: Launch<'_>) -> Result<PreparedLaunch> {
     }
 
     let mut cmd = embedded_command()?;
-    restrict_environment(&mut cmd, &command);
+    crate::copy_explicit_environment(&mut cmd, &command);
     cmd.args([
         "--unshare-user",
         "--unshare-ipc",
@@ -115,25 +98,17 @@ pub fn prepare_launch(launch: Launch<'_>) -> Result<PreparedLaunch> {
         "--unshare-uts",
         "--as-pid-1",
         "--disable-userns",
+        "--die-with-parent",
         "--cap-drop",
         "ALL",
         "--proc",
         "/proc",
     ]);
     match role {
-        Role::Supervisor | Role::Vm => {
-            cmd.args(["--dev", "/dev", "--tmpfs", "/tmp"]);
-        }
-        Role::Network => {
-            cmd.args(["--dir", "/dev"]);
-        }
-    }
-    if die_with_parent {
-        cmd.arg("--die-with-parent");
-    }
-    if role == Role::Vm {
-        cmd.arg("--unshare-net");
-    }
+        Role::Supervisor => cmd.args(["--dev", "/dev", "--tmpfs", "/tmp"]),
+        Role::Vm => cmd.args(["--dev", "/dev", "--tmpfs", "/tmp", "--unshare-net"]),
+        Role::Network => cmd.args(["--dir", "/dev"]),
+    };
 
     grants.sort_by_key(|grant| grant.path.components().count());
     append_mounts(&mut cmd, grants)?;
@@ -167,18 +142,11 @@ pub fn prepare_launch(launch: Launch<'_>) -> Result<PreparedLaunch> {
         .args(command.get_args());
     Ok(PreparedLaunch {
         command: cmd,
-        inherited_files,
-        identity: File::from(reader),
+        confinement: Some(Confinement {
+            inherited_files,
+            identity: File::from(reader),
+        }),
     })
-}
-
-fn restrict_environment(command: &mut Command, grants: &Command) {
-    command.env_clear();
-    for (name, value) in grants.get_envs() {
-        if let Some(value) = value {
-            command.env(name, value);
-        }
-    }
 }
 
 #[allow(unsafe_code)]
@@ -310,7 +278,7 @@ mod tests {
         grants.env("GRANTED", "value").env_remove("PROHIBITED");
         let mut probe = Command::new("/usr/bin/env");
         probe.env("HOST_SECRET", "secret");
-        restrict_environment(&mut probe, &grants);
+        crate::copy_explicit_environment(&mut probe, &grants);
         let output = probe.output().unwrap();
         assert!(output.status.success());
         assert_eq!(output.stdout, b"GRANTED=value\n");
@@ -368,8 +336,7 @@ mod tests {
             role: Role::Vm,
             command,
             grants: vec![child, parent, Grant::new(&recipe, Access::ReadOnly)],
-            die_with_parent: true,
-            policy: Some(super::super::DEFAULT_POLICY),
+            policy: Some(super::super::fallback_policy::SUPERVISOR),
             staging_directory: &std::env::temp_dir(),
         })
         .unwrap();
@@ -438,7 +405,6 @@ mod tests {
             role: Role::Network,
             command,
             grants,
-            die_with_parent: true,
             policy: None,
             staging_directory: &std::env::temp_dir(),
         })
@@ -528,8 +494,10 @@ mod tests {
         command.arg("5");
         let launch = PreparedLaunch {
             command,
-            inherited_files: Vec::new(),
-            identity: tempfile::tempfile().unwrap(),
+            confinement: Some(Confinement {
+                inherited_files: Vec::new(),
+                identity: tempfile::tempfile().unwrap(),
+            }),
         };
         let started = std::time::Instant::now();
         assert!(launch.spawn(Duration::from_secs(1)).is_err());
@@ -604,7 +572,6 @@ mod tests {
                 role,
                 command,
                 grants,
-                die_with_parent: true,
                 policy: None,
                 staging_directory: &std::env::temp_dir(),
             })?;
@@ -743,7 +710,6 @@ mod tests {
                 Grant::new(&host_pid, Access::ReadOnly),
                 Grant::new("/dev/kvm", Access::Device),
             ],
-            die_with_parent: true,
             policy: Some(&filter),
             staging_directory: &std::env::temp_dir(),
         })

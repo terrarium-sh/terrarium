@@ -2,7 +2,7 @@
 
 mod policy;
 
-use super::{Access, Grant, Launch, PolicyBundle, Role, SpawnedLaunch};
+use super::{Access, Grant, Launch, PolicyBundle, PreparedLaunch, Role};
 use anyhow::{Context, Result, ensure};
 use sha2::{Digest as _, Sha256};
 use std::fmt::Write as _;
@@ -11,7 +11,7 @@ use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::process::{Command, ExitCode};
+use std::process::{Child, Command, ExitCode};
 use std::time::Duration;
 
 const CODESIGN: &str = "/usr/bin/codesign";
@@ -21,52 +21,37 @@ const ACTIVATION_FD: i32 = 9;
 const ACTIVATION_ACK: u8 = 0x53;
 const SIGNING_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub struct PreparedLaunch {
-    pub command: Command,
+pub struct Confinement {
     bundle: tempfile::TempDir,
     inherited: File,
     activation: UnixStream,
 }
 
-impl PreparedLaunch {
-    pub fn spawn(self, identity_timeout: Duration) -> Result<SpawnedLaunch> {
+/// The signed worker bundle, which must outlive the worker.
+pub type Resources = tempfile::TempDir;
+
+impl Confinement {
+    pub(crate) fn confirm(self, child: &mut Child, timeout: Duration) -> Result<(u32, Resources)> {
         let Self {
-            mut command,
             bundle,
             inherited,
             mut activation,
         } = self;
+        drop(inherited);
         ensure!(
-            !identity_timeout.is_zero(),
+            !timeout.is_zero(),
             "macOS confinement activation needs a deadline"
         );
-        activation.set_read_timeout(Some(identity_timeout))?;
-        let spawned = command.spawn();
-        drop((command, inherited));
-        let mut child = spawned.context("starting macOS App Sandbox worker")?;
+        activation.set_read_timeout(Some(timeout))?;
         let mut acknowledgement = [0];
-        let result = activation
+        activation
             .read_exact(&mut acknowledgement)
-            .map_err(anyhow::Error::from)
-            .and_then(|()| {
-                ensure!(
-                    acknowledgement == [ACTIVATION_ACK],
-                    "macOS worker sent an invalid activation acknowledgement"
-                );
-                Ok(())
-            });
-        if let Err(error) = result {
-            let _ = terra_platform::process::kill_vm_child(&mut child);
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(error
-                .context("macOS sandbox worker did not verify confinement before initialization"));
-        }
-        Ok(SpawnedLaunch {
-            pid: child.id(),
-            child,
-            sandbox_bundle: Some(bundle),
-        })
+            .context("macOS sandbox worker did not verify confinement before initialization")?;
+        ensure!(
+            acknowledgement == [ACTIVATION_ACK],
+            "macOS worker sent an invalid activation acknowledgement"
+        );
+        Ok((child.id(), bundle))
     }
 }
 
@@ -75,24 +60,13 @@ pub fn prepare_launch(launch: Launch<'_>) -> Result<PreparedLaunch> {
         role,
         command,
         grants,
-        die_with_parent,
-        policy,
+        policy: _,
         staging_directory,
     } = launch;
     ensure!(
         role != Role::Supervisor,
         "the macOS supervisor uses the trusted lifecycle launcher"
     );
-    ensure!(
-        die_with_parent,
-        "macOS sandbox workers require supervisor parent-death handling"
-    );
-    if let Some(policy) = policy {
-        ensure!(
-            policy == policy::marker(role),
-            "macOS worker policy does not match its trusted launch role"
-        );
-    }
     let executable = Path::new(command.get_program());
     ensure!(
         executable.is_absolute() && executable.is_file(),
@@ -140,12 +114,8 @@ pub fn prepare_launch(launch: Launch<'_>) -> Result<PreparedLaunch> {
     )
     .context("verifying the signed macOS worker")?;
     let mut worker_command = Command::new(worker);
-    worker_command.args(command.get_args()).env_clear();
-    for (name, value) in command.get_envs() {
-        if let Some(value) = value {
-            worker_command.env(name, value);
-        }
-    }
+    worker_command.args(command.get_args());
+    crate::copy_explicit_environment(&mut worker_command, &command);
     worker_command
         .env(ROLE_ENV, role.name())
         .env(PROBE_ENV, probe);
@@ -158,9 +128,11 @@ pub fn prepare_launch(launch: Launch<'_>) -> Result<PreparedLaunch> {
     )?;
     Ok(PreparedLaunch {
         command: worker_command,
-        bundle,
-        inherited,
-        activation,
+        confinement: Some(Confinement {
+            bundle,
+            inherited,
+            activation,
+        }),
     })
 }
 
@@ -219,21 +191,14 @@ fn build_identifier(role: Role, executable: &Path, entitlements: &str) -> Result
 pub fn resolve_policy(policy: Option<&Path>, allow_fallback: bool) -> Result<PolicyBundle> {
     ensure!(
         policy.is_none(),
-        "macOS uses signed App Sandbox role policies; remove vm.bwrap.policy (Linux seccomp overrides cannot be used on macOS)"
+        "macOS uses signed App Sandbox role policies; remove vm.sandbox.policy (Linux seccomp overrides cannot be used on macOS)"
     );
     let _ = allow_fallback;
-    Ok(PolicyBundle {
-        supervisor: policy::marker(Role::Supervisor).to_vec(),
-        vm: policy::marker(Role::Vm).to_vec(),
-        network: policy::marker(Role::Network).to_vec(),
-    })
+    PolicyBundle::try_from_roles(|_| Ok(Vec::new()))
 }
 
-pub fn install_policy(policy: &[u8]) -> Result<()> {
-    ensure!(
-        policy == policy::marker(Role::Supervisor),
-        "macOS supervisor policy marker is invalid; worker authority must be installed by the signed launcher"
-    );
+/// The macOS supervisor stays unsandboxed; each worker's signed entitlements carry its authority.
+pub fn install_policy(_policy: &[u8]) -> Result<()> {
     Ok(())
 }
 
@@ -309,6 +274,7 @@ pub fn run_launcher_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SpawnedLaunch;
     use std::assert_matches;
     use std::os::fd::FromRawFd;
     use std::os::unix::net::{UnixDatagram, UnixListener};
@@ -503,8 +469,7 @@ mod tests {
                 role,
                 command,
                 grants,
-                die_with_parent: true,
-                policy: Some(policy::marker(role)),
+                policy: None,
                 staging_directory: &state,
             })?;
             launch.command.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -518,14 +483,12 @@ mod tests {
                 None
             };
             let SpawnedLaunch {
-                child,
-                sandbox_bundle,
-                ..
+                child, resources, ..
             } = launch.spawn(Duration::from_secs(10))?;
             drop(inherited_listener);
             let output = child.wait_with_output()?;
             assert!(output.status.success(), "{role:?}: {output:?}");
-            drop(sandbox_bundle);
+            drop(resources);
             match role {
                 Role::Vm => {
                     assert_matches!(

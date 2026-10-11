@@ -2,8 +2,6 @@ pub(super) const SUPERVISOR: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/supervisor-seccomp.bpf"));
 pub(super) const VM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/vm-seccomp.bpf"));
 pub(super) const NETWORK: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/network-seccomp.bpf"));
-#[cfg(test)]
-const BPF: &[u8] = SUPERVISOR;
 
 #[cfg(all(test, any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod tests {
@@ -75,8 +73,8 @@ mod tests {
             (load_word, 0, 0, 0),
         ]);
         expected.push((return_value, 0, 0, libc::SECCOMP_RET_ALLOW));
-        assert!(BPF.len().is_multiple_of(8));
-        let actual: Vec<_> = decode_instructions()
+        let actual: Vec<_> = super::super::seccomp::decode_bpf(SUPERVISOR)
+            .unwrap()
             .iter()
             .map(|filter| (filter.code, filter.jt, filter.jf, filter.k))
             .collect();
@@ -263,23 +261,9 @@ mod tests {
 
     #[allow(unsafe_code)]
     fn install_and_probe() {
-        let filters = decode_instructions();
-        let program = libc::sock_fprog {
-            len: filters.len().try_into().unwrap(),
-            filter: filters.as_ptr().cast_mut(),
-        };
-
-        // SAFETY: The program points to live filters for the duration of prctl, and syscall arguments match their Linux ABI.
+        super::super::seccomp::install_policy(SUPERVISOR).unwrap();
+        // SAFETY: these syscalls take no pointers.
         unsafe {
-            assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), 0);
-            assert_eq!(
-                libc::prctl(
-                    libc::PR_SET_SECCOMP,
-                    libc::SECCOMP_MODE_FILTER,
-                    &raw const program
-                ),
-                0
-            );
             assert!(libc::syscall(libc::SYS_getpid) > 0);
             #[cfg(target_arch = "x86_64")]
             if std::env::var("TERRA_FALLBACK_SECCOMP_TEST_CHILD").unwrap() == "x32" {
@@ -313,18 +297,5 @@ mod tests {
                 Some(libc::EPERM)
             );
         }
-    }
-
-    fn decode_instructions() -> Vec<libc::sock_filter> {
-        BPF.as_chunks::<8>()
-            .0
-            .iter()
-            .map(|chunk| libc::sock_filter {
-                code: u16::from_ne_bytes([chunk[0], chunk[1]]),
-                jt: chunk[2],
-                jf: chunk[3],
-                k: u32::from_ne_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]),
-            })
-            .collect()
     }
 }

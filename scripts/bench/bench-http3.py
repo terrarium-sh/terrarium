@@ -25,7 +25,7 @@ def digest(path):
 
 def summarize(runs):
     summaries = {}
-    for launcher in ("native", "direct", "bwrap"):
+    for launcher in ("native", "direct", "sandbox"):
         summaries[launcher] = {}
         for case in ("http3_upload", "http3_download"):
             values = [operation["mib_per_second"] for run in runs
@@ -115,7 +115,7 @@ def main():
                 time.sleep(0.05)
             address = (fixture / "address").read_text().strip()
             port = address.rsplit(":", 1)[1]
-            launchers = ["native", "direct", "bwrap"]
+            launchers = ["native", "direct", "sandbox"]
             for index in range(args.runs):
                 for launcher in launchers[index % 3:] + launchers[:index % 3]:
                     cell = {"run": index, "launcher": launcher, "operations": []}

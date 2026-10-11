@@ -235,7 +235,6 @@ pub(super) async fn fixture_with_host(
     }
 }
 
-#[cfg(any(unix, windows))]
 async fn benchmark_block_io(
     fixture: &mut Fixture,
     disk_path: &std::path::Path,
@@ -313,7 +312,6 @@ async fn benchmark_block_io(
     );
 }
 
-#[cfg(any(unix, windows))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "AOT file-backed MMIO queue benchmark; run with --release --ignored --nocapture"]
 #[allow(unsafe_code)]

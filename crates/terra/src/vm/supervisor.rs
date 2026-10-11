@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 #[cfg(any(target_os = "macos", windows))]
 use terra_platform::io::local::LocalListener;
 use terra_platform::io::local::{AsyncLocalStream, LocalStream, create_local_pair};
-use terra_sandbox::{Access, Grant, Launch, PolicyBundle, PreparedLaunch, Role};
+use terra_sandbox::{Launch, PolicyBundle, PreparedLaunch, Role};
 
 pub(crate) const SUPERVISOR_ARG: &str = "__supervisor";
 pub(crate) const NETWORK_ARG: &str = "__network";
@@ -189,7 +189,7 @@ fn run_box(dir: PathBuf, lock: &File) -> Result<ExitCode> {
         policies.as_ref().map(|policies| policies.get(Role::Vm)),
         self_test,
     )?;
-    let command = launch.command_mut();
+    let command = &mut launch.command;
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -262,9 +262,9 @@ fn prepare_vm_launch(
         VmLauncher::Direct => {
             let mut command = Command::new(executable);
             command.arg(boot::VM_PROCESS_FLAG_ARG).arg(bx.get_dir());
-            Ok(PreparedLaunch::Direct(command))
+            Ok(PreparedLaunch::direct(command))
         }
-        VmLauncher::Custom(initializer) => Ok(PreparedLaunch::Direct(
+        VmLauncher::Custom(initializer) => Ok(PreparedLaunch::direct(
             super::launcher::custom_command(initializer, executable, spec, bx)?,
         )),
         VmLauncher::Sandboxed => {
@@ -310,12 +310,8 @@ fn prepare_vm_outputs(bx: &BoxRef, is_self_test: bool) -> Result<()> {
     sys::create_regular_file(&bx.get_dir().join(state::DIAGNOSTICS_LOG))?;
     if is_self_test {
         let directory = self_test_directory(bx);
-        std::fs::create_dir_all(&directory)?;
-        #[cfg(windows)]
-        {
-            std::fs::create_dir_all(directory.join("writable"))?;
-            std::fs::create_dir_all(directory.join("readonly"))?;
-        }
+        std::fs::create_dir_all(directory.join("writable"))?;
+        std::fs::create_dir_all(directory.join("readonly"))?;
     }
     Ok(())
 }
@@ -595,12 +591,11 @@ fn run_native_probe(port: u16, policy: Option<&[u8]>) -> Result<()> {
     let mut launch = terra_sandbox::prepare_launch(Launch {
         role: Role::Vm,
         command,
-        grants: vec![Grant::new(executable, Access::ReadOnly)],
-        die_with_parent: true,
+        grants: Vec::new(),
         policy,
         staging_directory: &state::get_terra_home_path()?,
     })?;
-    let command = launch.command_mut();
+    let command = &mut launch.command;
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -655,17 +650,14 @@ fn run_network_native_probe(sentinel: &Path, policy: Option<&[u8]>) -> Result<()
     let executable = std::env::current_exe()?;
     let mut command = Command::new(&executable);
     command.arg(NETWORK_NATIVE_PROBE_ARG).arg(sentinel);
-    let mut grants = terra_sandbox::role_grants(Role::Network);
-    grants.push(Grant::new(executable, Access::ReadOnly));
     let mut launch = terra_sandbox::prepare_launch(Launch {
         role: Role::Network,
         command,
-        grants,
-        die_with_parent: true,
+        grants: Vec::new(),
         policy,
         staging_directory: &state::get_terra_home_path()?,
     })?;
-    let command = launch.command_mut();
+    let command = &mut launch.command;
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -721,20 +713,17 @@ pub(crate) fn start_broker(
     let mut command = Command::new(executable);
     command.arg(NETWORK_ARG);
     let mut launch = if is_sandboxed {
-        let mut grants = terra_sandbox::role_grants(Role::Network);
-        grants.push(Grant::new(executable, Access::ReadOnly));
         terra_sandbox::prepare_launch(Launch {
             role: Role::Network,
             command,
-            grants,
-            die_with_parent: true,
+            grants: Vec::new(),
             policy,
             staging_directory: &state::get_terra_home_path()?,
         })?
     } else {
-        PreparedLaunch::Direct(command)
+        PreparedLaunch::direct(command)
     };
-    let command = launch.command_mut();
+    let command = &mut launch.command;
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
