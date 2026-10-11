@@ -19,6 +19,19 @@ pub(crate) enum VcpuCommand {
     Stop,
 }
 
+impl fmt::Debug for VcpuCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Start(_, boot) => formatter
+                .debug_tuple("Start")
+                .field(&format_args!("_"))
+                .field(boot)
+                .finish(),
+            Self::Stop => formatter.write_str("Stop"),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum KvmError {
     #[cfg(target_arch = "x86_64")]

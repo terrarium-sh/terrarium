@@ -1,5 +1,5 @@
-#[cfg(unix)]
 use std::assert_matches;
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt as _, symlink as symlink_file};
 #[cfg(windows)]
 use std::os::windows::fs::symlink_file;

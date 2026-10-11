@@ -1,5 +1,4 @@
 use crate::support;
-use std::assert_matches;
 
 #[cfg(unix)]
 use std::os::unix::fs::symlink as symlink_file;
@@ -1101,6 +1100,7 @@ async fn metadata_lookup_and_chmod_do_not_require_file_read_access() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn write_only_files_open_for_write_without_read_access() {
+    use std::assert_matches;
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().expect("root");
     let path = root.path().join("writeonly");
@@ -1173,6 +1173,7 @@ async fn inaccessible_directories_allow_metadata_and_permission_repair() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn inaccessible_metadata_nodes_never_chmod_replacements() {
+    use std::assert_matches;
     use std::os::unix::fs::{PermissionsExt, symlink};
     for replace_with_symlink in [false, true] {
         let root = tempfile::tempdir().expect("root");

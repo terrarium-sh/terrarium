@@ -586,7 +586,6 @@ mod tests {
     use super::terra::agent::host_service::{HostClient, HostClientWithStore, HostWithStore};
     use super::*;
     use crate::component::agent::AgentHost;
-    use std::assert_matches;
     #[cfg(unix)]
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -603,6 +602,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn stale_readiness_registers_the_next_readers_waker() {
+        use std::assert_matches;
         use std::io::Write;
         use std::task::{Context, Poll, Waker};
         let directory = tempfile::tempdir().expect("socket directory");
