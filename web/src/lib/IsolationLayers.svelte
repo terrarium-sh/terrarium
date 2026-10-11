@@ -14,10 +14,10 @@
 
   const layers = [
     { title: 'Hardware VM', text: 'Your agent and tools run on a guest Linux kernel inside a hardware VM: KVM, Hypervisor.framework, or WHP.' },
-    { title: 'Wasm components', text: 'Each blue case is a separate Wasm store, with isolated memory and scoped host imports for that component.' },
+    { title: 'Wasm components', text: 'Each blue case is a separate Wasm store with isolated memory. The vCPU reaches each device directly; the VMM only boots and runs vCPUs.' },
     { title: 'Thin host API', text: 'Each Wasm store gets only its scoped host imports: VM handles, guest memory, disks, shares, or broker operations.' },
     { title: 'OS sandbox', text: 'By default, the VM worker runs in an OS sandbox without host networking: Bubblewrap and seccomp, App Sandbox, or AppContainer.' },
-    { title: 'Network broker', text: 'A separate process owns host sockets and enforces egress policy. Sandboxed on Linux and macOS.' }
+    { title: 'Network broker', text: 'A separate process owns host sockets and enforces egress policy, one stream per guest socket. Sandboxed on Linux and macOS.' }
   ];
 
   const icons = {
@@ -305,7 +305,7 @@
         class="iso"
         viewBox="{viewBox.x.toFixed(1)} {viewBox.y.toFixed(1)} {viewBox.w.toFixed(1)} {viewBox.h.toFixed(1)}"
         role="img"
-        aria-label="Your workload runs in a hardware VM. Its devices, VMM, host agent, and x86 interrupt controller each run inside an individual Wasm enclosure on a thin host API inside an OS-sandboxed VM worker; network traffic leaves through a separate broker process."
+        aria-label="Your workload runs in a hardware VM. Its devices, VMM, host agent, and x86 interrupt controller each run inside an individual Wasm enclosure on a thin host API inside an OS-sandboxed VM worker; the vCPU reaches each device directly rather than through the VMM, and network traffic leaves through a separate broker process with one stream per guest socket."
       >
         <defs>
           <pattern id="iso-api-grid" width="24" height="24" patternUnits="userSpaceOnUse" patternTransform="matrix({ISO_X} 0.5 {-ISO_X} 0.5 0 0)">
