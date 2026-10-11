@@ -2,14 +2,12 @@
 	import { base } from '$app/paths';
 	import { releaseTag } from '$lib/generated/version.json';
 	import { copyGuideCode } from '$lib/copy-guide-code';
+	import PageMeta from '$lib/PageMeta.svelte';
 
 	let { data } = $props();
 </script>
 
-<svelte:head>
-	<title>{data.guide.title} · Terra</title>
-	<meta name="description" content={data.guide.description} />
-</svelte:head>
+<PageMeta title={`${data.guide.title} — Terrarium`} description={data.guide.description} />
 
 <div class="page-intro">
 	<p class="eyebrow">Guides</p>

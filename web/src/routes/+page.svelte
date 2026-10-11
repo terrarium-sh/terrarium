@@ -6,6 +6,8 @@
   import { detectClientPlatform, type ClientPlatform } from '$lib/client-platform';
   import CopyButton from '$lib/CopyButton.svelte';
   import IsolationLayers from '$lib/IsolationLayers.svelte';
+  import PageMeta from '$lib/PageMeta.svelte';
+  import { page } from '$app/state';
 
   const platforms: SelectItem<ClientPlatform>[] = [
     { label: 'Linux', value: 'linux' },
@@ -25,9 +27,9 @@
   });
 </script>
 
+<PageMeta title="Terrarium — room to work" description="A home for persistent agents and a confined dev VM for your harness. One static core, Wasm-isolated devices, explicit access, and native support for Linux and Windows (x86_64 / ARM64), and macOS on Apple Silicon." />
 <svelte:head>
-  <title>Terrarium — room to work</title>
-  <meta name="description" content="A home for persistent agents and a confined dev VM for your harness. One static core, Wasm-isolated devices, explicit access, and native support for Linux and Windows (x86_64 / ARM64), and macOS on Apple Silicon." />
+  {@html `<script type="application/ld+json">${JSON.stringify({ '@context': 'https://schema.org', '@type': 'WebSite', name: 'Terrarium', url: page.url.origin + page.url.pathname })}</script>`}
 </svelte:head>
 
 <aside class="construction-notice" aria-label="Project status">

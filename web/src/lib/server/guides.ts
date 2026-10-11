@@ -22,11 +22,19 @@ const readGuideSource = (slug: GuideSlug) => sources[`../../../../docs/${slug}.m
 
 const extractTitle = (markdown: string) => markdown.match(/^# (.+)$/m)?.[1] ?? 'Terra guide';
 
-const extractDescription = (markdown: string) =>
-	markdown
-		.split('\n')
-		.find((line) => line && !line.startsWith('#'))
-		?.replace(/`/g, '') ?? '';
+const MAX_DESCRIPTION_LENGTH = 160;
+
+const extractDescription = (markdown: string) => {
+	const paragraph = (markdown.split(/\n\s*\n/).find((block) => block && !block.startsWith('#')) ?? '')
+		.replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
+		.replace(/`/g, '')
+		.replace(/\s+/g, ' ')
+		.trim();
+	if (paragraph.length <= MAX_DESCRIPTION_LENGTH) return paragraph;
+	const clipped = paragraph.slice(0, MAX_DESCRIPTION_LENGTH);
+	const sentenceEnd = clipped.lastIndexOf('. ');
+	return sentenceEnd > 0 ? clipped.slice(0, sentenceEnd + 1) : `${clipped.slice(0, clipped.lastIndexOf(' '))}…`;
+};
 
 const rewriteLink = (href: string) => {
 	if (href.startsWith('#') || /^(?:[a-z]+:|\/)/i.test(href)) return href;

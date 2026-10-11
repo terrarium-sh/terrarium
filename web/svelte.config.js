@@ -5,6 +5,7 @@ export default {
   preprocess: vitePreprocess(),
   kit: {
     adapter: adapter(),
-    paths: { base: process.env.BASE_PATH || '' }
+    paths: { base: process.env.BASE_PATH || '' },
+    prerender: { origin: process.env.SITE_ORIGIN || 'https://terrarium.sh' }
   }
 };

@@ -3,6 +3,7 @@
   import commands from '$lib/generated/commands.json';
   import { version } from '$lib/generated/version.json';
   import CopyButton from '$lib/CopyButton.svelte';
+  import PageMeta from '$lib/PageMeta.svelte';
 
   let query = $state('');
   const terms = $derived(query.toLowerCase().trim().split(/\s+/).filter(Boolean));
@@ -11,10 +12,7 @@
   )));
 </script>
 
-<svelte:head>
-  <title>Command reference — Terrarium</title>
-  <meta name="description" content="Search Terra commands, options, and examples. A command reference generated from the Terra CLI." />
-</svelte:head>
+<PageMeta title="Command reference — Terrarium" description="Search Terra commands, options, and examples. A command reference generated from the Terra CLI." />
 
 <div class="page-intro">
   <p class="eyebrow">Keep the reference close</p>

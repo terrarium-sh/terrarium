@@ -27,6 +27,8 @@ click-to-copy code controls, and the live GitHub star count. All content
 is readable without JavaScript.
 Set `BASE_PATH=/terrarium` at build time for a GitHub Pages project site;
 leave it empty for a domain root. Deep links use directory `index.html` files.
+`SITE_ORIGIN` (default `https://terrarium.sh`) makes canonical,
+Open Graph, `robots.txt` and `sitemap.xml` URLs absolute.
 
 ## Content
 
@@ -53,7 +55,7 @@ the command reference tracks the displayed release version. Each guide labels
 this distinction so unreleased features are not mistaken for released commands. A successful
 Release workflow also triggers Pages, including releases created by
 `GITHUB_TOKEN`. Pull requests build and check the site without deploying.
-GitHub's Pages configuration supplies the deployment base path.
+GitHub's Pages configuration supplies the deployment base path and origin.
 
 ## Theme and dependencies
 
