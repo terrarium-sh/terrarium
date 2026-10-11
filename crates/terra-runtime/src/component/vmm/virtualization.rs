@@ -26,7 +26,7 @@ impl<T: VirtualMachine> VirtualMachine for Arc<T> {
     }
 }
 
-impl VirtualMachine for terra_platform::vm::VmHandle {
+impl VirtualMachine for terra_hypervisor::vm::VmHandle {
     fn memory(&self) -> wasmtime::Result<GuestRam> {
         Ok(GuestRam::from_memory(self.memory()))
     }
@@ -406,7 +406,7 @@ mod tests {
     #[test]
     fn prepared_machine_rejects_mapped_entry_above_bootstrap_ram() {
         let config = MachineConfig::new(Architecture::X86, 2 << 20, 1, Vec::new()).unwrap();
-        let memory = terra_platform::memory::GuestMemory::from_ranges(&[
+        let memory = terra_hypervisor::memory::GuestMemory::from_ranges(&[
             (terra_limits::X86_RAM_BASE, 2 << 20),
             (terra_limits::X86_HIGH_RAM_BASE, 4096),
         ])
@@ -487,7 +487,7 @@ mod tests {
     async fn aot_vmm_applies_boot_and_keeps_both_vcpus_responsive() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::time::{Duration, Instant};
-        use terra_platform::memory::GuestMemory;
+        use terra_hypervisor::memory::GuestMemory;
 
         for architecture in [Architecture::X86, Architecture::Arm] {
             let engine = crate::engine::device_engine().unwrap();
@@ -535,7 +535,7 @@ mod tests {
                 irq,
             })
             .collect();
-            let ram = GuestRam::from_memory(GuestMemory::allocate_at(base, 8 << 20).unwrap());
+            let ram = GuestRam::from_memory(GuestMemory::from_ranges(&[(base, 8 << 20)]).unwrap());
             let config = MachineConfig::new(architecture, 8 << 20, 2, devices).unwrap();
             let mut kernel = vec![0; 65536];
             let (entry, copied) = match architecture {

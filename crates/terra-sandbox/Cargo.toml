@@ -29,6 +29,9 @@ terra-build = { path = "../terra-build" }
 [dev-dependencies]
 terra-build = { path = "../terra-build" }
 
+[target.'cfg(windows)'.dev-dependencies]
+terra-hypervisor = { path = "../terra-hypervisor" }
+
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 linux-raw-sys.workspace = true
 

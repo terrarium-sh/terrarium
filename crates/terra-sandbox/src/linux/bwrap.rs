@@ -329,9 +329,11 @@ mod tests {
         let mut command = Command::new(&executable);
         command.args(["a b", "--seccomp", "$HOME"]);
         let mut parent = Grant::new(&share, Access::ReadWrite);
-        parent.directory = Some(terra_platform::filesystem::open_share_root(&share).unwrap());
+        parent.directory =
+            Some(terra_platform::filesystem::share::open_share_root(&share).unwrap());
         let mut child = Grant::new(&nested, Access::ReadOnly);
-        child.directory = Some(terra_platform::filesystem::open_share_root(&nested).unwrap());
+        child.directory =
+            Some(terra_platform::filesystem::share::open_share_root(&nested).unwrap());
         let launch = prepare_launch(Launch {
             role: Role::Vm,
             command,
@@ -449,7 +451,8 @@ mod tests {
                     Access::ReadWrite
                 },
             );
-            mount.directory = Some(terra_platform::filesystem::open_share_root(&approved).unwrap());
+            mount.directory =
+                Some(terra_platform::filesystem::share::open_share_root(&approved).unwrap());
             let mut cmd = Command::new("/bin/sh");
             cmd.args(["-c", "cat /proc/self/fd/$SHARE_FD/marker", "sh"]);
             append_mounts(&mut cmd, vec![mount]).unwrap();
@@ -697,7 +700,8 @@ mod tests {
             filter.write_all(&value.to_ne_bytes()).unwrap();
         }
         let mut share_grant = Grant::new(&share, Access::ReadOnly);
-        share_grant.directory = Some(terra_platform::filesystem::open_share_root(&share).unwrap());
+        share_grant.directory =
+            Some(terra_platform::filesystem::share::open_share_root(&share).unwrap());
         let mut launch = prepare_launch(Launch {
             role: Role::Network,
             command,

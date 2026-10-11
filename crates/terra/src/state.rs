@@ -212,7 +212,7 @@ impl BoxRef {
         use std::io::Write as _;
 
         let mut control =
-            terra_platform::io::local::LocalStream::connect(self.dir.join(CONTROL_SOCKET))
+            terra_platform::local_socket::LocalStream::connect(self.dir.join(CONTROL_SOCKET))
                 .with_context(|| format!("connecting to {self}'s stop service"))?;
         control
             .write_all(&[terra_protocol::STOP_SIGNAL])
@@ -660,7 +660,7 @@ mod tests {
         let bx = BoxRef::from_state_dir(dir.path().join("dev"), dir.path());
         std::fs::create_dir_all(&bx.dir).unwrap();
         let listener =
-            terra_platform::io::local::LocalListener::bind(bx.dir.join(CONTROL_SOCKET)).unwrap();
+            terra_platform::local_socket::LocalListener::bind(bx.dir.join(CONTROL_SOCKET)).unwrap();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = [0];

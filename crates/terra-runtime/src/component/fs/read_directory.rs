@@ -56,7 +56,7 @@ impl DirectoryProducer {
     ) -> Self {
         let (sender, entries) = mpsc::channel(1);
         let task = spawn_blocking(move || {
-            let entries = terra_platform::filesystem::read_base_dir(&directory)?;
+            let entries = terra_platform::filesystem::share::windows::read_base_dir(&directory)?;
             for entry in entries {
                 if let Some(entry) = map_directory_entry(entry)?
                     && sender.blocking_send(entry).is_err()

@@ -1997,6 +1997,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "terra-hypervisor"
+version = "0.0.1"
+dependencies = [
+ "applevisor",
+ "applevisor-sys",
+ "kvm-bindings",
+ "kvm-ioctls",
+ "libc",
+ "log",
+ "rustix",
+ "terra-limits",
+ "vm-memory",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "terra-limits"
 version = "0.0.1"
 
@@ -2023,21 +2039,14 @@ dependencies = [
 name = "terra-platform"
 version = "0.0.1"
 dependencies = [
- "applevisor",
- "applevisor-sys",
  "async-io",
  "cap-primitives",
- "kvm-bindings",
- "kvm-ioctls",
  "libc",
- "log",
  "rustix",
  "tempfile",
- "terra-limits",
  "tokio",
  "tokio-util",
  "uds_windows",
- "vm-memory",
  "windows-sys 0.61.2",
 ]
 
@@ -2072,6 +2081,7 @@ dependencies = [
  "notify",
  "target-lexicon",
  "tempfile",
+ "terra-hypervisor",
  "terra-limits",
  "terra-network",
  "terra-platform",
@@ -2100,6 +2110,7 @@ dependencies = [
  "sha2 0.11.0",
  "tempfile",
  "terra-build",
+ "terra-hypervisor",
  "terra-platform",
  "windows-sys 0.61.2",
 ]

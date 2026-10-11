@@ -362,12 +362,12 @@ test-component-boot: $(COMPONENT_AOT_TARGETS) $(KERNEL_GZ) $(ROOTFS_IMG) $(BOOT_
 	$(CARGO_LOCKED) test $(TEST_FLAGS) -p terra-runtime --lib -- --ignored --nocapture
 
 test-platform-native-vm:
-	CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER="sh scripts/toolchain/run-macos-vm-test" $(CARGO_LOCKED) test $(TEST_FLAGS) -p terra-platform --test native_vm -- --ignored --test-threads=1 --nocapture
+	CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER="sh scripts/toolchain/run-macos-vm-test" $(CARGO_LOCKED) test $(TEST_FLAGS) -p terra-hypervisor --test native_vm -- --ignored --test-threads=1 --nocapture
 ifeq ($(shell uname -s),Darwin)
-	CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER="sh scripts/toolchain/run-macos-vm-test" $(CARGO_LOCKED) test $(TEST_FLAGS) -p terra-platform --lib cpu_off_waits_for_teardown_before_destroying_cpu -- --ignored --nocapture
+	CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER="sh scripts/toolchain/run-macos-vm-test" $(CARGO_LOCKED) test $(TEST_FLAGS) -p terra-hypervisor --lib cpu_power_cycles_preserve_the_handle_until_teardown -- --ignored --nocapture
 endif
 ifeq ($(ARCH),x86_64)
-	$(CARGO_LOCKED) test $(TEST_FLAGS) -p terra-platform --lib cpuid_matches_the_fixed_vcpu_count -- --ignored --nocapture
+	$(CARGO_LOCKED) test $(TEST_FLAGS) -p terra-hypervisor --lib cpuid_matches_the_fixed_vcpu_count -- --ignored --nocapture
 endif
 
 .PHONY: test-http3
@@ -420,7 +420,7 @@ verify-dependency-boundaries:
 	python3 -B scripts/checks/check-dependency-boundaries.py
 
 verify-platform:
-	$(CARGO_LOCKED) test $(TEST_FLAGS) -p terra-platform --target $(MUSL)
+	$(CARGO_LOCKED) test $(TEST_FLAGS) -p terra-platform -p terra-hypervisor --target $(MUSL)
 
 test-install:
 	scripts/checks/test-install.sh

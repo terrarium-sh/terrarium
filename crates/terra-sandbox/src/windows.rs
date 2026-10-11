@@ -260,7 +260,7 @@ fn build_worker_grants(grants: Vec<Grant>) -> Result<(Vec<WorkerGrant>, Vec<File
         let identity = grant
             .directory
             .as_ref()
-            .map(terra_platform::filesystem::file_identity)
+            .map(terra_platform::filesystem::share::file_identity)
             .transpose()?
             .map(|identity| identity.to_string());
         if let Some(directory) = grant.directory {
@@ -504,7 +504,7 @@ fn run_worker(
         for grant in &spec.grants {
             if let Some(identity) = &grant.identity {
                 let expected = identity.parse()?;
-                terra_platform::filesystem::open_granted_share_root(&grant.path, expected)?;
+                terra_platform::filesystem::share::open_granted_share_root(&grant.path, expected)?;
             }
             grants.add(&grant.path, grant.writable)?;
         }
@@ -745,7 +745,7 @@ mod tests {
     fn native_roles_enforce_vm_grants_and_broker_job() -> Result<()> {
         use std::net::{TcpListener, TcpStream};
         use std::process::Stdio;
-        use terra_platform::io::local::{LocalListener, LocalStream};
+        use terra_platform::local_socket::{LocalListener, LocalStream};
 
         let wrapper = PathBuf::from(
             std::env::var_os("TERRA_BIN")
@@ -755,8 +755,9 @@ mod tests {
         let executable = std::env::current_exe()?;
         let directory = tempfile::tempdir()?;
         let directory_handle =
-            terra_platform::filesystem::open_share_root(&directory.path().canonicalize()?)?;
-        let directory_identity = terra_platform::filesystem::file_identity(&directory_handle)?;
+            terra_platform::filesystem::share::open_share_root(&directory.path().canonicalize()?)?;
+        let directory_identity =
+            terra_platform::filesystem::share::file_identity(&directory_handle)?;
         let protected = directory.path().join("protected");
         std::fs::write(&protected, b"read-only metadata")?;
         let local_path = directory.path().join("host.sock");
@@ -859,7 +860,7 @@ mod tests {
                     std::fs::read(outside).is_err(),
                     "Windows VM read a host file outside its grants"
                 );
-                terra_platform::vm::PreparedVm::capabilities()
+                terra_hypervisor::vm::PreparedVm::capabilities()
                     .map_err(anyhow::Error::msg)
                     .context("AppContainer VM cannot access Windows Hypervisor Platform")?;
                 ensure!(
@@ -875,7 +876,7 @@ mod tests {
                     "Windows worker removed read-only metadata through its writable parent"
                 );
                 ensure!(
-                    terra_platform::io::local::LocalStream::connect(directory.join("host.sock"))
+                    terra_platform::local_socket::LocalStream::connect(directory.join("host.sock"))
                         .is_err(),
                     "AppContainer VM reached a host AF_UNIX endpoint inside an approved share"
                 );
@@ -908,26 +909,28 @@ mod tests {
 
     fn probe_granted_share_mutations(directory: &Path) -> Result<()> {
         let expected_directory = std::env::var("TERRA_WINDOWS_TEST_DIRECTORY_ID")?.parse()?;
-        let directory_handle =
-            terra_platform::filesystem::open_granted_share_root(directory, expected_directory)?;
-        terra_platform::filesystem::create_directory_at(
+        let directory_handle = terra_platform::filesystem::share::open_granted_share_root(
+            directory,
+            expected_directory,
+        )?;
+        terra_platform::filesystem::share::windows::create_directory_at(
             &directory_handle,
             Path::new("platform-ops"),
         )?;
         std::fs::write(directory.join("platform-ops/source"), b"approved")?;
-        terra_platform::filesystem::rename_at(
+        terra_platform::filesystem::share::windows::rename_at(
             &directory_handle,
             Path::new("platform-ops/source"),
             &directory_handle,
             Path::new("platform-ops/renamed"),
         )?;
-        terra_platform::filesystem::hard_link_at(
+        terra_platform::filesystem::share::windows::hard_link_at(
             &directory_handle,
             Path::new("platform-ops/renamed"),
             &directory_handle,
             Path::new("platform-ops/linked"),
         )?;
-        terra_platform::filesystem::unlink_file_at(
+        terra_platform::filesystem::share::windows::unlink_file_at(
             &directory_handle,
             Path::new("platform-ops/renamed"),
         )?;
@@ -935,16 +938,16 @@ mod tests {
             std::fs::read(directory.join("platform-ops/linked"))? == b"approved",
             "AppContainer VM hard link lost its source content"
         );
-        terra_platform::filesystem::unlink_file_at(
+        terra_platform::filesystem::share::windows::unlink_file_at(
             &directory_handle,
             Path::new("platform-ops/linked"),
         )?;
-        terra_platform::filesystem::remove_directory_at(
+        terra_platform::filesystem::share::windows::remove_directory_at(
             &directory_handle,
             Path::new("platform-ops"),
         )?;
         ensure!(
-            terra_platform::filesystem::create_directory_at(
+            terra_platform::filesystem::share::windows::create_directory_at(
                 &directory_handle,
                 Path::new("../escape"),
             )

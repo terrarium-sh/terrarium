@@ -194,9 +194,9 @@ pub(crate) fn supervise_supervisor_child(
 
 pub(crate) fn pass_listener(
     command: &mut Command,
-    listener: &terra_platform::io::local::LocalListener,
+    listener: &terra_platform::local_socket::LocalListener,
     target: i32,
-) -> Result<terra_platform::io::local::LocalListener> {
+) -> Result<terra_platform::local_socket::LocalListener> {
     use std::os::windows::io::AsRawSocket;
     let inherited = listener.try_clone()?;
     process::pass_handle(
@@ -210,14 +210,14 @@ pub(crate) fn pass_listener(
 pub(crate) fn claim_listener(
     target: i32,
     expected: &Path,
-) -> Result<terra_platform::io::local::LocalListener> {
+) -> Result<terra_platform::local_socket::LocalListener> {
     use std::os::windows::io::FromRawSocket;
     let socket = process::claim_socket(process::handle_variable(
         &process::LISTENER_HANDLE_VARIABLES,
         target,
     )?)?;
     // SAFETY: the whitelisted launcher transfers this prebound listener exclusively to the worker.
-    let listener = unsafe { terra_platform::io::local::LocalListener::from_raw_socket(socket) };
+    let listener = unsafe { terra_platform::local_socket::LocalListener::from_raw_socket(socket) };
     if listener.local_addr()?.as_pathname() != Some(expected) {
         return Err(Error::other("inherited listener does not match its grant"));
     }
@@ -342,7 +342,7 @@ fn send_stop() {
     }
 }
 
-pub fn register_stop_channel(channel: terra_platform::io::local::LocalStream) {
+pub fn register_stop_channel(channel: terra_platform::local_socket::LocalStream) {
     use std::os::windows::io::IntoRawSocket;
     use std::sync::atomic::Ordering;
 
@@ -470,7 +470,7 @@ mod tests {
         let mut stop_receiver = None;
         if role.as_deref() == Some("parent") {
             assert_ne!(console_processes, 0);
-            let (host, receiver) = terra_platform::io::local::create_local_pair().unwrap();
+            let (host, receiver) = terra_platform::local_socket::create_local_pair().unwrap();
             receiver
                 .set_read_timeout(Some(std::time::Duration::from_secs(1)))
                 .unwrap();
@@ -520,7 +520,7 @@ mod tests {
     fn console_interrupts_relay_one_stop_and_latch_before_registration() {
         use std::io::Read as _;
         use std::sync::atomic::Ordering;
-        use terra_platform::io::local::create_local_pair;
+        use terra_platform::local_socket::create_local_pair;
         use windows_sys::Win32::System::Console::{
             CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT,
             CTRL_SHUTDOWN_EVENT,

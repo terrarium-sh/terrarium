@@ -5,7 +5,7 @@ use std::sync::mpsc;
 use wasmtime::component::{Accessor, Resource};
 
 use super::{Completion, Error, Exit, Platform, PlatformHost, platform};
-use terra_platform::vm;
+use terra_hypervisor::vm;
 
 pub(crate) const EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 

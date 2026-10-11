@@ -28,7 +28,7 @@ pub use terra_platform::process::{
     VmChildGuard, attach_vm_child, kill_vm_child, supervise_vm_child,
 };
 
-pub fn register_stop_channel(channel: terra_platform::io::local::LocalStream) {
+pub fn register_stop_channel(channel: terra_platform::local_socket::LocalStream) {
     #[cfg(unix)]
     imp::register_stop_channel(channel.into());
     #[cfg(windows)]

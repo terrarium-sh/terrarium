@@ -184,7 +184,7 @@ impl memory::Host for DeviceContext {
         }
         let ranges = ranges
             .into_iter()
-            .map(|range| terra_platform::memory::MemoryRange {
+            .map(|range| terra_hypervisor::memory::MemoryRange {
                 addr: range.offset,
                 len: range.len,
             })
@@ -250,7 +250,7 @@ mod tests {
     fn device_memory_import_preserves_nonzero_guest_address_bounds() {
         use super::memory::Host as _;
         let ram = crate::memory::GuestRam::from_memory(
-            terra_platform::memory::GuestMemory::allocate_at(0x4000_0000, 4096).unwrap(),
+            terra_hypervisor::memory::GuestMemory::from_ranges(&[(0x4000_0000, 4096)]).unwrap(),
         );
         let mut host = super::DeviceContext::with_ram(ram);
         assert_eq!(host.address_limit(), 0x4000_1000);

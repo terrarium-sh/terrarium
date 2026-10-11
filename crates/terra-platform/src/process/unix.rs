@@ -5,11 +5,11 @@ use std::io::Result;
 use std::process::Command;
 
 #[allow(unsafe_code)]
-pub fn detach(cmd: &mut Command) {
+pub fn detach(command: &mut Command) {
     use std::os::unix::process::CommandExt;
     // SAFETY: setsid is async-signal-safe between fork and exec.
     unsafe {
-        cmd.pre_exec(|| {
+        command.pre_exec(|| {
             rustix::process::setsid()
                 .map(|_| ())
                 .map_err(std::io::Error::from)
@@ -31,7 +31,7 @@ fn duplicate_above_handoff(file: &impl std::os::fd::AsRawFd) -> Result<File> {
 
 #[allow(unsafe_code)]
 pub fn pass_descriptor(
-    cmd: &mut Command,
+    command: &mut Command,
     file: &impl std::os::fd::AsRawFd,
     target: i32,
 ) -> Result<File> {
@@ -41,7 +41,7 @@ pub fn pass_descriptor(
     let source = inherited.as_raw_fd();
     // SAFETY: dup2 is async-signal-safe between fork and exec; source remains open until spawn.
     unsafe {
-        cmd.pre_exec(move || {
+        command.pre_exec(move || {
             if libc::dup2(source, target) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -67,14 +67,14 @@ pub fn pass_ipc(
 }
 
 #[allow(unsafe_code)]
-pub fn claim_ipc(fd: i32) -> Result<std::os::unix::net::UnixStream> {
+pub fn claim_ipc(target: i32) -> Result<std::os::unix::net::UnixStream> {
     use std::os::fd::FromRawFd;
     // SAFETY: fcntl checks the inherited descriptor before ownership is claimed.
-    if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+    if unsafe { libc::fcntl(target, libc::F_GETFD) } < 0 {
         return Err(std::io::Error::last_os_error());
     }
     // SAFETY: the launcher transfers this live descriptor exclusively to the worker.
-    let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+    let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(target) };
     if rustix::net::sockopt::socket_type(&stream).map_err(std::io::Error::from)?
         != rustix::net::SocketType::STREAM
     {
@@ -88,14 +88,14 @@ pub fn claim_ipc(fd: i32) -> Result<std::os::unix::net::UnixStream> {
 }
 
 #[allow(unsafe_code)]
-pub fn supervise_vm_child(cmd: &mut Command, foreground: bool) -> Result<Option<VmChildGuard>> {
+pub fn supervise_vm_child(command: &mut Command, foreground: bool) -> Result<Option<VmChildGuard>> {
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::process::CommandExt;
     if !foreground {
-        detach(cmd);
+        detach(command);
         return Ok(None);
     }
-    detach(cmd);
+    detach(command);
     let mut ends = [0; 2];
     // SAFETY: pipe initializes both integer descriptors on success.
     if unsafe { libc::pipe(ends.as_mut_ptr()) } != 0 {
@@ -118,7 +118,7 @@ pub fn supervise_vm_child(cmd: &mut Command, foreground: bool) -> Result<Option<
     let max_fd = unsafe { libc::getdtablesize() };
     // SAFETY: fork, close, read, kill, and _exit are async-signal-safe after Command's fork.
     unsafe {
-        cmd.pre_exec(move || {
+        command.pre_exec(move || {
             #[cfg(target_os = "linux")]
             {
                 if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {

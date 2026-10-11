@@ -16,10 +16,10 @@ pub fn detach(command: &mut Command) {
     command.creation_flags(DETACHED_PROCESS);
 }
 
-/// Environment variables naming inherited IPC sockets, keyed by descriptor target.
+/// Windows has no descriptor numbers to `dup2` into a child, so a child finds each inherited
+/// handle through an environment variable keyed by the Unix descriptor target.
 pub const IPC_HANDLE_VARIABLES: [(i32, &str); 2] =
     [(7, "TERRA_NETWORK_HANDLE"), (8, "TERRA_CONFIG_HANDLE")];
-/// Environment variables naming inherited listener sockets, keyed by descriptor target.
 pub const LISTENER_HANDLE_VARIABLES: [(i32, &str); 4] = [
     (10, "TERRA_AGENT_LISTENER_HANDLE"),
     (11, "TERRA_CONTROL_LISTENER_HANDLE"),
@@ -97,9 +97,9 @@ pub fn claim_socket(variable: &str) -> Result<std::os::windows::io::RawSocket> {
 
 pub fn pass_ipc(
     command: &mut Command,
-    stream: &crate::io::local::LocalStream,
+    stream: &crate::local_socket::LocalStream,
     target: i32,
-) -> Result<crate::io::local::LocalStream> {
+) -> Result<crate::local_socket::LocalStream> {
     use std::os::windows::io::AsRawSocket;
     let inherited = stream.try_clone()?;
     pass_handle(
@@ -110,11 +110,11 @@ pub fn pass_ipc(
     Ok(inherited)
 }
 
-pub fn claim_ipc(target: i32) -> Result<crate::io::local::LocalStream> {
+pub fn claim_ipc(target: i32) -> Result<crate::local_socket::LocalStream> {
     use std::os::windows::io::FromRawSocket;
     let socket = claim_socket(handle_variable(&IPC_HANDLE_VARIABLES, target)?)?;
     // SAFETY: the whitelisted launcher transfers this inherited socket exclusively to the worker.
-    let stream = unsafe { crate::io::local::LocalStream::from_raw_socket(socket) };
+    let stream = unsafe { crate::local_socket::LocalStream::from_raw_socket(socket) };
     stream.peer_addr()?;
     Ok(stream)
 }

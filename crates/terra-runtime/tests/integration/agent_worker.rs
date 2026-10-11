@@ -3,7 +3,7 @@ use crate::support::agent as support;
 use std::io::{self, Read as _, Write as _};
 use std::time::Duration;
 
-use terra_platform::io::local::{LocalListener, LocalStream, create_local_pair};
+use terra_platform::local_socket::{LocalListener, LocalStream, create_local_pair};
 use terra_protocol::mux::MAX_STREAM_WINDOW_BYTES;
 
 use support::{AgentGuest, plan_frame, yamux_frame};

@@ -184,7 +184,7 @@ jobs:
         if: ${{ !cancelled() && steps.host-build.outcome == 'success' }}
         run: |
           rustup target add x86_64-pc-windows-gnu
-          cargo check --locked --all-targets -p terra-platform --target x86_64-pc-windows-gnu
+          cargo check --locked --all-targets -p terra-platform -p terra-hypervisor --target x86_64-pc-windows-gnu
       - name: Check distribution
         run: |
           ./dist/terra --version
@@ -214,7 +214,7 @@ jobs:
           status=0
           TERRA_BIN="$PWD/dist/terra" cargo test --no-fail-fast --locked --target x86_64-unknown-linux-musl -p terra --test native_boot -- --ignored --test-threads=1 --nocapture || status=1
           cargo test --no-fail-fast --locked --target x86_64-unknown-linux-musl -p terra-runtime --lib -- --ignored --test-threads=1 || status=1
-          cargo test --no-fail-fast --locked --target x86_64-unknown-linux-musl -p terra-platform --lib --test native_vm -- --ignored --test-threads=1 || status=1
+          cargo test --no-fail-fast --locked --target x86_64-unknown-linux-musl -p terra-hypervisor --lib --test native_vm -- --ignored --test-threads=1 || status=1
           TERRA_BIN="$PWD/dist/terra" cargo test --no-fail-fast --locked --target x86_64-unknown-linux-musl -p terra --test boot --test memory -- --ignored --test-threads=1 || status=1
           set -o pipefail
           TERRA_BIN="$PWD/dist/terra" TERRA_SECCOMP_ENFORCED=1 cargo test --locked --target x86_64-unknown-linux-musl -p terra --test boot -- --exact bwrap_enforces_vm_and_vcpu_threads --ignored --nocapture | tee default-jail.log || status=1
@@ -349,7 +349,7 @@ jobs:
           fi
           status=0
           cargo test --no-fail-fast --locked --target aarch64-unknown-linux-musl -p terra-runtime --lib -- --ignored --test-threads=1 || status=1
-          cargo test --no-fail-fast --locked --target aarch64-unknown-linux-musl -p terra-platform --lib --test native_vm -- --ignored --test-threads=1 || status=1
+          cargo test --no-fail-fast --locked --target aarch64-unknown-linux-musl -p terra-hypervisor --lib --test native_vm -- --ignored --test-threads=1 || status=1
           TERRA_BIN="$PWD/dist/terra" cargo test --no-fail-fast --locked --target aarch64-unknown-linux-musl -p terra --test native_boot -- --ignored --test-threads=1 --nocapture || status=1
           TERRA_BIN="$PWD/dist/terra" cargo test --no-fail-fast --locked --target aarch64-unknown-linux-musl -p terra --test boot --test memory -- --ignored --test-threads=1 || status=1
           set -o pipefail
@@ -548,7 +548,7 @@ jobs:
           CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER: sh scripts/toolchain/run-macos-vm-test
           TMPDIR: /tmp
         run: |
-          cargo test --no-fail-fast --locked --target aarch64-apple-darwin -p terra-platform --lib --test native_vm -- --ignored --test-threads=1
+          cargo test --no-fail-fast --locked --target aarch64-apple-darwin -p terra-hypervisor --lib --test native_vm -- --ignored --test-threads=1
           cargo test --no-fail-fast --locked --target aarch64-apple-darwin -p terra-runtime --lib -- --ignored --test-threads=1
           TERRA_BIN="$PWD/dist/terra" cargo test --no-fail-fast --locked --target aarch64-apple-darwin -p terra --test native_boot --test boot --test memory -- --ignored --test-threads=1 --nocapture
       - name: Report macOS boot coverage
@@ -632,7 +632,7 @@ jobs:
         if: ${{ !cancelled() && steps.host-build.outcome == 'success' && (inputs.native_vm_tests || matrix.native_vm_tests) }}
         timeout-minutes: 5
         shell: pwsh
-        run: cargo test --no-fail-fast --locked --target ${{ matrix.target }} -p terra-platform --lib --test native_vm -- --ignored --test-threads=1
+        run: cargo test --no-fail-fast --locked --target ${{ matrix.target }} -p terra-hypervisor --lib --test native_vm -- --ignored --test-threads=1
       - name: Report Windows boot coverage
         if: ${{ !(inputs.native_vm_tests || matrix.native_vm_tests) }}
         shell: pwsh

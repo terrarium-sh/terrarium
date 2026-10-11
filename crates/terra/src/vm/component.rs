@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use std::fs::File;
 use std::io::{Read as _, Write as _};
 use std::process::ExitCode;
-use terra_platform::io::local::{LocalListener, LocalStream, create_local_pair};
+use terra_platform::local_socket::{LocalListener, LocalStream, create_local_pair};
 use terra_protocol::PlanMode;
 use terra_runtime::TrustedArtifacts;
 use terra_runtime::component::fs::ShareGrant;
@@ -377,9 +377,9 @@ fn prepare_network_backend(
     let endpoint = sys::claim_ipc(super::supervisor::NETWORK_FD)?;
     endpoint.set_nonblocking(true)?;
     Ok(Some(terra_runtime::component::network::NetworkBackend {
-        client: terra_network::Client::new(terra_platform::io::local::AsyncLocalStream::from_std(
-            endpoint,
-        )?),
+        client: terra_network::Client::new(
+            terra_platform::local_socket::AsyncLocalStream::from_std(endpoint)?,
+        ),
         ready: metadata.ready.clone(),
         listeners: metadata.listeners.clone(),
     }))

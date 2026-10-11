@@ -16,7 +16,7 @@ pub struct ShareGrant {
 impl ShareGrant {
     pub fn new(root: &Path, readonly: bool) -> io::Result<Self> {
         Ok(Self::from_directory(
-            terra_platform::filesystem::open_share_root(root)?,
+            terra_platform::filesystem::share::open_share_root(root)?,
             readonly,
             root,
         ))
@@ -26,10 +26,10 @@ impl ShareGrant {
     pub fn new_host_granted(
         root: &Path,
         readonly: bool,
-        expected: terra_platform::filesystem::FileIdentity,
+        expected: terra_platform::filesystem::share::FileIdentity,
     ) -> io::Result<Self> {
         Ok(Self::from_directory(
-            terra_platform::filesystem::open_granted_share_root(root, expected)?,
+            terra_platform::filesystem::share::open_granted_share_root(root, expected)?,
             readonly,
             root,
         ))

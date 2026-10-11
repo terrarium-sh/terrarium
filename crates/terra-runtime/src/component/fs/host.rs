@@ -133,13 +133,14 @@ impl FsHost {
         let Descriptor::File(file) = descriptor else {
             return Ok(());
         };
-        let access = terra_platform::filesystem::FileAccess {
+        let access = terra_platform::filesystem::share::windows::FileAccess {
             read: file.open_mode.contains(OpenMode::READ),
             write: file.open_mode.contains(OpenMode::WRITE),
         };
-        let reopened =
-            terra_platform::filesystem::reopen_file_with_delete_sharing(&file.file, access)
-                .map_err(|_| types::ErrorCode::Io)?;
+        let reopened = terra_platform::filesystem::share::windows::reopen_file_with_delete_sharing(
+            &file.file, access,
+        )
+        .map_err(|_| types::ErrorCode::Io)?;
         file.file = std::sync::Arc::new(reopened);
         Ok(())
     }
@@ -447,7 +448,7 @@ fn add_windows_mutations<T: Send + 'static>(
             Box::pin(async move {
                 let result = match directory {
                     Ok(directory) => tokio::task::spawn_blocking(move || {
-                        terra_platform::filesystem::create_directory_at(
+                        terra_platform::filesystem::share::windows::create_directory_at(
                             &directory.dir,
                             path.as_ref(),
                         )
@@ -486,7 +487,7 @@ fn add_windows_mutations<T: Send + 'static>(
             Box::pin(async move {
                 let result = match directories {
                     Ok((old, new)) => tokio::task::spawn_blocking(move || {
-                        terra_platform::filesystem::hard_link_at(
+                        terra_platform::filesystem::share::windows::hard_link_at(
                             &old.dir,
                             old_path.as_ref(),
                             &new.dir,
@@ -531,7 +532,7 @@ fn add_windows_rename_and_delete<T: Send + 'static>(
             Box::pin(async move {
                 let result = match directories {
                     Ok((old, new)) => tokio::task::spawn_blocking(move || {
-                        terra_platform::filesystem::rename_at(
+                        terra_platform::filesystem::share::windows::rename_at(
                             &old.dir,
                             old_path.as_ref(),
                             &new.dir,
@@ -555,7 +556,7 @@ fn add_windows_rename_and_delete<T: Send + 'static>(
             Box::pin(async move {
                 let result = match directory {
                     Ok(directory) => tokio::task::spawn_blocking(move || {
-                        terra_platform::filesystem::remove_directory_at(
+                        terra_platform::filesystem::share::windows::remove_directory_at(
                             &directory.dir,
                             path.as_ref(),
                         )
@@ -577,7 +578,10 @@ fn add_windows_rename_and_delete<T: Send + 'static>(
             Box::pin(async move {
                 let result = match directory {
                     Ok(directory) => tokio::task::spawn_blocking(move || {
-                        terra_platform::filesystem::unlink_file_at(&directory.dir, path.as_ref())
+                        terra_platform::filesystem::share::windows::unlink_file_at(
+                            &directory.dir,
+                            path.as_ref(),
+                        )
                     })
                     .await
                     .map_err(|_| types::ErrorCode::Io)

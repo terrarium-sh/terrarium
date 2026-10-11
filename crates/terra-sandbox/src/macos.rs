@@ -379,7 +379,7 @@ mod tests {
         )?;
         for share in ["read-only", "writable"] {
             let directory = Path::new(&root).join(share);
-            let opened = terra_platform::filesystem::open_share_root(&directory)
+            let opened = terra_platform::filesystem::share::open_share_root(&directory)
                 .context("opening an approved share without ancestor read grants")?;
             ensure!(opened.metadata()?.is_dir(), "approved share is a directory");
             require_permission_denied(

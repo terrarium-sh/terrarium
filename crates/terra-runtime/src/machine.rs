@@ -79,8 +79,8 @@ impl MachineConfig {
     }
 
     #[must_use]
-    pub(crate) fn to_native_config(&self) -> terra_platform::vm::VmConfig {
-        use terra_platform::vm::{GicConfig, InterruptControllerConfig, VmConfig};
+    pub(crate) fn to_native_config(&self) -> terra_hypervisor::vm::VmConfig {
+        use terra_hypervisor::vm::{GicConfig, InterruptControllerConfig, VmConfig};
 
         VmConfig {
             ram_base: match self.architecture() {
@@ -312,7 +312,7 @@ mod tests {
 
     #[test]
     fn native_configuration_preserves_the_machine_layout() {
-        use terra_platform::vm::{GicConfig, InterruptControllerConfig, VmConfig};
+        use terra_hypervisor::vm::{GicConfig, InterruptControllerConfig, VmConfig};
 
         for architecture in [Architecture::X86, Architecture::Arm] {
             let layout = build_machine_layout_for(architecture, 8 << 20, 2, 1).unwrap();

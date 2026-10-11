@@ -2,7 +2,7 @@ use std::io::{Read as _, Write as _};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use terra_platform::io::local::{LocalListener, LocalStream};
+use terra_platform::local_socket::{LocalListener, LocalStream};
 
 use crate::box_runtime::{BoxHost, BoxRuntime};
 use crate::component::agent::Agent;

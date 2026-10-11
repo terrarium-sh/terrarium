@@ -1,6 +1,6 @@
 //! Guest-memory policy and bounded access.
 
-use terra_platform::memory::{
+use terra_hypervisor::memory::{
     DiscardError, GuestMemory, MemoryError as PlatformMemoryError, MemoryRange,
 };
 
@@ -22,7 +22,7 @@ pub struct GuestRam(GuestMemory);
 impl GuestRam {
     #[must_use]
     pub fn new(size: u64) -> Option<Self> {
-        GuestMemory::allocate(size).map(Self)
+        GuestMemory::from_ranges(&[(0, usize::try_from(size).ok()?)]).map(Self)
     }
 
     #[must_use]

@@ -297,7 +297,7 @@ mod tests {
         use super::{BlockHost, DiskGrant};
         use crate::component::block::component_tests::fixture_with_host;
         use crate::engine::device_engine;
-        use terra_platform::memory::MemoryRange;
+        use terra_hypervisor::memory::MemoryRange;
 
         let host = BlockHost::new(
             crate::memory::GuestRam::new(256 * 1024).unwrap(),
@@ -346,7 +346,7 @@ mod tests {
         use super::{BlockHost, DiskGrant};
         use crate::component::block::component_tests::fixture_with_host;
         use crate::engine::device_engine;
-        use terra_platform::memory::MemoryRange;
+        use terra_hypervisor::memory::MemoryRange;
 
         let mut backing = BoundedDisk::new(4096, false);
         super::BlockBacking::write_at(&mut backing, 0, &[0xA5; 512]).unwrap();

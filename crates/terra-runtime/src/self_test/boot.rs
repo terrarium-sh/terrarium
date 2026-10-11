@@ -4,7 +4,7 @@ use crate::TrustedArtifacts;
 use crate::box_runtime::{BoxHost, BoxRuntime};
 use crate::machine::{Architecture, build_machine_layout_for};
 use crate::memory::GuestRam;
-use terra_platform::memory::GuestMemory;
+use terra_hypervisor::memory::GuestMemory;
 
 pub(super) async fn run(
     artifacts: &TrustedArtifacts,

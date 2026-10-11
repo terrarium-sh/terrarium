@@ -23,7 +23,7 @@
         "aarch64-unknown-linux-gnu"
       ],
       "reason": "Returning from the native vCPU kick signal handler can bypass the ordinary syscall entry visible to ptrace.",
-      "source": "crates/terra-platform/src/linux/runner.rs:install_kick_handler"
+      "source": "crates/terra-hypervisor/src/kvm/kick.rs:install_kick_handler"
     },
     {
       "syscall": "fallocate",
@@ -35,7 +35,7 @@
         "aarch64-unknown-linux-gnu"
       ],
       "reason": "Guest block discard punches holes in file-backed disk images; discard requests depend on retained filesystem state and may be absent from the first foreground tracing pass.",
-      "source": "crates/terra-runtime/src/component/block/backing.rs:FileDisk::discard; crates/terra-platform/src/filesystem.rs:discard_file"
+      "source": "crates/terra-runtime/src/component/block/backing.rs:FileDisk::discard; crates/terra-platform/src/filesystem/disk.rs:discard_file"
     },
     {
       "syscall": "ioctl",
@@ -56,7 +56,7 @@
         1075883590
       ],
       "reason": "Create native KVM VM/vCPU resources, map guest RAM, inject interrupts, and run vCPUs; the host-component self-test has no hypervisor handles.",
-      "source": "crates/terra-platform/src/linux/kvm/amd64/kvm.rs; crates/terra-platform/src/linux/kvm/aarch64/machine.rs; kvm-ioctls 0.25.0 src/ioctls/system.rs:create_vm_with_type"
+      "source": "crates/terra-hypervisor/src/kvm/x86_64/machine.rs; crates/terra-hypervisor/src/kvm/aarch64/machine.rs; kvm-ioctls 0.25.0 src/ioctls/system.rs:create_vm_with_type"
     },
     {
       "syscall": "ioctl",
@@ -73,7 +73,7 @@
         3221794309
       ],
       "reason": "Read x86 KVM capabilities and initialize interrupt topology and boot identity mapping.",
-      "source": "crates/terra-platform/src/linux/kvm/amd64/kvm.rs:open,Machine::new; crates/terra-platform/src/linux/kvm/amd64/worker.rs:build_cpuid; crates/terra-platform/src/linux/kvm/amd64/arch.rs:setup_irqchip"
+      "source": "crates/terra-hypervisor/src/kvm/x86_64/machine.rs:open_kvm,Machine::new; crates/terra-hypervisor/src/kvm/x86_64.rs:build_cpuid; crates/terra-hypervisor/src/kvm/x86_64/boot.rs:setup_irqchip"
     },
     {
       "syscall": "ioctl",
@@ -90,7 +90,7 @@
         2167975555
       ],
       "reason": "Initialize x86 vCPU registers, CPUID, and parked application-processor state.",
-      "source": "crates/terra-platform/src/linux/kvm/amd64/arch.rs:configure_sregs,setup_regs,setup_bsp_planned; crates/terra-platform/src/linux/kvm/amd64/kvm.rs:park_ap"
+      "source": "crates/terra-hypervisor/src/kvm/x86_64/boot.rs:configure_sregs,setup_regs,setup_bsp_planned; crates/terra-hypervisor/src/kvm/x86_64/machine.rs:park_ap"
     },
     {
       "syscall": "ioctl",
@@ -107,7 +107,7 @@
         3222056672
       ],
       "reason": "Create ARM virtual interrupt controllers and initialize ARM vCPU target and register state.",
-      "source": "crates/terra-platform/src/linux/kvm/aarch64/machine.rs:prepare_vcpus,set_vgic_address; crates/terra-platform/src/linux/kvm/aarch64/worker.rs:configure_boot_vcpu,set_core_register"
+      "source": "crates/terra-hypervisor/src/kvm/aarch64/machine.rs:prepare_vcpus,set_vgic_address; crates/terra-hypervisor/src/kvm/aarch64.rs:configure_boot_vcpu,set_core_register"
     },
     {
       "syscall": "tkill",
@@ -117,7 +117,7 @@
         "aarch64-unknown-linux-musl"
       ],
       "reason": "Native KVM vCPU runners use musl pthread_kill to deliver the kick signal to a vCPU thread; the host-component self-test has no native vCPU runner.",
-      "source": "crates/terra-platform/src/linux/runner.rs:kick; musl 1.2.5 src/thread/pthread_kill.c"
+      "source": "crates/terra-hypervisor/src/kvm/kick.rs:kick; musl 1.2.5 src/thread/pthread_kill.c"
     },
     {
       "syscall": "tgkill",
@@ -127,7 +127,7 @@
         "aarch64-unknown-linux-gnu"
       ],
       "reason": "Native KVM vCPU runners use GNU libc pthread_kill to deliver the kick signal to a vCPU thread; the host-component self-test has no native vCPU runner.",
-      "source": "crates/terra-platform/src/linux/runner.rs:kick; glibc nptl/pthread_kill.c"
+      "source": "crates/terra-hypervisor/src/kvm/kick.rs:kick; glibc nptl/pthread_kill.c"
     },
     {
       "syscall": "execve",

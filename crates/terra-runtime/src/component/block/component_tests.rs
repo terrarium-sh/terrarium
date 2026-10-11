@@ -7,7 +7,7 @@ use crate::engine::{device_engine, precompile_component};
 use crate::memory::{BoundedMemory, GuestRam, MemoryError};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use terra_platform::memory::MemoryRange as Range;
+use terra_hypervisor::memory::MemoryRange as Range;
 use wasmtime::component::Component;
 
 const RAM: u64 = 256 * 1024;
@@ -712,9 +712,9 @@ async fn component_aot_deserialize_runs() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn component_operates_on_shared_machine_ram() {
-    use terra_platform::memory::GuestMemory;
+    use terra_hypervisor::memory::GuestMemory;
     let engine = device_engine().expect("engine builds");
-    let mem = GuestMemory::allocate(RAM).expect("maps");
+    let mem = GuestMemory::from_ranges(&[(0, usize::try_from(RAM).unwrap())]).expect("maps");
     let mut disk = BoundedDisk::new(8 * 512, false);
     disk.write_at(2 * 512, &[0x5E; 512]).expect("pattern in");
     let component =

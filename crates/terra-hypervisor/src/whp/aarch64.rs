@@ -1,0 +1,299 @@
+//! WHP `aarch64` VM preparation and vCPU run loops.
+
+mod boot;
+mod machine;
+
+pub(crate) use machine::check_available;
+
+use super::{Machine, RunExit};
+use crate::arm::{ArmMmioAccess, ArmRegisterWrite};
+use crate::memory::GuestMemory;
+use crate::vcpus::{Stop, Vcpus};
+use crate::vm::{
+    BootState, InterruptControllerConfig, InterruptMode, VcpuHandler, VcpuOutcome, VmCapabilities,
+    VmConfig, VmHandle, report_vcpu_failure,
+};
+use std::sync::Arc;
+use terra_limits::ARM_MAX_VCPUS;
+
+pub struct Vm {
+    machine: Arc<Machine>,
+    vcpus: Vcpus,
+}
+
+impl Vm {
+    pub fn create(config: &VmConfig, hard_stop: Option<fn() -> !>) -> Result<Self, String> {
+        let InterruptControllerConfig::Arm(gic) = config.interrupt_controller else {
+            return Err("Windows ARM64 requires an ARM interrupt controller".to_owned());
+        };
+        if config.vcpus == 0 || usize::from(config.vcpus) > ARM_MAX_VCPUS as usize {
+            return Err("invalid Windows ARM64 VM dimensions".to_owned());
+        }
+        if config.ram_base != terra_limits::ARM_RAM_BASE {
+            return Err("invalid Windows ARM64 RAM base".to_owned());
+        }
+        let memory = terra_limits::arm_ram_layout(config.ram_bytes)
+            .and_then(GuestMemory::from_layout)
+            .ok_or("allocating ARM WHP RAM")?;
+        let machine = Arc::new(
+            Machine::new(memory, u32::from(config.vcpus), Some(gic))
+                .map_err(|error| error.to_string())?,
+        );
+        let mut vcpus = Vcpus::new(usize::from(config.vcpus), machine.clone(), hard_stop);
+        for id in 0..config.vcpus {
+            machine
+                .create_vcpu(u32::from(id))
+                .map_err(|error| error.to_string())?;
+            let machine = Arc::clone(&machine);
+            let stop = vcpus.stop();
+            vcpus.spawn(move |startup| {
+                let Some((mut handler, _)) = startup.wait() else {
+                    return Ok(());
+                };
+                let outcome = run_vcpu(&machine, u32::from(id), handler.as_mut(), &stop);
+                report_vcpu_failure(id, handler.as_mut(), outcome)
+            })?;
+        }
+        Ok(Self { machine, vcpus })
+    }
+
+    #[allow(clippy::unnecessary_wraps)]
+    pub const fn capabilities() -> Result<VmCapabilities, String> {
+        Ok(VmCapabilities {
+            interrupt_mode: InterruptMode::ArmIrqLines,
+            tsc_frequency: None,
+        })
+    }
+
+    #[must_use]
+    pub fn handle(&self) -> VmHandle {
+        VmHandle::new(Arc::clone(&self.machine))
+    }
+
+    pub fn start(
+        mut self,
+        boot: BootState,
+        handlers: Vec<Box<dyn VcpuHandler>>,
+    ) -> Result<Vcpus, String> {
+        boot::setup_bsp(&self.machine, boot.entry, boot.boot_argument)
+            .map_err(|error| error.to_string())?;
+        self.vcpus.start(boot, handlers)?;
+        Ok(self.vcpus)
+    }
+}
+
+fn run_vcpu(
+    machine: &Machine,
+    vcpu: u32,
+    handler: &mut dyn VcpuHandler,
+    stop: &Stop,
+) -> Result<(), String> {
+    while !stop.is_requested() {
+        match machine.run_vcpu(vcpu).map_err(|error| error.to_string())? {
+            RunExit::MemoryAccess {
+                gpa, pc, syndrome, ..
+            } => arm_mmio(machine, vcpu, handler, gpa, pc, syndrome)?,
+            RunExit::Canceled => break,
+            RunExit::Reset { reboot } => {
+                stop.request();
+                handler.finished(if reboot {
+                    VcpuOutcome::Stopped
+                } else {
+                    VcpuOutcome::Shutdown
+                });
+                return Ok(());
+            }
+            RunExit::Other(reason) => {
+                return Err(format!("unexpected ARM WHP exit {reason:#x} on CPU {vcpu}"));
+            }
+        }
+    }
+    handler.finished(VcpuOutcome::Stopped);
+    Ok(())
+}
+
+fn arm_mmio(
+    machine: &Machine,
+    vcpu: u32,
+    handler: &mut dyn VcpuHandler,
+    gpa: u64,
+    pc: u64,
+    syndrome: u64,
+) -> Result<(), String> {
+    let read_register = |register| {
+        machine
+            .register_u64(vcpu, arm_general_register(register)?)
+            .map_err(|error| error.to_string())
+    };
+    let pc = pc.checked_add(4).ok_or("ARM PC overflow")?;
+    let mut registers = vec![(boot::WHV_ARM64_REGISTER_PC, pc)];
+    let access = ArmMmioAccess::decode(syndrome)?.ok_or_else(|| {
+        format!("WHP memory access exit without a data abort (syndrome {syndrome:#x})")
+    })?;
+    let ArmRegisterWrite { register, value } =
+        access.complete(handler.exchange(access.exit(gpa, read_register)?)?)?;
+    if let Some(register) = register {
+        registers.push((arm_general_register(register)?, value));
+    }
+    arm_set_registers(machine, vcpu, &registers)
+}
+
+fn arm_general_register(
+    index: u8,
+) -> Result<windows_sys::Win32::System::Hypervisor::WHV_REGISTER_NAME, String> {
+    if index > 30 {
+        return Err("ARM MMIO used SP/ZR as a destination register".to_owned());
+    }
+    Ok(boot::WHV_ARM64_REGISTER_X0 + i32::from(index))
+}
+
+fn arm_set_registers(
+    machine: &Machine,
+    vcpu: u32,
+    values: &[(
+        windows_sys::Win32::System::Hypervisor::WHV_REGISTER_NAME,
+        u64,
+    )],
+) -> Result<(), String> {
+    let names = values.iter().map(|(name, _)| *name).collect::<Vec<_>>();
+    let values = values
+        .iter()
+        .map(
+            |(_, value)| windows_sys::Win32::System::Hypervisor::WHV_REGISTER_VALUE {
+                Reg64: *value,
+            },
+        )
+        .collect::<Vec<_>>();
+    machine
+        .set_registers(vcpu, &names, &values)
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vm::{GicConfig, VcpuAction, VcpuExit};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    struct MmioSentinel {
+        vcpu: u32,
+        writes: mpsc::Sender<(u32, u64)>,
+        outcomes: mpsc::Sender<(u32, VcpuOutcome)>,
+    }
+
+    impl VcpuHandler for MmioSentinel {
+        fn exchange(&mut self, exit: VcpuExit) -> Result<VcpuAction, String> {
+            let VcpuExit::MmioWrite(write) = exit else {
+                return Err(format!("unexpected sentinel exit {exit:?}"));
+            };
+            assert_eq!(write.address, 0x1000_0000);
+            self.writes.send((self.vcpu, write.value)).unwrap();
+            Ok(VcpuAction::Reenter)
+        }
+
+        fn finished(&mut self, outcome: VcpuOutcome) {
+            self.outcomes.send((self.vcpu, outcome)).unwrap();
+        }
+    }
+
+    fn write_native_psci_guest(memory: &GuestMemory) {
+        // CPU_ON(1, 0x40001000, 0x1234); write the result; WFI forever.
+        let bsp = [
+            0x5280_0060_u32,
+            0x72b8_8000,
+            0xd280_0021,
+            0x5800_00e2,
+            0xd282_4683,
+            0xd400_0002,
+            0xd2a2_0005,
+            0xf900_00a0,
+            0xd503_207f,
+            0x17ff_ffff,
+            0x4000_1000,
+            0,
+        ];
+        // Write the PSCI context from X0; WFI forever.
+        let secondary = [0xd2a2_0005_u32, 0xf900_00a0, 0xd503_207f, 0x17ff_ffff];
+        for (address, instructions) in [
+            (terra_limits::ARM_RAM_BASE, bsp.as_slice()),
+            (terra_limits::ARM_RAM_BASE + 4096, secondary.as_slice()),
+        ] {
+            let bytes = instructions
+                .iter()
+                .flat_map(|instruction| instruction.to_le_bytes())
+                .collect::<Vec<_>>();
+            memory.write(address, &bytes).unwrap();
+        }
+    }
+
+    /// Native PSCI `CPU_ON` must release a secondary through WHP rather than a
+    /// userspace channel. Both CPUs write a sentinel and then idle in WFI;
+    /// cancellation must wake and join both native runs.
+    #[test]
+    #[ignore = "requires Windows Arm64 Hypervisor Platform"]
+    fn native_psci_starts_secondary_and_idle_cpus_cancel() {
+        let gic = GicConfig {
+            distributor_base: terra_limits::ARM_GIC_DIST_BASE,
+            distributor_size: terra_limits::ARM_GIC_DIST_SIZE,
+            redistributor_base: terra_limits::ARM_GIC_REDIST_BASE,
+            redistributor_size: terra_limits::ARM_GIC_REDIST_SIZE,
+        };
+        let vm = Vm::create(
+            &VmConfig {
+                ram_base: terra_limits::ARM_RAM_BASE,
+                ram_bytes: 2 << 20,
+                vcpus: 2,
+                interrupt_controller: InterruptControllerConfig::Arm(gic),
+                irq_routes: vec![],
+            },
+            None,
+        )
+        .unwrap();
+        for index in 0..2 {
+            assert_eq!(
+                vm.machine
+                    .register_u64(index, boot::WHV_ARM64_REGISTER_GICR_BASE_GPA)
+                    .unwrap(),
+                gic.redistributor_base + u64::from(index) * 0x2_0000
+            );
+        }
+        let memory = vm.handle().memory();
+        write_native_psci_guest(&memory);
+        let (writes, written) = mpsc::channel();
+        let (outcomes, finished) = mpsc::channel();
+        let handlers = (0..2)
+            .map(|vcpu| {
+                Box::new(MmioSentinel {
+                    vcpu,
+                    writes: writes.clone(),
+                    outcomes: outcomes.clone(),
+                }) as Box<dyn VcpuHandler>
+            })
+            .collect();
+        let mut group = vm
+            .start(
+                BootState {
+                    entry: terra_limits::ARM_RAM_BASE,
+                    boot_argument: 0,
+                },
+                handlers,
+            )
+            .unwrap();
+        let mut observed = (0..2)
+            .map(|_| written.recv_timeout(Duration::from_secs(5)).unwrap())
+            .collect::<Vec<_>>();
+        observed.sort_unstable();
+        assert_eq!(observed, [(0, 0), (1, 0x1234)]);
+        let results = group.join().unwrap();
+        assert_eq!(results, [Ok(()), Ok(())]);
+        let mut observed = (0..2)
+            .map(|_| finished.recv_timeout(Duration::from_secs(1)).unwrap())
+            .collect::<Vec<_>>();
+        observed.sort_unstable_by_key(|(vcpu, _)| *vcpu);
+        assert_eq!(
+            observed,
+            [(0, VcpuOutcome::Stopped), (1, VcpuOutcome::Stopped)]
+        );
+    }
+}

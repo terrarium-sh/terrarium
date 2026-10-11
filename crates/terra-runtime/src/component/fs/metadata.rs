@@ -35,7 +35,7 @@ pub(super) fn get_mode_at(
     let Descriptor::Dir(directory) = parent else {
         return Err(terra::fs::host::Error::Access);
     };
-    terra_platform::filesystem::mode_at(&directory.dir, name).map_err(map_error)
+    terra_platform::filesystem::share::mode_at(&directory.dir, name).map_err(map_error)
 }
 
 pub(super) fn set_mode_at(
@@ -49,14 +49,14 @@ pub(super) fn set_mode_at(
     if directory.perms.write_not_permitted() {
         return Err(terra::fs::host::Error::Access);
     }
-    terra_platform::filesystem::set_mode_at(&directory.dir, name, mode).map_err(map_error)
+    terra_platform::filesystem::share::set_mode_at(&directory.dir, name, mode).map_err(map_error)
 }
 
 pub(super) fn open_metadata_file(
     directory: &std::fs::File,
     name: &str,
 ) -> Result<std::fs::File, terra::fs::host::Error> {
-    terra_platform::filesystem::open_metadata_file(directory, name).map_err(map_error)
+    terra_platform::filesystem::share::open_metadata_file(directory, name).map_err(map_error)
 }
 
 pub(super) fn statfs(

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Keep the platform/runtime Cargo dependency boundary one-way."""
+"""Keep the platform/hypervisor/runtime Cargo dependency boundaries one-way."""
 
 import json
 import subprocess
@@ -37,6 +37,14 @@ def is_forbidden_platform_package(name):
     )
 
 
+def normal_dependencies(node):
+    return [
+        dependency["pkg"]
+        for dependency in node["deps"]
+        if any(kind["kind"] is None for kind in dependency["dep_kinds"])
+    ]
+
+
 def dependency_path(graph, start, forbidden):
     pending = deque([(start, [start])])
     visited = {start}
@@ -68,26 +76,39 @@ for target in TARGETS:
         for node in metadata["resolve"]["nodes"]
     }
     platform = package_id(metadata["packages"], "terra-platform")
+    hypervisor = package_id(metadata["packages"], "terra-hypervisor")
     runtime = package_id(metadata["packages"], "terra-runtime")
+    sandbox = package_id(metadata["packages"], "terra-sandbox")
     broker = package_id(metadata["packages"], "terra-network")
     broker_forbidden = {package for package, name in packages.items()
-                        if name in {"terra-runtime", "terra-platform"} or name.startswith(("wasmtime", "wasi"))}
+                        if name in {"terra-runtime", "terra-platform", "terra-hypervisor"}
+                        or name.startswith(("wasmtime", "wasi"))}
     broker_path = dependency_path(graph, broker, broker_forbidden)
     if broker_path:
         errors.append(f"{target}: network broker reaches VM machinery: "
                       + " -> ".join(packages[package] for package in broker_path))
     forbidden = {package for package, name in packages.items() if is_forbidden_platform_package(name)}
-    path = dependency_path(graph, platform, forbidden)
-    if path:
-        errors.append(
-            f"{target}: terra-platform reaches a forbidden package: "
-            + " -> ".join(packages[package] for package in path)
-        )
-    if platform not in graph.get(runtime, []):
-        errors.append(f"{target}: terra-runtime must directly depend on terra-platform")
+    for start in (platform, hypervisor):
+        path = dependency_path(graph, start, forbidden)
+        if path:
+            errors.append(
+                f"{target}: {packages[start]} reaches a forbidden package: "
+                + " -> ".join(packages[package] for package in path)
+            )
+    for dependency in (platform, hypervisor):
+        if dependency not in graph.get(runtime, []):
+            errors.append(f"{target}: terra-runtime must directly depend on {packages[dependency]}")
+    normal_graph = {node["id"]: normal_dependencies(node) for node in metadata["resolve"]["nodes"]}
+    for start in (platform, sandbox):
+        path = dependency_path(normal_graph, start, {hypervisor})
+        if path:
+            errors.append(
+                f"{target}: {packages[start]} reaches terra-hypervisor: "
+                + " -> ".join(packages[package] for package in path)
+            )
     if any(name == "terra-io" for name in packages.values()):
         errors.append(f"{target}: terra-io remains in the workspace or dependency graph")
 
 if errors:
     raise SystemExit("\n".join(errors))
-print("Validated platform/runtime Cargo dependency boundary on supported targets")
+print("Validated platform/hypervisor/runtime Cargo dependency boundaries on supported targets")

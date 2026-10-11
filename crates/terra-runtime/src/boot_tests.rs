@@ -312,7 +312,7 @@ async fn kernel_boots_with_high_ram_above_the_mmio_hole() {
 fn bridge_listener() -> (
     tempfile::TempDir,
     std::path::PathBuf,
-    terra_platform::io::local::LocalListener,
+    terra_platform::local_socket::LocalListener,
 ) {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
@@ -320,7 +320,7 @@ fn bridge_listener() -> (
     let dir = tempfile::tempdir().expect("temporary socket directory");
     let path = dir.path().join("agent.sock");
     let listener =
-        terra_platform::io::local::LocalListener::bind(&path).expect("bind agent socket");
+        terra_platform::local_socket::LocalListener::bind(&path).expect("bind agent socket");
     #[cfg(unix)]
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
         .expect("secure agent socket");
@@ -338,7 +338,7 @@ fn bridge_listener() -> (
 
 fn connect_agent(
     path: &std::path::Path,
-) -> std::io::Result<terra_platform::io::local::LocalStream> {
+) -> std::io::Result<terra_platform::local_socket::LocalStream> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_mins(2);
     loop {
         match connect_agent_once(path) {
@@ -353,11 +353,11 @@ fn connect_agent(
 
 fn connect_agent_once(
     path: &std::path::Path,
-) -> std::io::Result<terra_platform::io::local::LocalStream> {
+) -> std::io::Result<terra_platform::local_socket::LocalStream> {
     use std::io::Read as _;
     use terra_protocol::AGENT_HELLO;
 
-    let mut stream = terra_platform::io::local::LocalStream::connect(path)?;
+    let mut stream = terra_platform::local_socket::LocalStream::connect(path)?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
     let mut hello = [0; AGENT_HELLO.len()];
     stream.read_exact(&mut hello)?;
@@ -386,7 +386,7 @@ fn assert_agent_control_and_exec(path: &std::path::Path) -> std::io::Result<()> 
 }
 
 fn assert_agent_control_reply(
-    mut control: terra_platform::io::local::LocalStream,
+    mut control: terra_platform::local_socket::LocalStream,
 ) -> std::io::Result<()> {
     use std::io::Write as _;
     use terra_protocol::{AgentService, ControlReply, ControlRequest, encode_frame, read_frame};
@@ -423,7 +423,7 @@ fn agent_exec_with_input(
 }
 
 fn run_agent_exec(
-    mut exec: terra_platform::io::local::LocalStream,
+    mut exec: terra_platform::local_socket::LocalStream,
     argv: &[&str],
     input: Option<&[u8]>,
 ) -> std::io::Result<Vec<u8>> {
@@ -453,7 +453,7 @@ fn run_agent_exec(
 }
 
 fn write_agent_exec_request(
-    exec: &mut terra_platform::io::local::LocalStream,
+    exec: &mut terra_platform::local_socket::LocalStream,
     argv: &[&str],
     input: Option<&[u8]>,
 ) -> std::io::Result<()> {
@@ -677,7 +677,7 @@ async fn kernel_boots_local_only_agent_control_and_session() {
     let (_socket_dir, socket_path, listener) = bridge_listener();
     let (_control_dir, control_path, control_listener) = bridge_listener();
     let mut control_writer =
-        terra_platform::io::local::LocalStream::connect(&control_path).unwrap();
+        terra_platform::local_socket::LocalStream::connect(&control_path).unwrap();
     let (control, _) = control_listener.accept().unwrap();
     let client = tokio::task::spawn_blocking(move || {
         assert_agent_control_and_exec(&socket_path)?;
@@ -740,7 +740,7 @@ const STALLED_GUEST_PORT: u16 = 8080;
 
 fn begin_stalled_download(
     path: &std::path::Path,
-) -> std::io::Result<terra_platform::io::local::LocalStream> {
+) -> std::io::Result<terra_platform::local_socket::LocalStream> {
     use std::io::Write as _;
     use terra_protocol::{AgentService, SyncReply, SyncRequest, encode_frame, read_frame};
 
@@ -853,9 +853,9 @@ fn fill_stalled_network_writer(stream: &mut std::net::TcpStream) -> std::io::Res
 fn stop_with_stalled_transfers(
     path: &std::path::Path,
     host_port: u16,
-    mut control: terra_platform::io::local::LocalStream,
+    mut control: terra_platform::local_socket::LocalStream,
 ) -> std::io::Result<(
-    terra_platform::io::local::LocalStream,
+    terra_platform::local_socket::LocalStream,
     std::net::TcpStream,
     std::time::Instant,
 )> {
@@ -914,7 +914,7 @@ async fn kernel_boots_control_and_stop_progress_with_stalled_network_and_file() 
         .unwrap();
     let (_socket_dir, socket_path, listener) = bridge_listener();
     let (_control_dir, control_path, control_listener) = bridge_listener();
-    let control_writer = terra_platform::io::local::LocalStream::connect(&control_path).unwrap();
+    let control_writer = terra_platform::local_socket::LocalStream::connect(&control_path).unwrap();
     let (control, _) = control_listener.accept().unwrap();
     let host_port = reserved_loopback_port();
     let encoded = boot_plan(
@@ -993,7 +993,7 @@ async fn kernel_boots_control_and_stop_progress_with_stalled_network_and_file() 
 }
 
 fn assert_stalled_transfers_closed(
-    mut download: terra_platform::io::local::LocalStream,
+    mut download: terra_platform::local_socket::LocalStream,
     mut network: std::net::TcpStream,
 ) {
     use std::io::Read as _;
@@ -1081,7 +1081,7 @@ fn stop_after_network_reset(
     diagnostics: &std::path::Path,
     closed: &std::sync::mpsc::Receiver<bool>,
     shared_reset: bool,
-    mut control: terra_platform::io::local::LocalStream,
+    mut control: terra_platform::local_socket::LocalStream,
 ) -> std::io::Result<std::time::Instant> {
     use std::io::Write as _;
     use std::time::{Duration, Instant};
@@ -1228,7 +1228,7 @@ async fn assert_vsock_reset_effect(shared_reset: bool) {
     });
     let (_socket_dir, socket_path, listener) = bridge_listener();
     let (_control_dir, control_path, control_listener) = bridge_listener();
-    let control_writer = terra_platform::io::local::LocalStream::connect(&control_path).unwrap();
+    let control_writer = terra_platform::local_socket::LocalStream::connect(&control_path).unwrap();
     let (control, _) = control_listener.accept().unwrap();
     let diagnostics = tempfile::NamedTempFile::new().unwrap();
     let client_directory = directory.path().to_owned();
@@ -1401,7 +1401,7 @@ async fn kernel_boots_and_agent_stop_ends_workload() {
     let (kernel, boot_disk, root_path) = kernel_boot_assets();
     let (_control_dir, control_path, control_listener) = bridge_listener();
     let mut control_writer =
-        terra_platform::io::local::LocalStream::connect(&control_path).unwrap();
+        terra_platform::local_socket::LocalStream::connect(&control_path).unwrap();
     let (control, _) = control_listener.accept().unwrap();
     let client_path = socket_path.clone();
     let client = tokio::task::spawn_blocking(move || {
@@ -1670,7 +1670,7 @@ async fn assert_published_loopback_http(host_closes_first: bool) {
     let (kernel, boot_disk, root_path) = kernel_boot_assets();
     let (_control_dir, control_path, control_listener) = bridge_listener();
     let mut control_writer =
-        terra_platform::io::local::LocalStream::connect(&control_path).unwrap();
+        terra_platform::local_socket::LocalStream::connect(&control_path).unwrap();
     let (control, _) = control_listener.accept().unwrap();
     let diagnostics = tempfile::NamedTempFile::new().expect("create diagnostics");
     let encoded = boot_plan(

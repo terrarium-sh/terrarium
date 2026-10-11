@@ -311,7 +311,7 @@ mod tests {
     #[test]
     fn graceful_stop_waits_for_the_control_socket_and_releases_the_box() {
         use std::io::Read as _;
-        use terra_platform::io::local::LocalListener;
+        use terra_platform::local_socket::LocalListener;
 
         for (pid_line, delay) in [
             (std::process::id().to_string(), Duration::ZERO),
@@ -345,7 +345,7 @@ mod tests {
     #[test]
     fn forced_stop_reads_pid_metadata_after_the_grace_period() {
         use std::io::Read as _;
-        use terra_platform::io::local::LocalListener;
+        use terra_platform::local_socket::LocalListener;
 
         let dir = tempfile::tempdir().unwrap();
         let (bx, _home) = create_box_in(dir.path());

@@ -29,7 +29,7 @@ pub(super) fn prepare_sandbox_launch(
             directory.join("readonly"),
         ] {
             let mut grant = Grant::new(&path, Access::ReadWrite);
-            grant.directory = Some(terra_platform::filesystem::open_share_root(
+            grant.directory = Some(terra_platform::filesystem::share::open_share_root(
                 &path.canonicalize()?,
             )?);
             grants.push(grant);
@@ -94,13 +94,13 @@ pub(super) fn prepare_sandbox_launch(
 fn granted_directory_identity(
     grants: &[Grant],
     path: &Path,
-) -> Result<terra_platform::filesystem::FileIdentity> {
+) -> Result<terra_platform::filesystem::share::FileIdentity> {
     let directory = grants
         .iter()
         .find(|grant| grant.path == path)
         .and_then(|grant| grant.directory.as_ref())
         .with_context(|| format!("missing validated Windows share root {}", path.display()))?;
-    Ok(terra_platform::filesystem::file_identity(directory)?)
+    Ok(terra_platform::filesystem::share::file_identity(directory)?)
 }
 
 fn build_sandbox_grants(spec: &BootSpec, bx: &BoxRef) -> Result<Vec<Grant>> {
@@ -125,7 +125,7 @@ fn build_sandbox_grants(spec: &BootSpec, bx: &BoxRef) -> Result<Vec<Grant>> {
                 },
             );
             grant.directory = Some(
-                terra_platform::filesystem::open_share_root(&share.host)
+                terra_platform::filesystem::share::open_share_root(&share.host)
                     .with_context(|| format!("opening approved share {}", share.host.display()))?,
             );
             grants.push(grant);
@@ -417,7 +417,7 @@ mod tests {
         let bx = BoxRef::from_state_dir(dir.path().join("box"), dir.path());
         let mut command =
             custom_command(&init, &exe, &spec(dir.path(), PlanMode::Run), &bx).unwrap();
-        let (mut broker, worker) = terra_platform::io::local::create_local_pair().unwrap();
+        let (mut broker, worker) = terra_platform::local_socket::create_local_pair().unwrap();
         let inherited =
             crate::sys::pass_ipc(&mut command, &worker, super::super::supervisor::NETWORK_FD)
                 .unwrap();

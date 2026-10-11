@@ -44,7 +44,7 @@ pub fn create_backend(
     endpoints: Endpoints,
 ) -> wasmtime::Result<(NetworkBackend, tokio::task::JoinHandle<std::io::Result<()>>)> {
     use terra_network::config::{Config, Network, PublishedListener, StaticDnsRecord};
-    use terra_platform::io::local::{AsyncLocalStream, create_local_pair};
+    use terra_platform::local_socket::{AsyncLocalStream, create_local_pair};
     let listeners = vec![
         PublishedListener {
             grant: 1,

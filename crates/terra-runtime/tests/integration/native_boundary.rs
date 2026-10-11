@@ -188,9 +188,9 @@ fn round_trip_through_synthetic_ram() {
 
 #[test]
 fn nonzero_guest_base_keeps_capacity_and_address_bounds_distinct() {
-    use terra_platform::memory::GuestMemory;
+    use terra_hypervisor::memory::GuestMemory;
 
-    let ram = GuestRam::from_memory(GuestMemory::allocate_at(0x10_0000, 0x4000).expect("RAM"));
+    let ram = GuestRam::from_memory(GuestMemory::from_ranges(&[(0x10_0000, 0x4000)]).expect("RAM"));
     let memory = BoundedMemory::new(&ram);
 
     assert_eq!(ram.mapped_bytes(), 0x4000);
@@ -242,7 +242,7 @@ fn interrupt_storm_drops_signals_past_the_window_budget() {
 #[cfg(unix)]
 #[test]
 fn memory_hole_is_rejected_before_partial_write() {
-    use terra_platform::memory::GuestMemory;
+    use terra_hypervisor::memory::GuestMemory;
     let ram =
         GuestRam::from_memory(GuestMemory::from_ranges(&[(0, 0x1000), (0x2000, 0x1000)]).unwrap());
     let memory = BoundedMemory::new(&ram);
@@ -254,7 +254,7 @@ fn memory_hole_is_rejected_before_partial_write() {
 #[cfg(unix)]
 #[test]
 fn hostile_memory_imports_cannot_cross_mapping_holes() {
-    use terra_platform::memory::GuestMemory;
+    use terra_hypervisor::memory::GuestMemory;
     use terra_runtime::memory::GuestRam;
 
     let ram = GuestRam::from_memory(GuestMemory::from_ranges(&[(0, 4096), (8192, 4096)]).unwrap());
@@ -273,8 +273,8 @@ fn synthetic_ram_shapes_match() {
 #[cfg(unix)]
 #[test]
 fn shared_ram_aliases_one_mapping() {
-    use terra_platform::memory::GuestMemory;
-    let mem = GuestMemory::allocate(64 * 1024).expect("maps");
+    use terra_hypervisor::memory::GuestMemory;
+    let mem = GuestMemory::from_ranges(&[(0, 64 * 1024)]).expect("maps");
     let first = GuestRam::from_memory(mem.clone());
     let second = GuestRam::from_memory(mem.clone());
     assert_eq!(first.address_limit(), 64 * 1024);

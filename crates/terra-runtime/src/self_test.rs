@@ -21,8 +21,8 @@ mod vsock;
 const FIXTURE_STARTUP_WAIT: Duration = Duration::from_secs(120);
 
 pub struct AgentListeners {
-    pub control: terra_platform::io::local::LocalListener,
-    pub agent: terra_platform::io::local::LocalListener,
+    pub control: terra_platform::local_socket::LocalListener,
+    pub agent: terra_platform::local_socket::LocalListener,
 }
 
 pub async fn run_self_test(artifacts: TrustedArtifacts, directory: &Path) -> wasmtime::Result<()> {
@@ -306,7 +306,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn agent_uses_trusted_listeners_without_binding_in_the_vm() {
-        use terra_platform::io::local::LocalListener;
+        use terra_platform::local_socket::LocalListener;
 
         let directory = tempfile::tempdir().unwrap();
         let listeners = super::AgentListeners {
@@ -329,7 +329,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn local_only_devices_run_without_a_network_backend() {
-        use terra_platform::io::local::LocalListener;
+        use terra_platform::local_socket::LocalListener;
 
         let directory = tempfile::tempdir().unwrap();
         let listeners = super::AgentListeners {

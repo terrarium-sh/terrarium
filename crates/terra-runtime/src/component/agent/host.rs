@@ -7,7 +7,7 @@ use terra_protocol::{MAX_PLAN_BYTES, MAX_PLAN_HOST_STATE_BYTES};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use terra_platform::io::local::{
+use terra_platform::local_socket::{
     AsyncLocalListener as Listener, AsyncLocalStream, LocalListener, LocalStream,
 };
 type ReadHalf = AsyncLocalStream;

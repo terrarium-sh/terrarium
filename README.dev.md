@@ -48,7 +48,8 @@ WIT [interface symlinks](components/wit/README.md) materialized correctly.
 | `crates/terra-policy` | Shared network policy rules and address decisions |
 | `crates/terra-network` | Host network broker and its IPC client |
 | `crates/terra-limits` | Shared resource limits |
-| `crates/terra-platform` | Native VM, memory, filesystem, local-I/O and child-process APIs over KVM, Hypervisor.framework and WHP |
+| `crates/terra-hypervisor` | Native VMs, vCPU threads and guest memory over KVM, Hypervisor.framework and WHP |
+| `crates/terra-platform` | Host filesystem, local-socket and child-process APIs |
 | `crates/terra-sandbox` | Host confinement of VM and broker workers: Bubblewrap and seccomp, macOS App Sandbox, Windows AppContainer and restricted-token jobs |
 | `crates/terra-build` | Build-script logic: fallback seccomp filters, Bubblewrap asset lookup, version string |
 | `crates/terra-runtime` | Wasmtime stores, guest layout, scoped host capabilities, network configuration and policy contracts, and component/VM lifecycle orchestration |
@@ -105,7 +106,7 @@ Shutdown responsibilities stay with their resource owners:
 | `box_runtime` | Stop and join Wasmtime tasks |
 | `component/vmm/teardown.rs` | Sequence native cleanup and retain resources when cleanup cannot finish |
 | `component/vmm/native_task.rs` | Run cleanup independently of cancellation of a waiter |
-| `terra-platform` VM backends | Stop and join native vCPU threads |
+| `terra-hypervisor` `vcpus.rs` | Stop and join native vCPU threads |
 
 The agent starts as PID 1 from the read-only 3 MiB memory-backed boot disk, receives its boot
 plan over the fixed agent vsock stream, grows the box's ext4 images and enters the Alpine root with

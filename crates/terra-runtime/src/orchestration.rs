@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use terra_platform::io::local::{LocalListener, LocalStream};
-use terra_platform::vm::{self, InterruptMode};
+use terra_hypervisor::vm::{self, InterruptMode};
+use terra_platform::local_socket::{LocalListener, LocalStream};
 
 mod devices;
 mod observation;
@@ -412,7 +412,7 @@ mod tests {
     use super::*;
     use crate::component::mmio::{DeviceError, Operation, Reply, Request};
     use crate::component::relay;
-    use terra_platform::vm::VcpuHandler;
+    use terra_hypervisor::vm::VcpuHandler;
 
     fn create_device_handler() -> (
         RuntimeVcpu,

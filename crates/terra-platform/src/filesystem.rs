@@ -1,6 +1,9 @@
-//! Native filesystem and positional file operations.
+//! Native file metadata, permissions, and capped appends.
 
-use std::{fs::File, io, path::Path};
+use std::{
+    fs::File,
+    io::{self, Write as _},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -32,178 +35,6 @@ pub fn open_file_limit() -> Option<u64> {
     }
 }
 
-pub fn open_share_root(root: &Path) -> io::Result<File> {
-    #[cfg(unix)]
-    if !root.is_absolute()
-        || root.components().any(|component| {
-            !matches!(
-                component,
-                std::path::Component::RootDir | std::path::Component::Normal(_)
-            )
-        })
-    {
-        return Err(io::Error::other("mount source is not an absolute path"));
-    }
-    #[cfg(target_os = "macos")]
-    {
-        use rustix::fs::{Mode, OFlags, open};
-
-        Ok(open(
-            root,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW_ANY | OFlags::CLOEXEC,
-            Mode::empty(),
-        )?
-        .into())
-    }
-    #[cfg(target_os = "linux")]
-    {
-        use rustix::fs::{Mode, OFlags, openat};
-        use std::path::Component;
-
-        let mut directory = File::open("/")?;
-        for component in root.components() {
-            let Component::Normal(name) = component else {
-                continue;
-            };
-            directory = openat(
-                &directory,
-                name,
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::empty(),
-            )
-            .map_err(io::Error::from)?
-            .into();
-        }
-        Ok(directory)
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt as _;
-        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
-
-        let directory = File::options()
-            .read(true)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-            .open(root)?;
-        if !directory.metadata()?.is_dir() {
-            return Err(io::Error::other("mount source must be a directory"));
-        }
-        if !windows::matches_canonical_root(&directory, root)? {
-            return Err(io::Error::other("mount source changed while opening it"));
-        }
-        Ok(directory)
-    }
-}
-
-#[cfg(windows)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FileIdentity {
-    pub volume_serial: u64,
-    pub file_id: [u8; 16],
-}
-
-#[cfg(windows)]
-impl std::fmt::Display for FileIdentity {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "{}:{}",
-            self.volume_serial,
-            u128::from_le_bytes(self.file_id)
-        )
-    }
-}
-
-#[cfg(windows)]
-impl std::str::FromStr for FileIdentity {
-    type Err = io::Error;
-
-    fn from_str(value: &str) -> io::Result<Self> {
-        let invalid = || io::Error::new(io::ErrorKind::InvalidInput, "invalid share file identity");
-        let (serial, file_id) = value.split_once(':').ok_or_else(invalid)?;
-        Ok(Self {
-            volume_serial: serial.parse().map_err(|_| invalid())?,
-            file_id: file_id
-                .parse::<u128>()
-                .map_err(|_| invalid())?
-                .to_le_bytes(),
-        })
-    }
-}
-
-#[cfg(windows)]
-pub fn file_identity(file: &File) -> io::Result<FileIdentity> {
-    windows::file_identity(file)
-}
-
-#[cfg(windows)]
-pub use windows::{
-    create_directory_at, hard_link_at, read_base_dir, remove_directory_at, rename_at,
-    unlink_file_at,
-};
-
-#[cfg(windows)]
-pub fn open_granted_share_root(root: &Path, expected: FileIdentity) -> io::Result<File> {
-    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    };
-
-    let directory = File::options()
-        .read(true)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(root)?;
-    let metadata = directory.metadata()?;
-    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return Err(io::Error::other(
-            "granted share root must be a regular directory",
-        ));
-    }
-    if file_identity(&directory)? != expected {
-        return Err(io::Error::other(
-            "granted share root changed while opening it",
-        ));
-    }
-    Ok(directory)
-}
-
-#[cfg(target_os = "macos")]
-pub fn open_metadata_file(_directory: &File, name: &str) -> Result<File, Error> {
-    validate_child_name(name)?;
-    Err(Error::Unsupported)
-}
-
-#[cfg(not(target_os = "macos"))]
-pub fn open_metadata_file(directory: &File, name: &str) -> Result<File, Error> {
-    validate_child_name(name)?;
-    let file = {
-        #[cfg(unix)]
-        {
-            use rustix::fs::{Mode, OFlags, openat};
-            #[cfg(target_os = "linux")]
-            let flags = OFlags::PATH;
-            File::from(
-                openat(
-                    directory,
-                    name,
-                    flags | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                    Mode::empty(),
-                )
-                .map_err(|_| Error::Access)?,
-            )
-        }
-        #[cfg(windows)]
-        {
-            windows::open_metadata_file(directory, name)?
-        }
-    };
-    let metadata = file.metadata().map_err(|_| Error::Io)?;
-    if !metadata.is_file() && !metadata.is_dir() {
-        return Err(Error::Access);
-    }
-    Ok(file)
-}
-
 pub fn mode(file: &File, is_directory: bool) -> Result<Option<u32>, Error> {
     #[cfg(unix)]
     {
@@ -228,22 +59,6 @@ pub fn mode(file: &File, is_directory: bool) -> Result<Option<u32>, Error> {
                 })
                 .map_err(|_| Error::Io)
         }
-    }
-}
-
-pub fn mode_at(directory: &File, name: &str) -> Result<Option<u32>, Error> {
-    validate_child_name(name)?;
-    #[cfg(unix)]
-    {
-        let metadata = rustix::fs::statat(directory, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
-            .map_err(|_| Error::Access)?;
-        #[allow(clippy::useless_conversion)]
-        Ok(Some(u32::from(metadata.st_mode)))
-    }
-    #[cfg(windows)]
-    {
-        let _ = directory;
-        Ok(None)
     }
 }
 
@@ -292,43 +107,6 @@ pub fn set_mode(file: &File, is_directory: bool, mode: u32) -> Result<(), Error>
     }
 }
 
-pub fn set_mode_at(directory: &File, name: &str, mode: u32) -> Result<(), Error> {
-    validate_child_name(name)?;
-    #[cfg(target_os = "linux")]
-    {
-        let file = open_metadata_file(directory, name)?;
-        set_mode(
-            &file,
-            file.metadata().map_err(|_| Error::Io)?.is_dir(),
-            mode,
-        )
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let metadata = rustix::fs::statat(directory, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
-            .map_err(|_| Error::Access)?;
-        if !matches!(
-            rustix::fs::FileType::from_raw_mode(metadata.st_mode),
-            rustix::fs::FileType::RegularFile | rustix::fs::FileType::Directory
-        ) {
-            return Err(Error::Access);
-        }
-        let mode = u16::try_from(mode & 0o777).map_err(|_| Error::Access)?;
-        rustix::fs::chmodat(
-            directory,
-            name,
-            rustix::fs::Mode::from_raw_mode(mode),
-            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
-        )
-        .map_err(|_| Error::Access)
-    }
-    #[cfg(windows)]
-    {
-        let _ = (directory, mode);
-        Err(Error::Unsupported)
-    }
-}
-
 pub fn stat(file: &File) -> Result<FilesystemStat, Error> {
     #[cfg(unix)]
     {
@@ -357,231 +135,6 @@ pub fn stat(file: &File) -> Result<FilesystemStat, Error> {
     }
 }
 
-pub fn read_exact_at(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::FileExt as _;
-        file.read_exact_at(buf, offset)
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::FileExt as _;
-        let mut done = 0;
-        while done < buf.len() {
-            let at = offset
-                .checked_add(u64::try_from(done).map_err(io::Error::other)?)
-                .ok_or_else(|| io::Error::other("file offset overflow"))?;
-            match file.seek_read(&mut buf[done..], at) {
-                Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
-                Ok(len) => done += len,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(())
-    }
-}
-
-pub fn write_all_at(file: &File, offset: u64, buf: &[u8]) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::FileExt as _;
-        file.write_all_at(buf, offset)
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::FileExt as _;
-        let mut done = 0;
-        while done < buf.len() {
-            let at = offset
-                .checked_add(u64::try_from(done).map_err(io::Error::other)?)
-                .ok_or_else(|| io::Error::other("file offset overflow"))?;
-            match file.seek_write(&buf[done..], at) {
-                Ok(0) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "zero-length positional write",
-                    ));
-                }
-                Ok(len) => done += len,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(())
-    }
-}
-
-pub fn discard(file: &File, offset: u64, len: u64) -> io::Result<()> {
-    if len == 0 {
-        return Ok(());
-    }
-    discard_file(file, offset, len)
-}
-
-pub fn open_disk(path: &Path, readonly: bool) -> io::Result<File> {
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(!readonly)
-        .open(path)?;
-    if !file.metadata()?.is_file() {
-        return Err(io::Error::other("block backing must be a regular file"));
-    }
-    Ok(file)
-}
-
-fn validate_child_name(name: &str) -> Result<(), Error> {
-    if name.is_empty() || matches!(name, "." | "..") || name.contains(['/', '\0']) {
-        return Err(Error::Access);
-    }
-    #[cfg(windows)]
-    if name.contains(['\\', ':']) {
-        return Err(Error::Access);
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn discard_file(file: &File, offset: u64, len: u64) -> io::Result<()> {
-    rustix::fs::fallocate(
-        file,
-        rustix::fs::FallocateFlags::PUNCH_HOLE | rustix::fs::FallocateFlags::KEEP_SIZE,
-        offset,
-        len,
-    )
-    .map_err(io::Error::from)
-    .or_else(ignore_unsupported)
-}
-
-#[cfg(target_os = "macos")]
-fn discard_file(file: &File, offset: u64, len: u64) -> io::Result<()> {
-    use std::os::fd::AsRawFd as _;
-    let block = rustix::fs::fstatvfs(file)
-        .map_err(io::Error::from)?
-        .f_frsize;
-    if block == 0 {
-        return Err(io::Error::other("zero filesystem block size"));
-    }
-    let end = offset
-        .checked_add(len)
-        .ok_or_else(|| io::Error::other("discard range overflow"))?;
-    let offset = offset
-        .div_ceil(block)
-        .checked_mul(block)
-        .ok_or_else(|| io::Error::other("discard range overflow"))?;
-    let end = end / block * block;
-    if end <= offset {
-        return Ok(());
-    }
-    let range = libc::fpunchhole_t {
-        fp_flags: 0,
-        reserved: 0,
-        fp_offset: libc::off_t::try_from(offset).map_err(io::Error::other)?,
-        fp_length: libc::off_t::try_from(end - offset).map_err(io::Error::other)?,
-    };
-    #[allow(unsafe_code)]
-    let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PUNCHHOLE, &range) };
-    if result == 0 {
-        Ok(())
-    } else {
-        ignore_unsupported(io::Error::last_os_error())
-    }
-}
-
-#[cfg(windows)]
-fn discard_file(file: &File, offset: u64, len: u64) -> io::Result<()> {
-    use std::os::windows::io::AsRawHandle as _;
-    use windows_sys::Win32::System::IO::DeviceIoControl;
-    use windows_sys::Win32::System::Ioctl::{
-        FILE_ZERO_DATA_INFORMATION, FSCTL_SET_SPARSE, FSCTL_SET_ZERO_DATA,
-    };
-    let start = i64::try_from(offset).map_err(io::Error::other)?;
-    let end = start
-        .checked_add(i64::try_from(len).map_err(io::Error::other)?)
-        .ok_or_else(|| io::Error::other("discard range overflow"))?;
-    let mut returned = 0;
-    #[allow(unsafe_code)]
-    let sparse = unsafe {
-        DeviceIoControl(
-            file.as_raw_handle(),
-            FSCTL_SET_SPARSE,
-            core::ptr::null(),
-            0,
-            core::ptr::null_mut(),
-            0,
-            &raw mut returned,
-            core::ptr::null_mut(),
-        )
-    };
-    if sparse == 0 {
-        return zero_file_range(file, offset, len);
-    }
-    let range = FILE_ZERO_DATA_INFORMATION {
-        FileOffset: start,
-        BeyondFinalZero: end,
-    };
-    #[allow(unsafe_code)]
-    let zeroed = unsafe {
-        DeviceIoControl(
-            file.as_raw_handle(),
-            FSCTL_SET_ZERO_DATA,
-            (&raw const range).cast(),
-            u32::try_from(core::mem::size_of_val(&range)).map_err(io::Error::other)?,
-            core::ptr::null_mut(),
-            0,
-            &raw mut returned,
-            core::ptr::null_mut(),
-        )
-    };
-    if zeroed == 0 {
-        return zero_file_range(file, offset, len);
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn zero_file_range(file: &File, mut offset: u64, mut len: u64) -> io::Result<()> {
-    let end = offset
-        .checked_add(len)
-        .ok_or_else(|| io::Error::other("discard range overflow"))?;
-    if end > file.metadata()?.len() {
-        return Err(io::Error::from(io::ErrorKind::InvalidInput));
-    }
-    let zeroes = vec![0; 64 * 1024];
-    while len > 0 {
-        let chunk = usize::try_from(len.min(zeroes.len() as u64)).map_err(io::Error::other)?;
-        write_all_at(file, offset, &zeroes[..chunk])?;
-        offset += chunk as u64;
-        len -= chunk as u64;
-    }
-    Ok(())
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn ignore_unsupported(error: io::Error) -> io::Result<()> {
-    (error.kind() == io::ErrorKind::Unsupported).ok_or(error)
-}
-
-#[cfg(all(test, windows))]
-mod windows_discard_tests {
-    use super::*;
-
-    #[test]
-    fn zero_fill_fallback_preserves_neighbors_and_file_length() {
-        let file = tempfile::tempfile().unwrap();
-        file.set_len(200_000).unwrap();
-        write_all_at(&file, 0, &vec![0xa5; 200_000]).unwrap();
-        zero_file_range(&file, 500, 131_000).unwrap();
-        let mut contents = vec![0; 200_000];
-        read_exact_at(&file, 0, &mut contents).unwrap();
-        assert!(contents[..500].iter().all(|byte| *byte == 0xa5));
-        assert!(contents[500..131_500].iter().all(|byte| *byte == 0));
-        assert!(contents[131_500..].iter().all(|byte| *byte == 0xa5));
-        assert!(zero_file_range(&file, 199_999, 2).is_err());
-        assert_eq!(file.metadata().unwrap().len(), 200_000);
-    }
-}
-
 pub fn open_regular_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
@@ -600,7 +153,7 @@ pub fn open_regular_file(path: &std::path::Path) -> std::io::Result<std::fs::Fil
 /// Restrict an existing path to its owner: `0700` for a directory, `0600` for a
 /// file.
 #[cfg(unix)]
-pub fn set_owner_only(path: &Path, dir: bool) -> io::Result<()> {
+pub fn set_owner_only(path: &std::path::Path, dir: bool) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let mode = if dir { 0o700 } else { 0o600 };
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
@@ -610,62 +163,62 @@ pub fn set_owner_only(path: &Path, dir: bool) -> io::Result<()> {
 pub use windows::set_owner_only;
 
 #[cfg(windows)]
-pub use windows::{FileAccess, reopen_file_with_delete_sharing};
-
-#[cfg(windows)]
-#[path = "filesystem/windows.rs"]
 mod windows;
 
-#[cfg(all(test, unix))]
+pub mod disk;
+pub mod share;
+
+/// Drops bytes beyond the cap; concurrent writers must use independently opened append handles.
+pub fn append_capped(file: &mut File, bytes: &[u8], max_bytes: u64) -> io::Result<()> {
+    file.lock()?;
+    let result = (|| {
+        let remaining = max_bytes.saturating_sub(file.metadata()?.len());
+        let count = bytes
+            .len()
+            .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+        file.write_all(&bytes[..count])
+    })();
+    let unlocked = file.unlock();
+    result.and(unlocked)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    #[cfg(not(target_os = "macos"))]
-    #[test]
-    fn share_root_and_metadata_handles_reject_symlinks_and_retain_inodes() {
-        use std::assert_matches;
-        use std::io::{Read as _, Write as _};
-        use std::os::unix::fs::{PermissionsExt as _, symlink};
+    const MAX_LOG_FILE_BYTES: u64 = 32;
 
-        let root = tempfile::tempdir().expect("root");
-        let root_path = root.path().canonicalize().expect("canonical root");
-        let original = root_path.join("original");
-        std::fs::write(&original, b"original").expect("write original");
-        std::fs::set_permissions(&original, std::fs::Permissions::from_mode(0o000))
-            .expect("remove permissions");
-        let directory = open_share_root(&root_path).expect("open root");
-        let mut metadata = open_metadata_file(&directory, "original").expect("open metadata");
-        assert_eq!(metadata.metadata().expect("metadata").len(), 8);
-        assert!(metadata.read(&mut [0; 1]).is_err());
-        let moved = root_path.join("moved");
-        std::fs::rename(&original, &moved).expect("rename original");
-        std::fs::write(&original, b"replacement").expect("replace original");
-        set_mode(&metadata, false, 0o600).expect("set mode");
-        assert!(metadata.read(&mut [0; 1]).is_err());
-        assert!(metadata.write(b"changed").is_err());
-        assert_eq!(std::fs::read(&moved).expect("read moved"), b"original");
-        assert_eq!(
-            std::fs::read(&original).expect("read replacement"),
-            b"replacement"
-        );
-        for name in ["", ".", "..", "../original", "original/child", "original\0"] {
-            assert_matches!(open_metadata_file(&directory, name), Err(Error::Access));
-        }
-        symlink(&original, root_path.join("link")).expect("symlink");
-        assert_matches!(open_metadata_file(&directory, "link"), Err(Error::Access));
+    #[test]
+    fn cap_drops_excess_bytes_without_truncating_existing_contents() {
+        use std::io::{Read as _, Seek as _};
+        let mut file = tempfile::tempfile().unwrap();
+        append_capped(&mut file, b"abc", 3).unwrap();
+        append_capped(&mut file, b"ignored", 3).unwrap();
+        append_capped(&mut file, b"ignored", 0).unwrap();
+        assert_eq!(file.metadata().unwrap().len(), 3);
+        append_capped(&mut file, b"def", 5).unwrap();
+        file.rewind().unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"abcde");
     }
 
     #[test]
-    fn share_root_rejects_symlinked_ancestors() {
-        let root = tempfile::tempdir().expect("root");
-        let base = root.path().canonicalize().expect("canonical root");
-        let expected_parent = base.join("expected");
-        let private_parent = base.join("private");
-        std::fs::create_dir_all(expected_parent.join("share")).expect("expected share");
-        std::fs::create_dir_all(private_parent.join("share")).expect("private share");
-        let expected = expected_parent.join("share");
-        std::fs::rename(&expected_parent, base.join("moved")).expect("move expected");
-        std::os::unix::fs::symlink(&private_parent, &expected_parent).expect("symlink parent");
-        assert!(open_share_root(&expected).is_err());
+    fn independent_append_handles_share_one_file_cap() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("log");
+        File::create(&path)
+            .unwrap()
+            .set_len(MAX_LOG_FILE_BYTES - 3)
+            .unwrap();
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let mut file = File::options().read(true).append(true).open(&path).unwrap();
+                scope.spawn(move || {
+                    append_capped(&mut file, b"123456", MAX_LOG_FILE_BYTES).unwrap();
+                });
+            }
+        });
+        assert_eq!(std::fs::metadata(path).unwrap().len(), MAX_LOG_FILE_BYTES);
     }
 }

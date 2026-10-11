@@ -21,7 +21,7 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
-use terra_platform::io::local::{LocalListener as UnixListener, LocalStream as UnixStream};
+use terra_platform::local_socket::{LocalListener as UnixListener, LocalStream as UnixStream};
 #[cfg(test)]
 use wasmtime::Store;
 use wasmtime::StoreContextMut;
@@ -46,7 +46,7 @@ impl DiagnosticSink {
             .spawn(move || {
                 let result = std::iter::from_fn(|| receiver.blocking_recv())
                     .try_for_each(|bytes| {
-                        terra_platform::io::log::write_capped(
+                        terra_platform::filesystem::append_capped(
                             &mut output,
                             &bytes,
                             terra_limits::MAX_LOG_FILE_BYTES,

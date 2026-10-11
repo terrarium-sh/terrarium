@@ -1,0 +1,309 @@
+//! The WHP `aarch64` partition: exits, `GICv3`, and interrupt lines.
+
+use super::boot::{WHV_ARM64_REGISTER_GICR_BASE_GPA, WHV_ARM64_REGISTER_INTERNAL_ACTIVITY_STATE};
+use crate::whp::{
+    AlignedRegisterValue, AvailabilityError, Machine, MachineError, RunExit, WhpError, result,
+};
+use windows_sys::Win32::System::Hypervisor::{
+    WHV_CAPABILITY, WHV_REGISTER_VALUE, WHvGetCapability, WHvRequestInterrupt,
+    WHvRunVirtualProcessor, WHvSetPartitionProperty, WHvSetVirtualProcessorRegisters,
+};
+const ARM64_SUPPORT: u64 = 1 << 11;
+
+#[repr(C, align(16))]
+#[derive(Default)]
+struct Arm64RunVpExitContext {
+    exit_reason: i32,
+    reserved: u32,
+    reserved1: u64,
+    payload: [u64; 32],
+}
+
+const _: () = {
+    assert!(size_of::<Arm64RunVpExitContext>() == 272);
+    assert!(align_of::<Arm64RunVpExitContext>() == 16);
+    assert!(std::mem::offset_of!(Arm64RunVpExitContext, payload) == 16);
+};
+
+#[repr(C)]
+struct Arm64MemoryAccessContext {
+    vp_index: u32,
+    instruction_length: u8,
+    access_type: u8,
+    execution_state: u16,
+    pc: u64,
+    cpsr: u64,
+    reserved0: u32,
+    instruction_byte_count: u8,
+    access_info: u8,
+    reserved1: u16,
+    instruction_bytes: [u8; 4],
+    reserved2: u32,
+    gva: u64,
+    gpa: u64,
+    syndrome: u64,
+}
+
+const _: () = assert!(size_of::<Arm64MemoryAccessContext>() == 64);
+
+#[repr(C)]
+struct Arm64ResetContext {
+    vp_index: u32,
+    instruction_length: u8,
+    intercept_access_type: u8,
+    execution_state: u16,
+    pc: u64,
+    cpsr: u64,
+    reset_type: u32,
+    reserved: u32,
+}
+
+const _: () = assert!(size_of::<Arm64ResetContext>() == 32);
+
+const WHV_PARTITION_PROPERTY_CODE_ARM64_IC_PARAMETERS: i32 = 0x0000_1012;
+
+const WHV_CAPABILITY_CODE_GIC_LPI_INT_ID_BITS: i32 = 0x0000_2011;
+
+const ARM64_IC_EMULATION_MODE_GIC_V3: u32 = 1;
+
+const ARM64_GIC_REDISTRIBUTOR_STRIDE: u64 = 0x20_000;
+
+#[repr(C)]
+struct Arm64IcGicV3Parameters {
+    gicd_base_address: u64,
+    gits_translater_base_address: u64,
+    reserved: u32,
+    gic_lpi_int_id_bits: u32,
+    gic_ppi_overflow_interrupt_from_cntv: u32,
+    gic_ppi_performance_monitors_interrupt: u32,
+    reserved1: [u32; 6],
+}
+
+#[repr(C)]
+struct Arm64IcParameters {
+    emulation_mode: u32,
+    reserved: u32,
+    gic_v3: Arm64IcGicV3Parameters,
+}
+
+#[repr(C)]
+struct Arm64InterruptControl {
+    target_partition: u64,
+    interrupt_control: u64,
+    destination_address: u64,
+    requested_vector: u32,
+    target_vtl: u8,
+    reserved_z0: u8,
+    reserved_z1: u16,
+}
+
+const ARM64_INTERRUPT_ASSERTED: u64 = 1 << 34;
+
+const _: () = {
+    assert!(size_of::<Arm64InterruptControl>() == 32);
+    assert!(std::mem::offset_of!(Arm64InterruptControl, interrupt_control) == 8);
+    assert!(ARM64_INTERRUPT_ASSERTED == 0x0000_0004_0000_0000);
+};
+
+fn arm64_lpi_id_bits() -> Result<u32, WhpError> {
+    let mut lpi_id_bits = 0;
+    let mut written = 0;
+    // SAFETY: lpi_id_bits is the documented u32 output for this capability.
+    result(unsafe {
+        WHvGetCapability(
+            WHV_CAPABILITY_CODE_GIC_LPI_INT_ID_BITS,
+            (&raw mut lpi_id_bits).cast(),
+            size_of::<u32>() as u32,
+            &raw mut written,
+        )
+    })?;
+    if written == size_of::<u32>() as u32 {
+        Ok(lpi_id_bits)
+    } else {
+        Err(WhpError(-1))
+    }
+}
+
+impl Machine {
+    pub fn run_vcpu(&self, index: u32) -> Result<RunExit, MachineError> {
+        self.require_vcpu(index)?;
+        let mut context = Arm64RunVpExitContext::default();
+        // SAFETY: Arm64RunVpExitContext has the documented 272-byte ARM64 ABI size.
+        result(unsafe {
+            WHvRunVirtualProcessor(
+                self.handle,
+                index,
+                (&raw mut context).cast(),
+                size_of::<Arm64RunVpExitContext>() as u32,
+            )
+        })
+        .map_err(MachineError::Api)?;
+        Ok(RunExit::from_arm64(&context))
+    }
+
+    #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
+    pub fn clear_interrupts(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    #[allow(clippy::unused_self)]
+    pub fn request_x86_interrupt(&self, _: u8, _: u8) -> Result<(), String> {
+        Err("x86 interrupt injection is unavailable on ARM".to_owned())
+    }
+
+    pub fn inject_interrupt(&self, irq: u32, asserted: bool) -> Result<(), String> {
+        let intid = irq
+            .checked_add(32)
+            .ok_or_else(|| MachineError::InvalidVcpu.to_string())?;
+        let interrupt = Arm64InterruptControl {
+            target_partition: 0,
+            interrupt_control: u64::from(asserted) * ARM64_INTERRUPT_ASSERTED,
+            destination_address: 0,
+            requested_vector: intid,
+            target_vtl: 0,
+            reserved_z0: 0,
+            reserved_z1: 0,
+        };
+        // SAFETY: Arm64InterruptControl is the Arm64 WHV_INTERRUPT_CONTROL ABI.
+        result(unsafe {
+            WHvRequestInterrupt(
+                self.handle,
+                (&raw const interrupt).cast(),
+                size_of::<Arm64InterruptControl>() as u32,
+            )
+        })
+        .map_err(|error| MachineError::Api(error).to_string())
+    }
+
+    pub(crate) fn configure_interrupt_controller(&self) -> Result<(), MachineError> {
+        let lpi_id_bits = arm64_lpi_id_bits().map_err(MachineError::Api)?;
+        let parameters = Arm64IcParameters {
+            emulation_mode: ARM64_IC_EMULATION_MODE_GIC_V3,
+            reserved: 0,
+            gic_v3: Arm64IcGicV3Parameters {
+                gicd_base_address: self.gic.distributor_base,
+                gits_translater_base_address: 0,
+                reserved: 0,
+                gic_lpi_int_id_bits: lpi_id_bits,
+                gic_ppi_overflow_interrupt_from_cntv: 27,
+                gic_ppi_performance_monitors_interrupt: 23,
+                reserved1: [0; 6],
+            },
+        };
+        // SAFETY: parameters has the documented ARM64 IC property layout.
+        result(unsafe {
+            WHvSetPartitionProperty(
+                self.handle,
+                WHV_PARTITION_PROPERTY_CODE_ARM64_IC_PARAMETERS,
+                (&raw const parameters).cast(),
+                size_of::<Arm64IcParameters>() as u32,
+            )
+        })
+        .map_err(MachineError::Api)
+    }
+
+    pub(crate) fn configure_arm64_vcpu(&self, index: u32) -> Result<(), MachineError> {
+        let offset = u64::from(index)
+            .checked_mul(ARM64_GIC_REDISTRIBUTOR_STRIDE)
+            .ok_or(MachineError::InvalidGic)?;
+        if offset
+            .checked_add(ARM64_GIC_REDISTRIBUTOR_STRIDE)
+            .is_none_or(|end| end > self.gic.redistributor_size)
+        {
+            return Err(MachineError::InvalidGic);
+        }
+        let gicr_base = self
+            .gic
+            .redistributor_base
+            .checked_add(offset)
+            .ok_or(MachineError::InvalidGic)?;
+        let names = [
+            WHV_ARM64_REGISTER_GICR_BASE_GPA,
+            WHV_ARM64_REGISTER_INTERNAL_ACTIVITY_STATE,
+        ];
+        // Hyper-V handles PSCI CPU_ON and releases StartupSuspend itself.
+        let values = [
+            AlignedRegisterValue(WHV_REGISTER_VALUE { Reg64: gicr_base }),
+            AlignedRegisterValue(WHV_REGISTER_VALUE {
+                Reg64: u64::from(index != 0),
+            }),
+        ];
+        // SAFETY: the just-created vCPU accepts these documented ARM64 registers.
+        result(unsafe {
+            WHvSetVirtualProcessorRegisters(
+                self.handle,
+                index,
+                names.as_ptr(),
+                names.len() as u32,
+                values.as_ptr().cast(),
+            )
+        })
+        .map_err(MachineError::Api)
+    }
+}
+
+impl RunExit {
+    fn from_reason(reason: i32) -> Self {
+        const WHV_RUN_VP_EXIT_REASON_CANCELED: i32 = -1;
+        match reason {
+            WHV_RUN_VP_EXIT_REASON_CANCELED => Self::Canceled,
+            reason => Self::Other(reason),
+        }
+    }
+
+    fn from_arm64(context: &Arm64RunVpExitContext) -> Self {
+        const UNMAPPED_GPA: i32 = 0x8000_0000u32 as i32;
+        const GPA_INTERCEPT: i32 = 0x8000_0001u32 as i32;
+        const RESET: i32 = 0x8001_000c_u32 as i32;
+        match context.exit_reason {
+            UNMAPPED_GPA | GPA_INTERCEPT => {
+                // SAFETY: these exit reasons select WHV_MEMORY_ACCESS_CONTEXT.
+                let access = unsafe {
+                    (&raw const context.payload)
+                        .cast::<Arm64MemoryAccessContext>()
+                        .read()
+                };
+                Self::MemoryAccess {
+                    gpa: access.gpa,
+                    access_info: u32::from(access.access_type),
+                    pc: access.pc,
+                    cpsr: access.cpsr,
+                    syndrome: access.syndrome,
+                }
+            }
+            RESET => {
+                // SAFETY: the exit reason selects WHV_ARM64_RESET_CONTEXT.
+                let reset = unsafe {
+                    (&raw const context.payload)
+                        .cast::<Arm64ResetContext>()
+                        .read()
+                };
+                Self::Reset {
+                    reboot: reset.reset_type == 1,
+                }
+            }
+            reason => Self::from_reason(reason),
+        }
+    }
+}
+
+pub(crate) fn check_available() -> Result<(), AvailabilityError> {
+    let mut written = 0;
+    let mut features = WHV_CAPABILITY::default();
+    // SAFETY: WHV_CAPABILITY is the output type required by WHvGetCapability.
+    result(unsafe {
+        WHvGetCapability(
+            windows_sys::Win32::System::Hypervisor::WHvCapabilityCodeFeatures,
+            (&raw mut features).cast(),
+            size_of::<WHV_CAPABILITY>() as u32,
+            &raw mut written,
+        )
+    })
+    .map_err(AvailabilityError::Api)?;
+    // SAFETY: WHvGetCapability initialized the Features union member.
+    let supported = unsafe { features.Features.AsUINT64 } & ARM64_SUPPORT != 0;
+    if !supported {
+        return Err(AvailabilityError::Arm64Unsupported);
+    }
+    Ok(())
+}

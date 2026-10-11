@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 #[cfg(any(target_os = "macos", windows))]
-use terra_platform::io::local::LocalListener;
-use terra_platform::io::local::{AsyncLocalStream, LocalStream, create_local_pair};
+use terra_platform::local_socket::LocalListener;
+use terra_platform::local_socket::{AsyncLocalStream, LocalStream, create_local_pair};
 use terra_sandbox::{Launch, PolicyBundle, PreparedLaunch, Role};
 
 pub(crate) const SUPERVISOR_ARG: &str = "__supervisor";

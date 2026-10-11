@@ -142,7 +142,7 @@ pub struct FileDisk {
 
 impl FileDisk {
     pub fn open(path: &std::path::Path, readonly: bool) -> std::io::Result<Self> {
-        let file = terra_platform::filesystem::open_disk(path, readonly)?;
+        let file = terra_platform::filesystem::disk::open_disk(path, readonly)?;
         let capacity = file.metadata()?.len();
         Ok(Self {
             file,
@@ -159,7 +159,7 @@ impl BlockBacking for FileDisk {
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), BackingError> {
         self.check_range(offset, buf.len())?;
-        terra_platform::filesystem::read_exact_at(&self.file, offset, buf)
+        terra_platform::filesystem::disk::read_exact_at(&self.file, offset, buf)
             .map_err(|_| BackingError::Io)
     }
 
@@ -168,7 +168,7 @@ impl BlockBacking for FileDisk {
             return Err(BackingError::ReadOnly);
         }
         self.check_range(offset, buf.len())?;
-        terra_platform::filesystem::write_all_at(&self.file, offset, buf)
+        terra_platform::filesystem::disk::write_all_at(&self.file, offset, buf)
             .map_err(|_| BackingError::Io)
     }
 
@@ -177,7 +177,8 @@ impl BlockBacking for FileDisk {
             return Err(BackingError::ReadOnly);
         }
         self.check_range_len(offset, len)?;
-        terra_platform::filesystem::discard(&self.file, offset, len).map_err(|_| BackingError::Io)
+        terra_platform::filesystem::disk::discard(&self.file, offset, len)
+            .map_err(|_| BackingError::Io)
     }
 
     fn sync(&self) -> Result<(), BackingError> {

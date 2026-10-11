@@ -478,7 +478,7 @@ async fn spawn_foreground(
 }
 
 fn relay_foreground_stop(bx: &BoxRef) -> Result<()> {
-    let (host, mut receiver) = terra_platform::io::local::create_local_pair()
+    let (host, mut receiver) = terra_platform::local_socket::create_local_pair()
         .context("creating foreground stop channel")?;
     let bx = bx.clone();
     std::thread::Builder::new()

@@ -14,6 +14,7 @@ compiler = ["wasmtime/cranelift"]
 test-support = []
 
 [dependencies]
+terra-hypervisor = { path = "../terra-hypervisor" }
 terra-platform = { path = "../terra-platform" }
 terra-network = { path = "../terra-network" }
 terra-protocol = { path = "../terra-protocol" }

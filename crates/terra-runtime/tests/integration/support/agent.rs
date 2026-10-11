@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use terra_platform::io::local::{LocalListener, LocalStream};
+use terra_platform::local_socket::{LocalListener, LocalStream};
 use terra_runtime::box_runtime::{BoxHost, BoxRuntime, BoxRuntimeHandle};
 use terra_runtime::component::agent::Agent;
 use terra_runtime::component::vmm::lifecycle::LifecycleNotifier;
