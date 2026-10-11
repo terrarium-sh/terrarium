@@ -1650,19 +1650,13 @@ mod tests {
         let guest_port = guest.allocate_guest_port();
         let stream = guest.open_udp(guest_port).await.unwrap();
         let peer = (socket::HOST_SERVICE_IPV4, endpoints.udp).into();
-        let payload = vec![37; PAYLOAD_BYTES];
         let request = Message::UdpSend {
             segment: 0,
             peer,
-            bytes: payload.clone(),
+            bytes: vec![37; PAYLOAD_BYTES],
         }
         .encode()
         .unwrap();
-        let expected = Message::UdpDatagram {
-            segment: 0,
-            peer,
-            bytes: payload,
-        };
         let payload_mib =
             f64::from(u32::try_from(PAYLOAD_BYTES * DATAGRAMS).unwrap()) / 1024.0 / 1024.0;
         println!(
@@ -1674,9 +1668,12 @@ mod tests {
                 let started = Instant::now();
                 for _ in 0..DATAGRAMS / window {
                     guest.stream.submit_raw(stream, &burst).await.unwrap();
-                    for _ in 0..window {
-                        assert_eq!(guest.stream.read_message(stream).await.unwrap(), expected);
+                    let mut echoed_datagrams = 0;
+                    while echoed_datagrams < window {
+                        echoed_datagrams +=
+                            read_udp_echo(&mut guest, stream, peer, PAYLOAD_BYTES).await;
                     }
+                    assert_eq!(echoed_datagrams, window);
                 }
                 let elapsed = started.elapsed().as_secs_f64();
                 if sample != 0 {
@@ -1700,6 +1697,34 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
+    }
+
+    /// Returns how many `payload_bytes` echoes one message carries; the broker may coalesce a
+    /// window's echoes into one segmented run.
+    async fn read_udp_echo(
+        guest: &mut GuestNetwork,
+        stream: Stream,
+        peer: std::net::SocketAddr,
+        payload_bytes: usize,
+    ) -> usize {
+        let Message::UdpDatagram {
+            segment,
+            peer: echoed_peer,
+            bytes,
+        } = guest.stream.read_message(stream).await.unwrap()
+        else {
+            panic!("UDP echo requires datagram framing");
+        };
+        assert_eq!(echoed_peer, peer);
+        assert!(bytes.iter().all(|byte| *byte == 37));
+        if segment == 0 {
+            assert_eq!(bytes.len(), payload_bytes);
+            1
+        } else {
+            assert_eq!(usize::from(segment), payload_bytes);
+            assert_eq!(bytes.len() % payload_bytes, 0);
+            bytes.len() / payload_bytes
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
