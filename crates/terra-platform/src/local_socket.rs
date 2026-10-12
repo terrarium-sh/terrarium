@@ -261,7 +261,7 @@ mod tests {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "io::local::tests::local_stream_pair_returns_long_temp_path_errors",
+                "local_socket::tests::local_stream_pair_returns_long_temp_path_errors",
                 "--nocapture",
             ])
             .env("TERRA_TEST_LONG_PAIR_TEMP", "1")
