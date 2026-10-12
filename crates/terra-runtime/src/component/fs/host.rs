@@ -12,7 +12,7 @@ use wasmtime_wasi::{
 pub struct FsHost {
     pub device: crate::component::context::DeviceContext,
     grant: ShareGrant,
-    events: Option<super::file_events::FileEvents>,
+    events: Option<crate::component::relay::Stream<terra::fs::host::FileEvent>>,
     descriptor_budget: std::sync::Arc<tokio::sync::Semaphore>,
     descriptor_permits: std::collections::HashMap<u32, tokio::sync::OwnedSemaphorePermit>,
     #[cfg(test)]
@@ -73,7 +73,7 @@ impl FsHost {
     }
 
     pub(super) async fn initialize_events(&mut self) {
-        self.events = Some(super::file_events::FileEvents::new(&self.grant).await);
+        self.events = Some(super::file_events::watch_file_events(&self.grant).await);
     }
 
     fn preopen_directory(&self) -> Descriptor {
@@ -83,7 +83,15 @@ impl FsHost {
     fn grant_directory(&mut self) -> wasmtime::Result<Resource<Descriptor>> {
         let permit = self.descriptor_budget.clone().try_acquire_owned()?;
         let directory = self.preopen_directory();
-        let resource = self.ctx().table.push(directory)?;
+        Ok(self.push_descriptor(directory, permit)?)
+    }
+
+    fn push_descriptor(
+        &mut self,
+        descriptor: Descriptor,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<Resource<Descriptor>, wasmtime::component::ResourceTableError> {
+        let resource = self.ctx().table.push(descriptor)?;
         self.descriptor_permits.insert(resource.rep(), permit);
         Ok(resource)
     }
@@ -118,6 +126,16 @@ impl FsHost {
             .get(descriptor)
             .cloned()
             .map_err(|_| terra::fs::host::Error::Access)
+    }
+
+    fn clone_writable_descriptor(
+        &mut self,
+        descriptor: &Resource<Descriptor>,
+    ) -> Result<Descriptor, terra::fs::host::Error> {
+        if self.grant.access.is_read_only() {
+            return Err(terra::fs::host::Error::Access);
+        }
+        self.clone_descriptor(descriptor)
     }
 
     #[cfg(windows)]
@@ -210,7 +228,7 @@ impl<T: Send + 'static> terra::fs::host::HostWithStore<T> for HasSelf<FsHost> {
                 .map_err(|_| Error::Io)?;
             Ok((directory, permit))
         })?;
-        let (descriptor, permit) = tokio::task::spawn_blocking(move || {
+        let (descriptor, permit) = run_blocking(Error::Io, move || {
             let file = open_metadata_file(&directory.dir, &name)?;
             let descriptor = if file.metadata().map_err(|_| Error::Io)?.is_dir() {
                 Descriptor::Dir(Dir::new(file, directory.perms, OpenMode::empty(), false))
@@ -222,15 +240,14 @@ impl<T: Send + 'static> terra::fs::host::HostWithStore<T> for HasSelf<FsHost> {
                     false,
                 ))
             };
-            Ok::<_, Error>((descriptor, permit))
+            Ok((descriptor, permit))
         })
-        .await
-        .map_err(|_| Error::Io)??;
+        .await?;
         accessor.with(|mut access| {
-            let host = access.get();
-            let resource = host.ctx().table.push(descriptor).map_err(|_| Error::Io)?;
-            host.descriptor_permits.insert(resource.rep(), permit);
-            Ok(resource)
+            access
+                .get()
+                .push_descriptor(descriptor, permit)
+                .map_err(|_| Error::Io)
         })
     }
 
@@ -242,9 +259,7 @@ impl<T: Send + 'static> terra::fs::host::HostWithStore<T> for HasSelf<FsHost> {
         let descriptor = accessor.with(|mut access| access.get().clone_descriptor(&descriptor));
         async move {
             let descriptor = descriptor?;
-            tokio::task::spawn_blocking(move || statfs(&descriptor))
-                .await
-                .map_err(|_| terra::fs::host::Error::Io)?
+            run_blocking(terra::fs::host::Error::Io, move || statfs(&descriptor)).await
         }
     }
 
@@ -257,7 +272,7 @@ impl<T: Send + 'static> terra::fs::host::HostWithStore<T> for HasSelf<FsHost> {
         let descriptor = accessor.with(|mut access| access.get().clone_descriptor(&descriptor));
         async move {
             let descriptor = descriptor?;
-            tokio::task::spawn_blocking(move || {
+            run_blocking(terra::fs::host::Error::Io, move || {
                 #[cfg(test)]
                 if let Some(gate) = gate {
                     gate.wait_on_host_thread();
@@ -265,7 +280,6 @@ impl<T: Send + 'static> terra::fs::host::HostWithStore<T> for HasSelf<FsHost> {
                 get_mode(&descriptor)
             })
             .await
-            .map_err(|_| terra::fs::host::Error::Io)?
         }
     }
 
@@ -274,18 +288,14 @@ impl<T: Send + 'static> terra::fs::host::HostWithStore<T> for HasSelf<FsHost> {
         descriptor: Resource<Descriptor>,
         mode: u32,
     ) -> impl Future<Output = Result<(), terra::fs::host::Error>> + Send {
-        let descriptor = accessor.with(|mut access| {
-            let host = access.get();
-            if host.grant.readonly {
-                return Err(terra::fs::host::Error::Access);
-            }
-            host.clone_descriptor(&descriptor)
-        });
+        let descriptor =
+            accessor.with(|mut access| access.get().clone_writable_descriptor(&descriptor));
         async move {
             let descriptor = descriptor?;
-            tokio::task::spawn_blocking(move || set_mode(&descriptor, mode))
-                .await
-                .map_err(|_| terra::fs::host::Error::Io)?
+            run_blocking(terra::fs::host::Error::Io, move || {
+                set_mode(&descriptor, mode)
+            })
+            .await
         }
     }
 
@@ -295,9 +305,10 @@ impl<T: Send + 'static> terra::fs::host::HostWithStore<T> for HasSelf<FsHost> {
         name: String,
     ) -> Result<Option<u32>, terra::fs::host::Error> {
         let parent = accessor.with(|mut access| access.get().clone_descriptor(&parent))?;
-        tokio::task::spawn_blocking(move || get_mode_at(&parent, &name))
-            .await
-            .map_err(|_| terra::fs::host::Error::Io)?
+        run_blocking(terra::fs::host::Error::Io, move || {
+            get_mode_at(&parent, &name)
+        })
+        .await
     }
 
     async fn set_mode_at(
@@ -306,16 +317,11 @@ impl<T: Send + 'static> terra::fs::host::HostWithStore<T> for HasSelf<FsHost> {
         name: String,
         mode: u32,
     ) -> Result<(), terra::fs::host::Error> {
-        let parent = accessor.with(|mut access| {
-            let host = access.get();
-            if host.grant.readonly {
-                return Err(terra::fs::host::Error::Access);
-            }
-            host.clone_descriptor(&parent)
-        })?;
-        tokio::task::spawn_blocking(move || set_mode_at(&parent, &name, mode))
-            .await
-            .map_err(|_| terra::fs::host::Error::Io)?
+        let parent = accessor.with(|mut access| access.get().clone_writable_descriptor(&parent))?;
+        run_blocking(terra::fs::host::Error::Io, move || {
+            set_mode_at(&parent, &name, mode)
+        })
+        .await
     }
 
     fn file_events(
@@ -369,7 +375,7 @@ fn add_descriptor_lifecycle<T: Send + 'static>(
 ) -> wasmtime::Result<()> {
     use types::HostDescriptorWithStore;
     linker.allow_shadowing(true);
-    let mut interface = linker.instance("wasi:filesystem/types@0.3.0")?;
+    let mut interface = linker.instance(super::WASI_FILESYSTEM_TYPES)?;
     interface.resource(
         "descriptor",
         wasmtime::component::ResourceType::host::<Descriptor>(),
@@ -435,6 +441,27 @@ fn add_descriptor_lifecycle<T: Send + 'static>(
     Ok(())
 }
 
+async fn run_blocking<R: Send + 'static, E: Send + 'static>(
+    join_failure: E,
+    job: impl FnOnce() -> Result<R, E> + Send + 'static,
+) -> Result<R, E> {
+    tokio::task::spawn_blocking(job)
+        .await
+        .unwrap_or(Err(join_failure))
+}
+
+#[cfg(windows)]
+async fn mutate_on_blocking_thread<D: Send + 'static>(
+    prepared: Result<D, types::ErrorCode>,
+    mutate: impl FnOnce(D) -> std::io::Result<()> + Send + 'static,
+) -> Result<(), types::ErrorCode> {
+    let prepared = prepared?;
+    run_blocking(types::ErrorCode::Io, move || {
+        mutate(prepared).map_err(Into::into)
+    })
+    .await
+}
+
 #[cfg(windows)]
 fn add_windows_mutations<T: Send + 'static>(
     interface: &mut wasmtime::component::LinkerInstance<'_, T>,
@@ -446,18 +473,13 @@ fn add_windows_mutations<T: Send + 'static>(
             let directory =
                 accessor.with(|mut access| host(access.data_mut()).writable_directory(&descriptor));
             Box::pin(async move {
-                let result = match directory {
-                    Ok(directory) => tokio::task::spawn_blocking(move || {
-                        terra_platform::filesystem::share::windows::create_directory_at(
-                            &directory.dir,
-                            path.as_ref(),
-                        )
-                    })
-                    .await
-                    .map_err(|_| types::ErrorCode::Io)
-                    .and_then(|result| result.map_err(Into::into)),
-                    Err(error) => Err(error),
-                };
+                let result = mutate_on_blocking_thread(directory, move |directory| {
+                    terra_platform::filesystem::share::windows::create_directory_at(
+                        &directory.dir,
+                        path.as_ref(),
+                    )
+                })
+                .await;
                 Ok((result,))
             })
         },
@@ -485,20 +507,15 @@ fn add_windows_mutations<T: Send + 'static>(
                 Ok((old, new))
             });
             Box::pin(async move {
-                let result = match directories {
-                    Ok((old, new)) => tokio::task::spawn_blocking(move || {
-                        terra_platform::filesystem::share::windows::hard_link_at(
-                            &old.dir,
-                            old_path.as_ref(),
-                            &new.dir,
-                            new_path.as_ref(),
-                        )
-                    })
-                    .await
-                    .map_err(|_| types::ErrorCode::Io)
-                    .and_then(|result| result.map_err(Into::into)),
-                    Err(error) => Err(error),
-                };
+                let result = mutate_on_blocking_thread(directories, move |(old, new)| {
+                    terra_platform::filesystem::share::windows::hard_link_at(
+                        &old.dir,
+                        old_path.as_ref(),
+                        &new.dir,
+                        new_path.as_ref(),
+                    )
+                })
+                .await;
                 Ok((result,))
             })
         },
@@ -530,20 +547,15 @@ fn add_windows_rename_and_delete<T: Send + 'static>(
                 Ok((old, new))
             });
             Box::pin(async move {
-                let result = match directories {
-                    Ok((old, new)) => tokio::task::spawn_blocking(move || {
-                        terra_platform::filesystem::share::windows::rename_at(
-                            &old.dir,
-                            old_path.as_ref(),
-                            &new.dir,
-                            new_path.as_ref(),
-                        )
-                    })
-                    .await
-                    .map_err(|_| types::ErrorCode::Io)
-                    .and_then(|result| result.map_err(Into::into)),
-                    Err(error) => Err(error),
-                };
+                let result = mutate_on_blocking_thread(directories, move |(old, new)| {
+                    terra_platform::filesystem::share::windows::rename_at(
+                        &old.dir,
+                        old_path.as_ref(),
+                        &new.dir,
+                        new_path.as_ref(),
+                    )
+                })
+                .await;
                 Ok((result,))
             })
         },
@@ -554,18 +566,13 @@ fn add_windows_rename_and_delete<T: Send + 'static>(
             let directory =
                 accessor.with(|mut access| host(access.data_mut()).writable_directory(&descriptor));
             Box::pin(async move {
-                let result = match directory {
-                    Ok(directory) => tokio::task::spawn_blocking(move || {
-                        terra_platform::filesystem::share::windows::remove_directory_at(
-                            &directory.dir,
-                            path.as_ref(),
-                        )
-                    })
-                    .await
-                    .map_err(|_| types::ErrorCode::Io)
-                    .and_then(|result| result.map_err(Into::into)),
-                    Err(error) => Err(error),
-                };
+                let result = mutate_on_blocking_thread(directory, move |directory| {
+                    terra_platform::filesystem::share::windows::remove_directory_at(
+                        &directory.dir,
+                        path.as_ref(),
+                    )
+                })
+                .await;
                 Ok((result,))
             })
         },
@@ -576,18 +583,13 @@ fn add_windows_rename_and_delete<T: Send + 'static>(
             let directory =
                 accessor.with(|mut access| host(access.data_mut()).writable_directory(&descriptor));
             Box::pin(async move {
-                let result = match directory {
-                    Ok(directory) => tokio::task::spawn_blocking(move || {
-                        terra_platform::filesystem::share::windows::unlink_file_at(
-                            &directory.dir,
-                            path.as_ref(),
-                        )
-                    })
-                    .await
-                    .map_err(|_| types::ErrorCode::Io)
-                    .and_then(|result| result.map_err(Into::into)),
-                    Err(error) => Err(error),
-                };
+                let result = mutate_on_blocking_thread(directory, move |directory| {
+                    terra_platform::filesystem::share::windows::unlink_file_at(
+                        &directory.dir,
+                        path.as_ref(),
+                    )
+                })
+                .await;
                 Ok((result,))
             })
         },
@@ -598,6 +600,7 @@ fn add_windows_rename_and_delete<T: Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::component::AccessMode;
 
     #[test]
     fn cancelled_metadata_open_keeps_its_permit_until_the_blocking_job_finishes() {
@@ -612,7 +615,8 @@ mod tests {
         runtime.block_on(async {
             let root = tempfile::tempdir().unwrap();
             std::fs::write(root.path().join("file"), b"metadata").unwrap();
-            let grant = ShareGrant::new(&root.path().canonicalize().unwrap(), true).unwrap();
+            let grant = ShareGrant::new(&root.path().canonicalize().unwrap(), AccessMode::ReadOnly)
+                .unwrap();
             let mut host = FsHost::with_resource_capacity(
                 crate::component::context::DeviceContext::new(4096).unwrap(),
                 grant,

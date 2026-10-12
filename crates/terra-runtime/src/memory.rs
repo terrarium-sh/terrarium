@@ -4,8 +4,8 @@ use terra_hypervisor::memory::{
     DiscardError, GuestMemory, MemoryError as PlatformMemoryError, MemoryRange,
 };
 
-use crate::MAX_SINGLE_BYTES;
 use std::sync::atomic::{Ordering, fence};
+use terra_limits::MAX_SINGLE_GUEST_COPY_BYTES;
 use terra_limits::{MAX_BATCH_GUEST_COPY_BYTES, MAX_BATCH_GUEST_COPY_RANGES};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,7 +60,7 @@ impl<'a> BoundedMemory<'a> {
     }
 
     fn copy_len(len: u64) -> Result<usize, MemoryError> {
-        if len > MAX_SINGLE_BYTES {
+        if len > MAX_SINGLE_GUEST_COPY_BYTES {
             return Err(MemoryError::TooLarge);
         }
         usize::try_from(len).map_err(|_| MemoryError::TooLarge)
@@ -277,7 +277,7 @@ mod tests {
         assert_eq!(
             memory.read_ranges(&[MemoryRange {
                 addr: 0,
-                len: MAX_SINGLE_BYTES + 1
+                len: MAX_SINGLE_GUEST_COPY_BYTES + 1
             }]),
             Err(MemoryError::TooLarge)
         );
@@ -304,7 +304,7 @@ mod tests {
         let full = vec![
             MemoryRange {
                 addr: 0,
-                len: MAX_SINGLE_BYTES,
+                len: MAX_SINGLE_GUEST_COPY_BYTES,
             };
             4
         ];
@@ -333,7 +333,7 @@ mod tests {
             );
             assert_eq!(memory.read(0, 4).unwrap(), b"seed");
         }
-        let oversized = vec![9; usize::try_from(MAX_SINGLE_BYTES).unwrap() + 1];
+        let oversized = vec![9; usize::try_from(MAX_SINGLE_GUEST_COPY_BYTES).unwrap() + 1];
         assert_eq!(
             memory.write_ranges(&[(0, b"edit"), (8192, &oversized)]),
             Err(MemoryError::TooLarge)
@@ -349,14 +349,17 @@ mod tests {
         let ram = GuestRam::new(128 * 1024).expect("RAM");
         let memory = BoundedMemory::new(&ram);
         memory.write(0, b"seed").unwrap();
-        let payload = vec![9; usize::try_from(MAX_SINGLE_BYTES).unwrap()];
+        let payload = vec![9; usize::try_from(MAX_SINGLE_GUEST_COPY_BYTES).unwrap()];
         let full = vec![(0, payload.as_slice()); 4];
         let mut oversized = full.clone();
         oversized.push((0, b"x"));
         assert_eq!(memory.write_ranges(&oversized), Err(MemoryError::TooLarge));
         assert_eq!(memory.read(0, 4).unwrap(), b"seed");
         memory.write_ranges(&full).unwrap();
-        assert_eq!(memory.read(0, MAX_SINGLE_BYTES).unwrap(), payload);
+        assert_eq!(
+            memory.read(0, MAX_SINGLE_GUEST_COPY_BYTES).unwrap(),
+            payload
+        );
         memory
             .write_ranges(&vec![(0, b"x".as_slice()); MAX_BATCH_GUEST_COPY_RANGES])
             .unwrap();

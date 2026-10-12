@@ -1,10 +1,11 @@
 //! Block regressions through the production MMIO queues, memory, and disk imports.
 
-use crate::component::StandaloneDevice;
 use crate::component::block::BlockHost;
 use crate::component::block::backing::{BlockBacking, BoundedDisk, DiskGrant};
+use crate::component::{AccessMode, StandaloneDevice};
 use crate::engine::{device_engine, precompile_component};
 use crate::memory::{BoundedMemory, GuestRam, MemoryError};
+use crate::self_test::virtio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use terra_hypervisor::memory::MemoryRange as Range;
@@ -61,27 +62,26 @@ impl Fixture {
     }
 
     fn drain_interrupt(&self) -> bool {
-        let interrupt = self.read_register(0x060);
-        self.device.write(0x064, &1_u32.to_le_bytes()).unwrap();
+        let interrupt = self.read_register(virtio::INTERRUPT_STATUS);
+        self.device
+            .write(virtio::INTERRUPT_ACK, &1_u32.to_le_bytes())
+            .unwrap();
         interrupt != 0
     }
 
     fn configure_queue(&mut self) {
-        for (offset, value) in [
-            (0x70, 1_u32),
-            (0x70, 3),
-            (0x24, 1),
-            (0x20, 1),
-            (0x70, 11),
-            (0x38, u32::from(QUEUE_SIZE)),
-            (0x80, u32::try_from(DESCRIPTORS).unwrap()),
-            (0x90, u32::try_from(AVAILABLE).unwrap()),
-            (0xa0, u32::try_from(USED).unwrap()),
-            (0x44, 1),
-            (0x70, 15),
-        ] {
-            self.device.write(offset, &value.to_le_bytes()).unwrap();
-        }
+        virtio::start_single_queue(
+            &self.device,
+            0,
+            0,
+            virtio::QueueLayout {
+                size: QUEUE_SIZE,
+                descriptors: DESCRIPTORS,
+                available: AVAILABLE,
+                used: USED,
+            },
+        )
+        .unwrap();
         self.is_queue_ready = true;
     }
 
@@ -143,7 +143,9 @@ impl Fixture {
     }
 
     pub(super) async fn complete_request(&mut self) -> u32 {
-        self.device.write(0x050, &0_u32.to_le_bytes()).unwrap();
+        self.device
+            .write(virtio::QUEUE_NOTIFY, &0_u32.to_le_bytes())
+            .unwrap();
         let expected = self.used.wrapping_add(1).to_le_bytes();
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while self.read(USED + 2, 2).unwrap() != expected {
@@ -177,10 +179,10 @@ impl Fixture {
     }
 }
 
-async fn fixture(capacity_sectors: usize, readonly: bool) -> Fixture {
+async fn fixture(capacity_sectors: usize, access: AccessMode) -> Fixture {
     let engine = device_engine().expect("engine builds");
-    let mut disk = BoundedDisk::new(capacity_sectors * 512, readonly);
-    if !readonly {
+    let mut disk = BoundedDisk::new(capacity_sectors * 512, access);
+    if !access.is_read_only() {
         disk.write_at(3 * 512, &[0xAB; 512]).ok();
     }
     let component = Component::new(&engine, crate::test_fixtures::wasm::BLOCK)
@@ -189,7 +191,6 @@ async fn fixture(capacity_sectors: usize, readonly: bool) -> Fixture {
         &engine,
         BlockHost::new(GuestRam::new(RAM).unwrap(), DiskGrant::Mem(disk)),
         &component,
-        readonly,
     )
     .await
 }
@@ -203,7 +204,6 @@ async fn fixture_with_disk(
         engine,
         BlockHost::new(GuestRam::new(RAM).unwrap(), disk),
         component,
-        false,
     )
     .await
 }
@@ -212,19 +212,13 @@ pub(super) async fn fixture_with_host(
     engine: &wasmtime::Engine,
     host: BlockHost,
     component: &Component,
-    readonly: bool,
 ) -> Fixture {
     let ram = host.context.guest_ram().clone();
     let memory_read_calls = host.context.memory_read_import_counters();
-    let device = crate::component::block::instantiate(
-        engine,
-        host,
-        component,
-        readonly,
-        Arc::new(|_| Ok(())),
-    )
-    .await
-    .expect("block worker starts");
+    let device =
+        crate::component::block::instantiate(engine, host, component, Arc::new(|_| Ok(())))
+            .await
+            .expect("block worker starts");
     Fixture {
         device,
         ram,
@@ -359,7 +353,8 @@ async fn benchmark_aot_file_backed_block_transfers() {
         ] {
             let disk = tempfile::NamedTempFile::new().expect("disk file");
             disk.as_file().set_len(128 * 1024).expect("disk capacity");
-            let backing = FileDisk::open(disk.path(), false).expect("file-backed disk");
+            let backing =
+                FileDisk::open(disk.path(), AccessMode::ReadWrite).expect("file-backed disk");
             let mut fixture =
                 fixture_with_disk(&engine, DiskGrant::File(backing), &component).await;
             for range in &ranges {
@@ -379,14 +374,23 @@ async fn benchmark_aot_file_backed_block_transfers() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn component_mmio_state_survives_async_calls_and_close_is_terminal() {
-    let fixture = fixture(8, false).await;
+    let fixture = fixture(8, AccessMode::ReadWrite).await;
     assert_eq!(
-        fixture.device.read(0, 4).unwrap(),
-        0x7472_6976_u32.to_le_bytes()
+        fixture.device.read(virtio::MAGIC_VALUE, 4).unwrap(),
+        virtio::MAGIC.to_le_bytes()
     );
-    fixture.device.write(0x070, &1_u32.to_le_bytes()).unwrap();
-    assert_eq!(fixture.device.read(0x070, 4).unwrap(), 1_u32.to_le_bytes());
-    assert_eq!(fixture.device.read(0x060, 4).unwrap(), [0; 4]);
+    fixture
+        .device
+        .write(virtio::STATUS, &1_u32.to_le_bytes())
+        .unwrap();
+    assert_eq!(
+        fixture.device.read(virtio::STATUS, 4).unwrap(),
+        1_u32.to_le_bytes()
+    );
+    assert_eq!(
+        fixture.device.read(virtio::INTERRUPT_STATUS, 4).unwrap(),
+        [0; 4]
+    );
     fixture.device.close().unwrap();
     assert!(fixture.device.reset().is_err());
     assert!(fixture.device.read(0x044, 4).is_err());
@@ -394,7 +398,7 @@ async fn component_mmio_state_survives_async_calls_and_close_is_terminal() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn component_advertises_bounded_io_flush_and_discard() {
-    let fixture = fixture(256, false).await;
+    let fixture = fixture(256, AccessMode::ReadWrite).await;
     assert_eq!(fixture.read_register(0x108), u64::from(16 * 1024u32));
     assert_eq!(fixture.read_register(0x10c), 4);
     assert_eq!(
@@ -416,7 +420,7 @@ fn status(fixture: &Fixture) -> u8 {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn component_read_write_round_trip() {
-    let mut fixture = fixture(8, false).await;
+    let mut fixture = fixture(8, AccessMode::ReadWrite).await;
     fixture.write(DATA, &[0xCDu8; 512]).expect("payload staged");
     let result = fixture
         .submit_request(T_OUT, 1, &one(DATA, 512), STATUS)
@@ -434,7 +438,7 @@ async fn component_read_write_round_trip() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn component_discard_reaches_the_backing_without_changing_neighbors() {
-    let mut fixture = fixture(8, false).await;
+    let mut fixture = fixture(8, AccessMode::ReadWrite).await;
     fixture.write(DATA, &[0x5A; 1536]).expect("payload staged");
     let status = fixture
         .submit_request(T_OUT, 0, &one(DATA, 1536), STATUS)
@@ -462,7 +466,7 @@ async fn component_discard_reaches_the_backing_without_changing_neighbors() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn component_scatters_across_ranges_in_order() {
-    let mut fixture = fixture(8, false).await;
+    let mut fixture = fixture(8, AccessMode::ReadWrite).await;
     fixture
         .write(DATA, &[0x11u8; 512])
         .expect("first half staged");
@@ -506,7 +510,7 @@ async fn component_scatters_across_ranges_in_order() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn component_transfers_the_full_batch_across_distinct_ranges() {
-    let mut fixture = fixture(256, false).await;
+    let mut fixture = fixture(256, AccessMode::ReadWrite).await;
     let ranges: Vec<_> = (0..4u64)
         .map(|index| Range {
             addr: 0x4000 + index * 16 * 1024,
@@ -554,7 +558,7 @@ async fn component_transfers_the_full_batch_across_distinct_ranges() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn component_ignores_zero_length_ranges_at_invalid_addresses() {
-    let mut fixture = fixture(8, false).await;
+    let mut fixture = fixture(8, AccessMode::ReadWrite).await;
     fixture.write(DATA, &[0xA5; 512]).expect("payload staged");
     let ranges = vec![
         Range {
@@ -587,7 +591,7 @@ async fn component_ignores_zero_length_ranges_at_invalid_addresses() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invalid_later_range_does_not_partially_write_a_batch() {
-    let mut fixture = fixture(8, false).await;
+    let mut fixture = fixture(8, AccessMode::ReadWrite).await;
     fixture
         .write(DATA, &[0xA5; 512])
         .expect("first range staged");
@@ -623,7 +627,7 @@ async fn invalid_later_range_does_not_partially_write_a_batch() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn component_readonly_and_oob_are_ioerr() {
-    let mut fixture = fixture(8, true).await;
+    let mut fixture = fixture(8, AccessMode::ReadOnly).await;
     fixture.write(DATA, &[0xCDu8; 512]).expect("payload staged");
     let result = fixture
         .submit_request(T_OUT, 0, &one(DATA, 512), STATUS)
@@ -646,7 +650,7 @@ async fn component_readonly_and_oob_are_ioerr() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn component_flush_identify_and_unsupported() {
-    let mut fixture = fixture(8, false).await;
+    let mut fixture = fixture(8, AccessMode::ReadWrite).await;
     let result = fixture.submit_request(T_FLUSH, 0, &[], STATUS).await;
     assert_eq!(result, 0);
     assert!(fixture.drain_interrupt());
@@ -667,7 +671,7 @@ async fn component_flush_identify_and_unsupported() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn component_reset_discards_the_old_queue_until_renegotiated() {
-    let mut fixture = fixture(8, false).await;
+    let mut fixture = fixture(8, AccessMode::ReadWrite).await;
     fixture.configure_queue();
     fixture.write(DATA, &[0xCD; 512]).unwrap();
     fixture.stage_request(T_OUT, 1, &one(DATA, 512), STATUS);
@@ -696,7 +700,7 @@ async fn component_aot_deserialize_runs() {
     let component = unsafe { Component::deserialize(&engine, &artifact).expect("deserializes") };
     let mut fixture = fixture_with_disk(
         &engine,
-        DiskGrant::Mem(BoundedDisk::new(8 * 512, false)),
+        DiskGrant::Mem(BoundedDisk::new(8 * 512, AccessMode::ReadWrite)),
         &component,
     )
     .await;
@@ -715,7 +719,7 @@ async fn component_operates_on_shared_machine_ram() {
     use terra_hypervisor::memory::GuestMemory;
     let engine = device_engine().expect("engine builds");
     let mem = GuestMemory::from_ranges(&[(0, usize::try_from(RAM).unwrap())]).expect("maps");
-    let mut disk = BoundedDisk::new(8 * 512, false);
+    let mut disk = BoundedDisk::new(8 * 512, AccessMode::ReadWrite);
     disk.write_at(2 * 512, &[0x5E; 512]).expect("pattern in");
     let component =
         Component::new(&engine, crate::test_fixtures::wasm::BLOCK).expect("component compiles");
@@ -723,7 +727,6 @@ async fn component_operates_on_shared_machine_ram() {
         &engine,
         BlockHost::new(GuestRam::from_memory(mem.clone()), DiskGrant::Mem(disk)),
         &component,
-        false,
     )
     .await;
     assert_eq!(
@@ -739,7 +742,7 @@ async fn component_operates_on_shared_machine_ram() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::too_many_lines)]
 async fn component_rejects_malformed_chains_without_writing_the_disk() {
-    let mut fixture = fixture(8, false).await;
+    let mut fixture = fixture(8, AccessMode::ReadWrite).await;
     let header_addr = 0x1000;
     let mut header = [0; 16];
     header[..4].copy_from_slice(&T_OUT.to_le_bytes());

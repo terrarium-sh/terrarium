@@ -1,15 +1,11 @@
-use crate::support::stream_relay as relay;
+use crate::support::stream_relay::delayed_bytes;
 
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::task::{Context, Poll};
-use wasmtime::component::{
-    Component, Destination, Linker, StreamProducer, StreamReader, StreamResult, VecBuffer,
-};
+use terra_runtime::component::relay;
+use wasmtime::component::{Component, Linker, StreamReader};
 use wasmtime::{Engine, Store};
 
 const FORWARD: &str = r#"(component
@@ -102,14 +98,8 @@ async fn streams_pass_between_components_in_one_store_without_shared_memory() {
         .expect("consume export");
     let (sender, receiver) = tokio::sync::oneshot::channel();
     let dropped = Arc::new(AtomicBool::new(false));
-    let input = StreamReader::new(
-        &mut store,
-        DelayedBytes {
-            receiver,
-            dropped: Arc::clone(&dropped),
-        },
-    )
-    .expect("stream");
+    let input = StreamReader::new(&mut store, delayed_bytes(receiver, Arc::clone(&dropped)))
+        .expect("stream");
     let (input,) = forward
         .call_async(&mut store, (input,))
         .await
@@ -159,18 +149,12 @@ fn a_foreign_handle_does_not_transfer_the_source_even_when_slot_indices_collide(
     let (_other_sender, other_receiver) = tokio::sync::oneshot::channel();
     let stream = StreamReader::new(
         &mut owner,
-        DelayedBytes {
-            receiver: owner_receiver,
-            dropped: Arc::clone(&owner_dropped),
-        },
+        delayed_bytes(owner_receiver, Arc::clone(&owner_dropped)),
     )
     .expect("owner stream");
     let mut other_stream = StreamReader::new(
         &mut other,
-        DelayedBytes {
-            receiver: other_receiver,
-            dropped: Arc::clone(&other_dropped),
-        },
+        delayed_bytes(other_receiver, Arc::clone(&other_dropped)),
     )
     .expect("other stream");
     match stream.try_into_stream_any(&mut other) {
@@ -193,50 +177,13 @@ async fn closing_an_idle_stream_releases_its_waiting_source() {
     let mut store = store(&engine);
     let (mut sender, receiver) = tokio::sync::oneshot::channel();
     let dropped = Arc::new(AtomicBool::new(false));
-    let mut stream = StreamReader::new(
-        &mut store,
-        DelayedBytes {
-            receiver,
-            dropped: Arc::clone(&dropped),
-        },
-    )
-    .expect("stream");
+    let mut stream = StreamReader::new(&mut store, delayed_bytes(receiver, Arc::clone(&dropped)))
+        .expect("stream");
     stream.close(&mut store).expect("close unused endpoint");
     tokio::time::timeout(std::time::Duration::from_secs(2), sender.closed())
         .await
         .expect("source released");
     assert!(dropped.load(Ordering::Acquire));
-}
-
-struct DelayedBytes {
-    receiver: tokio::sync::oneshot::Receiver<Vec<u8>>,
-    dropped: Arc<AtomicBool>,
-}
-
-impl Drop for DelayedBytes {
-    fn drop(&mut self) {
-        self.dropped.store(true, Ordering::Release);
-    }
-}
-
-impl StreamProducer<()> for DelayedBytes {
-    type Item = u8;
-    type Buffer = VecBuffer<u8>;
-
-    fn poll_produce<'a>(
-        mut self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-        _: wasmtime::StoreContextMut<'a, ()>,
-        mut destination: Destination<'a, u8, Self::Buffer>,
-        finish: bool,
-    ) -> Poll<wasmtime::Result<StreamResult>> {
-        if finish {
-            return Poll::Ready(Ok(StreamResult::Cancelled));
-        }
-        let bytes = std::task::ready!(Pin::new(&mut self.receiver).poll(context))?;
-        destination.set_buffer(bytes.into());
-        Poll::Ready(Ok(StreamResult::Dropped))
-    }
 }
 
 #[tokio::test]
@@ -266,11 +213,16 @@ async fn bounded_relay_connects_components_without_moving_store_handles() {
         .call_async(&mut origin, (input,))
         .await
         .expect("forward handle inside origin");
-    let (sink, source) = relay::create_byte_channel();
+    let (sink, chunks) = relay::byte_channel(16 * 1024);
     input
         .pipe(&mut origin, sink)
         .expect("attach origin endpoint");
-    let input = StreamReader::new(&mut destination, source).expect("destination endpoint");
+    let relayed = futures_util::stream::unfold(chunks, |mut chunks| async move {
+        let chunk = chunks.next().await?.ok()?;
+        Some((chunk, chunks))
+    });
+    let input = StreamReader::new(&mut destination, relay::ByteStream::new(relayed))
+        .expect("destination endpoint");
     let (finished, completion) = tokio::sync::oneshot::channel();
     let sending = origin.run_concurrent(async |_| completion.await);
     let receiving = async {

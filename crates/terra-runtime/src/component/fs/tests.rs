@@ -15,6 +15,7 @@ use wasmtime_wasi::{
     },
 };
 
+use crate::component::AccessMode;
 use crate::component::context::DeviceContext;
 use crate::component::fs::{FsHost, ShareGrant};
 
@@ -27,8 +28,8 @@ async fn shares_report_filesystem_statistics() {
     let root = tempfile::tempdir().unwrap();
     let base = root.path().canonicalize().unwrap();
     let engine = crate::engine::device_engine().unwrap();
-    for readonly in [false, true] {
-        let mut fs = host(ShareGrant::new(&base, readonly).unwrap());
+    for access in [AccessMode::ReadWrite, AccessMode::ReadOnly] {
+        let mut fs = host(ShareGrant::new(&base, access).unwrap());
         let descriptor = fs.get_directories().unwrap().remove(0).0;
         let mut store = wasmtime::Store::new(&engine, fs);
         let stat = store
@@ -49,7 +50,7 @@ async fn shares_report_filesystem_statistics() {
 async fn filesystem_statistics_reject_unknown_descriptors() {
     let root = tempfile::tempdir().unwrap();
     let base = root.path().canonicalize().unwrap();
-    let fs = host(ShareGrant::new(&base, true).unwrap());
+    let fs = host(ShareGrant::new(&base, AccessMode::ReadOnly).unwrap());
     let engine = crate::engine::device_engine().unwrap();
     let mut store = wasmtime::Store::new(&engine, fs);
     let stat = store
@@ -71,7 +72,7 @@ async fn preopen_retains_its_directory_and_rights_without_ambient_resources() {
     std::fs::write(original.join("retained"), b"original").unwrap();
     #[cfg(unix)]
     let inode = std::fs::metadata(&original).unwrap().ino();
-    let grant = ShareGrant::new(&original, true).unwrap();
+    let grant = ShareGrant::new(&original, AccessMode::ReadOnly).unwrap();
     std::fs::rename(&original, base.join("moved")).unwrap();
     std::fs::create_dir(&original).unwrap();
     let mut fs = host(grant);
@@ -135,8 +136,9 @@ async fn wasi_itself_denies_escape_and_readonly_mutation() {
     std::fs::write(mounted.join("file"), b"original").unwrap();
     symlink_file("../secret", mounted.join("escape")).unwrap();
     let engine = crate::engine::device_engine().unwrap();
-    for readonly in [false, true] {
-        let mut fs = host(ShareGrant::new(&mounted, readonly).unwrap());
+    for access in [AccessMode::ReadWrite, AccessMode::ReadOnly] {
+        let is_read_only = access.is_read_only();
+        let mut fs = host(ShareGrant::new(&mounted, access).unwrap());
         let root_fd = fs.get_directories().unwrap().remove(0).0;
         let mut store = wasmtime::Store::new(&engine, fs);
         store
@@ -188,9 +190,9 @@ async fn wasi_itself_denies_escape_and_readonly_mutation() {
                     open("file", OpenFlags::empty(), DescriptorFlags::WRITE)
                         .await
                         .is_ok(),
-                    !readonly
+                    !is_read_only
                 );
-                if !readonly {
+                if !is_read_only {
                     WasiFilesystem::create_directory_at(
                         &access,
                         Resource::new_borrow(root_fd.rep()),
@@ -231,7 +233,7 @@ async fn wasi_itself_denies_escape_and_readonly_mutation() {
                     .await
                     .unwrap();
                 }
-                if readonly {
+                if is_read_only {
                     for (path, flags) in [("new", OpenFlags::CREATE), ("file", OpenFlags::TRUNCATE)]
                     {
                         assert!(open(path, flags, DescriptorFlags::WRITE).await.is_err());
@@ -272,8 +274,9 @@ async fn mode_capability_changes_writable_files_and_rejects_readonly_files() {
     std::fs::write(mounted.join("file"), b"file").unwrap();
     let engine = crate::engine::device_engine().unwrap();
 
-    for readonly in [false, true] {
-        let mut fs = host(ShareGrant::new(&mounted, readonly).unwrap());
+    for access in [AccessMode::ReadWrite, AccessMode::ReadOnly] {
+        let is_read_only = access.is_read_only();
+        let mut fs = host(ShareGrant::new(&mounted, access).unwrap());
         let root_fd = fs.get_directories().unwrap().remove(0).0;
         let mut store = wasmtime::Store::new(&engine, fs);
         let descriptor = store
@@ -299,7 +302,7 @@ async fn mode_capability_changes_writable_files_and_rejects_readonly_files() {
                 let result =
                     HasSelf::<FsHost>::set_mode(&host, Resource::new_borrow(descriptor), 0o7600)
                         .await;
-                assert_eq!(result.is_ok(), !readonly);
+                assert_eq!(result.is_ok(), !is_read_only);
                 #[cfg(windows)]
                 {
                     assert_eq!(
@@ -308,7 +311,7 @@ async fn mode_capability_changes_writable_files_and_rejects_readonly_files() {
                             .unwrap(),
                         Some(0o100_755)
                     );
-                    if !readonly {
+                    if !is_read_only {
                         HasSelf::<FsHost>::set_mode(&host, Resource::new_borrow(descriptor), 0o444)
                             .await
                             .unwrap();
@@ -330,7 +333,7 @@ async fn mode_capability_changes_writable_files_and_rejects_readonly_files() {
                     }
                 }
                 #[cfg(unix)]
-                if !readonly {
+                if !is_read_only {
                     assert_eq!(
                         HasSelf::<FsHost>::get_mode(&host, Resource::new_borrow(descriptor))
                             .await
@@ -357,7 +360,7 @@ async fn filesystem_actor_alone_publishes_interrupt_asserted_states() {
         wasmtime::component::Component::new(&engine, crate::test_fixtures::wasm::FS).unwrap();
     let host = FsHost::new(
         DeviceContext::new(64 * 1024).unwrap(),
-        ShareGrant::new(&mount, false).unwrap(),
+        ShareGrant::new(&mount, AccessMode::ReadWrite).unwrap(),
     );
     let channel = crate::component::fs::instantiate(
         &engine,

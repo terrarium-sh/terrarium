@@ -4,22 +4,23 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use terra_runtime::box_runtime::{BoxHost, BoxRuntime};
-use terra_runtime::component::InterruptCallback;
 use terra_runtime::component::agent::Agent;
 use terra_runtime::component::block::backing::{BoundedDisk, DiskGrant};
 use terra_runtime::component::context::DeviceContext;
 use terra_runtime::component::fs::{FsHost, ShareGrant};
 use terra_runtime::component::network::start_test_broker;
 use terra_runtime::component::vsock::streams::{FrontendStreams, StreamEndpoint};
+use terra_runtime::component::{AccessMode, InterruptCallback};
 use terra_runtime::engine::device_engine;
 use terra_runtime::memory::GuestRam;
+use terra_runtime::self_test::virtio;
+use terra_runtime::self_test::virtio::STATUS;
 use wasmtime::component::Component;
 
-const STATUS: u64 = 0x70;
-const STATUS_RESET: [u8; 4] = 0_u32.to_le_bytes();
+const STATUS_RESET: [u8; 4] = virtio::STATUS_RESET.to_le_bytes();
 const STATUS_ACKNOWLEDGE: [u8; 4] = 1_u32.to_le_bytes();
 const STATUS_DRIVER: [u8; 4] = 3_u32.to_le_bytes();
-const MAGIC: [u8; 4] = 0x7472_6976_u32.to_le_bytes();
+const MAGIC: [u8; 4] = virtio::MAGIC.to_le_bytes();
 
 fn no_interrupt() -> InterruptCallback {
     Arc::new(|_| Ok(()))
@@ -37,7 +38,7 @@ fn reset_device(
     write(STATUS, &STATUS_DRIVER).expect("status driver");
     write(STATUS, &STATUS_RESET).expect("status reset");
     assert_eq!(read(STATUS, 4).expect("status read"), STATUS_RESET);
-    assert_eq!(read(0, 4).expect("magic read"), MAGIC);
+    assert_eq!(read(virtio::MAGIC_VALUE, 4).expect("magic read"), MAGIC);
 }
 
 fn load_components(engine: &wasmtime::Engine) -> [Component; 3] {
@@ -48,13 +49,13 @@ fn load_components(engine: &wasmtime::Engine) -> [Component; 3] {
 }
 
 fn start_agent(runtime: &mut BoxRuntime, stream: StreamEndpoint) -> Agent {
-    let artifact = support::artifacts::trusted_artifacts().agent();
+    let artifact = support::artifacts::trusted_artifacts().agent;
     Agent::from_trusted_artifact(
         runtime,
         stream,
         artifact,
         terra_protocol::encode_frame(&terra_protocol::BootPlan::new(
-            support::artifacts::create_boot_plan(),
+            terra_protocol::Plan::bare_run(vec!["/bin/sh".into()]),
         ))
         .expect("plan encodes"),
         None,
@@ -77,13 +78,12 @@ async fn every_device_resets_and_closes_in_one_box_runtime() {
 
     let block_host = terra_runtime::component::block::BlockHost::new(
         ram.clone(),
-        DiskGrant::Mem(BoundedDisk::new(4096, false)),
+        DiskGrant::Mem(BoundedDisk::new(4096, AccessMode::ReadWrite)),
     );
     let block = terra_runtime::component::block::register_device(
         &mut runtime,
         block_host,
         &block_component,
-        false,
         no_interrupt(),
     )
     .expect("block");
@@ -91,7 +91,7 @@ async fn every_device_resets_and_closes_in_one_box_runtime() {
         &mut runtime,
         FsHost::new(
             DeviceContext::with_ram(ram.clone()),
-            ShareGrant::new(&mount, false).expect("mount grant"),
+            ShareGrant::new(&mount, AccessMode::ReadWrite).expect("mount grant"),
         ),
         &fs_component,
         "test",
@@ -116,7 +116,7 @@ async fn every_device_resets_and_closes_in_one_box_runtime() {
     let vsock = terra_runtime::component::vsock::register_device(
         &mut runtime,
         ram,
-        artifacts.vsock(),
+        artifacts.vsock_frontend,
         streams,
         Some(backend),
         Vec::new(),

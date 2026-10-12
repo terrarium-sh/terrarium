@@ -3,6 +3,18 @@
 pub use crate::component::vmm::bindings::machine::{Device, DeviceKind};
 pub use crate::component::vmm::bindings::virtualization::Architecture;
 
+impl DeviceKind {
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Block => "block",
+            Self::Fs => "filesystem",
+            Self::Memory => "memory",
+            Self::Vsock => "vsock",
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct MachineConfig {
     architecture: Architecture,
@@ -67,15 +79,14 @@ impl MachineConfig {
         &self.devices
     }
 
+    #[must_use]
+    pub fn irq_routes(&self) -> Vec<u32> {
+        self.devices.iter().map(|device| device.irq).collect()
+    }
+
     pub(crate) fn device_slot(&self, kind: DeviceKind, ordinal: usize) -> wasmtime::Result<u8> {
-        self.devices()
-            .iter()
-            .enumerate()
-            .filter(|(_, device)| device.kind == kind)
-            .nth(ordinal)
-            .map(|(slot, _)| u8::try_from(slot))
-            .transpose()?
-            .ok_or_else(|| wasmtime::Error::msg("interrupt device outside VM grant"))
+        let (slot, _) = find_device(&self.devices, kind, ordinal)?;
+        Ok(u8::try_from(slot)?)
     }
 
     #[must_use]
@@ -98,9 +109,23 @@ impl MachineConfig {
                     redistributor_size: terra_limits::ARM_GIC_REDIST_SIZE,
                 }),
             },
-            irq_routes: self.devices().iter().map(|device| device.irq).collect(),
+            irq_routes: self.irq_routes(),
         }
     }
+}
+
+/// The `ordinal`-th device of `kind` and its slot in `devices`.
+pub(crate) fn find_device(
+    devices: &[Device],
+    kind: DeviceKind,
+    ordinal: usize,
+) -> wasmtime::Result<(usize, &Device)> {
+    devices
+        .iter()
+        .enumerate()
+        .filter(|(_, device)| device.kind == kind)
+        .nth(ordinal)
+        .ok_or_else(|| wasmtime::Error::msg("interrupt device outside VM grant"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

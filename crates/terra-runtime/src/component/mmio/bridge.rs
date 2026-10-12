@@ -1,6 +1,5 @@
 //! Bounded native MMIO routing and shutdown.
 
-use crate::machine::DeviceKind;
 use futures_util::future::BoxFuture;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use std::collections::{HashSet, VecDeque};
@@ -50,14 +49,9 @@ fn complete_device(context: &BridgeContext, routed: &RoutedReply) -> wasmtime::R
         .ok_or_else(|| wasmtime::Error::msg("invalid MMIO reply slot"))?;
     if let Some(error) = routed.reply.error {
         device.counts.failed.fetch_add(1, Ordering::Relaxed);
-        let kind = match device.kind {
-            DeviceKind::Block => "block",
-            DeviceKind::Fs => "filesystem",
-            DeviceKind::Memory => "memory",
-            DeviceKind::Vsock => "vsock",
-        };
         return Err(wasmtime::Error::msg(format!(
-            "MMIO {kind} device error {error:?}"
+            "MMIO {} device error {error:?}",
+            device.kind.name()
         )));
     }
     device.counts.completed.fetch_add(1, Ordering::Relaxed);
@@ -308,6 +302,7 @@ mod tests {
     use super::super::{BoxRuntime, Reply, ReplySender, enqueue, mpsc};
     use super::*;
     use crate::box_runtime::BoxHost;
+    use crate::machine::DeviceKind;
     use std::assert_matches;
 
     fn access() -> Command {
@@ -325,7 +320,8 @@ mod tests {
         use super::super::{
             AtomicBool, AtomicU64, DeviceRegistration, DeviceRequestCounts, OnceLock,
         };
-        use crate::component::relay::{MMIO_CAPACITY, channel};
+        use crate::component::mmio::RELAY_CAPACITY;
+        use crate::component::relay::channel;
 
         let devices = Arc::new(OnceLock::new());
         assert!(
@@ -346,8 +342,8 @@ mod tests {
                 )
                 .is_ok()
         );
-        let (requests, request_stream) = channel(MMIO_CAPACITY);
-        let (reply_sink, replies) = channel(MMIO_CAPACITY);
+        let (requests, request_stream) = channel(RELAY_CAPACITY);
+        let (reply_sink, replies) = channel(RELAY_CAPACITY);
         (
             BridgeContext {
                 devices,

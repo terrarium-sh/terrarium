@@ -1,8 +1,7 @@
 {
   "terra-agent-component": {
     "terra:agent@0.1.0/host-service": [
-      "[method]client.input",
-      "[method]client.output",
+      "[method]client.connect",
       "[resource-drop]client",
       "listener",
       "plan",

@@ -3,7 +3,7 @@
 mod bindings;
 mod host;
 
-use crate::box_runtime::ComponentRole;
+use crate::component::relay;
 use crate::component::vsock::streams::StreamEndpoint;
 use futures_util::{
     FutureExt,
@@ -16,16 +16,12 @@ pub use bindings::AgentEvent;
 pub use host::{AgentHost, AgentHostService, agent_component_linker};
 use std::{
     io::Write,
-    pin::Pin,
+    num::NonZeroUsize,
     sync::Arc,
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
 use terra_platform::local_socket::{LocalListener as UnixListener, LocalStream as UnixStream};
-#[cfg(test)]
-use wasmtime::Store;
-use wasmtime::StoreContextMut;
-use wasmtime::component::{Source, StreamConsumer, StreamResult};
 
 #[cfg(test)]
 const MAX_DIAGNOSTIC_FILE_BYTES: u64 = terra_limits::MAX_LOG_FILE_BYTES;
@@ -64,45 +60,12 @@ impl DiagnosticSink {
     }
 }
 
-struct EventSink {
-    diagnostic_sender: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+async fn deliver_events(
+    mut events: relay::Stream<AgentEvent>,
     lifecycle: LifecycleNotifier,
-    pending_diagnostic: Option<BoxFuture<'static, wasmtime::Result<()>>>,
-    ended: Option<tokio::sync::oneshot::Sender<()>>,
-}
-
-impl Drop for EventSink {
-    fn drop(&mut self) {
-        if let Some(ended) = self.ended.take() {
-            let _ = ended.send(());
-        }
-    }
-}
-
-impl<H: 'static> StreamConsumer<H> for EventSink {
-    type Item = AgentEvent;
-
-    fn poll_consume(
-        mut self: Pin<&mut Self>,
-        context: &mut std::task::Context<'_>,
-        store: StoreContextMut<H>,
-        source: Source<'_, Self::Item>,
-        finish: bool,
-    ) -> std::task::Poll<wasmtime::Result<StreamResult>> {
-        if let Some(pending) = self.pending_diagnostic.as_mut() {
-            std::task::ready!(pending.as_mut().poll(context))?;
-            self.pending_diagnostic = None;
-            return std::task::Poll::Ready(Ok(StreamResult::Completed));
-        }
-        if finish {
-            return std::task::Poll::Ready(Ok(StreamResult::Cancelled));
-        }
-        let mut source = source;
-        let mut events = Vec::with_capacity(1);
-        source.read(store, &mut events)?;
-        let Some(event) = events.pop() else {
-            return std::task::Poll::Ready(Ok(StreamResult::Completed));
-        };
+    diagnostics: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+) -> wasmtime::Result<()> {
+    while let Some(event) = events.next().await {
         match event {
             AgentEvent::Connected => {
                 log::info!(
@@ -113,34 +76,21 @@ impl<H: 'static> StreamConsumer<H> for EventSink {
                         .as_nanos()
                 );
             }
-            AgentEvent::Disconnected => self.lifecycle.agent_disconnected(),
+            AgentEvent::Disconnected => lifecycle.agent_disconnected(),
             AgentEvent::Diagnostic(bytes) => {
-                if bytes.len() > MAX_DIAGNOSTIC_BATCH_BYTES {
-                    return std::task::Poll::Ready(Err(wasmtime::Error::msg(
-                        "agent diagnostic event limit",
-                    )));
-                }
-                let Some(sender) = &self.diagnostic_sender else {
-                    return std::task::Poll::Ready(Ok(StreamResult::Completed));
-                };
-                let sender = sender.clone();
-                let mut pending =
-                    async move { sender.send(bytes).await.map_err(wasmtime::Error::from) }.boxed();
-                match pending.as_mut().poll(context) {
-                    std::task::Poll::Ready(result) => result?,
-                    std::task::Poll::Pending => {
-                        self.pending_diagnostic = Some(pending);
-                        return std::task::Poll::Pending;
-                    }
+                wasmtime::ensure!(
+                    bytes.len() <= MAX_DIAGNOSTIC_BATCH_BYTES,
+                    "agent diagnostic event limit"
+                );
+                if let Some(diagnostics) = &diagnostics {
+                    diagnostics.send(bytes).await?;
                 }
             }
-            AgentEvent::AgentReady => self.lifecycle.agent_ready(),
-            AgentEvent::Exit(code) => {
-                self.lifecycle.guest_exit(code);
-            }
+            AgentEvent::AgentReady => lifecycle.agent_ready(),
+            AgentEvent::Exit(code) => lifecycle.guest_exit(code),
         }
-        std::task::Poll::Ready(Ok(StreamResult::Completed))
     }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -180,30 +130,26 @@ impl AgentWorkerGrant {
         let api = instance.terra_agent_api();
         let close = api.func_close();
         let diagnostics = self.diagnostics.map(DiagnosticSink::new).transpose()?;
-        let (events,) = api
+        let (event_stream,) = api
             .func_events()
             .call_async(&mut child.store, ())
             .await
             .map_err(|error| error.context("agent component event stream"))?;
-        let (ended, stream_end) = tokio::sync::oneshot::channel();
-        events.pipe(
-            &mut child.store,
-            EventSink {
-                diagnostic_sender: diagnostics.as_ref().map(|sink| sink.sender.clone()),
-                lifecycle: self.lifecycle,
-                pending_diagnostic: None,
-                ended: Some(ended),
-            },
-        )?;
+        let (event_sink, events) = relay::channel(NonZeroUsize::MIN);
+        event_stream.pipe(&mut child.store, event_sink)?;
+        let delivery = deliver_events(
+            events,
+            self.lifecycle,
+            diagnostics.as_ref().map(|sink| sink.sender.clone()),
+        );
         child.register_loop(Box::new(move |accessor| {
             Box::pin(async move {
                 let result = async {
-                    tokio::pin!(stream_end);
+                    tokio::pin!(delivery);
                     tokio::select! {
-                        _ = &mut stream_end => {},
+                        result = &mut delivery => result?,
                         () = self.close_notification.notified() => {
-                            close.call_concurrent(accessor, ()).await?;
-                            stream_end.await?;
+                            tokio::try_join!(close.call_concurrent(accessor, ()), &mut delivery)?;
                         },
                     }
                     wasmtime::ensure!(
@@ -217,7 +163,7 @@ impl AgentWorkerGrant {
                     Some(sink) => sink.finish().await.map_err(wasmtime::Error::from),
                     None => Ok(()),
                 };
-                let result = result.and(flushed);
+                let result = flushed.and(result);
                 let failure = result
                     .as_ref()
                     .err()
@@ -235,7 +181,6 @@ impl AgentWorkerGrant {
 }
 
 impl Agent {
-    #[allow(clippy::too_many_arguments)]
     pub fn from_trusted_artifact(
         runtime: &mut crate::box_runtime::BoxRuntime,
         endpoint: StreamEndpoint,
@@ -263,9 +208,7 @@ impl Agent {
             completion,
         };
         let child = runtime.child_factory();
-        runtime.grant_role_worker_unmanaged(ComponentRole::Agent, async move {
-            setup.create(child).await
-        })?;
+        runtime.grant_agent_worker_unmanaged(async move { setup.create(child).await })?;
         let close = async move {
             shared_closing.store(true, Ordering::Release);
             close_notification.notify_one();
@@ -277,21 +220,17 @@ impl Agent {
         }
         .boxed()
         .shared();
-        runtime.add_role_shutdown(ComponentRole::Agent, close.clone())?;
+        runtime.add_agent_shutdown(close.clone())?;
         Ok(Self { close, failure })
     }
 
     #[must_use]
     pub fn failure(&self) -> Option<String> {
-        self.failure
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-            .or_else(|| {
-                self.close
-                    .peek()
-                    .and_then(|result| result.as_ref().err().cloned())
-            })
+        crate::component::recorded_failure(&self.failure).or_else(|| {
+            self.close
+                .peek()
+                .and_then(|result| result.as_ref().err().cloned())
+        })
     }
 
     pub async fn close_async(&self) -> wasmtime::Result<()> {
@@ -309,31 +248,11 @@ pub fn enrich_boot_plan_for_fuzzing(bytes: &[u8]) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
     use std::assert_matches;
-    use std::collections::BTreeMap;
 
     fn boot_plan() -> Vec<u8> {
-        terra_protocol::encode_frame(&terra_protocol::BootPlan::new(terra_protocol::Plan {
-            mode: terra_protocol::PlanMode::Run,
-            workdir: None,
-            shares: Vec::new(),
-            volumes: Vec::new(),
-            net: terra_protocol::Net::Tsi,
-            published_ports: Vec::new(),
-            published_udp_ports: Vec::new(),
-            env: BTreeMap::new(),
-            root: false,
-            sudo: Vec::new(),
-            on_create: Vec::new(),
-            on_start: Vec::new(),
-            pre_stop: Vec::new(),
-            daemons: Vec::new(),
-            workload: vec!["/bin/sh".into()],
-            sandbox_info: String::new(),
-            await_initial_session: false,
-            host_tz: None,
-            host_time: None,
-            host_seed: None,
-        }))
+        terra_protocol::encode_frame(&terra_protocol::BootPlan::new(
+            terra_protocol::Plan::bare_run(vec!["/bin/sh".into()]),
+        ))
         .expect("plan encodes")
     }
 
@@ -408,127 +327,85 @@ mod tests {
         );
     }
 
+    /// Pipes `events` through a component stream, as the agent's event export does, into [`deliver_events`].
+    async fn deliver(
+        events: Vec<AgentEvent>,
+        lifecycle: LifecycleNotifier,
+        diagnostics: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+    ) -> wasmtime::Result<()> {
+        let engine = crate::engine::device_engine()?;
+        let mut store = wasmtime::Store::new(&engine, ());
+        let (event_sink, stream) = relay::channel(NonZeroUsize::MIN);
+        wasmtime::component::StreamReader::new(&mut store, events)?.pipe(&mut store, event_sink)?;
+        store
+            .run_concurrent(async |_| deliver_events(stream, lifecycle, diagnostics).await)
+            .await?
+    }
+
     #[tokio::test]
     async fn typed_events_update_the_bounded_native_observers() {
-        let engine = crate::engine::device_engine().expect("engine");
-        let mut store = Store::new(&engine, ());
         let lifecycle = crate::component::vmm::lifecycle::LifecycleHost::new();
-        let events = wasmtime::component::StreamReader::new(&mut store, vec![AgentEvent::Exit(7)])
-            .expect("event stream");
-        events
-            .pipe(
-                &mut store,
-                EventSink {
-                    lifecycle: lifecycle.notifier(),
-                    diagnostic_sender: None,
-                    pending_diagnostic: None,
-                    ended: None,
-                },
-            )
-            .expect("event sink");
-        store
-            .run_concurrent(async |_| {
-                let event = tokio::time::timeout(Duration::from_secs(1), lifecycle.next_event())
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .unwrap();
-                assert_matches!(
-                    event,
-                    crate::component::vmm::lifecycle::lifecycle_platform::Event::GuestExit(7)
-                );
-            })
+        deliver(vec![AgentEvent::Exit(7)], lifecycle.notifier(), None)
             .await
-            .expect("event stream runs");
+            .unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(1), lifecycle.next_event())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_matches!(
+            event,
+            crate::component::vmm::lifecycle::lifecycle_platform::Event::GuestExit(7)
+        );
     }
 
     #[tokio::test]
     async fn diagnostic_backpressure_retains_bytes_and_resumes_readiness_and_exit() {
-        let engine = crate::engine::device_engine().expect("engine");
-        let mut store = Store::new(&engine, ());
         let lifecycle = crate::component::vmm::lifecycle::LifecycleHost::new();
         let (diagnostic_sender, mut diagnostic_receiver) = tokio::sync::mpsc::channel(1);
         diagnostic_sender
             .try_send(vec![0])
             .expect("diagnostic queue fills");
-        let (ended, stream_end) = tokio::sync::oneshot::channel();
-        let events = wasmtime::component::StreamReader::new(
-            &mut store,
+        let delivery = deliver(
             vec![
                 AgentEvent::Diagnostic(b"slow disk\n".to_vec()),
                 AgentEvent::AgentReady,
                 AgentEvent::Exit(9),
             ],
-        )
-        .expect("event stream");
-        events
-            .pipe(
-                &mut store,
-                EventSink {
-                    lifecycle: lifecycle.notifier(),
-                    diagnostic_sender: Some(diagnostic_sender),
-                    pending_diagnostic: None,
-                    ended: Some(ended),
-                },
-            )
-            .expect("event sink");
-        store
-            .run_concurrent(async |_| {
-                for _ in 0..16 {
-                    tokio::task::yield_now().await;
-                }
-                assert!(!lifecycle.notifier().is_agent_ready());
-                assert_eq!(diagnostic_receiver.recv().await.unwrap(), [0]);
-                assert_eq!(diagnostic_receiver.recv().await.unwrap(), b"slow disk\n");
-                let event = tokio::time::timeout(Duration::from_secs(1), lifecycle.next_event())
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .unwrap();
-                assert_matches!(
-                    event,
-                    crate::component::vmm::lifecycle::lifecycle_platform::Event::GuestExit(9)
-                );
-                assert!(lifecycle.notifier().is_agent_ready());
-                tokio::time::timeout(Duration::from_secs(1), stream_end)
-                    .await
-                    .unwrap()
-                    .unwrap();
-            })
-            .await
-            .expect("event stream runs");
+            lifecycle.notifier(),
+            Some(diagnostic_sender),
+        );
+        let observer = async {
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+            assert!(!lifecycle.notifier().is_agent_ready());
+            assert_eq!(diagnostic_receiver.recv().await.unwrap(), [0]);
+            assert_eq!(diagnostic_receiver.recv().await.unwrap(), b"slow disk\n");
+            let event = tokio::time::timeout(Duration::from_secs(1), lifecycle.next_event())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_matches!(
+                event,
+                crate::component::vmm::lifecycle::lifecycle_platform::Event::GuestExit(9)
+            );
+        };
+        let (delivered, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(delivery, observer)
+        })
+        .await
+        .unwrap();
+        delivered.unwrap();
+        assert!(lifecycle.notifier().is_agent_ready());
     }
 
     #[tokio::test]
     async fn connection_loss_clears_readiness_before_failure() {
-        let engine = crate::engine::device_engine().unwrap();
-        let mut store = Store::new(&engine, ());
         let lifecycle = crate::component::vmm::lifecycle::LifecycleHost::new();
         lifecycle.notifier().agent_ready();
-        let events =
-            wasmtime::component::StreamReader::new(&mut store, vec![AgentEvent::Disconnected])
-                .unwrap();
-        events
-            .pipe(
-                &mut store,
-                EventSink {
-                    lifecycle: lifecycle.notifier(),
-                    diagnostic_sender: None,
-                    pending_diagnostic: None,
-                    ended: None,
-                },
-            )
-            .unwrap();
-        store
-            .run_concurrent(async |_| {
-                tokio::time::timeout(Duration::from_secs(1), async {
-                    while lifecycle.notifier().is_agent_ready() {
-                        tokio::task::yield_now().await;
-                    }
-                })
-                .await
-                .unwrap();
-            })
+        deliver(vec![AgentEvent::Disconnected], lifecycle.notifier(), None)
             .await
             .unwrap();
         assert!(!lifecycle.notifier().is_agent_ready());
@@ -536,37 +413,17 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_diagnostics_fail_before_enqueueing() {
-        let engine = crate::engine::device_engine().expect("engine");
-        let mut store = Store::new(&engine, ());
         let (diagnostic_sender, mut diagnostic_receiver) = tokio::sync::mpsc::channel(1);
-        let events = wasmtime::component::StreamReader::new(
-            &mut store,
-            vec![AgentEvent::Diagnostic(vec![
-                0;
-                MAX_DIAGNOSTIC_BATCH_BYTES + 1
-            ])],
-        )
-        .expect("event stream");
-        events
-            .pipe(
-                &mut store,
-                EventSink {
-                    lifecycle: crate::component::vmm::lifecycle::LifecycleHost::new().notifier(),
-                    diagnostic_sender: Some(diagnostic_sender),
-                    pending_diagnostic: None,
-                    ended: None,
-                },
-            )
-            .expect("event sink");
+        let oversized = AgentEvent::Diagnostic(vec![0; MAX_DIAGNOSTIC_BATCH_BYTES + 1]);
+        let lifecycle = crate::component::vmm::lifecycle::LifecycleHost::new();
         assert!(
-            store
-                .run_concurrent(async |_| {
-                    for _ in 0..1024 {
-                        tokio::task::yield_now().await;
-                    }
-                })
-                .await
-                .is_err()
+            deliver(
+                vec![oversized],
+                lifecycle.notifier(),
+                Some(diagnostic_sender)
+            )
+            .await
+            .is_err()
         );
         assert!(diagnostic_receiver.try_recv().is_err());
     }
@@ -587,7 +444,7 @@ mod tests {
             let agent = Agent::from_trusted_artifact(
                 &mut runtime,
                 StreamEndpoint::new(),
-                crate::test_fixtures::trusted_artifacts().agent(),
+                crate::test_fixtures::trusted_artifacts().agent,
                 boot_plan(),
                 None,
                 None,

@@ -7,10 +7,12 @@ use std::os::windows::fs::symlink_file;
 use std::sync::Arc;
 
 use terra_runtime::box_runtime::{BoxHost, BoxRuntime, BoxRuntimeHandle};
+use terra_runtime::component::AccessMode;
 use terra_runtime::component::context::DeviceContext;
 use terra_runtime::component::fs::{FsHost, ShareGrant};
 use terra_runtime::engine::device_engine;
 use terra_runtime::memory::{BoundedMemory, GuestRam};
+use terra_runtime::self_test::virtio;
 use wasmtime::component::Component;
 
 const REQUEST_QUEUE: u32 = 1;
@@ -60,13 +62,13 @@ struct Mounted {
     _runtime: BoxRuntimeHandle,
 }
 
-async fn mount(path: &std::path::Path, readonly: bool) -> Mounted {
-    mount_with_resource_capacity(path, readonly, None).await
+async fn mount(path: &std::path::Path, access: AccessMode) -> Mounted {
+    mount_with_resource_capacity(path, access, None).await
 }
 
 async fn mount_with_resource_capacity(
     path: &std::path::Path,
-    readonly: bool,
+    access: AccessMode,
     resource_capacity: Option<usize>,
 ) -> Mounted {
     let ram = GuestRam::new(128 * 1024).expect("ram");
@@ -74,7 +76,7 @@ async fn mount_with_resource_capacity(
     let component = Component::new(&engine, support::artifacts::wasm::FS).expect("component");
     let grant = ShareGrant::new(
         &std::fs::canonicalize(path).expect("canonical mount"),
-        readonly,
+        access,
     )
     .expect("grant");
     let device = DeviceContext::with_ram(ram.clone());
@@ -95,24 +97,18 @@ async fn mount_with_resource_capacity(
     )
     .expect("channel");
     let runtime = runtime.prepare().await.expect("runtime prepared").start();
-    for (offset, value) in [
-        (0x70, 1_u32),
-        (0x70, 3),
-        (0x24, 1),
-        (0x20, 1),
-        (0x70, 11),
-        (0x30, REQUEST_QUEUE),
-        (0x38, 8),
-        (0x80, u32::try_from(DESC).expect("descriptor address")),
-        (0x90, u32::try_from(AVAIL).expect("available address")),
-        (0xa0, u32::try_from(USED).expect("used address")),
-        (0x44, 1),
-        (0x70, 15),
-    ] {
-        channel
-            .write(offset, &value.to_le_bytes())
-            .expect("MMIO setup");
-    }
+    virtio::start_single_queue(
+        &channel,
+        0,
+        REQUEST_QUEUE,
+        virtio::QueueLayout {
+            size: 8,
+            descriptors: DESC,
+            available: AVAIL,
+            used: USED,
+        },
+    )
+    .expect("MMIO setup");
     Mounted {
         channel,
         ram,
@@ -162,7 +158,7 @@ async fn submit(
         &0_u16.to_le_bytes(),
     );
     channel
-        .write(0x50, &REQUEST_QUEUE.to_le_bytes())
+        .write(virtio::QUEUE_NOTIFY, &REQUEST_QUEUE.to_le_bytes())
         .expect("queue bell");
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
@@ -213,7 +209,7 @@ async fn submit_pair(
     write(memory, AVAIL + 4 + 2, &0_u16.to_le_bytes());
     write(memory, AVAIL + 4 + 4, &2_u16.to_le_bytes());
     channel
-        .write(0x50, &REQUEST_QUEUE.to_le_bytes())
+        .write(virtio::QUEUE_NOTIFY, &REQUEST_QUEUE.to_le_bytes())
         .expect("queue bell");
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
@@ -260,7 +256,7 @@ async fn negotiated_big_write_crosses_guest_pages_and_survives_fsync() {
     let root = tempfile::tempdir().expect("tempdir");
     let path = root.path().join("large");
     std::fs::write(&path, []).expect("fixture");
-    let mounted = mount(root.path(), false).await;
+    let mounted = mount(root.path(), AccessMode::ReadWrite).await;
     let memory = BoundedMemory::new(&mounted.ram);
     let channel = &mounted.channel;
 
@@ -348,7 +344,7 @@ async fn wasm_filesystem_component_serves_files_through_standard_wasi() {
         channel,
         ram,
         _runtime,
-    } = mount(root.path(), false).await;
+    } = mount(root.path(), AccessMode::ReadWrite).await;
     let memory = BoundedMemory::new(&ram);
     initialize(&channel, &memory).await;
     let lookup = submit(&channel, &memory, 1, &request(1, 2, 1, b"visible\0")).await;
@@ -476,7 +472,7 @@ async fn wasm_filesystem_component_retains_symlink_targets_after_rename() {
         channel,
         ram,
         _runtime,
-    } = mount(root.path(), false).await;
+    } = mount(root.path(), AccessMode::ReadWrite).await;
     let memory = BoundedMemory::new(&ram);
     initialize(&channel, &memory).await;
     let link = submit(&channel, &memory, 1, &request(1, 5, 1, b"link\0")).await;
@@ -508,7 +504,7 @@ async fn wasm_filesystem_component_retains_linked_nodes_after_forget() {
         channel,
         ram,
         _runtime,
-    } = mount_with_resource_capacity(root.path(), false, Some(22)).await;
+    } = mount_with_resource_capacity(root.path(), AccessMode::ReadWrite, Some(22)).await;
     let memory = BoundedMemory::new(&ram);
     initialize(&channel, &memory).await;
     let linked = submit(&channel, &memory, 1, &request(1, 2, 1, b"linked\0")).await;
@@ -561,7 +557,7 @@ async fn wasm_filesystem_component_create_rejects_existing_fifo() {
         channel,
         ram,
         _runtime,
-    } = mount(root.path(), false).await;
+    } = mount(root.path(), AccessMode::ReadWrite).await;
     let memory = BoundedMemory::new(&ram);
     initialize(&channel, &memory).await;
     let mut create = vec![0; 16];
@@ -580,7 +576,7 @@ async fn wasm_filesystem_component_enforces_readonly_grant() {
         channel,
         ram,
         _runtime,
-    } = mount(root.path(), true).await;
+    } = mount(root.path(), AccessMode::ReadOnly).await;
     let memory = BoundedMemory::new(&ram);
     initialize(&channel, &memory).await;
     let mut create = vec![0; 16];
@@ -603,7 +599,7 @@ async fn wasm_filesystem_component_refreshes_a_relooked_up_node_path() {
         channel,
         ram,
         _runtime,
-    } = mount(root.path(), false).await;
+    } = mount(root.path(), AccessMode::ReadWrite).await;
     let memory = BoundedMemory::new(&ram);
     initialize(&channel, &memory).await;
     let old = submit(&channel, &memory, 1, &request(1, 2, 1, b"old\0")).await;
@@ -636,7 +632,7 @@ async fn wasm_filesystem_component_rejects_an_unlinked_node_path() {
         channel,
         ram,
         _runtime,
-    } = mount(root.path(), false).await;
+    } = mount(root.path(), AccessMode::ReadWrite).await;
     let memory = BoundedMemory::new(&ram);
     initialize(&channel, &memory).await;
     let lookup = submit(&channel, &memory, 1, &request(1, 2, 1, b"link\0")).await;
@@ -662,7 +658,7 @@ async fn wasm_filesystem_component_recovers_after_resource_table_exhaustion() {
         channel,
         ram,
         _runtime,
-    } = mount_with_resource_capacity(root.path(), false, Some(64)).await;
+    } = mount_with_resource_capacity(root.path(), AccessMode::ReadWrite, Some(64)).await;
     let memory = BoundedMemory::new(&ram);
     initialize(&channel, &memory).await;
 
@@ -717,7 +713,7 @@ async fn wasm_filesystem_component_handles_directory_operations_and_deleted_entr
         channel,
         ram,
         _runtime,
-    } = mount(root.path(), false).await;
+    } = mount(root.path(), AccessMode::ReadWrite).await;
     let memory = BoundedMemory::new(&ram);
     initialize(&channel, &memory).await;
 
@@ -779,7 +775,7 @@ async fn wasm_filesystem_component_removes_a_cached_directory() {
         channel,
         ram,
         _runtime,
-    } = mount(root.path(), false).await;
+    } = mount(root.path(), AccessMode::ReadWrite).await;
     let memory = BoundedMemory::new(&ram);
     initialize(&channel, &memory).await;
     let mut mkdir = vec![0; 8];
@@ -815,7 +811,7 @@ async fn readdir_skips_a_full_batch_of_deleted_entries() {
     for index in 0..130 {
         std::fs::write(root.path().join(format!("file-{index}")), []).expect("fixture");
     }
-    let mounted = mount(root.path(), false).await;
+    let mounted = mount(root.path(), AccessMode::ReadWrite).await;
     let memory = BoundedMemory::new(&mounted.ram);
     initialize(&mounted.channel, &memory).await;
     let opened = submit(&mounted.channel, &memory, 1, &request(27, 2, 1, &[])).await;
@@ -853,7 +849,7 @@ async fn wasm_worker_drains_a_single_doorbell_without_native_queue_scheduling() 
         channel,
         ram,
         _runtime,
-    } = mount(root.path(), false).await;
+    } = mount(root.path(), AccessMode::ReadWrite).await;
     let memory = BoundedMemory::new(&ram);
     initialize(&channel, &memory).await;
     let first = request(3, 2, 1, &[]);
@@ -884,7 +880,7 @@ async fn wasm_filesystem_component_rejects_unsupported_opcodes_without_parsing()
         channel,
         ram,
         _runtime,
-    } = mount(root.path(), false).await;
+    } = mount(root.path(), AccessMode::ReadWrite).await;
     let memory = BoundedMemory::new(&ram);
     initialize(&channel, &memory).await;
     for (index, opcode) in (1_u16..).zip([21, 22, 23, 24, 31, 32, 33, 43, 46, 50]) {
@@ -925,7 +921,7 @@ async fn initialize_events(mounted: &Mounted) {
 #[tokio::test(flavor = "multi_thread")]
 async fn native_events_complete_filesystem_receive_requests_on_readonly_mounts() {
     let directory = tempfile::tempdir().expect("share");
-    let mounted = mount(directory.path(), true).await;
+    let mounted = mount(directory.path(), AccessMode::ReadOnly).await;
     initialize_events(&mounted).await;
     std::fs::write(directory.path().join("changed"), "contents").expect("host write");
     let reply = submit(
@@ -949,7 +945,7 @@ async fn native_events_complete_filesystem_receive_requests_on_readonly_mounts()
 #[tokio::test(flavor = "multi_thread")]
 async fn cancelling_an_idle_receive_does_not_block_the_filesystem_worker() {
     let directory = tempfile::tempdir().expect("share");
-    let mounted = mount(directory.path(), false).await;
+    let mounted = mount(directory.path(), AccessMode::ReadWrite).await;
     initialize_events(&mounted).await;
     let (receive, cancel) = submit_pair(
         &mounted.channel,
@@ -967,7 +963,7 @@ async fn cancelling_an_idle_receive_does_not_block_the_filesystem_worker() {
 async fn native_events_keep_inode_identity_across_atomic_replacement() {
     let directory = tempfile::tempdir().expect("share");
     std::fs::write(directory.path().join("value"), "old").expect("original");
-    let mounted = mount(directory.path(), true).await;
+    let mounted = mount(directory.path(), AccessMode::ReadOnly).await;
     initialize_events(&mounted).await;
     let memory = BoundedMemory::new(&mounted.ram);
     let lookup = submit(&mounted.channel, &memory, 1, &request(1, 2, 1, b"value\0")).await;
@@ -1004,7 +1000,7 @@ async fn native_events_keep_inode_identity_across_atomic_replacement() {
 async fn content_events_reuse_confirmed_cached_inode_identity() {
     let directory = tempfile::tempdir().expect("share");
     std::fs::write(directory.path().join("value"), "initial").expect("original");
-    let mounted = mount(directory.path(), true).await;
+    let mounted = mount(directory.path(), AccessMode::ReadOnly).await;
     initialize_events(&mounted).await;
     let memory = BoundedMemory::new(&mounted.ram);
     let mut saw_content = false;
@@ -1041,12 +1037,13 @@ async fn content_events_reuse_confirmed_cached_inode_identity() {
 #[tokio::test(flavor = "multi_thread")]
 async fn metadata_lookup_and_chmod_do_not_require_file_read_access() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    for readonly in [true, false] {
+    for access in [AccessMode::ReadOnly, AccessMode::ReadWrite] {
+        let is_read_only = access.is_read_only();
         let root = tempfile::tempdir().expect("root");
         let path = root.path().join("locked");
         std::fs::write(&path, b"original").expect("write");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod");
-        let mounted = mount(root.path(), readonly).await;
+        let mounted = mount(root.path(), access).await;
         let memory = BoundedMemory::new(&mounted.ram);
         let channel = &mounted.channel;
         let lookup = submit(channel, &memory, 0, &request(1, 1, 1, b"locked\0")).await;
@@ -1062,8 +1059,8 @@ async fn metadata_lookup_and_chmod_do_not_require_file_read_access() {
         chmod[..4].copy_from_slice(&1_u32.to_le_bytes());
         chmod[68..72].copy_from_slice(&0o600_u32.to_le_bytes());
         let changed = submit(channel, &memory, 2, &request(4, 3, inode, &chmod)).await;
-        assert_eq!(reply_error(&changed), if readonly { -13 } else { 0 });
-        if readonly {
+        assert_eq!(reply_error(&changed), if is_read_only { -13 } else { 0 });
+        if is_read_only {
             assert_eq!(
                 std::fs::metadata(&path).expect("metadata").mode() & 0o777,
                 0
@@ -1106,7 +1103,7 @@ async fn write_only_files_open_for_write_without_read_access() {
     let path = root.path().join("writeonly");
     std::fs::write(&path, b"original").expect("write");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200)).expect("chmod");
-    let mounted = mount(root.path(), false).await;
+    let mounted = mount(root.path(), AccessMode::ReadWrite).await;
     let memory = BoundedMemory::new(&mounted.ram);
     let channel = &mounted.channel;
     let lookup = submit(channel, &memory, 0, &request(1, 1, 1, b"writeonly\0")).await;
@@ -1148,7 +1145,7 @@ async fn inaccessible_directories_allow_metadata_and_permission_repair() {
     std::fs::create_dir(&path).expect("directory");
     std::fs::write(path.join("child"), b"contents").expect("child");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod");
-    let mounted = mount(root.path(), false).await;
+    let mounted = mount(root.path(), AccessMode::ReadWrite).await;
     let memory = BoundedMemory::new(&mounted.ram);
     let channel = &mounted.channel;
     let lookup = submit(channel, &memory, 0, &request(1, 1, 1, b"locked\0")).await;
@@ -1180,7 +1177,7 @@ async fn inaccessible_metadata_nodes_never_chmod_replacements() {
         let path = root.path().join("locked");
         std::fs::write(&path, b"original").expect("write");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod");
-        let mounted = mount(root.path(), false).await;
+        let mounted = mount(root.path(), AccessMode::ReadWrite).await;
         let memory = BoundedMemory::new(&mounted.ram);
         let lookup = submit(&mounted.channel, &memory, 0, &request(1, 1, 1, b"locked\0")).await;
         assert_eq!(reply_error(&lookup), 0);

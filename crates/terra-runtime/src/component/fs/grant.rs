@@ -2,9 +2,11 @@ use std::{io, path::Path};
 
 use wasmtime_wasi::filesystem::{Dir, FsPerms, OpenMode};
 
+use crate::component::AccessMode;
+
 #[derive(Clone)]
 pub struct ShareGrant {
-    pub readonly: bool,
+    pub access: AccessMode,
     pub(crate) root: std::path::PathBuf,
     pub(super) directory: Dir,
     pub(super) watch_budget: std::sync::Arc<tokio::sync::Semaphore>,
@@ -14,10 +16,10 @@ pub struct ShareGrant {
 }
 
 impl ShareGrant {
-    pub fn new(root: &Path, readonly: bool) -> io::Result<Self> {
+    pub fn new(root: &Path, access: AccessMode) -> io::Result<Self> {
         Ok(Self::from_directory(
             terra_platform::filesystem::share::open_share_root(root)?,
-            readonly,
+            access,
             root,
         ))
     }
@@ -25,33 +27,24 @@ impl ShareGrant {
     #[cfg(windows)]
     pub fn new_host_granted(
         root: &Path,
-        readonly: bool,
+        access: AccessMode,
         expected: terra_platform::filesystem::share::FileIdentity,
     ) -> io::Result<Self> {
         Ok(Self::from_directory(
             terra_platform::filesystem::share::open_granted_share_root(root, expected)?,
-            readonly,
+            access,
             root,
         ))
     }
 
-    fn from_directory(directory: std::fs::File, readonly: bool, root: &Path) -> Self {
-        let directory = Dir::new(
-            directory,
-            if readonly {
-                FsPerms::ReadOnly
-            } else {
-                FsPerms::ReadWrite
-            },
-            if readonly {
-                OpenMode::READ
-            } else {
-                OpenMode::READ | OpenMode::WRITE
-            },
-            false,
-        );
+    fn from_directory(directory: std::fs::File, access: AccessMode, root: &Path) -> Self {
+        let (permissions, open_mode) = match access {
+            AccessMode::ReadOnly => (FsPerms::ReadOnly, OpenMode::READ),
+            AccessMode::ReadWrite => (FsPerms::ReadWrite, OpenMode::READ | OpenMode::WRITE),
+        };
+        let directory = Dir::new(directory, permissions, open_mode, false);
         Self {
-            readonly,
+            access,
             root: root.to_path_buf(),
             watch_budget: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 super::file_events::MAX_NATIVE_WATCHES,
@@ -101,11 +94,11 @@ mod tests {
         std::fs::create_dir(&directory).unwrap();
         let link = base.join("link");
         symlink_dir(&directory, &link).unwrap();
-        assert!(ShareGrant::new(&directory, true).is_ok());
-        assert!(ShareGrant::new(&link, true).is_err());
+        assert!(ShareGrant::new(&directory, AccessMode::ReadOnly).is_ok());
+        assert!(ShareGrant::new(&link, AccessMode::ReadOnly).is_err());
         let file = base.join("file");
         std::fs::write(&file, b"file").unwrap();
-        assert!(ShareGrant::new(&file, false).is_err());
+        assert!(ShareGrant::new(&file, AccessMode::ReadWrite).is_err());
     }
 
     #[test]
@@ -119,6 +112,6 @@ mod tests {
         let expected = expected_parent.join("share");
         std::fs::rename(&expected_parent, base.join("moved")).unwrap();
         symlink_dir(&private_parent, &expected_parent).unwrap();
-        assert!(ShareGrant::new(&expected, false).is_err());
+        assert!(ShareGrant::new(&expected, AccessMode::ReadWrite).is_err());
     }
 }

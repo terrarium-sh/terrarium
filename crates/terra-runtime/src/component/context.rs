@@ -1,9 +1,9 @@
 //! Shared device capabilities and host imports.
 
-use crate::MAX_SINGLE_BYTES;
 use crate::component::bindings::{interrupt, memory};
 use crate::memory::{BoundedMemory, GuestRam};
 use std::sync::Arc;
+use terra_limits::MAX_SINGLE_GUEST_COPY_BYTES;
 use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 pub use crate::component::bindings::memory::Host as MemoryHost;
@@ -50,6 +50,16 @@ impl Default for InterruptSignals {
     }
 }
 
+#[must_use]
+pub(crate) fn isolated_wasi_ctx() -> WasiCtx {
+    WasiCtxBuilder::new()
+        .max_random_size(MAX_SINGLE_GUEST_COPY_BYTES)
+        .allow_tcp(false)
+        .allow_udp(false)
+        .allow_ip_name_lookup(false)
+        .build()
+}
+
 /// Common WASI, guest memory and interrupt state for one device.
 pub struct DeviceContext {
     ctx: WasiCtx,
@@ -74,12 +84,7 @@ impl DeviceContext {
     #[must_use]
     pub fn with_ram(ram: GuestRam) -> Self {
         Self {
-            ctx: WasiCtxBuilder::new()
-                .max_random_size(MAX_SINGLE_BYTES)
-                .allow_tcp(false)
-                .allow_udp(false)
-                .allow_ip_name_lookup(false)
-                .build(),
+            ctx: isolated_wasi_ctx(),
             table: ResourceTable::new(),
             ram,
             irq: InterruptSignals::new(),
@@ -276,7 +281,7 @@ mod tests {
     #[test]
     fn device_memory_import_rejects_oversized_writes_without_mutation() {
         use super::memory::Host as _;
-        let size = usize::try_from(crate::MAX_SINGLE_BYTES).unwrap() + 1;
+        let size = usize::try_from(terra_limits::MAX_SINGLE_GUEST_COPY_BYTES).unwrap() + 1;
         let mut host = super::DeviceContext::new(size as u64).unwrap();
         host.write(0, vec![7]).unwrap();
         assert_matches!(

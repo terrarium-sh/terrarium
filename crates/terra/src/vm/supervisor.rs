@@ -61,19 +61,18 @@ pub(super) fn spawn(
     let (launcher, policies) = match launcher {
         LauncherConfig::Direct => (VmLauncher::Direct, None),
         LauncherConfig::Custom(initializer) => (VmLauncher::Custom(initializer.clone()), None),
-        LauncherConfig::Sandboxed {
-            policy,
-            allow_fallback,
-        } => {
+        LauncherConfig::Sandboxed { policy } => {
             let policies = if std::env::var_os("TERRA_SYSCALL_TRACE").is_some() {
                 #[cfg(target_os = "linux")]
                 validate_native_confinement(None)?;
                 None
             } else {
-                Some(terra_sandbox::resolve_policy(
-                    policy.as_deref(),
-                    *allow_fallback,
-                )?)
+                if cfg!(target_os = "linux") && policy.is_none() {
+                    eprintln!(
+                        "terra: warning: using the built-in seccomp filters without syscall allowlists; install the release bundle at ~/.terra/config/seccomp or run `terra self-test --generate-policy`"
+                    );
+                }
+                Some(terra_sandbox::resolve_policy(policy.as_deref())?)
             };
             (VmLauncher::Sandboxed, policies)
         }
@@ -507,14 +506,11 @@ pub(crate) fn run_host_self_test() -> Result<()> {
     let policies = if std::env::var_os("TERRA_SYSCALL_TRACE").is_some() {
         None
     } else {
-        let (policy, fallback) = match &launcher {
-            LauncherConfig::Sandboxed {
-                policy,
-                allow_fallback,
-            } => (policy.as_deref(), *allow_fallback),
-            LauncherConfig::Direct | LauncherConfig::Custom(_) => (None, true),
+        let policy = match &launcher {
+            LauncherConfig::Sandboxed { policy } => policy.as_deref(),
+            LauncherConfig::Direct | LauncherConfig::Custom(_) => None,
         };
-        Some(terra_sandbox::resolve_policy(policy, fallback)?)
+        Some(terra_sandbox::resolve_policy(policy)?)
     };
     run_native_probe(
         endpoints.tcp,
@@ -626,7 +622,7 @@ pub(crate) fn run_vm_native_probe(port: u16) -> Result<ExitCode> {
 
 #[cfg(target_os = "linux")]
 pub(crate) fn validate_enforcement(bundle: &Path) -> Result<()> {
-    let policies = terra_sandbox::resolve_policy(Some(bundle), false)?;
+    let policies = terra_sandbox::resolve_policy(Some(bundle))?;
     validate_native_confinement(Some(&policies))
 }
 
@@ -681,11 +677,15 @@ pub(crate) fn run_network_native_probe_worker(sentinel: &Path) -> Result<ExitCod
     );
     #[cfg(windows)]
     {
-        File::open(sentinel).context("restricted broker cannot read host probe file")?;
+        ensure!(
+            File::open(sentinel).is_err(),
+            "network broker read a host file outside its grants"
+        );
         std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .context("restricted broker cannot create a TCP listener")?;
         std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .context("restricted broker cannot create a UDP socket")?;
+        terra_sandbox::resolve_computer_name().context("restricted broker cannot resolve names")?;
     }
     Ok(ExitCode::SUCCESS)
 }

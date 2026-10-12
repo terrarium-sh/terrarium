@@ -12,7 +12,7 @@ use wasmtime::component::StreamReader;
 use super::MAX_BOX_COMPONENTS;
 use super::store::{BoxHost, StoreHost, StoreState, create_store};
 use super::{
-    BoxRuntime, ComponentLoop, ComponentRole, DeviceWorker, EpochClock, MAX_BOX_COMPONENT_LOOPS,
+    BoxRuntime, ComponentLoop, DeviceWorker, EpochClock, MAX_BOX_COMPONENT_LOOPS,
     MAX_BOX_COMPONENT_WORKERS, PreparedBoxRuntime, WorkerTask,
 };
 use crate::component::mmio::{self, DevicePlan, Serve};
@@ -31,7 +31,7 @@ pub(crate) type Setup = Box<
         + Send,
 >;
 
-pub(crate) type RoleSetup = Pin<Box<dyn Future<Output = wasmtime::Result<WorkerTask>> + Send>>;
+pub(crate) type AgentSetup = Pin<Box<dyn Future<Output = wasmtime::Result<WorkerTask>> + Send>>;
 
 pub(crate) struct PreparedWorker {
     pub worker: WorkerTask,
@@ -51,7 +51,7 @@ impl BoxRuntime {
             shutdown,
             children: Vec::new(),
             component_loops: Vec::new(),
-            roles: Vec::new(),
+            agent_setup: None,
         })
     }
 
@@ -235,32 +235,24 @@ impl BoxRuntime {
         Ok(device)
     }
 
-    pub(crate) fn grant_role_worker_unmanaged<H: StoreHost>(
+    pub(crate) fn grant_agent_worker_unmanaged<H: StoreHost>(
         &mut self,
-        role: ComponentRole,
         initialize: impl Future<Output = wasmtime::Result<(DeviceWorker<H>, ())>> + Send + 'static,
     ) -> wasmtime::Result<()> {
-        wasmtime::ensure!(
-            !self.roles.iter().any(|(existing, _)| *existing == role),
-            "box already has a {role:?} role"
-        );
+        wasmtime::ensure!(self.agent_setup.is_none(), "box already has an agent");
         let shutdown = self.shutdown_receiver();
-        self.roles.push((
-            role,
-            Box::pin(async move {
-                let (worker, ()) = initialize.await?;
-                Ok(worker.prepare(shutdown))
-            }),
-        ));
+        self.agent_setup = Some(Box::pin(async move {
+            let (worker, ()) = initialize.await?;
+            Ok(worker.prepare(shutdown))
+        }));
         Ok(())
     }
 
-    pub fn add_role_shutdown(
+    pub fn add_agent_shutdown(
         &mut self,
-        role: ComponentRole,
         close: impl Future<Output = Result<(), String>> + Send + 'static,
     ) -> wasmtime::Result<()> {
-        self.add_device_shutdown(vmm::teardown::DeviceShutdown::for_role(role, close))
+        self.add_device_shutdown(vmm::teardown::DeviceShutdown::for_agent(close))
     }
 
     pub fn grant_interrupt_shutdown(
@@ -283,10 +275,10 @@ impl BoxRuntime {
     }
 
     async fn prepare_devices(mut self) -> wasmtime::Result<Self> {
-        for (role, setup) in std::mem::take(&mut self.roles) {
+        if let Some(setup) = self.agent_setup.take() {
             let worker = tokio::time::timeout(SETUP_TIMEOUT, setup)
                 .await
-                .map_err(|_| wasmtime::Error::msg(format!("{role:?} role setup timed out")))??;
+                .map_err(|_| wasmtime::Error::msg("agent setup timed out"))??;
             self.attach_worker(worker)?;
         }
         let Some(instance) = self.mmio.as_mut() else {
@@ -322,7 +314,7 @@ impl BoxRuntime {
                     "overlapping MMIO mappings"
                 );
             }
-            let (requests, request_stream) = relay::channel(relay::MMIO_CAPACITY);
+            let (requests, request_stream) = relay::channel(crate::component::mmio::RELAY_CAPACITY);
             let PreparedWorker { worker, replies } =
                 within_setup_timeout(device.slot, setup(request_stream)).await?;
             self.mmio
@@ -355,7 +347,7 @@ pub(crate) fn setup<H: StoreHost>(
             let (mut worker, serve) = initialize.await?;
             let requests = StreamReader::new(&mut worker.store, requests)?;
             let (reply_reader,) = serve.call_async(&mut worker.store, (requests,)).await?;
-            let (sink, replies) = relay::channel(relay::MMIO_CAPACITY);
+            let (sink, replies) = relay::channel(crate::component::mmio::RELAY_CAPACITY);
             reply_reader.pipe(&mut worker.store, sink)?;
             Ok(PreparedWorker {
                 worker: worker.prepare(shutdown),
@@ -411,7 +403,7 @@ mod tests {
             Err(tokio::sync::oneshot::error::TryRecvError::Empty)
         );
         let Err(error) = within_setup_timeout(3, async {
-            let (_sink, requests) = relay::channel(relay::MMIO_CAPACITY);
+            let (_sink, requests) = relay::channel(crate::component::mmio::RELAY_CAPACITY);
             setup(requests).await
         })
         .await

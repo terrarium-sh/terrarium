@@ -1,12 +1,13 @@
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
+use std::sync::{Arc, Mutex, MutexGuard};
 
-use wasmtime::StoreContextMut;
-use wasmtime::component::{
-    Access, Accessor, Destination, Linker, Source, StreamConsumer, StreamProducer, StreamReader,
-    StreamResult, VecBuffer,
-};
+use futures_util::FutureExt;
+use futures_util::future::BoxFuture;
+use tokio::sync::watch;
+use wasmtime::AsContextMut;
+use wasmtime::component::{Access, Accessor, Linker, StreamReader};
+
+use crate::component::relay::{DirectBuffer, DirectSink, DirectSource, TryRead, TryWrite};
 
 mod bindings {
     wasmtime::component::bindgen!({
@@ -31,16 +32,31 @@ struct Pipe {
     write_open: [bool; 2],
     frontend_ends: u8,
     queues: [VecDeque<u8>; 2],
-    revision: u64,
-    input_waiters: [Option<Waker>; 2],
-    output_waiters: [Option<Waker>; 2],
-    native_waiters: [Option<Waker>; 2],
+    changes: watch::Sender<()>,
+}
+
+impl Pipe {
+    fn notify(&self) {
+        self.changes.send_replace(());
+    }
+
+    fn is_current(&self, connection_number: u64) -> bool {
+        self.connection_number == Some(connection_number)
+    }
+
+    fn end_connection(&mut self) {
+        self.connection_number = None;
+        self.write_open = [false; 2];
+        for queue in &mut self.queues {
+            queue.clear();
+        }
+    }
 }
 
 #[derive(Clone)]
 pub struct StreamEndpoint {
     pipe: Arc<Mutex<Pipe>>,
-    observed_revision: u64,
+    changes: watch::Receiver<()>,
     side: usize,
 }
 
@@ -52,6 +68,7 @@ impl StreamEndpoint {
 
     #[must_use]
     pub fn pair() -> (Self, Self) {
+        let (changes, observed) = watch::channel(());
         let pipe = Arc::new(Mutex::new(Pipe {
             connection_number: None,
             retired_connection_number: 0,
@@ -59,14 +76,11 @@ impl StreamEndpoint {
             write_open: [false; 2],
             frontend_ends: 0,
             queues: std::array::from_fn(|_| VecDeque::new()),
-            revision: 0,
-            input_waiters: [None, None],
-            output_waiters: [None, None],
-            native_waiters: [None, None],
+            changes,
         }));
         let frontend = Self {
             pipe,
-            observed_revision: 0,
+            changes: observed,
             side: 0,
         };
         let mut role = frontend.clone();
@@ -74,30 +88,14 @@ impl StreamEndpoint {
         (frontend, role)
     }
 
-    fn notify(&self) {
-        let mut pipe = self
-            .pipe
+    fn lock(&self) -> MutexGuard<'_, Pipe> {
+        self.pipe
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        pipe.revision = pipe.revision.wrapping_add(1);
-        let waiters = [
-            std::mem::take(&mut pipe.input_waiters),
-            std::mem::take(&mut pipe.output_waiters),
-            std::mem::take(&mut pipe.native_waiters),
-        ];
-        drop(pipe);
-        waiters
-            .into_iter()
-            .flatten()
-            .flatten()
-            .for_each(Waker::wake);
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub fn connect(&mut self, connection_number: u64) -> Result<(), StreamError> {
-        let mut pipe = self
-            .pipe
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut pipe = self.lock();
         if pipe.is_retired {
             return Err(StreamError::Closed);
         }
@@ -114,53 +112,57 @@ impl StreamEndpoint {
         for queue in &mut pipe.queues {
             queue.clear();
         }
-        drop(pipe);
-        self.notify();
+        pipe.notify();
         Ok(())
     }
 
     #[must_use]
     pub fn current(&self) -> Option<u64> {
-        self.pipe
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .connection_number
+        self.lock().connection_number
     }
 
-    pub fn try_read(&mut self, connection_number: u64, max: u32) -> Result<Vec<u8>, StreamError> {
-        let max = usize::try_from(max).map_err(|_| StreamError::Io)?;
-        if max > STREAM_BUFFER_BYTES {
-            return Err(StreamError::Io);
-        }
-        let mut pipe = self
-            .pipe
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if pipe.connection_number != Some(connection_number) {
+    /// Copies bytes the peer wrote into `buffer` and returns how many; 0 when none are queued yet.
+    pub fn read_into(
+        &mut self,
+        connection_number: u64,
+        buffer: &mut [u8],
+    ) -> Result<usize, StreamError> {
+        let mut pipe = self.lock();
+        if !pipe.is_current(connection_number) {
             return Err(StreamError::Stale);
         }
         let peer = 1 - self.side;
-        let count = max.min(pipe.queues[peer].len());
         if pipe.queues[peer].is_empty() && !pipe.write_open[peer] {
             return Err(StreamError::Closed);
         }
-        let bytes = pipe.queues[peer].drain(..count).collect();
-        drop(pipe);
+        let count = buffer.len().min(pipe.queues[peer].len());
+        let (front, back) = pipe.queues[peer].as_slices();
+        let from_front = count.min(front.len());
+        buffer[..from_front].copy_from_slice(&front[..from_front]);
+        buffer[from_front..count].copy_from_slice(&back[..count - from_front]);
+        pipe.queues[peer].drain(..count);
         if count != 0 {
-            self.notify();
+            pipe.notify();
         }
+        Ok(count)
+    }
+
+    /// Takes up to `max` bytes the peer wrote; empty when none are queued yet.
+    pub fn try_read(&mut self, connection_number: u64, max: usize) -> Result<Vec<u8>, StreamError> {
+        let mut bytes = vec![0; max.min(STREAM_BUFFER_BYTES)];
+        let count = self.read_into(connection_number, &mut bytes)?;
+        bytes.truncate(count);
         Ok(bytes)
     }
 
-    pub fn try_write(&mut self, connection_number: u64, bytes: &[u8]) -> Result<u32, StreamError> {
-        if bytes.len() > STREAM_BUFFER_BYTES {
-            return Err(StreamError::Io);
-        }
-        let mut pipe = self
-            .pipe
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if pipe.connection_number != Some(connection_number) {
+    /// Queues what fits in the peer's buffer and returns how many bytes that was.
+    pub fn try_write(
+        &mut self,
+        connection_number: u64,
+        bytes: &[u8],
+    ) -> Result<usize, StreamError> {
+        let mut pipe = self.lock();
+        if !pipe.is_current(connection_number) {
             return Err(StreamError::Stale);
         }
         if !pipe.write_open[self.side] {
@@ -169,119 +171,107 @@ impl StreamEndpoint {
         let queue = &mut pipe.queues[self.side];
         let count = bytes.len().min(STREAM_BUFFER_BYTES - queue.len());
         queue.extend(&bytes[..count]);
-        drop(pipe);
         if count != 0 {
-            self.notify();
+            pipe.notify();
         }
-        u32::try_from(count).map_err(|_| StreamError::Io)
+        Ok(count)
     }
 
     pub fn close(&mut self, connection_number: u64) {
-        let mut pipe = self
-            .pipe
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if pipe.connection_number != Some(connection_number) {
-            return;
+        let mut pipe = self.lock();
+        if pipe.is_current(connection_number) {
+            pipe.write_open[self.side] = false;
+            pipe.notify();
         }
-        pipe.write_open[self.side] = false;
-        drop(pipe);
-        self.notify();
     }
 
     pub fn disconnect(&mut self, connection_number: u64) {
-        let mut pipe = self
-            .pipe
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if pipe.connection_number != Some(connection_number) {
-            return;
+        let mut pipe = self.lock();
+        if pipe.is_current(connection_number) {
+            pipe.end_connection();
+            pipe.notify();
         }
-        pipe.connection_number = None;
-        pipe.write_open = [false; 2];
-        for queue in &mut pipe.queues {
-            queue.clear();
-        }
-        drop(pipe);
-        self.notify();
     }
 
     fn release_frontend_end(&mut self, connection_number: u64) {
         if self.side != 0 {
             return;
         }
-        let mut pipe = self
-            .pipe
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if pipe.connection_number != Some(connection_number) {
+        let mut pipe = self.lock();
+        if !pipe.is_current(connection_number) {
             return;
         }
         pipe.frontend_ends -= 1;
         if pipe.frontend_ends == 0 {
-            pipe.connection_number = None;
-            pipe.write_open = [false; 2];
-            for queue in &mut pipe.queues {
-                queue.clear();
-            }
+            pipe.end_connection();
         }
-        drop(pipe);
-        self.notify();
+        pipe.notify();
     }
 
     fn is_retired(&self) -> bool {
-        self.pipe
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_retired
+        self.lock().is_retired
     }
 
     pub(crate) fn retire(&mut self) {
-        let mut pipe = self
-            .pipe
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut pipe = self.lock();
         pipe.is_retired = true;
-        pipe.connection_number = None;
-        pipe.write_open = [false; 2];
-        for queue in &mut pipe.queues {
-            queue.clear();
-        }
-        drop(pipe);
-        self.notify();
+        pipe.end_connection();
+        pipe.notify();
     }
 
-    fn stop_input(&mut self, connection_number: u64) -> Result<(), StreamError> {
-        let mut pipe = self
-            .pipe
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if pipe.connection_number != Some(connection_number) {
-            return Err(StreamError::Stale);
+    fn stop_input(&mut self, connection_number: u64) {
+        let mut pipe = self.lock();
+        if pipe.is_current(connection_number) {
+            let peer = 1 - self.side;
+            pipe.write_open[peer] = false;
+            pipe.queues[peer].clear();
+            pipe.notify();
         }
-        let peer = 1 - self.side;
-        pipe.write_open[peer] = false;
-        pipe.queues[peer].clear();
-        drop(pipe);
-        self.notify();
-        Ok(())
     }
 
+    /// Returns once the pipe changed since this endpoint last waited, so a check-then-wait loop misses no change.
     pub async fn wait(&mut self) {
-        std::future::poll_fn(|context| {
-            let mut pipe = self
-                .pipe
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if pipe.revision == self.observed_revision {
-                pipe.native_waiters[self.side] = Some(context.waker().clone());
-                Poll::Pending
-            } else {
-                self.observed_revision = pipe.revision;
-                Poll::Ready(())
+        let _ = self.changes.changed().await;
+    }
+
+    /// Resolves after the pipe's next change, counted from now.
+    fn changed(&self) -> BoxFuture<'static, ()> {
+        let mut changes = self.changes.clone();
+        changes.borrow_and_update();
+        async move {
+            let _ = changes.changed().await;
+        }
+        .boxed()
+    }
+
+    /// Waits for at least one byte; `Err(Closed)` once the peer closed and every byte was read.
+    pub async fn read(
+        &mut self,
+        connection_number: u64,
+        max: usize,
+    ) -> Result<Vec<u8>, StreamError> {
+        loop {
+            let bytes = self.try_read(connection_number, max)?;
+            if !bytes.is_empty() || max == 0 {
+                return Ok(bytes);
             }
-        })
-        .await;
+            self.wait().await;
+        }
+    }
+
+    pub async fn write_all(
+        &mut self,
+        connection_number: u64,
+        mut bytes: &[u8],
+    ) -> Result<(), StreamError> {
+        while !bytes.is_empty() {
+            let count = self.try_write(connection_number, bytes)?;
+            if count == 0 {
+                self.wait().await;
+            }
+            bytes = &bytes[count..];
+        }
+        Ok(())
     }
 }
 
@@ -332,133 +322,76 @@ impl<T: Send + 'static> role_stream::HostWithStore<T>
             }
             endpoint.wait().await;
         };
-        host.with(|mut access| {
-            output.pipe(
-                &mut access,
-                PipeOutput {
-                    endpoint: endpoint.clone(),
-                    connection_number,
-                },
-            )?;
-            StreamReader::new(
-                &mut access,
-                PipeInput {
-                    endpoint,
-                    connection_number,
-                },
-            )
-            .map(Some)
-        })
+        host.with(|mut access| attach(&mut access, endpoint, connection_number, output).map(Some))
     }
 }
 
-struct PipeInput {
+/// Stops the peer's writes and releases the frontend's claim when the component drops its input.
+struct InputEnd {
     endpoint: StreamEndpoint,
     connection_number: u64,
 }
 
-impl Drop for PipeInput {
+impl Drop for InputEnd {
     fn drop(&mut self) {
-        let _ = self.endpoint.stop_input(self.connection_number);
+        self.endpoint.stop_input(self.connection_number);
         self.endpoint.release_frontend_end(self.connection_number);
     }
 }
 
-impl<T: 'static> StreamProducer<T> for PipeInput {
-    type Item = u8;
-    type Buffer = VecBuffer<u8>;
-
-    fn poll_produce<'a>(
-        self: core::pin::Pin<&mut Self>,
-        context: &mut Context<'_>,
-        mut store: StoreContextMut<'a, T>,
-        destination: Destination<'a, u8, Self::Buffer>,
-        finish: bool,
-    ) -> Poll<wasmtime::Result<StreamResult>> {
-        let mut pipe = self
-            .endpoint
-            .pipe
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if pipe.connection_number != Some(self.connection_number) {
-            return Poll::Ready(Ok(StreamResult::Dropped));
-        }
-        let peer = 1 - self.endpoint.side;
-        if pipe.queues[peer].is_empty() {
-            if !pipe.write_open[peer] {
-                return Poll::Ready(Ok(StreamResult::Dropped));
-            }
-            if finish {
-                return Poll::Ready(Ok(StreamResult::Cancelled));
-            }
-            pipe.input_waiters[self.endpoint.side] = Some(context.waker().clone());
-            return Poll::Pending;
-        }
-        if destination.remaining(&mut store) == Some(0) {
-            return Poll::Ready(Ok(StreamResult::Completed));
-        }
-        let mut destination = destination.as_direct(store, STREAM_BUFFER_BYTES);
-        let bytes = destination.remaining();
-        let count = bytes.len().min(pipe.queues[peer].len());
-        for (slot, byte) in bytes.iter_mut().zip(pipe.queues[peer].drain(..count)) {
-            *slot = byte;
-        }
-        destination.mark_written(count);
-        drop(pipe);
-        self.endpoint.notify();
-        Poll::Ready(Ok(StreamResult::Completed))
-    }
-}
-
-struct PipeOutput {
+/// Half-closes the component's direction and releases the frontend's claim once its output ends.
+struct OutputEnd {
     endpoint: StreamEndpoint,
     connection_number: u64,
 }
 
-impl Drop for PipeOutput {
+impl Drop for OutputEnd {
     fn drop(&mut self) {
         self.endpoint.close(self.connection_number);
         self.endpoint.release_frontend_end(self.connection_number);
     }
 }
 
-impl<T: 'static> StreamConsumer<T> for PipeOutput {
-    type Item = u8;
+/// Wires one connection to a component: its `output` fills the pipe, and the returned stream drains the peer.
+fn attach<A: AsContextMut>(
+    mut store: A,
+    endpoint: StreamEndpoint,
+    connection_number: u64,
+    output: StreamReader<u8>,
+) -> wasmtime::Result<StreamReader<u8>> {
+    let output_end = OutputEnd {
+        endpoint: endpoint.clone(),
+        connection_number,
+    };
+    output.pipe(&mut store, DirectSink::new(output_end))?;
+    let input_end = InputEnd {
+        endpoint,
+        connection_number,
+    };
+    StreamReader::new(store, DirectSource::new(input_end, STREAM_BUFFER_BYTES))
+}
 
-    fn poll_consume(
-        self: core::pin::Pin<&mut Self>,
-        context: &mut Context<'_>,
-        store: StoreContextMut<T>,
-        source: Source<'_, u8>,
-        finish: bool,
-    ) -> Poll<wasmtime::Result<StreamResult>> {
-        let mut pipe = self
-            .endpoint
-            .pipe
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let side = self.endpoint.side;
-        if pipe.connection_number != Some(self.connection_number) || !pipe.write_open[side] {
-            return Poll::Ready(Ok(StreamResult::Dropped));
-        }
-        let capacity = STREAM_BUFFER_BYTES - pipe.queues[side].len();
-        if capacity == 0 {
-            if finish {
-                return Poll::Ready(Ok(StreamResult::Cancelled));
-            }
-            pipe.output_waiters[side] = Some(context.waker().clone());
-            return Poll::Pending;
-        }
-        let mut source = source.as_direct(store);
-        let bytes = source.remaining();
-        let count = bytes.len().min(capacity);
-        pipe.queues[side].extend(&bytes[..count]);
-        source.mark_read(count);
-        drop(pipe);
-        if count != 0 {
-            self.endpoint.notify();
-        }
-        Poll::Ready(Ok(StreamResult::Completed))
+impl DirectBuffer for InputEnd {
+    fn changed(&mut self) -> BoxFuture<'static, ()> {
+        self.endpoint.changed()
+    }
+}
+
+impl TryRead for InputEnd {
+    fn try_read(&mut self, buffer: &mut [u8]) -> Option<usize> {
+        self.endpoint.read_into(self.connection_number, buffer).ok()
+    }
+}
+
+impl DirectBuffer for OutputEnd {
+    fn changed(&mut self) -> BoxFuture<'static, ()> {
+        self.endpoint.changed()
+    }
+}
+
+impl TryWrite for OutputEnd {
+    fn try_write(&mut self, bytes: &[u8]) -> Option<usize> {
+        self.endpoint.try_write(self.connection_number, bytes).ok()
     }
 }
 
@@ -478,21 +411,7 @@ impl<T: Send + 'static> frontend_stream::HostWithStore<T>
             return Ok(Err(error));
         }
         let endpoint = endpoint.clone();
-        input.pipe(
-            &mut access,
-            PipeOutput {
-                endpoint: endpoint.clone(),
-                connection_number,
-            },
-        )?;
-        StreamReader::new(
-            &mut access,
-            PipeInput {
-                endpoint,
-                connection_number,
-            },
-        )
-        .map(Ok)
+        attach(&mut access, endpoint, connection_number, input).map(Ok)
     }
 }
 
@@ -579,11 +498,11 @@ mod tests {
     fn frontend_stream_drops_half_close_and_retire_without_affecting_replacements() {
         let (mut frontend, mut role) = StreamEndpoint::pair();
         frontend.connect(1).unwrap();
-        let input = PipeOutput {
+        let input = OutputEnd {
             endpoint: frontend.clone(),
             connection_number: 1,
         };
-        let output = PipeInput {
+        let output = InputEnd {
             endpoint: frontend.clone(),
             connection_number: 1,
         };
@@ -596,11 +515,11 @@ mod tests {
         drop(output);
         assert_eq!(frontend.current(), None);
         frontend.connect(2).unwrap();
-        let input = PipeOutput {
+        let input = OutputEnd {
             endpoint: frontend.clone(),
             connection_number: 2,
         };
-        let output = PipeInput {
+        let output = InputEnd {
             endpoint: frontend.clone(),
             connection_number: 2,
         };
@@ -621,7 +540,7 @@ mod tests {
         let (mut frontend, mut role) = StreamEndpoint::pair();
         frontend.connect(1).unwrap();
         frontend.try_write(1, &[7]).unwrap();
-        drop(PipeInput {
+        drop(InputEnd {
             endpoint: role.clone(),
             connection_number: 1,
         });

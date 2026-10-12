@@ -6,7 +6,7 @@ wasmtime::component::bindgen!({
     exports: { default: async },
     imports: {
         default: trappable,
-        "terra:agent/host-service.[method]client.input": store | trappable,
+        "terra:agent/host-service.[method]client.connect": store | trappable,
         "terra:agent/host-service.listener": store | trappable,
         "terra:agent/host-service.plan": store | trappable,
         "terra:agent/host-service.stop": store | trappable,

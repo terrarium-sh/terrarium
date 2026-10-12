@@ -146,12 +146,7 @@ impl MmioDevice {
     pub fn read(&self, offset: u64, len: usize) -> wasmtime::Result<Vec<u8>> {
         validate_width(len)?;
         let width = u8::try_from(len)?;
-        let address = self
-            .device
-            .base
-            .load(Ordering::Acquire)
-            .checked_add(offset)
-            .ok_or_else(|| wasmtime::Error::msg("MMIO address overflow"))?;
+        let address = self.device_address(offset)?;
         let reply = self.request(Command::Access(address, width, 0, false))?;
         let bytes = reply.value.to_le_bytes();
         Ok(bytes
@@ -167,12 +162,7 @@ impl MmioDevice {
             .get_mut(..bytes.len())
             .ok_or_else(|| wasmtime::Error::msg("MMIO width too large"))?
             .copy_from_slice(bytes);
-        let address = self
-            .device
-            .base
-            .load(Ordering::Acquire)
-            .checked_add(offset)
-            .ok_or_else(|| wasmtime::Error::msg("MMIO address overflow"))?;
+        let address = self.device_address(offset)?;
         self.request(Command::Access(
             address,
             u8::try_from(bytes.len())?,
@@ -180,6 +170,14 @@ impl MmioDevice {
             true,
         ))
         .map(|_| ())
+    }
+
+    fn device_address(&self, offset: u64) -> wasmtime::Result<u64> {
+        self.device
+            .base
+            .load(Ordering::Acquire)
+            .checked_add(offset)
+            .ok_or_else(|| wasmtime::Error::msg("MMIO address overflow"))
     }
 
     pub fn reset(&self) -> wasmtime::Result<()> {
@@ -241,10 +239,7 @@ impl MmioDevice {
     }
     #[must_use]
     pub fn failure(&self) -> Option<String> {
-        self.failure
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        recorded_failure(&self.failure)
     }
 
     fn request(&self, command: Command) -> wasmtime::Result<Reply> {

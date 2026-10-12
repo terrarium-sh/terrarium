@@ -187,16 +187,12 @@ mod tests {
         }
         assert_eq!(
             load_from(&root.path().join("collect.json"))?,
-            LauncherConfig::Sandboxed {
-                policy: None,
-                allow_fallback: true,
-            }
+            LauncherConfig::Sandboxed { policy: None }
         );
         assert_eq!(
             load_from(&root.path().join("enforce.json"))?,
             LauncherConfig::Sandboxed {
-                policy: Some(candidate),
-                allow_fallback: false,
+                policy: Some(candidate)
             }
         );
         Ok(())

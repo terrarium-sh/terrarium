@@ -150,6 +150,32 @@ impl BootPlan {
 }
 
 impl Plan {
+    #[must_use]
+    pub fn bare_run(workload: Vec<String>) -> Self {
+        Self {
+            mode: PlanMode::Run,
+            workdir: None,
+            shares: Vec::new(),
+            volumes: Vec::new(),
+            net: Net::Tsi,
+            published_ports: Vec::new(),
+            published_udp_ports: Vec::new(),
+            env: BTreeMap::new(),
+            root: false,
+            sudo: Vec::new(),
+            on_create: Vec::new(),
+            on_start: Vec::new(),
+            pre_stop: Vec::new(),
+            daemons: Vec::new(),
+            workload,
+            sandbox_info: String::new(),
+            await_initial_session: false,
+            host_tz: None,
+            host_time: None,
+            host_seed: None,
+        }
+    }
+
     pub fn validate_network(&self) -> std::io::Result<()> {
         if self.published_ports.len() + self.published_udp_ports.len() > MAX_PUBLISHED_PORTS
             || [&self.published_ports, &self.published_udp_ports]

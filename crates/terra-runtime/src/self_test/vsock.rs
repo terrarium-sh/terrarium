@@ -2,7 +2,6 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use terra_protocol::vsock::{AGENT_PORT, CONTROL_PORT, GUEST_CID, HOST_CID, UDP_PORT};
 
@@ -12,9 +11,9 @@ use crate::component::MmioDevice;
 use crate::component::vsock::streams::{FrontendStreams, StreamEndpoint};
 use crate::memory::GuestRam;
 
-use super::{read_memory, write_memory};
+use super::{read_memory, virtio, write_memory};
 
-const WAIT: Duration = Duration::from_secs(5);
+use super::STEP_WAIT;
 const HEADER_BYTES: usize = 44;
 const QUEUE_SIZE: u16 = 16;
 const RECEIVE_DESCRIPTOR: u64 = 0x1000;
@@ -41,7 +40,7 @@ pub(super) async fn run(
     let device = crate::component::vsock::register_device(
         &mut runtime,
         ram.clone(),
-        artifacts.vsock(),
+        artifacts.vsock_frontend,
         streams,
         None,
         Vec::new(),
@@ -94,7 +93,9 @@ pub(super) async fn run(
         );
         exercise_ready_receive_without_notification(&mut guest, &mut agent, connection_number)
             .await?;
-        guest.device.write(0x70, &0_u32.to_le_bytes())?;
+        guest
+            .device
+            .write(virtio::STATUS, &virtio::STATUS_RESET.to_le_bytes())?;
         wait_disconnected(&mut agent)
             .await
             .map_err(|error| error.context("agent retirement after physical reset"))?;
@@ -204,7 +205,9 @@ async fn exercise_ready_receive_without_notification(
     within("receive descriptor use for queued agent output", async {
         // A held TX interrupt can raise the line after one acknowledge; RX completion then adds no edge.
         loop {
-            guest.device.write(0x64, &3_u32.to_le_bytes())?;
+            guest
+                .device
+                .write(virtio::INTERRUPT_ACK, &3_u32.to_le_bytes())?;
             if guest.used_index(RECEIVE_USED)? != guest.received {
                 return Ok::<(), wasmtime::Error>(());
             }
@@ -339,25 +342,23 @@ impl GuestVsock {
                 && self.device.read(0x104, 4)? == 0_u32.to_le_bytes(),
             "fixed guest CID"
         );
-        for (offset, value) in [(0x70, 1_u32), (0x70, 3), (0x24, 1), (0x20, 1), (0x70, 11)] {
-            self.device.write(offset, &value.to_le_bytes())?;
-        }
+        virtio::negotiate_features(&self.device, 0)?;
         for (queue, descriptors, available, used) in [
             (0_u32, RECEIVE_DESCRIPTOR, RECEIVE_AVAILABLE, RECEIVE_USED),
             (1, TRANSMIT_DESCRIPTOR, TRANSMIT_AVAILABLE, TRANSMIT_USED),
         ] {
             write_memory(&self.ram, available, &[0; 4])?;
             write_memory(&self.ram, used, &[0; 4])?;
-            for (offset, value) in [
-                (0x30, queue),
-                (0x38, u32::from(QUEUE_SIZE)),
-                (0x80, u32::try_from(descriptors)?),
-                (0x90, u32::try_from(available)?),
-                (0xa0, u32::try_from(used)?),
-                (0x44, 1),
-            ] {
-                self.device.write(offset, &value.to_le_bytes())?;
-            }
+            virtio::enable_queue(
+                &self.device,
+                queue,
+                virtio::QueueLayout {
+                    size: QUEUE_SIZE,
+                    descriptors,
+                    available,
+                    used,
+                },
+            )?;
         }
         for index in 0..QUEUE_SIZE {
             write_memory(
@@ -377,8 +378,9 @@ impl GuestVsock {
             )?;
         }
         write_memory(&self.ram, RECEIVE_AVAILABLE + 2, &QUEUE_SIZE.to_le_bytes())?;
-        self.device.write(0x70, &15_u32.to_le_bytes())?;
-        self.device.write(0x50, &0_u32.to_le_bytes())
+        virtio::set_driver_ok(&self.device)?;
+        self.device
+            .write(virtio::QUEUE_NOTIFY, &0_u32.to_le_bytes())
     }
 
     fn used_index(&self, address: u64) -> wasmtime::Result<u16> {
@@ -433,12 +435,13 @@ impl GuestVsock {
         );
         write_memory(&self.ram, TRANSMIT_HEADER, &header)?;
         for (index, chunk) in bytes
-            .chunks(usize::try_from(crate::MAX_SINGLE_BYTES)?)
+            .chunks(usize::try_from(terra_limits::MAX_SINGLE_GUEST_COPY_BYTES)?)
             .enumerate()
         {
             write_memory(
                 &self.ram,
-                TRANSMIT_PAYLOAD + u64::try_from(index)? * crate::MAX_SINGLE_BYTES,
+                TRANSMIT_PAYLOAD
+                    + u64::try_from(index)? * terra_limits::MAX_SINGLE_GUEST_COPY_BYTES,
                 chunk,
             )?;
         }
@@ -470,13 +473,16 @@ impl GuestVsock {
             TRANSMIT_AVAILABLE + 2,
             &self.transmitted.to_le_bytes(),
         )?;
-        self.device.write(0x64, &3_u32.to_le_bytes())?;
-        self.device.write(0x50, &1_u32.to_le_bytes())?;
+        self.device
+            .write(virtio::INTERRUPT_ACK, &3_u32.to_le_bytes())?;
+        self.device
+            .write(virtio::QUEUE_NOTIFY, &1_u32.to_le_bytes())?;
         within(
             &format!("vsock transmit {source}:{destination} operation {op}"),
             async {
                 while self.used_index(TRANSMIT_USED)? != self.transmitted {
-                    self.device.write(0x64, &3_u32.to_le_bytes())?;
+                    self.device
+                        .write(virtio::INTERRUPT_ACK, &3_u32.to_le_bytes())?;
                     self.events.changed().await?;
                 }
                 wasmtime::Result::Ok(())
@@ -486,7 +492,8 @@ impl GuestVsock {
     }
 
     pub(super) fn receive(&mut self) -> wasmtime::Result<Vec<Packet>> {
-        self.device.write(0x64, &3_u32.to_le_bytes())?;
+        self.device
+            .write(virtio::INTERRUPT_ACK, &3_u32.to_le_bytes())?;
         let used = self.used_index(RECEIVE_USED)?;
         let mut packets = Vec::new();
         while self.received != used {
@@ -540,7 +547,8 @@ impl GuestVsock {
             RECEIVE_AVAILABLE + 2,
             &self.received.wrapping_add(QUEUE_SIZE).to_le_bytes(),
         )?;
-        self.device.write(0x50, &0_u32.to_le_bytes())?;
+        self.device
+            .write(virtio::QUEUE_NOTIFY, &0_u32.to_le_bytes())?;
         Ok(packets)
     }
 
@@ -566,7 +574,8 @@ impl GuestVsock {
                 }
                 wasmtime::ensure!(bytes.len() <= length, "vsock returned excess stream bytes");
                 if bytes.len() < length {
-                    self.device.write(0x64, &3_u32.to_le_bytes())?;
+                    self.device
+                        .write(virtio::INTERRUPT_ACK, &3_u32.to_le_bytes())?;
                     self.wait_for_receive_work().await?;
                 }
             }
@@ -576,14 +585,14 @@ impl GuestVsock {
     }
 }
 
-/// Waits up to [`WAIT`] for `step`, naming the step when it makes no progress.
+/// Waits up to [`STEP_WAIT`] for `step`, naming the step when it makes no progress.
 async fn within<T>(
     step: &str,
     future: impl std::future::Future<Output = T>,
 ) -> wasmtime::Result<T> {
-    tokio::time::timeout(WAIT, future)
+    tokio::time::timeout(STEP_WAIT, future)
         .await
-        .map_err(|_| wasmtime::Error::msg(format!("{step}: no progress within {WAIT:?}")))
+        .map_err(|_| wasmtime::Error::msg(format!("{step}: no progress within {STEP_WAIT:?}")))
 }
 
 fn stream_error(
@@ -623,13 +632,10 @@ pub(super) async fn read_stream(
         let mut bytes = Vec::new();
         while bytes.len() < length {
             let chunk = endpoint
-                .try_read(connection_number, u32::try_from(length - bytes.len())?)
+                .read(connection_number, length - bytes.len())
+                .await
                 .map_err(stream_error)?;
-            if chunk.is_empty() {
-                endpoint.wait().await;
-            } else {
-                bytes.extend(chunk);
-            }
+            bytes.extend(chunk);
         }
         Ok(bytes)
     })

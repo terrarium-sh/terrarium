@@ -1,18 +1,20 @@
 //! Host disk capabilities for the Wasm block device.
 
+use crate::component::AccessMode;
+
 /// One disk grant: fixed capacity with the real read-only mode enforced
 /// on every mutation path, mirroring the native WASI wrapper.
 pub struct BoundedDisk {
     data: Vec<u8>,
-    readonly: bool,
+    access: AccessMode,
 }
 
 impl BoundedDisk {
     #[must_use]
-    pub fn new(capacity: usize, readonly: bool) -> Self {
+    pub fn new(capacity: usize, access: AccessMode) -> Self {
         Self {
             data: vec![0u8; capacity],
-            readonly,
+            access,
         }
     }
 
@@ -20,7 +22,7 @@ impl BoundedDisk {
     pub fn from_readonly_bytes(data: Vec<u8>) -> Self {
         Self {
             data,
-            readonly: true,
+            access: AccessMode::ReadOnly,
         }
     }
 
@@ -37,6 +39,7 @@ impl BoundedDisk {
 /// Host storage operations exposed to the block component.
 pub trait BlockBacking {
     fn capacity(&self) -> u64;
+    fn access(&self) -> AccessMode;
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), BackingError>;
     fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<(), BackingError>;
     fn discard(&mut self, offset: u64, len: u64) -> Result<(), BackingError>;
@@ -56,6 +59,13 @@ impl BlockBacking for DiskGrant {
         match self {
             Self::Mem(disk) => BlockBacking::capacity(disk),
             Self::File(disk) => BlockBacking::capacity(disk),
+        }
+    }
+
+    fn access(&self) -> AccessMode {
+        match self {
+            Self::Mem(disk) => disk.access(),
+            Self::File(disk) => disk.access(),
         }
     }
 
@@ -100,13 +110,17 @@ impl BlockBacking for BoundedDisk {
         u64::try_from(self.data.len()).unwrap_or(u64::MAX)
     }
 
+    fn access(&self) -> AccessMode {
+        self.access
+    }
+
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), BackingError> {
         buf.copy_from_slice(&self.data[self.range(offset, buf.len())?]);
         Ok(())
     }
 
     fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<(), BackingError> {
-        if self.readonly {
+        if self.access.is_read_only() {
             return Err(BackingError::ReadOnly);
         }
         let range = self.range(offset, buf.len())?;
@@ -115,7 +129,7 @@ impl BlockBacking for BoundedDisk {
     }
 
     fn discard(&mut self, offset: u64, len: u64) -> Result<(), BackingError> {
-        if self.readonly {
+        if self.access.is_read_only() {
             return Err(BackingError::ReadOnly);
         }
         let len = usize::try_from(len).map_err(|_| BackingError::OutOfRange)?;
@@ -137,17 +151,17 @@ impl BlockBacking for BoundedDisk {
 pub struct FileDisk {
     file: std::fs::File,
     capacity: u64,
-    readonly: bool,
+    access: AccessMode,
 }
 
 impl FileDisk {
-    pub fn open(path: &std::path::Path, readonly: bool) -> std::io::Result<Self> {
-        let file = terra_platform::filesystem::disk::open_disk(path, readonly)?;
+    pub fn open(path: &std::path::Path, access: AccessMode) -> std::io::Result<Self> {
+        let file = terra_platform::filesystem::disk::open_disk(path, access.is_read_only())?;
         let capacity = file.metadata()?.len();
         Ok(Self {
             file,
             capacity,
-            readonly,
+            access,
         })
     }
 }
@@ -157,6 +171,10 @@ impl BlockBacking for FileDisk {
         self.capacity
     }
 
+    fn access(&self) -> AccessMode {
+        self.access
+    }
+
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), BackingError> {
         self.check_range(offset, buf.len())?;
         terra_platform::filesystem::disk::read_exact_at(&self.file, offset, buf)
@@ -164,7 +182,7 @@ impl BlockBacking for FileDisk {
     }
 
     fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<(), BackingError> {
-        if self.readonly {
+        if self.access.is_read_only() {
             return Err(BackingError::ReadOnly);
         }
         self.check_range(offset, buf.len())?;
@@ -173,7 +191,7 @@ impl BlockBacking for FileDisk {
     }
 
     fn discard(&mut self, offset: u64, len: u64) -> Result<(), BackingError> {
-        if self.readonly {
+        if self.access.is_read_only() {
             return Err(BackingError::ReadOnly);
         }
         self.check_range_len(offset, len)?;
@@ -223,6 +241,7 @@ mod tests {
 #[cfg(test)]
 mod file_tests {
     use super::{BackingError, BlockBacking, FileDisk};
+    use crate::component::AccessMode;
 
     fn backing_file() -> tempfile::NamedTempFile {
         let file = tempfile::NamedTempFile::new().unwrap();
@@ -234,11 +253,11 @@ mod file_tests {
     fn file_round_trip_persists_across_reopen() {
         let file = backing_file();
         {
-            let mut disk = FileDisk::open(file.path(), false).unwrap();
+            let mut disk = FileDisk::open(file.path(), AccessMode::ReadWrite).unwrap();
             disk.write_at(1536, &[0xAB; 512]).unwrap();
             disk.sync().unwrap();
         }
-        let disk = FileDisk::open(file.path(), true).unwrap();
+        let disk = FileDisk::open(file.path(), AccessMode::ReadOnly).unwrap();
         let mut bytes = [0; 512];
         disk.read_at(1536, &mut bytes).unwrap();
         assert_eq!(bytes, [0xAB; 512]);
@@ -247,7 +266,7 @@ mod file_tests {
     #[test]
     fn file_bounds_reject_past_end_and_overflow_without_extending_the_image() {
         let file = backing_file();
-        let mut disk = FileDisk::open(file.path(), false).unwrap();
+        let mut disk = FileDisk::open(file.path(), AccessMode::ReadWrite).unwrap();
         assert_eq!(disk.capacity(), 4096);
         for offset in [4096, u64::MAX] {
             assert_eq!(
@@ -266,7 +285,7 @@ mod file_tests {
     #[test]
     fn file_readonly_rejects_writes_and_discard() {
         let file = backing_file();
-        let mut disk = FileDisk::open(file.path(), true).unwrap();
+        let mut disk = FileDisk::open(file.path(), AccessMode::ReadOnly).unwrap();
         assert_eq!(disk.write_at(0, &[1]), Err(BackingError::ReadOnly));
         assert_eq!(disk.discard(0, 512), Err(BackingError::ReadOnly));
         let mut bytes = [1; 512];

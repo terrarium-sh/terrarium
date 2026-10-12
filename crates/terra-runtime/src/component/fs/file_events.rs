@@ -5,68 +5,52 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use super::bindings::wit::fs::host::{EventKind as FileEventKind, FileEvent};
+use futures_util::stream;
 use notify::event::{ModifyKind, RenameMode};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-pub(crate) const MAX_PENDING_FILE_EVENTS: usize = 4096;
-const WATCH_START_TIMEOUT: Duration = Duration::from_secs(1);
-pub(super) const MAX_NATIVE_WATCHES: usize = 1024;
-use tokio::sync::mpsc;
-use wasmtime::component::{Destination, StreamProducer, StreamResult};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 use crate::component::fs::ShareGrant;
+use crate::component::relay;
 
-pub(super) struct FileEvents {
-    receiver: mpsc::Receiver<QueuedEvent>,
-    pending: Option<QueuedEvent>,
-    _watcher: Option<WatchSession>,
-}
+pub(crate) const MAX_PENDING_FILE_EVENTS: usize = 4096;
+pub(super) const MAX_NATIVE_WATCHES: usize = 1024;
+const WATCH_START_TIMEOUT: Duration = Duration::from_secs(1);
+const WARNING_INTERVAL: Duration = Duration::from_secs(30);
+const MAX_EVENT_PATH_BYTES: usize = 4095;
 
 struct QueuedEvent {
     event: FileEvent,
-    _permit: tokio::sync::OwnedSemaphorePermit,
+    _permit: OwnedSemaphorePermit,
 }
 
 struct Warnings(Option<Instant>);
 
 impl Warnings {
     fn report(&mut self, message: impl std::fmt::Display) {
-        if self
-            .0
-            .is_none_or(|last| last.elapsed() >= Duration::from_secs(30))
-        {
+        if self.0.is_none_or(|last| last.elapsed() >= WARNING_INTERVAL) {
             log::warn!("shared file notifications degraded: {message}");
             self.0 = Some(Instant::now());
         }
     }
 }
 
-impl FileEvents {
-    pub(super) async fn new(share: &ShareGrant) -> Self {
-        let (sender, receiver) = mpsc::channel(MAX_PENDING_FILE_EVENTS);
-        let watcher = WatchSession::start(share, sender).await;
-        if watcher.is_none() {
-            return Self::default();
-        }
-        Self {
-            receiver,
-            pending: None,
-            _watcher: watcher,
-        }
-    }
-}
-
-impl Default for FileEvents {
-    fn default() -> Self {
-        Self {
-            receiver: mpsc::channel(1).1,
-            pending: None,
-            _watcher: None,
-        }
-    }
+/// Streams the share's changes; without a working native watcher the stream ends at once.
+pub(super) async fn watch_file_events(share: &ShareGrant) -> relay::Stream<FileEvent> {
+    let (sender, receiver) = mpsc::channel(MAX_PENDING_FILE_EVENTS);
+    let Some(watcher) = WatchSession::start(share, sender).await else {
+        return relay::Stream::default();
+    };
+    relay::Stream::new(stream::unfold(
+        (receiver, watcher),
+        |(mut receiver, watcher)| async move {
+            let queued = receiver.recv().await?;
+            Some((queued.event, (receiver, watcher)))
+        },
+    ))
 }
 
 struct WatchSession {
@@ -115,8 +99,8 @@ impl WatchSession {
 
 struct DirectoryWatches {
     watcher: RecommendedWatcher,
-    directories: std::collections::BTreeMap<PathBuf, tokio::sync::OwnedSemaphorePermit>,
-    budget: Arc<tokio::sync::Semaphore>,
+    directories: std::collections::BTreeMap<PathBuf, OwnedSemaphorePermit>,
+    budget: Arc<Semaphore>,
     stopped: Arc<AtomicBool>,
     warnings: Warnings,
 }
@@ -265,7 +249,7 @@ fn forward_event(
     result: notify::Result<Event>,
     root: &Path,
     sender: &mpsc::Sender<Option<QueuedEvent>>,
-    budget: &std::sync::Arc<tokio::sync::Semaphore>,
+    budget: &Arc<Semaphore>,
     warnings: &mut Warnings,
 ) {
     let event = match result {
@@ -301,7 +285,7 @@ fn forward_event(
 }
 
 fn is_valid_path(path: &str) -> bool {
-    path.len() <= 4095
+    path.len() <= MAX_EVENT_PATH_BYTES
         && !path.contains('\0')
         && path.split('/').all(|part| !matches!(part, "" | "." | ".."))
 }
@@ -337,10 +321,6 @@ fn normalize_event(root: &Path, event: &Event) -> Vec<FileEvent> {
 }
 
 fn normalize_path(root: &Path, event: &Event, index: usize, path: &Path) -> Option<FileEvent> {
-    if matches!(event.kind, EventKind::Access(_)) {
-        return None;
-    }
-    let relative = resolve_relative_event_path(root, path)?;
     let kind = match event.kind {
         EventKind::Access(_) => return None,
         EventKind::Create(_) => FileEventKind::Create,
@@ -375,7 +355,8 @@ fn normalize_path(root: &Path, event: &Event, index: usize, path: &Path) -> Opti
             }
         }
     };
-    let is_dir = matches!(
+    let relative = resolve_relative_event_path(root, path)?;
+    let is_directory = matches!(
         event.kind,
         EventKind::Create(notify::event::CreateKind::Folder)
             | EventKind::Remove(notify::event::RemoveKind::Folder)
@@ -385,44 +366,17 @@ fn normalize_path(root: &Path, event: &Event, index: usize, path: &Path) -> Opti
     let event = FileEvent {
         path: relative,
         kind,
-        is_directory: is_dir,
+        is_directory,
     };
     is_valid_path(&event.path).then_some(event)
-}
-
-impl<T: 'static> StreamProducer<T> for FileEvents {
-    type Item = FileEvent;
-    type Buffer = Option<FileEvent>;
-
-    fn poll_produce<'a>(
-        mut self: std::pin::Pin<&mut Self>,
-        context: &mut std::task::Context<'_>,
-        mut store: wasmtime::StoreContextMut<'a, T>,
-        mut destination: Destination<'a, Self::Item, Self::Buffer>,
-        finish: bool,
-    ) -> Poll<wasmtime::Result<StreamResult>> {
-        if finish {
-            return Poll::Ready(Ok(StreamResult::Cancelled));
-        }
-        if self.pending.is_none() {
-            match self.receiver.poll_recv(context) {
-                Poll::Ready(Some(frame)) => self.pending = Some(frame),
-                Poll::Ready(None) => return Poll::Ready(Ok(StreamResult::Dropped)),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-        if destination.remaining(&mut store) != Some(0) {
-            destination.set_buffer(self.pending.take().map(|queued| queued.event));
-        }
-        Poll::Ready(Ok(StreamResult::Completed))
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::component::AccessMode;
 
-    fn directory_registry(budget: Arc<tokio::sync::Semaphore>) -> DirectoryWatches {
+    fn directory_registry(budget: Arc<Semaphore>) -> DirectoryWatches {
         DirectoryWatches {
             watcher: RecommendedWatcher::new(
                 |_| {},
@@ -468,8 +422,9 @@ mod tests {
     #[tokio::test]
     async fn watches_new_directories_and_releases_resources_on_cancellation() {
         let root = tempfile::tempdir().unwrap();
-        let grant = ShareGrant::new(&root.path().canonicalize().unwrap(), false).unwrap();
-        let mut events = FileEvents::new(&grant).await;
+        let grant =
+            ShareGrant::new(&root.path().canonicalize().unwrap(), AccessMode::ReadWrite).unwrap();
+        let mut events = watch_file_events(&grant).await;
         std::fs::create_dir(root.path().join("nested")).unwrap();
         receive_path(&mut events, "nested").await;
         std::fs::write(root.path().join("nested/file"), "contents").unwrap();
@@ -586,8 +541,8 @@ mod tests {
     async fn native_watcher_delivers_host_writes_and_atomic_replacement() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
-        let grant = ShareGrant::new(&root, true).unwrap();
-        let mut events = FileEvents::new(&grant).await;
+        let grant = ShareGrant::new(&root, AccessMode::ReadOnly).unwrap();
+        let mut events = watch_file_events(&grant).await;
         std::fs::write(root.join("source"), "first").unwrap();
         receive_path(&mut events, "source").await;
         std::fs::write(root.join("replacement"), "second").unwrap();
@@ -602,7 +557,8 @@ mod tests {
     #[tokio::test]
     async fn cancelling_registration_releases_the_watcher_after_the_host_call_returns() {
         let root = tempfile::tempdir().unwrap();
-        let mut grant = ShareGrant::new(&root.path().canonicalize().unwrap(), true).unwrap();
+        let mut grant =
+            ShareGrant::new(&root.path().canonicalize().unwrap(), AccessMode::ReadOnly).unwrap();
         let (release, blocked) = std::sync::mpsc::channel::<()>();
         let blocked = std::sync::Mutex::new(blocked);
         let entered = Arc::new(tokio::sync::Semaphore::new(0));
@@ -632,11 +588,11 @@ mod tests {
         assert_eq!(grant.watch_budget.available_permits(), MAX_NATIVE_WATCHES);
     }
 
-    async fn receive_path(events: &mut FileEvents, path: &str) {
+    async fn receive_path(events: &mut relay::Stream<FileEvent>, path: &str) {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                let event = events.receiver.recv().await.unwrap();
-                if event.event.path == path {
+                let event = events.next().await.unwrap();
+                if event.path == path {
                     return;
                 }
             }

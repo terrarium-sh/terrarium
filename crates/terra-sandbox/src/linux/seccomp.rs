@@ -6,19 +6,16 @@ use std::path::Path;
 const MAX_BPF_BYTES: usize = 4096 * 8;
 pub const BUNDLE_FORMAT_VERSION: u32 = 1;
 
-pub fn resolve_policy(policy: Option<&Path>, allow_fallback: bool) -> Result<crate::PolicyBundle> {
+/// `None` selects the built-in role filters.
+pub fn resolve_policy(policy: Option<&Path>) -> Result<crate::PolicyBundle> {
     if let Some(path) = policy {
         return read_bundle(path);
     }
-    ensure!(
-        allow_fallback,
-        "a seccomp bundle is required (vm.sandbox.allow_fallback: false); set vm.sandbox.policy to a generated bundle directory or provide ~/.terra/config/seccomp"
-    );
     crate::PolicyBundle::try_from_roles(|role| {
         Ok(match role {
-            crate::Role::Supervisor => super::fallback_policy::SUPERVISOR,
-            crate::Role::Vm => super::fallback_policy::VM,
-            crate::Role::Network => super::fallback_policy::NETWORK,
+            crate::Role::Supervisor => super::builtin_policy::SUPERVISOR,
+            crate::Role::Vm => super::builtin_policy::VM,
+            crate::Role::Network => super::builtin_policy::NETWORK,
         }
         .to_vec())
     })
@@ -122,25 +119,22 @@ mod tests {
     fn non_bundle_or_invalid_policy_never_falls_back() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("policy.bpf");
-        let bpf = super::super::fallback_policy::SUPERVISOR;
+        let bpf = super::super::builtin_policy::SUPERVISOR;
         std::fs::write(&path, bpf).unwrap();
-        for allow_fallback in [false, true] {
-            assert!(resolve_policy(Some(&path), allow_fallback).is_err());
-        }
+        assert!(resolve_policy(Some(&path)).is_err());
         for invalid in [Vec::new(), vec![0; 7], vec![0; 4096 * 8 + 8]] {
             std::fs::write(&path, invalid).unwrap();
-            assert!(resolve_policy(Some(&path), true).is_err());
+            assert!(resolve_policy(Some(&path)).is_err());
         }
         std::fs::remove_file(&path).unwrap();
-        assert!(resolve_policy(Some(&path), true).is_err());
-        assert!(resolve_policy(None, false).is_err());
-        assert_eq!(resolve_policy(None, true).unwrap().supervisor, bpf);
+        assert!(resolve_policy(Some(&path)).is_err());
+        assert_eq!(resolve_policy(None).unwrap().supervisor, bpf);
     }
 
     #[test]
     fn role_bundle_requires_every_policy_and_its_manifest_hash() -> Result<()> {
         let directory = tempfile::tempdir()?;
-        let builtins = resolve_policy(None, true)?;
+        let builtins = resolve_policy(None)?;
         let mut roles = serde_json::Map::new();
         for role in crate::Role::ALL {
             let bytes = builtins.get(role);
@@ -164,19 +158,19 @@ mod tests {
         });
         let manifest_path = directory.path().join("manifest.json");
         std::fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
-        let loaded = resolve_policy(Some(directory.path()), false)?;
+        let loaded = resolve_policy(Some(directory.path()))?;
         for role in crate::Role::ALL {
             assert_eq!(loaded.get(role), builtins.get(role));
             let path = directory
                 .path()
                 .join(format!("{}.seccomp.bpf", role.name()));
             std::fs::remove_file(&path)?;
-            assert!(resolve_policy(Some(directory.path()), true).is_err());
+            assert!(resolve_policy(Some(directory.path())).is_err());
             std::fs::write(&path, builtins.get(role))?;
             let mut changed = builtins.get(role).to_vec();
             changed[0] ^= 1;
             std::fs::write(&path, changed)?;
-            assert!(resolve_policy(Some(directory.path()), true).is_err());
+            assert!(resolve_policy(Some(directory.path())).is_err());
             std::fs::write(path, builtins.get(role))?;
         }
         for (field, value) in [
@@ -186,7 +180,7 @@ mod tests {
             let mut incompatible = manifest.clone();
             incompatible[field] = value;
             std::fs::write(&manifest_path, serde_json::to_vec(&incompatible)?)?;
-            assert!(resolve_policy(Some(directory.path()), true).is_err());
+            assert!(resolve_policy(Some(directory.path())).is_err());
         }
         Ok(())
     }

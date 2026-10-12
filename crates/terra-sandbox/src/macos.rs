@@ -15,7 +15,7 @@ use std::process::{Child, Command, ExitCode};
 use std::time::Duration;
 
 const CODESIGN: &str = "/usr/bin/codesign";
-const ROLE_ENV: &str = "TERRA_MACOS_SANDBOX_ROLE";
+use terra_platform::process::sandbox_env::MACOS_ROLE;
 const PROBE_ENV: &str = "TERRA_MACOS_SANDBOX_PROBE";
 const ACTIVATION_FD: i32 = 9;
 const ACTIVATION_ACK: u8 = 0x53;
@@ -117,7 +117,7 @@ pub fn prepare_launch(launch: Launch<'_>) -> Result<PreparedLaunch> {
     worker_command.args(command.get_args());
     crate::copy_explicit_environment(&mut worker_command, &command);
     worker_command
-        .env(ROLE_ENV, role.name())
+        .env(MACOS_ROLE, role.name())
         .env(PROBE_ENV, probe);
     worker_command.current_dir(command.get_current_dir().unwrap_or(Path::new("/")));
     let (activation, child_activation) = UnixStream::pair()?;
@@ -188,12 +188,11 @@ fn build_identifier(role: Role, executable: &Path, entitlements: &str) -> Result
     Ok(identifier)
 }
 
-pub fn resolve_policy(policy: Option<&Path>, allow_fallback: bool) -> Result<PolicyBundle> {
+pub fn resolve_policy(policy: Option<&Path>) -> Result<PolicyBundle> {
     ensure!(
         policy.is_none(),
-        "macOS uses signed App Sandbox role policies; remove vm.sandbox.policy (Linux seccomp overrides cannot be used on macOS)"
+        "macOS uses its built-in App Sandbox role policies; remove vm.sandbox.policy (seccomp bundles are Linux-only)"
     );
-    let _ = allow_fallback;
     PolicyBundle::try_from_roles(|_| Ok(Vec::new()))
 }
 
@@ -216,7 +215,7 @@ pub fn role_grants(role: Role) -> Vec<Grant> {
 }
 
 pub fn verify_worker_role(role: Role) -> Result<()> {
-    let Some(launched_role) = std::env::var_os(ROLE_ENV) else {
+    let Some(launched_role) = std::env::var_os(MACOS_ROLE) else {
         return Ok(());
     };
     ensure!(
@@ -280,6 +279,13 @@ mod tests {
     use std::os::unix::net::{UnixDatagram, UnixListener};
     use std::process::Stdio;
 
+    /// An ignored override would leave the operator believing a custom policy applies.
+    #[test]
+    fn policy_override_is_a_configuration_error() {
+        assert!(resolve_policy(Some(Path::new("seccomp"))).is_err());
+        assert!(resolve_policy(None).is_ok());
+    }
+
     const TEST_ENDPOINT: &str = "TERRA_MACOS_TEST_ENDPOINT";
     const TEST_METADATA: &str = "TERRA_MACOS_TEST_METADATA";
     const TEST_SHARE_ROOT: &str = "TERRA_MACOS_TEST_SHARE_ROOT";
@@ -300,7 +306,7 @@ mod tests {
                 "macos::tests::direct_workers_require_no_sandbox_activation",
             ])
             .env(CHILD, "1")
-            .env_remove(ROLE_ENV)
+            .env_remove(MACOS_ROLE)
             .env_remove(PROBE_ENV)
             .output()?;
         assert!(output.status.success(), "{output:?}");
@@ -334,7 +340,7 @@ mod tests {
         let Some(endpoint) = std::env::var_os(TEST_ENDPOINT) else {
             return Ok(());
         };
-        let role = match std::env::var(ROLE_ENV)?.as_str() {
+        let role = match std::env::var(MACOS_ROLE)?.as_str() {
             "vm" => Role::Vm,
             "network" => Role::Network,
             value => anyhow::bail!("unexpected signed test role {value}"),

@@ -88,27 +88,30 @@ impl<T: Send + 'static> InterruptQueue<T> {
     }
 
     fn send(&self, command: T) -> wasmtime::Result<()> {
-        self.sender
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .ok_or_else(|| wasmtime::Error::msg("interrupt queue closed"))?
-            .try_send(command)
-            .map_err(|error| wasmtime::Error::msg(format!("interrupt queue: {error}")))
+        self.send_or(command, || {
+            Err(wasmtime::Error::msg("interrupt queue closed"))
+        })
     }
 
     fn send_if_open(&self, command: T) -> wasmtime::Result<()> {
-        if let Some(sender) = self
+        self.send_or(command, || Ok(()))
+    }
+
+    fn send_or(
+        &self,
+        command: T,
+        when_closed: impl FnOnce() -> wasmtime::Result<()>,
+    ) -> wasmtime::Result<()> {
+        match self
             .sender
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
         {
-            sender
+            Some(sender) => sender
                 .try_send(command)
-                .map_err(|error| wasmtime::Error::msg(format!("interrupt queue: {error}")))
-        } else {
-            Ok(())
+                .map_err(|error| wasmtime::Error::msg(format!("interrupt queue: {error}"))),
+            None => when_closed(),
         }
     }
 
@@ -292,7 +295,7 @@ impl BoxRuntime {
         let config = self.claim_x86_controller()?;
         let controller_config = controller::Config {
             mode,
-            routes: config.devices().iter().map(|device| device.irq).collect(),
+            routes: config.irq_routes(),
         };
         let (worker, controller) =
             call_bounded(instantiate(self, component, controller_config)).await?;
@@ -401,7 +404,7 @@ impl BoxRuntime {
         let (config, mut worker, controller) = self
             .start_controller(component, controller::Mode::IrqLines)
             .await?;
-        let routes: Arc<[u32]> = config.devices().iter().map(|device| device.irq).collect();
+        let routes: Arc<[u32]> = config.irq_routes().into();
         let inject: Arc<dyn Fn(u32, bool) -> wasmtime::Result<()> + Send + Sync> = Arc::new(inject);
         let (queue, mut receiver, completion) = interrupt_queue::<GsiCommand>();
         let line = controller.func_irq_line();
@@ -451,7 +454,7 @@ mod tests {
         let engine = crate::engine::device_engine().unwrap();
         let mut root = BoxRuntime::new(&engine, crate::box_runtime::BoxHost::new()).unwrap();
         let component = crate::test_fixtures::trusted_artifacts()
-            .interrupt_controller()
+            .interrupt_controller
             .deserialize(&engine)
             .unwrap();
         let (mut interrupts, controller) = instantiate(

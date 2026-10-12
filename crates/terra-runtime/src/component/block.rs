@@ -27,13 +27,12 @@ pub(crate) async fn instantiate(
     engine: &wasmtime::Engine,
     host: BlockHost,
     component: &Component,
-    readonly: bool,
     interrupt: InterruptCallback,
 ) -> wasmtime::Result<crate::component::StandaloneDevice> {
     let mut runtime =
         crate::box_runtime::BoxRuntime::new(engine, crate::box_runtime::store::BoxHost::new())?;
     crate::component::mmio::initialize_test_mmio(&mut runtime)?;
-    let channel = register_device(&mut runtime, host, component, readonly, interrupt)?;
+    let channel = register_device(&mut runtime, host, component, interrupt)?;
     Ok(crate::component::StandaloneDevice {
         _runtime: Arc::new(runtime.prepare().await?.start()),
         device: channel,
@@ -44,36 +43,34 @@ pub fn register_device(
     runtime: &mut crate::box_runtime::BoxRuntime,
     host: BlockHost,
     component: &Component,
-    readonly: bool,
     interrupt: InterruptCallback,
 ) -> wasmtime::Result<MmioDevice> {
-    register_device_with_host_factory(runtime, move || Ok(host), component, readonly, interrupt)
+    register_device_with_host_factory(runtime, move || Ok(host), component, interrupt)
 }
 
 pub fn register_device_with_host_factory(
     runtime: &mut crate::box_runtime::BoxRuntime,
     create_host: impl FnOnce() -> wasmtime::Result<BlockHost> + Send + 'static,
     component: &Component,
-    readonly: bool,
     interrupt: InterruptCallback,
 ) -> wasmtime::Result<MmioDevice> {
     let child = runtime.child_factory();
     let component = component.clone();
     runtime.grant_device_worker(DeviceKind::Block, async move {
-        create_worker(child(create_host()?), &component, readonly, interrupt).await
+        create_worker(child(create_host()?), &component, interrupt).await
     })
 }
 
 async fn create_worker(
     mut child: crate::box_runtime::DeviceWorker<BlockHost>,
     component: &Component,
-    readonly: bool,
     interrupt: InterruptCallback,
 ) -> wasmtime::Result<(
     crate::box_runtime::DeviceWorker<BlockHost>,
     crate::component::mmio::Serve,
 )> {
     let wake = child.store.data().context.interrupt_notification();
+    let readonly = child.store.data().disk_access().is_read_only();
     let linker = block_component_linker(child.store.engine())?;
     let instance = BlockDevice::instantiate_async(&mut child.store, component, &linker)
         .await
@@ -90,22 +87,30 @@ async fn create_worker(
         interrupt,
     };
     let serve = instance.terra_mmio_device().func_serve();
-    device_loop.register(&mut child, wake, "block")?;
+    device_loop.register(&mut child, wake, DeviceKind::Block)?;
     Ok((child, serve))
 }
 
 #[cfg(test)]
 mod tests {
-
+    use crate::component::AccessMode;
     use crate::component::block::BlockHost;
     use crate::component::block::backing::BoundedDisk;
     use crate::component::block::backing::DiskGrant;
     use crate::engine::device_engine;
     use crate::memory::BoundedMemory;
     use crate::memory::GuestRam;
+    use crate::self_test::virtio;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use wasmtime::component::Component;
+
+    const QUEUE: virtio::QueueLayout = virtio::QueueLayout {
+        size: 256,
+        descriptors: 0x1000,
+        available: 0x2000,
+        used: 0x3000,
+    };
 
     #[tokio::test(flavor = "multi_thread")]
     async fn actor_configures_and_serves_component_mmio() {
@@ -114,30 +119,29 @@ mod tests {
             Component::new(&engine, crate::test_fixtures::wasm::BLOCK).expect("component compiles");
         let host = crate::component::block::BlockHost::new(
             crate::memory::GuestRam::new(64 * 1024).unwrap(),
-            DiskGrant::Mem(BoundedDisk::new(4096, false)),
+            DiskGrant::Mem(BoundedDisk::new(4096, AccessMode::ReadWrite)),
         );
 
-        let channel = crate::component::block::instantiate(
-            &engine,
-            host,
-            &component,
-            false,
-            Arc::new(|_| Ok(())),
-        )
-        .await
-        .expect("actor instantiates");
+        let channel =
+            crate::component::block::instantiate(&engine, host, &component, Arc::new(|_| Ok(())))
+                .await
+                .expect("actor instantiates");
 
         assert_eq!(
-            channel.read(0, 4).expect("magic read"),
-            0x7472_6976u32.to_le_bytes()
+            channel.read(virtio::MAGIC_VALUE, 4).expect("magic read"),
+            virtio::MAGIC.to_le_bytes()
         );
         assert!(channel.read(0, 3).is_err());
         assert_eq!(channel.request_counts(), (1, 0));
-        channel.write(0x70, &[0]).expect("one-byte reset");
-        channel.write(0x70, &[0x80]).expect("failed reset");
+        channel.write(virtio::STATUS, &[0]).expect("one-byte reset");
+        channel
+            .write(virtio::STATUS, &[0x80])
+            .expect("failed reset");
         assert_eq!(
-            channel.read(0, 4).expect("worker survives resets"),
-            0x7472_6976_u32.to_le_bytes()
+            channel
+                .read(virtio::MAGIC_VALUE, 4)
+                .expect("worker survives resets"),
+            virtio::MAGIC.to_le_bytes()
         );
         channel.close().expect("actor closes");
         assert_eq!(channel.request_counts(), (5, 0));
@@ -155,13 +159,18 @@ mod tests {
             crate::box_runtime::BoxRuntime::new(&engine, crate::box_runtime::store::BoxHost::new())
                 .expect("box runtime");
         runtime.initialize_mmio().expect("MMIO service initializes");
-        let writable = BlockHost::new(ram.clone(), DiskGrant::Mem(BoundedDisk::new(4096, false)));
-        let readonly = BlockHost::new(ram, DiskGrant::Mem(BoundedDisk::new(8192, true)));
+        let writable = BlockHost::new(
+            ram.clone(),
+            DiskGrant::Mem(BoundedDisk::new(4096, AccessMode::ReadWrite)),
+        );
+        let readonly = BlockHost::new(
+            ram,
+            DiskGrant::Mem(BoundedDisk::new(8192, AccessMode::ReadOnly)),
+        );
         let first = crate::component::block::register_device(
             &mut runtime,
             writable,
             &component,
-            false,
             Arc::new(|_| Ok(())),
         )
         .expect("first block instantiates");
@@ -169,7 +178,6 @@ mod tests {
             &mut runtime,
             readonly,
             &component,
-            true,
             Arc::new(|_| Ok(())),
         )
         .expect("second block instantiates");
@@ -182,11 +190,10 @@ mod tests {
             BlockHost::new(
                 crate::memory::GuestRam::new(4096).unwrap(),
                 crate::component::block::backing::DiskGrant::Mem(
-                    crate::component::block::backing::BoundedDisk::new(0, false),
+                    crate::component::block::backing::BoundedDisk::new(0, AccessMode::ReadWrite),
                 ),
             ),
             &component,
-            false,
             Arc::new(|_| Ok(())),
         )
         .unwrap();
@@ -199,8 +206,8 @@ mod tests {
         );
         let other_running = other_box.prepare().await.unwrap().start();
         assert_eq!(
-            other_device.read(0, 4).unwrap(),
-            0x7472_6976_u32.to_le_bytes()
+            other_device.read(virtio::MAGIC_VALUE, 4).unwrap(),
+            virtio::MAGIC.to_le_bytes()
         );
         other_device.close().unwrap();
         other_running.join().await.unwrap();
@@ -246,41 +253,27 @@ mod tests {
         let component = Component::new(&engine, crate::test_fixtures::wasm::BLOCK).unwrap();
         let mut host = crate::component::block::BlockHost::new(
             crate::memory::GuestRam::new(64 * 1024).unwrap(),
-            DiskGrant::Mem(BoundedDisk::new(4096, false)),
+            DiskGrant::Mem(BoundedDisk::new(4096, AccessMode::ReadWrite)),
         );
         let ram = host.context.guest_ram().clone();
 
         host.context
             .guest_write(0x2002, &257u16.to_le_bytes())
             .unwrap();
-        let channel = crate::component::block::instantiate(
-            &engine,
-            host,
-            &component,
-            false,
-            Arc::new(|_| Ok(())),
-        )
-        .await
-        .unwrap();
-        for (offset, value) in [
-            (0x70, 1u32),
-            (0x70, 3),
-            (0x24, 1),
-            (0x20, 1),
-            (0x70, 11),
-            (0x38, 256),
-            (0x80, 0x1000),
-            (0x90, 0x2000),
-            (0xa0, 0x3000),
-            (0x44, 1),
-            (0x70, 15),
-        ] {
-            channel.write(offset, &value.to_le_bytes()).unwrap();
-        }
-        channel.write(0x50, &0u32.to_le_bytes()).unwrap();
+        let channel =
+            crate::component::block::instantiate(&engine, host, &component, Arc::new(|_| Ok(())))
+                .await
+                .unwrap();
+        virtio::start_single_queue(&channel, 0, 0, QUEUE).unwrap();
+        channel
+            .write(virtio::QUEUE_NOTIFY, &0u32.to_le_bytes())
+            .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(channel.failure().is_none());
-        assert_eq!(channel.read(0, 4).unwrap(), 0x7472_6976u32.to_le_bytes());
+        assert_eq!(
+            channel.read(virtio::MAGIC_VALUE, 4).unwrap(),
+            virtio::MAGIC.to_le_bytes()
+        );
         assert_eq!(
             crate::memory::BoundedMemory::new(&ram)
                 .read(0x3002, 2)
@@ -290,7 +283,9 @@ mod tests {
         crate::memory::BoundedMemory::new(&ram)
             .write(0x2002, &258u16.to_le_bytes())
             .unwrap();
-        channel.write(0x50, &0u32.to_le_bytes()).unwrap();
+        channel
+            .write(virtio::QUEUE_NOTIFY, &0u32.to_le_bytes())
+            .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while crate::memory::BoundedMemory::new(&ram)
                 .read(0x3002, 2)
@@ -314,7 +309,7 @@ mod tests {
         let memory = BoundedMemory::new(&ram);
         let host = crate::component::block::BlockHost::new(
             ram.clone(),
-            DiskGrant::Mem(BoundedDisk::new(4096, false)),
+            DiskGrant::Mem(BoundedDisk::new(4096, AccessMode::ReadWrite)),
         );
         let interrupted = Arc::new(AtomicBool::new(false));
         let interrupt = Arc::clone(&interrupted);
@@ -322,7 +317,6 @@ mod tests {
             &engine,
             host,
             &component,
-            false,
             Arc::new(move |level| {
                 interrupt.store(level, Ordering::Release);
                 Ok(())
@@ -345,22 +339,8 @@ mod tests {
         memory.write(0x4000, &4u32.to_le_bytes()).unwrap();
         memory.write(0x2002, &1u16.to_le_bytes()).unwrap();
         memory.write(0x2004, &0u16.to_le_bytes()).unwrap();
-        for (offset, value) in [
-            (0x70, 1u32),
-            (0x70, 3),
-            (0x24, 1),
-            (0x20, 1),
-            (0x70, 11),
-            (0x38, 256),
-            (0x80, 0x1000),
-            (0x90, 0x2000),
-            (0xa0, 0x3000),
-            (0x44, 1),
-            (0x70, 15),
-        ] {
-            channel.write(offset, &value.to_le_bytes()).unwrap();
-        }
-        let _ = channel.write(0x50, &0u32.to_le_bytes());
+        virtio::start_single_queue(&channel, 0, 0, QUEUE).unwrap();
+        let _ = channel.write(virtio::QUEUE_NOTIFY, &0u32.to_le_bytes());
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while memory.read(0x3002, 2).unwrap() != 1u16.to_le_bytes()
                 || !interrupted.load(Ordering::Acquire)

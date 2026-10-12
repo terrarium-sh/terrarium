@@ -105,12 +105,14 @@ listeners, shares, stop, detached lifetime and abrupt supervisor or broker death
 ## Windows
 
 The VM runs in AppContainer. The network broker uses a restricted token outside
-AppContainer. Both workers use explicit inherited handles and jobs.
+AppContainer, further restricted to `ALL APPLICATION PACKAGES` so it keeps the
+system grants Windows ships for AppContainers but no access to user files. Both
+workers use explicit inherited handles and jobs.
 
-| Worker | Default token | Networking | Other limits |
+| Worker | Token | Networking | Other limits |
 | --- | --- | --- | --- |
 | VM | Less-Privileged AppContainer with `HypervisorPlatform` and `registryRead` | None | Approved file grants, local IPC, single-process job, Win32k disabled |
-| Broker | Restricted token; privileges removed and Administrators deny-only | Native TCP/UDP and name resolution | 512-MiB commit limit, single-process job, Win32k and dynamic code disabled |
+| Broker | Restricted to `ALL APPLICATION PACKAGES`; privileges removed and Administrators deny-only | Native TCP/UDP and name resolution | No user file or box state access, 512-MiB commit limit, single-process job, Win32k and dynamic code disabled |
 
 **VM grants.** The VM launch creates a unique AppContainer profile and package SID,
 adds only that SID to approved file DACLs, removes the grants on orderly exit and
@@ -120,8 +122,12 @@ read-only. Grant traversal skips reparse points, and share roots cannot be repar
 points. Filesystem operations resolve guest paths within the approved share;
 a launch may grant at most 16,384 objects.
 
-The broker has the user's ordinary file access. Its restricted token and job
-limit privileges and process lifetime, but do not isolate host files.
+The broker's restricted token is further restricted to `ALL APPLICATION
+PACKAGES`, so it keeps the system grants Windows ships for AppContainers —
+system DLLs, Winsock, name resolution, read access to system files and most of
+`HKLM` — and cannot read or write user files, box state or the user's other
+processes. The trusted wrapper verifies the restricting SIDs on the token before
+each launch. Its job limits process lifetime and its commit limit bounds memory.
 
 **Lifetime.** A trusted wrapper creates each worker suspended inside a
 single-process job that kills it when the last job handle closes. The wrapper
@@ -133,32 +139,11 @@ worker, but DACL and profile cleanup cannot run; profile names are never reused.
 **WHP.** The VM's `HypervisorPlatform` capability permits access to Windows
 Hypervisor Platform; `registryRead` lets Winsock initialize for inherited IPC.
 The VM receives no network capabilities. A WHP failure aborts the launch without
-retrying. An administrator may select `restricted_token_job` for the VM, which removes
-privileges and makes Administrators deny-only but keeps the job, Win32k denial,
-child-process denial and handle allowlist. **This mode does not deny native VM
-sockets and imposes no AppContainer file or process isolation**: a compromised
-VM keeps the user's access. Terra logs this and changes no firewall settings.
+retrying.
 
-Policy overrides live in a directory set by `vm.sandbox.policy`, holding
-`supervisor.sandbox.json`, `vm.sandbox.json` and `network.sandbox.json`. Unknown
-fields, wrong roles and unsupported versions are rejected, and Linux seccomp files
-are not accepted.
-
-```json
-{
-  "schema_version": 1,
-  "role": "vm",
-  "mode": "restricted_token_job",
-  "less_privileged": false,
-  "memory_limit_bytes": 0
-}
-```
-
-Defaults: supervisor `supervisor`/not less-privileged; VM `app_container`,
-less-privileged, no memory limit; broker `restricted_token_job`,
-536,870,912-byte limit. Broker AppContainer mode is unsupported.
-`less_privileged: false` with VM `app_container` selects regular AppContainer
-and its broader baseline access.
+The role policies are built in and cannot be overridden; `vm.sandbox.policy`
+is refused on Windows. A host that cannot run them needs `vm.init: direct` or
+a custom launcher ([host VM launchers](vm-launchers.md)).
 
 **Networking.** The broker creates published listeners from the configured
 grants and opens IPv4 or IPv6 TCP/UDP sockets directly. It applies destination
@@ -175,10 +160,10 @@ checking the other shared-filesystem operations.
 
 Native validation must show that VM TCP/UDP fails for loopback, private and public
 destinations while broker IPC works; that host AF_UNIX paths in shares give no
-tunnel; that the broker can use native loopback sockets; that the VM cannot replace
-the PID files; that no stray handles reach workers; and that killing the
-supervisor or wrapper at any phase leaves no worker or live socket. Isolation
-VM isolation tests must fail when the VM selects `restricted_token_job` mode. The compiled grant probe:
+tunnel; that the broker can use native loopback sockets and resolve names but
+cannot read user files; that the VM cannot replace the PID files; that no stray
+handles reach workers; and that killing the supervisor or wrapper at any phase
+leaves no worker or live socket. The compiled grant probe:
 
 ```powershell
 $env:TERRA_BIN = (Resolve-Path target\debug\terra.exe).Path

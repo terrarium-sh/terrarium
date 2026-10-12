@@ -1,4 +1,5 @@
 use super::VmInput;
+use crate::component::AccessMode;
 use crate::machine::DeviceKind;
 use std::path::PathBuf;
 
@@ -6,7 +7,7 @@ pub(crate) fn assemble_devices(
     runtime: &mut crate::box_runtime::BoxRuntime,
     input: &mut VmInput,
     ram: crate::component::vmm::RamGrant,
-    disks: &[(PathBuf, bool)],
+    disks: &[PathBuf],
     bind_interrupt: impl Fn(DeviceKind, usize) -> Result<crate::component::InterruptCallback, String>,
 ) -> Result<(), String> {
     blocks(runtime, ram.clone(), input, disks, |index| {
@@ -26,7 +27,7 @@ pub(crate) fn assemble_devices(
     crate::component::vsock::register_device(
         runtime,
         ram,
-        input.artifacts.vsock(),
+        input.artifacts.vsock_frontend,
         streams,
         input.network_backend.take(),
         input.port_mappings.clone(),
@@ -36,32 +37,32 @@ pub(crate) fn assemble_devices(
     Ok(())
 }
 
-pub(crate) fn disk_paths(input: &VmInput) -> Vec<(PathBuf, bool)> {
-    let mut disks = Vec::with_capacity(1 + input.volume_disks.len());
-    disks.push((input.root_disk.clone(), false));
-    disks.extend(input.volume_disks.iter().cloned().map(|path| (path, false)));
-    disks
+pub(crate) fn disk_paths(input: &VmInput) -> Vec<PathBuf> {
+    std::iter::once(&input.root_disk)
+        .chain(&input.volume_disks)
+        .cloned()
+        .collect()
 }
 
 fn blocks(
     runtime: &mut crate::box_runtime::BoxRuntime,
     ram: impl Into<crate::component::vmm::RamGrant> + Send,
     input: &mut VmInput,
-    disks: &[(PathBuf, bool)],
+    disks: &[PathBuf],
     interrupt: impl Fn(usize) -> Result<crate::component::InterruptCallback, String>,
 ) -> Result<(), String> {
     use crate::component::block::BlockHost;
     use crate::component::block::backing::{DiskGrant, FileDisk};
     let component = input
         .artifacts
-        .block()
+        .block
         .deserialize(runtime.store.engine())
         .map_err(|error| error.to_string())?;
     let disks = disks
         .iter()
-        .map(|(path, readonly)| {
-            FileDisk::open(path, *readonly)
-                .map(|disk| (DiskGrant::File(disk), *readonly))
+        .map(|path| {
+            FileDisk::open(path, AccessMode::ReadWrite)
+                .map(DiskGrant::File)
                 .map_err(|error| format!("opening block backing {}: {error}", path.display()))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -71,13 +72,12 @@ fn blocks(
         )),
     );
     let ram = ram.into();
-    for (index, (disk, readonly)) in std::iter::once((boot_disk, true)).chain(disks).enumerate() {
+    for (index, disk) in std::iter::once(boot_disk).chain(disks).enumerate() {
         let ram = ram.clone();
         crate::component::block::register_device_with_host_factory(
             runtime,
             move || Ok(BlockHost::new(ram.resolve()?, disk)),
             &component,
-            readonly,
             interrupt(index)?,
         )
         .map_err(|error| error.to_string())?;
@@ -97,7 +97,7 @@ fn filesystems(
     }
     let component = input
         .artifacts
-        .fs()
+        .fs
         .deserialize(runtime.store.engine())
         .map_err(|error| error.to_string())?;
     let resource_capacity = filesystem_resource_capacity(input.shares.len());
@@ -149,7 +149,7 @@ fn memory(
     use crate::component::context::DeviceContext;
     let component = input
         .artifacts
-        .mem()
+        .mem
         .deserialize(runtime.store.engine())
         .map_err(|error| error.to_string())?;
     let ram = ram.into();
@@ -171,7 +171,7 @@ fn agent(
     crate::component::agent::Agent::from_trusted_artifact(
         runtime,
         endpoint,
-        input.artifacts.agent(),
+        input.artifacts.agent,
         std::mem::take(&mut input.plan),
         input.listener.take(),
         input.control.take(),
@@ -193,18 +193,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn empty_shares_do_not_load_the_filesystem_artifact() {
-        #[allow(unsafe_code)]
-        let artifacts = unsafe {
-            crate::TrustedArtifacts::new(
-                include_bytes!("../../../../build/terra-block-component.cwasm"),
-                include_bytes!("../../../../build/terra-agent-component.cwasm"),
-                include_bytes!("../../../../build/terra-vsock-frontend-component.cwasm"),
-                include_bytes!("../../../../build/terra-block-component.cwasm"),
-                include_bytes!("../../../../build/terra-mem-component.cwasm"),
-                include_bytes!("../../../../build/terra-boot-component.cwasm"),
-                include_bytes!("../../../../build/terra-vmm-component.cwasm"),
-                include_bytes!("../../../../build/terra-interrupt-controller-component.cwasm"),
-            )
+        let fixtures = crate::test_fixtures::trusted_artifacts();
+        let artifacts = crate::TrustedArtifacts {
+            fs: fixtures.block,
+            ..fixtures
         };
         let input = super::VmInput {
             component_memory_limits: crate::box_runtime::ComponentMemoryLimits::default(),

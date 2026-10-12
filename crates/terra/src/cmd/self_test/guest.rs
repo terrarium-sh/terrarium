@@ -370,7 +370,10 @@ fn exercise_exec(self_test: &SelfTest) -> Result<()> {
 fn exercise_shares(self_test: &SelfTest, writable: &Path, readonly: &Path) -> Result<()> {
     println!("self-test: writable/read-only shares, file events and synchronization");
     #[cfg(windows)]
-    let expects_symlink_denial = vm_uses_app_container()?;
+    let expects_symlink_denial = matches!(
+        crate::sandbox::config::load()?,
+        crate::sandbox::config::LauncherConfig::Sandboxed { .. }
+    );
     #[cfg(not(windows))]
     let expects_symlink_denial = false;
     let flags: &[&str] = if expects_symlink_denial {
@@ -397,19 +400,6 @@ fn exercise_shares(self_test: &SelfTest, writable: &Path, readonly: &Path) -> Re
     exercise_file_events(self_test, writable)?;
     self_test.execute(include_str!("scripts/shares-persisted.sh"), &[])?;
     Ok(())
-}
-
-#[cfg(windows)]
-fn vm_uses_app_container() -> Result<bool> {
-    match crate::sandbox::config::load()? {
-        crate::sandbox::config::LauncherConfig::Sandboxed {
-            policy,
-            allow_fallback,
-        } => terra_sandbox::resolve_policy(policy.as_deref(), allow_fallback)?
-            .uses_app_container(terra_sandbox::Role::Vm),
-        crate::sandbox::config::LauncherConfig::Direct
-        | crate::sandbox::config::LauncherConfig::Custom(_) => Ok(false),
-    }
 }
 
 fn exercise_file_events(self_test: &SelfTest, writable: &Path) -> Result<()> {

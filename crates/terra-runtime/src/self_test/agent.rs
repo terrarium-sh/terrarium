@@ -37,24 +37,10 @@ fn yamux_frame(kind: u8, flags: u16, stream: u32, payload: &[u8]) -> wasmtime::R
 
 impl GuestTransport {
     async fn send_bytes(&mut self, bytes: &[u8]) -> wasmtime::Result<()> {
-        let mut sent = 0;
-        while sent < bytes.len() {
-            let end = bytes
-                .len()
-                .min(sent + terra_protocol::mux::MAX_STREAM_FRAME_BYTES);
-            let count = self
-                .endpoint
-                .try_write(self.connection_number, &bytes[sent..end])
-                .map_err(|error| {
-                    wasmtime::Error::msg(format!("agent self-test write: {error:?}"))
-                })? as usize;
-            if count == 0 {
-                self.endpoint.wait().await;
-            } else {
-                sent += count;
-            }
-        }
-        Ok(())
+        self.endpoint
+            .write_all(self.connection_number, bytes)
+            .await
+            .map_err(|error| wasmtime::Error::msg(format!("agent self-test write: {error:?}")))
     }
 
     async fn receive_packets(&mut self) -> wasmtime::Result<()> {
@@ -136,28 +122,7 @@ impl GuestTransport {
 
 fn encode_plan() -> wasmtime::Result<Vec<u8>> {
     Ok(terra_protocol::encode_frame(
-        &terra_protocol::BootPlan::new(terra_protocol::Plan {
-            mode: terra_protocol::PlanMode::Run,
-            workdir: None,
-            shares: Vec::new(),
-            volumes: Vec::new(),
-            net: terra_protocol::Net::Tsi,
-            published_ports: Vec::new(),
-            published_udp_ports: Vec::new(),
-            env: std::collections::BTreeMap::new(),
-            root: false,
-            sudo: Vec::new(),
-            on_create: Vec::new(),
-            on_start: Vec::new(),
-            pre_stop: Vec::new(),
-            daemons: Vec::new(),
-            workload: vec!["/bin/true".into()],
-            sandbox_info: String::new(),
-            await_initial_session: false,
-            host_tz: None,
-            host_time: None,
-            host_seed: None,
-        }),
+        &terra_protocol::BootPlan::new(terra_protocol::Plan::bare_run(vec!["/bin/true".into()])),
     )?)
 }
 
@@ -207,8 +172,8 @@ fn connect_client(path: &Path) -> wasmtime::Result<LocalStream> {
             }
         }
     };
-    client.set_read_timeout(Some(Duration::from_secs(5)))?;
-    client.set_write_timeout(Some(Duration::from_secs(5)))?;
+    client.set_read_timeout(Some(super::STEP_WAIT))?;
+    client.set_write_timeout(Some(super::STEP_WAIT))?;
     Ok(client)
 }
 
@@ -252,7 +217,7 @@ pub(super) async fn run_with_external_clients(
     let _agent = Agent::from_trusted_artifact(
         &mut runtime,
         endpoint,
-        artifacts.agent(),
+        artifacts.agent,
         encode_plan()?,
         Some(listener),
         Some(control_grant),
@@ -274,7 +239,7 @@ pub(super) async fn run_with_external_clients(
         carrier_bytes: Vec::new(),
         stream_bytes: BTreeMap::new(),
     };
-    let result = tokio::time::timeout(Duration::from_secs(5), async {
+    let result = tokio::time::timeout(super::STEP_WAIT, async {
         exercise_transport(&mut guest).await?;
         lifecycle.wait_for_agent_ready().await;
         Ok(())
@@ -283,7 +248,7 @@ pub(super) async fn run_with_external_clients(
     .map_err(wasmtime::Error::from)
     .and_then(std::convert::identity);
     let closed = teardown
-        .wait_until(Instant::now() + Duration::from_secs(5))
+        .wait_until(Instant::now() + super::STEP_WAIT)
         .await
         .map_err(wasmtime::Error::msg);
     let _ = finished.send(());

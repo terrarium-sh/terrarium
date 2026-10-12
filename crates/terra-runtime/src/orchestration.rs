@@ -95,7 +95,7 @@ pub async fn prepare(mut input: VmInput) -> Result<PreparedVm, String> {
         InterruptMode::SoftwareIoapic => {
             let controller = input
                 .artifacts
-                .interrupt_controller()
+                .interrupt_controller
                 .deserialize(runtime.store.engine())
                 .map_err(|error| error.to_string())?;
             let inject = Arc::clone(&native_handle);
@@ -144,7 +144,7 @@ pub async fn prepare(mut input: VmInput) -> Result<PreparedVm, String> {
         InterruptMode::X86IrqLines => {
             let controller = input
                 .artifacts
-                .interrupt_controller()
+                .interrupt_controller
                 .deserialize(runtime.store.engine())
                 .map_err(|error| error.to_string())?;
             let inject = Arc::clone(&native_handle);
@@ -376,7 +376,7 @@ async fn boot_prepared<M: crate::component::vmm::VirtualMachine>(
     crate::box_runtime::BoxRuntime,
     crate::component::vmm::MachineHandle<M>,
 )> {
-    let boot = input.artifacts.boot().deserialize(runtime.store.engine())?;
+    let boot = input.artifacts.boot.deserialize(runtime.store.engine())?;
     let entry = runtime
         .boot_prepared_machine(
             &boot,
@@ -446,8 +446,8 @@ mod tests {
                 )
                 .is_ok()
         );
-        let (request_sink, requests) = relay::channel(relay::MMIO_CAPACITY);
-        let (replies, reply_stream) = relay::channel(relay::MMIO_CAPACITY);
+        let (request_sink, requests) = relay::channel(crate::component::mmio::RELAY_CAPACITY);
+        let (replies, reply_stream) = relay::channel(crate::component::mmio::RELAY_CAPACITY);
         let bridge = crate::component::mmio::bridge::create_component_loop(
             crate::component::mmio::bridge::BridgeContext {
                 devices: instance.devices,

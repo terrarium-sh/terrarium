@@ -69,8 +69,7 @@ binary and installs it at `~/.terra/config/seccomp`, keeping any previous
 bundle as `seccomp.previous`. A bundle matches one executable, so reinstall
 both together after a manual upgrade. Terra does not search beside the
 executable; set `vm.sandbox.policy` to use another bundle directory.
-Without a selected bundle, Terra uses its built-in role policies; set
-`vm.sandbox.allow_fallback: false` to require a bundle. See
+Without a bundle, Terra uses its built-in role policies. See
 [host VM launchers](vm-launchers.md) for configuration details.
 
 ## List boxes

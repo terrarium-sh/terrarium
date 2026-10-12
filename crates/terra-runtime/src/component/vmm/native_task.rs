@@ -1,7 +1,7 @@
 //! Run native cleanup independently of waiting tasks.
 
 use std::sync::{Arc, Mutex, Once};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use tokio::sync::watch;
 
@@ -107,8 +107,9 @@ impl<O: Clone + Send + Sync + 'static> NativeTask<O> {
             .ok_or_else(|| "native task outcome missing".to_owned())?
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn wait(&self) -> Outcome<O> {
-        self.wait_until(Instant::now() + Duration::from_secs(10))
+        self.wait_until(Instant::now() + std::time::Duration::from_secs(10))
             .await
     }
 
@@ -127,6 +128,7 @@ impl<O: Clone + Send + Sync + 'static> NativeTask<O> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     #[tokio::test]
     async fn stalled_cleanup_releases_the_state_lock_for_other_waiters() {

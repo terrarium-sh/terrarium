@@ -8,9 +8,30 @@ pub mod interrupt_controller;
 pub mod mem;
 pub mod mmio;
 pub mod network;
-pub(crate) mod relay;
+pub mod relay;
 pub mod vmm;
 pub mod vsock;
+
+/// Whether a disk or share grant lets the guest write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccessMode {
+    ReadOnly,
+    ReadWrite,
+}
+
+impl AccessMode {
+    #[must_use]
+    pub const fn is_read_only(self) -> bool {
+        matches!(self, Self::ReadOnly)
+    }
+}
+
+pub(crate) fn recorded_failure(failure: &std::sync::Mutex<Option<String>>) -> Option<String> {
+    failure
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
 
 pub type InterruptCallback = std::sync::Arc<dyn Fn(bool) -> wasmtime::Result<()> + Send + Sync>;
 

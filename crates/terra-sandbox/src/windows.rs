@@ -10,36 +10,35 @@ use anyhow::{Context, Result, bail, ensure};
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{Read, Write};
+use std::net::ToSocketAddrs;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode};
 use std::time::{Duration, Instant};
 use terra_platform::process;
-use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::Security::{
     GetTokenInformation, TOKEN_QUERY, TokenHasRestrictions, TokenIsAppContainer,
 };
 use windows_sys::Win32::System::JobObjects::IsProcessInJob;
 use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+use windows_sys::Win32::System::SystemInformation::{ComputerNameDnsHostname, GetComputerNameExW};
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetExitCodeProcess, INFINITE, OpenProcess,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, ResumeThread, WaitForMultipleObjects,
     WaitForSingleObject,
 };
 
-const SCHEMA_VERSION: u32 = 1;
-const MAX_POLICY_BYTES: u64 = 16 << 10;
 const MAX_SPEC_BYTES: u64 = 1 << 20;
 const BROKER_COMMIT_LIMIT_BYTES: usize = 512 << 20;
+use terra_platform::process::sandbox_env::{APP_CONTAINER_MODE, WINDOWS_MODE, WINDOWS_ROLE};
+
 const SPEC_ENV: &str = "TERRA_WINDOWS_SANDBOX_SPEC";
 const IDENTITY_ENV: &str = "TERRA_WINDOWS_SANDBOX_IDENTITY";
 const PARENT_ENV: &str = "TERRA_WINDOWS_SANDBOX_PARENT";
-const MODE_ENV: &str = "TERRA_WINDOWS_SANDBOX_MODE";
-const ROLE_ENV: &str = "TERRA_WINDOWS_SANDBOX_ROLE";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
     Supervisor,
     AppContainer,
@@ -50,16 +49,13 @@ impl Mode {
     const fn name(self) -> &'static str {
         match self {
             Self::Supervisor => "supervisor",
-            Self::AppContainer => "app_container",
+            Self::AppContainer => APP_CONTAINER_MODE,
             Self::RestrictedTokenJob => "restricted_token_job",
         }
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Policy {
-    schema_version: u32,
     role: Role,
     mode: Mode,
     less_privileged: bool,
@@ -67,24 +63,21 @@ struct Policy {
 }
 
 impl Policy {
-    const fn builtin(role: Role) -> Self {
+    const fn for_role(role: Role) -> Self {
         match role {
             Role::Supervisor => Self {
-                schema_version: SCHEMA_VERSION,
                 role,
                 mode: Mode::Supervisor,
                 less_privileged: false,
                 memory_limit_bytes: 0,
             },
             Role::Vm => Self {
-                schema_version: SCHEMA_VERSION,
                 role,
                 mode: Mode::AppContainer,
                 less_privileged: true,
                 memory_limit_bytes: 0,
             },
             Role::Network => Self {
-                schema_version: SCHEMA_VERSION,
                 role,
                 mode: Mode::RestrictedTokenJob,
                 less_privileged: false,
@@ -92,55 +85,12 @@ impl Policy {
             },
         }
     }
-
-    fn decode(bytes: &[u8], role: Role) -> Result<Self> {
-        ensure!(
-            bytes.len() as u64 <= MAX_POLICY_BYTES,
-            "Windows sandbox policy exceeds its size limit"
-        );
-        let policy: Self =
-            serde_json::from_slice(bytes).context("invalid Windows sandbox policy")?;
-        ensure!(
-            policy.schema_version == SCHEMA_VERSION,
-            "unsupported Windows sandbox policy version"
-        );
-        ensure!(
-            policy.role == role,
-            "Windows sandbox policy role must be {}",
-            role.name()
-        );
-        match (role, policy.mode) {
-            (Role::Supervisor, Mode::Supervisor)
-            | (Role::Vm, Mode::AppContainer | Mode::RestrictedTokenJob)
-            | (Role::Network, Mode::RestrictedTokenJob) => {}
-            (Role::Network, Mode::AppContainer) => {
-                bail!("Windows network broker AppContainer mode is unsupported")
-            }
-            (Role::Supervisor, Mode::AppContainer | Mode::RestrictedTokenJob)
-            | (Role::Vm | Role::Network, Mode::Supervisor) => {
-                bail!("invalid Windows sandbox mode for {}", role.name())
-            }
-        }
-        ensure!(
-            policy.mode == Mode::AppContainer || !policy.less_privileged,
-            "less_privileged requires app_container mode"
-        );
-        ensure!(
-            role != Role::Supervisor || policy.memory_limit_bytes == 0,
-            "supervisor sandbox memory limit must be zero"
-        );
-        ensure!(
-            role != Role::Network || policy.memory_limit_bytes >= 64 << 20,
-            "network sandbox memory limit must be at least 64 MiB"
-        );
-        Ok(policy)
-    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkerSpec {
-    policy: Policy,
+    role: Role,
     grants: Vec<WorkerGrant>,
 }
 
@@ -165,19 +115,13 @@ pub fn prepare_launch(launch: Launch<'_>) -> Result<PreparedLaunch> {
         launch.role != Role::Supervisor,
         "supervisor confinement is installed after launching workers"
     );
-    let policy = launch
-        .policy
-        .context("Windows sandbox launch requires its role policy")?;
-    let policy = Policy::decode(policy, launch.role)?;
-    if launch.role == Role::Vm && policy.mode == Mode::RestrictedTokenJob {
-        log::warn!(
-            "Windows VM restricted_token_job mode permits native host networking; select app_container for native network denial"
-        );
-    }
     let (grants, trusted_directories) = build_worker_grants(launch.grants)?;
     let executable = std::fs::canonicalize(launch.command.get_program())
         .context("resolving Windows sandbox worker executable")?;
-    let bytes = serde_json::to_vec(&WorkerSpec { policy, grants })?;
+    let bytes = serde_json::to_vec(&WorkerSpec {
+        role: launch.role,
+        grants,
+    })?;
     ensure!(
         bytes.len() as u64 <= MAX_SPEC_BYTES,
         "Windows sandbox launch specification exceeds its size limit"
@@ -329,52 +273,62 @@ fn read_identity(
     }
 }
 
-pub fn resolve_policy(path: Option<&Path>, _allow_fallback: bool) -> Result<PolicyBundle> {
-    if let Some(path) = path {
-        ensure!(
-            path.is_dir(),
-            "Windows sandbox policy must be a directory containing supervisor.sandbox.json, vm.sandbox.json, and network.sandbox.json"
-        );
-    }
-    PolicyBundle::try_from_roles(|role| {
-        let bytes = if let Some(path) = path {
-            let filename = path.join(format!("{}.sandbox.json", role.name()));
-            let mut bytes = Vec::new();
-            File::open(&filename)
-                .with_context(|| format!("opening {}", filename.display()))?
-                .take(MAX_POLICY_BYTES + 1)
-                .read_to_end(&mut bytes)?;
-            bytes
-        } else {
-            serde_json::to_vec(&Policy::builtin(role))?
-        };
-        Policy::decode(&bytes, role)?;
-        Ok(bytes)
-    })
-}
-
-pub(super) fn uses_app_container(policy: &[u8], role: Role) -> Result<bool> {
-    Ok(Policy::decode(policy, role)?.mode == Mode::AppContainer)
+pub fn resolve_policy(policy: Option<&Path>) -> Result<PolicyBundle> {
+    ensure!(
+        policy.is_none(),
+        "Windows uses its built-in sandbox role policies; remove vm.sandbox.policy (seccomp bundles are Linux-only)"
+    );
+    PolicyBundle::try_from_roles(|_| Ok(Vec::new()))
 }
 
 pub fn role_grants(_role: Role) -> Vec<Grant> {
     Vec::new()
 }
 
-pub fn install_policy(bytes: &[u8]) -> Result<()> {
-    Policy::decode(bytes, Role::Supervisor)?;
+/// The Windows supervisor stays unconfined; each worker's token and job carry its authority.
+pub fn install_policy(_policy: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn is_access_denied(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.raw_os_error() == i32::try_from(ERROR_ACCESS_DENIED).ok())
+}
+
 pub fn verify_worker_role(role: Role) -> Result<()> {
-    let Some(declared_role) = std::env::var_os(ROLE_ENV) else {
+    let Some(declared_role) = std::env::var_os(WINDOWS_ROLE) else {
         return Ok(());
     };
     ensure!(
         declared_role == role.name(),
         "Windows sandbox launch role differs from worker entrypoint"
     );
-    let token = api::open_current_token(TOKEN_QUERY)?;
+    let mode = std::env::var(WINDOWS_MODE)?;
+    match api::open_current_token(TOKEN_QUERY) {
+        Ok(token) => verify_worker_token(&token, role, &mode)?,
+        // The broker's ALL APPLICATION PACKAGES restriction denies reading its
+        // own token object; create_restricted_token verified the restricting
+        // SIDs before the launch.
+        Err(error)
+            if role == Role::Network
+                && mode == Mode::RestrictedTokenJob.name()
+                && is_access_denied(&error) => {}
+        Err(error) => return Err(error),
+    }
+    let mut in_job = 0;
+    // SAFETY: the current process pseudo-handle is valid and in_job is writable.
+    api::win_ok(unsafe {
+        IsProcessInJob(GetCurrentProcess(), std::ptr::null_mut(), &raw mut in_job)
+    })?;
+    ensure!(
+        in_job != 0,
+        "Windows sandbox worker is outside its lifetime job"
+    );
+    Ok(())
+}
+
+fn verify_worker_token(token: &OwnedHandle, role: Role, mode: &str) -> Result<()> {
     let mut is_app_container = 0_u32;
     let mut returned = 0;
     // SAFETY: token is live and the output is a correctly sized DWORD.
@@ -387,13 +341,13 @@ pub fn verify_worker_role(role: Role) -> Result<()> {
             &raw mut returned,
         )
     })?;
-    match std::env::var(MODE_ENV)?.as_str() {
-        "app_container" => {
+    match mode {
+        APP_CONTAINER_MODE => {
             ensure!(
                 is_app_container != 0,
                 "Windows worker lacks its AppContainer token"
             );
-            api::verify_capabilities(&token, role)?;
+            api::verify_capabilities(token, role)?;
         }
         "restricted_token_job" => {
             ensure!(
@@ -422,14 +376,26 @@ pub fn verify_worker_role(role: Role) -> Result<()> {
         ),
         mode => bail!("unknown Windows sandbox mode {mode}"),
     }
-    let mut in_job = 0;
-    // SAFETY: the current process pseudo-handle is valid and in_job is writable.
+    Ok(())
+}
+
+/// Resolves this computer's DNS host name through the system resolver, the
+/// path the broker's name lookups take.
+pub fn resolve_computer_name() -> Result<()> {
+    let mut name = [0_u16; 256];
+    let mut length = u32::try_from(name.len())?;
+    // SAFETY: name holds length UTF-16 units and length is writable.
     api::win_ok(unsafe {
-        IsProcessInJob(GetCurrentProcess(), std::ptr::null_mut(), &raw mut in_job)
+        GetComputerNameExW(ComputerNameDnsHostname, name.as_mut_ptr(), &raw mut length)
     })?;
+    let name = String::from_utf16(&name[..usize::try_from(length)?])?;
     ensure!(
-        in_job != 0,
-        "Windows sandbox worker is outside its lifetime job"
+        (name.as_str(), 0)
+            .to_socket_addrs()
+            .with_context(|| format!("resolving {name}"))?
+            .next()
+            .is_some(),
+        "resolving {name} returned no addresses"
     );
     Ok(())
 }
@@ -441,7 +407,7 @@ pub fn run_launcher_worker(arguments: impl Iterator<Item = OsString>) -> Result<
             arguments.eq([OsString::from("--version")]),
             "invalid Windows sandbox version arguments"
         );
-        println!("terra Windows sandbox {SCHEMA_VERSION}");
+        println!("terra Windows sandbox {}", env!("CARGO_PKG_VERSION"));
         return Ok(ExitCode::SUCCESS);
     }
     ensure!(
@@ -469,9 +435,7 @@ fn load_worker_spec() -> Result<WorkerSpec> {
         bytes.len() as u64 <= MAX_SPEC_BYTES,
         "Windows sandbox launch specification exceeds its size limit"
     );
-    let spec: WorkerSpec = serde_json::from_slice(&bytes)?;
-    Policy::decode(&serde_json::to_vec(&spec.policy)?, spec.policy.role)?;
-    Ok(spec)
+    Ok(serde_json::from_slice(&bytes)?)
 }
 
 fn run_worker(
@@ -490,12 +454,13 @@ fn run_worker(
             "Windows sandbox parent has exited"
         );
     }
-    std::env::var(ROLE_ENV).ok().map_or(Ok(()), |_| {
+    std::env::var(WINDOWS_ROLE).ok().map_or(Ok(()), |_| {
         bail!("a sandbox worker cannot run the trusted launcher")
     })?;
-    let job = api::create_worker_job(spec.policy.memory_limit_bytes)?;
-    let profile = if spec.policy.mode == Mode::AppContainer {
-        Some(api::Profile::create(spec.policy.role)?)
+    let policy = Policy::for_role(spec.role);
+    let job = api::create_worker_job(policy.memory_limit_bytes)?;
+    let profile = if policy.mode == Mode::AppContainer {
+        Some(api::Profile::create(policy.role)?)
     } else {
         None
     };
@@ -509,7 +474,7 @@ fn run_worker(
             grants.add(&grant.path, grant.writable)?;
         }
     }
-    let worker = api::spawn_worker(executable, arguments, &spec.policy, profile.as_ref(), &job)?;
+    let worker = api::spawn_worker(executable, arguments, &policy, profile.as_ref(), &job)?;
     if let Some(parent) = &parent {
         // SAFETY: parent remains live; a signaled handle prevents resuming the already job-confined child.
         ensure!(
@@ -545,7 +510,7 @@ fn run_worker(
             }
         }
     }
-    if spec.policy.role == Role::Vm
+    if spec.role == Role::Vm
         && let Some(lock) = process::inherited_handle(process::LOCK_HANDLE_VARIABLE)?
     {
         // SAFETY: the actual VM inherited the lock; the trusted wrapper releases its extra kernel handle.
@@ -630,12 +595,11 @@ mod tests {
         }
 
         let executable = std::env::current_exe()?;
-        let policy = serde_json::to_vec(&Policy::builtin(Role::Vm))?;
         let prepared = prepare_launch(Launch {
             role: Role::Vm,
             command: Command::new(&executable),
             grants: vec![Grant::new(&executable, Access::ReadOnly)],
-            policy: Some(&policy),
+            policy: None,
             staging_directory: &std::env::temp_dir(),
         })?;
         let mut command = Command::new(&executable);
@@ -654,34 +618,6 @@ mod tests {
         let output = command.output()?;
         assert!(output.status.success(), "{output:?}");
         Ok(())
-    }
-
-    #[test]
-    fn role_policies_keep_network_authority_in_the_broker() {
-        for role in Role::ALL {
-            let policy = Policy::builtin(role);
-            let bytes = serde_json::to_vec(&policy).unwrap();
-            assert!(Policy::decode(&bytes, role).is_ok());
-            for other in Role::ALL {
-                if role != other {
-                    assert!(Policy::decode(&bytes, other).is_err());
-                }
-            }
-        }
-        let mut policy = Policy::builtin(Role::Network);
-        assert_eq!(policy.mode, Mode::RestrictedTokenJob);
-        policy.mode = Mode::AppContainer;
-        policy.less_privileged = true;
-        assert!(Policy::decode(&serde_json::to_vec(&policy).unwrap(), Role::Network).is_err());
-    }
-
-    #[test]
-    fn restricted_vm_mode_requires_an_explicit_policy() {
-        assert_eq!(Policy::builtin(Role::Vm).mode, Mode::AppContainer);
-        let mut policy = Policy::builtin(Role::Vm);
-        policy.mode = Mode::RestrictedTokenJob;
-        policy.less_privileged = false;
-        assert!(Policy::decode(&serde_json::to_vec(&policy).unwrap(), Role::Vm).is_ok());
     }
 
     fn group_digits(value: usize) -> String {
@@ -708,10 +644,6 @@ mod tests {
         for quote in [
             format!("{}-MiB commit limit", BROKER_COMMIT_LIMIT_BYTES >> 20),
             format!(
-                "broker `restricted_token_job`, {}-byte limit",
-                group_digits(BROKER_COMMIT_LIMIT_BYTES)
-            ),
-            format!(
                 "a launch may grant at most {} objects",
                 group_digits(acl::MAX_GRANTED_OBJECTS)
             ),
@@ -720,24 +652,11 @@ mod tests {
         }
     }
 
+    /// An ignored override would leave the operator believing a custom policy applies.
     #[test]
-    fn supervisor_policy_rejects_unenforced_memory_limits() {
-        let mut policy = Policy::builtin(Role::Supervisor);
-        policy.memory_limit_bytes = BROKER_COMMIT_LIMIT_BYTES;
-        assert!(Policy::decode(&serde_json::to_vec(&policy).unwrap(), Role::Supervisor).is_err());
-    }
-
-    #[test]
-    fn policy_bundle_reports_the_validated_app_container_mode() {
-        let mut policies = resolve_policy(None, true).unwrap();
-        assert!(policies.uses_app_container(Role::Vm).unwrap());
-        assert!(!policies.uses_app_container(Role::Network).unwrap());
-        assert!(!policies.uses_app_container(Role::Supervisor).unwrap());
-        let mut restricted = Policy::builtin(Role::Vm);
-        restricted.mode = Mode::RestrictedTokenJob;
-        restricted.less_privileged = false;
-        policies.vm = serde_json::to_vec(&restricted).unwrap();
-        assert!(!policies.uses_app_container(Role::Vm).unwrap());
+    fn policy_override_is_a_configuration_error() {
+        assert!(resolve_policy(Some(Path::new("policies"))).is_err());
+        assert!(resolve_policy(None).is_ok());
     }
 
     #[test]
@@ -769,7 +688,6 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let address = listener.local_addr()?;
         drop(TcpStream::connect(address)?);
-        let policies = resolve_policy(None, true)?;
         for role in [Role::Vm, Role::Network] {
             let mut worker_command = Command::new(&executable);
             worker_command
@@ -793,16 +711,11 @@ mod tests {
                     Grant::new(&protected, Access::ReadOnly),
                 ]);
             }
-            let policy = match role {
-                Role::Vm => &policies.vm,
-                Role::Network => &policies.network,
-                Role::Supervisor => unreachable!(),
-            };
             let mut prepared = prepare_launch(Launch {
                 role,
                 command: worker_command,
                 grants,
-                policy: Some(policy),
+                policy: None,
                 staging_directory: &std::env::temp_dir(),
             })?;
             let mut command = Command::new(&wrapper);
@@ -839,7 +752,7 @@ mod tests {
     fn native_role_probe() -> Result<()> {
         use std::net::{SocketAddr, TcpStream, UdpSocket};
 
-        let role = match std::env::var(ROLE_ENV)?.as_str() {
+        let role = match std::env::var(WINDOWS_ROLE)?.as_str() {
             "vm" => Role::Vm,
             "network" => Role::Network,
             other => bail!("unexpected native test role {other}"),
@@ -895,12 +808,17 @@ mod tests {
                 );
             }
             Role::Network => {
+                ensure!(
+                    std::fs::read(&outside).is_err(),
+                    "restricted-token broker read a host file outside its grants"
+                );
                 let address: SocketAddr = std::env::var("TERRA_WINDOWS_TEST_ADDRESS")?.parse()?;
                 TcpStream::connect_timeout(&address, Duration::from_secs(1))
                     .context("restricted-token broker cannot use native loopback sockets")?;
                 UdpSocket::bind("127.0.0.1:0")
                     .and_then(|socket| socket.send_to(b"probe", address))
                     .context("restricted-token broker cannot send native loopback datagrams")?;
+                resolve_computer_name().context("restricted-token broker cannot resolve names")?;
             }
             Role::Supervisor => bail!("supervisor cannot run a worker probe"),
         }

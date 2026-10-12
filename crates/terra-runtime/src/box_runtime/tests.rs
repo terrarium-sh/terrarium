@@ -7,6 +7,7 @@ use std::time::Duration;
 use super::store::BoxHost;
 use super::{BoxRuntime, BoxRuntimeHandle, MAX_BOX_COMPONENTS};
 
+use crate::component::AccessMode;
 use crate::component::context::DeviceContext;
 use crate::component::vmm::lifecycle::Outcome;
 use crate::engine::device_engine;
@@ -68,7 +69,7 @@ fn empty_child_stores_cannot_bypass_box_capacity() {
         let child = root.new_child(crate::component::block::BlockHost::new(
             crate::memory::GuestRam::new(4096).unwrap(),
             crate::component::block::backing::DiskGrant::Mem(
-                crate::component::block::backing::BoundedDisk::new(0, false),
+                crate::component::block::backing::BoundedDisk::new(0, AccessMode::ReadWrite),
             ),
         ));
         root.attach_child(child).expect("available slot");
@@ -671,7 +672,11 @@ fn dropping_a_box_moves_filesystem_resource_cleanup_off_the_caller() {
     let runtime = BoxRuntime::new(&engine, BoxHost::new()).unwrap();
     let mut filesystem = crate::component::fs::FsHost::new(
         DeviceContext::new(4096).unwrap(),
-        crate::component::fs::ShareGrant::new(&root.path().canonicalize().unwrap(), false).unwrap(),
+        crate::component::fs::ShareGrant::new(
+            &root.path().canonicalize().unwrap(),
+            AccessMode::ReadWrite,
+        )
+        .unwrap(),
     );
     let (started, ready) = std::sync::mpsc::channel();
     let (release, blocked) = std::sync::mpsc::channel();

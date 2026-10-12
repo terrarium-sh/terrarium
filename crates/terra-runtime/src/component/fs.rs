@@ -27,6 +27,8 @@ pub use host::{FsHost, fs_component_linker};
 
 pub(crate) const MAX_BLOCKING_THREADS: usize = 33;
 
+const WASI_FILESYSTEM_TYPES: &str = "wasi:filesystem/types@0.3.0";
+
 pub(crate) struct FilesystemRuntime {
     runtime: Option<tokio::runtime::Runtime>,
     handle: tokio::runtime::Handle,
@@ -167,6 +169,6 @@ async fn create_worker(
         interrupt,
     };
     let serve = instance.terra_mmio_device().func_serve();
-    device_loop.register(&mut child, wake, "fs")?;
+    device_loop.register(&mut child, wake, DeviceKind::Fs)?;
     Ok((child, serve))
 }

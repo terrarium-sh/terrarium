@@ -22,7 +22,7 @@ pub(super) fn add<T: Send + 'static>(
     linker: &mut wasmtime::component::Linker<T>,
     filesystem: for<'a> fn(&'a mut T) -> wasmtime_wasi::filesystem::WasiFilesystemCtxView<'a>,
 ) -> wasmtime::Result<()> {
-    let mut interface = linker.instance("wasi:filesystem/types@0.3.0")?;
+    let mut interface = linker.instance(super::WASI_FILESYSTEM_TYPES)?;
     interface.func_wrap(
         "[method]descriptor.read-via-stream",
         move |store, (descriptor, offset): (Resource<Descriptor>, types::Filesize)| {

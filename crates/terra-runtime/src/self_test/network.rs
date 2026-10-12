@@ -17,7 +17,7 @@ use terra_protocol::vsock::{
     AGENT_PORT, CONTROL_PORT, FLOW_REPLY_BYTES, PUBLICATION_PORT, TCP_PORT, UDP_PORT,
 };
 
-const WAIT: Duration = Duration::from_secs(5);
+use super::STEP_WAIT;
 const STALLED_TCP_COUNT: usize = 8;
 const UDP_BURST_DATAGRAMS: usize = terra_protocol::network::MAX_NETWORK_DATAGRAMS + 1;
 const UDP_SEGMENT_BYTES: u16 = 1200;
@@ -33,7 +33,7 @@ pub(super) async fn run(
     let result = run_with_backend(artifacts, engine, backend, servers.endpoints).await;
     let served = servers.finish();
     client.disconnect();
-    let stopped = tokio::time::timeout(WAIT, broker).await;
+    let stopped = tokio::time::timeout(STEP_WAIT, broker).await;
     result?;
     served?;
     require_broker_peer_shutdown(stopped??)?;
@@ -192,7 +192,7 @@ impl TestServers {
         };
         tcp.set_nonblocking(true)?;
         udp.set_read_timeout(Some(super::FIXTURE_STARTUP_WAIT))?;
-        udp.set_write_timeout(Some(WAIT))?;
+        udp.set_write_timeout(Some(STEP_WAIT))?;
         let endpoints = Endpoints {
             tcp: tcp.local_addr()?.port(),
             udp: udp.local_addr()?.port(),
@@ -200,7 +200,7 @@ impl TestServers {
         };
         tcp6.set_nonblocking(true)?;
         udp6.set_read_timeout(Some(super::FIXTURE_STARTUP_WAIT))?;
-        udp6.set_write_timeout(Some(WAIT))?;
+        udp6.set_write_timeout(Some(STEP_WAIT))?;
         let tcp_ipv6 = std::thread::spawn(move || {
             let mut stream = accept_stream(&tcp6, super::FIXTURE_STARTUP_WAIT)?;
             wasmtime::ensure!(
@@ -379,13 +379,13 @@ fn serve_udp(udp: &UdpSocket) -> wasmtime::Result<()> {
         );
         if socket_peer.is_none() {
             let unsolicited_sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
-            unsolicited_sender.set_write_timeout(Some(WAIT))?;
+            unsolicited_sender.set_write_timeout(Some(STEP_WAIT))?;
             for _ in 0..UDP_BURST_DATAGRAMS {
                 unsolicited_sender.send_to(b"unsolicited", peer)?;
             }
         }
         socket_peer = Some(peer);
-        udp.set_read_timeout(Some(WAIT))?;
+        udp.set_read_timeout(Some(STEP_WAIT))?;
         udp.send_to(payload, peer)?;
     }
     let mut burst = Vec::new();
@@ -433,7 +433,7 @@ fn udp_segment(index: usize, length: usize) -> Vec<u8> {
 fn serve_tcp(listener: &TcpListener, published: u16) -> wasmtime::Result<()> {
     let mut stalled = accept_stream(listener, super::FIXTURE_STARTUP_WAIT)?;
     stalled.write_all(&vec![37; 24 * 1024])?;
-    let mut stream = accept_stream(listener, WAIT)?;
+    let mut stream = accept_stream(listener, STEP_WAIT)?;
     let expected = build_tcp_payload();
     let mut request = vec![0; expected.len()];
     stream.read_exact(&mut request)?;
@@ -444,7 +444,7 @@ fn serve_tcp(listener: &TcpListener, published: u16) -> wasmtime::Result<()> {
     stream.shutdown(Shutdown::Write)?;
     for _ in 0..2 {
         let mut stream =
-            TcpStream::connect_timeout(&(Ipv4Addr::LOCALHOST, published).into(), WAIT)?;
+            TcpStream::connect_timeout(&(Ipv4Addr::LOCALHOST, published).into(), STEP_WAIT)?;
         configure_stream(&stream)?;
         stream.write_all(&expected)?;
         stream.shutdown(Shutdown::Write)?;
@@ -468,7 +468,7 @@ fn serve_tcp(listener: &TcpListener, published: u16) -> wasmtime::Result<()> {
     );
     serve_reopened_published_udp(published)?;
     drop(retired_udp_peer);
-    let mut stream = accept_stream(listener, WAIT)?;
+    let mut stream = accept_stream(listener, STEP_WAIT)?;
     stream.write_all(b"reset-reply")?;
     wasmtime::ensure!(
         stream.read(&mut eof)? == 0,
@@ -480,7 +480,7 @@ fn serve_tcp(listener: &TcpListener, published: u16) -> wasmtime::Result<()> {
 }
 
 fn serve_tcp_half_closes(listener: &TcpListener) -> wasmtime::Result<()> {
-    let mut stream = accept_stream(listener, WAIT)?;
+    let mut stream = accept_stream(listener, STEP_WAIT)?;
     stream.shutdown(Shutdown::Write)?;
     let mut observed_fin = [0];
     stream.read_exact(&mut observed_fin)?;
@@ -496,7 +496,7 @@ fn serve_tcp_half_closes(listener: &TcpListener) -> wasmtime::Result<()> {
     let stream = tokio::net::TcpSocket::from_std_stream(stream);
     stream.set_zero_linger()?;
     drop(stream);
-    let mut stream = accept_stream(listener, WAIT)?;
+    let mut stream = accept_stream(listener, STEP_WAIT)?;
     stream.write_all(&vec![
         83;
         2 * terra_protocol::network::MAX_NETWORK_READ_BYTES + 1
@@ -525,8 +525,8 @@ fn serve_published_udp(port: u16) -> wasmtime::Result<UdpSocket> {
         b"published-ipv6".to_vec(),
     ];
     for (client, payload) in clients.iter().zip(&payloads) {
-        client.set_read_timeout(Some(WAIT))?;
-        client.set_write_timeout(Some(WAIT))?;
+        client.set_read_timeout(Some(STEP_WAIT))?;
+        client.set_write_timeout(Some(STEP_WAIT))?;
         client.send_to(
             payload,
             std::net::SocketAddr::new(client.local_addr()?.ip(), port),
@@ -559,7 +559,7 @@ fn serve_published_udp(port: u16) -> wasmtime::Result<UdpSocket> {
 
 fn serve_reopened_published_udp(port: u16) -> wasmtime::Result<()> {
     let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
-    client.set_read_timeout(Some(WAIT))?;
+    client.set_read_timeout(Some(STEP_WAIT))?;
     client.send_to(b"publication-reopened", (Ipv4Addr::LOCALHOST, port))?;
     let mut bytes = [0; 32];
     let (length, sender) = client.recv_from(&mut bytes)?;
@@ -588,16 +588,16 @@ fn serve_stalled_streams(listener: &TcpListener) -> wasmtime::Result<()> {
                 let admission_wait = if streams.is_empty() {
                     super::FIXTURE_STARTUP_WAIT
                 } else {
-                    WAIT
+                    STEP_WAIT
                 };
                 let (mut stream, _) =
                     tokio::time::timeout(admission_wait, listener.accept()).await??;
-                tokio::time::timeout(WAIT, stream.write_all(&payload)).await??;
+                tokio::time::timeout(STEP_WAIT, stream.write_all(&payload)).await??;
                 streams.push(stream);
             }
             for mut stream in streams {
                 let mut byte = [0];
-                let closed = tokio::time::timeout(WAIT, stream.read(&mut byte)).await?;
+                let closed = tokio::time::timeout(STEP_WAIT, stream.read(&mut byte)).await?;
                 wasmtime::ensure!(
                     matches!(closed, Ok(0))
                         || closed.is_err_and(|error| {
@@ -611,7 +611,7 @@ fn serve_stalled_streams(listener: &TcpListener) -> wasmtime::Result<()> {
 }
 
 /// `wait` is `FIXTURE_STARTUP_WAIT` for a server's first client: servers start before the
-/// guest, whose earlier self-test stages can take longer than `WAIT` under tracing or load.
+/// guest, whose earlier self-test stages can take longer than `STEP_WAIT` under tracing or load.
 fn accept_stream(listener: &TcpListener, wait: Duration) -> wasmtime::Result<TcpStream> {
     let deadline = Instant::now() + wait;
     let stream = loop {
@@ -633,8 +633,8 @@ fn accept_stream(listener: &TcpListener, wait: Duration) -> wasmtime::Result<Tcp
 
 fn configure_stream(stream: &TcpStream) -> wasmtime::Result<()> {
     stream.set_nonblocking(false)?;
-    stream.set_read_timeout(Some(WAIT))?;
-    stream.set_write_timeout(Some(WAIT))?;
+    stream.set_read_timeout(Some(STEP_WAIT))?;
+    stream.set_write_timeout(Some(STEP_WAIT))?;
     stream.set_nodelay(true)?;
     Ok(())
 }
@@ -820,7 +820,7 @@ async fn start_guest(
     let device = crate::component::vsock::register_device(
         &mut runtime,
         ram.clone(),
-        artifacts.vsock(),
+        artifacts.vsock_frontend,
         streams,
         Some(backend),
         mappings,
@@ -869,7 +869,7 @@ async fn run_dns_fallback(
     .await;
     let _ = stop.send(());
     client.disconnect();
-    let served = tokio::time::timeout(WAIT, broker_task).await??;
+    let served = tokio::time::timeout(STEP_WAIT, broker_task).await??;
     result?;
     served
 }
@@ -1599,12 +1599,12 @@ mod tests {
     }
 
     /// The host self-test starts these servers before its boot, vsock, storage and filesystem
-    /// stages; a server that gave up after `WAIT` refused the guest's later connection under
+    /// stages; a server that gave up after `STEP_WAIT` refused the guest's later connection under
     /// tracing or load.
     #[test]
     fn test_servers_outlive_earlier_self_test_stages() {
         let servers = TestServers::start().unwrap();
-        std::thread::sleep(WAIT + Duration::from_secs(1));
+        std::thread::sleep(STEP_WAIT + Duration::from_secs(1));
         let endpoints = servers.endpoints;
         TcpStream::connect((Ipv4Addr::LOCALHOST, endpoints.tcp)).unwrap();
         TcpStream::connect((std::net::Ipv6Addr::LOCALHOST, endpoints.tcp)).unwrap();
@@ -1619,8 +1619,8 @@ mod tests {
         const WINDOWS: [usize; 2] = [1, 32];
 
         let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        socket.set_read_timeout(Some(WAIT)).unwrap();
-        socket.set_write_timeout(Some(WAIT)).unwrap();
+        socket.set_read_timeout(Some(STEP_WAIT)).unwrap();
+        socket.set_write_timeout(Some(STEP_WAIT)).unwrap();
         let reserved = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let endpoints = Endpoints {
             tcp: 9,
@@ -1691,7 +1691,7 @@ mod tests {
         server.join().unwrap();
         client.disconnect();
         require_broker_peer_shutdown(
-            tokio::time::timeout(WAIT, broker_task)
+            tokio::time::timeout(STEP_WAIT, broker_task)
                 .await
                 .unwrap()
                 .unwrap(),
@@ -1805,7 +1805,7 @@ mod tests {
         server.join().unwrap();
         client.disconnect();
         require_broker_peer_shutdown(
-            tokio::time::timeout(WAIT, broker_task)
+            tokio::time::timeout(STEP_WAIT, broker_task)
                 .await
                 .unwrap()
                 .unwrap(),
@@ -1833,7 +1833,7 @@ mod tests {
         );
         client.disconnect();
         require_broker_peer_shutdown(
-            tokio::time::timeout(WAIT, broker_task)
+            tokio::time::timeout(STEP_WAIT, broker_task)
                 .await
                 .unwrap()
                 .unwrap(),

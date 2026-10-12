@@ -25,6 +25,8 @@ mod macos_policy_tests;
 mod windows;
 #[cfg(windows)]
 use windows as backend;
+#[cfg(windows)]
+pub use windows::resolve_computer_name;
 
 pub use backend::{install_policy, resolve_policy, run_launcher_worker, verify_worker_role};
 
@@ -44,7 +46,7 @@ impl Role {
     pub const fn name(self) -> &'static str {
         match self {
             Self::Supervisor => "supervisor",
-            Self::Vm => "vm",
+            Self::Vm => terra_platform::process::sandbox_env::VM_ROLE,
             Self::Network => "network",
         }
     }
@@ -73,11 +75,6 @@ impl PolicyBundle {
             Role::Vm => &self.vm,
             Role::Network => &self.network,
         }
-    }
-
-    #[cfg(windows)]
-    pub fn uses_app_container(&self, role: Role) -> Result<bool> {
-        windows::uses_app_container(self.get(role), role)
     }
 }
 

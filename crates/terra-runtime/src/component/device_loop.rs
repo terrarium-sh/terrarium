@@ -9,6 +9,7 @@ use super::InterruptCallback;
 use crate::box_runtime::DeviceWorker;
 use crate::box_runtime::store::{StoreHost, StoreState};
 use crate::component::context::DeviceHost;
+use crate::machine::DeviceKind;
 
 pub(crate) struct DeviceLoop<E> {
     pub run: TypedFunc<(), (Result<(), E>,)>,
@@ -20,10 +21,10 @@ impl<E: Lift + std::fmt::Debug + Send + Sync + 'static> DeviceLoop<E> {
         self,
         runtime: &mut DeviceWorker<H>,
         wake: Arc<Notify>,
-        name: &'static str,
+        kind: DeviceKind,
     ) -> wasmtime::Result<()> {
         runtime.register_loop(Box::new(move |accessor| {
-            Box::pin(self.drive(accessor, wake, name))
+            Box::pin(self.drive(accessor, wake, kind))
         }))
     }
 
@@ -31,14 +32,14 @@ impl<E: Lift + std::fmt::Debug + Send + Sync + 'static> DeviceLoop<E> {
         self,
         accessor: &Accessor<StoreState<H>>,
         wake: Arc<Notify>,
-        name: &'static str,
+        kind: DeviceKind,
     ) -> wasmtime::Result<()> {
         let running = self.run.call_concurrent(accessor, ());
         tokio::pin!(running);
         loop {
             let finished = tokio::select! {
                 result = &mut running => {
-                    result?.0.map_err(|error| wasmtime::Error::msg(format!("{name} worker: {error:?}")))?;
+                    result?.0.map_err(|error| wasmtime::Error::msg(format!("{} worker: {error:?}", kind.name())))?;
                     true
                 },
                 () = wake.notified() => false,

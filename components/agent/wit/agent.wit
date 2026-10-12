@@ -1,11 +1,10 @@
 package terra:agent@0.1.0;
 
 interface host-service {
-    enum endpoint-error { closed, io }
     variant event { connected, disconnected, diagnostic(list<u8>), exit(s32), agent-ready }
     resource client {
-        input: func() -> stream<u8>;
-        output: async func(bytes: stream<u8>) -> result<_, endpoint-error>;
+        /// Connects the client once: `output` carries bytes to it, and the returned stream carries its bytes.
+        connect: func(output: stream<u8>) -> stream<u8>;
     }
     listener: func() -> option<stream<own<client>>>;
     plan: func() -> list<u8>;

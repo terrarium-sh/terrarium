@@ -3,7 +3,7 @@
 use crate::component::context::{DeviceContext, DeviceHost};
 use wasmtime::component::ResourceTable;
 use wasmtime::{Engine, ResourceLimiter, Store};
-use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 
 pub const DEFAULT_COMPONENT_MEMORY_MIB: u32 = 16;
 /// Admits every flow the vsock switch allows.
@@ -153,12 +153,7 @@ impl RootHost {
                 lifecycle.native_teardown(),
             ),
             lifecycle,
-            ctx: WasiCtxBuilder::new()
-                .max_random_size(crate::MAX_SINGLE_BYTES)
-                .allow_tcp(false)
-                .allow_udp(false)
-                .allow_ip_name_lookup(false)
-                .build(),
+            ctx: crate::component::context::isolated_wasi_ctx(),
             table: ResourceTable::new(),
         }
     }

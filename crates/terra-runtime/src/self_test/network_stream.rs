@@ -1,7 +1,6 @@
 //! Drive per-socket network streams and raw TCP bytes through the production virtqueues.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::time::Duration;
 
 use terra_protocol::application::{Direction, Message, StreamDecoder};
 use terra_protocol::vsock::{
@@ -10,7 +9,7 @@ use terra_protocol::vsock::{
 
 use super::vsock::GuestVsock;
 
-const WAIT: Duration = Duration::from_secs(5);
+use super::STEP_WAIT;
 
 /// A guest stream endpoint: guest port and host port.
 pub(super) type Stream = (u32, u32);
@@ -108,7 +107,7 @@ impl GuestStream {
         &mut self,
         mut is_ready: impl FnMut(&Self) -> wasmtime::Result<bool>,
     ) -> wasmtime::Result<()> {
-        tokio::time::timeout(WAIT, async {
+        tokio::time::timeout(STEP_WAIT, async {
             loop {
                 self.poll().await?;
                 if is_ready(self)? {

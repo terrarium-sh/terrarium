@@ -1,3 +1,4 @@
+use terra_runtime::component::AccessMode;
 use terra_runtime::component::block::backing::BoundedDisk;
 use terra_runtime::component::block::backing::{BackingError, BlockBacking, FileDisk};
 use terra_runtime::component::context::DeviceContext;
@@ -23,8 +24,8 @@ fn hostile_memory_imports_reject_overflow_and_oversized_copies() {
 fn file_grants_enforce_capacity_and_readonly_independently_of_wasm() {
     let file = tempfile::NamedTempFile::new().unwrap();
     file.as_file().set_len(4096).unwrap();
-    let mut writable = FileDisk::open(file.path(), false).unwrap();
-    let mut readonly = FileDisk::open(file.path(), true).unwrap();
+    let mut writable = FileDisk::open(file.path(), AccessMode::ReadWrite).unwrap();
+    let mut readonly = FileDisk::open(file.path(), AccessMode::ReadOnly).unwrap();
     writable.write_at(4095, &[0xa5]).unwrap();
     for offset in [4096, u64::MAX] {
         assert_eq!(
@@ -51,7 +52,7 @@ fn file_grants_retain_the_opened_file_after_path_replacement() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("disk");
     std::fs::write(&path, [1; 16]).unwrap();
-    let mut disk = FileDisk::open(&path, false).unwrap();
+    let mut disk = FileDisk::open(&path, AccessMode::ReadWrite).unwrap();
     std::fs::rename(&path, directory.path().join("original")).unwrap();
     std::fs::write(&path, [2; 16]).unwrap();
     disk.write_at(0, &[3]).unwrap();
@@ -61,7 +62,7 @@ fn file_grants_retain_the_opened_file_after_path_replacement() {
         3
     );
     let null_device = if cfg!(windows) { "NUL" } else { "/dev/null" };
-    assert!(FileDisk::open(std::path::Path::new(null_device), false).is_err());
+    assert!(FileDisk::open(std::path::Path::new(null_device), AccessMode::ReadWrite).is_err());
 }
 
 #[cfg(target_os = "linux")]
@@ -71,7 +72,7 @@ fn file_discard_reclaims_allocated_blocks() {
 
     let file = tempfile::NamedTempFile::new().unwrap();
     file.as_file().set_len(1 << 20).unwrap();
-    let mut disk = FileDisk::open(file.path(), false).unwrap();
+    let mut disk = FileDisk::open(file.path(), AccessMode::ReadWrite).unwrap();
     disk.write_at(0, &vec![0xa5; 128 << 10]).unwrap();
     let allocated = file.as_file().metadata().unwrap().blocks();
     disk.discard(0, 128 << 10).unwrap();
@@ -83,7 +84,7 @@ fn file_discard_reclaims_allocated_blocks() {
 fn file_discard_reclaims_allocated_bytes() {
     let file = tempfile::NamedTempFile::new().unwrap();
     file.as_file().set_len(1 << 20).unwrap();
-    let mut disk = FileDisk::open(file.path(), false).unwrap();
+    let mut disk = FileDisk::open(file.path(), AccessMode::ReadWrite).unwrap();
     disk.write_at(0, &vec![0xa5; 128 << 10]).unwrap();
     let allocated = read_allocated_bytes(file.as_file());
     disk.discard(0, 128 << 10).unwrap();
@@ -206,7 +207,7 @@ fn nonzero_guest_base_keeps_capacity_and_address_bounds_distinct() {
 
 #[test]
 fn readonly_disk_resists_writes_and_truncation() {
-    let mut disk = BoundedDisk::new(4096, true);
+    let mut disk = BoundedDisk::new(4096, AccessMode::ReadOnly);
     assert_eq!(disk.write_at(0, b"x"), Err(BackingError::ReadOnly));
     assert!(disk.read_at(0, &mut [0; 4]).is_ok());
     assert_eq!(
@@ -217,7 +218,7 @@ fn readonly_disk_resists_writes_and_truncation() {
 
 #[test]
 fn writable_disk_enforces_capacity() {
-    let mut disk = BoundedDisk::new(512, false);
+    let mut disk = BoundedDisk::new(512, AccessMode::ReadWrite);
     disk.write_at(0, &[7u8; 16]).expect("in-capacity write");
     assert_eq!(
         disk.write_at(500, &[7u8; 16]),

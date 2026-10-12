@@ -10,11 +10,14 @@ use crate::box_runtime::store::BoxHost;
 use crate::component::vmm::bindings::virtualization;
 use crate::component::vmm::bindings::virtualization::Error;
 use crate::machine::{Architecture, Device, DeviceKind, MachineConfig};
+use crate::memory::{BoundedMemory, GuestRam};
+
 pub(crate) type InitializeMachine = wasmtime::component::TypedFunc<
     (Architecture, Resource<Vm>, Vec<Resource<super::Vcpu>>),
     (Result<(), super::bindings::machine::Error>,),
 >;
-use crate::memory::{BoundedMemory, GuestRam};
+
+const MACHINE_INITIALIZE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub trait VirtualMachine: Send + Sync + 'static {
     fn memory(&self) -> wasmtime::Result<GuestRam>;
@@ -72,14 +75,8 @@ impl<M: VirtualMachine> MachineHandle<M> {
         ordinal: usize,
         inject: impl Fn(&M, u32, bool) -> wasmtime::Result<()> + Send + Sync + 'static,
     ) -> wasmtime::Result<crate::component::InterruptCallback> {
-        let irq = self
-            .0
-            .devices
-            .iter()
-            .filter(|device| device.kind == kind)
-            .nth(ordinal)
-            .map(|device| device.irq)
-            .ok_or_else(|| wasmtime::Error::msg("interrupt device outside VM grant"))?;
+        let (_, device) = crate::machine::find_device(&self.0.devices, kind, ordinal)?;
+        let irq = device.irq;
         let machine = self.machine();
         Ok(Arc::new(move |level| inject(&machine, irq, level)))
     }
@@ -354,7 +351,7 @@ impl BoxRuntime {
             boot_entry,
         });
         let initialized = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            MACHINE_INITIALIZE_TIMEOUT,
             initialize.call_async(&mut self.store, (config.architecture(), vm, vcpus)),
         )
         .await
@@ -492,7 +489,7 @@ mod tests {
         for architecture in [Architecture::X86, Architecture::Arm] {
             let engine = crate::engine::device_engine().unwrap();
             let vmm = crate::test_fixtures::trusted_artifacts()
-                .vmm()
+                .vmm
                 .deserialize(&engine)
                 .unwrap();
             let boot =

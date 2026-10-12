@@ -144,7 +144,7 @@ pub fn register_device(
             run: api.func_run(),
             interrupt,
         }
-        .register(&mut child, wake, "vsock")?;
+        .register(&mut child, wake, DeviceKind::Vsock)?;
         Ok((child, serve))
     })
 }

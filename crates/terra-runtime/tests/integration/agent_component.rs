@@ -1,36 +1,14 @@
 use crate::support;
 use std::assert_matches;
 
+use std::num::NonZeroUsize;
 use terra_runtime::component::agent::{
     AgentEvent, AgentHost, AgentHostService, agent_component_linker,
 };
+use terra_runtime::component::relay;
 use terra_runtime::component::vsock::streams::StreamEndpoint;
 use terra_runtime::engine::device_engine;
-use wasmtime::component::{Component, Source, StreamConsumer, StreamResult};
-
-struct EventRecorder(tokio::sync::mpsc::UnboundedSender<AgentEvent>);
-
-impl StreamConsumer<AgentHost> for EventRecorder {
-    type Item = AgentEvent;
-
-    fn poll_consume(
-        self: std::pin::Pin<&mut Self>,
-        _context: &mut std::task::Context<'_>,
-        store: wasmtime::StoreContextMut<AgentHost>,
-        mut source: Source<'_, AgentEvent>,
-        finish: bool,
-    ) -> std::task::Poll<wasmtime::Result<StreamResult>> {
-        if finish {
-            return std::task::Poll::Ready(Ok(StreamResult::Cancelled));
-        }
-        let mut events = Vec::with_capacity(1);
-        source.read(store, &mut events)?;
-        for event in events {
-            let _ = self.0.send(event);
-        }
-        std::task::Poll::Ready(Ok(StreamResult::Completed))
-    }
-}
+use wasmtime::component::Component;
 
 /// Subscribing to events starts the worker without a separate run export; closing
 /// stays terminal across new subscriptions and endpoint replacements.
@@ -73,14 +51,12 @@ async fn events_start_worker_and_close_keeps_transport_terminal() {
         .call_async(&mut store, ())
         .await
         .expect("initial events");
-    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-    stream
-        .pipe(&mut store, EventRecorder(sender))
-        .expect("event recorder");
+    let (sink, mut recorded) = relay::channel(NonZeroUsize::new(16).expect("event queue"));
+    stream.pipe(&mut store, sink).expect("event recorder");
     store
         .run_concurrent(async |accessor| {
             let connected =
-                tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+                tokio::time::timeout(std::time::Duration::from_secs(1), recorded.next())
                     .await
                     .expect("worker started")
                     .expect("connected event");

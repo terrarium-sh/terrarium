@@ -25,83 +25,14 @@ impl TrustedArtifact {
 }
 
 /// Build-embedded AOT artifacts for one exact Wasmtime runtime.
+#[derive(Clone, Copy)]
 pub struct TrustedArtifacts {
-    block: TrustedArtifact,
-    agent: TrustedArtifact,
-    vsock: TrustedArtifact,
-    fs: TrustedArtifact,
-    mem: TrustedArtifact,
-    boot: TrustedArtifact,
-    vmm: TrustedArtifact,
-    interrupt_controller: TrustedArtifact,
-}
-
-impl TrustedArtifacts {
-    /// # Safety
-    ///
-    /// All byte slices must be trusted AOT artifacts produced for this exact
-    /// Wasmtime build; they must never come from a user or network input.
-    #[must_use]
-    #[allow(unsafe_code, clippy::too_many_arguments)]
-    pub const unsafe fn new(
-        block: &'static [u8],
-        agent: &'static [u8],
-        vsock: &'static [u8],
-        fs: &'static [u8],
-        mem: &'static [u8],
-        boot: &'static [u8],
-        vmm: &'static [u8],
-        interrupt_controller: &'static [u8],
-    ) -> Self {
-        Self {
-            block: TrustedArtifact(block),
-            agent: TrustedArtifact(agent),
-            vsock: TrustedArtifact(vsock),
-            fs: TrustedArtifact(fs),
-            mem: TrustedArtifact(mem),
-            boot: TrustedArtifact(boot),
-            vmm: TrustedArtifact(vmm),
-            interrupt_controller: TrustedArtifact(interrupt_controller),
-        }
-    }
-
-    #[must_use]
-    pub const fn block(&self) -> TrustedArtifact {
-        self.block
-    }
-
-    #[must_use]
-    pub const fn agent(&self) -> TrustedArtifact {
-        self.agent
-    }
-
-    #[must_use]
-    pub const fn vsock(&self) -> TrustedArtifact {
-        self.vsock
-    }
-
-    #[must_use]
-    pub const fn fs(&self) -> TrustedArtifact {
-        self.fs
-    }
-
-    #[must_use]
-    pub const fn mem(&self) -> TrustedArtifact {
-        self.mem
-    }
-
-    #[must_use]
-    pub const fn boot(&self) -> TrustedArtifact {
-        self.boot
-    }
-
-    #[must_use]
-    pub const fn interrupt_controller(&self) -> TrustedArtifact {
-        self.interrupt_controller
-    }
-
-    #[must_use]
-    pub const fn vmm(&self) -> TrustedArtifact {
-        self.vmm
-    }
+    pub block: TrustedArtifact,
+    pub agent: TrustedArtifact,
+    pub vsock_frontend: TrustedArtifact,
+    pub fs: TrustedArtifact,
+    pub mem: TrustedArtifact,
+    pub boot: TrustedArtifact,
+    pub vmm: TrustedArtifact,
+    pub interrupt_controller: TrustedArtifact,
 }

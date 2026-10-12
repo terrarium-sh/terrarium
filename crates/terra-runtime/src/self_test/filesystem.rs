@@ -6,12 +6,12 @@ use wasmtime::{Engine, Result, ensure};
 
 use crate::TrustedArtifacts;
 use crate::box_runtime::{BoxHost, BoxRuntime, BoxRuntimeHandle};
-use crate::component::MmioDevice;
 use crate::component::context::DeviceContext;
 use crate::component::fs::{FsHost, ShareGrant};
+use crate::component::{AccessMode, MmioDevice};
 use crate::memory::GuestRam;
 
-use super::{configure_queue, read_memory, submit_descriptors, write_memory};
+use super::{QUEUE, read_memory, submit_descriptors, virtio, write_memory};
 
 const REQUEST_QUEUE: u32 = 1;
 const INPUT: u64 = 0x4000;
@@ -19,15 +19,9 @@ const OUTPUT: u64 = 0x6000;
 const REPLY_CAPACITY: u32 = 4096;
 
 #[cfg(windows)]
-fn is_vm_sandbox_worker() -> bool {
-    std::env::var_os("TERRA_WINDOWS_SANDBOX_ROLE").is_some_and(|role| role == "vm")
-}
-
-#[cfg(windows)]
 fn is_vm_app_container() -> bool {
-    is_vm_sandbox_worker()
-        && std::env::var_os("TERRA_WINDOWS_SANDBOX_MODE")
-            .is_some_and(|mode| mode == "app_container")
+    use terra_platform::process::sandbox_env::{APP_CONTAINER_MODE, WINDOWS_MODE, is_vm_worker};
+    is_vm_worker() && std::env::var_os(WINDOWS_MODE).is_some_and(|mode| mode == APP_CONTAINER_MODE)
 }
 
 struct Share {
@@ -42,25 +36,25 @@ impl Share {
         artifacts: &TrustedArtifacts,
         engine: &Engine,
         directory: &Path,
-        readonly: bool,
+        access: AccessMode,
     ) -> Result<Self> {
         let ram = GuestRam::new(64 * 1024)
             .ok_or_else(|| wasmtime::Error::msg("filesystem self-test RAM allocation"))?;
-        let component = artifacts.fs().deserialize(engine)?;
+        let component = artifacts.fs.deserialize(engine)?;
         #[cfg(windows)]
-        let grant = if is_vm_sandbox_worker() {
-            let name = if readonly {
+        let grant = if terra_platform::process::sandbox_env::is_vm_worker() {
+            let name = if access.is_read_only() {
                 "TERRA_WINDOWS_SELF_TEST_READONLY_ID"
             } else {
                 "TERRA_WINDOWS_SELF_TEST_WRITABLE_ID"
             };
             let identity = std::env::var(name)?.parse()?;
-            ShareGrant::new_host_granted(directory, readonly, identity)
+            ShareGrant::new_host_granted(directory, access, identity)
         } else {
-            ShareGrant::new(&directory.canonicalize()?, readonly)
+            ShareGrant::new(&directory.canonicalize()?, access)
         };
         #[cfg(not(windows))]
-        let grant = ShareGrant::new(&directory.canonicalize()?, readonly);
+        let grant = ShareGrant::new(&directory.canonicalize()?, access);
         let grant = grant.map_err(|error| {
             wasmtime::Error::from(error).context(format!(
                 "opening filesystem self-test share {}",
@@ -79,7 +73,7 @@ impl Share {
             Arc::new(|_| Ok(())),
         )?;
         let runtime = runtime.prepare().await?.start();
-        configure_queue(&channel, REQUEST_QUEUE, 0)?;
+        virtio::start_single_queue(&channel, 0, REQUEST_QUEUE, QUEUE)?;
         let mut share = Self {
             channel,
             ram,
@@ -246,7 +240,7 @@ async fn run_writable(
     engine: &Engine,
     directory: &Path,
 ) -> Result<()> {
-    let mut share = Share::mount(artifacts, engine, directory, false)
+    let mut share = Share::mount(artifacts, engine, directory, AccessMode::ReadWrite)
         .await
         .context("mounting writable filesystem share")?;
     let (node, handle) = exercise_file_io(&mut share, directory).await?;
@@ -414,7 +408,7 @@ async fn run_readonly(
     engine: &Engine,
     directory: &Path,
 ) -> Result<()> {
-    let mut share = Share::mount(artifacts, engine, directory, true).await?;
+    let mut share = Share::mount(artifacts, engine, directory, AccessMode::ReadOnly).await?;
     let looked_up = share.request(1, 1, b"file\0", 0).await?;
     let node = read_u64(&looked_up, 16)?;
     let opened = share.request(14, node, &0_u32.to_le_bytes(), 0).await?;

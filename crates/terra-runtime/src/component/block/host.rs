@@ -2,10 +2,11 @@
 
 use super::backing::{BlockBacking, DiskGrant};
 use super::bindings::disk;
-use crate::MAX_BATCH_BYTES;
+use crate::component::AccessMode;
 use crate::component::context::{DeviceContext, DeviceHost, add_device_imports};
 use crate::memory::GuestRam;
 use std::sync::{Arc, Mutex};
+use terra_limits::MAX_BATCH_GUEST_COPY_BYTES;
 use wasmtime::Engine;
 use wasmtime::component::HasSelf;
 use wasmtime_wasi::{WasiCtxView, WasiView};
@@ -14,6 +15,7 @@ pub struct BlockHost {
     pub context: DeviceContext,
     disk: Arc<Mutex<DiskGrant>>,
     disk_capacity: u64,
+    disk_access: AccessMode,
     disk_slot: Arc<tokio::sync::Semaphore>,
 }
 
@@ -23,9 +25,17 @@ impl BlockHost {
         Self {
             context: DeviceContext::with_ram(ram),
             disk_capacity: disk.capacity(),
+            disk_access: disk.access(),
             disk: Arc::new(Mutex::new(disk)),
             disk_slot: Arc::new(tokio::sync::Semaphore::new(1)),
         }
+    }
+}
+
+impl BlockHost {
+    #[must_use]
+    pub(crate) const fn disk_access(&self) -> AccessMode {
+        self.disk_access
     }
 }
 
@@ -119,7 +129,7 @@ fn disk_read_at(
     offset: u64,
     len: u64,
 ) -> impl core::future::Future<Output = Result<Vec<u8>, disk::DiskError>> + Send + use<> {
-    run_disk_job(host, offset, len, MAX_BATCH_BYTES, move |disk| {
+    run_disk_job(host, offset, len, MAX_BATCH_GUEST_COPY_BYTES, move |disk| {
         let len = usize::try_from(len).map_err(|_| super::backing::BackingError::OutOfRange)?;
         let mut bytes = vec![0; len];
         disk.read_at(offset, &mut bytes)?;
@@ -136,7 +146,7 @@ fn disk_write_at(
         host,
         offset,
         data.len() as u64,
-        MAX_BATCH_BYTES,
+        MAX_BATCH_GUEST_COPY_BYTES,
         move |disk| disk.write_at(offset, &data),
     )
 }
@@ -158,7 +168,7 @@ fn disk_discard(
 fn disk_sync(
     host: &mut BlockHost,
 ) -> impl core::future::Future<Output = Result<(), disk::DiskError>> + Send + use<> {
-    run_disk_job(host, 0, 0, MAX_BATCH_BYTES, |disk| disk.sync())
+    run_disk_job(host, 0, 0, MAX_BATCH_GUEST_COPY_BYTES, |disk| disk.sync())
 }
 
 impl disk::Host for BlockHost {
@@ -178,20 +188,26 @@ pub fn block_component_linker<T: WasiView + AsMut<BlockHost> + 'static>(
 
 #[cfg(test)]
 mod tests {
+    use crate::component::AccessMode;
     use crate::component::block::backing::BoundedDisk;
     use std::assert_matches;
     #[tokio::test]
     async fn disk_imports_accept_one_bounded_batch() {
-        use super::{BlockHost, DiskGrant, MAX_BATCH_BYTES, disk, disk_read_at, disk_write_at};
+        use super::{
+            BlockHost, DiskGrant, MAX_BATCH_GUEST_COPY_BYTES, disk, disk_read_at, disk_write_at,
+        };
 
-        let capacity = usize::try_from(MAX_BATCH_BYTES).unwrap();
+        let capacity = usize::try_from(MAX_BATCH_GUEST_COPY_BYTES).unwrap();
         let mut host = BlockHost::new(
             crate::memory::GuestRam::new(4096).unwrap(),
-            DiskGrant::Mem(BoundedDisk::new(capacity, false)),
+            DiskGrant::Mem(BoundedDisk::new(capacity, AccessMode::ReadWrite)),
         );
         let bytes = vec![0xA5; capacity];
         assert_eq!(disk_write_at(&mut host, 0, bytes.clone()).await, Ok(()));
-        assert_eq!(disk_read_at(&mut host, 0, MAX_BATCH_BYTES).await, Ok(bytes));
+        assert_eq!(
+            disk_read_at(&mut host, 0, MAX_BATCH_GUEST_COPY_BYTES).await,
+            Ok(bytes)
+        );
         assert_eq!(
             disk_write_at(&mut host, 0, vec![0; capacity + 1]).await,
             Err(disk::DiskError::TooLarge)
@@ -205,12 +221,12 @@ mod tests {
 
         let mut host = BlockHost::new(
             crate::memory::GuestRam::new(4096).unwrap(),
-            DiskGrant::Mem(BoundedDisk::new(4096, false)),
+            DiskGrant::Mem(BoundedDisk::new(4096, AccessMode::ReadWrite)),
         );
         assert_eq!(disk_write_at(&mut host, 4095, vec![7]).await, Ok(()));
         assert_eq!(disk_read_at(&mut host, 4095, 1).await, Ok(vec![7]));
         assert_matches!(
-            disk_read_at(&mut host, 0, super::MAX_BATCH_BYTES + 1).await,
+            disk_read_at(&mut host, 0, super::MAX_BATCH_GUEST_COPY_BYTES + 1).await,
             Err(DiskError::TooLarge)
         );
         assert_matches!(
@@ -229,7 +245,7 @@ mod tests {
         );
         let mut host = BlockHost::new(
             crate::memory::GuestRam::new(4096).unwrap(),
-            DiskGrant::Mem(BoundedDisk::new(4096, true)),
+            DiskGrant::Mem(BoundedDisk::new(4096, AccessMode::ReadOnly)),
         );
         assert_matches!(
             disk_write_at(&mut host, 0, vec![1]).await,
@@ -249,13 +265,13 @@ mod tests {
         let mut host = BlockHost::new(
             crate::memory::GuestRam::new(4096).unwrap(),
             crate::component::block::backing::DiskGrant::Mem(
-                crate::component::block::backing::BoundedDisk::new(0, false),
+                crate::component::block::backing::BoundedDisk::new(0, AccessMode::ReadWrite),
             ),
         );
         let mut other = BlockHost::new(
             crate::memory::GuestRam::new(4096).unwrap(),
             crate::component::block::backing::DiskGrant::Mem(
-                crate::component::block::backing::BoundedDisk::new(0, false),
+                crate::component::block::backing::BoundedDisk::new(0, AccessMode::ReadWrite),
             ),
         );
         let (started, started_rx) = tokio::sync::oneshot::channel();
@@ -301,7 +317,7 @@ mod tests {
 
         let host = BlockHost::new(
             crate::memory::GuestRam::new(256 * 1024).unwrap(),
-            DiskGrant::Mem(BoundedDisk::new(4096, false)),
+            DiskGrant::Mem(BoundedDisk::new(4096, AccessMode::ReadWrite)),
         );
         let disk = std::sync::Arc::clone(&host.disk);
         assert!(
@@ -315,7 +331,7 @@ mod tests {
         let component =
             wasmtime::component::Component::new(&engine, crate::test_fixtures::wasm::BLOCK)
                 .unwrap();
-        let mut fixture = fixture_with_host(&engine, host, &component, false).await;
+        let mut fixture = fixture_with_host(&engine, host, &component).await;
         for (request_type, ranges) in [
             (
                 0,
@@ -348,7 +364,7 @@ mod tests {
         use crate::engine::device_engine;
         use terra_hypervisor::memory::MemoryRange;
 
-        let mut backing = BoundedDisk::new(4096, false);
+        let mut backing = BoundedDisk::new(4096, AccessMode::ReadWrite);
         super::BlockBacking::write_at(&mut backing, 0, &[0xA5; 512]).unwrap();
         let host = BlockHost::new(
             crate::memory::GuestRam::new(256 * 1024).unwrap(),
@@ -360,7 +376,7 @@ mod tests {
         let component =
             wasmtime::component::Component::new(&engine, crate::test_fixtures::wasm::BLOCK)
                 .unwrap();
-        let mut fixture = fixture_with_host(&engine, host, &component, false).await;
+        let mut fixture = fixture_with_host(&engine, host, &component).await;
         let (locked, locked_rx) = tokio::sync::oneshot::channel();
         let (release, release_rx) = std::sync::mpsc::sync_channel(0);
         let blocker = std::thread::spawn(move || {
@@ -381,7 +397,10 @@ mod tests {
             }],
             0x3000,
         );
-        fixture.device.write(0x050, &0_u32.to_le_bytes()).unwrap();
+        fixture
+            .device
+            .write(crate::self_test::virtio::QUEUE_NOTIFY, &0_u32.to_le_bytes())
+            .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while disk_slot.available_permits() != 0 {
                 tokio::task::yield_now().await;

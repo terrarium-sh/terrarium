@@ -18,15 +18,16 @@ terra-hypervisor = { path = "../terra-hypervisor" }
 terra-platform = { path = "../terra-platform" }
 terra-network = { path = "../terra-network" }
 terra-protocol = { path = "../terra-protocol" }
+bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["alloc", "std"] }
 notify = "8.2"
 terra-limits = { path = "../terra-limits" }
 log = "0.4.34"
 target-lexicon = "0.13"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "io-util"] }
 tokio-util = { version = "0.7", features = ["rt", "compat"] }
 yamux = "=0.14.1"
-wasmtime = { version = "=49.0.2", default-features = false, features = ["component-model-async", "std"] }
+wasmtime = { version = "=49.0.2", default-features = false, features = ["component-model-async", "component-model-bytes", "std"] }
 wasmtime-wasi = { version = "=49.0.2", default-features = false, features = ["p3"] }
 
 [target.'cfg(windows)'.dependencies]

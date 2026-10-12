@@ -14,7 +14,7 @@ pub struct AgentGuest {
     pub agent: Agent,
     pub lifecycle: LifecycleNotifier,
     pub connection_number: u64,
-    pub read_limit: u32,
+    pub read_limit: usize,
     runtime: BoxRuntimeHandle,
     root_finished: tokio::sync::oneshot::Sender<()>,
     teardown: terra_runtime::component::vmm::teardown::NativeTeardown,
@@ -36,7 +36,7 @@ impl AgentGuest {
         let agent = Agent::from_trusted_artifact(
             &mut runtime,
             role_endpoint,
-            artifacts.agent(),
+            artifacts.agent,
             plan,
             listener,
             control,
@@ -60,7 +60,7 @@ impl AgentGuest {
             agent,
             lifecycle,
             connection_number: 1,
-            read_limit: u32::try_from(STREAM_BUFFER_BYTES).expect("stream bound"),
+            read_limit: STREAM_BUFFER_BYTES,
             runtime,
             root_finished,
             teardown,
@@ -180,7 +180,7 @@ impl AgentGuest {
                 written += self
                     .endpoint
                     .try_write(self.connection_number, chunk)
-                    .expect("session bytes") as usize;
+                    .expect("session bytes");
                 if written < bytes.len() {
                     self.drain_control();
                     tokio::task::yield_now().await;
@@ -250,7 +250,7 @@ pub fn yamux_frame(kind: u8, flags: u16, stream: u32, value: u32, payload: &[u8]
 
 pub fn plan_frame() -> Vec<u8> {
     terra_protocol::encode_frame(&terra_protocol::BootPlan::new(
-        super::artifacts::create_boot_plan(),
+        terra_protocol::Plan::bare_run(vec!["/bin/sh".into()]),
     ))
     .expect("plan encodes")
 }

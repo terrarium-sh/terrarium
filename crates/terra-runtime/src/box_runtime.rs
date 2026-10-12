@@ -95,12 +95,7 @@ pub struct BoxRuntime {
     shutdown: watch::Sender<bool>,
     children: Vec<WorkerTask>,
     component_loops: Vec<ComponentLoop>,
-    roles: Vec<(ComponentRole, setup::RoleSetup)>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ComponentRole {
-    Agent,
+    agent_setup: Option<setup::AgentSetup>,
 }
 
 pub struct PreparedBoxRuntime {

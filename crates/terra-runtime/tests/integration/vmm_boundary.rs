@@ -6,11 +6,11 @@ use std::time::{Duration, Instant};
 
 use terra_limits::{X86_MMIO_BASE, X86_MMIO_STRIDE, X86_ZERO_PAGE};
 use terra_runtime::box_runtime::{BoxHost, BoxRuntime};
-use terra_runtime::component::InterruptCallback;
 use terra_runtime::component::context::DeviceContext;
 use terra_runtime::component::vmm::{
     BootEntry, Completion, Exit, PreparedMachine, StartedVcpus, VirtualMachine,
 };
+use terra_runtime::component::{AccessMode, InterruptCallback};
 use terra_runtime::engine::device_engine;
 use terra_runtime::machine::{Architecture, Device, DeviceKind, MachineConfig};
 use terra_runtime::memory::GuestRam;
@@ -450,11 +450,13 @@ async fn deferred_device_failure_prevents_cpu_launch() {
         terra_runtime::component::block::BlockHost::new(
             ram,
             terra_runtime::component::block::backing::DiskGrant::Mem(
-                terra_runtime::component::block::backing::BoundedDisk::new(0, false),
+                terra_runtime::component::block::backing::BoundedDisk::new(
+                    0,
+                    AccessMode::ReadWrite,
+                ),
             ),
         ),
         &memory(&engine),
-        true,
         no_interrupt(),
     )
     .expect("grant is deferred until composition");
@@ -496,13 +498,12 @@ async fn wasi_composes_multiple_deferred_workers_with_their_final_mappings() {
     for bytes in [4096, 8192, 12288] {
         let host = terra_runtime::component::block::BlockHost::new(
             ram.clone(),
-            DiskGrant::Mem(BoundedDisk::new(bytes, false)),
+            DiskGrant::Mem(BoundedDisk::new(bytes, AccessMode::ReadWrite)),
         );
         let channel = terra_runtime::component::block::register_device(
             &mut runtime,
             host,
             &block,
-            false,
             no_interrupt(),
         )
         .expect("deferred block grant");

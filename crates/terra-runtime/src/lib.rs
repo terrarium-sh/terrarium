@@ -13,9 +13,6 @@ pub mod memory;
 pub mod orchestration;
 pub mod self_test;
 
-pub(crate) use terra_limits::MAX_BATCH_GUEST_COPY_BYTES as MAX_BATCH_BYTES;
-pub(crate) use terra_limits::MAX_SINGLE_GUEST_COPY_BYTES as MAX_SINGLE_BYTES;
-
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 

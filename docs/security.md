@@ -117,7 +117,7 @@ retires networking while agent control stays available. The
 The default [host VM launcher](vm-launchers.md) runs the VM and the broker as
 separately confined processes; [host process sandboxing](sandboxing.md)
 describes each role, its grants and its filters. Without a generated policy
-bundle, the built-in fallback filters allow broader syscall access within the
+bundle, the built-in filters allow broader syscall access within the
 same namespace and filesystem boundaries; `install.sh` installs the release
 bundle. Direct and custom launchers are trusted host code with their own
 boundaries; a successful launch does not establish confinement.
@@ -183,8 +183,6 @@ sandbox. Host-loopback and LAN services may expose privileged APIs or their own
 vulnerabilities. Independent host network controls can further restrict broker
 authority. Direct launches and custom launchers without equivalent isolation
 also allow native VM code to bypass component-level policy using host sockets.
-On Windows, the `restricted_token_job` mode is weaker; see
-[sandboxing](sandboxing.md#windows).
 
 ## Outside the boundary
 

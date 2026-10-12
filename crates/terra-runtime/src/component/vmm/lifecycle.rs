@@ -85,7 +85,7 @@ impl LifecycleHost {
 
     pub(crate) fn next_event(
         &self,
-    ) -> impl core::future::Future<
+    ) -> impl Future<
         Output = wasmtime::Result<Result<lifecycle_platform::Event, lifecycle_platform::Error>>,
     > + Send
     + use<> {
@@ -171,12 +171,17 @@ impl LifecycleNotifier {
     }
 
     fn publish(&self, event: Event) -> bool {
-        self.event.send_if_modified(|current| {
+        self.publish_first(&self.event, event)
+    }
+
+    /// Returns true when `value` is the first one published on `channel`.
+    fn publish_first<T>(&self, channel: &watch::Sender<Option<T>>, value: T) -> bool {
+        channel.send_if_modified(|current| {
             if current.is_some() {
                 false
             } else {
                 self.shutdown_deadline.start();
-                *current = Some(event);
+                *current = Some(value);
                 true
             }
         })
@@ -189,15 +194,7 @@ impl LifecycleNotifier {
 
     /// Publishes the first terminal decision; native teardown may still be running.
     pub fn publish_outcome(&self, outcome: Outcome) {
-        let _ = self.outcome.send_if_modified(|current| {
-            if current.is_some() {
-                false
-            } else {
-                self.shutdown_deadline.start();
-                *current = Some(outcome);
-                true
-            }
-        });
+        self.publish_first(&self.outcome, outcome);
     }
 }
 
@@ -249,7 +246,7 @@ impl<T: Send + 'static> lifecycle_platform::HostWithStore<T> for LifecyclePlatfo
 
     fn next_event(
         host: &wasmtime::component::Accessor<T, Self>,
-    ) -> impl core::future::Future<
+    ) -> impl Future<
         Output = wasmtime::Result<Result<lifecycle_platform::Event, lifecycle_platform::Error>>,
     > + Send {
         host.with(|mut access| access.get().next_event())

@@ -4,6 +4,7 @@ pub(crate) mod bindings;
 pub(crate) mod bridge;
 mod device;
 
+use crate::component::recorded_failure;
 use crate::machine::DeviceKind;
 pub use device::MmioDevice;
 
@@ -37,7 +38,10 @@ pub(crate) struct DeviceChannel {
 
 const DEVICE_SPAN: u64 = 0x1000;
 /// The virtio-mmio `QueueNotify` register: the guest's queue kick, whose outcome it never reads.
-const QUEUE_NOTIFY_OFFSET: u64 = 0x050;
+pub const QUEUE_NOTIFY: u64 = 0x050;
+/// Requests or replies in flight between the MMIO bridge and one device store.
+pub const RELAY_CAPACITY: std::num::NonZeroUsize =
+    std::num::NonZeroUsize::new(64).expect("nonzero relay capacity");
 pub(super) const COMMAND_CAPACITY: usize = 64;
 pub(super) const CONTROL_CAPACITY: usize = 64;
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -249,7 +253,7 @@ impl Client {
             && self.devices.get().is_some_and(|devices| {
                 devices.iter().any(|device| {
                     owns_access(device, address, width)
-                        && address - device.base.load(Ordering::Acquire) == QUEUE_NOTIFY_OFFSET
+                        && address - device.base.load(Ordering::Acquire) == QUEUE_NOTIFY
                 })
             })
     }
@@ -320,13 +324,6 @@ fn submit(
         control,
     )?;
     wait_for_reply(failure, &response)
-}
-
-fn recorded_failure(failure: &Mutex<Option<String>>) -> Option<String> {
-    failure
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone()
 }
 
 fn wait_for_reply(

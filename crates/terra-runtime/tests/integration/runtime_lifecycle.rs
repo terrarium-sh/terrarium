@@ -1,14 +1,9 @@
+use std::sync::Arc;
 use std::time::Duration;
-use std::{
-    future::Future,
-    pin::Pin,
-    task::{Context, Poll},
-};
 
+use crate::support::stream_relay::delayed_bytes;
 use terra_runtime::box_runtime::{BoxHost, BoxRuntime};
-use wasmtime::component::{
-    Component, Destination, Linker, StreamProducer, StreamReader, StreamResult, VecBuffer,
-};
+use wasmtime::component::{Component, Linker, StreamReader};
 
 const FAST_COMPONENT: &str = r#"(component
     (core module $module
@@ -96,13 +91,8 @@ async fn stalled_io_loop_does_not_delay_another_loop_in_the_same_box() {
         .get_typed_func::<(StreamReader<u8>,), (u32,)>(&mut runtime.store, "consume")
         .expect("consume export");
     let (slow_release, slow_wait) = tokio::sync::oneshot::channel();
-    let input = StreamReader::new(
-        &mut runtime.store,
-        DelayedBytes {
-            receiver: slow_wait,
-        },
-    )
-    .expect("stalled input stream");
+    let input = StreamReader::new(&mut runtime.store, delayed_bytes(slow_wait, Arc::default()))
+        .expect("stalled input stream");
     let (fast_started, fast_ready) = tokio::sync::oneshot::channel();
     runtime
         .register_loop(Box::new(move |accessor| {
@@ -131,30 +121,6 @@ async fn stalled_io_loop_does_not_delay_another_loop_in_the_same_box() {
         .expect("fast loop starts");
     let _ = slow_release.send(vec![1, 2, 3, 4]);
     handle.join().await.expect("box stops cleanly");
-}
-
-struct DelayedBytes {
-    receiver: tokio::sync::oneshot::Receiver<Vec<u8>>,
-}
-
-impl StreamProducer<BoxHost> for DelayedBytes {
-    type Item = u8;
-    type Buffer = VecBuffer<u8>;
-
-    fn poll_produce<'a>(
-        mut self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-        _: wasmtime::StoreContextMut<'a, BoxHost>,
-        mut destination: Destination<'a, u8, Self::Buffer>,
-        finish: bool,
-    ) -> Poll<wasmtime::Result<StreamResult>> {
-        if finish {
-            return Poll::Ready(Ok(StreamResult::Cancelled));
-        }
-        let bytes = std::task::ready!(Pin::new(&mut self.receiver).poll(context))?;
-        destination.set_buffer(bytes.into());
-        Poll::Ready(Ok(StreamResult::Dropped))
-    }
 }
 
 #[tokio::test]

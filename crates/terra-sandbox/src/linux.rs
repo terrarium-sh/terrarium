@@ -1,7 +1,7 @@
 //! Linux command confinement.
 
+mod builtin_policy;
 mod bwrap;
-mod fallback_policy;
 pub mod seccomp;
 
 pub use bwrap::{Confinement, prepare_launch};

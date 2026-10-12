@@ -217,11 +217,9 @@ pub(super) fn validate_assets(
     bx: &BoxRef,
 ) -> Result<()> {
     let assets: Vec<(&str, &Path)> = match launcher {
-        LauncherConfig::Direct | LauncherConfig::Sandboxed { policy: None, .. } => Vec::new(),
+        LauncherConfig::Direct | LauncherConfig::Sandboxed { policy: None } => Vec::new(),
         LauncherConfig::Custom(path) => vec![("VM initializer", path)],
-        LauncherConfig::Sandboxed {
-            policy: Some(path), ..
-        } => vec![("Sandbox policy", path)],
+        LauncherConfig::Sandboxed { policy: Some(path) } => vec![("Sandbox policy", path)],
     };
     if assets.is_empty() {
         return Ok(());
@@ -486,7 +484,6 @@ mod tests {
 
         let policy = LauncherConfig::Sandboxed {
             policy: Some(asset),
-            allow_fallback: true,
         };
         let error = validate_assets(&policy, &current, &bx)
             .unwrap_err()
@@ -497,7 +494,6 @@ mod tests {
             LauncherConfig::Custom(bx.get_dir().join("initializer")),
             LauncherConfig::Sandboxed {
                 policy: Some(sibling.get_dir().join("policy.yml")),
-                allow_fallback: true,
             },
         ] {
             let error = validate_assets(&launcher, &current, &bx).unwrap_err();

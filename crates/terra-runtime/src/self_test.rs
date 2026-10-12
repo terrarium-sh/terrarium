@@ -6,9 +6,9 @@ use std::time::Duration;
 
 use crate::TrustedArtifacts;
 use crate::box_runtime::{BoxHost, BoxRuntime};
-use crate::component::MmioDevice;
 use crate::component::block::backing::{DiskGrant, FileDisk};
 use crate::component::context::DeviceContext;
+use crate::component::{AccessMode, MmioDevice};
 use crate::memory::{BoundedMemory, GuestRam};
 
 mod agent;
@@ -16,9 +16,11 @@ mod boot;
 mod filesystem;
 pub mod network;
 pub mod network_stream;
+pub mod virtio;
 mod vsock;
 
 const FIXTURE_STARTUP_WAIT: Duration = Duration::from_secs(120);
+const STEP_WAIT: Duration = Duration::from_secs(5);
 
 pub struct AgentListeners {
     pub control: terra_platform::local_socket::LocalListener,
@@ -27,25 +29,13 @@ pub struct AgentListeners {
 
 pub async fn run_self_test(artifacts: TrustedArtifacts, directory: &Path) -> wasmtime::Result<()> {
     let engine = crate::engine::device_engine()?;
-    boot::run(&artifacts, &engine)
-        .await
-        .map_err(|error| error.context("boot self-test"))?;
-    vsock::run(&artifacts, &engine)
-        .await
-        .map_err(|error| error.context("vsock frontend self-test"))?;
-    exercise_storage_and_memory(&artifacts, &engine, directory)
-        .await
-        .map_err(|error| error.context("storage and memory self-test"))?;
-    filesystem::run(&artifacts, &engine, directory)
-        .await
-        .map_err(|error| error.context("filesystem self-test"))?;
+    run_device_self_tests(&artifacts, &engine, directory).await?;
     network::run(&artifacts, &engine)
         .await
         .map_err(|error| error.context("network self-test"))?;
     agent::run(&artifacts, &engine, directory)
         .await
-        .map_err(|error| error.context("agent self-test"))?;
-    Ok(())
+        .map_err(|error| error.context("agent self-test"))
 }
 
 pub async fn run_self_test_with_network(
@@ -56,18 +46,7 @@ pub async fn run_self_test_with_network(
     agent_listeners: Option<AgentListeners>,
 ) -> wasmtime::Result<()> {
     let engine = crate::engine::device_engine()?;
-    boot::run(&artifacts, &engine)
-        .await
-        .map_err(|error| error.context("boot self-test"))?;
-    vsock::run(&artifacts, &engine)
-        .await
-        .map_err(|error| error.context("vsock frontend self-test"))?;
-    exercise_storage_and_memory(&artifacts, &engine, directory)
-        .await
-        .map_err(|error| error.context("storage and memory self-test"))?;
-    filesystem::run(&artifacts, &engine, directory)
-        .await
-        .map_err(|error| error.context("filesystem self-test"))?;
+    run_device_self_tests(&artifacts, &engine, directory).await?;
     network::run_with_backend(&artifacts, &engine, backend, endpoints)
         .await
         .map_err(|error| error.context("network self-test"))?;
@@ -86,15 +65,29 @@ pub async fn run_self_test_local_only(
     agent_listeners: Option<AgentListeners>,
 ) -> wasmtime::Result<()> {
     let engine = crate::engine::device_engine()?;
-    boot::run(&artifacts, &engine)
+    run_device_self_tests(&artifacts, &engine, directory).await?;
+    agent::run_with_external_clients(&artifacts, &engine, directory, agent_listeners)
+        .await
+        .map_err(|error| error.context("agent self-test"))
+}
+
+async fn run_device_self_tests(
+    artifacts: &TrustedArtifacts,
+    engine: &wasmtime::Engine,
+    directory: &Path,
+) -> wasmtime::Result<()> {
+    boot::run(artifacts, engine)
         .await
         .map_err(|error| error.context("boot self-test"))?;
-    vsock::run(&artifacts, &engine)
+    vsock::run(artifacts, engine)
         .await
         .map_err(|error| error.context("vsock frontend self-test"))?;
-    exercise_storage_and_memory(&artifacts, &engine, directory).await?;
-    filesystem::run(&artifacts, &engine, directory).await?;
-    agent::run_with_external_clients(&artifacts, &engine, directory, agent_listeners).await
+    exercise_storage_and_memory(artifacts, engine, directory)
+        .await
+        .map_err(|error| error.context("storage and memory self-test"))?;
+    filesystem::run(artifacts, engine, directory)
+        .await
+        .map_err(|error| error.context("filesystem self-test"))
 }
 
 const DESCRIPTORS: u64 = 0x1000;
@@ -104,6 +97,12 @@ const HEADER: u64 = 0x4000;
 const DATA: u64 = 0x5000;
 const STATUS: u64 = 0x6000;
 const QUEUE_SIZE: u16 = 8;
+const QUEUE: virtio::QueueLayout = virtio::QueueLayout {
+    size: QUEUE_SIZE,
+    descriptors: DESCRIPTORS,
+    available: AVAILABLE,
+    used: USED,
+};
 const RECLAIM_ADDRESS: u64 = 64 * 1024;
 const RECLAIM_BYTES: u32 = 64 * 1024;
 
@@ -117,28 +116,6 @@ fn read_memory(ram: &GuestRam, address: u64, length: u64) -> wasmtime::Result<Ve
     BoundedMemory::new(ram)
         .read(address, length)
         .map_err(|error| wasmtime::Error::msg(format!("self-test memory read: {error:?}")))
-}
-
-fn configure_queue(device: &MmioDevice, queue: u32, features: u32) -> wasmtime::Result<()> {
-    for (offset, value) in [
-        (0x70, 1),
-        (0x70, 3),
-        (0x24, 0),
-        (0x20, features),
-        (0x24, 1),
-        (0x20, 1),
-        (0x70, 11),
-        (0x30, queue),
-        (0x38, u32::from(QUEUE_SIZE)),
-        (0x80, u32::try_from(DESCRIPTORS)?),
-        (0x90, u32::try_from(AVAILABLE)?),
-        (0xa0, u32::try_from(USED)?),
-        (0x44, 1),
-        (0x70, 15),
-    ] {
-        device.write(offset, &value.to_le_bytes())?;
-    }
-    Ok(())
 }
 
 async fn submit_descriptors(
@@ -162,8 +139,8 @@ async fn submit_descriptors(
         &[0; 2],
     )?;
     write_memory(ram, AVAILABLE + 2, &index.wrapping_add(1).to_le_bytes())?;
-    device.write(0x50, &queue.to_le_bytes())?;
-    tokio::time::timeout(Duration::from_secs(5), async {
+    device.write(virtio::QUEUE_NOTIFY, &queue.to_le_bytes())?;
+    tokio::time::timeout(STEP_WAIT, async {
         while read_memory(ram, USED + 2, 2)? != index.wrapping_add(1).to_le_bytes() {
             if let Some(error) = device.failure() {
                 wasmtime::bail!("self-test device failed: {error}");
@@ -173,7 +150,7 @@ async fn submit_descriptors(
         wasmtime::Result::Ok(())
     })
     .await??;
-    device.write(0x64, &1_u32.to_le_bytes())?;
+    device.write(virtio::INTERRUPT_ACK, &1_u32.to_le_bytes())?;
     Ok(())
 }
 
@@ -229,21 +206,20 @@ async fn exercise_storage_and_memory(
         &mut runtime,
         crate::component::block::BlockHost::new(
             block_ram.clone(),
-            DiskGrant::File(FileDisk::open(&disk_path, false)?),
+            DiskGrant::File(FileDisk::open(&disk_path, AccessMode::ReadWrite)?),
         ),
-        &artifacts.block().deserialize(engine)?,
-        false,
+        &artifacts.block.deserialize(engine)?,
         Arc::new(|_| Ok(())),
     )?;
     let memory = crate::component::mem::register_device(
         &mut runtime,
         DeviceContext::with_ram(memory_ram.clone()),
-        &artifacts.mem().deserialize(engine)?,
+        &artifacts.mem.deserialize(engine)?,
         Arc::new(|_| Ok(())),
     )?;
     let runtime = runtime.prepare().await?.start();
     let result = async {
-        configure_queue(&block, 0, (1 << 9) | (1 << 13))?;
+        virtio::start_single_queue(&block, (1 << 9) | (1 << 13), 0, QUEUE)?;
         let bytes = [0xa5; 512];
         submit_block(&block, &block_ram, 0, 1, &bytes).await?;
         submit_block(&block, &block_ram, 1, 4, &[]).await?;
@@ -258,7 +234,7 @@ async fn exercise_storage_and_memory(
         let mut discard = [0; 16];
         discard[8..12].copy_from_slice(&8_u32.to_le_bytes());
         submit_block(&block, &block_ram, 3, 11, &discard).await?;
-        configure_queue(&memory, 2, (1 << 4) | (1 << 5))?;
+        virtio::start_single_queue(&memory, (1 << 4) | (1 << 5), 2, QUEUE)?;
         for offset in (0..u64::from(RECLAIM_BYTES)).step_by(4096) {
             write_memory(&memory_ram, RECLAIM_ADDRESS + offset, &[0x5a; 4096])?;
         }
@@ -279,9 +255,9 @@ async fn exercise_storage_and_memory(
             );
         }
         for device in [&block, &memory] {
-            device.write(0x70, &0_u32.to_le_bytes())?;
+            device.write(virtio::STATUS, &virtio::STATUS_RESET.to_le_bytes())?;
             wasmtime::ensure!(
-                device.read(0, 4)? == 0x7472_6976_u32.to_le_bytes(),
+                device.read(virtio::MAGIC_VALUE, 4)? == virtio::MAGIC.to_le_bytes(),
                 "self-test device reset failed"
             );
         }

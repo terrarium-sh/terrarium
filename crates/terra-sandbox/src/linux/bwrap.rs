@@ -115,8 +115,8 @@ pub fn prepare_launch(launch: Launch<'_>) -> Result<PreparedLaunch> {
     let mut inherited_files = Vec::new();
     let worker_floor = match role {
         Role::Supervisor => None,
-        Role::Vm => Some(super::fallback_policy::VM),
-        Role::Network => Some(super::fallback_policy::NETWORK),
+        Role::Vm => Some(super::builtin_policy::VM),
+        Role::Network => Some(super::builtin_policy::NETWORK),
     };
     for (descriptor, policy) in [(WORKER_FLOOR_FD, worker_floor), (SECCOMP_FD, policy)] {
         let Some(policy) = policy else { continue };
@@ -338,7 +338,7 @@ mod tests {
             role: Role::Vm,
             command,
             grants: vec![child, parent, Grant::new(&recipe, Access::ReadOnly)],
-            policy: Some(super::super::fallback_policy::SUPERVISOR),
+            policy: Some(super::super::builtin_policy::SUPERVISOR),
             staging_directory: &std::env::temp_dir(),
         })
         .unwrap();

@@ -1,14 +1,9 @@
-use std::future::Future as _;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll, ready};
 
+use futures_util::stream;
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::{JoinHandle, spawn_blocking};
-use wasmtime::StoreContextMut;
-use wasmtime::component::{
-    Destination, FutureReader, Resource, StreamProducer, StreamReader, StreamResult,
-};
+use tokio::task::spawn_blocking;
+use wasmtime::component::{FutureReader, Resource, StreamReader};
 use wasmtime_wasi::{
     filesystem::Descriptor,
     p3::bindings::filesystem::types::{self, DirectoryEntry, ErrorCode},
@@ -16,6 +11,7 @@ use wasmtime_wasi::{
 use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
 
 use super::FsHost;
+use crate::component::relay;
 
 pub(super) fn add_windows_read_directory<T: Send + 'static>(
     interface: &mut wasmtime::component::LinkerInstance<'_, T>,
@@ -30,99 +26,50 @@ pub(super) fn add_windows_read_directory<T: Send + 'static>(
             let (completion_tx, completion_rx) = oneshot::channel();
             let stream = match directory {
                 Ok(directory) => {
-                    StreamReader::new(&mut store, DirectoryProducer::new(directory, completion_tx))?
+                    StreamReader::new(&mut store, read_entries(directory, completion_tx))?
                 }
                 Err(error) => {
                     let _ = completion_tx.send(Err(error));
                     StreamReader::new(&mut store, std::iter::empty())?
                 }
             };
-            let completion = FutureReader::new(&mut store, completion_rx)?;
+            let completion = FutureReader::new(&mut store, async move {
+                Ok::<_, wasmtime::Error>(completion_rx.await.unwrap_or(Ok(())))
+            })?;
             Ok(((stream, completion),))
         },
     )
 }
 
-struct DirectoryProducer {
-    entries: mpsc::Receiver<DirectoryEntry>,
-    task: JoinHandle<Result<(), ErrorCode>>,
-    completion: Option<oneshot::Sender<Result<(), ErrorCode>>>,
-}
-
-impl DirectoryProducer {
-    fn new(
-        directory: Arc<std::fs::File>,
-        completion: oneshot::Sender<Result<(), ErrorCode>>,
-    ) -> Self {
-        let (sender, entries) = mpsc::channel(1);
-        let task = spawn_blocking(move || {
-            let entries = terra_platform::filesystem::share::windows::read_base_dir(&directory)?;
-            for entry in entries {
-                if let Some(entry) = map_directory_entry(entry)?
-                    && sender.blocking_send(entry).is_err()
-                {
-                    break;
-                }
+/// Streams the entries from a blocking reader; the completion reports how the read ended.
+fn read_entries(
+    directory: Arc<std::fs::File>,
+    completion: oneshot::Sender<Result<(), ErrorCode>>,
+) -> relay::Stream<DirectoryEntry> {
+    let (sender, entries) = mpsc::channel(1);
+    let task = spawn_blocking(move || {
+        let entries = terra_platform::filesystem::share::windows::read_base_dir(&directory)?;
+        for entry in entries {
+            if let Some(entry) = map_directory_entry(entry)?
+                && sender.blocking_send(entry).is_err()
+            {
+                break;
             }
-            drop(directory);
-            Ok(())
-        });
-        Self {
-            entries,
-            task,
-            completion: Some(completion),
         }
-    }
-
-    fn close(&mut self, result: Result<(), ErrorCode>) {
-        self.entries.close();
-        self.task.abort();
-        if let Some(completion) = self.completion.take() {
-            let _ = completion.send(result);
-        }
-    }
-}
-
-impl<D> StreamProducer<D> for DirectoryProducer {
-    type Item = DirectoryEntry;
-    type Buffer = Option<DirectoryEntry>;
-
-    fn poll_produce<'a>(
-        self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-        mut store: StoreContextMut<'a, D>,
-        mut destination: Destination<'a, Self::Item, Self::Buffer>,
-        finish: bool,
-    ) -> Poll<wasmtime::Result<StreamResult>> {
-        if destination.remaining(&mut store) == Some(0) {
-            return Poll::Ready(Ok(StreamResult::Completed));
-        }
-        let producer = self.get_mut();
-        match producer.entries.poll_recv(context) {
-            Poll::Ready(Some(entry)) => {
-                destination.set_buffer(Some(entry));
-                Poll::Ready(Ok(StreamResult::Completed))
+        drop(directory);
+        Ok(())
+    });
+    relay::Stream::new(stream::unfold(
+        Some((entries, task, completion)),
+        |state| async move {
+            let (mut entries, task, completion) = state?;
+            if let Some(entry) = entries.recv().await {
+                return Some((entry, Some((entries, task, completion))));
             }
-            Poll::Ready(None) => {
-                let result = match ready!(Pin::new(&mut producer.task).poll(context)) {
-                    Ok(result) => result,
-                    Err(_) => Err(ErrorCode::Io),
-                };
-                producer.close(result);
-                Poll::Ready(Ok(StreamResult::Dropped))
-            }
-            Poll::Pending if finish => Poll::Ready(Ok(StreamResult::Cancelled)),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl Drop for DirectoryProducer {
-    fn drop(&mut self) {
-        if self.completion.is_some() {
-            self.close(Ok(()));
-        }
-    }
+            let _ = completion.send(task.await.unwrap_or(Err(ErrorCode::Io)));
+            None
+        },
+    ))
 }
 
 fn map_directory_entry(

@@ -1,10 +1,11 @@
-use super::{MODE_ENV, Mode, Policy, ROLE_ENV, Result, Role, wide};
+use super::{Mode, Policy, Result, Role, wide};
 use anyhow::{Context, ensure};
 use std::ffi::{OsStr, OsString, c_void};
 use std::fs::File;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use terra_platform::process;
+use terra_platform::process::sandbox_env::{WINDOWS_MODE, WINDOWS_ROLE};
 use windows_sys::Win32::Foundation::{
     HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LocalFree, SetHandleInformation,
     WAIT_OBJECT_0,
@@ -17,6 +18,7 @@ use windows_sys::Win32::Security::{
     CreateRestrictedToken, DISABLE_MAX_PRIVILEGE, DeriveCapabilitySidsFromName, EqualSid, FreeSid,
     GetTokenInformation, LUA_TOKEN, PSID, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES,
     SID_AND_ATTRIBUTES, TOKEN_ALL_ACCESS, TOKEN_GROUPS, TOKEN_INFORMATION_CLASS, TokenCapabilities,
+    TokenRestrictedSids,
 };
 use windows_sys::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
@@ -42,11 +44,14 @@ use windows_sys::Win32::System::Threading::{
 
 // VidExo gates WHP access behind this capability even for capability queries.
 const HYPERVISOR_CAPABILITY: &str = "HypervisorPlatform";
+const ALL_APPLICATION_PACKAGES_SID: &str = "S-1-15-2-1";
 const DISABLE_WIN32K: u64 = 1 << 28;
 const DISABLE_DYNAMIC_CODE: u64 = 1 << 36;
 
 pub(super) fn win_ok(result: i32) -> Result<()> {
-    ensure!(result != 0, "{}", std::io::Error::last_os_error());
+    if result == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
     Ok(())
 }
 
@@ -465,7 +470,7 @@ pub(super) fn spawn_worker(
     let mut information = PROCESS_INFORMATION::default();
     let flags = CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT;
     let token = if policy.mode == Mode::RestrictedTokenJob {
-        Some(create_restricted_token()?)
+        Some(create_restricted_token(policy.role)?)
     } else {
         None
     };
@@ -509,19 +514,36 @@ pub(super) fn spawn_worker(
     })
 }
 
-fn create_restricted_token() -> Result<OwnedHandle> {
-    let source = open_current_token(TOKEN_ALL_ACCESS)?;
-    let admin = wide(OsStr::new("S-1-5-32-544"))?;
+fn sid_from_string(name: &str) -> Result<LocalAllocation> {
+    let name = wide(OsStr::new(name))?;
     let mut sid = std::ptr::null_mut();
-    // SAFETY: the string SID is NUL-terminated and the allocation output is writable.
-    win_ok(unsafe { ConvertStringSidToSidW(admin.as_ptr(), &raw mut sid) })?;
-    let sid = LocalAllocation(sid);
+    // SAFETY: name is NUL-terminated and the allocation output is writable.
+    win_ok(unsafe { ConvertStringSidToSidW(name.as_ptr(), &raw mut sid) })?;
+    Ok(LocalAllocation(sid))
+}
+
+fn create_restricted_token(role: Role) -> Result<OwnedHandle> {
+    let source = open_current_token(TOKEN_ALL_ACCESS)?;
+    let admin = sid_from_string("S-1-5-32-544")?;
     let deny_admin = SID_AND_ATTRIBUTES {
-        Sid: sid.0,
+        Sid: admin.0,
         Attributes: 0,
     };
+    // The broker parses untrusted network payloads, so every access check is
+    // restricted to ALL APPLICATION PACKAGES: the system grants Windows ships
+    // for AppContainers keep DLL loading, Winsock and name resolution working,
+    // and host files gain nothing.
+    let restrict = if role == Role::Network {
+        Some(sid_from_string(ALL_APPLICATION_PACKAGES_SID)?)
+    } else {
+        None
+    };
+    let restrict_sids = restrict.as_ref().map(|sid| SID_AND_ATTRIBUTES {
+        Sid: sid.0,
+        Attributes: 0,
+    });
     let mut restricted = std::ptr::null_mut();
-    // SAFETY: the primary token is live, the administrator SID is retained, and restricted is writable.
+    // SAFETY: the primary token is live, the deny and restricting SIDs are retained, and restricted is writable.
     win_ok(unsafe {
         CreateRestrictedToken(
             source.as_raw_handle(),
@@ -530,12 +552,48 @@ fn create_restricted_token() -> Result<OwnedHandle> {
             &raw const deny_admin,
             0,
             std::ptr::null(),
-            0,
-            std::ptr::null(),
+            u32::from(restrict_sids.is_some()),
+            restrict_sids
+                .as_ref()
+                .map_or(std::ptr::null(), std::ptr::from_ref),
             &raw mut restricted,
         )
     })?;
-    own_handle(restricted)
+    let restricted = own_handle(restricted)?;
+    if let Some(expected) = &restrict {
+        verify_restricting_sids(&restricted, expected)?;
+    }
+    Ok(restricted)
+}
+
+/// Trusted-wrapper check that the launched token carries exactly its file-access restriction.
+fn verify_restricting_sids(token: &OwnedHandle, expected: &LocalAllocation) -> Result<()> {
+    let buffer = token_information(token, TokenRestrictedSids)?;
+    // SAFETY: TokenRestrictedSids initializes the DWORD count before its aligned SID array.
+    let count = usize::try_from(unsafe { *buffer.as_ptr().cast::<u32>() })?;
+    ensure!(
+        count == 1
+            && std::mem::offset_of!(TOKEN_GROUPS, Groups)
+                + count * std::mem::size_of::<SID_AND_ATTRIBUTES>()
+                <= std::mem::size_of_val(buffer.as_slice()),
+        "Windows broker token carries unexpected restricting SIDs"
+    );
+    // SAFETY: the preceding check bounds the initialized restricting SID array.
+    let restricting = unsafe {
+        std::slice::from_raw_parts(
+            buffer
+                .as_ptr()
+                .cast::<SID_AND_ATTRIBUTES>()
+                .byte_add(std::mem::offset_of!(TOKEN_GROUPS, Groups)),
+            count,
+        )
+    };
+    ensure!(
+        // SAFETY: both SIDs are initialized and retained throughout the comparison.
+        unsafe { EqualSid(restricting[0].Sid, expected.0) } != 0,
+        "Windows broker restriction is not ALL APPLICATION PACKAGES"
+    );
+    Ok(())
 }
 
 fn build_capability_sids(policy: &Policy) -> Result<Vec<LocalAllocation>> {
@@ -574,15 +632,15 @@ fn build_worker_environment(policy: &Policy) -> Result<Vec<u16>> {
                 super::SPEC_ENV,
                 super::IDENTITY_ENV,
                 super::PARENT_ENV,
-                ROLE_ENV,
-                MODE_ENV,
+                WINDOWS_ROLE,
+                WINDOWS_MODE,
             ]
             .iter()
             .any(|excluded| name.eq_ignore_ascii_case(excluded))
         })
         .collect();
-    environment.push((ROLE_ENV.into(), policy.role.name().into()));
-    environment.push((MODE_ENV.into(), policy.mode.name().into()));
+    environment.push((WINDOWS_ROLE.into(), policy.role.name().into()));
+    environment.push((WINDOWS_MODE.into(), policy.mode.name().into()));
     environment.sort_by(|(left, _), (right, _)| {
         left.to_ascii_lowercase().cmp(&right.to_ascii_lowercase())
     });

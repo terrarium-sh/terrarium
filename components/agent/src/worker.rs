@@ -136,7 +136,7 @@ fn read_clients(
 async fn bridge_client(stream: yamux::Stream, client: host_service::Client) {
     let (mut guest_reader, mut guest_writer) = AsyncReadExt::split(stream);
     let (mut output_writer, output) = crate::wit_stream::new();
-    let mut host_reader = client.input();
+    let mut host_reader = client.connect(output);
     let to_host = async move {
         let mut bytes = vec![0; MAX_STREAM_FRAME_BYTES];
         loop {
@@ -169,7 +169,7 @@ async fn bridge_client(stream: yamux::Stream, client: host_service::Client) {
         }
         let _ = guest_writer.close().await;
     };
-    let _ = future::join3(client.output(output), to_host, to_guest).await;
+    future::join(to_host, to_guest).await;
 }
 
 fn poll_new_client(

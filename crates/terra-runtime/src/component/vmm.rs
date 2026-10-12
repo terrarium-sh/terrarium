@@ -73,10 +73,7 @@ pub struct FailureObservation {
 impl FailureObservation {
     #[must_use]
     pub fn failure(&self) -> Option<String> {
-        self.failure
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        crate::component::recorded_failure(&self.failure)
     }
 }
 
@@ -136,7 +133,7 @@ impl BoxRuntime {
         &mut self,
         artifacts: &crate::TrustedArtifacts,
     ) -> wasmtime::Result<()> {
-        let component = artifacts.vmm().deserialize(self.store.engine())?;
+        let component = artifacts.vmm.deserialize(self.store.engine())?;
         self.initialize_vmm(&component).await
     }
 }

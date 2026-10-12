@@ -1,4 +1,4 @@
-use terra_runtime::TrustedArtifacts;
+use terra_runtime::{TrustedArtifact, TrustedArtifacts};
 
 pub mod agent;
 #[allow(dead_code)]

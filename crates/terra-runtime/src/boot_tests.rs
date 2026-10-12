@@ -1,3 +1,4 @@
+use crate::component::AccessMode;
 use crate::component::network::{NetworkBackend, PortMapping};
 use std::assert_matches;
 use terra_network::config::{Config, Network, PublishedListener, StaticDnsRecord};
@@ -25,10 +26,7 @@ fn load_kernel(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
 }
 
 fn kernel_boot_assets() -> (Vec<u8>, Vec<u8>, tempfile::TempPath) {
-    let build = std::env::var_os("TERRA_BOOT_ASSETS_DIR").map_or_else(
-        || std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../build"),
-        std::path::PathBuf::from,
-    );
+    let build = crate::test_fixtures::boot_assets_dir();
     let decode = |name| {
         flate2::read::GzDecoder::new(
             std::fs::File::open(build.join(name)).expect("run `make build` first"),
@@ -54,29 +52,13 @@ fn boot_plan(
     workload: Vec<String>,
     await_initial_session: bool,
 ) -> Vec<u8> {
-    use std::collections::BTreeMap;
-    use terra_protocol::{Net, Plan, encode_frame};
+    use terra_protocol::{Plan, encode_frame};
     let plan = Plan {
         mode,
-        workdir: None,
-        shares: Vec::new(),
-        volumes: Vec::new(),
-        net: Net::Tsi,
-        published_ports: Vec::new(),
-        published_udp_ports: Vec::new(),
-        env: BTreeMap::new(),
         root: true,
-        sudo: Vec::new(),
         on_create,
-        on_start: Vec::new(),
-        pre_stop: Vec::new(),
-        daemons: Vec::new(),
-        workload,
-        sandbox_info: String::new(),
         await_initial_session,
-        host_tz: None,
-        host_time: None,
-        host_seed: None,
+        ..Plan::bare_run(workload)
     };
     encode_frame(&terra_protocol::BootPlan::new(plan)).expect("plan encodes")
 }
@@ -141,7 +123,7 @@ async fn kernel_boots_directory_share() {
         boot_disk,
         root_disk: root_disk.to_path_buf(),
         volume_disks: Vec::new(),
-        shares: vec![crate::component::fs::ShareGrant::new(&mount, false).unwrap()],
+        shares: vec![crate::component::fs::ShareGrant::new(&mount, AccessMode::ReadWrite).unwrap()],
         plan: encode_frame(&terra_protocol::BootPlan::new(plan)).unwrap(),
         artifacts: crate::test_fixtures::trusted_artifacts(),
         network_backend: Some(create_boot_network_backend()),
@@ -949,7 +931,9 @@ async fn kernel_boots_control_and_stop_progress_with_stalled_network_and_file() 
         boot_disk,
         root_disk: root_path.to_path_buf(),
         volume_disks: Vec::new(),
-        shares: vec![crate::component::fs::ShareGrant::new(directory.path(), false).unwrap()],
+        shares: vec![
+            crate::component::fs::ShareGrant::new(directory.path(), AccessMode::ReadWrite).unwrap(),
+        ],
         plan: encode_frame(&envelope).unwrap(),
         artifacts: crate::test_fixtures::trusted_artifacts(),
         network_backend: Some(start_network_broker(
@@ -1250,7 +1234,9 @@ async fn assert_vsock_reset_effect(shared_reset: bool) {
         boot_disk,
         root_disk: root_path.to_path_buf(),
         volume_disks: Vec::new(),
-        shares: vec![crate::component::fs::ShareGrant::new(directory.path(), false).unwrap()],
+        shares: vec![
+            crate::component::fs::ShareGrant::new(directory.path(), AccessMode::ReadWrite).unwrap(),
+        ],
         plan: encode_frame(&envelope).unwrap(),
         artifacts: crate::test_fixtures::trusted_artifacts(),
         network_backend: Some(start_network_broker(
@@ -1360,7 +1346,9 @@ async fn kernel_boots_libc_dns_tcp_fallback() {
         boot_disk,
         root_disk: root_path.to_path_buf(),
         volume_disks: Vec::new(),
-        shares: vec![crate::component::fs::ShareGrant::new(directory.path(), true).unwrap()],
+        shares: vec![
+            crate::component::fs::ShareGrant::new(directory.path(), AccessMode::ReadOnly).unwrap(),
+        ],
         plan: encode_frame(&terra_protocol::BootPlan::new(plan)).unwrap(),
         artifacts: crate::test_fixtures::trusted_artifacts(),
         network_backend: Some(backend),
@@ -1879,7 +1867,10 @@ async fn kernel_network_idle_sockets_preserve_tcp_progress() {
             boot_disk,
             root_disk: root_path.to_path_buf(),
             volume_disks: Vec::new(),
-            shares: vec![crate::component::fs::ShareGrant::new(directory.path(), true).unwrap()],
+            shares: vec![
+                crate::component::fs::ShareGrant::new(directory.path(), AccessMode::ReadOnly)
+                    .unwrap(),
+            ],
             plan: encode_frame(&envelope).unwrap(),
             artifacts: crate::test_fixtures::trusted_artifacts(),
             network_backend: Some(backend),

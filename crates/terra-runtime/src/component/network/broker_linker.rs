@@ -3,28 +3,27 @@ use super::bindings::terra::network::broker::{
     DatagramBatch as BrokerDatagramBatch, DatagramHeader as BrokerDatagramHeader,
     Error as BrokerError, IpAddress, SendFailure as BrokerSendFailure, SocketAddress,
 };
+use super::host::Denial;
+use crate::component::relay::{
+    self, ByteReceiver, ByteStream, ResourceStream, WriteCancelled, byte_channel,
+};
+use bytes::Bytes;
 use futures_util::StreamExt;
-use futures_util::future::BoxFuture;
-use futures_util::stream::BoxStream;
+use futures_util::stream;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use terra_network::{Client, Error, TcpDownload, TcpFlow, TcpUpload, UdpFlow};
 use terra_protocol::network::{
     DATAGRAM_FRAME_OVERHEAD_BYTES, DatagramBatch, DatagramHeader, MAX_NETWORK_CHUNK_BYTES,
     MAX_NETWORK_DATAGRAM_BATCH_BYTES, MAX_NETWORK_DATAGRAMS, MAX_NETWORK_NAME_BYTES, ResourceKind,
     SendFailure,
 };
-use tokio::sync::{mpsc, oneshot};
-use tokio_util::sync::{CancellationToken, PollSender};
-use wasmtime::component::{
-    Destination, FutureReader, Resource, ResourceType, Source, StreamConsumer, StreamProducer,
-    StreamReader, StreamResult, VecBuffer, WasmList,
-};
+use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
+use wasmtime::component::{FutureReader, Resource, ResourceType, StreamReader, WasmList};
 use wasmtime::{AsContext, AsContextMut, StoreContextMut};
 use wasmtime_wasi::WasiView;
 
-const UPLOAD_QUEUE_CHUNKS: usize = 2;
+const BROKER_INTERFACE: &str = "terra:network/broker@0.1.0";
 
 /// Each half is handed to the guest by its first `send` or `receive`; a second call finds `None`.
 struct BrokerTcp {
@@ -117,85 +116,6 @@ fn create_completion<T: 'static>(
     Ok((Completion(Some(sender)), future))
 }
 
-struct UploadPipe {
-    sender: PollSender<Vec<u8>>,
-    cancelled: CancellationToken,
-}
-
-impl<T: 'static> StreamConsumer<T> for UploadPipe {
-    type Item = u8;
-
-    fn poll_consume(
-        mut self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-        store: StoreContextMut<T>,
-        source: Source<'_, u8>,
-        finish: bool,
-    ) -> Poll<wasmtime::Result<StreamResult>> {
-        if finish {
-            self.sender.abort_send();
-            self.cancelled.cancel();
-            return Poll::Ready(Ok(StreamResult::Cancelled));
-        }
-        if std::task::ready!(self.sender.poll_reserve(context)).is_err() {
-            return Poll::Ready(Ok(StreamResult::Dropped));
-        }
-        let mut source = source.as_direct(store);
-        let count = source.remaining().len().min(MAX_NETWORK_CHUNK_BYTES);
-        if count == 0 {
-            self.sender.abort_send();
-            return Poll::Ready(Ok(StreamResult::Completed));
-        }
-        let bytes = source.remaining()[..count].to_vec();
-        source.mark_read(count);
-        let result = self.sender.send_item(bytes);
-        Poll::Ready(Ok(if result.is_ok() {
-            StreamResult::Completed
-        } else {
-            StreamResult::Dropped
-        }))
-    }
-}
-
-/// Writes the guest's chunks in order, then finishes the upload when the guest stream ends.
-/// A failed upload closes the whole flow; a cancelled one does not.
-fn start_upload(
-    mut upload: TcpUpload,
-    closed: &CancellationToken,
-    mut completion: Completion,
-) -> UploadPipe {
-    let (sender, mut chunks) = mpsc::channel::<Vec<u8>>(UPLOAD_QUEUE_CHUNKS);
-    let cancelled = closed.child_token();
-    let task_cancelled = cancelled.clone();
-    let closed = closed.clone();
-    tokio::spawn(async move {
-        let uploading = async {
-            loop {
-                let chunk = tokio::select! {
-                    chunk = chunks.recv() => chunk,
-                    error = upload.wait_failed() => return Err(error),
-                };
-                let Some(chunk) = chunk else { break };
-                upload.write(&chunk).await?;
-            }
-            upload.finish().await
-        };
-        let result = tokio::select! {
-            biased;
-            () = task_cancelled.cancelled() => Err(Error::Cancelled),
-            result = uploading => result,
-        };
-        if result.is_err_and(|error| error != Error::Cancelled) {
-            closed.cancel();
-        }
-        completion.finish(result);
-    });
-    UploadPipe {
-        sender: PollSender::new(sender),
-        cancelled,
-    }
-}
-
 fn begin_send<D: 'static>(
     mut store: impl AsContextMut<Data = D>,
     upload: Option<TcpUpload>,
@@ -208,48 +128,65 @@ fn begin_send<D: 'static>(
         completion.finish(Err(Error::InvalidState));
         return Ok(());
     };
-    data.pipe(store, start_upload(upload, closed, completion))
+    let (sink, chunks) = byte_channel(MAX_NETWORK_CHUNK_BYTES);
+    tokio::spawn(upload_chunks(upload, chunks, closed.clone(), completion));
+    data.pipe(store, sink)
 }
 
-/// Hands the guest each batch the stream yields; the stream's end or error finishes the completion.
-struct ItemStream<Item> {
-    stream: BoxStream<'static, Result<Vec<Item>, Error>>,
-    completion: Completion,
-    is_ended: bool,
-}
-
-impl<T: 'static, Item: Send + Sync + 'static> StreamProducer<T> for ItemStream<Item> {
-    type Item = Item;
-    type Buffer = VecBuffer<Item>;
-
-    fn poll_produce<'a>(
-        mut self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-        mut store: StoreContextMut<'a, T>,
-        mut destination: Destination<'a, Item, Self::Buffer>,
-        finish: bool,
-    ) -> Poll<wasmtime::Result<StreamResult>> {
-        if finish {
-            return Poll::Ready(Ok(StreamResult::Cancelled));
-        }
-        if self.is_ended {
-            return Poll::Ready(Ok(StreamResult::Dropped));
-        }
-        if destination.remaining(&mut store) == Some(0) {
-            return Poll::Ready(Ok(StreamResult::Completed));
-        }
-        let result = match std::task::ready!(self.stream.poll_next_unpin(context)) {
-            Some(Ok(items)) => {
-                destination.set_buffer(items.into());
-                return Poll::Ready(Ok(StreamResult::Completed));
+/// Writes the guest's chunks in order, then finishes the upload when the guest stream ends.
+/// A failed upload closes the whole flow; a cancelled one does not.
+async fn upload_chunks(
+    mut upload: TcpUpload,
+    mut chunks: ByteReceiver,
+    closed: CancellationToken,
+    mut completion: Completion,
+) {
+    let write_cancelled = chunks.cancellation();
+    let uploading = async {
+        loop {
+            let chunk = tokio::select! {
+                chunk = chunks.next() => chunk,
+                error = upload.wait_failed() => return Err(error),
+            };
+            match chunk {
+                Some(Ok(chunk)) => upload.write(&chunk).await?,
+                Some(Err(WriteCancelled)) => return Err(Error::Cancelled),
+                None => break,
             }
-            Some(Err(error)) => Err(error),
-            None => Ok(()),
-        };
-        self.is_ended = true;
-        self.completion.finish(result);
-        Poll::Ready(Ok(StreamResult::Dropped))
+        }
+        upload.finish().await
+    };
+    let result = tokio::select! {
+        biased;
+        () = closed.cancelled() => Err(Error::Cancelled),
+        () = write_cancelled.cancelled() => Err(Error::Cancelled),
+        result = uploading => result,
+    };
+    if result.is_err_and(|error| error != Error::Cancelled) {
+        closed.cancel();
     }
+    completion.finish(result);
+}
+
+/// Yields the items until the first error; the completion reports how the stream ended.
+fn finish_on_end<T: Send + 'static>(
+    items: impl futures_util::Stream<Item = Result<T, Error>> + Send + 'static,
+    completion: Completion,
+) -> impl futures_util::Stream<Item = T> + Send + 'static {
+    stream::unfold(Some((items.boxed(), completion)), |state| async move {
+        let (mut items, mut completion) = state?;
+        match items.next().await {
+            Some(Ok(item)) => Some((item, Some((items, completion)))),
+            Some(Err(error)) => {
+                completion.finish(Err(error));
+                None
+            }
+            None => {
+                completion.finish(Ok(()));
+                None
+            }
+        }
+    })
 }
 
 type ReceiveState<Flow> = Option<(Flow, CancellationToken)>;
@@ -269,16 +206,10 @@ async fn next_chunk(
 
 async fn next_datagrams(
     state: ReceiveState<UdpFlow>,
-) -> Option<(
-    Result<Vec<BrokerDatagramBatch>, Error>,
-    ReceiveState<UdpFlow>,
-)> {
+) -> Option<(Result<BrokerDatagramBatch, Error>, ReceiveState<UdpFlow>)> {
     let (flow, closed) = state?;
     Some(match until_closed(&closed, flow.receive()).await {
-        Ok(datagrams) => (
-            Ok(vec![broker_datagram_batch(datagrams)]),
-            Some((flow, closed)),
-        ),
+        Ok(datagrams) => (Ok(broker_datagram_batch(datagrams)), Some((flow, closed))),
         Err(error) => (Err(error), None),
     })
 }
@@ -294,10 +225,7 @@ fn broker_datagram_batch(batch: DatagramBatch) -> BrokerDatagramBatch {
                      length,
                      segment,
                  }| BrokerDatagramHeader {
-                    peer: SocketAddress {
-                        address: ip_address(peer.ip()),
-                        port: peer.port(),
-                    },
+                    peer: socket_address(peer),
                     length,
                     segment,
                 },
@@ -314,20 +242,14 @@ fn begin_receive<D: 'static>(
     closed: &CancellationToken,
     mut completion: Completion,
 ) -> wasmtime::Result<StreamReader<u8>> {
-    let stream = if let Some(download) = download {
-        futures_util::stream::unfold(Some((download, closed.clone())), next_chunk).boxed()
+    let chunks = if let Some(download) = download {
+        stream::unfold(Some((download, closed.clone())), next_chunk).boxed()
     } else {
         completion.finish(Err(Error::InvalidState));
-        futures_util::stream::empty().boxed()
+        stream::empty().boxed()
     };
-    StreamReader::new(
-        store,
-        ItemStream {
-            stream,
-            completion,
-            is_ended: false,
-        },
-    )
+    let chunks = finish_on_end(chunks, completion).map(Bytes::from);
+    StreamReader::new(store, ByteStream::new(chunks))
 }
 
 async fn until_closed<R>(
@@ -341,64 +263,6 @@ async fn until_closed<R>(
     }
 }
 
-struct Accept {
-    client: Client,
-    grant: terra_network::ListenerGrant,
-    closed: CancellationToken,
-    pending: Option<BoxFuture<'static, Result<TcpFlow, Error>>>,
-    completion: Completion,
-    is_eof: bool,
-}
-
-impl<T: WasiView + 'static> StreamProducer<T> for Accept {
-    type Item = Resource<BrokerTcp>;
-    type Buffer = VecBuffer<Self::Item>;
-
-    fn poll_produce<'a>(
-        mut self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-        mut store: StoreContextMut<'a, T>,
-        mut destination: Destination<'a, Self::Item, Self::Buffer>,
-        finish: bool,
-    ) -> Poll<wasmtime::Result<StreamResult>> {
-        if finish {
-            self.pending = None;
-            return Poll::Ready(Ok(StreamResult::Cancelled));
-        }
-        if self.is_eof {
-            return Poll::Ready(Ok(StreamResult::Dropped));
-        }
-        if destination.remaining(&mut store) == Some(0) {
-            return Poll::Ready(Ok(StreamResult::Completed));
-        }
-        let client = self.client.clone();
-        let grant = self.grant;
-        let closed = self.closed.clone();
-        let pending = self.pending.get_or_insert_with(|| {
-            Box::pin(async move { until_closed(&closed, client.accept(grant)).await })
-        });
-        let result = std::task::ready!(pending.as_mut().poll(context));
-        self.pending = None;
-        match result {
-            Ok(flow) => {
-                if let Ok(resource) = store.data_mut().ctx().table.push(BrokerTcp::new(flow)) {
-                    destination.set_buffer(vec![resource].into());
-                    Poll::Ready(Ok(StreamResult::Completed))
-                } else {
-                    self.is_eof = true;
-                    self.completion.finish(Err(Error::LimitExceeded));
-                    Poll::Ready(Ok(StreamResult::Dropped))
-                }
-            }
-            Err(error) => {
-                self.is_eof = true;
-                self.completion.finish(Err(error));
-                Poll::Ready(Ok(StreamResult::Dropped))
-            }
-        }
-    }
-}
-
 fn begin_accept<D: WasiView + 'static>(
     store: impl AsContextMut<Data = D>,
     client: Client,
@@ -407,20 +271,27 @@ fn begin_accept<D: WasiView + 'static>(
     is_duplicate: bool,
     mut completion: Completion,
 ) -> wasmtime::Result<StreamReader<Resource<BrokerTcp>>> {
-    if is_duplicate {
+    let flows = if is_duplicate {
         completion.finish(Err(Error::InvalidState));
-    }
-    StreamReader::new(
-        store,
-        Accept {
-            client,
-            grant,
-            closed,
-            pending: None,
-            completion,
-            is_eof: is_duplicate,
-        },
-    )
+        stream::empty().boxed()
+    } else {
+        stream::unfold((client, closed), move |(client, closed)| async move {
+            let flow = until_closed(&closed, client.accept(grant)).await;
+            Some((flow, (client, closed)))
+        })
+        .boxed()
+    };
+    let push = move |host: &mut D, accepted: Result<TcpFlow, Error>| {
+        let pushed = accepted.and_then(|flow| push_resource(host, BrokerTcp::new(flow)));
+        match pushed {
+            Ok(resource) => Ok(Some(resource)),
+            Err(error) => {
+                completion.finish(Err(error));
+                Ok(None)
+            }
+        }
+    };
+    StreamReader::new(store, ResourceStream::new(flows, push))
 }
 
 fn broker_error(error: Error) -> BrokerError {
@@ -442,6 +313,13 @@ fn broker_error(error: Error) -> BrokerError {
         Error::DatagramTooLarge => BrokerError::DatagramTooLarge,
         Error::Closed => BrokerError::Closed,
         Error::Io | Error::Protocol => BrokerError::Io,
+    }
+}
+
+fn socket_address(address: SocketAddr) -> SocketAddress {
+    SocketAddress {
+        address: ip_address(address.ip()),
+        port: address.port(),
     }
 }
 
@@ -501,45 +379,46 @@ fn resolve_listener_grant(
         .ok_or(Error::AccessDenied)
 }
 
+fn push_resource<T: WasiView, R: Send + 'static>(
+    host: &mut T,
+    resource: R,
+) -> Result<Resource<R>, Error> {
+    host.ctx()
+        .table
+        .push(resource)
+        .map_err(|_| Error::LimitExceeded)
+}
+
+fn drop_resource<T: WasiView, R: 'static>(
+    mut store: StoreContextMut<T>,
+    rep: u32,
+) -> wasmtime::Result<()> {
+    store
+        .data_mut()
+        .ctx()
+        .table
+        .delete(Resource::<R>::new_own(rep))?;
+    Ok(())
+}
+
 pub(crate) fn add<T: WasiView + AsMut<NetworkHost> + 'static>(
     linker: &mut wasmtime::component::Linker<T>,
 ) -> wasmtime::Result<()> {
-    let mut interface = linker.instance("terra:network/broker@0.1.0")?;
+    let mut interface = linker.instance(BROKER_INTERFACE)?;
     interface.resource(
         "tcp",
         ResourceType::host::<BrokerTcp>(),
-        |mut store, rep| {
-            store
-                .data_mut()
-                .ctx()
-                .table
-                .delete(Resource::<BrokerTcp>::new_own(rep))?;
-            Ok(())
-        },
+        drop_resource::<T, BrokerTcp>,
     )?;
     interface.resource(
         "udp",
         ResourceType::host::<BrokerUdp>(),
-        |mut store, rep| {
-            store
-                .data_mut()
-                .ctx()
-                .table
-                .delete(Resource::<BrokerUdp>::new_own(rep))?;
-            Ok(())
-        },
+        drop_resource::<T, BrokerUdp>,
     )?;
     interface.resource(
         "listener",
         ResourceType::host::<BrokerListener>(),
-        |mut store, rep| {
-            store
-                .data_mut()
-                .ctx()
-                .table
-                .delete(Resource::<BrokerListener>::new_own(rep))?;
-            Ok(())
-        },
+        drop_resource::<T, BrokerListener>,
     )?;
     add_open(&mut interface)?;
     add_listener(&mut interface)?;
@@ -580,15 +459,15 @@ fn add_open<T: WasiView + AsMut<NetworkHost> + 'static>(
                     && let Ok(peer) = peer
                 {
                     access.with(|mut store| {
-                        store.get().as_mut().report_denial(&peer.to_string(), false);
+                        store
+                            .get()
+                            .as_mut()
+                            .report_denial(&peer.to_string(), Denial::Access);
                     });
                 }
-                let result = match result {
-                    Ok(flow) => access
-                        .with(|mut store| store.get().ctx().table.push(BrokerTcp::new(flow)))
-                        .map_err(|_| Error::LimitExceeded),
-                    Err(error) => Err(error),
-                };
+                let result = result.and_then(|flow| {
+                    access.with(|mut store| push_resource(store.get(), BrokerTcp::new(flow)))
+                });
                 Ok((result.map_err(broker_error),))
             })
         },
@@ -599,12 +478,9 @@ fn add_open<T: WasiView + AsMut<NetworkHost> + 'static>(
                 Ok(client) => client,
                 Err(error) => return Ok((Err(broker_error(error)),)),
             };
-            let result = match client.open_udp().await {
-                Ok(flow) => access
-                    .with(|mut store| store.get().ctx().table.push(BrokerUdp::new(flow)))
-                    .map_err(|_| Error::LimitExceeded),
-                Err(error) => Err(error),
-            };
+            let result = client.open_udp().await.and_then(|flow| {
+                access.with(|mut store| push_resource(store.get(), BrokerUdp::new(flow)))
+            });
             Ok((result.map_err(broker_error),))
         })
     })?;
@@ -627,27 +503,17 @@ fn add_listener<T: WasiView + AsMut<NetworkHost> + 'static>(
                 Ok((client, grant)) => client.open_published_udp(grant).await,
                 Err(error) => Err(error),
             };
-            let result = match result {
-                Ok(flow) => access
-                    .with(|mut store| store.get().ctx().table.push(BrokerUdp::new(flow)))
-                    .map_err(|_| Error::LimitExceeded),
-                Err(error) => Err(error),
-            };
+            let result = result.and_then(|flow| {
+                access.with(|mut store| push_resource(store.get(), BrokerUdp::new(flow)))
+            });
             Ok((result.map_err(broker_error),))
         })
     })?;
     interface.func_wrap(
         "published-listener",
         |mut store, (host_port, ipv6): (u16, bool)| {
-            let result =
-                grant_listener(store.data_mut().as_mut(), host_port, ipv6).and_then(|listener| {
-                    store
-                        .data_mut()
-                        .ctx()
-                        .table
-                        .push(listener)
-                        .map_err(|_| Error::LimitExceeded)
-                });
+            let result = grant_listener(store.data_mut().as_mut(), host_port, ipv6)
+                .and_then(|listener| push_resource(store.data_mut(), listener));
             Ok((result.map_err(broker_error),))
         },
     )?;
@@ -676,11 +542,7 @@ fn add_tcp_io<T: WasiView + AsMut<NetworkHost> + 'static>(
         "[method]tcp.peer-address",
         |mut store, (resource,): (Resource<BrokerTcp>,)| {
             let tcp = store.data_mut().ctx().table.get(&resource)?;
-            let address = SocketAddress {
-                address: ip_address(tcp.peer.ip()),
-                port: tcp.peer.port(),
-            };
-            Ok((Ok::<_, BrokerError>(address),))
+            Ok((Ok::<_, BrokerError>(socket_address(tcp.peer)),))
         },
     )?;
     interface.func_wrap(
@@ -727,7 +589,10 @@ fn add_udp<T: WasiView + AsMut<NetworkHost> + 'static>(
                 if let Ok((_, denied)) = &result {
                     access.with(|mut store| {
                         for peer in denied {
-                            store.get().as_mut().report_denial(&peer.to_string(), false);
+                            store
+                                .get()
+                                .as_mut()
+                                .report_denial(&peer.to_string(), Denial::Access);
                         }
                     });
                 }
@@ -742,21 +607,14 @@ fn add_udp<T: WasiView + AsMut<NetworkHost> + 'static>(
             let is_duplicate = std::mem::replace(&mut udp.is_receiving, true);
             let (flow, closed) = (udp.flow.clone(), udp.closed.clone());
             let (mut completion, future) = create_completion(&mut store)?;
-            if is_duplicate {
+            let datagrams = if is_duplicate {
                 completion.finish(Err(Error::InvalidState));
-            }
-            let stream = StreamReader::new(
-                &mut store,
-                ItemStream {
-                    stream: if is_duplicate {
-                        futures_util::stream::empty().boxed()
-                    } else {
-                        futures_util::stream::unfold(Some((flow, closed)), next_datagrams).boxed()
-                    },
-                    completion,
-                    is_ended: false,
-                },
-            )?;
+                stream::empty().boxed()
+            } else {
+                stream::unfold(Some((flow, closed)), next_datagrams).boxed()
+            };
+            let datagrams = relay::Stream::new(finish_on_end(datagrams, completion));
+            let stream = StreamReader::new(&mut store, datagrams)?;
             Ok(((stream, future),))
         },
     )?;
@@ -881,7 +739,10 @@ fn add_resolve<T: WasiView + AsMut<NetworkHost> + 'static>(
                         .map(|addresses| addresses.into_iter().map(ip_address).collect::<Vec<_>>());
                     if matches!(result, Err(Error::AccessDenied)) {
                         access.with(|mut store| {
-                            store.get().as_mut().report_denial(&name, true);
+                            store
+                                .get()
+                                .as_mut()
+                                .report_denial(&name, Denial::NameLookup);
                         });
                     }
                     result
@@ -938,30 +799,6 @@ mod tests {
     fn completion() -> (Completion, oneshot::Receiver<Result<(), Error>>) {
         let (sender, receiver) = oneshot::channel();
         (Completion(Some(sender)), receiver)
-    }
-
-    struct CollectBytes(mpsc::UnboundedSender<Vec<u8>>);
-
-    impl StreamConsumer<()> for CollectBytes {
-        type Item = u8;
-
-        fn poll_consume(
-            self: Pin<&mut Self>,
-            _: &mut Context<'_>,
-            store: StoreContextMut<()>,
-            source: Source<'_, u8>,
-            finish: bool,
-        ) -> Poll<wasmtime::Result<StreamResult>> {
-            if finish {
-                return Poll::Ready(Ok(StreamResult::Cancelled));
-            }
-            let mut source = source.as_direct(store);
-            let count = source.remaining().len().min(997);
-            let bytes = source.remaining()[..count].to_vec();
-            source.mark_read(count);
-            let _ = self.0.send(bytes);
-            Poll::Ready(Ok(StreamResult::Completed))
-        }
     }
 
     #[tokio::test]
@@ -1107,7 +944,7 @@ mod tests {
     ) -> (Vec<u8>, Result<(), Error>) {
         let mut store = unit_store();
         let (completion, outcome) = completion();
-        let (collected, mut chunks) = mpsc::unbounded_channel();
+        let (sink, mut chunks) = byte_channel(997);
         let input = begin_receive(
             &mut store,
             tcp.unclaimed_download.take(),
@@ -1115,15 +952,21 @@ mod tests {
             completion,
         )
         .unwrap();
-        input.pipe(&mut store, CollectBytes(collected)).unwrap();
+        input.pipe(&mut store, sink).unwrap();
         store
             .run_concurrent(async |_| {
-                finish_remote(remote).await;
-                let outcome = outcome.await.unwrap();
-                let mut received = Vec::new();
-                while let Ok(chunk) = chunks.try_recv() {
-                    received.extend(chunk);
-                }
+                let collecting = async {
+                    let mut received = Vec::new();
+                    while let Some(chunk) = chunks.next().await {
+                        received.extend(chunk.unwrap());
+                    }
+                    received
+                };
+                let finishing = async {
+                    finish_remote(remote).await;
+                    outcome.await.unwrap()
+                };
+                let (received, outcome) = tokio::join!(collecting, finishing);
                 drop(tcp);
                 (received, outcome)
             })
@@ -1215,19 +1058,6 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_a_pending_accept_stream_releases_the_listener_grant() {
-        struct AcceptSink;
-        impl StreamConsumer<crate::component::vsock::VsockHost> for AcceptSink {
-            type Item = Resource<BrokerTcp>;
-            fn poll_consume(
-                self: Pin<&mut Self>,
-                _: &mut Context<'_>,
-                _: StoreContextMut<crate::component::vsock::VsockHost>,
-                _: Source<'_, Self::Item>,
-                _: bool,
-            ) -> Poll<wasmtime::Result<StreamResult>> {
-                Poll::Pending
-            }
-        }
         bounded(async {
             let reserved = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = reserved.local_addr().unwrap();
@@ -1253,7 +1083,9 @@ mod tests {
                 done,
             )
             .unwrap();
-            input.pipe(&mut store, AcceptSink).unwrap();
+            let (unread_sink, _unread) =
+                relay::channel::<Resource<BrokerTcp>>(std::num::NonZeroUsize::MIN);
+            input.pipe(&mut store, unread_sink).unwrap();
             store
                 .run_concurrent(async |_| {
                     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1469,7 +1301,10 @@ mod tests {
 
     #[tokio::test]
     async fn broker_closed_future_supports_idle_eof_absence_and_cancellation() {
-        use wasmtime::component::FutureConsumer;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        use wasmtime::StoreContextMut;
+        use wasmtime::component::{FutureConsumer, Source};
         struct Closed(Option<oneshot::Sender<()>>);
         impl FutureConsumer<crate::component::vsock::VsockHost> for Closed {
             type Item = ();

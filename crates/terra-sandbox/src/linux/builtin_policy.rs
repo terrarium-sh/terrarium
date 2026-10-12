@@ -83,12 +83,12 @@ mod tests {
 
     #[test]
     fn filter_allows_getpid_and_denies_ptrace_in_child() {
-        const CHILD: &str = "TERRA_FALLBACK_SECCOMP_TEST_CHILD";
+        const CHILD: &str = "TERRA_BUILTIN_SECCOMP_TEST_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "linux::fallback_policy::tests::filter_allows_getpid_and_denies_ptrace_in_child",
+                    "linux::builtin_policy::tests::filter_allows_getpid_and_denies_ptrace_in_child",
                 ])
                 .env(CHILD, "1")
                 .output()
@@ -103,7 +103,7 @@ mod tests {
                 let output = std::process::Command::new(std::env::current_exe().unwrap())
                     .args([
                         "--exact",
-                        "linux::fallback_policy::tests::filter_allows_getpid_and_denies_ptrace_in_child",
+                        "linux::builtin_policy::tests::filter_allows_getpid_and_denies_ptrace_in_child",
                     ])
                     .env(CHILD, "x32")
                     .output()
@@ -118,13 +118,13 @@ mod tests {
 
     #[test]
     fn worker_filters_separate_native_network_and_virtualization_authority() {
-        const CHILD: &str = "TERRA_ROLE_FALLBACK_TEST_CHILD";
+        const CHILD: &str = "TERRA_ROLE_BUILTIN_TEST_CHILD";
         let Ok(role) = std::env::var(CHILD) else {
             for role in ["vm", "network"] {
                 let output = std::process::Command::new(std::env::current_exe().unwrap())
                     .args([
                         "--exact",
-                        "linux::fallback_policy::tests::worker_filters_separate_native_network_and_virtualization_authority",
+                        "linux::builtin_policy::tests::worker_filters_separate_native_network_and_virtualization_authority",
                     ])
                     .env(CHILD, role)
                     .output()
@@ -141,7 +141,7 @@ mod tests {
         let filter = match role.as_str() {
             "vm" => VM,
             "network" => NETWORK,
-            role => panic!("invalid fallback role: {role}"),
+            role => panic!("invalid built-in role: {role}"),
         };
         super::super::seccomp::install_policy(filter).unwrap();
         std::os::unix::net::UnixStream::pair().unwrap();
@@ -266,7 +266,7 @@ mod tests {
         unsafe {
             assert!(libc::syscall(libc::SYS_getpid) > 0);
             #[cfg(target_arch = "x86_64")]
-            if std::env::var("TERRA_FALLBACK_SECCOMP_TEST_CHILD").unwrap() == "x32" {
+            if std::env::var("TERRA_BUILTIN_SECCOMP_TEST_CHILD").unwrap() == "x32" {
                 libc::syscall(libc::SYS_getpid | 0x4000_0000);
                 panic!("x32 syscall was not killed");
             }

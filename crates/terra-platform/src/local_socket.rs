@@ -24,6 +24,12 @@ pub fn create_local_pair() -> std::io::Result<(LocalStream, LocalStream)> {
 #[cfg(unix)]
 pub use tokio::net::UnixStream as AsyncLocalStream;
 
+/// Ends the stream's write direction at once, so the peer reads EOF while this end can still read.
+#[cfg(unix)]
+pub fn shutdown_write(stream: &AsyncLocalStream) -> std::io::Result<()> {
+    rustix::net::shutdown(stream, rustix::net::Shutdown::Write).map_err(std::io::Error::from)
+}
+
 #[cfg(unix)]
 pub struct AsyncLocalListener(tokio::io::unix::AsyncFd<LocalListener>);
 
@@ -34,25 +40,12 @@ impl AsyncLocalListener {
         tokio::io::unix::AsyncFd::new(listener).map(Self)
     }
 
-    pub fn poll_read_ready(
-        &self,
-        context: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        self.0.poll_read_ready(context).map_ok(|_| ())
-    }
-
-    pub fn poll_accept(
-        &self,
-        context: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<LocalStream>> {
-        loop {
-            let mut ready = std::task::ready!(self.0.poll_read_ready(context))?;
-            if let Ok(result) =
-                ready.try_io(|listener| listener.get_ref().accept().map(|(stream, _)| stream))
-            {
-                return std::task::Poll::Ready(result);
-            }
-        }
+    pub async fn accept(&self) -> std::io::Result<LocalStream> {
+        self.0
+            .async_io(tokio::io::Interest::READABLE, |listener| {
+                listener.accept().map(|(stream, _)| stream)
+            })
+            .await
     }
 }
 
@@ -110,6 +103,33 @@ mod asynchronous {
         pub fn from_std(stream: LocalStream) -> io::Result<Self> {
             Async::new(WindowsLocalStream(stream)).map(|stream| Self(stream.compat()))
         }
+
+        fn socket(&self) -> &LocalStream {
+            &self.0.get_ref().get_ref().0
+        }
+
+        /// Reads what is queued without waiting; `WouldBlock` until [`Self::readable`] resolves.
+        pub fn try_read(&self, buffer: &mut [u8]) -> io::Result<usize> {
+            io::Read::read(&mut self.socket(), buffer)
+        }
+
+        /// Writes what fits without waiting; `WouldBlock` until [`Self::writable`] resolves.
+        pub fn try_write(&self, bytes: &[u8]) -> io::Result<usize> {
+            io::Write::write(&mut self.socket(), bytes)
+        }
+
+        pub async fn readable(&self) -> io::Result<()> {
+            self.0.get_ref().readable().await
+        }
+
+        pub async fn writable(&self) -> io::Result<()> {
+            self.0.get_ref().writable().await
+        }
+    }
+
+    /// Ends the stream's write direction at once, so the peer reads EOF while this end can still read.
+    pub fn shutdown_write(stream: &AsyncLocalStream) -> io::Result<()> {
+        stream.socket().shutdown(std::net::Shutdown::Write)
     }
 
     struct WindowsLocalListener(LocalListener);
@@ -134,30 +154,10 @@ mod asynchronous {
             Async::new(WindowsLocalListener(listener)).map(Self)
         }
 
-        pub fn poll_read_ready(&self, context: &mut Context<'_>) -> Poll<io::Result<()>> {
-            self.0.poll_readable(context)
-        }
-
-        pub fn poll_accept(&self, context: &mut Context<'_>) -> Poll<io::Result<LocalStream>> {
-            loop {
-                match self.0.get_ref().0.accept() {
-                    Ok((stream, _)) => return Poll::Ready(Ok(stream)),
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        std::task::ready!(self.0.poll_readable(context))?;
-                    }
-                    Err(error) => return Poll::Ready(Err(error)),
-                }
-            }
-        }
-    }
-
-    impl AsyncLocalStream {
-        pub fn poll_read_ready(&self, context: &mut Context<'_>) -> Poll<io::Result<()>> {
-            self.0.get_ref().poll_readable(context)
-        }
-
-        pub fn poll_write_ready(&self, context: &mut Context<'_>) -> Poll<io::Result<()>> {
-            self.0.get_ref().poll_writable(context)
+        pub async fn accept(&self) -> io::Result<LocalStream> {
+            self.0
+                .read_with(|listener| listener.0.accept().map(|(stream, _)| stream))
+                .await
         }
     }
 
@@ -194,7 +194,7 @@ mod asynchronous {
 }
 
 #[cfg(windows)]
-pub use asynchronous::{AsyncLocalListener, AsyncLocalStream};
+pub use asynchronous::{AsyncLocalListener, AsyncLocalStream, shutdown_write};
 
 #[cfg(test)]
 mod tests {
@@ -284,20 +284,17 @@ mod asynchronous_tests {
 
     #[tokio::test]
     async fn cancelled_accept_and_read_leave_the_stream_usable() {
-        use std::{future::poll_fn, time::Duration};
+        use std::time::Duration;
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("socket");
         let listener = AsyncLocalListener::from_std(LocalListener::bind(&path).unwrap()).unwrap();
         assert!(
-            tokio::time::timeout(
-                Duration::from_millis(20),
-                poll_fn(|cx| listener.poll_accept(cx)),
-            )
-            .await
-            .is_err()
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
         );
         let mut client = AsyncLocalStream::connect(&path).await.unwrap();
-        let mut server = poll_fn(|cx| listener.poll_accept(cx)).await.unwrap();
+        let mut server = listener.accept().await.unwrap();
         let mut bytes = [0; 4];
         assert!(
             tokio::time::timeout(Duration::from_millis(20), client.read_exact(&mut bytes))
@@ -312,41 +309,50 @@ mod asynchronous_tests {
     }
 
     #[tokio::test]
-    async fn listener_readiness_waits_and_preserves_the_connection() {
-        use std::{future::poll_fn, time::Duration};
+    async fn accept_waits_and_preserves_the_connection() {
+        use std::time::Duration;
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("socket");
         let listener = AsyncLocalListener::from_std(LocalListener::bind(&path).unwrap()).unwrap();
-        assert!(
-            tokio::time::timeout(
-                Duration::from_millis(20),
-                poll_fn(|cx| listener.poll_read_ready(cx))
-            )
-            .await
-            .is_err()
-        );
         let mut client = LocalStream::connect(&path).unwrap();
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            poll_fn(|cx| listener.poll_read_ready(cx)),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        let mut server = tokio::time::timeout(
-            Duration::from_secs(1),
-            poll_fn(|cx| listener.poll_accept(cx)),
-        )
-        .await
-        .unwrap()
-        .unwrap();
         client.write_all(b"probe").unwrap();
+        let mut server = tokio::time::timeout(Duration::from_secs(1), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
         let mut buffer = [0; 5];
         server
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
         server.read_exact(&mut buffer).unwrap();
         assert_eq!(&buffer, b"probe");
+    }
+
+    /// Non-blocking I/O reports `WouldBlock` until readiness, and a write shutdown reads as EOF.
+    #[tokio::test]
+    async fn try_io_waits_for_readiness_and_shutdown_reads_as_eof() {
+        let (left, right) = create_local_pair().unwrap();
+        for stream in [&left, &right] {
+            stream.set_nonblocking(true).unwrap();
+        }
+        let (left, right) = (
+            AsyncLocalStream::from_std(left).unwrap(),
+            AsyncLocalStream::from_std(right).unwrap(),
+        );
+        let mut buffer = [0; 8];
+        assert_eq!(
+            left.try_read(&mut buffer).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        right.writable().await.unwrap();
+        assert_eq!(right.try_write(b"ping").unwrap(), 4);
+        left.readable().await.unwrap();
+        assert_eq!(left.try_read(&mut buffer).unwrap(), 4);
+        assert_eq!(&buffer[..4], b"ping");
+        shutdown_write(&right).unwrap();
+        left.readable().await.unwrap();
+        assert_eq!(left.try_read(&mut buffer).unwrap(), 0);
+        assert_eq!(left.try_write(b"back").unwrap(), 4);
     }
 
     #[tokio::test]

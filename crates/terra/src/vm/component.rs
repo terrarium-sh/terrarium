@@ -11,24 +11,31 @@ use std::io::{Read as _, Write as _};
 use std::process::ExitCode;
 use terra_platform::local_socket::{LocalListener, LocalStream, create_local_pair};
 use terra_protocol::PlanMode;
-use terra_runtime::TrustedArtifacts;
+use terra_runtime::component::AccessMode;
 use terra_runtime::component::fs::ShareGrant;
 use terra_runtime::orchestration::VmInput;
+use terra_runtime::{TrustedArtifact, TrustedArtifacts};
+
+macro_rules! embedded_artifact {
+    ($variable:literal) => {
+        TrustedArtifact::from_trusted_bytes(include_bytes!(env!($variable)))
+    };
+}
 
 #[allow(unsafe_code)]
 const ARTIFACTS: TrustedArtifacts = {
     // SAFETY: Make generates these AOT artifacts from repository components for this target.
     unsafe {
-        TrustedArtifacts::new(
-            include_bytes!(env!("TERRA_BLOCK_AOT")),
-            include_bytes!(env!("TERRA_AGENT_AOT")),
-            include_bytes!(env!("TERRA_VSOCK_FRONTEND_AOT")),
-            include_bytes!(env!("TERRA_FS_AOT")),
-            include_bytes!(env!("TERRA_MEM_AOT")),
-            include_bytes!(env!("TERRA_BOOT_AOT")),
-            include_bytes!(env!("TERRA_VMM_AOT")),
-            include_bytes!(env!("TERRA_INTERRUPT_CONTROLLER_AOT")),
-        )
+        TrustedArtifacts {
+            block: embedded_artifact!("TERRA_BLOCK_AOT"),
+            agent: embedded_artifact!("TERRA_AGENT_AOT"),
+            vsock_frontend: embedded_artifact!("TERRA_VSOCK_FRONTEND_AOT"),
+            fs: embedded_artifact!("TERRA_FS_AOT"),
+            mem: embedded_artifact!("TERRA_MEM_AOT"),
+            boot: embedded_artifact!("TERRA_BOOT_AOT"),
+            vmm: embedded_artifact!("TERRA_VMM_AOT"),
+            interrupt_controller: embedded_artifact!("TERRA_INTERRUPT_CONTROLLER_AOT"),
+        }
     }
 };
 
@@ -198,15 +205,20 @@ fn open_shares(spec: &BootSpec) -> Result<Vec<ShareGrant>> {
     for (index, mount) in mounts.iter().enumerate() {
         #[cfg(not(windows))]
         let _ = index;
+        let access = if mount.readonly {
+            AccessMode::ReadOnly
+        } else {
+            AccessMode::ReadWrite
+        };
         #[cfg(windows)]
         let grant = if uses_inherited_listeners() {
             let identity = std::env::var(format!("TERRA_WINDOWS_MOUNT_ID_{index}"))?.parse()?;
-            ShareGrant::new_host_granted(&mount.host, mount.readonly, identity)
+            ShareGrant::new_host_granted(&mount.host, access, identity)
         } else {
-            ShareGrant::new(&mount.host, mount.readonly)
+            ShareGrant::new(&mount.host, access)
         };
         #[cfg(not(windows))]
-        let grant = ShareGrant::new(&mount.host, mount.readonly);
+        let grant = ShareGrant::new(&mount.host, access);
         grants.push(grant.with_context(|| {
             format!(
                 "opening share {}",
@@ -248,11 +260,7 @@ fn stop_listener(bx: &BoxRef) -> Result<LocalListener> {
 
 #[cfg(any(target_os = "macos", windows))]
 fn uses_inherited_listeners() -> bool {
-    #[cfg(target_os = "macos")]
-    const ROLE_ENV: &str = "TERRA_MACOS_SANDBOX_ROLE";
-    #[cfg(windows)]
-    const ROLE_ENV: &str = "TERRA_WINDOWS_SANDBOX_ROLE";
-    std::env::var_os(ROLE_ENV).is_some_and(|role| role == "vm")
+    terra_platform::process::sandbox_env::is_vm_worker()
 }
 
 fn relay_stop(listener: LocalListener, mut control: LocalStream) {
@@ -460,7 +468,7 @@ mod tests {
         let grants = open_shares(&spec).unwrap();
         let plan = super::super::build_plan(&spec).unwrap().shares;
 
-        assert!(grants[0].readonly);
+        assert_eq!(grants[0].access, AccessMode::ReadOnly);
         assert_eq!(plan[0].tag, "terra-share-0");
         assert_eq!(plan[0].guest, "/work");
         assert!(plan[0].readonly);

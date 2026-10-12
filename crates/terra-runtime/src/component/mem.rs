@@ -99,7 +99,7 @@ async fn create_worker(
         .await
         .map_err(|error| error.context("memory component setup"))?;
     let serve = instance.terra_mmio_device().func_serve();
-    device_loop.register(&mut child, wake, "mem")?;
+    device_loop.register(&mut child, wake, DeviceKind::Memory)?;
     Ok((child, serve))
 }
 
@@ -205,25 +205,21 @@ mod tests {
         memory.write(0x2002, &1u16.to_le_bytes()).unwrap();
         memory.write(0x2004, &0u16.to_le_bytes()).unwrap();
         memory.write(0x4000, &[0x5a; 4096]).unwrap();
-        for (offset, value) in [
-            (0x70, 1u32),
-            (0x70, 3),
-            (0x24, 0),
-            (0x20, (1 << 4) | (1 << 5)),
-            (0x24, 1),
-            (0x20, 1),
-            (0x70, 11),
-            (0x30, 2),
-            (0x38, 256),
-            (0x80, 0x1000),
-            (0x90, 0x2000),
-            (0xa0, 0x3000),
-            (0x44, 1),
-            (0x70, 15),
-        ] {
-            channel.write(offset, &value.to_le_bytes()).unwrap();
-        }
-        channel.write(0x50, &2u32.to_le_bytes()).unwrap();
+        crate::self_test::virtio::start_single_queue(
+            &channel,
+            (1 << 4) | (1 << 5),
+            2,
+            crate::self_test::virtio::QueueLayout {
+                size: 256,
+                descriptors: 0x1000,
+                available: 0x2000,
+                used: 0x3000,
+            },
+        )
+        .unwrap();
+        channel
+            .write(crate::self_test::virtio::QUEUE_NOTIFY, &2u32.to_le_bytes())
+            .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while memory.read(0x3002, 2).unwrap() != 1u16.to_le_bytes()
                 || !interrupted.load(std::sync::atomic::Ordering::Acquire)
@@ -245,7 +241,9 @@ mod tests {
         memory.write(0x2002, &2u16.to_le_bytes()).unwrap();
         memory.write(0x2006, &1u16.to_le_bytes()).unwrap();
         memory.write(0x5000, &[0x5a; 4096]).unwrap();
-        channel.write(0x50, &2u32.to_le_bytes()).unwrap();
+        channel
+            .write(crate::self_test::virtio::QUEUE_NOTIFY, &2u32.to_le_bytes())
+            .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while memory.read(0x3002, 2).unwrap() != 2u16.to_le_bytes() {
                 tokio::task::yield_now().await;

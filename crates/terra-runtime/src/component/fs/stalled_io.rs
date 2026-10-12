@@ -4,24 +4,24 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::task::{Context, Poll};
 use std::time::Duration;
 
+use bytes::Bytes;
+use futures_util::stream;
 use tokio::sync::{Notify, Semaphore};
-use wasmtime::component::{
-    Component, Destination, FutureReader, Linker, Resource, StreamProducer, StreamReader,
-    StreamResult,
-};
+use wasmtime::component::{Component, FutureReader, Linker, Resource, StreamReader};
 use wasmtime_wasi::filesystem::Descriptor;
 use wasmtime_wasi::p3::bindings::filesystem::types::ErrorCode;
 
 use super::{FsHost, ShareGrant};
 use crate::box_runtime::store::BoxHost;
 use crate::box_runtime::{BoxRuntime, BoxRuntimeHandle};
-use crate::component::MmioDevice;
 use crate::component::context::DeviceContext;
+use crate::component::relay::ByteStream;
+use crate::component::{AccessMode, MmioDevice};
 use crate::engine::device_engine;
 use crate::memory::{BoundedMemory, GuestRam};
+use crate::self_test::virtio;
 
 pub(super) struct IoGate {
     operation: Operation,
@@ -51,7 +51,6 @@ enum Operation {
 struct StalledRead {
     gate: Arc<IoGate>,
     ready: Pin<Box<dyn Future<Output = ()> + Send>>,
-    started: bool,
 }
 
 impl Drop for StalledRead {
@@ -60,120 +59,107 @@ impl Drop for StalledRead {
     }
 }
 
-impl StreamProducer<crate::box_runtime::store::StoreState<FsHost>> for StalledRead {
-    type Item = u8;
-    type Buffer = Option<u8>;
-
-    fn poll_produce<'a>(
-        mut self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-        _: wasmtime::StoreContextMut<'a, crate::box_runtime::store::StoreState<FsHost>>,
-        mut destination: Destination<'a, Self::Item, Self::Buffer>,
-        _finish: bool,
-    ) -> Poll<wasmtime::Result<StreamResult>> {
-        if !self.started {
-            self.started = true;
-            self.gate.started.add_permits(1);
-        }
-        if self.ready.as_mut().poll(context).is_pending() {
-            return Poll::Pending;
-        }
-        destination.set_buffer(Some(7));
-        Poll::Ready(Ok(StreamResult::Dropped))
-    }
+/// Yields one byte after the gate releases; the gate counts the stream's first poll and its drop.
+fn stalled_read(gate: Arc<IoGate>) -> ByteStream {
+    let read = StalledRead {
+        ready: Box::pin(gate.release.clone().notified_owned()),
+        gate,
+    };
+    ByteStream::new(stream::unfold(
+        (read, false),
+        |(mut read, is_delivered)| async move {
+            if is_delivered {
+                return None;
+            }
+            read.gate.started.add_permits(1);
+            read.ready.as_mut().await;
+            Some((Bytes::from_static(&[7]), (read, true)))
+        },
+    ))
 }
 
+type FsLinker = Linker<crate::box_runtime::store::StoreState<FsHost>>;
+
 pub(super) fn install_io_gate(
-    mut linker: Linker<crate::box_runtime::store::StoreState<FsHost>>,
+    mut linker: FsLinker,
     gate: Option<Arc<IoGate>>,
-) -> wasmtime::Result<Linker<crate::box_runtime::store::StoreState<FsHost>>> {
-    if let Some(gate) = gate {
-        linker.allow_shadowing(true);
-        if matches!(gate.operation, Operation::HostMetadata) {
-            return Ok(linker);
+) -> wasmtime::Result<FsLinker> {
+    let Some(gate) = gate else {
+        return Ok(linker);
+    };
+    linker.allow_shadowing(true);
+    match gate.operation {
+        Operation::HostMetadata => {}
+        Operation::DirectoryRemoval => install_directory_removal_gate(&mut linker, gate)?,
+        Operation::Lookup => install_lookup_gate(&mut linker, gate)?,
+        Operation::Stat => install_stat_gate(&mut linker, gate)?,
+        Operation::MetadataHash => install_metadata_hash_gate(&mut linker, gate)?,
+        Operation::ReadDirectory => install_read_directory_gate(&mut linker, gate)?,
+        Operation::Sync => install_sync_gate(&mut linker, gate)?,
+        Operation::Write => {
+            install_sync_gate(&mut linker, gate.clone())?;
+            install_write_gate(&mut linker, gate)?;
         }
-        if matches!(gate.operation, Operation::DirectoryRemoval) {
-            return install_directory_removal_gate(linker, gate);
-        }
-        if matches!(
-            gate.operation,
-            Operation::Lookup
-                | Operation::Stat
-                | Operation::MetadataHash
-                | Operation::ReadDirectory
-        ) {
-            return install_metadata_gate(linker, gate);
-        }
-        if matches!(gate.operation, Operation::Write | Operation::Sync) {
-            let sync_gate = gate.clone();
-            linker
-                .instance("wasi:filesystem/types@0.3.0")?
-                .func_wrap_concurrent(
-                    "[method]descriptor.sync-data",
-                    move |_accessor, (_descriptor,): (Resource<Descriptor>,)| {
-                        let gate = sync_gate.clone();
-                        Box::pin(async move {
-                            gate.begin_release_wait().await;
-                            Ok((Ok::<(), ErrorCode>(()),))
-                        })
-                    },
-                )?;
-        }
-        if matches!(gate.operation, Operation::Write) {
-            linker.instance("wasi:filesystem/types@0.3.0")?.func_wrap(
-                "[method]descriptor.write-via-stream",
-                move |mut store,
-                      (_descriptor, _stream, _offset): (
-                    Resource<Descriptor>,
-                    StreamReader<u8>,
-                    u64,
-                )| {
-                    let released = gate.begin_release_wait();
-                    let completion = FutureReader::new(&mut store, async move {
-                        released.await;
-                        Ok::<Result<(), ErrorCode>, wasmtime::Error>(Ok(()))
-                    })?;
-                    Ok((completion,))
-                },
-            )?;
-            return Ok(linker);
-        }
-        if matches!(gate.operation, Operation::Sync) {
-            return Ok(linker);
-        }
-        linker.instance("wasi:filesystem/types@0.3.0")?.func_wrap(
-            "[method]descriptor.read-via-stream",
-            move |mut store, (_descriptor, offset): (Resource<Descriptor>, u64)| {
-                let stream = if offset == 0 {
-                    StreamReader::new(
-                        &mut store,
-                        StalledRead {
-                            gate: gate.clone(),
-                            ready: Box::pin(gate.release.clone().notified_owned()),
-                            started: false,
-                        },
-                    )?
-                } else {
-                    StreamReader::new(&mut store, vec![9_u8])?
-                };
-                let completion = FutureReader::new(&mut store, async {
-                    Ok::<Result<(), ErrorCode>, wasmtime::Error>(Ok(()))
-                })?;
-                Ok(((stream, completion),))
-            },
-        )?;
+        Operation::Read => install_read_gate(&mut linker, gate)?,
     }
     Ok(linker)
 }
 
+fn install_sync_gate(linker: &mut FsLinker, gate: Arc<IoGate>) -> wasmtime::Result<()> {
+    linker
+        .instance(super::WASI_FILESYSTEM_TYPES)?
+        .func_wrap_concurrent(
+            "[method]descriptor.sync-data",
+            move |_accessor, (_descriptor,): (Resource<Descriptor>,)| {
+                let gate = gate.clone();
+                Box::pin(async move {
+                    gate.begin_release_wait().await;
+                    Ok((Ok::<(), ErrorCode>(()),))
+                })
+            },
+        )
+}
+
+fn install_write_gate(linker: &mut FsLinker, gate: Arc<IoGate>) -> wasmtime::Result<()> {
+    linker.instance(super::WASI_FILESYSTEM_TYPES)?.func_wrap(
+        "[method]descriptor.write-via-stream",
+        move |mut store,
+              (_descriptor, _stream, _offset): (Resource<Descriptor>, StreamReader<u8>, u64)| {
+            let released = gate.begin_release_wait();
+            let completion = FutureReader::new(&mut store, async move {
+                released.await;
+                Ok::<Result<(), ErrorCode>, wasmtime::Error>(Ok(()))
+            })?;
+            Ok((completion,))
+        },
+    )
+}
+
+fn install_read_gate(linker: &mut FsLinker, gate: Arc<IoGate>) -> wasmtime::Result<()> {
+    linker.instance(super::WASI_FILESYSTEM_TYPES)?.func_wrap(
+        "[method]descriptor.read-via-stream",
+        move |mut store, (_descriptor, offset): (Resource<Descriptor>, u64)| {
+            let stream = if offset == 0 {
+                StreamReader::new(&mut store, stalled_read(gate.clone()))?
+            } else {
+                StreamReader::new(&mut store, vec![9_u8])?
+            };
+            let completion = FutureReader::new(&mut store, async {
+                Ok::<Result<(), ErrorCode>, wasmtime::Error>(Ok(()))
+            })?;
+            Ok(((stream, completion),))
+        },
+    )
+}
+
 fn install_directory_removal_gate(
-    mut linker: Linker<crate::box_runtime::store::StoreState<FsHost>>,
+    linker: &mut FsLinker,
     gate: Arc<IoGate>,
-) -> wasmtime::Result<Linker<crate::box_runtime::store::StoreState<FsHost>>> {
+) -> wasmtime::Result<()> {
     use wasmtime_wasi::filesystem::{WasiFilesystem, WasiFilesystemView as _};
     use wasmtime_wasi::p3::bindings::filesystem::types::HostDescriptorWithStore as _;
     linker
-        .instance("wasi:filesystem/types@0.3.0")?
+        .instance(super::WASI_FILESYSTEM_TYPES)?
         .func_wrap_concurrent(
             "[method]descriptor.remove-directory-at",
             move |accessor, (descriptor, path): (Resource<Descriptor>, String)| {
@@ -193,86 +179,78 @@ fn install_directory_removal_gate(
                     ))
                 })
             },
-        )?;
-    Ok(linker)
+        )
 }
 
-fn install_metadata_gate(
-    mut linker: Linker<crate::box_runtime::store::StoreState<FsHost>>,
-    gate: Arc<IoGate>,
-) -> wasmtime::Result<Linker<crate::box_runtime::store::StoreState<FsHost>>> {
-    use wasmtime_wasi::filesystem::WasiFilesystem;
-    use wasmtime_wasi::p3::bindings::filesystem::types::{HostDescriptorWithStore, PathFlags};
-    if matches!(gate.operation, Operation::Lookup) {
-        linker.instance("wasi:filesystem/types@0.3.0")?.func_wrap_concurrent(
-            "[method]descriptor.stat-at",
-            move |accessor, (descriptor, flags, path): (Resource<Descriptor>, PathFlags, String)| {
+macro_rules! install_armed_metadata_gate {
+    ($linker:expr, $gate:expr, $name:literal, $method:ident, ($($arg:ident: $type:ty),+)) => {{
+        use wasmtime_wasi::filesystem::{WasiFilesystem, WasiFilesystemView};
+        use wasmtime_wasi::p3::bindings::filesystem::types::HostDescriptorWithStore;
+        let gate = $gate;
+        $linker.instance(super::WASI_FILESYSTEM_TYPES)?.func_wrap_concurrent(
+            $name,
+            move |accessor, ($($arg,)+): ($($type,)+)| {
                 let gate = gate.clone();
                 Box::pin(async move {
                     gate.wait_if_armed().await;
-                    let wasi = accessor.with_getter::<WasiFilesystem>(wasmtime_wasi::filesystem::WasiFilesystemView::filesystem);
-                    Ok((match WasiFilesystem::stat_at(&wasi, descriptor, flags, path).await { Ok(value) => Ok(value), Err(error) => Err(error.downcast()?), },))
+                    let wasi = accessor.with_getter::<WasiFilesystem>(WasiFilesystemView::filesystem);
+                    Ok((match WasiFilesystem::$method(&wasi, $($arg),+).await {
+                        Ok(value) => Ok(value),
+                        Err(error) => Err(error.downcast()?),
+                    },))
                 })
             },
-        )?;
-    } else if matches!(gate.operation, Operation::Stat) {
-        linker
-            .instance("wasi:filesystem/types@0.3.0")?
-            .func_wrap_concurrent(
-                "[method]descriptor.stat",
-                move |accessor, (descriptor,): (Resource<Descriptor>,)| {
-                    let gate = gate.clone();
-                    Box::pin(async move {
-                        gate.wait_if_armed().await;
-                        let wasi = accessor.with_getter::<WasiFilesystem>(
-                            wasmtime_wasi::filesystem::WasiFilesystemView::filesystem,
-                        );
-                        Ok((match WasiFilesystem::stat(&wasi, descriptor).await {
-                            Ok(value) => Ok(value),
-                            Err(error) => Err(error.downcast()?),
-                        },))
-                    })
-                },
+        )
+    }};
+}
+
+fn install_lookup_gate(linker: &mut FsLinker, gate: Arc<IoGate>) -> wasmtime::Result<()> {
+    use wasmtime_wasi::p3::bindings::filesystem::types::PathFlags;
+    install_armed_metadata_gate!(
+        linker,
+        gate,
+        "[method]descriptor.stat-at",
+        stat_at,
+        (descriptor: Resource<Descriptor>, flags: PathFlags, path: String)
+    )
+}
+
+fn install_stat_gate(linker: &mut FsLinker, gate: Arc<IoGate>) -> wasmtime::Result<()> {
+    install_armed_metadata_gate!(
+        linker,
+        gate,
+        "[method]descriptor.stat",
+        stat,
+        (descriptor: Resource<Descriptor>)
+    )
+}
+
+fn install_metadata_hash_gate(linker: &mut FsLinker, gate: Arc<IoGate>) -> wasmtime::Result<()> {
+    install_armed_metadata_gate!(
+        linker,
+        gate,
+        "[method]descriptor.metadata-hash",
+        metadata_hash,
+        (descriptor: Resource<Descriptor>)
+    )
+}
+
+fn install_read_directory_gate(linker: &mut FsLinker, gate: Arc<IoGate>) -> wasmtime::Result<()> {
+    linker.instance(super::WASI_FILESYSTEM_TYPES)?.func_wrap(
+        "[method]descriptor.read-directory",
+        move |mut store, (_descriptor,): (Resource<Descriptor>,)| {
+            let released = gate.begin_release_wait();
+            let stream = StreamReader::new(
+                &mut store,
+                Vec::<wasmtime_wasi::p3::bindings::filesystem::types::DirectoryEntry>::new(),
             )?;
-    } else if matches!(gate.operation, Operation::MetadataHash) {
-        linker
-            .instance("wasi:filesystem/types@0.3.0")?
-            .func_wrap_concurrent(
-                "[method]descriptor.metadata-hash",
-                move |accessor, (descriptor,): (Resource<Descriptor>,)| {
-                    let gate = gate.clone();
-                    Box::pin(async move {
-                        gate.wait_if_armed().await;
-                        let wasi = accessor.with_getter::<WasiFilesystem>(
-                            wasmtime_wasi::filesystem::WasiFilesystemView::filesystem,
-                        );
-                        Ok((
-                            match WasiFilesystem::metadata_hash(&wasi, descriptor).await {
-                                Ok(value) => Ok(value),
-                                Err(error) => Err(error.downcast()?),
-                            },
-                        ))
-                    })
-                },
-            )?;
-    } else {
-        linker.instance("wasi:filesystem/types@0.3.0")?.func_wrap(
-            "[method]descriptor.read-directory",
-            move |mut store, (_descriptor,): (Resource<Descriptor>,)| {
-                let released = gate.begin_release_wait();
-                let stream = StreamReader::new(
-                    &mut store,
-                    Vec::<wasmtime_wasi::p3::bindings::filesystem::types::DirectoryEntry>::new(),
-                )?;
-                let completion = FutureReader::new(&mut store, async move {
-                    released.await;
-                    Ok::<Result<(), ErrorCode>, wasmtime::Error>(Ok(()))
-                })?;
-                Ok(((stream, completion),))
-            },
-        )?;
-    }
-    Ok(linker)
+            let completion = FutureReader::new(&mut store, async move {
+                released.await;
+                Ok::<Result<(), ErrorCode>, wasmtime::Error>(Ok(()))
+            })?;
+            Ok(((stream, completion),))
+        },
+    )
 }
 
 impl IoGate {
@@ -416,22 +394,18 @@ impl Mounted {
         let memory = BoundedMemory::new(&self.ram);
         memory.write(0x2002, &[0; 2]).unwrap();
         memory.write(0x3002, &[0; 2]).unwrap();
-        for (offset, value) in [
-            (0x70, 1_u32),
-            (0x70, 3),
-            (0x24, 1),
-            (0x20, 1),
-            (0x70, 11),
-            (0x30, 1),
-            (0x38, 128),
-            (0x80, 0x1000),
-            (0x90, 0x2000),
-            (0xa0, 0x3000),
-            (0x44, 1),
-            (0x70, 15),
-        ] {
-            self.channel.write(offset, &value.to_le_bytes()).unwrap();
-        }
+        virtio::start_single_queue(
+            &self.channel,
+            0,
+            1,
+            virtio::QueueLayout {
+                size: 128,
+                descriptors: 0x1000,
+                available: 0x2000,
+                used: 0x3000,
+            },
+        )
+        .unwrap();
     }
 
     async fn initialize_events(&mut self) {
@@ -473,7 +447,9 @@ impl Mounted {
             .unwrap();
         self.next += 1;
         memory.write(0x2002, &self.next.to_le_bytes()).unwrap();
-        self.channel.write(0x50, &1_u32.to_le_bytes()).unwrap();
+        self.channel
+            .write(virtio::QUEUE_NOTIFY, &1_u32.to_le_bytes())
+            .unwrap();
         PendingRequest {
             output,
             unique,
@@ -577,7 +553,15 @@ async fn mount_with_registration(
         release: Arc::new(Notify::new()),
         dropped: Semaphore::new(0),
     });
-    let mut grant = ShareGrant::new(&path, matches!(operation, Operation::Read)).unwrap();
+    let mut grant = ShareGrant::new(
+        &path,
+        if matches!(operation, Operation::Read) {
+            AccessMode::ReadOnly
+        } else {
+            AccessMode::ReadWrite
+        },
+    )
+    .unwrap();
     grant.watch_registration = registration;
     let mounted = Mounted::new(grant, gate.clone(), capacity).await;
     (root, mounted, gate)
@@ -1068,7 +1052,7 @@ fn saturated_mount_cleanup_does_not_starve_another_mount_or_guest_disk() {
         std::fs::write(&disk_path, b"disk contents").unwrap();
         let disk_host = crate::component::block::BlockHost::new(
             crate::memory::GuestRam::new(4096).unwrap(),
-            DiskGrant::File(FileDisk::open(&disk_path, false).unwrap()),
+            DiskGrant::File(FileDisk::open(&disk_path, AccessMode::ReadWrite).unwrap()),
         );
         let mut disk_store = wasmtime::Store::new(&device_engine().unwrap(), disk_host);
 

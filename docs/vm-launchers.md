@@ -19,7 +19,7 @@ vm:
 
 `vm.init: direct` opts out of the built-in process confinement for both the VM
 and its broker. On Linux,
-Terra embeds Bubblewrap and separate fallback filters for the supervisor, VM,
+Terra embeds Bubblewrap and separate built-in filters for the supervisor, VM,
 and network broker. Select a generated policy bundle with:
 
 ```yaml
@@ -32,16 +32,17 @@ vm:
 Policy selection has three steps:
 
 1. Use `vm.sandbox.policy` when set. Relative paths resolve against the directory
-   containing `config.yaml`.
-2. Otherwise use `~/.terra/config/seccomp` if present; `install.sh` installs
-   the release bundle there.
-3. Otherwise use the built-in role policies.
+   containing `config.yaml`. A missing or invalid bundle fails startup.
+2. Otherwise, on Linux, use `~/.terra/config/seccomp` if present; `install.sh`
+   installs the release bundle there. Other platforms never read this path.
+3. Otherwise use the built-in role policies; on Linux, `terra` prints a warning
+   because they carry no syscall allowlists.
 
 A bundle contains `manifest.json` and separate `supervisor.seccomp.bpf`,
 `vm.seccomp.bpf`, and `network.seccomp.bpf` files. Generated bundles also include
 readable JSON for each filter. Terra checks the version, target, per-role hashes,
 filter sizes, and instruction alignment; the kernel validates installation.
-Missing or invalid selected bundles fail startup without fallback.
+Normal boots do not need a policy compiler.
 
 To build a bundle, run `terra self-test --generate-policy`, then select the resulting
 bundle directory. Regenerate after changing Terra and validate on the intended
@@ -53,18 +54,9 @@ generated bundles add tighter syscall and ioctl allowlists. A permanent role
 filter stays active alongside a selected bundle, so a permissive custom bundle
 cannot lift the socket and parent-death restrictions.
 
-To require a generated bundle, set:
-
-```yaml
-vm:
-  init: sandbox
-  sandbox:
-    allow_fallback: false
-```
-
-`allow_fallback` defaults to `true`. With `false`, an explicit bundle or
-`~/.terra/config/seccomp` must exist. This setting does not assess how restrictive
-the selected filters are. Normal boots do not need a policy compiler.
+Only Linux accepts a policy override. macOS and Windows always use their
+built-in role policies ([host process sandboxing](sandboxing.md)) and refuse
+`vm.sandbox.policy`.
 
 `vm.sandbox` settings are unused when `vm.init` selects another launcher.
 Terra refuses a configured launcher or selected local policy inside a

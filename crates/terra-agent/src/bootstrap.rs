@@ -275,31 +275,10 @@ fn setup_env(plan: &Plan) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use terra_protocol::{Net, Plan, PlanMode};
+    use terra_protocol::Plan;
 
     fn test_plan() -> Plan {
-        Plan {
-            mode: PlanMode::Run,
-            workdir: None,
-            shares: Vec::new(),
-            volumes: Vec::new(),
-            net: Net::Tsi,
-            published_ports: Vec::new(),
-            published_udp_ports: Vec::new(),
-            env: std::collections::BTreeMap::new(),
-            root: false,
-            sudo: Vec::new(),
-            on_create: Vec::new(),
-            on_start: Vec::new(),
-            pre_stop: Vec::new(),
-            daemons: Vec::new(),
-            workload: Vec::new(),
-            sandbox_info: String::new(),
-            await_initial_session: false,
-            host_tz: None,
-            host_time: None,
-            host_seed: None,
-        }
+        Plan::bare_run(Vec::new())
     }
 
     #[test]

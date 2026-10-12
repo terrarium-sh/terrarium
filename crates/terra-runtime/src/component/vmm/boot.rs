@@ -167,7 +167,8 @@ impl BoxRuntime {
     ) -> wasmtime::Result<BootEntry> {
         wasmtime::ensure!(
             !kernel.is_empty() && u64::try_from(kernel.len())? <= MAX_BOOT_KERNEL_BYTES,
-            "kernel image must be between 1 byte and 64 MiB"
+            "kernel image must be between 1 byte and {} MiB",
+            MAX_BOOT_KERNEL_BYTES >> 20
         );
         wasmtime::ensure!(
             command_line.len() <= MAX_BOOT_COMMAND_LINE_BYTES,

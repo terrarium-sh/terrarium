@@ -10,7 +10,7 @@ pub(super) async fn run(
     artifacts: &TrustedArtifacts,
     engine: &wasmtime::Engine,
 ) -> wasmtime::Result<()> {
-    let component = artifacts.boot().deserialize(engine)?;
+    let component = artifacts.boot.deserialize(engine)?;
     let runtime = BoxRuntime::new(engine, BoxHost::new())?;
     for architecture in [Architecture::X86, Architecture::Arm] {
         let layout = build_machine_layout_for(architecture, 8 << 20, 1, 0)

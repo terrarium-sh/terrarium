@@ -89,45 +89,47 @@ impl NativeTeardown {
         &self,
         machine: super::virtualization::MachineRecovery,
     ) -> wasmtime::Result<()> {
-        let mut state = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let grants = state.grants_mut()?;
-        wasmtime::ensure!(
-            grants.machine.is_none(),
-            "native teardown already installed"
-        );
-        grants.machine = Some(machine);
-        Ok(())
+        self.install(|grants| {
+            wasmtime::ensure!(
+                grants.machine.is_none(),
+                "native teardown already installed"
+            );
+            grants.machine = Some(machine);
+            Ok(())
+        })
     }
 
     pub(crate) fn install_device(&self, device: DeviceShutdown) -> wasmtime::Result<()> {
-        let mut state = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let grants = state.grants_mut()?;
-        wasmtime::ensure!(
-            grants.devices.len() < crate::box_runtime::MAX_BOX_COMPONENTS + 1,
-            "box has too many device shutdown grants"
-        );
-        grants.devices.push(device);
-        Ok(())
+        self.install(|grants| {
+            wasmtime::ensure!(
+                grants.devices.len() < crate::box_runtime::MAX_BOX_COMPONENTS + 1,
+                "box has too many device shutdown grants"
+            );
+            grants.devices.push(device);
+            Ok(())
+        })
     }
 
     pub(crate) fn install_interrupts(&self, interrupts: Close) -> wasmtime::Result<()> {
+        self.install(|grants| {
+            wasmtime::ensure!(
+                grants.interrupts.is_none(),
+                "interrupt teardown already installed"
+            );
+            grants.interrupts = Some(interrupts);
+            Ok(())
+        })
+    }
+
+    fn install(
+        &self,
+        grant: impl FnOnce(&mut TeardownGrants) -> wasmtime::Result<()>,
+    ) -> wasmtime::Result<()> {
         let mut state = self
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let grants = state.grants_mut()?;
-        wasmtime::ensure!(
-            grants.interrupts.is_none(),
-            "interrupt teardown already installed"
-        );
-        grants.interrupts = Some(interrupts);
-        Ok(())
+        grant(state.grants_mut()?)
     }
 
     fn task(&self) -> CleanupTask {
@@ -215,7 +217,7 @@ pub struct DeviceShutdown {
 
 enum ShutdownKind {
     Device(DeviceKind),
-    Role(crate::box_runtime::ComponentRole),
+    Agent,
 }
 
 impl DeviceShutdown {
@@ -226,12 +228,9 @@ impl DeviceShutdown {
         }
     }
 
-    pub(crate) fn for_role(
-        role: crate::box_runtime::ComponentRole,
-        close: impl Future<Output = Outcome> + Send + 'static,
-    ) -> Self {
+    pub(crate) fn for_agent(close: impl Future<Output = Outcome> + Send + 'static) -> Self {
         Self {
-            kind: ShutdownKind::Role(role),
+            kind: ShutdownKind::Agent,
             close: Box::pin(close),
         }
     }
@@ -240,7 +239,7 @@ impl DeviceShutdown {
         match self.kind {
             ShutdownKind::Device(DeviceKind::Memory) => 0,
             ShutdownKind::Device(DeviceKind::Fs) => 1,
-            ShutdownKind::Role(crate::box_runtime::ComponentRole::Agent) => 2,
+            ShutdownKind::Agent => 2,
             ShutdownKind::Device(DeviceKind::Vsock) => 3,
             ShutdownKind::Device(DeviceKind::Block) => 4,
         }
@@ -334,15 +333,13 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_finishes_every_cleanup_in_order_and_keeps_the_first_error() {
-        use crate::box_runtime::ComponentRole;
-
         let completed = Arc::new(std::sync::Mutex::new(Vec::new()));
         let interrupts = Arc::clone(&completed);
         let teardown = NativeTeardown::new();
         for (kind, name) in [
             (ShutdownKind::Device(DeviceKind::Block), "block"),
             (ShutdownKind::Device(DeviceKind::Vsock), "vsock"),
-            (ShutdownKind::Role(ComponentRole::Agent), "agent"),
+            (ShutdownKind::Agent, "agent"),
             (ShutdownKind::Device(DeviceKind::Fs), "fs"),
             (ShutdownKind::Device(DeviceKind::Memory), "memory"),
         ] {
@@ -353,7 +350,7 @@ mod tests {
             };
             let shutdown = match kind {
                 ShutdownKind::Device(device) => DeviceShutdown::new(device, close),
-                ShutdownKind::Role(role) => DeviceShutdown::for_role(role, close),
+                ShutdownKind::Agent => DeviceShutdown::for_agent(close),
             };
             teardown.install_device(shutdown).unwrap();
         }
