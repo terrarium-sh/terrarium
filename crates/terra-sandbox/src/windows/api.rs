@@ -16,8 +16,9 @@ use windows_sys::Win32::Security::Isolation::{
 };
 use windows_sys::Win32::Security::{
     CreateRestrictedToken, DISABLE_MAX_PRIVILEGE, DeriveCapabilitySidsFromName, EqualSid, FreeSid,
-    GetTokenInformation, LUA_TOKEN, PSID, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES,
-    SID_AND_ATTRIBUTES, TOKEN_ALL_ACCESS, TOKEN_GROUPS, TOKEN_INFORMATION_CLASS, TokenCapabilities,
+    GetLengthSid, GetTokenInformation, PSID, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES,
+    SID_AND_ATTRIBUTES, SetTokenInformation, TOKEN_ALL_ACCESS, TOKEN_GROUPS,
+    TOKEN_INFORMATION_CLASS, TOKEN_MANDATORY_LABEL, TokenCapabilities, TokenIntegrityLevel,
     TokenRestrictedSids,
 };
 use windows_sys::Win32::System::Console::{
@@ -30,7 +31,7 @@ use windows_sys::Win32::System::JobObjects::{
     SetInformationJobObject,
 };
 use windows_sys::Win32::System::Pipes::CreatePipe;
-use windows_sys::Win32::System::SystemServices::SE_GROUP_ENABLED;
+use windows_sys::Win32::System::SystemServices::{SE_GROUP_ENABLED, SE_GROUP_INTEGRITY};
 use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, CreateProcessW,
     DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, INFINITE,
@@ -45,6 +46,7 @@ use windows_sys::Win32::System::Threading::{
 // VidExo gates WHP access behind this capability even for capability queries.
 const HYPERVISOR_CAPABILITY: &str = "HypervisorPlatform";
 const ALL_APPLICATION_PACKAGES_SID: &str = "S-1-15-2-1";
+const LOW_INTEGRITY_SID: &str = "S-1-16-4096";
 const DISABLE_WIN32K: u64 = 1 << 28;
 const DISABLE_DYNAMIC_CODE: u64 = 1 << 36;
 
@@ -317,7 +319,8 @@ pub(super) fn create_worker_job(memory_limit: usize) -> Result<OwnedHandle> {
             (&raw const limits).cast(),
             u32::try_from(std::mem::size_of_val(&limits))?,
         )
-    })?;
+    })
+    .context("limiting Windows sandbox worker job")?;
     Ok(job)
 }
 
@@ -358,6 +361,7 @@ impl Attributes {
                 std::ptr::null(),
             )
         })
+        .with_context(|| format!("setting Windows process attribute {name:#x}"))
     }
 
     fn insert_slice<T>(&mut self, name: u32, value: &[T]) -> Result<()> {
@@ -373,6 +377,7 @@ impl Attributes {
                 std::ptr::null(),
             )
         })
+        .with_context(|| format!("setting Windows process attribute {name:#x}"))
     }
 }
 
@@ -416,7 +421,8 @@ pub(super) fn spawn_worker(
     let executable_wide = wide(executable)?;
     let mut command_line = build_command_line(executable, arguments)?;
     let environment_wide = build_worker_environment(policy)?;
-    let (stdio, inherited) = prepare_inherited_handles(policy.role)?;
+    let (stdio, inherited) =
+        prepare_inherited_handles(policy.role).context("inheriting Windows worker handles")?;
     let capability_sids = build_capability_sids(policy)?;
     let mut capabilities: Vec<_> = capability_sids
         .iter()
@@ -543,11 +549,13 @@ fn create_restricted_token(role: Role) -> Result<OwnedHandle> {
         Attributes: 0,
     });
     let mut restricted = std::ptr::null_mut();
+    // LUA_TOKEN alongside restricting SIDs fails with ERROR_INVALID_PARAMETER; set_low_integrity
+    // replaces the integrity drop LUA_TOKEN gave.
     // SAFETY: the primary token is live, the deny and restricting SIDs are retained, and restricted is writable.
     win_ok(unsafe {
         CreateRestrictedToken(
             source.as_raw_handle(),
-            DISABLE_MAX_PRIVILEGE | LUA_TOKEN,
+            DISABLE_MAX_PRIVILEGE,
             1,
             &raw const deny_admin,
             0,
@@ -558,17 +566,43 @@ fn create_restricted_token(role: Role) -> Result<OwnedHandle> {
                 .map_or(std::ptr::null(), std::ptr::from_ref),
             &raw mut restricted,
         )
-    })?;
+    })
+    .context("creating Windows sandbox restricted token")?;
     let restricted = own_handle(restricted)?;
+    set_low_integrity(&restricted)?;
     if let Some(expected) = &restrict {
         verify_restricting_sids(&restricted, expected)?;
     }
     Ok(restricted)
 }
 
+fn set_low_integrity(token: &OwnedHandle) -> Result<()> {
+    let low = sid_from_string(LOW_INTEGRITY_SID)?;
+    let label = TOKEN_MANDATORY_LABEL {
+        Label: SID_AND_ATTRIBUTES {
+            Sid: low.0,
+            Attributes: SE_GROUP_INTEGRITY.cast_unsigned(),
+        },
+    };
+    // SAFETY: low is a valid SID retained through the call.
+    let length = u32::try_from(std::mem::size_of::<TOKEN_MANDATORY_LABEL>())?
+        + unsafe { GetLengthSid(low.0) };
+    // SAFETY: token is live and label points at a mandatory label whose SID outlives the call.
+    win_ok(unsafe {
+        SetTokenInformation(
+            token.as_raw_handle(),
+            TokenIntegrityLevel,
+            (&raw const label).cast(),
+            length,
+        )
+    })
+    .context("lowering Windows broker token integrity")
+}
+
 /// Trusted-wrapper check that the launched token carries exactly its file-access restriction.
 fn verify_restricting_sids(token: &OwnedHandle, expected: &LocalAllocation) -> Result<()> {
-    let buffer = token_information(token, TokenRestrictedSids)?;
+    let buffer = token_information(token, TokenRestrictedSids)
+        .context("reading Windows broker restricting SIDs")?;
     // SAFETY: TokenRestrictedSids initializes the DWORD count before its aligned SID array.
     let count = usize::try_from(unsafe { *buffer.as_ptr().cast::<u32>() })?;
     ensure!(
