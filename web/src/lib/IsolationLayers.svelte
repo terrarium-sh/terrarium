@@ -17,7 +17,7 @@
     { title: 'Wasm components', text: 'Each blue case is a separate Wasm store with isolated memory. The vCPU reaches each device directly; the VMM only boots and runs vCPUs.' },
     { title: 'Thin host API', text: 'Each Wasm store gets only its scoped host imports: VM handles, guest memory, disks, shares, or broker operations.' },
     { title: 'OS sandbox', text: 'By default, the VM worker runs in an OS sandbox without host networking: Bubblewrap and seccomp, App Sandbox, or AppContainer.' },
-    { title: 'Network broker', text: 'A separate process owns host sockets and enforces egress policy, one stream per guest socket. Sandboxed on Linux and macOS; a restricted token and job on Windows.' }
+    { title: 'Network broker', text: 'A separate process owns host sockets and enforces egress policy, one stream per guest socket. Sandboxed on every host: Bubblewrap, App Sandbox, or an AppContainer whose sockets come from a trusted launcher.' }
   ];
 
   const icons = {

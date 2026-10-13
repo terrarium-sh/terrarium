@@ -22,6 +22,172 @@ pub fn create_local_pair() -> std::io::Result<(LocalStream, LocalStream)> {
 }
 
 #[cfg(unix)]
+pub type OwnedSocket = std::os::fd::OwnedFd;
+#[cfg(windows)]
+pub type OwnedSocket = std::os::windows::io::OwnedSocket;
+
+/// Most sockets one [`send_sockets`] call carries.
+pub const MAX_HANDED_SOCKETS: usize = 64;
+
+/// Sends `sockets` for the peer to take with [`receive_sockets`]. Windows duplicates each socket
+/// into the `recipient` process; Unix passes the descriptors with the message and ignores it.
+#[cfg(unix)]
+pub fn send_sockets(
+    stream: &LocalStream,
+    sockets: &[OwnedSocket],
+    _recipient: u32,
+) -> std::io::Result<()> {
+    use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, SendFlags, sendmsg};
+    use std::os::fd::AsFd;
+    let count = handed_socket_count(sockets.len())?;
+    let descriptors: Vec<_> = sockets.iter().map(AsFd::as_fd).collect();
+    let mut space =
+        vec![std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(MAX_HANDED_SOCKETS))];
+    let mut control = SendAncillaryBuffer::new(&mut space);
+    if !descriptors.is_empty() && !control.push(SendAncillaryMessage::ScmRights(&descriptors)) {
+        return Err(std::io::Error::other("socket rights exceed their buffer"));
+    }
+    let sent = sendmsg(
+        stream,
+        &[std::io::IoSlice::new(&[count])],
+        &mut control,
+        SendFlags::empty(),
+    )?;
+    if sent != 1 {
+        return Err(std::io::ErrorKind::WriteZero.into());
+    }
+    Ok(())
+}
+
+/// Takes the sockets the peer sent with [`send_sockets`].
+#[cfg(unix)]
+pub fn receive_sockets(stream: &LocalStream) -> std::io::Result<Vec<OwnedSocket>> {
+    use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags, recvmsg};
+    let mut count = [0];
+    let mut space =
+        vec![std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(MAX_HANDED_SOCKETS))];
+    let mut control = RecvAncillaryBuffer::new(&mut space);
+    #[cfg(target_os = "linux")]
+    let flags = RecvFlags::CMSG_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let flags = RecvFlags::empty();
+    let received = recvmsg(
+        stream,
+        &mut [std::io::IoSliceMut::new(&mut count)],
+        &mut control,
+        flags,
+    )?;
+    let mut sockets = Vec::new();
+    for message in control.drain() {
+        if let RecvAncillaryMessage::ScmRights(descriptors) = message {
+            sockets.extend(descriptors);
+        }
+    }
+    // Only Linux applies close-on-exec while receiving.
+    #[cfg(not(target_os = "linux"))]
+    for socket in &sockets {
+        rustix::io::fcntl_setfd(socket, rustix::io::FdFlags::CLOEXEC)?;
+    }
+    if received.bytes != 1
+        || received.flags.contains(ReturnFlags::CTRUNC)
+        || sockets.len() != usize::from(count[0])
+    {
+        return Err(std::io::Error::other("socket hand-off is malformed"));
+    }
+    Ok(sockets)
+}
+
+#[cfg(windows)]
+pub use windows_sockets::{encode_sockets, receive_sockets, send_sockets};
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod windows_sockets {
+    use super::{LocalStream, MAX_HANDED_SOCKETS, OwnedSocket, handed_socket_count};
+    use std::io::{Read, Write};
+    use std::os::windows::io::{AsRawSocket, FromRawSocket};
+    use windows_sys::Win32::Networking::WinSock::{
+        FROM_PROTOCOL_INFO, INVALID_SOCKET, WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED,
+        WSADuplicateSocketW, WSAGetLastError, WSAPROTOCOL_INFOW, WSASocketW,
+    };
+
+    const PROTOCOL_INFO_BYTES: usize = std::mem::size_of::<WSAPROTOCOL_INFOW>();
+
+    fn last_socket_error() -> std::io::Error {
+        // SAFETY: WSAGetLastError reads the calling thread's last Winsock error.
+        std::io::Error::from_raw_os_error(unsafe { WSAGetLastError() })
+    }
+
+    pub fn send_sockets(
+        mut stream: &LocalStream,
+        sockets: &[OwnedSocket],
+        recipient: u32,
+    ) -> std::io::Result<()> {
+        stream.write_all(&encode_sockets(sockets, recipient)?)
+    }
+
+    /// Duplicates `sockets` into `recipient` and returns the frame [`send_sockets`] writes, so a
+    /// caller can commit to a reply only after every duplication succeeded.
+    pub fn encode_sockets(sockets: &[OwnedSocket], recipient: u32) -> std::io::Result<Vec<u8>> {
+        let mut message = vec![handed_socket_count(sockets.len())?];
+        for socket in sockets {
+            let mut information = WSAPROTOCOL_INFOW::default();
+            let raw = usize::try_from(socket.as_raw_socket()).map_err(std::io::Error::other)?;
+            // SAFETY: socket is live and information is writable for the call.
+            let status = unsafe { WSADuplicateSocketW(raw, recipient, &raw mut information) };
+            if status != 0 {
+                return Err(last_socket_error());
+            }
+            // SAFETY: WSAPROTOCOL_INFOW is plain old data, read for its exact size.
+            message.extend_from_slice(unsafe {
+                std::slice::from_raw_parts((&raw const information).cast(), PROTOCOL_INFO_BYTES)
+            });
+        }
+        Ok(message)
+    }
+
+    pub fn receive_sockets(mut stream: &LocalStream) -> std::io::Result<Vec<OwnedSocket>> {
+        let mut count = [0];
+        stream.read_exact(&mut count)?;
+        if usize::from(count[0]) > MAX_HANDED_SOCKETS {
+            return Err(std::io::Error::other("socket hand-off is malformed"));
+        }
+        let mut sockets = Vec::with_capacity(count[0].into());
+        for _ in 0..count[0] {
+            let mut information = WSAPROTOCOL_INFOW::default();
+            // SAFETY: every byte pattern is a valid WSAPROTOCOL_INFOW, filled for its exact size.
+            stream.read_exact(unsafe {
+                std::slice::from_raw_parts_mut((&raw mut information).cast(), PROTOCOL_INFO_BYTES)
+            })?;
+            // SAFETY: information describes a socket the sender duplicated into this process.
+            let socket = unsafe {
+                WSASocketW(
+                    FROM_PROTOCOL_INFO,
+                    FROM_PROTOCOL_INFO,
+                    FROM_PROTOCOL_INFO,
+                    &raw const information,
+                    0,
+                    WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT,
+                )
+            };
+            if socket == INVALID_SOCKET {
+                return Err(last_socket_error());
+            }
+            // SAFETY: WSASocketW returned this new socket, owned from here on.
+            sockets.push(unsafe { OwnedSocket::from_raw_socket(socket as u64) });
+        }
+        Ok(sockets)
+    }
+}
+
+fn handed_socket_count(count: usize) -> std::io::Result<u8> {
+    u8::try_from(count)
+        .ok()
+        .filter(|count| usize::from(*count) <= MAX_HANDED_SOCKETS)
+        .ok_or_else(|| std::io::Error::other("too many sockets for one hand-off"))
+}
+
+#[cfg(unix)]
 pub use tokio::net::UnixStream as AsyncLocalStream;
 
 /// Ends the stream's write direction at once, so the peer reads EOF while this end can still read.
@@ -409,5 +575,28 @@ mod asynchronous_tests {
         server.write_all(b"pong").unwrap();
         reader.read_exact(&mut buffer).await.unwrap();
         assert_eq!(&buffer, b"pong");
+    }
+}
+
+#[cfg(test)]
+mod hand_off_tests {
+    use super::*;
+
+    /// A handed-over listener keeps its bound address and accepts in the receiving end's owner.
+    #[test]
+    fn sockets_cross_a_local_stream_and_stay_usable() {
+        let (owner, recipient) = create_local_pair().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        send_sockets(&owner, &[OwnedSocket::from(listener)], std::process::id()).unwrap();
+        let mut received = receive_sockets(&recipient).unwrap();
+        assert_eq!(received.len(), 1);
+        let listener = std::net::TcpListener::from(received.remove(0));
+        assert_eq!(listener.local_addr().unwrap(), address);
+        let _client = std::net::TcpStream::connect(address).unwrap();
+        listener.accept().unwrap();
+
+        send_sockets(&owner, &[], std::process::id()).unwrap();
+        assert!(receive_sockets(&recipient).unwrap().is_empty());
     }
 }

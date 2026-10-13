@@ -153,7 +153,19 @@ async fn path_stat(directory: &types::Descriptor, name: &str) -> Result<Stat, i3
                 .map_err(wasi_error)
         },
     )?;
-    Ok(stat(metadata, identity))
+    let is_sizeless_link =
+        matches!(metadata.type_, types::DescriptorType::SymbolicLink) && metadata.size == 0;
+    let mut result = stat(metadata, identity);
+    // Windows reports symlinks as zero bytes; the guest reads a cached link only up to its size.
+    if is_sizeless_link {
+        let target = directory
+            .readlink_at(name.to_owned())
+            .await
+            .map_err(wasi_error)?;
+        result.size = u64::try_from(target.len()).map_err(|_| wire::EINVAL)?;
+        result.blocks = result.size.div_ceil(512);
+    }
+    Ok(result)
 }
 
 fn verify_identity(

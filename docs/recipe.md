@@ -102,7 +102,8 @@ when the box starts. A mount grants the guest access to that host directory.
 
 Mounts use a scoped WASI directory capability. Guest path traversal and
 symlinks cannot open a host path outside that grant. Read-only mounts reject
-writes and metadata changes. They support ordinary file I/O, relative symlinks,
+writes and metadata changes. They support ordinary file I/O, relative symlinks
+(on Windows hosts stored as WSL-style links that Windows does not follow),
 and guest execution/mmap. Names must be UTF-8; guest ownership is synthetic.
 Linux and macOS hosts expose Unix permission bits. On Windows, regular files
 report mode `0755`, or `0555` when the read-only attribute is set. Setting any

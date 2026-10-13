@@ -43,6 +43,8 @@ const WORKER_DENIED_SYSCALLS: [&str; 5] = [
     "io_uring_register",
 ];
 const VM_DENIED_SYSCALLS: [&str; 3] = ["connect", "sendmsg", "sendmmsg"];
+/// The supervisor binds every published listener before starting the broker.
+const NETWORK_DENIED_SYSCALLS: [&str; 1] = ["listen"];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Architecture {
@@ -203,6 +205,7 @@ fn append_vm_rules(filter: &mut Filter) -> Result<(), String> {
 /// Limits `socket` to IP: the broker shares the host network namespace, where `AF_UNIX` would reach
 /// abstract sockets such as the user's X11 display.
 fn append_network_rules(filter: &mut Filter) -> Result<(), String> {
+    filter.append_denied_syscalls(&NETWORK_DENIED_SYSCALLS)?;
     let socket = filter.architecture.resolve_syscall_number("socket")?;
     filter.append(JUMP_EQUAL, 0, 5, socket);
     filter.append(LOAD_WORD, 0, 0, FIRST_ARGUMENT);

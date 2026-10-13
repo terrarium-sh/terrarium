@@ -14,7 +14,8 @@ pub use unix::{
 pub use windows::{
     IPC_HANDLE_VARIABLES, LISTENER_HANDLE_VARIABLES, LOCK_HANDLE_VARIABLE, VmChildGuard,
     attach_vm_child, claim_ipc, claim_socket, detach, handle_variable, inherited_handle,
-    initialize_winsock, kill_vm_child, pass_handle, pass_ipc, set_inheritable, supervise_vm_child,
+    initialize_winsock, kill_vm_child, pass_handle, pass_ipc, set_inheritable,
+    spawn_without_standard_handles, supervise_vm_child,
 };
 
 /// Environment a host sandbox sets on the worker it launches, which the worker reads back.

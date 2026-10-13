@@ -4,13 +4,10 @@ ln /work/host /work/hard
 printf hard-linked > /work/hard
 test "$(cat /work/host)" = hard-linked
 printf linked > /work/hard
-if [ "${TERRA_SELF_TEST_EXPECT_SYMLINK_DENIAL:-}" = 1 ]; then
-    if ln -s host /work/link; then exit 1; fi
-    test ! -L /work/link
-else
-    ln -s host /work/link
-    test "$(cat /work/link)" = linked
-fi
+ln -s host /work/link
+test -L /work/link
+test "$(readlink /work/link)" = host
+test "$(cat /work/link)" = linked
 printf open-unlink > /work/open
 exec 3</work/open
 rm /work/open

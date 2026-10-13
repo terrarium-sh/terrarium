@@ -1,7 +1,8 @@
-use super::{Mode, Policy, Result, Role, wide};
+use super::{Policy, Result, Role, wide};
 use anyhow::{Context, ensure};
 use std::ffi::{OsStr, OsString, c_void};
 use std::fs::File;
+use std::io::Read as _;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use terra_platform::process;
@@ -15,25 +16,23 @@ use windows_sys::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeleteAppContainerProfile,
 };
 use windows_sys::Win32::Security::{
-    CreateRestrictedToken, DISABLE_MAX_PRIVILEGE, DeriveCapabilitySidsFromName, EqualSid, FreeSid,
-    GetLengthSid, GetTokenInformation, PSID, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES,
-    SID_AND_ATTRIBUTES, SetTokenInformation, TOKEN_ALL_ACCESS, TOKEN_GROUPS,
-    TOKEN_INFORMATION_CLASS, TOKEN_MANDATORY_LABEL, TokenCapabilities, TokenIntegrityLevel,
-    TokenRestrictedSids,
+    DeriveCapabilitySidsFromName, EqualSid, FreeSid, GetTokenInformation, PSID,
+    SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES, TOKEN_GROUPS,
+    TOKEN_INFORMATION_CLASS, TokenCapabilities,
 };
 use windows_sys::Win32::System::Console::{
-    GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    GetConsoleMode, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
 use windows_sys::Win32::System::JobObjects::{
     CreateJobObjectW, JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-    SetInformationJobObject,
+    JOBOBJECT_BASIC_UI_RESTRICTIONS, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JobObjectBasicUIRestrictions, JobObjectExtendedLimitInformation, SetInformationJobObject,
 };
 use windows_sys::Win32::System::Pipes::CreatePipe;
-use windows_sys::Win32::System::SystemServices::{SE_GROUP_ENABLED, SE_GROUP_INTEGRITY};
+use windows_sys::Win32::System::SystemServices::{JOB_OBJECT_UILIMIT_ALL, SE_GROUP_ENABLED};
 use windows_sys::Win32::System::Threading::{
-    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, CreateProcessW,
+    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DETACHED_PROCESS,
     DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, INFINITE,
     InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcessToken,
     PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY,
@@ -42,13 +41,62 @@ use windows_sys::Win32::System::Threading::{
     PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
     STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
 };
+use windows_sys::Win32::System::WindowsProgramming::{
+    PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT, PROCESS_CREATION_CHILD_PROCESS_RESTRICTED,
+};
 
 // VidExo gates WHP access behind this capability even for capability queries.
 const HYPERVISOR_CAPABILITY: &str = "HypervisorPlatform";
-const ALL_APPLICATION_PACKAGES_SID: &str = "S-1-15-2-1";
-const LOW_INTEGRITY_SID: &str = "S-1-16-4096";
+// Lets Winsock initialize inside a Less-Privileged AppContainer.
+const REGISTRY_READ_CAPABILITY: &str = "registryRead";
+// Network isolation recognizes only the legacy SID; resolution and accept need it.
+const INTERNET_CLIENT_SID: &str = "S-1-15-3-1";
+
+// PROCESS_CREATION_MITIGATION_POLICY_*_ALWAYS_ON values from WinBase.h; windows-sys omits them.
+const FORCE_RELOCATE_IMAGES: u64 = 1 << 8;
+const HEAP_TERMINATE: u64 = 1 << 12;
+const BOTTOM_UP_ASLR: u64 = 1 << 16;
+const HIGH_ENTROPY_ASLR: u64 = 1 << 20;
+const STRICT_HANDLE_CHECKS: u64 = 1 << 24;
 const DISABLE_WIN32K: u64 = 1 << 28;
+const DISABLE_EXTENSION_POINTS: u64 = 1 << 32;
 const DISABLE_DYNAMIC_CODE: u64 = 1 << 36;
+const DISABLE_NON_SYSTEM_FONTS: u64 = 1 << 48;
+const BLOCK_REMOTE_IMAGES: u64 = 1 << 52;
+const BLOCK_LOW_LABEL_IMAGES: u64 = 1 << 56;
+const PREFER_SYSTEM32_IMAGES: u64 = 1 << 60;
+// PROCESS_CREATION_MITIGATION_POLICY2_*_ALWAYS_ON values.
+const MODULE_TAMPERING_PROTECTION: u64 = 1 << 12;
+const RESTRICT_INDIRECT_BRANCH_PREDICTION: u64 = 1 << 16;
+const DISABLE_SPECULATIVE_STORE_BYPASS: u64 = 1 << 24;
+
+/// The two words of a worker's `PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Mitigations([u64; 2]);
+
+impl Mitigations {
+    pub(super) const NONE: Self = Self([0; 2]);
+    pub(super) const WORKER: Self = Self([
+        FORCE_RELOCATE_IMAGES
+            | HEAP_TERMINATE
+            | BOTTOM_UP_ASLR
+            | HIGH_ENTROPY_ASLR
+            | STRICT_HANDLE_CHECKS
+            | DISABLE_WIN32K
+            | DISABLE_EXTENSION_POINTS
+            | DISABLE_NON_SYSTEM_FONTS
+            | BLOCK_REMOTE_IMAGES
+            | BLOCK_LOW_LABEL_IMAGES
+            | PREFER_SYSTEM32_IMAGES,
+        MODULE_TAMPERING_PROTECTION
+            | RESTRICT_INDIRECT_BRANCH_PREDICTION
+            | DISABLE_SPECULATIVE_STORE_BYPASS,
+    ]);
+
+    pub(super) const fn prohibiting_dynamic_code(self) -> Self {
+        Self([self.0[0] | DISABLE_DYNAMIC_CODE, self.0[1]])
+    }
+}
 
 pub(super) fn win_ok(result: i32) -> Result<()> {
     if result == 0 {
@@ -139,31 +187,37 @@ pub(super) fn verify_capabilities(token: &OwnedHandle, role: Role) -> Result<()>
             count,
         )
     };
-    match role {
-        Role::Vm => {
-            let registry_read = derive_capability("registryRead")?;
-            let hypervisor = derive_capability(HYPERVISOR_CAPABILITY)?;
-            ensure!(
-                capabilities.len() <= 2
-                    && capabilities.iter().any(|capability| {
-                        // SAFETY: both SIDs are initialized and retained throughout the comparison.
-                        (unsafe { EqualSid(capability.Sid, hypervisor.0) }) != 0
-                    })
-                    && capabilities.iter().all(|capability| {
-                        // SAFETY: both SIDs are initialized and retained throughout the comparison.
-                        (unsafe { EqualSid(capability.Sid, registry_read.0) }) != 0
-                            || (unsafe { EqualSid(capability.Sid, hypervisor.0) }) != 0
-                    }),
-                "Windows VM token must have HypervisorPlatform and no other capabilities beyond registryRead"
-            );
-        }
-        Role::Network => anyhow::bail!("network broker AppContainer mode is unsupported"),
-        Role::Supervisor => ensure!(
-            capabilities.is_empty(),
-            "supervisor cannot use a worker AppContainer"
-        ),
-    }
+    let expected = role_capability_sids(role)?;
+    let is_expected = |sid: PSID| {
+        expected
+            .iter()
+            // SAFETY: both SIDs are initialized and retained throughout the comparison.
+            .any(|capability| unsafe { EqualSid(sid, capability.0) } != 0)
+    };
+    ensure!(
+        capabilities.len() == expected.len()
+            && capabilities
+                .iter()
+                .all(|capability| is_expected(capability.Sid)),
+        "Windows {} token must carry exactly its role capabilities",
+        role.name()
+    );
     Ok(())
+}
+
+/// The only capabilities each worker's token receives.
+fn role_capability_sids(role: Role) -> Result<Vec<LocalAllocation>> {
+    Ok(match role {
+        Role::Supervisor => Vec::new(),
+        Role::Vm => vec![
+            derive_capability(REGISTRY_READ_CAPABILITY)?,
+            derive_capability(HYPERVISOR_CAPABILITY)?,
+        ],
+        Role::Network => vec![
+            derive_capability(REGISTRY_READ_CAPABILITY)?,
+            sid_from_string(INTERNET_CLIENT_SID)?,
+        ],
+    })
 }
 
 fn derive_capability(name: &str) -> Result<LocalAllocation> {
@@ -282,7 +336,8 @@ impl Drop for Profile {
     }
 }
 
-pub(super) fn create_identity_pipe() -> Result<(File, File)> {
+/// Returns `(reader, writer)`; only the writer is inheritable.
+pub(super) fn create_child_writer_pipe() -> Result<(File, File)> {
     let attributes = SECURITY_ATTRIBUTES {
         nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>())?,
         lpSecurityDescriptor: std::ptr::null_mut(),
@@ -294,7 +349,7 @@ pub(super) fn create_identity_pipe() -> Result<(File, File)> {
     win_ok(unsafe { CreatePipe(&raw mut read, &raw mut write, &raw const attributes, 0) })?;
     let read = own_handle(read)?;
     let write = own_handle(write)?;
-    // SAFETY: only the write side belongs in the trusted launcher child.
+    // SAFETY: only the write side belongs in the child.
     win_ok(unsafe { SetHandleInformation(read.as_raw_handle(), HANDLE_FLAG_INHERIT, 0) })?;
     Ok((File::from(read), File::from(write)))
 }
@@ -321,6 +376,19 @@ pub(super) fn create_worker_job(memory_limit: usize) -> Result<OwnedHandle> {
         )
     })
     .context("limiting Windows sandbox worker job")?;
+    let interface = JOBOBJECT_BASIC_UI_RESTRICTIONS {
+        UIRestrictionsClass: JOB_OBJECT_UILIMIT_ALL,
+    };
+    // SAFETY: job is live and the restriction structure has the exact reported size.
+    win_ok(unsafe {
+        SetInformationJobObject(
+            job.as_raw_handle(),
+            JobObjectBasicUIRestrictions,
+            (&raw const interface).cast(),
+            u32::try_from(std::mem::size_of_val(&interface))?,
+        )
+    })
+    .context("restricting Windows sandbox worker desktop access")?;
     Ok(job)
 }
 
@@ -394,6 +462,16 @@ pub(super) struct Worker {
     pub(super) process: OwnedHandle,
     pub(super) thread: OwnedHandle,
     pub(super) pid: u32,
+    console_relays: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl Worker {
+    /// Waits for console output the exited worker left in its pipes.
+    pub(super) fn finish_console_relays(&mut self) {
+        for relay in self.console_relays.drain(..) {
+            let _ = relay.join();
+        }
+    }
 }
 
 impl Drop for Worker {
@@ -415,15 +493,21 @@ pub(super) fn spawn_worker(
     executable: &OsStr,
     arguments: impl Iterator<Item = OsString>,
     policy: &Policy,
-    profile: Option<&Profile>,
+    profile: &Profile,
     job: &OwnedHandle,
+    launcher_handles: &[(&str, HANDLE)],
 ) -> Result<Worker> {
     let executable_wide = wide(executable)?;
     let mut command_line = build_command_line(executable, arguments)?;
-    let environment_wide = build_worker_environment(policy)?;
-    let (stdio, inherited) =
-        prepare_inherited_handles(policy.role).context("inheriting Windows worker handles")?;
-    let capability_sids = build_capability_sids(policy)?;
+    let environment_wide = build_worker_environment(policy, launcher_handles)?;
+    let StandardHandles {
+        handles: stdio,
+        substitutes,
+        console_relays,
+    } = prepare_standard_handles().context("preparing Windows worker stdio")?;
+    let inherited = list_inherited_handles(policy.role, &stdio, launcher_handles)
+        .context("inheriting Windows worker handles")?;
+    let capability_sids = role_capability_sids(policy.role)?;
     let mut capabilities: Vec<_> = capability_sids
         .iter()
         .map(|sid| SID_AND_ATTRIBUTES {
@@ -432,7 +516,7 @@ pub(super) fn spawn_worker(
         })
         .collect();
     let security = SECURITY_CAPABILITIES {
-        AppContainerSid: profile.map_or(std::ptr::null_mut(), |profile| profile.sid),
+        AppContainerSid: profile.sid,
         Capabilities: if capabilities.is_empty() {
             std::ptr::null_mut()
         } else {
@@ -442,28 +526,21 @@ pub(super) fn spawn_worker(
         Reserved: 0,
     };
     let job_handles = [job.as_raw_handle()];
-    let child_policy = 1_u32;
-    let packages_opt_out = 1_u32;
-    let mitigation = DISABLE_WIN32K
-        | if policy.role == Role::Network {
-            DISABLE_DYNAMIC_CODE
-        } else {
-            0
-        };
+    let child_policy = PROCESS_CREATION_CHILD_PROCESS_RESTRICTED;
+    let packages_opt_out = PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
     let mut attributes = Attributes::new(6)?;
     attributes.insert_slice(PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &inherited)?;
     attributes.insert_slice(PROC_THREAD_ATTRIBUTE_JOB_LIST, &job_handles)?;
     attributes.insert(PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY, &child_policy)?;
-    attributes.insert(PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, &mitigation)?;
-    if profile.is_some() {
-        attributes.insert(PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, &security)?;
-        if policy.less_privileged {
-            attributes.insert(
-                PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY,
-                &packages_opt_out,
-            )?;
-        }
-    }
+    attributes.insert(
+        PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY,
+        &policy.mitigations.0,
+    )?;
+    attributes.insert(PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, &security)?;
+    attributes.insert(
+        PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY,
+        &packages_opt_out,
+    )?;
     let mut startup = STARTUPINFOEXW::default();
     startup.StartupInfo.cb = u32::try_from(std::mem::size_of::<STARTUPINFOEXW>())?;
     startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
@@ -474,49 +551,35 @@ pub(super) fn spawn_worker(
     ] = stdio;
     startup.lpAttributeList = attributes.as_mut_ptr();
     let mut information = PROCESS_INFORMATION::default();
-    let flags = CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT;
-    let token = if policy.mode == Mode::RestrictedTokenJob {
-        Some(create_restricted_token(policy.role)?)
-    } else {
-        None
-    };
+    // An attached worker could open CONIN$ and queue keystrokes for the user's shell.
+    let flags = CREATE_UNICODE_ENVIRONMENT
+        | CREATE_SUSPENDED
+        | EXTENDED_STARTUPINFO_PRESENT
+        | DETACHED_PROCESS;
     // SAFETY: every buffer and process attribute value remains live through this synchronous creation.
     // The job attribute attaches the process before creation returns, closing the suspend/assign orphan race.
     let result = unsafe {
-        if let Some(token) = &token {
-            CreateProcessAsUserW(
-                token.as_raw_handle(),
-                executable_wide.as_ptr(),
-                command_line.as_mut_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-                1,
-                flags,
-                environment_wide.as_ptr().cast(),
-                std::ptr::null(),
-                &raw const startup.StartupInfo,
-                &raw mut information,
-            )
-        } else {
-            CreateProcessW(
-                executable_wide.as_ptr(),
-                command_line.as_mut_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-                1,
-                flags,
-                environment_wide.as_ptr().cast(),
-                std::ptr::null(),
-                &raw const startup.StartupInfo,
-                &raw mut information,
-            )
-        }
+        CreateProcessW(
+            executable_wide.as_ptr(),
+            command_line.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+            flags,
+            environment_wide.as_ptr().cast(),
+            std::ptr::null(),
+            &raw const startup.StartupInfo,
+            &raw mut information,
+        )
     };
     win_ok(result).context("creating Windows sandbox worker (no weaker launch is attempted)")?;
+    // The worker's exit must be the relays' end of input.
+    drop(substitutes);
     Ok(Worker {
         process: own_handle(information.hProcess)?,
         thread: own_handle(information.hThread)?,
         pid: information.dwProcessId,
+        console_relays,
     })
 }
 
@@ -526,119 +589,6 @@ fn sid_from_string(name: &str) -> Result<LocalAllocation> {
     // SAFETY: name is NUL-terminated and the allocation output is writable.
     win_ok(unsafe { ConvertStringSidToSidW(name.as_ptr(), &raw mut sid) })?;
     Ok(LocalAllocation(sid))
-}
-
-fn create_restricted_token(role: Role) -> Result<OwnedHandle> {
-    let source = open_current_token(TOKEN_ALL_ACCESS)?;
-    let admin = sid_from_string("S-1-5-32-544")?;
-    let deny_admin = SID_AND_ATTRIBUTES {
-        Sid: admin.0,
-        Attributes: 0,
-    };
-    // The broker parses untrusted network payloads, so every access check is
-    // restricted to ALL APPLICATION PACKAGES: the system grants Windows ships
-    // for AppContainers keep DLL loading, Winsock and name resolution working,
-    // and host files gain nothing.
-    let restrict = if role == Role::Network {
-        Some(sid_from_string(ALL_APPLICATION_PACKAGES_SID)?)
-    } else {
-        None
-    };
-    let restrict_sids = restrict.as_ref().map(|sid| SID_AND_ATTRIBUTES {
-        Sid: sid.0,
-        Attributes: 0,
-    });
-    let mut restricted = std::ptr::null_mut();
-    // LUA_TOKEN alongside restricting SIDs fails with ERROR_INVALID_PARAMETER; set_low_integrity
-    // replaces the integrity drop LUA_TOKEN gave.
-    // SAFETY: the primary token is live, the deny and restricting SIDs are retained, and restricted is writable.
-    win_ok(unsafe {
-        CreateRestrictedToken(
-            source.as_raw_handle(),
-            DISABLE_MAX_PRIVILEGE,
-            1,
-            &raw const deny_admin,
-            0,
-            std::ptr::null(),
-            u32::from(restrict_sids.is_some()),
-            restrict_sids
-                .as_ref()
-                .map_or(std::ptr::null(), std::ptr::from_ref),
-            &raw mut restricted,
-        )
-    })
-    .context("creating Windows sandbox restricted token")?;
-    let restricted = own_handle(restricted)?;
-    set_low_integrity(&restricted)?;
-    if let Some(expected) = &restrict {
-        verify_restricting_sids(&restricted, expected)?;
-    }
-    Ok(restricted)
-}
-
-fn set_low_integrity(token: &OwnedHandle) -> Result<()> {
-    let low = sid_from_string(LOW_INTEGRITY_SID)?;
-    let label = TOKEN_MANDATORY_LABEL {
-        Label: SID_AND_ATTRIBUTES {
-            Sid: low.0,
-            Attributes: SE_GROUP_INTEGRITY.cast_unsigned(),
-        },
-    };
-    // SAFETY: low is a valid SID retained through the call.
-    let length = u32::try_from(std::mem::size_of::<TOKEN_MANDATORY_LABEL>())?
-        + unsafe { GetLengthSid(low.0) };
-    // SAFETY: token is live and label points at a mandatory label whose SID outlives the call.
-    win_ok(unsafe {
-        SetTokenInformation(
-            token.as_raw_handle(),
-            TokenIntegrityLevel,
-            (&raw const label).cast(),
-            length,
-        )
-    })
-    .context("lowering Windows broker token integrity")
-}
-
-/// Trusted-wrapper check that the launched token carries exactly its file-access restriction.
-fn verify_restricting_sids(token: &OwnedHandle, expected: &LocalAllocation) -> Result<()> {
-    let buffer = token_information(token, TokenRestrictedSids)
-        .context("reading Windows broker restricting SIDs")?;
-    // SAFETY: TokenRestrictedSids initializes the DWORD count before its aligned SID array.
-    let count = usize::try_from(unsafe { *buffer.as_ptr().cast::<u32>() })?;
-    ensure!(
-        count == 1
-            && std::mem::offset_of!(TOKEN_GROUPS, Groups)
-                + count * std::mem::size_of::<SID_AND_ATTRIBUTES>()
-                <= std::mem::size_of_val(buffer.as_slice()),
-        "Windows broker token carries unexpected restricting SIDs"
-    );
-    // SAFETY: the preceding check bounds the initialized restricting SID array.
-    let restricting = unsafe {
-        std::slice::from_raw_parts(
-            buffer
-                .as_ptr()
-                .cast::<SID_AND_ATTRIBUTES>()
-                .byte_add(std::mem::offset_of!(TOKEN_GROUPS, Groups)),
-            count,
-        )
-    };
-    ensure!(
-        // SAFETY: both SIDs are initialized and retained throughout the comparison.
-        unsafe { EqualSid(restricting[0].Sid, expected.0) } != 0,
-        "Windows broker restriction is not ALL APPLICATION PACKAGES"
-    );
-    Ok(())
-}
-
-fn build_capability_sids(policy: &Policy) -> Result<Vec<LocalAllocation>> {
-    let mut sids = Vec::new();
-    if policy.role == Role::Vm && policy.mode == Mode::AppContainer {
-        sids.push(derive_capability(HYPERVISOR_CAPABILITY)?);
-    }
-    if policy.less_privileged && policy.role != Role::Supervisor {
-        sids.push(derive_capability("registryRead")?);
-    }
-    Ok(sids)
 }
 
 fn build_command_line(
@@ -659,13 +609,19 @@ fn build_command_line(
     Ok(command_line)
 }
 
-fn build_worker_environment(policy: &Policy) -> Result<Vec<u16>> {
+/// `launcher_handles` names the wrapper's own handles the worker inherits.
+fn build_worker_environment(
+    policy: &Policy,
+    launcher_handles: &[(&str, HANDLE)],
+) -> Result<Vec<u16>> {
     let mut environment: Vec<_> = std::env::vars_os()
         .filter(|(name, _)| {
             ![
                 super::SPEC_ENV,
                 super::IDENTITY_ENV,
                 super::PARENT_ENV,
+                super::sockets::LAUNCHER_SOCKETS_ENV,
+                super::symlink_broker::SYMLINK_BROKER_ENV,
                 WINDOWS_ROLE,
                 WINDOWS_MODE,
             ]
@@ -675,6 +631,9 @@ fn build_worker_environment(policy: &Policy) -> Result<Vec<u16>> {
         .collect();
     environment.push((WINDOWS_ROLE.into(), policy.role.name().into()));
     environment.push((WINDOWS_MODE.into(), policy.mode.name().into()));
+    for (name, handle) in launcher_handles {
+        environment.push(((*name).into(), (*handle as usize).to_string().into()));
+    }
     environment.sort_by(|(left, _), (right, _)| {
         left.to_ascii_lowercase().cmp(&right.to_ascii_lowercase())
     });
@@ -686,23 +645,122 @@ fn build_worker_environment(policy: &Policy) -> Result<Vec<u16>> {
     Ok(environment_wide)
 }
 
-fn prepare_inherited_handles(role: Role) -> Result<([HANDLE; 3], Vec<HANDLE>)> {
-    let mut inherited = Vec::new();
-    let mut stdio = [std::ptr::null_mut(); 3];
-    for (slot, kind) in
-        stdio
-            .iter_mut()
-            .zip([STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE])
+/// Worker standard handles in which no console handle survives.
+struct StandardHandles {
+    handles: [HANDLE; 3],
+    /// NUL and pipe ends standing in for console handles.
+    substitutes: Vec<OwnedHandle>,
+    console_relays: Vec<std::thread::JoinHandle<()>>,
+}
+
+/// A console handle would let the worker read the user's input or queue keystrokes, so console
+/// input becomes NUL and console output a pipe relayed as plain text.
+fn prepare_standard_handles() -> Result<StandardHandles> {
+    let mut standard = StandardHandles {
+        handles: [std::ptr::null_mut(); 3],
+        substitutes: Vec::new(),
+        console_relays: Vec::new(),
+    };
+    for (slot, kind) in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE]
+        .into_iter()
+        .enumerate()
     {
         // SAFETY: query the trusted wrapper's configured standard handle.
-        *slot = unsafe { GetStdHandle(kind) };
+        let mut handle = unsafe { GetStdHandle(kind) };
         ensure!(
-            !slot.is_null() && *slot != INVALID_HANDLE_VALUE,
+            !handle.is_null() && handle != INVALID_HANDLE_VALUE,
             "Windows sandbox requires valid standard handles"
         );
-        // SAFETY: these handles belong to this single-threaded wrapper and remain live through creation.
-        win_ok(unsafe { SetHandleInformation(*slot, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) })?;
-        inherited.push(*slot);
+        if is_console(handle) {
+            let substitute = if kind == STD_INPUT_HANDLE {
+                OwnedHandle::from(File::open("NUL")?)
+            } else {
+                let (reader, writer) = create_child_writer_pipe()?;
+                let relay = std::thread::Builder::new()
+                    .name("sandbox-console-relay".into())
+                    .spawn(move || {
+                        if kind == STD_OUTPUT_HANDLE {
+                            relay_console_output(reader, std::io::stdout());
+                        } else {
+                            relay_console_output(reader, std::io::stderr());
+                        }
+                    })?;
+                standard.console_relays.push(relay);
+                OwnedHandle::from(writer)
+            };
+            handle = substitute.as_raw_handle();
+            standard.substitutes.push(substitute);
+        }
+        // SAFETY: these handles stay live in this wrapper through worker creation.
+        win_ok(unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) })?;
+        standard.handles[slot] = handle;
+    }
+    Ok(standard)
+}
+
+fn is_console(handle: HANDLE) -> bool {
+    let mut mode = 0;
+    // SAFETY: handle is a live standard handle and mode is writable.
+    unsafe { GetConsoleMode(handle, &raw mut mode) != 0 }
+}
+
+/// Keeps draining after the console fails so the worker never blocks on a full pipe.
+fn relay_console_output(mut source: File, mut console: impl std::io::Write) {
+    let mut pending = Vec::new();
+    let mut buffer = [0; 4096];
+    let mut is_console_writable = true;
+    loop {
+        let read = source.read(&mut buffer).unwrap_or(0);
+        pending.extend_from_slice(&buffer[..read]);
+        let complete = if read == 0 {
+            pending.len()
+        } else {
+            complete_utf8_prefix(&pending)
+        };
+        let text = strip_control_characters(&pending[..complete]);
+        pending.drain(..complete);
+        is_console_writable = is_console_writable
+            && console
+                .write_all(text.as_bytes())
+                .and_then(|()| console.flush())
+                .is_ok();
+        if read == 0 {
+            return;
+        }
+    }
+}
+
+/// The prefix that holds no UTF-8 sequence cut off by the end of `bytes`.
+fn complete_utf8_prefix(bytes: &[u8]) -> usize {
+    match std::str::from_utf8(bytes) {
+        Err(error) if error.error_len().is_none() => error.valid_up_to(),
+        _ => bytes.len(),
+    }
+}
+
+/// Escape sequences could write the user's clipboard or answer into console input.
+fn strip_control_characters(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .chars()
+        .map(|character| {
+            if character.is_control() && !matches!(character, '\n' | '\r' | '\t') {
+                char::REPLACEMENT_CHARACTER
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
+fn list_inherited_handles(
+    role: Role,
+    stdio: &[HANDLE; 3],
+    launcher_handles: &[(&str, HANDLE)],
+) -> Result<Vec<HANDLE>> {
+    let mut inherited = stdio.to_vec();
+    for (_, handle) in launcher_handles {
+        process::set_inheritable(*handle, true)?;
+        inherited.push(*handle);
     }
     for (_, name) in process::IPC_HANDLE_VARIABLES {
         if let Some(socket) = process::inherited_handle(name)? {
@@ -727,7 +785,7 @@ fn prepare_inherited_handles(role: Role) -> Result<([HANDLE; 3], Vec<HANDLE>)> {
     }
     inherited.sort_unstable();
     inherited.dedup();
-    Ok((stdio, inherited))
+    Ok(inherited)
 }
 
 fn format_os_pair(name: &OsStr, value: &OsStr) -> OsString {
@@ -775,6 +833,34 @@ pub(super) fn wait_for_exit(process: &OwnedHandle) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Relayed worker output reaches the console without escape sequences or C1 controls, and a
+    /// UTF-8 sequence split across reads survives intact.
+    #[test]
+    fn console_relay_strips_controls_and_keeps_split_utf8() {
+        assert_eq!(
+            strip_control_characters(b"ok\t\x1b]52;c;cm0gLXJm\x07\r\n\xc2\x9b2J"),
+            "ok\t\u{fffd}]52;c;cm0gLXJm\u{fffd}\r\n\u{fffd}2J"
+        );
+        let split = "\u{e9}".as_bytes();
+        assert_eq!(complete_utf8_prefix(&[b'a', split[0]]), 1);
+        assert_eq!(complete_utf8_prefix(&[b'a', 0xff, b'b']), 3);
+
+        let (reader, mut writer) = create_child_writer_pipe().unwrap();
+        let relay = std::thread::spawn(move || {
+            let mut console = Vec::new();
+            relay_console_output(reader, &mut console);
+            console
+        });
+        std::io::Write::write_all(&mut writer, &[b'a', split[0]]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::io::Write::write_all(&mut writer, &[split[1], 0x1b]).unwrap();
+        drop(writer);
+        assert_eq!(
+            String::from_utf8(relay.join().unwrap()).unwrap(),
+            "a\u{e9}\u{fffd}"
+        );
+    }
 
     #[test]
     fn command_line_escaping_preserves_backslashes_quotes_and_empty_arguments() {

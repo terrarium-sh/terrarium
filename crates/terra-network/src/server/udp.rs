@@ -2,13 +2,13 @@
 
 use super::peer::validate_peer;
 use super::tcp::bound_socket_buffers;
-use crate::{Error, map_io_error};
+use crate::{Error, SocketSource, map_io_error};
 use futures_util::future::BoxFuture;
 use lru::LruCache;
 use quinn_udp::{RecvMeta, Transmit, UdpSocketState};
 use socket2::SockRef;
 use std::io::{self, IoSliceMut};
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::ops::Range;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -258,7 +258,7 @@ fn allow_fragmentation(socket: &socket2::Socket, is_ipv6: bool) -> io::Result<()
 
 #[cfg(unix)]
 #[allow(unsafe_code)]
-fn set_socket_option(
+pub(super) fn set_socket_option(
     socket: &socket2::Socket,
     level: libc::c_int,
     name: libc::c_int,
@@ -286,7 +286,7 @@ fn set_socket_option(
 
 #[cfg(windows)]
 #[allow(unsafe_code)]
-fn set_socket_option(
+pub(super) fn set_socket_option(
     socket: &socket2::Socket,
     level: i32,
     name: i32,
@@ -307,7 +307,8 @@ fn set_socket_option(
     Ok(())
 }
 
-pub(super) fn bind_udp(local: SocketAddr) -> io::Result<Arc<OffloadSocket>> {
+/// Binds one published or outbound UDP socket natively.
+pub(crate) fn bind_udp_socket(local: SocketAddr) -> io::Result<socket2::Socket> {
     let socket = socket2::Socket::new(
         socket2::Domain::for_address(local),
         socket2::Type::DGRAM,
@@ -316,11 +317,20 @@ pub(super) fn bind_udp(local: SocketAddr) -> io::Result<Arc<OffloadSocket>> {
     if local.is_ipv6() {
         socket.set_only_v6(true)?;
     }
-    bound_socket_buffers(&SockRef::from(&socket))?;
     socket.bind(&local.into())?;
+    Ok(socket)
+}
+
+/// Prepares a bound UDP socket, wherever it was bound, for offloaded sends and receives.
+pub(super) fn adopt_udp(socket: socket2::Socket) -> io::Result<Arc<OffloadSocket>> {
+    bound_socket_buffers(&SockRef::from(&socket))?;
     socket.set_nonblocking(true)?;
     let offload = UdpSocketState::new((&socket).into())?;
-    allow_fragmentation(&socket, local.is_ipv6())?;
+    let is_ipv6 = socket
+        .local_addr()?
+        .as_socket()
+        .is_some_and(|address| address.is_ipv6());
+    allow_fragmentation(&socket, is_ipv6)?;
     Ok(Arc::new(OffloadSocket {
         socket: UdpSocket::from_std(socket.into())?,
         offload,
@@ -495,9 +505,10 @@ fn map_datagram_error(error: io::Error) -> Error {
     map_io_error(error)
 }
 
-pub(super) fn open() -> Result<UdpResource, Error> {
-    let ipv4 = bind_udp(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))).ok();
-    let ipv6 = bind_udp(SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))).ok();
+pub(super) fn open(sockets: &SocketSource) -> Result<UdpResource, Error> {
+    let open_family = |domain| sockets.bind_udp(domain).and_then(adopt_udp).ok();
+    let ipv4 = open_family(socket2::Domain::IPV4);
+    let ipv6 = open_family(socket2::Domain::IPV6);
     if ipv4.is_none() && ipv6.is_none() {
         return Err(Error::Io);
     }

@@ -1,9 +1,12 @@
-//! Windows worker confinement using `AppContainer`, restricted tokens, and jobs.
+//! Windows worker confinement using Less-Privileged `AppContainer` tokens and jobs.
 
 #![allow(unsafe_code)]
 
 mod acl;
 mod api;
+mod sockets;
+
+pub use sockets::LauncherSockets;
 
 use super::{Access, Grant, Launch, PolicyBundle, PreparedLaunch, Role};
 use anyhow::{Context, Result, bail, ensure};
@@ -12,15 +15,14 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::net::ToSocketAddrs;
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::io::{AsRawHandle, AsRawSocket, FromRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode};
 use std::time::{Duration, Instant};
+use terra_platform::filesystem::share::windows::symlink_broker;
 use terra_platform::process;
-use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, WAIT_OBJECT_0, WAIT_TIMEOUT};
-use windows_sys::Win32::Security::{
-    GetTokenInformation, TOKEN_QUERY, TokenHasRestrictions, TokenIsAppContainer,
-};
+use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TokenIsAppContainer};
 use windows_sys::Win32::System::JobObjects::IsProcessInJob;
 use windows_sys::Win32::System::Pipes::PeekNamedPipe;
 use windows_sys::Win32::System::SystemInformation::{ComputerNameDnsHostname, GetComputerNameExW};
@@ -42,7 +44,6 @@ const PARENT_ENV: &str = "TERRA_WINDOWS_SANDBOX_PARENT";
 enum Mode {
     Supervisor,
     AppContainer,
-    RestrictedTokenJob,
 }
 
 impl Mode {
@@ -50,7 +51,6 @@ impl Mode {
         match self {
             Self::Supervisor => "supervisor",
             Self::AppContainer => APP_CONTAINER_MODE,
-            Self::RestrictedTokenJob => "restricted_token_job",
         }
     }
 }
@@ -58,8 +58,8 @@ impl Mode {
 struct Policy {
     role: Role,
     mode: Mode,
-    less_privileged: bool,
     memory_limit_bytes: usize,
+    mitigations: api::Mitigations,
 }
 
 impl Policy {
@@ -68,20 +68,21 @@ impl Policy {
             Role::Supervisor => Self {
                 role,
                 mode: Mode::Supervisor,
-                less_privileged: false,
                 memory_limit_bytes: 0,
+                mitigations: api::Mitigations::NONE,
             },
+            // Wasmtime maps its AOT components executable, so the VM keeps dynamic code.
             Role::Vm => Self {
                 role,
                 mode: Mode::AppContainer,
-                less_privileged: true,
                 memory_limit_bytes: 0,
+                mitigations: api::Mitigations::WORKER,
             },
             Role::Network => Self {
                 role,
-                mode: Mode::RestrictedTokenJob,
-                less_privileged: false,
+                mode: Mode::AppContainer,
                 memory_limit_bytes: BROKER_COMMIT_LIMIT_BYTES,
+                mitigations: api::Mitigations::WORKER.prohibiting_dynamic_code(),
             },
         }
     }
@@ -131,7 +132,7 @@ pub fn prepare_launch(launch: Launch<'_>) -> Result<PreparedLaunch> {
     terra_platform::filesystem::set_owner_only(spec.path(), false)?;
     spec.write_all(&bytes)?;
     spec.flush()?;
-    let (identity, inherited_identity) = api::create_identity_pipe()?;
+    let (identity, inherited_identity) = api::create_child_writer_pipe()?;
     // SAFETY: the current process identity is known; this handle can only observe its lifetime.
     let parent = api::own_handle(unsafe {
         OpenProcess(
@@ -290,12 +291,6 @@ pub fn install_policy(_policy: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn is_access_denied(error: &anyhow::Error) -> bool {
-    error
-        .downcast_ref::<std::io::Error>()
-        .is_some_and(|error| error.raw_os_error() == i32::try_from(ERROR_ACCESS_DENIED).ok())
-}
-
 pub fn verify_worker_role(role: Role) -> Result<()> {
     let Some(declared_role) = std::env::var_os(WINDOWS_ROLE) else {
         return Ok(());
@@ -305,17 +300,15 @@ pub fn verify_worker_role(role: Role) -> Result<()> {
         "Windows sandbox launch role differs from worker entrypoint"
     );
     let mode = std::env::var(WINDOWS_MODE)?;
-    match api::open_current_token(TOKEN_QUERY) {
-        Ok(token) => verify_worker_token(&token, role, &mode)?,
-        // The broker's ALL APPLICATION PACKAGES restriction denies reading its
-        // own token object; create_restricted_token verified the restricting
-        // SIDs before the launch.
-        Err(error)
-            if role == Role::Network
-                && mode == Mode::RestrictedTokenJob.name()
-                && is_access_denied(&error) => {}
-        Err(error) => return Err(error),
-    }
+    verify_worker_token(&api::open_current_token(TOKEN_QUERY)?, role, &mode)?;
+    ensure!(
+        File::open("CONIN$").is_err()
+            && std::fs::OpenOptions::new()
+                .write(true)
+                .open("CONOUT$")
+                .is_err(),
+        "Windows sandbox worker is attached to a console"
+    );
     let mut in_job = 0;
     // SAFETY: the current process pseudo-handle is valid and in_job is writable.
     api::win_ok(unsafe {
@@ -348,27 +341,6 @@ fn verify_worker_token(token: &OwnedHandle, role: Role, mode: &str) -> Result<()
                 "Windows worker lacks its AppContainer token"
             );
             api::verify_capabilities(token, role)?;
-        }
-        "restricted_token_job" => {
-            ensure!(
-                role != Role::Supervisor && is_app_container == 0,
-                "restricted_token_job requires a VM or network worker"
-            );
-            let mut has_restrictions = 0_u32;
-            // SAFETY: token is live and this token-information class initializes a DWORD.
-            api::win_ok(unsafe {
-                GetTokenInformation(
-                    token.as_raw_handle(),
-                    TokenHasRestrictions,
-                    (&raw mut has_restrictions).cast(),
-                    4,
-                    &raw mut returned,
-                )
-            })?;
-            ensure!(
-                has_restrictions != 0,
-                "Windows VM lacks its restricted primary token"
-            );
         }
         "supervisor" => ensure!(
             role == Role::Supervisor,
@@ -458,23 +430,45 @@ fn run_worker(
         bail!("a sandbox worker cannot run the trusted launcher")
     })?;
     let policy = Policy::for_role(spec.role);
+    ensure!(
+        policy.mode == Mode::AppContainer,
+        "the {} role has no Windows sandbox worker",
+        spec.role.name()
+    );
     let job = api::create_worker_job(policy.memory_limit_bytes)?;
-    let profile = if policy.mode == Mode::AppContainer {
-        Some(api::Profile::create(policy.role)?)
-    } else {
-        None
-    };
-    let mut grants = profile.as_ref().map(acl::Grants::new);
-    if let Some(grants) = &mut grants {
-        for grant in &spec.grants {
-            if let Some(identity) = &grant.identity {
-                let expected = identity.parse()?;
-                terra_platform::filesystem::share::open_granted_share_root(&grant.path, expected)?;
-            }
-            grants.add(&grant.path, grant.writable)?;
-        }
-    }
-    let worker = api::spawn_worker(executable, arguments, &policy, profile.as_ref(), &job)?;
+    let profile = api::Profile::create(policy.role)?;
+    let mut grants = acl::Grants::new(&profile);
+    let share_roots = apply_grants(&mut grants, spec)?;
+    let socket_channel = (spec.role == Role::Network)
+        .then(terra_platform::local_socket::create_local_pair)
+        .transpose()?;
+    let symlink_channel = (spec.role == Role::Vm && !share_roots.is_empty())
+        .then(terra_platform::local_socket::create_local_pair)
+        .transpose()?;
+    let launcher_handles: Vec<_> = socket_channel
+        .iter()
+        .map(|(_, worker)| (sockets::LAUNCHER_SOCKETS_ENV, worker))
+        .chain(
+            symlink_channel
+                .iter()
+                .map(|(_, worker)| (symlink_broker::SYMLINK_BROKER_ENV, worker)),
+        )
+        .map(|(name, worker)| (name, worker.as_raw_socket() as HANDLE))
+        .collect();
+    let mut worker = api::spawn_worker(
+        executable,
+        arguments,
+        &policy,
+        &profile,
+        &job,
+        &launcher_handles,
+    )?;
+    let _launcher_sockets = socket_channel
+        .map(|(launcher, _)| sockets::serve(launcher, worker.pid))
+        .transpose()?;
+    let _symlink_broker = symlink_channel
+        .map(|(launcher, _)| symlink_broker::serve(launcher, share_roots))
+        .transpose()?;
     if let Some(parent) = &parent {
         // SAFETY: parent remains live; a signaled handle prevents resuming the already job-confined child.
         ensure!(
@@ -491,31 +485,7 @@ fn run_worker(
     let mut identity = File::from(identity);
     identity.write_all(&worker.pid.to_le_bytes())?;
     drop(identity);
-    for (_, name) in process::IPC_HANDLE_VARIABLES
-        .into_iter()
-        .chain(process::LISTENER_HANDLE_VARIABLES)
-    {
-        if let Some(socket) = process::inherited_handle(name)? {
-            // SAFETY: Winsock is initialized and the worker inherited this socket; release the wrapper's duplicate.
-            let status =
-                unsafe { windows_sys::Win32::Networking::WinSock::closesocket(socket as usize) };
-            if status != 0 {
-                // SAFETY: query the thread-local Winsock error immediately after the failed close.
-                bail!(
-                    "closing inherited Windows sandbox IPC socket failed: {}",
-                    std::io::Error::from_raw_os_error(unsafe {
-                        windows_sys::Win32::Networking::WinSock::WSAGetLastError()
-                    })
-                );
-            }
-        }
-    }
-    if spec.role == Role::Vm
-        && let Some(lock) = process::inherited_handle(process::LOCK_HANDLE_VARIABLE)?
-    {
-        // SAFETY: the actual VM inherited the lock; the trusted wrapper releases its extra kernel handle.
-        drop(unsafe { OwnedHandle::from_raw_handle(lock) });
-    }
+    release_worker_handles(spec.role)?;
     let mut handles = vec![worker.process.as_raw_handle()];
     if let Some(parent) = &parent {
         handles.push(parent.as_raw_handle());
@@ -538,11 +508,62 @@ fn run_worker(
     let mut code = 1;
     // SAFETY: the process handle is live and signaled, and code is writable.
     api::win_ok(unsafe { GetExitCodeProcess(worker.process.as_raw_handle(), &raw mut code) })?;
+    worker.finish_console_relays();
     drop(job);
-    if let Some(grants) = &mut grants {
-        grants.clear()?;
-    }
+    grants.clear()?;
     Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)))
+}
+
+/// Grants the worker its paths and returns the share roots, each opened against the identity
+/// the supervisor validated.
+fn apply_grants(
+    grants: &mut acl::Grants,
+    spec: &WorkerSpec,
+) -> Result<Vec<symlink_broker::ShareRoot>> {
+    let mut share_roots = Vec::new();
+    for grant in &spec.grants {
+        if let Some(identity) = &grant.identity {
+            share_roots.push(symlink_broker::ShareRoot {
+                directory: terra_platform::filesystem::share::open_granted_share_root(
+                    &grant.path,
+                    identity.parse()?,
+                )?,
+                is_writable: grant.writable,
+            });
+        }
+        grants.add(&grant.path, grant.writable)?;
+    }
+    Ok(share_roots)
+}
+
+/// Closes the wrapper's duplicates of the handles the worker inherited.
+fn release_worker_handles(role: Role) -> Result<()> {
+    for (_, name) in process::IPC_HANDLE_VARIABLES
+        .into_iter()
+        .chain(process::LISTENER_HANDLE_VARIABLES)
+    {
+        if let Some(socket) = process::inherited_handle(name)? {
+            // SAFETY: Winsock is initialized and the worker inherited this socket; release the wrapper's duplicate.
+            let status =
+                unsafe { windows_sys::Win32::Networking::WinSock::closesocket(socket as usize) };
+            if status != 0 {
+                // SAFETY: query the thread-local Winsock error immediately after the failed close.
+                bail!(
+                    "closing inherited Windows sandbox IPC socket failed: {}",
+                    std::io::Error::from_raw_os_error(unsafe {
+                        windows_sys::Win32::Networking::WinSock::WSAGetLastError()
+                    })
+                );
+            }
+        }
+    }
+    if role == Role::Vm
+        && let Some(lock) = process::inherited_handle(process::LOCK_HANDLE_VARIABLE)?
+    {
+        // SAFETY: the actual VM inherited the lock; the trusted wrapper releases its extra kernel handle.
+        drop(unsafe { OwnedHandle::from_raw_handle(lock) });
+    }
+    Ok(())
 }
 
 fn claim_handle(name: &str) -> Result<Option<OwnedHandle>> {
@@ -631,7 +652,8 @@ mod tests {
         groups.join(",")
     }
 
-    /// docs/sandboxing.md quotes the broker commit limit and grant cap; a change to either fails here.
+    /// docs/sandboxing.md quotes the broker commit limit, grant cap and launcher connection limits;
+    /// a change to any of them fails here.
     #[test]
     fn sandboxing_doc_quotes_the_windows_limits() {
         let doc = std::fs::read_to_string(
@@ -646,6 +668,11 @@ mod tests {
             format!(
                 "a launch may grant at most {} objects",
                 group_digits(acl::MAX_GRANTED_OBJECTS)
+            ),
+            format!(
+                "within {} seconds and at most {} at a time",
+                sockets::CONNECT_TIMEOUT.as_secs(),
+                sockets::MAX_PENDING_CONNECTS
             ),
         ] {
             assert!(doc.contains(&quote), "docs/sandboxing.md must say: {quote}");
@@ -706,10 +733,11 @@ mod tests {
                 .env("TERRA_WINDOWS_TEST_ADDRESS", address.to_string());
             let mut grants = vec![Grant::new(&executable, Access::ReadOnly)];
             if role == Role::Vm {
-                grants.extend([
-                    Grant::new(directory.path(), Access::ReadWrite),
-                    Grant::new(&protected, Access::ReadOnly),
-                ]);
+                let mut share = Grant::new(directory.path(), Access::ReadWrite);
+                share.directory = Some(terra_platform::filesystem::share::open_share_root(
+                    &directory.path().canonicalize()?,
+                )?);
+                grants.extend([share, Grant::new(&protected, Access::ReadOnly)]);
             }
             let mut prepared = prepare_launch(Launch {
                 role,
@@ -767,6 +795,7 @@ mod tests {
                 .context("native test outside file is missing")?,
         );
         let protected = directory.join("protected");
+        probe_process_hardening(role)?;
         match role {
             Role::Vm => {
                 ensure!(
@@ -809,19 +838,119 @@ mod tests {
             }
             Role::Network => {
                 ensure!(
-                    std::fs::read(&outside).is_err(),
-                    "restricted-token broker read a host file outside its grants"
+                    std::fs::read(&outside).is_err() && std::fs::read(&protected).is_err(),
+                    "AppContainer broker read a host file outside its grants"
                 );
                 let address: SocketAddr = std::env::var("TERRA_WINDOWS_TEST_ADDRESS")?.parse()?;
-                TcpStream::connect_timeout(&address, Duration::from_secs(1))
-                    .context("restricted-token broker cannot use native loopback sockets")?;
-                UdpSocket::bind("127.0.0.1:0")
-                    .and_then(|socket| socket.send_to(b"probe", address))
-                    .context("restricted-token broker cannot send native loopback datagrams")?;
-                resolve_computer_name().context("restricted-token broker cannot resolve names")?;
+                ensure!(
+                    TcpStream::connect_timeout(&address, Duration::from_secs(1)).is_err(),
+                    "AppContainer broker reached host loopback with its own socket"
+                );
+                let sockets = LauncherSockets::claim()?
+                    .context("AppContainer broker lacks its socket channel")?;
+                let (sender, receiver) = std::sync::mpsc::channel();
+                sockets.connect_tcp(
+                    address,
+                    Box::new(move |reply| {
+                        let _ = sender.send(reply);
+                    }),
+                );
+                let tcp = receiver
+                    .recv_timeout(Duration::from_secs(5))?
+                    .context("AppContainer broker cannot reach loopback with launcher sockets")?;
+                ensure!(
+                    tcp.listen(1).is_err(),
+                    "AppContainer broker can listen on a launcher socket"
+                );
+                let datagram = sockets.bind_udp(socket2::Domain::IPV4)?;
+                datagram
+                    .send_to(b"probe", &address.into())
+                    .context("AppContainer broker cannot send loopback datagrams")?;
+                resolve_computer_name().context("AppContainer broker cannot resolve names")?;
             }
             Role::Supervisor => bail!("supervisor cannot run a worker probe"),
         }
+        Ok(())
+    }
+
+    /// Reads the creation-time mitigations back from the kernel and tries the wrapper's console,
+    /// so a dropped process attribute fails here instead of silently weakening workers.
+    fn probe_process_hardening(role: Role) -> Result<()> {
+        use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+        use windows_sys::Win32::System::Threading::{
+            GetProcessMitigationPolicy, PROCESS_MITIGATION_POLICY, ProcessASLRPolicy,
+            ProcessChildProcessPolicy, ProcessDynamicCodePolicy,
+            ProcessExtensionPointDisablePolicy, ProcessFontDisablePolicy, ProcessImageLoadPolicy,
+            ProcessSideChannelIsolationPolicy, ProcessStrictHandleCheckPolicy,
+            ProcessSystemCallDisablePolicy,
+        };
+
+        let read_flags = |policy: PROCESS_MITIGATION_POLICY| -> Result<u32> {
+            let mut flags = 0_u32;
+            // SAFETY: every queried policy is a single DWORD of flags and flags is writable.
+            api::win_ok(unsafe {
+                GetProcessMitigationPolicy(
+                    GetCurrentProcess(),
+                    policy,
+                    (&raw mut flags).cast(),
+                    std::mem::size_of::<u32>(),
+                )
+            })
+            .with_context(|| format!("reading Windows mitigation policy {policy}"))?;
+            Ok(flags)
+        };
+        for (policy, required, name) in [
+            (
+                ProcessASLRPolicy,
+                0b111,
+                "bottom-up, forced and high-entropy ASLR",
+            ),
+            (
+                ProcessStrictHandleCheckPolicy,
+                0b11,
+                "permanent strict handle checks",
+            ),
+            (
+                ProcessSystemCallDisablePolicy,
+                0b1,
+                "Win32k system call denial",
+            ),
+            (
+                ProcessExtensionPointDisablePolicy,
+                0b1,
+                "legacy extension point denial",
+            ),
+            (ProcessFontDisablePolicy, 0b1, "non-system font denial"),
+            (
+                ProcessImageLoadPolicy,
+                0b111,
+                "remote, low-label and non-System32 image denial",
+            ),
+            (ProcessChildProcessPolicy, 0b1, "child process denial"),
+            (
+                ProcessSideChannelIsolationPolicy,
+                0b1001,
+                "branch target isolation and SSBD",
+            ),
+        ] {
+            let flags = read_flags(policy)?;
+            ensure!(
+                flags & required == required,
+                "Windows {} worker lacks {name}: flags {flags:#x}",
+                role.name()
+            );
+        }
+        ensure!(
+            (read_flags(ProcessDynamicCodePolicy)? & 1 != 0) == (role == Role::Network),
+            "Windows {} worker has the wrong dynamic code policy",
+            role.name()
+        );
+        // SAFETY: AttachConsole takes no pointers; success would only attach this probe.
+        ensure!(
+            unsafe { AttachConsole(ATTACH_PARENT_PROCESS) } == 0,
+            "Windows {} worker attached to the wrapper's console",
+            role.name()
+        );
         Ok(())
     }
 
@@ -863,6 +992,23 @@ mod tests {
         terra_platform::filesystem::share::windows::remove_directory_at(
             &directory_handle,
             Path::new("platform-ops"),
+        )?;
+        let broker = symlink_broker::SymlinkBroker::inherited()
+            .context("AppContainer VM with a writable share lacks its symlink channel")?;
+        broker.symlink_at(
+            &directory_handle,
+            &directory_handle,
+            Path::new("link"),
+            "target",
+        )?;
+        ensure!(
+            broker.readlink_at(&directory_handle, &directory_handle, Path::new("link"))?
+                == Some("target".into()),
+            "AppContainer VM cannot read its brokered symlink"
+        );
+        terra_platform::filesystem::share::windows::unlink_file_at(
+            &directory_handle,
+            Path::new("link"),
         )?;
         ensure!(
             terra_platform::filesystem::share::windows::create_directory_at(

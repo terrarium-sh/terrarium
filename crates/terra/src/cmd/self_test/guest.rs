@@ -369,22 +369,7 @@ fn exercise_exec(self_test: &SelfTest) -> Result<()> {
 
 fn exercise_shares(self_test: &SelfTest, writable: &Path, readonly: &Path) -> Result<()> {
     println!("self-test: writable/read-only shares, file events and synchronization");
-    #[cfg(windows)]
-    let expects_symlink_denial = matches!(
-        crate::sandbox::config::load()?,
-        crate::sandbox::config::LauncherConfig::Sandboxed { .. }
-    );
-    #[cfg(not(windows))]
-    let expects_symlink_denial = false;
-    let flags: &[&str] = if expects_symlink_denial {
-        println!(
-            "self-test: Windows AppContainer cannot create symbolic links in shared filesystems"
-        );
-        &["--env", "TERRA_SELF_TEST_EXPECT_SYMLINK_DENIAL=1"]
-    } else {
-        &["--env", "TERRA_SELF_TEST_EXPECT_SYMLINK_DENIAL=0"]
-    };
-    self_test.execute(include_str!("scripts/shares.sh"), flags)?;
+    self_test.execute(include_str!("scripts/shares.sh"), &[])?;
     #[cfg(unix)]
     self_test.execute("test \"$(/work/host-run)\" = HOST_EXECUTABLE", &[])?;
     require_file(&writable.join("host"), b"linked")?;

@@ -135,6 +135,9 @@ fn build_sandbox_grants(spec: &BootSpec, bx: &BoxRef) -> Result<Vec<Grant>> {
     grants.push(Grant::new(bx.get_dir(), Access::ReadWrite));
     #[cfg(any(target_os = "macos", windows))]
     {
+        // Windows grants are DACL entries on every object beneath the path, so a directory
+        // grant would expose stale volumes and logs the box configuration no longer names.
+        #[cfg(target_os = "macos")]
         grants.push(Grant::new(bx.get_dir(), Access::ReadOnly));
         for name in [state::ROOTFS_FILE, state::DIAGNOSTICS_LOG] {
             grants.push(Grant::new(bx.get_dir().join(name), Access::ReadWrite));
@@ -307,13 +310,17 @@ mod tests {
             grant.path == recipe && grant.access == Access::ReadOnly && grant.directory.is_none()
         }));
         #[cfg(target_os = "linux")]
-        let box_access = Access::ReadWrite;
-        #[cfg(any(target_os = "macos", windows))]
-        let box_access = Access::ReadOnly;
-        assert!(
+        let box_access = Some(Access::ReadWrite);
+        #[cfg(target_os = "macos")]
+        let box_access = Some(Access::ReadOnly);
+        #[cfg(windows)]
+        let box_access = None;
+        assert_eq!(
             grants
                 .iter()
-                .any(|grant| { grant.path == bx.get_dir() && grant.access == box_access })
+                .find(|grant| grant.path == bx.get_dir())
+                .map(|grant| grant.access),
+            box_access
         );
         #[cfg(any(target_os = "macos", windows))]
         for name in [state::ROOTFS_FILE, state::DIAGNOSTICS_LOG] {

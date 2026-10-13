@@ -12,7 +12,9 @@ use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 #[cfg(any(target_os = "macos", windows))]
 use terra_platform::local_socket::LocalListener;
-use terra_platform::local_socket::{AsyncLocalStream, LocalStream, create_local_pair};
+use terra_platform::local_socket::{
+    AsyncLocalStream, LocalStream, OwnedSocket, create_local_pair, receive_sockets, send_sockets,
+};
 use terra_sandbox::{Launch, PolicyBundle, PreparedLaunch, Role};
 
 pub(crate) const SUPERVISOR_ARG: &str = "__supervisor";
@@ -107,7 +109,11 @@ pub(super) fn spawn(
         spec.foreground || spec.mode == terra_protocol::PlanMode::Create,
     )?;
     let inherited = sys::pass_lock(&mut command, lock)?;
-    let mut child = command.spawn().context("starting box supervisor")?;
+    #[cfg(windows)]
+    let spawned = terra_platform::process::spawn_without_standard_handles(&mut command);
+    #[cfg(unix)]
+    let spawned = command.spawn();
+    let mut child = spawned.context("starting box supervisor")?;
     drop(inherited);
     if let Some(guard) = &guard
         && let Err(error) = sys::attach_vm_child(guard, &child)
@@ -285,10 +291,18 @@ fn start_optional_broker(
     if !boot.cfg.network.enabled {
         return Ok(None);
     }
-    let config = build_broker_config(boot)?;
+    let mut config = build_broker_config(boot)?;
+    let host_listeners = terra_network::bind_listeners(&mut config)?;
     let listeners = config.listeners.clone();
     let (endpoint, broker_endpoint) = create_local_pair()?;
-    let (broker, ready) = start_broker(executable, &config, broker_endpoint, policy, is_sandboxed)?;
+    let (broker, ready) = start_broker(
+        executable,
+        &config,
+        host_listeners,
+        broker_endpoint,
+        policy,
+        is_sandboxed,
+    )?;
     boot.network_broker = Some(BrokerMetadata { ready, listeners });
     Ok(Some((broker, endpoint)))
 }
@@ -643,9 +657,13 @@ fn validate_native_confinement(policies: Option<&PolicyBundle>) -> Result<()> {
 }
 
 fn run_network_native_probe(sentinel: &Path, policy: Option<&[u8]>) -> Result<()> {
+    let host_listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
     let executable = std::env::current_exe()?;
     let mut command = Command::new(&executable);
-    command.arg(NETWORK_NATIVE_PROBE_ARG).arg(sentinel);
+    command
+        .arg(NETWORK_NATIVE_PROBE_ARG)
+        .arg(sentinel)
+        .arg(host_listener.local_addr()?.to_string());
     let mut launch = terra_sandbox::prepare_launch(Launch {
         role: Role::Network,
         command,
@@ -668,12 +686,21 @@ fn run_network_native_probe(sentinel: &Path, policy: Option<&[u8]>) -> Result<()
     Ok(())
 }
 
-pub(crate) fn run_network_native_probe_worker(sentinel: &Path) -> Result<ExitCode> {
+/// `host_listener` is a loopback listener the supervisor holds open for the probe.
+pub(crate) fn run_network_native_probe_worker(
+    sentinel: &Path,
+    host_listener: std::net::SocketAddr,
+) -> Result<ExitCode> {
     boot::write_agent_ready();
     #[cfg(not(windows))]
     ensure!(
         File::open(sentinel).is_err() && File::open("/dev/kvm").is_err(),
         "network broker can access VM file or KVM grants"
+    );
+    #[cfg(target_os = "linux")]
+    ensure!(
+        std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).is_err(),
+        "network broker can listen"
     );
     #[cfg(windows)]
     {
@@ -681,13 +708,50 @@ pub(crate) fn run_network_native_probe_worker(sentinel: &Path) -> Result<ExitCod
             File::open(sentinel).is_err(),
             "network broker read a host file outside its grants"
         );
-        std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .context("restricted broker cannot create a TCP listener")?;
-        std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .context("restricted broker cannot create a UDP socket")?;
-        terra_sandbox::resolve_computer_name().context("restricted broker cannot resolve names")?;
+        probe_broker_loopback(
+            &terra_sandbox::LauncherSockets::claim()?
+                .context("network broker lacks its launcher socket channel")?,
+            host_listener,
+        )?;
+        terra_sandbox::resolve_computer_name().context("network broker cannot resolve names")?;
     }
+    #[cfg(not(windows))]
+    std::net::TcpStream::connect_timeout(&host_listener, Duration::from_secs(2))
+        .context("network broker cannot reach host loopback")?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// Launcher sockets reach host loopback while the broker's own cannot, and none can listen.
+#[cfg(windows)]
+fn probe_broker_loopback(
+    sockets: &terra_sandbox::LauncherSockets,
+    host_listener: std::net::SocketAddr,
+) -> Result<()> {
+    ensure!(
+        std::net::TcpStream::connect_timeout(&host_listener, Duration::from_millis(500)).is_err(),
+        "network broker reached host loopback with its own socket"
+    );
+    let (sender, receiver) = std::sync::mpsc::channel();
+    sockets.connect_tcp(
+        host_listener,
+        Box::new(move |reply| {
+            let _ = sender.send(reply);
+        }),
+    );
+    let tcp = receiver
+        .recv_timeout(Duration::from_secs(5))
+        .context("network broker's launcher connection timed out")?
+        .context("network broker cannot reach host loopback with a launcher socket")?;
+    ensure!(
+        tcp.listen(1).is_err(),
+        "network broker can listen on a launcher socket"
+    );
+    sockets
+        .bind_udp(socket2::Domain::IPV4)
+        .context("network broker cannot obtain a launcher UDP socket")?
+        .send_to(b"probe", &host_listener.into())
+        .context("network broker cannot send a loopback datagram")?;
+    Ok(())
 }
 
 fn wait_probe_ready(child: &mut std::process::Child) -> Result<()> {
@@ -703,6 +767,7 @@ fn wait_probe_ready(child: &mut std::process::Child) -> Result<()> {
 pub(crate) fn start_broker(
     executable: &Path,
     config: &terra_network::config::Config,
+    host_listeners: Vec<socket2::Socket>,
     endpoint: LocalStream,
     policy: Option<&[u8]>,
     is_sandboxed: bool,
@@ -736,14 +801,48 @@ pub(crate) fn start_broker(
     let guard = supervise_worker_child(command)?;
     let spawned = launch.spawn(BROKER_STARTUP_TIMEOUT)?;
     drop(files);
+    let broker_pid = spawned.pid;
     let broker = SupervisedChild::from_launch(spawned, guard)?;
     let bytes = serde_json::to_vec(&config)?;
     ensure!(
         bytes.len() <= terra_network::config::MAX_STARTUP_BYTES,
         "broker startup configuration exceeds its limit"
     );
-    let ready = exchange_broker_startup(startup, bytes, BROKER_STARTUP_TIMEOUT)?;
+    let startup_input = BrokerStartup {
+        listeners: host_listeners.into_iter().map(OwnedSocket::from).collect(),
+        broker_pid,
+        config: bytes,
+    };
+    let ready = exchange_broker_startup(startup, startup_input, BROKER_STARTUP_TIMEOUT)?;
     Ok((broker, ready))
+}
+
+/// The outbound sockets a sandboxed broker's launcher opens for it.
+struct LauncherOutbound(terra_sandbox::LauncherSockets);
+
+impl terra_network::OutboundSockets for LauncherOutbound {
+    fn connect_tcp(
+        &self,
+        peer: std::net::SocketAddr,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<socket2::Socket>> + Send>>
+    {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        self.0.connect_tcp(
+            peer,
+            Box::new(move |reply| {
+                let _ = sender.send(reply);
+            }),
+        );
+        Box::pin(async move {
+            receiver
+                .await
+                .unwrap_or_else(|_| Err(std::io::ErrorKind::BrokenPipe.into()))
+        })
+    }
+
+    fn bind_udp(&self, domain: socket2::Domain) -> std::io::Result<socket2::Socket> {
+        self.0.bind_udp(domain)
+    }
 }
 
 fn read_supervisor_input(reader: impl Read + Send + 'static, timeout: Duration) -> Result<Vec<u8>> {
@@ -770,9 +869,17 @@ fn read_supervisor_input(reader: impl Read + Send + 'static, timeout: Duration) 
         .context("waiting for supervisor startup input")?
 }
 
+/// What the supervisor sends a starting broker: its published listeners, bound before the broker
+/// or the supervisor's own sandbox exists, then its configuration.
+struct BrokerStartup {
+    listeners: Vec<OwnedSocket>,
+    broker_pid: u32,
+    config: Vec<u8>,
+}
+
 fn exchange_broker_startup(
     mut startup: LocalStream,
-    bytes: Vec<u8>,
+    input: BrokerStartup,
     timeout: Duration,
 ) -> Result<terra_network::config::Ready> {
     let interrupt = startup.try_clone()?;
@@ -781,7 +888,9 @@ fn exchange_broker_startup(
         .name("network-startup".into())
         .spawn(move || {
             let result = (|| {
-                startup.write_all(&bytes)?;
+                send_sockets(&startup, &input.listeners, input.broker_pid)?;
+                drop(input.listeners);
+                startup.write_all(&input.config)?;
                 startup.shutdown(Shutdown::Write)?;
                 let ready: terra_network::config::Ready = terra_protocol::read_frame_with_limit(
                     &mut startup,
@@ -825,6 +934,10 @@ pub(crate) fn run_broker() -> Result<ExitCode> {
     let mut startup = sys::claim_ipc(CONFIG_FD)?;
     startup.set_read_timeout(Some(BROKER_STARTUP_TIMEOUT))?;
     startup.set_write_timeout(Some(BROKER_STARTUP_TIMEOUT))?;
+    let listeners = receive_sockets(&startup)?
+        .into_iter()
+        .map(socket2::Socket::from)
+        .collect();
     let mut bytes = Vec::new();
     (&mut startup)
         .take((terra_network::config::MAX_STARTUP_BYTES + 1) as u64)
@@ -834,6 +947,12 @@ pub(crate) fn run_broker() -> Result<ExitCode> {
         "broker startup configuration exceeds its limit"
     );
     let config: terra_network::config::Config = serde_json::from_slice(&bytes)?;
+    let sockets = match terra_sandbox::LauncherSockets::claim()? {
+        Some(launcher) => {
+            terra_network::SocketSource::Delegated(std::sync::Arc::new(LauncherOutbound(launcher)))
+        }
+        None => terra_network::SocketSource::Native,
+    };
     let channel = sys::claim_ipc(NETWORK_FD)?;
     channel.set_nonblocking(true)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -841,7 +960,7 @@ pub(crate) fn run_broker() -> Result<ExitCode> {
         .max_blocking_threads(terra_network::MAX_RESOLVERS)
         .build()?;
     let result = runtime.block_on(async move {
-        let broker = terra_network::Broker::bind(&config)?;
+        let broker = terra_network::Broker::new(&config, listeners, sockets)?;
         startup.write_all(&terra_protocol::encode_frame_with_limit(
             &broker.ready(),
             terra_network::config::MAX_READY_BYTES,
@@ -897,6 +1016,14 @@ fn reap_adopted_children() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn startup_input(config: &[u8]) -> BrokerStartup {
+        BrokerStartup {
+            listeners: Vec::new(),
+            broker_pid: std::process::id(),
+            config: config.to_vec(),
+        }
+    }
 
     /// The broker cannot read host interfaces itself, so without these addresses its floor would let
     /// a guest reach the host's own public IPs.
@@ -957,6 +1084,7 @@ mod tests {
             };
             let (startup, mut broker) = create_local_pair().unwrap();
             let worker = std::thread::spawn(move || {
+                assert!(receive_sockets(&broker).unwrap().is_empty());
                 let mut input = Vec::new();
                 broker.read_to_end(&mut input).unwrap();
                 broker
@@ -971,7 +1099,7 @@ mod tests {
                 assert_eq!(input, b"config");
             });
             let error =
-                exchange_broker_startup(startup, b"config".to_vec(), Duration::from_secs(2))
+                exchange_broker_startup(startup, startup_input(b"config"), Duration::from_secs(2))
                     .unwrap_err();
             assert!(
                 error.to_string().contains("invalid broker readiness"),
@@ -981,10 +1109,11 @@ mod tests {
         }
         let (startup, mut broker) = create_local_pair().unwrap();
         let started = Instant::now();
-        let error =
-            exchange_broker_startup(startup, Vec::new(), Duration::from_millis(50)).unwrap_err();
+        let error = exchange_broker_startup(startup, startup_input(b""), Duration::from_millis(50))
+            .unwrap_err();
         assert!(error.to_string().contains("broker readiness"));
         assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(receive_sockets(&broker).unwrap().is_empty());
         let mut byte = [0];
         assert_eq!(broker.read(&mut byte).unwrap(), 0);
     }

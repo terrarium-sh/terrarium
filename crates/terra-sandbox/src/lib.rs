@@ -26,7 +26,7 @@ mod windows;
 #[cfg(windows)]
 use windows as backend;
 #[cfg(windows)]
-pub use windows::resolve_computer_name;
+pub use windows::{LauncherSockets, resolve_computer_name};
 
 pub use backend::{install_policy, resolve_policy, run_launcher_worker, verify_worker_role};
 
@@ -80,7 +80,31 @@ impl PolicyBundle {
 
 pub const LAUNCHER_WORKER_ARG: &str = "__sandbox_launcher";
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// Receives a launcher reply: an opened socket or the error that prevented it.
+pub type SocketReply = Box<dyn FnOnce(std::io::Result<socket2::Socket>) + Send>;
+
+/// Outbound sockets a host sandbox's trusted launcher opens for a worker it confines; only the
+/// Windows broker receives them.
+#[cfg(not(windows))]
+pub enum LauncherSockets {}
+
+#[cfg(not(windows))]
+impl LauncherSockets {
+    #[allow(clippy::unnecessary_wraps, reason = "matches the Windows signature")]
+    pub fn claim() -> Result<Option<Self>> {
+        Ok(None)
+    }
+
+    pub fn connect_tcp(&self, _: std::net::SocketAddr, _: SocketReply) {
+        match *self {}
+    }
+
+    pub fn bind_udp(&self, _: socket2::Domain) -> std::io::Result<socket2::Socket> {
+        match *self {}
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Access {
     ReadOnly,
     ReadWrite,

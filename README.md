@@ -34,7 +34,7 @@ the same box.
 - **Device components are sandboxed too.** Separate WebAssembly sandboxes
   restrict the code handling guest requests to scoped host capabilities.
   The VM process and network broker also run in the host's OS sandbox by
-  default: Bubblewrap and seccomp, App Sandbox, or AppContainer and restricted tokens.
+  default: Bubblewrap and seccomp, App Sandbox, or Less-Privileged AppContainers.
 - **Access starts at zero.** No host files or network access by default.
   Grant specific directories, enforce read-only mounts, and allow network
   destinations by hostname, IP, or CIDR and port.

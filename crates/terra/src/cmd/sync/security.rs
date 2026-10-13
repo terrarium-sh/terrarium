@@ -25,28 +25,23 @@ pub(super) fn to_guest_mode(meta: &std::fs::Metadata) -> u32 {
         meta.permissions().mode() & 0o777
     }
     #[cfg(windows)]
-    {
-        match (meta.is_dir(), meta.permissions().readonly()) {
-            (true, true) => 0o555,
-            (true, false) => 0o755,
-            (false, true) => 0o444,
-            (false, false) => 0o644,
-        }
-    }
+    windows_host_mode(meta.permissions().readonly())
+}
+
+/// Windows stores only the read-only attribute, so like a mount a host entry is `0755` or `0555`.
+#[cfg(windows)]
+fn windows_host_mode(is_readonly: bool) -> u32 {
+    if is_readonly { 0o555 } else { 0o755 }
 }
 
 pub(super) fn to_safe_mode(guest_mode: u32) -> u32 {
     guest_mode & 0o755
 }
 
-pub(super) fn effective_mode(mode: u32, direction: SyncDirection, kind: SyncEntryKind) -> u32 {
-    if cfg!(windows) && direction == SyncDirection::GuestToHost {
-        return match (kind == SyncEntryKind::Directory, mode & 0o200 == 0) {
-            (true, true) => 0o555,
-            (true, false) => 0o755,
-            (false, true) => 0o444,
-            (false, false) => 0o644,
-        };
+pub(super) fn effective_mode(mode: u32, direction: SyncDirection) -> u32 {
+    #[cfg(windows)]
+    if direction == SyncDirection::GuestToHost {
+        return windows_host_mode(mode & 0o200 == 0);
     }
     match direction {
         SyncDirection::HostToGuest => mode & 0o777,
@@ -295,6 +290,25 @@ pub(super) fn validate_download_symlink_target(entry_rel_path: &str, target: &st
 mod tests {
     use super::super::test_support::entry;
     use super::*;
+
+    /// A Windows host file uploads executable, as a mount shows it, and a download predicts the
+    /// mode the host then reports, so neither direction rewrites modes on every sync.
+    #[cfg(windows)]
+    #[test]
+    fn windows_host_modes_match_mounts_in_both_directions() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        for (is_readonly, guest_mode) in [(true, 0o444), (false, 0o644)] {
+            let mut permissions = file.as_file().metadata().unwrap().permissions();
+            permissions.set_readonly(is_readonly);
+            std::fs::set_permissions(file.path(), permissions).unwrap();
+            let host_mode = to_guest_mode(&file.as_file().metadata().unwrap());
+            assert_eq!(host_mode, if is_readonly { 0o555 } else { 0o755 });
+            assert_eq!(
+                effective_mode(guest_mode, SyncDirection::GuestToHost),
+                host_mode
+            );
+        }
+    }
 
     fn validate_links(
         source: &BTreeMap<String, SyncEntry>,

@@ -654,6 +654,8 @@ jobs:
           cargo test --no-fail-fast --locked --target ${{ matrix.target }} -p terra-runtime --lib -- --ignored --test-threads=1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $env:TERRA_BIN = (Resolve-Path ./dist/terra.exe).Path
+          cargo test --locked --target ${{ matrix.target }} -p terra-sandbox --lib windows::tests::native_roles_enforce_vm_grants_and_broker_job -- --ignored --exact
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --no-fail-fast --locked --target ${{ matrix.target }} -p terra --test native_boot --test boot --test memory -- --ignored --test-threads=1 --nocapture
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

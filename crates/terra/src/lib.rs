@@ -106,11 +106,17 @@ pub fn run_internal_role() -> Option<Result<ExitCode>> {
     if entrypoint == vm::supervisor::NETWORK_NATIVE_PROBE_ARG {
         return Some(
             prepare_internal_role(terra_sandbox::Role::Network, PROBE_DESCRIPTORS).and_then(|()| {
-                vm::supervisor::run_network_native_probe_worker(std::path::Path::new(
-                    &std::env::args_os()
-                        .nth(2)
-                        .context("missing broker probe sentinel")?,
-                ))
+                vm::supervisor::run_network_native_probe_worker(
+                    std::path::Path::new(
+                        &std::env::args_os()
+                            .nth(2)
+                            .context("missing broker probe sentinel")?,
+                    ),
+                    std::env::args()
+                        .nth(3)
+                        .context("missing broker probe host listener")?
+                        .parse()?,
+                )
             }),
         );
     }

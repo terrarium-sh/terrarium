@@ -719,6 +719,8 @@ fn pending_network_reads_do_not_block_other_downloads() {
                 std::thread::sleep(Duration::from_millis(10));
                 continue;
             };
+            // Windows hands an accepted socket its listener's nonblocking mode.
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(10)))
                 .unwrap();
@@ -1001,6 +1003,7 @@ fn serve_socket_probe_tcp(listener: &std::net::TcpListener, stop: &std::sync::at
     while !stop.load(std::sync::atomic::Ordering::Relaxed) && Instant::now() < deadline {
         match listener.accept() {
             Ok((mut stream, _)) => {
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(15)))
                     .unwrap();
@@ -1083,6 +1086,7 @@ fn static_tcp_send_limits_preserve_user_overrides_and_queued_fin() {
                     }
                     Err(error) => panic!("send limit peer: {error}"),
                 };
+                stream.set_nonblocking(false).unwrap();
                 connections += 1;
                 stream
                     .set_read_timeout(Some(Duration::from_secs(15)))
@@ -2058,7 +2062,7 @@ echo REPOSITORY_OK
         .replace(
             "HOST_MODE_ASSERTIONS",
             if cfg!(windows) {
-                "unsupported('chmod', lambda: os.chmod(path, 0o600))"
+                "os.chmod(path, 0o400)\nassert os.stat(path).st_mode & 0o7777 == 0o555\nos.chmod(path, 0o600)\nassert os.stat(path).st_mode & 0o7777 == 0o755\nos.mkdir('/work/modes')\nunsupported('chmod directory', lambda: os.chmod('/work/modes', 0o700))\nos.rmdir('/work/modes')"
             } else {
                 "os.chmod(path, 0o600)\nassert os.stat(path).st_mode & 0o7777 == 0o600"
             },

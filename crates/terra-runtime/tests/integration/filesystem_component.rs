@@ -494,6 +494,57 @@ async fn wasm_filesystem_component_retains_symlink_targets_after_rename() {
     channel.close().expect("close");
 }
 
+/// A guest-created symlink reports its target length as its size and reads back its target,
+/// while an absolute target is refused with EPERM. Windows stores it WSL-style, so the host never
+/// follows it.
+#[tokio::test(flavor = "multi_thread")]
+async fn wasm_filesystem_component_creates_guest_symlinks() {
+    let root = tempfile::tempdir().expect("tempdir");
+    std::fs::write(root.path().join("visible"), b"data").expect("fixture");
+    let Mounted {
+        channel,
+        ram,
+        _runtime,
+    } = mount(root.path(), AccessMode::ReadWrite).await;
+    let memory = BoundedMemory::new(&ram);
+    initialize(&channel, &memory).await;
+    let created = submit(
+        &channel,
+        &memory,
+        1,
+        &request(6, 2, 1, b"guest-link\0visible\0"),
+    )
+    .await;
+    assert_eq!(reply_error(&created), 0);
+    let link = u64::from_le_bytes(created[16..24].try_into().expect("link inode"));
+    let size = u64::from_le_bytes(created[64..72].try_into().expect("link size"));
+    assert_eq!(size, u64::try_from(b"visible".len()).expect("size"));
+    let target = submit(&channel, &memory, 2, &request(5, 3, link, &[])).await;
+    assert_eq!(reply_error(&target), 0);
+    assert_eq!(&target[16..], b"visible");
+    let absolute = submit(
+        &channel,
+        &memory,
+        3,
+        &request(6, 4, 1, b"absolute\0/etc/passwd\0"),
+    )
+    .await;
+    assert_eq!(reply_error(&absolute), -1);
+    channel.close().expect("close");
+    let host_link = root.path().join("guest-link");
+    assert!(
+        std::fs::symlink_metadata(&host_link)
+            .expect("host link")
+            .file_type()
+            .is_symlink()
+    );
+    #[cfg(windows)]
+    assert!(std::fs::read(&host_link).is_err());
+    #[cfg(unix)]
+    assert_eq!(std::fs::read(&host_link).expect("followed link"), b"data");
+    assert!(!root.path().join("absolute").exists());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn wasm_filesystem_component_retains_linked_nodes_after_forget() {
     let root = tempfile::tempdir().expect("tempdir");

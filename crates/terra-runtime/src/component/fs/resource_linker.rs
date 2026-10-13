@@ -78,11 +78,13 @@ pub(super) fn add<T: Send + 'static>(
     descriptor_async!(interface, filesystem, "[method]descriptor.set-times-at", set_times_at, (descriptor: Resource<Descriptor>, flags: types::PathFlags, path: String, access_time: types::NewTimestamp, modification_time: types::NewTimestamp));
     #[cfg(not(windows))]
     descriptor_async!(interface, filesystem, "[method]descriptor.link-at", link_at, (descriptor: Resource<Descriptor>, old_flags: types::PathFlags, old_path: String, new_descriptor: Resource<Descriptor>, new_path: String));
+    #[cfg(not(windows))]
     descriptor_async!(interface, filesystem, "[method]descriptor.readlink-at", readlink_at, (descriptor: Resource<Descriptor>, path: String));
     #[cfg(not(windows))]
     descriptor_async!(interface, filesystem, "[method]descriptor.remove-directory-at", remove_directory_at, (descriptor: Resource<Descriptor>, path: String));
     #[cfg(not(windows))]
     descriptor_async!(interface, filesystem, "[method]descriptor.rename-at", rename_at, (descriptor: Resource<Descriptor>, old_path: String, new_descriptor: Resource<Descriptor>, new_path: String));
+    #[cfg(not(windows))]
     descriptor_async!(interface, filesystem, "[method]descriptor.symlink-at", symlink_at, (descriptor: Resource<Descriptor>, old_path: String, new_path: String));
     #[cfg(not(windows))]
     descriptor_async!(interface, filesystem, "[method]descriptor.unlink-file-at", unlink_file_at, (descriptor: Resource<Descriptor>, path: String));

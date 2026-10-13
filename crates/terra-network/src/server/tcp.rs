@@ -1,12 +1,11 @@
 //! TCP sockets and the relay between one socket and one yamux stream.
 
-use crate::{Error, map_io_error};
+use crate::{Error, SocketSource, map_io_error};
 use socket2::SockRef;
 use std::io;
 use std::net::SocketAddr;
 #[cfg(windows)]
 use std::os::windows::io::AsRawSocket;
-use std::sync::Arc;
 #[cfg(windows)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -19,25 +18,39 @@ use tokio_util::compat::Compat;
 type StreamRead = ReadHalf<Compat<yamux::Stream>>;
 type StreamWrite = WriteHalf<Compat<yamux::Stream>>;
 
-fn create_tcp_socket(peer: SocketAddr, inline_urgent: bool) -> io::Result<TcpSocket> {
-    let socket = if peer.is_ipv4() {
-        TcpSocket::new_v4()?
-    } else {
-        TcpSocket::new_v6()?
-    };
+/// Applies the options every outbound TCP socket carries.
+fn configure_outbound(socket: &SockRef<'_>, inline_urgent: bool) -> io::Result<()> {
     if inline_urgent {
-        SockRef::from(&socket).set_out_of_band_inline(true)?;
+        socket.set_out_of_band_inline(true)?;
     }
-    socket.set_send_buffer_size(crate::MAX_SOCKET_BUFFER_BYTES)?;
-    socket.set_recv_buffer_size(crate::MAX_SOCKET_BUFFER_BYTES)?;
+    bound_socket_buffers(socket)
+}
+
+/// Binds one published TCP listener natively; see [`super::bind_listeners`].
+pub(super) fn bind_tcp_listener_socket(address: SocketAddr) -> io::Result<socket2::Socket> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(address),
+        socket2::Type::STREAM,
+        None,
+    )?;
+    reserve_listener_address(&socket)?;
+    bound_socket_buffers(&SockRef::from(&socket))?;
+    socket.bind(&address.into())?;
+    socket.listen(64)?;
     Ok(socket)
 }
 
-pub(super) fn bind_tcp_listener(address: SocketAddr) -> io::Result<Arc<TcpListener>> {
-    let socket = create_tcp_socket(address, false)?;
-    socket.set_reuseaddr(true)?;
-    socket.bind(address)?;
-    socket.listen(64).map(Arc::new)
+/// Unix lets a restarted box rebind its port in `TIME_WAIT`. On Windows `SO_REUSEADDR` would let
+/// another local process bind the published port, so the listener claims it exclusively.
+fn reserve_listener_address(socket: &socket2::Socket) -> io::Result<()> {
+    #[cfg(unix)]
+    socket.set_reuse_address(true)?;
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Networking::WinSock::{SO_EXCLUSIVEADDRUSE, SOL_SOCKET};
+        super::udp::set_socket_option(socket, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, 1)?;
+    }
+    Ok(())
 }
 
 pub(super) fn bound_socket_buffers(socket: &SockRef<'_>) -> io::Result<()> {
@@ -45,14 +58,44 @@ pub(super) fn bound_socket_buffers(socket: &SockRef<'_>) -> io::Result<()> {
     socket.set_send_buffer_size(crate::MAX_SOCKET_BUFFER_BYTES as usize)
 }
 
-pub(super) async fn connect(peer: SocketAddr, inline_urgent: bool) -> Result<TcpStream, Error> {
-    let socket = create_tcp_socket(peer, inline_urgent).map_err(map_io_error)?;
-    let stream = tokio::time::timeout(Duration::from_secs(30), socket.connect(peer))
-        .await
-        .map_err(|_| Error::TimedOut)?
-        .map_err(map_io_error)?;
+pub(super) async fn connect(
+    sockets: &SocketSource,
+    peer: SocketAddr,
+    inline_urgent: bool,
+) -> Result<TcpStream, Error> {
+    let stream = tokio::time::timeout(
+        Duration::from_secs(30),
+        open_stream(sockets, peer, inline_urgent),
+    )
+    .await
+    .map_err(|_| Error::TimedOut)?
+    .map_err(map_io_error)?;
     stream.set_nodelay(true).map_err(map_io_error)?;
     Ok(stream)
+}
+
+async fn open_stream(
+    sockets: &SocketSource,
+    peer: SocketAddr,
+    inline_urgent: bool,
+) -> io::Result<TcpStream> {
+    match sockets {
+        SocketSource::Native => {
+            let socket = if peer.is_ipv4() {
+                TcpSocket::new_v4()?
+            } else {
+                TcpSocket::new_v6()?
+            };
+            configure_outbound(&SockRef::from(&socket), inline_urgent)?;
+            socket.connect(peer).await
+        }
+        SocketSource::Delegated(outbound) => {
+            let socket = outbound.connect_tcp(peer).await?;
+            configure_outbound(&SockRef::from(&socket), inline_urgent)?;
+            socket.set_nonblocking(true)?;
+            TcpStream::from_std(socket.into())
+        }
+    }
 }
 
 pub(super) async fn accept(listener: &TcpListener) -> Result<(TcpStream, SocketAddr), Error> {

@@ -197,6 +197,42 @@ pub fn attach_vm_child(guard: &VmChildGuard, child: &std::process::Child) -> Res
     Err(Error::other("created VM process has no initial thread"))
 }
 
+/// Spawns `command` without this process's standard handles, which every child would otherwise
+/// inherit: a detached child holding them keeps whoever reads this process's output waiting.
+/// The inherit flags are process-wide, so a child another thread spawns meanwhile also misses them.
+pub fn spawn_without_standard_handles(command: &mut Command) -> Result<std::process::Child> {
+    use windows_sys::Win32::Foundation::{GetHandleInformation, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+    let mut inheritable = Vec::new();
+    let mut cleared = Ok(());
+    for kind in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: GetStdHandle returns this process's handle for `kind` without taking ownership.
+        let handle = unsafe { GetStdHandle(kind) };
+        let mut flags = 0;
+        // SAFETY: handle is this process's standard handle and flags is writable.
+        if !handle.is_null()
+            && handle != INVALID_HANDLE_VALUE
+            && unsafe { GetHandleInformation(handle, &raw mut flags) } != 0
+            && flags & HANDLE_FLAG_INHERIT != 0
+            && !inheritable.contains(&handle)
+        {
+            cleared = set_inheritable(handle, false);
+            if cleared.is_err() {
+                break;
+            }
+            inheritable.push(handle);
+        }
+    }
+    let spawned = cleared.and_then(|()| command.spawn());
+    let restored = inheritable
+        .into_iter()
+        .map(|handle| set_inheritable(handle, true))
+        .fold(Ok(()), Result::and);
+    restored.and(spawned)
+}
+
 pub fn kill_vm_child(child: &mut std::process::Child) -> Result<()> {
     child.kill()
 }

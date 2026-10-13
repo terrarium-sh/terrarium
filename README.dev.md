@@ -50,7 +50,7 @@ WIT [interface symlinks](components/wit/README.md) materialized correctly.
 | `crates/terra-limits` | Shared resource limits |
 | `crates/terra-hypervisor` | Native VMs, vCPU threads and guest memory over KVM, Hypervisor.framework and WHP |
 | `crates/terra-platform` | Host filesystem, local-socket and child-process APIs |
-| `crates/terra-sandbox` | Host confinement of VM and broker workers: Bubblewrap and seccomp, macOS App Sandbox, Windows AppContainer and restricted-token jobs |
+| `crates/terra-sandbox` | Host confinement of VM and broker workers: Bubblewrap and seccomp, macOS App Sandbox, Windows Less-Privileged AppContainers and jobs |
 | `crates/terra-build` | Build-script logic: fallback seccomp filters, Bubblewrap asset lookup, version string |
 | `crates/terra-runtime` | Wasmtime stores, guest layout, scoped host capabilities, network configuration and policy contracts, and component/VM lifecycle orchestration |
 | `components` | Wasm devices and services, reusable transport code, and shared WIT interfaces |
@@ -171,7 +171,8 @@ packaged kernel and boot images carry ABI markers checked before boot.
   stream for broker resolution. Losing the control stream retires all network
   streams; agent control continues.
 - **Publication:** only trusted configuration creates host loopback listeners (at
-  most 32 mappings). The frontend opens a stream to guest port 6004 per accepted
+  most 32 mappings); the supervisor binds them and hands them to the broker,
+  which cannot listen itself. The frontend opens a stream to guest port 6004 per accepted
   TCP connection, or one per UDP listener family, and sends a header naming the
   configured guest port. The agent checks it against the boot plan and relays to
   the service from source `169.254.96.1`, delivering to `100.96.0.2:<port>`.
@@ -416,8 +417,9 @@ platform for Windows; native VM gates remain required for execution behavior.
 
 Windows tests run symlink fixtures by default. Enable Developer Mode or grant
 the account permission to create symbolic links before running the suite.
-Inside AppContainer, creating symlinks in host shares remains unsupported even
-with Developer Mode; see [Windows sandbox limits](docs/sandboxing.md#windows).
+Guest symlinks in host shares are stored WSL-style rather than as Windows
+symlinks, through the VM's wrapper when sandboxed; see
+[Windows sandboxing](docs/sandboxing.md#windows).
 
 Real Linux guest gates require `/dev/kvm`:
 

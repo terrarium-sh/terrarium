@@ -6,6 +6,8 @@ use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
 use crate::filesystem::Error;
 
+pub mod symlink_broker;
+
 #[derive(Clone, Copy)]
 pub struct FileAccess {
     pub read: bool,
@@ -55,6 +57,20 @@ fn resolve_leaf(
     path: &Path,
     trailing_separator: TrailingSeparator,
 ) -> std::io::Result<ResolvedLeaf> {
+    let (parent, leaf) = resolve_parent(directory, path, trailing_separator)?;
+    let path = nt_final_path(&parent)?.join(leaf);
+    Ok(ResolvedLeaf {
+        _parent: parent,
+        path,
+    })
+}
+
+/// Opens the leaf's parent through the confined resolver; the leaf itself is not touched.
+fn resolve_parent(
+    directory: &File,
+    path: &Path,
+    trailing_separator: TrailingSeparator,
+) -> std::io::Result<(File, std::ffi::OsString)> {
     use std::io::{Error, ErrorKind};
 
     let raw_path = path.as_os_str().to_string_lossy();
@@ -82,11 +98,7 @@ fn resolve_leaf(
     } else {
         cap_primitives::fs::open_dir(directory, parent_path)?
     };
-    let path = nt_final_path(&parent)?.join(leaf);
-    Ok(ResolvedLeaf {
-        _parent: parent,
-        path,
-    })
+    Ok((parent, leaf.to_os_string()))
 }
 
 #[allow(unsafe_code)]
@@ -226,56 +238,80 @@ pub(super) fn file_identity(file: &File) -> std::io::Result<super::FileIdentity>
     })
 }
 
+/// Opens `name` relative to `parent` without resolving a path; `options` should include
+/// `FILE_OPEN_REPARSE_POINT` whenever the child may be a link.
 #[allow(unsafe_code)]
-pub(super) fn open_metadata_file(directory: &File, name: &str) -> Result<File, Error> {
-    use std::os::windows::fs::MetadataExt as _;
-    use std::os::windows::io::{FromRawHandle as _, OwnedHandle};
+fn nt_open_child(
+    parent: &File,
+    name: &std::ffi::OsStr,
+    access: u32,
+    disposition: u32,
+    options: u32,
+) -> std::io::Result<File> {
+    use std::os::windows::ffi::OsStrExt as _;
     use std::ptr::null;
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
-    use windows_sys::Wdk::Storage::FileSystem::{
-        FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
-    };
-    use windows_sys::Win32::Foundation::UNICODE_STRING;
+    use windows_sys::Wdk::Storage::FileSystem::{FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile};
+    use windows_sys::Win32::Foundation::{RtlNtStatusToDosError, UNICODE_STRING};
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, SYNCHRONIZE,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, SYNCHRONIZE,
     };
-    let mut encoded = name.encode_utf16().collect::<Vec<_>>();
-    let length = u16::try_from(encoded.len() * 2).map_err(|_| Error::Access)?;
+    let mut encoded = name.encode_wide().collect::<Vec<_>>();
+    let length = u16::try_from(encoded.len() * 2).map_err(std::io::Error::other)?;
     let name = UNICODE_STRING {
         Length: length,
         MaximumLength: length,
         Buffer: encoded.as_mut_ptr(),
     };
     let attributes = OBJECT_ATTRIBUTES {
-        Length: u32::try_from(size_of::<OBJECT_ATTRIBUTES>()).map_err(|_| Error::Io)?,
-        RootDirectory: directory.as_raw_handle(),
+        Length: u32::try_from(size_of::<OBJECT_ATTRIBUTES>()).map_err(std::io::Error::other)?,
+        RootDirectory: parent.as_raw_handle(),
         ObjectName: &raw const name,
         ..Default::default()
     };
     let mut status = IO_STATUS_BLOCK::default();
     let mut handle = null_mut();
-    // SAFETY: the validated child name and directory handle remain live; reparse points are opened without following them.
+    // SAFETY: the child name and parent handle remain live for the synchronous call.
     let result = unsafe {
         NtCreateFile(
             &raw mut handle,
-            FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            access | SYNCHRONIZE,
             &raw const attributes,
             &raw mut status,
             null(),
             0,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            FILE_OPEN,
-            FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            disposition,
+            options | FILE_SYNCHRONOUS_IO_NONALERT,
             null(),
             0,
         )
     };
     if result < 0 {
-        return Err(Error::Access);
+        // SAFETY: RtlNtStatusToDosError only translates the status value.
+        let code = unsafe { RtlNtStatusToDosError(result) };
+        return Err(std::io::Error::from_raw_os_error(
+            i32::try_from(code).unwrap_or(i32::MAX),
+        ));
     }
     // SAFETY: a successful NtCreateFile returns one owned handle.
-    let file = File::from(unsafe { OwnedHandle::from_raw_handle(handle) });
+    Ok(File::from(unsafe { OwnedHandle::from_raw_handle(handle) }))
+}
+
+pub(super) fn open_metadata_file(directory: &File, name: &str) -> Result<File, Error> {
+    use std::os::windows::fs::MetadataExt as _;
+    use windows_sys::Wdk::Storage::FileSystem::{FILE_OPEN, FILE_OPEN_REPARSE_POINT};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+    };
+    let file = nt_open_child(
+        directory,
+        std::ffi::OsStr::new(name),
+        FILE_READ_ATTRIBUTES,
+        FILE_OPEN,
+        FILE_OPEN_REPARSE_POINT,
+    )
+    .map_err(|_| Error::Access)?;
     if file.metadata().map_err(|_| Error::Io)?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
     {
         return Err(Error::Access);
@@ -283,9 +319,232 @@ pub(super) fn open_metadata_file(directory: &File, name: &str) -> Result<File, E
     Ok(file)
 }
 
+/// The version WSL writes ahead of the UTF-8 target in an `IO_REPARSE_TAG_LX_SYMLINK` buffer.
+const WSL_SYMLINK_VERSION: u32 = 2;
+/// Linux `PATH_MAX` less its terminator.
+const MAX_SYMLINK_TARGET_BYTES: usize = 4095;
+/// `ReparseTag`, `ReparseDataLength` and `Reserved` precede the reparse data.
+const REPARSE_HEADER_BYTES: usize = 8;
+
+/// Creates a Linux symlink the way WSL stores one, which Windows itself never follows; an
+/// `AppContainer` may not set reparse points, so a sandboxed VM goes through [`symlink_broker`].
+#[allow(unsafe_code)]
+pub fn symlink_at(directory: &File, path: &Path, target: &str) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FILE_CREATE, FILE_NON_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT, IO_REPARSE_TAG_LX_SYMLINK,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_DISPOSITION_INFO, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FileDispositionInfo,
+        SetFileInformationByHandle,
+    };
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    use windows_sys::Win32::System::Ioctl::FSCTL_SET_REPARSE_POINT;
+
+    // Matches WASI's cap-std symlink-at; the raw code keeps the guest's EPERM across the broker.
+    if target.starts_with('/') {
+        return Err(Error::from_raw_os_error(
+            windows_sys::Win32::Foundation::ERROR_PRIVILEGE_NOT_HELD.cast_signed(),
+        ));
+    }
+    if target.is_empty() || target.len() > MAX_SYMLINK_TARGET_BYTES || target.contains('\0') {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "invalid symlink target",
+        ));
+    }
+    let data_length = u16::try_from(4 + target.len()).map_err(Error::other)?;
+    let mut buffer = Vec::with_capacity(REPARSE_HEADER_BYTES + usize::from(data_length));
+    buffer.extend(IO_REPARSE_TAG_LX_SYMLINK.cast_unsigned().to_le_bytes());
+    buffer.extend(data_length.to_le_bytes());
+    buffer.extend(0_u16.to_le_bytes());
+    buffer.extend(WSL_SYMLINK_VERSION.to_le_bytes());
+    buffer.extend(target.as_bytes());
+    let (parent, leaf) = resolve_parent(directory, path, TrailingSeparator::Reject)?;
+    let link = nt_open_child(
+        &parent,
+        &leaf,
+        FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES | DELETE,
+        FILE_CREATE,
+        FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
+    )?;
+    let mut returned = 0;
+    // SAFETY: link is live and buffer holds the complete reparse data for the call.
+    let is_set = unsafe {
+        DeviceIoControl(
+            link.as_raw_handle(),
+            FSCTL_SET_REPARSE_POINT,
+            buffer.as_ptr().cast(),
+            u32::try_from(buffer.len()).map_err(Error::other)?,
+            null_mut(),
+            0,
+            &raw mut returned,
+            null_mut(),
+        )
+    } != 0;
+    if is_set {
+        return Ok(());
+    }
+    let error = Error::last_os_error();
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    // SAFETY: link was opened with DELETE and disposition has the layout FileDispositionInfo expects.
+    unsafe {
+        SetFileInformationByHandle(
+            link.as_raw_handle(),
+            FileDispositionInfo,
+            (&raw const disposition).cast(),
+            u32::try_from(size_of::<FILE_DISPOSITION_INFO>()).map_err(Error::other)?,
+        );
+    }
+    Err(error)
+}
+
+/// Reads a symlink [`symlink_at`] created; `Ok(None)` means the entry is not such a link.
+#[allow(unsafe_code)]
+pub fn read_wsl_symlink_at(directory: &File, path: &Path) -> std::io::Result<Option<String>> {
+    use std::io::{Error, ErrorKind};
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FILE_OPEN, FILE_OPEN_REPARSE_POINT, IO_REPARSE_TAG_LX_SYMLINK,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_READ_ATTRIBUTES,
+        FileAttributeTagInfo, GetFileInformationByHandleEx, MAXIMUM_REPARSE_DATA_BUFFER_SIZE,
+    };
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    use windows_sys::Win32::System::Ioctl::FSCTL_GET_REPARSE_POINT;
+
+    let (parent, leaf) = resolve_parent(directory, path, TrailingSeparator::Reject)?;
+    let link = nt_open_child(
+        &parent,
+        &leaf,
+        FILE_READ_ATTRIBUTES,
+        FILE_OPEN,
+        FILE_OPEN_REPARSE_POINT,
+    )?;
+    let mut tag = FILE_ATTRIBUTE_TAG_INFO::default();
+    // SAFETY: link is live and tag has the layout FileAttributeTagInfo writes.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            link.as_raw_handle(),
+            FileAttributeTagInfo,
+            (&raw mut tag).cast(),
+            u32::try_from(size_of::<FILE_ATTRIBUTE_TAG_INFO>()).map_err(Error::other)?,
+        )
+    } == 0
+    {
+        return Err(Error::last_os_error());
+    }
+    if tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
+        || tag.ReparseTag != IO_REPARSE_TAG_LX_SYMLINK.cast_unsigned()
+    {
+        return Ok(None);
+    }
+    let mut buffer = vec![0_u8; MAXIMUM_REPARSE_DATA_BUFFER_SIZE as usize];
+    let mut returned = 0;
+    // SAFETY: link is live and buffer is writable for its full length.
+    if unsafe {
+        DeviceIoControl(
+            link.as_raw_handle(),
+            FSCTL_GET_REPARSE_POINT,
+            std::ptr::null(),
+            0,
+            buffer.as_mut_ptr().cast(),
+            u32::try_from(buffer.len()).map_err(Error::other)?,
+            &raw mut returned,
+            null_mut(),
+        )
+    } == 0
+    {
+        return Err(Error::last_os_error());
+    }
+    parse_wsl_symlink(&buffer[..usize::try_from(returned).map_err(Error::other)?])
+        .map(Some)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "malformed WSL symlink"))
+}
+
+fn parse_wsl_symlink(buffer: &[u8]) -> Option<String> {
+    let header = buffer.get(..REPARSE_HEADER_BYTES)?;
+    let data_length = usize::from(u16::from_le_bytes([header[4], header[5]]));
+    let data = buffer.get(REPARSE_HEADER_BYTES..REPARSE_HEADER_BYTES + data_length)?;
+    let (version, target) = data.split_first_chunk::<4>()?;
+    (u32::from_le_bytes(*version) == WSL_SYMLINK_VERSION
+        && !target.is_empty()
+        && target.len() <= MAX_SYMLINK_TARGET_BYTES)
+        .then(|| String::from_utf8(target.to_vec()).ok())
+        .flatten()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A WSL-style link round-trips its target, reads as a symlink to std (and so to WASI),
+    /// is never followed by Windows, and is renamed and removed like any other entry.
+    #[test]
+    fn wsl_symlinks_round_trip_and_windows_never_follows_them() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("base"), b"target").unwrap();
+        std::fs::create_dir(temp.path().join("nested")).unwrap();
+        let directory =
+            crate::filesystem::share::open_share_root(&temp.path().canonicalize().unwrap())
+                .unwrap();
+        symlink_at(&directory, Path::new("nested/link"), "../base").unwrap();
+        assert_eq!(
+            read_wsl_symlink_at(&directory, Path::new("nested/link")).unwrap(),
+            Some("../base".into())
+        );
+        let metadata = std::fs::symlink_metadata(temp.path().join("nested/link")).unwrap();
+        assert!(metadata.file_type().is_symlink());
+        assert!(std::fs::read(temp.path().join("nested/link")).is_err());
+        assert_eq!(
+            symlink_at(&directory, Path::new("nested/link"), "other")
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            read_wsl_symlink_at(&directory, Path::new("base")).unwrap(),
+            None
+        );
+        rename_at(
+            &directory,
+            Path::new("nested/link"),
+            &directory,
+            Path::new("moved"),
+        )
+        .unwrap();
+        assert_eq!(
+            read_wsl_symlink_at(&directory, Path::new("moved")).unwrap(),
+            Some("../base".into())
+        );
+        unlink_file_at(&directory, Path::new("moved")).unwrap();
+        assert!(!temp.path().join("moved").exists());
+        assert_eq!(std::fs::read(temp.path().join("base")).unwrap(), b"target");
+    }
+
+    #[test]
+    fn wsl_symlinks_reject_escapes_and_invalid_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory =
+            crate::filesystem::share::open_share_root(&temp.path().canonicalize().unwrap())
+                .unwrap();
+        for (path, target) in [
+            ("../escape", "target"),
+            ("link/", "target"),
+            ("link", ""),
+            ("link", "nul\0byte"),
+        ] {
+            assert!(symlink_at(&directory, Path::new(path), target).is_err());
+        }
+        assert!(symlink_at(&directory, Path::new("link"), &"x".repeat(4096)).is_err());
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+        let mut malformed = vec![0_u8; REPARSE_HEADER_BYTES];
+        malformed[4..6].copy_from_slice(&8_u16.to_le_bytes());
+        malformed.extend(1_u32.to_le_bytes());
+        malformed.extend(b"link");
+        assert_eq!(parse_wsl_symlink(&malformed), None);
+        assert_eq!(parse_wsl_symlink(&malformed[..10]), None);
+    }
 
     #[test]
     fn base_directory_iteration_uses_opened_handle() {

@@ -561,7 +561,10 @@ async fn resolver_admission_is_released_after_a_timeout() {
     bounded(async {
         let resolvers = Arc::new(Semaphore::new(1));
         let permit = resolvers.clone().try_acquire_owned().unwrap();
-        assert_eq!(resolve_addresses(Slow, permit).await, Err(Error::TimedOut));
+        assert_eq!(
+            resolve_addresses(Slow, permit, crate::SocketSource::Native).await,
+            Err(Error::TimedOut)
+        );
         assert!(resolvers.clone().try_acquire_owned().is_err());
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert!(resolvers.try_acquire_owned().is_ok());
@@ -781,7 +784,11 @@ async fn udp_publication_grants_one_owner_and_only_received_peers() {
 
 fn bound_resource(publication_grant: Option<u32>) -> UdpResource {
     UdpResource {
-        ipv4: Some(super::udp::bind_udp((Ipv4Addr::LOCALHOST, 0).into()).unwrap()),
+        ipv4: Some(
+            super::udp::bind_udp_socket((Ipv4Addr::LOCALHOST, 0).into())
+                .and_then(super::udp::adopt_udp)
+                .unwrap(),
+        ),
         ipv6: None,
         peers: UdpPeers::shared(if publication_grant.is_some() {
             crate::MAX_UDP_PUBLICATION_PEERS
@@ -1215,11 +1222,35 @@ async fn closing_a_shared_udp_publication_lets_it_reopen_at_once() {
 #[cfg(unix)]
 #[tokio::test]
 async fn broker_udp_sockets_leave_fragmentation_to_the_os() {
-    let socket = super::udp::bind_udp("0.0.0.0:0".parse().unwrap()).unwrap();
+    let socket = super::udp::bind_udp_socket("0.0.0.0:0".parse().unwrap())
+        .and_then(super::udp::adopt_udp)
+        .unwrap();
     let result = socket.socket.send_to(&[0; 3000], "192.0.2.1:9").await;
     assert_ne!(
         result.as_ref().err().and_then(std::io::Error::raw_os_error),
         Some(libc::EMSGSIZE),
         "{result:?}"
     );
+}
+
+/// A broker refuses handed-over listeners whose count, address or transport differs from their
+/// grants, so a supervisor mistake cannot publish an unapproved port.
+#[tokio::test]
+async fn broker_refuses_listeners_that_do_not_match_their_grants() {
+    let reserved = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let address = reserved.local_addr().unwrap();
+    drop(reserved);
+    let mut setup = config();
+    setup.listeners = vec![PublishedListener {
+        grant: 1,
+        address,
+        transport: ResourceKind::Tcp,
+    }];
+    let listeners = bind_listeners(&mut setup).unwrap();
+    assert!(Broker::new(&setup, Vec::new(), SocketSource::Native).is_err());
+    let elsewhere = tcp::bind_tcp_listener_socket((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+    assert!(Broker::new(&setup, vec![elsewhere], SocketSource::Native).is_err());
+    let datagram = bind_udp_socket(address).unwrap();
+    assert!(Broker::new(&setup, vec![datagram], SocketSource::Native).is_err());
+    assert!(Broker::new(&setup, listeners, SocketSource::Native).is_ok());
 }

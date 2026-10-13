@@ -6,10 +6,11 @@ mod tests;
 mod udp;
 
 use self::peer::validate_peer;
-use self::tcp::bind_tcp_listener;
-use self::udp::bind_udp;
-use crate::config::{Config, Ready};
-use crate::{Error, ResourceKind};
+use self::tcp::bind_tcp_listener_socket;
+use self::udp::adopt_udp;
+pub(crate) use self::udp::bind_udp_socket;
+use crate::config::{Config, PublishedListener, Ready};
+use crate::{Error, ResourceKind, SocketSource};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::{Future, poll_fn};
 use std::io;
@@ -25,6 +26,7 @@ use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt};
 
 pub struct Broker {
     policy: Arc<BoxPolicy>,
+    sockets: SocketSource,
     listeners: BTreeMap<ListenerGrant, Arc<TcpListener>>,
     udp_listeners: BTreeMap<ListenerGrant, Arc<udp::OffloadSocket>>,
     max_resources: usize,
@@ -33,6 +35,7 @@ pub struct Broker {
 /// State every stream handler shares.
 struct Shared {
     policy: Arc<BoxPolicy>,
+    sockets: SocketSource,
     listeners: BTreeMap<ListenerGrant, Arc<TcpListener>>,
     udp_listeners: BTreeMap<ListenerGrant, Arc<udp::OffloadSocket>>,
     resources: Arc<Semaphore>,
@@ -103,56 +106,129 @@ enum Prepared {
     Resolved(Vec<IpAddr>),
 }
 
-impl Broker {
-    pub fn bind(config: &Config) -> io::Result<Self> {
-        if config.listeners.len() > crate::MAX_LISTENERS {
+/// Binds the configured published listeners natively, in `config.listeners` order, for the
+/// trusted side to hand to a broker it then confines. An IPv6 listener that cannot bind beside an
+/// IPv4 listener on the same port and transport is dropped from `config`.
+pub fn bind_listeners(config: &mut Config) -> io::Result<Vec<socket2::Socket>> {
+    validate_listener_grants(config)?;
+    let mut sockets = Vec::with_capacity(config.listeners.len());
+    let mut bound = Vec::with_capacity(config.listeners.len());
+    for grant in &config.listeners {
+        let binding = match grant.transport {
+            ResourceKind::Tcp => bind_tcp_listener_socket(grant.address),
+            ResourceKind::Udp => bind_udp_socket(grant.address),
+        };
+        match binding {
+            Ok(socket) => {
+                sockets.push(socket);
+                bound.push(grant.clone());
+            }
+            Err(_) if is_best_effort_ipv6(config, grant) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    config.listeners = bound;
+    Ok(sockets)
+}
+
+fn is_best_effort_ipv6(config: &Config, grant: &PublishedListener) -> bool {
+    grant.address.is_ipv6()
+        && config.listeners.iter().any(|other| {
+            other.address.is_ipv4()
+                && other.address.port() == grant.address.port()
+                && other.transport == grant.transport
+        })
+}
+
+fn validate_listener_grants(config: &Config) -> io::Result<()> {
+    if config.listeners.len() > crate::MAX_LISTENERS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "too many published listeners",
+        ));
+    }
+    let mut grants = BTreeSet::new();
+    for grant in &config.listeners {
+        if grant.grant == 0
+            || !terra_policy::is_host_loopback(grant.address.ip())
+            || grant.address.port() == 0
+            || !grants.insert(grant.grant)
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "too many published listeners",
+                "invalid published listener grant",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A handed-over listener must be bound to its grant's address with its grant's transport.
+fn adopt_listener(
+    grant: &PublishedListener,
+    socket: socket2::Socket,
+    listeners: &mut BTreeMap<ListenerGrant, Arc<TcpListener>>,
+    udp_listeners: &mut BTreeMap<ListenerGrant, Arc<udp::OffloadSocket>>,
+) -> io::Result<()> {
+    let expected_kind = match grant.transport {
+        ResourceKind::Tcp => socket2::Type::STREAM,
+        ResourceKind::Udp => socket2::Type::DGRAM,
+    };
+    if socket.local_addr()?.as_socket() != Some(grant.address) || socket.r#type()? != expected_kind
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "handed-over listener does not match its grant",
+        ));
+    }
+    match grant.transport {
+        ResourceKind::Tcp => {
+            socket.set_nonblocking(true)?;
+            let listener = TcpListener::from_std(std::net::TcpListener::from(socket))?;
+            listeners.insert(grant.grant, Arc::new(listener));
+        }
+        ResourceKind::Udp => {
+            udp_listeners.insert(grant.grant, adopt_udp(socket)?);
+        }
+    }
+    Ok(())
+}
+
+impl Broker {
+    /// Binds the published listeners and serves outbound traffic from this process.
+    pub fn bind(config: &Config) -> io::Result<Self> {
+        let mut config = config.clone();
+        let listeners = bind_listeners(&mut config)?;
+        Self::new(&config, listeners, SocketSource::Native)
+    }
+
+    /// Takes `listeners` from [`bind_listeners`] in `config.listeners` order, so the broker
+    /// never binds a listener itself.
+    pub fn new(
+        config: &Config,
+        listeners: Vec<socket2::Socket>,
+        sockets: SocketSource,
+    ) -> io::Result<Self> {
+        validate_listener_grants(config)?;
+        if listeners.len() != config.listeners.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "handed-over listeners do not match their grants",
             ));
         }
         let policy = Arc::new(
             BoxPolicy::new(&config.policy, crate::config::GATEWAY_ADDRESSES)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?,
         );
-        let mut listeners = BTreeMap::new();
+        let mut tcp_listeners = BTreeMap::new();
         let mut udp_listeners = BTreeMap::new();
-        for grant in &config.listeners {
-            if grant.grant == 0
-                || !terra_policy::is_host_loopback(grant.address.ip())
-                || grant.address.port() == 0
-                || listeners.contains_key(&grant.grant)
-                || udp_listeners.contains_key(&grant.grant)
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "invalid published listener grant",
-                ));
-            }
-            let binding = match grant.transport {
-                ResourceKind::Tcp => bind_tcp_listener(grant.address).map(|socket| {
-                    listeners.insert(grant.grant, socket);
-                }),
-                ResourceKind::Udp => bind_udp(grant.address).map(|socket| {
-                    udp_listeners.insert(grant.grant, socket);
-                }),
-            };
-            if let Err(error) = binding {
-                if grant.address.is_ipv6()
-                    && config.listeners.iter().any(|other| {
-                        other.address.is_ipv4()
-                            && other.address.port() == grant.address.port()
-                            && other.transport == grant.transport
-                    })
-                {
-                    continue;
-                }
-                return Err(error);
-            }
+        for (grant, socket) in config.listeners.iter().zip(listeners) {
+            adopt_listener(grant, socket, &mut tcp_listeners, &mut udp_listeners)?;
         }
         Ok(Self {
             policy,
-            listeners,
+            sockets,
+            listeners: tcp_listeners,
             udp_listeners,
             max_resources: crate::MAX_RESOURCES,
         })
@@ -172,6 +248,7 @@ impl Broker {
     ) -> io::Result<()> {
         let shared = Arc::new(Shared {
             policy: self.policy,
+            sockets: self.sockets,
             listeners: self.listeners,
             udp_listeners: self.udp_listeners,
             resources: Arc::new(Semaphore::new(self.max_resources)),
@@ -275,7 +352,7 @@ impl Shared {
                     return Err(Error::AccessDenied);
                 }
                 let permit = self.claim_resource()?;
-                let tcp = tcp::connect(peer, inline_urgent).await?;
+                let tcp = tcp::connect(&self.sockets, peer, inline_urgent).await?;
                 Ok(Prepared::Tcp { tcp, peer, permit })
             }
             Open::Accept(grant) => {
@@ -287,7 +364,7 @@ impl Shared {
             }
             Open::Udp => Ok(Prepared::Udp {
                 permit: self.claim_resource()?,
-                udp: udp::open()?,
+                udp: udp::open(&self.sockets)?,
                 grant: None,
             }),
             Open::PublishedUdp(grant) => {
@@ -305,7 +382,7 @@ impl Shared {
                     .clone()
                     .try_acquire_owned()
                     .map_err(|_| Error::LimitExceeded)?;
-                dns::resolve(&name, &self.policy, self.resolvers.clone())
+                dns::resolve(&name, &self.policy, self.resolvers.clone(), &self.sockets)
                     .await
                     .map(Prepared::Resolved)
             }

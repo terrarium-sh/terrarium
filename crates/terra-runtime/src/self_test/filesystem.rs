@@ -18,12 +18,6 @@ const INPUT: u64 = 0x4000;
 const OUTPUT: u64 = 0x6000;
 const REPLY_CAPACITY: u32 = 4096;
 
-#[cfg(windows)]
-fn is_vm_app_container() -> bool {
-    use terra_platform::process::sandbox_env::{APP_CONTAINER_MODE, WINDOWS_MODE, is_vm_worker};
-    is_vm_worker() && std::env::var_os(WINDOWS_MODE).is_some_and(|mode| mode == APP_CONTAINER_MODE)
-}
-
 struct Share {
     channel: MmioDevice,
     ram: GuestRam,
@@ -259,7 +253,7 @@ async fn run_writable(
         std::fs::read(directory.join("linked"))? == b"filesys",
         "filesystem hardlink readback"
     );
-    let app_container = exercise_symlink(&mut share, directory).await?;
+    exercise_symlink(&mut share, directory).await?;
     share.request(9, 1, &mkdir_body(), 0).await?;
     ensure!(
         directory.join("directory").is_dir(),
@@ -271,14 +265,9 @@ async fn run_writable(
         .request(28, 1, &file_io_body(directory_handle, 0, 4096), 0)
         .await?;
     let names = directory_names(&entries)?;
-    let expected_names: &[&[u8]] = if app_container {
-        &[b"renamed", b"linked", b"directory"]
-    } else {
-        &[b"renamed", b"linked", b"symlink", b"directory"]
-    };
-    for name in expected_names {
+    for name in [b"renamed".as_slice(), b"linked", b"symlink", b"directory"] {
         ensure!(
-            names.contains(name),
+            names.contains(&name),
             "filesystem readdir misses {}",
             String::from_utf8_lossy(name)
         );
@@ -302,12 +291,7 @@ async fn run_writable(
     share
         .request(29, 1, &directory_handle.to_le_bytes(), 0)
         .await?;
-    let removed_names: &[&[u8]] = if app_container {
-        &[b"linked\0", b"renamed\0"]
-    } else {
-        &[b"symlink\0", b"linked\0", b"renamed\0"]
-    };
-    for name in removed_names {
+    for name in [b"symlink\0".as_slice(), b"linked\0", b"renamed\0"] {
         share.request(10, 1, name, 0).await?;
     }
     share.request(11, 1, b"directory\0", 0).await?;
@@ -319,46 +303,18 @@ async fn run_writable(
     share.close().await
 }
 
-async fn exercise_symlink(share: &mut Share, directory: &Path) -> Result<bool> {
+async fn exercise_symlink(share: &mut Share, directory: &Path) -> Result<()> {
+    let symlink = share.request(6, 1, b"symlink\0renamed\0", 0).await?;
+    let symlink_node = read_u64(&symlink, 16)?;
+    let target = share.request(5, symlink_node, &[], 0).await?;
+    ensure!(&target[16..] == b"renamed", "filesystem symlink target");
+    // Windows stores guest links the way WSL does, which std classifies but cannot read.
     #[cfg(windows)]
-    let app_container = is_vm_app_container();
+    let is_host_symlink = std::fs::symlink_metadata(directory.join("symlink"))?.is_symlink();
     #[cfg(not(windows))]
-    let app_container = false;
-    if app_container {
-        share.request(6, 1, b"symlink\0renamed\0", -13).await?;
-        match std::fs::symlink_metadata(directory.join("symlink")) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-            Ok(_) => {
-                return Err(wasmtime::Error::msg(
-                    "Windows AppContainer created a symlink despite access denial",
-                ));
-            }
-        }
-        log::info!(
-            "Windows AppContainer does not permit symbolic link creation; filesystem self-test verified access denial and continues"
-        );
-    } else {
-        #[cfg(windows)]
-        let symlink = share
-            .request(6, 1, b"symlink\0renamed\0", 0)
-            .await
-            .map_err(|error| {
-                error.context(
-                    "Windows symlink creation failed; enable Developer Mode or grant the symlink privilege",
-                )
-            })?;
-        #[cfg(not(windows))]
-        let symlink = share.request(6, 1, b"symlink\0renamed\0", 0).await?;
-        let symlink_node = read_u64(&symlink, 16)?;
-        let target = share.request(5, symlink_node, &[], 0).await?;
-        ensure!(&target[16..] == b"renamed", "filesystem symlink target");
-        ensure!(
-            std::fs::read_link(directory.join("symlink"))? == Path::new("renamed"),
-            "filesystem host symlink readback"
-        );
-    }
-    Ok(app_container)
+    let is_host_symlink = std::fs::read_link(directory.join("symlink"))? == Path::new("renamed");
+    ensure!(is_host_symlink, "filesystem host symlink readback");
+    Ok(())
 }
 
 async fn exercise_file_io(share: &mut Share, directory: &Path) -> Result<(u64, u64)> {

@@ -437,6 +437,8 @@ fn add_descriptor_lifecycle<T: Send + 'static>(
     super::read_directory::add_windows_read_directory(&mut interface, host)?;
     #[cfg(windows)]
     add_windows_mutations(&mut interface, host)?;
+    #[cfg(windows)]
+    add_windows_symlinks(&mut interface, host, filesystem)?;
     linker.allow_shadowing(false);
     Ok(())
 }
@@ -521,6 +523,86 @@ fn add_windows_mutations<T: Send + 'static>(
         },
     )?;
     add_windows_rename_and_delete(interface, host)
+}
+
+/// Guest links are stored the way WSL stores them; reading falls back to the WASI implementation
+/// for Windows symlinks.
+#[cfg(windows)]
+fn add_windows_symlinks<T: Send + 'static>(
+    interface: &mut wasmtime::component::LinkerInstance<'_, T>,
+    host: for<'a> fn(&'a mut T) -> &'a mut FsHost,
+    filesystem: for<'a> fn(&'a mut T) -> wasmtime_wasi::filesystem::WasiFilesystemCtxView<'a>,
+) -> wasmtime::Result<()> {
+    use terra_platform::filesystem::share::windows::{
+        self as share, symlink_broker::SymlinkBroker,
+    };
+    use types::HostDescriptorWithStore;
+    interface.func_wrap_concurrent(
+        "[method]descriptor.symlink-at",
+        move |accessor, (descriptor, target, path): (Resource<Descriptor>, String, String)| {
+            let directories = accessor.with(|mut access| {
+                let host = host(access.data_mut());
+                Ok((
+                    host.grant.directory.clone(),
+                    host.writable_directory(&descriptor)?,
+                ))
+            });
+            Box::pin(async move {
+                let result = mutate_on_blocking_thread(directories, move |(root, directory)| {
+                    match SymlinkBroker::inherited() {
+                        Some(broker) => {
+                            broker.symlink_at(&root.dir, &directory.dir, path.as_ref(), &target)
+                        }
+                        None => share::symlink_at(&directory.dir, path.as_ref(), &target),
+                    }
+                })
+                .await;
+                Ok((result,))
+            })
+        },
+    )?;
+    interface.func_wrap_concurrent(
+        "[method]descriptor.readlink-at",
+        move |accessor, (descriptor, path): (Resource<Descriptor>, String)| {
+            let directories = accessor.with(|mut access| {
+                let host = host(access.data_mut());
+                Ok((host.grant.directory.clone(), host.directory(&descriptor)?))
+            });
+            Box::pin(async move {
+                let (root, directory) = match directories {
+                    Ok(directories) => directories,
+                    Err(error) => return Ok((Err(error),)),
+                };
+                let lookup = path.clone();
+                let wsl_target = run_blocking(types::ErrorCode::Io, move || {
+                    match SymlinkBroker::inherited() {
+                        Some(broker) => {
+                            broker.readlink_at(&root.dir, &directory.dir, lookup.as_ref())
+                        }
+                        None => share::read_wsl_symlink_at(&directory.dir, lookup.as_ref()),
+                    }
+                    .map_err(Into::into)
+                })
+                .await;
+                match wsl_target {
+                    Ok(Some(target)) => Ok((Ok(target),)),
+                    Err(error) => Ok((Err(error),)),
+                    Ok(None) => {
+                        let wasi = accessor.with_getter::<WasiFilesystem>(filesystem);
+                        match <WasiFilesystem as HostDescriptorWithStore<T>>::readlink_at(
+                            &wasi, descriptor, path,
+                        )
+                        .await
+                        {
+                            Ok(target) => Ok((Ok(target),)),
+                            Err(error) => Ok((Err(error.downcast()?),)),
+                        }
+                    }
+                }
+            })
+        },
+    )?;
+    Ok(())
 }
 
 #[cfg(windows)]

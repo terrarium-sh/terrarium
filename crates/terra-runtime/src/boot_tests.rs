@@ -550,6 +550,10 @@ fn local_http_server(
             }
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    // Windows hands an accepted socket its listener's nonblocking mode.
+                    stream
+                        .set_nonblocking(false)
+                        .expect("block local HTTP stream");
                     let mut request = [0; 1024];
                     let _ = stream.read(&mut request);
                     stream
@@ -594,6 +598,9 @@ fn local_upload_server(
             }
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    stream
+                        .set_nonblocking(false)
+                        .expect("block local upload stream");
                     let mut data = vec![0; expected_bytes];
                     stream.read_exact(&mut data).expect("read upload");
                     assert!(data.iter().all(|byte| *byte == 0), "upload bytes match");
@@ -991,9 +998,17 @@ fn assert_stalled_transfers_closed(
         .unwrap();
     match network.read(&mut [0]) {
         Ok(0) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+        Err(error) if is_closed_by_peer(&error) => {}
         result => panic!("stopped network transfer remains live: {result:?}"),
     }
+}
+
+/// Winsock reports a connection its stack aborted as `ConnectionAborted` rather than a reset.
+fn is_closed_by_peer(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+    )
 }
 
 fn serve_network_reset_peer(listener: &std::net::TcpListener) -> bool {
@@ -1014,13 +1029,14 @@ fn serve_network_reset_peer(listener: &std::net::TcpListener) -> bool {
             Err(error) => panic!("network reset peer: {error}"),
         }
     };
+    stream.set_nonblocking(false).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(15)))
         .unwrap();
     stream.write_all(&[0x5a]).unwrap();
     match stream.read(&mut [0]) {
         Ok(0) => true,
-        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => true,
+        Err(error) if is_closed_by_peer(&error) => true,
         result => panic!("network reset did not close broker peer: {result:?}"),
     }
 }

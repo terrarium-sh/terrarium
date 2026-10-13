@@ -199,7 +199,7 @@ async fn plan_file_update(
     };
 
     if is_identical {
-        let mode_differs = effective_mode(src.mode, direction, src.kind) != dst.mode;
+        let mode_differs = effective_mode(src.mode, direction) != dst.mode;
         let mtime_differs = src.mtime_secs != dst.mtime_secs || src.mtime_nanos != dst.mtime_nanos;
         if mode_differs || mtime_differs {
             Ok(PlanAction::UpdateFileMetadata {
@@ -327,7 +327,7 @@ pub(super) async fn build_plan(
             },
             Some(dst) => match src.kind {
                 SyncEntryKind::Directory => {
-                    let mode_differs = effective_mode(src.mode, direction, src.kind) != dst.mode;
+                    let mode_differs = effective_mode(src.mode, direction) != dst.mode;
                     let mtime_differs =
                         src.mtime_secs != dst.mtime_secs || src.mtime_nanos != dst.mtime_nanos;
                     if mode_differs || mtime_differs {
@@ -457,7 +457,7 @@ mod tests {
                 source.extend(source_file.map(|entry| (path.into(), entry)));
                 target.extend(target_file.map(|entry| (path.into(), entry)));
                 for entry in target.values_mut() {
-                    entry.mode = effective_mode(entry.mode, direction, entry.kind);
+                    entry.mode = effective_mode(entry.mode, direction);
                 }
                 let actions = build_plan(
                     &source,

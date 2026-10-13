@@ -147,12 +147,12 @@ mod tests {
         std::os::unix::net::UnixStream::pair().unwrap();
         probe_preserved_worker_lifetime();
         probe_denied_terminal_injection();
-        let network = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0));
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0));
+        assert_eq!(listener.unwrap_err().raw_os_error(), Some(libc::EPERM));
         if role == "vm" {
-            assert_eq!(network.unwrap_err().raw_os_error(), Some(libc::EPERM));
             probe_denied_vm_outgoing_sockets();
         } else {
-            network.unwrap();
+            std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
             probe_denied_kvm_ioctls();
             probe_broker_socket_families();
         }

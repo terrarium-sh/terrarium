@@ -162,7 +162,9 @@ remove the conflicting destination entry before retrying.
 `--dry-run` previews these actions without copying, replacing, or deleting
 destination entries. Download validation still creates temporary name probes.
 
-Sync preserves modification times and supported permission bits. It copies
+Sync preserves modification times and supported permission bits. A Windows host
+stores only the read-only attribute, so, as in a mount, its files and directories
+sync to the guest as `0755`, or `0555` when read-only. It copies
 symlinks without following them; downloaded links must resolve within the
 synchronized tree. Special files and non-UTF-8 tree names are rejected. A failed
 transfer preserves that file's previous destination, but a tree sync is not a

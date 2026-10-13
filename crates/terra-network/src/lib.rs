@@ -7,9 +7,11 @@ pub mod config;
 mod frames;
 mod mux;
 mod server;
+mod sockets;
 
 pub use client::{Client, TcpDownload, TcpFlow, TcpUpload, UdpFlow};
-pub use server::Broker;
+pub use server::{Broker, bind_listeners};
+pub use sockets::{OutboundSockets, SocketSource};
 
 pub use terra_protocol::network::{Error, ListenerGrant, ResourceKind};
 
