@@ -13,8 +13,9 @@ pub(super) async fn run(
     let component = artifacts.boot.deserialize(engine)?;
     let runtime = BoxRuntime::new(engine, BoxHost::new())?;
     for architecture in [Architecture::X86, Architecture::Arm] {
-        let layout = build_machine_layout_for(architecture, 8 << 20, 1, 0)
-            .map_err(|error| wasmtime::Error::msg(format!("boot self-test layout: {error:?}")))?;
+        let layout = build_machine_layout_for(architecture, 8 << 20, 1, 0).map_err(|error| {
+            wasmtime::Error::msg(format!("boot device suite layout: {error:?}"))
+        })?;
         let config = layout.to_machine_config(1)?;
         let ram_base = match architecture {
             Architecture::X86 => terra_limits::X86_RAM_BASE,
@@ -22,7 +23,7 @@ pub(super) async fn run(
         };
         let ram = GuestRam::from_memory(
             GuestMemory::from_ranges(&[(ram_base, usize::try_from(config.ram_bytes())?)])
-                .ok_or_else(|| wasmtime::Error::msg("boot self-test RAM allocation"))?,
+                .ok_or_else(|| wasmtime::Error::msg("boot device suite RAM allocation"))?,
         );
         let kernel = kernel_image(architecture);
         let entry = runtime
@@ -34,24 +35,24 @@ pub(super) async fn run(
         };
         wasmtime::ensure!(
             super::read_memory(&ram, entry.entry + payload_offset, 4)? == [42; 4],
-            "boot self-test kernel payload was not staged"
+            "boot device suite kernel payload was not staged"
         );
         let boot_data = super::read_memory(&ram, entry.boot_argument, 4096)?;
         match architecture {
             Architecture::X86 => wasmtime::ensure!(
                 boot_data[0x202..0x206] == 0x5372_6448_u32.to_le_bytes(),
-                "boot self-test x86 zero page is missing"
+                "boot device suite x86 zero page is missing"
             ),
             Architecture::Arm => {
                 wasmtime::ensure!(
                     boot_data.starts_with(&0xd00d_feed_u32.to_be_bytes()),
-                    "boot self-test ARM device tree is missing"
+                    "boot device suite ARM device tree is missing"
                 );
                 wasmtime::ensure!(
                     !boot_data
                         .windows(b"virtio_mmio.device=".len())
                         .any(|bytes| bytes == b"virtio_mmio.device="),
-                    "boot self-test ARM command line duplicates device tree MMIO devices"
+                    "boot device suite ARM command line duplicates device tree MMIO devices"
                 );
             }
         }
@@ -60,7 +61,7 @@ pub(super) async fn run(
                 .boot_prepared_machine(&component, &config, ram, vec![0; 64], "")
                 .await
                 .is_err(),
-            "boot self-test accepted a malformed kernel"
+            "boot device suite accepted a malformed kernel"
         );
     }
     Ok(())

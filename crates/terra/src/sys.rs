@@ -24,9 +24,9 @@ pub use imp::{
     restrict_new_files, set_open_file_mode, terminate_process, try_lock_run,
 };
 pub use terra_platform::filesystem::{open_regular_file, set_owner_only};
-pub use terra_platform::process::{
-    VmChildGuard, attach_vm_child, kill_vm_child, supervise_vm_child,
-};
+#[cfg(unix)]
+pub use terra_platform::process::supervise_vm_child;
+pub use terra_platform::process::{VmChildGuard, attach_vm_child, kill_vm_child};
 
 pub fn register_stop_channel(channel: terra_platform::local_socket::LocalStream) {
     #[cfg(unix)]

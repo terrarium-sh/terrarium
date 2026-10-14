@@ -12,7 +12,7 @@ use terra_runtime::component::context::DeviceContext;
 use terra_runtime::component::fs::{FsHost, ShareGrant};
 use terra_runtime::engine::device_engine;
 use terra_runtime::memory::{BoundedMemory, GuestRam};
-use terra_runtime::self_test::virtio;
+use terra_runtime::test_support::virtio;
 use wasmtime::component::Component;
 
 const REQUEST_QUEUE: u32 = 1;

@@ -1,2 +1,2 @@
 kernel/patches/*.patch -whitespace
-crates/terra/src/cmd/self_test/scripts/*.sh text eol=lf
+crates/terra/tests/guest_suite/scripts/*.sh text eol=lf

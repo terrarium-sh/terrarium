@@ -15,9 +15,9 @@ use std::time::Duration;
 
 const BWRAP: &[u8] = include_bytes!(env!("TERRA_BWRAP_BIN"));
 static EMBEDDED_BWRAP: OnceLock<std::result::Result<OwnedFd, String>> = OnceLock::new();
-const SECCOMP_FD: RawFd = 5;
+/// One descriptor per seccomp filter Bubblewrap installs before executing the worker.
+const SECCOMP_FDS: [RawFd; 2] = [10, 5];
 const INFO_FD: RawFd = 6;
-const WORKER_FLOOR_FD: RawFd = 10;
 
 pub struct Confinement {
     inherited_files: Vec<File>,
@@ -63,11 +63,19 @@ pub fn embedded_command() -> Result<Command> {
 }
 
 pub fn prepare_launch(launch: Launch<'_>) -> Result<PreparedLaunch> {
+    let filter = seccomp::role_filter(launch.role);
+    prepare_launch_with_filters(launch, &[filter])
+}
+
+/// `filters` replace the role's built-in filters; tests confine probes that are not terra.
+pub(super) fn prepare_launch_with_filters(
+    launch: Launch<'_>,
+    filters: &[&[u8]],
+) -> Result<PreparedLaunch> {
     let Launch {
         role,
         command,
         mut grants,
-        policy,
         staging_directory: _,
     } = launch;
     let executable = Path::new(command.get_program());
@@ -113,16 +121,15 @@ pub fn prepare_launch(launch: Launch<'_>) -> Result<PreparedLaunch> {
     grants.sort_by_key(|grant| grant.path.components().count());
     append_mounts(&mut cmd, grants)?;
     let mut inherited_files = Vec::new();
-    let worker_floor = match role {
-        Role::Supervisor => None,
-        Role::Vm => Some(super::builtin_policy::VM),
-        Role::Network => Some(super::builtin_policy::NETWORK),
-    };
-    for (descriptor, policy) in [(WORKER_FLOOR_FD, worker_floor), (SECCOMP_FD, policy)] {
-        let Some(policy) = policy else { continue };
-        seccomp::validate_bpf(policy)?;
-        let mut file = tempfile::tempfile().context("opening private seccomp policy")?;
-        file.write_all(policy)?;
+    ensure!(
+        filters.len() <= SECCOMP_FDS.len(),
+        "at most {} seccomp filters fit a sandbox launch",
+        SECCOMP_FDS.len()
+    );
+    for (descriptor, filter) in SECCOMP_FDS.into_iter().zip(filters) {
+        seccomp::validate_bpf(filter)?;
+        let mut file = tempfile::tempfile().context("opening private seccomp filter")?;
+        file.write_all(filter)?;
         file.rewind()?;
         let inherited = terra_platform::process::pass_descriptor(&mut cmd, &file, descriptor)?;
         inherited_files.push(inherited);
@@ -142,10 +149,10 @@ pub fn prepare_launch(launch: Launch<'_>) -> Result<PreparedLaunch> {
         .args(command.get_args());
     Ok(PreparedLaunch {
         command: cmd,
-        confinement: Some(Confinement {
+        confinement: Confinement {
             inherited_files,
             identity: File::from(reader),
-        }),
+        },
     })
 }
 
@@ -334,13 +341,18 @@ mod tests {
         let mut child = Grant::new(&nested, Access::ReadOnly);
         child.directory =
             Some(terra_platform::filesystem::share::open_share_root(&nested).unwrap());
-        let launch = prepare_launch(Launch {
-            role: Role::Vm,
-            command,
-            grants: vec![child, parent, Grant::new(&recipe, Access::ReadOnly)],
-            policy: Some(super::super::builtin_policy::SUPERVISOR),
-            staging_directory: &std::env::temp_dir(),
-        })
+        let launch = prepare_launch_with_filters(
+            Launch {
+                role: Role::Vm,
+                command,
+                grants: vec![child, parent, Grant::new(&recipe, Access::ReadOnly)],
+                staging_directory: &std::env::temp_dir(),
+            },
+            &[
+                super::super::builtin_policy::VM_ROLE_FILTER,
+                super::super::builtin_policy::SUPERVISOR_ROLE_FILTER,
+            ],
+        )
         .unwrap();
         let args = launch
             .command
@@ -366,14 +378,12 @@ mod tests {
             })
             .unwrap();
         assert!(parent < child && child < metadata);
-        assert!(
-            args.windows(2)
-                .any(|args| args == ["--add-seccomp-fd", "5"])
-        );
-        assert!(
-            args.windows(2)
-                .any(|args| args == ["--add-seccomp-fd", "10"])
-        );
+        for descriptor in ["10", "5"] {
+            assert!(
+                args.windows(2)
+                    .any(|args| args == ["--add-seccomp-fd", descriptor])
+            );
+        }
         assert!(args.windows(2).any(|args| args == ["--info-fd", "6"]));
         assert!(args.iter().any(|arg| arg == "--unshare-pid"));
         assert!(!args.iter().any(|arg| arg == "--new-session"));
@@ -407,7 +417,6 @@ mod tests {
             role: Role::Network,
             command,
             grants,
-            policy: None,
             staging_directory: &std::env::temp_dir(),
         })
         .unwrap();
@@ -497,10 +506,10 @@ mod tests {
         command.arg("5");
         let launch = PreparedLaunch {
             command,
-            confinement: Some(Confinement {
+            confinement: Confinement {
                 inherited_files: Vec::new(),
                 identity: tempfile::tempfile().unwrap(),
-            }),
+            },
         };
         let started = std::time::Instant::now();
         assert!(launch.spawn(Duration::from_secs(1)).is_err());
@@ -571,13 +580,15 @@ mod tests {
             let mut grants = super::super::role_grants(role);
             grants.push(Grant::new(&probe, Access::ReadOnly));
             grants.push(Grant::new(&host_sockets, Access::ReadOnly));
-            let mut launch = prepare_launch(Launch {
-                role,
-                command,
-                grants,
-                policy: None,
-                staging_directory: &std::env::temp_dir(),
-            })?;
+            let mut launch = prepare_launch_with_filters(
+                Launch {
+                    role,
+                    command,
+                    grants,
+                    staging_directory: &std::env::temp_dir(),
+                },
+                &[seccomp::role_filter(role)],
+            )?;
             launch.command.stdin(Stdio::null());
             let inherited = terra_platform::process::pass_descriptor(
                 &mut launch.command,
@@ -702,21 +713,23 @@ mod tests {
         let mut share_grant = Grant::new(&share, Access::ReadOnly);
         share_grant.directory =
             Some(terra_platform::filesystem::share::open_share_root(&share).unwrap());
-        let mut launch = prepare_launch(Launch {
-            role: Role::Network,
-            command,
-            grants: vec![
-                Grant::new(&probe, Access::ReadOnly),
-                Grant::new(&box_dir, Access::ReadWrite),
-                share_grant,
-                Grant::new(&recipe, Access::ReadOnly),
-                Grant::new(&pinned_paths, Access::ReadOnly),
-                Grant::new(&host_pid, Access::ReadOnly),
-                Grant::new("/dev/kvm", Access::Device),
-            ],
-            policy: Some(&filter),
-            staging_directory: &std::env::temp_dir(),
-        })
+        let mut launch = prepare_launch_with_filters(
+            Launch {
+                role: Role::Network,
+                command,
+                grants: vec![
+                    Grant::new(&probe, Access::ReadOnly),
+                    Grant::new(&box_dir, Access::ReadWrite),
+                    share_grant,
+                    Grant::new(&recipe, Access::ReadOnly),
+                    Grant::new(&pinned_paths, Access::ReadOnly),
+                    Grant::new(&host_pid, Access::ReadOnly),
+                    Grant::new("/dev/kvm", Access::Device),
+                ],
+                staging_directory: &std::env::temp_dir(),
+            },
+            &[super::super::builtin_policy::NETWORK_ROLE_FILTER, &filter],
+        )
         .unwrap();
         launch
             .command

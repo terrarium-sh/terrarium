@@ -214,6 +214,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "capstone"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f442ae0f2f3f1b923334b4a5386c95c69c1cfa072bafa23d6fae6d9682eb1dd4"
+dependencies = [
+ "capstone-sys",
+ "static_assertions",
+]
+
+[[package]]
+name = "capstone-sys"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4e8087cab6731295f5a2a2bd82989ba4f41d3a428aab2e7c98d8f4db38aac05"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "cc"
 version = "1.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1948,12 +1967,10 @@ dependencies = [
  "log",
  "notify",
  "rustix",
- "seccompiler",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "socket2",
- "syscalls",
  "sysinfo",
  "tempfile",
  "terra-build",
@@ -1994,7 +2011,9 @@ dependencies = [
 name = "terra-build"
 version = "0.0.1"
 dependencies = [
+ "serde_json",
  "syscalls",
+ "tempfile",
 ]
 
 [[package]]
@@ -2102,9 +2121,12 @@ name = "terra-sandbox"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "capstone",
+ "clap",
  "libc",
  "linux-raw-sys",
  "log",
+ "object",
  "rustix",
  "seccompiler",
  "serde",

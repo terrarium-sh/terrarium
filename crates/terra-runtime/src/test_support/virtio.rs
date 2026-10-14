@@ -1,4 +1,4 @@
-//! Guest-driver side of the virtio-MMIO handshake that self-tests play against devices.
+//! Guest-driver side of the virtio-MMIO handshake that device suites play against devices.
 
 pub use crate::component::mmio::QUEUE_NOTIFY;
 

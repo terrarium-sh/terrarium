@@ -33,25 +33,12 @@ impl Share {
         access: AccessMode,
     ) -> Result<Self> {
         let ram = GuestRam::new(64 * 1024)
-            .ok_or_else(|| wasmtime::Error::msg("filesystem self-test RAM allocation"))?;
+            .ok_or_else(|| wasmtime::Error::msg("filesystem device suite RAM allocation"))?;
         let component = artifacts.fs.deserialize(engine)?;
-        #[cfg(windows)]
-        let grant = if terra_platform::process::sandbox_env::is_vm_worker() {
-            let name = if access.is_read_only() {
-                "TERRA_WINDOWS_SELF_TEST_READONLY_ID"
-            } else {
-                "TERRA_WINDOWS_SELF_TEST_WRITABLE_ID"
-            };
-            let identity = std::env::var(name)?.parse()?;
-            ShareGrant::new_host_granted(directory, access, identity)
-        } else {
-            ShareGrant::new(&directory.canonicalize()?, access)
-        };
-        #[cfg(not(windows))]
         let grant = ShareGrant::new(&directory.canonicalize()?, access);
         let grant = grant.map_err(|error| {
             wasmtime::Error::from(error).context(format!(
-                "opening filesystem self-test share {}",
+                "opening filesystem device suite share {}",
                 directory.display()
             ))
         })?;
@@ -62,7 +49,7 @@ impl Share {
             &mut runtime,
             host,
             &component,
-            "self_test",
+            "device_suite",
             128,
             Arc::new(|_| Ok(())),
         )?;
@@ -321,7 +308,7 @@ async fn exercise_file_io(share: &mut Share, directory: &Path) -> Result<(u64, u
     let created = share.request(35, 1, &create_body(b"file\0"), 0).await?;
     let node = read_u64(&created, 16)?;
     let handle = read_u64(&created, 144)?;
-    let payload = b"filesystem self-test writes through WASI";
+    let payload = b"filesystem device suite writes through WASI";
     let mut write = file_io_body(handle, 0, u32::try_from(payload.len())?);
     write.extend_from_slice(payload);
     let written = share.request(16, node, &write, 0).await?;

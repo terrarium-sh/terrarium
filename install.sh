@@ -1,8 +1,7 @@
 #!/bin/sh
 # Installs the latest terra release (or TERRA_VERSION=x.y.z), verifying its
 # release checksum before anything is put in place. When GitHub CLI is present,
-# it verifies the release attestation too. On Linux it also installs the
-# release's matching seccomp policy bundle at ~/.terra/config/seccomp.
+# it verifies the release attestation too.
 set -eu
 
 prerelease=no
@@ -30,15 +29,12 @@ if [ "$os" = Darwin ] && [ -d /opt/homebrew/bin ]; then
   bin=/opt/homebrew/bin
 fi
 
-policy_target=
 case "$os/$arch" in
   Linux/x86_64)
     asset=terra-x86_64-linux
-    policy_target=x86_64-unknown-linux-musl
     ;;
   Linux/aarch64 | Linux/arm64)
     asset=terra-aarch64-linux
-    policy_target=aarch64-unknown-linux-musl
     ;;
   Darwin/arm64)
     asset=terra-aarch64-macos
@@ -79,10 +75,6 @@ fi
 curl -fsSL --proto '=https' --tlsv1.2 "$base/SHA256SUMS" -o "$tmp/SHA256SUMS"
 gh=$(command -v gh || true)
 
-is_released() {
-  awk -v a="$1" '$2 == a { found = 1 } END { exit !found }' "$tmp/SHA256SUMS"
-}
-
 fetch_verified() {
   curl -fsSL --proto '=https' --tlsv1.2 "$base/$1" -o "$tmp/$1"
   # The checksum comes from the same release ref as the archive, so a tampered
@@ -112,19 +104,6 @@ fetch_verified() {
 
 archive="$asset.tar.gz"
 fetch_verified "$archive"
-# Terra loads ~/.terra/config/seccomp without checking which executable it was
-# built for, so a bundle left from another release would stay in force.
-policy=
-if [ -n "$policy_target" ] && is_released "terra-seccomp-$policy_target.tar.gz"; then
-  fetch_verified "terra-seccomp-$policy_target.tar.gz"
-  mkdir "$tmp/policy"
-  tar -xzf "$tmp/terra-seccomp-$policy_target.tar.gz" -C "$tmp/policy"
-  if ! [ -f "$tmp/policy/manifest.json" ]; then
-    echo "terrarium: terra-seccomp-$policy_target.tar.gz does not contain a policy manifest" >&2
-    exit 1
-  fi
-  policy="$tmp/policy"
-fi
 if [ -z "$gh" ]; then
   echo "terrarium: GitHub CLI is unavailable; checksum verified but attestation was not" >&2
 fi
@@ -165,21 +144,3 @@ else
   esac
 fi
 echo "installed terra at $bin/terra"
-
-if [ -n "$policy_target" ]; then
-  config="$HOME/.terra/config"
-  (umask 077 && mkdir -p "$config")
-  if [ -n "$policy" ]; then
-    rm -rf "$config/.seccomp.new" "$config/seccomp.previous"
-    cp -R "$policy" "$config/.seccomp.new"
-    if [ -e "$config/seccomp" ]; then
-      mv "$config/seccomp" "$config/seccomp.previous"
-    fi
-    mv "$config/.seccomp.new" "$config/seccomp"
-    echo "installed the matching seccomp policy at $config/seccomp"
-  elif [ -e "$config/seccomp" ]; then
-    rm -rf "$config/seccomp.previous"
-    mv "$config/seccomp" "$config/seccomp.previous"
-    echo "terrarium: this release has no seccomp policy; moved the old one to $config/seccomp.previous" >&2
-  fi
-fi

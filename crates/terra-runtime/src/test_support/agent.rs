@@ -21,7 +21,7 @@ struct GuestTransport {
 fn field<const N: usize>(bytes: &[u8], offset: usize) -> wasmtime::Result<[u8; N]> {
     bytes
         .get(offset..offset + N)
-        .ok_or_else(|| wasmtime::Error::msg("short agent self-test frame"))?
+        .ok_or_else(|| wasmtime::Error::msg("short agent device suite frame"))?
         .try_into()
         .map_err(wasmtime::Error::from)
 }
@@ -40,7 +40,7 @@ impl GuestTransport {
         self.endpoint
             .write_all(self.connection_number, bytes)
             .await
-            .map_err(|error| wasmtime::Error::msg(format!("agent self-test write: {error:?}")))
+            .map_err(|error| wasmtime::Error::msg(format!("agent device suite write: {error:?}")))
     }
 
     async fn receive_packets(&mut self) -> wasmtime::Result<()> {
@@ -49,7 +49,7 @@ impl GuestTransport {
                 .endpoint
                 .try_read(self.connection_number, 16384)
                 .map_err(|error| {
-                    wasmtime::Error::msg(format!("agent self-test read: {error:?}"))
+                    wasmtime::Error::msg(format!("agent device suite read: {error:?}"))
                 })?;
             if bytes.is_empty() {
                 break;
@@ -67,7 +67,7 @@ impl GuestTransport {
             };
             wasmtime::ensure!(
                 length <= terra_protocol::mux::MAX_STREAM_FRAME_BYTES,
-                "agent self-test Yamux frame limit"
+                "agent device suite Yamux frame limit"
             );
             let end = YAMUX_HEADER_BYTES + length;
             if self.carrier_bytes.len() < end {
@@ -88,7 +88,7 @@ impl GuestTransport {
                     self.send_bytes(&yamux_frame(1, 2, stream, &[])?).await?;
                 }
             }
-            wasmtime::ensure!(kind != 3, "agent self-test peer sent GoAway");
+            wasmtime::ensure!(kind != 3, "agent device suite peer sent GoAway");
         }
         Ok(())
     }
@@ -133,26 +133,26 @@ pub(super) async fn run(
 ) -> wasmtime::Result<()> {
     let client_directory = directory.to_owned();
     let clients = std::thread::spawn(move || run_clients(&client_directory));
-    let result = run_with_external_clients(artifacts, engine, directory, None).await;
+    let result = run_with_clients(artifacts, engine, directory).await;
     let served = clients
         .join()
-        .map_err(|_| wasmtime::Error::msg("agent self-test clients failed"))?;
+        .map_err(|_| wasmtime::Error::msg("agent device suite clients failed"))?;
     result?;
     served
 }
 
-pub(super) fn run_clients(directory: &Path) -> wasmtime::Result<()> {
+fn run_clients(directory: &Path) -> wasmtime::Result<()> {
     let mut control = connect_client(&directory.join("agent-control.sock"))?;
     let mut client = connect_client(&directory.join("agent-agent.sock"))?;
     client.write_all(b"guestless input")?;
     let mut output = [0; b"guestless output".len()];
     client.set_read_timeout(Some(super::FIXTURE_STARTUP_WAIT))?;
     client.read_exact(&mut output).map_err(|error| {
-        wasmtime::Error::msg(format!("agent self-test startup response: {error}"))
+        wasmtime::Error::msg(format!("agent device suite startup response: {error}"))
     })?;
     wasmtime::ensure!(
         &output == b"guestless output",
-        "agent self-test local output"
+        "agent device suite local output"
     );
     control.write_all(&[terra_protocol::STOP_SIGNAL])?;
     Ok(())
@@ -166,7 +166,7 @@ fn connect_client(path: &Path) -> wasmtime::Result<LocalStream> {
             Err(error) => {
                 wasmtime::ensure!(
                     Instant::now() < deadline,
-                    "agent self-test client connection: {error}"
+                    "agent device suite client connection: {error}"
                 );
                 std::thread::sleep(Duration::from_millis(5));
             }
@@ -177,22 +177,13 @@ fn connect_client(path: &Path) -> wasmtime::Result<LocalStream> {
     Ok(client)
 }
 
-pub(super) async fn run_with_external_clients(
+async fn run_with_clients(
     artifacts: &crate::TrustedArtifacts,
     engine: &wasmtime::Engine,
     directory: &Path,
-    listeners: Option<super::AgentListeners>,
 ) -> wasmtime::Result<()> {
-    let super::AgentListeners {
-        control: control_listener,
-        agent: listener,
-    } = match listeners {
-        Some(listeners) => listeners,
-        None => super::AgentListeners {
-            control: LocalListener::bind(directory.join("agent-control.sock"))?,
-            agent: LocalListener::bind(directory.join("agent-agent.sock"))?,
-        },
-    };
+    let control_listener = LocalListener::bind(directory.join("agent-control.sock"))?;
+    let listener = LocalListener::bind(directory.join("agent-agent.sock"))?;
     control_listener.set_nonblocking(true)?;
     let control_grant = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
@@ -207,12 +198,12 @@ pub(super) async fn run_with_external_clients(
     })
     .await
     .map_err(|error| {
-        wasmtime::Error::from(error).context("agent self-test control client admission")
+        wasmtime::Error::from(error).context("agent device suite control client admission")
     })??;
     drop(control_listener);
     let (mut peer, endpoint) = StreamEndpoint::pair();
     peer.connect(1)
-        .map_err(|error| wasmtime::Error::msg(format!("agent self-test connect: {error:?}")))?;
+        .map_err(|error| wasmtime::Error::msg(format!("agent device suite connect: {error:?}")))?;
     let mut runtime = BoxRuntime::new(engine, BoxHost::new())?;
     let _agent = Agent::from_trusted_artifact(
         &mut runtime,
@@ -272,7 +263,7 @@ async fn exercise_transport(guest: &mut GuestTransport) -> wasmtime::Result<()> 
     let decoded = envelope.plan;
     wasmtime::ensure!(
         decoded.host_time.is_some() && decoded.host_seed.is_some(),
-        "agent self-test host plan enrichment"
+        "agent device suite host plan enrichment"
     );
     guest
         .send_control(&terra_protocol::encode_frame(
@@ -280,7 +271,10 @@ async fn exercise_transport(guest: &mut GuestTransport) -> wasmtime::Result<()> 
         )?)
         .await?;
     let input = guest.read_stream_bytes(2, b"guestless input".len()).await?;
-    wasmtime::ensure!(input == b"guestless input", "agent self-test local input");
+    wasmtime::ensure!(
+        input == b"guestless input",
+        "agent device suite local input"
+    );
     guest
         .send_bytes(&yamux_frame(0, 0, 2, b"guestless output")?)
         .await?;
@@ -291,7 +285,7 @@ async fn exercise_transport(guest: &mut GuestTransport) -> wasmtime::Result<()> 
         }
         wasmtime::ensure!(
             command == terra_protocol::CLOCK_SYNC,
-            "unexpected self-test control command"
+            "unexpected device suite control command"
         );
         let mut update = vec![command];
         update.extend(
@@ -301,7 +295,7 @@ async fn exercise_transport(guest: &mut GuestTransport) -> wasmtime::Result<()> 
         );
         wasmtime::ensure!(
             terra_protocol::decode_clock_sync(&update).is_some(),
-            "self-test clock update"
+            "device suite clock update"
         );
     }
     Ok(())

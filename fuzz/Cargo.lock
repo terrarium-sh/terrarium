@@ -1735,12 +1735,10 @@ dependencies = [
  "libc",
  "log",
  "rustix",
- "seccompiler",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "socket2",
- "syscalls",
  "tempfile",
  "terra-build",
  "terra-limits",
@@ -1775,6 +1773,7 @@ dependencies = [
 name = "terra-build"
 version = "0.0.1"
 dependencies = [
+ "serde_json",
  "syscalls",
 ]
 

@@ -2,7 +2,7 @@
 
 mod policy;
 
-use super::{Access, Grant, Launch, PolicyBundle, PreparedLaunch, Role};
+use super::{Access, Grant, Launch, PreparedLaunch, Role};
 use anyhow::{Context, Result, ensure};
 use sha2::{Digest as _, Sha256};
 use std::fmt::Write as _;
@@ -60,7 +60,6 @@ pub fn prepare_launch(launch: Launch<'_>) -> Result<PreparedLaunch> {
         role,
         command,
         grants,
-        policy: _,
         staging_directory,
     } = launch;
     ensure!(
@@ -128,11 +127,11 @@ pub fn prepare_launch(launch: Launch<'_>) -> Result<PreparedLaunch> {
     )?;
     Ok(PreparedLaunch {
         command: worker_command,
-        confinement: Some(Confinement {
+        confinement: Confinement {
             bundle,
             inherited,
             activation,
-        }),
+        },
     })
 }
 
@@ -188,16 +187,8 @@ fn build_identifier(role: Role, executable: &Path, entitlements: &str) -> Result
     Ok(identifier)
 }
 
-pub fn resolve_policy(policy: Option<&Path>) -> Result<PolicyBundle> {
-    ensure!(
-        policy.is_none(),
-        "macOS uses its built-in App Sandbox role policies; remove vm.sandbox.policy (seccomp bundles are Linux-only)"
-    );
-    PolicyBundle::try_from_roles(|_| Ok(Vec::new()))
-}
-
 /// The macOS supervisor stays unsandboxed; each worker's signed entitlements carry its authority.
-pub fn install_policy(_policy: &[u8]) -> Result<()> {
+pub fn restrict_role(_role: Role) -> Result<()> {
     Ok(())
 }
 
@@ -278,13 +269,6 @@ mod tests {
     use std::os::fd::FromRawFd;
     use std::os::unix::net::{UnixDatagram, UnixListener};
     use std::process::Stdio;
-
-    /// An ignored override would leave the operator believing a custom policy applies.
-    #[test]
-    fn policy_override_is_a_configuration_error() {
-        assert!(resolve_policy(Some(Path::new("seccomp"))).is_err());
-        assert!(resolve_policy(None).is_ok());
-    }
 
     const TEST_ENDPOINT: &str = "TERRA_MACOS_TEST_ENDPOINT";
     const TEST_METADATA: &str = "TERRA_MACOS_TEST_METADATA";
@@ -475,7 +459,6 @@ mod tests {
                 role,
                 command,
                 grants,
-                policy: None,
                 staging_directory: &state,
             })?;
             launch.command.stdout(Stdio::piped()).stderr(Stdio::piped());

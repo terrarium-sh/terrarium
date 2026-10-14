@@ -1,7 +1,16 @@
-pub(super) const SUPERVISOR: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/supervisor-seccomp.bpf"));
-pub(super) const VM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/vm-seccomp.bpf"));
-pub(super) const NETWORK: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/network-seccomp.bpf"));
+pub(super) const SUPERVISOR_ROLE_FILTER: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/supervisor-role-filter.bpf"));
+pub(super) const VM_ROLE_FILTER: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/vm-role-filter.bpf"));
+pub(super) const NETWORK_ROLE_FILTER: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/network-role-filter.bpf"));
+/// Empty for a target without a checked-in policy, such as a glibc development build.
+pub(super) const SUPERVISOR_ALLOWLIST: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/supervisor-allowlist.bpf"));
+pub(super) const VM_ALLOWLIST: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/vm-allowlist.bpf"));
+pub(super) const NETWORK_ALLOWLIST: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/network-allowlist.bpf"));
 
 #[cfg(all(test, any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod tests {
@@ -13,7 +22,7 @@ mod tests {
     const TIOCLINUX: u32 = 0x541c;
 
     #[test]
-    fn embedded_filter_matches_native_denylist() {
+    fn supervisor_role_filter_matches_native_rules() {
         #[cfg(target_arch = "x86_64")]
         let audit_arch = 0xc000_003e;
         #[cfg(target_arch = "aarch64")]
@@ -73,7 +82,7 @@ mod tests {
             (load_word, 0, 0, 0),
         ]);
         expected.push((return_value, 0, 0, libc::SECCOMP_RET_ALLOW));
-        let actual: Vec<_> = super::super::seccomp::decode_bpf(SUPERVISOR)
+        let actual: Vec<_> = super::super::seccomp::decode_bpf(SUPERVISOR_ROLE_FILTER)
             .unwrap()
             .iter()
             .map(|filter| (filter.code, filter.jt, filter.jf, filter.k))
@@ -116,6 +125,68 @@ mod tests {
         install_and_probe();
     }
 
+    /// A compiled allowlist kills the process on any unlisted syscall or `ioctl` request; listed
+    /// calls reach the kernel and fail on their own merits.
+    #[allow(unsafe_code)]
+    #[test]
+    fn compiled_allowlist_kills_unlisted_syscalls_and_ioctl_requests() {
+        use std::os::unix::process::ExitStatusExt as _;
+        const CHILD: &str = "TERRA_ALLOWLIST_TEST_CHILD";
+        let Ok(mode) = std::env::var(CHILD) else {
+            for (mode, signal) in [
+                ("listed", None),
+                ("unlisted", Some(libc::SIGSYS)),
+                ("request", Some(libc::SIGSYS)),
+            ] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "linux::builtin_policy::tests::compiled_allowlist_kills_unlisted_syscalls_and_ioctl_requests",
+                    ])
+                    .env(CHILD, mode)
+                    .output()
+                    .unwrap();
+                assert_eq!(output.status.signal(), signal, "{mode}: {output:?}");
+                if signal.is_none() {
+                    assert!(output.status.success(), "{mode}: {output:?}");
+                }
+            }
+            return;
+        };
+        let policy = terra_build::seccomp_policy::RolePolicy {
+            syscalls: ["exit", "exit_group", "futex", "getpid", "ioctl"]
+                .map(str::to_owned)
+                .into(),
+            ioctls: [u32::try_from(libc::FIONBIO).unwrap()].into(),
+        };
+        let architecture =
+            terra_build::seccomp::Architecture::from_target(std::env::consts::ARCH, "little")
+                .unwrap();
+        let allowlist = terra_build::seccomp::compile_allowlist(architecture, &policy).unwrap();
+        super::super::seccomp::install_filters(&[&allowlist]).unwrap();
+        // SAFETY: getpid takes no pointers; the invalid descriptor keeps each ioctl from
+        // dereferencing its argument, and _exit ends the process before any unlisted call.
+        unsafe {
+            assert!(libc::syscall(libc::SYS_getpid) > 0);
+            match mode.as_str() {
+                "listed" => {
+                    assert_eq!(libc::ioctl(-1, libc::FIONBIO, 0), -1);
+                    if *libc::__errno_location() != libc::EBADF {
+                        libc::_exit(2);
+                    }
+                }
+                "unlisted" => {
+                    libc::syscall(libc::SYS_getppid);
+                }
+                "request" => {
+                    libc::ioctl(-1, libc::TIOCGWINSZ, 0);
+                }
+                mode => panic!("invalid allowlist test mode: {mode}"),
+            }
+            libc::_exit(0);
+        }
+    }
+
     #[test]
     fn worker_filters_separate_native_network_and_virtualization_authority() {
         const CHILD: &str = "TERRA_ROLE_BUILTIN_TEST_CHILD";
@@ -139,11 +210,11 @@ mod tests {
             return;
         };
         let filter = match role.as_str() {
-            "vm" => VM,
-            "network" => NETWORK,
+            "vm" => VM_ROLE_FILTER,
+            "network" => NETWORK_ROLE_FILTER,
             role => panic!("invalid built-in role: {role}"),
         };
-        super::super::seccomp::install_policy(filter).unwrap();
+        super::super::seccomp::install_filters(&[filter]).unwrap();
         std::os::unix::net::UnixStream::pair().unwrap();
         probe_preserved_worker_lifetime();
         probe_denied_terminal_injection();
@@ -261,7 +332,7 @@ mod tests {
 
     #[allow(unsafe_code)]
     fn install_and_probe() {
-        super::super::seccomp::install_policy(SUPERVISOR).unwrap();
+        super::super::seccomp::install_filters(&[SUPERVISOR_ROLE_FILTER]).unwrap();
         // SAFETY: these syscalls take no pointers.
         unsafe {
             assert!(libc::syscall(libc::SYS_getpid) > 0);

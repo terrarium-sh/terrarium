@@ -114,13 +114,12 @@ Device reset disconnects every connection; losing the broker or network control
 retires networking while agent control stays available. The
 [network transport](../README.dev.md#network-transport) defines these streams.
 
-The default [host VM launcher](vm-launchers.md) runs the VM and the broker as
-separately confined processes; [host process sandboxing](sandboxing.md)
-describes each role, its grants and its filters. Without a generated policy
-bundle, the built-in filters allow broader syscall access within the
-same namespace and filesystem boundaries; `install.sh` installs the release
-bundle. Direct and custom launchers are trusted host code with their own
-boundaries; a successful launch does not establish confinement.
+Terra always runs the VM and the broker as separately confined processes;
+[host process sandboxing](sandboxing.md) describes each role, its grants and
+its filters. Linux builds compile in a syscall allowlist per role, generated
+from that role's code ([host sandbox policy](sandbox-policy.md)); a glibc
+development build has none and keeps the role filters, which allow broader
+syscall access within the same namespace and filesystem boundaries.
 
 Components inherit no host environment, arguments or standard streams. Devices
 can read and corrupt their own VM's RAM: component isolation protects the host
@@ -165,7 +164,7 @@ Running Terra as host root expands the impact of a boundary failure.
 
 ### Network policy limits
 
-In the default sandboxed launch, the broker enforces recipe network rules even if
+Because every launch is sandboxed, the broker enforces recipe network rules even if
 the VM process is compromised, because the VM worker has no host network access.
 Broker requests are untrusted, bounded, and validated independently. Only
 broker-controlled resolution establishes learned address grants. TCP
@@ -181,8 +180,7 @@ The broker's native policy engine is trusted code. A native broker compromise
 can bypass its in-process destination rules and use networking allowed by its OS
 sandbox. Host-loopback and LAN services may expose privileged APIs or their own
 vulnerabilities. Independent host network controls can further restrict broker
-authority. Direct launches and custom launchers without equivalent isolation
-also allow native VM code to bypass component-level policy using host sockets.
+authority.
 
 ## Outside the boundary
 

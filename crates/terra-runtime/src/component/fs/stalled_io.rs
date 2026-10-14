@@ -21,7 +21,7 @@ use crate::component::relay::ByteStream;
 use crate::component::{AccessMode, MmioDevice};
 use crate::engine::device_engine;
 use crate::memory::{BoundedMemory, GuestRam};
-use crate::self_test::virtio;
+use crate::test_support::virtio;
 
 pub(super) struct IoGate {
     operation: Operation,

@@ -27,9 +27,8 @@ precompiled Wasmtime components and, on Linux, Bubblewrap, plus license notices.
 Linux releases target static musl; ordinary Cargo commands use the native host
 target. Production loads embedded AOT components without a Wasm compiler. Run
 image-building Make targets sequentially in a shared checkout.
-The default Linux launcher can boot with its built-in minimal seccomp policy.
-To use the generated syscall and ioctl allowlist, generate a policy for the
-exact `dist/terra`; see [policy generation](#verification).
+A musl build of a target with a checked-in policy compiles in the per-role
+syscall and ioctl allowlists; see [host sandbox policy](docs/sandbox-policy.md).
 
 The guest is Alpine Linux on the host's CPU architecture. Guest images are
 built on Linux; macOS and Windows builds consume those images and compile AOT
@@ -51,7 +50,7 @@ WIT [interface symlinks](components/wit/README.md) materialized correctly.
 | `crates/terra-hypervisor` | Native VMs, vCPU threads and guest memory over KVM, Hypervisor.framework and WHP |
 | `crates/terra-platform` | Host filesystem, local-socket and child-process APIs |
 | `crates/terra-sandbox` | Host confinement of VM and broker workers: Bubblewrap and seccomp, macOS App Sandbox, Windows Less-Privileged AppContainers and jobs |
-| `crates/terra-build` | Build-script logic: fallback seccomp filters, Bubblewrap asset lookup, version string |
+| `crates/terra-build` | Build-script logic: seccomp role filters and allowlist compiler, policy file format, Bubblewrap asset lookup, version string |
 | `crates/terra-runtime` | Wasmtime stores, guest layout, scoped host capabilities, network configuration and policy contracts, and component/VM lifecycle orchestration |
 | `components` | Wasm devices and services, reusable transport code, and shared WIT interfaces |
 | `kernel`, `pins.mk` | Guest kernel configuration, integration patches, owned source overlay and pinned inputs |
@@ -60,14 +59,14 @@ WIT [interface symlinks](components/wit/README.md) materialized correctly.
 | `packaging` | Host packages, service unit and bundled licenses |
 | `web` | Project website |
 
-Host confinement lives in `crates/terra-sandbox`, with one module per platform.
-`crates/terra/src/sandbox/config.rs` selects and resolves launchers and policies.
-VM launch planning supplies explicit filesystem grants and environment values;
-the common prepared-launch API owns platform dispatch, descriptors, and host-PID handoff.
-`crates/terra/src/sandbox/policy.rs` exposes command-factory policy generation on every
-platform, backed by `sandbox/generation.rs` on Linux. Absent policies leave
-commands unchanged; requested enforcement and generation report unsupported on
-platforms without a backend. Self-test and foreground generation share this API.
+Host confinement lives in `crates/terra-sandbox`, with one module per platform;
+every launch is confined, with each role's built-in policy. VM launch planning
+supplies explicit filesystem grants and environment values; the common
+prepared-launch API owns platform dispatch, descriptors, and host-PID handoff.
+`crates/terra-sandbox/src/linux/generator` (the `seccomp-policy` tool behind
+`make policy`) derives the Linux syscall allowlists from per-role binaries,
+built from `crates/terra/examples/role-*.rs`, which call the same
+`terra::role` entry points as production.
 
 Runtime derives the fixed machine layout and asks platform to create the VM,
 RAM, disks and vCPUs. A short-lived boot component plans kernel placement;
@@ -290,8 +289,8 @@ rebuilding historical releases.
 Real HTTP/3 tests and benchmarks use a static Rust quinn/h3 fixture
 (`crates/terra/tests/assets/http3_probe`), with certificate verification and no
 TCP fallback. After `make dist`, run `make test-http3` on native Linux/KVM. This checks GET/POST
-compatibility and verified 1-MiB uploads/downloads natively and with both Terra
-launchers. For throughput:
+compatibility and verified 1-MiB uploads/downloads on the host and inside a Terra box.
+For throughput:
 
 ```sh
 python3 scripts/bench/bench-http3.py --terra dist/terra --runs 5 --mib 64 --output build/http3-benchmark/report.json
@@ -312,52 +311,29 @@ platform. Release reuses the Build workflow, adds source archives, then publishe
 after required build and check jobs pass. Security audits run on dependency changes and weekly. Kernel changes
 run tooling checks; kernel archive export is available through manual dispatch.
 
-Linux policy jobs consume the exact x86-64 and AArch64 distribution artifacts
-and run `terra self-test --generate-policy --validate-vm`. The binary traces its
-guestless host checks, compiles a policy with reviewed virtualization supplements, and checks
-both host components and the full guest suite under that policy. The policy job
-needs native KVM and Bubblewrap user namespaces; self-tests, syscall tracing,
-and classic BPF compilation are embedded in Terra, using ptrace and the Rust `seccompiler`
-and `syscalls` crates. The separate CI artifact
-verifier uses Python 3 and libseccomp to independently resolve syscall names;
-the policy job does not build source or test harnesses. Native host test jobs independently
-check the default jail and embedded fallback policy.
+Each Linux build job runs `make policy-check`, which regenerates the seccomp
+allowlists by statically scanning that architecture's role binaries and fails
+when they differ from the checked-in policy. It needs no KVM. The KVM gates then
+run the boot and guest suites against the distribution, whose compiled-in
+allowlists kill any syscall the generator missed.
 
 Releases additionally require the native host matrix (Linux x86_64/AArch64,
 macOS ARM64, Windows amd64/ARM64); optional ordinary CI jobs do not waive it.
+Set `LINUX_X64_VM_RUNNER` and `LINUX_ARM64_VM_RUNNER` repository variables to
+KVM-capable runner labels.
 
-Policy jobs may fail in ordinary Build CI but are required for releases. Set
-`LINUX_X64_VM_RUNNER` and `LINUX_ARM64_VM_RUNNER` repository variables to
-KVM-capable runner labels. A release verifies each architecture's policy against
-its exact binary and publishes it as `terra-seccomp-<target>.tar.gz` (readable
-policy, raw BPF and validation manifest), covered by `SHA256SUMS`; a missing,
-invalid or merely host-validated policy fails publication. `install.sh`
-installs the matching archive; Terra itself never downloads a policy.
-
-Run `terra self-test` for host checks without tracing or generation. For local
-policy generation without virtualization, run `terra self-test --generate-policy`.
-To reproduce
-CI's VM validation using an installed binary:
+After a change that can alter the syscalls a sandboxed role makes, including
+dependency and toolchain bumps, regenerate and review the policy:
 
 ```sh
-terra self-test --generate-policy --validate-vm --policy-output ./policy --policy-diagnostics ./policy-logs
-mkdir -p ~/.terra/config/seccomp
-cp -L ./policy/*.seccomp.json ./policy/*.seccomp.bpf ./policy/manifest.json ~/.terra/config/seccomp/
+make policy
+make TERRA_TARGET=aarch64-unknown-linux-musl policy
+git diff crates/terra-sandbox/src/linux/policy/
 ```
 
-[Policy generation](docs/vm-launchers.md#generate-a-policy-from-the-installed-binary)
-covers outputs, custom workloads and recipes. Every new feature must update the
-bundled self-tests and any guest-only coverage as required by
-[AGENTS.md](AGENTS.md).
-
-The manual [Backfill Linux policy](.github/workflows/policy-backfill.yml) workflow
-downloads and verifies an existing release's exact binary, invokes its embedded
-`self-test --generate-policy --validate-vm` command on native x86-64 and AArch64 runners, and attaches
-successful policy sets. Both architectures must pass. Binaries predating the
-self-test policy generation or lacking VM validation fail the capability check; the workflow
-does not build historical sources. The workflow uses its current verifier before
-publication and updates the release's `SHA256SUMS` after upload. A retry verifies
-an existing archive against the binary before repairing a missing checksum.
+[Host sandbox policy](docs/sandbox-policy.md) explains the analysis and what makes
+it refuse a site. New host operations also need boot-test coverage, which runs
+under the allowlists, as [AGENTS.md](AGENTS.md) requires.
 
 Two weekly workflows open pin-update PRs: `Guest pins bump` checks same-series
 kernel LTS patches, stable e2fsprogs releases, and Alpine releases with doas and

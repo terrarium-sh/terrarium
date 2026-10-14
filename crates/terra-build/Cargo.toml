@@ -7,7 +7,11 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+serde_json.workspace = true
 syscalls = { version = "0.8.1", default-features = false, features = ["x86_64", "aarch64"] }
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

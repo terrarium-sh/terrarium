@@ -11,9 +11,9 @@ pub mod engine;
 pub mod machine;
 pub mod memory;
 pub mod orchestration;
-pub mod self_test;
 
 #[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
 pub mod test_support;
 
 #[cfg(test)]

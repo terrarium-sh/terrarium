@@ -1350,7 +1350,7 @@ async fn kernel_boots_libc_dns_tcp_fallback() {
         guest: "/work".into(),
         readonly: true,
     });
-    let (backend, stop, responder) = crate::self_test::network::create_dns_fallback_backend();
+    let (backend, stop, responder) = crate::test_support::network::create_dns_fallback_backend();
     let backend_client = backend.client.clone();
     let diagnostics = tempfile::NamedTempFile::new().unwrap();
     let (kernel, boot_disk, root_path) = kernel_boot_assets();

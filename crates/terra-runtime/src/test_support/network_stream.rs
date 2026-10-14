@@ -85,7 +85,7 @@ impl GuestStream {
                     let buffered = self.bytes.entry(stream).or_default();
                     wasmtime::ensure!(
                         buffered.len() + packet.payload.len() <= receive_window(stream) as usize,
-                        "network self-test guest receive bound"
+                        "network device suite guest receive bound"
                     );
                     buffered.extend(packet.payload);
                 }
@@ -96,7 +96,7 @@ impl GuestStream {
                         .acknowledge(packet.guest_port, packet.port, 0)
                         .await?;
                 }
-                _ => wasmtime::bail!("network self-test unexpected transport operation"),
+                _ => wasmtime::bail!("network device suite unexpected transport operation"),
             }
         }
         Ok(())
@@ -153,7 +153,7 @@ impl GuestStream {
                 .map_err(|error| error.context("waiting for a vsock publication stream request"))?;
         }
         let host_port = self.requests.pop_front().ok_or_else(|| {
-            wasmtime::Error::msg("network self-test publication request vanished")
+            wasmtime::Error::msg("network device suite publication request vanished")
         })?;
         let stream = (PUBLICATION_PORT, host_port);
         let window = receive_window(stream);
@@ -268,14 +268,14 @@ impl GuestStream {
         wasmtime::ensure!(
             terra_protocol::application::HEADER_BYTES + length
                 <= terra_protocol::application::MAX_UDP_FRAME_BYTES,
-            "network self-test frame bound"
+            "network device suite frame bound"
         );
         bytes.extend(self.read_bytes(stream, length).await?);
         let mut decoder = StreamDecoder::default();
         decoder.push(&bytes)?;
         decoder
             .next(Direction::HostToGuest)?
-            .ok_or_else(|| wasmtime::Error::msg("network self-test incomplete frame"))
+            .ok_or_else(|| wasmtime::Error::msg("network device suite incomplete frame"))
     }
 
     pub(super) async fn finish_input(&mut self, stream: Stream) -> wasmtime::Result<()> {

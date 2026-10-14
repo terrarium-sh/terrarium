@@ -24,7 +24,6 @@ impl BoxFixture {
         std::fs::create_dir(&project).unwrap();
         std::fs::create_dir(&home).unwrap();
         std::fs::create_dir(home.join(".terra")).unwrap();
-        std::fs::write(home.join(".terra/config.yaml"), "vm:\n  init: direct\n").unwrap();
         Self {
             terra: std::env::var_os("TERRA_BIN")
                 .map_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_terra")), PathBuf::from),
@@ -837,11 +836,6 @@ fn windows_ports_available(tcp_port: u16, udp_port: u16) -> bool {
 fn windows_broker_and_supervisor_death_release_published_ports() {
     for kill_supervisor in [false, true] {
         let fixture = BoxFixture::new();
-        std::fs::write(
-            fixture.home.join(".terra/config.yaml"),
-            "vm:\n  init: sandbox\n",
-        )
-        .unwrap();
         let tcp_reservation = TcpListener::bind("127.0.0.1:0").unwrap();
         let udp_reservation = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let tcp_port = tcp_reservation.local_addr().unwrap().port();

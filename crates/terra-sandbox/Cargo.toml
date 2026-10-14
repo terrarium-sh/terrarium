@@ -20,6 +20,17 @@ tempfile.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 seccompiler = "=0.5.0"
+capstone = { version = "0.14", default-features = false, features = ["full", "std", "arch_x86", "arch_arm64"], optional = true }
+object = { version = "0.40", default-features = false, features = ["read_core", "elf", "std"], optional = true }
+terra-build = { path = "../terra-build", optional = true }
+clap = { workspace = true, optional = true }
+
+[features]
+generator = ["dep:capstone", "dep:clap", "dep:object", "dep:terra-build"]
+
+[[bin]]
+name = "seccomp-policy"
+required-features = ["generator"]
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Isolation", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming"] }

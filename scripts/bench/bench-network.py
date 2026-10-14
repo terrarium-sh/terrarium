@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare direct and sandboxed Terra guest networking on native Linux/KVM."""
+"""Measure Terra guest networking on native Linux/KVM."""
 
 from __future__ import annotations
 
@@ -478,14 +478,14 @@ def measure_operation(binary, env, project, pids, probe_mode, port, count, direc
     return payload
 
 
-def measure_box(binary, probe, launcher, run, args, fixtures):
-    result = {"run": run, "launcher": launcher, "binary": str(binary), "operations": []}
+def measure_box(binary, probe, run, args, fixtures):
+    result = {"run": run, "binary": str(binary), "operations": []}
     tcp_concurrency = getattr(args, "tcp_concurrency", 1)
     local_only = getattr(args, "local_only", False)
     sample_memory = getattr(args, "sample_memory", False)
     result.update({"network_enabled": not local_only, "operation_rss_sampling": sample_memory,
                    "setup_boot_shutdown_rss_sampling": sample_memory})
-    with retained_capture_directory(args.output.parent, f"run-{run}-{launcher}-") as temporary, tempfile.TemporaryDirectory(prefix="tn-") as short_temporary:
+    with retained_capture_directory(args.output.parent, f"run-{run}-") as temporary, tempfile.TemporaryDirectory(prefix="tn-") as short_temporary:
         root = Path(temporary)
         result["capture_path"] = str(root)
         # AF_UNIX paths must stay short even when the retained output directory is deeply nested.
@@ -496,7 +496,6 @@ def measure_box(binary, probe, launcher, run, args, fixtures):
         for directory in (home, project, mount):
             directory.mkdir()
         (home / ".terra").mkdir()
-        (home / ".terra" / "config.yaml").write_text(f"vm:\n  init: {launcher}\n")
         shutil.copy2(probe, mount / "probe")
         recipe = {
             "hw": {"cpus": 2, "mem_mib": 512},
@@ -525,7 +524,7 @@ def measure_box(binary, probe, launcher, run, args, fixtures):
                 measured["capture_path"] = str(root / phase)
                 result[phase] = measured
                 if measured["exit_code"] != 0 or measured["timed_out"]:
-                    raise RuntimeError(f"{launcher} {phase} failed: {measured['stderr']['tail']}")
+                    raise RuntimeError(f"{phase} failed: {measured['stderr']['tail']}")
             listing = subprocess.run([str(binary), "ls", "--tsv", "--project", str(project)], env=env, capture_output=True, check=True, text=True)
             box_directory = Path(listing.stdout.splitlines()[0].split("\t")[3])
             pids = BENCH.read_box_process_pids(box_directory)
@@ -558,7 +557,7 @@ def measure_box(binary, probe, launcher, run, args, fixtures):
             if local_only:
                 operations = [("localhost", 0, args.tcp_mib * 1024 * 1024)]
             if args.profile_download:
-                with record_cpu_profile(processes, args.profile_download / f"{run}-{launcher}", args.timeout) as profile:
+                with record_cpu_profile(processes, args.profile_download / f"{run}", args.timeout) as profile:
                     result["profile"] = profile
                     result["operations"].append(measure_operation(binary, env, project, pids, "download", fixtures.tcp_port, args.tcp_mib * 1024 * 1024, root / "download", args.timeout, fixtures, tcp_concurrency))
                 operations = []
@@ -587,43 +586,24 @@ def measure_box(binary, probe, launcher, run, args, fixtures):
 
 
 def summarize(runs: list[dict]) -> dict:
-    summary = {}
-    for launcher in ("direct", "sandbox"):
-        completed = [run for run in runs if run["launcher"] == launcher and "failure" not in run]
-        if not completed:
-            continue
-        metrics = {
-            "boot_to_agent_ready_seconds": statistics.median(run["boot_to_agent_ready"]["wall_seconds"] for run in completed),
-            "box_rss_at_ready_kib": statistics.median(run["box_rss_at_ready_kib"] for run in completed),
-            "box_rss_after_idle_kib": statistics.median(run["box_rss_after_idle_kib"] for run in completed),
-            "box_threads_at_ready": statistics.median(run["box_threads_at_ready"] for run in completed),
-            "idle_box_process_tree_cpu_percent": statistics.median(run["idle_box_process_tree_cpu_percent"] for run in completed),
-        }
-        for field in ("box_pss_at_ready_kib", "box_pss_after_idle_kib"):
-            values = [run[field] for run in completed if run.get(field) is not None]
-            metrics[field] = statistics.median(values) if values else None
-        for case in {operation["case"] for run in completed for operation in run["operations"]}:
-            operations = [operation for run in completed for operation in run["operations"] if operation["case"] == case]
-            metrics[case] = {name: statistics.median(operation[name] for operation in operations) for name in ("mib_per_second", "p50_us", "p95_us", "first_connect_us", "connections_per_second", "host_box_cpu_seconds", "host_total_cpu_seconds", "host_box_cpu_seconds_per_mib") if name in operations[0]}
-        boot_seconds = sorted(run["boot_to_agent_ready"]["wall_seconds"] for run in completed)
-        summary[launcher] = {"completed_runs": len(completed), "medians": metrics, "boot_to_agent_ready_seconds": {"p50": statistics.median(boot_seconds), "p95": boot_seconds[min(len(boot_seconds) - 1, (len(boot_seconds) * 95 + 99) // 100 - 1)], "samples": boot_seconds}}
-    return summary
-
-
-def summarize_pairs(runs: list[dict]) -> dict:
-    completed = {(run["run"], run["launcher"]): run for run in runs if "failure" not in run}
-    cases = {}
-    for run_number in sorted({run["run"] for run in runs}):
-        if (run_number, "direct") not in completed or (run_number, "sandbox") not in completed:
-            continue
-        direct = {operation["case"]: operation for operation in completed[run_number, "direct"]["operations"]}
-        broker = {operation["case"]: operation for operation in completed[run_number, "sandbox"]["operations"]}
-        for case in sorted(direct.keys() & broker.keys()):
-            metrics = cases.setdefault(case, {})
-            for field in ("mib_per_second", "p50_us", "p95_us", "first_connect_us", "connections_per_second", "host_box_cpu_seconds", "host_total_cpu_seconds", "host_box_cpu_seconds_per_mib"):
-                if field in direct[case] and field in broker[case] and direct[case][field] > 0:
-                    metrics.setdefault(field, []).append({"run": run_number, "direct": direct[case][field], "broker": broker[case][field], "broker_over_direct": broker[case][field] / direct[case][field]})
-    return {case: {field: {"pairs": pairs, "median_ratio": statistics.median(pair["broker_over_direct"] for pair in pairs), "min_ratio": min(pair["broker_over_direct"] for pair in pairs), "max_ratio": max(pair["broker_over_direct"] for pair in pairs)} for field, pairs in metrics.items()} for case, metrics in cases.items()}
+    completed = [run for run in runs if "failure" not in run]
+    if not completed:
+        return {}
+    metrics = {
+        "boot_to_agent_ready_seconds": statistics.median(run["boot_to_agent_ready"]["wall_seconds"] for run in completed),
+        "box_rss_at_ready_kib": statistics.median(run["box_rss_at_ready_kib"] for run in completed),
+        "box_rss_after_idle_kib": statistics.median(run["box_rss_after_idle_kib"] for run in completed),
+        "box_threads_at_ready": statistics.median(run["box_threads_at_ready"] for run in completed),
+        "idle_box_process_tree_cpu_percent": statistics.median(run["idle_box_process_tree_cpu_percent"] for run in completed),
+    }
+    for field in ("box_pss_at_ready_kib", "box_pss_after_idle_kib"):
+        values = [run[field] for run in completed if run.get(field) is not None]
+        metrics[field] = statistics.median(values) if values else None
+    for case in {operation["case"] for run in completed for operation in run["operations"]}:
+        operations = [operation for run in completed for operation in run["operations"] if operation["case"] == case]
+        metrics[case] = {name: statistics.median(operation[name] for operation in operations) for name in ("mib_per_second", "p50_us", "p95_us", "first_connect_us", "connections_per_second", "host_box_cpu_seconds", "host_total_cpu_seconds", "host_box_cpu_seconds_per_mib") if name in operations[0]}
+    boot_seconds = sorted(run["boot_to_agent_ready"]["wall_seconds"] for run in completed)
+    return {"completed_runs": len(completed), "medians": metrics, "boot_to_agent_ready_seconds": {"p50": statistics.median(boot_seconds), "p95": boot_seconds[min(len(boot_seconds) - 1, (len(boot_seconds) * 95 + 99) // 100 - 1)], "samples": boot_seconds}}
 
 
 def parse_args():
@@ -723,18 +703,11 @@ def main():
                 if host_irq_deltas(irqs, {"cpu_columns": [0], "counts": {"LOC": 12}}).get("total") != 2 or "unavailable" not in host_irq_deltas(irqs, {"unavailable": "masked"}):
                     raise RuntimeError("host IRQ accounting mixed unavailable counters or scopes")
                 report["counter_self_check"] = {"process_tree_pss": pss, "worker_context_switches": stable, "host_irqs": snapshot_host_irqs()}
-                paired = []
-                for run_number, (direct_rate, broker_rate) in enumerate(((100, 10), (100, 200), (1, 2))):
-                    for launcher, rate in (("direct", direct_rate), ("sandbox", broker_rate)):
-                        paired.append({"run": run_number, "launcher": launcher, "operations": [{"case": "tcp_download", "mib_per_second": rate}]})
-                ratios = summarize_pairs(list(reversed(paired)))["tcp_download"]["mib_per_second"]
-                if ratios["median_ratio"] != 2 or len(ratios["pairs"]) != 3:
-                    raise RuntimeError("paired comparison did not match direct and broker by run")
                 command = [sys.executable, "-c", "print('ready')"]
                 checked = timed_network_command(command, os.environ, Path(temporary) / "command", 5)
                 if checked["exit_code"] != 0 or checked["timed_out"] or checked["stdout"]["tail"].strip() != "ready":
                     raise RuntimeError("network command capture failed")
-                failed = measure_box(Path("/bin/false"), probe, "direct", "retention-check", args, fixtures)
+                failed = measure_box(Path("/bin/false"), probe, "retention-check", args, fixtures)
                 retained = Path(failed["capture_path"])
                 if "failure" not in failed or not all((retained / name).is_file() for name in ("result.json", "setup/stdout", "setup/stderr", "stop/stdout", "stop/stderr")) or Path(failed["runtime_path_alias"]).exists():
                     raise RuntimeError("failed run did not retain its capture or remove its short path alias")
@@ -814,15 +787,13 @@ def main():
                 binary = args.terra.resolve()
                 report.update({"terra": str(binary), "terra_sha256": BENCH.digest(binary)})
                 for run in range(args.runs):
-                    for launcher in (("direct", "sandbox") if run % 2 == 0 else ("sandbox", "direct")):
-                        result = measure_box(binary, probe, launcher, run, args, fixtures)
-                        report["runs"].append(result)
-                        if args.profile_download is None and not args.sample_memory:
-                            report["summaries"] = summarize(report["runs"])
-                            report["paired_comparisons"] = summarize_pairs(report["runs"])
-                        args.output.write_text(json.dumps(report, indent=2) + "\n")
-                        if "failure" in result:
-                            raise RuntimeError(result["failure"])
+                    result = measure_box(binary, probe, run, args, fixtures)
+                    report["runs"].append(result)
+                    if args.profile_download is None and not args.sample_memory:
+                        report["summary"] = summarize(report["runs"])
+                    args.output.write_text(json.dumps(report, indent=2) + "\n")
+                    if "failure" in result:
+                        raise RuntimeError(result["failure"])
         args.output.write_text(json.dumps(report, indent=2) + "\n")
 
 

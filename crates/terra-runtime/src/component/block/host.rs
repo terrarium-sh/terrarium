@@ -399,7 +399,10 @@ mod tests {
         );
         fixture
             .device
-            .write(crate::self_test::virtio::QUEUE_NOTIFY, &0_u32.to_le_bytes())
+            .write(
+                crate::test_support::virtio::QUEUE_NOTIFY,
+                &0_u32.to_le_bytes(),
+            )
             .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while disk_slot.available_permits() != 0 {

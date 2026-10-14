@@ -13,8 +13,8 @@ use terra_runtime::component::vsock::streams::{FrontendStreams, StreamEndpoint};
 use terra_runtime::component::{AccessMode, InterruptCallback};
 use terra_runtime::engine::device_engine;
 use terra_runtime::memory::GuestRam;
-use terra_runtime::self_test::virtio;
-use terra_runtime::self_test::virtio::STATUS;
+use terra_runtime::test_support::virtio;
+use terra_runtime::test_support::virtio::STATUS;
 use wasmtime::component::Component;
 
 const STATUS_RESET: [u8; 4] = virtio::STATUS_RESET.to_le_bytes();

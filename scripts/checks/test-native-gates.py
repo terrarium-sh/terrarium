@@ -3,7 +3,6 @@
 
 from pathlib import Path
 import importlib.util
-import itertools
 import os
 import re
 import subprocess
@@ -126,60 +125,17 @@ class NativeGateTests(unittest.TestCase):
             with self.subTest(source=source), self.assertRaises(ValueError):
                 module.validate_kernel_buffers(source)
 
-    @linux_workflow_shell_only
-    def test_release_requires_all_native_gates_and_matching_policy_uploads(self):
+    def test_every_linux_build_checks_the_static_policy_without_kvm(self):
         release = (ROOT / '.github/workflows/release.yml').read_text()
         self.assertIn('      native_vm_tests: true', release)
         self.assertIn('      release_sources: true', release)
-        policy = WORKFLOW.split('  linux-policy:\n', 1)[1].split('  macos-aarch64:\n', 1)[0]
-        self.assertIn('    continue-on-error: ${{ !inputs.release_sources }}', policy)
-        self.assertNotIn("matrix.arch != 'x86_64'", policy)
-        outcomes = itertools.product(('true', 'false', ''), ('true', 'false', ''),
-                                     ('success', 'failure', 'skipped'), ('success', 'failure', 'skipped'))
-        for result, available, validated, uploaded in outcomes:
-            environment = {**os.environ, 'BUILD_READY': result, 'KVM_AVAILABLE': available,
-                           'POLICY_VALIDATED': validated, 'POLICY_UPLOADED': uploaded}
-            completed = subprocess.run(['bash', '-e', '-c', workflow_command('Require release policy validation')],
-                                       env=environment, text=True, capture_output=True, check=False)
-            self.assertEqual(completed.returncode,
-                             int(result != 'true' or available != 'true' or validated != 'success' or uploaded != 'success'))
-
-    @linux_workflow_shell_only
-    def test_release_asset_assembly_rejects_missing_and_mismatched_policies(self):
-        release = (ROOT / '.github/workflows/release.yml').read_text()
-        command = workflow_command('Assemble validated policy assets', release)
-        for has_arm_policy, rejected in ((False, ''), (True, 'aarch64-unknown-linux-musl'), (True, '')):
-            with self.subTest(has_arm_policy=has_arm_policy, rejected=rejected), tempfile.TemporaryDirectory() as directory:
-                policies = Path(directory) / 'policies'
-                (policies / 'terra-seccomp-x86_64-unknown-linux-musl').mkdir(parents=True)
-                if has_arm_policy:
-                    (policies / 'terra-seccomp-aarch64-unknown-linux-musl').mkdir()
-                mocks = '''
-sudo() { :; }
-chmod() { :; }
-python3() { test "${@: -1}" != "$REJECTED_TARGET"; }
-tar() { :; }
-'''
-                completed = subprocess.run(['bash', '-e', '-c', mocks + command], cwd=directory,
-                                           env={**os.environ, 'REJECTED_TARGET': rejected},
-                                           text=True, capture_output=True, check=False)
-                self.assertEqual(completed.returncode, int(not has_arm_policy or bool(rejected)))
-
-    def test_policy_generation_uses_the_distribution_without_test_harnesses(self):
-        policy = WORKFLOW.split('  linux-policy:\n', 1)[1].split('  macos-aarch64:\n', 1)[0]
-        for legacy in ('make ', 'cargo ', 'rustup ', 'setup-zig', 'harness'):
-            self.assertNotIn(legacy, policy)
-        self.assertIn('./dist/terra self-test --generate-policy --validate-vm --policy-output', policy)
-        self.assertIn('--policy-diagnostics "build/seccomp-traces/${{ matrix.target }}"', policy)
-        self.assertIn('python3 libseccomp2', policy)
-        self.assertNotIn('strace', policy)
-        self.assertNotIn('apt-get', workflow_command('Prepare policy validation'))
-        self.assertNotIn('terra-policy-harnesses-', WORKFLOW)
-        for step in ('KVM gates', 'KVM product gates'):
-            command = workflow_command(step)
-            self.assertIn('TERRA_SECCOMP_ENFORCED=1 cargo test', command)
-            self.assertIn('--exact bwrap_enforces_vm_and_vcpu_threads --ignored --nocapture', command)
-            self.assertIn("grep -Fq 'test result: ok. 1 passed; 0 failed; 0 ignored;'", command)
+        steps = WORKFLOW.split('      - name: Check seccomp policy\n')[1:]
+        self.assertEqual(len(steps), 2)
+        for step in steps:
+            header, command = step.split('        run: ', 1)
+            self.assertNotIn('continue-on-error', header)
+            self.assertNotIn('kvm', header.lower())
+            self.assertTrue(command.startswith('make policy-check\n'))
 
     @linux_workflow_shell_only
     def test_component_cleanup_preserves_runtime_wasm_fixtures(self):
@@ -208,67 +164,65 @@ tar() { :; }
     @linux_workflow_shell_only
     def test_kvm_permissions_survive_device_initialization(self):
         """KVM's first open can trigger udev to discard a one-time user ACL."""
-        backfill = (ROOT / '.github/workflows/policy-backfill.yml').read_text()
-        for workflow, expected_setups in ((WORKFLOW, 3), (backfill, 1)):
-            self.assertEqual(workflow.count('      - name: Enable KVM access\n'), expected_setups)
-            for step in workflow.split('      - name: Enable KVM access\n')[1:]:
-                self.assertIn("runner.environment == 'github-hosted'", step.split('        run:', 1)[0])
-                command = workflow_command('Enable KVM access', '      - name: Enable KVM access\n' + step)
-                for device in ('/dev/null', '/dev/terra-ci-missing-kvm'):
-                    with self.subTest(device=device), tempfile.TemporaryDirectory() as directory:
-                        setup = command.replace('/dev/kvm', device)
-                        gate = workflow_command('KVM gates').replace('/dev/kvm', device)
-                        shell = f'''
+        self.assertEqual(WORKFLOW.count('      - name: Enable KVM access\n'), 2)
+        for step in WORKFLOW.split('      - name: Enable KVM access\n')[1:]:
+            self.assertIn("runner.environment == 'github-hosted'", step.split('        run:', 1)[0])
+            command = workflow_command('Enable KVM access', '      - name: Enable KVM access\n' + step)
+            for device in ('/dev/null', '/dev/terra-ci-missing-kvm'):
+                with self.subTest(device=device), tempfile.TemporaryDirectory() as directory:
+                    setup = command.replace('/dev/kvm', device)
+                    gate = workflow_command('KVM gates').replace('/dev/kvm', device)
+                    shell = f'''
 kvm_acl=0
 kvm_owner=''
 kvm_mode=0660
 kvm_rule=''
 sudo() {{
-    case "$*" in
-        'setfacl -m u:{os.getuid()}:rw {device}') kvm_acl=1 ;;
-        'tee /etc/udev/rules.d/99-terra-kvm.rules') cat > kvm.rules ;;
-        'udevadm control --reload-rules') kvm_rule=$(cat kvm.rules) ;;
-        'chown {os.getuid()} {device}') kvm_owner={os.getuid()} ;;
-        'chmod 0600 {device}') kvm_mode=0600 ;;
-        *) echo "unexpected sudo: $*"; return 1 ;;
-    esac
+case "$*" in
+    'setfacl -m u:{os.getuid()}:rw {device}') kvm_acl=1 ;;
+    'tee /etc/udev/rules.d/99-terra-kvm.rules') cat > kvm.rules ;;
+    'udevadm control --reload-rules') kvm_rule=$(cat kvm.rules) ;;
+    'chown {os.getuid()} {device}') kvm_owner={os.getuid()} ;;
+    'chmod 0600 {device}') kvm_mode=0600 ;;
+    *) echo "unexpected sudo: $*"; return 1 ;;
+esac
 }}
 can_open_kvm() {{
-    test "$kvm_acl" = 1 || {{ test "$kvm_owner" = {os.getuid()} && test "$kvm_mode" = 0600; }}
+test "$kvm_acl" = 1 || {{ test "$kvm_owner" = {os.getuid()} && test "$kvm_mode" = 0600; }}
 }}
 [() {{
-    if test "$1" = '!'; then
-        shift
-        ! [ "$@"
-    elif {{ test "$1" = -r || test "$1" = -w; }} && test "$2" = /dev/null; then
-        can_open_kvm
-    else
-        builtin [ "$@"
-    fi
+if test "$1" = '!'; then
+    shift
+    ! [ "$@"
+elif {{ test "$1" = -r || test "$1" = -w; }} && test "$2" = /dev/null; then
+    can_open_kvm
+else
+    builtin [ "$@"
+fi
 }}
 cargo() {{
-    can_open_kvm || return 1
-    echo native-test-command
-    echo 'test result: ok. 1 passed; 0 failed; 0 ignored;'
-    kvm_acl=0
-    kvm_owner=''
-    kvm_mode=0660
-    if test "$kvm_rule" = 'KERNEL=="kvm", OWNER="{os.getuid()}", MODE="0600", OPTIONS+="static_node=kvm"'; then
-        kvm_owner={os.getuid()}
-        kvm_mode=0600
-    fi
+can_open_kvm || return 1
+echo native-test-command
+echo 'test result: ok. 1 passed; 0 failed; 0 ignored;'
+kvm_acl=0
+kvm_owner=''
+kvm_mode=0660
+if test "$kvm_rule" = 'KERNEL=="kvm", OWNER="{os.getuid()}", MODE="0600", OPTIONS+="static_node=kvm"'; then
+    kvm_owner={os.getuid()}
+    kvm_mode=0600
+fi
 }}
 {setup}
 {gate}
 '''
-                        result = subprocess.run(
-                            ['bash', '-e', '-o', 'pipefail', '-c', shell], text=True, cwd=directory,
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
-                        )
-                        self.assertEqual(result.returncode, int(device != '/dev/null'), result.stdout)
-                        self.assertEqual(result.stdout.count('native-test-command'), 5 if device == '/dev/null' else 0)
-                        if device != '/dev/null':
-                            self.assertIn('require a native /dev/terra-ci-missing-kvm device', result.stdout)
+                    result = subprocess.run(
+                        ['bash', '-e', '-o', 'pipefail', '-c', shell], text=True, cwd=directory,
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
+                    )
+                    self.assertEqual(result.returncode, int(device != '/dev/null'), result.stdout)
+                    self.assertEqual(result.stdout.count('native-test-command'), 4 if device == '/dev/null' else 0)
+                    if device != '/dev/null':
+                        self.assertIn('require a native /dev/terra-ci-missing-kvm device', result.stdout)
 
     @linux_workflow_shell_only
     def test_native_gate_admission(self):

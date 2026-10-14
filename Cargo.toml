@@ -47,3 +47,8 @@ strip = "symbols"
 overflow-checks = true
 debug-assertions = true
 panic = "abort"
+
+# The release build with symbols kept, so `make policy` can scan each role's code.
+[profile.policy]
+inherits = "release"
+strip = "none"

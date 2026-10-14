@@ -1,38 +1,40 @@
+//! Terminal attachment and session listing checks for the guest suite.
+
 use anyhow::{Result, ensure};
 
-use super::SelfTest;
+use super::Suite;
 
-pub(super) fn exercise(self_test: &SelfTest) -> Result<()> {
+pub(super) fn exercise(suite: &Suite) -> Result<()> {
     ensure!(
-        self_test.read_json(&["exercise", "sessions", "--json"])? == serde_json::json!([]),
+        suite.read_json(&["exercise", "sessions", "--json"])? == serde_json::json!([]),
         "unexpected initial terminal sessions"
     );
     ensure!(
-        String::from_utf8(self_test.run(&["exercise", "sessions"])?.stdout)?
+        String::from_utf8(suite.run(&["exercise", "sessions"])?.stdout)?
             .trim()
             .is_empty(),
         "unexpected initial terminal sessions output"
     );
     #[cfg(unix)]
-    exercise_attachment(self_test)?;
+    exercise_attachment(suite)?;
     #[cfg(not(unix))]
     {
-        println!("self-test: terminal attachment skipped on this host");
-        self_test.run(&["exercise", "detach", "--all"])?;
+        println!("guest suite: terminal attachment skipped on this host");
+        suite.run(&["exercise", "detach", "--all"])?;
     }
     Ok(())
 }
 
 #[cfg(unix)]
-fn exercise_attachment(self_test: &SelfTest) -> Result<()> {
+fn exercise_attachment(suite: &Suite) -> Result<()> {
     use std::time::Duration;
 
     use anyhow::Context as _;
 
-    let (mut client, _terminal) = attach_terminal_client(self_test)?;
+    let (mut client, _terminal) = attach_terminal_client(suite)?;
     super::wait_until(
         || {
-            let sessions = self_test.read_json(&["exercise", "sessions", "--json"])?;
+            let sessions = suite.read_json(&["exercise", "sessions", "--json"])?;
             Ok(sessions
                 .as_array()
                 .is_some_and(|sessions| !sessions.is_empty()))
@@ -40,37 +42,37 @@ fn exercise_attachment(self_test: &SelfTest) -> Result<()> {
         "terminal attachment",
         Duration::from_secs(30),
     )?;
-    let sessions = self_test.read_json(&["exercise", "sessions", "--json"])?;
+    let sessions = suite.read_json(&["exercise", "sessions", "--json"])?;
     let id = sessions[0]["id"]
         .as_u64()
         .context("terminal session ID missing")?
         .to_string();
     ensure!(id == "0", "first terminal session ID: expected 0, got {id}");
     ensure!(
-        String::from_utf8(self_test.run(&["exercise", "sessions"])?.stdout)?
+        String::from_utf8(suite.run(&["exercise", "sessions"])?.stdout)?
             .trim()
             .starts_with("0\t"),
         "first terminal session output is missing its ID row"
     );
-    self_test.run(&["exercise", "detach", &id])?;
+    suite.run(&["exercise", "detach", &id])?;
     client.wait_for_exit()?;
     ensure!(
-        self_test.read_json(&["exercise", "sessions", "--json"])? == serde_json::json!([]),
+        suite.read_json(&["exercise", "sessions", "--json"])? == serde_json::json!([]),
         "terminal session survived detach"
     );
     ensure!(
-        String::from_utf8(self_test.run(&["exercise", "sessions"])?.stdout)?
+        String::from_utf8(suite.run(&["exercise", "sessions"])?.stdout)?
             .trim()
             .is_empty(),
         "terminal session output survived detach"
     );
-    self_test.run_expected(&["exercise", "detach", &id], None, super::COMMAND_TIMEOUT)?;
-    self_test.run(&["exercise", "detach", "--all"])?;
-    let (mut first_client, _first_terminal) = attach_terminal_client(self_test)?;
-    let (mut second_client, _second_terminal) = attach_terminal_client(self_test)?;
+    suite.run_expected(&["exercise", "detach", &id], None, super::COMMAND_TIMEOUT)?;
+    suite.run(&["exercise", "detach", "--all"])?;
+    let (mut first_client, _first_terminal) = attach_terminal_client(suite)?;
+    let (mut second_client, _second_terminal) = attach_terminal_client(suite)?;
     super::wait_until(
         || {
-            let sessions = self_test.read_json(&["exercise", "sessions", "--json"])?;
+            let sessions = suite.read_json(&["exercise", "sessions", "--json"])?;
             Ok(sessions
                 .as_array()
                 .is_some_and(|sessions| sessions.len() == 2))
@@ -78,15 +80,15 @@ fn exercise_attachment(self_test: &SelfTest) -> Result<()> {
         "two terminal attachments",
         Duration::from_secs(30),
     )?;
-    self_test.run(&["exercise", "detach", "--all"])?;
+    suite.run(&["exercise", "detach", "--all"])?;
     first_client.wait_for_exit()?;
     second_client.wait_for_exit()?;
     ensure!(
-        self_test.read_json(&["exercise", "sessions", "--json"])? == serde_json::json!([]),
+        suite.read_json(&["exercise", "sessions", "--json"])? == serde_json::json!([]),
         "terminal sessions survived detach --all"
     );
     ensure!(
-        String::from_utf8(self_test.run(&["exercise", "sessions"])?.stdout)?
+        String::from_utf8(suite.run(&["exercise", "sessions"])?.stdout)?
             .trim()
             .is_empty(),
         "terminal session output survived detach --all"
@@ -96,13 +98,13 @@ fn exercise_attachment(self_test: &SelfTest) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn attach_terminal_client(self_test: &SelfTest) -> Result<(AttachedClient, std::os::fd::OwnedFd)> {
+fn attach_terminal_client(suite: &Suite) -> Result<(AttachedClient, std::os::fd::OwnedFd)> {
     use std::process::Stdio;
 
     use anyhow::Context as _;
 
     let (terminal, slave) = open_terminal_pair()?;
-    let client = self_test
+    let client = suite
         .command(["exercise"])
         .stdin(Stdio::from(slave))
         .stdout(Stdio::null())

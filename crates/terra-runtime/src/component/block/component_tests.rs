@@ -5,7 +5,7 @@ use crate::component::block::backing::{BlockBacking, BoundedDisk, DiskGrant};
 use crate::component::{AccessMode, StandaloneDevice};
 use crate::engine::{device_engine, precompile_component};
 use crate::memory::{BoundedMemory, GuestRam, MemoryError};
-use crate::self_test::virtio;
+use crate::test_support::virtio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use terra_hypervisor::memory::MemoryRange as Range;

@@ -100,7 +100,7 @@ mod tests {
     use crate::engine::device_engine;
     use crate::memory::BoundedMemory;
     use crate::memory::GuestRam;
-    use crate::self_test::virtio;
+    use crate::test_support::virtio;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use wasmtime::component::Component;

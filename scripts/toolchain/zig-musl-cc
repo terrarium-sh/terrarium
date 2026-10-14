@@ -6,6 +6,9 @@
 # genuinely a cross: building for Apple Silicon from x86_64 still compiles
 # libkrun's *guest* init for aarch64 musl.
 #
+# rustc asks for a static PIE with -static-pie, which zig ignores (linking a
+# fixed-address executable); zig spells it -static -pie, so it is translated.
+#
 # Two flags are dropped on the way through:
 #   --target=x86_64-unknown-linux-musl — cc-rs passes the Rust triple, which zig
 #     can't parse; we supply zig's own target form below instead.
@@ -17,6 +20,10 @@ for arg do
 	shift
 	case "$arg" in
 	--target=* | -Wl,-O?) continue ;;
+	-static-pie)
+		set -- "$@" -static -pie
+		continue
+		;;
 	esac
 	set -- "$@" "$arg"
 done

@@ -8,15 +8,14 @@ mod sockets;
 
 pub use sockets::LauncherSockets;
 
-use super::{Access, Grant, Launch, PolicyBundle, PreparedLaunch, Role};
+use super::{Access, Grant, Launch, PreparedLaunch, Role};
 use anyhow::{Context, Result, bail, ensure};
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{Read, Write};
-use std::net::ToSocketAddrs;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, AsRawSocket, FromRawHandle, OwnedHandle};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, Command, ExitCode};
 use std::time::{Duration, Instant};
 use terra_platform::filesystem::share::windows::symlink_broker;
@@ -25,7 +24,6 @@ use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TokenIsAppContainer};
 use windows_sys::Win32::System::JobObjects::IsProcessInJob;
 use windows_sys::Win32::System::Pipes::PeekNamedPipe;
-use windows_sys::Win32::System::SystemInformation::{ComputerNameDnsHostname, GetComputerNameExW};
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetExitCodeProcess, INFINITE, OpenProcess,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, ResumeThread, WaitForMultipleObjects,
@@ -179,13 +177,13 @@ pub fn prepare_launch(launch: Launch<'_>) -> Result<PreparedLaunch> {
     process::pass_handle(&mut command, parent.as_raw_handle(), PARENT_ENV)?;
     Ok(PreparedLaunch {
         command,
-        confinement: Some(Confinement {
+        confinement: Confinement {
             identity,
             inherited_identity,
             _parent: parent,
             _spec: spec,
             trusted_directories,
-        }),
+        },
     })
 }
 
@@ -274,20 +272,12 @@ fn read_identity(
     }
 }
 
-pub fn resolve_policy(policy: Option<&Path>) -> Result<PolicyBundle> {
-    ensure!(
-        policy.is_none(),
-        "Windows uses its built-in sandbox role policies; remove vm.sandbox.policy (seccomp bundles are Linux-only)"
-    );
-    PolicyBundle::try_from_roles(|_| Ok(Vec::new()))
-}
-
 pub fn role_grants(_role: Role) -> Vec<Grant> {
     Vec::new()
 }
 
 /// The Windows supervisor stays unconfined; each worker's token and job carry its authority.
-pub fn install_policy(_policy: &[u8]) -> Result<()> {
+pub fn restrict_role(_role: Role) -> Result<()> {
     Ok(())
 }
 
@@ -353,7 +343,12 @@ fn verify_worker_token(token: &OwnedHandle, role: Role, mode: &str) -> Result<()
 
 /// Resolves this computer's DNS host name through the system resolver, the
 /// path the broker's name lookups take.
-pub fn resolve_computer_name() -> Result<()> {
+#[cfg(test)]
+fn resolve_computer_name() -> Result<()> {
+    use std::net::ToSocketAddrs as _;
+    use windows_sys::Win32::System::SystemInformation::{
+        ComputerNameDnsHostname, GetComputerNameExW,
+    };
     let mut name = [0_u16; 256];
     let mut length = u32::try_from(name.len())?;
     // SAFETY: name holds length UTF-16 units and length is writable.
@@ -586,6 +581,7 @@ fn wide(value: &OsStr) -> Result<Vec<u16>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn launcher_inherits_and_claims_the_parent_watch_handle() -> Result<()> {
@@ -620,7 +616,6 @@ mod tests {
             role: Role::Vm,
             command: Command::new(&executable),
             grants: vec![Grant::new(&executable, Access::ReadOnly)],
-            policy: None,
             staging_directory: &std::env::temp_dir(),
         })?;
         let mut command = Command::new(&executable);
@@ -677,13 +672,6 @@ mod tests {
         ] {
             assert!(doc.contains(&quote), "docs/sandboxing.md must say: {quote}");
         }
-    }
-
-    /// An ignored override would leave the operator believing a custom policy applies.
-    #[test]
-    fn policy_override_is_a_configuration_error() {
-        assert!(resolve_policy(Some(Path::new("policies"))).is_err());
-        assert!(resolve_policy(None).is_ok());
     }
 
     #[test]
@@ -743,7 +731,6 @@ mod tests {
                 role,
                 command: worker_command,
                 grants,
-                policy: None,
                 staging_directory: &std::env::temp_dir(),
             })?;
             let mut command = Command::new(&wrapper);

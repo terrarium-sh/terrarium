@@ -1,5 +1,11 @@
+//! Guest exercises for the bundled recipes, driven through the terra binary on a native hypervisor.
+//! `TERRA_BIN` overrides the Cargo-built binary; the VM suite requires `--ignored`.
+
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use std::ffi::OsStr;
 use std::fs::{self, File, FileTimes};
+use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::thread;
@@ -14,16 +20,26 @@ mod sessions;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 const STORAGE_TIMEOUT: Duration = Duration::from_secs(240);
 
-struct SelfTest {
+struct Suite {
     directory: PathBuf,
     binary: PathBuf,
+    stage: PathBuf,
     project: PathBuf,
     boxes: Vec<String>,
 }
 
-impl SelfTest {
+impl Suite {
     fn command(&self, arguments: impl IntoIterator<Item = impl AsRef<OsStr>>) -> Command {
+        let home = self.stage.join("home");
         let mut command = Command::new(&self.binary);
+        command
+            .current_dir(&self.project)
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("TMPDIR", &self.stage)
+            .env("TMP", &self.stage)
+            .env("TEMP", &self.stage)
+            .env_remove("RUST_LOG");
         command.arg("--project").arg(&self.project).args(arguments);
         command
     }
@@ -43,7 +59,7 @@ impl SelfTest {
 
     fn capture(command: &mut Command, expected: Option<i32>, timeout: Duration) -> Result<Output> {
         command.stdin(Stdio::null());
-        let output = crate::process::run_capture(command, timeout)?;
+        let output = run_capture(command, timeout)?;
         let matches = expected.map_or_else(
             || !output.status.success(),
             |code| output.status.code() == Some(code),
@@ -124,32 +140,74 @@ impl SelfTest {
         }
         ensure!(
             failures.is_empty(),
-            "self-test cleanup failed:\n{}",
+            "guest suite cleanup failed:\n{}",
             failures.join("\n")
         );
         Ok(())
     }
 }
 
-pub(super) fn run_suite(project: &Path) -> Result<()> {
+fn run_capture(command: &mut Command, timeout: Duration) -> Result<Output> {
+    let mut stdout = tempfile::tempfile()?;
+    let mut stderr = tempfile::tempfile()?;
+    command
+        .stdout(stdout.try_clone()?)
+        .stderr(stderr.try_clone()?);
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("starting {command:?}"))?;
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("{command:?} timed out after {timeout:?}");
+        }
+        thread::sleep(Duration::from_millis(25));
+    };
+    let read_capture = |file: &mut File| -> Result<Vec<u8>> {
+        file.seek(SeekFrom::Start(0))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    };
+    Ok(Output {
+        status,
+        stdout: read_capture(&mut stdout)?,
+        stderr: read_capture(&mut stderr)?,
+    })
+}
+
+/// Drives the bundled guest exercises through the terra binary, each box in a private HOME,
+/// TMPDIR and project.
+#[test]
+#[ignore = "requires native KVM and Bubblewrap user namespaces"]
+fn guest_suite_passes_in_a_private_home() {
+    let stage = tempfile::Builder::new().prefix("ts-").tempdir().unwrap();
+    let project = stage.path().join("project");
+    fs::create_dir_all(stage.path().join("home/.terra")).unwrap();
+    fs::create_dir_all(&project).unwrap();
     let directory = tempfile::Builder::new()
-        .prefix("terra-self-test-")
-        .tempdir_in(project)?;
-    let mut self_test = SelfTest {
+        .prefix("terra-guest-suite-")
+        .tempdir_in(&project)
+        .unwrap();
+    let mut suite = Suite {
         directory: directory.path().to_owned(),
-        binary: std::env::current_exe()?,
-        project: project.to_owned(),
+        binary: std::env::var_os("TERRA_BIN")
+            .map_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_terra")), PathBuf::from),
+        stage: stage.path().to_owned(),
+        project,
         boxes: Vec::new(),
     };
-    let result = run_exercises(&mut self_test);
-    let cleanup = self_test.cleanup();
+    let result = run_exercises(&mut suite);
+    let cleanup = suite.cleanup();
     match (result, cleanup) {
-        (Ok(()), Ok(())) => {
-            println!("self-test: passed");
-            Ok(())
-        }
-        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-        (Err(error), Err(cleanup)) => Err(error.context(format!("{cleanup:#}"))),
+        (Ok(()), Ok(())) => {}
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => panic!("{error:#}"),
+        (Err(error), Err(cleanup)) => panic!("{error:#}\n{cleanup:#}"),
     }
 }
 
@@ -190,21 +248,21 @@ fn require_file(path: &Path, expected: &[u8]) -> Result<()> {
 fn fill_share_path(host: &mut Value, placeholder: &str, path: &Path) -> Result<()> {
     let path = path
         .to_str()
-        .context("self-test shares require a UTF-8 project path")?;
+        .context("guest suite shares require a UTF-8 project path")?;
     *host = Value::String(
         host.as_str()
-            .context("self-test share path must be a string")?
+            .context("guest suite share path must be a string")?
             .replace(placeholder, path),
     );
     Ok(())
 }
 
-fn run_exercises(self_test: &mut SelfTest) -> Result<()> {
+fn run_exercises(suite: &mut Suite) -> Result<()> {
     let allowed = network::HostService::start()?;
     let denied = network::HostService::start()?;
-    println!("self-test: setup, bake, hooks and detached service");
-    let writable = self_test.directory.join("writable");
-    let readonly = self_test.directory.join("readonly");
+    println!("guest suite: setup, bake, hooks and detached service");
+    let writable = suite.directory.join("writable");
+    let readonly = suite.directory.join("readonly");
     fs::create_dir(&writable)?;
     fs::create_dir(&readonly)?;
     fs::write(writable.join("host"), "HOST_SEED")?;
@@ -228,16 +286,16 @@ fn run_exercises(self_test: &mut SelfTest) -> Result<()> {
     )?;
     fill_share_path(&mut recipe["mounts"][0]["host"], "{writable}", &writable)?;
     fill_share_path(&mut recipe["mounts"][1]["host"], "{readonly}", &readonly)?;
-    require_output(&self_test.setup("exercise", &recipe, Some(0))?, "BAKE_OK")?;
-    self_test.run(&["exercise", "setup"])?;
-    let resolved = self_test.read_json(&["exercise", "show", "--json", "--with-env-values"])?;
+    require_output(&suite.setup("exercise", &recipe, Some(0))?, "BAKE_OK")?;
+    suite.run(&["exercise", "setup"])?;
+    let resolved = suite.read_json(&["exercise", "show", "--json", "--with-env-values"])?;
     ensure!(
         resolved["env"]["WORKLOAD_ENV"] == "recipe-value",
         "recipe environment missing: {resolved}"
     );
-    self_test.run(&["exercise", "-d"])?;
-    self_test.execute(include_str!("scripts/exercise-ready.sh"), &[])?;
-    self_test.require_box_state("exercise", "running")?;
+    suite.run(&["exercise", "-d"])?;
+    suite.execute(include_str!("scripts/exercise-ready.sh"), &[])?;
+    suite.require_box_state("exercise", "running")?;
     wait_until(
         || Ok(network::read_published_port(published_port)),
         "published HTTP port",
@@ -256,17 +314,17 @@ fn run_exercises(self_test: &mut SelfTest) -> Result<()> {
         "unexpected host network request"
     );
 
-    exercise_exec(self_test)?;
-    exercise_shares(self_test, &writable, &readonly)?;
-    exercise_sync(self_test)?;
-    exercise_network(self_test, &allowed, &denied, &recipe["hw"])?;
-    exercise_local_only_network(self_test, &recipe["hw"])?;
-    exercise_storage(self_test, &writable, &recipe["hw"])?;
+    exercise_exec(suite)?;
+    exercise_shares(suite, &writable, &readonly)?;
+    exercise_sync(suite)?;
+    exercise_network(suite, &allowed, &denied, &recipe["hw"])?;
+    exercise_local_only_network(suite, &recipe["hw"])?;
+    exercise_storage(suite, &writable, &recipe["hw"])?;
     Ok(())
 }
 
 fn exercise_network(
-    self_test: &mut SelfTest,
+    suite: &mut Suite,
     allowed: &network::HostService,
     denied: &network::HostService,
     hardware: &Value,
@@ -274,8 +332,8 @@ fn exercise_network(
     const CONCURRENT_NETWORK_FLOWS: usize = 8;
     let allowed_port = allowed.port();
     let denied_port = denied.port();
-    println!("self-test: local DNS, TCP/UDP host services, ports and denial");
-    self_test.execute(
+    println!("guest suite: local DNS, TCP/UDP host services, ports and denial");
+    suite.execute(
         &include_str!("scripts/network.sh")
             .replace(
                 "{concurrent_network_flows}",
@@ -297,11 +355,8 @@ fn exercise_network(
             .replace("{hardware}", &serde_json::to_string(hardware)?)
             .replace("{allowed_port}", &allowed_port.to_string()),
     )?;
-    self_test.setup("isolated", &isolated, Some(0))?;
-    require_output(
-        &self_test.run(&["isolated", "--foreground"])?,
-        "ISOLATED_OK",
-    )?;
+    suite.setup("isolated", &isolated, Some(0))?;
+    require_output(&suite.run(&["isolated", "--foreground"])?, "ISOLATED_OK")?;
     ensure!(
         allowed.requests() == CONCURRENT_NETWORK_FLOWS
             && denied.requests() == 0
@@ -309,48 +364,48 @@ fn exercise_network(
             && denied.datagrams() == 0,
         "isolated box reached host services"
     );
-    network::exercise_quic(self_test, allowed)
+    network::exercise_quic(suite, allowed)
 }
 
-fn exercise_local_only_network(self_test: &mut SelfTest, hardware: &Value) -> Result<()> {
-    println!("self-test: local-only loopback, agent exec and shutdown");
+fn exercise_local_only_network(suite: &mut Suite, hardware: &Value) -> Result<()> {
+    println!("guest suite: local-only loopback, agent exec and shutdown");
     let recipe: Value = yaml_serde::from_str(
         &include_str!("recipes/local-only.yaml")
             .replace("{hardware}", &serde_json::to_string(hardware)?),
     )?;
-    self_test.setup("local-only", &recipe, Some(0))?;
-    self_test.run(&["local-only", "-d"])?;
+    suite.setup("local-only", &recipe, Some(0))?;
+    suite.run(&["local-only", "-d"])?;
     let script = include_str!("scripts/local-only.sh");
-    let output = SelfTest::capture(
-        &mut self_test.command(["local-only", "exec", "--", "/bin/sh", "-ec", script]),
+    let output = Suite::capture(
+        &mut suite.command(["local-only", "exec", "--", "/bin/sh", "-ec", script]),
         Some(0),
         COMMAND_TIMEOUT,
     )?;
     require_output(&output, "LOCAL_ONLY_OK")?;
-    self_test.run(&["local-only", "stop"])?;
-    self_test.require_box_state("local-only", "stopped")
+    suite.run(&["local-only", "stop"])?;
+    suite.require_box_state("local-only", "stopped")
 }
 
-fn exercise_exec(self_test: &SelfTest) -> Result<()> {
-    println!("self-test: exec identities, pipes, PTY and sessions");
+fn exercise_exec(suite: &Suite) -> Result<()> {
+    println!("guest suite: exec identities, pipes, PTY and sessions");
     for (script, flags, expected) in [
         ("id -u", &[][..], "1000"),
         ("id -u", &["--root"][..], "0"),
         ("pwd", &[][..], "/work/nested/deep"),
     ] {
-        let output = self_test.execute(script, flags)?;
+        let output = suite.execute(script, flags)?;
         ensure!(
             String::from_utf8_lossy(&output.stdout).trim() == expected,
             "unexpected {script} output: {output:?}"
         );
     }
-    self_test.execute(
+    suite.execute(
         "test \"$WORKLOAD_ENV\" = exec-value; test \"$(pwd)\" = /tmp",
         &["--env", "WORKLOAD_ENV=exec-value", "--workdir", "/tmp"],
     )?;
-    self_test.execute_expected("exit 7", &[], Some(7))?;
-    self_test.execute_expected("doas id -u", &[], None)?;
-    let streams = self_test.execute(
+    suite.execute_expected("exit 7", &[], Some(7))?;
+    suite.execute_expected("doas id -u", &[], None)?;
+    let streams = suite.execute(
         "printf 'one\\ntwo\\n'; echo ERROR >&2; test ! -t 1",
         &["--no-tty"],
     )?;
@@ -359,19 +414,19 @@ fn exercise_exec(self_test: &SelfTest) -> Result<()> {
             && String::from_utf8_lossy(&streams.stderr).contains("ERROR"),
         "exec streams differ: {streams:?}"
     );
-    self_test.execute("test -t 0; test -t 1; echo TTY_OK", &["--tty"])?;
-    sessions::exercise(self_test)?;
-    self_test.execute("echo ROOT_WRITE > /etc/workload-probe", &["--root"])?;
-    self_test.execute(include_str!("scripts/namespaces.sh"), &[])?;
-    self_test.execute(include_str!("scripts/overlay.sh"), &["--root"])?;
+    suite.execute("test -t 0; test -t 1; echo TTY_OK", &["--tty"])?;
+    sessions::exercise(suite)?;
+    suite.execute("echo ROOT_WRITE > /etc/workload-probe", &["--root"])?;
+    suite.execute(include_str!("scripts/namespaces.sh"), &[])?;
+    suite.execute(include_str!("scripts/overlay.sh"), &["--root"])?;
     Ok(())
 }
 
-fn exercise_shares(self_test: &SelfTest, writable: &Path, readonly: &Path) -> Result<()> {
-    println!("self-test: writable/read-only shares, file events and synchronization");
-    self_test.execute(include_str!("scripts/shares.sh"), &[])?;
+fn exercise_shares(suite: &Suite, writable: &Path, readonly: &Path) -> Result<()> {
+    println!("guest suite: writable/read-only shares, file events and synchronization");
+    suite.execute(include_str!("scripts/shares.sh"), &[])?;
     #[cfg(unix)]
-    self_test.execute("test \"$(/work/host-run)\" = HOST_EXECUTABLE", &[])?;
+    suite.execute("test \"$(/work/host-run)\" = HOST_EXECUTABLE", &[])?;
     require_file(&writable.join("host"), b"linked")?;
     require_file(&writable.join("after"), b"renamed")?;
     require_file(&readonly.join("seed"), b"READ_ONLY")?;
@@ -382,32 +437,32 @@ fn exercise_shares(self_test: &SelfTest, writable: &Path, readonly: &Path) -> Re
         readonly_names == [OsStr::new("seed")],
         "read-only share was modified: {readonly_names:?}"
     );
-    exercise_file_events(self_test, writable)?;
-    self_test.execute(include_str!("scripts/shares-persisted.sh"), &[])?;
+    exercise_file_events(suite, writable)?;
+    suite.execute(include_str!("scripts/shares-persisted.sh"), &[])?;
     Ok(())
 }
 
-fn exercise_file_events(self_test: &SelfTest, writable: &Path) -> Result<()> {
-    self_test.execute(include_str!("scripts/watcher-ready.sh"), &["--root"])?;
+fn exercise_file_events(suite: &Suite, writable: &Path) -> Result<()> {
+    suite.execute(include_str!("scripts/watcher-ready.sh"), &["--root"])?;
     fs::write(writable.join("host-update"), "LIVE_UPDATE")?;
     fs::write(writable.join("host-created"), "CREATED")?;
-    self_test.execute(include_str!("scripts/file-events-created.sh"), &["--root"])?;
+    suite.execute(include_str!("scripts/file-events-created.sh"), &["--root"])?;
     fs::remove_file(writable.join("host-created"))?;
-    self_test.execute(include_str!("scripts/file-events-deleted.sh"), &["--root"])?;
+    suite.execute(include_str!("scripts/file-events-deleted.sh"), &["--root"])?;
     Ok(())
 }
 
-fn exercise_sync(self_test: &SelfTest) -> Result<()> {
-    let source = self_test.directory.join("sync-source");
+fn exercise_sync(suite: &Suite) -> Result<()> {
+    let source = suite.directory.join("sync-source");
     fs::create_dir_all(source.join("nested"))?;
     let payload: Vec<u8> = (0..=255).cycle().take(256 * 257).collect();
     fs::write(source.join("nested/binary"), &payload)?;
     fs::write(source.join("value"), "first")?;
     let source_directory = format!("{}/", source.display());
-    self_test.run(&["exercise", "sync", &source_directory, ":/tmp/synced/"])?;
-    let downloaded = self_test.directory.join("sync-download");
+    suite.run(&["exercise", "sync", &source_directory, ":/tmp/synced/"])?;
+    let downloaded = suite.directory.join("sync-download");
     let downloaded_directory = format!("{}/", downloaded.display());
-    self_test.run(&["exercise", "sync", ":/tmp/synced/", &downloaded_directory])?;
+    suite.run(&["exercise", "sync", ":/tmp/synced/", &downloaded_directory])?;
     require_file(&downloaded.join("nested/binary"), &payload)?;
     require_file(&downloaded.join("value"), b"first")?;
     let value = source.join("value");
@@ -418,8 +473,8 @@ fn exercise_sync(self_test: &SelfTest) -> Result<()> {
             .set_accessed(original_times.accessed()?)
             .set_modified(original_times.modified()?),
     )?;
-    self_test.execute("printf extra > /tmp/synced/extra", &[])?;
-    self_test.run(&[
+    suite.execute("printf extra > /tmp/synced/extra", &[])?;
+    suite.run(&[
         "exercise",
         "sync",
         "--delete",
@@ -428,11 +483,11 @@ fn exercise_sync(self_test: &SelfTest) -> Result<()> {
         &source_directory,
         ":/tmp/synced/",
     ])?;
-    self_test.execute(
+    suite.execute(
         "test \"$(cat /tmp/synced/value)\" = first; test -f /tmp/synced/extra",
         &[],
     )?;
-    self_test.run(&[
+    suite.run(&[
         "exercise",
         "sync",
         "--delete",
@@ -440,12 +495,12 @@ fn exercise_sync(self_test: &SelfTest) -> Result<()> {
         &source_directory,
         ":/tmp/synced/",
     ])?;
-    self_test.execute(
+    suite.execute(
         "test \"$(cat /tmp/synced/value)\" = other; test ! -e /tmp/synced/extra",
         &[],
     )?;
     fs::write(downloaded.join("extra"), "remove")?;
-    self_test.run(&[
+    suite.run(&[
         "exercise",
         "sync",
         "--delete",
@@ -458,17 +513,17 @@ fn exercise_sync(self_test: &SelfTest) -> Result<()> {
         "sync retained deleted file"
     );
     require_file(&downloaded.join("value"), b"other")?;
-    let single = self_test.directory.join("single");
-    SelfTest::capture(
-        self_test
+    let single = suite.directory.join("single");
+    Suite::capture(
+        suite
             .command(["exercise", "sync"])
             .arg(value)
             .arg(":/tmp/single"),
         Some(0),
         COMMAND_TIMEOUT,
     )?;
-    SelfTest::capture(
-        self_test.command(["sync", ":/tmp/single"]).arg(&single),
+    Suite::capture(
+        suite.command(["sync", ":/tmp/single"]).arg(&single),
         Some(0),
         COMMAND_TIMEOUT,
     )?;
@@ -476,12 +531,12 @@ fn exercise_sync(self_test: &SelfTest) -> Result<()> {
     Ok(())
 }
 
-fn exercise_storage(self_test: &mut SelfTest, writable: &Path, hardware: &Value) -> Result<()> {
-    println!("self-test: stop, persistent restart, storage export/import and removal");
-    self_test.run(&["exercise", "stop"])?;
-    self_test.require_box_state("exercise", "stopped")?;
+fn exercise_storage(suite: &mut Suite, writable: &Path, hardware: &Value) -> Result<()> {
+    println!("guest suite: stop, persistent restart, storage export/import and removal");
+    suite.run(&["exercise", "stop"])?;
+    suite.require_box_state("exercise", "stopped")?;
     require_file(&writable.join("hooks"), b"start\nstop\n")?;
-    let storage = self_test.read_json(&["exercise", "storage", "show", "--json"])?;
+    let storage = suite.read_json(&["exercise", "storage", "show", "--json"])?;
     let images = storage["images"]
         .as_array()
         .context("storage images missing")?;
@@ -498,17 +553,17 @@ fn exercise_storage(self_test: &mut SelfTest, writable: &Path, hardware: &Value)
         ),
         "invalid storage image: {storage}"
     );
-    let artifact = self_test.directory.join("storage.terra");
-    SelfTest::capture(
-        self_test
+    let artifact = suite.directory.join("storage.terra");
+    Suite::capture(
+        suite
             .command(["exercise", "storage", "export"])
             .arg(&artifact),
         Some(0),
         STORAGE_TIMEOUT,
     )?;
     ensure!(fs::metadata(&artifact)?.len() > 0, "empty storage export");
-    self_test.run(&["exercise", "storage", "prune"])?;
-    let foreground = self_test.run(&[
+    suite.run(&["exercise", "storage", "prune"])?;
+    let foreground = suite.run(&[
         "exercise",
         "--foreground",
         "--root",
@@ -521,15 +576,15 @@ fn exercise_storage(self_test: &mut SelfTest, writable: &Path, hardware: &Value)
         require_output(&foreground, marker)?;
     }
     require_file(&writable.join("hooks"), b"start\nstop\nstart\nstop\n")?;
-    SelfTest::capture(
-        self_test
+    Suite::capture(
+        suite
             .command(["exercise", "storage", "import"])
             .arg(&artifact),
         Some(0),
         STORAGE_TIMEOUT,
     )?;
     require_output(
-        &self_test.run(&[
+        &suite.run(&[
             "exercise",
             "--foreground",
             "--",
@@ -539,90 +594,85 @@ fn exercise_storage(self_test: &mut SelfTest, writable: &Path, hardware: &Value)
         ])?,
         "RESTORED_OK",
     )?;
-    self_test.run_expected(
+    suite.run_expected(
         &["exercise", "--foreground", "--", "sh", "-c", "exit 7"],
         Some(7),
         COMMAND_TIMEOUT,
     )?;
-    self_test.run(&["exercise", "logs", "--tail", "20"])?;
-    self_test.run(&["exercise", "logs", "--diagnostics", "--tail", "20"])?;
+    suite.run(&["exercise", "logs", "--tail", "20"])?;
+    suite.run(&["exercise", "logs", "--diagnostics", "--tail", "20"])?;
     let recipe: Value = yaml_serde::from_str(
         &include_str!("recipes/bad-bake.yaml")
             .replace("{hardware}", &serde_json::to_string(hardware)?),
     )?;
-    let bad_bake = self_test.setup("bad-bake", &recipe, None)?;
+    let bad_bake = suite.setup("bad-bake", &recipe, None)?;
     require_output(&bad_bake, "FAILED_BAKE")?;
     require_output(
-        &self_test.run(&["bad-bake", "logs", "--diagnostics"])?,
+        &suite.run(&["bad-bake", "logs", "--diagnostics"])?,
         "init failed",
     )?;
-    self_test.run(&["exercise", "rm"])?;
-    self_test.require_box_state("exercise", "not_created")?;
-    self_test.run(&["exercise", "rm", "--purge"])?;
+    suite.run(&["exercise", "rm"])?;
+    suite.require_box_state("exercise", "not_created")?;
+    suite.run(&["exercise", "rm", "--purge"])?;
     ensure!(
-        !self_test
+        !suite
             .list_boxes()?
             .iter()
             .any(|bx| bx["name"] == "exercise"),
         "purged box is still listed"
     );
-    self_test.boxes.retain(|name| name != "exercise");
+    suite.boxes.retain(|name| name != "exercise");
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn embedded_recipes_preserve_escaped_share_paths_and_recipe_settings() -> Result<()> {
-        let mut exercise: Value = yaml_serde::from_str(
-            &include_str!("recipes/exercise.yaml")
-                .replace("{allowed_port}", "12345")
-                .replace("{published_port}", "54321"),
-        )?;
-        let writable = Path::new(
-            "C:\\self test\\{readonly}\\'quoted' \"double\"
+#[test]
+fn embedded_recipes_preserve_escaped_share_paths_and_recipe_settings() -> Result<()> {
+    let mut exercise: Value = yaml_serde::from_str(
+        &include_str!("recipes/exercise.yaml")
+            .replace("{allowed_port}", "12345")
+            .replace("{published_port}", "54321"),
+    )?;
+    let writable = Path::new(
+        "C:\\self test\\{readonly}\\'quoted' \"double\"
 next: value",
-        );
-        let readonly = Path::new(
-            "/self test/{writable}/'quoted' \"double\"
+    );
+    let readonly = Path::new(
+        "/self test/{writable}/'quoted' \"double\"
 next: value",
-        );
-        fill_share_path(&mut exercise["mounts"][0]["host"], "{writable}", writable)?;
-        fill_share_path(&mut exercise["mounts"][1]["host"], "{readonly}", readonly)?;
-        let serialized = yaml_serde::to_string(&exercise)?;
-        let reparsed: Value = yaml_serde::from_str(&serialized)?;
-        assert_eq!(reparsed, exercise);
-        let config: crate::config::Config = yaml_serde::from_str(&serialized)?;
-        assert_eq!(config.mounts[0].host, writable);
-        assert_eq!(config.mounts[1].host, readonly);
+    );
+    fill_share_path(&mut exercise["mounts"][0]["host"], "{writable}", writable)?;
+    fill_share_path(&mut exercise["mounts"][1]["host"], "{readonly}", readonly)?;
+    let serialized = yaml_serde::to_string(&exercise)?;
+    let reparsed: Value = yaml_serde::from_str(&serialized)?;
+    assert_eq!(reparsed, exercise);
+    let config: terra::config::Config = yaml_serde::from_str(&serialized)?;
+    assert_eq!(config.mounts[0].host, writable);
+    assert_eq!(config.mounts[1].host, readonly);
+    assert_eq!(config.hw.cpus, 2);
+    assert_eq!(config.hw.mem_mib, 512);
+    assert_eq!(config.hw.rootfs_mib, 128);
+    assert_eq!(
+        exercise["network"]["allow"],
+        serde_json::json!(["gate.test:12345"])
+    );
+    assert_eq!(
+        exercise["network"]["ports"],
+        serde_json::json!(["54321:18080", "54321:18082/udp"])
+    );
+    assert!(config.daemons[2].contains("200 OK\\r\\nContent-Length: 13"));
+    let hardware = serde_json::to_string(&exercise["hw"])?;
+    for template in [
+        include_str!("recipes/isolated.yaml"),
+        include_str!("recipes/local-only.yaml"),
+        include_str!("recipes/bad-bake.yaml"),
+    ] {
+        let recipe = template
+            .replace("{hardware}", &hardware)
+            .replace("{allowed_port}", "12345");
+        let config: terra::config::Config = yaml_serde::from_str(&recipe)?;
         assert_eq!(config.hw.cpus, 2);
         assert_eq!(config.hw.mem_mib, 512);
         assert_eq!(config.hw.rootfs_mib, 128);
-        assert_eq!(
-            exercise["network"]["allow"],
-            serde_json::json!(["gate.test:12345"])
-        );
-        assert_eq!(
-            exercise["network"]["ports"],
-            serde_json::json!(["54321:18080", "54321:18082/udp"])
-        );
-        assert!(config.daemons[2].contains("200 OK\\r\\nContent-Length: 13"));
-        let hardware = serde_json::to_string(&exercise["hw"])?;
-        for template in [
-            include_str!("recipes/isolated.yaml"),
-            include_str!("recipes/local-only.yaml"),
-            include_str!("recipes/bad-bake.yaml"),
-        ] {
-            let recipe = template
-                .replace("{hardware}", &hardware)
-                .replace("{allowed_port}", "12345");
-            let config: crate::config::Config = yaml_serde::from_str(&recipe)?;
-            assert_eq!(config.hw.cpus, 2);
-            assert_eq!(config.hw.mem_mib, 512);
-            assert_eq!(config.hw.rootfs_mib, 128);
-        }
-        Ok(())
     }
+    Ok(())
 }

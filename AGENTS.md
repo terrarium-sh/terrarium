@@ -11,20 +11,20 @@
     cargo test --workspace # Use `cargo test -p terra --lib` for terra units
     ```
 *   **Scripts read Rust sources:** checks under `scripts/` parse source text
-    (fixture paths in `test_fixtures.rs`, `file:symbol` references in
-    `scripts/seccomp/seccomp-supplements.json`). The fast path skips them; after
+    (fixture paths in `test_fixtures.rs`). The fast path skips them; after
     moving or renaming code, run `make verify-source`.
 *   **CLI Updates:** `crates/terra/src/cli.rs` is the source of truth for the man
     pages; `make man` re-renders them (they are generated, not committed).
 *   **Boot Tests:** Requires `/dev/kvm`. Run: `make dist && TERRA_BIN=$PWD/dist/terra cargo test -p terra --test boot -- --ignored`
-*   **Default self-test coverage:** Every new feature must update the bundled
-    self-tests so generated seccomp policies include its host operations. Exercise
-    guestless paths in `crates/terra-runtime/src/self_test.rs`; cover guest-only
-    paths in `crates/terra/src/cmd/self_test/guest.rs` and document their reviewed rules in
-    `scripts/seccomp/seccomp-supplements.json`. Verify
-    `terra self-test --generate-policy` without virtualization and
-    `terra self-test --generate-policy --validate-vm`
-    on native Linux before publishing policies.
+*   **Seccomp policy:** the Linux allowlists in
+    `crates/terra-sandbox/src/linux/policy/` are generated from code, not
+    written by hand. After a change that can alter which syscalls a sandboxed
+    role reaches (new code paths, dependency or toolchain bumps), run
+    `make policy` on each Linux architecture and commit the reviewed diff;
+    CI's `make policy-check` fails on any drift. When the generator refuses a
+    site, make the code analyzable rather than widening the policy by hand. New
+    host operations still need boot-test coverage, which runs under the
+    allowlist.
 
 ## Threat model
 

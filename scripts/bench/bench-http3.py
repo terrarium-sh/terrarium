@@ -17,6 +17,7 @@ import time
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 PROBE_SOURCE = REPOSITORY / "crates/terra/tests/assets/http3_probe"
+MODES = ("host", "box")
 
 
 def digest(path):
@@ -25,14 +26,14 @@ def digest(path):
 
 def summarize(runs):
     summaries = {}
-    for launcher in ("native", "direct", "sandbox"):
-        summaries[launcher] = {}
+    for mode in MODES:
+        summaries[mode] = {}
         for case in ("http3_upload", "http3_download"):
             values = [operation["mib_per_second"] for run in runs
-                      if run["launcher"] == launcher for operation in run["operations"]
+                      if run["mode"] == mode for operation in run["operations"]
                       if operation["case"] == case]
             if values:
-                summaries[launcher][case] = {
+                summaries[mode][case] = {
                     "samples": values, "median_mib_per_second": statistics.median(values),
                     "min_mib_per_second": min(values), "max_mib_per_second": max(values),
                 }
@@ -61,7 +62,7 @@ def main():
         "created_at_utc": datetime.now(UTC).isoformat(), "passed": False,
         "terra_sha256": digest(binary), "capture_path": str(capture),
         "host": {"system": platform.system(), "release": platform.release(), "machine": platform.machine()},
-        "workload": {"runs_per_launcher": args.runs, "bytes_per_transfer": args.mib * 1048576,
+        "workload": {"runs_per_mode": args.runs, "bytes_per_transfer": args.mib * 1048576,
                      "guest_vcpus": 2, "guest_memory_mib": 512, "probe_worker_threads": 2},
         "measurement": "One HTTP/3 stream over QUIC/TLS per transfer, after a small GET on the same connection. Client monotonic timing includes payload verification and final response, excludes VM boot, process launch and TLS handshake. Upload receives only a small acknowledgment; download has no payload echo. Native control uses the same probe and UDP-only host server. Loopback results do not model WAN latency or loss.",
         "sources": {str(path.relative_to(REPOSITORY)): digest(path) for path in
@@ -115,10 +116,9 @@ def main():
                 time.sleep(0.05)
             address = (fixture / "address").read_text().strip()
             port = address.rsplit(":", 1)[1]
-            launchers = ["native", "direct", "sandbox"]
             for index in range(args.runs):
-                for launcher in launchers[index % 3:] + launchers[:index % 3]:
-                    cell = {"run": index, "launcher": launcher, "operations": []}
+                for mode in MODES[index % len(MODES):] + MODES[:index % len(MODES)]:
+                    cell = {"run": index, "mode": mode, "operations": []}
                     report["runs"].append(cell)
                     with tempfile.TemporaryDirectory(prefix="th3-", dir="/tmp") as temporary:
                         root = Path(temporary)
@@ -128,11 +128,10 @@ def main():
                         env = environment | {"HOME": str(home)}
                         setup = False
                         try:
-                            if launcher == "native":
+                            if mode == "host":
                                 client = [probe]
                                 target, certificates = address, str(fixture)
                             else:
-                                (home / ".terra/config.yaml").write_text(f"vm:\n  init: {launcher}\n")
                                 recipe = root / "http3.yaml"
                                 recipe.write_text(json.dumps({
                                     "hw": {"cpus": 2, "mem_mib": 512},
@@ -149,16 +148,16 @@ def main():
                                 target, certificates = "100.96.0.1:" + port, "/fixture"
                             run([*client, "client", target, certificates], env)
                             cell["compatibility_passed"] = True
-                            for mode in (("upload", "download") if index % 2 == 0 else ("download", "upload")):
-                                payload = json.loads(run([*client, mode, target, certificates, str(args.mib * 1048576)], env))
-                                if (payload["case"] != "http3_" + mode or payload["bytes"] != args.mib * 1048576
+                            for direction in (("upload", "download") if index % 2 == 0 else ("download", "upload")):
+                                payload = json.loads(run([*client, direction, target, certificates, str(args.mib * 1048576)], env))
+                                if (payload["case"] != "http3_" + direction or payload["bytes"] != args.mib * 1048576
                                         or payload["protocol"] != "HTTP/3.0" or payload["verified"] is not True
                                         or not math.isfinite(payload["seconds"]) or payload["seconds"] <= 0
                                         or not math.isclose(payload["mib_per_second"], args.mib / payload["seconds"], rel_tol=1e-5)):
                                     raise RuntimeError(f"invalid HTTP/3 transfer result: {payload}")
                                 cell["operations"].append(payload)
                                 save()
-                            print(index, launcher, {o["case"]: round(o["mib_per_second"], 2) for o in cell["operations"]}, flush=True)
+                            print(index, mode, {o["case"]: round(o["mib_per_second"], 2) for o in cell["operations"]}, flush=True)
                         finally:
                             if setup:
                                 run([binary, "http3", "stop", "--project", project], env, timeout=30)

@@ -2,10 +2,12 @@
 
 mod builtin_policy;
 mod bwrap;
-pub mod seccomp;
+#[cfg(feature = "generator")]
+pub mod generator;
+mod seccomp;
 
 pub use bwrap::{Confinement, prepare_launch};
-pub use seccomp::{install_policy, resolve_policy};
+pub use seccomp::restrict_role;
 
 use super::{Access, Grant, Role};
 use anyhow::Result;

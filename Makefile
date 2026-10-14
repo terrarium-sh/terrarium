@@ -85,7 +85,7 @@ COMPONENT_AOT_TARGETS := $(addsuffix -aot,$(COMPONENT_TARGETS))
 COMPONENT_MANIFEST := components/Cargo.toml
 COMPONENT_WASM_DIR := components/target/wasm-components/release
 
-.PHONY: $(COMPONENT_TARGETS) $(COMPONENT_AOT_TARGETS) verify-source verify-host-components guest-assets check-guest-assets host-build host-dist source-dist verify-wit verify-dependency-boundaries verify-platform build verify verify-components verify-workspace dist man clean test-component-boot test-platform-native-vm test-component-vmm test-install check-zig check-bubblewrap
+.PHONY: $(COMPONENT_TARGETS) $(COMPONENT_AOT_TARGETS) policy policy-check verify-source verify-host-components guest-assets check-guest-assets host-build host-dist source-dist verify-wit verify-dependency-boundaries verify-platform build verify verify-components verify-workspace dist man clean test-component-boot test-platform-native-vm test-component-vmm test-install check-zig check-bubblewrap
 
 # Pin changes invalidate every embedded guest payload.
 PINS := $(ARCH) $(KERNEL_VERSION) $(KERNEL_SHA256) $(E2FSPROGS_VERSION) $(E2FSPROGS_SHA256) \
@@ -331,6 +331,24 @@ check-guest-assets:
 host-build: check-guest-assets $(COMPONENT_AOT_TARGETS)
 	$(CARGO_LOCKED) build --release -p terra --target $(TERRA_TARGET)
 
+## Regenerate the checked-in syscall allowlist for $(TERRA_TARGET) by scanning one binary
+## per sandboxed role; `policy-check` fails instead when the checked-in file differs. The
+## components are inputs here, not rebuilt: a host build already produced them. The role
+## binaries use the static relocation model, so library calls are direct instead of through
+## function pointers the analysis would have to chase; the shipped binary stays a static PIE.
+POLICY_BUILD := target/$(TERRA_TARGET)/policy
+policy policy-check: check-guest-assets
+	@for aot in $(COMPONENTS:%=$(BUILD)/terra-%-component.cwasm); do test -s $$aot || { echo "missing component: $$aot; run make host-build" >&2; exit 1; }; done
+	$(CARGO_LOCKED) --config 'target.$(TERRA_TARGET).rustflags = ["-C", "relocation-model=static"]' \
+		build --profile policy -p terra --target $(TERRA_TARGET) --bin terra \
+		--example role-supervisor --example role-vm --example role-network
+	$(CARGO_LOCKED) run --target $(MUSL) -p terra-sandbox --features generator --bin seccomp-policy -- \
+		--target $(TERRA_TARGET) \
+		--supervisor $(POLICY_BUILD)/examples/role-supervisor \
+		--vm $(POLICY_BUILD)/examples/role-vm \
+		--network $(POLICY_BUILD)/examples/role-network \
+		--executable $(POLICY_BUILD)/terra $(if $(filter policy-check,$@),--check)
+
 test-component-vmm: dist
 	TERRA_BIN=$(abspath $(DIST)/terra) $(CARGO_LOCKED) test $(TEST_FLAGS) -p terra --test boot --test memory -- --ignored
 
@@ -396,8 +414,6 @@ verify-source:
 	python3 -B scripts/sources/test-vendor-sources.py || $(CHECK_FAILURE); \
 	python3 -B scripts/sources/test-alpine-sources.py || $(CHECK_FAILURE); \
 	python3 -B scripts/pins/test-pin-updates.py || $(CHECK_FAILURE); \
-	python3 -B scripts/seccomp/test-verify-seccomp-artifact.py || $(CHECK_FAILURE); \
-	python3 -B scripts/seccomp/test-policy-backfill.py || $(CHECK_FAILURE); \
 	python3 -B scripts/kernel/check-vsock-abi.py || $(CHECK_FAILURE); \
 	python3 -B scripts/checks/test-native-gates.py || $(CHECK_FAILURE); \
 	scripts/checks/test-install.sh || $(CHECK_FAILURE); \
@@ -411,9 +427,11 @@ verify-workspace:
 	$(MAKE) verify-source || $(CHECK_FAILURE); \
 	$(MAKE) verify-platform || $(CHECK_FAILURE); \
 	$(CARGO_LOCKED) clippy --workspace --all-targets --target $(MUSL) -- -D warnings || $(CHECK_FAILURE); \
+	$(CARGO_LOCKED) clippy -p terra-sandbox --features generator --all-targets --target $(MUSL) -- -D warnings || $(CHECK_FAILURE); \
 	$(CARGO_LOCKED) clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings || $(CHECK_FAILURE); \
 	$(CARGO_LOCKED) doc --workspace --no-deps --document-private-items --target $(MUSL) || $(CHECK_FAILURE); \
 	$(CARGO_LOCKED) test $(TEST_FLAGS) --workspace --target $(MUSL) || $(CHECK_FAILURE); \
+	$(CARGO_LOCKED) test $(TEST_FLAGS) -p terra-sandbox --features generator --lib --target $(MUSL) || $(CHECK_FAILURE); \
 	exit $$status
 
 verify-dependency-boundaries:

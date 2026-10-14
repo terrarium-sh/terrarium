@@ -3,27 +3,13 @@
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    match terra::run_internal_role().unwrap_or_else(|| run_with_runtime(terra::run())) {
-        Ok(code) => code,
-        Err(error) if terra::is_stdout_broken_pipe(&error) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("terra: {}", terra::render_error(&e));
-            ExitCode::FAILURE
-        }
+    if let Some(role) = std::env::args_os()
+        .nth(1)
+        .and_then(|argument| terra::role::from_argument(&argument))
+    {
+        return role();
     }
-}
-
-fn run_with_runtime<F, T>(operation: F) -> anyhow::Result<T>
-where
-    F: std::future::Future<Output = anyhow::Result<T>>,
-{
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()?;
-    let result = runtime.block_on(operation);
-    runtime.shutdown_timeout(std::time::Duration::from_secs(1));
-    result
+    terra::exit_code_of(terra::run_with_runtime(terra::run()))
 }
 
 #[cfg(test)]
@@ -33,7 +19,7 @@ mod tests {
     fn process_exits_with_a_permanently_blocked_host_operation() {
         const CHILD: &str = "TERRA_TEST_BLOCKED_SHUTDOWN";
         if std::env::var_os(CHILD).is_some() {
-            super::run_with_runtime(async {
+            terra::run_with_runtime(async {
                 let (started, ready) = tokio::sync::oneshot::channel();
                 tokio::task::spawn_blocking(move || {
                     let _ = started.send(());

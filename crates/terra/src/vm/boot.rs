@@ -1,7 +1,6 @@
 //! Booting a prepared box into its VM process.
 
 use crate::cli::BootArgs;
-use crate::sandbox::config::LauncherConfig;
 use crate::session::{self, DETACH_KEY_NAME, SessionOutcome, pump_session};
 use crate::state::BoxRef;
 use crate::{config, sys};
@@ -71,35 +70,24 @@ pub(crate) enum BootMode {
     DetachedWithJoin,
 }
 
-pub fn get_vm_process_box_dir() -> Option<PathBuf> {
-    let mut args = std::env::args_os().skip(1);
-    if args.next()? != VM_PROCESS_FLAG_ARG {
-        return None;
-    }
-    args.next().map(PathBuf::from)
-}
-
 pub async fn start(
     spec: &BootSpec,
     bx: &BoxRef,
     boot: BootMode,
     run_lock: File,
     agent_timeout: Option<u64>,
-    launcher: &LauncherConfig,
 ) -> Result<ExitCode> {
     match boot {
-        BootMode::Detached => spawn_detached(bx, spec, run_lock, launcher),
+        BootMode::Detached => spawn_detached(bx, spec, run_lock),
         BootMode::Foreground => {
             eprintln!(
                 "terra: starting {bx} in the foreground; `terra {} stop` stops it",
                 bx.get_name()
             );
             print_mount_summary(&spec.cfg.mounts);
-            spawn_foreground(bx, spec, run_lock, agent_timeout, launcher).await
+            spawn_foreground(bx, spec, run_lock, agent_timeout).await
         }
-        BootMode::DetachedWithJoin => {
-            spawn_and_attach(bx, spec, run_lock, agent_timeout, launcher).await
-        }
+        BootMode::DetachedWithJoin => spawn_and_attach(bx, spec, run_lock, agent_timeout).await,
     }
 }
 
@@ -110,12 +98,7 @@ pub async fn attach(bx: &BoxRef, agent_timeout: Option<u64>) -> Result<ExitCode>
 }
 
 /// The caller keeps its lock while the isolated bake child uses a duplicate.
-pub async fn run_bake(
-    cfg: &config::Config,
-    bx: &BoxRef,
-    lock: &File,
-    launcher: &LauncherConfig,
-) -> Result<()> {
+pub async fn run_bake(cfg: &config::Config, bx: &BoxRef, lock: &File) -> Result<()> {
     let bake = BootSpec {
         cfg: cfg.clone(),
         project_dir: bx.get_project_dir().to_path_buf(),
@@ -127,7 +110,7 @@ pub async fn run_bake(
     };
     eprintln!("terra: baking on_create for {bx} in an isolated VM (no shares)");
     let baking = BoxRef::mark_baking(lock).context("marking the on_create bake")?;
-    let LaunchedVm { mut child, _guard } = spawn_vm_process(bx, &bake, lock, launcher)?;
+    let LaunchedVm { mut child, _guard } = spawn_vm_process(bx, &bake, lock)?;
     let deadline = Instant::now() + DETACH_READY_DEADLINE;
     let output = async {
         let stream =
@@ -257,14 +240,13 @@ async fn spawn_and_attach(
     spec: &BootSpec,
     run_lock: File,
     agent_timeout: Option<u64>,
-    launcher: &LauncherConfig,
 ) -> Result<ExitCode> {
     eprintln!(
         "terra: starting {bx} - {DETACH_KEY_NAME} detaches, `terra {} stop` stops it",
         bx.get_name()
     );
     print_mount_summary(&spec.cfg.mounts);
-    let LaunchedVm { mut child, _guard } = spawn_vm_process(bx, spec, &run_lock, launcher)?;
+    let LaunchedVm { mut child, _guard } = spawn_vm_process(bx, spec, &run_lock)?;
     // The child owns the lock from here on; a copy held by this client would
     // keep the box reading as running, VM or no VM.
     drop(run_lock);
@@ -304,13 +286,8 @@ async fn spawn_and_attach(
     finish_session(bx, &outcome, Some(&mut child))
 }
 
-fn spawn_detached(
-    bx: &BoxRef,
-    spec: &BootSpec,
-    run_lock: File,
-    launcher: &LauncherConfig,
-) -> Result<ExitCode> {
-    let LaunchedVm { child, _guard } = spawn_vm_process(bx, spec, &run_lock, launcher)?;
+fn spawn_detached(bx: &BoxRef, spec: &BootSpec, run_lock: File) -> Result<ExitCode> {
+    let LaunchedVm { child, _guard } = spawn_vm_process(bx, spec, &run_lock)?;
     drop(run_lock);
     wait_for_detached_agent(bx, child, DETACH_READY_DEADLINE)
 }
@@ -369,17 +346,11 @@ pub(super) struct LaunchedVm {
     pub(super) _guard: Option<sys::VmChildGuard>,
 }
 
-fn spawn_vm_process(
-    bx: &BoxRef,
-    spec: &BootSpec,
-    lock: &File,
-    launcher: &LauncherConfig,
-) -> Result<LaunchedVm> {
-    super::launcher::validate_assets(launcher, spec, bx)?;
+fn spawn_vm_process(bx: &BoxRef, spec: &BootSpec, lock: &File) -> Result<LaunchedVm> {
     bx.clear_host_pid()
         .context("clearing previous VM identity")?;
     let exe = std::env::current_exe().context("locating the terra binary")?;
-    super::supervisor::spawn(bx, spec, lock, &exe, launcher)
+    super::supervisor::spawn(bx, spec, lock, &exe)
 }
 
 pub(super) fn send_startup_input(child: &mut Child, json: Vec<u8>) -> Result<()> {
@@ -388,7 +359,7 @@ pub(super) fn send_startup_input(child: &mut Child, json: Vec<u8>) -> Result<()>
         .name("process-startup-input".into())
         .spawn(move || {
             use std::io::Write;
-            // A launcher that exits or ignores stdin must not block the startup deadline.
+            // A child that exits or ignores stdin must not block the startup deadline.
             let _ = stdin.write_all(&json);
         })
         .context("starting process startup writer")?;
@@ -427,9 +398,8 @@ async fn spawn_foreground(
     spec: &BootSpec,
     run_lock: File,
     agent_timeout: Option<u64>,
-    launcher: &LauncherConfig,
 ) -> Result<ExitCode> {
-    let LaunchedVm { mut child, _guard } = spawn_vm_process(bx, spec, &run_lock, launcher)?;
+    let LaunchedVm { mut child, _guard } = spawn_vm_process(bx, spec, &run_lock)?;
     drop(run_lock);
     let ready = relay_foreground_stop(bx).and_then(|()| start_ready_reader(&mut child));
     let ready = match ready {

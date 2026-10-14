@@ -79,12 +79,8 @@ journalctl -u terra@pi-dev -f
 The recipe should define a `workload:` — headless there's no interactive shell to
 fall back to. Use recipe mounts for shared directories, and `terra sync`
 or volumes for guest files.
-For custom seccomp policies, set `vm.sandbox.policy` to a complete bundle directory
-containing the supervisor, VMM and network broker policies and manifest. Validated
-policies are available as separate `terra-seccomp-<target>.tar.gz` release
-archives for manual use. Terra checks that setting, then
-`~/.terra/config/seccomp`, before using its built-in fallback when allowed; see the
-[host VM launcher guide](../docs/vm-launchers.md).
+Linux binaries carry their seccomp allowlists compiled in; see the
+[host sandbox policy](../docs/sandbox-policy.md).
 
 ## Graceful stop
 

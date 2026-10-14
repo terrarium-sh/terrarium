@@ -63,14 +63,8 @@ To verify a downloaded release archive's attestation, use its filename:
 gh attestation verify terra-x86_64-linux.tar.gz --repo terrarium-sh/terrarium
 ```
 
-Linux releases publish a matching Bubblewrap policy bundle in a separate
-`terra-seccomp-<target>.tar.gz` archive. `install.sh` verifies it like the
-binary and installs it at `~/.terra/config/seccomp`, keeping any previous
-bundle as `seccomp.previous`. A bundle matches one executable, so reinstall
-both together after a manual upgrade. Terra does not search beside the
-executable; set `vm.sandbox.policy` to use another bundle directory.
-Without a bundle, Terra uses its built-in role policies. See
-[host VM launchers](vm-launchers.md) for configuration details.
+Linux binaries carry their seccomp allowlists compiled in, so there is no
+separate policy to install. See [host sandbox policy](sandbox-policy.md).
 
 ## List boxes
 

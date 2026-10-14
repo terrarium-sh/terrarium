@@ -205,11 +205,11 @@ mod tests {
         memory.write(0x2002, &1u16.to_le_bytes()).unwrap();
         memory.write(0x2004, &0u16.to_le_bytes()).unwrap();
         memory.write(0x4000, &[0x5a; 4096]).unwrap();
-        crate::self_test::virtio::start_single_queue(
+        crate::test_support::virtio::start_single_queue(
             &channel,
             (1 << 4) | (1 << 5),
             2,
-            crate::self_test::virtio::QueueLayout {
+            crate::test_support::virtio::QueueLayout {
                 size: 256,
                 descriptors: 0x1000,
                 available: 0x2000,
@@ -218,7 +218,10 @@ mod tests {
         )
         .unwrap();
         channel
-            .write(crate::self_test::virtio::QUEUE_NOTIFY, &2u32.to_le_bytes())
+            .write(
+                crate::test_support::virtio::QUEUE_NOTIFY,
+                &2u32.to_le_bytes(),
+            )
             .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while memory.read(0x3002, 2).unwrap() != 1u16.to_le_bytes()
@@ -242,7 +245,10 @@ mod tests {
         memory.write(0x2006, &1u16.to_le_bytes()).unwrap();
         memory.write(0x5000, &[0x5a; 4096]).unwrap();
         channel
-            .write(crate::self_test::virtio::QUEUE_NOTIFY, &2u32.to_le_bytes())
+            .write(
+                crate::test_support::virtio::QUEUE_NOTIFY,
+                &2u32.to_le_bytes(),
+            )
             .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while memory.read(0x3002, 2).unwrap() != 2u16.to_le_bytes() {

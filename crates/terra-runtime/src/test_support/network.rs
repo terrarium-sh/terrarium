@@ -40,7 +40,7 @@ pub(super) async fn run(
     Ok(())
 }
 
-pub fn create_backend(
+fn create_backend(
     endpoints: Endpoints,
 ) -> wasmtime::Result<(NetworkBackend, tokio::task::JoinHandle<std::io::Result<()>>)> {
     use terra_network::config::{Config, Network, PublishedListener, StaticDnsRecord};
@@ -99,14 +99,14 @@ pub fn create_backend(
 }
 
 #[derive(Clone, Copy)]
-pub struct Endpoints {
-    pub tcp: u16,
-    pub udp: u16,
-    pub published: u16,
+struct Endpoints {
+    tcp: u16,
+    udp: u16,
+    published: u16,
 }
 
-pub struct TestServers {
-    pub endpoints: Endpoints,
+struct TestServers {
+    endpoints: Endpoints,
     tcp: std::thread::JoinHandle<wasmtime::Result<()>>,
     udp: std::thread::JoinHandle<wasmtime::Result<()>>,
     tcp_ipv6: std::thread::JoinHandle<wasmtime::Result<()>>,
@@ -139,7 +139,7 @@ fn bind_servers(first_port: u16) -> std::io::Result<BoundServers> {
     ))?;
     let published = reserved.local_addr()?.port();
     // ponytail: the broker binds `published` in another process after these drop; the window is
-    // narrow, so a collision there still fails the self-test.
+    // narrow, so a collision there still fails the device suite.
     let _free_on_every_family = (
         TcpListener::bind((Ipv6Addr::LOCALHOST, published))?,
         UdpSocket::bind((Ipv4Addr::LOCALHOST, published))?,
@@ -168,7 +168,7 @@ fn retry_port(attempt: usize) -> u16 {
 }
 
 impl TestServers {
-    pub fn start() -> wasmtime::Result<Self> {
+    fn start() -> wasmtime::Result<Self> {
         let mut attempts = 1;
         let BoundServers {
             tcp,
@@ -205,18 +205,18 @@ impl TestServers {
             let mut stream = accept_stream(&tcp6, super::FIXTURE_STARTUP_WAIT)?;
             wasmtime::ensure!(
                 stream.peer_addr()?.ip() == std::net::Ipv6Addr::LOCALHOST,
-                "network self-test IPv6 TCP source"
+                "network device suite IPv6 TCP source"
             );
             let mut bytes = [0; 10];
             stream.read_exact(&mut bytes)?;
             wasmtime::ensure!(
                 &bytes == b"terra-ipv6",
-                "network self-test IPv6 TCP request"
+                "network device suite IPv6 TCP request"
             );
             let mut extra = [0];
             wasmtime::ensure!(
                 stream.read(&mut extra)? == 0,
-                "network self-test IPv6 TCP FIN"
+                "network device suite IPv6 TCP FIN"
             );
             stream.write_all(&bytes)?;
             stream.shutdown(Shutdown::Write)?;
@@ -227,7 +227,7 @@ impl TestServers {
             let (length, peer) = udp6.recv_from(&mut bytes)?;
             wasmtime::ensure!(
                 &bytes[..length] == b"terra-ipv6" && peer.ip() == std::net::Ipv6Addr::LOCALHOST,
-                "network self-test IPv6 UDP request"
+                "network device suite IPv6 UDP request"
             );
             udp6.send_to(&bytes[..length], peer)?;
             Ok(())
@@ -243,11 +243,11 @@ impl TestServers {
         })
     }
 
-    pub fn finish(self) -> wasmtime::Result<()> {
+    fn finish(self) -> wasmtime::Result<()> {
         let results = [self.tcp, self.udp, self.tcp_ipv6, self.udp_ipv6].map(|server| {
             server
                 .join()
-                .map_err(|_| wasmtime::Error::msg("network self-test server failed"))
+                .map_err(|_| wasmtime::Error::msg("network device suite server failed"))
         });
         for result in results {
             result??;
@@ -371,7 +371,7 @@ fn serve_udp(udp: &UdpSocket) -> wasmtime::Result<()> {
         let (length, peer) = udp.recv_from(&mut bytes)?;
         wasmtime::ensure!(
             &bytes[..length] == payload && peer.ip().is_loopback(),
-            "network self-test UDP request"
+            "network device suite UDP request"
         );
         wasmtime::ensure!(
             socket_peer.is_none_or(|previous| previous == peer),
@@ -437,9 +437,9 @@ fn serve_tcp(listener: &TcpListener, published: u16) -> wasmtime::Result<()> {
     let expected = build_tcp_payload();
     let mut request = vec![0; expected.len()];
     stream.read_exact(&mut request)?;
-    wasmtime::ensure!(request == expected, "network self-test TCP request");
+    wasmtime::ensure!(request == expected, "network device suite TCP request");
     let mut eof = [0];
-    wasmtime::ensure!(stream.read(&mut eof)? == 0, "network self-test TCP EOF");
+    wasmtime::ensure!(stream.read(&mut eof)? == 0, "network device suite TCP EOF");
     stream.write_all(&expected)?;
     stream.shutdown(Shutdown::Write)?;
     for _ in 0..2 {
@@ -452,11 +452,11 @@ fn serve_tcp(listener: &TcpListener, published: u16) -> wasmtime::Result<()> {
         stream.read_exact(&mut reply)?;
         wasmtime::ensure!(
             &reply == b"published-reply",
-            "network self-test published response"
+            "network device suite published response"
         );
         wasmtime::ensure!(
             stream.read(&mut eof)? == 0,
-            "network self-test published EOF"
+            "network device suite published EOF"
         );
     }
     let retired_udp_peer = serve_published_udp(published)?;
@@ -464,7 +464,7 @@ fn serve_tcp(listener: &TcpListener, published: u16) -> wasmtime::Result<()> {
     wasmtime::ensure!(
         matches!(reset, Ok(0))
             || reset.is_err_and(|error| { error.kind() == std::io::ErrorKind::ConnectionReset }),
-        "network self-test reset left a stalled TCP resource open"
+        "network device suite reset left a stalled TCP resource open"
     );
     serve_reopened_published_udp(published)?;
     drop(retired_udp_peer);
@@ -472,7 +472,7 @@ fn serve_tcp(listener: &TcpListener, published: u16) -> wasmtime::Result<()> {
     stream.write_all(b"reset-reply")?;
     wasmtime::ensure!(
         stream.read(&mut eof)? == 0,
-        "network self-test connection after reset EOF"
+        "network device suite connection after reset EOF"
     );
     stream.shutdown(Shutdown::Write)?;
     serve_tcp_half_closes(listener)?;
@@ -611,7 +611,7 @@ fn serve_stalled_streams(listener: &TcpListener) -> wasmtime::Result<()> {
 }
 
 /// `wait` is `FIXTURE_STARTUP_WAIT` for a server's first client: servers start before the
-/// guest, whose earlier self-test stages can take longer than `STEP_WAIT` under tracing or load.
+/// guest, whose earlier network stages can take longer than `STEP_WAIT` under tracing or load.
 fn accept_stream(listener: &TcpListener, wait: Duration) -> wasmtime::Result<TcpStream> {
     let deadline = Instant::now() + wait;
     let stream = loop {
@@ -620,7 +620,7 @@ fn accept_stream(listener: &TcpListener, wait: Duration) -> wasmtime::Result<Tcp
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 wasmtime::ensure!(
                     Instant::now() < deadline,
-                    "network self-test TCP accept timed out"
+                    "network device suite TCP accept timed out"
                 );
                 std::thread::sleep(Duration::from_millis(1));
             }
@@ -639,7 +639,7 @@ fn configure_stream(stream: &TcpStream) -> wasmtime::Result<()> {
     Ok(())
 }
 
-pub async fn run_with_backend(
+async fn run_with_backend(
     artifacts: &TrustedArtifacts,
     engine: &wasmtime::Engine,
     backend: NetworkBackend,
@@ -670,7 +670,7 @@ async fn run_socket_streams(
     for reply in futures_util::future::join_all(requests).await {
         wasmtime::ensure!(
             reply == Ok(vec![Ipv4Addr::LOCALHOST.into()]),
-            "network self-test concurrent broker replies"
+            "network device suite concurrent broker replies"
         );
     }
     let broker_client = backend.client.clone();
@@ -812,7 +812,7 @@ async fn start_guest(
     crate::box_runtime::BoxRuntimeHandle,
 )> {
     let ram = GuestRam::new(2 * 1024 * 1024)
-        .ok_or_else(|| wasmtime::Error::msg("network self-test RAM allocation"))?;
+        .ok_or_else(|| wasmtime::Error::msg("network device suite RAM allocation"))?;
     let mut runtime = BoxRuntime::new(engine, BoxHost::new())?;
     runtime.initialize_mmio()?;
     let (streams, agent) = FrontendStreams::new();
@@ -1093,7 +1093,7 @@ impl GuestNetwork {
         let (stream, result) = self.open_tcp_result_on(guest_port, target).await?;
         wasmtime::ensure!(
             matches!(result, Message::TcpOpened(Ok(_))),
-            "network self-test TCP opening: {result:?}"
+            "network device suite TCP opening: {result:?}"
         );
         Ok(stream)
     }
@@ -1191,7 +1191,7 @@ impl GuestNetwork {
             match self.stream.read_message(stream).await? {
                 Message::Publication { guest_port, peer } => break (stream, guest_port, peer),
                 Message::PublicationUdp { guest_port: 8081 } => self.udp_publications.push(stream),
-                other => wasmtime::bail!("network self-test publication header: {other:?}"),
+                other => wasmtime::bail!("network device suite publication header: {other:?}"),
             }
         };
         wasmtime::ensure!(
@@ -1598,11 +1598,10 @@ mod tests {
         assert!(ports.len() > super::PORT_ATTEMPTS / 2);
     }
 
-    /// The host self-test starts these servers before its boot, vsock, storage and filesystem
-    /// stages; a server that gave up after `STEP_WAIT` refused the guest's later connection under
-    /// tracing or load.
+    /// The device suite starts these servers before the guest's earlier network stages; a server
+    /// that gave up after `STEP_WAIT` refused the guest's later connection under tracing or load.
     #[test]
-    fn test_servers_outlive_earlier_self_test_stages() {
+    fn test_servers_outlive_earlier_network_stages() {
         let servers = TestServers::start().unwrap();
         std::thread::sleep(STEP_WAIT + Duration::from_secs(1));
         let endpoints = servers.endpoints;

@@ -1,5 +1,7 @@
-//! Fallback seccomp filters terra embeds, compiled for any supported Linux target.
+//! The seccomp filters terra embeds, compiled for any supported Linux target.
 
+/// The kernel's limit: 4096 instructions of 8 bytes.
+pub const MAX_FILTER_BYTES: usize = 4096 * 8;
 const LOAD_WORD: u16 = 0x20;
 const AND: u16 = 0x54;
 const JUMP_EQUAL: u16 = 0x15;
@@ -46,7 +48,7 @@ const VM_DENIED_SYSCALLS: [&str; 3] = ["connect", "sendmsg", "sendmmsg"];
 /// The supervisor binds every published listener before starting the broker.
 const NETWORK_DENIED_SYSCALLS: [&str; 1] = ["listen"];
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Architecture {
     X86_64,
     Aarch64,
@@ -72,7 +74,12 @@ impl Architecture {
         }
     }
 
-    fn resolve_syscall_number(self, name: &str) -> Result<u32, String> {
+    /// The architecture a Rust target triple such as `x86_64-unknown-linux-musl` names.
+    pub fn from_triple(triple: &str) -> Result<Self, String> {
+        Self::from_target(triple.split('-').next().unwrap_or_default(), "little")
+    }
+
+    pub fn resolve_syscall_number(self, name: &str) -> Result<u32, String> {
         let number = match self {
             Self::X86_64 => name
                 .parse::<syscalls::x86_64::Sysno>()
@@ -84,9 +91,18 @@ impl Architecture {
         .map_err(|()| format!("unknown target syscall: {name}"))?;
         u32::try_from(number).map_err(|error| error.to_string())
     }
+
+    #[must_use]
+    pub fn name_syscall(self, number: u32) -> Option<&'static str> {
+        let number = usize::try_from(number).ok()?;
+        match self {
+            Self::X86_64 => syscalls::x86_64::Sysno::new(number).map(|syscall| syscall.name()),
+            Self::Aarch64 => syscalls::aarch64::Sysno::new(number).map(|syscall| syscall.name()),
+        }
+    }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Role {
     Supervisor,
     Vm,
@@ -112,6 +128,23 @@ struct Filter {
 }
 
 impl Filter {
+    /// Starts a filter that kills any other architecture's or x32 syscall and loads the number.
+    fn new(architecture: Architecture) -> Self {
+        let mut filter = Self {
+            architecture,
+            bpf: Vec::new(),
+        };
+        filter.append(LOAD_WORD, 0, 0, AUDIT_ARCH);
+        filter.append(JUMP_EQUAL, 1, 0, architecture.audit_arch());
+        filter.append(RETURN, 0, 0, KILL_PROCESS);
+        filter.append(LOAD_WORD, 0, 0, SYSCALL_NUMBER);
+        if architecture == Architecture::X86_64 {
+            filter.append(JUMP_BITS_SET, 0, 1, X32_SYSCALL_BIT);
+            filter.append(RETURN, 0, 0, KILL_PROCESS);
+        }
+        filter
+    }
+
     fn append(&mut self, code: u16, jump_true: u8, jump_false: u8, value: u32) {
         self.bpf.extend_from_slice(&code.to_le_bytes());
         self.bpf.extend_from_slice(&[jump_true, jump_false]);
@@ -128,20 +161,10 @@ impl Filter {
     }
 }
 
-/// Returns the filter as little-endian `sock_filter` instructions.
-pub fn compile_fallback_seccomp(architecture: Architecture, role: Role) -> Result<Vec<u8>, String> {
-    let mut filter = Filter {
-        architecture,
-        bpf: Vec::new(),
-    };
-    filter.append(LOAD_WORD, 0, 0, AUDIT_ARCH);
-    filter.append(JUMP_EQUAL, 1, 0, architecture.audit_arch());
-    filter.append(RETURN, 0, 0, KILL_PROCESS);
-    filter.append(LOAD_WORD, 0, 0, SYSCALL_NUMBER);
-    if architecture == Architecture::X86_64 {
-        filter.append(JUMP_BITS_SET, 0, 1, X32_SYSCALL_BIT);
-        filter.append(RETURN, 0, 0, KILL_PROCESS);
-    }
+/// Returns the role's filter, which denies dangerous interfaces and enforces argument rules, as
+/// little-endian `sock_filter` instructions.
+pub fn compile_role_filter(architecture: Architecture, role: Role) -> Result<Vec<u8>, String> {
+    let mut filter = Filter::new(architecture);
     filter.append_denied_syscalls(&DENIED_SYSCALLS)?;
     append_terminal_injection_rules(&mut filter)?;
     match role {
@@ -156,6 +179,51 @@ pub fn compile_fallback_seccomp(architecture: Architecture, role: Role) -> Resul
         }
     }
     filter.append(RETURN, 0, 0, ALLOW);
+    Ok(filter.bpf)
+}
+
+/// Returns an allowlist that kills the process on any syscall, or `ioctl` request, `policy`
+/// does not list. Argument rules stay in [`compile_role_filter`], which every role also installs.
+pub fn compile_allowlist(
+    architecture: Architecture,
+    policy: &crate::seccomp_policy::RolePolicy,
+) -> Result<Vec<u8>, String> {
+    let mut filter = Filter::new(architecture);
+    let ioctl = architecture.resolve_syscall_number("ioctl")?;
+    // `ioctl` comes first: it carries `KVM_RUN`, the VM's hottest syscall, and argument rules
+    // keep the kernel from caching its verdict.
+    if policy.syscalls.contains("ioctl") {
+        // Past the argument load, one compare and return per request, and the final kill.
+        let skip = u8::try_from(2 * policy.ioctls.len() + 2)
+            .map_err(|_| "too many ioctl requests for one filter".to_owned())?;
+        filter.append(JUMP_EQUAL, 0, skip, ioctl);
+        filter.append(LOAD_WORD, 0, 0, SECOND_ARGUMENT);
+        for request in &policy.ioctls {
+            filter.append(JUMP_EQUAL, 0, 1, *request);
+            filter.append(RETURN, 0, 0, ALLOW);
+        }
+        filter.append(RETURN, 0, 0, KILL_PROCESS);
+    } else if !policy.ioctls.is_empty() {
+        return Err("ioctl requests listed without the ioctl syscall".into());
+    }
+    // The kernel itself issues `restart_syscall` to resume an interrupted sleep.
+    let always_allowed = ["restart_syscall"];
+    for name in policy
+        .syscalls
+        .iter()
+        .map(String::as_str)
+        .chain(always_allowed)
+    {
+        let syscall = architecture.resolve_syscall_number(name)?;
+        if syscall != ioctl {
+            filter.append(JUMP_EQUAL, 0, 1, syscall);
+            filter.append(RETURN, 0, 0, ALLOW);
+        }
+    }
+    filter.append(RETURN, 0, 0, KILL_PROCESS);
+    if filter.bpf.len() > MAX_FILTER_BYTES {
+        return Err("allowlist exceeds the kernel's 4096 BPF instructions".into());
+    }
     Ok(filter.bpf)
 }
 

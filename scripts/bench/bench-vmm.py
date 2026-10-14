@@ -31,7 +31,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--component", type=Path, required=True, help="current component VMM binary")
     parser.add_argument("--legacy-launcher", choices=("direct", "bwrap", "sandbox"), help="baseline vm.init setting (bwrap for binaries before the sandbox rename)")
-    parser.add_argument("--component-launcher", choices=("direct", "sandbox"), help="current vm.init setting")
     parser.add_argument("--runs", type=int, default=3, help="runs per baseline case (default: 3)")
     parser.add_argument(
         "--capacity-runs", type=int, default=1, help="runs for each 4/8-vCPU capacity case (default: 1)"
@@ -745,7 +744,6 @@ def main() -> None:
                 args.command_timeout_seconds,
                 args.interactive_samples,
                 args.idle_sample_seconds,
-                args.component_launcher,
             ),
         ],
     }

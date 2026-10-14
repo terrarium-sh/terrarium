@@ -1,3 +1,5 @@
+//! Host fixture services and published-port probes for the guest suite.
+
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::Arc;
@@ -43,7 +45,7 @@ impl HostService {
         let server_datagrams = Arc::clone(&datagrams);
         let server_stop = Arc::clone(&stop);
         let thread = thread::Builder::new()
-            .name("self-test-network".to_owned())
+            .name("guest-suite-network".to_owned())
             .spawn(move || {
                 serve_requests(
                     &listener,
@@ -201,13 +203,13 @@ pub(super) fn read_published_datagram(port: u16) -> bool {
     result().unwrap_or(false)
 }
 
-pub(super) fn exercise_quic(self_test: &super::SelfTest, allowed: &HostService) -> Result<()> {
-    println!("self-test: UDP QUIC options, ECN and GSO");
+pub(super) fn exercise_quic(suite: &super::Suite, allowed: &HostService) -> Result<()> {
+    println!("guest suite: UDP QUIC options, ECN and GSO");
     std::fs::write(
-        self_test.directory.join("writable/socket-probe"),
+        suite.directory.join("writable/socket-probe"),
         include_bytes!(env!("TERRA_SOCKET_PROBE")),
     )?;
-    let output = self_test.execute(
+    let output = suite.execute(
         &format!(
             "cp /work/socket-probe /tmp/socket-probe; chmod 755 /tmp/socket-probe; \
              /tmp/socket-probe --quic-socket 100.96.0.1 {}",

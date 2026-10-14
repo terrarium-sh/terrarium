@@ -32,7 +32,7 @@ pub(super) async fn run(
     engine: &wasmtime::Engine,
 ) -> wasmtime::Result<()> {
     let ram = GuestRam::new(2 * 1024 * 1024)
-        .ok_or_else(|| wasmtime::Error::msg("vsock self-test RAM allocation"))?;
+        .ok_or_else(|| wasmtime::Error::msg("vsock device suite RAM allocation"))?;
     let mut runtime = BoxRuntime::new(engine, BoxHost::new())?;
     runtime.initialize_mmio()?;
     let (streams, mut agent) = FrontendStreams::new();
@@ -598,7 +598,7 @@ async fn within<T>(
 fn stream_error(
     error: crate::component::vsock::streams::stream_types::StreamError,
 ) -> wasmtime::Error {
-    wasmtime::Error::msg(format!("vsock self-test stream: {error:?}"))
+    wasmtime::Error::msg(format!("vsock device suite stream: {error:?}"))
 }
 
 pub(super) async fn wait_connected(endpoint: &mut StreamEndpoint) -> wasmtime::Result<u64> {

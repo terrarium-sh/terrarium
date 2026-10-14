@@ -12,8 +12,8 @@ use std::time::Duration;
 mod linux;
 #[cfg(target_os = "linux")]
 use linux as backend;
-#[cfg(target_os = "linux")]
-pub use linux::seccomp;
+#[cfg(all(target_os = "linux", feature = "generator"))]
+pub use linux::generator;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
@@ -26,9 +26,9 @@ mod windows;
 #[cfg(windows)]
 use windows as backend;
 #[cfg(windows)]
-pub use windows::{LauncherSockets, resolve_computer_name};
+pub use windows::LauncherSockets;
 
-pub use backend::{install_policy, resolve_policy, run_launcher_worker, verify_worker_role};
+pub use backend::{restrict_role, run_launcher_worker, verify_worker_role};
 
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
@@ -48,32 +48,6 @@ impl Role {
             Self::Supervisor => "supervisor",
             Self::Vm => terra_platform::process::sandbox_env::VM_ROLE,
             Self::Network => "network",
-        }
-    }
-}
-
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-pub struct PolicyBundle {
-    pub supervisor: Vec<u8>,
-    pub vm: Vec<u8>,
-    pub network: Vec<u8>,
-}
-
-impl PolicyBundle {
-    fn try_from_roles(mut policy: impl FnMut(Role) -> Result<Vec<u8>>) -> Result<Self> {
-        Ok(Self {
-            supervisor: policy(Role::Supervisor)?,
-            vm: policy(Role::Vm)?,
-            network: policy(Role::Network)?,
-        })
-    }
-
-    #[must_use]
-    pub fn get(&self, role: Role) -> &[u8] {
-        match role {
-            Role::Supervisor => &self.supervisor,
-            Role::Vm => &self.vm,
-            Role::Network => &self.network,
         }
     }
 }
@@ -138,19 +112,16 @@ pub struct Launch<'a> {
     pub grants: Vec<Grant>,
     /// Where macOS stages each signed worker bundle.
     pub staging_directory: &'a Path,
-    /// `None` uses only the platform's mandatory role restrictions.
-    pub policy: Option<&'a [u8]>,
 }
 
 pub struct PreparedLaunch {
     pub command: Command,
-    /// `None` runs `command` unconfined.
-    confinement: Option<backend::Confinement>,
+    confinement: backend::Confinement,
 }
 
 /// Host resources a confined child needs until it exits.
 pub struct LaunchResources {
-    _retained: Option<backend::Resources>,
+    _retained: backend::Resources,
 }
 
 pub struct SpawnedLaunch {
@@ -160,14 +131,6 @@ pub struct SpawnedLaunch {
 }
 
 impl PreparedLaunch {
-    #[must_use]
-    pub const fn direct(command: Command) -> Self {
-        Self {
-            command,
-            confinement: None,
-        }
-    }
-
     pub fn spawn(self, confirmation_timeout: Duration) -> Result<SpawnedLaunch> {
         let Self {
             mut command,
@@ -176,19 +139,12 @@ impl PreparedLaunch {
         let spawned = command.spawn();
         drop(command);
         let mut child = spawned.context("starting the worker process")?;
-        let Some(confinement) = confinement else {
-            return Ok(SpawnedLaunch {
-                pid: child.id(),
-                child,
-                resources: LaunchResources { _retained: None },
-            });
-        };
         match confinement.confirm(&mut child, confirmation_timeout) {
             Ok((pid, retained)) => Ok(SpawnedLaunch {
                 child,
                 pid,
                 resources: LaunchResources {
-                    _retained: Some(retained),
+                    _retained: retained,
                 },
             }),
             Err(error) => {
@@ -224,9 +180,8 @@ fn copy_explicit_environment(confined: &mut Command, requested: &Command) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Stdio;
 
-    /// The build script compiles one fallback filter per terra-build role; a role
+    /// The build script compiles one role filter per terra-build role; a role
     /// missing there would leave the runtime without its embedded policy.
     #[test]
     fn build_script_roles_match_runtime_roles() {
@@ -234,26 +189,5 @@ mod tests {
             terra_build::seccomp::Role::ALL.map(terra_build::seccomp::Role::name),
             Role::ALL.map(Role::name)
         );
-    }
-
-    #[test]
-    fn direct_launch_preserves_command_and_reports_the_child_pid() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let mut launch = PreparedLaunch::direct(Command::new(std::env::current_exe()?));
-        launch
-            .command
-            .arg("--list")
-            .current_dir(directory.path())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let spawned = launch.spawn(Duration::ZERO)?;
-        assert_eq!(spawned.pid, spawned.child.id());
-        let output = spawned.child.wait_with_output()?;
-        assert!(output.status.success(), "{output:?}");
-        assert!(
-            String::from_utf8(output.stdout)?
-                .contains("tests::direct_launch_preserves_command_and_reports_the_child_pid")
-        );
-        Ok(())
     }
 }

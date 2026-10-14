@@ -1,6 +1,5 @@
 use super::boot::{self, BootSpec, BrokerMetadata, LaunchedVm};
 use crate::process::SupervisedChild;
-use crate::sandbox::config::LauncherConfig;
 use crate::state::{self, BoxRef};
 use crate::sys;
 use anyhow::{Context, Result, ensure};
@@ -15,70 +14,21 @@ use terra_platform::local_socket::LocalListener;
 use terra_platform::local_socket::{
     AsyncLocalStream, LocalStream, OwnedSocket, create_local_pair, receive_sockets, send_sockets,
 };
-use terra_sandbox::{Launch, PolicyBundle, PreparedLaunch, Role};
+use terra_sandbox::{Launch, Role};
 
 pub(crate) const SUPERVISOR_ARG: &str = "__supervisor";
 pub(crate) const NETWORK_ARG: &str = "__network";
-pub(crate) const VM_SELF_TEST_ARG: &str = "__vm_self_test";
-pub(crate) const VM_NATIVE_PROBE_ARG: &str = "__vm_native_probe";
-pub(crate) const NETWORK_NATIVE_PROBE_ARG: &str = "__network_native_probe";
 pub(crate) const NETWORK_FD: i32 = 7;
 #[cfg(any(target_os = "macos", windows))]
 pub(crate) const AGENT_LISTENER_FD: i32 = 10;
 #[cfg(any(target_os = "macos", windows))]
 pub(crate) const CONTROL_LISTENER_FD: i32 = 11;
-#[cfg(any(target_os = "macos", windows))]
-pub(crate) const AGENT_CONTROL_LISTENER_FD: i32 = 12;
-#[cfg(any(target_os = "macos", windows))]
-pub(crate) const AGENT_AGENT_LISTENER_FD: i32 = 13;
 const CONFIG_FD: i32 = 8;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(90);
 const BROKER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
-const MAX_SUPERVISOR_SPEC_BYTES: u64 = (64 << 20) + (256 << 10);
 
-#[derive(serde::Serialize, serde::Deserialize)]
-struct SupervisorSpec {
-    boot: BootSpec,
-    launcher: VmLauncher,
-    policies: Option<PolicyBundle>,
-    self_test: Option<[u16; 3]>,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum VmLauncher {
-    Direct,
-    Custom(PathBuf),
-    Sandboxed,
-}
-
-pub(super) fn spawn(
-    bx: &BoxRef,
-    spec: &BootSpec,
-    lock: &File,
-    exe: &Path,
-    launcher: &LauncherConfig,
-) -> Result<LaunchedVm> {
-    let (launcher, policies) = match launcher {
-        LauncherConfig::Direct => (VmLauncher::Direct, None),
-        LauncherConfig::Custom(initializer) => (VmLauncher::Custom(initializer.clone()), None),
-        LauncherConfig::Sandboxed { policy } => {
-            let policies = if std::env::var_os("TERRA_SYSCALL_TRACE").is_some() {
-                #[cfg(target_os = "linux")]
-                validate_native_confinement(None)?;
-                None
-            } else {
-                if cfg!(target_os = "linux") && policy.is_none() {
-                    eprintln!(
-                        "terra: warning: using the built-in seccomp filters without syscall allowlists; install the release bundle at ~/.terra/config/seccomp or run `terra self-test --generate-policy`"
-                    );
-                }
-                Some(terra_sandbox::resolve_policy(policy.as_deref())?)
-            };
-            (VmLauncher::Sandboxed, policies)
-        }
-    };
+pub(super) fn spawn(bx: &BoxRef, spec: &BootSpec, lock: &File, exe: &Path) -> Result<LaunchedVm> {
     super::resources::prepare_volumes(spec, bx)?;
     let mut child_spec = spec.clone();
     child_spec.host_publishes_pid = true;
@@ -86,16 +36,7 @@ pub(super) fn spawn(
         child_spec.network_broker.is_none(),
         "broker metadata must be supplied by the supervisor"
     );
-    let bytes = serde_json::to_vec(&SupervisorSpec {
-        boot: child_spec,
-        launcher,
-        policies,
-        self_test: None,
-    })?;
-    ensure!(
-        bytes.len() as u64 <= MAX_SUPERVISOR_SPEC_BYTES,
-        "supervisor startup specification exceeds its limit"
-    );
+    let bytes = boot::encode_boot_spec(&child_spec)?;
     let diagnostics = sys::create_regular_file(&bx.get_dir().join("launcher.log"))?;
     let mut command = Command::new(exe);
     command
@@ -160,51 +101,27 @@ pub(crate) fn run(dir: PathBuf) -> Result<ExitCode> {
 
 fn run_box(dir: PathBuf, lock: &File) -> Result<ExitCode> {
     crate::process::install_interrupt_handler()?;
-    let bytes = read_supervisor_input(std::io::stdin(), BROKER_STARTUP_TIMEOUT)?;
-    let SupervisorSpec {
-        mut boot,
-        launcher,
-        policies,
-        self_test,
-    } = serde_json::from_slice(&bytes)?;
+    let mut boot = read_supervisor_input(std::io::stdin(), BROKER_STARTUP_TIMEOUT)?;
     let bx = BoxRef::from_state_dir(dir, &boot.project_dir);
     let supervisor_identity =
         sys::create_regular_file(&bx.get_dir().join(state::SUPERVISOR_PID_FILE))?;
     BoxRef::publish_pid(&supervisor_identity, std::process::id(), false)?;
     let identity = sys::create_regular_file(&bx.get_dir().join(state::HOST_PID_FILE))?;
     #[cfg(any(target_os = "macos", windows))]
-    prepare_vm_outputs(&bx, self_test.is_some())?;
+    prepare_vm_outputs(&bx)?;
     let executable = std::env::current_exe()?;
-    let (mut broker, endpoint) = start_optional_broker(
-        &executable,
-        &mut boot,
-        policies
-            .as_ref()
-            .map(|policies| policies.get(Role::Network)),
-        matches!(launcher, VmLauncher::Sandboxed),
-    )?
-    .map_or((None, None), |(broker, endpoint)| {
-        (Some(broker), Some(endpoint))
-    });
-    let mut launch = prepare_vm_launch(
-        &launcher,
-        &boot,
-        &bx,
-        &executable,
-        policies.as_ref().map(|policies| policies.get(Role::Vm)),
-        self_test,
-    )?;
+    let (mut broker, endpoint) = start_optional_broker(&executable, &mut boot)?
+        .map_or((None, None), |(broker, endpoint)| {
+            (Some(broker), Some(endpoint))
+        });
+    let mut launch = super::launcher::prepare_vm_launch(&boot, &bx, &executable)?;
     let command = &mut launch.command;
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
     #[cfg(any(target_os = "macos", windows))]
-    let inherited_listeners = if matches!(launcher, VmLauncher::Sandboxed) {
-        pass_vm_listeners(command, &bx, boot.mode, self_test.is_some())?
-    } else {
-        Vec::new()
-    };
+    let inherited_listeners = pass_vm_listeners(command, &bx, boot.mode)?;
     let inherited = endpoint
         .as_ref()
         .map(|endpoint| sys::pass_ipc(command, endpoint, NETWORK_FD))
@@ -221,68 +138,15 @@ fn run_box(dir: PathBuf, lock: &File) -> Result<ExitCode> {
     boot::publish_vm_pid(vm_pid, &bx, lock, &identity, boot.mode)?;
     boot::send_startup_input(vm.child_mut(), boot::encode_boot_spec(&boot)?)?;
     let ready = boot::start_ready_reader(vm.child_mut())?;
-    let agent_clients = if self_test.is_some() {
-        let directory = self_test_directory(&bx);
-        Some(
-            std::thread::Builder::new()
-                .name("self-test-agent-clients".into())
-                .spawn(move || terra_runtime::self_test::run_agent_clients(&directory))?,
-        )
-    } else {
-        None
-    };
-    if let Some(policies) = &policies {
-        terra_sandbox::install_policy(policies.get(Role::Supervisor))?;
-    }
-    let result = supervise(
-        &bx,
-        &mut vm,
-        broker.as_mut(),
-        &ready,
-        STARTUP_TIMEOUT,
-        self_test.is_some(),
-    );
+    terra_sandbox::restrict_role(Role::Supervisor)?;
+    let result = supervise(&bx, &mut vm, broker.as_mut(), &ready, STARTUP_TIMEOUT);
     drop((vm, broker));
-    let code = result?;
-    if code == ExitCode::SUCCESS
-        && let Some(clients) = agent_clients
-    {
-        clients
-            .join()
-            .map_err(|_| anyhow::anyhow!("self-test agent client failed"))?
-            .map_err(|error| anyhow::anyhow!("self-test agent clients: {error:#}"))?;
-    }
-    Ok(code)
-}
-
-fn prepare_vm_launch(
-    launcher: &VmLauncher,
-    spec: &BootSpec,
-    bx: &BoxRef,
-    executable: &Path,
-    policy: Option<&[u8]>,
-    self_test: Option<[u16; 3]>,
-) -> Result<PreparedLaunch> {
-    match launcher {
-        VmLauncher::Direct => {
-            let mut command = Command::new(executable);
-            command.arg(boot::VM_PROCESS_FLAG_ARG).arg(bx.get_dir());
-            Ok(PreparedLaunch::direct(command))
-        }
-        VmLauncher::Custom(initializer) => Ok(PreparedLaunch::direct(
-            super::launcher::custom_command(initializer, executable, spec, bx)?,
-        )),
-        VmLauncher::Sandboxed => {
-            super::launcher::prepare_sandbox_launch(spec, bx, executable, policy, self_test)
-        }
-    }
+    result
 }
 
 fn start_optional_broker(
     executable: &Path,
     boot: &mut BootSpec,
-    policy: Option<&[u8]>,
-    is_sandboxed: bool,
 ) -> Result<Option<(SupervisedChild, LocalStream)>> {
     ensure!(
         boot.network_broker.is_none(),
@@ -295,37 +159,18 @@ fn start_optional_broker(
     let host_listeners = terra_network::bind_listeners(&mut config)?;
     let listeners = config.listeners.clone();
     let (endpoint, broker_endpoint) = create_local_pair()?;
-    let (broker, ready) = start_broker(
-        executable,
-        &config,
-        host_listeners,
-        broker_endpoint,
-        policy,
-        is_sandboxed,
-    )?;
+    let (broker, ready) = start_broker(executable, &config, host_listeners, broker_endpoint)?;
     boot.network_broker = Some(BrokerMetadata { ready, listeners });
     Ok(Some((broker, endpoint)))
 }
 
-pub(super) fn self_test_directory(bx: &BoxRef) -> PathBuf {
-    #[cfg(target_os = "linux")]
-    return bx.get_dir().to_owned();
-    #[cfg(not(target_os = "linux"))]
-    bx.get_dir().join("self-test")
-}
-
 #[cfg(any(target_os = "macos", windows))]
-fn prepare_vm_outputs(bx: &BoxRef, is_self_test: bool) -> Result<()> {
+fn prepare_vm_outputs(bx: &BoxRef) -> Result<()> {
     #[cfg(target_os = "macos")]
     std::fs::create_dir_all(bx.get_dir().join("runtime-logs"))?;
     #[cfg(windows)]
     sys::create_regular_file(&bx.get_dir().join(state::LOG_FILE))?;
     sys::create_regular_file(&bx.get_dir().join(state::DIAGNOSTICS_LOG))?;
-    if is_self_test {
-        let directory = self_test_directory(bx);
-        std::fs::create_dir_all(directory.join("writable"))?;
-        std::fs::create_dir_all(directory.join("readonly"))?;
-    }
     Ok(())
 }
 
@@ -334,7 +179,6 @@ fn pass_vm_listeners(
     command: &mut Command,
     bx: &BoxRef,
     mode: terra_protocol::PlanMode,
-    is_self_test: bool,
 ) -> Result<Vec<LocalListener>> {
     let mut paths = vec![(AGENT_LISTENER_FD, bx.get_dir().join(state::AGENT_SOCKET))];
     if mode == terra_protocol::PlanMode::Run {
@@ -342,16 +186,6 @@ fn pass_vm_listeners(
             CONTROL_LISTENER_FD,
             bx.get_dir().join(state::CONTROL_SOCKET),
         ));
-    }
-    if is_self_test {
-        let directory = self_test_directory(bx);
-        paths.extend([
-            (
-                AGENT_CONTROL_LISTENER_FD,
-                directory.join("agent-control.sock"),
-            ),
-            (AGENT_AGENT_LISTENER_FD, directory.join("agent-agent.sock")),
-        ]);
     }
     let mut inherited = Vec::new();
     for (descriptor, path) in paths {
@@ -373,7 +207,6 @@ fn supervise(
     mut broker: Option<&mut SupervisedChild>,
     ready: &std::sync::mpsc::Receiver<Result<bool>>,
     startup_timeout: Duration,
-    is_self_test: bool,
 ) -> Result<ExitCode> {
     let deadline = Instant::now() + startup_timeout;
     let mut is_ready = false;
@@ -425,9 +258,6 @@ fn supervise(
             match ready.try_recv() {
                 Ok(result) => {
                     ensure!(result?, "VM closed its startup pipe before readiness");
-                    if is_self_test {
-                        exercise_host_service_clients(bx)?;
-                    }
                     is_ready = true;
                     boot::write_agent_ready();
                 }
@@ -443,12 +273,6 @@ fn supervise(
         }
         std::thread::sleep(Duration::from_millis(25));
     }
-}
-
-fn exercise_host_service_clients(bx: &BoxRef) -> Result<()> {
-    let client = LocalStream::connect(bx.get_dir().join(state::AGENT_SOCKET))?;
-    drop(client);
-    bx.request_stop()
 }
 
 pub(crate) fn build_broker_config(spec: &BootSpec) -> Result<terra_network::config::Config> {
@@ -480,314 +304,23 @@ pub(crate) fn build_broker_config(spec: &BootSpec) -> Result<terra_network::conf
     })
 }
 
-pub(crate) fn run_host_self_test() -> Result<()> {
-    let servers = terra_runtime::self_test::network::TestServers::start()
-        .map_err(|error| anyhow::anyhow!("{error:#}"))?;
-    let endpoints = servers.endpoints;
-    let directory = tempfile::tempdir()?;
-    let bx = BoxRef::from_state_dir(directory.path().join("box"), directory.path());
-    let lock = bx.lock_run()?;
-    #[cfg(windows)]
-    std::fs::write(bx.get_dir().join(state::ROOTFS_FILE), b"")?;
-    let spec = BootSpec {
-        cfg: crate::config::Config {
-            network: crate::config::Network {
-                allow: vec![
-                    format!("HOST_LOOPBACK:{}", endpoints.tcp),
-                    format!("HOST_LOOPBACK:{}", endpoints.udp),
-                    "localhost".into(),
-                ],
-                hosts: vec![crate::config::StaticDnsRecord {
-                    name: "loopback.test".into(),
-                    addr: "127.0.0.1".into(),
-                }],
-                ports: vec![
-                    format!("{}:8080", endpoints.published),
-                    format!("{}:8081/udp", endpoints.published),
-                ],
-                ..crate::config::Network::default()
-            },
-            ..crate::config::Config::default()
-        },
-        project_dir: directory.path().to_path_buf(),
-        root: false,
-        mode: terra_protocol::PlanMode::Run,
-        foreground: true,
-        host_publishes_pid: true,
-        network_broker: None,
-    };
-    let launcher = crate::sandbox::config::load()?;
-    let policies = if std::env::var_os("TERRA_SYSCALL_TRACE").is_some() {
-        None
-    } else {
-        let policy = match &launcher {
-            LauncherConfig::Sandboxed { policy } => policy.as_deref(),
-            LauncherConfig::Direct | LauncherConfig::Custom(_) => None,
-        };
-        Some(terra_sandbox::resolve_policy(policy)?)
-    };
-    run_native_probe(
-        endpoints.tcp,
-        policies.as_ref().map(|policies| policies.get(Role::Vm)),
-    )?;
-    let sentinel = bx.get_dir().join("broker-denied-sentinel");
-    std::fs::write(&sentinel, b"VM grant")?;
-    run_network_native_probe(
-        &sentinel,
-        policies
-            .as_ref()
-            .map(|policies| policies.get(Role::Network)),
-    )?;
-    run_multiprocess_self_test(
-        &bx,
-        &lock,
-        spec.clone(),
-        policies.clone(),
-        [endpoints.tcp, endpoints.udp, endpoints.published],
-    )?;
-    servers
-        .finish()
-        .map_err(|error| anyhow::anyhow!("{error:#}"))?;
-    let local_box = BoxRef::from_state_dir(directory.path().join("local-only"), directory.path());
-    let local_lock = local_box.lock_run()?;
-    #[cfg(windows)]
-    std::fs::write(local_box.get_dir().join(state::ROOTFS_FILE), b"")?;
-    let mut local_spec = spec;
-    local_spec.cfg.network = crate::config::Network {
-        enabled: false,
-        ..crate::config::Network::default()
-    };
-    run_multiprocess_self_test(&local_box, &local_lock, local_spec, policies, [0; 3])
-}
-
-fn run_multiprocess_self_test(
-    bx: &BoxRef,
-    lock: &File,
-    spec: BootSpec,
-    policies: Option<PolicyBundle>,
-    endpoints: [u16; 3],
-) -> Result<()> {
-    let bytes = serde_json::to_vec(&SupervisorSpec {
-        boot: spec,
-        launcher: VmLauncher::Sandboxed,
-        policies,
-        self_test: Some(endpoints),
-    })?;
-    let executable = std::env::current_exe()?;
-    let mut command = Command::new(executable);
-    command
-        .arg(SUPERVISOR_ARG)
-        .arg(bx.get_dir())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
-    let guard = sys::supervise_supervisor_child(&mut command, true)?;
-    let inherited = sys::pass_lock(&mut command, lock)?;
-    let mut child = SupervisedChild::new(command.spawn()?, guard)?;
-    drop(inherited);
-    boot::send_startup_input(child.child_mut(), bytes)?;
-    let status = child.wait(STARTUP_TIMEOUT, true)?;
-    ensure!(
-        status.success(),
-        "multiprocess host self-test failed ({status})"
-    );
-    Ok(())
-}
-
-fn run_native_probe(port: u16, policy: Option<&[u8]>) -> Result<()> {
-    let executable = std::env::current_exe()?;
-    let mut command = Command::new(&executable);
-    command.arg(VM_NATIVE_PROBE_ARG).arg(port.to_string());
-    let mut launch = terra_sandbox::prepare_launch(Launch {
-        role: Role::Vm,
-        command,
-        grants: Vec::new(),
-        policy,
-        staging_directory: &state::get_terra_home_path()?,
-    })?;
-    let command = &mut launch.command;
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
-    let guard = supervise_worker_child(command)?;
-    let mut child = SupervisedChild::from_launch(launch.spawn(BROKER_STARTUP_TIMEOUT)?, guard)?;
-    wait_probe_ready(child.child_mut())?;
-    let status = child.wait(BROKER_STARTUP_TIMEOUT, true)?;
-    let is_denied = status.success();
-    #[cfg(target_os = "linux")]
-    let is_denied = is_denied || status.code() == Some(128 + libc::SIGSYS);
-    ensure!(
-        is_denied,
-        "native VM networking enforcement probe failed: {status}"
-    );
-    Ok(())
-}
-
-pub(crate) fn run_vm_native_probe(port: u16) -> Result<ExitCode> {
-    boot::write_agent_ready();
-    let endpoint = (std::net::Ipv4Addr::LOCALHOST, port).into();
-    ensure!(
-        std::net::TcpStream::connect_timeout(&endpoint, Duration::from_millis(100)).is_err(),
-        "isolated VM worker reached a host endpoint with a native socket"
-    );
-    Ok(ExitCode::SUCCESS)
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) fn validate_enforcement(bundle: &Path) -> Result<()> {
-    let policies = terra_sandbox::resolve_policy(Some(bundle))?;
-    validate_native_confinement(Some(&policies))
-}
-
-#[cfg(target_os = "linux")]
-fn validate_native_confinement(policies: Option<&PolicyBundle>) -> Result<()> {
-    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
-    run_native_probe(
-        listener.local_addr()?.port(),
-        policies.map(|policies| policies.get(Role::Vm)),
-    )?;
-    let directory = tempfile::tempdir()?;
-    let sentinel = directory.path().join("vm-grant");
-    std::fs::write(&sentinel, b"VM grant")?;
-    run_network_native_probe(
-        &sentinel,
-        policies.map(|policies| policies.get(Role::Network)),
-    )
-}
-
-fn run_network_native_probe(sentinel: &Path, policy: Option<&[u8]>) -> Result<()> {
-    let host_listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
-    let executable = std::env::current_exe()?;
-    let mut command = Command::new(&executable);
-    command
-        .arg(NETWORK_NATIVE_PROBE_ARG)
-        .arg(sentinel)
-        .arg(host_listener.local_addr()?.to_string());
-    let mut launch = terra_sandbox::prepare_launch(Launch {
-        role: Role::Network,
-        command,
-        grants: Vec::new(),
-        policy,
-        staging_directory: &state::get_terra_home_path()?,
-    })?;
-    let command = &mut launch.command;
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
-    let guard = supervise_worker_child(command)?;
-    let mut child = SupervisedChild::from_launch(launch.spawn(BROKER_STARTUP_TIMEOUT)?, guard)?;
-    wait_probe_ready(child.child_mut())?;
-    ensure!(
-        child.wait(BROKER_STARTUP_TIMEOUT, true)?.success(),
-        "network broker native confinement probe failed"
-    );
-    Ok(())
-}
-
-/// `host_listener` is a loopback listener the supervisor holds open for the probe.
-pub(crate) fn run_network_native_probe_worker(
-    sentinel: &Path,
-    host_listener: std::net::SocketAddr,
-) -> Result<ExitCode> {
-    boot::write_agent_ready();
-    #[cfg(not(windows))]
-    ensure!(
-        File::open(sentinel).is_err() && File::open("/dev/kvm").is_err(),
-        "network broker can access VM file or KVM grants"
-    );
-    #[cfg(target_os = "linux")]
-    ensure!(
-        std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).is_err(),
-        "network broker can listen"
-    );
-    #[cfg(windows)]
-    {
-        ensure!(
-            File::open(sentinel).is_err(),
-            "network broker read a host file outside its grants"
-        );
-        probe_broker_loopback(
-            &terra_sandbox::LauncherSockets::claim()?
-                .context("network broker lacks its launcher socket channel")?,
-            host_listener,
-        )?;
-        terra_sandbox::resolve_computer_name().context("network broker cannot resolve names")?;
-    }
-    #[cfg(not(windows))]
-    std::net::TcpStream::connect_timeout(&host_listener, Duration::from_secs(2))
-        .context("network broker cannot reach host loopback")?;
-    Ok(ExitCode::SUCCESS)
-}
-
-/// Launcher sockets reach host loopback while the broker's own cannot, and none can listen.
-#[cfg(windows)]
-fn probe_broker_loopback(
-    sockets: &terra_sandbox::LauncherSockets,
-    host_listener: std::net::SocketAddr,
-) -> Result<()> {
-    ensure!(
-        std::net::TcpStream::connect_timeout(&host_listener, Duration::from_millis(500)).is_err(),
-        "network broker reached host loopback with its own socket"
-    );
-    let (sender, receiver) = std::sync::mpsc::channel();
-    sockets.connect_tcp(
-        host_listener,
-        Box::new(move |reply| {
-            let _ = sender.send(reply);
-        }),
-    );
-    let tcp = receiver
-        .recv_timeout(Duration::from_secs(5))
-        .context("network broker's launcher connection timed out")?
-        .context("network broker cannot reach host loopback with a launcher socket")?;
-    ensure!(
-        tcp.listen(1).is_err(),
-        "network broker can listen on a launcher socket"
-    );
-    sockets
-        .bind_udp(socket2::Domain::IPV4)
-        .context("network broker cannot obtain a launcher UDP socket")?
-        .send_to(b"probe", &host_listener.into())
-        .context("network broker cannot send a loopback datagram")?;
-    Ok(())
-}
-
-fn wait_probe_ready(child: &mut std::process::Child) -> Result<()> {
-    ensure!(
-        boot::start_ready_reader(child)?
-            .recv_timeout(BROKER_STARTUP_TIMEOUT)
-            .context("waiting for native confinement probe")??,
-        "native confinement probe stopped before testing its restrictions"
-    );
-    Ok(())
-}
-
 pub(crate) fn start_broker(
     executable: &Path,
     config: &terra_network::config::Config,
     host_listeners: Vec<socket2::Socket>,
     endpoint: LocalStream,
-    policy: Option<&[u8]>,
-    is_sandboxed: bool,
 ) -> Result<(SupervisedChild, terra_network::config::Ready)> {
     let (startup, configuration) = create_local_pair()?;
     startup.set_read_timeout(Some(BROKER_STARTUP_TIMEOUT))?;
     startup.set_write_timeout(Some(BROKER_STARTUP_TIMEOUT))?;
     let mut command = Command::new(executable);
     command.arg(NETWORK_ARG);
-    let mut launch = if is_sandboxed {
-        terra_sandbox::prepare_launch(Launch {
-            role: Role::Network,
-            command,
-            grants: Vec::new(),
-            policy,
-            staging_directory: &state::get_terra_home_path()?,
-        })?
-    } else {
-        PreparedLaunch::direct(command)
-    };
+    let mut launch = terra_sandbox::prepare_launch(Launch {
+        role: Role::Network,
+        command,
+        grants: Vec::new(),
+        staging_directory: &state::get_terra_home_path()?,
+    })?;
     let command = &mut launch.command;
     command
         .stdin(Stdio::null())
@@ -845,24 +378,15 @@ impl terra_network::OutboundSockets for LauncherOutbound {
     }
 }
 
-fn read_supervisor_input(reader: impl Read + Send + 'static, timeout: Duration) -> Result<Vec<u8>> {
+fn read_supervisor_input(
+    reader: impl Read + Send + 'static,
+    timeout: Duration,
+) -> Result<BootSpec> {
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name("supervisor-startup".into())
         .spawn(move || {
-            let mut bytes = Vec::new();
-            let result = reader
-                .take(MAX_SUPERVISOR_SPEC_BYTES + 1)
-                .read_to_end(&mut bytes)
-                .context("reading supervisor startup input")
-                .and_then(|_| {
-                    ensure!(
-                        bytes.len() as u64 <= MAX_SUPERVISOR_SPEC_BYTES,
-                        "supervisor startup specification exceeds its limit"
-                    );
-                    Ok(bytes)
-                });
-            let _ = sender.send(result);
+            let _ = sender.send(boot::read_boot_spec(reader));
         })?;
     receiver
         .recv_timeout(timeout)
@@ -1064,14 +588,9 @@ mod tests {
             network_broker: None,
         };
         assert!(
-            start_optional_broker(
-                Path::new("missing-broker-executable"),
-                &mut boot,
-                None,
-                false
-            )
-            .unwrap()
-            .is_none()
+            start_optional_broker(Path::new("missing-broker-executable"), &mut boot)
+                .unwrap()
+                .is_none()
         );
         assert!(boot.network_broker.is_none());
     }
@@ -1122,7 +641,9 @@ mod tests {
     fn supervisor_input_deadline_covers_an_open_startup_pipe() {
         let (input, writer) = create_local_pair().unwrap();
         let started = Instant::now();
-        let error = read_supervisor_input(input, Duration::from_millis(50)).unwrap_err();
+        let error = read_supervisor_input(input, Duration::from_millis(50))
+            .err()
+            .unwrap();
         assert!(error.to_string().contains("supervisor startup input"));
         assert!(started.elapsed() < Duration::from_secs(1));
         drop(writer);
@@ -1188,7 +709,6 @@ mod tests {
                 Some(&mut broker),
                 &receiver,
                 Duration::from_secs(5),
-                false,
             )
             .unwrap(),
             ExitCode::from(7)
@@ -1226,7 +746,6 @@ mod tests {
                 Some(&mut broker),
                 &receiver,
                 Duration::from_secs(5),
-                false
             )
             .unwrap(),
             ExitCode::from(7)
@@ -1322,7 +841,6 @@ mod tests {
                         broker.as_mut(),
                         &receiver,
                         Duration::from_millis(100),
-                        false,
                     );
                     match expected {
                         Some(code) => assert_eq!(result.unwrap(), ExitCode::from(code)),
