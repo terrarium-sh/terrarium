@@ -1237,9 +1237,15 @@ async fn broker_udp_sockets_leave_fragmentation_to_the_os() {
 /// grants, so a supervisor mistake cannot publish an unapproved port.
 #[tokio::test]
 async fn broker_refuses_listeners_that_do_not_match_their_grants() {
-    let reserved = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let address = reserved.local_addr().unwrap();
-    drop(reserved);
+    // Windows excludes different port ranges per protocol, so a free TCP port may refuse UDP.
+    let (address, datagram) = (0..100)
+        .find_map(|_| {
+            let reserved = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).ok()?;
+            let address = reserved.local_addr().ok()?;
+            drop(reserved);
+            Some((address, bind_udp_socket(address).ok()?))
+        })
+        .expect("a loopback port free for both TCP and UDP");
     let mut setup = config();
     setup.listeners = vec![PublishedListener {
         grant: 1,
@@ -1250,7 +1256,6 @@ async fn broker_refuses_listeners_that_do_not_match_their_grants() {
     assert!(Broker::new(&setup, Vec::new(), SocketSource::Native).is_err());
     let elsewhere = tcp::bind_tcp_listener_socket((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
     assert!(Broker::new(&setup, vec![elsewhere], SocketSource::Native).is_err());
-    let datagram = bind_udp_socket(address).unwrap();
     assert!(Broker::new(&setup, vec![datagram], SocketSource::Native).is_err());
     assert!(Broker::new(&setup, listeners, SocketSource::Native).is_ok());
 }

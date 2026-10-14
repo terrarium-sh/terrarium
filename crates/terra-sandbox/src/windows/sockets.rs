@@ -7,14 +7,16 @@ use anyhow::{Context, Result, ensure};
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::os::windows::io::FromRawSocket;
+use std::os::windows::io::{AsRawSocket, FromRawSocket};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use terra_platform::local_socket::{LocalStream, OwnedSocket, encode_sockets, receive_sockets};
 use terra_platform::process;
 use terra_platform::process::sandbox_env::WINDOWS_ROLE;
-use windows_sys::Win32::Networking::WinSock::WSAEMFILE;
+use windows_sys::Win32::Networking::WinSock::{
+    SO_UPDATE_CONNECT_CONTEXT, SOL_SOCKET, WSAEMFILE, setsockopt,
+};
 
 pub(super) const LAUNCHER_SOCKETS_ENV: &str = "TERRA_WINDOWS_SANDBOX_SOCKETS";
 pub(super) const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -88,7 +90,8 @@ impl Request {
     }
 
     /// A Windows duplicate keeps the connection state its socket had when duplicated, so a
-    /// connection completes here before the socket is handed over.
+    /// connection completes here before the socket is handed over. A non-blocking connect leaves
+    /// that user-mode state unconnected, so `SO_UPDATE_CONNECT_CONTEXT` records the completion.
     fn open(self) -> io::Result<socket2::Socket> {
         match self {
             Self::ConnectTcp(peer) => {
@@ -98,6 +101,20 @@ impl Request {
                     None,
                 )?;
                 socket.connect_timeout(&peer.into(), CONNECT_TIMEOUT)?;
+                let raw = usize::try_from(socket.as_raw_socket()).map_err(io::Error::other)?;
+                // SAFETY: socket is live; the option takes no value.
+                let status = unsafe {
+                    setsockopt(
+                        raw,
+                        SOL_SOCKET,
+                        SO_UPDATE_CONNECT_CONTEXT,
+                        std::ptr::null(),
+                        0,
+                    )
+                };
+                if status != 0 {
+                    return Err(io::Error::last_os_error());
+                }
                 Ok(socket)
             }
             Self::BindUdp(domain) => {
