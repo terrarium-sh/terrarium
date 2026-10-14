@@ -186,6 +186,16 @@ impl Image {
         )
     }
 
+    #[cfg(test)]
+    pub(super) fn add_data(&mut self, address: u64, bytes: &[u8]) {
+        self.sections.push(Section {
+            name: ".rodata".to_owned(),
+            address,
+            bytes: bytes.to_vec(),
+            is_executable: false,
+        });
+    }
+
     pub(super) fn read(&self, address: u64, length: usize) -> Option<&[u8]> {
         self.sections.iter().find_map(|section| {
             let offset = usize::try_from(address.checked_sub(section.address)?).ok()?;

@@ -131,6 +131,9 @@ impl<'a> FunctionFlow<'a> {
                 !table_spans
                     .iter()
                     .any(|span| span.start <= *location && *location + 8 <= span.end)
+                    && image
+                        .read_u64(*location)
+                        .is_some_and(|target| flow.index_of(target).is_some())
             });
         let unresolved = unrecovered.into_iter().find(|&index| {
             is_interior_referenced

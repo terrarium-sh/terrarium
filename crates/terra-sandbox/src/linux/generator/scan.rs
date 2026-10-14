@@ -731,6 +731,24 @@ mod tests {
         assert!(scan_image(&truncated).is_err());
     }
 
+    /// A data word holding an instruction start inside a function could be the target of its
+    /// indirect jump, so generation must refuse; a word pointing between instructions is only a
+    /// byte pattern (such as embedded metadata) and must not block the vtable tail call.
+    #[test]
+    fn interior_data_words_block_indirect_jumps_only_at_instruction_starts() -> Result<()> {
+        // mov eax, 39; syscall; jmp [rcx + 8]
+        let code = [mov_eax(39), SYSCALL.to_vec(), vec![0xff, 0x61, 0x08]].concat();
+        let with_word = |word: u64| {
+            let mut image = Image::from_code(Architecture::X86_64, &[("f", 0x1000, &code)]);
+            image.add_data(0x8000, &word.to_le_bytes());
+            scan_image(&image)
+        };
+        assert_eq!(with_word(0x1001)?.syscalls, BTreeSet::from([39]));
+        let error = with_word(0x1005).err().unwrap();
+        assert!(error.to_string().contains("cannot vouch"), "{error:#}");
+        Ok(())
+    }
+
     #[test]
     fn aarch64_svc_numbers_resolve_from_x8() -> Result<()> {
         let code: Vec<u8> = [0xd280_07e8_u32, 0xd400_0001, 0xd65f_03c0]
