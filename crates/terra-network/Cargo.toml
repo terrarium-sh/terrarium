@@ -17,7 +17,7 @@ tokio-util = { version = "0.7", features = ["rt", "compat"] }
 yamux = "=0.14.1"
 socket2 = "0.6"
 lru = "0.18"
-quinn-udp = { version = "=0.5.16", default-features = false }
+quinn-udp = { version = "=0.6.3", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
