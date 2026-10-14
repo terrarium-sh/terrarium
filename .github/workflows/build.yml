@@ -85,7 +85,7 @@ jobs:
           key: guest-${{ matrix.arch }}-${{ hashFiles('pins.mk', 'Makefile', 'kernel/Containerfile', 'kernel/*.config', 'kernel/patches/*.patch', 'kernel/overlay/**', 'scripts/kernel/kernel-container.sh', 'scripts/**/*.py') }}
       - name: Build guest assets
         run: make ARCH=${{ matrix.arch }} guest-assets
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: terra-guest-${{ matrix.arch }}
           path: |
@@ -107,14 +107,14 @@ jobs:
             scripts/sources/alpine-sources.sh
             mv build/alpine-corresponding-source.tar.gz build/terra-alpine-aarch64-source.tar.gz
           fi
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: ${{ inputs.release_sources && matrix.arch == 'x86_64' }}
         with:
           name: terra-source
           path: build/terra-source.tar.gz
           if-no-files-found: error
           compression-level: 0
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: ${{ inputs.release_sources && matrix.arch == 'aarch64' }}
         with:
           name: terra-alpine-source-aarch64
@@ -254,7 +254,7 @@ jobs:
           CARGO_TARGET_DIR: target/asan
         run: |
           cargo +"$NIGHTLY_TOOLCHAIN" test --no-fail-fast --locked -p terra-runtime --test integration --target x86_64-unknown-linux-gnu -- native_boundary::
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: terra-x86_64-linux
           path: dist
@@ -356,7 +356,7 @@ jobs:
           TERRA_BIN="$PWD/dist/terra" cargo test --no-fail-fast --locked --target aarch64-unknown-linux-musl -p terra --test native_boot -- --ignored --test-threads=1 --nocapture || status=1
           TERRA_BIN="$PWD/dist/terra" cargo test --no-fail-fast --locked --target aarch64-unknown-linux-musl -p terra --test boot --test memory --test guest_suite -- --ignored --test-threads=1 || status=1
           exit "$status"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: terra-aarch64-linux
           path: dist
@@ -424,7 +424,7 @@ jobs:
         if: ${{ !(inputs.native_vm_tests || vars.MACOS_ARM64_VM_RUNNER != '') }}
         run: |
           echo 'macOS native VM acceptance was not run; configure MACOS_ARM64_VM_RUNNER with Hypervisor.framework access or request native_vm_tests.' >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: terra-aarch64-macos
           path: dist
@@ -526,7 +526,7 @@ jobs:
           cargo test --locked --target ${{ matrix.target }} -p terra-sandbox --lib windows::tests::native_roles_enforce_vm_grants_and_broker_job -- --ignored --exact
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --no-fail-fast --locked --target ${{ matrix.target }} -p terra --test native_boot --test boot --test memory -- --ignored --test-threads=1 --nocapture
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: terra-${{ matrix.target }}
           path: dist
