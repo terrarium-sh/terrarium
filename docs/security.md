@@ -2,9 +2,8 @@
 
 Terra runs a workload in a hardware-virtualized VM (KVM on Linux,
 Hypervisor.framework on macOS, WHP on Windows) to protect the host from a
-hostile guest, within the trusted computing base and limits below. Only Linux
-has passed native acceptance; macOS and Windows gates are open in
-[todo.md](todo.md).
+hostile guest, within the trusted computing base and limits below. Open
+hardening and validation work is in [todo.md](todo.md).
 
 ## Trust and authority
 

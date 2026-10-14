@@ -16,7 +16,7 @@
     { title: 'Hardware VM', text: 'Your agent and tools run on a guest Linux kernel inside a hardware VM: KVM, Hypervisor.framework, or WHP.' },
     { title: 'Wasm components', text: 'Each blue case is a separate Wasm store with isolated memory. The vCPU reaches each device directly; the VMM only boots and runs vCPUs.' },
     { title: 'Thin host API', text: 'Each Wasm store gets only its scoped host imports: VM handles, guest memory, disks, shares, or broker operations.' },
-    { title: 'OS sandbox', text: 'By default, the VM worker runs in an OS sandbox without host networking: Bubblewrap and seccomp, App Sandbox, or AppContainer.' },
+    { title: 'OS sandbox', text: 'The VM worker always runs in an OS sandbox without host networking: Bubblewrap and seccomp, App Sandbox, or AppContainer.' },
     { title: 'Network broker', text: 'A separate process owns host sockets and enforces egress policy, one stream per guest socket. Sandboxed on every host: Bubblewrap, App Sandbox, or an AppContainer whose sockets come from a trusted launcher.' }
   ];
 
@@ -296,6 +296,7 @@
     </ol>
     <p class="layer-description" aria-hidden="true">{#key active}<span>{layers[active - 1].text}</span>{/key}</p>
     <a href="{base}/docs/security/">Explore the security model <span aria-hidden="true">→</span></a>
+    <a href="{base}/docs/sandboxing/">See how each platform sandboxes it <span aria-hidden="true">→</span></a>
   </div>
   <!-- The layer list buttons give keyboard users the same selection the figure gives pointers. -->
   <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_noninteractive_element_interactions -->

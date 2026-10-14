@@ -14,7 +14,7 @@ Each Linux role runs under two stacked seccomp filters; a syscall must pass both
 1. A **role filter** denies dangerous kernel interfaces and alternate syscall
    ABIs and enforces argument rules: socket families, outgoing `sendto`, the
    parent-death signal, terminal-injection ioctls
-   ([Linux sandboxing](sandboxing.md#linux)).
+   ([Linux sandboxing](sandboxing-linux.md)).
 2. An **allowlist** of the syscalls, and `ioctl` requests, the role's code can
    make. Any other call kills the process.
 

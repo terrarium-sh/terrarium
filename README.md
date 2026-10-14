@@ -125,6 +125,8 @@ See the [recipe reference](docs/recipe.md) to customize tools, access, and workl
 - [Recipe reference](docs/recipe.md) — network access, mounts, packages, and workloads.
 - [Project manifest](docs/manifest.md) — manage multiple boxes with `terra.yaml`.
 - [Security model](docs/security.md) — trust boundaries, enforcement, and limitations.
+- [Host process sandboxing](docs/sandboxing.md) — the processes in a box and how
+  Linux, macOS and Windows confine each one.
 - [Host sandbox policy](docs/sandbox-policy.md) — built-in confinement and the
   Linux syscall allowlists generated from each sandboxed role's code.
 - [Development](README.dev.md) — build from source, test, and release.

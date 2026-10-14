@@ -647,12 +647,13 @@ mod tests {
         groups.join(",")
     }
 
-    /// docs/sandboxing.md quotes the broker commit limit, grant cap and launcher connection limits;
+    /// docs/sandboxing-windows.md quotes the broker commit limit, grant cap and launcher connection limits;
     /// a change to any of them fails here.
     #[test]
     fn sandboxing_doc_quotes_the_windows_limits() {
         let doc = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/sandboxing.md"),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../docs/sandboxing-windows.md"),
         )
         .unwrap()
         .split_whitespace()
@@ -670,7 +671,10 @@ mod tests {
                 sockets::MAX_PENDING_CONNECTS
             ),
         ] {
-            assert!(doc.contains(&quote), "docs/sandboxing.md must say: {quote}");
+            assert!(
+                doc.contains(&quote),
+                "docs/sandboxing-windows.md must say: {quote}"
+            );
         }
     }
 

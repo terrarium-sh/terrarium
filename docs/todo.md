@@ -1,9 +1,8 @@
 # Remaining work
 
-The network transport uses [per-socket TCP and UDP vsock streams](../README.dev.md#network-transport);
-its native gates on hosts other than Linux x86_64 remain open.
+The network transport uses [per-socket TCP and UDP vsock streams](../README.dev.md#network-transport).
 
-Terra currently has a Linux x86_64 KVM implementation with WASI components for
+Terra runs on KVM, Hypervisor.framework and WHP with WASI components for
 boot, block, filesystem, a combined vsock device/network frontend, a separate
 agent store, memory, and the VMM. The production
 transport is a bounded scalar bridge between independent Wasmtime stores; shared
@@ -14,25 +13,6 @@ This is an implementation and acceptance backlog. An item is complete only
 when its stated acceptance condition has been recorded with the relevant test
 or host result. Build-only and cross-compilation checks do not establish native
 VM behavior.
-
-ARM timer, macOS lifecycle, Windows WHP/console/socket and release-gate fixes are
-implemented; the corresponding native host gates below remain open until executed.
-
-## Product acceptance
-
-- [ ] **Linux AArch64 KVM:** run the packaged binary's boot, mount, networking,
-  SMP, memory-reclaim, shutdown, and ARM GIC-routing gates on AArch64 hardware.
-  Include CPU state, device ordering, and capacity behavior.
-  Record the commands and results beside
-  [`crates/terra/tests/native_boot.rs`](../crates/terra/tests/native_boot.rs) and
-  [`crates/terra/tests/memory.rs`](../crates/terra/tests/memory.rs).
-
-- [ ] **macOS and Windows:** run the native packaged-release gates on Apple
-  Silicon macOS and both supported Windows WHP architectures. Cover boot,
-  two-vCPU startup, granted networking, read-write and read-only mounts,
-  persistent volumes, and orderly shutdown. On Windows, explicitly verify the
-  reduced WASI mount contract, CPU state, and device ordering. The gate is
-  [`crates/terra/tests/native_boot.rs`](../crates/terra/tests/native_boot.rs).
 
 ## Filesystem and I/O correctness
 

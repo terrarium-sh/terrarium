@@ -245,6 +245,10 @@ nav a[aria-current] { color: var(--accent-strong); background: var(--accent-soft
 .prose th, .prose td { border-bottom: 1px solid var(--frost-border-color); padding: 0.65rem; text-align: left; }
 .prose blockquote { border-left: 3px solid var(--accent); padding-left: 1rem; margin-left: 0; color: var(--hint-color); }
 .prose :not(pre) > code { overflow-wrap: anywhere; }
+/* Text diagrams draw connected tree lines, which the default code line height breaks apart. */
+.prose pre:has(> code.language-text) { line-height: 1.25; }
+.platform-sections { max-width: 82ch; margin-inline: auto; }
+.platform-sections .platform-choice { margin-bottom: 0; }
 
 @media (max-width: 800px) {
   .hero { grid-template-columns: 1fr; gap: 2.5rem; padding-block: 3rem; }

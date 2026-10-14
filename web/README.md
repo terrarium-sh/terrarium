@@ -37,8 +37,11 @@ selects the appropriate installer. Visitors can switch platforms manually.
 Mobile and unknown clients get a choice; without JavaScript both installers
 remain visible. The installers themselves select the native architecture.
 
-Guides read `../docs/{usage,recipe,manifest,security}.md` during the build.
-Edit those source documents to update their website pages.
+Guides read `../docs/{usage,recipe,manifest,security,sandboxing,sandbox-policy}.md`
+during the build. The sandboxing guide also shows `../docs/sandboxing-{linux,macos,windows}.md`
+as platform sections, preselected for the visitor's desktop platform like the
+installers; without JavaScript every section stays visible. Edit those source
+documents to update their website pages.
 
 `pnpm generate` recursively reads the binary's `--help` and `--version`.
 Both `dev` and `build` regenerate the command index before starting; generated

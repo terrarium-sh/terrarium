@@ -395,7 +395,7 @@ Windows tests run symlink fixtures by default. Enable Developer Mode or grant
 the account permission to create symbolic links before running the suite.
 Guest symlinks in host shares are stored WSL-style rather than as Windows
 symlinks, through the VM's wrapper when sandboxed; see
-[Windows sandboxing](docs/sandboxing.md#windows).
+[Windows sandboxing](docs/sandboxing-windows.md).
 
 Real Linux guest gates require `/dev/kvm`:
 
