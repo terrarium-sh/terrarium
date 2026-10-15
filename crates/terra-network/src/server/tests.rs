@@ -1237,12 +1237,13 @@ async fn broker_udp_sockets_leave_fragmentation_to_the_os() {
 /// grants, so a supervisor mistake cannot publish an unapproved port.
 #[tokio::test]
 async fn broker_refuses_listeners_that_do_not_match_their_grants() {
-    // Windows excludes different port ranges per protocol, so a free TCP port may refuse UDP.
-    let (address, datagram) = (0..100)
-        .find_map(|_| {
-            let reserved = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).ok()?;
-            let address = reserved.local_addr().ok()?;
-            drop(reserved);
+    // Windows excludes different port ranges per protocol, so a port one protocol's allocator
+    // picks may be excluded for the other; probing ports spread over the range escapes any block.
+    let (address, datagram) = (0..256u16)
+        .find_map(|attempt| {
+            let port = 49152 + attempt.wrapping_mul(4099) % 16384;
+            let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+            drop(std::net::TcpListener::bind(address).ok()?);
             Some((address, bind_udp_socket(address).ok()?))
         })
         .expect("a loopback port free for both TCP and UDP");
