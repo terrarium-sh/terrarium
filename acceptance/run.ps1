@@ -213,6 +213,10 @@ try {
     Invoke-GuestCheck "overlay.sh" @("--root")
     Complete-Step
 
+    Start-Step "the guest gets no hardware virtualization"
+    Invoke-GuestCheck "no-virtualization.sh" @("--root")
+    Complete-Step
+
     Start-Step "shares: read-write, read-only, links"
     Invoke-GuestCheck "shares.sh"
     Assert-Equal (Read-Text "work/host") "linked"

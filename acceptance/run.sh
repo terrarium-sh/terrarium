@@ -209,6 +209,10 @@ guest_check namespaces.sh
 guest_check overlay.sh --root
 passed
 
+begin "the guest gets no hardware virtualization"
+guest_check no-virtualization.sh --root
+passed
+
 begin "shares: read-write, read-only, links"
 guest_check shares.sh
 run probe exec --no-tty -- sh -ec 'test "$(/work/host-run)" = HOST_EXECUTABLE'

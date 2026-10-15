@@ -412,6 +412,7 @@ fn exercise_exec(suite: &Suite) -> Result<()> {
     )?;
     suite.execute_expected("exit 7", &[], Some(7))?;
     suite.execute_expected("doas id -u", &[], None)?;
+    suite.execute("! grep -qw -e vmx -e svm /proc/cpuinfo", &[])?;
     let streams = suite.execute(
         "printf 'one\\ntwo\\n'; echo ERROR >&2; test ! -t 1",
         &["--no-tty"],

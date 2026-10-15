@@ -29,8 +29,24 @@ pub(super) fn build_cpuid(
         return Err(KvmError::BadVcpuCount(vcpu_count));
     }
     let mut cpuid = kvm.get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)?;
+    hide_virtualization_extensions(cpuid.as_mut_slice());
     configure_cpuid(cpuid.as_mut_slice(), vcpus, 0);
     Ok(cpuid)
+}
+
+const CPUID_VMX: (u32, u32) = (1, 1 << 5);
+const CPUID_SVM: (u32, u32) = (0x8000_0001, 1 << 2);
+
+/// KVM offers VMX/SVM whenever the host enables nested KVM, exposing its nested code to the
+/// guest; without the CPUID bit KVM rejects CR4.VMXE and EFER.SVME, whatever the guest kernel.
+fn hide_virtualization_extensions(entries: &mut [kvm_bindings::kvm_cpuid_entry2]) {
+    for entry in entries {
+        for (function, ecx) in [CPUID_VMX, CPUID_SVM] {
+            if entry.function == function {
+                entry.ecx &= !ecx;
+            }
+        }
+    }
 }
 
 fn configure_cpuid(entries: &mut [kvm_bindings::kvm_cpuid_entry2], vcpus: u8, id: u8) {
@@ -234,6 +250,23 @@ mod tests {
         }
     }
 
+    /// A host with nested KVM must not hand the guest VMX or SVM.
+    #[test]
+    fn virtualization_extensions_are_hidden() {
+        use kvm_bindings::kvm_cpuid_entry2;
+
+        let mut entries =
+            [(1, 1 << 5), (0x8000_0001, 1 << 2), (7, u32::MAX)].map(|(function, ecx)| {
+                kvm_cpuid_entry2 {
+                    function,
+                    ecx: ecx | 1,
+                    ..kvm_cpuid_entry2::default()
+                }
+            });
+        super::hide_virtualization_extensions(&mut entries);
+        assert_eq!(entries.map(|entry| entry.ecx), [1, 1, u32::MAX]);
+    }
+
     #[test]
     fn native_failure_notifies_the_host_with_cpu_and_hardware_reason() {
         struct Handler(Option<String>);
@@ -275,6 +308,14 @@ mod tests {
             assert_ne!(leaf.ecx & (1 << 31), 0);
             assert_eq!((leaf.ebx >> 16) & 0xff, u32::try_from(count).unwrap());
             assert_eq!(leaf.edx & (1 << 28) != 0, count > 1);
+            for (function, ecx) in [super::CPUID_VMX, super::CPUID_SVM] {
+                assert!(
+                    cpuid
+                        .as_slice()
+                        .iter()
+                        .all(|entry| entry.function != function || entry.ecx & ecx == 0)
+                );
+            }
         }
         assert!(super::build_cpuid(&kvm, 0).is_err());
         assert!(super::build_cpuid(&kvm, 256).is_err());
