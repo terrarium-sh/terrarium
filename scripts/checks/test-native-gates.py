@@ -137,6 +137,26 @@ class NativeGateTests(unittest.TestCase):
             self.assertNotIn('kvm', header.lower())
             self.assertTrue(command.startswith('make policy-check\n'))
 
+    def test_both_acceptance_runners_play_the_same_checks(self):
+        """The Unix and Windows runners must not drift apart: same steps, same guest scripts, all present."""
+        shell = (ROOT / 'acceptance/run.sh').read_text()
+        powershell = (ROOT / 'acceptance/run.ps1').read_text()
+        self.assertEqual(re.findall(r'^begin "(.+)"$', shell, re.M),
+                         re.findall(r'^    Start-Step "(.+)"$', powershell, re.M))
+        scripts = re.compile(r'(?:/suite/guest/|guest_check |Invoke-GuestCheck ")([a-z-]+\.sh)')
+        used = set(scripts.findall(shell))
+        self.assertEqual(used, set(scripts.findall(powershell)))
+        for script in used:
+            self.assertTrue((ROOT / 'acceptance/guest' / script).is_file(), script)
+        for recipe in re.findall(r'^boxes="(.+)"$', shell, re.M)[0].split():
+            self.assertTrue((ROOT / f'acceptance/recipes/{recipe}.yaml').is_file(), recipe)
+
+    def test_every_platform_build_runs_the_acceptance_suite_and_releases_it(self):
+        self.assertEqual(WORKFLOW.count('        run: sh acceptance/run.sh --terra dist/terra\n'), 3)
+        self.assertEqual(WORKFLOW.count('        run: ./acceptance/run.ps1 -Terra dist/terra.exe\n'), 1)
+        release = (ROOT / '.github/workflows/release.yml').read_text()
+        self.assertIn('        run: cp -R acceptance stage/terra-acceptance\n', release)
+
     @linux_workflow_shell_only
     def test_component_cleanup_preserves_runtime_wasm_fixtures(self):
         fixture_source = (ROOT / 'crates/terra-runtime/src/test_fixtures.rs').read_text()

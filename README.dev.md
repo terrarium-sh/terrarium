@@ -410,6 +410,21 @@ These exercise runtime/device integration, CLI boots, mounts, networking,
 capacity and memory growth/reclamation. Ignored tests are not covered by an
 ordinary workspace test pass.
 
+The acceptance suite in [`acceptance/`](acceptance) checks every feature through
+the CLI alone, so users run it against an installed release (see the README)
+and CI runs it against each platform's build:
+
+```sh
+sh acceptance/run.sh --terra dist/terra                      # Linux, macOS
+powershell -File acceptance/run.ps1 -Terra dist/terra.exe    # Windows
+```
+
+Its guest-side checks in `acceptance/guest/` are shared with the `guest_suite`
+cargo test. Releases ship the suite as `terra-acceptance.tar.gz`; a runner
+fetched on its own downloads the suite of the installed release and hands over
+to that release's runner. `scripts/checks/test-native-gates.py` keeps the two
+runners' steps and guest scripts identical.
+
 `make test-platform-native-vm` checks preparation cleanup and repeated stop/join
 on a native hypervisor without guest artifacts. On Apple Silicon the target
 signs the test executable with the hypervisor entitlement before running it.

@@ -17,6 +17,13 @@ use serde_json::Value;
 mod network;
 mod sessions;
 
+/// A guest-side check shared with the standalone acceptance suite.
+macro_rules! guest_script {
+    ($name:literal) => {
+        include_str!(concat!("../../../../acceptance/guest/", $name))
+    };
+}
+
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 const STORAGE_TIMEOUT: Duration = Duration::from_secs(240);
 
@@ -294,7 +301,7 @@ fn run_exercises(suite: &mut Suite) -> Result<()> {
         "recipe environment missing: {resolved}"
     );
     suite.run(&["exercise", "-d"])?;
-    suite.execute(include_str!("scripts/exercise-ready.sh"), &[])?;
+    suite.execute(guest_script!("exercise-ready.sh"), &[])?;
     suite.require_box_state("exercise", "running")?;
     wait_until(
         || Ok(network::read_published_port(published_port)),
@@ -375,7 +382,7 @@ fn exercise_local_only_network(suite: &mut Suite, hardware: &Value) -> Result<()
     )?;
     suite.setup("local-only", &recipe, Some(0))?;
     suite.run(&["local-only", "-d"])?;
-    let script = include_str!("scripts/local-only.sh");
+    let script = guest_script!("local-only.sh");
     let output = Suite::capture(
         &mut suite.command(["local-only", "exec", "--", "/bin/sh", "-ec", script]),
         Some(0),
@@ -417,14 +424,14 @@ fn exercise_exec(suite: &Suite) -> Result<()> {
     suite.execute("test -t 0; test -t 1; echo TTY_OK", &["--tty"])?;
     sessions::exercise(suite)?;
     suite.execute("echo ROOT_WRITE > /etc/workload-probe", &["--root"])?;
-    suite.execute(include_str!("scripts/namespaces.sh"), &[])?;
-    suite.execute(include_str!("scripts/overlay.sh"), &["--root"])?;
+    suite.execute(guest_script!("namespaces.sh"), &[])?;
+    suite.execute(guest_script!("overlay.sh"), &["--root"])?;
     Ok(())
 }
 
 fn exercise_shares(suite: &Suite, writable: &Path, readonly: &Path) -> Result<()> {
     println!("guest suite: writable/read-only shares, file events and synchronization");
-    suite.execute(include_str!("scripts/shares.sh"), &[])?;
+    suite.execute(guest_script!("shares.sh"), &[])?;
     #[cfg(unix)]
     suite.execute("test \"$(/work/host-run)\" = HOST_EXECUTABLE", &[])?;
     require_file(&writable.join("host"), b"linked")?;
@@ -438,17 +445,17 @@ fn exercise_shares(suite: &Suite, writable: &Path, readonly: &Path) -> Result<()
         "read-only share was modified: {readonly_names:?}"
     );
     exercise_file_events(suite, writable)?;
-    suite.execute(include_str!("scripts/shares-persisted.sh"), &[])?;
+    suite.execute(guest_script!("shares-persisted.sh"), &[])?;
     Ok(())
 }
 
 fn exercise_file_events(suite: &Suite, writable: &Path) -> Result<()> {
-    suite.execute(include_str!("scripts/watcher-ready.sh"), &["--root"])?;
+    suite.execute(guest_script!("watcher-ready.sh"), &["--root"])?;
     fs::write(writable.join("host-update"), "LIVE_UPDATE")?;
     fs::write(writable.join("host-created"), "CREATED")?;
-    suite.execute(include_str!("scripts/file-events-created.sh"), &["--root"])?;
+    suite.execute(guest_script!("file-events-created.sh"), &["--root"])?;
     fs::remove_file(writable.join("host-created"))?;
-    suite.execute(include_str!("scripts/file-events-deleted.sh"), &["--root"])?;
+    suite.execute(guest_script!("file-events-deleted.sh"), &["--root"])?;
     Ok(())
 }
 
@@ -570,7 +577,7 @@ fn exercise_storage(suite: &mut Suite, writable: &Path, hardware: &Value) -> Res
         "--",
         "sh",
         "-ec",
-        include_str!("scripts/storage-restart.sh"),
+        guest_script!("storage-restart.sh"),
     ])?;
     for marker in ["START_OK", "RESTART_OK", "STOP_OK"] {
         require_output(&foreground, marker)?;

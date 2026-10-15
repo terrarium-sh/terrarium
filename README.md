@@ -70,6 +70,24 @@ Open a new terminal after installation.
 
 </details>
 
+To check that every feature works on this machine - boxes, exec, shares, sync,
+network policy and storage - run the acceptance suite. It boots throwaway boxes
+in a temporary directory, leaves your own boxes alone, and finishes in under a
+minute:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/terrarium-sh/terrarium/main/acceptance/run.sh -o terra-acceptance.sh && sh terra-acceptance.sh
+```
+
+<details>
+<summary>On Windows (PowerShell)</summary>
+
+```powershell
+Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/terrarium-sh/terrarium/main/acceptance/run.ps1 -OutFile terra-acceptance.ps1; if ($?) { powershell -ExecutionPolicy Bypass -File terra-acceptance.ps1 }
+```
+
+</details>
+
 The quickstart builds a dev VM for a Node.js project. In your project
 directory, create `dev.yaml`:
 

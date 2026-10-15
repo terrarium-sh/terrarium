@@ -55,6 +55,8 @@ jobs:
         with:
           name: terra-alpine-source-aarch64
           path: stage
+      - name: Stage the acceptance suite
+        run: cp -R acceptance stage/terra-acceptance
       - name: Assemble platform archives
         run: |
           for directory in stage/*/; do

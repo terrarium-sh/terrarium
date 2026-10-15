@@ -16,6 +16,9 @@
 *   **CLI Updates:** `crates/terra/src/cli.rs` is the source of truth for the man
     pages; `make man` re-renders them (they are generated, not committed).
 *   **Boot Tests:** Requires `/dev/kvm`. Run: `make dist && TERRA_BIN=$PWD/dist/terra cargo test -p terra --test boot -- --ignored`
+*   **Feature acceptance:** `sh acceptance/run.sh --terra dist/terra` (Windows:
+    `acceptance/run.ps1`). Keep both runners' steps identical; a new
+    user-facing feature gets a step in both.
 *   **Seccomp policy:** the Linux allowlists in
     `crates/terra-sandbox/src/linux/policy/` are generated from code, not
     written by hand. After a change that can alter which syscalls a sandboxed

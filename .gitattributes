@@ -1,2 +1,3 @@
 kernel/patches/*.patch -whitespace
 crates/terra/tests/guest_suite/scripts/*.sh text eol=lf
+acceptance/** text eol=lf

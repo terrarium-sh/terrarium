@@ -1,0 +1,6 @@
+hw: {cpus: 1, mem_mib: 256}
+network: {enabled: false}
+mounts: [{host: ./suite, guest: /suite, readonly: true}]
+workload:
+  entrypoint: /bin/sh
+  args: ['-ec', 'while true; do sleep 60; done']

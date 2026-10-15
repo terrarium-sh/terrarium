@@ -1,0 +1,3 @@
+hw: {cpus: 1, mem_mib: 256}
+hooks:
+  on_create: ['echo FAILED_BAKE; exit 9']

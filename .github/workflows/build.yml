@@ -220,6 +220,10 @@ jobs:
           cargo test --no-fail-fast --locked --target x86_64-unknown-linux-musl -p terra-hypervisor --lib --test native_vm -- --ignored --test-threads=1 || status=1
           TERRA_BIN="$PWD/dist/terra" cargo test --no-fail-fast --locked --target x86_64-unknown-linux-musl -p terra --test boot --test memory --test guest_suite -- --ignored --test-threads=1 || status=1
           exit "$status"
+      - name: Feature acceptance
+        if: ${{ !cancelled() && steps.host-build.outcome == 'success' }}
+        timeout-minutes: 15
+        run: sh acceptance/run.sh --terra dist/terra
       - name: HTTP/3 compatibility
         if: ${{ !cancelled() && steps.host-build.outcome == 'success' }}
         timeout-minutes: 15
@@ -356,6 +360,10 @@ jobs:
           TERRA_BIN="$PWD/dist/terra" cargo test --no-fail-fast --locked --target aarch64-unknown-linux-musl -p terra --test native_boot -- --ignored --test-threads=1 --nocapture || status=1
           TERRA_BIN="$PWD/dist/terra" cargo test --no-fail-fast --locked --target aarch64-unknown-linux-musl -p terra --test boot --test memory --test guest_suite -- --ignored --test-threads=1 || status=1
           exit "$status"
+      - name: Feature acceptance
+        if: ${{ !cancelled() && steps.host-build.outcome == 'success' && (inputs.native_vm_tests || vars.LINUX_ARM64_VM_RUNNER != '') }}
+        timeout-minutes: 15
+        run: sh acceptance/run.sh --terra dist/terra
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: terra-aarch64-linux
@@ -420,6 +428,10 @@ jobs:
           cargo test --no-fail-fast --locked --target aarch64-apple-darwin -p terra-hypervisor --lib --test native_vm -- --ignored --test-threads=1
           cargo test --no-fail-fast --locked --target aarch64-apple-darwin -p terra-runtime --lib -- --ignored --test-threads=1
           TERRA_BIN="$PWD/dist/terra" cargo test --no-fail-fast --locked --target aarch64-apple-darwin -p terra --test native_boot --test boot --test memory -- --ignored --test-threads=1 --nocapture
+      - name: Feature acceptance
+        if: ${{ !cancelled() && steps.host-build.outcome == 'success' && (inputs.native_vm_tests || vars.MACOS_ARM64_VM_RUNNER != '') }}
+        timeout-minutes: 15
+        run: sh acceptance/run.sh --terra dist/terra
       - name: Report macOS boot coverage
         if: ${{ !(inputs.native_vm_tests || vars.MACOS_ARM64_VM_RUNNER != '') }}
         run: |
@@ -526,6 +538,11 @@ jobs:
           cargo test --locked --target ${{ matrix.target }} -p terra-sandbox --lib windows::tests::native_roles_enforce_vm_grants_and_broker_job -- --ignored --exact
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --no-fail-fast --locked --target ${{ matrix.target }} -p terra --test native_boot --test boot --test memory -- --ignored --test-threads=1 --nocapture
+      - name: Feature acceptance
+        if: ${{ !cancelled() && steps.host-build.outcome == 'success' && (inputs.native_vm_tests || matrix.native_vm_tests) }}
+        timeout-minutes: 15
+        shell: powershell
+        run: ./acceptance/run.ps1 -Terra dist/terra.exe
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: terra-${{ matrix.target }}
