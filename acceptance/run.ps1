@@ -69,6 +69,9 @@ $work = Join-Path ([IO.Path]::GetTempPath()) ("terra-acceptance-" + [guid]::NewG
 $project = Join-Path $work "project"
 $log = Join-Path $work "step.log"
 $step = $null
+$stepWatch = $null
+$results = New-Object System.Collections.Generic.List[object]
+$suiteWatch = [Diagnostics.Stopwatch]::StartNew()
 New-Item -ItemType Directory -Path (Join-Path $work "home") | Out-Null
 $savedHome = $env:HOME
 $savedProfile = $env:USERPROFILE
@@ -81,12 +84,38 @@ $env:USERPROFILE = $env:HOME
 
 function Start-Step($Name) {
     $script:step = $Name
+    $script:stepWatch = [Diagnostics.Stopwatch]::StartNew()
     Write-Host ("{0,-58} " -f $Name) -NoNewline
     Set-Content -LiteralPath $log -Value $null
 }
 
 function Complete-Step {
     Write-Host "ok"
+    Add-StepResult "ok"
+}
+
+function Add-StepResult($Result) {
+    $results.Add([pscustomobject]@{ Result = $Result; Seconds = [int][math]::Floor($stepWatch.Elapsed.TotalSeconds); Name = $step })
+    $script:stepWatch = $null
+}
+
+function Format-Duration([int]$Seconds) {
+    if ($Seconds -ge 60) { "{0}m{1:d2}s" -f [math]::Floor($Seconds / 60), ($Seconds % 60) } else { "${Seconds}s" }
+}
+
+function Write-Summary {
+    Write-Host ""
+    foreach ($result in $results) {
+        $status = "  {0,-4}" -f $result.Result
+        if ($env:NO_COLOR) {
+            Write-Host $status -NoNewline
+        } else {
+            Write-Host $status -NoNewline -ForegroundColor $(if ($result.Result -eq "ok") { "Green" } else { "Red" })
+        }
+        Write-Host (" {0,6}  {1}" -f (Format-Duration $result.Seconds), $result.Name)
+    }
+    $failed = @($results | Where-Object { $_.Result -ne "ok" }).Count
+    Write-Host ("  {0} passed, {1} failed in {2}" -f ($results.Count - $failed), $failed, (Format-Duration ([math]::Floor($suiteWatch.Elapsed.TotalSeconds))))
 }
 
 function Write-Note($Text) {
@@ -317,6 +346,7 @@ try {
     Write-Host "terra $version works on this machine"
     $passed = $true
 } catch {
+    if ($stepWatch) { Add-StepResult "FAIL" }
     Write-Host "FAIL"
     Write-Host "$step failed: $_"
     if (Test-Path -LiteralPath $log) {
@@ -331,6 +361,7 @@ try {
         }
     }
     Pop-Location
+    if (-not [Console]::IsOutputRedirected) { Write-Summary }
     $env:HOME = $savedHome
     $env:USERPROFILE = $savedProfile
     if ($passed) {

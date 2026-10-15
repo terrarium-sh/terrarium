@@ -77,12 +77,18 @@ work=$(mktemp -d /tmp/terra-acceptance.XXXXXX)
 project="$work/project"
 log="$work/step.log"
 step=
+step_started=
+results=
+suite_started=$(date +%s)
 mkdir "$work/home"
 HOME="$work/home"
 export HOME
 
 finish() {
   status=$?
+  if [ "$status" -ne 0 ] && [ -n "$step_started" ]; then
+    record FAIL
+  fi
   if [ "$status" -ne 0 ]; then
     echo "FAIL"
     echo "$step failed (exit $status):"
@@ -93,6 +99,9 @@ finish() {
     for name in $boxes; do
       "$terra" "$name" rm --force --purge --timeout 5 >/dev/null 2>&1 || true
     done
+  fi
+  if [ -t 1 ]; then
+    summary
   fi
   if [ "$status" -eq 0 ]; then
     rm -rf "$work"
@@ -109,12 +118,43 @@ trap 'exit 130' INT TERM HUP
 
 begin() {
   step=$1
+  step_started=$(date +%s)
   printf '%-58s ' "$1"
   : > "$log"
 }
 
 passed() {
   echo ok
+  record ok
+}
+
+record() {
+  results="$results$1 $(( $(date +%s) - step_started )) $step
+"
+  step_started=
+}
+
+duration() {
+  if [ "$1" -ge 60 ]; then
+    printf '%dm%02ds' $(( $1 / 60 )) $(( $1 % 60 ))
+  else
+    printf '%ds' "$1"
+  fi
+}
+
+summary() {
+  green= red= reset=
+  if [ -z "${NO_COLOR:-}" ]; then
+    green=$(printf '\033[32m') red=$(printf '\033[31m') reset=$(printf '\033[0m')
+  fi
+  echo
+  printf '%s' "$results" | while read -r result seconds name; do
+    if [ "$result" = ok ]; then color=$green; else color=$red; fi
+    printf '  %s%-4s%s %6s  %s\n' "$color" "$result" "$reset" "$(duration "$seconds")" "$name"
+  done
+  failed=$(printf '%s' "$results" | grep -c '^FAIL ' || true)
+  ok=$(printf '%s' "$results" | grep -c '^ok ' || true)
+  printf '  %s passed, %s failed in %s\n' "$ok" "$failed" "$(duration $(( $(date +%s) - suite_started )))"
 }
 
 note() {
