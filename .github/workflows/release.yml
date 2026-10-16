@@ -13,7 +13,6 @@ jobs:
     uses: ./.github/workflows/build.yml
     with:
       release_sources: true
-      native_vm_tests: true
 
   release:
     runs-on: ubuntu-latest
