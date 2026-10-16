@@ -158,7 +158,11 @@ impl Cpu {
         Ok(())
     }
 
-    pub fn set_arm_mmio_read(&self, register: Option<u8>, value: u64) -> Result<(), HvError> {
+    pub fn set_arm_general_register(
+        &self,
+        register: Option<u8>,
+        value: u64,
+    ) -> Result<(), HvError> {
         if let Some(register) = register {
             let register = general_register(register).ok_or(HvError::InvalidRegister)?;
             self.vcpu.set_reg(register, value)?;

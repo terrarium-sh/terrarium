@@ -217,6 +217,50 @@ mod supported_host {
 
     #[cfg(all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos")))]
     #[test]
+    #[ignore = "requires a native hypervisor"]
+    fn native_vcpu_completes_debug_os_register_traps() {
+        let _native_hypervisor = NATIVE_HYPERVISOR.lock().expect("lock native hypervisor");
+        let config = one_vcpu_config();
+        let prepared = PreparedVm::create(&config, None).expect("prepare native VM");
+        let memory = prepared.handle().memory();
+        let entry = terra_limits::ARM_RAM_BASE;
+        let marker = entry + 0x100;
+        // msr osdlr_el1, xzr; msr oslar_el1, xzr; write MARKER; spin. Hypervisor.framework traps
+        // the OS-lock writes (MDCR_EL2.TDOSA) even without a host debugger.
+        let code = [
+            0xd510_139f_u32,
+            0xd510_109f,
+            0xd2a8_0000,
+            0x9104_0000,
+            0x5294_b4a1,
+            0x72b4_b4a1,
+            0xb900_0001,
+            0x1400_0000,
+        ];
+        memory
+            .write(entry, &code.map(u32::to_le_bytes).concat())
+            .expect("stage ARM OS-lock guest");
+        let finished = Arc::new(Mutex::new(Vec::new()));
+        let mut running = prepared
+            .start(
+                BootState {
+                    entry,
+                    boot_argument: 0,
+                },
+                vec![Box::new(MarkerHandler(Arc::clone(&finished)))],
+            )
+            .expect("start native vCPU");
+        assert!(
+            marker_was_written(&memory, marker),
+            "native vCPU did not complete the trapped OS-lock writes"
+        );
+        running.request_stop();
+        let outcomes = running.join().expect("bounded native vCPU join");
+        assert!(outcomes.into_iter().all(|outcome| outcome.is_ok()));
+    }
+
+    #[cfg(all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos")))]
+    #[test]
     fn arm_native_config_rejects_the_wrong_interrupt_controller_and_vcpu_count() {
         let mut config = one_vcpu_config();
         config.interrupt_controller = InterruptControllerConfig::X86;

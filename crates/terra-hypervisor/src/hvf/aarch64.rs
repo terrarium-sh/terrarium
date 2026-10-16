@@ -5,7 +5,7 @@ mod machine;
 pub(crate) use machine::Machine;
 
 use crate::arm::psci::{self, PsciAction, PsciCall};
-use crate::arm::{ArmMmioAccess, ArmRegisterWrite};
+use crate::arm::{ArmDebugOsAccess, ArmMmioAccess, ArmRegisterWrite};
 use crate::vcpus::{Kick, Startup, Stop, Vcpus};
 use crate::vm::{
     BootState, InterruptControllerConfig, InterruptMode, VcpuHandler, VcpuOutcome, VmCapabilities,
@@ -324,14 +324,18 @@ fn run_one(
             physical_address,
             ..
         } => {
-            if let Some(access) = ArmMmioAccess::decode(syndrome)? {
+            if let Some(access) = ArmDebugOsAccess::decode(syndrome) {
+                let ArmRegisterWrite { register, value } = access.complete();
+                cpu.set_arm_general_register(register, value)
+                    .map_err(|error| error.to_string())?;
+            } else if let Some(access) = ArmMmioAccess::decode(syndrome)? {
                 let exit = access.exit(physical_address, |register| {
                     cpu.arm_register_value(register)
                         .map_err(|error| error.to_string())
                 })?;
                 let ArmRegisterWrite { register, value } =
                     access.complete(handler.exchange(exit)?)?;
-                cpu.set_arm_mmio_read(register, value)
+                cpu.set_arm_general_register(register, value)
                     .map_err(|error| error.to_string())?;
             } else {
                 return run_psci(cpu, cpus, stop);

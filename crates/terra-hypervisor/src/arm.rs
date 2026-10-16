@@ -124,6 +124,49 @@ pub(crate) struct ArmRegisterWrite {
     pub(crate) value: u64,
 }
 
+/// An EL1 access to a debug OS register (`OSLAR_EL1`, `OSLSR_EL1`, `OSDLR_EL1`, `DBGPRCR_EL1`)
+/// that Hypervisor.framework traps to the host through `MDCR_EL2.TDOSA`. Nothing in a VM without
+/// a host debugger observes their state, so a completed access writes no register and reads zero.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ArmDebugOsAccess {
+    read_register: Option<u8>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl ArmDebugOsAccess {
+    /// `None` for exceptions that are not a trapped debug OS-register access.
+    pub fn decode(syndrome: u64) -> Option<Self> {
+        const EC: u64 = 0b11_1111 << 26;
+        const SYS64_TRAP: u64 = 0x18 << 26;
+        if syndrome & EC != SYS64_TRAP {
+            return None;
+        }
+        let op0 = (syndrome >> 20) & 0b11;
+        let op1 = (syndrome >> 14) & 0b111;
+        let op2 = (syndrome >> 17) & 0b111;
+        let crn = (syndrome >> 10) & 0b1111;
+        let crm = (syndrome >> 1) & 0b1111;
+        let is_debug_os = (op0, op1, crn, op2) == (2, 0, 1, 4) && matches!(crm, 0 | 1 | 3 | 4);
+        if !is_debug_os {
+            return None;
+        }
+        let is_read = syndrome & 1 != 0;
+        let destination = ((syndrome >> 5) & 0b1_1111) as u8;
+        Some(Self {
+            read_register: (is_read && destination != 31).then_some(destination),
+        })
+    }
+
+    /// The guest register write that completes the access.
+    pub fn complete(self) -> ArmRegisterWrite {
+        ArmRegisterWrite {
+            register: self.read_register,
+            value: 0,
+        }
+    }
+}
+
 /// ARM PSCI calls for hypervisors that exit to userspace on HVC.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) mod psci {
@@ -341,7 +384,10 @@ pub(crate) mod psci {
 
 #[cfg(test)]
 mod tests {
-    use super::{ArmMmioAccess, ArmRegisterWrite, MmioRead, MmioWrite, VcpuAction, VcpuExit};
+    use super::{
+        ArmDebugOsAccess, ArmMmioAccess, ArmRegisterWrite, MmioRead, MmioWrite, VcpuAction,
+        VcpuExit,
+    };
 
     const DATA_ABORT: u64 = 0x24 << 26;
     const ISV: u64 = 1 << 24;
@@ -457,5 +503,68 @@ mod tests {
             })
         );
         assert!(load(SF).complete(VcpuAction::Reenter).is_err());
+    }
+
+    /// A Linux guest clears the OS lock with `msr osdlr_el1, xzr; msr oslar_el1, xzr`, and
+    /// Hypervisor.framework traps both (syndrome 0x622807e6 seen on macOS 26); every trapped
+    /// debug OS register must complete as a no-op write or a zero read, or the guest dies in
+    /// early boot.
+    #[test]
+    fn debug_os_register_traps_complete_without_a_host_debugger() {
+        let write = ArmDebugOsAccess::decode(0x6228_07e6).unwrap();
+        assert_eq!(
+            write.complete(),
+            ArmRegisterWrite {
+                register: None,
+                value: 0,
+            }
+        );
+        for oslar_or_dbgprcr in [0x6228_07e0, 0x6228_07e8] {
+            assert_eq!(
+                ArmDebugOsAccess::decode(oslar_or_dbgprcr)
+                    .unwrap()
+                    .complete(),
+                ArmRegisterWrite {
+                    register: None,
+                    value: 0,
+                }
+            );
+        }
+        let read = ArmDebugOsAccess::decode(0x6228_0407).unwrap();
+        assert_eq!(
+            read.complete(),
+            ArmRegisterWrite {
+                register: Some(0),
+                value: 0,
+            }
+        );
+        for oslsr_or_dbgprcr in [0x6228_0403, 0x6228_0409] {
+            assert!(ArmDebugOsAccess::decode(oslsr_or_dbgprcr).is_some());
+        }
+        let discarded = ArmDebugOsAccess::decode(0x6228_07e7).unwrap();
+        assert_eq!(
+            discarded.complete(),
+            ArmRegisterWrite {
+                register: None,
+                value: 0,
+            }
+        );
+    }
+
+    /// Only the debug OS registers have no state to lose; another system-register trap or a
+    /// data abort must stay undecoded so the vCPU keeps failing loudly.
+    #[test]
+    fn other_exceptions_are_not_debug_os_accesses() {
+        for syndrome in [
+            0x6228_0404, // a debug register outside the OS lock set
+            0x6238_07e6, // OSDLR_EL1 under op0 = 3
+            0x9000_0000, // data abort
+            0x5800_0000, // HVC
+        ] {
+            assert!(
+                ArmDebugOsAccess::decode(syndrome).is_none(),
+                "{syndrome:#x}"
+            );
+        }
     }
 }
