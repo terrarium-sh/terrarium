@@ -2,94 +2,60 @@
 
 **Give your agent room to work. Decide what it can touch.**
 
-Terrarium runs agents and development tools in hardware-virtualized microVMs.
-One `terra` executable and a YAML recipe give each box its own kernel, its own
-disk, and only the host files and network destinations you grant.
+Terrarium runs agents and development tools in lightweight virtual machines
+called boxes. Each box has its own kernel and disk, and it sees only the host
+folders and network destinations you allow. You need one program, `terra`, and
+a short YAML recipe.
 
 [![CI](https://github.com/terrarium-sh/terrarium/actions/workflows/build.yml/badge.svg)](https://github.com/terrarium-sh/terrarium/actions)
 [![Latest release](https://img.shields.io/github/v/release/terrarium-sh/terrarium)](https://github.com/terrarium-sh/terrarium/releases/latest)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 > [!WARNING]
-> **Under construction.** Docs are incomplete and the code is still under
+> **Under construction.** The docs are incomplete and the code is still under
 > internal review.
 
-## What it's for
+![Terminal demo: create a box from dev.yaml, then enter it.](docs/demo.gif)
 
-- **A terrarium for agents.** Give a long-lived agent a box of its own to live
-  and work in. Its tools and state persist across restarts, and systemd can keep
-  it running. [Set one up →](docs/usage.md#a-terrarium-for-agents)
-- **A dev VM for your harness.** Run Claude Code, Codex, or your own tooling
-  against your project in a confined VM instead of on your host.
+## What you can do with it
+
+- **Run your coding agent in a box.** Run Claude Code, Codex or your own tools
+  on your project inside a VM, not directly on your machine.
   [Start with the quickstart →](#quickstart)
+- **Give an agent a long-term home.** Its tools and files stay between
+  restarts, and systemd can keep it running.
+  [Set one up →](docs/usage.md#a-terrarium-for-agents)
+- **Try things you don't trust.** Unknown installers, untrusted builds and
+  one-off scripts run in a box. You can also publish a box's services on host
+  loopback.
 
-These are the primary uses, not the only ones: untrusted builds, unfamiliar
-installers, one-off recipe runs, and services published on host loopback fit
-the same box.
+## Install
 
-## Why Terrarium
+Terrarium runs on Linux (amd64, aarch64), macOS on Apple Silicon, and Windows
+(amd64, ARM64). Linux needs access to `/dev/kvm`. Windows needs the Windows
+Hypervisor Platform feature turned on. More detail is in the
+[platform requirements](packaging/README.md#native-host-builds).
 
-- **A dedicated kernel for every box.** Hardware virtualization isolates the
-  workload from the host, including guest root.
-- **Device components are sandboxed too.** Separate WebAssembly sandboxes
-  restrict the code handling guest requests to scoped host capabilities.
-  The VM process and network broker also run in the host's OS sandbox by
-  default: Bubblewrap and seccomp, App Sandbox, or Less-Privileged AppContainers.
-- **Access starts at zero.** No host files or network access by default.
-  Grant specific directories, enforce read-only mounts, and allow network
-  destinations by hostname, IP, or CIDR and port.
-- **An embedded runtime, no daemon to manage.** The guest kernel, base filesystem,
-  and VM components ship inside `terra`. Recipes define resources, access,
-  package installation, and the workload.
-- **Keep working in the same box.** Detach and rejoin, run commands, or sync
-  files without rebuilding. Guest storage persists between restarts.
-
-Know what it protects against and where it stops: read the
-[security model and its limits](docs/security.md).
-
-## Quickstart
-
-Supported hosts: Linux amd64 and aarch64, macOS on Apple Silicon, and Windows
-amd64 and ARM64. Linux requires access to `/dev/kvm`; Windows requires Windows
-Hypervisor Platform. See [platform requirements](packaging/README.md#native-host-builds).
-
-Install on Linux or macOS:
+**Linux and macOS:**
 
 ```sh
 curl -fsSLO https://raw.githubusercontent.com/terrarium-sh/terrarium/main/install.sh && sh install.sh
 ```
 
-<details>
-<summary>Install on Windows (PowerShell)</summary>
+**Windows (PowerShell):**
 
 ```powershell
 Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/terrarium-sh/terrarium/main/install.ps1 -OutFile install.ps1; if ($?) { powershell -ExecutionPolicy Bypass -File install.ps1 }
 ```
 
-Open a new terminal after installation.
+On Windows, open a new terminal after installing. Other ways to install are in
+the [usage guide](docs/usage.md#installation-options).
 
-</details>
+## Quickstart
 
-To check that every feature works on this machine - boxes, exec, shares, sync,
-network policy and storage - run the acceptance suite. It boots throwaway boxes
-in a temporary directory, leaves your own boxes alone, and finishes in under a
-minute:
+This example sets up a box for a Node.js project.
 
-```sh
-curl -fsSL https://raw.githubusercontent.com/terrarium-sh/terrarium/main/acceptance/run.sh -o terra-acceptance.sh && sh terra-acceptance.sh
-```
-
-<details>
-<summary>On Windows (PowerShell)</summary>
-
-```powershell
-Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/terrarium-sh/terrarium/main/acceptance/run.ps1 -OutFile terra-acceptance.ps1; if ($?) { powershell -ExecutionPolicy Bypass -File terra-acceptance.ps1 }
-```
-
-</details>
-
-The quickstart builds a dev VM for a Node.js project. In your project
-directory, create `dev.yaml`:
+**1. Write a recipe.** In your project folder, create `dev.yaml`:
 
 ```yaml
 hw:
@@ -113,42 +79,69 @@ workload:
   workdir: /work
 ```
 
-This installs Node.js, npm, and Git, shares your project read-write at `/work`,
-and allows HTTPS access to the Alpine and npm package registries. Add the
-destinations your tools need to `network.allow`.
+This recipe:
+
+- gives the box 2 CPUs, 2 GiB of memory and a 4 GiB disk;
+- shares your project folder at `/work`, so edits show up on both sides;
+- allows HTTPS only to the Alpine and npm package registries;
+- installs Node.js, npm and Git the first time the box is created.
+
+If your tools need other sites, add them to `network.allow`.
+
+**2. Create the box and go in:**
 
 ```sh
-terra ./dev.yaml setup   # create the box and install tools
-terra                   # enter the guest shell at /work
+terra ./dev.yaml setup   # create the box and install the tools
+terra                    # open a shell in the box at /work
 ```
 
-Project edits are shared with the host. This includes `dev.yaml`, so review
-the recipe before rerunning setup. See [recipe trust](docs/security.md#recipe-storage).
+**3. Leave and come back.** Press `Ctrl-\` to detach. The box keeps running.
 
-Press `Ctrl-\` to detach while keeping the box running. From the host:
+| Command | What it does |
+| --- | --- |
+| `terra` | Go back into the box's shell |
+| `terra exec -- node --version` | Run one command in the box |
+| `terra stop` | Stop the box (its files are kept) |
+| `terra rm` | Delete the box and its storage |
 
-```sh
-terra exec -- node --version   # run a command in the guest
-terra                         # rejoin the shell
-```
+> [!IMPORTANT]
+> The box can edit your project folder, and that includes `dev.yaml`. Check the
+> recipe before you run `setup` again. See [recipe trust](docs/security.md#recipe-storage).
 
-Use `terra stop` to stop the box and `terra rm` to delete its storage.
-See the [recipe reference](docs/recipe.md) to customize tools, access, and workloads.
+To change tools, access or the workload, see the [recipe reference](docs/recipe.md).
 
-![Terminal demo: create a box from dev.yaml, then enter it.](docs/demo.gif)
+## Why Terrarium
 
-## Go further
+- **Nothing is allowed until you allow it.** A new box sees no host files and
+  has no network. You choose which folders it gets, whether they are read-only,
+  and which hosts, IPs or ranges and ports it can reach.
+- **A real VM, not a container.** Each box runs its own kernel under hardware
+  virtualization, so even root inside the box stays inside.
+- **More layers around the VM.** The code that handles the box's device requests
+  runs in separate WebAssembly sandboxes. The VM process and network broker also
+  run in the host OS sandbox: Bubblewrap and seccomp on Linux, App Sandbox on
+  macOS, and Less-Privileged AppContainers on Windows.
+- **No daemon, nothing extra to install.** The guest kernel, base system and VM
+  parts are built into `terra`.
+- **Your work stays put.** Detach and rejoin, run commands, or sync files without
+  rebuilding. The box's storage persists across restarts.
 
-- [Usage guide](docs/usage.md) — installation options, commands, file sync, and storage.
-- [Recipe reference](docs/recipe.md) — network access, mounts, packages, and workloads.
-- [Project manifest](docs/manifest.md) — manage multiple boxes with `terra.yaml`.
-- [Security model](docs/security.md) — trust boundaries, enforcement, and limitations.
-- [Host process sandboxing](docs/sandboxing.md) — the processes in a box and how
-  Linux, macOS and Windows confine each one.
-- [Host sandbox policy](docs/sandbox-policy.md) — built-in confinement and the
-  Linux syscall allowlists generated from each sandboxed role's code.
-- [Development](README.dev.md) — build from source, test, and release.
-- [Packaging](packaging/README.md) — platform requirements, systemd, and man pages.
-- [Security policy](SECURITY.md) — report a vulnerability privately.
+To learn what Terrarium protects against and where it stops, read the
+[security model](docs/security.md).
+
+## Learn more
+
+- [Usage guide](docs/usage.md): install options, commands, file sync and storage.
+- [Recipe reference](docs/recipe.md): network access, mounts, packages and workloads.
+- [Project manifest](docs/manifest.md): manage several boxes with `terra.yaml`.
+- [Security model](docs/security.md): trust boundaries, enforcement and limits.
+- [Host process sandboxing](docs/sandboxing.md): which processes a box uses and
+  how each OS confines them.
+- [Host sandbox policy](docs/sandbox-policy.md): built-in confinement and the
+  generated Linux syscall allowlists.
+- [Packaging](packaging/README.md): platform requirements, systemd and man pages.
+- [Development](README.dev.md): build from source, test, run the acceptance gates
+  and release.
+- [Security policy](SECURITY.md): report a vulnerability privately.
 
 Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).

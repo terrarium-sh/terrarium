@@ -37,6 +37,38 @@ for the Windows build command, Linux asset staging, platform requirements, and
 signing. Windows builds use PowerShell and require a checkout with the shared
 WIT [interface symlinks](components/wit/README.md) materialized correctly.
 
+## Acceptance gates
+
+The acceptance suite boots throwaway boxes and runs every user-facing feature
+through the `terra` CLI. It needs only `terra`, `curl` and `tar`, takes about a
+minute, and leaves existing boxes alone. Each one-liner downloads the suite, so
+you can run it on any test machine without a checkout.
+
+A development build reports its version as `dev+<hash>`. Run it against the
+suite from the branch it was built from. Replace `main` with your branch and
+`./terra` with the binary to test:
+
+```sh
+curl -fsSL https://codeload.github.com/terrarium-sh/terrarium/tar.gz/main | tar -xz --strip-components=1 terrarium-main/acceptance && sh acceptance/run.sh --terra ./terra
+```
+
+```powershell
+Invoke-WebRequest -UseBasicParsing https://codeload.github.com/terrarium-sh/terrarium/zip/main -OutFile terra-src.zip; if ($?) { Expand-Archive terra-src.zip -Force; powershell -ExecutionPolicy Bypass -File terra-src/terrarium-main/acceptance/run.ps1 -Terra .\terra.exe }
+```
+
+A release build fetches the suite of its own version, checked against the
+release `SHA256SUMS`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/terrarium-sh/terrarium/main/acceptance/run.sh -o terra-acceptance.sh && sh terra-acceptance.sh --terra ./terra
+```
+
+From a checkout, run `make dist && sh acceptance/run.sh --terra dist/terra` (on
+Windows: `powershell -File acceptance/run.ps1 -Terra dist/terra.exe`). The
+runner prints a timed summary of all steps. When a step fails, the runner prints
+that step's log and keeps its working directory under `/tmp/terra-acceptance.*`.
+A new user-facing feature gets a step in both `run.sh` and `run.ps1`.
+
 ## Code layout
 
 | Path | Responsibility |
@@ -410,16 +442,8 @@ These exercise runtime/device integration, CLI boots, mounts, networking,
 capacity and memory growth/reclamation. Ignored tests are not covered by an
 ordinary workspace test pass.
 
-The acceptance suite in [`acceptance/`](acceptance) checks every feature through
-the CLI alone, so users run it against an installed release (see the README)
-and CI runs it against each platform's build:
-
-```sh
-sh acceptance/run.sh --terra dist/terra                      # Linux, macOS
-powershell -File acceptance/run.ps1 -Terra dist/terra.exe    # Windows
-```
-
-Its guest-side checks in `acceptance/guest/` are shared with the `guest_suite`
+CI runs the [acceptance gates](#acceptance-gates) against each platform's build.
+The suite's guest-side checks in `acceptance/guest/` are shared with the `guest_suite`
 cargo test. Releases ship the suite as `terra-acceptance.tar.gz`; a runner
 fetched on its own downloads the suite of the installed release and hands over
 to that release's runner. `scripts/checks/test-native-gates.py` keeps the two
