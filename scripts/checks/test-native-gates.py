@@ -127,7 +127,7 @@ class NativeGateTests(unittest.TestCase):
 
     def test_every_linux_build_checks_the_static_policy_without_kvm(self):
         release = (ROOT / '.github/workflows/release.yml').read_text()
-        self.assertIn('      native_vm_tests: true', release)
+        self.assertNotIn('native_vm_tests', release)
         self.assertIn('      release_sources: true', release)
         steps = WORKFLOW.split('      - name: Check seccomp policy\n')[1:]
         self.assertEqual(len(steps), 2)
