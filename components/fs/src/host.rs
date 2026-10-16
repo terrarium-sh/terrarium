@@ -22,7 +22,7 @@ pub struct Stat {
 
 const FIXED_OWNER: u32 = 1000;
 
-fn fixed_owner(uid: Option<u32>, gid: Option<u32>) -> bool {
+pub fn fixed_owner(uid: Option<u32>, gid: Option<u32>) -> bool {
     uid.is_none_or(|value| value == FIXED_OWNER) && gid.is_none_or(|value| value == FIXED_OWNER)
 }
 
@@ -319,16 +319,12 @@ impl Node {
 
     pub async fn setattr(
         &self,
+        open_file: Option<&Descriptor>,
         mode: Option<u32>,
         size: Option<u64>,
         atime: Option<Instant>,
         mtime: Option<Instant>,
-        uid: Option<u32>,
-        gid: Option<u32>,
     ) -> Result<(), i32> {
-        if !fixed_owner(uid, gid) {
-            return Err(wire::EOPNOTSUPP);
-        }
         if let Some(mode) = mode {
             if let Some(descriptor) = &self.descriptor {
                 crate::terra::fs::host::set_mode(descriptor, mode)
@@ -342,11 +338,11 @@ impl Node {
             }
         }
         if let Some(size) = size {
-            self.open(types::DescriptorFlags::WRITE, false)
-                .await?
-                .set_size(size)
-                .await
-                .map_err(wasi_error)?;
+            let writable = match open_file {
+                Some(descriptor) => descriptor.clone(),
+                None => self.open(types::DescriptorFlags::WRITE, false).await?,
+            };
+            writable.set_size(size).await.map_err(wasi_error)?;
         }
         if atime.is_some() || mtime.is_some() {
             let convert = |value: Option<Instant>| {
@@ -356,10 +352,18 @@ impl Node {
                 )
             };
             if let Some(descriptor) = &self.descriptor {
-                descriptor
+                let mut result = open_file
+                    .unwrap_or(descriptor)
                     .set_times(convert(atime), convert(mtime))
-                    .await
-                    .map_err(wasi_error)?;
+                    .await;
+                // Windows sets file times only through a handle opened for writing.
+                if open_file.is_none()
+                    && matches!(result, Err(types::ErrorCode::Access))
+                    && let Ok(writable) = self.open(types::DescriptorFlags::WRITE, false).await
+                {
+                    result = writable.set_times(convert(atime), convert(mtime)).await;
+                }
+                result.map_err(wasi_error)?;
             } else {
                 let (parent, name) = self.checked_path().await?;
                 parent
@@ -556,9 +560,8 @@ pub async fn lookup(parent: &Node, name: Vec<u8>) -> Result<Node, i32> {
         .await
         .map_err(wasi_error)?;
     let flags = match metadata.type_ {
-        types::DescriptorType::RegularFile => {
-            Some(types::DescriptorFlags::READ | types::DescriptorFlags::WRITE)
-        }
+        // A cached write handle would fail Windows host readers that share only reads.
+        types::DescriptorType::RegularFile => Some(types::DescriptorFlags::READ),
         types::DescriptorType::Directory => {
             Some(types::DescriptorFlags::READ | types::DescriptorFlags::MUTATE_DIRECTORY)
         }
@@ -655,9 +658,28 @@ pub async fn create(
     if created {
         apply_create_mode(&descriptor, mode).await?;
     }
+    let cached = match directory
+        .open_at(
+            types::PathFlags::empty(),
+            name.clone(),
+            types::OpenFlags::empty(),
+            types::DescriptorFlags::READ,
+        )
+        .await
+    {
+        Ok(cached) => {
+            verify_identity(
+                descriptor.metadata_hash().await.map_err(wasi_error)?,
+                cached.metadata_hash().await.map_err(wasi_error)?,
+            )?;
+            std::sync::Arc::new(cached)
+        }
+        Err(types::ErrorCode::NotPermitted | types::ErrorCode::Access) => descriptor.clone(),
+        Err(code) => return Err(wasi_error(code)),
+    };
     Ok((
         Node {
-            descriptor: Some(descriptor.clone()),
+            descriptor: Some(cached),
             path: Some((directory.clone(), name)),
             path_identity: None,
         },

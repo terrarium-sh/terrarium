@@ -115,14 +115,31 @@ async fn set_attributes(state: RequestState, request: &Request<'_>) -> Result<Ve
     let mode = u32_at(request.body, 68)?;
     let uid = u32_at(request.body, 76)?;
     let gid = u32_at(request.body, 80)?;
+    if !host::fixed_owner(
+        (valid & 2 != 0).then_some(uid),
+        (valid & 4 != 0).then_some(gid),
+    ) {
+        return Err(wire::EOPNOTSUPP);
+    }
     let node = request_node(state, request.node)?;
+    let open_file = if valid & 64 != 0 {
+        let handle = u64_at(request.body, 8)?;
+        state.with(|state| {
+            Ok(state
+                .handles
+                .get(&handle)
+                .filter(|open| open.writable && open.node == request.node)
+                .map(|open| open.descriptor.clone()))
+        })?
+    } else {
+        None
+    };
     node.setattr(
+        open_file.as_ref(),
         (valid & 1 != 0).then_some(mode),
         (valid & 8 != 0).then_some(size),
         (valid & 16 != 0).then_some(atime),
         (valid & 32 != 0).then_some(mtime),
-        (valid & 2 != 0).then_some(uid),
-        (valid & 4 != 0).then_some(gid),
     )
     .await?;
     Ok(attr_out(&node.stat().await?))
