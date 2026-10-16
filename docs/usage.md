@@ -50,7 +50,8 @@ See [platform requirements](../packaging/README.md) before installing.
 The installer verifies the release checksum and also verifies its GitHub
 attestation when the GitHub CLI is installed. Re-run the installer to upgrade.
 On Linux and macOS, pin a version with `TERRA_VERSION=x.y.z sh install.sh`, or
-use `sh install.sh --prerelease` to include prereleases.
+use `sh install.sh --prerelease` to include prereleases. On Windows, pass
+`-Version x.y.z` or `-Prerelease` to `install.ps1`.
 
 On Windows, `install.ps1` installs `terra.exe` to
 `%LOCALAPPDATA%\Programs\terra` and adds that directory to the user `PATH`.

@@ -39,6 +39,7 @@ while [ "$#" -gt 0 ]; do
     *) url=$1; shift ;;
   esac
 done
+echo "$url" >> "$INSTALL_FIXTURES/urls"
 case "$url" in
   https://api.github.com/*) cp "$INSTALL_FIXTURES/releases.json" "$output" ;;
   *) cp "$INSTALL_FIXTURES/${url##*/}" "$output" ;;
@@ -72,10 +73,17 @@ HOME="$tmp/home" PATH="$tmp/bin:$PATH" INSTALL_FIXTURES="$tmp/release" INSTALL_D
   TERRA_VERSION=1.2.3 sh "$root/install.sh" >/dev/null 2>&1
 cmp "$tmp/original-terra" "$tmp/installed-terra"
 
-rm -f "$tmp/installed-terra"
+rm -f "$tmp/installed-terra" "$tmp/release/urls"
 HOME="$tmp/home" PATH="$tmp/bin:$PATH" INSTALL_FIXTURES="$tmp/release" INSTALL_DEST="$tmp/installed-terra" \
   TERRA_VERSION= sh "$root/install.sh" --prerelease >/dev/null
 cmp "$tmp/release/terra" "$tmp/installed-terra"
+grep -qx 'https://github.com/terrarium-sh/terrarium/releases/download/v1.3.0-rc.1/terra-x86_64-linux.tar.gz' "$tmp/release/urls"
+
+rm -f "$tmp/installed-terra" "$tmp/release/urls"
+HOME="$tmp/home" PATH="$tmp/bin:$PATH" INSTALL_FIXTURES="$tmp/release" INSTALL_DEST="$tmp/installed-terra" \
+  TERRA_VERSION= sh "$root/install.sh" >/dev/null 2>&1
+grep -qx 'https://github.com/terrarium-sh/terrarium/releases/latest/download/terra-x86_64-linux.tar.gz' "$tmp/release/urls"
+! grep -q api.github.com "$tmp/release/urls"
 
 rm -f "$tmp/installed-terra"
 if GH_FAIL=1 HOME="$tmp/home" PATH="$tmp/bin:$PATH" INSTALL_FIXTURES="$tmp/release" INSTALL_DEST="$tmp/installed-terra" \
