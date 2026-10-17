@@ -431,12 +431,44 @@ pub fn is_host_root() -> bool {
     rustix::process::getuid().as_raw() == 0
 }
 
+/// Waits up to [`POLL`](super::POLL) for a read on `fd` to return without blocking.
+pub fn wait_for_input(fd: impl std::os::fd::AsFd) -> bool {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+
+    let mut read_fds = [PollFd::new(&fd, PollFlags::IN)];
+    let timeout = Timespec {
+        tv_sec: 0,
+        tv_nsec: super::POLL.subsec_nanos().into(),
+    };
+    poll(&mut read_fds, Some(&timeout)).is_ok_and(|ready| ready > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sys::SignalResult;
     use std::assert_matches;
     use std::fs::OpenOptions;
+
+    #[test]
+    fn input_readiness_waits_for_a_byte() {
+        use std::io::Write as _;
+
+        let (mut writer, reader) = terra_platform::local_socket::create_local_pair().unwrap();
+        assert!(!wait_for_input(&reader));
+        writer.write_all(b"x").unwrap();
+        assert!(wait_for_input(&reader));
+    }
+
+    #[test]
+    fn input_readiness_reports_eof() {
+        use std::io::Read as _;
+
+        let (writer, mut reader) = terra_platform::local_socket::create_local_pair().unwrap();
+        drop(writer);
+        assert!(wait_for_input(&reader));
+        assert_eq!(reader.read(&mut [0]).unwrap(), 0);
+    }
 
     fn create_scratch_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("terra-sys-{}-{name}", std::process::id()))

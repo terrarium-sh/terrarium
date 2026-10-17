@@ -1,0 +1,594 @@
+diff --git a/.github/workflows/release.yml b/.github/workflows/release.yml
+index d743f57..22c1218 100644
+--- a/.github/workflows/release.yml
++++ b/.github/workflows/release.yml
+@@ -56,6 +56,10 @@ jobs:
+           path: stage
+       - name: Stage the acceptance suite
+         run: cp -R acceptance stage/terra-acceptance
++      - name: Stage the acceptance runners
++        run: |
++          cp acceptance/run.sh stage/terra-acceptance.sh
++          cp acceptance/run.ps1 stage/terra-acceptance.ps1
+       - name: Assemble platform archives
+         run: |
+           for directory in stage/*/; do
+@@ -65,18 +69,21 @@ jobs:
+         run: |
+           cd stage
+           shopt -s nullglob
+-          assets=(terra-*.tar.gz)
++          assets=(terra-*.tar.gz terra-acceptance.sh terra-acceptance.ps1)
+           sha256sum "${assets[@]}" > SHA256SUMS
+       - name: Attest release artifacts
+         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+         with:
+-          subject-path: stage/*.tar.gz
++          subject-path: |
++            stage/*.tar.gz
++            stage/terra-acceptance.sh
++            stage/terra-acceptance.ps1
+       - name: Create the release
+         env:
+           GH_TOKEN: ${{ github.token }}
+         run: |
+           shopt -s nullglob
+-          assets=(stage/terra-*.tar.gz)
++          assets=(stage/terra-*.tar.gz stage/terra-acceptance.sh stage/terra-acceptance.ps1)
+           prerelease=()
+           case "$GITHUB_REF_NAME" in
+             *-*) prerelease=(--prerelease) ;;
+diff --git a/README.dev.md b/README.dev.md
+index 15c7a44..78b59ec 100644
+--- a/README.dev.md
++++ b/README.dev.md
+@@ -56,13 +56,22 @@ curl -fsSL https://codeload.github.com/terrarium-sh/terrarium/tar.gz/main | tar
+ Invoke-WebRequest -UseBasicParsing https://codeload.github.com/terrarium-sh/terrarium/zip/main -OutFile terra-src.zip; if ($?) { Expand-Archive terra-src.zip -Force; powershell -ExecutionPolicy Bypass -File terra-src/terrarium-main/acceptance/run.ps1 -Terra .\terra.exe }
+ ```
+ 
+-A release build fetches the suite of its own version, checked against the
+-release `SHA256SUMS`:
++A release build is checked against its own release. Each release publishes the
++runners as `terra-acceptance.sh` and `terra-acceptance.ps1`. Run on its own, a
++runner downloads the suite of the version `terra` reports, checks it against
++that release's `SHA256SUMS`, and runs it:
+ 
+ ```sh
+-curl -fsSL https://raw.githubusercontent.com/terrarium-sh/terrarium/main/acceptance/run.sh -o terra-acceptance.sh && sh terra-acceptance.sh --terra ./terra
++v=$(./terra --version | cut -d' ' -f2 | cut -d+ -f1) && curl -fsSL "https://github.com/terrarium-sh/terrarium/releases/download/v$v/terra-acceptance.sh" -o terra-acceptance.sh && sh terra-acceptance.sh --terra ./terra
+ ```
+ 
++```powershell
++$v = ((.\terra.exe --version) -split ' ')[1] -replace '\+.*'; curl.exe -fsSL "https://github.com/terrarium-sh/terrarium/releases/download/v$v/terra-acceptance.ps1" -o terra-acceptance.ps1; if ($LASTEXITCODE -eq 0) { powershell -ExecutionPolicy Bypass -File terra-acceptance.ps1 -Terra .\terra.exe }
++```
++
++Or download `terra-acceptance.tar.gz` from the release page, extract it, and run
++its `run.sh --terra ./terra` or `run.ps1 -Terra .\terra.exe`.
++
+ From a checkout, run `make dist && sh acceptance/run.sh --terra dist/terra` (on
+ Windows: `powershell -File acceptance/run.ps1 -Terra dist/terra.exe`). The
+ runner prints a timed summary of all steps. When a step fails, the runner prints
+@@ -444,9 +453,10 @@ ordinary workspace test pass.
+ 
+ CI runs the [acceptance gates](#acceptance-gates) against each platform's build.
+ The suite's guest-side checks in `acceptance/guest/` are shared with the `guest_suite`
+-cargo test. Releases ship the suite as `terra-acceptance.tar.gz`; a runner
+-fetched on its own downloads the suite of the installed release and hands over
+-to that release's runner. `scripts/checks/test-native-gates.py` keeps the two
++cargo test. Releases ship the suite as `terra-acceptance.tar.gz` and the runners
++as `terra-acceptance.sh` and `terra-acceptance.ps1`; a runner fetched on its own
++downloads the suite of the installed release and hands over to that release's
++runner. `scripts/checks/test-native-gates.py` keeps the two
+ runners' steps and guest scripts identical.
+ 
+ `make test-platform-native-vm` checks preparation cleanup and repeated stop/join
+diff --git a/acceptance/run.ps1 b/acceptance/run.ps1
+index 20b9789..6c1a4ae 100644
+--- a/acceptance/run.ps1
++++ b/acceptance/run.ps1
+@@ -28,6 +28,18 @@ function Get-TerraVersion {
+     if ($version -match "\+") { $version -replace "\+.*", "" } else { "dev" }
+ }
+ 
++# Get-FileHash comes from a module that Windows PowerShell cannot load when it inherits
++# PowerShell 7's PSModulePath, so hash with .NET directly.
++function Get-Sha256([string]$Path) {
++    $stream = [IO.File]::OpenRead($Path)
++    try {
++        $hasher = [Security.Cryptography.SHA256]::Create()
++        [BitConverter]::ToString($hasher.ComputeHash($stream)) -replace "-", ""
++    } finally {
++        $stream.Dispose()
++    }
++}
++
+ # --- Without a suite: hand over to the runner of the release terra reports,
+ # --- so runner and recipes always match.
+ 
+@@ -50,7 +62,7 @@ if (-not $Suite) {
+             $fields = $line -split '\s+'
+             if ($fields[-1] -eq "terra-acceptance.tar.gz") { $expected = $fields[0] }
+         }
+-        if (-not $expected -or (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ne $expected) {
++        if (-not $expected -or (Get-Sha256 $archive) -ne $expected) {
+             throw "terra-acceptance.tar.gz does not match the v$version SHA256SUMS - not running it"
+         }
+         tar -xzf $archive -C (Join-Path $download "suite")
+@@ -170,7 +182,7 @@ function Write-Text($Path, $Text) {
+ }
+ 
+ function Get-FileSha256($Path) {
+-    (Get-FileHash -LiteralPath (Join-Path $project $Path)).Hash
++    Get-Sha256 (Join-Path $project $Path)
+ }
+ 
+ function Read-Http($Port, $Attempts) {
+diff --git a/crates/terra-sandbox/src/windows.rs b/crates/terra-sandbox/src/windows.rs
+index 30f7baa..a954e50 100644
+--- a/crates/terra-sandbox/src/windows.rs
++++ b/crates/terra-sandbox/src/windows.rs
+@@ -25,7 +25,7 @@ use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TokenIsAppC
+ use windows_sys::Win32::System::JobObjects::IsProcessInJob;
+ use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+ use windows_sys::Win32::System::Threading::{
+-    GetCurrentProcess, GetExitCodeProcess, INFINITE, OpenProcess,
++    CREATE_NO_WINDOW, GetCurrentProcess, GetExitCodeProcess, INFINITE, OpenProcess,
+     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, ResumeThread, WaitForMultipleObjects,
+     WaitForSingleObject,
+ };
+@@ -140,6 +140,8 @@ pub fn prepare_launch(launch: Launch<'_>) -> Result<PreparedLaunch> {
+         )
+     })?;
+     let mut command = Command::new(std::env::current_exe()?);
++    // A detached supervisor has no console, so Windows would open a visible one for the wrapper.
++    std::os::windows::process::CommandExt::creation_flags(&mut command, CREATE_NO_WINDOW);
+     command.env_clear();
+     for name in [
+         "SystemRoot",
+diff --git a/crates/terra/src/session.rs b/crates/terra/src/session.rs
+index a55f0ba..8f86e19 100644
+--- a/crates/terra/src/session.rs
++++ b/crates/terra/src/session.rs
+@@ -5,8 +5,6 @@ use crate::state::{BoxRef, Holder};
+ use crate::sys::POLL;
+ use anyhow::{Context, Result};
+ use std::io::{Read, Write};
+-#[cfg(unix)]
+-use std::os::fd::AsFd;
+ use std::sync::Arc;
+ use std::sync::atomic::{AtomicBool, Ordering};
+ use std::time::{Duration, Instant};
+@@ -323,9 +321,7 @@ fn spawn_stdin_reader(escape: Option<u8>, sender: tokio::sync::mpsc::Sender<Inpu
+         let mut stdin = std::io::stdin();
+         let mut buf = [0u8; 4096];
+         while !stopped.load(Ordering::SeqCst) {
+-            if !input_is_ready(&stdin) {
+-                #[cfg(windows)]
+-                std::thread::sleep(POLL);
++            if !crate::sys::wait_for_input(&stdin) {
+                 continue;
+             }
+             let n = match stdin.read(&mut buf) {
+@@ -356,57 +352,6 @@ fn spawn_stdin_reader(escape: Option<u8>, sender: tokio::sync::mpsc::Sender<Inpu
+     }
+ }
+ 
+-#[cfg(unix)]
+-fn input_is_ready(fd: impl AsFd) -> bool {
+-    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+-
+-    let mut read_fds = [PollFd::new(&fd, PollFlags::IN)];
+-    let timeout = Timespec {
+-        tv_sec: 0,
+-        tv_nsec: POLL.subsec_nanos().into(),
+-    };
+-    poll(&mut read_fds, Some(&timeout)).is_ok_and(|ready| ready > 0)
+-}
+-
+-#[allow(unsafe_code)]
+-#[cfg(windows)]
+-fn input_is_ready(stdin: &impl std::os::windows::io::AsRawHandle) -> bool {
+-    use windows_sys::Win32::Foundation::{
+-        ERROR_BROKEN_PIPE, ERROR_PIPE_NOT_CONNECTED, GetLastError,
+-    };
+-    use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_DISK, FILE_TYPE_PIPE, GetFileType};
+-    use windows_sys::Win32::System::Console::GetNumberOfConsoleInputEvents;
+-    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+-
+-    let handle = stdin.as_raw_handle();
+-    // SAFETY: stdin owns this handle for the duration of the probe and all output pointers are
+-    // writable locals.
+-    unsafe {
+-        let file_type = GetFileType(handle);
+-        if file_type == FILE_TYPE_DISK {
+-            return true;
+-        }
+-        if file_type == FILE_TYPE_PIPE {
+-            let mut available = 0;
+-            let succeeded = PeekNamedPipe(
+-                handle,
+-                std::ptr::null_mut(),
+-                0,
+-                std::ptr::null_mut(),
+-                &raw mut available,
+-                std::ptr::null_mut(),
+-            ) != 0;
+-            return if succeeded {
+-                available > 0
+-            } else {
+-                matches!(GetLastError(), ERROR_BROKEN_PIPE | ERROR_PIPE_NOT_CONNECTED)
+-            };
+-        }
+-        let mut events = 0;
+-        GetNumberOfConsoleInputEvents(handle, &raw mut events) == 0 || events > 0
+-    }
+-}
+-
+ enum PumpResult {
+     Exit(i32),
+     Detached,
+@@ -649,62 +594,6 @@ mod tests {
+         (outcome, shown)
+     }
+ 
+-    #[cfg(unix)]
+-    #[test]
+-    fn input_readiness_waits_for_a_byte() {
+-        let (mut writer, reader) = terra_platform::local_socket::create_local_pair().unwrap();
+-        assert!(!input_is_ready(&reader));
+-        writer.write_all(b"x").unwrap();
+-        assert!(input_is_ready(&reader));
+-    }
+-
+-    #[cfg(unix)]
+-    #[test]
+-    fn input_readiness_reports_eof() {
+-        let (writer, mut reader) = terra_platform::local_socket::create_local_pair().unwrap();
+-        drop(writer);
+-        assert!(input_is_ready(&reader));
+-        assert_eq!(reader.read(&mut [0]).unwrap(), 0);
+-    }
+-
+-    #[cfg(windows)]
+-    #[allow(unsafe_code)]
+-    #[test]
+-    fn input_readiness_accepts_redirected_files_and_pipe_eof() {
+-        use std::os::windows::io::FromRawHandle;
+-        use windows_sys::Win32::System::Pipes::CreatePipe;
+-
+-        let mut file = tempfile::tempfile().unwrap();
+-        assert!(input_is_ready(&file));
+-        assert_eq!(file.read(&mut [0]).unwrap(), 0);
+-
+-        let mut read_handle = std::ptr::null_mut();
+-        let mut write_handle = std::ptr::null_mut();
+-        // SAFETY: the writable outputs receive two handles owned by the returned files.
+-        let (mut reader, mut writer) = unsafe {
+-            assert_ne!(
+-                CreatePipe(
+-                    &raw mut read_handle,
+-                    &raw mut write_handle,
+-                    std::ptr::null(),
+-                    0
+-                ),
+-                0
+-            );
+-            (
+-                std::fs::File::from_raw_handle(read_handle),
+-                std::fs::File::from_raw_handle(write_handle),
+-            )
+-        };
+-        assert!(!input_is_ready(&reader));
+-        writer.write_all(b"x").unwrap();
+-        assert!(input_is_ready(&reader));
+-        assert_eq!(reader.read(&mut [0]).unwrap(), 1);
+-        drop(writer);
+-        assert!(input_is_ready(&reader));
+-        assert_eq!(reader.read(&mut [0]).unwrap(), 0);
+-    }
+-
+     /// A box on disk, held as a running one, with a fake agent bound to its
+     /// socket. The fake speaks just enough of the wire for the host's side to
+     /// be driven: hello, the `SessionControl` frame, the request the host
+diff --git a/crates/terra/src/sys.rs b/crates/terra/src/sys.rs
+index 629481f..19b6bea 100644
+--- a/crates/terra/src/sys.rs
++++ b/crates/terra/src/sys.rs
+@@ -21,7 +21,7 @@ pub use imp::is_host_root;
+ pub use imp::{
+     MAX_SOCK_PATH, allocated_size, claim_inherited_lock, find_terminating_signal, holds_run_lock,
+     host_addresses, install_stop_signal_handlers, make_sparse, pass_lock, read_process_start_time,
+-    restrict_new_files, set_open_file_mode, terminate_process, try_lock_run,
++    restrict_new_files, set_open_file_mode, terminate_process, try_lock_run, wait_for_input,
+ };
+ pub use terra_platform::filesystem::{open_regular_file, set_owner_only};
+ #[cfg(unix)]
+diff --git a/crates/terra/src/sys/unix.rs b/crates/terra/src/sys/unix.rs
+index b3199fe..0cb8df7 100644
+--- a/crates/terra/src/sys/unix.rs
++++ b/crates/terra/src/sys/unix.rs
+@@ -431,6 +431,18 @@ pub fn is_host_root() -> bool {
+     rustix::process::getuid().as_raw() == 0
+ }
+ 
++/// Waits up to [`POLL`](super::POLL) for a read on `fd` to return without blocking.
++pub fn wait_for_input(fd: impl std::os::fd::AsFd) -> bool {
++    use rustix::event::{PollFd, PollFlags, Timespec, poll};
++
++    let mut read_fds = [PollFd::new(&fd, PollFlags::IN)];
++    let timeout = Timespec {
++        tv_sec: 0,
++        tv_nsec: super::POLL.subsec_nanos().into(),
++    };
++    poll(&mut read_fds, Some(&timeout)).is_ok_and(|ready| ready > 0)
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -438,6 +450,26 @@ mod tests {
+     use std::assert_matches;
+     use std::fs::OpenOptions;
+ 
++    #[test]
++    fn input_readiness_waits_for_a_byte() {
++        use std::io::Write as _;
++
++        let (mut writer, reader) = terra_platform::local_socket::create_local_pair().unwrap();
++        assert!(!wait_for_input(&reader));
++        writer.write_all(b"x").unwrap();
++        assert!(wait_for_input(&reader));
++    }
++
++    #[test]
++    fn input_readiness_reports_eof() {
++        use std::io::Read as _;
++
++        let (writer, mut reader) = terra_platform::local_socket::create_local_pair().unwrap();
++        drop(writer);
++        assert!(wait_for_input(&reader));
++        assert_eq!(reader.read(&mut [0]).unwrap(), 0);
++    }
++
+     fn create_scratch_path(name: &str) -> std::path::PathBuf {
+         std::env::temp_dir().join(format!("terra-sys-{}-{name}", std::process::id()))
+     }
+diff --git a/crates/terra/src/sys/windows.rs b/crates/terra/src/sys/windows.rs
+index 6e35c8e..ffb8ebc 100644
+--- a/crates/terra/src/sys/windows.rs
++++ b/crates/terra/src/sys/windows.rs
+@@ -427,6 +427,124 @@ pub(crate) fn file_link_count(path: &Path) -> Result<u64> {
+     Ok(u64::from(information.nNumberOfLinks))
+ }
+ 
++/// Waits up to [`POLL`](super::POLL) for a read on `input` to return without blocking.
++pub fn wait_for_input(input: &impl AsRawHandle) -> bool {
++    let is_ready = input_is_ready(input);
++    if !is_ready {
++        std::thread::sleep(super::POLL);
++    }
++    is_ready
++}
++
++fn input_is_ready(input: &impl AsRawHandle) -> bool {
++    use windows_sys::Win32::Foundation::{
++        ERROR_BROKEN_PIPE, ERROR_PIPE_NOT_CONNECTED, GetLastError,
++    };
++    use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_DISK, FILE_TYPE_PIPE, GetFileType};
++    use windows_sys::Win32::System::Console::GetNumberOfConsoleInputEvents;
++    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
++
++    let handle = input.as_raw_handle();
++    // SAFETY: input owns this handle for the duration of the probe and all output pointers are
++    // writable locals.
++    unsafe {
++        let file_type = GetFileType(handle);
++        if file_type == FILE_TYPE_DISK {
++            return true;
++        }
++        if file_type == FILE_TYPE_PIPE {
++            let mut available = 0;
++            let succeeded = PeekNamedPipe(
++                handle,
++                std::ptr::null_mut(),
++                0,
++                std::ptr::null_mut(),
++                &raw mut available,
++                std::ptr::null_mut(),
++            ) != 0;
++            return if succeeded {
++                available > 0
++            } else {
++                matches!(GetLastError(), ERROR_BROKEN_PIPE | ERROR_PIPE_NOT_CONNECTED)
++            };
++        }
++        let mut events = 0;
++        if GetNumberOfConsoleInputEvents(handle, &raw mut events) == 0 {
++            return true;
++        }
++        events > 0 && console_read_would_return(handle)
++    }
++}
++
++const CONSOLE_PEEK_RECORDS: u32 = 128;
++
++/// Answers whether a console read returns without waiting for more keys; a blocked read would
++/// keep the reader thread, and so the finished exec, alive until the user pressed Enter.
++fn console_read_would_return(handle: HANDLE) -> bool {
++    use windows_sys::Win32::System::Console::{
++        ENABLE_LINE_INPUT, GetConsoleMode, INPUT_RECORD, PeekConsoleInputW, ReadConsoleInputW,
++    };
++
++    let mut mode = 0;
++    let mut records = [INPUT_RECORD::default(); CONSOLE_PEEK_RECORDS as usize];
++    let mut peeked = 0;
++    // SAFETY: the mode and count are writable locals, and the record buffer holds the length
++    // reported to Windows.
++    unsafe {
++        if GetConsoleMode(handle, &raw mut mode) == 0
++            || PeekConsoleInputW(
++                handle,
++                records.as_mut_ptr(),
++                CONSOLE_PEEK_RECORDS,
++                &raw mut peeked,
++            ) == 0
++        {
++            return true;
++        }
++    }
++    let records = &records[..peeked as usize];
++    let skipped = records
++        .iter()
++        .take_while(|record| console_key_down(record).is_none())
++        .count();
++    if let Ok(skipped @ 1..) = u32::try_from(skipped) {
++        let mut discarded = 0;
++        let mut scratch = [INPUT_RECORD::default(); CONSOLE_PEEK_RECORDS as usize];
++        // SAFETY: the scratch buffer holds `skipped` records, which are the leading records
++        // the peek just returned and which a console read would skip.
++        unsafe {
++            ReadConsoleInputW(handle, scratch.as_mut_ptr(), skipped, &raw mut discarded);
++        }
++    }
++    console_records_complete_a_read(&records[skipped..], mode & ENABLE_LINE_INPUT != 0)
++}
++
++/// The character a key-down record types; `None` for every record a console read skips.
++fn console_key_down(record: &windows_sys::Win32::System::Console::INPUT_RECORD) -> Option<u16> {
++    use windows_sys::Win32::System::Console::KEY_EVENT;
++
++    if u32::from(record.EventType) != KEY_EVENT {
++        return None;
++    }
++    // SAFETY: a KEY_EVENT record carries a KEY_EVENT_RECORD, whose character is a UTF-16 unit.
++    let (is_down, character) = unsafe {
++        let key = record.Event.KeyEvent;
++        (key.bKeyDown != 0, key.uChar.UnicodeChar)
++    };
++    (is_down && character != 0).then_some(character)
++}
++
++fn console_records_complete_a_read(
++    records: &[windows_sys::Win32::System::Console::INPUT_RECORD],
++    is_line_input: bool,
++) -> bool {
++    const CARRIAGE_RETURN: u16 = b'\r' as u16;
++    records
++        .iter()
++        .filter_map(console_key_down)
++        .any(|character| !is_line_input || character == CARRIAGE_RETURN)
++}
++
+ fn win_ok(ok: i32) -> Result<()> {
+     (ok != 0).ok_or_else(Error::last_os_error)
+ }
+@@ -438,6 +556,89 @@ mod tests {
+     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+     use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_SPARSE_FILE;
+ 
++    fn console_record(
++        event_type: u32,
++        is_down: bool,
++        character: u16,
++    ) -> windows_sys::Win32::System::Console::INPUT_RECORD {
++        use windows_sys::Win32::System::Console::{INPUT_RECORD, INPUT_RECORD_0, KEY_EVENT_RECORD};
++
++        let mut key = KEY_EVENT_RECORD {
++            bKeyDown: i32::from(is_down),
++            ..KEY_EVENT_RECORD::default()
++        };
++        key.uChar.UnicodeChar = character;
++        INPUT_RECORD {
++            EventType: u16::try_from(event_type).unwrap(),
++            Event: INPUT_RECORD_0 { KeyEvent: key },
++        }
++    }
++
++    /// A fresh console window queues focus and mouse records, and a line-mode console holds typed
++    /// keys until Enter; treating either as readable blocks the stdin thread, so a finished
++    /// `terra exec` hangs until the user presses Enter.
++    #[test]
++    fn console_input_is_readable_only_when_a_read_would_return() {
++        use windows_sys::Win32::System::Console::{FOCUS_EVENT, KEY_EVENT, MOUSE_EVENT};
++
++        let focus = console_record(FOCUS_EVENT, false, 0);
++        let mouse = console_record(MOUSE_EVENT, false, 0);
++        let typed = console_record(KEY_EVENT, true, u16::from(b'a'));
++        let released = console_record(KEY_EVENT, false, u16::from(b'\r'));
++        let shift = console_record(KEY_EVENT, true, 0);
++        let enter = console_record(KEY_EVENT, true, u16::from(b'\r'));
++
++        for is_line_input in [true, false] {
++            assert!(!console_records_complete_a_read(&[], is_line_input));
++            assert!(!console_records_complete_a_read(
++                &[focus, mouse, released, shift],
++                is_line_input
++            ));
++            assert!(console_records_complete_a_read(
++                &[focus, enter],
++                is_line_input
++            ));
++        }
++        assert!(!console_records_complete_a_read(&[typed, typed], true));
++        assert!(console_records_complete_a_read(&[typed], false));
++    }
++
++    #[test]
++    fn input_readiness_accepts_redirected_files_and_pipe_eof() {
++        use std::io::{Read as _, Write as _};
++        use windows_sys::Win32::System::Pipes::CreatePipe;
++
++        let mut file = tempfile::tempfile().unwrap();
++        assert!(input_is_ready(&file));
++        assert_eq!(file.read(&mut [0]).unwrap(), 0);
++
++        let mut read_handle = std::ptr::null_mut();
++        let mut write_handle = std::ptr::null_mut();
++        // SAFETY: the writable outputs receive two handles owned by the returned files.
++        let (mut reader, mut writer) = unsafe {
++            assert_ne!(
++                CreatePipe(
++                    &raw mut read_handle,
++                    &raw mut write_handle,
++                    std::ptr::null(),
++                    0
++                ),
++                0
++            );
++            (
++                std::fs::File::from_raw_handle(read_handle),
++                std::fs::File::from_raw_handle(write_handle),
++            )
++        };
++        assert!(!input_is_ready(&reader));
++        writer.write_all(b"x").unwrap();
++        assert!(input_is_ready(&reader));
++        assert_eq!(reader.read(&mut [0]).unwrap(), 1);
++        drop(writer);
++        assert!(input_is_ready(&reader));
++        assert_eq!(reader.read(&mut [0]).unwrap(), 0);
++    }
++
+     #[test]
+     fn detached_launch_keeps_startup_pipes_without_parent_console() {
+         use std::io::{Read as _, Write as _};
+diff --git a/scripts/checks/test-native-gates.py b/scripts/checks/test-native-gates.py
+index 05c20e3..4895567 100644
+--- a/scripts/checks/test-native-gates.py
++++ b/scripts/checks/test-native-gates.py
+@@ -157,6 +157,15 @@ class NativeGateTests(unittest.TestCase):
+         release = (ROOT / '.github/workflows/release.yml').read_text()
+         self.assertIn('        run: cp -R acceptance stage/terra-acceptance\n', release)
+ 
++    def test_releases_publish_both_acceptance_runners_as_checksummed_assets(self):
++        """A runner fetched from the release, not from main, always understands that release's suite."""
++        release = (ROOT / '.github/workflows/release.yml').read_text()
++        for runner, published in (('run.sh', 'terra-acceptance.sh'), ('run.ps1', 'terra-acceptance.ps1')):
++            self.assertIn(f'cp acceptance/{runner} stage/{published}\n', release)
++            self.assertIn(f' {published}', re.search(r'assets=\(terra-\*\.tar\.gz[^)]*\)', release).group(0))
++            self.assertIn(f'stage/{published}', re.search(r'assets=\(stage/terra-\*\.tar\.gz[^)]*\)', release).group(0))
++            self.assertIn(f'            stage/{published}\n', release)
++
+     @linux_workflow_shell_only
+     def test_component_cleanup_preserves_runtime_wasm_fixtures(self):
+         fixture_source = (ROOT / 'crates/terra-runtime/src/test_fixtures.rs').read_text()

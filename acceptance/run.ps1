@@ -28,6 +28,17 @@ function Get-TerraVersion {
     if ($version -match "\+") { $version -replace "\+.*", "" } else { "dev" }
 }
 
+# Get-FileHash comes from a module that Windows PowerShell cannot load when it inherits
+# PowerShell 7's PSModulePath, so hash with .NET directly.
+function Get-Sha256([string]$Path) {
+    $stream = [IO.File]::OpenRead($Path)
+    try {
+        [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($stream)) -replace "-", ""
+    } finally {
+        $stream.Dispose()
+    }
+}
+
 # --- Without a suite: hand over to the runner of the release terra reports,
 # --- so runner and recipes always match.
 
@@ -50,7 +61,7 @@ if (-not $Suite) {
             $fields = $line -split '\s+'
             if ($fields[-1] -eq "terra-acceptance.tar.gz") { $expected = $fields[0] }
         }
-        if (-not $expected -or (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ne $expected) {
+        if (-not $expected -or (Get-Sha256 $archive) -ne $expected) {
             throw "terra-acceptance.tar.gz does not match the v$version SHA256SUMS - not running it"
         }
         tar -xzf $archive -C (Join-Path $download "suite")
@@ -170,7 +181,7 @@ function Write-Text($Path, $Text) {
 }
 
 function Get-FileSha256($Path) {
-    (Get-FileHash -LiteralPath (Join-Path $project $Path)).Hash
+    Get-Sha256 (Join-Path $project $Path)
 }
 
 function Read-Http($Port, $Attempts) {

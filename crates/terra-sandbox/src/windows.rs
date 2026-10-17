@@ -15,6 +15,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, AsRawSocket, FromRawHandle, OwnedHandle};
+use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitCode};
 use std::time::{Duration, Instant};
@@ -25,7 +26,7 @@ use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TokenIsAppC
 use windows_sys::Win32::System::JobObjects::IsProcessInJob;
 use windows_sys::Win32::System::Pipes::PeekNamedPipe;
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetExitCodeProcess, INFINITE, OpenProcess,
+    CREATE_NO_WINDOW, GetCurrentProcess, GetExitCodeProcess, INFINITE, OpenProcess,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, ResumeThread, WaitForMultipleObjects,
     WaitForSingleObject,
 };
@@ -140,6 +141,8 @@ pub fn prepare_launch(launch: Launch<'_>) -> Result<PreparedLaunch> {
         )
     })?;
     let mut command = Command::new(std::env::current_exe()?);
+    // A detached supervisor has no console, so Windows would open a visible one for the wrapper.
+    command.creation_flags(CREATE_NO_WINDOW);
     command.env_clear();
     for name in [
         "SystemRoot",

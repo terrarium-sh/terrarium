@@ -427,6 +427,124 @@ pub(crate) fn file_link_count(path: &Path) -> Result<u64> {
     Ok(u64::from(information.nNumberOfLinks))
 }
 
+/// Waits up to [`POLL`](super::POLL) for a read on `input` to return without blocking.
+pub fn wait_for_input(input: &impl AsRawHandle) -> bool {
+    let is_ready = input_is_ready(input);
+    if !is_ready {
+        std::thread::sleep(super::POLL);
+    }
+    is_ready
+}
+
+fn input_is_ready(input: &impl AsRawHandle) -> bool {
+    use windows_sys::Win32::Foundation::{
+        ERROR_BROKEN_PIPE, ERROR_PIPE_NOT_CONNECTED, GetLastError,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_DISK, FILE_TYPE_PIPE, GetFileType};
+    use windows_sys::Win32::System::Console::GetNumberOfConsoleInputEvents;
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+
+    let handle = input.as_raw_handle();
+    // SAFETY: input owns this handle for the duration of the probe and all output pointers are
+    // writable locals.
+    unsafe {
+        let file_type = GetFileType(handle);
+        if file_type == FILE_TYPE_DISK {
+            return true;
+        }
+        if file_type == FILE_TYPE_PIPE {
+            let mut available = 0;
+            let succeeded = PeekNamedPipe(
+                handle,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &raw mut available,
+                std::ptr::null_mut(),
+            ) != 0;
+            return if succeeded {
+                available > 0
+            } else {
+                matches!(GetLastError(), ERROR_BROKEN_PIPE | ERROR_PIPE_NOT_CONNECTED)
+            };
+        }
+        let mut events = 0;
+        if GetNumberOfConsoleInputEvents(handle, &raw mut events) == 0 {
+            return true;
+        }
+        events > 0 && console_read_would_return(handle)
+    }
+}
+
+const CONSOLE_PEEK_RECORDS: u32 = 128;
+
+/// Discards the leading records a console read skips, then answers whether the read returns
+/// without waiting for more keys; a blocked read would keep the finished exec alive until Enter.
+fn console_read_would_return(handle: HANDLE) -> bool {
+    use windows_sys::Win32::System::Console::{
+        ENABLE_LINE_INPUT, GetConsoleMode, INPUT_RECORD, PeekConsoleInputW, ReadConsoleInputW,
+    };
+
+    let mut mode = 0;
+    let mut records = [INPUT_RECORD::default(); CONSOLE_PEEK_RECORDS as usize];
+    let mut peeked = 0;
+    // SAFETY: the mode and count are writable locals, and the record buffer holds the length
+    // reported to Windows.
+    unsafe {
+        if GetConsoleMode(handle, &raw mut mode) == 0
+            || PeekConsoleInputW(
+                handle,
+                records.as_mut_ptr(),
+                CONSOLE_PEEK_RECORDS,
+                &raw mut peeked,
+            ) == 0
+        {
+            return true;
+        }
+    }
+    let records = &records[..peeked as usize];
+    let skipped = records
+        .iter()
+        .take_while(|record| typed_character(record).is_none())
+        .count();
+    if let Ok(skipped @ 1..) = u32::try_from(skipped) {
+        let mut discarded = 0;
+        let mut scratch = [INPUT_RECORD::default(); CONSOLE_PEEK_RECORDS as usize];
+        // SAFETY: the scratch buffer holds `skipped` records, which are the leading records
+        // the peek just returned and which a console read would skip.
+        unsafe {
+            ReadConsoleInputW(handle, scratch.as_mut_ptr(), skipped, &raw mut discarded);
+        }
+    }
+    console_records_complete_a_read(&records[skipped..], mode & ENABLE_LINE_INPUT != 0)
+}
+
+/// `None` for every record a console read skips.
+fn typed_character(record: &windows_sys::Win32::System::Console::INPUT_RECORD) -> Option<u16> {
+    use windows_sys::Win32::System::Console::KEY_EVENT;
+
+    if u32::from(record.EventType) != KEY_EVENT {
+        return None;
+    }
+    // SAFETY: a KEY_EVENT record carries a KEY_EVENT_RECORD, whose character is a UTF-16 unit.
+    let (is_down, character) = unsafe {
+        let key = record.Event.KeyEvent;
+        (key.bKeyDown != 0, key.uChar.UnicodeChar)
+    };
+    (is_down && character != 0).then_some(character)
+}
+
+fn console_records_complete_a_read(
+    records: &[windows_sys::Win32::System::Console::INPUT_RECORD],
+    is_line_input: bool,
+) -> bool {
+    const CARRIAGE_RETURN: u16 = b'\r' as u16;
+    records
+        .iter()
+        .filter_map(typed_character)
+        .any(|character| !is_line_input || character == CARRIAGE_RETURN)
+}
+
 fn win_ok(ok: i32) -> Result<()> {
     (ok != 0).ok_or_else(Error::last_os_error)
 }
@@ -437,6 +555,89 @@ mod tests {
     use std::os::windows::fs::MetadataExt;
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_SPARSE_FILE;
+
+    fn console_record(
+        event_type: u32,
+        is_down: bool,
+        character: u16,
+    ) -> windows_sys::Win32::System::Console::INPUT_RECORD {
+        use windows_sys::Win32::System::Console::{INPUT_RECORD, INPUT_RECORD_0, KEY_EVENT_RECORD};
+
+        let mut key = KEY_EVENT_RECORD {
+            bKeyDown: i32::from(is_down),
+            ..KEY_EVENT_RECORD::default()
+        };
+        key.uChar.UnicodeChar = character;
+        INPUT_RECORD {
+            EventType: u16::try_from(event_type).unwrap(),
+            Event: INPUT_RECORD_0 { KeyEvent: key },
+        }
+    }
+
+    /// A fresh console window queues focus and mouse records, and a line-mode console holds typed
+    /// keys until Enter; treating either as readable blocks the stdin thread, so a finished
+    /// `terra exec` hangs until the user presses Enter.
+    #[test]
+    fn console_input_is_readable_only_when_a_read_would_return() {
+        use windows_sys::Win32::System::Console::{FOCUS_EVENT, KEY_EVENT, MOUSE_EVENT};
+
+        let focus = console_record(FOCUS_EVENT, false, 0);
+        let mouse = console_record(MOUSE_EVENT, false, 0);
+        let typed = console_record(KEY_EVENT, true, u16::from(b'a'));
+        let released = console_record(KEY_EVENT, false, u16::from(b'\r'));
+        let shift = console_record(KEY_EVENT, true, 0);
+        let enter = console_record(KEY_EVENT, true, u16::from(b'\r'));
+
+        for is_line_input in [true, false] {
+            assert!(!console_records_complete_a_read(&[], is_line_input));
+            assert!(!console_records_complete_a_read(
+                &[focus, mouse, released, shift],
+                is_line_input
+            ));
+            assert!(console_records_complete_a_read(
+                &[focus, enter],
+                is_line_input
+            ));
+        }
+        assert!(!console_records_complete_a_read(&[typed, typed], true));
+        assert!(console_records_complete_a_read(&[typed], false));
+    }
+
+    #[test]
+    fn input_readiness_accepts_redirected_files_and_pipe_eof() {
+        use std::io::{Read as _, Write as _};
+        use windows_sys::Win32::System::Pipes::CreatePipe;
+
+        let mut file = tempfile::tempfile().unwrap();
+        assert!(input_is_ready(&file));
+        assert_eq!(file.read(&mut [0]).unwrap(), 0);
+
+        let mut read_handle = std::ptr::null_mut();
+        let mut write_handle = std::ptr::null_mut();
+        // SAFETY: the writable outputs receive two handles owned by the returned files.
+        let (mut reader, mut writer) = unsafe {
+            assert_ne!(
+                CreatePipe(
+                    &raw mut read_handle,
+                    &raw mut write_handle,
+                    std::ptr::null(),
+                    0
+                ),
+                0
+            );
+            (
+                std::fs::File::from_raw_handle(read_handle),
+                std::fs::File::from_raw_handle(write_handle),
+            )
+        };
+        assert!(!input_is_ready(&reader));
+        writer.write_all(b"x").unwrap();
+        assert!(input_is_ready(&reader));
+        assert_eq!(reader.read(&mut [0]).unwrap(), 1);
+        drop(writer);
+        assert!(input_is_ready(&reader));
+        assert_eq!(reader.read(&mut [0]).unwrap(), 0);
+    }
 
     #[test]
     fn detached_launch_keeps_startup_pipes_without_parent_console() {

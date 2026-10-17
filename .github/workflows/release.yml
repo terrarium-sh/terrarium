@@ -56,6 +56,10 @@ jobs:
           path: stage
       - name: Stage the acceptance suite
         run: cp -R acceptance stage/terra-acceptance
+      - name: Stage the acceptance runners
+        run: |
+          cp acceptance/run.sh stage/terra-acceptance.sh
+          cp acceptance/run.ps1 stage/terra-acceptance.ps1
       - name: Assemble platform archives
         run: |
           for directory in stage/*/; do
@@ -65,18 +69,21 @@ jobs:
         run: |
           cd stage
           shopt -s nullglob
-          assets=(terra-*.tar.gz)
+          assets=(terra-*.tar.gz terra-acceptance.sh terra-acceptance.ps1)
           sha256sum "${assets[@]}" > SHA256SUMS
       - name: Attest release artifacts
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
-          subject-path: stage/*.tar.gz
+          subject-path: |
+            stage/*.tar.gz
+            stage/terra-acceptance.sh
+            stage/terra-acceptance.ps1
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           shopt -s nullglob
-          assets=(stage/terra-*.tar.gz)
+          assets=(stage/terra-*.tar.gz stage/terra-acceptance.sh stage/terra-acceptance.ps1)
           prerelease=()
           case "$GITHUB_REF_NAME" in
             *-*) prerelease=(--prerelease) ;;

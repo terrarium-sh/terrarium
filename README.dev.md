@@ -56,12 +56,21 @@ curl -fsSL https://codeload.github.com/terrarium-sh/terrarium/tar.gz/main | tar 
 Invoke-WebRequest -UseBasicParsing https://codeload.github.com/terrarium-sh/terrarium/zip/main -OutFile terra-src.zip; if ($?) { Expand-Archive terra-src.zip -Force; powershell -ExecutionPolicy Bypass -File terra-src/terrarium-main/acceptance/run.ps1 -Terra .\terra.exe }
 ```
 
-A release build fetches the suite of its own version, checked against the
-release `SHA256SUMS`:
+A release build is checked against its own release. Each release publishes the
+runners as `terra-acceptance.sh` and `terra-acceptance.ps1`. Run on its own, a
+runner downloads the suite of the version `terra` reports, checks it against
+that release's `SHA256SUMS`, and runs it:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/terrarium-sh/terrarium/main/acceptance/run.sh -o terra-acceptance.sh && sh terra-acceptance.sh --terra ./terra
+v=$(./terra --version | cut -d' ' -f2 | cut -d+ -f1) && curl -fsSL "https://github.com/terrarium-sh/terrarium/releases/download/v$v/terra-acceptance.sh" -o terra-acceptance.sh && sh terra-acceptance.sh --terra ./terra
 ```
+
+```powershell
+$v = ((.\terra.exe --version) -split ' ')[1] -replace '\+.*'; curl.exe -fsSL "https://github.com/terrarium-sh/terrarium/releases/download/v$v/terra-acceptance.ps1" -o terra-acceptance.ps1; if ($LASTEXITCODE -eq 0) { powershell -ExecutionPolicy Bypass -File terra-acceptance.ps1 -Terra .\terra.exe }
+```
+
+Or download `terra-acceptance.tar.gz` from the release page, extract it, and run
+its `run.sh --terra ./terra` or `run.ps1 -Terra .\terra.exe`.
 
 From a checkout, run `make dist && sh acceptance/run.sh --terra dist/terra` (on
 Windows: `powershell -File acceptance/run.ps1 -Terra dist/terra.exe`). The
@@ -444,9 +453,10 @@ ordinary workspace test pass.
 
 CI runs the [acceptance gates](#acceptance-gates) against each platform's build.
 The suite's guest-side checks in `acceptance/guest/` are shared with the `guest_suite`
-cargo test. Releases ship the suite as `terra-acceptance.tar.gz`; a runner
-fetched on its own downloads the suite of the installed release and hands over
-to that release's runner. `scripts/checks/test-native-gates.py` keeps the two
+cargo test. Releases ship the suite as `terra-acceptance.tar.gz` and the runners
+as `terra-acceptance.sh` and `terra-acceptance.ps1`; a runner fetched on its own
+downloads the suite of the installed release and hands over to that release's
+runner. `scripts/checks/test-native-gates.py` keeps the two
 runners' steps and guest scripts identical.
 
 `make test-platform-native-vm` checks preparation cleanup and repeated stop/join

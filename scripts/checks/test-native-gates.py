@@ -157,6 +157,15 @@ class NativeGateTests(unittest.TestCase):
         release = (ROOT / '.github/workflows/release.yml').read_text()
         self.assertIn('        run: cp -R acceptance stage/terra-acceptance\n', release)
 
+    def test_releases_publish_both_acceptance_runners_as_checksummed_assets(self):
+        """A runner fetched from the release, not from main, always understands that release's suite."""
+        release = (ROOT / '.github/workflows/release.yml').read_text()
+        for runner, published in (('run.sh', 'terra-acceptance.sh'), ('run.ps1', 'terra-acceptance.ps1')):
+            self.assertIn(f'cp acceptance/{runner} stage/{published}\n', release)
+            self.assertIn(f' {published}', re.search(r'assets=\(terra-\*\.tar\.gz[^)]*\)', release).group(0))
+            self.assertIn(f'stage/{published}', re.search(r'assets=\(stage/terra-\*\.tar\.gz[^)]*\)', release).group(0))
+            self.assertIn(f'            stage/{published}\n', release)
+
     @linux_workflow_shell_only
     def test_component_cleanup_preserves_runtime_wasm_fixtures(self):
         fixture_source = (ROOT / 'crates/terra-runtime/src/test_fixtures.rs').read_text()

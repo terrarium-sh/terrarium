@@ -21,7 +21,7 @@ pub use imp::is_host_root;
 pub use imp::{
     MAX_SOCK_PATH, allocated_size, claim_inherited_lock, find_terminating_signal, holds_run_lock,
     host_addresses, install_stop_signal_handlers, make_sparse, pass_lock, read_process_start_time,
-    restrict_new_files, set_open_file_mode, terminate_process, try_lock_run,
+    restrict_new_files, set_open_file_mode, terminate_process, try_lock_run, wait_for_input,
 };
 pub use terra_platform::filesystem::{open_regular_file, set_owner_only};
 #[cfg(unix)]

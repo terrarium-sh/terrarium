@@ -2,11 +2,9 @@
 //! bytes between that port and the user's terminal.
 
 use crate::state::{BoxRef, Holder};
-use crate::sys::POLL;
+use crate::sys::{POLL, wait_for_input};
 use anyhow::{Context, Result};
 use std::io::{Read, Write};
-#[cfg(unix)]
-use std::os::fd::AsFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -323,9 +321,7 @@ fn spawn_stdin_reader(escape: Option<u8>, sender: tokio::sync::mpsc::Sender<Inpu
         let mut stdin = std::io::stdin();
         let mut buf = [0u8; 4096];
         while !stopped.load(Ordering::SeqCst) {
-            if !input_is_ready(&stdin) {
-                #[cfg(windows)]
-                std::thread::sleep(POLL);
+            if !wait_for_input(&stdin) {
                 continue;
             }
             let n = match stdin.read(&mut buf) {
@@ -353,57 +349,6 @@ fn spawn_stdin_reader(escape: Option<u8>, sender: tokio::sync::mpsc::Sender<Inpu
     InputReader {
         completed,
         thread: Some(thread),
-    }
-}
-
-#[cfg(unix)]
-fn input_is_ready(fd: impl AsFd) -> bool {
-    use rustix::event::{PollFd, PollFlags, Timespec, poll};
-
-    let mut read_fds = [PollFd::new(&fd, PollFlags::IN)];
-    let timeout = Timespec {
-        tv_sec: 0,
-        tv_nsec: POLL.subsec_nanos().into(),
-    };
-    poll(&mut read_fds, Some(&timeout)).is_ok_and(|ready| ready > 0)
-}
-
-#[allow(unsafe_code)]
-#[cfg(windows)]
-fn input_is_ready(stdin: &impl std::os::windows::io::AsRawHandle) -> bool {
-    use windows_sys::Win32::Foundation::{
-        ERROR_BROKEN_PIPE, ERROR_PIPE_NOT_CONNECTED, GetLastError,
-    };
-    use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_DISK, FILE_TYPE_PIPE, GetFileType};
-    use windows_sys::Win32::System::Console::GetNumberOfConsoleInputEvents;
-    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
-
-    let handle = stdin.as_raw_handle();
-    // SAFETY: stdin owns this handle for the duration of the probe and all output pointers are
-    // writable locals.
-    unsafe {
-        let file_type = GetFileType(handle);
-        if file_type == FILE_TYPE_DISK {
-            return true;
-        }
-        if file_type == FILE_TYPE_PIPE {
-            let mut available = 0;
-            let succeeded = PeekNamedPipe(
-                handle,
-                std::ptr::null_mut(),
-                0,
-                std::ptr::null_mut(),
-                &raw mut available,
-                std::ptr::null_mut(),
-            ) != 0;
-            return if succeeded {
-                available > 0
-            } else {
-                matches!(GetLastError(), ERROR_BROKEN_PIPE | ERROR_PIPE_NOT_CONNECTED)
-            };
-        }
-        let mut events = 0;
-        GetNumberOfConsoleInputEvents(handle, &raw mut events) == 0 || events > 0
     }
 }
 
@@ -647,62 +592,6 @@ mod tests {
             .await
             .unwrap();
         (outcome, shown)
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn input_readiness_waits_for_a_byte() {
-        let (mut writer, reader) = terra_platform::local_socket::create_local_pair().unwrap();
-        assert!(!input_is_ready(&reader));
-        writer.write_all(b"x").unwrap();
-        assert!(input_is_ready(&reader));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn input_readiness_reports_eof() {
-        let (writer, mut reader) = terra_platform::local_socket::create_local_pair().unwrap();
-        drop(writer);
-        assert!(input_is_ready(&reader));
-        assert_eq!(reader.read(&mut [0]).unwrap(), 0);
-    }
-
-    #[cfg(windows)]
-    #[allow(unsafe_code)]
-    #[test]
-    fn input_readiness_accepts_redirected_files_and_pipe_eof() {
-        use std::os::windows::io::FromRawHandle;
-        use windows_sys::Win32::System::Pipes::CreatePipe;
-
-        let mut file = tempfile::tempfile().unwrap();
-        assert!(input_is_ready(&file));
-        assert_eq!(file.read(&mut [0]).unwrap(), 0);
-
-        let mut read_handle = std::ptr::null_mut();
-        let mut write_handle = std::ptr::null_mut();
-        // SAFETY: the writable outputs receive two handles owned by the returned files.
-        let (mut reader, mut writer) = unsafe {
-            assert_ne!(
-                CreatePipe(
-                    &raw mut read_handle,
-                    &raw mut write_handle,
-                    std::ptr::null(),
-                    0
-                ),
-                0
-            );
-            (
-                std::fs::File::from_raw_handle(read_handle),
-                std::fs::File::from_raw_handle(write_handle),
-            )
-        };
-        assert!(!input_is_ready(&reader));
-        writer.write_all(b"x").unwrap();
-        assert!(input_is_ready(&reader));
-        assert_eq!(reader.read(&mut [0]).unwrap(), 1);
-        drop(writer);
-        assert!(input_is_ready(&reader));
-        assert_eq!(reader.read(&mut [0]).unwrap(), 0);
     }
 
     /// A box on disk, held as a running one, with a fake agent bound to its
