@@ -3,7 +3,7 @@ resolver = "3"
 members = ["block", "boot", "device-transport", "fs", "mem", "interrupt-controller", "vmm", "agent", "vsock-device", "vsock-frontend"]
 
 [workspace.dependencies]
-wit-bindgen = "=0.62.0"
+wit-bindgen = "=0.63.0"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

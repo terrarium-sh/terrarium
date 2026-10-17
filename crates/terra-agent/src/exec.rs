@@ -22,7 +22,7 @@ pub async fn serve_exec(conn: AsyncFile, workload_root: bool, cancel: Cancellati
         .get_ref()
         .get_ref()
         .try_clone()
-        .and_then(tokio::io::unix::AsyncFd::new)
+        .and_then(crate::into_async_fd)
     else {
         return;
     };
@@ -746,10 +746,7 @@ mod tests {
         let (mut child, pidfd) = crate::reap::spawn_owned(|| command.spawn()).unwrap();
         let stdin = crate::into_async_file(child.stdin.take().unwrap()).unwrap();
         let (mut client, server) = UnixStream::pair().unwrap();
-        let monitor = tokio::io::unix::AsyncFd::new(File::from(std::os::fd::OwnedFd::from(
-            server.try_clone().unwrap(),
-        )))
-        .unwrap();
+        let monitor = crate::into_async_fd(server.try_clone().unwrap()).unwrap();
         let mut server =
             crate::into_async_file(File::from(std::os::fd::OwnedFd::from(server))).unwrap();
         let pidfd = Arc::new(pidfd);
@@ -901,9 +898,7 @@ mod tests {
     async fn disconnect_is_detected_with_unread_input() {
         let (sender, receiver) = std::os::unix::net::UnixStream::pair().unwrap();
         let mut sender = crate::into_async_file(sender).unwrap();
-        let receiver =
-            tokio::io::unix::AsyncFd::new(File::from(std::os::fd::OwnedFd::from(receiver)))
-                .unwrap();
+        let receiver = crate::into_async_fd(receiver).unwrap();
         sender.write_all(b"unread").await.unwrap();
         let watching = tokio::spawn(async move { wait_read_closed(&receiver).await });
         tokio::task::yield_now().await;

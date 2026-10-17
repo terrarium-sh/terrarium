@@ -96,7 +96,7 @@ where
 }
 
 pub async fn wait_owned(pidfd: &OwnedPidfd) -> std::io::Result<ExitStatus> {
-    let pidfd_ready = tokio::io::unix::AsyncFd::new(pidfd.try_clone()?)?;
+    let pidfd_ready = crate::into_async_fd(pidfd.try_clone()?)?;
     loop {
         if let Some(status) = collect_status(pidfd)? {
             return Ok(status);

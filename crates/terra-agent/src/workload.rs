@@ -326,7 +326,7 @@ fn drop_privileges() -> std::io::Result<()> {
 
 async fn stop_gracefully(workload: &crate::reap::OwnedPidfd, stop_grace: Duration) {
     let _ = rustix::process::pidfd_send_signal(workload, rustix::process::Signal::TERM);
-    let ready = workload.try_clone().and_then(tokio::io::unix::AsyncFd::new);
+    let ready = workload.try_clone().and_then(crate::into_async_fd);
     if let Ok(ready) = ready
         && matches!(
             tokio::time::timeout(stop_grace, ready.readable()).await,

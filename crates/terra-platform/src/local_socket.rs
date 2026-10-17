@@ -201,9 +201,14 @@ pub struct AsyncLocalListener(tokio::io::unix::AsyncFd<LocalListener>);
 
 #[cfg(unix)]
 impl AsyncLocalListener {
+    #[allow(unsafe_code)]
     pub fn from_std(listener: LocalListener) -> std::io::Result<Self> {
         listener.set_nonblocking(true)?;
-        tokio::io::unix::AsyncFd::new(listener).map(Self)
+        // SAFETY: the private `AsyncFd` owns the listener and is never handed out mutably, so the
+        // registered descriptor stays open and unchanged until `Self` drops.
+        unsafe { tokio::io::unix::AsyncFd::register(listener) }
+            .map(Self)
+            .map_err(std::io::Error::from)
     }
 
     pub async fn accept(&self) -> std::io::Result<LocalStream> {

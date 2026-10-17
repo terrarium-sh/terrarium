@@ -1,9 +1,9 @@
-# Weekly RustSec advisory audit of every committed lockfile.
+# Daily RustSec advisory audit of every committed lockfile.
 name: Security audit
 
 on:
   schedule:
-    - cron: '23 4 * * 1'
+    - cron: '23 4 * * *'
   push:
     branches: [main]
     paths:

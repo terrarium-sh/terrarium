@@ -56,6 +56,17 @@ fn into_async_file(file: impl Into<std::os::fd::OwnedFd>) -> std::io::Result<Asy
 }
 
 #[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn into_async_fd(
+    fd: impl Into<std::os::fd::OwnedFd>,
+) -> std::io::Result<tokio::io::unix::AsyncFd<File>> {
+    // SAFETY: the `AsyncFd` owns the `File`, and no caller swaps it through `get_mut`, so the
+    // registered descriptor stays open and unchanged until the `AsyncFd` drops.
+    unsafe { tokio::io::unix::AsyncFd::register(File::from(fd.into())) }
+        .map_err(std::io::Error::from)
+}
+
+#[cfg(target_os = "linux")]
 async fn wait_for_tasks_or_cancel(
     tasks: &tokio_util::task::TaskTracker,
     cancellation: &tokio_util::sync::CancellationToken,
