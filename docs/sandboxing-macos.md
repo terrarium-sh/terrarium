@@ -33,21 +33,22 @@ the worker exec its own executable.
 
 | Worker | Allowed on top of the base |
 | --- | --- |
-| VM | Its granted files and shares only; no network, no child processes |
-| Broker | Outbound connections to any IP (including host loopback), inbound connections on IP sockets, UDP binds, socket creation, name resolution through mDNSResponder, granted resolver files; no TCP binds, so it cannot open TCP listeners; no disks, shares or child processes |
+| VM | Its granted files and shares, and the FSEvents daemon for share notifications; no network, no child processes |
+| Broker | Name resolution through mDNSResponder, outbound connections to any IP (including host loopback), UDP binds and inbound UDP, socket creation, granted resolver files; no TCP binds, so it cannot open TCP listeners; no disks, shares or child processes |
 
-The broker accepts on listeners the supervisor binds and hands over.
+The broker accepts on listeners the supervisor binds and hands over, which
+needs no network rule.
 
 ## Launcher
 
 The supervisor writes an owner-only spec (role, canonical grants) under
-`~/.terra`. The launcher renders the profile with every path passed as a
-parameter, so no path text enters the profile, applies it with
-`sandbox_init_with_parameters` and execs the worker. There is no per-launch
-signing. The shipped executable is signed once with Hardened Runtime and
-`packaging/macos.entitlements`, so both workers carry the hypervisor and
-unsigned-executable-memory entitlements. Hypervisor.framework is not gated by
-Seatbelt, so no profile keeps the broker from creating a VM.
+`~/.terra`. The launcher renders the profile with the executable and every
+grant passed as parameters, so no path from the spec enters the profile text.
+It applies the profile with `sandbox_init_with_parameters` and execs the
+worker. There is no per-launch signing. The shipped executable is signed once
+with Hardened Runtime and `packaging/macos.entitlements`, so both workers carry
+the hypervisor and unsigned-executable-memory entitlements. Hypervisor.framework
+is not gated by Seatbelt, so no profile keeps the broker from creating a VM.
 
 ## Activation check
 
@@ -59,18 +60,23 @@ a successful profile call alone is not trusted.
 ## Files
 
 Grants are profile rules on canonical paths: Seatbelt matches resolved paths, so
-`/tmp` grants become `/private/tmp`. A read-only grant inside a writable grant
-is still rejected; no caller needs it. The VM gets the box directory read-only
-plus specific writable disk, diagnostics and `runtime-logs/` paths. File rules
-do not grant Unix-socket authority, so the supervisor prebinds the agent and stop
-listeners and passes them to the VM as descriptors.
+`/tmp` grants become `/private/tmp`. Each grant's ancestor directories also get
+a metadata-only rule, because the file-events watcher canonicalizes each share
+path. The VM can also send IPC to the FSEvents daemon, which that watcher
+subscribes through; the daemon delivers only events for paths the VM's file
+rules allow. A read-only grant inside a writable grant is still rejected; no
+caller needs it. The VM gets the box directory read-only plus specific writable
+disk, diagnostics and `runtime-logs/` paths. File rules do not grant Unix-socket
+authority, so the supervisor prebinds the agent and stop listeners and passes
+them to the VM as descriptors.
 
 ## Limits
 
 - Both profiles include Apple's `system.sb` baseline. There are no namespaces,
   seccomp filters or mount remapping.
-- The broker keeps outbound network access, including host loopback. It has no
-  TCP bind, so it cannot open TCP listeners; UDP binds work.
+- The broker keeps outbound network access, including host loopback, and can
+  reach mDNSResponder. It cannot bind TCP sockets, so it cannot open TCP
+  listeners; UDP binds work.
 - Both workers are the same signed binary and carry the hypervisor
   entitlement, and Seatbelt does not gate Hypervisor.framework, so a
   compromised broker could create a VM.
@@ -85,7 +91,7 @@ Native acceptance on Apple Silicon macOS 15+, from an SSH session:
 ```sh
 make TERRA_TARGET=aarch64-apple-darwin host-dist
 codesign --force --sign - --options runtime --entitlements packaging/macos.entitlements dist/terra
-TERRA_BIN=$PWD/dist/terra CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER="sh scripts/toolchain/run-macos-vm-test" \
+TERRA_BIN=$PWD/dist/terra CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER="sh $PWD/scripts/toolchain/run-macos-vm-test" \
   cargo test -p terra-sandbox --lib macos -- --ignored --test-threads=1 --nocapture
 ```
 

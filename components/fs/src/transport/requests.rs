@@ -1,10 +1,10 @@
 use super::io::PreparedIo;
 use super::{
-    MAX_DIRECTORIES, MAX_READ, O_ACCMODE, OpenDirectory, State, allocate_handle, attr_out,
-    clear_runtime, create_flags, directory, dirents_out, entry_out, flush_body, handle, host,
-    increment_lookup, mark_unused_if_unheld, name, names, node, node_id, open_flags, open_out,
-    read_file, repoint_node, statfs_out, store_handle, symlink_parts, timestamp, u32_at, u64_at,
-    wasi_error, wire, write_file, write_out,
+    MAX_DIRECTORIES, O_ACCMODE, OpenDirectory, State, allocate_handle, attr_out, clear_runtime,
+    create_flags, directory, dirents_out, entry_out, flush_body, handle, host, increment_lookup,
+    mark_unused_if_unheld, name, names, node, node_id, open_flags, open_out, read_file,
+    repoint_node, statfs_out, store_handle, symlink_parts, timestamp, u32_at, u64_at, wasi_error,
+    wire, write_file, write_out,
 };
 use crate::wasi::filesystem::types;
 use futures::FutureExt;
@@ -408,9 +408,7 @@ fn prepare_file_io(state: &State, owned_request: OwnedRequest) -> Result<Prepare
     let work = match request.opcode {
         wire::READ => {
             let offset = u64_at(request.body, 8)?;
-            let size = usize::try_from(u32_at(request.body, 16)?)
-                .unwrap_or(MAX_READ)
-                .min(MAX_READ);
+            let size = read_size(&request)?;
             async move { read_file(&descriptor, offset, size).await }.boxed_local()
         }
         wire::WRITE => {
@@ -444,6 +442,14 @@ fn prepare_file_io(state: &State, owned_request: OwnedRequest) -> Result<Prepare
     })
 }
 
+fn read_size(request: &Request<'_>) -> Result<usize, i32> {
+    let size = usize::try_from(u32_at(request.body, 16)?).map_err(|_| wire::EINVAL)?;
+    if size > wire::MAX_READ {
+        return Err(wire::EINVAL);
+    }
+    Ok(size)
+}
+
 fn take_write_payload(mut request_bytes: Vec<u8>, payload_len: usize) -> Vec<u8> {
     let payload_start = wire::HEADER + 40;
     let payload_end = payload_start + payload_len;
@@ -462,8 +468,25 @@ fn file_identity(state: &State, node: u64) -> Result<(u64, u64), i32> {
 
 #[cfg(test)]
 mod tests {
-    use super::take_write_payload;
+    use super::{read_size, take_write_payload};
     use crate::wire;
+
+    #[test]
+    fn oversized_reads_are_refused_not_answered_short() {
+        fn request(body: &[u8]) -> wire::Request<'_> {
+            wire::Request {
+                opcode: wire::READ,
+                unique: 0,
+                node: 0,
+                body,
+            }
+        }
+        let mut body = [0_u8; 24];
+        body[16..20].copy_from_slice(&u32::try_from(wire::MAX_READ).unwrap().to_le_bytes());
+        assert_eq!(read_size(&request(&body)), Ok(wire::MAX_READ));
+        body[16..20].copy_from_slice(&u32::try_from(wire::MAX_READ + 1).unwrap().to_le_bytes());
+        assert_eq!(read_size(&request(&body)), Err(wire::EINVAL));
+    }
 
     #[test]
     fn write_payload_reuses_tight_request_allocation() {

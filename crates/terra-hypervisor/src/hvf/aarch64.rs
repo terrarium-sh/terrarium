@@ -2,7 +2,7 @@
 
 mod machine;
 
-pub(crate) use machine::Machine;
+pub(crate) use machine::{Machine, map_guest_ram, unmap_guest_ram};
 
 use crate::arm::psci::{self, PsciAction, PsciCall};
 use crate::arm::{ArmDebugOsAccess, ArmMmioAccess, ArmRegisterWrite};

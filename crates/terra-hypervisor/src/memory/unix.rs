@@ -57,7 +57,7 @@ impl Backing {
     #[allow(unsafe_code)]
     pub(super) fn discard_host_pages(address: *mut u8, len: usize) -> Result<(), DiscardError> {
         // SAFETY: `GuestMemory::discard` confines this full page range to the mapping.
-        let result = unsafe {
+        let zeroed = unsafe {
             libc::madvise(
                 address.cast(),
                 len,
@@ -67,16 +67,27 @@ impl Backing {
                 libc::MADV_DONTNEED,
             )
         };
-        #[cfg(target_os = "macos")]
-        if result != 0
-            && matches!(
-                std::io::Error::last_os_error().raw_os_error(),
-                Some(libc::ENOTSUP | libc::EINVAL)
-            )
-        {
-            return Err(DiscardError::Unsupported);
+        if zeroed != 0 {
+            return Err(Self::discard_error());
         }
-        (result == 0).ok_or(DiscardError::Io)
+        // Zeroed macOS pages stay charged to the process until marked reusable.
+        // SAFETY: the same range as above.
+        #[cfg(target_os = "macos")]
+        if unsafe { libc::madvise(address.cast(), len, libc::MADV_FREE_REUSABLE) } != 0 {
+            return Err(Self::discard_error());
+        }
+        Ok(())
+    }
+
+    fn discard_error() -> DiscardError {
+        #[cfg(target_os = "macos")]
+        if matches!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ENOTSUP | libc::EINVAL)
+        ) {
+            return DiscardError::Unsupported;
+        }
+        DiscardError::Io
     }
 
     pub(super) fn host_page_bytes() -> usize {

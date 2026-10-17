@@ -1,5 +1,6 @@
 use crate::{Access, Grant, Role};
 use anyhow::{Context, Result, bail, ensure};
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -80,9 +81,9 @@ pub(super) fn render_profile(
     executable: &Path,
     grants: &[WorkerGrant],
 ) -> Result<Profile> {
-    let role_profile = match role {
-        Role::Vm => VM_PROFILE,
-        Role::Network => NETWORK_PROFILE,
+    let (role_profile, watches_shares) = match role {
+        Role::Vm => (VM_PROFILE, true),
+        Role::Network => (NETWORK_PROFILE, false),
         Role::Supervisor => bail!("the macOS supervisor owns lifecycle authority"),
     };
     let mut text = format!("{BASE_PROFILE}{role_profile}");
@@ -103,6 +104,19 @@ pub(super) fn render_profile(
             "(allow {operations} ({filter} (param \"GRANT_{index}\")))"
         )?;
         parameters.push((format!("GRANT_{index}"), path_text(&grant.path)?));
+    }
+    // The VM's file-events watcher canonicalizes each share path, which stats every ancestor.
+    let ancestors: BTreeSet<&Path> = grants
+        .iter()
+        .filter(|grant| watches_shares && grant.is_directory)
+        .flat_map(|grant| grant.path.ancestors().skip(1))
+        .collect();
+    for (index, ancestor) in ancestors.into_iter().enumerate() {
+        writeln!(
+            text,
+            "(allow file-read-metadata (literal (param \"ANCESTOR_{index}\")))"
+        )?;
+        parameters.push((format!("ANCESTOR_{index}"), path_text(ancestor)?));
     }
     Ok(Profile { text, parameters })
 }
@@ -194,7 +208,13 @@ mod tests {
         assert!(network.text.contains("network-outbound"));
         assert!(!vm.text.contains("process-fork") && !network.text.contains("process-fork"));
         assert!(!vm.text.contains("allow default") && !network.text.contains("allow default"));
+        assert!(
+            vm.text
+                .contains("(allow mach-lookup (global-name \"com.apple.FSEvents\"))")
+        );
+        assert!(!network.text.contains("com.apple.FSEvents"));
         assert_eq!(network.parameters.len(), 1);
+        assert_eq!(vm.parameters.len(), 1);
         assert!(render_profile(Role::Supervisor, exe, &[]).is_err());
         Ok(())
     }
@@ -236,6 +256,27 @@ mod tests {
                     .to_owned()
             )
         );
+        assert!(
+            profile
+                .text
+                .contains("(allow file-read-metadata (literal (param \"ANCESTOR_0\")))\n")
+        );
+        let ancestors: BTreeSet<&str> = profile
+            .parameters
+            .iter()
+            .filter(|(name, _)| name.starts_with("ANCESTOR_"))
+            .map(|(_, path)| path.as_str())
+            .collect();
+        let canonical_root = std::fs::canonicalize(root.path())?;
+        assert_eq!(
+            ancestors,
+            canonical_root
+                .ancestors()
+                .map(|path| path.to_str().unwrap())
+                .collect()
+        );
+        let network = render_profile(Role::Network, Path::new("/bin/terra"), &grants)?;
+        assert!(!network.text.contains("ANCESTOR_"));
         Ok(())
     }
 

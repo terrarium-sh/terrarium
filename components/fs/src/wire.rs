@@ -80,6 +80,13 @@ pub const EDQUOT: i32 = 122;
 pub const ENOTRECOVERABLE: i32 = 131;
 pub const INIT_EXT: u32 = 1 << 30;
 const BIG_WRITES: u32 = 1 << 5;
+const MAX_PAGES: u32 = 1 << 22;
+const GUEST_PAGE_BYTES: usize = 4096;
+const MAX_READ_PAGES: u16 = 16;
+/// The most bytes one read reply carries. `init` caps the kernel's reads here, because
+/// the kernel zero-fills a short buffered reply and truncates its cached file size
+/// (`fuse_short_read`; this server negotiates no writeback cache).
+pub const MAX_READ: usize = MAX_READ_PAGES as usize * GUEST_PAGE_BYTES;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Request<'a> {
@@ -148,11 +155,12 @@ pub fn init(body: &[u8]) -> Result<Vec<u8>, i32> {
     out[0..4].copy_from_slice(&7_u32.to_le_bytes());
     out[4..8].copy_from_slice(&minor.min(40).to_le_bytes());
     out[8..12].copy_from_slice(&(64 * 1024_u32).to_le_bytes());
-    out[12..16].copy_from_slice(&(flags & (INIT_EXT | BIG_WRITES)).to_le_bytes());
+    out[12..16].copy_from_slice(&(flags & (INIT_EXT | BIG_WRITES | MAX_PAGES)).to_le_bytes());
     out[16..18].copy_from_slice(&64_u16.to_le_bytes());
     out[18..20].copy_from_slice(&48_u16.to_le_bytes());
     out[20..24].copy_from_slice(&(64 * 1024_u32).to_le_bytes());
     out[24..28].copy_from_slice(&1_u32.to_le_bytes());
+    out[28..30].copy_from_slice(&MAX_READ_PAGES.to_le_bytes());
     if extended {
         out[32..36].copy_from_slice(&(u32_at(body, 16).unwrap_or(0) & FILE_EVENTS).to_le_bytes());
     }
@@ -182,6 +190,20 @@ mod tests {
             assert_eq!(u32_at(&reply, 12), Ok(flags));
             assert_eq!(u32_at(&reply, 20), Ok(64 * 1024));
         }
+    }
+
+    #[test]
+    fn reads_are_bounded_by_the_advertised_page_count() {
+        let mut body = vec![0; 16];
+        body[..4].copy_from_slice(&7_u32.to_le_bytes());
+        body[4..8].copy_from_slice(&40_u32.to_le_bytes());
+        body[12..16].copy_from_slice(&MAX_PAGES.to_le_bytes());
+        let reply = init(&body).unwrap();
+        assert_eq!(u32_at(&reply, 12), Ok(MAX_PAGES));
+        assert_eq!(
+            u16::from_le_bytes(reply[28..30].try_into().unwrap()),
+            MAX_READ_PAGES
+        );
     }
 
     #[test]

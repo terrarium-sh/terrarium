@@ -379,10 +379,12 @@ $(COMPONENT_AOT_TARGETS): component-%-aot: component-%
 test-component-boot: $(COMPONENT_AOT_TARGETS) $(KERNEL_GZ) $(ROOTFS_IMG) $(BOOT_IMG)
 	$(CARGO_LOCKED) test $(TEST_FLAGS) -p terra-runtime --lib -- --ignored --nocapture
 
+# Cargo runs a target runner with the tested package's directory as its working
+# directory, so the runner path must be absolute.
 test-platform-native-vm:
-	CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER="sh scripts/toolchain/run-macos-vm-test" $(CARGO_LOCKED) test $(TEST_FLAGS) -p terra-hypervisor --test native_vm -- --ignored --test-threads=1 --nocapture
+	CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER="sh $(abspath scripts/toolchain/run-macos-vm-test)" $(CARGO_LOCKED) test $(TEST_FLAGS) -p terra-hypervisor --test native_vm -- --ignored --test-threads=1 --nocapture
 ifeq ($(shell uname -s),Darwin)
-	CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER="sh scripts/toolchain/run-macos-vm-test" $(CARGO_LOCKED) test $(TEST_FLAGS) -p terra-hypervisor --lib cpu_power_cycles_preserve_the_handle_until_teardown -- --ignored --nocapture
+	CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER="sh $(abspath scripts/toolchain/run-macos-vm-test)" $(CARGO_LOCKED) test $(TEST_FLAGS) -p terra-hypervisor --lib cpu_power_cycles_preserve_the_handle_until_teardown -- --ignored --nocapture
 endif
 ifeq ($(ARCH),x86_64)
 	$(CARGO_LOCKED) test $(TEST_FLAGS) -p terra-hypervisor --lib cpuid_matches_the_fixed_vcpu_count -- --ignored --nocapture

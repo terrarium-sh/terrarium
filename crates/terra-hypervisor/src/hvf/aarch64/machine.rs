@@ -12,7 +12,7 @@ use applevisor::prelude::{
     SysReg, Vcpu, VcpuExit, VcpuHandle, VirtualMachine, VirtualMachineConfig,
     VirtualMachineInstance,
 };
-use applevisor_sys::hv_vm_map;
+use applevisor_sys::{hv_vm_map, hv_vm_unmap};
 
 const GIC_SPI_OFFSET: u32 = 32;
 
@@ -92,17 +92,8 @@ impl Machine {
             .host_address(terra_limits::ARM_RAM_BASE)
             .ok_or(HvError::Memory)?;
         // SAFETY: `ram` stays alive until after the Hypervisor.framework VM is destroyed.
-        let result = unsafe {
-            hv_vm_map(
-                host_address.cast::<c_void>(),
-                terra_limits::ARM_RAM_BASE,
-                ram_size_usize,
-                u64::from(MemPerms::RWX),
-            )
-        };
-        if result != 0 {
-            return Err(HypervisorError::from(result).into());
-        }
+        unsafe { map_guest_ram(host_address, terra_limits::ARM_RAM_BASE, ram_size_usize) }?;
+        ram.mark_hypervisor_mapped();
         Ok(Self { vm, ram })
     }
 
@@ -279,6 +270,43 @@ fn general_register(number: u8) -> Option<Reg> {
         29 => Some(Reg::X29),
         30 => Some(Reg::X30),
         _ => None,
+    }
+}
+
+/// Maps `len` bytes of host memory into the guest at `guest_address`.
+///
+/// # Safety
+///
+/// The host range must be this VM's guest RAM, because any other host memory
+/// would become guest-accessible, and must stay mapped until the VM is destroyed.
+pub(crate) unsafe fn map_guest_ram(
+    host_address: *mut u8,
+    guest_address: u64,
+    len: usize,
+) -> Result<(), HypervisorError> {
+    // SAFETY: the caller keeps the host range mapped for the VM's lifetime.
+    let result = unsafe {
+        hv_vm_map(
+            host_address.cast::<c_void>(),
+            guest_address,
+            len,
+            u64::from(MemPerms::RWX),
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(HypervisorError::from(result))
+    }
+}
+
+pub(crate) fn unmap_guest_ram(guest_address: u64, len: usize) -> Result<(), HypervisorError> {
+    // SAFETY: unmapping removes only the guest's access; the host mapping stays.
+    let result = unsafe { hv_vm_unmap(guest_address, len) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(HypervisorError::from(result))
     }
 }
 

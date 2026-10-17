@@ -1,0 +1,2 @@
+; Share notifications subscribe through FSEvents, which delivers only events these file rules allow.
+(allow mach-lookup (global-name "com.apple.FSEvents"))

@@ -418,6 +418,8 @@ fn raw_vsock_tcp_receive_credit_preserves_high_lowat() {
                 Err(error) => return Err(error),
             }
         };
+        // macOS hands an accepted socket the listener's non-blocking mode.
+        stream.set_nonblocking(false)?;
         stream.set_nodelay(true)?;
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
         stream.set_write_timeout(Some(Duration::from_secs(5)))?;
@@ -1231,8 +1233,13 @@ fn run_boot_suite() {
     );
     // Host diagnostics stay out of the workload's terminal: they belong in the
     // box's log - and the refusal message is terra's own policy talking.
-    let log = std::fs::read_to_string(s.get_box_files_path("egress").join("terra.log"))
-        .unwrap_or_default();
+    let log_name = if cfg!(target_os = "macos") {
+        "runtime-logs/terra.log"
+    } else {
+        "terra.log"
+    };
+    let log =
+        std::fs::read_to_string(s.get_box_files_path("egress").join(log_name)).unwrap_or_default();
     assert!(
         log.contains("policy denied name lookup"),
         "the log does not name the refused query:\n{log}"

@@ -4,11 +4,18 @@ use super::bindings::wit as terra;
 use crate::component::context::DeviceContext;
 use crate::memory::{ReclaimError, ReclaimRange};
 
+/// The guest reports freed memory continually, so only the first host failure is logged.
+static FIRST_HOST_RECLAIM_FAILURE: std::sync::Once = std::sync::Once::new();
+
 fn reclaim_error(error: ReclaimError) -> terra::mem::host::Error {
     match error {
         ReclaimError::Invalid => terra::mem::host::Error::Invalid,
         ReclaimError::TooLarge => terra::mem::host::Error::TooLarge,
-        ReclaimError::Io | ReclaimError::Unsupported => terra::mem::host::Error::Io,
+        ReclaimError::Io | ReclaimError::Unsupported => {
+            FIRST_HOST_RECLAIM_FAILURE
+                .call_once(|| log::warn!("guest memory reclaim failed on the host: {error:?}"));
+            terra::mem::host::Error::Io
+        }
     }
 }
 

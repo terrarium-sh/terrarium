@@ -1,6 +1,8 @@
 //! Native guest RAM allocation and access.
 
 use std::sync::Arc;
+#[cfg(target_os = "macos")]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(unix)]
 mod unix;
@@ -36,6 +38,8 @@ pub enum DiscardError {
 pub struct GuestMemory {
     backing: Arc<Backing>,
     limit: u64,
+    #[cfg(target_os = "macos")]
+    is_hypervisor_mapped: Arc<AtomicBool>,
 }
 
 impl GuestMemory {
@@ -67,6 +71,8 @@ impl GuestMemory {
         Some(Self {
             backing: Arc::new(Backing::new(&ranges)?),
             limit: range_end(last_base, last_size)?,
+            #[cfg(target_os = "macos")]
+            is_hypervisor_mapped: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -137,16 +143,45 @@ impl GuestMemory {
         self.backing.write(addr, bytes)
     }
 
-    /// Discards complete host pages after validating the full batch.
+    /// Discards complete host pages after validating the full batch. The guest
+    /// must not touch the ranges until this returns: on macOS they leave the VM.
+    #[cfg_attr(target_os = "macos", allow(unsafe_code))]
     pub fn discard(&self, ranges: &[MemoryRange]) -> Result<(), DiscardError> {
         let ranges = ranges
             .iter()
             .map(|&range| self.discard_host_range(range))
             .collect::<Result<Vec<_>, _>>()?;
-        for (address, len) in ranges {
-            Backing::discard_host_pages(address, len)?;
+        for (guest_address, host_address, len) in ranges {
+            // Discarded pages that Hypervisor.framework still maps stay charged to this process.
+            #[cfg(target_os = "macos")]
+            if self.is_hypervisor_mapped.load(Ordering::Relaxed) {
+                crate::hvf::unmap_guest_ram(guest_address, len).map_err(|_| DiscardError::Io)?;
+                let discarded = Backing::discard_host_pages(host_address, len);
+                // SAFETY: `discard_host_range` keeps this range inside the VM's own RAM at its
+                // own guest address, and the VM's machine holds that RAM until it is destroyed.
+                if let Err(error) =
+                    unsafe { crate::hvf::map_guest_ram(host_address, guest_address, len) }
+                {
+                    // The guest would read zeros and lose writes in the hole, so the VM stops.
+                    log::error!(
+                        "guest RAM {guest_address:#x}+{len:#x} could not be remapped after a discard: {error}"
+                    );
+                    std::process::abort();
+                }
+                discarded?;
+                continue;
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = guest_address;
+            Backing::discard_host_pages(host_address, len)?;
         }
         Ok(())
+    }
+
+    /// Routes later discards through the Hypervisor.framework VM's mapping.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn mark_hypervisor_mapped(&self) {
+        self.is_hypervisor_mapped.store(true, Ordering::Relaxed);
     }
 
     #[cfg(unix)]
@@ -167,7 +202,11 @@ impl GuestMemory {
         }
     }
 
-    fn discard_host_range(&self, range: MemoryRange) -> Result<(*mut u8, usize), DiscardError> {
+    /// The guest address, host address and length of the complete host pages in `range`.
+    fn discard_host_range(
+        &self,
+        range: MemoryRange,
+    ) -> Result<(u64, *mut u8, usize), DiscardError> {
         if range.len == 0 || !self.contains_range(range.addr, range.len) {
             return Err(DiscardError::Invalid);
         }
@@ -176,9 +215,10 @@ impl GuestMemory {
             .backing
             .host_address_within_region(range.addr, range.len)
             .ok_or(DiscardError::Invalid)?;
-        full_host_pages(address as usize, length, Backing::host_page_bytes())
-            .map(|(address, length)| (address as *mut u8, length))
-            .ok_or(DiscardError::Invalid)
+        let (start, length) = full_host_pages(address as usize, length, Backing::host_page_bytes())
+            .ok_or(DiscardError::Invalid)?;
+        let skipped = u64::try_from(start - address as usize).map_err(|_| DiscardError::Invalid)?;
+        Ok((range.addr + skipped, start as *mut u8, length))
     }
 }
 
@@ -282,6 +322,26 @@ mod tests {
             full_host_pages(0x4000, 0x8000, 0x4000),
             Some((0x4000, 0x8000))
         );
+    }
+
+    /// The macOS discard unmaps the guest range of exactly the host pages it
+    /// discards, so the guest address must round up with the host address.
+    #[cfg(unix)]
+    #[test]
+    fn discard_range_keeps_guest_and_host_pages_aligned() {
+        let page = Backing::host_page_bytes();
+        let base = (page * 4) as u64;
+        let memory = GuestMemory::from_ranges(&[(base, page * 4)]).expect("RAM");
+        let host_base = memory.host_address(base).expect("host address") as usize;
+        let (guest, host, len) = memory
+            .discard_host_range(MemoryRange {
+                addr: base + 1,
+                len: (page * 3) as u64,
+            })
+            .expect("range");
+        assert_eq!(guest, base + page as u64);
+        assert_eq!(host as usize, host_base + page);
+        assert_eq!(len, page * 2);
     }
 
     #[test]

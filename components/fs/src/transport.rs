@@ -34,7 +34,6 @@ const QUEUE_SIZE: u16 = 256;
 const DEVICE_ID: u32 = 26;
 const MAX_CHAIN: usize = 32;
 const MAX_REQUEST: usize = 128 * 1024;
-const MAX_READ: usize = 64 * 1024;
 const MAX_NODES: usize = 8192;
 const MAX_HANDLES: usize = 2048;
 const MAX_DIRECTORIES: usize = 2048;

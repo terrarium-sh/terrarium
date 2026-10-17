@@ -122,7 +122,25 @@ fn vm_pid(running: &RunningBox) -> u32 {
         .unwrap_or_else(|error| panic!("parsing {files}/terra.pid: {error}"))
 }
 
-fn rss_kib(pid: u32) -> std::io::Result<u64> {
+/// The VM process's host memory. On macOS, guest-touched pages show in
+/// `phys_footprint` but not in the `resident_size` sysinfo reports.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code, reason = "proc_pid_rusage has no safe binding here")]
+fn host_memory_kib(pid: u32) -> std::io::Result<u64> {
+    let pid = i32::try_from(pid).map_err(|_| std::io::Error::other("VM pid out of range"))?;
+    let mut usage = std::mem::MaybeUninit::<libc::rusage_info_v4>::uninit();
+    // SAFETY: `proc_pid_rusage` initializes the buffer it is given.
+    let result =
+        unsafe { libc::proc_pid_rusage(pid, libc::RUSAGE_INFO_V4, usage.as_mut_ptr().cast()) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the call above succeeded, so the buffer is initialized.
+    Ok(unsafe { usage.assume_init() }.ri_phys_footprint / 1024)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_memory_kib(pid: u32) -> std::io::Result<u64> {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
     let pid = Pid::from_u32(pid);
@@ -138,7 +156,7 @@ fn rss_kib(pid: u32) -> std::io::Result<u64> {
         .ok_or_else(|| std::io::Error::other("VM process is absent"))
 }
 
-fn wait_for_rss(
+fn wait_for_memory(
     running: &RunningBox,
     pid: u32,
     description: &str,
@@ -147,18 +165,18 @@ fn wait_for_rss(
     let started = Instant::now();
     let mut samples = Vec::new();
     loop {
-        match rss_kib(pid) {
-            Ok(rss) => {
-                samples.push(rss.to_string());
-                if predicate(rss) {
-                    return rss;
+        match host_memory_kib(pid) {
+            Ok(kib) => {
+                samples.push(kib.to_string());
+                if predicate(kib) {
+                    return kib;
                 }
             }
             Err(error) => samples.push(format!("error: {error}")),
         }
         assert!(
             started.elapsed() < MEMORY_SETTLE_TIMEOUT,
-            "{description} after {} seconds; resident memory samples (KiB): {samples:?}\nbox logs:\n{}",
+            "{description} after {} seconds; host memory samples (KiB): {samples:?}\nbox logs:\n{}",
             MEMORY_SETTLE_TIMEOUT.as_secs(),
             running.logs()
         );
@@ -166,19 +184,19 @@ fn wait_for_rss(
     }
 }
 
-fn wait_for_idle_rss(running: &RunningBox, pid: u32) -> u64 {
+fn wait_for_idle_memory(running: &RunningBox, pid: u32) -> u64 {
     let mut previous = 0;
     let mut settled_since = Instant::now();
-    wait_for_rss(
+    wait_for_memory(
         running,
         pid,
-        "idle demand-backed resident memory did not settle below 512 MiB",
-        |rss| {
-            if rss.abs_diff(previous) > 16 * MIB_KIB {
-                previous = rss;
+        "idle demand-backed host memory did not settle below 512 MiB",
+        |kib| {
+            if kib.abs_diff(previous) > 16 * MIB_KIB {
+                previous = kib;
                 settled_since = Instant::now();
             }
-            rss < 512 * MIB_KIB && settled_since.elapsed() >= Duration::from_secs(3)
+            kib < 512 * MIB_KIB && settled_since.elapsed() >= Duration::from_secs(3)
         },
     )
 }
@@ -240,15 +258,15 @@ fn guest_memory_grows_and_shrinks_with_its_working_set() {
     }
 
     let pid = vm_pid(&running);
-    let initial = wait_for_rss(
+    let initial = wait_for_memory(
         &running,
         pid,
-        "initial demand-backed resident memory did not settle below 512 MiB",
-        |rss| rss < 512 * MIB_KIB,
+        "initial demand-backed host memory did not settle below 512 MiB",
+        |kib| kib < 512 * MIB_KIB,
     );
 
     for cycle in 1..=2 {
-        let before = wait_for_idle_rss(&running, pid);
+        let before = wait_for_idle_memory(&running, pid);
         running.exec(&[
             "dd",
             "if=/dev/zero",
@@ -256,18 +274,18 @@ fn guest_memory_grows_and_shrinks_with_its_working_set() {
             "bs=1M",
             "count=256",
         ]);
-        let grown = wait_for_rss(
+        let grown = wait_for_memory(
             &running,
             pid,
-            &format!("resident memory did not grow by 128 MiB from {before} KiB in cycle {cycle}"),
-            |rss| rss >= before + 128 * MIB_KIB,
+            &format!("host memory did not grow by 128 MiB from {before} KiB in cycle {cycle}"),
+            |kib| kib >= before + 128 * MIB_KIB,
         );
         running.exec(&["rm", "-f", "/dev/shm/terra-memory-test"]);
-        let shrunk = wait_for_rss(
+        let shrunk = wait_for_memory(
             &running,
             pid,
-            &format!("resident memory did not release 128 MiB in cycle {cycle}"),
-            |rss| rss + 128 * MIB_KIB <= grown,
+            &format!("host memory did not release 128 MiB in cycle {cycle}"),
+            |kib| kib + 128 * MIB_KIB <= grown,
         );
         println!(
             "cycle {cycle}: initial={initial} KiB, before={before} KiB, grown={grown} KiB, shrunk={shrunk} KiB"
