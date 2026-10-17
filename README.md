@@ -119,7 +119,7 @@ To change tools, access or the workload, see the [recipe reference](docs/recipe.
   virtualization, so even root inside the box stays inside.
 - **More layers around the VM.** The code that handles the box's device requests
   runs in separate WebAssembly sandboxes. The VM process and network broker also
-  run in the host OS sandbox: Bubblewrap and seccomp on Linux, App Sandbox on
+  run in the host OS sandbox: Bubblewrap and seccomp on Linux, Seatbelt on
   macOS, and Less-Privileged AppContainers on Windows.
 - **No daemon, nothing extra to install.** The guest kernel, base system and VM
   parts are built into `terra`.

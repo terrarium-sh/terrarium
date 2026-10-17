@@ -7,7 +7,7 @@ launch stops the box. The per-platform pages describe each mechanism and draw
 its process layout:
 
 - [Linux](sandboxing-linux.md): Bubblewrap namespaces and seccomp filters.
-- [macOS](sandboxing-macos.md): App Sandbox entitlements on signed worker copies.
+- [macOS](sandboxing-macos.md): Seatbelt profiles applied by a trusted launcher.
 - [Windows](sandboxing-windows.md): Less-Privileged AppContainers and jobs.
 
 ## Processes

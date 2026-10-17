@@ -110,7 +110,7 @@ pub struct Launch<'a> {
     pub command: Command,
     /// Grants beyond the role's platform files and the read-only executable.
     pub grants: Vec<Grant>,
-    /// Where macOS stages each signed worker bundle.
+    /// Where macOS writes each worker's launch spec.
     pub staging_directory: &'a Path,
 }
 
@@ -177,6 +177,59 @@ fn copy_explicit_environment(confined: &mut Command, requested: &Command) {
     }
 }
 
+#[cfg_attr(
+    target_os = "linux",
+    allow(
+        dead_code,
+        reason = "only the macOS and Windows launchers read a worker spec"
+    )
+)]
+pub(crate) const MAX_WORKER_SPEC_BYTES: u64 = 1 << 20;
+
+#[cfg_attr(
+    target_os = "linux",
+    allow(
+        dead_code,
+        reason = "only the macOS and Windows launchers read a worker spec"
+    )
+)]
+pub(crate) fn write_worker_spec(
+    directory: &Path,
+    spec: &impl serde::Serialize,
+) -> Result<tempfile::NamedTempFile> {
+    use std::io::Write as _;
+    let bytes = serde_json::to_vec(spec)?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= MAX_WORKER_SPEC_BYTES,
+        "worker launch specification exceeds its size limit"
+    );
+    let mut file = tempfile::NamedTempFile::new_in(directory)?;
+    terra_platform::filesystem::set_owner_only(file.path(), false)?;
+    file.write_all(&bytes)?;
+    file.flush()?;
+    Ok(file)
+}
+
+#[cfg_attr(
+    target_os = "linux",
+    allow(
+        dead_code,
+        reason = "only the macOS and Windows launchers read a worker spec"
+    )
+)]
+pub(crate) fn read_worker_spec<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
+    use std::io::Read as _;
+    let mut bytes = Vec::new();
+    File::open(path)?
+        .take(MAX_WORKER_SPEC_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= MAX_WORKER_SPEC_BYTES,
+        "worker launch specification exceeds its size limit"
+    );
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,5 +242,32 @@ mod tests {
             terra_build::seccomp::Role::ALL.map(terra_build::seccomp::Role::name),
             Role::ALL.map(Role::name)
         );
+    }
+
+    #[test]
+    fn worker_spec_round_trips_through_an_owner_only_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let spec = write_worker_spec(directory.path(), &vec![Role::Vm, Role::Network]).unwrap();
+        assert!(spec.path().starts_with(directory.path()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                spec.path().metadata().unwrap().permissions().mode() & 0o077,
+                0
+            );
+        }
+        let read: Vec<Role> = read_worker_spec(spec.path()).unwrap();
+        assert_eq!(read, [Role::Vm, Role::Network]);
+    }
+
+    #[test]
+    fn worker_spec_over_its_limit_is_rejected_both_ways() {
+        let directory = tempfile::tempdir().unwrap();
+        let oversized = "x".repeat(usize::try_from(MAX_WORKER_SPEC_BYTES).unwrap());
+        assert!(write_worker_spec(directory.path(), &oversized).is_err());
+        let path = directory.path().join("oversized.json");
+        std::fs::write(&path, format!("\"{oversized}\"")).unwrap();
+        assert!(read_worker_spec::<String>(&path).is_err());
     }
 }

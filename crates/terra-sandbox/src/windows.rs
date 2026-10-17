@@ -16,7 +16,7 @@ use std::io::{Read, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, AsRawSocket, FromRawHandle, OwnedHandle};
 use std::os::windows::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode};
 use std::time::{Duration, Instant};
 use terra_platform::filesystem::share::windows::symlink_broker;
@@ -31,7 +31,6 @@ use windows_sys::Win32::System::Threading::{
     WaitForSingleObject,
 };
 
-const MAX_SPEC_BYTES: u64 = 1 << 20;
 const BROKER_COMMIT_LIMIT_BYTES: usize = 512 << 20;
 use terra_platform::process::sandbox_env::{APP_CONTAINER_MODE, WINDOWS_MODE, WINDOWS_ROLE};
 
@@ -118,19 +117,14 @@ pub fn prepare_launch(launch: Launch<'_>) -> Result<PreparedLaunch> {
     let (grants, trusted_directories) = build_worker_grants(launch.grants)?;
     let executable = std::fs::canonicalize(launch.command.get_program())
         .context("resolving Windows sandbox worker executable")?;
-    let bytes = serde_json::to_vec(&WorkerSpec {
-        role: launch.role,
-        grants,
-    })?;
-    ensure!(
-        bytes.len() as u64 <= MAX_SPEC_BYTES,
-        "Windows sandbox launch specification exceeds its size limit"
-    );
-    let mut spec =
-        tempfile::NamedTempFile::new().context("creating Windows sandbox launch specification")?;
-    terra_platform::filesystem::set_owner_only(spec.path(), false)?;
-    spec.write_all(&bytes)?;
-    spec.flush()?;
+    let spec = super::write_worker_spec(
+        &std::env::temp_dir(),
+        &WorkerSpec {
+            role: launch.role,
+            grants,
+        },
+    )
+    .context("creating Windows sandbox launch specification")?;
     let (identity, inherited_identity) = api::create_child_writer_pipe()?;
     // SAFETY: the current process identity is known; this handle can only observe its lifetime.
     let parent = api::own_handle(unsafe {
@@ -391,21 +385,14 @@ pub fn run_launcher_worker(arguments: impl Iterator<Item = OsString>) -> Result<
     let executable = arguments
         .next()
         .context("Windows launcher lacks a worker executable")?;
-    run_worker(&executable, arguments, &load_worker_spec()?)
-}
-
-fn load_worker_spec() -> Result<WorkerSpec> {
-    let path =
-        std::env::var_os(SPEC_ENV).context("Windows launcher lacks a startup specification")?;
-    let mut bytes = Vec::new();
-    File::open(path)?
-        .take(MAX_SPEC_BYTES + 1)
-        .read_to_end(&mut bytes)?;
-    ensure!(
-        bytes.len() as u64 <= MAX_SPEC_BYTES,
-        "Windows sandbox launch specification exceeds its size limit"
-    );
-    Ok(serde_json::from_slice(&bytes)?)
+    run_worker(
+        &executable,
+        arguments,
+        &super::read_worker_spec(Path::new(
+            &std::env::var_os(SPEC_ENV)
+                .context("Windows launcher lacks a startup specification")?,
+        ))?,
+    )
 }
 
 fn run_worker(

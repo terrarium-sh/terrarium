@@ -90,7 +90,7 @@ A new user-facing feature gets a step in both `run.sh` and `run.ps1`.
 | `crates/terra-limits` | Shared resource limits |
 | `crates/terra-hypervisor` | Native VMs, vCPU threads and guest memory over KVM, Hypervisor.framework and WHP |
 | `crates/terra-platform` | Host filesystem, local-socket and child-process APIs |
-| `crates/terra-sandbox` | Host confinement of VM and broker workers: Bubblewrap and seccomp, macOS App Sandbox, Windows Less-Privileged AppContainers and jobs |
+| `crates/terra-sandbox` | Host confinement of VM and broker workers: Bubblewrap and seccomp, macOS Seatbelt profiles, Windows Less-Privileged AppContainers and jobs |
 | `crates/terra-build` | Build-script logic: seccomp role filters and allowlist compiler, policy file format, Bubblewrap asset lookup, version string |
 | `crates/terra-runtime` | Wasmtime stores, guest layout, scoped host capabilities, network configuration and policy contracts, and component/VM lifecycle orchestration |
 | `components` | Wasm devices and services, reusable transport code, and shared WIT interfaces |
@@ -358,10 +358,9 @@ when they differ from the checked-in policy. It needs no KVM. The KVM gates then
 run the boot and guest suites against the distribution, whose compiled-in
 allowlists kill any syscall the generator missed.
 
-Releases additionally require the native host matrix (Linux x86_64/AArch64,
-macOS ARM64, Windows amd64/ARM64); optional ordinary CI jobs do not waive it.
-Set `LINUX_X64_VM_RUNNER` and `LINUX_ARM64_VM_RUNNER` repository variables to
-KVM-capable runner labels.
+Releases build every platform but run VM gates on Linux amd64, plus any host
+with a configured native runner. On the other hosts, run the
+[acceptance suite](#acceptance-gates) that each release ships.
 
 After a change that can alter the syscalls a sandboxed role makes, including
 dependency and toolchain bumps, regenerate and review the policy:

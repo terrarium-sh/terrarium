@@ -1,7 +1,7 @@
 # Host sandbox policy
 
 Terra always starts the VM and its network broker in its built-in native
-sandbox: Bubblewrap on Linux, App Sandbox on macOS and AppContainer on Windows.
+sandbox: Bubblewrap on Linux, Seatbelt on macOS and AppContainer on Windows.
 There is no unconfined or custom launcher, and nothing changes a policy at run
 time: no setting, file or environment variable. A failed sandbox launch stops
 the box without fallback. [Host process sandboxing](sandboxing.md) describes

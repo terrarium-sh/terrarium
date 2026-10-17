@@ -404,7 +404,7 @@ jobs:
         id: host-build
         run: |
           make TERRA_TARGET=aarch64-apple-darwin host-dist
-          codesign --force --sign - --entitlements packaging/macos.entitlements dist/terra
+          codesign --force --sign - --options runtime --entitlements packaging/macos.entitlements dist/terra
           codesign --verify --strict --verbose=2 dist/terra
           ./dist/terra --version
           ./dist/terra --help
@@ -427,6 +427,7 @@ jobs:
         run: |
           cargo test --no-fail-fast --locked --target aarch64-apple-darwin -p terra-hypervisor --lib --test native_vm -- --ignored --test-threads=1
           cargo test --no-fail-fast --locked --target aarch64-apple-darwin -p terra-runtime --lib -- --ignored --test-threads=1
+          TERRA_BIN="$PWD/dist/terra" cargo test --no-fail-fast --locked --target aarch64-apple-darwin -p terra-sandbox --lib macos -- --ignored --test-threads=1 --nocapture
           TERRA_BIN="$PWD/dist/terra" cargo test --no-fail-fast --locked --target aarch64-apple-darwin -p terra --test native_boot --test boot --test memory -- --ignored --test-threads=1 --nocapture
       - name: Feature acceptance
         if: ${{ !cancelled() && steps.host-build.outcome == 'success' && (inputs.native_vm_tests || vars.MACOS_ARM64_VM_RUNNER != '') }}

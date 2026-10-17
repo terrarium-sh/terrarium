@@ -131,10 +131,11 @@ Optionally, pass `-ComponentsDirectory <directory>` to reuse matching prebuilt
 WASM components instead of building them locally.
 
 macOS requires Apple Silicon and macOS 15 or newer. The release executable must
-be signed with `packaging/macos.entitlements`, which grants
-`com.apple.security.hypervisor`. CI uses an ad-hoc signature to check the
-entitlement; a distributed macOS executable needs the project's release signing
-identity.
+be signed with Hardened Runtime (`--options runtime`) and
+`packaging/macos.entitlements`, which grants `com.apple.security.hypervisor` and
+`com.apple.security.cs.allow-unsigned-executable-memory` (Wasmtime's AOT
+code). CI uses an ad-hoc signature to check the entitlements; a distributed
+macOS executable needs the project's release signing identity.
 
 Windows x64 requires Windows 10 version 1809 or newer with Windows Hypervisor
 Platform enabled. Windows ARM64 requires Windows 11 24H2 build 26100.3915 or
@@ -142,9 +143,9 @@ newer with the same feature. Terra checks the hypervisor capability before it
 creates a partition, and checks ARM64 support on ARM hosts. Ordinary hosted CI
 checks compilation and unit tests; configured native runners run VM acceptance.
 Windows and macOS native VM acceptance is opt-in in CI until native runners are
-available. Releases require VM acceptance on Linux amd64; see
-[native test setup](../README.dev.md#verification).
-Releases also require native acceptance on every supported host.
+available. Releases require VM acceptance only on Linux amd64; on other hosts,
+run the [acceptance suite](../README.dev.md#acceptance-gates) each release
+ships. See [native test setup](../README.dev.md#verification).
 
 `make dist` includes `LICENSE`, `NOTICE`, GPL-2.0, and the selected MIT license texts
 beside the executable. Windows builds select windows-sys under Apache-2.0; its

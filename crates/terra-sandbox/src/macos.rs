@@ -1,39 +1,39 @@
-//! Signed App Sandbox workers with separate VM and network authority.
+//! Seatbelt-confined workers with separate VM and network authority.
 
 mod policy;
+mod seatbelt;
 
 use super::{Access, Grant, Launch, PreparedLaunch, Role};
 use anyhow::{Context, Result, ensure};
-use sha2::{Digest as _, Sha256};
-use std::fmt::Write as _;
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 use std::process::{Child, Command, ExitCode};
 use std::time::Duration;
-
-const CODESIGN: &str = "/usr/bin/codesign";
 use terra_platform::process::sandbox_env::MACOS_ROLE;
+
 const PROBE_ENV: &str = "TERRA_MACOS_SANDBOX_PROBE";
+const SPEC_ENV: &str = "TERRA_MACOS_SANDBOX_SPEC";
 const ACTIVATION_FD: i32 = 9;
 const ACTIVATION_ACK: u8 = 0x53;
-const SIGNING_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct Confinement {
-    bundle: tempfile::TempDir,
+    spec: tempfile::NamedTempFile,
     inherited: File,
     activation: UnixStream,
 }
 
-/// The signed worker bundle, which must outlive the worker.
-pub type Resources = tempfile::TempDir;
+/// The spec only needs to outlive activation; `confirm` deletes it.
+pub type Resources = ();
 
 impl Confinement {
     pub(crate) fn confirm(self, child: &mut Child, timeout: Duration) -> Result<(u32, Resources)> {
         let Self {
-            bundle,
+            spec,
             inherited,
             mut activation,
         } = self;
@@ -44,18 +44,52 @@ impl Confinement {
         );
         activation.set_read_timeout(Some(timeout))?;
         let mut acknowledgement = [0];
-        activation
-            .read_exact(&mut acknowledgement)
-            .context("macOS sandbox worker did not verify confinement before initialization")?;
+        if let Err(error) = activation.read_exact(&mut acknowledgement) {
+            return Err(activation_failure(child, error, timeout));
+        }
         ensure!(
             acknowledgement == [ACTIVATION_ACK],
             "macOS worker sent an invalid activation acknowledgement"
         );
-        Ok((child.id(), bundle))
+        drop(spec);
+        Ok((child.id(), ()))
+    }
+}
+
+fn activation_failure(
+    child: &mut Child,
+    error: std::io::Error,
+    timeout: Duration,
+) -> anyhow::Error {
+    if error.kind() != std::io::ErrorKind::UnexpectedEof {
+        return anyhow::Error::new(error).context(format!(
+            "macOS sandbox worker did not verify confinement within {timeout:?}"
+        ));
+    }
+    // EOF means the worker is exiting, so this kill cannot change its exit status.
+    let _ = terra_platform::process::kill_vm_child(child);
+    // NOWAIT leaves the worker unreaped, since spawn's kill_vm_child afterwards signals its raw PID.
+    let signal = rustix::process::waitid(
+        rustix::process::WaitId::Pid(rustix::process::Pid::from_child(child)),
+        rustix::process::WaitIdOptions::EXITED | rustix::process::WaitIdOptions::NOWAIT,
+    )
+    .ok()
+    .flatten()
+    .and_then(|status| status.terminating_signal());
+    match signal {
+        Some(signal) => anyhow::anyhow!(
+            "macOS sandbox worker was killed by signal {signal} before verifying confinement"
+        ),
+        None => anyhow::Error::new(error)
+            .context("macOS sandbox worker exited before verifying confinement"),
     }
 }
 
 pub fn prepare_launch(launch: Launch<'_>) -> Result<PreparedLaunch> {
+    prepare_launch_via(launch, &std::env::current_exe()?)
+}
+
+fn prepare_launch_via(launch: Launch<'_>, launcher: &Path) -> Result<PreparedLaunch> {
     let Launch {
         role,
         command,
@@ -76,48 +110,22 @@ pub fn prepare_launch(launch: Launch<'_>) -> Result<PreparedLaunch> {
         "macOS sandbox working directory must be absolute"
     );
     std::fs::create_dir_all(staging_directory)?;
-    let bundle = tempfile::Builder::new()
-        .prefix("macos-worker-")
-        .tempdir_in(staging_directory)?;
-    let probe = bundle.path().join("host-only-probe");
-    std::fs::write(&probe, b"macOS App Sandbox must deny this host file")?;
-    terra_platform::filesystem::set_owner_only(&probe, false)?;
-    let entitlements = policy::render_entitlements(role, &grants, &probe)?;
-    let identifier = build_identifier(role, executable, &entitlements)?;
-    let application = bundle.path().join("Worker.app");
-    let binary_directory = application.join("Contents/MacOS");
-    std::fs::create_dir_all(&binary_directory)?;
-    let worker = binary_directory.join("terra");
-    std::fs::copy(executable, &worker).context("copying the executable for macOS role signing")?;
-    let info = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\n<key>CFBundleIdentifier</key><string>{identifier}</string>\n<key>CFBundleExecutable</key><string>terra</string>\n<key>CFBundlePackageType</key><string>APPL</string>\n<key>CFBundleVersion</key><string>1</string>\n<key>LSMinimumSystemVersion</key><string>15.0</string>\n<key>LSUIElement</key><true/>\n</dict></plist>\n"
-    );
-    std::fs::write(application.join("Contents/Info.plist"), info)?;
-    let entitlement_path = bundle.path().join("entitlements.plist");
-    std::fs::write(&entitlement_path, entitlements)?;
-    let identity = std::env::var_os("TERRA_MACOS_SIGN_IDENTITY").unwrap_or_else(|| "-".into());
-    let mut sign = Command::new(CODESIGN);
-    sign.args(["--force", "--sign"])
-        .arg(identity)
-        .args(["--timestamp=none", "--options", "runtime", "--identifier"])
-        .arg(identifier)
-        .arg("--entitlements")
-        .arg(&entitlement_path)
-        .arg(&application);
-    run_codesign(&mut sign)
-        .context("signing the macOS worker; install Apple's signing tools or set TERRA_MACOS_SIGN_IDENTITY to a local identity")?;
-    run_codesign(
-        Command::new(CODESIGN)
-            .args(["--verify", "--strict"])
-            .arg(&application),
-    )
-    .context("verifying the signed macOS worker")?;
-    let mut worker_command = Command::new(worker);
-    worker_command.args(command.get_args());
-    crate::copy_explicit_environment(&mut worker_command, &command);
+    let spec = crate::write_worker_spec(
+        staging_directory,
+        &policy::WorkerSpec {
+            role,
+            grants: policy::resolve_grants(&grants, staging_directory)?,
+        },
+    )?;
+    let mut worker_command = Command::new(launcher);
     worker_command
-        .env(MACOS_ROLE, role.name())
-        .env(PROBE_ENV, probe);
+        .arg(super::LAUNCHER_WORKER_ARG)
+        .arg("--macos-worker")
+        .arg("--")
+        .arg(executable)
+        .args(command.get_args());
+    crate::copy_explicit_environment(&mut worker_command, &command);
+    worker_command.env(SPEC_ENV, spec.path());
     worker_command.current_dir(command.get_current_dir().unwrap_or(Path::new("/")));
     let (activation, child_activation) = UnixStream::pair()?;
     let inherited = terra_platform::process::pass_descriptor(
@@ -128,66 +136,14 @@ pub fn prepare_launch(launch: Launch<'_>) -> Result<PreparedLaunch> {
     Ok(PreparedLaunch {
         command: worker_command,
         confinement: Confinement {
-            bundle,
+            spec,
             inherited,
             activation,
         },
     })
 }
 
-fn run_codesign(command: &mut Command) -> Result<()> {
-    let mut stderr = tempfile::tempfile().context("creating codesign stderr capture")?;
-    let mut child = command
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(stderr.try_clone()?)
-        .spawn()
-        .context("starting codesign")?;
-    let deadline = std::time::Instant::now() + SIGNING_TIMEOUT;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {}
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(error).context("waiting for codesign");
-            }
-        }
-        if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            anyhow::bail!("codesign did not finish within {SIGNING_TIMEOUT:?}");
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    };
-    let mut message = String::new();
-    std::io::Seek::rewind(&mut stderr)?;
-    stderr.read_to_string(&mut message)?;
-    ensure!(status.success(), "codesign failed ({status}): {message}");
-    Ok(())
-}
-
-fn build_identifier(role: Role, executable: &Path, entitlements: &str) -> Result<String> {
-    let mut digest = Sha256::new();
-    let mut file = File::open(executable)?;
-    let mut bytes = [0; 8192];
-    loop {
-        let length = file.read(&mut bytes)?;
-        if length == 0 {
-            break;
-        }
-        digest.update(&bytes[..length]);
-    }
-    digest.update(entitlements.as_bytes());
-    let mut identifier = format!("is.alis.terrarium.worker.{}.", role.name());
-    for byte in digest.finalize() {
-        let _ = write!(identifier, "{byte:02x}");
-    }
-    Ok(identifier)
-}
-
-/// The macOS supervisor stays unsandboxed; each worker's signed entitlements carry its authority.
+/// The macOS supervisor stays unsandboxed; the trusted launcher applies each worker's Seatbelt profile before exec.
 pub fn restrict_role(_role: Role) -> Result<()> {
     Ok(())
 }
@@ -249,16 +205,43 @@ fn require_permission_denied<T>(result: std::io::Result<T>, operation: &str) -> 
     }
 }
 
-pub fn run_launcher_worker(
-    arguments: impl Iterator<Item = std::ffi::OsString>,
-) -> Result<ExitCode> {
+pub fn run_launcher_worker(arguments: impl Iterator<Item = OsString>) -> Result<ExitCode> {
+    let arguments: Vec<OsString> = arguments.collect();
+    if arguments == [OsString::from("--version")] {
+        println!("terra macOS sandbox {}", env!("CARGO_PKG_VERSION"));
+        return Ok(ExitCode::SUCCESS);
+    }
+    let [flag, separator, executable, worker_arguments @ ..] = arguments.as_slice() else {
+        anyhow::bail!(
+            "terra {} accepts --version or --macos-worker -- <executable> <arguments>",
+            super::LAUNCHER_WORKER_ARG
+        );
+    };
     ensure!(
-        arguments.eq([std::ffi::OsString::from("--version")]),
-        "terra {} accepts only --version",
+        flag == "--macos-worker" && separator == "--",
+        "terra {} needs --macos-worker -- before the worker executable",
         super::LAUNCHER_WORKER_ARG
     );
-    println!("terra macOS App Sandbox launcher v1 (host validation pending)");
-    Ok(ExitCode::SUCCESS)
+    ensure!(
+        std::env::var_os(MACOS_ROLE).is_none(),
+        "a sandbox worker cannot run the trusted launcher"
+    );
+    let spec_path = std::env::var_os(SPEC_ENV).context("the macOS sandbox spec is missing")?;
+    let spec: policy::WorkerSpec = crate::read_worker_spec(Path::new(&spec_path))?;
+    let executable = std::fs::canonicalize(executable)
+        .context("resolving the macOS sandbox worker executable")?;
+    let profile = policy::render_profile(spec.role, &executable, &spec.grants)?;
+    let mut worker = Command::new(&executable);
+    worker
+        .args(worker_arguments)
+        .env_remove(SPEC_ENV)
+        .env(MACOS_ROLE, spec.role.name())
+        .env(PROBE_ENV, &spec_path);
+    seatbelt::apply(&profile)?;
+    Err(anyhow::Error::new(worker.exec()).context(format!(
+        "starting {} under its macOS sandbox profile",
+        executable.display()
+    )))
 }
 
 #[cfg(test)]
@@ -273,7 +256,30 @@ mod tests {
     const TEST_ENDPOINT: &str = "TERRA_MACOS_TEST_ENDPOINT";
     const TEST_METADATA: &str = "TERRA_MACOS_TEST_METADATA";
     const TEST_SHARE_ROOT: &str = "TERRA_MACOS_TEST_SHARE_ROOT";
+    const TEST_SYMLINKED_SHARE: &str = "TERRA_MACOS_TEST_SYMLINKED_SHARE";
     const TEST_LISTENER_FD: i32 = 10;
+
+    #[allow(unsafe_code, reason = "Hypervisor.framework has no safe binding here")]
+    #[link(name = "Hypervisor", kind = "framework")]
+    unsafe extern "C" {
+        fn hv_vm_create(config: *mut std::ffi::c_void) -> i32;
+        fn hv_vm_destroy() -> i32;
+    }
+
+    /// Hypervisor.framework is not gated by Seatbelt: only the
+    /// `com.apple.security.hypervisor` entitlement decides, so the signed test
+    /// binary gets 0 under every profile.
+    #[allow(unsafe_code)]
+    fn hypervisor_vm_create_result() -> i32 {
+        // SAFETY: a null config requests the default VM; this process owns the
+        // single VM slot and destroys it again on success.
+        let result = unsafe { hv_vm_create(std::ptr::null_mut()) };
+        if result == 0 {
+            // SAFETY: the VM created above is still alive.
+            assert_eq!(unsafe { hv_vm_destroy() }, 0);
+        }
+        result
+    }
 
     #[test]
     fn direct_workers_require_no_sandbox_activation() -> Result<()> {
@@ -319,17 +325,143 @@ mod tests {
     }
 
     #[test]
+    fn activation_reports_a_worker_killed_before_its_ack() {
+        let message = failed_confirmation_message("kill -s KILL $$");
+        assert!(message.contains("killed by signal 9"), "{message}");
+    }
+
+    #[test]
+    fn activation_reports_a_worker_that_exits_before_its_ack() {
+        let message = failed_confirmation_message("exit 7");
+        assert!(message.contains("exited before verifying"), "{message}");
+    }
+
+    #[test]
+    fn launcher_requires_the_worker_separator() {
+        for arguments in [
+            vec!["x"],
+            vec!["--macos-worker"],
+            vec!["--macos-worker", "/bin/true"],
+        ] {
+            assert!(run_launcher_worker(arguments.into_iter().map(Into::into)).is_err());
+        }
+        let error = run_launcher_worker(
+            ["--macos-worker", "/bin/true", "x"]
+                .into_iter()
+                .map(Into::into),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("--macos-worker --"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn launcher_refuses_to_run_inside_a_worker() -> Result<()> {
+        const CHILD: &str = "TERRA_MACOS_LAUNCHER_REFUSAL_TEST";
+        if std::env::var_os(CHILD).is_some() {
+            let error = run_launcher_worker(
+                ["--macos-worker", "--", "/bin/true"]
+                    .into_iter()
+                    .map(Into::into),
+            )
+            .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("a sandbox worker cannot run the trusted launcher"),
+                "{error:#}"
+            );
+            return Ok(());
+        }
+        let output = Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "macos::tests::launcher_refuses_to_run_inside_a_worker",
+            ])
+            .env(CHILD, "1")
+            .env(MACOS_ROLE, "vm")
+            .output()?;
+        assert!(output.status.success(), "{output:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn seatbelt_rejects_a_malformed_profile() -> Result<()> {
+        const CHILD: &str = "TERRA_MACOS_SEATBELT_MALFORMED_TEST";
+        if std::env::var_os(CHILD).is_some() {
+            let error = seatbelt::apply(&policy::Profile {
+                text: "(version 1)(deny".into(),
+                parameters: vec![],
+            })
+            .unwrap_err();
+            assert!(
+                !format!("{error:#}").ends_with("no error message"),
+                "{error:#}"
+            );
+            return Ok(());
+        }
+        let output = Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "macos::tests::seatbelt_rejects_a_malformed_profile",
+            ])
+            .env(CHILD, "1")
+            .output()?;
+        assert!(output.status.success(), "{output:?}");
+        Ok(())
+    }
+
+    /// Runs `script` as a worker that never acknowledges. The worker must stay
+    /// unreaped after the failed confirmation, because spawn's cleanup signals
+    /// its raw PID.
+    fn failed_confirmation_message(script: &str) -> String {
+        let (activation, child_end) = UnixStream::pair().unwrap();
+        let child_stdin = child_end.try_clone().unwrap();
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", script])
+            .stdin(Stdio::from(OwnedFd::from(child_stdin)))
+            .spawn()
+            .unwrap();
+        let confinement = Confinement {
+            spec: tempfile::NamedTempFile::new().unwrap(),
+            inherited: File::from(OwnedFd::from(child_end)),
+            activation,
+        };
+        let error = confinement
+            .confirm(&mut child, Duration::from_secs(10))
+            .unwrap_err();
+        child
+            .wait()
+            .expect("a failed confirmation must leave the worker unreaped");
+        format!("{error:#}")
+    }
+
+    #[test]
     #[allow(unsafe_code)]
-    fn signed_worker_probe_child() -> Result<()> {
+    fn sandboxed_worker_probe_child() -> Result<()> {
         let Some(endpoint) = std::env::var_os(TEST_ENDPOINT) else {
             return Ok(());
         };
         let role = match std::env::var(MACOS_ROLE)?.as_str() {
             "vm" => Role::Vm,
             "network" => Role::Network,
-            value => anyhow::bail!("unexpected signed test role {value}"),
+            value => anyhow::bail!("unexpected sandboxed test role {value}"),
         };
         verify_worker_role(role)?;
+        require_permission_denied(
+            Command::new("/usr/bin/true").status(),
+            "executing a program the profile does not grant",
+        )?;
+        require_permission_denied(
+            Command::new(std::env::current_exe()?)
+                .arg("--list")
+                .status(),
+            "starting a child process",
+        )?;
+        ensure!(
+            hypervisor_vm_create_result() == 0,
+            "a profile cannot deny Hypervisor.framework to a worker with the entitlement"
+        );
         let address = endpoint
             .to_str()
             .context("invalid native test endpoint")?
@@ -339,6 +471,11 @@ mod tests {
             Role::Vm => {
                 require_permission_denied(connection, "connecting to the host test listener")?;
                 verify_share_access_and_socket_denial()?;
+                let symlinked = std::env::var_os(TEST_SYMLINKED_SHARE)
+                    .context("missing native test symlinked share")?;
+                terra_platform::filesystem::share::open_share_root(Path::new(&symlinked)).context(
+                    "opening the canonical path of a share granted by its symlinked spelling",
+                )?;
                 // SAFETY: the native acceptance parent prebinds and inherits this owned listener.
                 let listener = unsafe { UnixListener::from_raw_fd(TEST_LISTENER_FD) };
                 listener.set_nonblocking(true)?;
@@ -349,7 +486,20 @@ mod tests {
                 ensure!(&bytes == b"ipc", "inherited listener data was corrupted");
                 peer.write_all(b"ack")?;
             }
-            Role::Network => connection?.write_all(b"broker")?,
+            Role::Network => {
+                require_permission_denied(
+                    std::net::TcpListener::bind("127.0.0.1:0"),
+                    "creating a broker TCP listener",
+                )?;
+                std::net::UdpSocket::bind("0.0.0.0:0").context("binding a broker UDP socket")?;
+                let mut resolved = std::net::ToSocketAddrs::to_socket_addrs(&("localhost", 0))
+                    .context("resolving a name through the system resolver")?;
+                ensure!(
+                    resolved.next().is_some(),
+                    "name resolution returned no addresses"
+                );
+                connection?.write_all(b"broker")?;
+            }
             Role::Supervisor => unreachable!("the test has no supervisor child"),
         }
         require_permission_denied(
@@ -410,18 +560,28 @@ mod tests {
         Ok(endpoints)
     }
 
-    /// This check proves runtime App Sandbox activation, VM host-network
-    /// denial including Unix sockets inside shares, share opening without
-    /// ancestor read grants, broker connectivity,
-    /// inherited IPC, and read-only metadata.
-    /// A code signature by itself cannot pass the activation handshake.
+    /// Launching through the real terra executable, both roles must be
+    /// confined by their Seatbelt profile: host-file and program-exec denial,
+    /// VM host-network denial including Unix sockets inside shares, share
+    /// opening without ancestor read grants (also when the grant is spelled
+    /// through a symlink), broker TCP-listener denial with UDP still bound,
+    /// broker connectivity, inherited IPC, and read-only metadata. A launcher
+    /// that cannot apply its spec must fail the launch before the worker runs.
     #[test]
-    #[ignore = "requires native macOS App Sandbox and codesign"]
+    #[ignore = "requires native macOS and TERRA_BIN pointing to the newly built terra executable"]
     #[allow(
         clippy::too_many_lines,
-        reason = "both signed launches share the authority witnesses"
+        reason = "both sandboxed launches share the authority witnesses"
     )]
-    fn signed_workers_enforce_role_boundaries() -> Result<()> {
+    fn sandboxed_workers_enforce_role_boundaries() -> Result<()> {
+        let terra_bin = std::path::PathBuf::from(
+            std::env::var_os("TERRA_BIN")
+                .context("set TERRA_BIN to the native terra executable")?,
+        );
+        ensure!(
+            terra_bin.is_absolute(),
+            "TERRA_BIN must be an absolute path"
+        );
         let state = std::env::home_dir().unwrap().join(".terra");
         std::fs::create_dir_all(&state)?;
         let root = tempfile::tempdir_in(&state)?;
@@ -432,6 +592,11 @@ mod tests {
         listener.set_nonblocking(true)?;
         let share_root = root.path().join("shares");
         let share_sockets = bind_share_sockets(&share_root)?;
+        let symlinked_share = tempfile::tempdir()?;
+        ensure!(
+            std::fs::canonicalize(symlinked_share.path())? != symlinked_share.path(),
+            "TMPDIR must be a symlinked path such as /tmp or the default /var/folders/... to test symlinked shares"
+        );
         let executable = std::env::current_exe()?;
         for role in [Role::Vm, Role::Network] {
             let socket_path = root.path().join("agent.socket");
@@ -443,24 +608,32 @@ mod tests {
             command
                 .args([
                     "--exact",
-                    "macos::tests::signed_worker_probe_child",
+                    "macos::tests::sandboxed_worker_probe_child",
                     "--nocapture",
                 ])
                 .env(TEST_ENDPOINT, listener.local_addr()?.to_string())
                 .env(TEST_METADATA, &metadata)
-                .env(TEST_SHARE_ROOT, &share_root);
+                .env(TEST_SHARE_ROOT, &share_root)
+                .env(
+                    TEST_SYMLINKED_SHARE,
+                    std::fs::canonicalize(symlinked_share.path())?,
+                );
             let mut grants = vec![Grant::new(&executable, Access::ReadOnly)];
             if role == Role::Vm {
                 grants.push(Grant::new(&metadata, Access::ReadOnly));
                 grants.push(Grant::new(share_root.join("read-only"), Access::ReadOnly));
                 grants.push(Grant::new(share_root.join("writable"), Access::ReadWrite));
+                grants.push(Grant::new(symlinked_share.path(), Access::ReadOnly));
             }
-            let mut launch = prepare_launch(Launch {
-                role,
-                command,
-                grants,
-                staging_directory: &state,
-            })?;
+            let mut launch = prepare_launch_via(
+                Launch {
+                    role,
+                    command,
+                    grants,
+                    staging_directory: &state,
+                },
+                &terra_bin,
+            )?;
             launch.command.stdout(Stdio::piped()).stderr(Stdio::piped());
             let inherited_listener = if role == Role::Vm {
                 Some(terra_platform::process::pass_descriptor(
@@ -471,13 +644,10 @@ mod tests {
             } else {
                 None
             };
-            let SpawnedLaunch {
-                child, resources, ..
-            } = launch.spawn(Duration::from_secs(10))?;
+            let SpawnedLaunch { child, .. } = launch.spawn(Duration::from_secs(10))?;
             drop(inherited_listener);
             let output = child.wait_with_output()?;
             assert!(output.status.success(), "{role:?}: {output:?}");
-            drop(resources);
             match role {
                 Role::Vm => {
                     assert_matches!(
@@ -511,6 +681,33 @@ mod tests {
             );
         }
         assert_eq!(std::fs::read(&metadata)?, b"supervisor identity");
+
+        let mut command = Command::new(&executable);
+        command.args(["--exact", "macos::tests::sandboxed_worker_probe_child"]);
+        let mut launch = prepare_launch_via(
+            Launch {
+                role: Role::Network,
+                command,
+                grants: vec![Grant::new(&executable, Access::ReadOnly)],
+                staging_directory: &state,
+            },
+            &terra_bin,
+        )?;
+        std::fs::write(launch.confinement.spec.path(), b"{}")?;
+        let stderr_path = root.path().join("launcher.stderr");
+        launch.command.stderr(File::create(&stderr_path)?);
+        let started = std::time::Instant::now();
+        let Err(error) = launch.spawn(Duration::from_secs(30)) else {
+            panic!("a launcher with an unparsable spec must not confirm confinement");
+        };
+        assert!(started.elapsed() < Duration::from_secs(5), "{error:#}");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("exited before verifying confinement"),
+            "{message}"
+        );
+        let stderr = std::fs::read_to_string(&stderr_path)?;
+        assert!(stderr.contains("missing field"), "{stderr}");
         Ok(())
     }
 }

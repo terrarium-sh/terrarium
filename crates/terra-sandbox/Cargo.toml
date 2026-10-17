@@ -14,7 +14,6 @@ log = "0.4.34"
 rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2 = { version = "0.11", default-features = false }
 socket2 = "0.6"
 tempfile.workspace = true
 

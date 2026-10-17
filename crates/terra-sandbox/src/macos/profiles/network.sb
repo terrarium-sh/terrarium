@@ -1,0 +1,6 @@
+; getaddrinfo resolves names through mDNSResponder.
+(system-network)
+(allow network-outbound (remote ip))
+(allow network-inbound (local ip))
+(allow network-bind (local udp))
+(allow system-socket)
