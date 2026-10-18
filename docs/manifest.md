@@ -1,7 +1,7 @@
 # Project manifest
 
-`terra.yaml` gives a project stable names for its recipes. Commit it when a
-project has more than one useful box, so each clone uses the same names.
+`terra.yaml` names a project's boxes and points each name at a recipe. Commit
+it so every clone uses the same names.
 
 ```yaml
 boxes:
@@ -9,10 +9,9 @@ boxes:
   ci: ./ci.yaml
 ```
 
-Each value is a recipe path, never an inline recipe. Relative paths resolve
-from the project directory, and `~` expands for the current user. With one
-manifest entry, `terra setup` can choose it without a box name; with several,
-specify one:
+Each value is a path to a recipe file, never an inline recipe. Paths are
+relative to the project directory, and `~` means your own home. With one entry,
+`terra setup` picks it without a box name; with several, name the box:
 
 ```sh
 terra dev setup
@@ -20,15 +19,13 @@ terra ci setup --dry-run
 terra dev
 ```
 
-Setup reads the manifest and pins the referenced recipe. Later boots use the
-pinned copy, so changing either file has no effect until `terra <box> setup`
-runs again. `terra <box> show` displays the pinned recipe and notes if the
-manifest now points elsewhere.
+Setup pins a copy of the recipe in the box, and boots use that copy. Editing
+the manifest or the recipe changes nothing until you run `terra <box> setup`
+again. `terra <box> show` prints the pinned recipe and says when the manifest
+now points elsewhere.
 
-Prefer keeping the manifest and its recipes outside guest-writable shares.
-Terra asks before pinning a recipe when current pins indicate that a guest
-could have written the recipe or manifest; in noninteractive use, review both
-and pass `--trust-recipe`. Removed shares are not tracked, so this warning
-cannot identify every guest-written file. See
-[recipe storage and trust](security.md#recipe-storage) before granting mounts
-or network access.
+Keep the manifest and its recipes out of writable shares, because the guest
+could edit them. Terra asks before pinning a recipe a guest could have written;
+without a terminal, review both files and pass `--trust-recipe`. Terra checks
+only current shares, so files left by a removed share get no warning. See
+[where recipes live](security.md#where-recipes-live).

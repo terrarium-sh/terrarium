@@ -10,6 +10,35 @@ its process layout:
 - [macOS](sandboxing-macos.md): Seatbelt profiles applied by a trusted launcher.
 - [Windows](sandboxing-windows.md): Less-Privileged AppContainers and jobs.
 
+## Strictness per platform
+
+What an attacker gets after compromising a worker's native code.
+
+| | Linux | macOS | Windows |
+| --- | --- | --- | --- |
+| **Mechanism** | Namespaces + seccomp | Seatbelt profile | Less-Privileged AppContainer + job |
+| **Syscall filter** | Generated allowlist per role | None | Win32k calls blocked |
+| **Supervisor** | Seccomp-filtered | Unconfined | Unconfined |
+| ***VM worker can…*** | | | |
+| Reach the network | No: own network namespace | No | No |
+| Read files beyond its grants | No | Apple's `system.sb` baseline | System files open to all AppContainers |
+| Start another program | No: no `execve` | No | No: job allows no children |
+| ***Broker can…*** | | | |
+| Connect out | Any address, host loopback included | Any address, host loopback included | Any address, through its wrapper |
+| Open a TCP listener | No | No | No |
+| Read files | Resolver files only | Resolver files only | Its own executable only |
+| Create a VM | No: no `/dev` | **Yes**: shares the hypervisor entitlement | No: no hypervisor capability |
+| Memory cap | None | None | 512 MiB commit |
+
+Linux is the strictest: every role, the supervisor included, runs under a
+syscall allowlist. The supervisor never handles guest RAM or packets, so leaving
+it unconfined on macOS and Windows matters only if a worker escapes first.
+Windows adds a job and exploit mitigations but filters no syscalls. macOS rests on a single Seatbelt profile per worker, built on a
+private, deprecated Apple interface. On every platform a compromised broker
+keeps outbound network access, so use a host firewall when that matters.
+Native validation on macOS and Windows is still pending; see
+[todo.md](todo.md).
+
 ## Processes
 
 Every platform runs the same processes; only the confinement around the two
@@ -37,7 +66,7 @@ Socket descriptors never cross the VM-to-broker channel: the VM receives bounded
 and opaque resource handles, and the broker authorizes every operation even if
 the VM's frontend is compromised. A compromised broker still holds whatever
 network access its OS sandbox allows; see
-[network policy limits](security.md#network-policy-limits). Local-only boxes
+[network policy limits](security.md#network). Local-only boxes
 (`network.enabled: false`) run no broker.
 
 The supervisor binds every published listener on host loopback before it starts

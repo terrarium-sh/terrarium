@@ -1,8 +1,7 @@
 # Using Terra
 
-`terra` manages a box in the current project. Its command shape is
-`terra [BOX] [VERB]`: put the box name before the verb. When the project has
-one box, the name is optional.
+`terra` manages the boxes of the project in the current directory. Put the box
+name before the verb: `terra [BOX] [VERB]`. With one box, the name is optional.
 
 ```sh
 terra dev setup
@@ -13,119 +12,79 @@ terra dev stop
 ```
 
 `BOX` is a name from `terra.yaml`, an existing box, or a recipe path such as
-`./ci.yaml`; a recipe path names the box from its filename. See
+`./ci.yaml`, which names the box after the file. See
 [the manifest reference](manifest.md) and [the recipe reference](recipe.md).
+Every command accepts `--project DIR` to work on another project.
 
 ## Primary uses
 
-Terra is built around two uses. They are where it starts, not its limit: a box
-fits any workload that needs a clear boundary.
+Terra is built around two uses, but any workload that needs a clear boundary
+fits in a box.
 
 ### A terrarium for agents
 
 Give a long-lived agent a box of its own. The root filesystem and volumes
-persist across restarts, so its tools and state stay put. Make the agent the
-recipe's [workload](recipe.md#processes), share only the directories it should
-touch, or none and hand files over with `terra <box> sync`, and
-[allow](recipe.md#network) only the destinations it needs.
+survive restarts, so its tools and state stay put.
+
+1. Make the agent the recipe's [workload](recipe.md#processes).
+2. Share only the directories it should touch, or none, and hand files over
+   with `terra <box> sync`.
+3. [Allow](recipe.md#network) only the destinations it needs.
+
 `terra <box> logs --diagnostics` shows hook output and network denials. To keep
-the agent running across host restarts, run the box under the
+the agent running across host restarts, use the
 [systemd unit](../packaging/README.md#running-terra-under-systemd).
 
 ### A dev VM for your harness
 
-Run Claude Code, Codex, or your own tooling against a project without handing
-it your host. [Mount](recipe.md#mounts-and-environment) the project, mark
-anything the harness only reads `readonly`, and allow the registries and APIs
-it calls. Work interactively: detach with `Ctrl-\`, rejoin with `terra dev`,
-and run one-off commands with `terra dev exec`. The
-[quickstart](../README.md#quickstart) builds this shape.
+Run Claude Code, Codex or your own tooling against a project without handing it
+your host. [Mount](recipe.md#mounts) the project, mark anything the harness only
+reads `readonly`, and allow the registries and APIs it calls. Detach with
+`Ctrl-\`, rejoin with `terra dev`, and run one-off commands with
+`terra dev exec`. The [quickstart](../README.md#quickstart) builds this setup.
 
 ## Installation options
 
 Use the [quickstart installers](../README.md#quickstart) or
-[build from source](../README.dev.md) with the pinned Rust toolchains.
-See [platform requirements](../packaging/README.md) before installing.
+[build from source](../README.dev.md). Check the
+[platform requirements](../packaging/README.md) first.
 
-The installer verifies the release checksum and also verifies its GitHub
-attestation when the GitHub CLI is installed. Re-run the installer to upgrade.
-On Linux and macOS, pin a version with `TERRA_VERSION=x.y.z sh install.sh`, or
-use `sh install.sh --prerelease` to include prereleases. On Windows, pass
-`-Version x.y.z` or `-Prerelease` to `install.ps1`.
+The installer verifies the release checksum, and its GitHub attestation when the
+GitHub CLI is installed. Run it again to upgrade.
 
-On Windows, `install.ps1` installs `terra.exe` to
-`%LOCALAPPDATA%\Programs\terra` and adds that directory to the user `PATH`.
-Open a new terminal afterwards. The installer accepts `-Prerelease` and honors
-`$env:TERRA_VERSION`.
+| | Linux and macOS | Windows |
+| --- | --- | --- |
+| Pin a version | `TERRA_VERSION=x.y.z sh install.sh` | `install.ps1 -Version x.y.z` or `$env:TERRA_VERSION` |
+| Include prereleases | `sh install.sh --prerelease` | `install.ps1 -Prerelease` |
 
-To verify a downloaded release archive's attestation, use its filename:
+On Windows, `terra.exe` goes to `%LOCALAPPDATA%\Programs\terra`, which the
+installer adds to your `PATH`; open a new terminal afterwards.
+
+To verify a downloaded archive yourself:
 
 ```sh
 gh attestation verify terra-x86_64-linux.tar.gz --repo terrarium-sh/terrarium
 ```
 
-Linux binaries carry their seccomp allowlists compiled in, so there is no
-separate policy to install. See [host sandbox policy](sandbox-policy.md).
-
-## List boxes
-
-`terra ls` lists the current project's boxes; `--all` includes boxes stored
-across projects. Filter by `--state` and use `-q` (`--quiet`) for one box name
-per line:
-
-```sh
-terra ls --state running --quiet
-terra ls --state stopped,not_created
-terra ls --all --state running --json
-```
-
-States are `running`, `setting_up`, `stopped`, `not_created`, and `gone`.
-Repeat `--state` or separate states with commas to match any of them. Filters
-work with every output format, including `--json` and `--tsv`. An empty match
-succeeds with no entries (`[]` for JSON). Quiet output cannot be combined with
-JSON or TSV; with `--all`, the same name can appear in multiple projects, so
-use JSON or TSV when you also need project paths. `terra ps` is an alias for
-`terra ls`.
-
 ## Set up and start
 
-`terra <box> setup` reads the recipe, asks for approval when required, pins it,
-creates storage, and runs `on_create`. Re-run it after changing the recipe.
-Use `--dry-run` in automation to validate setup without changes. A
-noninteractive setup of a recipe that a guest might have written requires
-`--trust-recipe` after review.
+`terra <box> setup` reads the recipe, asks for approval when needed, pins it,
+creates storage and runs `on_create`. Run it again after changing the recipe.
+`--dry-run` checks the recipe without changing anything. Without a terminal, a
+recipe a guest might have written needs `--trust-recipe` after you review it.
 
-`terra <box>` starts a stopped box or attaches to an already-running box. It
-starts the recipe's workload unless `-- CMD…` supplies one command for that
-boot. `--root` runs that boot's workload and daemons as guest root. Use `-d` to start
-headless; `--foreground` is for a service manager that owns the VM process.
-On every platform, the VM runs in a separate child process. With `--foreground`,
-the VM terminates when the parent command exits.
-A noninteractive start needs `-d` or `--foreground`.
+`terra <box>` starts the box, or attaches if it is already running. It runs the
+recipe's workload, or the command after `--` for that boot only.
+
+- `--root` runs that boot's workload and daemons as guest root.
+- `-d` starts the box in the background.
+- `--foreground` is for a service manager: the VM stops when the command exits.
+
+Without a terminal, a start needs `-d` or `--foreground`.
 
 The workload has one shared session. Press `Ctrl-\` to detach without stopping
-it, then run `terra <box>` to join again. `terra <box> sessions` lists attached
-clients, and `terra <box> detach ID` or `--all` removes them.
-
-## Network access
-
-Recipes grant external destinations through `network.allow` and publish guest
-services through `network.ports` (TCP by default, `/udp` for UDP). Guest localhost and guest-local routes stay
-inside the guest. `network.enabled: false` keeps local networking and agent
-commands available while omitting the host broker and external connections.
-See [the recipe reference](recipe.md#network) for configuration and
-[the security model](security.md#network-policy-limits) for enforcement limits.
-
-## Kernel updates
-
-Each boot uses the guest kernel bundled with the `terra` binary that starts
-the box. After upgrading Terra, run `terra <box> stop`, then `terra <box>` to
-use that release's kernel. Existing boxes do not need rebuilding. Attaching
-to a running box leaves its kernel unchanged.
-
-The kernel and read-only boot disk are decompressed directly into memory on
-each boot, without disk files or a cache. Using the latest Terra release gives you the kernel shipped with that
-release; guest package updates do not change the kernel Terra boots.
+it and `terra <box>` to rejoin. `terra <box> sessions` lists attached clients;
+`terra <box> detach ID` or `--all` disconnects them.
 
 ## Work with a running box
 
@@ -137,84 +96,99 @@ terra dev sync :/app/output/ ./output/
 terra dev logs -f
 ```
 
-`exec` and `sync` require a running box. `exec` runs separately from the
-workload; use `--root` only for that command. `sync` synchronizes files and
-directories between the host and the guest (`box:/path` or `:/path`).
-`logs` contains Terra diagnostics; attach to the box for workload output.
-Guest VM diagnostics are written to `diagnostics.log`, replayed after a failed
-boot, and available through `terra <box> logs --diagnostics`.
+- `exec` runs a command beside the workload; `--root` applies to that command
+  only.
+- `logs` shows Terra's host diagnostics, and `--diagnostics` the guest's. Both
+  are replayed after a failed boot. Workload output goes to the session.
+- `show` prints the pinned recipe. Environment values stay hidden unless you
+  pass `--with-env-values`.
 
-Sync is one-way. `box:` and `:` both refer to the selected box. A source
-folder ending in `/` copies its contents; without `/`, an existing destination
-directory receives a subdirectory with the source's name. Missing sources fail.
+### Sync files
 
-By default, sync skips files with equal size and modification time (compared at
-microsecond precision). `--checksum` reads same-size files on both sides and
-compares SHA-256 instead; matching contents need no transfer. `--delete` removes
-extras only inside the selected destination subtree, after successful transfers.
-File-to-directory and directory-to-file conflicts still fail with `--delete`;
-remove the conflicting destination entry before retrying.
-`--dry-run` previews these actions without copying, replacing, or deleting
-destination entries. Download validation still creates temporary name probes.
+`sync` copies one way between the host and a running box. `box:/path` and
+`:/path` both mean a path in the selected box.
 
-Sync preserves modification times and supported permission bits. A Windows host
-stores only the read-only attribute, so, as in a mount, its files and directories
-sync to the guest as `0755`, or `0555` when read-only. It copies
-symlinks without following them; downloaded links must resolve within the
-synchronized tree. Special files and non-UTF-8 tree names are rejected. A failed
-transfer preserves that file's previous destination, but a tree sync is not a
-transaction: completed earlier changes remain. Retry with a quiet source if files
-change during scanning or transfer. After upgrading from an older agent protocol,
-stop and restart the box before syncing.
+- A source folder ending in `/` copies its contents; without `/`, it lands as a
+  subfolder of the destination.
+- Files with the same size and modification time are skipped. `--checksum`
+  compares SHA-256 contents instead.
+- `--delete` removes destination files the source lacks, inside the destination
+  folder only.
+- `--dry-run` shows what would change without changing it.
 
-Links inside the synchronized tree are copied as links, never traversed as
-directories. A selected root that is itself a symlink is treated as a link;
-use its target path to synchronize the directory's contents. Parents above
-the selected root resolve normally. Unicode filenames are supported. Before a
-download, temporary name-only entries on the destination filesystem check for
-collisions between incoming and existing names and resolve aliases in symlink
-chains. Distinct spellings that identify the same destination entry are rejected;
-rename one before syncing. Case-sensitive filesystems can retain distinct names.
+Sync keeps modification times and permission bits. Windows hosts keep only the
+read-only attribute, so their files arrive as `0755`, or `0555` when read-only.
+Symlinks are copied as links, never followed, and downloaded links must point
+inside the synced tree. A source that is itself a symlink is copied as a link;
+give its target path to sync the folder. Special files and non-UTF-8 names are refused.
 
-Name probes require writable destination directories, even for a dry run. Missing
-directories are modeled under an existing ancestor. Probes are removed and parent
-modification times restored before transfers begin; filesystem change events and
-change times may still reflect the probes. Directories whose comparison settings
-are not inherited by the probes are rejected. Windows additionally rejects device
-names, invalid filename characters, trailing dots or spaces, and names or link
-targets containing `~`, because DOS short-name aliases cannot be reproduced
-reliably in a temporary directory.
+Sync is not a transaction: a failed file keeps its old copy, but files already
+synced stay changed. Keep the source and the host destination still while a
+sync runs, including through a writable share. Sync refuses:
 
-Metadata-only downloads to files with multiple hard links fail; replace the
-destination file with an independent copy before retrying. Keep the host
-destination quiet during a download, including any guest-writable share of it.
+- names that would collide on the destination, such as two spellings that a
+  case-insensitive filesystem treats as one.
+- a folder replacing a file or the reverse, even with `--delete`. Remove the
+  destination entry first.
+- metadata-only updates to a file with several hard links. Replace it with an
+  independent copy first.
+- on Windows, device names, invalid characters, trailing dots or spaces, and
+  names or link targets containing `~`.
 
-`terra <box> show` prints the effective pinned recipe for review. Environment
-values stay redacted unless `--with-env-values` is passed.
+Downloads need a writable destination folder, even for `--dry-run`, because
+Terra briefly creates and removes test names there to detect collisions.
 
-## Stop, storage, and removal
+## Network access
 
-`terra <box> stop` requests an orderly shutdown, including `pre_stop`.
-`terra <box> rm` removes guest storage, logs, and sockets but keeps the pinned
-recipe. Add `--purge` to remove the recipe too. `--force` can remove a running
-box after attempting a graceful stop.
+`network.allow` grants external destinations and `network.ports` publishes
+guest services on host loopback. Guest localhost and guest-local routes stay
+inside the guest. `network.enabled: false` turns off external networking while
+Terra commands keep working. See [the recipe reference](recipe.md#network) and
+[the security model](security.md#network).
 
-Box state lives under `~/.terra/box/t-<project-slug>/<box>/`, where the slug is
-a stable base32 hash of the project path. The memory-backed boot disk contains
-the guest agent and resize helper bundled with the Terra binary. `terra ls` lists boxes in the current project, and
-`terra ls --all` lists every local project. `terra <box> storage show` inspects
-the root filesystem and volumes; `export`, `import`, and `prune` manage images.
-Export and import require a stopped box and the same recipe.
-`host.pid` in that box directory holds the host-visible VM PID and start
-identity for stop and liveness checks. The box supervisor writes it, and a
-sandboxed VM sees it read-only.
+## List boxes
 
-The root filesystem and volumes use discard/TRIM to return freed guest blocks
-to the host automatically. Their configured capacity stays the same; physical
-space is reclaimed where the host filesystem supports sparse holes, at its
-allocation granularity. Deletions made before discard was enabled need a guest
-`fstrim` to reclaim their space.
+`terra ls` (or `terra ps`) lists the project's boxes; `--all` lists every
+project's.
 
-Every command accepts `--project DIR` to operate on another project. Read the
-[security model](security.md) before using mounts, public network access, or
-guest-provided files on the host.
+```sh
+terra ls --state running --quiet
+terra ls --state stopped,not_created
+terra ls --all --state running --json
+```
+
+- States are `running`, `setting_up`, `stopped`, `not_created` and `gone`.
+  Repeat `--state` or join states with commas to match any of them.
+- Filters work with every format, including `--json` and `--tsv`. No match
+  prints nothing, or `[]` for JSON.
+- `-q` (`--quiet`) prints one name per line and cannot be combined with JSON or
+  TSV. With `--all`, names can repeat across projects; use JSON or TSV to see
+  each project's path.
+
+## Upgrade
+
+Each boot uses the guest kernel and agent bundled with the `terra` that starts
+the box. After upgrading Terra, stop and start each running box to move it to
+the new release; `sync` needs this when the agent protocol changed. Existing
+boxes do not need rebuilding, and attaching to a running box changes nothing.
+Guest package updates never change the kernel.
+
+## Stop, storage and removal
+
+- `terra <box> stop` shuts the box down in order, running `pre_stop`.
+- `terra <box> rm` removes the box's storage, logs and sockets but keeps its
+  pinned recipe; `--purge` removes that too. `--force` removes a running box
+  after trying a graceful stop.
+- `terra <box> storage show` lists the root filesystem and volumes. `export`
+  writes the images to a file and `import` loads one back, into a stopped box
+  with the same recipe. `prune` deletes images the recipe no longer names.
+
+Box state lives under `~/.terra/box/t-<project-slug>/<box>/`; the slug is a
+stable hash of the project path.
+
+Disk images are sparse: deleting files in the box gives the space back to the
+host, while the guest keeps its full configured capacity. This needs a host
+filesystem that supports sparse files.
+
+Read the [security model](security.md) before using mounts, public network
+access, or files from a guest on the host.

@@ -106,7 +106,7 @@ terra                    # open a shell in the box at /work
 
 > [!IMPORTANT]
 > The box can edit your project folder, and that includes `dev.yaml`. Check the
-> recipe before you run `setup` again. See [recipe trust](docs/security.md#recipe-storage).
+> recipe before you run `setup` again. See [recipe trust](docs/security.md#where-recipes-live).
 
 To change tools, access or the workload, see the [recipe reference](docs/recipe.md).
 
@@ -123,6 +123,9 @@ To change tools, access or the workload, see the [recipe reference](docs/recipe.
   macOS, and Less-Privileged AppContainers on Windows.
 - **No daemon, nothing extra to install.** The guest kernel, base system and VM
   parts are built into `terra`.
+- **One narrow path, less to trust.** Every box boots the same kernel and the
+  same Alpine release, built for your machine's CPU. There are no OCI images,
+  registries or architecture matrix to configure, or to get wrong.
 - **Your work stays put.** Detach and rejoin, run commands, or sync files without
   rebuilding. The box's storage persists across restarts.
 

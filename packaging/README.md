@@ -36,22 +36,21 @@ the first one's workload had been writing to.
 
 ## What terra needs from the environment
 
-These are the requirements the unit satisfies. Additional restrictions must
-permit the configured workload.
+The unit keeps terra's needs and leaves confinement to terra itself, which runs
+its VM worker and network broker under Bubblewrap and seccomp.
 
 | Requirement | Why | Unit knob |
 |---|---|---|
-| `/dev/kvm` read-write | the native VMM runs on KVM | `SupplementaryGroups=kvm`, `DeviceAllow=/dev/kvm rw`, no `PrivateDevices` |
-| Executable mappings | loading embedded AOT components | `MemoryDenyWriteExecute=no` |
-| Real host network | The network broker opens policy-authorized host sockets in the host network namespace | no `PrivateNetwork`; IP filtering must permit configured destinations |
-| Writable `$HOME/.terra` | persistent box state | `StateDirectory=terra` + `Environment=HOME=%S/terra` |
-| A recipe to boot | `~/.terra/%i.yaml`, read by the `ExecStartPre` setup | yours to install; see below |
+| `/dev/kvm` read-write | the VM runs on KVM | `SupplementaryGroups=kvm` |
+| Unprivileged user namespaces and `mount` | Bubblewrap builds each worker's sandbox | no `RestrictNamespaces`, no `SystemCallFilter` |
+| `AF_NETLINK` | the supervisor reads the host's interface addresses | no `RestrictAddressFamilies` |
+| Host network | the broker opens host sockets | no `PrivateNetwork` |
+| Writable `$HOME/.terra` | box state | `StateDirectory=terra` + `Environment=HOME=%S/terra` |
+| A recipe to boot | `~/.terra/%i.yaml`, read by `ExecStartPre` | yours to install; see below |
 
-The runtime needs no host namespace privileges. Host-directory mounts use the
-paths granted by the recipe. Run the service as the unprivileged `terra` user with KVM
-access; host-root execution is refused unless `TERRA_ALLOW_ROOT=1` is set.
-Root-managed service filtering can enforce network restrictions independently
-of recipe policy; see [network policy limits](../docs/security.md#network-policy-limits).
+Run the service as the unprivileged `terra` user; terra refuses host root unless
+`TERRA_ALLOW_ROOT=1` is set. A host firewall can restrict the broker
+independently of recipe policy; see [network](../docs/security.md#network).
 
 ## One-time host setup
 

@@ -200,10 +200,10 @@ packaged kernel and boot images carry ABI markers checked before boot.
 - **QUIC compatibility:** external UDP accepts the options QUIC stacks set, as
   documented no-ops where the host cannot honor them: DF/MTU discovery
   (`IP_MTU_DISCOVER`, `IPV6_DONTFRAG`), ECN (`IP_RECVTOS`, `IP_TOS` and their IPv6
-  forms, with markings dropped), `UDP_GRO` (never coalesces) and `SO_BROADCAST`.
-  `UDP_SEGMENT` (GSO) splits a send into separate datagrams of at most 4096 bytes
-  and 64 segments, written atomically; a burst larger than the 48-KiB carrier
-  credit returns `EMSGSIZE`. `sendmsg` accepts ECN, `UDP_SEGMENT` and same-source
+  forms, with markings dropped) and `SO_BROADCAST`. Each datagram carries at
+  most 4096 bytes. `UDP_SEGMENT` (GSO) sends up to 64 such segments in one
+  atomic run; a run larger than the carrier's credit returns `EMSGSIZE`.
+  `UDP_GRO` coalesces received runs and reports their segment size. `sendmsg` accepts ECN, `UDP_SEGMENT` and same-source
   `PKTINFO` control messages; others return `EOPNOTSUPP`. With DF a no-op, the
   host may fragment a PMTU probe, so QUIC can choose a larger MTU than the path's.
 - **Control:** the agent sends Hello and waits for Ready before configuring DNS.
@@ -225,8 +225,9 @@ Queued-payload budgets per stream:
 | Control | 32 KiB | 128 KiB |
 | Each TCP/UDP/publication stream | 48 KiB | 80 KiB |
 
-The 1024 flows' allowances total 128 MiB inside the frontend's 200-MiB Wasm
-memory limit. Guest UDP sockets keep a 64-KiB carrier window and a decoded queue
+The 1024 flows' allowances total 128 MiB inside the frontend's 216-MiB Wasm
+memory floor, which applies whatever `components.memory_mib` says.
+Local-only boxes use the ordinary component limit. Guest UDP sockets keep a 64-KiB carrier window and a decoded queue
 of at most 48 datagrams. The broker allows 64 MiB of buffered bytes and 2048
 resources. Idle reads, accepts and terminal-error waits have a separate bounded
 allowance; active requests retain 240 slots and DNS retains 16. Frame queues
@@ -252,6 +253,37 @@ readiness retains its nonzero exit code, including `128 + signal` on Unix.
 Boot failures replay bounded host and guest log tails, explicitly noting empty
 guest diagnostics. Native KVM failures include the vCPU and operation or hardware
 exit reason, even if the guest agent never runs.
+
+`host.pid` in the box directory holds the VM's host PID and start identity for
+stop and liveness checks; the supervisor writes it, and the sandboxed VM sees it
+read-only.
+
+## Shared mounts
+
+Each mount runs up to 32 filesystem requests at once and queues up to 256,
+counting reads, writes, flushes and metadata calls individually; requests on
+one file run in order. Event resolution keeps one reserved slot, and
+cancellation bypasses the queue through reserved virtio-fs ring capacity. Each
+mount has its own runtime with at most 33 blocking threads, so a stalled mount
+does not starve other mounts or disks. Descriptor cleanup runs off the worker
+and holds its reservation until it finishes; teardown waits at most one second
+for remaining tasks.
+
+Host edits do not invalidate pages the guest has mapped. On macOS, objects the
+guest cannot read are tracked by a parent-relative reference; a host rename or
+delete makes it return not-found until the guest looks it up again.
+
+## Sync
+
+Sync compares modification times at microsecond precision. Before a download,
+it creates temporary name-only entries in the destination to find collisions
+between incoming and existing names and to resolve aliases in symlink chains;
+missing directories are modeled under their nearest existing ancestor. Probes
+are removed and parent modification times restored before transfers begin, but
+file events and change times can still show them. Directories whose comparison
+settings the probes would not inherit are refused. Windows refuses names and
+link targets containing `~` because DOS short-name aliases cannot be reproduced
+in a temporary directory.
 
 ## Guest kernel and images
 
@@ -312,6 +344,9 @@ Each boot selects the payloads bundled with the binary starting the box, so
 upgrading Terra and stopping/starting an existing box updates its kernel and
 boot disk without rebuilding its root filesystem.
 
+On x86_64, guest RAM skips the device region from 3.25 GiB to 4 GiB, where
+virtio devices and interrupt controllers sit, and continues above 4 GiB.
+`hw.mem_mib` counts mapped RAM only; Linux reserves some of it for boot data.
 Guest RAM is demand-backed and Linux reports free pages through the memory
 component for native discard. Guest capacity stays fixed; host RSS includes
 runtime overhead and reclaim is asynchronous. The kernel command line uses

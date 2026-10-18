@@ -1,113 +1,39 @@
-# Templated terra sandbox unit (podman-style).
-#   systemctl start terra@pi-dev   ->   the recipe ~/.terra/pi-dev.yaml (HOME below)
-# The instance name (%i) names the recipe file; the box takes the file's stem
-# for its name, so both are %i.
-#
-# Install: cp packaging/terra@.service /etc/systemd/system/ && systemctl daemon-reload
-# See packaging/README.md for the one-time host setup (user + /dev/kvm access).
+# terra box as a service: `systemctl start terra@pi-dev` sets up and boots the
+# recipe /var/lib/terra/.terra/pi-dev.yaml as box `pi-dev`.
+# Install and host setup: packaging/README.md.
 
 [Unit]
-Description=terra microVM sandbox (%i)
+Description=terra box (%i)
 Documentation=https://github.com/terrarium-sh/terrarium
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=exec
-# Two steps, because the box they name is different: only `setup` takes a recipe
-# *path*, and a boot takes a box *name* (it runs what setup pinned, which is the
-# point — a boot never re-reads a file somebody could have edited underneath it).
-#
-# Setting up on every start is deliberate: the unit is declarative, so each
-# restart re-reads the recipe and re-pins it, which is what makes editing that
-# file and restarting the service mean something. Re-running it on an unchanged
-# recipe pins nothing and re-bakes nothing.
-#
-# --trust-recipe is deliberate and is *not* a blanket "yes". terra only asks
-# about a recipe that lies inside a directory some box shares read-write, and a
-# recipe under ~/.terra is not one — the mount guard refuses any share containing
-# terra's own directory outright. Keeping recipes there rather than in the box's
-# project directory (which a recipe commonly shares) is what makes that true. So
-# this flag changes nothing for the intended layout; it is here because a unit
-# has no terminal to be asked on, and the alternative is a service that fails to
-# start the day someone points %i at a recipe inside a share. If you do that,
-# read the recipe first: this line is the reading.
+# Setup on every start re-pins an edited recipe; an unchanged one is a no-op.
+# --trust-recipe is safe because no box can share ~/.terra, where the recipe lives.
 ExecStartPre=/usr/local/bin/terra %S/terra/.terra/%i.yaml setup --trust-recipe
-# The foreground CLI owns the worker and forwards stop signals; both stay in the service cgroup.
 ExecStart=/usr/local/bin/terra %i --foreground
 
-# --- Identity -------------------------------------------------------------
 User=terra
 Group=terra
 SupplementaryGroups=kvm
 
-# --- State ----------------------------------------------------------------
-# HOME is pinned to the managed state directory so box state stays there
-# regardless of the account's passwd home.
-#
-# A box lives at ~/.terra/box/<slug of its project directory>/<name>, so what
-# WorkingDirectory decides is the *slug*. This unit is a template, so `terra@a`
-# and `terra@b` must be different sandboxes; with a shared WorkingDirectory they
-# would share a slug, and a box is one (slug, name) pair — so the second instance
-# would rewrite the first one's recipe and then boot the filesystem its workload
-# had been writing to. %i is what keeps them apart.
 StateDirectory=terra terra/%i
-# 0700, not systemd's 0755 default. terra makes ~/.terra and each box's directory
-# owner-only itself, so nothing secret is directly exposed either way — but the
-# directory holding them has no reason to be traversable by every account on the
-# host, and this is where the recipes and guest images live.
 StateDirectoryMode=0700
 Environment=HOME=%S/terra
+# A box is keyed by its project directory, so a shared one would make every
+# instance the same box.
 WorkingDirectory=%S/terra/%i
-# terra needs no external tools at run time; PATH is here for the unit's own use.
-Environment=PATH=/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin
 
-# --- Lifecycle ------------------------------------------------------------
-# SIGTERM triggers an orderly guest shutdown: terra signals the guest over the
-# control connection, which stops the workload (SIGTERM, then SIGKILL after a
-# grace period) and runs the recipe's pre_stop hooks before the VM exits.
-# TimeoutStopSec bounds that; after it systemd sends SIGKILL, which still leaves
-# no orphan worker in the service cgroup.
-KillSignal=SIGTERM
 TimeoutStopSec=65
 Restart=on-failure
 RestartSec=2
 
-# --- Hard requirements (do NOT tighten these away) ------------------------
-# PrivateDevices=yes would hide /dev/kvm.
-DeviceAllow=/dev/kvm rw
-DevicePolicy=closed
-# Embedded Wasmtime AOT code requires executable mappings.
-MemoryDenyWriteExecute=no
-# The egress proxy opens host sockets, so PrivateNetwork must stay off.
-PrivateNetwork=false
-
-# --- Optional hardening (safe additions) ----------------------------------
-# Local IPC uses AF_UNIX; the confined network broker uses INET/INET6.
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-CapabilityBoundingSet=
-LockPersonality=true
-ProtectHostname=true
-ProtectKernelTunables=true
-ProtectKernelModules=true
-RestrictSUIDSGID=true
-RemoveIPC=true
-UMask=0077
-RestrictNamespaces=true
+# terra confines its own workers with Bubblewrap and seccomp. Do not add
+# RestrictNamespaces, SystemCallFilter or RestrictAddressFamilies: each one
+# stops the VM worker or the network broker from starting.
 NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-# terra keeps its state under %S/terra, nothing in /tmp — so a private /tmp costs
-# nothing and takes the shared one off the map.
-PrivateTmp=true
-ReadWritePaths=%S/terra
-ProtectControlGroups=true
-ProtectKernelLogs=true
-ProtectClock=true
-# The two below are the ones to drop first if a boot misbehaves under a future
-# systemd: they filter syscalls rather than files, which KVM exercises widest.
-SystemCallFilter=@system-service
-SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target

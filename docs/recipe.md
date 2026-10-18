@@ -1,17 +1,16 @@
 # Recipe reference
 
-A recipe is the YAML policy for one box: its resources, host access, network,
-and workload. `terra setup` pins a copy in the box. Edit the source recipe and
+A recipe is the YAML policy for one box: its resources, host access, network
+and workload. `terra setup` pins a copy in the box; edit the source recipe and
 run setup again to apply a change. A project's `terra.yaml` maps box names to
 recipes; see [the manifest reference](manifest.md).
 
-Prefer storing recipes and manifests outside guest-writable shares. If your
-workflow requires sharing them writable, review them before setup, even after
-removing the share: guest-written files remain on the host. See
-[recipe storage and trust](security.md#recipe-storage).
+Keep recipes and manifests out of writable shares, because the guest could edit
+them. If you must share them, review them before every setup, even after
+removing the share. See [where recipes live](security.md#where-recipes-live).
 
-An empty recipe creates a box with 2 vCPUs, 1024 MiB RAM, a 512 MiB writable
-root filesystem, an interactive shell, no host mounts, and no network.
+An empty recipe gives 2 vCPUs, 1024 MiB RAM, a 512 MiB root filesystem, an
+interactive shell, no mounts and no network. Every field:
 
 ```yaml
 hw:
@@ -51,164 +50,116 @@ workload:
 
 ## Resources and storage
 
-`hw.cpus`, `hw.mem_mib`, and `hw.rootfs_mib` set virtual CPUs, guest RAM, and
-the private writable root filesystem capacity. The root filesystem is sparse,
-but it cannot exceed `rootfs_mib`. `components.memory_mib` limits each Wasm
-component's linear memory independently. The default and minimum configurable
-ceiling are 16 MiB. There is no combined component memory limit. Component
-ceilings are separate from guest RAM and do not bound all native host-process
-memory. Operators set aggregate VM resource budgets through operating-system
-controls.
+- `hw.cpus`, `hw.mem_mib` and `hw.rootfs_mib` set the vCPUs, guest RAM and root
+  filesystem size. The root filesystem is sparse but never grows past
+  `rootfs_mib`.
+- `components.memory_mib` caps the memory of each of Terra's device
+  components: 16 MiB by default and at minimum. Most recipes leave it out.
 
-When networking is enabled, the combined device/network frontend's ceiling is
-the larger of `components.memory_mib` and 216 MiB, enough for its full flow
-table. Local-only mode uses the ordinary component ceiling.
+`volumes` are private guest disks that survive restarts and are deleted by
+`terra rm`. Each needs:
 
-A box has at most 1024 concurrent network flows. Outbound and published connections share this capacity. Requests
-also have separate bounds for TCP, UDP, and DNS work.
+- a `name` of up to 247 ASCII letters, digits, `.`, `-` or `_`, unique ignoring
+  case. It cannot end in a dot or be a Windows device name such as `CON`.
+- an absolute `guest` path.
+- a positive `size_mib`. Writes past it fail.
 
-External TCP uses one stream per socket; UDP datagrams share a bounded
-UDP/control connection and carry at most 4 KiB. The broker owns and authorizes
-the host sockets. Admission and queue limits bound buffered data; guest-local
-sockets continue to use native Linux networking.
+A box has at most 32 mounts and volumes combined on x86_64, or 11 on AArch64.
 
-On x86_64, RAM starts at zero and skips the reserved device-address region
-from 3.25 GiB to 4 GiB, continuing above 4 GiB when needed. Virtio devices
-and interrupt controllers retain fixed addresses in that gap. `hw.mem_mib`
-counts mapped RAM, excluding the gap; Linux reserves some RAM for boot data.
-RAM capacity is constrained by host resources and the platform's address space.
+Growing `rootfs_mib` or a volume takes effect on the next boot; images never
+shrink. Renaming a volume creates a new empty one and leaves the old image
+behind. `terra <box> storage prune` removes images no longer named by the
+recipe; `setup --rebuild` does too.
 
-Increasing a root filesystem or volume limit takes effect on the next boot;
-existing images do not shrink. Renaming a volume leaves its prior image behind
-and creates an empty one under the new name. `terra <box> setup --rebuild`
-removes images for volumes no longer named by the recipe; `storage prune` removes
-those orphaned volume images without rebuilding the root filesystem. A box has
-at most 32 combined host-directory mounts and volumes on x86_64, or 11 on AArch64.
+## Mounts
 
-`volumes` are persistent private guest disks. Each needs a unique portable `name`,
-an absolute `guest` path, and a positive `size_mib`; writes past the size fail.
-Names use 1-247 ASCII letters, digits, `.`, `-`, or `_`, without a trailing dot or
-a Windows device name such as `CON`. Names must be distinct ignoring ASCII case
-on every platform; Unicode volume IDs are unsupported. The length limit leaves
-room for the image filename prefix and suffix.
-They survive restarts and are removed by `terra rm`.
+Each `mounts` item has a `host` path, an absolute `guest` path and optional
+`readonly: true`. Host paths are relative to the project directory, and `~`
+means your own home. The host directory must exist when the box starts.
 
-## Mounts and environment
+A mount gives the guest that directory and nothing outside it: guest paths and
+symlinks cannot escape it. Read-only mounts reject writes and metadata changes.
 
-Each `mounts` item has a host path, an absolute guest path, and optional
-`readonly: true`. Host and `env_file` paths resolve relative to the project
-directory; `~` expands only for the current user's home. Mount hosts must exist
-when the box starts. A mount grants the guest access to that host directory.
+What works through a mount:
 
-Mounts use a scoped WASI directory capability. Guest path traversal and
-symlinks cannot open a host path outside that grant. Read-only mounts reject
-writes and metadata changes. They support ordinary file I/O, relative symlinks
-(on Windows hosts stored as WSL-style links that Windows does not follow),
-and guest execution/mmap. Names must be UTF-8; guest ownership is synthetic.
-Linux and macOS hosts expose Unix permission bits. On Windows, regular files
-report mode `0755`, or `0555` when the read-only attribute is set. Setting any
-write bit clears that attribute; clearing all write bits sets it. Owner/group
-distinctions and executable bits remain synthetic, and Windows ACLs are unchanged.
-Windows directories report `0755`; other directory modes are unsupported.
-Lookup, stat, and chmod do not require content-read permission. Write-only files
-can be opened for writing; reopening checks inode identity before truncation.
-On macOS, inaccessible objects use a parent-directory-relative metadata reference.
-If the host renames, removes, or replaces such an object, its cached guest reference
-returns not-found; look it up again at its current path. Files already opened for
-content access keep their normal descriptor semantics.
+- Ordinary file I/O, executing files and `mmap`.
+- Relative symlinks. Windows hosts store them WSL-style, and Windows itself
+  does not follow them.
+- Permission bits on Linux and macOS hosts. On Windows, only the write bits
+  work: they map to the file's read-only attribute.
 
-Each shared mount allows 32 active filesystem requests and 256 outstanding
-requests including queued work. Reads, writes, flushes, and metadata operations
-use the same queue; these are individual requests, not whole copy jobs. Reads,
-writes, and flushes on the same file run in order. Event resolution has one
-reserved operation, and cancellation bypasses the scheduler with reserved
-virtio-fs ring capacity. If all 32 operations stall, further queued filesystem
-work waits for capacity. Each mount has its own runtime with at most 33 blocking
-threads for filesystem operations and descriptor cleanup. Saturating that pool
-does not consume the pools used by other mounts or guest disks. Shared underlying
-host storage failures can still affect every user of that storage.
+What does not: host `chmod`/`chown`, xattrs, locks shared between boxes, and
+non-UTF-8 names. Guest file ownership is synthetic. Use a volume when an
+application needs full Linux filesystem behavior.
 
-On shutdown, each shared mount has one second to flush its open writable files.
-A failed or timed-out flush reports an I/O error and allows shutdown to continue;
-durability is not guaranteed after that error. An already-running host filesystem
-operation may still complete after shutdown.
-Descriptor cleanup runs off the worker and retains its resource reservation
-until it completes. Process teardown waits at most one second for remaining
-runtime tasks; this does not force the host OS to complete stalled filesystem I/O.
+**Shutdown.** Guest writes reach the host file as they happen, so stopping a box
+does not lose them. Terra also gives each mount one second to sync open files
+to disk; if that fails or times out, Terra logs an I/O error and the host OS
+writes the data out as usual.
 
-Terra forwards native host file events to guest `inotify` automatically on Linux,
-macOS, and Windows hosts, including read-only mounts and other-box edits.
-Events travel through the virtio-fs filesystem worker and the bundled FUSE driver.
-Guest writes generate native host notifications through ordinary filesystem I/O.
-Delivery is best effort: events can be coalesced, duplicated, reordered, or lost;
-rename cookies and exact event counts are not preserved. Watcher failures and
-queue overflow produce rate-limited diagnostics without stopping the box.
-Watcher registration waits asynchronously for up to one second before the
-filesystem component starts. A timeout disables notifications for that mount
-and lets startup continue; the watcher stops when its blocked host call returns.
-Each box shares a budget of 4,096 pending events and 1,024 watched directories
-across its mounts. Directories beyond the watch limit receive no notification
-coverage; reaching the limit produces a rate-limited diagnostic.
-Terra does not poll, rescan, or replay missed changes. Filesystems without native
-notifications cannot provide automatic reload through this bridge. Host edits do
-not automatically invalidate guest mapped pages. Private disks and `sync` transfers
-receive no additional notification bridge.
+**File events.** Host file changes reach guest `inotify` on Linux, macOS and
+Windows, including read-only mounts and edits from other boxes. Delivery is
+best effort: events can merge, repeat, reorder or drop, and rename cookies are
+not kept. Each box watches at most 1,024 directories with 4,096 pending events;
+past that, Terra logs a warning. Terra never polls or replays missed changes.
+Volumes and `terra sync` copies get no events.
 
-Use private volumes when an application needs full Linux filesystem behavior; host chmod/chown, xattrs, and cross-box locks are not
-available through a mount.
+## Environment
 
-`env` supplies literal variables to hooks and guest processes. `env_file` is a
-dotenv file whose `KEY=VALUE` entries override `env`; blank lines and `#`
-comments are allowed. `terra <box> show` redacts environment values unless
-`--with-env-values` is specified.
+`env` sets literal variables for hooks and guest processes. `env_file` is a
+dotenv file, relative to the project directory; its `KEY=VALUE` lines override
+`env`, and blank lines and `#` comments are allowed. `terra <box> show` hides
+values unless you pass `--with-env-values`.
 
 ## Network
 
-`network.enabled` defaults to `true`. Set `network: {enabled: false}` for
-guest-local networking only: loopback and agent sessions stay available,
-external connections fail, and Terra starts no network broker. Local-only
-recipes require allowlist mode and empty `allow`, `hosts`, and `ports`.
+`network.enabled` defaults to `true`. `network: {enabled: false}` keeps only
+guest-local networking: loopback and terra sessions work, external connections
+fail and no broker runs. Such a recipe must use allowlist mode with empty
+`allow`, `hosts` and `ports`. For how rules are enforced, see
+[network](security.md#network).
 
-Network rules apply at the Wasm component boundary. The built-in Linux jail
-shares the host network namespace; native VM-process compromise can bypass
-recipe rules. See [network policy limits](security.md#network-policy-limits).
+- **`mode: allowlist`** (default) allows nothing until an `allow` entry names a
+  hostname, IP or CIDR, optionally with `:PORT`. Hostnames match exactly;
+  `*.example.com` matches subdomains but not `example.com`.
+- **`mode: unrestricted-public`** allows public addresses, including public
+  addresses on your LAN. The host's own interface IPs, private and link-local
+  ranges, and cloud-metadata addresses still need an explicit rule.
+- **`hosts`** adds local DNS records. `HOST_LOOPBACK` names the Terra host. A
+  record alone allows nothing; add a matching `allow` rule.
+- **`ports`** publishes a guest listener on host loopback. `"8080"` maps the
+  same port, `"3000:80"` maps host 3000 to guest 80, and `/udp` selects UDP, as
+  in `"5353:53/udp"`. TCP and UDP can share a host port.
 
-The default `mode: allowlist` permits no egress until an `allow` entry grants a
-hostname, IP address, or CIDR, optionally limited with `:PORT`. A hostname rule
-is exact; `*.example.com` matches subdomains, not `example.com` itself.
+Limits:
 
-`mode: unrestricted-public` permits public destinations, including public
-addresses on a LAN. Filtering is based on destination addresses, not network
-location. IPs collected from host interfaces at VM startup (including public
-IPs), private ranges, link-local addresses, and blocked cloud-metadata addresses
-still need an explicit rule. `HOST_LOOPBACK` names the host running Terra.
-A `hosts` record only provides local DNS; add a matching `allow` rule before
-connecting.
-`ports` publishes a guest listener on host loopback: `"8080"` maps the same
-port and `"3000:80"` maps host 3000 to guest 80. TCP is the default; append
-`/udp` for UDP, such as `"5353:53/udp"`. TCP and UDP may share a host port.
-
-External ICMP echo forwarding is unavailable, so TCP or UDP rules do not enable
-external `ping`. DNS returns A and AAAA records only. Terra uses a 60-second DNS
-cache hint: an address learned from a lookup permits new connections for 60
-seconds unless another lookup renews it; an existing connection is unaffected.
+- A box has at most 1024 network flows at once, outbound and published
+  together.
+- A UDP datagram carries at most 4 KiB.
+- DNS answers A and AAAA queries only; MX, TXT, SRV and other types come back
+  empty. The host follows CNAMEs, so the guest gets addresses under the name it
+  asked for, and only that name needs an `allow` rule.
+- An address learned from a lookup allows new connections for 60 seconds unless
+  a new lookup renews it; open connections are unaffected.
+- `ping` to external hosts does not work: there is no ICMP forwarding.
 
 ## Processes
 
-`hooks.on_create` runs once as guest root during setup, before host mounts are
-available. `hooks.on_start` runs as guest root before every workload start, and
-`pre_stop` runs during an orderly stop. `daemons` are background shell commands:
-a nonzero exit restarts after one second; exit zero ends that daemon.
+- `hooks.on_create` runs once as guest root during setup, before mounts exist.
+- `hooks.on_start` runs as guest root before every workload start.
+- `hooks.pre_stop` runs during an orderly stop.
+- `daemons` are background shell commands. A nonzero exit restarts the daemon
+  after one second; exit zero ends it.
 
-The workload and daemons run as `terri` (UID 1000) by default. `workload.entrypoint`
-defaults to `/bin/sh`; `args` are passed literally. `workdir`, when given, must
-be absolute. `sudo` grants the workload user named commands as guest root with
-any arguments. `terra <box> --root` runs that boot's workload and daemons as
-guest root; `terra <box> exec --root -- CMD` affects only that command.
+The workload and daemons run as `terri` (UID 1000). `workload.entrypoint`
+defaults to `/bin/sh`, `args` are passed as written, and `workdir` must be
+absolute. `sudo` lets the workload user run the named commands as guest root,
+with any arguments. `terra <box> --root` runs that boot's workload and daemons
+as root; `terra <box> exec --root -- CMD` runs only that command as root.
 
 ## Applying changes
 
-Run `terra <box> setup` after editing a recipe. `--dry-run` validates setup
-without changing state. `--rebuild` discards the guest root filesystem, reruns
-`on_create`, and removes volume images no longer named by the recipe. Read
+Run `terra <box> setup` after editing a recipe. `--dry-run` checks it without
+changing anything. `--rebuild` discards the root filesystem, reruns
+`on_create` and removes volume images the recipe no longer names. Read
 [usage](usage.md) and [security](security.md) before granting host access.

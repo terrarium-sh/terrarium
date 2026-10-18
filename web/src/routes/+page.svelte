@@ -61,7 +61,7 @@
 </section>
 
 <section class="principles" aria-label="Why Terrarium">
-  <div><span class="eyebrow">01 / Self-contained</span><h2>One static core.</h2><p>The kernel, base filesystem, and device components ship in one binary. A small core you can inspect, with recipes and hooks to extend it.</p></div>
+  <div><span class="eyebrow">01 / Self-contained</span><h2>One static core.</h2><p>The kernel, Alpine base, and device components ship in one binary. Every box takes the same narrow path, with no OCI images or registries: fewer moving parts to trust. Recipes and hooks extend it.</p></div>
   <div><span class="eyebrow">02 / Isolated</span><h2>Wasm-isolated devices.</h2><p>Software fault isolation (SFI) gives the VMM and every device instance a separate WebAssembly sandbox, with scoped access to a thin host API.</p></div>
   <div><span class="eyebrow">03 / Explicit</span><h2>Access is a choice.</h2><p>Host files and network access start closed. Your recipe names the directories, destinations, and capabilities you grant.</p></div>
   <div><span class="eyebrow">04 / Portable</span><h2>Bring your environment.</h2><p>Linux and Windows (x86_64 / ARM64), and macOS on Apple Silicon. Native hypervisors underneath; the same recipes and CLI wherever you work.</p></div>

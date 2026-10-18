@@ -33,7 +33,7 @@ fn security_docs_quote_the_enforced_bounds() {
         (
             "security.md",
             format!(
-                "default is {DEFAULT_COMPONENT_MEMORY_MIB} MiB, raised to {} MiB for the combined network frontend so its {}-flow table fits; configurable ceilings require at least {DEFAULT_COMPONENT_MEMORY_MIB} MiB",
+                "{DEFAULT_COMPONENT_MEMORY_MIB} MiB by default, {} MiB for the network device so its {}-flow table fits. A configured limit must be at least {DEFAULT_COMPONENT_MEMORY_MIB} MiB",
                 NETWORK_FRONTEND_MEMORY_BYTES >> 20,
                 terra_protocol::vsock::MAX_NETWORK_SOCKETS,
             ),
