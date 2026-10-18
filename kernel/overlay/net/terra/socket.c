@@ -701,7 +701,15 @@ static int terra_begin_stream(struct terra_tsi_socket *state)
 	terra_stream_options(state);
 	memset(state->opening, 0, sizeof(state->opening));
 	put_unaligned_le16(TERRA_NETWORK_VERSION, state->opening + 8);
-	put_unaligned_le16(sock_flag(state->sk, SOCK_URGINLINE), state->opening + 12);
+	put_unaligned_le16(sock_flag(state->sk, SOCK_URGINLINE) |
+			   sock_flag(state->sk, SOCK_KEEPOPEN) << 1, state->opening + 12);
+	if (sock_flag(state->sk, SOCK_KEEPOPEN)) {
+		const struct tcp_sock *tcp = tcp_sk(state->sk);
+
+		put_unaligned_le16(clamp_t(int, keepalive_probes(tcp), 1, MAX_TCP_KEEPCNT), state->opening + 14);
+		put_unaligned_le16(clamp_t(int, keepalive_time_when(tcp) / HZ, 1, MAX_TCP_KEEPIDLE), state->opening + 16);
+		put_unaligned_le16(clamp_t(int, keepalive_intvl_when(tcp) / HZ, 1, MAX_TCP_KEEPINTVL), state->opening + 18);
+	}
 	if (terra_peer_is_host_service(&state->peer) &&
 	    (state->peer.ss_family == AF_INET ||
 	     ipv6_addr_v4mapped(&((struct sockaddr_in6 *)&state->peer)->sin6_addr))) {
@@ -710,13 +718,13 @@ static int terra_begin_stream(struct terra_tsi_socket *state)
 			((struct sockaddr_in6 *)&state->peer)->sin6_port;
 
 		put_unaligned_le16(2, state->opening + 10);
-		put_unaligned_le16(ntohs(port), state->opening + 16);
-		payload = 12;
+		put_unaligned_le16(ntohs(port), state->opening + 20);
+		payload = 16;
 		error = port ? 0 : -EINVAL;
 	} else {
 		put_unaligned_le16(1, state->opening + 10);
-		payload = 8 + TERRA_ENDPOINT_BYTES;
-		error = terra_encode_peer(state->opening + 16, &state->peer, state->peer_length);
+		payload = 12 + TERRA_ENDPOINT_BYTES;
+		error = terra_encode_peer(state->opening + 20, &state->peer, state->peer_length);
 	}
 	if (error) {
 		terra_detach_stream(state);
@@ -1770,6 +1778,13 @@ static void terra_apply_option(struct terra_tsi_socket *state, struct socket *so
 	}
 }
 
+static bool terra_keepalive_option(int level, int option)
+{
+	return (level == SOL_SOCKET && option == SO_KEEPALIVE) ||
+		(level == SOL_TCP && (option == TCP_KEEPIDLE || option == TCP_KEEPINTVL ||
+		 option == TCP_KEEPCNT));
+}
+
 static int terra_setsockopt(struct socket *socket, int level, int option,
 			    sockptr_t value, unsigned int length)
 {
@@ -1782,7 +1797,9 @@ static int terra_setsockopt(struct socket *socket, int level, int option,
 	/* IPV6_ADDRFORM replaces sock->ops with inet_stream_ops, so terra_release_socket would never free the attached state. */
 	if (level == SOL_IPV6 && option == IPV6_ADDRFORM)
 		return -EOPNOTSUPP;
-	if (level == SOL_SOCKET) {
+	if (socket->type == SOCK_STREAM && terra_keepalive_option(level, option)) {
+		supported = true;
+	} else if (level == SOL_SOCKET) {
 		switch (option) {
 		case SO_REUSEADDR: case SO_REUSEPORT: case SO_RCVBUF: case SO_SNDBUF:
 		case SO_RCVTIMEO_OLD: case SO_SNDTIMEO_OLD:
@@ -1826,7 +1843,10 @@ static int terra_setsockopt(struct socket *socket, int level, int option,
 		if (integer < 0 || integer > TERRA_UDP_DATAGRAM)
 			return -EINVAL;
 	}
-	if (state->stream && socket->type == SOCK_STREAM && level == SOL_SOCKET && option == SO_OOBINLINE)
+	/* terra_begin_stream hands these options to the broker's socket; a later change would never reach it. */
+	if (socket->type == SOCK_STREAM &&
+	    ((state->stream && level == SOL_SOCKET && option == SO_OOBINLINE) ||
+	     (state->mode == TERRA_SOCKET_EXTERNAL && terra_keepalive_option(level, option))))
 		return -EOPNOTSUPP;
 	error = level == SOL_SOCKET ? sock_setsockopt(socket, level, option, value, length) :
 		state->native_ops->setsockopt(socket, level, option, value, length);
@@ -1893,6 +1913,7 @@ static int terra_getsockopt(struct socket *socket, int level, int option,
 	     (socket->type == SOCK_DGRAM && smp_load_acquire(&state->udp_open))) &&
 	    !((socket->type == SOCK_DGRAM && terra_udp_option(level, option)) ||
 	      (level == SOL_TCP && (option == TCP_NODELAY || option == TCP_MAXSEG)) ||
+	      (socket->type == SOCK_STREAM && terra_keepalive_option(level, option)) ||
 	      (level == SOL_IP && (option == IP_TTL || option == IP_RECVERR || option == IP_PKTINFO)) ||
 	      (level == SOL_IPV6 && (option == IPV6_V6ONLY || option == IPV6_UNICAST_HOPS ||
 		 option == IPV6_RECVERR || option == IPV6_RECVPKTINFO))))

@@ -11,21 +11,17 @@ use crate::{
 };
 use futures_util::future::try_join;
 use std::net::SocketAddr;
-use terra_protocol::application::{Message, OPEN_TIMEOUT_SECS, TcpTarget};
+use terra_protocol::application::{Message, OPEN_TIMEOUT_SECS, TcpOpenOptions, TcpTarget};
 use terra_protocol::socket::Error as SocketError;
 use terra_vsock_device::ConnectionId;
 
 pub(super) async fn serve(connection: ConnectionId) {
     let opening = async {
         let outcome = async {
-            let Message::TcpOpen {
-                target,
-                inline_urgent,
-            } = read_opening(connection).await?
-            else {
+            let Message::TcpOpen { target, options } = read_opening(connection).await? else {
                 return Err(SocketError::Protocol);
             };
-            open(target, inline_urgent).await
+            open(target, options).await
         }
         .await;
         let reply = Message::TcpOpened(
@@ -45,7 +41,10 @@ pub(super) async fn serve(connection: ConnectionId) {
     finish_flow(connection);
 }
 
-async fn open(target: TcpTarget, inline_urgent: bool) -> Result<(Tcp, SocketAddr), SocketError> {
+async fn open(
+    target: TcpTarget,
+    options: TcpOpenOptions,
+) -> Result<(Tcp, SocketAddr), SocketError> {
     let (destination, reported) = match target {
         TcpTarget::Peer(peer) => (resolve_destination(peer)?, peer),
         TcpTarget::HostService(port) => {
@@ -53,10 +52,20 @@ async fn open(target: TcpTarget, inline_urgent: bool) -> Result<(Tcp, SocketAddr
             (destination, destination)
         }
     };
-    broker::open_tcp(host_socket_address(destination), inline_urgent)
-        .await
-        .map(|socket| (socket, reported))
-        .map_err(broker_error)
+    broker::open_tcp(
+        host_socket_address(destination),
+        broker::TcpOpenOptions {
+            inline_urgent: options.inline_urgent,
+            keepalive: options.keepalive.map(|keepalive| broker::TcpKeepalive {
+                idle_secs: keepalive.idle_secs(),
+                interval_secs: keepalive.interval_secs(),
+                probe_count: keepalive.probe_count(),
+            }),
+        },
+    )
+    .await
+    .map(|socket| (socket, reported))
+    .map_err(broker_error)
 }
 
 pub(super) async fn relay(connection: ConnectionId, socket: &Tcp) {

@@ -15,6 +15,8 @@ typedef uint64_t u64;
 #define __user
 #define SOCK_STREAM 1
 #define SOCK_DGRAM 2
+#define SOL_SOCKET 1
+#define SO_KEEPALIVE 9
 #define SOL_TCP 6
 #define SOL_IP 0
 #define SOL_IPV6 41

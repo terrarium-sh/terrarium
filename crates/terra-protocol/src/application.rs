@@ -5,6 +5,8 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
 };
 
+use serde::{Deserialize, Serialize};
+
 use crate::socket::{self, Error as ProtocolError};
 
 pub const VERSION: u16 = 1;
@@ -29,6 +31,12 @@ pub const MAX_OPENING_BYTES: usize = 64;
 pub const OPEN_TIMEOUT_SECS: u64 = 30;
 /// Concurrent DNS queries the agent may have outstanding on the control stream.
 pub const MAX_DNS_QUERIES: usize = 16;
+/// Linux `MAX_TCP_KEEPIDLE` and `MAX_TCP_KEEPINTVL`, in seconds.
+pub const MAX_KEEPALIVE_SECS: u16 = 32767;
+/// Linux `MAX_TCP_KEEPCNT`.
+pub const MAX_KEEPALIVE_PROBES: u16 = 127;
+const TCP_OPEN_INLINE_URGENT_FLAG: u16 = 1;
+const TCP_OPEN_KEEPALIVE_FLAG: u16 = 2;
 const _: () = assert!(DNS_PREFIX_BYTES + socket::MAX_DNS_BYTES + 2 <= MAX_PAYLOAD_BYTES);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,6 +144,66 @@ impl fmt::Display for ErrorCode {
 
 impl std::error::Error for ErrorCode {}
 
+/// Guest-chosen TCP keepalive; construction and deserialization enforce the Linux limits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "TcpKeepaliveFields")]
+pub struct TcpKeepalive {
+    idle_secs: u16,
+    interval_secs: u16,
+    probe_count: u16,
+}
+
+#[derive(Deserialize)]
+struct TcpKeepaliveFields {
+    idle_secs: u16,
+    interval_secs: u16,
+    probe_count: u16,
+}
+
+impl TryFrom<TcpKeepaliveFields> for TcpKeepalive {
+    type Error = &'static str;
+    fn try_from(fields: TcpKeepaliveFields) -> Result<Self, Self::Error> {
+        Self::new(fields.idle_secs, fields.interval_secs, fields.probe_count)
+            .ok_or("keepalive timing out of range")
+    }
+}
+
+impl TcpKeepalive {
+    #[must_use]
+    pub fn new(idle_secs: u16, interval_secs: u16, probe_count: u16) -> Option<Self> {
+        let is_valid = (1..=MAX_KEEPALIVE_SECS).contains(&idle_secs)
+            && (1..=MAX_KEEPALIVE_SECS).contains(&interval_secs)
+            && (1..=MAX_KEEPALIVE_PROBES).contains(&probe_count);
+        is_valid.then_some(Self {
+            idle_secs,
+            interval_secs,
+            probe_count,
+        })
+    }
+
+    #[must_use]
+    pub fn idle_secs(self) -> u16 {
+        self.idle_secs
+    }
+
+    #[must_use]
+    pub fn interval_secs(self) -> u16 {
+        self.interval_secs
+    }
+
+    #[must_use]
+    pub fn probe_count(self) -> u16 {
+        self.probe_count
+    }
+}
+
+/// Socket options the guest chose before `connect`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TcpOpenOptions {
+    pub inline_urgent: bool,
+    pub keepalive: Option<TcpKeepalive>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TcpTarget {
     Peer(SocketAddr),
@@ -146,7 +214,7 @@ pub enum TcpTarget {
 pub enum Message {
     TcpOpen {
         target: TcpTarget,
-        inline_urgent: bool,
+        options: TcpOpenOptions,
     },
     TcpOpened(Result<SocketAddr, ProtocolError>),
     UdpOpen,
@@ -211,18 +279,32 @@ impl Message {
         let mut frame = Vec::with_capacity(HEADER_BYTES + ENDPOINT_BYTES);
         frame.resize(HEADER_BYTES, 0);
         match self {
-            Self::TcpOpen {
-                target,
-                inline_urgent,
-            } => {
+            Self::TcpOpen { target, options } => {
                 frame.extend_from_slice(&VERSION.to_le_bytes());
                 let kind: u16 = match target {
                     TcpTarget::Peer(_) => 1,
                     TcpTarget::HostService(_) => 2,
                 };
                 frame.extend_from_slice(&kind.to_le_bytes());
-                frame.extend_from_slice(&u16::from(*inline_urgent).to_le_bytes());
-                frame.extend_from_slice(&0_u16.to_le_bytes());
+                let mut flags = 0;
+                if options.inline_urgent {
+                    flags |= TCP_OPEN_INLINE_URGENT_FLAG;
+                }
+                let (probe_count, idle_secs, interval_secs) = match options.keepalive {
+                    Some(keepalive) => {
+                        flags |= TCP_OPEN_KEEPALIVE_FLAG;
+                        (
+                            keepalive.probe_count,
+                            keepalive.idle_secs,
+                            keepalive.interval_secs,
+                        )
+                    }
+                    None => (0, 0, 0),
+                };
+                frame.extend_from_slice(&flags.to_le_bytes());
+                for field in [probe_count, idle_secs, interval_secs] {
+                    frame.extend_from_slice(&field.to_le_bytes());
+                }
                 match target {
                     TcpTarget::Peer(peer) => encode_peer(&mut frame, *peer)?,
                     TcpTarget::HostService(0) => return Err(ErrorCode::InvalidFrame),
@@ -292,29 +374,7 @@ impl Message {
     fn decode_payload(opcode: Opcode, payload: &[u8]) -> Result<Self, ErrorCode> {
         let mut body = Body(payload);
         let message = match opcode {
-            Opcode::TcpOpen => {
-                body.version()?;
-                let kind = body.u16()?;
-                let flags = body.u16()?;
-                if flags > 1 || body.u16()? != 0 {
-                    return Err(ErrorCode::InvalidFrame);
-                }
-                let target = match kind {
-                    1 => TcpTarget::Peer(body.peer()?),
-                    2 => {
-                        let port = body.u16()?;
-                        if port == 0 || body.u16()? != 0 {
-                            return Err(ErrorCode::InvalidFrame);
-                        }
-                        TcpTarget::HostService(port)
-                    }
-                    _ => return Err(ErrorCode::InvalidFrame),
-                };
-                Self::TcpOpen {
-                    target,
-                    inline_urgent: flags != 0,
-                }
-            }
+            Opcode::TcpOpen => decode_tcp_open(&mut body)?,
             Opcode::TcpOpened => Self::TcpOpened(match body.status()? {
                 Some(error) => Err(error),
                 None => Ok(body.peer()?),
@@ -685,7 +745,46 @@ impl<'a> Body<'a> {
     }
 }
 
-const _: () = assert!(HEADER_BYTES + 8 + ENDPOINT_BYTES <= MAX_OPENING_BYTES);
+fn decode_tcp_open(body: &mut Body<'_>) -> Result<Message, ErrorCode> {
+    body.version()?;
+    let kind = body.u16()?;
+    let flags = body.u16()?;
+    if flags & !(TCP_OPEN_INLINE_URGENT_FLAG | TCP_OPEN_KEEPALIVE_FLAG) != 0 {
+        return Err(ErrorCode::InvalidFrame);
+    }
+    let (probe_count, idle_secs, interval_secs) = (body.u16()?, body.u16()?, body.u16()?);
+    let keepalive = if flags & TCP_OPEN_KEEPALIVE_FLAG == 0 {
+        if probe_count | idle_secs | interval_secs != 0 {
+            return Err(ErrorCode::InvalidFrame);
+        }
+        None
+    } else {
+        Some(
+            TcpKeepalive::new(idle_secs, interval_secs, probe_count)
+                .ok_or(ErrorCode::InvalidFrame)?,
+        )
+    };
+    let target = match kind {
+        1 => TcpTarget::Peer(body.peer()?),
+        2 => {
+            let port = body.u16()?;
+            if port == 0 || body.u16()? != 0 {
+                return Err(ErrorCode::InvalidFrame);
+            }
+            TcpTarget::HostService(port)
+        }
+        _ => return Err(ErrorCode::InvalidFrame),
+    };
+    Ok(Message::TcpOpen {
+        target,
+        options: TcpOpenOptions {
+            inline_urgent: flags & TCP_OPEN_INLINE_URGENT_FLAG != 0,
+            keepalive,
+        },
+    })
+}
+
+const _: () = assert!(HEADER_BYTES + 12 + ENDPOINT_BYTES <= MAX_OPENING_BYTES);
 const _: () = assert!(HEADER_BYTES + STATUS_BYTES + ENDPOINT_BYTES <= MAX_OPENING_BYTES);
 
 #[cfg(test)]
@@ -781,11 +880,25 @@ mod tests {
         for message in [
             Message::TcpOpen {
                 target: TcpTarget::Peer(peer),
-                inline_urgent: true,
+                options: TcpOpenOptions {
+                    inline_urgent: true,
+                    keepalive: TcpKeepalive::new(60, 15, 9),
+                },
+            },
+            Message::TcpOpen {
+                target: TcpTarget::Peer(peer),
+                options: TcpOpenOptions::default(),
             },
             Message::TcpOpen {
                 target: TcpTarget::HostService(443),
-                inline_urgent: false,
+                options: TcpOpenOptions {
+                    inline_urgent: false,
+                    keepalive: TcpKeepalive::new(MAX_KEEPALIVE_SECS, 1, MAX_KEEPALIVE_PROBES),
+                },
+            },
+            Message::TcpOpen {
+                target: TcpTarget::HostService(443),
+                options: TcpOpenOptions::default(),
             },
             Message::TcpOpened(Ok(peer)),
             Message::TcpOpened(Err(ProtocolError::AccessDenied)),
@@ -843,15 +956,30 @@ mod tests {
         let peer: SocketAddr = "203.0.113.1:443".parse().unwrap();
         let bytes = Message::TcpOpen {
             target: TcpTarget::Peer(peer),
-            inline_urgent: true,
+            options: TcpOpenOptions {
+                inline_urgent: true,
+                keepalive: TcpKeepalive::new(60, 15, 9),
+            },
         }
         .encode()
         .unwrap();
         assert_eq!(
             bytes,
             [
-                1, 0, 0, 0, 28, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 4, 0, 0xbb, 1, 203, 0, 113, 1, 0,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+                1, 0, 0, 0, 32, 0, 0, 0, 1, 0, 1, 0, 3, 0, 9, 0, 60, 0, 15, 0, 4, 0, 0xbb, 1, 203,
+                0, 113, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+            ]
+        );
+        let service = Message::TcpOpen {
+            target: TcpTarget::HostService(443),
+            options: TcpOpenOptions::default(),
+        }
+        .encode()
+        .unwrap();
+        assert_eq!(
+            service,
+            [
+                1, 0, 0, 0, 16, 0, 0, 0, 1, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xbb, 1, 0, 0
             ]
         );
         assert!(bytes.len() <= MAX_OPENING_BYTES);
@@ -865,11 +993,45 @@ mod tests {
                 .len(),
             12
         );
-        for (offset, value) in [(2, 1), (8, 4), (10, 3), (12, 2), (14, 1)] {
+        for (offset, value) in [
+            (2, 1),
+            (8, 4),
+            (10, 3),
+            (12, 4),
+            (12, 8),
+            (14, 0),
+            (16, 0),
+            (18, 0),
+        ] {
             let mut forged = bytes.clone();
             forged[offset] = value;
             assert!(Message::decode(&forged, Direction::GuestToHost).is_err());
         }
+        let mut forged = bytes.clone();
+        forged[18..20].copy_from_slice(&(MAX_KEEPALIVE_SECS + 1).to_le_bytes());
+        assert_eq!(
+            Message::decode(&forged, Direction::GuestToHost),
+            Err(ErrorCode::InvalidFrame)
+        );
+        let mut forged = bytes.clone();
+        forged[14..16].copy_from_slice(&(MAX_KEEPALIVE_PROBES + 1).to_le_bytes());
+        assert_eq!(
+            Message::decode(&forged, Direction::GuestToHost),
+            Err(ErrorCode::InvalidFrame)
+        );
+        let mut without_flag = bytes.clone();
+        without_flag[12] = 1;
+        assert_eq!(
+            Message::decode(&without_flag, Direction::GuestToHost),
+            Err(ErrorCode::InvalidFrame)
+        );
+        let mut short = bytes.clone();
+        short.truncate(HEADER_BYTES + 28);
+        short[4] = 28;
+        assert_eq!(
+            Message::decode(&short, Direction::GuestToHost),
+            Err(ErrorCode::InvalidFrame)
+        );
         let mut stale = bytes;
         stale[8] = 4;
         assert_eq!(

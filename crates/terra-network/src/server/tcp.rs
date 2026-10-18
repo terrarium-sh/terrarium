@@ -9,6 +9,7 @@ use std::os::windows::io::AsRawSocket;
 #[cfg(windows)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use terra_protocol::application::TcpOpenOptions;
 use terra_protocol::network::{MAX_NETWORK_CHUNK_BYTES, MAX_NETWORK_READ_BYTES, TcpEvent};
 use tokio::io::{AsyncReadExt, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
@@ -19,9 +20,17 @@ type StreamRead = ReadHalf<Compat<yamux::Stream>>;
 type StreamWrite = WriteHalf<Compat<yamux::Stream>>;
 
 /// Applies the options every outbound TCP socket carries.
-fn configure_outbound(socket: &SockRef<'_>, inline_urgent: bool) -> io::Result<()> {
-    if inline_urgent {
+fn configure_outbound(socket: &SockRef<'_>, options: TcpOpenOptions) -> io::Result<()> {
+    if options.inline_urgent {
         socket.set_out_of_band_inline(true)?;
+    }
+    if let Some(keepalive) = options.keepalive {
+        socket.set_tcp_keepalive(
+            &socket2::TcpKeepalive::new()
+                .with_time(Duration::from_secs(keepalive.idle_secs().into()))
+                .with_interval(Duration::from_secs(keepalive.interval_secs().into()))
+                .with_retries(keepalive.probe_count().into()),
+        )?;
     }
     bound_socket_buffers(socket)
 }
@@ -61,15 +70,12 @@ pub(super) fn bound_socket_buffers(socket: &SockRef<'_>) -> io::Result<()> {
 pub(super) async fn connect(
     sockets: &SocketSource,
     peer: SocketAddr,
-    inline_urgent: bool,
+    options: TcpOpenOptions,
 ) -> Result<TcpStream, Error> {
-    let stream = tokio::time::timeout(
-        Duration::from_secs(30),
-        open_stream(sockets, peer, inline_urgent),
-    )
-    .await
-    .map_err(|_| Error::TimedOut)?
-    .map_err(map_io_error)?;
+    let stream = tokio::time::timeout(Duration::from_secs(30), open_stream(sockets, peer, options))
+        .await
+        .map_err(|_| Error::TimedOut)?
+        .map_err(map_io_error)?;
     stream.set_nodelay(true).map_err(map_io_error)?;
     Ok(stream)
 }
@@ -77,7 +83,7 @@ pub(super) async fn connect(
 async fn open_stream(
     sockets: &SocketSource,
     peer: SocketAddr,
-    inline_urgent: bool,
+    options: TcpOpenOptions,
 ) -> io::Result<TcpStream> {
     match sockets {
         SocketSource::Native => {
@@ -86,12 +92,12 @@ async fn open_stream(
             } else {
                 TcpSocket::new_v6()?
             };
-            configure_outbound(&SockRef::from(&socket), inline_urgent)?;
+            configure_outbound(&SockRef::from(&socket), options)?;
             socket.connect(peer).await
         }
         SocketSource::Delegated(outbound) => {
             let socket = outbound.connect_tcp(peer).await?;
-            configure_outbound(&SockRef::from(&socket), inline_urgent)?;
+            configure_outbound(&SockRef::from(&socket), options)?;
             socket.set_nonblocking(true)?;
             TcpStream::from_std(socket.into())
         }

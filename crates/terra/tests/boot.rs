@@ -394,7 +394,7 @@ fn raw_vsock_tcp_receive_credit_preserves_high_lowat() {
     use std::io::{Read, Write};
     use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener};
     use std::sync::atomic::{AtomicBool, Ordering};
-    use terra_protocol::application::{Message, TcpTarget};
+    use terra_protocol::application::{Message, TcpOpenOptions, TcpTarget};
 
     fn serve_credit_payload(
         listener: &TcpListener,
@@ -453,12 +453,12 @@ fn raw_vsock_tcp_receive_credit_preserves_high_lowat() {
     let peer = SocketAddr::new(IpAddr::V4(terra_protocol::socket::HOST_SERVICE_IPV4), port);
     let opening = Message::TcpOpen {
         target: TcpTarget::Peer(peer),
-        inline_urgent: false,
+        options: TcpOpenOptions::default(),
     }
     .encode()
     .unwrap();
     let opened = Message::TcpOpened(Ok(peer)).encode().unwrap();
-    assert_eq!(opening.len(), 36);
+    assert_eq!(opening.len(), 40);
     assert_eq!(opened.len(), 32);
     let payload: Vec<_> = (0..32 * 1024)
         .map(|offset| u8::try_from(offset % 251).unwrap())
@@ -893,6 +893,7 @@ fn static_socket_calls_forward_tcp_and_udp_through_authorized_broker() {
     });
     assert!(output.contains("SOCKET_EXTERNAL_OK"), "{output}");
     assert!(output.contains("SOCKET_TCP_PEEK_OFFSET_OK"), "{output}");
+    assert!(output.contains("SOCKET_TCP_KEEPALIVE_OK"), "{output}");
     assert!(
         output.contains("SOCKET_NESTED_FORWARDING_UNSUPPORTED_OK"),
         "{output}"

@@ -141,8 +141,6 @@ mod tests {
         let client = ClientConn::from_file(File::from(OwnedFd::from(guest))).unwrap();
         let _ = session.attach_client(&client).await;
         host.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        let mut host = host;
-        let _ = terra_protocol::read_frame::<terra_protocol::AgentOutput>(&mut host).unwrap();
         (session, host)
     }
 

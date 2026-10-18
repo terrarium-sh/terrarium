@@ -263,7 +263,7 @@ static void wait_credit_queue(int descriptor, int expected) {
 }
 
 static void exercise_receive_credit_lowat(void) {
-    unsigned char opening[36], expected_opened[32], opened[32];
+    unsigned char opening[40], expected_opened[32], opened[32];
     unsigned char expected[32 * 1024], received[32 * 1024];
     read_credit_fixture("/work/VSOCK_CREDIT_OPEN", opening, sizeof(opening));
     read_credit_fixture("/work/VSOCK_CREDIT_OPENED", expected_opened, sizeof(expected_opened));

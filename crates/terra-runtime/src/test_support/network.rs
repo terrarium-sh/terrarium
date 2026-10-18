@@ -11,7 +11,7 @@ use crate::box_runtime::{BoxHost, BoxRuntime};
 use crate::component::network::{NetworkBackend, PortMapping};
 use crate::component::vsock::streams::{FrontendStreams, StreamEndpoint};
 use crate::memory::GuestRam;
-use terra_protocol::application::{Message, TcpTarget};
+use terra_protocol::application::{Message, TcpKeepalive, TcpOpenOptions, TcpTarget};
 use terra_protocol::socket::{self, Error};
 use terra_protocol::vsock::{
     AGENT_PORT, CONTROL_PORT, FLOW_REPLY_BYTES, PUBLICATION_PORT, TCP_PORT, UDP_PORT,
@@ -1045,7 +1045,7 @@ impl GuestNetwork {
     async fn exercise_opening_errors(&mut self) -> wasmtime::Result<()> {
         let tcp = Message::TcpOpen {
             target: TcpTarget::HostService(80),
-            inline_urgent: false,
+            options: TcpOpenOptions::default(),
         };
         for (host_port, opening, wrong_class, expected) in [
             (
@@ -1107,7 +1107,10 @@ impl GuestNetwork {
         self.stream.connect(stream).await?;
         let opening = Message::TcpOpen {
             target,
-            inline_urgent: true,
+            options: TcpOpenOptions {
+                inline_urgent: true,
+                keepalive: TcpKeepalive::new(60, 15, 9),
+            },
         }
         .encode()?;
         self.stream.submit_raw(stream, &opening[..5]).await?;

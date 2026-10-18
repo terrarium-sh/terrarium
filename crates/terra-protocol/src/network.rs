@@ -1,6 +1,8 @@
 //! Bounded messages for the network broker, one yamux stream per operation.
 
-use crate::application::{MAX_DATAGRAM_SEGMENTS, MAX_UDP_RUN_BYTES, is_valid_segmented_run};
+use crate::application::{
+    MAX_DATAGRAM_SEGMENTS, MAX_UDP_RUN_BYTES, TcpOpenOptions, is_valid_segmented_run,
+};
 pub use crate::socket::Error;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, SocketAddr};
@@ -227,7 +229,7 @@ pub enum ResourceKind {
 pub enum Open {
     Tcp {
         peer: SocketAddr,
-        inline_urgent: bool,
+        options: TcpOpenOptions,
     },
     Accept(ListenerGrant),
     Udp,
@@ -307,6 +309,40 @@ mod tests {
             assert!(batch.push(peer, &vec![7; *length]));
         }
         batch
+    }
+
+    #[test]
+    fn tcp_open_options_round_trip_and_reject_out_of_range_keepalive() {
+        use crate::application::{MAX_KEEPALIVE_PROBES, MAX_KEEPALIVE_SECS, TcpKeepalive};
+        let peer: SocketAddr = "203.0.113.1:443".parse().unwrap();
+        let open = |options| Open::Tcp { peer, options };
+        assert!(roundtrips(&open(TcpOpenOptions::default())));
+        assert!(roundtrips(&open(TcpOpenOptions {
+            inline_urgent: true,
+            keepalive: TcpKeepalive::new(MAX_KEEPALIVE_SECS, 1, MAX_KEEPALIVE_PROBES),
+        })));
+        for (idle_secs, interval_secs, probe_count) in [
+            (0, 1, 1),
+            (1, 0, 1),
+            (1, 1, 0),
+            (MAX_KEEPALIVE_SECS + 1, 1, 1),
+            (1, MAX_KEEPALIVE_SECS + 1, 1),
+            (1, 1, MAX_KEEPALIVE_PROBES + 1),
+        ] {
+            let frame = encode_frame(&RawKeepaliveForTest {
+                idle_secs,
+                interval_secs,
+                probe_count,
+            })
+            .unwrap();
+            assert!(
+                read_frame_with_limit::<TcpKeepalive>(
+                    &mut frame.as_slice(),
+                    MAX_NETWORK_FRAME_BYTES
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]
@@ -435,6 +471,13 @@ mod tests {
         headers: Vec<DatagramHeader>,
         #[serde(serialize_with = "serde_bytes::serialize")]
         bytes: Vec<u8>,
+    }
+
+    #[derive(Serialize)]
+    struct RawKeepaliveForTest {
+        idle_secs: u16,
+        interval_secs: u16,
+        probe_count: u16,
     }
 
     fn roundtrips_raw(raw: &RawBatchForTest) -> bool {

@@ -343,16 +343,13 @@ impl Shared {
 
     async fn prepare(&self, open: Open) -> Result<Prepared, Error> {
         match open {
-            Open::Tcp {
-                peer,
-                inline_urgent,
-            } => {
+            Open::Tcp { peer, options } => {
                 validate_peer(peer)?;
                 if !self.policy.authorizes(peer) {
                     return Err(Error::AccessDenied);
                 }
                 let permit = self.claim_resource()?;
-                let tcp = tcp::connect(&self.sockets, peer, inline_urgent).await?;
+                let tcp = tcp::connect(&self.sockets, peer, options).await?;
                 Ok(Prepared::Tcp { tcp, peer, permit })
             }
             Open::Accept(grant) => {

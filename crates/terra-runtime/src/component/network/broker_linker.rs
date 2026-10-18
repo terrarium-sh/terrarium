@@ -2,6 +2,7 @@ use super::NetworkHost;
 use super::bindings::terra::network::broker::{
     DatagramBatch as BrokerDatagramBatch, DatagramHeader as BrokerDatagramHeader,
     Error as BrokerError, IpAddress, SendFailure as BrokerSendFailure, SocketAddress,
+    TcpOpenOptions as BrokerTcpOpenOptions,
 };
 use super::host::Denial;
 use crate::component::relay::{
@@ -12,6 +13,7 @@ use futures_util::StreamExt;
 use futures_util::stream;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use terra_network::{Client, Error, TcpDownload, TcpFlow, TcpUpload, UdpFlow};
+use terra_protocol::application::{TcpKeepalive, TcpOpenOptions};
 use terra_protocol::network::{
     DATAGRAM_FRAME_OVERHEAD_BYTES, DatagramBatch, DatagramHeader, MAX_NETWORK_CHUNK_BYTES,
     MAX_NETWORK_DATAGRAM_BATCH_BYTES, MAX_NETWORK_DATAGRAMS, MAX_NETWORK_NAME_BYTES, ResourceKind,
@@ -443,7 +445,7 @@ fn add_open<T: WasiView + AsMut<NetworkHost> + 'static>(
 ) -> wasmtime::Result<()> {
     interface.func_wrap_concurrent(
         "open-tcp",
-        |access, (peer, inline_urgent): (SocketAddress, bool)| {
+        |access, (peer, options): (SocketAddress, BrokerTcpOpenOptions)| {
             Box::pin(async move {
                 let client =
                     match access.with(|mut store| store.get().as_mut().clone_broker_client()) {
@@ -451,9 +453,9 @@ fn add_open<T: WasiView + AsMut<NetworkHost> + 'static>(
                         Err(error) => return Ok((Err(broker_error(error)),)),
                     };
                 let peer = canonical_peer(peer);
-                let result = match peer {
-                    Ok(peer) => client.open_tcp(peer, inline_urgent).await,
-                    Err(error) => Err(error),
+                let result = match (peer, forwarded_tcp_options(&options)) {
+                    (Ok(peer), Ok(options)) => client.open_tcp(peer, options).await,
+                    (Err(error), _) | (_, Err(error)) => Err(error),
                 };
                 if matches!(result, Err(Error::AccessDenied))
                     && let Ok(peer) = peer
@@ -619,6 +621,24 @@ fn add_udp<T: WasiView + AsMut<NetworkHost> + 'static>(
         },
     )?;
     Ok(())
+}
+
+fn forwarded_tcp_options(options: &BrokerTcpOpenOptions) -> Result<TcpOpenOptions, Error> {
+    let keepalive = options
+        .keepalive
+        .map(|keepalive| {
+            TcpKeepalive::new(
+                keepalive.idle_secs,
+                keepalive.interval_secs,
+                keepalive.probe_count,
+            )
+            .ok_or(Error::InvalidArgument)
+        })
+        .transpose()?;
+    Ok(TcpOpenOptions {
+        inline_urgent: options.inline_urgent,
+        keepalive,
+    })
 }
 
 /// A guest entry as a broker header, or why that entry alone cannot be sent.
@@ -788,7 +808,10 @@ mod tests {
         let client = broker_client(vec![]);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let (flow, accepted) = tokio::join!(client.open_tcp(address, false), listener.accept());
+        let (flow, accepted) = tokio::join!(
+            client.open_tcp(address, TcpOpenOptions::default()),
+            listener.accept()
+        );
         (BrokerTcp::new(flow.unwrap()), accepted.unwrap().0, client)
     }
 

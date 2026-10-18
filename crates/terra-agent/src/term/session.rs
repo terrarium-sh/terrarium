@@ -195,19 +195,18 @@ impl Session {
             let mut inner = self.inner.lock().await;
             let id = inner.next_id;
             inner.next_id += 1;
+            let output = inner
+                .saw_output
+                .then(|| inner.parser.screen().contents_formatted());
             if inner.closed {
-                let output = inner
-                    .saw_output
-                    .then(|| inner.parser.screen().contents_formatted());
                 (id, output, Some(inner.exit_code))
             } else {
-                let output = inner.parser.screen().contents_formatted();
                 inner.clients.push(Client {
                     id,
                     conn: conn.clone(),
                     size: None,
                 });
-                (id, Some(output), None)
+                (id, output, None)
             }
         };
         if let Some(output) = output
@@ -391,8 +390,6 @@ mod tests {
         let (second, mut second_reader) = client();
         session.attach_client(&first).await.unwrap();
         session.attach_client(&second).await.unwrap();
-        let _ = frame(&mut first_reader).await;
-        let _ = frame(&mut second_reader).await;
 
         session.feed_output(b"last line\n").await;
         session.broadcast_exit(42).await;
@@ -439,6 +436,20 @@ mod tests {
             DetachOutcome::Detached {
                 size: Some((50, 200))
             }
+        );
+    }
+
+    /// A client that attaches before any output gets no repaint: an empty screen's repaint only
+    /// clears the host terminal, wiping what the user ran before attaching.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn early_client_keeps_its_terminal() {
+        let (session, _) = session();
+        let (client, mut reader) = client();
+        session.attach_client(&client).await.unwrap();
+        session.feed_output(b"first").await;
+        assert_eq!(
+            frame(&mut reader).await,
+            AgentOutput::Out(b"first".to_vec())
         );
     }
 
@@ -566,7 +577,6 @@ mod tests {
         let (session, _) = session();
         let (client, mut reader) = client();
         let id = session.attach_client(&client).await.unwrap();
-        let _ = frame(&mut reader).await;
 
         assert_eq!(
             session.detach_client(id).await,
@@ -694,7 +704,6 @@ mod tests {
         .unwrap();
         let (client, mut reader) = client();
         session.attach_client(&client).await.unwrap();
-        let _ = frame(&mut reader).await;
         session.send_input(&vec![0; 1 << 20]).await.unwrap();
 
         cancellation.cancel();
@@ -748,7 +757,6 @@ mod tests {
         let (healthy, mut healthy_reader) = client();
         session.attach_client(&stalled).await.unwrap();
         session.attach_client(&healthy).await.unwrap();
-        let _ = frame(&mut healthy_reader).await;
 
         let bytes = vec![b'x'; 1 << 20];
         let reading = tokio::spawn(async move { frame(&mut healthy_reader).await });

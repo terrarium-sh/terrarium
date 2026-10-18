@@ -82,6 +82,7 @@ def tcp_info_source(source: str) -> str:
     return (
         re.search(r'^#define TERRA_TCP_SEGMENT_BYTES [0-9]+$', source, re.MULTILINE)[0] + '\n'
         + declaration(source, r'^static bool terra_udp_option\(') + '\n'
+        + declaration(source, r'^static bool terra_keepalive_option\(') + '\n'
         + declaration(source, r'^static int terra_getsockopt\(') + '\n'
         + declaration(source, r'^static int terra_send_stream\(') + '\n'
     )

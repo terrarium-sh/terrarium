@@ -3,6 +3,7 @@
 use super::*;
 use std::future::poll_fn;
 use std::time::Duration;
+use terra_protocol::application::{TcpKeepalive, TcpOpenOptions};
 use terra_protocol::network::{DatagramBatch, SendFailure, TcpEvent, UdpReply, UdpRequest};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -83,7 +84,12 @@ async fn malformed_or_out_of_order_tcp_events_disconnect_the_client() {
             let (client, mut broker) = fake_broker();
             let peer: SocketAddr = PEER.parse().unwrap();
             let (flow, (_, mut stream)) = tokio::join!(
-                async { client.open_tcp(peer, false).await.unwrap() },
+                async {
+                    client
+                        .open_tcp(peer, TcpOpenOptions::default())
+                        .await
+                        .unwrap()
+                },
                 broker.answer(Ok(Opened::Tcp { peer }))
             );
             let (mut upload, mut download) = flow.split();
@@ -129,7 +135,7 @@ async fn open_replies_that_do_not_match_the_request_disconnect_the_client() {
                     if is_accept {
                         client.accept(1).await
                     } else {
-                        client.open_tcp(loopback, false).await
+                        client.open_tcp(loopback, TcpOpenOptions::default()).await
                     }
                     .err()
                 },
@@ -155,9 +161,13 @@ async fn open_replies_that_do_not_match_the_request_disconnect_the_client() {
 #[tokio::test]
 async fn broker_errors_are_returned_without_disconnecting() {
     bounded(async {
+        let options = TcpOpenOptions {
+            inline_urgent: true,
+            keepalive: TcpKeepalive::new(60, 15, 9),
+        };
         let (client, mut broker) = fake_broker();
         let (result, (open, _)) = tokio::join!(
-            client.open_tcp(PEER.parse().unwrap(), true),
+            client.open_tcp(PEER.parse().unwrap(), options),
             broker.answer(Err(Error::AccessDenied))
         );
         assert_eq!(result.err(), Some(Error::AccessDenied));
@@ -165,7 +175,7 @@ async fn broker_errors_are_returned_without_disconnecting() {
             open,
             Open::Tcp {
                 peer: PEER.parse().unwrap(),
-                inline_urgent: true
+                options
             }
         );
         assert!(client.is_available());
@@ -267,7 +277,10 @@ async fn disconnecting_fails_pending_calls() {
         client.disconnect();
         assert_eq!(pending.await.unwrap(), Err(Error::Closed));
         assert_eq!(
-            client.open_tcp(PEER.parse().unwrap(), false).await.err(),
+            client
+                .open_tcp(PEER.parse().unwrap(), TcpOpenOptions::default())
+                .await
+                .err(),
             Some(Error::Closed)
         );
     })

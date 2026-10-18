@@ -15,7 +15,7 @@ tokio = { version = "1", features = ["rt", "net", "io-util", "sync", "time", "ma
 futures-util = { version = "0.3", default-features = false, features = ["alloc", "std"] }
 tokio-util = { version = "0.7", features = ["rt", "compat"] }
 yamux = "=0.14.1"
-socket2 = "0.6"
+socket2 = { version = "0.6", features = ["all"] }
 lru = "0.18"
 quinn-udp = { version = "=0.6.3", default-features = false }
 

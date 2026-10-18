@@ -109,6 +109,13 @@ int main(void) {
     assert(terra_getsockopt(&socket, SOL_TCP, TCP_INFO, (char *)&information, &length) == -EINVAL);
     length = sizeof(information);
     assert(terra_getsockopt(&socket, SOL_TCP, TCP_INFO, NULL, &length) == -EFAULT);
+    int before_keepalive_calls = native_calls;
+    length = sizeof(information);
+    assert(terra_getsockopt(&socket, SOL_TCP, TCP_KEEPIDLE, (char *)&information, &length) == 17 &&
+           native_calls == before_keepalive_calls + 1);
+    assert(terra_getsockopt(&socket, SOL_TCP, TCP_CONGESTION, (char *)&information, &length) == -ENOPROTOOPT &&
+           native_calls == before_keepalive_calls + 1);
+    native_calls = before_keepalive_calls;
     state.mode = 0;
     send_result = 7;
     assert(check_tcp_send(&socket, &message, 7) == 7 && native_calls == 1 &&

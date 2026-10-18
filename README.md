@@ -15,7 +15,7 @@ a short YAML recipe.
 > **Under construction.** The docs are incomplete and the code is still under
 > internal review.
 
-![Terminal demo: create a box from dev.yaml, then enter it.](docs/demo.gif)
+![Terminal demo: set up a box from dev.yaml, enter it, reach an allowed host, get blocked on another, detach.](docs/demo.gif)
 
 ## What you can do with it
 

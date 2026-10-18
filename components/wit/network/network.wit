@@ -38,7 +38,9 @@ interface broker {
     resource listener {
         accept: func() -> tuple<stream<tcp>, future<result<_, error>>>;
     }
-    open-tcp: async func(peer: socket-address, inline-urgent: bool) -> result<tcp, error>;
+    record tcp-keepalive { idle-secs: u16, interval-secs: u16, probe-count: u16 }
+    record tcp-open-options { inline-urgent: bool, keepalive: option<tcp-keepalive> }
+    open-tcp: async func(peer: socket-address, options: tcp-open-options) -> result<tcp, error>;
     open-udp: async func() -> result<udp, error>;
     published-listener: func(host-port: u16, ipv6: bool) -> result<listener, error>;
     published-udp: async func(host-port: u16, ipv6: bool) -> result<udp, error>;

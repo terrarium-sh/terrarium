@@ -10,6 +10,7 @@
 #include <linux/fib_rules.h>
 #include <linux/rtnetlink.h>
 #include <linux/veth.h>
+#include <netinet/tcp.h>
 #include <netinet/udp.h>
 #include <netdb.h>
 #include <sched.h>
@@ -1922,6 +1923,43 @@ static void serve_published_udp(unsigned short port, int loopback_only) {
     }
 }
 
+/* libuv arms keepalive before connect (Node's fetch, npm). The broker's socket carries the
+ * one-second timings, so the idle connection must survive their probes; a change after connect
+ * would never reach the broker and is refused. */
+static void exercise_tcp_keepalive(const struct sockaddr *address, socklen_t length) {
+    int fd = socket(address->sa_family, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    require(fd >= 0, "TCP keepalive socket");
+    int enabled = 1, fast = 1;
+    require(setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &enabled, sizeof(enabled)) == 0 &&
+            setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &fast, sizeof(fast)) == 0 &&
+            setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &fast, sizeof(fast)) == 0 &&
+            setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &fast, sizeof(fast)) == 0, "pre-connect keepalive");
+    require(connect(fd, address, length) == 0, "TCP keepalive connect");
+    require(setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &enabled, sizeof(enabled)) == -1 && errno == EOPNOTSUPP,
+            "post-connect SO_KEEPALIVE refused");
+    require(setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &fast, sizeof(fast)) == -1 && errno == EOPNOTSUPP,
+            "post-connect TCP_KEEPIDLE refused");
+    int value = 0;
+    socklen_t value_length = sizeof(value);
+    require(getsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &value, &value_length) == 0 && value == 1, "SO_KEEPALIVE readback");
+    value_length = sizeof(value);
+    require(getsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &value, &value_length) == 0 && value == fast, "TCP_KEEPIDLE readback");
+    sleep(3);
+    value_length = sizeof(value);
+    require(getsockopt(fd, SOL_SOCKET, SO_ERROR, &value, &value_length) == 0 && value == 0, "idle keepalive connection stays healthy");
+    write_all(fd, (const unsigned char *)"keep", 4);
+    require(shutdown(fd, SHUT_WR) == 0, "TCP keepalive client FIN");
+    unsigned char echoed[4];
+    size_t received = 0;
+    while (received < sizeof(echoed)) {
+        ssize_t count = recv(fd, echoed + received, sizeof(echoed) - received, 0);
+        require(count > 0, "TCP keepalive echo");
+        received += (size_t)count;
+    }
+    require(memcmp(echoed, "keep", 4) == 0, "TCP keepalive echo bytes");
+    close(fd);
+}
+
 int main(int argc, char **argv) {
     alarm(90);
     signal(SIGPIPE, SIG_IGN);
@@ -1980,6 +2018,8 @@ int main(int argc, char **argv) {
     trace_phase("SOCKET_TCP_PEEK_OFFSET_PRE_CONNECT");
     exercise_tcp_peek_offset((struct sockaddr *)&peer, sizeof(peer), 1);
     puts("SOCKET_TCP_PEEK_OFFSET_OK");
+    exercise_tcp_keepalive((struct sockaddr *)&peer, sizeof(peer));
+    puts("SOCKET_TCP_KEEPALIVE_OK");
     exercise_concurrent_tcp((struct sockaddr *)&peer, sizeof(peer));
     exercise_udp(argv[2], parse_port(argv[4]), parse_port(argv[5]));
     exercise_udp_native_first(argv[2], parse_port(argv[4]));

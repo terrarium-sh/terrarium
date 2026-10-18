@@ -11,6 +11,7 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::task::Poll;
+use terra_protocol::application::TcpOpenOptions;
 use terra_protocol::network::{ListenerGrant, MAX_NETWORK_NAME_BYTES, Open, Opened};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot};
@@ -59,13 +60,12 @@ impl Client {
         self.0.closed.cancel();
     }
 
-    pub async fn open_tcp(&self, peer: SocketAddr, inline_urgent: bool) -> Result<TcpFlow, Error> {
-        let (stream, opened) = self
-            .open_stream(&Open::Tcp {
-                peer,
-                inline_urgent,
-            })
-            .await?;
+    pub async fn open_tcp(
+        &self,
+        peer: SocketAddr,
+        options: TcpOpenOptions,
+    ) -> Result<TcpFlow, Error> {
+        let (stream, opened) = self.open_stream(&Open::Tcp { peer, options }).await?;
         match opened {
             Opened::Tcp { peer: opened_peer } if opened_peer == peer => {
                 Ok(TcpFlow::start(self, stream, peer))
