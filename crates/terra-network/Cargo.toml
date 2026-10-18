@@ -26,7 +26,7 @@ libc.workspace = true
 windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock", "Win32_System_IO"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["test-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "test-util"] }
 
 [lints]
 workspace = true

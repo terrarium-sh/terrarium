@@ -225,6 +225,42 @@ async fn unrequested_or_empty_udp_replies_disconnect_the_client() {
     .await;
 }
 
+/// A guest that closes its UDP socket while a requested batch is in flight ends only that flow:
+/// the batch has no call left to take it, which is not a broker protocol violation. Two workers let
+/// the drop land while the flow task routes the reply; one thread always sees the close first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closing_a_udp_flow_with_a_reply_in_flight_keeps_the_client() {
+    bounded(async {
+        let (client, mut broker) = fake_broker();
+        for yields in (0..16).cycle().take(512) {
+            let (flow, (_, mut stream)) = tokio::join!(
+                async { client.open_udp().await.unwrap() },
+                broker.answer(Ok(Opened::Udp))
+            );
+            let receiving = tokio::spawn({
+                let flow = flow.clone();
+                async move { flow.receive().await }
+            });
+            let request = crate::frames::read_frame::<UdpRequest>(&mut stream)
+                .await
+                .unwrap();
+            assert_eq!(request, Some(UdpRequest::Receive));
+            receiving.abort();
+            let _ = receiving.await;
+            crate::frames::write_frame(&mut stream, &UdpReply::Datagrams(one_datagram()))
+                .await
+                .unwrap();
+            for _ in 0..yields {
+                tokio::task::yield_now().await;
+            }
+            drop(flow);
+            while stream.read(&mut [0; 1]).await.is_ok_and(|read| read > 0) {}
+            assert!(client.is_available());
+        }
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn out_of_range_send_failures_disconnect_the_client() {
     bounded(async {

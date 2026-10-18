@@ -205,7 +205,9 @@ async fn run(
                     Err(_) => false,
                 };
                 if !is_routed {
-                    client.disconnect();
+                    if !closed.is_cancelled() {
+                        client.disconnect();
+                    }
                     return;
                 }
                 reply = Box::pin(read_reply(read));
