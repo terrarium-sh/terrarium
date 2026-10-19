@@ -87,6 +87,8 @@ This recipe:
 - installs Node.js, npm and Git the first time the box is created.
 
 If your tools need other sites, add them to `network.allow`.
+For more ready-made recipes, see
+[terrarium_examples](https://github.com/terrarium-sh/terrarium_examples).
 
 **2. Create the box and go in:**
 

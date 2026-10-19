@@ -111,6 +111,7 @@ terra</code></pre><CopyButton text={() => setupCode?.textContent?.trimEnd() ?? '
   entrypoint: /bin/sh</code></pre><CopyButton text={() => recipeCode?.textContent?.trimEnd() ?? ''} label="Copy dev.yaml recipe" /></div>
     <div class="copyable-block"><div class="terminal-line"><span aria-hidden="true">$</span> terra ./dev.yaml setup<br /><span aria-hidden="true">$</span> terra</div><CopyButton text={'terra ./dev.yaml setup\nterra'} label="Copy terminal commands" /></div>
     <p>Public network access is opt-in.<br />Host files stay private until you share them.</p>
+    <p class="small">More recipes: <a href="https://github.com/terrarium-sh/terrarium_examples" target="_blank" rel="noopener noreferrer">terrarium_examples</a></p>
   </div>
 </section>
 
