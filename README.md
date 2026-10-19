@@ -1,4 +1,4 @@
-# 🪴 Terrarium
+# <img src="web/static/favicon.svg" alt="" width="40" height="40" align="top"> Terrarium
 
 **Give your agent room to work. Decide what it can touch.**
 
