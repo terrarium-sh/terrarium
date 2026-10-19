@@ -85,7 +85,7 @@ COMPONENT_AOT_TARGETS := $(addsuffix -aot,$(COMPONENT_TARGETS))
 COMPONENT_MANIFEST := components/Cargo.toml
 COMPONENT_WASM_DIR := components/target/wasm-components/release
 
-.PHONY: $(COMPONENT_TARGETS) $(COMPONENT_AOT_TARGETS) policy policy-check verify-source verify-host-components guest-assets check-guest-assets host-build host-dist source-dist verify-wit verify-dependency-boundaries verify-platform build verify verify-components verify-workspace dist man clean test-component-boot test-platform-native-vm test-component-vmm test-install check-zig check-bubblewrap
+.PHONY: $(COMPONENT_TARGETS) $(COMPONENT_AOT_TARGETS) policy policy-check verify-source verify-host-components guest-assets check-guest-assets host-build host-dist source-dist verify-wit verify-dependency-boundaries verify-platform build verify verify-components verify-workspace dist man skill clean test-component-boot test-platform-native-vm test-component-vmm test-install check-zig check-bubblewrap
 
 # Pin changes invalidate every embedded guest payload.
 PINS := $(ARCH) $(KERNEL_VERSION) $(KERNEL_SHA256) $(E2FSPROGS_VERSION) $(E2FSPROGS_SHA256) \
@@ -418,6 +418,7 @@ verify-source:
 	python3 -B scripts/pins/test-pin-updates.py || $(CHECK_FAILURE); \
 	python3 -B scripts/kernel/check-vsock-abi.py || $(CHECK_FAILURE); \
 	python3 -B scripts/checks/test-native-gates.py || $(CHECK_FAILURE); \
+	python3 -B scripts/docs/render-agent-skill.py --check || $(CHECK_FAILURE); \
 	scripts/checks/test-install.sh || $(CHECK_FAILURE); \
 	$(CARGO) fmt --all -- --check || $(CHECK_FAILURE); \
 	$(CARGO) fmt --manifest-path fuzz/Cargo.toml -- --check || $(CHECK_FAILURE); \
@@ -466,6 +467,11 @@ check-zig:
 ## out of the release build's dependency graph.
 man:
 	$(CARGO_LOCKED) run -p terra --example gen-docs --target $(TERRA_TARGET)
+
+## Render the agent skill (skills/terra-box/SKILL.md) from packaging/agent-skill.md
+## and the docs it includes. verify-source fails while the committed copy is stale.
+skill:
+	python3 -B scripts/docs/render-agent-skill.py
 
 ## Assemble dist/terra — the single fully-static, portable binary.
 dist: build man

@@ -1,14 +1,89 @@
-//! Security docs quote these bounds; each phrase is rendered from the constant that enforces it.
+//! Docs and the agent skill template checked against the code they describe.
 
-fn read_doc(name: &str) -> String {
+use std::collections::BTreeSet;
+
+fn read_repo_text(relative: &str) -> String {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../docs")
-        .join(name);
+        .join("../..")
+        .join(relative);
     std::fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("reading {}: {error}", path.display()))
+}
+
+fn read_doc(name: &str) -> String {
+    read_repo_text(&format!("docs/{name}"))
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn list_yaml_blocks(markdown: &str) -> Vec<&str> {
+    markdown
+        .split("```yaml\n")
+        .skip(1)
+        .map(|rest| rest.split("```").next().unwrap())
+        .collect()
+}
+
+fn collect_key_paths(value: &yaml_serde::Value, path: &str, paths: &mut BTreeSet<String>) {
+    match value {
+        yaml_serde::Value::Mapping(mapping) => {
+            for (key, child) in mapping {
+                let path = format!("{path}.{}", key.as_str().unwrap());
+                collect_key_paths(child, &path, paths);
+                paths.insert(path);
+            }
+        }
+        yaml_serde::Value::Sequence(items) => {
+            for item in items {
+                collect_key_paths(item, &format!("{path}[]"), paths);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn list_key_paths(value: &yaml_serde::Value) -> BTreeSet<String> {
+    let mut paths = BTreeSet::new();
+    collect_key_paths(value, "", &mut paths);
+    paths
+}
+
+/// The recipe reference introduces its first example with "Every field". A
+/// `Config` field missing from it, or a key `Config` no longer has, fails here.
+#[test]
+fn the_recipe_reference_example_names_every_field() {
+    let reference = read_repo_text("docs/recipe.md");
+    let example = list_yaml_blocks(&reference)[0];
+    let config: crate::config::Config = yaml_serde::from_str(example).unwrap();
+    let documented = list_key_paths(&yaml_serde::from_str(example).unwrap());
+    let fields = list_key_paths(&yaml_serde::to_value(&config).unwrap());
+    let mismatched: Vec<_> = documented.symmetric_difference(&fields).collect();
+    assert!(
+        mismatched.is_empty(),
+        "docs/recipe.md's first example and Config disagree on {mismatched:?}"
+    );
+}
+
+/// Every YAML block in the agent skill is a manifest or a recipe terra accepts,
+/// so the skill cannot teach a field name or value terra refuses.
+#[test]
+fn agent_skill_examples_are_accepted() {
+    let skill = read_repo_text("skills/terra-box/SKILL.md");
+    let blocks = list_yaml_blocks(&skill);
+    assert_ne!(blocks.len(), 0, "the agent skill has no ```yaml blocks");
+    for block in blocks {
+        let project = tempfile::tempdir().unwrap();
+        if block.starts_with("boxes:") {
+            std::fs::write(project.path().join(crate::config::MANIFEST_FILE), block).unwrap();
+            crate::config::load_manifest(project.path())
+                .unwrap()
+                .unwrap();
+        } else {
+            crate::config::parse_recipe(block, project.path(), &project.path().join("box.yaml"))
+                .unwrap_or_else(|error| panic!("{error:#}\n{block}"));
+        }
+    }
 }
 
 /// A changed constant or a hand-edited doc number fails here until both agree again.

@@ -137,6 +137,8 @@ To learn what Terrarium protects against and where it stops, read the
 - [Usage guide](docs/usage.md): install options, commands, file sync and storage.
 - [Recipe reference](docs/recipe.md): network access, mounts, packages and workloads.
 - [Project manifest](docs/manifest.md): manage several boxes with `terra.yaml`.
+- [Agent skill](docs/usage.md#let-an-agent-build-the-box): let your coding agent
+  write and set up boxes from your requirements.
 - [Security model](docs/security.md): trust boundaries, enforcement and limits.
 - [Host process sandboxing](docs/sandboxing.md): which processes a box uses and
   how each OS confines them.
