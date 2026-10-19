@@ -216,7 +216,7 @@ nav a[aria-current] { color: var(--accent-strong); background: var(--accent-soft
 #install-commands pre { white-space: pre-wrap; overflow-wrap: anywhere; }
 .start-section p { font-size: 0.92rem; }
 .reading-section { border-top: 1px solid var(--frost-border-color); padding-top: 2.5rem; }
-.reading-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1.3rem; margin-top: 2rem; }
+.reading-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1.3rem; margin-top: 2rem; }
 .reading-grid a { position: relative; color: var(--text-color); padding: 1.75rem; border: 1px solid var(--frost-border-color); background: #fffdf780; border-radius: 16px; text-decoration: none; }
 .reading-grid a::after { content: "↗"; display: block; margin-top: 1.5rem; color: var(--accent); font-size: 1.25rem; }
 .reading-grid a:hover { background: var(--accent-soft); border-color: var(--accent); }

@@ -3,7 +3,7 @@ import { guideEntries } from '$lib/server/guides';
 
 export const prerender = true;
 
-const paths = ['/', '/commands/', ...guideEntries.map(({ slug }) => `/docs/${slug}/`)];
+const paths = ['/', '/commands/', '/skill.md', ...guideEntries.map(({ slug }) => `/docs/${slug}/`)];
 
 export const GET = ({ url }) =>
 	new Response(

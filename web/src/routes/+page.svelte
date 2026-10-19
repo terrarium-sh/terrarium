@@ -120,5 +120,6 @@ terra</code></pre><CopyButton text={() => setupCode?.textContent?.trimEnd() ?? '
     <a href="{base}/commands/"><h3>Command reference</h3><p>Find a command, flag, or example. Generated directly from the CLI.</p></a>
     <a href="{base}/docs/recipe/"><h3>Write a recipe</h3><p>Configure resources, mounts, network access, and lifecycle hooks.</p></a>
     <a href="{base}/docs/security/"><h3>Understand the boundary</h3><p>What Terra isolates, what it trusts, and how its devices are sandboxed.</p></a>
+    <a href="{base}/skill.md"><h3>Agent skill</h3><p>Let your coding agent write, check, and smoke-test a box. Save as <code>.claude/skills/terra-box/SKILL.md</code>.</p></a>
   </div>
 </section>
