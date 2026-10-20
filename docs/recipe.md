@@ -31,6 +31,7 @@ env:
   MODEL: example
 env_file: .env  # create this file, or omit env_file
 network:
+  enabled: true
   mode: allowlist
   allow: [dl-cdn.alpinelinux.org:443, db.local:5432]
   hosts:
@@ -129,7 +130,9 @@ fail and no broker runs. Such a recipe must use allowlist mode with empty
   record alone allows nothing; add a matching `allow` rule.
 - **`ports`** publishes a guest listener on host loopback. `"8080"` maps the
   same port, `"3000:80"` maps host 3000 to guest 80, and `/udp` selects UDP, as
-  in `"5353:53/udp"`. TCP and UDP can share a host port.
+  in `"5353:53/udp"`. TCP and UDP can share a host port. The guest service must
+  listen on all interfaces, such as `0.0.0.0`: a listener on `127.0.0.1` alone
+  is unreachable.
 
 Limits:
 
@@ -146,8 +149,10 @@ Limits:
 ## Processes
 
 - `hooks.on_create` runs once as guest root during setup, before mounts exist.
+  It uses the recipe's network rules, and setup prints its output.
 - `hooks.on_start` runs as guest root before every workload start.
 - `hooks.pre_stop` runs during an orderly stop.
+- `on_start` and `pre_stop` output go to the box's session.
 - `daemons` are background shell commands. A nonzero exit restarts the daemon
   after one second; exit zero ends it.
 
@@ -159,7 +164,8 @@ as root; `terra <box> exec --root -- CMD` runs only that command as root.
 
 ## Applying changes
 
-Run `terra <box> setup` after editing a recipe. `--dry-run` checks it without
-changing anything. `--rebuild` discards the root filesystem, reruns
-`on_create` and removes volume images the recipe no longer names. Read
+Stop the box and run `terra <box> setup` after editing a recipe. `--dry-run`
+checks it without changing anything. `--rebuild` discards the root filesystem,
+reruns `on_create` and removes volume images the recipe no longer names; without
+it, an edited `on_create` does not run. Read
 [usage](usage.md) and [security](security.md) before granting host access.

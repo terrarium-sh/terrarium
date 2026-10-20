@@ -58,7 +58,7 @@ function collectCommands(path, description, records) {
 }
 
 const version = execFileSync(terra, ['--version'], options).trim();
-const binaryRelease = version.match(/^terra (\d+\.\d+\.\d+)(?:\+\S+)?$/)?.[1];
+const binaryRelease = version.match(/^terra (\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)(?:\+\S+)?$/)?.[1];
 const releaseTag = process.env.TERRA_RELEASE_TAG || (binaryRelease ? `v${binaryRelease}` : null);
 if (releaseTag && releaseTag !== `v${binaryRelease}`) {
   throw new Error(`Release ${releaseTag} does not match binary ${version}`);

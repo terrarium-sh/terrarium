@@ -52,6 +52,9 @@ test('renders nested commands with corrected usage and stable metadata', (t) => 
   const mismatch = generate(binary, output, fixture, 'v1.0.0');
   assert.notEqual(mismatch.status, 0);
   assert.match(mismatch.stderr, /does not match binary/);
+  const prerelease = { ...fixture, '--version': 'terra 0.1.0-beta+f92dbb1\n' };
+  assert.equal(generate(binary, output, prerelease, 'v0.1.0-beta').status, 0);
+  assert.equal(JSON.parse(readFileSync(join(dir, 'version.json'), 'utf8')).releaseTag, 'v0.1.0-beta');
   assert.equal(generate(binary, output, { ...fixture, '--version': 'terra dev+abcdef' }).status, 0);
   assert.equal(JSON.parse(readFileSync(join(dir, 'version.json'), 'utf8')).releaseTag, null);
   const nestedFailure = { ...fixture };

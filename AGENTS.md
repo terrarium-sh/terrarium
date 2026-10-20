@@ -13,6 +13,10 @@
 *   **Scripts read Rust sources:** checks under `scripts/` parse source text
     (fixture paths in `test_fixtures.rs`). The fast path skips them; after
     moving or renaming code, run `make verify-source`.
+*   **Agent skill:** `skills/terra-box/SKILL.md` is rendered from
+    `packaging/agent-skill.md` and `docs/{recipe,manifest}.md`. After editing
+    any of them, run `make skill` and commit the result; `make verify-source`
+    fails on drift.
 *   **CLI Updates:** `crates/terra/src/cli.rs` is the source of truth for the man
     pages; `make man` re-renders them (they are generated, not committed).
 *   **Boot Tests:** Requires `/dev/kvm`. Run: `make dist && TERRA_BIN=$PWD/dist/terra cargo test -p terra --test boot -- --ignored`

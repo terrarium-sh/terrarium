@@ -111,6 +111,7 @@ terra</code></pre><CopyButton text={() => setupCode?.textContent?.trimEnd() ?? '
   entrypoint: /bin/sh</code></pre><CopyButton text={() => recipeCode?.textContent?.trimEnd() ?? ''} label="Copy dev.yaml recipe" /></div>
     <div class="copyable-block"><div class="terminal-line"><span aria-hidden="true">$</span> terra ./dev.yaml setup<br /><span aria-hidden="true">$</span> terra</div><CopyButton text={'terra ./dev.yaml setup\nterra'} label="Copy terminal commands" /></div>
     <p>Public network access is opt-in.<br />Host files stay private until you share them.</p>
+    <p class="small">More recipes: <a href="https://github.com/terrarium-sh/terrarium_examples" target="_blank" rel="noopener noreferrer">terrarium_examples</a></p>
   </div>
 </section>
 
@@ -120,5 +121,6 @@ terra</code></pre><CopyButton text={() => setupCode?.textContent?.trimEnd() ?? '
     <a href="{base}/commands/"><h3>Command reference</h3><p>Find a command, flag, or example. Generated directly from the CLI.</p></a>
     <a href="{base}/docs/recipe/"><h3>Write a recipe</h3><p>Configure resources, mounts, network access, and lifecycle hooks.</p></a>
     <a href="{base}/docs/security/"><h3>Understand the boundary</h3><p>What Terra isolates, what it trusts, and how its devices are sandboxed.</p></a>
+    <a href="{base}/skill.md"><h3>Agent skill</h3><p>Let your coding agent write, check, and smoke-test a box. Save as <code>.claude/skills/terra-box/SKILL.md</code>.</p></a>
   </div>
 </section>
