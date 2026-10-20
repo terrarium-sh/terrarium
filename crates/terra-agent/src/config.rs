@@ -136,6 +136,8 @@ fn encode_interface_address(address: std::net::Ipv4Addr) -> [u8; 16] {
     bytes
 }
 
+pub(super) const VOLUME_MOUNT_FLAGS: MountFlags = MountFlags::NOSUID.union(MountFlags::NODEV);
+
 pub(super) fn mount_filesystems(plan: &terra_protocol::Plan) -> Result<()> {
     for share in &plan.shares {
         mount_share(share)?;
@@ -146,7 +148,7 @@ pub(super) fn mount_filesystems(plan: &terra_protocol::Plan) -> Result<()> {
             Some(&volume.dev),
             &volume.guest,
             Some("ext4"),
-            MountFlags::NOSUID | MountFlags::NODEV,
+            VOLUME_MOUNT_FLAGS,
         )?;
         let (uid, gid) = crate::workload::workload_owner();
         if !plan.root

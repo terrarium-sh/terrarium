@@ -1085,6 +1085,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "lz4_flex"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ecbdfe44b1bd960b68170b417450a628c43f7cf56bb3c5317e61cb230ee7f226"
+
+[[package]]
 name = "mach2"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1582,6 +1588,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
+name = "signal-hook-registry"
+version = "1.4.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
+dependencies = [
+ "errno",
+ "libc",
+]
+
+[[package]]
 name = "simd-adler32"
 version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1817,6 +1833,7 @@ dependencies = [
  "async-io",
  "cap-primitives",
  "libc",
+ "object",
  "rustix",
  "tempfile",
  "tokio",
@@ -1857,6 +1874,8 @@ dependencies = [
 name = "terra-protocol"
 version = "0.0.1"
 dependencies = [
+ "crc32fast",
+ "lz4_flex",
  "postcard",
  "serde",
  "serde_bytes",
@@ -1881,6 +1900,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "wasmtime",
+ "wasmtime-internal-jit-icache-coherence",
  "wasmtime-wasi",
  "windows-sys 0.61.2",
  "yamux",
@@ -2003,6 +2023,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",

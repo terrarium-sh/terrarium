@@ -24,7 +24,7 @@ terra-limits = { path = "../terra-limits" }
 terra-network = { path = "../terra-network" }
 terra-policy = { path = "../terra-policy" }
 terra-sandbox = { path = "../terra-sandbox" }
-terra-protocol = { path = "../terra-protocol", features = ["tokio"] }
+terra-protocol = { path = "../terra-protocol", features = ["tokio", "packed-image"] }
 clap.workspace = true
 clap_complete = "4"
 anyhow.workspace = true
@@ -36,7 +36,7 @@ crossterm = { version = "0.29", default-features = false, features = ["windows"]
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 terra-runtime = { path = "../terra-runtime" }
 terra-platform = { path = "../terra-platform" }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "signal", "sync", "time"] }
 libc.workspace = true
 rustix.workspace = true
 tempfile.workspace = true
@@ -56,6 +56,7 @@ terra-build = { path = "../terra-build" }
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 notify = "8.2"
 clap_mangen = "0.3"
+wasmtime = { version = "=49.0.3", default-features = false }
 
 [lints]
 workspace = true

@@ -566,7 +566,11 @@ mod tests {
                     &boot,
                     prepared.config(),
                     prepared.ram().unwrap(),
-                    kernel,
+                    terra_protocol::packed_image::pack_fast_leaked(
+                        &kernel,
+                        terra_protocol::guest_image::GuestImage::Kernel,
+                    )
+                    .unwrap(),
                     "root=/dev/vda",
                 )
                 .await

@@ -45,6 +45,13 @@ ALPINE_SOURCE_DIST := $(BUILD)/alpine-corresponding-source.tar.gz
 include pins.mk
 
 KERNEL_GZ := $(BUILD)/vmlinux.gz
+# terra embeds the kernel and boot disk repacked as chunked LZ4: the kernel then
+# decodes in a few milliseconds per boot, and the boot disk is read in place.
+# The marked gzip files stay the build's artifacts, so the kernel cache and its
+# input hash do not depend on the embedded format.
+KERNEL_IMAGE := $(BUILD)/vmlinux.tlz4
+PACKED_IMAGE_INPUTS := crates/terra-protocol/src/packed_image.rs crates/terra-protocol/examples/repack-guest-image.rs
+REPACK_GUEST_IMAGE := $(CARGO_LOCKED) run -p terra-protocol --features packer --example repack-guest-image --
 E2FSPROGS_SRC := $(BUILD)/e2fsprogs-$(E2FSPROGS_VERSION)
 MKE2FS := $(BUILD)/mke2fs
 RESIZE2FS := $(BUILD)/resize2fs
@@ -180,6 +187,9 @@ kernel-export: $(KERNEL_GZ)
 	python3 scripts/kernel/kernel-artifact.py export $(KERNEL_GZ) $(KERNEL_OUTPUT)/.config $(KERNEL_INPUTS) $(BUILD)/terra-kernel-$(ARCH).tar.gz
 	sha256sum $(BUILD)/terra-kernel-$(ARCH).tar.gz > $(BUILD)/terra-kernel-$(ARCH).tar.gz.sha256
 
+$(KERNEL_IMAGE): $(KERNEL_GZ) $(PACKED_IMAGE_INPUTS)
+	$(REPACK_GUEST_IMAGE) kernel $< $@
+
 ## Static mke2fs — a *build-time* tool only: it bakes the prebaked images below.
 ## It is not shipped in the binary; the guest grows those images with resize2fs.
 $(MKE2FS): $(PIN_STAMP)
@@ -297,9 +307,10 @@ $(SOCKET_PROBE): crates/terra/tests/assets/socket_probe.c $(PIN_STAMP) Makefile 
 
 # Built-in drivers let the kernel boot directly from this small read-only disk.
 BOOT_TREE := $(BUILD)/boot-tree
-BOOT_IMG := $(BUILD)/boot.img.gz
+BOOT_GZ := $(BUILD)/boot.img.gz
+BOOT_IMAGE := $(BUILD)/boot.img.tlz4
 BOOT_IMG_MIB := 3
-$(BOOT_IMG): $(MKE2FS) $(RESIZE2FS) $(AGENT_BIN) $(PIN_STAMP) Makefile crates/terra-protocol/src/guest_image.rs crates/terra-protocol/examples/package-guest-image.rs
+$(BOOT_GZ): $(MKE2FS) $(RESIZE2FS) $(AGENT_BIN) $(PIN_STAMP) Makefile crates/terra-protocol/src/guest_image.rs crates/terra-protocol/examples/package-guest-image.rs
 	rm -rf $(BOOT_TREE)
 	# /dev is where the kernel auto-mounts devtmpfs (CONFIG_DEVTMPFS_MOUNT), which
 	# is what gives init a console and the disk nodes; /proc, /sys and /mnt are
@@ -310,23 +321,26 @@ $(BOOT_IMG): $(MKE2FS) $(RESIZE2FS) $(AGENT_BIN) $(PIN_STAMP) Makefile crates/te
 	rm -f $(BUILD)/boot.img
 	truncate -s $(BOOT_IMG_MIB)M $(BUILD)/boot.img
 	unshare -U -r $(MKE2FS) -F -q -t ext4 -b 4096 -m 0 -O ^has_journal -d $(BOOT_TREE) $(BUILD)/boot.img
-	$(CARGO_LOCKED) run -p terra-protocol --example package-guest-image -- boot $(BUILD)/boot.img $(BOOT_IMG)
+	$(CARGO_LOCKED) run -p terra-protocol --example package-guest-image -- boot $(BUILD)/boot.img $(BOOT_GZ)
+
+$(BOOT_IMAGE): $(BOOT_GZ) $(PACKED_IMAGE_INPUTS)
+	$(REPACK_GUEST_IMAGE) boot $< $@
 
 ## Build the static terra binary (embeds vmlinux, prebaked images, and trusted
 ## component artifacts).
-build: $(COMPONENT_AOT_TARGETS) $(KERNEL_GZ) $(ROOTFS_IMG) $(VOLUME_IMG) $(BOOT_IMG) $(BWRAP) $(SOCKET_PROBE)
+build: $(COMPONENT_AOT_TARGETS) $(KERNEL_IMAGE) $(ROOTFS_IMG) $(VOLUME_IMG) $(BOOT_IMAGE) $(BWRAP) $(SOCKET_PROBE)
 	$(CARGO_LOCKED) build --release -p terra --target $(TERRA_TARGET)
 
 # Guest payloads are produced on Linux and then embedded by each native host
 # build. This keeps macOS and Windows releases free of host mkfs/container
 # tooling while preserving one architecture-specific Linux guest per executable.
-guest-assets: $(KERNEL_GZ) $(ROOTFS_IMG) $(VOLUME_IMG) $(BOOT_IMG) $(BWRAP) $(SOCKET_PROBE)
+guest-assets: $(KERNEL_IMAGE) $(ROOTFS_IMG) $(VOLUME_IMG) $(BOOT_IMAGE) $(BWRAP) $(SOCKET_PROBE)
 
 # A host build receives these architecture-matched files from a Linux guest
 # build. Check them as inputs so a fresh macOS checkout never tries to rebuild
 # the guest kernel, rootfs, or Linux agent because artifact mtimes changed.
 check-guest-assets:
-	@for asset in $(KERNEL_GZ) $(ROOTFS_IMG) $(VOLUME_IMG) $(BOOT_IMG) $(LINUX_BWRAP_ASSET) $(SOCKET_PROBE); do test -s $$asset || { echo "missing staged guest asset: $$asset" >&2; exit 1; }; done
+	@for asset in $(KERNEL_IMAGE) $(ROOTFS_IMG) $(VOLUME_IMG) $(BOOT_IMAGE) $(LINUX_BWRAP_ASSET) $(SOCKET_PROBE); do test -s $$asset || { echo "missing staged guest asset: $$asset" >&2; exit 1; }; done
 
 host-build: check-guest-assets $(COMPONENT_AOT_TARGETS)
 	$(CARGO_LOCKED) build --release -p terra --target $(TERRA_TARGET)
@@ -376,7 +390,7 @@ $(COMPONENT_AOT_TARGETS): component-%-aot: component-%
 	mkdir -p $(BUILD)
 	$(CARGO_LOCKED) run --target $(TERRA_TARGET) -p terra-runtime --features compiler --example precompile-component -- $(COMPONENT_WASM_DIR)/terra_$(subst -,_,$*)_component.wasm $(BUILD)/terra-$*-component.cwasm
 
-test-component-boot: $(COMPONENT_AOT_TARGETS) $(KERNEL_GZ) $(ROOTFS_IMG) $(BOOT_IMG)
+test-component-boot: $(COMPONENT_AOT_TARGETS) $(KERNEL_IMAGE) $(ROOTFS_IMG) $(BOOT_IMAGE)
 	$(CARGO_LOCKED) test $(TEST_FLAGS) -p terra-runtime --lib -- --ignored --nocapture
 
 # Cargo runs a target runner with the tested package's directory as its working
@@ -431,6 +445,7 @@ verify-workspace:
 	$(MAKE) verify-platform || $(CHECK_FAILURE); \
 	$(CARGO_LOCKED) clippy --workspace --all-targets --target $(MUSL) -- -D warnings || $(CHECK_FAILURE); \
 	$(CARGO_LOCKED) clippy -p terra-sandbox --features generator --all-targets --target $(MUSL) -- -D warnings || $(CHECK_FAILURE); \
+	$(CARGO_LOCKED) clippy -p terra-protocol --features packer --all-targets --target $(MUSL) -- -D warnings || $(CHECK_FAILURE); \
 	$(CARGO_LOCKED) clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings || $(CHECK_FAILURE); \
 	$(CARGO_LOCKED) doc --workspace --no-deps --document-private-items --target $(MUSL) || $(CHECK_FAILURE); \
 	$(CARGO_LOCKED) test $(TEST_FLAGS) --workspace --target $(MUSL) || $(CHECK_FAILURE); \
@@ -446,7 +461,7 @@ verify-platform:
 test-install:
 	scripts/checks/test-install.sh
 
-verify-components: $(COMPONENT_AOT_TARGETS) $(KERNEL_GZ) $(ROOTFS_IMG) $(VOLUME_IMG) $(BOOT_IMG) $(BWRAP) $(SOCKET_PROBE)
+verify-components: $(COMPONENT_AOT_TARGETS) $(KERNEL_IMAGE) $(ROOTFS_IMG) $(VOLUME_IMG) $(BOOT_IMAGE) $(BWRAP) $(SOCKET_PROBE)
 verify-host-components: check-guest-assets $(COMPONENT_AOT_TARGETS)
 
 verify-components verify-host-components:

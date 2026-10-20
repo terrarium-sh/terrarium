@@ -21,10 +21,10 @@ CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER = { value = "scripts/toolchain/zi
 # zig supplies musl's CRT, so rust must not also link its self-contained one —
 # otherwise `_start` is defined twice.
 CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS = "-C link-self-contained=no"
-# The embedded kernel is decompressed into memory on each boot.
-TERRA_KERNEL_GZ = { value = "build/vmlinux.gz", relative = true }
-# Read-only ext4 containing the guest agent and filesystem resize helper.
-TERRA_BOOT_IMG = { value = "build/boot.img.gz", relative = true }
+# The embedded kernel, chunked LZ4, decoded into guest memory on each boot.
+TERRA_KERNEL_IMAGE = { value = "build/vmlinux.tlz4", relative = true }
+# Read-only ext4 containing the guest agent and filesystem resize helper, chunked LZ4.
+TERRA_BOOT_IMAGE = { value = "build/boot.img.tlz4", relative = true }
 # The prebaked (gzipped) guest root filesystem — see the Makefile. Shipping it as
 # bytes is what lets a non-Linux host create a box without any mkfs tooling.
 TERRA_ROOTFS_IMG = { value = "build/rootfs.img.gz", relative = true }

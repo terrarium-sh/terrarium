@@ -1936,6 +1936,78 @@ fn capacity_32_volumes_reaches_vdah() {
     assert!(output.contains("VOLUME_CAPACITY_OK"), "{output}");
 }
 
+#[test]
+#[ignore = "boots a VM several times and requires a native hypervisor"]
+fn root_and_volume_filesystems_span_their_devices_after_growth_and_restart() {
+    const MIB: u64 = 1024 * 1024;
+    let suite = Suite::new();
+    let recipe = suite.get_work_dir().join("grow.yaml");
+    let write_recipe = |rootfs_mib: u64, volume_mib: u64| {
+        std::fs::write(
+            &recipe,
+            format!(
+                "hw: {{cpus: 1, mem_mib: 256, rootfs_mib: {rootfs_mib}}}\nvolumes:\n  - name: data\n    guest: /data\n    size_mib: {volume_mib}\nworkload:\n  entrypoint: /bin/sh\n  args:\n    - -ec\n    - |\n      for target in / /data; do\n        device=$(awk -v t=$target '$2==t {{print $1}}' /proc/mounts | tail -n 1)\n        sectors=$(cat /sys/class/block/${{device##*/}}/size)\n        echo \"SPAN $target $((sectors * 512)) $(stat -f -c '%S %b' $target)\"\n      done\n"
+            ),
+        )
+        .unwrap();
+    };
+    let boot_and_measure = |rootfs_mib: u64, volume_mib: u64| {
+        write_recipe(rootfs_mib, volume_mib);
+        let output = suite.boot_recipe(&recipe, "grow", &[]);
+        let spans = output
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("SPAN "))
+            .map(|line| {
+                let numbers: Vec<u64> = line
+                    .split_whitespace()
+                    .skip(1)
+                    .map(|number| number.parse().unwrap())
+                    .collect();
+                (numbers[0], numbers[1] * numbers[2])
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(spans.len(), 2, "{output}");
+        spans
+    };
+    let assert_spans = |spans: &[(u64, u64)], rootfs_mib: u64, volume_mib: u64| {
+        for (&(device_bytes, filesystem_bytes), mib) in spans.iter().zip([rootfs_mib, volume_mib]) {
+            assert_eq!(device_bytes, mib * MIB, "{spans:?}");
+            assert!(filesystem_bytes > device_bytes * 8 / 10, "{spans:?}");
+            assert!(filesystem_bytes <= device_bytes, "{spans:?}");
+        }
+    };
+
+    // A clean exit leaves no journal to replay, so the next boot's mounts skip recovery.
+    let assert_journals_clean = || {
+        use std::io::{Read as _, Seek as _};
+        const SUPERBLOCK_INCOMPAT_OFFSET: u64 = 1024 + 0x60;
+        const INCOMPAT_RECOVER: u32 = 0x4;
+        let files = suite.get_box_files_path("grow");
+        for image in ["rootfs.img", "vol-data.img"] {
+            let mut file = std::fs::File::open(files.join(image)).unwrap();
+            file.seek(std::io::SeekFrom::Start(SUPERBLOCK_INCOMPAT_OFFSET))
+                .unwrap();
+            let mut incompat = [0; 4];
+            file.read_exact(&mut incompat).unwrap();
+            assert_eq!(
+                u32::from_le_bytes(incompat) & INCOMPAT_RECOVER,
+                0,
+                "{image} still needs journal recovery after a clean exit"
+            );
+        }
+    };
+
+    let first = boot_and_measure(256, 64);
+    assert_spans(&first, 256, 64);
+    assert_journals_clean();
+    let grown = boot_and_measure(512, 128);
+    assert_spans(&grown, 512, 128);
+    assert_journals_clean();
+    let restarted = boot_and_measure(512, 128);
+    assert_eq!(restarted, grown);
+    assert_journals_clean();
+}
+
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
 #[ignore = "requires x86 KVM with a known TSC frequency and an always-running APIC timer"]

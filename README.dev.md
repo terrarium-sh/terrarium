@@ -295,20 +295,26 @@ Boot drivers are built in. The boot volume contains the agent and resize helper;
 Terra does not ship a general-purpose module tree. Packages requiring other
 kernel drivers need a built-in equivalent.
 
-Kernel and boot gzip assets include [trusted ABI markers](#network-transport)
-checked before decompression and VM creation. Make targets package them
-automatically. To package verified matching raw images manually, select the
-image kind as the first positional argument:
+Kernel and boot gzip assets include [trusted ABI markers](#network-transport).
+Terra embeds them repacked as chunked LZ4 (`.tlz4`): independently compressed
+LZ4-HC chunks, each with a CRC32, behind a header that carries the same marker.
+The kernel uses 1 MiB chunks and is streamed into guest RAM at boot. The boot
+disk uses 64 KiB chunks and is read in place, decoding only the chunks the
+guest touches. Markers are checked before any decompression and VM creation.
+Make targets package both forms automatically. To package verified matching raw
+images manually, select the image kind as the first positional argument:
 
 ```sh
 cargo run --locked -p terra-protocol --example package-guest-image -- kernel build/vmlinux build/vmlinux.gz
 cargo run --locked -p terra-protocol --example package-guest-image -- boot build/boot.img build/boot.img.gz
+cargo run --locked -p terra-protocol --features packer --example repack-guest-image -- kernel build/vmlinux.gz build/vmlinux.tlz4
+cargo run --locked -p terra-protocol --features packer --example repack-guest-image -- boot build/boot.img.gz build/boot.img.tlz4
 ```
 
 The kernel's 12-byte standard gzip `TK` subfield records `VS` and little-endian
 socket/application/vsock ABI versions. The boot image uses its separate `TB`
-marker. Direct `VmInput` callers supplying decompressed bytes are responsible
-for matching their trusted artifacts; the live version handshake still runs.
+marker. Direct `VmInput` callers supplying their own images are responsible for
+matching their trusted artifacts; the live version handshake still runs.
 
 The pinned [kernel container](kernel/Containerfile) supplies the build tools and
 the AArch64 compiler, native on AArch64 hosts and cross on x86_64. Its wrapper

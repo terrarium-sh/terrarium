@@ -365,7 +365,7 @@ static int terra_bind_external(struct terra_tsi_socket *state)
 	if (inet_sk(state->sk)->inet_num)
 		return 0;
 	local.ss_family = state->sk->sk_family;
-	return state->native_ops->bind(state->socket, (struct sockaddr *)&local,
+	return state->native_ops->bind(state->socket, (struct sockaddr_unsized *)&local,
 		state->sk->sk_family == AF_INET ? sizeof(struct sockaddr_in) :
 						 sizeof(struct sockaddr_in6));
 }
@@ -416,7 +416,7 @@ static int terra_create_stream(struct terra_tsi_socket *state, u64 receive_bytes
 	error = sock_create_kern(&init_net, AF_VSOCK, SOCK_STREAM, 0, &state->stream);
 	if (error)
 		return error;
-	error = kernel_bind(state->stream, (struct sockaddr *)&local, sizeof(local));
+	error = kernel_bind(state->stream, (struct sockaddr_unsized *)&local, sizeof(local));
 	if (!error) {
 		error = kernel_getsockname(state->stream, (struct sockaddr *)&local);
 		if (error >= 0)
@@ -1296,9 +1296,9 @@ static int terra_connect(struct socket *socket, struct sockaddr *peer, int peer_
 	return error;
 }
 
-static int terra_bind(struct socket *socket, struct sockaddr *peer, int peer_length)
+static int terra_bind(struct socket *socket, struct sockaddr_unsized *local, int local_length)
 {
-	return terra_socket_state(socket)->native_ops->bind(socket, peer, peer_length);
+	return terra_socket_state(socket)->native_ops->bind(socket, local, local_length);
 }
 
 static int terra_listen(struct socket *socket, int backlog)

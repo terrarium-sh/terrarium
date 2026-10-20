@@ -92,6 +92,7 @@ fn main() -> ! {
             mux,
         }) => {
             let outcome = run_agent(&plan, &control, diagnostic, clients);
+            bootstrap::leave_filesystems_clean(&plan);
             if let Ok(flags) = rustix::fs::fcntl_getfl(&control) {
                 let _ = rustix::fs::fcntl_setfl(&control, flags & !rustix::fs::OFlags::NONBLOCK);
             }

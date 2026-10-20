@@ -52,7 +52,7 @@ fn blocks(
     interrupt: impl Fn(usize) -> Result<crate::component::InterruptCallback, String>,
 ) -> Result<(), String> {
     use crate::component::block::BlockHost;
-    use crate::component::block::backing::{DiskGrant, FileDisk};
+    use crate::component::block::backing::{DiskGrant, FileDisk, PackedDisk};
     let component = input
         .artifacts
         .block
@@ -66,11 +66,7 @@ fn blocks(
                 .map_err(|error| format!("opening block backing {}: {error}", path.display()))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let boot_disk = DiskGrant::Mem(
-        crate::component::block::backing::BoundedDisk::from_readonly_bytes(std::mem::take(
-            &mut input.boot_disk,
-        )),
-    );
+    let boot_disk = DiskGrant::Packed(PackedDisk::new(input.boot_disk.clone()));
     let ram = ram.into();
     for (index, disk) in std::iter::once(boot_disk).chain(disks).enumerate() {
         let ram = ram.clone();
@@ -200,8 +196,16 @@ mod tests {
         };
         let input = super::VmInput {
             component_memory_limits: crate::box_runtime::ComponentMemoryLimits::default(),
-            kernel: Vec::new(),
-            boot_disk: Vec::new(),
+            kernel: terra_protocol::packed_image::pack_fast_leaked(
+                &[0],
+                terra_protocol::guest_image::GuestImage::Kernel,
+            )
+            .unwrap(),
+            boot_disk: terra_protocol::packed_image::pack_fast_leaked(
+                &[0],
+                terra_protocol::guest_image::GuestImage::Boot,
+            )
+            .unwrap(),
             root_disk: PathBuf::new(),
             volume_disks: Vec::new(),
             shares: Vec::new(),

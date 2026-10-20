@@ -78,7 +78,7 @@ if ($unresolvedWitSymlinks.Count -gt 0) {
     $preflightFailures += "shared WIT symbolic links must resolve ($($examples -join ', ')); restore the linked WIT files and directories"
 }
 
-$guestAssets = "build/vmlinux.gz", "build/rootfs.img.gz", "build/volume.img.gz", "build/boot.img.gz", "build/socket-probe"
+$guestAssets = "build/vmlinux.tlz4", "build/rootfs.img.gz", "build/volume.img.gz", "build/boot.img.tlz4", "build/socket-probe"
 $missingGuestAssets = @($guestAssets | Where-Object {
     -not (Test-Path -LiteralPath $_ -PathType Leaf) -or (Get-Item -LiteralPath $_).Length -eq 0
 })

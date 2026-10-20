@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use std::fs::File;
 use std::io::{Read as _, Write as _};
 use std::process::ExitCode;
+use terra_platform::code_memory::PageAligned;
 use terra_platform::local_socket::{LocalListener, LocalStream, create_local_pair};
 use terra_protocol::PlanMode;
 use terra_runtime::component::AccessMode;
@@ -17,9 +18,10 @@ use terra_runtime::orchestration::VmInput;
 use terra_runtime::{TrustedArtifact, TrustedArtifacts};
 
 macro_rules! embedded_artifact {
-    ($variable:literal) => {
-        TrustedArtifact::from_trusted_bytes(include_bytes!(env!($variable)))
-    };
+    ($variable:literal) => {{
+        static BYTES: &PageAligned<[u8]> = &PageAligned(*include_bytes!(env!($variable)));
+        TrustedArtifact::from_trusted_page_aligned(BYTES)
+    }};
 }
 
 #[allow(unsafe_code)]
@@ -261,6 +263,89 @@ mod tests {
     use super::*;
     use crate::config::{Config, Mount};
     use std::path::PathBuf;
+
+    fn embedded_artifacts() -> [TrustedArtifact; 8] {
+        let TrustedArtifacts {
+            block,
+            agent,
+            vsock_frontend,
+            fs,
+            mem,
+            boot,
+            vmm,
+            interrupt_controller,
+        } = ARTIFACTS;
+        [
+            block,
+            agent,
+            vsock_frontend,
+            fs,
+            mem,
+            boot,
+            vmm,
+            interrupt_controller,
+        ]
+    }
+
+    /// The first engine to load an artifact in place owns it; every test loads
+    /// through this one so test order cannot change the owner.
+    static SHARED_ENGINE: std::sync::LazyLock<wasmtime::Engine> =
+        std::sync::LazyLock::new(|| terra_runtime::engine::device_engine().unwrap());
+
+    /// Every embedded artifact runs from the executable's own file pages
+    /// rather than a private copy, loaded once per process.
+    #[test]
+    fn embedded_artifacts_deserialize_in_place() {
+        for artifact in embedded_artifacts() {
+            let first = artifact.deserialize_in_place(&SHARED_ENGINE).unwrap();
+            let second = artifact.deserialize_in_place(&SHARED_ENGINE).unwrap();
+            assert_eq!(first.image_range(), second.image_range());
+            #[cfg(target_os = "linux")]
+            assert!(is_executable_file_mapping(first.image_range()));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn is_executable_file_mapping(image: std::ops::Range<*const u8>) -> bool {
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+        maps.lines().any(|line| {
+            let fields: Vec<&str> = line.split_ascii_whitespace().collect();
+            let (start, end) = fields[0].split_once('-').unwrap();
+            let start = usize::from_str_radix(start, 16).unwrap();
+            let end = usize::from_str_radix(end, 16).unwrap();
+            start < image.end.addr()
+                && image.start.addr() < end
+                && fields[1].contains('x')
+                && fields[4] != "0"
+        })
+    }
+
+    /// A second engine would register the in-place unwind tables twice, which
+    /// aborts the process in libgcc, so it gets a private copy instead.
+    #[test]
+    fn another_engine_falls_back_to_a_private_copy() {
+        let shared = ARTIFACTS.boot.deserialize_in_place(&SHARED_ENGINE).unwrap();
+        let other = terra_runtime::engine::device_engine().unwrap();
+        assert!(ARTIFACTS.boot.deserialize_in_place(&other).is_err());
+        let copied = ARTIFACTS.boot.deserialize(&other).unwrap();
+        assert_ne!(copied.image_range(), shared.image_range());
+    }
+
+    /// Bytes that may share their pages with other data never run in place and
+    /// still load through a private copy.
+    #[test]
+    #[allow(unsafe_code)]
+    fn bytes_without_pages_of_their_own_fall_back_to_a_private_copy() {
+        let heap = Box::leak(
+            include_bytes!(env!("TERRA_BOOT_AOT"))
+                .to_vec()
+                .into_boxed_slice(),
+        );
+        // SAFETY: the heap bytes are a copy of a trusted embedded artifact.
+        let artifact = unsafe { TrustedArtifact::from_trusted_bytes(heap) };
+        assert!(artifact.deserialize_in_place(&SHARED_ENGINE).is_err());
+        artifact.deserialize(&SHARED_ENGINE).unwrap();
+    }
 
     #[test]
     fn broker_absence_requires_local_only_configuration() {

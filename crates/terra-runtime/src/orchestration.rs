@@ -16,8 +16,8 @@ use observation::finish_preparation;
 pub const GUEST_BOOT_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct VmInput {
-    pub kernel: Vec<u8>,
-    pub boot_disk: Vec<u8>,
+    pub kernel: terra_protocol::packed_image::PackedImage<'static>,
+    pub boot_disk: terra_protocol::packed_image::PackedImage<'static>,
     pub root_disk: PathBuf,
     pub volume_disks: Vec<PathBuf>,
     pub shares: Vec<crate::component::fs::ShareGrant>,
@@ -382,7 +382,7 @@ async fn boot_prepared<M: crate::component::vmm::VirtualMachine>(
             &boot,
             prepared.config(),
             prepared.ram()?,
-            std::mem::take(&mut input.kernel),
+            input.kernel.clone(),
             &kernel_cmdline,
         )
         .await?;

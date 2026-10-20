@@ -4,17 +4,20 @@ use crate::state::{self, BoxRef};
 use crate::sys;
 use anyhow::{Context, Result, ensure};
 use std::fs::File;
+use std::future::Future;
 use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::{Command, ExitCode, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 #[cfg(any(target_os = "macos", windows))]
 use terra_platform::local_socket::LocalListener;
 use terra_platform::local_socket::{
     AsyncLocalStream, LocalStream, OwnedSocket, create_local_pair, receive_sockets, send_sockets,
 };
 use terra_sandbox::{Launch, Role};
+use tokio::sync::oneshot;
 
 pub(crate) const SUPERVISOR_ARG: &str = "__supervisor";
 pub(crate) const NETWORK_ARG: &str = "__network";
@@ -101,6 +104,14 @@ pub(crate) fn run(dir: PathBuf) -> Result<ExitCode> {
 
 fn run_box(dir: PathBuf, lock: &File) -> Result<ExitCode> {
     crate::process::install_interrupt_handler()?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("starting supervisor runtime")?;
+    let interrupt = {
+        let _context = runtime.enter();
+        crate::process::interrupt_signal()?
+    };
     let mut boot = read_supervisor_input(std::io::stdin(), BROKER_STARTUP_TIMEOUT)?;
     let bx = BoxRef::from_state_dir(dir, &boot.project_dir);
     let supervisor_identity =
@@ -137,9 +148,19 @@ fn run_box(dir: PathBuf, lock: &File) -> Result<ExitCode> {
     let mut vm = SupervisedChild::from_launch(spawned, guard)?;
     boot::publish_vm_pid(vm_pid, &bx, lock, &identity, boot.mode)?;
     boot::send_startup_input(vm.child_mut(), boot::encode_boot_spec(&boot)?)?;
-    let ready = boot::start_ready_reader(vm.child_mut())?;
+    let (sender, startup) = tokio::sync::oneshot::channel();
+    boot::start_ready_reader(vm.child_mut(), move |notification| {
+        let _ = sender.send(notification);
+    })?;
     terra_sandbox::restrict_role(Role::Supervisor)?;
-    let result = supervise(&bx, &mut vm, broker.as_mut(), &ready, STARTUP_TIMEOUT);
+    let result = runtime.block_on(supervise(
+        &bx,
+        &mut vm,
+        broker.as_mut(),
+        startup,
+        interrupt,
+        STARTUP_TIMEOUT,
+    ));
     drop((vm, broker));
     result
 }
@@ -201,78 +222,106 @@ fn pass_vm_listeners(
     Ok(inherited)
 }
 
-fn supervise(
+async fn supervise(
     bx: &BoxRef,
     vm: &mut SupervisedChild,
     mut broker: Option<&mut SupervisedChild>,
-    ready: &std::sync::mpsc::Receiver<Result<bool>>,
+    startup: oneshot::Receiver<Result<bool>>,
+    interrupt: impl Future<Output = ()>,
     startup_timeout: Duration,
 ) -> Result<ExitCode> {
-    let deadline = Instant::now() + startup_timeout;
+    ensure!(
+        !crate::process::is_interrupted(),
+        "box supervisor interrupted"
+    );
+    let deadline = tokio::time::Instant::now() + startup_timeout;
+    let vm_exited = crate::process::exited(vm.child_mut())?;
+    let broker_exited = match broker.as_mut() {
+        Some(broker) => Some(crate::process::exited(broker.child_mut())?),
+        None => None,
+    };
+    let broker_exited = async move {
+        match broker_exited {
+            Some(exited) => exited.await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(interrupt, vm_exited, broker_exited, startup);
     let mut is_ready = false;
     loop {
-        ensure!(
-            !crate::process::is_interrupted(),
-            "box supervisor interrupted"
-        );
-        let mut vm_status = vm.try_wait()?;
-        if vm_status.is_none()
-            && let Some(broker_child) = broker.as_mut()
-            && let Some(status) = broker_child.try_wait()?
-        {
-            if is_ready {
-                log::warn!("{bx}'s network broker stopped ({status}); networking is unavailable");
-                broker = None;
-            } else {
-                if status.success() {
-                    vm_status = vm.wait(CLEANUP_TIMEOUT, true).ok();
+        tokio::select! {
+            biased;
+            () = &mut interrupt => anyhow::bail!("box supervisor interrupted"),
+            () = &mut vm_exited => {
+                let startup = (!is_ready).then_some(startup.as_mut());
+                return report_vm_exit(bx, vm, broker, startup, is_ready).await;
+            }
+            () = &mut broker_exited, if broker.is_some() => {
+                let status = broker
+                    .as_mut()
+                    .context("network broker missing")?
+                    .wait(CLEANUP_TIMEOUT, false)?;
+                if is_ready {
+                    log::warn!("{bx}'s network broker stopped ({status}); networking is unavailable");
+                    broker = None;
+                    continue;
                 }
-                ensure!(
-                    vm_status.is_some(),
-                    "{bx}'s network broker stopped unexpectedly ({status}); stopping the box"
-                );
+                if status.success()
+                    && tokio::time::timeout(CLEANUP_TIMEOUT, vm_exited.as_mut()).await.is_ok()
+                {
+                    return report_vm_exit(bx, vm, broker, Some(startup.as_mut()), is_ready).await;
+                }
+                anyhow::bail!("{bx}'s network broker stopped unexpectedly ({status}); stopping the box");
             }
-        }
-        if let Some(status) = vm_status {
-            if !is_ready
-                && ready
-                    .recv_timeout(CLEANUP_TIMEOUT)
-                    .is_ok_and(|result| matches!(result, Ok(true)))
-            {
-                boot::write_agent_ready();
-            }
-            if let Some(broker) = broker.as_mut()
-                && let Ok(broker_status) = broker.wait(CLEANUP_TIMEOUT, false)
-            {
-                ensure!(
-                    is_ready || broker_status.success(),
-                    "{bx}'s network broker stopped unexpectedly ({broker_status}) during VM shutdown"
-                );
-            }
-            let code = status
-                .code()
-                .unwrap_or_else(|| 128 + sys::find_terminating_signal(status).unwrap_or(0));
-            return Ok(ExitCode::from(crate::exit_status_byte(code)));
-        }
-        if !is_ready {
-            match ready.try_recv() {
-                Ok(result) => {
-                    ensure!(result?, "VM closed its startup pipe before readiness");
+            notification = &mut startup, if !is_ready => match notification {
+                Ok(Ok(true)) => {
                     is_ready = true;
                     boot::write_agent_ready();
                 }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    anyhow::bail!("VM startup reader disconnected")
+                // A startup failure as the VM exits: its exit status explains the failure best.
+                Ok(failure) => {
+                    if tokio::time::timeout(CLEANUP_TIMEOUT, vm_exited.as_mut()).await.is_ok() {
+                        return report_vm_exit(bx, vm, broker, None, is_ready).await;
+                    }
+                    failure?;
+                    anyhow::bail!("VM closed its startup pipe before readiness");
                 }
+                Err(_) => anyhow::bail!("VM startup reader disconnected"),
+            },
+            () = tokio::time::sleep_until(deadline), if !is_ready => {
+                anyhow::bail!("timed out waiting for guest agent readiness")
             }
-            ensure!(
-                is_ready || Instant::now() < deadline,
-                "timed out waiting for guest agent readiness"
-            );
         }
-        std::thread::sleep(Duration::from_millis(25));
     }
+}
+
+/// The box's exit code once the VM has exited. `startup` is the unread readiness notification: a
+/// VM that becomes ready and exits at once still reports readiness.
+async fn report_vm_exit(
+    bx: &BoxRef,
+    vm: &mut SupervisedChild,
+    broker: Option<&mut SupervisedChild>,
+    startup: Option<Pin<&mut oneshot::Receiver<Result<bool>>>>,
+    is_ready: bool,
+) -> Result<ExitCode> {
+    let status = vm.wait(CLEANUP_TIMEOUT, false)?;
+    if let Some(startup) = startup
+        && let Ok(Ok(Ok(true))) = tokio::time::timeout(CLEANUP_TIMEOUT, startup).await
+    {
+        boot::write_agent_ready();
+    }
+    if let Some(broker) = broker
+        && let Ok(broker_status) = broker.wait(CLEANUP_TIMEOUT, false)
+    {
+        ensure!(
+            is_ready || broker_status.success(),
+            "{bx}'s network broker stopped unexpectedly ({broker_status}) during VM shutdown"
+        );
+    }
+    let code = status
+        .code()
+        .unwrap_or_else(|| 128 + sys::find_terminating_signal(status).unwrap_or(0));
+    Ok(ExitCode::from(crate::exit_status_byte(code)))
 }
 
 pub(crate) fn build_broker_config(spec: &BootSpec) -> Result<terra_network::config::Config> {
@@ -512,7 +561,7 @@ fn enable_subreaping() -> Result<()> {
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 fn reap_adopted_children() -> Result<()> {
-    let deadline = Instant::now() + CLEANUP_TIMEOUT;
+    let deadline = std::time::Instant::now() + CLEANUP_TIMEOUT;
     loop {
         let mut status = 0;
         // SAFETY: the supervisor owns its adopted children; status is writable.
@@ -530,7 +579,7 @@ fn reap_adopted_children() -> Result<()> {
             }
         }
         ensure!(
-            Instant::now() < deadline,
+            std::time::Instant::now() < deadline,
             "supervisor children did not exit after cleanup"
         );
         std::thread::sleep(Duration::from_millis(10));
@@ -540,6 +589,7 @@ fn reap_adopted_children() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     fn startup_input(config: &[u8]) -> BrokerStartup {
         BrokerStartup {
@@ -670,10 +720,41 @@ mod tests {
             } else {
                 Stdio::null()
             })
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null());
         let guard = sys::supervise_vm_child(&mut command, true).unwrap();
         SupervisedChild::new(command.spawn().unwrap(), guard).unwrap()
+    }
+
+    /// Runs [`supervise`] with `notification` already delivered, or with none ever arriving.
+    #[cfg(target_os = "linux")]
+    fn supervise_with(
+        bx: &BoxRef,
+        vm: &mut SupervisedChild,
+        broker: Option<&mut SupervisedChild>,
+        notification: Option<Result<bool>>,
+        startup_timeout: Duration,
+    ) -> Result<ExitCode> {
+        let (sender, startup) = oneshot::channel();
+        let _silent_reader = match notification {
+            Some(notification) => {
+                let _ = sender.send(notification);
+                None
+            }
+            None => Some(sender),
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(supervise(
+                bx,
+                vm,
+                broker,
+                startup,
+                std::future::pending(),
+                startup_timeout,
+            ))
     }
 
     #[cfg(target_os = "linux")]
@@ -690,24 +771,22 @@ mod tests {
         let mut broker = spawn_test_worker("success");
         broker.wait(CLEANUP_TIMEOUT, false).unwrap();
         assert!(vm.try_wait().unwrap().is_none());
-        let (sender, receiver) = std::sync::mpsc::channel();
         let notification = if mode == "invalid" {
             Err(anyhow::anyhow!("invalid readiness"))
         } else {
             Ok(mode == "ready")
         };
-        sender.send(notification).unwrap();
         let mut input = vm.child_mut().stdin.take().unwrap();
         let release = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(500));
             input.write_all(&[1]).unwrap();
         });
         assert_eq!(
-            supervise(
+            supervise_with(
                 &bx,
                 &mut vm,
                 Some(&mut broker),
-                &receiver,
+                Some(notification),
                 Duration::from_secs(5),
             )
             .unwrap(),
@@ -737,14 +816,12 @@ mod tests {
             assert!(sys::read_process_start_time(vm_pid).is_some());
             vm_input.write_all(&[1]).unwrap();
         });
-        let (sender, receiver) = std::sync::mpsc::channel();
-        sender.send(Ok(true)).unwrap();
         assert_eq!(
-            supervise(
+            supervise_with(
                 &bx,
                 &mut vm,
                 Some(&mut broker),
-                &receiver,
+                Some(Ok(true)),
                 Duration::from_secs(5),
             )
             .unwrap(),
@@ -831,15 +908,11 @@ mod tests {
                     if expected.is_some() {
                         vm.wait(CLEANUP_TIMEOUT, false).unwrap();
                     }
-                    let (sender, receiver) = std::sync::mpsc::channel();
-                    if let Some(notification) = notification {
-                        sender.send(notification).unwrap();
-                    }
-                    let result = supervise(
+                    let result = supervise_with(
                         &bx,
                         &mut vm,
                         broker.as_mut(),
-                        &receiver,
+                        notification,
                         Duration::from_millis(100),
                     );
                     match expected {
@@ -855,6 +928,26 @@ mod tests {
             }
             _ => std::process::exit(1),
         }
+    }
+
+    /// The VM's exit ends supervision as it happens; no pipe event has to announce it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn supervision_ends_when_the_vm_exits() {
+        let directory = tempfile::tempdir().unwrap();
+        let bx = BoxRef::from_state_dir(directory.path().into(), directory.path());
+        let mut vm = spawn_test_worker("fail-after-input");
+        let mut input = vm.child_mut().stdin.take().unwrap();
+        let supervisor = std::thread::spawn(move || {
+            supervise_with(&bx, &mut vm, None, Some(Ok(true)), Duration::from_secs(5)).unwrap()
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !supervisor.is_finished(),
+            "supervision ended before the VM exited"
+        );
+        input.write_all(&[1]).unwrap();
+        assert_eq!(supervisor.join().unwrap(), ExitCode::from(7));
     }
 
     #[cfg(target_os = "linux")]

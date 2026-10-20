@@ -4,6 +4,8 @@ use anyhow::{Context, Result, bail};
 use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use terra_protocol::guest_image::GuestImage;
+use terra_protocol::packed_image::PackedImage;
 
 static ROOTFS_IMG_GZ: &[u8] = include_bytes!(env!("TERRA_ROOTFS_IMG"));
 
@@ -11,12 +13,13 @@ static ROOTFS_IMG_GZ: &[u8] = include_bytes!(env!("TERRA_ROOTFS_IMG"));
 static VOLUME_IMG_GZ: &[u8] = include_bytes!(env!("TERRA_VOLUME_IMG"));
 
 /// The guest kernel from the pinned kernel source; the Makefile sets
-/// `TERRA_KERNEL_GZ`.
-static KERNEL_GZ: &[u8] = include_bytes!(env!("TERRA_KERNEL_GZ"));
+/// `TERRA_KERNEL_IMAGE`.
+static KERNEL_PACKED: &[u8] = include_bytes!(env!("TERRA_KERNEL_IMAGE"));
 
 /// A read-only ext4 with the guest agent and `resize2fs`. The guest's root
 /// filesystem is this volume, never a host directory.
-static BOOT_IMG_GZ: &[u8] = include_bytes!(env!("TERRA_BOOT_IMG"));
+static BOOT_PACKED: &[u8] = include_bytes!(env!("TERRA_BOOT_IMAGE"));
+
 pub(crate) const BYTES_PER_MIB: u64 = 1024 * 1024;
 
 pub(crate) fn write_sparse_chunk(out: &mut File, chunk: &[u8]) -> std::io::Result<()> {
@@ -250,35 +253,12 @@ fn resize_image(path: &Path, target: u64, field: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn load_kernel() -> Result<Vec<u8>> {
-    decode_kernel_image(KERNEL_GZ)
+pub fn load_kernel() -> Result<PackedImage<'static>> {
+    Ok(PackedImage::parse(KERNEL_PACKED, GuestImage::Kernel)?)
 }
 
-fn decode_kernel_image(gzip: &[u8]) -> Result<Vec<u8>> {
-    let mut decoder = flate2::read::GzDecoder::new(gzip);
-    terra_protocol::guest_image::GuestImage::Kernel
-        .validate(decoder.header().and_then(flate2::GzHeader::extra))?;
-    let mut kernel = Vec::new();
-    decoder
-        .read_to_end(&mut kernel)
-        .context("decompressing guest kernel")?;
-    Ok(kernel)
-}
-
-pub fn load_boot_image() -> Result<Vec<u8>> {
-    decode_boot_image(BOOT_IMG_GZ)
-}
-
-fn decode_boot_image(gzip: &[u8]) -> Result<Vec<u8>> {
-    let mut decoder = flate2::read::GzDecoder::new(gzip);
-    terra_protocol::guest_image::GuestImage::Boot
-        .validate(decoder.header().and_then(flate2::GzHeader::extra))?;
-    let mut image = Vec::new();
-    decoder
-        .read_to_end(&mut image)
-        .context("decompressing boot image")?;
-    image.shrink_to_fit();
-    Ok(image)
+pub fn load_boot_image() -> Result<PackedImage<'static>> {
+    Ok(PackedImage::parse(BOOT_PACKED, GuestImage::Boot)?)
 }
 
 #[cfg(test)]
@@ -289,9 +269,7 @@ mod tests {
     fn loading_kernel_leaves_no_files_on_disk() {
         let home = crate::sys::TestHome::new();
         let kernel = load_kernel().unwrap();
-        let expected_size = u32::from_le_bytes(*KERNEL_GZ.last_chunk::<4>().unwrap());
-        assert_ne!(kernel, Vec::<u8>::new());
-        assert_eq!(kernel.len() as u64, u64::from(expected_size));
+        assert_ne!(kernel.image_bytes(), 0);
         assert_eq!(std::fs::read_dir(home.get_path()).unwrap().count(), 0);
     }
 
@@ -299,46 +277,8 @@ mod tests {
     fn loading_boot_image_leaves_no_files_on_disk() {
         let home = crate::sys::TestHome::new();
         let image = load_boot_image().unwrap();
-        let expected_size = u32::from_le_bytes(*BOOT_IMG_GZ.last_chunk::<4>().unwrap());
-        assert_ne!(image, Vec::<u8>::new());
-        assert_eq!(image.len() as u64, u64::from(expected_size));
+        assert_ne!(image.image_bytes(), 0);
         assert_eq!(std::fs::read_dir(home.get_path()).unwrap().count(), 0);
-    }
-
-    #[test]
-    fn boot_image_version_is_validated_before_decompression() {
-        use std::io::Write as _;
-
-        let header_without_payload = [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff];
-        let error = decode_boot_image(&header_without_payload).unwrap_err();
-        assert!(error.to_string().contains("rebuild"), "{error}");
-
-        let mut encoder = flate2::GzBuilder::new()
-            .extra(terra_protocol::guest_image::GuestImage::Boot.marker())
-            .write(Vec::new(), flate2::Compression::fast());
-        encoder.write_all(b"current guest image").unwrap();
-        assert_eq!(
-            decode_boot_image(&encoder.finish().unwrap()).unwrap(),
-            b"current guest image"
-        );
-    }
-
-    #[test]
-    fn kernel_version_is_validated_before_decompression() {
-        use std::io::Write as _;
-
-        let header_without_payload = [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff];
-        let error = decode_kernel_image(&header_without_payload).unwrap_err();
-        assert!(error.to_string().contains("rebuild"), "{error}");
-
-        let mut encoder = flate2::GzBuilder::new()
-            .extra(terra_protocol::guest_image::GuestImage::Kernel.marker())
-            .write(Vec::new(), flate2::Compression::fast());
-        encoder.write_all(b"current guest kernel").unwrap();
-        assert_eq!(
-            decode_kernel_image(&encoder.finish().unwrap()).unwrap(),
-            b"current guest kernel"
-        );
     }
 
     #[test]

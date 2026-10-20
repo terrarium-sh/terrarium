@@ -11,13 +11,13 @@ default = []
 # The shipped device runtime only deserializes artifacts produced by the
 # trusted build. Keep Cranelift out of that dependency graph.
 compiler = ["wasmtime/cranelift"]
-test-support = []
+test-support = ["terra-protocol/test-support"]
 
 [dependencies]
 terra-hypervisor = { path = "../terra-hypervisor" }
 terra-platform = { path = "../terra-platform" }
 terra-network = { path = "../terra-network" }
-terra-protocol = { path = "../terra-protocol" }
+terra-protocol = { path = "../terra-protocol", features = ["packed-image"] }
 bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["alloc", "std"] }
 notify = "8.2"
@@ -28,15 +28,17 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", 
 tokio-util = { version = "0.7", features = ["rt", "compat"] }
 yamux = "=0.14.1"
 wasmtime = { version = "=49.0.3", default-features = false, features = ["component-model-async", "component-model-bytes", "std"] }
+wasmtime-internal-jit-icache-coherence = "=49.0.3"
 wasmtime-wasi = { version = "=49.0.3", default-features = false, features = ["p3"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation"] }
 
 [dev-dependencies]
-terra-protocol = { path = "../terra-protocol", features = ["mux"] }
+terra-protocol = { path = "../terra-protocol", features = ["mux", "test-support"] }
 tokio = { version = "1", features = ["test-util"] }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+object = { version = "0.40", default-features = false, features = ["read_core", "elf"] }
 # Integration tests link the library without cfg(test).
 terra-runtime = { path = ".", features = ["test-support"] }
 tempfile = { workspace = true }

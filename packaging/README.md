@@ -120,7 +120,7 @@ machine matching the target architecture. Enable Developer Mode and clone with
 `git -c core.symlinks=true clone https://github.com/terrarium-sh/terrarium.git`
 so the shared WIT links are checked out correctly.
 
-Copy `vmlinux.gz`, `rootfs.img.gz`, `volume.img.gz`, `boot.img.gz`, and
+Copy `vmlinux.tlz4`, `rootfs.img.gz`, `volume.img.gz`, `boot.img.tlz4`, and
 `socket-probe` from the matching Linux guest-assets build into `build/`.
 Use the same source revision and guest architecture. Then run the Windows host
 build command above; it installs the pinned component toolchain and `wasm-tools`,

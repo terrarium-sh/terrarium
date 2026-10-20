@@ -293,13 +293,16 @@ fn spawn_detached(bx: &BoxRef, spec: &BootSpec, run_lock: File) -> Result<ExitCo
 }
 
 fn wait_for_detached_agent(bx: &BoxRef, mut child: Child, timeout: Duration) -> Result<ExitCode> {
-    let notification = start_ready_reader(&mut child)
-        .and_then(|receiver| {
-            receiver
-                .recv_timeout(timeout)
-                .context("waiting for VM startup notification")
-        })
-        .and_then(std::convert::identity);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let notification = start_ready_reader(&mut child, move |notification| {
+        let _ = sender.send(notification);
+    })
+    .and_then(|()| {
+        receiver
+            .recv_timeout(timeout)
+            .context("waiting for VM startup notification")
+    })
+    .and_then(std::convert::identity);
     let (startup_pipe_closed, failure) = match notification {
         Ok(true) => {
             let vm = bx
@@ -379,18 +382,17 @@ pub(super) fn publish_vm_pid(
         .with_context(|| format!("publishing host VM identity for {bx}"))
 }
 
+/// Delivers the VM's readiness notification to `deliver` from a reader thread.
 pub(super) fn start_ready_reader(
     child: &mut Child,
-) -> Result<std::sync::mpsc::Receiver<Result<bool>>> {
+    deliver: impl FnOnce(Result<bool>) + Send + 'static,
+) -> Result<()> {
     let ready = child.stdout.take().context("opening VM startup pipe")?;
-    let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name("vm-startup".into())
-        .spawn(move || {
-            let _ = sender.send(read_agent_ready(ready));
-        })
+        .spawn(move || deliver(read_agent_ready(ready)))
         .context("starting VM startup reader")?;
-    Ok(receiver)
+    Ok(())
 }
 
 async fn spawn_foreground(
@@ -401,43 +403,40 @@ async fn spawn_foreground(
 ) -> Result<ExitCode> {
     let LaunchedVm { mut child, _guard } = spawn_vm_process(bx, spec, &run_lock)?;
     drop(run_lock);
-    let ready = relay_foreground_stop(bx).and_then(|()| start_ready_reader(&mut child));
-    let ready = match ready {
-        Ok(ready) => ready,
+    let (sender, startup) = tokio::sync::oneshot::channel();
+    let started = relay_foreground_stop(bx).and_then(|()| {
+        start_ready_reader(&mut child, move |notification| {
+            let _ = sender.send(notification);
+        })
+    });
+    let exited = match started.and_then(|()| crate::process::exited(&child)) {
+        Ok(exited) => exited,
         Err(error) => {
             let _ = kill_and_reap_vm(child);
             return Err(error);
         }
     };
-    let deadline = Instant::now() + DETACH_READY_DEADLINE;
+    let deadline = tokio::time::Instant::now() + DETACH_READY_DEADLINE;
     let vm = async {
-        let mut is_ready = false;
-        loop {
-            if let Some(status) = child.try_wait().context("waiting for foreground VM")? {
-                replay_logs(bx, status);
-                return Ok(ExitCode::from(compute_vm_child_exit_byte(bx, status)));
+        tokio::pin!(exited);
+        tokio::select! {
+            biased;
+            () = &mut exited => {}
+            notification = tokio::time::timeout_at(deadline, startup) => match notification {
+                Ok(Ok(Ok(true))) => exited.as_mut().await,
+                // The pipe closes as the VM exits; its exit status explains a failure best.
+                Ok(Ok(Ok(false))) => anyhow::ensure!(
+                    tokio::time::timeout(KILL_REAP_WAIT, exited.as_mut()).await.is_ok(),
+                    "VM closed its startup pipe before readiness"
+                ),
+                Ok(Ok(Err(error))) => return Err(error),
+                Ok(Err(_)) => anyhow::bail!("VM startup reader disconnected"),
+                Err(_) => anyhow::bail!("timed out waiting for VM startup notification"),
             }
-            if !is_ready {
-                match ready.try_recv() {
-                    Ok(notification) => {
-                        anyhow::ensure!(
-                            notification?,
-                            "VM closed its startup pipe before readiness"
-                        );
-                        is_ready = true;
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        anyhow::bail!("VM startup reader disconnected")
-                    }
-                }
-                anyhow::ensure!(
-                    is_ready || Instant::now() < deadline,
-                    "timed out waiting for VM startup notification"
-                );
-            }
-            tokio::time::sleep(sys::POLL).await;
         }
+        let status = child.wait().context("waiting for foreground VM")?;
+        replay_logs(bx, status);
+        Ok(ExitCode::from(compute_vm_child_exit_byte(bx, status)))
     };
     let result = supervise_foreground(bx, vm, pump_box_console(bx, agent_timeout)).await;
     if result.is_err() {

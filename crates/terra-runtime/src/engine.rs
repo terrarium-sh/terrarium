@@ -1,5 +1,6 @@
 //! Wasmtime engine configuration and component precompilation.
 
+use std::sync::Arc;
 use wasmtime::{Config, Engine};
 
 /// Engine for device stores with epoch interruption and async components.
@@ -21,7 +22,8 @@ fn apply_device_settings(config: &mut Config) -> wasmtime::Result<()> {
         .wasm_component_model_threading(false)
         .wasm_component_model_memory64(false)
         .wasm_component_model_async(true)
-        .concurrency_support(true);
+        .concurrency_support(true)
+        .with_custom_code_memory(Some(Arc::new(crate::artifacts::CodeProtection)));
     Ok(())
 }
 
@@ -42,6 +44,19 @@ mod tests {
             assert!(wasmtime::Module::new(&engine, module).is_err());
         }
         wasmtime::Module::new(&engine, "(module (memory 1))").expect("ordinary memory");
+    }
+
+    /// [`crate::artifacts::CodeProtection`] publishes code without `PROT_BTI`,
+    /// which is sound only while device artifacts are compiled without branch
+    /// target identification.
+    #[test]
+    fn precompiled_artifacts_do_not_request_branch_protection() {
+        use object::{Object as _, ObjectSection as _};
+        let engine = super::device_engine().expect("engine");
+        let artifact = super::precompile_component(&engine, b"(component)").expect("compiles");
+        let elf = object::File::parse(artifact.as_slice()).expect("ELF artifact");
+        let bti = elf.section_by_name(".wasmtime.bti").expect("BTI section");
+        assert_eq!(bti.data().expect("BTI flag"), [0]);
     }
 
     /// A precompiled artifact must not enable CPU features of the machine that

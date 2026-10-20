@@ -1,6 +1,8 @@
 use anyhow::{Context, Result, bail};
 use rustix::mount::{MountFlags, MountPropagationFlags};
 use std::fs::{self, File};
+use std::io::{Seek, SeekFrom};
+use std::os::unix::fs::FileExt;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 use terra_protocol::{
@@ -114,7 +116,89 @@ fn read_boot_plan(reader: &mut impl std::io::Read) -> Result<Plan> {
     Ok(boot_plan.plan)
 }
 
+const SUPERBLOCK_OFFSET: u64 = 1024;
+const SUPERBLOCK_LEN: usize = 1024;
+const EXT4_MAGIC: u16 = 0xEF53;
+const EXT4_MAX_LOG_BLOCK_SIZE: u32 = 6;
+const SB_BLOCKS_COUNT_LO: usize = 0x04;
+const SB_LOG_BLOCK_SIZE: usize = 0x18;
+const SB_MAGIC: usize = 0x38;
+const SB_FEATURE_INCOMPAT: usize = 0x60;
+const SB_FEATURE_RO_COMPAT: usize = 0x64;
+const SB_BLOCKS_COUNT_HI: usize = 0x150;
+const INCOMPAT_64BIT: u32 = 0x80;
+const RO_COMPAT_BIGALLOC: u32 = 0x200;
+
+/// Whether the ext4 superblock of `device` already counts as many blocks as resize2fs would
+/// resize to; any doubt answers `false`.
+fn filesystem_already_spans_device(device: &str) -> bool {
+    read_superblock(device).is_ok_and(|(superblock, device_bytes)| {
+        superblock_spans_device(&superblock, device_bytes, rustix::param::page_size() as u64)
+    })
+}
+
+fn read_superblock(device: &str) -> std::io::Result<(Vec<u8>, u64)> {
+    let mut file = File::open(device)?;
+    let device_bytes = file.seek(SeekFrom::End(0))?;
+    let mut superblock = vec![0; SUPERBLOCK_LEN];
+    file.read_exact_at(&mut superblock, SUPERBLOCK_OFFSET)?;
+    Ok((superblock, device_bytes))
+}
+
+/// Mirrors resize2fs's default target size (the device rounded down to a page),
+/// skipping its group-trimming adjustment: unequal sizes fall back to resizing.
+/// A journal awaiting replay cannot change a count that already fills the device:
+/// ext4 grows online only up to its device and never shrinks online.
+fn superblock_spans_device(superblock: &[u8], device_bytes: u64, page_size: u64) -> bool {
+    parse_superblock_span(superblock, device_bytes, page_size).unwrap_or(false)
+}
+
+fn parse_superblock_span(superblock: &[u8], device_bytes: u64, page_size: u64) -> Option<bool> {
+    let word = |offset: usize| -> Option<u32> {
+        let bytes = superblock.get(offset..offset + 4)?;
+        Some(u32::from_le_bytes(bytes.try_into().ok()?))
+    };
+    let magic = superblock.get(SB_MAGIC..SB_MAGIC + 2)?;
+    if u16::from_le_bytes(magic.try_into().ok()?) != EXT4_MAGIC {
+        return Some(false);
+    }
+    let incompat = word(SB_FEATURE_INCOMPAT)?;
+    if word(SB_FEATURE_RO_COMPAT)? & RO_COMPAT_BIGALLOC != 0 {
+        return Some(false);
+    }
+    let log_block_size = word(SB_LOG_BLOCK_SIZE)?;
+    if log_block_size > EXT4_MAX_LOG_BLOCK_SIZE {
+        return Some(false);
+    }
+    let block_size = 1024u64 << log_block_size;
+    let mut blocks = u64::from(word(SB_BLOCKS_COUNT_LO)?);
+    if incompat & INCOMPAT_64BIT != 0 {
+        blocks |= u64::from(word(SB_BLOCKS_COUNT_HI)?) << 32;
+    }
+    let mut device_blocks = device_bytes / block_size;
+    if page_size > block_size {
+        device_blocks &= !(page_size / block_size - 1);
+    }
+    Some(device_blocks == blocks)
+}
+
+/// Remounts the volumes and the root read-only so the next boot mounts them without a
+/// journal replay; a filesystem a process still writes to stays as it is.
+pub(super) fn leave_filesystems_clean(plan: &Plan) {
+    for volume in &plan.volumes {
+        let _ = rustix::mount::mount_remount(
+            volume.guest.as_str(),
+            crate::config::VOLUME_MOUNT_FLAGS | MountFlags::RDONLY,
+            "",
+        );
+    }
+    let _ = rustix::mount::mount_remount("/", MountFlags::RDONLY, "");
+}
+
 fn grow_filesystem(device: &str) {
+    if filesystem_already_spans_device(device) {
+        return;
+    }
     if let Err(error) = mount(Some(device), CLEAN_MOUNT, Some("ext4"), MountFlags::empty()) {
         eprintln!("terra-agent: warning: {device} would not mount ({error:#}) - skipping resize");
         return;
@@ -276,6 +360,97 @@ fn setup_env(plan: &Plan) {
 mod tests {
     use super::*;
     use terra_protocol::Plan;
+
+    const PAGE: u64 = 4096;
+
+    fn superblock(blocks: u64, log_block_size: u32, incompat: u32, ro_compat: u32) -> Vec<u8> {
+        let mut sb = vec![0; SUPERBLOCK_LEN];
+        let mut put =
+            |offset: usize, value: &[u8]| sb[offset..offset + value.len()].copy_from_slice(value);
+        put(0x04, &blocks.to_le_bytes()[..4]);
+        put(0x18, &log_block_size.to_le_bytes());
+        put(0x38, &EXT4_MAGIC.to_le_bytes());
+        put(0x60, &incompat.to_le_bytes());
+        put(0x64, &ro_compat.to_le_bytes());
+        put(0x150, &blocks.to_le_bytes()[4..8]);
+        sb
+    }
+
+    #[test]
+    fn exact_size_match_skips_resize() {
+        assert!(superblock_spans_device(
+            &superblock(4096, 2, 0, 0),
+            4096 * 4096,
+            PAGE
+        ));
+    }
+
+    #[test]
+    fn larger_device_needs_resize() {
+        assert!(!superblock_spans_device(
+            &superblock(4096, 2, 0, 0),
+            8192 * 4096,
+            PAGE
+        ));
+    }
+
+    #[test]
+    fn device_size_is_rounded_down_to_a_page_for_small_blocks() {
+        let sb = superblock(4096, 0, 0, 0);
+        let device_bytes = 4096 * 1024 + 3 * 1024;
+        assert!(superblock_spans_device(&sb, device_bytes, PAGE));
+        assert!(!superblock_spans_device(&sb, device_bytes + 4096, PAGE));
+    }
+
+    #[test]
+    fn sixty_four_bit_filesystems_use_the_high_block_count() {
+        let blocks = (1u64 << 32) + 8;
+        let sb = superblock(blocks, 2, INCOMPAT_64BIT, 0);
+        assert!(superblock_spans_device(&sb, blocks * 4096, PAGE));
+        assert!(!superblock_spans_device(&sb, 8 * 4096, PAGE));
+    }
+
+    /// Every boot after a poweroff without a clean unmount finds the journal flagged for
+    /// replay; a filesystem that already fills its device still skips the resize.
+    #[test]
+    fn journal_awaiting_replay_still_skips_a_filled_device() {
+        const INCOMPAT_RECOVER: u32 = 0x4;
+        let sb = superblock(4096, 2, INCOMPAT_RECOVER, 0);
+        assert!(superblock_spans_device(&sb, 4096 * 4096, PAGE));
+        assert!(!superblock_spans_device(&sb, 8192 * 4096, PAGE));
+    }
+
+    /// A garbage block-size exponent would wrap `1024 << n` to zero and divide PID 1 by it.
+    #[test]
+    fn block_size_beyond_ext4s_maximum_needs_resize() {
+        for log_block_size in [7, 54, 63, u32::MAX] {
+            assert!(!superblock_spans_device(
+                &superblock(0, log_block_size, 0, 0),
+                4096 * 4096,
+                PAGE
+            ));
+        }
+    }
+
+    #[test]
+    fn bigalloc_and_bad_magic_need_resize() {
+        let size = 4096 * 4096;
+        assert!(!superblock_spans_device(
+            &superblock(4096, 2, 0, RO_COMPAT_BIGALLOC),
+            size,
+            PAGE
+        ));
+        let mut sb = superblock(4096, 2, 0, 0);
+        sb[0x38] = 0;
+        assert!(!superblock_spans_device(&sb, size, PAGE));
+    }
+
+    #[test]
+    fn truncated_superblock_needs_resize() {
+        let sb = superblock(4096, 2, 0, 0);
+        assert!(!superblock_spans_device(&sb[..0x40], 4096 * 4096, PAGE));
+        assert!(!superblock_spans_device(&[], 0, PAGE));
+    }
 
     fn test_plan() -> Plan {
         Plan::bare_run(Vec::new())

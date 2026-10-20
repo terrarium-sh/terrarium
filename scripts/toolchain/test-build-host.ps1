@@ -59,7 +59,7 @@ exit [int]$env:TERRA_BUILD_HOST_EXIT_CODE
         Set-Content -LiteralPath (Join-Path $archiveRoot "components/block/wit/host.wit") -Value "../wit/terra/host.wit"
         New-Item -ItemType SymbolicLink -Path (Join-Path $archiveRoot "components/wit/terra/deps/valid") -Target (Join-Path $archiveRoot "components/wit/terra/shared") | Out-Null
         New-Item -ItemType SymbolicLink -Path (Join-Path $archiveRoot "components/wit/terra/deps/broken") -Target (Join-Path $archiveRoot "missing-wit-target") | Out-Null
-        foreach ($asset in @("vmlinux.gz", "rootfs.img.gz", "volume.img.gz", "boot.img.gz")) {
+        foreach ($asset in @("vmlinux.tlz4", "rootfs.img.gz", "volume.img.gz", "boot.img.tlz4")) {
             [IO.File]::WriteAllBytes((Join-Path $archiveRoot "build/$asset"), [byte[]](1))
         }
         Set-Content -LiteralPath (Join-Path $fakeTools "rustup.cmd") -Value @'

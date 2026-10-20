@@ -11,6 +11,8 @@ mod frames;
 pub mod guest_image;
 pub mod mux;
 pub mod network;
+#[cfg(feature = "packed-image")]
+pub mod packed_image;
 mod plan;
 pub mod session;
 pub mod socket;

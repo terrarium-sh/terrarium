@@ -357,7 +357,17 @@ mod tests {
         let boot =
             wasmtime::component::Component::new(&engine, crate::test_fixtures::wasm::BOOT).unwrap();
         let entry = runtime
-            .boot_prepared_machine(&boot, machine.config(), machine.ram().unwrap(), kernel, "")
+            .boot_prepared_machine(
+                &boot,
+                machine.config(),
+                machine.ram().unwrap(),
+                terra_protocol::packed_image::pack_fast_leaked(
+                    &kernel,
+                    terra_protocol::guest_image::GuestImage::Kernel,
+                )
+                .unwrap(),
+                "",
+            )
             .await
             .unwrap();
         machine.accept_boot(entry).unwrap();

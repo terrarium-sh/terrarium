@@ -60,6 +60,44 @@ pub(crate) fn install_interrupt_handler() -> Result<()> {
     Ok(())
 }
 
+/// Resolves on the first interrupt delivered after this call; one that arrived earlier shows in
+/// [`is_interrupted`]. Call it inside a tokio runtime.
+#[cfg(unix)]
+pub(crate) fn interrupt_signal() -> Result<impl std::future::Future<Output = ()>> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut interrupt = signal(SignalKind::interrupt()).context("watching SIGINT")?;
+    let mut terminate = signal(SignalKind::terminate()).context("watching SIGTERM")?;
+    let mut hangup = signal(SignalKind::hangup()).context("watching SIGHUP")?;
+    Ok(async move {
+        tokio::select! {
+            _ = interrupt.recv() => {}
+            _ = terminate.recv() => {}
+            _ = hangup.recv() => {}
+        }
+    })
+}
+
+/// Resolves on the first console interrupt delivered after this call; one that arrived earlier
+/// shows in [`is_interrupted`]. Call it inside a tokio runtime.
+#[cfg(windows)]
+pub(crate) fn interrupt_signal() -> Result<impl std::future::Future<Output = ()>> {
+    use tokio::signal::windows;
+    let mut ctrl_c = windows::ctrl_c().context("watching Ctrl+C")?;
+    let mut ctrl_break = windows::ctrl_break().context("watching Ctrl+Break")?;
+    let mut ctrl_close = windows::ctrl_close().context("watching console close")?;
+    let mut ctrl_logoff = windows::ctrl_logoff().context("watching logoff")?;
+    let mut ctrl_shutdown = windows::ctrl_shutdown().context("watching shutdown")?;
+    Ok(async move {
+        tokio::select! {
+            _ = ctrl_c.recv() => {}
+            _ = ctrl_break.recv() => {}
+            _ = ctrl_close.recv() => {}
+            _ = ctrl_logoff.recv() => {}
+            _ = ctrl_shutdown.recv() => {}
+        }
+    })
+}
+
 #[cfg(test)]
 pub(crate) fn run_capture(
     command: &mut std::process::Command,
@@ -132,6 +170,7 @@ impl SupervisedChild {
         &mut self.child
     }
 
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn try_wait(&mut self) -> Result<Option<ExitStatus>> {
         let status = self.child.try_wait()?;
         if status.is_some() {
@@ -159,6 +198,57 @@ impl SupervisedChild {
             std::thread::sleep(POLL_INTERVAL);
         }
     }
+}
+
+/// Resolves once `child` has exited, leaving it for the owner to reap.
+pub(crate) fn exited(child: &Child) -> Result<impl std::future::Future<Output = ()> + use<>> {
+    let block_until_exited = exit_waiter(child)?;
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("child-exit".into())
+        .spawn(move || {
+            block_until_exited();
+            let _ = sender.send(());
+        })
+        .context("starting child exit watcher")?;
+    Ok(async move {
+        let _ = receiver.await;
+    })
+}
+
+/// Blocks until `child` exits without reaping it; returns early if it was already reaped.
+#[cfg(unix)]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "Windows duplicates the process handle, which can fail"
+)]
+fn exit_waiter(child: &Child) -> Result<impl FnOnce() + Send + use<>> {
+    use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+    let pid = Pid::from_child(child);
+    Ok(move || {
+        while matches!(
+            waitid(
+                WaitId::Pid(pid),
+                WaitIdOptions::EXITED | WaitIdOptions::NOWAIT
+            ),
+            Err(rustix::io::Errno::INTR)
+        ) {}
+    })
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn exit_waiter(child: &Child) -> Result<impl FnOnce() + Send + use<>> {
+    use std::os::windows::io::{AsHandle as _, AsRawHandle as _};
+    use windows_sys::Win32::System::Threading::{INFINITE, WaitForSingleObject};
+    let handle = child
+        .as_handle()
+        .try_clone_to_owned()
+        .context("duplicating child process handle")?;
+    Ok(move || {
+        // SAFETY: the duplicated handle stays open for this call.
+        unsafe { WaitForSingleObject(handle.as_raw_handle(), INFINITE) };
+    })
 }
 
 impl Drop for SupervisedChild {
@@ -233,6 +323,26 @@ mod tests {
                 signal.join().unwrap();
                 assert!(format!("{error:#}").contains("interrupted"));
             }
+            #[cfg(unix)]
+            "signal" => {
+                install_interrupt_handler().unwrap();
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let interrupt = {
+                    let _context = runtime.enter();
+                    interrupt_signal().unwrap()
+                };
+                // SAFETY: getpid identifies this isolated test process; SIGTERM uses its installed handler.
+                assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGTERM) }, 0);
+                runtime
+                    .block_on(async {
+                        tokio::time::timeout(Duration::from_secs(5), interrupt).await
+                    })
+                    .unwrap();
+                assert!(is_interrupted());
+            }
             _ => unreachable!("unknown child mode"),
         }
     }
@@ -251,6 +361,43 @@ mod tests {
         assert_eq!(output.stderr, vec![b'e'; 1024 * 1024]);
     }
 
+    /// The exit watcher stays pending while the child runs, resolves once it exits, and leaves
+    /// the exit status for the owner to reap.
+    #[test]
+    fn exited_resolves_on_exit_and_leaves_the_child_to_reap() {
+        use std::process::Stdio;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let running = build_test_command("wait")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let running = SupervisedChild::new(running, None).unwrap();
+        let still_running = exited(&running.child).unwrap();
+        assert!(
+            runtime
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_millis(200), still_running).await
+                })
+                .is_err()
+        );
+        drop(running);
+
+        let mut exiting = build_test_command("output")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let has_exited = exited(&exiting).unwrap();
+        runtime
+            .block_on(async { tokio::time::timeout(Duration::from_secs(10), has_exited).await })
+            .unwrap();
+        assert_eq!(exiting.try_wait().unwrap().unwrap().code(), Some(12));
+    }
+
     #[test]
     fn capture_timeout_kills_and_reaps_child() {
         let started = Instant::now();
@@ -258,6 +405,16 @@ mod tests {
             run_capture(&mut build_test_command("wait"), Duration::from_millis(100)).unwrap_err();
         assert!(error.to_string().contains("timed out"));
         assert!(started.elapsed() < Duration::from_secs(4));
+    }
+
+    /// A signal resolves the interrupt future and, through the chained handler, still sets the
+    /// interrupt flag.
+    #[cfg(unix)]
+    #[test]
+    fn an_interrupt_signal_resolves_the_future_and_sets_the_flag_in_an_isolated_process() {
+        let output =
+            run_capture(&mut build_test_command("signal"), Duration::from_secs(10)).unwrap();
+        assert!(output.status.success(), "{output:?}");
     }
 
     #[cfg(unix)]

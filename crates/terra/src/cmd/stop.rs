@@ -88,6 +88,7 @@ fn can_retry_stop(error: &anyhow::Error) -> bool {
 }
 
 const KILL_REAP_WAIT: Duration = Duration::from_secs(2);
+const STOPPED_CHECK_INTERVAL: Duration = Duration::from_millis(10);
 
 fn wait_until_stopped(bx: &BoxRef, deadline: Instant) -> Result<bool> {
     loop {
@@ -99,7 +100,7 @@ fn wait_until_stopped(bx: &BoxRef, deadline: Instant) -> Result<bool> {
         if Instant::now() >= deadline {
             return Ok(false);
         }
-        std::thread::sleep(sys::POLL);
+        std::thread::sleep(STOPPED_CHECK_INTERVAL);
     }
 }
 

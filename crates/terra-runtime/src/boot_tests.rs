@@ -3,42 +3,32 @@ use crate::component::network::{NetworkBackend, PortMapping};
 use std::assert_matches;
 use terra_network::config::{Config, Network, PublishedListener, StaticDnsRecord};
 
-fn load_boot_disk(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
-    use std::io::Read as _;
-
-    let mut decoder = flate2::read::GzDecoder::new(std::fs::File::open(path)?);
-    terra_protocol::guest_image::GuestImage::Boot
-        .validate(decoder.header().and_then(flate2::GzHeader::extra))?;
-    let mut boot_disk = Vec::new();
-    decoder.read_to_end(&mut boot_disk)?;
-    Ok(boot_disk)
+fn load_packed_image(
+    path: &std::path::Path,
+    kind: terra_protocol::guest_image::GuestImage,
+) -> terra_protocol::packed_image::PackedImage<'static> {
+    let bytes = std::fs::read(path).expect("run `make build` first");
+    terra_protocol::packed_image::PackedImage::parse(bytes.leak(), kind).unwrap()
 }
 
-fn load_kernel(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
-    use std::io::Read as _;
+fn kernel_boot_assets() -> (
+    terra_protocol::packed_image::PackedImage<'static>,
+    terra_protocol::packed_image::PackedImage<'static>,
+    tempfile::TempPath,
+) {
+    use terra_protocol::guest_image::GuestImage;
 
-    let mut decoder = flate2::read::GzDecoder::new(std::fs::File::open(path)?);
-    terra_protocol::guest_image::GuestImage::Kernel
-        .validate(decoder.header().and_then(flate2::GzHeader::extra))?;
-    let mut kernel = Vec::new();
-    decoder.read_to_end(&mut kernel)?;
-    Ok(kernel)
-}
-
-fn kernel_boot_assets() -> (Vec<u8>, Vec<u8>, tempfile::TempPath) {
     let build = crate::test_fixtures::boot_assets_dir();
-    let decode = |name| {
-        flate2::read::GzDecoder::new(
-            std::fs::File::open(build.join(name)).expect("run `make build` first"),
-        )
-    };
-    let kernel = load_kernel(&build.join("vmlinux.gz")).unwrap();
     let stage_disk = |name| {
         let mut disk = tempfile::NamedTempFile::new().unwrap();
-        std::io::copy(&mut decode(name), &mut disk).unwrap();
+        let mut decoder = flate2::read::GzDecoder::new(
+            std::fs::File::open(build.join(name)).expect("run `make build` first"),
+        );
+        std::io::copy(&mut decoder, &mut disk).unwrap();
         disk.into_temp_path()
     };
-    let boot_disk = load_boot_disk(&build.join("boot.img.gz")).unwrap();
+    let kernel = load_packed_image(&build.join("vmlinux.tlz4"), GuestImage::Kernel);
+    let boot_disk = load_packed_image(&build.join("boot.img.tlz4"), GuestImage::Boot);
     (kernel, boot_disk, stage_disk("rootfs.img.gz"))
 }
 

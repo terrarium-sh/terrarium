@@ -89,10 +89,10 @@ jobs:
         with:
           name: terra-guest-${{ matrix.arch }}
           path: |
-            build/vmlinux.gz
+            build/vmlinux.tlz4
             build/rootfs.img.gz
             build/volume.img.gz
-            build/boot.img.gz
+            build/boot.img.tlz4
             build/bwrap-${{ matrix.arch }}
             build/socket-probe
           if-no-files-found: error

@@ -27,7 +27,16 @@ pub(super) async fn run(
         );
         let kernel = kernel_image(architecture);
         let entry = runtime
-            .boot_prepared_machine(&component, &config, ram.clone(), kernel, "console=hvc0")
+            .boot_prepared_machine(
+                &component,
+                &config,
+                ram.clone(),
+                terra_protocol::packed_image::pack_fast_leaked(
+                    &kernel,
+                    terra_protocol::guest_image::GuestImage::Kernel,
+                )?,
+                "console=hvc0",
+            )
             .await?;
         let payload_offset = match architecture {
             Architecture::X86 => 0,
@@ -58,7 +67,16 @@ pub(super) async fn run(
         }
         wasmtime::ensure!(
             runtime
-                .boot_prepared_machine(&component, &config, ram, vec![0; 64], "")
+                .boot_prepared_machine(
+                    &component,
+                    &config,
+                    ram,
+                    terra_protocol::packed_image::pack_fast_leaked(
+                        &[0; 64],
+                        terra_protocol::guest_image::GuestImage::Kernel,
+                    )?,
+                    ""
+                )
                 .await
                 .is_err(),
             "boot device suite accepted a malformed kernel"
