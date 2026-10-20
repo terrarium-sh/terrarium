@@ -10,8 +10,8 @@
 # Requires $(ARCH) — include it after those are set.
 
 # --- Terra guest kernel: upstream Linux LTS ---------------------------------
-KERNEL_VERSION := 6.18.56
-KERNEL_SHA256 := 4633bbda2ab95eaf2a7af4041236451d6759c72e6946265531af4b3aacefbf89
+KERNEL_VERSION := 6.18.57
+KERNEL_SHA256 := 5bd9acdc82ec5efc3790ae840e5aaa40dfde7efff261cf6dde902dc570acf98c
 KERNEL_URL := https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$(KERNEL_VERSION).tar.xz
 
 # --- e2fsprogs --------------------------------------------------------------
