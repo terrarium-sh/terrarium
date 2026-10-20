@@ -8,6 +8,8 @@ fn read_repo_text(relative: &str) -> String {
         .join(relative);
     std::fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("reading {}: {error}", path.display()))
+        // A Windows checkout with core.autocrlf has CRLF docs.
+        .replace("\r\n", "\n")
 }
 
 fn read_doc(name: &str) -> String {
