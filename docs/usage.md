@@ -31,7 +31,7 @@ survive restarts, so its tools and state stay put.
    with `terra <box> sync`.
 3. [Allow](recipe.md#network) only the destinations it needs.
 
-`terra <box> logs --diagnostics` shows hook output and network denials. To keep
+`terra <box> logs` shows network denials as `egress: blocked` lines. To keep
 the agent running across host restarts, use the
 [systemd unit](../packaging/README.md#running-terra-under-systemd).
 
@@ -42,6 +42,17 @@ your host. [Mount](recipe.md#mounts) the project, mark anything the harness only
 reads `readonly`, and allow the registries and APIs it calls. Detach with
 `Ctrl-\`, rejoin with `terra dev`, and run one-off commands with
 `terra dev exec`. The [quickstart](../README.md#quickstart) builds this setup.
+
+### Let an agent build the box
+
+The [terra-box skill](../skills/terra-box/SKILL.md) teaches Claude Code, Codex
+and other agents to turn your requirements into a recipe, check it, set it up
+and test it. Install it into your agent's skills folder, for Claude Code:
+
+```sh
+mkdir -p ~/.claude/skills/terra-box
+curl -fsSL -o ~/.claude/skills/terra-box/SKILL.md https://raw.githubusercontent.com/terrarium-sh/terrarium/main/skills/terra-box/SKILL.md
+```
 
 ## Installation options
 

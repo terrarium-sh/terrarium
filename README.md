@@ -1,4 +1,4 @@
-# 🪴 Terrarium
+# <img src="web/static/favicon.svg" alt="" width="40" height="40" align="top"> Terrarium
 
 **Give your agent room to work. Decide what it can touch.**
 
@@ -87,6 +87,8 @@ This recipe:
 - installs Node.js, npm and Git the first time the box is created.
 
 If your tools need other sites, add them to `network.allow`.
+For more ready-made recipes, see
+[terrarium_examples](https://github.com/terrarium-sh/terrarium_examples).
 
 **2. Create the box and go in:**
 
@@ -137,6 +139,8 @@ To learn what Terrarium protects against and where it stops, read the
 - [Usage guide](docs/usage.md): install options, commands, file sync and storage.
 - [Recipe reference](docs/recipe.md): network access, mounts, packages and workloads.
 - [Project manifest](docs/manifest.md): manage several boxes with `terra.yaml`.
+- [Agent skill](docs/usage.md#let-an-agent-build-the-box): let your coding agent
+  write and set up boxes from your requirements.
 - [Security model](docs/security.md): trust boundaries, enforcement and limits.
 - [Host process sandboxing](docs/sandboxing.md): which processes a box uses and
   how each OS confines them.
