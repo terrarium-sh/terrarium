@@ -266,7 +266,8 @@ nav a[aria-current] { color: var(--accent-strong); background: var(--accent-soft
   .site-header { flex-wrap: wrap; padding-block: 1rem; min-height: auto; }
   nav { gap: 1.3rem; }
   .site-header { row-gap: .5rem; }
-  .site-header nav { width: 100%; gap: .75rem; }
+  .site-header nav { width: 100%; gap: 0; }
+  .site-header nav a { padding-inline: 0.55rem; }
   .hero, .start-section, .principles, .reference-layout { grid-template-columns: 1fr; }
   .hero { gap: 2rem; }
   .hero h1 { font-size: clamp(2.65rem, 11vw, 3.25rem); }

@@ -42,6 +42,7 @@
   <nav aria-label="Main navigation">
     <a href="{base}/docs/usage/" aria-current={page.url.pathname.includes('/docs/') ? 'page' : undefined}>Guides</a>
     <a href="{base}/commands/" aria-current={page.url.pathname.includes('/commands/') ? 'page' : undefined}>Commands</a>
+    <a href="https://github.com/terrarium-sh/terrarium_examples" target="_blank" rel="noopener noreferrer">Examples</a>
     <a href="https://github.com/terrarium-sh/terrarium" target="_blank" rel="noopener noreferrer">GitHub</a>
   </nav>
 </header>
