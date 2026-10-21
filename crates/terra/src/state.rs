@@ -125,14 +125,23 @@ impl BoxRef {
     }
 
     pub fn list_unused_volume_images(&self, configured: &[String]) -> Result<Vec<PathBuf>> {
-        let keep: Vec<PathBuf> = configured
+        let images = self.list_volume_images()?;
+        // see case_only_volume_rename_keeps_the_existing_image
+        let kept: Vec<&PathBuf> = configured
             .iter()
-            .map(|n| self.get_volume_image(n))
+            .filter_map(|name| {
+                let image = self.get_volume_image(name);
+                images.iter().find(|path| **path == image).or_else(|| {
+                    images
+                        .iter()
+                        .find(|path| path.as_os_str().eq_ignore_ascii_case(&image))
+                })
+            })
             .collect();
-        Ok(self
-            .list_volume_images()?
-            .into_iter()
-            .filter(|path| !keep.contains(path))
+        Ok(images
+            .iter()
+            .filter(|path| !kept.contains(path))
+            .cloned()
             .collect())
     }
 
@@ -1080,6 +1089,32 @@ mod tests {
                 b.get_volume_image("old")
             ]
         );
+    }
+
+    /// Volume names are case-insensitive, so renaming `Data` to `data` keeps using `vol-Data.img`
+    /// on macOS and Windows file systems. Listing that image as unused would let `storage prune`
+    /// delete a live volume. Once a separate exact-case image exists (a case-sensitive file
+    /// system), the old spelling is unused again and prunable.
+    #[test]
+    fn case_only_volume_rename_keeps_the_existing_image() {
+        let _home = TestHome::new();
+        let dir = tempfile::tempdir().unwrap();
+        let b = resolve_box_ref(dir.path());
+        std::fs::create_dir_all(b.get_dir()).unwrap();
+        std::fs::write(b.get_volume_image("Data"), b"image").unwrap();
+        let configured = ["data".to_string()];
+        assert_eq!(
+            b.list_unused_volume_images(&configured).unwrap(),
+            Vec::<PathBuf>::new()
+        );
+
+        std::fs::write(b.get_volume_image("data"), b"image").unwrap();
+        if b.list_volume_images().unwrap().len() == 2 {
+            assert_eq!(
+                b.list_unused_volume_images(&configured).unwrap(),
+                vec![b.get_volume_image("Data")]
+            );
+        }
     }
 
     /// A boot racing a momentary hold on the lock must not be told the box is
