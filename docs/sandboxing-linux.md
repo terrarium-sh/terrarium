@@ -30,7 +30,8 @@ terra (CLI) ── agent and control sockets ──► __vm
   all capabilities. The VM also gets a private network namespace, so its native
   sockets cannot reach host networking; the broker keeps the host network
   namespace.
-- The broker gets no `/dev` device nodes and no `/tmp`.
+- The broker gets no `/dev` device nodes and no `/tmp`. It does get `/proc`,
+  where `/proc/net` lists the host's connections and Unix socket names.
 - The launcher clears the inherited environment and forwards only diagnostic and
   worker metadata. Guest environment grants travel in the boot plan; broker
   policy and listener grants arrive on a supervisor-controlled startup channel
@@ -47,8 +48,8 @@ terra (CLI) ── agent and control sockets ──► __vm
   `TIOCSTI` and `TIOCLINUX` terminal-injection ioctls.
 - The broker shares the host network namespace, where abstract Unix sockets
   (such as an X11 display) and host netlink live. Its filters allow only IPv4
-  and IPv6 sockets and deny `listen`; the supervisor reads host interface
-  addresses for it.
+  and IPv6 sockets and Unix stream socket pairs, and deny `listen`; the
+  supervisor reads host interface addresses for it.
 
 ## Lifetime
 

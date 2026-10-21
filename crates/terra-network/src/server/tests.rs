@@ -531,6 +531,31 @@ async fn cancelling_an_accept_releases_the_grant() {
     .await;
 }
 
+/// A client that resets while queued fails its own accept on Windows (`WSAECONNRESET`) and its
+/// socket options on macOS (`EINVAL`). The published port must keep accepting the next client;
+/// Linux hands out the reset connection instead, so every accept must succeed.
+#[tokio::test]
+async fn a_client_reset_before_accept_leaves_the_port_open() {
+    bounded(async {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let reset = std::net::TcpStream::connect(address).unwrap();
+        SockRef::from(&reset)
+            .set_linger(Some(Duration::ZERO))
+            .unwrap();
+        drop(reset);
+        let kept = TcpStream::connect(address).await.unwrap();
+        let expected = kept.local_addr().unwrap();
+        for _ in 0..2 {
+            if tcp::accept(&listener).await.unwrap().1 == expected {
+                return;
+            }
+        }
+        panic!("the client after the reset one was never accepted");
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn dns_answers_while_many_tcp_flows_are_busy() {
     bounded(async {

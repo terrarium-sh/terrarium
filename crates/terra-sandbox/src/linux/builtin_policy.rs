@@ -242,6 +242,22 @@ mod tests {
                 Some(libc::EPERM)
             );
         }
+        for (family, kind) in [
+            (libc::AF_UNIX, libc::SOCK_DGRAM),
+            (libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC),
+            (libc::AF_INET, libc::SOCK_STREAM),
+        ] {
+            let mut pair = [-1; 2];
+            // SAFETY: `pair` is a live two-descriptor buffer, and the filter must refuse the call.
+            assert_eq!(
+                unsafe { libc::socketpair(family, kind, 0, pair.as_mut_ptr()) },
+                -1
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EPERM)
+            );
+        }
         // SAFETY: socket takes no pointers; the descriptor is closed immediately.
         unsafe {
             let ipv6 = libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, 0);

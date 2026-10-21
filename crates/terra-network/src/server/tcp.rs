@@ -104,14 +104,32 @@ async fn open_stream(
     }
 }
 
+/// Skips connections their client already reset, which fail accept or its socket options on some
+/// hosts; an error here would close the published port for good.
 pub(super) async fn accept(listener: &TcpListener) -> Result<(TcpStream, SocketAddr), Error> {
-    let (stream, peer) = listener.accept().await.map_err(map_io_error)?;
-    if !peer.ip().is_loopback() {
-        return Err(Error::AccessDenied);
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(map_io_error(error)),
+        };
+        if !peer.ip().is_loopback() {
+            return Err(Error::AccessDenied);
+        }
+        if bound_socket_buffers(&SockRef::from(&stream))
+            .and_then(|()| stream.set_nodelay(true))
+            .is_ok()
+        {
+            return Ok((stream, peer));
+        }
     }
-    bound_socket_buffers(&SockRef::from(&stream)).map_err(map_io_error)?;
-    stream.set_nodelay(true).map_err(map_io_error)?;
-    Ok((stream, peer))
 }
 
 struct Relay {

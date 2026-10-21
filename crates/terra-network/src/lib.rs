@@ -10,7 +10,7 @@ mod server;
 mod sockets;
 
 pub use client::{Client, TcpDownload, TcpFlow, TcpUpload, UdpFlow};
-pub use server::{Broker, bind_listeners};
+pub use server::{Broker, bind_listeners, embeds_ipv4};
 pub use sockets::{OutboundSockets, SocketSource};
 
 pub use terra_protocol::network::{Error, ListenerGrant, ResourceKind};

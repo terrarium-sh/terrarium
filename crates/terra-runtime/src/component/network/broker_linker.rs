@@ -340,11 +340,7 @@ fn canonical_peer(address: SocketAddress) -> Result<SocketAddr, Error> {
         IpAddress::Ipv4((a, b, c, d)) => IpAddr::V4(Ipv4Addr::new(a, b, c, d)),
         IpAddress::Ipv6(segments) => {
             let address = Ipv6Addr::from(<[u16; 8]>::from(segments));
-            if address.to_ipv4_mapped().is_some()
-                || (address.segments()[..6] == [0; 6]
-                    && !address.is_unspecified()
-                    && !address.is_loopback())
-            {
+            if terra_network::embeds_ipv4(address) {
                 return Err(Error::InvalidArgument);
             }
             IpAddr::V6(address)

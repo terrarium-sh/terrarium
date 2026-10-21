@@ -274,6 +274,8 @@ Limits:
 - DNS answers A and AAAA queries only; MX, TXT, SRV and other types come back
   empty. The host follows CNAMEs, so the guest gets addresses under the name it
   asked for, and only that name needs an `allow` rule.
+- In allowlist mode, or with `hosts` records, all guest DNS goes to Terra's
+  resolver, so an `allow` rule for port 53 is refused.
 - An address learned from a lookup allows new connections for 60 seconds unless
   a new lookup renews it; open connections are unaffected.
 - `ping` to external hosts does not work: there is no ICMP forwarding.

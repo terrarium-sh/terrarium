@@ -5,6 +5,7 @@ mod tcp;
 mod tests;
 mod udp;
 
+pub use self::peer::embeds_ipv4;
 use self::peer::validate_peer;
 use self::tcp::bind_tcp_listener_socket;
 use self::udp::adopt_udp;

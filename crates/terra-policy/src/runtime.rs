@@ -97,7 +97,21 @@ impl BoxPolicy {
     }
 
     fn add_allow_rule(&mut self, entry: &str) -> Result<()> {
-        match parse_allow(entry)? {
+        let rule = parse_allow(entry)?;
+        if matches!(
+            rule,
+            Rule::Host(Some(53)) | Rule::Addr(_, Some(53)) | Rule::Name(_, Some(53))
+        ) && self.blocks_direct_dns()
+        {
+            return Err(format!(
+                "allow rule '{entry}' can never open port 53: with 'mode: allowlist' or \
+                 'hosts:' records, all guest DNS goes to terra's built-in resolver, which \
+                 answers A and AAAA queries only.\n\
+                 Drop the rule, or use 'mode: unrestricted-public' without 'hosts:' \
+                 records to query other DNS servers directly."
+            ));
+        }
+        match rule {
             Rule::Host(port) => self.host_grants.push(port),
             Rule::Addr(cidr, port) => {
                 if let Some(gateway) = self

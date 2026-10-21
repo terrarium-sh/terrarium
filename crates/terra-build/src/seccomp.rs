@@ -19,6 +19,8 @@ const PR_SET_PDEATHSIG: u32 = 1;
 const AF_UNIX: u32 = 1;
 const AF_INET: u32 = 2;
 const AF_INET6: u32 = 10;
+const SOCK_TYPE_MASK: u32 = 0xf;
+const SOCK_STREAM: u32 = 1;
 const KVM_IOCTL_TYPE: u32 = 0xae00;
 const TIOCSTI: u32 = 0x5412;
 const TIOCLINUX: u32 = 0x541c;
@@ -270,8 +272,9 @@ fn append_vm_rules(filter: &mut Filter) -> Result<(), String> {
     Ok(())
 }
 
-/// Limits `socket` to IP: the broker shares the host network namespace, where `AF_UNIX` would reach
-/// abstract sockets such as the user's X11 display.
+/// Limits `socket` to IP and `socketpair` to Unix streams: the broker shares the host network
+/// namespace, where a Unix datagram socket would reach abstract sockets such as the user's X11
+/// display, and another family could load a rare protocol module.
 fn append_network_rules(filter: &mut Filter) -> Result<(), String> {
     filter.append_denied_syscalls(&NETWORK_DENIED_SYSCALLS)?;
     let socket = filter.architecture.resolve_syscall_number("socket")?;
@@ -279,6 +282,15 @@ fn append_network_rules(filter: &mut Filter) -> Result<(), String> {
     filter.append(LOAD_WORD, 0, 0, FIRST_ARGUMENT);
     filter.append(JUMP_EQUAL, 2, 0, AF_INET);
     filter.append(JUMP_EQUAL, 1, 0, AF_INET6);
+    filter.append(RETURN, 0, 0, DENY_EPERM);
+    filter.append(RETURN, 0, 0, ALLOW);
+    let socketpair = filter.architecture.resolve_syscall_number("socketpair")?;
+    filter.append(JUMP_EQUAL, 0, 7, socketpair);
+    filter.append(LOAD_WORD, 0, 0, FIRST_ARGUMENT);
+    filter.append(JUMP_EQUAL, 0, 3, AF_UNIX);
+    filter.append(LOAD_WORD, 0, 0, SECOND_ARGUMENT);
+    filter.append(AND, 0, 0, SOCK_TYPE_MASK);
+    filter.append(JUMP_EQUAL, 1, 0, SOCK_STREAM);
     filter.append(RETURN, 0, 0, DENY_EPERM);
     filter.append(RETURN, 0, 0, ALLOW);
     let ioctl = filter.architecture.resolve_syscall_number("ioctl")?;

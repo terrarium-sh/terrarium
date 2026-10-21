@@ -909,6 +909,22 @@ fn direct_dns_and_host_service_capabilities_match_the_recipe() {
     }
 }
 
+/// Direct DNS is denied before any rule is checked while the gateway answers names, so a
+/// `:53` rule there would look right and do nothing. Under `unrestricted-public` without
+/// `hosts:` records, direct DNS is open and the rule reaches a floored resolver.
+#[test]
+fn port_53_rules_are_refused_while_the_gateway_answers_names() {
+    for rule in ["10.0.0.1:53", "dns.test:53", "HOST_LOOPBACK:53"] {
+        let error = build_policy(&build_network(NetworkMode::Allowlist, &[rule])).unwrap_err();
+        assert!(error.contains("can never open port 53"), "{error}");
+        let mut network = build_network(NetworkMode::UnrestrictedPublic, &[rule]);
+        network.hosts = vec![build_dns_record("dns.test", "10.0.0.1")];
+        assert!(build_policy(&network).is_err(), "{rule}");
+    }
+    let p = build_box_policy(NetworkMode::UnrestrictedPublic, &["10.0.0.1:53"]);
+    assert!(p.authorizes("10.0.0.1:53".parse().unwrap()));
+}
+
 /// A peer's authorization is the one decision the broker makes: direct DNS
 /// stays closed while the gateway answers names, `HOST_LOOPBACK` grants reach
 /// host loopback, and a learned grant reports when it lapses.

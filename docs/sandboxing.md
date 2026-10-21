@@ -26,7 +26,7 @@ What an attacker gets after compromising a worker's native code.
 | ***Broker can…*** | | | |
 | Connect out | Any address, host loopback included | Any address, host loopback included | Any address, through its wrapper |
 | Open a TCP listener | No | No | No |
-| Read files | Resolver files only | Resolver files only | Its own executable only |
+| Read files | Resolver files and `/proc`, including the host's `/proc/net` | Resolver files only | Its own executable only |
 | Create a VM | No: no `/dev` | **Yes**: shares the hypervisor entitlement | No: no hypervisor capability |
 | Memory cap | None | None | 512 MiB commit |
 
