@@ -180,6 +180,7 @@ fn run_vcpu(
                 VcpuExit::Shutdown
                 | VcpuExit::SystemEvent(KVM_SYSTEM_EVENT_SHUTDOWN | KVM_SYSTEM_EVENT_RESET, _),
             ) => {
+                stop.request();
                 let _ = handler.exchange(NativeExit::Shutdown);
                 return Ok(VcpuOutcome::Shutdown);
             }

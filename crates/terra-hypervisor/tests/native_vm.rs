@@ -215,6 +215,57 @@ mod supported_host {
         PreparedVm::create(&config, None).expect("recreate native VM after vCPU cleanup");
     }
 
+    /// A guest reset exits only the vCPU that asked (x86: a triple fault; ARM: PSCI
+    /// `SYSTEM_RESET`). The others sleep in the hypervisor (a parked AP, a powered-off CPU) until
+    /// the backend wakes them, so without that wake-up a guest panic under `panic=-1` leaves the
+    /// box running with a dead guest. The guest kernel's own `reboot` resets vsock first, which
+    /// ends the box through the agent and hides this.
+    #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
+    #[test]
+    #[ignore = "requires a native hypervisor"]
+    fn guest_reset_finishes_every_vcpu() {
+        let _native_hypervisor = NATIVE_HYPERVISOR.lock().expect("lock native hypervisor");
+        let mut config = one_vcpu_config();
+        config.vcpus = 2;
+        let prepared = PreparedVm::create(&config, None).expect("prepare native VM");
+        let memory = prepared.handle().memory();
+        let (boot, _) = stage_guest(&memory);
+        // lidt [rip + 0xf9] (a zeroed, zero-limit IDTR); ud2.
+        #[cfg(target_arch = "x86_64")]
+        let reset = vec![0x0f, 0x01, 0x1d, 0xf9, 0, 0, 0, 0x0f, 0x0b];
+        // w0 = PSCI SYSTEM_RESET; hvc #0; b .
+        #[cfg(target_arch = "aarch64")]
+        let reset = [0x5280_0120_u32, 0x72b0_8000, 0xd400_0002, 0x1400_0000]
+            .map(u32::to_le_bytes)
+            .concat();
+        memory.write(boot.entry, &reset).expect("stage reset guest");
+        let finished = Arc::new(Mutex::new(Vec::new()));
+        let mut running = prepared
+            .start(
+                boot,
+                (0..2)
+                    .map(|_| Box::new(MarkerHandler(Arc::clone(&finished))) as Box<dyn VcpuHandler>)
+                    .collect(),
+            )
+            .expect("start native vCPUs");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while finished.lock().expect("read native vCPU outcomes").len() < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "vCPUs still running after the guest reset: {:?}",
+                finished.lock().expect("read native vCPU outcomes")
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            running
+                .join()
+                .expect("bounded native vCPU join")
+                .into_iter()
+                .all(|outcome| outcome.is_ok())
+        );
+    }
+
     #[cfg(all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos")))]
     #[test]
     #[ignore = "requires a native hypervisor"]

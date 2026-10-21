@@ -275,6 +275,7 @@ fn dispatch_kernel_exit(
             require_reentry(handler_action(handler, VcpuExit::Interrupted)?)?;
         }
         KvmVcpuExit::Shutdown => {
+            stop.request();
             let _ = handler.exchange(VcpuExit::Shutdown);
             return Ok(Some(VcpuOutcome::Shutdown));
         }
