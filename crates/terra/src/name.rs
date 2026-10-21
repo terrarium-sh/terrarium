@@ -71,6 +71,13 @@ pub fn validate_box_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn box_hostname(name: &str) -> String {
+    name.to_ascii_lowercase()
+        .replace(['.', '_'], "-")
+        .trim_end_matches('-')
+        .to_owned()
+}
+
 fn is_windows_device_name(name: &str) -> bool {
     matches!(
         name.split('.')
@@ -107,6 +114,33 @@ fn is_windows_device_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every valid box name yields a valid hostname label (RFC 1123), so boxes can be told apart
+    /// in the guest.
+    #[test]
+    fn box_names_map_to_hostname_labels() {
+        for (name, hostname) in [
+            ("dev", "dev"),
+            ("My_Box.v2", "my-box-v2"),
+            ("api_", "api"),
+            ("web-", "web"),
+            ("7", "7"),
+        ] {
+            assert!(validate_box_name(name).is_ok(), "{name}");
+            assert_eq!(box_hostname(name), hostname);
+        }
+        let longest = "a".repeat(32);
+        let label = box_hostname(&longest);
+        assert!(validate_box_name(&longest).is_ok());
+        assert!(
+            (1..=63).contains(&label.len())
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+        );
+    }
 
     #[test]
     fn storage_names_have_one_alphabet_on_every_platform() {

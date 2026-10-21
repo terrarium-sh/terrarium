@@ -85,16 +85,16 @@ pub async fn run(
     )
 }
 
-pub(crate) fn encode_boot_plan(spec: &BootSpec) -> Result<Vec<u8>> {
+pub(crate) fn encode_boot_plan(spec: &BootSpec, box_name: &str) -> Result<Vec<u8>> {
     terra_protocol::encode_frame_with_limit(
-        &terra_protocol::BootPlan::new(build_plan(spec)?),
+        &terra_protocol::BootPlan::new(build_plan(spec, box_name)?),
         terra_protocol::MAX_PLAN_BYTES - terra_protocol::MAX_PLAN_HOST_STATE_BYTES,
     )
     .context("boot plan exceeds its encoded size limit; reduce the recipe or environment")
 }
 
 /// The resolved config the agent runs as PID 1.
-fn build_plan(spec: &BootSpec) -> Result<Plan> {
+fn build_plan(spec: &BootSpec, box_name: &str) -> Result<Plan> {
     let cfg = &spec.cfg;
     let baking = spec.mode == PlanMode::Create;
     let shares = if baking {
@@ -141,6 +141,7 @@ fn build_plan(spec: &BootSpec) -> Result<Plan> {
     published_udp_ports.dedup();
     let plan = Plan {
         mode: spec.mode,
+        hostname: crate::name::box_hostname(box_name),
         workdir: cfg
             .workload
             .workdir
@@ -272,8 +273,9 @@ mod tests {
             guest: "/data".into(),
             size_mib: 1,
         }];
-        let plan = build_plan(&spec).unwrap();
+        let plan = build_plan(&spec, "My_Box").unwrap();
 
+        assert_eq!(plan.hostname, "my-box");
         assert_eq!(plan.workload, ["/bin/sh", "-c", "make"]);
         assert_eq!(plan.daemons, ["ascend --serve"]);
         assert_eq!(plan.env["API_KEY"], "sk-super-secret");
@@ -285,12 +287,12 @@ mod tests {
         assert_eq!(plan.volumes[0].guest, "/data");
         assert_eq!(plan.net, Net::Tsi);
         spec.cfg.network.enabled = false;
-        assert_eq!(build_plan(&spec).unwrap().net, Net::LocalOnly);
+        assert_eq!(build_plan(&spec, "dev").unwrap().net, Net::LocalOnly);
         let foreground = BootSpec {
             foreground: true,
             ..spec
         };
-        let foreground_plan = build_plan(&foreground).unwrap();
+        let foreground_plan = build_plan(&foreground, "dev").unwrap();
         assert!(foreground_plan.await_initial_session);
     }
 
@@ -305,7 +307,7 @@ mod tests {
             host_publishes_pid: false,
             network_broker: None,
         };
-        assert!(build_plan(&spec).unwrap().await_initial_session);
+        assert!(build_plan(&spec, "dev").unwrap().await_initial_session);
     }
 
     /// A bake installs software into the box's filesystem, so it runs as guest
@@ -323,7 +325,7 @@ mod tests {
             host_publishes_pid: false,
             network_broker: None,
         };
-        let plan = |root, mode| build_plan(&spec(root, mode)).unwrap().root;
+        let plan = |root, mode| build_plan(&spec(root, mode), "dev").unwrap().root;
 
         assert!(plan(false, PlanMode::Create), "a bake is root");
         assert!(plan(true, PlanMode::Create));

@@ -119,7 +119,7 @@ pub async fn run(
     let mode = choose_boot_mode(args, is_at_a_terminal)?;
     let project_dir = approved.bx.get_project_dir().to_path_buf();
     let spec = boot::BootSpec::resolve(approved.cfg.clone(), args, project_dir, mode);
-    crate::vm::encode_boot_plan(&spec)?;
+    crate::vm::encode_boot_plan(&spec, approved.bx.get_name())?;
     let prepared = setup::prepare_box(&approved, setup::Rebuild::No)?;
 
     if !spec.cfg.hooks.on_create.is_empty()

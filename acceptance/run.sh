@@ -232,9 +232,10 @@ expect "$(cat work/ready)" recipe-value
 expect_listed probe running
 passed
 
-begin "exec: user, root, env, workdir, status, streams"
+begin "exec: user, root, hostname, env, workdir, status, streams"
 expect "$(output probe exec --no-tty -- id -u)" 1000
 expect "$(output probe exec --no-tty --root -- id -u)" 0
+expect "$(output probe exec --no-tty -- hostname)" probe
 run probe exec --no-tty --env PROBE=exec-value --workdir /tmp -- \
   sh -ec 'test "$PROBE" = exec-value; test "$(pwd)" = /tmp'
 expect "$(exit_status probe exec --no-tty -- sh -c 'exit 7')" 7

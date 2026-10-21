@@ -87,6 +87,7 @@ pub struct HostTime {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Plan {
     pub mode: PlanMode,
+    pub hostname: String,
     pub workdir: Option<String>,
     pub shares: Vec<Share>,
     pub volumes: Vec<Disk>,
@@ -154,6 +155,7 @@ impl Plan {
     pub fn bare_run(workload: Vec<String>) -> Self {
         Self {
             mode: PlanMode::Run,
+            hostname: "terrarium".to_owned(),
             workdir: None,
             shares: Vec::new(),
             volumes: Vec::new(),
@@ -225,6 +227,7 @@ mod tests {
         for host_tz in [None, Some(vec![1, 2, 3])] {
             let plan = Plan {
                 mode: PlanMode::Create,
+                hostname: "dev".into(),
                 workdir: Some("/work".into()),
                 shares: vec![Share {
                     tag: "_etc".into(),

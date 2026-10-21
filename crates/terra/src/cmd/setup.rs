@@ -262,15 +262,18 @@ pub fn request_recipe_approval(
     }
     let pinned_paths = (previous_paths.as_ref() != Some(&paths)).then_some(paths);
     config::merge_env_file(&mut cfg)?;
-    crate::vm::encode_boot_plan(&boot::BootSpec {
-        cfg: cfg.clone(),
-        project_dir: bx.get_project_dir().to_path_buf(),
-        root: false,
-        mode: terra_protocol::PlanMode::Run,
-        foreground: false,
-        host_publishes_pid: false,
-        network_broker: None,
-    })?;
+    crate::vm::encode_boot_plan(
+        &boot::BootSpec {
+            cfg: cfg.clone(),
+            project_dir: bx.get_project_dir().to_path_buf(),
+            root: false,
+            mode: terra_protocol::PlanMode::Run,
+            foreground: false,
+            host_publishes_pid: false,
+            network_broker: None,
+        },
+        bx.get_name(),
+    )?;
     Ok(ApprovedRecipe {
         bx,
         cfg,

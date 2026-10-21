@@ -353,7 +353,7 @@ fn setup_env(plan: &Plan) {
             format!("/run/user/{}", terra_protocol::WORKLOAD_ID),
         );
     }
-    let _ = rustix::system::sethostname(b"terrarium");
+    let _ = rustix::system::sethostname(plan.hostname.as_bytes());
 }
 
 #[cfg(test)]

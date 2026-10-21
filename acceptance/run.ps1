@@ -232,9 +232,10 @@ try {
     Assert-Listed "probe" "running"
     Complete-Step
 
-    Start-Step "exec: user, root, env, workdir, status, streams"
+    Start-Step "exec: user, root, hostname, env, workdir, status, streams"
     Assert-Equal (Get-TerraOutput @("probe", "exec", "--no-tty", "--", "id", "-u")) "1000"
     Assert-Equal (Get-TerraOutput @("probe", "exec", "--no-tty", "--root", "--", "id", "-u")) "0"
+    Assert-Equal (Get-TerraOutput @("probe", "exec", "--no-tty", "--", "hostname")) "probe"
     Invoke-Terra @("probe", "exec", "--no-tty", "--env", "PROBE=exec-value", "--workdir", "/tmp", "--",
         "sh", "-ec", 'test $PROBE = exec-value; test $(pwd) = /tmp')
     Invoke-Terra @("probe", "exec", "--no-tty", "--", "sh", "-c", "exit 7") -ExitCode 7

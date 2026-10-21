@@ -152,7 +152,7 @@ pub async fn run(
     let kernel = image::load_kernel()?;
     let boot_disk = image::load_boot_image()?;
     let root_disk = bx.get_dir().join(crate::state::ROOTFS_FILE);
-    let plan = encode_boot_plan(spec)?;
+    let plan = encode_boot_plan(spec, bx.get_name())?;
     let volume_disks = volume_disk_paths(spec, bx);
     let shares = open_shares(spec)?;
     let listener = Some(agent_listener(bx)?);
@@ -414,7 +414,7 @@ mod tests {
             network_broker: None,
         };
         let grants = open_shares(&spec).unwrap();
-        let plan = super::super::build_plan(&spec).unwrap().shares;
+        let plan = super::super::build_plan(&spec, "dev").unwrap().shares;
 
         assert_eq!(grants[0].access, AccessMode::ReadOnly);
         assert_eq!(plan[0].tag, "terra-share-0");
@@ -486,7 +486,7 @@ mod tests {
             network_broker: None,
         };
         let grants = open_shares(&spec).unwrap();
-        let plan = super::super::build_plan(&spec).unwrap().shares;
+        let plan = super::super::build_plan(&spec, "dev").unwrap().shares;
 
         assert!(grants.is_empty());
         assert_eq!(plan, Vec::<terra_protocol::Share>::new());
