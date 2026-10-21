@@ -26,6 +26,9 @@ Environment=HOME=%S/terra
 # instance the same box.
 WorkingDirectory=%S/terra/%i
 
+# Stop signals only the CLI, which asks the guest to shut down; the escalation
+# SIGKILL still reaches every process in the unit.
+KillMode=mixed
 TimeoutStopSec=65
 Restart=on-failure
 RestartSec=2

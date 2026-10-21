@@ -87,9 +87,10 @@ Linux binaries carry their seccomp allowlists compiled in; see the
 the guest's control connection, the agent stops the workload (SIGTERM, then
 SIGKILL if it is still there 30 seconds later — an interactive shell ignores
 SIGTERM) and runs the recipe's `pre_stop` hooks, then the VM exits. The unit's
-`TimeoutStopSec` is 65 seconds; after that systemd escalates to SIGKILL. The
-foreground CLI and its VM worker stay in the service cgroup, so systemd's
-cleanup reaches the worker too.
+`TimeoutStopSec` is 65 seconds; after that systemd escalates to SIGKILL. With
+`KillMode=mixed` the SIGTERM goes to the foreground CLI alone, while the
+SIGKILL reaches the box's supervisor and VM worker too, since they stay in the
+service cgroup.
 
 ## Where the output goes
 

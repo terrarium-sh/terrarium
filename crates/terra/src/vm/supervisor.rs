@@ -248,10 +248,20 @@ async fn supervise(
     };
     tokio::pin!(interrupt, vm_exited, broker_exited, startup);
     let mut is_ready = false;
+    let mut stop_deadline = None;
     loop {
         tokio::select! {
             biased;
-            () = &mut interrupt => anyhow::bail!("box supervisor interrupted"),
+            () = &mut interrupt, if stop_deadline.is_none() => {
+                ensure!(is_ready, "box supervisor interrupted");
+                if let Err(error) = bx.request_stop() {
+                    log::warn!("{error:#}");
+                }
+                stop_deadline = Some(
+                    tokio::time::Instant::now()
+                        + Duration::from_secs(crate::cli::DEFAULT_STOP_TIMEOUT_SECS),
+                );
+            }
             () = &mut vm_exited => {
                 let startup = (!is_ready).then_some(startup.as_mut());
                 return report_vm_exit(bx, vm, broker, startup, is_ready).await;
@@ -290,6 +300,9 @@ async fn supervise(
             },
             () = tokio::time::sleep_until(deadline), if !is_ready => {
                 anyhow::bail!("timed out waiting for guest agent readiness")
+            }
+            () = tokio::time::sleep_until(stop_deadline.unwrap_or(deadline)), if stop_deadline.is_some() => {
+                anyhow::bail!("{bx} did not stop in time after an interrupt; killing its VM")
             }
         }
     }
@@ -948,6 +961,46 @@ mod tests {
         );
         input.write_all(&[1]).unwrap();
         assert_eq!(supervisor.join().unwrap(), ExitCode::from(7));
+    }
+
+    /// `systemctl stop` and host shutdown SIGTERM the supervisor too. Bailing would drop the VM,
+    /// which SIGKILLs it before `pre_stop` and the guest's final sync, so a ready box gets the
+    /// same stop byte `terra stop` sends and supervision waits for the VM's own exit.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn interrupt_after_readiness_stops_the_guest_gracefully() {
+        let directory = tempfile::tempdir().unwrap();
+        let bx = BoxRef::from_state_dir(directory.path().into(), directory.path());
+        let control = terra_platform::local_socket::LocalListener::bind(
+            bx.get_dir().join(state::CONTROL_SOCKET),
+        )
+        .unwrap();
+        let mut vm = spawn_test_worker("fail-after-input");
+        let mut vm_input = vm.child_mut().stdin.take().unwrap();
+        let guest = std::thread::spawn(move || {
+            let (mut request, _) = control.accept().unwrap();
+            let mut byte = [0];
+            request.read_exact(&mut byte).unwrap();
+            assert_eq!(byte, [terra_protocol::STOP_SIGNAL]);
+            vm_input.write_all(&[1]).unwrap();
+        });
+        let (sender, startup) = oneshot::channel();
+        sender.send(Ok(true)).unwrap();
+        let code = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(supervise(
+                &bx,
+                &mut vm,
+                None,
+                startup,
+                async { tokio::time::sleep(Duration::from_millis(100)).await },
+                Duration::from_secs(5),
+            ))
+            .unwrap();
+        assert_eq!(code, ExitCode::from(7));
+        guest.join().unwrap();
     }
 
     #[cfg(target_os = "linux")]
