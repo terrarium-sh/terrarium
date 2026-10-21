@@ -1054,7 +1054,7 @@ fn saturated_mount_cleanup_does_not_starve_another_mount_or_guest_disk() {
             crate::memory::GuestRam::new(4096).unwrap(),
             DiskGrant::File(FileDisk::open(&disk_path, AccessMode::ReadWrite).unwrap()),
         );
-        let mut disk_store = wasmtime::Store::new(&device_engine().unwrap(), disk_host);
+        let mut disk_store = crate::engine::device_store(&device_engine().unwrap(), disk_host);
 
         let (release, blocked) = std::sync::mpsc::channel();
         *gate.blocked_drop.lock().unwrap() = Some(blocked);

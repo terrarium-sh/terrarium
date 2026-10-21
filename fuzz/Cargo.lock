@@ -1833,7 +1833,6 @@ dependencies = [
  "async-io",
  "cap-primitives",
  "libc",
- "object",
  "rustix",
  "tempfile",
  "tokio",

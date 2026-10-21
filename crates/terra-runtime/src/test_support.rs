@@ -72,9 +72,8 @@ pub fn device_store_with_limits<H: DeviceHost>(
         .memories(4)
         .tables(8)
         .build();
-    let mut store = Store::new(engine, StandaloneHost { host, limits });
+    let mut store = crate::engine::device_store(engine, StandaloneHost { host, limits });
     store.set_hostcall_fuel(crate::box_runtime::store::MAX_COMPONENT_HOSTCALL_ALLOCATION_BYTES);
-    store.set_epoch_deadline(1);
     store.limiter(|host| &mut host.limits);
     store
 }

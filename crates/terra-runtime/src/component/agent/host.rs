@@ -427,7 +427,7 @@ mod tests {
         let client_rep = entry.rep();
         let host = AgentHost::new(StreamEndpoint::new(), service);
         let engine = crate::engine::device_engine().expect("engine");
-        let mut store = wasmtime::Store::new(&engine, host);
+        let mut store = crate::engine::device_store(&engine, host);
         store
             .run_concurrent(async |accessor| {
                 let service = accessor.with_getter::<AgentService>(AgentHost::agent_service_mut);
@@ -469,7 +469,7 @@ mod tests {
             _lease: reserve_client(&slots).unwrap(),
         };
         let engine = crate::engine::device_engine().unwrap();
-        let mut store = wasmtime::Store::new(&engine, ());
+        let mut store = crate::engine::device_store(&engine, ());
         StreamReader::new(&mut store, b"session output".to_vec())
             .unwrap()
             .pipe(&mut store, DirectSink::new(output))

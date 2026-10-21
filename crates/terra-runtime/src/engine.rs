@@ -1,9 +1,13 @@
 //! Wasmtime engine configuration and component precompilation.
 
 use std::sync::Arc;
-use wasmtime::{Config, Engine};
+use wasmtime::{Config, Engine, Store};
 
-/// Engine for device stores with epoch interruption and async components.
+/// Fuel a store burns before yielding to the async executor, so long-running wasm cannot
+/// starve the stores and host tasks that share its thread.
+const FUEL_YIELD_INTERVAL: u64 = 10_000_000;
+
+/// Engine for device stores with fuel-driven yielding and async components.
 pub fn device_engine() -> wasmtime::Result<Engine> {
     let mut config = Config::new();
     apply_device_settings(&mut config)?;
@@ -16,7 +20,7 @@ fn apply_device_settings(config: &mut Config) -> wasmtime::Result<()> {
     // instead of only hosts matching the build machine's CPU.
     config.target(&target_lexicon::Triple::host().to_string())?;
     config
-        .epoch_interruption(true)
+        .consume_fuel(true)
         .shared_memory(false)
         .wasm_memory64(false)
         .wasm_component_model_threading(false)
@@ -25,6 +29,25 @@ fn apply_device_settings(config: &mut Config) -> wasmtime::Result<()> {
         .concurrency_support(true)
         .with_custom_code_memory(Some(Arc::new(crate::artifacts::CodeProtection)));
     Ok(())
+}
+
+/// A store on the device engine with unlimited fuel that yields to the executor at a fixed
+/// fuel interval.
+///
+/// # Panics
+///
+/// If `engine` does not consume fuel; every [`device_engine`] does.
+#[must_use]
+#[allow(clippy::expect_used)]
+pub fn device_store<T: 'static>(engine: &Engine, data: T) -> Store<T> {
+    let mut store = Store::new(engine, data);
+    store
+        .set_fuel(u64::MAX)
+        .expect("the device engine consumes fuel");
+    store
+        .fuel_async_yield_interval(Some(FUEL_YIELD_INTERVAL))
+        .expect("the device engine consumes fuel");
+    store
 }
 
 /// Precompile a trusted component build into an AOT artifact for

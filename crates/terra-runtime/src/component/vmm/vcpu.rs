@@ -440,7 +440,7 @@ mod tests {
         let stale = host.table.push(stale_vcpu).unwrap();
         let stale_rep = stale.rep();
         platform::HostVcpu::drop(&mut host, stale).unwrap();
-        let mut store = wasmtime::Store::new(&engine, host);
+        let mut store = crate::engine::device_store(&engine, host);
         let result = store
             .run_concurrent(async |accessor| {
                 assert!(
@@ -496,7 +496,7 @@ mod tests {
         let (native, vcpu) = vcpu_channel();
         let mut host = PlatformHost::default();
         let resource = host.table.push(vcpu).unwrap();
-        let mut store = wasmtime::Store::new(&engine, host);
+        let mut store = crate::engine::device_store(&engine, host);
         let native = store
             .run_concurrent(async |accessor| {
                 let (release, wait) = std::sync::mpsc::sync_channel(0);

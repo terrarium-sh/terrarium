@@ -31,7 +31,7 @@ async fn shares_report_filesystem_statistics() {
     for access in [AccessMode::ReadWrite, AccessMode::ReadOnly] {
         let mut fs = host(ShareGrant::new(&base, access).unwrap());
         let descriptor = fs.get_directories().unwrap().remove(0).0;
-        let mut store = wasmtime::Store::new(&engine, fs);
+        let mut store = crate::engine::device_store(&engine, fs);
         let stat = store
             .run_concurrent(async |accessor| {
                 let host = accessor.with_getter::<HasSelf<FsHost>>(|host| host);
@@ -52,7 +52,7 @@ async fn filesystem_statistics_reject_unknown_descriptors() {
     let base = root.path().canonicalize().unwrap();
     let fs = host(ShareGrant::new(&base, AccessMode::ReadOnly).unwrap());
     let engine = crate::engine::device_engine().unwrap();
-    let mut store = wasmtime::Store::new(&engine, fs);
+    let mut store = crate::engine::device_store(&engine, fs);
     let stat = store
         .run_concurrent(async |accessor| {
             let host = accessor.with_getter::<HasSelf<FsHost>>(|host| host);
@@ -98,7 +98,7 @@ async fn preopen_retains_its_directory_and_rights_without_ambient_resources() {
     assert!(empty.filesystem().get_directories().unwrap().is_empty());
     fs.ctx().table.set_max_capacity(2);
     let engine = crate::engine::device_engine().unwrap();
-    let mut store = wasmtime::Store::new(&engine, fs);
+    let mut store = crate::engine::device_store(&engine, fs);
     let opened = store
         .run_concurrent(async |accessor| {
             let access = accessor.with_getter::<WasiFilesystem>(WasiFilesystemView::filesystem);
@@ -140,7 +140,7 @@ async fn wasi_itself_denies_escape_and_readonly_mutation() {
         let is_read_only = access.is_read_only();
         let mut fs = host(ShareGrant::new(&mounted, access).unwrap());
         let root_fd = fs.get_directories().unwrap().remove(0).0;
-        let mut store = wasmtime::Store::new(&engine, fs);
+        let mut store = crate::engine::device_store(&engine, fs);
         store
             .run_concurrent(async |accessor| {
                 let access = accessor.with_getter::<WasiFilesystem>(WasiFilesystemView::filesystem);
@@ -278,7 +278,7 @@ async fn mode_capability_changes_writable_files_and_rejects_readonly_files() {
         let is_read_only = access.is_read_only();
         let mut fs = host(ShareGrant::new(&mounted, access).unwrap());
         let root_fd = fs.get_directories().unwrap().remove(0).0;
-        let mut store = wasmtime::Store::new(&engine, fs);
+        let mut store = crate::engine::device_store(&engine, fs);
         let descriptor = store
             .run_concurrent(async |accessor| {
                 let access = accessor.with_getter::<WasiFilesystem>(WasiFilesystemView::filesystem);

@@ -12,7 +12,7 @@ use wasmtime::component::StreamReader;
 use super::MAX_BOX_COMPONENTS;
 use super::store::{BoxHost, StoreHost, StoreState, create_store};
 use super::{
-    BoxRuntime, ComponentLoop, DeviceWorker, EpochClock, MAX_BOX_COMPONENT_LOOPS,
+    BoxIdentity, BoxRuntime, ComponentLoop, DeviceWorker, MAX_BOX_COMPONENT_LOOPS,
     MAX_BOX_COMPONENT_WORKERS, PreparedBoxRuntime, WorkerTask,
 };
 use crate::component::mmio::{self, DevicePlan, Serve};
@@ -39,15 +39,15 @@ pub(crate) struct PreparedWorker {
 }
 
 impl BoxRuntime {
+    /// Panics if `engine` does not consume fuel; [`crate::engine::device_engine`] always does.
     pub fn new(engine: &Engine, host: BoxHost) -> wasmtime::Result<Self> {
-        let epoch_clock = EpochClock::start(engine.clone())?;
         let (shutdown, _) = watch::channel(false);
         Ok(Self {
             store: create_store(engine, host),
             vmm: None,
             mmio: None,
             interrupt_controller_configured: false,
-            epoch_clock,
+            identity: Arc::new(BoxIdentity),
             shutdown,
             children: Vec::new(),
             component_loops: Vec::new(),
@@ -63,11 +63,11 @@ impl BoxRuntime {
         &self,
     ) -> impl FnOnce(H) -> DeviceWorker<H> + Send + 'static {
         let memory_limits = self.store.data().memory_limits();
-        let epoch_clock = Arc::clone(&self.epoch_clock);
+        let identity = Arc::clone(&self.identity);
         let engine = self.store.engine().clone();
         move |host| DeviceWorker {
             store: create_store(&engine, StoreState::with_limits(host, memory_limits)),
-            epoch_clock,
+            identity,
             component_loops: Vec::new(),
         }
     }
@@ -87,7 +87,7 @@ impl BoxRuntime {
 
     pub(crate) fn attach_worker(&mut self, child: WorkerTask) -> wasmtime::Result<()> {
         wasmtime::ensure!(
-            Arc::ptr_eq(&self.epoch_clock, &child.epoch_clock),
+            Arc::ptr_eq(&self.identity, &child.identity),
             "child runtime belongs to another box"
         );
         wasmtime::ensure!(
@@ -182,7 +182,6 @@ impl BoxRuntime {
         }
         Ok(PreparedBoxRuntime {
             store: self.store,
-            _epoch_clock: self.epoch_clock,
             shutdown: self.shutdown,
             children: self.children,
             component_loops: self.component_loops,

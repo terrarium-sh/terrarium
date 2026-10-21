@@ -465,7 +465,7 @@ mod tests {
     async fn frontend_stream_pair_preserves_backpressure_eof_and_retirement() {
         let engine = crate::engine::device_engine().unwrap();
         let (streams, mut role) = FrontendStreams::new();
-        let mut store = wasmtime::Store::new(&engine, streams);
+        let mut store = crate::engine::device_store(&engine, streams);
         let payload = vec![37; STREAM_BUFFER_BYTES * 2];
         let input = StreamReader::new(&mut store, payload.clone()).unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(2), store.run_concurrent(async |accessor| {

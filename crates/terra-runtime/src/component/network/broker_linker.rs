@@ -816,7 +816,7 @@ mod tests {
     }
 
     fn unit_store() -> wasmtime::Store<()> {
-        wasmtime::Store::new(&crate::engine::device_engine().unwrap(), ())
+        crate::engine::device_store(&crate::engine::device_engine().unwrap(), ())
     }
 
     fn completion() -> (Completion, oneshot::Receiver<Result<(), Error>>) {
@@ -1064,7 +1064,7 @@ mod tests {
             crate::component::vsock::streams::FrontendStreams::new().0,
             None,
         );
-        let mut store = wasmtime::Store::new(&crate::engine::device_engine().unwrap(), host);
+        let mut store = crate::engine::device_store(&crate::engine::device_engine().unwrap(), host);
         let (done, outcome) = completion();
         begin_accept(
             &mut store,
@@ -1095,7 +1095,8 @@ mod tests {
                 crate::component::vsock::streams::FrontendStreams::new().0,
                 None,
             );
-            let mut store = wasmtime::Store::new(&crate::engine::device_engine().unwrap(), host);
+            let mut store =
+                crate::engine::device_store(&crate::engine::device_engine().unwrap(), host);
             let (done, outcome) = completion();
             let input = begin_accept(
                 &mut store,
@@ -1380,8 +1381,7 @@ mod tests {
                 crate::component::vsock::streams::FrontendStreams::new().0,
                 backend,
             );
-            let mut store = wasmtime::Store::new(&engine, host);
-            store.set_epoch_deadline(1);
+            let mut store = crate::engine::device_store(&engine, host);
             let mut linker = wasmtime::component::Linker::new(&engine);
             add(&mut linker).unwrap();
             let instance = linker

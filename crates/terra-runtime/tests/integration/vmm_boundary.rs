@@ -14,7 +14,7 @@ use terra_runtime::component::{AccessMode, InterruptCallback};
 use terra_runtime::engine::device_engine;
 use terra_runtime::machine::{Architecture, Device, DeviceKind, MachineConfig};
 use terra_runtime::memory::GuestRam;
-use wasmtime::{Store, component::Component};
+use wasmtime::component::Component;
 
 struct TestVm(GuestRam);
 
@@ -181,7 +181,10 @@ async fn vcpu_preparation_requires_a_router_and_boot() {
 #[tokio::test]
 async fn device_components_receive_no_platform_or_vcpu_grant() {
     let engine = device_engine().expect("engine");
-    let mut store = Store::new(&engine, DeviceContext::new(4096).expect("device host"));
+    let mut store = terra_runtime::engine::device_store(
+        &engine,
+        DeviceContext::new(4096).expect("device host"),
+    );
     let linker = wasmtime::component::Linker::new(&engine);
     assert!(
         linker

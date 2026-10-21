@@ -34,7 +34,7 @@ async fn completed_device_loops_retire_without_stopping_the_box() {
 }
 
 #[tokio::test]
-async fn epochs_yield_spinning_wasm_for_deadline_and_cancellation() {
+async fn fuel_yields_spinning_wasm_for_deadline_and_cancellation() {
     use std::future::{Future as _, poll_fn};
     use std::task::Poll;
 

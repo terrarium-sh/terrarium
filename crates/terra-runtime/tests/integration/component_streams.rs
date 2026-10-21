@@ -69,9 +69,7 @@ const CONSUME: &str = r#"(component
         (canon lift (core func $consume) async (callback $callback))))"#;
 
 fn store(engine: &Engine) -> Store<()> {
-    let mut store = Store::new(engine, ());
-    store.set_epoch_deadline(100);
-    store
+    terra_runtime::engine::device_store(engine, ())
 }
 
 #[tokio::test]

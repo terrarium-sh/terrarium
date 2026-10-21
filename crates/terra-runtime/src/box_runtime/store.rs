@@ -47,7 +47,6 @@ impl Default for ComponentMemoryLimits {
 /// treating this as a budget.
 pub const STORE_MEMORY_BYTES: usize =
     (crate::box_runtime::store::DEFAULT_COMPONENT_MEMORY_MIB as usize) << 20;
-const COMPONENT_EPOCH_DEADLINE: u64 = 10;
 // Wasmtime charges lifted range records as well as their payloads.
 pub(crate) const MAX_COMPONENT_HOSTCALL_ALLOCATION_BYTES: usize =
     terra_limits::MAX_COMPONENT_HOSTCALL_BYTES
@@ -258,10 +257,8 @@ pub(super) fn create_store<H: StoreHost>(
     engine: &Engine,
     host: StoreState<H>,
 ) -> Store<StoreState<H>> {
-    let mut store = Store::new(engine, host);
+    let mut store = crate::engine::device_store(engine, host);
     store.set_hostcall_fuel(MAX_COMPONENT_HOSTCALL_ALLOCATION_BYTES);
-    store.set_epoch_deadline(COMPONENT_EPOCH_DEADLINE);
-    store.epoch_deadline_async_yield_and_update(COMPONENT_EPOCH_DEADLINE);
     store.limiter(|host| host);
     store
 }

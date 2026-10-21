@@ -707,7 +707,7 @@ mod tests {
             let parent = host.get_directories().unwrap().remove(0).0;
             let budget = host.descriptor_budget.clone();
             let engine = crate::engine::device_engine().unwrap();
-            let mut store = wasmtime::Store::new(&engine, host);
+            let mut store = crate::engine::device_store(&engine, host);
             let (entered, started) = tokio::sync::oneshot::channel();
             let (release, blocked) = std::sync::mpsc::channel();
             let occupied_pool = tokio::task::spawn_blocking(move || {

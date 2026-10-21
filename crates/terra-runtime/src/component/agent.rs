@@ -334,7 +334,7 @@ mod tests {
         diagnostics: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
     ) -> wasmtime::Result<()> {
         let engine = crate::engine::device_engine()?;
-        let mut store = wasmtime::Store::new(&engine, ());
+        let mut store = crate::engine::device_store(&engine, ());
         let (event_sink, stream) = relay::channel(NonZeroUsize::MIN);
         wasmtime::component::StreamReader::new(&mut store, events)?.pipe(&mut store, event_sink)?;
         store

@@ -555,7 +555,6 @@ mod tests {
         Arc,
         atomic::{AtomicBool, Ordering},
     };
-    use wasmtime::Store;
     use wasmtime::component::{Source, StreamConsumer, StreamReader};
 
     struct TrackedSink {
@@ -596,7 +595,7 @@ mod tests {
     #[tokio::test]
     async fn sink_reserves_capacity_before_lowering_and_preserves_order() {
         let engine = crate::engine::device_engine().expect("engine");
-        let mut store = Store::new(&engine, ());
+        let mut store = crate::engine::device_store(&engine, ());
         let (sink, mut stream) =
             channel::<crate::component::mmio::Request>(NonZeroUsize::new(2).expect("capacity"));
         let input =
@@ -618,8 +617,8 @@ mod tests {
     #[tokio::test]
     async fn stream_moves_records_between_independent_stores_in_order() {
         let engine = crate::engine::device_engine().expect("engine");
-        let mut root = Store::new(&engine, ());
-        let mut child = Store::new(&engine, ());
+        let mut root = crate::engine::device_store(&engine, ());
+        let mut child = crate::engine::device_store(&engine, ());
         let (sink, stream) =
             channel::<crate::component::mmio::Request>(NonZeroUsize::new(2).expect("capacity"));
         let input =
@@ -650,7 +649,7 @@ mod tests {
     #[tokio::test]
     async fn closed_receiver_drops_the_source_stream() {
         let engine = crate::engine::device_engine().expect("engine");
-        let mut store = Store::new(&engine, ());
+        let mut store = crate::engine::device_store(&engine, ());
         let (sink, stream) = channel::<crate::component::mmio::Reply>(NonZeroUsize::MIN);
         drop(stream);
         let input = StreamReader::new(
@@ -672,7 +671,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_the_other_store_cancels_a_blocked_relay() {
         let engine = crate::engine::device_engine().expect("engine");
-        let mut store = Store::new(&engine, ());
+        let mut store = crate::engine::device_store(&engine, ());
         let (sink, mut stream) =
             channel::<crate::component::mmio::Request>(NonZeroUsize::new(1).expect("capacity"));
         let dropped = Arc::new(AtomicBool::new(false));
@@ -718,7 +717,7 @@ mod tests {
     #[tokio::test]
     async fn bytes_cross_the_component_boundary_in_bounded_chunks_and_end_cleanly() {
         let engine = crate::engine::device_engine().unwrap();
-        let mut store = Store::new(&engine, ());
+        let mut store = crate::engine::device_store(&engine, ());
         let source = ByteStream::new(stream::iter([
             Bytes::from_static(b"abcde"),
             Bytes::from_static(b"f"),

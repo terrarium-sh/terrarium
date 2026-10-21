@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use crate::support::stream_relay::DropFlag;
 use terra_runtime::component::relay::{BYTE_QUEUE_BYTES, ByteSink, byte_channel};
+use wasmtime::StoreContextMut;
 use wasmtime::component::{Source, StreamConsumer, StreamReader, StreamResult};
-use wasmtime::{Store, StoreContextMut};
 
 const CHUNK_BYTES: usize = 16 * 1024;
 
@@ -36,7 +36,7 @@ impl StreamConsumer<()> for TrackedSink {
 #[tokio::test]
 async fn bounded_relay_releases_a_blocked_cross_store_writer() {
     let engine = terra_runtime::engine::device_engine().expect("engine");
-    let mut store = Store::new(&engine, ());
+    let mut store = terra_runtime::engine::device_store(&engine, ());
     let (sink, mut chunks) = byte_channel(CHUNK_BYTES);
     let dropped = Arc::new(AtomicBool::new(false));
     let input = StreamReader::new(&mut store, vec![7_u8; BYTE_QUEUE_BYTES + CHUNK_BYTES * 4])

@@ -1,5 +1,5 @@
+use wasmtime::Engine;
 use wasmtime::component::{Component, Linker, Resource, ResourceTable, ResourceType};
-use wasmtime::{Engine, Store};
 
 const FORGE: &str = r#"(component
     (import "test:grant/token@0.1.0" (instance $api
@@ -60,34 +60,37 @@ fn linker(engine: &Engine, grant: u32) -> Linker<State> {
     linker
 }
 
-#[test]
-fn imported_host_resources_stay_component_local_in_a_shared_resource_table() {
+#[tokio::test]
+async fn imported_host_resources_stay_component_local_in_a_shared_resource_table() {
     let engine = terra_runtime::engine::device_engine().expect("engine");
     let component = Component::new(&engine, FORGE).expect("forging component");
-    let mut store = Store::new(
+    let mut store = terra_runtime::engine::device_store(
         &engine,
         State {
             table: ResourceTable::new(),
             native_handles: Vec::new(),
         },
     );
-    store.set_epoch_deadline(100);
     let first = linker(&engine, 10)
-        .instantiate(&mut store, &component)
+        .instantiate_async(&mut store, &component)
+        .await
         .expect("first instance");
     let second = linker(&engine, 20)
-        .instantiate(&mut store, &component)
+        .instantiate_async(&mut store, &component)
+        .await
         .expect("second instance");
     let first_token = first
         .get_typed_func::<(), (u32,)>(&mut store, "token")
         .expect("first token")
-        .call(&mut store, ())
+        .call_async(&mut store, ())
+        .await
         .expect("first grant")
         .0;
     let second_token = second
         .get_typed_func::<(), (u32,)>(&mut store, "token")
         .expect("second token")
-        .call(&mut store, ())
+        .call_async(&mut store, ())
+        .await
         .expect("second grant")
         .0;
     let probe = first
@@ -95,7 +98,10 @@ fn imported_host_resources_stay_component_local_in_a_shared_resource_table() {
         .expect("first probe");
     assert_eq!(first_token, second_token, "canonical indices can collide");
     assert_eq!(
-        probe.call(&mut store, (second_token,)).expect("own grant"),
+        probe
+            .call_async(&mut store, (second_token,))
+            .await
+            .expect("own grant"),
         (10,)
     );
     let second_probe = second
@@ -103,12 +109,13 @@ fn imported_host_resources_stay_component_local_in_a_shared_resource_table() {
         .expect("second probe");
     assert_eq!(
         second_probe
-            .call(&mut store, (first_token,))
+            .call_async(&mut store, (first_token,))
+            .await
             .expect("second grant"),
         (20,)
     );
     let foreign_native_handle = store.data().native_handles[1];
-    match probe.call(&mut store, (foreign_native_handle,)) {
+    match probe.call_async(&mut store, (foreign_native_handle,)).await {
         Ok(value) => assert_eq!(
             value,
             (10,),
@@ -120,7 +127,8 @@ fn imported_host_resources_stay_component_local_in_a_shared_resource_table() {
         ),
     }
     let error = probe
-        .call(&mut store, (u32::MAX,))
+        .call_async(&mut store, (u32::MAX,))
+        .await
         .expect_err("ungranted handle");
     assert!(
         format!("{error:#}").contains("unknown handle index"),

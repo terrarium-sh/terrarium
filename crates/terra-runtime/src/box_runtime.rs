@@ -2,18 +2,15 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use tokio::{sync::watch, task::JoinSet};
 use tokio_util::task::AbortOnDropHandle;
 
+use wasmtime::Store;
 use wasmtime::component::Accessor;
-use wasmtime::{Engine, Store};
 
 pub(crate) mod setup;
 pub(crate) mod store;
@@ -28,54 +25,9 @@ pub(crate) const MAX_BOX_COMPONENTS: usize = terra_limits::MAX_DEVICES;
 const MAX_BOX_COMPONENT_WORKERS: usize = MAX_BOX_COMPONENTS + 3;
 const MAX_BOX_COMPONENT_LOOPS: usize =
     MAX_BOX_COMPONENTS * 3 + terra_limits::MAX_VCPUS as usize + 3;
-const EPOCH_TICK_INTERVAL: Duration = Duration::from_millis(10);
 
-/// Keeps the runtime engine's epoch interruption advancing.
-struct EpochClock {
-    stop: Arc<AtomicBool>,
-    ticker: Option<std::thread::JoinHandle<()>>,
-}
-
-impl EpochClock {
-    fn start(engine: Engine) -> wasmtime::Result<Arc<Self>> {
-        let stop = Arc::new(AtomicBool::new(false));
-        let ticker = spawn_epoch_ticker(engine, EPOCH_TICK_INTERVAL, Arc::clone(&stop))
-            .ok_or_else(|| wasmtime::Error::msg("starting epoch ticker"))?;
-        Ok(Arc::new(Self {
-            stop,
-            ticker: Some(ticker),
-        }))
-    }
-}
-
-impl Drop for EpochClock {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(ticker) = self.ticker.take() {
-            let _ = ticker.join();
-        }
-    }
-}
-
-/// Running epoch ticker: bumps the engine clock until `stop` is set so
-/// epoch deadlines actually fire. The worker owns one per VM; the
-/// harness test proves the mechanism with a short interval.
-#[must_use]
-fn spawn_epoch_ticker(
-    engine: Engine,
-    interval: core::time::Duration,
-    stop: std::sync::Arc<core::sync::atomic::AtomicBool>,
-) -> Option<std::thread::JoinHandle<()>> {
-    std::thread::Builder::new()
-        .name("epoch-tick".to_string())
-        .spawn(move || {
-            while !stop.load(core::sync::atomic::Ordering::Acquire) {
-                std::thread::sleep(interval);
-                engine.increment_epoch();
-            }
-        })
-        .ok()
-}
+/// Marks the stores and workers of one box, so a worker cannot join another box.
+struct BoxIdentity;
 
 /// A long-running device loop borrowing its component store through an accessor.
 pub(crate) type ComponentLoop<T = BoxHost> = Box<
@@ -85,22 +37,23 @@ pub(crate) type ComponentLoop<T = BoxHost> = Box<
         + Send,
 >;
 
-/// Builds a box's root store and device workers.
+/// One box's device runtime while it is assembled: the root store holding the VMM and MMIO
+/// bridge, and one worker store per device. [`Self::prepare`] sets the devices up to run.
 pub struct BoxRuntime {
     pub store: Store<BoxHost>,
     pub(crate) vmm: Option<crate::component::vmm::VmmInstance>,
     pub(crate) mmio: Option<crate::component::mmio::MmioInstance>,
     pub(crate) interrupt_controller_configured: bool,
-    epoch_clock: Arc<EpochClock>,
+    identity: Arc<BoxIdentity>,
     shutdown: watch::Sender<bool>,
     children: Vec<WorkerTask>,
     component_loops: Vec<ComponentLoop>,
     agent_setup: Option<setup::AgentSetup>,
 }
 
+/// A box runtime with its devices set up; [`Self::start`] runs it.
 pub struct PreparedBoxRuntime {
     store: Store<BoxHost>,
-    _epoch_clock: Arc<EpochClock>,
     shutdown: watch::Sender<bool>,
     children: Vec<WorkerTask>,
     component_loops: Vec<ComponentLoop>,
@@ -109,14 +62,14 @@ pub struct PreparedBoxRuntime {
 
 pub(crate) struct DeviceWorker<H: StoreHost> {
     pub store: Store<StoreState<H>>,
-    epoch_clock: Arc<EpochClock>,
+    identity: Arc<BoxIdentity>,
     component_loops: Vec<ComponentLoop<StoreState<H>>>,
 }
 
 pub(crate) struct WorkerTask {
     run: Pin<Box<dyn Future<Output = wasmtime::Result<()>> + Send>>,
     executor: Option<tokio::runtime::Handle>,
-    epoch_clock: Arc<EpochClock>,
+    identity: Arc<BoxIdentity>,
     loop_count: usize,
 }
 
@@ -305,7 +258,7 @@ impl<H: StoreHost> DeviceWorker<H> {
     pub(crate) fn prepare(mut self, shutdown: watch::Receiver<bool>) -> WorkerTask {
         WorkerTask {
             executor: None,
-            epoch_clock: Arc::clone(&self.epoch_clock),
+            identity: Arc::clone(&self.identity),
             loop_count: self.component_loops.len(),
             run: Box::pin(async move { self.run(shutdown).await }),
         }

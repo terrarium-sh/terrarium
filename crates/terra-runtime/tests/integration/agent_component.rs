@@ -17,10 +17,11 @@ async fn events_start_worker_and_close_keeps_transport_terminal() {
     let engine = device_engine().expect("engine");
     let component = Component::new(&engine, support::artifacts::wasm::AGENT).expect("component");
     let (mut frontend, role) = StreamEndpoint::pair();
-    let mut store =
-        wasmtime::Store::new(&engine, AgentHost::new(role, AgentHostService::default()));
+    let mut store = terra_runtime::engine::device_store(
+        &engine,
+        AgentHost::new(role, AgentHostService::default()),
+    );
     store.set_hostcall_fuel(terra_limits::MAX_COMPONENT_HOSTCALL_BYTES);
-    store.set_epoch_deadline(1);
     let instance = agent_component_linker(&engine)
         .expect("linker")
         .instantiate_async(&mut store, &component)
