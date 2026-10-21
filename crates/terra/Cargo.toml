@@ -56,7 +56,7 @@ terra-build = { path = "../terra-build" }
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 notify = "8.2"
 clap_mangen = "0.3"
-wasmtime = { version = "=49.0.3", default-features = false }
+wasmtime = { version = "=50.0.0", default-features = false }
 
 [lints]
 workspace = true

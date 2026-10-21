@@ -215,58 +215,43 @@ mod tests {
             Arc,
             atomic::{AtomicBool, Ordering},
         };
-        use wasmtime::component::AccessorTask;
-
-        struct RetainedResume {
-            resource_index: u32,
-            sender: tokio::sync::mpsc::Sender<Pending>,
-            pending: Pending,
-            ready: tokio::sync::oneshot::Sender<()>,
-        }
-
-        impl AccessorTask<BoxHost> for RetainedResume {
-            async fn run(self, accessor: &Accessor<BoxHost>) -> wasmtime::Result<()> {
-                let platform = accessor.with_getter::<Platform>(|host| &mut host.platform);
-                let mut resume =
-                    Box::pin(<Platform as platform::HostVcpuWithStore<BoxHost>>::resume(
-                        &platform,
-                        Resource::new_borrow(self.resource_index),
-                        Completion::Start,
-                    ));
-                assert!(
-                    std::future::poll_fn(|context| { Poll::Ready(resume.as_mut().poll(context)) })
-                        .await
-                        .is_pending()
-                );
-                platform.with(|mut access| {
-                    let vcpu = access
-                        .get()
-                        .table
-                        .get(&Resource::<Vcpu>::new_borrow(self.resource_index))
-                        .unwrap();
-                    assert!(vcpu.0.is_none());
-                });
-                self.sender.try_send(self.pending).unwrap();
-                self.ready.send(()).unwrap();
-                std::future::pending::<()>().await;
-                drop(resume);
-                Ok(())
-            }
-        }
 
         let engine = crate::engine::device_engine().unwrap();
         let mut root = BoxRuntime::new(&engine, BoxHost::new()).unwrap();
         let (native, resource) = root.store.data_mut().platform.add_test_vcpu();
         let (reply, response) = mpsc::sync_channel(1);
         let (ready, failed_child) = tokio::sync::oneshot::channel();
-        let task = RetainedResume {
-            resource_index: resource.rep(),
-            sender: native.sender,
-            pending: Pending {
-                exit: Exit::Halt,
-                reply,
-            },
-            ready,
+        let resource_index = resource.rep();
+        let sender = native.sender;
+        let pending = Pending {
+            exit: Exit::Halt,
+            reply,
+        };
+        let task = async move |accessor: &Accessor<BoxHost>| -> wasmtime::Result<()> {
+            let platform = accessor.with_getter::<Platform>(|host| &mut host.platform);
+            let mut resume = Box::pin(<Platform as platform::HostVcpuWithStore<BoxHost>>::resume(
+                &platform,
+                Resource::new_borrow(resource_index),
+                Completion::Start,
+            ));
+            assert!(
+                std::future::poll_fn(|context| { Poll::Ready(resume.as_mut().poll(context)) })
+                    .await
+                    .is_pending()
+            );
+            platform.with(|mut access| {
+                let vcpu = access
+                    .get()
+                    .table
+                    .get(&Resource::<Vcpu>::new_borrow(resource_index))
+                    .unwrap();
+                assert!(vcpu.0.is_none());
+            });
+            sender.try_send(pending).unwrap();
+            ready.send(()).unwrap();
+            std::future::pending::<()>().await;
+            drop(resume);
+            Ok(())
         };
         root.register_loop(Box::new(move |accessor| {
             Box::pin(async move {
