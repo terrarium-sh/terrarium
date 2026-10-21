@@ -620,9 +620,13 @@ async fn wasm_filesystem_component_create_rejects_existing_fifo() {
     channel.close().expect("close");
 }
 
+/// Windows routes mkdir, unlink, rmdir, rename, link and symlink through overrides with their own
+/// read-only check, apart from CREATE; each must be refused on a read-only grant.
 #[tokio::test(flavor = "multi_thread")]
 async fn wasm_filesystem_component_enforces_readonly_grant() {
     let root = tempfile::tempdir().expect("tempdir");
+    std::fs::write(root.path().join("file"), b"kept").expect("file fixture");
+    std::fs::create_dir(root.path().join("directory")).expect("directory fixture");
     let Mounted {
         channel,
         ram,
@@ -634,10 +638,44 @@ async fn wasm_filesystem_component_enforces_readonly_grant() {
     create[..4].copy_from_slice(&(0o100_u32 | 2).to_le_bytes());
     create[4..8].copy_from_slice(&0o644_u32.to_le_bytes());
     create.extend_from_slice(b"denied\0");
-    let reply = submit(&channel, &memory, 1, &request(35, 2, 1, &create)).await;
-    assert_eq!(reply_error(&reply), -1);
+    let file = submit(&channel, &memory, 1, &request(1, 2, 1, b"file\0")).await;
+    let file = u64::from_le_bytes(file[16..24].try_into().expect("file node"));
+    let mut mkdir = vec![0; 8];
+    mkdir[..4].copy_from_slice(&0o755_u32.to_le_bytes());
+    mkdir.extend_from_slice(b"denied\0");
+    let mut rename = 1_u64.to_le_bytes().to_vec();
+    rename.extend_from_slice(b"file\0denied\0");
+    let mut link = file.to_le_bytes().to_vec();
+    link.extend_from_slice(b"denied\0");
+    for (unique, (name, opcode, payload)) in [
+        ("create", 35, create),
+        ("mkdir", 9, mkdir),
+        ("unlink", 10, b"file\0".to_vec()),
+        ("rmdir", 11, b"directory\0".to_vec()),
+        ("rename", 12, rename),
+        ("link", 13, link),
+        ("symlink", 6, b"denied\0file\0".to_vec()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let index = u16::try_from(unique).expect("index") + 2;
+        let reply = submit(
+            &channel,
+            &memory,
+            index,
+            &request(opcode, u64::from(index) + 1, 1, &payload),
+        )
+        .await;
+        assert_eq!(reply_error(&reply), -1, "{name}");
+    }
     channel.close().expect("close");
     assert!(!root.path().join("denied").exists());
+    assert_eq!(
+        std::fs::read(root.path().join("file")).expect("file"),
+        b"kept"
+    );
+    assert!(root.path().join("directory").is_dir());
 }
 
 #[tokio::test(flavor = "multi_thread")]

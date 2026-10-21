@@ -114,4 +114,22 @@ mod tests {
         symlink_dir(&private_parent, &expected_parent).unwrap();
         assert!(ShareGrant::new(&expected, AccessMode::ReadWrite).is_err());
     }
+
+    /// A share under a parent the user can only pass through (mode 0711 on a multi-user host)
+    /// opens on macOS and Windows, so Linux must not need read permission on its ancestors.
+    #[cfg(unix)]
+    #[test]
+    fn mount_source_needs_only_search_permission_on_ancestors() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let parent = std::fs::canonicalize(root.path())
+            .unwrap()
+            .join("search-only");
+        std::fs::create_dir_all(parent.join("share")).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o311)).unwrap();
+        let grant = ShareGrant::new(&parent.join("share"), AccessMode::ReadOnly);
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        grant.unwrap();
+    }
 }

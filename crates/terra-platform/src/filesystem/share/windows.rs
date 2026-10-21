@@ -14,24 +14,46 @@ pub struct FileAccess {
     pub write: bool,
 }
 
-#[allow(unsafe_code)]
 pub fn reopen_file_with_delete_sharing(file: &File, access: FileAccess) -> std::io::Result<File> {
-    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, ReOpenFile,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
 
     let desired_access = (if access.read { GENERIC_READ } else { 0 })
         | (if access.write { GENERIC_WRITE } else { 0 });
-    // SAFETY: reopening the retained handle preserves the granted object without resolving a path.
-    let reopened = unsafe {
-        ReOpenFile(
-            file.as_raw_handle(),
-            desired_access,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            0,
-        )
+    reopen(
+        file,
+        desired_access,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        0,
+    )
+}
+
+/// `directory` reopened without delete sharing, so nobody can rename it while the handle lives:
+/// a metadata handle shares delete, and a guest could otherwise swap a junction in under the
+/// path built from it.
+fn pin_directory(directory: &File) -> std::io::Result<File> {
+    use windows_sys::Win32::Foundation::GENERIC_READ;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
+
+    reopen(
+        directory,
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        FILE_FLAG_BACKUP_SEMANTICS,
+    )
+}
+
+#[allow(unsafe_code)]
+fn reopen(file: &File, desired_access: u32, share_mode: u32, flags: u32) -> std::io::Result<File> {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::ReOpenFile;
+
+    // SAFETY: reopening the retained handle preserves the granted object without resolving a path.
+    let reopened = unsafe { ReOpenFile(file.as_raw_handle(), desired_access, share_mode, flags) };
     if reopened == INVALID_HANDLE_VALUE {
         return Err(std::io::Error::last_os_error());
     }
@@ -94,7 +116,7 @@ fn resolve_parent(
     };
     let parent_path = components.as_path();
     let parent = if parent_path.as_os_str().is_empty() {
-        directory.try_clone()?
+        pin_directory(directory)?
     } else {
         cap_primitives::fs::open_dir(directory, parent_path)?
     };
@@ -173,7 +195,8 @@ pub(super) fn matches_canonical_root(directory: &File, root: &Path) -> std::io::
 }
 
 pub fn read_base_dir(directory: &File) -> std::io::Result<std::fs::ReadDir> {
-    std::fs::read_dir(nt_final_path(directory)?)
+    let pinned = pin_directory(directory)?;
+    std::fs::read_dir(nt_final_path(&pinned)?)
 }
 
 pub fn create_directory_at(directory: &File, path: &Path) -> std::io::Result<()> {
@@ -571,6 +594,35 @@ mod tests {
                 std::ffi::OsString::from("two")
             ]
         );
+    }
+
+    /// A guest's metadata handle shares delete. Holding a clone of it while acting on the path
+    /// built from it would let the guest rename the directory and swap in a host-made junction
+    /// that points outside the share.
+    #[test]
+    fn parent_resolution_pins_a_delete_sharing_directory() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("held")).unwrap();
+        let metadata_handle = File::options()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(temp.path().join("held"))
+            .unwrap();
+        let (parent, _) = resolve_parent(
+            &metadata_handle,
+            Path::new("child"),
+            TrailingSeparator::Reject,
+        )
+        .unwrap();
+        assert!(std::fs::rename(temp.path().join("held"), temp.path().join("moved")).is_err());
+        drop(parent);
+        std::fs::rename(temp.path().join("held"), temp.path().join("moved")).unwrap();
     }
 
     #[test]

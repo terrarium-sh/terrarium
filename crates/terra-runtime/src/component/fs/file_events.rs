@@ -99,12 +99,137 @@ impl WatchSession {
 
 struct DirectoryWatches {
     watcher: RecommendedWatcher,
+    #[cfg(unix)]
+    root: PathBuf,
+    #[cfg(unix)]
+    root_directory: std::os::fd::OwnedFd,
     directories: std::collections::BTreeMap<PathBuf, OwnedSemaphorePermit>,
     budget: Arc<Semaphore>,
     stopped: Arc<AtomicBool>,
     warnings: Warnings,
 }
 
+/// The guest can swap any share directory for a symlink, so the walk opens each directory from the
+/// share root without following symlinks and lists it through that handle.
+#[cfg(unix)]
+impl DirectoryWatches {
+    fn open_share_directory(&self, path: &Path) -> Option<std::os::fd::OwnedFd> {
+        let mut directory = open_directory_at(&self.root_directory, std::ffi::OsStr::new("."))?;
+        for component in path.strip_prefix(&self.root).ok()?.components() {
+            let Component::Normal(name) = component else {
+                return None;
+            };
+            directory = open_directory_at(&directory, name)?;
+        }
+        Some(directory)
+    }
+
+    fn register_directory(
+        &mut self,
+        path: &Path,
+        directory: std::os::fd::OwnedFd,
+    ) -> Option<rustix::fs::Dir> {
+        if self.stopped.load(Ordering::Acquire) || self.directories.contains_key(path) {
+            return None;
+        }
+        let Ok(permit) = self.budget.clone().try_acquire_owned() else {
+            self.warnings
+                .report("directory watch limit reached; new directories will not be watched");
+            return None;
+        };
+        let opened = rustix::fs::fstat(&directory).ok()?;
+        if let Err(error) = self.watcher.watch(path, RecursiveMode::NonRecursive) {
+            self.warnings.report(error);
+            return None;
+        }
+        // The native watch resolves `path` again, through whatever symlink the guest swapped in.
+        if !rustix::fs::stat(path)
+            .is_ok_and(|watched| (watched.st_dev, watched.st_ino) == (opened.st_dev, opened.st_ino))
+        {
+            let _ = self.watcher.unwatch(path);
+            return None;
+        }
+        self.directories.insert(path.to_owned(), permit);
+        match rustix::fs::Dir::new(directory) {
+            Ok(entries) => Some(entries),
+            Err(error) => {
+                self.warnings.report(std::io::Error::from(error));
+                None
+            }
+        }
+    }
+
+    fn register_tree(&mut self, path: &Path) {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let mut directories = Vec::new();
+        if let Some(directory) = self.open_share_directory(path)
+            && let Some(entries) = self.register_directory(path, directory)
+        {
+            directories.push((path.to_owned(), entries));
+        }
+        while !self.stopped.load(Ordering::Acquire) {
+            let Some((parent, entries)) = directories.last_mut() else {
+                break;
+            };
+            let entry = match entries.read() {
+                Some(Ok(entry)) => entry,
+                Some(Err(error)) => {
+                    self.warnings.report(std::io::Error::from(error));
+                    continue;
+                }
+                None => {
+                    directories.pop();
+                    continue;
+                }
+            };
+            let name = std::ffi::OsStr::from_bytes(entry.file_name().to_bytes());
+            if matches!(name.as_bytes(), b"." | b"..")
+                || !matches!(
+                    entry.file_type(),
+                    rustix::fs::FileType::Directory | rustix::fs::FileType::Unknown
+                )
+            {
+                continue;
+            }
+            if self.budget.available_permits() == 0 {
+                self.warnings.report(
+                    "directory watch limit reached; remaining directories will not be watched",
+                );
+                break;
+            }
+            let child = parent.join(name);
+            let Some(directory) = entries
+                .fd()
+                .ok()
+                .and_then(|entries| open_directory_at(entries, name))
+            else {
+                continue;
+            };
+            if let Some(children) = self.register_directory(&child, directory) {
+                directories.push((child, children));
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn open_directory_at(
+    parent: impl std::os::fd::AsFd,
+    name: &std::ffi::OsStr,
+) -> Option<std::os::fd::OwnedFd> {
+    use rustix::fs::{Mode, OFlags};
+
+    rustix::fs::openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .ok()
+}
+
+#[cfg(windows)]
 impl DirectoryWatches {
     fn register_directory(&mut self, path: &Path) -> Option<std::fs::ReadDir> {
         if self.stopped.load(Ordering::Acquire) || self.directories.contains_key(path) {
@@ -163,7 +288,9 @@ impl DirectoryWatches {
             }
         }
     }
+}
 
+impl DirectoryWatches {
     fn update(&mut self, root: &Path, event: &FileEvent) {
         let path = root.join(&event.path);
         if event.kind == FileEventKind::Remove {
@@ -217,8 +344,20 @@ fn run_watches(
             return;
         }
     };
+    #[cfg(unix)]
+    let root_directory = match terra_platform::filesystem::share::open_share_root(root) {
+        Ok(directory) => directory.into(),
+        Err(error) => {
+            log::warn!("shared file notifications unavailable: {error}");
+            return;
+        }
+    };
     let mut registry = DirectoryWatches {
         watcher,
+        #[cfg(unix)]
+        root: root.clone(),
+        #[cfg(unix)]
+        root_directory,
         directories: std::collections::BTreeMap::new(),
         budget: grant.watch_budget.clone(),
         stopped,
@@ -376,13 +515,21 @@ mod tests {
     use super::*;
     use crate::component::AccessMode;
 
-    fn directory_registry(budget: Arc<Semaphore>) -> DirectoryWatches {
+    fn directory_registry(root: &Path, budget: Arc<Semaphore>) -> DirectoryWatches {
+        #[cfg(windows)]
+        let _ = root;
         DirectoryWatches {
             watcher: RecommendedWatcher::new(
                 |_| {},
                 notify::Config::default().with_follow_symlinks(false),
             )
             .unwrap(),
+            #[cfg(unix)]
+            root: root.to_owned(),
+            #[cfg(unix)]
+            root_directory: terra_platform::filesystem::share::open_share_root(root)
+                .unwrap()
+                .into(),
             directories: std::collections::BTreeMap::new(),
             budget,
             stopped: Arc::new(AtomicBool::new(false)),
@@ -392,19 +539,21 @@ mod tests {
 
     #[test]
     fn directory_registration_is_bounded_across_shares_and_releases_removed_trees() {
-        let first = tempfile::tempdir().unwrap();
-        let second = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(first.path().join("nested/deeper")).unwrap();
+        let first_directory = tempfile::tempdir().unwrap();
+        let second_directory = tempfile::tempdir().unwrap();
+        let first = first_directory.path().canonicalize().unwrap();
+        let second = second_directory.path().canonicalize().unwrap();
+        std::fs::create_dir_all(first.join("nested/deeper")).unwrap();
         let budget = Arc::new(tokio::sync::Semaphore::new(2));
-        let mut first_registry = directory_registry(budget.clone());
-        let mut second_registry = directory_registry(budget.clone());
-        first_registry.register_tree(first.path());
-        second_registry.register_tree(second.path());
+        let mut first_registry = directory_registry(&first, budget.clone());
+        let mut second_registry = directory_registry(&second, budget.clone());
+        first_registry.register_tree(&first);
+        second_registry.register_tree(&second);
         assert_eq!(first_registry.directories.len(), 2);
         assert!(second_registry.directories.is_empty());
         assert_eq!(budget.available_permits(), 0);
         first_registry.update(
-            first.path(),
+            &first,
             &FileEvent {
                 path: "nested".into(),
                 kind: FileEventKind::Remove,
@@ -412,7 +561,7 @@ mod tests {
             },
         );
         assert_eq!(budget.available_permits(), 1);
-        second_registry.register_tree(second.path());
+        second_registry.register_tree(&second);
         assert_eq!(second_registry.directories.len(), 1);
         drop(first_registry);
         drop(second_registry);
@@ -526,15 +675,40 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn does_not_forward_through_symlinks() {
-        let root = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        std::os::unix::fs::symlink(outside.path(), root.path().join("link")).unwrap();
-        let mut registry = directory_registry(Arc::new(tokio::sync::Semaphore::new(4)));
-        registry.register_tree(root.path());
+        std::os::unix::fs::symlink(outside.path(), root.join("link")).unwrap();
+        let mut registry = directory_registry(&root, Arc::new(tokio::sync::Semaphore::new(4)));
+        registry.register_tree(&root);
         assert_eq!(registry.directories.len(), 1);
-        assert!(registry.directories.contains_key(root.path()));
-        let event = Event::new(EventKind::Any).add_path(root.path().join("link/file"));
-        assert!(normalize_event(root.path(), &event).is_empty());
+        assert!(registry.directories.contains_key(&root));
+        let event = Event::new(EventKind::Any).add_path(root.join("link/file"));
+        assert!(normalize_event(&root, &event).is_empty());
+    }
+
+    /// A guest can replace a share directory with a symlink after the host learns of a new
+    /// directory under it. Resolving the event's path as text would then list and watch
+    /// directories outside the share.
+    #[cfg(unix)]
+    #[test]
+    fn registration_never_walks_through_a_symlinked_parent() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("new/deeper")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("swapped")).unwrap();
+        let mut registry = directory_registry(&root, Arc::new(tokio::sync::Semaphore::new(8)));
+        registry.register_tree(&root);
+        registry.update(
+            &root,
+            &FileEvent {
+                path: "swapped/new".into(),
+                kind: FileEventKind::Create,
+                is_directory: true,
+            },
+        );
+        assert_eq!(registry.directories.keys().collect::<Vec<_>>(), [&root]);
     }
 
     #[tokio::test]

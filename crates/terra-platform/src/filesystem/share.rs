@@ -32,15 +32,22 @@ pub fn open_share_root(root: &Path) -> io::Result<File> {
         use rustix::fs::{Mode, OFlags, openat};
         use std::path::Component;
 
+        // Parents need only search permission (O_PATH), as on macOS and Windows; the root is read.
         let mut directory = File::open("/")?;
-        for component in root.components() {
+        let mut components = root.components().peekable();
+        while let Some(component) = components.next() {
             let Component::Normal(name) = component else {
                 continue;
+            };
+            let access = if components.peek().is_some() {
+                OFlags::PATH
+            } else {
+                OFlags::RDONLY
             };
             directory = openat(
                 &directory,
                 name,
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                access | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::empty(),
             )
             .map_err(io::Error::from)?

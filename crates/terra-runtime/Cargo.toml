@@ -31,6 +31,9 @@ wasmtime = { version = "=50.0.0", default-features = false, features = ["compone
 wasmtime-internal-jit-icache-coherence = "=50.0.0"
 wasmtime-wasi = { version = "=50.0.0", default-features = false, features = ["p3"] }
 
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation"] }
 
