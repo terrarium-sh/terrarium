@@ -235,7 +235,7 @@ pub(crate) mod psci {
                 None => DENIED,
             },
             CPU_ON | CPU_ON_32 => match target {
-                Some((0, _) | (_, true)) => ALREADY_ON,
+                Some((_, true)) => ALREADY_ON,
                 Some((target, false)) if is_entry_valid(call.argument1) => {
                     return PsciAction::StartCpu {
                         target,
@@ -269,6 +269,23 @@ pub(crate) mod psci {
             PsciCall::from_registers([function, argument0, argument1, argument2])
         }
 
+        /// The boot CPU may turn itself off like any other, and then `CPU_ON` brings it back.
+        #[test]
+        fn cpu_on_restarts_the_boot_cpu_after_cpu_off() {
+            assert_eq!(
+                decide(call(CPU_ON, 0, 0x8000, 7), &[false, true], |_| true),
+                PsciAction::StartCpu {
+                    target: 0,
+                    entry: 0x8000,
+                    context: 7
+                }
+            );
+            assert_eq!(
+                decide(call(CPU_ON, 0, 0x8000, 7), &[true, true], |_| true),
+                PsciAction::Return(ALREADY_ON)
+            );
+        }
+
         #[test]
         fn cpu_on_starts_an_unpowered_cpu_with_a_valid_entry() {
             assert_eq!(
@@ -300,10 +317,6 @@ pub(crate) mod psci {
         #[test]
         fn cpu_on_reports_already_on_and_unknown_targets() {
             let never = |_| panic!("entry checked for a CPU that cannot start");
-            assert_eq!(
-                decide(call(CPU_ON, 0, 0x8000, 0), &[false, false], never),
-                PsciAction::Return(ALREADY_ON)
-            );
             assert_eq!(
                 decide(call(CPU_ON, 1, 0x8000, 0), &[true, true], never),
                 PsciAction::Return(ALREADY_ON)

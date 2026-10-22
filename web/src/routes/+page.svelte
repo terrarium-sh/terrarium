@@ -85,11 +85,11 @@
     <div id="install-commands">
       {#if platform !== 'windows'}
         <h3>{platform === 'macos' ? 'macOS on Apple Silicon · Terminal' : platform === 'linux' ? 'Linux · Terminal' : 'Linux & macOS on Apple Silicon · Terminal'}</h3>
-        <div class="copyable-block"><pre><code bind:this={linuxInstallCode}>curl -fsSLO https://raw.githubusercontent.com/terrarium-sh/terrarium/main/install.sh &amp;&amp; sh install.sh</code></pre><CopyButton text={() => linuxInstallCode?.textContent?.trimEnd() ?? ''} label="Copy Linux and macOS install command" /></div>
+        <div class="copyable-block"><pre><code bind:this={linuxInstallCode}>curl -fsSL https://raw.githubusercontent.com/terrarium-sh/terrarium/main/install.sh | sh</code></pre><CopyButton text={() => linuxInstallCode?.textContent?.trimEnd() ?? ''} label="Copy Linux and macOS install command" /></div>
       {/if}
       {#if platform === 'windows' || !platform}
         <h3>Windows · PowerShell</h3>
-        <div class="copyable-block"><pre><code bind:this={windowsInstallCode}>Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/terrarium-sh/terrarium/main/install.ps1 -OutFile install.ps1; if ($?) &#123; powershell -ExecutionPolicy Bypass -File install.ps1 &#125;</code></pre><CopyButton text={() => windowsInstallCode?.textContent?.trimEnd() ?? ''} label="Copy Windows install command" /></div>
+        <div class="copyable-block"><pre><code bind:this={windowsInstallCode}>irm https://raw.githubusercontent.com/terrarium-sh/terrarium/main/install.ps1 | iex</code></pre><CopyButton text={() => windowsInstallCode?.textContent?.trimEnd() ?? ''} label="Copy Windows install command" /></div>
         <p class="small muted">After installing on Windows, open a new terminal so <code>terra</code> is on your PATH.</p>
       {/if}
     </div>

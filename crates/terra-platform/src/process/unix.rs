@@ -185,6 +185,10 @@ pub fn attach_vm_child(_guard: &VmChildGuard, _child: &std::process::Child) -> R
 
 #[allow(unsafe_code)]
 pub fn kill_vm_child(child: &mut std::process::Child) -> Result<()> {
+    // A reaped child's PID may already name another process or group.
+    if child.try_wait()?.is_some() {
+        return Ok(());
+    }
     let pid = i32::try_from(child.id()).map_err(std::io::Error::other)?;
     // SAFETY: an unreaped child cannot have its PID reused; signal the group only if it owns it.
     let group = unsafe { libc::getpgid(pid) };

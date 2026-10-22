@@ -492,6 +492,9 @@ jobs:
       - name: Verify build wrapper
         shell: pwsh
         run: ./scripts/toolchain/test-build-host.ps1
+      - name: Verify installer
+        shell: pwsh
+        run: ./scripts/checks/test-install.ps1
       - name: Build distribution
         id: host-build
         shell: pwsh

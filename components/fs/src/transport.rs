@@ -279,7 +279,10 @@ fn handle(state: &State, id: u64) -> Option<&OpenHandle> {
 
 fn name(bytes: &[u8]) -> Result<Vec<u8>, i32> {
     let name = bytes.split(|byte| *byte == 0).next().ok_or(wire::EINVAL)?;
-    if name.is_empty() || name.len() == bytes.len() || name.contains(&b'/') {
+    if name.is_empty()
+        || name.len() == bytes.len()
+        || name.iter().any(|byte| matches!(byte, b'/' | b'\\' | b':'))
+    {
         return Err(wire::EINVAL);
     }
     Ok(name.to_vec())
@@ -1457,6 +1460,16 @@ mod allocation_tests {
         assert_eq!(&before_forget[40..48], &99_u64.to_le_bytes());
         assert_eq!(&after_relookup[40..48], &99_u64.to_le_bytes());
         assert_eq!(stat.ino, 99);
+    }
+
+    /// A Windows host would turn `\` into a subdirectory and `:` into an alternate data stream;
+    /// every host refuses both, so a share behaves the same wherever it lives.
+    #[test]
+    fn names_with_path_or_stream_separators_are_refused() {
+        for refused in [&b"a\\b\0"[..], b"file:stream\0", b"a/b\0"] {
+            assert_eq!(name(refused), Err(wire::EINVAL));
+        }
+        assert_eq!(name(b"plain\0"), Ok(b"plain".to_vec()));
     }
 
     #[test]

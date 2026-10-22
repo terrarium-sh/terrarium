@@ -67,6 +67,13 @@ HOME="$tmp/home" PATH="$tmp/bin:$PATH" INSTALL_FIXTURES="$tmp/release" INSTALL_D
 test ! -e "$tmp/home/.terra/config/seccomp" && test ! -e "$tmp/home/.terra/config/seccomp.previous"
 cmp "$tmp/original-terra" "$tmp/installed-terra"
 
+# The documented one-liner pipes the script into sh and selects prereleases by environment.
+rm -f "$tmp/installed-terra" "$tmp/release/urls"
+HOME="$tmp/home" PATH="$tmp/bin:$PATH" INSTALL_FIXTURES="$tmp/release" INSTALL_DEST="$tmp/installed-terra" \
+  TERRA_VERSION= TERRA_PRERELEASE=1 sh < "$root/install.sh" >/dev/null
+cmp "$tmp/original-terra" "$tmp/installed-terra"
+grep -qx 'https://github.com/terrarium-sh/terrarium/releases/download/v1.3.0-rc.1/terra-x86_64-linux.tar.gz' "$tmp/release/urls"
+
 rm -f "$tmp/installed-terra"
 HOME="$tmp/home" PATH="$tmp/bin:$PATH" INSTALL_FIXTURES="$tmp/release" INSTALL_DEST="$tmp/installed-terra" \
   INSTALL_ARCH=aarch64 \

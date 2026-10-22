@@ -39,13 +39,13 @@ Hypervisor Platform feature turned on. More detail is in the
 **Linux and macOS:**
 
 ```sh
-curl -fsSLO https://raw.githubusercontent.com/terrarium-sh/terrarium/main/install.sh && sh install.sh
+curl -fsSL https://raw.githubusercontent.com/terrarium-sh/terrarium/main/install.sh | sh
 ```
 
 **Windows (PowerShell):**
 
 ```powershell
-Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/terrarium-sh/terrarium/main/install.ps1 -OutFile install.ps1; if ($?) { powershell -ExecutionPolicy Bypass -File install.ps1 }
+irm https://raw.githubusercontent.com/terrarium-sh/terrarium/main/install.ps1 | iex
 ```
 
 On Windows, open a new terminal after installing. Other ways to install are in

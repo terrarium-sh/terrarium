@@ -315,6 +315,10 @@ impl BoxRef {
             Ok(file) => {
                 file.set_len(0)
                     .with_context(|| format!("truncating lock {}", path.display()))?;
+                // A holder that died without cleanup left its pids; `ls` would report them while
+                // this non-VM holder (export, import, storage) owns the box.
+                self.clear_host_pid()
+                    .with_context(|| format!("clearing stale pids in {}", self.dir.display()))?;
                 Ok(file)
             }
             Err(TryLockError::WouldBlock) => {
@@ -341,10 +345,14 @@ impl BoxRef {
             .dir
             .parent()
             .context("box state has no project directory")?;
+        // On Unix, resolved like the slug, so every spelling of one project records the same
+        // origin; Windows keeps the typed path rather than canonicalize's verbatim `\\?\` form.
         #[cfg(unix)]
         let bytes = {
-            use std::os::unix::ffi::OsStrExt as _;
-            self.project_dir.as_os_str().as_bytes().to_vec()
+            use std::os::unix::ffi::OsStringExt as _;
+            crate::sys::canonicalize_existing_prefix(&self.project_dir)
+                .into_os_string()
+                .into_vec()
         };
         #[cfg(windows)]
         let bytes = {
@@ -653,6 +661,19 @@ mod tests {
         {
             std::fs::write(dir.path().join(ORIGIN_FILE), b"invalid UTF-16 origin").unwrap();
             assert_eq!(read_origin(dir.path()), None);
+        }
+        #[cfg(unix)]
+        {
+            let real = tempfile::tempdir().unwrap();
+            let link = dir.path().join("project-link");
+            std::os::unix::fs::symlink(real.path(), &link).unwrap();
+            BoxRef::from_state_dir(box_dir.clone(), &link)
+                .write_origin()
+                .unwrap();
+            assert_eq!(
+                read_origin(dir.path()),
+                Some(real.path().canonicalize().unwrap())
+            );
         }
         std::fs::remove_file(dir.path().join(ORIGIN_FILE)).unwrap();
         std::fs::create_dir(dir.path().join(ORIGIN_FILE)).unwrap();
@@ -1115,6 +1136,24 @@ mod tests {
                 vec![b.get_volume_image("Data")]
             );
         }
+    }
+
+    /// A VM killed without cleanup leaves host.pid and supervisor.pid behind. Taking the lock
+    /// proves no process owns the box, so the files go, or `ls --json` would report the dead
+    /// VM's pid while an export or import holds the box.
+    #[test]
+    fn taking_the_run_lock_clears_a_dead_holders_pids() {
+        let _home = TestHome::new();
+        let dir = tempfile::tempdir().unwrap();
+        let b = resolve_box_ref(dir.path());
+        std::fs::create_dir_all(b.get_dir()).unwrap();
+        for file in [HOST_PID_FILE, SUPERVISOR_PID_FILE] {
+            std::fs::write(b.get_dir().join(file), "4242 1\n").unwrap();
+        }
+        assert!(b.read_vm_process().is_some() && b.read_supervisor_process().is_some());
+        let _lock = b.lock_run().unwrap();
+        assert_eq!(b.read_vm_process(), None);
+        assert_eq!(b.read_supervisor_process(), None);
     }
 
     /// A boot racing a momentary hold on the lock must not be told the box is

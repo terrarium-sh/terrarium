@@ -65,8 +65,8 @@ GitHub CLI is installed. Run it again to upgrade.
 
 | | Linux and macOS | Windows |
 | --- | --- | --- |
-| Pin a version | `TERRA_VERSION=x.y.z sh install.sh` | `install.ps1 -Version x.y.z` or `$env:TERRA_VERSION` |
-| Include prereleases | `sh install.sh --prerelease` | `install.ps1 -Prerelease` |
+| Pin a version | `curl -fsSL …/install.sh \| TERRA_VERSION=x.y.z sh` | `$env:TERRA_VERSION="x.y.z"; irm …/install.ps1 \| iex` |
+| Include prereleases | `curl -fsSL …/install.sh \| TERRA_PRERELEASE=1 sh` | `$env:TERRA_PRERELEASE=1; irm …/install.ps1 \| iex` |
 
 On Windows, `terra.exe` goes to `%LOCALAPPDATA%\Programs\terra`, which the
 installer adds to your `PATH`; open a new terminal afterwards.

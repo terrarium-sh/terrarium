@@ -80,6 +80,8 @@ means your own home. The host directory must exist when the box starts.
 
 A mount gives the guest that directory and nothing outside it: guest paths and
 symlinks cannot escape it. Read-only mounts reject writes and metadata changes.
+File names containing `\` or `:` are refused on every host, because Windows would
+store them as subfolders and alternate data streams.
 
 What works through a mount:
 

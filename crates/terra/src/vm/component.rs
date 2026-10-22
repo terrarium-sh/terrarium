@@ -102,7 +102,6 @@ fn agent_listener(bx: &BoxRef) -> Result<LocalListener> {
             .map_err(Into::into);
     }
     let _ = std::fs::remove_file(&path);
-    image::sweep_staging_temps(bx.get_dir(), |_| false);
     let listener = LocalListener::bind(&path)
         .with_context(|| format!("binding the agent socket {}", path.display()))?;
     sys::set_owner_only(&path, false).with_context(|| format!("securing {}", path.display()))?;
