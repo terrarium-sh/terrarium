@@ -12,6 +12,11 @@ rustflags = ["-C", "link-self-contained=no", "--cfg", "musl_v1_2_3"]
 [target.'cfg(target_os = "windows")']
 rustflags = ["-C", "control-flow-guard=yes"]
 
+# Page-aligned file offsets let embedded components run from a view of the executable's file,
+# which Control Flow Guard accepts, unlike the image's own pages.
+[target.'cfg(all(target_os = "windows", target_env = "msvc"))']
+rustflags = ["-C", "link-arg=/FILEALIGN:4096"]
+
 [env]
 CC_x86_64_unknown_linux_musl = { value = "scripts/toolchain/zig-musl-cc", relative = true }
 AR_x86_64_unknown_linux_musl = { value = "scripts/toolchain/zig-musl-ar", relative = true }

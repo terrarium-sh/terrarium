@@ -6,9 +6,9 @@ mod unix;
 mod windows;
 
 #[cfg(unix)]
-pub use unix::{page_size, protect_executable, protect_read_only};
+pub use unix::{map_file_backed_code, page_size, protect_executable, protect_read_only};
 #[cfg(windows)]
-pub use windows::{page_size, protect_executable, protect_read_only};
+pub use windows::{map_file_backed_code, page_size, protect_executable, protect_read_only};
 
 /// Places a value on pages of its own: aligned, and padded to whole pages by
 /// its size, so its code can be made executable in place without exposing

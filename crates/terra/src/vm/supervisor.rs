@@ -328,7 +328,8 @@ async fn report_vm_exit(
     {
         ensure!(
             is_ready || broker_status.success(),
-            "{bx}'s network broker stopped unexpectedly ({broker_status}) during VM shutdown"
+            "{bx}'s network broker stopped unexpectedly ({broker_status}) during VM shutdown \
+             (VM {status})"
         );
     }
     let code = status

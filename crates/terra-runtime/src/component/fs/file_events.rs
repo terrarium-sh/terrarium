@@ -2,7 +2,7 @@
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::{
-    Arc,
+    Arc, Weak,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -25,6 +25,23 @@ const MAX_EVENT_PATH_BYTES: usize = 4095;
 struct QueuedEvent {
     event: FileEvent,
     _permit: OwnedSemaphorePermit,
+    _undelivered: Arc<()>,
+}
+
+/// The event a share queued last; it absorbs identical events until the guest takes it, see
+/// `identical_events_merge_until_the_guest_takes_the_queued_one`.
+#[derive(Default)]
+struct LastQueued(Option<(FileEvent, Weak<()>)>);
+
+impl LastQueued {
+    fn absorbs(&self, event: &FileEvent) -> bool {
+        self.0.as_ref().is_some_and(|(last, undelivered)| {
+            undelivered.strong_count() > 0
+                && last.path == event.path
+                && last.kind == event.kind
+                && last.is_directory == event.is_directory
+        })
+    }
 }
 
 struct Warnings(Option<Instant>);
@@ -323,6 +340,7 @@ fn run_watches(
     let callback_root = root.clone();
     let callback_stopped = stopped.clone();
     let mut warnings = Warnings(None);
+    let mut last_queued = LastQueued::default();
     let callback = move |result| {
         if !callback_stopped.load(Ordering::Acquire) {
             forward_event(
@@ -330,6 +348,7 @@ fn run_watches(
                 &callback_root,
                 &sender,
                 &event_budget,
+                &mut last_queued,
                 &mut warnings,
             );
         }
@@ -389,6 +408,7 @@ fn forward_event(
     root: &Path,
     sender: &mpsc::Sender<Option<QueuedEvent>>,
     budget: &Arc<Semaphore>,
+    last_queued: &mut LastQueued,
     warnings: &mut Warnings,
 ) {
     let event = match result {
@@ -405,6 +425,12 @@ fn forward_event(
         return;
     }
     for (index, path) in event.paths.iter().enumerate() {
+        let Some(event) = normalize_path(root, &event, index, path) else {
+            continue;
+        };
+        if last_queued.absorbs(&event) {
+            continue;
+        }
         let Ok(permit) = budget.clone().try_acquire_owned() else {
             warnings.report("event queue full; dropping changes");
             continue;
@@ -413,12 +439,12 @@ fn forward_event(
             warnings.report("event queue full; dropping changes");
             continue;
         };
-        let Some(event) = normalize_path(root, &event, index, path) else {
-            continue;
-        };
+        let undelivered = Arc::new(());
+        last_queued.0 = Some((event.clone(), Arc::downgrade(&undelivered)));
         slot.send(Some(QueuedEvent {
             event,
             _permit: permit,
+            _undelivered: undelivered,
         }));
     }
 }
@@ -606,6 +632,7 @@ mod tests {
             root.path(),
             &sender,
             &budget,
+            &mut LastQueued::default(),
             &mut warnings,
         );
         assert!(warnings.0.is_none());
@@ -781,6 +808,7 @@ mod tests {
         let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
         let (first_sender, mut first) = mpsc::channel(4);
         let (second_sender, mut second) = mpsc::channel(4);
+        let (mut first_last, mut second_last) = (LastQueued::default(), LastQueued::default());
         let mut warnings = Warnings(None);
         let event =
             Event::new(EventKind::Modify(ModifyKind::Any)).add_path(root.path().join("file"));
@@ -789,6 +817,7 @@ mod tests {
             root.path(),
             &first_sender,
             &budget,
+            &mut first_last,
             &mut warnings,
         );
         forward_event(
@@ -796,6 +825,7 @@ mod tests {
             root.path(),
             &second_sender,
             &budget,
+            &mut second_last,
             &mut warnings,
         );
         assert!(second.try_recv().is_err());
@@ -805,6 +835,7 @@ mod tests {
             root.path(),
             &second_sender,
             &budget,
+            &mut second_last,
             &mut warnings,
         );
         assert_eq!(second.try_recv().unwrap().unwrap().event.path, "file");
@@ -814,38 +845,91 @@ mod tests {
     fn forwarding_recovers_after_overflow_and_native_errors() {
         let root = tempfile::tempdir().unwrap();
         let (sender, mut receiver) = mpsc::channel(1);
+        let mut last_queued = LastQueued::default();
         let mut warnings = Warnings(None);
         let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(4096));
-        let event =
-            Event::new(EventKind::Modify(ModifyKind::Any)).add_path(root.path().join("file"));
+        let modify = |name: &str| {
+            Event::new(EventKind::Modify(ModifyKind::Any)).add_path(root.path().join(name))
+        };
         forward_event(
-            Ok(event.clone()),
+            Ok(modify("file")),
             root.path(),
             &sender,
             &budget,
+            &mut last_queued,
             &mut warnings,
         );
         forward_event(
-            Ok(event.clone()),
+            Ok(modify("other")),
             root.path(),
             &sender,
             &budget,
+            &mut last_queued,
             &mut warnings,
         );
         assert!(warnings.0.is_some());
-        let first = receiver.try_recv().unwrap().unwrap();
+        assert_eq!(receiver.try_recv().unwrap().unwrap().event.path, "file");
         assert!(receiver.try_recv().is_err());
         forward_event(
             Err(notify::Error::generic("backend failure")),
             root.path(),
             &sender,
             &budget,
+            &mut last_queued,
             &mut warnings,
         );
-        forward_event(Ok(event), root.path(), &sender, &budget, &mut warnings);
-        assert_eq!(
-            receiver.try_recv().unwrap().unwrap().event.path,
-            first.event.path
+        forward_event(
+            Ok(modify("other")),
+            root.path(),
+            &sender,
+            &budget,
+            &mut last_queued,
+            &mut warnings,
         );
+        assert_eq!(receiver.try_recv().unwrap().unwrap().event.path, "other");
+    }
+
+    /// Windows reports every write to a file, unlike inotify, which merges an
+    /// event identical to the one still queued; without the same merge a burst
+    /// of writes fills the bounded queue with duplicates the guest must drain
+    /// one round trip at a time before it sees any later change.
+    #[test]
+    fn identical_events_merge_until_the_guest_takes_the_queued_one() {
+        let root = tempfile::tempdir().unwrap();
+        let (sender, mut receiver) = mpsc::channel(8);
+        let mut last_queued = LastQueued::default();
+        let mut warnings = Warnings(None);
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
+        let modify = |name: &str| {
+            Event::new(EventKind::Modify(ModifyKind::Any)).add_path(root.path().join(name))
+        };
+        for name in ["flood", "flood", "flood", "value", "flood"] {
+            forward_event(
+                Ok(modify(name)),
+                root.path(),
+                &sender,
+                &budget,
+                &mut last_queued,
+                &mut warnings,
+            );
+        }
+        let mut paths = Vec::new();
+        while let Ok(Some(queued)) = receiver.try_recv() {
+            paths.push(queued.event.path);
+        }
+        assert_eq!(paths, ["flood", "value", "flood"]);
+        assert!(warnings.0.is_none());
+        for _ in 0..2 {
+            forward_event(
+                Ok(modify("flood")),
+                root.path(),
+                &sender,
+                &budget,
+                &mut last_queued,
+                &mut warnings,
+            );
+        }
+        assert_eq!(receiver.try_recv().unwrap().unwrap().event.path, "flood");
+        assert!(receiver.try_recv().is_err());
     }
 }

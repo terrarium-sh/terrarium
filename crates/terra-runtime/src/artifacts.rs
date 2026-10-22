@@ -86,10 +86,15 @@ impl TrustedArtifact {
             };
         }
         let loaded = if address.is_multiple_of(code_memory::page_size()) {
-            // SAFETY: the trusted bytes sit on pages of their own that nothing
-            // writes, for the life of the process; the cached component keeps
-            // its code published, so the pages are never unpublished.
-            unsafe { Component::deserialize_raw(engine, NonNull::from(&bytes.0)) }
+            code_memory::map_file_backed_code(&bytes.0)
+                .map_err(wasmtime::Error::from)
+                .and_then(|code| {
+                    // SAFETY: the trusted bytes, or a file view holding the same bytes, sit on
+                    // pages of their own that nothing writes, for the life of the process; the
+                    // cached component keeps its code published, so the pages are never
+                    // unpublished.
+                    unsafe { Component::deserialize_raw(engine, NonNull::from(code)) }
+                })
         } else {
             Err(wasmtime::Error::msg(
                 "the artifact's alignment is below the page size",
@@ -131,7 +136,7 @@ impl wasmtime::CustomCodeMemory for CodeProtection {
     }
 
     /// Leaves the range read-only rather than writable: in-place code is the
-    /// executable's own image, and nothing here edits code after publishing it.
+    /// executable's own file, and nothing here edits code after publishing it.
     fn unpublish_executable(&self, ptr: *const u8, len: usize) -> wasmtime::Result<()> {
         if len == 0 {
             return Ok(());

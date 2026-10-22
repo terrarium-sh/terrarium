@@ -8,6 +8,10 @@ use crate::filesystem::Error;
 
 pub mod symlink_broker;
 
+const SHARE_READ_WRITE_DELETE: u32 = windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ
+    | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE
+    | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE;
+
 #[derive(Clone, Copy)]
 pub struct FileAccess {
     pub read: bool,
@@ -16,35 +20,28 @@ pub struct FileAccess {
 
 pub fn reopen_file_with_delete_sharing(file: &File, access: FileAccess) -> std::io::Result<File> {
     use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    };
 
     let desired_access = (if access.read { GENERIC_READ } else { 0 })
         | (if access.write { GENERIC_WRITE } else { 0 });
-    reopen(
-        file,
-        desired_access,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        0,
-    )
+    reopen(file, desired_access, SHARE_READ_WRITE_DELETE, 0)
 }
 
-/// `directory` reopened without delete sharing, so nobody can rename it while the handle lives:
-/// a metadata handle shares delete, and a guest could otherwise swap a junction in under the
-/// path built from it. The pin needs data access: Windows skips share-mode checks for a handle
-/// holding only `FILE_READ_ATTRIBUTES`.
+/// `directory` reopened without delete sharing, so a guest cannot rename it and swap a junction in
+/// under a path built from it. The pin holds data access because Windows skips share-mode checks
+/// for attribute-only handles; `ReOpenFile` would refuse a directory with access denied.
 fn pin_directory(directory: &File) -> std::io::Result<File> {
-    use windows_sys::Win32::Foundation::GENERIC_READ;
+    use windows_sys::Wdk::Storage::FileSystem::{FILE_DIRECTORY_FILE, FILE_OPEN};
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_LIST_DIRECTORY, FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
 
-    reopen(
+    nt_open_child(
         directory,
-        GENERIC_READ,
+        std::ffi::OsStr::new(""),
+        FILE_LIST_DIRECTORY,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
-        FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_OPEN,
+        FILE_DIRECTORY_FILE,
     )
 }
 
@@ -262,13 +259,14 @@ pub(super) fn file_identity(file: &File) -> std::io::Result<super::FileIdentity>
     })
 }
 
-/// Opens `name` relative to `parent` without resolving a path; `options` should include
-/// `FILE_OPEN_REPARSE_POINT` whenever the child may be a link.
+/// Opens `name` relative to `parent` without resolving a path; an empty `name` reopens `parent`.
+/// `options` should include `FILE_OPEN_REPARSE_POINT` whenever the child may be a link.
 #[allow(unsafe_code)]
 fn nt_open_child(
     parent: &File,
     name: &std::ffi::OsStr,
     access: u32,
+    share_mode: u32,
     disposition: u32,
     options: u32,
 ) -> std::io::Result<File> {
@@ -277,9 +275,7 @@ fn nt_open_child(
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use windows_sys::Wdk::Storage::FileSystem::{FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile};
     use windows_sys::Win32::Foundation::{RtlNtStatusToDosError, UNICODE_STRING};
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, SYNCHRONIZE,
-    };
+    use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
     let mut encoded = name.encode_wide().collect::<Vec<_>>();
     let length = u16::try_from(encoded.len() * 2).map_err(std::io::Error::other)?;
     let name = UNICODE_STRING {
@@ -304,7 +300,7 @@ fn nt_open_child(
             &raw mut status,
             null(),
             0,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            share_mode,
             disposition,
             options | FILE_SYNCHRONOUS_IO_NONALERT,
             null(),
@@ -332,6 +328,7 @@ pub(super) fn open_metadata_file(directory: &File, name: &str) -> Result<File, E
         directory,
         std::ffi::OsStr::new(name),
         FILE_READ_ATTRIBUTES,
+        SHARE_READ_WRITE_DELETE,
         FILE_OPEN,
         FILE_OPEN_REPARSE_POINT,
     )
@@ -389,6 +386,7 @@ pub fn symlink_at(directory: &File, path: &Path, target: &str) -> std::io::Resul
         &parent,
         &leaf,
         FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES | DELETE,
+        SHARE_READ_WRITE_DELETE,
         FILE_CREATE,
         FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
     )?;
@@ -442,6 +440,7 @@ pub fn read_wsl_symlink_at(directory: &File, path: &Path) -> std::io::Result<Opt
         &parent,
         &leaf,
         FILE_READ_ATTRIBUTES,
+        SHARE_READ_WRITE_DELETE,
         FILE_OPEN,
         FILE_OPEN_REPARSE_POINT,
     )?;

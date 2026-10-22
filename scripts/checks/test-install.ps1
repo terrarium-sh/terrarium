@@ -12,16 +12,17 @@ $environmentKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("Environmen
 $originalPath = $environmentKey.GetValue("Path", $null, "DoNotExpandEnvironmentNames")
 $originalKind = if ($null -ne $originalPath) { $environmentKey.GetValueKind("Path") } else { $null }
 $originalLocalAppData = $env:LOCALAPPDATA
-$script:urls = [System.Collections.Generic.List[string]]::new()
+$urls = [System.Collections.Generic.List[string]]::new()
 
-function curl.exe {
+# A closure, not `$script:`: inside install.ps1 `$script:` names the installer's scope.
+${function:curl.exe} = {
     $url = @($args | Where-Object { $_ -like "https://*" })[0]
     $output = $args[[array]::IndexOf($args, "-o") + 1]
-    $script:urls.Add($url)
+    $urls.Add($url)
     $name = if ($url -like "https://api.github.com/*") { "releases.json" } else { Split-Path -Leaf $url }
-    Copy-Item -LiteralPath (Join-Path $script:release $name) -Destination $output
+    Copy-Item -LiteralPath (Join-Path $release $name) -Destination $output
     $global:LASTEXITCODE = 0
-}
+}.GetNewClosure()
 
 function gh { $global:LASTEXITCODE = 0 }
 
@@ -47,19 +48,19 @@ try {
     # A pinned version passed as a flag to the downloaded script.
     & $installer -Version 1.2.3 | Out-Null
     Assert ((Get-Content -Raw -LiteralPath $installed) -eq (Get-Content -Raw -LiteralPath (Join-Path $release "terra.exe"))) "the pinned install did not place terra.exe"
-    Assert ($script:urls -match "/releases/download/v1\.2\.3/") "the pinned install did not fetch v1.2.3"
+    Assert (@($urls -match "/releases/download/v1\.2\.3/").Count -gt 0) "the pinned install did not fetch v1.2.3"
     $rawPath = $environmentKey.GetValue("Path", "", "DoNotExpandEnvironmentNames")
     Assert ($rawPath -like "%USERPROFILE%\terra-test-bin;*") "an unexpanded PATH entry was rewritten: $rawPath"
     Assert ($environmentKey.GetValueKind("Path") -eq "ExpandString") "the user PATH lost its expandable type"
 
     # The documented one-liner: `irm | iex` with the prerelease chosen by environment.
-    $script:urls.Clear()
+    $urls.Clear()
     Remove-Item -LiteralPath $installed
     $env:TERRA_PRERELEASE = "1"
     Get-Content -Raw -LiteralPath $installer | Invoke-Expression | Out-Null
     Remove-Item Env:\TERRA_PRERELEASE
     Assert (Test-Path -LiteralPath $installed -PathType Leaf) "the iex install did not place terra.exe"
-    Assert ($script:urls -match "/releases/download/v1\.3\.0-rc\.1/") "TERRA_PRERELEASE did not select the prerelease"
+    Assert (@($urls -match "/releases/download/v1\.3\.0-rc\.1/").Count -gt 0) "TERRA_PRERELEASE did not select the prerelease"
     Assert (-not (Test-Path variable:repo)) "the installer left its variables in the caller's session"
 
     # A checksum mismatch installs nothing.

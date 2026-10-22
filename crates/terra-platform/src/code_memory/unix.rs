@@ -7,6 +7,11 @@ pub fn page_size() -> usize {
     rustix::param::page_size()
 }
 
+/// `bytes` already sit in the executable's own file mapping, which `mprotect` can make executable.
+pub fn map_file_backed_code(bytes: &'static [u8]) -> io::Result<&'static [u8]> {
+    Ok(bytes)
+}
+
 /// # Safety
 ///
 /// `ptr..ptr + len` must be page-aligned mapped memory that nothing writes
