@@ -621,7 +621,12 @@ mod tests {
     fn project_origins_preserve_native_paths_and_reject_failed_writes() {
         let dir = tempfile::tempdir().unwrap();
         let box_dir = dir.path().join("box");
-        let mut paths = vec![PathBuf::from(" project \t"), dir.path().join("project ")];
+        // Unix origins are recorded resolved, and macOS's temp directory sits behind a symlink.
+        #[cfg(unix)]
+        let project = dir.path().canonicalize().unwrap().join("project ");
+        #[cfg(windows)]
+        let project = dir.path().join("project ");
+        let mut paths = vec![PathBuf::from(" project \t"), project];
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStringExt as _;

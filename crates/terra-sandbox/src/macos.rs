@@ -10,7 +10,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt as _;
+use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::path::Path;
 use std::process::{Child, Command, ExitCode};
 use std::time::Duration;
@@ -68,15 +68,8 @@ fn activation_failure(
     }
     // EOF means the worker is exiting, so this kill cannot change its exit status.
     let _ = terra_platform::process::kill_vm_child(child);
-    // NOWAIT leaves the worker unreaped, since spawn's kill_vm_child afterwards signals its raw PID.
-    let signal = rustix::process::waitid(
-        rustix::process::WaitId::Pid(rustix::process::Pid::from_child(child)),
-        rustix::process::WaitIdOptions::EXITED | rustix::process::WaitIdOptions::NOWAIT,
-    )
-    .ok()
-    .flatten()
-    .and_then(|status| status.terminating_signal());
-    match signal {
+    // Reaping goes through `Child`: kill_vm_child's own try_wait may already have reaped it.
+    match child.wait().ok().and_then(|status| status.signal()) {
         Some(signal) => anyhow::anyhow!(
             "macOS sandbox worker was killed by signal {signal} before verifying confinement"
         ),
@@ -432,7 +425,7 @@ mod tests {
             .unwrap_err();
         child
             .wait()
-            .expect("a failed confirmation must leave the worker unreaped");
+            .expect("a failed confirmation must reap the worker only through its Child");
         format!("{error:#}")
     }
 
