@@ -267,7 +267,6 @@
         "lstat",
         "madvise",
         "memfd_create",
-        "mkdir",
         "mkdirat",
         "mmap",
         "mprotect",

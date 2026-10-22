@@ -7,7 +7,7 @@ use super::super::KvmError;
 use crate::memory::GuestMemory;
 use crate::vcpus::Stop;
 use crate::vm::{
-    MmioRead, MmioWrite, Msr, PioRead, PioWrite, VcpuAction, VcpuExit, VcpuHandler, VcpuOutcome,
+    MmioRead, MmioWrite, PioRead, PioWrite, VcpuAction, VcpuExit, VcpuHandler, VcpuOutcome,
 };
 use kvm_bindings::{KVM_API_VERSION, kvm_userspace_memory_region};
 use kvm_ioctls::{Cap, Kvm, VcpuExit as KvmVcpuExit, VcpuFd, VmFd};
@@ -231,38 +231,8 @@ fn dispatch_kernel_exit(
                 }),
             )?)?;
         }
-        KvmVcpuExit::X86Rdmsr(msr) => {
-            trace_exit("rdmsr");
-            let action = handler_action(
-                handler,
-                VcpuExit::Rdmsr(Msr {
-                    index: msr.index,
-                    value: 0,
-                }),
-            )?;
-            match action {
-                VcpuAction::Rdmsr(value) => {
-                    *msr.data = value;
-                    *msr.error = 0;
-                }
-                VcpuAction::MsrFault => *msr.error = 1,
-                _ => return Err(unexpected_action("rdmsr")),
-            }
-        }
-        KvmVcpuExit::X86Wrmsr(msr) => {
-            trace_exit("wrmsr");
-            match handler_action(
-                handler,
-                VcpuExit::Wrmsr(Msr {
-                    index: msr.index,
-                    value: msr.data,
-                }),
-            )? {
-                VcpuAction::Wrmsr => *msr.error = 0,
-                VcpuAction::MsrFault => *msr.error = 1,
-                _ => return Err(unexpected_action("wrmsr")),
-            }
-        }
+        KvmVcpuExit::X86Rdmsr(_) => return Err(KvmError::UnexpectedExit("rdmsr")),
+        KvmVcpuExit::X86Wrmsr(_) => return Err(KvmError::UnexpectedExit("wrmsr")),
         KvmVcpuExit::Hlt => {
             trace_exit("hlt");
             require_reentry(handler_action(handler, VcpuExit::Halt)?)?;

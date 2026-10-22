@@ -128,24 +128,6 @@ async fn wasm_vmm_routes_native_exits_and_stops_with_the_box() {
     .expect("PIO completion");
     assert_matches!(pio, Completion::PioZero);
 
-    let msr = tokio::task::block_in_place(|| {
-        vcpu.exchange(Exit::Rdmsr(terra_runtime::component::vmm::platform::Msr {
-            index: 0x10,
-            value: 0,
-        }))
-    })
-    .expect("MSR completion");
-    assert_matches!(msr, Completion::Rdmsr(0));
-
-    let unsupported_msr = tokio::task::block_in_place(|| {
-        vcpu.exchange(Exit::Rdmsr(terra_runtime::component::vmm::platform::Msr {
-            index: u32::MAX,
-            value: 0,
-        }))
-    })
-    .expect("unsupported MSR completion");
-    assert_matches!(unsupported_msr, Completion::MsrFault);
-
     memory.close().expect("memory close");
     let shutdown_started = std::time::Instant::now();
     let stopped = tokio::task::block_in_place(|| vcpu.exchange(Exit::Shutdown));

@@ -556,6 +556,11 @@ fn translate_x86(
         }
     }
     let Some(X86OperandType::Reg(destination)) = operand(0) else {
+        if id == X86_INS_MOV as u32
+            && let Some(X86OperandType::Imm(value)) = operand(1)
+        {
+            decoded.reference = Some(Reference::Value(value as u64));
+        }
         return;
     };
     if let (Some((dst, shift, width)), Some(X86OperandType::Imm(value)), None) =

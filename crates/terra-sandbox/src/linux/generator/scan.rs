@@ -11,6 +11,9 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::rc::Rc;
 
+/// What each (function, register) receives from its callers; `None` marks a resolution in progress.
+type CallerValues = HashMap<(usize, Reg), Option<BTreeSet<Value>>>;
+
 /// The most problems listed before the rest are summarized.
 const MAX_REPORTED_PROBLEMS: usize = 40;
 
@@ -52,10 +55,13 @@ fn scan_image(image: &Image) -> Result<RoleScan> {
             if number != ioctl {
                 continue;
             }
-            let mut seen = HashSet::new();
-            for request in
-                program.resolve(function, index, architecture.second_argument(), &mut seen)?
-            {
+            let mut callers = CallerValues::new();
+            for request in program.resolve(
+                function,
+                index,
+                architecture.second_argument(),
+                &mut callers,
+            )? {
                 match request {
                     Value::Constant(request) => {
                         ioctls.insert(request & 0xffff_ffff);
@@ -431,7 +437,7 @@ impl<'a> Program<'a> {
 
     fn syscall_numbers(&self, function: usize, index: usize) -> Result<BTreeSet<Value>> {
         let architecture = self.image.architecture;
-        let mut seen = HashSet::new();
+        let mut callers = CallerValues::new();
         // musl's do_setxid runs on every thread with the number __setxid stored in a struct, so
         // the number is __setxid's first argument, provided __setxid alone hands do_setxid out.
         if self.image.functions[function].name == "do_setxid"
@@ -450,9 +456,9 @@ impl<'a> Program<'a> {
                     "do_setxid's address reaches code other than __setxid".into(),
                 )]));
             }
-            return self.resolve_from_callers(setxid, architecture.arguments()[0], &mut seen);
+            return self.resolve_from_callers(setxid, architecture.arguments()[0], &mut callers);
         }
-        self.resolve(function, index, architecture.syscall_number(), &mut seen)
+        self.resolve(function, index, architecture.syscall_number(), &mut callers)
     }
 
     /// The values `reg` holds before `index`, following incoming arguments into every caller.
@@ -461,7 +467,7 @@ impl<'a> Program<'a> {
         function: usize,
         index: usize,
         reg: Reg,
-        seen: &mut HashSet<(usize, Reg)>,
+        callers: &mut CallerValues,
     ) -> Result<BTreeSet<Value>> {
         let flow = self.flow(function)?;
         let mut resolved = BTreeSet::new();
@@ -477,7 +483,7 @@ impl<'a> Program<'a> {
                 )));
                 continue;
             }
-            let from_callers = self.resolve_from_callers(function, argument, seen)?;
+            let from_callers = self.resolve_from_callers(function, argument, callers)?;
             resolved.extend(from_callers.into_iter().map(|value| {
                 match value {
                     Value::Constant(value) => Value::Constant(
@@ -496,12 +502,20 @@ impl<'a> Program<'a> {
         &self,
         function: usize,
         argument: Reg,
-        seen: &mut HashSet<(usize, Reg)>,
+        resolved_callers: &mut CallerValues,
     ) -> Result<BTreeSet<Value>> {
-        let mut resolved = BTreeSet::new();
-        if !seen.insert((function, argument)) {
-            return Ok(resolved);
+        match resolved_callers.get(&(function, argument)) {
+            Some(Some(resolved)) => return Ok(resolved.clone()),
+            Some(None) => {
+                return Ok(BTreeSet::from([Value::Unknown(format!(
+                    "{} receives register {argument} back through its own callers",
+                    self.image.functions[function].name
+                ))]));
+            }
+            None => {}
         }
+        resolved_callers.insert((function, argument), None);
+        let mut resolved = BTreeSet::new();
         let callers = self.callers_of(function)?;
         resolved.extend(callers.problems.iter().cloned().map(Value::Unknown));
         if callers.sites.is_empty() && callers.problems.is_empty() {
@@ -511,8 +525,9 @@ impl<'a> Program<'a> {
             )));
         }
         for &(caller, site) in &callers.sites {
-            resolved.extend(self.resolve(caller, site, argument, seen)?);
+            resolved.extend(self.resolve(caller, site, argument, resolved_callers)?);
         }
+        resolved_callers.insert((function, argument), Some(resolved.clone()));
         Ok(resolved)
     }
 
@@ -695,6 +710,40 @@ mod tests {
         Ok(())
     }
 
+    /// Two paths reach one caller with different transforms; a caller resolved once must give
+    /// its values to the second path too, or that path's number is silently dropped.
+    #[test]
+    fn numbers_resolve_through_every_path_to_a_shared_caller() -> Result<()> {
+        // mov rax, rdi; syscall; ret
+        let wrapper = [vec![0x48, 0x89, 0xf8], SYSCALL.to_vec(), vec![RET]].concat();
+        // call wrapper; ret
+        let unchanged = [call(0x2000, 0x1000), vec![RET]].concat();
+        // add edi, 1; call wrapper; ret
+        let incremented = [vec![0x83, 0xc7, 0x01], call(0x3003, 0x1000), vec![RET]].concat();
+        // mov ebx, edi; call unchanged; mov edi, ebx; call incremented; ret
+        let shared = [
+            vec![0x89, 0xfb],
+            call(0x4002, 0x2000),
+            vec![0x89, 0xdf],
+            call(0x4009, 0x3000),
+            vec![RET],
+        ]
+        .concat();
+        // mov edi, 200; call shared; ret
+        let mut entry = vec![0xbf];
+        entry.extend(200_u32.to_le_bytes());
+        let entry = [entry, call(0x5005, 0x4000), vec![RET]].concat();
+        let scanned = x86(&[
+            ("syscall", 0x1000, wrapper),
+            ("unchanged", 0x2000, unchanged),
+            ("incremented", 0x3000, incremented),
+            ("shared", 0x4000, shared),
+            ("entry", 0x5000, entry),
+        ])?;
+        assert_eq!(scanned.syscalls, BTreeSet::from([200, 201]));
+        Ok(())
+    }
+
     #[test]
     fn ioctl_requests_resolve() -> Result<()> {
         // mov esi, 0x5413; syscall(ioctl)
@@ -717,6 +766,29 @@ mod tests {
         // A wrapper nobody calls directly may be called with any number.
         let wrapper = [vec![0x48, 0x89, 0xf8], SYSCALL.to_vec(), vec![RET]].concat();
         assert!(x86(&[("syscall", 0x1000, wrapper)]).is_err());
+    }
+
+    /// A wrapper whose address is stored straight into memory can be called through that slot
+    /// with any number, so its direct callers no longer vouch for it.
+    #[test]
+    fn function_addresses_stored_as_immediates_escape() {
+        let wrapper = [vec![0x48, 0x89, 0xf8], SYSCALL.to_vec(), vec![RET]].concat();
+        let mut caller = vec![0xbf];
+        caller.extend(39_u32.to_le_bytes());
+        let caller = [caller, call(0x2005, 0x1000), vec![RET]].concat();
+        let functions = |stash: Vec<u8>| {
+            x86(&[
+                ("syscall", 0x1000, wrapper.clone()),
+                ("caller", 0x2000, caller.clone()),
+                ("stash", 0x3000, stash),
+            ])
+        };
+        // mov qword ptr [rip + 0x100], 0x2001 (inside caller, not a function start); ret
+        let harmless = [0x48, 0xc7, 0x05, 0, 1, 0, 0, 1, 0x20, 0, 0, RET].to_vec();
+        assert_eq!(functions(harmless).unwrap().syscalls, BTreeSet::from([39]));
+        // mov qword ptr [rip + 0x100], 0x1000; ret
+        let escaping = [0x48, 0xc7, 0x05, 0, 1, 0, 0, 0, 0x10, 0, 0, RET].to_vec();
+        assert!(functions(escaping).is_err());
     }
 
     /// Syscall bytes outside every function would be code the analysis never read.

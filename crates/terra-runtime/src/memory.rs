@@ -139,8 +139,8 @@ impl<'a> BoundedMemory<'a> {
 }
 
 const PAGE_BYTES: u64 = 4096;
-const MAX_RANGES: usize = 32;
-const MAX_DISCARD_BYTES: u64 = 128 << 20;
+const MAX_RANGES: usize = terra_limits::MAX_RECLAIM_REPORT_RANGES;
+const MAX_DISCARD_BYTES: u64 = terra_limits::MAX_RECLAIM_REPORT_BYTES;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReclaimRange {

@@ -32,7 +32,8 @@ pub fn reopen_file_with_delete_sharing(file: &File, access: FileAccess) -> std::
 
 /// `directory` reopened without delete sharing, so nobody can rename it while the handle lives:
 /// a metadata handle shares delete, and a guest could otherwise swap a junction in under the
-/// path built from it.
+/// path built from it. The pin needs data access: Windows skips share-mode checks for a handle
+/// holding only `FILE_READ_ATTRIBUTES`.
 fn pin_directory(directory: &File) -> std::io::Result<File> {
     use windows_sys::Win32::Foundation::GENERIC_READ;
     use windows_sys::Win32::Storage::FileSystem::{

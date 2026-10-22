@@ -194,9 +194,9 @@ packaged kernel and boot images carry ABI markers checked before boot.
   trip); `sendto` then returns once the datagram is queued. Denied or failed sends
   come back as UdpError, which sets the socket's asynchronous error and, with
   `IP_RECVERR`, an error-queue entry. `connect` is guest-local filtering. The
-  broker accepts inbound datagrams only from the 16 most recent peers the socket
+  broker accepts inbound datagrams only from the 128 most recent peers the socket
   sent to within 60 seconds. Frontend and broker exchange ordered batches of up to
-  32 datagrams per IPC frame (broker protocol 1).
+  64 datagrams per IPC frame (broker protocol 1).
 - **QUIC compatibility:** external UDP accepts the options QUIC stacks set, as
   documented no-ops where the host cannot honor them: DF/MTU discovery
   (`IP_MTU_DISCOVER`, `IPV6_DONTFRAG`), ECN (`IP_RECVTOS`, `IP_TOS` and their IPv6
@@ -223,16 +223,15 @@ Queued-payload budgets per stream:
 | --- | ---: | ---: |
 | Agent | 64 KiB | 256 KiB |
 | Control | 32 KiB | 128 KiB |
-| Each TCP/UDP/publication stream | 48 KiB | 80 KiB |
+| Each TCP/UDP/publication stream | 64 KiB | 80 KiB |
 
-The 1024 flows' allowances total 128 MiB inside the frontend's 216-MiB Wasm
+The 1024 flows' allowances total 144 MiB inside the frontend's 216-MiB Wasm
 memory floor, which applies whatever `components.memory_mib` says.
 Local-only boxes use the ordinary component limit. Guest UDP sockets keep a 64-KiB carrier window and a decoded queue
-of at most 48 datagrams. The broker allows 64 MiB of buffered bytes and 2048
-resources. Idle reads, accepts and terminal-error waits have a separate bounded
-allowance; active requests retain 240 slots and DNS retains 16. Frame queues
-remain bounded to 512 entries. The broker raises its open-file soft limit to
-fit its resource allowance. These are admission bounds,
+of at most 48 datagrams. VM process and broker share one yamux connection, which
+grants each stream a 256 KiB receive window, so 1024 flows can queue about 256 MiB
+in each direction. The broker admits 2048 resources and 16 DNS lookups at once,
+and raises its open-file soft limit to fit them. These are admission bounds,
 not resident-memory measurements.
 
 ## Boot readiness and failures
@@ -344,8 +343,9 @@ still requires running it on the affected host.
 Root and volume images are prebaked ext4 files. Creating a box decompresses
 and sizes those images; the guest grows the filesystems. Runtime hosts need no
 filesystem formatting tools or image downloads. The kernel and boot disk are
-embedded in `terra` and decompressed directly into memory on each boot. The
-read-only boot filesystem has no journal.
+embedded in `terra` as chunked LZ4 containers: each boot decodes the kernel into
+guest memory, while the boot disk stays packed and the block device decodes only
+the chunks a read touches. The read-only boot filesystem has no journal.
 Each boot selects the payloads bundled with the binary starting the box, so
 upgrading Terra and stopping/starting an existing box updates its kernel and
 boot disk without rebuilding its root filesystem.

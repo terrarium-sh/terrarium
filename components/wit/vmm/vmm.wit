@@ -3,7 +3,6 @@ package terra:vmm@0.1.0;
 interface platform {
     record pio-read { port: u16, length: u32 }
     record pio-write { port: u16, length: u32 }
-    record msr { index: u32, value: u64 }
 
     variant exit {
         halt,
@@ -11,8 +10,6 @@ interface platform {
         interrupted,
         pio-read(pio-read),
         pio-write(pio-write),
-        rdmsr(msr),
-        wrmsr(msr),
         stopped,
     }
 
@@ -20,9 +17,6 @@ interface platform {
         start,
         reenter,
         pio-zero,
-        rdmsr(u64),
-        msr-fault,
-        wrmsr,
     }
 
     enum error { unavailable, bad-exit, cancelled }

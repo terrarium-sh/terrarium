@@ -639,6 +639,7 @@ async fn wasm_filesystem_component_enforces_readonly_grant() {
     create[4..8].copy_from_slice(&0o644_u32.to_le_bytes());
     create.extend_from_slice(b"denied\0");
     let file = submit(&channel, &memory, 1, &request(1, 2, 1, b"file\0")).await;
+    assert_eq!(reply_error(&file), 0);
     let file = u64::from_le_bytes(file[16..24].try_into().expect("file node"));
     let mut mkdir = vec![0; 8];
     mkdir[..4].copy_from_slice(&0o755_u32.to_le_bytes());

@@ -46,12 +46,6 @@ fn native_exit(exit: vm::VcpuExit) -> Option<Exit> {
         vm::VcpuExit::PioWrite(vm::PioWrite { port, length }) => {
             Some(Exit::PioWrite(platform::PioWrite { port, length }))
         }
-        vm::VcpuExit::Rdmsr(vm::Msr { index, value }) => {
-            Some(Exit::Rdmsr(platform::Msr { index, value }))
-        }
-        vm::VcpuExit::Wrmsr(vm::Msr { index, value }) => {
-            Some(Exit::Wrmsr(platform::Msr { index, value }))
-        }
         vm::VcpuExit::MmioRead(_)
         | vm::VcpuExit::MmioWrite(_)
         | vm::VcpuExit::IoApicAccess(_)
@@ -65,9 +59,6 @@ fn native_action(action: Completion) -> vm::VcpuAction {
         Completion::Start => vm::VcpuAction::Start,
         Completion::Reenter => vm::VcpuAction::Reenter,
         Completion::PioZero => vm::VcpuAction::PioZero,
-        Completion::Rdmsr(value) => vm::VcpuAction::Rdmsr(value),
-        Completion::MsrFault => vm::VcpuAction::MsrFault,
-        Completion::Wrmsr => vm::VcpuAction::Wrmsr,
     }
 }
 
@@ -117,14 +108,12 @@ pub(super) fn vcpu_channel() -> (NativeVcpu, Vcpu) {
     )
 }
 
-fn accepts_completion(exit: &Exit, completion: &Completion) -> bool {
+fn accepts_completion(exit: &Exit, completion: Completion) -> bool {
     match exit {
         Exit::Halt | Exit::Interrupted | Exit::PioWrite(_) => {
             matches!(completion, Completion::Reenter)
         }
         Exit::PioRead(_) => matches!(completion, Completion::PioZero),
-        Exit::Rdmsr(_) => matches!(completion, Completion::Rdmsr(_) | Completion::MsrFault),
-        Exit::Wrmsr(_) => matches!(completion, Completion::Wrmsr | Completion::MsrFault),
         Exit::Shutdown | Exit::Stopped => false,
     }
 }
@@ -153,7 +142,7 @@ impl<T: Send + 'static> platform::HostVcpuWithStore<T> for Platform {
         })?;
         match rendezvous.state {
             VcpuState::AwaitingCompletion(pending) => {
-                let valid = accepts_completion(&pending.exit, &completion);
+                let valid = accepts_completion(&pending.exit, completion);
                 if !valid {
                     return Ok(Err(Error::BadExit));
                 }
@@ -335,26 +324,6 @@ mod tests {
                     length: 4,
                 }),
             ),
-            (
-                vm::VcpuExit::Rdmsr(vm::Msr {
-                    index: 0x1234,
-                    value: 0x5678,
-                }),
-                Exit::Rdmsr(platform::Msr {
-                    index: 0x1234,
-                    value: 0x5678,
-                }),
-            ),
-            (
-                vm::VcpuExit::Wrmsr(vm::Msr {
-                    index: 0x2345,
-                    value: 0x6789,
-                }),
-                Exit::Wrmsr(platform::Msr {
-                    index: 0x2345,
-                    value: 0x6789,
-                }),
-            ),
             (vm::VcpuExit::Stopped, Exit::Stopped),
         ];
         for (input, expected) in cases {
@@ -393,9 +362,6 @@ mod tests {
             (Completion::Start, vm::VcpuAction::Start),
             (Completion::Reenter, vm::VcpuAction::Reenter),
             (Completion::PioZero, vm::VcpuAction::PioZero),
-            (Completion::Rdmsr(0x2345), vm::VcpuAction::Rdmsr(0x2345)),
-            (Completion::MsrFault, vm::VcpuAction::MsrFault),
-            (Completion::Wrmsr, vm::VcpuAction::Wrmsr),
         ];
         for (input, expected) in cases {
             assert_eq!(native_action(input), expected);
@@ -529,12 +495,12 @@ mod tests {
 
     #[test]
     fn rendezvous_rejects_completions_for_another_exit() {
-        assert!(accepts_completion(&Exit::Halt, &Completion::Reenter));
-        assert!(!accepts_completion(&Exit::Halt, &Completion::PioZero));
+        assert!(accepts_completion(&Exit::Halt, Completion::Reenter));
+        assert!(!accepts_completion(&Exit::Halt, Completion::PioZero));
         assert!(!accepts_completion(
             &Exit::PioRead(platform::PioRead { port: 0, length: 1 }),
-            &Completion::Reenter
+            Completion::Reenter
         ));
-        assert!(!accepts_completion(&Exit::Shutdown, &Completion::Reenter));
+        assert!(!accepts_completion(&Exit::Shutdown, Completion::Reenter));
     }
 }

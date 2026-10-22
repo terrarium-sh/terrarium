@@ -8,6 +8,7 @@ mod agent_component;
 mod agent_stream;
 mod agent_worker;
 mod all_device_lifecycle;
+mod block_component;
 mod component_grants;
 mod component_imports;
 mod component_streams;

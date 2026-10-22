@@ -4,7 +4,7 @@ use tokio::io::{AsyncRead, AsyncWrite, BufStream};
 use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
 use yamux::{Config, Connection, Mode};
 
-const YAMUX_STREAM_WINDOW_BYTES: usize = 256 << 10;
+pub const YAMUX_STREAM_WINDOW_BYTES: usize = 256 << 10;
 const CHANNEL_READ_BUFFER_BYTES: usize = 256 << 10;
 const CHANNEL_WRITE_BUFFER_BYTES: usize = 64 << 10;
 

@@ -376,6 +376,7 @@ impl Block {
         let Some(status_addr) = status_tail(&chain) else {
             return Err(DeviceError::BadLen);
         };
+        terra::host::memory::read(status_addr, 1).map_err(|_| DeviceError::BadLen)?;
         let Ok((req_type, sector)) = request_type(&chain[0]) else {
             return ioerr_completion(status_addr, epoch);
         };
@@ -397,7 +398,6 @@ impl Block {
                 len: u64::from(desc.len),
             });
         }
-        terra::host::memory::read(status_addr, 1).map_err(|_| DeviceError::BadLen)?;
         let status = Self::execute(req_type, sector, data, total, status_addr, epoch).await;
         if !is_current(epoch) {
             return Err(DeviceError::NotReady);
@@ -475,9 +475,14 @@ async fn process_pending() -> Result<bool, DeviceError> {
         Err(DeviceError::NotReady) => return Ok(false),
         Err(error) => return Err(error),
     };
-    let (available, head) = read_split_ring_available(avail, size, &mut next, |address, len| {
-        terra::host::memory::read(address, len).map_err(|_| DeviceError::BadLen)
-    })?;
+    // An unaddressable ring cannot be served; wait for reset or another doorbell, as mem does.
+    let Ok((available, head)) =
+        read_split_ring_available(avail, size, &mut next, |address, len| {
+            terra::host::memory::read(address, len).map_err(|_| DeviceError::BadLen)
+        })
+    else {
+        return Ok(false);
+    };
     let Some(head) = head else {
         if !is_current(epoch) {
             return Ok(false);
@@ -497,7 +502,7 @@ async fn process_pending() -> Result<bool, DeviceError> {
     if !is_current(epoch) {
         return Ok(false);
     }
-    complete_split_ring_entry(
+    if complete_split_ring_entry(
         used,
         size,
         head,
@@ -506,7 +511,11 @@ async fn process_pending() -> Result<bool, DeviceError> {
         |address, bytes| {
             terra::host::memory::write(address, bytes).map_err(|_| DeviceError::BadLen)
         },
-    )?;
+    )
+    .is_err()
+    {
+        return Ok(false);
+    }
     next = next.wrapping_add(1);
     match transport(|state| {
         if !is_current(epoch) {

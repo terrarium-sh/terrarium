@@ -16,6 +16,7 @@ use wasmtime_wasi::{WasiCtxView, WasiView};
 mod agent;
 mod boot;
 mod filesystem;
+pub use filesystem::FuzzShare;
 pub(crate) mod network;
 mod network_stream;
 pub mod virtio;

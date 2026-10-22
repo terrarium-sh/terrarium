@@ -21,7 +21,7 @@ terra-agent-component = { path = "../components/agent", features = ["fuzzing"] }
 terra-vsock-device = { path = "../components/vsock-device", features = ["fuzzing"] }
 terra-vsock-frontend-component = { path = "../components/vsock-frontend", features = ["fuzzing"] }
 terra-fs-component = { path = "../components/fs" }
-wasmtime = { version = "=50.0.0", default-features = false, features = ["std"] }
+wasmtime = { version = "=50.0.0", default-features = false, features = ["std", "cranelift"] }
 
 [[bin]]
 name = "network_policy"
@@ -87,6 +87,13 @@ panic = "deny"
 [[bin]]
 name = "vsock_packets"
 path = "fuzz_targets/vsock_packets.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "share_operations"
+path = "fuzz_targets/share_operations.rs"
 test = false
 doc = false
 bench = false

@@ -10,6 +10,7 @@ mod server;
 mod sockets;
 
 pub use client::{Client, TcpDownload, TcpFlow, TcpUpload, UdpFlow};
+pub use mux::YAMUX_STREAM_WINDOW_BYTES;
 pub use server::{Broker, bind_listeners, embeds_ipv4};
 pub use sockets::{OutboundSockets, SocketSource};
 

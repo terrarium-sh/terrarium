@@ -73,12 +73,6 @@ pub struct PioWrite {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Msr {
-    pub index: u32,
-    pub value: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IoApicAccess {
     pub offset: u8,
     pub width: u8,
@@ -95,8 +89,6 @@ pub enum VcpuExit {
     MmioWrite(MmioWrite),
     PioRead(PioRead),
     PioWrite(PioWrite),
-    Rdmsr(Msr),
-    Wrmsr(Msr),
     IoApicAccess(IoApicAccess),
     IoApicEoi(u8),
     Stopped,
@@ -108,9 +100,6 @@ pub enum VcpuAction {
     Reenter,
     MmioRead(u64),
     PioZero,
-    Rdmsr(u64),
-    MsrFault,
-    Wrmsr,
     IoApicValue(u32),
 }
 

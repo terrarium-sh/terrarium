@@ -571,6 +571,7 @@ name = "terra-mem-component"
 version = "0.1.0"
 dependencies = [
  "terra-device-transport",
+ "terra-limits",
  "wit-bindgen",
 ]
 

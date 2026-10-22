@@ -41,9 +41,11 @@ libc.workspace = true
 rustix.workspace = true
 tempfile.workspace = true
 sha2 = { version = "0.11", default-features = false }
-tracing-appender = "0.2"
 log = "0.4.34"
-tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "registry", "tracing-log", "std"] }
+# wasmtime-wasi reports through tracing; forward its events to the box log.
+tracing = { version = "0.1", default-features = false, features = ["log"] }
+humantime = { version = "2.4.0", default-features = false }
+env_filter = { version = "2.0.0", default-features = false }
 
 
 [target.'cfg(windows)'.dependencies]

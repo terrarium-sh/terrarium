@@ -27,14 +27,13 @@ struct Share {
 
 impl Share {
     async fn mount(
-        artifacts: &TrustedArtifacts,
+        component: &wasmtime::component::Component,
         engine: &Engine,
         directory: &Path,
         access: AccessMode,
     ) -> Result<Self> {
         let ram = GuestRam::new(64 * 1024)
             .ok_or_else(|| wasmtime::Error::msg("filesystem device suite RAM allocation"))?;
-        let component = artifacts.fs.deserialize(engine)?;
         let grant = ShareGrant::new(&directory.canonicalize()?, access);
         let grant = grant.map_err(|error| {
             wasmtime::Error::from(error).context(format!(
@@ -48,7 +47,7 @@ impl Share {
         let channel = crate::component::fs::register_device(
             &mut runtime,
             host,
-            &component,
+            component,
             "device_suite",
             128,
             Arc::new(|_| Ok(())),
@@ -78,6 +77,16 @@ impl Share {
         body: &[u8],
         expected_error: i32,
     ) -> Result<Vec<u8>> {
+        let reply = self.send(opcode, node, body).await?;
+        let error = i32::from_le_bytes(reply[4..8].try_into()?);
+        ensure!(
+            error == expected_error,
+            "filesystem opcode {opcode}: expected {expected_error}, got {error}"
+        );
+        Ok(reply)
+    }
+
+    async fn send(&mut self, opcode: u32, node: u64, body: &[u8]) -> Result<Vec<u8>> {
         let unique = u64::from(self.index) + 1;
         let mut request = vec![0; 40];
         request[..4].copy_from_slice(&u32::try_from(40 + body.len())?.to_le_bytes());
@@ -109,18 +118,49 @@ impl Share {
             "filesystem reply length"
         );
         let reply = read_memory(&self.ram, OUTPUT, u64::from(length))?;
-        let error = i32::from_le_bytes(reply[4..8].try_into()?);
         ensure!(read_u64(&reply, 8)? == unique, "filesystem reply identity");
-        ensure!(
-            error == expected_error,
-            "filesystem opcode {opcode}: expected {expected_error}, got {error}"
-        );
         Ok(reply)
     }
 
     async fn close(self) -> Result<()> {
         self.channel.close()?;
         self.runtime.join().await
+    }
+}
+
+/// A writable share mounted through the filesystem component, for fuzzing guest request sequences.
+pub struct FuzzShare {
+    share: Share,
+    runtime: tokio::runtime::Runtime,
+}
+
+impl FuzzShare {
+    /// Mounts `directory` through `component`, which the caller compiled for `engine`.
+    pub fn mount(
+        engine: &Engine,
+        component: &wasmtime::component::Component,
+        directory: &Path,
+    ) -> Result<Self> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()?;
+        let share = runtime.block_on(Share::mount(
+            component,
+            engine,
+            directory,
+            AccessMode::ReadWrite,
+        ))?;
+        Ok(Self { share, runtime })
+    }
+
+    /// The device's reply to one FUSE request, whatever its error.
+    pub fn request(&mut self, opcode: u32, node: u64, body: &[u8]) -> Result<Vec<u8>> {
+        self.runtime.block_on(self.share.send(opcode, node, body))
+    }
+
+    pub fn close(self) -> Result<()> {
+        self.runtime.block_on(self.share.close())
     }
 }
 
@@ -221,7 +261,8 @@ async fn run_writable(
     engine: &Engine,
     directory: &Path,
 ) -> Result<()> {
-    let mut share = Share::mount(artifacts, engine, directory, AccessMode::ReadWrite)
+    let component = artifacts.fs.deserialize(engine)?;
+    let mut share = Share::mount(&component, engine, directory, AccessMode::ReadWrite)
         .await
         .context("mounting writable filesystem share")?;
     let (node, handle) = exercise_file_io(&mut share, directory).await?;
@@ -351,7 +392,8 @@ async fn run_readonly(
     engine: &Engine,
     directory: &Path,
 ) -> Result<()> {
-    let mut share = Share::mount(artifacts, engine, directory, AccessMode::ReadOnly).await?;
+    let component = artifacts.fs.deserialize(engine)?;
+    let mut share = Share::mount(&component, engine, directory, AccessMode::ReadOnly).await?;
     let looked_up = share.request(1, 1, b"file\0", 0).await?;
     let node = read_u64(&looked_up, 16)?;
     let opened = share.request(14, node, &0_u32.to_le_bytes(), 0).await?;

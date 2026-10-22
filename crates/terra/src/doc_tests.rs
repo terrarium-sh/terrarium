@@ -132,3 +132,51 @@ fn security_docs_quote_the_enforced_bounds() {
         );
     }
 }
+
+/// The dev guide's network bounds tell a host operator how much memory a guest can make terra
+/// queue; a changed constant fails here until README.dev.md says the same.
+#[test]
+fn dev_guide_quotes_the_enforced_network_bounds() {
+    use terra_protocol::vsock::{
+        FLOW_REPLY_BYTES, FLOW_UPSTREAM_BYTES, MAX_FLOW_REPLY_BYTES, MAX_FLOW_UPSTREAM_BYTES,
+        MAX_NETWORK_SOCKETS,
+    };
+    let guide = read_repo_text("README.dev.md")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let quotes = [
+        format!(
+            "inbound datagrams only from the {} most recent peers the socket sent to within {} seconds",
+            terra_network::MAX_UDP_OUTBOUND_PEERS,
+            terra_protocol::network::UDP_PEER_TTL_SECS,
+        ),
+        format!(
+            "ordered batches of up to {} datagrams per IPC frame",
+            terra_protocol::network::MAX_NETWORK_DATAGRAMS
+        ),
+        format!(
+            "| Each TCP/UDP/publication stream | {} KiB | {} KiB |",
+            FLOW_UPSTREAM_BYTES >> 10,
+            FLOW_REPLY_BYTES >> 10
+        ),
+        format!(
+            "The {MAX_NETWORK_SOCKETS} flows' allowances total {} MiB inside the frontend's {}-MiB Wasm memory floor",
+            (MAX_FLOW_UPSTREAM_BYTES + MAX_FLOW_REPLY_BYTES) >> 20,
+            terra_runtime::box_runtime::NETWORK_FRONTEND_MEMORY_BYTES >> 20,
+        ),
+        format!(
+            "grants each stream a {} KiB receive window, so {MAX_NETWORK_SOCKETS} flows can queue about {} MiB in each direction",
+            terra_network::YAMUX_STREAM_WINDOW_BYTES >> 10,
+            (terra_network::YAMUX_STREAM_WINDOW_BYTES * MAX_NETWORK_SOCKETS) >> 20,
+        ),
+        format!(
+            "The broker admits {} resources and {} DNS lookups at once",
+            terra_network::MAX_RESOURCES,
+            terra_network::MAX_DNS_REQUESTS
+        ),
+    ];
+    for quote in quotes {
+        assert!(guide.contains(&quote), "README.dev.md must say: {quote}");
+    }
+}

@@ -247,6 +247,7 @@ jobs:
           cargo +"$NIGHTLY_TOOLCHAIN" fuzz run network_application -- -max_total_time=60 -max_len=65536 || status=1
           cargo +"$NIGHTLY_TOOLCHAIN" fuzz run vsock_packets -- -max_total_time=60 -max_len=131072 || status=1
           cargo +"$NIGHTLY_TOOLCHAIN" fuzz run protocol_frames -- -max_total_time=60 -max_len=4096 || status=1
+          cargo +"$NIGHTLY_TOOLCHAIN" fuzz run share_operations -- -max_total_time=60 -max_len=4096 || status=1
           exit "$status"
       - name: Reclaim fuzz build space
         if: ${{ !cancelled() }}

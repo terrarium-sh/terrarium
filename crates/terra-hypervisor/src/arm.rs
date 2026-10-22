@@ -89,9 +89,6 @@ impl ArmMmioAccess {
             | VcpuAction::Reenter
             | VcpuAction::MmioRead(_)
             | VcpuAction::PioZero
-            | VcpuAction::Rdmsr(_)
-            | VcpuAction::MsrFault
-            | VcpuAction::Wrmsr
             | VcpuAction::IoApicValue(_) => {
                 Err(format!("unexpected ARM MMIO completion {action:?}"))
             }
