@@ -8,5 +8,7 @@ workload:
   args:
     - "-c"
     - |
-      wget -q -T 10 -O /dev/null https://www.example.com/ && echo SUB_OK       || echo SUB_FAIL
-      wget -q -T 10 -O /dev/null https://example.com/     && echo APEX_REACHED || echo APEX_BLOCKED
+      # Any HTTP answer, even a CDN's 503, proves the policy let the name through.
+      reach() { err=$(wget -q -T 10 -O /dev/null "$1" 2>&1) || { echo "$err"; case $err in *"server returned error"*) ;; *) return 1 ;; esac; }; }
+      reach https://www.example.com/ && echo SUB_OK       || echo SUB_FAIL
+      reach https://example.com/     && echo APEX_REACHED || echo APEX_BLOCKED
