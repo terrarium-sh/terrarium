@@ -25,7 +25,6 @@ pub mod image;
 mod resources;
 
 use self::boot::BootSpec;
-use crate::config;
 use crate::policy::network;
 use crate::render::{format_workload_line, redact_config_env, render_config_yaml};
 #[cfg(not(any(
@@ -93,23 +92,30 @@ pub(crate) fn encode_boot_plan(spec: &BootSpec, box_name: &str) -> Result<Vec<u8
     .context("boot plan exceeds its encoded size limit; reduce the recipe or environment")
 }
 
+pub(crate) fn rootfs_access(spec: &BootSpec) -> terra_runtime::component::AccessMode {
+    use terra_runtime::component::AccessMode;
+    if spec.mode == PlanMode::Run && spec.cfg.hw.rootfs_readonly {
+        AccessMode::ReadOnly
+    } else {
+        AccessMode::ReadWrite
+    }
+}
+
 /// The resolved config the agent runs as PID 1.
 fn build_plan(spec: &BootSpec, box_name: &str) -> Result<Plan> {
     let cfg = &spec.cfg;
-    let baking = spec.mode == PlanMode::Create;
-    let shares = if baking {
-        Vec::new()
-    } else {
-        cfg.mounts
-            .iter()
-            .enumerate()
-            .map(|(index, mount)| Share {
-                tag: terra_runtime::component::fs::share_tag(index),
-                guest: mount.guest.to_string_lossy().into_owned(),
-                readonly: mount.readonly,
-            })
-            .collect()
-    };
+    let is_setup_boot = spec.mode == PlanMode::Create;
+    let is_root = spec.root || is_setup_boot;
+    let shares = cfg
+        .mounts
+        .iter()
+        .enumerate()
+        .map(|(index, mount)| Share {
+            tag: terra_runtime::component::fs::share_tag(index),
+            guest: mount.guest.to_string_lossy().into_owned(),
+            readonly: mount.readonly,
+        })
+        .collect();
     let volumes = cfg
         .volumes
         .iter()
@@ -123,7 +129,7 @@ fn build_plan(spec: &BootSpec, box_name: &str) -> Result<Plan> {
             })
         })
         .collect::<Result<_>>()?;
-    let published_mappings = if baking {
+    let published_mappings = if is_setup_boot {
         Vec::new()
     } else {
         network::rules::parse_port_mappings(&cfg.network.ports)?
@@ -157,7 +163,8 @@ fn build_plan(spec: &BootSpec, box_name: &str) -> Result<Plan> {
         published_ports,
         published_udp_ports,
         env: cfg.env.clone(),
-        root: spec.root || baking,
+        root: is_root,
+        rootfs_readonly: rootfs_access(spec) == terra_runtime::component::AccessMode::ReadOnly,
         sudo: cfg.sudo.clone(),
         on_create: cfg.hooks.on_create.clone(),
         on_start: cfg.hooks.on_start.clone(),
@@ -167,7 +174,7 @@ fn build_plan(spec: &BootSpec, box_name: &str) -> Result<Plan> {
         workload: std::iter::once(cfg.workload.entrypoint.to_string_lossy().into_owned())
             .chain(cfg.workload.args.iter().cloned())
             .collect(),
-        sandbox_info: generate_sandbox_info(cfg, spec.root),
+        sandbox_info: generate_sandbox_info(spec),
         host_tz: read_host_timezone(),
         host_time: None,
         host_seed: None,
@@ -179,9 +186,10 @@ fn build_plan(spec: &BootSpec, box_name: &str) -> Result<Plan> {
 /// What the agent writes to `/terra/README.md`, so an AI agent looking
 /// around the box finds an explanation instead of guessing.
 #[must_use]
-fn generate_sandbox_info(cfg: &config::Config, root: bool) -> String {
+fn generate_sandbox_info(spec: &BootSpec) -> String {
+    let cfg = &spec.cfg;
     let yaml = render_config_yaml(&redact_config_env(cfg)).unwrap_or_default();
-    let who = if root {
+    let who = if spec.root || spec.mode == PlanMode::Create {
         "`root`".to_string()
     } else {
         format!("`{WORKLOAD_USER_NAME}` (uid {WORKLOAD_ID}, non-root)")
@@ -189,6 +197,26 @@ fn generate_sandbox_info(cfg: &config::Config, root: bool) -> String {
     format!(
         include_str!("sandbox_readme.md"),
         who = who,
+        rootfs = if rootfs_access(spec) == terra_runtime::component::AccessMode::ReadOnly {
+            "The root filesystem is READ-ONLY: every write to it fails with EROFS, as \
+             root too. `/tmp`, `/var/tmp` and `/run` are in-memory and reset on every \
+             boot; only the `mounts` and `lifetime: box` volumes below keep data."
+        } else {
+            "The root filesystem is a private disk image. It PERSISTS across restarts of \
+             this sandbox; rebuilding or removing the box clears it. Its size is capped, \
+             so it can fill up: writes past the cap fail with ENOSPC."
+        },
+        shares = match spec.mode {
+            PlanMode::Create => {
+                "This is setup's VM: the `mounts` below are not attached and the \
+                 `volumes` are not mounted until the box starts, so writes to their \
+                 guest paths land in the root filesystem."
+            }
+            PlanMode::Run => {
+                "Only the `mounts` listed below are shared with the host. Everything \
+                 else you write stays inside the sandbox."
+            }
+        },
         cmd = format_workload_line(cfg),
         yaml = yaml,
         egress = network::describe(&cfg.network),
@@ -203,9 +231,22 @@ fn generate_sandbox_info(cfg: &config::Config, root: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config;
     use std::assert_matches;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+
+    fn build_run_spec(cfg: config::Config) -> BootSpec {
+        BootSpec {
+            cfg,
+            project_dir: PathBuf::from("/project"),
+            root: false,
+            mode: PlanMode::Run,
+            foreground: false,
+            host_publishes_pid: false,
+            network_broker: None,
+        }
+    }
 
     #[test]
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -218,6 +259,64 @@ mod tests {
         }
     }
 
+    /// An agent reading the README acts on it, so it describes the boot it is
+    /// in: setup's VM of a read-only box runs as root on a writable root with
+    /// no mounts or volumes attached, and only the run boots after it are
+    /// read-only, the workload user's, and shared with the host.
+    #[test]
+    fn sandbox_info_describes_the_boot_not_just_the_recipe() {
+        let mut cfg: config::Config = yaml_serde::from_str("{}").unwrap();
+        cfg.hw.rootfs_readonly = true;
+        let info = |mode| {
+            build_plan(
+                &BootSpec {
+                    cfg: cfg.clone(),
+                    project_dir: PathBuf::from("/project"),
+                    root: false,
+                    mode,
+                    foreground: false,
+                    host_publishes_pid: false,
+                    network_broker: None,
+                },
+                "dev",
+            )
+            .unwrap()
+            .sandbox_info
+        };
+        let setup = info(PlanMode::Create);
+        assert!(setup.contains("You run as `root`"), "{setup}");
+        assert!(setup.contains("It PERSISTS"), "{setup}");
+        assert!(
+            setup.contains("not mounted until the box starts"),
+            "{setup}"
+        );
+        assert!(!setup.contains("shared with the host"), "{setup}");
+        let run = info(PlanMode::Run);
+        assert!(run.contains("You run as `terri`"), "{run}");
+        assert!(run.contains("READ-ONLY"), "{run}");
+        assert!(run.contains("shared with the host"), "{run}");
+    }
+
+    /// An agent reading the README acts on it, so the root filesystem line must
+    /// match the boot: writes to a read-only root fail, they do not persist.
+    #[test]
+    fn sandbox_info_says_whether_the_root_keeps_writes() {
+        let mut spec = build_run_spec(config::Config::default());
+        let writable = generate_sandbox_info(&spec);
+        assert!(
+            writable.contains("It PERSISTS across restarts"),
+            "{writable}"
+        );
+        assert!(!writable.contains("READ-ONLY"), "{writable}");
+        spec.cfg.hw.rootfs_readonly = true;
+        let readonly = generate_sandbox_info(&spec);
+        assert!(
+            readonly.contains("READ-ONLY: every write to it fails with EROFS"),
+            "{readonly}"
+        );
+        assert!(!readonly.contains("PERSISTS"), "{readonly}");
+    }
+
     #[test]
     fn sandbox_info_carries_the_resolved_config_as_yaml() {
         let mut cfg: config::Config =
@@ -227,7 +326,8 @@ mod tests {
             guest: PathBuf::from("/models"),
             readonly: true,
         }];
-        let info = generate_sandbox_info(&cfg, false);
+        let mut spec = build_run_spec(cfg);
+        let info = generate_sandbox_info(&spec);
         assert!(info.contains("# Terrarium sandbox"));
         assert!(info.contains("`/bin/sh -c make`"));
         assert!(info.contains("(uid 1000, non-root)"));
@@ -241,7 +341,8 @@ mod tests {
         assert!(info.contains("`sudo` - the commands"), "{info}");
 
         // --root: no privilege drop, and the doc says so.
-        let root = generate_sandbox_info(&cfg, true);
+        spec.root = true;
+        let root = generate_sandbox_info(&spec);
         assert!(root.contains("You run as `root`"), "{root}");
     }
 
@@ -272,6 +373,7 @@ mod tests {
             name: "data".into(),
             guest: "/data".into(),
             size_mib: 1,
+            lifetime: config::VolumeLifetime::Box,
         }];
         let plan = build_plan(&spec, "My_Box").unwrap();
 
@@ -296,8 +398,70 @@ mod tests {
         assert!(foreground_plan.await_initial_session);
     }
 
+    /// The setup boot attaches no filesystem device, but the agent creates the mount
+    /// points in the base from the plan's share list.
     #[test]
-    fn a_bake_waits_for_its_console_before_running_hooks() {
+    fn a_setup_plan_names_the_shares_and_publishes_no_ports() {
+        let mut cfg: config::Config = yaml_serde::from_str("{}").unwrap();
+        cfg.mounts = vec![config::Mount {
+            host: "/host/work".into(),
+            guest: "/work".into(),
+            readonly: false,
+        }];
+        cfg.network.ports = vec!["8080:80".into()];
+        let spec = BootSpec {
+            cfg,
+            project_dir: PathBuf::from("/proj"),
+            root: false,
+            mode: PlanMode::Create,
+            foreground: false,
+            host_publishes_pid: false,
+            network_broker: None,
+        };
+        let plan = build_plan(&spec, "dev").unwrap();
+        assert_eq!(plan.shares[0].guest, "/work");
+        assert_eq!(plan.published_ports, [] as [u16; 0]);
+    }
+
+    /// The disk the host opens and the plan the agent reads come from one
+    /// decision, so the agent never mounts a read-only device writable.
+    #[test]
+    fn only_a_run_boot_of_a_read_only_box_gets_a_read_only_root() {
+        use terra_runtime::component::AccessMode;
+        let spec = |mode, rootfs_readonly| {
+            let mut cfg: config::Config = yaml_serde::from_str("{}").unwrap();
+            cfg.hw.rootfs_readonly = rootfs_readonly;
+            BootSpec {
+                cfg,
+                project_dir: PathBuf::from("/project"),
+                root: false,
+                mode,
+                foreground: false,
+                host_publishes_pid: false,
+                network_broker: None,
+            }
+        };
+        for (mode, rootfs_readonly, expected) in [
+            (PlanMode::Run, true, AccessMode::ReadOnly),
+            (PlanMode::Create, true, AccessMode::ReadWrite),
+            (PlanMode::Run, false, AccessMode::ReadWrite),
+        ] {
+            let spec = spec(mode, rootfs_readonly);
+            assert_eq!(
+                rootfs_access(&spec),
+                expected,
+                "{mode:?}, {rootfs_readonly}"
+            );
+            assert_eq!(
+                build_plan(&spec, "dev").unwrap().rootfs_readonly,
+                expected == AccessMode::ReadOnly,
+                "{mode:?}, {rootfs_readonly}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_setup_boot_waits_for_its_console_before_running_hooks() {
         let spec = BootSpec {
             cfg: yaml_serde::from_str("{}").unwrap(),
             project_dir: PathBuf::from("/proj"),
@@ -310,12 +474,12 @@ mod tests {
         assert!(build_plan(&spec, "dev").unwrap().await_initial_session);
     }
 
-    /// A bake installs software into the box's filesystem, so it runs as guest
+    /// A setup boot installs software into the box's filesystem, so it runs as guest
     /// root however the boot was spelled - and a workload boot never inherits
     /// that. Read off the mode here rather than written onto the spec on the
     /// way in, which left two places deciding one thing.
     #[test]
-    fn a_bake_is_guest_root_and_a_workload_boot_is_not() {
+    fn a_setup_boot_is_guest_root_and_a_workload_boot_is_not() {
         let spec = |root, mode| BootSpec {
             cfg: yaml_serde::from_str("{}").unwrap(),
             project_dir: PathBuf::from("/proj"),
@@ -327,22 +491,22 @@ mod tests {
         };
         let plan = |root, mode| build_plan(&spec(root, mode), "dev").unwrap().root;
 
-        assert!(plan(false, PlanMode::Create), "a bake is root");
+        assert!(plan(false, PlanMode::Create), "a setup boot is root");
         assert!(plan(true, PlanMode::Create));
         // …and it does not leak into the boot that follows it.
         assert!(!plan(false, PlanMode::Run), "a workload boot is not");
         assert!(plan(true, PlanMode::Run), "--root still reaches the plan");
     }
 
-    /// `sandbox_info` lands in the guest's *persistent* filesystem: names are
-    /// useful, values would outlive the boot that set them.
+    /// `sandbox_info` is a file every guest process can read: names are
+    /// useful, values would hand the recipe's secrets to all of them.
     #[test]
     fn sandbox_info_names_env_vars_without_their_values() {
         let cfg = config::Config {
             env: BTreeMap::from([("API_KEY".to_string(), "sk-super-secret".to_string())]),
             ..yaml_serde::from_str("{}").unwrap()
         };
-        let info = generate_sandbox_info(&cfg, false);
+        let info = generate_sandbox_info(&build_run_spec(cfg));
         assert!(info.contains("API_KEY"), "the name should still be shown");
         assert!(!info.contains("sk-super-secret"), "{info}");
     }

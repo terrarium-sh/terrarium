@@ -298,12 +298,11 @@ mod tests {
         }
     }
 
-    /// The recipe is printed where the values outlive the boot that set them:
-    /// `terra show` is made to be redirected into a file and pasted into a bug
-    /// report, and the box's own `/terra/README.md` is written into a
-    /// filesystem that persists across boots. So the names stay - knowing
-    /// `API_KEY` is set is the useful half - and the values go, unless the one
-    /// flag that exists for them was written.
+    /// The recipe is printed where others read it: `terra show` is made to be
+    /// redirected into a file and pasted into a bug report, and every guest
+    /// process can read the box's own `/terra/README.md`. So the names stay -
+    /// knowing `API_KEY` is set is the useful half - and the values go, unless
+    /// the one flag that exists for them was written.
     #[test]
     fn the_printed_recipe_names_env_vars_without_their_values() {
         let cfg = config::Config {
@@ -482,6 +481,7 @@ mod tests {
                 cpus: 4,
                 mem_mib: 4096,
                 rootfs_mib: 2048,
+                rootfs_readonly: false,
             },
             ..yaml_serde::from_str("{}").unwrap()
         };

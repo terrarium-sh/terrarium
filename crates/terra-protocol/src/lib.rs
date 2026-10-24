@@ -9,6 +9,7 @@ pub mod control;
 pub mod dns;
 mod frames;
 pub mod guest_image;
+pub mod guest_root;
 pub mod mux;
 pub mod network;
 #[cfg(feature = "packed-image")]

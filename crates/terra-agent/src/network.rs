@@ -384,6 +384,13 @@ async fn verify_network_version(
     Ok(decoder)
 }
 
+pub(super) fn render_resolv_conf(net: terra_protocol::Net) -> String {
+    match net {
+        terra_protocol::Net::LocalOnly => "# local_only\n".to_owned(),
+        terra_protocol::Net::Tsi => format!("nameserver {}\n", DNS_ADDRESS.ip()),
+    }
+}
+
 pub(super) async fn start(
     plan: &terra_protocol::Plan,
     shutdown: &CancellationToken,
@@ -392,10 +399,7 @@ pub(super) async fn start(
 ) -> Result<()> {
     validate_kernel_socket_version()?;
     match plan.net {
-        terra_protocol::Net::LocalOnly => {
-            std::fs::write("/etc/resolv.conf", "# local_only\n")
-                .context("configuring local-only resolution")?;
-        }
+        terra_protocol::Net::LocalOnly => {}
         terra_protocol::Net::Tsi => {
             let shutdown = shutdown.child_token();
             if !plan.published_udp_ports.is_empty() {
@@ -441,11 +445,6 @@ pub(super) async fn start(
                     },
                 );
             }
-            std::fs::write(
-                "/etc/resolv.conf",
-                format!("nameserver {}\n", DNS_ADDRESS.ip()),
-            )
-            .context("configuring guest DNS")?;
             ensure!(
                 !shutdown.is_cancelled(),
                 "network unavailable during startup"

@@ -4,11 +4,8 @@ You are inside a Terrarium micro-VM: an isolated Linux guest (Alpine). The
 facts that matter for working here:
 
 - You run as {who}.
-- The root filesystem is a private disk image. It PERSISTS across restarts of
-  this sandbox (only `terra rm` on the host clears it). Its size is capped, so
-  it can fill up: writes past the cap fail with ENOSPC.
-- Only the `mounts` listed below are shared with the host. Everything else you
-  write stays inside the sandbox.
+- {rootfs}
+- {shares}
 - Network egress is filtered (see Network below). When an address is
   unreachable, the egress policy - not an outage - is the likely reason.
 
@@ -25,13 +22,15 @@ The command this sandbox runs:
 
 What each option means from inside the sandbox:
 
-- `hw` - your resources; `rootfs_mib` caps the root filesystem.
+- `hw` - your resources; `rootfs_mib` caps the root filesystem, and
+  `rootfs_readonly: true` makes it read-only.
 - `mounts` - host directories shared into the sandbox: files under a `guest`
   path are visible on the host at its `host` path, and vice versa. A
   `readonly: true` mount rejects writes. Nothing outside these mounts reaches
   the host filesystem.
 - `volumes` - bounded scratch disks: each an ext4 image of `size_mib`, mounted
-  at its `guest` path, persistent across restarts of this box.
+  at its `guest` path. `lifetime: box` keeps its data across restarts of this
+  box; `lifetime: boot` gives it an empty filesystem on every boot.
 - `env` - variable names exported to you. Values are deliberately not written
   into this file; read them from your environment.
 - `sudo` - the commands you may run as root via `doas` (or `sudo`). Every

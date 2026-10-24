@@ -1,0 +1,8 @@
+hw: {cpus: 1, mem_mib: 256, rootfs_readonly: true}
+network: {enabled: false}
+volumes:
+  - {name: kept, guest: /kept, size_mib: 64}
+  - {name: scratch, guest: /scratch, size_mib: 64, lifetime: boot}
+workload:
+  entrypoint: /bin/sh
+  args: ['-ec', 'while true; do sleep 60; done']

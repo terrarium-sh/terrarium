@@ -17,6 +17,8 @@ use std::time::{Duration, Instant};
 /// command line and takes its boot off stdin.
 pub const VM_PROCESS_FLAG_ARG: &str = "__vm";
 
+pub const SETUP_VM_STOPPED_BEFORE_CONSOLE: &str = "the setup VM stopped before opening its console";
+
 const DETACH_READY_DEADLINE: Duration =
     Duration::from_secs(terra_runtime::orchestration::GUEST_BOOT_TIMEOUT.as_secs() + 30);
 const KILL_REAP_WAIT: Duration = Duration::from_secs(2);
@@ -97,9 +99,10 @@ pub async fn attach(bx: &BoxRef, agent_timeout: Option<u64>) -> Result<ExitCode>
     finish_session(bx, &pump_box_console(bx, agent_timeout).await?, None)
 }
 
-/// The caller keeps its lock while the isolated bake child uses a duplicate.
-pub async fn run_bake(cfg: &config::Config, bx: &BoxRef, lock: &File) -> Result<()> {
-    let bake = BootSpec {
+/// Boots the isolated VM that prepares the root image.
+/// The caller keeps its lock while the isolated setup VM uses a duplicate.
+pub async fn run_setup_vm(cfg: &config::Config, bx: &BoxRef, lock: &File) -> Result<()> {
+    let setup_spec = BootSpec {
         cfg: cfg.clone(),
         project_dir: bx.get_project_dir().to_path_buf(),
         root: false,
@@ -108,20 +111,20 @@ pub async fn run_bake(cfg: &config::Config, bx: &BoxRef, lock: &File) -> Result<
         host_publishes_pid: false,
         network_broker: None,
     };
-    eprintln!("terra: baking on_create for {bx} in an isolated VM (no shares)");
-    let baking = BoxRef::mark_baking(lock).context("marking the on_create bake")?;
-    let LaunchedVm { mut child, _guard } = spawn_vm_process(bx, &bake, lock)?;
+    eprintln!("terra: preparing {bx} in an isolated VM (no shares)");
+    let setting_up = BoxRef::mark_setting_up(lock).context("marking the setup VM")?;
+    let LaunchedVm { mut child, _guard } = spawn_vm_process(bx, &setup_spec, lock)?;
     let deadline = Instant::now() + DETACH_READY_DEADLINE;
     let output = async {
         let stream =
-            session::connect_to_agent(bx, terra_protocol::AgentService::Session, "bake", || {
+            session::connect_to_agent(bx, terra_protocol::AgentService::Session, "setup", || {
                 anyhow::ensure!(
                     child.try_wait()?.is_none(),
-                    "the bake stopped before opening its console"
+                    "{SETUP_VM_STOPPED_BEFORE_CONSOLE}"
                 );
                 anyhow::ensure!(
                     Instant::now() < deadline,
-                    "timed out opening the bake console"
+                    "timed out opening the setup VM console"
                 );
                 Ok(())
             })
@@ -132,38 +135,32 @@ pub async fn run_bake(cfg: &config::Config, bx: &BoxRef, lock: &File) -> Result<
     if output.is_err() {
         let _ = sys::kill_vm_child(&mut child);
     }
-    let status = child.wait().context("waiting for the on_create bake")?;
+    let status = child.wait().context("waiting for the setup VM")?;
     if !status.success() || output.is_err() {
         let _ = write_boot_logs(bx, &mut std::io::stderr().lock());
     }
     output.with_context(|| {
         format!(
-            "streaming the on_create bake (box process {status}; launcher diagnostics: {})",
+            "streaming the setup VM (box process {status}; launcher diagnostics: {})",
             bx.get_dir().join("launcher.log").display()
         )
     })?;
     if !status.success() {
         if let Some(signal) = sys::find_terminating_signal(status) {
             anyhow::bail!(
-                "the on_create bake was killed (signal {signal}) before it finished.\n\
-                 NOTE: a bake has no graceful stop - e.g. `terra stop` or the OOM killer \
+                "the setup VM was killed (signal {signal}) before it finished.\n\
+                 NOTE: the setup VM has no graceful stop - e.g. `terra stop` or the OOM killer \
                  both land as a plain signal"
             );
         }
         anyhow::bail!(
-            "the on_create bake failed - fix the recipe, then `terra {} setup` re-runs \
+            "setup failed - fix the recipe, then `terra {} setup` re-runs \
              it (`--rebuild` for a clean slate); agent diagnostics are in diagnostics.log",
             bx.get_name()
         );
     }
-    baking.clear().context("clearing bake mark")?;
-    crate::vm::image::staged_write(&bx.get_dir().join(crate::state::BAKE_STAMP), |_| Ok(()))
-        .with_context(|| {
-            format!(
-                "recording {}",
-                bx.get_dir().join(crate::state::BAKE_STAMP).display()
-            )
-        })?;
+    setting_up.clear().context("clearing setup mark")?;
+    bx.write_setup_stamp()?;
     Ok(())
 }
 
@@ -376,9 +373,9 @@ pub(super) fn publish_vm_pid(
     identity: &File,
     mode: terra_protocol::PlanMode,
 ) -> Result<()> {
-    BoxRef::publish_pid(identity, pid, mode == terra_protocol::PlanMode::Create)
+    BoxRef::publish_pid(identity, pid, mode)
         .with_context(|| format!("publishing protected host VM identity for {bx}"))?;
-    BoxRef::publish_pid(lock, pid, mode == terra_protocol::PlanMode::Create)
+    BoxRef::publish_pid(lock, pid, mode)
         .with_context(|| format!("publishing host VM identity for {bx}"))
 }
 
@@ -749,7 +746,7 @@ mod tests {
         assert_eq!(error.to_string(), "VM failed");
     }
 
-    /// A failure replays the *end* of a log, never the whole of it: a bake's
+    /// A failure replays the *end* of a log, never the whole of it: a setup's
     /// `apk add` output runs to megabytes, and the line that says what broke is
     /// the last one. What is left out is said out loud, so nobody reads a
     /// truncated log as the whole story.

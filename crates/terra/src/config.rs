@@ -67,6 +67,18 @@ pub struct Hw {
     pub mem_mib: u32,
     /// Sparse, so only what gets written costs.
     pub rootfs_mib: u32,
+    /// Run boots attach the root image read-only; setup still writes it.
+    pub rootfs_readonly: bool,
+}
+
+/// How long a volume's contents last.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VolumeLifetime {
+    #[default]
+    Box,
+    /// Every boot starts from an empty filesystem.
+    Boot,
 }
 
 impl Default for Hw {
@@ -75,6 +87,7 @@ impl Default for Hw {
             cpus: 2,
             mem_mib: 1024,
             rootfs_mib: 512,
+            rootfs_readonly: false,
         }
     }
 }
@@ -96,6 +109,8 @@ pub struct Volume {
     pub guest: PathBuf,
     /// Writes past this fail with ENOSPC.
     pub size_mib: u32,
+    #[serde(default)]
+    pub lifetime: VolumeLifetime,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

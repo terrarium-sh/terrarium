@@ -19,13 +19,13 @@ pub fn run(
         Some(cwd),
         resolve::Existence::MayBeMissing,
     )?;
-    if let Some(from) = &target.manifest_divergence {
+    if let Some(from) = target.find_manifest_divergence() {
         eprintln!(
             "terra: note: this is {}'s pinned recipe, which is what a boot runs - \
              {} names {} instead, and `terra {} setup` would pin that one",
             target.bx.get_name(),
             config::MANIFEST_FILE,
-            render::escape_printable_path(from),
+            render::escape_printable_path(&from),
             target.bx.get_name()
         );
     }

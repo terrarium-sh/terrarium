@@ -76,22 +76,14 @@ fn choose_boot_mode(args: &BootArgs, is_at_a_terminal: bool) -> Result<BootMode>
     )
 }
 
-/// `terra [BOX]` - boot a box, or join it if it is up. A box that is not set up
-/// yet is offered one first, from the recipe the manifest names for it or from
-/// a recipe path given here; `cwd` is what that path resolves against.
+/// Boot a box whose setup finished, or join its running VM.
 pub async fn run(
     name: Option<&str>,
     args: &BootArgs,
     project_dir: &Path,
-    cwd: &Path,
     is_at_a_terminal: bool,
 ) -> Result<ExitCode> {
-    let target = resolve::resolve(
-        name,
-        project_dir,
-        Some(cwd),
-        resolve::Existence::MayBeMissing,
-    )?;
+    let target = resolve::resolve(name, project_dir, None, resolve::Existence::MustExist)?;
 
     match build_start_plan(&target.bx, args, is_at_a_terminal)? {
         // One line for both: a script tells them apart by the exit code, not
@@ -114,32 +106,25 @@ pub async fn run(
         StartPlan::Boot => {}
     }
 
-    let approved =
-        setup::request_recipe_approval(target, &setup::Approval::Offer, is_at_a_terminal, false)?;
     let mode = choose_boot_mode(args, is_at_a_terminal)?;
-    let project_dir = approved.bx.get_project_dir().to_path_buf();
-    let spec = boot::BootSpec::resolve(approved.cfg.clone(), args, project_dir, mode);
-    crate::vm::encode_boot_plan(&spec, approved.bx.get_name())?;
-    let prepared = setup::prepare_box(&approved, setup::Rebuild::No)?;
-
-    if !spec.cfg.hooks.on_create.is_empty()
-        && (prepared.fresh_rootfs
-            || !approved
-                .bx
-                .get_dir()
-                .join(crate::state::BAKE_STAMP)
-                .exists())
-    {
-        boot::run_bake(&spec.cfg, &approved.bx, &prepared.lock).await?;
+    // Locked before the pin is read - a setup finishing in between would
+    // otherwise boot the old recipe on the root it set up for the new one.
+    let lock = setup::lock_finished_box(&target.bx)?;
+    let manifest_divergence = target.find_manifest_divergence();
+    let (bx, cfg) = setup::load_pinned_config(target)?;
+    let project_dir = bx.get_project_dir().to_path_buf();
+    let spec = boot::BootSpec::resolve(cfg, args, project_dir, mode);
+    crate::vm::encode_boot_plan(&spec, bx.get_name())?;
+    if let Some(from) = manifest_divergence {
+        eprintln!(
+            "terra: note: {} differs from {}'s pinned recipe; this boot runs the pinned one \
+             (`terra {} setup` applies the change)",
+            crate::render::escape_printable_path(&from),
+            bx.get_name(),
+            bx.get_name()
+        );
     }
-    boot::start(
-        &spec,
-        &approved.bx,
-        mode,
-        prepared.lock,
-        args.agent.agent_timeout,
-    )
-    .await
+    boot::start(&spec, &bx, mode, lock, args.agent.agent_timeout).await
 }
 
 #[cfg(test)]
@@ -149,12 +134,14 @@ mod tests {
     use clap::Parser;
 
     #[tokio::test]
-    async fn oversized_command_override_is_refused_before_preparing_the_box() {
+    async fn oversized_command_override_is_refused_before_booting() {
         let _home = TestHome::new();
         let dir = tempfile::tempdir().unwrap();
         let bx = BoxRef::resolve(dir.path(), "dev").unwrap();
         std::fs::create_dir_all(bx.get_dir()).unwrap();
         std::fs::write(bx.get_dir().join(crate::state::RECIPE_FILE), "{}").unwrap();
+        std::fs::write(bx.get_dir().join(crate::state::ROOTFS_FILE), b"").unwrap();
+        bx.write_setup_stamp().unwrap();
         let paths =
             crate::policy::mount::PinnedPaths::from_config(&crate::config::Config::default());
         std::fs::write(
@@ -164,12 +151,30 @@ mod tests {
         .unwrap();
         let mut args = build_boot_args(&["--foreground"]);
         args.command = vec!["echo".into(), "x".repeat(terra_protocol::MAX_PLAN_BYTES)];
-        let error = run(Some("dev"), &args, dir.path(), dir.path(), false)
+        let error = run(Some("dev"), &args, dir.path(), false)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("boot plan"), "{error:#}");
-        assert!(!bx.get_dir().join(crate::state::PID_FILE).exists());
-        assert!(!bx.get_dir().join(crate::state::ROOTFS_FILE).exists());
+        assert_eq!(bx.read_vm_process(), None, "a VM was launched");
+    }
+
+    /// Start never pins: a recipe path or a box nobody set up is sent to setup.
+    #[tokio::test]
+    async fn a_recipe_path_or_a_missing_box_is_sent_to_setup() {
+        let _home = TestHome::new();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("dev.yaml"), "{}").unwrap();
+        let args = build_boot_args(&["--foreground"]);
+        for name in ["./dev.yaml", "dev"] {
+            let error = run(Some(name), &args, dir.path(), false).await.unwrap_err();
+            assert!(format!("{error:#}").contains("setup"), "{name}: {error:#}");
+        }
+        assert!(
+            !BoxRef::resolve(dir.path(), "dev")
+                .unwrap()
+                .get_dir()
+                .exists()
+        );
     }
 
     /// The flags of a bare invocation, as clap parses them.
@@ -248,26 +253,26 @@ mod tests {
         }
     }
 
-    /// Ordinary clients must not attach to a setup bake as though it were a running workload.
+    /// Ordinary clients must not attach to a setup VM as though it were a running workload.
     #[test]
-    fn a_box_being_baked_is_not_offered_as_a_session_to_join() {
+    fn a_box_being_set_up_is_not_offered_as_a_session_to_join() {
         let dir = tempfile::tempdir().unwrap();
         let (bx, lock, _home) = create_box_in(dir.path(), true);
 
-        let baking = BoxRef::mark_baking(lock.as_ref().unwrap()).unwrap();
+        let setting_up = BoxRef::mark_setting_up(lock.as_ref().unwrap()).unwrap();
         assert_eq!(bx.get_holder().unwrap(), Holder::SettingUp);
         let err = build_start_plan(&bx, &build_boot_args(&[]), false)
-            .expect_err("a box mid-bake must not be offered as a session to join")
+            .expect_err("a box mid-setup must not be offered as a session to join")
             .to_string();
         assert_eq!(err, bx.setup_holds_it().to_string());
         // …and `-d`, which used to answer plain success about a box that is
         // not up: a script cannot tell that from a box it can now use.
         assert!(build_start_plan(&bx, &build_boot_args(&["-d"]), false).is_err());
 
-        // The mark goes with the bake, and what is left is an ordinary held
+        // The mark goes with the setup, and what is left is an ordinary held
         // box: with no terminal to attach from, this is the 125 a script reads
         // as "already running".
-        drop(baking);
+        drop(setting_up);
         assert_eq!(bx.get_holder().unwrap(), Holder::Running);
         assert_eq!(
             build_start_plan(&bx, &build_boot_args(&[]), false).unwrap(),

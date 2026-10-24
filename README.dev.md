@@ -148,11 +148,13 @@ Shutdown responsibilities stay with their resource owners:
 | `component/vmm/native_task.rs` | Run cleanup independently of cancellation of a waiter |
 | `terra-hypervisor` `vcpus.rs` | Stop and join native vCPU threads |
 
-The agent starts as PID 1 from the read-only 3 MiB memory-backed boot disk, receives its boot
-plan over the fixed agent vsock stream, grows the box's ext4 images and enters the Alpine root with
-`pivot_root`. It applies `on_create` when its guest-side recipe stamp differs,
-then configures mounts and runs hooks and the workload. Boot-plan environment
-values are sent through memory, not persisted as a host plan file.
+The agent starts as PID 1 from the read-only 3 MiB memory-backed boot disk,
+receives its boot plan over the fixed agent vsock stream and enters the Alpine
+root with `pivot_root`. Setup's VM grows the root filesystem, runs `on_create`
+when its commands differ from the guest-side stamp, and creates the recipe's
+directories. Run boots grow volume filesystems to their images, mount shares
+and volumes, then run hooks and the workload. Boot-plan environment values are
+sent through memory, not persisted as a host plan file.
 
 ## Network transport
 
@@ -340,12 +342,14 @@ fallback for failed legacy IRQ registration remains for WHP. The ignored
 vCPUs for active local timers and no IRQ 0 clockevent on x86 KVM; Intel acceptance
 still requires running it on the affected host.
 
-Root and volume images are prebaked ext4 files. Creating a box decompresses
-and sizes those images; the guest grows the filesystems. Runtime hosts need no
-filesystem formatting tools or image downloads. The kernel and boot disk are
-embedded in `terra` as chunked LZ4 containers: each boot decodes the kernel into
-guest memory, while the boot disk stays packed and the block device decodes only
-the chunks a read touches. The read-only boot filesystem has no journal.
+Root and volume images are prebaked ext4 files. Setup decompresses and sizes
+the root and box-lifetime images; run boots recreate boot-lifetime images.
+The guest grows the root filesystem during setup and volume filesystems on
+run boots. Runtime hosts need no filesystem formatting tools or image downloads.
+The kernel and boot disk are embedded in `terra` as chunked LZ4 containers:
+each boot decodes the kernel into guest memory, while the boot disk stays packed
+and the block device decodes only the chunks a read touches. The read-only boot
+filesystem has no journal.
 Each boot selects the payloads bundled with the binary starting the box, so
 upgrading Terra and stopping/starting an existing box updates its kernel and
 boot disk without rebuilding its root filesystem.

@@ -2369,3 +2369,361 @@ fn bwrap_enforces_vm_and_vcpu_threads() {
         std::thread::sleep(Duration::from_millis(20));
     }
 }
+
+#[cfg(target_os = "linux")]
+mod read_only_rootfs {
+    use super::*;
+
+    const WORKLOAD_SCRIPT: &str = r#"exec 2>&1
+echo "UID=$(id -u)"
+echo "WHO=$(grep -m1 '^- You run as' /terra/README.md)"
+echo "HOME_WRITE=$(touch $HOME/x 2>&1)"
+echo "SUDO_ETC=$(sudo touch /etc/x 2>&1)"
+sudo touch /tmp/sudo-ok && echo SUDO_OK
+touch /tmp/t /var/tmp/t && echo TMP_OK
+getent hosts many.test | grep -q 192.0.2.1 && echo DNS_OK
+grep -q ' /kept ' /proc/mounts && grep -q ' /scratch ' /proc/mounts && grep -q ' /work ' /proc/mounts && echo MOUNTS_OK
+echo "SCRATCH=$([ -e /scratch/marker ] && echo present || echo gone)"
+echo "KEPT=$(cat /kept/marker 2>/dev/null || echo gone)"
+echo "ONSTART=$(cat /kept/onstart 2>/dev/null)"
+touch /scratch/marker
+echo kept > /kept/marker
+sync
+if [ -e /work/hang ]; then echo HANGING; sleep 300; fi
+"#;
+
+    struct ReadOnlyBox {
+        suite: Suite,
+        project: PathBuf,
+        recipe: PathBuf,
+    }
+
+    impl ReadOnlyBox {
+        fn new() -> Self {
+            Self::with_on_create(&[])
+        }
+
+        fn with_on_create(on_create: &[&str]) -> Self {
+            use std::fmt::Write as _;
+            let mut hooks = String::new();
+            if !on_create.is_empty() {
+                hooks.push_str("  on_create:\n");
+                for line in on_create {
+                    writeln!(hooks, "    - {line:?}").unwrap();
+                }
+            }
+            let suite = Suite::new();
+            let project = suite.create_project_dir("readonly");
+            let recipe = suite.get_work_dir().join("readonly.yaml");
+            let script = WORKLOAD_SCRIPT.replace('\n', "\n      ");
+            std::fs::write(
+                &recipe,
+                format!(
+                    "hw: {{cpus: 1, mem_mib: 256, rootfs_mib: 256, rootfs_readonly: true}}\nsudo: [touch]\nnetwork:\n  hosts:\n    - name: many.test\n      addr: 192.0.2.1\nvolumes:\n  - {{name: kept, guest: /kept, size_mib: 32}}\n  - {{name: scratch, guest: /scratch, size_mib: 32, lifetime: boot}}\nmounts:\n  - {{host: {}, guest: /work}}\nhooks:\n{hooks}  on_start:\n    - touch /etc/x 2> /kept/onstart || true\nworkload:\n  entrypoint: /bin/sh\n  args:\n    - -c\n    - |\n      {script}\n",
+                    project.display()
+                ),
+            )
+            .unwrap();
+            Self {
+                suite,
+                project,
+                recipe,
+            }
+        }
+
+        fn project(&self) -> &str {
+            self.project.to_str().unwrap()
+        }
+
+        fn setup(&self, extra: &[&str]) {
+            let mut args = vec![self.recipe.to_str().unwrap(), "setup", "--project"];
+            args.push(self.project());
+            args.extend_from_slice(extra);
+            let (out, code) = self.suite.run_terra_status(&args);
+            assert_eq!(code, 0, "{out}");
+        }
+
+        fn boot(&self, extra: &[&str]) -> String {
+            let mut args = vec!["readonly", "--foreground", "--project", self.project()];
+            args.extend_from_slice(extra);
+            let (out, code) = self.suite.run_terra_status(&args);
+            assert_eq!(code, 0, "{out}");
+            out
+        }
+
+        fn rootfs_bytes(&self) -> Vec<u8> {
+            std::fs::read(self.suite.get_box_files_path("readonly").join("rootfs.img")).unwrap()
+        }
+
+        /// Boots with the workload hanging, then SIGKILLs the VM process.
+        fn boot_and_kill_vm(&self) {
+            use std::io::BufRead as _;
+            let box_dir = self.suite.get_box_files_path("readonly");
+            std::fs::write(self.project.join("hang"), "").unwrap();
+            let mut child = Command::new(&self.suite.terra)
+                .args(["readonly", "--foreground", "--project", self.project()])
+                .env("HOME", &self.suite.home)
+                .env("USERPROFILE", &self.suite.home)
+                .env_remove("RUST_LOG")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let (sender, receiver) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut seen = String::new();
+                for line in std::io::BufReader::new(stdout).lines() {
+                    let Ok(line) = line else { break };
+                    seen = seen + &line + "\n";
+                    if line.contains("HANGING") {
+                        let _ = sender.send(seen);
+                        return;
+                    }
+                }
+                let _ = sender.send(seen);
+            });
+            let seen = receiver.recv_timeout(Duration::from_secs(90));
+            let pid = std::fs::read_to_string(box_dir.join("terra.pid"));
+            let vm_pid: u32 = pid
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap();
+            let _ = Command::new("kill")
+                .args(["-KILL", &vm_pid.to_string()])
+                .status();
+            let _ = child.kill();
+            child.wait().unwrap();
+            std::fs::remove_file(self.project.join("hang")).unwrap();
+            let seen = seen.unwrap();
+            assert!(seen.contains("HANGING"), "{seen}");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while linux_process_is_live(vm_pid) {
+                assert!(Instant::now() < deadline, "VM survived SIGKILL");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let lock = std::fs::File::open(box_dir.join("terra.pid")).unwrap();
+            loop {
+                match lock.try_lock() {
+                    Ok(()) => break,
+                    Err(std::fs::TryLockError::WouldBlock) => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "supervisor kept the box lock after SIGKILL"
+                        );
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    Err(std::fs::TryLockError::Error(error)) => {
+                        panic!("probing the box lock: {error}");
+                    }
+                }
+            }
+        }
+    }
+
+    fn assert_workload_facts(out: &str) {
+        for expected in [
+            "UID=1000",
+            "HOME_WRITE=touch: /home/terri/x: Read-only file system",
+            "SUDO_ETC=touch: /etc/x: Read-only file system",
+            "SUDO_OK",
+            "TMP_OK",
+            "DNS_OK",
+            "MOUNTS_OK",
+        ] {
+            assert!(out.contains(expected), "missing {expected:?}:\n{out}");
+        }
+    }
+
+    #[test]
+    #[ignore = "boots a real VM and requires a native hypervisor"]
+    fn read_only_rootfs_boots_the_workload_and_stays_byte_identical() {
+        let readonly = ReadOnlyBox::new();
+        readonly.setup(&[]);
+        let pristine = readonly.rootfs_bytes();
+
+        let first = readonly.boot(&[]);
+        assert_workload_facts(&first);
+        assert!(first.contains("WHO=- You run as `terri`"), "{first}");
+        assert!(
+            first.contains("SCRATCH=gone") && first.contains("KEPT=gone"),
+            "{first}"
+        );
+        assert!(
+            readonly.rootfs_bytes() == pristine,
+            "rootfs.img changed after a stop"
+        );
+
+        let second = readonly.boot(&[]);
+        assert!(
+            second.contains("SCRATCH=gone") && second.contains("KEPT=kept"),
+            "{second}"
+        );
+        assert!(
+            second.contains("ONSTART=touch: /etc/x: Read-only file system"),
+            "the on_start write reached the root:\n{second}"
+        );
+        assert!(
+            readonly.rootfs_bytes() == pristine,
+            "rootfs.img changed after a restart"
+        );
+    }
+
+    /// A process that `on_create` leaves holding a root file open for writing is killed before
+    /// setup ends, so the image is left clean and the next read-only boot can mount it.
+    #[test]
+    #[ignore = "boots a real VM and requires a native hypervisor"]
+    fn setup_kills_a_leftover_root_writer_so_the_read_only_boot_mounts() {
+        let readonly = ReadOnlyBox::with_on_create(&[
+            "setsid sh -c 'exec 3>>/var/lib/terra-writer; exec sleep 1000' </dev/null >/dev/null 2>&1 &",
+        ]);
+        readonly.setup(&[]);
+        assert_workload_facts(&readonly.boot(&[]));
+    }
+
+    #[test]
+    #[ignore = "boots a real VM and requires a native hypervisor"]
+    fn read_only_rootfs_survives_sigkill_and_volumes_follow_their_lifetime() {
+        let readonly = ReadOnlyBox::new();
+        readonly.setup(&[]);
+        let pristine = readonly.rootfs_bytes();
+
+        readonly.boot_and_kill_vm();
+        assert!(
+            readonly.rootfs_bytes() == pristine,
+            "rootfs.img changed after SIGKILL"
+        );
+
+        let after_kill = readonly.boot(&[]);
+        assert!(
+            after_kill.contains("SCRATCH=gone") && after_kill.contains("KEPT=kept"),
+            "{after_kill}"
+        );
+        assert!(
+            readonly.rootfs_bytes() == pristine,
+            "rootfs.img changed after the restart that followed SIGKILL"
+        );
+    }
+
+    #[test]
+    #[ignore = "boots a real VM and requires a native hypervisor"]
+    fn read_only_rootfs_rejects_root_writes_and_describes_a_root_boot() {
+        let readonly = ReadOnlyBox::new();
+        readonly.setup(&[]);
+
+        std::fs::write(readonly.project.join("hang"), "").unwrap();
+        let root = Command::new(&readonly.suite.terra)
+            .args(["readonly", "-d", "--root", "--project", readonly.project()])
+            .env("HOME", &readonly.suite.home)
+            .env("USERPROFILE", &readonly.suite.home)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(root.status.success(), "{root:?}");
+        let (out, _) = readonly.suite.exec_in(
+            "readonly",
+            &readonly.project,
+            true,
+            &[
+                "sh",
+                "-c",
+                "touch /etc/x 2>&1; grep -m1 '^- You run as' /terra/README.md",
+            ],
+        );
+        assert!(out.contains("Read-only file system"), "{out}");
+        assert!(
+            out.contains("- You run as `root`"),
+            "README ignores --root:\n{out}"
+        );
+        let _ =
+            readonly
+                .suite
+                .run_terra_status(&["readonly", "stop", "--project", readonly.project()]);
+    }
+
+    #[test]
+    #[ignore = "boots a real VM and requires a native hypervisor"]
+    fn rebuild_still_writes_the_read_only_base() {
+        let readonly = ReadOnlyBox::new();
+        readonly.setup(&[]);
+        readonly.setup(&["--rebuild"]);
+        let out = readonly.boot(&[]);
+        assert_workload_facts(&out);
+    }
+}
+
+/// The root image ships the workload identity and links its per-boot files
+/// into tmpfs: `on_create` already sees `terri`, the home belongs to it, the
+/// sudo list is the whole doas policy, and a rule dropped into `/etc/doas.d`
+/// is gone after a restart instead of persisting in the image. `on_create`
+/// replaces two links with a regular file and a directory (a `sed -i` edit),
+/// and setup puts the links back, so neither rule outlives setup.
+#[test]
+#[ignore = "boots a real VM and requires a native hypervisor"]
+fn the_image_ships_the_identity_and_regenerates_per_boot_files() {
+    let suite = Suite::new();
+    let project = suite.create_project_dir("identity");
+    let project = project.to_str().unwrap();
+    let recipe = suite.get_work_dir().join("identity.yaml");
+    std::fs::write(
+        &recipe,
+        "hooks:\n  on_create:\n    - echo \"CREATE_TERRI=$(id -u terri)\"\n    - sed -i 's/^#.*/permit nopass terri/' /etc/doas.conf\n    - rm /etc/doas.d && mkdir /etc/doas.d && echo 'permit nopass terri' > /etc/doas.d/x.conf\nsudo: [id]\nworkload:\n  entrypoint: /bin/sleep\n  args: [infinity]\n",
+    )
+    .unwrap();
+    let (setup, code) =
+        suite.run_terra_status(&[recipe.to_str().unwrap(), "setup", "--project", project]);
+    assert_eq!(code, 0, "{setup}");
+    assert!(setup.contains("CREATE_TERRI=1000"), "{setup}");
+
+    let start = || {
+        let (out, code) = suite.run_terra_status(&["identity", "-d", "--project", project]);
+        assert_eq!(code, 0, "{out}");
+    };
+    let exec = |root: bool, script: &str| {
+        let (out, code) =
+            suite.exec_in("identity", Path::new(project), root, &["sh", "-c", script]);
+        assert_eq!(code, 0, "{script}: {out}");
+        out
+    };
+    let stop = || {
+        let (out, code) = suite.run_terra_status(&["identity", "stop", "--project", project]);
+        assert_eq!(code, 0, "{out}");
+    };
+
+    start();
+    let facts = exec(
+        false,
+        "echo HOME_OWNER=$(stat -c %u:%g /home/terri); \
+         for f in /etc/resolv.conf /etc/doas.conf /etc/doas.d /etc/localtime /terra/README.md; do \
+           echo LINK $f $(readlink $f); done; \
+         echo SUDO_ID=$(sudo id -u); \
+         sudo true 2>/dev/null && echo SUDO_TRUE_ALLOWED || echo SUDO_TRUE_DENIED",
+    );
+    assert!(facts.contains("HOME_OWNER=1000:1000"), "{facts}");
+    for (link, target) in [
+        ("/etc/resolv.conf", "/run/terra/resolv.conf"),
+        ("/etc/doas.conf", "/run/terra/doas.conf"),
+        ("/etc/doas.d", "/run/terra/doas.d"),
+        ("/etc/localtime", "/run/terra/localtime"),
+        ("/terra/README.md", "/run/terra/README.md"),
+    ] {
+        assert!(facts.contains(&format!("LINK {link} {target}")), "{facts}");
+    }
+    assert!(facts.contains("SUDO_ID=0"), "{facts}");
+    assert!(facts.contains("SUDO_TRUE_DENIED"), "{facts}");
+    exec(true, "echo 'permit nopass 1000' > /etc/doas.d/extra.conf");
+    stop();
+
+    start();
+    // As root: doas.d is 0750 root, so terri's `ls` would print nothing whatever it held.
+    let after = exec(
+        true,
+        "ls -A /etc/doas.d >/dev/null && echo DOAS_D=[$(ls -A /etc/doas.d)]",
+    );
+    assert!(after.contains("DOAS_D=[]"), "{after}");
+    stop();
+}

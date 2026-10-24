@@ -42,10 +42,13 @@ const ARTIFACTS: TrustedArtifacts = {
 };
 
 fn volume_disk_paths(spec: &BootSpec, bx: &BoxRef) -> Vec<std::path::PathBuf> {
+    if spec.mode == PlanMode::Create {
+        return Vec::new();
+    }
     spec.cfg
         .volumes
         .iter()
-        .map(|volume| bx.get_volume_image(&volume.name))
+        .map(|volume| bx.get_volume_image_path(&volume.name))
         .collect()
 }
 
@@ -150,7 +153,7 @@ pub async fn run(
 
     let kernel = image::load_kernel()?;
     let boot_disk = image::load_boot_image()?;
-    let root_disk = bx.get_dir().join(crate::state::ROOTFS_FILE);
+    let rootfs_disk = bx.get_dir().join(crate::state::ROOTFS_FILE);
     let plan = encode_boot_plan(spec, bx.get_name())?;
     let volume_disks = volume_disk_paths(spec, bx);
     let shares = open_shares(spec)?;
@@ -165,7 +168,7 @@ pub async fn run(
     log::info!(
         "terra: {} {bx} ({} vCPU, {} MiB)",
         if spec.mode == PlanMode::Create {
-            "baking"
+            "setting up"
         } else {
             "starting"
         },
@@ -187,7 +190,7 @@ pub async fn run(
         BoxRef::publish_pid(
             lock.context("missing VM run lock")?,
             std::process::id(),
-            spec.mode == PlanMode::Create,
+            spec.mode,
         )
         .context("publishing the VM process identity")?;
     }
@@ -195,7 +198,8 @@ pub async fn run(
         component_memory_limits,
         kernel,
         boot_disk,
-        root_disk,
+        rootfs_disk,
+        rootfs_access: super::rootfs_access(spec),
         volume_disks,
         shares,
         plan,
@@ -261,7 +265,35 @@ fn prepare_network_backend(
 mod tests {
     use super::*;
     use crate::config::{Config, Mount};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn setup_attaches_no_volume_disks() {
+        let bx = BoxRef::from_state_dir(PathBuf::from("/box"), Path::new("/project"));
+        let mut spec = BootSpec {
+            cfg: Config {
+                volumes: vec![crate::config::Volume {
+                    name: "scratch".into(),
+                    guest: "/scratch".into(),
+                    size_mib: 8,
+                    lifetime: crate::config::VolumeLifetime::Boot,
+                }],
+                ..Config::default()
+            },
+            project_dir: PathBuf::from("/project"),
+            root: false,
+            mode: PlanMode::Create,
+            foreground: false,
+            host_publishes_pid: false,
+            network_broker: None,
+        };
+        assert_eq!(volume_disk_paths(&spec, &bx), [] as [PathBuf; 0]);
+        spec.mode = PlanMode::Run;
+        assert_eq!(
+            volume_disk_paths(&spec, &bx),
+            [bx.get_volume_image_path("scratch")]
+        );
+    }
 
     fn embedded_artifacts() -> [TrustedArtifact; 8] {
         let TrustedArtifacts {
@@ -467,11 +499,11 @@ mod tests {
     }
 
     #[test]
-    fn bake_has_no_host_shares() {
+    fn setup_boot_has_no_host_shares() {
         let spec = BootSpec {
             cfg: Config {
                 mounts: vec![Mount {
-                    host: PathBuf::from("/not-opened-for-a-bake"),
+                    host: PathBuf::from("/not-opened-for-a-setup-boot"),
                     guest: PathBuf::from("/work"),
                     readonly: false,
                 }],
@@ -484,10 +516,6 @@ mod tests {
             host_publishes_pid: false,
             network_broker: None,
         };
-        let grants = open_shares(&spec).unwrap();
-        let plan = super::super::build_plan(&spec, "dev").unwrap().shares;
-
-        assert!(grants.is_empty());
-        assert_eq!(plan, Vec::<terra_protocol::Share>::new());
+        assert!(open_shares(&spec).unwrap().is_empty());
     }
 }

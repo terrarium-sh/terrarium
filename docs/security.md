@@ -85,6 +85,12 @@ the guest through a writable share. Metadata-only copies skip files with
 several hard links, so they cannot change another path's permissions or
 timestamps. `--delete` removes extra files only inside the destination tree.
 
+With `hw.rootfs_readonly: true`, every boot after setup opens `rootfs.img`
+read-only on the host and flags the disk read-only, so guest root cannot change
+the root image; the VM worker's sandbox is also granted it read-only. It
+protects only that image: writable mounts and `lifetime: box` volumes still
+keep whatever the guest writes.
+
 ## Layers on the host
 
 - **Wasm components.** Each device runs in its own Wasmtime store with its own

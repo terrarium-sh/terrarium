@@ -178,19 +178,19 @@ fn install_sparse(
 }
 
 /// Write the prebaked root filesystem to `path`, sized to `size_mib` (sparse;
-/// the guest grows the filesystem into it on first boot).
-pub fn ensure_rootfs_image(path: &Path, size_mib: u32) -> Result<()> {
-    ensure_image(path, size_mib, ROOTFS_IMG_GZ, "hw.rootfs_mib")
+/// setup's VM grows the filesystem into it).
+pub fn install_or_grow_rootfs_image(path: &Path, size_mib: u32) -> Result<()> {
+    install_or_grow_image(path, size_mib, ROOTFS_IMG_GZ, "hw.rootfs_mib")
 }
 
-pub fn ensure_volume_image(path: &Path, size_mib: u32) -> Result<()> {
-    ensure_image(path, size_mib, VOLUME_IMG_GZ, "size_mib")
+pub fn install_or_grow_volume_image(path: &Path, size_mib: u32) -> Result<()> {
+    install_or_grow_image(path, size_mib, VOLUME_IMG_GZ, "size_mib")
 }
 
-fn ensure_image(path: &Path, size_mib: u32, gz: &[u8], field: &str) -> Result<()> {
+fn install_or_grow_image(path: &Path, size_mib: u32, gz: &[u8], field: &str) -> Result<()> {
     let target = u64::from(size_mib) * BYTES_PER_MIB;
     if path.exists() {
-        return resize_image(path, target, field);
+        return grow_image(path, target, field);
     }
     // One byte past the cap proves it does not fit without unpacking it all.
     let mut bounded = flate2::read::GzDecoder::new(gz).take(target + 1);
@@ -205,7 +205,7 @@ fn ensure_image(path: &Path, size_mib: u32, gz: &[u8], field: &str) -> Result<()
 
 /// Growing a sparse image is free; shrinking would truncate the filesystem
 /// inside it, so a smaller size only warns and keeps the current size.
-fn resize_image(path: &Path, target: u64, field: &str) -> Result<()> {
+fn grow_image(path: &Path, target: u64, field: &str) -> Result<()> {
     let image = crate::sys::open_regular_file_for_write(path, false)
         .with_context(|| format!("opening {}", path.display()))?;
     let current = image
@@ -235,7 +235,7 @@ fn resize_image(path: &Path, target: u64, field: &str) -> Result<()> {
         }
         std::cmp::Ordering::Less => {
             log::warn!(
-                "{field} is {} MiB but {} is {} MiB; keeping existing filesystem size (terra rm rebuilds it)",
+                "{field} is {} MiB but {} is {} MiB; keeping existing filesystem size (`terra rm`, then `terra setup`, rebuilds it)",
                 mib(target),
                 name,
                 mib(current)
@@ -243,7 +243,7 @@ fn resize_image(path: &Path, target: u64, field: &str) -> Result<()> {
             eprintln!(
                 "terra: warning: {field} is {} MiB but {} is already {} MiB; \
                  shrinking would truncate the filesystem, so the existing size is kept \
-                 (`terra rm` rebuilds the box at the smaller size)",
+                 (`terra rm`, then `terra setup`, rebuilds the box at the smaller size)",
                 mib(target),
                 name,
                 mib(current),
@@ -294,13 +294,13 @@ mod tests {
             .set_len(4 * mib)
             .unwrap();
 
-        resize_image(&img, 4 * mib, "hw.rootfs_mib").unwrap(); // unchanged
+        grow_image(&img, 4 * mib, "hw.rootfs_mib").unwrap(); // unchanged
         assert_eq!(std::fs::metadata(&img).unwrap().len(), 4 * mib);
 
-        resize_image(&img, 16 * mib, "hw.rootfs_mib").unwrap(); // grows
+        grow_image(&img, 16 * mib, "hw.rootfs_mib").unwrap(); // grows
         assert_eq!(std::fs::metadata(&img).unwrap().len(), 16 * mib);
 
-        resize_image(&img, 8 * mib, "hw.rootfs_mib").unwrap(); // refuses to shrink
+        grow_image(&img, 8 * mib, "hw.rootfs_mib").unwrap(); // refuses to shrink
         assert_eq!(std::fs::metadata(&img).unwrap().len(), 16 * mib);
     }
 
@@ -313,17 +313,17 @@ mod tests {
         crate::sys::symlink_file(&redirected, &image).unwrap();
 
         for target in [0, 8, 16] {
-            assert!(resize_image(&image, target, "size_mib").is_err());
+            assert!(grow_image(&image, target, "size_mib").is_err());
             assert_eq!(std::fs::read(&redirected).unwrap(), b"original");
         }
-        assert!(ensure_rootfs_image(&image, 1).is_err());
-        assert!(ensure_volume_image(&image, 1).is_err());
+        assert!(install_or_grow_rootfs_image(&image, 1).is_err());
+        assert!(install_or_grow_volume_image(&image, 1).is_err());
     }
 
     #[test]
     fn a_rootfs_smaller_than_the_prebaked_image_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(ensure_rootfs_image(&dir.path().join("tiny.img"), 1).is_err());
+        assert!(install_or_grow_rootfs_image(&dir.path().join("tiny.img"), 1).is_err());
     }
 
     #[test]
@@ -358,7 +358,7 @@ mod tests {
 
         // A prebaked filesystem that does not fit is the refusal every caller
         // can actually reach.
-        assert!(ensure_volume_image(&img, 1).is_err());
+        assert!(install_or_grow_volume_image(&img, 1).is_err());
         assert!(!img.exists(), "a half-written image was installed");
         let left: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()

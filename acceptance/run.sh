@@ -7,7 +7,7 @@ set -eu
 
 usage="usage: run.sh [--terra PATH] [--suite DIR]"
 repo="terrarium-sh/terrarium"
-boxes="probe isolated offline bad-bake"
+boxes="probe isolated offline readonly bad-bake"
 
 terra=terra
 suite=
@@ -307,6 +307,19 @@ run offline stop
 expect_listed offline stopped
 passed
 
+begin "a read-only root refuses writes; boot-lifetime volumes start empty"
+run ./readonly.yaml setup
+run readonly -d
+expect_contains "$(output readonly exec --no-tty --root -- sh -c 'touch /etc/probe 2>&1; true')" \
+  "Read-only file system"
+run readonly exec --no-tty -- sh -ec 'echo KEPT > /kept/value; echo GONE > /scratch/value'
+run readonly stop
+run readonly -d
+expect "$(output readonly exec --no-tty -- cat /kept/value)" KEPT
+run readonly exec --no-tty -- sh -ec 'test ! -e /scratch/value'
+run readonly stop
+passed
+
 begin "stop runs pre_stop and keeps the box"
 run probe stop
 expect_listed probe stopped
@@ -324,6 +337,7 @@ restarted=$(output probe --foreground --root -- sh -e /suite/guest/storage-resta
 expect_contains "$restarted" RESTART_OK
 expect_contains "$restarted" STOP_OK
 run probe storage import "$work/storage.terra"
+run probe setup
 expect_contains "$(output probe --foreground -- \
   sh -ec 'test $(cat /data/value) = PERSISTED; echo RESTORED_OK')" RESTORED_OK
 passed

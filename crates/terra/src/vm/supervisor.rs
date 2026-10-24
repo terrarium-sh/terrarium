@@ -32,7 +32,9 @@ const BROKER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(super) fn spawn(bx: &BoxRef, spec: &BootSpec, lock: &File, exe: &Path) -> Result<LaunchedVm> {
-    super::resources::prepare_volumes(spec, bx)?;
+    if spec.mode == terra_protocol::PlanMode::Run {
+        super::resources::prepare_volumes(spec, bx)?;
+    }
     let mut child_spec = spec.clone();
     child_spec.host_publishes_pid = true;
     ensure!(
@@ -116,7 +118,11 @@ fn run_box(dir: PathBuf, lock: &File) -> Result<ExitCode> {
     let bx = BoxRef::from_state_dir(dir, &boot.project_dir);
     let supervisor_identity =
         sys::create_regular_file(&bx.get_dir().join(state::SUPERVISOR_PID_FILE))?;
-    BoxRef::publish_pid(&supervisor_identity, std::process::id(), false)?;
+    BoxRef::publish_pid(
+        &supervisor_identity,
+        std::process::id(),
+        terra_protocol::PlanMode::Run,
+    )?;
     let identity = sys::create_regular_file(&bx.get_dir().join(state::HOST_PID_FILE))?;
     #[cfg(any(target_os = "macos", windows))]
     prepare_vm_outputs(&bx)?;
@@ -162,6 +168,9 @@ fn run_box(dir: PathBuf, lock: &File) -> Result<ExitCode> {
         STARTUP_TIMEOUT,
     ));
     drop((vm, broker));
+    if boot.mode == terra_protocol::PlanMode::Run {
+        super::resources::remove_boot_lifetime_volume_images(&boot, &bx);
+    }
     result
 }
 
@@ -604,6 +613,43 @@ fn reap_adopted_children() -> Result<()> {
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    #[test]
+    fn setup_launch_skips_volume_preparation() {
+        let root = tempfile::tempdir().unwrap();
+        let bx = BoxRef::from_state_dir(root.path().into(), root.path());
+        std::fs::create_dir(bx.get_volume_image_path("scratch")).unwrap();
+        let lock = tempfile::tempfile().unwrap();
+        let executable = root.path().join("missing-supervisor");
+        let mut boot = BootSpec {
+            cfg: crate::config::Config {
+                volumes: vec![crate::config::Volume {
+                    name: "scratch".into(),
+                    guest: "/scratch".into(),
+                    size_mib: 8,
+                    lifetime: crate::config::VolumeLifetime::Boot,
+                }],
+                ..crate::config::Config::default()
+            },
+            project_dir: root.path().into(),
+            root: false,
+            mode: terra_protocol::PlanMode::Create,
+            foreground: false,
+            host_publishes_pid: false,
+            network_broker: None,
+        };
+        let error = spawn(&bx, &boot, &lock, &executable).err().unwrap();
+        assert!(
+            error.to_string().contains("starting box supervisor"),
+            "{error:#}"
+        );
+        boot.mode = terra_protocol::PlanMode::Run;
+        let error = spawn(&bx, &boot, &lock, &executable).err().unwrap();
+        assert!(
+            error.to_string().contains("emptying volume image"),
+            "{error:#}"
+        );
+    }
 
     fn startup_input(config: &[u8]) -> BrokerStartup {
         BrokerStartup {

@@ -1,13 +1,13 @@
-//! End-to-end tests: run the compiled `terra` binary and assert on stdout,
-//! stderr, and exit codes. Only paths that fail before a VM boot are exercised,
-//! so no KVM or rootfs download is needed; booting is covered by the boot suite
-//! by `tests/boot.rs` (`cargo test --test boot -- --ignored`, needs /dev/kvm).
+//! Host-side command tests; setup completion is simulated when the VM cannot
+//! open its console. Real VM behavior is covered by `tests/boot.rs`.
 
 // Integration tests are their own crate and cannot inherit the crate roots'
 // `#![cfg_attr(test, ...)]` opt-out, so it is spelled out here.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::process::{Command, Output};
+
+use sha2::{Digest as _, Sha256};
 
 /// Run terra from wherever the test process is, for cases that address a box by
 /// `--project` and never touch `~/.terra`.
@@ -27,21 +27,74 @@ fn run_terra_in(dir: &std::path::Path, home: &std::path::Path, args: &[&str]) ->
     )
 }
 
+/// Simulate setup completion after a pre-console VM failure, preserving host
+/// preparation for subsequent assertions. Boot tests cover real setup failures.
+fn setup_without_vm(dir: &std::path::Path, home: &std::path::Path, args: &[&str]) -> Output {
+    let out = run_terra_in(dir, home, args);
+    if out.status.success() {
+        return out;
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(terra::SETUP_VM_STOPPED_BEFORE_CONSOLE),
+        "setup failed other than by its VM not launching: {stderr}"
+    );
+    // Only the box this setup prepared lacks the stamp its VM writes on success;
+    // writing it lets later steps meet a set-up box.
+    let unfinished: Vec<_> = find_boxes(home)
+        .into_iter()
+        .filter(|state| {
+            state.join("recipe.yaml").exists()
+                && state.join("rootfs.img").exists()
+                && !state.join("setup-finished").exists()
+        })
+        .collect();
+    assert_eq!(
+        unfinished.len(),
+        1,
+        "expected one box whose setup VM did not run: {unfinished:?}\n{stderr}"
+    );
+    let recipe = std::fs::read(unfinished[0].join("recipe.yaml")).unwrap();
+    std::fs::write(unfinished[0].join("setup-finished"), Sha256::digest(recipe)).unwrap();
+    Output {
+        status: successful_exit_status(),
+        ..out
+    }
+}
+
+fn successful_exit_status() -> std::process::ExitStatus {
+    #[cfg(unix)]
+    {
+        std::os::unix::process::ExitStatusExt::from_raw(0)
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::process::ExitStatusExt::from_raw(0)
+    }
+}
+
+fn list_subdirectories(path: &std::path::Path) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(path)
+        .unwrap_or_else(|error| panic!("reading {}: {error}", path.display()))
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.is_dir())
+        .collect()
+}
+
+fn find_boxes(home: &std::path::Path) -> Vec<std::path::PathBuf> {
+    list_subdirectories(&home.join(".terra").join("box"))
+        .iter()
+        .flat_map(|project| list_subdirectories(project))
+        .collect()
+}
+
 /// The state directory of the one box under `~/.terra/box` - the layout is
 /// `box/<hashed project>/<box name>/`, and each test gets its own empty home,
 /// so "the one" is well defined.
 fn find_only_box(home: &std::path::Path) -> std::path::PathBuf {
-    let dirs = |p: &std::path::Path| -> Vec<std::path::PathBuf> {
-        std::fs::read_dir(p)
-            .expect("no ~/.terra/box")
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.is_dir())
-            .collect()
-    };
-    let projects = dirs(&home.join(".terra").join("box"));
+    let projects = list_subdirectories(&home.join(".terra").join("box"));
     assert_eq!(projects.len(), 1, "expected one project: {projects:?}");
-    let mut boxes = dirs(&projects[0]);
+    let mut boxes = list_subdirectories(&projects[0]);
     assert_eq!(boxes.len(), 1, "expected one box: {boxes:?}");
     boxes.pop().unwrap()
 }
@@ -112,7 +165,7 @@ fn setup_pins_a_recipe_and_the_box_then_answers_from_it() {
     let home = tempfile::tempdir().unwrap();
 
     std::fs::write(dir.path().join("b.yaml"), "hw:\n  cpus: 1\n").unwrap();
-    let first = run_terra_in(dir.path(), home.path(), &["./b.yaml", "setup"]);
+    let first = setup_without_vm(dir.path(), home.path(), &["./b.yaml", "setup"]);
     assert!(
         first.status.success(),
         "{}",
@@ -134,7 +187,7 @@ fn setup_pins_a_recipe_and_the_box_then_answers_from_it() {
     // edit made to that copy is what answers.
     let marker = "env:\n  KEPT_BY_THE_BOX: \"1\"\n";
     std::fs::write(&recipe, marker).unwrap();
-    let second = run_terra_in(dir.path(), home.path(), &["b", "setup"]);
+    let second = setup_without_vm(dir.path(), home.path(), &["b", "setup"]);
     assert!(
         second.status.success(),
         "{}",
@@ -153,7 +206,7 @@ fn setup_adopts_recipe_edits_and_start_does_not() {
     let other = dir.path().join("other.yaml");
     std::fs::write(&other, "hw:\n  cpus: 3\n").unwrap();
 
-    let made = run_terra_in(dir.path(), home.path(), &["./other.yaml", "setup"]);
+    let made = setup_without_vm(dir.path(), home.path(), &["./other.yaml", "setup"]);
     assert!(
         made.status.success(),
         "{}",
@@ -173,13 +226,13 @@ fn setup_adopts_recipe_edits_and_start_does_not() {
     );
 
     // `setup` is the adopt step, and says so.
-    let adopted = run_terra_in(dir.path(), home.path(), &["./other.yaml", "setup"]);
+    let adopted = setup_without_vm(dir.path(), home.path(), &["./other.yaml", "setup"]);
     assert!(adopted.status.success());
     assert!(String::from_utf8_lossy(&adopted.stderr).contains("recipe updated"));
     let recipe = std::fs::read_to_string(state.join("recipe.yaml")).unwrap();
     assert!(recipe.contains("cpus: 5"));
 
-    let again = run_terra_in(dir.path(), home.path(), &["./other.yaml", "setup"]);
+    let again = setup_without_vm(dir.path(), home.path(), &["./other.yaml", "setup"]);
     assert!(again.status.success());
     assert!(!String::from_utf8_lossy(&again.stderr).contains("recipe updated"));
 }
@@ -198,7 +251,7 @@ fn a_box_can_share_the_directory_it_is_a_box_of() {
     let recipe = dir.path().join("sandbox.yaml");
     std::fs::write(&recipe, "mounts:\n  - host: .\n    guest: /work\n").unwrap();
 
-    let out = run_terra_in(dir.path(), home.path(), &["./sandbox.yaml", "setup"]);
+    let out = setup_without_vm(dir.path(), home.path(), &["./sandbox.yaml", "setup"]);
     assert!(
         out.status.success(),
         "{}",
@@ -257,7 +310,7 @@ fn a_box_can_share_the_directory_it_is_a_box_of() {
     );
 
     // …and --trust-recipe pins it, out loud, without touching the filesystem.
-    let trusted = run_terra_in(
+    let trusted = setup_without_vm(
         dir.path(),
         home.path(),
         &["./sandbox.yaml", "setup", "--trust-recipe"],
@@ -292,7 +345,7 @@ fn a_recipe_a_sibling_box_could_have_written_is_not_pinned_silently() {
         "mounts:\n  - host: .\n    guest: /work\n",
     )
     .unwrap();
-    let dev = run_terra_in(dir.path(), home.path(), &["./dev.yaml", "setup"]);
+    let dev = setup_without_vm(dir.path(), home.path(), &["./dev.yaml", "setup"]);
     assert!(
         dev.status.success(),
         "{}",
@@ -316,13 +369,11 @@ fn a_recipe_a_sibling_box_could_have_written_is_not_pinned_silently() {
     )
     .unwrap();
 
-    // `terra test` must not pin it. There is no terminal here, so there is
-    // nobody to offer a setup to - and a script never pins a policy.
+    // `terra test` must not pin it: only setup reads the manifest's recipe.
     let started = run_terra_in(dir.path(), home.path(), &["test"]);
     assert_eq!(started.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&started.stderr);
-    assert!(stderr.contains("would build it"), "{stderr}");
-    assert!(stderr.contains("no terminal"), "{stderr}");
+    assert!(stderr.contains("terra test setup"), "{stderr}");
 
     // …and `terra setup test`, which does read it, asks first - here, with no
     // terminal, refuses - naming the share that could have authored it and what
@@ -361,7 +412,7 @@ fn a_directory_can_hold_several_named_boxes() {
     std::fs::write(dir.path().join("ci.yaml"), "hw:\n  cpus: 2\n").unwrap();
 
     for r in ["./dev.yaml", "./ci.yaml"] {
-        let out = run_terra_in(dir.path(), home.path(), &[r, "setup"]);
+        let out = setup_without_vm(dir.path(), home.path(), &[r, "setup"]);
         assert!(
             out.status.success(),
             "{}",
@@ -403,6 +454,36 @@ fn a_directory_can_hold_several_named_boxes() {
     );
 }
 
+/// A boot runs the pinned recipe, never the file the manifest names; when that
+/// file changed since setup, the boot says so instead of silently ignoring it.
+/// The boot runs `true`, so it ends whether or not a VM can launch here.
+#[test]
+fn a_start_notes_a_manifest_recipe_that_changed_since_setup() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("dev.yaml"), "hw:\n  cpus: 1\n").unwrap();
+    std::fs::write(dir.path().join("terra.yaml"), "boxes:\n  dev: ./dev.yaml\n").unwrap();
+    let made = setup_without_vm(dir.path(), home.path(), &["dev", "setup"]);
+    assert!(made.status.success());
+
+    let boot = ["dev", "--foreground", "--", "true"];
+    let unchanged = run_terra_in(dir.path(), home.path(), &boot);
+    let stderr = String::from_utf8_lossy(&unchanged.stderr);
+    assert!(!stderr.contains("differs from"), "{stderr}");
+
+    std::fs::write(dir.path().join("dev.yaml"), "hw:\n  cpus: 2\n").unwrap();
+    let changed = run_terra_in(dir.path(), home.path(), &boot);
+    let stderr = String::from_utf8_lossy(&changed.stderr);
+    assert!(
+        stderr.contains("differs from dev's pinned recipe"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("`terra dev setup` applies the change"),
+        "{stderr}"
+    );
+}
+
 /// `terra.yaml` maps the project's box names to recipes - references only, so a
 /// guest that can write it (it lives in the tree boxes share) can at worst
 /// repoint a name at another recipe file, and pinning one of those is gated at
@@ -428,7 +509,7 @@ fn the_manifest_names_the_projects_boxes() {
     assert!(stderr.contains("dev") && stderr.contains("ci"), "{stderr}");
 
     // A manifest name resolves through its reference and names the box.
-    let made = run_terra_in(dir.path(), home.path(), &["dev", "setup"]);
+    let made = setup_without_vm(dir.path(), home.path(), &["dev", "setup"]);
     assert!(
         made.status.success(),
         "{}",
@@ -486,7 +567,7 @@ fn ls_all_lists_boxes_by_the_directory_they_belong_to() {
     // call "stopped".
     for d in [one.path(), two.path()] {
         std::fs::write(d.join("b.yaml"), "hw:\n  cpus: 1\n").unwrap();
-        let out = run_terra_in(d, home.path(), &["./b.yaml", "setup"]);
+        let out = setup_without_vm(d, home.path(), &["./b.yaml", "setup"]);
         assert!(
             out.status.success(),
             "{}",
@@ -501,8 +582,8 @@ fn ls_all_lists_boxes_by_the_directory_they_belong_to() {
             "{stdout}"
         );
     }
-    // Set up but never booted: `terra setup` with no `on_create` never starts
-    // a VM, so there is a filesystem and nothing holding the lock.
+    // Set up but never booted: setup's VM has exited, so there is a
+    // filesystem and nothing holding the lock.
     assert_eq!(stdout.matches("stopped").count(), 2, "{stdout}");
 
     // A box outlives the directory it was made for, and says so rather than
@@ -536,7 +617,7 @@ fn exec_on_a_box_that_is_not_running_says_so() {
     let home = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("dev.yaml"), "hw:\n  cpus: 1\n").unwrap();
     assert!(
-        run_terra_in(dir.path(), home.path(), &["./dev.yaml", "setup"])
+        setup_without_vm(dir.path(), home.path(), &["./dev.yaml", "setup"])
             .status
             .success()
     );
@@ -617,7 +698,7 @@ fn a_bare_start_without_a_terminal_names_both_ways_to_run() {
     let home = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("dev.yaml"), "hw:\n  cpus: 1\n").unwrap();
     assert!(
-        run_terra_in(dir.path(), home.path(), &["./dev.yaml", "setup"])
+        setup_without_vm(dir.path(), home.path(), &["./dev.yaml", "setup"])
             .status
             .success()
     );
@@ -667,7 +748,7 @@ fn a_message_about_a_box_names_the_box() {
     let home = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("dev.yaml"), "hw:\n  cpus: 1\n").unwrap();
     assert!(
-        run_terra_in(dir.path(), home.path(), &["./dev.yaml", "setup"])
+        setup_without_vm(dir.path(), home.path(), &["./dev.yaml", "setup"])
             .status
             .success()
     );
@@ -680,9 +761,8 @@ fn a_message_about_a_box_names_the_box() {
     assert!(stderr.contains(&named), "{stderr}");
 }
 
-/// A bare `terra` with nothing set up: no terminal here, so there is nobody to
-/// offer a setup to and it must say what to run instead - never pin a recipe on
-/// a script's behalf.
+/// A bare `terra` with nothing set up never sets one up, terminal or not: only
+/// `terra <box> setup` creates or pins a box, so it says what to run instead.
 #[test]
 fn the_bare_form_without_a_recipe_says_how_to_set_one_up() {
     let dir = tempfile::tempdir().unwrap();
@@ -717,7 +797,7 @@ fn a_terra_word_cannot_name_a_box() {
 
     // …and the names people actually give sandboxes still work.
     std::fs::write(dir.path().join("dev.yaml"), "hw:\n  cpus: 1\n").unwrap();
-    let ok = run_terra_in(dir.path(), home.path(), &["./dev.yaml", "setup"]);
+    let ok = setup_without_vm(dir.path(), home.path(), &["./dev.yaml", "setup"]);
     assert!(
         ok.status.success(),
         "{}",
@@ -746,7 +826,7 @@ fn ls_reports_a_state_line_per_box() {
     assert!(empty.stdout.is_empty(), "the listing itself is empty");
 
     // Declared in the manifest but never set up: listed, as not created -
-    // a recipe alone can still boot one, so it is a box worth reporting.
+    // `terra <box> setup` builds it from that recipe, so it is a box worth reporting.
     // No `files:` line: there are no files to point at yet.
     std::fs::write(dir.path().join("terra.yaml"), "boxes:\n  b: ./b.yaml\n").unwrap();
     std::fs::write(dir.path().join("b.yaml"), "hw:\n  cpus: 1\n").unwrap();
@@ -757,7 +837,7 @@ fn ls_reports_a_state_line_per_box() {
     assert!(!stdout.contains("files:"), "{stdout}");
 
     // Set up: created, not running.
-    let setup = run_terra_in(dir.path(), home.path(), &["b", "setup"]);
+    let setup = setup_without_vm(dir.path(), home.path(), &["b", "setup"]);
     assert!(
         setup.status.success(),
         "{}",
@@ -815,7 +895,7 @@ fn ls_state_filters_apply_to_every_format() {
     )
     .unwrap();
     for (dir, name) in [(project.path(), "b"), (removed_project.path(), "./b.yaml")] {
-        let setup = run_terra_in(dir, home.path(), &[name, "setup"]);
+        let setup = setup_without_vm(dir, home.path(), &[name, "setup"]);
         assert!(
             setup.status.success(),
             "{}",
@@ -955,7 +1035,7 @@ fn a_missing_recipe_path_is_an_error_even_when_the_box_exists() {
     let home = tempfile::tempdir().unwrap();
     let recipe = dir.path().join("ci.yaml");
     std::fs::write(&recipe, "hw:\n  cpus: 1\n").unwrap();
-    let first = run_terra_in(dir.path(), home.path(), &["./ci.yaml", "setup"]);
+    let first = setup_without_vm(dir.path(), home.path(), &["./ci.yaml", "setup"]);
     assert!(
         first.status.success(),
         "{}",
@@ -968,7 +1048,7 @@ fn a_missing_recipe_path_is_an_error_even_when_the_box_exists() {
     let stderr = String::from_utf8_lossy(&gone.stderr);
     assert!(stderr.contains("not found"), "{stderr}");
 
-    let by_name = run_terra_in(dir.path(), home.path(), &["ci", "setup"]);
+    let by_name = setup_without_vm(dir.path(), home.path(), &["ci", "setup"]);
     assert!(
         by_name.status.success(),
         "{}",
@@ -1034,7 +1114,7 @@ fn show_answers_from_the_pinned_recipe_not_the_source_it_came_from() {
     let source = shared.join("dev.yaml");
     std::fs::write(&source, "hw:\n  cpus: 3\n").unwrap();
 
-    let made = run_terra_in(dir.path(), home.path(), &["~/.terra/dev.yaml", "setup"]);
+    let made = setup_without_vm(dir.path(), home.path(), &["~/.terra/dev.yaml", "setup"]);
     assert!(
         made.status.success(),
         "{}",
@@ -1116,7 +1196,7 @@ fn stop_of_a_stopped_box_succeeds() {
     let dir = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("b.yaml"), "hw:\n  cpus: 1\n").unwrap();
-    run_terra_in(dir.path(), home.path(), &["./b.yaml", "setup"]);
+    setup_without_vm(dir.path(), home.path(), &["./b.yaml", "setup"]);
     let out = run_terra_in(dir.path(), home.path(), &["stop"]);
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("already stopped"));
@@ -1127,7 +1207,11 @@ fn logs_without_a_log_errors() {
     let dir = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("b.yaml"), "hw:\n  cpus: 1\n").unwrap();
-    run_terra_in(dir.path(), home.path(), &["./b.yaml", "setup"]);
+    setup_without_vm(dir.path(), home.path(), &["./b.yaml", "setup"]);
+    // Setup's VM may already have logged; this pins the box that has no log.
+    for log in ["terra.log", "runtime-logs/terra.log"] {
+        let _ = std::fs::remove_file(find_only_box(home.path()).join(log));
+    }
     let out = run_terra_in(dir.path(), home.path(), &["logs"]);
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("no log"));
@@ -1145,7 +1229,7 @@ fn rm_is_repeatable_while_the_box_is_addressable_and_an_error_once_it_is_gone() 
     let dir = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("b.yaml"), "hw:\n  cpus: 1\n").unwrap();
-    run_terra_in(dir.path(), home.path(), &["./b.yaml", "setup"]);
+    setup_without_vm(dir.path(), home.path(), &["./b.yaml", "setup"]);
 
     // The recipe is kept, so the box is still there to remove again.
     for _ in 0..2 {
@@ -1204,13 +1288,13 @@ fn invalid_yaml_reports_parse_error_and_exits_one() {
 }
 
 /// The example recipe shipped at the repo root must be accepted. `terra setup`
-/// performs this check without booting a VM, so this needs no KVM.
+/// checks it before its VM starts, so this needs no KVM.
 #[test]
 fn the_shipped_example_recipe_is_accepted() {
     let dir = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let recipe = concat!(env!("CARGO_MANIFEST_DIR"), "/../../pi-dev.yaml");
-    let out = run_terra_in(dir.path(), home.path(), &[recipe, "setup"]);
+    let out = setup_without_vm(dir.path(), home.path(), &[recipe, "setup"]);
     assert!(
         out.status.success(),
         "{}",

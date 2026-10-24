@@ -1,19 +1,13 @@
 use super::bootstrap::mount;
-use super::hooks::{HOOK_TIMEOUT, wait_for_child};
-use anyhow::{Context, Result, bail, ensure};
+use super::hooks::wait_for_child;
+use anyhow::{Context, Result, ensure};
 use rustix::mount::MountFlags;
 use std::fs;
-use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 use std::process::Command;
 use tokio_util::sync::CancellationToken;
-
-const SUBORDINATE_ID_START: u32 = 100_000;
-const SUBORDINATE_ID_COUNT: u32 = 65_536;
-const DOAS_CONF: &str = "/etc/doas.conf";
-const DOAS_DIR: &str = "/etc/doas.d";
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -143,13 +137,16 @@ pub(super) fn mount_filesystems(plan: &terra_protocol::Plan) -> Result<()> {
         mount_share(share)?;
     }
     for volume in &plan.volumes {
+        // Setup made the mount points in the root image; this creates the ones nested
+        // inside an already-mounted share (`/work/node_modules` under `/work`).
         prepare_mount_point(&volume.guest)?;
         mount(
             Some(&volume.dev),
             &volume.guest,
             Some("ext4"),
             VOLUME_MOUNT_FLAGS,
-        )?;
+        )
+        .with_context(|| format!("mounting volume at {}", volume.guest))?;
         let (uid, gid) = crate::workload::workload_owner();
         if !plan.root
             && let Err(error) = rustix::fs::chown(&volume.guest, uid, gid)
@@ -176,6 +173,19 @@ fn mount_share(share: &terra_protocol::Share) -> Result<()> {
         Some("virtiofs"),
         flags | MountFlags::NOSUID | MountFlags::NODEV,
     )
+    .with_context(|| format!("mounting share at {}", share.guest))
+}
+
+pub(super) fn prepare_mount_points(plan: &terra_protocol::Plan) -> Result<()> {
+    for path in plan
+        .shares
+        .iter()
+        .map(|share| &share.guest)
+        .chain(plan.volumes.iter().map(|volume| &volume.guest))
+    {
+        prepare_mount_point(path)?;
+    }
+    Ok(())
 }
 
 fn prepare_mount_point(path: &str) -> Result<()> {
@@ -183,21 +193,12 @@ fn prepare_mount_point(path: &str) -> Result<()> {
         .with_context(|| format!("creating mount point {path}"))
 }
 
-pub(super) fn ensure_baked(on_create: &[String]) -> Result<()> {
-    if on_create.is_empty() || is_baked(&on_create.join("\n"))? {
-        return Ok(());
-    }
-    bail!(
-        "this box's on_create never finished baking - `terra setup` re-runs it (`--rebuild` for a clean slate)"
-    )
-}
-
 pub(super) fn is_baked(recipe: &str) -> Result<bool> {
     match fs::read_to_string(terra_protocol::RECIPE_STAMP_PATH) {
         Ok(stamped) if stamped == recipe => Ok(true),
         Ok(stamped) if !stamped.is_empty() => {
             eprintln!(
-                "terra-agent: warning: on_create changed since this box was created, and the old one is already baked in; keeping it (`terra rm` rebuilds)"
+                "terra-agent: warning: on_create changed since this box was set up, and the old one already ran; keeping its result (`terra setup --rebuild` runs the new one)"
             );
             Ok(true)
         }
@@ -207,38 +208,7 @@ pub(super) fn is_baked(recipe: &str) -> Result<bool> {
     }
 }
 
-pub(super) async fn configure_user(as_root: bool, cancellation: &CancellationToken) -> Result<()> {
-    if as_root {
-        return Ok(());
-    }
-    let entry = format!("{}:", terra_protocol::WORKLOAD_USER_NAME);
-    if !fs::read_to_string("/etc/passwd")
-        .is_ok_and(|passwords| passwords.lines().any(|line| line.starts_with(&entry)))
-    {
-        let workload_id = terra_protocol::WORKLOAD_ID.to_string();
-        run_quiet_command(
-            "addgroup",
-            &["-g", &workload_id, terra_protocol::WORKLOAD_USER_NAME],
-            cancellation,
-        )
-        .await;
-        run_quiet_command(
-            "adduser",
-            &[
-                "-D",
-                "-u",
-                &workload_id,
-                "-G",
-                terra_protocol::WORKLOAD_USER_NAME,
-                terra_protocol::WORKLOAD_USER_NAME,
-            ],
-            cancellation,
-        )
-        .await;
-    }
-    setup_subordinate_ids("/etc/subuid")?;
-    setup_subordinate_ids("/etc/subgid")?;
-    setup_rootless_container_config()?;
+pub(super) fn prepare_runtime_dir() -> Result<()> {
     let runtime_dir = format!("/run/user/{}", terra_protocol::WORKLOAD_ID);
     fs::create_dir_all(&runtime_dir).with_context(|| format!("creating {runtime_dir}"))?;
     fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o700))?;
@@ -247,123 +217,10 @@ pub(super) async fn configure_user(as_root: bool, cancellation: &CancellationTok
     Ok(())
 }
 
-pub(super) fn configure_sudo(as_root: bool, commands: &[String]) -> Result<()> {
-    use std::fmt::Write as _;
-    if as_root {
-        return Ok(());
-    }
-    match fs::remove_dir_all(DOAS_DIR) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error).context(format!("removing {DOAS_DIR}")),
-    }
-    fs::create_dir_all(DOAS_DIR).with_context(|| format!("creating {DOAS_DIR}"))?;
-    let mut policy =
-        String::from("# Generated by terra from the profile's `sudo:` - edits are overwritten.\n");
-    for command in commands {
-        if command.contains(['\n', '#']) {
-            eprintln!("terra-agent: warning: skipping invalid sudo `{command}`");
-            continue;
-        }
-        let _ = writeln!(
-            policy,
-            "permit nopass {} cmd {command}",
-            terra_protocol::WORKLOAD_ID
-        );
-    }
-    fs::write(DOAS_CONF, policy).with_context(|| format!("writing {DOAS_CONF}"))?;
-    fs::set_permissions(DOAS_CONF, fs::Permissions::from_mode(0o640))
-        .with_context(|| format!("securing {DOAS_CONF}"))?;
-    Ok(())
-}
-
-fn setup_rootless_container_config() -> Result<()> {
-    if !Path::new("/usr/bin/podman").exists() {
-        return Ok(());
-    }
-    let config_dir = format!("{}/.config/containers", terra_protocol::WORKLOAD_HOME);
-    crate::sync::ensure_directory(Path::new(&config_dir), true)?;
-    let config = format!("{config_dir}/containers.conf");
-    match fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&config)
-    {
-        Ok(mut file) => file.write_all(b"[engine]\ncgroup_manager = \"cgroupfs\"\n")?,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error).with_context(|| format!("creating {config}")),
-    }
-    let (uid, gid) = crate::workload::workload_owner();
-    rustix::fs::chown(&config, uid, gid)?;
-    Ok(())
-}
-
-fn setup_subordinate_ids(path: &str) -> Result<()> {
-    let entry = format!(
-        "{}:{SUBORDINATE_ID_START}:{SUBORDINATE_ID_COUNT}",
-        terra_protocol::WORKLOAD_USER_NAME
-    );
-    let contents = match fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(error).with_context(|| format!("reading {path}")),
-    };
-    let prefix = format!("{}:", terra_protocol::WORKLOAD_USER_NAME);
-    if contents.lines().all(|line| !line.starts_with(&prefix)) {
-        let mut file = fs::OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(path)?;
-        if !contents.is_empty() && !contents.ends_with('\n') {
-            writeln!(file)?;
-        }
-        writeln!(file, "{entry}")?;
-    }
-    Ok(())
-}
-
-async fn run_quiet_command(command_name: &str, args: &[&str], cancellation: &CancellationToken) {
-    let mut command = Command::new(command_name);
-    command
-        .args(args)
-        .process_group(0)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    let status = match crate::reap::spawn_owned(|| command.spawn()) {
-        Ok((_, pidfd)) => wait_for_child(&pidfd, HOOK_TIMEOUT, cancellation).await,
-        Err(error) => Err(error),
-    };
-    match status {
-        Ok(status) if status.success() => {}
-        Ok(status) => eprintln!(
-            "terra-agent: warning: `{command_name}` exited {status} - the {} user may be missing",
-            terra_protocol::WORKLOAD_USER_NAME
-        ),
-        Err(error) => eprintln!("terra-agent: warning: could not run `{command_name}`: {error}"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
-    #[test]
-    fn an_empty_on_create_needs_no_bake_stamp() {
-        assert!(ensure_baked(&[]).is_ok());
-    }
-
-    #[test]
-    fn subordinate_ids_append_to_a_file_without_a_trailing_newline() {
-        let path = crate::create_scratch_path("init", "subordinate-ids");
-        fs::write(&path, "other:200000:65536").unwrap();
-        setup_subordinate_ids(path.to_str().unwrap()).unwrap();
-        setup_subordinate_ids(path.to_str().unwrap()).unwrap();
-        assert_eq!(
-            fs::read_to_string(&path).unwrap(),
-            "other:200000:65536\nterri:100000:65536\n"
-        );
-        fs::remove_file(path).unwrap();
-    }
     #[test]
     fn a_symlinked_mount_point_is_supported() {
         let real = crate::create_scratch_path("init", "mp-real");

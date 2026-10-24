@@ -89,9 +89,10 @@ fn build_sandbox_grants(spec: &BootSpec, bx: &BoxRef) -> Result<Vec<Grant>> {
         // grant would expose stale volumes and logs the box configuration no longer names.
         #[cfg(target_os = "macos")]
         grants.push(Grant::new(bx.get_dir(), Access::ReadOnly));
-        for name in [state::ROOTFS_FILE, state::DIAGNOSTICS_LOG] {
-            grants.push(Grant::new(bx.get_dir().join(name), Access::ReadWrite));
-        }
+        grants.push(Grant::new(
+            bx.get_dir().join(state::DIAGNOSTICS_LOG),
+            Access::ReadWrite,
+        ));
         #[cfg(target_os = "macos")]
         grants.push(Grant::new(
             bx.get_dir().join("runtime-logs"),
@@ -102,18 +103,27 @@ fn build_sandbox_grants(spec: &BootSpec, bx: &BoxRef) -> Result<Vec<Grant>> {
             bx.get_dir().join(state::LOG_FILE),
             Access::ReadWrite,
         ));
-        for volume in &spec.cfg.volumes {
-            grants.push(Grant::new(
-                bx.get_volume_image(&volume.name),
-                Access::ReadWrite,
-            ));
+        if spec.mode == terra_protocol::PlanMode::Run {
+            for volume in &spec.cfg.volumes {
+                grants.push(Grant::new(
+                    bx.get_volume_image_path(&volume.name),
+                    Access::ReadWrite,
+                ));
+            }
         }
     }
+    grants.push(Grant::new(
+        bx.get_dir().join(state::ROOTFS_FILE),
+        match super::rootfs_access(spec) {
+            terra_runtime::component::AccessMode::ReadOnly => Access::ReadOnly,
+            terra_runtime::component::AccessMode::ReadWrite => Access::ReadWrite,
+        },
+    ));
     for name in [
         state::RECIPE_FILE,
         state::PINNED_PATHS_FILE,
         state::ORIGIN_FILE,
-        state::BAKE_STAMP,
+        state::SETUP_STAMP,
         state::HOST_PID_FILE,
         state::SUPERVISOR_PID_FILE,
         state::PID_FILE,
@@ -138,7 +148,7 @@ mod tests {
     use terra_protocol::PlanMode;
 
     #[test]
-    fn sandbox_grants_keep_metadata_readonly_and_exclude_bake_shares() {
+    fn sandbox_grants_keep_metadata_readonly_and_exclude_setup_shares() {
         let root = tempfile::tempdir().unwrap();
         let base = root.path().canonicalize().unwrap();
         let box_dir = base.join("box");
@@ -154,12 +164,22 @@ mod tests {
             guest: "/share".into(),
             readonly: true,
         });
+        spec.cfg.volumes.push(config::Volume {
+            name: "scratch".into(),
+            guest: "/scratch".into(),
+            size_mib: 8,
+            lifetime: config::VolumeLifetime::Boot,
+        });
         let grants = build_sandbox_grants(&spec, &bx).unwrap();
         assert!(grants.iter().any(|grant| {
             grant.path == share && grant.access == Access::ReadOnly && grant.directory.is_some()
         }));
         assert!(grants.iter().any(|grant| {
             grant.path == recipe && grant.access == Access::ReadOnly && grant.directory.is_none()
+        }));
+        #[cfg(any(target_os = "macos", windows))]
+        assert!(grants.iter().any(|grant| {
+            grant.path == bx.get_volume_image_path("scratch") && grant.access == Access::ReadWrite
         }));
         #[cfg(target_os = "linux")]
         let box_access = Some(Access::ReadWrite);
@@ -175,19 +195,48 @@ mod tests {
             box_access
         );
         #[cfg(any(target_os = "macos", windows))]
-        for name in [state::ROOTFS_FILE, state::DIAGNOSTICS_LOG] {
-            assert!(grants.iter().any(|grant| {
-                grant.path == bx.get_dir().join(name) && grant.access == Access::ReadWrite
-            }));
-        }
+        assert!(grants.iter().any(|grant| {
+            grant.path == bx.get_dir().join(state::DIAGNOSTICS_LOG)
+                && grant.access == Access::ReadWrite
+        }));
         spec.mode = terra_protocol::PlanMode::Create;
         let grants = build_sandbox_grants(&spec, &bx).unwrap();
         assert!(!grants.iter().any(|grant| grant.path == share));
+        assert!(
+            !grants
+                .iter()
+                .any(|grant| grant.path == bx.get_volume_image_path("scratch"))
+        );
         let moved = base.join("moved");
         std::fs::rename(&share, &moved).unwrap();
         crate::sys::symlink_dir(&moved, &share).unwrap();
         spec.mode = terra_protocol::PlanMode::Run;
         assert!(build_sandbox_grants(&spec, &bx).is_err());
+    }
+
+    /// The worker's sandbox grants the root image exactly the access the disk
+    /// is opened with, so a read-only boot cannot reopen it for writing.
+    #[test]
+    fn the_root_image_grant_follows_the_boots_rootfs_access() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().canonicalize().unwrap();
+        let box_dir = base.join("box");
+        std::fs::create_dir_all(&box_dir).unwrap();
+        let bx = BoxRef::from_state_dir(box_dir, &base);
+        let rootfs = bx.get_dir().join(state::ROOTFS_FILE);
+        let rootfs_grant = |mode, rootfs_readonly| {
+            let mut spec = spec(&base, mode);
+            spec.cfg.hw.rootfs_readonly = rootfs_readonly;
+            build_sandbox_grants(&spec, &bx)
+                .unwrap()
+                .into_iter()
+                .filter(|grant| grant.path == rootfs)
+                .map(|grant| grant.access)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rootfs_grant(PlanMode::Run, true), [Access::ReadOnly]);
+        assert_eq!(rootfs_grant(PlanMode::Create, true), [Access::ReadWrite]);
+        assert_eq!(rootfs_grant(PlanMode::Run, false), [Access::ReadWrite]);
     }
 
     fn spec(project_dir: &Path, mode: PlanMode) -> BootSpec {

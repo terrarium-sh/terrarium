@@ -766,6 +766,7 @@ fn volume_names_reject_windows_filename_metacharacters() {
             name,
             guest: PathBuf::from("/data"),
             size_mib: 64,
+            lifetime: VolumeLifetime::Box,
         });
         assert!(validate(&cfg).is_err());
     }
@@ -786,6 +787,7 @@ fn volume_names_reject_unicode_and_ascii_case_aliases_on_every_platform() {
                 name: name.into(),
                 guest: guest.into(),
                 size_mib: 64,
+                lifetime: VolumeLifetime::Box,
             });
         }
         assert!(validate(&cfg).is_err(), "{first}, {second}");
@@ -804,7 +806,35 @@ fn volume_names_reject_unicode_and_ascii_case_aliases_on_every_platform() {
             name: name.into(),
             guest: "/data".into(),
             size_mib: 64,
+            lifetime: VolumeLifetime::Box,
         });
         assert!(validate(&cfg).is_err(), "{name}");
+    }
+}
+
+#[test]
+fn a_writable_root_and_box_lifetime_are_the_defaults_and_both_round_trip() {
+    let cfg: Config = yaml_serde::from_str("volumes: [{name: v, guest: /v, size_mib: 8}]").unwrap();
+    assert!(!cfg.hw.rootfs_readonly);
+    assert_eq!(cfg.volumes[0].lifetime, VolumeLifetime::Box);
+
+    let cfg: Config = yaml_serde::from_str(
+        "hw: {rootfs_readonly: true}\nvolumes: [{name: v, guest: /v, size_mib: 8, lifetime: boot}]",
+    )
+    .unwrap();
+    assert!(cfg.hw.rootfs_readonly);
+    assert_eq!(cfg.volumes[0].lifetime, VolumeLifetime::Boot);
+    let again: Config = yaml_serde::from_str(&yaml_serde::to_string(&cfg).unwrap()).unwrap();
+    assert_eq!(again, cfg);
+}
+
+#[test]
+fn volume_lifetimes_reject_unknown_values() {
+    for recipe in [
+        "hw: {rootfs_readonly: boot}",
+        "volumes: [{name: v, guest: /v, size_mib: 8, lifetime: forever}]",
+        "volumes: [{name: v, guest: /v, size_mib: 8, lifetime: true}]",
+    ] {
+        assert!(yaml_serde::from_str::<Config>(recipe).is_err(), "{recipe}");
     }
 }

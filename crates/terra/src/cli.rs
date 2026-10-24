@@ -142,7 +142,7 @@ pub fn parse_or_exit() -> Cli {
 #[derive(Subcommand, Debug)]
 pub enum Cmd {
     /// Set up a box for this directory: read a recipe, pin it, build the guest
-    /// filesystem, and bake `on_create`. Safe to run again.
+    /// filesystem, and run `on_create`. Safe to run again.
     ///
     /// The box before it may be a recipe *path* as well as a name, the box then
     /// taking the file's stem: `terra ./pi-dev.yaml setup`.
@@ -194,7 +194,7 @@ pub enum Cmd {
         alias = "ps",
         after_long_help = "EXAMPLES:\n    \
                            terra ls --state running --quiet         Print running box names\n    \
-                           terra ls --state stopped,not_created     Find boxes ready to start\n    \
+                           terra ls --state needs_setup,not_created Find boxes that need setup\n    \
                            terra ls --all --state running --json    Inspect running boxes across projects"
     )]
     Ls(LsArgs),
@@ -203,7 +203,7 @@ pub enum Cmd {
     /// The box's storage - its guest filesystem and volume images.
     Storage(StorageArgs),
     /// Throw a box away: its guest filesystem, volumes, logs and sockets. The
-    /// recipe is kept, so `terra <box>` can build it again from scratch.
+    /// recipe is kept, so `terra <box> setup` can build it again from scratch.
     Rm(RmArgs),
     /// Output shell completion code for the specified shell.
     #[command(after_long_help = "EXAMPLES:\n    \
@@ -255,7 +255,7 @@ pub struct SetupArgs {
     /// it. Required when there is no terminal to ask on.
     #[arg(long)]
     pub trust_recipe: bool,
-    /// Rebuild the guest filesystem from scratch, re-bake `on_create`, and
+    /// Rebuild the guest filesystem from scratch, run `on_create` again, and
     /// remove the volume images the recipe no longer names.
     #[arg(long)]
     pub rebuild: bool,
@@ -400,7 +400,8 @@ pub enum StorageCmd {
     /// the project. The box must not be running.
     Export(StorageFileArgs),
     /// Replace the box's images with those in a file `export` wrote. The box
-    /// must be set up already, and must not be running.
+    /// must be set up already, and must not be running. After a root-image
+    /// import, `terra BOX setup` finishes it before the box starts.
     Import(StorageFileArgs),
     /// Remove the volume images the recipe no longer names. Their data goes
     /// with them.

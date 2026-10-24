@@ -16,5 +16,7 @@
 __pycache__/
 /.agents/
 /.codex/
+/.claude/
 /.aws/
 /.playwright-mcp/
+/.superpowers/

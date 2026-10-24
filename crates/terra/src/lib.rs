@@ -17,6 +17,8 @@ mod policy;
 mod process;
 
 pub use render::render_error;
+#[doc(hidden)]
+pub use vm::boot::SETUP_VM_STOPPED_BEFORE_CONSOLE;
 mod render;
 mod resolve;
 #[doc(hidden)]
@@ -79,7 +81,7 @@ pub async fn run() -> Result<ExitCode> {
     // so it is read here rather than eight times over.
     let name = args.name.as_deref();
     match &args.cmd {
-        None => cmd::start::run(name, &args.boot, &project_dir, &cwd, is_at_a_terminal).await,
+        None => cmd::start::run(name, &args.boot, &project_dir, is_at_a_terminal).await,
         Some(Cmd::Setup(a)) => cmd::setup::run(a, name, &project_dir, &cwd, is_at_a_terminal).await,
         Some(Cmd::Exec(a)) => cmd::exec::run(a, name, &project_dir, is_at_a_terminal).await,
         Some(Cmd::Sync(a)) => cmd::sync::run(a, name, &project_dir).await,

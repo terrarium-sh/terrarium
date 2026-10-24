@@ -27,7 +27,12 @@ test-support = ["packed-image"]
 name = "repack-guest-image"
 required-features = ["packer"]
 
+[[example]]
+name = "guest-identity"
+test = true
+
 [dev-dependencies]
+tempfile.workspace = true
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 tokio = { version = "1", default-features = false, features = ["io-util", "macros", "rt"] }
 

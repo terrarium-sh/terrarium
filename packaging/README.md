@@ -24,15 +24,15 @@ systemctl start terra@pi-dev
 
 The instance name is the recipe file's stem, so the box is named `%i` too. Setup
 runs on every start, which is what makes editing the recipe and restarting the
-service mean something; on an unchanged recipe it pins nothing and re-bakes
-nothing.
+service mean something; on an unchanged recipe it pins nothing and boots no
+setup VM.
 
 A box lives at `~/.terra/box/<slug of its project directory>/<name>`, so what the
 unit's `WorkingDirectory` decides is the slug — which is why it carries `%i`. Do
 not drop it: with a shared working directory both instances resolve to the *same*
-box, and because setup only builds a guest filesystem when none exists, starting
-the second recipe would rewrite that box's recipe and then boot the filesystem
-the first one's workload had been writing to.
+box, and because setup keeps an existing guest filesystem rather than replacing
+it, starting the second recipe would rewrite that box's recipe and then boot the
+filesystem the first one's workload had been writing to.
 
 ## What terra needs from the environment
 

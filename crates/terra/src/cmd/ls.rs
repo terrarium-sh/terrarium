@@ -215,6 +215,8 @@ mod tests {
         let bx = BoxRef::resolve(dir.path(), "dev").unwrap();
         std::fs::create_dir_all(bx.get_dir()).unwrap();
         std::fs::write(bx.get_dir().join(crate::state::ROOTFS_FILE), b"image").unwrap();
+        std::fs::write(bx.get_dir().join(crate::state::RECIPE_FILE), "{}").unwrap();
+        bx.write_setup_stamp().unwrap();
 
         let line = format_tsv_line(&bx, bx.get_state().unwrap());
         let fields: Vec<&str> = line.split('\t').collect();
@@ -237,6 +239,8 @@ mod tests {
         let bx = BoxRef::resolve(dir.path(), "dev").unwrap();
         std::fs::create_dir_all(bx.get_dir()).unwrap();
         std::fs::write(bx.get_dir().join(crate::state::ROOTFS_FILE), b"image").unwrap();
+        std::fs::write(bx.get_dir().join(crate::state::RECIPE_FILE), "{}").unwrap();
+        bx.write_setup_stamp().unwrap();
 
         let entries = vec![
             BoxEntry {

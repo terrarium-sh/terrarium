@@ -30,26 +30,27 @@ pub(super) async fn execute(
     config::enable_loopback()?;
     crate::network::start(plan, shutdown, tasks, diagnostic).await?;
     diagnostic.record_boot_stage("networking_ready");
-    crate::sync::ensure_directory(Path::new(terra_protocol::WORKLOAD_HOME), true)
-        .with_context(|| format!("creating home {}", terra_protocol::WORKLOAD_HOME))?;
     if plan.mode == PlanMode::Create {
         let startup = crate::channel::StartupGate::new();
         let SessionPty { session, .. } =
             start_session(plan, clients, startup, stop, shutdown, tasks).await?;
         crate::report_agent_ready(control).await?;
         diagnostic.record_boot_stage("hooks_start");
-        let outcome = bake_if_stale(&plan.on_create, diagnostic, &session, stop).await;
+        let outcome = async {
+            bake_if_stale(&plan.on_create, diagnostic, &session, stop).await?;
+            write_persistent_state(plan)
+        }
+        .await;
         if outcome.is_ok() {
             diagnostic.record_boot_stage("workload_ready");
         }
         session.broadcast_exit(i32::from(outcome.is_err())).await;
         return outcome.map(|()| 0);
     }
-    config::ensure_baked(&plan.on_create)?;
     config::mount_filesystems(plan)?;
-    fs::write("/terra/README.md", &plan.sandbox_info).context("writing sandbox description")?;
-    config::configure_user(plan.root, stop).await?;
-    config::configure_sudo(plan.root, &plan.sudo)?;
+    if !plan.root {
+        config::prepare_runtime_dir()?;
+    }
     let startup = crate::channel::StartupGate::new();
     let SessionPty {
         session,
@@ -133,6 +134,18 @@ async fn bake_if_stale(
     }
     fs::write(terra_protocol::RECIPE_STAMP_PATH, &recipe)
         .with_context(|| format!("stamping {}", terra_protocol::RECIPE_STAMP_PATH))
+}
+
+/// Creates what the recipe names in the root image; a run boot only finds it there.
+fn write_persistent_state(plan: &Plan) -> Result<()> {
+    terra_protocol::guest_root::link_per_boot_files(Path::new("/"))
+        .context("restoring the per-boot links on_create replaced")?;
+    config::prepare_mount_points(plan)?;
+    if let Some(workdir) = &plan.workdir {
+        crate::sync::ensure_directory(Path::new(workdir), true)
+            .with_context(|| format!("creating workdir {workdir}"))?;
+    }
+    Ok(())
 }
 
 fn restrict_ptrace() {

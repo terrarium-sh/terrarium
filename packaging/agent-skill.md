@@ -30,7 +30,7 @@ it wins.
    | Root for named commands at runtime | `sudo` |
 
 2. **Write the recipe** with the reference below, and a `terra.yaml` naming it
-   unless the user wants a single recipe run by path (`terra ./box.yaml ...`).
+   unless the user wants a single recipe set up by path (`terra ./box.yaml setup`).
 3. **Check it:** `terra <box> setup --dry-run` exits non-zero with the reason
    when terra would refuse it. `terra <box> show` prints the resolved recipe.
 4. **Set it up:** `terra <box> setup` pins the recipe, builds the disk and runs

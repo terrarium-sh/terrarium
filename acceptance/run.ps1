@@ -10,7 +10,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repo = "terrarium-sh/terrarium"
-$boxes = "probe", "isolated", "offline", "bad-bake"
+$boxes = "probe", "isolated", "offline", "readonly", "bad-bake"
 
 if (Test-Path -LiteralPath $Terra -PathType Leaf) {
     $Terra = (Resolve-Path -LiteralPath $Terra).Path
@@ -312,6 +312,20 @@ try {
     Assert-Listed "offline" "stopped"
     Complete-Step
 
+    Start-Step "a read-only root refuses writes; boot-lifetime volumes start empty"
+    Invoke-Terra @("./readonly.yaml", "setup")
+    Invoke-Terra @("readonly", "-d")
+    Assert-Contains (Get-TerraOutput @("readonly", "exec", "--no-tty", "--root", "--",
+        "sh", "-c", "touch /etc/probe 2>&1; true")) "Read-only file system"
+    Invoke-Terra @("readonly", "exec", "--no-tty", "--",
+        "sh", "-ec", "echo KEPT > /kept/value; echo GONE > /scratch/value")
+    Invoke-Terra @("readonly", "stop")
+    Invoke-Terra @("readonly", "-d")
+    Assert-Equal (Get-TerraOutput @("readonly", "exec", "--no-tty", "--", "cat", "/kept/value")) "KEPT"
+    Invoke-Terra @("readonly", "exec", "--no-tty", "--", "sh", "-ec", "test ! -e /scratch/value")
+    Invoke-Terra @("readonly", "stop")
+    Complete-Step
+
     Start-Step "stop runs pre_stop and keeps the box"
     Invoke-Terra @("probe", "stop")
     Assert-Listed "probe" "stopped"
@@ -330,6 +344,7 @@ try {
     Assert-Contains $restarted "RESTART_OK"
     Assert-Contains $restarted "STOP_OK"
     Invoke-Terra @("probe", "storage", "import", $exported)
+    Invoke-Terra @("probe", "setup")
     Assert-Contains (Get-TerraOutput @("probe", "--foreground", "--",
         "sh", "-ec", 'test $(cat /data/value) = PERSISTED; echo RESTORED_OK')) "RESTORED_OK"
     Complete-Step

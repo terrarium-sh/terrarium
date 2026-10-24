@@ -188,6 +188,7 @@ mod tests {
     use std::io::Read as _;
     #[cfg(unix)]
     use std::process::{Child, Command, Stdio};
+    use terra_protocol::PlanMode;
 
     /// A box on disk under a home of this test's own - which has to be in
     /// place before the box is resolved, since that is when its directory is
@@ -212,7 +213,7 @@ mod tests {
         let inheritance = sys::pass_lock(&mut cmd, &lock).unwrap();
         let mut child = cmd.spawn().unwrap();
         drop(inheritance);
-        BoxRef::publish_pid(&lock, child.id(), false).unwrap();
+        BoxRef::publish_pid(&lock, child.id(), PlanMode::Run).unwrap();
         // From here the child alone holds the box, as it does after a boot.
         drop(lock);
         let mut up = [0u8; 1];
@@ -266,15 +267,15 @@ mod tests {
         assert!(err.contains("published no pid"), "{err}");
     }
 
-    /// A bake marks its box and serves nothing to talk to, so waiting it out
-    /// reads as a hang for exactly as long as the bake takes. A mark with no
+    /// A setup marks its box and serves nothing to talk to, so waiting it out
+    /// reads as a hang for exactly as long as the setup takes. A mark with no
     /// published pid refuses immediately, saying what actually holds the box.
     #[test]
-    fn a_bake_mark_with_no_pid_refuses_without_waiting_out_the_grace() {
+    fn a_setup_mark_with_no_pid_refuses_without_waiting_out_the_grace() {
         let dir = tempfile::tempdir().unwrap();
         let (bx, _home) = create_box_in(dir.path());
         let lock = bx.lock_run().unwrap();
-        let marked = BoxRef::mark_baking(&lock).unwrap();
+        let marked = BoxRef::mark_setting_up(&lock).unwrap();
         assert_eq!(bx.read_vm_process(), None, "the mark precedes any child");
 
         // Long enough that a regression to wait-it-out would fail the test run
@@ -282,20 +283,20 @@ mod tests {
         let err = format!(
             "{:#}",
             stop_and_wait(&bx, Duration::from_mins(1), SetupAction::Refuse)
-                .expect_err("a bake is refused")
+                .expect_err("a setup is refused")
         );
         assert!(err.contains("being set up"), "{err}");
         drop(marked);
     }
 
     #[test]
-    fn a_bake_with_a_published_pid_refuses_stop_but_allows_forced_removal() {
+    fn a_setup_with_a_published_pid_refuses_stop_but_allows_forced_removal() {
         let dir = tempfile::tempdir().unwrap();
         let (bx, _home) = create_box_in(dir.path());
         let lock = bx.lock_run().unwrap();
-        let marked = BoxRef::mark_baking(&lock).unwrap();
+        let marked = BoxRef::mark_setting_up(&lock).unwrap();
         let mut child = sys::build_test_child_command().spawn().unwrap();
-        BoxRef::publish_pid(&lock, child.id(), true).unwrap();
+        BoxRef::publish_pid(&lock, child.id(), PlanMode::Create).unwrap();
         assert_matches!(bx.get_holder().unwrap(), Holder::SettingUp);
         let error = stop_and_wait(&bx, Duration::ZERO, SetupAction::Refuse)
             .expect_err("stop must leave setup running");

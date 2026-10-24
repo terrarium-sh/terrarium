@@ -265,17 +265,17 @@ mod tests {
         child.wait().unwrap();
     }
 
-    /// A bake-marked box aborts `--force` as well - mid-bake deletion is what
+    /// A setup-marked box aborts `--force` as well - mid-setup deletion is what
     /// `--rebuild` is for, and the mark says the box's own setup still owns it.
     #[test]
-    fn force_never_deletes_mid_bake() {
+    fn force_never_deletes_mid_setup() {
         let dir = tempfile::tempdir().unwrap();
         let _home = crate::sys::TestHome::new();
         let bx = BoxRef::resolve(dir.path(), "dev").unwrap();
         std::fs::create_dir_all(bx.get_dir()).unwrap();
         std::fs::write(bx.get_dir().join(state::ROOTFS_FILE), b"image").unwrap();
         let lock = bx.lock_run().unwrap();
-        let marked = BoxRef::mark_baking(&lock).unwrap();
+        let marked = BoxRef::mark_setting_up(&lock).unwrap();
 
         let args = crate::cli::RmArgs {
             purge: true,
@@ -283,12 +283,12 @@ mod tests {
             timeout: 0,
         };
         let err = run(&args, Some("dev"), dir.path())
-            .expect_err("a box mid-bake must not be removed")
+            .expect_err("a box mid-setup must not be removed")
             .to_string();
         assert!(err.contains("being set up"), "{err}");
         assert!(
             bx.get_dir().join(state::ROOTFS_FILE).exists(),
-            "the image was deleted mid-bake"
+            "the image was deleted mid-setup"
         );
         drop(marked);
     }

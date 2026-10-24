@@ -52,7 +52,7 @@ pub enum Source {
 pub struct ResolvedBox {
     pub bx: BoxRef,
     pub source: Source,
-    pub manifest_divergence: Option<PathBuf>,
+    pub manifest: Option<config::Manifest>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -68,6 +68,17 @@ enum PinSource {
 }
 
 impl ResolvedBox {
+    /// Find the manifest recipe when its text differs from the pinned recipe.
+    pub(crate) fn find_manifest_divergence(&self) -> Option<PathBuf> {
+        if !matches!(self.source, Source::Pinned) {
+            return None;
+        }
+        let reference = self.manifest.as_ref()?.boxes.get(self.bx.get_name())?;
+        let chosen = read_recipe(reference, self.bx.get_project_dir()).ok()??;
+        let pinned = config::read_recipe_text(&self.bx.get_dir().join(state::RECIPE_FILE)).ok()?;
+        (chosen.text != pinned).then_some(chosen.from)
+    }
+
     pub(crate) fn parse_recipe_without_env_file(&self) -> Result<config::Config> {
         match &self.source {
             Source::Pinned => config::load_path(
@@ -81,7 +92,7 @@ impl ResolvedBox {
     }
 }
 
-/// The box `name` — or the directory's only one — which must be set up already.
+/// The box `name` - or the directory's only one - which must have a pinned recipe.
 pub fn resolve_pinned_box(project_dir: &Path, name: Option<&str>) -> Result<BoxRef> {
     Ok(resolve(name, project_dir, None, Existence::MustExist)?.bx)
 }
@@ -139,7 +150,7 @@ fn resolve_inner(
                 return Ok(ResolvedBox {
                     bx: BoxRef::resolve(project_dir, &name)?,
                     source: Source::File(recipe),
-                    manifest_divergence: None,
+                    manifest: None,
                 });
             }
         },
@@ -159,16 +170,15 @@ fn resolve_inner(
         return Ok(ResolvedBox {
             bx,
             source: Source::Pinned,
-            manifest_divergence: None,
+            manifest,
         });
     }
 
     if pinned && matches!(pin_source, PinSource::Operate) {
-        let divergence = find_manifest_divergence(&bx, manifest.as_ref());
         return Ok(ResolvedBox {
             bx,
             source: Source::Pinned,
-            manifest_divergence: divergence,
+            manifest,
         });
     }
 
@@ -178,7 +188,7 @@ fn resolve_inner(
             return Ok(ResolvedBox {
                 bx,
                 source: Source::Manifest(recipe),
-                manifest_divergence: None,
+                manifest: None,
             });
         }
         let missing = build_missing_recipe_error(bx.get_name(), reference, bx.get_project_dir());
@@ -198,7 +208,7 @@ fn resolve_inner(
         return Ok(ResolvedBox {
             bx,
             source: Source::Pinned,
-            manifest_divergence: None,
+            manifest: None,
         });
     }
 
@@ -207,16 +217,6 @@ fn resolve_inner(
         bx.get_name(),
         bx.get_project_dir(),
     ))
-}
-
-/// The recipe `terra setup` would pin next, when the manifest names a
-/// different file than the box's own pin - what a boot runs today versus
-/// what the next `setup` would switch it to.
-fn find_manifest_divergence(bx: &BoxRef, manifest: Option<&config::Manifest>) -> Option<PathBuf> {
-    let reference = manifest?.boxes.get(bx.get_name())?;
-    let chosen = read_recipe(reference, bx.get_project_dir()).ok()??;
-    let pinned = config::read_recipe_text(&bx.get_dir().join(state::RECIPE_FILE)).ok()?;
-    (chosen.text != pinned).then_some(chosen.from)
 }
 
 pub(crate) fn choose_default_box_name(
@@ -554,11 +554,10 @@ mod tests {
     }
 
     /// Which resolutions read a recipe path typed on the command line, and
-    /// which refuse one. The split is whether the verb can *run* a recipe:
-    /// `setup` pins one, `show` prints one, and a boot offers to pin one before
-    /// it runs - so all three read the file. The verbs that operate on an
-    /// existing box read no recipe at all, and for them the fix is spelled out
-    /// rather than the path being quietly taken for a name.
+    /// which refuse one. `setup` pins one and `show` prints one, so both read
+    /// the file. The verbs that operate on an existing box - a boot included -
+    /// read no recipe at all, and for them the fix is spelled out rather than
+    /// the path being quietly taken for a name.
     #[test]
     fn a_recipe_path_is_read_only_where_there_is_a_shell_directory_for_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -567,7 +566,7 @@ mod tests {
         let e = resolve(Some("./ci.yaml"), dir.path(), None, Existence::MustExist).unwrap_err();
         assert!(format!("{e:#}").contains("box name"), "{e:#}");
 
-        // The three that carry the shell's directory read the file it names.
+        // The two that carry the shell's directory read the file it names.
         let t = resolve(
             Some("./ci.yaml"),
             dir.path(),
@@ -676,7 +675,7 @@ mod tests {
         )
         .unwrap();
         assert_matches!(agreed.source, Source::Pinned);
-        assert_eq!(agreed.manifest_divergence, None);
+        assert_eq!(agreed.find_manifest_divergence(), None);
 
         // …and an edited manifest is named, with the file that would win.
         std::fs::write(dir.path().join("dev.yaml"), "hw:\n  cpus: 8\n").unwrap();
@@ -693,7 +692,7 @@ mod tests {
             "the pin is still what a boot runs"
         );
         assert_eq!(
-            diverged.manifest_divergence,
+            diverged.find_manifest_divergence(),
             Some(dir.path().join("dev.yaml")),
             "the recipe `terra setup` would pin instead goes unreported"
         );
@@ -707,7 +706,7 @@ mod tests {
                 Existence::MayBeMissing,
             )
             .unwrap()
-            .manifest_divergence,
+            .find_manifest_divergence(),
             None
         );
     }

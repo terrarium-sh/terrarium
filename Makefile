@@ -55,6 +55,7 @@ REPACK_GUEST_IMAGE := $(CARGO_LOCKED) run -p terra-protocol --features packer --
 E2FSPROGS_SRC := $(BUILD)/e2fsprogs-$(E2FSPROGS_VERSION)
 MKE2FS := $(BUILD)/mke2fs
 RESIZE2FS := $(BUILD)/resize2fs
+DEBUGFS := $(BUILD)/debugfs
 BWRAP := $(BUILD)/bwrap-$(ARCH)
 SOCKET_PROBE := $(BUILD)/socket-probe
 BWRAP_CC := $(MKE2FS_CC_$(ARCH))
@@ -71,6 +72,7 @@ LIBCAP_TARBALL := $(BUILD)/libcap-$(LIBCAP_VERSION).tar.xz
 # with no filesystem tooling on the host at all. The guest (always Alpine Linux)
 # grows the fs to the configured size on first boot.
 ROOTFS_TREE := $(BUILD)/rootfs-tree
+ROOTFS_IDENTITY_INPUTS := crates/terra-protocol/src/guest_root.rs crates/terra-protocol/src/plan.rs crates/terra-protocol/examples/guest-identity.rs
 ROOTFS_IMG := $(BUILD)/rootfs.img.gz
 VOLUME_IMG := $(BUILD)/volume.img.gz
 VOLUME_IMG_MIB := 4
@@ -236,6 +238,12 @@ $(BWRAP): $(BUBBLEWRAP_SOURCES) $(BUBBLEWRAP_HEADERS) $(BUBBLEWRAP_SRC)/meson.bu
 		$(BUILD)/libcap-$(ARCH)-src/libcap/libcap.a -o $@.tmp
 	mv $@.tmp $@
 
+## debugfs sets the workload's ownership on the packed image; it runs only on the build host.
+$(DEBUGFS): $(MKE2FS)
+	CC=$(abspath $(MKE2FS_CC)) $(MAKE) -C $(E2FSPROGS_SRC)/debugfs debugfs
+	cp $(E2FSPROGS_SRC)/debugfs/debugfs $@
+	strip $@
+
 # resize2fs runs inside the guest; cross builds must not reuse the host mke2fs binary's tree.
 ifeq ($(ARCH),$(BUILD_ARCH))
 $(RESIZE2FS): $(MKE2FS)
@@ -266,7 +274,7 @@ endif
 ## kernel.apparmor_restrict_unprivileged_userns=0` is the fix; CI does the same.
 ## fakeroot is not an alternative — $(MKE2FS) is static, so there is no dynamic
 ## linker for its LD_PRELOAD to hook.
-$(ROOTFS_IMG): $(MKE2FS) $(PIN_STAMP)
+$(ROOTFS_IMG): $(MKE2FS) $(DEBUGFS) $(PIN_STAMP) $(ROOTFS_IDENTITY_INPUTS)
 	mkdir -p $(ROOTFS_TREE)
 	curl -fsSL $(ALPINE_URL) -o $(BUILD)/alpine-minirootfs.tar.gz
 	echo "$(ALPINE_SHA256)  $(BUILD)/alpine-minirootfs.tar.gz" | sha256sum -c -
@@ -282,9 +290,12 @@ $(ROOTFS_IMG): $(MKE2FS) $(PIN_STAMP)
 	echo "$(DOAS_SHIM_SHA256)  $(BUILD)/$(DOAS_SHIM_APK)" | sha256sum -c -
 	tar -pxzf $(BUILD)/$(DOAS_APK) -C $(ROOTFS_TREE) usr etc
 	tar -pxzf $(BUILD)/$(DOAS_SHIM_APK) -C $(ROOTFS_TREE) usr
+	$(CARGO_LOCKED) run -p terra-protocol --example guest-identity -- $(ROOTFS_TREE) $(BUILD)/rootfs-owners.debugfs
 	rm -f $(BUILD)/rootfs.img
 	truncate -s $(ROOTFS_IMG_MIB)M $(BUILD)/rootfs.img
 	unshare -U -r $(MKE2FS) -F -q -t ext4 -b 4096 -d $(ROOTFS_TREE) $(BUILD)/rootfs.img
+	# mke2fs -d in the namespace can only own files as root; debugfs hands the workload its home.
+	$(DEBUGFS) -w -f $(BUILD)/rootfs-owners.debugfs $(BUILD)/rootfs.img >/dev/null
 	gzip -9 -c $(BUILD)/rootfs.img > $(ROOTFS_IMG)
 
 ## Prebaked *empty* filesystem for scratch volumes. Volumes are prebaked so a

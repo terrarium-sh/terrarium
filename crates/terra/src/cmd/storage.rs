@@ -57,13 +57,20 @@ fn list_images_of(bx: &BoxRef) -> Result<Vec<PathBuf>> {
     )
 }
 
-fn list_configured_volume_names(bx: &BoxRef) -> Result<Vec<String>> {
+fn list_configured_volumes(bx: &BoxRef) -> Result<Vec<config::Volume>> {
     let cfg = config::load_path(
         &bx.get_dir().join(crate::state::RECIPE_FILE),
         bx.get_project_dir(),
     )
     .context("reading the pinned recipe")?;
-    Ok(cfg.volumes.into_iter().map(|v| v.name).collect())
+    Ok(cfg.volumes)
+}
+
+fn list_configured_volume_names(bx: &BoxRef) -> Result<Vec<String>> {
+    Ok(list_configured_volumes(bx)?
+        .into_iter()
+        .map(|volume| volume.name)
+        .collect())
 }
 
 #[derive(Serialize)]
@@ -200,9 +207,10 @@ fn export(bx: &BoxRef, to: &Path) -> Result<()> {
     let _lock = bx.lock_run()?;
     recover_import(bx)?;
     let rootfs = bx.get_dir().join(crate::state::ROOTFS_FILE);
-    let configured = list_configured_volume_names(bx)?
+    let configured = list_configured_volumes(bx)?
         .into_iter()
-        .map(|name| bx.get_volume_image(&name))
+        .filter(|volume| volume.lifetime == config::VolumeLifetime::Box)
+        .map(|volume| bx.get_volume_image_path(&volume.name))
         .collect::<Vec<_>>();
     let images = list_images_of(bx)?
         .into_iter()
@@ -342,10 +350,12 @@ fn import(bx: &BoxRef, from: &Path) -> Result<()> {
             bx.get_name()
         );
     }
-    eprintln!(
-        "terra: imported into {bx} - `terra {}` boots it",
-        bx.get_name()
-    );
+    let name = bx.get_name();
+    if bx.is_set_up() {
+        eprintln!("terra: imported into {bx} - `terra {name}` boots it");
+    } else {
+        eprintln!("terra: imported into {bx} - run `terra {name} setup` before starting it");
+    }
     Ok(())
 }
 
@@ -541,14 +551,7 @@ pub(crate) fn recover_import(bx: &BoxRef) -> Result<()> {
             .iter()
             .any(|entry| entry.image == crate::state::ROOTFS_FILE)
         {
-            let stamp = bx.get_dir().join(crate::state::BAKE_STAMP);
-            match std::fs::remove_file(&stamp) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(error).with_context(|| format!("removing {}", stamp.display()));
-                }
-            }
+            bx.remove_setup_stamp()?;
             #[cfg(unix)]
             File::open(bx.get_dir())?.sync_all()?;
         }
@@ -679,12 +682,12 @@ mod tests {
     }
 
     #[test]
-    fn only_rootfs_imports_clear_the_bake_stamp() {
+    fn only_rootfs_imports_clear_the_setup_stamp() {
         for name in [crate::state::ROOTFS_FILE, "vol-data.img"] {
             let dir = tempfile::tempdir().unwrap();
             let bx = BoxRef::from_state_dir(dir.path().to_owned(), dir.path());
-            let stamp = bx.get_dir().join(crate::state::BAKE_STAMP);
-            std::fs::write(&stamp, b"baked").unwrap();
+            let stamp = bx.get_dir().join(crate::state::SETUP_STAMP);
+            std::fs::write(&stamp, b"").unwrap();
             let staging = dir.path().join(".import.test");
             std::fs::create_dir(&staging).unwrap();
             let stage = staging.join(name);
@@ -698,7 +701,7 @@ mod tests {
     fn failed_stamp_removal_keeps_the_committed_journal_for_recovery() {
         let dir = tempfile::tempdir().unwrap();
         let bx = BoxRef::from_state_dir(dir.path().to_owned(), dir.path());
-        let stamp = bx.get_dir().join(crate::state::BAKE_STAMP);
+        let stamp = bx.get_dir().join(crate::state::SETUP_STAMP);
         std::fs::create_dir(&stamp).unwrap();
         let staging = dir.path().join(".import.test");
         std::fs::create_dir(&staging).unwrap();
@@ -801,8 +804,8 @@ mod tests {
                 let staging = dir.path().join(".import.test");
                 std::fs::create_dir(&staging).unwrap();
                 let names = ["rootfs.img", "vol-data.img", "vol-new.img"];
-                let stamp = bx.get_dir().join(crate::state::BAKE_STAMP);
-                std::fs::write(&stamp, b"baked").unwrap();
+                let stamp = bx.get_dir().join(crate::state::SETUP_STAMP);
+                std::fs::write(&stamp, b"").unwrap();
                 for (index, name) in names.iter().enumerate() {
                     if index < 2 {
                         std::fs::write(dir.path().join(name), b"old").unwrap();
@@ -886,7 +889,11 @@ mod tests {
         let mut recipe = String::from("hw:\n  cpus: 1\nvolumes:\n");
         for (i, name) in volumes.iter().enumerate() {
             let _ = writeln!(recipe, "  - {{name: {name}, guest: /v{i}, size_mib: 8}}");
-            std::fs::write(bx.get_volume_image(name), format!("{name} data").as_bytes()).unwrap();
+            std::fs::write(
+                bx.get_volume_image_path(name),
+                format!("{name} data").as_bytes(),
+            )
+            .unwrap();
         }
         std::fs::write(bx.get_dir().join(crate::state::RECIPE_FILE), recipe).unwrap();
         std::fs::write(bx.get_dir().join(crate::state::ROOTFS_FILE), b"rootfs data").unwrap();
@@ -917,8 +924,8 @@ mod tests {
 
         for image in [
             from.get_dir().join(crate::state::ROOTFS_FILE),
-            from.get_volume_image("data"),
-            from.get_volume_image("cache"),
+            from.get_volume_image_path("data"),
+            from.get_volume_image_path("cache"),
         ] {
             let name = image.file_name().unwrap().to_str().unwrap();
             let there = into.get_dir().join(name);
@@ -940,13 +947,49 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let _home = TestHome::new();
         let from = build_box_ref(dir.path(), &["data"]);
-        std::fs::write(from.get_volume_image("old"), b"dropped").unwrap();
+        std::fs::write(from.get_volume_image_path("old"), b"dropped").unwrap();
 
         let artifact = dir.path().join("dev.terra");
         export(&from, &artifact).unwrap();
 
         let into = build_box_ref(&dir.path().join("elsewhere"), &["data"]);
         import(&into, &artifact).unwrap();
+    }
+
+    /// A boot-lifetime image can outlive a crashed VM, but the artifact carries
+    /// only what a restart would have kept.
+    #[test]
+    fn export_skips_boot_lifetime_volumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = TestHome::new();
+        let bx = build_box_ref(dir.path(), &["data"]);
+        std::fs::write(bx.get_volume_image_path("scratch"), b"scratch data").unwrap();
+        std::fs::write(
+            bx.get_dir().join(crate::state::RECIPE_FILE),
+            "hw:\n  cpus: 1\nvolumes:\n  - {name: data, guest: /v0, size_mib: 8}\n  - {name: scratch, guest: /v1, size_mib: 8, lifetime: boot}\n",
+        )
+        .unwrap();
+
+        let artifact = dir.path().join("dev.terra");
+        export(&bx, &artifact).unwrap();
+
+        assert_eq!(
+            artifact_entry_names(&artifact),
+            ["rootfs.img", "vol-data.img"]
+        );
+    }
+
+    fn artifact_entry_names(path: &Path) -> Vec<String> {
+        let mut src = GzDecoder::new(BufReader::new(File::open(path).unwrap()));
+        let mut magic = [0u8; STORAGE_ARTIFACT_MAGIC.len()];
+        src.read_exact(&mut magic).unwrap();
+        assert_eq!(&magic, STORAGE_ARTIFACT_MAGIC);
+        let mut names = Vec::new();
+        while let Some((name, len)) = read_entry_header(&mut src).unwrap() {
+            names.push(name);
+            std::io::copy(&mut (&mut src).take(len), &mut std::io::sink()).unwrap();
+        }
+        names
     }
 
     #[test]
@@ -1167,7 +1210,7 @@ mod tests {
             "a truncated artifact replaced the live image"
         );
         assert_eq!(
-            std::fs::read(bx.get_volume_image("data")).unwrap(),
+            std::fs::read(bx.get_volume_image_path("data")).unwrap(),
             b"data data",
             "an earlier complete artifact entry replaced the live image"
         );
@@ -1191,15 +1234,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let _home = TestHome::new();
         let bx = build_box_ref(dir.path(), &["data"]);
-        std::fs::write(bx.get_volume_image("old"), b"dropped").unwrap();
+        std::fs::write(bx.get_volume_image_path("old"), b"dropped").unwrap();
 
         prune(&bx).unwrap();
         assert!(
-            !bx.get_volume_image("old").exists(),
+            !bx.get_volume_image_path("old").exists(),
             "the dropped volume was kept"
         );
         assert!(
-            bx.get_volume_image("data").exists(),
+            bx.get_volume_image_path("data").exists(),
             "a named volume was removed"
         );
         assert!(

@@ -31,7 +31,7 @@ it wins.
    | Root for named commands at runtime | `sudo` |
 
 2. **Write the recipe** with the reference below, and a `terra.yaml` naming it
-   unless the user wants a single recipe run by path (`terra ./box.yaml ...`).
+   unless the user wants a single recipe set up by path (`terra ./box.yaml setup`).
 3. **Check it:** `terra <box> setup --dry-run` exits non-zero with the reason
    when terra would refuse it. `terra <box> show` prints the resolved recipe.
 4. **Set it up:** `terra <box> setup` pins the recipe, builds the disk and runs
@@ -149,6 +149,7 @@ hw:
   cpus: 2
   mem_mib: 1024
   rootfs_mib: 4096
+  rootfs_readonly: false
 components:
   memory_mib: 16
 mounts:
@@ -159,6 +160,7 @@ volumes:
   - name: data
     guest: /data
     size_mib: 1024
+    lifetime: box
 env:
   MODEL: example
 env_file: .env  # create this file, or omit env_file
@@ -186,23 +188,43 @@ workload:
 - `hw.cpus`, `hw.mem_mib` and `hw.rootfs_mib` set the vCPUs, guest RAM and root
   filesystem size. The root filesystem is sparse but never grows past
   `rootfs_mib`.
+- `hw.rootfs_readonly: true` makes the root filesystem read-only on every boot
+  after setup. See [read-only root](#read-only-root).
 - `components.memory_mib` caps the memory of each of Terra's device
   components: 16 MiB by default and at minimum. Most recipes leave it out.
 
-`volumes` are private guest disks that survive restarts and are deleted by
-`terra rm`. Each needs:
+`volumes` are private guest disks, deleted by `terra rm`. Each needs:
 
 - a `name` of up to 247 ASCII letters, digits, `.`, `-` or `_`, unique ignoring
   case. It cannot end in a dot or be a Windows device name such as `CON`.
 - an absolute `guest` path.
 - a positive `size_mib`. Writes past it fail.
 
+`lifetime` says how long a volume's data lasts. The default, `box`, keeps it
+across restarts. `boot` gives the volume an empty filesystem of `size_mib` on
+every boot, even after a crash, so nothing written to it survives a restart.
+
 A box has at most 32 mounts and volumes combined on x86_64, or 11 on AArch64.
 
-Growing `rootfs_mib` or a volume takes effect on the next boot; images never
-shrink. Renaming a volume creates a new empty one and leaves the old image
-behind. `terra <box> storage prune` removes images no longer named by the
-recipe; `setup --rebuild` does too.
+Growing `rootfs_mib` or a `lifetime: box` volume takes effect at the next
+`terra <box> setup`; an existing image never shrinks. A `lifetime: boot` volume
+is recreated at its configured size on every boot, so it can shrink as well as
+grow. Renaming a volume creates a new empty one and leaves the old image
+behind.
+`terra <box> storage prune` removes images no longer named by the recipe;
+`setup --rebuild` does too.
+
+#### Read-only root
+
+With `hw.rootfs_readonly: true`, the root image never changes after setup. Setup
+prepares it, and `on_create` writes it as usual; every other boot attaches it
+read-only on the host, so not even guest root can change it. Every later write
+to the root fails with `EROFS`: from the workload, daemons, `on_start`,
+`pre_stop`, `sudo`, `exec --root` and `terra sync`, so a runtime `apk add` fails
+too. The workload's home, `/home/terri`, is read-only as well. To get a
+writable home, add a `lifetime: boot` volume at `/home/terri`; it starts empty
+on every boot. `/tmp`, `/var/tmp` and `/run` are tmpfs in guest RAM.
+`lifetime: box` volumes and writable mounts still persist.
 
 ### Mounts
 
@@ -284,8 +306,13 @@ Limits:
 
 ### Processes
 
-- `hooks.on_create` runs once as guest root during setup, before mounts exist.
-  It uses the recipe's network rules, and setup prints its output.
+- Setup prepares the root image in an isolated VM without shares, with or
+  without `on_create`, and sizes the root image and `lifetime: box` volumes. A
+  start never prepares the root image. Running setup again on an unchanged
+  recipe boots no VM.
+- `hooks.on_create` runs once as guest root during that setup, before mounts
+  exist; the workload user `terri` already exists. It uses the recipe's network
+  rules, and setup prints its output.
 - `hooks.on_start` runs as guest root before every workload start.
 - `hooks.pre_stop` runs during an orderly stop.
 - `on_start` and `pre_stop` output go to the box's session.

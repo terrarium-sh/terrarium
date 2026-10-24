@@ -18,7 +18,8 @@ pub const GUEST_BOOT_TIMEOUT: Duration = Duration::from_secs(60);
 pub struct VmInput {
     pub kernel: terra_protocol::packed_image::PackedImage<'static>,
     pub boot_disk: terra_protocol::packed_image::PackedImage<'static>,
-    pub root_disk: PathBuf,
+    pub rootfs_disk: PathBuf,
+    pub rootfs_access: crate::component::AccessMode,
     pub volume_disks: Vec<PathBuf>,
     pub shares: Vec<crate::component::fs::ShareGrant>,
     pub plan: Vec<u8>,
@@ -58,7 +59,7 @@ impl PreparedVm {
 
 #[allow(clippy::needless_return, clippy::too_many_lines)]
 pub async fn prepare(mut input: VmInput) -> Result<PreparedVm, String> {
-    let disks = devices::disk_paths(&input);
+    let disks = devices::box_disks(&input);
     let layout =
         crate::machine::build_machine_layout(input.ram_bytes, 1 + disks.len(), input.shares.len())
             .map_err(|error| format!("invalid guest layout: {error:?}"))?;

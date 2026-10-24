@@ -7,7 +7,7 @@ pub(crate) fn assemble_devices(
     runtime: &mut crate::box_runtime::BoxRuntime,
     input: &mut VmInput,
     ram: crate::component::vmm::RamGrant,
-    disks: &[PathBuf],
+    disks: &[(PathBuf, AccessMode)],
     bind_interrupt: impl Fn(DeviceKind, usize) -> Result<crate::component::InterruptCallback, String>,
 ) -> Result<(), String> {
     blocks(runtime, ram.clone(), input, disks, |index| {
@@ -37,10 +37,14 @@ pub(crate) fn assemble_devices(
     Ok(())
 }
 
-pub(crate) fn disk_paths(input: &VmInput) -> Vec<PathBuf> {
-    std::iter::once(&input.root_disk)
-        .chain(&input.volume_disks)
-        .cloned()
+pub(crate) fn box_disks(input: &VmInput) -> Vec<(PathBuf, AccessMode)> {
+    std::iter::once((input.rootfs_disk.clone(), input.rootfs_access))
+        .chain(
+            input
+                .volume_disks
+                .iter()
+                .map(|path| (path.clone(), AccessMode::ReadWrite)),
+        )
         .collect()
 }
 
@@ -48,7 +52,7 @@ fn blocks(
     runtime: &mut crate::box_runtime::BoxRuntime,
     ram: impl Into<crate::component::vmm::RamGrant> + Send,
     input: &mut VmInput,
-    disks: &[PathBuf],
+    disks: &[(PathBuf, AccessMode)],
     interrupt: impl Fn(usize) -> Result<crate::component::InterruptCallback, String>,
 ) -> Result<(), String> {
     use crate::component::block::BlockHost;
@@ -60,8 +64,8 @@ fn blocks(
         .map_err(|error| error.to_string())?;
     let disks = disks
         .iter()
-        .map(|path| {
-            FileDisk::open(path, AccessMode::ReadWrite)
+        .map(|(path, access)| {
+            FileDisk::open(path, *access)
                 .map(DiskGrant::File)
                 .map_err(|error| format!("opening block backing {}: {error}", path.display()))
         })
@@ -187,14 +191,8 @@ mod tests {
         assert_eq!(super::filesystem_resource_capacity_for(128, 32), 0);
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn empty_shares_do_not_load_the_filesystem_artifact() {
-        let fixtures = crate::test_fixtures::trusted_artifacts();
-        let artifacts = crate::TrustedArtifacts {
-            fs: fixtures.block,
-            ..fixtures
-        };
-        let input = super::VmInput {
+    fn build_input(artifacts: crate::TrustedArtifacts) -> super::VmInput {
+        super::VmInput {
             component_memory_limits: crate::box_runtime::ComponentMemoryLimits::default(),
             kernel: terra_protocol::packed_image::pack_fast_leaked(
                 &[0],
@@ -206,7 +204,8 @@ mod tests {
                 terra_protocol::guest_image::GuestImage::Boot,
             )
             .unwrap(),
-            root_disk: PathBuf::new(),
+            rootfs_disk: PathBuf::new(),
+            rootfs_access: crate::component::AccessMode::ReadWrite,
             volume_disks: Vec::new(),
             shares: Vec::new(),
             plan: Vec::new(),
@@ -220,7 +219,36 @@ mod tests {
             listener: None,
             control: None,
             diagnostics: None,
+        }
+    }
+
+    /// The rootfs disk comes first with the boot's access; volumes stay writable.
+    #[test]
+    fn only_the_rootfs_disk_takes_the_boots_access() {
+        use crate::component::AccessMode;
+        let input = super::VmInput {
+            rootfs_disk: PathBuf::from("rootfs.img"),
+            rootfs_access: AccessMode::ReadOnly,
+            volume_disks: vec![PathBuf::from("vol-a.img"), PathBuf::from("vol-b.img")],
+            ..build_input(crate::test_fixtures::trusted_artifacts())
         };
+        assert_eq!(
+            super::box_disks(&input),
+            [
+                (PathBuf::from("rootfs.img"), AccessMode::ReadOnly),
+                (PathBuf::from("vol-a.img"), AccessMode::ReadWrite),
+                (PathBuf::from("vol-b.img"), AccessMode::ReadWrite),
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn empty_shares_do_not_load_the_filesystem_artifact() {
+        let fixtures = crate::test_fixtures::trusted_artifacts();
+        let input = build_input(crate::TrustedArtifacts {
+            fs: fixtures.block,
+            ..fixtures
+        });
         let engine = crate::engine::device_engine().unwrap();
         let mut runtime =
             crate::box_runtime::BoxRuntime::new(&engine, crate::box_runtime::BoxHost::new())

@@ -141,7 +141,7 @@ pub(crate) fn wait_while_running(bx: &BoxRef, timeout: Option<u64>) -> impl FnMu
             anyhow::ensure!(
                 Instant::now() < deadline,
                 "{bx}'s agent did not answer within the --agent-timeout of {secs}s \
-                 (still booting, or baking `on_create`?)"
+                 (still booting, or being set up?)"
             );
         }
         Ok(())
@@ -825,32 +825,32 @@ mod tests {
         }
     }
 
-    /// Ordinary clients must not attach to a setup bake as though it were a running workload.
+    /// Ordinary clients must not attach to a setup VM as though it were a running workload.
     #[test]
-    fn a_box_mid_bake_is_refused_rather_than_waited_on() {
+    fn a_box_mid_setup_is_refused_rather_than_waited_on() {
         let dir = tempfile::tempdir().unwrap();
         let _home = crate::sys::TestHome::new();
         let bx = BoxRef::resolve(dir.path(), "dev").unwrap();
         std::fs::create_dir_all(bx.get_dir()).unwrap();
         let lock = bx.lock_run().unwrap();
 
-        let baking = BoxRef::mark_baking(&lock).unwrap();
+        let setting_up = BoxRef::mark_setting_up(&lock).unwrap();
         for verb in ["exec", "sync"] {
             let err = ensure_running(&bx, verb).unwrap_err().to_string();
             assert_eq!(err, bx.setup_holds_it().to_string(), "{verb}");
         }
 
-        drop(baking);
+        drop(setting_up);
         assert!(ensure_running(&bx, "exec").is_ok());
 
         let mut still_waiting = wait_while_running(&bx, None);
         assert!(still_waiting().is_ok(), "a served box is waited on");
-        let baking = BoxRef::mark_baking(&lock).unwrap();
+        let setting_up = BoxRef::mark_setting_up(&lock).unwrap();
         let err = still_waiting()
-            .expect_err("a bake that took the box mid-wait was waited out")
+            .expect_err("a setup that took the box mid-wait was waited out")
             .to_string();
         assert_eq!(err, bx.setup_holds_it().to_string());
-        drop(baking);
+        drop(setting_up);
         assert!(still_waiting().is_ok());
 
         // The lock's release is deferred while a concurrently forked test

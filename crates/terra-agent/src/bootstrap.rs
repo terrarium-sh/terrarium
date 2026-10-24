@@ -1,16 +1,22 @@
 use anyhow::{Context, Result, bail};
 use rustix::mount::{MountFlags, MountPropagationFlags};
 use std::fs::{self, File};
-use std::io::{Seek, SeekFrom};
-use std::os::unix::fs::FileExt;
-use std::os::unix::fs::PermissionsExt;
+use std::io::{Seek, SeekFrom, Write as _};
+use std::os::unix::fs::{DirBuilderExt as _, FileExt, OpenOptionsExt as _, PermissionsExt};
+use std::path::Path;
 use std::process::Command;
+use terra_protocol::guest_root::{
+    PER_BOOT_DIR, PER_BOOT_DOAS_CONF, PER_BOOT_DOAS_DIR, PER_BOOT_LOCALTIME, PER_BOOT_RESOLV_CONF,
+    PER_BOOT_SANDBOX_INFO,
+};
 use terra_protocol::{
-    BootPlan, CLOCK_SYNC, CLOCK_SYNC_BYTES, Plan, RESIZE2FS_GUEST_PATH, ROOT_DEVICE,
+    BootPlan, CLOCK_SYNC, CLOCK_SYNC_BYTES, Plan, PlanMode, RESIZE2FS_GUEST_PATH, ROOT_DEVICE,
+    WORKLOAD_ID,
 };
 
 const CLEAN_MOUNT: &str = "/mnt/clean";
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
 pub(super) struct Boot {
     pub(super) plan: Plan,
     pub(super) control: File,
@@ -48,17 +54,33 @@ pub(super) fn enter_root() -> Result<Boot> {
     let plan = read_boot_plan(&mut control)?;
     setup_env(&plan);
     apply_host_state(&plan)?;
-    grow_filesystem(ROOT_DEVICE);
-    for volume in &plan.volumes {
-        grow_filesystem(&volume.dev);
+    match plan.mode {
+        PlanMode::Create => grow_filesystem(ROOT_DEVICE),
+        PlanMode::Run => {
+            for volume in &plan.volumes {
+                grow_filesystem(&volume.dev);
+            }
+        }
     }
     mount(
         Some(ROOT_DEVICE),
         NEWROOT,
         Some("ext4"),
-        MountFlags::empty(),
+        if plan.rootfs_readonly {
+            MountFlags::RDONLY
+        } else {
+            MountFlags::empty()
+        },
     )
-    .with_context(|| format!("mounting the guest rootfs image ({ROOT_DEVICE})"))?;
+    .with_context(|| {
+        if plan.rootfs_readonly {
+            format!(
+                "mounting the read-only guest rootfs image ({ROOT_DEVICE}); its journal may need replay - run `terra <box> setup --rebuild`"
+            )
+        } else {
+            format!("mounting the guest rootfs image ({ROOT_DEVICE})")
+        }
+    })?;
     for directory in ["proc", "sys", "dev", "terra"] {
         fs::create_dir_all(format!("{NEWROOT}/{directory}"))?;
     }
@@ -91,7 +113,10 @@ pub(super) fn enter_root() -> Result<Boot> {
         MountFlags::NOSUID | MountFlags::NODEV,
     )?;
     fs::set_permissions("/run", fs::Permissions::from_mode(0o755))?;
-    apply_tz(plan.host_tz.as_deref());
+    if plan.rootfs_readonly {
+        mount_scratch_directories()?;
+    }
+    write_per_boot_files(Path::new(PER_BOOT_DIR), &plan)?;
     Ok(Boot {
         plan,
         control,
@@ -99,6 +124,19 @@ pub(super) fn enter_root() -> Result<Boot> {
         clients,
         mux,
     })
+}
+
+fn mount_scratch_directories() -> Result<()> {
+    for target in ["/tmp", "/var/tmp"] {
+        mount(
+            None,
+            target,
+            Some("tmpfs"),
+            MountFlags::NOSUID | MountFlags::NODEV,
+        )?;
+        fs::set_permissions(target, fs::Permissions::from_mode(0o1777))?;
+    }
+    Ok(())
 }
 
 fn read_boot_plan(reader: &mut impl std::io::Read) -> Result<Plan> {
@@ -183,8 +221,18 @@ fn parse_superblock_span(superblock: &[u8], device_bytes: u64, page_size: u64) -
 }
 
 /// Remounts the volumes and the root read-only so the next boot mounts them without a
-/// journal replay; a filesystem a process still writes to stays as it is.
-pub(super) fn leave_filesystems_clean(plan: &Plan) {
+/// journal replay. A run boot leaves a busy filesystem as it is; a Create boot kills leftover
+/// processes first and fails if the root stays writable.
+pub(super) fn leave_filesystems_clean(plan: &Plan) -> Result<()> {
+    let is_create = plan.mode == PlanMode::Create;
+    if is_create {
+        // Linux skips the caller and init, so only leftover guest processes die.
+        // SAFETY: kill(2) with pid -1 touches no memory.
+        #[allow(unsafe_code)]
+        unsafe {
+            libc::kill(-1, libc::SIGKILL);
+        }
+    }
     for volume in &plan.volumes {
         let _ = rustix::mount::mount_remount(
             volume.guest.as_str(),
@@ -192,8 +240,24 @@ pub(super) fn leave_filesystems_clean(plan: &Plan) {
             "",
         );
     }
-    let _ = rustix::mount::mount_remount("/", MountFlags::RDONLY, "");
+    // A killed process releases its files while exiting, so EBUSY clears within moments.
+    let mut attempts = if is_create { REMOUNT_ATTEMPTS } else { 1 };
+    loop {
+        match rustix::mount::mount_remount("/", MountFlags::RDONLY, "") {
+            Err(rustix::io::Errno::BUSY) if attempts > 1 => {
+                attempts -= 1;
+                std::thread::sleep(REMOUNT_RETRY_DELAY);
+            }
+            Err(error) if is_create => {
+                return Err(error).context("remounting the guest root read-only after setup");
+            }
+            Ok(()) | Err(_) => return Ok(()),
+        }
+    }
 }
+
+const REMOUNT_ATTEMPTS: u32 = 20;
+const REMOUNT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
 fn grow_filesystem(device: &str) {
     if filesystem_already_spans_device(device) {
@@ -227,16 +291,54 @@ fn grow_filesystem(device: &str) {
     }
 }
 
-fn apply_tz(bytes: Option<&[u8]>) {
-    if let Some(bytes) = bytes.filter(|bytes| !bytes.is_empty()) {
-        let _ = fs::create_dir_all("/etc");
-        let tmp = "/etc/.localtime.tmp";
-        if let Err(error) = fs::write(tmp, bytes) {
-            eprintln!("terra-agent: warning: could not write /etc/localtime: {error}");
-        } else {
-            let _ = fs::rename(tmp, "/etc/localtime");
+fn render_doas_policy(sudo: &[String]) -> String {
+    use std::fmt::Write as _;
+    let mut policy =
+        String::from("# Generated by terra from the recipe's `sudo:` - edits are overwritten.\n");
+    for command in sudo {
+        if command.contains(['\n', '#']) {
+            eprintln!("terra-agent: warning: skipping invalid sudo `{command}`");
+            continue;
         }
+        let _ = writeln!(policy, "permit nopass {WORKLOAD_ID} cmd {command}");
     }
+    policy
+}
+
+fn write_per_boot_files(directory: &Path, plan: &Plan) -> Result<()> {
+    let file = |per_boot_path: &str| {
+        directory.join(Path::new(per_boot_path).file_name().unwrap_or_default())
+    };
+    fs::create_dir_all(directory).with_context(|| format!("creating {}", directory.display()))?;
+    let write = |per_boot_path: &str, contents: &[u8]| {
+        let path = file(per_boot_path);
+        fs::write(&path, contents).with_context(|| format!("writing {}", path.display()))
+    };
+    write(
+        PER_BOOT_RESOLV_CONF,
+        crate::network::render_resolv_conf(plan.net).as_bytes(),
+    )?;
+    let doas_conf = file(PER_BOOT_DOAS_CONF);
+    fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o640)
+        .open(&doas_conf)
+        .and_then(|mut policy| policy.write_all(render_doas_policy(&plan.sudo).as_bytes()))
+        .with_context(|| format!("writing {}", doas_conf.display()))?;
+    let doas_dir = file(PER_BOOT_DOAS_DIR);
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o750)
+        .create(&doas_dir)
+        .with_context(|| format!("creating {}", doas_dir.display()))?;
+    if let Some(bytes) = plan.host_tz.as_deref().filter(|bytes| !bytes.is_empty())
+        && let Err(error) = write(PER_BOOT_LOCALTIME, bytes)
+    {
+        eprintln!("terra-agent: warning: {error:#}");
+    }
+    write(PER_BOOT_SANDBOX_INFO, plan.sandbox_info.as_bytes())
 }
 
 fn apply_host_state(plan: &Plan) -> Result<()> {
@@ -454,6 +556,50 @@ mod tests {
 
     fn test_plan() -> Plan {
         Plan::bare_run(Vec::new())
+    }
+
+    #[test]
+    fn per_boot_files_follow_the_plan() {
+        let directory = crate::create_scratch_path("bootstrap", "per-boot");
+        let _ = fs::remove_dir_all(&directory);
+        let read = |path: &str| {
+            fs::read_to_string(directory.join(Path::new(path).file_name().unwrap())).unwrap()
+        };
+        let mode = |path: &str| {
+            fs::metadata(directory.join(Path::new(path).file_name().unwrap()))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        let mut plan = test_plan();
+        plan.net = terra_protocol::Net::Tsi;
+        plan.sudo = vec!["/bin/ls".into(), "bad\ncmd".into(), "x # y".into()];
+        plan.sandbox_info = "readme".into();
+        plan.host_tz = None;
+        write_per_boot_files(&directory, &plan).unwrap();
+        assert!(read(PER_BOOT_RESOLV_CONF).starts_with("nameserver "));
+        assert_eq!(
+            read(PER_BOOT_DOAS_CONF).lines().collect::<Vec<_>>()[1..],
+            [format!("permit nopass {WORKLOAD_ID} cmd /bin/ls")]
+        );
+        assert_eq!(mode(PER_BOOT_DOAS_CONF), 0o640);
+        assert_eq!(mode(PER_BOOT_DOAS_DIR), 0o750);
+        assert_eq!(
+            fs::read_dir(directory.join(Path::new(PER_BOOT_DOAS_DIR).file_name().unwrap()))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert_eq!(read(PER_BOOT_SANDBOX_INFO), "readme");
+        assert!(!directory.join("localtime").exists());
+
+        plan.net = terra_protocol::Net::LocalOnly;
+        plan.host_tz = Some(b"tzdata".to_vec());
+        write_per_boot_files(&directory, &plan).unwrap();
+        assert_eq!(read(PER_BOOT_RESOLV_CONF), "# local_only\n");
+        assert_eq!(read(PER_BOOT_LOCALTIME), "tzdata");
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

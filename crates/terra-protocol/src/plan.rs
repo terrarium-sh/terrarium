@@ -96,8 +96,11 @@ pub struct Plan {
     pub published_udp_ports: Vec<u16>,
     pub env: BTreeMap<String, String>,
     /// Run the workload as root instead of dropping to the workload user
-    /// (`--root`; also set for the `terra setup` bake).
+    /// (`--root`; also set for setup's VM).
     pub root: bool,
+    /// The host attached the root device read-only, so the agent mounts it
+    /// read-only and puts tmpfs on `/tmp` and `/var/tmp`.
+    pub rootfs_readonly: bool,
     pub sudo: Vec<String>,
     pub on_create: Vec<String>,
     pub on_start: Vec<String>,
@@ -164,6 +167,7 @@ impl Plan {
             published_udp_ports: Vec::new(),
             env: BTreeMap::new(),
             root: false,
+            rootfs_readonly: false,
             sudo: Vec::new(),
             on_create: Vec::new(),
             on_start: Vec::new(),
@@ -243,6 +247,7 @@ mod tests {
                 published_udp_ports: vec![53],
                 env: BTreeMap::from([("FOO".to_string(), "bar".to_string())]),
                 root: false,
+                rootfs_readonly: false,
                 sudo: vec!["apk".into()],
                 on_create: vec!["apk add git".into()],
                 on_start: vec!["date".into()],

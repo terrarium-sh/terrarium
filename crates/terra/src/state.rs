@@ -6,6 +6,7 @@ use sha2::{Digest as _, Sha256};
 use std::fs::{File, TryLockError};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use terra_protocol::PlanMode;
 
 const BOX_HOME: &str = "box";
 
@@ -15,7 +16,7 @@ pub(crate) const HOST_PID_FILE: &str = "host.pid";
 pub(crate) const SUPERVISOR_PID_FILE: &str = "supervisor.pid";
 pub(crate) const CONTROL_SOCKET: &str = "c";
 pub(crate) const AGENT_SOCKET: &str = "a";
-pub(crate) const BAKE_STAMP: &str = "baked";
+pub(crate) const SETUP_STAMP: &str = "setup-finished";
 #[cfg(not(target_os = "macos"))]
 pub(crate) const LOG_FILE: &str = "terra.log";
 #[cfg(target_os = "macos")]
@@ -29,7 +30,7 @@ const VOLUME_SUFFIX: &str = ".img";
 pub const RECIPE_FILE: &str = "recipe.yaml";
 pub const PINNED_PATHS_FILE: &str = "pinned-paths.yaml";
 
-const BAKE_MARK: &str = "bake";
+const SETUP_MARK: &str = "setup";
 
 /// POSIX record locks would let an unrelated close of the pid file unlock a running box.
 const LOCK_CONTENTION_GRACE: Duration = Duration::from_millis(500);
@@ -96,7 +97,7 @@ impl BoxRef {
     }
 
     #[must_use]
-    pub fn get_volume_image(&self, name: &str) -> PathBuf {
+    pub fn get_volume_image_path(&self, name: &str) -> PathBuf {
         self.dir
             .join(format!("{VOLUME_PREFIX}{name}{VOLUME_SUFFIX}"))
     }
@@ -130,7 +131,7 @@ impl BoxRef {
         let kept: Vec<&PathBuf> = configured
             .iter()
             .filter_map(|name| {
-                let image = self.get_volume_image(name);
+                let image = self.get_volume_image_path(name);
                 images.iter().find(|path| **path == image).or_else(|| {
                     images
                         .iter()
@@ -156,7 +157,7 @@ impl BoxRef {
             .strip_suffix(VOLUME_SUFFIX)?;
         let plain =
             !volume.is_empty() && !matches!(volume, "." | "..") && !volume.contains(['/', '\\']);
-        plain.then(|| self.get_volume_image(volume))
+        plain.then(|| self.get_volume_image_path(volume))
     }
 
     /// Empty for a box nobody has taken.
@@ -181,7 +182,7 @@ impl BoxRef {
         let mut words = line.split_whitespace();
         let pid = words.next()?.parse().ok().filter(|pid| *pid > 0)?;
         let process_identity = Some(words.next()?.parse().ok()?);
-        if words.next().is_some_and(|word| word != BAKE_MARK) || words.next().is_some() {
+        if words.next().is_some_and(|word| word != SETUP_MARK) || words.next().is_some() {
             return None;
         }
         Some(ProcessIdentity {
@@ -228,10 +229,10 @@ impl BoxRef {
             .with_context(|| format!("asking {self} to stop"))
     }
 
-    fn is_marked_baking(&self) -> bool {
+    fn is_marked_setting_up(&self) -> bool {
         self.read_lock_line()
             .split_whitespace()
-            .any(|w| w == BAKE_MARK)
+            .any(|w| w == SETUP_MARK)
     }
 
     /// Rewrites the lock metadata without replacing the inode.
@@ -243,14 +244,14 @@ impl BoxRef {
         file.sync_all()
     }
 
-    pub fn publish_pid(lock: &File, pid: u32, baking: bool) -> std::io::Result<()> {
+    pub fn publish_pid(lock: &File, pid: u32, mode: PlanMode) -> std::io::Result<()> {
         let process_identity = crate::sys::read_process_start_time(pid).ok_or_else(|| {
             std::io::Error::other(format!("reading start identity for pid {pid}"))
         })?;
         let mut line = format!("{pid} {process_identity}");
-        if baking {
+        if mode == PlanMode::Create {
             line.push(' ');
-            line.push_str(BAKE_MARK);
+            line.push_str(SETUP_MARK);
         }
         Self::rewrite_lock_line(lock, &line)
     }
@@ -262,24 +263,62 @@ impl BoxRef {
         {
             return Ok(Holder::Free);
         }
-        if self.is_marked_baking() {
+        if self.is_marked_setting_up() {
             return Ok(Holder::SettingUp);
         }
         Ok(Holder::Running)
     }
 
-    pub fn mark_baking(lock: &File) -> std::io::Result<BakeMark<'_>> {
-        Self::rewrite_lock_line(lock, BAKE_MARK)?;
-        Ok(BakeMark(lock))
+    pub fn mark_setting_up(lock: &File) -> std::io::Result<SetupMark<'_>> {
+        Self::rewrite_lock_line(lock, SETUP_MARK)?;
+        Ok(SetupMark(lock))
     }
 
     pub fn setup_holds_it(&self) -> anyhow::Error {
         anyhow!(
-            "{self} is being set up - its `on_create` bake holds the box and serves \
-             no agent port (`{logs}` follows the bake; run this again once it is \
+            "{self} is being set up - its setup VM holds the box and serves \
+             no agent port (`{logs}` follows the setup; run this again once it is \
              done)",
             logs = self.build_logs_command()
         )
+    }
+
+    /// Whether setup finished for the current pinned recipe and root image.
+    pub fn is_set_up(&self) -> bool {
+        if !self.dir.join(ROOTFS_FILE).exists() {
+            return false;
+        }
+        let Ok(stamp) = std::fs::read(self.dir.join(SETUP_STAMP)) else {
+            return false;
+        };
+        let Ok(recipe) = std::fs::read(self.dir.join(RECIPE_FILE)) else {
+            return false;
+        };
+        stamp.as_slice() == Sha256::digest(recipe).as_slice()
+    }
+
+    pub fn write_setup_stamp(&self) -> Result<()> {
+        use std::io::Write as _;
+
+        let recipe_path = self.dir.join(RECIPE_FILE);
+        let recipe = std::fs::read(&recipe_path)
+            .with_context(|| format!("reading {}", recipe_path.display()))?;
+        let digest = Sha256::digest(recipe);
+        let stamp = self.dir.join(SETUP_STAMP);
+        crate::vm::image::staged_write(&stamp, |out| {
+            out.write_all(&digest)
+                .with_context(|| format!("recording {}", stamp.display()))
+        })
+    }
+
+    pub fn remove_setup_stamp(&self) -> Result<()> {
+        let stamp = self.dir.join(SETUP_STAMP);
+        match std::fs::remove_file(&stamp) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                Err(error).with_context(|| format!("removing {}", stamp.display()))
+            }
+            _ => Ok(()),
+        }
     }
 
     pub fn get_state(&self) -> Result<BoxState> {
@@ -288,7 +327,8 @@ impl BoxRef {
             Holder::SettingUp => BoxState::SettingUp,
             // "Stopped" would invite booting a box whose project directory is gone.
             Holder::Free if !self.project_dir.is_dir() => BoxState::Gone,
-            Holder::Free if self.dir.join(ROOTFS_FILE).exists() => BoxState::Stopped,
+            Holder::Free if self.is_set_up() => BoxState::Stopped,
+            Holder::Free if self.dir.join(ROOTFS_FILE).exists() => BoxState::NeedsSetup,
             Holder::Free => BoxState::NotCreated,
         })
     }
@@ -322,11 +362,11 @@ impl BoxRef {
                 Ok(file)
             }
             Err(TryLockError::WouldBlock) => {
-                if self.is_marked_baking() {
+                if self.is_marked_setting_up() {
                     return Err(self.setup_holds_it());
                 }
                 bail!(
-                    "{} is locked by another terra command{} - a bake, export or \
+                    "{} is locked by another terra command{} - a setup, export or \
                      import holds the box for minutes",
                     self.dir.display(),
                     self.read_vm_process()
@@ -374,18 +414,18 @@ impl BoxRef {
     }
 }
 
-pub struct BakeMark<'a>(&'a File);
+pub struct SetupMark<'a>(&'a File);
 
-impl BakeMark<'_> {
+impl SetupMark<'_> {
     pub(crate) fn clear(self) -> std::io::Result<()> {
         BoxRef::rewrite_lock_line(self.0, "")
     }
 }
 
-impl Drop for BakeMark<'_> {
+impl Drop for SetupMark<'_> {
     fn drop(&mut self) {
         if let Err(error) = self.0.set_len(0) {
-            log::warn!("could not clear bake mark: {error}");
+            log::warn!("could not clear setup mark: {error}");
         }
     }
 }
@@ -584,6 +624,8 @@ pub enum BoxState {
     Running,
     SettingUp,
     Stopped,
+    /// A root image exists, but setup did not finish for the pinned recipe.
+    NeedsSetup,
     NotCreated,
     /// State remains, but the project directory is gone.
     Gone,
@@ -597,6 +639,7 @@ impl std::fmt::Display for BoxState {
             BoxState::Running => "running",
             BoxState::SettingUp => "setting_up",
             BoxState::Stopped => "stopped",
+            BoxState::NeedsSetup => "needs_setup",
             BoxState::NotCreated => "not_created",
             BoxState::Gone => "gone",
         })
@@ -864,13 +907,8 @@ mod tests {
     /// drift from what the other promises.
     #[test]
     fn every_box_state_is_a_single_word() {
-        for state in [
-            BoxState::Running,
-            BoxState::SettingUp,
-            BoxState::Stopped,
-            BoxState::NotCreated,
-            BoxState::Gone,
-        ] {
+        use clap::ValueEnum as _;
+        for state in BoxState::value_variants() {
             let word = state.to_string();
             assert_ne!(word, "");
             assert!(
@@ -898,6 +936,10 @@ mod tests {
             serde_json::to_string(&BoxState::NotCreated).unwrap(),
             "\"not_created\""
         );
+        assert_eq!(
+            serde_json::to_string(&BoxState::NeedsSetup).unwrap(),
+            "\"needs_setup\""
+        );
         assert_eq!(serde_json::to_string(&BoxState::Gone).unwrap(), "\"gone\"");
     }
 
@@ -924,7 +966,7 @@ mod tests {
         );
         assert_eq!(
             b.find_image_named("vol-data.img"),
-            Some(b.get_volume_image("data"))
+            Some(b.get_volume_image_path("data"))
         );
         for outside in [
             "../../.ssh/authorized_keys",
@@ -995,7 +1037,7 @@ mod tests {
         let b = resolve_box_ref(dir.path());
         for p in [
             b.get_dir().join(ROOTFS_FILE),
-            b.get_volume_image("data"),
+            b.get_volume_image_path("data"),
             b.get_dir().join(CONTROL_SOCKET),
             b.get_dir().join(RECIPE_FILE),
             b.get_dir().join(AGENT_SOCKET),
@@ -1009,7 +1051,10 @@ mod tests {
                 p.display()
             );
         }
-        assert_eq!(b.get_volume_image("data"), b.get_dir().join("vol-data.img"));
+        assert_eq!(
+            b.get_volume_image_path("data"),
+            b.get_dir().join("vol-data.img")
+        );
     }
 
     /// Socket paths spend from `sun_path`'s 107 bytes; the slug is a fixed 18,
@@ -1087,9 +1132,9 @@ mod tests {
         );
         std::fs::create_dir_all(b.get_dir()).unwrap();
         for name in ["data", "cache", "old"] {
-            std::fs::write(b.get_volume_image(name), b"image").unwrap();
+            std::fs::write(b.get_volume_image_path(name), b"image").unwrap();
         }
-        std::fs::create_dir(b.get_volume_image("directory")).unwrap();
+        std::fs::create_dir(b.get_volume_image_path("directory")).unwrap();
         std::fs::write(b.get_dir().join(ROOTFS_FILE), b"rootfs").unwrap();
         std::fs::write(b.get_dir().join(RECIPE_FILE), "hw:\n  cpus: 1\n").unwrap();
         let log = b.get_dir().join(LOG_FILE);
@@ -1100,7 +1145,10 @@ mod tests {
         unused.sort();
         assert_eq!(
             unused,
-            vec![b.get_volume_image("cache"), b.get_volume_image("old")]
+            vec![
+                b.get_volume_image_path("cache"),
+                b.get_volume_image_path("old")
+            ]
         );
 
         // With no volumes configured every image is unused - and still nothing
@@ -1110,9 +1158,9 @@ mod tests {
         assert_eq!(
             all,
             vec![
-                b.get_volume_image("cache"),
-                b.get_volume_image("data"),
-                b.get_volume_image("old")
+                b.get_volume_image_path("cache"),
+                b.get_volume_image_path("data"),
+                b.get_volume_image_path("old")
             ]
         );
     }
@@ -1127,18 +1175,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let b = resolve_box_ref(dir.path());
         std::fs::create_dir_all(b.get_dir()).unwrap();
-        std::fs::write(b.get_volume_image("Data"), b"image").unwrap();
+        std::fs::write(b.get_volume_image_path("Data"), b"image").unwrap();
         let configured = ["data".to_string()];
         assert_eq!(
             b.list_unused_volume_images(&configured).unwrap(),
             Vec::<PathBuf>::new()
         );
 
-        std::fs::write(b.get_volume_image("data"), b"image").unwrap();
+        std::fs::write(b.get_volume_image_path("data"), b"image").unwrap();
         if b.list_volume_images().unwrap().len() == 2 {
             assert_eq!(
                 b.list_unused_volume_images(&configured).unwrap(),
-                vec![b.get_volume_image("Data")]
+                vec![b.get_volume_image_path("Data")]
             );
         }
     }
@@ -1199,9 +1247,9 @@ mod tests {
     }
 
     /// A contended lock names the command holding it instead of advising
-    /// `terra stop`: a bake or a storage export legitimately keeps the box for
+    /// `terra stop`: a setup or a storage export legitimately keeps the box for
     /// minutes, and stopping it is not what the contender wants to be told.
-    /// A box mid-bake answers with the setup refusal, which says what the
+    /// A box mid-setup answers with the setup refusal, which says what the
     /// holder actually is.
     #[test]
     fn contention_names_the_command_holding_the_box() {
@@ -1211,7 +1259,7 @@ mod tests {
         std::fs::create_dir_all(b.get_dir()).unwrap();
 
         let lock = b.lock_run().unwrap();
-        BoxRef::publish_pid(&lock, std::process::id(), false).unwrap();
+        BoxRef::publish_pid(&lock, std::process::id(), PlanMode::Run).unwrap();
         let err = b.lock_run().expect_err("the box is held").to_string();
         assert!(
             err.contains(&format!(
@@ -1222,7 +1270,7 @@ mod tests {
         );
         assert!(!err.contains("terra stop"), "no stop advice: {err}");
 
-        let marked = BoxRef::mark_baking(&lock).unwrap();
+        let marked = BoxRef::mark_setting_up(&lock).unwrap();
         let err = format!("{:#}", b.lock_run().expect_err("the box is held"));
         assert!(err.contains("being set up"), "{err}");
         drop(marked);
@@ -1262,15 +1310,15 @@ mod tests {
         assert_eq!(b.get_holder().unwrap(), Holder::Free);
     }
 
-    /// The lock, the pid and the bake mark are one file: taking the lock empties
+    /// The lock, the pid and the setup mark are one file: taking the lock empties
     /// whatever the last run left, so a dead pid can never be read as a live one
-    /// and a mark a killed bake left behind can never make the next boot read as
-    /// a bake. What is signalled must also *be* a pid (signalling `0` reaches
+    /// and a mark a killed setup left behind can never make the next boot read as
+    /// a setup. What is signalled must also *be* a pid (signalling `0` reaches
     /// the process group).
     ///
     /// [`BoxRef::holder`] is the whole of the answer, so it is read here rather
     /// than the mark: a mark nobody is holding the lock over is nobody's, which
-    /// is what a bake killed between writing it and taking the lock leaves.
+    /// is what a setup killed between writing it and taking the lock leaves.
     #[test]
     fn the_lock_is_the_pid_file_and_taking_it_empties_what_the_last_run_left() {
         let _home = TestHome::new();
@@ -1279,7 +1327,7 @@ mod tests {
         std::fs::create_dir_all(b.get_dir()).unwrap();
 
         assert_eq!(b.read_vm_process(), None, "no pid file at all");
-        for bad in ["", "  ", "0", "-1", "nonsense", BAKE_MARK] {
+        for bad in ["", "  ", "0", "-1", "nonsense", SETUP_MARK] {
             std::fs::write(b.get_dir().join(PID_FILE), bad).unwrap();
             assert_eq!(b.read_vm_process(), None, "{bad:?} is not a pid");
             assert_eq!(
@@ -1298,10 +1346,10 @@ mod tests {
         assert_eq!(
             b.get_holder().unwrap(),
             Holder::Running,
-            "a killed bake's mark outlived its lock"
+            "a killed setup's mark outlived its lock"
         );
 
-        BoxRef::publish_pid(&lock, std::process::id(), false).unwrap();
+        BoxRef::publish_pid(&lock, std::process::id(), PlanMode::Run).unwrap();
         let published = b.read_vm_process().unwrap();
         assert_eq!(published.pid, std::process::id());
         assert_eq!(
@@ -1309,7 +1357,7 @@ mod tests {
             crate::sys::read_process_start_time(std::process::id()),
             "the start identity is read from the host and round-trips"
         );
-        BoxRef::publish_pid(&lock, std::process::id(), true).unwrap();
+        BoxRef::publish_pid(&lock, std::process::id(), PlanMode::Create).unwrap();
         let marked = b.read_vm_process().unwrap();
         assert_eq!(
             marked.pid,
@@ -1321,7 +1369,7 @@ mod tests {
             "the mark rides behind the start identity"
         );
 
-        for line in ["4242", "4242 bake", "4242 7 other"] {
+        for line in ["4242", "4242 setup", "4242 7 other"] {
             BoxRef::rewrite_lock_line(&lock, line).unwrap();
             assert_eq!(
                 b.read_vm_process(),
@@ -1334,10 +1382,10 @@ mod tests {
         assert!(b.get_dir().join(PID_FILE).exists());
         assert!(b.lock_run().is_err(), "a second run got the same box");
 
-        // A bake that has not spawned its child yet: marked, with no pid to
+        // A setup that has not spawned its child yet: marked, with no pid to
         // signal - which is what `terra stop` waits out rather than mistaking
         // for a stopped box. The guard puts the file back however it ended.
-        let marked = BoxRef::mark_baking(&lock).unwrap();
+        let marked = BoxRef::mark_setting_up(&lock).unwrap();
         assert_eq!(
             b.get_holder().unwrap(),
             Holder::SettingUp,
@@ -1346,9 +1394,9 @@ mod tests {
         assert_eq!(
             b.read_vm_process(),
             None,
-            "a bake marks the box before it has a pid"
+            "a setup marks the box before it has a pid"
         );
-        BoxRef::publish_pid(&lock, std::process::id(), true).unwrap();
+        BoxRef::publish_pid(&lock, std::process::id(), PlanMode::Create).unwrap();
         assert_eq!(b.get_holder().unwrap(), Holder::SettingUp);
         assert_eq!(
             b.read_vm_process().map(|vm| vm.pid),
@@ -1360,10 +1408,10 @@ mod tests {
         assert_eq!(
             b.read_vm_process(),
             None,
-            "the bake child's pid outlived the bake"
+            "the setup child's pid outlived the setup"
         );
 
-        BoxRef::publish_pid(&lock, std::process::id(), false).unwrap();
+        BoxRef::publish_pid(&lock, std::process::id(), PlanMode::Run).unwrap();
         assert_eq!(
             b.read_vm_process().map(|vm| vm.pid),
             Some(std::process::id())
@@ -1379,13 +1427,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let b = BoxRef::from_state_dir(dir.path().to_owned(), dir.path());
         let lock = b.lock_run().unwrap();
-        BoxRef::publish_pid(&lock, std::process::id(), false).unwrap();
+        BoxRef::publish_pid(&lock, std::process::id(), PlanMode::Run).unwrap();
         let original = std::fs::read(b.get_dir().join(PID_FILE)).unwrap();
-        assert!(BoxRef::publish_pid(&lock, u32::MAX, false).is_err());
+        assert!(BoxRef::publish_pid(&lock, u32::MAX, PlanMode::Run).is_err());
         assert_eq!(std::fs::read(b.get_dir().join(PID_FILE)).unwrap(), original);
         let readonly = File::open(b.get_dir().join(PID_FILE)).unwrap();
-        assert!(BoxRef::publish_pid(&readonly, std::process::id(), false).is_err());
-        assert!(BoxRef::mark_baking(&readonly).is_err());
+        assert!(BoxRef::publish_pid(&readonly, std::process::id(), PlanMode::Run).is_err());
+        assert!(BoxRef::mark_setting_up(&readonly).is_err());
     }
 
     #[cfg(unix)]
@@ -1458,7 +1506,7 @@ mod tests {
             })
         );
         assert_eq!(bx.read_vm_process().map(|process| process.pid), Some(42));
-        for invalid in ["", "123", "123 invalid", "0 456", "123 456 bake"] {
+        for invalid in ["", "123", "123 invalid", "0 456", "123 456 setup"] {
             std::fs::write(&supervisor_pid, invalid).unwrap();
             assert_eq!(bx.read_supervisor_process(), None, "{invalid:?}");
         }
@@ -1491,7 +1539,7 @@ mod tests {
         std::fs::create_dir_all(b.get_dir()).unwrap();
         let held = b.lock_run().unwrap();
 
-        BoxRef::publish_pid(&held, std::process::id(), false).unwrap();
+        BoxRef::publish_pid(&held, std::process::id(), PlanMode::Run).unwrap();
         #[cfg(unix)]
         let identity = |p: &Path| {
             let meta = std::fs::metadata(p).unwrap();
@@ -1501,8 +1549,8 @@ mod tests {
         let before = identity(&b.get_dir().join(PID_FILE));
 
         // Longer, then shorter than what it replaced - no tail may survive.
-        BoxRef::publish_pid(&held, std::process::id(), true).unwrap();
-        BoxRef::publish_pid(&held, std::process::id(), false).unwrap();
+        BoxRef::publish_pid(&held, std::process::id(), PlanMode::Create).unwrap();
+        BoxRef::publish_pid(&held, std::process::id(), PlanMode::Run).unwrap();
         #[cfg(unix)]
         assert_eq!(
             identity(&b.get_dir().join(PID_FILE)),
@@ -1530,7 +1578,7 @@ mod tests {
     /// which used to assert its wording themselves, so rewording it here broke
     /// two tests that are about neither the wording nor this message.
     #[test]
-    fn the_refusal_for_a_box_being_set_up_names_the_bake_and_the_way_to_watch_it() {
+    fn the_refusal_for_a_box_being_set_up_names_the_setup_and_the_way_to_watch_it() {
         let _home = TestHome::new();
         let dir = tempfile::tempdir().unwrap();
         let b = resolve_box_ref(dir.path());
@@ -1557,11 +1605,15 @@ mod tests {
 
         assert_matches!(b.get_state().unwrap(), BoxState::NotCreated);
         std::fs::write(b.get_dir().join(ROOTFS_FILE), b"image").unwrap();
+        // An image setup's VM never finished is not a box a boot accepts.
+        assert_matches!(b.get_state().unwrap(), BoxState::NeedsSetup);
+        std::fs::write(b.get_dir().join(RECIPE_FILE), "{}").unwrap();
+        b.write_setup_stamp().unwrap();
         assert_matches!(b.get_state().unwrap(), BoxState::Stopped);
 
         let lock = b.lock_run().unwrap();
         assert_matches!(b.get_state().unwrap(), BoxState::Running);
-        let marked = BoxRef::mark_baking(&lock).unwrap();
+        let marked = BoxRef::mark_setting_up(&lock).unwrap();
         assert_matches!(b.get_state().unwrap(), BoxState::SettingUp);
         assert_eq!(b.get_state().unwrap().to_string(), "setting_up");
         drop(marked);

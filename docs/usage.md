@@ -11,8 +11,8 @@ terra dev exec -- sh
 terra dev stop
 ```
 
-`BOX` is a name from `terra.yaml`, an existing box, or a recipe path such as
-`./ci.yaml`, which names the box after the file. See
+`BOX` is a name from `terra.yaml` or an existing box. `setup` and `show` also
+take a recipe path such as `./ci.yaml`, which names the box after the file. See
 [the manifest reference](manifest.md) and [the recipe reference](recipe.md).
 Every command accepts `--project DIR` to work on another project.
 
@@ -80,12 +80,14 @@ gh attestation verify terra-x86_64-linux.tar.gz --repo terrarium-sh/terrarium
 ## Set up and start
 
 `terra <box> setup` reads the recipe, asks for approval when needed, pins it,
-creates storage and runs `on_create`. Run it again after changing the recipe.
+creates storage, prepares the root image in an isolated VM without shares and
+runs `on_create`. Run it again after changing the recipe.
 `--dry-run` checks the recipe without changing anything. Without a terminal, a
 recipe a guest might have written needs `--trust-recipe` after you review it.
 
-`terra <box>` starts the box, or attaches if it is already running. It runs the
-recipe's workload, or the command after `--` for that boot only.
+`terra <box>` starts a box that `setup` finished, or attaches if it is already
+running. It never builds or re-pins: after editing a recipe, run `setup` again.
+It runs the recipe's workload, or the command after `--` for that boot only.
 
 - `--root` runs that boot's workload and daemons as guest root.
 - `-d` starts the box in the background.
@@ -164,11 +166,13 @@ project's.
 
 ```sh
 terra ls --state running --quiet
-terra ls --state stopped,not_created
+terra ls --state needs_setup,not_created
 terra ls --all --state running --json
 ```
 
-- States are `running`, `setting_up`, `stopped`, `not_created` and `gone`.
+- States are `running`, `setting_up`, `stopped`, `needs_setup`, `not_created`
+  and `gone`. `needs_setup` means setup is unfinished, the pinned recipe
+  changed, or the root image was imported: `terra <box> setup` makes it bootable.
   Repeat `--state` or join states with commas to match any of them.
 - Filters work with every format, including `--json` and `--tsv`. No match
   prints nothing, or `[]` for JSON.
@@ -191,8 +195,10 @@ Guest package updates never change the kernel.
   pinned recipe; `--purge` removes that too. `--force` removes a running box
   after trying a graceful stop.
 - `terra <box> storage show` lists the root filesystem and volumes. `export`
-  writes the images to a file and `import` loads one back, into a stopped box
-  with the same recipe. `prune` deletes images the recipe no longer names.
+  writes the images to a file (a `lifetime: boot` volume is left out, since the
+  next boot replaces it) and `import` loads one back, into a stopped box with
+  the same recipe; after a root-image import run `terra <box> setup` before
+  starting it. `prune` deletes images the recipe no longer names.
 
 Box state lives under `~/.terra/box/t-<project-slug>/<box>/`; the slug is a
 stable hash of the project path.
