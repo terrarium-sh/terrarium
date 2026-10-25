@@ -29,6 +29,11 @@ volumes:
     guest: /data
     size_mib: 1024
     lifetime: box
+  # rootfs_overlay: true needs hw.rootfs_readonly: true
+  # - name: changes
+  #   rootfs_overlay: true
+  #   size_mib: 1024
+  #   lifetime: boot
 env:
   MODEL: example
 env_file: .env  # create this file, or omit env_file
@@ -56,8 +61,8 @@ workload:
 - `hw.cpus`, `hw.mem_mib` and `hw.rootfs_mib` set the vCPUs, guest RAM and root
   filesystem size. The root filesystem is sparse but never grows past
   `rootfs_mib`.
-- `hw.rootfs_readonly: true` makes the root filesystem read-only on every boot
-  after setup. See [read-only root](#read-only-root).
+- `hw.rootfs_readonly: true` keeps the root image unchanged on every boot after
+  setup. See [read-only root](#read-only-root).
 - `components.memory_mib` caps the memory of each of Terra's device
   components: 16 MiB by default and at minimum. Most recipes leave it out.
 
@@ -65,7 +70,8 @@ workload:
 
 - a `name` of up to 247 ASCII letters, digits, `.`, `-` or `_`, unique ignoring
   case. It cannot end in a dot or be a Windows device name such as `CON`.
-- an absolute `guest` path.
+- an absolute `guest` path other than `/`, or `rootfs_overlay: true` to take a
+  read-only root's writes instead (see [overlay volume](#overlay-volume)).
 - a positive `size_mib`. Writes past it fail.
 
 `lifetime` says how long a volume's data lasts. The default, `box`, keeps it
@@ -86,18 +92,51 @@ behind.
 
 With `hw.rootfs_readonly: true`, the root image never changes after setup. Setup
 prepares it, and `on_create` writes it as usual; every other boot attaches it
-read-only on the host, so not even guest root can change it. Every later write
-to the root fails with `EROFS`: from the workload, daemons, `on_start`,
-`pre_stop`, `sudo`, `exec --root` and `terra sync`, so a runtime `apk add` fails
-too. The workload's home, `/home/terri`, is read-only as well. To get a
-writable home, add a `lifetime: boot` volume at `/home/terri`; it starts empty
-on every boot. `/tmp`, `/var/tmp` and `/run` are tmpfs in guest RAM.
-`lifetime: box` volumes and writable mounts still persist.
+read-only on the host, so not even guest root can change it. `lifetime: box`
+volumes and writable mounts still persist.
+
+Without an [overlay volume](#overlay-volume), every later write to the root
+fails with `EROFS`: from the workload, daemons, `on_start`, `pre_stop`, `sudo`,
+`exec --root` and `terra sync`, so a runtime `apk add` fails too. The
+workload's home, `/home/terri`, is read-only as well. To get a writable home,
+add a `lifetime: boot` volume at `/home/terri`; it starts empty on every boot.
+`/tmp`, `/var/tmp` and `/run` are tmpfs in guest RAM.
+
+#### Overlay volume
+
+A volume with `rootfs_overlay: true` in place of `guest` makes a read-only root
+writable for one boot:
+
+```yaml
+hw: {rootfs_readonly: true}
+volumes:
+  - {name: changes, rootfs_overlay: true, size_mib: 4096, lifetime: boot}
+```
+
+The guest's root is an overlay: the root image below, unchanged, and the volume
+on top, which takes every write to the root. The volume is never mounted at a
+guest path. It needs `hw.rootfs_readonly: true` and `lifetime: boot`, and a box
+has at most one. Root writes past its `size_mib` fail with `ENOSPC`.
+
+Everything written to the root lasts until the box stops: installed packages,
+edits under `/etc`, the home directory, `/tmp`, `/var/tmp` and `/var/log`. The
+next boot, even after a crash, starts again from the image setup left. To keep
+something, install it in `on_create` and run setup, or write it to a mount or a
+`lifetime: box` volume, such as one at `/var/log`.
+
+Programs can tell the root is an overlay:
+
+- Renaming a directory that came from the image fails with `EXDEV`; `mv` falls
+  back to copying.
+- A file's inode number changes when it is first modified, and hard links to a
+  file from the image split.
+- Container engines cannot keep their storage on the root; see
+  [containers](#containers).
 
 ## Mounts
 
-Each `mounts` item has a `host` path, an absolute `guest` path and optional
-`readonly: true`. Host paths are relative to the project directory, and `~`
+Each `mounts` item has a `host` path, an absolute `guest` path other than `/`
+and optional `readonly: true`. Host paths are relative to the project directory, and `~`
 means your own home. The host directory must exist when the box starts.
 
 A mount gives the guest that directory and nothing outside it: guest paths and
@@ -192,6 +231,49 @@ defaults to `/bin/sh`, `args` are passed as written, and `workdir` must be
 absolute. `sudo` lets the workload user run the named commands as guest root,
 with any arguments. `terra <box> --root` runs that boot's workload and daemons
 as root; `terra <box> exec --root -- CMD` runs only that command as root.
+
+## Containers
+
+Rootless podman runs as `terri`. The image already ships `terri`'s
+subordinate IDs and a `containers.conf` that suits the guest, so on a writable
+root `on_create: [apk add podman]` is all it takes. Images then live on the
+root, so size `hw.rootfs_mib` for them.
+
+Podman's storage must be on a writable filesystem that is not an overlay. Its
+default, `~/.local/share/containers/storage`, is on the root, so a read-only
+root needs a volume for it, with or without an overlay volume: a plain
+read-only root refuses the write, and on an overlay root podman stops with
+`'overlay' is not supported over overlayfs`. Point `graphroot` at the volume in
+a `storage.conf` written by `on_create`; these `allow` rules cover Alpine
+packages and Docker Hub:
+
+```yaml
+hw: {rootfs_readonly: true}
+network:
+  allow:
+    - dl-cdn.alpinelinux.org:443
+    - registry-1.docker.io:443
+    - auth.docker.io:443
+    - production.cloudflare.docker.com:443
+    - production.cloudfront.docker.com:443
+volumes:
+  - {name: changes, rootfs_overlay: true, size_mib: 4096, lifetime: boot}
+  - {name: containers, guest: /var/lib/terri-containers, size_mib: 8192}
+hooks:
+  on_create:
+    - apk add podman
+    - |
+      cat > /home/terri/.config/containers/storage.conf <<'EOF'
+      [storage]
+      driver = "overlay"
+      graphroot = "/var/lib/terri-containers/storage"
+      EOF
+```
+
+A `lifetime: box` volume keeps pulled images across restarts; `lifetime: boot`
+starts every boot clean. Keep the volume outside `/home/terri`: setup creates a
+volume's missing parent directories as root, so `terri` could not write in
+them.
 
 ## Applying changes
 

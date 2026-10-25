@@ -87,9 +87,11 @@ timestamps. `--delete` removes extra files only inside the destination tree.
 
 With `hw.rootfs_readonly: true`, every boot after setup opens `rootfs.img`
 read-only on the host and flags the disk read-only, so guest root cannot change
-the root image; the VM worker's sandbox is also granted it read-only. It
-protects only that image: writable mounts and `lifetime: box` volumes still
-keep whatever the guest writes.
+the root image; the VM worker's sandbox is also granted it read-only. An
+overlay volume does not change that: the image stays read-only, and the guest's
+root writes go to a `lifetime: boot` volume that is replaced before every boot
+and never mounted at a guest path. The flag protects only the image: writable
+mounts and `lifetime: box` volumes still keep whatever the guest writes.
 
 ## Layers on the host
 

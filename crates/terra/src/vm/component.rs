@@ -274,7 +274,8 @@ mod tests {
             cfg: Config {
                 volumes: vec![crate::config::Volume {
                     name: "scratch".into(),
-                    guest: "/scratch".into(),
+                    guest: Some("/scratch".into()),
+                    rootfs_overlay: false,
                     size_mib: 8,
                     lifetime: crate::config::VolumeLifetime::Boot,
                 }],

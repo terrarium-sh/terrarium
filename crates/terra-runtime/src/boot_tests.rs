@@ -46,7 +46,6 @@ fn boot_plan(
     let plan = Plan {
         mode,
         root: true,
-        rootfs_readonly: false,
         on_create,
         await_initial_session,
         ..Plan::bare_run(workload)

@@ -764,7 +764,8 @@ fn volume_names_reject_windows_filename_metacharacters() {
         let mut cfg = Config::default();
         cfg.volumes.push(Volume {
             name,
-            guest: PathBuf::from("/data"),
+            guest: Some(PathBuf::from("/data")),
+            rootfs_overlay: false,
             size_mib: 64,
             lifetime: VolumeLifetime::Box,
         });
@@ -785,7 +786,8 @@ fn volume_names_reject_unicode_and_ascii_case_aliases_on_every_platform() {
         for (name, guest) in [(first, "/a"), (second, "/b")] {
             cfg.volumes.push(Volume {
                 name: name.into(),
-                guest: guest.into(),
+                guest: Some(guest.into()),
+                rootfs_overlay: false,
                 size_mib: 64,
                 lifetime: VolumeLifetime::Box,
             });
@@ -804,7 +806,8 @@ fn volume_names_reject_unicode_and_ascii_case_aliases_on_every_platform() {
         let mut cfg = Config::default();
         cfg.volumes.push(Volume {
             name: name.into(),
-            guest: "/data".into(),
+            guest: Some("/data".into()),
+            rootfs_overlay: false,
             size_mib: 64,
             lifetime: VolumeLifetime::Box,
         });
@@ -836,5 +839,82 @@ fn volume_lifetimes_reject_unknown_values() {
         "volumes: [{name: v, guest: /v, size_mib: 8, lifetime: true}]",
     ] {
         assert!(yaml_serde::from_str::<Config>(recipe).is_err(), "{recipe}");
+    }
+}
+
+fn try_parse_recipe(yaml: &str) -> Result<Config> {
+    parse_recipe(yaml, Path::new("/proj"), Path::new("/proj/r.yaml"))
+}
+
+const OVERLAY_HW: &str = "hw: {rootfs_readonly: true}\n";
+
+/// `terra show` and the guest README print an overlay volume as
+/// `rootfs_overlay: true` with no `guest`, and an ordinary volume as before.
+#[test]
+fn a_volume_round_trips_with_only_the_target_it_sets() {
+    let cfg = try_parse_recipe(&format!(
+        "{OVERLAY_HW}volumes:\n  - {{name: a, guest: /x/../a, size_mib: 8}}\n  - {{name: b, rootfs_overlay: true, size_mib: 8, lifetime: boot}}"
+    ))
+    .unwrap();
+    assert_eq!(cfg.volumes[0].guest, Some("/a".into()));
+    let yaml = yaml_serde::to_string(&cfg.volumes).unwrap();
+    assert_eq!(yaml.matches("rootfs_overlay").count(), 1, "{yaml}");
+    assert_eq!(yaml.matches("guest:").count(), 1, "{yaml}");
+    let again: Vec<Volume> = yaml_serde::from_str(&yaml).unwrap();
+    assert_eq!(again, cfg.volumes);
+}
+
+#[test]
+fn a_volume_target_mistake_is_refused_with_the_fix() {
+    let overlay = |name: &str, lifetime: &str| {
+        format!("{{name: {name}, rootfs_overlay: true, size_mib: 8{lifetime}}}")
+    };
+    let boot = ", lifetime: boot";
+    for (recipe, expected) in [
+        (
+            format!(
+                "{OVERLAY_HW}volumes: [{{name: v, guest: /v, rootfs_overlay: true, size_mib: 8}}]"
+            ),
+            "sets both guest and rootfs_overlay",
+        ),
+        (
+            format!("{OVERLAY_HW}volumes: [{{name: v, size_mib: 8}}]"),
+            "set guest: /path, or rootfs_overlay: true",
+        ),
+        (
+            format!("volumes: [{}]", overlay("o", boot)),
+            "set hw.rootfs_readonly: true",
+        ),
+        (
+            format!("{OVERLAY_HW}volumes: [{}]", overlay("o", "")),
+            "set lifetime: boot",
+        ),
+        (
+            format!("{OVERLAY_HW}volumes: [{}]", overlay("o", ", lifetime: box")),
+            "set lifetime: boot",
+        ),
+        (
+            format!(
+                "{OVERLAY_HW}volumes: [{}, {}]",
+                overlay("o", boot),
+                overlay("p", boot)
+            ),
+            "second rootfs_overlay",
+        ),
+    ] {
+        let error = try_parse_recipe(&recipe).unwrap_err().to_string();
+        assert!(error.contains(expected), "{recipe}: {error}");
+    }
+}
+
+/// A filesystem at `/` would hide the root, however the path is spelled.
+#[test]
+fn guest_root_is_refused_for_a_mount_and_a_volume() {
+    for recipe in [
+        "mounts: [{host: ., guest: /x/..}]",
+        "volumes: [{name: v, guest: /., size_mib: 8}]",
+    ] {
+        let error = try_parse_recipe(recipe).unwrap_err().to_string();
+        assert!(error.contains("guest path '/' on "), "{recipe}: {error}");
     }
 }

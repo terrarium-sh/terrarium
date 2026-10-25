@@ -638,7 +638,8 @@ mod tests {
         let mut over = cfg;
         over.volumes.push(config::Volume {
             name: "over".into(),
-            guest: "/data".into(),
+            guest: Some("/data".into()),
+            rootfs_overlay: false,
             size_mib: 1,
             lifetime: config::VolumeLifetime::Box,
         });

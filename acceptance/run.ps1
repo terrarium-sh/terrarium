@@ -10,7 +10,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repo = "terrarium-sh/terrarium"
-$boxes = "probe", "isolated", "offline", "readonly", "bad-bake"
+$boxes = "probe", "isolated", "offline", "readonly", "overlay", "bad-bake"
 
 if (Test-Path -LiteralPath $Terra -PathType Leaf) {
     $Terra = (Resolve-Path -LiteralPath $Terra).Path
@@ -324,6 +324,17 @@ try {
     Assert-Equal (Get-TerraOutput @("readonly", "exec", "--no-tty", "--", "cat", "/kept/value")) "KEPT"
     Invoke-Terra @("readonly", "exec", "--no-tty", "--", "sh", "-ec", "test ! -e /scratch/value")
     Invoke-Terra @("readonly", "stop")
+    Complete-Step
+
+    Start-Step "a rootfs overlay makes a read-only root writable for one boot"
+    Invoke-Terra @("./overlay.yaml", "setup")
+    Invoke-Terra @("overlay", "-d")
+    Invoke-Terra @("overlay", "exec", "--no-tty", "--root", "--", "sh", "-ec", "echo CHANGED > /etc/overlay-probe")
+    Assert-Equal (Get-TerraOutput @("overlay", "exec", "--no-tty", "--", "cat", "/etc/overlay-probe")) "CHANGED"
+    Invoke-Terra @("overlay", "stop")
+    Invoke-Terra @("overlay", "-d")
+    Invoke-Terra @("overlay", "exec", "--no-tty", "--", "sh", "-ec", "test ! -e /etc/overlay-probe")
+    Invoke-Terra @("overlay", "stop")
     Complete-Step
 
     Start-Step "stop runs pre_stop and keeps the box"

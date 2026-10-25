@@ -7,7 +7,7 @@ set -eu
 
 usage="usage: run.sh [--terra PATH] [--suite DIR]"
 repo="terrarium-sh/terrarium"
-boxes="probe isolated offline readonly bad-bake"
+boxes="probe isolated offline readonly overlay bad-bake"
 
 terra=terra
 suite=
@@ -318,6 +318,17 @@ run readonly -d
 expect "$(output readonly exec --no-tty -- cat /kept/value)" KEPT
 run readonly exec --no-tty -- sh -ec 'test ! -e /scratch/value'
 run readonly stop
+passed
+
+begin "a rootfs overlay makes a read-only root writable for one boot"
+run ./overlay.yaml setup
+run overlay -d
+run overlay exec --no-tty --root -- sh -ec 'echo CHANGED > /etc/overlay-probe'
+expect "$(output overlay exec --no-tty -- cat /etc/overlay-probe)" CHANGED
+run overlay stop
+run overlay -d
+run overlay exec --no-tty -- sh -ec 'test ! -e /etc/overlay-probe'
+run overlay stop
 passed
 
 begin "stop runs pre_stop and keeps the box"

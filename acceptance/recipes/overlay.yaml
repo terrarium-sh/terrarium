@@ -1,0 +1,7 @@
+hw: {cpus: 1, mem_mib: 256, rootfs_readonly: true}
+network: {enabled: false}
+volumes:
+  - {name: changes, rootfs_overlay: true, size_mib: 64, lifetime: boot}
+workload:
+  entrypoint: /bin/sh
+  args: ['-ec', 'while true; do sleep 60; done']

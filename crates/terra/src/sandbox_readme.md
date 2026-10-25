@@ -23,14 +23,16 @@ The command this sandbox runs:
 What each option means from inside the sandbox:
 
 - `hw` - your resources; `rootfs_mib` caps the root filesystem, and
-  `rootfs_readonly: true` makes it read-only.
+  `rootfs_readonly: true` keeps its image unchanged after setup.
 - `mounts` - host directories shared into the sandbox: files under a `guest`
   path are visible on the host at its `host` path, and vice versa. A
   `readonly: true` mount rejects writes. Nothing outside these mounts reaches
   the host filesystem.
 - `volumes` - bounded scratch disks: each an ext4 image of `size_mib`, mounted
   at its `guest` path. `lifetime: box` keeps its data across restarts of this
-  box; `lifetime: boot` gives it an empty filesystem on every boot.
+  box; `lifetime: boot` gives it an empty filesystem on every boot. A volume
+  with `rootfs_overlay: true` instead of `guest` takes a read-only root's writes
+  for one boot.
 - `env` - variable names exported to you. Values are deliberately not written
   into this file; read them from your environment.
 - `sudo` - the commands you may run as root via `doas` (or `sudo`). Every

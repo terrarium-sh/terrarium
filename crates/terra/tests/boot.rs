@@ -2392,7 +2392,24 @@ sync
 if [ -e /work/hang ]; then echo HANGING; sleep 300; fi
 "#;
 
+    const OVERLAY_WORKLOAD_SCRIPT: &str = r#"exec 2>&1
+echo "ROOT_TYPE=$(awk '$2 == "/" {print $3}' /proc/mounts | tail -n1)"
+echo "OVERLAY_DEVICE_MOUNTS=$(grep -c '^/dev/vdd ' /proc/mounts)"
+grep -q '^/dev/vdc /kept ' /proc/mounts && grep -q '^/dev/vde /scratch ' /proc/mounts && echo MOUNTS_OK
+echo "ONSTART_ETC_X=$([ -e /etc/x ] && echo present || echo gone)"
+echo "ETC_Y=$([ -e /etc/y ] && echo present || echo gone)"
+echo "HOME_Y=$([ -e $HOME/y ] && echo present || echo gone)"
+echo "ONCREATE=$(cat /oncreate-marker 2>/dev/null || echo gone)"
+sudo touch /etc/y && touch $HOME/y && echo WRITES_OK
+sync
+if [ -e /work/hang ]; then echo HANGING; sleep 300; fi
+"#;
+
+    const READONLY_VOLUMES: &str = "  - {name: kept, guest: /kept, size_mib: 32}\n  - {name: scratch, guest: /scratch, size_mib: 32, lifetime: boot}\n";
+    const OVERLAY_VOLUMES: &str = "  - {name: kept, guest: /kept, size_mib: 32}\n  - {name: changes, rootfs_overlay: true, size_mib: 32, lifetime: boot}\n  - {name: scratch, guest: /scratch, size_mib: 32, lifetime: boot}\n";
+
     struct ReadOnlyBox {
+        name: &'static str,
         suite: Suite,
         project: PathBuf,
         recipe: PathBuf,
@@ -2404,6 +2421,24 @@ if [ -e /work/hang ]; then echo HANGING; sleep 300; fi
         }
 
         fn with_on_create(on_create: &[&str]) -> Self {
+            Self::build("readonly", READONLY_VOLUMES, WORKLOAD_SCRIPT, on_create)
+        }
+
+        fn overlay() -> Self {
+            Self::build(
+                "overlay",
+                OVERLAY_VOLUMES,
+                OVERLAY_WORKLOAD_SCRIPT,
+                &["echo CREATED > /oncreate-marker"],
+            )
+        }
+
+        fn build(
+            name: &'static str,
+            volumes: &str,
+            workload_script: &str,
+            on_create: &[&str],
+        ) -> Self {
             use std::fmt::Write as _;
             let mut hooks = String::new();
             if !on_create.is_empty() {
@@ -2413,18 +2448,19 @@ if [ -e /work/hang ]; then echo HANGING; sleep 300; fi
                 }
             }
             let suite = Suite::new();
-            let project = suite.create_project_dir("readonly");
-            let recipe = suite.get_work_dir().join("readonly.yaml");
-            let script = WORKLOAD_SCRIPT.replace('\n', "\n      ");
+            let project = suite.create_project_dir(name);
+            let recipe = suite.get_work_dir().join(format!("{name}.yaml"));
+            let script = workload_script.replace('\n', "\n      ");
             std::fs::write(
                 &recipe,
                 format!(
-                    "hw: {{cpus: 1, mem_mib: 256, rootfs_mib: 256, rootfs_readonly: true}}\nsudo: [touch]\nnetwork:\n  hosts:\n    - name: many.test\n      addr: 192.0.2.1\nvolumes:\n  - {{name: kept, guest: /kept, size_mib: 32}}\n  - {{name: scratch, guest: /scratch, size_mib: 32, lifetime: boot}}\nmounts:\n  - {{host: {}, guest: /work}}\nhooks:\n{hooks}  on_start:\n    - touch /etc/x 2> /kept/onstart || true\nworkload:\n  entrypoint: /bin/sh\n  args:\n    - -c\n    - |\n      {script}\n",
+                    "hw: {{cpus: 1, mem_mib: 256, rootfs_mib: 256, rootfs_readonly: true}}\nsudo: [touch]\nnetwork:\n  hosts:\n    - name: many.test\n      addr: 192.0.2.1\nvolumes:\n{volumes}mounts:\n  - {{host: {}, guest: /work}}\nhooks:\n{hooks}  on_start:\n    - touch /etc/x 2> /kept/onstart || true\nworkload:\n  entrypoint: /bin/sh\n  args:\n    - -c\n    - |\n      {script}\n",
                     project.display()
                 ),
             )
             .unwrap();
             Self {
+                name,
                 suite,
                 project,
                 recipe,
@@ -2444,7 +2480,7 @@ if [ -e /work/hang ]; then echo HANGING; sleep 300; fi
         }
 
         fn boot(&self, extra: &[&str]) -> String {
-            let mut args = vec!["readonly", "--foreground", "--project", self.project()];
+            let mut args = vec![self.name, "--foreground", "--project", self.project()];
             args.extend_from_slice(extra);
             let (out, code) = self.suite.run_terra_status(&args);
             assert_eq!(code, 0, "{out}");
@@ -2452,16 +2488,17 @@ if [ -e /work/hang ]; then echo HANGING; sleep 300; fi
         }
 
         fn rootfs_bytes(&self) -> Vec<u8> {
-            std::fs::read(self.suite.get_box_files_path("readonly").join("rootfs.img")).unwrap()
+            std::fs::read(self.suite.get_box_files_path(self.name).join("rootfs.img")).unwrap()
         }
 
-        /// Boots with the workload hanging, then SIGKILLs the VM process.
-        fn boot_and_kill_vm(&self) {
+        /// Boots with the workload hanging, then SIGKILLs the VM process and
+        /// returns what the killed boot printed.
+        fn boot_and_kill_vm(&self) -> String {
             use std::io::BufRead as _;
-            let box_dir = self.suite.get_box_files_path("readonly");
+            let box_dir = self.suite.get_box_files_path(self.name);
             std::fs::write(self.project.join("hang"), "").unwrap();
             let mut child = Command::new(&self.suite.terra)
-                .args(["readonly", "--foreground", "--project", self.project()])
+                .args([self.name, "--foreground", "--project", self.project()])
                 .env("HOME", &self.suite.home)
                 .env("USERPROFILE", &self.suite.home)
                 .env_remove("RUST_LOG")
@@ -2509,7 +2546,7 @@ if [ -e /work/hang ]; then echo HANGING; sleep 300; fi
             let lock = std::fs::File::open(box_dir.join("terra.pid")).unwrap();
             loop {
                 match lock.try_lock() {
-                    Ok(()) => break,
+                    Ok(()) => return seen,
                     Err(std::fs::TryLockError::WouldBlock) => {
                         assert!(
                             Instant::now() < deadline,
@@ -2645,6 +2682,62 @@ if [ -e /work/hang ]; then echo HANGING; sleep 300; fi
                 .run_terra_status(&["readonly", "stop", "--project", readonly.project()]);
     }
 
+    /// The overlay volume sits between two guest volumes, so their devices
+    /// prove it keeps its disk slot, and nothing mounts its own device. Every
+    /// boot starts without the previous boot's root writes and with setup's.
+    fn assert_overlay_workload_facts(out: &str) {
+        for expected in [
+            "ROOT_TYPE=overlay",
+            "OVERLAY_DEVICE_MOUNTS=0",
+            "MOUNTS_OK",
+            "ONSTART_ETC_X=present",
+            "ETC_Y=gone",
+            "HOME_Y=gone",
+            "ONCREATE=CREATED",
+            "WRITES_OK",
+        ] {
+            assert!(out.contains(expected), "missing {expected:?}:\n{out}");
+        }
+    }
+
+    #[test]
+    #[ignore = "boots a real VM and requires a native hypervisor"]
+    fn rootfs_overlay_changes_last_one_boot_and_leave_the_image_untouched() {
+        let overlay = ReadOnlyBox::overlay();
+        overlay.setup(&[]);
+        let pristine = overlay.rootfs_bytes();
+
+        for boot_number in 1..=2 {
+            let out = overlay.boot(&[]);
+            assert_overlay_workload_facts(&out);
+            assert!(
+                overlay.rootfs_bytes() == pristine,
+                "rootfs.img changed after boot {boot_number}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "boots a real VM and requires a native hypervisor"]
+    fn rootfs_overlay_changes_do_not_survive_sigkill() {
+        let overlay = ReadOnlyBox::overlay();
+        overlay.setup(&[]);
+        let pristine = overlay.rootfs_bytes();
+
+        assert_overlay_workload_facts(&overlay.boot_and_kill_vm());
+        assert!(
+            overlay.rootfs_bytes() == pristine,
+            "rootfs.img changed after SIGKILL"
+        );
+
+        let after_kill = overlay.boot(&[]);
+        assert_overlay_workload_facts(&after_kill);
+        assert!(
+            overlay.rootfs_bytes() == pristine,
+            "rootfs.img changed after the restart that followed SIGKILL"
+        );
+    }
+
     #[test]
     #[ignore = "boots a real VM and requires a native hypervisor"]
     fn rebuild_still_writes_the_read_only_base() {
@@ -2653,6 +2746,75 @@ if [ -e /work/hang ]; then echo HANGING; sleep 300; fi
         readonly.setup(&["--rebuild"]);
         let out = readonly.boot(&[]);
         assert_workload_facts(&out);
+    }
+}
+
+/// Rootless podman needs the network to install, so it runs apart from
+/// `read_only_rootfs`.
+#[cfg(target_os = "linux")]
+mod containers {
+    use super::*;
+
+    /// The recipe in the recipe reference's Containers section runs rootless
+    /// podman on its overlay driver, with its overlay volume and without one:
+    /// either way podman's storage is on an ext4 volume.
+    #[test]
+    #[ignore = "boots a real VM, requires a native hypervisor and downloads podman"]
+    fn the_documented_podman_recipe_runs_containers_on_read_only_and_overlay_roots() {
+        const SCRIPT: &str = "cd /tmp && tar -C / -chf bb.tar bin/busybox lib/ld-musl-$(uname -m).so.1 \
+             && podman import -q bb.tar localhost/bb >/dev/null \
+             && podman run --rm localhost/bb /bin/busybox printf 'CONTAINER_%s\\n' OK; \
+             podman info --format 'DRIVER={{.Store.GraphDriverName}}'";
+        let reference = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/recipe.md"),
+        )
+        .unwrap();
+        let documented = reference
+            .split("## Containers")
+            .nth(1)
+            .and_then(|section| section.split("```yaml\n").nth(1))
+            .and_then(|block| block.split("```").next())
+            .unwrap();
+        let without_overlay = documented
+            .lines()
+            .filter(|line| !line.contains("rootfs_overlay"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let suite = Suite::new();
+        let project = suite.create_project_dir("podman");
+        let project = project.to_str().unwrap();
+        for (name, recipe) in [
+            ("podman-overlay", documented),
+            ("podman-readonly", without_overlay.as_str()),
+        ] {
+            let path = suite.get_work_dir().join(format!("{name}.yaml"));
+            std::fs::write(
+                &path,
+                format!("{recipe}workload: {{entrypoint: /bin/sleep, args: [infinity]}}\n"),
+            )
+            .unwrap();
+            for args in [
+                vec![path.to_str().unwrap(), "setup", "--project", project],
+                vec![name, "-d", "--project", project],
+            ] {
+                let (out, code) = suite.run_terra_status(&args);
+                assert_eq!(code, 0, "{args:?}: {out}");
+            }
+            let (out, _) = suite.exec_in(
+                name,
+                Path::new(project),
+                false,
+                &["sh", "-c", &format!("{{ {SCRIPT}; }} 2>&1")],
+            );
+            let _ = suite.run_terra_status(&[name, "stop", "--project", project]);
+            for expected in ["CONTAINER_OK", "DRIVER=overlay"] {
+                assert!(
+                    out.contains(expected),
+                    "{name}: missing {expected:?}:\n{out}"
+                );
+            }
+        }
     }
 }
 

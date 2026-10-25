@@ -120,7 +120,8 @@ mod tests {
         std::fs::create_dir(bx.get_dir()).unwrap();
         let volume = |name: &str, lifetime| Volume {
             name: name.into(),
-            guest: format!("/{name}").into(),
+            guest: Some(format!("/{name}").into()),
+            rootfs_overlay: false,
             size_mib: 8,
             lifetime,
         };

@@ -41,7 +41,10 @@ use anyhow::{Context as _, Result};
 use std::fs::File;
 #[cfg(unix)]
 use std::io::Read as _;
-use terra_protocol::{Disk, Net, Plan, PlanMode, Share, WORKLOAD_ID, WORKLOAD_USER_NAME};
+use terra_protocol::{
+    Disk, Net, Plan, PlanMode, RootfsMount, Share, WORKLOAD_ID, WORKLOAD_USER_NAME,
+};
+use terra_runtime::component::AccessMode;
 
 pub(crate) use terra_runtime::machine::MAX_GUEST_STORAGE_DEVICES;
 
@@ -92,8 +95,7 @@ pub(crate) fn encode_boot_plan(spec: &BootSpec, box_name: &str) -> Result<Vec<u8
     .context("boot plan exceeds its encoded size limit; reduce the recipe or environment")
 }
 
-pub(crate) fn rootfs_access(spec: &BootSpec) -> terra_runtime::component::AccessMode {
-    use terra_runtime::component::AccessMode;
+pub(crate) fn rootfs_access(spec: &BootSpec) -> AccessMode {
     if spec.mode == PlanMode::Run && spec.cfg.hw.rootfs_readonly {
         AccessMode::ReadOnly
     } else {
@@ -116,19 +118,29 @@ fn build_plan(spec: &BootSpec, box_name: &str) -> Result<Plan> {
             readonly: mount.readonly,
         })
         .collect();
-    let volumes = cfg
-        .volumes
-        .iter()
-        .enumerate()
-        .map(|(index, volume)| {
-            Ok(Disk {
-                dev: terra_protocol::to_volume_device(index).with_context(|| {
-                    format!("volume {index} is past the last guest block device")
-                })?,
-                guest: volume.guest.to_string_lossy().into_owned(),
-            })
-        })
-        .collect::<Result<_>>()?;
+    let get_volume_device = |index| {
+        terra_protocol::to_volume_device(index)
+            .with_context(|| format!("volume {index} is past the last guest block device"))
+    };
+    let mut volumes = Vec::new();
+    for (index, volume) in cfg.volumes.iter().enumerate() {
+        if let Some(guest) = &volume.guest {
+            volumes.push(Disk {
+                dev: get_volume_device(index)?,
+                guest: guest.to_string_lossy().into_owned(),
+            });
+        }
+    }
+    let rootfs = match rootfs_access(spec) {
+        AccessMode::ReadWrite => RootfsMount::Writable,
+        AccessMode::ReadOnly => match cfg.volumes.iter().position(|volume| volume.rootfs_overlay) {
+            Some(index) => RootfsMount::Overlay {
+                upper_dev: get_volume_device(index)?,
+            },
+            None => RootfsMount::ReadOnly,
+        },
+    };
+    let sandbox_info = generate_sandbox_info(spec, &rootfs);
     let published_mappings = if is_setup_boot {
         Vec::new()
     } else {
@@ -164,7 +176,7 @@ fn build_plan(spec: &BootSpec, box_name: &str) -> Result<Plan> {
         published_udp_ports,
         env: cfg.env.clone(),
         root: is_root,
-        rootfs_readonly: rootfs_access(spec) == terra_runtime::component::AccessMode::ReadOnly,
+        rootfs,
         sudo: cfg.sudo.clone(),
         on_create: cfg.hooks.on_create.clone(),
         on_start: cfg.hooks.on_start.clone(),
@@ -174,7 +186,7 @@ fn build_plan(spec: &BootSpec, box_name: &str) -> Result<Plan> {
         workload: std::iter::once(cfg.workload.entrypoint.to_string_lossy().into_owned())
             .chain(cfg.workload.args.iter().cloned())
             .collect(),
-        sandbox_info: generate_sandbox_info(spec),
+        sandbox_info,
         host_tz: read_host_timezone(),
         host_time: None,
         host_seed: None,
@@ -186,7 +198,7 @@ fn build_plan(spec: &BootSpec, box_name: &str) -> Result<Plan> {
 /// What the agent writes to `/terra/README.md`, so an AI agent looking
 /// around the box finds an explanation instead of guessing.
 #[must_use]
-fn generate_sandbox_info(spec: &BootSpec) -> String {
+fn generate_sandbox_info(spec: &BootSpec, rootfs: &RootfsMount) -> String {
     let cfg = &spec.cfg;
     let yaml = render_config_yaml(&redact_config_env(cfg)).unwrap_or_default();
     let who = if spec.root || spec.mode == PlanMode::Create {
@@ -197,14 +209,22 @@ fn generate_sandbox_info(spec: &BootSpec) -> String {
     format!(
         include_str!("sandbox_readme.md"),
         who = who,
-        rootfs = if rootfs_access(spec) == terra_runtime::component::AccessMode::ReadOnly {
-            "The root filesystem is READ-ONLY: every write to it fails with EROFS, as \
-             root too. `/tmp`, `/var/tmp` and `/run` are in-memory and reset on every \
-             boot; only the `mounts` and `lifetime: box` volumes below keep data."
-        } else {
-            "The root filesystem is a private disk image. It PERSISTS across restarts of \
-             this sandbox; rebuilding or removing the box clears it. Its size is capped, \
-             so it can fill up: writes past the cap fail with ENOSPC."
+        rootfs = match rootfs {
+            RootfsMount::Writable => {
+                "The root filesystem is a private disk image. It PERSISTS across restarts of \
+                 this sandbox; rebuilding or removing the box clears it. Its size is capped, \
+                 so it can fill up: writes past the cap fail with ENOSPC."
+            }
+            RootfsMount::ReadOnly => {
+                "The root filesystem is READ-ONLY: every write to it fails with EROFS, as \
+                 root too. `/tmp`, `/var/tmp` and `/run` are in-memory and reset on every \
+                 boot; only the `mounts` and `lifetime: box` volumes below keep data."
+            }
+            RootfsMount::Overlay { .. } => {
+                "The root filesystem is writable for this boot only: writes go to the \
+                 `rootfs_overlay` volume and are gone after a restart; only the `mounts` and \
+                 `lifetime: box` volumes below keep data."
+            }
         },
         shares = match spec.mode {
             PlanMode::Create => {
@@ -302,14 +322,14 @@ mod tests {
     #[test]
     fn sandbox_info_says_whether_the_root_keeps_writes() {
         let mut spec = build_run_spec(config::Config::default());
-        let writable = generate_sandbox_info(&spec);
+        let writable = build_plan(&spec, "dev").unwrap().sandbox_info;
         assert!(
             writable.contains("It PERSISTS across restarts"),
             "{writable}"
         );
         assert!(!writable.contains("READ-ONLY"), "{writable}");
         spec.cfg.hw.rootfs_readonly = true;
-        let readonly = generate_sandbox_info(&spec);
+        let readonly = build_plan(&spec, "dev").unwrap().sandbox_info;
         assert!(
             readonly.contains("READ-ONLY: every write to it fails with EROFS"),
             "{readonly}"
@@ -327,7 +347,7 @@ mod tests {
             readonly: true,
         }];
         let mut spec = build_run_spec(cfg);
-        let info = generate_sandbox_info(&spec);
+        let info = build_plan(&spec, "dev").unwrap().sandbox_info;
         assert!(info.contains("# Terrarium sandbox"));
         assert!(info.contains("`/bin/sh -c make`"));
         assert!(info.contains("(uid 1000, non-root)"));
@@ -342,7 +362,7 @@ mod tests {
 
         // --root: no privilege drop, and the doc says so.
         spec.root = true;
-        let root = generate_sandbox_info(&spec);
+        let root = build_plan(&spec, "dev").unwrap().sandbox_info;
         assert!(root.contains("You run as `root`"), "{root}");
     }
 
@@ -371,7 +391,8 @@ mod tests {
         }];
         spec.cfg.volumes = vec![config::Volume {
             name: "data".into(),
-            guest: "/data".into(),
+            guest: Some("/data".into()),
+            rootfs_overlay: false,
             size_mib: 1,
             lifetime: config::VolumeLifetime::Box,
         }];
@@ -427,7 +448,6 @@ mod tests {
     /// decision, so the agent never mounts a read-only device writable.
     #[test]
     fn only_a_run_boot_of_a_read_only_box_gets_a_read_only_root() {
-        use terra_runtime::component::AccessMode;
         let spec = |mode, rootfs_readonly| {
             let mut cfg: config::Config = yaml_serde::from_str("{}").unwrap();
             cfg.hw.rootfs_readonly = rootfs_readonly;
@@ -453,8 +473,11 @@ mod tests {
                 "{mode:?}, {rootfs_readonly}"
             );
             assert_eq!(
-                build_plan(&spec, "dev").unwrap().rootfs_readonly,
-                expected == AccessMode::ReadOnly,
+                build_plan(&spec, "dev").unwrap().rootfs,
+                match expected {
+                    AccessMode::ReadOnly => RootfsMount::ReadOnly,
+                    AccessMode::ReadWrite => RootfsMount::Writable,
+                },
                 "{mode:?}, {rootfs_readonly}"
             );
         }
@@ -506,8 +529,85 @@ mod tests {
             env: BTreeMap::from([("API_KEY".to_string(), "sk-super-secret".to_string())]),
             ..yaml_serde::from_str("{}").unwrap()
         };
-        let info = generate_sandbox_info(&build_run_spec(cfg));
+        let info = build_plan(&build_run_spec(cfg), "dev")
+            .unwrap()
+            .sandbox_info;
         assert!(info.contains("API_KEY"), "the name should still be shown");
         assert!(!info.contains("sk-super-secret"), "{info}");
+    }
+
+    fn overlay_spec(mode: PlanMode) -> BootSpec {
+        let volume = |name: &str, guest: Option<&str>| config::Volume {
+            name: name.into(),
+            guest: guest.map(PathBuf::from),
+            rootfs_overlay: guest.is_none(),
+            size_mib: 64,
+            lifetime: config::VolumeLifetime::Boot,
+        };
+        let mut cfg = config::Config::default();
+        cfg.hw.rootfs_readonly = true;
+        cfg.volumes = vec![
+            volume("before", Some("/before")),
+            volume("changes", None),
+            volume("after", Some("/after")),
+        ];
+        BootSpec {
+            cfg,
+            project_dir: PathBuf::from("/project"),
+            root: false,
+            mode,
+            foreground: false,
+            host_publishes_pid: false,
+            network_broker: None,
+        }
+    }
+
+    /// The overlay keeps its slot among the attached disks, so the guest
+    /// volumes around it keep theirs, and it is not also mounted at a path.
+    #[test]
+    fn a_run_plan_puts_the_overlay_device_in_rootfs_not_in_volumes() {
+        let plan = build_plan(&overlay_spec(PlanMode::Run), "dev").unwrap();
+        assert_eq!(
+            plan.rootfs,
+            RootfsMount::Overlay {
+                upper_dev: terra_protocol::to_volume_device(1).unwrap()
+            }
+        );
+        let devices: Vec<_> = plan.volumes.iter().map(|disk| disk.dev.clone()).collect();
+        assert_eq!(
+            devices,
+            [
+                terra_protocol::to_volume_device(0).unwrap(),
+                terra_protocol::to_volume_device(2).unwrap()
+            ]
+        );
+        assert_eq!(plan.volumes[0].guest, "/before");
+        assert_eq!(plan.volumes[1].guest, "/after");
+    }
+
+    /// Setup writes the root itself; its plan keeps the guest volumes only for
+    /// their mount points and carries no overlay.
+    #[test]
+    fn setups_plan_has_a_writable_root_and_no_overlay() {
+        let plan = build_plan(&overlay_spec(PlanMode::Create), "dev").unwrap();
+        assert_eq!(plan.rootfs, RootfsMount::Writable);
+        assert_eq!(plan.volumes.len(), 2);
+        let info = &plan.sandbox_info;
+        assert!(!info.contains("writable for this boot only"), "{info}");
+    }
+
+    /// An agent reading the README must learn where its root writes go: the
+    /// root line points at the volume the YAML below lists.
+    #[test]
+    fn sandbox_info_says_root_writes_go_to_the_overlay_volume() {
+        let info = build_plan(&overlay_spec(PlanMode::Run), "dev")
+            .unwrap()
+            .sandbox_info;
+        assert!(
+            info.contains("writable for this boot only: writes go to the `rootfs_overlay` volume"),
+            "{info}"
+        );
+        assert!(info.contains("rootfs_overlay: true"), "{info}");
+        assert!(!info.contains("READ-ONLY"), "{info}");
     }
 }

@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, bail};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use super::{Config, MIN_MEM_MIB};
+use super::{Config, MIN_MEM_MIB, VolumeLifetime};
+use std::path::Path;
 use terra_protocol::MAX_VOLUMES;
 
 pub(crate) fn validate_env(env: &BTreeMap<String, String>) -> Result<()> {
@@ -36,7 +37,7 @@ pub(crate) fn validate(cfg: &Config) -> Result<()> {
     validate_volumes(cfg)?;
     validate_network(cfg)?;
     validate_env(&cfg.env)?;
-    validate_one_thing_per_guest_path(cfg)?;
+    validate_guest_paths(cfg)?;
     Ok(())
 }
 
@@ -109,6 +110,7 @@ fn validate_volumes(cfg: &Config) -> Result<()> {
         );
     }
     let mut seen = HashSet::new();
+    let mut has_overlay = false;
     for v in &cfg.volumes {
         crate::name::validate_storage_name(&v.name).context("invalid volume name")?;
         anyhow::ensure!(
@@ -126,6 +128,32 @@ fn validate_volumes(cfg: &Config) -> Result<()> {
                 "volume '{}' must have size_mib > 0",
                 crate::render::escape_printable(&v.name)
             );
+        }
+        let name = crate::render::escape_printable(&v.name);
+        match (&v.guest, v.rootfs_overlay) {
+            (Some(_), false) => {}
+            (Some(_), true) => bail!(
+                "volume '{name}' sets both guest and rootfs_overlay; keep one \
+                 (guest mounts it at a path, rootfs_overlay makes it the root's writable layer)"
+            ),
+            (None, false) => {
+                bail!("volume '{name}' needs a target: set guest: /path, or rootfs_overlay: true")
+            }
+            (None, true) => {
+                anyhow::ensure!(
+                    !has_overlay,
+                    "volume '{name}' is a second rootfs_overlay; only one volume can be the root's writable layer"
+                );
+                has_overlay = true;
+                anyhow::ensure!(
+                    cfg.hw.rootfs_readonly,
+                    "volume '{name}' is a rootfs_overlay, which layers over a read-only root; set hw.rootfs_readonly: true"
+                );
+                anyhow::ensure!(
+                    v.lifetime == VolumeLifetime::Boot,
+                    "volume '{name}' is a rootfs_overlay, so it must be fresh each boot; set lifetime: boot (the default is box)"
+                );
+            }
         }
     }
     Ok(())
@@ -154,7 +182,7 @@ fn validate_network(cfg: &Config) -> Result<()> {
 /// Refuse two entries claiming one guest path. They are mounted in recipe
 /// order, so the later one silently wins and the earlier one is a line in the
 /// recipe that does nothing.
-fn validate_one_thing_per_guest_path(cfg: &Config) -> Result<()> {
+fn validate_guest_paths(cfg: &Config) -> Result<()> {
     let claims = cfg
         .mounts
         .iter()
@@ -167,14 +195,19 @@ fn validate_one_thing_per_guest_path(cfg: &Config) -> Result<()> {
                 ),
             )
         })
-        .chain(cfg.volumes.iter().map(|v| {
-            (
-                v.guest.as_path(),
+        .chain(cfg.volumes.iter().filter_map(|v| {
+            Some((
+                v.guest.as_deref()?,
                 format!("volume '{}'", crate::render::escape_printable(&v.name)),
-            )
+            ))
         }));
     let mut seen = HashMap::new();
     for (guest, what) in claims {
+        anyhow::ensure!(
+            guest != Path::new("/"),
+            "guest path '/' on {what} would hide the root filesystem; pick a subdirectory \
+             (a volume takes a read-only root's writes with rootfs_overlay: true)"
+        );
         if let Some(earlier) = seen.insert(guest, what.clone()) {
             bail!(
                 "guest path '{}' is claimed twice, by {earlier} and by {what} \

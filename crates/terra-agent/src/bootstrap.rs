@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use rustix::mount::{MountFlags, MountPropagationFlags};
+use std::ffi::CStr;
 use std::fs::{self, File};
 use std::io::{Seek, SeekFrom, Write as _};
 use std::os::unix::fs::{DirBuilderExt as _, FileExt, OpenOptionsExt as _, PermissionsExt};
@@ -11,7 +12,7 @@ use terra_protocol::guest_root::{
 };
 use terra_protocol::{
     BootPlan, CLOCK_SYNC, CLOCK_SYNC_BYTES, Plan, PlanMode, RESIZE2FS_GUEST_PATH, ROOT_DEVICE,
-    WORKLOAD_ID,
+    RootfsMount, WORKLOAD_ID,
 };
 
 const CLEAN_MOUNT: &str = "/mnt/clean";
@@ -60,27 +61,13 @@ pub(super) fn enter_root() -> Result<Boot> {
             for volume in &plan.volumes {
                 grow_filesystem(&volume.dev);
             }
+            match &plan.rootfs {
+                RootfsMount::Overlay { upper_dev } => grow_filesystem(upper_dev),
+                RootfsMount::Writable | RootfsMount::ReadOnly => {}
+            }
         }
     }
-    mount(
-        Some(ROOT_DEVICE),
-        NEWROOT,
-        Some("ext4"),
-        if plan.rootfs_readonly {
-            MountFlags::RDONLY
-        } else {
-            MountFlags::empty()
-        },
-    )
-    .with_context(|| {
-        if plan.rootfs_readonly {
-            format!(
-                "mounting the read-only guest rootfs image ({ROOT_DEVICE}); its journal may need replay - run `terra <box> setup --rebuild`"
-            )
-        } else {
-            format!("mounting the guest rootfs image ({ROOT_DEVICE})")
-        }
-    })?;
+    mount_guest_root(&plan.rootfs, NEWROOT)?;
     for directory in ["proc", "sys", "dev", "terra"] {
         fs::create_dir_all(format!("{NEWROOT}/{directory}"))?;
     }
@@ -113,8 +100,9 @@ pub(super) fn enter_root() -> Result<Boot> {
         MountFlags::NOSUID | MountFlags::NODEV,
     )?;
     fs::set_permissions("/run", fs::Permissions::from_mode(0o755))?;
-    if plan.rootfs_readonly {
-        mount_scratch_directories()?;
+    match plan.rootfs {
+        RootfsMount::ReadOnly => mount_scratch_directories()?,
+        RootfsMount::Writable | RootfsMount::Overlay { .. } => {}
     }
     write_per_boot_files(Path::new(PER_BOOT_DIR), &plan)?;
     Ok(Boot {
@@ -124,6 +112,49 @@ pub(super) fn enter_root() -> Result<Boot> {
         clients,
         mux,
     })
+}
+
+fn mount_guest_root(rootfs: &RootfsMount, new_root: &str) -> Result<()> {
+    let mount_image = |target: &str, flags: MountFlags| {
+        mount(Some(ROOT_DEVICE), target, Some("ext4"), flags).with_context(|| {
+            if flags.contains(MountFlags::RDONLY) {
+                format!(
+                    "mounting the read-only guest rootfs image ({ROOT_DEVICE}); its journal may need replay - run `terra <box> setup --rebuild`"
+                )
+            } else {
+                format!("mounting the guest rootfs image ({ROOT_DEVICE})")
+            }
+        })
+    };
+    match rootfs {
+        RootfsMount::Writable => mount_image(new_root, MountFlags::empty()),
+        RootfsMount::ReadOnly => mount_image(new_root, MountFlags::RDONLY),
+        RootfsMount::Overlay { upper_dev } => {
+            fs::create_dir_all("/mnt/upper")?;
+            fs::create_dir_all("/mnt/lower")?;
+            mount(
+                Some(upper_dev),
+                "/mnt/upper",
+                Some("ext4"),
+                MountFlags::empty(),
+            )
+            .with_context(|| format!("mounting the rootfs overlay volume ({upper_dev})"))?;
+            for directory in ["/mnt/upper/upper", "/mnt/upper/work"] {
+                fs::create_dir_all(directory).with_context(|| {
+                    format!("preparing the rootfs overlay volume ({upper_dev})")
+                })?;
+            }
+            mount_image("/mnt/lower", MountFlags::RDONLY)?;
+            mount_with_data(
+                None,
+                new_root,
+                Some("overlay"),
+                MountFlags::empty(),
+                c"lowerdir=/mnt/lower,upperdir=/mnt/upper/upper,workdir=/mnt/upper/work",
+            )
+            .with_context(|| format!("mounting the rootfs overlay on {upper_dev}"))
+        }
+    }
 }
 
 fn mount_scratch_directories() -> Result<()> {
@@ -421,16 +452,27 @@ pub(super) fn mount(
     fstype: Option<&str>,
     flags: MountFlags,
 ) -> Result<()> {
+    let data = if fstype == Some("ext4") && !flags.contains(MountFlags::RDONLY) {
+        c"discard"
+    } else {
+        c""
+    };
+    mount_with_data(source, target, fstype, flags, data)
+}
+
+fn mount_with_data(
+    source: Option<&str>,
+    target: &str,
+    fstype: Option<&str>,
+    flags: MountFlags,
+    data: &CStr,
+) -> Result<()> {
     rustix::mount::mount(
         source.unwrap_or("none"),
         target,
         fstype.unwrap_or("none"),
         flags,
-        if fstype == Some("ext4") && !flags.contains(MountFlags::RDONLY) {
-            c"discard"
-        } else {
-            c""
-        },
+        data,
     )
     .map_err(std::io::Error::from)
     .with_context(|| format!("mounting {target}"))

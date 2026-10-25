@@ -23,8 +23,8 @@ fits in a box.
 
 ### A terrarium for agents
 
-Give a long-lived agent a box of its own. The root filesystem and volumes
-survive restarts, so its tools and state stay put.
+Give a long-lived agent a box of its own. By default, the root filesystem and
+volumes survive restarts, so its tools and state stay put.
 
 1. Make the agent the recipe's [workload](recipe.md#processes).
 2. Share only the directories it should touch, or none, and hand files over

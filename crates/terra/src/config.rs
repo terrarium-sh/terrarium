@@ -106,7 +106,13 @@ pub struct Volume {
     /// Names the image file (`vol-<name>.img` under the box's state dir).
     /// Renaming starts a fresh image.
     pub name: String,
-    pub guest: PathBuf,
+    /// Unset only on the `rootfs_overlay` volume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest: Option<PathBuf>,
+    /// The upper layer of an overlay over a read-only root, in place of a
+    /// mount at `guest`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rootfs_overlay: bool,
     /// Writes past this fail with ENOSPC.
     pub size_mib: u32,
     #[serde(default)]
@@ -387,11 +393,15 @@ pub fn parse_recipe(text: &str, project_dir: &Path, source: &Path) -> Result<Con
     if let Some(file) = &cfg.env_file {
         cfg.env_file = Some(resolve_recipe_path(file, project_dir)?);
     }
+    let volume_paths = cfg
+        .volumes
+        .iter_mut()
+        .filter_map(|volume| volume.guest.as_mut());
     for path in cfg
         .mounts
         .iter_mut()
         .map(|mount| &mut mount.guest)
-        .chain(cfg.volumes.iter_mut().map(|volume| &mut volume.guest))
+        .chain(volume_paths)
     {
         *path = normalize_guest_path(path)?;
     }
