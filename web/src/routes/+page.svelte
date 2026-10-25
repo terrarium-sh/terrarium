@@ -55,7 +55,7 @@
 </section>
 
 <section class="principles use-cases" aria-label="What Terrarium is for">
-  <div><span class="eyebrow">Primary use / Agents</span><h2>A terrarium for agents.</h2><p>Give a long-lived agent a box of its own. Its storage persists across restarts, and it reaches only the files and destinations you grant.</p><a href="{base}/docs/usage/#a-terrarium-for-agents">Set one up <span aria-hidden="true">→</span></a></div>
+  <div><span class="eyebrow">Primary use / Agents</span><h2>A terrarium for agents.</h2><p>Give a long-lived agent a box of its own. Its storage persists across restarts, and it reaches only the files and destinations you grant. Or lock its <a href="{base}/docs/recipe/#read-only-root">root read-only</a>, with a disk-backed overlay that resets every boot.</p><a href="{base}/docs/usage/#a-terrarium-for-agents">Set one up <span aria-hidden="true">→</span></a></div>
   <div><span class="eyebrow">Primary use / Development</span><h2>A dev VM for your harness.</h2><p>Run Claude Code, Codex, or your own tooling against your project in a confined VM instead of on your host.</p><a href="#start">Start with the quickstart <span aria-hidden="true">→</span></a></div>
   <div><span class="eyebrow">And more</span><h2>Room for more.</h2><p>Anything that needs a clear boundary: untrusted builds, unfamiliar installers, one-off recipe runs, or a service published on host loopback.</p><a href="{base}/docs/usage/#primary-uses">Read the usage guide <span aria-hidden="true">→</span></a></div>
 </section>

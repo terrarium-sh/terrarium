@@ -104,7 +104,7 @@ nav a[aria-current] { color: var(--accent-strong); background: var(--accent-soft
 .principles p { color: var(--hint-color); font-size: 0.88rem; margin-bottom: 0; }
 .use-cases { grid-template-columns: 1fr 1fr 0.85fr; margin-bottom: 1.5rem; }
 .use-cases > :last-child { padding-left: 1.75rem; border-left: 1px solid var(--frost-border-color); }
-.use-cases a { display: inline-block; margin-top: 1rem; font-size: 0.88rem; }
+.use-cases > div > a { display: inline-block; margin-top: 1rem; font-size: 0.88rem; }
 .isolation-section { display: grid; grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.7fr); grid-template-areas: ". figure" "heading figure" "steps figure" ". figure"; grid-template-rows: 1fr auto auto 1fr; gap: 0 3.5rem; padding-block: 5.5rem; border-bottom: 1px solid var(--frost-border-color); }
 .isolation-heading { grid-area: heading; }
 .isolation-heading h2 { margin-bottom: 0; font-size: clamp(1.6rem, 2.4vw, 1.85rem); }
