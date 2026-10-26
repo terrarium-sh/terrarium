@@ -1,7 +1,7 @@
 <script lang="ts">
   import '@alis-is/starlight/style.sass';
   import '../theme.css';
-  import { base } from '$app/paths';
+  import { asset, resolve } from '$app/paths';
   import { page } from '$app/state';
   import { onMount } from 'svelte';
 
@@ -35,13 +35,13 @@
 
 <a class="skip-link" href="#main">Skip to content</a>
 <header class="site-header">
-  <a class="wordmark" href="{base}/" aria-label="Terrarium home">
-    <img src="{base}/logo.svg" alt="" width="44" height="42" />
+  <a class="wordmark" href={resolve('/')} aria-label="Terrarium home">
+    <img src={asset('logo.svg')} alt="" width="44" height="42" />
     <span>terra<span class="muted">rium</span></span>
   </a>
   <nav aria-label="Main navigation">
-    <a href="{base}/docs/usage/" aria-current={page.url.pathname.includes('/docs/') ? 'page' : undefined}>Guides</a>
-    <a href="{base}/commands/" aria-current={page.url.pathname.includes('/commands/') ? 'page' : undefined}>Commands</a>
+    <a href={resolve('docs/usage/')} aria-current={page.url.pathname.includes('/docs/') ? 'page' : undefined}>Guides</a>
+    <a href={resolve('commands/')} aria-current={page.url.pathname.includes('/commands/') ? 'page' : undefined}>Commands</a>
     <a href="https://github.com/terrarium-sh/terrarium_examples" target="_blank" rel="noopener noreferrer">Examples</a>
     <a href="https://github.com/terrarium-sh/terrarium" target="_blank" rel="noopener noreferrer">GitHub</a>
   </nav>

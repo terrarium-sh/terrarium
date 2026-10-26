@@ -1,12 +1,12 @@
 <script lang="ts">
-  import { base } from '$app/paths';
-  import { releaseTag } from '$lib/generated/version.json';
+  import { asset, resolve } from '$app/paths';
+  import { releaseTag } from '#lib/generated/version.json';
   import { onMount } from 'svelte';
   import { Select, type SelectItem } from '@alis-is/starlight';
-  import { detectClientPlatform, type ClientPlatform } from '$lib/client-platform';
-  import CopyButton from '$lib/CopyButton.svelte';
-  import IsolationLayers from '$lib/IsolationLayers.svelte';
-  import PageMeta from '$lib/PageMeta.svelte';
+  import { detectClientPlatform, type ClientPlatform } from '#lib/client-platform.ts';
+  import CopyButton from '#lib/CopyButton.svelte';
+  import IsolationLayers from '#lib/IsolationLayers.svelte';
+  import PageMeta from '#lib/PageMeta.svelte';
   import { page } from '$app/state';
 
   const platforms: SelectItem<ClientPlatform>[] = [
@@ -43,21 +43,21 @@
     <h1>Give your agent<br />room to <em>work.</em></h1>
     <p class="lead">Decide what it can touch.</p>
     <p class="hero-description">A portable microVM with one static core, Wasm-isolated devices, and only the access you choose.</p>
-    <div class="actions"><a class="primary-link" href="#start">Get started <span aria-hidden="true">→</span></a><a href="{base}/commands/">Explore the commands</a></div>
+    <div class="actions"><a class="primary-link" href="#start">Get started <span aria-hidden="true">→</span></a><a href={resolve('commands/')}>Explore the commands</a></div>
     <p class="small muted">Linux · macOS on Apple Silicon · Windows</p>
   </div>
   <div class="hero-art">
     <figure>
-      <img src="{base}/logo.svg" width="969" height="914" alt="A frog and dragonfly among ferns and a yellow flower, inside a glass terrarium." />
+      <img src={asset('logo.svg')} width="969" height="914" alt="A frog and dragonfly among ferns and a yellow flower, inside a glass terrarium." />
       <figcaption>A little world. A clear boundary.</figcaption>
     </figure>
   </div>
 </section>
 
 <section class="principles use-cases" aria-label="What Terrarium is for">
-  <div><span class="eyebrow">Primary use / Agents</span><h2>A terrarium for agents.</h2><p>Give a long-lived agent a box of its own. Its storage persists across restarts, and it reaches only the files and destinations you grant. Or lock its <a href="{base}/docs/recipe/#read-only-root">root read-only</a>, with a disk-backed overlay that resets every boot.</p><a href="{base}/docs/usage/#a-terrarium-for-agents">Set one up <span aria-hidden="true">→</span></a></div>
+  <div><span class="eyebrow">Primary use / Agents</span><h2>A terrarium for agents.</h2><p>Give a long-lived agent a box of its own. Its storage persists across restarts, and it reaches only the files and destinations you grant. Or lock its <a href={resolve('docs/recipe/#read-only-root')}>root read-only</a>, with a disk-backed overlay that resets every boot.</p><a href={resolve('docs/usage/#a-terrarium-for-agents')}>Set one up <span aria-hidden="true">→</span></a></div>
   <div><span class="eyebrow">Primary use / Development</span><h2>A dev VM for your harness.</h2><p>Run Claude Code, Codex, or your own tooling against your project in a confined VM instead of on your host.</p><a href="#start">Start with the quickstart <span aria-hidden="true">→</span></a></div>
-  <div><span class="eyebrow">And more</span><h2>Room for more.</h2><p>Anything that needs a clear boundary: untrusted builds, unfamiliar installers, one-off recipe runs, or a service published on host loopback.</p><a href="{base}/docs/usage/#primary-uses">Read the usage guide <span aria-hidden="true">→</span></a></div>
+  <div><span class="eyebrow">And more</span><h2>Room for more.</h2><p>Anything that needs a clear boundary: untrusted builds, unfamiliar installers, one-off recipe runs, or a service published on host loopback.</p><a href={resolve('docs/usage/#primary-uses')}>Read the usage guide <span aria-hidden="true">→</span></a></div>
 </section>
 
 <section class="principles" aria-label="Why Terrarium">
@@ -96,7 +96,7 @@
     <h3>Set up your box</h3>
     <div class="copyable-block"><pre><code bind:this={setupCode}>terra ./dev.yaml setup
 terra</code></pre><CopyButton text={() => setupCode?.textContent?.trimEnd() ?? ''} label="Copy setup commands" /></div>
-    <a href="{base}/docs/usage/">Read the usage guide <span aria-hidden="true">→</span></a>
+    <a href={resolve('docs/usage/')}>Read the usage guide <span aria-hidden="true">→</span></a>
   </div>
   <div class="recipe-preview">
     <div class="code-heading"><span class="status-dot"></span><span>dev.yaml</span><span class="muted">your box, your rules</span></div>
@@ -118,9 +118,9 @@ terra</code></pre><CopyButton text={() => setupCode?.textContent?.trimEnd() ?? '
 <section class="reading-section">
   <p class="eyebrow">Keep exploring</p><h2>A reference within reach.</h2>
   <div class="reading-grid">
-    <a href="{base}/commands/"><h3>Command reference</h3><p>Find a command, flag, or example. Generated directly from the CLI.</p></a>
-    <a href="{base}/docs/recipe/"><h3>Write a recipe</h3><p>Configure resources, mounts, network access, and lifecycle hooks.</p></a>
-    <a href="{base}/docs/security/"><h3>Understand the boundary</h3><p>What Terra isolates, what it trusts, and how its devices are sandboxed.</p></a>
-    <a href="{base}/skill.md"><h3>Agent skill</h3><p>Let your coding agent write, check, and smoke-test a box. Save as <code>.claude/skills/terra-box/SKILL.md</code>.</p></a>
+    <a href={resolve('commands/')}><h3>Command reference</h3><p>Find a command, flag, or example. Generated directly from the CLI.</p></a>
+    <a href={resolve('docs/recipe/')}><h3>Write a recipe</h3><p>Configure resources, mounts, network access, and lifecycle hooks.</p></a>
+    <a href={resolve('docs/security/')}><h3>Understand the boundary</h3><p>What Terra isolates, what it trusts, and how its devices are sandboxed.</p></a>
+    <a href={resolve('skill.md')}><h3>Agent skill</h3><p>Let your coding agent write, check, and smoke-test a box. Save as <code>.claude/skills/terra-box/SKILL.md</code>.</p></a>
   </div>
 </section>

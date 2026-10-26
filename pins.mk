@@ -10,8 +10,8 @@
 # Requires $(ARCH) — include it after those are set.
 
 # --- Terra guest kernel: upstream Linux LTS ---------------------------------
-KERNEL_VERSION := 6.18.57
-KERNEL_SHA256 := 5bd9acdc82ec5efc3790ae840e5aaa40dfde7efff261cf6dde902dc570acf98c
+KERNEL_VERSION := 6.18.58
+KERNEL_SHA256 := 069b19f9032c4dac8149ae4b6520c35debca0f42a9f6d52ee55ba6ca9b818013
 KERNEL_URL := https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$(KERNEL_VERSION).tar.xz
 
 # --- e2fsprogs --------------------------------------------------------------
@@ -31,11 +31,11 @@ LIBCAP_SHA256 := 0d621e562fd932ccf67b9660fb018e468a683d7b827541df27813228c996bb1
 LIBCAP_URL := https://www.kernel.org/pub/linux/libs/security/linux-privs/libcap2/libcap-$(LIBCAP_VERSION).tar.xz
 
 # --- Alpine root filesystem -------------------------------------------------
-ALPINE_VERSION := 3.24.2
+ALPINE_VERSION := 3.24.3
 # Derived, deliberately: the mirror path is the *branch* (v3.24) while the
-# tarball is the *point release* (3.24.1), and hardcoding both is how a bump to
+# tarball is the *point release* (3.24.x), and hardcoding both is how a bump to
 # 3.25.0 ends up fetching from the v3.24 branch. $(basename) drops the last
-# dot-suffix: 3.24.1 -> 3.24.
+# dot-suffix: 3.24.x -> 3.24.
 ALPINE_BRANCH := v$(basename $(ALPINE_VERSION))
 # Alpine's arch names happen to match `uname -m` for both targets, so $(ARCH)
 # indexes the download paths directly.
@@ -59,8 +59,8 @@ DOAS_SHIM_APK := doas-sudo-shim-0.2.0-r0.apk
 # the shim, which is a shell script but ships in a per-arch .apk. Suffixed
 # variables rather than a conditional, so adding an arch is three lines and
 # forgetting one is the error below rather than an empty (silently failing) hash.
-ALPINE_SHA256_x86_64 := c5ca053cfe1d85c5b96dff8b9bc57045f7f184a30ffb6b65776409ca90388677
-ALPINE_SHA256_aarch64 := 9bf70a7f18ea44094cbb5f70c58f9af129c8214745743db0e68e5502cc2ce773
+ALPINE_SHA256_x86_64 := f8e1cafba9b1b283b5d30d06f9885c8d2bc161ffe9083ade8e2e157813a53407
+ALPINE_SHA256_aarch64 := 4d3f80afaebd447c5591a63a73bde380a149fe8b2d85488cafabb2ff97551f50
 DOAS_SHA256_x86_64 := 1b0198d957fee06b484fc0e23783f03213cc97d8003c5f46b8d940d8ca9f57c8
 DOAS_SHA256_aarch64 := 7d35ce1a0a76de43f7621e2099e45bfd83e6d8cf667db657633ab1f374d05f72
 DOAS_SHIM_SHA256_x86_64 := 74361be22e06e395703ea5bef1f53a8f21a3350a06748ab6eb404c2c916bb35b

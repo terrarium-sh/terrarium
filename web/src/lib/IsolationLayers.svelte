@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { base } from '$app/paths';
+  import { resolve } from '$app/paths';
   import { onMount } from 'svelte';
 
   type Point = [number, number, number];
@@ -295,8 +295,8 @@
       {/each}
     </ol>
     <p class="layer-description" aria-hidden="true">{#key active}<span>{layers[active - 1].text}</span>{/key}</p>
-    <a href="{base}/docs/security/">Explore the security model <span aria-hidden="true">→</span></a>
-    <a href="{base}/docs/sandboxing/">See how each platform sandboxes it <span aria-hidden="true">→</span></a>
+    <a href={resolve('docs/security/')}>Explore the security model <span aria-hidden="true">→</span></a>
+    <a href={resolve('docs/sandboxing/')}>See how each platform sandboxes it <span aria-hidden="true">→</span></a>
   </div>
   <!-- The layer list buttons give keyboard users the same selection the figure gives pointers. -->
   <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_noninteractive_element_interactions -->

@@ -1,7 +1,7 @@
 # Terrarium website
 
 Static SvelteKit, TypeScript, and [Starlight](https://github.com/alis-is/starlight).
-Requires Node 22.12+ and pnpm (the version is pinned in `package.json`).
+Requires Node 22.17+ and pnpm (the version is pinned in `package.json`).
 
 ```sh
 cd web

@@ -1,5 +1,5 @@
 import { error } from '@sveltejs/kit';
-import { findGuide, guideEntries, guideList } from '$lib/server/guides';
+import { findGuide, guideEntries, guideList } from '#lib/server/guides.ts';
 
 export const entries = () => guideEntries;
 

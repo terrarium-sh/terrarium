@@ -1,4 +1,4 @@
-import { base } from '$app/paths';
+import { resolve } from '$app/paths';
 import { marked, Renderer } from 'marked';
 
 const repository = 'https://github.com/terrarium-sh/terrarium/blob/main/';
@@ -55,9 +55,9 @@ const rewriteLink = (href: string) => {
 	const [path, anchor = ''] = href.split('#', 2);
 	const name = path.replace(/\.md$/, '');
 	const platform = sandboxPlatforms.find((item) => name === `sandboxing-${item.platform}`)?.platform;
-	if (platform) return `${base}/docs/sandboxing/#${platform}${anchor && `-${anchor}`}`;
+	if (platform) return resolve(`docs/sandboxing/#${platform}${anchor && `-${anchor}`}`);
 	const slug = name as GuideSlug;
-	if (guideFiles.includes(slug)) return `${base}/docs/${slug}/${anchor && `#${anchor}`}`;
+	if (guideFiles.includes(slug)) return resolve(`docs/${slug}/${anchor && `#${anchor}`}`);
 
 	return `${new URL(path, `${repository}docs/`)}${anchor && `#${anchor}`}`;
 };

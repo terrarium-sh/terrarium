@@ -1,11 +1,11 @@
 <script lang="ts">
-	import { base } from '$app/paths';
+	import { resolve } from '$app/paths';
 	import { onMount } from 'svelte';
 	import { Select, type SelectItem } from '@alis-is/starlight';
-	import { releaseTag } from '$lib/generated/version.json';
-	import { copyGuideCode } from '$lib/copy-guide-code';
-	import { detectClientPlatform, type ClientPlatform } from '$lib/client-platform';
-	import PageMeta from '$lib/PageMeta.svelte';
+	import { releaseTag } from '#lib/generated/version.json';
+	import { copyGuideCode } from '#lib/copy-guide-code.ts';
+	import { detectClientPlatform, type ClientPlatform } from '#lib/client-platform.ts';
+	import PageMeta from '#lib/PageMeta.svelte';
 
 	let { data } = $props();
 
@@ -40,12 +40,12 @@
 	<p class="eyebrow">Guides</p>
 	<nav aria-label="Guides">
 		{#each data.guides as guide}
-			<a href={`${base}/docs/${guide.slug}/`} aria-current={guide.slug === data.guide.slug ? 'page' : undefined}>{guide.title}</a>{' '}
+			<a href={resolve(`docs/${guide.slug}/`)} aria-current={guide.slug === data.guide.slug ? 'page' : undefined}>{guide.title}</a>{' '}
 		{/each}
 	</nav>
 </div>
 
-<p class="docs-notice">Development guide, built from the current repository. Features may differ from {releaseTag ?? 'the published release'}; consult the <a href={`${base}/commands/`}>command reference</a> for the binary documented on this site.</p>
+<p class="docs-notice">Development guide, built from the current repository. Features may differ from {releaseTag ?? 'the published release'}; consult the <a href={resolve('commands/')}>command reference</a> for the binary documented on this site.</p>
 
 {#key data.guide.slug}
 	<article class="prose" use:copyGuideCode>{@html data.guide.html}</article>

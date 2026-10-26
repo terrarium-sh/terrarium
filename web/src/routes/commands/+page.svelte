@@ -1,9 +1,9 @@
 <script lang="ts">
   import { Input, Button } from '@alis-is/starlight';
-  import commands from '$lib/generated/commands.json';
-  import { version } from '$lib/generated/version.json';
-  import CopyButton from '$lib/CopyButton.svelte';
-  import PageMeta from '$lib/PageMeta.svelte';
+  import commands from '#lib/generated/commands.json';
+  import { version } from '#lib/generated/version.json';
+  import CopyButton from '#lib/CopyButton.svelte';
+  import PageMeta from '#lib/PageMeta.svelte';
 
   let query = $state('');
   const terms = $derived(query.toLowerCase().trim().split(/\s+/).filter(Boolean));
