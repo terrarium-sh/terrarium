@@ -7,7 +7,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-lru = "0.18"
+lru = "0.19"
 serde.workspace = true
 
 [lints]

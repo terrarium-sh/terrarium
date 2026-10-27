@@ -16,7 +16,7 @@ futures-util = { version = "0.3", default-features = false, features = ["alloc",
 tokio-util = { version = "0.7", features = ["rt", "compat"] }
 yamux = "=0.14.1"
 socket2 = { version = "0.6", features = ["all"] }
-lru = "0.18"
+lru = "0.19"
 quinn-udp = { version = "=0.6.3", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
