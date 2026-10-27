@@ -6,7 +6,7 @@ pub mod rules;
 #[cfg(test)]
 mod tests;
 
-use crate::config::{Network, NetworkMode};
+use crate::recipe::{Network, NetworkMode};
 
 pub fn describe(net: &Network) -> &'static str {
     if !net.enabled {

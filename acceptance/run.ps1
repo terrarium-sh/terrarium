@@ -364,9 +364,18 @@ try {
     $restarted = Get-TerraOutput @("probe", "--foreground", "--root", "--", "sh", "-e", "/suite/guest/storage-restart.sh")
     Assert-Contains $restarted "RESTART_OK"
     Assert-Contains $restarted "STOP_OK"
-    Invoke-Terra @("probe", "storage", "import", $exported)
-    Invoke-Terra @("probe", "setup")
+    $refused = Get-TerraOutput @("probe", "storage", "import", $exported) -Fails
+    Assert-Contains $refused "gate.test"
+    Assert-Contains $refused "--trust-recipe"
+    Invoke-Terra @("probe", "storage", "import", "--trust-recipe", $exported)
     Assert-Contains (Get-TerraOutput @("probe", "--foreground", "--",
+        "sh", "-ec", 'test $(cat /data/value) = PERSISTED; echo RESTORED_OK')) "RESTORED_OK"
+    $imported = Join-Path $work "imported"
+    New-Item -ItemType Directory -Path $imported, (Join-Path $imported "work"), (Join-Path $imported "readonly") | Out-Null
+    Copy-Item -Recurse -LiteralPath (Join-Path $project "suite") -Destination (Join-Path $imported "suite")
+    Invoke-Terra @("--project", $imported, "probe", "storage", "import", "--trust-recipe", $exported)
+    Assert-Contains (Get-TerraOutput @("--project", $imported, "ls", "--state", "stopped", "--quiet")) "probe"
+    Assert-Contains (Get-TerraOutput @("--project", $imported, "probe", "--foreground", "--",
         "sh", "-ec", 'test $(cat /data/value) = PERSISTED; echo RESTORED_OK')) "RESTORED_OK"
     Complete-Step
 
@@ -382,6 +391,7 @@ try {
     Start-Step "a failing bake fails setup and is diagnosable"
     Assert-Contains (Get-TerraOutput @("./bad-bake.yaml", "setup") -Fails) "FAILED_BAKE"
     Assert-Contains (Get-TerraOutput @("bad-bake", "logs", "--diagnostics")) "init failed"
+    Assert-Listed "bad-bake" "needs_setup"
     Complete-Step
 
     Start-Step "rm discards the box, --purge forgets it"

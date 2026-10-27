@@ -30,7 +30,11 @@ use tokio::io::{AsyncRead, AsyncWrite};
 /// Synchronize a file or directory tree between the host and a running box.
 pub async fn run(args: &SyncArgs, name: Option<&str>, project_dir: &Path) -> Result<ExitCode> {
     let transfer = parse_endpoints(&args.src, &args.dst)?;
-    let bx = &crate::resolve::resolve_pinned_box(project_dir, name)?;
+    let bx = &crate::recipe::resolve::resolve_box(
+        name,
+        project_dir,
+        crate::recipe::resolve::Existence::MustExist,
+    )?;
 
     let mut stream = crate::session::connect_to_running_agent(
         bx,

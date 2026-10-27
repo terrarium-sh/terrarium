@@ -164,7 +164,11 @@ pub fn run(
     name: Option<&str>,
     project_dir: &Path,
 ) -> Result<ExitCode> {
-    let bx = &crate::resolve::resolve_pinned_box(project_dir, name)?;
+    let bx = &crate::recipe::resolve::resolve_box(
+        name,
+        project_dir,
+        crate::recipe::resolve::Existence::MustExist,
+    )?;
     let stopped = stop_and_wait(bx, Duration::from_secs(args.timeout), SetupAction::Refuse)
         .context("could not stop the box - `terra rm --force` takes it away regardless")?;
     match stopped {

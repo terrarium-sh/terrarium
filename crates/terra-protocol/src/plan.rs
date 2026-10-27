@@ -38,9 +38,6 @@ fn disk_suffix(mut index: usize) -> String {
 pub const KERNEL_CMDLINE: &str = "reboot=k panic=-1 panic_print=0 quiet loglevel=3 no-kvmapf \
      root=/dev/vda rootfstype=ext4 ro init=/terra-agent";
 
-/// Where the agent records the baked `on_create` stamp.
-pub const RECIPE_STAMP_PATH: &str = "/terra/recipe";
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum PlanMode {
     Run,

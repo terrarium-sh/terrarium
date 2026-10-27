@@ -2,22 +2,22 @@ use super::*;
 
 /// The two directories a load spends: the shell's, which finds the recipe
 /// file, and the box's, which its mounts are relative to.
-fn load_from(arg: &str, cwd: &Path, project_dir: &Path) -> Result<Config> {
-    let recipe = crate::resolve::read_recipe(arg, cwd)?
-        .ok_or_else(|| crate::resolve::build_missing_recipe_error(arg, arg, cwd))
+fn load_from(arg: &str, cwd: &Path, project_dir: &Path) -> Result<Recipe> {
+    let recipe = crate::recipe::resolve::read_recipe(arg, cwd)?
+        .ok_or_else(|| crate::recipe::resolve::build_missing_recipe_error(arg, arg, cwd))
         .context("resolving the recipe")?;
     parse_recipe(&recipe.text, project_dir, &recipe.from)
 }
 
-fn load(arg: &str, cwd: &Path) -> Result<Config> {
+fn load(arg: &str, cwd: &Path) -> Result<Recipe> {
     load_from(arg, cwd, cwd)
 }
 
-fn read_fully(text: &str, project_dir: &Path, source: &Path) -> Result<Config> {
+fn read_fully(text: &str, project_dir: &Path, source: &Path) -> Result<Recipe> {
     let project_dir = std::fs::canonicalize(project_dir)?;
-    let mut cfg = parse_recipe(text, &project_dir, source)?;
-    merge_env_file(&mut cfg)?;
-    Ok(cfg)
+    let mut recipe = parse_recipe(text, &project_dir, source)?;
+    merge_env_file(&mut recipe)?;
+    Ok(recipe)
 }
 
 /// A relative `host:` belongs to the box, so it resolves against the
@@ -31,16 +31,16 @@ fn a_relative_mount_resolves_against_the_project_directory() {
     std::fs::create_dir_all(project.join("src")).unwrap();
     std::fs::create_dir_all(elsewhere.join("src")).unwrap();
     std::fs::write(
-        elsewhere.join("cfg.yaml"),
+        elsewhere.join("recipe.yaml"),
         "mounts:\n  - host: src\n    guest: /work\n",
     )
     .unwrap();
 
     // The recipe path is the shell's to resolve; the mount inside it is the
-    // box's: standing in `elsewhere`, `./cfg.yaml` is found there - and its
+    // box's: standing in `elsewhere`, `./recipe.yaml` is found there - and its
     // `src` is still the *project's*.
-    let cfg = load_from("./cfg.yaml", &elsewhere, &project).unwrap();
-    assert_eq!(cfg.mounts[0].host, project.join("src"));
+    let recipe = load_from("./recipe.yaml", &elsewhere, &project).unwrap();
+    assert_eq!(recipe.mounts[0].host, project.join("src"));
 }
 
 /// Reading a recipe must not depend on its shares being there: a guest with
@@ -53,23 +53,23 @@ fn parsing_a_recipe_does_not_touch_the_host_paths_it_names() {
     let project = dir.path();
     let yaml = "mounts:\n  - host: ./gone\n    guest: /work\n";
 
-    let mut cfg = parse_recipe(yaml, project, Path::new("r.yaml")).unwrap();
+    let mut recipe = parse_recipe(yaml, project, Path::new("r.yaml")).unwrap();
     assert_eq!(
-        cfg.mounts[0].host,
+        recipe.mounts[0].host,
         project.join("gone"),
         "a relative host is still made absolute against the project"
     );
 
     let bx = crate::state::BoxRef::from_state_dir(project.join("box-state"), project);
-    let err = crate::policy::mount::resolve_mounts(&cfg, &bx)
+    let err = crate::policy::mount::resolve_mounts(&recipe, &bx)
         .unwrap_err()
         .to_string();
     assert!(err.contains("resolving mount host path"), "{err}");
 
     std::fs::create_dir(project.join("gone")).unwrap();
-    cfg.mounts = crate::policy::mount::resolve_mounts(&cfg, &bx).unwrap();
+    recipe.mounts = crate::policy::mount::resolve_mounts(&recipe, &bx).unwrap();
     assert_eq!(
-        cfg.mounts[0].host,
+        recipe.mounts[0].host,
         std::fs::canonicalize(project.join("gone")).unwrap()
     );
 }
@@ -92,23 +92,23 @@ fn relative_mount_resolved_against_cwd() {
     std::fs::create_dir(cwd.join("src")).unwrap();
 
     let yaml = "hw:\n  cpus: 1\n  mem_mib: 512\nmounts:\n  - host: src\n    guest: /work\nnetwork:\n  mode: allowlist\n  allow:\n    - example.com:443\nhooks:\n  on_start:\n    - echo hi\n";
-    std::fs::write(cwd.join("cfg.yaml"), yaml).unwrap();
-    let cfg = load("./cfg.yaml", &cwd).unwrap();
-    assert_eq!(cfg.mounts[0].host, cwd.join("src"));
-    assert_eq!(cfg.hw.cpus, 1);
-    assert_eq!(cfg.hw.mem_mib, 512);
-    assert_eq!(cfg.hw.rootfs_mib, 512); // untouched fields still get their default
-    assert_eq!(cfg.network.mode, NetworkMode::Allowlist);
-    assert_eq!(cfg.network.allow, vec!["example.com:443".to_string()]);
-    assert_eq!(cfg.hooks.on_start, vec!["echo hi"]);
+    std::fs::write(cwd.join("recipe.yaml"), yaml).unwrap();
+    let recipe = load("./recipe.yaml", &cwd).unwrap();
+    assert_eq!(recipe.mounts[0].host, cwd.join("src"));
+    assert_eq!(recipe.hw.cpus, 1);
+    assert_eq!(recipe.hw.mem_mib, 512);
+    assert_eq!(recipe.hw.rootfs_mib, 512); // untouched fields still get their default
+    assert_eq!(recipe.network.mode, NetworkMode::Allowlist);
+    assert_eq!(recipe.network.allow, vec!["example.com:443".to_string()]);
+    assert_eq!(recipe.hooks.on_start, vec!["echo hi"]);
 }
 
 /// A recipe's daemons are shell lines, taken as written.
 #[test]
 fn daemons_parse_and_default_empty() {
-    let cfg: Config = yaml_serde::from_str("daemons: [ascend]\n").unwrap();
-    assert_eq!(cfg.daemons, vec!["ascend"]);
-    let none: Config = yaml_serde::from_str("{}").unwrap();
+    let recipe: Recipe = yaml_serde::from_str("daemons: [ascend]\n").unwrap();
+    assert_eq!(recipe.daemons, vec!["ascend"]);
+    let none: Recipe = yaml_serde::from_str("{}").unwrap();
     assert_eq!(none.daemons, Vec::<String>::new());
 }
 
@@ -167,10 +167,10 @@ fn local_only_networking_is_explicit_and_refuses_host_grants() {
 
 #[test]
 fn env_map_parses() {
-    let cfg: Config = yaml_serde::from_str("env:\n  MODEL: gpt-4o\n  DEBUG: \"1\"\n").unwrap();
-    assert_eq!(cfg.env.get("MODEL").map(String::as_str), Some("gpt-4o"));
-    assert_eq!(cfg.env.get("DEBUG").map(String::as_str), Some("1"));
-    let none: Config = yaml_serde::from_str("hw:\n  cpus: 1\n  mem_mib: 64\n").unwrap();
+    let recipe: Recipe = yaml_serde::from_str("env:\n  MODEL: gpt-4o\n  DEBUG: \"1\"\n").unwrap();
+    assert_eq!(recipe.env.get("MODEL").map(String::as_str), Some("gpt-4o"));
+    assert_eq!(recipe.env.get("DEBUG").map(String::as_str), Some("1"));
+    let none: Recipe = yaml_serde::from_str("hw:\n  cpus: 1\n  mem_mib: 64\n").unwrap();
     assert!(none.env.is_empty());
 }
 
@@ -184,15 +184,15 @@ fn env_file_merges_over_env() {
         "# comment\n\nA=from-file\nB=only-file\n",
     )
     .unwrap();
-    let cfg = read_fully(
+    let recipe = read_fully(
         "env:\n  A: from-recipe\n  C: only-recipe\nenv_file: secrets.env\n",
         dir.path(),
         Path::new("r.yaml"),
     )
     .unwrap();
-    assert_eq!(cfg.env["A"], "from-file"); // the file wins
-    assert_eq!(cfg.env["B"], "only-file"); // only in the file
-    assert_eq!(cfg.env["C"], "only-recipe"); // only in the recipe
+    assert_eq!(recipe.env["A"], "from-file"); // the file wins
+    assert_eq!(recipe.env["B"], "only-file"); // only in the file
+    assert_eq!(recipe.env["C"], "only-recipe"); // only in the recipe
 }
 
 #[test]
@@ -247,17 +247,21 @@ fn a_deleted_env_file_does_not_stop_the_recipe_parsing() {
     let dir = tempfile::tempdir().unwrap();
     let recipe = "mounts:\n  - {host: ., guest: /work}\nenv_file: ./gone.env\n";
 
-    let mut cfg = parse_recipe(recipe, dir.path(), Path::new("r.yaml"))
+    let mut recipe = parse_recipe(recipe, dir.path(), Path::new("r.yaml"))
         .expect("a missing env_file is not a parse failure");
-    assert_eq!(cfg.mounts[0].host, dir.path(), "the shares are still there");
     assert_eq!(
-        cfg.env_file.as_deref(),
+        recipe.mounts[0].host,
+        dir.path(),
+        "the shares are still there"
+    );
+    assert_eq!(
+        recipe.env_file.as_deref(),
         Some(dir.path().join("gone.env").as_path()),
         "the path is settled at parse time; only the read is deferred"
     );
 
     // …and the read itself still fails, for whoever actually wanted it.
-    let err = merge_env_file(&mut cfg).unwrap_err().to_string();
+    let err = merge_env_file(&mut recipe).unwrap_err().to_string();
     assert!(err.contains("opening env file"), "{err}");
 }
 
@@ -280,9 +284,9 @@ fn a_shell_export_prefix_in_an_env_file_is_refused() {
     // The plain spelling of that same line is what works - and the value is
     // taken literally, quotes and all, which is why they are not written.
     std::fs::write(dir.path().join("plain.env"), "API_KEY=sk-1\nQ=\"quoted\"\n").unwrap();
-    let cfg = read_fully("env_file: plain.env\n", dir.path(), Path::new("r.yaml")).unwrap();
-    assert_eq!(cfg.env["API_KEY"], "sk-1");
-    assert_eq!(cfg.env["Q"], "\"quoted\"");
+    let recipe = read_fully("env_file: plain.env\n", dir.path(), Path::new("r.yaml")).unwrap();
+    assert_eq!(recipe.env["API_KEY"], "sk-1");
+    assert_eq!(recipe.env["Q"], "\"quoted\"");
 }
 
 /// `~alice` is the *shell's* expansion, and terra never sees it expanded
@@ -401,8 +405,8 @@ fn a_manifest_reference_must_be_a_recipe_path() {
 /// Container-level `#[serde(default)]` must not leak into structs without it.
 #[test]
 fn unknown_keys_and_missing_required_fields_are_refused() {
-    assert!(yaml_serde::from_str::<Config>("hw:\n  cpus: 1\n  nope: 2\n").is_err());
-    assert!(yaml_serde::from_str::<Config>("nope: 1\n").is_err());
+    assert!(yaml_serde::from_str::<Recipe>("hw:\n  cpus: 1\n  nope: 2\n").is_err());
+    assert!(yaml_serde::from_str::<Recipe>("nope: 1\n").is_err());
     assert!(yaml_serde::from_str::<Mount>("guest: /work\n").is_err());
     assert!(yaml_serde::from_str::<StaticDnsRecord>("name: db\n").is_err());
 }
@@ -578,16 +582,16 @@ fn relative_guest_mount_path_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let cwd = dir.path();
     std::fs::write(
-        cwd.join("cfg.yaml"),
+        cwd.join("recipe.yaml"),
         "mounts:\n  - host: .\n    guest: work\n",
     )
     .unwrap();
-    let err = load("./cfg.yaml", cwd).unwrap_err().to_string();
+    let err = load("./recipe.yaml", cwd).unwrap_err().to_string();
     assert!(err.contains("must be absolute"), "{err}");
 }
 
 #[test]
-fn missing_config_names_the_path() {
+fn missing_recipe_names_the_path() {
     let err = load("no-such-profile-xyz", Path::new("/proj"))
         .unwrap_err()
         .to_string();
@@ -761,15 +765,15 @@ fn invalid_env_lines_do_not_disclose_contents() {
 fn volume_names_reject_windows_filename_metacharacters() {
     for character in [':', '*', '?', '"', '<', '>', '|', '\0'] {
         let name = format!("data{character}stream");
-        let mut cfg = Config::default();
-        cfg.volumes.push(Volume {
+        let mut recipe = Recipe::default();
+        recipe.volumes.push(Volume {
             name,
             guest: Some(PathBuf::from("/data")),
             rootfs_overlay: false,
             size_mib: 64,
             lifetime: VolumeLifetime::Box,
         });
-        assert!(validate(&cfg).is_err());
+        assert!(validate(&recipe).is_err());
     }
 }
 
@@ -782,9 +786,9 @@ fn volume_names_reject_unicode_and_ascii_case_aliases_on_every_platform() {
         ("ſ", "S"),
         ("data", "DATA"),
     ] {
-        let mut cfg = Config::default();
+        let mut recipe = Recipe::default();
         for (name, guest) in [(first, "/a"), (second, "/b")] {
-            cfg.volumes.push(Volume {
+            recipe.volumes.push(Volume {
                 name: name.into(),
                 guest: Some(guest.into()),
                 rootfs_overlay: false,
@@ -792,7 +796,7 @@ fn volume_names_reject_unicode_and_ascii_case_aliases_on_every_platform() {
                 lifetime: VolumeLifetime::Box,
             });
         }
-        assert!(validate(&cfg).is_err(), "{first}, {second}");
+        assert!(validate(&recipe).is_err(), "{first}, {second}");
     }
     for name in [
         "café",
@@ -803,32 +807,33 @@ fn volume_names_reject_unicode_and_ascii_case_aliases_on_every_platform() {
         "data.",
         "data space",
     ] {
-        let mut cfg = Config::default();
-        cfg.volumes.push(Volume {
+        let mut recipe = Recipe::default();
+        recipe.volumes.push(Volume {
             name: name.into(),
             guest: Some("/data".into()),
             rootfs_overlay: false,
             size_mib: 64,
             lifetime: VolumeLifetime::Box,
         });
-        assert!(validate(&cfg).is_err(), "{name}");
+        assert!(validate(&recipe).is_err(), "{name}");
     }
 }
 
 #[test]
 fn a_writable_root_and_box_lifetime_are_the_defaults_and_both_round_trip() {
-    let cfg: Config = yaml_serde::from_str("volumes: [{name: v, guest: /v, size_mib: 8}]").unwrap();
-    assert!(!cfg.hw.rootfs_readonly);
-    assert_eq!(cfg.volumes[0].lifetime, VolumeLifetime::Box);
+    let recipe: Recipe =
+        yaml_serde::from_str("volumes: [{name: v, guest: /v, size_mib: 8}]").unwrap();
+    assert!(!recipe.hw.rootfs_readonly);
+    assert_eq!(recipe.volumes[0].lifetime, VolumeLifetime::Box);
 
-    let cfg: Config = yaml_serde::from_str(
+    let recipe: Recipe = yaml_serde::from_str(
         "hw: {rootfs_readonly: true}\nvolumes: [{name: v, guest: /v, size_mib: 8, lifetime: boot}]",
     )
     .unwrap();
-    assert!(cfg.hw.rootfs_readonly);
-    assert_eq!(cfg.volumes[0].lifetime, VolumeLifetime::Boot);
-    let again: Config = yaml_serde::from_str(&yaml_serde::to_string(&cfg).unwrap()).unwrap();
-    assert_eq!(again, cfg);
+    assert!(recipe.hw.rootfs_readonly);
+    assert_eq!(recipe.volumes[0].lifetime, VolumeLifetime::Boot);
+    let again: Recipe = yaml_serde::from_str(&yaml_serde::to_string(&recipe).unwrap()).unwrap();
+    assert_eq!(again, recipe);
 }
 
 #[test]
@@ -838,11 +843,11 @@ fn volume_lifetimes_reject_unknown_values() {
         "volumes: [{name: v, guest: /v, size_mib: 8, lifetime: forever}]",
         "volumes: [{name: v, guest: /v, size_mib: 8, lifetime: true}]",
     ] {
-        assert!(yaml_serde::from_str::<Config>(recipe).is_err(), "{recipe}");
+        assert!(yaml_serde::from_str::<Recipe>(recipe).is_err(), "{recipe}");
     }
 }
 
-fn try_parse_recipe(yaml: &str) -> Result<Config> {
+fn try_parse_recipe(yaml: &str) -> Result<Recipe> {
     parse_recipe(yaml, Path::new("/proj"), Path::new("/proj/r.yaml"))
 }
 
@@ -852,16 +857,16 @@ const OVERLAY_HW: &str = "hw: {rootfs_readonly: true}\n";
 /// `rootfs_overlay: true` with no `guest`, and an ordinary volume as before.
 #[test]
 fn a_volume_round_trips_with_only_the_target_it_sets() {
-    let cfg = try_parse_recipe(&format!(
+    let recipe = try_parse_recipe(&format!(
         "{OVERLAY_HW}volumes:\n  - {{name: a, guest: /x/../a, size_mib: 8}}\n  - {{name: b, rootfs_overlay: true, size_mib: 8, lifetime: boot}}"
     ))
     .unwrap();
-    assert_eq!(cfg.volumes[0].guest, Some("/a".into()));
-    let yaml = yaml_serde::to_string(&cfg.volumes).unwrap();
+    assert_eq!(recipe.volumes[0].guest, Some("/a".into()));
+    let yaml = yaml_serde::to_string(&recipe.volumes).unwrap();
     assert_eq!(yaml.matches("rootfs_overlay").count(), 1, "{yaml}");
     assert_eq!(yaml.matches("guest:").count(), 1, "{yaml}");
     let again: Vec<Volume> = yaml_serde::from_str(&yaml).unwrap();
-    assert_eq!(again, cfg.volumes);
+    assert_eq!(again, recipe.volumes);
 }
 
 #[test]
@@ -917,4 +922,63 @@ fn guest_root_is_refused_for_a_mount_and_a_volume() {
         let error = try_parse_recipe(recipe).unwrap_err().to_string();
         assert!(error.contains("guest path '/' on "), "{recipe}: {error}");
     }
+}
+
+/// Box names are case-insensitive: a manifest key normalizes to lowercase, and two
+/// keys differing only by case are refused rather than one silently winning.
+#[test]
+fn manifest_box_names_normalize_to_lowercase() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(MANIFEST_FILE),
+        "boxes:\n  Dev: ./dev.yaml\n",
+    )
+    .unwrap();
+    let manifest = load_manifest(dir.path()).unwrap().unwrap();
+    assert_eq!(manifest.boxes.keys().collect::<Vec<_>>(), ["dev"]);
+
+    std::fs::write(
+        dir.path().join(MANIFEST_FILE),
+        "boxes:\n  Dev: ./a.yaml\n  dev: ./b.yaml\n",
+    )
+    .unwrap();
+    let err = load_manifest(dir.path()).unwrap_err().to_string();
+    assert!(err.contains("twice, in different cases"), "{err}");
+}
+
+#[test]
+fn combined_volumes_and_mounts_fit_the_vmm() {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    assert_eq!(crate::vm::MAX_GUEST_STORAGE_DEVICES, 32);
+    let recipe = Recipe {
+        mounts: (0..crate::vm::MAX_GUEST_STORAGE_DEVICES)
+            .map(|index| Mount {
+                host: format!("/host/{index}").into(),
+                guest: format!("/guest/{index}").into(),
+                readonly: false,
+            })
+            .collect(),
+        ..Recipe::default()
+    };
+    assert!(validate::validate_storage_devices(&recipe).is_ok());
+
+    let mut over = recipe;
+    over.volumes.push(Volume {
+        name: "over".into(),
+        guest: Some("/data".into()),
+        rootfs_overlay: false,
+        size_mib: 1,
+        lifetime: VolumeLifetime::Box,
+    });
+    let err = validate::validate_storage_devices(&over)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("combined volumes and host-directory mounts"),
+        "{err}"
+    );
+    assert!(
+        err.contains(&crate::vm::MAX_GUEST_STORAGE_DEVICES.to_string()),
+        "{err}"
+    );
 }

@@ -182,7 +182,7 @@ fn start_optional_broker(
         boot.network_broker.is_none(),
         "broker metadata must be supplied by the supervisor"
     );
-    if !boot.cfg.network.enabled {
+    if !boot.recipe.network.enabled {
         return Ok(None);
     }
     let mut config = build_broker_config(boot)?;
@@ -349,11 +349,11 @@ async fn report_vm_exit(
 
 pub(crate) fn build_broker_config(spec: &BootSpec) -> Result<terra_network::config::Config> {
     ensure!(
-        spec.cfg.network.enabled,
+        spec.recipe.network.enabled,
         "local-only VM does not use a network broker"
     );
     let mappings = if spec.mode == terra_protocol::PlanMode::Run {
-        crate::policy::network::rules::parse_port_mappings(&spec.cfg.network.ports)?
+        crate::policy::network::rules::parse_port_mappings(&spec.recipe.network.ports)?
     } else {
         Vec::new()
     };
@@ -371,7 +371,7 @@ pub(crate) fn build_broker_config(spec: &BootSpec) -> Result<terra_network::conf
         }
     }
     Ok(terra_network::config::Config {
-        policy: spec.cfg.network.host_policy()?,
+        policy: spec.recipe.network.host_policy()?,
         listeners,
     })
 }
@@ -622,15 +622,15 @@ mod tests {
         let lock = tempfile::tempfile().unwrap();
         let executable = root.path().join("missing-supervisor");
         let mut boot = BootSpec {
-            cfg: crate::config::Config {
-                volumes: vec![crate::config::Volume {
+            recipe: crate::recipe::Recipe {
+                volumes: vec![crate::recipe::Volume {
                     name: "scratch".into(),
                     guest: Some("/scratch".into()),
                     rootfs_overlay: false,
                     size_mib: 8,
-                    lifetime: crate::config::VolumeLifetime::Boot,
+                    lifetime: crate::recipe::VolumeLifetime::Boot,
                 }],
-                ..crate::config::Config::default()
+                ..crate::recipe::Recipe::default()
             },
             project_dir: root.path().into(),
             root: false,
@@ -665,7 +665,7 @@ mod tests {
     #[test]
     fn broker_config_carries_the_host_interface_addresses() {
         let boot = BootSpec {
-            cfg: crate::config::Config::default(),
+            recipe: crate::recipe::Recipe::default(),
             project_dir: PathBuf::from("/project"),
             root: false,
             mode: terra_protocol::PlanMode::Run,
@@ -684,12 +684,12 @@ mod tests {
     #[test]
     fn local_only_startup_needs_no_broker_executable_or_channel() {
         let mut boot = BootSpec {
-            cfg: crate::config::Config {
-                network: crate::config::Network {
+            recipe: crate::recipe::Recipe {
+                network: crate::recipe::Network {
                     enabled: false,
-                    ..crate::config::Network::default()
+                    ..crate::recipe::Network::default()
                 },
-                ..crate::config::Config::default()
+                ..crate::recipe::Recipe::default()
             },
             project_dir: PathBuf::from("/project"),
             root: false,

@@ -87,6 +87,11 @@ grow. Renaming a volume creates a new empty one and leaves the old image
 behind.
 `terra <box> storage prune` removes images no longer named by the recipe;
 `setup --rebuild` does too.
+`terra <box> storage export` writes the pinned recipe, including inline `env:`
+values, and the images; `storage import` asks before pinning that recipe
+(`--trust-recipe` skips the question), and the box boots straight after it.
+The imported recipe's mounts and `env_file` resolve against the importing
+project, so the paths it names must exist there.
 
 ### Read-only root
 
@@ -217,9 +222,10 @@ Limits:
   without `on_create`, and sizes the root image and `lifetime: box` volumes. A
   start never prepares the root image. Running setup again on an unchanged
   recipe boots no VM.
-- `hooks.on_create` runs once as guest root during that setup, before mounts
-  exist; the workload user `terri` already exists. It uses the recipe's network
-  rules, and setup prints its output.
+- `hooks.on_create` runs as guest root only when setup builds a new root image
+  (the first setup and `--rebuild`), before mounts exist; the workload user
+  `terri` already exists. It uses the recipe's network rules, and setup prints
+  its output. If it fails, the next setup builds the root again from scratch.
 - `hooks.on_start` runs as guest root before every workload start.
 - `hooks.pre_stop` runs during an orderly stop.
 - `on_start` and `pre_stop` output go to the box's session.
@@ -280,5 +286,5 @@ them.
 Stop the box and run `terra <box> setup` after editing a recipe. `--dry-run`
 checks it without changing anything. `--rebuild` discards the root filesystem,
 reruns `on_create` and removes volume images the recipe no longer names; without
-it, an edited `on_create` does not run. Read
+it, an edited `on_create` does not run, and setup says so. Read
 [usage](usage.md) and [security](security.md) before granting host access.

@@ -2,8 +2,8 @@
 //! prompt. Everything here escapes what it prints - a guest-written recipe
 //! could otherwise repaint the very summary the `y` is being given to.
 
-use crate::config;
 use crate::policy::network;
+use crate::recipe::{Hooks, Mount, Network, Recipe};
 use anyhow::Result;
 use std::io;
 use std::path::Path;
@@ -72,20 +72,44 @@ pub fn render_error(error: &anyhow::Error) -> String {
 const REDACTED_ENV_VALUE: &str = "(set - value not printable)";
 
 #[must_use]
-pub fn redact_config_env(cfg: &config::Config) -> config::Config {
-    let mut redacted = cfg.clone();
+pub fn redact_recipe_env(recipe: &Recipe) -> Recipe {
+    let mut redacted = recipe.clone();
     for value in redacted.env.values_mut() {
         *value = REDACTED_ENV_VALUE.to_string();
     }
     redacted
 }
 
-pub fn render_config_yaml(cfg: &config::Config) -> Result<String, yaml_serde::Error> {
-    yaml_serde::to_string(cfg)
+pub fn render_recipe_yaml(recipe: &Recipe) -> Result<String, yaml_serde::Error> {
+    yaml_serde::to_string(recipe)
 }
 
-pub fn render_config_json(cfg: &config::Config) -> Result<String, serde_json::Error> {
-    let json = serde_json::to_string_pretty(cfg)?;
+/// A recipe may be `MAX_RECIPE_BYTES`, and a refused review lands in a CI log.
+const MAX_REVIEW_LINES: usize = 200;
+const MAX_REVIEW_LINE_CHARS: usize = 200;
+const REVIEW_FENCE: &str = "    | ";
+
+/// A recipe as an approval page shows it: parsed and re-rendered, `env:`
+/// values redacted, and every line fenced so none can pass for terra's own.
+pub(crate) fn render_recipe_for_review(recipe: &Recipe) -> Result<String, yaml_serde::Error> {
+    use std::fmt::Write as _;
+    let yaml = render_recipe_yaml(&redact_recipe_env(recipe))?;
+    let lines: Vec<&str> = yaml.lines().collect();
+    let mut page = String::new();
+    for line in lines.iter().take(MAX_REVIEW_LINES) {
+        let line = escape_printable(line);
+        let shown: String = line.chars().take(MAX_REVIEW_LINE_CHARS).collect();
+        let cut = if shown.len() < line.len() { "…" } else { "" };
+        let _ = writeln!(page, "{REVIEW_FENCE}{shown}{cut}");
+    }
+    if let Some(more) = lines.len().checked_sub(MAX_REVIEW_LINES).filter(|&n| n > 0) {
+        let _ = writeln!(page, "{REVIEW_FENCE}… {more} more lines");
+    }
+    Ok(page.trim_end().to_string())
+}
+
+pub fn render_recipe_json(recipe: &Recipe) -> Result<String, serde_json::Error> {
+    let json = serde_json::to_string_pretty(recipe)?;
     Ok(format!("{json}\n"))
 }
 
@@ -107,7 +131,7 @@ pub(crate) fn quote_shell_word(text: &str) -> String {
 }
 
 #[must_use]
-pub(crate) fn format_mount_line(m: &config::Mount) -> String {
+pub(crate) fn format_mount_line(m: &Mount) -> String {
     let mode = if m.readonly { "ro" } else { "rw" };
     format!(
         "{} <- {} ({mode})",
@@ -118,9 +142,9 @@ pub(crate) fn format_mount_line(m: &config::Mount) -> String {
 
 /// The workload as one command line - for a screen, never for exec.
 #[must_use]
-pub fn format_workload_line(cfg: &config::Config) -> String {
-    let mut line = escape_printable_path(&cfg.workload.entrypoint);
-    for a in &cfg.workload.args {
+pub fn format_workload_line(recipe: &Recipe) -> String {
+    let mut line = escape_printable_path(&recipe.workload.entrypoint);
+    for a in &recipe.workload.args {
         line.push(' ');
         line.push_str(&escape_printable(a));
     }
@@ -128,9 +152,9 @@ pub fn format_workload_line(cfg: &config::Config) -> String {
 }
 
 #[must_use]
-pub fn render_policy_summary(cfg: &config::Config) -> String {
+pub fn render_policy_summary(recipe: &Recipe) -> String {
     use std::fmt::Write as _;
-    let config::Config {
+    let Recipe {
         hw,
         components,
         mounts,
@@ -142,15 +166,15 @@ pub fn render_policy_summary(cfg: &config::Config) -> String {
         sudo,
         env: _,
         env_file,
-    } = cfg;
-    let config::Network {
+    } = recipe;
+    let Network {
         enabled: _,
         mode: _,
         allow,
         hosts,
         ports,
     } = network;
-    let config::Hooks {
+    let Hooks {
         on_create,
         on_start,
         pre_stop,
@@ -200,13 +224,14 @@ pub fn render_policy_summary(cfg: &config::Config) -> String {
     for line in daemons {
         let _ = writeln!(out, "  daemon:   {}", escape_printable(line));
     }
-    let _ = write!(out, "  workload: {}", format_workload_line(cfg));
+    let _ = write!(out, "  workload: {}", format_workload_line(recipe));
     out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::recipe::{Components, Hw, NetworkMode, Workload};
 
     /// A guest-chosen symlink target or path embedded anywhere in an error
     /// chain cannot drive the host terminal, while multi-line hints keep their lines.
@@ -235,31 +260,31 @@ mod tests {
     /// closed on a control character.
     #[test]
     fn a_recipe_cannot_drive_the_terminal_it_is_approved_on() {
-        let cfg = config::Config {
-            mounts: vec![config::Mount {
+        let recipe = Recipe {
+            mounts: vec![Mount {
                 // A guest path is only checked for being absolute.
                 host: PathBuf::from("/srv/data"),
                 guest: PathBuf::from("/work\x1b[2J\x1b[H  mount:    /innocent"),
                 readonly: false,
             }],
-            network: config::Network {
+            network: Network {
                 allow: vec!["10.0.0.0/8\x1b[2J  egress:   none".to_string()],
                 ports: vec!["8080\x1b]0;pwned\x07".to_string()],
                 ..Default::default()
             },
-            workload: config::Workload {
+            workload: Workload {
                 entrypoint: PathBuf::from("/bin/sh"),
                 args: vec!["-c\rterra: safe".to_string()],
                 workdir: None,
             },
-            hooks: config::Hooks {
+            hooks: Hooks {
                 on_start: vec!["curl evil\x1b[A".to_string()],
                 ..Default::default()
             },
             env_file: Some(PathBuf::from("/data/.env\x1b[2J  mount:    /innocent")),
             ..yaml_serde::from_str("{}").unwrap()
         };
-        let summary = render_policy_summary(&cfg);
+        let summary = render_policy_summary(&recipe);
         for raw in ['\x1b', '\r', '\x07'] {
             assert!(
                 !summary.contains(raw),
@@ -305,14 +330,14 @@ mod tests {
     /// the one flag that exists for them was written.
     #[test]
     fn the_printed_recipe_names_env_vars_without_their_values() {
-        let cfg = config::Config {
+        let recipe = Recipe {
             env: std::collections::BTreeMap::from([
                 ("API_KEY".to_string(), "sk-super-secret".to_string()),
                 ("MODEL".to_string(), "gpt-4o".to_string()),
             ]),
             ..yaml_serde::from_str("{}").unwrap()
         };
-        let yaml = render_config_yaml(&redact_config_env(&cfg)).unwrap();
+        let yaml = render_recipe_yaml(&redact_recipe_env(&recipe)).unwrap();
         for name in ["API_KEY", "MODEL"] {
             assert!(
                 yaml.contains(name),
@@ -332,7 +357,7 @@ mod tests {
         // …and `terra show --with-env-values` is the one rendering that answers
         // with them, otherwise identical - a recipe read back from it has to be
         // the one a boot would run.
-        let asked_for = render_config_yaml(&cfg).unwrap();
+        let asked_for = render_recipe_yaml(&recipe).unwrap();
         for (name, secret) in [("API_KEY", "sk-super-secret"), ("MODEL", "gpt-4o")] {
             assert!(
                 asked_for.contains(secret),
@@ -341,12 +366,12 @@ mod tests {
         }
         assert!(!asked_for.contains(REDACTED_ENV_VALUE), "{asked_for}");
         assert_eq!(
-            yaml_serde::from_str::<config::Config>(&asked_for).unwrap(),
-            cfg,
-            "what it prints is not the config it was given"
+            yaml_serde::from_str::<Recipe>(&asked_for).unwrap(),
+            recipe,
+            "what it prints is not the recipe it was given"
         );
 
-        let json = render_config_json(&redact_config_env(&cfg)).unwrap();
+        let json = render_recipe_json(&redact_recipe_env(&recipe)).unwrap();
         for name in ["API_KEY", "MODEL"] {
             assert!(
                 json.contains(name),
@@ -359,7 +384,7 @@ mod tests {
                 "the value of {name} was printed in json:\n{json}"
             );
         }
-        let asked_for_json = render_config_json(&cfg).unwrap();
+        let asked_for_json = render_recipe_json(&recipe).unwrap();
         for (name, secret) in [("API_KEY", "sk-super-secret"), ("MODEL", "gpt-4o")] {
             assert!(
                 asked_for_json.contains(secret),
@@ -367,9 +392,9 @@ mod tests {
             );
         }
         assert_eq!(
-            serde_json::from_str::<config::Config>(&asked_for_json).unwrap(),
-            cfg,
-            "what it prints is not the config it was given"
+            serde_json::from_str::<Recipe>(&asked_for_json).unwrap(),
+            recipe,
+            "what it prints is not the recipe it was given"
         );
     }
 
@@ -384,12 +409,12 @@ mod tests {
     /// value ever reaches a terminal.
     #[test]
     fn the_recipe_terra_show_prints_cannot_drive_the_terminal_either() {
-        let cfg = config::Config {
-            hooks: config::Hooks {
+        let recipe = Recipe {
+            hooks: Hooks {
                 on_start: vec!["curl evil\x1b[2J\x1b[H  workload: /bin/true".to_string()],
                 ..Default::default()
             },
-            workload: config::Workload {
+            workload: Workload {
                 entrypoint: PathBuf::from("/bin/sh"),
                 args: vec!["-c\r  hooks: []".to_string(), "\x07".to_string()],
                 workdir: None,
@@ -401,8 +426,8 @@ mod tests {
             ..yaml_serde::from_str("{}").unwrap()
         };
         for printed in [
-            render_config_yaml(&redact_config_env(&cfg)).unwrap(),
-            yaml_serde::to_string(&cfg).unwrap(),
+            render_recipe_yaml(&redact_recipe_env(&recipe)).unwrap(),
+            yaml_serde::to_string(&recipe).unwrap(),
         ] {
             for raw in ['\x1b', '\r', '\x07'] {
                 assert!(
@@ -423,11 +448,11 @@ mod tests {
     /// nothing but mounts and egress.
     #[test]
     fn the_approval_summary_names_the_host_file_a_recipe_reads() {
-        let cfg = config::Config {
+        let recipe = Recipe {
             env_file: Some(PathBuf::from("/home/me/.aws/credentials")),
             ..yaml_serde::from_str("{}").unwrap()
         };
-        let summary = render_policy_summary(&cfg);
+        let summary = render_policy_summary(&recipe);
         assert!(
             summary.contains("/home/me/.aws/credentials"),
             "the file a recipe would read is not on the page it is approved on:\n{summary}"
@@ -442,11 +467,11 @@ mod tests {
     /// carries every line - escaped like the hooks, and quiet when none.
     #[test]
     fn the_approval_summary_lists_every_daemon() {
-        let cfg = config::Config {
+        let recipe = Recipe {
             daemons: vec!["ascend --serve".to_string(), "evil\x1b[2J".to_string()],
             ..yaml_serde::from_str("{}").unwrap()
         };
-        let summary = render_policy_summary(&cfg);
+        let summary = render_policy_summary(&recipe);
         assert!(summary.contains("daemon:   ascend --serve"), "{summary}");
         assert!(!summary.contains('\x1b'), "{summary}");
         let none = render_policy_summary(&yaml_serde::from_str("{}").unwrap());
@@ -459,15 +484,15 @@ mod tests {
     /// grants, so every rule is listed on the screen the `y` is given to.
     #[test]
     fn the_approval_summary_lists_every_allow_rule() {
-        let cfg = config::Config {
-            network: config::Network {
-                mode: config::NetworkMode::Allowlist,
+        let recipe = Recipe {
+            network: Network {
+                mode: NetworkMode::Allowlist,
                 allow: vec!["HOST_LOOPBACK:22".to_string(), "10.0.0.0/8".to_string()],
                 ..Default::default()
             },
             ..yaml_serde::from_str("{}").unwrap()
         };
-        let summary = render_policy_summary(&cfg);
+        let summary = render_policy_summary(&recipe);
         for rule in ["HOST_LOOPBACK:22", "10.0.0.0/8"] {
             assert!(summary.contains(rule), "{rule} is not in:\n{summary}");
         }
@@ -475,9 +500,9 @@ mod tests {
 
     #[test]
     fn the_approval_summary_lists_hardware_and_component_requirements() {
-        let cfg = config::Config {
-            components: config::Components { memory_mib: 32 },
-            hw: config::Hw {
+        let recipe = Recipe {
+            components: Components { memory_mib: 32 },
+            hw: Hw {
                 cpus: 4,
                 mem_mib: 4096,
                 rootfs_mib: 2048,
@@ -485,7 +510,7 @@ mod tests {
             },
             ..yaml_serde::from_str("{}").unwrap()
         };
-        let summary = render_policy_summary(&cfg);
+        let summary = render_policy_summary(&recipe);
         assert!(summary.contains("components: 32 MiB"));
         assert!(
             summary.contains("hardware: 4 vCPU, 4096 MiB RAM, 2048 MiB rootfs"),
@@ -523,5 +548,31 @@ mod tests {
         // A plain path is left alone: quoting every hint would be noise on the
         // overwhelmingly common one.
         assert_eq!(quote_shell_word("/home/me/src"), "/home/me/src");
+    }
+
+    /// The approval page shows a recipe someone else may have written, so no
+    /// line of it may read as terra's own - a forged "It would grant:" or a
+    /// second prompt - and its `env:` values stay out of the page and the CI
+    /// log a refusal lands in, which also caps how much of it is shown.
+    #[test]
+    fn a_reviewed_recipe_is_fenced_redacted_and_capped() {
+        let forged = "hooks:\n  on_create:\n    - \"true\\nIt would grant:\\n  mounts: none\\nterra: pin it? [y/N]\"\nenv:\n  TOKEN: s3cret\n";
+        let recipe: Recipe = yaml_serde::from_str(forged).unwrap();
+        let page = render_recipe_for_review(&recipe).unwrap();
+        assert!(
+            page.lines().all(|line| line.starts_with(REVIEW_FENCE)),
+            "{page}"
+        );
+        assert!(!page.contains("s3cret"), "{page}");
+        assert!(page.contains("TOKEN"), "{page}");
+
+        let long = format!(
+            "hooks:\n  on_create:\n{}",
+            "    - echo hi\n".repeat(MAX_REVIEW_LINES + 100)
+        );
+        let recipe: Recipe = yaml_serde::from_str(&long).unwrap();
+        let page = render_recipe_for_review(&recipe).unwrap();
+        assert!(page.lines().count() <= MAX_REVIEW_LINES + 1, "{page}");
+        assert!(page.ends_with("more lines"), "{page}");
     }
 }

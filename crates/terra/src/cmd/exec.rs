@@ -1,7 +1,7 @@
 //! `terra <box> exec` - run one command in a running box, on a terminal of its
 //! own. The pumping machinery it shares with sessions is [`crate::session`]'s.
 
-use crate::resolve;
+use crate::recipe::resolve;
 use crate::session::{self, pump_exec};
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
@@ -15,7 +15,7 @@ pub async fn run(
     project_dir: &Path,
     is_at_a_terminal: bool,
 ) -> Result<ExitCode> {
-    let bx = &resolve::resolve_pinned_box(project_dir, name)?;
+    let bx = &resolve::resolve_box(name, project_dir, resolve::Existence::MustExist)?;
     let mut stream = session::connect_to_running_agent(
         bx,
         "exec",

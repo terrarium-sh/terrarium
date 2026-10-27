@@ -37,7 +37,7 @@ pub(super) async fn execute(
         crate::report_agent_ready(control).await?;
         diagnostic.record_boot_stage("hooks_start");
         let outcome = async {
-            bake_if_stale(&plan.on_create, diagnostic, &session, stop).await?;
+            run_on_create(&plan.on_create, diagnostic, &session, stop).await?;
             write_persistent_state(plan)
         }
         .await;
@@ -116,24 +116,19 @@ async fn fail_startup(
     error
 }
 
-async fn bake_if_stale(
+async fn run_on_create(
     on_create: &[String],
     diagnostic: &Diagnostics,
     session: &Arc<crate::term::session::Session>,
     stop: &CancellationToken,
 ) -> Result<()> {
-    let recipe = on_create.join("\n");
-    if config::is_baked(&recipe)? {
-        return Ok(());
-    }
     if !on_create.is_empty() {
         diagnostic.record(b"terra: baking on_create...\n");
     }
     for line in on_create {
         hooks::run(line, Some(session), stop).await?;
     }
-    fs::write(terra_protocol::RECIPE_STAMP_PATH, &recipe)
-        .with_context(|| format!("stamping {}", terra_protocol::RECIPE_STAMP_PATH))
+    Ok(())
 }
 
 /// Creates what the recipe names in the root image; a run boot only finds it there.

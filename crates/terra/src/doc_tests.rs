@@ -52,18 +52,18 @@ fn list_key_paths(value: &yaml_serde::Value) -> BTreeSet<String> {
 }
 
 /// The recipe reference introduces its first example with "Every field". A
-/// `Config` field missing from it, or a key `Config` no longer has, fails here.
+/// `Recipe` field missing from it, or a key `Recipe` no longer has, fails here.
 #[test]
 fn the_recipe_reference_example_names_every_field() {
     let reference = read_repo_text("docs/recipe.md");
     let example = list_yaml_blocks(&reference)[0];
-    let config: crate::config::Config = yaml_serde::from_str(example).unwrap();
+    let recipe: crate::recipe::Recipe = yaml_serde::from_str(example).unwrap();
     let documented = list_key_paths(&yaml_serde::from_str(example).unwrap());
-    let fields = list_key_paths(&yaml_serde::to_value(&config).unwrap());
+    let fields = list_key_paths(&yaml_serde::to_value(&recipe).unwrap());
     let mismatched: Vec<_> = documented.symmetric_difference(&fields).collect();
     assert!(
         mismatched.is_empty(),
-        "docs/recipe.md's first example and Config disagree on {mismatched:?}"
+        "docs/recipe.md's first example and Recipe disagree on {mismatched:?}"
     );
 }
 
@@ -77,12 +77,12 @@ fn agent_skill_examples_are_accepted() {
     for block in blocks {
         let project = tempfile::tempdir().unwrap();
         if block.starts_with("boxes:") {
-            std::fs::write(project.path().join(crate::config::MANIFEST_FILE), block).unwrap();
-            crate::config::load_manifest(project.path())
+            std::fs::write(project.path().join(crate::recipe::MANIFEST_FILE), block).unwrap();
+            crate::recipe::load_manifest(project.path())
                 .unwrap()
                 .unwrap();
         } else {
-            crate::config::parse_recipe(block, project.path(), &project.path().join("box.yaml"))
+            crate::recipe::parse_recipe(block, project.path(), &project.path().join("box.yaml"))
                 .unwrap_or_else(|error| panic!("{error:#}\n{block}"));
         }
     }

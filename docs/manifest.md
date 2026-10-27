@@ -9,7 +9,8 @@ boxes:
   ci: ./ci.yaml
 ```
 
-Each value is a path to a recipe file, never an inline recipe. Paths are
+Box names are case-insensitive: `Dev` and `dev` name the same box. Each value
+is a path to a recipe file, never an inline recipe. Paths are
 relative to the project directory, and `~` means your own home. With one entry,
 `terra setup` picks it without a box name; with several, name the box:
 

@@ -84,7 +84,10 @@ fn build_reversal_hint(typed: &[String]) -> Option<String> {
     })?;
 
     for (idx, arg) in typed.iter().enumerate() {
-        if idx <= verb_idx || arg.starts_with('-') || crate::resolve::BoxArg::parse(arg).is_err() {
+        if idx <= verb_idx
+            || arg.starts_with('-')
+            || crate::recipe::resolve::BoxArg::parse(arg).is_err()
+        {
             continue;
         }
         let mut candidate_argv = Vec::with_capacity(typed.len() + 1);
@@ -180,7 +183,7 @@ pub enum Cmd {
     /// The client's connection is closed and its terminal restored, as if the
     /// detach key had been pressed.
     Detach(DetachArgs),
-    /// Print the fully-resolved config a boot would use: the box's pinned
+    /// Print the fully-resolved recipe a boot would use: the box's pinned
     /// recipe, or - for a box not set up yet, or a recipe named by path - the
     /// recipe that would be pinned.
     ///
@@ -249,11 +252,12 @@ impl Cmd {
     }
 }
 
+const TRUST_RECIPE_HELP: &str = "Pin the recipe without asking, even when a guest could have \
+     written it. Required when there is no terminal to ask on.";
+
 #[derive(Args, Debug)]
 pub struct SetupArgs {
-    /// Pin the recipe without asking, even when a guest could have written
-    /// it. Required when there is no terminal to ask on.
-    #[arg(long)]
+    #[arg(long, help = TRUST_RECIPE_HELP)]
     pub trust_recipe: bool,
     /// Rebuild the guest filesystem from scratch, run `on_create` again, and
     /// remove the volume images the recipe no longer names.
@@ -393,19 +397,30 @@ pub enum StorageCmd {
     /// List the box's images: what each is sized to, what it costs on disk,
     /// and which the recipe no longer names.
     Show(StorageShowArgs),
-    /// Write the box's images to one file, to be imported into a box set up
-    /// from the same recipe on another machine.
+    /// Write the box's pinned recipe and images to one file, to be imported on
+    /// another machine.
     ///
-    /// The images only - the recipe is what makes a box, and it travels with
-    /// the project. The box must not be running.
+    /// The recipe's inline `env:` values travel with it; its `env_file` does
+    /// not. The box must be set up, and must not be running.
     Export(StorageFileArgs),
-    /// Replace the box's images with those in a file `export` wrote. The box
-    /// must be set up already, and must not be running. After a root-image
-    /// import, `terra BOX setup` finishes it before the box starts.
-    Import(StorageFileArgs),
+    /// Replace the box's recipe and images with those in a file `export`
+    /// wrote, creating the box if it does not exist. The box boots straight
+    /// after an import, and must not be running.
+    ///
+    /// The recipe is pinned like any other from outside the project: it is put
+    /// to you first.
+    Import(StorageImportArgs),
     /// Remove the volume images the recipe no longer names. Their data goes
     /// with them.
     Prune,
+}
+
+#[derive(Args, Debug)]
+pub struct StorageImportArgs {
+    #[command(flatten)]
+    pub file: StorageFileArgs,
+    #[arg(long, help = TRUST_RECIPE_HELP)]
+    pub trust_recipe: bool,
 }
 
 #[derive(Args, Debug)]

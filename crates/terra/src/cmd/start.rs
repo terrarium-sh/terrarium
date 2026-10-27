@@ -2,8 +2,7 @@
 //! doing of it.
 
 use crate::cli::BootArgs;
-use crate::cmd::setup;
-use crate::resolve;
+use crate::recipe::resolve;
 use crate::session::DETACH_KEY_NAME;
 use crate::state::{BoxRef, Holder};
 use crate::vm::boot::{self, BootMode};
@@ -83,7 +82,7 @@ pub async fn run(
     project_dir: &Path,
     is_at_a_terminal: bool,
 ) -> Result<ExitCode> {
-    let target = resolve::resolve(name, project_dir, None, resolve::Existence::MustExist)?;
+    let target = resolve::resolve_recipe(name, project_dir, resolve::Purpose::Boot)?;
 
     match build_start_plan(&target.bx, args, is_at_a_terminal)? {
         // One line for both: a script tells them apart by the exit code, not
@@ -109,11 +108,11 @@ pub async fn run(
     let mode = choose_boot_mode(args, is_at_a_terminal)?;
     // Locked before the pin is read - a setup finishing in between would
     // otherwise boot the old recipe on the root it set up for the new one.
-    let lock = setup::lock_finished_box(&target.bx)?;
+    let lock = target.bx.lock_finished()?;
     let manifest_divergence = target.find_manifest_divergence();
-    let (bx, cfg) = setup::load_pinned_config(target)?;
+    let (bx, recipe) = target.load_pinned_recipe()?;
     let project_dir = bx.get_project_dir().to_path_buf();
-    let spec = boot::BootSpec::resolve(cfg, args, project_dir, mode);
+    let spec = boot::BootSpec::resolve(recipe, args, project_dir, mode);
     crate::vm::encode_boot_plan(&spec, bx.get_name())?;
     if let Some(from) = manifest_divergence {
         eprintln!(
@@ -142,8 +141,7 @@ mod tests {
         std::fs::write(bx.get_dir().join(crate::state::RECIPE_FILE), "{}").unwrap();
         std::fs::write(bx.get_dir().join(crate::state::ROOTFS_FILE), b"").unwrap();
         bx.write_setup_stamp().unwrap();
-        let paths =
-            crate::policy::mount::PinnedPaths::from_config(&crate::config::Config::default());
+        let paths = crate::state::PinnedPaths::from_recipe(&crate::recipe::Recipe::default());
         std::fs::write(
             bx.get_dir().join(crate::state::PINNED_PATHS_FILE),
             yaml_serde::to_string(&paths).unwrap(),

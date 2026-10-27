@@ -1,6 +1,6 @@
 use super::describe;
 use super::rules::parse_port_mappings;
-use crate::config::{Network, NetworkMode, StaticDnsRecord};
+use crate::recipe::{Network, NetworkMode, StaticDnsRecord};
 
 fn build_network(mode: NetworkMode, allow: &[&str]) -> Network {
     Network {
@@ -52,7 +52,7 @@ fn parse_port_mappings_and_reject_invalid_entries() {
         assert!(parse_port_mappings(&ports).is_err());
     }
 
-    let refused = crate::config::parse_recipe(
+    let refused = crate::recipe::parse_recipe(
         "network:\n  ports: [\"8080\", \"8080:90\"]\n",
         std::path::Path::new("/proj"),
         std::path::Path::new("/proj/r.yaml"),
@@ -76,7 +76,7 @@ fn published_mapping_limit_counts_host_listeners_even_for_one_guest_port() {
         "network:\n  ports: {}",
         serde_json::to_string(&ports).unwrap()
     );
-    let error = crate::config::parse_recipe(
+    let error = crate::recipe::parse_recipe(
         &yaml,
         std::path::Path::new("/proj"),
         std::path::Path::new("/proj/r.yaml"),

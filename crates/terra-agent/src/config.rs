@@ -193,21 +193,6 @@ fn prepare_mount_point(path: &str) -> Result<()> {
         .with_context(|| format!("creating mount point {path}"))
 }
 
-pub(super) fn is_baked(recipe: &str) -> Result<bool> {
-    match fs::read_to_string(terra_protocol::RECIPE_STAMP_PATH) {
-        Ok(stamped) if stamped == recipe => Ok(true),
-        Ok(stamped) if !stamped.is_empty() => {
-            eprintln!(
-                "terra-agent: warning: on_create changed since this box was set up, and the old one already ran; keeping its result (`terra setup --rebuild` runs the new one)"
-            );
-            Ok(true)
-        }
-        Ok(_) => Ok(false),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error).context(format!("reading {}", terra_protocol::RECIPE_STAMP_PATH)),
-    }
-}
-
 pub(super) fn prepare_runtime_dir() -> Result<()> {
     let runtime_dir = format!("/run/user/{}", terra_protocol::WORKLOAD_ID);
     fs::create_dir_all(&runtime_dir).with_context(|| format!("creating {runtime_dir}"))?;

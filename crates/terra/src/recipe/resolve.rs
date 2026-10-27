@@ -2,8 +2,10 @@
 //! place `terra.yaml` is read per resolution - it commonly sits in a share a
 //! guest can write, so a second read could see a different manifest.
 
+use super::{
+    MANIFEST_FILE, Manifest, load_manifest_or_warn, read_recipe_text, resolve_recipe_path,
+};
 use crate::state::{self, BoxRef};
-use crate::{config, config::MANIFEST_FILE};
 use anyhow::{Context as _, Result, anyhow};
 use std::path::{Path, PathBuf};
 
@@ -12,7 +14,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug)]
 pub enum BoxArg {
     Name(String),
-    RecipePath { path: String, name: String },
+    RecipePath(String),
 }
 
 impl BoxArg {
@@ -21,21 +23,27 @@ impl BoxArg {
             crate::name::validate_box_name(arg)?;
             return Ok(Self::Name(arg.to_string()));
         }
-        let name = Path::new(arg)
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned();
-        crate::name::validate_box_name(&name).with_context(|| format!("resolving '{arg}'"))?;
-        Ok(Self::RecipePath {
-            path: arg.to_string(),
-            name,
-        })
+        let recipe_path = Self::RecipePath(arg.to_string());
+        crate::name::validate_box_name(&recipe_path.box_name())
+            .with_context(|| format!("resolving '{arg}'"))?;
+        Ok(recipe_path)
+    }
+
+    /// A recipe path names the box after its file's stem.
+    pub fn box_name(&self) -> String {
+        match self {
+            Self::Name(name) => name.clone(),
+            Self::RecipePath(path) => Path::new(path)
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+        }
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct Recipe {
+pub struct RecipeFile {
     pub from: PathBuf,
     pub text: String,
 }
@@ -44,15 +52,10 @@ pub struct Recipe {
 #[derive(Debug)]
 pub enum Source {
     Pinned,
-    File(Recipe),
-    Manifest(Recipe),
-}
-
-#[derive(Debug)]
-pub struct ResolvedBox {
-    pub bx: BoxRef,
-    pub source: Source,
-    pub manifest: Option<config::Manifest>,
+    File(RecipeFile),
+    Manifest(RecipeFile),
+    /// The recipe a storage artifact carries; `from` is the artifact.
+    Artifact(RecipeFile),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -61,13 +64,48 @@ pub(crate) enum Existence {
     MayBeMissing,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum PinSource {
-    Operate,
-    Setup,
+/// The box a BOX argument names - or the directory's only box. A recipe path
+/// is refused.
+pub fn resolve_box(arg: Option<&str>, project_dir: &Path, existence: Existence) -> Result<BoxRef> {
+    let manifest = load_manifest_or_warn(project_dir);
+    let name = match arg.map(BoxArg::parse).transpose()? {
+        Some(BoxArg::Name(name)) => name,
+        Some(BoxArg::RecipePath(path)) => return Err(refuse_recipe_path(&path)),
+        None => choose_default_box_name(project_dir, manifest.as_ref())?,
+    };
+    let bx = BoxRef::resolve(project_dir, &name)?;
+    match existence {
+        Existence::MustExist if !is_pinned(&bx) => Err(build_missing_box_error(
+            project_dir,
+            Some(bx.get_name()),
+            manifest.as_ref(),
+        )),
+        Existence::MustExist | Existence::MayBeMissing => Ok(bx),
+    }
 }
 
-impl ResolvedBox {
+/// Where a verb takes a box's recipe from.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Purpose<'a> {
+    /// What a boot runs: the pin of a box that must exist, named by name.
+    Boot,
+    /// What `show` reads: a typed path, else the pin, else the manifest's entry.
+    Read { cwd: &'a Path },
+    /// What `setup` pins: a typed path, else the manifest's entry, else the pin.
+    /// `setup` is the one verb that re-reads the manifest over an existing pin,
+    /// so a pin never outlives a `terra.yaml` edit.
+    Pin { cwd: &'a Path },
+}
+
+/// A box's recipe, and the box it is for.
+#[derive(Debug)]
+pub struct ResolvedRecipe {
+    pub bx: BoxRef,
+    pub source: Source,
+    pub manifest: Option<Manifest>,
+}
+
+impl ResolvedRecipe {
     /// Find the manifest recipe when its text differs from the pinned recipe.
     pub(crate) fn find_manifest_divergence(&self) -> Option<PathBuf> {
         if !matches!(self.source, Source::Pinned) {
@@ -75,153 +113,102 @@ impl ResolvedBox {
         }
         let reference = self.manifest.as_ref()?.boxes.get(self.bx.get_name())?;
         let chosen = read_recipe(reference, self.bx.get_project_dir()).ok()??;
-        let pinned = config::read_recipe_text(&self.bx.get_dir().join(state::RECIPE_FILE)).ok()?;
+        let pinned = read_recipe_text(&self.bx.get_dir().join(state::RECIPE_FILE)).ok()?;
         (chosen.text != pinned).then_some(chosen.from)
     }
-
-    pub(crate) fn parse_recipe_without_env_file(&self) -> Result<config::Config> {
-        match &self.source {
-            Source::Pinned => config::load_path(
-                &self.bx.get_dir().join(state::RECIPE_FILE),
-                self.bx.get_project_dir(),
-            ),
-            Source::File(r) | Source::Manifest(r) => {
-                config::parse_recipe(&r.text, self.bx.get_project_dir(), &r.from)
-            }
-        }
-    }
 }
 
-/// The box `name` - or the directory's only one - which must have a pinned recipe.
-pub fn resolve_pinned_box(project_dir: &Path, name: Option<&str>) -> Result<BoxRef> {
-    Ok(resolve(name, project_dir, None, Existence::MustExist)?.bx)
-}
-
-/// A BOX argument read for `terra setup`: the recipe to pin. A name pins what
-/// the manifest chose even when the box is already set up - `setup` is the one
-/// verb that re-reads the manifest, so a reference pointing nowhere is the
-/// manifest's fault, and the pin never outlives a `terra.yaml` edit.
-pub fn resolve_for_setup(arg: Option<&str>, project_dir: &Path, cwd: &Path) -> Result<ResolvedBox> {
-    resolve_inner(
-        arg,
-        project_dir,
-        Some(cwd),
-        Existence::MayBeMissing,
-        PinSource::Setup,
-    )
-}
-
-/// The one resolution: a BOX argument becomes the box and where its recipe
-/// comes from. `cwd` is the directory the verb reads recipe files against -
-/// unset, the verb takes box names only, and `existence` decides whether a box
-/// nobody set up resolves at all. Only `setup` consults the manifest over an
-/// existing pin; the verbs that answer from a pin - `show`, a boot - tolerate
-/// a manifest that points nowhere.
-pub fn resolve(
+/// The recipe a BOX argument - or none, for the directory's only box - resolves
+/// to for `purpose`.
+pub fn resolve_recipe(
     arg: Option<&str>,
     project_dir: &Path,
-    cwd: Option<&Path>,
-    existence: Existence,
-) -> Result<ResolvedBox> {
-    resolve_inner(arg, project_dir, cwd, existence, PinSource::Operate)
-}
-
-fn resolve_inner(
-    arg: Option<&str>,
-    project_dir: &Path,
-    cwd: Option<&Path>,
-    existence: Existence,
-    pin_source: PinSource,
-) -> Result<ResolvedBox> {
-    let manifest = config::load_manifest_or_warn(project_dir);
-    let name = match arg {
+    purpose: Purpose<'_>,
+) -> Result<ResolvedRecipe> {
+    let manifest = load_manifest_or_warn(project_dir);
+    let arg = arg.map(BoxArg::parse).transpose()?;
+    let name = match &arg {
+        Some(arg) => arg.box_name(),
         None => choose_default_box_name(project_dir, manifest.as_ref())?,
-        Some(arg) => match BoxArg::parse(arg)? {
-            BoxArg::Name(name) => name,
-            BoxArg::RecipePath { path, name } => {
-                let cwd = cwd.ok_or_else(|| {
-                    anyhow!(
-                        "'{path}' is a recipe path - this command takes a box name \
-                         (`terra {path} setup` is what reads and pins the file)"
-                    )
-                })?;
-                let recipe = read_recipe(&path, cwd)?
-                    .ok_or_else(|| build_missing_recipe_error(&path, &path, cwd))?;
-                return Ok(ResolvedBox {
-                    bx: BoxRef::resolve(project_dir, &name)?,
-                    source: Source::File(recipe),
-                    manifest: None,
-                });
-            }
-        },
     };
-
     let bx = BoxRef::resolve(project_dir, &name)?;
-    let pinned = bx.get_dir().join(state::RECIPE_FILE).exists();
+    let source = match arg {
+        Some(BoxArg::RecipePath(path)) => Source::File(read_typed_recipe(&path, purpose)?),
+        Some(BoxArg::Name(_)) | None => choose_named_source(&bx, manifest.as_ref(), purpose)?,
+    };
+    Ok(ResolvedRecipe {
+        bx,
+        source,
+        manifest,
+    })
+}
 
-    if cwd.is_none() {
-        if matches!(existence, Existence::MustExist) && !pinned {
-            return Err(build_missing_box_error(
-                project_dir,
-                Some(&name),
-                manifest.as_ref(),
-            ));
-        }
-        return Ok(ResolvedBox {
-            bx,
-            source: Source::Pinned,
+fn read_typed_recipe(path: &str, purpose: Purpose<'_>) -> Result<RecipeFile> {
+    let cwd = match purpose {
+        Purpose::Boot => return Err(refuse_recipe_path(path)),
+        Purpose::Read { cwd } | Purpose::Pin { cwd } => cwd,
+    };
+    read_recipe(path, cwd)?.ok_or_else(|| build_missing_recipe_error(path, path, cwd))
+}
+
+fn choose_named_source(
+    bx: &BoxRef,
+    manifest: Option<&Manifest>,
+    purpose: Purpose<'_>,
+) -> Result<Source> {
+    let is_pinned = is_pinned(bx);
+    let project_dir = bx.get_project_dir();
+    match purpose {
+        Purpose::Boot if !is_pinned => Err(build_missing_box_error(
+            project_dir,
+            Some(bx.get_name()),
             manifest,
-        });
-    }
-
-    if pinned && matches!(pin_source, PinSource::Operate) {
-        return Ok(ResolvedBox {
-            bx,
-            source: Source::Pinned,
-            manifest,
-        });
-    }
-
-    let manifest_reference = manifest.as_ref().and_then(|m| m.boxes.get(bx.get_name()));
-    if let Some(reference) = manifest_reference {
-        if let Some(recipe) = read_recipe(reference, bx.get_project_dir())? {
-            return Ok(ResolvedBox {
-                bx,
-                source: Source::Manifest(recipe),
-                manifest: None,
-            });
+        )),
+        Purpose::Boot => Ok(Source::Pinned),
+        Purpose::Read { .. } if is_pinned => Ok(Source::Pinned),
+        Purpose::Read { .. } | Purpose::Pin { .. } => {
+            let Some(reference) = manifest.and_then(|m| m.boxes.get(bx.get_name())) else {
+                return if is_pinned {
+                    Ok(Source::Pinned)
+                } else {
+                    Err(build_missing_recipe_error(
+                        bx.get_name(),
+                        bx.get_name(),
+                        project_dir,
+                    ))
+                };
+            };
+            if let Some(recipe) = read_recipe(reference, project_dir)? {
+                return Ok(Source::Manifest(recipe));
+            }
+            let missing = build_missing_recipe_error(bx.get_name(), reference, project_dir);
+            if is_pinned {
+                // The box is set up; only the manifest's reference is wrong, so the
+                // "never been set up" lead would lie.
+                Err(missing)
+            } else {
+                Err(missing.context(
+                    build_missing_box_error(project_dir, Some(bx.get_name()), manifest).to_string(),
+                ))
+            }
         }
-        let missing = build_missing_recipe_error(bx.get_name(), reference, bx.get_project_dir());
-        return if pinned {
-            // The box is set up; only the manifest's reference is wrong, so the
-            // "never been set up" lead would lie.
-            Err(missing)
-        } else {
-            Err(missing.context(
-                build_missing_box_error(project_dir, Some(bx.get_name()), manifest.as_ref())
-                    .to_string(),
-            ))
-        };
     }
+}
 
-    if pinned {
-        return Ok(ResolvedBox {
-            bx,
-            source: Source::Pinned,
-            manifest: None,
-        });
-    }
+fn is_pinned(bx: &BoxRef) -> bool {
+    bx.get_dir().join(state::RECIPE_FILE).exists()
+}
 
-    Err(build_missing_recipe_error(
-        bx.get_name(),
-        bx.get_name(),
-        bx.get_project_dir(),
-    ))
+fn refuse_recipe_path(path: &str) -> anyhow::Error {
+    anyhow!(
+        "'{path}' is a recipe path - this command takes a box name \
+         (`terra {path} setup` is what reads and pins the file)"
+    )
 }
 
 pub(crate) fn choose_default_box_name(
     project_dir: &Path,
-    manifest: Option<&config::Manifest>,
+    manifest: Option<&Manifest>,
 ) -> Result<String> {
     let existing = state::list_existing_names(project_dir)?;
     let names = list_known_names_with(&existing, manifest);
@@ -243,13 +230,13 @@ pub(crate) fn choose_default_box_name(
 /// manifest declares, sorted.
 pub(crate) fn list_known_names(
     project_dir: &Path,
-    manifest: Option<&config::Manifest>,
+    manifest: Option<&Manifest>,
 ) -> Result<Vec<String>> {
     let existing = state::list_existing_names(project_dir)?;
     Ok(list_known_names_with(&existing, manifest))
 }
 
-fn list_known_names_with(existing: &[String], manifest: Option<&config::Manifest>) -> Vec<String> {
+fn list_known_names_with(existing: &[String], manifest: Option<&Manifest>) -> Vec<String> {
     let mut names = existing.to_vec();
     names.extend(manifest.iter().flat_map(|m| m.boxes.keys().cloned()));
     names.sort();
@@ -263,20 +250,15 @@ fn list_known_names_with(existing: &[String], manifest: Option<&config::Manifest
 fn build_missing_box_error(
     project_dir: &Path,
     name: Option<&str>,
-    manifest: Option<&config::Manifest>,
+    manifest: Option<&Manifest>,
 ) -> anyhow::Error {
-    let default_hint = || {
-        format!(
-            "`terra <box> setup` makes one, from {} or a recipe path",
-            config::MANIFEST_FILE
-        )
-    };
+    let default_hint =
+        || format!("`terra <box> setup` makes one, from {MANIFEST_FILE} or a recipe path");
     let hint = match (name, manifest) {
         (Some(n), Some(m)) => {
             if m.boxes.contains_key(n) {
                 format!(
-                    "{} declares it, but it has never been set up: `terra {n} setup`",
-                    config::MANIFEST_FILE
+                    "{MANIFEST_FILE} declares it, but it has never been set up: `terra {n} setup`"
                 )
             } else {
                 default_hint()
@@ -288,7 +270,7 @@ fn build_missing_box_error(
             } else {
                 format!(
                     "{} declares {}, and none is set up yet: `terra <box> setup`",
-                    config::MANIFEST_FILE,
+                    MANIFEST_FILE,
                     m.boxes.keys().cloned().collect::<Vec<_>>().join(", ")
                 )
             }
@@ -301,18 +283,18 @@ fn build_missing_box_error(
     }
 }
 
-pub(crate) fn read_recipe(reference: &str, source_dir: &Path) -> Result<Option<Recipe>> {
+pub(crate) fn read_recipe(reference: &str, source_dir: &Path) -> Result<Option<RecipeFile>> {
     if !is_path(reference) {
         return Ok(None);
     }
-    let path = config::resolve_recipe_path(Path::new(reference), source_dir)?;
-    match config::read_recipe_text(&path) {
+    let path = resolve_recipe_path(Path::new(reference), source_dir)?;
+    match read_recipe_text(&path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         r => {
             let text = r.with_context(|| {
                 format!("reading {}", crate::render::escape_printable_path(&path))
             })?;
-            Ok(Some(Recipe { from: path, text }))
+            Ok(Some(RecipeFile { from: path, text }))
         }
     }
 }
@@ -330,7 +312,7 @@ pub(crate) fn build_missing_recipe_error(
              named by path\n(`terra ./{arg}.yaml setup`, or a {MANIFEST_FILE} entry)"
         );
     }
-    let tried = match config::resolve_recipe_path(Path::new(reference), source_dir) {
+    let tried = match resolve_recipe_path(Path::new(reference), source_dir) {
         Ok(p) => p.display().to_string(),
         Err(e) => return e,
     };
@@ -338,10 +320,10 @@ pub(crate) fn build_missing_recipe_error(
     let reference = crate::render::escape_printable(reference);
     let arg = crate::render::escape_printable(arg);
     if reference == arg {
-        anyhow!("config not found: {tried} (terra {reference} setup reads and pins the file)")
+        anyhow!("recipe not found: {tried} (terra {reference} setup reads and pins the file)")
     } else {
         anyhow!(
-            "config not found: {tried}\n\
+            "recipe not found: {tried}\n\
              (box '{arg}' in {MANIFEST_FILE} points at '{reference}')"
         )
     }
@@ -362,7 +344,7 @@ mod tests {
     use std::assert_matches;
 
     fn resolve_recipe_path(reference: &str, source_dir: &Path) -> Result<PathBuf> {
-        config::resolve_recipe_path(Path::new(reference), source_dir)
+        crate::recipe::resolve_recipe_path(Path::new(reference), source_dir)
     }
 
     /// A bare word is a box, never a file: there is no directory of profiles it
@@ -434,10 +416,9 @@ mod tests {
         }
         assert!(!is_path("ci"));
         assert!(!is_path("ci.v2"), "an extension that is not a recipe's");
-        assert_matches!(
-            BoxArg::parse("ci.yaml").unwrap(),
-            BoxArg::RecipePath { name, .. } if name == "ci"
-        );
+        let arg = BoxArg::parse("ci.yaml").unwrap();
+        assert_matches!(arg, BoxArg::RecipePath(_));
+        assert_eq!(arg.box_name(), "ci");
     }
 
     /// A path whose stem is not a valid box name is refused with the rule and
@@ -445,10 +426,7 @@ mod tests {
     /// typed (`My Recipe.yaml` used to become a box called `My_Recipe`).
     #[test]
     fn a_stem_that_is_not_a_name_is_refused_not_munged() {
-        assert_matches!(
-            BoxArg::parse("./ci.v2.yaml").unwrap(),
-            BoxArg::RecipePath { name, .. } if name == "ci.v2"
-        );
+        assert_eq!(BoxArg::parse("./ci.v2.yaml").unwrap().box_name(), "ci.v2");
         for bad in [
             "./My Recipe.yaml",
             "./.hidden.yaml",
@@ -474,25 +452,14 @@ mod tests {
         .unwrap();
         std::fs::write(dir.path().join("dev-recipe.yaml"), "hw:\n  cpus: 1\n").unwrap();
 
-        let t = resolve(
-            Some("dev"),
-            dir.path(),
-            Some(dir.path()),
-            Existence::MayBeMissing,
-        )
-        .unwrap();
+        let t = resolve_recipe(Some("dev"), dir.path(), Purpose::Read { cwd: dir.path() }).unwrap();
         let Source::Manifest(r) = &t.source else {
             panic!("the manifest chose this recipe, so the source must say so")
         };
         assert_eq!(r.from, dir.path().join("dev-recipe.yaml"));
 
-        let e = resolve(
-            Some("other"),
-            dir.path(),
-            Some(dir.path()),
-            Existence::MayBeMissing,
-        )
-        .unwrap_err();
+        let e = resolve_recipe(Some("other"), dir.path(), Purpose::Read { cwd: dir.path() })
+            .unwrap_err();
         assert!(e.to_string().contains("bare word"), "{e}");
     }
 
@@ -511,13 +478,7 @@ mod tests {
         std::fs::write(project.join("dev.yaml"), "hw:\n  cpus: 3\n").unwrap();
         std::fs::write(elsewhere.join("dev.yaml"), "hw:\n  cpus: 9\n").unwrap();
 
-        let t = resolve(
-            Some("dev"),
-            &project,
-            Some(&elsewhere),
-            Existence::MayBeMissing,
-        )
-        .unwrap();
+        let t = resolve_recipe(Some("dev"), &project, Purpose::Read { cwd: &elsewhere }).unwrap();
         let Source::Manifest(r) = &t.source else {
             panic!("the manifest chose this recipe, so the source must say so")
         };
@@ -534,15 +495,10 @@ mod tests {
         )
         .unwrap();
         std::fs::write(elsewhere.join("only-here.yaml"), "hw:\n  cpus: 9\n").unwrap();
-        let e = resolve(
-            Some("dev"),
-            &project,
-            Some(&elsewhere),
-            Existence::MayBeMissing,
-        )
-        .expect_err("a reference pointing nowhere in the project must not resolve");
+        let e = resolve_recipe(Some("dev"), &project, Purpose::Read { cwd: &elsewhere })
+            .expect_err("a reference pointing nowhere in the project must not resolve");
         let msg = format!("{e:#}");
-        assert!(msg.contains("config not found"), "{msg}");
+        assert!(msg.contains("recipe not found"), "{msg}");
         assert!(
             msg.contains(&project.display().to_string()),
             "the path it looked for is the project's: {msg}"
@@ -563,15 +519,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("ci.yaml"), "hw:\n  cpus: 1\n").unwrap();
 
-        let e = resolve(Some("./ci.yaml"), dir.path(), None, Existence::MustExist).unwrap_err();
+        let e = resolve_box(Some("./ci.yaml"), dir.path(), Existence::MustExist).unwrap_err();
         assert!(format!("{e:#}").contains("box name"), "{e:#}");
 
         // The two that carry the shell's directory read the file it names.
-        let t = resolve(
+        let t = resolve_recipe(
             Some("./ci.yaml"),
             dir.path(),
-            Some(dir.path()),
-            Existence::MayBeMissing,
+            Purpose::Read { cwd: dir.path() },
         )
         .unwrap();
         let Source::File(r) = &t.source else {
@@ -587,8 +542,8 @@ mod tests {
     #[test]
     fn operating_on_a_box_resolves_lexically_unless_the_box_must_exist() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(resolve(Some("dev"), dir.path(), None, Existence::MayBeMissing,).is_ok());
-        let err = resolve(Some("dev"), dir.path(), None, Existence::MustExist)
+        assert!(resolve_box(Some("dev"), dir.path(), Existence::MayBeMissing).is_ok());
+        let err = resolve_box(Some("dev"), dir.path(), Existence::MustExist)
             .expect_err("a box nobody set up must not satisfy must_exist")
             .to_string();
         assert!(err.contains("no box 'dev'"), "{err}");
@@ -604,11 +559,11 @@ mod tests {
 
         let plain =
             build_missing_recipe_error("./nope.yaml", "./nope.yaml", dir.path()).to_string();
-        assert!(plain.contains("config not found"), "{plain}");
+        assert!(plain.contains("recipe not found"), "{plain}");
         assert!(!plain.contains(MANIFEST_FILE), "{plain}");
 
         let via_manifest = build_missing_recipe_error("dev", "./gone.yaml", dir.path()).to_string();
-        assert!(via_manifest.contains("config not found"), "{via_manifest}");
+        assert!(via_manifest.contains("recipe not found"), "{via_manifest}");
         assert!(via_manifest.contains(MANIFEST_FILE), "{via_manifest}");
 
         std::fs::write(dir.path().join("here.yaml"), "hw:\n  cpus: 1\n").unwrap();
@@ -630,18 +585,12 @@ mod tests {
         .unwrap();
         let chain = format!(
             "{:#}",
-            resolve(
-                Some("dev"),
-                dir.path(),
-                Some(dir.path()),
-                Existence::MayBeMissing,
-            )
-            .unwrap_err()
+            resolve_recipe(Some("dev"), dir.path(), Purpose::Read { cwd: dir.path() }).unwrap_err()
         );
         assert!(chain.contains("no box 'dev'"), "{chain}");
         assert!(chain.contains("never been set up"), "{chain}");
         assert!(
-            chain.contains("config not found") && chain.contains("gone.yaml"),
+            chain.contains("recipe not found") && chain.contains("gone.yaml"),
             "the cause was discarded: {chain}"
         );
     }
@@ -667,25 +616,15 @@ mod tests {
         // The same recipe by both routes is no divergence: a pin the manifest
         // agrees with is what a settled project looks like.
         std::fs::write(dir.path().join("dev.yaml"), "hw:\n  cpus: 1\n").unwrap();
-        let agreed = resolve(
-            Some("dev"),
-            dir.path(),
-            Some(dir.path()),
-            Existence::MayBeMissing,
-        )
-        .unwrap();
+        let agreed =
+            resolve_recipe(Some("dev"), dir.path(), Purpose::Read { cwd: dir.path() }).unwrap();
         assert_matches!(agreed.source, Source::Pinned);
         assert_eq!(agreed.find_manifest_divergence(), None);
 
         // …and an edited manifest is named, with the file that would win.
         std::fs::write(dir.path().join("dev.yaml"), "hw:\n  cpus: 8\n").unwrap();
-        let diverged = resolve(
-            Some("dev"),
-            dir.path(),
-            Some(dir.path()),
-            Existence::MayBeMissing,
-        )
-        .unwrap();
+        let diverged =
+            resolve_recipe(Some("dev"), dir.path(), Purpose::Read { cwd: dir.path() }).unwrap();
         assert_matches!(
             diverged.source,
             Source::Pinned,
@@ -699,11 +638,10 @@ mod tests {
 
         // A typed path is the recipe, so there is nothing for it to diverge from.
         assert_eq!(
-            resolve(
+            resolve_recipe(
                 Some("./dev.yaml"),
                 dir.path(),
-                Some(dir.path()),
-                Existence::MayBeMissing,
+                Purpose::Read { cwd: dir.path() }
             )
             .unwrap()
             .find_manifest_divergence(),
@@ -730,26 +668,21 @@ mod tests {
         std::fs::create_dir_all(bx.get_dir()).unwrap();
         std::fs::write(bx.get_dir().join(state::RECIPE_FILE), "hw:\n  cpus: 1\n").unwrap();
 
-        assert!(resolve(Some("dev"), dir.path(), None, Existence::MustExist).is_ok());
+        assert!(resolve_box(Some("dev"), dir.path(), Existence::MustExist).is_ok());
         assert!(
-            resolve(None, dir.path(), None, Existence::MustExist).is_ok(),
+            resolve_box(None, dir.path(), Existence::MustExist).is_ok(),
             "and by default"
         );
 
-        let started = resolve(
-            Some("dev"),
-            dir.path(),
-            Some(dir.path()),
-            Existence::MayBeMissing,
-        )
-        .unwrap();
+        let started =
+            resolve_recipe(Some("dev"), dir.path(), Purpose::Read { cwd: dir.path() }).unwrap();
         assert_matches!(started.source, Source::Pinned);
 
         // `setup` also tolerates a broken manifest when a pin exists: the
         // lenient `load_manifest_or_warn` reads it as nothing, so the pin wins
         // by default. A broken manifest with no pin still surfaces as
         // no recipe rather than `failed to parse`.
-        let t = resolve_for_setup(Some("dev"), dir.path(), dir.path()).unwrap();
+        let t = resolve_recipe(Some("dev"), dir.path(), Purpose::Pin { cwd: dir.path() }).unwrap();
         assert_matches!(t.source, Source::Pinned);
     }
 
@@ -772,7 +705,7 @@ mod tests {
 
         let err = format!(
             "{:#}",
-            resolve_for_setup(Some("dev"), dir.path(), dir.path())
+            resolve_recipe(Some("dev"), dir.path(), Purpose::Pin { cwd: dir.path() })
                 .expect_err("a dangling manifest reference must fail setup")
         );
         assert!(err.contains(MANIFEST_FILE), "{err}");
@@ -801,13 +734,7 @@ mod tests {
         }
         let chain = format!(
             "{:#}",
-            resolve(
-                Some("dev"),
-                dir.path(),
-                Some(dir.path()),
-                Existence::MayBeMissing,
-            )
-            .unwrap_err()
+            resolve_recipe(Some("dev"), dir.path(), Purpose::Read { cwd: dir.path() }).unwrap_err()
         );
         assert!(chain.contains("reading"), "{chain}");
         assert!(

@@ -2,7 +2,7 @@
 //! session, or every one of them. The agent closes that client's connection,
 //! so its terminal is restored wherever it hung.
 
-use crate::resolve;
+use crate::recipe::resolve;
 use crate::session;
 use anyhow::Result;
 use std::path::Path;
@@ -13,7 +13,7 @@ pub async fn run(
     name: Option<&str>,
     project_dir: &Path,
 ) -> Result<ExitCode> {
-    let bx = &resolve::resolve_pinned_box(project_dir, name)?;
+    let bx = &resolve::resolve_box(name, project_dir, resolve::Existence::MustExist)?;
     if let Some(id) = args.id {
         session::detach_client(bx, id, args.agent.agent_timeout).await?;
         eprintln!("terra: detached client {id} from {bx}");

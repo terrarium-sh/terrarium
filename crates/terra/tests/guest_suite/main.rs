@@ -625,6 +625,7 @@ fn exercise_storage(suite: &mut Suite, writable: &Path, hardware: &Value) -> Res
         &suite.run(&["bad-bake", "logs", "--diagnostics"])?,
         "init failed",
     )?;
+    suite.require_box_state("bad-bake", "needs_setup")?;
     suite.run(&["exercise", "rm"])?;
     suite.require_box_state("exercise", "not_created")?;
     suite.run(&["exercise", "rm", "--purge"])?;
@@ -659,12 +660,12 @@ next: value",
     let serialized = yaml_serde::to_string(&exercise)?;
     let reparsed: Value = yaml_serde::from_str(&serialized)?;
     assert_eq!(reparsed, exercise);
-    let config: terra::config::Config = yaml_serde::from_str(&serialized)?;
-    assert_eq!(config.mounts[0].host, writable);
-    assert_eq!(config.mounts[1].host, readonly);
-    assert_eq!(config.hw.cpus, 2);
-    assert_eq!(config.hw.mem_mib, 512);
-    assert_eq!(config.hw.rootfs_mib, 128);
+    let parsed: terra::recipe::Recipe = yaml_serde::from_str(&serialized)?;
+    assert_eq!(parsed.mounts[0].host, writable);
+    assert_eq!(parsed.mounts[1].host, readonly);
+    assert_eq!(parsed.hw.cpus, 2);
+    assert_eq!(parsed.hw.mem_mib, 512);
+    assert_eq!(parsed.hw.rootfs_mib, 128);
     assert_eq!(
         exercise["network"]["allow"],
         serde_json::json!(["gate.test:12345"])
@@ -673,7 +674,7 @@ next: value",
         exercise["network"]["ports"],
         serde_json::json!(["54321:18080", "54321:18082/udp"])
     );
-    assert!(config.daemons[2].contains("200 OK\\r\\nContent-Length: 13"));
+    assert!(parsed.daemons[2].contains("200 OK\\r\\nContent-Length: 13"));
     let hardware = serde_json::to_string(&exercise["hw"])?;
     for template in [
         include_str!("recipes/isolated.yaml"),
@@ -683,10 +684,10 @@ next: value",
         let recipe = template
             .replace("{hardware}", &hardware)
             .replace("{allowed_port}", "12345");
-        let config: terra::config::Config = yaml_serde::from_str(&recipe)?;
-        assert_eq!(config.hw.cpus, 2);
-        assert_eq!(config.hw.mem_mib, 512);
-        assert_eq!(config.hw.rootfs_mib, 128);
+        let parsed: terra::recipe::Recipe = yaml_serde::from_str(&recipe)?;
+        assert_eq!(parsed.hw.cpus, 2);
+        assert_eq!(parsed.hw.mem_mib, 512);
+        assert_eq!(parsed.hw.rootfs_mib, 128);
     }
     Ok(())
 }

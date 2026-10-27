@@ -63,6 +63,14 @@ impl Suite {
     }
 
     fn run_terra_status(&self, args: &[&str]) -> (String, i32) {
+        let out = self.run_terra_output(args);
+        (
+            String::from_utf8_lossy_owned(out.stdout),
+            out.status.code().unwrap_or(-1),
+        )
+    }
+
+    fn run_terra_output(&self, args: &[&str]) -> std::process::Output {
         let out = Command::new(&self.terra)
             .args(args)
             .env("HOME", &self.home)
@@ -78,10 +86,7 @@ impl Suite {
                 out.status.code()
             );
         }
-        (
-            String::from_utf8_lossy_owned(out.stdout),
-            out.status.code().unwrap_or(-1),
-        )
+        out
     }
 
     /// Where terra keeps `name`'s files - asked via `ls --tsv`, the
@@ -468,7 +473,7 @@ fn raw_vsock_tcp_receive_credit_preserves_high_lowat() {
     std::fs::write(directory.join("VSOCK_CREDIT_PAYLOAD"), &payload).unwrap();
     let marker = directory.join("VSOCK_CREDIT_INITIAL");
     let recipe = suite.get_work_dir().join("raw-vsock-credit-lowat.yaml");
-    let configuration = serde_json::json!({
+    let recipe_json = serde_json::json!({
         "network": {"allow": [format!("HOST_LOOPBACK:{port}")]},
         "mounts": [{"host": directory, "guest": "/work", "readonly": false}],
         "workload": {
@@ -476,7 +481,7 @@ fn raw_vsock_tcp_receive_credit_preserves_high_lowat() {
             "args": ["-ec", "exec /work/terra-vsock-probe receive-credit-lowat > /work/VSOCK_CREDIT_PROBE_LOG 2>&1"],
         },
     });
-    std::fs::write(&recipe, serde_json::to_vec(&configuration).unwrap()).unwrap();
+    std::fs::write(&recipe, serde_json::to_vec(&recipe_json).unwrap()).unwrap();
     let stop = AtomicBool::new(false);
     std::thread::scope(|threads| {
         let server = threads.spawn(|| serve_credit_payload(&listener, &marker, &payload, &stop));
@@ -925,7 +930,7 @@ fn published_udp_preserves_peers_datagrams_and_transport_isolation() {
     let local_reservation = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let local_port = local_reservation.local_addr().unwrap().port();
     let recipe = suite.get_work_dir().join("server.yaml");
-    let configuration = serde_json::json!({
+    let recipe_json = serde_json::json!({
         "network": {"ports": [format!("{port}:18083/udp"), format!("{port}:18085/tcp"), format!("{local_port}:18084/udp")]},
         "mounts": [{"host": probe.parent().unwrap(), "guest": "/work", "readonly": true}],
         "daemons": [
@@ -935,7 +940,7 @@ fn published_udp_preserves_peers_datagrams_and_transport_isolation() {
         ],
         "workload": {"entrypoint": "/bin/sleep", "args": ["infinity"]},
     });
-    std::fs::write(&recipe, serde_json::to_vec(&configuration).unwrap()).unwrap();
+    std::fs::write(&recipe, serde_json::to_vec(&recipe_json).unwrap()).unwrap();
     let project = project.to_str().unwrap();
     assert_eq!(
         suite
@@ -1139,12 +1144,12 @@ fn native_tcp_reset_after_fin_preserves_the_socket_error() {
         rustix::net::sockopt::set_socket_linger(&stream, Some(Duration::ZERO)).unwrap();
     });
     let recipe = suite.get_work_dir().join("socket-reset-after-fin.yaml");
-    let configuration = serde_json::json!({
+    let recipe_json = serde_json::json!({
         "network": {"allow": [format!("HOST_LOOPBACK:{port}")]},
         "mounts": [{"host": probe.parent().unwrap(), "guest": "/work", "readonly": true}],
         "workload": {"entrypoint": "/work/terra-socket-probe", "args": ["--reset-after-fin", "100.96.0.1", port.to_string()]},
     });
-    std::fs::write(&recipe, serde_json::to_vec(&configuration).unwrap()).unwrap();
+    std::fs::write(&recipe, serde_json::to_vec(&recipe_json).unwrap()).unwrap();
     let output = suite.boot_recipe(
         &recipe,
         "socket-reset-after-fin",
@@ -1260,7 +1265,7 @@ fn run_boot_suite() {
         "wildcard reached the apex:\n{out}"
     );
 
-    // == on_create: baked once, stamped in the guest, skipped after ==
+    // == on_create: runs once on the fresh root, never again ==
     let first = s.boot("bake", &[]);
     let second = s.boot("bake", &[]);
     let when = |out: &str| {
@@ -1268,15 +1273,84 @@ fn run_boot_suite() {
             .find_map(|l| l.strip_prefix("WHEN=").map(str::to_owned))
     };
     assert!(
-        first.contains("STAMP=mkdir -p /opt/baked;"),
-        "the recipe is not stamped inside the guest:\n{first}"
-    );
-    assert!(
         when(&first).is_some() && when(&first) == when(&second),
         "on_create re-ran: {:?} vs {:?}",
         when(&first),
         when(&second)
     );
+    let edited_dir = s.create_project_dir("bake-edited");
+    let edited = edited_dir.join("bake.yaml");
+    let source = std::fs::read_to_string(assets_dir().join("bake.yaml")).unwrap();
+    std::fs::write(
+        &edited,
+        source.replace("mkdir -p /opt/baked", "mkdir -p /opt/baked2"),
+    )
+    .unwrap();
+    let bake_project = s.get_work_dir().join("bake");
+    let resetup = s.run_terra_output(&[
+        edited.to_str().unwrap(),
+        "setup",
+        "--project",
+        bake_project.to_str().unwrap(),
+    ]);
+    let resetup_stderr = String::from_utf8_lossy(&resetup.stderr);
+    assert!(resetup.status.success(), "{resetup_stderr}");
+    assert!(
+        resetup_stderr.contains("--rebuild"),
+        "a changed on_create went unreported:\n{resetup_stderr}"
+    );
+    let third = s.run_terra_command(&[
+        "bake",
+        "--foreground",
+        "--project",
+        bake_project.to_str().unwrap(),
+    ]);
+    assert!(
+        when(&third) == when(&first),
+        "setup re-ran on_create on an existing root: {:?} vs {:?}",
+        when(&third),
+        when(&first)
+    );
+
+    // == a setup whose on_create fails leaves an unstamped root; the next one replaces it ==
+    let flaky_project = s.create_project_dir("flaky");
+    let flaky = s.get_work_dir().join("flaky.yaml");
+    std::fs::write(
+        &flaky,
+        "hooks:\n  on_create:\n    - touch /leftover\n    - \"false\"\n",
+    )
+    .unwrap();
+    let flaky_args = [
+        flaky.to_str().unwrap(),
+        "setup",
+        "--project",
+        flaky_project.to_str().unwrap(),
+    ];
+    assert_ne!(
+        s.run_terra_status(&flaky_args).1,
+        0,
+        "a failing on_create passed setup"
+    );
+    let flaky_files = s.get_box_files_path("flaky");
+    assert!(flaky_files.join("rootfs.img").exists());
+    assert!(!flaky_files.join("setup-finished").exists());
+    std::fs::write(
+        &flaky,
+        "hooks:\n  on_create:\n    - test ! -e /leftover\n    - echo cleaned > /baked\nworkload:\n  entrypoint: /bin/cat\n  args: [/baked]\n",
+    )
+    .unwrap();
+    assert_eq!(
+        s.run_terra_status(&flaky_args).1,
+        0,
+        "setup did not start from a clean root"
+    );
+    let flaky_boot = s.run_terra_command(&[
+        "flaky",
+        "--foreground",
+        "--project",
+        flaky_project.to_str().unwrap(),
+    ]);
+    assert!(flaky_boot.contains("cleaned"), "{flaky_boot}");
 
     // == ports + isolation: one VM publishes, another reaches it via hosts ==
     let server = s.create_project_dir("server");

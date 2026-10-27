@@ -45,7 +45,7 @@ fn volume_disk_paths(spec: &BootSpec, bx: &BoxRef) -> Vec<std::path::PathBuf> {
     if spec.mode == PlanMode::Create {
         return Vec::new();
     }
-    spec.cfg
+    spec.recipe
         .volumes
         .iter()
         .map(|volume| bx.get_volume_image_path(&volume.name))
@@ -68,7 +68,7 @@ fn open_shares(spec: &BootSpec) -> Result<Vec<ShareGrant>> {
         return Ok(Vec::new());
     }
 
-    let mounts = &spec.cfg.mounts;
+    let mounts = &spec.recipe.mounts;
     let mut grants = Vec::with_capacity(mounts.len());
     for (index, mount) in mounts.iter().enumerate() {
         #[cfg(not(windows))]
@@ -149,7 +149,7 @@ pub async fn run(
     on_ready: impl FnOnce() + Send,
 ) -> Result<ExitCode> {
     prepare_vm_process(bx, spec.mode)?;
-    let component_memory_limits = spec.cfg.components.memory_limits()?;
+    let component_memory_limits = spec.recipe.components.memory_limits()?;
 
     let kernel = image::load_kernel()?;
     let boot_disk = image::load_boot_image()?;
@@ -159,7 +159,7 @@ pub async fn run(
     let shares = open_shares(spec)?;
     let listener = Some(agent_listener(bx)?);
     let port_mappings = if spec.mode == PlanMode::Run {
-        rules::parse_port_mappings(&spec.cfg.network.ports)?
+        rules::parse_port_mappings(&spec.recipe.network.ports)?
     } else {
         Vec::new()
     };
@@ -172,8 +172,8 @@ pub async fn run(
         } else {
             "starting"
         },
-        spec.cfg.hw.cpus,
-        spec.cfg.hw.mem_mib
+        spec.recipe.hw.cpus,
+        spec.recipe.hw.mem_mib
     );
     let diagnostics_path = bx.get_dir().join(crate::state::DIAGNOSTICS_LOG);
     let diagnostics = Some(sys::create_regular_file(&diagnostics_path)?);
@@ -206,8 +206,8 @@ pub async fn run(
         artifacts: ARTIFACTS,
         network_backend,
         port_mappings,
-        ram_bytes: u64::from(spec.cfg.hw.mem_mib) << 20,
-        vcpus: usize::from(spec.cfg.hw.cpus),
+        ram_bytes: u64::from(spec.recipe.hw.mem_mib) << 20,
+        vcpus: usize::from(spec.recipe.hw.cpus),
         deadline: None,
         hard_stop: Some(std::process::abort),
         listener,
@@ -239,7 +239,7 @@ pub async fn run(
 fn prepare_network_backend(
     spec: &BootSpec,
 ) -> Result<Option<terra_runtime::component::network::NetworkBackend>> {
-    if !spec.cfg.network.enabled {
+    if !spec.recipe.network.enabled {
         anyhow::ensure!(
             spec.network_broker.is_none(),
             "local-only VM received network broker metadata"
@@ -264,22 +264,22 @@ fn prepare_network_backend(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, Mount};
+    use crate::recipe::{Mount, Recipe};
     use std::path::{Path, PathBuf};
 
     #[test]
     fn setup_attaches_no_volume_disks() {
         let bx = BoxRef::from_state_dir(PathBuf::from("/box"), Path::new("/project"));
         let mut spec = BootSpec {
-            cfg: Config {
-                volumes: vec![crate::config::Volume {
+            recipe: Recipe {
+                volumes: vec![crate::recipe::Volume {
                     name: "scratch".into(),
                     guest: Some("/scratch".into()),
                     rootfs_overlay: false,
                     size_mib: 8,
-                    lifetime: crate::config::VolumeLifetime::Boot,
+                    lifetime: crate::recipe::VolumeLifetime::Boot,
                 }],
-                ..Config::default()
+                ..Recipe::default()
             },
             project_dir: PathBuf::from("/project"),
             root: false,
@@ -382,7 +382,7 @@ mod tests {
     #[test]
     fn broker_absence_requires_local_only_configuration() {
         let mut spec = BootSpec {
-            cfg: Config::default(),
+            recipe: Recipe::default(),
             project_dir: PathBuf::from("/project"),
             root: false,
             mode: PlanMode::Run,
@@ -396,7 +396,7 @@ mod tests {
                 .to_string()
                 .contains("missing VM network broker metadata")
         );
-        spec.cfg.network.enabled = false;
+        spec.recipe.network.enabled = false;
         assert!(prepare_network_backend(&spec).unwrap().is_none());
         assert!(super::super::supervisor::build_broker_config(&spec).is_err());
         spec.network_broker = Some(super::super::boot::BrokerMetadata {
@@ -430,13 +430,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
         let spec = BootSpec {
-            cfg: Config {
+            recipe: Recipe {
                 mounts: vec![Mount {
                     host: root,
                     guest: PathBuf::from("/work"),
                     readonly: true,
                 }],
-                ..Config::default()
+                ..Recipe::default()
             },
             project_dir: PathBuf::from("/project"),
             root: false,
@@ -465,13 +465,13 @@ mod tests {
         std::fs::create_dir(&share).unwrap();
         std::fs::create_dir(bx.get_dir()).unwrap();
         let spec = BootSpec {
-            cfg: Config {
+            recipe: Recipe {
                 mounts: vec![Mount {
                     host: share.clone(),
                     guest: PathBuf::from("/data"),
                     readonly: false,
                 }],
-                ..Config::default()
+                ..Recipe::default()
             },
             project_dir,
             root: false,
@@ -491,7 +491,7 @@ mod tests {
         let child = share.join("child");
         std::fs::create_dir(&child).unwrap();
         let mut spec = spec;
-        spec.cfg.mounts[0].host = child;
+        spec.recipe.mounts[0].host = child;
         assert!(open_shares(&spec).is_ok());
         std::fs::remove_dir_all(&share).unwrap();
         std::fs::create_dir(bx.get_dir().join("child")).unwrap();
@@ -502,13 +502,13 @@ mod tests {
     #[test]
     fn setup_boot_has_no_host_shares() {
         let spec = BootSpec {
-            cfg: Config {
+            recipe: Recipe {
                 mounts: vec![Mount {
                     host: PathBuf::from("/not-opened-for-a-setup-boot"),
                     guest: PathBuf::from("/work"),
                     readonly: false,
                 }],
-                ..Config::default()
+                ..Recipe::default()
             },
             project_dir: PathBuf::from("/project"),
             root: false,

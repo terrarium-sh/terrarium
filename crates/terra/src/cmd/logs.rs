@@ -140,7 +140,11 @@ fn write_log(
 ) -> anyhow::Result<ExitCode> {
     use anyhow::Context as _;
     use std::io::Write as _;
-    let bx = &crate::resolve::resolve_pinned_box(project_dir, name)?;
+    let bx = &crate::recipe::resolve::resolve_box(
+        name,
+        project_dir,
+        crate::recipe::resolve::Existence::MustExist,
+    )?;
     let log = bx.get_dir().join(if args.diagnostics {
         crate::state::DIAGNOSTICS_LOG
     } else {

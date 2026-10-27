@@ -358,9 +358,21 @@ run probe storage prune
 restarted=$(output probe --foreground --root -- sh -e /suite/guest/storage-restart.sh)
 expect_contains "$restarted" RESTART_OK
 expect_contains "$restarted" STOP_OK
-run probe storage import "$work/storage.terra"
-run probe setup
+if refused=$(output probe storage import "$work/storage.terra"); then
+  note "import without --trust-recipe succeeded"
+  false
+fi
+expect_contains "$refused" gate.test
+expect_contains "$refused" --trust-recipe
+run probe storage import --trust-recipe "$work/storage.terra"
 expect_contains "$(output probe --foreground -- \
+  sh -ec 'test $(cat /data/value) = PERSISTED; echo RESTORED_OK')" RESTORED_OK
+imported="$work/imported"
+mkdir -p "$imported/work" "$imported/readonly"
+cp -R "$project/suite" "$imported/suite"
+run --project "$imported" probe storage import --trust-recipe "$work/storage.terra"
+expect_contains "$(output --project "$imported" ls --state stopped --quiet)" probe
+expect_contains "$(output --project "$imported" probe --foreground -- \
   sh -ec 'test $(cat /data/value) = PERSISTED; echo RESTORED_OK')" RESTORED_OK
 passed
 
@@ -380,6 +392,7 @@ if bake=$(output ./bad-bake.yaml setup); then
 fi
 expect_contains "$bake" FAILED_BAKE
 expect_contains "$(output bad-bake logs --diagnostics)" "init failed"
+expect_listed bad-bake needs_setup
 passed
 
 begin "rm discards the box, --purge forgets it"

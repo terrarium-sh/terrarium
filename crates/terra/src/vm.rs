@@ -26,7 +26,7 @@ mod resources;
 
 use self::boot::BootSpec;
 use crate::policy::network;
-use crate::render::{format_workload_line, redact_config_env, render_config_yaml};
+use crate::render::{format_workload_line, redact_recipe_env, render_recipe_yaml};
 #[cfg(not(any(
     all(
         target_os = "linux",
@@ -96,19 +96,19 @@ pub(crate) fn encode_boot_plan(spec: &BootSpec, box_name: &str) -> Result<Vec<u8
 }
 
 pub(crate) fn rootfs_access(spec: &BootSpec) -> AccessMode {
-    if spec.mode == PlanMode::Run && spec.cfg.hw.rootfs_readonly {
+    if spec.mode == PlanMode::Run && spec.recipe.hw.rootfs_readonly {
         AccessMode::ReadOnly
     } else {
         AccessMode::ReadWrite
     }
 }
 
-/// The resolved config the agent runs as PID 1.
+/// The plan the agent runs as PID 1, resolved from the recipe.
 fn build_plan(spec: &BootSpec, box_name: &str) -> Result<Plan> {
-    let cfg = &spec.cfg;
+    let recipe = &spec.recipe;
     let is_setup_boot = spec.mode == PlanMode::Create;
     let is_root = spec.root || is_setup_boot;
-    let shares = cfg
+    let shares = recipe
         .mounts
         .iter()
         .enumerate()
@@ -123,7 +123,7 @@ fn build_plan(spec: &BootSpec, box_name: &str) -> Result<Plan> {
             .with_context(|| format!("volume {index} is past the last guest block device"))
     };
     let mut volumes = Vec::new();
-    for (index, volume) in cfg.volumes.iter().enumerate() {
+    for (index, volume) in recipe.volumes.iter().enumerate() {
         if let Some(guest) = &volume.guest {
             volumes.push(Disk {
                 dev: get_volume_device(index)?,
@@ -133,7 +133,11 @@ fn build_plan(spec: &BootSpec, box_name: &str) -> Result<Plan> {
     }
     let rootfs = match rootfs_access(spec) {
         AccessMode::ReadWrite => RootfsMount::Writable,
-        AccessMode::ReadOnly => match cfg.volumes.iter().position(|volume| volume.rootfs_overlay) {
+        AccessMode::ReadOnly => match recipe
+            .volumes
+            .iter()
+            .position(|volume| volume.rootfs_overlay)
+        {
             Some(index) => RootfsMount::Overlay {
                 upper_dev: get_volume_device(index)?,
             },
@@ -144,7 +148,7 @@ fn build_plan(spec: &BootSpec, box_name: &str) -> Result<Plan> {
     let published_mappings = if is_setup_boot {
         Vec::new()
     } else {
-        network::rules::parse_port_mappings(&cfg.network.ports)?
+        network::rules::parse_port_mappings(&recipe.network.ports)?
     };
     let (mut published_ports, mut published_udp_ports) = (Vec::new(), Vec::new());
     for mapping in published_mappings {
@@ -160,31 +164,31 @@ fn build_plan(spec: &BootSpec, box_name: &str) -> Result<Plan> {
     let plan = Plan {
         mode: spec.mode,
         hostname: crate::name::box_hostname(box_name),
-        workdir: cfg
+        workdir: recipe
             .workload
             .workdir
             .as_ref()
             .map(|p| p.to_string_lossy().into_owned()),
         shares,
         volumes,
-        net: if cfg.network.enabled {
+        net: if recipe.network.enabled {
             Net::Tsi
         } else {
             Net::LocalOnly
         },
         published_ports,
         published_udp_ports,
-        env: cfg.env.clone(),
+        env: recipe.env.clone(),
         root: is_root,
         rootfs,
-        sudo: cfg.sudo.clone(),
-        on_create: cfg.hooks.on_create.clone(),
-        on_start: cfg.hooks.on_start.clone(),
-        pre_stop: cfg.hooks.pre_stop.clone(),
-        daemons: cfg.daemons.clone(),
+        sudo: recipe.sudo.clone(),
+        on_create: recipe.hooks.on_create.clone(),
+        on_start: recipe.hooks.on_start.clone(),
+        pre_stop: recipe.hooks.pre_stop.clone(),
+        daemons: recipe.daemons.clone(),
         await_initial_session: spec.foreground || spec.mode == PlanMode::Create,
-        workload: std::iter::once(cfg.workload.entrypoint.to_string_lossy().into_owned())
-            .chain(cfg.workload.args.iter().cloned())
+        workload: std::iter::once(recipe.workload.entrypoint.to_string_lossy().into_owned())
+            .chain(recipe.workload.args.iter().cloned())
             .collect(),
         sandbox_info,
         host_tz: read_host_timezone(),
@@ -199,8 +203,8 @@ fn build_plan(spec: &BootSpec, box_name: &str) -> Result<Plan> {
 /// around the box finds an explanation instead of guessing.
 #[must_use]
 fn generate_sandbox_info(spec: &BootSpec, rootfs: &RootfsMount) -> String {
-    let cfg = &spec.cfg;
-    let yaml = render_config_yaml(&redact_config_env(cfg)).unwrap_or_default();
+    let recipe = &spec.recipe;
+    let yaml = render_recipe_yaml(&redact_recipe_env(recipe)).unwrap_or_default();
     let who = if spec.root || spec.mode == PlanMode::Create {
         "`root`".to_string()
     } else {
@@ -237,10 +241,10 @@ fn generate_sandbox_info(spec: &BootSpec, rootfs: &RootfsMount) -> String {
                  else you write stays inside the sandbox."
             }
         },
-        cmd = format_workload_line(cfg),
+        cmd = format_workload_line(recipe),
         yaml = yaml,
-        egress = network::describe(&cfg.network),
-        network_mode = if cfg.network.enabled {
+        egress = network::describe(&recipe.network),
+        network_mode = if recipe.network.enabled {
             "External TCP and UDP use the filtered network vsock connection. DNS uses the guest resolver at `127.0.0.53`."
         } else {
             "Local-only networking: external connections and DNS resolution are disabled."
@@ -251,14 +255,14 @@ fn generate_sandbox_info(spec: &BootSpec, rootfs: &RootfsMount) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config;
+    use crate::recipe::{Mount, Recipe, Volume, VolumeLifetime};
     use std::assert_matches;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
-    fn build_run_spec(cfg: config::Config) -> BootSpec {
+    fn build_run_spec(recipe: Recipe) -> BootSpec {
         BootSpec {
-            cfg,
+            recipe,
             project_dir: PathBuf::from("/project"),
             root: false,
             mode: PlanMode::Run,
@@ -285,12 +289,12 @@ mod tests {
     /// read-only, the workload user's, and shared with the host.
     #[test]
     fn sandbox_info_describes_the_boot_not_just_the_recipe() {
-        let mut cfg: config::Config = yaml_serde::from_str("{}").unwrap();
-        cfg.hw.rootfs_readonly = true;
+        let mut recipe: Recipe = yaml_serde::from_str("{}").unwrap();
+        recipe.hw.rootfs_readonly = true;
         let info = |mode| {
             build_plan(
                 &BootSpec {
-                    cfg: cfg.clone(),
+                    recipe: recipe.clone(),
                     project_dir: PathBuf::from("/project"),
                     root: false,
                     mode,
@@ -321,14 +325,14 @@ mod tests {
     /// match the boot: writes to a read-only root fail, they do not persist.
     #[test]
     fn sandbox_info_says_whether_the_root_keeps_writes() {
-        let mut spec = build_run_spec(config::Config::default());
+        let mut spec = build_run_spec(Recipe::default());
         let writable = build_plan(&spec, "dev").unwrap().sandbox_info;
         assert!(
             writable.contains("It PERSISTS across restarts"),
             "{writable}"
         );
         assert!(!writable.contains("READ-ONLY"), "{writable}");
-        spec.cfg.hw.rootfs_readonly = true;
+        spec.recipe.hw.rootfs_readonly = true;
         let readonly = build_plan(&spec, "dev").unwrap().sandbox_info;
         assert!(
             readonly.contains("READ-ONLY: every write to it fails with EROFS"),
@@ -338,15 +342,15 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_info_carries_the_resolved_config_as_yaml() {
-        let mut cfg: config::Config =
+    fn sandbox_info_carries_the_resolved_recipe_as_yaml() {
+        let mut recipe: Recipe =
             yaml_serde::from_str("workload:\n  entrypoint: /bin/sh\n  args: [-c, make]\n").unwrap();
-        cfg.mounts = vec![config::Mount {
+        recipe.mounts = vec![Mount {
             host: PathBuf::from("/srv/models"),
             guest: PathBuf::from("/models"),
             readonly: true,
         }];
-        let mut spec = build_run_spec(cfg);
+        let mut spec = build_run_spec(recipe);
         let info = build_plan(&spec, "dev").unwrap().sandbox_info;
         assert!(info.contains("# Terrarium sandbox"));
         assert!(info.contains("`/bin/sh -c make`"));
@@ -367,15 +371,15 @@ mod tests {
     }
 
     /// The plan is the guest's whole contract: exec line in exec order, env in
-    /// the plan and only there, devices and stop mode as configured.
+    /// the plan and only there, devices and stop mode as the recipe sets them.
     #[test]
-    fn the_plan_carries_the_resolved_config() {
-        let mut cfg: config::Config =
+    fn the_plan_carries_the_resolved_recipe() {
+        let mut recipe: Recipe =
             yaml_serde::from_str("workload:\n  entrypoint: /bin/sh\n  args: [-c, make]\n").unwrap();
-        cfg.env = BTreeMap::from([("API_KEY".to_string(), "sk-super-secret".to_string())]);
-        cfg.daemons = vec!["ascend --serve".into()];
+        recipe.env = BTreeMap::from([("API_KEY".to_string(), "sk-super-secret".to_string())]);
+        recipe.daemons = vec!["ascend --serve".into()];
         let spec = BootSpec {
-            cfg,
+            recipe,
             project_dir: PathBuf::from("/proj"),
             root: false,
             mode: PlanMode::Run,
@@ -384,17 +388,17 @@ mod tests {
             network_broker: None,
         };
         let mut spec = spec;
-        spec.cfg.mounts = vec![config::Mount {
+        spec.recipe.mounts = vec![Mount {
             host: "/host/work".into(),
             guest: "/work".into(),
             readonly: true,
         }];
-        spec.cfg.volumes = vec![config::Volume {
+        spec.recipe.volumes = vec![Volume {
             name: "data".into(),
             guest: Some("/data".into()),
             rootfs_overlay: false,
             size_mib: 1,
-            lifetime: config::VolumeLifetime::Box,
+            lifetime: VolumeLifetime::Box,
         }];
         let plan = build_plan(&spec, "My_Box").unwrap();
 
@@ -409,7 +413,7 @@ mod tests {
         assert_eq!(plan.volumes[0].dev, "/dev/vdc");
         assert_eq!(plan.volumes[0].guest, "/data");
         assert_eq!(plan.net, Net::Tsi);
-        spec.cfg.network.enabled = false;
+        spec.recipe.network.enabled = false;
         assert_eq!(build_plan(&spec, "dev").unwrap().net, Net::LocalOnly);
         let foreground = BootSpec {
             foreground: true,
@@ -423,15 +427,15 @@ mod tests {
     /// points in the base from the plan's share list.
     #[test]
     fn a_setup_plan_names_the_shares_and_publishes_no_ports() {
-        let mut cfg: config::Config = yaml_serde::from_str("{}").unwrap();
-        cfg.mounts = vec![config::Mount {
+        let mut recipe: Recipe = yaml_serde::from_str("{}").unwrap();
+        recipe.mounts = vec![Mount {
             host: "/host/work".into(),
             guest: "/work".into(),
             readonly: false,
         }];
-        cfg.network.ports = vec!["8080:80".into()];
+        recipe.network.ports = vec!["8080:80".into()];
         let spec = BootSpec {
-            cfg,
+            recipe,
             project_dir: PathBuf::from("/proj"),
             root: false,
             mode: PlanMode::Create,
@@ -449,10 +453,10 @@ mod tests {
     #[test]
     fn only_a_run_boot_of_a_read_only_box_gets_a_read_only_root() {
         let spec = |mode, rootfs_readonly| {
-            let mut cfg: config::Config = yaml_serde::from_str("{}").unwrap();
-            cfg.hw.rootfs_readonly = rootfs_readonly;
+            let mut recipe: Recipe = yaml_serde::from_str("{}").unwrap();
+            recipe.hw.rootfs_readonly = rootfs_readonly;
             BootSpec {
-                cfg,
+                recipe,
                 project_dir: PathBuf::from("/project"),
                 root: false,
                 mode,
@@ -486,7 +490,7 @@ mod tests {
     #[test]
     fn a_setup_boot_waits_for_its_console_before_running_hooks() {
         let spec = BootSpec {
-            cfg: yaml_serde::from_str("{}").unwrap(),
+            recipe: yaml_serde::from_str("{}").unwrap(),
             project_dir: PathBuf::from("/proj"),
             root: false,
             mode: PlanMode::Create,
@@ -504,7 +508,7 @@ mod tests {
     #[test]
     fn a_setup_boot_is_guest_root_and_a_workload_boot_is_not() {
         let spec = |root, mode| BootSpec {
-            cfg: yaml_serde::from_str("{}").unwrap(),
+            recipe: yaml_serde::from_str("{}").unwrap(),
             project_dir: PathBuf::from("/proj"),
             root,
             mode,
@@ -525,11 +529,11 @@ mod tests {
     /// useful, values would hand the recipe's secrets to all of them.
     #[test]
     fn sandbox_info_names_env_vars_without_their_values() {
-        let cfg = config::Config {
+        let recipe = Recipe {
             env: BTreeMap::from([("API_KEY".to_string(), "sk-super-secret".to_string())]),
             ..yaml_serde::from_str("{}").unwrap()
         };
-        let info = build_plan(&build_run_spec(cfg), "dev")
+        let info = build_plan(&build_run_spec(recipe), "dev")
             .unwrap()
             .sandbox_info;
         assert!(info.contains("API_KEY"), "the name should still be shown");
@@ -537,22 +541,22 @@ mod tests {
     }
 
     fn overlay_spec(mode: PlanMode) -> BootSpec {
-        let volume = |name: &str, guest: Option<&str>| config::Volume {
+        let volume = |name: &str, guest: Option<&str>| Volume {
             name: name.into(),
             guest: guest.map(PathBuf::from),
             rootfs_overlay: guest.is_none(),
             size_mib: 64,
-            lifetime: config::VolumeLifetime::Boot,
+            lifetime: VolumeLifetime::Boot,
         };
-        let mut cfg = config::Config::default();
-        cfg.hw.rootfs_readonly = true;
-        cfg.volumes = vec![
+        let mut recipe = Recipe::default();
+        recipe.hw.rootfs_readonly = true;
+        recipe.volumes = vec![
             volume("before", Some("/before")),
             volume("changes", None),
             volume("after", Some("/after")),
         ];
         BootSpec {
-            cfg,
+            recipe,
             project_dir: PathBuf::from("/project"),
             root: false,
             mode,

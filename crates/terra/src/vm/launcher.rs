@@ -23,7 +23,7 @@ pub(super) fn prepare_vm_launch(
     #[cfg(windows)]
     {
         if spec.mode == terra_protocol::PlanMode::Run {
-            for (index, mount) in spec.cfg.mounts.iter().enumerate() {
+            for (index, mount) in spec.recipe.mounts.iter().enumerate() {
                 let identity = granted_directory_identity(&grants, &mount.host)?;
                 command.env(
                     format!("TERRA_WINDOWS_MOUNT_ID_{index}"),
@@ -65,7 +65,7 @@ fn build_sandbox_grants(spec: &BootSpec, bx: &BoxRef) -> Result<Vec<Grant>> {
     );
     let mut grants = Vec::new();
     if spec.mode == terra_protocol::PlanMode::Run {
-        for share in &spec.cfg.mounts {
+        for share in &spec.recipe.mounts {
             let mut grant = Grant::new(
                 &share.host,
                 if share.readonly {
@@ -86,7 +86,7 @@ fn build_sandbox_grants(spec: &BootSpec, bx: &BoxRef) -> Result<Vec<Grant>> {
     #[cfg(any(target_os = "macos", windows))]
     {
         // Windows grants are DACL entries on every object beneath the path, so a directory
-        // grant would expose stale volumes and logs the box configuration no longer names.
+        // grant would expose stale volumes and logs the box's recipe no longer names.
         #[cfg(target_os = "macos")]
         grants.push(Grant::new(bx.get_dir(), Access::ReadOnly));
         grants.push(Grant::new(
@@ -104,7 +104,7 @@ fn build_sandbox_grants(spec: &BootSpec, bx: &BoxRef) -> Result<Vec<Grant>> {
             Access::ReadWrite,
         ));
         if spec.mode == terra_protocol::PlanMode::Run {
-            for volume in &spec.cfg.volumes {
+            for volume in &spec.recipe.volumes {
                 grants.push(Grant::new(
                     bx.get_volume_image_path(&volume.name),
                     Access::ReadWrite,
@@ -144,7 +144,7 @@ fn build_sandbox_grants(spec: &BootSpec, bx: &BoxRef) -> Result<Vec<Grant>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config;
+    use crate::recipe::{Mount, Recipe, Volume, VolumeLifetime};
     use terra_protocol::PlanMode;
 
     #[test]
@@ -159,17 +159,17 @@ mod tests {
         std::fs::write(&recipe, "{}").unwrap();
         let bx = BoxRef::from_state_dir(box_dir, &base);
         let mut spec = spec(&base, terra_protocol::PlanMode::Run);
-        spec.cfg.mounts.push(config::Mount {
+        spec.recipe.mounts.push(Mount {
             host: share.clone(),
             guest: "/share".into(),
             readonly: true,
         });
-        spec.cfg.volumes.push(config::Volume {
+        spec.recipe.volumes.push(Volume {
             name: "scratch".into(),
             guest: Some("/scratch".into()),
             rootfs_overlay: false,
             size_mib: 8,
-            lifetime: config::VolumeLifetime::Boot,
+            lifetime: VolumeLifetime::Boot,
         });
         let grants = build_sandbox_grants(&spec, &bx).unwrap();
         assert!(grants.iter().any(|grant| {
@@ -227,7 +227,7 @@ mod tests {
         let rootfs = bx.get_dir().join(state::ROOTFS_FILE);
         let rootfs_grant = |mode, rootfs_readonly| {
             let mut spec = spec(&base, mode);
-            spec.cfg.hw.rootfs_readonly = rootfs_readonly;
+            spec.recipe.hw.rootfs_readonly = rootfs_readonly;
             build_sandbox_grants(&spec, &bx)
                 .unwrap()
                 .into_iter()
@@ -242,7 +242,7 @@ mod tests {
 
     fn spec(project_dir: &Path, mode: PlanMode) -> BootSpec {
         BootSpec {
-            cfg: config::Config::default(),
+            recipe: Recipe::default(),
             project_dir: project_dir.to_path_buf(),
             root: false,
             mode,

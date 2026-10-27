@@ -1,5 +1,7 @@
-//! Parse and validate a YAML recipe into a [`Config`]
+//! A box's recipe: the YAML a person writes, parsed and validated into a [`Recipe`]
 
+mod load;
+pub(crate) mod resolve;
 #[cfg(test)]
 mod tests;
 mod validate;
@@ -14,7 +16,7 @@ use validate::{validate, validate_env};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
-pub struct Config {
+pub struct Recipe {
     pub hw: Hw,
     pub components: Components,
     pub mounts: Vec<Mount>,
@@ -328,7 +330,7 @@ pub fn load_manifest(project_dir: &Path) -> Result<Option<Manifest>> {
             });
         }
     };
-    let manifest: Manifest = yaml_serde::from_str(&text)
+    let mut manifest: Manifest = yaml_serde::from_str(&text)
         .map_err(|error| escape_yaml_error(&error))
         .with_context(|| {
             format!(
@@ -336,18 +338,28 @@ pub fn load_manifest(project_dir: &Path) -> Result<Option<Manifest>> {
                 crate::render::escape_printable_path(&path)
             )
         })?;
-    for (name, reference) in &manifest.boxes {
-        crate::name::validate_box_name(name)
+    let mut boxes = BTreeMap::new();
+    for (name, reference) in std::mem::take(&mut manifest.boxes) {
+        crate::name::validate_box_name(&name)
             .with_context(|| format!("in {}", crate::render::escape_printable_path(&path)))?;
-        if !crate::resolve::is_path(reference) {
-            let reference = crate::render::escape_printable(reference);
+        if !crate::recipe::resolve::is_path(&reference) {
+            let reference = crate::render::escape_printable(&reference);
             bail!(
                 "box '{name}' in {} points at '{reference}', which is not a recipe path \
                  (a reference is a path, e.g. ./{reference}.yaml)",
                 crate::render::escape_printable_path(&path)
             );
         }
+        let normalized = crate::name::normalize_box_name(&name);
+        if boxes.insert(normalized.clone(), reference).is_some() {
+            bail!(
+                "{} names box '{normalized}' twice, in different cases - box names are \
+                 case-insensitive, so keep one",
+                crate::render::escape_printable_path(&path)
+            );
+        }
     }
+    manifest.boxes = boxes;
     Ok(Some(manifest))
 }
 
@@ -372,14 +384,14 @@ pub fn load_manifest_or_warn(project_dir: &Path) -> Option<Manifest> {
     }
 }
 
-pub fn load_path(path: &Path, project_dir: &Path) -> Result<Config> {
+pub fn load_path(path: &Path, project_dir: &Path) -> Result<Recipe> {
     let text = read_recipe_text(path)
         .with_context(|| format!("reading {}", crate::render::escape_printable_path(path)))?;
     parse_recipe(&text, project_dir, path)
 }
 
-pub fn parse_recipe(text: &str, project_dir: &Path, source: &Path) -> Result<Config> {
-    let mut cfg: Config = yaml_serde::from_str(text)
+pub fn parse_recipe(text: &str, project_dir: &Path, source: &Path) -> Result<Recipe> {
+    let mut recipe: Recipe = yaml_serde::from_str(text)
         .map_err(|error| escape_yaml_error(&error))
         .with_context(|| {
             format!(
@@ -387,17 +399,17 @@ pub fn parse_recipe(text: &str, project_dir: &Path, source: &Path) -> Result<Con
                 crate::render::escape_printable_path(source)
             )
         })?;
-    for mount in &mut cfg.mounts {
+    for mount in &mut recipe.mounts {
         mount.host = resolve_recipe_path(&mount.host, project_dir)?;
     }
-    if let Some(file) = &cfg.env_file {
-        cfg.env_file = Some(resolve_recipe_path(file, project_dir)?);
+    if let Some(file) = &recipe.env_file {
+        recipe.env_file = Some(resolve_recipe_path(file, project_dir)?);
     }
-    let volume_paths = cfg
+    let volume_paths = recipe
         .volumes
         .iter_mut()
         .filter_map(|volume| volume.guest.as_mut());
-    for path in cfg
+    for path in recipe
         .mounts
         .iter_mut()
         .map(|mount| &mut mount.guest)
@@ -405,11 +417,11 @@ pub fn parse_recipe(text: &str, project_dir: &Path, source: &Path) -> Result<Con
     {
         *path = normalize_guest_path(path)?;
     }
-    for command in &mut cfg.sudo {
+    for command in &mut recipe.sudo {
         *command = command.trim().to_string();
     }
-    validate(&cfg)?;
-    Ok(cfg)
+    validate(&recipe)?;
+    Ok(recipe)
 }
 
 fn normalize_guest_path(path: &Path) -> Result<PathBuf> {
@@ -483,8 +495,8 @@ pub(crate) fn list_declared_writable_shares(
 
 /// Merge `env_file:` over `env:` - the file wins - warning on a name set in
 /// both.
-pub(crate) fn merge_env_file(cfg: &mut Config) -> Result<()> {
-    let Some(path) = cfg.env_file.as_ref() else {
+pub(crate) fn merge_env_file(recipe: &mut Recipe) -> Result<()> {
+    let Some(path) = recipe.env_file.as_ref() else {
         return Ok(());
     };
     let mut text = String::new();
@@ -519,7 +531,11 @@ pub(crate) fn merge_env_file(cfg: &mut Config) -> Result<()> {
         // Only a value the merge actually changes is worth a word: the same
         // name set to the same thing in both is a recipe stating what the
         // dotenv already says, not an override anyone loses.
-        if cfg.env.get(k).is_some_and(|from_recipe| from_recipe != v) {
+        if recipe
+            .env
+            .get(k)
+            .is_some_and(|from_recipe| from_recipe != v)
+        {
             eprintln!(
                 "terra: warning: env variable '{}' is set in both env: and \
                  env_file: {} - the env_file wins",
@@ -527,16 +543,16 @@ pub(crate) fn merge_env_file(cfg: &mut Config) -> Result<()> {
                 crate::render::escape_printable_path(path)
             );
         }
-        cfg.env.insert(k.to_string(), v.to_string());
+        recipe.env.insert(k.to_string(), v.to_string());
     }
-    validate_env(&cfg.env)
+    validate_env(&recipe.env)
 }
 
-pub(crate) fn resolve_env_file(cfg: &mut Config) -> Result<()> {
-    let Some(path) = cfg.env_file.as_ref() else {
+pub(crate) fn resolve_env_file(recipe: &mut Recipe) -> Result<()> {
+    let Some(path) = recipe.env_file.as_ref() else {
         return Ok(());
     };
-    cfg.env_file = Some(std::fs::canonicalize(path).with_context(|| {
+    recipe.env_file = Some(std::fs::canonicalize(path).with_context(|| {
         format!(
             "resolving env file {}",
             crate::render::escape_printable_path(path)
@@ -547,7 +563,7 @@ pub(crate) fn resolve_env_file(cfg: &mut Config) -> Result<()> {
 
 /// Where a path written in a recipe or a `terra.yaml` lands: `~` expanded, then
 /// made absolute against `source_dir` - the directory that file belongs to,
-/// never the shell's (see [`crate::resolve`]). The one spelling of the
+/// never the shell's (see [`resolve`]). The one spelling of the
 /// rule, so a `mounts[].host`, an `env_file:` and a manifest reference cannot
 /// resolve three different ways.
 pub(crate) fn resolve_recipe_path(p: &Path, source_dir: &Path) -> Result<PathBuf> {

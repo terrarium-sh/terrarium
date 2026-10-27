@@ -171,8 +171,8 @@ terra ls --all --state running --json
 ```
 
 - States are `running`, `setting_up`, `stopped`, `needs_setup`, `not_created`
-  and `gone`. `needs_setup` means setup is unfinished, the pinned recipe
-  changed, or the root image was imported: `terra <box> setup` makes it bootable.
+  and `gone`. `needs_setup` means the last setup did not finish, or the pinned
+  recipe changed since it did: `terra <box> setup` makes it bootable.
   Repeat `--state` or join states with commas to match any of them.
 - Filters work with every format, including `--json` and `--tsv`. No match
   prints nothing, or `[]` for JSON.
@@ -195,10 +195,15 @@ Guest package updates never change the kernel.
   pinned recipe; `--purge` removes that too. `--force` removes a running box
   after trying a graceful stop.
 - `terra <box> storage show` lists the root filesystem and volumes. `export`
-  writes the images to a file (a `lifetime: boot` volume is left out, since the
-  next boot replaces it) and `import` loads one back, into a stopped box with
-  the same recipe; after a root-image import run `terra <box> setup` before
-  starting it. `prune` deletes images the recipe no longer names.
+  writes a set-up box to a file: its pinned recipe, including inline `env:`
+  values, and its images (a `lifetime: boot` volume is left out, since the next
+  boot replaces it). `import` loads one into a stopped or new box, on this or
+  another machine. It asks before pinning the carried recipe, as setup does;
+  without a terminal it prints the recipe and refuses, and `--trust-recipe`
+  pins it without asking. Its mounts and `env_file` resolve against the
+  importing project, so a file the recipe names must exist there first. The box
+  boots straight after an import.
+  `prune` deletes images the recipe no longer names.
 
 Box state lives under `~/.terra/box/t-<project-slug>/<box>/`; the slug is a
 stable hash of the project path.

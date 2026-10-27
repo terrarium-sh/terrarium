@@ -39,14 +39,17 @@ fn setup_without_vm(dir: &std::path::Path, home: &std::path::Path, args: &[&str]
         stderr.contains(terra::SETUP_VM_STOPPED_BEFORE_CONSOLE),
         "setup failed other than by its VM not launching: {stderr}"
     );
-    // Only the box this setup prepared lacks the stamp its VM writes on success;
+    // Only the box this setup prepared lacks the stamp for its pin that its VM writes on success;
     // writing it lets later steps meet a set-up box.
     let unfinished: Vec<_> = find_boxes(home)
         .into_iter()
         .filter(|state| {
-            state.join("recipe.yaml").exists()
-                && state.join("rootfs.img").exists()
-                && !state.join("setup-finished").exists()
+            let Ok(recipe) = std::fs::read(state.join("recipe.yaml")) else {
+                return false;
+            };
+            state.join("rootfs.img").exists()
+                && std::fs::read(state.join("setup-finished")).ok().as_deref()
+                    != Some(Sha256::digest(recipe).as_slice())
         })
         .collect();
     assert_eq!(
@@ -1065,9 +1068,9 @@ fn a_missing_recipe_path_is_an_error_even_when_the_box_exists() {
 fn show_prints_the_resolved_recipe_without_env_values() {
     let dir = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
-    let cfg = dir.path().join("box.yaml");
+    let recipe = dir.path().join("box.yaml");
     std::fs::write(
-        &cfg,
+        &recipe,
         "hw:\n  cpus: 3\n  mem_mib: 256\nenv:\n  FOO: sk-secret\n",
     )
     .unwrap();
@@ -1272,7 +1275,7 @@ fn missing_recipe_reports_the_path_and_exits_one() {
     );
     assert_eq!(out.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("config not found"), "{stderr}");
+    assert!(stderr.contains("recipe not found"), "{stderr}");
     assert!(stderr.contains("definitely-not-a-recipe-e2e"), "{stderr}");
 }
 
@@ -1280,9 +1283,13 @@ fn missing_recipe_reports_the_path_and_exits_one() {
 fn invalid_yaml_reports_parse_error_and_exits_one() {
     let dir = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
-    let cfg = dir.path().join("bad.yaml");
-    std::fs::write(&cfg, "hw: [not, a, mapping]").unwrap();
-    let out = run_terra_in(dir.path(), home.path(), &[cfg.to_str().unwrap(), "setup"]);
+    let recipe = dir.path().join("bad.yaml");
+    std::fs::write(&recipe, "hw: [not, a, mapping]").unwrap();
+    let out = run_terra_in(
+        dir.path(),
+        home.path(),
+        &[recipe.to_str().unwrap(), "setup"],
+    );
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("failed to parse YAML"));
 }
@@ -1306,13 +1313,17 @@ fn the_shipped_example_recipe_is_accepted() {
 fn missing_mount_host_path_exits_one() {
     let dir = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
-    let cfg = dir.path().join("cfg.yaml");
+    let recipe = dir.path().join("recipe.yaml");
     std::fs::write(
-        &cfg,
+        &recipe,
         "mounts:\n  - host: ./nonexistent-e2e-path\n    guest: /work\n",
     )
     .unwrap();
-    let out = run_terra_in(dir.path(), home.path(), &[cfg.to_str().unwrap(), "setup"]);
+    let out = run_terra_in(
+        dir.path(),
+        home.path(),
+        &[recipe.to_str().unwrap(), "setup"],
+    );
     assert_eq!(out.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("resolving mount host path"), "{stderr}");

@@ -2,8 +2,9 @@
 //! `--force` takes the box from a running VM.
 
 use crate::cmd::stop::{SetupAction, StopOutcome, stop_and_wait};
+use crate::recipe::resolve;
+use crate::state;
 use crate::state::BoxRef;
-use crate::{resolve, state};
 use anyhow::{Context, Result};
 use std::fs::File;
 use std::path::Path;
@@ -11,7 +12,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 pub fn run(args: &crate::cli::RmArgs, name: Option<&str>, project_dir: &Path) -> Result<ExitCode> {
-    let bx = &resolve::resolve(name, project_dir, None, resolve::Existence::MayBeMissing)?.bx;
+    let bx = &resolve::resolve_box(name, project_dir, resolve::Existence::MayBeMissing)?;
     let state_dir = bx.get_dir();
 
     anyhow::ensure!(

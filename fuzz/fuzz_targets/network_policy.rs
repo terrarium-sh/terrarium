@@ -5,7 +5,7 @@ use libfuzzer_sys::fuzz_target;
 use std::assert_matches;
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use terra::config::{Network, NetworkMode, StaticDnsRecord};
+use terra::recipe::{Network, NetworkMode, StaticDnsRecord};
 use terra_policy::normalize_hostname;
 use terra_policy::{BoxPolicy, NameLookup};
 use terra_runtime::component::network::HostServiceAddresses;

@@ -1,7 +1,8 @@
 //! `terra ls` - list this directory's boxes, or every box on this machine.
 
+use crate::recipe::resolve;
 use crate::state::BoxRef;
-use crate::{config, render, resolve, state};
+use crate::{recipe, render, state};
 use anyhow::{Context, Result};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -126,7 +127,7 @@ fn list_boxes_of_project(project_dir: &Path) -> Result<Vec<BoxRef>> {
     // manifest must not be the thing that stops it.
     resolve::list_known_names(
         project_dir,
-        config::load_manifest_or_warn(project_dir).as_ref(),
+        recipe::load_manifest_or_warn(project_dir).as_ref(),
     )?
     .iter()
     .map(|n| BoxRef::resolve(project_dir, n))

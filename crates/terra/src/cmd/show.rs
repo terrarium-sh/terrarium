@@ -1,7 +1,9 @@
-//! `terra show` - print the fully-resolved config a boot would use.
+//! `terra show` - print the fully-resolved recipe a boot would use.
 
 use crate::policy::mount;
-use crate::{config, render, resolve};
+use crate::recipe::resolve;
+use crate::recipe::{MANIFEST_FILE, merge_env_file, resolve_env_file};
+use crate::render;
 use anyhow::{Context, Result};
 use std::io::Write;
 use std::path::Path;
@@ -13,26 +15,21 @@ pub fn run(
     project_dir: &Path,
     cwd: &Path,
 ) -> Result<ExitCode> {
-    let target = resolve::resolve(
-        name,
-        project_dir,
-        Some(cwd),
-        resolve::Existence::MayBeMissing,
-    )?;
+    let target = resolve::resolve_recipe(name, project_dir, resolve::Purpose::Read { cwd })?;
     if let Some(from) = target.find_manifest_divergence() {
         eprintln!(
             "terra: note: this is {}'s pinned recipe, which is what a boot runs - \
              {} names {} instead, and `terra {} setup` would pin that one",
             target.bx.get_name(),
-            config::MANIFEST_FILE,
+            MANIFEST_FILE,
             render::escape_printable_path(&from),
             target.bx.get_name()
         );
     }
 
     let is_pinned = matches!(target.source, resolve::Source::Pinned);
-    let mut cfg = target.parse_recipe_without_env_file()?;
-    match mount::resolve_mounts(&cfg, &target.bx) {
+    let mut recipe = target.parse_recipe_without_env_file()?;
+    match mount::resolve_mounts(&recipe, &target.bx) {
         Ok(mounts) => {
             for s in mount::find_sensitive_mounts(&mounts) {
                 let access = if s.mount.readonly {
@@ -46,7 +43,7 @@ pub fn run(
                     s.category
                 );
             }
-            cfg.mounts = mounts;
+            recipe.mounts = mounts;
         }
         Err(e) if is_pinned => return Err(e),
         Err(e) => eprintln!(
@@ -54,11 +51,13 @@ pub fn run(
             render::render_error(&e)
         ),
     }
-    let env_values = config::resolve_env_file(&mut cfg).and_then(|()| {
+    let env_values = resolve_env_file(&mut recipe).and_then(|()| {
         if is_pinned {
-            mount::verify_pinned_paths(&target.bx, &mount::PinnedPaths::from_config(&cfg))?;
+            target
+                .bx
+                .verify_pinned_paths(&crate::state::PinnedPaths::from_recipe(&recipe))?;
         }
-        config::merge_env_file(&mut cfg)
+        merge_env_file(&mut recipe)
     });
     if let Err(e) = env_values {
         if is_pinned {
@@ -71,15 +70,15 @@ pub fn run(
     }
     let target;
     let to_show = if args.with_env_values {
-        &cfg
+        &recipe
     } else {
-        target = render::redact_config_env(&cfg);
+        target = render::redact_recipe_env(&recipe);
         &target
     };
     let output = if args.json {
-        render::render_config_json(to_show).context("serializing config to json")?
+        render::render_recipe_json(to_show).context("serializing the recipe to json")?
     } else {
-        render::render_config_yaml(to_show).context("serializing config")?
+        render::render_recipe_yaml(to_show).context("serializing the recipe")?
     };
     render::finish_stdout_write(std::io::stdout().lock().write_all(output.as_bytes()))?;
     Ok(ExitCode::SUCCESS)
@@ -88,6 +87,7 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::recipe::parse_recipe;
     use crate::state::{self, BoxRef};
 
     /// `show` is what a recipe is reviewed with before it is trusted, so it
@@ -105,7 +105,7 @@ mod tests {
         let bx = BoxRef::resolve(&project, "dev").unwrap();
 
         // A mount of the box's own state is what `terra setup` refuses.
-        let refused = config::parse_recipe(
+        let refused = parse_recipe(
             &format!(
                 "mounts:\n  - host: {}\n    guest: /work\n",
                 bx.get_dir().display()
@@ -120,7 +120,7 @@ mod tests {
             .to_string();
         assert!(err.contains("this box's own state"), "{err}");
 
-        let mut ok = config::parse_recipe(
+        let mut ok = parse_recipe(
             "mounts:\n  - host: ./sub/../src\n    guest: /work\n",
             &project,
             Path::new("r.yaml"),
@@ -180,20 +180,19 @@ mod tests {
         // …and the file being there is not a thing `show` needs told twice:
         // the values are merged as a boot would merge them.
         std::fs::write(project.join("secrets.env"), "API_KEY=sk-1\n").unwrap();
-        let target = resolve::resolve(
+        let target = resolve::resolve_recipe(
             Some("./dev.yaml"),
             &project,
-            Some(&project),
-            resolve::Existence::MayBeMissing,
+            resolve::Purpose::Read { cwd: &project },
         )
         .unwrap();
-        let mut cfg = target.parse_recipe_without_env_file().unwrap();
-        config::resolve_env_file(&mut cfg).unwrap();
-        config::merge_env_file(&mut cfg).unwrap();
-        assert_eq!(cfg.env["API_KEY"], "sk-1");
+        let mut recipe = target.parse_recipe_without_env_file().unwrap();
+        resolve_env_file(&mut recipe).unwrap();
+        merge_env_file(&mut recipe).unwrap();
+        assert_eq!(recipe.env["API_KEY"], "sk-1");
     }
 
-    /// `show` promises the configuration a boot runs, and a boot refuses a pin
+    /// `show` promises the recipe a boot runs, and a boot refuses a pin
     /// whose share moved: it used to print the repointed target, a mount no
     /// boot would grant.
     #[test]
@@ -217,12 +216,12 @@ mod tests {
             let bx = BoxRef::resolve(&project, "dev").unwrap();
             std::fs::create_dir_all(bx.get_dir()).unwrap();
             std::fs::write(bx.get_dir().join(state::RECIPE_FILE), recipe).unwrap();
-            let mut cfg = config::parse_recipe(recipe, &project, Path::new("dev.yaml")).unwrap();
-            cfg.mounts = mount::resolve_mounts(&cfg, &bx).unwrap();
-            config::resolve_env_file(&mut cfg).unwrap();
+            let mut recipe = parse_recipe(recipe, &project, Path::new("dev.yaml")).unwrap();
+            recipe.mounts = mount::resolve_mounts(&recipe, &bx).unwrap();
+            resolve_env_file(&mut recipe).unwrap();
             std::fs::write(
                 bx.get_dir().join(state::PINNED_PATHS_FILE),
-                yaml_serde::to_string(&mount::PinnedPaths::from_config(&cfg)).unwrap(),
+                yaml_serde::to_string(&crate::state::PinnedPaths::from_recipe(&recipe)).unwrap(),
             )
             .unwrap();
 

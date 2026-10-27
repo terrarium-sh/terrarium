@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use super::{Config, MIN_MEM_MIB, VolumeLifetime};
+use super::{MIN_MEM_MIB, Recipe, VolumeLifetime};
 use std::path::Path;
 use terra_protocol::MAX_VOLUMES;
 
@@ -29,20 +29,21 @@ pub(crate) fn validate_env(env: &BTreeMap<String, String>) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn validate(cfg: &Config) -> Result<()> {
-    validate_workdir(cfg)?;
-    validate_hw(cfg)?;
-    cfg.components.memory_limits()?;
-    validate_sudo(cfg)?;
-    validate_volumes(cfg)?;
-    validate_network(cfg)?;
-    validate_env(&cfg.env)?;
-    validate_guest_paths(cfg)?;
+pub(crate) fn validate(recipe: &Recipe) -> Result<()> {
+    validate_workdir(recipe)?;
+    validate_hw(recipe)?;
+    recipe.components.memory_limits()?;
+    validate_sudo(recipe)?;
+    validate_volumes(recipe)?;
+    validate_storage_devices(recipe)?;
+    validate_network(recipe)?;
+    validate_env(&recipe.env)?;
+    validate_guest_paths(recipe)?;
     Ok(())
 }
 
-fn validate_workdir(cfg: &Config) -> Result<()> {
-    if let Some(dir) = &cfg.workload.workdir
+fn validate_workdir(recipe: &Recipe) -> Result<()> {
+    if let Some(dir) = &recipe.workload.workdir
         && !dir.as_os_str().to_string_lossy().starts_with('/')
     {
         bail!(
@@ -53,8 +54,8 @@ fn validate_workdir(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-fn validate_hw(cfg: &Config) -> Result<()> {
-    if cfg.hw.rootfs_mib == 0 {
+fn validate_hw(recipe: &Recipe) -> Result<()> {
+    if recipe.hw.rootfs_mib == 0 {
         bail!(
             "hw.rootfs_mib must be > 0 (the state is always a bounded image; use mounts for uncapped scratch)"
         );
@@ -62,31 +63,31 @@ fn validate_hw(cfg: &Config) -> Result<()> {
     // A VM the VMM cannot build fails in a
     // background process whose only report is a replayed log - so the numbers
     // that decide whether it can be built are checked against the recipe.
-    if cfg.hw.cpus == 0 {
+    if recipe.hw.cpus == 0 {
         bail!("hw.cpus must be > 0 (a VM needs at least one vCPU)");
     }
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-    if usize::from(cfg.hw.cpus) > terra_runtime::machine::MAX_VCPUS {
+    if usize::from(recipe.hw.cpus) > terra_runtime::machine::MAX_VCPUS {
         bail!(
             "hw.cpus is {}; at most {} vCPUs fit this machine",
-            cfg.hw.cpus,
+            recipe.hw.cpus,
             terra_runtime::machine::MAX_VCPUS
         );
     }
-    if cfg.hw.mem_mib < MIN_MEM_MIB {
+    if recipe.hw.mem_mib < MIN_MEM_MIB {
         bail!(
             "hw.mem_mib is {} MiB, under the {MIN_MEM_MIB} MiB a guest needs to boot \
              (it would die part-way through the boot instead of starting)",
-            cfg.hw.mem_mib
+            recipe.hw.mem_mib
         );
     }
     Ok(())
 }
 
-fn validate_sudo(cfg: &Config) -> Result<()> {
+fn validate_sudo(recipe: &Recipe) -> Result<()> {
     // doas fails *closed* on a parse error, silently revoking every grant - so
     // anything that could break a rule out of its own line is refused here.
-    for c in &cfg.sudo {
+    for c in &recipe.sudo {
         if c.is_empty() {
             bail!("sudo entries must be command names, not empty strings");
         }
@@ -101,17 +102,17 @@ fn validate_sudo(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-fn validate_volumes(cfg: &Config) -> Result<()> {
-    if cfg.volumes.len() > MAX_VOLUMES {
+fn validate_volumes(recipe: &Recipe) -> Result<()> {
+    if recipe.volumes.len() > MAX_VOLUMES {
         bail!(
-            "{} volumes configured; at most {} fit (one guest block device each)",
-            cfg.volumes.len(),
+            "the recipe names {} volumes; at most {} fit (one guest block device each)",
+            recipe.volumes.len(),
             MAX_VOLUMES
         );
     }
     let mut seen = HashSet::new();
     let mut has_overlay = false;
-    for v in &cfg.volumes {
+    for v in &recipe.volumes {
         crate::name::validate_storage_name(&v.name).context("invalid volume name")?;
         anyhow::ensure!(
             v.name.len() <= 247,
@@ -146,7 +147,7 @@ fn validate_volumes(cfg: &Config) -> Result<()> {
                 );
                 has_overlay = true;
                 anyhow::ensure!(
-                    cfg.hw.rootfs_readonly,
+                    recipe.hw.rootfs_readonly,
                     "volume '{name}' is a rootfs_overlay, which layers over a read-only root; set hw.rootfs_readonly: true"
                 );
                 anyhow::ensure!(
@@ -159,20 +160,34 @@ fn validate_volumes(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-fn validate_network(cfg: &Config) -> Result<()> {
-    if !cfg.network.enabled {
+pub(super) fn validate_storage_devices(recipe: &Recipe) -> Result<()> {
+    let count = recipe
+        .mounts
+        .len()
+        .checked_add(recipe.volumes.len())
+        .ok_or_else(|| anyhow::anyhow!("too many volumes and host-directory mounts"))?;
+    anyhow::ensure!(
+        count <= crate::vm::MAX_GUEST_STORAGE_DEVICES,
+        "a box supports at most {} combined volumes and host-directory mounts; remove a volume or mount",
+        crate::vm::MAX_GUEST_STORAGE_DEVICES
+    );
+    Ok(())
+}
+
+fn validate_network(recipe: &Recipe) -> Result<()> {
+    if !recipe.network.enabled {
         anyhow::ensure!(
-            cfg.network.mode == super::NetworkMode::Allowlist
-                && cfg.network.allow.is_empty()
-                && cfg.network.hosts.is_empty()
-                && cfg.network.ports.is_empty(),
+            recipe.network.mode == super::NetworkMode::Allowlist
+                && recipe.network.allow.is_empty()
+                && recipe.network.hosts.is_empty()
+                && recipe.network.ports.is_empty(),
             "network.enabled: false requires allowlist mode and empty allow, hosts, and ports; remove those grants or enable networking"
         );
         return Ok(());
     }
-    crate::policy::network::rules::parse_port_mappings(&cfg.network.ports)?;
+    crate::policy::network::rules::parse_port_mappings(&recipe.network.ports)?;
     terra_policy::BoxPolicy::new(
-        &cfg.network.host_policy()?,
+        &recipe.network.host_policy()?,
         terra_network::config::GATEWAY_ADDRESSES,
     )
     .map_err(anyhow::Error::msg)?;
@@ -182,8 +197,8 @@ fn validate_network(cfg: &Config) -> Result<()> {
 /// Refuse two entries claiming one guest path. They are mounted in recipe
 /// order, so the later one silently wins and the earlier one is a line in the
 /// recipe that does nothing.
-fn validate_guest_paths(cfg: &Config) -> Result<()> {
-    let claims = cfg
+fn validate_guest_paths(recipe: &Recipe) -> Result<()> {
+    let claims = recipe
         .mounts
         .iter()
         .map(|m| {
@@ -195,7 +210,7 @@ fn validate_guest_paths(cfg: &Config) -> Result<()> {
                 ),
             )
         })
-        .chain(cfg.volumes.iter().filter_map(|v| {
+        .chain(recipe.volumes.iter().filter_map(|v| {
             Some((
                 v.guest.as_deref()?,
                 format!("volume '{}'", crate::render::escape_printable(&v.name)),

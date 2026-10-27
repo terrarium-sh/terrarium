@@ -118,11 +118,11 @@ impl Drop for BoxFixture {
 fn bake_hook_output_uses_the_console_and_agent_diagnostics_use_the_log() {
     let fixture = BoxFixture::new();
     let recipe = fixture.directory.path().join("native.yaml");
-    let config = serde_json::json!({
+    let recipe_json = serde_json::json!({
         "hw": {"cpus": 1, "mem_mib": 256},
         "hooks": {"on_create": ["echo BAKE_STDOUT; echo BAKE_STDERR >&2"]}
     });
-    std::fs::write(&recipe, yaml_serde::to_string(&config).unwrap()).unwrap();
+    std::fs::write(&recipe, yaml_serde::to_string(&recipe_json).unwrap()).unwrap();
     let output = fixture.successful(&[recipe.to_str().unwrap(), "setup"]);
     assert!(output.contains("BAKE_STDOUT"), "{output}");
     assert!(output.contains("BAKE_STDERR"), "{output}");
@@ -142,11 +142,11 @@ fn native_boot_executes_shell() {
     for cpus in [1, 2] {
         let fixture = BoxFixture::new();
         let recipe = fixture.directory.path().join("native.yaml");
-        let config = serde_json::json!({
+        let recipe_json = serde_json::json!({
             "hw": {"cpus": cpus, "mem_mib": 256},
             "workload": {"entrypoint": "/bin/sleep", "args": ["300"]}
         });
-        std::fs::write(&recipe, yaml_serde::to_string(&config).unwrap()).unwrap();
+        std::fs::write(&recipe, yaml_serde::to_string(&recipe_json).unwrap()).unwrap();
         fixture.successful(&[recipe.to_str().unwrap(), "setup"]);
         fixture.successful(&["native", "-d"]);
         let output = fixture.successful(&[
@@ -190,12 +190,12 @@ fn native_boot_shares_host_changes_between_running_boxes() {
     std::fs::write(shared.join("value"), "initial").unwrap();
     for (fixture, readonly) in [(&writer, false), (&reader, true)] {
         let recipe = fixture.directory.path().join("native.yaml");
-        let config = serde_json::json!({
+        let recipe_json = serde_json::json!({
             "hw": {"cpus": 2, "mem_mib": 256},
             "mounts": [{"host": shared, "guest": "/shared", "readonly": readonly}],
             "workload": {"entrypoint": "/bin/sleep", "args": ["300"]}
         });
-        std::fs::write(&recipe, yaml_serde::to_string(&config).unwrap()).unwrap();
+        std::fs::write(&recipe, yaml_serde::to_string(&recipe_json).unwrap()).unwrap();
         fixture.successful(&[recipe.to_str().unwrap(), "setup"]);
         fixture.successful(&["native", "-d"]);
     }
@@ -389,7 +389,7 @@ test "$container_id" = "$(podman ps -aq --filter name=rootless --filter status=e
 if doas id -u; then exit 1; fi
 echo ROOTLESS_PODMAN_OK"#
     );
-    let config = serde_json::json!({
+    let recipe_json = serde_json::json!({
         "network": {
             "mode": "unrestricted-public",
             "allow": [format!("gate.test:{allowed_port}")],
@@ -404,7 +404,7 @@ echo ROOTLESS_PODMAN_OK"#
         "mounts": [{"host": readonly, "guest": "/readonly", "readonly": true}],
         "workload": {"entrypoint": "/bin/sh", "args": ["-exc", script]}
     });
-    std::fs::write(&recipe, yaml_serde::to_string(&config).unwrap()).unwrap();
+    std::fs::write(&recipe, yaml_serde::to_string(&recipe_json).unwrap()).unwrap();
     fixture.successful(&[recipe.to_str().unwrap(), "setup"]);
     for boot in 0..2 {
         let server = allowed.try_clone().unwrap();
@@ -476,11 +476,11 @@ fn native_boot_forwards_shared_file_events() {
     prepare_file_events_probe(&probe);
     for (fixture, readonly) in [(&writer, false), (&reader, true)] {
         let recipe = fixture.directory.path().join("native.yaml");
-        let config = serde_json::json!({
+        let recipe_json = serde_json::json!({
             "mounts": [{"host": shared, "guest": "/shared", "readonly": readonly}],
             "workload": {"entrypoint": "/bin/sleep", "args": ["300"]}
         });
-        std::fs::write(&recipe, yaml_serde::to_string(&config).unwrap()).unwrap();
+        std::fs::write(&recipe, yaml_serde::to_string(&recipe_json).unwrap()).unwrap();
         fixture.successful(&[recipe.to_str().unwrap(), "setup"]);
         fixture.successful(&["native", "-d"]);
     }
@@ -620,13 +620,13 @@ fn native_boot_reloads_node_server_from_host_events() {
     };
     std::fs::write(shared.join("server.js"), script("initial")).unwrap();
     let recipe = fixture.directory.path().join("native.yaml");
-    let config = serde_json::json!({
+    let recipe_json = serde_json::json!({
         "network": {"mode": "unrestricted-public"},
         "hooks": {"on_create": ["apk add --no-cache nodejs"]},
         "mounts": [{"host": shared, "guest": "/shared", "readonly": true}],
         "workload": {"entrypoint": "/usr/bin/node", "args": ["--watch", "/shared/server.js"]}
     });
-    std::fs::write(&recipe, yaml_serde::to_string(&config).unwrap()).unwrap();
+    std::fs::write(&recipe, yaml_serde::to_string(&recipe_json).unwrap()).unwrap();
     fixture.successful(&[recipe.to_str().unwrap(), "setup"]);
     fixture.successful(&["native", "-d"]);
     for value in ["initial", "edited", "replaced"] {
@@ -841,11 +841,11 @@ fn windows_broker_and_supervisor_death_release_published_ports() {
         let tcp_port = tcp_reservation.local_addr().unwrap().port();
         let udp_port = udp_reservation.local_addr().unwrap().port();
         let recipe = fixture.directory.path().join("native.yaml");
-        let config = serde_json::json!({
+        let recipe_json = serde_json::json!({
             "network": {"ports": [format!("{tcp_port}:8080/tcp"), format!("{udp_port}:8081/udp")]},
             "workload": {"entrypoint": "/bin/sleep", "args": ["300"]}
         });
-        std::fs::write(&recipe, yaml_serde::to_string(&config).unwrap()).unwrap();
+        std::fs::write(&recipe, yaml_serde::to_string(&recipe_json).unwrap()).unwrap();
         fixture.successful(&[recipe.to_str().unwrap(), "setup"]);
         drop((tcp_reservation, udp_reservation));
         fixture.successful(&["native", "-d"]);

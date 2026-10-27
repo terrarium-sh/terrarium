@@ -1,11 +1,11 @@
 use anyhow::{Context, Result};
 
 use super::boot::BootSpec;
-use crate::config::VolumeLifetime;
+use crate::recipe::VolumeLifetime;
 use crate::state::BoxRef;
 
 pub(super) fn prepare_volumes(spec: &BootSpec, bx: &BoxRef) -> Result<()> {
-    for volume in &spec.cfg.volumes {
+    for volume in &spec.recipe.volumes {
         let path = bx.get_volume_image_path(&volume.name);
         match volume.lifetime {
             VolumeLifetime::Boot => {
@@ -27,7 +27,7 @@ pub(super) fn prepare_volumes(spec: &BootSpec, bx: &BoxRef) -> Result<()> {
 
 /// Frees host disk after the VM exits; the next start replaces the image anyway.
 pub(super) fn remove_boot_lifetime_volume_images(spec: &BootSpec, bx: &BoxRef) {
-    for volume in &spec.cfg.volumes {
+    for volume in &spec.recipe.volumes {
         if volume.lifetime != VolumeLifetime::Boot {
             continue;
         }
@@ -107,7 +107,7 @@ pub(super) fn limit_vm_process() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, Volume};
+    use crate::recipe::{Recipe, Volume};
     use std::path::PathBuf;
 
     /// A boot-lifetime image is replaced by a fresh one before every boot and
@@ -126,12 +126,12 @@ mod tests {
             lifetime,
         };
         let spec = BootSpec {
-            cfg: Config {
+            recipe: Recipe {
                 volumes: vec![
                     volume("scratch", VolumeLifetime::Boot),
                     volume("kept", VolumeLifetime::Box),
                 ],
-                ..Config::default()
+                ..Recipe::default()
             },
             project_dir: PathBuf::from("/project"),
             root: false,

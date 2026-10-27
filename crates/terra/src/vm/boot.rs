@@ -1,9 +1,10 @@
 //! Booting a prepared box into its VM process.
 
 use crate::cli::BootArgs;
+use crate::recipe::{Mount, Recipe};
 use crate::session::{self, DETACH_KEY_NAME, SessionOutcome, pump_session};
 use crate::state::BoxRef;
-use crate::{config, sys};
+use crate::sys;
 use anyhow::{Context, Result};
 use std::fs::File;
 use std::io::Read;
@@ -28,7 +29,7 @@ const REPLAY_LOG_TAIL_BYTES: u64 = 64 << 10;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct BootSpec {
-    pub cfg: config::Config,
+    pub recipe: Recipe,
     pub project_dir: PathBuf,
     pub root: bool,
     pub mode: terra_protocol::PlanMode,
@@ -47,15 +48,15 @@ pub struct BrokerMetadata {
 
 impl BootSpec {
     pub fn resolve(
-        mut cfg: config::Config,
+        mut recipe: Recipe,
         args: &BootArgs,
         project_dir: PathBuf,
         boot: BootMode,
     ) -> Self {
-        override_workload(&mut cfg, &args.command);
+        override_workload(&mut recipe, &args.command);
         Self {
             root: args.root,
-            cfg,
+            recipe,
             project_dir,
             mode: terra_protocol::PlanMode::Run,
             foreground: boot == BootMode::Foreground,
@@ -86,7 +87,7 @@ pub async fn start(
                 "terra: starting {bx} in the foreground; `terra {} stop` stops it",
                 bx.get_name()
             );
-            print_mount_summary(&spec.cfg.mounts);
+            print_mount_summary(&spec.recipe.mounts);
             spawn_foreground(bx, spec, run_lock, agent_timeout).await
         }
         BootMode::DetachedWithJoin => spawn_and_attach(bx, spec, run_lock, agent_timeout).await,
@@ -101,9 +102,9 @@ pub async fn attach(bx: &BoxRef, agent_timeout: Option<u64>) -> Result<ExitCode>
 
 /// Boots the isolated VM that prepares the root image.
 /// The caller keeps its lock while the isolated setup VM uses a duplicate.
-pub async fn run_setup_vm(cfg: &config::Config, bx: &BoxRef, lock: &File) -> Result<()> {
+pub async fn run_setup_vm(recipe: &Recipe, bx: &BoxRef, lock: &File) -> Result<()> {
     let setup_spec = BootSpec {
-        cfg: cfg.clone(),
+        recipe: recipe.clone(),
         project_dir: bx.get_project_dir().to_path_buf(),
         root: false,
         mode: terra_protocol::PlanMode::Create,
@@ -219,7 +220,7 @@ async fn supervise_foreground(
     }
 }
 
-fn print_mount_summary(mounts: &[config::Mount]) {
+fn print_mount_summary(mounts: &[Mount]) {
     if mounts.is_empty() {
         eprintln!("terra: mounts: none (no host filesystem in the sandbox)");
     } else {
@@ -242,7 +243,7 @@ async fn spawn_and_attach(
         "terra: starting {bx} - {DETACH_KEY_NAME} detaches, `terra {} stop` stops it",
         bx.get_name()
     );
-    print_mount_summary(&spec.cfg.mounts);
+    print_mount_summary(&spec.recipe.mounts);
     let LaunchedVm { mut child, _guard } = spawn_vm_process(bx, spec, &run_lock)?;
     // The child owns the lock from here on; a copy held by this client would
     // keep the box reading as running, VM or no VM.
@@ -518,10 +519,10 @@ pub(super) fn read_boot_spec(reader: impl Read) -> Result<BootSpec> {
     serde_json::from_slice(&json).context("decoding the boot to run")
 }
 
-fn override_workload(cfg: &mut config::Config, command: &[String]) {
+fn override_workload(recipe: &mut Recipe, command: &[String]) {
     if let Some((entrypoint, args)) = command.split_first() {
-        cfg.workload.entrypoint = PathBuf::from(entrypoint);
-        cfg.workload.args = args.to_vec();
+        recipe.workload.entrypoint = PathBuf::from(entrypoint);
+        recipe.workload.args = args.to_vec();
     }
 }
 
@@ -643,6 +644,7 @@ fn read_log_tail(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::recipe::Workload;
 
     #[test]
     fn sandbox_identity_publishes_the_host_pid_before_boot() {
@@ -861,14 +863,14 @@ mod tests {
     #[test]
     fn a_boot_survives_the_trip_to_the_background_process() {
         use clap::Parser;
-        let cfg: config::Config = yaml_serde::from_str(
+        let recipe: Recipe = yaml_serde::from_str(
             "hw:\n  cpus: 4\n  mem_mib: 2048\nenv:\n  API_KEY: sk-secret\n\
              workload:\n  entrypoint: /bin/sh\n",
         )
         .unwrap();
         let boot = crate::cli::Cli::parse_from(["terra", "--", "npm", "test"]).boot;
 
-        let spec = BootSpec::resolve(cfg, &boot, PathBuf::from("/proj"), BootMode::Detached);
+        let spec = BootSpec::resolve(recipe, &boot, PathBuf::from("/proj"), BootMode::Detached);
         let back = read_boot_spec(serde_json::to_vec(&spec).unwrap().as_slice()).unwrap();
 
         assert_eq!(
@@ -876,11 +878,14 @@ mod tests {
             PathBuf::from("/proj"),
             "the child re-resolves nothing, its own cwd included"
         );
-        assert_eq!(back.cfg.hw.cpus, 4, "the recipe's hardware crosses whole");
-        assert_eq!(back.cfg.hw.mem_mib, 2048);
-        assert_eq!(back.cfg.env["API_KEY"], "sk-secret");
-        assert_eq!(back.cfg.workload.entrypoint, PathBuf::from("npm"));
-        assert_eq!(back.cfg.workload.args, ["test"]);
+        assert_eq!(
+            back.recipe.hw.cpus, 4,
+            "the recipe's hardware crosses whole"
+        );
+        assert_eq!(back.recipe.hw.mem_mib, 2048);
+        assert_eq!(back.recipe.env["API_KEY"], "sk-secret");
+        assert_eq!(back.recipe.workload.entrypoint, PathBuf::from("npm"));
+        assert_eq!(back.recipe.workload.args, ["test"]);
     }
 
     /// Foreground supervision and the workload's terminal use the same flag,
@@ -915,13 +920,13 @@ mod tests {
         assert!(c.cmd.is_none(), "using a box has no verb");
         assert_eq!(c.boot.command, ["npm", "test", "--watch"]);
 
-        let mut cfg: config::Config = yaml_serde::from_str("{}").unwrap();
-        override_workload(&mut cfg, &c.boot.command);
-        assert_eq!(cfg.workload.entrypoint, PathBuf::from("npm"));
-        assert_eq!(cfg.workload.args, ["test", "--watch"]);
+        let mut recipe: Recipe = yaml_serde::from_str("{}").unwrap();
+        override_workload(&mut recipe, &c.boot.command);
+        assert_eq!(recipe.workload.entrypoint, PathBuf::from("npm"));
+        assert_eq!(recipe.workload.args, ["test", "--watch"]);
 
-        let mut cfg: config::Config = yaml_serde::from_str("{}").unwrap();
-        override_workload(&mut cfg, &[]);
-        assert_eq!(cfg.workload, config::Workload::default());
+        let mut recipe: Recipe = yaml_serde::from_str("{}").unwrap();
+        override_workload(&mut recipe, &[]);
+        assert_eq!(recipe.workload, Workload::default());
     }
 }

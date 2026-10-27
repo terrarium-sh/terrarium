@@ -1,8 +1,9 @@
 //! `terra <box> sessions` - list the clients attached to a running box's
 //! session, as the ids `terra <box> detach` takes.
 
+use crate::recipe::resolve;
+use crate::render;
 use crate::session::{self, SessionClient};
-use crate::{render, resolve};
 use anyhow::{Context, Result};
 use std::io::Write;
 use std::path::Path;
@@ -19,7 +20,7 @@ pub async fn run(
     name: Option<&str>,
     project_dir: &Path,
 ) -> Result<ExitCode> {
-    let bx = &resolve::resolve_pinned_box(project_dir, name)?;
+    let bx = &resolve::resolve_box(name, project_dir, resolve::Existence::MustExist)?;
     let clients = session::list_clients(bx, args.agent.agent_timeout).await?;
     if args.json {
         let entries: Vec<SessionEntry> = clients

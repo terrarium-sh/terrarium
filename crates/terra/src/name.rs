@@ -44,6 +44,8 @@ pub(crate) fn validate_storage_name(name: &str) -> Result<()> {
 /// Refuse a name that could not be a state subdirectory or fit a socket path,
 /// before anything is built under it.
 pub fn validate_box_name(name: &str) -> Result<()> {
+    let normalized = normalize_box_name(name);
+    let name = normalized.as_str();
     if RESERVED_NAMES.contains(&name) {
         bail!(
             "'{}' cannot name a box: it is a terra command",
@@ -69,6 +71,12 @@ pub fn validate_box_name(name: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Box names are case-insensitive, matched in lowercase: a case-insensitive
+/// filesystem (APFS, NTFS) gives two spellings one state directory.
+pub(crate) fn normalize_box_name(name: &str) -> String {
+    name.to_ascii_lowercase()
 }
 
 pub(crate) fn box_hostname(name: &str) -> String {
@@ -205,6 +213,8 @@ mod tests {
             let err = validate_box_name(file).unwrap_err().to_string();
             assert!(err.contains("recipe file"), "{file}: {err}");
         }
+        // Names are case-insensitive, so a command word in capitals is still one.
+        assert!(validate_box_name("LS").is_err());
         // The origin label sits outside the name alphabet, so no name can
         // collide with the file beside the box directories.
         assert!(validate_box_name(crate::state::ORIGIN_FILE).is_err());
