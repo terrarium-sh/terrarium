@@ -40,9 +40,10 @@ WIT [interface symlinks](components/wit/README.md) materialized correctly.
 ## Acceptance gates
 
 The acceptance suite boots throwaway boxes and runs every user-facing feature
-through the `terra` CLI. It needs only `terra`, `curl` and `tar`, takes about a
-minute, and leaves existing boxes alone. Each one-liner downloads the suite, so
-you can run it on any test machine without a checkout.
+through the `terra` CLI. It needs only `terra`, `curl`, `tar` and access to the
+Alpine package mirror (the podman step installs podman), takes a few minutes,
+and leaves existing boxes alone. Each one-liner downloads the suite, so you can
+run it on any test machine without a checkout.
 
 A development build reports its version as `dev+<hash>`. Run it against the
 suite from the branch it was built from. Replace `main` with your branch and

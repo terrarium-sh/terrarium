@@ -1,0 +1,11 @@
+hw: {cpus: 2, mem_mib: 512, rootfs_mib: 512}
+network:
+  allow: [dl-cdn.alpinelinux.org:443]
+  ports: ['{podman_port}:8080']
+mounts:
+  - {host: ./suite, guest: /suite, readonly: true}
+hooks:
+  on_create: [apk add podman]
+workload:
+  entrypoint: /bin/sh
+  args: ['-ec', 'while true; do sleep 60; done']

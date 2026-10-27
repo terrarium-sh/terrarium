@@ -10,7 +10,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repo = "terrarium-sh/terrarium"
-$boxes = "probe", "isolated", "offline", "readonly", "overlay", "bad-bake"
+$boxes = "probe", "isolated", "offline", "podman", "readonly", "overlay", "bad-bake"
 
 if (Test-Path -LiteralPath $Terra -PathType Leaf) {
     $Terra = (Resolve-Path -LiteralPath $Terra).Path
@@ -212,10 +212,12 @@ try {
     Write-Text "readonly/seed" "READ_ONLY"
     $allowedPort = Get-Random -Minimum 30000 -Maximum 50000
     $deniedPort = $allowedPort + 1
+    $podmanPort = $allowedPort + 2
     foreach ($recipe in $boxes) {
         $text = (Read-Text "suite/recipes/$recipe.yaml") `
             -replace "\{allowed_port\}", $allowedPort `
-            -replace "\{denied_port\}", $deniedPort
+            -replace "\{denied_port\}", $deniedPort `
+            -replace "\{podman_port\}", $podmanPort
         Write-Text "$recipe.yaml" $text
     }
 
@@ -310,6 +312,14 @@ try {
         "sh", "-e", "/suite/guest/local-only.sh")) "LOCAL_ONLY_OK"
     Invoke-Terra @("offline", "stop")
     Assert-Listed "offline" "stopped"
+    Complete-Step
+
+    Start-Step "network: podman's published port reaches the host"
+    Invoke-Terra @("./podman.yaml", "setup")
+    Invoke-Terra @("podman", "-d")
+    Invoke-Terra @("podman", "exec", "--no-tty", "--", "sh", "-e", "/suite/guest/podman-publish.sh")
+    Assert-Equal (Read-Http $podmanPort 30) "CONTAINER_NETWORK"
+    Invoke-Terra @("podman", "stop")
     Complete-Step
 
     Start-Step "a read-only root refuses writes; boot-lifetime volumes start empty"

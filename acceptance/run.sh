@@ -7,7 +7,7 @@ set -eu
 
 usage="usage: run.sh [--terra PATH] [--suite DIR]"
 repo="terrarium-sh/terrarium"
-boxes="probe isolated offline readonly overlay bad-bake"
+boxes="probe isolated offline podman readonly overlay bad-bake"
 
 terra=terra
 suite=
@@ -214,8 +214,10 @@ printf '#!/bin/sh\necho HOST_EXECUTABLE\n' > work/host-run
 chmod 755 work/host-run
 allowed_port=$(( $$ % 20000 + 30000 ))
 denied_port=$(( allowed_port + 1 ))
+podman_port=$(( allowed_port + 2 ))
 for recipe in $boxes; do
   sed -e "s/{allowed_port}/$allowed_port/g" -e "s/{denied_port}/$denied_port/g" \
+    -e "s/{podman_port}/$podman_port/g" \
     "suite/recipes/$recipe.yaml" > "$recipe.yaml"
 done
 
@@ -305,6 +307,15 @@ run offline -d
 expect_contains "$(output offline exec --no-tty -- sh -e /suite/guest/local-only.sh)" LOCAL_ONLY_OK
 run offline stop
 expect_listed offline stopped
+passed
+
+begin "network: podman's published port reaches the host"
+run ./podman.yaml setup
+run podman -d
+run podman exec --no-tty -- sh -e /suite/guest/podman-publish.sh
+expect "$(curl -fsS --retry 30 --retry-delay 1 --retry-all-errors --max-time 5 \
+  "http://127.0.0.1:$podman_port/" 2>> "$log")" CONTAINER_NETWORK
+run podman stop
 passed
 
 begin "a read-only root refuses writes; boot-lifetime volumes start empty"
