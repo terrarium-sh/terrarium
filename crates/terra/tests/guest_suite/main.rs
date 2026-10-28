@@ -591,12 +591,7 @@ fn exercise_storage(suite: &mut Suite, writable: &Path, hardware: &Value) -> Res
         Some(0),
         STORAGE_TIMEOUT,
     )?;
-    suite.require_box_state("exercise", "needs_setup")?;
-    Suite::capture(
-        &mut suite.command(["exercise", "setup"]),
-        Some(0),
-        STORAGE_TIMEOUT,
-    )?;
+    suite.require_box_state("exercise", "stopped")?;
     require_output(
         &suite.run(&[
             "exercise",
