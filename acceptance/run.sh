@@ -22,6 +22,8 @@ case "$terra" in
   */*) terra=$(cd "$(dirname "$terra")" && pwd)/$(basename "$terra") ;;
   *) terra=$(command -v "$terra") || { echo "terra is not on PATH; pass --terra" >&2; exit 2; } ;;
 esac
+# A terminal on stdin would make terra prompt instead of refusing, as it does in CI.
+exec </dev/null
 if [ -z "$suite" ] && [ -f "$(dirname "$0")/recipes/probe.yaml" ]; then
   suite=$(dirname "$0")
 fi

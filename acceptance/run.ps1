@@ -135,7 +135,8 @@ function Write-Note($Text) {
 
 function Get-TerraOutput([string[]]$Arguments, [int]$ExitCode = 0, [switch]$Fails) {
     $ErrorActionPreference = "Continue"
-    $output = (& $Terra @Arguments 2>&1 | ForEach-Object { "$_" }) -join "`n"
+    # A console on stdin would make terra prompt instead of refusing, as it does in CI.
+    $output = ($null | & $Terra @Arguments 2>&1 | ForEach-Object { "$_" }) -join "`n"
     $status = $LASTEXITCODE
     Write-Note $output
     if ($Fails) {
