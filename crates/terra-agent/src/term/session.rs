@@ -734,22 +734,20 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stalled_output_does_not_hold_the_session_state_lock() {
         let (session, _) = session();
-        let (stalled, _reader) = client();
+        let (stalled, reader) = client();
         session.attach_client(&stalled).await.unwrap();
         let output_session = session.clone();
         let output = tokio::spawn(async move {
             output_session.feed_output(&vec![b'x'; 1 << 20]).await;
         });
+        // Bytes on the socket mean the parse under `inner` is done and the oversized write has stalled.
         tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if session.delivery.try_lock().is_err() {
-                    break;
-                }
+            while rustix::io::ioctl_fionread(reader.get_ref().get_ref()).unwrap() == 0 {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("broadcast did not start");
+        .expect("broadcast did not start writing");
         assert!(
             tokio::time::timeout(Duration::from_millis(100), session.list_clients())
                 .await
