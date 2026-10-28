@@ -149,7 +149,8 @@ main() {
         ;;
     esac
   fi
-  echo "installed terra at $bin/terra"
+  installed_version=$("$tmp/terra" --version 2>/dev/null || true)
+  echo "installed ${installed_version:-terra} at $bin/terra"
 }
 
 main "$@"

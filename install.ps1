@@ -105,7 +105,9 @@
             Write-Host "added $bin to the user PATH - open a new terminal to use terra"
         }
         $environment.Close()
-        Write-Host "installed terra at $target"
+        $installedVersion = try { (& $target --version 2>$null) -join " " } catch { $null }
+        if (-not $installedVersion) { $installedVersion = "terra" }
+        Write-Host "installed $installedVersion at $target"
     } finally {
         Remove-Item -Recurse -Force -LiteralPath $tmp
     }

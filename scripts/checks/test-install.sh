@@ -7,6 +7,7 @@ trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/bin" "$tmp/release"
 cat > "$tmp/release/terra" <<'EOF'
 #!/bin/sh
+test "${1:-}" = --version && echo "terra 1.2.3"
 exit 0
 EOF
 chmod +x "$tmp/release/terra"
@@ -63,7 +64,8 @@ chmod +x "$tmp/bin/uname" "$tmp/bin/curl" "$tmp/bin/install" "$tmp/bin/gh"
 mkdir -p "$tmp/home/.terra/config/seccomp" "$tmp/home/.terra/config/seccomp.previous"
 
 HOME="$tmp/home" PATH="$tmp/bin:$PATH" INSTALL_FIXTURES="$tmp/release" INSTALL_DEST="$tmp/installed-terra" \
-  TERRA_VERSION=1.2.3 sh "$root/install.sh" >/dev/null
+  TERRA_VERSION=1.2.3 sh "$root/install.sh" > "$tmp/output"
+grep -qx "installed terra 1.2.3 at /usr/local/bin/terra" "$tmp/output"
 test ! -e "$tmp/home/.terra/config/seccomp" && test ! -e "$tmp/home/.terra/config/seccomp.previous"
 cmp "$tmp/original-terra" "$tmp/installed-terra"
 
