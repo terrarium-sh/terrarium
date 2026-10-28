@@ -23,7 +23,7 @@ pty-process = "0.5"
 rustix.workspace = true
 # Terminal screen model so a client attaching to a running TUI gets repainted
 # with the current screen instead of missing history.
-vt100 = "0.16"
+vt100 = "0.18"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }

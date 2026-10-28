@@ -76,7 +76,7 @@ jobs:
         with:
           version: ${{ steps.zig-version.outputs.version }}
       - run: rustup target add ${{ matrix.rust_target }}
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
         with:
           key: ${{ matrix.arch }}-guest
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -162,7 +162,7 @@ jobs:
           nightly=$(sed -n 's/^channel = "\(nightly-[^"]*\)"/\1/p' components/rust-toolchain.toml)
           echo "NIGHTLY_TOOLCHAIN=$nightly" >> "$GITHUB_ENV"
           rustup toolchain install "$nightly" --profile minimal --component rustfmt,clippy --target wasm32-unknown-unknown --target wasm32-wasip3
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
         with:
           cache-on-failure: true
           workspaces: . -> target
@@ -307,7 +307,7 @@ jobs:
         run: |
           rustup target add aarch64-unknown-linux-musl
           rustup toolchain install "$(sed -n 's/^channel = "\(nightly-[^"]*\)"/\1/p' components/rust-toolchain.toml)" --profile minimal --component rustfmt,clippy --target wasm32-unknown-unknown --target wasm32-wasip3
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
         with:
           cache-on-failure: true
           workspaces: |
@@ -391,7 +391,7 @@ jobs:
       - name: Install component toolchain
         run: |
           rustup toolchain install "$(sed -n 's/^channel = "\(nightly-[^"]*\)"/\1/p' components/rust-toolchain.toml)" --profile minimal --component rustfmt,clippy --target wasm32-unknown-unknown --target wasm32-wasip3
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
         with:
           cache-on-failure: true
           workspaces: |
@@ -482,7 +482,7 @@ jobs:
         run: |
           $nightly = (Select-String -LiteralPath components/rust-toolchain.toml -Pattern '^channel = "(nightly-[^"]+)"$').Matches[0].Groups[1].Value
           rustup toolchain install $nightly --profile minimal --target wasm32-unknown-unknown --target wasm32-wasip3
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
         with:
           cache-on-failure: true
           workspaces: |

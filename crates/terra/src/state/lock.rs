@@ -260,7 +260,6 @@ mod tests {
     use crate::state::{self, resolve_box_ref, wait_until_free};
     use crate::sys::TestHome;
     use std::fs::OpenOptions;
-    use std::path::Path;
 
     #[test]
     fn graceful_stop_reaches_the_box_control_socket() {
@@ -632,7 +631,7 @@ mod tests {
 
         BoxRef::publish_pid(&held, std::process::id(), PlanMode::Run).unwrap();
         #[cfg(unix)]
-        let identity = |p: &Path| {
+        let identity = |p: &std::path::Path| {
             let meta = std::fs::metadata(p).unwrap();
             (meta.dev(), meta.ino())
         };

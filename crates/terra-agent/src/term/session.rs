@@ -4,6 +4,7 @@ use crate::AsyncFile;
 use crate::term::tty::set_winsize;
 #[cfg(test)]
 use std::fs::File;
+use std::num::NonZeroU16;
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -24,6 +25,12 @@ pub(crate) fn clamp_term_size(rows: u16, cols: u16) -> (u16, u16) {
         rows.clamp(MIN_ROWS, MAX_ROWS),
         cols.clamp(MIN_COLS, MAX_COLS),
     )
+}
+
+/// Sizes come from [`clamp_term_size`] or the defaults, so neither is zero.
+fn to_screen_size(rows: u16, cols: u16) -> (NonZeroU16, NonZeroU16) {
+    let nonzero = |n| NonZeroU16::new(n).unwrap_or(NonZeroU16::MIN);
+    (nonzero(rows), nonzero(cols))
 }
 
 const INPUT_QUEUE_CAPACITY: usize = 1;
@@ -118,7 +125,10 @@ impl Session {
         let cancellation = cancellation.clone();
         let session = Arc::new(Self {
             inner: Mutex::new(Inner {
-                parser: vt100::Parser::new(DEFAULT_ROWS, DEFAULT_COLS, 0),
+                parser: {
+                    let (rows, cols) = to_screen_size(DEFAULT_ROWS, DEFAULT_COLS);
+                    vt100::Parser::new(rows, cols, 0)
+                },
                 clients: Vec::new(),
                 next_id: 0,
                 closed: false,
@@ -210,7 +220,7 @@ impl Session {
             }
         };
         if let Some(output) = output
-            && conn.write_out_chunks(&output).await.is_err()
+            && conn.write_out_chunks(output.as_bytes()).await.is_err()
         {
             self.inner
                 .lock()
@@ -336,10 +346,11 @@ impl Inner {
                 (rows.min(other_rows), cols.min(other_cols))
             })
             .unwrap_or((DEFAULT_ROWS, DEFAULT_COLS));
-        if self.parser.screen().size() == (rows, cols) {
+        let size = to_screen_size(rows, cols);
+        if self.parser.screen().size() == size {
             return None;
         }
-        self.parser.screen_mut().set_size(rows, cols);
+        self.parser.set_size(size.0, size.1);
         Some((rows, cols))
     }
 }
@@ -475,13 +486,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_repaint_above_the_frame_limit_is_chunked() {
         let (session, _) = session();
-        session
-            .inner
-            .lock()
-            .await
-            .parser
-            .screen_mut()
-            .set_size(MAX_ROWS, MAX_COLS);
+        session.inner.lock().await.parser.screen_mut().set_size(
+            NonZeroU16::new(MAX_ROWS).unwrap(),
+            NonZeroU16::new(MAX_COLS).unwrap(),
+        );
         let cells = usize::from(MAX_ROWS) * usize::from(MAX_COLS);
         let bytes = "\x1b[38;2;0;0;0mX\x1b[38;2;255;255;255mX".repeat(cells / 2);
         session.feed_output(bytes.as_bytes()).await;
@@ -517,7 +525,7 @@ mod tests {
             }
         }
         assert_eq!(attach.await.unwrap().unwrap(), 0);
-        assert_eq!(painted, expected);
+        assert_eq!(painted, expected.as_bytes());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -529,7 +537,7 @@ mod tests {
             .await
             .parser
             .screen_mut()
-            .set_size(100, 200);
+            .set_size(NonZeroU16::new(100).unwrap(), NonZeroU16::new(200).unwrap());
         let bytes = "\x1b[38;2;0;0;0mX\x1b[38;2;255;255;255mX".repeat(10_000);
         session.feed_output(bytes.as_bytes()).await;
         let expected = session
@@ -562,7 +570,7 @@ mod tests {
             assert!(chunk.len() <= REPAINT_CHUNK_BYTES);
             painted.extend_from_slice(&chunk);
         }
-        assert_eq!(painted, expected);
+        assert_eq!(painted, expected.as_bytes());
         assert_eq!(
             frame(&mut reader).await,
             AgentOutput::Out(b"live output".to_vec())

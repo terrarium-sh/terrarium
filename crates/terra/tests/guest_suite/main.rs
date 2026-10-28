@@ -586,7 +586,7 @@ fn exercise_storage(suite: &mut Suite, writable: &Path, hardware: &Value) -> Res
     require_file(&writable.join("hooks"), b"start\nstop\nstart\nstop\n")?;
     Suite::capture(
         suite
-            .command(["exercise", "storage", "import"])
+            .command(["exercise", "storage", "import", "--trust-recipe"])
             .arg(&artifact),
         Some(0),
         STORAGE_TIMEOUT,
