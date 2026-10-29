@@ -23,11 +23,10 @@ const BOX_HOME: &str = "box";
 
 pub(crate) const CONTROL_SOCKET: &str = "c";
 pub(crate) const AGENT_SOCKET: &str = "a";
-#[cfg(not(target_os = "macos"))]
-pub(crate) const LOG_FILE: &str = "terra.log";
-#[cfg(target_os = "macos")]
+/// The one box directory the VM worker may write, beside its volumes.
+pub(crate) const RUNTIME_LOG_DIR: &str = "runtime-logs";
 pub(crate) const LOG_FILE: &str = "runtime-logs/terra.log";
-pub(crate) const DIAGNOSTICS_LOG: &str = "diagnostics.log";
+pub(crate) const DIAGNOSTICS_LOG: &str = "runtime-logs/diagnostics.log";
 
 pub const ORIGIN_FILE: &str = ".path";
 
@@ -605,6 +604,14 @@ mod tests {
             resolve_box_ref(&real).get_dir(),
             resolve_box_ref(&link).get_dir()
         );
+    }
+
+    /// The VM worker's only writable box directory holds both logs it writes.
+    #[test]
+    fn vm_written_logs_live_in_the_runtime_log_dir() {
+        for log in [LOG_FILE, DIAGNOSTICS_LOG] {
+            assert_eq!(Path::new(log).parent(), Some(Path::new(RUNTIME_LOG_DIR)));
+        }
     }
 
     #[test]

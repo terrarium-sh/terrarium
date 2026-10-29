@@ -136,6 +136,10 @@ pub(super) fn mount_filesystems(plan: &terra_protocol::Plan) -> Result<()> {
     for share in &plan.shares {
         mount_share(share)?;
     }
+    mount_volumes(plan)
+}
+
+pub(super) fn mount_volumes(plan: &terra_protocol::Plan) -> Result<()> {
     for volume in &plan.volumes {
         // Setup made the mount points in the root image; this creates the ones nested
         // inside an already-mounted share (`/work/node_modules` under `/work`).

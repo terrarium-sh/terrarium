@@ -55,17 +55,13 @@ pub(super) fn enter_root() -> Result<Boot> {
     let plan = read_boot_plan(&mut control)?;
     setup_env(&plan);
     apply_host_state(&plan)?;
-    match plan.mode {
-        PlanMode::Create => grow_filesystem(ROOT_DEVICE),
-        PlanMode::Run => {
-            for volume in &plan.volumes {
-                grow_filesystem(&volume.dev);
-            }
-            match &plan.rootfs {
-                RootfsMount::Overlay { upper_dev } => grow_filesystem(upper_dev),
-                RootfsMount::Writable | RootfsMount::ReadOnly => {}
-            }
-        }
+    for volume in &plan.volumes {
+        grow_filesystem(&volume.dev);
+    }
+    match &plan.rootfs {
+        RootfsMount::Writable => grow_filesystem(ROOT_DEVICE),
+        RootfsMount::Overlay { upper_dev } => grow_filesystem(upper_dev),
+        RootfsMount::ReadOnly => {}
     }
     mount_guest_root(&plan.rootfs, NEWROOT)?;
     for directory in ["proc", "sys", "dev", "terra"] {

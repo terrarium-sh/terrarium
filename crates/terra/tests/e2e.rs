@@ -1212,9 +1212,7 @@ fn logs_without_a_log_errors() {
     std::fs::write(dir.path().join("b.yaml"), "hw:\n  cpus: 1\n").unwrap();
     setup_without_vm(dir.path(), home.path(), &["./b.yaml", "setup"]);
     // Setup's VM may already have logged; this pins the box that has no log.
-    for log in ["terra.log", "runtime-logs/terra.log"] {
-        let _ = std::fs::remove_file(find_only_box(home.path()).join(log));
-    }
+    let _ = std::fs::remove_file(find_only_box(home.path()).join("runtime-logs/terra.log"));
     let out = run_terra_in(dir.path(), home.path(), &["logs"]);
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("no log"));

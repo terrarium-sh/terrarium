@@ -13,7 +13,9 @@ terra (CLI)                 your user, unconfined
    │                        start; holds the run lock and listeners
    ├─ bwrap ─► __vm         own user, PID, mount, IPC, UTS and
    │                        network namespaces; role filter and its
-   │                        allowlist; /dev/kvm, box state, shares
+   │                        allowlist; /dev/kvm, read-only
+   │                        box state with writable logs and
+   │                        disks; shares
    └─ bwrap ─► __network    own user, PID, mount, IPC and UTS
                             namespaces; host network; role filter
                             and its allowlist; no /dev, no /tmp
@@ -21,6 +23,7 @@ terra (CLI)                 your user, unconfined
 __vm ◄── socket pair (fd 7) ──► __network
 __supervisor ── startup channel (fd 8) ──► __network
 __supervisor ── run lock (fd 3) ──► __vm
+__supervisor ── agent and control listeners (fd 10, 11) ──► __vm
 terra (CLI) ── agent and control sockets ──► __vm
 ```
 

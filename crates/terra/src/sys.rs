@@ -14,8 +14,6 @@ mod imp;
 #[path = "sys/windows.rs"]
 mod imp;
 
-#[cfg(windows)]
-pub(crate) use imp::file_handle_matches_path;
 pub(crate) use imp::file_link_count;
 pub use imp::is_host_root;
 pub use imp::{
@@ -37,7 +35,6 @@ pub fn register_stop_channel(channel: terra_platform::local_socket::LocalStream)
 #[cfg(unix)]
 pub(crate) use imp::close_unrelated_descriptors;
 pub(crate) use imp::supervise_supervisor_child;
-#[cfg(any(target_os = "macos", windows))]
 pub(crate) use imp::{claim_listener, pass_listener};
 pub(crate) use terra_platform::process::{claim_ipc, pass_ipc};
 
@@ -135,44 +132,41 @@ pub(crate) use std::os::windows::fs::symlink_dir;
 #[cfg(all(test, windows))]
 pub(crate) use std::os::windows::fs::symlink_file;
 
-#[cfg(unix)]
-pub(crate) fn set_path_mtime(
-    path: &Path,
-    mtime_secs: i64,
-    mtime_nanos: u32,
-) -> std::io::Result<()> {
-    #[allow(clippy::cast_possible_wrap)]
-    let times = rustix::fs::Timestamps {
-        last_access: rustix::fs::Timespec {
-            tv_sec: 0,
-            tv_nsec: rustix::fs::UTIME_OMIT,
-        },
-        last_modification: rustix::fs::Timespec {
-            tv_sec: mtime_secs as _,
-            tv_nsec: mtime_nanos.into(),
-        },
-    };
-    rustix::fs::utimensat(rustix::fs::CWD, path, &times, rustix::fs::AtFlags::empty())
-        .map_err(std::io::Error::from)
-}
-
-#[cfg(windows)]
-pub(crate) fn set_path_mtime(
-    path: &Path,
-    mtime_secs: i64,
-    mtime_nanos: u32,
-) -> std::io::Result<()> {
-    use std::os::windows::fs::OpenOptionsExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_WRITE_ATTRIBUTES,
-    };
-
-    let file_times = terra_protocol::sync_file_times(mtime_secs, mtime_nanos)?;
-    let file = std::fs::OpenOptions::new()
-        .access_mode(FILE_WRITE_ATTRIBUTES)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)?;
-    file.set_times(file_times)
+/// Opens a file or directory itself for a metadata change, never a link in its place.
+pub(crate) fn open_entry_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let open = |options: &mut std::fs::OpenOptions| {
+            options
+                .custom_flags(
+                    (rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::NOFOLLOW)
+                        .bits()
+                        .cast_signed(),
+                )
+                .open(path)
+        };
+        // fchmod and futimens need any open descriptor, so a file its owner cannot read opens
+        // for writing instead.
+        match open(std::fs::OpenOptions::new().read(true)) {
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                open(std::fs::OpenOptions::new().write(true)).map_err(|_| error)
+            }
+            opened => opened,
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+            FILE_WRITE_ATTRIBUTES,
+        };
+        std::fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+    }
 }
 
 #[cfg(test)]
@@ -195,9 +189,19 @@ pub(crate) fn open_regular_file_for_write(
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(create);
     #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    open_regular_file_no_follow(path, &mut options)
+}
+
+/// Opens `path` itself, refusing a symlink, FIFO or device in its place.
+pub(crate) fn open_regular_file_no_follow(
+    path: &Path,
+    options: &mut std::fs::OpenOptions,
+) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600).custom_flags(
+        options.custom_flags(
             (rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::NOFOLLOW)
                 .bits()
                 .cast_signed(),

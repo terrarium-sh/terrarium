@@ -84,28 +84,21 @@ fn install_host_symlink(target: &str, destination: &Path) -> Result<()> {
 }
 
 fn update_host_metadata(path: &Path, mode: u32, mtime_secs: i64, mtime_nanos: u32) -> Result<()> {
-    let metadata = std::fs::symlink_metadata(path)?;
+    let file = sys::open_entry_no_follow(path)
+        .with_context(|| format!("opening {} for its metadata", path.display()))?;
+    let metadata = file.metadata()?;
     anyhow::ensure!(
-        !metadata.file_type().is_symlink(),
-        "cannot update symlink metadata"
+        !metadata.file_type().is_symlink() && (metadata.is_file() || metadata.is_dir()),
+        "cannot update metadata of {}: not a regular file or directory",
+        path.display()
     );
     anyhow::ensure!(
-        !metadata.is_file() || sys::file_link_count(path)? <= 1,
+        !metadata.is_file() || sys::file_link_count(&file)? <= 1,
         "cannot update metadata of hard-linked file {}; replace it with an independent copy before syncing",
         path.display()
     );
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(to_safe_mode(mode)))?;
-    }
-    #[cfg(windows)]
-    {
-        let mut permissions = metadata.permissions();
-        permissions.set_readonly(mode & 0o200 == 0);
-        std::fs::set_permissions(path, permissions)?;
-    }
-    sys::set_path_mtime(path, mtime_secs, mtime_nanos)
+    sys::set_open_file_mode(&file, to_safe_mode(mode))?;
+    file.set_times(terra_protocol::sync_file_times(mtime_secs, mtime_nanos)?)
         .with_context(|| format!("setting timestamp on {}", path.display()))
 }
 
@@ -647,6 +640,31 @@ mod tests {
     use super::super::test_support::{PendingPeer, peer};
     use super::*;
 
+    /// A guest can swap a planned entry for a link through a writable share, so a
+    /// metadata update changes the entry itself and refuses a link in its place.
+    #[test]
+    #[cfg(unix)]
+    fn metadata_updates_refuse_a_link_in_place_of_the_entry() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = tempfile::tempdir().unwrap();
+        let outside = scratch.path().join("outside");
+        std::fs::write(&outside, b"private").unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = scratch.path().join("planned");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        assert!(update_host_metadata(&link, 0o755, 200, 0).is_err());
+        let after = std::fs::metadata(&outside).unwrap();
+        assert_eq!(after.permissions().mode() & 0o777, 0o600);
+        assert_ne!(meta_mtime_secs(&after), 200);
+
+        // A file its owner may only write still takes the planned metadata.
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o200)).unwrap();
+        update_host_metadata(&outside, 0o644, 200, 0).unwrap();
+        let after = std::fs::metadata(&outside).unwrap();
+        assert_eq!(after.permissions().mode() & 0o777, 0o644);
+        assert_eq!(meta_mtime_secs(&after), 200);
+    }
+
     #[tokio::test]
     async fn download_metadata_does_not_modify_hard_links_outside_the_tree() {
         let scratch = tempfile::tempdir().unwrap();
@@ -659,7 +677,12 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
-        sys::set_path_mtime(&outside, 100, 0).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&outside)
+            .unwrap()
+            .set_times(terra_protocol::sync_file_times(100, 0).unwrap())
+            .unwrap();
         std::fs::hard_link(&outside, root.join("file")).unwrap();
         let before = std::fs::metadata(&outside).unwrap();
         let updates = [(String::from("file"), 0o755, 200, 0)];

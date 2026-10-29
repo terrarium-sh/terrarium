@@ -155,8 +155,9 @@ pub async fn run_setup_vm(recipe: &Recipe, bx: &BoxRef, lock: &File) -> Result<(
             );
         }
         anyhow::bail!(
-            "setup failed - fix the recipe, then `terra {} setup` re-runs \
-             it (`--rebuild` for a clean slate); agent diagnostics are in diagnostics.log",
+            "setup failed - fix the recipe, then `terra {0} setup` re-runs \
+             it (`--rebuild` for a clean slate); `terra {0} logs --diagnostics` shows the \
+             agent diagnostics",
             bx.get_name()
         );
     }
@@ -615,9 +616,7 @@ fn write_boot_logs(bx: &BoxRef, output: &mut impl std::io::Write) -> std::io::Re
 
 fn read_log_tail(path: &Path) -> String {
     use std::io::{Read, Seek, SeekFrom};
-    // Plain open, symlinks followed: the log name is terra's own symlink to
-    // the appender's current generation.
-    let Ok(mut f) = std::fs::File::open(path) else {
+    let Ok(mut f) = crate::logs::open_box_log(path) else {
         return String::new();
     };
     let len = f.metadata().map(|m| m.len()).unwrap_or_default();

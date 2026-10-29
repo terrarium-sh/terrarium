@@ -17,7 +17,7 @@ const NETWORK_DESCRIPTORS: &[i32] = if cfg!(target_os = "macos") {
 const VM_DESCRIPTORS: &[i32] = if cfg!(target_os = "macos") {
     &[3, 7, 9, 10, 11]
 } else {
-    &[3, 7]
+    &[3, 7, 10, 11]
 };
 
 fn prepare_internal_role(role: Role, kept: &[i32]) -> Result<()> {

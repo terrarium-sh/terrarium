@@ -232,9 +232,9 @@ fn generate_sandbox_info(spec: &BootSpec, rootfs: &RootfsMount) -> String {
         },
         shares = match spec.mode {
             PlanMode::Create => {
-                "This is setup's VM: the `mounts` below are not attached and the \
-                 `volumes` are not mounted until the box starts, so writes to their \
-                 guest paths land in the root filesystem."
+                "This is setup's VM: the `mounts` below are not attached until the box \
+                 starts, but the `volumes` are mounted as they are then, so writes under \
+                 a volume's guest path land in that volume."
             }
             PlanMode::Run => {
                 "Only the `mounts` listed below are shared with the host. Everything \
@@ -285,7 +285,7 @@ mod tests {
 
     /// An agent reading the README acts on it, so it describes the boot it is
     /// in: setup's VM of a read-only box runs as root on a writable root with
-    /// no mounts or volumes attached, and only the run boots after it are
+    /// its volumes but no mounts, and only the run boots after it are
     /// read-only, the workload user's, and shared with the host.
     #[test]
     fn sandbox_info_describes_the_boot_not_just_the_recipe() {
@@ -311,9 +311,10 @@ mod tests {
         assert!(setup.contains("You run as `root`"), "{setup}");
         assert!(setup.contains("It PERSISTS"), "{setup}");
         assert!(
-            setup.contains("not mounted until the box starts"),
+            setup.contains("not attached until the box starts"),
             "{setup}"
         );
+        assert!(setup.contains("land in that volume"), "{setup}");
         assert!(!setup.contains("shared with the host"), "{setup}");
         let run = info(PlanMode::Run);
         assert!(run.contains("You run as `terri`"), "{run}");

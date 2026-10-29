@@ -346,7 +346,7 @@ still requires running it on the affected host.
 Root and volume images are prebaked ext4 files. Setup decompresses and sizes
 the root and box-lifetime images; run boots recreate boot-lifetime images.
 The guest grows the root filesystem during setup and volume filesystems on
-run boots. Runtime hosts need no filesystem formatting tools or image downloads.
+every boot. Runtime hosts need no filesystem formatting tools or image downloads.
 The kernel and boot disk are embedded in `terra` as chunked LZ4 containers:
 each boot decodes the kernel into guest memory, while the boot disk stays packed
 and the block device decodes only the chunks a read touches. The read-only boot

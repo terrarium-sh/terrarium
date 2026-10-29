@@ -11,10 +11,9 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::{Command, ExitCode, Stdio};
 use std::time::Duration;
-#[cfg(any(target_os = "macos", windows))]
-use terra_platform::local_socket::LocalListener;
 use terra_platform::local_socket::{
-    AsyncLocalStream, LocalStream, OwnedSocket, create_local_pair, receive_sockets, send_sockets,
+    AsyncLocalStream, LocalListener, LocalStream, OwnedSocket, create_local_pair, receive_sockets,
+    send_sockets,
 };
 use terra_sandbox::{Launch, Role};
 use tokio::sync::oneshot;
@@ -22,9 +21,7 @@ use tokio::sync::oneshot;
 pub(crate) const SUPERVISOR_ARG: &str = "__supervisor";
 pub(crate) const NETWORK_ARG: &str = "__network";
 pub(crate) const NETWORK_FD: i32 = 7;
-#[cfg(any(target_os = "macos", windows))]
 pub(crate) const AGENT_LISTENER_FD: i32 = 10;
-#[cfg(any(target_os = "macos", windows))]
 pub(crate) const CONTROL_LISTENER_FD: i32 = 11;
 const CONFIG_FD: i32 = 8;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(90);
@@ -32,9 +29,7 @@ const BROKER_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(super) fn spawn(bx: &BoxRef, spec: &BootSpec, lock: &File, exe: &Path) -> Result<LaunchedVm> {
-    if spec.mode == terra_protocol::PlanMode::Run {
-        super::resources::prepare_volumes(spec, bx)?;
-    }
+    super::resources::prepare_volumes(spec, bx)?;
     let mut child_spec = spec.clone();
     child_spec.host_publishes_pid = true;
     ensure!(
@@ -124,8 +119,7 @@ fn run_box(dir: PathBuf, lock: &File) -> Result<ExitCode> {
         terra_protocol::PlanMode::Run,
     )?;
     let identity = sys::create_regular_file(&bx.get_dir().join(state::HOST_PID_FILE))?;
-    #[cfg(any(target_os = "macos", windows))]
-    prepare_vm_outputs(&bx)?;
+    std::fs::create_dir_all(bx.get_dir().join(state::RUNTIME_LOG_DIR))?;
     let executable = std::env::current_exe()?;
     let (mut broker, endpoint) = start_optional_broker(&executable, &mut boot)?
         .map_or((None, None), |(broker, endpoint)| {
@@ -137,7 +131,6 @@ fn run_box(dir: PathBuf, lock: &File) -> Result<ExitCode> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
-    #[cfg(any(target_os = "macos", windows))]
     let inherited_listeners = pass_vm_listeners(command, &bx, boot.mode)?;
     let inherited = endpoint
         .as_ref()
@@ -147,9 +140,7 @@ fn run_box(dir: PathBuf, lock: &File) -> Result<ExitCode> {
     drop(endpoint);
     let guard = supervise_worker_child(command)?;
     let spawned = launch.spawn(BROKER_STARTUP_TIMEOUT)?;
-    drop((inherited, inherited_lock));
-    #[cfg(any(target_os = "macos", windows))]
-    drop(inherited_listeners);
+    drop((inherited, inherited_lock, inherited_listeners));
     let vm_pid = spawned.pid;
     let mut vm = SupervisedChild::from_launch(spawned, guard)?;
     boot::publish_vm_pid(vm_pid, &bx, lock, &identity, boot.mode)?;
@@ -168,9 +159,7 @@ fn run_box(dir: PathBuf, lock: &File) -> Result<ExitCode> {
         STARTUP_TIMEOUT,
     ));
     drop((vm, broker));
-    if boot.mode == terra_protocol::PlanMode::Run {
-        super::resources::remove_boot_lifetime_volume_images(&boot, &bx);
-    }
+    super::resources::remove_boot_lifetime_volume_images(&boot, &bx);
     result
 }
 
@@ -194,17 +183,6 @@ fn start_optional_broker(
     Ok(Some((broker, endpoint)))
 }
 
-#[cfg(any(target_os = "macos", windows))]
-fn prepare_vm_outputs(bx: &BoxRef) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    std::fs::create_dir_all(bx.get_dir().join("runtime-logs"))?;
-    #[cfg(windows)]
-    sys::create_regular_file(&bx.get_dir().join(state::LOG_FILE))?;
-    sys::create_regular_file(&bx.get_dir().join(state::DIAGNOSTICS_LOG))?;
-    Ok(())
-}
-
-#[cfg(any(target_os = "macos", windows))]
 fn pass_vm_listeners(
     command: &mut Command,
     bx: &BoxRef,
@@ -614,8 +592,10 @@ mod tests {
     use super::*;
     use std::time::Instant;
 
+    /// Setup prepares the run's volumes too, so a volume image in the way fails either boot
+    /// before a supervisor starts.
     #[test]
-    fn setup_launch_skips_volume_preparation() {
+    fn every_launch_prepares_its_volumes() {
         let root = tempfile::tempdir().unwrap();
         let bx = BoxRef::from_state_dir(root.path().into(), root.path());
         std::fs::create_dir(bx.get_volume_image_path("scratch")).unwrap();
@@ -639,17 +619,17 @@ mod tests {
             host_publishes_pid: false,
             network_broker: None,
         };
-        let error = spawn(&bx, &boot, &lock, &executable).err().unwrap();
-        assert!(
-            error.to_string().contains("starting box supervisor"),
-            "{error:#}"
-        );
-        boot.mode = terra_protocol::PlanMode::Run;
-        let error = spawn(&bx, &boot, &lock, &executable).err().unwrap();
-        assert!(
-            error.to_string().contains("emptying volume image"),
-            "{error:#}"
-        );
+        for mode in [
+            terra_protocol::PlanMode::Create,
+            terra_protocol::PlanMode::Run,
+        ] {
+            boot.mode = mode;
+            let error = spawn(&bx, &boot, &lock, &executable).err().unwrap();
+            assert!(
+                error.to_string().contains("emptying volume image"),
+                "{error:#}"
+            );
+        }
     }
 
     fn startup_input(config: &[u8]) -> BrokerStartup {

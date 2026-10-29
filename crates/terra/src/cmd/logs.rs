@@ -22,22 +22,6 @@ pub fn run(
     }
 }
 
-fn is_log_moved(f: &std::fs::File, log: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let (Ok(old), Ok(new)) = (f.metadata(), std::fs::metadata(log)) else {
-            return true;
-        };
-        old.dev() != new.dev() || old.ino() != new.ino()
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::io::AsRawHandle;
-        !sys::file_handle_matches_path(f.as_raw_handle(), log)
-    }
-}
-
 #[derive(Default)]
 struct LogText {
     pending: Vec<u8>,
@@ -155,7 +139,9 @@ fn write_log(
     }
     let mut out = std::io::stdout();
     let mut text = LogText::default();
-    let mut f = std::fs::File::open(&log).with_context(|| format!("opening {}", log.display()))?;
+    let mut f =
+        crate::logs::open_box_log(&log).with_context(|| format!("opening {}", log.display()))?;
+    let mut marker = crate::logs::TrimMarker::read(&mut f).context("reading log")?;
     if let Some(tail) = args.tail {
         seek_to_tail(&mut f, tail).context("seeking to tail")?;
     }
@@ -168,6 +154,9 @@ fn write_log(
 
     loop {
         let alive = bx.get_holder()?.holds();
+        if crate::logs::resume_after_rewrite(&mut f, &mut marker).context("following log")? {
+            text.finish(&mut out)?;
+        }
         let n = text.drain(&mut f, &mut out).context("streaming log")?;
         out.flush().context("writing to stdout")?;
         if n == 0 {
@@ -177,14 +166,6 @@ fn write_log(
                 return Ok(ExitCode::SUCCESS);
             }
             std::thread::sleep(sys::POLL);
-            if is_log_moved(&f, &log) {
-                // The old generation is sealed now: drain what the writer put
-                // there after the last copy.
-                text.drain(&mut f, &mut out).context("streaming log")?;
-                text.finish(&mut out)?;
-                f = std::fs::File::open(&log)
-                    .with_context(|| format!("reopening {}", log.display()))?;
-            }
         }
     }
 }
@@ -208,37 +189,6 @@ mod tests {
             "hello\\u{1b}]52;clipboard\\u{7}\\r\n€��"
         );
         assert_eq!(text.pending, Vec::<u8>::new());
-    }
-
-    /// A rotation is a new file under the same name (the appender repoints
-    /// the `terra.log` symlink); the handle a follower holds keeps reading
-    /// the generation it was opened on, and the name changing is what tells
-    /// the follower to switch.
-    #[test]
-    fn a_rotated_log_is_a_new_file_under_the_same_name() {
-        let dir = tempfile::tempdir().unwrap();
-        let log = dir.path().join(crate::state::LOG_FILE);
-        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
-        std::fs::write(&log, b"first generation").unwrap();
-        let mut f = std::fs::File::open(&log).unwrap();
-        assert!(
-            !is_log_moved(&f, &log),
-            "an untouched file is not a rotation"
-        );
-
-        // Growth in place is not a rotation: the same inode, just longer.
-        std::fs::write(&log, b"grown in place").unwrap();
-        assert!(!is_log_moved(&f, &log));
-
-        // A file that disappears and is replaced is one, as the appender
-        // leaves it: the follower's handle still reads the generation it was
-        // opened on.
-        std::fs::remove_file(&log).unwrap();
-        std::fs::write(&log, b"second generation").unwrap();
-        assert!(is_log_moved(&f, &log), "the name points at a new file");
-        let mut old = String::new();
-        f.read_to_string(&mut old).unwrap();
-        assert_eq!(old, "grown in place", "the old generation stays readable");
     }
 
     #[test]

@@ -12,11 +12,12 @@ use std::path::Path;
 use std::process::{Child, Command};
 use std::sync::OnceLock;
 use std::time::Duration;
+use terra_platform::process::sandbox_env::LINUX_ROLE;
 
 const BWRAP: &[u8] = include_bytes!(env!("TERRA_BWRAP_BIN"));
 static EMBEDDED_BWRAP: OnceLock<std::result::Result<OwnedFd, String>> = OnceLock::new();
 /// One descriptor per seccomp filter Bubblewrap installs before executing the worker.
-const SECCOMP_FDS: [RawFd; 2] = [10, 5];
+const SECCOMP_FDS: [RawFd; 2] = [4, 5];
 const INFO_FD: RawFd = 6;
 
 pub struct Confinement {
@@ -99,6 +100,7 @@ pub(super) fn prepare_launch_with_filters(
 
     let mut cmd = embedded_command()?;
     crate::copy_explicit_environment(&mut cmd, &command);
+    cmd.env(LINUX_ROLE, role.name());
     cmd.args([
         "--unshare-user",
         "--unshare-ipc",
@@ -118,7 +120,7 @@ pub(super) fn prepare_launch_with_filters(
         Role::Network => cmd.args(["--dir", "/dev"]),
     };
 
-    grants.sort_by_key(|grant| grant.path.components().count());
+    crate::order_most_specific_last(&mut grants);
     append_mounts(&mut cmd, grants)?;
     let mut inherited_files = Vec::new();
     ensure!(
@@ -378,7 +380,7 @@ mod tests {
             })
             .unwrap();
         assert!(parent < child && child < metadata);
-        for descriptor in ["10", "5"] {
+        for descriptor in ["4", "5"] {
             assert!(
                 args.windows(2)
                     .any(|args| args == ["--add-seccomp-fd", descriptor])

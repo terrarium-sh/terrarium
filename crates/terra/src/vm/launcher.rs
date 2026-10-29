@@ -81,36 +81,20 @@ fn build_sandbox_grants(spec: &BootSpec, bx: &BoxRef) -> Result<Vec<Grant>> {
             grants.push(grant);
         }
     }
-    #[cfg(target_os = "linux")]
-    grants.push(Grant::new(bx.get_dir(), Access::ReadWrite));
-    #[cfg(any(target_os = "macos", windows))]
-    {
-        // Windows grants are DACL entries on every object beneath the path, so a directory
-        // grant would expose stale volumes and logs the box's recipe no longer names.
-        #[cfg(target_os = "macos")]
-        grants.push(Grant::new(bx.get_dir(), Access::ReadOnly));
+    // Read-only: the host CLI trusts the box directory's entries, such as an import journal.
+    // Windows grants are DACL entries on every object beneath the path, so a directory
+    // grant would expose stale volumes the box's recipe no longer names.
+    #[cfg(unix)]
+    grants.push(Grant::new(bx.get_dir(), Access::ReadOnly));
+    grants.push(Grant::new(
+        bx.get_dir().join(state::RUNTIME_LOG_DIR),
+        Access::ReadWrite,
+    ));
+    for volume in &spec.recipe.volumes {
         grants.push(Grant::new(
-            bx.get_dir().join(state::DIAGNOSTICS_LOG),
+            bx.get_volume_image_path(&volume.name),
             Access::ReadWrite,
         ));
-        #[cfg(target_os = "macos")]
-        grants.push(Grant::new(
-            bx.get_dir().join("runtime-logs"),
-            Access::ReadWrite,
-        ));
-        #[cfg(windows)]
-        grants.push(Grant::new(
-            bx.get_dir().join(state::LOG_FILE),
-            Access::ReadWrite,
-        ));
-        if spec.mode == terra_protocol::PlanMode::Run {
-            for volume in &spec.recipe.volumes {
-                grants.push(Grant::new(
-                    bx.get_volume_image_path(&volume.name),
-                    Access::ReadWrite,
-                ));
-            }
-        }
     }
     grants.push(Grant::new(
         bx.get_dir().join(state::ROOTFS_FILE),
@@ -178,13 +162,10 @@ mod tests {
         assert!(grants.iter().any(|grant| {
             grant.path == recipe && grant.access == Access::ReadOnly && grant.directory.is_none()
         }));
-        #[cfg(any(target_os = "macos", windows))]
         assert!(grants.iter().any(|grant| {
             grant.path == bx.get_volume_image_path("scratch") && grant.access == Access::ReadWrite
         }));
-        #[cfg(target_os = "linux")]
-        let box_access = Some(Access::ReadWrite);
-        #[cfg(target_os = "macos")]
+        #[cfg(unix)]
         let box_access = Some(Access::ReadOnly);
         #[cfg(windows)]
         let box_access = None;
@@ -195,19 +176,16 @@ mod tests {
                 .map(|grant| grant.access),
             box_access
         );
-        #[cfg(any(target_os = "macos", windows))]
         assert!(grants.iter().any(|grant| {
-            grant.path == bx.get_dir().join(state::DIAGNOSTICS_LOG)
+            grant.path == bx.get_dir().join(state::RUNTIME_LOG_DIR)
                 && grant.access == Access::ReadWrite
         }));
         spec.mode = terra_protocol::PlanMode::Create;
         let grants = build_sandbox_grants(&spec, &bx).unwrap();
         assert!(!grants.iter().any(|grant| grant.path == share));
-        assert!(
-            !grants
-                .iter()
-                .any(|grant| grant.path == bx.get_volume_image_path("scratch"))
-        );
+        assert!(grants.iter().any(|grant| {
+            grant.path == bx.get_volume_image_path("scratch") && grant.access == Access::ReadWrite
+        }));
         let moved = base.join("moved");
         std::fs::rename(&share, &moved).unwrap();
         crate::sys::symlink_dir(&moved, &share).unwrap();

@@ -105,6 +105,12 @@ fn resolve_parent(
             "path must name a child",
         ));
     }
+    // A colon names an NTFS alternate data stream, never a file or directory.
+    if path.components().any(
+        |component| matches!(component, Component::Normal(name) if name.to_string_lossy().contains(':')),
+    ) {
+        return Err(Error::new(ErrorKind::InvalidInput, "invalid child name"));
+    }
     let mut components = path.components();
     let Some(Component::Normal(leaf)) = components.next_back() else {
         return Err(Error::new(
@@ -116,7 +122,7 @@ fn resolve_parent(
     let parent = if parent_path.as_os_str().is_empty() {
         pin_directory(directory)?
     } else {
-        cap_primitives::fs::open_dir(directory, parent_path)?
+        pin_directory(&cap_primitives::fs::open_dir(directory, parent_path)?)?
     };
     Ok((parent, leaf.to_os_string()))
 }
@@ -678,6 +684,14 @@ mod tests {
         assert!(!temp.path().join("nested").exists());
         assert!(create_directory_at(&directory, Path::new("../escape")).is_err());
         assert!(create_directory_at(&directory, Path::new("\\escape")).is_err());
+        std::fs::create_dir(temp.path().join("streams")).unwrap();
+        for stream in ["stream:name", "streams/file::$DATA", "streams:hidden/child"] {
+            assert!(
+                create_directory_at(&directory, Path::new(stream)).is_err(),
+                "{stream}"
+            );
+        }
+        assert!(!temp.path().join("stream").exists());
         std::fs::write(temp.path().join("trailing"), b"preserved").unwrap();
         assert!(unlink_file_at(&directory, Path::new("trailing/")).is_err());
         assert!(

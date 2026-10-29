@@ -4,4 +4,5 @@ for i in $(seq 1 100); do
 done
 test -f /work/ready
 test $(wc -l < /opt/workload/bake) = 1
+test "$(cat /data/from-setup)" = baked
 test $(nproc) = 2

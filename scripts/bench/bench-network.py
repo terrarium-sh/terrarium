@@ -290,7 +290,7 @@ def collect_boot_stages(directory: Path) -> dict:
     records = {"host_utc": [], "guest_utc_and_agent_monotonic": []}
     observed = set()
     read_errors = []
-    for name in ("launcher.log", "terra.log", "diagnostics.log"):
+    for name in ("launcher.log", "runtime-logs/terra.log", "runtime-logs/diagnostics.log"):
         path = directory / name
         if not path.exists():
             continue
@@ -672,9 +672,10 @@ def main():
                 log_directory.mkdir()
                 if collect_boot_stages(log_directory)["unavailable_stages"] != list(BOOT_STAGES):
                     raise RuntimeError("missing baseline stages were not marked unavailable")
-                (log_directory / "terra.log").write_text("INFO terra boot_stage=vm_entry unix_time_ns=200\n")
+                (log_directory / "runtime-logs").mkdir()
+                (log_directory / "runtime-logs/terra.log").write_text("INFO terra boot_stage=vm_entry unix_time_ns=200\n")
                 (log_directory / "launcher.log").write_text("terra boot_stage=supervisor_start unix_time_ns=100\n")
-                (log_directory / "diagnostics.log").write_text("agent received boot planterra boot_stage=networking_ready unix_time_ns=400 agent_elapsed_ns=50\n")
+                (log_directory / "runtime-logs/diagnostics.log").write_text("agent received boot planterra boot_stage=networking_ready unix_time_ns=400 agent_elapsed_ns=50\n")
                 stages = collect_boot_stages(log_directory)
                 if len(stages["records"]["host_utc"]) != 2 or stages["records"]["host_utc"][0]["source"] != "launcher.log" or stages["records"]["guest_utc_and_agent_monotonic"][0]["agent_elapsed_ns"] != 50 or "hooks_start" not in stages["unavailable_stages"]:
                     raise RuntimeError("boot stage extraction mixed clock domains or missing stages")

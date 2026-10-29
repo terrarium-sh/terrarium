@@ -57,8 +57,8 @@ The VM's package SID is the only one added to approved file DACLs;
 orderly exit removes the grants and deletes the profile. Read-only grants carry
 explicit write/delete/permission denies; writable directories omit
 `FILE_DELETE_CHILD`. The VM gets no grant on the box directory itself, only on
-the files its box configuration names: the root disk, configured volumes and logs
-read-write, and box metadata read-only. Grant traversal skips reparse
+the files its box configuration names: the root disk, configured volumes and
+`runtime-logs/` read-write, and box metadata read-only. Grant traversal skips reparse
 points, and share roots cannot be reparse points. Filesystem operations resolve
 guest paths within the approved share; a launch may grant at most 16,384 objects.
 

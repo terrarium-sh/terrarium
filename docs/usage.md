@@ -80,8 +80,8 @@ gh attestation verify terra-x86_64-linux.tar.gz --repo terrarium-sh/terrarium
 ## Set up and start
 
 `terra <box> setup` reads the recipe, asks for approval when needed, pins it,
-creates storage, prepares the root image in an isolated VM without shares and
-runs `on_create`. Run it again after changing the recipe.
+creates storage, prepares the root image in an isolated VM with the box's
+volumes but no shares, and runs `on_create`. Run it again after changing the recipe.
 `--dry-run` checks the recipe without changing anything. Without a terminal, a
 recipe a guest might have written needs `--trust-recipe` after you review it.
 

@@ -71,7 +71,7 @@ impl BoxFixture {
             .into_iter()
             .flatten()
             .flatten()
-            .map(|project| project.path().join("native/diagnostics.log"))
+            .map(|project| project.path().join("native/runtime-logs/diagnostics.log"))
             .filter_map(|path| std::fs::read_to_string(path).ok())
             .collect()
     }

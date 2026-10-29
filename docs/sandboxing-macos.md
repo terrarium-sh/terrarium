@@ -65,8 +65,8 @@ a metadata-only rule, because the file-events watcher canonicalizes each share
 path. The VM can also send IPC to the FSEvents daemon, which that watcher
 subscribes through; the daemon delivers only events for paths the VM's file
 rules allow. A read-only grant inside a writable grant is still rejected; no
-caller needs it. The VM gets the box directory read-only plus specific writable
-disk, diagnostics and `runtime-logs/` paths. File rules do not grant Unix-socket
+caller needs it. The VM gets the box directory read-only plus writable disks and
+`runtime-logs/`. File rules do not grant Unix-socket
 authority, so the supervisor prebinds the agent and stop listeners and passes
 them to the VM as descriptors.
 

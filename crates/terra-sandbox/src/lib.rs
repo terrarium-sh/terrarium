@@ -166,6 +166,21 @@ pub fn prepare_launch(mut launch: Launch<'_>) -> Result<PreparedLaunch> {
     backend::prepare_launch(launch)
 }
 
+/// Orders `grants` for backends where a later grant overrides an earlier one: a deeper path
+/// applies last, and on the same path a read-only grant does, so the narrower grant wins.
+#[cfg_attr(
+    target_os = "macos",
+    allow(dead_code, reason = "the macOS profile refuses overlapping grants")
+)]
+pub(crate) fn order_most_specific_last(grants: &mut [Grant]) {
+    grants.sort_by_key(|grant| {
+        (
+            grant.path.components().count(),
+            grant.access == Access::ReadOnly,
+        )
+    });
+}
+
 /// Gives `confined` only the variables `requested` sets explicitly.
 #[cfg(unix)]
 fn copy_explicit_environment(confined: &mut Command, requested: &Command) {
@@ -233,6 +248,32 @@ pub(crate) fn read_worker_spec<T: serde::de::DeserializeOwned>(path: &Path) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Windows ACLs and bind mounts both let the last grant win, so a read-only grant nested
+    /// in, or duplicating, a writable one must come after it whatever order the caller used.
+    #[test]
+    fn the_narrower_grant_applies_last() {
+        let mut grants = vec![
+            Grant::new("/share/secrets", Access::ReadOnly),
+            Grant::new("/share", Access::ReadOnly),
+            Grant::new("/share", Access::ReadWrite),
+            Grant::new("/share/cache", Access::ReadWrite),
+        ];
+        order_most_specific_last(&mut grants);
+        let order: Vec<_> = grants
+            .iter()
+            .map(|grant| (grant.path.to_str().unwrap(), grant.access))
+            .collect();
+        assert_eq!(
+            order,
+            [
+                ("/share", Access::ReadWrite),
+                ("/share", Access::ReadOnly),
+                ("/share/cache", Access::ReadWrite),
+                ("/share/secrets", Access::ReadOnly),
+            ]
+        );
+    }
 
     /// The build script compiles one role filter per terra-build role; a role
     /// missing there would leave the runtime without its embedded policy.

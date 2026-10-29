@@ -184,7 +184,8 @@ pub fn prepare_launch(launch: Launch<'_>) -> Result<PreparedLaunch> {
     })
 }
 
-fn build_worker_grants(grants: Vec<Grant>) -> Result<(Vec<WorkerGrant>, Vec<File>)> {
+fn build_worker_grants(mut grants: Vec<Grant>) -> Result<(Vec<WorkerGrant>, Vec<File>)> {
+    crate::order_most_specific_last(&mut grants);
     let mut worker_grants = Vec::with_capacity(grants.len());
     let mut trusted_directories = Vec::new();
     for grant in grants {

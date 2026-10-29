@@ -9,9 +9,9 @@ use terra_platform::process::{VmChildGuard, pass_descriptor};
 #[cfg(target_os = "macos")]
 mod macos;
 
-pub(crate) fn file_link_count(path: &Path) -> Result<u64> {
+pub(crate) fn file_link_count(file: &File) -> Result<u64> {
     use std::os::unix::fs::MetadataExt;
-    Ok(std::fs::symlink_metadata(path)?.nlink())
+    Ok(file.metadata()?.nlink())
 }
 
 pub fn try_lock_run(path: &Path) -> std::result::Result<File, std::fs::TryLockError> {
@@ -158,7 +158,6 @@ pub(crate) fn supervise_supervisor_child(
     terra_platform::process::supervise_vm_child(command, die_with_parent)
 }
 
-#[cfg(target_os = "macos")]
 pub(crate) fn pass_listener(
     command: &mut Command,
     listener: &std::os::unix::net::UnixListener,
@@ -169,7 +168,6 @@ pub(crate) fn pass_listener(
     ))
 }
 
-#[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 pub(crate) fn claim_listener(
     descriptor: i32,

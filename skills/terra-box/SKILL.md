@@ -350,13 +350,16 @@ Limits:
 
 ### Processes
 
-- Setup prepares the root image in an isolated VM without shares, with or
-  without `on_create`, and sizes the root image and `lifetime: box` volumes. A
+- Setup prepares the root image in an isolated VM with the recipe's volumes but
+  no shares, with or without `on_create`, and sizes the root image and
+  `lifetime: box` volumes. A
   start never prepares the root image. Running setup again on an unchanged
   recipe boots no VM.
 - `hooks.on_create` runs as guest root only when setup builds a new root image
-  (the first setup and `--rebuild`), before mounts exist; the workload user
-  `terri` already exists. It uses the recipe's network rules, and setup prints
+  (the first setup and `--rebuild`), with volumes mounted and shares not; the
+  workload user `terri` already exists. Its writes under a volume's `guest`
+  path land in the volume, so a `lifetime: boot` volume loses them at the next
+  boot. It uses the recipe's network rules, and setup prints
   its output. If it fails, the next setup builds the root again from scratch.
 - `hooks.on_start` runs as guest root before every workload start.
 - `hooks.pre_stop` runs during an orderly stop.

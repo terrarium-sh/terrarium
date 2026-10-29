@@ -1239,13 +1239,11 @@ fn run_boot_suite() {
     );
     // Host diagnostics stay out of the workload's terminal: they belong in the
     // box's log - and the refusal message is terra's own policy talking.
-    let log_name = if cfg!(target_os = "macos") {
-        "runtime-logs/terra.log"
-    } else {
-        "terra.log"
-    };
-    let log =
-        std::fs::read_to_string(s.get_box_files_path("egress").join(log_name)).unwrap_or_default();
+    let log = std::fs::read_to_string(
+        s.get_box_files_path("egress")
+            .join("runtime-logs/terra.log"),
+    )
+    .unwrap_or_default();
     assert!(
         log.contains("policy denied name lookup"),
         "the log does not name the refused query:\n{log}"
@@ -1382,7 +1380,7 @@ fn run_boot_suite() {
     );
 
     // == the state directory is what guards the agent's port ==
-    // The VMM binds `a` itself, and its exec service runs commands as guest
+    // The supervisor binds `a` for the VMM, and its exec service runs commands as guest
     // root, so the one thing between another account on this host and that
     // port is the mode of the directory it is bound in. terra's own umask
     // cannot be it. Asserted on a box that is *running*, since that is when
@@ -2274,7 +2272,8 @@ fn broker_loss_preserves_agent_and_supervisor_loss_stops_the_box() {
         if !kill_supervisor {
             loop {
                 let diagnostics =
-                    std::fs::read_to_string(directory.join("diagnostics.log")).unwrap_or_default();
+                    std::fs::read_to_string(directory.join("runtime-logs/diagnostics.log"))
+                        .unwrap_or_default();
                 if !linux_process_is_live(broker)
                     && diagnostics.contains("network unavailable: owner: Network is down")
                     && std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()

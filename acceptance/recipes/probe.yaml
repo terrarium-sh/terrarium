@@ -10,7 +10,7 @@ mounts:
 volumes: [{name: data, guest: /data, size_mib: 8}]
 env: {RECIPE_ENV: recipe-value}
 hooks:
-  on_create: ['mkdir -p /opt/workload; echo baked >> /opt/workload/bake; echo BAKE_OK']
+  on_create: ['mkdir -p /opt/workload; echo baked >> /opt/workload/bake; echo baked > /data/from-setup; echo BAKE_OK']
   on_start: ['echo start >> /work/hooks; echo START_OK']
   pre_stop: ['echo stop >> /work/hooks; echo STOP_OK']
 daemons:

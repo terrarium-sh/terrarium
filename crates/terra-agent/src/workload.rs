@@ -31,6 +31,7 @@ pub(super) async fn execute(
     crate::network::start(plan, shutdown, tasks, diagnostic).await?;
     diagnostic.record_boot_stage("networking_ready");
     if plan.mode == PlanMode::Create {
+        config::mount_volumes(plan)?;
         let startup = crate::channel::StartupGate::new();
         let SessionPty { session, .. } =
             start_session(plan, clients, startup, stop, shutdown, tasks).await?;

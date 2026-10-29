@@ -42,9 +42,6 @@ const ARTIFACTS: TrustedArtifacts = {
 };
 
 fn volume_disk_paths(spec: &BootSpec, bx: &BoxRef) -> Vec<std::path::PathBuf> {
-    if spec.mode == PlanMode::Create {
-        return Vec::new();
-    }
     spec.recipe
         .volumes
         .iter()
@@ -99,7 +96,6 @@ fn open_shares(spec: &BootSpec) -> Result<Vec<ShareGrant>> {
 
 fn agent_listener(bx: &BoxRef) -> Result<LocalListener> {
     let path = bx.get_dir().join(crate::state::AGENT_SOCKET);
-    #[cfg(any(target_os = "macos", windows))]
     if uses_inherited_listeners() {
         return sys::claim_listener(super::supervisor::AGENT_LISTENER_FD, &path)
             .map_err(Into::into);
@@ -113,7 +109,6 @@ fn agent_listener(bx: &BoxRef) -> Result<LocalListener> {
 
 fn stop_listener(bx: &BoxRef) -> Result<LocalListener> {
     let path = bx.get_dir().join(crate::state::CONTROL_SOCKET);
-    #[cfg(any(target_os = "macos", windows))]
     if uses_inherited_listeners() {
         return sys::claim_listener(super::supervisor::CONTROL_LISTENER_FD, &path)
             .map_err(Into::into);
@@ -125,7 +120,6 @@ fn stop_listener(bx: &BoxRef) -> Result<LocalListener> {
     Ok(listener)
 }
 
-#[cfg(any(target_os = "macos", windows))]
 fn uses_inherited_listeners() -> bool {
     terra_platform::process::sandbox_env::is_vm_worker()
 }
@@ -267,8 +261,10 @@ mod tests {
     use crate::recipe::{Mount, Recipe};
     use std::path::{Path, PathBuf};
 
+    /// Setup sees the same volumes a run does, so `on_create` writes land where the workload
+    /// reads them.
     #[test]
-    fn setup_attaches_no_volume_disks() {
+    fn setup_attaches_the_runs_volume_disks() {
         let bx = BoxRef::from_state_dir(PathBuf::from("/box"), Path::new("/project"));
         let mut spec = BootSpec {
             recipe: Recipe {
@@ -288,7 +284,10 @@ mod tests {
             host_publishes_pid: false,
             network_broker: None,
         };
-        assert_eq!(volume_disk_paths(&spec, &bx), [] as [PathBuf; 0]);
+        assert_eq!(
+            volume_disk_paths(&spec, &bx),
+            [bx.get_volume_image_path("scratch")]
+        );
         spec.mode = PlanMode::Run;
         assert_eq!(
             volume_disk_paths(&spec, &bx),

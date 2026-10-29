@@ -170,7 +170,7 @@ pub enum Cmd {
                            terra dev sync --checksum ./src/ :/app/   Compare file contents using SHA-256\n    \
                            terra dev sync --dry-run ./src/ :/app/    Preview planned transfers and deletions")]
     Sync(SyncArgs),
-    /// Show a box's host diagnostics, rotated as it grows. `--diagnostics` shows guest VM
+    /// Show a box's host diagnostics, trimmed to the newest as it grows. `--diagnostics` shows guest VM
     /// diagnostics instead; both are replayed after a failed boot. The workload's
     /// terminal goes to the session - attach to the box to see it live.
     Logs(LogsArgs),
