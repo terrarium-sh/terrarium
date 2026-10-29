@@ -57,7 +57,7 @@ struct terra_tsi_socket {
     struct delayed_work timeout_work;
     struct work_struct setup_work, udp_work;
     int datagrams, wait;
-    void *udp_frame, *udp_receive;
+    void *udp_frame;
     void (*data_ready)(struct sock *), (*write_space)(struct sock *);
     void (*state_change)(struct sock *), (*error_report)(struct sock *);
 };

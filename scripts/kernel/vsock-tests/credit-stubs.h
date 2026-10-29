@@ -164,7 +164,20 @@ static bool virtio_transport_has_space(struct virtio_vsock_sock *vvs) {
     assert(held_lock == vvs->tx_lock.id);
     return min(vvs->buf_alloc, vvs->peer_buf_alloc) > vvs->tx_cnt - vvs->peer_fwd_cnt;
 }
-void virtio_transport_inc_tx_pkt(struct virtio_vsock_sock *vvs, struct sk_buff *skb);
+/* Upstream virtio_transport_common.c helpers the patch leaves unchanged. */
+static void virtio_transport_dec_rx_pkt(struct virtio_vsock_sock *vvs, u32 bytes_read, u32 bytes_dequeued) {
+    vvs->rx_bytes -= bytes_read;
+    vvs->buf_used -= bytes_dequeued;
+    vvs->fwd_cnt += bytes_dequeued;
+}
+static void virtio_transport_inc_tx_pkt(struct virtio_vsock_sock *vvs, struct sk_buff *skb) {
+    struct virtio_vsock_hdr *hdr = virtio_vsock_hdr(skb);
+    spin_lock_bh(&vvs->rx_lock);
+    vvs->last_fwd_cnt = vvs->fwd_cnt;
+    hdr->fwd_cnt = cpu_to_le32(vvs->fwd_cnt);
+    hdr->buf_alloc = cpu_to_le32(vvs->buf_alloc);
+    spin_unlock_bh(&vvs->rx_lock);
+}
 static int virtio_transport_send_credit_update(struct vsock_sock *vsk) {
     assert(socket_locked && !held_lock && !vsk->trans->tx_lock.held && !vsk->trans->rx_lock.held);
     struct sk_buff packet = {0};

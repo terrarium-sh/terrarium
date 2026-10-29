@@ -1,3 +1,12 @@
+Subject: [PATCH] fuse: forward host file events to guest inotify
+
+Terra's virtio-fs device reports changes made to shared files on the host.
+Negotiate FUSE_TERRA_FILE_EVENTS at init, keep one FUSE_TERRA_RECEIVE_EVENT
+request outstanding per mount, and turn each reply into attribute, dentry
+and page-cache invalidation plus the matching fsnotify events. Unmount
+cancels the outstanding request; ordinary requests leave two virtqueue
+descriptors free so the cancellation never waits behind stalled I/O.
+---
 --- a/fs/fuse/dir.c
 +++ b/fs/fuse/dir.c
 @@ -9,6 +9,7 @@
@@ -8,35 +17,32 @@
  #include <linux/file.h>
  #include <linux/fs_context.h>
  #include <linux/moduleparam.h>
-@@ -1756,6 +1757,174 @@
+@@ -1756,6 +1757,165 @@ static int fuse_dir_fsync(struct file *file, loff_t start, loff_t end,
  	return err;
  }
  
 +static void fuse_terra_notify(struct fuse_mount *fm,
 +			      const struct fuse_terra_event *event)
 +{
++	/* The fsnotify event for each event kind; kind 0 is not an event. */
++	static const u32 kind_masks[] = { 0, FS_CREATE, FS_DELETE, FS_MODIFY, FS_ATTRIB };
++	u32 kind = event->kind & ~(FUSE_TERRA_EVENT_DIRECTORY | FUSE_TERRA_EVENT_SAME_INODE);
 +	struct inode *dir, *inode = NULL, *current_inode = NULL, *recorded = NULL;
++	struct qstr name = QSTR_INIT(event->name, event->name_len);
 +	struct dentry *parent, *entry;
 +	struct fuse_entry_out outarg;
-+	struct qstr name;
 +	bool replaced;
-+	u32 kind = event->kind & ~(0x100 | FUSE_TERRA_EVENT_SAME_INODE);
 +	u32 mask;
 +	int err;
 +
-+	if (!event->name_len || event->name_len > NAME_MAX ||
++	if (!kind || kind >= ARRAY_SIZE(kind_masks) ||
++	    !event->name_len || event->name_len > NAME_MAX ||
 +	    strnlen(event->name, sizeof(event->name)) != event->name_len ||
 +	    memchr(event->name, '/', event->name_len) ||
 +	    !strcmp(event->name, ".") || !strcmp(event->name, ".."))
 +		return;
-+	switch (kind) {
-+	case 1: mask = FS_CREATE; break;
-+	case 2: mask = FS_DELETE; break;
-+	case 3: mask = FS_MODIFY; break;
-+	case 4: mask = FS_ATTRIB; break;
-+	default: return;
-+	}
-+	if (event->kind & 0x100)
++	mask = kind_masks[kind];
++	if (event->kind & FUSE_TERRA_EVENT_DIRECTORY)
 +		mask |= FS_ISDIR;
 +	down_read(&fm->fc->killsb);
 +	if (!fm->sb)
@@ -46,17 +52,15 @@
 +		goto unlock_sb;
 +	if (dir->i_sb != fm->sb || !S_ISDIR(dir->i_mode))
 +		goto put_dir;
-+	if ((event->kind & FUSE_TERRA_EVENT_SAME_INODE) && kind >= 3 && event->child) {
++	if ((event->kind & FUSE_TERRA_EVENT_SAME_INODE) && (mask & (FS_MODIFY | FS_ATTRIB)) &&
++	    event->child) {
 +		inode = fuse_ilookup(fm->fc, event->child, NULL);
 +		if (inode && inode->i_sb == fm->sb) {
 +			fuse_invalidate_attr(inode);
-+			if (kind == 3)
++			if (mask & FS_MODIFY)
 +				invalidate_mapping_pages(inode->i_mapping, 0, -1);
 +			if (S_ISDIR(inode->i_mode))
 +				mask |= FS_ISDIR;
-+			name.name = event->name;
-+			name.len = event->name_len;
-+			name.hash = 0;
 +			fsnotify(mask | FS_EVENT_ON_CHILD, inode, FSNOTIFY_EVENT_INODE,
 +				 dir, &name, inode, 0);
 +			iput(inode);
@@ -70,8 +74,6 @@
 +		parent = d_obtain_alias(igrab(dir));
 +	if (IS_ERR(parent))
 +		goto put_dir;
-+	name.name = event->name;
-+	name.len = event->name_len;
 +	name.hash = full_name_hash(parent, name.name, name.len);
 +	inode_lock(dir);
 +	entry = d_lookup(parent, &name);
@@ -98,7 +100,7 @@
 +	if (inode) {
 +		fuse_invalidate_attr(inode);
 +		/* Do not write back guest pages over an external edit. */
-+		if (kind == 1 || kind == 3)
++		if (mask & (FS_CREATE | FS_MODIFY))
 +			invalidate_mapping_pages(inode->i_mapping, 0, -1);
 +		if (S_ISDIR(inode->i_mode))
 +			mask |= FS_ISDIR;
@@ -108,7 +110,7 @@
 +	fuse_dir_changed(dir);
 +	if (entry && (replaced || !inode))
 +		d_drop(entry);
-+	if (kind >= 3 && inode && !replaced)
++	if ((mask & (FS_MODIFY | FS_ATTRIB)) && inode && !replaced)
 +		fsnotify(mask | FS_EVENT_ON_CHILD, inode, FSNOTIFY_EVENT_INODE,
 +			 dir, &name, inode, 0);
 +	else
@@ -118,8 +120,9 @@
 +		if (replaced) {
 +			fsnotify_link_count(inode);
 +			fsnotify_inoderemove(inode);
-+		} else if (kind <= 2)
++		} else if (mask & (FS_CREATE | FS_DELETE)) {
 +			fsnotify_inode(inode, FS_MODIFY);
++		}
 +	}
 + unlock:
 +	iput(recorded);
@@ -145,7 +148,6 @@
 +
 +	if (!error) {
 +		fuse_terra_notify(receive->fm, &receive->event);
-+		memset(&receive->event, 0, sizeof(receive->event));
 +		error = fuse_simple_background(receive->fm, args, GFP_NOFS);
 +		if (!error)
 +			return;
@@ -161,10 +163,8 @@
 +	int error;
 +
 +	receive = kzalloc(sizeof(*receive), GFP_KERNEL);
-+	if (!receive) {
-+		pr_warn_ratelimited("fuse: shared file notifications unavailable\n");
++	if (!receive)
 +		return;
-+	}
 +	receive->fm = fm;
 +	receive->args.opcode = FUSE_TERRA_RECEIVE_EVENT;
 +	receive->args.nodeid = FUSE_ROOT_ID;
@@ -183,9 +183,18 @@
  static long fuse_dir_ioctl(struct file *file, unsigned int cmd,
  			    unsigned long arg)
  {
+--- a/fs/fuse/fuse_i.h
++++ b/fs/fuse/fuse_i.h
+@@ -1556,4 +1556,6 @@ extern void fuse_sysctl_unregister(void);
+ #define fuse_sysctl_unregister()	do { } while (0)
+ #endif /* CONFIG_SYSCTL */
+ 
++void fuse_terra_start_events(struct fuse_mount *fm);
++
+ #endif /* _FS_FUSE_I_H */
 --- a/fs/fuse/inode.c
 +++ b/fs/fuse/inode.c
-@@ -1316,6 +1316,7 @@
+@@ -1316,6 +1316,7 @@ struct fuse_init_args {
  
  static void process_init_reply(struct fuse_args *args, int error)
  {
@@ -193,16 +202,16 @@
  	struct fuse_init_args *ia = container_of(args, typeof(*ia), args);
  	struct fuse_mount *fm = ia->fm;
  	struct fuse_conn *fc = fm->fc;
-@@ -1335,6 +1336,8 @@
- 
+@@ -1336,6 +1337,8 @@ static void process_init_reply(struct fuse_args *args, int error)
  			if (flags & FUSE_INIT_EXT)
  				flags |= (u64) arg->flags2 << 32;
-+
-+			file_events = flags & FUSE_TERRA_FILE_EVENTS;
  
++			file_events = flags & FUSE_TERRA_FILE_EVENTS;
++
  			ra_pages = arg->max_readahead / PAGE_SIZE;
  			if (flags & FUSE_ASYNC_READ)
-@@ -1478,6 +1481,8 @@
+ 				fc->async_read = 1;
+@@ -1478,6 +1481,8 @@ static void process_init_reply(struct fuse_args *args, int error)
  
  	fuse_set_initialized(fc);
  	wake_up_all(&fc->blocked_waitq);
@@ -211,7 +220,7 @@
  }
  
  static struct fuse_init_args *fuse_new_init(struct fuse_mount *fm)
-@@ -1524,6 +1529,7 @@
+@@ -1520,6 +1525,7 @@ static struct fuse_init_args *fuse_new_init(struct fuse_mount *fm)
  	if (fuse_uring_enabled())
  		flags |= FUSE_OVER_IO_URING;
  
@@ -219,18 +228,9 @@
  	ia->in.flags = flags;
  	ia->in.flags2 = flags >> 32;
  
---- a/fs/fuse/fuse_i.h
-+++ b/fs/fuse/fuse_i.h
-@@ -1556,4 +1556,6 @@
- #define fuse_sysctl_unregister()	do { } while (0)
- #endif /* CONFIG_SYSCTL */
- 
-+void fuse_terra_start_events(struct fuse_mount *fm);
-+
- #endif /* _FS_FUSE_I_H */
 --- a/fs/fuse/virtio_fs.c
 +++ b/fs/fuse/virtio_fs.c
-@@ -1434,6 +1434,13 @@
+@@ -1436,6 +1436,13 @@ static int virtio_fs_enqueue_req(struct virtio_fs_vq *fsvq,
  	}
  
  	vq = fsvq->vq;
@@ -244,7 +244,7 @@
  	ret = virtqueue_add_sgs(vq, sgs, out_sgs, in_sgs, req, GFP_ATOMIC);
  	if (ret < 0) {
  		spin_unlock(&fsvq->lock);
-@@ -1615,6 +1615,15 @@
+@@ -1617,6 +1624,15 @@ static void virtio_fs_conn_destroy(struct fuse_mount *fm)
  	if (IS_ENABLED(CONFIG_FUSE_DAX))
  		fuse_dax_cancel_work(fc);
  
@@ -262,13 +262,14 @@
  	fsvq->connected = false;
 --- a/include/uapi/linux/fuse.h
 +++ b/include/uapi/linux/fuse.h
-@@ -1308,4 +1308,16 @@
+@@ -1308,4 +1308,17 @@ struct fuse_uring_cmd_req {
  	uint8_t padding[6];
  };
  
 +#define FUSE_TERRA_FILE_EVENTS (1ULL << 63)
 +#define FUSE_TERRA_RECEIVE_EVENT 4096
 +#define FUSE_TERRA_CANCEL_EVENTS 4097
++#define FUSE_TERRA_EVENT_DIRECTORY 0x100
 +#define FUSE_TERRA_EVENT_SAME_INODE 0x200
 +struct fuse_terra_event {
 +	uint64_t parent;

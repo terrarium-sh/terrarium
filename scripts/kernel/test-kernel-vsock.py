@@ -49,9 +49,7 @@ def transport_credit_source(source: str) -> str:
     notification_begin = dequeue.index('\tfwd_cnt_delta =')
     notification_end = dequeue.index('\n\treturn total;', notification_begin)
     return (
-        declaration(source, r'^static void virtio_transport_dec_rx_pkt\(') + '\n'
-        + declaration(source, r'^void virtio_transport_inc_tx_pkt\(') + '\n'
-        + 'static void check_dequeue_credit(struct vsock_sock *vsk) {\n'
+        'static void check_dequeue_credit(struct vsock_sock *vsk) {\n'
         + 'struct virtio_vsock_sock *vvs=vsk->trans;u32 fwd_cnt_delta,receive_window,peer_receive_window;\n'
         + 'bool low_rx_bytes;int receive_low_water;\n'
         + dequeue[snapshot_begin:snapshot_end]
@@ -69,13 +67,15 @@ def transport_receive_source(source: str, connection: str) -> str:
         + '\n' + declaration(connection, r'^static int vsock_set_peek_off\('))
 
 
-def udp_definitions(source: str) -> str:
-    names = ('TERRA_UDP_MAX_SEGMENTS', 'TERRA_UDP_SEGMENT_FIELD_BYTES', 'TERRA_UDP_CARRIER_BYTES',
-             'TERRA_UDP_RUN_BYTES', 'TERRA_UDP_QUEUE_BYTES', 'TERRA_UDP_QUEUED_DATAGRAMS')
+def socket_definitions(source: str) -> str:
+    names = ('TERRA_TCP_OPEN_BYTES', 'TERRA_UDP_MAX_SEGMENTS', 'TERRA_UDP_SEGMENT_FIELD_BYTES',
+             'TERRA_UDP_PREFIX_BYTES', 'TERRA_UDP_CARRIER_BYTES', 'TERRA_UDP_RUN_BYTES', 'TERRA_UDP_QUEUE_BYTES',
+             'TERRA_UDP_QUEUED_DATAGRAMS')
     definitions = [re.search(rf'^#define {name}\b(?:.*\\\n)*.*$', source, re.MULTILINE)[0] for name in names]
     control_block = re.search(r'^struct terra_datagram_cb \{.*?^#define TERRA_DATAGRAM_CB\(skb\)[^\n]*',
                               source, re.MULTILINE | re.DOTALL)[0]
-    return '\n'.join(definitions) + '\n' + control_block + '\n'
+    errors = re.search(r'^static const u8 terra_errors\[\] = \{.*?^\};', source, re.MULTILINE | re.DOTALL)[0]
+    return '\n'.join(definitions) + '\n' + control_block + '\n' + errors + '\n'
 
 
 def tcp_info_source(source: str) -> str:
@@ -83,6 +83,8 @@ def tcp_info_source(source: str) -> str:
         re.search(r'^#define TERRA_TCP_SEGMENT_BYTES [0-9]+$', source, re.MULTILINE)[0] + '\n'
         + declaration(source, r'^static bool terra_udp_option\(') + '\n'
         + declaration(source, r'^static bool terra_keepalive_option\(') + '\n'
+        + declaration(source, r'^static bool terra_forwarded_option\(') + '\n'
+        + declaration(source, r'^static int terra_get_tcp_info\(') + '\n'
         + declaration(source, r'^static int terra_getsockopt\(') + '\n'
         + declaration(source, r'^static int terra_send_stream\(') + '\n'
     )
@@ -100,10 +102,9 @@ def main() -> None:
     transport = patched_source('net/vmw_vsock/virtio_transport_common.c')
     request_credit = declaration(transport, r'^int virtio_transport_send_credit_request\(')
     functions = request_credit + '\n' + '\n'.join(declaration(source, rf'^static [^\n]*\b{name}\(') for name in (
-        'terra_decode_error', 'terra_encode_peer', 'terra_decode_peer', 'terra_canonical_peer',
-        'terra_peer_equal', 'terra_validate_opened', 'terra_open_timeout', 'terra_frame_header',
-        'terra_datagram_bytes', 'terra_datagram_segment', 'terra_udp_queue_admits', 'terra_discard_udp_bytes',
-        'terra_receive_udp_datagram', 'terra_resume_udp', 'terra_consume_datagram', 'terra_receive_coalesced',
+        'terra_decode_error', 'terra_encode_peer', 'terra_decode_peer', 'terra_peer_equal',
+        'terra_validate_opened', 'terra_open_timeout', 'terra_frame_header', 'terra_datagram_bytes',
+        'terra_datagram_segment', 'terra_udp_queue_admits', 'terra_receive_udp_datagram', 'terra_resume_udp', 'terra_consume_datagram', 'terra_receive_coalesced',
         'terra_receive_udp_frame', 'terra_udp_writable', 'terra_udp_control', 'terra_send_udp',
         'terra_track_tcp_close', 'terra_setup_stream', 'terra_socket_poll', 'terra_set_peek_off', 'terra_listen',
         'terra_recv_stream', 'terra_recv_error_queue', 'terra_recv_native_datagram', 'terra_udp_receive_ready',
@@ -113,7 +114,7 @@ def main() -> None:
         'terra_resume_udp', 'terra_stream_callback', 'terra_restore_stream_callbacks', 'terra_detach_stream',
         'terra_release_socket'))
     programs = (
-        ('socket-checks.c', udp_definitions(source) + functions, ['-Wno-unused-function', '-Wno-sign-compare']),
+        ('socket-checks.c', socket_definitions(source) + functions, ['-Wno-unused-function', '-Wno-sign-compare']),
         ('tcp-info-checks.c', tcp_info_source(source), ['-Wno-sign-compare']),
         ('credit-checks.c', transport_credit_source(transport) + transport_receive_source(transport, connection),
          ['-Wno-sign-compare']),

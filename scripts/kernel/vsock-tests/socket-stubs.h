@@ -143,6 +143,15 @@ static bool ipv6_addr_equal(const struct in6_addr *a, const struct in6_addr *b) 
 static bool ipv6_addr_any(const struct in6_addr *a) {
     return !(a->s6_addr32[0] | a->s6_addr32[1] | a->s6_addr32[2] | a->s6_addr32[3]);
 }
+static void ipv6_addr_set_v4mapped(__be32 address, struct in6_addr *mapped) {
+    *mapped = (struct in6_addr){.s6_addr32 = {0, 0, htonl(0xffff), address}};
+}
+static const void *memchr_inv(const void *start, int value, size_t length) {
+    for (const u8 *byte = start; length--; byte++)
+        if (*byte != (u8)value)
+            return byte;
+    return NULL;
+}
 struct in_pktinfo {
     int ipi_ifindex;
     struct in_addr ipi_spec_dst, ipi_addr;
@@ -475,18 +484,16 @@ struct terra_tsi_socket {
     bool connecting, closing;
     int connect_error;
     struct sock *sk;
-    struct sockaddr_storage peer;
-    unsigned int peer_length;
-    bool udp_connected;
+    struct sockaddr_in6 peer;
     int udp_failed, wait;
-    u8 *udp_receive, *udp_frame;
+    u8 *udp_frame;
     struct sk_buff_head datagrams;
     bool peer_send_closed, peer_closed, connected, udp_open;
     int mode;
     const struct proto_ops *native_ops;
     struct work_struct setup_work, udp_work;
     u8 opening[64];
-    unsigned int opening_offset, opening_length, opened_length;
+    unsigned int opening_offset, opened_length;
 };
 /* terra_connect_locked is compiled whole; the checks drive only its early branches, so its later steps abort.
  */
@@ -504,13 +511,13 @@ static void terra_detach_stream(struct terra_tsi_socket *state) {
     (void)state;
     abort();
 }
-static int terra_copy_peer(struct sockaddr_storage *destination, const struct sockaddr *peer, int length) {
-    (void)destination;
+static int terra_copy_peer(struct sockaddr_in6 *peer, const struct sockaddr *address, int length) {
     (void)peer;
+    (void)address;
     (void)length;
     abort();
 }
-static int terra_prepare_external(struct terra_tsi_socket *state) {
+static int terra_bind_external(struct terra_tsi_socket *state) {
     (void)state;
     abort();
 }
@@ -625,7 +632,7 @@ static int kernel_recvmsg(struct socket *socket, struct msghdr *message, struct 
     if (!carrier_available)
         return -EAGAIN;
     assert(carrier_available >= (s64)length);
-    for (unsigned int index = 0; index < count; index++) {
+    for (unsigned int index = 0; index < count && !(flags & MSG_TRUNC); index++) {
         memcpy(vector[index].iov_base, carrier + offset, vector[index].iov_len);
         offset += vector[index].iov_len;
     }
@@ -659,9 +666,9 @@ static void terra_socket_error(struct terra_tsi_socket *state, int error) {
     terra_socket_wake(state);
 }
 static void terra_queue_datagram_error(struct terra_tsi_socket *state, int error,
-                                       const struct sockaddr_storage *peer) {
+                                       const struct sockaddr_in6 *peer) {
     (void)state;
-    assert(error == -EACCES && peer->ss_family == AF_INET);
+    assert(error == -EACCES && ipv6_addr_v4mapped(&peer->sin6_addr));
     queued_errors++;
 }
 static void terra_udp_failed(struct terra_tsi_socket *state, int error) {

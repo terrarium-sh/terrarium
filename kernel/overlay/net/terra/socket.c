@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include <linux/build_bug.h>
-#include <linux/capability.h>
-#include <linux/inet.h>
 #include <linux/init.h>
-#include <linux/ioctl.h>
 #include <linux/jiffies.h>
 #include <linux/kobject.h>
 #include <asm/ioctls.h>
@@ -29,9 +26,12 @@
 #include <net/sock_reuseport.h>
 #include <uapi/linux/sockios.h>
 
+#define TERRA_SOCKET_VERSION 1
 #define TERRA_NETWORK_VERSION 1
 #define TERRA_HEADER_BYTES 8
 #define TERRA_ENDPOINT_BYTES 20
+/* TCP_OPEN: header, version, target kind, flags, three keepalive fields, then the peer endpoint. */
+#define TERRA_TCP_OPEN_BYTES (TERRA_HEADER_BYTES + 12 + TERRA_ENDPOINT_BYTES)
 #define TERRA_TCP_PORT 6002
 #define TERRA_UDP_PORT 6003
 #define TERRA_TCP_SEGMENT_BYTES 65535
@@ -41,13 +41,16 @@ static_assert(TERRA_TCP_RECEIVE_BYTES + TERRA_TCP_SEND_BYTES == 131072);
 #define TERRA_UDP_DATAGRAM 4096
 #define TERRA_UDP_MAX_SEGMENTS 64
 #define TERRA_UDP_SEGMENT_FIELD_BYTES 4
-#define TERRA_UDP_FRAME_BYTES \
-	(TERRA_HEADER_BYTES + TERRA_ENDPOINT_BYTES + TERRA_UDP_SEGMENT_FIELD_BYTES + TERRA_UDP_DATAGRAM)
+/* A UDP frame is header, peer endpoint, and segment field, then datagram payload. */
+#define TERRA_UDP_PREFIX_BYTES \
+	(TERRA_HEADER_BYTES + TERRA_ENDPOINT_BYTES + TERRA_UDP_SEGMENT_FIELD_BYTES)
+#define TERRA_UDP_FRAME_BYTES (TERRA_UDP_PREFIX_BYTES + TERRA_UDP_DATAGRAM)
 #define TERRA_UDP_CARRIER_BYTES 65536
-/* A UDP frame fills at most the carrier's buffer; a larger one could never be fully received.
- * terra_send_udp's capacity check enforces this bound with -EMSGSIZE, as native GSO does. */
-#define TERRA_UDP_RUN_BYTES \
-	(TERRA_UDP_CARRIER_BYTES - TERRA_HEADER_BYTES - TERRA_ENDPOINT_BYTES - TERRA_UDP_SEGMENT_FIELD_BYTES)
+/*
+ * A UDP frame fills at most the carrier's buffer; a larger one could never be fully received.
+ * terra_send_udp's capacity check enforces this bound with -EMSGSIZE, as native GSO does.
+ */
+#define TERRA_UDP_RUN_BYTES (TERRA_UDP_CARRIER_BYTES - TERRA_UDP_PREFIX_BYTES)
 #define TERRA_UDP_QUEUE_BYTES 131072
 #define TERRA_UDP_QUEUED_DATAGRAMS 48
 #define TERRA_DRAIN_BUDGET 16
@@ -61,16 +64,19 @@ static_assert(TERRA_TCP_RECEIVE_BYTES + TERRA_TCP_SEND_BYTES == 131072);
 #define TERRA_OP_UDP_DATAGRAM 0x103
 #define TERRA_OP_UDP_ERROR 0x104
 
-/* A queued datagram skb: endpoint then payload; `offset` payload bytes were already delivered. */
+/* A queued skb's payload came from `peer`; its first `offset` bytes were already delivered. */
 struct terra_datagram_cb {
+	struct sockaddr_in6 peer;
 	u32 offset;
 	u16 segment;
 };
+
 #define TERRA_DATAGRAM_CB(skb) ((struct terra_datagram_cb *)(skb)->cb)
+static_assert(sizeof(struct terra_datagram_cb) <= sizeof_field(struct sk_buff, cb));
 
 static unsigned int terra_datagram_bytes(const struct sk_buff *skb)
 {
-	return skb->len - TERRA_ENDPOINT_BYTES - TERRA_DATAGRAM_CB(skb)->offset;
+	return skb->len - TERRA_DATAGRAM_CB(skb)->offset;
 }
 
 /* Size of the skb's next datagram; every later one but a shorter last has the same size. */
@@ -93,40 +99,43 @@ struct terra_tsi_socket {
 	const struct proto_ops *native_ops;
 	struct proto_ops operations;
 	struct socket *stream;
+	/* Guards mode, peer, the carrier stream, and the TCP opening exchange. */
 	struct mutex select_mutex;
+	/* Serializes connect and external UDP sends, which share udp_frame and carrier space. */
 	struct mutex send_mutex;
+	/* Serializes UDP receives, which peek, copy, then consume the head datagram. */
 	struct mutex receive_mutex;
 	struct work_struct setup_work;
 	struct delayed_work timeout_work;
 	struct work_struct udp_work;
 	wait_queue_head_t wait;
-	struct sockaddr_storage peer;
-	unsigned int peer_length;
+	/* The external peer; an IPv4 one is v4-mapped so both families compare and encode alike. */
+	struct sockaddr_in6 peer;
 	enum terra_socket_mode mode;
+	/*
+	 * connecting, connected, and udp_open are set with smp_store_release after the stream and
+	 * connect_error they describe; lockless readers pair them with smp_load_acquire.
+	 */
 	bool connecting;
 	bool connected;
 	bool closing;
-	bool bound;
-	bool udp_connected;
 	bool udp_open;
 	bool peer_send_closed;
 	bool peer_closed;
 	int udp_failed;
 	int connect_error;
-	u8 opening[64];
-	u8 opened[64];
-	unsigned int opening_length;
+	u8 opening[TERRA_TCP_OPEN_BYTES];
+	u8 opened[TERRA_HEADER_BYTES + 4 + TERRA_ENDPOINT_BYTES];
 	unsigned int opening_offset;
 	unsigned int opened_length;
 	unsigned int opened_needed;
 	unsigned long opening_deadline;
-	void (*data_ready)(struct sock *);
-	void (*write_space)(struct sock *);
-	void (*state_change)(struct sock *);
-	void (*error_report)(struct sock *);
+	void (*data_ready)(struct sock *sk);
+	void (*write_space)(struct sock *sk);
+	void (*state_change)(struct sock *sk);
+	void (*error_report)(struct sock *sk);
 	struct sk_buff_head datagrams;
 	u8 *udp_frame;
-	u8 *udp_receive;
 };
 
 static struct terra_tsi_socket *terra_socket_state(struct socket *socket)
@@ -134,30 +143,16 @@ static struct terra_tsi_socket *terra_socket_state(struct socket *socket)
 	return (void *)((uintptr_t)READ_ONCE(socket->sk->sk_user_data) & SK_USER_DATA_PTRMASK);
 }
 
-static int terra_decode_error(u16 error)
+/* The errno for each terra_protocol::socket::Error code; code 0 is success, not an error. */
+static const u8 terra_errors[] = {
+	0, EACCES, EINVAL, ENOTCONN, ESTALE, EPROTOTYPE, EAGAIN,
+	ENOBUFS, EALREADY, ECANCELED, ECONNREFUSED, ECONNRESET, ETIMEDOUT, EHOSTUNREACH,
+	EAGAIN, EMSGSIZE, EPIPE, EIO, EOPNOTSUPP, ENETDOWN, EPROTO,
+};
+
+static int terra_decode_error(u16 status)
 {
-	switch (error) {
-	case 1: return -EACCES;
-	case 2: return -EINVAL;
-	case 3: return -ENOTCONN;
-	case 4: return -ESTALE;
-	case 5: return -EPROTOTYPE;
-	case 6: return -EAGAIN;
-	case 7: return -ENOBUFS;
-	case 8: return -EALREADY;
-	case 9: return -ECANCELED;
-	case 10: return -ECONNREFUSED;
-	case 11: return -ECONNRESET;
-	case 12: return -ETIMEDOUT;
-	case 13: return -EHOSTUNREACH;
-	case 14: return -EAGAIN;
-	case 15: return -EMSGSIZE;
-	case 16: return -EPIPE;
-	case 17: return -EIO;
-	case 18: return -EOPNOTSUPP;
-	case 19: return -ENETDOWN;
-	default: return -EPROTO;
-	}
+	return status && status < ARRAY_SIZE(terra_errors) ? -terra_errors[status] : -EPROTO;
 }
 
 static void terra_socket_wake(struct terra_tsi_socket *state)
@@ -175,196 +170,111 @@ static void terra_socket_error(struct terra_tsi_socket *state, int error)
 }
 
 static void terra_queue_datagram_error(struct terra_tsi_socket *state, int error,
-				       const struct sockaddr_storage *peer)
+				       const struct sockaddr_in6 *peer)
 {
-	struct flowi6 flow = {};
+	struct flowi6 flow = { .daddr = peer->sin6_addr, .fl6_dport = peer->sin6_port };
+	struct sock *sk = state->sk;
 
-	if (state->sk->sk_type != SOCK_DGRAM ||
-	    (peer->ss_family != AF_INET && peer->ss_family != AF_INET6))
-		return;
-	if (error < 0)
-		error = -error;
-	if (state->sk->sk_family == AF_INET ||
-	    (inet_test_bit(RECVERR, state->sk) && !inet6_test_bit(RECVERR6, state->sk) &&
-	     (peer->ss_family == AF_INET ||
-	      ipv6_addr_v4mapped(&((const struct sockaddr_in6 *)peer)->sin6_addr)))) {
-		__be32 address;
-		__be16 port;
-
-		if (peer->ss_family == AF_INET) {
-			address = ((const struct sockaddr_in *)peer)->sin_addr.s_addr;
-			port = ((const struct sockaddr_in *)peer)->sin_port;
-		} else {
-			address = ((const struct sockaddr_in6 *)peer)->sin6_addr.s6_addr32[3];
-			port = ((const struct sockaddr_in6 *)peer)->sin6_port;
-		}
-		ip_local_error(state->sk, error, address, port, 0);
-		return;
-	}
-	if (peer->ss_family == AF_INET) {
-		const struct sockaddr_in *address = (const void *)peer;
-
-		ipv6_addr_set_v4mapped(address->sin_addr.s_addr, &flow.daddr);
-		flow.fl6_dport = address->sin_port;
-	} else {
-		const struct sockaddr_in6 *address = (const void *)peer;
-
-		flow.daddr = address->sin6_addr;
-		flow.fl6_dport = address->sin6_port;
-	}
-	ipv6_local_error(state->sk, error, &flow, 0);
+	if (sk->sk_family == AF_INET ||
+	    (ipv6_addr_v4mapped(&peer->sin6_addr) && inet_test_bit(RECVERR, sk) &&
+	     !inet6_test_bit(RECVERR6, sk)))
+		ip_local_error(sk, -error, peer->sin6_addr.s6_addr32[3], peer->sin6_port, 0);
+	else
+		ipv6_local_error(sk, -error, &flow, 0);
 }
 
-static int terra_encode_peer(u8 *endpoint, const struct sockaddr_storage *peer,
-			     unsigned int peer_length)
+static int terra_encode_peer(u8 *endpoint, const struct sockaddr_in6 *peer)
 {
 	memset(endpoint, 0, TERRA_ENDPOINT_BYTES);
-	if (peer->ss_family == AF_INET && peer_length >= sizeof(struct sockaddr_in)) {
-		const struct sockaddr_in *address = (const void *)peer;
-
-		if (!address->sin_port)
-			return -EINVAL;
+	if (peer->sin6_scope_id || peer->sin6_flowinfo)
+		return -EOPNOTSUPP;
+	if (!peer->sin6_port)
+		return -EINVAL;
+	put_unaligned_le16(ntohs(peer->sin6_port), endpoint + 2);
+	if (ipv6_addr_v4mapped(&peer->sin6_addr)) {
 		endpoint[0] = 4;
-		put_unaligned_le16(ntohs(address->sin_port), endpoint + 2);
-		memcpy(endpoint + 4, &address->sin_addr, 4);
-		return 0;
-	}
-	if (peer->ss_family == AF_INET6 && peer_length >= 24) {
-		const struct sockaddr_in6 *address = (const void *)peer;
-
-		if (address->sin6_scope_id || address->sin6_flowinfo)
-			return -EOPNOTSUPP;
-		if (!address->sin6_port)
-			return -EINVAL;
+		memcpy(endpoint + 4, &peer->sin6_addr.s6_addr32[3], 4);
+	} else {
 		endpoint[0] = 6;
-		put_unaligned_le16(ntohs(address->sin6_port), endpoint + 2);
-		memcpy(endpoint + 4, &address->sin6_addr, 16);
-		return 0;
+		memcpy(endpoint + 4, &peer->sin6_addr, 16);
 	}
-	return -EAFNOSUPPORT;
+	return 0;
 }
 
-static int terra_decode_peer(struct sockaddr_storage *peer, const u8 *endpoint)
+static int terra_decode_peer(struct sockaddr_in6 *peer, const u8 *endpoint)
 {
-	unsigned int index;
+	__be32 address4;
 
 	memset(peer, 0, sizeof(*peer));
+	peer->sin6_family = AF_INET6;
+	peer->sin6_port = htons(get_unaligned_le16(endpoint + 2));
 	if (endpoint[1])
 		return -EPROTO;
-	if (endpoint[0] == 4) {
-		struct sockaddr_in *address = (void *)peer;
-
-		for (index = 8; index < TERRA_ENDPOINT_BYTES; index++)
-			if (endpoint[index])
-				return -EPROTO;
-		address->sin_family = AF_INET;
-		address->sin_port = htons(get_unaligned_le16(endpoint + 2));
-		memcpy(&address->sin_addr, endpoint + 4, 4);
-		return sizeof(*address);
-	}
 	if (endpoint[0] == 6) {
-		struct sockaddr_in6 *address = (void *)peer;
-
-		address->sin6_family = AF_INET6;
-		address->sin6_port = htons(get_unaligned_le16(endpoint + 2));
-		memcpy(&address->sin6_addr, endpoint + 4, 16);
-		return sizeof(*address);
+		memcpy(&peer->sin6_addr, endpoint + 4, 16);
+		return 0;
 	}
-	return -EPROTO;
+	if (endpoint[0] != 4 || memchr_inv(endpoint + 8, 0, TERRA_ENDPOINT_BYTES - 8))
+		return -EPROTO;
+	memcpy(&address4, endpoint + 4, sizeof(address4));
+	ipv6_addr_set_v4mapped(address4, &peer->sin6_addr);
+	return 0;
 }
 
-static void terra_canonical_peer(const struct sockaddr_storage *peer, __be32 *address4,
-				 struct in6_addr *address6, __be16 *port)
+static bool terra_peer_equal(const struct sockaddr_in6 *first, const struct sockaddr_in6 *second)
 {
-	*address4 = 0;
-	memset(address6, 0, sizeof(*address6));
-	if (peer->ss_family == AF_INET) {
-		*address4 = ((const struct sockaddr_in *)peer)->sin_addr.s_addr;
-		*port = ((const struct sockaddr_in *)peer)->sin_port;
-		return;
+	return first->sin6_port == second->sin6_port &&
+		ipv6_addr_equal(&first->sin6_addr, &second->sin6_addr);
+}
+
+/* Writes `peer` in the form the socket's family reports addresses and returns its length. */
+static int terra_report_peer(const struct sock *sk, const struct sockaddr_in6 *peer, void *address)
+{
+	struct sockaddr_in *address4 = address;
+
+	if (sk->sk_family == AF_INET6) {
+		memcpy(address, peer, sizeof(*peer));
+		return sizeof(*peer);
 	}
-	*port = ((const struct sockaddr_in6 *)peer)->sin6_port;
-	if (ipv6_addr_v4mapped(&((const struct sockaddr_in6 *)peer)->sin6_addr))
-		*address4 = ((const struct sockaddr_in6 *)peer)->sin6_addr.s6_addr32[3];
-	else
-		*address6 = ((const struct sockaddr_in6 *)peer)->sin6_addr;
+	memset(address4, 0, sizeof(*address4));
+	address4->sin_family = AF_INET;
+	address4->sin_port = peer->sin6_port;
+	address4->sin_addr.s_addr = peer->sin6_addr.s6_addr32[3];
+	return sizeof(*address4);
 }
 
-static bool terra_peer_equal(const struct sockaddr_storage *first,
-			     const struct sockaddr_storage *second)
+static int terra_copy_peer(struct sockaddr_in6 *peer, const struct sockaddr *address, int length)
 {
-	struct in6_addr first6, second6;
-	__be32 first4, second4;
-	__be16 first_port, second_port;
+	const struct sockaddr_in *address4 = (const void *)address;
 
-	terra_canonical_peer(first, &first4, &first6, &first_port);
-	terra_canonical_peer(second, &second4, &second6, &second_port);
-	return first_port == second_port && first4 == second4 &&
-		ipv6_addr_equal(&first6, &second6);
-}
-
-static int terra_report_peer(struct terra_tsi_socket *state,
-			      struct sockaddr_storage *peer, int length)
-{
-	struct sockaddr_in address4;
-	struct sockaddr_in6 *address6;
-
-	if (state->sk->sk_family != AF_INET6 || peer->ss_family != AF_INET)
-		return length;
-	address4 = *(struct sockaddr_in *)peer;
 	memset(peer, 0, sizeof(*peer));
-	address6 = (struct sockaddr_in6 *)peer;
-	address6->sin6_family = AF_INET6;
-	address6->sin6_port = address4.sin_port;
-	ipv6_addr_set_v4mapped(address4.sin_addr.s_addr, &address6->sin6_addr);
-	return sizeof(*address6);
-}
-
-static int terra_copy_peer(struct sockaddr_storage *destination,
-			   const struct sockaddr *peer, int length)
-{
-	unsigned int required;
-
-	if (length < sizeof(peer->sa_family))
+	if (length < sizeof(address->sa_family))
 		return -EINVAL;
-	switch (peer->sa_family) {
-	case AF_INET: required = sizeof(struct sockaddr_in); break;
-	case AF_INET6: required = 24; break;
-	default: return -EAFNOSUPPORT;
+	switch (address->sa_family) {
+	case AF_INET:
+		if (length < sizeof(*address4))
+			return -EINVAL;
+		peer->sin6_family = AF_INET6;
+		peer->sin6_port = address4->sin_port;
+		ipv6_addr_set_v4mapped(address4->sin_addr.s_addr, &peer->sin6_addr);
+		return 0;
+	case AF_INET6:
+		if (length < SIN6_LEN_RFC2133)
+			return -EINVAL;
+		memcpy(peer, address, min_t(int, length, sizeof(*peer)));
+		return 0;
+	default:
+		return -EAFNOSUPPORT;
 	}
-	if (length < required)
-		return -EINVAL;
-	memset(destination, 0, sizeof(*destination));
-	memcpy(destination, peer, min_t(size_t, length, sizeof(*destination)));
-	return peer->sa_family == AF_INET ? sizeof(struct sockaddr_in) :
-						 sizeof(struct sockaddr_in6);
 }
 
-static bool terra_peer_is_host_service(const struct sockaddr_storage *peer)
-{
-	static const struct in6_addr gateway6 = {
-		.s6_addr = { 0xfd, 0x53, 0x4d, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },
-	};
-
-	if (peer->ss_family == AF_INET)
-		return ((const struct sockaddr_in *)peer)->sin_addr.s_addr ==
-			htonl(0x64600001);
-	if (peer->ss_family == AF_INET6) {
-		const struct in6_addr *address = &((const struct sockaddr_in6 *)peer)->sin6_addr;
-
-		return ipv6_addr_equal(address, &gateway6) ||
-			(ipv6_addr_v4mapped(address) && address->s6_addr32[3] == htonl(0x64600001));
-	}
-	return false;
-}
-
+/* Gives the native socket a local port before external use, as connect or sendto would. */
 static int terra_bind_external(struct terra_tsi_socket *state)
 {
-	struct sockaddr_storage local = { 0 };
+	struct sockaddr_storage local = { .ss_family = state->sk->sk_family };
 
 	if (inet_sk(state->sk)->inet_num)
 		return 0;
-	local.ss_family = state->sk->sk_family;
 	return state->native_ops->bind(state->socket, (struct sockaddr_unsized *)&local,
 		state->sk->sk_family == AF_INET ? sizeof(struct sockaddr_in) :
 						 sizeof(struct sockaddr_in6));
@@ -402,34 +312,37 @@ static void terra_stream_options(struct terra_tsi_socket *state)
 	WRITE_ONCE(transport->sk_sndtimeo, READ_ONCE(state->sk->sk_sndtimeo));
 	WRITE_ONCE(transport->sk_rcvtimeo, READ_ONCE(state->sk->sk_rcvtimeo));
 	WRITE_ONCE(transport->sk_rcvlowat, READ_ONCE(state->sk->sk_rcvlowat));
-	WRITE_ONCE(transport->sk_sndbuf, min_t(int, READ_ONCE(state->sk->sk_sndbuf), TERRA_TCP_SEND_BYTES));
+	WRITE_ONCE(transport->sk_sndbuf,
+		   min_t(int, READ_ONCE(state->sk->sk_sndbuf), TERRA_TCP_SEND_BYTES));
 	state->stream->ops->setsockopt(state->stream, AF_VSOCK, SO_VM_SOCKETS_BUFFER_SIZE,
 		KERNEL_SOCKPTR(&buffer), sizeof(buffer));
 }
 
-/* Create the per-socket carrier; its guest port never shadows a fixed agent, control, or publication port. */
 static int terra_create_stream(struct terra_tsi_socket *state, u64 receive_bytes)
 {
-	struct sockaddr_vm local = { .svm_family = AF_VSOCK, .svm_cid = 3, .svm_port = VMADDR_PORT_ANY };
+	struct sockaddr_vm local = {
+		.svm_family = AF_VSOCK, .svm_cid = 3, .svm_port = VMADDR_PORT_ANY,
+	};
+	sockptr_t value = KERNEL_SOCKPTR(&receive_bytes);
+	u32 port;
 	int error;
 
 	error = sock_create_kern(&init_net, AF_VSOCK, SOCK_STREAM, 0, &state->stream);
 	if (error)
 		return error;
 	error = kernel_bind(state->stream, (struct sockaddr_unsized *)&local, sizeof(local));
-	if (!error) {
-		error = kernel_getsockname(state->stream, (struct sockaddr *)&local);
-		if (error >= 0)
-			error = local.svm_port >= 6000 && local.svm_port <= 6004 &&
-				local.svm_port != TERRA_TCP_PORT && local.svm_port != TERRA_UDP_PORT ?
-				-EADDRNOTAVAIL : 0;
-	}
+	port = vsock_sk(state->stream->sk)->local_addr.svm_port;
+	/* A dynamic carrier port must not shadow Terra's fixed vsock ports 6000-6004. */
+	if (!error && port >= 6000 && port <= 6004)
+		error = -EADDRNOTAVAIL;
 	if (!error)
 		error = state->stream->ops->setsockopt(state->stream, AF_VSOCK,
-			SO_VM_SOCKETS_BUFFER_MAX_SIZE, KERNEL_SOCKPTR(&receive_bytes), sizeof(receive_bytes));
+						       SO_VM_SOCKETS_BUFFER_MAX_SIZE, value,
+						       sizeof(receive_bytes));
 	if (!error)
 		error = state->stream->ops->setsockopt(state->stream, AF_VSOCK,
-			SO_VM_SOCKETS_BUFFER_SIZE, KERNEL_SOCKPTR(&receive_bytes), sizeof(receive_bytes));
+						       SO_VM_SOCKETS_BUFFER_SIZE, value,
+						       sizeof(receive_bytes));
 	if (error) {
 		sock_release(state->stream);
 		state->stream = NULL;
@@ -499,7 +412,7 @@ static void terra_finish_opening(struct terra_tsi_socket *state, int error)
 static int terra_validate_opened(struct terra_tsi_socket *state)
 {
 	const u8 *frame = state->opened;
-	struct sockaddr_storage peer;
+	struct sockaddr_in6 peer;
 	u16 status;
 
 	if (get_unaligned_le16(frame) != TERRA_OP_TCP_OPENED || get_unaligned_le16(frame + 2) ||
@@ -510,10 +423,10 @@ static int terra_validate_opened(struct terra_tsi_socket *state)
 		return state->opened_needed == 12 ? terra_decode_error(status) : -EPROTO;
 	if (state->opened_needed != 32)
 		return -EPROTO;
-	return terra_decode_peer(&peer, frame + 12) < 0 ? -EPROTO : 0;
+	return terra_decode_peer(&peer, frame + 12);
 }
 
-/* Every carrier failure before the opening result means networking is unavailable, not a peer reset. */
+/* Any carrier failure before the opening result means the network is down, not a peer reset. */
 static void terra_setup_stream(struct work_struct *work)
 {
 	struct terra_tsi_socket *state = container_of(work, struct terra_tsi_socket, setup_work);
@@ -536,9 +449,9 @@ static void terra_setup_stream(struct work_struct *work)
 		goto unlock;
 	}
 	state->stream->state = SS_CONNECTED;
-	if (state->opening_offset < state->opening_length) {
+	if (state->opening_offset < TERRA_TCP_OPEN_BYTES) {
 		vector.iov_base = state->opening + state->opening_offset;
-		vector.iov_len = state->opening_length - state->opening_offset;
+		vector.iov_len = TERRA_TCP_OPEN_BYTES - state->opening_offset;
 		result = kernel_sendmsg(state->stream, &message, &vector, 1, vector.iov_len);
 		if (result == -EAGAIN)
 			goto unlock;
@@ -547,7 +460,7 @@ static void terra_setup_stream(struct work_struct *work)
 			goto failed;
 		}
 		state->opening_offset += result;
-		if (state->opening_offset < state->opening_length) {
+		if (state->opening_offset < TERRA_TCP_OPEN_BYTES) {
 			queue_work(system_unbound_wq, &state->setup_work);
 			goto unlock;
 		}
@@ -598,10 +511,10 @@ static void terra_open_timeout(struct work_struct *work)
 	mutex_lock(&state->select_mutex);
 	now = jiffies;
 	if (READ_ONCE(state->connecting) && !READ_ONCE(state->closing)) {
-		if (time_before(now, state->opening_deadline))
+		if (time_before(now, state->opening_deadline)) {
 			mod_delayed_work(system_unbound_wq, &state->timeout_work,
-				state->opening_deadline - now);
-		else {
+					 state->opening_deadline - now);
+		} else {
 			kernel_sock_shutdown(state->stream, SHUT_RDWR);
 			terra_finish_opening(state, -ETIMEDOUT);
 		}
@@ -618,9 +531,9 @@ static void terra_track_tcp_close(struct terra_tsi_socket *state, struct sock *s
 		return;
 	if (READ_ONCE(sk->sk_err))
 		terra_socket_error(state, READ_ONCE(sk->sk_err));
-	else if (peer == SHUTDOWN_MASK &&
-		 (!READ_ONCE(state->peer_send_closed) || !(READ_ONCE(sk->sk_shutdown) & SEND_SHUTDOWN)) &&
-		 !READ_ONCE(state->sk->sk_err))
+	else if (peer == SHUTDOWN_MASK && !READ_ONCE(state->sk->sk_err) &&
+		 (!READ_ONCE(state->peer_send_closed) ||
+		  !(READ_ONCE(sk->sk_shutdown) & SEND_SHUTDOWN)))
 		terra_socket_error(state, -ECONNRESET);
 	if (peer & SEND_SHUTDOWN)
 		WRITE_ONCE(state->peer_send_closed, true);
@@ -665,73 +578,36 @@ static void terra_stream_callback(struct sock *sk)
 	read_unlock_bh(&sk->sk_callback_lock);
 }
 
-static int terra_prepare_external(struct terra_tsi_socket *state)
-{
-	int error;
-
-	if (state->sk->sk_type == SOCK_DGRAM && !state->udp_frame) {
-		state->udp_frame = kmalloc(TERRA_UDP_FRAME_BYTES, GFP_KERNEL);
-		state->udp_receive = kmalloc(TERRA_UDP_FRAME_BYTES, GFP_KERNEL);
-		if (!state->udp_frame || !state->udp_receive) {
-			kfree(state->udp_frame);
-			kfree(state->udp_receive);
-			state->udp_frame = NULL;
-			state->udp_receive = NULL;
-			return -ENOMEM;
-		}
-	}
-	if (state->bound)
-		return 0;
-	error = terra_bind_external(state);
-	if (!error)
-		state->bound = true;
-	return error;
-}
-
 static int terra_begin_stream(struct terra_tsi_socket *state)
 {
-	struct sockaddr_vm peer = { .svm_family = AF_VSOCK, .svm_cid = 2, .svm_port = TERRA_TCP_PORT };
-	unsigned int payload;
+	struct sockaddr_vm host = {
+		.svm_family = AF_VSOCK, .svm_cid = 2, .svm_port = TERRA_TCP_PORT,
+	};
+	u8 *frame = state->opening;
 	int error;
 
 	terra_detach_stream(state);
+	memset(frame, 0, TERRA_TCP_OPEN_BYTES);
+	error = terra_encode_peer(frame + 20, &state->peer);
+	if (error)
+		return error;
+	terra_frame_header(frame, TERRA_OP_TCP_OPEN, TERRA_TCP_OPEN_BYTES - TERRA_HEADER_BYTES);
+	put_unaligned_le16(TERRA_NETWORK_VERSION, frame + 8);
+	put_unaligned_le16(1, frame + 10);
+	put_unaligned_le16(sock_flag(state->sk, SOCK_URGINLINE) |
+			   sock_flag(state->sk, SOCK_KEEPOPEN) << 1, frame + 12);
+	if (sock_flag(state->sk, SOCK_KEEPOPEN)) {
+		const struct tcp_sock *tcp = tcp_sk(state->sk);
+		int idle = keepalive_time_when(tcp) / HZ, interval = keepalive_intvl_when(tcp) / HZ;
+
+		put_unaligned_le16(clamp(keepalive_probes(tcp), 1, MAX_TCP_KEEPCNT), frame + 14);
+		put_unaligned_le16(clamp(idle, 1, MAX_TCP_KEEPIDLE), frame + 16);
+		put_unaligned_le16(clamp(interval, 1, MAX_TCP_KEEPINTVL), frame + 18);
+	}
 	error = terra_create_stream(state, TERRA_TCP_RECEIVE_BYTES);
 	if (error)
 		return error;
 	terra_stream_options(state);
-	memset(state->opening, 0, sizeof(state->opening));
-	put_unaligned_le16(TERRA_NETWORK_VERSION, state->opening + 8);
-	put_unaligned_le16(sock_flag(state->sk, SOCK_URGINLINE) |
-			   sock_flag(state->sk, SOCK_KEEPOPEN) << 1, state->opening + 12);
-	if (sock_flag(state->sk, SOCK_KEEPOPEN)) {
-		const struct tcp_sock *tcp = tcp_sk(state->sk);
-
-		put_unaligned_le16(clamp_t(int, keepalive_probes(tcp), 1, MAX_TCP_KEEPCNT), state->opening + 14);
-		put_unaligned_le16(clamp_t(int, keepalive_time_when(tcp) / HZ, 1, MAX_TCP_KEEPIDLE), state->opening + 16);
-		put_unaligned_le16(clamp_t(int, keepalive_intvl_when(tcp) / HZ, 1, MAX_TCP_KEEPINTVL), state->opening + 18);
-	}
-	if (terra_peer_is_host_service(&state->peer) &&
-	    (state->peer.ss_family == AF_INET ||
-	     ipv6_addr_v4mapped(&((struct sockaddr_in6 *)&state->peer)->sin6_addr))) {
-		__be16 port = state->peer.ss_family == AF_INET ?
-			((struct sockaddr_in *)&state->peer)->sin_port :
-			((struct sockaddr_in6 *)&state->peer)->sin6_port;
-
-		put_unaligned_le16(2, state->opening + 10);
-		put_unaligned_le16(ntohs(port), state->opening + 20);
-		payload = 16;
-		error = port ? 0 : -EINVAL;
-	} else {
-		put_unaligned_le16(1, state->opening + 10);
-		payload = 12 + TERRA_ENDPOINT_BYTES;
-		error = terra_encode_peer(state->opening + 20, &state->peer, state->peer_length);
-	}
-	if (error) {
-		terra_detach_stream(state);
-		return error;
-	}
-	terra_frame_header(state->opening, TERRA_OP_TCP_OPEN, payload);
-	state->opening_length = TERRA_HEADER_BYTES + payload;
 	WRITE_ONCE(state->peer_send_closed, false);
 	WRITE_ONCE(state->peer_closed, false);
 	state->opening_offset = 0;
@@ -740,7 +616,7 @@ static int terra_begin_stream(struct terra_tsi_socket *state)
 	terra_attach_callbacks(state);
 	WRITE_ONCE(state->connecting, true);
 	state->socket->state = SS_CONNECTING;
-	error = kernel_connect(state->stream, (struct sockaddr *)&peer, sizeof(peer), O_NONBLOCK);
+	error = kernel_connect(state->stream, (struct sockaddr *)&host, sizeof(host), O_NONBLOCK);
 	if (error && error != -EINPROGRESS) {
 		terra_finish_opening(state, -ENETDOWN);
 		return -ENETDOWN;
@@ -759,7 +635,7 @@ static int terra_wait_connected(struct terra_tsi_socket *state, int flags)
 	if (flags & O_NONBLOCK)
 		return -EINPROGRESS;
 	waited = wait_event_interruptible_timeout(state->wait,
-		!smp_load_acquire(&state->connecting), timeout);
+						  !smp_load_acquire(&state->connecting), timeout);
 	if (waited <= 0) {
 		mutex_lock(&state->select_mutex);
 		if (READ_ONCE(state->connecting)) {
@@ -774,7 +650,8 @@ static int terra_wait_connected(struct terra_tsi_socket *state, int flags)
 
 /*
  * Like UDP, a frame is admitted while queued and error memory stay under the receive buffer; an
- * empty queue waives the byte cap so a frame larger than the remaining room cannot stall the carrier.
+ * empty queue waives the byte cap, so a frame larger than the remaining room cannot stall the
+ * carrier.
  */
 static bool terra_udp_queue_admits(struct terra_tsi_socket *state, unsigned int truesize)
 {
@@ -800,72 +677,63 @@ static void terra_udp_failed(struct terra_tsi_socket *state, int error)
 	terra_socket_error(state, error);
 }
 
-static bool terra_discard_udp_bytes(struct terra_tsi_socket *state, unsigned int count)
-{
-	struct msghdr message = { .msg_flags = MSG_DONTWAIT };
-	struct kvec vector;
-
-	while (count) {
-		vector.iov_base = state->udp_receive;
-		vector.iov_len = min_t(unsigned int, count, TERRA_UDP_FRAME_BYTES);
-		if (kernel_recvmsg(state->stream, &message, &vector, 1, vector.iov_len, MSG_DONTWAIT) !=
-		    vector.iov_len)
-			return false;
-		count -= vector.iov_len;
-	}
-	return true;
-}
-
 /*
- * Read a datagram frame straight into a page-backed skb: the endpoint lands in the linear part and
- * the payload in fragments, so a 64 KiB run needs no contiguous allocation or bounce copy.
+ * Read a datagram frame's payload straight into page fragments, so a 64 KiB run needs no
+ * contiguous allocation or bounce copy. Returns false to stop draining: the queue is full or the
+ * carrier failed.
  */
 static bool terra_receive_udp_datagram(struct terra_tsi_socket *state, u32 length)
 {
 	struct msghdr message = { .msg_flags = MSG_DONTWAIT };
-	unsigned int payload = length - TERRA_ENDPOINT_BYTES - TERRA_UDP_SEGMENT_FIELD_BYTES;
-	struct kvec vectors[MAX_SKB_FRAGS + 3];
-	struct sockaddr_storage peer;
+	unsigned int payload = TERRA_HEADER_BYTES + length - TERRA_UDP_PREFIX_BYTES;
+	u8 prefix[TERRA_UDP_PREFIX_BYTES];
+	u8 *segment_field = prefix + TERRA_HEADER_BYTES + TERRA_ENDPOINT_BYTES;
+	struct kvec vectors[MAX_SKB_FRAGS + 1];
+	struct terra_datagram_cb *cb;
 	struct sk_buff *datagram;
 	unsigned int count = 0, index;
 	u16 segment;
 	int error;
 
-	datagram = alloc_skb_with_frags(TERRA_ENDPOINT_BYTES, payload, PAGE_ALLOC_COSTLY_ORDER, &error,
+	if (!terra_udp_queue_admits(state, SKB_TRUESIZE(0) + PAGE_ALIGN(payload)))
+		return false;
+	datagram = alloc_skb_with_frags(0, payload, PAGE_ALLOC_COSTLY_ORDER, &error,
 					GFP_KERNEL | __GFP_NOWARN);
 	if (!datagram) {
-		if (terra_discard_udp_bytes(state, TERRA_HEADER_BYTES + length))
+		/* Skip the frame: the patched vsock stream drops MSG_TRUNC bytes uncopied. */
+		vectors[0] = (struct kvec) { NULL, TERRA_HEADER_BYTES + length };
+		if (kernel_recvmsg(state->stream, &message, vectors, 1, vectors[0].iov_len,
+				   MSG_DONTWAIT | MSG_TRUNC) == vectors[0].iov_len)
 			return true;
 		terra_udp_failed(state, -EPROTO);
 		return false;
 	}
-	vectors[count++] = (struct kvec) { state->udp_receive, TERRA_HEADER_BYTES };
-	vectors[count++] = (struct kvec) { skb_put(datagram, TERRA_ENDPOINT_BYTES), TERRA_ENDPOINT_BYTES };
-	vectors[count++] = (struct kvec) { state->udp_receive + TERRA_HEADER_BYTES,
-					   TERRA_UDP_SEGMENT_FIELD_BYTES };
+	vectors[count++] = (struct kvec) { prefix, sizeof(prefix) };
 	for (index = 0; index < skb_shinfo(datagram)->nr_frags; index++) {
 		skb_frag_t *fragment = &skb_shinfo(datagram)->frags[index];
 
 		vectors[count++] = (struct kvec) {
-			page_address(skb_frag_page(fragment)) + skb_frag_off(fragment), skb_frag_size(fragment)
+			page_address(skb_frag_page(fragment)) + skb_frag_off(fragment),
+			skb_frag_size(fragment)
 		};
 	}
-	datagram->len += payload;
+	datagram->len = payload;
 	datagram->data_len = payload;
 	if (kernel_recvmsg(state->stream, &message, vectors, count, TERRA_HEADER_BYTES + length,
 			   MSG_DONTWAIT) != TERRA_HEADER_BYTES + length)
 		goto malformed;
-	segment = get_unaligned_le16(state->udp_receive + TERRA_HEADER_BYTES);
-	if (get_unaligned_le16(state->udp_receive + TERRA_HEADER_BYTES + 2) ||
+	segment = get_unaligned_le16(segment_field);
+	if (get_unaligned_le16(segment_field + 2) ||
 	    (segment ? segment > TERRA_UDP_DATAGRAM || payload <= segment ||
 		       DIV_ROUND_UP(payload, segment) > TERRA_UDP_MAX_SEGMENTS :
 		       payload > TERRA_UDP_DATAGRAM))
 		goto malformed;
-	if (terra_decode_peer(&peer, datagram->data) < 0)
+	cb = TERRA_DATAGRAM_CB(datagram);
+	if (terra_decode_peer(&cb->peer, prefix + TERRA_HEADER_BYTES) < 0)
 		goto malformed;
-	TERRA_DATAGRAM_CB(datagram)->segment = segment;
+	cb->segment = segment;
 	mutex_lock(&state->select_mutex);
-	if (state->udp_connected && !terra_peer_equal(&peer, &state->peer)) {
+	if (state->connected && !terra_peer_equal(&cb->peer, &state->peer)) {
 		mutex_unlock(&state->select_mutex);
 		goto drop;
 	}
@@ -884,13 +752,14 @@ drop:
 	return true;
 }
 
-/* Accept one complete frame from the carrier; a carrier error, close, or malformed frame retires the socket. */
+/* Takes one whole frame off the carrier; an error, close, or malformed frame retires the socket. */
 static bool terra_receive_udp_frame(struct terra_tsi_socket *state)
 {
 	struct sock *transport = state->stream->sk;
 	struct msghdr message = { .msg_flags = MSG_DONTWAIT };
-	struct sockaddr_storage peer;
-	struct kvec vector;
+	u8 frame[TERRA_HEADER_BYTES + 4 + TERRA_ENDPOINT_BYTES];
+	struct kvec vector = { frame, TERRA_HEADER_BYTES };
+	struct sockaddr_in6 peer;
 	bool is_valid;
 	s64 available;
 	u32 length;
@@ -899,19 +768,17 @@ static bool terra_receive_udp_frame(struct terra_tsi_socket *state)
 	available = vsock_stream_has_data(vsock_sk(transport));
 	if (available < TERRA_HEADER_BYTES)
 		goto incomplete;
-	vector.iov_base = state->udp_receive;
-	vector.iov_len = TERRA_HEADER_BYTES;
 	if (kernel_recvmsg(state->stream, &message, &vector, 1, TERRA_HEADER_BYTES,
 			   MSG_DONTWAIT | MSG_PEEK) != TERRA_HEADER_BYTES) {
 		terra_udp_failed(state, -EPROTO);
 		return false;
 	}
-	opcode = get_unaligned_le16(state->udp_receive);
-	length = get_unaligned_le32(state->udp_receive + 4);
+	opcode = get_unaligned_le16(frame);
+	length = get_unaligned_le32(frame + 4);
 	switch (opcode) {
 	case TERRA_OP_UDP_DATAGRAM:
-		is_valid = length >= TERRA_ENDPOINT_BYTES + TERRA_UDP_SEGMENT_FIELD_BYTES &&
-			length <= TERRA_ENDPOINT_BYTES + TERRA_UDP_SEGMENT_FIELD_BYTES + TERRA_UDP_RUN_BYTES;
+		is_valid = length >= TERRA_UDP_PREFIX_BYTES - TERRA_HEADER_BYTES &&
+			   length <= TERRA_UDP_CARRIER_BYTES - TERRA_HEADER_BYTES;
 		break;
 	case TERRA_OP_UDP_ERROR:
 		is_valid = length == 4 + TERRA_ENDPOINT_BYTES;
@@ -920,28 +787,23 @@ static bool terra_receive_udp_frame(struct terra_tsi_socket *state)
 		is_valid = false;
 		break;
 	}
-	if (!is_valid || get_unaligned_le16(state->udp_receive + 2)) {
+	if (!is_valid || get_unaligned_le16(frame + 2)) {
 		terra_udp_failed(state, -EPROTO);
 		return false;
 	}
 	if (available < TERRA_HEADER_BYTES + length)
 		goto incomplete;
-	if (opcode != TERRA_OP_UDP_ERROR) {
-		if (!terra_udp_queue_admits(state, SKB_TRUESIZE(TERRA_ENDPOINT_BYTES) +
-					    PAGE_ALIGN(length - TERRA_ENDPOINT_BYTES)))
-			return false;
+	if (opcode != TERRA_OP_UDP_ERROR)
 		return terra_receive_udp_datagram(state, length);
-	}
-	vector.iov_base = state->udp_receive;
-	vector.iov_len = TERRA_HEADER_BYTES + length;
-	if (kernel_recvmsg(state->stream, &message, &vector, 1, vector.iov_len, MSG_DONTWAIT) !=
-	    TERRA_HEADER_BYTES + length) {
+	vector.iov_len = sizeof(frame);
+	if (kernel_recvmsg(state->stream, &message, &vector, 1, sizeof(frame), MSG_DONTWAIT) !=
+	    sizeof(frame)) {
 		terra_udp_failed(state, -EPROTO);
 		return false;
 	}
-	status = get_unaligned_le16(state->udp_receive + 8);
-	if (!status || status > 20 || get_unaligned_le16(state->udp_receive + 10) ||
-	    terra_decode_peer(&peer, state->udp_receive + 12) < 0) {
+	status = get_unaligned_le16(frame + 8);
+	if (!status || status >= ARRAY_SIZE(terra_errors) || get_unaligned_le16(frame + 10) ||
+	    terra_decode_peer(&peer, frame + 12) < 0) {
 		terra_udp_failed(state, -EPROTO);
 		return false;
 	}
@@ -973,15 +835,22 @@ static void terra_drain_udp(struct work_struct *work)
 /* Open the socket's UDP carrier once, synchronously, before any datagram frame is accepted. */
 static int terra_udp_open(struct terra_tsi_socket *state)
 {
-	struct sockaddr_vm host = { .svm_family = AF_VSOCK, .svm_cid = 2, .svm_port = TERRA_UDP_PORT };
+	struct sockaddr_vm host = {
+		.svm_family = AF_VSOCK, .svm_cid = 2, .svm_port = TERRA_UDP_PORT,
+	};
 	struct msghdr message = { .msg_flags = MSG_NOSIGNAL };
-	struct kvec vector;
-	u8 frame[12];
+	u8 frame[12] = {};
+	struct kvec vector = { frame, sizeof(frame) };
 	u16 status;
 	int error;
 
 	if (state->udp_open)
 		return READ_ONCE(state->udp_failed);
+	if (!state->udp_frame) {
+		state->udp_frame = kmalloc(TERRA_UDP_FRAME_BYTES, GFP_KERNEL);
+		if (!state->udp_frame)
+			return -ENOMEM;
+	}
 	error = terra_create_stream(state, TERRA_UDP_CARRIER_BYTES);
 	if (error)
 		return error;
@@ -992,13 +861,8 @@ static int terra_udp_open(struct terra_tsi_socket *state)
 		goto release;
 	terra_frame_header(frame, TERRA_OP_UDP_OPEN, 4);
 	put_unaligned_le16(TERRA_NETWORK_VERSION, frame + 8);
-	put_unaligned_le16(0, frame + 10);
-	vector.iov_base = frame;
-	vector.iov_len = sizeof(frame);
 	if (kernel_sendmsg(state->stream, &message, &vector, 1, sizeof(frame)) != sizeof(frame))
 		goto release;
-	vector.iov_base = frame;
-	vector.iov_len = sizeof(frame);
 	if (kernel_recvmsg(state->stream, &message, &vector, 1, sizeof(frame), MSG_WAITALL) !=
 	    sizeof(frame))
 		goto release;
@@ -1050,13 +914,12 @@ static int terra_udp_control(struct sock *sk, struct msghdr *message, u16 *segme
 			if (!*segment || *segment > TERRA_UDP_DATAGRAM)
 				return -EINVAL;
 		} else if (control->cmsg_level == SOL_IP && control->cmsg_type == IP_TOS) {
-			if (control->cmsg_len == CMSG_LEN(sizeof(u8))) {
+			if (control->cmsg_len == CMSG_LEN(sizeof(u8)))
 				value = *(u8 *)CMSG_DATA(control);
-			} else if (control->cmsg_len == CMSG_LEN(sizeof(value))) {
+			else if (control->cmsg_len == CMSG_LEN(sizeof(value)))
 				memcpy(&value, CMSG_DATA(control), sizeof(value));
-			} else {
+			else
 				return -EINVAL;
-			}
 			if (value < 0 || value > 255)
 				return -EINVAL;
 		} else if (control->cmsg_level == SOL_IPV6 && control->cmsg_type == IPV6_TCLASS) {
@@ -1079,7 +942,8 @@ static int terra_udp_control(struct sock *sk, struct msghdr *message, u16 *segme
 		} else if (control->cmsg_level == SOL_IPV6 && control->cmsg_type == IPV6_PKTINFO) {
 			struct in6_pktinfo info;
 
-			if (control->cmsg_len != CMSG_LEN(sizeof(info)) || sk->sk_family != AF_INET6)
+			if (control->cmsg_len != CMSG_LEN(sizeof(info)) ||
+			    sk->sk_family != AF_INET6)
 				return -EINVAL;
 			memcpy(&info, CMSG_DATA(control), sizeof(info));
 			if (info.ipi6_ifindex)
@@ -1094,14 +958,12 @@ static int terra_udp_control(struct sock *sk, struct msghdr *message, u16 *segme
 	return 0;
 }
 
-static int terra_send_udp(struct terra_tsi_socket *state, struct sockaddr_storage *peer,
-			  unsigned int peer_length, struct msghdr *message, size_t length,
-			  u16 segment, bool nonblock)
+static int terra_send_udp(struct terra_tsi_socket *state, const struct sockaddr_in6 *peer,
+			  struct msghdr *message, size_t length, u16 segment, bool nonblock)
 {
 	struct msghdr forwarded = { .msg_flags = MSG_DONTWAIT | MSG_NOSIGNAL };
 	struct virtio_vsock_sock *transport = vsock_sk(state->stream->sk)->trans;
-	unsigned int prefix = TERRA_HEADER_BYTES + TERRA_ENDPOINT_BYTES + TERRA_UDP_SEGMENT_FIELD_BYTES;
-	unsigned int frame_length = prefix + length;
+	unsigned int frame_length = TERRA_UDP_PREFIX_BYTES + length;
 	long timeout = sock_sndtimeo(state->sk, nonblock);
 	u8 endpoint[TERRA_ENDPOINT_BYTES], *frame = state->udp_frame;
 	u32 capacity;
@@ -1119,7 +981,7 @@ static int terra_send_udp(struct terra_tsi_socket *state, struct sockaddr_storag
 	error = sock_error(state->sk);
 	if (error)
 		return error;
-	error = terra_encode_peer(endpoint, peer, peer_length);
+	error = terra_encode_peer(endpoint, peer);
 	if (error)
 		return error;
 	if (!terra_udp_writable(state, frame_length)) {
@@ -1129,7 +991,8 @@ static int terra_send_udp(struct terra_tsi_socket *state, struct sockaddr_storag
 		if (!timeout)
 			return -EAGAIN;
 		waited = wait_event_interruptible_timeout(state->wait,
-			terra_udp_writable(state, frame_length), timeout);
+							  terra_udp_writable(state, frame_length),
+							  timeout);
 		if (waited <= 0)
 			return waited ? sock_intr_errno(timeout) : -EAGAIN;
 	}
@@ -1148,10 +1011,11 @@ static int terra_send_udp(struct terra_tsi_socket *state, struct sockaddr_storag
 	}
 	terra_frame_header(frame, TERRA_OP_UDP_SEND, frame_length - TERRA_HEADER_BYTES);
 	memcpy(frame + TERRA_HEADER_BYTES, endpoint, sizeof(endpoint));
-	/* A GSO send that fits one datagram goes out as that datagram: a run always holds several. */
-	put_unaligned_le16(length > segment ? segment : 0, frame + TERRA_HEADER_BYTES + TERRA_ENDPOINT_BYTES);
+	/* A GSO send that fits one datagram goes out as one: a run always holds several. */
+	put_unaligned_le16(length > segment ? segment : 0,
+			   frame + TERRA_HEADER_BYTES + TERRA_ENDPOINT_BYTES);
 	put_unaligned_le16(0, frame + TERRA_HEADER_BYTES + TERRA_ENDPOINT_BYTES + 2);
-	if (!copy_from_iter_full(frame + prefix, length, &message->msg_iter)) {
+	if (!copy_from_iter_full(frame + TERRA_UDP_PREFIX_BYTES, length, &message->msg_iter)) {
 		error = -EFAULT;
 		goto free;
 	}
@@ -1172,37 +1036,29 @@ free:
 
 static void terra_set_udp_peer(struct terra_tsi_socket *state)
 {
-	struct inet_sock *inet = inet_sk(state->sk);
+	const struct sockaddr_in6 *peer = &state->peer;
+	struct sock *sk = state->sk;
 
-	lock_sock(state->sk);
-	if (state->peer.ss_family == AF_INET) {
-		const struct sockaddr_in *peer = (const void *)&state->peer;
-
-		WRITE_ONCE(inet->inet_daddr, peer->sin_addr.s_addr);
-		inet->inet_dport = peer->sin_port;
-		if (state->sk->sk_family == AF_INET6)
-			ipv6_addr_set_v4mapped(peer->sin_addr.s_addr, &state->sk->sk_v6_daddr);
-	} else {
-		const struct sockaddr_in6 *peer = (const void *)&state->peer;
-
-		state->sk->sk_v6_daddr = peer->sin6_addr;
-		inet->inet_dport = peer->sin6_port;
-		WRITE_ONCE(inet->inet_daddr, ipv6_addr_v4mapped(&peer->sin6_addr) ?
-			peer->sin6_addr.s6_addr32[3] : 0);
-	}
-	sk_dst_reset(state->sk);
-	state->sk->sk_state = TCP_ESTABLISHED;
-	if (state->sk->sk_prot->rehash)
-		state->sk->sk_prot->rehash(state->sk);
-	reuseport_has_conns_set(state->sk);
-	release_sock(state->sk);
+	lock_sock(sk);
+	WRITE_ONCE(inet_sk(sk)->inet_daddr, ipv6_addr_v4mapped(&peer->sin6_addr) ?
+		   peer->sin6_addr.s6_addr32[3] : 0);
+	inet_sk(sk)->inet_dport = peer->sin6_port;
+	if (sk->sk_family == AF_INET6)
+		sk->sk_v6_daddr = peer->sin6_addr;
+	sk_dst_reset(sk);
+	sk->sk_state = TCP_ESTABLISHED;
+	if (sk->sk_prot->rehash)
+		sk->sk_prot->rehash(sk);
+	reuseport_has_conns_set(sk);
+	release_sock(sk);
 }
 
-static int terra_connect_locked(struct socket *socket, struct sockaddr *peer, int peer_length, int flags)
+static int terra_connect_locked(struct socket *socket, struct sockaddr *peer, int peer_length,
+				int flags)
 {
 	struct terra_tsi_socket *state = terra_socket_state(socket);
-	struct sockaddr_storage target;
-	int error, selected, target_length;
+	struct sockaddr_in6 target;
+	int error, selected;
 
 	if (peer_length < sizeof(peer->sa_family))
 		return -EINVAL;
@@ -1231,25 +1087,25 @@ static int terra_connect_locked(struct socket *socket, struct sockaddr *peer, in
 			terra_detach_stream(state);
 		error = state->native_ops->connect(socket, peer, peer_length, flags);
 		if (!error || (socket->type == SOCK_STREAM && error == -EINPROGRESS)) {
-			state->mode = peer->sa_family == AF_UNSPEC ? TERRA_SOCKET_UNSELECTED : TERRA_SOCKET_NATIVE;
-			/* __udp_disconnect keeps sk_v6_daddr, which would keep filtering native replies to a past external peer. */
+			state->mode = peer->sa_family == AF_UNSPEC ?
+				      TERRA_SOCKET_UNSELECTED : TERRA_SOCKET_NATIVE;
+			/*
+			 * __udp_disconnect keeps sk_v6_daddr, which would keep filtering native
+			 * replies to a past external peer.
+			 */
 			if (socket->type == SOCK_DGRAM && peer->sa_family == AF_UNSPEC &&
 			    state->sk->sk_family == AF_INET6) {
 				lock_sock(state->sk);
 				state->sk->sk_v6_daddr = in6addr_any;
 				release_sock(state->sk);
 			}
-			state->udp_connected = false;
 			smp_store_release(&state->connected, false);
 		}
 		goto unlock;
 	}
-	target_length = terra_copy_peer(&target, peer, peer_length);
-	if (target_length < 0) {
-		error = target_length;
-		goto unlock;
-	}
-	error = terra_prepare_external(state);
+	error = terra_copy_peer(&target, peer, peer_length);
+	if (!error)
+		error = terra_bind_external(state);
 	if (error)
 		goto unlock;
 	if (socket->type == SOCK_DGRAM) {
@@ -1257,16 +1113,13 @@ static int terra_connect_locked(struct socket *socket, struct sockaddr *peer, in
 		if (error)
 			goto unlock;
 		state->peer = target;
-		state->peer_length = target_length;
 		state->mode = TERRA_SOCKET_EXTERNAL;
-		state->udp_connected = true;
 		smp_store_release(&state->connected, true);
 		terra_set_udp_peer(state);
 		socket->state = SS_CONNECTED;
 		goto unlock;
 	}
 	state->peer = target;
-	state->peer_length = target_length;
 	WRITE_ONCE(state->sk->sk_err, 0);
 	state->connect_error = 0;
 	state->mode = TERRA_SOCKET_EXTERNAL;
@@ -1278,27 +1131,25 @@ unlock:
 	return error;
 }
 
+/* A nonblocking call fails with -EAGAIN instead of waiting for another call to release `lock`. */
+static int terra_lock(struct mutex *lock, bool nonblock)
+{
+	if (nonblock)
+		return mutex_trylock(lock) ? 0 : -EAGAIN;
+	return mutex_lock_interruptible(lock);
+}
+
 static int terra_connect(struct socket *socket, struct sockaddr *peer, int peer_length, int flags)
 {
 	struct terra_tsi_socket *state = terra_socket_state(socket);
 	int error;
 
-	if (flags & O_NONBLOCK) {
-		if (!mutex_trylock(&state->send_mutex))
-			return -EAGAIN;
-	} else {
-		error = mutex_lock_interruptible(&state->send_mutex);
-		if (error)
-			return error;
-	}
+	error = terra_lock(&state->send_mutex, flags & O_NONBLOCK);
+	if (error)
+		return error;
 	error = terra_connect_locked(socket, peer, peer_length, flags);
 	mutex_unlock(&state->send_mutex);
 	return error;
-}
-
-static int terra_bind(struct socket *socket, struct sockaddr_unsized *local, int local_length)
-{
-	return terra_socket_state(socket)->native_ops->bind(socket, local, local_length);
 }
 
 static int terra_listen(struct socket *socket, int backlog)
@@ -1334,21 +1185,15 @@ static int terra_accept(struct socket *socket, struct socket *accepted,
 static int terra_getname(struct socket *socket, struct sockaddr *peer, int remote)
 {
 	struct terra_tsi_socket *state = terra_socket_state(socket);
-	struct sockaddr_storage reported;
 	int length;
 
 	mutex_lock(&state->select_mutex);
-	if (!remote || state->mode != TERRA_SOCKET_EXTERNAL) {
-		mutex_unlock(&state->select_mutex);
-		return state->native_ops->getname(socket, peer, remote);
-	}
-	if (!smp_load_acquire(&state->connected) || (socket->type == SOCK_DGRAM && !state->udp_connected)) {
-		mutex_unlock(&state->select_mutex);
-		return -ENOTCONN;
-	}
-	reported = state->peer;
-	length = terra_report_peer(state, &reported, state->peer_length);
-	memcpy(peer, &reported, length);
+	if (!remote || state->mode != TERRA_SOCKET_EXTERNAL)
+		length = state->native_ops->getname(socket, peer, remote);
+	else if (!smp_load_acquire(&state->connected))
+		length = -ENOTCONN;
+	else
+		length = terra_report_peer(state->sk, &state->peer, peer);
 	mutex_unlock(&state->select_mutex);
 	return length;
 }
@@ -1415,7 +1260,8 @@ static int terra_send_stream(struct terra_tsi_socket *state, struct socket *sock
 }
 
 /* Reads one send's GSO segment size into `segment` and checks `length` against the GSO limits. */
-static int terra_udp_send_segment(struct sock *sk, struct msghdr *message, size_t length, u16 *segment)
+static int terra_udp_send_segment(struct sock *sk, struct msghdr *message, size_t length,
+				  u16 *segment)
 {
 	int error = terra_udp_control(sk, message, segment);
 
@@ -1432,36 +1278,39 @@ static int terra_udp_send_segment(struct sock *sk, struct msghdr *message, size_
 static int terra_sendmsg(struct socket *socket, struct msghdr *message, size_t length)
 {
 	struct terra_tsi_socket *state = terra_socket_state(socket);
-	struct sockaddr_storage peer;
-	int peer_length, selected, error;
 	bool nonblock = message->msg_flags & MSG_DONTWAIT;
+	struct sockaddr *address = message->msg_name;
+	int address_length = message->msg_namelen;
+	struct sockaddr_storage connected;
+	struct sockaddr_in6 peer;
+	int selected, error;
 	u16 segment;
 
 	if (socket->type == SOCK_STREAM)
 		return terra_send_stream(state, socket, message, length);
 	if (state->stream && READ_ONCE(state->sk->sk_shutdown) & SEND_SHUTDOWN)
 		return -EPIPE;
-	if (message->msg_name) {
-		peer_length = terra_copy_peer(&peer, message->msg_name, message->msg_namelen);
-		if (peer_length < 0)
-			return peer_length;
+	if (address) {
+		error = terra_copy_peer(&peer, address, address_length);
+		if (error)
+			return error;
 	} else {
-		bool is_connected_externally;
+		bool is_connected;
 
-		/* terra_connect rewrites the connected peer under select_mutex; an unlocked copy could mix two peers. */
+		/* connect rewrites the peer under select_mutex; an unlocked copy could tear it. */
 		mutex_lock(&state->select_mutex);
-		is_connected_externally = state->mode == TERRA_SOCKET_EXTERNAL && state->udp_connected;
-		if (is_connected_externally) {
-			peer = state->peer;
-			peer_length = state->peer_length;
-		}
+		is_connected = state->connected;
+		peer = state->peer;
 		mutex_unlock(&state->select_mutex);
-		if (!is_connected_externally)
+		if (!is_connected)
 			return state->native_ops->sendmsg(socket, message, length);
+		address = (struct sockaddr *)&connected;
+		address_length = terra_report_peer(state->sk, &peer, &connected);
 	}
-	selected = terra_tsi_select_native(socket, (struct sockaddr *)&peer, peer_length);
+	selected = terra_tsi_select_native(socket, address, address_length);
 	if (selected)
-		return selected < 0 ? selected : state->native_ops->sendmsg(socket, message, length);
+		return selected < 0 ? selected :
+		       state->native_ops->sendmsg(socket, message, length);
 	error = terra_udp_send_segment(state->sk, message, length, &segment);
 	if (error)
 		return error;
@@ -1469,21 +1318,16 @@ static int terra_sendmsg(struct socket *socket, struct msghdr *message, size_t l
 		return -EPIPE;
 	if (message->msg_flags & ~(MSG_DONTWAIT | MSG_NOSIGNAL))
 		return -EOPNOTSUPP;
-	if (nonblock) {
-		if (!mutex_trylock(&state->send_mutex))
-			return -EAGAIN;
-	} else {
-		error = mutex_lock_interruptible(&state->send_mutex);
-		if (error)
-			return error;
-	}
+	error = terra_lock(&state->send_mutex, nonblock);
+	if (error)
+		return error;
 	mutex_lock(&state->select_mutex);
-	error = terra_prepare_external(state);
+	error = terra_bind_external(state);
 	if (!error)
 		error = terra_udp_open(state);
 	mutex_unlock(&state->select_mutex);
 	if (!error)
-		error = terra_send_udp(state, &peer, peer_length, message, length, segment, nonblock);
+		error = terra_send_udp(state, &peer, message, length, segment, nonblock);
 	mutex_unlock(&state->send_mutex);
 	return error;
 }
@@ -1505,10 +1349,10 @@ static void terra_consume_datagram(struct terra_tsi_socket *state, struct sk_buf
 
 /*
  * Append the queued datagrams UDP GRO would merge after `segments` full `segment`-byte datagrams
- * from `endpoint`: same peer and size, ending at most one shorter. Returns the bytes appended or a
+ * from `peer`: same peer and size, ending at most one shorter. Returns the bytes appended or a
  * negative error.
  */
-static int terra_receive_coalesced(struct terra_tsi_socket *state, const u8 *endpoint,
+static int terra_receive_coalesced(struct terra_tsi_socket *state, const struct sockaddr_in6 *peer,
 				   unsigned int segment, unsigned int segments,
 				   struct msghdr *message, size_t room)
 {
@@ -1523,15 +1367,17 @@ static int terra_receive_coalesced(struct terra_tsi_socket *state, const u8 *end
 		next = skb_peek(&state->datagrams);
 		bytes = next ? terra_datagram_bytes(next) : 0;
 		next_segment = next ? terra_datagram_segment(next) : 0;
-		accepted = bytes && bytes <= room && !memcmp(next->data, endpoint, TERRA_ENDPOINT_BYTES) &&
-			(next_segment == segment || (next_segment == bytes && bytes < segment)) &&
-			segments + DIV_ROUND_UP(bytes, segment) <= TERRA_UDP_MAX_SEGMENTS;
+		accepted = bytes && bytes <= room &&
+			   terra_peer_equal(&TERRA_DATAGRAM_CB(next)->peer, peer) &&
+			   (next_segment == segment ||
+			    (next_segment == bytes && bytes < segment)) &&
+			   segments + DIV_ROUND_UP(bytes, segment) <= TERRA_UDP_MAX_SEGMENTS;
 		if (accepted)
 			__skb_unlink(next, &state->datagrams);
 		spin_unlock_bh(&state->datagrams.lock);
 		if (!accepted)
 			break;
-		if (skb_copy_datagram_iter(next, TERRA_ENDPOINT_BYTES + TERRA_DATAGRAM_CB(next)->offset,
+		if (skb_copy_datagram_iter(next, TERRA_DATAGRAM_CB(next)->offset,
 					   &message->msg_iter, bytes)) {
 			kfree_skb(next);
 			return -EFAULT;
@@ -1575,7 +1421,7 @@ static int terra_recv_error_queue(struct terra_tsi_socket *state, struct socket 
 	return error;
 }
 
-/* Takes a datagram the native socket queued, such as a reply from a native peer; -EAGAIN means none. */
+/* Takes a datagram the native socket queued, such as a native peer's reply; -EAGAIN means none. */
 static int terra_recv_native_datagram(struct terra_tsi_socket *state, struct socket *socket,
 				      struct msghdr *message, size_t length, int flags)
 {
@@ -1604,15 +1450,17 @@ static bool terra_udp_receive_ready(struct terra_tsi_socket *state, struct socke
 static int terra_deliver_datagram(struct terra_tsi_socket *state, struct sk_buff *datagram,
 				  struct msghdr *message, size_t length, int flags)
 {
-	unsigned int available = terra_datagram_bytes(datagram), segment = terra_datagram_segment(datagram);
+	struct terra_datagram_cb *cb = TERRA_DATAGRAM_CB(datagram);
+	unsigned int available = terra_datagram_bytes(datagram);
+	unsigned int segment = terra_datagram_segment(datagram);
 	bool is_gro = !(flags & MSG_PEEK) && segment && length > segment &&
-		udp_test_bit(GRO_ENABLED, state->sk);
-	unsigned int delivered = is_gro ? min_t(size_t, available, length / segment * segment) : segment;
+		      udp_test_bit(GRO_ENABLED, state->sk);
+	unsigned int delivered = is_gro ? min_t(size_t, available, length / segment * segment) :
+				 segment;
 	unsigned int copied = min_t(size_t, length, delivered);
 	int appended;
 
-	if (skb_copy_datagram_iter(datagram, TERRA_ENDPOINT_BYTES + TERRA_DATAGRAM_CB(datagram)->offset,
-				   &message->msg_iter, copied))
+	if (skb_copy_datagram_iter(datagram, cb->offset, &message->msg_iter, copied))
 		return -EFAULT;
 	if (copied < delivered)
 		message->msg_flags |= MSG_TRUNC;
@@ -1620,8 +1468,9 @@ static int terra_deliver_datagram(struct terra_tsi_socket *state, struct sk_buff
 		terra_consume_datagram(state, datagram, delivered);
 	if (is_gro) {
 		if (delivered == available && !(available % segment)) {
-			appended = terra_receive_coalesced(state, datagram->data, segment, available / segment,
-							   message, length - copied);
+			appended = terra_receive_coalesced(state, &cb->peer, segment,
+							   available / segment, message,
+							   length - copied);
 			if (appended < 0)
 				return appended;
 			copied += appended;
@@ -1641,9 +1490,8 @@ static int terra_recvmsg(struct socket *socket, struct msghdr *message, size_t l
 	struct terra_tsi_socket *state = terra_socket_state(socket);
 	long timeout = sock_rcvtimeo(state->sk, flags & MSG_DONTWAIT);
 	struct sk_buff *datagram = NULL;
-	struct sockaddr_storage peer;
 	long waited;
-	int error, peer_length, received;
+	int error;
 
 	if (socket->type == SOCK_STREAM)
 		return terra_recv_stream(state, socket, message, length, flags);
@@ -1653,14 +1501,9 @@ static int terra_recvmsg(struct socket *socket, struct msghdr *message, size_t l
 		return terra_recv_error_queue(state, socket, message, length, flags);
 	if (flags & ~(MSG_DONTWAIT | MSG_PEEK | MSG_TRUNC | MSG_CMSG_CLOEXEC | MSG_WAITALL))
 		return -EOPNOTSUPP;
-	if (flags & MSG_DONTWAIT) {
-		if (!mutex_trylock(&state->receive_mutex))
-			return -EAGAIN;
-	} else {
-		error = mutex_lock_interruptible(&state->receive_mutex);
-		if (error)
-			return error;
-	}
+	error = terra_lock(&state->receive_mutex, flags & MSG_DONTWAIT);
+	if (error)
+		return error;
 	for (;;) {
 		error = sock_error(state->sk);
 		if (error)
@@ -1687,30 +1530,21 @@ static int terra_recvmsg(struct socket *socket, struct msghdr *message, size_t l
 			goto unlock;
 		}
 		waited = wait_event_interruptible_timeout(*sk_sleep(state->sk),
-			terra_udp_receive_ready(state, socket), timeout);
+							  terra_udp_receive_ready(state, socket),
+							  timeout);
 		if (waited <= 0) {
 			error = waited ? sock_intr_errno(timeout) : -EAGAIN;
 			goto unlock;
 		}
 		timeout = waited;
 	}
-	peer_length = terra_decode_peer(&peer, datagram->data);
-	if (peer_length < 0) {
-		if (!(flags & MSG_PEEK))
-			terra_consume_datagram(state, datagram, terra_datagram_bytes(datagram));
-		error = peer_length;
+	error = terra_deliver_datagram(state, datagram, message, length, flags);
+	if (error < 0)
 		goto unlock;
-	}
-	received = terra_deliver_datagram(state, datagram, message, length, flags);
-	if (received < 0) {
-		error = received;
-		goto unlock;
-	}
-	if (message->msg_name) {
-		peer_length = terra_report_peer(state, &peer, peer_length);
-		memcpy(message->msg_name, &peer, peer_length);
-		message->msg_namelen = peer_length;
-	}
+	if (message->msg_name)
+		message->msg_namelen = terra_report_peer(state->sk,
+							 &TERRA_DATAGRAM_CB(datagram)->peer,
+							 message->msg_name);
 	if (state->sk->sk_family == AF_INET &&
 	    inet_cmsg_flags(inet_sk(state->sk)) & IP_CMSG_PKTINFO) {
 		struct in_pktinfo packet = {
@@ -1727,7 +1561,6 @@ static int terra_recvmsg(struct socket *socket, struct msghdr *message, size_t l
 
 		put_cmsg(message, SOL_IPV6, IPV6_PKTINFO, sizeof(packet), &packet);
 	}
-	error = received;
 unlock:
 	kfree_skb(datagram);
 	mutex_unlock(&state->receive_mutex);
@@ -1743,27 +1576,31 @@ static int terra_shutdown(struct socket *socket, int direction)
 	if (direction < SHUT_RD || direction > SHUT_RDWR)
 		return -EINVAL;
 	if (socket->type == SOCK_STREAM)
-		return smp_load_acquire(&state->connected) ? kernel_sock_shutdown(state->stream, direction) : -ENOTCONN;
+		return smp_load_acquire(&state->connected) ?
+		       kernel_sock_shutdown(state->stream, direction) : -ENOTCONN;
 	lock_sock(state->sk);
-	state->sk->sk_shutdown |= direction == SHUT_RDWR ? SHUTDOWN_MASK :
-		direction == SHUT_RD ? RCV_SHUTDOWN : SEND_SHUTDOWN;
+	/* SHUT_RD/WR/RDWR become RCV_SHUTDOWN/SEND_SHUTDOWN/SHUTDOWN_MASK, as in inet_shutdown. */
+	state->sk->sk_shutdown |= direction + 1;
 	release_sock(state->sk);
 	terra_socket_wake(state);
-	return state->udp_connected ? 0 : -ENOTCONN;
+	return 0;
 }
 
 static bool terra_udp_option(int level, int option)
 {
 	return (level == SOL_IP && (option == IP_RECVERR || option == IP_PKTINFO ||
-		option == IP_TTL || option == IP_MTU_DISCOVER || option == IP_RECVTOS || option == IP_TOS)) ||
-		(level == SOL_IPV6 && (option == IPV6_RECVERR || option == IPV6_RECVPKTINFO ||
-		option == IPV6_UNICAST_HOPS || option == IPV6_MTU_DISCOVER || option == IPV6_DONTFRAG ||
-		option == IPV6_RECVTCLASS || option == IPV6_TCLASS)) ||
-		(level == SOL_UDP && (option == UDP_GRO || option == UDP_SEGMENT));
+				    option == IP_TTL || option == IP_MTU_DISCOVER ||
+				    option == IP_RECVTOS || option == IP_TOS)) ||
+	       (level == SOL_IPV6 && (option == IPV6_RECVERR || option == IPV6_RECVPKTINFO ||
+				      option == IPV6_UNICAST_HOPS || option == IPV6_MTU_DISCOVER ||
+				      option == IPV6_DONTFRAG || option == IPV6_RECVTCLASS ||
+				      option == IPV6_TCLASS)) ||
+	       (level == SOL_UDP && (option == UDP_GRO || option == UDP_SEGMENT));
 }
 
-/* Carries an option the native socket accepted over to the carrier; a larger UDP budget may resume it. */
-static void terra_apply_option(struct terra_tsi_socket *state, struct socket *socket, int level, int option)
+/* Copies an accepted option to the carrier; a larger UDP receive budget may resume draining. */
+static void terra_apply_option(struct terra_tsi_socket *state, struct socket *socket, int level,
+			       int option)
 {
 	if (socket->type == SOCK_STREAM) {
 		mutex_lock(&state->select_mutex);
@@ -1785,6 +1622,16 @@ static bool terra_keepalive_option(int level, int option)
 		 option == TCP_KEEPCNT));
 }
 
+/* Protocol-level options the broker's socket honours, so an external socket may get or set them. */
+static bool terra_forwarded_option(int type, int level, int option)
+{
+	return (type == SOCK_DGRAM && terra_udp_option(level, option)) ||
+		(type == SOCK_STREAM && terra_keepalive_option(level, option)) ||
+		(level == SOL_TCP && (option == TCP_NODELAY || option == TCP_MAXSEG)) ||
+		(level == SOL_IP && option == IP_TTL) ||
+		(level == SOL_IPV6 && (option == IPV6_V6ONLY || option == IPV6_UNICAST_HOPS));
+}
+
 static int terra_setsockopt(struct socket *socket, int level, int option,
 			    sockptr_t value, unsigned int length)
 {
@@ -1794,12 +1641,10 @@ static int terra_setsockopt(struct socket *socket, int level, int option,
 
 	if (level == SOL_TCP && option == TCP_ULP)
 		return -EOPNOTSUPP;
-	/* IPV6_ADDRFORM replaces sock->ops with inet_stream_ops, so terra_release_socket would never free the attached state. */
+	/* IPV6_ADDRFORM swaps in inet_stream_ops, so terra_release_socket would leak the state. */
 	if (level == SOL_IPV6 && option == IPV6_ADDRFORM)
 		return -EOPNOTSUPP;
-	if (socket->type == SOCK_STREAM && terra_keepalive_option(level, option)) {
-		supported = true;
-	} else if (level == SOL_SOCKET) {
+	if (level == SOL_SOCKET) {
 		switch (option) {
 		case SO_REUSEADDR: case SO_REUSEPORT: case SO_RCVBUF: case SO_SNDBUF:
 		case SO_RCVTIMEO_OLD: case SO_SNDTIMEO_OLD:
@@ -1807,7 +1652,7 @@ static int terra_setsockopt(struct socket *socket, int level, int option,
 		case SO_BINDTODEVICE: case SO_MARK: case SO_OOBINLINE:
 			supported = true;
 			break;
-		case SO_PEEK_OFF:
+		case SO_KEEPALIVE: case SO_PEEK_OFF:
 			supported = socket->type == SOCK_STREAM;
 			break;
 		case SO_BROADCAST:
@@ -1815,24 +1660,20 @@ static int terra_setsockopt(struct socket *socket, int level, int option,
 			break;
 		case SO_RCVLOWAT:
 			supported = length >= sizeof(integer) &&
-				!copy_from_sockptr(&integer, value, sizeof(integer)) && integer == 1;
-			break;
-		default:
+				    !copy_from_sockptr(&integer, value, sizeof(integer)) &&
+				    integer == 1;
 			break;
 		}
-	} else if (socket->type == SOCK_DGRAM && terra_udp_option(level, option)) {
-		supported = true;
-	} else if ((level == SOL_TCP && option == TCP_MAXSEG) ||
-		   (level == SOL_IP && option == IP_TTL) ||
-		   (level == SOL_IPV6 && option == IPV6_UNICAST_HOPS)) {
-		supported = true;
 	} else if (level == SOL_TCP && option == TCP_NODELAY) {
 		supported = length >= sizeof(integer) &&
 			!copy_from_sockptr(&integer, value, sizeof(integer)) && integer;
-	} else if (level == SOL_IPV6 && option == IPV6_V6ONLY) {
-		supported = true;
+	} else {
+		supported = terra_forwarded_option(socket->type, level, option);
 	}
-	/* An unlisted option would not reach the broker's socket; failing keeps a guest from trusting one that never applies, such as SO_ATTACH_FILTER. */
+	/*
+	 * An unlisted option would not reach the broker's socket; failing keeps a guest from
+	 * trusting one that never applies, such as SO_ATTACH_FILTER.
+	 */
 	if (!supported && !(socket->type == SOCK_STREAM && state->mode == TERRA_SOCKET_NATIVE))
 		return -ENOPROTOOPT;
 	if (socket->type == SOCK_DGRAM && level == SOL_UDP && option == UDP_SEGMENT) {
@@ -1843,7 +1684,7 @@ static int terra_setsockopt(struct socket *socket, int level, int option,
 		if (integer < 0 || integer > TERRA_UDP_DATAGRAM)
 			return -EINVAL;
 	}
-	/* terra_begin_stream hands these options to the broker's socket; a later change would never reach it. */
+	/* terra_begin_stream sends these to the broker once; later changes would never reach it. */
 	if (socket->type == SOCK_STREAM &&
 	    ((state->stream && level == SOL_SOCKET && option == SO_OOBINLINE) ||
 	     (state->mode == TERRA_SOCKET_EXTERNAL && terra_keepalive_option(level, option))))
@@ -1855,68 +1696,67 @@ static int terra_setsockopt(struct socket *socket, int level, int option,
 	return error;
 }
 
+/* Reports an external socket's TCP_INFO from its carrier, since the native TCP never connected. */
+static int terra_get_tcp_info(struct terra_tsi_socket *state, char __user *value,
+			      int __user *length)
+{
+	struct virtio_vsock_sock *transport = NULL;
+	struct tcp_info information = {};
+	struct tcp_sock *tcp = tcp_sk(state->sk);
+	u32 outstanding, capacity;
+	int size;
+
+	if (get_user(size, length))
+		return -EFAULT;
+	if (size < 0)
+		return -EINVAL;
+	mutex_lock(&state->select_mutex);
+	information.tcpi_state = smp_load_acquire(&state->connected) ? TCP_ESTABLISHED : TCP_CLOSE;
+	if (state->stream) {
+		if (READ_ONCE(state->stream->sk->sk_shutdown) & RCV_SHUTDOWN)
+			information.tcpi_state = TCP_CLOSE_WAIT;
+		else if (READ_ONCE(state->stream->sk->sk_shutdown) & SEND_SHUTDOWN)
+			information.tcpi_state = TCP_FIN_WAIT2;
+	}
+	information.tcpi_snd_mss = tcp->rx_opt.user_mss ?: TERRA_TCP_SEGMENT_BYTES;
+	information.tcpi_rcv_mss = TERRA_TCP_SEGMENT_BYTES;
+	information.tcpi_advmss = information.tcpi_snd_mss;
+	information.tcpi_rcv_space = TERRA_TCP_RECEIVE_BYTES;
+	if (state->stream && smp_load_acquire(&state->connected))
+		transport = vsock_sk(state->stream->sk)->trans;
+	if (transport) {
+		lock_sock(state->sk);
+		spin_lock_bh(&transport->tx_lock);
+		outstanding = transport->tx_cnt - transport->peer_fwd_cnt;
+		capacity = min(READ_ONCE(transport->buf_alloc), transport->peer_buf_alloc);
+		information.tcpi_snd_wnd = min_t(u32, TERRA_TCP_SEND_BYTES,
+						 capacity - min(capacity, outstanding));
+		spin_unlock_bh(&transport->tx_lock);
+		tcp->bytes_acked = max_t(u64, tcp->bytes_acked, 1 + tcp->bytes_sent -
+					 min_t(u64, tcp->bytes_sent, outstanding));
+		information.tcpi_bytes_acked = tcp->bytes_acked;
+		release_sock(state->sk);
+	}
+	mutex_unlock(&state->select_mutex);
+	size = min_t(unsigned int, size, sizeof(information));
+	if (put_user(size, length) || copy_to_user(value, &information, size))
+		return -EFAULT;
+	return 0;
+}
+
 static int terra_getsockopt(struct socket *socket, int level, int option,
 			    char __user *value, int __user *length)
 {
 	struct terra_tsi_socket *state = terra_socket_state(socket);
 
 	if (socket->type == SOCK_STREAM && state->mode == TERRA_SOCKET_EXTERNAL &&
-	    level == SOL_TCP && option == TCP_INFO) {
-		struct tcp_info information = {};
-		int size;
-
-		if (get_user(size, length))
-			return -EFAULT;
-		if (size < 0)
-			return -EINVAL;
-		mutex_lock(&state->select_mutex);
-		information.tcpi_state = smp_load_acquire(&state->connected) ? TCP_ESTABLISHED : TCP_CLOSE;
-		if (state->stream) {
-			if (READ_ONCE(state->stream->sk->sk_shutdown) & RCV_SHUTDOWN)
-				information.tcpi_state = TCP_CLOSE_WAIT;
-			else if (READ_ONCE(state->stream->sk->sk_shutdown) & SEND_SHUTDOWN)
-				information.tcpi_state = TCP_FIN_WAIT2;
-		}
-		information.tcpi_snd_mss = tcp_sk(state->sk)->rx_opt.user_mss ?:
-			TERRA_TCP_SEGMENT_BYTES;
-		information.tcpi_rcv_mss = TERRA_TCP_SEGMENT_BYTES;
-		information.tcpi_advmss = information.tcpi_snd_mss;
-		information.tcpi_rcv_space = TERRA_TCP_RECEIVE_BYTES;
-		if (state->stream && smp_load_acquire(&state->connected)) {
-			struct virtio_vsock_sock *transport = vsock_sk(state->stream->sk)->trans;
-
-			if (transport) {
-				struct tcp_sock *tcp = tcp_sk(state->sk);
-				u32 outstanding, capacity;
-
-				lock_sock(state->sk);
-				spin_lock_bh(&transport->tx_lock);
-				outstanding = transport->tx_cnt - transport->peer_fwd_cnt;
-				capacity = min(READ_ONCE(transport->buf_alloc), transport->peer_buf_alloc);
-				information.tcpi_snd_wnd = min_t(u32, TERRA_TCP_SEND_BYTES,
-					capacity - min(capacity, outstanding));
-				spin_unlock_bh(&transport->tx_lock);
-				tcp->bytes_acked = max_t(u64, tcp->bytes_acked,
-					1 + tcp->bytes_sent - min_t(u64, tcp->bytes_sent, outstanding));
-				information.tcpi_bytes_acked = tcp->bytes_acked;
-				release_sock(state->sk);
-			}
-		}
-		mutex_unlock(&state->select_mutex);
-		size = min_t(unsigned int, size, sizeof(information));
-		if (put_user(size, length) || copy_to_user(value, &information, size))
-			return -EFAULT;
-		return 0;
-	}
-
+	    level == SOL_TCP && option == TCP_INFO)
+		return terra_get_tcp_info(state, value, length);
 	if ((state->mode == TERRA_SOCKET_EXTERNAL ||
 	     (socket->type == SOCK_DGRAM && smp_load_acquire(&state->udp_open))) &&
-	    !((socket->type == SOCK_DGRAM && terra_udp_option(level, option)) ||
-	      (level == SOL_TCP && (option == TCP_NODELAY || option == TCP_MAXSEG)) ||
-	      (socket->type == SOCK_STREAM && terra_keepalive_option(level, option)) ||
-	      (level == SOL_IP && (option == IP_TTL || option == IP_RECVERR || option == IP_PKTINFO)) ||
-	      (level == SOL_IPV6 && (option == IPV6_V6ONLY || option == IPV6_UNICAST_HOPS ||
-		 option == IPV6_RECVERR || option == IPV6_RECVPKTINFO))))
+	    !(terra_forwarded_option(socket->type, level, option) ||
+	      (level == SOL_IP && (option == IP_RECVERR || option == IP_PKTINFO)) ||
+	      (level == SOL_IPV6 && (option == IPV6_RECVERR || option == IPV6_RECVPKTINFO))))
 		return -ENOPROTOOPT;
 	return state->native_ops->getsockopt(socket, level, option, value, length);
 }
@@ -1924,21 +1764,20 @@ static int terra_getsockopt(struct socket *socket, int level, int option,
 static int terra_ioctl_socket(struct socket *socket, unsigned int command, unsigned long argument)
 {
 	struct terra_tsi_socket *state = terra_socket_state(socket);
-	int bytes;
 
-	if (command == _IOR('T', 1, __u16))
-		return put_user(TERRA_SOCKET_VERSION, (__u16 __user *)argument);
 	if (state->mode == TERRA_SOCKET_EXTERNAL && socket->type == SOCK_STREAM) {
 		int error;
 
 		mutex_lock(&state->select_mutex);
-		error = state->stream ? state->stream->ops->ioctl(state->stream, command, argument) : -ENOTCONN;
+		error = state->stream ?
+			state->stream->ops->ioctl(state->stream, command, argument) : -ENOTCONN;
 		mutex_unlock(&state->select_mutex);
 		return error;
 	}
 	if (command == SIOCINQ && smp_load_acquire(&state->udp_open) &&
 	    !skb_queue_empty(&state->datagrams)) {
 		struct sk_buff *datagram;
+		int bytes;
 
 		if (state->native_ops->poll(socket->file, socket, NULL) & EPOLLIN)
 			return state->native_ops->ioctl(socket, command, argument);
@@ -1952,13 +1791,14 @@ static int terra_ioctl_socket(struct socket *socket, unsigned int command, unsig
 }
 
 static ssize_t terra_splice_read(struct socket *socket, loff_t *position,
-				struct pipe_inode_info *pipe, size_t length, unsigned int flags)
+				 struct pipe_inode_info *pipe, size_t length, unsigned int flags)
 {
 	struct terra_tsi_socket *state = terra_socket_state(socket);
 
 	if (state->mode != TERRA_SOCKET_EXTERNAL)
 		return state->native_ops->splice_read ?
-			state->native_ops->splice_read(socket, position, pipe, length, flags) : -EOPNOTSUPP;
+		       state->native_ops->splice_read(socket, position, pipe, length, flags) :
+		       -EOPNOTSUPP;
 	return copy_splice_read(socket->file, position, pipe, length, flags);
 }
 
@@ -1978,8 +1818,10 @@ static int terra_release_socket(struct socket *socket)
 	terra_detach_stream(state);
 	skb_queue_purge(&state->datagrams);
 	kfree(state->udp_frame);
-	kfree(state->udp_receive);
-	/* An external TCP socket only mirrors ESTABLISHED; closing it natively would send FIN on uninitialized TCP state. */
+	/*
+	 * An external TCP socket only mirrors ESTABLISHED; closing it natively would send FIN on
+	 * uninitialized TCP state.
+	 */
 	if (socket->type == SOCK_STREAM && state->mode == TERRA_SOCKET_EXTERNAL) {
 		lock_sock(state->sk);
 		WRITE_ONCE(state->sk->sk_state, TCP_CLOSE);
@@ -1993,19 +1835,24 @@ static int terra_release_socket(struct socket *socket)
 	return 0;
 }
 
+/* Wraps a TCP or UDP socket over IPv4 or IPv6; every other socket stays native. */
 int terra_tsi_attach(struct socket *socket)
 {
+	struct sock *sk = socket->sk;
 	struct terra_tsi_socket *state;
 
+	if (!sk || (sk->sk_family != AF_INET && sk->sk_family != AF_INET6) ||
+	    !((socket->type == SOCK_STREAM && sk->sk_protocol == IPPROTO_TCP) ||
+	      (socket->type == SOCK_DGRAM && sk->sk_protocol == IPPROTO_UDP)))
+		return 0;
 	state = kzalloc(sizeof(*state), GFP_KERNEL);
 	if (!state)
 		return -ENOMEM;
 	state->socket = socket;
-	state->sk = socket->sk;
+	state->sk = sk;
 	state->native_ops = socket->ops;
 	state->operations = *socket->ops;
 	state->operations.release = terra_release_socket;
-	state->operations.bind = terra_bind;
 	state->operations.connect = terra_connect;
 	state->operations.accept = terra_accept;
 	state->operations.getname = terra_getname;
@@ -2037,11 +1884,13 @@ int terra_tsi_attach(struct socket *socket)
 }
 
 static ssize_t terra_socket_abi_show(struct kobject *object,
-				   struct kobj_attribute *attribute, char *buffer)
+				     struct kobj_attribute *attribute, char *buffer)
 {
 	return sysfs_emit(buffer, "%u\n", TERRA_SOCKET_VERSION);
 }
+
 static struct kobj_attribute terra_socket_abi_attribute = __ATTR_RO(terra_socket_abi);
+
 static int __init terra_socket_abi_init(void)
 {
 	return sysfs_create_file(kernel_kobj, &terra_socket_abi_attribute.attr);

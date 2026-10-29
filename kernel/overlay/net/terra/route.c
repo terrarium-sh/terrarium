@@ -18,9 +18,10 @@
 static int terra_tsi_route4(struct sock *sk, __be32 destination,
 			    __be16 port)
 {
+	struct fib_result result = {};
+	struct fib_lookup_arg arg = { .result = &result, .flags = FIB_LOOKUP_NOREF };
 	struct inet_sock *inet = inet_sk(sk);
 	struct net *net = sock_net(sk);
-	struct fib_result result = {};
 	struct flowi4 flow;
 	int oif = READ_ONCE(sk->sk_bound_dev_if);
 	int error;
@@ -44,27 +45,11 @@ static int terra_tsi_route4(struct sock *sk, __be32 destination,
 	security_sk_classify_flow(sk, flowi4_to_flowi_common(&flow));
 
 	rcu_read_lock();
-#ifdef CONFIG_IP_MULTIPLE_TABLES
-	{
-		struct fib_lookup_arg arg = {
-			.result = &result,
-			.flags = FIB_LOOKUP_NOREF,
-		};
-
-		l3mdev_update_flow(net, flowi4_to_flowi(&flow));
-		error = fib_rules_lookup(net->ipv4.rules_ops,
-					 flowi4_to_flowi(&flow), 0, &arg);
-		/* An explicit unreachable rule also returns ENETUNREACH. */
-		if (error == -ESRCH)
-			error = -ENETUNREACH;
-		else
-			error = 0;
-	}
-#else
-	error = fib_lookup(net, &flow, &result, 0);
-#endif
+	l3mdev_update_flow(net, flowi4_to_flowi(&flow));
+	error = fib_rules_lookup(net->ipv4.rules_ops, flowi4_to_flowi(&flow), 0, &arg);
 	rcu_read_unlock();
-	if (error != -ENETUNREACH || result.lookup_matched)
+	/* Only -ESRCH means no route; fib_lookup folds unreachable rules into -ENETUNREACH. */
+	if (error != -ESRCH || result.lookup_matched)
 		return 1;
 
 	if (ipv4_is_multicast(destination) || ipv4_is_lbcast(destination) ||
@@ -77,16 +62,21 @@ static int terra_tsi_route4(struct sock *sk, __be32 destination,
 
 static int terra_tsi_route6(struct sock *sk, struct sockaddr_in6 *peer)
 {
+	int oif = READ_ONCE(sk->sk_bound_dev_if);
+	struct fib6_result result = {};
+	struct fib_lookup_arg arg = {
+		.lookup_ptr = fib6_table_lookup,
+		.lookup_data = &oif,
+		.result = &result,
+		.flags = FIB_LOOKUP_NOREF,
+	};
 	struct ipv6_pinfo *info = inet6_sk(sk);
 	struct inet_sock *inet = inet_sk(sk);
 	struct net *net = sock_net(sk);
-	struct fib6_result result = {};
 	struct flowi6 flow = {};
 	int address_type = ipv6_addr_type(&peer->sin6_addr);
-	int oif = READ_ONCE(sk->sk_bound_dev_if);
 	int flags = 0;
 	int error;
-	bool missing;
 
 	if (ipv6_addr_v4mapped(&peer->sin6_addr)) {
 		if (ipv6_only_sock(sk))
@@ -131,26 +121,10 @@ static int terra_tsi_route6(struct sock *sk, struct sockaddr_in6 *peer)
 	security_sk_classify_flow(sk, flowi6_to_flowi_common(&flow));
 
 	rcu_read_lock();
-#ifdef CONFIG_IPV6_MULTIPLE_TABLES
-	{
-		struct fib_lookup_arg arg = {
-			.lookup_ptr = fib6_table_lookup,
-			.lookup_data = &oif,
-			.result = &result,
-			.flags = FIB_LOOKUP_NOREF,
-		};
-
-		l3mdev_update_flow(net, flowi6_to_flowi(&flow));
-		error = fib_rules_lookup(net->ipv6.fib6_rules_ops,
-					 flowi6_to_flowi(&flow), flags, &arg);
-		missing = error == -ESRCH;
-	}
-#else
-	error = fib6_lookup(net, oif, &flow, &result, flags);
-	missing = !error && result.f6i == net->ipv6.fib6_null_entry;
-#endif
+	l3mdev_update_flow(net, flowi6_to_flowi(&flow));
+	error = fib_rules_lookup(net->ipv6.fib6_rules_ops, flowi6_to_flowi(&flow), flags, &arg);
 	rcu_read_unlock();
-	if (!missing || result.lookup_matched)
+	if (error != -ESRCH || result.lookup_matched)
 		return 1;
 
 	if (address_type & IPV6_ADDR_MULTICAST || peer->sin6_scope_id ||
@@ -162,21 +136,15 @@ static int terra_tsi_route6(struct sock *sk, struct sockaddr_in6 *peer)
 	return peer->sin6_port ? 0 : -EINVAL;
 }
 
+/* Returns 1 when the guest routes `peer`, 0 when only the host reaches it, or a negative error. */
 int terra_tsi_select_native(struct socket *socket, struct sockaddr *peer,
 			    int peer_len)
 {
-	struct sock *sk;
-
-	if (!socket || !socket->sk || !peer ||
-	    peer_len < sizeof(peer->sa_family))
-		return -EINVAL;
-	sk = socket->sk;
-	if (sk->sk_family == AF_UNIX || peer->sa_family == AF_UNSPEC)
-		return 1;
-	if (sk->sk_family != AF_INET && sk->sk_family != AF_INET6)
-		return -EAFNOSUPPORT;
+	struct sock *sk = socket->sk;
 
 	switch (peer->sa_family) {
+	case AF_UNSPEC:
+		return 1;
 	case AF_INET: {
 		struct sockaddr_in *address = (struct sockaddr_in *)peer;
 

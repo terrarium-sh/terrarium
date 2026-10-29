@@ -1,5 +1,10 @@
 #include "socket-stubs.h"
 #include "extracted.c"
+static struct sockaddr_in6 ipv4_peer(u32 address, u16 port) {
+    struct sockaddr_in6 peer = {.sin6_family = AF_INET6, .sin6_port = htons(port)};
+    ipv6_addr_set_v4mapped(htonl(address), &peer.sin6_addr);
+    return peer;
+}
 static bool udp_receive_ready(struct terra_tsi_socket *state, struct socket *socket) {
     return terra_udp_receive_ready(state, socket);
 }
@@ -38,16 +43,12 @@ static int check_udp_send_validation(struct sock *sk, struct msghdr *message, si
 }
 
 static void peer_checks(void) {
-    struct sockaddr_storage peer = {0}, decoded;
-    struct sockaddr_in *ipv4 = (void *)&peer;
+    struct sockaddr_in6 peer = ipv4_peer(0xcb007101, 443), decoded;
     u8 endpoint[TERRA_ENDPOINT_BYTES];
-    ipv4->sin_family = AF_INET;
-    ipv4->sin_port = htons(443);
-    ipv4->sin_addr.s_addr = htonl(0xcb007101);
-    assert(!terra_encode_peer(endpoint, &peer, sizeof(struct sockaddr_in)));
+    assert(!terra_encode_peer(endpoint, &peer));
     u8 expected[TERRA_ENDPOINT_BYTES] = {4, 0, 0xbb, 1, 203, 0, 113, 1};
     assert(!memcmp(endpoint, expected, sizeof(expected)));
-    assert(terra_decode_peer(&decoded, endpoint) == sizeof(struct sockaddr_in));
+    assert(!terra_decode_peer(&decoded, endpoint) && !memcmp(&decoded, &peer, sizeof(peer)));
     assert(terra_peer_equal(&peer, &decoded));
     endpoint[8] = 1;
     assert(terra_decode_peer(&decoded, endpoint) == -EPROTO);
@@ -57,21 +58,23 @@ static void peer_checks(void) {
     endpoint[1] = 0;
     endpoint[0] = 5;
     assert(terra_decode_peer(&decoded, endpoint) == -EPROTO);
-    ipv4->sin_port = 0;
-    assert(terra_encode_peer(endpoint, &peer, sizeof(struct sockaddr_in)) == -EINVAL);
-    ipv4->sin_port = htons(443);
-    struct sockaddr_storage mapped = {0};
-    struct sockaddr_in6 *ipv6 = (void *)&mapped;
-    ipv6->sin6_family = AF_INET6;
-    ipv6->sin6_port = htons(443);
-    ipv6->sin6_addr.s6_addr32[2] = htonl(0xffff);
-    ipv6->sin6_addr.s6_addr32[3] = htonl(0xcb007101);
-    assert(terra_peer_equal(&peer, &mapped) && terra_peer_equal(&mapped, &peer));
-    ipv6->sin6_port = htons(444);
-    assert(!terra_peer_equal(&peer, &mapped));
-    ipv6->sin6_port = htons(443);
-    ipv6->sin6_scope_id = 1;
-    assert(terra_encode_peer(endpoint, &mapped, sizeof(struct sockaddr_in6)) == -EOPNOTSUPP);
+    struct sockaddr_in6 other = peer;
+    other.sin6_port = htons(444);
+    assert(!terra_peer_equal(&peer, &other));
+    other.sin6_port = 0;
+    assert(terra_encode_peer(endpoint, &other) == -EINVAL);
+    struct sockaddr_in6 ipv6 = {.sin6_family = AF_INET6, .sin6_port = htons(443)};
+    ipv6.sin6_addr.s6_addr[0] = 0xfd;
+    ipv6.sin6_addr.s6_addr[15] = 1;
+    assert(!terra_encode_peer(endpoint, &ipv6) && endpoint[0] == 6 &&
+           !memcmp(endpoint + 4, &ipv6.sin6_addr, 16));
+    assert(!terra_decode_peer(&decoded, endpoint) && terra_peer_equal(&decoded, &ipv6) &&
+           !terra_peer_equal(&decoded, &peer));
+    ipv6.sin6_scope_id = 1;
+    assert(terra_encode_peer(endpoint, &ipv6) == -EOPNOTSUPP);
+    ipv6.sin6_scope_id = 0;
+    ipv6.sin6_flowinfo = 1;
+    assert(terra_encode_peer(endpoint, &ipv6) == -EOPNOTSUPP);
 }
 
 static void error_checks(void) {
@@ -129,17 +132,12 @@ static void clear_datagrams(struct sk_buff_head *queue) {
 
 static struct sk_buff *queue_datagram(struct sk_buff_head *queue, u8 peer, unsigned int length, u16 segment) {
     int error;
-    struct sk_buff *datagram = alloc_skb_with_frags(TERRA_ENDPOINT_BYTES, length, 0, &error, 0);
-    struct sockaddr_storage address = {0};
-    struct sockaddr_in *ipv4 = (void *)&address;
-    ipv4->sin_family = AF_INET;
-    ipv4->sin_port = htons(1000 + peer);
-    ipv4->sin_addr.s_addr = htonl(0xcb007100 + peer);
-    assert(!terra_encode_peer(skb_put(datagram, TERRA_ENDPOINT_BYTES), &address, sizeof(*ipv4)));
+    struct sk_buff *datagram = alloc_skb_with_frags(0, length, 0, &error, 0);
     for (unsigned int index = 0; index < datagram->shinfo.nr_frags; index++)
         memset(datagram->shinfo.frags[index].page, peer + length, datagram->shinfo.frags[index].size);
-    datagram->len += length;
+    datagram->len = length;
     datagram->data_len = length;
+    TERRA_DATAGRAM_CB(datagram)->peer = ipv4_peer(0xcb007100 + peer, 1000 + peer);
     TERRA_DATAGRAM_CB(datagram)->segment = segment;
     skb_queue_tail(queue, datagram);
     return datagram;
@@ -309,11 +307,11 @@ static void udp_resume_checks(void) {
     assert(!state.udp_work.queued);
 }
 
-static size_t datagram_frame(u8 *frame, const struct sockaddr_storage *peer, size_t length, u16 segment,
+static size_t datagram_frame(u8 *frame, const struct sockaddr_in6 *peer, size_t length, u16 segment,
                              u16 reserved) {
     terra_frame_header(frame, TERRA_OP_UDP_DATAGRAM,
                        TERRA_ENDPOINT_BYTES + TERRA_UDP_SEGMENT_FIELD_BYTES + length);
-    assert(!terra_encode_peer(frame + TERRA_HEADER_BYTES, peer, sizeof(struct sockaddr_in)));
+    assert(!terra_encode_peer(frame + TERRA_HEADER_BYTES, peer));
     put_unaligned_le16(segment, frame + TERRA_HEADER_BYTES + TERRA_ENDPOINT_BYTES);
     put_unaligned_le16(reserved, frame + TERRA_HEADER_BYTES + TERRA_ENDPOINT_BYTES + 2);
     for (size_t index = 0; index < length; index++)
@@ -326,14 +324,14 @@ static size_t datagram_frame(u8 *frame, const struct sockaddr_storage *peer, siz
  * the socket, unallocatable ones are skipped, and a full queue or retained error memory at the receive buffer
  * leaves the frame on the carrier, while an empty queue waives only the byte cap. */
 static void udp_segmented_receive_checks(struct terra_tsi_socket *state,
-                                         const struct sockaddr_storage *peer) {
+                                         const struct sockaddr_in6 *peer) {
     size_t length = datagram_frame(carrier, peer, TERRA_UDP_RUN_BYTES, 1024, 0);
     carrier_available = length;
     assert(length == TERRA_UDP_CARRIER_BYTES && terra_receive_udp_frame(state) &&
            state->datagrams.qlen == 1 && !carrier_available);
     struct sk_buff *queued = state->datagrams.first;
     assert(terra_datagram_bytes(queued) == TERRA_UDP_RUN_BYTES && terra_datagram_segment(queued) == 1024);
-    assert(skb_byte(queued, TERRA_ENDPOINT_BYTES + 5000) == 5000 % 251 &&
+    assert(skb_byte(queued, 5000) == 5000 % 251 &&
            skb_byte(queued, queued->len - 1) == (TERRA_UDP_RUN_BYTES - 1) % 251);
     length = datagram_frame(carrier, peer, 2500, 1000, 0);
     carrier_available = length;
@@ -394,17 +392,12 @@ static void udp_checks(void) {
     struct vsock_sock transport = {.sk.sk_state = TCP_ESTABLISHED, .trans = &capacity};
     struct sock outer = {.sk_data_ready = decoded_data_ready, .sk_rcvbuf = 1 << 20};
     struct socket socket = {.sk = &transport.sk};
-    u8 received[4124], outgoing[4124];
-    struct terra_tsi_socket state = {
-        .sk = &outer, .stream = &socket, .udp_receive = received, .udp_frame = outgoing, .wait = 123};
-    struct sockaddr_storage peer = {0};
-    struct sockaddr_in *address = (void *)&peer;
-    address->sin_family = AF_INET;
-    address->sin_port = htons(80);
-    address->sin_addr.s_addr = htonl(0xcb007101);
+    u8 outgoing[4124];
+    struct terra_tsi_socket state = {.sk = &outer, .stream = &socket, .udp_frame = outgoing, .wait = 123};
+    struct sockaddr_in6 peer = ipv4_peer(0xcb007101, 80);
     u8 frame[33] = {0};
     terra_frame_header(frame, TERRA_OP_UDP_DATAGRAM, 25);
-    assert(!terra_encode_peer(frame + 8, &peer, sizeof(*address)));
+    assert(!terra_encode_peer(frame + 8, &peer));
     frame[32] = 'D';
     memcpy(carrier, frame, 33);
     carrier_available = 10;
@@ -414,7 +407,7 @@ static void udp_checks(void) {
     carrier_available = 33;
     assert(terra_receive_udp_frame(&state) && state.datagrams.qlen == 1);
     assert(decoded_data_wakes == before_data_wakes + 1 && wakes == before_delivery_wakes);
-    assert(state.datagrams.first->len == 21 && skb_byte(state.datagrams.first, 20) == 'D');
+    assert(state.datagrams.first->len == 1 && skb_byte(state.datagrams.first, 0) == 'D');
     assert(terra_datagram_bytes(state.datagrams.first) == 1 &&
            !TERRA_DATAGRAM_CB(state.datagrams.first)->segment);
     clear_datagrams(&state.datagrams);
@@ -444,7 +437,7 @@ static void udp_checks(void) {
     terra_frame_header(frame, TERRA_OP_UDP_ERROR, 24);
     put_unaligned_le16(1, frame + 8);
     put_unaligned_le16(0, frame + 10);
-    assert(!terra_encode_peer(frame + 12, &peer, sizeof(*address)));
+    assert(!terra_encode_peer(frame + 12, &peer));
     memcpy(carrier, frame, 32);
     carrier_available = 32;
     int before_queued_error_wakes = wakes;
@@ -452,21 +445,21 @@ static void udp_checks(void) {
     assert(wakes == before_queued_error_wakes + 1);
     struct msghdr message = {.msg_iter.bytes = (const u8 *)"abc"};
     carrier_space = 0;
-    assert(terra_send_udp(&state, &peer, sizeof(*address), &message, 3, 0, true) == -EACCES &&
+    assert(terra_send_udp(&state, &peer, &message, 3, 0, true) == -EACCES &&
            !outer.sk_err && !sends);
-    assert(terra_send_udp(&state, &peer, sizeof(*address), &message, 3, 0, true) == -EAGAIN && !sends);
+    assert(terra_send_udp(&state, &peer, &message, 3, 0, true) == -EAGAIN && !sends);
     for (wait_action = 1; wait_action <= 2; wait_action++) {
         outer.sk_shutdown = 0;
         message.msg_iter.bytes = (const u8 *)"abc";
         waiting_socket = &outer;
         int expected = wait_action == 1 ? -EPIPE : -EACCES;
-        assert(terra_send_udp(&state, &peer, sizeof(*address), &message, 3, 0, false) == expected && !sends);
+        assert(terra_send_udp(&state, &peer, &message, 3, 0, false) == expected && !sends);
     }
     assert(waits == 2 && !outer.sk_err);
     outer.sk_shutdown = 0;
     wait_action = 0;
     message.msg_iter.bytes = (const u8 *)"abc";
-    assert(terra_send_udp(&state, &peer, sizeof(*address), &message, 3, 0, false) == 3 && sends == 1 &&
+    assert(terra_send_udp(&state, &peer, &message, 3, 0, false) == 3 && sends == 1 &&
            waits == 3);
     assert(get_unaligned_le16(carrier) == TERRA_OP_UDP_SEND && get_unaligned_le32(carrier + 4) == 27 &&
            !memcmp(carrier + 32, "abc", 3));
@@ -665,12 +658,10 @@ static size_t udp_frame_length(size_t length) {
 
 /* Every send is one UDP_SEND frame; its segment field is set only when a GSO payload spans several datagrams.
  */
-static void check_udp_frames(const struct sockaddr_storage *peer, const u8 *payload, size_t length,
+static void check_udp_frames(const struct sockaddr_in6 *peer, const u8 *payload, size_t length,
                              u16 segment) {
     u8 endpoint[TERRA_ENDPOINT_BYTES];
-    unsigned int peer_length =
-        peer->ss_family == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
-    assert(!terra_encode_peer(endpoint, peer, peer_length));
+    assert(!terra_encode_peer(endpoint, peer));
     size_t prefix = udp_frame_length(0);
     assert(get_unaligned_le16(carrier) == TERRA_OP_UDP_SEND);
     assert(!get_unaligned_le16(carrier + 2));
@@ -689,11 +680,7 @@ static void udp_gso_checks(void) {
     struct socket socket = {.sk = &transport.sk};
     u8 outgoing[TERRA_UDP_FRAME_BYTES];
     struct terra_tsi_socket state = {.sk = &outer, .stream = &socket, .udp_frame = outgoing, .wait = 123};
-    struct sockaddr_storage peer = {0};
-    struct sockaddr_in *address = (void *)&peer;
-    address->sin_family = AF_INET;
-    address->sin_port = htons(80);
-    address->sin_addr.s_addr = htonl(0xcb007101);
+    struct sockaddr_in6 peer = ipv4_peer(0xcb007101, 80);
     u8 payload[8193];
     for (unsigned int i = 0; i < sizeof(payload); i++)
         payload[i] = i % 251;
@@ -717,7 +704,7 @@ static void udp_gso_checks(void) {
         struct msghdr message = {.msg_iter.bytes = payload};
         carrier_space = 10000;
         int before_sends = sends, before_allocations = allocations;
-        assert(terra_send_udp(&state, &peer, sizeof(*address), &message, cases[i].length, cases[i].segment,
+        assert(terra_send_udp(&state, &peer, &message, cases[i].length, cases[i].segment,
                               true) == (int)cases[i].length);
         assert(sends == before_sends + 1 && message.msg_iter.bytes == payload + cases[i].length);
         assert(allocations ==
@@ -731,23 +718,23 @@ static void udp_gso_checks(void) {
     carrier[0] = 0xa5;
     carrier_space = framed - 1;
     int before_requests = credit_requests;
-    assert(terra_send_udp(&state, &peer, sizeof(*address), &message, 2401, 1000, true) == -EAGAIN);
+    assert(terra_send_udp(&state, &peer, &message, 2401, 1000, true) == -EAGAIN);
     assert(sends == before_sends && allocations == before_allocations && message.msg_iter.bytes == payload &&
            carrier[0] == 0xa5);
     assert(credit_requests == before_requests + 1 && !transport.sk.locked);
     capacity.buf_alloc = framed - 1;
     capacity.peer_buf_alloc = framed;
     carrier_space = 10000;
-    assert(terra_send_udp(&state, &peer, sizeof(*address), &message, 2401, 1000, true) == -EMSGSIZE);
+    assert(terra_send_udp(&state, &peer, &message, 2401, 1000, true) == -EMSGSIZE);
     capacity.buf_alloc = framed;
     capacity.peer_buf_alloc = framed - 1;
-    assert(terra_send_udp(&state, &peer, sizeof(*address), &message, 2401, 1000, false) == -EMSGSIZE);
+    assert(terra_send_udp(&state, &peer, &message, 2401, 1000, false) == -EMSGSIZE);
     assert(sends == before_sends && allocations == before_allocations && message.msg_iter.bytes == payload &&
            carrier[0] == 0xa5);
     assert(credit_requests == before_requests + 1);
     capacity.peer_buf_alloc = framed;
     carrier_space = framed;
-    assert(terra_send_udp(&state, &peer, sizeof(*address), &message, 2401, 1000, true) == 2401 &&
+    assert(terra_send_udp(&state, &peer, &message, 2401, 1000, true) == 2401 &&
            sends == before_sends + 1);
     check_udp_frames(&peer, payload, 2401, 1000);
     capacity.buf_alloc = capacity.peer_buf_alloc = 24576;
@@ -756,7 +743,7 @@ static void udp_gso_checks(void) {
     int before_waits = waits;
     waiting_socket = &outer;
     wait_action = 0;
-    assert(terra_send_udp(&state, &peer, sizeof(*address), &message, 2401, 1000, false) == 2401);
+    assert(terra_send_udp(&state, &peer, &message, 2401, 1000, false) == 2401);
     assert(waits == before_waits + 1 && sends == before_sends + 2);
     check_udp_frames(&peer, payload, 2401, 1000);
     assert(credit_requests == before_requests + 2 && !transport.sk.locked);
@@ -765,23 +752,23 @@ static void udp_gso_checks(void) {
     before_allocations = allocations;
     carrier[0] = 0xa5;
     allocation_fails = true;
-    assert(terra_send_udp(&state, &peer, sizeof(*address), &message, 6000, 1200, true) == -ENOMEM);
+    assert(terra_send_udp(&state, &peer, &message, 6000, 1200, true) == -ENOMEM);
     assert(sends == before_sends && allocations == before_allocations + 1 &&
            message.msg_iter.bytes == payload && !live_allocations && carrier[0] == 0xa5);
     allocation_fails = false;
     before_allocations = allocations;
     iter_copy_limit = 1000;
-    assert(terra_send_udp(&state, &peer, sizeof(*address), &message, 2401, 1000, true) == -EFAULT);
+    assert(terra_send_udp(&state, &peer, &message, 2401, 1000, true) == -EFAULT);
     assert(sends == before_sends && allocations == before_allocations && message.msg_iter.bytes == payload &&
            !live_allocations && carrier[0] == 0xa5);
     message.msg_iter.bytes = payload;
     iter_copy_limit = 1200;
-    assert(terra_send_udp(&state, &peer, sizeof(*address), &message, 6000, 1200, true) == -EFAULT);
+    assert(terra_send_udp(&state, &peer, &message, 6000, 1200, true) == -EFAULT);
     assert(sends == before_sends && allocations == before_allocations + 1 &&
            message.msg_iter.bytes == payload && !live_allocations && carrier[0] == 0xa5);
     iter_copy_limit = SIZE_MAX;
     transport.trans = NULL;
-    assert(terra_send_udp(&state, &peer, sizeof(*address), &message, 2401, 1000, true) == -ENETDOWN &&
+    assert(terra_send_udp(&state, &peer, &message, 2401, 1000, true) == -ENETDOWN &&
            sends == before_sends);
 }
 
@@ -793,11 +780,7 @@ static void udp_atomic_credit_checks(void) {
     struct socket socket = {.sk = &transport.sk};
     u8 outgoing[TERRA_UDP_FRAME_BYTES];
     struct terra_tsi_socket state = {.sk = &outer, .stream = &socket, .udp_frame = outgoing, .wait = 123};
-    struct sockaddr_storage peer = {0};
-    struct sockaddr_in *address = (void *)&peer;
-    address->sin_family = AF_INET;
-    address->sin_port = htons(80);
-    address->sin_addr.s_addr = htonl(0xcb007101);
+    struct sockaddr_in6 peer = ipv4_peer(0xcb007101, 80);
     u8 payload[40 * 1200];
     for (unsigned int i = 0; i < sizeof(payload); i++)
         payload[i] = i % 251;
@@ -807,19 +790,19 @@ static void udp_atomic_credit_checks(void) {
     carrier_space = framed - 3;
     carrier[0] = 0xa5;
     assert(framed <= peer_capacity);
-    assert(terra_send_udp(&state, &peer, sizeof(*address), &message, sizeof(payload), 1200, true) == -EAGAIN);
+    assert(terra_send_udp(&state, &peer, &message, sizeof(payload), 1200, true) == -EAGAIN);
     assert(credit_requests == before_requests + 1 && sends == before_sends &&
            allocations == before_allocations);
     assert(message.msg_iter.bytes == payload && carrier[0] == 0xa5 && !transport.sk.locked);
     credit_request_error = -ENOMEM;
-    assert(terra_send_udp(&state, &peer, sizeof(*address), &message, sizeof(payload), 1200, false) ==
+    assert(terra_send_udp(&state, &peer, &message, sizeof(payload), 1200, false) ==
            -ENOMEM);
     assert(credit_requests == before_requests + 2 && sends == before_sends &&
            allocations == before_allocations && waits == before_waits);
     assert(message.msg_iter.bytes == payload && carrier[0] == 0xa5 && !transport.sk.locked);
     credit_request_error = 0;
     requested_credit_space = peer_capacity;
-    assert(terra_send_udp(&state, &peer, sizeof(*address), &message, sizeof(payload), 1200, false) ==
+    assert(terra_send_udp(&state, &peer, &message, sizeof(payload), 1200, false) ==
            (int)sizeof(payload));
     assert(credit_requests == before_requests + 3 && sends == before_sends + 1 &&
            allocations == before_allocations + 1);
@@ -935,7 +918,7 @@ static void peek_mirror_checks(void) {
     assert(!terra_set_peek_off(&outer, 5) && outer.sk_peek_off == 5 && carrier_sock.sk_peek_off == -1);
     carrier_sock.sk_state = TCP_ESTABLISHED;
     state.opened_needed = 32;
-    state.opening_length = 0;
+    state.opening_offset = TERRA_TCP_OPEN_BYTES;
     u8 opened[32] = {0x01, 0x01, 0, 0, 24, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0xbb, 1, 203, 0, 113, 1};
     memcpy(state.opened, opened, sizeof(opened));
     state.opened_length = 31;
