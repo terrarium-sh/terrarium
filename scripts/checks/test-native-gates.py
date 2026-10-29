@@ -71,7 +71,7 @@ class NativeGateTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             module.validate_patch_series({})
 
-    def test_socket_version_matches_kernel_encoder_and_ioctl(self):
+    def test_socket_version_matches_protocol_and_kernel(self):
         module = self.vsock_checks
         for source, kernel_source in [
             ('', '#define TERRA_SOCKET_VERSION 1'),
