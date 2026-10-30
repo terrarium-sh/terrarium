@@ -17,7 +17,7 @@ use terra_protocol::application::{Direction, MAX_DNS_QUERIES, Message, StreamDec
 use terra_protocol::vsock::{CONTROL_PORT, GUEST_CID, PUBLICATION_PORT};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
 use tokio::net::{TcpListener, TcpSocket, TcpStream, UdpSocket};
-use tokio::sync::{Mutex as AsyncMutex, Semaphore, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore, SemaphorePermit, oneshot};
 use tokio::time::Instant;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
@@ -28,10 +28,12 @@ const DNS_ADDRESS: SocketAddr = SocketAddr::new(std::net::IpAddr::V4(DNS_IPV4), 
 const MAX_DNS_CLIENTS: usize = 16;
 const MAX_TCP_PUBLICATION_CLIENTS: usize = 32;
 const MAX_UDP_PUBLICATION_CLIENTS: usize = 2 * terra_protocol::MAX_PUBLISHED_PORTS;
-/// Fits two descriptors per carrier inside [`BASE_AGENT_OPEN_FILES`].
 const MAX_PUBLICATION_CARRIERS: usize = 128;
 const BASE_AGENT_OPEN_FILES: usize = 1024;
+// A TCP carrier holds its vsock stream and the published service socket.
+const _: () = assert!(2 * MAX_PUBLICATION_CARRIERS <= BASE_AGENT_OPEN_FILES);
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const PUBLICATION_TIMEOUT: Duration =
     Duration::from_secs(terra_protocol::application::OPEN_TIMEOUT_SECS);
 const UDP_PEER_TTL: Duration = Duration::from_secs(terra_protocol::network::UDP_PEER_TTL_SECS);
@@ -59,7 +61,7 @@ impl PublicationGrants {
 
 #[derive(Debug, PartialEq, Eq)]
 enum PublicationTarget {
-    Tcp { guest_port: u16, peer: SocketAddr },
+    Tcp { guest_port: u16 },
     Udp { guest_port: u16 },
 }
 
@@ -94,19 +96,15 @@ impl NetworkClient {
         if self.shutdown.is_cancelled() {
             return Err(io::Error::from(rustix::io::Errno::NETDOWN));
         }
-        let mut pending = PendingControlWrite {
-            shutdown: &self.shutdown,
-            complete: false,
-        };
+        let partial_write = self.shutdown.drop_guard_ref();
         writer.write_all(&bytes).await?;
         writer.flush().await?;
-        pending.complete = true;
+        partial_write.disarm();
         Ok(())
     }
 
-    /// Answer one DNS query; `Ok(None)` means the network did not answer within the deadline.
-    async fn query(&self, stream: bool, bytes: Vec<u8>) -> io::Result<Option<Vec<u8>>> {
-        let Ok(outcome) = tokio::time::timeout(DNS_TIMEOUT, async {
+    async fn query(&self, stream: bool, bytes: Vec<u8>) -> io::Result<Vec<u8>> {
+        tokio::time::timeout(DNS_TIMEOUT, async {
             let _permit = self.queries.acquire().await.map_err(io::Error::other)?;
             let id = self
                 .next_id
@@ -132,24 +130,7 @@ impl NetworkClient {
                 Err(_) => Err(io::Error::from(rustix::io::Errno::NETDOWN)),
             }
         })
-        .await
-        else {
-            return Ok(None);
-        };
-        outcome.map(Some)
-    }
-}
-
-struct PendingControlWrite<'a> {
-    shutdown: &'a CancellationToken,
-    complete: bool,
-}
-
-impl Drop for PendingControlWrite<'_> {
-    fn drop(&mut self) {
-        if !self.complete {
-            self.shutdown.cancel();
-        }
+        .await?
     }
 }
 
@@ -252,12 +233,6 @@ fn limit_vsock_buffer_bytes(socket: impl AsFd, buffer_bytes: usize) -> io::Resul
     Ok(())
 }
 
-fn vsock_socket(buffer_bytes: usize) -> io::Result<rustix::fd::OwnedFd> {
-    let socket = crate::mux::create_vsock_socket()?;
-    limit_vsock_buffer_bytes(&socket, buffer_bytes)?;
-    Ok(socket)
-}
-
 fn connect_control() -> Result<VsockStream> {
     let socket = crate::mux::connect_vsock(CONTROL_PORT, "network control", |socket| {
         limit_vsock_buffer_bytes(socket, terra_protocol::vsock::CONTROL_REPLY_BYTES)
@@ -266,8 +241,10 @@ fn connect_control() -> Result<VsockStream> {
 }
 
 fn listen_publications() -> Result<async_io::Async<File>> {
-    let socket = vsock_socket(terra_protocol::vsock::FLOW_REPLY_BYTES)
-        .context("creating the publication vsock listener")?;
+    let socket =
+        crate::mux::create_vsock_socket().context("creating the publication vsock listener")?;
+    limit_vsock_buffer_bytes(&socket, terra_protocol::vsock::FLOW_REPLY_BYTES)
+        .context("configuring the publication vsock listener")?;
     rustix::net::bind(
         &socket,
         &crate::mux::vsock_address(GUEST_CID, PUBLICATION_PORT),
@@ -325,7 +302,7 @@ async fn receive_results(
     error
 }
 
-pub(super) fn validate_kernel_socket_version() -> Result<()> {
+fn validate_kernel_socket_version() -> Result<()> {
     let version = std::fs::read_to_string("/sys/kernel/terra_socket_abi")
         .context("reading kernel socket ABI; rebuild the kernel and guest together")?;
     validate_socket_version(
@@ -369,7 +346,7 @@ async fn verify_network_version(
     reader: &mut (impl AsyncRead + Unpin),
 ) -> Result<StreamDecoder> {
     let mut decoder = StreamDecoder::default();
-    tokio::time::timeout(DNS_TIMEOUT, async {
+    tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
         client.send(&Message::Hello).await?;
         match read_message(reader, &mut decoder).await? {
             Some(Message::Ready) => Ok(()),
@@ -421,28 +398,46 @@ pub(super) async fn start(
             let client = NetworkClient::new(writer, shutdown.clone());
             let decoder = verify_network_version(&client, &mut reader).await?;
             let pending = client.pending.clone();
-            let owner_shutdown = shutdown.clone();
-            let owner_diagnostic = diagnostic.clone();
-            tasks.spawn(async move {
-                if let Some(error) = owner_shutdown
-                    .run_until_cancelled(receive_results(reader, decoder, pending))
-                    .await
-                {
-                    report_network_unavailable("owner", &error, &owner_shutdown, &owner_diagnostic);
-                }
-            });
-            start_dns(client, &shutdown, tasks, diagnostic).await?;
+            spawn_network_service(
+                "owner",
+                async move { Err(receive_results(reader, decoder, pending).await) },
+                &shutdown,
+                tasks,
+                diagnostic,
+            );
+            let udp_dns = UdpSocket::bind(DNS_ADDRESS)
+                .await
+                .context("binding guest UDP DNS")?;
+            let tcp_dns = TcpListener::bind(DNS_ADDRESS)
+                .await
+                .context("binding guest TCP DNS")?;
+            spawn_network_service(
+                "UDP DNS",
+                serve_udp_dns(udp_dns, client.clone(), shutdown.clone(), tasks.clone()),
+                &shutdown,
+                tasks,
+                diagnostic,
+            );
+            spawn_network_service(
+                "TCP DNS",
+                serve_tcp_dns(tcp_dns, client, shutdown.clone(), tasks.clone()),
+                &shutdown,
+                tasks,
+                diagnostic,
+            );
             if let Some(listener) = publications {
-                let ports = plan.published_ports.clone();
-                let udp_ports = plan.published_udp_ports.clone();
                 spawn_network_service(
                     "publication",
+                    serve_publications(
+                        listener,
+                        plan.published_ports.clone(),
+                        plan.published_udp_ports.clone(),
+                        shutdown.clone(),
+                        tasks.clone(),
+                    ),
                     &shutdown,
                     tasks,
                     diagnostic,
-                    move |shutdown, tasks| async move {
-                        serve_publications(listener, ports, udp_ports, &shutdown, &tasks).await
-                    },
                 );
             }
             ensure!(
@@ -454,38 +449,8 @@ pub(super) async fn start(
     Ok(())
 }
 
-async fn start_dns(
-    client: Arc<NetworkClient>,
-    shutdown: &CancellationToken,
-    tasks: &TaskTracker,
-    diagnostic: &Diagnostics,
-) -> Result<()> {
-    let udp = UdpSocket::bind(DNS_ADDRESS)
-        .await
-        .context("binding guest UDP DNS")?;
-    let tcp = TcpListener::bind(DNS_ADDRESS)
-        .await
-        .context("binding guest TCP DNS")?;
-    let udp_client = client.clone();
-    spawn_network_service(
-        "UDP DNS",
-        shutdown,
-        tasks,
-        diagnostic,
-        move |shutdown, tasks| async move { serve_udp_dns(udp, udp_client, &shutdown, &tasks).await },
-    );
-    spawn_network_service(
-        "TCP DNS",
-        shutdown,
-        tasks,
-        diagnostic,
-        move |shutdown, tasks| async move { serve_tcp_dns(tcp, client, &shutdown, &tasks).await },
-    );
-    Ok(())
-}
-
 async fn resolve_dns(client: &NetworkClient, stream: bool, query: Vec<u8>) -> io::Result<Vec<u8>> {
-    if let Ok(Some(response)) = client.query(stream, query.clone()).await {
+    if let Ok(response) = client.query(stream, query.clone()).await {
         return Ok(response);
     }
     let question = if stream {
@@ -504,21 +469,30 @@ async fn resolve_dns(client: &NetworkClient, stream: bool, query: Vec<u8>) -> io
     Ok(response)
 }
 
-fn spawn_network_service<Service>(
+fn spawn_network_service(
     name: &'static str,
+    service: impl std::future::Future<Output = io::Result<()>> + Send + 'static,
     shutdown: &CancellationToken,
     tasks: &TaskTracker,
     diagnostic: &Diagnostics,
-    build_service: impl FnOnce(CancellationToken, TaskTracker) -> Service + Send + 'static,
+) {
+    let shutdown = shutdown.clone();
+    let diagnostic = diagnostic.clone();
+    tasks.spawn(async move { run_network_service(name, service, &shutdown, &diagnostic).await });
+}
+
+fn spawn_admitted<Client>(
+    tasks: &TaskTracker,
+    shutdown: &CancellationToken,
+    permit: OwnedSemaphorePermit,
+    client: Client,
 ) where
-    Service: std::future::Future<Output = io::Result<()>> + Send,
+    Client: std::future::Future<Output: Send> + Send + 'static,
 {
     let shutdown = shutdown.clone();
-    let service_tasks = tasks.clone();
-    let diagnostic = diagnostic.clone();
     tasks.spawn(async move {
-        let service = build_service(shutdown.clone(), service_tasks);
-        run_network_service(name, service, &shutdown, &diagnostic).await;
+        let _permit = permit;
+        shutdown.run_until_cancelled(client).await;
     });
 }
 
@@ -548,8 +522,8 @@ fn report_network_unavailable(
 async fn serve_udp_dns(
     socket: UdpSocket,
     client: Arc<NetworkClient>,
-    shutdown: &CancellationToken,
-    tasks: &TaskTracker,
+    shutdown: CancellationToken,
+    tasks: TaskTracker,
 ) -> io::Result<()> {
     let socket = Arc::new(socket);
     let slots = Arc::new(Semaphore::new(MAX_DNS_CLIENTS));
@@ -565,16 +539,10 @@ async fn serve_udp_dns(
         let query = bytes[..length].to_vec();
         let client = client.clone();
         let socket = socket.clone();
-        let shutdown = shutdown.clone();
-        tasks.spawn(async move {
-            let _permit = permit;
-            shutdown
-                .run_until_cancelled(async {
-                    if let Ok(response) = resolve_dns(&client, false, query).await {
-                        let _ = socket.send_to(&response, peer).await;
-                    }
-                })
-                .await;
+        spawn_admitted(&tasks, &shutdown, permit, async move {
+            if let Ok(response) = resolve_dns(&client, false, query).await {
+                let _ = socket.send_to(&response, peer).await;
+            }
         });
     }
 }
@@ -582,8 +550,8 @@ async fn serve_udp_dns(
 async fn serve_tcp_dns(
     listener: TcpListener,
     client: Arc<NetworkClient>,
-    shutdown: &CancellationToken,
-    tasks: &TaskTracker,
+    shutdown: CancellationToken,
+    tasks: TaskTracker,
 ) -> io::Result<()> {
     let slots = Arc::new(Semaphore::new(MAX_DNS_CLIENTS));
     loop {
@@ -592,28 +560,20 @@ async fn serve_tcp_dns(
             continue;
         };
         let client = client.clone();
-        let shutdown = shutdown.clone();
-        tasks.spawn(async move {
-            let _permit = permit;
-            shutdown
-                .run_until_cancelled(serve_dns_stream(stream, &client))
-                .await;
+        spawn_admitted(&tasks, &shutdown, permit, async move {
+            serve_dns_stream(stream, &client).await
         });
     }
 }
 
 async fn serve_dns_stream(mut stream: TcpStream, client: &NetworkClient) -> io::Result<()> {
     loop {
-        let query = tokio::time::timeout(DNS_TIMEOUT, read_dns_query(&mut stream))
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "DNS client read timed out"))??;
-        let Some(query) = query else {
+        let Some(query) = tokio::time::timeout(DNS_TIMEOUT, read_dns_query(&mut stream)).await??
+        else {
             return Ok(());
         };
         let response = resolve_dns(client, true, query).await?;
-        tokio::time::timeout(DNS_TIMEOUT, stream.write_all(&response))
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "DNS client write timed out"))??;
+        tokio::time::timeout(DNS_TIMEOUT, stream.write_all(&response)).await??;
     }
 }
 
@@ -642,8 +602,8 @@ async fn serve_publications(
     listener: async_io::Async<File>,
     tcp_ports: Vec<u16>,
     udp_ports: Vec<u16>,
-    shutdown: &CancellationToken,
-    tasks: &TaskTracker,
+    shutdown: CancellationToken,
+    tasks: TaskTracker,
 ) -> io::Result<()> {
     let slots = Arc::new(Semaphore::new(MAX_PUBLICATION_CARRIERS));
     let grants = Arc::new(PublicationGrants::new(tcp_ports, udp_ports));
@@ -661,12 +621,8 @@ async fn serve_publications(
             .await?;
         let carrier = VsockStream::new(carrier)?;
         let grants = grants.clone();
-        let shutdown = shutdown.clone();
-        tasks.spawn(async move {
-            let _permit = permit;
-            shutdown
-                .run_until_cancelled(relay_publication(carrier, &grants))
-                .await;
+        spawn_admitted(&tasks, &shutdown, permit, async move {
+            relay_publication(carrier, &grants).await
         });
     }
 }
@@ -676,10 +632,8 @@ async fn read_publication_header(
 ) -> io::Result<PublicationTarget> {
     let mut header = [0; terra_protocol::application::HEADER_BYTES];
     carrier.read_exact(&mut header).await?;
-    let length = usize::try_from(u32::from_le_bytes([
-        header[4], header[5], header[6], header[7],
-    ]))
-    .map_err(io::Error::other)?;
+    let length =
+        terra_protocol::application::decode_payload_length(&header).map_err(io::Error::other)?;
     if length
         > terra_protocol::application::MAX_OPENING_BYTES - terra_protocol::application::HEADER_BYTES
     {
@@ -692,8 +646,8 @@ async fn read_publication_header(
     frame.resize(header.len() + length, 0);
     carrier.read_exact(&mut frame[header.len()..]).await?;
     match Message::decode(&frame, Direction::HostToGuest).map_err(io::Error::other)? {
-        Some((Message::Publication { guest_port, peer }, _)) => {
-            Ok(PublicationTarget::Tcp { guest_port, peer })
+        Some((Message::Publication { guest_port, .. }, _)) => {
+            Ok(PublicationTarget::Tcp { guest_port })
         }
         Some((Message::PublicationUdp { guest_port }, _)) => {
             Ok(PublicationTarget::Udp { guest_port })
@@ -746,30 +700,11 @@ async fn relay_publication(
     grants: &PublicationGrants,
 ) -> io::Result<()> {
     let deadline = Instant::now() + PUBLICATION_TIMEOUT;
-    let target = tokio::time::timeout_at(deadline, read_publication_header(&mut carrier))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "publication opening timed out"))??;
-    let (guest_port, ports, slots) = match target {
-        PublicationTarget::Tcp { guest_port, .. } => {
-            (guest_port, &grants.tcp_ports, &grants.tcp_slots)
-        }
-        PublicationTarget::Udp { guest_port } => (guest_port, &grants.udp_ports, &grants.udp_slots),
-    };
-    if !ports.contains(&guest_port) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "publication names an unconfigured guest port",
-        ));
-    }
-    let _permit = slots.try_acquire().map_err(io::Error::other)?;
-    match target {
-        PublicationTarget::Tcp { .. } => {
+    match tokio::time::timeout_at(deadline, read_publication_header(&mut carrier)).await?? {
+        PublicationTarget::Tcp { guest_port } => {
+            let _permit = admit_publication(guest_port, &grants.tcp_ports, &grants.tcp_slots)?;
             let mut service =
-                tokio::time::timeout_at(deadline, connect_published_service(guest_port))
-                    .await
-                    .map_err(|_| {
-                        io::Error::new(io::ErrorKind::TimedOut, "publication opening timed out")
-                    })??;
+                tokio::time::timeout_at(deadline, connect_published_service(guest_port)).await??;
             if service.local_addr()?.ip() != std::net::IpAddr::V4(RELAY_SOURCE) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -778,7 +713,8 @@ async fn relay_publication(
             }
             copy_publication_bytes(&mut service, &mut carrier).await
         }
-        PublicationTarget::Udp { .. } => {
+        PublicationTarget::Udp { guest_port } => {
+            let _permit = admit_publication(guest_port, &grants.udp_ports, &grants.udp_slots)?;
             relay_udp_publication(
                 carrier,
                 RELAY_SOURCE,
@@ -787,6 +723,20 @@ async fn relay_publication(
             .await
         }
     }
+}
+
+fn admit_publication<'a>(
+    guest_port: u16,
+    ports: &[u16],
+    slots: &'a Semaphore,
+) -> io::Result<SemaphorePermit<'a>> {
+    if !ports.contains(&guest_port) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "publication names an unconfigured guest port",
+        ));
+    }
+    slots.try_acquire().map_err(io::Error::other)
 }
 
 async fn wait_udp_publication_reply(
@@ -882,7 +832,7 @@ fn read_publication_replies(
             && length <= segment
             && run.len() + length <= terra_protocol::application::MAX_UDP_RUN_BYTES;
         if !extends_run {
-            if !run.is_empty() || segment != 0 {
+            if segment != 0 {
                 finish_run(&mut messages, peer, &mut run, &mut segment);
             }
             segment = length;
@@ -937,8 +887,9 @@ async fn relay_udp_publication(
                         return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected UDP publication message"));
                     }
                 };
-                let entry = if let Some(index) = peers.iter().position(|entry| entry.peer == peer) {
-                    peers.remove(index).ok_or_else(|| io::Error::other("missing UDP publication peer"))?
+                let known = peers.iter().position(|entry| entry.peer == peer).and_then(|index| peers.remove(index));
+                let entry = if let Some(entry) = known {
+                    entry
                 } else {
                     if peers.len() == terra_protocol::network::MAX_UDP_PUBLICATION_PEERS {
                         peers.pop_front();
@@ -1007,7 +958,7 @@ mod tests {
             terra_protocol::vsock::FLOW_REPLY_BYTES,
             terra_protocol::vsock::CONTROL_REPLY_BYTES,
         ] {
-            vsock_socket(bytes).unwrap();
+            limit_vsock_buffer_bytes(crate::mux::create_vsock_socket().unwrap(), bytes).unwrap();
         }
     }
 
@@ -1073,12 +1024,12 @@ mod tests {
     }
 
     async fn read_host_message(host: &mut tokio::io::DuplexStream) -> Message {
-        let mut header = [0; 8];
+        let mut header = [0; terra_protocol::application::HEADER_BYTES];
         host.read_exact(&mut header).await.unwrap();
-        let length = u32::from_le_bytes(header[4..].try_into().unwrap()) as usize;
+        let length = terra_protocol::application::decode_payload_length(&header).unwrap();
         let mut frame = header.to_vec();
-        frame.resize(8 + length, 0);
-        host.read_exact(&mut frame[8..]).await.unwrap();
+        frame.resize(header.len() + length, 0);
+        host.read_exact(&mut frame[header.len()..]).await.unwrap();
         let mut decoder = StreamDecoder::default();
         decoder.push(&frame).unwrap();
         decoder.next(Direction::GuestToHost).unwrap().unwrap()
@@ -1100,7 +1051,12 @@ mod tests {
                 let tasks = tasks.clone();
                 async move {
                     shutdown
-                        .run_until_cancelled(serve_udp_dns(listener, client, &shutdown, &tasks))
+                        .run_until_cancelled(serve_udp_dns(
+                            listener,
+                            client,
+                            shutdown.clone(),
+                            tasks,
+                        ))
                         .await
                 }
             });
@@ -1161,8 +1117,8 @@ mod tests {
                 .await
                 .unwrap();
         }
-        assert_eq!(first.await.unwrap().unwrap(), Some(vec![1; 12]));
-        assert_eq!(second.await.unwrap().unwrap(), Some(vec![2; 12]));
+        assert_eq!(first.await.unwrap().unwrap(), vec![1; 12]);
+        assert_eq!(second.await.unwrap().unwrap(), vec![2; 12]);
         assert!(network.client.pending.lock().unwrap().is_empty());
     }
 
@@ -1292,10 +1248,7 @@ mod tests {
         let mut carrier = &bytes[..];
         assert_eq!(
             read_publication_header(&mut carrier).await.unwrap(),
-            PublicationTarget::Tcp {
-                guest_port: 8080,
-                peer
-            }
+            PublicationTarget::Tcp { guest_port: 8080 }
         );
         assert_eq!(carrier, b"GET /");
         let datagram = Message::UdpDatagram {
@@ -1735,16 +1688,22 @@ mod tests {
     fn publication_preserves_distinct_peer_and_excludes_loopback_listener() {
         const CHILD: &str = "TERRA_PUBLICATION_NAMESPACE_TEST";
         if std::env::var_os(CHILD).is_none() {
+            let (_crate, test_path) = std::any::type_name_of_val(
+                &publication_preserves_distinct_peer_and_excludes_loopback_listener,
+            )
+            .split_once("::")
+            .unwrap();
             let output = std::process::Command::new("unshare")
                 .args(["--user", "--map-root-user", "--net"])
                 .arg(std::env::current_exe().unwrap())
-                .args(["--exact", "network::tests::publication_preserves_distinct_peer_and_excludes_loopback_listener", "--ignored"])
+                .args(["--exact", test_path, "--ignored"])
                 .env(CHILD, "1")
-                .output().unwrap();
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
             assert!(
-                output.status.success(),
-                "{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
+                output.status.success() && stdout.contains("1 passed"),
+                "{stdout}\n{}",
                 String::from_utf8_lossy(&output.stderr)
             );
             return;
@@ -1790,11 +1749,11 @@ mod tests {
             .unwrap();
         assert_eq!(
             rustix::net::sockopt::socket_recv_buffer_size(&peer_socket).unwrap(),
-            2 * terra_protocol::socket::MAX_DATAGRAM_BYTES
+            2 * terra_protocol::application::MAX_UDP_FRAME_BYTES
         );
         assert_eq!(
             rustix::net::sockopt::socket_send_buffer_size(&peer_socket).unwrap(),
-            2 * terra_protocol::socket::MAX_DATAGRAM_BYTES
+            2 * terra_protocol::application::MAX_UDP_FRAME_BYTES
         );
         drop(peer_socket);
         let port = service.local_addr().unwrap().port();

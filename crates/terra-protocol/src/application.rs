@@ -472,7 +472,7 @@ fn split_frame<'a>(
     direction: Direction,
     only: Option<&[Opcode]>,
 ) -> Result<Option<SplitFrame<'a>>, ErrorCode> {
-    let Some(header) = bytes.get(..HEADER_BYTES) else {
+    let Some(header) = bytes.first_chunk::<HEADER_BYTES>() else {
         return Ok(None);
     };
     let opcode = Opcode::try_from(u16::from_le_bytes([header[0], header[1]]))?;
@@ -485,10 +485,7 @@ fn split_frame<'a>(
     if only.is_some_and(|only| !only.contains(&opcode)) {
         return Err(ErrorCode::InvalidFrame);
     }
-    let length = usize::try_from(u32::from_le_bytes([
-        header[4], header[5], header[6], header[7],
-    ]))
-    .map_err(|_| ErrorCode::LimitExceeded)?;
+    let length = decode_payload_length(header)?;
     if length > opcode.max_payload_bytes() {
         return Err(ErrorCode::LimitExceeded);
     }
@@ -499,6 +496,14 @@ fn split_frame<'a>(
             payload,
             frame_bytes: HEADER_BYTES + length,
         }))
+}
+
+/// Reads the payload length a frame header declares, without checking it against any limit.
+pub fn decode_payload_length(header: &[u8; HEADER_BYTES]) -> Result<usize, ErrorCode> {
+    usize::try_from(u32::from_le_bytes([
+        header[4], header[5], header[6], header[7],
+    ]))
+    .map_err(|_| ErrorCode::LimitExceeded)
 }
 
 /// Borrowed [`Message::decode`] of a guest `UdpSend` frame; any other frame is an error.
