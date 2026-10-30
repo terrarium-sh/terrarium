@@ -37,7 +37,12 @@ pub(super) fn role_grants(role: Role) -> Vec<Grant> {
         .collect()
 }
 
-pub fn verify_worker_role(_role: Role) -> Result<()> {
+/// `restrict_role` trusts Bubblewrap to have installed a worker's role filter.
+pub(super) fn verify_confinement(_role: Role) -> Result<()> {
+    anyhow::ensure!(
+        rustix::thread::secure_computing_mode()? == rustix::thread::SecureComputingMode::Filter,
+        "Linux sandbox worker runs without its seccomp role filter"
+    );
     Ok(())
 }
 

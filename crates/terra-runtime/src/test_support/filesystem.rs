@@ -311,6 +311,20 @@ async fn run_writable(
         .request(15, node, &file_io_body(read_handle, 0, 4096), 0)
         .await?;
     ensure!(&read[16..] == b"filesys", "filesystem reopened readback");
+    // A guest kernel that sends OPEN for a FIFO node must not block a host thread awaiting a writer.
+    #[cfg(unix)]
+    {
+        let status = std::process::Command::new("mkfifo")
+            .arg(directory.join("pipe"))
+            .status()?;
+        ensure!(status.success(), "creating the FIFO fixture");
+        let pipe = share.request(1, 1, b"pipe\0", 0).await?;
+        share
+            .request(14, read_u64(&pipe, 16)?, &0_u32.to_le_bytes(), -95)
+            .await
+            .context("filesystem open of a FIFO")?;
+        share.request(10, 1, b"pipe\0", 0).await?;
+    }
     for released_handle in [handle, read_handle] {
         let mut release = vec![0; 24];
         release[..8].copy_from_slice(&released_handle.to_le_bytes());

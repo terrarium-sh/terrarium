@@ -76,7 +76,7 @@ fn open_shares(spec: &BootSpec) -> Result<Vec<ShareGrant>> {
             AccessMode::ReadWrite
         };
         #[cfg(windows)]
-        let grant = if uses_inherited_listeners() {
+        let grant = if terra_platform::process::sandbox_env::is_vm_worker() {
             let identity = std::env::var(format!("TERRA_WINDOWS_MOUNT_ID_{index}"))?.parse()?;
             ShareGrant::new_host_granted(&mount.host, access, identity)
         } else {
@@ -94,34 +94,10 @@ fn open_shares(spec: &BootSpec) -> Result<Vec<ShareGrant>> {
     Ok(grants)
 }
 
-fn agent_listener(bx: &BoxRef) -> Result<LocalListener> {
-    let path = bx.get_dir().join(crate::state::AGENT_SOCKET);
-    if uses_inherited_listeners() {
-        return sys::claim_listener(super::supervisor::AGENT_LISTENER_FD, &path)
-            .map_err(Into::into);
-    }
-    let _ = std::fs::remove_file(&path);
-    let listener = LocalListener::bind(&path)
-        .with_context(|| format!("binding the agent socket {}", path.display()))?;
-    sys::set_owner_only(&path, false).with_context(|| format!("securing {}", path.display()))?;
-    Ok(listener)
-}
-
-fn stop_listener(bx: &BoxRef) -> Result<LocalListener> {
-    let path = bx.get_dir().join(crate::state::CONTROL_SOCKET);
-    if uses_inherited_listeners() {
-        return sys::claim_listener(super::supervisor::CONTROL_LISTENER_FD, &path)
-            .map_err(Into::into);
-    }
-    let _ = std::fs::remove_file(&path);
-    let listener = LocalListener::bind(&path)
-        .with_context(|| format!("binding the stop socket {}", path.display()))?;
-    sys::set_owner_only(&path, false).with_context(|| format!("securing {}", path.display()))?;
-    Ok(listener)
-}
-
-fn uses_inherited_listeners() -> bool {
-    terra_platform::process::sandbox_env::is_vm_worker()
+fn claim_box_listener(bx: &BoxRef, descriptor: i32, name: &str) -> Result<LocalListener> {
+    let path = bx.get_dir().join(name);
+    sys::claim_listener(descriptor, &path)
+        .with_context(|| format!("claiming the supervisor's listener {}", path.display()))
 }
 
 fn relay_stop(listener: LocalListener, mut control: LocalStream) {
@@ -151,7 +127,11 @@ pub async fn run(
     let plan = encode_boot_plan(spec, bx.get_name())?;
     let volume_disks = volume_disk_paths(spec, bx);
     let shares = open_shares(spec)?;
-    let listener = Some(agent_listener(bx)?);
+    let listener = Some(claim_box_listener(
+        bx,
+        super::supervisor::AGENT_LISTENER_FD,
+        crate::state::AGENT_SOCKET,
+    )?);
     let port_mappings = if spec.mode == PlanMode::Run {
         rules::parse_port_mappings(&spec.recipe.network.ports)?
     } else {
@@ -174,7 +154,12 @@ pub async fn run(
     let control = if spec.mode == PlanMode::Run {
         let (host, worker) = create_local_pair().context("creating the VM stop channel")?;
         sys::register_stop_channel(host.try_clone()?);
-        relay_stop(stop_listener(bx)?, host);
+        let stop = claim_box_listener(
+            bx,
+            super::supervisor::CONTROL_LISTENER_FD,
+            crate::state::CONTROL_SOCKET,
+        )?;
+        relay_stop(stop, host);
         Some(worker)
     } else {
         None
@@ -412,7 +397,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bx = BoxRef::from_state_dir(dir.path().join("state"), dir.path());
         std::fs::create_dir(bx.get_dir()).unwrap();
-        let listener = stop_listener(&bx).unwrap();
+        let listener =
+            LocalListener::bind(bx.get_dir().join(crate::state::CONTROL_SOCKET)).unwrap();
         let (host, mut worker) = create_local_pair().unwrap();
         worker
             .set_read_timeout(Some(std::time::Duration::from_secs(2)))

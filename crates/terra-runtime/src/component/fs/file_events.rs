@@ -160,6 +160,8 @@ impl DirectoryWatches {
             return None;
         }
         // The native watch resolves `path` again, through whatever symlink the guest swapped in.
+        // A guest that swaps back before this check keeps the watch, but the VM sandbox shows it
+        // only shares and the worker's own scratch directories.
         if !rustix::fs::stat(path)
             .is_ok_and(|watched| (watched.st_dev, watched.st_ino) == (opened.st_dev, opened.st_ino))
         {

@@ -46,7 +46,10 @@ const WORKER_DENIED_SYSCALLS: [&str; 5] = [
     "io_uring_enter",
     "io_uring_register",
 ];
-const VM_DENIED_SYSCALLS: [&str; 3] = ["connect", "sendmsg", "sendmmsg"];
+/// The supervisor binds the VM's agent and control listeners before starting the worker. A
+/// compromised worker could otherwise listen on a socket file in a writable share for host
+/// processes to connect to.
+const VM_DENIED_SYSCALLS: [&str; 5] = ["bind", "listen", "connect", "sendmsg", "sendmmsg"];
 /// The supervisor binds every published listener before starting the broker.
 const NETWORK_DENIED_SYSCALLS: [&str; 1] = ["listen"];
 

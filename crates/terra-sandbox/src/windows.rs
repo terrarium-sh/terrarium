@@ -32,30 +32,14 @@ use windows_sys::Win32::System::Threading::{
 };
 
 const BROKER_COMMIT_LIMIT_BYTES: usize = 512 << 20;
-use terra_platform::process::sandbox_env::{APP_CONTAINER_MODE, WINDOWS_MODE, WINDOWS_ROLE};
+use terra_platform::process::sandbox_env::ROLE;
 
 const SPEC_ENV: &str = "TERRA_WINDOWS_SANDBOX_SPEC";
 const IDENTITY_ENV: &str = "TERRA_WINDOWS_SANDBOX_IDENTITY";
 const PARENT_ENV: &str = "TERRA_WINDOWS_SANDBOX_PARENT";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Mode {
-    Supervisor,
-    AppContainer,
-}
-
-impl Mode {
-    const fn name(self) -> &'static str {
-        match self {
-            Self::Supervisor => "supervisor",
-            Self::AppContainer => APP_CONTAINER_MODE,
-        }
-    }
-}
-
 struct Policy {
     role: Role,
-    mode: Mode,
     memory_limit_bytes: usize,
     mitigations: api::Mitigations,
 }
@@ -65,20 +49,17 @@ impl Policy {
         match role {
             Role::Supervisor => Self {
                 role,
-                mode: Mode::Supervisor,
                 memory_limit_bytes: 0,
                 mitigations: api::Mitigations::NONE,
             },
             // Wasmtime maps its AOT components executable, so the VM keeps dynamic code.
             Role::Vm => Self {
                 role,
-                mode: Mode::AppContainer,
                 memory_limit_bytes: 0,
                 mitigations: api::Mitigations::WORKER,
             },
             Role::Network => Self {
                 role,
-                mode: Mode::AppContainer,
                 memory_limit_bytes: BROKER_COMMIT_LIMIT_BYTES,
                 mitigations: api::Mitigations::WORKER.prohibiting_dynamic_code(),
             },
@@ -279,16 +260,8 @@ pub fn restrict_role(_role: Role) -> Result<()> {
     Ok(())
 }
 
-pub fn verify_worker_role(role: Role) -> Result<()> {
-    let Some(declared_role) = std::env::var_os(WINDOWS_ROLE) else {
-        return Ok(());
-    };
-    ensure!(
-        declared_role == role.name(),
-        "Windows sandbox launch role differs from worker entrypoint"
-    );
-    let mode = std::env::var(WINDOWS_MODE)?;
-    verify_worker_token(&api::open_current_token(TOKEN_QUERY)?, role, &mode)?;
+pub(super) fn verify_confinement(role: Role) -> Result<()> {
+    verify_worker_token(&api::open_current_token(TOKEN_QUERY)?, role)?;
     ensure!(
         File::open("CONIN$").is_err()
             && std::fs::OpenOptions::new()
@@ -309,7 +282,7 @@ pub fn verify_worker_role(role: Role) -> Result<()> {
     Ok(())
 }
 
-fn verify_worker_token(token: &OwnedHandle, role: Role, mode: &str) -> Result<()> {
+fn verify_worker_token(token: &OwnedHandle, role: Role) -> Result<()> {
     let mut is_app_container = 0_u32;
     let mut returned = 0;
     // SAFETY: token is live and the output is a correctly sized DWORD.
@@ -322,21 +295,11 @@ fn verify_worker_token(token: &OwnedHandle, role: Role, mode: &str) -> Result<()
             &raw mut returned,
         )
     })?;
-    match mode {
-        APP_CONTAINER_MODE => {
-            ensure!(
-                is_app_container != 0,
-                "Windows worker lacks its AppContainer token"
-            );
-            api::verify_capabilities(token, role)?;
-        }
-        "supervisor" => ensure!(
-            role == Role::Supervisor,
-            "supervisor token cannot launch a worker"
-        ),
-        mode => bail!("unknown Windows sandbox mode {mode}"),
-    }
-    Ok(())
+    ensure!(
+        is_app_container != 0,
+        "Windows worker lacks its AppContainer token"
+    );
+    api::verify_capabilities(token, role)
 }
 
 /// Resolves this computer's DNS host name through the system resolver, the
@@ -412,12 +375,12 @@ fn run_worker(
             "Windows sandbox parent has exited"
         );
     }
-    std::env::var(WINDOWS_ROLE).ok().map_or(Ok(()), |_| {
+    std::env::var(ROLE).ok().map_or(Ok(()), |_| {
         bail!("a sandbox worker cannot run the trusted launcher")
     })?;
     let policy = Policy::for_role(spec.role);
     ensure!(
-        policy.mode == Mode::AppContainer,
+        spec.role != Role::Supervisor,
         "the {} role has no Windows sandbox worker",
         spec.role.name()
     );
@@ -762,12 +725,12 @@ mod tests {
     fn native_role_probe() -> Result<()> {
         use std::net::{SocketAddr, TcpStream, UdpSocket};
 
-        let role = match std::env::var(WINDOWS_ROLE)?.as_str() {
+        let role = match std::env::var(ROLE)?.as_str() {
             "vm" => Role::Vm,
             "network" => Role::Network,
             other => bail!("unexpected native test role {other}"),
         };
-        verify_worker_role(role)?;
+        crate::verify_worker_role(role)?;
         let directory = PathBuf::from(
             std::env::var_os("TERRA_WINDOWS_TEST_DIRECTORY")
                 .context("native test directory is missing")?,

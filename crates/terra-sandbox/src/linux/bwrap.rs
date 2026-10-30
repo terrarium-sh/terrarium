@@ -12,7 +12,7 @@ use std::path::Path;
 use std::process::{Child, Command};
 use std::sync::OnceLock;
 use std::time::Duration;
-use terra_platform::process::sandbox_env::LINUX_ROLE;
+use terra_platform::process::sandbox_env::ROLE;
 
 const BWRAP: &[u8] = include_bytes!(env!("TERRA_BWRAP_BIN"));
 static EMBEDDED_BWRAP: OnceLock<std::result::Result<OwnedFd, String>> = OnceLock::new();
@@ -100,7 +100,7 @@ pub(super) fn prepare_launch_with_filters(
 
     let mut cmd = embedded_command()?;
     crate::copy_explicit_environment(&mut cmd, &command);
-    cmd.env(LINUX_ROLE, role.name());
+    cmd.env(ROLE, role.name());
     cmd.args([
         "--unshare-user",
         "--unshare-ipc",

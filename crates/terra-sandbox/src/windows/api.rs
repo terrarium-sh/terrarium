@@ -6,7 +6,7 @@ use std::io::Read as _;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use terra_platform::process;
-use terra_platform::process::sandbox_env::{WINDOWS_MODE, WINDOWS_ROLE};
+use terra_platform::process::sandbox_env::ROLE;
 use windows_sys::Win32::Foundation::{
     HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LocalFree, SetHandleInformation,
     WAIT_OBJECT_0,
@@ -622,15 +622,13 @@ fn build_worker_environment(
                 super::PARENT_ENV,
                 super::sockets::LAUNCHER_SOCKETS_ENV,
                 super::symlink_broker::SYMLINK_BROKER_ENV,
-                WINDOWS_ROLE,
-                WINDOWS_MODE,
+                ROLE,
             ]
             .iter()
             .any(|excluded| name.eq_ignore_ascii_case(excluded))
         })
         .collect();
-    environment.push((WINDOWS_ROLE.into(), policy.role.name().into()));
-    environment.push((WINDOWS_MODE.into(), policy.mode.name().into()));
+    environment.push((ROLE.into(), policy.role.name().into()));
     for (name, handle) in launcher_handles {
         environment.push(((*name).into(), (*handle as usize).to_string().into()));
     }

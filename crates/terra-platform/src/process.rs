@@ -20,23 +20,12 @@ pub use windows::{
 
 /// Environment a host sandbox sets on the worker it launches, which the worker reads back.
 pub mod sandbox_env {
-    pub const LINUX_ROLE: &str = "TERRA_LINUX_SANDBOX_ROLE";
-    pub const MACOS_ROLE: &str = "TERRA_MACOS_SANDBOX_ROLE";
-    pub const WINDOWS_ROLE: &str = "TERRA_WINDOWS_SANDBOX_ROLE";
-    pub const WINDOWS_MODE: &str = "TERRA_WINDOWS_SANDBOX_MODE";
+    pub const ROLE: &str = "TERRA_SANDBOX_ROLE";
     pub const VM_ROLE: &str = "vm";
-    pub const APP_CONTAINER_MODE: &str = "app_container";
 
     /// Whether a host sandbox launched this process as its VM worker.
     #[must_use]
     pub fn is_vm_worker() -> bool {
-        let role = if cfg!(target_os = "macos") {
-            MACOS_ROLE
-        } else if cfg!(windows) {
-            WINDOWS_ROLE
-        } else {
-            LINUX_ROLE
-        };
-        std::env::var_os(role).is_some_and(|role| role == VM_ROLE)
+        std::env::var_os(ROLE).is_some_and(|role| role == VM_ROLE)
     }
 }

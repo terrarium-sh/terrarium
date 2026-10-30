@@ -85,12 +85,7 @@ pub(super) fn single_host_entry_map(
         anyhow::bail!("unsupported special file: {}", path.display());
     };
     let link_target = if kind == SyncEntryKind::Symlink {
-        Some(
-            std::fs::read_link(path)?
-                .to_str()
-                .context("non-UTF-8 symlink target")?
-                .to_owned(),
-        )
+        Some(read_link_target(path)?)
     } else {
         None
     };
@@ -112,6 +107,18 @@ pub(super) fn single_host_entry_map(
         },
     );
     Ok(map)
+}
+
+fn read_link_target(path: &Path) -> Result<String> {
+    let target =
+        std::fs::read_link(path).with_context(|| format!("reading link {}", path.display()))?;
+    let target = target
+        .to_str()
+        .with_context(|| format!("non-UTF-8 symlink target in {}", path.display()))?
+        .to_owned();
+    #[cfg(windows)]
+    let target = target.replace('\\', "/");
+    Ok(target)
 }
 
 pub(super) fn scan_host_directory(root_path: &Path) -> Result<BTreeMap<String, SyncEntry>> {
@@ -150,15 +157,7 @@ pub(super) fn scan_host_directory(root_path: &Path) -> Result<BTreeMap<String, S
             let (kind, link_target) = if file_type.is_dir() {
                 (SyncEntryKind::Directory, None)
             } else if file_type.is_symlink() {
-                let target = std::fs::read_link(&child_full)
-                    .with_context(|| format!("reading link {}", child_full.display()))?;
-                let target_str = target
-                    .to_str()
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("non-utf8 symlink target in {}", child_full.display())
-                    })?
-                    .to_string();
-                (SyncEntryKind::Symlink, Some(target_str))
+                (SyncEntryKind::Symlink, Some(read_link_target(&child_full)?))
             } else if file_type.is_file() {
                 (SyncEntryKind::File, None)
             } else {

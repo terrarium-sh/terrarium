@@ -192,7 +192,6 @@
       "syscalls": [
         "accept",
         "accept4",
-        "bind",
         "clock_getres",
         "clock_gettime",
         "clone",
@@ -238,7 +237,6 @@
         "ioctl",
         "kcmp",
         "linkat",
-        "listen",
         "lseek",
         "madvise",
         "membarrier",
@@ -272,7 +270,6 @@
         "set_tid_address",
         "shutdown",
         "sigaltstack",
-        "socket",
         "socketpair",
         "statx",
         "symlinkat",

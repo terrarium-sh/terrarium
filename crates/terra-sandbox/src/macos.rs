@@ -14,7 +14,7 @@ use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::path::Path;
 use std::process::{Child, Command, ExitCode};
 use std::time::Duration;
-use terra_platform::process::sandbox_env::MACOS_ROLE;
+use terra_platform::process::sandbox_env::ROLE;
 
 const PROBE_ENV: &str = "TERRA_MACOS_SANDBOX_PROBE";
 const SPEC_ENV: &str = "TERRA_MACOS_SANDBOX_SPEC";
@@ -154,14 +154,7 @@ pub fn role_grants(role: Role) -> Vec<Grant> {
         .collect()
 }
 
-pub fn verify_worker_role(role: Role) -> Result<()> {
-    let Some(launched_role) = std::env::var_os(MACOS_ROLE) else {
-        return Ok(());
-    };
-    ensure!(
-        launched_role == role.name() && role != Role::Supervisor,
-        "macOS worker role differs from its trusted sandbox launch role"
-    );
+pub(super) fn verify_confinement(role: Role) -> Result<()> {
     let probe = std::env::var_os(PROBE_ENV).context("macOS sandbox activation probe is missing")?;
     require_permission_denied(
         File::open(probe),
@@ -216,7 +209,7 @@ pub fn run_launcher_worker(arguments: impl Iterator<Item = OsString>) -> Result<
         super::LAUNCHER_WORKER_ARG
     );
     ensure!(
-        std::env::var_os(MACOS_ROLE).is_none(),
+        std::env::var_os(ROLE).is_none(),
         "a sandbox worker cannot run the trusted launcher"
     );
     let spec_path = std::env::var_os(SPEC_ENV).context("the macOS sandbox spec is missing")?;
@@ -228,7 +221,7 @@ pub fn run_launcher_worker(arguments: impl Iterator<Item = OsString>) -> Result<
     worker
         .args(worker_arguments)
         .env_remove(SPEC_ENV)
-        .env(MACOS_ROLE, spec.role.name())
+        .env(ROLE, spec.role.name())
         .env(PROBE_ENV, &spec_path);
     seatbelt::apply(&profile)?;
     Err(anyhow::Error::new(worker.exec()).context(format!(
@@ -272,28 +265,6 @@ mod tests {
             assert_eq!(unsafe { hv_vm_destroy() }, 0);
         }
         result
-    }
-
-    #[test]
-    fn direct_workers_require_no_sandbox_activation() -> Result<()> {
-        const CHILD: &str = "TERRA_MACOS_DIRECT_WORKER_TEST";
-        if std::env::var_os(CHILD).is_some() {
-            for role in Role::ALL {
-                verify_worker_role(role)?;
-            }
-            return Ok(());
-        }
-        let output = Command::new(std::env::current_exe()?)
-            .args([
-                "--exact",
-                "macos::tests::direct_workers_require_no_sandbox_activation",
-            ])
-            .env(CHILD, "1")
-            .env_remove(MACOS_ROLE)
-            .env_remove(PROBE_ENV)
-            .output()?;
-        assert!(output.status.success(), "{output:?}");
-        Ok(())
     }
 
     #[test]
@@ -372,7 +343,7 @@ mod tests {
                 "macos::tests::launcher_refuses_to_run_inside_a_worker",
             ])
             .env(CHILD, "1")
-            .env(MACOS_ROLE, "vm")
+            .env(ROLE, "vm")
             .output()?;
         assert!(output.status.success(), "{output:?}");
         Ok(())
@@ -435,12 +406,12 @@ mod tests {
         let Some(endpoint) = std::env::var_os(TEST_ENDPOINT) else {
             return Ok(());
         };
-        let role = match std::env::var(MACOS_ROLE)?.as_str() {
+        let role = match std::env::var(ROLE)?.as_str() {
             "vm" => Role::Vm,
             "network" => Role::Network,
             value => anyhow::bail!("unexpected sandboxed test role {value}"),
         };
-        verify_worker_role(role)?;
+        crate::verify_worker_role(role)?;
         require_permission_denied(
             Command::new("/usr/bin/true").status(),
             "executing a program the profile does not grant",

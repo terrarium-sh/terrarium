@@ -28,7 +28,7 @@ use windows as backend;
 #[cfg(windows)]
 pub use windows::LauncherSockets;
 
-pub use backend::{restrict_role, run_launcher_worker, verify_worker_role};
+pub use backend::{restrict_role, run_launcher_worker};
 
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
@@ -53,6 +53,25 @@ impl Role {
 }
 
 pub const LAUNCHER_WORKER_ARG: &str = "__sandbox_launcher";
+
+/// Every worker launch is sandboxed, so only the unconfined supervisor runs without its
+/// launcher's role; a worker then proves the confinement its launcher applied.
+pub fn verify_worker_role(role: Role) -> Result<()> {
+    let launched_role = std::env::var_os(terra_platform::process::sandbox_env::ROLE);
+    if role == Role::Supervisor {
+        anyhow::ensure!(
+            launched_role.is_none(),
+            "a sandboxed worker cannot run the supervisor"
+        );
+        return Ok(());
+    }
+    anyhow::ensure!(
+        launched_role.is_some_and(|launched_role| launched_role == role.name()),
+        "{} worker was not started by its sandbox launcher",
+        role.name()
+    );
+    backend::verify_confinement(role)
+}
 
 /// Receives a launcher reply: an opened socket or the error that prevented it.
 pub type SocketReply = Box<dyn FnOnce(std::io::Result<socket2::Socket>) + Send>;
@@ -282,6 +301,41 @@ mod tests {
         assert_eq!(
             terra_build::seccomp::Role::ALL.map(terra_build::seccomp::Role::name),
             Role::ALL.map(Role::name)
+        );
+    }
+
+    /// Every worker launch is sandboxed, so a VM or broker worker without its launcher's role
+    /// has escaped its sandbox; only the unconfined supervisor runs without one.
+    #[test]
+    fn direct_workers_are_refused_but_the_supervisor_runs_unconfined() {
+        verify_worker_role(Role::Supervisor).unwrap();
+        for role in [Role::Vm, Role::Network] {
+            assert!(verify_worker_role(role).is_err(), "{}", role.name());
+        }
+    }
+
+    /// A worker that re-executes the supervisor entry point still carries its launcher's role,
+    /// which the supervisor refuses.
+    #[test]
+    fn a_sandboxed_worker_cannot_run_the_supervisor() {
+        const CHILD: &str = "TERRA_SANDBOX_SUPERVISOR_IN_WORKER_TEST";
+        if std::env::var_os(CHILD).is_some() {
+            assert!(verify_worker_role(Role::Supervisor).is_err());
+            return;
+        }
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::a_sandboxed_worker_cannot_run_the_supervisor",
+            ])
+            .env(CHILD, "1")
+            .env(terra_platform::process::sandbox_env::ROLE, Role::Vm.name())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "{output:?}"
         );
     }
 

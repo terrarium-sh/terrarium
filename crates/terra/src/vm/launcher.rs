@@ -81,11 +81,8 @@ fn build_sandbox_grants(spec: &BootSpec, bx: &BoxRef) -> Result<Vec<Grant>> {
             grants.push(grant);
         }
     }
-    // Read-only: the host CLI trusts the box directory's entries, such as an import journal.
-    // Windows grants are DACL entries on every object beneath the path, so a directory
-    // grant would expose stale volumes the box's recipe no longer names.
-    #[cfg(unix)]
-    grants.push(Grant::new(bx.get_dir(), Access::ReadOnly));
+    // The box directory itself stays ungranted: it holds stale volumes the recipe no longer names
+    // and entries the host CLI trusts, such as an import journal.
     grants.push(Grant::new(
         bx.get_dir().join(state::RUNTIME_LOG_DIR),
         Access::ReadWrite,
@@ -142,6 +139,7 @@ mod tests {
         let recipe = box_dir.join(state::RECIPE_FILE);
         std::fs::write(&recipe, "{}").unwrap();
         let bx = BoxRef::from_state_dir(box_dir, &base);
+        std::fs::write(bx.get_volume_image_path("stale"), "").unwrap();
         let mut spec = spec(&base, terra_protocol::PlanMode::Run);
         spec.recipe.mounts.push(Mount {
             host: share.clone(),
@@ -165,17 +163,9 @@ mod tests {
         assert!(grants.iter().any(|grant| {
             grant.path == bx.get_volume_image_path("scratch") && grant.access == Access::ReadWrite
         }));
-        #[cfg(unix)]
-        let box_access = Some(Access::ReadOnly);
-        #[cfg(windows)]
-        let box_access = None;
-        assert_eq!(
-            grants
-                .iter()
-                .find(|grant| grant.path == bx.get_dir())
-                .map(|grant| grant.access),
-            box_access
-        );
+        assert!(!grants.iter().any(|grant| {
+            grant.path == bx.get_dir() || grant.path == bx.get_volume_image_path("stale")
+        }));
         assert!(grants.iter().any(|grant| {
             grant.path == bx.get_dir().join(state::RUNTIME_LOG_DIR)
                 && grant.access == Access::ReadWrite

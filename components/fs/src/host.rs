@@ -295,6 +295,15 @@ impl Node {
         let mut descriptor = if let Some(descriptor) = &self.descriptor {
             descriptor.clone()
         } else {
+            // Opening a FIFO by path would block a host filesystem thread until a writer appears.
+            let (parent, name) = self.checked_path().await?;
+            let metadata = parent
+                .stat_at(types::PathFlags::empty(), name.clone())
+                .await
+                .map_err(wasi_error)?;
+            if !matches!(metadata.type_, types::DescriptorType::RegularFile) {
+                return Err(wire::EOPNOTSUPP);
+            }
             self.open_path(types::OpenFlags::empty(), access).await?
         };
         if !matches!(

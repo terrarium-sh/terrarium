@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use terra_platform::local_socket::{LocalStream, OwnedSocket, encode_sockets, receive_sockets};
 use terra_platform::process;
-use terra_platform::process::sandbox_env::WINDOWS_ROLE;
+use terra_platform::process::sandbox_env::ROLE;
 use windows_sys::Win32::Networking::WinSock::{
     SO_UPDATE_CONNECT_CONTEXT, SOL_SOCKET, WSAEMFILE, setsockopt,
 };
@@ -211,7 +211,7 @@ impl LauncherSockets {
     pub fn claim() -> Result<Option<Self>> {
         let Some(handle) = process::inherited_handle(LAUNCHER_SOCKETS_ENV)? else {
             ensure!(
-                std::env::var_os(WINDOWS_ROLE).is_none_or(|role| role != Role::Network.name()),
+                std::env::var_os(ROLE).is_none_or(|role| role != Role::Network.name()),
                 "the Windows sandbox launched the broker without its socket channel"
             );
             return Ok(None);

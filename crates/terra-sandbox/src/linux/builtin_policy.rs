@@ -221,7 +221,7 @@ mod tests {
         let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0));
         assert_eq!(listener.unwrap_err().raw_os_error(), Some(libc::EPERM));
         if role == "vm" {
-            probe_denied_vm_outgoing_sockets();
+            probe_denied_vm_listeners_and_outgoing_sockets();
         } else {
             std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
             probe_denied_kvm_ioctls();
@@ -294,8 +294,14 @@ mod tests {
     }
 
     #[allow(unsafe_code)]
-    fn probe_denied_vm_outgoing_sockets() {
-        for syscall in [libc::SYS_connect, libc::SYS_sendmsg, libc::SYS_sendmmsg] {
+    fn probe_denied_vm_listeners_and_outgoing_sockets() {
+        for syscall in [
+            libc::SYS_bind,
+            libc::SYS_listen,
+            libc::SYS_connect,
+            libc::SYS_sendmsg,
+            libc::SYS_sendmmsg,
+        ] {
             // SAFETY: an invalid descriptor and null pointers have no external effects even if a filter regresses.
             assert_eq!(unsafe { libc::syscall(syscall, -1, 0, 0, 0, 0, 0) }, -1);
             assert_eq!(
