@@ -1,6 +1,9 @@
 # `workdir` names a directory that does not exist yet, inside the share the
-# runner appends: terra creates it and hands it to the workload user. No egress
-# needed.
+# runner appends: terra creates it and hands it to the workload user, and
+# `on_start` already runs there. No egress needed.
+hooks:
+  on_start:
+    - echo ON_START_DIR=$(pwd)
 workload:
   workdir: /work/nested/deep
   entrypoint: /bin/sh

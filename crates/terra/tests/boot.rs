@@ -1584,6 +1584,7 @@ fn run_mount_boot_suite() {
     // == workdir: created when missing, owned by the workload user ==
     let (out, _) = s.boot_with_share("workdir", &[]);
     assert!(out.contains("PWD=/work/nested/deep"), "{out}");
+    assert!(out.contains("ON_START_DIR=/work/nested/deep"), "{out}");
     assert!(out.contains("OWNER=1000:1000"), "{out}");
     assert!(out.contains("WRITE_OK"), "{out}");
 

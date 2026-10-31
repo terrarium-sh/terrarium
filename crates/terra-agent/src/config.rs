@@ -16,6 +16,13 @@ struct InterfaceRequest {
     data: [u8; 24],
 }
 
+pub(super) fn restrict_ptrace() {
+    const PATH: &str = "/proc/sys/kernel/yama/ptrace_scope";
+    if let Err(error) = fs::write(PATH, "1\n") {
+        eprintln!("terra-agent: warning: could not restrict ptrace ({PATH}): {error}");
+    }
+}
+
 #[allow(unsafe_code)]
 pub(super) fn enable_loopback() -> Result<()> {
     let socket = rustix::net::socket_with(

@@ -137,12 +137,11 @@ fn spawn_pty(
     workload_root: bool,
     term: TermSize,
 ) -> Result<RunningProcess, SpawnFailure> {
-    let (pty, _, child_pidfd) = match crate::workload::spawn_on_pty(
+    let (pty, child_pidfd) = match crate::workload::spawn_on_pty(
         cmd,
         args,
         term,
         req.as_root || workload_root,
-        Some(terra_protocol::WORKLOAD_HOME),
         req.workdir.as_deref(),
         &req.env,
     ) {

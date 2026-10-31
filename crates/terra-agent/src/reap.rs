@@ -50,6 +50,20 @@ impl OwnedPidfd {
         drop(owned);
         let _ = rustix::process::pidfd_send_signal(self, sig);
     }
+
+    pub async fn stop_gracefully(&self, grace: std::time::Duration) {
+        let _ = rustix::process::pidfd_send_signal(self, rustix::process::Signal::TERM);
+        let ready = self.try_clone().and_then(crate::into_async_fd);
+        if let Ok(ready) = ready
+            && matches!(
+                tokio::time::timeout(grace, ready.readable()).await,
+                Ok(Ok(_))
+            )
+        {
+            return;
+        }
+        let _ = rustix::process::pidfd_send_signal(self, rustix::process::Signal::KILL);
+    }
 }
 
 static OWNED: Mutex<Vec<OwnedChild>> = Mutex::new(Vec::new());
@@ -240,5 +254,23 @@ mod tests {
 
         *lock_or_abort(&old_status) = Some(ExitStatus::from_raw(7 << 8));
         assert_eq!(lock_or_abort(&old_status).unwrap().code(), Some(7));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_graceful_stop_ends_early_when_the_process_takes_the_signal() {
+        let (_child, pidfd) = spawn_owned(|| {
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg("trap 'exit 0' TERM; while true; do sleep 1; done")
+                .spawn()
+        })
+        .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            pidfd.stop_gracefully(Duration::from_secs(30)),
+        )
+        .await
+        .unwrap();
+        wait_owned(&pidfd).await.unwrap();
     }
 }

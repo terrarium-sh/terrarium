@@ -132,9 +132,9 @@ mod tests {
         let cancellation = CancellationToken::new();
         let tasks = TaskTracker::new();
         let session = Session::new(
+            &tasks,
             crate::into_async_file(File::from(OwnedFd::from(input))).unwrap(),
             &cancellation,
-            &tasks,
         )
         .unwrap();
         let (host, guest) = UnixStream::pair().unwrap();

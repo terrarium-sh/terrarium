@@ -18,15 +18,7 @@ use terra_protocol::{
 const CLEAN_MOUNT: &str = "/mnt/clean";
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
-pub(super) struct Boot {
-    pub(super) plan: Plan,
-    pub(super) control: File,
-    pub(super) diagnostic: File,
-    pub(super) clients: tokio::sync::mpsc::Receiver<File>,
-    pub(super) mux: crate::mux::GuestMux,
-}
-
-pub(super) fn enter_root() -> Result<Boot> {
+pub(super) fn enter_root() -> Result<(Plan, crate::mux::Streams)> {
     const NEWROOT: &str = "/mnt/root";
 
     mount(None, "/proc", Some("proc"), MountFlags::empty()).context("mounting /proc")?;
@@ -46,13 +38,8 @@ pub(super) fn enter_root() -> Result<Boot> {
     fs::create_dir_all(NEWROOT)?;
     fs::create_dir_all(CLEAN_MOUNT)?;
 
-    let crate::mux::Streams {
-        mut control,
-        diagnostic,
-        clients,
-        driver: mux,
-    } = crate::mux::GuestMux::connect()?;
-    let plan = read_boot_plan(&mut control)?;
+    let mut streams = crate::mux::GuestMux::connect()?;
+    let plan = read_boot_plan(&mut streams.control)?;
     setup_env(&plan);
     apply_host_state(&plan)?;
     for volume in &plan.volumes {
@@ -101,13 +88,7 @@ pub(super) fn enter_root() -> Result<Boot> {
         RootfsMount::Writable | RootfsMount::Overlay { .. } => {}
     }
     write_per_boot_files(Path::new(PER_BOOT_DIR), &plan)?;
-    Ok(Boot {
-        plan,
-        control,
-        diagnostic,
-        clients,
-        mux,
-    })
+    Ok((plan, streams))
 }
 
 fn mount_guest_root(rootfs: &RootfsMount, new_root: &str) -> Result<()> {

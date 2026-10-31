@@ -277,7 +277,7 @@ mod tests {
             guest_driver,
         } = carrier(0).await;
         let stop = tokio_util::sync::CancellationToken::new();
-        let watcher = tokio::spawn(crate::watch_control(
+        let watcher = tokio::spawn(crate::agent::watch_control(
             control,
             stop.clone(),
             tokio_util::sync::CancellationToken::new(),

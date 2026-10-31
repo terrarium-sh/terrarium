@@ -116,9 +116,9 @@ pub(crate) enum DetachOutcome {
 
 impl Session {
     pub fn new(
+        tasks: &TaskTracker,
         input: AsyncFile,
         cancellation: &CancellationToken,
-        tasks: &TaskTracker,
     ) -> std::io::Result<Arc<Self>> {
         let (sender, mut receiver) = mpsc::channel::<Vec<u8>>(INPUT_QUEUE_CAPACITY);
         let input_fd = input.get_ref().as_fd().try_clone_to_owned()?;
@@ -366,9 +366,9 @@ mod tests {
         let tasks = TaskTracker::new();
         (
             Session::new(
+                &tasks,
                 crate::into_async_file(input).unwrap(),
                 &cancellation,
-                &tasks,
             )
             .unwrap(),
             crate::into_async_file(sink).unwrap(),
@@ -661,9 +661,9 @@ mod tests {
         let cancellation = CancellationToken::new();
         let tasks = TaskTracker::new();
         let session = Session::new(
+            &tasks,
             crate::into_async_file(input).unwrap(),
             &cancellation,
-            &tasks,
         )
         .unwrap();
         drop(sink);
@@ -683,9 +683,9 @@ mod tests {
         let cancellation = CancellationToken::new();
         let tasks = TaskTracker::new();
         let session = Session::new(
+            &tasks,
             crate::into_async_file(input).unwrap(),
             &cancellation,
-            &tasks,
         )
         .unwrap();
         let bytes = vec![0; 64 << 10];
@@ -705,9 +705,9 @@ mod tests {
         let cancellation = CancellationToken::new();
         let tasks = TaskTracker::new();
         let session = Session::new(
+            &tasks,
             crate::into_async_file(input).unwrap(),
             &cancellation,
-            &tasks,
         )
         .unwrap();
         let (client, mut reader) = client();

@@ -369,9 +369,9 @@ pub(super) fn render_resolv_conf(net: terra_protocol::Net) -> String {
 }
 
 pub(super) async fn start(
+    tasks: &TaskTracker,
     plan: &terra_protocol::Plan,
     shutdown: &CancellationToken,
-    tasks: &TaskTracker,
     diagnostic: &Diagnostics,
 ) -> Result<()> {
     validate_kernel_socket_version()?;
@@ -399,10 +399,10 @@ pub(super) async fn start(
             let decoder = verify_network_version(&client, &mut reader).await?;
             let pending = client.pending.clone();
             spawn_network_service(
+                tasks,
                 "owner",
                 async move { Err(receive_results(reader, decoder, pending).await) },
                 &shutdown,
-                tasks,
                 diagnostic,
             );
             let udp_dns = UdpSocket::bind(DNS_ADDRESS)
@@ -412,31 +412,31 @@ pub(super) async fn start(
                 .await
                 .context("binding guest TCP DNS")?;
             spawn_network_service(
-                "UDP DNS",
-                serve_udp_dns(udp_dns, client.clone(), shutdown.clone(), tasks.clone()),
-                &shutdown,
                 tasks,
+                "UDP DNS",
+                serve_udp_dns(tasks.clone(), udp_dns, client.clone(), shutdown.clone()),
+                &shutdown,
                 diagnostic,
             );
             spawn_network_service(
-                "TCP DNS",
-                serve_tcp_dns(tcp_dns, client, shutdown.clone(), tasks.clone()),
-                &shutdown,
                 tasks,
+                "TCP DNS",
+                serve_tcp_dns(tasks.clone(), tcp_dns, client, shutdown.clone()),
+                &shutdown,
                 diagnostic,
             );
             if let Some(listener) = publications {
                 spawn_network_service(
+                    tasks,
                     "publication",
                     serve_publications(
+                        tasks.clone(),
                         listener,
                         plan.published_ports.clone(),
                         plan.published_udp_ports.clone(),
                         shutdown.clone(),
-                        tasks.clone(),
                     ),
                     &shutdown,
-                    tasks,
                     diagnostic,
                 );
             }
@@ -470,10 +470,10 @@ async fn resolve_dns(client: &NetworkClient, stream: bool, query: Vec<u8>) -> io
 }
 
 fn spawn_network_service(
+    tasks: &TaskTracker,
     name: &'static str,
     service: impl std::future::Future<Output = io::Result<()>> + Send + 'static,
     shutdown: &CancellationToken,
-    tasks: &TaskTracker,
     diagnostic: &Diagnostics,
 ) {
     let shutdown = shutdown.clone();
@@ -520,10 +520,10 @@ fn report_network_unavailable(
 }
 
 async fn serve_udp_dns(
+    tasks: TaskTracker,
     socket: UdpSocket,
     client: Arc<NetworkClient>,
     shutdown: CancellationToken,
-    tasks: TaskTracker,
 ) -> io::Result<()> {
     let socket = Arc::new(socket);
     let slots = Arc::new(Semaphore::new(MAX_DNS_CLIENTS));
@@ -548,10 +548,10 @@ async fn serve_udp_dns(
 }
 
 async fn serve_tcp_dns(
+    tasks: TaskTracker,
     listener: TcpListener,
     client: Arc<NetworkClient>,
     shutdown: CancellationToken,
-    tasks: TaskTracker,
 ) -> io::Result<()> {
     let slots = Arc::new(Semaphore::new(MAX_DNS_CLIENTS));
     loop {
@@ -599,11 +599,11 @@ async fn read_dns_query(
 }
 
 async fn serve_publications(
+    tasks: TaskTracker,
     listener: async_io::Async<File>,
     tcp_ports: Vec<u16>,
     udp_ports: Vec<u16>,
     shutdown: CancellationToken,
-    tasks: TaskTracker,
 ) -> io::Result<()> {
     let slots = Arc::new(Semaphore::new(MAX_PUBLICATION_CARRIERS));
     let grants = Arc::new(PublicationGrants::new(tcp_ports, udp_ports));
@@ -1052,10 +1052,10 @@ mod tests {
                 async move {
                     shutdown
                         .run_until_cancelled(serve_udp_dns(
+                            tasks,
                             listener,
                             client,
                             shutdown.clone(),
-                            tasks,
                         ))
                         .await
                 }

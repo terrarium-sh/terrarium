@@ -39,11 +39,11 @@ impl Daemons {
 }
 
 pub fn spawn_all(
+    tasks: &TaskTracker,
     lines: &[String],
     as_root: bool,
     output: Option<&std::fs::File>,
     parent_cancellation: &CancellationToken,
-    tasks: &TaskTracker,
 ) -> std::io::Result<Daemons> {
     let processes = DaemonRegistry::default();
     let cancellation = parent_cancellation.child_token();
@@ -71,9 +71,7 @@ pub fn spawn_all(
     let on_shutdown = daemons.clone();
     tasks.spawn(async move {
         parent_cancellation.cancelled().await;
-        on_shutdown
-            .stop(Duration::from_secs(terra_protocol::DEFAULT_STOP_GRACE_SECS))
-            .await;
+        on_shutdown.stop(crate::STOP_GRACE).await;
     });
     Ok(daemons)
 }
@@ -159,11 +157,11 @@ mod tests {
 
     fn spawn(lines: &[String], as_root: bool, output: Option<&std::fs::File>) -> Daemons {
         spawn_all(
+            &TaskTracker::new(),
             lines,
             as_root,
             output,
             &CancellationToken::new(),
-            &TaskTracker::new(),
         )
         .unwrap()
     }
@@ -273,7 +271,7 @@ mod tests {
     async fn parent_cancellation_stops_a_running_daemon() {
         let parent = CancellationToken::new();
         let tasks = TaskTracker::new();
-        let daemons = spawn_all(&["sleep 600".to_string()], true, None, &parent, &tasks).unwrap();
+        let daemons = spawn_all(&tasks, &["sleep 600".to_string()], true, None, &parent).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while lock_or_abort(&daemons.processes).is_empty() {
             assert!(std::time::Instant::now() < deadline, "never spawned");

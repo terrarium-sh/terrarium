@@ -1,9 +1,4 @@
 //! Agent session, file transfer, and exec services.
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::struct_field_names
-)]
 
 use crate::AsyncFile;
 use crate::term::session::{ClientConn, DetachOutcome, Session};
@@ -23,126 +18,141 @@ const STARTUP_WAIT: Duration = Duration::from_mins(5);
 const SERVICE_SELECT_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[derive(Clone)]
-pub(crate) struct StartupGate(watch::Sender<StartupState>);
-
-#[derive(Clone, Copy)]
-enum StartupState {
+/// Whether sync and exec are served; the console session and its control always are.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StartupState {
+    /// Sync and exec wait until the state changes or `STARTUP_WAIT` runs out.
     Pending,
     Ready,
-    Failed,
+    Refused,
 }
 
-impl StartupGate {
-    pub(crate) fn new() -> Self {
-        Self(watch::Sender::new(StartupState::Pending))
-    }
+/// Changes the [`StartupState`] of a running server; dropping it refuses requests still pending.
+pub(crate) struct Server(watch::Sender<StartupState>);
 
-    pub(crate) fn ready(&self) {
-        self.0.send_replace(StartupState::Ready);
-    }
-
-    pub(crate) fn fail(&self) {
-        self.0.send_replace(StartupState::Failed);
-    }
-
-    async fn wait(&self) -> bool {
-        let mut state = self.0.subscribe();
-        let outcome = tokio::time::timeout(
-            STARTUP_WAIT,
-            state.wait_for(|state| match state {
-                StartupState::Pending => false,
-                StartupState::Ready | StartupState::Failed => true,
-            }),
-        )
-        .await;
-        matches!(outcome, Ok(Ok(state)) if matches!(*state, StartupState::Ready))
+impl Server {
+    pub(crate) fn update_state(&self, state: StartupState) {
+        self.0.send_replace(state);
     }
 }
 
-pub(crate) async fn serve_clients(
+pub(crate) fn init_server(
+    tasks: &TaskTracker,
     session: Arc<Session>,
     mut clients: mpsc::Receiver<File>,
     workload_is_root: bool,
     initial_session: Option<mpsc::Sender<()>>,
-    startup: StartupGate,
-    cancellation: CancellationToken,
-) {
-    let tasks = TaskTracker::new();
-    while let Some(conn) = cancellation
-        .run_until_cancelled(clients.recv())
-        .await
-        .flatten()
-    {
-        tasks.spawn(serve_connection(
-            session.clone(),
-            conn,
-            workload_is_root,
-            initial_session.clone(),
-            startup.clone(),
-            cancellation.clone(),
-        ));
-    }
-    tasks.close();
-    tasks.wait().await;
+    initial_state: StartupState,
+    cancellation: &CancellationToken,
+) -> Server {
+    let (state, startup) = watch::channel(initial_state);
+    let services = Services {
+        session,
+        workload_is_root,
+        initial_session,
+        startup,
+        cancellation: cancellation.clone(),
+    };
+    let connections = tasks.clone();
+    tasks.spawn(async move {
+        while let Some(conn) = services
+            .cancellation
+            .run_until_cancelled(clients.recv())
+            .await
+            .flatten()
+        {
+            connections.spawn(services.clone().serve(conn));
+        }
+    });
+    Server(state)
 }
 
-async fn serve_connection(
+async fn wait_until_started(startup: &mut watch::Receiver<StartupState>) -> bool {
+    let outcome = tokio::time::timeout(
+        STARTUP_WAIT,
+        startup.wait_for(|state| match state {
+            StartupState::Pending => false,
+            StartupState::Ready | StartupState::Refused => true,
+        }),
+    )
+    .await;
+    matches!(outcome, Ok(Ok(state)) if *state == StartupState::Ready)
+}
+
+/// What each client connection is served with; every connection task owns a copy.
+#[derive(Clone)]
+struct Services {
     session: Arc<Session>,
-    conn: File,
     workload_is_root: bool,
     initial_session: Option<mpsc::Sender<()>>,
-    startup: StartupGate,
+    startup: watch::Receiver<StartupState>,
     cancellation: CancellationToken,
-) {
-    let Ok(mut conn) = crate::into_async_file(conn) else {
-        return;
-    };
-    let service = cancellation
-        .run_until_cancelled(async {
-            conn.write_all(&AGENT_HELLO).await?;
-            conn.flush().await?;
-            tokio::time::timeout(
-                SERVICE_SELECT_TIMEOUT,
-                read_frame_async_with_limit::<AgentService>(&mut conn, MAX_SERVICE_FRAME_BYTES),
-            )
-            .await
-            .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))?
-        })
-        .await;
-    let Some(Ok(Some(service))) = service else {
-        return;
-    };
-    match service {
-        AgentService::Session => {
-            cancellation
-                .run_until_cancelled(serve_client(&session, conn, initial_session.as_ref()))
-                .await;
-        }
-        AgentService::SessionControl => {
-            cancellation
-                .run_until_cancelled(serve_session_control(&session, conn))
-                .await;
-        }
-        AgentService::Sync
-            if cancellation.run_until_cancelled(startup.wait()).await == Some(true) =>
-        {
-            let Ok(file) = prepare_file_transfer(conn) else {
-                return;
-            };
-            serve_file_transfer(file, workload_is_root, cancellation).await;
-        }
-        AgentService::Exec
-            if cancellation.run_until_cancelled(startup.wait()).await == Some(true) =>
-        {
-            Box::pin(crate::exec::serve_exec(
-                conn,
-                workload_is_root,
-                cancellation,
-            ))
+}
+
+impl Services {
+    async fn serve(self, conn: File) {
+        let Self {
+            session,
+            workload_is_root,
+            initial_session,
+            mut startup,
+            cancellation,
+        } = self;
+        let Ok(mut conn) = crate::into_async_file(conn) else {
+            return;
+        };
+        let service = cancellation
+            .run_until_cancelled(async {
+                conn.write_all(&AGENT_HELLO).await?;
+                conn.flush().await?;
+                tokio::time::timeout(
+                    SERVICE_SELECT_TIMEOUT,
+                    read_frame_async_with_limit::<AgentService>(&mut conn, MAX_SERVICE_FRAME_BYTES),
+                )
+                .await?
+            })
             .await;
+        let Some(Ok(Some(service))) = service else {
+            return;
+        };
+        let waits_for_startup = match service {
+            AgentService::Session | AgentService::SessionControl => false,
+            AgentService::Sync | AgentService::Exec => true,
+        };
+        if waits_for_startup
+            && cancellation
+                .run_until_cancelled(wait_until_started(&mut startup))
+                .await
+                != Some(true)
+        {
+            return;
         }
-        AgentService::Sync | AgentService::Exec => {}
+        match service {
+            AgentService::Session => {
+                cancellation
+                    .run_until_cancelled(serve_client(&session, conn, initial_session.as_ref()))
+                    .await;
+            }
+            AgentService::SessionControl => {
+                cancellation
+                    .run_until_cancelled(serve_session_control(&session, conn))
+                    .await;
+            }
+            AgentService::Sync => {
+                let Ok(file) = prepare_file_transfer(conn) else {
+                    return;
+                };
+                serve_file_transfer(file, workload_is_root, cancellation).await;
+            }
+            AgentService::Exec => {
+                Box::pin(crate::exec::serve_exec(
+                    conn,
+                    workload_is_root,
+                    cancellation,
+                ))
+                .await;
+            }
+        }
     }
 }
 
@@ -180,7 +190,7 @@ async fn serve_client(
     conn: AsyncFile,
     initial_session: Option<&mpsc::Sender<()>>,
 ) {
-    let Ok(reader) = conn
+    let Ok(mut reader) = conn
         .get_ref()
         .as_fd()
         .try_clone_to_owned()
@@ -197,7 +207,6 @@ async fn serve_client(
     if let Some(initial_session) = initial_session {
         let _ = initial_session.try_send(());
     }
-    let mut reader = reader;
     loop {
         match terra_protocol::read_frame_async::<ClientInput>(&mut reader).await {
             Ok(Some(ClientInput::Keys(bytes))) if session.send_input(&bytes).await.is_err() => {
@@ -224,38 +233,32 @@ async fn serve_session_control(session: &Arc<Session>, mut conn: AsyncFile) {
     let Ok(Ok(Some(request))) = request else {
         return;
     };
-    match request {
-        ControlRequest::List => {
-            for (id, size) in session.list_clients().await {
-                let size = size.map(|(rows, cols)| TermSize { rows, cols });
-                if write_control_reply(&mut conn, &ControlReply::Client { id, size })
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-            }
-            let _ = write_control_reply(&mut conn, &ControlReply::Done).await;
-        }
-        ControlRequest::Detach { id } => match session.detach_client(id).await {
-            DetachOutcome::Detached { .. } => {
-                let _ = write_control_reply(&mut conn, &ControlReply::Detached { id }).await;
-            }
-            DetachOutcome::Missing => {
-                let _ = write_control_reply(&mut conn, &ControlReply::Missing { id }).await;
-            }
-        },
+    let replies: Vec<ControlReply> = match request {
+        ControlRequest::List => session
+            .list_clients()
+            .await
+            .into_iter()
+            .map(|(id, size)| ControlReply::Client {
+                id,
+                size: size.map(|(rows, cols)| TermSize { rows, cols }),
+            })
+            .chain([ControlReply::Done])
+            .collect(),
+        ControlRequest::Detach { id } => vec![match session.detach_client(id).await {
+            DetachOutcome::Detached { .. } => ControlReply::Detached { id },
+            DetachOutcome::Missing => ControlReply::Missing { id },
+        }],
         ControlRequest::DetachAll => {
             let (ids, _) = session.detach_all_clients().await;
-            for id in ids {
-                if write_control_reply(&mut conn, &ControlReply::Detached { id })
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-            }
-            let _ = write_control_reply(&mut conn, &ControlReply::Done).await;
+            ids.into_iter()
+                .map(|id| ControlReply::Detached { id })
+                .chain([ControlReply::Done])
+                .collect()
+        }
+    };
+    for reply in &replies {
+        if write_control_reply(&mut conn, reply).await.is_err() {
+            return;
         }
     }
 }
@@ -265,8 +268,7 @@ async fn write_control_reply(conn: &mut AsyncFile, reply: &ControlReply) -> std:
         CONTROL_TIMEOUT,
         terra_protocol::write_frame_async(conn, reply),
     )
-    .await
-    .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))?
+    .await?
 }
 
 #[cfg(test)]
@@ -311,19 +313,20 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn requests_wait_for_startup_or_fail_with_it() {
-        let startup = StartupGate::new();
-        let waiting = {
-            let startup = startup.clone();
-            tokio::spawn(async move { startup.wait().await })
-        };
+    async fn requests_wait_for_startup_or_are_refused() {
+        let (state, mut startup) = watch::channel(StartupState::Pending);
+        let server = Server(state);
+        let waiting = tokio::spawn(async move { wait_until_started(&mut startup).await });
         tokio::task::yield_now().await;
-        startup.ready();
+        server.update_state(StartupState::Ready);
         assert!(waiting.await.unwrap());
 
-        let startup = StartupGate::new();
-        startup.fail();
-        assert!(!startup.wait().await);
+        let (_, mut startup) = watch::channel(StartupState::Refused);
+        assert!(!wait_until_started(&mut startup).await);
+
+        let (state, mut startup) = watch::channel(StartupState::Pending);
+        drop(Server(state));
+        assert!(!wait_until_started(&mut startup).await);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -332,9 +335,9 @@ mod tests {
         let cancellation = CancellationToken::new();
         let tasks = TaskTracker::new();
         let session = Session::new(
+            &tasks,
             crate::into_async_file(input).unwrap(),
             &cancellation,
-            &tasks,
         )
         .unwrap();
         let (client, client_sink) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -347,14 +350,14 @@ mod tests {
         let serving = {
             let session = session.clone();
             tokio::spawn(async move {
-                serve_connection(
+                Services {
                     session,
-                    File::from(OwnedFd::from(agent)),
-                    false,
-                    None,
-                    StartupGate::new(),
+                    workload_is_root: false,
+                    initial_session: None,
+                    startup: watch::channel(StartupState::Pending).1,
                     cancellation,
-                )
+                }
+                .serve(File::from(OwnedFd::from(agent)))
                 .await;
             })
         };
@@ -410,7 +413,7 @@ mod tests {
     /// Cancelling a partial upload removes its temporary file before its worker exits.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelling_a_partial_upload_preserves_the_destination() {
-        let scratch = crate::create_scratch_path("channel", "cancel-upload");
+        let scratch = crate::create_scratch_path("services", "cancel-upload");
         std::fs::create_dir_all(&scratch).unwrap();
         let destination = scratch.join("file");
         std::fs::write(&destination, b"old").unwrap();
@@ -463,7 +466,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelling_a_stalled_download_joins_the_file_worker() {
-        let scratch = crate::create_scratch_path("channel", "cancel-download");
+        let scratch = crate::create_scratch_path("services", "cancel-download");
         std::fs::create_dir_all(&scratch).unwrap();
         std::fs::write(scratch.join("file"), vec![0; 4 * 1024 * 1024]).unwrap();
         let (mut host, agent) = file_connection();
