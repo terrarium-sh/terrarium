@@ -74,13 +74,14 @@ pub(super) async fn execute(
         .workdir
         .clone()
         .unwrap_or_else(|| terra_protocol::WORKLOAD_HOME.to_owned());
-    if let Err(error) = crate::sync::ensure_directory(Path::new(&workdir), !plan.root)
-        .with_context(|| format!("creating workdir {workdir}"))
-        .and_then(|()| {
-            std::env::set_current_dir(&workdir)
-                .with_context(|| format!("entering workdir {workdir}"))
-        })
-    {
+    if let Err(error) = crate::sync::ensure_directory(
+        Path::new(&workdir),
+        crate::sync::Owner::for_workload(plan.root),
+    )
+    .with_context(|| format!("creating workdir {workdir}"))
+    .and_then(|()| {
+        std::env::set_current_dir(&workdir).with_context(|| format!("entering workdir {workdir}"))
+    }) {
         return Err(fail_startup(&startup, &session, error).await);
     }
     startup.ready();
@@ -138,7 +139,7 @@ fn write_persistent_state(plan: &Plan) -> Result<()> {
         .context("restoring the per-boot links on_create replaced")?;
     config::prepare_mount_points(plan)?;
     if let Some(workdir) = &plan.workdir {
-        crate::sync::ensure_directory(Path::new(workdir), true)
+        crate::sync::ensure_directory(Path::new(workdir), crate::sync::Owner::Workload)
             .with_context(|| format!("creating workdir {workdir}"))?;
     }
     Ok(())

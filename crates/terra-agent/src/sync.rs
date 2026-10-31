@@ -91,25 +91,40 @@ fn create_put_temp(path: &Path) -> std::io::Result<PreparedPut> {
     })
 }
 
-fn prepare_put(path: &Path) -> std::io::Result<PreparedPut> {
-    match create_put_temp(path) {
-        Ok(prepared) => Ok(prepared),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let parent = path.parent().unwrap_or(path);
-            ensure_directory(parent, false)?;
-            create_put_temp(path)
+/// Who owns a directory or file the agent creates; the agent itself runs as root.
+#[derive(Clone, Copy)]
+pub(crate) enum Owner {
+    Root,
+    Workload,
+}
+
+impl Owner {
+    pub(crate) const fn for_workload(workload_is_root: bool) -> Self {
+        if workload_is_root {
+            Self::Root
+        } else {
+            Self::Workload
         }
-        Err(error) => Err(error),
+    }
+
+    fn assign_to(self, created: impl std::os::fd::AsFd) -> std::io::Result<()> {
+        match self {
+            Self::Root => Ok(()),
+            Self::Workload => {
+                let (uid, gid) = crate::workload::workload_owner();
+                Ok(rustix::fs::fchown(created, uid, gid)?)
+            }
+        }
     }
 }
 
-pub(crate) fn ensure_directory(path: &Path, give_to_workload: bool) -> std::io::Result<()> {
-    open_or_create_directory(path, give_to_workload, rustix::fs::OFlags::empty()).map(drop)
+pub(crate) fn ensure_directory(path: &Path, owner: Owner) -> std::io::Result<()> {
+    open_or_create_directory(path, owner, rustix::fs::OFlags::empty()).map(drop)
 }
 
 fn open_or_create_directory(
     path: &Path,
-    give_to_workload: bool,
+    owner: Owner,
     symlink_flags: rustix::fs::OFlags,
 ) -> std::io::Result<std::fs::File> {
     use rustix::fs::{Mode, OFlags};
@@ -144,10 +159,7 @@ fn open_or_create_directory(
             Mode::empty(),
         )?
         .into();
-        if give_to_workload {
-            let (uid, gid) = crate::workload::workload_owner();
-            rustix::fs::fchown(&parent, uid, gid)?;
-        }
+        owner.assign_to(&parent)?;
     }
     Ok(parent)
 }
@@ -195,6 +207,14 @@ fn reply_on_error<T>(
     }
 }
 
+fn send_outcome(conn: &mut impl Write, outcome: std::io::Result<()>) -> std::io::Result<()> {
+    let reply = match outcome {
+        Ok(()) => SyncReply::Success,
+        Err(error) => SyncReply::Err(error.to_string()),
+    };
+    send_reply(conn, &reply)
+}
+
 fn resolve_target_path(session_root: &Path, relative_path: &str) -> std::io::Result<PathBuf> {
     validate_relative_path(relative_path)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
@@ -213,11 +233,29 @@ fn resolve_target_path(session_root: &Path, relative_path: &str) -> std::io::Res
     Ok(path)
 }
 
-fn hash_file<E>(
+fn resolve_target_path_creating_parent(
+    session_root: &Path,
+    relative_path: &str,
+) -> std::io::Result<PathBuf> {
+    let path = resolve_target_path(session_root, relative_path)?;
+    if let Some(parent) = path.parent() {
+        ensure_directory(parent, Owner::Root)?;
+    }
+    Ok(path)
+}
+
+fn is_unchanged_since(file: &std::fs::File, before: &std::fs::Metadata) -> bool {
+    file.metadata().is_ok_and(|after| {
+        before.len() == after.len() && before.modified().ok() == after.modified().ok()
+    })
+}
+
+/// The outer error aborts the session; the inner error is reported to the peer.
+fn hash_file(
     path: &Path,
     cancellation: &CancellationToken,
-    mut report_progress: impl FnMut(u64) -> Result<(), E>,
-) -> Result<std::io::Result<[u8; 32]>, E> {
+    mut report_progress: impl FnMut(u64) -> std::io::Result<()>,
+) -> std::io::Result<std::io::Result<[u8; 32]>> {
     let (mut file, before) = match open_sync_file(path) {
         Ok(file) => file,
         Err(error) => return Ok(Err(error)),
@@ -248,9 +286,7 @@ fn hash_file<E>(
             Err(error) => return Ok(Err(error)),
         }
     }
-    if !file.metadata().is_ok_and(|after| {
-        before.len() == after.len() && before.modified().ok() == after.modified().ok()
-    }) {
+    if !is_unchanged_since(&file, &before) {
         return Ok(Err(std::io::Error::other("source changed while hashing")));
     }
     Ok(Ok(hasher.finalize().into()))
@@ -285,6 +321,17 @@ fn stream_exact(
     Ok(())
 }
 
+fn truncated_mtime_nanos(metadata: &std::fs::Metadata) -> u32 {
+    truncate_nanos(u32::try_from(metadata.mtime_nsec()).unwrap_or(0))
+}
+
+fn read_link_target(path: &Path) -> std::io::Result<String> {
+    std::fs::read_link(path)?
+        .into_os_string()
+        .into_string()
+        .map_err(|_| std::io::Error::other("non-UTF-8 symlink target"))
+}
+
 fn build_sync_entry(
     relative_path: String,
     kind: SyncEntryKind,
@@ -300,95 +347,51 @@ fn build_sync_entry(
         },
         mode: metadata.mode() & 0o777,
         mtime_secs: metadata.mtime(),
-        mtime_nanos: truncate_nanos(u32::try_from(metadata.mtime_nsec()).unwrap_or(0)),
+        mtime_nanos: truncated_mtime_nanos(metadata),
         link_target,
     }
 }
 
-struct ScanState<'a, W: Write> {
-    session_root: &'a Path,
-    conn: &'a mut W,
-    budget: SyncManifestBudget,
-}
-
-impl<W: Write> ScanState<'_, W> {
-    fn emit_child_entry(
-        &mut self,
-        rel: &Path,
-        name: &str,
-        queue: &mut VecDeque<PathBuf>,
-    ) -> std::io::Result<bool> {
-        match self.build_child_entry(rel, name, queue)? {
-            Ok(entry) => {
-                send_reply(self.conn, &SyncReply::Entry(entry))?;
-                Ok(true)
-            }
-            Err(message) => {
-                send_reply(self.conn, &SyncReply::Err(message))?;
-                Ok(false)
-            }
-        }
+fn build_child_entry(
+    session_root: &Path,
+    parent_rel: &Path,
+    name: &std::ffi::OsStr,
+    budget: &mut SyncManifestBudget,
+    pending_directories: &mut VecDeque<PathBuf>,
+) -> Result<SyncEntry, String> {
+    let name = name
+        .to_str()
+        .ok_or_else(|| "non-utf8 filename encountered".to_owned())?;
+    let child_rel = parent_rel.join(name);
+    let rel_str = child_rel.to_string_lossy().into_owned();
+    if rel_str.len() > terra_protocol::MAX_SYNC_PATH_BYTES {
+        return Err(format!("relative path exceeds maximum length: {rel_str}"));
     }
-
-    /// The outer error aborts the session; the inner error is reported to the peer.
-    fn build_child_entry(
-        &mut self,
-        rel: &Path,
-        name: &str,
-        queue: &mut VecDeque<PathBuf>,
-    ) -> std::io::Result<Result<SyncEntry, String>> {
-        let child_rel = if rel.as_os_str().is_empty() {
-            PathBuf::from(name)
-        } else {
-            rel.join(name)
-        };
-        let rel_str = child_rel.to_string_lossy().into_owned();
-        if rel_str.len() > terra_protocol::MAX_SYNC_PATH_BYTES {
-            return Ok(Err(format!(
-                "relative path exceeds maximum length: {rel_str}"
-            )));
-        }
-        let full = self.session_root.join(&child_rel);
-        let meta = match std::fs::symlink_metadata(&full) {
-            Ok(m) => m,
-            Err(e) => return Ok(Err(e.to_string())),
-        };
-        let mut link_target = None;
-        let kind = if meta.is_dir() {
-            queue.push_back(child_rel);
-            SyncEntryKind::Directory
-        } else if meta.file_type().is_symlink() {
-            match std::fs::read_link(&full) {
-                Ok(t) => {
-                    let target_str = t
-                        .to_str()
-                        .ok_or_else(|| std::io::Error::other("non-UTF-8 symlink target"))?
-                        .to_owned();
-                    link_target = Some(target_str);
-                    SyncEntryKind::Symlink
-                }
-                Err(e) => return Ok(Err(e.to_string())),
+    let full = session_root.join(&child_rel);
+    let meta = std::fs::symlink_metadata(&full).map_err(|e| e.to_string())?;
+    let mut link_target = None;
+    let kind = if meta.is_dir() {
+        pending_directories.push_back(child_rel);
+        SyncEntryKind::Directory
+    } else if meta.file_type().is_symlink() {
+        link_target = Some(read_link_target(&full).map_err(|e| e.to_string())?);
+        SyncEntryKind::Symlink
+    } else if meta.is_file() {
+        SyncEntryKind::File
+    } else {
+        return Err(format!("unsupported special file: {rel_str}"));
+    };
+    budget
+        .add_entry(&rel_str, link_target.as_deref())
+        .map_err(|limit| match limit {
+            SyncManifestLimit::Entries => {
+                format!("manifest exceeds maximum entries limit: {MAX_SYNC_ENTRIES}")
             }
-        } else if meta.is_file() {
-            SyncEntryKind::File
-        } else {
-            return Ok(Err(format!("unsupported special file: {rel_str}")));
-        };
-        match self.budget.add_entry(&rel_str, link_target.as_deref()) {
-            Ok(()) => {}
-            Err(SyncManifestLimit::Entries) => {
-                return Ok(Err(format!(
-                    "manifest exceeds maximum entries limit: {MAX_SYNC_ENTRIES}"
-                )));
+            SyncManifestLimit::MetadataBytes => {
+                format!("manifest metadata exceeds maximum bytes limit: {MAX_SYNC_METADATA_BYTES}")
             }
-            Err(SyncManifestLimit::MetadataBytes) => {
-                return Ok(Err(format!(
-                    "manifest metadata exceeds maximum bytes limit: {MAX_SYNC_METADATA_BYTES}"
-                )));
-            }
-        }
-        Ok(Ok(build_sync_entry(rel_str, kind, &meta, link_target)))
-    }
+        })?;
+    Ok(build_sync_entry(rel_str, kind, &meta, link_target))
 }
 
 fn scan_directory_tree(
@@ -396,15 +399,9 @@ fn scan_directory_tree(
     conn: &mut impl Write,
     cancellation: &CancellationToken,
 ) -> std::io::Result<()> {
-    let mut state = ScanState {
-        session_root,
-        conn,
-        budget: SyncManifestBudget::default(),
-    };
-    let mut queue = VecDeque::new();
-    queue.push_back(PathBuf::new());
-
-    while let Some(rel) = queue.pop_front() {
+    let mut budget = SyncManifestBudget::default();
+    let mut pending_directories = VecDeque::from([PathBuf::new()]);
+    while let Some(rel) = pending_directories.pop_front() {
         ensure_not_cancelled(cancellation)?;
         let full = if rel.as_os_str().is_empty() {
             session_root.to_path_buf()
@@ -412,41 +409,32 @@ fn scan_directory_tree(
             session_root.join(&rel)
         };
         let read_dir = match std::fs::read_dir(&full) {
-            Ok(rd) => rd,
+            Ok(read_dir) => read_dir,
             Err(e) => {
-                send_reply(
-                    state.conn,
+                return send_reply(
+                    conn,
                     &SyncReply::Err(format!("reading directory {}: {e}", full.display())),
-                )?;
-                return Ok(());
+                );
             }
         };
-        for entry_res in read_dir {
+        for dir_entry in read_dir {
             ensure_not_cancelled(cancellation)?;
-            let entry = match entry_res {
-                Ok(e) => e,
-                Err(e) => {
-                    send_reply(state.conn, &SyncReply::Err(e.to_string()))?;
-                    return Ok(());
-                }
-            };
-            let file_name = entry.file_name();
-            let Some(name_str) = file_name.to_str() else {
-                send_reply(
-                    state.conn,
-                    &SyncReply::Err("non-utf8 filename encountered".to_string()),
-                )?;
-                return Ok(());
-            };
-            if name_str == "." || name_str == ".." {
-                continue;
-            }
-            if !state.emit_child_entry(&rel, name_str, &mut queue)? {
-                return Ok(());
+            let child = dir_entry.map_err(|e| e.to_string()).and_then(|dir_entry| {
+                build_child_entry(
+                    session_root,
+                    &rel,
+                    &dir_entry.file_name(),
+                    &mut budget,
+                    &mut pending_directories,
+                )
+            });
+            match child {
+                Ok(child) => send_reply(conn, &SyncReply::Entry(child))?,
+                Err(message) => return send_reply(conn, &SyncReply::Err(message)),
             }
         }
     }
-    send_reply(state.conn, &SyncReply::ScanComplete)
+    send_reply(conn, &SyncReply::ScanComplete)
 }
 
 fn handle_scan_entries(
@@ -463,15 +451,9 @@ fn handle_scan_entries(
         RootStatus::Missing => return send_reply(conn, &SyncReply::ScanComplete),
     };
     let metadata = std::fs::symlink_metadata(root_path)?;
-    let link_target = if kind == SyncEntryKind::Symlink {
-        Some(
-            std::fs::read_link(root_path)?
-                .to_str()
-                .ok_or_else(|| std::io::Error::other("non-UTF-8 symlink target"))?
-                .to_owned(),
-        )
-    } else {
-        None
+    let link_target = match kind {
+        SyncEntryKind::Symlink => Some(read_link_target(root_path)?),
+        SyncEntryKind::Directory | SyncEntryKind::File => None,
     };
     send_reply(
         conn,
@@ -517,12 +499,12 @@ fn handle_write_file(
     root_path: &Path,
     relative_path: &str,
     meta: WriteFileMeta,
-    workload_is_root: bool,
+    owner: Owner,
     conn: &mut (impl Read + Write),
     cancellation: &CancellationToken,
 ) -> std::io::Result<()> {
-    let prepared =
-        resolve_target_path(root_path, relative_path).and_then(|target| prepare_put(&target));
+    let prepared = resolve_target_path_creating_parent(root_path, relative_path)
+        .and_then(|target| create_put_temp(&target));
     let Some(mut upload) = reply_on_error(conn, prepared)? else {
         return Ok(());
     };
@@ -540,10 +522,7 @@ fn handle_write_file(
         }
         ensure_not_cancelled(cancellation)?;
         file.set_len(meta.size)?;
-        if !workload_is_root {
-            let (uid, gid) = crate::workload::workload_owner();
-            rustix::fs::fchown(&*file, uid, gid)?;
-        }
+        owner.assign_to(&*file)?;
         file.set_permissions(std::fs::Permissions::from_mode(meta.mode & 0o777))?;
         file.set_times(terra_protocol::sync_file_times(
             meta.mtime_secs,
@@ -560,11 +539,7 @@ fn handle_write_file(
         upload.is_committed = true;
         Ok(())
     })();
-
-    match result {
-        Ok(()) => send_reply(conn, &SyncReply::Success),
-        Err(e) => send_reply(conn, &SyncReply::Err(e.to_string())),
-    }
+    send_outcome(conn, result)
 }
 
 fn handle_read_file(
@@ -584,40 +559,31 @@ fn handle_read_file(
             size: before.len(),
             mode: before.mode() & 0o7777,
             mtime_secs: before.mtime(),
-            mtime_nanos: truncate_nanos(u32::try_from(before.mtime_nsec()).unwrap_or(0)),
+            mtime_nanos: truncated_mtime_nanos(&before),
         },
     )?;
     stream_exact(&mut file, &mut *conn, before.len(), cancellation)?;
-    let after = file.metadata()?;
-    if before.len() != after.len() || before.modified()? != after.modified()? {
-        return send_reply(
-            conn,
-            &SyncReply::Err("source changed while transferring".to_string()),
-        );
-    }
-    send_reply(conn, &SyncReply::Success)
+    let outcome = if is_unchanged_since(&file, &before) {
+        Ok(())
+    } else {
+        Err(std::io::Error::other("source changed while transferring"))
+    };
+    send_outcome(conn, outcome)
 }
 
 fn create_directory(
     root_path: &Path,
     relative_path: &str,
     mode: u32,
-    workload_is_root: bool,
+    owner: Owner,
 ) -> std::io::Result<()> {
-    let dir_path = resolve_target_path(root_path, relative_path)?;
-    if let Some(parent) = dir_path.parent() {
-        ensure_directory(parent, false)?;
-    }
-    let directory =
-        open_or_create_directory(&dir_path, !workload_is_root, rustix::fs::OFlags::NOFOLLOW)?;
+    let dir_path = resolve_target_path_creating_parent(root_path, relative_path)?;
+    let directory = open_or_create_directory(&dir_path, owner, rustix::fs::OFlags::NOFOLLOW)?;
     directory.set_permissions(std::fs::Permissions::from_mode((mode & 0o777) | 0o700))
 }
 
 fn create_symlink(root_path: &Path, relative_path: &str, target: &str) -> std::io::Result<()> {
-    let link_path = resolve_target_path(root_path, relative_path)?;
-    if let Some(parent) = link_path.parent() {
-        ensure_directory(parent, false)?;
-    }
+    let link_path = resolve_target_path_creating_parent(root_path, relative_path)?;
     let temp = link_path.with_file_name(generate_random_temp_name()?);
     let result =
         std::os::unix::fs::symlink(target, &temp).and_then(|()| std::fs::rename(&temp, &link_path));
@@ -664,43 +630,21 @@ pub fn serve_sync_session(
     let _ = handle_sync_session(&mut conn, workload_is_root, cancellation);
 }
 
-fn inspect_root_status(
-    path: &Path,
-    guest_root: &str,
-    conn: &mut impl Write,
-) -> std::io::Result<Option<RootStatus>> {
+fn inspect_root_status(path: &Path) -> std::io::Result<RootStatus> {
     match std::fs::symlink_metadata(path) {
-        Ok(m) if m.is_dir() => Ok(Some(RootStatus::ExistingDirectory)),
-        Ok(m) if m.file_type().is_symlink() => Ok(Some(RootStatus::ExistingSymlink)),
-        Ok(m) if m.is_file() => Ok(Some(RootStatus::ExistingFile)),
-        Ok(_) => {
-            send_reply(
-                conn,
-                &SyncReply::Err(format!("root {guest_root} is an unsupported file type")),
-            )?;
-            Ok(None)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Some(RootStatus::Missing)),
-        Err(e) => {
-            send_reply(
-                conn,
-                &SyncReply::Err(format!("inspecting root {guest_root}: {e}")),
-            )?;
-            Ok(None)
-        }
+        Ok(m) if m.is_dir() => Ok(RootStatus::ExistingDirectory),
+        Ok(m) if m.file_type().is_symlink() => Ok(RootStatus::ExistingSymlink),
+        Ok(m) if m.is_file() => Ok(RootStatus::ExistingFile),
+        Ok(_) => Err(std::io::Error::other(format!(
+            "root {} is an unsupported file type",
+            path.display()
+        ))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(RootStatus::Missing),
+        Err(e) => Err(std::io::Error::new(
+            e.kind(),
+            format!("inspecting root {}: {e}", path.display()),
+        )),
     }
-}
-
-fn begin_session(
-    conn: &mut impl Write,
-    guest_root: &str,
-) -> std::io::Result<Option<(PathBuf, RootStatus)>> {
-    let root_path = PathBuf::from(guest_root);
-    let Some(root_status) = inspect_root_status(&root_path, guest_root, conn)? else {
-        return Ok(None);
-    };
-    send_reply(conn, &SyncReply::SessionReady { root_status })?;
-    Ok(Some((root_path, root_status)))
 }
 
 fn handle_sync_session(
@@ -709,31 +653,32 @@ fn handle_sync_session(
     cancellation: &CancellationToken,
 ) -> std::io::Result<()> {
     ensure_not_cancelled(cancellation)?;
+    let owner = Owner::for_workload(workload_is_root);
     let mut session: Option<(PathBuf, RootStatus)> = None;
 
     while let Some(req) = read_frame::<SyncRequest>(&mut *conn)? {
         ensure_not_cancelled(cancellation)?;
         if let SyncRequest::BeginSession { guest_root } = &req {
-            let Some(begun) = begin_session(conn, guest_root)? else {
+            let root_path = PathBuf::from(guest_root);
+            let Some(root_status) = reply_on_error(conn, inspect_root_status(&root_path))? else {
                 return Ok(());
             };
-            session = Some(begun);
+            send_reply(conn, &SyncReply::SessionReady { root_status })?;
+            session = Some((root_path, root_status));
             continue;
         }
         let Some((root_path, root_status)) = &session else {
             return Ok(());
         };
         let (root_path, root_status) = (root_path.as_path(), *root_status);
-        let result = match req {
+        match req {
             SyncRequest::BeginSession { .. } => unreachable!("handled before the session lookup"),
             SyncRequest::CommitFile => return Err(std::io::Error::other("unexpected file commit")),
             SyncRequest::ScanEntries => {
                 handle_scan_entries(root_path, root_status, conn, cancellation)?;
-                continue;
             }
             SyncRequest::ComputeDigest { relative_path } => {
                 handle_compute_digest(root_path, &relative_path, conn, cancellation)?;
-                continue;
             }
             SyncRequest::WriteFile {
                 relative_path,
@@ -751,44 +696,40 @@ fn handle_sync_session(
                         mtime_secs,
                         mtime_nanos,
                     },
-                    workload_is_root,
+                    owner,
                     conn,
                     cancellation,
                 )?;
-                continue;
             }
             SyncRequest::ReadFile { relative_path } => {
                 handle_read_file(root_path, &relative_path, conn, cancellation)?;
-                continue;
             }
             SyncRequest::CreateDir {
                 relative_path,
                 mode,
-            } => create_directory(root_path, &relative_path, mode, workload_is_root),
+            } => send_outcome(
+                conn,
+                create_directory(root_path, &relative_path, mode, owner),
+            )?,
             SyncRequest::CreateSymlink {
                 relative_path,
                 target,
-            } => create_symlink(root_path, &relative_path, &target),
+            } => send_outcome(conn, create_symlink(root_path, &relative_path, &target))?,
             SyncRequest::UpdateMetadata {
                 relative_path,
                 mode,
                 mtime_secs,
                 mtime_nanos,
-            } => update_metadata(root_path, &relative_path, mode, mtime_secs, mtime_nanos),
+            } => send_outcome(
+                conn,
+                update_metadata(root_path, &relative_path, mode, mtime_secs, mtime_nanos),
+            )?,
             SyncRequest::RemoveEntry {
                 relative_path,
                 is_dir,
-            } => remove_entry(root_path, &relative_path, is_dir),
-            SyncRequest::EndSession => {
-                send_reply(conn, &SyncReply::Success)?;
-                break;
-            }
-        };
-        let reply = match result {
-            Ok(()) => SyncReply::Success,
-            Err(error) => SyncReply::Err(error.to_string()),
-        };
-        send_reply(conn, &reply)?;
+            } => send_outcome(conn, remove_entry(root_path, &relative_path, is_dir))?,
+            SyncRequest::EndSession => return send_reply(conn, &SyncReply::Success),
+        }
     }
     Ok(())
 }
@@ -805,15 +746,14 @@ mod tests {
         std::fs::create_dir_all(real.join("app")).unwrap();
         let alias = scratch.join("alias");
         std::os::unix::fs::symlink(&real, &alias).unwrap();
-        let mut conn = Vec::new();
         assert_eq!(
-            inspect_root_status(&alias, "alias", &mut conn).unwrap(),
-            Some(RootStatus::ExistingSymlink)
+            inspect_root_status(&alias).unwrap(),
+            RootStatus::ExistingSymlink
         );
         let root = alias.join("app");
         assert_eq!(
-            inspect_root_status(&root, "alias/app", &mut conn).unwrap(),
-            Some(RootStatus::ExistingDirectory)
+            inspect_root_status(&root).unwrap(),
+            RootStatus::ExistingDirectory
         );
         let file = resolve_target_path(&root, "file").unwrap();
         std::fs::write(file, b"inside").unwrap();
@@ -846,7 +786,7 @@ mod tests {
         )
         .unwrap();
         std::os::unix::fs::symlink(&outside, root.join("new")).unwrap();
-        assert!(create_directory(&root, "new", 0o777, true).is_err());
+        assert!(create_directory(&root, "new", 0o777, Owner::Root).is_err());
         assert_eq!(std::fs::metadata(&outside).unwrap().mode() & 0o777, 0o700);
         std::fs::remove_dir_all(scratch).unwrap();
     }
@@ -860,7 +800,8 @@ mod tests {
         std::fs::create_dir_all(&outside).unwrap();
         std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o700)).unwrap();
         let handle =
-            open_or_create_directory(&directory, false, rustix::fs::OFlags::NOFOLLOW).unwrap();
+            open_or_create_directory(&directory, Owner::Root, rustix::fs::OFlags::NOFOLLOW)
+                .unwrap();
         std::fs::rename(&directory, &moved).unwrap();
         std::os::unix::fs::symlink(&outside, &directory).unwrap();
         handle
@@ -920,7 +861,7 @@ mod tests {
                 mtime_secs: 100,
                 mtime_nanos: 0,
             },
-            true,
+            Owner::Root,
             &mut closed,
             &CancellationToken::new(),
         )
@@ -1088,6 +1029,39 @@ mod tests {
         std::fs::remove_dir_all(scratch).unwrap();
     }
 
+    /// A child the scan cannot describe ends the scan with an error reply
+    /// instead of dropping the connection without one.
+    #[test]
+    fn scan_replies_with_an_error_for_a_non_utf8_symlink_target() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let scratch = crate::create_scratch_path("sync", "non-utf8-link-target");
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(b"\xff"), scratch.join("link"))
+            .unwrap();
+        let mut conn = TestConn {
+            input: std::io::Cursor::new(Vec::new()),
+            output: Vec::new(),
+        };
+        handle_scan_entries(
+            &scratch,
+            RootStatus::ExistingDirectory,
+            &mut conn,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let mut replies = conn.output.as_slice();
+        assert_matches!(
+            read_frame::<SyncReply>(&mut replies).unwrap(),
+            Some(SyncReply::Entry(_))
+        );
+        assert_eq!(
+            read_frame::<SyncReply>(&mut replies).unwrap(),
+            Some(SyncReply::Err("non-UTF-8 symlink target".into()))
+        );
+        assert_eq!(replies, []);
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
+
     #[test]
     fn update_metadata_sets_mtime_on_directories_and_keeps_atime() {
         let scratch = crate::create_scratch_path("sync", "update-metadata-times");
@@ -1171,20 +1145,22 @@ mod tests {
                 assert_eq!(children.len(), 2);
                 assert_eq!(
                     (
+                        children[0].relative_path.as_str(),
                         children[0].kind,
                         children[0].size,
                         children[0].mode,
                         children[0].mtime_secs
                     ),
-                    (SyncEntryKind::File, 8, 0o640, 1000)
+                    ("file", SyncEntryKind::File, 8, 0o640, 1000)
                 );
                 assert_eq!(
                     (
+                        children[1].relative_path.as_str(),
                         children[1].kind,
                         children[1].size,
                         children[1].link_target.as_deref()
                     ),
-                    (SyncEntryKind::Symlink, 0, Some("file"))
+                    ("link", SyncEntryKind::Symlink, 0, Some("file"))
                 );
             } else {
                 assert_eq!(children, [] as [terra_protocol::SyncEntry; 0]);

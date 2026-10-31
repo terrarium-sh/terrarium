@@ -193,7 +193,7 @@ pub(super) fn prepare_mount_points(plan: &terra_protocol::Plan) -> Result<()> {
 }
 
 fn prepare_mount_point(path: &str) -> Result<()> {
-    crate::sync::ensure_directory(Path::new(path), false)
+    crate::sync::ensure_directory(Path::new(path), crate::sync::Owner::Root)
         .with_context(|| format!("creating mount point {path}"))
 }
 
