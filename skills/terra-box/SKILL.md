@@ -364,6 +364,8 @@ Limits:
 - `hooks.on_start` runs as guest root before every workload start.
 - `hooks.pre_stop` runs during an orderly stop.
 - `on_start` and `pre_stop` output go to the box's session.
+- Hooks write to the box's terminal, so tools that detect one show colors and
+  progress bars.
 - `on_start`, `pre_stop`, daemons and the workload run in `workload.workdir`
   (`/home/terri` when unset); `on_create` runs in `/`, since shares are not
   mounted during setup.

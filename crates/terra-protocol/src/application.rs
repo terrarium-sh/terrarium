@@ -210,6 +210,39 @@ pub enum TcpTarget {
     HostService(u16),
 }
 
+/// How a DNS message travels: as one datagram, or on a stream behind its two-byte length.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DnsTransport {
+    Datagram,
+    Stream,
+}
+
+impl DnsTransport {
+    /// The DNS message `bytes` carries, without a stream's length prefix.
+    #[must_use]
+    pub fn message(self, bytes: &[u8]) -> &[u8] {
+        match self {
+            Self::Datagram => bytes,
+            Self::Stream => bytes.get(2..).unwrap_or_default(),
+        }
+    }
+
+    /// `message` as this transport carries it; `None` when it is too long for a stream's prefix.
+    #[must_use]
+    pub fn frame(self, message: Vec<u8>) -> Option<Vec<u8>> {
+        match self {
+            Self::Datagram => Some(message),
+            Self::Stream => {
+                let length = u16::try_from(message.len()).ok()?;
+                let mut framed = Vec::with_capacity(message.len() + 2);
+                framed.extend_from_slice(&length.to_be_bytes());
+                framed.extend_from_slice(&message);
+                Some(framed)
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Message {
     TcpOpen {
@@ -238,12 +271,12 @@ pub enum Message {
     Ready,
     DnsQuery {
         id: u32,
-        stream: bool,
+        transport: DnsTransport,
         bytes: Vec<u8>,
     },
     DnsResult {
         id: u32,
-        stream: bool,
+        transport: DnsTransport,
         bytes: Vec<u8>,
     },
     Publication {
@@ -339,11 +372,24 @@ impl Message {
                 append_status(&mut frame, Some(*error));
                 encode_peer(&mut frame, *peer)?;
             }
-            Self::DnsQuery { id, stream, bytes } | Self::DnsResult { id, stream, bytes } => {
+            Self::DnsQuery {
+                id,
+                transport,
+                bytes,
+            }
+            | Self::DnsResult {
+                id,
+                transport,
+                bytes,
+            } => {
+                let flags: u16 = match transport {
+                    DnsTransport::Datagram => 0,
+                    DnsTransport::Stream => 1,
+                };
                 frame.extend_from_slice(&id.to_le_bytes());
-                frame.extend_from_slice(&u16::from(*stream).to_le_bytes());
+                frame.extend_from_slice(&flags.to_le_bytes());
                 frame.extend_from_slice(&0_u16.to_le_bytes());
-                frame.extend_from_slice(dns(bytes, *stream)?);
+                frame.extend_from_slice(dns(bytes, *transport)?);
             }
             Self::Publication { guest_port, .. } | Self::PublicationUdp { guest_port } => {
                 if *guest_port == 0 {
@@ -417,16 +463,27 @@ impl Message {
             }
             Opcode::DnsQuery | Opcode::DnsResult => {
                 let id = body.u32()?;
-                let flags = body.u16()?;
-                if flags > 1 || body.u16()? != 0 {
+                let transport = match body.u16()? {
+                    0 => DnsTransport::Datagram,
+                    1 => DnsTransport::Stream,
+                    _ => return Err(ErrorCode::InvalidFrame),
+                };
+                if body.u16()? != 0 {
                     return Err(ErrorCode::InvalidFrame);
                 }
-                let stream = flags != 0;
-                let bytes = dns(body.remaining(), stream)?.to_vec();
+                let bytes = dns(body.remaining(), transport)?.to_vec();
                 if opcode == Opcode::DnsQuery {
-                    Self::DnsQuery { id, stream, bytes }
+                    Self::DnsQuery {
+                        id,
+                        transport,
+                        bytes,
+                    }
                 } else {
-                    Self::DnsResult { id, stream, bytes }
+                    Self::DnsResult {
+                        id,
+                        transport,
+                        bytes,
+                    }
                 }
             }
             Opcode::Publication | Opcode::PublicationUdp => {
@@ -587,33 +644,37 @@ fn seal_frame(frame: &mut [u8], opcode: Opcode) -> Result<(), ErrorCode> {
 #[derive(Default)]
 pub struct StreamDecoder {
     bytes: Vec<u8>,
+    /// Where the first undecoded byte is; decoding advances it instead of moving the rest.
+    start: usize,
 }
 
 impl StreamDecoder {
     #[must_use]
     pub fn remaining_capacity(&self) -> usize {
-        MAX_UDP_FRAME_BYTES.saturating_sub(self.bytes.len())
+        MAX_UDP_FRAME_BYTES.saturating_sub(self.bytes.len() - self.start)
     }
 
     pub fn push(&mut self, bytes: &[u8]) -> Result<(), ErrorCode> {
         if bytes.len() > self.remaining_capacity() {
             return Err(ErrorCode::LimitExceeded);
         }
+        self.bytes.drain(..self.start);
+        self.start = 0;
         self.bytes.extend_from_slice(bytes);
         Ok(())
     }
 
     pub fn next(&mut self, direction: Direction) -> Result<Option<Message>, ErrorCode> {
-        let Some((message, length)) = Message::decode(&self.bytes, direction)? else {
+        let Some((message, length)) = Message::decode(&self.bytes[self.start..], direction)? else {
             return Ok(None);
         };
-        self.bytes.drain(..length);
+        self.start += length;
         Ok(Some(message))
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
+        self.start == self.bytes.len()
     }
 }
 
@@ -677,6 +738,17 @@ pub const fn is_valid_segmented_run(length: usize, segment: usize) -> bool {
         && length.div_ceil(segment) <= MAX_DATAGRAM_SEGMENTS
 }
 
+/// Whether a `length`-byte datagram joins a `run_bytes`-byte run of `segment`-byte datagrams as
+/// UDP GRO merges them: no longer than the segment, after no shorter one, and within one frame.
+#[must_use]
+pub const fn extends_udp_run(run_bytes: usize, segment: usize, length: usize) -> bool {
+    segment != 0
+        && length != 0
+        && length <= segment
+        && run_bytes.is_multiple_of(segment)
+        && is_valid_segmented_run(run_bytes + length, segment)
+}
+
 fn segmented(bytes: &[u8], segment: u16) -> Result<&[u8], ErrorCode> {
     if is_valid_segmented_run(bytes.len(), usize::from(segment)) {
         Ok(bytes)
@@ -685,11 +757,15 @@ fn segmented(bytes: &[u8], segment: u16) -> Result<&[u8], ErrorCode> {
     }
 }
 
-fn dns(bytes: &[u8], stream: bool) -> Result<&[u8], ErrorCode> {
-    if bytes.is_empty() || bytes.len() > socket::MAX_DNS_BYTES + usize::from(stream) * 2 {
+fn dns(bytes: &[u8], transport: DnsTransport) -> Result<&[u8], ErrorCode> {
+    let prefix_bytes = match transport {
+        DnsTransport::Datagram => 0,
+        DnsTransport::Stream => 2,
+    };
+    if bytes.is_empty() || bytes.len() > socket::MAX_DNS_BYTES + prefix_bytes {
         return Err(ErrorCode::LimitExceeded);
     }
-    if stream
+    if transport == DnsTransport::Stream
         && (bytes.len() < 3
             || usize::from(u16::from_be_bytes([bytes[0], bytes[1]])) != bytes.len() - 2)
     {
@@ -938,12 +1014,12 @@ mod tests {
             Message::Ready,
             Message::DnsQuery {
                 id: 7,
-                stream: false,
+                transport: DnsTransport::Datagram,
                 bytes: vec![1; socket::MAX_DNS_BYTES],
             },
             Message::DnsResult {
                 id: u32::MAX,
-                stream: true,
+                transport: DnsTransport::Stream,
                 bytes: vec![0, 1, 42],
             },
             Message::Publication {
@@ -1092,7 +1168,7 @@ mod tests {
         assert!(
             Message::DnsQuery {
                 id: 1,
-                stream: true,
+                transport: DnsTransport::Stream,
                 bytes: vec![0, 5, 1],
             }
             .encode()

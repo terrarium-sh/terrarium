@@ -214,7 +214,8 @@ printf INITIAL > work/host-update
 printf READ_ONLY > readonly/seed
 printf '#!/bin/sh\necho HOST_EXECUTABLE\n' > work/host-run
 chmod 755 work/host-run
-allowed_port=$(( $$ % 20000 + 30000 ))
+# Below every OS's ephemeral range, so no outgoing connection already holds the port.
+allowed_port=$(( $$ % 12000 + 20000 ))
 denied_port=$(( allowed_port + 1 ))
 podman_port=$(( allowed_port + 2 ))
 for recipe in $boxes; do
@@ -287,6 +288,8 @@ expect "$(cat sync-back/value)" first
 run probe exec --no-tty -- sh -c 'printf extra > /tmp/synced/extra'
 run probe sync --delete --checksum ./sync-source/ :/tmp/synced/
 run probe exec --no-tty -- sh -c 'test ! -e /tmp/synced/extra'
+run probe sync ./sync-source/ :/tmp/owned/deep/
+run probe exec --no-tty -- sh -c 'test "$(stat -c %u /tmp/owned)" = "$(id -u)"'
 passed
 
 begin "network: published ports, allowlist, local DNS, denial"

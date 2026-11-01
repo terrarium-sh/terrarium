@@ -1,7 +1,8 @@
 //! Agent session, file transfer, and exec services.
 
 use crate::AsyncFile;
-use crate::term::session::{ClientConn, DetachOutcome, Session};
+use crate::session::{ClientConn, DetachOutcome, Session};
+use crate::workload::GuestUser;
 use std::fs::File;
 use std::os::fd::AsFd;
 use std::sync::Arc;
@@ -40,7 +41,7 @@ pub(crate) fn init_server(
     tasks: &TaskTracker,
     session: Arc<Session>,
     mut clients: mpsc::Receiver<File>,
-    workload_is_root: bool,
+    workload_user: GuestUser,
     initial_session: Option<mpsc::Sender<()>>,
     initial_state: StartupState,
     cancellation: &CancellationToken,
@@ -48,7 +49,7 @@ pub(crate) fn init_server(
     let (state, startup) = watch::channel(initial_state);
     let services = Services {
         session,
-        workload_is_root,
+        workload_user,
         initial_session,
         startup,
         cancellation: cancellation.clone(),
@@ -83,7 +84,7 @@ async fn wait_until_started(startup: &mut watch::Receiver<StartupState>) -> bool
 #[derive(Clone)]
 struct Services {
     session: Arc<Session>,
-    workload_is_root: bool,
+    workload_user: GuestUser,
     initial_session: Option<mpsc::Sender<()>>,
     startup: watch::Receiver<StartupState>,
     cancellation: CancellationToken,
@@ -93,7 +94,7 @@ impl Services {
     async fn serve(self, conn: File) {
         let Self {
             session,
-            workload_is_root,
+            workload_user,
             initial_session,
             mut startup,
             cancellation,
@@ -142,27 +143,26 @@ impl Services {
                 let Ok(file) = prepare_file_transfer(conn) else {
                     return;
                 };
-                serve_file_transfer(file, workload_is_root, cancellation).await;
+                serve_file_transfer(file, workload_user, cancellation).await;
             }
             AgentService::Exec => {
-                Box::pin(crate::exec::serve_exec(
-                    conn,
-                    workload_is_root,
-                    cancellation,
-                ))
-                .await;
+                Box::pin(crate::exec::serve_exec(conn, workload_user, cancellation)).await;
             }
         }
     }
 }
 
-async fn serve_file_transfer(file: File, workload_is_root: bool, cancellation: CancellationToken) {
+async fn serve_file_transfer(
+    mut file: File,
+    workload_user: GuestUser,
+    cancellation: CancellationToken,
+) {
     let Ok(shutdown) = file.try_clone() else {
         return;
     };
     let worker_cancellation = cancellation.clone();
     let mut worker = tokio::task::spawn_blocking(move || {
-        crate::sync::serve_sync_session(file, workload_is_root, &worker_cancellation);
+        let _ = crate::sync::serve_sync_session(&mut file, workload_user, &worker_cancellation);
     });
     tokio::select! {
         _ = &mut worker => return,
@@ -173,7 +173,7 @@ async fn serve_file_transfer(file: File, workload_is_root: bool, cancellation: C
 }
 
 fn prepare_file_transfer(conn: AsyncFile) -> std::io::Result<File> {
-    let file = conn.into_inner().into_inner()?;
+    let file = conn.into_inner();
     let flags = rustix::fs::fcntl_getfl(&file)?;
     rustix::fs::fcntl_setfl(&file, flags & !rustix::fs::OFlags::NONBLOCK)?;
     for kind in [
@@ -213,11 +213,7 @@ async fn serve_client(
                 break;
             }
             Ok(Some(ClientInput::Keys(_) | ClientInput::Eof)) => {}
-            Ok(Some(ClientInput::Resize(TermSize { rows, cols }))) => {
-                if rows > 0 && cols > 0 {
-                    session.set_client_size(id, rows, cols).await;
-                }
-            }
+            Ok(Some(ClientInput::Resize(size))) => session.set_client_size(id, size).await,
             Ok(None) | Err(_) => break,
         }
     }
@@ -245,16 +241,16 @@ async fn serve_session_control(session: &Arc<Session>, mut conn: AsyncFile) {
             .chain([ControlReply::Done])
             .collect(),
         ControlRequest::Detach { id } => vec![match session.detach_client(id).await {
-            DetachOutcome::Detached { .. } => ControlReply::Detached { id },
+            DetachOutcome::Detached => ControlReply::Detached { id },
             DetachOutcome::Missing => ControlReply::Missing { id },
         }],
-        ControlRequest::DetachAll => {
-            let (ids, _) = session.detach_all_clients().await;
-            ids.into_iter()
-                .map(|id| ControlReply::Detached { id })
-                .chain([ControlReply::Done])
-                .collect()
-        }
+        ControlRequest::DetachAll => session
+            .detach_all_clients()
+            .await
+            .into_iter()
+            .map(|id| ControlReply::Detached { id })
+            .chain([ControlReply::Done])
+            .collect(),
     };
     for reply in &replies {
         if write_control_reply(&mut conn, reply).await.is_err() {
@@ -352,7 +348,7 @@ mod tests {
             tokio::spawn(async move {
                 Services {
                     session,
-                    workload_is_root: false,
+                    workload_user: GuestUser::Workload,
                     initial_session: None,
                     startup: watch::channel(StartupState::Pending).1,
                     cancellation,
@@ -391,7 +387,11 @@ mod tests {
     async fn cancelling_an_idle_file_connection_joins_the_file_worker() {
         let (_host, agent) = file_connection();
         let cancellation = CancellationToken::new();
-        let transfer = tokio::spawn(serve_file_transfer(agent, true, cancellation.clone()));
+        let transfer = tokio::spawn(serve_file_transfer(
+            agent,
+            GuestUser::Root,
+            cancellation.clone(),
+        ));
 
         cancellation.cancel();
         wait_for_file_transfer(transfer).await;
@@ -401,7 +401,11 @@ mod tests {
     async fn cancelling_an_incomplete_request_joins_the_file_worker() {
         let (mut host, agent) = file_connection();
         let cancellation = CancellationToken::new();
-        let transfer = tokio::spawn(serve_file_transfer(agent, true, cancellation.clone()));
+        let transfer = tokio::spawn(serve_file_transfer(
+            agent,
+            GuestUser::Root,
+            cancellation.clone(),
+        ));
         host.write_all(&[0, 0]).await.unwrap();
         host.flush().await.unwrap();
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -419,7 +423,11 @@ mod tests {
         std::fs::write(&destination, b"old").unwrap();
         let (mut host, agent) = file_connection();
         let cancellation = CancellationToken::new();
-        let transfer = tokio::spawn(serve_file_transfer(agent, true, cancellation.clone()));
+        let transfer = tokio::spawn(serve_file_transfer(
+            agent,
+            GuestUser::Root,
+            cancellation.clone(),
+        ));
 
         terra_protocol::write_frame_async(
             &mut host,
@@ -471,7 +479,11 @@ mod tests {
         std::fs::write(scratch.join("file"), vec![0; 4 * 1024 * 1024]).unwrap();
         let (mut host, agent) = file_connection();
         let cancellation = CancellationToken::new();
-        let transfer = tokio::spawn(serve_file_transfer(agent, true, cancellation.clone()));
+        let transfer = tokio::spawn(serve_file_transfer(
+            agent,
+            GuestUser::Root,
+            cancellation.clone(),
+        ));
 
         terra_protocol::write_frame_async(
             &mut host,

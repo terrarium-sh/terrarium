@@ -211,7 +211,8 @@ try {
     Write-Text "work/host" "HOST_SEED"
     Write-Text "work/host-update" "INITIAL"
     Write-Text "readonly/seed" "READ_ONLY"
-    $allowedPort = Get-Random -Minimum 30000 -Maximum 50000
+    # Below every OS's ephemeral range, so no outgoing connection already holds the port.
+    $allowedPort = Get-Random -Minimum 20000 -Maximum 32000
     $deniedPort = $allowedPort + 1
     $podmanPort = $allowedPort + 2
     foreach ($recipe in $boxes) {
@@ -291,6 +292,8 @@ try {
     Invoke-Terra @("probe", "exec", "--no-tty", "--", "sh", "-c", "printf extra > /tmp/synced/extra")
     Invoke-Terra @("probe", "sync", "--delete", "--checksum", "./sync-source/", ":/tmp/synced/")
     Invoke-Terra @("probe", "exec", "--no-tty", "--", "sh", "-c", "test ! -e /tmp/synced/extra")
+    Invoke-Terra @("probe", "sync", "./sync-source/", ":/tmp/owned/deep/")
+    Invoke-Terra @("probe", "exec", "--no-tty", "--", "sh", "-c", 'test "$(stat -c %u /tmp/owned)" = "$(id -u)"')
     Complete-Step
 
     Start-Step "network: published ports, allowlist, local DNS, denial"

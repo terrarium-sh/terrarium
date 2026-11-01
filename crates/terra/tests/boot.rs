@@ -2276,7 +2276,7 @@ fn broker_loss_preserves_agent_and_supervisor_loss_stops_the_box() {
                     std::fs::read_to_string(directory.join("runtime-logs/diagnostics.log"))
                         .unwrap_or_default();
                 if !linux_process_is_live(broker)
-                    && diagnostics.contains("network unavailable: owner: Network is down")
+                    && diagnostics.contains("network unavailable: control: Network is down")
                     && std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
                 {
                     break;

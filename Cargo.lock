@@ -1967,7 +1967,6 @@ name = "terra-agent"
 version = "0.0.1"
 dependencies = [
  "anyhow",
- "async-io",
  "futures-util",
  "libc",
  "linux-raw-sys",

@@ -1,8 +1,8 @@
 //! Background commands restarted on failure (`daemons:` in the recipe).
 
-use crate::mutex::lock_or_abort;
-use std::os::unix::process::CommandExt as _;
-use std::process::{Command, Stdio};
+use crate::lock_or_abort;
+use crate::workload::GuestUser;
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -11,14 +11,14 @@ use tokio_util::task::TaskTracker;
 type DaemonRegistry = Arc<Mutex<Vec<Arc<crate::reap::OwnedPidfd>>>>;
 
 #[derive(Clone)]
-pub struct Daemons {
+pub(crate) struct Daemons {
     processes: DaemonRegistry,
     cancellation: CancellationToken,
     supervisors: TaskTracker,
 }
 
 impl Daemons {
-    pub async fn stop(&self, grace: Duration) {
+    pub(crate) async fn stop(&self, grace: Duration) {
         self.cancellation.cancel();
         self.signal(rustix::process::Signal::TERM);
         if tokio::time::timeout(grace, self.supervisors.wait())
@@ -38,27 +38,26 @@ impl Daemons {
     }
 }
 
-pub fn spawn_all(
+pub(crate) fn spawn_all(
     tasks: &TaskTracker,
     lines: &[String],
-    as_root: bool,
-    output: Option<&std::fs::File>,
+    user: GuestUser,
+    terminal: BorrowedFd<'_>,
     parent_cancellation: &CancellationToken,
 ) -> std::io::Result<Daemons> {
     let processes = DaemonRegistry::default();
     let cancellation = parent_cancellation.child_token();
-    let output = output
-        .map(std::fs::File::try_clone)
-        .transpose()?
-        .map(Arc::new);
     let supervisors = TaskTracker::new();
-    for line in lines {
+    let terminals = lines
+        .iter()
+        .map(|_| terminal.try_clone_to_owned())
+        .collect::<std::io::Result<Vec<_>>>()?;
+    for (line, terminal) in lines.iter().zip(terminals) {
         let line = line.clone();
-        let output = output.clone();
         let registry = processes.clone();
         let cancellation = cancellation.clone();
         supervisors.spawn(tasks.track_future(async move {
-            supervise(&line, &registry, &cancellation, as_root, output.as_deref()).await;
+            supervise(&line, &registry, &cancellation, user, &terminal).await;
         }));
     }
     supervisors.close();
@@ -80,71 +79,62 @@ async fn supervise(
     line: &str,
     registry: &DaemonRegistry,
     cancellation: &CancellationToken,
-    as_root: bool,
-    output: Option<&std::fs::File>,
+    user: GuestUser,
+    terminal: &OwnedFd,
 ) {
     loop {
         if cancellation.is_cancelled() {
             return;
         }
-        let mut command = Command::new("sh");
-        command.arg("-c").arg(line).process_group(0);
-        if let Some(output) = output {
-            let (stdout, stderr) = match (output.try_clone(), output.try_clone()) {
-                (Ok(stdout), Ok(stderr)) => (stdout, stderr),
-                (Err(error), _) | (_, Err(error)) => {
-                    eprintln!("terra-agent: daemon `{line}` could not clone its output ({error})");
-                    return;
-                }
-            };
-            command
-                .stdout(Stdio::from(stdout))
-                .stderr(Stdio::from(stderr));
-        }
-        if !as_root {
-            crate::workload::run_as_workload(&mut command);
-        }
-        let (_, pidfd) = match crate::reap::spawn_owned(|| command.spawn()) {
-            Ok(pair) => pair,
-            Err(e) => {
-                eprintln!("terra-agent: daemon `{line}` could not spawn ({e})");
-                tokio::select! {
-                    () = tokio::time::sleep(RESTART_DELAY) => {}
-                    () = cancellation.cancelled() => return,
-                }
-                continue;
+        let mut command = match crate::recipe_shell_command(line, terminal.as_fd()) {
+            Ok(command) => command,
+            Err(error) => {
+                eprintln!("terra-agent: daemon `{line}` could not clone its output ({error})");
+                return;
             }
         };
-        let pidfd = Arc::new(pidfd);
-        {
-            let mut processes = lock_or_abort(registry);
-            processes.push(pidfd.clone());
-            if cancellation.is_cancelled() {
-                pidfd.signal_group(rustix::process::Signal::TERM);
-            }
-        }
-        let status = tokio::select! {
-            status = crate::reap::wait_owned(&pidfd) => status,
-            () = cancellation.cancelled() => {
-                pidfd.signal_group(rustix::process::Signal::TERM);
-                crate::reap::wait_owned(&pidfd).await
-            }
-        };
-        let _ = rustix::process::kill_process_group(pidfd.leader(), rustix::process::Signal::KILL);
-        lock_or_abort(registry).retain(|registered| !Arc::ptr_eq(registered, &pidfd));
+        crate::workload::run_as(&mut command, user);
+        let status = run_registered(&mut command, registry, cancellation).await;
         if cancellation.is_cancelled() {
             return;
         }
         match status {
             Ok(s) if s.success() => return,
             Ok(s) => eprintln!("terra-agent: daemon `{line}` exited {s} - restarting"),
-            Err(e) => eprintln!("terra-agent: daemon `{line}` wait failed ({e})"),
+            Err(e) => eprintln!("terra-agent: daemon `{line}` failed ({e}) - restarting"),
         }
         tokio::select! {
             () = tokio::time::sleep(RESTART_DELAY) => {}
             () = cancellation.cancelled() => return,
         }
     }
+}
+
+/// Runs the daemon once, registered so [`Daemons::stop`] can signal it.
+async fn run_registered(
+    command: &mut std::process::Command,
+    registry: &DaemonRegistry,
+    cancellation: &CancellationToken,
+) -> std::io::Result<std::process::ExitStatus> {
+    let (_, pidfd) = crate::reap::spawn_owned(|| command.spawn())?;
+    let pidfd = Arc::new(pidfd);
+    {
+        let mut processes = lock_or_abort(registry);
+        processes.push(pidfd.clone());
+        if cancellation.is_cancelled() {
+            pidfd.signal_group(rustix::process::Signal::TERM);
+        }
+    }
+    let status = tokio::select! {
+        status = crate::reap::wait_owned(&pidfd) => status,
+        () = cancellation.cancelled() => {
+            pidfd.signal_group(rustix::process::Signal::TERM);
+            crate::reap::wait_owned(&pidfd).await
+        }
+    };
+    let _ = rustix::process::kill_process_group(pidfd.leader(), rustix::process::Signal::KILL);
+    lock_or_abort(registry).retain(|registered| !Arc::ptr_eq(registered, &pidfd));
+    status
 }
 
 const RESTART_DELAY: Duration = Duration::from_secs(1);
@@ -155,32 +145,19 @@ mod tests {
 
     const STOP_GRACE_TEST: Duration = Duration::from_secs(5);
 
-    fn spawn(lines: &[String], as_root: bool, output: Option<&std::fs::File>) -> Daemons {
+    fn spawn_writing_to(lines: &[String], output: &std::fs::File) -> Daemons {
         spawn_all(
             &TaskTracker::new(),
             lines,
-            as_root,
-            output,
+            GuestUser::Root,
+            output.as_fd(),
             &CancellationToken::new(),
         )
         .unwrap()
     }
 
-    async fn read_child_pid(path: &std::path::Path) -> rustix::process::Pid {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if let Some(pid) = std::fs::read_to_string(path)
-                    .ok()
-                    .and_then(|text| text.trim().parse().ok())
-                    .and_then(rustix::process::Pid::from_raw)
-                {
-                    return pid;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("child pid file was never written")
+    fn spawn(lines: &[String]) -> Daemons {
+        spawn_writing_to(lines, &std::fs::File::create("/dev/null").unwrap())
     }
 
     /// The point of the feature: a command that exits non-zero comes back,
@@ -190,7 +167,7 @@ mod tests {
         let file = crate::create_scratch_path("daemon", "restart-count");
         let _ = std::fs::remove_file(&file);
         let line = format!("echo x >> {}; exit 3", file.display());
-        let daemons = spawn(&[line], true, None);
+        let daemons = spawn(&[line]);
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let count = |file: &std::path::Path| {
             std::fs::read_to_string(file)
@@ -206,7 +183,7 @@ mod tests {
 
         let clean = crate::create_scratch_path("daemon", "clean");
         let _ = std::fs::remove_file(&clean);
-        let daemons = spawn(&[format!("echo done > {}", clean.display())], true, None);
+        let daemons = spawn(&[format!("echo done > {}", clean.display())]);
         tokio::time::sleep(Duration::from_millis(300)).await;
         daemons.stop(STOP_GRACE_TEST).await;
         assert_eq!(
@@ -228,10 +205,9 @@ mod tests {
         let output = crate::create_scratch_path("daemon", "output");
         let _ = std::fs::remove_file(&output);
         let file = std::fs::File::create(&output).unwrap();
-        let daemons = spawn(
+        let daemons = spawn_writing_to(
             &["printf daemon-out; printf daemon-err >&2".to_string()],
-            true,
-            Some(&file),
+            &file,
         );
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while std::fs::read_to_string(&output).unwrap_or_default().len()
@@ -252,7 +228,7 @@ mod tests {
     /// wait out a daemon that ignores the box's shutdown.
     #[tokio::test]
     async fn stop_kills_a_running_daemon_promptly() {
-        let daemons = spawn(&["sleep 600".to_string()], true, None);
+        let daemons = spawn(&["sleep 600".to_string()]);
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while lock_or_abort(&daemons.processes).is_empty() {
             assert!(std::time::Instant::now() < deadline, "never spawned");
@@ -271,7 +247,14 @@ mod tests {
     async fn parent_cancellation_stops_a_running_daemon() {
         let parent = CancellationToken::new();
         let tasks = TaskTracker::new();
-        let daemons = spawn_all(&tasks, &["sleep 600".to_string()], true, None, &parent).unwrap();
+        let daemons = spawn_all(
+            &tasks,
+            &["sleep 600".to_string()],
+            GuestUser::Root,
+            std::fs::File::create("/dev/null").unwrap().as_fd(),
+            &parent,
+        )
+        .unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while lock_or_abort(&daemons.processes).is_empty() {
             assert!(std::time::Instant::now() < deadline, "never spawned");
@@ -295,15 +278,11 @@ mod tests {
     async fn a_straggler_is_killed_once_the_grace_runs_out() {
         let ready = crate::create_scratch_path("daemon", "straggler-ready");
         let _ = std::fs::remove_file(&ready);
-        let daemons = spawn(
-            &[format!(
-                "trap '' TERM; echo $$ > {}; sleep 600",
-                ready.display()
-            )],
-            true,
-            None,
-        );
-        let _ = read_child_pid(&ready).await;
+        let daemons = spawn(&[format!(
+            "trap '' TERM; echo $$ > {}; sleep 600",
+            ready.display()
+        )]);
+        let _ = crate::read_pid_file(&ready).await;
         std::fs::remove_file(&ready).unwrap();
         let grace = Duration::from_millis(500);
         let start = std::time::Instant::now();
@@ -329,8 +308,8 @@ mod tests {
         let file = crate::create_scratch_path("daemon", "child-pid");
         let _ = std::fs::remove_file(&file);
         let line = format!("sh -c 'sleep 600' & echo $! > {}; wait", file.display());
-        let daemons = spawn(&[line], true, None);
-        let pid = read_child_pid(&file).await;
+        let daemons = spawn(&[line]);
+        let pid = crate::read_pid_file(&file).await;
         daemons.stop(STOP_GRACE_TEST).await;
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while rustix::process::test_kill_process(pid).is_ok()
@@ -350,8 +329,8 @@ mod tests {
         let file = crate::create_scratch_path("daemon", "exit-child-pid");
         let _ = std::fs::remove_file(&file);
         let line = format!("sh -c 'sleep 600' & echo $! > {}; exit 0", file.display());
-        let daemons = spawn(&[line], true, None);
-        let pid = read_child_pid(&file).await;
+        let daemons = spawn(&[line]);
+        let pid = crate::read_pid_file(&file).await;
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while rustix::process::test_kill_process(pid).is_ok()
             && std::time::Instant::now() < deadline
@@ -374,8 +353,8 @@ mod tests {
             "sh -c 'trap \"\" TERM; sleep 600' & echo $! > {}; wait",
             file.display()
         );
-        let daemons = spawn(&[line], true, None);
-        let pid = read_child_pid(&file).await;
+        let daemons = spawn(&[line]);
+        let pid = crate::read_pid_file(&file).await;
         daemons.stop(STOP_GRACE_TEST).await;
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while rustix::process::test_kill_process(pid).is_ok()

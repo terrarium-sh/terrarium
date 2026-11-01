@@ -2,29 +2,38 @@
 
 use anyhow::{Context as _, Result};
 use futures_util::{future::poll_fn, io::AsyncWriteExt as _};
-use std::{fs::File, os::fd::OwnedFd, os::unix::net::UnixStream, thread};
+use std::{fs::File, os::fd::OwnedFd, os::unix::net::UnixStream};
 use tokio::sync::mpsc;
+use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
 
-pub(super) struct GuestMux {
-    thread: thread::JoinHandle<()>,
+/// The always-open control and diagnostic streams carry little, so a small buffer keeps an idle
+/// box lean.
+const RESERVED_STREAM_BUFFER_BYTES: usize = 8 << 10;
+/// Client streams carry exec, sync and session bytes; 64 KiB halves the hops exec output takes.
+const CLIENT_STREAM_BUFFER_BYTES: usize = 64 << 10;
+
+pub(crate) struct GuestMux {
+    task: tokio::task::JoinHandle<()>,
 }
 
-pub(super) struct Streams {
-    pub(super) control: File,
-    pub(super) diagnostic: File,
-    pub(super) clients: mpsc::Receiver<File>,
-    pub(super) driver: GuestMux,
+pub(crate) struct Streams {
+    pub(crate) control: File,
+    pub(crate) diagnostic: File,
+    pub(crate) clients: mpsc::Receiver<File>,
+    pub(crate) driver: GuestMux,
 }
 
 impl GuestMux {
-    pub(super) fn wait(self) {
-        if self.thread.join().is_err() {
-            eprintln!("terra-agent: mux thread panicked");
+    /// Returns once the host closes the carrier.
+    pub(crate) async fn wait(self) {
+        if self.task.await.is_err() {
+            eprintln!("terra-agent: mux task panicked");
         }
     }
 
-    pub(super) fn connect() -> Result<Streams> {
-        Self::start(connect_agent_vsock()?)
+    pub(crate) fn connect() -> Result<Streams> {
+        let carrier = connect_vsock(terra_protocol::vsock::AGENT_PORT, "agent", |_| Ok(()))?;
+        Self::start(carrier.into())
     }
 
     fn start(carrier: File) -> Result<Streams> {
@@ -32,36 +41,29 @@ impl GuestMux {
         let (diagnostic, driver_diagnostic) =
             UnixStream::pair().context("creating diagnostic bridge")?;
         let (clients, client_streams) = mpsc::channel(terra_protocol::mux::MAX_CLIENT_STREAMS);
-        let driver = thread::Builder::new()
-            .name("agent-mux".into())
-            .spawn(move || {
-                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                else {
-                    return;
-                };
-                if let Err(error) = runtime.block_on(run(
-                    carrier,
-                    File::from(OwnedFd::from(driver_control)),
-                    File::from(OwnedFd::from(driver_diagnostic)),
-                    clients,
-                )) {
-                    eprintln!("terra-agent: mux failed: {error:#}");
-                }
-            })
-            .context("starting mux driver")?;
+        let task = tokio::spawn(async move {
+            if let Err(error) = run(
+                carrier,
+                File::from(OwnedFd::from(driver_control)),
+                File::from(OwnedFd::from(driver_diagnostic)),
+                clients,
+            )
+            .await
+            {
+                eprintln!("terra-agent: mux failed: {error:#}");
+            }
+        });
         Ok(Streams {
             control: File::from(OwnedFd::from(control)),
             diagnostic: File::from(OwnedFd::from(diagnostic)),
             clients: client_streams,
-            driver: Self { thread: driver },
+            driver: Self { task },
         })
     }
 }
 
 #[allow(unsafe_code)]
-pub(super) fn vsock_address(cid: u32, port: u32) -> rustix::net::SocketAddrAny {
+pub(crate) fn vsock_address(cid: u32, port: u32) -> rustix::net::SocketAddrAny {
     #[repr(C)]
     struct VsockAddress {
         family: u16,
@@ -86,7 +88,7 @@ pub(super) fn vsock_address(cid: u32, port: u32) -> rustix::net::SocketAddrAny {
     unsafe { rustix::net::SocketAddrAny::read(std::ptr::from_ref(&address).cast(), 16) }
 }
 
-pub(super) fn create_vsock_socket() -> std::io::Result<OwnedFd> {
+pub(crate) fn create_vsock_socket() -> std::io::Result<OwnedFd> {
     Ok(rustix::net::socket_with(
         rustix::net::AddressFamily::VSOCK,
         rustix::net::SocketType::STREAM,
@@ -96,7 +98,7 @@ pub(super) fn create_vsock_socket() -> std::io::Result<OwnedFd> {
 }
 
 /// Binds the guest side of `port`, then connects to the host side. `prepare` runs before either.
-pub(super) fn connect_vsock(
+pub(crate) fn connect_vsock(
     port: u32,
     endpoint: &str,
     prepare: impl FnOnce(&OwnedFd) -> std::io::Result<()>,
@@ -116,17 +118,15 @@ pub(super) fn connect_vsock(
     Ok(socket)
 }
 
-fn connect_agent_vsock() -> Result<File> {
-    connect_vsock(terra_protocol::vsock::AGENT_PORT, "agent", |_| Ok(())).map(File::from)
-}
-
 async fn run(
     carrier: File,
     control: File,
     diagnostic: File,
     clients: mpsc::Sender<File>,
 ) -> Result<()> {
-    let carrier = async_io::Async::new(carrier).context("registering carrier")?;
+    let carrier = crate::into_async_file(carrier)
+        .context("registering carrier")?
+        .compat();
     let mut connection = yamux::Connection::new(
         carrier,
         terra_protocol::mux::yamux_config(),
@@ -144,7 +144,7 @@ async fn run(
             .write(&[])
             .await
             .context("sending reserved mux SYN")?;
-        tokio::spawn(bridge(stream, local));
+        tokio::spawn(bridge(stream, local, RESERVED_STREAM_BUFFER_BYTES));
     }
 
     while let Some(stream) = poll_fn(|cx| connection.poll_next_inbound(cx)).await {
@@ -154,28 +154,41 @@ async fn run(
         if clients.try_send(File::from(OwnedFd::from(agent))).is_err() {
             continue;
         }
-        tokio::spawn(bridge(stream, File::from(OwnedFd::from(driver))));
+        tokio::spawn(bridge(
+            stream,
+            File::from(OwnedFd::from(driver)),
+            CLIENT_STREAM_BUFFER_BYTES,
+        ));
     }
     Ok(())
 }
 
-async fn bridge(stream: yamux::Stream, local: File) {
-    let Ok(reader) = local.try_clone().and_then(async_io::Async::new) else {
+async fn bridge(stream: yamux::Stream, local: File, buffer_bytes: usize) {
+    let Ok(reader) = local.try_clone().and_then(crate::into_async_file) else {
         return;
     };
-    let Ok(mut writer) = async_io::Async::new(local) else {
+    let Ok(writer) = crate::into_async_file(local) else {
         return;
     };
+    let (reader, mut writer) = (reader.compat(), writer.compat_write());
     let (mut stream_reader, mut stream_writer) = futures_util::io::AsyncReadExt::split(stream);
     let to_stream = async move {
-        let copied = futures_util::io::copy(reader, &mut stream_writer).await;
+        let copied = futures_util::io::copy_buf(
+            futures_util::io::BufReader::with_capacity(buffer_bytes, reader),
+            &mut stream_writer,
+        )
+        .await;
         let closed = stream_writer.close().await;
         copied?;
         closed
     };
     let to_local = async move {
-        futures_util::io::copy(&mut stream_reader, &mut writer).await?;
-        rustix::net::shutdown(writer.get_ref(), rustix::net::Shutdown::Write)
+        futures_util::io::copy_buf(
+            futures_util::io::BufReader::with_capacity(buffer_bytes, &mut stream_reader),
+            &mut writer,
+        )
+        .await?;
+        rustix::net::shutdown(writer.get_ref().get_ref(), rustix::net::Shutdown::Write)
             .map_err(std::io::Error::from)
     };
     let (output, input) = tokio::join!(to_stream, to_local);
@@ -208,12 +221,12 @@ mod tests {
 
     async fn wait_for_guest_driver(driver: GuestMux) {
         promptly(async {
-            while !driver.thread.is_finished() {
+            while !driver.task.is_finished() {
                 tokio::task::yield_now().await;
             }
         })
         .await;
-        driver.wait();
+        driver.wait().await;
     }
 
     async fn carrier(client_count: usize) -> Carrier {
@@ -224,7 +237,7 @@ mod tests {
             clients,
             driver: guest_driver,
         } = GuestMux::start(File::from(OwnedFd::from(guest))).unwrap();
-        let carrier = async_io::Async::new(File::from(OwnedFd::from(host))).unwrap();
+        let carrier = crate::into_async_file(host).unwrap().compat();
         let mut connection = yamux::Connection::new(
             carrier,
             terra_protocol::mux::yamux_config(),

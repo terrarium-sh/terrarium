@@ -1,8 +1,6 @@
 //! Bounded messages for the network broker, one yamux stream per operation.
 
-use crate::application::{
-    MAX_DATAGRAM_SEGMENTS, MAX_UDP_RUN_BYTES, TcpOpenOptions, is_valid_segmented_run,
-};
+use crate::application::{TcpOpenOptions, extends_udp_run, is_valid_segmented_run};
 pub use crate::socket::Error;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, SocketAddr};
@@ -138,17 +136,12 @@ impl DatagramBatch {
             } else {
                 last.segment
             };
-            if let Some(extended) = last.length.checked_add(length)
-                && last.peer == peer
-                && length != 0
-                && length <= segment
-                && last.length % segment == 0
-                && usize::from(extended) <= MAX_UDP_RUN_BYTES
-                && usize::from(extended).div_ceil(usize::from(segment)) <= MAX_DATAGRAM_SEGMENTS
+            if last.peer == peer
+                && extends_udp_run(usize::from(last.length), usize::from(segment), bytes.len())
                 && batch_bytes + bytes.len() <= MAX_NETWORK_DATAGRAM_BATCH_BYTES
             {
                 last.segment = segment;
-                last.length = extended;
+                last.length += length;
                 self.bytes.extend_from_slice(bytes);
                 return true;
             }
@@ -287,6 +280,7 @@ pub enum UdpReply {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::MAX_DATAGRAM_SEGMENTS;
     use crate::{encode_frame, read_frame_with_limit};
 
     fn roundtrips<T>(message: &T) -> bool

@@ -1,30 +1,44 @@
 //! Terminal-multiplexer core: broadcast output to attached clients and forward input.
 
 use crate::AsyncFile;
-use crate::term::tty::set_winsize;
 #[cfg(test)]
 use std::fs::File;
 use std::num::NonZeroU16;
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
-use terra_protocol::AgentOutput;
+use terra_protocol::{AgentOutput, TermSize};
 use tokio::io::AsyncWriteExt as _;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 pub(crate) const DEFAULT_ROWS: u16 = 24;
 pub(crate) const DEFAULT_COLS: u16 = 80;
-pub(crate) const MIN_ROWS: u16 = 5;
-pub(crate) const MIN_COLS: u16 = 20;
-pub(crate) const MAX_ROWS: u16 = 512;
-pub(crate) const MAX_COLS: u16 = 1024;
+const MIN_ROWS: u16 = 5;
+const MIN_COLS: u16 = 20;
+const MAX_ROWS: u16 = 512;
+const MAX_COLS: u16 = 1024;
 
 pub(crate) fn clamp_term_size(rows: u16, cols: u16) -> (u16, u16) {
     (
         rows.clamp(MIN_ROWS, MAX_ROWS),
         cols.clamp(MIN_COLS, MAX_COLS),
     )
+}
+
+pub(crate) fn set_winsize(fd: BorrowedFd<'_>, rows: u16, cols: u16) {
+    let size = rustix::termios::Winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let _ = rustix::termios::tcsetwinsize(fd, size);
+}
+
+/// A client's resize request as a terminal size; a zero dimension is ignored rather than clamped.
+pub(crate) fn requested_term_size(size: TermSize) -> Option<(u16, u16)> {
+    (size.rows > 0 && size.cols > 0).then(|| clamp_term_size(size.rows, size.cols))
 }
 
 /// Sizes come from [`clamp_term_size`] or the defaults, so neither is zero.
@@ -85,20 +99,19 @@ impl Drop for ClientConnInner {
     }
 }
 
-pub struct Session {
+pub(crate) struct Session {
     inner: Mutex<Inner>,
     delivery: Mutex<()>,
     input_fd: OwnedFd,
     input: mpsc::Sender<Vec<u8>>,
-    cancellation: CancellationToken,
 }
 
 struct Inner {
     parser: vt100::Parser,
     clients: Vec<Client>,
     next_id: u64,
-    closed: bool,
-    exit_code: i32,
+    /// Set once the session has ended; a client attaching later gets it straight away.
+    exit_code: Option<i32>,
     saw_output: bool,
 }
 
@@ -111,11 +124,11 @@ struct Client {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum DetachOutcome {
     Missing,
-    Detached { size: Option<(u16, u16)> },
+    Detached,
 }
 
 impl Session {
-    pub fn new(
+    pub(crate) fn new(
         tasks: &TaskTracker,
         input: AsyncFile,
         cancellation: &CancellationToken,
@@ -131,14 +144,12 @@ impl Session {
                 },
                 clients: Vec::new(),
                 next_id: 0,
-                closed: false,
-                exit_code: 0,
+                exit_code: None,
                 saw_output: false,
             }),
             delivery: Mutex::new(()),
             input_fd,
             input: sender,
-            cancellation: cancellation.clone(),
         });
         tasks.spawn(cancellation.clone().run_until_cancelled_owned(async move {
             let mut writer = input;
@@ -157,7 +168,7 @@ impl Session {
         let _delivery = self.delivery.lock().await;
         let clients = {
             let mut inner = self.inner.lock().await;
-            if inner.closed {
+            if inner.exit_code.is_some() {
                 return;
             }
             inner.parser.process(bytes);
@@ -189,8 +200,7 @@ impl Session {
         let _delivery = self.delivery.lock().await;
         let clients = {
             let mut inner = self.inner.lock().await;
-            inner.exit_code = code;
-            inner.closed = true;
+            inner.exit_code = Some(code);
             std::mem::take(&mut inner.clients)
         };
         for client in clients {
@@ -208,8 +218,8 @@ impl Session {
             let output = inner
                 .saw_output
                 .then(|| inner.parser.screen().contents_formatted());
-            if inner.closed {
-                (id, output, Some(inner.exit_code))
+            if let Some(code) = inner.exit_code {
+                (id, output, Some(code))
             } else {
                 inner.clients.push(Client {
                     id,
@@ -254,10 +264,10 @@ impl Session {
         let _ = client.conn.write(&AgentOutput::Detached).await;
         client.conn.close();
         self.apply_size(size);
-        DetachOutcome::Detached { size }
+        DetachOutcome::Detached
     }
 
-    pub(crate) async fn detach_all_clients(&self) -> (Vec<u64>, Option<(u16, u16)>) {
+    pub(crate) async fn detach_all_clients(&self) -> Vec<u64> {
         let _delivery = self.delivery.lock().await;
         let (clients, size) = {
             let mut inner = self.inner.lock().await;
@@ -272,7 +282,7 @@ impl Session {
             client.conn.close();
         }
         self.apply_size(size);
-        (ids, size)
+        ids
     }
 
     pub(crate) async fn list_clients(&self) -> Vec<(u64, Option<(u16, u16)>)> {
@@ -285,19 +295,18 @@ impl Session {
             .collect()
     }
 
-    pub(crate) async fn set_client_size(
-        &self,
-        id: u64,
-        rows: u16,
-        cols: u16,
-    ) -> Option<(u16, u16)> {
+    pub(crate) async fn set_client_size(&self, id: u64, requested: TermSize) {
+        let Some(size) = requested_term_size(requested) else {
+            return;
+        };
         let mut inner = self.inner.lock().await;
-        let client = inner.clients.iter_mut().find(|client| client.id == id)?;
-        client.size = Some(clamp_term_size(rows, cols));
-        let size = inner.update_shared_size();
+        let Some(client) = inner.clients.iter_mut().find(|client| client.id == id) else {
+            return;
+        };
+        client.size = Some(size);
+        let shared_size = inner.update_shared_size();
         drop(inner);
-        self.apply_size(size);
-        size
+        self.apply_size(shared_size);
     }
 
     fn apply_size(&self, size: Option<(u16, u16)>) {
@@ -307,20 +316,16 @@ impl Session {
     }
 
     pub(crate) async fn send_input(&self, bytes: &[u8]) -> std::io::Result<()> {
-        tokio::select! {
-            () = self.cancellation.cancelled() => Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
-            result = tokio::time::timeout(CLIENT_WRITE_TIMEOUT, self.input.send(bytes.to_vec())) => {
-                result
-                    .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))?
-                    .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))
-            }
-        }
+        tokio::time::timeout(CLIENT_WRITE_TIMEOUT, self.input.send(bytes.to_vec()))
+            .await
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))?
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))
     }
 
     async fn close_clients(&self) {
         let clients = {
             let mut inner = self.inner.lock().await;
-            inner.closed = true;
+            inner.exit_code.get_or_insert(0);
             std::mem::take(&mut inner.clients)
         };
         for client in clients {
@@ -434,20 +439,37 @@ mod tests {
         let first = session.attach_client(&first).await.unwrap();
         let second = session.attach_client(&second).await.unwrap();
 
-        assert_eq!(
-            session.set_client_size(first, 50, 200).await,
-            Some((50, 200))
-        );
-        assert_eq!(
-            session.set_client_size(second, 30, 100).await,
-            Some((30, 100))
-        );
-        assert_eq!(
-            session.detach_client(second).await,
-            DetachOutcome::Detached {
-                size: Some((50, 200))
-            }
-        );
+        session
+            .set_client_size(
+                first,
+                TermSize {
+                    rows: 50,
+                    cols: 200,
+                },
+            )
+            .await;
+        assert_eq!(screen_size(&session).await, (50, 200));
+        session
+            .set_client_size(
+                second,
+                TermSize {
+                    rows: 30,
+                    cols: 100,
+                },
+            )
+            .await;
+        assert_eq!(screen_size(&session).await, (30, 100));
+        session
+            .set_client_size(second, TermSize { rows: 0, cols: 120 })
+            .await;
+        assert_eq!(screen_size(&session).await, (30, 100));
+        assert_eq!(session.detach_client(second).await, DetachOutcome::Detached);
+        assert_eq!(screen_size(&session).await, (50, 200));
+    }
+
+    async fn screen_size(session: &Session) -> (u16, u16) {
+        let (rows, cols) = session.inner.lock().await.parser.screen().size();
+        (rows.get(), cols.get())
     }
 
     /// A client that attaches before any output gets no repaint: an empty screen's repaint only
@@ -586,10 +608,7 @@ mod tests {
         let (client, mut reader) = client();
         let id = session.attach_client(&client).await.unwrap();
 
-        assert_eq!(
-            session.detach_client(id).await,
-            DetachOutcome::Detached { size: None }
-        );
+        assert_eq!(session.detach_client(id).await, DetachOutcome::Detached);
         assert_eq!(frame(&mut reader).await, AgentOutput::Detached);
         assert_eq!(
             tokio::time::timeout(
@@ -611,7 +630,7 @@ mod tests {
         let first = session.attach_client(&first).await.unwrap();
         let second = session.attach_client(&second).await.unwrap();
 
-        assert_eq!(session.detach_all_clients().await.0, vec![first, second]);
+        assert_eq!(session.detach_all_clients().await, vec![first, second]);
         assert_eq!(
             session.list_clients().await,
             [] as [(u64, std::option::Option<(u16, u16)>); 0]
@@ -652,7 +671,16 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unknown_clients_cannot_change_the_shared_size() {
         let (session, _) = session();
-        assert_eq!(session.set_client_size(42, 30, 100).await, None);
+        session
+            .set_client_size(
+                42,
+                TermSize {
+                    rows: 30,
+                    cols: 100,
+                },
+            )
+            .await;
+        assert_eq!(screen_size(&session).await, (DEFAULT_ROWS, DEFAULT_COLS));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -742,7 +770,7 @@ mod tests {
         });
         // Bytes on the socket mean the parse under `inner` is done and the oversized write has stalled.
         tokio::time::timeout(Duration::from_secs(1), async {
-            while rustix::io::ioctl_fionread(reader.get_ref().get_ref()).unwrap() == 0 {
+            while rustix::io::ioctl_fionread(reader.get_ref()).unwrap() == 0 {
                 tokio::task::yield_now().await;
             }
         })

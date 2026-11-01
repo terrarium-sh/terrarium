@@ -2,11 +2,9 @@
 
 use crate::AsyncFile;
 use crate::reap::OwnedPidfd;
-use crate::term::session::clamp_term_size;
-use crate::term::tty::set_winsize;
-use std::fmt::Display;
+use crate::session::{clamp_term_size, requested_term_size, set_winsize};
+use crate::workload::GuestUser;
 use std::os::fd::AsFd;
-use std::sync::Arc;
 use std::time::Duration;
 use terra_protocol::{AgentOutput, ClientInput, ExecRequest, TermSize};
 use terra_protocol::{read_frame_async as read_frame, write_frame_async as write_frame};
@@ -15,152 +13,100 @@ use tokio::sync::{Mutex, watch};
 use tokio_util::sync::CancellationToken;
 
 const EXEC_NOT_RUN: i32 = 127;
-const EXEC_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
+const FRAME_TIMEOUT: Duration = Duration::from_secs(30);
+const OUTPUT_READ_BYTES: usize = 64 << 10;
 
-pub async fn serve_exec(conn: AsyncFile, workload_root: bool, cancel: CancellationToken) {
-    let Ok(disconnect) = conn
-        .get_ref()
-        .get_ref()
-        .try_clone()
-        .and_then(crate::into_async_fd)
-    else {
+pub(crate) async fn serve_exec(
+    conn: AsyncFile,
+    workload_user: GuestUser,
+    cancellation: CancellationToken,
+) {
+    let Ok(disconnect) = conn.get_ref().try_clone().and_then(crate::into_async_fd) else {
         return;
     };
     let (mut reader, mut writer) = tokio::io::split(conn);
     let req = tokio::select! {
         biased;
-        () = cancel.cancelled() => return,
-        result = tokio::time::timeout(EXEC_SETUP_TIMEOUT, read_frame::<ExecRequest>(&mut reader)) => {
-            if let Ok(Ok(Some(req))) = result {
-                req
-            } else {
-                let _ = write_exec(&mut writer, &AgentOutput::Exit { code: EXEC_NOT_RUN }, &cancel).await;
-                return;
-            }
-        }
+        () = cancellation.cancelled() => return,
+        result = tokio::time::timeout(FRAME_TIMEOUT, read_frame::<ExecRequest>(&mut reader)) => result,
     };
-    Box::pin(run_exec(
-        reader,
-        writer,
-        &req,
-        workload_root,
-        disconnect,
-        cancel,
-    ))
-    .await;
+    let code = if let Ok(Ok(Some(req))) = req {
+        Box::pin(run_exec(
+            reader,
+            &mut writer,
+            &req,
+            workload_user,
+            disconnect,
+            &cancellation,
+        ))
+        .await
+    } else {
+        EXEC_NOT_RUN
+    };
+    let _ = send_output(&mut writer, &AgentOutput::Exit { code }, &cancellation).await;
 }
 
-async fn run_exec<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'static>(
+async fn run_exec<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     mut reader: R,
-    writer_conn: W,
+    writer: &mut W,
     req: &ExecRequest,
-    workload_root: bool,
+    workload_user: GuestUser,
     disconnect: tokio::io::unix::AsyncFd<std::fs::File>,
-    cancel: CancellationToken,
-) {
+    cancellation: &CancellationToken,
+) -> i32 {
     let Some((cmd, args)) = req.argv.split_first() else {
-        return;
+        return EXEC_NOT_RUN;
+    };
+    let user = if req.as_root {
+        GuestUser::Root
+    } else {
+        workload_user
     };
     let is_tty = req.tty.is_some();
-    let spawned = if let Some(term) = req.tty {
-        spawn_pty(cmd, args, req, workload_root, term)
-    } else {
-        spawn_pipes(cmd, args, req, workload_root)
+    let command = exec_command(cmd, args, req, user);
+    let spawned = match req.tty {
+        Some(term) => spawn_pty(command, term),
+        None => spawn_pipes(command),
     };
     let running = match spawned {
         Ok(running) => running,
-        Err(SpawnFailure::Launch(error)) => {
-            report_exec_failure(writer_conn, cmd, error, is_tty, &cancel).await;
-            return;
-        }
-        Err(SpawnFailure::Setup(process)) => {
-            abort_exec(process, writer_conn, &cancel).await;
-            return;
+        Err(error) => {
+            report_exec_failure(writer, cmd, &error, is_tty, cancellation).await;
+            return EXEC_NOT_RUN;
         }
     };
 
-    let writer = Mutex::new(writer_conn);
-    let input_stop = cancel.child_token();
-    let input_task = tokio::spawn({
-        let input_cancel = input_stop.clone();
-        let process = running.process.clone();
-        async move {
-            pump_input(
-                &mut reader,
-                running.stdin,
-                is_tty,
-                &process,
-                &disconnect,
-                input_cancel,
-            )
-            .await;
-        }
-    });
-
-    let code = Box::pin(drive_output(
-        running.output,
-        &writer,
+    let writer = Mutex::new(writer);
+    let input = pump_input(
+        &mut reader,
+        running.stdin,
+        is_tty,
         &running.process,
-        &cancel,
-    ))
-    .await;
-    input_stop.cancel();
-    let _ = input_task.await;
-    let _ = write_output(&writer, AgentOutput::Exit { code }, &cancel).await;
-}
-
-async fn abort_exec<W: AsyncWrite + Unpin>(
-    process: Arc<OwnedPidfd>,
-    mut conn: W,
-    cancel: &CancellationToken,
-) {
-    process.signal_group(rustix::process::Signal::KILL);
-    let _ = crate::reap::wait_owned(&process).await;
-    let _ = write_exec(&mut conn, &AgentOutput::Exit { code: EXEC_NOT_RUN }, cancel).await;
+        &disconnect,
+    );
+    let output = drive_output(running.output, &writer, &running.process, cancellation);
+    tokio::pin!(input, output);
+    tokio::select! {
+        code = &mut output => code,
+        () = &mut input => output.await,
+    }
 }
 
 struct RunningProcess {
-    process: Arc<OwnedPidfd>,
+    process: OwnedPidfd,
     stdin: AsyncFile,
     output: ExecOutput,
 }
 
-enum SpawnFailure {
-    Launch(String),
-    Setup(Arc<OwnedPidfd>),
-}
-
-fn spawn_pty(
-    cmd: &str,
-    args: &[String],
-    req: &ExecRequest,
-    workload_root: bool,
-    term: TermSize,
-) -> Result<RunningProcess, SpawnFailure> {
-    let (pty, child_pidfd) = match crate::workload::spawn_on_pty(
-        cmd,
-        args,
-        term,
-        req.as_root || workload_root,
-        req.workdir.as_deref(),
-        &req.env,
-    ) {
-        Ok(child) => child,
-        Err(error) => {
-            return Err(SpawnFailure::Launch(error.to_string()));
-        }
-    };
-    let process = Arc::new(child_pidfd);
+fn spawn_pty(command: std::process::Command, term: TermSize) -> anyhow::Result<RunningProcess> {
+    let (pty, pts) = pty_process::blocking::open()?;
+    let (rows, cols) = clamp_term_size(term.rows, term.cols);
+    pty.resize(pty_process::Size::new(rows, cols))?;
     let master: std::os::fd::OwnedFd = pty.into();
-    let Ok(output_master) = master.try_clone() else {
-        return Err(SpawnFailure::Setup(process));
-    };
-    let (Ok(stdin), Ok(output)) = (
-        crate::into_async_file(master),
-        crate::into_async_file(output_master),
-    ) else {
-        return Err(SpawnFailure::Setup(process));
-    };
+    let output = crate::into_async_file(master.try_clone()?)?;
+    let stdin = crate::into_async_file(master)?;
+    let command = pty_process::blocking::Command::from(command);
+    let (_child, process) = crate::reap::spawn_owned(|| command.spawn(pts))?;
     Ok(RunningProcess {
         process,
         stdin,
@@ -168,49 +114,23 @@ fn spawn_pty(
     })
 }
 
-fn spawn_pipes(
-    cmd: &str,
-    args: &[String],
-    req: &ExecRequest,
-    workload_root: bool,
-) -> Result<RunningProcess, SpawnFailure> {
+fn spawn_pipes(mut command: std::process::Command) -> anyhow::Result<RunningProcess> {
     use std::os::unix::process::CommandExt;
-    use std::process::Stdio;
 
-    let mut command = std::process::Command::new(cmd);
+    let (child_stdin, stdin) = std::io::pipe()?;
+    let (stdout, child_stdout) = std::io::pipe()?;
+    let (stderr, child_stderr) = std::io::pipe()?;
+    let (stdin, stdout, stderr) = (
+        crate::into_async_file(stdin)?,
+        crate::into_async_file(stdout)?,
+        crate::into_async_file(stderr)?,
+    );
     command
-        .args(args)
         .process_group(0)
-        .env("HOME", terra_protocol::WORKLOAD_HOME)
-        .envs(&req.env)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if let Some(workdir) = req.workdir.as_deref() {
-        command.current_dir(workdir);
-    }
-    if !(req.as_root || workload_root) {
-        crate::workload::run_as_workload(&mut command);
-    }
-    let (mut child, child_pidfd) = match crate::reap::spawn_owned(|| command.spawn()) {
-        Ok(child) => child,
-        Err(error) => {
-            return Err(SpawnFailure::Launch(error.to_string()));
-        }
-    };
-    let process = Arc::new(child_pidfd);
-    let (Some(stdin), Some(stdout), Some(stderr)) =
-        (child.stdin.take(), child.stdout.take(), child.stderr.take())
-    else {
-        return Err(SpawnFailure::Setup(process));
-    };
-    let (Ok(stdin), Ok(stdout), Ok(stderr)) = (
-        crate::into_async_file(stdin),
-        crate::into_async_file(stdout),
-        crate::into_async_file(stderr),
-    ) else {
-        return Err(SpawnFailure::Setup(process));
-    };
+        .stdin(child_stdin)
+        .stdout(child_stdout)
+        .stderr(child_stderr);
+    let (_child, process) = crate::reap::spawn_owned(|| command.spawn())?;
     Ok(RunningProcess {
         process,
         stdin,
@@ -218,27 +138,45 @@ fn spawn_pipes(
     })
 }
 
+fn exec_command(
+    cmd: &str,
+    args: &[String],
+    req: &ExecRequest,
+    user: GuestUser,
+) -> std::process::Command {
+    let mut command = std::process::Command::new(cmd);
+    command
+        .args(args)
+        .env("HOME", terra_protocol::WORKLOAD_HOME)
+        .envs(&req.env);
+    if let Some(workdir) = req.workdir.as_deref() {
+        command.current_dir(workdir);
+    }
+    crate::workload::run_as(&mut command, user);
+    command
+}
+
 async fn pump_input<R: AsyncRead + Unpin>(
     reader: &mut R,
     stdin: AsyncFile,
     is_tty: bool,
-    process: &Arc<OwnedPidfd>,
-    monitor: &tokio::io::unix::AsyncFd<std::fs::File>,
-    cancel: CancellationToken,
+    process: &OwnedPidfd,
+    disconnect: &tokio::io::unix::AsyncFd<std::fs::File>,
 ) {
     let forward = async {
         let mut stdin = Some(stdin);
-        while let Some(input) = read_frame(reader).await? {
+        while let Ok(Some(input)) = read_frame(reader).await {
             let bytes = match input {
                 ClientInput::Keys(bytes) => bytes,
-                ClientInput::Resize(TermSize { rows, cols }) if is_tty && rows > 0 && cols > 0 => {
-                    if let Some(stdin) = stdin.as_ref() {
-                        let (rows, cols) = clamp_term_size(rows, cols);
+                ClientInput::Resize(size) => {
+                    if is_tty
+                        && let Some((rows, cols)) = requested_term_size(size)
+                        && let Some(stdin) = stdin.as_ref()
+                    {
                         set_winsize(stdin.get_ref().as_fd(), rows, cols);
                     }
                     continue;
                 }
-                ClientInput::Resize(_) => continue,
                 ClientInput::Eof if is_tty => vec![0x04],
                 ClientInput::Eof => {
                     drop(stdin.take());
@@ -249,27 +187,24 @@ async fn pump_input<R: AsyncRead + Unpin>(
                 && let Err(error) = child_stdin.write_all(&bytes).await
             {
                 if error.kind() != std::io::ErrorKind::BrokenPipe {
-                    return Err(error);
+                    return;
                 }
                 drop(stdin.take());
             }
         }
-        std::io::Result::Ok(())
     };
     tokio::select! {
-        biased;
-        () = cancel.cancelled() => {},
-        _ = forward => {},
-        _ = wait_read_closed(monitor) => {},
+        () = forward => {},
+        _ = wait_read_closed(disconnect) => {},
     }
     process.signal_group(rustix::process::Signal::KILL);
 }
 
 async fn wait_read_closed(
-    monitor: &tokio::io::unix::AsyncFd<std::fs::File>,
+    disconnect: &tokio::io::unix::AsyncFd<std::fs::File>,
 ) -> std::io::Result<()> {
     loop {
-        let mut readiness = monitor.readable().await?;
+        let mut readiness = disconnect.readable().await?;
         if readiness.ready().is_read_closed() {
             return Ok(());
         }
@@ -288,134 +223,112 @@ enum ExecOutput {
 async fn drive_output<W: AsyncWrite + Unpin>(
     output: ExecOutput,
     writer: &Mutex<W>,
-    process: &Arc<OwnedPidfd>,
-    cancel: &CancellationToken,
+    process: &OwnedPidfd,
+    cancellation: &CancellationToken,
 ) -> i32 {
-    let (exited_tx, exited_rx) = watch::channel(false);
-    let waiter_process = process.clone();
-    let waiter = tokio::spawn(async move {
-        let status = crate::reap::wait_owned(&waiter_process).await;
+    let (exited_tx, exited) = watch::channel(false);
+    let wait = async {
+        let status = crate::reap::wait_owned(process).await;
         let _ = exited_tx.send(true);
         status
-    });
-    let output = match output {
-        ExecOutput::Pty(output) => {
-            pump_output(output, writer, AgentOutput::Out, true, exited_rx, cancel).await
-        }
-        ExecOutput::Pipes { stdout, stderr } => tokio::try_join!(
-            pump_output(
-                stdout,
-                writer,
-                AgentOutput::Out,
-                false,
-                exited_rx.clone(),
-                cancel
-            ),
-            pump_output(stderr, writer, AgentOutput::Err, false, exited_rx, cancel),
-        )
-        .map(|_| ()),
     };
-    if output.is_err() {
-        process.signal_group(rustix::process::Signal::KILL);
+    let pump = async {
+        let pumped = match output {
+            ExecOutput::Pty(output) => {
+                pump_output(output, writer, AgentOutput::Out, exited, cancellation).await
+            }
+            ExecOutput::Pipes { stdout, stderr } => tokio::try_join!(
+                pump_output(
+                    stdout,
+                    writer,
+                    AgentOutput::Out,
+                    exited.clone(),
+                    cancellation
+                ),
+                pump_output(stderr, writer, AgentOutput::Err, exited, cancellation),
+            )
+            .map(|_| ()),
+        };
+        if pumped.is_err() {
+            process.signal_group(rustix::process::Signal::KILL);
+        }
+        pumped
+    };
+    match tokio::join!(wait, pump) {
+        (status, Ok(())) => exit_code(status),
+        (_, Err(())) => EXEC_NOT_RUN,
     }
-    let code = exit_code(
-        waiter
-            .await
-            .unwrap_or_else(|_| Err(std::io::Error::other("child waiter failed"))),
-    );
-    if output.is_ok() { code } else { EXEC_NOT_RUN }
 }
 
 async fn pump_output<R: AsyncRead + Unpin>(
     mut source: R,
     writer: &Mutex<impl AsyncWrite + Unpin>,
     wrap: fn(Vec<u8>) -> AgentOutput,
-    is_tty: bool,
     mut exited: watch::Receiver<bool>,
-    cancel: &CancellationToken,
+    cancellation: &CancellationToken,
 ) -> Result<(), ()> {
-    let mut deadline = None;
-    let mut bytes = [0; 8192];
+    let drained = async {
+        let _ = exited.wait_for(|&has_exited| has_exited).await;
+        tokio::time::sleep(crate::OUTPUT_DRAIN_GRACE).await;
+    };
+    tokio::pin!(drained);
+    let mut bytes = vec![0; OUTPUT_READ_BYTES];
     loop {
-        if let Some(deadline) = deadline
-            && deadline <= tokio::time::Instant::now()
-        {
-            return Ok(());
-        }
-        let read = async {
-            match deadline {
-                Some(deadline) => tokio::time::timeout_at(deadline, source.read(&mut bytes))
-                    .await
-                    .unwrap_or(Ok(0)),
-                None => source.read(&mut bytes).await,
-            }
-        };
-        let result = tokio::select! {
+        let read = tokio::select! {
             biased;
-            () = cancel.cancelled() => return Err(()),
-            result = exited.changed(), if deadline.is_none() => {
-                if result.is_err() || *exited.borrow() {
-                    deadline = Some(tokio::time::Instant::now() + crate::hooks::OUTPUT_DRAIN_GRACE);
-                }
-                continue;
-            },
-            result = read => result,
+            () = cancellation.cancelled() => return Err(()),
+            () = &mut drained => return Ok(()),
+            read = source.read(&mut bytes) => read,
         };
-        match result {
+        let count = match read {
             Ok(0) => return Ok(()),
-            Err(error)
-                if is_tty && error.raw_os_error() == Some(rustix::io::Errno::IO.raw_os_error()) =>
-            {
+            Ok(count) => count,
+            // A pty master reads EIO once no slave fd is open.
+            Err(error) if error.raw_os_error() == Some(rustix::io::Errno::IO.raw_os_error()) => {
                 return Ok(());
             }
-            Ok(count) if !write_output(writer, wrap(bytes[..count].to_vec()), cancel).await => {
-                return Err(());
-            }
-            Ok(_) => {}
             Err(_) => return Err(()),
-        }
+        };
+        send_output(
+            &mut *writer.lock().await,
+            &wrap(bytes[..count].to_vec()),
+            cancellation,
+        )
+        .await?;
     }
 }
 
-async fn write_exec<W: AsyncWrite + Unpin>(
+async fn send_output<W: AsyncWrite + Unpin>(
     conn: &mut W,
     msg: &AgentOutput,
-    cancel: &CancellationToken,
-) -> bool {
+    cancellation: &CancellationToken,
+) -> Result<(), ()> {
     tokio::select! {
         biased;
-        () = cancel.cancelled() => false,
-        result = tokio::time::timeout(EXEC_SETUP_TIMEOUT, write_frame(conn, msg)) => matches!(result, Ok(Ok(()))),
+        () = cancellation.cancelled() => Err(()),
+        result = tokio::time::timeout(FRAME_TIMEOUT, write_frame(conn, msg)) => match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) | Err(_) => Err(()),
+        },
     }
-}
-
-async fn write_output<W: AsyncWrite + Unpin>(
-    writer: &Mutex<W>,
-    msg: AgentOutput,
-    cancel: &CancellationToken,
-) -> bool {
-    let mut writer = writer.lock().await;
-    write_exec(&mut *writer, &msg, cancel).await
 }
 
 async fn report_exec_failure<W: AsyncWrite + Unpin>(
-    conn: W,
+    conn: &mut W,
     cmd: &str,
-    error: impl Display,
-    tty: bool,
-    cancel: &CancellationToken,
+    error: &anyhow::Error,
+    is_tty: bool,
+    cancellation: &CancellationToken,
 ) {
-    let mut conn = conn;
-    let output = if tty {
-        AgentOutput::Out(format!("terra: cannot run {cmd}: {error}\r\n").into_bytes())
+    let message = format!("terra: cannot run {cmd}: {error}");
+    let output = if is_tty {
+        AgentOutput::Out(format!("{message}\r\n").into_bytes())
     } else {
-        AgentOutput::Err(format!("terra: cannot run {cmd}: {error}\n").into_bytes())
+        AgentOutput::Err(format!("{message}\n").into_bytes())
     };
-    let _ = write_exec(&mut conn, &output, cancel).await;
-    let _ = write_exec(&mut conn, &AgentOutput::Exit { code: EXEC_NOT_RUN }, cancel).await;
+    let _ = send_output(conn, &output, cancellation).await;
 }
 
-#[must_use]
 fn exit_code(status: std::io::Result<std::process::ExitStatus>) -> i32 {
     use std::os::unix::process::ExitStatusExt;
     status
@@ -428,7 +341,7 @@ fn exit_code(status: std::io::Result<std::process::ExitStatus>) -> i32 {
         .unwrap_or(EXEC_NOT_RUN)
 }
 
-pub(crate) async fn wait_for_exit_code(pidfd: &crate::reap::OwnedPidfd) -> i32 {
+pub(crate) async fn wait_for_exit_code(pidfd: &OwnedPidfd) -> i32 {
     exit_code(crate::reap::wait_owned(pidfd).await)
 }
 
@@ -446,27 +359,37 @@ mod tests {
     const NO_EXIT: i32 = i32::MIN;
     const HARNESS_TIMEOUT: Duration = Duration::from_secs(20);
 
-    async fn run_exec_request(
-        argv: &[&str],
-        is_tty: bool,
-        stdin: &[u8],
-        env: BTreeMap<String, String>,
-    ) -> (Vec<u8>, Vec<u8>, i32) {
-        let req = ExecRequest {
+    fn exec_request(argv: &[&str], is_tty: bool) -> ExecRequest {
+        ExecRequest {
             argv: argv.iter().map(ToString::to_string).collect(),
             as_root: false,
             tty: is_tty.then_some(TermSize { rows: 24, cols: 80 }),
             workdir: None,
-            env,
-        };
+            env: BTreeMap::new(),
+        }
+    }
+
+    /// Serves one exec connection and sends it `request`.
+    fn start_exec(
+        request: &ExecRequest,
+        cancellation: &CancellationToken,
+    ) -> (UnixStream, tokio::task::JoinHandle<()>) {
         let (mut client, server) = UnixStream::pair().unwrap();
         client.set_read_timeout(Some(HARNESS_TIMEOUT)).unwrap();
         let agent = tokio::spawn(serve_exec(
             crate::into_async_file(server).unwrap(),
-            true,
-            CancellationToken::new(),
+            GuestUser::Root,
+            cancellation.clone(),
         ));
-        let mut input = terra_protocol::encode_frame(&req).unwrap();
+        client
+            .write_all(&terra_protocol::encode_frame(request).unwrap())
+            .unwrap();
+        (client, agent)
+    }
+
+    async fn run_exec_request(request: &ExecRequest, stdin: &[u8]) -> (Vec<u8>, Vec<u8>, i32) {
+        let (mut client, agent) = start_exec(request, &CancellationToken::new());
+        let mut input = Vec::new();
         if !stdin.is_empty() {
             input.extend(terra_protocol::encode_frame(&ClientInput::Keys(stdin.to_vec())).unwrap());
         }
@@ -496,10 +419,11 @@ mod tests {
     async fn pipe_exec_finishes_when_a_descendant_keeps_output_open() {
         let started = std::time::Instant::now();
         let (out, err, code) = run_exec_request(
-            &["sh", "-c", "sleep 5 & printf done; printf err >&2; exit 7"],
-            false,
+            &exec_request(
+                &["sh", "-c", "sleep 5 & printf done; printf err >&2; exit 7"],
+                false,
+            ),
             b"",
-            BTreeMap::new(),
         )
         .await;
         assert_eq!((out, err, code), (b"done".to_vec(), b"err".to_vec(), 7));
@@ -507,13 +431,25 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exec_finishes_while_a_descendant_floods_output() {
+        for is_tty in [false, true] {
+            let started = std::time::Instant::now();
+            let (_, _, code) =
+                run_exec_request(&exec_request(&["sh", "-c", "yes & exit 3"], is_tty), b"").await;
+            assert_eq!(code, 3);
+            assert!(started.elapsed() < Duration::from_secs(4));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tty_exec_finishes_when_a_descendant_keeps_output_open() {
         let started = std::time::Instant::now();
         let (out, err, code) = run_exec_request(
-            &["sh", "-c", "trap '' HUP; sleep 6 & printf done; exit 7"],
-            true,
+            &exec_request(
+                &["sh", "-c", "trap '' HUP; sleep 6 & printf done; exit 7"],
+                true,
+            ),
             b"",
-            BTreeMap::new(),
         )
         .await;
         assert_eq!((out, err, code), (b"done".to_vec(), Vec::new(), 7));
@@ -526,7 +462,7 @@ mod tests {
         let reader = tokio::spawn(async move {
             let mut frames = 0;
             while let Some(frame) = read_frame::<AgentOutput>(&mut receiver).await.unwrap() {
-                assert_eq!(frame, AgentOutput::Out(vec![b'x'; 8192]));
+                assert_eq!(frame, AgentOutput::Out(vec![b'x'; OUTPUT_READ_BYTES]));
                 frames += 1;
                 tokio::time::sleep(Duration::from_millis(300)).await;
             }
@@ -541,7 +477,6 @@ mod tests {
                 tokio::io::repeat(b'x'),
                 &writer,
                 AgentOutput::Out,
-                true,
                 exited,
                 &CancellationToken::new(),
             ),
@@ -562,23 +497,10 @@ mod tests {
             } else {
                 "exec 0<&-; printf ready; sleep .1; printf done; exit 7"
             };
-            let request = ExecRequest {
-                argv: vec!["sh".to_string(), "-c".to_string(), command.to_string()],
-                as_root: false,
-                tty: None,
-                workdir: None,
-                env: BTreeMap::new(),
-            };
-            let (mut client, server) = UnixStream::pair().unwrap();
-            client.set_read_timeout(Some(HARNESS_TIMEOUT)).unwrap();
-            let mut agent = tokio::spawn(serve_exec(
-                crate::into_async_file(server).unwrap(),
-                true,
-                CancellationToken::new(),
-            ));
-            client
-                .write_all(&terra_protocol::encode_frame(&request).unwrap())
-                .unwrap();
+            let (mut client, mut agent) = start_exec(
+                &exec_request(&["sh", "-c", command], false),
+                &CancellationToken::new(),
+            );
             assert_eq!(
                 terra_protocol::read_frame::<AgentOutput>(&mut client).unwrap(),
                 Some(AgentOutput::Out(b"ready".to_vec()))
@@ -613,26 +535,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pipe_exec_kills_the_child_when_output_disconnects() {
-        let request = ExecRequest {
-            argv: vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                "printf out; exec sleep 600".to_string(),
-            ],
-            as_root: false,
-            tty: None,
-            workdir: None,
-            env: BTreeMap::new(),
-        };
-        let (mut client, server) = UnixStream::pair().unwrap();
-        let agent = tokio::spawn(serve_exec(
-            crate::into_async_file(server).unwrap(),
-            true,
-            CancellationToken::new(),
-        ));
-        client
-            .write_all(&terra_protocol::encode_frame(&request).unwrap())
-            .unwrap();
+        let (client, agent) = start_exec(
+            &exec_request(&["sh", "-c", "printf out; exec sleep 600"], false),
+            &CancellationToken::new(),
+        );
         client.shutdown(Shutdown::Read).unwrap();
 
         tokio::time::timeout(Duration::from_secs(3), agent)
@@ -647,7 +553,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let agent = tokio::spawn(serve_exec(
             crate::into_async_file(server).unwrap(),
-            true,
+            GuestUser::Root,
             cancel.clone(),
         ));
         cancel.cancel();
@@ -660,28 +566,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancellation_kills_the_exec_process_group_and_closes_the_connection() {
         for is_tty in [false, true] {
-            let request = ExecRequest {
-                argv: vec![
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    "sleep 600 & echo $!; wait".to_string(),
-                ],
-                as_root: false,
-                tty: is_tty.then_some(TermSize { rows: 24, cols: 80 }),
-                workdir: None,
-                env: BTreeMap::new(),
-            };
-            let (mut client, server) = UnixStream::pair().unwrap();
-            client.set_read_timeout(Some(HARNESS_TIMEOUT)).unwrap();
             let cancel = CancellationToken::new();
-            let agent = tokio::spawn(serve_exec(
-                crate::into_async_file(server).unwrap(),
-                true,
-                cancel.clone(),
-            ));
-            client
-                .write_all(&terra_protocol::encode_frame(&request).unwrap())
-                .unwrap();
+            let (mut client, agent) = start_exec(
+                &exec_request(&["sh", "-c", "sleep 600 & echo $!; wait"], is_tty),
+                &cancel,
+            );
             let Some(AgentOutput::Out(pid)) = terra_protocol::read_frame(&mut client).unwrap()
             else {
                 panic!("exec did not report its child pid");
@@ -711,27 +600,20 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pipe_exec_keeps_streams_and_bytes_intact() {
         let (out, err, code) = run_exec_request(
-            &["sh", "-c", "echo OUT; echo ERR >&2; exit 3"],
-            false,
+            &exec_request(&["sh", "-c", "echo OUT; echo ERR >&2; exit 3"], false),
             b"",
-            BTreeMap::new(),
         )
         .await;
         assert_eq!((out, err, code), (b"OUT\n".to_vec(), b"ERR\n".to_vec(), 3));
 
-        let (out, _, code) = run_exec_request(
-            &["printf", "a\nb\n"],
-            false,
-            b"unread input",
-            BTreeMap::new(),
-        )
-        .await;
+        let (out, _, code) =
+            run_exec_request(&exec_request(&["printf", "a\nb\n"], false), b"unread input").await;
         assert_eq!((out, code), (b"a\nb\n".to_vec(), 0));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pipe_exec_closes_stdin() {
-        let (out, _, code) = run_exec_request(&["cat"], false, b"payload\n", BTreeMap::new()).await;
+        let (out, _, code) = run_exec_request(&exec_request(&["cat"], false), b"payload\n").await;
         assert_eq!((out, code), (b"payload\n".to_vec(), 0));
     }
 
@@ -750,9 +632,8 @@ mod tests {
             crate::into_async_file(File::from(std::os::fd::OwnedFd::from(server))).unwrap();
         let pidfd = Arc::new(pidfd);
         let process = pidfd.clone();
-        let cancel = CancellationToken::new();
         let mut pump = tokio::spawn(async move {
-            pump_input(&mut server, stdin, false, &process, &monitor, cancel).await;
+            pump_input(&mut server, stdin, false, &process, &monitor).await;
         });
 
         client
@@ -774,13 +655,55 @@ mod tests {
             .unwrap();
     }
 
+    /// A child that never reads stdin leaves the input pump stuck writing once the pipe fills, so
+    /// no further frame is read; only the read-closed watch sees the host go and kills the child.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_disconnect_kills_a_child_whose_stdin_is_full() {
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("trap '' TERM; while :; do :; done")
+            .stdin(std::process::Stdio::piped());
+        let (mut child, pidfd) = crate::reap::spawn_owned(|| command.spawn()).unwrap();
+        let stdin = crate::into_async_file(child.stdin.take().unwrap()).unwrap();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let monitor = crate::into_async_fd(server.try_clone().unwrap()).unwrap();
+        let mut server =
+            crate::into_async_file(File::from(std::os::fd::OwnedFd::from(server))).unwrap();
+        let pidfd = Arc::new(pidfd);
+        let process = pidfd.clone();
+        let mut pump = tokio::spawn(async move {
+            pump_input(&mut server, stdin, false, &process, &monitor).await;
+        });
+
+        let host = std::thread::spawn(move || {
+            let frame =
+                terra_protocol::encode_frame(&ClientInput::Keys(vec![b'x'; 16 << 10])).unwrap();
+            for _ in 0..10 {
+                if client.write_all(&frame).is_err() {
+                    break;
+                }
+            }
+        });
+        tokio::time::timeout(HARNESS_TIMEOUT, &mut pump)
+            .await
+            .expect("the pump kept writing to a child that never reads")
+            .unwrap();
+        host.join().unwrap();
+        tokio::time::timeout(HARNESS_TIMEOUT, crate::reap::wait_owned(&pidfd))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tty_exec_gets_a_terminal_and_input() {
         let (out, err, code) = run_exec_request(
-            &["sh", "-c", "test -t 1 && echo yes; echo ERR >&2; exit 3"],
-            true,
+            &exec_request(
+                &["sh", "-c", "test -t 1 && echo yes; echo ERR >&2; exit 3"],
+                true,
+            ),
             b"",
-            BTreeMap::new(),
         )
         .await;
         let output = String::from_utf8_lossy(&out);
@@ -788,7 +711,7 @@ mod tests {
         assert_eq!(err, [] as [u8; 0]);
         assert_eq!(code, 3);
 
-        let (out, _, code) = run_exec_request(&["cat"], true, b"payload\n", BTreeMap::new()).await;
+        let (out, _, code) = run_exec_request(&exec_request(&["cat"], true), b"payload\n").await;
         assert!(
             out.windows(b"payload".len())
                 .any(|bytes| bytes == b"payload")
@@ -800,23 +723,23 @@ mod tests {
     async fn signal_exit_and_failed_start_report_codes() {
         for tty in [false, true] {
             let (_, _, code) =
-                run_exec_request(&["sh", "-c", "kill -TERM $$"], tty, b"", BTreeMap::new()).await;
+                run_exec_request(&exec_request(&["sh", "-c", "kill -TERM $$"], tty), b"").await;
             assert_eq!(code, 128 + rustix::process::Signal::TERM.as_raw());
         }
 
         let (out, err, code) =
-            run_exec_request(&["/no/such/command"], false, b"", BTreeMap::new()).await;
+            run_exec_request(&exec_request(&["/no/such/command"], false), b"").await;
         assert_eq!(code, EXEC_NOT_RUN);
         assert_eq!(out, [] as [u8; 0]);
         assert!(String::from_utf8_lossy(&err).contains("cannot run"));
 
         let (out, _, code) =
-            run_exec_request(&["/no/such/command"], true, b"", BTreeMap::new()).await;
+            run_exec_request(&exec_request(&["/no/such/command"], true), b"").await;
         assert_eq!(code, EXEC_NOT_RUN);
         assert!(String::from_utf8_lossy(&out).contains("cannot run"));
 
         assert_eq!(
-            run_exec_request(&[], false, b"", BTreeMap::new()).await.2,
+            run_exec_request(&exec_request(&[], false), b"").await.2,
             EXEC_NOT_RUN
         );
     }
@@ -824,24 +747,25 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn exec_sets_home_and_overlays_environment() {
         let (out, _, code) =
-            run_exec_request(&["sh", "-c", "echo $HOME"], false, b"", BTreeMap::new()).await;
+            run_exec_request(&exec_request(&["sh", "-c", "echo $HOME"], false), b"").await;
         assert_eq!((out, code), (b"/home/terri\n".to_vec(), 0));
 
         let mut env = BTreeMap::new();
         env.insert("SUPPLIED_VAR".to_string(), "from_exec".to_string());
         env.insert("HOME".to_string(), "/custom/exec/home".to_string());
         for tty in [false, true] {
-            let (out, _, code) = run_exec_request(
-                &[
-                    "sh",
-                    "-c",
-                    "echo $SUPPLIED_VAR; echo $HOME; test -n \"$PATH\" && echo has_path",
-                ],
-                tty,
-                b"",
-                env.clone(),
-            )
-            .await;
+            let request = ExecRequest {
+                env: env.clone(),
+                ..exec_request(
+                    &[
+                        "sh",
+                        "-c",
+                        "echo $SUPPLIED_VAR; echo $HOME; test -n \"$PATH\" && echo has_path",
+                    ],
+                    tty,
+                )
+            };
+            let (out, _, code) = run_exec_request(&request, b"").await;
             assert_eq!(code, 0);
             let output = String::from_utf8_lossy(&out);
             assert!(output.contains("from_exec"));
@@ -852,29 +776,12 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn buffered_and_fragmented_input_is_not_discarded() {
-        let req = ExecRequest {
-            argv: vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                "sleep .1; cat".to_string(),
-            ],
-            as_root: false,
-            tty: None,
-            workdir: None,
-            env: BTreeMap::new(),
-        };
         let first = vec![b'a'; 512 * 1024];
         let second = b"second frame".to_vec();
-        let (mut client, server) = UnixStream::pair().unwrap();
-        client.set_read_timeout(Some(HARNESS_TIMEOUT)).unwrap();
-        let agent = tokio::spawn(serve_exec(
-            crate::into_async_file(server).unwrap(),
-            true,
-            CancellationToken::new(),
-        ));
-        client
-            .write_all(&terra_protocol::encode_frame(&req).unwrap())
-            .unwrap();
+        let (mut client, agent) = start_exec(
+            &exec_request(&["sh", "-c", "sleep .1; cat"], false),
+            &CancellationToken::new(),
+        );
         client
             .write_all(&terra_protocol::encode_frame(&ClientInput::Keys(first.clone())).unwrap())
             .unwrap();

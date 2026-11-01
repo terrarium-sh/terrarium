@@ -1,13 +1,18 @@
+//! The diagnostic stream to the host: boot stages and agent messages, best effort and bounded.
+
 use std::fs::File;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use terra_protocol::control::MAX_DIAGNOSTIC_EVENT_BYTES;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
-pub(super) const CHUNK_BYTES: usize = 4096;
+const CHUNK_BYTES: usize = 4096;
+const _: () = assert!(CHUNK_BYTES <= MAX_DIAGNOSTIC_EVENT_BYTES);
 const QUEUE_BYTES: usize = 64 << 10;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(1);
+const FINISH_GRACE: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
-pub(super) struct Diagnostics {
+pub(crate) struct Diagnostics {
     sender: tokio::sync::mpsc::Sender<Vec<u8>>,
     tasks: TaskTracker,
     cancellation: CancellationToken,
@@ -15,7 +20,7 @@ pub(super) struct Diagnostics {
 }
 
 impl Diagnostics {
-    pub(super) fn new(writer: File) -> std::io::Result<Self> {
+    pub(crate) fn new(writer: File) -> std::io::Result<Self> {
         let (sender, mut receiver) =
             tokio::sync::mpsc::channel::<Vec<u8>>(QUEUE_BYTES / CHUNK_BYTES);
         let mut writer = crate::into_async_file(writer)?;
@@ -26,7 +31,7 @@ impl Diagnostics {
             worker_cancellation
                 .run_until_cancelled(async move {
                     while let Some(bytes) = receiver.recv().await {
-                        if write(&mut writer, &bytes).await.is_err() {
+                        if write(&mut writer, bytes).await.is_err() {
                             break;
                         }
                     }
@@ -42,7 +47,7 @@ impl Diagnostics {
         })
     }
 
-    pub(super) fn record(&self, bytes: &[u8]) {
+    pub(crate) fn record(&self, bytes: &[u8]) {
         for bytes in bytes.chunks(CHUNK_BYTES) {
             if self.sender.try_send(bytes.to_vec()).is_err() {
                 break;
@@ -50,7 +55,7 @@ impl Diagnostics {
         }
     }
 
-    pub(super) fn record_boot_stage(&self, stage: &str) {
+    pub(crate) fn record_boot_stage(&self, stage: &str) {
         self.record(
             format!(
                 "terra boot_stage={stage} unix_time_ns={} agent_elapsed_ns={}\n",
@@ -64,23 +69,19 @@ impl Diagnostics {
         );
     }
 
-    pub(super) async fn finish(self) {
-        let Self {
-            sender,
-            tasks,
-            cancellation,
-            started: _,
-        } = self;
-        drop(sender);
-        crate::wait_for_tasks_or_cancel(&tasks, &cancellation, Duration::from_secs(1)).await;
+    pub(crate) async fn finish(self) {
+        drop(self.sender);
+        if tokio::time::timeout(FINISH_GRACE, self.tasks.wait())
+            .await
+            .is_err()
+        {
+            self.cancellation.cancel();
+            self.tasks.wait().await;
+        }
     }
 }
 
-pub(super) async fn write(writer: &mut crate::AsyncFile, bytes: &[u8]) -> std::io::Result<()> {
-    let bytes = bytes[..bytes
-        .len()
-        .min(terra_protocol::control::MAX_DIAGNOSTIC_EVENT_BYTES)]
-        .to_vec();
+pub(crate) async fn write(writer: &mut crate::AsyncFile, bytes: Vec<u8>) -> std::io::Result<()> {
     tokio::time::timeout(
         WRITE_TIMEOUT,
         terra_protocol::write_frame_async(
@@ -94,7 +95,7 @@ pub(super) async fn write(writer: &mut crate::AsyncFile, bytes: &[u8]) -> std::i
 
 #[cfg(test)]
 mod tests {
-    use crate::diagnostics::{CHUNK_BYTES as DIAGNOSTIC_CHUNK_BYTES, Diagnostics};
+    use super::*;
     use std::fs::File;
     use std::os::fd::OwnedFd;
     use std::os::unix::net::UnixStream;
@@ -120,7 +121,7 @@ mod tests {
     async fn diagnostics_finish_bounds_a_stalled_sink() {
         let (stream, _peer) = UnixStream::pair().unwrap();
         let diagnostic = Diagnostics::new(File::from(OwnedFd::from(stream))).unwrap();
-        let bytes = vec![b'x'; DIAGNOSTIC_CHUNK_BYTES];
+        let bytes = vec![b'x'; CHUNK_BYTES];
         let fill_until = std::time::Instant::now() + Duration::from_millis(100);
         while std::time::Instant::now() < fill_until {
             diagnostic.record(&bytes);

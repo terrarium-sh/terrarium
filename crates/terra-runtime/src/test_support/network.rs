@@ -11,7 +11,7 @@ use crate::box_runtime::{BoxHost, BoxRuntime};
 use crate::component::network::{NetworkBackend, PortMapping};
 use crate::component::vsock::streams::{FrontendStreams, StreamEndpoint};
 use crate::memory::GuestRam;
-use terra_protocol::application::{Message, TcpKeepalive, TcpOpenOptions, TcpTarget};
+use terra_protocol::application::{DnsTransport, Message, TcpKeepalive, TcpOpenOptions, TcpTarget};
 use terra_protocol::socket::{self, Error};
 use terra_protocol::vsock::{
     AGENT_PORT, CONTROL_PORT, FLOW_REPLY_BYTES, PUBLICATION_PORT, TCP_PORT, UDP_PORT,
@@ -1180,7 +1180,9 @@ impl GuestNetwork {
             .send_with_flags(stream.0, stream.1, 4, 3, 0, &[])
             .await?;
         self.stream.reset(stream).await?;
-        let bytes = self.resolve(false, dns_query("loopback.test")?).await?;
+        let bytes = self
+            .resolve(DnsTransport::Datagram, dns_query("loopback.test")?)
+            .await?;
         wasmtime::ensure!(
             bytes.ends_with(&Ipv4Addr::LOCALHOST.octets()),
             "the frontend keeps serving after a guest closes and resets a TCP stream"
@@ -1471,27 +1473,42 @@ impl GuestNetwork {
         Ok(())
     }
 
-    async fn query_dns(&mut self, stream: bool, bytes: Vec<u8>) -> wasmtime::Result<u32> {
+    async fn query_dns(
+        &mut self,
+        transport: DnsTransport,
+        bytes: Vec<u8>,
+    ) -> wasmtime::Result<u32> {
         let id = self.next_query;
         self.next_query += 1;
-        self.stream
-            .send_message(CONTROL, &Message::DnsQuery { id, stream, bytes })
-            .await?;
+        let query = Message::DnsQuery {
+            id,
+            transport,
+            bytes,
+        };
+        self.stream.send_message(CONTROL, &query).await?;
         Ok(id)
     }
 
-    async fn read_dns(&mut self) -> wasmtime::Result<(u32, bool, Vec<u8>)> {
+    async fn read_dns(&mut self) -> wasmtime::Result<(u32, DnsTransport, Vec<u8>)> {
         match self.stream.read_message(CONTROL).await? {
-            Message::DnsResult { id, stream, bytes } => Ok((id, stream, bytes)),
+            Message::DnsResult {
+                id,
+                transport,
+                bytes,
+            } => Ok((id, transport, bytes)),
             other => wasmtime::bail!("unexpected control message {other:?}"),
         }
     }
 
-    async fn resolve(&mut self, stream: bool, bytes: Vec<u8>) -> wasmtime::Result<Vec<u8>> {
-        let id = self.query_dns(stream, bytes).await?;
-        let (answered, answered_stream, bytes) = self.read_dns().await?;
+    async fn resolve(
+        &mut self,
+        transport: DnsTransport,
+        bytes: Vec<u8>,
+    ) -> wasmtime::Result<Vec<u8>> {
+        let id = self.query_dns(transport, bytes).await?;
+        let (answered, answered_transport, bytes) = self.read_dns().await?;
         wasmtime::ensure!(
-            answered == id && answered_stream == stream,
+            answered == id && answered_transport == transport,
             "DNS result identity"
         );
         Ok(bytes)
@@ -1500,22 +1517,28 @@ impl GuestNetwork {
     async fn exercise_dns(&mut self) -> wasmtime::Result<()> {
         let mut pending = VecDeque::new();
         for _ in 0..6 {
-            pending.push_back(self.query_dns(false, dns_query("loopback.test")?).await?);
+            pending.push_back(
+                self.query_dns(DnsTransport::Datagram, dns_query("loopback.test")?)
+                    .await?,
+            );
         }
         while !pending.is_empty() {
-            let (id, stream, bytes) = self.read_dns().await?;
+            let (id, transport, bytes) = self.read_dns().await?;
             let position = pending
                 .iter()
                 .position(|query| *query == id)
                 .ok_or_else(|| wasmtime::Error::msg("unknown DNS result identity"))?;
             pending.remove(position);
             wasmtime::ensure!(
-                !stream && bytes.ends_with(&Ipv4Addr::LOCALHOST.octets()),
+                transport == DnsTransport::Datagram
+                    && bytes.ends_with(&Ipv4Addr::LOCALHOST.octets()),
                 "concurrent DNS broker result"
             );
         }
         for (name, code) in [("loopback.test", 0), ("localhost", 2), ("denied.test", 3)] {
-            let bytes = self.resolve(false, dns_query(name)?).await?;
+            let bytes = self
+                .resolve(DnsTransport::Datagram, dns_query(name)?)
+                .await?;
             wasmtime::ensure!(
                 bytes.len() >= 12 && bytes[..2] == [0x12, 0x34] && bytes[3] & 15 == code,
                 "broker-authorized DNS response for {name}"
@@ -1524,7 +1547,7 @@ impl GuestNetwork {
         let query = dns_query("loopback.test")?;
         let mut bytes = u16::try_from(query.len())?.to_be_bytes().to_vec();
         bytes.extend(query);
-        let bytes = self.resolve(true, bytes).await?;
+        let bytes = self.resolve(DnsTransport::Stream, bytes).await?;
         wasmtime::ensure!(
             usize::from(u16::from_be_bytes(bytes[..2].try_into()?)) == bytes.len() - 2
                 && bytes.ends_with(&Ipv4Addr::LOCALHOST.octets()),
@@ -1535,14 +1558,14 @@ impl GuestNetwork {
 
     async fn exercise_dns_fallback(&mut self) -> wasmtime::Result<()> {
         let query = dns_query("many.test")?;
-        let bytes = self.resolve(false, query.clone()).await?;
+        let bytes = self.resolve(DnsTransport::Datagram, query.clone()).await?;
         wasmtime::ensure!(
             bytes.len() == query.len() && bytes[2] & 2 != 0 && bytes[6..12] == [0; 6],
             "DNS truncation requests TCP fallback"
         );
         let mut framed = u16::try_from(query.len())?.to_be_bytes().to_vec();
         framed.extend(&query);
-        let bytes = self.resolve(true, framed).await?;
+        let bytes = self.resolve(DnsTransport::Stream, framed).await?;
         wasmtime::ensure!(
             bytes.len() == 2 + query.len() + 32 * 16
                 && bytes[8..10] == 32_u16.to_be_bytes()

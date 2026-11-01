@@ -1,63 +1,58 @@
-//! The unprivileged workload user: its IDs, and running processes as it.
+//! The guest user a workload runs as, and handing processes and files to it.
 
-use anyhow::Result;
-use pty_process::blocking::{Command as PtyCommand, Pty};
-use terra_protocol::{TermSize, WORKLOAD_ID};
+use rustix::process::{Gid, Uid};
+use terra_protocol::{Plan, WORKLOAD_ID};
 
-pub(crate) fn spawn_on_pty(
-    cmd: &str,
-    args: &[String],
-    term: TermSize,
-    as_root: bool,
-    workdir: Option<&str>,
-    env: &std::collections::BTreeMap<String, String>,
-) -> Result<(Pty, crate::reap::OwnedPidfd)> {
-    let (pty, pts) = pty_process::blocking::open()?;
-    let (rows, cols) = crate::term::session::clamp_term_size(term.rows, term.cols);
-    pty.resize(pty_process::Size::new(rows, cols))?;
-    let mut command = PtyCommand::new(cmd)
-        .args(args)
-        .env("HOME", terra_protocol::WORKLOAD_HOME);
-    if let Some(workdir) = workdir {
-        command = command.current_dir(workdir);
-    }
-    for (key, value) in env {
-        command = command.env(key, value);
-    }
-    if !as_root {
-        command = run_pty_command_as_workload(command);
-    }
-    let (_child, child_pidfd) = crate::reap::spawn_owned(|| command.spawn(pts))?;
-    Ok((pty, child_pidfd))
+const WORKLOAD_UID: Uid = Uid::from_raw_unchecked(WORKLOAD_ID);
+const WORKLOAD_GID: Gid = Gid::from_raw_unchecked(WORKLOAD_ID);
+
+/// The account a workload process runs as; the agent itself runs as root.
+#[derive(Clone, Copy)]
+pub(crate) enum GuestUser {
+    Root,
+    Workload,
 }
 
-pub(crate) fn workload_owner() -> (Option<rustix::process::Uid>, Option<rustix::process::Gid>) {
-    (
-        Some(rustix::process::Uid::from_raw(WORKLOAD_ID)),
-        Some(rustix::process::Gid::from_raw(WORKLOAD_ID)),
-    )
+impl GuestUser {
+    pub(crate) const fn from_plan(plan: &Plan) -> Self {
+        if plan.root {
+            Self::Root
+        } else {
+            Self::Workload
+        }
+    }
+}
+
+/// Gives `created`, which the agent made as root, to `user`. Handing it to root changes nothing,
+/// and a share refuses a chown to root.
+pub(crate) fn hand_over(created: impl std::os::fd::AsFd, user: GuestUser) -> std::io::Result<()> {
+    match user {
+        GuestUser::Root => Ok(()),
+        GuestUser::Workload => Ok(rustix::fs::fchown(
+            created,
+            Some(WORKLOAD_UID),
+            Some(WORKLOAD_GID),
+        )?),
+    }
 }
 
 #[allow(unsafe_code)]
-pub(crate) fn run_as_workload(command: &mut std::process::Command) {
+pub(crate) fn run_as(command: &mut std::process::Command, user: GuestUser) {
     use std::os::unix::process::CommandExt as _;
 
-    // SAFETY: a post-fork/pre-exec hook that only calls async-signal-safe
-    // id-setting syscalls.
-    unsafe {
-        command.pre_exec(drop_privileges);
+    match user {
+        GuestUser::Root => {}
+        // SAFETY: a post-fork/pre-exec hook that only calls async-signal-safe
+        // id-setting syscalls.
+        GuestUser::Workload => unsafe {
+            command.pre_exec(drop_privileges);
+        },
     }
-}
-
-#[allow(unsafe_code)]
-pub(crate) fn run_pty_command_as_workload(command: PtyCommand) -> PtyCommand {
-    // SAFETY: as in `run_as_workload`.
-    unsafe { command.pre_exec(drop_privileges) }
 }
 
 fn drop_privileges() -> std::io::Result<()> {
     rustix::thread::set_thread_groups(&[])?;
-    rustix::thread::set_thread_gid(rustix::process::Gid::from_raw(WORKLOAD_ID))?;
-    rustix::thread::set_thread_uid(rustix::process::Uid::from_raw(WORKLOAD_ID))?;
+    rustix::thread::set_thread_gid(WORKLOAD_GID)?;
+    rustix::thread::set_thread_uid(WORKLOAD_UID)?;
     Ok(())
 }

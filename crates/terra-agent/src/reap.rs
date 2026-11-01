@@ -1,29 +1,24 @@
 //! PID 1's orphan reaper.
 
-use crate::mutex::lock_or_abort;
+use crate::lock_or_abort;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
-#[cfg(test)]
-use std::process::Command;
-use std::process::{Child, ExitStatus};
+use std::process::{Child, Command, ExitStatus};
 use std::sync::{Arc, Mutex};
-#[cfg(test)]
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
+
+/// Where the reaper leaves an owned child's status if it collects it first.
+type ExitSlot = Arc<Mutex<Option<ExitStatus>>>;
 
 struct OwnedChild {
     pid: rustix::process::Pid,
-    status: Arc<Mutex<Option<ExitStatus>>>,
+    status: ExitSlot,
 }
 
-pub struct OwnedPidfd {
+pub(crate) struct OwnedPidfd {
     pidfd: OwnedFd,
     leader: rustix::process::Pid,
-    status: Arc<Mutex<Option<ExitStatus>>>,
-}
-
-impl OwnedPidfd {
-    pub fn try_clone(&self) -> std::io::Result<OwnedFd> {
-        self.pidfd.try_clone()
-    }
+    status: ExitSlot,
 }
 
 impl AsFd for OwnedPidfd {
@@ -33,12 +28,12 @@ impl AsFd for OwnedPidfd {
 }
 
 impl OwnedPidfd {
-    pub fn leader(&self) -> rustix::process::Pid {
+    pub(crate) fn leader(&self) -> rustix::process::Pid {
         self.leader
     }
 
     /// Signals the process group while preventing the orphan reaper from releasing its leader PID.
-    pub fn signal_group(&self, sig: rustix::process::Signal) {
+    pub(crate) fn signal_group(&self, sig: rustix::process::Signal) {
         let owned = lock_or_abort(&OWNED);
         if lock_or_abort(&self.status).is_none()
             && owned
@@ -51,9 +46,9 @@ impl OwnedPidfd {
         let _ = rustix::process::pidfd_send_signal(self, sig);
     }
 
-    pub async fn stop_gracefully(&self, grace: std::time::Duration) {
+    pub(crate) async fn stop_gracefully(&self, grace: std::time::Duration) {
         let _ = rustix::process::pidfd_send_signal(self, rustix::process::Signal::TERM);
-        let ready = self.try_clone().and_then(crate::into_async_fd);
+        let ready = self.pidfd.try_clone().and_then(crate::into_async_fd);
         if let Ok(ready) = ready
             && matches!(
                 tokio::time::timeout(grace, ready.readable()).await,
@@ -68,10 +63,7 @@ impl OwnedPidfd {
 
 static OWNED: Mutex<Vec<OwnedChild>> = Mutex::new(Vec::new());
 
-fn register_owned(
-    owned: &mut Vec<OwnedChild>,
-    pid: rustix::process::Pid,
-) -> Arc<Mutex<Option<ExitStatus>>> {
+fn register_owned(owned: &mut Vec<OwnedChild>, pid: rustix::process::Pid) -> ExitSlot {
     let status = Arc::new(Mutex::new(None));
     owned.retain(|owned_child| owned_child.pid != pid);
     owned.push(OwnedChild {
@@ -82,7 +74,9 @@ fn register_owned(
 }
 
 /// Spawns a child whose exit status is preserved even if reaped by the orphan reaper.
-pub fn spawn_owned<E>(spawn: impl FnOnce() -> Result<Child, E>) -> Result<(Child, OwnedPidfd), E>
+pub(crate) fn spawn_owned<E>(
+    spawn: impl FnOnce() -> Result<Child, E>,
+) -> Result<(Child, OwnedPidfd), E>
 where
     E: From<std::io::Error>,
 {
@@ -109,8 +103,33 @@ where
     ))
 }
 
-pub async fn wait_owned(pidfd: &OwnedPidfd) -> std::io::Result<ExitStatus> {
-    let pidfd_ready = crate::into_async_fd(pidfd.try_clone()?)?;
+/// Runs `command` in its own process group; a timeout or cancellation kills the group, reaps it,
+/// and becomes the error.
+pub(crate) async fn run_or_kill(
+    command: &mut Command,
+    timeout: Duration,
+    cancellation: &CancellationToken,
+) -> std::io::Result<ExitStatus> {
+    use std::os::unix::process::CommandExt as _;
+
+    let (_child, pidfd) = spawn_owned(|| command.process_group(0).spawn())?;
+    let interruption = tokio::select! {
+        status = wait_owned(&pidfd) => return status,
+        () = cancellation.cancelled() => {
+            std::io::Error::new(std::io::ErrorKind::Interrupted, "command cancelled")
+        }
+        () = tokio::time::sleep(timeout) => std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("timed out after {timeout:?}"),
+        ),
+    };
+    pidfd.signal_group(rustix::process::Signal::KILL);
+    let _ = wait_owned(&pidfd).await;
+    Err(interruption)
+}
+
+pub(crate) async fn wait_owned(pidfd: &OwnedPidfd) -> std::io::Result<ExitStatus> {
+    let pidfd_ready = crate::into_async_fd(pidfd.pidfd.try_clone()?)?;
     loop {
         if let Some(status) = collect_status(pidfd)? {
             return Ok(status);
@@ -127,33 +146,34 @@ fn collect_status(pidfd: &OwnedPidfd) -> std::io::Result<Option<ExitStatus>> {
     use std::os::unix::process::ExitStatusExt;
 
     let mut owned = lock_or_abort(&OWNED);
-    if let Some(status) = lock_or_abort(&pidfd.status).take() {
-        owned.retain(|child| !Arc::ptr_eq(&child.status, &pidfd.status));
-        return Ok(Some(status));
-    }
-    match rustix::process::waitid(
-        rustix::process::WaitId::PidFd(pidfd.as_fd()),
-        rustix::process::WaitIdOptions::EXITED | rustix::process::WaitIdOptions::NOHANG,
-    ) {
-        Ok(Some(status)) => {
-            let raw = status
-                .exit_status()
-                .map(|code| code << 8)
-                .or_else(|| {
-                    status
-                        .terminating_signal()
-                        .map(|signal| signal | if status.dumped() { 0x80 } else { 0 })
-                })
-                .ok_or_else(|| std::io::Error::other("child exited without a status"))?;
-            owned.retain(|child| !Arc::ptr_eq(&child.status, &pidfd.status));
-            Ok(Some(ExitStatus::from_raw(raw)))
-        }
-        Ok(None) | Err(rustix::io::Errno::CHILD) => Ok(None),
-        Err(error) => Err(error.into()),
-    }
+    let reaped = lock_or_abort(&pidfd.status).take();
+    let status = match reaped {
+        Some(status) => status,
+        None => match rustix::process::waitid(
+            rustix::process::WaitId::PidFd(pidfd.as_fd()),
+            rustix::process::WaitIdOptions::EXITED | rustix::process::WaitIdOptions::NOHANG,
+        ) {
+            Ok(Some(status)) => {
+                let raw = status
+                    .exit_status()
+                    .map(|code| code << 8)
+                    .or_else(|| {
+                        status
+                            .terminating_signal()
+                            .map(|signal| signal | if status.dumped() { 0x80 } else { 0 })
+                    })
+                    .ok_or_else(|| std::io::Error::other("child exited without a status"))?;
+                ExitStatus::from_raw(raw)
+            }
+            Ok(None) | Err(rustix::io::Errno::CHILD) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        },
+    };
+    owned.retain(|child| !Arc::ptr_eq(&child.status, &pidfd.status));
+    Ok(Some(status))
 }
 
-pub async fn watch_orphans(cancellation: tokio_util::sync::CancellationToken) {
+pub(crate) async fn watch_orphans(cancellation: CancellationToken) {
     let Ok(mut signals) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())
     else {
         return;
@@ -272,5 +292,55 @@ mod tests {
         .await
         .unwrap();
         wait_owned(&pidfd).await.unwrap();
+    }
+
+    fn shell(line: &str) -> Command {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(line);
+        command
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_wedged_process_is_killed_and_reported_as_timed_out() {
+        let start = std::time::Instant::now();
+        let error = run_or_kill(
+            &mut shell("sleep 600"),
+            Duration::from_millis(300),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "waited {:?} on a process that never returns",
+            start.elapsed()
+        );
+    }
+
+    /// The command gets its own process group even when the caller forgot it, so the kill
+    /// reaches what the command started.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_timed_out_process_takes_its_children_with_it() {
+        let pid_file = crate::create_scratch_path("reap", "child");
+        let _ = std::fs::remove_file(&pid_file);
+        let mut command = shell(&format!(
+            "sleep 600 & echo $! > {}; wait",
+            pid_file.display()
+        ));
+        let cancellation = CancellationToken::new();
+        let running = run_or_kill(&mut command, Duration::from_millis(500), &cancellation);
+        let _ = tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .expect("the kill missed the command's process group");
+        let pid = crate::read_pid_file(&pid_file).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while rustix::process::test_kill_process(pid).is_ok()
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(rustix::process::test_kill_process(pid).is_err());
+        let _ = std::fs::remove_file(pid_file);
     }
 }

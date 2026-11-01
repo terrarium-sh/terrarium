@@ -1,6 +1,7 @@
+use crate::mounts::{DATA_MOUNT_FLAGS, mount, mount_with_data};
+use crate::workload::GuestUser;
 use anyhow::{Context, Result, bail};
 use rustix::mount::{MountFlags, MountPropagationFlags};
-use std::ffi::CStr;
 use std::fs::{self, File};
 use std::io::{Seek, SeekFrom, Write as _};
 use std::os::unix::fs::{DirBuilderExt as _, FileExt, OpenOptionsExt as _, PermissionsExt};
@@ -18,23 +19,22 @@ use terra_protocol::{
 const CLEAN_MOUNT: &str = "/mnt/clean";
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
-pub(super) fn enter_root() -> Result<(Plan, crate::mux::Streams)> {
+pub(crate) fn enter_root() -> Result<(Plan, crate::mux::Streams)> {
     const NEWROOT: &str = "/mnt/root";
 
-    mount(None, "/proc", Some("proc"), MountFlags::empty()).context("mounting /proc")?;
-    mount(None, "/sys", Some("sysfs"), MountFlags::empty()).context("mounting /sys")?;
+    mount("proc", "/proc", "proc", MountFlags::empty())?;
+    mount("sysfs", "/sys", "sysfs", MountFlags::empty())?;
     fs::set_permissions("/dev/net/tun", fs::Permissions::from_mode(0o666))
         .context("enabling rootless guest networking on /dev/net/tun")?;
     fs::create_dir_all("/dev/pts")?;
-    mount(None, "/dev/pts", Some("devpts"), MountFlags::empty()).context("mounting /dev/pts")?;
+    mount("devpts", "/dev/pts", "devpts", MountFlags::empty())?;
     fs::create_dir_all("/dev/shm")?;
     for (target, fstype) in [("/dev/shm", "tmpfs"), ("/sys/fs/cgroup", "cgroup2")] {
-        if let Err(e) = mount(None, target, Some(fstype), MountFlags::empty()) {
+        if let Err(e) = mount(fstype, target, fstype, MountFlags::empty()) {
             eprintln!("terra-agent: warning: could not mount {target}: {e:#}");
         }
     }
-    mount(None, "/mnt", Some("tmpfs"), MountFlags::empty())
-        .context("mounting the staging tmpfs")?;
+    mount("tmpfs", "/mnt", "tmpfs", MountFlags::empty()).context("mounting the staging tmpfs")?;
     fs::create_dir_all(NEWROOT)?;
     fs::create_dir_all(CLEAN_MOUNT)?;
 
@@ -57,13 +57,8 @@ pub(super) fn enter_root() -> Result<(Plan, crate::mux::Streams)> {
     for directory in ["proc", "sys", "dev"] {
         let source = format!("/{directory}");
         let target = format!("{NEWROOT}/{directory}");
-        mount(
-            Some(&source),
-            &target,
-            None,
-            MountFlags::BIND | MountFlags::REC,
-        )
-        .with_context(|| format!("binding /{directory} into the guest root"))?;
+        mount(&source, &target, "", MountFlags::BIND | MountFlags::REC)
+            .with_context(|| format!("binding /{directory} into the guest root"))?;
     }
     std::env::set_current_dir(NEWROOT).context("entering the guest root")?;
     rustix::process::pivot_root(".", ".").context("switching to the guest root")?;
@@ -76,13 +71,12 @@ pub(super) fn enter_root() -> Result<(Plan, crate::mux::Streams)> {
     )
     .context("making guest mounts shared for rootless containers")?;
     fs::create_dir_all("/run")?;
-    mount(
-        None,
-        "/run",
-        Some("tmpfs"),
-        MountFlags::NOSUID | MountFlags::NODEV,
-    )?;
+    mount("tmpfs", "/run", "tmpfs", DATA_MOUNT_FLAGS)?;
     fs::set_permissions("/run", fs::Permissions::from_mode(0o755))?;
+    match GuestUser::from_plan(&plan) {
+        GuestUser::Workload => prepare_workload_runtime_dir()?,
+        GuestUser::Root => {}
+    }
     match plan.rootfs {
         RootfsMount::ReadOnly => mount_scratch_directories()?,
         RootfsMount::Writable | RootfsMount::Overlay { .. } => {}
@@ -93,7 +87,7 @@ pub(super) fn enter_root() -> Result<(Plan, crate::mux::Streams)> {
 
 fn mount_guest_root(rootfs: &RootfsMount, new_root: &str) -> Result<()> {
     let mount_image = |target: &str, flags: MountFlags| {
-        mount(Some(ROOT_DEVICE), target, Some("ext4"), flags).with_context(|| {
+        mount(ROOT_DEVICE, target, "ext4", flags).with_context(|| {
             if flags.contains(MountFlags::RDONLY) {
                 format!(
                     "mounting the read-only guest rootfs image ({ROOT_DEVICE}); its journal may need replay - run `terra <box> setup --rebuild`"
@@ -109,13 +103,8 @@ fn mount_guest_root(rootfs: &RootfsMount, new_root: &str) -> Result<()> {
         RootfsMount::Overlay { upper_dev } => {
             fs::create_dir_all("/mnt/upper")?;
             fs::create_dir_all("/mnt/lower")?;
-            mount(
-                Some(upper_dev),
-                "/mnt/upper",
-                Some("ext4"),
-                MountFlags::empty(),
-            )
-            .with_context(|| format!("mounting the rootfs overlay volume ({upper_dev})"))?;
+            mount(upper_dev, "/mnt/upper", "ext4", MountFlags::empty())
+                .with_context(|| format!("mounting the rootfs overlay volume ({upper_dev})"))?;
             for directory in ["/mnt/upper/upper", "/mnt/upper/work"] {
                 fs::create_dir_all(directory).with_context(|| {
                     format!("preparing the rootfs overlay volume ({upper_dev})")
@@ -123,9 +112,9 @@ fn mount_guest_root(rootfs: &RootfsMount, new_root: &str) -> Result<()> {
             }
             mount_image("/mnt/lower", MountFlags::RDONLY)?;
             mount_with_data(
-                None,
+                "overlay",
                 new_root,
-                Some("overlay"),
+                "overlay",
                 MountFlags::empty(),
                 c"lowerdir=/mnt/lower,upperdir=/mnt/upper/upper,workdir=/mnt/upper/work",
             )
@@ -136,12 +125,7 @@ fn mount_guest_root(rootfs: &RootfsMount, new_root: &str) -> Result<()> {
 
 fn mount_scratch_directories() -> Result<()> {
     for target in ["/tmp", "/var/tmp"] {
-        mount(
-            None,
-            target,
-            Some("tmpfs"),
-            MountFlags::NOSUID | MountFlags::NODEV,
-        )?;
+        mount("tmpfs", target, "tmpfs", DATA_MOUNT_FLAGS)?;
         fs::set_permissions(target, fs::Permissions::from_mode(0o1777))?;
     }
     Ok(())
@@ -231,7 +215,7 @@ fn parse_superblock_span(superblock: &[u8], device_bytes: u64, page_size: u64) -
 /// Remounts the volumes and the root read-only so the next boot mounts them without a
 /// journal replay. A run boot leaves a busy filesystem as it is; a Create boot kills leftover
 /// processes first and fails if the root stays writable.
-pub(super) fn leave_filesystems_clean(plan: &Plan) -> Result<()> {
+pub(crate) fn leave_filesystems_clean(plan: &Plan) -> Result<()> {
     let is_create = plan.mode == PlanMode::Create;
     if is_create {
         // Linux skips the caller and init, so only leftover guest processes die.
@@ -244,7 +228,7 @@ pub(super) fn leave_filesystems_clean(plan: &Plan) -> Result<()> {
     for volume in &plan.volumes {
         let _ = rustix::mount::mount_remount(
             volume.guest.as_str(),
-            crate::config::VOLUME_MOUNT_FLAGS | MountFlags::RDONLY,
+            DATA_MOUNT_FLAGS | MountFlags::RDONLY,
             "",
         );
     }
@@ -271,16 +255,13 @@ fn grow_filesystem(device: &str) {
     if filesystem_already_spans_device(device) {
         return;
     }
-    if let Err(error) = mount(Some(device), CLEAN_MOUNT, Some("ext4"), MountFlags::empty()) {
+    if let Err(error) = mount(device, CLEAN_MOUNT, "ext4", MountFlags::empty()) {
         eprintln!("terra-agent: warning: {device} would not mount ({error:#}) - skipping resize");
         return;
     }
-    if let Err(error) = rustix::mount::unmount(CLEAN_MOUNT, rustix::mount::UnmountFlags::empty())
-        .map_err(std::io::Error::from)
-        .with_context(|| format!("umount {CLEAN_MOUNT}"))
-    {
+    if let Err(error) = rustix::mount::unmount(CLEAN_MOUNT, rustix::mount::UnmountFlags::empty()) {
         eprintln!(
-            "terra-agent: warning: could not unmount {CLEAN_MOUNT} ({error:#}) - skipping resize"
+            "terra-agent: warning: could not unmount {CLEAN_MOUNT} ({error}) - skipping resize"
         );
         let _ = rustix::mount::unmount(CLEAN_MOUNT, rustix::mount::UnmountFlags::DETACH);
         return;
@@ -357,7 +338,7 @@ fn apply_host_state(plan: &Plan) -> Result<()> {
             .context("waiting for the guest CSPRNG")?;
     }
     if let Some(time) = plan.host_time {
-        synchronize_clock(time.seconds, time.nanoseconds, true)?;
+        set_clock(time.seconds, time.nanoseconds)?;
     }
     Ok(())
 }
@@ -390,13 +371,9 @@ fn credit_entropy(seed: &[u8; 32]) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn synchronize_clock(seconds: i64, nanoseconds: u32, bootstrap: bool) -> Result<()> {
+fn set_clock(seconds: i64, nanoseconds: u32) -> Result<()> {
     if nanoseconds >= 1_000_000_000 {
         bail!("invalid host clock sample");
-    }
-    let current = rustix::time::clock_gettime(rustix::time::ClockId::Realtime);
-    if !bootstrap && current.tv_sec.abs_diff(seconds) < 5 {
-        return Ok(());
     }
     rustix::time::clock_settime(
         rustix::time::ClockId::Realtime,
@@ -410,7 +387,7 @@ pub(super) fn synchronize_clock(seconds: i64, nanoseconds: u32, bootstrap: bool)
     Ok(())
 }
 
-pub(super) async fn read_clock_update(reader: &mut crate::AsyncFile) -> Result<()> {
+pub(crate) async fn read_clock_update(reader: &mut crate::AsyncFile) -> Result<()> {
     use tokio::io::AsyncReadExt as _;
     let mut bytes = [0; CLOCK_SYNC_BYTES];
     bytes[0] = CLOCK_SYNC;
@@ -420,39 +397,22 @@ pub(super) async fn read_clock_update(reader: &mut crate::AsyncFile) -> Result<(
         .context("reading clock update")?;
     let (seconds, nanoseconds) = terra_protocol::decode_clock_sync(&bytes)
         .ok_or_else(|| anyhow::anyhow!("invalid clock update"))?;
-    synchronize_clock(seconds, nanoseconds, false)
+    let current = rustix::time::clock_gettime(rustix::time::ClockId::Realtime);
+    if current.tv_sec.abs_diff(seconds) < 5 {
+        return Ok(());
+    }
+    set_clock(seconds, nanoseconds)
 }
 
-pub(super) fn mount(
-    source: Option<&str>,
-    target: &str,
-    fstype: Option<&str>,
-    flags: MountFlags,
-) -> Result<()> {
-    let data = if fstype == Some("ext4") && !flags.contains(MountFlags::RDONLY) {
-        c"discard"
-    } else {
-        c""
-    };
-    mount_with_data(source, target, fstype, flags, data)
-}
-
-fn mount_with_data(
-    source: Option<&str>,
-    target: &str,
-    fstype: Option<&str>,
-    flags: MountFlags,
-    data: &CStr,
-) -> Result<()> {
-    rustix::mount::mount(
-        source.unwrap_or("none"),
-        target,
-        fstype.unwrap_or("none"),
-        flags,
-        data,
-    )
-    .map_err(std::io::Error::from)
-    .with_context(|| format!("mounting {target}"))
+#[allow(unsafe_code)]
+fn prepare_workload_runtime_dir() -> Result<()> {
+    let runtime_dir = format!("/run/user/{WORKLOAD_ID}");
+    fs::create_dir_all(&runtime_dir).with_context(|| format!("creating {runtime_dir}"))?;
+    fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o700))?;
+    crate::workload::hand_over(File::open(&runtime_dir)?, GuestUser::Workload)?;
+    // SAFETY: no other thread touches the environment yet.
+    unsafe { std::env::set_var("XDG_RUNTIME_DIR", runtime_dir) };
+    Ok(())
 }
 
 #[allow(unsafe_code)]
@@ -469,10 +429,6 @@ fn setup_env(plan: &Plan) {
             std::env::set_var(key, value);
         }
         std::env::set_var("HOME", terra_protocol::WORKLOAD_HOME);
-        std::env::set_var(
-            "XDG_RUNTIME_DIR",
-            format!("/run/user/{}", terra_protocol::WORKLOAD_ID),
-        );
     }
     let _ = rustix::system::sethostname(plan.hostname.as_bytes());
 }

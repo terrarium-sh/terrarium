@@ -18,7 +18,6 @@ libc.workspace = true
 linux-raw-sys = { workspace = true, features = ["ioctl", "net", "vm_sockets"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
 tokio-util = { version = "0.7", features = ["rt", "compat"] }
-async-io = "2.6"
 pty-process = "0.5"
 rustix.workspace = true
 # Terminal screen model so a client attaching to a running TUI gets repainted

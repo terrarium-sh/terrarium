@@ -128,12 +128,15 @@ fn bake_hook_output_uses_the_console_and_agent_diagnostics_use_the_log() {
     assert!(output.contains("BAKE_STDERR"), "{output}");
     let diagnostics = fixture.diagnostics();
     assert!(
-        diagnostics.contains("agent received boot plan"),
+        diagnostics.contains("boot_stage=boot_plan_received"),
         "{diagnostics}"
     );
     assert!(!diagnostics.contains("BAKE_STDOUT"), "{diagnostics}");
     assert!(!diagnostics.contains("BAKE_STDERR"), "{diagnostics}");
-    assert!(!output.contains("agent received boot plan"), "{output}");
+    assert!(
+        !output.contains("boot_stage=boot_plan_received"),
+        "{output}"
+    );
 }
 
 #[test]
