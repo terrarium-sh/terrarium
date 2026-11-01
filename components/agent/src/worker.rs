@@ -17,10 +17,11 @@ use futures_util::{
 };
 use std::{pin::pin, task::Poll};
 use terra_protocol::{
-    control::{STOP_SIGNAL, encode_clock_sync},
+    AgentCommand, encode_frame,
     mux::{MAX_CLIENT_STREAMS, MAX_STREAM_FRAME_BYTES},
 };
 
+type FutureReader<T> = wit_bindgen::rt::async_support::FutureReader<T>;
 type StreamReader<T> = wit_bindgen::rt::async_support::StreamReader<T>;
 type StreamWriter<T> = wit_bindgen::rt::async_support::StreamWriter<T>;
 type StreamResult = wit_bindgen::rt::async_support::StreamResult;
@@ -28,7 +29,7 @@ type StreamResult = wit_bindgen::rt::async_support::StreamResult;
 struct Worker {
     events: StreamWriter<Event>,
     plan: Vec<u8>,
-    stop: StreamReader<u8>,
+    stop: FutureReader<()>,
     listener: Option<StreamReader<host_service::Client>>,
 }
 
@@ -78,14 +79,7 @@ async fn forward_events(
     }
 }
 
-/// Resolves when the host requests a graceful stop; never when the stop stream ends without one.
-async fn wait_for_stop(mut stop: StreamReader<u8>) {
-    if stop.next().await != Some(STOP_SIGNAL) {
-        future::pending::<()>().await;
-    }
-}
-
-fn clock_syncs() -> impl Stream<Item = Vec<u8>> {
+fn clock_syncs() -> impl Stream<Item = AgentCommand> {
     stream::unfold(None, |mut previous| async move {
         loop {
             monotonic_clock::wait_for(1_000_000_000).await;
@@ -99,26 +93,30 @@ fn clock_syncs() -> impl Stream<Item = Vec<u8>> {
                 continue;
             }
             previous = Some(sample);
-            return Some((
-                encode_clock_sync(instant.seconds, instant.nanoseconds).to_vec(),
-                previous,
-            ));
+            let command = AgentCommand::SyncClock {
+                seconds: instant.seconds,
+                nanoseconds: instant.nanoseconds,
+            };
+            return Some((command, previous));
         }
     })
 }
 
-/// Writes the boot plan, then the stop signal and clock syncs as they come.
-async fn write_control(mut stream: impl AsyncWrite + Unpin, plan: Vec<u8>, stop: StreamReader<u8>) {
+/// Writes the boot plan, then the stop command and clock syncs as they come.
+async fn write_control(mut stream: impl AsyncWrite + Unpin, plan: Vec<u8>, stop: FutureReader<()>) {
     if stream.write_all(&plan).await.is_err() {
         return;
     }
-    let stop = stream::once(wait_for_stop(stop)).map(|()| vec![STOP_SIGNAL]);
-    let mut messages = pin!(stream::select_with_strategy(
+    let stop = stream::once(stop.into_future()).map(|()| AgentCommand::Stop);
+    let mut commands = pin!(stream::select_with_strategy(
         stop,
         clock_syncs(),
         |(): &mut ()| PollNext::Left
     ));
-    while let Some(bytes) = messages.next().await {
+    while let Some(command) = commands.next().await {
+        let Ok(bytes) = encode_frame(&command) else {
+            return;
+        };
         if stream.write_all(&bytes).await.is_err() {
             return;
         }
@@ -195,7 +193,7 @@ async fn next_inbound(connection: &mut yamux::Connection<ByteStream>) -> Option<
 async fn run_mux(
     carrier: ByteStream,
     plan: Vec<u8>,
-    stop: StreamReader<u8>,
+    stop: FutureReader<()>,
     listener: Option<StreamReader<host_service::Client>>,
     events: Sender<Event>,
     diagnostics: Sender<Diagnostic>,
@@ -287,7 +285,7 @@ async fn serve_clients(
 
 async fn run_session(
     plan: Vec<u8>,
-    stop: StreamReader<u8>,
+    stop: FutureReader<()>,
     listener: Option<StreamReader<host_service::Client>>,
     mut events: Sender<Event>,
     mut diagnostics: Sender<Diagnostic>,

@@ -15,7 +15,7 @@ pub(crate) enum GuestUser {
 
 impl GuestUser {
     pub(crate) const fn from_plan(plan: &Plan) -> Self {
-        if plan.root {
+        if plan.as_root {
             Self::Root
         } else {
             Self::Workload

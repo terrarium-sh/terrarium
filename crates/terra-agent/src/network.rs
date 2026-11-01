@@ -13,8 +13,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
-use terra_protocol::application::{
-    Direction, DnsTransport, MAX_DNS_QUERIES, Message, StreamDecoder,
+use terra_protocol::application::{HostFrame, LentFrame, StreamDecoder, UdpRun};
+use terra_protocol::network_control::{
+    AgentControl, DnsPayload, DnsTransport, FrontendControl, MAX_DNS_QUERIES, Publication,
 };
 use terra_protocol::vsock::{CONTROL_PORT, GUEST_CID, PUBLICATION_PORT};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
@@ -41,7 +42,7 @@ const PUBLICATION_TIMEOUT: Duration =
 const UDP_PEER_TTL: Duration = Duration::from_secs(terra_protocol::network::UDP_PEER_TTL_SECS);
 
 type Writer = AsyncMutex<Pin<Box<dyn AsyncWrite + Send>>>;
-type PendingQueries = Mutex<BTreeMap<u32, oneshot::Sender<Message>>>;
+type PendingQueries = Mutex<BTreeMap<u32, oneshot::Sender<DnsPayload>>>;
 
 struct PublicationGrants {
     tcp: PortGrant,
@@ -81,12 +82,6 @@ impl PortGrant {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum PublicationTarget {
-    Tcp { guest_port: u16 },
-    Udp { guest_port: u16 },
-}
-
 struct UdpPublicationPeer {
     peer: SocketAddr,
     socket: UdpSocket,
@@ -112,8 +107,8 @@ impl NetworkClient {
         })
     }
 
-    async fn send(&self, message: &Message) -> io::Result<()> {
-        let bytes = message.encode().map_err(io::Error::other)?;
+    async fn send(&self, message: &AgentControl) -> io::Result<()> {
+        let bytes = terra_protocol::encode_frame(message)?;
         let mut writer = self.writer.lock().await;
         if self.shutdown.is_cancelled() {
             return Err(io::Error::from(rustix::io::Errno::NETDOWN));
@@ -138,14 +133,14 @@ impl NetworkClient {
                 id,
                 pending: &self.pending,
             };
-            self.send(&Message::DnsQuery {
+            self.send(&AgentControl::DnsQuery(DnsPayload {
                 id,
                 transport,
                 bytes,
-            })
+            }))
             .await?;
             match reply.await {
-                Ok(Message::DnsResult {
+                Ok(DnsPayload {
                     transport: answered,
                     bytes,
                     ..
@@ -283,50 +278,36 @@ fn listen_publications() -> Result<tokio::io::unix::AsyncFd<File>> {
     Ok(crate::into_async_fd(socket)?)
 }
 
-/// `scratch` is the stream's read buffer, kept by the caller so a read does not allocate.
-async fn read_message(
+/// Reads once into `decoder`; `false` at a clean end of the stream.
+async fn read_into_decoder(
     reader: &mut (impl AsyncRead + Unpin),
     decoder: &mut StreamDecoder,
-    scratch: &mut Vec<u8>,
-) -> io::Result<Option<Message>> {
-    loop {
-        if let Some(message) = decoder
-            .next(Direction::HostToGuest)
-            .map_err(io::Error::other)?
-        {
-            return Ok(Some(message));
-        }
-        let capacity = decoder.remaining_capacity();
-        if scratch.len() < capacity {
-            scratch.resize(capacity, 0);
-        }
-        let count = reader.read(&mut scratch[..capacity]).await?;
-        if count == 0 {
-            return if decoder.is_empty() {
-                Ok(None)
-            } else {
-                Err(io::Error::from(io::ErrorKind::UnexpectedEof))
-            };
-        }
-        decoder.push(&scratch[..count]).map_err(io::Error::other)?;
+) -> io::Result<bool> {
+    let count = reader.read(decoder.read_buffer()).await?;
+    if count == 0 {
+        return if decoder.is_empty() {
+            Ok(false)
+        } else {
+            Err(io::Error::from(io::ErrorKind::UnexpectedEof))
+        };
     }
+    decoder.commit(count);
+    Ok(true)
 }
 
 /// Delivers DNS results until the control stream ends; any end of the stream means networking is gone.
 async fn receive_results(
     mut reader: impl AsyncRead + Unpin,
-    mut decoder: StreamDecoder,
     client: Arc<NetworkClient>,
 ) -> io::Error {
-    let mut scratch = Vec::new();
     let error = loop {
-        match read_message(&mut reader, &mut decoder, &mut scratch).await {
-            Ok(Some(message @ Message::DnsResult { id, .. })) => {
-                if let Some(sender) = crate::lock_or_abort(&client.pending).remove(&id) {
-                    let _ = sender.send(message);
+        match terra_protocol::read_frame_async::<FrontendControl>(&mut reader).await {
+            Ok(Some(FrontendControl::DnsResult(payload))) => {
+                if let Some(sender) = crate::lock_or_abort(&client.pending).remove(&payload.id) {
+                    let _ = sender.send(payload);
                 }
             }
-            Ok(Some(_)) => {
+            Ok(Some(FrontendControl::Ready)) => {
                 break io::Error::new(io::ErrorKind::InvalidData, "unexpected control message");
             }
             Ok(None) | Err(_) => break io::Error::from(rustix::io::Errno::NETDOWN),
@@ -334,20 +315,6 @@ async fn receive_results(
     };
     crate::lock_or_abort(&client.pending).clear();
     error
-}
-
-fn validate_kernel_socket_version() -> Result<()> {
-    let version: u16 = std::fs::read_to_string("/sys/kernel/terra_socket_abi")
-        .context("reading kernel socket ABI; rebuild the kernel and guest together")?
-        .trim()
-        .parse()
-        .context("invalid kernel socket ABI")?;
-    ensure!(
-        version == terra_protocol::socket::VERSION,
-        "socket protocol version {version} is incompatible with guest version {}; rebuild the kernel, network component, and guest",
-        terra_protocol::socket::VERSION
-    );
-    Ok(())
 }
 
 fn reserve_udp_publication_files(
@@ -368,16 +335,15 @@ fn reserve_udp_publication_files(
     Ok(limits)
 }
 
-/// Exchanges Hello/Ready on a fresh control stream and returns the decoder holding any bytes after Ready.
-async fn verify_network_version(
+/// Exchanges Hello/Ready on a fresh control stream.
+async fn await_network_ready(
     client: &NetworkClient,
     reader: &mut (impl AsyncRead + Unpin),
-) -> Result<StreamDecoder> {
-    let mut decoder = StreamDecoder::default();
+) -> Result<()> {
     tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
-        client.send(&Message::Hello).await?;
-        match read_message(reader, &mut decoder, &mut Vec::new()).await? {
-            Some(Message::Ready) => Ok(()),
+        client.send(&AgentControl::Hello).await?;
+        match terra_protocol::read_frame_async(reader).await? {
+            Some(FrontendControl::Ready) => Ok(()),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "network returned an invalid readiness response",
@@ -385,8 +351,8 @@ async fn verify_network_version(
         }
     })
     .await
-    .context("network version handshake timed out")??;
-    Ok(decoder)
+    .context("network readiness handshake timed out")??;
+    Ok(())
 }
 
 pub(crate) fn render_resolv_conf(net: terra_protocol::Net) -> String {
@@ -402,7 +368,6 @@ pub(crate) async fn start(
     shutdown: &CancellationToken,
     diagnostic: &Diagnostics,
 ) -> Result<()> {
-    validate_kernel_socket_version()?;
     match plan.net {
         terra_protocol::Net::LocalOnly => {}
         terra_protocol::Net::Tsi => {
@@ -424,12 +389,12 @@ pub(crate) async fn start(
                 };
             let (mut reader, writer) = tokio::io::split(connect_control()?);
             let client = NetworkClient::new(writer, shutdown.clone());
-            let decoder = verify_network_version(&client, &mut reader).await?;
+            await_network_ready(&client, &mut reader).await?;
             let results_client = client.clone();
             spawn_network_service(
                 tasks,
                 "control",
-                async move { Err(receive_results(reader, decoder, results_client).await) },
+                async move { Err(receive_results(reader, results_client).await) },
                 &shutdown,
                 diagnostic,
             );
@@ -485,13 +450,10 @@ async fn resolve_dns(
     if let Ok(response) = client.query(transport, query.clone()).await {
         return Ok(response);
     }
-    let response = terra_protocol::dns::error_response(
-        transport.message(&query),
-        terra_protocol::dns::DNS_RCODE_SERVFAIL,
-    );
-    transport
-        .frame(response)
-        .ok_or_else(|| io::Error::other("DNS response exceeds a stream's length prefix"))
+    Ok(terra_protocol::dns::error_response(
+        &query,
+        terra_protocol::dns::Rcode::ServFail,
+    ))
 }
 
 fn spawn_network_service(
@@ -589,7 +551,11 @@ async fn serve_dns_stream(mut stream: TcpStream, client: &NetworkClient) -> io::
             return Ok(());
         };
         let response = resolve_dns(client, DnsTransport::Stream, query).await?;
-        tokio::time::timeout(DNS_TIMEOUT, stream.write_all(&response)).await??;
+        let length = u16::try_from(response.len())
+            .map_err(|_| io::Error::other("DNS response exceeds a stream's length prefix"))?;
+        let mut framed = length.to_be_bytes().to_vec();
+        framed.extend_from_slice(&response);
+        tokio::time::timeout(DNS_TIMEOUT, stream.write_all(&framed)).await??;
     }
 }
 
@@ -608,9 +574,8 @@ async fn read_dns_query(
             "DNS query exceeds its size limit",
         ));
     }
-    let mut query = vec![0; length + 2];
-    query[..2].copy_from_slice(&prefix);
-    reader.read_exact(&mut query[2..]).await?;
+    let mut query = vec![0; length];
+    reader.read_exact(&mut query).await?;
     Ok(Some(query))
 }
 
@@ -645,48 +610,10 @@ async fn serve_publications(
 
 async fn read_publication_header(
     carrier: &mut (impl AsyncRead + Unpin),
-) -> io::Result<PublicationTarget> {
-    let mut header = [0; terra_protocol::application::HEADER_BYTES];
-    carrier.read_exact(&mut header).await?;
-    let length =
-        terra_protocol::application::decode_payload_length(&header).map_err(io::Error::other)?;
-    if length
-        > terra_protocol::application::MAX_OPENING_BYTES - terra_protocol::application::HEADER_BYTES
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "oversized publication header",
-        ));
-    }
-    let mut frame = header.to_vec();
-    frame.resize(header.len() + length, 0);
-    carrier.read_exact(&mut frame[header.len()..]).await?;
-    match Message::decode(&frame, Direction::HostToGuest).map_err(io::Error::other)? {
-        Some((Message::Publication { guest_port, .. }, _)) => {
-            Ok(PublicationTarget::Tcp { guest_port })
-        }
-        Some((Message::PublicationUdp { guest_port }, _)) => {
-            Ok(PublicationTarget::Udp { guest_port })
-        }
-        None
-        | Some((
-            Message::TcpOpen { .. }
-            | Message::TcpOpened(_)
-            | Message::UdpOpen
-            | Message::UdpOpened(_)
-            | Message::UdpSend { .. }
-            | Message::UdpDatagram { .. }
-            | Message::UdpError { .. }
-            | Message::Hello
-            | Message::Ready
-            | Message::DnsQuery { .. }
-            | Message::DnsResult { .. },
-            _,
-        )) => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid publication header",
-        )),
-    }
+) -> io::Result<Publication> {
+    terra_protocol::read_frame_async(carrier)
+        .await?
+        .ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))
 }
 
 async fn connect_published_service(guest_port: u16) -> io::Result<TcpStream> {
@@ -717,13 +644,15 @@ async fn relay_publication(
 ) -> io::Result<()> {
     let deadline = Instant::now() + PUBLICATION_TIMEOUT;
     match tokio::time::timeout_at(deadline, read_publication_header(&mut carrier)).await?? {
-        PublicationTarget::Tcp { guest_port } => {
+        Publication::Tcp { guest_port } => {
+            let guest_port = guest_port.get();
             let _permit = grants.tcp.admit(guest_port)?;
             let mut service =
                 tokio::time::timeout_at(deadline, connect_published_service(guest_port)).await??;
             copy_publication_bytes(&mut service, &mut carrier).await
         }
-        PublicationTarget::Udp { guest_port } => {
+        Publication::Udp { guest_port } => {
+            let guest_port = guest_port.get();
             let _permit = grants.udp.admit(guest_port)?;
             relay_udp_publication(
                 carrier,
@@ -761,11 +690,11 @@ async fn connect_published_udp_service(
     let socket = UdpSocket::bind((source, 0)).await?;
     rustix::net::sockopt::set_socket_recv_buffer_size(
         &socket,
-        terra_protocol::application::MAX_UDP_FRAME_BYTES,
+        terra_protocol::application::MAX_FRAME_BYTES,
     )?;
     rustix::net::sockopt::set_socket_send_buffer_size(
         &socket,
-        terra_protocol::application::MAX_UDP_FRAME_BYTES,
+        terra_protocol::application::MAX_FRAME_BYTES,
     )?;
     socket.connect(destination).await?;
     Ok(socket)
@@ -785,60 +714,80 @@ async fn send_publication_datagrams(
     Ok(())
 }
 
-/// Takes up to `MAX_DATAGRAM_SEGMENTS` replies already queued on one publication socket as
-/// frames, merging equal-size datagrams that end in at most one shorter one into a segmented
-/// frame as UDP GRO would.
+/// Reusable buffers that turn the replies queued on a publication socket into `UdpSend` frames.
+struct ReplyBuffers {
+    datagram: [u8; terra_protocol::network::MAX_NETWORK_DATAGRAM_BYTES + 1],
+    run: Vec<u8>,
+    frames: Vec<u8>,
+}
+
+impl ReplyBuffers {
+    const fn new() -> Self {
+        Self {
+            datagram: [0; terra_protocol::network::MAX_NETWORK_DATAGRAM_BYTES + 1],
+            run: Vec::new(),
+            frames: Vec::new(),
+        }
+    }
+}
+
+/// Frames up to `MAX_DATAGRAM_SEGMENTS` replies already queued on one publication socket into
+/// `buffers.frames`, merging equal-size datagrams that end in at most one shorter one into a
+/// segmented frame as UDP GRO would.
 fn read_publication_replies(
     socket: &UdpSocket,
     peer: SocketAddr,
-    reply: &mut [u8],
-) -> io::Result<Vec<Message>> {
+    buffers: &mut ReplyBuffers,
+) -> io::Result<()> {
     fn finish_run(
-        messages: &mut Vec<Message>,
+        frames: &mut Vec<u8>,
         peer: SocketAddr,
         run: &mut Vec<u8>,
         segment: &mut usize,
-    ) {
-        let bytes = std::mem::take(run);
-        let frame_segment = match u16::try_from(*segment) {
-            Ok(segment) if bytes.len() > usize::from(segment) => segment,
-            _ => 0,
-        };
-        messages.push(Message::UdpSend {
+    ) -> io::Result<()> {
+        let lent = UdpRun {
             peer,
-            segment: frame_segment,
-            bytes,
-        });
+            segment: u16::try_from(*segment).unwrap_or(0),
+            bytes: run.as_slice(),
+        };
+        terra_protocol::application::append_udp_send(frames, lent).map_err(io::Error::other)?;
+        run.clear();
         *segment = 0;
+        Ok(())
     }
-    let mut messages = Vec::new();
-    let mut run = Vec::new();
+    let ReplyBuffers {
+        datagram,
+        run,
+        frames,
+    } = buffers;
+    run.clear();
+    frames.clear();
     let mut segment = 0;
     for _ in 0..terra_protocol::application::MAX_DATAGRAM_SEGMENTS {
-        let length = match socket.try_recv(reply) {
+        let length = match socket.try_recv(datagram) {
             Ok(length) => length,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-            Err(error) if messages.is_empty() && run.is_empty() => return Err(error),
+            Err(error) if frames.is_empty() && run.is_empty() => return Err(error),
             Err(_) => break,
         };
-        if length > terra_protocol::socket::MAX_DATAGRAM_BYTES {
+        if length > terra_protocol::network::MAX_NETWORK_DATAGRAM_BYTES {
             continue;
         }
         if !terra_protocol::application::extends_udp_run(run.len(), segment, length) {
             if segment != 0 {
-                finish_run(&mut messages, peer, &mut run, &mut segment);
+                finish_run(frames, peer, run, &mut segment)?;
             }
             segment = length;
         }
-        run.extend_from_slice(&reply[..length]);
+        run.extend_from_slice(&datagram[..length]);
         if length == 0 || length < segment {
-            finish_run(&mut messages, peer, &mut run, &mut segment);
+            finish_run(frames, peer, run, &mut segment)?;
         }
     }
     if segment != 0 {
-        finish_run(&mut messages, peer, &mut run, &mut segment);
+        finish_run(frames, peer, run, &mut segment)?;
     }
-    Ok(messages)
+    Ok(())
 }
 
 async fn relay_udp_publication(
@@ -847,9 +796,8 @@ async fn relay_udp_publication(
     destination: SocketAddr,
 ) -> io::Result<()> {
     let mut decoder = StreamDecoder::default();
-    let mut scratch = Vec::new();
     let mut peers: VecDeque<UdpPublicationPeer> = VecDeque::new();
-    let mut reply = [0; terra_protocol::socket::MAX_DATAGRAM_BYTES + 1];
+    let mut replies = ReplyBuffers::new();
     let mut next_reply = 0;
     loop {
         let now = Instant::now();
@@ -860,36 +808,45 @@ async fn relay_udp_publication(
             .min()
             .unwrap_or(now + UDP_PEER_TTL);
         tokio::select! {
-            message = read_message(&mut carrier, &mut decoder, &mut scratch) => {
-                let Some(message) = message? else {
+            read = read_into_decoder(&mut carrier, &mut decoder) => {
+                if !read? {
                     return Ok(());
-                };
-                match message {
-                    Message::UdpDatagram { peer, segment, bytes } => {
-                        forward_host_datagram(&mut peers, peer, segment, &bytes, source, destination)
-                            .await?;
-                    }
-                    Message::UdpError { .. } => {}
-                    Message::TcpOpen { .. }
-                    | Message::TcpOpened(_)
-                    | Message::UdpOpen
-                    | Message::UdpOpened(_)
-                    | Message::UdpSend { .. }
-                    | Message::Hello
-                    | Message::Ready
-                    | Message::DnsQuery { .. }
-                    | Message::DnsResult { .. }
-                    | Message::Publication { .. }
-                    | Message::PublicationUdp { .. } => {
-                        return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected UDP publication message"));
-                    }
                 }
+                forward_host_frames(&mut decoder, &mut peers, source, destination).await?;
             }
             (index, ready) = wait_udp_publication_reply(&peers, next_reply) => {
                 next_reply = (index + 1) % peers.len();
-                forward_peer_replies(&mut carrier, &mut peers, index, ready, &mut reply).await?;
+                forward_peer_replies(&mut carrier, &mut peers, index, ready, &mut replies).await?;
             }
             () = tokio::time::sleep_until(expires), if !peers.is_empty() => {}
+        }
+    }
+}
+
+/// Forwards every whole frame `decoder` holds, sending datagram runs straight from its buffer.
+async fn forward_host_frames(
+    decoder: &mut StreamDecoder,
+    peers: &mut VecDeque<UdpPublicationPeer>,
+    source: Ipv4Addr,
+    destination: SocketAddr,
+) -> io::Result<()> {
+    loop {
+        let frame = decoder
+            .next_lent_frame::<HostFrame>()
+            .map_err(io::Error::other)?;
+        match frame {
+            None => return Ok(()),
+            Some(LentFrame::UdpRun(run)) => {
+                forward_host_datagram(peers, run.peer, run.segment, run.bytes, source, destination)
+                    .await?;
+            }
+            Some(LentFrame::Frame(HostFrame::UdpError { .. })) => {}
+            Some(LentFrame::Frame(HostFrame::Opened(_) | HostFrame::UdpDatagram(_))) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unexpected UDP publication message",
+                ));
+            }
         }
     }
 }
@@ -934,7 +891,7 @@ async fn forward_peer_replies(
     peers: &mut VecDeque<UdpPublicationPeer>,
     index: usize,
     ready: io::Result<()>,
-    reply: &mut [u8],
+    replies: &mut ReplyBuffers,
 ) -> io::Result<()> {
     let entry = peers
         .get(index)
@@ -942,16 +899,12 @@ async fn forward_peer_replies(
     if entry.expires <= Instant::now() {
         return Ok(());
     }
-    match ready.and_then(|()| read_publication_replies(&entry.socket, entry.peer, reply)) {
-        Ok(messages) if !messages.is_empty() => {
-            let mut frames = Vec::new();
-            for message in messages {
-                frames.extend(message.encode().map_err(io::Error::other)?);
-            }
-            carrier.write_all(&frames).await?;
+    match ready.and_then(|()| read_publication_replies(&entry.socket, entry.peer, replies)) {
+        Ok(()) if !replies.frames.is_empty() => {
+            carrier.write_all(&replies.frames).await?;
             carrier.flush().await?;
         }
-        Ok(_) => {}
+        Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
         Err(_) => {
             peers.remove(index);
@@ -964,12 +917,50 @@ async fn forward_peer_replies(
 mod tests {
     use super::*;
     use std::assert_matches;
+    use std::num::NonZeroU16;
+    use terra_protocol::application::{Frame as _, GuestFrame};
+
+    /// A frame other than a datagram, split across reads, makes forwarding return for more bytes;
+    /// it would spin forever if the incomplete frame looked like nothing to do. The forwarding
+    /// runs on its own thread so a regression fails here instead of hanging the suite.
+    #[test]
+    fn forwarding_returns_for_the_rest_of_a_split_error_frame() {
+        let error = HostFrame::UdpError {
+            peer: "192.0.2.1:9".parse().unwrap(),
+            error: terra_protocol::socket::Error::Closed,
+        }
+        .encode()
+        .unwrap();
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut decoder = StreamDecoder::default();
+            let partial = &error[..error.len() - 1];
+            decoder.read_buffer()[..partial.len()].copy_from_slice(partial);
+            decoder.commit(partial.len());
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let forwarded = runtime.block_on(forward_host_frames(
+                &mut decoder,
+                &mut VecDeque::new(),
+                Ipv4Addr::LOCALHOST,
+                "127.0.0.1:9".parse().unwrap(),
+            ));
+            done.send((forwarded.is_ok(), decoder.is_empty())).unwrap();
+        });
+        assert_eq!(
+            finished.recv_timeout(Duration::from_secs(10)),
+            Ok((true, false)),
+            "forwarding must return and keep the partial frame"
+        );
+    }
 
     #[tokio::test]
-    async fn dns_tcp_framing_bounds_and_preserves_queries() {
+    async fn dns_tcp_framing_bounds_and_strips_the_length_prefix() {
         assert_eq!(
             read_dns_query(&mut &b"\0\x03abc"[..]).await.unwrap(),
-            Some(b"\0\x03abc".to_vec())
+            Some(b"abc".to_vec())
         );
         assert_eq!(read_dns_query(&mut &b""[..]).await.unwrap(), None);
         for query in [&b"\0"[..], &b"\0\x03ab"[..], &b"\x10\x01"[..]] {
@@ -1037,11 +1028,7 @@ mod tests {
         let (guest, host) = tokio::io::duplex(64 * 1024);
         let (reader, writer) = tokio::io::split(guest);
         let client = NetworkClient::new(writer, CancellationToken::new());
-        let receiver = tokio::spawn(receive_results(
-            reader,
-            StreamDecoder::default(),
-            client.clone(),
-        ));
+        let receiver = tokio::spawn(receive_results(reader, client.clone()));
         TestNetwork {
             client,
             host,
@@ -1049,16 +1036,22 @@ mod tests {
         }
     }
 
-    async fn read_host_message(host: &mut tokio::io::DuplexStream) -> Message {
-        let mut header = [0; terra_protocol::application::HEADER_BYTES];
+    async fn read_host_message(host: &mut tokio::io::DuplexStream) -> AgentControl {
+        terra_protocol::read_frame_async(host)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    /// Reads one kernel-layout frame without reading past it.
+    async fn read_guest_frame(host: &mut tokio::io::DuplexStream) -> GuestFrame {
+        use terra_protocol::application::HEADER_BYTES;
+        let mut header = [0; HEADER_BYTES];
         host.read_exact(&mut header).await.unwrap();
-        let length = terra_protocol::application::decode_payload_length(&header).unwrap();
         let mut frame = header.to_vec();
-        frame.resize(header.len() + length, 0);
-        host.read_exact(&mut frame[header.len()..]).await.unwrap();
-        let mut decoder = StreamDecoder::default();
-        decoder.push(&frame).unwrap();
-        decoder.next(Direction::GuestToHost).unwrap().unwrap()
+        frame.resize(terra_protocol::application::frame_len(header).unwrap(), 0);
+        host.read_exact(&mut frame[HEADER_BYTES..]).await.unwrap();
+        GuestFrame::decode(&frame).unwrap().unwrap().0
     }
 
     /// Saturated UDP DNS keeps at most sixteen tracked clients and cancellation releases every query.
@@ -1090,7 +1083,7 @@ mod tests {
                 requester.send_to(&[0; 12], address).await.unwrap();
                 assert_matches!(
                     read_host_message(&mut network.host).await,
-                    Message::DnsQuery { .. }
+                    AgentControl::DnsQuery(_)
                 );
             }
             assert_eq!(tasks.len(), MAX_DNS_CLIENTS);
@@ -1119,7 +1112,8 @@ mod tests {
             let client = network.client.clone();
             async move { client.query(DnsTransport::Datagram, vec![1; 12]).await }
         });
-        let Message::DnsQuery { id: first_id, .. } = read_host_message(&mut network.host).await
+        let AgentControl::DnsQuery(DnsPayload { id: first_id, .. }) =
+            read_host_message(&mut network.host).await
         else {
             panic!("expected a DNS query");
         };
@@ -1127,19 +1121,20 @@ mod tests {
             let client = network.client.clone();
             async move { client.query(DnsTransport::Datagram, vec![2; 12]).await }
         });
-        let Message::DnsQuery { id: second_id, .. } = read_host_message(&mut network.host).await
+        let AgentControl::DnsQuery(DnsPayload { id: second_id, .. }) =
+            read_host_message(&mut network.host).await
         else {
             panic!("expected a DNS query");
         };
         for (id, byte) in [(second_id, 2), (first_id, 1)] {
-            let reply = Message::DnsResult {
+            let reply = FrontendControl::DnsResult(DnsPayload {
                 id,
                 transport: DnsTransport::Datagram,
                 bytes: vec![byte; 12],
-            };
+            });
             network
                 .host
-                .write_all(&reply.encode().unwrap())
+                .write_all(&terra_protocol::encode_frame(&reply).unwrap())
                 .await
                 .unwrap();
         }
@@ -1167,7 +1162,7 @@ mod tests {
         assert!(!parent.is_cancelled());
         assert_eq!(
             client
-                .send(&Message::Hello)
+                .send(&AgentControl::Hello)
                 .await
                 .unwrap_err()
                 .raw_os_error(),
@@ -1219,16 +1214,11 @@ mod tests {
         drop(network.host);
         network.receiver.await.unwrap();
         let query = b"\x12\x34\x01\0\0\x01\0\0\0\0\0\0\x01a\0\0\x01\0\x01";
+        let expected =
+            terra_protocol::dns::error_response(query, terra_protocol::dns::Rcode::ServFail);
         for transport in [DnsTransport::Datagram, DnsTransport::Stream] {
-            let mut request = query.to_vec();
-            let mut expected =
-                terra_protocol::dns::error_response(query, terra_protocol::dns::DNS_RCODE_SERVFAIL);
-            if transport == DnsTransport::Stream {
-                request.splice(..0, u16::try_from(query.len()).unwrap().to_be_bytes());
-                expected.splice(..0, u16::try_from(expected.len()).unwrap().to_be_bytes());
-            }
             assert_eq!(
-                resolve_dns(&network.client, transport, request)
+                resolve_dns(&network.client, transport, query.to_vec())
                     .await
                     .unwrap(),
                 expected
@@ -1271,49 +1261,40 @@ mod tests {
     /// The publication header is consumed exactly; raw bytes behind it stay for the relay.
     #[tokio::test]
     async fn publication_header_leaves_raw_bytes_unread() {
-        let peer: SocketAddr = "203.0.113.9:40000".parse().unwrap();
-        let mut bytes = Message::Publication {
-            guest_port: 8080,
-            peer,
-        }
-        .encode()
-        .unwrap();
+        let header = |publication| terra_protocol::encode_frame(&publication).unwrap();
+        let guest_port = NonZeroU16::new(8080).unwrap();
+        let mut bytes = header(Publication::Tcp { guest_port });
         bytes.extend_from_slice(b"GET /");
         let mut carrier = &bytes[..];
         assert_eq!(
             read_publication_header(&mut carrier).await.unwrap(),
-            PublicationTarget::Tcp { guest_port: 8080 }
+            Publication::Tcp { guest_port }
         );
         assert_eq!(carrier, b"GET /");
-        let datagram = Message::UdpDatagram {
+        let datagram = HostFrame::UdpDatagram(UdpRun {
             segment: 0,
-            peer,
+            peer: "203.0.113.9:40000".parse().unwrap(),
             bytes: b"udp".to_vec(),
-        }
+        })
         .encode()
         .unwrap();
-        let mut bytes = Message::PublicationUdp { guest_port: 5353 }
-            .encode()
-            .unwrap();
+        let guest_port = NonZeroU16::new(5353).unwrap();
+        let mut bytes = header(Publication::Udp { guest_port });
         bytes.extend_from_slice(&datagram);
         let mut carrier = &bytes[..];
         assert_eq!(
             read_publication_header(&mut carrier).await.unwrap(),
-            PublicationTarget::Udp { guest_port: 5353 }
+            Publication::Udp { guest_port }
         );
         assert_eq!(carrier, datagram);
-        let mut wrong = &Message::Ready.encode().unwrap()[..];
-        assert!(read_publication_header(&mut wrong).await.is_err());
-        let oversized = u32::try_from(
-            terra_protocol::application::MAX_OPENING_BYTES
-                - terra_protocol::application::HEADER_BYTES
-                + 1,
-        )
-        .unwrap();
-        let mut header = [0; terra_protocol::application::HEADER_BYTES];
-        header[4..8].copy_from_slice(&oversized.to_le_bytes());
+        let wrong = terra_protocol::encode_frame(&FrontendControl::Ready).unwrap();
+        assert!(read_publication_header(&mut &wrong[..]).await.is_err());
+        let oversized =
+            u32::try_from(<Publication as terra_protocol::Message>::MAX_PAYLOAD_BYTES + 1)
+                .unwrap()
+                .to_le_bytes();
         assert_eq!(
-            read_publication_header(&mut &header[..])
+            read_publication_header(&mut &oversized[..])
                 .await
                 .unwrap_err()
                 .kind(),
@@ -1360,14 +1341,17 @@ mod tests {
     async fn publication_admission_reserves_each_protocol() {
         let grants = Arc::new(PublicationGrants::new(vec![8080], vec![5353]));
         for message in [
-            Message::PublicationUdp { guest_port: 8080 },
-            Message::Publication {
-                guest_port: 5353,
-                peer: "203.0.113.9:40000".parse().unwrap(),
+            Publication::Udp {
+                guest_port: NonZeroU16::new(8080).unwrap(),
+            },
+            Publication::Tcp {
+                guest_port: NonZeroU16::new(5353).unwrap(),
             },
         ] {
             let (guest, mut host) = tokio::io::duplex(64);
-            host.write_all(&message.encode().unwrap()).await.unwrap();
+            host.write_all(&terra_protocol::encode_frame(&message).unwrap())
+                .await
+                .unwrap();
             assert_eq!(
                 relay_publication(guest, &grants).await.unwrap_err().kind(),
                 io::ErrorKind::InvalidData
@@ -1380,9 +1364,10 @@ mod tests {
         for _ in 0..2 * terra_protocol::MAX_PUBLISHED_PORTS {
             let (guest, mut host) = tokio::io::duplex(64);
             host.write_all(
-                &Message::PublicationUdp { guest_port: 5353 }
-                    .encode()
-                    .unwrap(),
+                &terra_protocol::encode_frame(&Publication::Udp {
+                    guest_port: NonZeroU16::new(5353).unwrap(),
+                })
+                .unwrap(),
             )
             .await
             .unwrap();
@@ -1459,17 +1444,17 @@ mod tests {
         async fn send(&mut self, peer: SocketAddr, bytes: &[u8]) -> SocketAddr {
             self.host
                 .write_all(
-                    &Message::UdpDatagram {
+                    &HostFrame::UdpDatagram(UdpRun {
                         segment: 0,
                         peer,
                         bytes: bytes.to_vec(),
-                    }
+                    })
                     .encode()
                     .unwrap(),
                 )
                 .await
                 .unwrap();
-            let mut received = [0; terra_protocol::socket::MAX_DATAGRAM_BYTES + 1];
+            let mut received = [0; terra_protocol::network::MAX_NETWORK_DATAGRAM_BYTES + 1];
             let (length, source) = self.service.recv_from(&mut received).await.unwrap();
             assert_eq!(&received[..length], bytes);
             source
@@ -1483,19 +1468,19 @@ mod tests {
             let mut publication = TestUdpPublication::new().await;
             let ipv4: SocketAddr = "203.0.113.9:40000".parse().unwrap();
             let ipv6: SocketAddr = "[2001:db8::9]:40001".parse().unwrap();
-            let mut coalesced = Message::UdpDatagram {
+            let mut coalesced = HostFrame::UdpDatagram(UdpRun {
                 segment: 0,
                 peer: ipv4,
                 bytes: b"\0binary\xff".to_vec(),
-            }
+            })
             .encode()
             .unwrap();
             coalesced.extend_from_slice(
-                &Message::UdpDatagram {
+                &HostFrame::UdpDatagram(UdpRun {
                     segment: 0,
                     peer: ipv6,
                     bytes: Vec::new(),
-                }
+                })
                 .encode()
                 .unwrap(),
             );
@@ -1511,27 +1496,27 @@ mod tests {
                 (
                     ipv4,
                     first,
-                    vec![0x93; terra_protocol::socket::MAX_DATAGRAM_BYTES],
+                    vec![0x93; terra_protocol::network::MAX_NETWORK_DATAGRAM_BYTES],
                 ),
             ] {
                 publication.service.send_to(&bytes, source).await.unwrap();
                 assert_eq!(
-                    read_host_message(&mut publication.host).await,
-                    Message::UdpSend {
+                    read_guest_frame(&mut publication.host).await,
+                    GuestFrame::UdpSend(UdpRun {
                         segment: 0,
                         peer,
                         bytes
-                    }
+                    })
                 );
             }
-            let maximum = vec![0x41; terra_protocol::socket::MAX_DATAGRAM_BYTES];
+            let maximum = vec![0x41; terra_protocol::network::MAX_NETWORK_DATAGRAM_BYTES];
             assert_eq!(publication.send(ipv4, &maximum).await, first);
             let stranger = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
             stranger.send_to(b"unrelated", first).await.unwrap();
             publication
                 .service
                 .send_to(
-                    &vec![0; terra_protocol::socket::MAX_DATAGRAM_BYTES + 1],
+                    &vec![0; terra_protocol::network::MAX_NETWORK_DATAGRAM_BYTES + 1],
                     first,
                 )
                 .await
@@ -1547,7 +1532,7 @@ mod tests {
             publication
                 .host
                 .write_all(
-                    &Message::UdpError {
+                    &HostFrame::UdpError {
                         peer: ipv4,
                         error: terra_protocol::socket::Error::AccessDenied,
                     }
@@ -1559,12 +1544,12 @@ mod tests {
             assert_eq!(publication.send(ipv4, b"still live").await, first);
             publication.service.send_to(b"reply", first).await.unwrap();
             assert_eq!(
-                read_host_message(&mut publication.host).await,
-                Message::UdpSend {
+                read_guest_frame(&mut publication.host).await,
+                GuestFrame::UdpSend(UdpRun {
                     segment: 0,
                     peer: ipv4,
                     bytes: b"reply".to_vec()
-                }
+                })
             );
             publication.host.shutdown().await.unwrap();
             publication.relay.await.unwrap().unwrap().unwrap();
@@ -1587,11 +1572,11 @@ mod tests {
             publication
                 .host
                 .write_all(
-                    &Message::UdpDatagram {
+                    &HostFrame::UdpDatagram(UdpRun {
                         peer,
                         segment: 1000,
                         bytes: run.clone(),
-                    }
+                    })
                     .encode()
                     .unwrap(),
                 )
@@ -1617,28 +1602,28 @@ mod tests {
                 publication.service.try_send_to(datagram, source).unwrap();
             }
             for expected in [
-                Message::UdpSend {
+                GuestFrame::UdpSend(UdpRun {
                     peer,
                     segment: 1000,
                     bytes: run[..2000].to_vec(),
-                },
-                Message::UdpSend {
+                }),
+                GuestFrame::UdpSend(UdpRun {
                     segment: 0,
                     peer,
                     bytes: Vec::new(),
-                },
-                Message::UdpSend {
+                }),
+                GuestFrame::UdpSend(UdpRun {
                     peer,
                     segment: 300,
                     bytes: run[..600].to_vec(),
-                },
-                Message::UdpSend {
+                }),
+                GuestFrame::UdpSend(UdpRun {
                     peer,
                     segment: 400,
                     bytes: [&run[..400], &run[..7]].concat(),
-                },
+                }),
             ] {
-                assert_eq!(read_host_message(&mut publication.host).await, expected);
+                assert_eq!(read_guest_frame(&mut publication.host).await, expected);
             }
         })
         .await
@@ -1685,12 +1670,12 @@ mod tests {
         tokio::time::resume();
         publication.service.send_to(b"reply", source).await.unwrap();
         assert_eq!(
-            read_host_message(&mut publication.host).await,
-            Message::UdpSend {
+            read_guest_frame(&mut publication.host).await,
+            GuestFrame::UdpSend(UdpRun {
                 segment: 0,
                 peer,
                 bytes: b"reply".to_vec()
-            }
+            })
         );
         tokio::time::pause();
         tokio::time::advance(UDP_PEER_TTL / 2 + Duration::from_secs(1)).await;
@@ -1708,7 +1693,7 @@ mod tests {
         assert_ne!(replacement, retired.local_addr().unwrap());
         publication
             .host
-            .write_all(&Message::Ready.encode().unwrap())
+            .write_all(&HostFrame::Opened(Ok(())).encode().unwrap())
             .await
             .unwrap();
         assert_eq!(
@@ -1790,11 +1775,11 @@ mod tests {
             .unwrap();
         assert_eq!(
             rustix::net::sockopt::socket_recv_buffer_size(&peer_socket).unwrap(),
-            2 * terra_protocol::application::MAX_UDP_FRAME_BYTES
+            2 * terra_protocol::application::MAX_FRAME_BYTES
         );
         assert_eq!(
             rustix::net::sockopt::socket_send_buffer_size(&peer_socket).unwrap(),
-            2 * terra_protocol::application::MAX_UDP_FRAME_BYTES
+            2 * terra_protocol::application::MAX_FRAME_BYTES
         );
         drop(peer_socket);
         let port = service.local_addr().unwrap().port();
@@ -1802,19 +1787,20 @@ mod tests {
         let relay = tokio::spawn(async move {
             relay_publication(guest, &PublicationGrants::new(Vec::new(), vec![port])).await
         });
-        let mut datagrams = Message::PublicationUdp { guest_port: port }
-            .encode()
-            .unwrap();
+        let mut datagrams = terra_protocol::encode_frame(&Publication::Udp {
+            guest_port: NonZeroU16::new(port).unwrap(),
+        })
+        .unwrap();
         for peer in [
             "203.0.113.9:40000".parse().unwrap(),
             "[2001:db8::9]:40001".parse().unwrap(),
         ] {
             datagrams.extend_from_slice(
-                &Message::UdpDatagram {
+                &HostFrame::UdpDatagram(UdpRun {
                     segment: 0,
                     peer,
                     bytes: Vec::new(),
-                }
+                })
                 .encode()
                 .unwrap(),
             );
@@ -1831,14 +1817,14 @@ mod tests {
         ] {
             service.send_to(b"wildcard reply", source).await.unwrap();
             assert_eq!(
-                tokio::time::timeout(Duration::from_secs(1), read_host_message(&mut host))
+                tokio::time::timeout(Duration::from_secs(1), read_guest_frame(&mut host))
                     .await
                     .unwrap(),
-                Message::UdpSend {
+                GuestFrame::UdpSend(UdpRun {
                     segment: 0,
                     peer,
                     bytes: b"wildcard reply".to_vec()
-                }
+                })
             );
         }
         host.shutdown().await.unwrap();

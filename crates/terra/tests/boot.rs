@@ -218,14 +218,6 @@ impl Suite {
             ])
             .args(["-static", "-O2", "-o"])
             .arg(&probe)
-            .arg(format!(
-                "-DTERRA_SOCKET_ABI={}",
-                terra_protocol::socket::VERSION
-            ))
-            .arg(format!(
-                "-DTERRA_NETWORK_ABI={}",
-                terra_protocol::application::VERSION
-            ))
             .arg(source)
             .status()
             .expect("compiling guest probe");
@@ -399,7 +391,7 @@ fn raw_vsock_tcp_receive_credit_preserves_high_lowat() {
     use std::io::{Read, Write};
     use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener};
     use std::sync::atomic::{AtomicBool, Ordering};
-    use terra_protocol::application::{Message, TcpOpenOptions, TcpTarget};
+    use terra_protocol::application::{Frame as _, GuestFrame, HostFrame, TcpOpenOptions};
 
     fn serve_credit_payload(
         listener: &TcpListener,
@@ -456,15 +448,15 @@ fn raw_vsock_tcp_receive_credit_preserves_high_lowat() {
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
     let peer = SocketAddr::new(IpAddr::V4(terra_protocol::socket::HOST_SERVICE_IPV4), port);
-    let opening = Message::TcpOpen {
-        target: TcpTarget::Peer(peer),
+    let opening = GuestFrame::TcpOpen {
+        peer,
         options: TcpOpenOptions::default(),
     }
     .encode()
     .unwrap();
-    let opened = Message::TcpOpened(Ok(peer)).encode().unwrap();
-    assert_eq!(opening.len(), 40);
-    assert_eq!(opened.len(), 32);
+    let opened = HostFrame::Opened(Ok(())).encode().unwrap();
+    assert_eq!(opening.len(), 36);
+    assert_eq!(opened.len(), 12);
     let payload: Vec<_> = (0..32 * 1024)
         .map(|offset| u8::try_from(offset % 251).unwrap())
         .collect();

@@ -88,11 +88,14 @@ pub async fn run(
 }
 
 pub(crate) fn encode_boot_plan(spec: &BootSpec, box_name: &str) -> Result<Vec<u8>> {
-    terra_protocol::encode_frame_with_limit(
-        &terra_protocol::BootPlan::new(build_plan(spec, box_name)?),
-        terra_protocol::MAX_PLAN_BYTES - terra_protocol::MAX_PLAN_HOST_STATE_BYTES,
-    )
-    .context("boot plan exceeds its encoded size limit; reduce the recipe or environment")
+    // The host's clock and seed join the plan after this, within MAX_PLAN_HOST_STATE_BYTES.
+    terra_protocol::encode_frame(&build_plan(spec, box_name)?)
+        .ok()
+        .filter(|frame| {
+            frame.len() - 4
+                <= terra_protocol::MAX_PLAN_BYTES - terra_protocol::MAX_PLAN_HOST_STATE_BYTES
+        })
+        .context("boot plan exceeds its encoded size limit; reduce the recipe or environment")
 }
 
 pub(crate) fn rootfs_access(spec: &BootSpec) -> AccessMode {
@@ -179,7 +182,7 @@ fn build_plan(spec: &BootSpec, box_name: &str) -> Result<Plan> {
         published_ports,
         published_udp_ports,
         env: recipe.env.clone(),
-        root: is_root,
+        as_root: is_root,
         rootfs,
         sudo: recipe.sudo.clone(),
         on_create: recipe.hooks.on_create.clone(),
@@ -517,7 +520,7 @@ mod tests {
             host_publishes_pid: false,
             network_broker: None,
         };
-        let plan = |root, mode| build_plan(&spec(root, mode), "dev").unwrap().root;
+        let plan = |root, mode| build_plan(&spec(root, mode), "dev").unwrap().as_root;
 
         assert!(plan(false, PlanMode::Create), "a setup boot is root");
         assert!(plan(true, PlanMode::Create));

@@ -68,13 +68,12 @@ def transport_receive_source(source: str, connection: str) -> str:
 
 
 def socket_definitions(source: str) -> str:
-    names = ('TERRA_TCP_OPEN_BYTES', 'TERRA_UDP_MAX_SEGMENTS', 'TERRA_UDP_SEGMENT_FIELD_BYTES',
-             'TERRA_UDP_PREFIX_BYTES', 'TERRA_UDP_CARRIER_BYTES', 'TERRA_UDP_RUN_BYTES', 'TERRA_UDP_QUEUE_BYTES',
+    names = ('TERRA_TCP_OPEN_BYTES', 'TERRA_UDP_PREFIX_BYTES', 'TERRA_UDP_RUN_BYTES', 'TERRA_UDP_QUEUE_BYTES',
              'TERRA_UDP_QUEUED_DATAGRAMS')
     definitions = [re.search(rf'^#define {name}\b(?:.*\\\n)*.*$', source, re.MULTILINE)[0] for name in names]
     control_block = re.search(r'^struct terra_datagram_cb \{.*?^#define TERRA_DATAGRAM_CB\(skb\)[^\n]*',
                               source, re.MULTILINE | re.DOTALL)[0]
-    errors = re.search(r'^static const u8 terra_errors\[\] = \{.*?^\};', source, re.MULTILINE | re.DOTALL)[0]
+    errors = re.search(r'^static const u8 terra_errors\[\] = TERRA_ERRNOS;', source, re.MULTILINE)[0]
     return '\n'.join(definitions) + '\n' + control_block + '\n' + errors + '\n'
 
 
@@ -103,7 +102,7 @@ def main() -> None:
     request_credit = declaration(transport, r'^int virtio_transport_send_credit_request\(')
     functions = request_credit + '\n' + '\n'.join(declaration(source, rf'^static [^\n]*\b{name}\(') for name in (
         'terra_decode_error', 'terra_encode_peer', 'terra_decode_peer', 'terra_peer_equal',
-        'terra_validate_opened', 'terra_open_timeout', 'terra_frame_header', 'terra_datagram_bytes',
+        'terra_decode_opened', 'terra_open_timeout', 'terra_frame_header', 'terra_datagram_bytes',
         'terra_datagram_segment', 'terra_udp_queue_admits', 'terra_receive_udp_datagram', 'terra_resume_udp', 'terra_consume_datagram', 'terra_receive_coalesced',
         'terra_receive_udp_frame', 'terra_udp_writable', 'terra_udp_control', 'terra_send_udp',
         'terra_track_tcp_close', 'terra_setup_stream', 'terra_socket_poll', 'terra_set_peek_off', 'terra_listen',
@@ -126,7 +125,7 @@ def main() -> None:
         for checks, extracted, warnings in programs:
             (directory / 'extracted.c').write_text(extracted)
             subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror', *warnings, '-fsanitize=address,undefined',
-                            '-g', f'-I{directory}', f'-I{TESTS}', str(TESTS / checks), '-o', str(executable)],
+                            '-g', f'-I{directory}', f'-I{TESTS}', f'-I{ROOT / "kernel/overlay/include"}', str(TESTS / checks), '-o', str(executable)],
                            check=True)
             subprocess.run([str(executable)], check=True, env={**os.environ, 'ASAN_OPTIONS': 'detect_leaks=0'})
     print('kernel opening, TCP peek/discard/TCP_INFO, UDP controls/GSO/GRO/atomic backpressure, transport credit, and callback teardown checks passed')

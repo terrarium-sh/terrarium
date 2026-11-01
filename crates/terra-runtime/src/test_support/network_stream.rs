@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use terra_protocol::application::{Direction, Message, StreamDecoder};
+use terra_protocol::application::{self, Frame as _, GuestFrame, HEADER_BYTES, HostFrame};
 use terra_protocol::vsock::{
     AGENT_PORT, CONTROL_PORT, FLOW_REPLY_BYTES, FLOW_UPSTREAM_BYTES, PUBLICATION_PORT,
 };
@@ -218,9 +218,18 @@ impl GuestStream {
     pub(super) async fn send_message(
         &mut self,
         stream: Stream,
-        message: &Message,
+        frame: &GuestFrame,
     ) -> wasmtime::Result<()> {
-        let bytes = message.encode()?;
+        let bytes = frame.encode()?;
+        self.submit_raw(stream, &bytes).await
+    }
+
+    pub(super) async fn send_control<T: terra_protocol::Message>(
+        &mut self,
+        stream: Stream,
+        message: &T,
+    ) -> wasmtime::Result<()> {
+        let bytes = terra_protocol::encode_frame(message)?;
         self.submit_raw(stream, &bytes).await
     }
 
@@ -260,22 +269,24 @@ impl GuestStream {
         Ok(drained)
     }
 
-    pub(super) async fn read_message(&mut self, stream: Stream) -> wasmtime::Result<Message> {
-        let mut bytes = self
-            .read_bytes(stream, terra_protocol::application::HEADER_BYTES)
-            .await?;
-        let length = usize::try_from(u32::from_le_bytes(bytes[4..8].try_into()?))?;
-        wasmtime::ensure!(
-            terra_protocol::application::HEADER_BYTES + length
-                <= terra_protocol::application::MAX_UDP_FRAME_BYTES,
-            "network device suite frame bound"
-        );
-        bytes.extend(self.read_bytes(stream, length).await?);
-        let mut decoder = StreamDecoder::default();
-        decoder.push(&bytes)?;
-        decoder
-            .next(Direction::HostToGuest)?
+    pub(super) async fn read_frame(&mut self, stream: Stream) -> wasmtime::Result<HostFrame> {
+        let mut bytes = self.read_bytes(stream, HEADER_BYTES).await?;
+        let length = application::frame_len(bytes.as_slice().try_into()?)?;
+        bytes.extend(self.read_bytes(stream, length - HEADER_BYTES).await?);
+        HostFrame::decode(&bytes)?
+            .map(|(frame, _)| frame)
             .ok_or_else(|| wasmtime::Error::msg("network device suite incomplete frame"))
+    }
+
+    pub(super) async fn read_message<T: terra_protocol::Message>(
+        &mut self,
+        stream: Stream,
+    ) -> wasmtime::Result<T> {
+        let mut frame = self.read_bytes(stream, 4).await?;
+        let length = terra_protocol::frame_payload_len::<T>(frame.as_slice().try_into()?)?;
+        frame.extend(self.read_bytes(stream, length).await?);
+        terra_protocol::read_frame(&mut frame.as_slice())?
+            .ok_or_else(|| wasmtime::Error::msg("network device suite incomplete message"))
     }
 
     pub(super) async fn finish_input(&mut self, stream: Stream) -> wasmtime::Result<()> {

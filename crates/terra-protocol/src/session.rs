@@ -4,6 +4,9 @@ use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 
+/// Terminal bytes one [`ClientInput::Keys`], [`AgentOutput::Out`] or [`AgentOutput::Err`] carries at most.
+pub const MAX_TERMINAL_CHUNK_BYTES: usize = 64 << 10;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TermSize {
     pub rows: u16,
@@ -15,6 +18,11 @@ pub enum ClientInput {
     Keys(#[serde(with = "serde_bytes")] Vec<u8>),
     Resize(TermSize),
     Eof,
+}
+
+impl crate::Message for ClientInput {
+    const MAX_PAYLOAD_BYTES: usize =
+        MAX_TERMINAL_CHUNK_BYTES + crate::frames::BYTE_VARIANT_OVERHEAD_BYTES;
 }
 
 /// A framed response from the agent to a terminal or exec client.
@@ -29,11 +37,20 @@ pub enum AgentOutput {
     Detached,
 }
 
+impl crate::Message for AgentOutput {
+    const MAX_PAYLOAD_BYTES: usize =
+        MAX_TERMINAL_CHUNK_BYTES + crate::frames::BYTE_VARIANT_OVERHEAD_BYTES;
+}
+
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlRequest {
     List,
     Detach { id: u64 },
     DetachAll,
+}
+
+impl crate::Message for ControlRequest {
+    const MAX_PAYLOAD_BYTES: usize = 16;
 }
 
 /// The agent's answer to a [`ControlRequest`].
@@ -43,6 +60,10 @@ pub enum ControlReply {
     Done,
     Detached { id: u64 },
     Missing { id: u64 },
+}
+
+impl crate::Message for ControlReply {
+    const MAX_PAYLOAD_BYTES: usize = 4096;
 }
 
 /// `as_root` is the `--root` flag, and the agent resolves the command identity.
@@ -55,6 +76,11 @@ pub struct ExecRequest {
     pub tty: Option<TermSize>,
     pub workdir: Option<String>,
     pub env: BTreeMap<String, String>,
+}
+
+impl crate::Message for ExecRequest {
+    /// The same budget a boot plan gives the workload's command and environment.
+    const MAX_PAYLOAD_BYTES: usize = crate::MAX_PLAN_BYTES;
 }
 
 fn deserialize_argv<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>

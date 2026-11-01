@@ -250,10 +250,8 @@ mod tests {
     use std::assert_matches;
 
     fn boot_plan() -> Vec<u8> {
-        terra_protocol::encode_frame(&terra_protocol::BootPlan::new(
-            terra_protocol::Plan::bare_run(vec!["/bin/sh".into()]),
-        ))
-        .expect("plan encodes")
+        terra_protocol::encode_frame(&terra_protocol::Plan::bare_run(vec!["/bin/sh".into()]))
+            .expect("plan encodes")
     }
 
     #[test]

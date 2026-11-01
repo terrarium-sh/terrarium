@@ -94,7 +94,7 @@ COMPONENT_AOT_TARGETS := $(addsuffix -aot,$(COMPONENT_TARGETS))
 COMPONENT_MANIFEST := components/Cargo.toml
 COMPONENT_WASM_DIR := components/target/wasm-components/release
 
-.PHONY: $(COMPONENT_TARGETS) $(COMPONENT_AOT_TARGETS) policy policy-check verify-source verify-host-components guest-assets check-guest-assets host-build host-dist source-dist verify-wit verify-dependency-boundaries verify-platform build verify verify-components verify-workspace dist man skill clean test-component-boot test-platform-native-vm test-component-vmm test-install check-zig check-bubblewrap
+.PHONY: $(COMPONENT_TARGETS) $(COMPONENT_AOT_TARGETS) policy policy-check verify-source verify-host-components guest-assets check-guest-assets host-build host-dist source-dist verify-wit verify-dependency-boundaries verify-platform build verify verify-components verify-workspace dist man skill kernel-abi clean test-component-boot test-platform-native-vm test-component-vmm test-install check-zig check-bubblewrap
 
 # Pin changes invalidate every embedded guest payload.
 PINS := $(ARCH) $(KERNEL_VERSION) $(KERNEL_SHA256) $(E2FSPROGS_VERSION) $(E2FSPROGS_SHA256) \
@@ -116,8 +116,8 @@ KERNEL_OUTPUT := $(BUILD)/kernel-$(ARCH)
 KERNEL_FRAGMENTS := kernel/terra.config kernel/$(ARCH).config
 KERNEL_PATCHES := $(sort $(wildcard kernel/patches/*.patch))
 KERNEL_OVERLAY := $(shell find kernel/overlay -type f | sort)
-KERNEL_PACKAGING_INPUTS := crates/terra-protocol/src/guest_image.rs crates/terra-protocol/src/socket.rs \
-	crates/terra-protocol/src/application.rs crates/terra-protocol/src/vsock.rs crates/terra-protocol/examples/package-guest-image.rs
+KERNEL_PACKAGING_INPUTS := crates/terra-protocol/src/guest_image.rs crates/terra-protocol/src/kernel_abi.rs \
+	crates/terra-protocol/examples/package-guest-image.rs
 KERNEL_INPUTS := $(BUILD)/.kernel-inputs
 KERNEL_PATCH_STAMP := $(KERNEL_SOURCE)/.terra-patches
 KERNEL_JOBS ?= $(shell nproc)
@@ -321,7 +321,7 @@ BOOT_TREE := $(BUILD)/boot-tree
 BOOT_GZ := $(BUILD)/boot.img.gz
 BOOT_IMAGE := $(BUILD)/boot.img.tlz4
 BOOT_IMG_MIB := 3
-$(BOOT_GZ): $(MKE2FS) $(RESIZE2FS) $(AGENT_BIN) $(PIN_STAMP) Makefile crates/terra-protocol/src/guest_image.rs crates/terra-protocol/examples/package-guest-image.rs
+$(BOOT_GZ): $(MKE2FS) $(RESIZE2FS) $(AGENT_BIN) $(PIN_STAMP) Makefile crates/terra-protocol/src/guest_image.rs crates/terra-protocol/src/kernel_abi.rs crates/terra-protocol/examples/package-guest-image.rs
 	rm -rf $(BOOT_TREE)
 	# /dev is where the kernel auto-mounts devtmpfs (CONFIG_DEVTMPFS_MOUNT), which
 	# is what gives init a console and the disk nodes; /proc, /sys and /mnt are
@@ -493,6 +493,11 @@ check-zig:
 ## out of the release build's dependency graph.
 man:
 	$(CARGO_LOCKED) run -p terra --example gen-docs --target $(TERRA_TARGET)
+
+## Render the kernel ABI header from terra-protocol; its tests fail while the committed copy is stale.
+kernel-abi:
+	$(CARGO_LOCKED) run -q -p terra-protocol --example render-kernel-abi > kernel/overlay/include/linux/terra_abi.h.tmp
+	mv kernel/overlay/include/linux/terra_abi.h.tmp kernel/overlay/include/linux/terra_abi.h
 
 ## Render the agent skill (skills/terra-box/SKILL.md) from packaging/agent-skill.md
 ## and the docs it includes. verify-source fails while the committed copy is stale.

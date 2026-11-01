@@ -1,10 +1,9 @@
 //! One guest UDP socket per vsock stream: open once, then datagram frames both ways.
 
 use super::{
-    CHUNK_BYTES, batches, broker_error, consume_upstream, deliver_bytes, deliver_message,
-    deliver_opening, finish_flow, host_socket_address, native_socket_address, read_opening,
-    reject_opening, reset_flow, resolve_destination, run_before_deadline, shutdown_flow,
-    wait_upstream,
+    CHUNK_BYTES, batches, broker_error, consume_upstream, deliver_bytes, deliver_frame,
+    finish_flow, host_socket_address, native_socket_address, open_socket, reset_flow,
+    resolve_destination, shutdown_flow, wait_upstream,
 };
 use crate::terra::network::broker::{self, Udp};
 use futures_util::{
@@ -14,11 +13,10 @@ use futures_util::{
 };
 use std::{cell::RefCell, net::SocketAddr, pin::Pin};
 use terra_protocol::application::{
-    Message, OPEN_TIMEOUT_SECS, UdpSendFrame, append_udp_datagram, decode_udp_send,
+    Frame as _, GuestFrame, HostFrame, LentFrame, UDP_FRAME_OVERHEAD_BYTES, UdpRun,
+    append_udp_datagram,
 };
-use terra_protocol::network::{
-    DATAGRAM_FRAME_OVERHEAD_BYTES, MAX_NETWORK_DATAGRAM_BATCH_BYTES, MAX_NETWORK_DATAGRAMS,
-};
+use terra_protocol::network::{MAX_NETWORK_DATAGRAM_BATCH_BYTES, MAX_NETWORK_DATAGRAMS};
 use terra_protocol::socket::Error as SocketError;
 use terra_vsock_device::{ConnectionId, Role};
 use wit_bindgen::rt::async_support::FutureReader;
@@ -82,28 +80,13 @@ impl PeerTranslations {
 }
 
 pub(super) async fn serve(connection: ConnectionId) {
-    let opening = async {
-        let outcome = async {
-            if read_opening(connection).await? != Message::UdpOpen {
-                return Err(SocketError::Protocol);
-            }
-            broker::open_udp().await.map_err(broker_error)
+    let opening = async { broker::open_udp().await.map_err(broker_error) };
+    if let Some(socket) = open_socket(connection, opening).await {
+        if relay(connection, &socket, None).await.is_err() {
+            reset_flow(connection);
+        } else {
+            shutdown_flow(connection);
         }
-        .await;
-        let reply = Message::UdpOpened(outcome.as_ref().map(|_| ()).map_err(|error| *error));
-        deliver_opening(connection, &reply).await?;
-        outcome
-    };
-    match run_before_deadline(OPEN_TIMEOUT_SECS, opening).await {
-        Ok(Ok(socket)) => {
-            if relay(connection, &socket, None).await.is_err() {
-                reset_flow(connection);
-            } else {
-                shutdown_flow(connection);
-            }
-        }
-        Ok(Err(_)) => shutdown_flow(connection),
-        Err(error) => reject_opening(connection, &Message::UdpOpened(Err(error))),
     }
     finish_flow(connection);
 }
@@ -154,15 +137,19 @@ async fn send_datagrams(
         let mut headers = Vec::new();
         let mut bytes = Vec::with_capacity(queued.len().min(MAX_NETWORK_DATAGRAM_BATCH_BYTES));
         let mut consumed = 0;
-        while let Some(UdpSendFrame {
-            peer,
-            segment,
-            bytes: payload,
-            frame_bytes,
-        }) = decode_udp_send(&queued[consumed..]).map_err(|_| SocketError::Protocol)?
+        while let Some((frame, frame_bytes)) =
+            GuestFrame::decode_lent(&queued[consumed..]).map_err(|_| SocketError::Protocol)?
         {
+            let LentFrame::UdpRun(UdpRun {
+                peer,
+                segment,
+                bytes: payload,
+            }) = frame
+            else {
+                return Err(SocketError::Protocol);
+            };
             if headers.len() == MAX_NETWORK_DATAGRAMS
-                || bytes.len() + payload.len() + (headers.len() + 1) * DATAGRAM_FRAME_OVERHEAD_BYTES
+                || bytes.len() + payload.len() + (headers.len() + 1) * UDP_FRAME_OVERHEAD_BYTES
                     > MAX_NETWORK_DATAGRAM_BATCH_BYTES
             {
                 break;
@@ -211,7 +198,7 @@ async fn send_datagrams(
         if !errors.is_empty() {
             let _guard = writer.lock().await;
             for (peer, error) in errors {
-                deliver_message(connection, &Message::UdpError { peer, error }).await?;
+                deliver_frame(connection, &HostFrame::UdpError { peer, error }).await?;
             }
         }
     }
@@ -237,17 +224,19 @@ async fn deliver_datagrams(
     batch: broker::DatagramBatch,
 ) -> Result<(), SocketError> {
     let broker::DatagramBatch { headers, bytes } = batch;
-    let mut frames =
-        Vec::with_capacity(bytes.len() + headers.len() * DATAGRAM_FRAME_OVERHEAD_BYTES);
+    let mut frames = Vec::with_capacity(bytes.len() + headers.len() * UDP_FRAME_OVERHEAD_BYTES);
     let mut rest = bytes.as_slice();
     for header in &headers {
-        let (run, tail) = rest
+        let (bytes, tail) = rest
             .split_at_checked(usize::from(header.length))
             .ok_or(SocketError::Protocol)?;
         rest = tail;
-        let peer = peers.guest_peer(native_socket_address(header.peer));
-        append_udp_datagram(&mut frames, peer, header.segment, run)
-            .map_err(|_| SocketError::Protocol)?;
+        let run = UdpRun {
+            peer: peers.guest_peer(native_socket_address(header.peer)),
+            segment: header.segment,
+            bytes,
+        };
+        append_udp_datagram(&mut frames, run).map_err(|_| SocketError::Protocol)?;
     }
     deliver_bytes(connection, frames).await
 }

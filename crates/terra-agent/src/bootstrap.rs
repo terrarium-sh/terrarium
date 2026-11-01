@@ -11,10 +11,7 @@ use terra_protocol::guest_root::{
     PER_BOOT_DIR, PER_BOOT_DOAS_CONF, PER_BOOT_DOAS_DIR, PER_BOOT_LOCALTIME, PER_BOOT_RESOLV_CONF,
     PER_BOOT_SANDBOX_INFO,
 };
-use terra_protocol::{
-    BootPlan, CLOCK_SYNC, CLOCK_SYNC_BYTES, Plan, PlanMode, RESIZE2FS_GUEST_PATH, ROOT_DEVICE,
-    RootfsMount, WORKLOAD_ID,
-};
+use terra_protocol::{Plan, PlanMode, RESIZE2FS_GUEST_PATH, ROOT_DEVICE, RootfsMount, WORKLOAD_ID};
 
 const CLEAN_MOUNT: &str = "/mnt/clean";
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -132,18 +129,12 @@ fn mount_scratch_directories() -> Result<()> {
 }
 
 fn read_boot_plan(reader: &mut impl std::io::Read) -> Result<Plan> {
-    let boot_plan: BootPlan =
-        terra_protocol::read_frame_with_limit(reader, terra_protocol::MAX_PLAN_BYTES)
-            .context("reading the boot plan")?
-            .ok_or_else(|| anyhow::anyhow!("control channel closed before receiving boot plan"))?;
-    boot_plan
-        .validate_protocol_versions()
-        .context("validating boot protocol versions")?;
-    boot_plan
-        .plan
-        .validate_network()
+    let plan: Plan = terra_protocol::read_frame(reader)
+        .context("reading the boot plan")?
+        .ok_or_else(|| anyhow::anyhow!("control channel closed before receiving boot plan"))?;
+    plan.validate_network()
         .context("validating guest network configuration")?;
-    Ok(boot_plan.plan)
+    Ok(plan)
 }
 
 const SUPERBLOCK_OFFSET: u64 = 1024;
@@ -387,16 +378,8 @@ fn set_clock(seconds: i64, nanoseconds: u32) -> Result<()> {
     Ok(())
 }
 
-pub(crate) async fn read_clock_update(reader: &mut crate::AsyncFile) -> Result<()> {
-    use tokio::io::AsyncReadExt as _;
-    let mut bytes = [0; CLOCK_SYNC_BYTES];
-    bytes[0] = CLOCK_SYNC;
-    reader
-        .read_exact(&mut bytes[1..])
-        .await
-        .context("reading clock update")?;
-    let (seconds, nanoseconds) = terra_protocol::decode_clock_sync(&bytes)
-        .ok_or_else(|| anyhow::anyhow!("invalid clock update"))?;
+/// Set the guest clock to the host's when they differ by five seconds or more.
+pub(crate) fn sync_clock(seconds: i64, nanoseconds: u32) -> Result<()> {
     let current = rustix::time::clock_gettime(rustix::time::ClockId::Realtime);
     if current.tv_sec.abs_diff(seconds) < 5 {
         return Ok(());
@@ -578,36 +561,16 @@ mod tests {
     }
 
     #[test]
-    fn boot_plan_versions_are_checked_before_host_state_or_hooks() {
-        let mut boot_plan = BootPlan::new(test_plan());
-        boot_plan.plan.on_start.push("exit 99".into());
-        boot_plan.plan.host_time = Some(terra_protocol::HostTime {
+    fn boot_plan_carries_host_state_and_hooks() {
+        let mut plan = test_plan();
+        plan.on_start.push("exit 99".into());
+        plan.host_time = Some(terra_protocol::HostTime {
             seconds: 12,
             nanoseconds: 34,
         });
-        boot_plan.plan.host_seed = Some([0; 32]);
-        let frame = terra_protocol::encode_frame(&boot_plan).unwrap();
-        assert_eq!(
-            read_boot_plan(&mut frame.as_slice()).unwrap(),
-            boot_plan.plan
-        );
-        for (agent_version, socket_version) in [
-            (
-                terra_protocol::AGENT_PROTOCOL_VERSION - 1,
-                terra_protocol::socket::VERSION,
-            ),
-            (
-                terra_protocol::AGENT_PROTOCOL_VERSION,
-                terra_protocol::socket::VERSION + 1,
-            ),
-        ] {
-            boot_plan.agent_version = agent_version;
-            boot_plan.socket_version = socket_version;
-            let frame = terra_protocol::encode_frame(&boot_plan).unwrap();
-            assert!(read_boot_plan(&mut frame.as_slice()).is_err());
-        }
-        let bare_plan = terra_protocol::encode_frame(&test_plan()).unwrap();
-        assert!(read_boot_plan(&mut bare_plan.as_slice()).is_err());
+        plan.host_seed = Some([0; 32]);
+        let frame = terra_protocol::encode_frame(&plan).unwrap();
+        assert_eq!(read_boot_plan(&mut frame.as_slice()).unwrap(), plan);
     }
 
     #[test]

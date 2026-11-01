@@ -2,7 +2,7 @@
 
 use std::fs::File;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use terra_protocol::control::MAX_DIAGNOSTIC_EVENT_BYTES;
+use terra_protocol::MAX_DIAGNOSTIC_EVENT_BYTES;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 const CHUNK_BYTES: usize = 4096;

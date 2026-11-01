@@ -14,7 +14,6 @@ use terra_protocol::{self as protocol, AgentOutput, AgentService, ClientInput, T
 const AGENT_HELLO_WAIT_TIMEOUT: Duration = Duration::from_millis(500);
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_SESSION_CLIENTS: usize = 1024;
-const MAX_CONTROL_REPLY_FRAME_BYTES: usize = 4096;
 const SILENT_BOOT_GRACE: Duration = Duration::from_secs(15);
 
 pub fn read_terminal_size() -> Option<TermSize> {
@@ -189,10 +188,7 @@ pub async fn list_clients(bx: &BoxRef, agent_timeout: Option<u64>) -> Result<Vec
     loop {
         match tokio::time::timeout(
             CONTROL_READ_TIMEOUT,
-            protocol::read_frame_async_with_limit::<protocol::ControlReply>(
-                &mut stream,
-                MAX_CONTROL_REPLY_FRAME_BYTES,
-            ),
+            protocol::read_frame_async::<protocol::ControlReply>(&mut stream),
         )
         .await
         .map_err(|_| anyhow::anyhow!("reading the session listing timed out"))?
@@ -227,10 +223,7 @@ pub async fn detach_client(bx: &BoxRef, client_id: u64, agent_timeout: Option<u6
     .await?;
     match tokio::time::timeout(
         CONTROL_READ_TIMEOUT,
-        protocol::read_frame_async_with_limit::<protocol::ControlReply>(
-            &mut stream,
-            MAX_CONTROL_REPLY_FRAME_BYTES,
-        ),
+        protocol::read_frame_async::<protocol::ControlReply>(&mut stream),
     )
     .await
     .map_err(|_| anyhow::anyhow!("reading the detach reply timed out"))?
@@ -265,10 +258,7 @@ pub async fn detach_all(bx: &BoxRef, agent_timeout: Option<u64>) -> Result<u64> 
     loop {
         match tokio::time::timeout(
             CONTROL_READ_TIMEOUT,
-            protocol::read_frame_async_with_limit::<protocol::ControlReply>(
-                &mut stream,
-                MAX_CONTROL_REPLY_FRAME_BYTES,
-            ),
+            protocol::read_frame_async::<protocol::ControlReply>(&mut stream),
         )
         .await
         .map_err(|_| anyhow::anyhow!("reading the detach replies timed out"))?

@@ -1,19 +1,19 @@
 //! Chunked LZ4 container for the embedded guest kernel and boot disk.
 
-use crate::guest_image::GuestImage;
+use crate::guest_image::{GuestImage, MARKER_BYTES};
 use std::io;
 use std::ops::Range;
 
-const MAGIC: [u8; 8] = *b"TERRALZ\x01";
+const MAGIC: [u8; 8] = *b"TERRALZ\x02";
 const KERNEL_CHUNK_BYTES: u32 = 1024 * 1024;
 const BOOT_CHUNK_BYTES: u32 = 64 * 1024;
 
-const MAGIC_RANGE: Range<usize> = 0..8;
-const MARKER_RANGE: Range<usize> = 8..20;
-const CHUNK_BYTES_RANGE: Range<usize> = 20..24;
-const IMAGE_BYTES_RANGE: Range<usize> = 24..32;
-const CHUNK_COUNT_RANGE: Range<usize> = 32..36;
-const HEADER_BYTES: usize = 36;
+const MAGIC_RANGE: Range<usize> = 0..MAGIC.len();
+const MARKER_RANGE: Range<usize> = MAGIC_RANGE.end..MAGIC_RANGE.end + MARKER_BYTES;
+const CHUNK_BYTES_RANGE: Range<usize> = MARKER_RANGE.end..MARKER_RANGE.end + 4;
+const IMAGE_BYTES_RANGE: Range<usize> = CHUNK_BYTES_RANGE.end..CHUNK_BYTES_RANGE.end + 8;
+const CHUNK_COUNT_RANGE: Range<usize> = IMAGE_BYTES_RANGE.end..IMAGE_BYTES_RANGE.end + 4;
+const HEADER_BYTES: usize = CHUNK_COUNT_RANGE.end;
 const TABLE_ENTRY_BYTES: usize = 8;
 const ENTRY_CRC_AT: usize = 4;
 

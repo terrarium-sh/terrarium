@@ -583,7 +583,10 @@ pub(super) async fn receive_datagrams(
 type StreamRead = ReadHalf<Compat<yamux::Stream>>;
 
 async fn next_request(mut read: StreamRead) -> (StreamRead, Option<UdpRequest>) {
-    let request = crate::frames::read_frame(&mut read).await.ok().flatten();
+    let request = terra_protocol::read_frame_async(&mut read)
+        .await
+        .ok()
+        .flatten();
     (read, request)
 }
 
@@ -623,12 +626,12 @@ pub(super) async fn serve(stream: Compat<yamux::Stream>, udp: UdpResource, polic
             datagrams = finish(&mut receiving) => match datagrams {
                 Ok(datagrams) => UdpReply::Datagrams(datagrams),
                 Err(error) => {
-                    let _ = crate::frames::write_frame(&mut write, &UdpReply::Failed(error)).await;
+                    let _ = terra_protocol::write_frame_async(&mut write, &UdpReply::Failed(error)).await;
                     return;
                 }
             },
         };
-        if crate::frames::write_frame(&mut write, &reply)
+        if terra_protocol::write_frame_async(&mut write, &reply)
             .await
             .is_err()
         {

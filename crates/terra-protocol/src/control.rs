@@ -11,7 +11,9 @@ pub enum AgentService {
     SessionControl,
 }
 
-pub const MAX_SERVICE_FRAME_BYTES: usize = 64;
+impl crate::Message for AgentService {
+    const MAX_PAYLOAD_BYTES: usize = 64;
+}
 
 pub const STOP_SIGNAL: u8 = b'S';
 
@@ -19,8 +21,6 @@ pub const DEFAULT_STOP_GRACE_SECS: u64 = 30;
 
 /// Bump when a host and a running guest agent cannot safely communicate.
 pub const AGENT_PROTOCOL_VERSION: u8 = 2;
-
-pub const AGENT_READY_NOTIFICATION: u8 = b'R';
 
 /// The first bytes the agent writes on each accepted connection.
 /// `V` cannot be an escape byte because a session repaints immediately after the hello.
@@ -41,29 +41,26 @@ pub enum LifecycleEvent {
     },
 }
 
-pub const MAX_DIAGNOSTIC_EVENT_BYTES: usize = 64 << 10;
-pub const MAX_DIAGNOSTIC_FRAME_BYTES: usize = MAX_DIAGNOSTIC_EVENT_BYTES + 8;
-
-pub const CLOCK_SYNC: u8 = b'T';
-pub const CLOCK_SYNC_BYTES: usize = 13;
-
-#[must_use]
-pub fn encode_clock_sync(seconds: i64, nanoseconds: u32) -> [u8; CLOCK_SYNC_BYTES] {
-    let mut bytes = [0; CLOCK_SYNC_BYTES];
-    bytes[0] = CLOCK_SYNC;
-    bytes[1..9].copy_from_slice(&seconds.to_le_bytes());
-    bytes[9..13].copy_from_slice(&nanoseconds.to_le_bytes());
-    bytes
+impl crate::Message for LifecycleEvent {
+    const MAX_PAYLOAD_BYTES: usize =
+        MAX_DIAGNOSTIC_EVENT_BYTES + crate::frames::BYTE_VARIANT_OVERHEAD_BYTES;
 }
 
-#[must_use]
-pub fn decode_clock_sync(bytes: &[u8]) -> Option<(i64, u32)> {
-    if bytes.len() != CLOCK_SYNC_BYTES || bytes[0] != CLOCK_SYNC {
-        return None;
-    }
-    let seconds = i64::from_le_bytes(bytes[1..9].try_into().ok()?);
-    let nanoseconds = u32::from_le_bytes(bytes[9..13].try_into().ok()?);
-    (nanoseconds < 1_000_000_000).then_some((seconds, nanoseconds))
+pub const MAX_DIAGNOSTIC_EVENT_BYTES: usize = 64 << 10;
+
+/// What the host sends the agent on its control stream after the boot plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AgentCommand {
+    Stop,
+    /// The host's wall clock, for an agent whose clock has drifted.
+    SyncClock {
+        seconds: i64,
+        nanoseconds: u32,
+    },
+}
+
+impl crate::Message for AgentCommand {
+    const MAX_PAYLOAD_BYTES: usize = 32;
 }
 
 #[cfg(test)]
@@ -76,19 +73,27 @@ mod tests {
             let event = LifecycleEvent::Diagnostic {
                 bytes: vec![0; size],
             };
-            let encoded = crate::encode_frame(&event).unwrap();
+            let encoded = crate::frames::frame_bytes(&event);
             let decoded = crate::read_frame::<LifecycleEvent>(&mut encoded.as_slice());
             assert_eq!(decoded.is_ok(), size == MAX_DIAGNOSTIC_EVENT_BYTES);
         }
     }
 
     #[test]
-    fn clock_update_is_fixed_size_and_rejects_invalid_nanoseconds() {
-        let update = encode_clock_sync(-1, 999_999_999);
-        assert_eq!(decode_clock_sync(&update), Some((-1, 999_999_999)));
-        let mut invalid = update;
-        invalid[9..13].copy_from_slice(&1_000_000_000_u32.to_le_bytes());
-        assert_eq!(decode_clock_sync(&invalid), None);
+    fn agent_commands_round_trip_within_their_limit() {
+        for command in [
+            AgentCommand::Stop,
+            AgentCommand::SyncClock {
+                seconds: i64::MIN,
+                nanoseconds: u32::MAX,
+            },
+        ] {
+            let frame = crate::encode_frame(&command).unwrap();
+            assert_eq!(
+                crate::read_frame::<AgentCommand>(&mut frame.as_slice()).unwrap(),
+                Some(command)
+            );
+        }
     }
 
     #[test]
@@ -102,27 +107,20 @@ mod tests {
             let frame = crate::encode_frame(&service).unwrap();
             assert_eq!(&frame[4..], &[wire]);
             assert_eq!(
-                crate::read_frame_with_limit::<AgentService>(
-                    &mut frame.as_slice(),
-                    MAX_SERVICE_FRAME_BYTES,
-                )
-                .unwrap(),
+                crate::read_frame::<AgentService>(&mut frame.as_slice()).unwrap(),
                 Some(service),
             );
         }
-        assert_eq!(AGENT_HELLO, [b'V', AGENT_PROTOCOL_VERSION]);
     }
 
     #[test]
     fn service_selection_rejects_unknown_and_oversized_frames() {
-        let unknown = crate::encode_frame(&"unknown_service").unwrap();
-        let oversized = u32::try_from(MAX_SERVICE_FRAME_BYTES + 1)
+        let unknown = crate::frames::frame_bytes(&"unknown_service");
+        let oversized = u32::try_from(<AgentService as crate::Message>::MAX_PAYLOAD_BYTES + 1)
             .unwrap()
             .to_le_bytes();
         for mut bytes in [unknown.as_slice(), oversized.as_slice()] {
-            let error =
-                crate::read_frame_with_limit::<AgentService>(&mut bytes, MAX_SERVICE_FRAME_BYTES)
-                    .unwrap_err();
+            let error = crate::read_frame::<AgentService>(&mut bytes).unwrap_err();
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         }
     }
@@ -134,6 +132,7 @@ mod tests {
             &[2, 46]
         );
     }
+
     #[test]
     fn round_trip_lifecycle_events() {
         for event in [

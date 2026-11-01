@@ -466,11 +466,8 @@ fn exchange_broker_startup(
                 drop(input.listeners);
                 startup.write_all(&input.config)?;
                 startup.shutdown(Shutdown::Write)?;
-                let ready: terra_network::config::Ready = terra_protocol::read_frame_with_limit(
-                    &mut startup,
-                    terra_network::config::MAX_READY_BYTES,
-                )?
-                .context("network broker closed its readiness channel")?;
+                let ready: terra_network::config::Ready = terra_protocol::read_frame(&mut startup)?
+                    .context("network broker closed its readiness channel")?;
                 ensure!(
                     ready.host_service_ports.len() <= terra_policy::MAX_EXPANDED_RULES,
                     "invalid broker readiness metadata"
@@ -535,10 +532,7 @@ pub(crate) fn run_broker() -> Result<ExitCode> {
         .build()?;
     let result = runtime.block_on(async move {
         let broker = terra_network::Broker::new(&config, listeners, sockets)?;
-        startup.write_all(&terra_protocol::encode_frame_with_limit(
-            &broker.ready(),
-            terra_network::config::MAX_READY_BYTES,
-        )?)?;
+        startup.write_all(&terra_protocol::encode_frame(&broker.ready())?)?;
         drop(startup);
         broker.serve(AsyncLocalStream::from_std(channel)?).await
     });
@@ -698,13 +692,7 @@ mod tests {
                 let mut input = Vec::new();
                 broker.read_to_end(&mut input).unwrap();
                 broker
-                    .write_all(
-                        &terra_protocol::encode_frame_with_limit(
-                            &ready,
-                            terra_network::config::MAX_READY_BYTES,
-                        )
-                        .unwrap(),
-                    )
+                    .write_all(&terra_protocol::encode_frame(&ready).unwrap())
                     .unwrap();
                 assert_eq!(input, b"config");
             });
@@ -1040,9 +1028,7 @@ mod tests {
                     .unwrap();
             assert!(output.status.success(), "{mode}: {output:?}");
             assert_eq!(
-                output
-                    .stdout
-                    .contains(&terra_protocol::AGENT_READY_NOTIFICATION),
+                output.stdout.contains(&boot::AGENT_READY_NOTIFICATION),
                 expected_ready,
                 "{mode}: {output:?}"
             );
@@ -1062,7 +1048,7 @@ mod tests {
         let (sender, ready) = std::sync::mpsc::channel();
         let reader = std::thread::spawn(move || {
             for byte in output.by_ref().bytes().take(4096) {
-                if byte.unwrap() == terra_protocol::AGENT_READY_NOTIFICATION {
+                if byte.unwrap() == boot::AGENT_READY_NOTIFICATION {
                     sender.send(()).unwrap();
                     break;
                 }

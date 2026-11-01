@@ -17,6 +17,9 @@
     `packaging/agent-skill.md` and `docs/{recipe,manifest}.md`. After editing
     any of them, run `make skill` and commit the result; `make verify-source`
     fails on drift.
+*   **Kernel ABI header:** `kernel/overlay/include/linux/terra_abi.h` is
+    rendered from `terra-protocol`. After changing a constant it carries, run
+    `make kernel-abi` and commit the result; the protocol tests fail on drift.
 *   **CLI Updates:** `crates/terra/src/cli.rs` is the source of truth for the man
     pages; `make man` re-renders them (they are generated, not committed).
 *   **Boot Tests:** Requires `/dev/kvm`. Run: `make dist && TERRA_BIN=$PWD/dist/terra cargo test -p terra --test boot -- --ignored`

@@ -83,7 +83,6 @@ async fn connect_tcp(client: &Client, inline_urgent: bool) -> (Tcp, TcpListener)
         listener.accept()
     );
     let flow = flow.unwrap();
-    assert_eq!(flow.peer(), address);
     let (upload, download) = flow.split();
     let tcp = Tcp {
         upload,
@@ -484,12 +483,10 @@ async fn accepting_requires_a_loopback_peer_and_queues_accepts_per_grant() {
         let flow = waiting.await.unwrap().unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!queued.is_finished());
-        let second = TcpStream::connect(address).await.unwrap();
-        assert_eq!(
-            queued.await.unwrap().unwrap().peer(),
-            second.local_addr().unwrap()
-        );
-        assert_eq!(flow.peer(), connected.local_addr().unwrap());
+        let mut second = TcpStream::connect(address).await.unwrap();
+        let (_queued_upload, mut queued_download) = queued.await.unwrap().unwrap().split();
+        second.write_all(b"2").await.unwrap();
+        assert_eq!(read_download(&mut queued_download, 1).await, b"2");
         let (mut upload, mut download) = flow.split();
         connected.write_all(b"in").await.unwrap();
         assert_eq!(read_download(&mut download, 2).await, b"in");
@@ -547,7 +544,7 @@ async fn a_client_reset_before_accept_leaves_the_port_open() {
         let kept = TcpStream::connect(address).await.unwrap();
         let expected = kept.local_addr().unwrap();
         for _ in 0..2 {
-            if tcp::accept(&listener).await.unwrap().1 == expected {
+            if tcp::accept(&listener).await.unwrap().peer_addr().ok() == Some(expected) {
                 return;
             }
         }
@@ -1062,7 +1059,7 @@ async fn outbound_tcp_keepalive_follows_the_guest_request() {
     let without_keepalive = tcp::connect(&SocketSource::Native, peer, TcpOpenOptions::default())
         .await
         .unwrap();
-    let (inbound, _) = tcp::accept(&listener).await.unwrap();
+    let inbound = tcp::accept(&listener).await.unwrap();
     assert!(SockRef::from(&with_keepalive).keepalive().unwrap());
     #[cfg(target_os = "linux")]
     {

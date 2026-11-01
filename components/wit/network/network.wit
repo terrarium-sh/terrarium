@@ -21,7 +21,6 @@ interface broker {
         datagram-too-large, closed, io,
     }
     resource tcp {
-        peer-address: func() -> result<socket-address, error>;
         send: func(data: stream<u8>) -> future<result<_, error>>;
         receive: func() -> tuple<stream<u8>, future<result<_, error>>>;
     }

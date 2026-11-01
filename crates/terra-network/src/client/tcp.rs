@@ -4,7 +4,6 @@
 use super::Client;
 use crate::Error;
 use std::io;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use terra_protocol::network::TcpEvent;
@@ -20,7 +19,6 @@ type StreamRead = ReadHalf<Compat<yamux::Stream>>;
 type StreamWrite = WriteHalf<Compat<yamux::Stream>>;
 
 pub struct TcpFlow {
-    peer: SocketAddr,
     upload: TcpUpload,
     download: TcpDownload,
     close: CancellationToken,
@@ -60,7 +58,7 @@ impl Reader {
     /// client.
     async fn run(mut self) {
         loop {
-            let event = crate::frames::read_frame::<TcpEvent>(&mut self.stream).await;
+            let event = terra_protocol::read_frame_async::<TcpEvent>(&mut self.stream).await;
             match event {
                 Ok(Some(TcpEvent::Data(bytes))) if !bytes.is_empty() && self.data.is_some() => {
                     self.send_data(Ok(bytes)).await;
@@ -117,7 +115,7 @@ async fn run_reader(reader: Reader, close: CancellationToken) {
 }
 
 impl TcpFlow {
-    pub(super) fn start(client: &Client, stream: Compat<yamux::Stream>, peer: SocketAddr) -> Self {
+    pub(super) fn start(client: &Client, stream: Compat<yamux::Stream>) -> Self {
         let (read, write) = tokio::io::split(stream);
         let (data_sender, data) = mpsc::channel(MAX_QUEUED_FRAMES);
         let (state_sender, state) = watch::channel(FlowState::default());
@@ -134,7 +132,6 @@ impl TcpFlow {
             close.clone(),
         ));
         Self {
-            peer,
             upload: TcpUpload {
                 stream: write,
                 state: state.clone(),
@@ -146,11 +143,6 @@ impl TcpFlow {
             },
             close,
         }
-    }
-
-    #[must_use]
-    pub fn peer(&self) -> SocketAddr {
-        self.peer
     }
 
     /// Cancelling the token ends the flow's reader task.

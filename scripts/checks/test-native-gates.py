@@ -71,32 +71,6 @@ class NativeGateTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             module.validate_patch_series({})
 
-    def test_socket_version_matches_protocol_and_kernel(self):
-        module = self.vsock_checks
-        for source, kernel_source in [
-            ('', '#define TERRA_SOCKET_VERSION 1'),
-            ('pub const VERSION: u16 = 1;', ''),
-            ('pub const VERSION: u16 = 2;', '#define TERRA_SOCKET_VERSION 1'),
-        ]:
-            with self.subTest(source=source, kernel_source=kernel_source), self.assertRaises(ValueError):
-                module.validate_socket_version(source, kernel_source)
-        module.validate_socket_version('pub const VERSION: u16 = 0x1;', '#define TERRA_SOCKET_VERSION 1')
-
-    def test_network_application_version_header_and_opcodes_match(self):
-        module = self.vsock_checks
-        source = (ROOT / 'crates/terra-protocol/src/application.rs').read_text()
-        kernel_source = module.load_kernel_source(ROOT)
-        module.validate_application_abi(source, kernel_source)
-        for invalid in (kernel_source.replace('TERRA_HEADER_BYTES 8', 'TERRA_HEADER_BYTES 32'),
-                        kernel_source.replace('TERRA_OP_UDP_SEND 0x03', 'TERRA_OP_UDP_SEND 0x07'), ''):
-            with self.subTest(kernel_source=invalid[:40]), self.assertRaises(ValueError):
-                module.validate_application_abi(source, invalid)
-        for invalid in (source.replace('VERSION: u16 = 1', 'VERSION: u16 = 2'),
-                        source.replace('HEADER_BYTES: usize = 8', 'HEADER_BYTES: usize = 32'),
-                        source.replace('UdpError = 0x104', 'UdpError = 0x10e'), ''):
-            with self.subTest(source=invalid[:40]), self.assertRaises(ValueError):
-                module.validate_application_abi(invalid, kernel_source)
-
     def test_fixed_endpoint_tuples_match_protocol_and_kernel(self):
         module = self.vsock_checks
         protocol = (ROOT / 'crates/terra-protocol/src/vsock.rs').read_text()
@@ -105,7 +79,6 @@ class NativeGateTests(unittest.TestCase):
         for guest, adapter in (
             (protocol.replace('HOST_CID: u32 = 2', 'HOST_CID: u32 = 4'), kernel),
             (protocol.replace('UDP_PORT: u32 = 6003', 'UDP_PORT: u32 = 6005'), kernel),
-            (protocol, kernel.replace('TERRA_UDP_PORT 6003', 'TERRA_UDP_PORT 6001')),
             (protocol, kernel + '\n\tstruct sockaddr_vm extra = { .svm_cid = 2, .svm_port = 6001 };'),
             ('', kernel), (protocol, ''),
         ):

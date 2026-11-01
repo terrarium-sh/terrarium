@@ -124,7 +124,8 @@ static void reject_endpoint(unsigned int guest_port, unsigned int host_port) {
     require(close(descriptor) == 0, "close rejected endpoint");
 }
 
-/* A cross-role opening returns a protocol refusal or reset, followed by no service bytes. */
+/* A wrong frame on a flow port gets no service bytes: the TCP port refuses it with a protocol error,
+ * the UDP port has already answered Opened(Ok) and then resets; either may reset instead. */
 static void reject_opening(unsigned int guest_port, unsigned int host_port, unsigned char opcode) {
     int descriptor = socket(AF_VSOCK, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     require(descriptor >= 0, "create opening probe");
@@ -153,14 +154,14 @@ static void reject_opening(unsigned int guest_port, unsigned int host_port, unsi
     require(setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0 &&
             setsockopt(descriptor, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) == 0,
             "bounded application opening");
-    unsigned char opening[12] = {opcode, 0, 0, 0, 4, 0, 0, 0, TERRA_NETWORK_ABI, 0, 0, 0};
+    unsigned char opening[12] = {opcode, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0};
     require(send(descriptor, opening, sizeof(opening), MSG_NOSIGNAL) == sizeof(opening),
             "send cross-role opening");
     unsigned char response[128];
     ssize_t received = recv(descriptor, response, sizeof(response), 0);
     if (received > 0) {
         unsigned char expected[12] = {0x01, 0x01, 0, 0, 4, 0, 0, 0, 20, 0, 0, 0};
-        expected[0] = host_port == TCP_PORT ? 0x01 : 0x02;
+        expected[8] = host_port == TCP_PORT ? 20 : 0;
         size_t length = (size_t)received;
         require(length <= sizeof(expected), "cross-role refusal carries no service bytes");
         while (length < sizeof(expected)) {
@@ -179,11 +180,6 @@ static void reject_opening(unsigned int guest_port, unsigned int host_port, unsi
 static void exercise_endpoints(int network_enabled) {
     char device[512];
     find_vsock_device(device, sizeof(device));
-    FILE *abi = fopen("/sys/kernel/terra_socket_abi", "r");
-    unsigned int version = 0;
-    require(abi != NULL && fscanf(abi, "%u", &version) == 1 && version == TERRA_SOCKET_ABI,
-            "matching kernel socket ABI");
-    require(fclose(abi) == 0, "close kernel socket ABI");
     const char *obsolete[] = {"/dev/terra-agent-control", "/dev/terra-agent-session",
                               "/dev/terra-network-control", "/dev/terra-network-session"};
     for (unsigned int index = 0; index < sizeof(obsolete) / sizeof(obsolete[0]); index++)
@@ -203,7 +199,7 @@ static void exercise_endpoints(int network_enabled) {
         int control = duplicate_agent_vsock(CONTROL_PORT);
         require(close(control) == 0, "close control inspection");
         reject_opening(5997, TCP_PORT, 4);
-        reject_opening(TCP_PORT, TCP_PORT, 2);
+        reject_opening(TCP_PORT, TCP_PORT, 3);
         reject_opening(5996, UDP_PORT, 1);
     } else {
         reject_endpoint(5998, TCP_PORT);
@@ -263,7 +259,7 @@ static void wait_credit_queue(int descriptor, int expected) {
 }
 
 static void exercise_receive_credit_lowat(void) {
-    unsigned char opening[40], expected_opened[32], opened[32];
+    unsigned char opening[36], expected_opened[12], opened[12];
     unsigned char expected[32 * 1024], received[32 * 1024];
     read_credit_fixture("/work/VSOCK_CREDIT_OPEN", opening, sizeof(opening));
     read_credit_fixture("/work/VSOCK_CREDIT_OPENED", expected_opened, sizeof(expected_opened));
@@ -295,7 +291,7 @@ static void exercise_receive_credit_lowat(void) {
     require(send(descriptor, opening, sizeof(opening), MSG_NOSIGNAL) == sizeof(opening),
             "send codec-derived valid TcpOpen");
     require(recv(descriptor, opened, sizeof(opened), MSG_WAITALL) == sizeof(opened) &&
-            memcmp(opened, expected_opened, sizeof(opened)) == 0, "authorized TcpOpened reply");
+            memcmp(opened, expected_opened, sizeof(opened)) == 0, "authorized Opened reply");
     struct pollfd ready = {.fd = descriptor, .events = POLLIN};
     require(poll(&ready, 1, 3000) == 1 && (ready.revents & POLLIN),
             "default-low-water initial payload readiness");

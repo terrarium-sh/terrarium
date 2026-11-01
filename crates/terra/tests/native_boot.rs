@@ -160,7 +160,6 @@ fn native_boot_executes_shell() {
             "-ec",
             &format!(
                 r#"test "$(nproc)" = {cpus}
-                test "$(cat /sys/kernel/terra_socket_abi)" = {socket_abi}
                 vsocks=0
                 for device in /sys/bus/virtio/devices/*/device; do
                     if test "$(cat "$device")" = 0x0013; then vsocks=$((vsocks + 1)); fi
@@ -171,7 +170,6 @@ fn native_boot_executes_shell() {
                 test ! -e /dev/terra-network-control
                 sleep 1
                 echo BOOT_SHELL_OK"#,
-                socket_abi = terra_protocol::socket::VERSION,
             ),
         ]);
         assert!(

@@ -10,7 +10,7 @@ use std::os::windows::io::AsRawSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use terra_protocol::application::TcpOpenOptions;
-use terra_protocol::network::{MAX_NETWORK_CHUNK_BYTES, MAX_NETWORK_READ_BYTES, TcpEvent};
+use terra_protocol::network::{MAX_NETWORK_CHUNK_BYTES, TcpEvent};
 use tokio::io::{AsyncReadExt, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::Mutex;
@@ -106,7 +106,7 @@ async fn open_stream(
 
 /// Skips connections their client already reset, which fail accept or its socket options on some
 /// hosts; an error here would close the published port for good.
-pub(super) async fn accept(listener: &TcpListener) -> Result<(TcpStream, SocketAddr), Error> {
+pub(super) async fn accept(listener: &TcpListener) -> Result<TcpStream, Error> {
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(accepted) => accepted,
@@ -127,7 +127,7 @@ pub(super) async fn accept(listener: &TcpListener) -> Result<(TcpStream, SocketA
             .and_then(|()| stream.set_nodelay(true))
             .is_ok()
         {
-            return Ok((stream, peer));
+            return Ok(stream);
         }
     }
 }
@@ -176,7 +176,7 @@ pub(super) async fn relay(stream: Compat<yamux::Stream>, tcp: TcpStream) {
 
 impl Relay {
     async fn send(&self, event: &TcpEvent) -> bool {
-        crate::frames::write_frame(&mut *self.events.lock().await, event)
+        terra_protocol::write_frame_async(&mut *self.events.lock().await, event)
             .await
             .is_ok()
     }
@@ -206,7 +206,7 @@ impl Relay {
 
     /// Returns whether `Eof` was sent; `false` means the relay must end.
     async fn download(&self) -> bool {
-        let mut buffer = vec![0; MAX_NETWORK_READ_BYTES];
+        let mut buffer = vec![0; MAX_NETWORK_CHUNK_BYTES];
         loop {
             let event = match self.read_some(&mut buffer).await {
                 Ok(0) => TcpEvent::Eof,

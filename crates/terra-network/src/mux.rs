@@ -15,7 +15,7 @@ pub(crate) fn yamux_config() -> Config {
     config
         .set_max_num_streams(crate::MAX_STREAMS)
         .set_max_connection_receive_window(Some(crate::MAX_STREAMS * YAMUX_STREAM_WINDOW_BYTES))
-        .set_split_send_size(terra_protocol::network::MAX_NETWORK_FRAME_BYTES)
+        .set_split_send_size(terra_protocol::network::MAX_NETWORK_PAYLOAD_BYTES)
         .set_read_after_close(false);
     config
 }

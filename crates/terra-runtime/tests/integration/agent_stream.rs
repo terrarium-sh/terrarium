@@ -6,15 +6,16 @@ use support::{AgentGuest, plan_frame, yamux_frame};
 use terra_runtime::component::vsock::streams::stream_types::StreamError;
 
 /// Fragmenting every Yamux header and lifecycle frame preserves boot-plan
-/// delivery, version validation, and readiness.
+/// delivery and readiness.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fragmented_stream_delivers_plan_and_lifecycle() {
-    let mut envelope: terra_protocol::BootPlan =
-        terra_protocol::decode_frame_payload(&plan_frame()[4..]).expect("plan");
-    envelope.plan.sandbox_info = "x".repeat(4 * 1024);
-    let expected = envelope.plan.sandbox_info.clone();
+    let mut plan: terra_protocol::Plan = terra_protocol::read_frame(&mut plan_frame().as_slice())
+        .expect("plan")
+        .expect("plan frame");
+    plan.sandbox_info = "x".repeat(4 * 1024);
+    let expected = plan.sandbox_info.clone();
     let mut agent = AgentGuest::create(
-        terra_protocol::encode_frame(&envelope).expect("plan"),
+        terra_protocol::encode_frame(&plan).expect("plan"),
         None,
         None,
     )

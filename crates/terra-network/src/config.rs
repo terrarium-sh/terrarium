@@ -23,6 +23,10 @@ pub struct Ready {
     pub host_service_ports: Vec<Option<u16>>,
 }
 
+impl terra_protocol::Message for Ready {
+    const MAX_PAYLOAD_BYTES: usize = 32 * 1024;
+}
+
 pub const GATEWAY_ADDRESSES: [IpAddr; 2] = [
     IpAddr::V4(terra_protocol::socket::HOST_SERVICE_IPV4),
     IpAddr::V6(terra_protocol::socket::HOST_SERVICE_IPV6),
@@ -31,4 +35,3 @@ pub const GATEWAY_ADDRESSES: [IpAddr; 2] = [
 /// 48 bytes covers one JSON-quoted IPv6 address and its separator.
 pub const MAX_STARTUP_BYTES: usize =
     terra_policy::MAX_CONFIG_BYTES + terra_policy::MAX_HOST_ADDRESSES * 48 + 64 * 1024;
-pub const MAX_READY_BYTES: usize = 32 * 1024;

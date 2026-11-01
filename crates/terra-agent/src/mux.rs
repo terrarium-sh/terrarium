@@ -397,14 +397,13 @@ mod tests {
                 .is_err()
         );
 
-        promptly(control_stream.write_all(&[terra_protocol::STOP_SIGNAL]))
-            .await
-            .unwrap();
-        let mut stop = [0; 1];
+        let command = terra_protocol::encode_frame(&terra_protocol::AgentCommand::Stop).unwrap();
+        promptly(control_stream.write_all(&command)).await.unwrap();
+        let mut stop = vec![0; command.len()];
         promptly(tokio::io::AsyncReadExt::read_exact(&mut control, &mut stop))
             .await
             .unwrap();
-        assert_eq!(stop, [terra_protocol::STOP_SIGNAL]);
+        assert_eq!(stop, command);
         let ready =
             terra_protocol::encode_frame(&terra_protocol::LifecycleEvent::AgentReady).unwrap();
         promptly(tokio::io::AsyncWriteExt::write_all(&mut control, &ready))

@@ -2,80 +2,76 @@
 
 use libfuzzer_sys::fuzz_target;
 use terra_protocol::application::{
-    Direction, MAX_UDP_FRAME_BYTES, Message, StreamDecoder, UdpSendFrame, decode_udp_send,
+    Frame, GuestFrame, HostFrame, LentFrame, MAX_FRAME_BYTES, StreamDecoder,
 };
 
-fn decode_stream(bytes: &[u8], direction: Direction, chunk_bytes: usize) {
+fn decode_stream<F: Frame + std::fmt::Debug + PartialEq>(bytes: &[u8], chunk_bytes: usize) {
     let mut decoder = StreamDecoder::default();
     let mut consumed = 0;
     for chunk in bytes.chunks(chunk_bytes) {
-        if decoder.push(chunk).is_err() {
+        let buffer = decoder.read_buffer();
+        if buffer.len() < chunk.len() {
             return;
         }
-        while let Ok(Some(message)) = decoder.next(direction) {
-            let encoded = message.encode();
+        buffer[..chunk.len()].copy_from_slice(chunk);
+        decoder.commit(chunk.len());
+        while let Ok(Some(frame)) = decoder
+            .next_lent_frame::<F>()
+            .map(|frame| frame.map(LentFrame::into_owned))
+        {
+            let encoded = frame.encode();
             assert!(
                 encoded
                     .as_ref()
-                    .is_ok_and(|frame| frame.len() <= MAX_UDP_FRAME_BYTES)
+                    .is_ok_and(|encoded| encoded.len() <= MAX_FRAME_BYTES)
             );
-            if let Ok(frame) = encoded {
+            if let Ok(encoded) = encoded {
                 assert_eq!(
-                    Message::decode(&bytes[consumed..], direction),
-                    Ok(Some((message, frame.len())))
+                    F::decode(&bytes[consumed..]),
+                    Ok(Some((frame, encoded.len())))
                 );
                 assert_eq!(
-                    bytes.get(consumed..consumed + frame.len()),
-                    Some(frame.as_slice())
+                    bytes.get(consumed..consumed + encoded.len()),
+                    Some(encoded.as_slice())
                 );
-                consumed += frame.len();
+                consumed += encoded.len();
             }
         }
-        assert!(decoder.remaining_capacity() <= MAX_UDP_FRAME_BYTES);
     }
     assert_eq!(
-        decoder.next(direction),
-        Message::decode(&bytes[consumed..], direction)
-            .map(|frame| frame.map(|(message, _)| message))
+        decoder
+            .next_lent_frame::<F>()
+            .map(|frame| frame.map(LentFrame::into_owned)),
+        F::decode(&bytes[consumed..]).map(|decoded| decoded.map(|(frame, _)| frame))
     );
 }
 
+fn check_direction<F: Frame + std::fmt::Debug + PartialEq>(bytes: &[u8]) {
+    if let Ok(Some((frame, length))) = F::decode(bytes) {
+        assert!(length <= MAX_FRAME_BYTES);
+        assert_eq!(frame.encode().ok().as_deref(), bytes.get(..length));
+    }
+    if let Ok(Some((LentFrame::UdpRun(run), length))) = F::decode_lent(bytes) {
+        assert!(
+            bytes[..length].as_ptr_range().contains(&run.bytes.as_ptr()) || run.bytes.is_empty()
+        );
+        assert_eq!(
+            F::decode(bytes),
+            Ok(Some((F::from_udp_run(run.into_owned()), length)))
+        );
+    }
+    for chunk_bytes in [
+        1,
+        usize::from(bytes.first().copied().unwrap_or(0)) + 1,
+        MAX_FRAME_BYTES,
+    ] {
+        decode_stream::<F>(bytes, chunk_bytes);
+    }
+}
+
 fuzz_target!(|bytes: &[u8]| {
-    for direction in [Direction::GuestToHost, Direction::HostToGuest] {
-        if let Ok(Some((message, length))) = Message::decode(bytes, direction) {
-            assert!(length <= MAX_UDP_FRAME_BYTES);
-            assert_eq!(message.encode().ok().as_deref(), bytes.get(..length));
-        }
-        for chunk_bytes in [
-            1,
-            usize::from(bytes.first().copied().unwrap_or(0)) + 1,
-            MAX_UDP_FRAME_BYTES,
-        ] {
-            decode_stream(bytes, direction, chunk_bytes);
-        }
-    }
-    match Message::decode(bytes, Direction::GuestToHost) {
-        Ok(Some((
-            Message::UdpSend {
-                peer,
-                segment,
-                bytes: payload,
-            },
-            length,
-        ))) => {
-            assert_eq!(
-                decode_udp_send(bytes),
-                Ok(Some(UdpSendFrame {
-                    peer,
-                    segment,
-                    bytes: &payload,
-                    frame_bytes: length,
-                }))
-            );
-        }
-        Ok(Some(_)) | Err(_) => assert!(decode_udp_send(bytes).is_err()),
-        Ok(None) => assert!(!matches!(decode_udp_send(bytes), Ok(Some(_)))),
-    }
+    check_direction::<GuestFrame>(bytes);
+    check_direction::<HostFrame>(bytes);
     let _ = terra_protocol::guest_image::GuestImage::Boot.validate(Some(bytes));
     let _ = terra_protocol::guest_image::GuestImage::Kernel.validate(Some(bytes));
 });

@@ -3,17 +3,12 @@
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 
-/// Maximum file size supported by sync operations: 16 GiB.
 pub const MAX_FILE_BYTES: u64 = 16 << 30;
-
-/// Maximum entries permitted in a single sync manifest before refusing to proceed.
 pub const MAX_SYNC_ENTRIES: usize = 100_000;
-
-/// Maximum length in bytes of any relative or root path on the wire.
 pub const MAX_SYNC_PATH_BYTES: usize = 4096;
-
-/// Total budget on accumulated metadata bytes from untrusted manifest frames.
 pub const MAX_SYNC_METADATA_BYTES: usize = 16 * 1024 * 1024;
+/// Fixed metadata a manifest entry costs on top of its path and link target.
+const ENTRY_METADATA_OVERHEAD_BYTES: usize = 32;
 
 /// The limit exceeded while collecting a sync manifest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,7 +33,6 @@ impl SyncManifestBudget {
         }
     }
 
-    /// Adds one entry and its path, link-target, and fixed metadata overhead.
     pub fn add_entry(
         &mut self,
         path: &str,
@@ -54,7 +48,7 @@ impl SyncManifestBudget {
         let metadata_bytes = path
             .len()
             .checked_add(link_target.map_or(0, str::len))
-            .and_then(|bytes| bytes.checked_add(32))
+            .and_then(|bytes| bytes.checked_add(ENTRY_METADATA_OVERHEAD_BYTES))
             .ok_or(SyncManifestLimit::MetadataBytes)?;
         self.metadata_bytes = self
             .metadata_bytes
@@ -67,27 +61,22 @@ impl SyncManifestBudget {
     }
 }
 
-/// Upper limit on untrusted error message frames from guest.
 pub const MAX_SYNC_ERROR_BYTES: usize = 4096;
 
-/// Deterministic timestamp precision in nanoseconds: 1 microsecond (1,000 ns).
-/// Preserved identically across Linux ext4 (1 ns), APFS (1 ns), and Windows NTFS (100 ns).
+/// Microseconds survive ext4 and APFS (1 ns) as well as NTFS (100 ns).
 const SYNC_TIMESTAMP_PRECISION_NANOS: u32 = 1_000;
 
-/// Truncate nanoseconds to [`SYNC_TIMESTAMP_PRECISION_NANOS`].
 #[must_use]
 pub const fn truncate_nanos(nanos: u32) -> u32 {
     (nanos / SYNC_TIMESTAMP_PRECISION_NANOS) * SYNC_TIMESTAMP_PRECISION_NANOS
 }
 
-/// Synchronization direction relative to the host.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SyncDirection {
     HostToGuest,
     GuestToHost,
 }
 
-/// Kind of synchronized filesystem entry.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SyncEntryKind {
     File,
@@ -122,19 +111,16 @@ pub enum RootStatus {
 /// Host requests sent to the guest agent over [`crate::AgentService::Sync`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SyncRequest {
-    /// Open the sync session for a specific guest root.
     BeginSession {
         #[serde(deserialize_with = "deserialize_abs_path")]
         guest_root: String,
     },
-    /// Scan and stream all entries within the session root.
     ScanEntries,
-    /// Request SHA-256 digest of a regular file under the session root.
     ComputeDigest {
         #[serde(deserialize_with = "deserialize_relative_path")]
         relative_path: String,
     },
-    /// Prepare to write a regular file into the guest. Followed by `size` raw bytes after `WriteFileReady`.
+    /// `size` raw bytes follow once the agent replies `WriteFileReady`.
     WriteFile {
         #[serde(deserialize_with = "deserialize_relative_path")]
         relative_path: String,
@@ -146,24 +132,20 @@ pub enum SyncRequest {
         mtime_nanos: u32,
     },
     CommitFile,
-    /// Prepare to read a regular file from the guest. Followed by `size` raw bytes from guest after `ReadFileReady`.
     ReadFile {
         #[serde(deserialize_with = "deserialize_relative_path")]
         relative_path: String,
     },
-    /// Create a directory on the guest.
     CreateDir {
         #[serde(deserialize_with = "deserialize_relative_path")]
         relative_path: String,
         mode: u32,
     },
-    /// Create a symbolic link on the guest.
     CreateSymlink {
         #[serde(deserialize_with = "deserialize_relative_path")]
         relative_path: String,
         target: String,
     },
-    /// Update mode and timestamp of an existing guest entry without rewriting content.
     UpdateMetadata {
         #[serde(deserialize_with = "deserialize_relative_path")]
         relative_path: String,
@@ -172,32 +154,36 @@ pub enum SyncRequest {
         #[serde(deserialize_with = "deserialize_nanos")]
         mtime_nanos: u32,
     },
-    /// Remove an entry under the session root.
     RemoveEntry {
         #[serde(deserialize_with = "deserialize_relative_path")]
         relative_path: String,
         is_dir: bool,
     },
-    /// Gracefully end the sync session.
     EndSession,
+}
+
+impl crate::Message for SyncRequest {
+    /// A symlink's path and target, plus the variant's fixed fields.
+    const MAX_PAYLOAD_BYTES: usize = 2 * MAX_SYNC_PATH_BYTES + 64;
 }
 
 /// Guest agent replies sent to the host over [`crate::AgentService::Sync`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SyncReply {
-    /// The session has opened and resolved the guest root.
-    SessionReady { root_status: RootStatus },
-    /// One entry emitted during scanning.
+    SessionReady {
+        root_status: RootStatus,
+    },
     Entry(SyncEntry),
-    /// All entries have been emitted.
     ScanComplete,
-    /// Keepalive/progress update emitted while hashing large files.
-    DigestProgress { bytes_hashed: u64 },
-    /// Computed SHA-256 digest of a file.
-    Digest { sha256: [u8; 32] },
-    /// Agent is ready to receive `size` raw bytes for `WriteFile`.
+    /// Keeps the host waiting while a large file hashes.
+    DigestProgress {
+        bytes_hashed: u64,
+    },
+    Digest {
+        sha256: [u8; 32],
+    },
     WriteFileReady,
-    /// Agent is about to stream `size` raw bytes for `ReadFile`.
+    /// `size` raw bytes follow this reply.
     ReadFileReady {
         #[serde(deserialize_with = "deserialize_sync_file_size")]
         size: u64,
@@ -206,10 +192,12 @@ pub enum SyncReply {
         #[serde(deserialize_with = "deserialize_nanos")]
         mtime_nanos: u32,
     },
-    /// Operation completed successfully.
     Success,
-    /// Operation failed; untrusted guest-chosen error message.
     Err(#[serde(deserialize_with = "crate::bounded::string::<_, MAX_SYNC_ERROR_BYTES>")] String),
+}
+
+impl crate::Message for SyncReply {
+    const MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 }
 
 pub fn sync_file_times(seconds: i64, nanos: u32) -> std::io::Result<std::fs::FileTimes> {
@@ -230,18 +218,10 @@ where
     D: Deserializer<'de>,
 {
     let path = String::deserialize(deserializer)?;
-    if path.is_empty() {
-        return Err(D::Error::custom("guest path cannot be empty"));
-    }
-    if path.len() > MAX_SYNC_PATH_BYTES {
-        return Err(D::Error::custom("guest path exceeds maximum length"));
-    }
-    if path.contains('\0') {
-        return Err(D::Error::custom("guest path cannot contain NUL bytes"));
-    }
     if !path.starts_with('/') {
         return Err(D::Error::custom("guest path must be absolute"));
     }
+    validate_wire_path(&path).map_err(D::Error::custom)?;
     Ok(path)
 }
 
@@ -254,18 +234,23 @@ where
     Ok(path)
 }
 
+fn validate_wire_path(path: &str) -> Result<(), &'static str> {
+    if path.len() > MAX_SYNC_PATH_BYTES {
+        return Err("path exceeds maximum length");
+    }
+    if path.contains('\0') {
+        return Err("path cannot contain NUL bytes");
+    }
+    Ok(())
+}
+
 /// Validates the slash-separated relative path syntax used on the wire.
 /// Allows `""` to represent the synchronized root.
 fn validate_wire_relative_path(path: &str) -> Result<(), &'static str> {
     if path.is_empty() {
         return Ok(());
     }
-    if path.len() > MAX_SYNC_PATH_BYTES {
-        return Err("relative path exceeds maximum length");
-    }
-    if path.contains('\0') {
-        return Err("relative path cannot contain NUL bytes");
-    }
+    validate_wire_path(path)?;
     if path.starts_with('/') || path.starts_with('\\') {
         return Err("relative path cannot start with a path separator");
     }
@@ -368,7 +353,7 @@ mod tests {
         );
 
         let mut metadata_budget = SyncManifestBudget::default();
-        let metadata = "a".repeat(MAX_SYNC_METADATA_BYTES - 32);
+        let metadata = "a".repeat(MAX_SYNC_METADATA_BYTES - ENTRY_METADATA_OVERHEAD_BYTES);
         assert!(metadata_budget.add_entry(&metadata, None).is_ok());
         assert_eq!(
             metadata_budget.add_entry("a", None),

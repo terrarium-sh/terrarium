@@ -14,7 +14,7 @@ fuzzing = []
 
 [dependencies]
 terra-device-transport = { path = "../device-transport" }
-terra-protocol = { path = "../../crates/terra-protocol", features = ["mux"] }
+terra-protocol = { path = "../../crates/terra-protocol", features = ["futures-io", "mux"] }
 wit-bindgen = { workspace = true, features = ["async-spawn", "inter-task-wakeup"] }
 futures-util = { version = "0.3", default-features = false, features = ["std", "io", "sink"] }
 futures-channel = "0.3"

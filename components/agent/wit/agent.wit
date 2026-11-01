@@ -8,7 +8,8 @@ interface host-service {
     }
     listener: func() -> option<stream<own<client>>>;
     plan: func() -> list<u8>;
-    stop: func() -> stream<u8>;
+    /// Resolves when the host requests a graceful stop; never if it does not.
+    stop: func() -> future;
 }
 
 interface api {

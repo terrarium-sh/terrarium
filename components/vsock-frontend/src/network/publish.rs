@@ -1,32 +1,42 @@
 //! Trusted TCP and UDP publication over frontend-initiated vsock streams.
 
 use super::{
-    Task, batches, deliver_opening, finish_flow, lock_network, native_socket_address,
-    register_flow, reset_flow, run_before_deadline, shutdown_flow, spawn_task, tcp, udp, wait,
+    Task, batches, deliver_opening, finish_flow, lock_network, message_bytes, register_flow,
+    reset_flow, run_before_deadline, shutdown_flow, spawn_task, tcp, udp, wait,
     wait_for_publication,
 };
 use crate::terra::network::broker::{self, Listener, Tcp, Udp};
-use crate::terra::network::types::{PublishedPort, Transport};
+use crate::terra::network::types::Transport;
 use crate::{switch, transport};
 use futures_util::StreamExt as _;
 use futures_util::future::{AbortHandle, AbortRegistration, Abortable, poll_fn};
 use std::{
+    num::NonZeroU16,
     sync::atomic::{AtomicU32, Ordering},
     task::Poll,
 };
-use terra_protocol::application::{Message, OPEN_TIMEOUT_SECS};
+use terra_protocol::application::OPEN_TIMEOUT_SECS;
+use terra_protocol::network_control::Publication;
 use terra_protocol::socket::Error as SocketError;
 use terra_vsock_device::{ConnectionId, PUBLICATION_HOST_PORTS, VsockError};
 
 const MAX_HOST_PORT_ATTEMPTS: usize = terra_vsock_device::MAX_NETWORK_SOCKETS + 1;
 static NEXT_HOST_PORT: AtomicU32 = AtomicU32::new(PUBLICATION_HOST_PORTS.start);
 
+/// A published port with both ports nonzero.
+#[derive(Clone, Copy)]
+pub(super) struct PublishedPort {
+    pub(super) host_port: NonZeroU16,
+    pub(super) guest_port: NonZeroU16,
+    pub(super) transport: Transport,
+}
+
 pub(super) fn start_listeners(ports: &[PublishedPort]) -> Vec<Task> {
     let mut listeners = Vec::new();
     for port in ports {
+        let guest_port = port.guest_port;
         for ipv6 in [false, true] {
-            let guest_port = port.guest_port;
-            let host_port = port.host_port;
+            let host_port = port.host_port.get();
             match port.transport {
                 Transport::Tcp => {
                     if let Ok(listener) = broker::published_listener(host_port, ipv6) {
@@ -51,7 +61,7 @@ pub(super) fn start_listeners(ports: &[PublishedPort]) -> Vec<Task> {
     listeners
 }
 
-async fn serve_tcp_listener(listener: Listener, guest_port: u16) {
+async fn serve_tcp_listener(listener: Listener, guest_port: NonZeroU16) {
     let (accepted, completion) = listener.accept();
     let mut sockets = std::pin::pin!(batches(accepted, 1));
     while let Some(sockets) = sockets.next().await {
@@ -101,7 +111,7 @@ async fn wait_publication_capacity() -> ConnectionId {
 async fn serve_udp_listener(
     mut connection: ConnectionId,
     mut registration: AbortRegistration,
-    guest_port: u16,
+    guest_port: NonZeroU16,
     host_port: u16,
     ipv6: bool,
 ) {
@@ -127,7 +137,7 @@ async fn serve_udp_listener(
 }
 
 /// Open the guest stream for one accepted host connection; without capacity the host connection is dropped.
-fn accept(guest_port: u16, socket: Tcp) {
+fn accept(guest_port: NonZeroU16, socket: Tcp) {
     let Some(connection) = connect_publication() else {
         return;
     };
@@ -158,11 +168,14 @@ fn connect_publication() -> Option<ConnectionId> {
     None
 }
 
-async fn open_publication(connection: ConnectionId, header: &Message) -> Result<(), SocketError> {
+async fn open_publication(
+    connection: ConnectionId,
+    publication: Publication,
+) -> Result<(), SocketError> {
     if !wait_connected(connection).await {
         return Err(SocketError::Cancelled);
     }
-    deliver_opening(connection, header).await
+    deliver_opening(connection, message_bytes(&publication)?).await
 }
 
 async fn wait_connected(connection: ConnectionId) -> bool {
@@ -181,26 +194,15 @@ async fn wait_connected(connection: ConnectionId) -> bool {
     .await
 }
 
-async fn publish(connection: ConnectionId, guest_port: u16, socket: Tcp) {
-    let opened = match socket.peer_address() {
-        Ok(peer) => {
-            matches!(
-                run_before_deadline(
-                    OPEN_TIMEOUT_SECS,
-                    open_publication(
-                        connection,
-                        &Message::Publication {
-                            guest_port,
-                            peer: native_socket_address(peer),
-                        },
-                    )
-                )
-                .await,
-                Ok(Ok(()))
-            )
-        }
-        Err(_) => false,
-    };
+async fn publish(connection: ConnectionId, guest_port: NonZeroU16, socket: Tcp) {
+    let opened = matches!(
+        run_before_deadline(
+            OPEN_TIMEOUT_SECS,
+            open_publication(connection, Publication::Tcp { guest_port }),
+        )
+        .await,
+        Ok(Ok(()))
+    );
     if opened {
         tcp::relay(connection, &socket).await;
     } else {
@@ -211,7 +213,7 @@ async fn publish(connection: ConnectionId, guest_port: u16, socket: Tcp) {
 
 async fn publish_udp(
     connection: ConnectionId,
-    guest_port: u16,
+    guest_port: NonZeroU16,
     host_port: u16,
     ipv6: bool,
     socket: Option<(Udp, udp::DatagramReceiver)>,
@@ -226,7 +228,7 @@ async fn publish_udp(
                 None,
             ),
         };
-        open_publication(connection, &Message::PublicationUdp { guest_port }).await?;
+        open_publication(connection, Publication::Udp { guest_port }).await?;
         Ok::<_, SocketError>((socket, receiver))
     };
     match run_before_deadline(OPEN_TIMEOUT_SECS, opening).await {

@@ -1,34 +1,27 @@
 //! Bounded messages for the network broker, one yamux stream per operation.
 
-use crate::application::{TcpOpenOptions, extends_udp_run, is_valid_segmented_run};
+use crate::application::{
+    TcpOpenOptions, UDP_FRAME_OVERHEAD_BYTES, extends_udp_run, is_valid_udp_run,
+};
 pub use crate::socket::Error;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, SocketAddr};
 
 /// One vsock packet's largest payload, so a TCP chunk crosses to the guest as one packet.
 pub const MAX_NETWORK_CHUNK_BYTES: usize = 64 * 1024;
-pub const MAX_NETWORK_READ_BYTES: usize = MAX_NETWORK_CHUNK_BYTES;
 pub const MAX_NETWORK_DATAGRAM_BYTES: usize = 4096;
 pub const MAX_NETWORK_NAME_BYTES: usize = 256;
 pub const MAX_NETWORK_ADDRESSES: usize = 32;
-pub const MAX_NETWORK_FRAME_BYTES: usize = MAX_NETWORK_READ_BYTES + 128;
+pub const MAX_NETWORK_PAYLOAD_BYTES: usize = MAX_NETWORK_CHUNK_BYTES + 128;
 pub const MAX_UDP_PUBLICATION_PEERS: usize = 16;
 pub const MAX_NETWORK_DATAGRAMS: usize = 64;
-/// Upper bound on one batch entry's guest frame header, endpoint, and segment field.
-pub const DATAGRAM_FRAME_OVERHEAD_BYTES: usize = 32;
 /// Budget for a datagram batch, counting [`DatagramBatch::batch_bytes`].
 pub const MAX_NETWORK_DATAGRAM_BATCH_BYTES: usize = MAX_NETWORK_CHUNK_BYTES;
 pub const UDP_PEER_TTL_SECS: u64 = 60;
 
+const _: () = assert!(MAX_NETWORK_DATAGRAM_BATCH_BYTES <= MAX_NETWORK_PAYLOAD_BYTES);
 const _: () = assert!(
-    DATAGRAM_FRAME_OVERHEAD_BYTES
-        >= crate::application::HEADER_BYTES
-            + crate::application::ENDPOINT_BYTES
-            + crate::application::UDP_SEGMENT_HEADER_BYTES
-);
-const _: () = assert!(MAX_NETWORK_DATAGRAM_BATCH_BYTES <= MAX_NETWORK_FRAME_BYTES);
-const _: () = assert!(
-    crate::application::MAX_UDP_RUN_BYTES + DATAGRAM_FRAME_OVERHEAD_BYTES
+    crate::application::MAX_UDP_RUN_BYTES + UDP_FRAME_OVERHEAD_BYTES
         <= MAX_NETWORK_DATAGRAM_BATCH_BYTES
 );
 
@@ -46,11 +39,7 @@ pub struct DatagramHeader {
 impl DatagramHeader {
     #[must_use]
     pub fn is_valid(&self) -> bool {
-        if self.segment == 0 {
-            usize::from(self.length) <= MAX_NETWORK_DATAGRAM_BYTES
-        } else {
-            is_valid_segmented_run(usize::from(self.length), usize::from(self.segment))
-        }
+        is_valid_udp_run(usize::from(self.length), usize::from(self.segment))
     }
 }
 
@@ -113,13 +102,13 @@ impl DatagramBatch {
 
     #[must_use]
     pub fn batch_bytes(&self) -> usize {
-        self.bytes.len() + self.len() * DATAGRAM_FRAME_OVERHEAD_BYTES
+        self.bytes.len() + self.len() * UDP_FRAME_OVERHEAD_BYTES
     }
 
     #[must_use]
     pub fn has_room_for_datagram(&self) -> bool {
         self.len() < MAX_NETWORK_DATAGRAMS
-            && self.batch_bytes() + DATAGRAM_FRAME_OVERHEAD_BYTES + MAX_NETWORK_DATAGRAM_BYTES
+            && self.batch_bytes() + UDP_FRAME_OVERHEAD_BYTES + MAX_NETWORK_DATAGRAM_BYTES
                 <= MAX_NETWORK_DATAGRAM_BATCH_BYTES
     }
 
@@ -148,7 +137,7 @@ impl DatagramBatch {
         }
         if bytes.len() > MAX_NETWORK_DATAGRAM_BYTES
             || self.len() >= MAX_NETWORK_DATAGRAMS
-            || batch_bytes + DATAGRAM_FRAME_OVERHEAD_BYTES + bytes.len()
+            || batch_bytes + UDP_FRAME_OVERHEAD_BYTES + bytes.len()
                 > MAX_NETWORK_DATAGRAM_BATCH_BYTES
         {
             return false;
@@ -232,17 +221,23 @@ pub enum Open {
     ),
 }
 
+impl crate::Message for Open {
+    const MAX_PAYLOAD_BYTES: usize = MAX_NETWORK_PAYLOAD_BYTES;
+}
+
 /// Broker reply to [`Open`], sent as `Result<Opened, Error>`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Opened {
-    Tcp {
-        peer: SocketAddr,
-    },
+    Tcp,
     Udp,
     Resolved(
         #[serde(deserialize_with = "crate::bounded::vec::<_, _, MAX_NETWORK_ADDRESSES>")]
         Vec<IpAddr>,
     ),
+}
+
+impl crate::Message for Result<Opened, Error> {
+    const MAX_PAYLOAD_BYTES: usize = MAX_NETWORK_PAYLOAD_BYTES;
 }
 
 /// Broker frames on a TCP stream; the client's upload is raw bytes ending in FIN.
@@ -251,7 +246,7 @@ pub enum TcpEvent {
     Data(
         #[serde(
             serialize_with = "serde_bytes::serialize",
-            deserialize_with = "crate::bounded::bytes::<_, MAX_NETWORK_READ_BYTES>"
+            deserialize_with = "crate::bounded::bytes::<_, MAX_NETWORK_CHUNK_BYTES>"
         )]
         Vec<u8>,
     ),
@@ -261,10 +256,18 @@ pub enum TcpEvent {
     Failed(Error),
 }
 
+impl crate::Message for TcpEvent {
+    const MAX_PAYLOAD_BYTES: usize = MAX_NETWORK_PAYLOAD_BYTES;
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UdpRequest {
     Send(DatagramBatch),
     Receive,
+}
+
+impl crate::Message for UdpRequest {
+    const MAX_PAYLOAD_BYTES: usize = MAX_NETWORK_PAYLOAD_BYTES;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -277,23 +280,22 @@ pub enum UdpReply {
     Failed(Error),
 }
 
+impl crate::Message for UdpReply {
+    const MAX_PAYLOAD_BYTES: usize = MAX_NETWORK_PAYLOAD_BYTES;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::application::MAX_DATAGRAM_SEGMENTS;
-    use crate::{encode_frame, read_frame_with_limit};
+    use crate::frames::frame_bytes;
+    use crate::{Message, encode_frame, read_frame};
 
-    fn roundtrips<T>(message: &T) -> bool
-    where
-        T: Serialize + serde::de::DeserializeOwned + PartialEq,
-    {
-        read_frame_with_limit::<T>(
-            &mut encode_frame(message).unwrap().as_slice(),
-            MAX_NETWORK_FRAME_BYTES,
-        )
-        .ok()
-        .flatten()
-        .is_some_and(|decoded| decoded == *message)
+    fn roundtrips<T: Message + PartialEq>(message: &T) -> bool {
+        read_frame::<T>(&mut encode_frame(message).unwrap().as_slice())
+            .ok()
+            .flatten()
+            .is_some_and(|decoded| decoded == *message)
     }
 
     fn batch_of(lengths: &[usize]) -> DatagramBatch {
@@ -323,19 +325,13 @@ mod tests {
             (1, MAX_KEEPALIVE_SECS + 1, 1),
             (1, 1, MAX_KEEPALIVE_PROBES + 1),
         ] {
-            let frame = encode_frame(&RawKeepaliveForTest {
+            let payload = postcard::to_allocvec(&RawKeepaliveForTest {
                 idle_secs,
                 interval_secs,
                 probe_count,
             })
             .unwrap();
-            assert!(
-                read_frame_with_limit::<TcpKeepalive>(
-                    &mut frame.as_slice(),
-                    MAX_NETWORK_FRAME_BYTES
-                )
-                .is_err()
-            );
+            assert!(postcard::from_bytes::<TcpKeepalive>(&payload).is_err());
         }
     }
 
@@ -357,10 +353,14 @@ mod tests {
         ] {
             assert!(roundtrips(&request));
         }
-        assert!(roundtrips(&TcpEvent::Data(vec![0; MAX_NETWORK_READ_BYTES])));
+        assert!(roundtrips(&TcpEvent::Data(vec![
+            0;
+            MAX_NETWORK_CHUNK_BYTES
+        ])));
         assert!(!roundtrips(&TcpEvent::Data(vec![
             0;
-            MAX_NETWORK_READ_BYTES + 1
+            MAX_NETWORK_CHUNK_BYTES
+                + 1
         ])));
         assert!(roundtrips(&Ok::<_, Error>(Opened::Resolved(vec![
             "1.1.1.1".parse().unwrap();
@@ -375,10 +375,7 @@ mod tests {
         malicious.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0x0f]);
         let length = u32::try_from(malicious.len() - 4).unwrap();
         malicious[..4].copy_from_slice(&length.to_le_bytes());
-        assert!(
-            read_frame_with_limit::<TcpEvent>(&mut malicious.as_slice(), MAX_NETWORK_FRAME_BYTES)
-                .is_err()
-        );
+        assert!(read_frame::<TcpEvent>(&mut malicious.as_slice()).is_err());
     }
 
     /// A batch filled to its byte budget with the largest peer encoding fits one frame, and
@@ -394,14 +391,8 @@ mod tests {
             while batch.push(peer, &vec![0xff; length]) {}
             assert!(batch.batch_bytes() <= MAX_NETWORK_DATAGRAM_BATCH_BYTES);
             for frame in [
-                crate::encode_frame_with_limit(
-                    &UdpRequest::Send(batch.clone()),
-                    MAX_NETWORK_FRAME_BYTES,
-                ),
-                crate::encode_frame_with_limit(
-                    &UdpReply::Datagrams(batch.clone()),
-                    MAX_NETWORK_FRAME_BYTES,
-                ),
+                encode_frame(&UdpRequest::Send(batch.clone())),
+                encode_frame(&UdpReply::Datagrams(batch.clone())),
             ] {
                 assert!(frame.is_ok());
             }
@@ -454,7 +445,12 @@ mod tests {
     fn guest_frames_bytes(batch: &DatagramBatch) -> usize {
         let mut frames = Vec::new();
         for (peer, segment, bytes) in batch.entries() {
-            crate::application::append_udp_datagram(&mut frames, peer, segment, bytes).unwrap();
+            let run = crate::application::UdpRun {
+                peer,
+                segment,
+                bytes,
+            };
+            crate::application::append_udp_datagram(&mut frames, run).unwrap();
         }
         frames.len()
     }
@@ -475,11 +471,8 @@ mod tests {
     }
 
     fn roundtrips_raw(raw: &RawBatchForTest) -> bool {
-        let frame = encode_frame(&(1_u32, raw)).unwrap();
-        matches!(
-            read_frame_with_limit::<UdpRequest>(&mut frame.as_slice(), MAX_NETWORK_FRAME_BYTES),
-            Ok(Some(_))
-        )
+        let frame = frame_bytes(&(1_u32, raw));
+        matches!(read_frame::<UdpRequest>(&mut frame.as_slice()), Ok(Some(_)))
     }
 
     #[test]
@@ -620,8 +613,8 @@ mod tests {
 
     #[test]
     fn read_events_fit_one_frame() {
-        let event = TcpEvent::Data(vec![0x42; MAX_NETWORK_READ_BYTES]);
-        assert!(encode_frame(&event).unwrap().len() <= MAX_NETWORK_FRAME_BYTES);
+        let event = TcpEvent::Data(vec![0x42; MAX_NETWORK_CHUNK_BYTES]);
+        assert!(encode_frame(&event).unwrap().len() <= MAX_NETWORK_PAYLOAD_BYTES);
         assert!(roundtrips(&event));
     }
 
@@ -631,10 +624,7 @@ mod tests {
         for length in [0, 1, 127, 128, MAX_NETWORK_DATAGRAM_BYTES] {
             let bytes: Vec<u8> = (0..=255).cycle().take(length).collect();
             let event = TcpEvent::Data(bytes.clone());
-            assert_eq!(
-                encode_frame(&event).unwrap(),
-                encode_frame(&(0_u32, &bytes)).unwrap()
-            );
+            assert_eq!(encode_frame(&event).unwrap(), frame_bytes(&(0_u32, &bytes)));
             assert!(roundtrips(&event));
             let mut batch = DatagramBatch::default();
             assert!(batch.push(peer, &bytes));
@@ -642,14 +632,14 @@ mod tests {
             let header = (peer, u16::try_from(length).unwrap(), 0_u16);
             assert_eq!(
                 encode_frame(&request).unwrap(),
-                encode_frame(&(0_u32, vec![header], serde_bytes::Bytes::new(&bytes))).unwrap()
+                frame_bytes(&(0_u32, vec![header], serde_bytes::Bytes::new(&bytes)))
             );
             assert!(roundtrips(&request));
             assert!(roundtrips(&UdpReply::Datagrams(batch)));
         }
         assert_eq!(
             encode_frame(&TcpEvent::WriteShutdown(Ok(()))).unwrap(),
-            encode_frame(&(2_u32, 0_u32)).unwrap()
+            frame_bytes(&(2_u32, 0_u32))
         );
     }
 }

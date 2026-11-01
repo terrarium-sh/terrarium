@@ -14,7 +14,7 @@
 #define TCP_ESTABLISHED 1
 #define RCV_SHUTDOWN 1
 #define SEND_SHUTDOWN 2
-#define TERRA_HEADER_BYTES 8
+#include <linux/terra_abi.h>
 #define TERRA_SOCKET_EXTERNAL 2
 #define smp_load_acquire(value) (*(value))
 struct socket;

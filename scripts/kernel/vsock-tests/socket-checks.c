@@ -85,22 +85,19 @@ static void error_checks(void) {
 }
 
 static void opening_checks(void) {
-    struct terra_tsi_socket state = {.opened_needed = 32};
-    u8 opened[32] = {0x01, 0x01, 0, 0, 24, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0xbb, 1, 203, 0, 113, 1};
-    memcpy(state.opened, opened, sizeof(opened));
-    assert(!terra_validate_opened(&state));
-    unsigned int corrupt[] = {0, 1, 2, 10, 13, 20};
+    u8 opened[TERRA_HEADER_BYTES + TERRA_STATUS_BYTES] = {0x01, 0x01, 0, 0, TERRA_STATUS_BYTES};
+    assert(!terra_decode_opened(opened));
+    unsigned int corrupt[] = {0, 1, 2, 4, 5, 10};
     for (unsigned int i = 0; i < ARRAY_SIZE(corrupt); i++) {
-        state.opened[corrupt[i]] ^= 1;
-        assert(terra_validate_opened(&state) == -EPROTO);
-        state.opened[corrupt[i]] ^= 1;
+        opened[corrupt[i]] ^= 1;
+        assert(terra_decode_opened(opened) == -EPROTO);
+        opened[corrupt[i]] ^= 1;
     }
-    put_unaligned_le16(1, state.opened + 8);
-    assert(terra_validate_opened(&state) == -EPROTO);
-    state.opened_needed = 12;
-    assert(terra_validate_opened(&state) == -EACCES);
-    put_unaligned_le16(0, state.opened + 8);
-    assert(terra_validate_opened(&state) == -EPROTO);
+    put_unaligned_le16(1, opened + 8);
+    assert(terra_decode_opened(opened) == -EACCES);
+    put_unaligned_le16(21, opened + 8);
+    assert(terra_decode_opened(opened) == -EPROTO);
+    struct terra_tsi_socket state = {0};
     state.connecting = true;
     state.opening_deadline = 2000;
     jiffies = 1000;
@@ -917,11 +914,10 @@ static void peek_mirror_checks(void) {
     state.connecting = true;
     assert(!terra_set_peek_off(&outer, 5) && outer.sk_peek_off == 5 && carrier_sock.sk_peek_off == -1);
     carrier_sock.sk_state = TCP_ESTABLISHED;
-    state.opened_needed = 32;
     state.opening_offset = TERRA_TCP_OPEN_BYTES;
-    u8 opened[32] = {0x01, 0x01, 0, 0, 24, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0xbb, 1, 203, 0, 113, 1};
+    u8 opened[TERRA_HEADER_BYTES + TERRA_STATUS_BYTES] = {0x01, 0x01, 0, 0, TERRA_STATUS_BYTES};
     memcpy(state.opened, opened, sizeof(opened));
-    state.opened_length = 31;
+    state.opened_length = sizeof(opened) - 1;
     carrier_available = 1;
     carrier[0] = 0;
     terra_setup_stream(&state.setup_work);

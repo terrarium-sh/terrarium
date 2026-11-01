@@ -466,17 +466,11 @@ static int kernel_sock_shutdown(struct socket *socket, int how) {
     shutdowns++;
     return 0;
 }
-#define TERRA_HEADER_BYTES 8
-#define TERRA_ENDPOINT_BYTES 20
-#define TERRA_OP_TCP_OPENED 0x101
-#define TERRA_OP_UDP_SEND 0x03
-#define TERRA_OP_UDP_DATAGRAM 0x103
-#define TERRA_OP_UDP_ERROR 0x104
-#define TERRA_UDP_DATAGRAM 4096
-#define TERRA_UDP_FRAME_BYTES (TERRA_HEADER_BYTES + TERRA_ENDPOINT_BYTES + 4 + TERRA_UDP_DATAGRAM)
+#include <linux/terra_abi.h>
+#define TERRA_UDP_FRAME_BYTES \
+    (TERRA_HEADER_BYTES + TERRA_ENDPOINT_BYTES + TERRA_UDP_SEGMENT_FIELD_BYTES + TERRA_UDP_DATAGRAM)
 struct terra_tsi_socket {
-    u8 opened[64];
-    unsigned int opened_needed;
+    u8 opened[TERRA_HEADER_BYTES + TERRA_STATUS_BYTES];
     struct mutex select_mutex;
     struct delayed_work timeout_work;
     struct socket *stream;

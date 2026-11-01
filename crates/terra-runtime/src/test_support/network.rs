@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream, UdpSocket};
+use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::num::NonZeroU16;
 use std::time::{Duration, Instant};
 
 use super::network_stream::GuestStream;
@@ -11,7 +12,12 @@ use crate::box_runtime::{BoxHost, BoxRuntime};
 use crate::component::network::{NetworkBackend, PortMapping};
 use crate::component::vsock::streams::{FrontendStreams, StreamEndpoint};
 use crate::memory::GuestRam;
-use terra_protocol::application::{DnsTransport, Message, TcpKeepalive, TcpOpenOptions, TcpTarget};
+use terra_protocol::application::{
+    Frame as _, GuestFrame, HostFrame, TcpKeepalive, TcpOpenOptions, UdpRun,
+};
+use terra_protocol::network_control::{
+    AgentControl, DnsPayload, DnsTransport, FrontendControl, Publication,
+};
 use terra_protocol::socket::{self, Error};
 use terra_protocol::vsock::{
     AGENT_PORT, CONTROL_PORT, FLOW_REPLY_BYTES, PUBLICATION_PORT, TCP_PORT, UDP_PORT,
@@ -262,7 +268,7 @@ pub(crate) fn create_dns_fallback_backend() -> (
     tokio::sync::oneshot::Sender<()>,
     tokio::task::JoinHandle<wasmtime::Result<()>>,
 ) {
-    let (worker, endpoint) = tokio::io::duplex(terra_protocol::network::MAX_NETWORK_FRAME_BYTES);
+    let (worker, endpoint) = tokio::io::duplex(terra_protocol::network::MAX_NETWORK_PAYLOAD_BYTES);
     let backend = NetworkBackend {
         client: terra_network::Client::new(worker),
         ready: terra_network::config::Ready {
@@ -305,14 +311,12 @@ async fn serve_many_addresses(endpoint: tokio::io::DuplexStream) -> wasmtime::Re
 }
 
 async fn answer_many_addresses(stream: yamux::Stream) -> wasmtime::Result<()> {
-    use terra_protocol::network::{MAX_NETWORK_FRAME_BYTES, Open, Opened};
+    use terra_protocol::network::{Open, Opened};
     use tokio::io::AsyncWriteExt;
     use tokio_util::compat::FuturesAsyncReadCompatExt;
 
     let mut stream = stream.compat();
-    let open =
-        terra_protocol::read_frame_async_with_limit::<Open>(&mut stream, MAX_NETWORK_FRAME_BYTES)
-            .await?;
+    let open = terra_protocol::read_frame_async::<Open>(&mut stream).await?;
     wasmtime::ensure!(
         open == Some(Open::Resolve("many.test".into())),
         "DNS fallback broker resolves only the configured fixture"
@@ -323,10 +327,7 @@ async fn answer_many_addresses(stream: yamux::Stream) -> wasmtime::Result<()> {
             .collect(),
     ));
     stream
-        .write_all(&terra_protocol::encode_frame_with_limit(
-            &reply,
-            MAX_NETWORK_FRAME_BYTES,
-        )?)
+        .write_all(&terra_protocol::encode_frame(&reply)?)
         .await?;
     stream.shutdown().await?;
     Ok(())
@@ -360,7 +361,7 @@ fn dns_query(name: &str) -> wasmtime::Result<Vec<u8>> {
 fn build_tcp_payload() -> Vec<u8> {
     (0..251)
         .cycle()
-        .take(2 * terra_protocol::network::MAX_NETWORK_READ_BYTES + 1)
+        .take(2 * terra_protocol::network::MAX_NETWORK_CHUNK_BYTES + 1)
         .collect()
 }
 
@@ -418,12 +419,12 @@ fn serve_udp(udp: &UdpSocket) -> wasmtime::Result<()> {
     Ok(())
 }
 
-fn plain_udp_send(peer: std::net::SocketAddr, bytes: Vec<u8>) -> Message {
-    Message::UdpSend {
+fn plain_udp_send(peer: std::net::SocketAddr, bytes: Vec<u8>) -> GuestFrame {
+    GuestFrame::UdpSend(UdpRun {
         peer,
         segment: 0,
         bytes,
-    }
+    })
 }
 
 fn udp_segment(index: usize, length: usize) -> Vec<u8> {
@@ -499,7 +500,8 @@ fn serve_tcp_half_closes(listener: &TcpListener) -> wasmtime::Result<()> {
     let mut stream = accept_stream(listener, STEP_WAIT)?;
     stream.write_all(&vec![
         83;
-        2 * terra_protocol::network::MAX_NETWORK_READ_BYTES + 1
+        2 * terra_protocol::network::MAX_NETWORK_CHUNK_BYTES
+            + 1
     ])?;
     stream.read_exact(&mut observed_fin)?;
     wasmtime::ensure!(
@@ -731,6 +733,14 @@ async fn run_socket_streams(
 }
 
 const CONTROL: Stream = (CONTROL_PORT, CONTROL_PORT);
+fn host_service(port: u16) -> SocketAddr {
+    (socket::HOST_SERVICE_IPV4, port).into()
+}
+
+fn nonzero_port(port: u16) -> wasmtime::Result<NonZeroU16> {
+    NonZeroU16::new(port).ok_or_else(|| wasmtime::Error::msg("port 0"))
+}
+
 /// Fills every flow slot left after the stalled TCP flows and both UDP publication families.
 #[allow(clippy::cast_possible_truncation)]
 const STALLED_UDP_COUNT: u32 =
@@ -747,7 +757,7 @@ async fn exercise_admission_pressure(
     }
     let mut stalled = Vec::with_capacity(STALLED_TCP_COUNT);
     for _ in 0..STALLED_TCP_COUNT {
-        stalled.push(guest.open_tcp(TcpTarget::HostService(tcp_port)).await?);
+        stalled.push(guest.open_tcp(host_service(tcp_port)).await?);
     }
     for &stream in &stalled {
         guest.stream.wait_buffered(stream, FLOW_REPLY_BYTES).await?;
@@ -931,9 +941,7 @@ async fn exercise_socket_stream(
         .await
         .map_err(|error| error.context("agent admission with networking enabled"))?;
     guest.exercise_opening_errors().await?;
-    let stalled = guest
-        .open_tcp(TcpTarget::HostService(endpoints.tcp))
-        .await?;
+    let stalled = guest.open_tcp(host_service(endpoints.tcp)).await?;
     guest
         .stream
         .guest
@@ -971,12 +979,12 @@ async fn exercise_socket_stream(
         error.context("UDP per-datagram peers, socket loss and asynchronous denial")
     })?;
     guest
-        .exchange_tcp(TcpTarget::HostService(endpoints.tcp), &build_tcp_payload())
+        .exchange_tcp(host_service(endpoints.tcp), &build_tcp_payload())
         .await
         .map_err(|error| error.context("large TCP echo"))?;
     guest
         .exchange_tcp(
-            TcpTarget::Peer((socket::HOST_SERVICE_IPV6, endpoints.tcp).into()),
+            (socket::HOST_SERVICE_IPV6, endpoints.tcp).into(),
             b"terra-ipv6",
         )
         .await?;
@@ -991,12 +999,10 @@ async fn exercise_socket_stream(
         .map_err(|error| error.context("frontend-initiated UDP publication streams"))?;
     guest.stream.reset(publication).await?;
     let (_, denied) = guest
-        .open_tcp_result(TcpTarget::Peer(
-            (Ipv4Addr::new(192, 0, 2, 23), endpoints.tcp).into(),
-        ))
+        .open_tcp_result((Ipv4Addr::new(192, 0, 2, 23), endpoints.tcp).into())
         .await?;
     wasmtime::ensure!(
-        denied == Message::TcpOpened(Err(Error::AccessDenied)),
+        denied == HostFrame::Opened(Err(Error::AccessDenied)),
         "TCP opening reports broker authorization failure before raw data"
     );
     guest.stream.reset(stalled).await?;
@@ -1004,7 +1010,7 @@ async fn exercise_socket_stream(
         .exchange_reopened_publication_udp(publication, prior_peer)
         .await?;
     let replacement = guest
-        .open_tcp_on(stalled.0, TcpTarget::HostService(endpoints.tcp))
+        .open_tcp_on(stalled.0, host_service(endpoints.tcp))
         .await?;
     wasmtime::ensure!(
         guest.stream.read_bytes(replacement, 11).await? == b"reset-reply",
@@ -1034,48 +1040,45 @@ impl GuestNetwork {
             udp_publications: Vec::new(),
         };
         guest.stream.connect(CONTROL).await?;
-        guest.stream.send_message(CONTROL, &Message::Hello).await?;
+        guest
+            .stream
+            .send_control(CONTROL, &AgentControl::Hello)
+            .await?;
         wasmtime::ensure!(
-            guest.stream.read_message(CONTROL).await? == Message::Ready,
-            "network ABI readiness precedes socket operations"
+            guest
+                .stream
+                .read_message::<FrontendControl>(CONTROL)
+                .await?
+                == FrontendControl::Ready,
+            "network readiness precedes socket operations"
         );
         Ok(guest)
     }
 
     async fn exercise_opening_errors(&mut self) -> wasmtime::Result<()> {
-        let tcp = Message::TcpOpen {
-            target: TcpTarget::HostService(80),
+        let mut trailing_byte = GuestFrame::TcpOpen {
+            peer: host_service(80),
             options: TcpOpenOptions::default(),
-        };
-        for (host_port, opening, wrong_class, expected) in [
-            (
-                TCP_PORT,
-                tcp.clone(),
-                Message::UdpOpen,
-                Message::TcpOpened(Err(Error::Protocol)),
-            ),
-            (
-                UDP_PORT,
-                Message::UdpOpen,
-                tcp,
-                Message::UdpOpened(Err(Error::Protocol)),
-            ),
-        ] {
-            let mut wrong_version = opening.encode()?;
-            let version_start = terra_protocol::application::HEADER_BYTES;
-            wrong_version[version_start..version_start + 2]
-                .copy_from_slice(&(terra_protocol::application::VERSION + 1).to_le_bytes());
-            for bytes in [wrong_version, wrong_class.encode()?] {
-                let stream = (self.allocate_guest_port(), host_port);
-                self.stream.connect(stream).await?;
-                self.stream.submit_raw(stream, &bytes).await?;
-                wasmtime::ensure!(
-                    self.stream.read_message(stream).await? == expected,
-                    "invalid socket openings report a protocol error before EOF"
-                );
-                self.stream.require_eof(stream).await?;
-                self.stream.reset(stream).await?;
-            }
+        }
+        .encode()?;
+        trailing_byte[4] += 1;
+        trailing_byte.push(0);
+        let wrong_class = GuestFrame::UdpSend(UdpRun {
+            peer: host_service(80),
+            segment: 0,
+            bytes: Vec::new(),
+        })
+        .encode()?;
+        for bytes in [trailing_byte, wrong_class] {
+            let stream = (self.allocate_guest_port(), TCP_PORT);
+            self.stream.connect(stream).await?;
+            self.stream.submit_raw(stream, &bytes).await?;
+            wasmtime::ensure!(
+                self.stream.read_frame(stream).await? == HostFrame::Opened(Err(Error::Protocol)),
+                "invalid TCP openings report a protocol error before EOF"
+            );
+            self.stream.require_eof(stream).await?;
+            self.stream.reset(stream).await?;
         }
         let refused = (self.allocate_guest_port(), PUBLICATION_PORT);
         self.stream
@@ -1085,14 +1088,10 @@ impl GuestNetwork {
         self.stream.require_reset(refused).await
     }
 
-    async fn open_tcp_on(
-        &mut self,
-        guest_port: u32,
-        target: TcpTarget,
-    ) -> wasmtime::Result<Stream> {
-        let (stream, result) = self.open_tcp_result_on(guest_port, target).await?;
+    async fn open_tcp_on(&mut self, guest_port: u32, peer: SocketAddr) -> wasmtime::Result<Stream> {
+        let (stream, result) = self.open_tcp_result_on(guest_port, peer).await?;
         wasmtime::ensure!(
-            matches!(result, Message::TcpOpened(Ok(_))),
+            result == HostFrame::Opened(Ok(())),
             "network device suite TCP opening: {result:?}"
         );
         Ok(stream)
@@ -1101,12 +1100,12 @@ impl GuestNetwork {
     async fn open_tcp_result_on(
         &mut self,
         guest_port: u32,
-        target: TcpTarget,
-    ) -> wasmtime::Result<(Stream, Message)> {
+        peer: SocketAddr,
+    ) -> wasmtime::Result<(Stream, HostFrame)> {
         let stream = (guest_port, TCP_PORT);
         self.stream.connect(stream).await?;
-        let opening = Message::TcpOpen {
-            target,
+        let opening = GuestFrame::TcpOpen {
+            peer,
             options: TcpOpenOptions {
                 inline_urgent: true,
                 keepalive: TcpKeepalive::new(60, 15, 9),
@@ -1115,7 +1114,7 @@ impl GuestNetwork {
         .encode()?;
         self.stream.submit_raw(stream, &opening[..5]).await?;
         self.stream.submit_raw(stream, &opening[5..]).await?;
-        let result = self.stream.read_message(stream).await?;
+        let result = self.stream.read_frame(stream).await?;
         Ok((stream, result))
     }
 
@@ -1125,34 +1124,33 @@ impl GuestNetwork {
         port
     }
 
-    async fn open_tcp_result(&mut self, target: TcpTarget) -> wasmtime::Result<(Stream, Message)> {
+    async fn open_tcp_result(&mut self, peer: SocketAddr) -> wasmtime::Result<(Stream, HostFrame)> {
         let port = self.allocate_guest_port();
-        self.open_tcp_result_on(port, target).await
+        self.open_tcp_result_on(port, peer).await
     }
 
-    async fn open_tcp(&mut self, target: TcpTarget) -> wasmtime::Result<Stream> {
+    async fn open_tcp(&mut self, peer: SocketAddr) -> wasmtime::Result<Stream> {
         let port = self.allocate_guest_port();
-        self.open_tcp_on(port, target).await
+        self.open_tcp_on(port, peer).await
     }
 
     async fn open_udp(&mut self, guest_port: u32) -> wasmtime::Result<Stream> {
         let stream = (guest_port, UDP_PORT);
         self.stream.connect(stream).await?;
-        self.stream.send_message(stream, &Message::UdpOpen).await?;
-        let reply = self.stream.read_message(stream).await?;
+        let reply = self.stream.read_frame(stream).await?;
         wasmtime::ensure!(
-            reply == Message::UdpOpened(Ok(())),
+            reply == HostFrame::Opened(Ok(())),
             "UDP socket admission on {guest_port}: {reply:?}"
         );
         Ok(stream)
     }
 
     async fn exercise_tcp_half_closes(&mut self, port: u16) -> wasmtime::Result<()> {
-        let reset_after_fin = self.open_tcp(TcpTarget::HostService(port)).await?;
+        let reset_after_fin = self.open_tcp(host_service(port)).await?;
         self.stream.require_eof(reset_after_fin).await?;
         self.stream.submit_raw(reset_after_fin, b"RX").await?;
         self.stream.require_reset(reset_after_fin).await?;
-        let receive_closed = self.open_tcp(TcpTarget::HostService(port)).await?;
+        let receive_closed = self.open_tcp(host_service(port)).await?;
         wasmtime::ensure!(
             self.stream.read_bytes(receive_closed, 16 * 1024).await? == vec![83; 16 * 1024],
             "guest receive close follows the prefetched raw payload"
@@ -1166,8 +1164,8 @@ impl GuestNetwork {
         self.exercise_dns().await
     }
 
-    async fn exchange_tcp(&mut self, target: TcpTarget, payload: &[u8]) -> wasmtime::Result<()> {
-        let stream = self.open_tcp(target).await?;
+    async fn exchange_tcp(&mut self, peer: SocketAddr, payload: &[u8]) -> wasmtime::Result<()> {
+        let stream = self.open_tcp(peer).await?;
         self.stream.submit_raw(stream, payload).await?;
         self.stream.finish_input(stream).await?;
         wasmtime::ensure!(
@@ -1191,17 +1189,21 @@ impl GuestNetwork {
     }
 
     async fn exchange_published(&mut self) -> wasmtime::Result<()> {
-        let (stream, guest_port, peer) = loop {
+        let (stream, guest_port) = loop {
             let stream = self.stream.accept().await?;
             match self.stream.read_message(stream).await? {
-                Message::Publication { guest_port, peer } => break (stream, guest_port, peer),
-                Message::PublicationUdp { guest_port: 8081 } => self.udp_publications.push(stream),
-                other => wasmtime::bail!("network device suite publication header: {other:?}"),
+                Publication::Tcp { guest_port } => break (stream, guest_port),
+                Publication::Udp { guest_port } if guest_port.get() == 8081 => {
+                    self.udp_publications.push(stream);
+                }
+                other @ Publication::Udp { .. } => {
+                    wasmtime::bail!("network device suite publication header: {other:?}")
+                }
             }
         };
         wasmtime::ensure!(
-            guest_port == 8080 && peer.ip().is_loopback(),
-            "publication header names the configured port and its host peer"
+            guest_port.get() == 8080,
+            "publication header names the configured port"
         );
         let payload = build_tcp_payload();
         wasmtime::ensure!(
@@ -1217,19 +1219,21 @@ impl GuestNetwork {
         while self.udp_publications.len() < 2 {
             let stream = self.stream.accept().await?;
             wasmtime::ensure!(
-                self.stream.read_message(stream).await?
-                    == Message::PublicationUdp { guest_port: 8081 },
+                self.stream.read_message::<Publication>(stream).await?
+                    == Publication::Udp {
+                        guest_port: nonzero_port(8081)?
+                    },
                 "UDP publication names only the authorized guest port"
             );
             self.udp_publications.push(stream);
         }
         let mut ipv4 = None;
         for stream in self.udp_publications.clone() {
-            let Message::UdpDatagram {
+            let HostFrame::UdpDatagram(UdpRun {
                 segment: 0,
                 peer,
                 bytes,
-            } = self.stream.read_message(stream).await?
+            }) = self.stream.read_frame(stream).await?
             else {
                 wasmtime::bail!("published UDP requires datagram framing");
             };
@@ -1251,11 +1255,11 @@ impl GuestNetwork {
                 .await?;
             if peer.is_ipv4() {
                 ipv4 = Some((stream, peer));
-                let Message::UdpDatagram {
+                let HostFrame::UdpDatagram(UdpRun {
                     segment: 0,
                     peer: second,
                     bytes,
-                } = self.stream.read_message(stream).await?
+                }) = self.stream.read_frame(stream).await?
                 else {
                     wasmtime::bail!("published UDP second peer datagram");
                 };
@@ -1271,11 +1275,11 @@ impl GuestNetwork {
         let (stream, first_peer) =
             ipv4.ok_or_else(|| wasmtime::Error::msg("missing IPv4 UDP publication"))?;
         for expected in [b"".as_slice(), b"after-oversize"] {
-            let Message::UdpDatagram {
+            let HostFrame::UdpDatagram(UdpRun {
                 segment: 0,
                 peer,
                 bytes,
-            } = self.stream.read_message(stream).await?
+            }) = self.stream.read_frame(stream).await?
             else {
                 wasmtime::bail!("published UDP datagram after oversized drop");
             };
@@ -1292,8 +1296,8 @@ impl GuestNetwork {
             .send_message(stream, &plain_udp_send(peer, vec![1]))
             .await?;
         wasmtime::ensure!(
-            self.stream.read_message(stream).await?
-                == Message::UdpError {
+            self.stream.read_frame(stream).await?
+                == HostFrame::UdpError {
                     peer,
                     error: Error::AccessDenied
                 },
@@ -1313,14 +1317,17 @@ impl GuestNetwork {
             "replacement UDP publication has a fresh transport tuple"
         );
         wasmtime::ensure!(
-            self.stream.read_message(stream).await? == Message::PublicationUdp { guest_port: 8081 },
+            self.stream.read_message::<Publication>(stream).await?
+                == Publication::Udp {
+                    guest_port: nonzero_port(8081)?
+                },
             "replacement UDP publication validates its guest port again"
         );
-        let Message::UdpDatagram {
+        let HostFrame::UdpDatagram(UdpRun {
             segment: 0,
             peer,
             bytes,
-        } = self.stream.read_message(stream).await?
+        }) = self.stream.read_frame(stream).await?
         else {
             wasmtime::bail!("replacement UDP publication first datagram");
         };
@@ -1332,8 +1339,8 @@ impl GuestNetwork {
             .send_message(stream, &plain_udp_send(prior_peer, vec![1]))
             .await?;
         wasmtime::ensure!(
-            self.stream.read_message(stream).await?
-                == Message::UdpError {
+            self.stream.read_frame(stream).await?
+                == HostFrame::UdpError {
                     peer: prior_peer,
                     error: Error::AccessDenied
                 },
@@ -1370,12 +1377,12 @@ impl GuestNetwork {
                 .send_message(stream, &plain_udp_send(peer, payload.clone()))
                 .await?;
             wasmtime::ensure!(
-                self.stream.read_message(stream).await?
-                    == Message::UdpDatagram {
+                self.stream.read_frame(stream).await?
+                    == HostFrame::UdpDatagram(UdpRun {
                         segment: 0,
                         peer,
                         bytes: payload
-                    },
+                    }),
                 "UDP preserves the guest-visible sender address and datagram boundaries"
             );
             if index == 0 {
@@ -1384,8 +1391,8 @@ impl GuestNetwork {
                     .send_message(stream, &plain_udp_send(denied, vec![1]))
                     .await?;
                 wasmtime::ensure!(
-                    self.stream.read_message(stream).await?
-                        == Message::UdpError {
+                    self.stream.read_frame(stream).await?
+                        == HostFrame::UdpError {
                             peer: denied,
                             error: Error::AccessDenied
                         },
@@ -1396,23 +1403,23 @@ impl GuestNetwork {
         let mut burst = Vec::new();
         for index in 0..u8::try_from(UDP_BURST_DATAGRAMS)? {
             burst.extend(
-                Message::UdpSend {
+                GuestFrame::UdpSend(UdpRun {
                     segment: 0,
                     peer: ipv4,
                     bytes: vec![index; usize::from(index) + 1],
-                }
+                })
                 .encode()?,
             );
         }
         self.stream.submit_raw(stream, &burst).await?;
         for index in 0..u8::try_from(UDP_BURST_DATAGRAMS)? {
             wasmtime::ensure!(
-                self.stream.read_message(stream).await?
-                    == Message::UdpDatagram {
+                self.stream.read_frame(stream).await?
+                    == HostFrame::UdpDatagram(UdpRun {
                         segment: 0,
                         peer: ipv4,
                         bytes: vec![index; usize::from(index) + 1]
-                    },
+                    }),
                 "UDP receive streams retain every datagram across a broker batch boundary"
             );
         }
@@ -1420,7 +1427,13 @@ impl GuestNetwork {
         self.stream.finish_input(stream).await?;
         self.stream.require_eof(stream).await?;
         self.stream
-            .send_message(replacement, &Message::Hello)
+            .send_message(
+                replacement,
+                &GuestFrame::TcpOpen {
+                    peer: host_service(80),
+                    options: TcpOpenOptions::default(),
+                },
+            )
             .await?;
         self.stream.require_reset(replacement).await?;
         self.exercise_dns().await
@@ -1441,26 +1454,26 @@ impl GuestNetwork {
         self.stream
             .send_message(
                 stream,
-                &Message::UdpSend {
+                &GuestFrame::UdpSend(UdpRun {
                     peer,
                     segment: UDP_SEGMENT_BYTES,
                     bytes: expected.concat(),
-                },
+                }),
             )
             .await?;
         let mut received = Vec::new();
         while received.len() < expected.len() {
-            match self.stream.read_message(stream).await? {
-                Message::UdpDatagram {
+            match self.stream.read_frame(stream).await? {
+                HostFrame::UdpDatagram(UdpRun {
                     peer: from,
                     segment: 0,
                     bytes,
-                } if from == peer => received.push(bytes),
-                Message::UdpDatagram {
+                }) if from == peer => received.push(bytes),
+                HostFrame::UdpDatagram(UdpRun {
                     peer: from,
                     segment,
                     bytes,
-                } if from == peer => {
+                }) if from == peer => {
                     received.extend(bytes.chunks(usize::from(segment)).map(<[u8]>::to_vec));
                 }
                 other => wasmtime::bail!("unexpected segmented UDP reply {other:?}"),
@@ -1480,23 +1493,23 @@ impl GuestNetwork {
     ) -> wasmtime::Result<u32> {
         let id = self.next_query;
         self.next_query += 1;
-        let query = Message::DnsQuery {
+        let query = AgentControl::DnsQuery(DnsPayload {
             id,
             transport,
             bytes,
-        };
-        self.stream.send_message(CONTROL, &query).await?;
+        });
+        self.stream.send_control(CONTROL, &query).await?;
         Ok(id)
     }
 
     async fn read_dns(&mut self) -> wasmtime::Result<(u32, DnsTransport, Vec<u8>)> {
         match self.stream.read_message(CONTROL).await? {
-            Message::DnsResult {
+            FrontendControl::DnsResult(DnsPayload {
                 id,
                 transport,
                 bytes,
-            } => Ok((id, transport, bytes)),
-            other => wasmtime::bail!("unexpected control message {other:?}"),
+            }) => Ok((id, transport, bytes)),
+            FrontendControl::Ready => wasmtime::bail!("unexpected control message Ready"),
         }
     }
 
@@ -1544,14 +1557,12 @@ impl GuestNetwork {
                 "broker-authorized DNS response for {name}"
             );
         }
-        let query = dns_query("loopback.test")?;
-        let mut bytes = u16::try_from(query.len())?.to_be_bytes().to_vec();
-        bytes.extend(query);
-        let bytes = self.resolve(DnsTransport::Stream, bytes).await?;
+        let bytes = self
+            .resolve(DnsTransport::Stream, dns_query("loopback.test")?)
+            .await?;
         wasmtime::ensure!(
-            usize::from(u16::from_be_bytes(bytes[..2].try_into()?)) == bytes.len() - 2
-                && bytes.ends_with(&Ipv4Addr::LOCALHOST.octets()),
-            "DNS TCP framing"
+            bytes.ends_with(&Ipv4Addr::LOCALHOST.octets()),
+            "DNS over a stream resolves"
         );
         Ok(())
     }
@@ -1563,21 +1574,14 @@ impl GuestNetwork {
             bytes.len() == query.len() && bytes[2] & 2 != 0 && bytes[6..12] == [0; 6],
             "DNS truncation requests TCP fallback"
         );
-        let mut framed = u16::try_from(query.len())?.to_be_bytes().to_vec();
-        framed.extend(&query);
-        let bytes = self.resolve(DnsTransport::Stream, framed).await?;
+        let bytes = self.resolve(DnsTransport::Stream, query.clone()).await?;
         wasmtime::ensure!(
-            bytes.len() == 2 + query.len() + 32 * 16
-                && bytes[8..10] == 32_u16.to_be_bytes()
-                && bytes[4] & 2 == 0,
+            bytes.len() == query.len() + 32 * 16
+                && bytes[6..8] == 32_u16.to_be_bytes()
+                && bytes[2] & 2 == 0,
             "DNS TCP fallback retains every broker-authorized address"
         );
-        for (answer, last) in bytes[2 + query.len()..]
-            .as_chunks::<16>()
-            .0
-            .iter()
-            .zip(1..=32)
-        {
+        for (answer, last) in bytes[query.len()..].as_chunks::<16>().0.iter().zip(1..=32) {
             wasmtime::ensure!(
                 answer[12..] == Ipv4Addr::new(192, 0, 2, last).octets(),
                 "DNS fallback answer integrity"
@@ -1675,11 +1679,11 @@ mod tests {
         let guest_port = guest.allocate_guest_port();
         let stream = guest.open_udp(guest_port).await.unwrap();
         let peer = (socket::HOST_SERVICE_IPV4, endpoints.udp).into();
-        let request = Message::UdpSend {
+        let request = GuestFrame::UdpSend(UdpRun {
             segment: 0,
             peer,
             bytes: vec![37; PAYLOAD_BYTES],
-        }
+        })
         .encode()
         .unwrap();
         let payload_mib =
@@ -1732,11 +1736,11 @@ mod tests {
         peer: std::net::SocketAddr,
         payload_bytes: usize,
     ) -> usize {
-        let Message::UdpDatagram {
+        let HostFrame::UdpDatagram(UdpRun {
             segment,
             peer: echoed_peer,
             bytes,
-        } = guest.stream.read_message(stream).await.unwrap()
+        }) = guest.stream.read_frame(stream).await.unwrap()
         else {
             panic!("UDP echo requires datagram framing");
         };
@@ -1797,10 +1801,7 @@ mod tests {
             "native TCP + broker + production frontend/virtqueues; excludes VM and setup; one warmup"
         );
         for sample in 0..=SAMPLES {
-            let stream = guest
-                .open_tcp(TcpTarget::HostService(endpoints.tcp))
-                .await
-                .unwrap();
+            let stream = guest.open_tcp(host_service(endpoints.tcp)).await.unwrap();
             let started = Instant::now();
             guest.stream.submit_raw(stream, &payload).await.unwrap();
             guest.stream.finish_input(stream).await.unwrap();

@@ -9,10 +9,10 @@ use futures_util::stream;
 use terra_platform::local_socket::{
     AsyncLocalListener as Listener, AsyncLocalStream, LocalListener, LocalStream, shutdown_write,
 };
-use terra_protocol::{MAX_PLAN_BYTES, MAX_PLAN_HOST_STATE_BYTES};
+use terra_protocol::{MAX_PLAN_HOST_STATE_BYTES, STOP_SIGNAL};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use wasmtime::Engine;
-use wasmtime::component::{Access, Resource, ResourceTable, StreamReader};
+use wasmtime::component::{Access, FutureReader, Resource, ResourceTable, StreamReader};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 
 use super::bindings::wit as terra;
@@ -86,9 +86,15 @@ pub struct AgentService;
 pub struct AgentHostService {
     listener: Option<Listener>,
     plan: Option<Vec<u8>>,
-    stop: Option<SocketInput>,
+    stop: StopClaim,
     resources: ResourceTable,
     client_slots: Arc<Semaphore>,
+}
+
+/// The stop socket, if the box has one, which the guest claims once as its stop future.
+enum StopClaim {
+    Unclaimed(Option<Socket>),
+    Claimed,
 }
 
 /// The client resource and its two streams each hold a lease, so `client_slots` bounds open sockets.
@@ -104,14 +110,10 @@ impl AgentHostService {
         listener: Option<LocalListener>,
         stop: Option<LocalStream>,
     ) -> io::Result<Self> {
-        let stop = SocketInput {
-            socket: stop.map(prepare_socket).transpose()?,
-            _lease: None,
-        };
         Ok(Self {
             listener: listener.map(Listener::from_std).transpose()?,
             plan: Some(enrich_plan(plan)?),
-            stop: Some(stop),
+            stop: StopClaim::Unclaimed(stop.map(prepare_socket).transpose()?),
             ..Self::default()
         })
     }
@@ -136,10 +138,7 @@ impl Default for AgentHostService {
         Self {
             listener: None,
             plan: Some(Vec::new()),
-            stop: Some(SocketInput {
-                socket: None,
-                _lease: None,
-            }),
+            stop: StopClaim::Unclaimed(None),
             resources: ResourceTable::new(),
             client_slots: Arc::new(Semaphore::new(MAX_CLIENTS)),
         }
@@ -217,13 +216,20 @@ impl<T: Send + 'static> terra::agent::host_service::HostWithStore<T> for AgentSe
         Ok(plan)
     }
 
-    fn stop(mut access: Access<'_, T, Self>) -> wasmtime::Result<StreamReader<u8>> {
-        let stop = access
-            .get()
-            .stop
-            .take()
-            .ok_or_else(|| wasmtime::Error::msg("agent stop already claimed"))?;
-        StreamReader::new(&mut access, DirectSource::new(stop, CHUNK_BYTES))
+    fn stop(mut access: Access<'_, T, Self>) -> wasmtime::Result<FutureReader<()>> {
+        let StopClaim::Unclaimed(socket) =
+            std::mem::replace(&mut access.get().stop, StopClaim::Claimed)
+        else {
+            return Err(wasmtime::Error::msg("agent stop already claimed"));
+        };
+        FutureReader::new(&mut access, async move {
+            if let Some(socket) = socket
+                && read_stop_signal(&socket).await
+            {
+                return Ok::<_, wasmtime::Error>(());
+            }
+            std::future::pending().await
+        })
     }
 }
 
@@ -317,6 +323,21 @@ fn would_block(error: &io::Error) -> Option<usize> {
     (error.kind() == io::ErrorKind::WouldBlock).then_some(0)
 }
 
+/// Whether the stop socket's first byte is [`STOP_SIGNAL`]; EOF or an error is no stop request.
+async fn read_stop_signal(socket: &AsyncLocalStream) -> bool {
+    let mut byte = [0];
+    loop {
+        if socket.readable().await.is_err() {
+            return false;
+        }
+        match socket.try_read(&mut byte) {
+            Ok(count) => return count == 1 && byte == [STOP_SIGNAL],
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(_) => return false,
+        }
+    }
+}
+
 fn prepare_socket(stream: LocalStream) -> io::Result<Socket> {
     stream.set_nonblocking(true)?;
     AsyncLocalStream::from_std(stream).map(Arc::new)
@@ -349,41 +370,34 @@ pub(crate) fn enrich_plan_with_host_state(
     nanoseconds: u32,
     seed: [u8; 32],
 ) -> io::Result<Vec<u8>> {
-    let length: [u8; 4] = frame
-        .get(..4)
-        .and_then(|bytes| bytes.try_into().ok())
+    let mut remaining = frame;
+    let mut plan: terra_protocol::Plan = terra_protocol::read_frame(&mut remaining)?
+        .filter(|_| remaining.is_empty())
         .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "boot plan has no frame length")
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "boot plan frame length is invalid",
+            )
         })?;
-    let payload_len = usize::try_from(u32::from_le_bytes(length)).map_err(io::Error::other)?;
-    if payload_len > MAX_PLAN_BYTES || Some(frame.len()) != payload_len.checked_add(4) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "boot plan frame length is invalid",
-        ));
-    }
-    let mut boot_plan: terra_protocol::BootPlan =
-        terra_protocol::decode_frame_payload(&frame[4..])?;
-    boot_plan.validate_protocol_versions()?;
     if nanoseconds >= 1_000_000_000 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "host clock nanoseconds are invalid",
         ));
     }
-    boot_plan.plan.host_time = Some(terra_protocol::HostTime {
+    plan.host_time = Some(terra_protocol::HostTime {
         seconds,
         nanoseconds,
     });
-    boot_plan.plan.host_seed = Some(seed);
-    let frame = terra_protocol::encode_frame_with_limit(&boot_plan, MAX_PLAN_BYTES)?;
-    if (frame.len() - 4).saturating_sub(payload_len) > MAX_PLAN_HOST_STATE_BYTES {
+    plan.host_seed = Some(seed);
+    let enriched = terra_protocol::encode_frame(&plan)?;
+    if enriched.len().saturating_sub(frame.len()) > MAX_PLAN_HOST_STATE_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "enriched boot plan exceeds its host-state bound",
         ));
     }
-    Ok(frame)
+    Ok(enriched)
 }
 
 #[cfg(test)]
@@ -541,11 +555,10 @@ mod enrichment_tests {
     #[test]
     fn plan_enrichment_preserves_plan_fields_and_adds_host_state() {
         let mut plan = test_plan();
-        let frame =
-            terra_protocol::encode_frame(&terra_protocol::BootPlan::new(plan.clone())).unwrap();
+        let frame = terra_protocol::encode_frame(&plan.clone()).unwrap();
         let seed = std::array::from_fn(|index| u8::try_from(index).unwrap());
         let frame = enrich_plan_with_host_state(&frame, 12, 34, seed).unwrap();
-        let decoded: terra_protocol::BootPlan = terra_protocol::read_frame(&mut frame.as_slice())
+        let decoded: terra_protocol::Plan = terra_protocol::read_frame(&mut frame.as_slice())
             .unwrap()
             .unwrap();
         plan.host_time = Some(terra_protocol::HostTime {
@@ -553,47 +566,24 @@ mod enrichment_tests {
             nanoseconds: 34,
         });
         plan.host_seed = Some(seed);
-        assert_eq!(decoded, terra_protocol::BootPlan::new(plan));
+        assert_eq!(decoded, plan);
     }
 
     #[test]
     fn maximum_host_plan_fits_after_host_state_enrichment() {
-        let limit = MAX_PLAN_BYTES - MAX_PLAN_HOST_STATE_BYTES;
-        let mut boot_plan = terra_protocol::BootPlan::new(test_plan());
-        boot_plan.plan.sandbox_info = "x".repeat(limit);
-        let overhead = terra_protocol::encode_frame(&boot_plan).unwrap().len() - 4 - limit;
-        boot_plan.plan.sandbox_info.truncate(limit - overhead);
-        let frame = terra_protocol::encode_frame_with_limit(&boot_plan, limit).unwrap();
+        let limit = terra_protocol::MAX_PLAN_BYTES - MAX_PLAN_HOST_STATE_BYTES;
+        let mut plan = test_plan();
+        plan.sandbox_info = "x".repeat(limit);
+        let overhead = terra_protocol::encode_frame(&plan).unwrap().len() - 4 - limit;
+        plan.sandbox_info.truncate(limit - overhead);
+        let frame = terra_protocol::encode_frame(&plan).unwrap();
         assert_eq!(frame.len(), limit + 4);
         let frame =
             enrich_plan_with_host_state(&frame, i64::MIN, 999_999_999, [u8::MAX; 32]).unwrap();
-        assert!(frame.len() <= MAX_PLAN_BYTES + 4);
-        let decoded: terra_protocol::BootPlan =
-            terra_protocol::read_frame_with_limit(&mut frame.as_slice(), MAX_PLAN_BYTES)
-                .unwrap()
-                .unwrap();
-        assert_eq!(decoded.plan.sandbox_info, boot_plan.plan.sandbox_info);
-    }
-
-    #[test]
-    fn incompatible_or_unversioned_boot_plan_never_reaches_control_carrier() {
-        for (agent_version, socket_version) in [
-            (
-                terra_protocol::AGENT_PROTOCOL_VERSION - 1,
-                terra_protocol::socket::VERSION,
-            ),
-            (
-                terra_protocol::AGENT_PROTOCOL_VERSION,
-                terra_protocol::socket::VERSION + 1,
-            ),
-        ] {
-            let mut boot_plan = terra_protocol::BootPlan::new(test_plan());
-            boot_plan.agent_version = agent_version;
-            boot_plan.socket_version = socket_version;
-            let frame = terra_protocol::encode_frame(&boot_plan).unwrap();
-            assert!(enrich_plan_with_host_state(&frame, 12, 34, [0; 32]).is_err());
-        }
-        let bare_plan = terra_protocol::encode_frame(&test_plan()).unwrap();
-        assert!(enrich_plan_with_host_state(&bare_plan, 12, 34, [0; 32]).is_err());
+        assert!(frame.len() <= terra_protocol::MAX_PLAN_BYTES + 4);
+        let decoded: terra_protocol::Plan = terra_protocol::read_frame(&mut frame.as_slice())
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded.sandbox_info, plan.sandbox_info);
     }
 }

@@ -172,7 +172,6 @@
     "terra:mmio@0.1.0/types": [],
     "terra:network@0.1.0/broker": [
       "[method]listener.accept",
-      "[method]tcp.peer-address",
       "[method]tcp.receive",
       "[method]tcp.send",
       "[method]udp.receive-from",

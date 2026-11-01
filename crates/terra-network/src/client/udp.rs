@@ -4,9 +4,7 @@ use super::Client;
 use crate::Error;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
-use terra_protocol::network::{
-    DatagramBatch, MAX_NETWORK_FRAME_BYTES, SendFailure, UdpReply, UdpRequest,
-};
+use terra_protocol::network::{DatagramBatch, SendFailure, UdpReply, UdpRequest};
 use tokio::io::{AsyncWriteExt, ReadHalf};
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::compat::Compat;
@@ -146,8 +144,7 @@ impl UdpFlow {
 }
 
 fn encode(request: &UdpRequest) -> Result<Vec<u8>, Error> {
-    terra_protocol::encode_frame_with_limit(request, MAX_NETWORK_FRAME_BYTES)
-        .map_err(|_| Error::InvalidArgument)
+    terra_protocol::encode_frame(request).map_err(|_| Error::InvalidArgument)
 }
 
 fn is_valid_batch(datagrams: &DatagramBatch) -> bool {
@@ -160,7 +157,7 @@ fn is_valid_batch(datagrams: &DatagramBatch) -> bool {
 type StreamRead = ReadHalf<Compat<yamux::Stream>>;
 
 async fn read_reply(mut read: StreamRead) -> (StreamRead, std::io::Result<Option<UdpReply>>) {
-    let reply = crate::frames::read_frame::<UdpReply>(&mut read).await;
+    let reply = terra_protocol::read_frame_async::<UdpReply>(&mut read).await;
     (read, reply)
 }
 

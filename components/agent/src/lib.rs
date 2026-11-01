@@ -12,16 +12,9 @@ mod worker;
 
 #[cfg(feature = "fuzzing")]
 #[must_use]
-pub fn read_lifecycle_frames_for_fuzzing(
-    mut bytes: &[u8],
-) -> Vec<terra_protocol::control::LifecycleEvent> {
+pub fn read_lifecycle_frames_for_fuzzing(mut bytes: &[u8]) -> Vec<terra_protocol::LifecycleEvent> {
     use futures_util::FutureExt as _;
-    std::iter::from_fn(|| {
-        lifecycle::read_event(&mut bytes, lifecycle::MAX_DIAGNOSTIC_PAYLOAD_BYTES)
-            .now_or_never()
-            .flatten()
-    })
-    .collect()
+    std::iter::from_fn(|| lifecycle::read_event(&mut bytes).now_or_never().flatten()).collect()
 }
 
 static CLOSED: terra_device_transport::Doorbell = terra_device_transport::Doorbell::new();

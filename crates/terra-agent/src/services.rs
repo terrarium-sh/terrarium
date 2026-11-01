@@ -8,8 +8,7 @@ use std::os::fd::AsFd;
 use std::sync::Arc;
 use std::time::Duration;
 use terra_protocol::{
-    AGENT_HELLO, AgentService, ClientInput, ControlReply, ControlRequest, MAX_SERVICE_FRAME_BYTES,
-    TermSize, read_frame_async_with_limit,
+    AGENT_HELLO, AgentService, ClientInput, ControlReply, ControlRequest, TermSize,
 };
 use tokio::io::AsyncWriteExt as _;
 use tokio::sync::{mpsc, watch};
@@ -108,7 +107,7 @@ impl Services {
                 conn.flush().await?;
                 tokio::time::timeout(
                     SERVICE_SELECT_TIMEOUT,
-                    read_frame_async_with_limit::<AgentService>(&mut conn, MAX_SERVICE_FRAME_BYTES),
+                    terra_protocol::read_frame_async::<AgentService>(&mut conn),
                 )
                 .await?
             })

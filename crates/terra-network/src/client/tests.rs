@@ -48,11 +48,11 @@ impl FakeBroker {
     /// Accepts the next stream, reads its `Open`, and answers with `reply`.
     async fn answer(&mut self, reply: Result<Opened, Error>) -> (Open, BrokerStream) {
         let mut stream = self.streams.recv().await.unwrap().compat();
-        let open = crate::frames::read_frame::<Open>(&mut stream)
+        let open = terra_protocol::read_frame_async::<Open>(&mut stream)
             .await
             .unwrap()
             .unwrap();
-        crate::frames::write_frame(&mut stream, &reply)
+        terra_protocol::write_frame_async(&mut stream, &reply)
             .await
             .unwrap();
         (open, stream)
@@ -90,7 +90,7 @@ async fn malformed_or_out_of_order_tcp_events_disconnect_the_client() {
                         .await
                         .unwrap()
                 },
-                broker.answer(Ok(Opened::Tcp { peer }))
+                broker.answer(Ok(Opened::Tcp))
             );
             let (mut upload, mut download) = flow.split();
             for bytes in events {
@@ -107,27 +107,7 @@ async fn malformed_or_out_of_order_tcp_events_disconnect_the_client() {
 #[tokio::test]
 async fn open_replies_that_do_not_match_the_request_disconnect_the_client() {
     let loopback: SocketAddr = PEER.parse().unwrap();
-    for (open_reply, is_accept) in [
-        (
-            Opened::Tcp {
-                peer: "127.0.0.1:10".parse().unwrap(),
-            },
-            false,
-        ),
-        (Opened::Udp, false),
-        (
-            Opened::Tcp {
-                peer: "192.0.2.1:9".parse().unwrap(),
-            },
-            true,
-        ),
-        (
-            Opened::Tcp {
-                peer: "127.0.0.1:0".parse().unwrap(),
-            },
-            true,
-        ),
-    ] {
+    for (open_reply, is_accept) in [(Opened::Udp, false), (Opened::Resolved(vec![]), true)] {
         bounded(async {
             let (client, mut broker) = fake_broker();
             let (result, _) = tokio::join!(
@@ -198,7 +178,7 @@ async fn unrequested_or_empty_udp_replies_disconnect_the_client() {
                 async { client.open_udp().await.unwrap() },
                 broker.answer(Ok(Opened::Udp))
             );
-            crate::frames::write_frame(&mut stream, &reply)
+            terra_protocol::write_frame_async(&mut stream, &reply)
                 .await
                 .unwrap();
             assert_disconnected(&client).await;
@@ -212,13 +192,16 @@ async fn unrequested_or_empty_udp_replies_disconnect_the_client() {
             broker.answer(Ok(Opened::Udp))
         );
         let receiving = tokio::spawn(async move { flow.receive().await });
-        let request = crate::frames::read_frame::<UdpRequest>(&mut stream)
+        let request = terra_protocol::read_frame_async::<UdpRequest>(&mut stream)
             .await
             .unwrap();
         assert_eq!(request, Some(UdpRequest::Receive));
-        crate::frames::write_frame(&mut stream, &UdpReply::Datagrams(DatagramBatch::default()))
-            .await
-            .unwrap();
+        terra_protocol::write_frame_async(
+            &mut stream,
+            &UdpReply::Datagrams(DatagramBatch::default()),
+        )
+        .await
+        .unwrap();
         assert_eq!(receiving.await.unwrap(), Err(Error::Closed));
         assert_disconnected(&client).await;
     })
@@ -241,13 +224,13 @@ async fn closing_a_udp_flow_with_a_reply_in_flight_keeps_the_client() {
                 let flow = flow.clone();
                 async move { flow.receive().await }
             });
-            let request = crate::frames::read_frame::<UdpRequest>(&mut stream)
+            let request = terra_protocol::read_frame_async::<UdpRequest>(&mut stream)
                 .await
                 .unwrap();
             assert_eq!(request, Some(UdpRequest::Receive));
             receiving.abort();
             let _ = receiving.await;
-            crate::frames::write_frame(&mut stream, &UdpReply::Datagrams(one_datagram()))
+            terra_protocol::write_frame_async(&mut stream, &UdpReply::Datagrams(one_datagram()))
                 .await
                 .unwrap();
             for _ in 0..yields {
@@ -270,7 +253,7 @@ async fn out_of_range_send_failures_disconnect_the_client() {
             broker.answer(Ok(Opened::Udp))
         );
         let sending = tokio::spawn(async move { flow.send(one_datagram()).await });
-        let request = crate::frames::read_frame::<UdpRequest>(&mut stream)
+        let request = terra_protocol::read_frame_async::<UdpRequest>(&mut stream)
             .await
             .unwrap();
         assert!(matches!(request, Some(UdpRequest::Send(_))));
@@ -278,7 +261,7 @@ async fn out_of_range_send_failures_disconnect_the_client() {
             index: 1,
             error: Error::Io,
         }]);
-        crate::frames::write_frame(&mut stream, &reply)
+        terra_protocol::write_frame_async(&mut stream, &reply)
             .await
             .unwrap();
         assert_eq!(sending.await.unwrap(), Err(Error::Closed));
@@ -335,11 +318,11 @@ async fn a_broker_failure_ends_the_udp_flow_with_its_error() {
             let flow = flow.clone();
             async move { flow.receive().await }
         });
-        let request = crate::frames::read_frame::<UdpRequest>(&mut stream)
+        let request = terra_protocol::read_frame_async::<UdpRequest>(&mut stream)
             .await
             .unwrap();
         assert_eq!(request, Some(UdpRequest::Receive));
-        crate::frames::write_frame(&mut stream, &UdpReply::Failed(Error::Io))
+        terra_protocol::write_frame_async(&mut stream, &UdpReply::Failed(Error::Io))
             .await
             .unwrap();
         assert_eq!(receiving.await.unwrap(), Err(Error::Io));

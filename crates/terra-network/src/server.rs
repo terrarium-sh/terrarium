@@ -15,7 +15,7 @@ use crate::{Error, ResourceKind, SocketSource};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::{Future, poll_fn};
 use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex, PoisonError};
 use terra_policy::BoxPolicy;
 use terra_protocol::network::{ListenerGrant, Open, Opened};
@@ -96,7 +96,6 @@ impl Drop for GrantOwner {
 enum Prepared {
     Tcp {
         tcp: TcpStream,
-        peer: SocketAddr,
         permit: OwnedSemaphorePermit,
     },
     Udp {
@@ -283,7 +282,7 @@ fn is_channel_gone(error: &io::Error) -> bool {
 }
 
 async fn handle_stream(shared: Arc<Shared>, mut stream: Compat<yamux::Stream>) {
-    let Ok(Some(open)) = crate::frames::read_frame::<Open>(&mut stream).await else {
+    let Ok(Some(open)) = terra_protocol::read_frame_async::<Open>(&mut stream).await else {
         return;
     };
     let Some(prepared) = until_client_leaves(&mut stream, shared.prepare(open)).await else {
@@ -293,7 +292,7 @@ async fn handle_stream(shared: Arc<Shared>, mut stream: Compat<yamux::Stream>) {
         .as_ref()
         .map(Prepared::opened)
         .map_err(|error| *error);
-    if crate::frames::write_frame(&mut stream, &reply)
+    if terra_protocol::write_frame_async(&mut stream, &reply)
         .await
         .is_err()
     {
@@ -327,7 +326,7 @@ async fn until_client_leaves<T>(
 impl Prepared {
     fn opened(&self) -> Opened {
         match self {
-            Self::Tcp { peer, .. } => Opened::Tcp { peer: *peer },
+            Self::Tcp { .. } => Opened::Tcp,
             Self::Udp { .. } => Opened::Udp,
             Self::Resolved(addresses) => Opened::Resolved(addresses.clone()),
         }
@@ -351,14 +350,14 @@ impl Shared {
                 }
                 let permit = self.claim_resource()?;
                 let tcp = tcp::connect(&self.sockets, peer, options).await?;
-                Ok(Prepared::Tcp { tcp, peer, permit })
+                Ok(Prepared::Tcp { tcp, permit })
             }
             Open::Accept(grant) => {
                 let listener = self.listeners.get(&grant).ok_or(Error::AccessDenied)?;
                 let _owner = self.grant_owners.claim(grant).await;
                 let permit = self.claim_resource()?;
-                let (tcp, peer) = tcp::accept(listener).await?;
-                Ok(Prepared::Tcp { tcp, peer, permit })
+                let tcp = tcp::accept(listener).await?;
+                Ok(Prepared::Tcp { tcp, permit })
             }
             Open::Udp => Ok(Prepared::Udp {
                 permit: self.claim_resource()?,

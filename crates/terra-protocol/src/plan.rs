@@ -54,9 +54,7 @@ pub struct Share {
 /// Workload user name (cosmetic, for shell prompts).
 pub const WORKLOAD_USER_NAME: &str = "terri";
 
-/// The non-root workload user's numeric identity (uid == gid). One source of
-/// truth for both sides: the host's userns maps this uid to the launching
-/// user, and the agent drops the workload to it.
+/// The non-root workload user's uid and gid, shared by the image build and the agent.
 pub const WORKLOAD_ID: u32 = 1000;
 
 pub const WORKLOAD_HOME: &str = "/home/terri";
@@ -107,9 +105,8 @@ pub struct Plan {
     pub published_ports: Vec<u16>,
     pub published_udp_ports: Vec<u16>,
     pub env: BTreeMap<String, String>,
-    /// Run the workload as root instead of dropping to the workload user
-    /// (`--root`; also set for setup's VM).
-    pub root: bool,
+    /// `--root`, and always set for setup's VM.
+    pub as_root: bool,
     pub rootfs: RootfsMount,
     pub sudo: Vec<String>,
     pub on_create: Vec<String>,
@@ -127,40 +124,8 @@ pub struct Plan {
     pub host_seed: Option<[u8; 32]>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct BootPlan {
-    pub agent_version: u8,
-    pub socket_version: u16,
-    pub plan: Plan,
-}
-
-impl BootPlan {
-    #[must_use]
-    pub const fn new(plan: Plan) -> Self {
-        Self {
-            agent_version: crate::AGENT_PROTOCOL_VERSION,
-            socket_version: crate::socket::VERSION,
-            plan,
-        }
-    }
-
-    pub fn validate_protocol_versions(&self) -> std::io::Result<()> {
-        if self.agent_version != crate::AGENT_PROTOCOL_VERSION
-            || self.socket_version != crate::socket::VERSION
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "boot protocol mismatch: host agent {}/socket {}, guest agent {}/socket {}; rebuild the kernel, agent, components, and runtime together",
-                    self.agent_version,
-                    self.socket_version,
-                    crate::AGENT_PROTOCOL_VERSION,
-                    crate::socket::VERSION
-                ),
-            ));
-        }
-        Ok(())
-    }
+impl crate::Message for Plan {
+    const MAX_PAYLOAD_BYTES: usize = MAX_PLAN_BYTES;
 }
 
 impl Plan {
@@ -176,7 +141,7 @@ impl Plan {
             published_ports: Vec::new(),
             published_udp_ports: Vec::new(),
             env: BTreeMap::new(),
-            root: false,
+            as_root: false,
             rootfs: RootfsMount::Writable,
             sudo: Vec::new(),
             on_create: Vec::new(),
@@ -224,14 +189,14 @@ mod tests {
 
     #[test]
     fn plan_mode_retains_its_wire_format() {
-        assert_eq!(&encode_frame(&PlanMode::Create).unwrap()[4..], &[1]);
+        assert_eq!(postcard::to_allocvec(&PlanMode::Create).unwrap(), [1]);
     }
 
     #[test]
     fn plan_limit_rejects_the_length_before_allocating() {
         let over_limit = u32::try_from(MAX_PLAN_BYTES + 1).unwrap();
         let mut reader = std::io::Cursor::new(over_limit.to_le_bytes());
-        let error = crate::read_frame_with_limit::<Plan>(&mut reader, MAX_PLAN_BYTES).unwrap_err();
+        let error = read_frame::<Plan>(&mut reader).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert_eq!(reader.position(), 4);
     }
@@ -256,7 +221,7 @@ mod tests {
                 published_ports: vec![80, 443],
                 published_udp_ports: vec![53],
                 env: BTreeMap::from([("FOO".to_string(), "bar".to_string())]),
-                root: false,
+                as_root: false,
                 rootfs: RootfsMount::Overlay {
                     upper_dev: to_volume_device(1).unwrap(),
                 },
@@ -299,32 +264,6 @@ mod tests {
             assert!(local_only.validate_network().is_ok());
             let mut cursor = std::io::Cursor::new(encode_frame(&plan).unwrap());
             assert_eq!(read_frame::<Plan>(&mut cursor).unwrap(), Some(plan.clone()));
-            let boot = BootPlan::new(plan.clone());
-            assert!(boot.validate_protocol_versions().is_ok());
-            let frame = encode_frame(&boot).unwrap();
-            assert_eq!(
-                read_frame::<BootPlan>(&mut frame.as_slice()).unwrap(),
-                Some(boot.clone())
-            );
-            for agent_version in [0, crate::AGENT_PROTOCOL_VERSION + 1] {
-                let mut invalid = boot.clone();
-                invalid.agent_version = agent_version;
-                assert_eq!(
-                    invalid.validate_protocol_versions().unwrap_err().kind(),
-                    std::io::ErrorKind::InvalidData
-                );
-            }
-            for socket_version in [0, crate::socket::VERSION + 1] {
-                let mut invalid = boot.clone();
-                invalid.socket_version = socket_version;
-                assert_eq!(
-                    invalid.validate_protocol_versions().unwrap_err().kind(),
-                    std::io::ErrorKind::InvalidData
-                );
-            }
-            let bare = encode_frame(&plan).unwrap();
-            assert!(read_frame::<BootPlan>(&mut bare.as_slice()).is_err());
-            assert!(read_frame::<Plan>(&mut frame.as_slice()).is_err());
         }
     }
 
@@ -342,8 +281,8 @@ mod tests {
     #[test]
     fn network_modes_round_trip_by_name() {
         for (net, name) in [(Net::Tsi, "tsi"), (Net::LocalOnly, "local_only")] {
-            let frame = encode_frame(&net).unwrap();
-            assert_eq!(read_frame::<Net>(&mut frame.as_slice()).unwrap(), Some(net));
+            let payload = postcard::to_allocvec(&net).unwrap();
+            assert_eq!(postcard::from_bytes::<Net>(&payload).unwrap(), net);
             let decoder = serde::de::value::StrDeserializer::<serde::de::value::Error>::new(name);
             assert_eq!(Net::deserialize(decoder).unwrap(), net);
         }

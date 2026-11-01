@@ -6,26 +6,31 @@ pub enum GuestImage {
     Kernel,
 }
 
+/// Bumps when a marker's layout changes.
+const MARKER_FORMAT: u8 = 4;
+pub const MARKER_BYTES: usize = 8;
+
 impl GuestImage {
+    /// The gzip header subfield naming the agent protocol and kernel ABI an image was built for:
+    /// its two-byte ID and length, then the marker format, agent version, and kernel ABI version.
     #[must_use]
-    pub fn marker(self) -> [u8; 12] {
-        let mut extra = [0; 12];
-        match self {
-            Self::Boot => {
-                extra[..4].copy_from_slice(b"TB\x08\0");
-                extra[4] = 2;
-                extra[5] = crate::AGENT_PROTOCOL_VERSION;
-                extra[6..8].copy_from_slice(b"VS");
-                extra[8..10].copy_from_slice(&crate::socket::VERSION.to_le_bytes());
-            }
-            Self::Kernel => {
-                extra[..6].copy_from_slice(b"TK\x08\0VS");
-                extra[6..8].copy_from_slice(&crate::socket::VERSION.to_le_bytes());
-                extra[8..10].copy_from_slice(&crate::application::VERSION.to_le_bytes());
-            }
-        }
-        extra[10..12].copy_from_slice(&crate::vsock::VERSION.to_le_bytes());
-        extra
+    pub fn marker(self) -> [u8; MARKER_BYTES] {
+        let (id, agent_version) = match self {
+            Self::Boot => (*b"TB", crate::AGENT_PROTOCOL_VERSION),
+            // The kernel image carries no agent.
+            Self::Kernel => (*b"TK", 0),
+        };
+        let [abi_low, abi_high] = crate::kernel_abi::VERSION.to_le_bytes();
+        [
+            id[0],
+            id[1],
+            4,
+            0,
+            MARKER_FORMAT,
+            agent_version,
+            abi_low,
+            abi_high,
+        ]
     }
 
     pub fn validate(self, extra: Option<&[u8]>) -> std::io::Result<()> {
@@ -53,30 +58,28 @@ mod tests {
     use std::io::{Read as _, Write as _};
 
     #[test]
-    fn boot_marker_pins_current_protocols_and_standard_gzip_subfield_layout() {
-        let extra = GuestImage::Boot.marker();
-        assert_eq!(&extra[..5], b"TB\x08\0\x02");
-        assert_eq!(extra[5], crate::AGENT_PROTOCOL_VERSION);
-        assert_eq!(&extra[6..8], b"VS");
-        assert_eq!(&extra[8..10], &crate::socket::VERSION.to_le_bytes());
-        assert_eq!(&extra[10..], &crate::vsock::VERSION.to_le_bytes());
-        GuestImage::Boot.validate(Some(&extra)).unwrap();
-    }
-
-    #[test]
-    fn kernel_marker_pins_socket_application_and_vsock_versions() {
-        let extra = GuestImage::Kernel.marker();
-        assert_eq!(&extra[..6], b"TK\x08\0VS");
-        assert_eq!(&extra[6..8], &crate::socket::VERSION.to_le_bytes());
-        assert_eq!(&extra[8..10], &crate::application::VERSION.to_le_bytes());
-        assert_eq!(&extra[10..], &crate::vsock::VERSION.to_le_bytes());
-        GuestImage::Kernel.validate(Some(&extra)).unwrap();
-        assert!(
-            GuestImage::Kernel
-                .validate(Some(&GuestImage::Boot.marker()))
-                .is_err()
+    fn markers_pin_the_agent_protocol_and_kernel_abi_in_a_gzip_subfield() {
+        let abi = crate::kernel_abi::VERSION.to_le_bytes();
+        let boot = GuestImage::Boot.marker();
+        assert_eq!(
+            boot[..6],
+            [
+                b'T',
+                b'B',
+                4,
+                0,
+                MARKER_FORMAT,
+                crate::AGENT_PROTOCOL_VERSION
+            ]
         );
-        assert!(GuestImage::Boot.validate(Some(&extra)).is_err());
+        assert_eq!(boot[6..], abi);
+        let kernel = GuestImage::Kernel.marker();
+        assert_eq!(kernel[..6], [b'T', b'K', 4, 0, MARKER_FORMAT, 0]);
+        assert_eq!(kernel[6..], abi);
+        GuestImage::Boot.validate(Some(&boot)).unwrap();
+        GuestImage::Kernel.validate(Some(&kernel)).unwrap();
+        assert!(GuestImage::Kernel.validate(Some(&boot)).is_err());
+        assert!(GuestImage::Boot.validate(Some(&kernel)).is_err());
     }
 
     #[test]

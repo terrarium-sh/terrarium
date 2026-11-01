@@ -45,12 +45,12 @@ fn boot_plan(
     use terra_protocol::{Plan, encode_frame};
     let plan = Plan {
         mode,
-        root: true,
+        as_root: true,
         on_create,
         await_initial_session,
         ..Plan::bare_run(workload)
     };
-    encode_frame(&terra_protocol::BootPlan::new(plan)).expect("plan encodes")
+    encode_frame(&plan).expect("plan encodes")
 }
 
 fn boot_probe_plan(vcpus: usize) -> Vec<u8> {
@@ -97,8 +97,7 @@ async fn kernel_boots_directory_share() {
     }
     let tag = crate::component::fs::share_tag(0);
     let encoded = boot_plan(PlanMode::Run, Vec::new(), vec!["/bin/true".into()], false);
-    let envelope: terra_protocol::BootPlan = read_frame(&mut encoded.as_slice()).unwrap().unwrap();
-    let mut plan = envelope.plan;
+    let mut plan: terra_protocol::Plan = read_frame(&mut encoded.as_slice()).unwrap().unwrap();
     plan.on_start.push("set -ex; test $(/work/script) = executed; test $(cat /work/host-file) = host-data; printf guest-data >/work/guest-file; ln /work/guest-file /work/hardlink; ln -s guest-file /work/link; test $(cat /work/link) = guest-data; mv /work/guest-file /work/renamed; test $(cat /work/hardlink) = guest-data; cp /work/large-host /work/large-copy; cmp /work/large-host /work/large-copy; test $(wc -c </work/large-copy) = 65537; sync".into());
     let diagnostics = tempfile::NamedTempFile::new().unwrap();
     plan.shares.push(Share {
@@ -115,7 +114,7 @@ async fn kernel_boots_directory_share() {
         rootfs_access: AccessMode::ReadWrite,
         volume_disks: Vec::new(),
         shares: vec![crate::component::fs::ShareGrant::new(&mount, AccessMode::ReadWrite).unwrap()],
-        plan: encode_frame(&terra_protocol::BootPlan::new(plan)).unwrap(),
+        plan: encode_frame(&plan).unwrap(),
         artifacts: crate::test_fixtures::trusted_artifacts(),
         network_backend: Some(create_boot_network_backend()),
         port_mappings: Vec::new(),
@@ -681,8 +680,7 @@ async fn kernel_boots_local_only_agent_control_and_session() {
         vec!["sleep".into(), "120".into()],
         false,
     );
-    let envelope: terra_protocol::BootPlan = read_frame(&mut encoded.as_slice()).unwrap().unwrap();
-    let mut plan = envelope.plan;
+    let mut plan: terra_protocol::Plan = read_frame(&mut encoded.as_slice()).unwrap().unwrap();
     plan.net = Net::LocalOnly;
     let diagnostics = tempfile::NamedTempFile::new().unwrap();
     let (kernel, boot_disk, root_path) = kernel_boot_assets();
@@ -694,7 +692,7 @@ async fn kernel_boots_local_only_agent_control_and_session() {
         rootfs_access: AccessMode::ReadWrite,
         volume_disks: Vec::new(),
         shares: Vec::new(),
-        plan: encode_frame(&terra_protocol::BootPlan::new(plan)).unwrap(),
+        plan: encode_frame(&plan).unwrap(),
         artifacts: crate::test_fixtures::trusted_artifacts(),
         network_backend: None,
         port_mappings: Vec::new(),
@@ -889,7 +887,7 @@ fn stop_with_stalled_transfers(
 #[ignore = "requires native KVM, matching component AOT artifacts, and boot assets"]
 async fn kernel_boots_control_and_stop_progress_with_stalled_network_and_file() {
     use std::time::Duration;
-    use terra_protocol::{BootPlan, PlanMode, Share, encode_frame, read_frame};
+    use terra_protocol::{Plan, PlanMode, Share, encode_frame, read_frame};
 
     let directory = tempfile::tempdir().unwrap();
     std::fs::File::create(directory.path().join("pressure-file"))
@@ -911,16 +909,14 @@ async fn kernel_boots_control_and_stop_progress_with_stalled_network_and_file() 
         ],
         false,
     );
-    let mut envelope: BootPlan = read_frame(&mut encoded.as_slice()).unwrap().unwrap();
-    envelope.plan.published_ports.push(STALLED_GUEST_PORT);
-    envelope.plan.shares.push(Share {
+    let mut plan: Plan = read_frame(&mut encoded.as_slice()).unwrap().unwrap();
+    plan.published_ports.push(STALLED_GUEST_PORT);
+    plan.shares.push(Share {
         tag: crate::component::fs::share_tag(0),
         guest: "/work".into(),
         readonly: false,
     });
-    envelope
-        .plan
-        .pre_stop
+    plan.pre_stop
         .push("touch /work/CONTROL_WHILE_BULK_STALLED".into());
     let client = tokio::task::spawn_blocking(move || {
         stop_with_stalled_transfers(&socket_path, host_port, control_writer)
@@ -937,7 +933,7 @@ async fn kernel_boots_control_and_stop_progress_with_stalled_network_and_file() 
         shares: vec![
             crate::component::fs::ShareGrant::new(directory.path(), AccessMode::ReadWrite).unwrap(),
         ],
-        plan: encode_frame(&envelope).unwrap(),
+        plan: encode_frame(&plan).unwrap(),
         artifacts: crate::test_fixtures::trusted_artifacts(),
         network_backend: Some(start_network_broker(
             Network::default(),
@@ -1170,7 +1166,7 @@ async fn kernel_shared_vsock_reset_disconnects_both_roles() {
 
 #[allow(clippy::too_many_lines)]
 async fn assert_vsock_reset_effect(shared_reset: bool) {
-    use terra_protocol::{BootPlan, PlanMode, Share, encode_frame, read_frame};
+    use terra_protocol::{Plan, PlanMode, Share, encode_frame, read_frame};
 
     let directory = tempfile::tempdir().unwrap();
     let probe = directory.path().join("vsock-probe");
@@ -1183,14 +1179,6 @@ async fn assert_vsock_reset_effect(shared_reset: bool) {
             &format!("{}-linux-musl", std::env::consts::ARCH),
         ])
         .args(["-static", "-O2", "-Wall", "-Wextra", "-Werror"])
-        .arg(format!(
-            "-DTERRA_SOCKET_ABI={}",
-            terra_protocol::socket::VERSION
-        ))
-        .arg(format!(
-            "-DTERRA_NETWORK_ABI={}",
-            terra_protocol::application::VERSION
-        ))
         .arg("-o")
         .arg(&probe)
         .arg(source)
@@ -1216,8 +1204,8 @@ async fn assert_vsock_reset_effect(shared_reset: bool) {
         ],
         false,
     );
-    let mut envelope: BootPlan = read_frame(&mut encoded.as_slice()).unwrap().unwrap();
-    envelope.plan.shares.push(Share {
+    let mut plan: Plan = read_frame(&mut encoded.as_slice()).unwrap().unwrap();
+    plan.shares.push(Share {
         tag: crate::component::fs::share_tag(0),
         guest: "/work".into(),
         readonly: false,
@@ -1250,7 +1238,7 @@ async fn assert_vsock_reset_effect(shared_reset: bool) {
         shares: vec![
             crate::component::fs::ShareGrant::new(directory.path(), AccessMode::ReadWrite).unwrap(),
         ],
-        plan: encode_frame(&envelope).unwrap(),
+        plan: encode_frame(&plan).unwrap(),
         artifacts: crate::test_fixtures::trusted_artifacts(),
         network_backend: Some(start_network_broker(
             Network {
@@ -1340,8 +1328,7 @@ async fn kernel_boots_libc_dns_tcp_fallback() {
         vec!["/work/socket-probe".into(), "--dns-tcp-fallback".into()],
         true,
     );
-    let envelope: terra_protocol::BootPlan = read_frame(&mut encoded.as_slice()).unwrap().unwrap();
-    let mut plan = envelope.plan;
+    let mut plan: terra_protocol::Plan = read_frame(&mut encoded.as_slice()).unwrap().unwrap();
     plan.shares.push(Share {
         tag: crate::component::fs::share_tag(0),
         guest: "/work".into(),
@@ -1363,7 +1350,7 @@ async fn kernel_boots_libc_dns_tcp_fallback() {
         shares: vec![
             crate::component::fs::ShareGrant::new(directory.path(), AccessMode::ReadOnly).unwrap(),
         ],
-        plan: encode_frame(&terra_protocol::BootPlan::new(plan)).unwrap(),
+        plan: encode_frame(&plan).unwrap(),
         artifacts: crate::test_fixtures::trusted_artifacts(),
         network_backend: Some(backend),
         port_mappings: Vec::new(),
@@ -1689,8 +1676,7 @@ async fn assert_published_loopback_http(host_closes_first: bool) {
         ],
         false,
     );
-    let envelope: terra_protocol::BootPlan = read_frame(&mut encoded.as_slice()).unwrap().unwrap();
-    let mut plan = envelope.plan;
+    let mut plan: terra_protocol::Plan = read_frame(&mut encoded.as_slice()).unwrap().unwrap();
     plan.published_ports.push(GUEST_PORT);
     let client = tokio::task::spawn_blocking(move || {
         let response = published_http_response(host_port, host_closes_first)?;
@@ -1705,7 +1691,7 @@ async fn assert_published_loopback_http(host_closes_first: bool) {
         rootfs_access: AccessMode::ReadWrite,
         volume_disks: Vec::new(),
         shares: Vec::new(),
-        plan: terra_protocol::encode_frame(&terra_protocol::BootPlan::new(plan)).unwrap(),
+        plan: terra_protocol::encode_frame(&plan).unwrap(),
         artifacts: crate::test_fixtures::trusted_artifacts(),
         network_backend: Some(start_network_broker(
             Network::default(),
@@ -1825,7 +1811,7 @@ async fn kernel_network_idle_sockets_preserve_tcp_progress() {
         Arc,
         atomic::{AtomicBool, Ordering},
     };
-    use terra_protocol::{BootPlan, Net, PlanMode, Share, encode_frame, read_frame};
+    use terra_protocol::{Net, Plan, PlanMode, Share, encode_frame, read_frame};
 
     let directory = tempfile::tempdir().unwrap();
     let probe = directory.path().join("network-tx-probe");
@@ -1869,9 +1855,9 @@ async fn kernel_network_idle_sockets_preserve_tcp_progress() {
             ],
             true,
         );
-        let mut envelope: BootPlan = read_frame(&mut encoded.as_slice()).unwrap().unwrap();
-        envelope.plan.net = net;
-        envelope.plan.shares.push(Share {
+        let mut plan: Plan = read_frame(&mut encoded.as_slice()).unwrap().unwrap();
+        plan.net = net;
+        plan.shares.push(Share {
             tag: crate::component::fs::share_tag(0),
             guest: "/work".into(),
             readonly: true,
@@ -1891,7 +1877,7 @@ async fn kernel_network_idle_sockets_preserve_tcp_progress() {
                 crate::component::fs::ShareGrant::new(directory.path(), AccessMode::ReadOnly)
                     .unwrap(),
             ],
-            plan: encode_frame(&envelope).unwrap(),
+            plan: encode_frame(&plan).unwrap(),
             artifacts: crate::test_fixtures::trusted_artifacts(),
             network_backend: Some(backend),
             port_mappings: Vec::new(),

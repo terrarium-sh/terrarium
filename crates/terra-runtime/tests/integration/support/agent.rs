@@ -134,15 +134,14 @@ impl AgentGuest {
     }
 
     pub async fn read_plan(&mut self) -> terra_protocol::Plan {
-        let length =
-            u32::from_le_bytes(self.read_control(4).await.try_into().expect("frame length"));
-        let envelope: terra_protocol::BootPlan =
-            terra_protocol::decode_frame_payload(&self.read_control(length as usize).await)
-                .expect("plan");
-        envelope
-            .validate_protocol_versions()
-            .expect("plan versions");
-        envelope.plan
+        self.read_control_message().await
+    }
+
+    async fn read_control_message<T: terra_protocol::Message>(&mut self) -> T {
+        let prefix = self.read_control(4).await.try_into().expect("frame length");
+        let length = terra_protocol::frame_payload_len::<T>(prefix).expect("frame length");
+        terra_protocol::decode_frame_payload(&self.read_control(length).await)
+            .expect("control message")
     }
 
     pub async fn send_control(&mut self, bytes: &[u8]) {
@@ -158,17 +157,12 @@ impl AgentGuest {
 
     pub async fn wait_for_stop(&mut self) {
         loop {
-            let command = self.read_control(1).await[0];
-            if command == terra_protocol::STOP_SIGNAL {
-                return;
+            match self.read_control_message().await {
+                terra_protocol::AgentCommand::Stop => return,
+                terra_protocol::AgentCommand::SyncClock { nanoseconds, .. } => {
+                    assert!(nanoseconds < 1_000_000_000);
+                }
             }
-            assert_eq!(command, terra_protocol::CLOCK_SYNC);
-            let mut update = vec![command];
-            update.extend(
-                self.read_control(terra_protocol::CLOCK_SYNC_BYTES - 1)
-                    .await,
-            );
-            assert!(terra_protocol::decode_clock_sync(&update).is_some());
         }
     }
 
@@ -249,8 +243,6 @@ pub fn yamux_frame(kind: u8, flags: u16, stream: u32, value: u32, payload: &[u8]
 }
 
 pub fn plan_frame() -> Vec<u8> {
-    terra_protocol::encode_frame(&terra_protocol::BootPlan::new(
-        terra_protocol::Plan::bare_run(vec!["/bin/sh".into()]),
-    ))
-    .expect("plan encodes")
+    terra_protocol::encode_frame(&terra_protocol::Plan::bare_run(vec!["/bin/sh".into()]))
+        .expect("plan encodes")
 }

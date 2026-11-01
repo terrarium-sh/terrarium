@@ -4,7 +4,6 @@
 
 mod client;
 pub mod config;
-mod frames;
 mod mux;
 mod server;
 mod sockets;
@@ -26,7 +25,7 @@ pub const MAX_UDP_OUTBOUND_PEERS: usize = 128;
 pub const MAX_SOCKET_BUFFER_BYTES: u32 = 256 << 10;
 const MAX_STREAMS: usize = MAX_RESOURCES + MAX_LISTENERS + MAX_DNS_REQUESTS + 16;
 const _: () = assert!(
-    terra_protocol::network::MAX_NETWORK_READ_BYTES <= terra_limits::NETWORK_TCP_READ_BUFFER_BYTES
+    terra_protocol::network::MAX_NETWORK_CHUNK_BYTES <= terra_limits::NETWORK_TCP_READ_BUFFER_BYTES
 );
 const _: () =
     assert!(terra_policy::MAX_RESOLVED_ADDRESSES <= terra_protocol::network::MAX_NETWORK_ADDRESSES);

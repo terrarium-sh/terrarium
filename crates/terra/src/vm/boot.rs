@@ -527,18 +527,21 @@ fn override_workload(recipe: &mut Recipe, command: &[String]) {
     }
 }
 
+/// The byte the VM process writes to its startup pipe once the guest agent is ready.
+pub(super) const AGENT_READY_NOTIFICATION: u8 = b'R';
+
 pub(super) fn write_agent_ready() {
     use std::io::Write as _;
     let mut startup = std::io::stdout().lock();
     let _ = startup
-        .write_all(&[terra_protocol::AGENT_READY_NOTIFICATION])
+        .write_all(&[AGENT_READY_NOTIFICATION])
         .and_then(|()| startup.flush());
 }
 
 fn read_agent_ready(mut reader: impl Read) -> Result<bool> {
     let mut ready = [0];
     match reader.read_exact(&mut ready) {
-        Ok(()) if ready == [terra_protocol::AGENT_READY_NOTIFICATION] => Ok(true),
+        Ok(()) if ready == [AGENT_READY_NOTIFICATION] => Ok(true),
         Ok(()) => anyhow::bail!("invalid VM startup notification"),
         Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
         Err(error) => Err(error).context("reading VM startup notification"),

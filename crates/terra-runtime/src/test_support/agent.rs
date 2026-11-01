@@ -8,6 +8,7 @@ use crate::box_runtime::{BoxHost, BoxRuntime};
 use crate::component::agent::Agent;
 use crate::component::vsock::streams::StreamEndpoint;
 use std::collections::BTreeMap;
+use terra_protocol::AgentCommand;
 
 const YAMUX_HEADER_BYTES: usize = 12;
 
@@ -122,7 +123,7 @@ impl GuestTransport {
 
 fn encode_plan() -> wasmtime::Result<Vec<u8>> {
     Ok(terra_protocol::encode_frame(
-        &terra_protocol::BootPlan::new(terra_protocol::Plan::bare_run(vec!["/bin/true".into()])),
+        &terra_protocol::Plan::bare_run(vec!["/bin/true".into()]),
     )?)
 }
 
@@ -258,9 +259,7 @@ async fn exercise_transport(guest: &mut GuestTransport) -> wasmtime::Result<()> 
     }
     let length = u32::from_le_bytes(field(&guest.read_control(4).await?, 0)?);
     let plan = guest.read_control(usize::try_from(length)?).await?;
-    let envelope: terra_protocol::BootPlan = terra_protocol::decode_frame_payload(&plan)?;
-    envelope.validate_protocol_versions()?;
-    let decoded = envelope.plan;
+    let decoded: terra_protocol::Plan = terra_protocol::decode_frame_payload(&plan)?;
     wasmtime::ensure!(
         decoded.host_time.is_some() && decoded.host_seed.is_some(),
         "agent device suite host plan enrichment"
@@ -279,24 +278,15 @@ async fn exercise_transport(guest: &mut GuestTransport) -> wasmtime::Result<()> 
         .send_bytes(&yamux_frame(0, 0, 2, b"guestless output")?)
         .await?;
     loop {
-        let command = guest.read_control(1).await?[0];
-        if command == terra_protocol::STOP_SIGNAL {
-            break;
+        let prefix = <[u8; 4]>::try_from(guest.read_control(4).await?)
+            .map_err(|_| wasmtime::Error::msg("device suite control frame prefix"))?;
+        let length = terra_protocol::frame_payload_len::<AgentCommand>(prefix)?;
+        match terra_protocol::decode_frame_payload(&guest.read_control(length).await?)? {
+            AgentCommand::Stop => break,
+            AgentCommand::SyncClock { nanoseconds, .. } => {
+                wasmtime::ensure!(nanoseconds < 1_000_000_000, "device suite clock update");
+            }
         }
-        wasmtime::ensure!(
-            command == terra_protocol::CLOCK_SYNC,
-            "unexpected device suite control command"
-        );
-        let mut update = vec![command];
-        update.extend(
-            guest
-                .read_control(terra_protocol::CLOCK_SYNC_BYTES - 1)
-                .await?,
-        );
-        wasmtime::ensure!(
-            terra_protocol::decode_clock_sync(&update).is_some(),
-            "device suite clock update"
-        );
     }
     Ok(())
 }

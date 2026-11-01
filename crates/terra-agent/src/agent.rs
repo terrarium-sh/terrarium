@@ -15,7 +15,7 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
-use terra_protocol::{CLOCK_SYNC, LifecycleEvent, Plan, STOP_SIGNAL};
+use terra_protocol::{AgentCommand, LifecycleEvent, Plan};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
@@ -418,21 +418,19 @@ pub(crate) async fn watch_control(
     stop: CancellationToken,
     shutdown: CancellationToken,
 ) {
-    use tokio::io::AsyncReadExt as _;
     shutdown
         .run_until_cancelled(async {
-            let mut byte = [0u8; 1];
             loop {
-                match control.read(&mut byte).await {
-                    Ok(0) => break,
-                    Ok(_) if byte[0] == STOP_SIGNAL => break,
-                    Ok(_) if byte[0] == CLOCK_SYNC => {
-                        if let Err(error) = bootstrap::read_clock_update(&mut control).await {
+                match terra_protocol::read_frame_async::<AgentCommand>(&mut control).await {
+                    Ok(None | Some(AgentCommand::Stop)) => break,
+                    Ok(Some(AgentCommand::SyncClock {
+                        seconds,
+                        nanoseconds,
+                    })) => {
+                        if let Err(error) = bootstrap::sync_clock(seconds, nanoseconds) {
                             eprintln!("terra-agent: clock update failed ({error:#})");
                         }
                     }
-                    Ok(_) => eprintln!("terra-agent: ignored invalid control command"),
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                     Err(error) => {
                         eprintln!(
                             "terra-agent: the control connection failed ({error}) - stopping"
@@ -457,7 +455,8 @@ mod tests {
         let (mut host, guest) = UnixStream::pair().unwrap();
         let guest = File::from(OwnedFd::from(guest));
         let (_sender, connected) = tokio::sync::mpsc::channel(1);
-        host.write_all(&[STOP_SIGNAL]).unwrap();
+        host.write_all(&terra_protocol::encode_frame(&AgentCommand::Stop).unwrap())
+            .unwrap();
 
         let stop = CancellationToken::new();
         let shutdown = CancellationToken::new();

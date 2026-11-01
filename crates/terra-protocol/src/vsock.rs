@@ -1,6 +1,5 @@
 //! Fixed endpoint classes and device queue payload budgets.
 
-pub const VERSION: u16 = 1;
 pub const HOST_CID: u32 = 2;
 pub const GUEST_CID: u32 = 3;
 pub const AGENT_PORT: u32 = 6000;
@@ -32,8 +31,6 @@ pub const fn is_flow_guest_port(port: u32) -> bool {
 }
 
 const _: () = assert!(MAX_FLOW_UPSTREAM_BYTES + MAX_FLOW_REPLY_BYTES == 144 * 1024 * 1024);
-const _: () = assert!(crate::application::MAX_FRAME_BYTES <= FLOW_UPSTREAM_BYTES);
-const _: () = assert!(crate::application::MAX_FRAME_BYTES <= FLOW_REPLY_BYTES);
 
 #[cfg(test)]
 mod tests {

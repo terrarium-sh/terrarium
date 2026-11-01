@@ -7,6 +7,7 @@ use futures_util::{
 use std::{
     collections::BTreeMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    num::NonZeroU16,
     sync::{
         Arc, LazyLock, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -14,7 +15,8 @@ use std::{
     task::{Poll, Waker},
 };
 use terra::network::broker::{self, IpAddress as HostIpAddress, SocketAddress};
-use terra_protocol::application::{Direction, Message, StreamDecoder};
+use terra_protocol::Message;
+use terra_protocol::application::{Frame as _, HostFrame, OPEN_TIMEOUT_SECS};
 use terra_protocol::socket::Error as SocketError;
 use terra_vsock_device::{ConnectionId, Role};
 
@@ -72,9 +74,16 @@ impl Drop for Task {
     }
 }
 
+/// The network configuration `configure` admitted.
+#[derive(Clone)]
+struct NetworkConfig {
+    host_service_ports: Vec<Option<u16>>,
+    published_ports: Vec<publish::PublishedPort>,
+}
+
 #[derive(Default)]
 struct State {
-    config: Option<crate::terra::network::types::Config>,
+    config: Option<NetworkConfig>,
     control: Option<(ConnectionId, Task)>,
     is_control_ready: bool,
     flows: Vec<Flow>,
@@ -138,38 +147,46 @@ pub fn configure(
     if crate::WORK.is_closed() || crate::CONFIGURED.load(std::sync::atomic::Ordering::Acquire) {
         return Err(Error::NotReady);
     }
-    validate_config(&config)?;
+    let config = parse_config(config)?;
     reset();
     lock_network().config = Some(config);
     wake_worker();
     Ok(())
 }
 
-fn validate_config(
-    config: &crate::terra::network::types::Config,
-) -> Result<(), crate::terra::network::types::Error> {
+fn parse_config(
+    config: crate::terra::network::types::Config,
+) -> Result<NetworkConfig, crate::terra::network::types::Error> {
     use crate::terra::network::types::{Error, Transport};
     if config.flow_capacity == 0
         || config.flow_capacity as usize > terra_vsock_device::MAX_NETWORK_SOCKETS
         || config.host_service_ports.len() > terra_policy::MAX_EXPANDED_RULES
         || config.host_service_ports.contains(&Some(0))
         || config.published_ports.len() > terra_protocol::MAX_PUBLISHED_PORTS
-        || config
-            .published_ports
-            .iter()
-            .enumerate()
-            .any(|(index, port)| {
-                port.host_port == 0
-                    || port.guest_port == 0
-                    || config.published_ports[..index].iter().any(|other| {
-                        other.host_port == port.host_port && other.transport == port.transport
-                    })
-            })
     {
         return Err(Error::Malformed);
     }
-    let udp_stream_count = config
-        .published_ports
+    let mut published_ports = Vec::<publish::PublishedPort>::new();
+    for port in config.published_ports {
+        let (Some(host_port), Some(guest_port)) = (
+            NonZeroU16::new(port.host_port),
+            NonZeroU16::new(port.guest_port),
+        ) else {
+            return Err(Error::Malformed);
+        };
+        if published_ports
+            .iter()
+            .any(|other| other.host_port == host_port && other.transport == port.transport)
+        {
+            return Err(Error::Malformed);
+        }
+        published_ports.push(publish::PublishedPort {
+            host_port,
+            guest_port,
+            transport: port.transport,
+        });
+    }
+    let udp_stream_count = published_ports
         .iter()
         .filter(|port| port.transport == Transport::Udp)
         .count()
@@ -177,7 +194,10 @@ fn validate_config(
     if udp_stream_count > config.flow_capacity as usize {
         return Err(Error::Backpressure);
     }
-    Ok(())
+    Ok(NetworkConfig {
+        host_service_ports: config.host_service_ports,
+        published_ports,
+    })
 }
 
 pub fn reset() {
@@ -334,13 +354,19 @@ pub(crate) async fn deliver_bytes(
     Ok(())
 }
 
-async fn deliver_message(connection: ConnectionId, message: &Message) -> Result<(), SocketError> {
-    let bytes = message.encode().map_err(|_| SocketError::Protocol)?;
-    deliver_bytes(connection, bytes).await
+fn frame_bytes(frame: &HostFrame) -> Result<Vec<u8>, SocketError> {
+    frame.encode().map_err(|_| SocketError::Protocol)
 }
 
-async fn deliver_opening(connection: ConnectionId, message: &Message) -> Result<(), SocketError> {
-    let bytes = message.encode().map_err(|_| SocketError::Protocol)?;
+fn message_bytes<T: Message>(message: &T) -> Result<Vec<u8>, SocketError> {
+    terra_protocol::encode_frame(message).map_err(|_| SocketError::Protocol)
+}
+
+async fn deliver_frame(connection: ConnectionId, frame: &HostFrame) -> Result<(), SocketError> {
+    deliver_bytes(connection, frame_bytes(frame)?).await
+}
+
+async fn deliver_opening(connection: ConnectionId, bytes: Vec<u8>) -> Result<(), SocketError> {
     if wait_capacity(connection, bytes.len(), CHUNK_BYTES)
         .await
         .map_err(|()| SocketError::Cancelled)?
@@ -355,7 +381,32 @@ async fn deliver_opening(connection: ConnectionId, message: &Message) -> Result<
     Ok(())
 }
 
-fn reject_opening(connection: ConnectionId, reply: &Message) {
+/// Open the flow's socket before the opening deadline and reply with the outcome; `None` means the
+/// flow was shut down or rejected instead.
+async fn open_socket<T>(
+    connection: ConnectionId,
+    open: impl std::future::Future<Output = Result<T, SocketError>>,
+) -> Option<T> {
+    let opening = async {
+        let outcome = open.await;
+        let reply = HostFrame::Opened(outcome.as_ref().map(|_| ()).map_err(|error| *error));
+        deliver_opening(connection, frame_bytes(&reply)?).await?;
+        outcome
+    };
+    match run_before_deadline(OPEN_TIMEOUT_SECS, opening).await {
+        Ok(Ok(socket)) => Some(socket),
+        Ok(Err(_)) => {
+            shutdown_flow(connection);
+            None
+        }
+        Err(error) => {
+            reject_opening(connection, &HostFrame::Opened(Err(error)));
+            None
+        }
+    }
+}
+
+fn reject_opening(connection: ConnectionId, reply: &HostFrame) {
     let delivered = reply
         .encode()
         .is_ok_and(|bytes| switch().deliver(connection, bytes).is_ok());
@@ -366,62 +417,27 @@ fn reject_opening(connection: ConnectionId, reply: &Message) {
     }
 }
 
-/// Decode the next guest frame from bytes already queued; `Ok(None)` means none is complete yet.
-fn read_queued_message(
-    connection: ConnectionId,
-    decoder: &mut StreamDecoder,
-) -> Result<Option<Message>, SocketError> {
-    loop {
-        if let Some(message) = decoder
-            .next(Direction::GuestToHost)
-            .map_err(|_| SocketError::Protocol)?
-        {
-            return Ok(Some(message));
-        }
-        let bytes =
-            switch().peek_upstream(connection, decoder.remaining_capacity().min(CHUNK_BYTES));
-        if bytes.is_empty() {
-            return Ok(None);
-        }
-        decoder.push(&bytes).map_err(|_| SocketError::Protocol)?;
-        consume_upstream(connection, bytes.len()).map_err(|()| SocketError::Cancelled)?;
+/// Read the next message from the guest's queued bytes, consuming none until it has all arrived;
+/// `Ok(None)` means the guest closed its sending side at a message boundary.
+async fn read_message<T: Message>(connection: ConnectionId) -> Result<Option<T>, SocketError> {
+    let prefix = wait_upstream(connection, 4, 4)
+        .await
+        .map_err(|()| SocketError::Cancelled)?;
+    if prefix.is_empty() {
+        return Ok(None);
     }
-}
-
-/// Read the next guest frame; `Ok(None)` means the guest closed its sending side.
-async fn read_message(
-    connection: ConnectionId,
-    decoder: &mut StreamDecoder,
-) -> Result<Option<Message>, SocketError> {
-    loop {
-        if let Some(message) = read_queued_message(connection, decoder)? {
-            return Ok(Some(message));
-        }
-        let bytes = wait_upstream(connection, 1, decoder.remaining_capacity().min(CHUNK_BYTES))
-            .await
-            .map_err(|()| SocketError::Cancelled)?;
-        if bytes.is_empty() {
-            return if decoder.is_empty() {
-                Ok(None)
-            } else {
-                Err(SocketError::Protocol)
-            };
-        }
-        decoder.push(&bytes).map_err(|_| SocketError::Protocol)?;
-        consume_upstream(connection, bytes.len()).map_err(|()| SocketError::Cancelled)?;
-    }
-}
-
-async fn read_opening(connection: ConnectionId) -> Result<Message, SocketError> {
-    let mut decoder = StreamDecoder::default();
-    let opening = read_message(connection, &mut decoder)
-        .await?
-        .ok_or(SocketError::Closed)?;
-    if decoder.is_empty() {
-        Ok(opening)
-    } else {
-        Err(SocketError::Protocol)
-    }
+    let prefix = <[u8; 4]>::try_from(prefix).map_err(|_| SocketError::Protocol)?;
+    let frame_bytes =
+        4 + terra_protocol::frame_payload_len::<T>(prefix).map_err(|_| SocketError::Protocol)?;
+    let frame = wait_upstream(connection, frame_bytes, frame_bytes)
+        .await
+        .map_err(|()| SocketError::Cancelled)?;
+    let message = terra_protocol::read_frame(&mut frame.as_slice())
+        .ok()
+        .flatten()
+        .ok_or(SocketError::Protocol)?;
+    consume_upstream(connection, frame_bytes).map_err(|()| SocketError::Cancelled)?;
+    Ok(Some(message))
 }
 
 async fn run_before_deadline<T>(
@@ -666,7 +682,7 @@ pub(crate) async fn pump_downstream(
 ) -> Result<(), broker::Error> {
     let mut chunks = std::pin::pin!(batches(
         output,
-        terra_protocol::network::MAX_NETWORK_READ_BYTES
+        terra_protocol::network::MAX_NETWORK_CHUNK_BYTES
     ));
     loop {
         let closed = std::pin::pin!(wait_receive_closed(connection));
@@ -745,17 +761,34 @@ mod tests {
             }],
             flow_capacity: 1,
         };
-        assert_eq!(validate_config(&config), Err(Error::Backpressure));
+        let parse = |config: &Config| parse_config(config.clone()).map(|_| ());
+        assert_eq!(parse(&config), Err(Error::Backpressure));
         config.flow_capacity = 2;
-        assert_eq!(validate_config(&config), Ok(()));
+        assert_eq!(parse(&config), Ok(()));
         config.published_ports.push(PublishedPort {
             host_port: 5353,
             guest_port: 53,
             transport: Transport::Tcp,
         });
-        assert_eq!(validate_config(&config), Ok(()));
+        assert_eq!(parse(&config), Ok(()));
+        for zero_port in [
+            PublishedPort {
+                host_port: 0,
+                guest_port: 53,
+                transport: Transport::Tcp,
+            },
+            PublishedPort {
+                host_port: 5354,
+                guest_port: 0,
+                transport: Transport::Tcp,
+            },
+        ] {
+            let mut zeroed = config.clone();
+            zeroed.published_ports.push(zero_port);
+            assert_eq!(parse(&zeroed), Err(Error::Malformed));
+        }
         config.published_ports.push(config.published_ports[0]);
-        assert_eq!(validate_config(&config), Err(Error::Malformed));
+        assert_eq!(parse(&config), Err(Error::Malformed));
     }
 
     #[test]
@@ -769,10 +802,9 @@ mod tests {
 
     #[test]
     fn host_service_destinations_require_a_granted_port() {
-        lock_network().config = Some(crate::terra::network::types::Config {
+        lock_network().config = Some(NetworkConfig {
             host_service_ports: vec![Some(8080)],
             published_ports: Vec::new(),
-            flow_capacity: 128,
         });
         let granted = SocketAddr::new(IpAddr::V4(terra_protocol::socket::HOST_SERVICE_IPV4), 8080);
         assert_eq!(

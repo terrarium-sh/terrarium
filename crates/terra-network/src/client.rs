@@ -67,21 +67,17 @@ impl Client {
     ) -> Result<TcpFlow, Error> {
         let (stream, opened) = self.open_stream(&Open::Tcp { peer, options }).await?;
         match opened {
-            Opened::Tcp { peer: opened_peer } if opened_peer == peer => {
-                Ok(TcpFlow::start(self, stream, peer))
-            }
-            Opened::Tcp { .. } | Opened::Udp | Opened::Resolved(_) => Err(self.reject_broker()),
+            Opened::Tcp => Ok(TcpFlow::start(self, stream)),
+            Opened::Udp | Opened::Resolved(_) => Err(self.reject_broker()),
         }
     }
 
-    /// Waits for one connection to the published listener; the peer is loopback.
+    /// Waits for one connection to the published listener.
     pub async fn accept(&self, grant: ListenerGrant) -> Result<TcpFlow, Error> {
         let (stream, opened) = self.open_stream(&Open::Accept(grant)).await?;
         match opened {
-            Opened::Tcp { peer } if peer.ip().is_loopback() && peer.port() != 0 => {
-                Ok(TcpFlow::start(self, stream, peer))
-            }
-            Opened::Tcp { .. } | Opened::Udp | Opened::Resolved(_) => Err(self.reject_broker()),
+            Opened::Tcp => Ok(TcpFlow::start(self, stream)),
+            Opened::Udp | Opened::Resolved(_) => Err(self.reject_broker()),
         }
     }
 
@@ -106,7 +102,7 @@ impl Client {
             {
                 Ok(addresses)
             }
-            Opened::Resolved(_) | Opened::Tcp { .. } | Opened::Udp => Err(self.reject_broker()),
+            Opened::Resolved(_) | Opened::Tcp | Opened::Udp => Err(self.reject_broker()),
         }
     }
 
@@ -114,7 +110,7 @@ impl Client {
         let (stream, opened) = self.open_stream(open).await?;
         match opened {
             Opened::Udp => Ok(UdpFlow::start(self, stream)),
-            Opened::Tcp { .. } | Opened::Resolved(_) => Err(self.reject_broker()),
+            Opened::Tcp | Opened::Resolved(_) => Err(self.reject_broker()),
         }
     }
 
@@ -135,10 +131,10 @@ impl Client {
                     _ => Error::Closed,
                 })?
                 .compat();
-            crate::frames::write_frame(&mut stream, open)
+            terra_protocol::write_frame_async(&mut stream, open)
                 .await
                 .map_err(|_| Error::Closed)?;
-            let opened = crate::frames::read_frame::<Result<Opened, Error>>(&mut stream)
+            let opened = terra_protocol::read_frame_async::<Result<Opened, Error>>(&mut stream)
                 .await
                 .map_err(|error| self.reject_malformed(&error))?
                 .ok_or(Error::Closed)??;

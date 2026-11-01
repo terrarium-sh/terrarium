@@ -3,8 +3,6 @@
 use serde::{Deserialize, Serialize};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-pub const VERSION: u16 = 1;
-pub const MAX_DATAGRAM_BYTES: usize = super::network::MAX_NETWORK_DATAGRAM_BYTES;
 pub const MAX_DNS_BYTES: usize = 4096;
 pub const HOST_SERVICE_IPV4: Ipv4Addr = Ipv4Addr::new(100, 96, 0, 1);
 pub const HOST_SERVICE_IPV6: Ipv6Addr = Ipv6Addr::new(0xfd53, 0x4d00, 0, 0, 0, 0, 0, 1);
@@ -35,33 +33,36 @@ pub enum Error {
 }
 
 impl Error {
-    const ALL: [Self; 20] = [
-        Self::AccessDenied,
-        Self::InvalidArgument,
-        Self::InvalidState,
-        Self::StaleHandle,
-        Self::WrongKind,
-        Self::Busy,
-        Self::LimitExceeded,
-        Self::DuplicateRequest,
-        Self::Cancelled,
-        Self::ConnectionRefused,
-        Self::ConnectionReset,
-        Self::TimedOut,
-        Self::NameUnresolvable,
-        Self::ResolverBusy,
-        Self::DatagramTooLarge,
-        Self::Closed,
-        Self::Io,
-        Self::NotSupported,
-        Self::NotReady,
-        Self::Protocol,
-    ];
-
+    /// Postcard encodes a variant as its declaration index, which is the wire code minus one.
     #[must_use]
     pub fn decode(value: u64) -> Option<Self> {
-        let index = usize::try_from(value.checked_sub(1)?).ok()?;
-        Self::ALL.get(index).copied()
+        let index = u8::try_from(value.checked_sub(1)?).ok()?;
+        postcard::from_bytes(&[index]).ok()
+    }
+
+    /// The errno the guest kernel's terra sockets report for this error.
+    pub(crate) const fn errno_name(self) -> &'static str {
+        match self {
+            Self::AccessDenied => "EACCES",
+            Self::InvalidArgument => "EINVAL",
+            Self::InvalidState => "ENOTCONN",
+            Self::StaleHandle => "ESTALE",
+            Self::WrongKind => "EPROTOTYPE",
+            Self::Busy | Self::ResolverBusy => "EAGAIN",
+            Self::LimitExceeded => "ENOBUFS",
+            Self::DuplicateRequest => "EALREADY",
+            Self::Cancelled => "ECANCELED",
+            Self::ConnectionRefused => "ECONNREFUSED",
+            Self::ConnectionReset => "ECONNRESET",
+            Self::TimedOut => "ETIMEDOUT",
+            Self::NameUnresolvable => "EHOSTUNREACH",
+            Self::DatagramTooLarge => "EMSGSIZE",
+            Self::Closed => "EPIPE",
+            Self::Io => "EIO",
+            Self::NotSupported => "EOPNOTSUPP",
+            Self::NotReady => "ENETDOWN",
+            Self::Protocol => "EPROTO",
+        }
     }
 }
 
@@ -69,24 +70,22 @@ impl Error {
 mod tests {
     use super::*;
 
+    /// Codes run from 1 without gaps, each matching its `repr(u16)` value, so serde's variant
+    /// index and the wire code agree; raw errno values beyond the last code are rejected.
     #[test]
     fn defined_errors_preserve_codes_and_reject_raw_errno() {
-        for (index, expected) in Error::ALL.into_iter().enumerate() {
-            let value = index as u64 + 1;
-            assert_eq!(u64::from(expected as u16), value);
-            assert_eq!(Error::decode(value), Some(expected));
+        let mut code = 1;
+        while let Some(error) = Error::decode(code) {
+            assert_eq!(u64::from(error as u16), code);
+            assert_eq!(
+                postcard::to_allocvec(&error).unwrap(),
+                [u8::try_from(code - 1).unwrap()]
+            );
+            code += 1;
         }
-        for value in [0, 21, 111, u64::MAX] {
+        assert_eq!(code, 21);
+        for value in [0, 21, 111, 129, u64::MAX] {
             assert_eq!(Error::decode(value), None);
-        }
-    }
-
-    /// Postcard's variant index is the wire code minus one, so the serde and `repr(u16)` encodings agree.
-    #[test]
-    fn serde_variant_index_matches_wire_code() {
-        for expected in Error::ALL {
-            let encoded = postcard::to_allocvec(&expected).unwrap();
-            assert_eq!(u16::from(encoded[0]), expected as u16 - 1);
         }
     }
 }

@@ -14,7 +14,6 @@ use tokio_util::sync::CancellationToken;
 
 const EXEC_NOT_RUN: i32 = 127;
 const FRAME_TIMEOUT: Duration = Duration::from_secs(30);
-const OUTPUT_READ_BYTES: usize = 64 << 10;
 
 pub(crate) async fn serve_exec(
     conn: AsyncFile,
@@ -272,7 +271,7 @@ async fn pump_output<R: AsyncRead + Unpin>(
         tokio::time::sleep(crate::OUTPUT_DRAIN_GRACE).await;
     };
     tokio::pin!(drained);
-    let mut bytes = vec![0; OUTPUT_READ_BYTES];
+    let mut bytes = vec![0; terra_protocol::MAX_TERMINAL_CHUNK_BYTES];
     loop {
         let read = tokio::select! {
             biased;
@@ -462,7 +461,10 @@ mod tests {
         let reader = tokio::spawn(async move {
             let mut frames = 0;
             while let Some(frame) = read_frame::<AgentOutput>(&mut receiver).await.unwrap() {
-                assert_eq!(frame, AgentOutput::Out(vec![b'x'; OUTPUT_READ_BYTES]));
+                assert_eq!(
+                    frame,
+                    AgentOutput::Out(vec![b'x'; terra_protocol::MAX_TERMINAL_CHUNK_BYTES])
+                );
                 frames += 1;
                 tokio::time::sleep(Duration::from_millis(300)).await;
             }
@@ -782,9 +784,13 @@ mod tests {
             &exec_request(&["sh", "-c", "sleep .1; cat"], false),
             &CancellationToken::new(),
         );
-        client
-            .write_all(&terra_protocol::encode_frame(&ClientInput::Keys(first.clone())).unwrap())
-            .unwrap();
+        for chunk in first.chunks(terra_protocol::MAX_TERMINAL_CHUNK_BYTES) {
+            client
+                .write_all(
+                    &terra_protocol::encode_frame(&ClientInput::Keys(chunk.to_vec())).unwrap(),
+                )
+                .unwrap();
+        }
         let second_frame =
             terra_protocol::encode_frame(&ClientInput::Keys(second.clone())).unwrap();
         client.write_all(&second_frame[..2]).unwrap();

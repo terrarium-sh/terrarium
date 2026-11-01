@@ -3,11 +3,8 @@
 use crate::exports::terra::agent::api::Event;
 use futures_channel::{mpsc::Sender, oneshot};
 use futures_io::AsyncRead;
-use futures_util::{SinkExt as _, io::AsyncReadExt as _};
-use terra_protocol::control::{LifecycleEvent, MAX_DIAGNOSTIC_FRAME_BYTES};
-
-const MAX_CONTROL_PAYLOAD_BYTES: usize = (1 << 20) - 4;
-pub(crate) const MAX_DIAGNOSTIC_PAYLOAD_BYTES: usize = MAX_DIAGNOSTIC_FRAME_BYTES - 4;
+use futures_util::SinkExt as _;
+use terra_protocol::LifecycleEvent;
 
 pub(crate) struct Diagnostic {
     pub bytes: Vec<u8>,
@@ -15,23 +12,16 @@ pub(crate) struct Diagnostic {
     pub delivered: Option<oneshot::Sender<()>>,
 }
 
-/// Reads one length-prefixed frame; `None` ends the stream, on EOF and on malformed input alike.
-pub(crate) async fn read_event(
-    stream: &mut (impl AsyncRead + Unpin),
-    max_payload_bytes: usize,
-) -> Option<LifecycleEvent> {
-    let mut length = [0; 4];
-    stream.read_exact(&mut length).await.ok()?;
-    let length = usize::try_from(u32::from_le_bytes(length))
+/// Reads one frame; `None` ends the stream, on EOF and on malformed input alike.
+pub(crate) async fn read_event(stream: &mut (impl AsyncRead + Unpin)) -> Option<LifecycleEvent> {
+    terra_protocol::read_frame_futures(stream)
+        .await
         .ok()
-        .filter(|length| *length <= max_payload_bytes)?;
-    let mut payload = vec![0; length];
-    stream.read_exact(&mut payload).await.ok()?;
-    terra_protocol::decode_frame_payload(&payload).ok()
+        .flatten()
 }
 
 pub(crate) async fn read_lifecycle(mut stream: impl AsyncRead + Unpin, mut sender: Sender<Event>) {
-    while let Some(event) = read_event(&mut stream, MAX_CONTROL_PAYLOAD_BYTES).await {
+    while let Some(event) = read_event(&mut stream).await {
         let event = match event {
             LifecycleEvent::AgentReady => Event::AgentReady,
             LifecycleEvent::Exit { code } => Event::Exit(code),
@@ -47,9 +37,7 @@ pub(crate) async fn read_diagnostics(
     mut stream: impl AsyncRead + Unpin,
     mut sender: Sender<Diagnostic>,
 ) {
-    while let Some(LifecycleEvent::Diagnostic { bytes }) =
-        read_event(&mut stream, MAX_DIAGNOSTIC_PAYLOAD_BYTES).await
-    {
+    while let Some(LifecycleEvent::Diagnostic { bytes }) = read_event(&mut stream).await {
         if !bytes.is_empty()
             && sender
                 .send(Diagnostic {
@@ -70,8 +58,9 @@ mod tests {
     use futures_channel::mpsc;
     use futures_util::FutureExt as _;
     use std::assert_matches;
+    use terra_protocol::Message as _;
 
-    fn frame(event: &impl serde::Serialize) -> Vec<u8> {
+    fn frame(event: &LifecycleEvent) -> Vec<u8> {
         terra_protocol::encode_frame(event).unwrap()
     }
 
@@ -120,11 +109,9 @@ mod tests {
         let frame = frame(&LifecycleEvent::Diagnostic {
             bytes: bytes.clone(),
         });
-        assert_eq!(frame.len(), MAX_DIAGNOSTIC_FRAME_BYTES);
+        assert_eq!(frame.len(), 4 + LifecycleEvent::MAX_PAYLOAD_BYTES);
         assert_eq!(
-            read_event(&mut frame.as_slice(), MAX_DIAGNOSTIC_PAYLOAD_BYTES)
-                .now_or_never()
-                .unwrap(),
+            read_event(&mut frame.as_slice()).now_or_never().unwrap(),
             Some(LifecycleEvent::Diagnostic { bytes })
         );
     }
@@ -134,7 +121,7 @@ mod tests {
     fn oversized_truncated_and_malformed_frames_end_the_stream() {
         for bytes in [
             u32::MAX.to_le_bytes().to_vec(),
-            u32::try_from(MAX_CONTROL_PAYLOAD_BYTES + 1)
+            u32::try_from(LifecycleEvent::MAX_PAYLOAD_BYTES + 1)
                 .unwrap()
                 .to_le_bytes()
                 .to_vec(),
@@ -142,9 +129,7 @@ mod tests {
             vec![1, 0, 0, 0, b'{'],
         ] {
             assert_eq!(
-                read_event(&mut bytes.as_slice(), MAX_CONTROL_PAYLOAD_BYTES)
-                    .now_or_never()
-                    .unwrap(),
+                read_event(&mut bytes.as_slice()).now_or_never().unwrap(),
                 None
             );
         }

@@ -49,7 +49,6 @@ fn to_screen_size(rows: u16, cols: u16) -> (NonZeroU16, NonZeroU16) {
 
 const INPUT_QUEUE_CAPACITY: usize = 1;
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
-const REPAINT_CHUNK_BYTES: usize = 64 << 10;
 
 #[derive(Clone)]
 pub(crate) struct ClientConn(Arc<ClientConnInner>);
@@ -82,7 +81,7 @@ impl ClientConn {
     }
 
     async fn write_out_chunks(&self, bytes: &[u8]) -> std::io::Result<()> {
-        for chunk in bytes.chunks(REPAINT_CHUNK_BYTES) {
+        for chunk in bytes.chunks(terra_protocol::MAX_TERMINAL_CHUNK_BYTES) {
             self.write(&AgentOutput::Out(chunk.to_vec())).await?;
         }
         Ok(())
@@ -388,6 +387,16 @@ mod tests {
         )
     }
 
+    /// A client whose small socket buffer stalls on one maximum-size output frame.
+    fn stalled_client() -> (ClientConn, AsyncFile) {
+        let (client, agent) = std::os::unix::net::UnixStream::pair().unwrap();
+        rustix::net::sockopt::set_socket_send_buffer_size(&agent, 4096).unwrap();
+        (
+            ClientConn::from_file(File::from(std::os::fd::OwnedFd::from(agent))).unwrap(),
+            crate::into_async_file(client).unwrap(),
+        )
+    }
+
     async fn frame(reader: &mut AsyncFile) -> AgentOutput {
         tokio::time::timeout(
             Duration::from_secs(2),
@@ -501,9 +510,9 @@ mod tests {
         assert_eq!(frame(&mut reader).await, AgentOutput::Exit { code: 0 });
     }
 
-    /// A supported 512×1024 attributed screen repaints to more than the 8 MiB
-    /// frame limit, so the repaint goes out as consecutive frames no larger
-    /// than `REPAINT_CHUNK_BYTES` - as one frame the protocol refused it and
+    /// A supported 512×1024 attributed screen repaints to more than one
+    /// frame's limit, so the repaint goes out as consecutive frames no larger
+    /// than `MAX_TERMINAL_CHUNK_BYTES` - as one frame the protocol refused it and
     /// the attaching client received nothing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_repaint_above_the_frame_limit_is_chunked() {
@@ -539,7 +548,11 @@ mod tests {
         loop {
             match frame(&mut reader).await {
                 AgentOutput::Out(chunk) => {
-                    assert!(chunk.len() <= REPAINT_CHUNK_BYTES, "{}", chunk.len());
+                    assert!(
+                        chunk.len() <= terra_protocol::MAX_TERMINAL_CHUNK_BYTES,
+                        "{}",
+                        chunk.len()
+                    );
                     painted.extend_from_slice(&chunk);
                 }
                 AgentOutput::Exit { code: 0 } => break,
@@ -569,7 +582,7 @@ mod tests {
             .parser
             .screen()
             .contents_formatted();
-        assert!(expected.len() > REPAINT_CHUNK_BYTES);
+        assert!(expected.len() > terra_protocol::MAX_TERMINAL_CHUNK_BYTES);
         let (client, mut reader) = client();
         let attach = tokio::spawn({
             let session = session.clone();
@@ -589,7 +602,7 @@ mod tests {
             let AgentOutput::Out(chunk) = frame(&mut reader).await else {
                 panic!("repaint interrupted");
             };
-            assert!(chunk.len() <= REPAINT_CHUNK_BYTES);
+            assert!(chunk.len() <= terra_protocol::MAX_TERMINAL_CHUNK_BYTES);
             painted.extend_from_slice(&chunk);
         }
         assert_eq!(painted, expected.as_bytes());
@@ -762,11 +775,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stalled_output_does_not_hold_the_session_state_lock() {
         let (session, _) = session();
-        let (stalled, reader) = client();
+        let (stalled, reader) = stalled_client();
         session.attach_client(&stalled).await.unwrap();
         let output_session = session.clone();
         let output = tokio::spawn(async move {
-            output_session.feed_output(&vec![b'x'; 1 << 20]).await;
+            output_session
+                .feed_output(&vec![b'x'; terra_protocol::MAX_TERMINAL_CHUNK_BYTES])
+                .await;
         });
         // Bytes on the socket mean the parse under `inner` is done and the oversized write has stalled.
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -787,12 +802,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_stalled_client_does_not_skip_healthy_output() {
         let (session, _) = session();
-        let (stalled, _stalled_reader) = client();
+        let (stalled, _stalled_reader) = stalled_client();
         let (healthy, mut healthy_reader) = client();
         session.attach_client(&stalled).await.unwrap();
         session.attach_client(&healthy).await.unwrap();
 
-        let bytes = vec![b'x'; 1 << 20];
+        let bytes = vec![b'x'; terra_protocol::MAX_TERMINAL_CHUNK_BYTES];
         let reading = tokio::spawn(async move { frame(&mut healthy_reader).await });
         session.feed_output(&bytes).await;
         assert_eq!(reading.await.unwrap(), AgentOutput::Out(bytes));

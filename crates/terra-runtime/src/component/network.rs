@@ -16,7 +16,7 @@ pub fn start_test_broker(
     let broker = terra_network::Broker::bind(&config)?;
     let ready = broker.ready();
     let (worker, endpoint) =
-        tokio::io::duplex(terra_protocol::network::MAX_NETWORK_FRAME_BYTES * 2);
+        tokio::io::duplex(terra_protocol::network::MAX_NETWORK_PAYLOAD_BYTES * 2);
     tokio::spawn(broker.serve(endpoint));
     Ok(NetworkBackend {
         client: terra_network::Client::new(worker),

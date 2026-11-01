@@ -587,6 +587,7 @@ dependencies = [
 name = "terra-protocol"
 version = "0.0.1"
 dependencies = [
+ "futures-util",
  "postcard",
  "serde",
  "serde_bytes",

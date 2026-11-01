@@ -10,24 +10,19 @@ use std::io::Read;
 use std::path::Path;
 use std::time::{Duration, Instant};
 use terra_protocol::{
-    MAX_FILE_BYTES, SyncDirection, SyncReply, SyncRequest, read_frame_async_with_limit,
-    write_frame_async,
+    MAX_FILE_BYTES, SyncDirection, SyncReply, SyncRequest, read_frame_async, write_frame_async,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-const MAX_SYNC_FRAME_BYTES: usize = 64 * 1024;
 const COPY_STALL_TIMEOUT: Duration = Duration::from_mins(1);
 pub(super) const COPY_DATA_TIMEOUT: Duration = Duration::from_hours(1);
 
 pub(super) async fn read_reply(stream: &mut (impl AsyncRead + Unpin)) -> Result<SyncReply> {
-    let reply = tokio::time::timeout(
-        COPY_STALL_TIMEOUT,
-        read_frame_async_with_limit(stream, MAX_SYNC_FRAME_BYTES),
-    )
-    .await
-    .context("waiting for agent reply")?
-    .context("reading agent reply")?
-    .ok_or_else(|| anyhow::anyhow!("agent closed connection without replying"))?;
+    let reply = tokio::time::timeout(COPY_STALL_TIMEOUT, read_frame_async(stream))
+        .await
+        .context("waiting for agent reply")?
+        .context("reading agent reply")?
+        .ok_or_else(|| anyhow::anyhow!("agent closed connection without replying"))?;
     match reply {
         SyncReply::Err(err) => anyhow::bail!("guest: {}", sanitize_guest_error_message(&err)),
         other => Ok(other),

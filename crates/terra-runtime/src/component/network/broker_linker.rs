@@ -13,11 +13,10 @@ use futures_util::StreamExt;
 use futures_util::stream;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use terra_network::{Client, Error, TcpDownload, TcpFlow, TcpUpload, UdpFlow};
-use terra_protocol::application::{TcpKeepalive, TcpOpenOptions};
+use terra_protocol::application::{TcpKeepalive, TcpOpenOptions, UDP_FRAME_OVERHEAD_BYTES};
 use terra_protocol::network::{
-    DATAGRAM_FRAME_OVERHEAD_BYTES, DatagramBatch, DatagramHeader, MAX_NETWORK_CHUNK_BYTES,
-    MAX_NETWORK_DATAGRAM_BATCH_BYTES, MAX_NETWORK_DATAGRAMS, MAX_NETWORK_NAME_BYTES, ResourceKind,
-    SendFailure,
+    DatagramBatch, DatagramHeader, MAX_NETWORK_CHUNK_BYTES, MAX_NETWORK_DATAGRAM_BATCH_BYTES,
+    MAX_NETWORK_DATAGRAMS, MAX_NETWORK_NAME_BYTES, ResourceKind, SendFailure,
 };
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -29,7 +28,6 @@ const BROKER_INTERFACE: &str = "terra:network/broker@0.1.0";
 
 /// Each half is handed to the guest by its first `send` or `receive`; a second call finds `None`.
 struct BrokerTcp {
-    peer: SocketAddr,
     unclaimed_upload: Option<TcpUpload>,
     unclaimed_download: Option<TcpDownload>,
     closed: CancellationToken,
@@ -37,11 +35,9 @@ struct BrokerTcp {
 
 impl BrokerTcp {
     fn new(flow: TcpFlow) -> Self {
-        let peer = flow.peer();
         let closed = flow.close_token();
         let (upload, download) = flow.split();
         Self {
-            peer,
             unclaimed_upload: Some(upload),
             unclaimed_download: Some(download),
             closed,
@@ -537,13 +533,6 @@ fn add_tcp_io<T: WasiView + AsMut<NetworkHost> + 'static>(
     interface: &mut wasmtime::component::LinkerInstance<'_, T>,
 ) -> wasmtime::Result<()> {
     interface.func_wrap(
-        "[method]tcp.peer-address",
-        |mut store, (resource,): (Resource<BrokerTcp>,)| {
-            let tcp = store.data_mut().ctx().table.get(&resource)?;
-            Ok((Ok::<_, BrokerError>(socket_address(tcp.peer)),))
-        },
-    )?;
-    interface.func_wrap(
         "[method]tcp.send",
         |mut store, (resource, data): (Resource<BrokerTcp>, StreamReader<u8>)| {
             let tcp = store.data_mut().ctx().table.get_mut(&resource)?;
@@ -667,8 +656,7 @@ async fn send_datagrams(
         .map(|header| usize::from(header.length))
         .sum();
     if lengths_total != bytes.len()
-        || bytes.len() + headers.len() * DATAGRAM_FRAME_OVERHEAD_BYTES
-            > MAX_NETWORK_DATAGRAM_BATCH_BYTES
+        || bytes.len() + headers.len() * UDP_FRAME_OVERHEAD_BYTES > MAX_NETWORK_DATAGRAM_BATCH_BYTES
     {
         return Err(Error::InvalidArgument);
     }
@@ -776,7 +764,7 @@ mod tests {
     use super::*;
     use std::time::Duration;
     use terra_network::config::{Config, Network, PublishedListener};
-    use terra_protocol::network::{MAX_NETWORK_DATAGRAM_BYTES, MAX_NETWORK_READ_BYTES};
+    use terra_protocol::network::{MAX_NETWORK_CHUNK_BYTES, MAX_NETWORK_DATAGRAM_BYTES};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
@@ -863,33 +851,6 @@ mod tests {
             Err(Error::AccessDenied)
         ));
         client.disconnect();
-    }
-
-    #[tokio::test]
-    async fn accepted_flows_keep_the_broker_peer_address() {
-        bounded(async {
-            let reserved = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let address = reserved.local_addr().unwrap();
-            drop(reserved);
-            let client = broker_client(vec![PublishedListener {
-                grant: 11,
-                address,
-                transport: ResourceKind::Tcp,
-            }]);
-            let accepting = tokio::spawn({
-                let client = client.clone();
-                async move { client.accept(11).await }
-            });
-            let connected = loop {
-                if let Ok(stream) = TcpStream::connect(address).await {
-                    break stream;
-                }
-            };
-            let tcp = BrokerTcp::new(accepting.await.unwrap().unwrap());
-            assert_eq!(tcp.peer, connected.local_addr().unwrap());
-            client.disconnect();
-        })
-        .await;
     }
 
     #[tokio::test]
@@ -997,7 +958,7 @@ mod tests {
     async fn receive_delivers_data_then_ends_successfully_on_peer_fin() {
         bounded(async {
             let (tcp, remote, client) = connected_tcp().await;
-            let payload = vec![8; MAX_NETWORK_READ_BYTES + 3];
+            let payload = vec![8; MAX_NETWORK_CHUNK_BYTES + 3];
             let (received, outcome) = receive_outcome(tcp, remote, async |mut remote| {
                 remote.write_all(&payload).await.unwrap();
                 remote.shutdown().await.unwrap();
@@ -1125,13 +1086,12 @@ mod tests {
                 async move { client.accept(11).await }
             });
             tokio::time::sleep(Duration::from_millis(100)).await;
-            let connected = tokio::net::TcpStream::connect(address).await.unwrap();
-            let accepted = tokio::time::timeout(Duration::from_secs(5), accepting)
+            let _connected = tokio::net::TcpStream::connect(address).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), accepting)
                 .await
                 .expect("the dropped accept released the grant")
                 .unwrap()
                 .unwrap();
-            assert_eq!(accepted.peer(), connected.local_addr().unwrap());
             client.disconnect();
         })
         .await;

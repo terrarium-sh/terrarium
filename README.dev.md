@@ -184,17 +184,17 @@ Frames are an 8-byte header (opcode, reserved, payload length) plus payload; the
 opcodes, endpoint encoding and error codes are defined in
 `crates/terra-protocol/src/application.rs` and `socket.rs`, and the
 broker IPC in `network.rs`. The kernel, agent, components and runtime must be
-built together: every opening frame carries the network ABI version, and
-packaged kernel and boot images carry ABI markers checked before boot.
+built together: packaged kernel and boot images carry ABI markers checked before
+boot, and `make kernel-abi` renders the kernel's copy of the constants.
 `scripts/kernel/check-vsock-abi.py` checks the kernel overlay against the Rust constants.
 
 - **TCP:** the guest sends TcpOpen; the frontend connects through the broker and
-  answers TcpOpened before guest `connect` returns. After that the stream carries
+  answers Opened before guest `connect` returns. After that the stream carries
   raw bytes, and stock vsock provides backpressure and half-close. Accepted bytes
   drain through every queue before FIN. Opening errors are precise; afterwards a
   reset is `ECONNRESET` and EOF is EOF. The opening deadline is 30 seconds.
-- **UDP:** the first external use opens the stream (the only synchronous round
-  trip); `sendto` then returns once the datagram is queued. Denied or failed sends
+- **UDP:** the first external use connects the stream, which the frontend
+  answers with Opened (the only synchronous round trip); `sendto` then returns once the datagram is queued. Denied or failed sends
   come back as UdpError, which sets the socket's asynchronous error and, with
   `IP_RECVERR`, an error-queue entry. `connect` is guest-local filtering. The
   broker accepts inbound datagrams only from the 128 most recent peers the socket
