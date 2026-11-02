@@ -11,9 +11,9 @@ a short YAML recipe.
 [![Latest release](https://img.shields.io/github/v/release/terrarium-sh/terrarium)](https://github.com/terrarium-sh/terrarium/releases/latest)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-> [!WARNING]
-> **Under construction.** The docs are incomplete and the code is still under
-> internal review.
+> [!NOTE]
+> **Ready to try.** The CLI should stay stable. Internal protocols and on-disk
+> storage can still change in breaking ways, though less often over time.
 
 ![Terminal demo: set up a box from dev.yaml, enter it, reach an allowed host, get blocked on another, detach.](docs/demo.gif)
 

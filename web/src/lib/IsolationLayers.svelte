@@ -1,6 +1,6 @@
 <script lang="ts">
   import { resolve } from '$app/paths';
-  import { onMount } from 'svelte';
+  import { Rotation } from '#lib/rotation.svelte.ts';
 
   type Point = [number, number, number];
   type Box = { x: number; y: number; z: number; w: number; d: number; h: number };
@@ -164,45 +164,8 @@
     return `left: ${(((px - viewBox.x) / viewBox.w) * 100).toFixed(2)}%; top: ${(((py - viewBox.y) / viewBox.h) * 100).toFixed(2)}%`;
   }
 
-  let active = $state(1);
-  let isHovered = $state(false);
-  let isFocused = $state(false);
-  let isVisible = $state(false);
-  let canAnimate = $state(false);
-  let isPaused = $state(false);
-  let dwellMs = $state(CYCLE_MS);
-  let selectionCount = $state(0);
-  const isCycling = $derived(canAnimate && !isPaused && isVisible && !isHovered && !isFocused);
-
-  onMount(() => {
-    const motionPreference = matchMedia('(prefers-reduced-motion: reduce)');
-    const updateMotionPreference = () => (canAnimate = !motionPreference.matches);
-    updateMotionPreference();
-    motionPreference.addEventListener('change', updateMotionPreference);
-    return () => motionPreference.removeEventListener('change', updateMotionPreference);
-  });
-
-  function observeVisibility(node: HTMLElement) {
-    const observer = new IntersectionObserver(([entry]) => (isVisible = entry.isIntersecting), { threshold: 0.3 });
-    observer.observe(node);
-    return () => observer.disconnect();
-  }
-
-  $effect(() => {
-    if (!isCycling) return;
-    void selectionCount;
-    const timer = setTimeout(() => {
-      active = (active % layers.length) + 1;
-      dwellMs = CYCLE_MS;
-    }, dwellMs);
-    return () => clearTimeout(timer);
-  });
-
-  function selectLayer(layer: number) {
-    active = layer;
-    dwellMs = TAPPED_DWELL_MS;
-    selectionCount += 1;
-  }
+  const rotation = new Rotation(layers.length, CYCLE_MS, TAPPED_DWELL_MS);
+  const active = $derived(rotation.active + 1);
 
   function findLayer(event: Event): number | undefined {
     const layer = (event.target as Element).closest<HTMLElement | SVGElement>('[data-layer]')?.dataset.layer;
@@ -211,16 +174,12 @@
 
   function previewLayerUnderMouse(event: PointerEvent) {
     const layer = findLayer(event);
-    if (event.pointerType === 'mouse' && layer) active = layer;
+    if (event.pointerType === 'mouse' && layer) rotation.active = layer - 1;
   }
 
   function selectTappedLayer(event: MouseEvent) {
     const layer = findLayer(event);
-    if (layer) selectLayer(layer);
-  }
-
-  function setHovered(event: PointerEvent, hovered: boolean) {
-    if (event.pointerType === 'mouse') isHovered = hovered;
+    if (layer) rotation.select(layer - 1);
   }
 </script>
 
@@ -262,14 +221,11 @@
 {/snippet}
 
 <section
-  {@attach observeVisibility}
+  {@attach rotation.observeVisibility}
+  {...rotation.holdWhileEngaged}
   class="isolation-section"
-  class:is-animated={canAnimate && !isPaused && isVisible}
+  class:is-animated={rotation.isAnimated}
   aria-labelledby="isolation-heading"
-  onfocusin={() => (isFocused = true)}
-  onfocusout={(event) => (isFocused = event.currentTarget.contains(event.relatedTarget as Node | null))}
-  onpointerenter={(event) => setHovered(event, true)}
-  onpointerleave={(event) => setHovered(event, false)}
 >
   <div class="isolation-heading">
     <p class="eyebrow">Isolation at every layer</p>
@@ -283,13 +239,13 @@
             type="button"
             class:active={active === index + 1}
             aria-pressed={active === index + 1}
-            onclick={() => selectLayer(index + 1)}
-            onfocus={() => (active = index + 1)}
-            onpointerenter={(event) => event.pointerType === 'mouse' && (active = index + 1)}
+            onclick={() => rotation.select(index)}
+            onfocus={() => (rotation.active = index)}
+            onpointerenter={(event) => event.pointerType === 'mouse' && (rotation.active = index)}
           >
             <span class="layer-number">{index + 1}</span>
             <span>{layer.title}<span class="sr-only">: {layer.text}</span></span>
-            {#if isCycling && active === index + 1}{#key selectionCount}<span class="layer-progress" style:animation-duration="{dwellMs}ms"></span>{/key}{/if}
+            {#if rotation.isCycling && active === index + 1}{#key rotation.selectionCount}<span class="layer-progress" style:animation-duration="{rotation.dwellMs}ms"></span>{/key}{/if}
           </button>
         </li>
       {/each}
@@ -312,16 +268,6 @@
           <pattern id="iso-api-grid" width="24" height="24" patternUnits="userSpaceOnUse" patternTransform="matrix({ISO_X} 0.5 {-ISO_X} 0.5 0 0)">
             <path d="M24 0H0V24" fill="none" stroke="#568d88" stroke-width="0.6" />
           </pattern>
-          <clipPath id="iso-vm-glass">
-            <polygon points={leftFace(vm)} />
-            <polygon points={rightFace(vm)} />
-            <polygon points={topFace(vm)} />
-          </clipPath>
-          <linearGradient id="iso-reflection">
-            <stop stop-color="#fff" stop-opacity="0" />
-            <stop offset="0.5" stop-color="#fff" stop-opacity="0.45" />
-            <stop offset="1" stop-color="#fff" stop-opacity="0" />
-          </linearGradient>
           <linearGradient id="iso-workload-top" x1="0" y1="0" x2="1" y2="1">
             <stop stop-color="#51877a" />
             <stop offset="1" stop-color="#28594f" />
@@ -375,9 +321,6 @@
           <polygon class="iso-sheen" points={leftFace(vm)} />
           <polygon class="iso-glass" points={rightFace(vm)} />
           <polygon class="iso-glass iso-glass-top" points={topFace(vm)} />
-          <g clip-path="url(#iso-vm-glass)" pointer-events="none">
-            <path class="iso-reflection" d="M-90-100H-30L90 350H30Z" />
-          </g>
         </g>
 
         <g class="iso-layer" data-layer="2" class:is-active={active === 2} class:is-dimmed={active !== 2}>
@@ -437,8 +380,8 @@
         <span class="iso-boundary-process">OS sandbox</span>
       </span>
       <span>Interrupts: Wasm controller on x86 · native IRQ lines on ARM.</span>
-      {#if canAnimate}
-        <button class="iso-motion-toggle" type="button" onclick={() => (isPaused = !isPaused)}>{isPaused ? 'Resume motion' : 'Pause motion'}</button>
+      {#if rotation.canAnimate}
+        <button class="iso-motion-toggle" type="button" onclick={() => (rotation.isPaused = !rotation.isPaused)}>{rotation.isPaused ? 'Resume motion' : 'Pause motion'}</button>
       {/if}
     </figcaption>
   </figure>

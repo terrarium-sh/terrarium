@@ -63,12 +63,17 @@ GitHub's Pages configuration supplies the deployment base path and origin.
 ## Theme and dependencies
 
 `src/theme.css` defines the custom Starlight theme with a `#f8f5ee` background,
-blue-green glass accents, and pale glass buttons.
+forest-green actions, and blue-green glass accents. The landing page pairs the
+logo with the main introduction, then shows interactive examples, the isolation
+diagram, and a three-step setup. On phones the logo sits beside the headline;
+the remaining content stacks, and code examples wrap within their panels.
 Fonts are system fonts; the favicon is local SVG.
 `static/logo.svg` supplies the header and homepage illustration. Its plants
 bend, the frog blinks, and a dragonfly loops back to the flower. CSS provides
 short entrance animations and hover transitions.
-All motion respects reduced-motion settings.
+The examples and isolation diagram have pause controls and stop advancing while
+hovered or focused. All motion respects reduced-motion settings. With JavaScript
+disabled, the examples appear as a static list and both installers stay visible.
 
 Starlight is pinned to a public GitHub source commit because its package
 registry requires authentication. pnpm packages that source using its upstream
