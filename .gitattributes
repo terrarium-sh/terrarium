@@ -1,3 +1,4 @@
 kernel/patches/*.patch -whitespace
 crates/terra/tests/guest_suite/scripts/*.sh text eol=lf
 acceptance/** text eol=lf
+kernel/overlay/include/linux/terra_abi.h text eol=lf
