@@ -1,7 +1,7 @@
 <script lang="ts">
   import { asset, resolve } from '$app/paths';
   import { releaseTag } from '#lib/generated/version.json';
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import { Select, type SelectItem } from '@alis-is/starlight';
   import { detectClientPlatform, type ClientPlatform } from '#lib/client-platform.ts';
   import CopyButton from '#lib/CopyButton.svelte';
@@ -21,10 +21,65 @@
   let windowsInstallCode = $state<HTMLElement>();
   let setupCode = $state<HTMLElement>();
   let recipeCode = $state<HTMLElement>();
+  let canShareFirstViewport = $state(false);
+  const sections = [
+    { id: 'intro', label: 'Overview' },
+    { id: 'benefits', label: 'Your tools' },
+    { id: 'isolation', label: 'Isolation' },
+    { id: 'start', label: 'Get started' },
+    { id: 'explore', label: 'Explore' }
+  ];
+  const visibleSections = $derived(sections.filter(section => !canShareFirstViewport || section.id !== 'benefits'));
+  let activeSectionId = $state('intro');
+  const activeSectionIndex = $derived(Math.max(0, visibleSections.findIndex(section => section.id === activeSectionId)));
+  const previousSection = $derived(visibleSections[activeSectionIndex - 1]);
+  const nextSection = $derived(visibleSections[activeSectionIndex + 1]);
+
+  function updateActiveSection() {
+    const headerHeight = document.querySelector('.site-header')?.getBoundingClientRect().height ?? 0;
+    let currentSectionId = visibleSections[0].id;
+    for (const section of visibleSections) {
+      const element = document.getElementById(section.id);
+      if (element && element.getBoundingClientRect().top <= headerHeight + 2) currentSectionId = section.id;
+    }
+    activeSectionId = currentSectionId;
+  }
+
+  function navigateToSection(id: string) {
+    document.getElementById(id)?.scrollIntoView({ block: 'start', behavior: 'auto' });
+  }
+
+  $effect(updateActiveSection);
+
+  function fitOpening(opening: HTMLElement) {
+    const header = document.querySelector<HTMLElement>('.site-header');
+    const openingSections = opening.querySelectorAll<HTMLElement>('section');
+
+    function updateFit() {
+      document.documentElement.style.setProperty('--home-header-height', `${header?.getBoundingClientRect().height ?? 0}px`);
+      const availableHeight = parseFloat(getComputedStyle(opening).minHeight);
+      const contentHeight = Array.from(openingSections).reduce((height, section) => height + section.getBoundingClientRect().height, 0);
+      canShareFirstViewport = Math.ceil(contentHeight) <= availableHeight;
+      untrack(updateActiveSection);
+    }
+
+    const observer = new ResizeObserver(updateFit);
+    if (header) observer.observe(header);
+    for (const section of openingSections) observer.observe(section);
+    window.addEventListener('resize', updateFit);
+    updateFit();
+    return () => {
+      observer.disconnect();
+      window.removeEventListener('resize', updateFit);
+      document.documentElement.style.removeProperty('--home-header-height');
+    };
+  }
 
   onMount(() => {
     platform = detectClientPlatform(navigator);
     isClient = true;
+    window.addEventListener('scroll', updateActiveSection, { passive: true });
+    return () => window.removeEventListener('scroll', updateActiveSection);
   });
 </script>
 
@@ -33,6 +88,8 @@
   {@html `<script type="application/ld+json">${JSON.stringify({ '@context': 'https://schema.org', '@type': 'WebSite', name: 'Terrarium', url: page.url.origin + page.url.pathname })}</script>`}
 </svelte:head>
 
+<div id="intro" class="home-opening" class:is-combined={canShareFirstViewport} {@attach fitOpening}>
+<div class="home-screen">
 <section class="hero" aria-labelledby="hero-heading">
   <h1 id="hero-heading">Give your agent<br />room to <em>work.</em></h1>
   <p class="lead">Persistent Linux VMs for agents and dev tools. One binary, with only the host files and network access you allow.</p>
@@ -45,23 +102,26 @@
     <img src={asset('logo.svg')} width="969" height="914" fetchpriority="high" alt="A frog and dragonfly among ferns and a yellow flower, inside a glass terrarium." />
   </figure>
 </section>
+</div>
 
+<div id="benefits" class="home-screen">
 <Benefits>
   <h2>Your tools. Your rules.</h2>
 </Benefits>
+</div>
+</div>
 
+<div id="isolation" class="home-screen">
 <IsolationLayers />
+</div>
 
-<section id="start" class="start-section" aria-labelledby="start-heading">
-  <div class="start-intro section-intro">
-    <div>
-      <p class="eyebrow">From a recipe to a running box</p>
-      <h2 id="start-heading">Make a little room.</h2>
-    </div>
-    <div>
-      <p class="section-description">Install Terra, write a short recipe, and step inside your own Linux VM.</p>
-      {#if releaseTag}<p class="release-note">Current release <a target="_blank" rel="noopener noreferrer" href={`https://github.com/terrarium-sh/terrarium/releases/tag/${releaseTag}`}>{releaseTag}</a></p>{/if}
-    </div>
+<div id="start" class="home-screen">
+<section class="start-section" aria-labelledby="start-heading">
+  <div class="start-intro">
+    <p class="eyebrow">From a recipe to a running box</p>
+    <h2 id="start-heading">Make a little room.</h2>
+    <p class="section-description">Install Terra, write a short recipe, and step inside your own Linux VM.</p>
+    {#if releaseTag}<p class="release-note">Current release <a target="_blank" rel="noopener noreferrer" href={`https://github.com/terrarium-sh/terrarium/releases/tag/${releaseTag}`}>{releaseTag}</a></p>{/if}
   </div>
   <div class="setup-install">
     <h3 class="step-heading"><span>01</span> Install Terra</h3>
@@ -114,7 +174,9 @@ terra</code></pre><CopyButton text={() => setupCode?.textContent?.trimEnd() ?? '
     <span>The CLI should stay stable. Internal protocols and on-disk storage can still change in breaking ways, though less often over time.</span>
   </aside>
 </section>
+</div>
 
+<div id="explore" class="home-screen">
 <section class="reading-section">
   <p class="eyebrow">Keep exploring</p><h2>A little guidance goes a long way.</h2>
   <div class="reading-grid">
@@ -124,3 +186,16 @@ terra</code></pre><CopyButton text={() => setupCode?.textContent?.trimEnd() ?? '
     <a href={resolve('skill.md')}><h3>Agent skill</h3><p>Let your coding agent write, check, and smoke-test a box. Save as <code>.claude/skills/terra-box/SKILL.md</code>.</p></a>
   </div>
 </section>
+</div>
+
+<nav class="section-controls" class:is-ready={isClient} aria-label="Page sections" inert={!isClient}>
+  <button type="button" disabled={!previousSection} aria-label={previousSection ? `Previous section: ${previousSection.label}` : 'Previous section'} onclick={() => previousSection && navigateToSection(previousSection.id)}>
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M5 12l7-7 7 7" /></svg>
+    <span>Previous</span>
+  </button>
+  <span class="section-position" role="status">{visibleSections[activeSectionIndex].label}<span>{activeSectionIndex + 1} / {visibleSections.length}</span></span>
+  <button type="button" disabled={!nextSection} aria-label={nextSection ? `Next section: ${nextSection.label}` : 'Next section'} onclick={() => nextSection && navigateToSection(nextSection.id)}>
+    <span>Next</span>
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12l7 7 7-7" /></svg>
+  </button>
+</nav>

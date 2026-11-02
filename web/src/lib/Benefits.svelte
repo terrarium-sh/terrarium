@@ -2,7 +2,6 @@
   import { resolve } from '$app/paths';
   import { Rotation } from '#lib/rotation.svelte.ts';
   import type { Snippet } from 'svelte';
-  import { fade } from 'svelte/transition';
 
   let { children }: { children: Snippet } = $props();
 
@@ -11,7 +10,6 @@
 
   const CYCLE_MS = 7000;
   const TAPPED_DWELL_MS = 14000;
-  const DESCRIPTION_FADE_MS = 180;
 
   const benefits: Benefit[] = [
     {
@@ -112,7 +110,6 @@
 
   const rotation = new Rotation(benefits.length, CYCLE_MS, TAPPED_DWELL_MS);
   const benefit = $derived(benefits[rotation.active]);
-  const descriptionFadeMs = $derived(rotation.isAnimated ? DESCRIPTION_FADE_MS : 0);
 </script>
 
 <section {@attach rotation.observeVisibility} {...rotation.holdWhileEngaged} class="benefits-section" class:is-animated={rotation.isAnimated} aria-label="Why Terrarium">
@@ -142,9 +139,9 @@
         <pre><code>{#key rotation.active}{#each benefit.lines as line, index}<span class="screen-line" data-kind={line.kind} style:--i={index}>{#if line.kind === 'command'}<span class="screen-prompt">{line.prompt ?? '$'} </span>{/if}{line.text}{#if line.note}<span class="screen-note">{line.kind === 'command' ? '  ' : ''}{line.note}</span>{/if}</span>{/each}{/key}</code></pre>
       </div>
       <div class="benefit-description">
-        {#key rotation.active}
-          <p class="benefit-text" in:fade={{ delay: descriptionFadeMs, duration: descriptionFadeMs }} out:fade={{ duration: descriptionFadeMs }}>{benefit.text} <a href={benefit.link.href}>{benefit.link.label} <span aria-hidden="true">{benefit.link.arrow}</span></a></p>
-        {/key}
+        {#each benefits as item, index (item.title)}
+          <p class="benefit-text" class:active={rotation.active === index} inert={rotation.active !== index}>{item.text} <a href={item.link.href}>{item.link.label} <span aria-hidden="true">{item.link.arrow}</span></a></p>
+        {/each}
       </div>
     </div>
   </div>
