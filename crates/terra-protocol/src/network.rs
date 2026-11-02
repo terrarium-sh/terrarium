@@ -239,7 +239,7 @@ impl crate::Message for Open {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Resolved(
     #[serde(deserialize_with = "crate::bounded::vec::<_, _, MAX_NETWORK_ADDRESSES>")]
-    pub Vec<IpAddr>,
+    pub  Vec<IpAddr>,
 );
 
 impl crate::Message for Result<Resolved, Error> {
